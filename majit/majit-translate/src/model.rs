@@ -3267,6 +3267,43 @@ pub fn clear_unreachable_blocks(graph: &mut FunctionGraph) {
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
 )]
+fn function_path_ends_with(segments: &[String], tail: &[&str]) -> bool {
+    segments.len() >= tail.len()
+        && segments[segments.len() - tail.len()..]
+            .iter()
+            .map(String::as_str)
+            .eq(tail.iter().copied())
+}
+
+/// True when `segments`/`args` spell the no-arg `boxed::Box::new_uninit`
+/// allocation.  The crate root may be present or already stripped; the tail
+/// pins the owner so an unrelated `new_uninit` leaf is never classified as
+/// this allocation.  Arity is pinned so a multi-arg path sharing the leaf
+/// is never swept or fused as a fresh box.
+fn is_box_new_uninit_path(segments: &[String], args: &[LinkArg]) -> bool {
+    args.is_empty() && function_path_ends_with(segments, &["boxed", "Box", "new_uninit"])
+}
+
+/// True when `segments` is exactly `core::ptr::write` of two arguments — the
+/// store that initializes an uninit box, and the raw-write arm
+/// `sink_fused_boxing_aggregates_at_raw_writes` rematerializes.
+fn is_core_ptr_write_path(segments: &[String], args: &[LinkArg]) -> bool {
+    args.len() == 2
+        && segments
+            .iter()
+            .map(String::as_str)
+            .eq(["core", "ptr", "write"])
+}
+
+/// True when `segments`/`args` spell `Box::assume_init` or
+/// `MaybeUninit::assume_init` of one argument — the type-level transmute
+/// that follows `ptr::write` into an uninit box.
+fn is_assume_init_path(segments: &[String], args: &[LinkArg]) -> bool {
+    args.len() == 1
+        && (function_path_ends_with(segments, &["boxed", "Box", "assume_init"])
+            || function_path_ends_with(segments, &["MaybeUninit", "assume_init"]))
+}
+
 pub fn remove_dead_aggregates(graph: &mut FunctionGraph) -> usize {
     use crate::flowspace::model::Variable;
 
@@ -3285,15 +3322,7 @@ pub fn remove_dead_aggregates(graph: &mut FunctionGraph) -> usize {
             target: CallTarget::FunctionPath { segments },
             args,
             ..
-        } => {
-            let tail = ["boxed", "Box", "new_uninit"];
-            args.is_empty()
-                && segments.len() >= tail.len()
-                && segments[segments.len() - tail.len()..]
-                    .iter()
-                    .zip(tail.iter())
-                    .all(|(s, t)| s == t)
-        }
+        } => is_box_new_uninit_path(segments, args),
         _ => false,
     };
 
@@ -4060,6 +4089,118 @@ pub fn fuse_boxing_alloc(
         }
         !out.is_empty()
     }
+    fn is_cast_instance_of(
+        graph: &FunctionGraph,
+        var: &Variable,
+        of: &Variable,
+        depth: u32,
+    ) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| {
+                op.result.as_ref() == Some(var)
+                    && matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments },
+                            args,
+                            ..
+                        } if segments.first().map(String::as_str)
+                            == Some(crate::runtime_names::shims::CAST_INSTANCE)
+                            && args.first().and_then(LinkArg::as_variable).is_some_and(|inner| {
+                                inner == of || is_cast_instance_of(graph, inner, of, depth - 1)
+                            })
+                    )
+            })
+    }
+    fn refers_to_alloc(
+        graph: &FunctionGraph,
+        var: &Variable,
+        alloc: &Variable,
+        depth: u32,
+    ) -> bool {
+        if var == alloc {
+            return true;
+        }
+        let mut roots = Vec::new();
+        store_roots(graph, var, depth, &mut roots)
+            && !roots.is_empty()
+            && roots
+                .iter()
+                .all(|root| root == alloc || is_cast_instance_of(graph, root, alloc, depth))
+    }
+    /// The unique `core::ptr::write` that stores a value into `alloc`, and
+    /// that value.  Several writes, or a write of a non-variable, decline.
+    fn ptr_write_into(graph: &FunctionGraph, alloc: &Variable) -> Option<(usize, usize, Variable)> {
+        let mut found: Option<(usize, usize, Variable)> = None;
+        for (bi, block) in graph.blocks.iter().enumerate() {
+            for (oi, op) in block.operations.iter().enumerate() {
+                let OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    args,
+                    ..
+                } = &op.kind
+                else {
+                    continue;
+                };
+                if !is_core_ptr_write_path(segments, args) {
+                    continue;
+                }
+                let Some(dest) = args[0].as_variable() else {
+                    continue;
+                };
+                if !refers_to_alloc(graph, dest, alloc, 8) {
+                    continue;
+                }
+                let Some(value) = args[1].as_variable() else {
+                    continue;
+                };
+                let value = value.clone();
+                if found.is_some() {
+                    return None;
+                }
+                found = Some((bi, oi, value));
+            }
+        }
+        found
+    }
+    fn assume_init_of(graph: &FunctionGraph, alloc: &Variable) -> Option<(usize, usize, Variable)> {
+        let mut found: Option<(usize, usize, Variable)> = None;
+        for (bi, block) in graph.blocks.iter().enumerate() {
+            for (oi, op) in block.operations.iter().enumerate() {
+                let OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    args,
+                    ..
+                } = &op.kind
+                else {
+                    continue;
+                };
+                if !is_assume_init_path(segments, args) {
+                    continue;
+                }
+                let Some(operand) = args[0].as_variable() else {
+                    continue;
+                };
+                if !refers_to_alloc(graph, operand, alloc, 8) {
+                    continue;
+                }
+                let Some(result) = op.result.clone() else {
+                    continue;
+                };
+                if found.is_some() {
+                    return None;
+                }
+                found = Some((bi, oi, result));
+            }
+        }
+        found
+    }
     /// Resolve `var` to the constant address `terminal` reads off its producer.
     ///
     /// The walk itself is shared by every header spelling: it steps through
@@ -4455,6 +4596,10 @@ pub fn fuse_boxing_alloc(
         /// struct order (`ob_header` is field zero of every boxing struct).
         w_class: Option<Payload>,
         payloads: Vec<Payload>,
+        /// Cluster ops the New rewrite replaces: the `ptr::write` that
+        /// initialized an uninit box, and the `new_uninit` call when New is
+        /// emitted at `assume_init`.
+        dead_ops: Vec<(usize, usize)>,
     }
 
     let mut sites: Vec<Site> = Vec::new();
@@ -4470,17 +4615,53 @@ pub fn fuse_boxing_alloc(
             let OpKind::Call { target, args, .. } = &op.kind else {
                 continue;
             };
-            let Some(flavor) = gc_malloc_flavor(target).filter(|_| args.len() == 1) else {
-                continue;
-            };
-            let Some(result) = &op.result else {
-                crate::decline::record(
-                    FUSE_GATE,
-                    "malloc-call-has-no-result-var",
-                    format_args!("{}", graph.name),
-                );
-                continue;
-            };
+            // Two allocation spellings: `lltype::malloc*` of the aggregate,
+            // and the uninit-box cluster `Box::new_uninit` + `ptr::write` +
+            // `assume_init`.  Both lower to the same `New` / `NewWithVtable`
+            // plus field stores.  Missing the shape is the population filter.
+            let malloc_flavor = gc_malloc_flavor(target).filter(|_| args.len() == 1);
+            let is_uninit = matches!(
+                target,
+                CallTarget::FunctionPath { segments } if is_box_new_uninit_path(segments, args)
+            );
+            let (flavor, agg_operand, result, rewrite_bi, rewrite_oi, dead_ops) =
+                if let Some(flavor) = malloc_flavor {
+                    let Some(result) = op.result.clone() else {
+                        crate::decline::record(
+                            FUSE_GATE,
+                            "malloc-call-has-no-result-var",
+                            format_args!("{}", graph.name),
+                        );
+                        continue;
+                    };
+                    let Some(agg_operand) = args[0].as_variable().cloned() else {
+                        crate::decline::record(
+                            FUSE_GATE,
+                            "aggregate-roots-unresolvable",
+                            format_args!("{}", graph.name),
+                        );
+                        continue;
+                    };
+                    (flavor, agg_operand, result, bi, oi, Vec::new())
+                } else if is_uninit {
+                    let Some(uninit) = op.result.clone() else {
+                        continue;
+                    };
+                    let Some((write_bi, write_oi, written)) = ptr_write_into(graph, &uninit) else {
+                        continue;
+                    };
+                    let mut dead_ops = vec![(write_bi, write_oi)];
+                    let (rewrite_bi, rewrite_oi, result) =
+                        if let Some((abi, aoi, ares)) = assume_init_of(graph, &uninit) {
+                            dead_ops.push((bi, oi));
+                            (abi, aoi, ares)
+                        } else {
+                            (bi, oi, uninit)
+                        };
+                    ("malloc", written, result, rewrite_bi, rewrite_oi, dead_ops)
+                } else {
+                    continue;
+                };
             // The aggregate itself can reach the malloc as a `Block.inputargs`
             // phi, not only its header: a constructor that builds the struct up
             // front and then branches — `w_float_new` builds the `W_FloatObject`
@@ -4493,7 +4674,7 @@ pub fn fuse_boxing_alloc(
             // variable a `core::ptr::write` arm stores, which is what
             // `sink_fused_boxing_aggregates_at_raw_writes` matches on.
             let mut agg_roots = Vec::new();
-            if !store_roots(graph, &args[0], 8, &mut agg_roots) {
+            if !store_roots(graph, &agg_operand, 8, &mut agg_roots) {
                 crate::decline::record(
                     FUSE_GATE,
                     "aggregate-roots-unresolvable",
@@ -4562,7 +4743,9 @@ pub fn fuse_boxing_alloc(
                     store
                         .locations
                         .iter()
-                        .any(|&(block, op)| store_dominates_site(graph, agg, (block, op), (bi, oi)))
+                        .any(|&(block, op)| {
+                            store_dominates_site(graph, agg, (block, op), (rewrite_bi, rewrite_oi))
+                        })
                         .then(|| (store.field.clone(), store.value.clone()))
                 });
                 match found {
@@ -4604,7 +4787,7 @@ pub fn fuse_boxing_alloc(
             // `model::resolve_header_plan` rows are where that is recorded,
             // and this row is the count of clusters the fuse gave up on for
             // any header reason at all.
-            let Some(header) = resolve_header_plan(graph, agg, (bi, oi)) else {
+            let Some(header) = resolve_header_plan(graph, agg, (rewrite_bi, rewrite_oi)) else {
                 crate::decline::record(
                     FUSE_GATE,
                     "vtable-unresolved",
@@ -4630,14 +4813,15 @@ pub fn fuse_boxing_alloc(
                 continue;
             }
             sites.push(Site {
-                block: bi,
-                op: oi,
+                block: rewrite_bi,
+                op: rewrite_oi,
                 aggregate: agg.clone(),
                 result: result.clone(),
                 owner,
                 vtable: header.vtable,
                 w_class: header.w_class,
                 payloads,
+                dead_ops,
             });
         }
     }
@@ -4647,39 +4831,55 @@ pub fn fuse_boxing_alloc(
     // Rewrite in reverse (block, op) order so the per-site `insert` does not
     // shift the indices of not-yet-processed sites in the same block.
     for site in sites.into_iter().rev() {
-        let block = &mut graph.blocks[site.block];
-        block.operations[site.op] = SpaceOperation {
-            result: Some(site.result.clone()),
-            // `rewrite_op_malloc` picks the opcode from what the struct
-            // carries: with a static vtable it is `new_with_vtable`, without
-            // one it is `new`.  Both take the size descriptor and nothing else.
-            kind: match site.vtable {
-                Some(vtable) => OpKind::NewWithVtable {
-                    owner: site.owner,
-                    vtable,
-                },
-                None => OpKind::New { owner: site.owner },
-            },
-        };
-        // The kept stores follow the allocation, in struct order: the header's
-        // `w_class` where the vtable does not stand for it, then the payloads.
-        // Each is a plain `FieldWrite` the assembler lowers to its own
-        // `setfield_gc`, which is the shape
-        // `Transformer.rewrite_op_malloc` leaves every field the allocation
-        // itself does not carry.
-        for (k, payload) in site.w_class.into_iter().chain(site.payloads).enumerate() {
-            block.operations.insert(
-                site.op + 1 + k,
-                SpaceOperation {
-                    result: None,
-                    kind: OpKind::FieldWrite {
-                        base: site.result.clone(),
-                        field: payload.field,
-                        value: payload.value,
-                        ty: payload.ty,
+        let inserted = usize::from(site.w_class.is_some()) + site.payloads.len();
+        {
+            let block = &mut graph.blocks[site.block];
+            block.operations[site.op] = SpaceOperation {
+                result: Some(site.result.clone()),
+                // `rewrite_op_malloc` picks the opcode from what the struct
+                // carries: with a static vtable it is `new_with_vtable`, without
+                // one it is `new`.  Both take the size descriptor and nothing else.
+                kind: match site.vtable {
+                    Some(vtable) => OpKind::NewWithVtable {
+                        owner: site.owner,
+                        vtable,
                     },
+                    None => OpKind::New { owner: site.owner },
                 },
-            );
+            };
+            // The kept stores follow the allocation, in struct order: the header's
+            // `w_class` where the vtable does not stand for it, then the payloads.
+            // Each is a plain `FieldWrite` the assembler lowers to its own
+            // `setfield_gc`, which is the shape
+            // `Transformer.rewrite_op_malloc` leaves every field the allocation
+            // itself does not carry.
+            for (k, payload) in site.w_class.into_iter().chain(site.payloads).enumerate() {
+                block.operations.insert(
+                    site.op + 1 + k,
+                    SpaceOperation {
+                        result: None,
+                        kind: OpKind::FieldWrite {
+                            base: site.result.clone(),
+                            field: payload.field,
+                            value: payload.value,
+                            ty: payload.ty,
+                        },
+                    },
+                );
+            }
+        }
+        let mut dead = site.dead_ops;
+        for (dbi, doi) in &mut dead {
+            if *dbi == site.block && *doi > site.op {
+                *doi += inserted;
+            }
+        }
+        dead.sort_unstable();
+        for (dbi, doi) in dead.into_iter().rev() {
+            if dbi == site.block && doi == site.op {
+                continue;
+            }
+            graph.blocks[dbi].operations.remove(doi);
         }
     }
     sink_fused_boxing_aggregates_at_raw_writes(graph, &fused_aggregates);
@@ -4723,8 +4923,7 @@ fn sink_fused_boxing_aggregates_at_raw_writes(
     };
     let is_raw_write = |kind: &OpKind| {
         matches!(kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, args, .. }
-            if args.len() == 2
-                && segments.iter().map(String::as_str).eq(["core", "ptr", "write"]))
+            if is_core_ptr_write_path(segments, args))
     };
 
     let mut sinks = Vec::new();
@@ -5026,14 +5225,7 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
             // stored the now-unused `Array` aggregate, so the box is a fresh
             // alloc nothing reads.  Pin the arity so an unrelated multi-arg
             // path sharing the leaf is never swept.
-            let new_uninit = ["boxed", "Box", "new_uninit"];
-            let is_box_new_uninit = args.is_empty()
-                && segments.len() >= new_uninit.len()
-                && segments[segments.len() - new_uninit.len()..]
-                    .iter()
-                    .map(String::as_str)
-                    .eq(new_uninit.iter().copied());
-            is_cast || is_get_instantiate || is_box_new_uninit
+            is_cast || is_get_instantiate || is_box_new_uninit_path(segments, args)
         }
         _ => false,
     };
@@ -5067,15 +5259,7 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
                 target: CallTarget::FunctionPath { segments },
                 args,
                 ..
-            } => {
-                let new_uninit = ["boxed", "Box", "new_uninit"];
-                args.is_empty()
-                    && segments.len() >= new_uninit.len()
-                    && segments[segments.len() - new_uninit.len()..]
-                        .iter()
-                        .map(String::as_str)
-                        .eq(new_uninit.iter().copied())
-            }
+            } => is_box_new_uninit_path(segments, args),
             _ => false,
         })
         .filter_map(|op| op.result.clone())
@@ -9148,6 +9332,227 @@ mod tests {
                 "{allocator}: no allocation call may survive the fusion"
             );
         }
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_lowers_box_new_uninit_write_assume_init_cluster() {
+        // `Box::new_uninit(); ptr::write(box, agg); assume_init(box)` is the
+        // uninit spelling of the same malloc-then-init cluster: NewWithVtable
+        // plus the payload store, with the uninit call, the write, and
+        // assume_init removed.
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let v = graph
+            .push_op_var(entry, OpKind::ConstFloat(0.0f64.to_bits()), true)
+            .unwrap();
+        let header = push_boxing_header(&mut graph, entry, 4357049520);
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("W_FloatObject"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: agg.clone(),
+                field: FieldDescriptor {
+                    name: "ob_header".into(),
+                    owner_root: Some("W_FloatObject".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                },
+                value: LinkArg::Value(header),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: agg.clone(),
+                field: FieldDescriptor {
+                    name: "floatval".into(),
+                    owner_root: Some("W_FloatObject".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                },
+                value: LinkArg::Value(v.clone()),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        let uninit = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            "alloc".into(),
+                            "boxed".into(),
+                            "Box".into(),
+                            "new_uninit".into(),
+                        ],
+                    },
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            entry,
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["core".into(), "ptr".into(), "write".into()],
+                },
+                args: crate::model::call_args(vec![uninit.clone(), agg.clone()]),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        let ret = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["boxed".into(), "Box".into(), "assume_init".into()],
+                    },
+                    args: crate::model::call_args(vec![uninit.clone()]),
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(ret.clone()));
+
+        let fused = fuse_boxing_alloc(&mut graph, &numeric_boxing_attrs());
+        assert_eq!(fused, 1, "the uninit-box cluster must fuse");
+
+        let ops = &graph.block(entry).operations;
+        let nwv_pos = ops
+            .iter()
+            .position(|op| {
+                matches!(&op.kind, OpKind::NewWithVtable { owner, vtable }
+                    if owner == "W_FloatObject" && *vtable == 4357049520)
+            })
+            .expect("NewWithVtable must replace assume_init");
+        assert_eq!(
+            ops[nwv_pos].result.as_ref(),
+            Some(&ret),
+            "NewWithVtable must reuse the assume_init result register"
+        );
+        match &ops[nwv_pos + 1].kind {
+            OpKind::FieldWrite {
+                base, field, ty, ..
+            } => {
+                assert_eq!(base, &ret);
+                assert_eq!(field.name, "floatval");
+                assert_eq!(*ty, ValueType::Float);
+            }
+            other => panic!("expected payload FieldWrite after NewWithVtable, got {other:?}"),
+        }
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::FunctionPath { segments }, args, .. }
+                    if is_box_new_uninit_path(segments, args)
+                        || is_core_ptr_write_path(segments, args)
+                        || is_assume_init_path(segments, args)
+            )),
+            "new_uninit / ptr::write / assume_init must not survive the fusion: {ops:#?}"
+        );
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_ignores_box_new_lookalike() {
+        // `boxed::Box::new(agg)` shares the owner but is not the no-arg
+        // uninit allocation; without an `lltype::malloc*` flavor it stays
+        // residual.
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let v = graph
+            .push_op_var(entry, OpKind::ConstFloat(0.0f64.to_bits()), true)
+            .unwrap();
+        let header = push_boxing_header(&mut graph, entry, 4357049520);
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("W_FloatObject"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: agg.clone(),
+                field: FieldDescriptor {
+                    name: "ob_header".into(),
+                    owner_root: Some("W_FloatObject".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                },
+                value: LinkArg::Value(header),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: agg.clone(),
+                field: FieldDescriptor {
+                    name: "floatval".into(),
+                    owner_root: Some("W_FloatObject".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                },
+                value: LinkArg::Value(v),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        let ret = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["boxed".into(), "Box".into(), "new".into()],
+                    },
+                    args: crate::model::call_args(vec![agg.clone()]),
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(ret));
+
+        assert_eq!(
+            fuse_boxing_alloc(&mut graph, &numeric_boxing_attrs()),
+            0,
+            "Box::new is not the uninit allocation"
+        );
+        assert!(
+            graph.block(entry).operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.last().map(String::as_str) == Some("new")
+            )),
+            "the look-alike Box::new call must remain residual"
+        );
     }
 
     #[test]

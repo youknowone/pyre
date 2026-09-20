@@ -152,8 +152,11 @@ pub trait JitPolicy {
         } else {
             self.look_inside_function(func) && !self._reject_function(func)
         };
-        // policy.py: `_jit_unroll_safe_` opts back in despite a loop.
-        contains_loop = contains_loop && !func.hints.iter().any(|h| h == "unroll_safe");
+        // `_jit_unroll_safe_` opts back in despite a loop. Harvested
+        // tokens live on `FunctionGraph.hints` (the BFS carrier);
+        // `func.hints` is the same bag when the caller synthesized the
+        // `SemanticFunction` around a registered graph.
+        contains_loop = contains_loop && !has_unroll_safe(func);
 
         let res = see_function
             && !contains_unsupported_variable_type(
@@ -231,7 +234,13 @@ pub trait JitPolicy {
             crate::decline::record(
                 crate::decline::gate::LOOK_INSIDE_GRAPH,
                 reason,
-                format_args!("{}", func.name),
+                format_args!(
+                    "{}",
+                    func.graph
+                        .source_identity
+                        .as_deref()
+                        .unwrap_or(func.name.as_str())
+                ),
             );
         }
         res
@@ -293,6 +302,13 @@ impl JitPolicy for StopAtXPolicy {
     fn look_inside_function(&self, func: &SemanticFunction) -> bool {
         !self.funcs.iter().any(|f| f == &func.name)
     }
+}
+
+/// `_jit_unroll_safe_` on the function, carried on `func.hints` and on
+/// `graph.hints` (the registration carrier the BFS copies).
+fn has_unroll_safe(func: &SemanticFunction) -> bool {
+    func.hints.iter().any(|h| h == "unroll_safe")
+        || func.graph.hints.iter().any(|h| h == "unroll_safe")
 }
 
 /// policy.py:56 `getattr(func, '_jit_look_inside_', ...)`.
@@ -601,50 +617,65 @@ pub fn collect_declared_value_types<'a>(kind: &'a OpKind, out: &mut Vec<&'a Valu
 /// Standard DFS classification: edges from a block back to an ancestor
 /// in the current DFS stack are back edges.  Returns the list of back
 /// edges as `(from_block, to_block)` pairs.
+///
+/// Walks the startblock-reachable, non-`dead` closure — the same
+/// `iterblocks()` set `contains_unsupported_variable_type` uses.
+/// Charon keeps unreachable BBs (orphan `on_unwind` chains) and `dead`
+/// stubs in `graph.blocks`; RPython's flow graph never contains them.
 fn find_backedges(graph: &FunctionGraph) -> Vec<(usize, usize)> {
-    use std::collections::HashSet;
-
+    let by_id: std::collections::HashMap<BlockId, &Block> = graph
+        .blocks
+        .iter()
+        .filter(|b| !b.dead)
+        .map(|b| (b.id, b))
+        .collect();
     let mut backedges = Vec::new();
-    let mut seen: HashSet<usize> = HashSet::new();
-    let mut seeing: HashSet<usize> = HashSet::new();
-    if !graph.blocks.is_empty() {
-        let start = graph.startblock.0;
-        seen.insert(start);
-        find_backedges_dfs(graph, start, &mut seen, &mut seeing, &mut backedges);
+    let mut seen: HashSet<BlockId> = HashSet::new();
+    let mut seeing: HashSet<BlockId> = HashSet::new();
+    if !by_id.contains_key(&graph.startblock) {
+        return backedges;
     }
+    seen.insert(graph.startblock);
+    find_backedges_dfs(
+        &by_id,
+        graph.startblock,
+        &mut seen,
+        &mut seeing,
+        &mut backedges,
+    );
     backedges
 }
 
 fn find_backedges_dfs(
-    graph: &FunctionGraph,
-    block_idx: usize,
-    seen: &mut std::collections::HashSet<usize>,
-    seeing: &mut std::collections::HashSet<usize>,
+    by_id: &std::collections::HashMap<BlockId, &Block>,
+    block_id: BlockId,
+    seen: &mut HashSet<BlockId>,
+    seeing: &mut HashSet<BlockId>,
     backedges: &mut Vec<(usize, usize)>,
 ) {
-    seeing.insert(block_idx);
-    for target in block_exit_targets(graph, block_idx) {
+    seeing.insert(block_id);
+    let Some(block) = by_id.get(&block_id) else {
+        seeing.remove(&block_id);
+        return;
+    };
+    // `iterblocks` derives the successor set from `Block.exits` only;
+    // final blocks (`exits == ()`) have no outgoing targets. Skip a
+    // `dead` / missing target — it is a Charon CFG artefact, not a
+    // source-level back-edge.
+    for target in block.exits.iter().map(|link| link.target) {
+        if !by_id.contains_key(&target) {
+            continue;
+        }
         if seen.contains(&target) {
             if seeing.contains(&target) {
-                backedges.push((block_idx, target));
+                backedges.push((block_id.0, target.0));
             }
         } else {
             seen.insert(target);
-            find_backedges_dfs(graph, target, seen, seeing, backedges);
+            find_backedges_dfs(by_id, target, seen, seeing, backedges);
         }
     }
-    seeing.remove(&block_idx);
-}
-
-fn block_exit_targets(graph: &FunctionGraph, block_idx: usize) -> Vec<usize> {
-    let block = match graph.blocks.get(block_idx) {
-        Some(b) => b,
-        None => return Vec::new(),
-    };
-    // RPython `flowspace/model.py` FunctionGraph.iterblocks derives
-    // the successor set from `Block.exits` only; final blocks
-    // (`exits == ()`) have no outgoing targets.
-    block.exits.iter().map(|link| link.target.0).collect()
+    seeing.remove(&block_id);
 }
 
 #[cfg(test)]
@@ -981,5 +1012,81 @@ mod tests {
         g.set_goto(entry, entry, Vec::new());
         let edges = find_backedges(&g);
         assert_eq!(edges, vec![(entry.0, entry.0)]);
+    }
+
+    /// `FunctionGraph.hints` is the carrier BFS copies onto the synthesized
+    /// `SemanticFunction`. Harvested `unroll_safe` lands there; an empty
+    /// `func.hints` must not hide it.
+    #[test]
+    fn unroll_safe_on_graph_hints_opts_in_a_loop() {
+        let mut policy = DefaultJitPolicy::new();
+        let mut g = FunctionGraph::new("loopy");
+        let entry = g.startblock;
+        g.set_goto(entry, entry, Vec::new());
+        g.hints = vec!["unroll_safe".into()];
+        assert!(policy.look_inside_graph(&SemanticFunction {
+            name: "loopy".into(),
+            graph: g,
+            return_type: None,
+            self_ty_root: None,
+            trait_impl_id: None,
+            hints: vec![],
+            module_path: String::new(),
+            trait_root: None,
+            trait_qualified: None,
+            returns_objectptr: false,
+        }));
+    }
+
+    /// `iterblocks()` never yields a block the startblock cannot reach.
+    /// A self-loop on an orphan Charon BB is not a source-level loop.
+    #[test]
+    fn find_backedges_ignores_unreachable_self_loop() {
+        let mut g = FunctionGraph::new("linear");
+        let entry = g.startblock;
+        let sink = g.create_block();
+        g.set_goto(entry, sink, Vec::new());
+        let orphan = g.create_block();
+        g.set_goto(orphan, orphan, Vec::new());
+        assert!(find_backedges(&g).is_empty());
+        let mut policy = DefaultJitPolicy::new();
+        assert!(policy.look_inside_graph(&SemanticFunction {
+            name: "linear".into(),
+            graph: g,
+            return_type: None,
+            self_ty_root: None,
+            trait_impl_id: None,
+            hints: vec![],
+            module_path: String::new(),
+            trait_root: None,
+            trait_qualified: None,
+            returns_objectptr: false,
+        }));
+    }
+
+    /// A `dead` stub (orphan `on_unwind` cleanup) may still have a
+    /// residual self-edge. `iterblocks` never sees it.
+    #[test]
+    fn find_backedges_ignores_dead_block_self_loop() {
+        let mut g = FunctionGraph::new("dead_loop");
+        let entry = g.startblock;
+        let dead = g.create_block();
+        g.set_goto(entry, dead, Vec::new());
+        g.set_goto(dead, dead, Vec::new());
+        g.block_mut(dead).dead = true;
+        assert!(find_backedges(&g).is_empty());
+        let mut policy = DefaultJitPolicy::new();
+        assert!(policy.look_inside_graph(&SemanticFunction {
+            name: "dead_loop".into(),
+            graph: g,
+            return_type: None,
+            self_ty_root: None,
+            trait_impl_id: None,
+            hints: vec![],
+            module_path: String::new(),
+            trait_root: None,
+            trait_qualified: None,
+            returns_objectptr: false,
+        }));
     }
 }

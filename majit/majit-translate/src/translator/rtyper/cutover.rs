@@ -3013,6 +3013,42 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
         &["self", "val"],
         LowLevelType::Void,
     ),
+    // `Cell::get(&self) -> T` copies the cell.  The residual is the scalar
+    // load; census uses are `Cell<i32>` (`cerrno` alt-errno), so `Signed`.
+    (&["cell", "Cell", "get"], &["self"], LowLevelType::Signed),
+    // `AtomicUsize` is layout-transparent over `usize`; `new(v)` yields that
+    // inner unsigned word.
+    (
+        &["sync", "atomic", "AtomicUsize", "new"],
+        &["v"],
+        LowLevelType::Unsigned,
+    ),
+    (
+        &["sync", "atomic", "AtomicUsize", "swap"],
+        &["self", "val", "order"],
+        LowLevelType::Unsigned,
+    ),
+    (
+        &["sync", "atomic", "AtomicUsize", "store"],
+        &["self", "val", "order"],
+        LowLevelType::Void,
+    ),
+    // `AtomicPtr::swap` returns the previous `*mut T` as an untyped address.
+    (
+        &["sync", "atomic", "AtomicPtr", "swap"],
+        &["self", "val", "order"],
+        LowLevelType::Address,
+    ),
+    (
+        &["sync", "atomic", "AtomicPtr", "new"],
+        &["v"],
+        LowLevelType::Address,
+    ),
+    (
+        &["sync", "atomic", "AtomicI64", "new"],
+        &["v"],
+        LowLevelType::Signed,
+    ),
     // `usize::saturating_mul(self, rhs) -> usize` clamps the product at the
     // type max.  The residual computes the clamped product; only the
     // `Unsigned` scalar result is modeled.  The census uses are all `usize`
@@ -7705,6 +7741,57 @@ mod tests {
                     "is_int".to_string()
                 ]))
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn foreign_stdlib_externals_registers_cell_get_and_atomic_scalar_rows() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::translator::rtyper::call_registry::CallRegistry;
+
+        let registry = CallRegistry::new(std::rc::Rc::new(Bookkeeper::new()));
+        register_foreign_stdlib_externals(&registry);
+        for (segments, argnames) in [
+            (["cell", "Cell", "get"].as_slice(), ["self"].as_slice()),
+            (
+                ["sync", "atomic", "AtomicUsize", "new"].as_slice(),
+                ["v"].as_slice(),
+            ),
+            (
+                ["sync", "atomic", "AtomicPtr", "swap"].as_slice(),
+                ["self", "val", "order"].as_slice(),
+            ),
+        ] {
+            let entry = registry
+                .lookup(&FunctionPathKey::from_segments(segments.iter().copied()))
+                .unwrap_or_else(|| panic!("{segments:?} must be registered"));
+            assert_eq!(
+                entry.function_desc.borrow().signature.argnames,
+                argnames
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect::<Vec<_>>(),
+                "{segments:?}"
+            );
+            assert!(
+                !entry.function_desc.borrow().cache.borrow().is_empty(),
+                "{segments:?}: annotator stub graph required"
+            );
+        }
+    }
+
+    #[test]
+    fn foreign_stdlib_externals_does_not_register_refcell_get_lookalike() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::translator::rtyper::call_registry::CallRegistry;
+
+        let registry = CallRegistry::new(std::rc::Rc::new(Bookkeeper::new()));
+        register_foreign_stdlib_externals(&registry);
+        assert!(
+            registry
+                .lookup(&FunctionPathKey::from_segments(["cell", "RefCell", "get"]))
+                .is_none(),
+            "RefCell::get is not Cell::get"
         );
     }
 

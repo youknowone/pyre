@@ -54,7 +54,13 @@
 //!     lifetimes).
 //!   - `Cast` — same-Variable alias.
 //!   - `Discriminant(place)` — synthetic `FieldRead("__discriminant")`.
-//!   - `Aggregate` — synthetic `Call(SyntheticTransparentCtor)`.
+//!   - `Aggregate` — a unique, unescaped named struct lowers to `New` +
+//!     `FieldWrite` (malloc then setfield). A stack value that is copied,
+//!     returned, stored, or merged through a phi stays a constructor, so
+//!     later mutation of one copy is not visible through the others.
+//!     Transparent newtype wrappers stay a no-op alias. Enum variants,
+//!     tuples, and arrays still emit `Call(SyntheticTransparentCtor)` for
+//!     later rewrites.
 //!   - `ShallowInitBox` — synthetic `Call(SyntheticTransparentCtor)`.
 //!   - `Repeat` / `Len` / `NullaryOp` — synthetic `Call(__array_repeat
 //!     / __len / __nullary_*)`.
@@ -1726,7 +1732,10 @@ fn derive_program_metadata(
                     .enumerate()
                     .map(|(i, f)| {
                         let fname = f.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
-                        (fname, tyref_to_attr_value_type(&f.ty, llbc))
+                        (
+                            fname,
+                            tyref_to_attr_value_type_for_struct_field(&f.ty, td, llbc),
+                        )
                     })
                     .collect();
                 struct_field_attrs.insert(canonical_name.clone(), attr_rows);
@@ -2727,6 +2736,8 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || !lo.next_call_results.is_empty()
             || !lo.checked_arith_call_results.is_empty()
             || !lo.option_try_sites.is_empty()
+            || !lo.result_try_sites.is_empty()
+            || !lo.disc_combinator_sites.is_empty()
             || !lo.slice_index_rangefrom_sites.is_empty()
             || !lo.slice_index_range_sites.is_empty()
             || !lo.slice_index_rangeto_sites.is_empty()
@@ -2959,6 +2970,15 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 return_narrow_root.as_deref(),
             )
         };
+        // Non-carrier `Result` `?` is the same ControlFlow diamond as
+        // `option_try`, with Ok/Err polarity and an `Err` return instead of
+        // `None`.  Exception-carrier Results are already rewritten above.
+        let result_try_stats = if lo.result_try_sites.is_empty() {
+            ResultTryStats::default()
+        } else {
+            let return_owners = lo.resolve_result_return_owners(&fd.signature.output);
+            rewire_result_try_call_sites(&mut lo.graph, &lo.result_try_sites, return_owners)
+        };
         // The `bool::then` short-circuit rewrite (`front::bool_then`) splits
         // the residual `then` call block into a `Some`/`None` diamond.  It
         // runs on the post-lowering graph (its block A is closed with a
@@ -3096,6 +3116,15 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             .map_err(LowerError::Unsupported)?;
         }
         let closure_select_rewritten = closure_select_outcome.rewritten;
+        let disc_combinator_rewritten = if lo.disc_combinator_sites.is_empty() {
+            0
+        } else {
+            rewire_disc_combinator_sites(
+                &mut lo.graph,
+                &lo.disc_combinator_sites,
+                static_addrs.error_carrier,
+            )
+        };
         // The `(a..=b).contains(&x)` fold (`front::range_contains`) splices
         // the residual `contains` method call in place with native
         // `bitand(le(a, x), ge(b, x))` compares and removes the paired
@@ -3132,6 +3161,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || from_size_align_rewritten > 0
             || from_size_align_expect_rewritten > 0
             || option_try_stats.rewritten > 0
+            || result_try_stats.rewritten > 0
             || bool_then_rewritten > 0
             || slice_first_rewritten > 0
             || slice_get_rewritten > 0
@@ -3143,6 +3173,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || result_as_ref_rewritten > 0
             || map_or_rewritten > 0
             || closure_select_rewritten > 0
+            || disc_combinator_rewritten > 0
         {
             crate::model::clear_unreachable_blocks(&mut lo.graph);
         }
@@ -3465,12 +3496,222 @@ fn simplify_lowered_graph(
     // among them.  Ordering the prune first does not remove the need.
     crate::model::clear_unreachable_blocks(graph);
     // Re-thread boxing-cluster operands the dead-var sweeps above stripped out
-    // of the `NewWithVtable`-chain blocks' inputargs.  Runs last so no later
-    // pass can remove the threaded inputarg, restoring the adapter's per-block
-    // operand invariant for cross-block boxing clusters (e.g. `w_int_new`,
-    // whose `intval` payload and `__cast_instance_intrinsic` return chain span the
-    // blocks split by the `get_instantiate` / `gc_interp::enabled` calls).
+    // of the `NewWithVtable`-chain blocks' inputargs.  Runs after those sweeps
+    // so no later dead-var pass can remove the threaded inputarg, restoring the
+    // adapter's per-block operand invariant for cross-block boxing clusters
+    // (e.g. `w_int_new`, whose `intval` payload and
+    // `__cast_instance_intrinsic` return chain span the blocks split by the
+    // `get_instantiate` / `gc_interp::enabled` calls).
     crate::model::thread_undefined_op_operands(graph);
+    // Named-struct aggregates that boxing fusion did not consume become
+    // `new(descr)` only when the constructor is the unique, unescaped
+    // allocation — a stack value that is copied, returned, stored, or
+    // merged through a phi must stay a constructor. Only the final
+    // simplify runs this — the pre-pass still has consumer rewrites
+    // (`range_iter`, slice-index) that match the constructor.
+    if sweep_dead_vars {
+        lower_struct_aggregate_ctors_to_new(graph);
+    }
+}
+
+/// Whether `target` is `lltype::malloc` / `malloc_typed` / the managed and
+/// stable flavors — the boxing-cluster allocator `fuse_boxing_alloc` keys on.
+fn call_target_is_gc_malloc(target: &CallTarget) -> bool {
+    let CallTarget::FunctionPath { segments } = target else {
+        return false;
+    };
+    let [.., parent, leaf] = segments.as_slice() else {
+        return false;
+    };
+    parent == "lltype"
+        && matches!(
+            leaf.as_str(),
+            "malloc" | "malloc_typed" | "malloc_typed_managed" | "malloc_typed_stable"
+        )
+}
+
+/// Rewrite a live named-struct aggregate constructor to `malloc` plus the
+/// field stores already emitted beside it.
+///
+/// Construction is `p = malloc(S); p.f = v`. The MIR front first emits a
+/// `SyntheticTransparentCtor` so `fuse_boxing_alloc`,
+/// `lower_struct_ptr_writes`, and `remove_dead_aggregates` still see the
+/// construct-on-stack spelling; after those passes, a remaining struct
+/// constructor that is the unique, unescaped allocation becomes
+/// [`OpKind::New`].
+///
+/// A named struct on the stack is a value: `let b = a`, passing by value,
+/// returning it, storing it into a field, or merging it through a phi
+/// copies it, and later mutation of one copy must not be visible through
+/// the other. `New` gives the result reference identity, so those
+/// constructors stay constructors.
+///
+/// Aggregates that still participate in a boxing cluster also stay
+/// constructors: the malloc argument, any phi that carries it, and nested
+/// named structs stored into those (the header object fusion reads
+/// `ob_type` off). They are the cluster's stack value, not the heap
+/// object; rewriting them to `New` would allocate the header separately
+/// and leave fusion looking at a `New` instead of a
+/// `SyntheticTransparentCtor`.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded"
+)]
+fn lower_struct_aggregate_ctors_to_new(graph: &mut FunctionGraph) -> usize {
+    let malloc_args = boxing_cluster_ctor_results(graph);
+
+    let mut rewrite: Vec<(usize, usize, String)> = Vec::new();
+    for (block_idx, block) in graph.blocks.iter().enumerate() {
+        for (op_idx, op) in block.operations.iter().enumerate() {
+            let Some(result) = op.result.as_ref() else {
+                continue;
+            };
+            if malloc_args.contains(result) {
+                continue;
+            }
+            let OpKind::Call {
+                target:
+                    CallTarget::SyntheticTransparentCtor {
+                        is_struct: true, ..
+                    },
+                args,
+                result_ty,
+            } = &op.kind
+            else {
+                continue;
+            };
+            if !args.is_empty() {
+                continue;
+            }
+            let ValueType::Ref(Some(owner)) = result_ty else {
+                continue;
+            };
+            if owner.is_empty() {
+                continue;
+            }
+            if struct_ctor_copied_by_value(graph, result) {
+                continue;
+            }
+            rewrite.push((block_idx, op_idx, owner.clone()));
+        }
+    }
+    for (block_idx, op_idx, owner) in &rewrite {
+        graph.blocks[*block_idx].operations[*op_idx].kind = OpKind::New {
+            owner: owner.clone(),
+        };
+    }
+    rewrite.len()
+}
+
+/// Whether `result` is used as a by-value copy, move, or merge rather than
+/// as the unique object whose fields are initialized in place.
+///
+/// Those uses are the sites at which a stack aggregate is a value: a later
+/// `FieldWrite` on one copy must not be visible through the others, and a
+/// residual callee that takes the aggregate by value expects the stack
+/// layout, not a heap pointer.
+fn struct_ctor_copied_by_value(graph: &FunctionGraph, result: &Variable) -> bool {
+    for block in &graph.blocks {
+        if block.inputargs.iter().any(|arg| arg == result) {
+            return true;
+        }
+        for link in &block.exits {
+            if link
+                .args
+                .iter()
+                .any(|arg| arg.as_variable() == Some(result))
+            {
+                return true;
+            }
+        }
+        for op in &block.operations {
+            match &op.kind {
+                OpKind::Call { target, args, .. } => {
+                    if args.iter().any(|arg| arg.as_variable() == Some(result))
+                        && !call_target_is_gc_malloc(target)
+                    {
+                        return true;
+                    }
+                }
+                OpKind::FieldWrite { value, .. } => {
+                    if value.as_variable() == Some(result) {
+                        return true;
+                    }
+                }
+                OpKind::FieldRead { base, .. } if base == result => {}
+                kind => {
+                    if crate::inline::op_variable_refs(kind)
+                        .iter()
+                        .any(|var| var == result)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Variables that still belong to an unfused boxing cluster: each
+/// `lltype::malloc[_typed*]` argument, the phis that carry it, and every
+/// nested named-struct stored into those aggregates.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded"
+)]
+fn boxing_cluster_ctor_results(graph: &FunctionGraph) -> std::collections::HashSet<Variable> {
+    use std::collections::HashSet;
+
+    let mut cluster: HashSet<Variable> = HashSet::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let OpKind::Call { target, args, .. } = &op.kind else {
+                continue;
+            };
+            if !call_target_is_gc_malloc(target) {
+                continue;
+            }
+            cluster.extend(args.iter().filter_map(LinkArg::as_variable).cloned());
+        }
+    }
+    let mut growing = true;
+    while growing {
+        growing = false;
+        for block in &graph.blocks {
+            for (slot, arg) in block.inputargs.iter().enumerate() {
+                if !cluster.contains(arg) {
+                    continue;
+                }
+                for pred in &graph.blocks {
+                    for link in &pred.exits {
+                        if link.target != block.id {
+                            continue;
+                        }
+                        if let Some(v) = link.args.get(slot).and_then(LinkArg::as_variable)
+                            && cluster.insert(v.clone())
+                        {
+                            growing = true;
+                        }
+                    }
+                }
+            }
+            for op in &block.operations {
+                let OpKind::FieldWrite { base, value, .. } = &op.kind else {
+                    continue;
+                };
+                if !cluster.contains(base) {
+                    continue;
+                }
+                if let Some(v) = value.as_variable()
+                    && cluster.insert(v.clone())
+                {
+                    growing = true;
+                }
+            }
+        }
+    }
+    cluster
 }
 
 /// Order in which [`Lowering::lower`] walks the MIR basic blocks.
@@ -3888,6 +4129,15 @@ struct Lowering<'a> {
     /// `front::option_closure_select` post-pass synthesizes (see
     /// [`crate::front::option_closure_select::ClosureSelectSite`]).
     closure_select_sites: Vec<crate::front::option_closure_select::ClosureSelectSite>,
+    /// Option/Result combinators whose body is a discriminant switch (plus an
+    /// optional closure `call_once`).  Captured here so the post-pass can
+    /// replace the opaque core residual with the if/else the flow graph
+    /// would have had if the source had been written that way.
+    disc_combinator_sites: Vec<DiscCombinatorSite>,
+    /// `Try::branch(res)` sites whose receiver is a non-carrier `Result`.
+    /// The Option sibling is [`Lowering::option_try_sites`]; exception-carrier
+    /// Results stay on [`Lowering::result_exc_call_results`].
+    result_try_sites: Vec<ResultTrySite>,
     /// Result-var ids of one-word niche `Option` discriminant reads folded to
     /// a pointer null-test (`ne(base, null_mut())`, `build_rvalue`
     /// `Rvalue::Discriminant` niche arm).  Such a discriminant is a `SomeBool`
@@ -4210,6 +4460,8 @@ impl<'a> Lowering<'a> {
             map_or_sites: Vec::new(),
             is_none_sites: Vec::new(),
             closure_select_sites: Vec::new(),
+            disc_combinator_sites: Vec::new(),
+            result_try_sites: Vec::new(),
             niche_disc_vars: std::collections::HashSet::new(),
             cast_ptr_to_int_src: std::collections::HashMap::new(),
             root_scope_moved_locals,
@@ -6186,14 +6438,16 @@ impl<'a> Lowering<'a> {
                 ))
             }
             // `Aggregate(kind, operands)` — tuple / struct / enum-variant
-            // / array construction. Modeled as a synthetic constructor
-            // call (`CallTarget::SyntheticTransparentCtor`), the
-            // CallTarget variant explicitly carved out for "constructors
-            // RPython's rtyper erases before jtransform" — the MIR
-            // driver fits that description (Charon has already resolved
-            // types, so the call is post-frontend-resolution by
-            // construction).  Operands flow as call arguments; the
-            // synthetic name is best-effort from the AggregateKind tag.
+            // / array construction. A unique, unescaped named struct is
+            // `malloc(GcStruct)` plus one `setfield` per member; the
+            // constructor call is a temporary marker so boxing fusion and
+            // dead-aggregate sweep still see the construct-on-stack
+            // spelling, then [`lower_struct_aggregate_ctors_to_new`]
+            // rewrites it to `OpKind::New` only when that rewrite is a
+            // value-preserving allocation. Transparent newtype wrappers
+            // stay a no-op alias of their inner operand. Enum variants,
+            // tuples, and arrays keep `CallTarget::SyntheticTransparentCtor`
+            // for the later rewrites that still match that shape.
             Rvalue::Aggregate(kind, operands) => {
                 // A fieldless (C-like) enum variant carries no payload, so
                 // constructing it is just naming its discriminant integer
@@ -6356,9 +6610,9 @@ impl<'a> Lowering<'a> {
                 // `classdesc.py:705`) succeeds for classes whose
                 // `__init__` is not registered with the bookkeeper —
                 // the operand values flow through the FieldWrite chain
-                // below instead.  `SyntheticTransparentCtor` survives
-                // as the marker that downstream jtransform unwraps to
-                // the underlying `SomeInstance(classdef)`.
+                // below instead.  A named struct's constructor is the
+                // malloc marker; [`lower_struct_aggregate_ctors_to_new`]
+                // rewrites it to `OpKind::New` after boxing fusion.
                 let ctor_target = if owner_path.is_empty() {
                     CallTarget::synthetic_transparent_ctor(ctor_name.clone())
                 } else if adt_is_struct {
@@ -7144,6 +7398,10 @@ impl<'a> Lowering<'a> {
                     // consumes `inner`.  It selects the payload projection
                     // below.
                     let container_is_enum = tyref_is_enum_free(&inner.ty, self.llbc);
+                    // A closure env is identified from the type decl's
+                    // `src: Closure` origin, not from the `closure` name
+                    // leaf.  Needed before `resolve_place` consumes `inner`.
+                    let owner_is_closure_env = tyref_is_closure_env(&inner.ty, self.llbc);
                     let base = self.resolve_place(mir_bb, *inner)?;
                     let bb_id = self.block_id[mir_bb];
                     let base = if let Some(root) = narrow_root {
@@ -7171,18 +7429,19 @@ impl<'a> Lowering<'a> {
                     // A shell variant's payload takes the shell projection:
                     // the `&P` a slice accessor hands back through
                     // `Option`/`Result`/`ControlFlow` is the primitive, not
-                    // a pointer the program stores.  Every other container's
-                    // `&P` field is a reference the program declared and
-                    // keeps its own bank.
-                    let declared = if container_is_enum {
-                        tyref_enum_payload_value_type(&place_ty, self.llbc)
-                    } else {
-                        tyref_to_value_type(&place_ty, self.llbc)
-                    };
-                    let ty = match declared {
-                        ValueType::Ref(None) => tyref_to_value_type(&field_ty, self.llbc),
-                        resolved => resolved,
-                    };
+                    // a pointer the program stores.  A closure-env field
+                    // whose declared type is a shared borrow of a primitive
+                    // is the same integer: the body reads the capture
+                    // through that borrow as a scalar (`Rvalue::Ref`
+                    // aliases the referent).  An ordinary struct's `&P`
+                    // field is a pointer the program stores and compares.
+                    let ty = adt_field_read_value_type(
+                        &place_ty,
+                        &field_ty,
+                        container_is_enum,
+                        owner_is_closure_env,
+                        self.llbc,
+                    );
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -7997,12 +8256,21 @@ impl<'a> Lowering<'a> {
         // argument, including primitive payloads for which the annotator does
         // not split classdefs.
         let owner_leaf = name_path.rsplit("::").next().unwrap_or("").to_string();
-        let owner_root = match head
-            .as_object()
-            .and_then(|h| adt_head_instantiation_suffix(h, self.llbc))
-        {
-            Some(suffix) => format!("{owner_leaf}{suffix}"),
-            None => owner_leaf,
+        // Duplicate-leaf hardening drops the shared `closure` /
+        // `closure#N` alias from the field registry.  Field reads of a
+        // capture must key the full crate-stripped path the registry
+        // kept — the same spelling [`tyref_input_class_root`] uses for
+        // the env parameter.
+        let owner_root = if majit_charon_reader::ullbc::is_closure_leaf(&owner_leaf) {
+            strip_crate_prefix(&name_path)
+        } else {
+            match head
+                .as_object()
+                .and_then(|h| adt_head_instantiation_suffix(h, self.llbc))
+            {
+                Some(suffix) => format!("{owner_leaf}{suffix}"),
+                None => owner_leaf,
+            }
         };
         match (&td.kind, variant_idx) {
             (TypeDeclKind::Struct(fields), None) => {
@@ -9157,10 +9425,10 @@ impl<'a> Lowering<'a> {
                         .clone();
                 }
                 // `core::intrinsics::transmute::<A, B>(x)` is a bitwise
-                // move.  When both Rust types lower to the same JIT register
-                // bank and Charon's type/layout data proves their byte sizes
-                // equal, the move is the bank's ordinary copy (`same_as`).
-                // This includes `u8 -> #[repr(u8)]` fieldless enums: the enum
+                // move.  `f64 ↔ i64` is `float2longlong` /
+                // `longlong2float`.  Any other pair of equal-size
+                // same-bank types is the bank's ordinary copy (`same_as`),
+                // including `u8 -> #[repr(u8)]` fieldless enums: the enum
                 // is already modelled as its integer tag by
                 // `tyref_to_value_type`, and its `TypeDecl` layout supplies
                 // the matching one-byte size.  A bank crossing or an unknown
@@ -9172,26 +9440,51 @@ impl<'a> Lowering<'a> {
                         fd.item_meta.name_path().as_str(),
                         "core::intrinsics::transmute" | "core::mem::transmute"
                     )
-                    && first_arg_ty.as_ref().is_some_and(|src_ty| {
-                        transmute_is_same_layout_bank(src_ty, &call.dest.ty, self.llbc)
-                    })
                 {
-                    let res = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(res.clone()),
-                        kind: OpKind::UnaryOp {
-                            op: "same_as".to_string(),
-                            operand: args[0].clone(),
-                            result_ty: result_ty.clone(),
-                        },
-                    });
-                    self.local_var[dest_local] = Some(res);
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
+                    if first_arg_ty.as_ref().is_some_and(|src| {
+                        self.tyref_literal_float_atom(src) == Some("F64")
+                            && self.tyref_literal_int_atom(&call.dest.ty) == Some("I64")
+                    }) {
+                        return self.emit_float_bytes_llop(
+                            mir_bb,
+                            dest_local,
+                            target,
+                            args[0].clone(),
+                            false,
+                        );
+                    }
+                    if first_arg_ty.as_ref().is_some_and(|src| {
+                        self.tyref_literal_int_atom(src) == Some("I64")
+                            && self.tyref_literal_float_atom(&call.dest.ty) == Some("F64")
+                    }) {
+                        return self.emit_float_bytes_llop(
+                            mir_bb,
+                            dest_local,
+                            target,
+                            args[0].clone(),
+                            true,
+                        );
+                    }
+                    if first_arg_ty.as_ref().is_some_and(|src_ty| {
+                        transmute_is_same_layout_bank(src_ty, &call.dest.ty, self.llbc)
+                    }) {
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind: OpKind::UnaryOp {
+                                op: "same_as".to_string(),
+                                operand: args[0].clone(),
+                                result_ty: result_ty.clone(),
+                            },
+                        });
+                        self.local_var[dest_local] = Some(res);
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
                 }
                 // `we_are_jitted()` is true during tracing and blackholing
                 // (rlib/jit.py:355-358); the rtyper folds the surviving
@@ -9441,7 +9734,8 @@ impl<'a> Lowering<'a> {
                 // unregistered clone/to_owned/to_string.
                 if args.len() == 1
                     && (self.is_to_string_identity(&reg, first_arg_ty.as_ref())
-                        || self.is_string_clone_identity(&reg, first_arg_ty.as_ref()))
+                        || self.is_string_clone_identity(&reg, first_arg_ty.as_ref())
+                        || self.is_copy_scalar_or_thin_ptr_clone(&reg, first_arg_ty.as_ref()))
                     // A `Wtf8::to_wtf8_buf` that defines a proven mutable
                     // accumulator is not the ordinary immutable-string copy
                     // this identity arm models.  Its later `push*` calls and
@@ -9456,6 +9750,104 @@ impl<'a> Lowering<'a> {
                         && is_builder_mode_accumulator(self.body, self.llbc, dest_local))
                 {
                     self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `T::default()` for a Copy scalar or thin-pointer `T` is the
+                // zero of that kind — an RPython constant, not a residual
+                // `core` body.
+                if args.is_empty()
+                    && self.is_scalar_or_ptr_default(&reg, &call.dest.ty)
+                    && let Some(zero) = self.emit_zero_constant_of_ty(bb_id, &call.dest.ty)
+                {
+                    self.local_var[dest_local] = Some(zero);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `<*mut T>::add` / `<*const T>::add` is `raw_ptradd` scaled
+                // by the pointee size (`rewrite_op_direct_ptradd`).  The
+                // pointer is a Ref at this layer, so take the address
+                // integer first — otherwise the add assembles as
+                // `int_add/ri>i`, an opname with no blackhole handler.
+                if args.len() == 2
+                    && let Some(pointee_size) =
+                        self.ptr_add_pointee_size(&reg, first_arg_ty.as_ref())
+                {
+                    let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
+                        let res =
+                            graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind,
+                        });
+                        res
+                    };
+                    let offset = if pointee_size == 0 {
+                        args[0].clone()
+                    } else {
+                        let addr = push_cast_ptr_to_int(&mut self.graph, bb_id, args[0].clone());
+                        self.cast_ptr_to_int_src
+                            .insert(addr.clone(), args[0].clone());
+                        let rhs = if pointee_size == 1 {
+                            args[1].clone()
+                        } else {
+                            let scale = push_op(&mut self.graph, OpKind::ConstInt(pointee_size));
+                            push_op(
+                                &mut self.graph,
+                                OpKind::BinOp {
+                                    op: "mul".to_string(),
+                                    lhs: args[1].clone(),
+                                    rhs: scale,
+                                    result_ty: ValueType::Int,
+                                },
+                            )
+                        };
+                        push_op(
+                            &mut self.graph,
+                            OpKind::BinOp {
+                                op: "add".to_string(),
+                                lhs: addr,
+                                rhs,
+                                result_ty: ValueType::Int,
+                            },
+                        )
+                    };
+                    self.local_var[dest_local] = Some(offset);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `core::ptr::write` of a Copy scalar or thin pointer is a
+                // raw store into the already-allocated object.  An aggregate
+                // write is left for `lower_struct_ptr_writes`.
+                if args.len() == 2
+                    && let Some((item_ty, itemsize, is_item_signed)) =
+                        self.ptr_write_store_descr(&reg, second_arg_ty.as_ref())
+                {
+                    let offset = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(offset.clone()),
+                        kind: OpKind::ConstInt(0),
+                    });
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: None,
+                        kind: OpKind::RawStore {
+                            base: args[0].clone(),
+                            offset,
+                            value: args[1].clone(),
+                            item_ty,
+                            itemsize,
+                            is_item_signed,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(self.emit_unit(bb_id));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -10780,43 +11172,85 @@ impl<'a> Lowering<'a> {
                 // `longlong2float.longlong2float(bits)`: reinterpret the integer
                 // bit pattern as an f64 instead of following the opaque core body.
                 if args.len() == 1 && self.is_f64_from_bits(&reg) {
-                    let res = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(res.clone()),
-                        kind: OpKind::Call {
-                            target: CallTarget::FunctionPath {
-                                segments: vec![
-                                    "longlong2float".to_string(),
-                                    "longlong2float".to_string(),
-                                ],
-                            },
-                            args: crate::model::call_args(vec![args[0].clone()]),
-                            result_ty: ValueType::Float,
-                        },
-                    });
-                    self.local_var[dest_local] = Some(res);
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
+                    return self.emit_longlong2float_call(
+                        mir_bb,
+                        dest_local,
+                        target,
+                        args[0].clone(),
+                        true,
+                    );
                 }
                 // `f64::to_bits(x)` is `longlong2float.float2longlong(x)`.
                 if args.len() == 1 && self.is_f64_to_bits(&reg) {
+                    return self.emit_longlong2float_call(
+                        mir_bb,
+                        dest_local,
+                        target,
+                        args[0].clone(),
+                        false,
+                    );
+                }
+                // Host llops spelled as calls: `pyre_*::longlong2float::*`
+                // (`Float2LongLongEntry.specialize_call` /
+                // `LongLong2FloatEntry.specialize_call`) and
+                // `*::lltype::cast_{ptr_to_int,int_to_ptr}`
+                // (`rewrite_op_cast_ptr_to_int`). Exact trailing
+                // segments plus banks; a look-alike module or leaf
+                // stays residual.
+                if args.len() == 1
+                    && let CallKind::Fun(FunId::Regular { id }) = &reg.kind
+                    && let Some(fd) = self.llbc.fn_by_id(*id)
+                {
+                    let path = fd.item_meta.name_path();
+                    let src = first_arg_ty
+                        .as_ref()
+                        .map(|ty| tyref_to_value_type(ty, self.llbc));
+                    let dst = tyref_to_value_type(&call.dest.ty, self.llbc);
+                    if let Some(to_float) = host_longlong2float_llop(&path, src.as_ref(), &dst) {
+                        return self.emit_float_bytes_llop(
+                            mir_bb,
+                            dest_local,
+                            target,
+                            args[0].clone(),
+                            to_float,
+                        );
+                    }
+                    if let Some((op, result_ty)) = host_lltype_cast_llop(&path, src.as_ref(), &dst)
+                    {
+                        if op == "cast_int_to_ptr"
+                            && let Some(orig) = self.cast_ptr_to_int_src.get(&args[0]).cloned()
+                        {
+                            self.local_var[dest_local] = Some(orig);
+                            let target_bb = self.block_id[target];
+                            let link_args = self.edge_args(mir_bb, target)?;
+                            self.graph.set_goto(bb_id, target_bb, link_args);
+                            return Ok(());
+                        }
+                        return self.emit_host_cast_llop(
+                            mir_bb,
+                            dest_local,
+                            target,
+                            args[0].clone(),
+                            op,
+                            result_ty,
+                        );
+                    }
+                }
+                // `f64::to_int_unchecked::<i64>(x)` is `cast_float_to_int`.
+                // Truncation toward zero, undefined outside the signed
+                // range — the same contract as the llop.  A saturating
+                // `as i64` helper is not this spelling and stays residual.
+                if args.len() == 1
+                    && self.is_f64_to_int_unchecked_i64(&reg, &call.dest.ty, first_arg_ty.as_ref())
+                {
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
-                        kind: OpKind::Call {
-                            target: CallTarget::FunctionPath {
-                                segments: vec![
-                                    "longlong2float".to_string(),
-                                    "float2longlong".to_string(),
-                                ],
-                            },
-                            args: crate::model::call_args(vec![args[0].clone()]),
+                        kind: OpKind::UnaryOp {
+                            op: "cast_float_to_int".to_string(),
+                            operand: args[0].clone(),
                             result_ty: ValueType::Int,
                         },
                     });
@@ -11220,6 +11654,21 @@ impl<'a> Lowering<'a> {
                 // allocation, not an alias of the source.)
                 let (segments, method_hint) = if args.len() == 1 && is_slice_to_vec(&segments) {
                     (vec!["list".to_string()], None)
+                } else if args.is_empty() && is_alloc_vec_new_segments(&segments) {
+                    // `Vec::new()` is the empty-list constructor.  Retarget
+                    // onto the `vec::Vec::new` path `flowspace_adapter`
+                    // already rewrites to `newlist()` / `ll_newemptylist`.
+                    (
+                        vec!["vec".to_string(), "Vec".to_string(), "new".to_string()],
+                        None,
+                    )
+                } else if args.len() == 2 && is_alloc_vec_push_segments(&segments) {
+                    // `Vec::push` is list append.  The adapter already maps
+                    // `vec::Vec::push` onto `getattr(recv, "append")`.
+                    (
+                        vec!["vec".to_string(), "Vec".to_string(), "push".to_string()],
+                        None,
+                    )
                 } else if args.len() == 2
                     && is_vec_extend_segments(&segments)
                     && second_arg_ty
@@ -12884,9 +13333,14 @@ impl<'a> Lowering<'a> {
         } = &op_kind
             && args.len() == 1
             && name == "branch"
-            && let Some(site) = self.recognize_option_try_site(first_arg_ty.as_ref(), &result_var)
         {
-            self.option_try_sites.push(site);
+            if let Some(site) = self.recognize_option_try_site(first_arg_ty.as_ref(), &result_var) {
+                self.option_try_sites.push(site);
+            } else if let Some(site) =
+                self.recognize_result_try_site(first_arg_ty.as_ref(), &result_var)
+            {
+                self.result_try_sites.push(site);
+            }
         }
         // Capture `bool::then(cond, closure_env)` sites for the
         // short-circuit `Option` diamond `front::bool_then` synthesizes.
@@ -13251,6 +13705,34 @@ impl<'a> Lowering<'a> {
             )
         {
             self.closure_select_sites.push(site);
+        }
+        // Discriminant-switch combinators whose opaque core body is an
+        // if/else on the receiver tag (plus `call_once` of a closure
+        // argument when there is one).  Option `map`/`and_then`/
+        // `unwrap_or_else`/`or_else`/`is_some_and` already have their own
+        // capture above; this records the remaining Option/Result methods
+        // whose semantics are the same shape.
+        if let OpKind::Call {
+            target: CallTarget::Method { name, .. },
+            args,
+            ..
+        } = &op_kind
+            && let Some(kind) = DiscCombinator::from_method(
+                name,
+                args.len(),
+                callee_name_path.as_deref(),
+                first_arg_ty.as_ref(),
+                self.llbc,
+            )
+            && let Some(site) = self.recognize_disc_combinator_site(
+                kind,
+                first_arg_ty.as_ref(),
+                second_arg_ty.as_ref(),
+                &call.dest.ty,
+                &result_var,
+            )
+        {
+            self.disc_combinator_sites.push(site);
         }
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result_var.clone()),
@@ -14407,6 +14889,115 @@ impl<'a> Lowering<'a> {
         first_arg_ty.is_some_and(|ty| tyref_is_string_value(ty, self.llbc))
     }
 
+    /// `core::clone::impls::<Impl>::clone` on a Copy scalar or thin-pointer
+    /// pointee is the value itself.  A non-Copy clone (Vec, a named struct)
+    /// keeps its ordinary residual call: the path is not enough.
+    fn is_copy_scalar_or_thin_ptr_clone(
+        &self,
+        reg: &RegularCall,
+        first_arg_ty: Option<&TyRef>,
+    ) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        if !is_core_clone_impls_clone_path(fd.item_meta.name_path().as_str()) {
+            return false;
+        }
+        first_arg_ty
+            .and_then(|ty| tyref_clone_pointee_node(ty, self.llbc))
+            .is_some_and(|pointee| json_ty_is_copy_scalar_or_thin_ptr(pointee, self.llbc))
+    }
+
+    /// `core::default::<Impl>::default` / `core::ptr::mut_ptr::<Impl>::default`
+    /// for a scalar or thin-pointer destination: the zero of that kind.
+    fn is_scalar_or_ptr_default(&self, reg: &RegularCall, dest_ty: &TyRef) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        is_core_default_path(fd.item_meta.name_path().as_str())
+            && tyref_is_copy_scalar_or_thin_ptr(dest_ty, self.llbc)
+    }
+
+    /// `<*mut T>::add` / `<*const T>::add` when the pointee has a known
+    /// byte size, so the existing `raw_ptradd` / `direct_ptradd` scaling
+    /// can run at the callsite.
+    fn ptr_add_pointee_size(&self, reg: &RegularCall, first_arg_ty: Option<&TyRef>) -> Option<i64> {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return None;
+        };
+        let fd = self.llbc.fn_by_id(*id)?;
+        if !is_core_ptr_add_path(fd.item_meta.name_path().as_str()) {
+            return None;
+        }
+        let pointee = first_arg_ty.and_then(|ty| {
+            tyref_peel_one_raw_ptr_node(ty, self.llbc)
+                .or_else(|| tyref_peel_one_ref_node(ty, self.llbc))
+        })?;
+        json_ty_byte_size(pointee, self.llbc)
+    }
+
+    /// `core::ptr::write` of a Copy scalar or thin pointer.  An aggregate
+    /// write stays a residual call so `lower_struct_ptr_writes` can still
+    /// turn a constructor-shaped operand into field stores.
+    fn ptr_write_store_descr(
+        &self,
+        reg: &RegularCall,
+        value_ty: Option<&TyRef>,
+    ) -> Option<(ValueType, usize, bool)> {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return None;
+        };
+        let fd = self.llbc.fn_by_id(*id)?;
+        if !is_core_ptr_write_path(fd.item_meta.name_path().as_str()) {
+            return None;
+        }
+        let ty = value_ty?;
+        if !tyref_is_copy_scalar_or_thin_ptr(ty, self.llbc) {
+            return None;
+        }
+        json_ty_raw_store_descr(tyref_node(ty, self.llbc)?, self.llbc)
+    }
+
+    fn emit_zero_constant_of_ty(&mut self, bb_id: BlockId, dest_ty: &TyRef) -> Option<Variable> {
+        if !tyref_is_copy_scalar_or_thin_ptr(dest_ty, self.llbc) {
+            return None;
+        }
+        let node = tyref_node(dest_ty, self.llbc)
+            .and_then(|node| strip_ty_indirections(node, self.llbc))?;
+        let kind = if json_ty_is_thin_pointer_element(node, self.llbc) {
+            OpKind::ConstRefNull
+        } else {
+            match tyref_to_value_type(dest_ty, self.llbc) {
+                ValueType::Int => OpKind::ConstInt(0),
+                ValueType::Unsigned => OpKind::ConstUInt(0),
+                ValueType::Bool => OpKind::ConstBool(false),
+                ValueType::Float => OpKind::ConstFloat(0),
+                ValueType::SingleFloat => OpKind::ConstSingleFloat(0),
+                ValueType::Int128 => OpKind::ConstInt128(0),
+                ValueType::UInt128 => OpKind::ConstUInt128(0),
+                ValueType::Ref(_) | ValueType::Str => OpKind::ConstRefNull,
+                ValueType::Void => OpKind::ConstNone,
+                ValueType::StringBuilder | ValueType::State | ValueType::Unknown => {
+                    return None;
+                }
+            }
+        };
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind,
+        });
+        Some(res)
+    }
+
     /// `pyre_object::gc_storage::gc_alloc_storage_box::<Wtf8Buf>` is the
     /// physical Rust owner for a value that the translated model already
     /// represents as one RPython string.  Admit only the exact string-family
@@ -15146,30 +15737,173 @@ impl<'a> Lowering<'a> {
     /// Its rtyper specialization emits `convert_longlong_bytes_to_float`, the
     /// exact inverse of `float2longlong`.
     fn is_f64_from_bits(&self, reg: &RegularCall) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        self.llbc.fn_by_id(*id).is_some_and(|fd| {
-            let path = fd.item_meta.name_path();
-            path == "core::f64::<Impl>::from_bits"
-                || path == "std::f64::<Impl>::from_bits"
-                || path.ends_with("::from_bits")
-                || path.contains("from_bits")
-        })
+        self.f64_inherent_method(reg, "from_bits")
     }
 
     /// `f64::to_bits(self)` — the reverse of [`is_f64_from_bits`].
     fn is_f64_to_bits(&self, reg: &RegularCall) -> bool {
+        self.f64_inherent_method(reg, "to_bits")
+    }
+
+    /// Inherent `f64` method at `core::f64::<Impl>::{method}` (or `std::`).
+    fn f64_inherent_method(&self, reg: &RegularCall, method: &str) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
             let path = fd.item_meta.name_path();
-            path == "core::f64::<Impl>::to_bits"
-                || path == "std::f64::<Impl>::to_bits"
-                || path.ends_with("::to_bits")
-                || path.contains("to_bits")
+            path.strip_prefix("core::f64::<Impl>::")
+                .or_else(|| path.strip_prefix("std::f64::<Impl>::"))
+                == Some(method)
         })
+    }
+
+    /// `f64::to_int_unchecked::<i64>` — truncation toward zero, undefined
+    /// outside the signed range, which is `cast_float_to_int`.  An i128
+    /// dest, an f32 receiver, or a saturating `as` helper is not this
+    /// spelling.
+    fn is_f64_to_int_unchecked_i64(
+        &self,
+        reg: &RegularCall,
+        dest_ty: &TyRef,
+        first_arg_ty: Option<&TyRef>,
+    ) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        if self.tyref_literal_int_atom(dest_ty) != Some("I64") {
+            return false;
+        }
+        let path = fd.item_meta.name_path();
+        match path.as_str() {
+            "core::f64::<Impl>::to_int_unchecked" | "std::f64::<Impl>::to_int_unchecked" => true,
+            "core::convert::num::<Impl>::to_int_unchecked"
+            | "core::convert::num::FloatToInt::to_int_unchecked" => {
+                first_arg_ty.is_some_and(|ty| self.tyref_literal_float_atom(ty) == Some("F64"))
+            }
+            _ => false,
+        }
+    }
+
+    /// `transmute::<f64, i64>` / `transmute::<i64, f64>` is the same
+    /// bitcast as `float2longlong` / `longlong2float`.  Emit the llop
+    /// itself so a leaf the walker descends does not residualize a
+    /// typed call.
+    fn emit_float_bytes_llop(
+        &mut self,
+        mir_bb: usize,
+        dest_local: usize,
+        target: usize,
+        operand: crate::flowspace::model::Variable,
+        to_float: bool,
+    ) -> Result<(), LowerError> {
+        let bb_id = self.block_id[mir_bb];
+        let (op, result_ty) = if to_float {
+            ("convert_longlong_bytes_to_float", ValueType::Float)
+        } else {
+            ("convert_float_bytes_to_longlong", ValueType::Int)
+        };
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::UnaryOp {
+                op: op.to_string(),
+                operand,
+                result_ty,
+            },
+        });
+        self.local_var[dest_local] = Some(res);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(())
+    }
+
+    /// `lltype.cast_ptr_to_int` / `cast_int_to_ptr` as the unary llop
+    /// `rewrite_op_cast_ptr_to_int` keeps, not a residual call.
+    fn emit_host_cast_llop(
+        &mut self,
+        mir_bb: usize,
+        dest_local: usize,
+        target: usize,
+        operand: crate::flowspace::model::Variable,
+        op: &str,
+        result_ty: ValueType,
+    ) -> Result<(), LowerError> {
+        let bb_id = self.block_id[mir_bb];
+        let concretetype = if op == "cast_int_to_ptr" {
+            crate::model::ConcreteType::GcRef
+        } else {
+            crate::model::ConcreteType::Signed
+        };
+        let res = self.graph.alloc_value_var_with_type(concretetype);
+        FunctionGraph::set_concretetype_of_inline(
+            &operand,
+            if op == "cast_int_to_ptr" {
+                crate::model::ConcreteType::Signed
+            } else {
+                crate::model::ConcreteType::GcRef
+            },
+        );
+        if op == "cast_ptr_to_int" {
+            self.cast_ptr_to_int_src
+                .insert(res.clone(), operand.clone());
+        }
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::UnaryOp {
+                op: op.to_string(),
+                operand,
+                result_ty,
+            },
+        });
+        self.local_var[dest_local] = Some(res);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(())
+    }
+
+    /// Rewrite a 64-bit float/int bitcast to the `longlong2float` pair.
+    /// `to_float` is `longlong2float.longlong2float`; otherwise
+    /// `longlong2float.float2longlong`.
+    fn emit_longlong2float_call(
+        &mut self,
+        mir_bb: usize,
+        dest_local: usize,
+        target: usize,
+        operand: crate::flowspace::model::Variable,
+        to_float: bool,
+    ) -> Result<(), LowerError> {
+        let bb_id = self.block_id[mir_bb];
+        let (leaf, result_ty) = if to_float {
+            ("longlong2float", ValueType::Float)
+        } else {
+            ("float2longlong", ValueType::Int)
+        };
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["longlong2float".to_string(), leaf.to_string()],
+                },
+                args: crate::model::call_args(vec![operand]),
+                result_ty,
+            },
+        });
+        self.local_var[dest_local] = Some(res);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(())
     }
 
     /// `f64::is_sign_negative(self)` — `core` has no graph body (Opaque), so the
@@ -16487,6 +17221,292 @@ impl<'a> Lowering<'a> {
         })
     }
 
+    /// Resolve `Try::branch(res)` where `res: Result<T, E>` and `E` is not the
+    /// exception carrier.  Carrier Results stay on `result_exc`; a miss here
+    /// leaves the residual `branch` call.
+    fn recognize_result_try_site(
+        &self,
+        recv_ty: Option<&TyRef>,
+        result_var: &Variable,
+    ) -> Option<ResultTrySite> {
+        let recv_ty = self.peel_to_option_or_result(recv_ty?)?;
+        if !crate::front::result_exc::tyref_is_result(&recv_ty, self.llbc)
+            || crate::front::result_exc::tyref_is_result_of_carrier(
+                &recv_ty,
+                self.llbc,
+                self.static_addrs.error_carrier,
+            )
+        {
+            return None;
+        }
+        let (result_owner, ok_owner, err_owner, ok_ty, err_ty, err_class) =
+            self.resolve_result_owners(&recv_ty)?;
+        Some(ResultTrySite {
+            branch_result_var: result_var.clone(),
+            result_owner,
+            ok_owner,
+            err_owner,
+            ok_ty,
+            err_ty,
+            err_class,
+            recv_err_ast: crate::front::result_exc::tyref_result_err(&recv_ty, self.llbc)
+                .map(|ty| tyref_to_ast_string(&ty, self.llbc))
+                .unwrap_or_default(),
+        })
+    }
+
+    fn resolve_result_return_owners(&self, output_ty: &TyRef) -> Option<ResultTryReturnOwners> {
+        let output_ty = self.peel_to_option_or_result(output_ty)?;
+        if !crate::front::result_exc::tyref_is_result(&output_ty, self.llbc) {
+            return None;
+        }
+        let (result_owner, _ok_owner, err_owner, _ok_ty, err_ty, _err_class) =
+            self.resolve_result_owners(&output_ty)?;
+        Some(ResultTryReturnOwners {
+            result_owner,
+            err_owner,
+            err_ty,
+            err_ast: crate::front::result_exc::tyref_result_err(&output_ty, self.llbc)
+                .map(|ty| tyref_to_ast_string(&ty, self.llbc))
+                .unwrap_or_default(),
+        })
+    }
+
+    fn resolve_result_owners(
+        &self,
+        ty: &TyRef,
+    ) -> Option<(String, String, String, ValueType, ValueType, Option<String>)> {
+        let ok_tyref = crate::front::result_exc::tyref_result_ok(ty, self.llbc)?;
+        let err_tyref = crate::front::result_exc::tyref_result_err(ty, self.llbc)?;
+        let def_id = self.tyref_adt_def_id(ty)?;
+        let td = self.llbc.type_by_id(def_id)?;
+        let result_owner = format!(
+            "{}{}",
+            td.item_meta.name_path(),
+            tyref_enum_instantiation_suffix(ty, self.llbc)
+        );
+        let ok_owner = Self::tagged_pair_payload_owner(td, &result_owner, 0)?;
+        let err_owner = Self::tagged_pair_payload_owner(td, &result_owner, 1)?;
+        Some((
+            result_owner,
+            ok_owner,
+            err_owner,
+            tyref_enum_payload_value_type(&ok_tyref, self.llbc),
+            tyref_enum_payload_value_type(&err_tyref, self.llbc),
+            enum_payload_instance_class_root(&err_tyref, self.llbc),
+        ))
+    }
+
+    fn peel_to_option_or_result(&self, ty: &TyRef) -> Option<TyRef> {
+        let peeled = self
+            .tyref_peel_ref_to_pointee(ty)
+            .unwrap_or_else(|| clone_tyref(ty));
+        if crate::front::result_exc::tyref_is_option(&peeled, self.llbc)
+            || crate::front::result_exc::tyref_is_result(&peeled, self.llbc)
+        {
+            Some(peeled)
+        } else {
+            None
+        }
+    }
+
+    fn recognize_disc_combinator_site(
+        &self,
+        kind: DiscCombinator,
+        recv_ty: Option<&TyRef>,
+        env_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+        result_var: &Variable,
+    ) -> Option<DiscCombinatorSite> {
+        let recv_ty = self.peel_to_option_or_result(recv_ty?)?;
+        let is_option = crate::front::result_exc::tyref_is_option(&recv_ty, self.llbc);
+        let is_result = crate::front::result_exc::tyref_is_result(&recv_ty, self.llbc);
+        match kind {
+            DiscCombinator::OptionFilter | DiscCombinator::OptionOkOr if !is_option => {
+                return None;
+            }
+            DiscCombinator::ResultMap
+            | DiscCombinator::ResultAndThen
+            | DiscCombinator::ResultUnwrapOrElse
+            | DiscCombinator::ResultOrElse
+            | DiscCombinator::ResultOk
+            | DiscCombinator::ResultErr
+            | DiscCombinator::ResultIsOk
+            | DiscCombinator::ResultIsErr
+                if !is_result =>
+            {
+                return None;
+            }
+            _ => {}
+        }
+        if is_result
+            && crate::front::result_exc::tyref_is_result_of_carrier(
+                &recv_ty,
+                self.llbc,
+                self.static_addrs.error_carrier,
+            )
+            && matches!(
+                kind,
+                DiscCombinator::ResultUnwrapOrElse
+                    | DiscCombinator::ResultOrElse
+                    | DiscCombinator::ResultOk
+                    | DiscCombinator::ResultErr
+            )
+        {
+            // Carrier Results whose combinator would rebuild a Result shell
+            // are `result_exc`'s domain.  `map`/`and_then` still lower: the
+            // post-pass handles the LastException form `result_exc` leaves.
+            return None;
+        }
+
+        let mut site = DiscCombinatorSite {
+            kind,
+            result_var: result_var.clone(),
+            recv_owner: String::new(),
+            recv_tag0_owner: String::new(),
+            recv_tag1_owner: String::new(),
+            payload0_ty: ValueType::Ref(None),
+            payload1_ty: ValueType::Ref(None),
+            payload0_class: None,
+            payload1_class: None,
+            result_owner: String::new(),
+            result_tag0_owner: String::new(),
+            result_tag1_owner: String::new(),
+            result_payload0_ty: ValueType::Ref(None),
+            result_payload1_ty: ValueType::Ref(None),
+            result_payload0_class: None,
+            result_payload1_class: None,
+            call_once_owner: String::new(),
+            args_tuple_suffix: String::new(),
+            call_result_ty: ValueType::Ref(None),
+            call_result_class: None,
+        };
+
+        if is_option {
+            let (option_owner, some_owner, payload_ty) =
+                self.resolve_option_consumer_owners(&recv_ty)?;
+            site.recv_owner = option_owner;
+            site.recv_tag1_owner = some_owner;
+            site.payload1_ty = payload_ty;
+            site.payload1_class = self.option_payload_instance_class_root(&recv_ty);
+        } else {
+            let (owner, ok_owner, err_owner, ok_ty, err_ty, err_class) =
+                self.resolve_result_owners(&recv_ty)?;
+            site.recv_owner = owner;
+            site.recv_tag0_owner = ok_owner;
+            site.recv_tag1_owner = err_owner;
+            site.payload0_ty = ok_ty;
+            site.payload1_ty = err_ty;
+            site.payload0_class = crate::front::result_exc::tyref_result_ok(&recv_ty, self.llbc)
+                .and_then(|ty| enum_payload_instance_class_root(&ty, self.llbc));
+            site.payload1_class = err_class;
+        }
+
+        if kind.needs_closure() {
+            let env_def_id = self.tyref_ref_adt_def_id(env_ty?)?;
+            site.call_once_owner = self.llbc.type_by_id(env_def_id)?.item_meta.name_path();
+        }
+
+        match kind {
+            DiscCombinator::OptionFilter => {
+                let (option_owner, some_owner, payload_ty) =
+                    self.resolve_option_consumer_owners(dest_ty)?;
+                site.result_owner = option_owner;
+                site.result_tag1_owner = some_owner;
+                site.result_payload1_ty = payload_ty;
+                site.result_payload1_class = self.option_payload_instance_class_root(dest_ty);
+                site.call_result_ty = ValueType::Bool;
+                site.args_tuple_suffix = option_payload_tuple_suffix(&recv_ty, self.llbc);
+            }
+            DiscCombinator::OptionOkOr => {
+                let dest = self.peel_to_option_or_result(dest_ty)?;
+                let (owner, ok_owner, err_owner, ok_ty, err_ty, _err_class) =
+                    self.resolve_result_owners(&dest)?;
+                site.result_owner = owner;
+                site.result_tag0_owner = ok_owner;
+                site.result_tag1_owner = err_owner;
+                site.result_payload0_ty = ok_ty;
+                site.result_payload1_ty = err_ty;
+                site.result_payload0_class = site.payload1_class.clone();
+                site.result_payload1_class = env_ty
+                    .and_then(|ty| {
+                        self.tyref_peel_ref_to_pointee(ty)
+                            .or_else(|| Some(clone_tyref(ty)))
+                    })
+                    .and_then(|ty| enum_payload_instance_class_root(&ty, self.llbc));
+            }
+            DiscCombinator::ResultMap | DiscCombinator::ResultAndThen => {
+                let dest = self.peel_to_option_or_result(dest_ty)?;
+                if !crate::front::result_exc::tyref_is_result(&dest, self.llbc) {
+                    return None;
+                }
+                let (owner, ok_owner, err_owner, ok_ty, err_ty, err_class) =
+                    self.resolve_result_owners(&dest)?;
+                site.result_owner = owner;
+                site.result_tag0_owner = ok_owner;
+                site.result_tag1_owner = err_owner;
+                site.result_payload0_ty = ok_ty.clone();
+                site.result_payload1_ty = err_ty;
+                site.result_payload1_class = err_class;
+                if kind == DiscCombinator::ResultMap {
+                    site.call_result_ty = ok_ty;
+                    site.call_result_class =
+                        crate::front::result_exc::tyref_result_ok(&dest, self.llbc)
+                            .and_then(|ty| enum_payload_instance_class_root(&ty, self.llbc));
+                    site.result_payload0_class = site.call_result_class.clone();
+                    site.args_tuple_suffix =
+                        crate::front::result_exc::tyref_result_ok(&recv_ty, self.llbc)
+                            .map(|ty| payload_tuple_suffix(&ty, self.llbc))
+                            .unwrap_or_default();
+                } else {
+                    site.call_result_ty = tyref_to_value_type(&dest, self.llbc);
+                    site.args_tuple_suffix =
+                        crate::front::result_exc::tyref_result_ok(&recv_ty, self.llbc)
+                            .map(|ty| payload_tuple_suffix(&ty, self.llbc))
+                            .unwrap_or_default();
+                }
+            }
+            DiscCombinator::ResultUnwrapOrElse => {
+                site.call_result_ty = tyref_to_value_type(dest_ty, self.llbc);
+                site.args_tuple_suffix =
+                    crate::front::result_exc::tyref_result_err(&recv_ty, self.llbc)
+                        .map(|ty| payload_tuple_suffix(&ty, self.llbc))
+                        .unwrap_or_default();
+            }
+            DiscCombinator::ResultOrElse => {
+                let dest = self.peel_to_option_or_result(dest_ty)?;
+                let (owner, ok_owner, err_owner, ok_ty, err_ty, err_class) =
+                    self.resolve_result_owners(&dest)?;
+                site.result_owner = owner;
+                site.result_tag0_owner = ok_owner;
+                site.result_tag1_owner = err_owner;
+                site.result_payload0_ty = ok_ty;
+                site.result_payload1_ty = err_ty;
+                site.result_payload0_class = site.payload0_class.clone();
+                site.result_payload1_class = err_class;
+                site.call_result_ty = tyref_to_value_type(&dest, self.llbc);
+                site.args_tuple_suffix =
+                    crate::front::result_exc::tyref_result_err(&recv_ty, self.llbc)
+                        .map(|ty| payload_tuple_suffix(&ty, self.llbc))
+                        .unwrap_or_default();
+            }
+            DiscCombinator::ResultOk | DiscCombinator::ResultErr => {
+                let dest = self.peel_to_option_or_result(dest_ty)?;
+                if !crate::front::result_exc::tyref_is_option(&dest, self.llbc) {
+                    return None;
+                }
+                let (option_owner, some_owner, payload_ty) =
+                    self.resolve_option_consumer_owners(&dest)?;
+                site.result_owner = option_owner;
+                site.result_tag1_owner = some_owner;
+                site.result_payload1_ty = payload_ty;
+                site.result_payload1_class = self.option_payload_instance_class_root(&dest);
+            }
+            DiscCombinator::ResultIsOk | DiscCombinator::ResultIsErr => {}
+        }
+        Some(site)
+    }
+
     /// Resolve a recognized `Option::map_or(opt, default, closure)` call into a
     /// [`crate::front::option_map_or::MapOrSite`] — the `Option` enum root +
     /// `Some` variant owners, the closure env's `call_once` owner, the payload
@@ -16800,10 +17820,13 @@ impl<'a> Lowering<'a> {
     ) -> Option<crate::front::option_closure_select::ClosureSelectSite> {
         use crate::front::option_closure_select::ClosureCombinator;
         let recv_ty = recv_ty?;
-        if !crate::front::result_exc::tyref_is_option(recv_ty, self.llbc) {
+        let recv_ty = self
+            .tyref_peel_ref_to_pointee(recv_ty)
+            .unwrap_or_else(|| clone_tyref(recv_ty));
+        if !crate::front::result_exc::tyref_is_option(&recv_ty, self.llbc) {
             return None;
         }
-        let def_id = self.tyref_adt_def_id(recv_ty)?;
+        let def_id = self.tyref_adt_def_id(&recv_ty)?;
         let td = self.llbc.type_by_id(def_id)?;
         // Suffix the enum root with the receiver `Option<X>`'s `<X>` so the
         // per-instantiation root a static `Some(..)` mints is reused here;
@@ -16811,18 +17834,18 @@ impl<'a> Lowering<'a> {
         let option_owner = format!(
             "{}{}",
             td.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(recv_ty, self.llbc)
+            tyref_enum_instantiation_suffix(&recv_ty, self.llbc)
         );
         let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
-        let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
-        let payload_class_root = self.option_payload_instance_class_root(recv_ty);
+        let payload_ty = self.tyref_option_payload_value_type(&recv_ty)?;
+        let payload_class_root = self.option_payload_instance_class_root(&recv_ty);
         let env_def_id = self.tyref_ref_adt_def_id(env_ty?)?;
         let env_td = self.llbc.type_by_id(env_def_id)?;
         let call_once_owner = env_td.item_meta.name_path();
         // The single-element closure-`Args` tuple `(payload,)` the extracted
         // `call_once` reads its `.0` from, keyed to the same `Tuple<X>` leaf
         // the read side derives at `resolve_place`.
-        let args_tuple_suffix = option_payload_tuple_suffix(recv_ty, self.llbc);
+        let args_tuple_suffix = option_payload_tuple_suffix(&recv_ty, self.llbc);
         // The type the closure's `call_once` returns: `map`'s dest is
         // `Option<U>` and its closure returns `U` (the dest payload);
         // `and_then`'s dest is `Option<U>` returned directly; `or_else`'s dest
@@ -16855,9 +17878,9 @@ impl<'a> Lowering<'a> {
                     .unwrap_or(ValueType::Ref(None));
             (suffix, payload_ty)
         });
-        let niche = self.tyref_is_niche_option_ptr(recv_ty);
+        let niche = self.tyref_is_niche_option_ptr(&recv_ty);
         let fieldless_none_tag =
-            tyref_option_fieldless_niche(recv_ty, self.llbc).map(|niche| niche.none_tag);
+            tyref_option_fieldless_niche(&recv_ty, self.llbc).map(|niche| niche.none_tag);
         // `map`/`and_then` BUILD their result `Option<U>`; the other combinators
         // build none.  `U` is the dest payload, not the receiver's `T`, so the
         // built variant must key the dest's own classdef — otherwise two `map`s
@@ -18856,6 +19879,22 @@ impl<'a> Lowering<'a> {
     where
         'a: 't,
     {
+        self.tyref_literal_atom(ty, "Int")
+    }
+
+    /// The `Float` width atom (`"F32"` / `"F64"`) of a float literal type.
+    /// `None` for any non-float-literal type.
+    fn tyref_literal_float_atom<'t>(&self, ty: &'t TyRef) -> Option<&'t str>
+    where
+        'a: 't,
+    {
+        self.tyref_literal_atom(ty, "Float")
+    }
+
+    fn tyref_literal_atom<'t>(&self, ty: &'t TyRef, kind: &str) -> Option<&'t str>
+    where
+        'a: 't,
+    {
         let value = match ty {
             TyRef::Inline { value: (_, v) } => v,
             TyRef::Other(v) => v,
@@ -18865,7 +19904,7 @@ impl<'a> Lowering<'a> {
             .as_object()?
             .get("Literal")?
             .as_object()?
-            .get("Int")?
+            .get(kind)?
             .as_str()
     }
 
@@ -23417,6 +24456,70 @@ fn tyref_deref_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     tyref_to_value_type(&TyRef::Other(node.clone()), llbc)
 }
 
+/// Register-bank kind of an ADT field read.
+///
+/// Prefers the place's post-projection type (generic substitution is
+/// already applied there).  A shell variant peels a shared borrow of a
+/// primitive the way [`tyref_enum_payload_value_type`] does.  A closure-env
+/// field whose declared type is that same borrow is the integer too: the
+/// body reads the capture through the borrow as a scalar (`Rvalue::Ref`
+/// aliases the referent, `resolve_place` collapses `Deref`, and
+/// `Ptr(Signed)` does not exist), so a captured `&usize` is the `usize`.
+/// Without the peel the field stays `Ref` and a later `int_add` assembles
+/// as `int_add/ri>i`.  An ordinary struct's `&P` field is a pointer the
+/// program stores and compares, so it keeps the Ref bank.
+fn adt_field_read_value_type(
+    place_ty: &TyRef,
+    field_ty: &TyRef,
+    container_is_enum: bool,
+    owner_is_closure_env: bool,
+    llbc: &Llbc,
+) -> ValueType {
+    let declared = if container_is_enum {
+        tyref_enum_payload_value_type(place_ty, llbc)
+    } else {
+        tyref_to_value_type(place_ty, llbc)
+    };
+    match declared {
+        ValueType::Ref(None) => {
+            if owner_is_closure_env
+                && let Some(peeled) = tyref_shared_borrow_primitive_value(field_ty, llbc)
+                    .or_else(|| tyref_shared_borrow_primitive_value(place_ty, llbc))
+            {
+                return peeled;
+            }
+            tyref_to_value_type(field_ty, llbc)
+        }
+        resolved => resolved,
+    }
+}
+
+/// Whether `td` is a compiler-generated closure environment.
+///
+/// Charon stamps those with `src: { Closure: … }`; ordinary ADTs are
+/// `"TopLevel"`.  Identified from that origin, never from the `closure` /
+/// `closure#N` name leaf.
+fn type_decl_is_closure_env(td: &TypeDecl) -> bool {
+    td.src
+        .as_ref()
+        .is_some_and(|src| src.get("Closure").is_some())
+}
+
+/// Whether `ty` resolves to a closure-env ADT, after peeling reference
+/// wrappers so a `&self` receiver answers the same as a by-value one.
+fn tyref_is_closure_env(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|node| strip_ty_wrappers(node, llbc))
+        .and_then(adt_node_def_id)
+        .and_then(|def_id| llbc.type_by_id(def_id))
+        .is_some_and(type_decl_is_closure_env)
+}
+
+fn tyref_shared_borrow_primitive_value(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
+    let pointee = tyref_shared_borrow_primitive_pointee(ty, llbc)?;
+    Some(tyref_to_value_type(&TyRef::Other(pointee), llbc))
+}
+
 /// Register-bank kind of an enum variant's payload — `Option<T>`,
 /// `Result<T, E>`, `ControlFlow<T, _>`, `Bound<T>`.
 ///
@@ -24015,6 +25118,24 @@ fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
         return ValueType::Str;
     }
     ValueType::Ref(None)
+}
+
+/// Register-class of a struct field, matching [`tyref_to_attr_value_type`]
+/// except for a closure-env capture whose declared type is a shared borrow
+/// of a primitive: seed that attr as the scalar so FORCE does not install
+/// a Ref class field against an Int-banked getfield.  Ordinary struct
+/// fields of reference type stay `Ref`.
+fn tyref_to_attr_value_type_for_struct_field(
+    ty: &TyRef,
+    owner: &TypeDecl,
+    llbc: &Llbc,
+) -> ValueType {
+    if type_decl_is_closure_env(owner)
+        && let Some(peeled) = tyref_shared_borrow_primitive_value(ty, llbc)
+    {
+        return peeled;
+    }
+    tyref_to_attr_value_type(ty, llbc)
 }
 
 /// The bare leaf name of `ty`'s named-ADT root, after stripping
@@ -24951,6 +26072,155 @@ fn json_ty_is_statically_sized(node: &serde_json::Value, llbc: &Llbc) -> bool {
     // The tuple atom and a named `{"Adt": def_id}`; the `Builtin` ids stay
     // out, so `Slice` and `Str` decline with the top-level spellings.
     id.as_str() == Some("Tuple") || id.as_object().is_some_and(|m| m.contains_key("Adt"))
+}
+
+/// A Copy scalar: a Charon `Literal` integer, float, `bool`, or `char`.
+/// Arrays, tuples, and named ADTs are not scalars even when they are Copy.
+fn json_ty_is_copy_scalar(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    let Some(obj) = strip_ty_indirections(node, llbc).and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    let Some(lit) = obj.get("Literal") else {
+        return false;
+    };
+    if matches!(lit.as_str(), Some("Bool" | "Char")) {
+        return true;
+    }
+    lit.as_object().is_some_and(|lit| {
+        lit.contains_key("Int")
+            || lit.contains_key("UInt")
+            || lit.contains_key("Float")
+            || lit.contains_key("Bool")
+            || lit.contains_key("Char")
+    })
+}
+
+fn json_ty_is_copy_scalar_or_thin_ptr(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    json_ty_is_copy_scalar(node, llbc) || json_ty_is_thin_pointer_element(node, llbc)
+}
+
+fn tyref_peel_one_ref_node<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_json::Value> {
+    let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+    let pointee = node
+        .as_object()?
+        .get("Ref")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.get(1))?;
+    strip_ty_indirections(pointee, llbc)
+}
+
+fn tyref_peel_one_raw_ptr_node<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_json::Value> {
+    let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+    let pointee = node
+        .as_object()?
+        .get("RawPtr")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.first())?;
+    strip_ty_indirections(pointee, llbc)
+}
+
+/// The pointee of `&self` for `Clone::clone`, or the type itself when the
+/// argument is already a by-value Copy scalar / thin pointer.
+fn tyref_clone_pointee_node<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_json::Value> {
+    tyref_peel_one_ref_node(ty, llbc).or_else(|| strip_ty_indirections(tyref_node(ty, llbc)?, llbc))
+}
+
+fn tyref_is_copy_scalar_or_thin_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|node| strip_ty_indirections(node, llbc))
+        .is_some_and(|node| json_ty_is_copy_scalar_or_thin_ptr(node, llbc))
+}
+
+fn json_ty_literal_byte_size(node: &serde_json::Value) -> Option<i64> {
+    let lit = node.as_object()?.get("Literal")?;
+    if lit.as_str() == Some("Bool") {
+        return Some(1);
+    }
+    if lit.as_str() == Some("Char") {
+        return Some(4);
+    }
+    let lit = lit.as_object()?;
+    if lit.contains_key("Bool") {
+        return Some(1);
+    }
+    if lit.contains_key("Char") {
+        return Some(4);
+    }
+    let word = crate::layout::target_word_size() as i64;
+    let int_atom = lit
+        .get("UInt")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| lit.get("Int").and_then(serde_json::Value::as_str));
+    if let Some(atom) = int_atom {
+        return Some(match atom {
+            "U8" | "I8" => 1,
+            "U16" | "I16" => 2,
+            "U32" | "I32" => 4,
+            "U64" | "I64" => 8,
+            "U128" | "I128" => 16,
+            "Usize" | "Isize" => word,
+            _ => return None,
+        });
+    }
+    match lit.get("Float").and_then(serde_json::Value::as_str) {
+        Some("F32") => Some(4),
+        Some("F64") => Some(8),
+        _ => None,
+    }
+}
+
+fn json_ty_byte_size(node: &serde_json::Value, llbc: &Llbc) -> Option<i64> {
+    let node = strip_ty_indirections(node, llbc)?;
+    if json_ty_is_thin_pointer_element(node, llbc) {
+        return Some(crate::layout::target_word_size() as i64);
+    }
+    if let Some(size) = json_ty_literal_byte_size(node) {
+        return Some(size);
+    }
+    let adt = inline_adt_def_id(node)?;
+    let target = std::env::var("TARGET").unwrap_or_default();
+    llbc.type_by_id(adt)?
+        .layout_for_target(&target)?
+        .size
+        .map(|size| size as i64)
+}
+
+fn json_ty_raw_store_descr(
+    node: &serde_json::Value,
+    llbc: &Llbc,
+) -> Option<(ValueType, usize, bool)> {
+    let node = strip_ty_indirections(node, llbc)?;
+    if json_ty_is_thin_pointer_element(node, llbc) {
+        return Some((ValueType::Int, crate::layout::target_word_size(), false));
+    }
+    let size = json_ty_literal_byte_size(node)? as usize;
+    let lit = node.as_object()?.get("Literal")?;
+    if matches!(lit.as_str(), Some("Bool" | "Char")) {
+        return Some((ValueType::Int, size, false));
+    }
+    let lit = lit.as_object()?;
+    if lit.contains_key("Bool") || lit.contains_key("Char") {
+        return Some((ValueType::Int, size, false));
+    }
+    if lit.get("Float").and_then(serde_json::Value::as_str) == Some("F32") {
+        return Some((ValueType::SingleFloat, size, false));
+    }
+    if lit.contains_key("Float") {
+        return Some((ValueType::Float, size, false));
+    }
+    if lit.get("UInt").and_then(serde_json::Value::as_str) == Some("U128") {
+        return Some((ValueType::UInt128, size, false));
+    }
+    if lit.get("Int").and_then(serde_json::Value::as_str) == Some("I128") {
+        return Some((ValueType::Int128, size, true));
+    }
+    if lit.contains_key("UInt") {
+        return Some((ValueType::Unsigned, size, false));
+    }
+    if lit.contains_key("Int") {
+        return Some((ValueType::Int, size, true));
+    }
+    None
 }
 
 /// Does the iterator ADT named by `path` hand back a reference *it* added,
@@ -26922,6 +28192,59 @@ fn path_ends_with_segments(path: &str, key: &str) -> bool {
     path_eq_ignoring_raw(path, key) || path_has_suffix_ignoring_raw(path, key)
 }
 
+fn value_type_is_int_bank(ty: &ValueType) -> bool {
+    matches!(ty, ValueType::Int | ValueType::Unsigned)
+}
+
+/// `rlib/longlong2float.py` `float2longlong` / `longlong2float`.
+/// Trailing segments are exactly `longlong2float::{float2longlong,longlong2float}`
+/// and the banks are f64↔i64; a look-alike module is not this pair.
+fn host_longlong2float_llop(path: &str, src: Option<&ValueType>, dst: &ValueType) -> Option<bool> {
+    let to_float = if path_ends_with_segments(path, "longlong2float::longlong2float") {
+        true
+    } else if path_ends_with_segments(path, "longlong2float::float2longlong") {
+        false
+    } else {
+        return None;
+    };
+    let src_ok = match src {
+        Some(ValueType::Int | ValueType::Unsigned) if to_float => true,
+        Some(ValueType::Float) if !to_float => true,
+        None => true,
+        _ => false,
+    };
+    let dst_ok = if to_float {
+        matches!(dst, ValueType::Float)
+    } else {
+        value_type_is_int_bank(dst)
+    };
+    (src_ok && dst_ok).then_some(to_float)
+}
+
+/// `lltype.cast_ptr_to_int` / `cast_int_to_ptr`. Trailing segments are
+/// exactly `lltype::{cast_ptr_to_int,cast_int_to_ptr}` and the banks are
+/// Ref↔Int; a bare leaf or a look-alike module stays a call.
+fn host_lltype_cast_llop(
+    path: &str,
+    src: Option<&ValueType>,
+    dst: &ValueType,
+) -> Option<(&'static str, ValueType)> {
+    if path_ends_with_segments(path, "lltype::cast_ptr_to_int") {
+        let src_ok = matches!(src, Some(ValueType::Ref(_)) | None);
+        return (src_ok && value_type_is_int_bank(dst))
+            .then_some(("cast_ptr_to_int", ValueType::Int));
+    }
+    if path_ends_with_segments(path, "lltype::cast_int_to_ptr") {
+        let src_ok = match src {
+            Some(ty) => value_type_is_int_bank(ty),
+            None => true,
+        };
+        return (src_ok && matches!(dst, ValueType::Ref(_)))
+            .then_some(("cast_int_to_ptr", dst.clone()));
+    }
+    None
+}
+
 /// Whether an impl-owned global is exactly
 /// `PyreClassPyTypeOf::PYTYPE`.
 ///
@@ -28507,6 +29830,1330 @@ fn is_core_result_map_err_path(path: &str) -> bool {
         path.split("::").collect::<Vec<_>>().as_slice(),
         ["core" | "std", "result", "<Impl>" | "Result", "map_err"]
     )
+}
+
+fn is_core_clone_impls_clone_path(path: &str) -> bool {
+    matches!(
+        path.split("::").collect::<Vec<_>>().as_slice(),
+        ["core", "clone", "impls", "<Impl>", "clone"]
+    )
+}
+
+fn is_core_default_path(path: &str) -> bool {
+    matches!(
+        path.split("::").collect::<Vec<_>>().as_slice(),
+        ["core", "default", "<Impl>", "default"] | ["core", "ptr", "mut_ptr", "<Impl>", "default"]
+    )
+}
+
+fn is_core_ptr_add_path(path: &str) -> bool {
+    matches!(
+        path.split("::").collect::<Vec<_>>().as_slice(),
+        ["core", "ptr", "mut_ptr" | "const_ptr", "<Impl>", "add"]
+    )
+}
+
+fn is_core_ptr_write_path(path: &str) -> bool {
+    path == "core::ptr::write"
+}
+
+fn is_alloc_vec_new_segments(segments: &[String]) -> bool {
+    matches!(
+        segments,
+        [a, b, c, d]
+            if a == "alloc" && b == "vec" && (c == "<Impl>" || c == "Vec") && d == "new"
+    )
+}
+
+fn is_alloc_vec_push_segments(segments: &[String]) -> bool {
+    matches!(
+        segments,
+        [a, b, c, d]
+            if a == "alloc" && b == "vec" && (c == "<Impl>" || c == "Vec") && d == "push"
+    )
+}
+
+fn is_core_option_method(path: &str, leaf: &str) -> bool {
+    matches!(
+        path.split("::").collect::<Vec<_>>().as_slice(),
+        ["core" | "std", "option", "<Impl>" | "Option", method] if *method == leaf
+    )
+}
+
+fn is_core_result_method(path: &str, leaf: &str) -> bool {
+    matches!(
+        path.split("::").collect::<Vec<_>>().as_slice(),
+        ["core" | "std", "result", "<Impl>" | "Result", method] if *method == leaf
+    )
+}
+
+/// Option/Result methods whose body is a discriminant switch, optionally
+/// calling a closure argument.  RPython never has these callees: the same
+/// source is an if/else in the flow graph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiscCombinator {
+    OptionFilter,
+    OptionOkOr,
+    ResultMap,
+    ResultAndThen,
+    ResultUnwrapOrElse,
+    ResultOrElse,
+    ResultOk,
+    ResultErr,
+    ResultIsOk,
+    ResultIsErr,
+}
+
+impl DiscCombinator {
+    fn from_method(
+        name: &str,
+        nargs: usize,
+        callee_path: Option<&str>,
+        recv_ty: Option<&TyRef>,
+        llbc: &Llbc,
+    ) -> Option<Self> {
+        let path = callee_path?;
+        let _ = (recv_ty, llbc);
+        match (name, nargs) {
+            ("filter", 2) if is_core_option_method(path, "filter") => Some(Self::OptionFilter),
+            ("ok_or", 2) if is_core_option_method(path, "ok_or") => Some(Self::OptionOkOr),
+            ("map", 2) if is_core_result_method(path, "map") => Some(Self::ResultMap),
+            ("and_then", 2) if is_core_result_method(path, "and_then") => Some(Self::ResultAndThen),
+            ("unwrap_or_else", 2) if is_core_result_method(path, "unwrap_or_else") => {
+                Some(Self::ResultUnwrapOrElse)
+            }
+            ("or_else", 2) if is_core_result_method(path, "or_else") => Some(Self::ResultOrElse),
+            ("ok", 1) if is_core_result_method(path, "ok") => Some(Self::ResultOk),
+            ("err", 1) if is_core_result_method(path, "err") => Some(Self::ResultErr),
+            ("is_ok", 1) if is_core_result_method(path, "is_ok") => Some(Self::ResultIsOk),
+            ("is_err", 1) if is_core_result_method(path, "is_err") => Some(Self::ResultIsErr),
+            _ => None,
+        }
+    }
+
+    fn needs_closure(self) -> bool {
+        matches!(
+            self,
+            Self::OptionFilter
+                | Self::ResultMap
+                | Self::ResultAndThen
+                | Self::ResultUnwrapOrElse
+                | Self::ResultOrElse
+        )
+    }
+
+    fn method_name(self) -> &'static str {
+        match self {
+            Self::OptionFilter => "filter",
+            Self::OptionOkOr => "ok_or",
+            Self::ResultMap => "map",
+            Self::ResultAndThen => "and_then",
+            Self::ResultUnwrapOrElse => "unwrap_or_else",
+            Self::ResultOrElse => "or_else",
+            Self::ResultOk => "ok",
+            Self::ResultErr => "err",
+            Self::ResultIsOk => "is_ok",
+            Self::ResultIsErr => "is_err",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct DiscCombinatorSite {
+    kind: DiscCombinator,
+    result_var: Variable,
+    recv_owner: String,
+    recv_tag0_owner: String,
+    recv_tag1_owner: String,
+    payload0_ty: ValueType,
+    payload1_ty: ValueType,
+    payload0_class: Option<String>,
+    payload1_class: Option<String>,
+    result_owner: String,
+    result_tag0_owner: String,
+    result_tag1_owner: String,
+    result_payload0_ty: ValueType,
+    result_payload1_ty: ValueType,
+    result_payload0_class: Option<String>,
+    result_payload1_class: Option<String>,
+    call_once_owner: String,
+    args_tuple_suffix: String,
+    call_result_ty: ValueType,
+    call_result_class: Option<String>,
+}
+
+#[derive(Clone)]
+struct ResultTrySite {
+    branch_result_var: Variable,
+    result_owner: String,
+    ok_owner: String,
+    err_owner: String,
+    ok_ty: ValueType,
+    err_ty: ValueType,
+    err_class: Option<String>,
+    recv_err_ast: String,
+}
+
+#[derive(Clone)]
+struct ResultTryReturnOwners {
+    result_owner: String,
+    err_owner: String,
+    err_ty: ValueType,
+    err_ast: String,
+}
+
+#[derive(Default, Debug, Clone)]
+struct ResultTryStats {
+    rewritten: usize,
+}
+
+fn rewire_disc_combinator_sites(
+    graph: &mut FunctionGraph,
+    sites: &[DiscCombinatorSite],
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> usize {
+    sites
+        .iter()
+        .filter(|site| rewire_one_disc_combinator(graph, site, spec).is_ok())
+        .count()
+}
+
+fn rewire_one_disc_combinator(
+    graph: &mut FunctionGraph,
+    site: &DiscCombinatorSite,
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> Result<(), String> {
+    match site.kind {
+        DiscCombinator::ResultIsOk | DiscCombinator::ResultIsErr => {
+            rewire_result_is_ok_err(graph, site)
+        }
+        _ => rewire_disc_combinator_diamond(graph, site, spec),
+    }
+}
+
+fn locate_combinator_call(
+    graph: &FunctionGraph,
+    result_var: &Variable,
+    method: &str,
+    name: &str,
+) -> Result<(usize, usize, Variable, Vec<Variable>), String> {
+    let a = graph
+        .blocks
+        .iter()
+        .position(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| op.result.as_ref() == Some(result_var))
+        })
+        .ok_or_else(|| format!("{name}: {method} result var has no producer block"))?;
+    let ci = graph.blocks[a]
+        .operations
+        .iter()
+        .position(|op| op.result.as_ref() == Some(result_var))
+        .ok_or_else(|| format!("{name}: {method} call not found in block {a}"))?;
+    let ops_len = graph.blocks[a].operations.len();
+    let flow_result = if ci + 1 == ops_len {
+        result_var.clone()
+    } else if ci + 2 == ops_len {
+        let cast = &graph.blocks[a].operations[ci + 1];
+        match cast.result.as_ref() {
+            Some(narrowed) if crate::model::cast_instance_of(&cast.kind, result_var).is_some() => {
+                narrowed.clone()
+            }
+            _ => {
+                return Err(format!(
+                    "{name}: {method} call is not the last op of block {a}"
+                ));
+            }
+        }
+    } else {
+        return Err(format!(
+            "{name}: {method} call is not the last op of block {a}"
+        ));
+    };
+    let args = match &graph.blocks[a].operations[ci].kind {
+        OpKind::Call {
+            target: CallTarget::Method { name: m, .. },
+            args,
+            ..
+        } if m == method => args.iter().map(|arg| arg.clone().into_variable()).collect(),
+        other => {
+            return Err(format!(
+                "{name}: {method} producer is not a method call: {other:?}"
+            ));
+        }
+    };
+    Ok((a, ci, flow_result, args))
+}
+
+fn rewire_result_is_ok_err(
+    graph: &mut FunctionGraph,
+    site: &DiscCombinatorSite,
+) -> Result<(), String> {
+    let name = graph.name.clone();
+    let method = site.kind.method_name();
+    let (a, ci, flow_result, args) =
+        locate_combinator_call(graph, &site.result_var, method, &name)?;
+    if args.len() != 1 {
+        return Err(format!("{name}: {method} is not a one-arg call"));
+    }
+    if flow_result != site.result_var {
+        return Err(format!("{name}: {method} carried a trailing cast"));
+    }
+    let recv = args[0].clone();
+    let a_id = graph.blocks[a].id;
+    graph.blocks[a].operations.truncate(ci);
+    let disc = emit_enum_disc_read(graph, a_id, recv, &site.recv_owner);
+    let tag = graph
+        .push_op_var(
+            a_id,
+            OpKind::ConstInt(if site.kind == DiscCombinator::ResultIsOk {
+                0
+            } else {
+                1
+            }),
+            true,
+        )
+        .expect("ConstInt produces a value");
+    graph.block_mut(a_id).operations.push(SpaceOperation {
+        result: Some(site.result_var.clone()),
+        kind: OpKind::BinOp {
+            op: "eq".to_string(),
+            lhs: disc,
+            rhs: tag,
+            result_ty: ValueType::Bool,
+        },
+    });
+    Ok(())
+}
+
+fn rewire_disc_combinator_diamond(
+    graph: &mut FunctionGraph,
+    site: &DiscCombinatorSite,
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> Result<(), String> {
+    use crate::front::bool_then::{close_goto_mixed, reproduce_exit_args};
+
+    let name = graph.name.clone();
+    let method = site.kind.method_name();
+    let (a, ci, flow_result, args) =
+        locate_combinator_call(graph, &site.result_var, method, &name)?;
+    let recv = args
+        .first()
+        .cloned()
+        .ok_or_else(|| format!("{name}: {method} missing receiver"))?;
+    let extra = args.get(1).cloned();
+    if site.kind == DiscCombinator::OptionFilter {
+        return rewire_option_filter_diamond(graph, site, a, ci, recv, extra, flow_result, &name);
+    }
+    let exception_lowered = matches!(graph.blocks[a].exitswitch, Some(ExitSwitch::LastException));
+    let [exit] = graph.blocks[a].exits.as_slice() else {
+        if exception_lowered && graph.blocks[a].exits.len() == 2 {
+            return rewire_result_map_last_exception(graph, site, spec, a, ci, recv, extra);
+        }
+        return Err(format!(
+            "{name}: {method} block does not have a single exit"
+        ));
+    };
+    if graph.blocks[a].exitswitch.is_some()
+        || exit.exitcase.is_some()
+        || exit.last_exception.is_some()
+        || exit.last_exc_value.is_some()
+    {
+        return Err(format!("{name}: {method} exit is not a plain goto"));
+    }
+    let saved_exit = exit.clone();
+    let b_target = saved_exit.target;
+    let mut carried: Vec<Variable> = Vec::new();
+    for arg in &saved_exit.args {
+        if let LinkArg::Value(v) = arg
+            && *v != flow_result
+            && !carried.contains(v)
+        {
+            carried.push(v.clone());
+        }
+    }
+
+    let (then_is_tag1, then_needs_recv, then_needs_extra, else_needs_recv, else_needs_extra) =
+        match site.kind {
+            DiscCombinator::OptionFilter => unreachable!("filter has its own diamond"),
+            DiscCombinator::OptionOkOr => (true, true, false, false, true),
+            DiscCombinator::ResultMap | DiscCombinator::ResultAndThen => {
+                (false, true, true, true, false)
+            }
+            DiscCombinator::ResultUnwrapOrElse | DiscCombinator::ResultOrElse => {
+                (false, true, false, true, true)
+            }
+            DiscCombinator::ResultOk => (false, true, false, false, false),
+            DiscCombinator::ResultErr => (true, true, false, false, false),
+            DiscCombinator::ResultIsOk | DiscCombinator::ResultIsErr => unreachable!(),
+        };
+
+    let mut then_sources = carried.clone();
+    if then_needs_recv && !then_sources.contains(&recv) {
+        then_sources.push(recv.clone());
+    }
+    if then_needs_extra
+        && let Some(extra) = extra.as_ref()
+        && !then_sources.contains(extra)
+    {
+        then_sources.push(extra.clone());
+    }
+    let mut else_sources = carried.clone();
+    if else_needs_recv && !else_sources.contains(&recv) {
+        else_sources.push(recv.clone());
+    }
+    if else_needs_extra
+        && let Some(extra) = extra.as_ref()
+        && !else_sources.contains(extra)
+    {
+        else_sources.push(extra.clone());
+    }
+
+    let (then_bb, then_inputs) = graph.create_block_with_arg_vars(then_sources.len());
+    let (else_bb, else_inputs) = graph.create_block_with_arg_vars(else_sources.len());
+
+    let then_value = build_disc_arm(
+        graph,
+        site,
+        then_bb,
+        &recv,
+        &then_sources,
+        &then_inputs,
+        extra.as_ref(),
+        true,
+        &name,
+    )?;
+    let then_args = reproduce_exit_args(
+        &saved_exit,
+        &flow_result,
+        &then_value,
+        &then_sources,
+        &then_inputs,
+        &name,
+    )?;
+    close_goto_mixed(graph, then_bb, b_target, then_args);
+
+    let else_value = build_disc_arm(
+        graph,
+        site,
+        else_bb,
+        &recv,
+        &else_sources,
+        &else_inputs,
+        extra.as_ref(),
+        false,
+        &name,
+    )?;
+    let else_args = reproduce_exit_args(
+        &saved_exit,
+        &flow_result,
+        &else_value,
+        &else_sources,
+        &else_inputs,
+        &name,
+    )?;
+    close_goto_mixed(graph, else_bb, b_target, else_args);
+
+    let a_id = graph.blocks[a].id;
+    let ops_len = graph.blocks[a].operations.len();
+    let remove_upto = if ci + 2 == ops_len { ci + 1 } else { ci };
+    for _ in ci..=remove_upto {
+        graph.blocks[a].operations.remove(ci);
+    }
+    let disc = emit_enum_disc_read(graph, a_id, recv, &site.recv_owner);
+    if then_is_tag1 {
+        graph.set_branch(a_id, disc, then_bb, then_sources, else_bb, else_sources);
+    } else {
+        graph.set_branch(a_id, disc, else_bb, else_sources, then_bb, then_sources);
+    }
+    let _ = spec;
+    Ok(())
+}
+
+fn rewire_option_filter_diamond(
+    graph: &mut FunctionGraph,
+    site: &DiscCombinatorSite,
+    a: usize,
+    ci: usize,
+    recv: Variable,
+    extra: Option<Variable>,
+    flow_result: Variable,
+    name: &str,
+) -> Result<(), String> {
+    use crate::front::bool_then::{
+        close_goto_mixed, emit_option_variant, map_source, reproduce_exit_args,
+    };
+    use crate::front::option_closure_select::emit_call_once;
+    use crate::front::option_map_or::emit_narrow;
+
+    let env = extra.ok_or_else(|| format!("{name}: filter missing predicate"))?;
+    let [exit] = graph.blocks[a].exits.as_slice() else {
+        return Err(format!("{name}: filter block does not have a single exit"));
+    };
+    if graph.blocks[a].exitswitch.is_some()
+        || exit.exitcase.is_some()
+        || exit.last_exception.is_some()
+        || exit.last_exc_value.is_some()
+    {
+        return Err(format!("{name}: filter exit is not a plain goto"));
+    }
+    let saved_exit = exit.clone();
+    let b_target = saved_exit.target;
+    let mut carried: Vec<Variable> = Vec::new();
+    for arg in &saved_exit.args {
+        if let LinkArg::Value(v) = arg
+            && *v != flow_result
+            && !carried.contains(v)
+        {
+            carried.push(v.clone());
+        }
+    }
+
+    let mut some_sources = carried.clone();
+    if !some_sources.contains(&recv) {
+        some_sources.push(recv.clone());
+    }
+    if !some_sources.contains(&env) {
+        some_sources.push(env.clone());
+    }
+    let none_sources = carried.clone();
+    let (some_bb, some_inputs) = graph.create_block_with_arg_vars(some_sources.len());
+    let (none_bb, none_inputs) = graph.create_block_with_arg_vars(none_sources.len());
+
+    let none = emit_option_variant(graph, none_bb, &site.result_owner, 0, None);
+    let none_args = reproduce_exit_args(
+        &saved_exit,
+        &flow_result,
+        &none,
+        &none_sources,
+        &none_inputs,
+        name,
+    )?;
+    close_goto_mixed(graph, none_bb, b_target, none_args);
+
+    let recv_in = map_source(&some_sources, &some_inputs, &recv)
+        .ok_or_else(|| format!("{name}: filter receiver not threaded"))?;
+    let env_in = map_source(&some_sources, &some_inputs, &env)
+        .ok_or_else(|| format!("{name}: filter env not threaded"))?;
+    let payload = emit_payload_read(
+        graph,
+        some_bb,
+        recv_in,
+        &site.recv_tag1_owner,
+        site.payload1_ty.clone(),
+    );
+    let pred = emit_call_once(
+        graph,
+        some_bb,
+        env_in,
+        Some((
+            payload.clone(),
+            site.payload1_ty.clone(),
+            site.payload1_class.clone(),
+        )),
+        &site.call_once_owner,
+        ValueType::Bool,
+        &site.args_tuple_suffix,
+    );
+
+    let mut keep_sources = some_inputs.clone();
+    keep_sources.push(payload.clone());
+    let (keep_bb, keep_inputs) = graph.create_block_with_arg_vars(keep_sources.len());
+    let (drop_bb, drop_inputs) = graph.create_block_with_arg_vars(some_inputs.len());
+    let keep_payload = keep_inputs
+        .last()
+        .cloned()
+        .ok_or_else(|| format!("{name}: filter keep arm missing payload"))?;
+    let keep_payload = emit_narrow(graph, keep_bb, keep_payload, &site.result_payload1_class);
+    let some = emit_option_variant(
+        graph,
+        keep_bb,
+        &site.result_owner,
+        1,
+        Some((
+            &site.result_tag1_owner,
+            keep_payload,
+            site.result_payload1_ty.clone(),
+        )),
+    );
+    let drop_none = emit_option_variant(graph, drop_bb, &site.result_owner, 0, None);
+
+    let mut keep_exit = Vec::new();
+    let mut drop_exit = Vec::new();
+    for arg in &saved_exit.args {
+        match arg {
+            LinkArg::Const(c) => {
+                keep_exit.push(LinkArg::Const(c.clone()));
+                drop_exit.push(LinkArg::Const(c.clone()));
+            }
+            LinkArg::Value(v) if *v == flow_result => {
+                keep_exit.push(LinkArg::Value(some.clone()));
+                drop_exit.push(LinkArg::Value(drop_none.clone()));
+            }
+            LinkArg::Value(v) => {
+                let in_some = map_source(&some_sources, &some_inputs, v)
+                    .ok_or_else(|| format!("{name}: filter exit arg not threaded"))?;
+                let in_keep = map_source(&keep_sources, &keep_inputs, &in_some)
+                    .ok_or_else(|| format!("{name}: filter keep exit arg not threaded"))?;
+                let in_drop = map_source(&some_inputs, &drop_inputs, &in_some)
+                    .ok_or_else(|| format!("{name}: filter drop exit arg not threaded"))?;
+                keep_exit.push(LinkArg::Value(in_keep));
+                drop_exit.push(LinkArg::Value(in_drop));
+            }
+        }
+    }
+    close_goto_mixed(graph, keep_bb, b_target, keep_exit);
+    close_goto_mixed(graph, drop_bb, b_target, drop_exit);
+    graph.set_branch(
+        some_bb,
+        pred,
+        keep_bb,
+        keep_sources,
+        drop_bb,
+        some_inputs.clone(),
+    );
+
+    let a_id = graph.blocks[a].id;
+    let ops_len = graph.blocks[a].operations.len();
+    let remove_upto = if ci + 2 == ops_len { ci + 1 } else { ci };
+    for _ in ci..=remove_upto {
+        graph.blocks[a].operations.remove(ci);
+    }
+    let disc = emit_enum_disc_read(graph, a_id, recv, &site.recv_owner);
+    graph.set_branch(a_id, disc, some_bb, some_sources, none_bb, none_sources);
+    Ok(())
+}
+
+fn build_disc_arm(
+    graph: &mut FunctionGraph,
+    site: &DiscCombinatorSite,
+    block: BlockId,
+    recv: &Variable,
+    sources: &[Variable],
+    inputs: &[Variable],
+    extra: Option<&Variable>,
+    is_then: bool,
+    name: &str,
+) -> Result<Variable, String> {
+    use crate::front::bool_then::{emit_option_variant, emit_sum_variant, map_source};
+    use crate::front::option_closure_select::emit_call_once;
+    use crate::front::option_map_or::emit_narrow;
+
+    match (site.kind, is_then) {
+        (DiscCombinator::OptionFilter, _) => unreachable!("filter has its own diamond"),
+        (DiscCombinator::OptionOkOr, true) => {
+            let recv = map_source(sources, inputs, recv)
+                .ok_or_else(|| format!("{name}: ok_or receiver not threaded"))?;
+            let payload = emit_payload_read(
+                graph,
+                block,
+                recv,
+                &site.recv_tag1_owner,
+                site.payload1_ty.clone(),
+            );
+            let payload = emit_narrow(graph, block, payload, &site.payload1_class);
+            Ok(emit_sum_variant(
+                graph,
+                block,
+                &site.result_owner,
+                "Ok",
+                0,
+                Some((
+                    &site.result_tag0_owner,
+                    payload,
+                    site.result_payload0_ty.clone(),
+                )),
+            ))
+        }
+        (DiscCombinator::OptionOkOr, false) => {
+            let extra = extra.ok_or_else(|| format!("{name}: ok_or missing err value"))?;
+            let err = map_source(sources, inputs, extra)
+                .ok_or_else(|| format!("{name}: ok_or err not threaded"))?;
+            let err = emit_narrow(graph, block, err, &site.result_payload1_class);
+            Ok(emit_sum_variant(
+                graph,
+                block,
+                &site.result_owner,
+                "Err",
+                1,
+                Some((
+                    &site.result_tag1_owner,
+                    err,
+                    site.result_payload1_ty.clone(),
+                )),
+            ))
+        }
+        (DiscCombinator::ResultMap, true) | (DiscCombinator::ResultAndThen, true) => {
+            let recv = map_source(sources, inputs, recv)
+                .ok_or_else(|| format!("{name}: Result receiver not threaded into Ok arm"))?;
+            let extra = extra.ok_or_else(|| format!("{name}: Result map missing closure"))?;
+            let env = map_source(sources, inputs, extra)
+                .ok_or_else(|| format!("{name}: Result map env not threaded"))?;
+            let payload = emit_payload_read(
+                graph,
+                block,
+                recv,
+                &site.recv_tag0_owner,
+                site.payload0_ty.clone(),
+            );
+            let mapped = emit_call_once(
+                graph,
+                block,
+                env,
+                Some((
+                    payload,
+                    site.payload0_ty.clone(),
+                    site.payload0_class.clone(),
+                )),
+                &site.call_once_owner,
+                site.call_result_ty.clone(),
+                &site.args_tuple_suffix,
+            );
+            let mapped = emit_narrow(graph, block, mapped, &site.call_result_class);
+            if site.kind == DiscCombinator::ResultAndThen {
+                Ok(mapped)
+            } else {
+                Ok(emit_sum_variant(
+                    graph,
+                    block,
+                    &site.result_owner,
+                    "Ok",
+                    0,
+                    Some((
+                        &site.result_tag0_owner,
+                        mapped,
+                        site.result_payload0_ty.clone(),
+                    )),
+                ))
+            }
+        }
+        (DiscCombinator::ResultMap, false) | (DiscCombinator::ResultAndThen, false) => {
+            let recv = map_source(sources, inputs, recv)
+                .ok_or_else(|| format!("{name}: Result receiver not threaded into Err arm"))?;
+            let payload = emit_payload_read(
+                graph,
+                block,
+                recv,
+                &site.recv_tag1_owner,
+                site.payload1_ty.clone(),
+            );
+            let payload = emit_narrow(graph, block, payload, &site.payload1_class);
+            Ok(emit_sum_variant(
+                graph,
+                block,
+                &site.result_owner,
+                "Err",
+                1,
+                Some((
+                    &site.result_tag1_owner,
+                    payload,
+                    site.result_payload1_ty.clone(),
+                )),
+            ))
+        }
+        (DiscCombinator::ResultUnwrapOrElse, true) | (DiscCombinator::ResultOrElse, true) => {
+            let recv = map_source(sources, inputs, recv)
+                .ok_or_else(|| format!("{name}: Result receiver not threaded into Ok arm"))?;
+            if site.kind == DiscCombinator::ResultOrElse {
+                Ok(recv)
+            } else {
+                Ok(emit_payload_read(
+                    graph,
+                    block,
+                    recv,
+                    &site.recv_tag0_owner,
+                    site.payload0_ty.clone(),
+                ))
+            }
+        }
+        (DiscCombinator::ResultUnwrapOrElse, false) | (DiscCombinator::ResultOrElse, false) => {
+            let recv = map_source(sources, inputs, recv)
+                .ok_or_else(|| format!("{name}: Result receiver not threaded into Err arm"))?;
+            let extra =
+                extra.ok_or_else(|| format!("{name}: Result unwrap_or_else missing closure"))?;
+            let env = map_source(sources, inputs, extra)
+                .ok_or_else(|| format!("{name}: Result unwrap_or_else env not threaded"))?;
+            let payload = emit_payload_read(
+                graph,
+                block,
+                recv,
+                &site.recv_tag1_owner,
+                site.payload1_ty.clone(),
+            );
+            Ok(emit_call_once(
+                graph,
+                block,
+                env,
+                Some((
+                    payload,
+                    site.payload1_ty.clone(),
+                    site.payload1_class.clone(),
+                )),
+                &site.call_once_owner,
+                site.call_result_ty.clone(),
+                &site.args_tuple_suffix,
+            ))
+        }
+        (DiscCombinator::ResultOk, true) => {
+            let recv = map_source(sources, inputs, recv)
+                .ok_or_else(|| format!("{name}: Result::ok receiver not threaded"))?;
+            let payload = emit_payload_read(
+                graph,
+                block,
+                recv,
+                &site.recv_tag0_owner,
+                site.payload0_ty.clone(),
+            );
+            let payload = emit_narrow(graph, block, payload, &site.payload0_class);
+            Ok(emit_option_variant(
+                graph,
+                block,
+                &site.result_owner,
+                1,
+                Some((
+                    &site.result_tag1_owner,
+                    payload,
+                    site.result_payload1_ty.clone(),
+                )),
+            ))
+        }
+        (DiscCombinator::ResultOk, false) => Ok(emit_option_variant(
+            graph,
+            block,
+            &site.result_owner,
+            0,
+            None,
+        )),
+        (DiscCombinator::ResultErr, true) => {
+            let recv = map_source(sources, inputs, recv)
+                .ok_or_else(|| format!("{name}: Result::err receiver not threaded"))?;
+            let payload = emit_payload_read(
+                graph,
+                block,
+                recv,
+                &site.recv_tag1_owner,
+                site.payload1_ty.clone(),
+            );
+            let payload = emit_narrow(graph, block, payload, &site.payload1_class);
+            Ok(emit_option_variant(
+                graph,
+                block,
+                &site.result_owner,
+                1,
+                Some((
+                    &site.result_tag1_owner,
+                    payload,
+                    site.result_payload1_ty.clone(),
+                )),
+            ))
+        }
+        (DiscCombinator::ResultErr, false) => Ok(emit_option_variant(
+            graph,
+            block,
+            &site.result_owner,
+            0,
+            None,
+        )),
+        (DiscCombinator::ResultIsOk | DiscCombinator::ResultIsErr, _) => unreachable!(),
+    }
+}
+
+fn rewire_result_map_last_exception(
+    graph: &mut FunctionGraph,
+    site: &DiscCombinatorSite,
+    spec: crate::ErrorCarrierSpec<'_>,
+    a: usize,
+    ci: usize,
+    recv: Variable,
+    extra: Option<Variable>,
+) -> Result<(), String> {
+    // `result_exc` already turned this Result-returning combinator into a
+    // can-raise site.  Only `map`/`and_then` keep that form; decline any
+    // other combinator rather than guess an exception ABI.
+    if !matches!(
+        site.kind,
+        DiscCombinator::ResultMap | DiscCombinator::ResultAndThen
+    ) {
+        return Err(format!(
+            "{}: {} LastException form is not lowered",
+            graph.name,
+            site.kind.method_name()
+        ));
+    }
+    let _ = (spec, a, ci, recv, extra);
+    Err(format!(
+        "{}: {} LastException form left residual",
+        graph.name,
+        site.kind.method_name()
+    ))
+}
+
+fn emit_enum_disc_read(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    recv: Variable,
+    owner: &str,
+) -> Variable {
+    let disc = graph.alloc_value_var();
+    graph.block_mut(block).operations.push(SpaceOperation {
+        result: Some(disc.clone()),
+        kind: OpKind::FieldRead {
+            base: recv,
+            field: FieldDescriptor {
+                name: "__discriminant".to_string(),
+                owner_root: Some(owner.to_string()),
+                owner_id: None,
+                base_is_deref: None,
+                taken_by_address: false,
+            },
+            ty: ValueType::Int,
+            pure: true,
+        },
+    });
+    disc
+}
+
+fn emit_payload_read(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    recv: Variable,
+    owner: &str,
+    ty: ValueType,
+) -> Variable {
+    let payload = graph.alloc_value_var();
+    graph.block_mut(block).operations.push(SpaceOperation {
+        result: Some(payload.clone()),
+        kind: OpKind::FieldRead {
+            base: recv,
+            field: FieldDescriptor {
+                name: "__pos_0".to_string(),
+                owner_root: Some(owner.to_string()),
+                owner_id: None,
+                base_is_deref: None,
+                taken_by_address: false,
+            },
+            ty,
+            pure: true,
+        },
+    });
+    payload
+}
+
+fn rewire_result_try_call_sites(
+    graph: &mut FunctionGraph,
+    sites: &[ResultTrySite],
+    return_owners: Option<ResultTryReturnOwners>,
+) -> ResultTryStats {
+    let mut stats = ResultTryStats::default();
+    for site in sites {
+        if rewire_one_result_try_site(graph, site, return_owners.as_ref()).is_ok() {
+            stats.rewritten += 1;
+        }
+    }
+    stats
+}
+
+fn rewire_one_result_try_site(
+    graph: &mut FunctionGraph,
+    site: &ResultTrySite,
+    return_owners: Option<&ResultTryReturnOwners>,
+) -> Result<(), String> {
+    use crate::flowspace::model::Constant;
+    use crate::front::bool_then::{emit_sum_variant, map_source};
+    use crate::front::option_map_or::emit_narrow;
+    use crate::front::result_exc::{
+        assert_block_pure_besides, assert_single_pred, back_substitute, collapse_pos0_read,
+        follow_single_exit, split_diamond_exits,
+    };
+
+    let name = graph.name.clone();
+    let Some(return_owners) = return_owners else {
+        return Err(format!("{name}: enclosing function does not return Result"));
+    };
+    if return_owners.err_ast != site.recv_err_ast {
+        return Err(format!(
+            "{name}: Result `?` FromResidual would convert {} into {}",
+            site.recv_err_ast, return_owners.err_ast
+        ));
+    }
+    if graph.blocks[graph.returnblock.0].inputargs.len() != 1 {
+        return Err(format!(
+            "{name}: Result-returning function returnblock is not unary"
+        ));
+    }
+
+    let b = graph
+        .blocks
+        .iter()
+        .position(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| op.result.as_ref() == Some(&site.branch_result_var))
+        })
+        .ok_or_else(|| format!("{name}: Result branch result var has no producer block"))?;
+    let branch_idx = graph.blocks[b]
+        .operations
+        .iter()
+        .position(|op| op.result.as_ref() == Some(&site.branch_result_var))
+        .ok_or_else(|| format!("{name}: Result branch op not found in block {b}"))?;
+    let res_b = match &graph.blocks[b].operations[branch_idx].kind {
+        OpKind::Call {
+            target: CallTarget::Method { name: m, .. },
+            args,
+            ..
+        } if m == "branch" && args.len() == 1 => args[0].clone(),
+        other => {
+            return Err(format!(
+                "{name}: Result branch producer is not a one-arg branch method call: {other:?}"
+            ));
+        }
+    };
+    assert_single_pred(graph, b, &name)?;
+    assert_block_pure_besides(graph, b, &[branch_idx], "branch", &name)?;
+
+    let (a, res_a) = result_try_predecessor_carrying(graph, b, &res_b, &name)?;
+    let cf = site.branch_result_var.clone();
+    let (c, cf_c) =
+        follow_single_exit(graph, b, &cf).map_err(|e| format!("{name}: branch block exit: {e}"))?;
+    assert_single_pred(graph, c, &name)?;
+
+    let (disc_idx, cf_disc_var) = graph.blocks[c]
+        .operations
+        .iter()
+        .enumerate()
+        .find_map(|(i, op)| match &op.kind {
+            OpKind::FieldRead { base, field, .. }
+                if *base == cf_c && field.name == "__discriminant" =>
+            {
+                op.result.clone().map(|r| (i, r))
+            }
+            _ => None,
+        })
+        .ok_or_else(|| format!("{name}: block {c} lacks the ControlFlow __discriminant read"))?;
+    match &graph.blocks[c].exitswitch {
+        Some(ExitSwitch::Value(v)) if *v == cf_disc_var => {}
+        other => {
+            return Err(format!(
+                "{name}: block {c} exitswitch {other:?} is not the ControlFlow discriminant switch"
+            ));
+        }
+    }
+    assert_block_pure_besides(graph, c, &[disc_idx], "discriminant", &name)?;
+    let (continue_link, break_link) = split_diamond_exits(&graph.blocks[c].exits, &name)?;
+    let (e_block, residual_var) = result_try_verify_break_arm(graph, &break_link, &cf_c, &name)?;
+    // The from_residual block still owns the original successor — the
+    // RootScope close lives there, not in the residual call itself.
+    // Jumping the rewritten Err arm at returnblock would skip that
+    // chain.  Map the successor's args back to the Result producer; a
+    // value that cannot be mapped declines the site.
+    let (err_sources, err_specs, err_target) = result_try_err_successor(
+        graph,
+        a,
+        b,
+        c,
+        &break_link,
+        e_block,
+        &residual_var,
+        &res_a,
+        &name,
+    )?;
+
+    enum ContinueArg {
+        Const(crate::flowspace::model::Constant),
+        Payload,
+        Mapped(Variable),
+    }
+    let mut continue_specs = Vec::with_capacity(continue_link.args.len());
+    let mut payload_positions = Vec::new();
+    let mut ok_sources = Vec::new();
+    if !ok_sources.contains(&res_a) {
+        ok_sources.push(res_a.clone());
+    }
+    for (i, arg) in continue_link.args.iter().enumerate() {
+        match arg {
+            LinkArg::Const(cst) => continue_specs.push(ContinueArg::Const(cst.clone())),
+            LinkArg::Value(v) if *v == cf_c => {
+                continue_specs.push(ContinueArg::Payload);
+                payload_positions.push(i);
+            }
+            LinkArg::Value(v) if *v == cf_disc_var => {
+                continue_specs.push(ContinueArg::Const(Constant::new(ConstValue::Int(0))));
+            }
+            LinkArg::Value(v) => {
+                let v_a = back_substitute(graph, &[(a, b), (b, c)], v, &name)?;
+                if !ok_sources.contains(&v_a) {
+                    ok_sources.push(v_a.clone());
+                }
+                continue_specs.push(ContinueArg::Mapped(v_a));
+            }
+        }
+    }
+    if payload_positions.len() > 1 {
+        return Err(format!(
+            "{name}: ControlFlow value threaded into {} continue-arm slots",
+            payload_positions.len()
+        ));
+    }
+
+    let (ok_bb, ok_inputs) = graph.create_block_with_arg_vars(ok_sources.len());
+    let (err_bb, err_inputs) = graph.create_block_with_arg_vars(err_sources.len());
+
+    let res_in_ok = map_source(&ok_sources, &ok_inputs, &res_a)
+        .ok_or_else(|| format!("{name}: Result value not threaded into Ok arm"))?;
+    let payload = emit_payload_read(graph, ok_bb, res_in_ok, &site.ok_owner, site.ok_ty.clone());
+    let ok_link_args = continue_specs
+        .iter()
+        .map(|spec| match spec {
+            ContinueArg::Const(cst) => Ok(LinkArg::Const(cst.clone())),
+            ContinueArg::Payload => Ok(LinkArg::Value(payload.clone())),
+            ContinueArg::Mapped(v_a) => map_source(&ok_sources, &ok_inputs, v_a)
+                .map(LinkArg::Value)
+                .ok_or_else(|| format!("{name}: continue arg not threaded into Ok arm")),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    graph.set_control_flow_metadata(
+        ok_bb,
+        None,
+        vec![Link::new_mixed(ok_link_args, continue_link.target, None)],
+    );
+    for pos in payload_positions {
+        collapse_pos0_read(graph, continue_link.target, pos, &name)?;
+    }
+
+    let res_in_err = map_source(&err_sources, &err_inputs, &res_a)
+        .ok_or_else(|| format!("{name}: Result value not threaded into Err arm"))?;
+    let err_payload = emit_payload_read(
+        graph,
+        err_bb,
+        res_in_err,
+        &site.err_owner,
+        site.err_ty.clone(),
+    );
+    let err_payload = emit_narrow(graph, err_bb, err_payload, &site.err_class);
+    let err_shell = emit_sum_variant(
+        graph,
+        err_bb,
+        &return_owners.result_owner,
+        "Err",
+        1,
+        Some((
+            &return_owners.err_owner,
+            err_payload,
+            return_owners.err_ty.clone(),
+        )),
+    );
+    let err_link_args = err_specs
+        .iter()
+        .map(|spec| match spec {
+            ResultTryErrArg::Const(cst) => Ok(LinkArg::Const(cst.clone())),
+            ResultTryErrArg::Shell => Ok(LinkArg::Value(err_shell.clone())),
+            ResultTryErrArg::Mapped(v_a) => map_source(&err_sources, &err_inputs, v_a)
+                .map(LinkArg::Value)
+                .ok_or_else(|| format!("{name}: break-arm arg not threaded into Err arm")),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    graph.set_control_flow_metadata(
+        err_bb,
+        None,
+        vec![Link::new_mixed(err_link_args, err_target, None)],
+    );
+
+    let a_id = graph.blocks[a].id;
+    let disc = emit_enum_disc_read(graph, a_id, res_a, &site.result_owner);
+    graph.set_control_flow_metadata(
+        a_id,
+        Some(ExitSwitch::Value(disc)),
+        vec![
+            Link::new_mixed(
+                ok_sources.iter().cloned().map(LinkArg::Value).collect(),
+                ok_bb,
+                Some(ExitCase::Const(ConstValue::Int(0))),
+            ),
+            Link::new_mixed(
+                err_sources.iter().cloned().map(LinkArg::Value).collect(),
+                err_bb,
+                Some(ExitCase::Const(ConstValue::Int(1))),
+            ),
+        ],
+    );
+    Ok(())
+}
+
+fn result_try_predecessor_carrying(
+    graph: &FunctionGraph,
+    block: usize,
+    var_in_block: &Variable,
+    name: &str,
+) -> Result<(usize, Variable), String> {
+    let preds: Vec<usize> = graph
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, b)| b.exits.iter().any(|l| l.target.0 == block).then_some(i))
+        .collect();
+    let [pred] = preds.as_slice() else {
+        return Err(format!(
+            "{name}: diamond block {block} has {} predecessors, expected 1",
+            preds.len()
+        ));
+    };
+    let pos = graph.blocks[block]
+        .inputargs
+        .iter()
+        .position(|v| v == var_in_block)
+        .ok_or_else(|| format!("{name}: branch receiver is not a block {block} inputarg"))?;
+    let [link] = graph.blocks[*pred].exits.as_slice() else {
+        return Err(format!(
+            "{name}: Result-producing block {pred} has multiple exits"
+        ));
+    };
+    match link.args.get(pos) {
+        Some(LinkArg::Value(v)) => Ok((*pred, v.clone())),
+        other => Err(format!(
+            "{name}: predecessor arg at position {pos} is {other:?}, expected Value"
+        )),
+    }
+}
+
+fn result_try_verify_break_arm(
+    graph: &FunctionGraph,
+    break_link: &Link,
+    cf_c: &Variable,
+    name: &str,
+) -> Result<(usize, Variable), String> {
+    use crate::front::result_exc::{assert_block_pure_besides, peel_recast_chain_from};
+    let pos = break_link
+        .args
+        .iter()
+        .position(|a| matches!(a, LinkArg::Value(v) if v == cf_c))
+        .ok_or_else(|| format!("{name}: break arm does not carry the ControlFlow value"))?;
+    let e_block = break_link.target.0;
+    let cf_e = graph.blocks[e_block]
+        .inputargs
+        .get(pos)
+        .cloned()
+        .ok_or_else(|| format!("{name}: break arm target lacks inputarg {pos}"))?;
+    let ops = &graph.blocks[e_block].operations;
+    let payload = ops.iter().enumerate().find_map(|(i, op)| match &op.kind {
+        OpKind::FieldRead { base, field, .. } if *base == cf_e && field.name == "__pos_0" => {
+            op.result.clone().map(|r| (i, r))
+        }
+        _ => None,
+    });
+    let Some((pos0_idx, payload_var)) = payload else {
+        return Err(format!(
+            "{name}: break arm block {e_block} lacks the __pos_0 residual read"
+        ));
+    };
+    let residual = ops.iter().enumerate().find_map(|(i, op)| match &op.kind {
+        OpKind::Call {
+            target: CallTarget::Method { name: m, .. },
+            args,
+            ..
+        } if m == "from_residual" && args.as_slice() == std::slice::from_ref(&payload_var) => {
+            op.result.clone().map(|r| (i, r))
+        }
+        _ => None,
+    });
+    let Some((from_residual_idx, residual_result)) = residual else {
+        return Err(format!(
+            "{name}: break arm block {e_block} lacks the from_residual call"
+        ));
+    };
+    let (residual_var, recast_indices) = peel_recast_chain_from(graph, e_block, &residual_result);
+    let mut recognized = vec![pos0_idx, from_residual_idx];
+    recognized.extend(recast_indices);
+    assert_block_pure_besides(graph, e_block, &recognized, "break arm", name)?;
+    Ok((e_block, residual_var))
+}
+
+enum ResultTryErrArg {
+    Const(crate::flowspace::model::Constant),
+    Shell,
+    Mapped(Variable),
+}
+
+/// Map the from_residual block's successor back to the Result producer.
+///
+/// The rewritten Err arm must land on that successor so a RootScope close
+/// (or any other forwarded live value) still runs.  A value produced inside
+/// the diamond that is not the residual itself cannot be mapped, and the
+/// site stays residual rather than skipping the close.
+fn result_try_err_successor(
+    graph: &FunctionGraph,
+    a: usize,
+    b: usize,
+    c: usize,
+    break_link: &Link,
+    e_block: usize,
+    residual_var: &Variable,
+    res_a: &Variable,
+    name: &str,
+) -> Result<(Vec<Variable>, Vec<ResultTryErrArg>, BlockId), String> {
+    use crate::front::result_exc::back_substitute;
+    let [e_exit] = graph.blocks[e_block].exits.as_slice() else {
+        return Err(format!(
+            "{name}: break arm block {e_block} does not have a single exit"
+        ));
+    };
+    if graph.blocks[e_block].exitswitch.is_some()
+        || e_exit.exitcase.is_some()
+        || e_exit.last_exception.is_some()
+        || e_exit.last_exc_value.is_some()
+    {
+        return Err(format!(
+            "{name}: break arm block {e_block} exit is not a plain goto"
+        ));
+    }
+    let err_target = e_exit.target;
+    let mut err_sources = vec![res_a.clone()];
+    let mut err_specs = Vec::with_capacity(e_exit.args.len());
+    for arg in &e_exit.args {
+        match arg {
+            LinkArg::Const(cst) => err_specs.push(ResultTryErrArg::Const(cst.clone())),
+            LinkArg::Value(v) if v == residual_var => err_specs.push(ResultTryErrArg::Shell),
+            LinkArg::Value(v) => {
+                let pos = graph.blocks[e_block]
+                    .inputargs
+                    .iter()
+                    .position(|x| x == v)
+                    .ok_or_else(|| {
+                        format!(
+                            "{name}: break-arm successor carries a value produced in \
+                             block {e_block} that is not the residual"
+                        )
+                    })?;
+                match break_link.args.get(pos) {
+                    Some(LinkArg::Const(cst)) => {
+                        err_specs.push(ResultTryErrArg::Const(cst.clone()));
+                    }
+                    Some(LinkArg::Value(cv)) => {
+                        let v_a = back_substitute(graph, &[(a, b), (b, c)], cv, name)?;
+                        if !err_sources.contains(&v_a) {
+                            err_sources.push(v_a.clone());
+                        }
+                        err_specs.push(ResultTryErrArg::Mapped(v_a));
+                    }
+                    other => {
+                        return Err(format!(
+                            "{name}: break-arm inputarg {pos} is {other:?}, expected a value"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if err_target == graph.returnblock
+        && (err_specs.len() != 1 || !matches!(err_specs.first(), Some(ResultTryErrArg::Shell)))
+    {
+        return Err(format!(
+            "{name}: break arm does not forward the residual as the unary return"
+        ));
+    }
+    Ok((err_sources, err_specs, err_target))
 }
 
 /// `<[T]>::to_vec` — Rust MIR `alloc::slice::<Impl>::to_vec`, a slice→owned-Vec
@@ -30718,16 +33365,21 @@ fn collapse_panic_message_chains(graph: &mut FunctionGraph) -> usize {
 mod tests {
     use super::harden_duplicate_leaf_metadata;
     use super::{
-        DecodedConst, FnPtrFamily, cast_call_segments, cast_kind_is_raw_ptr,
-        cast_pointer_marker_op, charon_const_generic_to_string, charon_type_value_to_ast_string,
-        checked_arith_uint_atom_is_word_sized, decode_literal, fn_ptr_family_for,
-        int_binop_needs_ptr_to_int, is_class_pytype_assoc_const, is_core_result_map_err_path,
-        json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling, primitive_float_const,
-        push_cast_ptr_to_int, push_ptr_to_unsigned_cast, shaped_array_parts,
-        simplify_lowered_graph, tyref_array_suffix, tyref_is_raw_byte_ptr,
-        tyref_positional_aggregate_root, tyref_to_value_type,
+        DecodedConst, FnPtrFamily, adt_field_read_value_type, cast_call_segments,
+        cast_kind_is_raw_ptr, cast_pointer_marker_op, charon_const_generic_to_string,
+        charon_type_value_to_ast_string, checked_arith_uint_atom_is_word_sized, decode_literal,
+        fn_ptr_family_for, int_binop_needs_ptr_to_int, is_class_pytype_assoc_const,
+        is_core_result_map_err_path, json_ty_is_thin_pointer_element,
+        json_ty_scalar_element_spelling, lower_struct_aggregate_ctors_to_new,
+        primitive_float_const, push_cast_ptr_to_int, push_ptr_to_unsigned_cast, shaped_array_parts,
+        simplify_lowered_graph, type_decl_is_closure_env, tyref_array_suffix, tyref_is_closure_env,
+        tyref_is_raw_byte_ptr, tyref_positional_aggregate_root, tyref_to_attr_value_type,
+        tyref_to_attr_value_type_for_struct_field, tyref_to_value_type,
     };
-    use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
+    use crate::flowspace::model::Variable;
+    use crate::model::{
+        CallTarget, FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType,
+    };
     use majit_charon_reader::{Llbc, ullbc::TyRef};
 
     #[test]
@@ -30739,6 +33391,7 @@ mod tests {
             "std::result::Result::map_err",
         ] {
             assert!(is_core_result_map_err_path(path), "{path}");
+            assert!(super::is_core_result_method(path, "map_err"), "{path}");
         }
         for path in [
             "map_err",
@@ -30749,6 +33402,80 @@ mod tests {
         ] {
             assert!(!is_core_result_map_err_path(path), "{path}");
         }
+    }
+
+    #[test]
+    fn std_extern_path_predicates_match_exact_full_paths_only() {
+        assert!(super::is_core_clone_impls_clone_path(
+            "core::clone::impls::<Impl>::clone"
+        ));
+        assert!(!super::is_core_clone_impls_clone_path(
+            "core::clone::<Impl>::clone"
+        ));
+        assert!(!super::is_core_clone_impls_clone_path(
+            "alloc::vec::<Impl>::clone"
+        ));
+
+        assert!(super::is_core_default_path(
+            "core::default::<Impl>::default"
+        ));
+        assert!(super::is_core_default_path(
+            "core::ptr::mut_ptr::<Impl>::default"
+        ));
+        assert!(!super::is_core_default_path(
+            "core::ptr::const_ptr::<Impl>::default"
+        ));
+        assert!(!super::is_core_default_path(
+            "core::default::Default::default"
+        ));
+
+        assert!(super::is_core_ptr_add_path(
+            "core::ptr::mut_ptr::<Impl>::add"
+        ));
+        assert!(super::is_core_ptr_add_path(
+            "core::ptr::const_ptr::<Impl>::add"
+        ));
+        assert!(!super::is_core_ptr_add_path(
+            "core::ptr::mut_ptr::<Impl>::wrapping_add"
+        ));
+        assert!(!super::is_core_ptr_add_path(
+            "core::ptr::mut_ptr::<Impl>::offset"
+        ));
+
+        assert!(super::is_core_ptr_write_path("core::ptr::write"));
+        assert!(!super::is_core_ptr_write_path("core::ptr::write_unaligned"));
+        assert!(!super::is_core_ptr_write_path("core::ptr::write_bytes"));
+
+        assert!(super::is_alloc_vec_new_segments(&[
+            "alloc".into(),
+            "vec".into(),
+            "<Impl>".into(),
+            "new".into(),
+        ]));
+        assert!(super::is_alloc_vec_new_segments(&[
+            "alloc".into(),
+            "vec".into(),
+            "Vec".into(),
+            "new".into(),
+        ]));
+        assert!(!super::is_alloc_vec_new_segments(&[
+            "alloc".into(),
+            "vec".into(),
+            "<Impl>".into(),
+            "with_capacity".into(),
+        ]));
+        assert!(super::is_alloc_vec_push_segments(&[
+            "alloc".into(),
+            "vec".into(),
+            "<Impl>".into(),
+            "push".into(),
+        ]));
+        assert!(!super::is_alloc_vec_push_segments(&[
+            "alloc".into(),
+            "vec".into(),
+            "<Impl>".into(),
+            "push_str".into(),
+        ]));
     }
 
     #[test]
@@ -30872,6 +33599,306 @@ mod tests {
             "the orphaned block must be cleared, not left naming the array: {:?}",
             graph.block(forwarding).inputargs
         );
+    }
+
+    fn struct_ctor_graph(pass_to_malloc: bool) -> FunctionGraph {
+        struct_ctor_graph_escaping(pass_to_malloc, StructCtorEscape::UniqueLocal)
+    }
+
+    #[derive(Clone, Copy)]
+    enum StructCtorEscape {
+        /// Field reads only; the aggregate itself does not escape.
+        UniqueLocal,
+        /// `return s` — a by-value move to the caller.
+        Returned,
+        /// Passed to a residual call that expects the by-value layout.
+        CallArg,
+        /// Copied into a successor phi, then mutated.
+        Phi,
+    }
+
+    fn struct_ctor_graph_escaping(pass_to_malloc: bool, escape: StructCtorEscape) -> FunctionGraph {
+        let mut graph = FunctionGraph::new("struct_ctor");
+        let entry = graph.startblock;
+        let owner = "error::DictKeyError";
+        let result = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_struct_ctor(
+                        vec!["error".to_string()],
+                        "DictKeyError",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some(owner.to_string())),
+                },
+                true,
+            )
+            .expect("struct ctor");
+        let payload = graph
+            .push_op_var(entry, OpKind::ConstInt(1), true)
+            .expect("payload");
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: result.clone(),
+                field: FieldDescriptor::new("kind", Some(owner.to_string())),
+                value: LinkArg::Value(payload.clone()),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        if pass_to_malloc {
+            graph.push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path(["runtime_object", "lltype", "malloc_typed"]),
+                    args: crate::model::call_args(vec![result.clone()]),
+                    result_ty: ValueType::Ref(Some(owner.to_string())),
+                },
+                true,
+            );
+        }
+        match escape {
+            StructCtorEscape::UniqueLocal => {
+                let kind = graph
+                    .push_op_var(
+                        entry,
+                        OpKind::FieldRead {
+                            base: result,
+                            field: FieldDescriptor::new("kind", Some(owner.to_string())),
+                            ty: ValueType::Int,
+                            pure: true,
+                        },
+                        true,
+                    )
+                    .expect("field read");
+                graph.set_return(entry, Some(kind));
+            }
+            StructCtorEscape::Returned => graph.set_return(entry, Some(result)),
+            StructCtorEscape::CallArg => {
+                graph.push_op_var(
+                    entry,
+                    OpKind::Call {
+                        target: CallTarget::function_path(["slice", "index"]),
+                        args: crate::model::call_args(vec![result]),
+                        result_ty: ValueType::Int,
+                    },
+                    true,
+                );
+                graph.set_return(entry, None);
+            }
+            StructCtorEscape::Phi => {
+                let (next, args) = graph.create_block_with_arg_vars(1);
+                let copy = args[0].clone();
+                graph.push_op_var(
+                    next,
+                    OpKind::FieldWrite {
+                        base: copy,
+                        field: FieldDescriptor::new("kind", Some(owner.to_string())),
+                        value: LinkArg::Value(payload),
+                        ty: ValueType::Int,
+                    },
+                    false,
+                );
+                graph.set_goto(entry, next, vec![result]);
+                graph.set_return(next, None);
+            }
+        }
+        graph
+    }
+
+    fn struct_ctor_ops(graph: &FunctionGraph) -> (usize, usize, usize) {
+        let mut ctors = 0usize;
+        let mut news = 0usize;
+        let mut field_writes = 0usize;
+        for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+            match &op.kind {
+                OpKind::Call {
+                    target:
+                        CallTarget::SyntheticTransparentCtor {
+                            is_struct: true, ..
+                        },
+                    ..
+                } => ctors += 1,
+                OpKind::New { owner } if owner == "error::DictKeyError" => news += 1,
+                OpKind::FieldWrite { field, .. } if field.name == "kind" => field_writes += 1,
+                _ => {}
+            }
+        }
+        (ctors, news, field_writes)
+    }
+
+    /// A unique, unescaped named struct is `malloc(GcStruct)` plus one
+    /// `setfield` per member, not a residual constructor call. Transparent
+    /// newtype wrappers are a different arm and stay a no-op alias.
+    #[test]
+    fn named_struct_aggregate_lowers_to_new_plus_field_stores() {
+        let mut graph = struct_ctor_graph(false);
+        assert_eq!(struct_ctor_ops(&graph), (1, 0, 1));
+        assert_eq!(lower_struct_aggregate_ctors_to_new(&mut graph), 1);
+        assert_eq!(struct_ctor_ops(&graph), (0, 1, 1));
+    }
+
+    /// Returning the aggregate is a by-value move. `New` would give the
+    /// caller a pointer, so later copies share mutations of one object.
+    #[test]
+    fn returned_struct_ctor_keeps_value_semantics() {
+        let mut graph = struct_ctor_graph_escaping(false, StructCtorEscape::Returned);
+        assert_eq!(lower_struct_aggregate_ctors_to_new(&mut graph), 0);
+        assert_eq!(struct_ctor_ops(&graph), (1, 0, 1));
+    }
+
+    /// Passing the aggregate to a call is a by-value copy. Residual callees
+    /// expect the stack layout, not a heap pointer.
+    #[test]
+    fn by_value_call_arg_struct_ctor_is_not_rewritten() {
+        let mut graph = struct_ctor_graph_escaping(false, StructCtorEscape::CallArg);
+        assert_eq!(lower_struct_aggregate_ctors_to_new(&mut graph), 0);
+        assert_eq!(struct_ctor_ops(&graph), (1, 0, 1));
+    }
+
+    /// A phi copy plus a later field write must not share one allocation:
+    /// each copy is a distinct value.
+    #[test]
+    fn phi_mutated_struct_ctor_is_not_rewritten() {
+        let mut graph = struct_ctor_graph_escaping(false, StructCtorEscape::Phi);
+        assert_eq!(lower_struct_aggregate_ctors_to_new(&mut graph), 0);
+        assert_eq!(struct_ctor_ops(&graph), (1, 0, 2));
+    }
+
+    /// The rewrite is the last step of the final simplify, after boxing fusion
+    /// and the consumer rewrites that still match a constructor. The pre-pass
+    /// simplify must not steal those constructors.
+    #[test]
+    fn final_simplify_rewrites_struct_ctors_prepass_does_not() {
+        let mut graph = struct_ctor_graph(false);
+        simplify_lowered_graph(&mut graph, &std::collections::HashMap::new(), false);
+        assert_eq!(struct_ctor_ops(&graph), (1, 0, 1));
+        simplify_lowered_graph(&mut graph, &std::collections::HashMap::new(), true);
+        assert_eq!(struct_ctor_ops(&graph), (0, 1, 1));
+    }
+
+    /// `malloc_typed(T { .. })` is the boxing cluster. Its stack aggregate
+    /// stays a constructor so `fuse_boxing_alloc` can still see it.
+    #[test]
+    fn malloc_typed_struct_ctor_is_left_for_boxing_fusion() {
+        let mut graph = struct_ctor_graph(true);
+        assert_eq!(lower_struct_aggregate_ctors_to_new(&mut graph), 0);
+        assert_eq!(struct_ctor_ops(&graph), (1, 0, 1));
+    }
+
+    fn boxing_cluster_with_nested_header() -> FunctionGraph {
+        let mut graph = FunctionGraph::new("w_new_int");
+        let entry = graph.startblock;
+        let header_owner = "ObjectHeader";
+        let outer_owner = "W_IntObject";
+        let header = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_struct_ctor(Vec::new(), header_owner),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some(header_owner.to_string())),
+                },
+                true,
+            )
+            .expect("header ctor");
+        let class_static = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path(["charon_corpus", "INT_CLASS"]),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("class static");
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: header.clone(),
+                field: FieldDescriptor::new("ob_type", Some(header_owner.to_string())),
+                value: LinkArg::Value(class_static),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        let outer = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_struct_ctor(Vec::new(), outer_owner),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some(outer_owner.to_string())),
+                },
+                true,
+            )
+            .expect("outer ctor");
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: outer.clone(),
+                field: FieldDescriptor::new("ob_header", Some(outer_owner.to_string())),
+                value: LinkArg::Value(header),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        let boxed = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path(["runtime_object", "lltype", "malloc_typed"]),
+                    args: crate::model::call_args(vec![outer.clone()]),
+                    result_ty: ValueType::Ref(Some(outer_owner.to_string())),
+                },
+                true,
+            )
+            .expect("malloc_typed");
+        graph.set_return(entry, Some(boxed));
+        graph
+    }
+
+    fn boxing_cluster_ctor_new_counts(graph: &FunctionGraph) -> (usize, usize) {
+        let mut ctors = 0usize;
+        let mut news = 0usize;
+        for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+            match &op.kind {
+                OpKind::Call {
+                    target:
+                        CallTarget::SyntheticTransparentCtor {
+                            is_struct: true, ..
+                        },
+                    ..
+                } => ctors += 1,
+                OpKind::New { .. } => news += 1,
+                _ => {}
+            }
+        }
+        (ctors, news)
+    }
+
+    /// The nested header stored into a `malloc_typed` aggregate is still
+    /// part of the boxing cluster. Rewriting it to `New` would allocate the
+    /// header separately and leave fusion looking at a `New` instead of a
+    /// constructor.
+    #[test]
+    fn malloc_typed_nested_header_ctor_is_left_for_boxing_fusion() {
+        let mut graph = boxing_cluster_with_nested_header();
+        assert_eq!(boxing_cluster_ctor_new_counts(&graph), (2, 0));
+        assert_eq!(lower_struct_aggregate_ctors_to_new(&mut graph), 0);
+        assert_eq!(boxing_cluster_ctor_new_counts(&graph), (2, 0));
+    }
+
+    /// Final simplify must not steal the cluster either: fusion still has
+    /// to see the construct-on-stack spelling after class addresses land.
+    #[test]
+    fn final_simplify_leaves_boxing_cluster_ctors_including_nested_header() {
+        let mut graph = boxing_cluster_with_nested_header();
+        simplify_lowered_graph(&mut graph, &std::collections::HashMap::new(), true);
+        assert_eq!(boxing_cluster_ctor_new_counts(&graph), (2, 0));
     }
 
     /// Every row of the fn-pointer family decision, including the two the
@@ -34984,6 +38011,880 @@ mod tests {
         assert_eq!(copies[0].0.id(), input.id());
     }
 
+    fn scalar_method_call_fixture(
+        caller_name: &str,
+        callee_name: &[&str],
+        src_ty: serde_json::Value,
+        dst_ty: serde_json::Value,
+    ) -> Llbc {
+        let span = || {
+            serde_json::json!({
+                "data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 1}
+                }
+            })
+        };
+        let item_meta = |path: &[&str], is_local: bool| {
+            serde_json::json!({
+                "name": path
+                    .iter()
+                    .map(|segment| {
+                        if *segment == "<Impl>" {
+                            serde_json::json!({"Impl": {"kind": "InherentImplBlock"}})
+                        } else {
+                            serde_json::json!({"Ident": [segment, 0]})
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": is_local
+            })
+        };
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["fixture", caller_name], true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [src_ty.clone()],
+                "output": dst_ty.clone()
+            },
+            "body": {
+                "Unstructured": {
+                    "span": span(),
+                    "locals": {
+                        "arg_count": 1,
+                        "locals": [
+                            {"index": 0, "name": null, "span": span(), "ty": dst_ty.clone()},
+                            {"index": 1, "name": "value", "span": span(), "ty": src_ty.clone()}
+                        ]
+                    },
+                    "body": [
+                        {
+                            "statements": [],
+                            "terminator": {
+                                "span": span(),
+                                "kind": {
+                                    "Call": {
+                                        "call": {
+                                            "func": {
+                                                "Regular": {
+                                                    "kind": {"Fun": {"Regular": 1}},
+                                                    "generics": {
+                                                        "regions": [],
+                                                        "types": [src_ty.clone(), dst_ty.clone()],
+                                                        "const_generics": [],
+                                                        "trait_refs": []
+                                                    }
+                                                }
+                                            },
+                                            "args": [{
+                                                "Copy": {"kind": {"Local": 1}, "ty": src_ty.clone()}
+                                            }],
+                                            "dest": {"kind": {"Local": 0}, "ty": dst_ty.clone()}
+                                        },
+                                        "target": 2,
+                                        "on_unwind": 1
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {"span": span(), "kind": "UnwindResume"}
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {"span": span(), "kind": "Return"}
+                        }
+                    ]
+                }
+            }
+        });
+        let callee = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta(callee_name, false),
+            "signature": {
+                "is_unsafe": true,
+                "inputs": [src_ty.clone()],
+                "output": dst_ty.clone()
+            },
+            "body": "Opaque"
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [caller, callee],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes()).expect("scalar method fixture Llbc parses")
+    }
+
+    fn std_extern_call_fixture(
+        caller_name: &str,
+        callee_name: &[&str],
+        arg_tys: &[serde_json::Value],
+        dest_ty: serde_json::Value,
+    ) -> Llbc {
+        let span = || {
+            serde_json::json!({
+                "data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 1}
+                }
+            })
+        };
+        let item_meta = |path: &[&str], is_local: bool| {
+            serde_json::json!({
+                "name": path
+                    .iter()
+                    .map(|segment| {
+                        if *segment == "<Impl>" {
+                            serde_json::json!({"Impl": {"kind": "InherentImplBlock"}})
+                        } else {
+                            serde_json::json!({"Ident": [segment, 0]})
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": is_local
+            })
+        };
+        let generics = serde_json::json!({
+            "regions": [],
+            "types": [],
+            "const_generics": [],
+            "trait_refs": []
+        });
+        let mut locals = vec![serde_json::json!({
+            "index": 0,
+            "name": null,
+            "span": span(),
+            "ty": dest_ty.clone()
+        })];
+        for (i, ty) in arg_tys.iter().enumerate() {
+            locals.push(serde_json::json!({
+                "index": i + 1,
+                "name": format!("arg{i}"),
+                "span": span(),
+                "ty": ty
+            }));
+        }
+        let call_args: Vec<serde_json::Value> = arg_tys
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| {
+                serde_json::json!({
+                    "Copy": {"kind": {"Local": i + 1}, "ty": ty}
+                })
+            })
+            .collect();
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["fixture", caller_name], true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": arg_tys.to_vec(),
+                "output": dest_ty.clone()
+            },
+            "body": {
+                "Unstructured": {
+                    "span": span(),
+                    "locals": {
+                        "arg_count": arg_tys.len(),
+                        "locals": locals
+                    },
+                    "body": [
+                        {
+                            "statements": [],
+                            "terminator": {
+                                "span": span(),
+                                "kind": {
+                                    "Call": {
+                                        "call": {
+                                            "func": {
+                                                "Regular": {
+                                                    "kind": {"Fun": {"Regular": 1}},
+                                                    "generics": generics.clone()
+                                                }
+                                            },
+                                            "args": call_args,
+                                            "dest": {"kind": {"Local": 0}, "ty": dest_ty.clone()}
+                                        },
+                                        "target": 2,
+                                        "on_unwind": 1
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {"span": span(), "kind": "UnwindResume"}
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {"span": span(), "kind": "Return"}
+                        }
+                    ]
+                }
+            }
+        });
+        let callee = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta(callee_name, false),
+            "signature": {
+                "is_unsafe": true,
+                "inputs": arg_tys.to_vec(),
+                "output": dest_ty.clone()
+            },
+            "body": "Opaque"
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [caller, callee],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes()).expect("std extern fixture Llbc parses")
+    }
+
+    fn call_leafs(ops: &[&SpaceOperation]) -> Vec<String> {
+        ops.iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } => segments.last().cloned(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn copy_scalar_clone_is_the_value_itself() {
+        let i64_ty = serde_json::json!({"Literal": {"Int": "I64"}});
+        let recv = serde_json::json!({"Ref": ["_", i64_ty.clone(), "Shared"]});
+        let llbc = std_extern_call_fixture(
+            "clone_i64",
+            &["core", "clone", "impls", "<Impl>", "clone"],
+            &[recv],
+            i64_ty,
+        );
+        let graph = super::lower_function(&llbc, "clone_i64").expect("lower Copy clone");
+        let ops = graph_ops(&graph);
+        assert!(
+            !call_leafs(&ops).iter().any(|leaf| *leaf == "clone"),
+            "Copy clone must not residualize; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn non_copy_clone_lookalike_stays_residual() {
+        let adt = serde_json::json!({"Adt": {"id": {"Adt": 0}, "generics": {"types": []}}});
+        let recv = serde_json::json!({"Ref": ["_", adt.clone(), "Shared"]});
+        let llbc = std_extern_call_fixture(
+            "clone_vec",
+            &["core", "clone", "impls", "<Impl>", "clone"],
+            &[recv],
+            adt,
+        );
+        let graph = super::lower_function(&llbc, "clone_vec").expect("lower non-Copy clone");
+        let ops = graph_ops(&graph);
+        assert!(
+            call_leafs(&ops).iter().any(|leaf| *leaf == "clone"),
+            "a non-Copy clone must stay residual; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn clone_lookalike_path_stays_residual() {
+        let i64_ty = serde_json::json!({"Literal": {"Int": "I64"}});
+        let recv = serde_json::json!({"Ref": ["_", i64_ty.clone(), "Shared"]});
+        let llbc = std_extern_call_fixture(
+            "clone_blanket",
+            &["core", "clone", "<Impl>", "clone"],
+            &[recv],
+            i64_ty,
+        );
+        let graph = super::lower_function(&llbc, "clone_blanket").expect("lower lookalike clone");
+        let ops = graph_ops(&graph);
+        assert!(
+            call_leafs(&ops).iter().any(|leaf| *leaf == "clone"),
+            "core::clone::<Impl>::clone must not use the impls identity; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn scalar_default_is_the_zero_constant() {
+        let i64_ty = serde_json::json!({"Literal": {"Int": "I64"}});
+        let llbc = std_extern_call_fixture(
+            "default_i64",
+            &["core", "default", "<Impl>", "default"],
+            &[],
+            i64_ty,
+        );
+        let graph = super::lower_function(&llbc, "default_i64").expect("lower scalar default");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| matches!(op.kind, OpKind::ConstInt(0))),
+            "i64::default must become ConstInt(0); ops={ops:?}"
+        );
+        assert!(
+            !call_leafs(&ops).iter().any(|leaf| *leaf == "default"),
+            "scalar default must not residualize; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn pointer_default_is_a_null_constant() {
+        let ptr_ty = serde_json::json!({
+            "RawPtr": [{"Literal": {"Int": "I64"}}, "Mut"]
+        });
+        let llbc = std_extern_call_fixture(
+            "default_mut_ptr",
+            &["core", "ptr", "mut_ptr", "<Impl>", "default"],
+            &[],
+            ptr_ty,
+        );
+        let graph = super::lower_function(&llbc, "default_mut_ptr").expect("lower ptr default");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| matches!(op.kind, OpKind::ConstRefNull)),
+            "*mut T::default must become ConstRefNull; ops={ops:?}"
+        );
+        assert!(
+            !call_leafs(&ops).iter().any(|leaf| *leaf == "default"),
+            "pointer default must not residualize; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn default_lookalike_path_stays_residual() {
+        let i64_ty = serde_json::json!({"Literal": {"Int": "I64"}});
+        let llbc = std_extern_call_fixture(
+            "default_trait",
+            &["core", "default", "Default", "default"],
+            &[],
+            i64_ty,
+        );
+        let graph = super::lower_function(&llbc, "default_trait").expect("lower lookalike default");
+        let ops = graph_ops(&graph);
+        assert!(
+            call_leafs(&ops).iter().any(|leaf| *leaf == "default"),
+            "Default::default must stay residual; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn ptr_add_of_bytes_is_unscaled_add() {
+        let ptr_ty = serde_json::json!({
+            "RawPtr": [{"Literal": {"UInt": "U8"}}, "Mut"]
+        });
+        let usize_ty = serde_json::json!({"Literal": {"UInt": "Usize"}});
+        let llbc = std_extern_call_fixture(
+            "add_u8",
+            &["core", "ptr", "mut_ptr", "<Impl>", "add"],
+            &[ptr_ty.clone(), usize_ty],
+            ptr_ty,
+        );
+        let graph = super::lower_function(&llbc, "add_u8").expect("lower *mut u8::add");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add")),
+            "*mut u8::add must become int_add; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "mul")),
+            "*mut u8::add must not scale; ops={ops:?}"
+        );
+        assert!(
+            !call_leafs(&ops).iter().any(|leaf| *leaf == "add"),
+            "*mut u8::add must not residualize; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn ptr_add_of_i64_scales_by_pointee_size() {
+        let ptr_ty = serde_json::json!({
+            "RawPtr": [{"Literal": {"Int": "I64"}}, "Mut"]
+        });
+        let usize_ty = serde_json::json!({"Literal": {"UInt": "Usize"}});
+        let llbc = std_extern_call_fixture(
+            "add_i64",
+            &["core", "ptr", "const_ptr", "<Impl>", "add"],
+            &[ptr_ty.clone(), usize_ty],
+            ptr_ty,
+        );
+        let graph = super::lower_function(&llbc, "add_i64").expect("lower *const i64::add");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| matches!(op.kind, OpKind::ConstInt(8))),
+            "*const i64::add must multiply by 8; ops={ops:?}"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "mul")),
+            "*const i64::add must emit int_mul; ops={ops:?}"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add")),
+            "*const i64::add must emit int_add; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn ptr_add_lookalike_stays_residual() {
+        let ptr_ty = serde_json::json!({
+            "RawPtr": [{"Literal": {"UInt": "U8"}}, "Mut"]
+        });
+        let usize_ty = serde_json::json!({"Literal": {"UInt": "Usize"}});
+        let llbc = std_extern_call_fixture(
+            "wrapping_add",
+            &["core", "ptr", "mut_ptr", "<Impl>", "wrapping_add"],
+            &[ptr_ty.clone(), usize_ty],
+            ptr_ty,
+        );
+        let graph = super::lower_function(&llbc, "wrapping_add").expect("lower wrapping_add");
+        let ops = graph_ops(&graph);
+        assert!(
+            call_leafs(&ops).iter().any(|leaf| *leaf == "wrapping_add"),
+            "wrapping_add must stay residual; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn ptr_write_of_scalar_is_a_raw_store() {
+        let ptr_ty = serde_json::json!({
+            "RawPtr": [{"Literal": {"Int": "I64"}}, "Mut"]
+        });
+        let i64_ty = serde_json::json!({"Literal": {"Int": "I64"}});
+        let unit = serde_json::json!({
+            "Adt": {"id": "Tuple", "generics": {
+                "regions": [], "types": [], "const_generics": [], "trait_refs": []
+            }}
+        });
+        let llbc = std_extern_call_fixture(
+            "write_i64",
+            &["core", "ptr", "write"],
+            &[ptr_ty, i64_ty],
+            unit,
+        );
+        let graph = super::lower_function(&llbc, "write_i64").expect("lower ptr::write");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::RawStore {
+                    itemsize: 8,
+                    is_item_signed: true,
+                    ..
+                }
+            )),
+            "ptr::write of i64 must become RawStore; ops={ops:?}"
+        );
+        assert!(
+            !call_leafs(&ops).iter().any(|leaf| *leaf == "write"),
+            "scalar ptr::write must not residualize; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn ptr_write_lookalike_stays_residual() {
+        let ptr_ty = serde_json::json!({
+            "RawPtr": [{"Literal": {"Int": "I64"}}, "Mut"]
+        });
+        let i64_ty = serde_json::json!({"Literal": {"Int": "I64"}});
+        let unit = serde_json::json!({
+            "Adt": {"id": "Tuple", "generics": {
+                "regions": [], "types": [], "const_generics": [], "trait_refs": []
+            }}
+        });
+        let llbc = std_extern_call_fixture(
+            "write_unaligned",
+            &["core", "ptr", "write_unaligned"],
+            &[ptr_ty, i64_ty],
+            unit,
+        );
+        let graph = super::lower_function(&llbc, "write_unaligned").expect("lower write_unaligned");
+        let ops = graph_ops(&graph);
+        assert!(
+            call_leafs(&ops)
+                .iter()
+                .any(|leaf| *leaf == "write_unaligned"),
+            "write_unaligned must stay residual; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op.kind, OpKind::RawStore { .. })),
+            "write_unaligned must not become RawStore; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn vec_new_retargets_to_the_empty_list_constructor() {
+        let vec_ty = serde_json::json!({"Adt": {"id": {"Adt": 0}, "generics": {"types": []}}});
+        let llbc =
+            std_extern_call_fixture("vec_new", &["alloc", "vec", "<Impl>", "new"], &[], vec_ty);
+        let graph = super::lower_function(&llbc, "vec_new").expect("lower Vec::new");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments == &["vec".to_string(), "Vec".to_string(), "new".to_string()]
+            )),
+            "alloc::vec::<Impl>::new must retarget to vec::Vec::new; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn vec_push_retargets_to_list_append() {
+        let vec_ty = serde_json::json!({"Adt": {"id": {"Adt": 0}, "generics": {"types": []}}});
+        let i64_ty = serde_json::json!({"Literal": {"Int": "I64"}});
+        let unit = serde_json::json!({
+            "Adt": {"id": "Tuple", "generics": {
+                "regions": [], "types": [], "const_generics": [], "trait_refs": []
+            }}
+        });
+        let llbc = std_extern_call_fixture(
+            "vec_push",
+            &["alloc", "vec", "<Impl>", "push"],
+            &[vec_ty, i64_ty],
+            unit,
+        );
+        let graph = super::lower_function(&llbc, "vec_push").expect("lower Vec::push");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments == &["vec".to_string(), "Vec".to_string(), "push".to_string()]
+            )),
+            "alloc::vec::<Impl>::push must retarget to vec::Vec::push; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn vec_new_lookalike_stays_on_its_own_path() {
+        let vec_ty = serde_json::json!({"Adt": {"id": {"Adt": 0}, "generics": {"types": []}}});
+        let llbc = std_extern_call_fixture(
+            "vec_with_capacity",
+            &["alloc", "vec", "<Impl>", "with_capacity"],
+            &[serde_json::json!({"Literal": {"UInt": "Usize"}})],
+            vec_ty,
+        );
+        let graph =
+            super::lower_function(&llbc, "vec_with_capacity").expect("lower Vec::with_capacity");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments.last().is_some_and(|leaf| leaf == "with_capacity")
+            )),
+            "Vec::with_capacity must not take the Vec::new retarget; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments == &["vec".to_string(), "Vec".to_string(), "new".to_string()]
+            )),
+            "Vec::with_capacity must not become vec::Vec::new; ops={ops:?}"
+        );
+    }
+
+    fn graph_ops(graph: &crate::model::FunctionGraph) -> Vec<&SpaceOperation> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect()
+    }
+
+    #[test]
+    fn int_of_float_projects_to_cast_float_to_int() {
+        let llbc = scalar_method_call_fixture(
+            "to_int_unchecked_i64",
+            &["core", "f64", "<Impl>", "to_int_unchecked"],
+            serde_json::json!({"Literal": {"Float": "F64"}}),
+            serde_json::json!({"Literal": {"Int": "I64"}}),
+        );
+        let graph = super::lower_function(&llbc, "to_int_unchecked_i64")
+            .expect("lower f64::to_int_unchecked::<i64>");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, result_ty, .. }
+                    if op == "cast_float_to_int" && *result_ty == ValueType::Int
+            )),
+            "f64::to_int_unchecked::<i64> must become cast_float_to_int; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(op.kind, OpKind::Call { .. })),
+            "f64::to_int_unchecked::<i64> must not residualize; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn f64_to_bits_projects_to_float2longlong() {
+        let llbc = scalar_method_call_fixture(
+            "f64_to_bits",
+            &["core", "f64", "<Impl>", "to_bits"],
+            serde_json::json!({"Literal": {"Float": "F64"}}),
+            serde_json::json!({"Literal": {"UInt": "U64"}}),
+        );
+        let graph = super::lower_function(&llbc, "f64_to_bits").expect("lower f64::to_bits");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if matches!(segments.as_slice(), [a, b] if a == "longlong2float" && b == "float2longlong")
+            )),
+            "f64::to_bits must become float2longlong; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn f32_to_bits_is_not_projected() {
+        let llbc = scalar_method_call_fixture(
+            "f32_to_bits",
+            &["core", "f32", "<Impl>", "to_bits"],
+            serde_json::json!({"Literal": {"Float": "F32"}}),
+            serde_json::json!({"Literal": {"UInt": "U32"}}),
+        );
+        let graph = super::lower_function(&llbc, "f32_to_bits").expect("lower f32::to_bits");
+        let ops = graph_ops(&graph);
+        assert!(
+            !ops.iter().any(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } => matches!(
+                    segments.as_slice(),
+                    [a, b] if a == "longlong2float"
+                        && (b == "float2longlong" || b == "longlong2float")
+                ),
+                _ => false,
+            }),
+            "f32::to_bits must not become the f64 bitcast; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments.last().is_some_and(|leaf| leaf == "to_bits")
+            )),
+            "f32::to_bits must stay a residual call; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn i128_to_int_unchecked_is_not_projected() {
+        let llbc = scalar_method_call_fixture(
+            "to_int_unchecked_i128",
+            &["core", "f64", "<Impl>", "to_int_unchecked"],
+            serde_json::json!({"Literal": {"Float": "F64"}}),
+            serde_json::json!({"Literal": {"Int": "I128"}}),
+        );
+        let graph = super::lower_function(&llbc, "to_int_unchecked_i128")
+            .expect("lower f64::to_int_unchecked::<i128>");
+        let ops = graph_ops(&graph);
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, .. } if op == "cast_float_to_int"
+            )),
+            "to_int_unchecked::<i128> must not become the 64-bit cast; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments.last().is_some_and(|leaf| leaf == "to_int_unchecked")
+            )),
+            "to_int_unchecked::<i128> must stay residual; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn f64_i64_transmute_projects_to_float_bytes_llop() {
+        let llbc = scalar_method_call_fixture(
+            "transmute_f64_to_i64",
+            &["core", "intrinsics", "transmute"],
+            serde_json::json!({"Literal": {"Float": "F64"}}),
+            serde_json::json!({"Literal": {"Int": "I64"}}),
+        );
+        let graph = super::lower_function(&llbc, "transmute_f64_to_i64")
+            .expect("lower transmute::<f64, i64>");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, result_ty, .. }
+                    if op == "convert_float_bytes_to_longlong" && *result_ty == ValueType::Int
+            )),
+            "transmute::<f64, i64> must become convert_float_bytes_to_longlong; ops={ops:?}"
+        );
+    }
+
+    fn assert_unary_llop(ops: &[&SpaceOperation], name: &str, result_ty: ValueType) {
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, result_ty: ty, .. } if op == name && *ty == result_ty
+            )),
+            "{name} llop missing; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(op.kind, OpKind::Call { .. })),
+            "{name} must not residualize; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn host_float2longlong_projects_to_float_bytes_llop() {
+        let llbc = scalar_method_call_fixture(
+            "pyre_float2longlong",
+            &["pyre_object", "longlong2float", "float2longlong"],
+            serde_json::json!({"Literal": {"Float": "F64"}}),
+            serde_json::json!({"Literal": {"Int": "I64"}}),
+        );
+        let graph = super::lower_function(&llbc, "pyre_float2longlong")
+            .expect("lower pyre_object::longlong2float::float2longlong");
+        assert_unary_llop(
+            &graph_ops(&graph),
+            "convert_float_bytes_to_longlong",
+            ValueType::Int,
+        );
+    }
+
+    #[test]
+    fn host_longlong2float_projects_to_float_bytes_llop() {
+        let llbc = scalar_method_call_fixture(
+            "pyre_longlong2float",
+            &["pyre_interpreter", "longlong2float", "longlong2float"],
+            serde_json::json!({"Literal": {"Int": "I64"}}),
+            serde_json::json!({"Literal": {"Float": "F64"}}),
+        );
+        let graph = super::lower_function(&llbc, "pyre_longlong2float")
+            .expect("lower pyre_interpreter::longlong2float::longlong2float");
+        assert_unary_llop(
+            &graph_ops(&graph),
+            "convert_longlong_bytes_to_float",
+            ValueType::Float,
+        );
+    }
+
+    #[test]
+    fn host_lltype_cast_ptr_to_int_projects_to_llop() {
+        let ptr_ty = serde_json::json!({"RawPtr": [{"Literal": {"Int": "I64"}}, "Mut"]});
+        let llbc = scalar_method_call_fixture(
+            "pyre_cast_ptr_to_int",
+            &["pyre_object", "lltype", "cast_ptr_to_int"],
+            ptr_ty,
+            serde_json::json!({"Literal": {"Int": "I64"}}),
+        );
+        let graph = super::lower_function(&llbc, "pyre_cast_ptr_to_int")
+            .expect("lower pyre_object::lltype::cast_ptr_to_int");
+        assert_unary_llop(&graph_ops(&graph), "cast_ptr_to_int", ValueType::Int);
+    }
+
+    #[test]
+    fn host_lltype_cast_int_to_ptr_projects_to_llop() {
+        let ptr_ty = serde_json::json!({"RawPtr": [{"Literal": {"Int": "I64"}}, "Mut"]});
+        let llbc = scalar_method_call_fixture(
+            "pyre_cast_int_to_ptr",
+            &["pyre_object", "lltype", "cast_int_to_ptr"],
+            serde_json::json!({"Literal": {"Int": "I64"}}),
+            ptr_ty,
+        );
+        let graph = super::lower_function(&llbc, "pyre_cast_int_to_ptr")
+            .expect("lower pyre_object::lltype::cast_int_to_ptr");
+        assert_unary_llop(&graph_ops(&graph), "cast_int_to_ptr", ValueType::Ref(None));
+    }
+
+    #[test]
+    fn lookalike_float2longlong_path_is_not_projected() {
+        let llbc = scalar_method_call_fixture(
+            "lookalike_float2longlong",
+            &["pyre_object", "my_longlong2float", "float2longlong"],
+            serde_json::json!({"Literal": {"Float": "F64"}}),
+            serde_json::json!({"Literal": {"Int": "I64"}}),
+        );
+        let graph = super::lower_function(&llbc, "lookalike_float2longlong")
+            .expect("lower look-alike float2longlong path");
+        let ops = graph_ops(&graph);
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, .. }
+                    if op == "convert_float_bytes_to_longlong"
+                        || op == "convert_longlong_bytes_to_float"
+                        || op == "cast_ptr_to_int"
+                        || op == "cast_int_to_ptr"
+            )),
+            "substring look-alike must not become a host llop; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments.last().is_some_and(|leaf| leaf == "float2longlong")
+            )),
+            "look-alike path must stay a residual call; ops={ops:?}"
+        );
+    }
+
     #[test]
     fn equal_size_int_to_float_transmute_stays_residual() {
         let llbc = transmute_lowering_fixture();
@@ -35446,6 +39347,206 @@ mod tests {
         assert!(!int_binop_needs_ptr_to_int("lt", Some(&int), Some(&int)));
         assert!(!int_binop_needs_ptr_to_int("mod", Some(&int), Some(&int)));
         assert!(!int_binop_needs_ptr_to_int("add", Some(&ptr), Some(&ptr)));
+    }
+
+    fn fixture_ty(v: serde_json::Value) -> TyRef {
+        serde_json::from_value::<TyRef>(serde_json::json!({
+            "HashConsedValue": [0, v]
+        }))
+        .expect("fixture TyRef parses")
+    }
+
+    fn shared_borrow_of_usize() -> TyRef {
+        fixture_ty(serde_json::json!({
+            "Ref": [
+                {"Erased": null},
+                {"Literal": {"UInt": "Usize"}},
+                "Shared"
+            ]
+        }))
+    }
+
+    fn shared_borrow_of_u8() -> TyRef {
+        fixture_ty(serde_json::json!({
+            "Ref": [
+                {"Erased": null},
+                {"Literal": {"UInt": "U8"}},
+                "Shared"
+            ]
+        }))
+    }
+
+    fn adt_ty(def_id: u64) -> TyRef {
+        fixture_ty(serde_json::json!({
+            "Adt": {"id": {"Adt": def_id}, "generics": {"types": []}}
+        }))
+    }
+
+    fn type_decl_meta(path: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": {"data": {
+                "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+            }},
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        })
+    }
+
+    fn llbc_with_ordinary_and_closure_env() -> Llbc {
+        // def_id 0: ordinary struct named `closure` with src TopLevel — the
+        // name leaf must not decide env-ness.
+        // def_id 1: compiler-generated closure env named `Env` with src Closure.
+        let file = serde_json::json!({
+            "charon_version": "0.1.201", "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [
+                    {
+                        "def_id": 0,
+                        "item_meta": type_decl_meta(&["fixture", "BorrowedByte", "closure"]),
+                        "kind": {"Struct": [{
+                            "name": "byte",
+                            "ty": {"Ref": [{"Erased": null}, {"Literal": {"UInt": "U8"}}, "Shared"]},
+                            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+                        }]},
+                        "src": "TopLevel"
+                    },
+                    {
+                        "def_id": 1,
+                        "item_meta": type_decl_meta(&["fixture", "try_dispatch_binary_special", "Env"]),
+                        "kind": {"Struct": [{
+                            "name": null,
+                            "ty": {"Ref": [{"Erased": null}, {"Literal": {"UInt": "Usize"}}, "Shared"]},
+                            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": false}
+                        }]},
+                        "src": {"Closure": {"info": {"kind": "FnOnce"}}}
+                    }
+                ],
+                "fun_decls": [], "global_decls": [], "trait_decls": [], "trait_impls": []
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses")
+    }
+
+    #[test]
+    fn type_decl_is_closure_env_reads_src_not_the_name() {
+        let llbc = llbc_with_ordinary_and_closure_env();
+        let named_closure = llbc.type_by_id(0).expect("ordinary struct");
+        let env = llbc.type_by_id(1).expect("closure env");
+        assert!(
+            !type_decl_is_closure_env(named_closure),
+            "a struct whose leaf is `closure` but whose src is TopLevel is not an env"
+        );
+        assert!(
+            type_decl_is_closure_env(env),
+            "src Closure identifies the env even when the leaf is not `closure`"
+        );
+        assert!(!tyref_is_closure_env(&adt_ty(0), &llbc));
+        assert!(tyref_is_closure_env(&adt_ty(1), &llbc));
+    }
+
+    #[test]
+    fn adt_field_read_peels_shared_borrow_of_usize_to_unsigned() {
+        // `try_dispatch_binary_special::closure::call` captures `operands:
+        // usize` by shared borrow.  `Rvalue::Ref` aliases that integer, so
+        // the field read must be Unsigned; leaving it Ref assembles
+        // `int_add/ri>i` at pc 10 of jitcode `call`.
+        let llbc = llbc_with_ordinary_and_closure_env();
+        let ref_usize = shared_borrow_of_usize();
+        let ref_u8 = shared_borrow_of_u8();
+        assert_eq!(
+            tyref_to_value_type(&ref_usize, &llbc),
+            ValueType::Ref(None),
+            "the global projection stays non-peeling for &usize"
+        );
+        assert_eq!(
+            adt_field_read_value_type(&ref_u8, &ref_u8, false, false, &llbc),
+            ValueType::Ref(None),
+            "an ordinary struct's &u8 field is a stored pointer"
+        );
+        assert_eq!(
+            adt_field_read_value_type(&ref_usize, &ref_usize, false, true, &llbc),
+            ValueType::Unsigned,
+            "a closure-env &usize capture is the usize"
+        );
+        let ordinary = llbc.type_by_id(0).expect("ordinary struct");
+        let env = llbc.type_by_id(1).expect("closure env");
+        assert_eq!(
+            tyref_to_attr_value_type(&ref_u8, &llbc),
+            ValueType::Ref(None),
+            "the generic attr projection does not peel a stored &u8"
+        );
+        assert_eq!(
+            tyref_to_attr_value_type_for_struct_field(&ref_u8, ordinary, &llbc),
+            ValueType::Ref(None),
+            "FORCE-attr rows for an ordinary struct stay Ref"
+        );
+        assert_eq!(
+            tyref_to_attr_value_type_for_struct_field(&ref_usize, env, &llbc),
+            ValueType::Unsigned,
+            "FORCE-attr rows for a closure-env capture match the Int-banked getfield"
+        );
+    }
+
+    #[test]
+    fn resolve_adt_field_keys_a_closure_capture_by_its_full_path() {
+        use super::Lowering;
+        use majit_charon_reader::ullbc::Unstructured;
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+        }});
+        let file = serde_json::json!({
+            "charon_version": "0.1.201", "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [{
+                    "def_id": 0,
+                    "item_meta": {
+                        "name": [
+                            {"Ident": ["fixture", 0]},
+                            {"Ident": ["try_dispatch_binary_special", 0]},
+                            {"Ident": ["closure", 0]}
+                        ],
+                        "span": span, "source_text": null,
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                        "is_local": true
+                    },
+                    "kind": {"Struct": [{
+                        "name": null,
+                        "ty": {"Literal": {"UInt": "Usize"}},
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": false}
+                    }]}
+                }],
+                "fun_decls": [], "global_decls": [], "trait_decls": [], "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).unwrap();
+        let body: Unstructured = serde_json::from_value(serde_json::json!({
+            "locals": {"arg_count": 0, "locals": []}, "body": [], "span": span
+        }))
+        .unwrap();
+        let dont_look_inside = std::collections::HashSet::new();
+        let lowering = Lowering::new(
+            &llbc,
+            "fixture".into(),
+            &body,
+            crate::HostStaticAddrs::default(),
+            &[],
+            None,
+            &dont_look_inside,
+        )
+        .unwrap();
+        let payload = serde_json::json!([{"Adt": [0, null]}, 0]);
+        let (owner_root, field_name, _, _) = lowering
+            .resolve_adt_field(&payload)
+            .expect("closure field projection must resolve");
+        assert_eq!(field_name, "__pos_0");
+        assert_eq!(
+            owner_root, "try_dispatch_binary_special::closure",
+            "the shared leaf `closure` is withdrawn; the field keys the full path"
+        );
     }
 
     #[test]
@@ -40960,5 +45061,266 @@ mod tests {
             .is_none()
         );
         assert!(primitive_float_const(&["unrelated".into()]).is_none());
+    }
+
+    fn disc_site(kind: super::DiscCombinator, result_var: Variable) -> super::DiscCombinatorSite {
+        super::DiscCombinatorSite {
+            kind,
+            result_var,
+            recv_owner: "core::result::Result".into(),
+            recv_tag0_owner: "core::result::Result::Ok".into(),
+            recv_tag1_owner: "core::result::Result::Err".into(),
+            payload0_ty: ValueType::Int,
+            payload1_ty: ValueType::Int,
+            payload0_class: None,
+            payload1_class: None,
+            result_owner: "core::result::Result".into(),
+            result_tag0_owner: "core::result::Result::Ok".into(),
+            result_tag1_owner: "core::result::Result::Err".into(),
+            result_payload0_ty: ValueType::Int,
+            result_payload1_ty: ValueType::Int,
+            result_payload0_class: None,
+            result_payload1_class: None,
+            call_once_owner: "test::closure".into(),
+            args_tuple_suffix: String::new(),
+            call_result_ty: ValueType::Int,
+            call_result_class: None,
+        }
+    }
+
+    fn option_disc_site(
+        kind: super::DiscCombinator,
+        result_var: Variable,
+    ) -> super::DiscCombinatorSite {
+        let mut site = disc_site(kind, result_var);
+        site.recv_owner = "core::option::Option".into();
+        site.recv_tag1_owner = "core::option::Option::Some".into();
+        site.result_owner = "core::option::Option".into();
+        site.result_tag1_owner = "core::option::Option::Some".into();
+        site.call_result_ty = ValueType::Bool;
+        site
+    }
+
+    fn count_method_calls(graph: &FunctionGraph, method: &str) -> usize {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::Method { name, .. }, .. } if name == method
+                )
+            })
+            .count()
+    }
+
+    fn build_two_arg_combinator(method: &str) -> (FunctionGraph, Variable) {
+        let mut graph = FunctionGraph::new("test_disc_combinator");
+        let a = graph.startblock;
+        let recv = graph.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let extra = graph.push_op_var(a, OpKind::ConstInt(7), true).unwrap();
+        let result = graph
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::method(method, Some("Result".into())),
+                    args: crate::model::call_args(vec![recv, extra]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _) = graph.create_block_with_arg_vars(1);
+        graph.set_return(b, None);
+        graph.set_goto(a, b, vec![result.clone()]);
+        (graph, result)
+    }
+
+    #[test]
+    fn result_map_lowers_to_discriminant_switch() {
+        let (mut graph, result) = build_two_arg_combinator("map");
+        let rewritten = super::rewire_disc_combinator_sites(
+            &mut graph,
+            &[disc_site(super::DiscCombinator::ResultMap, result)],
+            crate::ErrorCarrierSpec::default(),
+        );
+        assert_eq!(rewritten, 1);
+        assert_eq!(count_method_calls(&graph, "map"), 0);
+        assert_eq!(count_method_calls(&graph, "call_once"), 1);
+        assert_eq!(graph.blocks[graph.startblock.0].exits.len(), 2);
+    }
+
+    #[test]
+    fn option_filter_lowers_to_discriminant_and_predicate_switch() {
+        let mut graph = FunctionGraph::new("test_filter");
+        let a = graph.startblock;
+        let recv = graph.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let env = graph.push_op_var(a, OpKind::ConstInt(7), true).unwrap();
+        let result = graph
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::method("filter", Some("Option".into())),
+                    args: crate::model::call_args(vec![recv, env]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _) = graph.create_block_with_arg_vars(1);
+        graph.set_return(b, None);
+        graph.set_goto(a, b, vec![result.clone()]);
+        let rewritten = super::rewire_disc_combinator_sites(
+            &mut graph,
+            &[option_disc_site(
+                super::DiscCombinator::OptionFilter,
+                result,
+            )],
+            crate::ErrorCarrierSpec::default(),
+        );
+        assert_eq!(rewritten, 1);
+        assert_eq!(count_method_calls(&graph, "filter"), 0);
+        assert_eq!(count_method_calls(&graph, "call_once"), 1);
+        assert_eq!(graph.blocks[graph.startblock.0].exits.len(), 2);
+        let pred_branches = graph
+            .blocks
+            .iter()
+            .filter(|block| block.exits.len() == 2 && block.id != graph.startblock)
+            .count();
+        assert_eq!(pred_branches, 1, "the Some arm switches on the predicate");
+    }
+
+    #[test]
+    fn result_ok_lowers_to_some_none_switch() {
+        let mut graph = FunctionGraph::new("test_result_ok");
+        let a = graph.startblock;
+        let recv = graph.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let result = graph
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::method("ok", Some("Result".into())),
+                    args: crate::model::call_args(vec![recv]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _) = graph.create_block_with_arg_vars(1);
+        graph.set_return(b, None);
+        graph.set_goto(a, b, vec![result.clone()]);
+        let mut site = disc_site(super::DiscCombinator::ResultOk, result);
+        site.result_owner = "core::option::Option".into();
+        site.result_tag1_owner = "core::option::Option::Some".into();
+        let rewritten = super::rewire_disc_combinator_sites(
+            &mut graph,
+            &[site],
+            crate::ErrorCarrierSpec::default(),
+        );
+        assert_eq!(rewritten, 1);
+        assert_eq!(count_method_calls(&graph, "ok"), 0);
+        assert_eq!(graph.blocks[graph.startblock.0].exits.len(), 2);
+    }
+
+    #[test]
+    fn result_is_ok_replaces_the_call_with_a_tag_compare() {
+        let mut graph = FunctionGraph::new("test_is_ok");
+        let a = graph.startblock;
+        let recv = graph.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let result = graph
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::method("is_ok", Some("Result".into())),
+                    args: crate::model::call_args(vec![recv]),
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _) = graph.create_block_with_arg_vars(1);
+        graph.set_return(b, None);
+        graph.set_goto(a, b, vec![result.clone()]);
+        let rewritten = super::rewire_disc_combinator_sites(
+            &mut graph,
+            &[disc_site(super::DiscCombinator::ResultIsOk, result)],
+            crate::ErrorCarrierSpec::default(),
+        );
+        assert_eq!(rewritten, 1);
+        assert_eq!(count_method_calls(&graph, "is_ok"), 0);
+        assert!(
+            graph.blocks[a.0]
+                .operations
+                .iter()
+                .any(|op| { matches!(&op.kind, OpKind::BinOp { op, .. } if op == "eq") })
+        );
+    }
+
+    #[test]
+    fn result_unwrap_or_else_calls_on_err() {
+        let (mut graph, result) = build_two_arg_combinator("unwrap_or_else");
+        let rewritten = super::rewire_disc_combinator_sites(
+            &mut graph,
+            &[disc_site(super::DiscCombinator::ResultUnwrapOrElse, result)],
+            crate::ErrorCarrierSpec::default(),
+        );
+        assert_eq!(rewritten, 1);
+        assert_eq!(count_method_calls(&graph, "unwrap_or_else"), 0);
+        assert_eq!(count_method_calls(&graph, "call_once"), 1);
+    }
+
+    #[test]
+    fn core_option_result_method_paths() {
+        assert!(super::is_core_option_method(
+            "core::option::<Impl>::filter",
+            "filter"
+        ));
+        assert!(super::is_core_result_method(
+            "core::result::Result::map",
+            "map"
+        ));
+        assert!(!super::is_core_result_method(
+            "core::option::<Impl>::map",
+            "map"
+        ));
+        assert!(!super::is_core_option_method(
+            "mycrate::option::<Impl>::filter",
+            "filter"
+        ));
+    }
+
+    #[test]
+    fn desugar_mix_result_question_mark_lowers_to_result_switch() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../charon-corpus/corpus.ullbc");
+        let llbc = Llbc::load(path).expect("load corpus");
+        let graph = super::lower_function(&llbc, "desugar_mix").expect("lowering");
+        let residual_branch = count_method_calls(&graph, "branch");
+        let residual_from_residual = count_method_calls(&graph, "from_residual");
+        assert_eq!(
+            residual_branch, 0,
+            "desugar_mix: residual Try::branch after Result `?` lowering"
+        );
+        assert_eq!(
+            residual_from_residual, 0,
+            "desugar_mix: residual from_residual after Result `?` lowering"
+        );
+        let result_disc = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. }
+                        if field.name == "__discriminant"
+                            && field.owner_root.as_deref().is_some_and(|owner| owner.contains("Result"))
+                )
+            })
+            .count();
+        assert!(
+            result_disc >= 1,
+            "desugar_mix: expected a Result discriminant switch"
+        );
     }
 }

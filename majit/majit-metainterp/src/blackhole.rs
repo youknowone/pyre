@@ -11190,6 +11190,10 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
             majit_translate::insns::BC_CAST_PTR_TO_INT,
         ),
         (
+            "cast_int_to_ptr/i>r",
+            majit_translate::insns::BC_CAST_INT_TO_PTR,
+        ),
+        (
             "int_isconstant/i>i",
             majit_translate::insns::BC_INT_ISCONSTANT,
         ),

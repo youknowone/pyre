@@ -30,6 +30,7 @@ pyre-object = { workspace = true }
 pyre-interpreter = { workspace = true }
 pyre-module = { workspace = true }
 rustpython-wtf8 = { workspace = true }
+linkme = { workspace = true }
 majit-ir = { workspace = true }
 majit-macros = { workspace = true }
 majit-metainterp = { workspace = true }
@@ -47,6 +48,7 @@ majit-backend-cranelift = { workspace = true, optional = true }
 majit-backend-dynasm = { workspace = true, optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+ctor = { workspace = true }
 # The wasm backend's exception helpers (jit_exc_raise) are needed on wasm32
 # where the native backends are absent. default-features off: the host
 # binding (web vs host-import) is selected upstream by pyre-jit, so pulling
