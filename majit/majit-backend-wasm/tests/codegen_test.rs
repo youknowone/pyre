@@ -159,8 +159,10 @@ fn stat_value(stderr: &str, name: &str) -> u64 {
 /// CALL_ASSEMBLER must not refill a frame on the bump path. The inline
 /// bump leaves `jf_gcmap` unset. Expected `memory.fill`s are the entry
 /// home clear of marked slots, leftover `NEW_ARRAY_CLEAR` ZERO_ARRAY,
-/// and the CA caller nulling the callee home range (`home_slots * SLOT_SIZE`
-/// from the dispatch snapshot) before publishing that snapshot's gcmap.
+/// rewriter `ZeroArray` payload zeros of a freshly allocated Python
+/// array, and the CA caller nulling the callee home range
+/// (`home_slots * SLOT_SIZE` from the dispatch snapshot) before
+/// publishing that snapshot's gcmap.
 #[track_caller]
 fn assert_no_call_assembler_frame_fill(stderr: &str) {
     let home_base = format!(
@@ -210,11 +212,69 @@ fn assert_no_call_assembler_frame_fill(stderr: &str) {
             && lines[index - 3] == home_slots
             && lines[index - 2] == "i32.const 8"
             && lines[index - 1] == "i32.mul";
+        // `OpCode::ZeroArray` after `emit_pending_zeros` (scales rewritten
+        // to 1, start/size in bytes): dest = wrap(base) + start +
+        // `ArrayDescr.base_size()`. PeepSink folds `wrap(const)` to
+        // `i32.const` and drops a 0 add, so a trimmed start is two adds
+        // and a 0 start (or 0 `base_size`) is one.
+        let is_zero_array = index >= 8
+            && lines[index - 8].starts_with("local.get ")
+            && lines[index - 7] == "i32.wrap_i64"
+            && lines[index - 6].starts_with("i32.const ")
+            && lines[index - 5] == "i32.add"
+            && lines[index - 4].starts_with("i32.const ")
+            && lines[index - 3] == "i32.add"
+            && lines[index - 2] == "i32.const 0"
+            && lines[index - 1].starts_with("i32.const ");
+        let is_zero_array_zero_start = index >= 6
+            && lines[index - 6].starts_with("local.get ")
+            && lines[index - 5] == "i32.wrap_i64"
+            && lines[index - 4].starts_with("i32.const ")
+            && lines[index - 3] == "i32.add"
+            && lines[index - 2] == "i32.const 0"
+            && lines[index - 1].starts_with("i32.const ");
         assert!(
-            is_entry_home_clear || is_headered_payload || is_object_zero || is_ca_callee_home_null,
+            is_entry_home_clear
+                || is_headered_payload
+                || is_object_zero
+                || is_ca_callee_home_null
+                || is_zero_array
+                || is_zero_array_zero_start,
             "recursive CA filled a nursery frame on the bump path:\n{stderr}"
         );
     }
+}
+
+#[test]
+fn zero_array_payload_fill_is_not_a_frame_refill() {
+    assert_no_call_assembler_frame_fill(
+        "\
+local.get 37
+i32.wrap_i64
+i32.const 4
+i32.add
+i32.const 4
+i32.add
+i32.const 0
+i32.const 20
+memory.fill
+",
+    );
+}
+
+#[test]
+fn zero_array_zero_start_payload_fill_is_not_a_frame_refill() {
+    assert_no_call_assembler_frame_fill(
+        "\
+local.get 37
+i32.wrap_i64
+i32.const 4
+i32.add
+i32.const 0
+i32.const 24
+memory.fill
+",
+    );
 }
 
 #[test]
