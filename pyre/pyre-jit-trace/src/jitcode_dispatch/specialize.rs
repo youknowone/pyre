@@ -4215,6 +4215,13 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
 
     walker_emit_shadow_guard(ctx, op_pc, obj, concrete_obj, shadow)?;
 
+    if crate::jitcode_dispatch::diag::fbw_mf_diag_enabled() {
+        eprintln!(
+            "[lma] pc={op_pc} name={name} obj={concrete_obj:p} w_type={w_type:p} \
+             vt={version_tag} w_descr={w_descr:p} descr_t={}",
+            unsafe { pyre_object::type_name_of(w_descr) },
+        );
+    }
     let method_const = ctx.trace_ctx.const_ref(w_descr as i64);
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, method_const)?;
     Ok(Some(()))
@@ -4766,6 +4773,12 @@ pub(crate) fn try_walker_fold_load_method_self<Sym: WalkSym>(
     // the whole precondition.  Left as a residual this is a second per-iteration
     // call on top of the `getattr` one (`lst.append(x)` pays both).
     if unsafe { pyre_object::is_method(concrete_attr) } {
+        if crate::jitcode_dispatch::diag::fbw_mf_diag_enabled() {
+            eprintln!(
+                "[lms] pc={op_pc} IS_METHOD attr={concrete_attr:p} attr_const={}",
+                attr.is_constant(),
+            );
+        }
         let method_type_addr = &pyre_object::function::METHOD_TYPE as *const _ as i64;
         let class_pinned = attr.is_constant() || ctx.trace_ctx.heap_cache().is_class_known(attr);
         if !class_pinned {
@@ -4795,6 +4808,16 @@ pub(crate) fn try_walker_fold_load_method_self<Sym: WalkSym>(
     };
     let bound =
         pyre_interpreter::eval::compute_load_method_bound(concrete_obj, concrete_attr, &name);
+    if crate::jitcode_dispatch::diag::fbw_mf_diag_enabled() {
+        eprintln!(
+            "[lms] pc={op_pc} name={name} obj={concrete_obj:p} obj_t={} attr={concrete_attr:p} \
+             attr_t={} attr_const={} bound={bound:p} obj_class={:p}",
+            unsafe { pyre_object::type_name_of(concrete_obj) },
+            unsafe { pyre_object::type_name_of(concrete_attr) },
+            attr.is_constant(),
+            unsafe { (*concrete_obj).w_class },
+        );
+    }
     let bound_op = if std::ptr::eq(bound, concrete_obj) {
         obj
     } else if bound == pyre_object::PY_NULL {
