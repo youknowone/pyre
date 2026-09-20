@@ -155,22 +155,15 @@ pub fn w_pytraceback_new(
     lineno: i64,
     w_code: PyObjectRef,
 ) -> PyObjectRef {
-    // `pytraceback.py PyTraceback` is an ordinary `W_Root` (`malloc_fixedsize`).
-    // Collecting nursery so a node that dies in the handler does not wait for
-    // a major cycle.  JIT-emitted nodes already use the movable SizeDescr
-    // (`descr.rs jit_emitted_tracebacks_are_movable_but_raw_pointer_objects_are_not`).
-    // Host nodes match that placement because every live traceback pointer is a
-    // traced field (`W_BaseException.w_traceback`, `PyTraceback.w_next`) or a
-    // rooted slot (`fbw_store_journal_root_walker` for `FBW_TRACEBACK_STORE_JOURNAL`).
-    // Blackhole / resume carriers hold the exception as a raw i64, not the node.
-    // `frame` / `w_next` / `w_code` are pinned because this allocation can
-    // safepoint and a raw `*mut PyFrame` held only in locals is reachable from
-    // no root walker.  Most frames are allocated non-moving (`FrameBox::new`);
-    // a compiled trace's inlined-callee frame is a nursery object, so a minor
-    // triggered here would recycle an unrooted copy.
-    let w_class = get_instantiate(&PYTRACEBACK_TYPE);
+    // `frame` is pinned alongside the two managed fields, because the
+    // allocation below can safepoint and a raw `*mut PyFrame` held only in
+    // this function's locals is reachable from no root walker.  Most frames
+    // are allocated non-moving (`FrameBox::new`).  A compiled trace's
+    // inlined-callee frame is a nursery object, so a minor triggered here
+    // would recycle an unrooted copy.  Upstream relocates that frame and
+    // rewrites the slot (`incminimark.py minor_collection`).
     let roots = pyre_object::gc_roots::push_roots();
-    let inputs = pyre_object::gc_roots::pin_roots(&[w_next, w_code, frame as PyObjectRef, w_class]);
+    let inputs = pyre_object::gc_roots::pin_roots(&[w_next, w_code, frame as PyObjectRef]);
 
     // Nursery, same as `space.allocate_instance(PyTraceback)` /
     // `malloc_fixedsize`.  The host-side constructor used to take
@@ -197,7 +190,7 @@ pub fn w_pytraceback_new(
     let value = PyTraceback {
         ob_header: PyObject {
             ob_type: &PYTRACEBACK_TYPE as *const PyType,
-            w_class: roots.get(inputs + 3),
+            w_class: get_instantiate(&PYTRACEBACK_TYPE),
         },
         frame: roots.get(inputs + 2) as *mut crate::pyframe::PyFrame,
         lasti,
