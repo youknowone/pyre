@@ -6228,8 +6228,11 @@ impl<S: JitState> JitDriver<S> {
                 .meta
                 .tracing
                 .as_ref()
-                .and_then(|ctx| ctx.virtualizable_heap_ptr());
+                .map(|ctx| ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null()));
             if !self.sync_before(state, &compiled_meta, vable) {
+                // `sync_before` returns false only from its early
+                // `sync_named_virtualizable_before_jit` failure, which is
+                // before it writes the context pointer.
                 return None;
             }
             // The entry arguments are assembled in buffers the driver keeps
@@ -6303,6 +6306,7 @@ impl<S: JitState> JitDriver<S> {
                     state.state_field_layout().total_live_values(),
                 ) {
                     self.entry_scratch_out(scratch);
+                    self.restore_trace_vable_ptr(saved_vable_ptr);
                     return None;
                 }
 
@@ -6316,6 +6320,7 @@ impl<S: JitState> JitDriver<S> {
                     &mut scratch.vable_arrays,
                 ) {
                     self.entry_scratch_out(scratch);
+                    self.restore_trace_vable_ptr(saved_vable_ptr);
                     return None;
                 }
             }
@@ -6334,6 +6339,7 @@ impl<S: JitState> JitDriver<S> {
                         );
                     }
                     self.entry_scratch_out(scratch);
+                    self.restore_trace_vable_ptr(saved_vable_ptr);
                     return None;
                 };
                 if crate::callee_rca_enabled() {
@@ -6354,6 +6360,7 @@ impl<S: JitState> JitDriver<S> {
                 // types are confirmed here as well.
                 let Some(types) = self.meta.front_target_inputarg_types(green_key) else {
                     self.entry_scratch_out(scratch);
+                    self.restore_trace_vable_ptr(saved_vable_ptr);
                     return None;
                 };
                 if types.len() != scratch.live_values.len()
@@ -6376,6 +6383,7 @@ impl<S: JitState> JitDriver<S> {
                         );
                     }
                     self.entry_scratch_out(scratch);
+                    self.restore_trace_vable_ptr(saved_vable_ptr);
                     return None;
                 }
             }
@@ -7835,6 +7843,18 @@ impl<S: JitState> JitDriver<S> {
         true
     }
 
+    /// Puts back the recording context's virtualizable frame saved before a
+    /// compiled entry. `sync_after` does this for the exits that take it; the
+    /// decline and finish exits call this directly, because a walk that resumes
+    /// recording must flush into its own frame whether or not the entry ran.
+    fn restore_trace_vable_ptr(&mut self, saved: Option<*const u8>) {
+        if let Some(ptr) = saved {
+            if let Some(ctx) = self.meta.tracing.as_mut() {
+                ctx.set_virtualizable_heap_ptr(ptr);
+            }
+        }
+    }
+
     /// Counterpart of [`Self::sync_before`]; takes the same pre-resolved
     /// virtualizable red, and for the same reason. Restores the recording
     /// context's virtualizable pointer saved before that `sync_before`.
@@ -7845,11 +7865,7 @@ impl<S: JitState> JitDriver<S> {
         virtualizable: Option<&JitDriverVar>,
         saved_vable_ptr: Option<*const u8>,
     ) {
-        if let Some(ptr) = saved_vable_ptr {
-            if let Some(ctx) = self.meta.tracing.as_mut() {
-                ctx.set_virtualizable_heap_ptr(ptr);
-            }
-        }
+        self.restore_trace_vable_ptr(saved_vable_ptr);
         let Some(virtualizable) = virtualizable else {
             return;
         };
@@ -8105,7 +8121,7 @@ impl<S: JitState> JitDriver<S> {
             .meta
             .tracing
             .as_ref()
-            .and_then(|ctx| ctx.virtualizable_heap_ptr());
+            .map(|ctx| ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null()));
         if !state.is_compatible(&meta) || !self.sync_before(state, &meta, vable) {
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
@@ -8129,6 +8145,7 @@ impl<S: JitState> JitDriver<S> {
             &live_values,
             state.state_field_layout().total_live_values(),
         ) {
+            self.restore_trace_vable_ptr(saved_vable_ptr);
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
@@ -8137,6 +8154,7 @@ impl<S: JitState> JitDriver<S> {
         let Some(live_values) =
             self.extend_compiled_live_values(green_key, state, &meta, vable, live_values)
         else {
+            self.restore_trace_vable_ptr(saved_vable_ptr);
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
@@ -8150,6 +8168,7 @@ impl<S: JitState> JitDriver<S> {
                 .meta
                 .pack_front_target_live_values(green_key, &live_values)
             else {
+                self.restore_trace_vable_ptr(saved_vable_ptr);
                 return DetailedDriverRunOutcome::Abort {
                     restored: false,
                     via_blackhole: false,
@@ -8169,6 +8188,7 @@ impl<S: JitState> JitDriver<S> {
                 .run_compiled_detailed_with_values(green_key, &live_values)
         };
         let Some(mut result) = result else {
+            self.restore_trace_vable_ptr(saved_vable_ptr);
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
@@ -8181,6 +8201,7 @@ impl<S: JitState> JitDriver<S> {
             let typed_values = std::mem::take(&mut result.typed_values).into_vec();
             let is_exit_frame_with_exception = result.is_exit_frame_with_exception;
             drop(result);
+            self.restore_trace_vable_ptr(saved_vable_ptr);
             return DetailedDriverRunOutcome::Finished {
                 typed_values,
                 via_blackhole: false,
@@ -8271,7 +8292,7 @@ impl<S: JitState> JitDriver<S> {
             .meta
             .tracing
             .as_ref()
-            .and_then(|ctx| ctx.virtualizable_heap_ptr());
+            .map(|ctx| ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null()));
         if !self.sync_before(state, &meta, vable) {
             if crate::majit_log_enabled() {
                 eprintln!(
@@ -8310,6 +8331,7 @@ impl<S: JitState> JitDriver<S> {
                     ),
                 );
             }
+            self.restore_trace_vable_ptr(saved_vable_ptr);
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
@@ -8324,6 +8346,7 @@ impl<S: JitState> JitDriver<S> {
                     green_key, target_pc
                 );
             }
+            self.restore_trace_vable_ptr(saved_vable_ptr);
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
@@ -8340,6 +8363,7 @@ impl<S: JitState> JitDriver<S> {
                     green_key, target_pc
                 );
             }
+            self.restore_trace_vable_ptr(saved_vable_ptr);
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
@@ -8376,6 +8400,7 @@ impl<S: JitState> JitDriver<S> {
         if is_finish {
             let typed_values = std::mem::take(&mut result.typed_values).into_vec();
             drop(result);
+            self.restore_trace_vable_ptr(saved_vable_ptr);
             return DetailedDriverRunOutcome::Finished {
                 typed_values,
                 via_blackhole: false,
