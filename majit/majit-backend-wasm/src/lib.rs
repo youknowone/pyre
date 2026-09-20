@@ -4750,10 +4750,15 @@ pub fn dead_frame_from_ran_frame(_compiled_ptr: usize, frame_ptr: usize) -> Dead
     let raw_values: Vec<i64> = (0..num_outputs)
         .map(|i| exit_arg_word(frame_ptr, &fail_descr, i))
         .collect();
+    let mut jf_slot = (frame_ptr - majit_backend::jitframe::FIRST_ITEM_OFFSET) as i64;
+    let depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+    unsafe {
+        majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(&mut jf_slot));
+    }
     let mut data = WasmFrameData::boxed(raw_values, fail_descr, exc_value);
-    let jf = (frame_ptr - majit_backend::jitframe::FIRST_ITEM_OFFSET)
-        as *mut majit_backend::jitframe::JitFrame;
+    let jf = jf_slot as *mut majit_backend::jitframe::JitFrame;
     data.seed_savedata_from_jf(jf);
+    majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
     DeadFrame::Boxed(data)
 }
 
@@ -4815,10 +4820,14 @@ fn dead_frame_from_forced_frame(frame_ptr: usize, fail_index: u32) -> DeadFrame 
             value
         })
         .collect();
+    let mut jf_slot = (frame_ptr - majit_backend::jitframe::FIRST_ITEM_OFFSET) as i64;
+    let depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+    unsafe {
+        majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(&mut jf_slot));
+    }
     let mut data = WasmFrameData::boxed(raw_values, fail_descr, 0);
-    let jf = (frame_ptr - majit_backend::jitframe::FIRST_ITEM_OFFSET)
-        as *mut majit_backend::jitframe::JitFrame;
-    data.attach_origin_jf(jf);
+    data.attach_origin_jf(jf_slot as *mut majit_backend::jitframe::JitFrame);
+    majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
     DeadFrame::Boxed(data)
 }
 
@@ -6742,9 +6751,15 @@ impl majit_backend::Backend for WasmBackend {
                 // virtualizable token is an independent edge to this JITFRAME;
                 // its lazy force may arrive after the execution root is gone.
                 install_post_finish_force_gcmap(jf);
+                wasm_jit_write_barrier(jf as i64);
                 let mut data = WasmFrameData::boxed(raw_values, fail_descr, exc_value);
+                // `boxed` registers the copied Ref slots and may collect.
+                // Keep the JITFRAME on the shadow stack across that call so
+                // `jf_savedata` is forwarded, then publish the updated
+                // address before dropping the frame root.
+                let jf = majit_gc::shadow_stack::peek_jf(saved).0 as *mut JitFrame;
                 data.seed_savedata_from_jf(jf);
-                remember_and_drop_execution_frame(jf, saved);
+                majit_gc::shadow_stack::pop_jf_to(saved);
 
                 return DeadFrame::Boxed(data);
             }
