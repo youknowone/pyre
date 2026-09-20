@@ -1655,6 +1655,8 @@ unsafe fn load_attr_slowpath(
     name: &str,
     map: MapRef,
 ) -> Result<PyObjectRef, PyError> {
+    // mapdict.py:1490 `w_name = pycode.co_names_w[nameindex]`.
+    let w_name = unsafe { crate::pycode::w_code_getname_w_or_new(pycode, nameindex, name) };
     // mapdict.py:1495 `if map is not None:`.
     if !map.is_null() {
         // mapdict.py:1496 `w_type = map.terminator.w_cls`.
@@ -1663,7 +1665,7 @@ unsafe fn load_attr_slowpath(
         // pyre has no separate `_handle_getattribute`; `space.getattr`
         // re-dispatches the custom `__getattribute__`, the same result.
         if unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some() {
-            return crate::baseobjspace::getattr_str(w_obj, name);
+            return crate::baseobjspace::getattr(w_obj, w_name);
         }
         // mapdict.py:1500 `version_tag = w_type.version_tag()`.
         let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(w_type) };
@@ -1722,7 +1724,7 @@ unsafe fn load_attr_slowpath(
         }
     }
     // mapdict.py `return space.getattr(w_obj, w_name)`.
-    crate::baseobjspace::getattr_str(w_obj, name)
+    crate::baseobjspace::getattr(w_obj, w_name)
 }
 
 /// The JIT LOAD_ATTR fast-path resolver: the `load_attr_slowpath`
@@ -3039,6 +3041,8 @@ unsafe fn store_attr_slowpath(
     w_value: PyObjectRef,
     entry: Option<MapdictCacheEntry>,
 ) -> Result<(), PyError> {
+    // mapdict.py:1590 `w_name = pycode.co_names_w[nameindex]`.
+    let w_name = unsafe { crate::pycode::w_code_getname_w_or_new(pycode, nameindex, name) };
     // `object.__class__` is a getset data descriptor in PyPy, so `_classify_attr`
     // (classify_attr) marks it INVALID and the store falls through to
     // `space.setattr` (mapdict.py) — the assignment re-roots the instance
@@ -3049,7 +3053,7 @@ unsafe fn store_attr_slowpath(
     // that special-case instead of being mis-stored as an ordinary instance-dict
     // attribute (which leaves the real type unchanged).
     if name == "__class__" {
-        return crate::baseobjspace::setattr_str(w_obj, name, w_value).map(|_| ());
+        return crate::baseobjspace::setattr(w_obj, w_name, w_value).map(|_| ());
     }
     // mapdict.py:1591 `if map is not None:`.
     if !map.is_null() {
@@ -3109,7 +3113,7 @@ unsafe fn store_attr_slowpath(
         // mapdict.py:1612-1614 — a custom `__setattr__` handles the store. pyre
         // re-dispatches through `space.setattr` (no separate helper).
         if unsafe { crate::baseobjspace::setattr_if_not_from_object(w_type) }.is_some() {
-            return crate::baseobjspace::setattr_str(w_obj, name, w_value).map(|_| ());
+            return crate::baseobjspace::setattr(w_obj, w_name, w_value).map(|_| ());
         }
         // mapdict.py:1616 `if version_tag is not None:` (0 = None).
         if version_tag != 0 {
@@ -3146,7 +3150,7 @@ unsafe fn store_attr_slowpath(
                             }
                         };
                         if !written {
-                            return crate::baseobjspace::setattr_str(w_obj, name, w_value)
+                            return crate::baseobjspace::setattr(w_obj, w_name, w_value)
                                 .map(|_| ());
                         }
                         // mapdict.py:1630-1631 — fill only when there is no custom
@@ -3201,7 +3205,7 @@ unsafe fn store_attr_slowpath(
                                 }
                             };
                             if mapnew.is_null() {
-                                return crate::baseobjspace::setattr_str(w_obj, name, w_value)
+                                return crate::baseobjspace::setattr(w_obj, w_name, w_value)
                                     .map(|_| ());
                             }
                             // mapdict.py:1642-1648 — fill only when no attribute
@@ -3234,7 +3238,7 @@ unsafe fn store_attr_slowpath(
         }
     }
     // mapdict.py `space.setattr(w_obj, w_name, w_value)`.
-    crate::baseobjspace::setattr_str(w_obj, name, w_value).map(|_| ())
+    crate::baseobjspace::setattr(w_obj, w_name, w_value).map(|_| ())
 }
 
 // ── obj storage protocol (mapdict.py MapdictStorageMixin) ──────

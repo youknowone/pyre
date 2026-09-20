@@ -5367,10 +5367,12 @@ pub fn finditem_str_named(
         let w_key = unsafe { crate::pycode::w_code_getname_w(pycode, nameindex) };
         if !w_key.is_null() {
             let hash = unsafe { pyre_object::unicodeobject::w_str_hash_memoized(w_key) };
-            return unsafe {
+            return match unsafe {
                 pyre_object::dictmultiobject::w_dict_getitem_str_checked_hashed_w(obj, w_key, hash)
-            }
-            .map_err(|_| take_pending_dict_key_error(w_key));
+            } {
+                Ok(hit) => Ok(hit),
+                Err(_) => Err(take_pending_dict_key_error(w_key)),
+            };
         }
         // `objspace.py StdObjSpace.finditem_str` — `w_obj.getitem_str(key)`
         // with no DictOperationGuard.  The lock lives on the user-facing
@@ -6573,29 +6575,21 @@ pub fn clear_all_weakrefs(obj: PyObjectRef) {
 /// (PyPy: Module.getdict → w_dict lookup).
 /// For other objects, looks up the attribute in the per-object side table.
 
+/// `space.getattr` for a borrowed UTF-8 name. A proven literal folds to an
+/// interned unicode Ref; traced opcode paths intern via `getname_w` and enter
+/// [`getattr`] instead.
 pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
     // `space.getattr` — the full path, including the `__getattr__` fallback.
-    // The impl's own root frame is popped before this `map_err` runs, and
-    // a user `__getattr__` may have collected, so the receiver is pinned
-    // across both the lookup and the AttributeError enrichment.
-    let w_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new(name));
+    // The impl's own root frame is popped before AttributeError enrichment,
+    // and a user `__getattr__` may have collected, so the receiver is pinned
+    // across both the lookup and the error path.
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(obj);
-    getattr_str_impl(
+    getattr(
         pyre_object::gc_roots::shadow_stack_get(obj_slot),
-        name,
-        true,
-        false,
-        w_name,
+        pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
     )
-    .map_err(|mut err| {
-        // PyPy 9883bb2a9d `DescrOperation.getattr`: enrich an AttributeError
-        // only after the complete `__getattribute__` / `__getattr__` chain has
-        // failed, preserving a more specific inner lookup's existing context.
-        err.enrich_attribute_error_str(pyre_object::gc_roots::shadow_stack_get(obj_slot), name);
-        err
-    })
 }
 
 /// Shared body of `space.getattr` and the bare `object.__getattribute__` slot.
@@ -6722,7 +6716,7 @@ fn getattr_str_impl(
         && !crate::_pypy_generic_alias::is_attr_blocked(name)
     {
         let origin = unsafe { pyre_object::w_generic_alias_get_origin(obj) };
-        return getattr_str(origin, name);
+        return getattr(origin, w_name);
     }
 
     // super proxy — PyPy: pypy/module/__builtin__/descriptor.py
@@ -7211,7 +7205,7 @@ fn getattr_str_impl(
                 }
                 let _name_roots = pyre_object::gc_roots::push_roots();
                 let name_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(name));
+                let _ = pyre_object::gc_roots::pin_root(w_name);
                 // objspace.py:666 / descroperation.py:238
                 // `space.get_and_call_function(w_descr, w_obj, w_name)` —
                 // bind the `__getattribute__` slot through `__get__`.
@@ -7599,13 +7593,16 @@ pub fn getattr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
     } else {
         unsafe { getattr_surrogate(obj, w_name, name) }
     };
-    result.map_err(|mut err| {
-        err.enrich_attribute_error(
-            pyre_object::gc_roots::shadow_stack_get(operands),
-            pyre_object::gc_roots::shadow_stack_get(operands + 1),
-        );
-        err
-    })
+    match result {
+        Ok(value) => Ok(value),
+        Err(mut err) => {
+            err.enrich_attribute_error(
+                pyre_object::gc_roots::shadow_stack_get(operands),
+                pyre_object::gc_roots::shadow_stack_get(operands + 1),
+            );
+            Err(err)
+        }
+    }
 }
 
 /// `_PyObject_LookupAttr` — the full `space.getattr` protocol for a caller
@@ -7642,11 +7639,7 @@ pub fn setattr(obj: PyObjectRef, w_name: PyObjectRef, value: PyObjectRef) -> PyR
     }
     let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
     if unsafe { pyre_object::dictmultiobject::wtf8_key_is_utf8(name) } {
-        setattr_str(
-            obj,
-            unsafe { pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(name) },
-            value,
-        )
+        setattr_utf8(obj, w_name, value)
     } else {
         unsafe { setattr_surrogate(obj, w_name, name, value) }
     }
@@ -7662,9 +7655,7 @@ pub fn delattr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
     }
     let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
     if unsafe { pyre_object::dictmultiobject::wtf8_key_is_utf8(name) } {
-        delattr_str(obj, unsafe {
-            pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(name)
-        })
+        delattr_utf8(obj, w_name)
     } else {
         unsafe { delattr_surrogate(obj, w_name, name) }
     }
@@ -12258,9 +12249,9 @@ pub unsafe fn type_fully_qualified_name(w_type: PyObjectRef) -> Wtf8Buf {
 /// `w_obj` must be a valid object pointer (null tolerated).
 pub unsafe fn load_method_fast_path(
     w_obj: PyObjectRef,
-    name: &str,
+    w_name: PyObjectRef,
 ) -> Option<(PyObjectRef, u64, PyObjectRef)> {
-    if w_obj.is_null() {
+    if w_obj.is_null() || w_name.is_null() {
         return None;
     }
     // callmethod.py `w_type = space.type(w_obj)`.
@@ -12281,14 +12272,11 @@ pub unsafe fn load_method_fast_path(
     }
     // A cell's payload moves without `_version_tag`.  The cell fold reads
     // `ObjectMutableCell.w_value`; this arm only bakes a stable descriptor.
-    if type_attr_stored_is_cell(w_type, Wtf8::new(name)) {
+    if type_attr_stored_is_cell(w_type, pyre_object::unicodeobject::w_str_get_wtf8(w_name)) {
         return None;
     }
-    // callmethod.py:59 `_pure_lookup_where_with_method_cache(name, vt)`.
-    let w_descr = lookup_in_type(
-        w_type,
-        pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
-    )?;
+    // callmethod.py:59 `_pure_lookup_where_with_method_cache`.
+    let w_descr = lookup_in_type(w_type, w_name)?;
     // callmethod.py:66 `space.type(w_descr).flag_method_descriptor`: only a
     // method-descriptor type (the `function` typedef, typedef.py:807) binds
     // `self` here; builtin functions, staticmethod / classmethod / property
@@ -12299,7 +12287,9 @@ pub unsafe fn load_method_fast_path(
     }
     // callmethod.py `w_value = w_obj.getdictvalue(space, name)`: a shadowing
     // instance attribute means the method is not bound.
-    instance_dict_does_not_shadow(w_obj, name)?;
+    unsafe {
+        instance_dict_does_not_shadow_wtf8(w_obj, pyre_object::w_str_get_wtf8(w_name))?;
+    }
     Some((w_type, version_tag, w_descr))
 }
 
@@ -14236,7 +14226,18 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
     Ok(w_none())
 }
 
+/// `space.setattr` for a borrowed UTF-8 name. A proven literal folds to an
+/// interned unicode Ref; traced opcode paths intern via `getname_w` and enter
+/// [`setattr`] instead.
 pub fn setattr_str(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
+    setattr(
+        obj,
+        pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
+        value,
+    )
+}
+
+fn setattr_utf8(obj: PyObjectRef, w_name: PyObjectRef, value: PyObjectRef) -> PyResult {
     let obj = crate::module::_weakref::interp__weakref::force(obj)?;
     // `super` proxies only `__getattribute__` (descriptor.py W_Super); it has
     // no `__setattr__`, so `super().name = value` uses the object default and
@@ -14260,7 +14261,7 @@ pub fn setattr_str(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult
                 let value_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ = pyre_object::gc_roots::pin_root(value);
                 let name_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(name));
+                let _ = pyre_object::gc_roots::pin_root(w_name);
                 return crate::call::call_function_impl_result(
                     pyre_object::gc_roots::shadow_stack_get(sa_slot),
                     &[
@@ -14288,7 +14289,7 @@ pub fn setattr_str(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult
                 let value_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ = pyre_object::gc_roots::pin_root(value);
                 let name_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(name));
+                let _ = pyre_object::gc_roots::pin_root(w_name);
                 return get_and_call_function(
                     pyre_object::gc_roots::shadow_stack_get(sa_slot),
                     pyre_object::gc_roots::shadow_stack_get(obj_slot),
@@ -14302,7 +14303,7 @@ pub fn setattr_str(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult
             }
         }
     }
-    object_setattr(obj, name, value)
+    object_setattr(obj, w_name, value)
 }
 
 /// Trace-time stability predicate for the walker's immutable-type
@@ -14786,8 +14787,13 @@ pub(crate) fn exception_attr_set(obj: PyObjectRef, name: &str, value: PyObjectRe
 /// that bypasses user `__setattr__` overrides and writes directly
 /// through the descriptor / instance-dict path.  Called by
 /// `object.__setattr__` and as the default path in `setattr`.
-pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
+pub fn object_setattr(obj: PyObjectRef, w_name: PyObjectRef, value: PyObjectRef) -> PyResult {
     let obj = crate::module::_weakref::interp__weakref::force(obj)?;
+    let name_wtf8 = unsafe { pyre_object::w_str_get_wtf8(w_name) };
+    if !unsafe { pyre_object::dictmultiobject::wtf8_key_is_utf8(name_wtf8) } {
+        return unsafe { object_setattr_surrogate(obj, w_name, name_wtf8, value) };
+    }
+    let name = unsafe { pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(name_wtf8) };
     // `W_BaseException` carries its instance dict on the typed `w_dict` slot but
     // installs no `__dict__` getset in its namespace, so the descriptor walk
     // below finds no exception `__dict__` setter.  A plain base mixed into an
@@ -14818,10 +14824,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
         };
         if w_type.is_null() {
             None
-        } else if let Some(descr) = lookup_in_type_where(
-            w_type,
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
-        ) {
+        } else if let Some(descr) = lookup_in_type_where(w_type, w_name) {
             if set(descr, obj, value)? {
                 return Ok(w_none());
             }
@@ -14973,7 +14976,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
             if !w_dict.is_null() {
                 let _name_roots = pyre_object::gc_roots::push_roots();
                 let name_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(name));
+                let _ = pyre_object::gc_roots::pin_root(w_name);
                 let value_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ = pyre_object::gc_roots::pin_root(value);
                 setitem(
@@ -15550,10 +15553,17 @@ fn missing_attribute_subject(obj: PyObjectRef) -> String {
     }
 }
 
-/// Delete an attribute: `del obj.name`.
-///
-/// PyPy: descroperation.py descr__delattr__
+/// `space.delattr` for a borrowed UTF-8 name. A proven literal folds to an
+/// interned unicode Ref; traced opcode paths intern via `getname_w` and enter
+/// [`delattr`] instead.
 pub fn delattr_str(obj: PyObjectRef, name: &str) -> PyResult {
+    delattr(
+        obj,
+        pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
+    )
+}
+
+fn delattr_utf8(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
     let obj = crate::module::_weakref::interp__weakref::force(obj)?;
     // descroperation.py:254 — space.lookup for __delattr__ through MRO
     unsafe {
@@ -15571,7 +15581,7 @@ pub fn delattr_str(obj: PyObjectRef, name: &str) -> PyResult {
                 if !is_default {
                     let _name_roots = pyre_object::gc_roots::push_roots();
                     let name_slot = pyre_object::gc_roots::shadow_stack_len();
-                    let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(name));
+                    let _ = pyre_object::gc_roots::pin_root(w_name);
                     return get_and_call_function(
                         da,
                         obj,
@@ -15598,7 +15608,7 @@ pub fn delattr_str(obj: PyObjectRef, name: &str) -> PyResult {
                 if !is_default {
                     let _name_roots = pyre_object::gc_roots::push_roots();
                     let name_slot = pyre_object::gc_roots::shadow_stack_len();
-                    let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(name));
+                    let _ = pyre_object::gc_roots::pin_root(w_name);
                     return get_and_call_function(
                         da,
                         obj,
@@ -15610,7 +15620,7 @@ pub fn delattr_str(obj: PyObjectRef, name: &str) -> PyResult {
             }
         }
     }
-    object_delattr(obj, name)
+    object_delattr(obj, w_name)
 }
 
 /// True for an exception attribute whose class registers a `GetSetProperty`
@@ -15696,7 +15706,11 @@ pub(crate) fn exception_attr_delete(obj: PyObjectRef, name: &str) -> PyResult {
             }
         }
         _ if unsafe { exception_deletable_slot(obj, name) } => {
-            return object_setattr(obj, name, w_none());
+            return object_setattr(
+                obj,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
+                w_none(),
+            );
         }
         _ => {}
     }
@@ -15704,8 +15718,13 @@ pub(crate) fn exception_attr_delete(obj: PyObjectRef, name: &str) -> PyResult {
 }
 
 /// Terminal `object.__delattr__` — bypasses user override.
-pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
+pub fn object_delattr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
     let obj = crate::module::_weakref::interp__weakref::force(obj)?;
+    let name_wtf8 = unsafe { pyre_object::w_str_get_wtf8(w_name) };
+    if !unsafe { pyre_object::dictmultiobject::wtf8_key_is_utf8(name_wtf8) } {
+        return unsafe { object_delattr_surrogate(obj, w_name, name_wtf8) };
+    }
+    let name = unsafe { pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(name_wtf8) };
     if unsafe { pyre_object::function::is_method(obj) } && name == "__class__" {
         return Err(PyError::type_error("can't delete __class__ attribute"));
     }
@@ -15724,10 +15743,7 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
         };
         if w_type.is_null() {
             None
-        } else if let Some(descr) = lookup_in_type_where(
-            w_type,
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
-        ) {
+        } else if let Some(descr) = lookup_in_type_where(w_type, w_name) {
             if is_data_descr(descr) {
                 delete(descr, obj)?;
                 return Ok(w_none());
@@ -15769,7 +15785,7 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
             if !w_dict.is_null() {
                 let _name_roots = pyre_object::gc_roots::push_roots();
                 let name_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(name));
+                let _ = pyre_object::gc_roots::pin_root(w_name);
                 match delitem(w_dict, pyre_object::gc_roots::shadow_stack_get(name_slot)) {
                     Ok(()) => return Ok(w_none()),
                     Err(err) if err.kind == crate::PyErrorKind::KeyError => {

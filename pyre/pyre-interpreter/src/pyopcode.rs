@@ -1318,6 +1318,15 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         self.push_value(null)
     }
 
+    /// LOAD_ATTR method branch threaded with the bytecode `nameindex`.
+    /// Default ignores `nameindex` and runs [`Self::load_method`].
+    fn load_method_cached(&mut self, name: &str, _nameindex: usize) -> Result<(), PyError>
+    where
+        Self: SharedOpcodeHandler + NamespaceOpcodeHandler,
+    {
+        OpcodeStepExecutor::load_method(self, name)
+    }
+
     /// LOAD_SPECIAL used by synchronous/asynchronous context managers.
     /// Like PyPy's BEFORE_WITH, this performs a type-MRO lookup and descriptor
     /// binding without consulting the instance's `__getattribute__`.
@@ -1436,6 +1445,9 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     }
     fn delete_attr(&mut self, _name: &str) -> Result<(), PyError> {
         Err(crate::PyError::type_error("delete_attr not implemented"))
+    }
+    fn delete_attr_cached(&mut self, name: &str, _nameindex: usize) -> Result<(), PyError> {
+        OpcodeStepExecutor::delete_attr(self, name)
     }
     fn delete_name(&mut self, _name: &str, _nameindex: usize) -> Result<(), PyError> {
         Err(crate::PyError::type_error("delete_name not implemented"))
@@ -3564,7 +3576,8 @@ pub fn execute_delete_attr<E: OpcodeStepExecutor>(
     let Instruction::DeleteAttr { namei } = instruction else {
         unreachable!()
     };
-    executor.delete_attr(code.names[u32_as_usize(namei.get(op_arg))].as_ref())?;
+    let name_idx = u32_as_usize(namei.get(op_arg));
+    executor.delete_attr_cached(code.names[name_idx].as_ref(), name_idx)?;
     Ok(StepResult::Continue)
 }
 
@@ -3626,7 +3639,7 @@ where
     let name_idx = u32_as_usize(attr.name_idx());
     let name = code.names[name_idx].as_ref();
     if attr.is_method() {
-        executor.load_method(name)?;
+        executor.load_method_cached(name, name_idx)?;
     } else {
         executor.load_attr_cached(name, name_idx)?;
     }

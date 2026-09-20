@@ -3115,8 +3115,15 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
     let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
         return Ok(None);
     };
+    let w_name = unsafe {
+        pyre_interpreter::pycode::w_code_getname_w_or_new(
+            w_code_ptr as pyre_object::PyObjectRef,
+            name_idx,
+            &name,
+        )
+    };
     let Some((w_type, _version_tag, w_descr)) =
-        (unsafe { pyre_interpreter::load_method_fast_path(concrete_obj, &name) })
+        (unsafe { pyre_interpreter::load_method_fast_path(concrete_obj, w_name) })
     else {
         let cell = unsafe { pyre_interpreter::load_method_cell_fast_path(concrete_obj, &name) };
         return walker_fold_load_method_cell(ctx, op_pc, obj, concrete_obj, cell, dst, dst_bank);
@@ -3951,10 +3958,17 @@ pub(crate) fn try_walker_fold_load_method_self<Sym: WalkSym>(
     let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
         return Ok(None);
     };
+    let w_name = unsafe {
+        pyre_interpreter::pycode::w_code_getname_w_or_new(
+            w_code_ptr as pyre_object::PyObjectRef,
+            name_idx,
+            &name,
+        )
+    };
     // Same oracle the attribute fold asked: when it still answers the
     // descriptor this residual was paired with, bind the receiver.
     if let Some((_, _, w_descr)) =
-        unsafe { pyre_interpreter::baseobjspace::load_method_fast_path(concrete_obj, &name) }
+        unsafe { pyre_interpreter::baseobjspace::load_method_fast_path(concrete_obj, w_name) }
     {
         if std::ptr::eq(w_descr, concrete_attr) {
             write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, obj)?;
@@ -3971,7 +3985,7 @@ pub(crate) fn try_walker_fold_load_method_self<Sym: WalkSym>(
         }
     }
     let bound =
-        pyre_interpreter::eval::compute_load_method_bound(concrete_obj, concrete_attr, &name);
+        pyre_interpreter::eval::compute_load_method_bound(concrete_obj, concrete_attr, w_name);
     let bound_op = if std::ptr::eq(bound, concrete_obj) {
         obj
     } else if bound == pyre_object::PY_NULL {
