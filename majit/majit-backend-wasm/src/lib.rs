@@ -7978,6 +7978,18 @@ mod tests {
         names
     }
 
+    /// The normalize + GC rewrite half of [`WasmBackend::compile_loop`], with
+    /// the codegen that follows it left off.
+    fn prepare_ops_for_compile(
+        backend: &mut WasmBackend,
+        inputargs: &[InputArgRc],
+        ops: &[OpRc],
+    ) -> (Vec<Op>, Option<Arc<majit_gc::GcTable>>) {
+        let mut ops_owned = normalize_ops_for_codegen(inputargs, ops);
+        codegen::materialize_unbound_label_args(inputargs, &mut ops_owned);
+        backend.rewrite_ops_for_gc(ops_owned)
+    }
+
     /// Adjacent `New`s merge into `CallMallocNursery` + `NurseryPtrIncrement`.
     #[test]
     fn gc_rewrite_on_merges_adjacent_news() {
@@ -7987,7 +7999,7 @@ mod tests {
         let mut backend = WasmBackend::new();
         backend.set_gc_allocator(Box::new(gc));
         let (inputargs, ops) = u1_new_setfield_ops(type_id);
-        let (prepared, _) = backend.prepare_ops_for_compile(&inputargs, &ops, true);
+        let (prepared, _) = prepare_ops_for_compile(&mut backend, &inputargs, &ops);
         assert!(
             prepared
                 .iter()
@@ -8029,7 +8041,7 @@ mod tests {
         let finish = majit_ir::Op::new(majit_ir::OpCode::Finish, &[rb(majit_ir::OpRef::ref_op(1))]);
         finish.setfailargs(vec![rb(majit_ir::OpRef::const_ptr(root))].into());
         let (prepared, table) =
-            backend.prepare_ops_for_compile(&[], &[OpRc::new(same), OpRc::new(finish)], true);
+            prepare_ops_for_compile(&mut backend, &[], &[OpRc::new(same), OpRc::new(finish)]);
         let table = table.expect("operand ConstPtr must intern into a gc table");
         assert_eq!(table.slot(0), root);
         assert!(
@@ -8072,8 +8084,11 @@ mod tests {
         arr.pos().set(majit_ir::OpRef::ref_op(1));
         let finish = majit_ir::Op::new(majit_ir::OpCode::Finish, &[]);
         let inputargs = vec![InputArg::from_type_rc(majit_ir::Type::Int, 0)];
-        let (prepared, _) =
-            backend.prepare_ops_for_compile(&inputargs, &[OpRc::new(arr), OpRc::new(finish)], true);
+        let (prepared, _) = prepare_ops_for_compile(
+            &mut backend,
+            &inputargs,
+            &[OpRc::new(arr), OpRc::new(finish)],
+        );
         assert!(
             prepared
                 .iter()
@@ -8119,7 +8134,7 @@ mod tests {
         new_op.pos().set(majit_ir::OpRef::ref_op(1));
         let finish = majit_ir::Op::new(majit_ir::OpCode::Finish, &[]);
         let (prepared, _) =
-            backend.prepare_ops_for_compile(&[], &[OpRc::new(new_op), OpRc::new(finish)], true);
+            prepare_ops_for_compile(&mut backend, &[], &[OpRc::new(new_op), OpRc::new(finish)]);
         let word = std::mem::size_of::<usize>() as i64;
         let sized = prepared.iter().any(|op| {
             op.opcode == majit_ir::OpCode::GcStore

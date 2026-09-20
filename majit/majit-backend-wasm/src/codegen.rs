@@ -12401,7 +12401,6 @@ mod tests {
     }
 }
 
-
 /// `(field_size, is_signed)` from an op's FieldDescr. A field op always carries
 /// a FieldDescr; a missing one is an invariant violation, so panic rather than
 /// emit a silently-wrong width.
@@ -12412,7 +12411,6 @@ fn field_size_sign_from_descr(op: &Op) -> (usize, bool) {
     }
     missing_layout_descr("field descr (size/sign)", op)
 }
-
 
 /// Store width for a `SetfieldGc`/`SetfieldRaw`. A pointer (`Type::Ref`) field
 /// is stored at machine-word width regardless of the descr's recorded size: a
@@ -12431,7 +12429,6 @@ fn setfield_store_size_from_descr(op: &Op) -> usize {
     missing_layout_descr("field descr (store size)", op)
 }
 
-
 fn field_is_float_from_descr(op: &Op) -> bool {
     let descr = op.getdescr();
     match descr.as_ref().and_then(|d| d.as_field_descr()) {
@@ -12439,7 +12436,6 @@ fn field_is_float_from_descr(op: &Op) -> bool {
         None => missing_layout_descr("field descr (is_float)", op),
     }
 }
-
 
 fn emit_float_load(
     sink: &mut PeepSink<'_, '_>,
@@ -12463,12 +12459,10 @@ fn emit_float_load(
     Ok(())
 }
 
-
 fn array_item_is_float_from_descr(op: &Op) -> bool {
     op.with_array_descr(|ad| ad.item_type() == Type::Float)
         .unwrap_or_else(|| missing_layout_descr("array descr (item is_float)", op))
 }
-
 
 /// Argument index of the stored value for a GC ref-storing op. `SetfieldRaw` /
 /// `SetarrayitemRaw` store into non-GC memory and never need a write barrier,
@@ -12482,7 +12476,6 @@ fn ref_store_value_arg(op: &Op) -> Option<usize> {
     }
 }
 
-
 /// Extract field offset from op's descr (FieldDescr).
 fn field_offset_from_descr(op: &Op) -> u64 {
     let __descr_arc_descr = op.getdescr();
@@ -12493,7 +12486,6 @@ fn field_offset_from_descr(op: &Op) -> u64 {
     }
     missing_layout_descr("field descr (offset)", op)
 }
-
 
 /// `(length-field offset, length-field size)` from an op's ArrayDescr length
 /// descriptor, mirroring `bh_arraylen_gc`, which reads the length at
@@ -12511,7 +12503,6 @@ fn array_len_layout_from_descr(op: &Op) -> (u64, usize) {
     .flatten()
     .unwrap_or_else(|| missing_layout_descr("array descr (len layout)", op))
 }
-
 
 /// `descr.py unpack_interiorfielddescr`: `ofs = basesize + field.offset`,
 /// plus the element stride and the field's own width / signedness / kind.
