@@ -658,8 +658,7 @@
       "reason": "package skips itself on a free-threaded build (Py_GIL_DISABLED)"
     },
     "test.test_io": {
-      "dynasm": "TIMEOUT",
-      "reason": "CBufferedReaderTest.test_threads hangs — concurrent bufio.read() raises TryLock's `reentrant call` although every reader is its own thread, and the remaining readers never join; reproduces under PYRE_NO_JIT=1, so it is not the JIT"
+      "dynasm": "PASS"
     },
     "test.test_ioctl": {
       "dynasm": "FAIL"
