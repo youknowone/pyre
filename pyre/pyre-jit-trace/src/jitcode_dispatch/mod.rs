@@ -1499,23 +1499,23 @@ fn emit_traceback_node<Sym: WalkSym>(
         .trace_ctx
         .execute_new_with_vtable(crate::descr::pytraceback_size_descr());
     let fields = [
+        (site.frame, 0),
+        // Field 1 is `lasti`, which the slot holds in bytes.
+        (
+            ctx.trace_ctx
+                .const_int(i64::from(site.last_instruction) * 2),
+            1,
+        ),
+        (w_next, 2),
+        (ctx.trace_ctx.const_int(site.lineno), 3),
+        (ctx.trace_ctx.const_ref(site.w_code as i64), 4),
         (
             ctx.trace_ctx
                 .const_ref(pyre_object::pyobject::get_instantiate(
                     &pyre_interpreter::pytraceback::PYTRACEBACK_TYPE,
                 ) as i64),
-            0,
+            5,
         ),
-        (site.frame, 1),
-        // Field 2 is `lasti`, which the slot holds in bytes.
-        (
-            ctx.trace_ctx
-                .const_int(i64::from(site.last_instruction) * 2),
-            2,
-        ),
-        (w_next, 3),
-        (ctx.trace_ctx.const_int(site.lineno), 4),
-        (ctx.trace_ctx.const_ref(site.w_code as i64), 5),
     ];
     for (value, index) in fields {
         let descr = crate::descr::pytraceback_field_descr(index);

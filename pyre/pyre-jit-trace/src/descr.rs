@@ -852,34 +852,6 @@ fn build_object_descr_group_with_def_path(
     )
 }
 
-/// [`build_object_descr_group_with_def_path`] for a STRUCT that must stay out
-/// of BOTH name registries — one whose per-instance vtable differs while the
-/// layout does not, so a shared name slot would be first-write-wins and lose
-/// the other vtables — yet still needs a `gc_cache._cache_size` identity.
-/// `cache_key_name` supplies that identity directly; without it the group
-/// lands on the no-identity key and its `type_id` becomes the header tid for
-/// every keyless struct the blackhole and resume paths allocate.
-fn build_object_descr_group_keyed_only(
-    obj_size: usize,
-    type_id: u32,
-    vtable: usize,
-    fields: &[(&'static str, usize, usize, Type, bool, bool, bool)],
-    cache_key_name: &str,
-) -> PyreObjectDescrGroup {
-    build_object_descr_group_with_extra_gc_edges(
-        obj_size,
-        type_id,
-        vtable,
-        fields,
-        "",
-        "",
-        &[],
-        &[],
-        cache_key_name,
-        false,
-    )
-}
-
 /// `build_object_descr_group_with_def_path` for a struct the JIT never
 /// allocates and whose pointer may not carry a `GcHeader`.  `headerless` is
 /// what keeps `StructPtrInfo::make_guards` from certifying a runtime type id
@@ -5269,101 +5241,103 @@ pub fn specialised_tuple_oo_size_descr() -> DescrRef {
 /// one set per `ExcKind`.  The vtable (`ob_type`) differs per kind
 /// (`exc_kind_to_pytype`), so each kind owns its group.  `_new_exception`
 /// classes use the slim [`W_BaseException`] SizeDescr; extra-field
-/// subclasses use [`W_ExceptionExtended`].  The constructor-written
-/// fields — `kind`, `w_class`, `args_w` — share the same offsets and
-/// indices across both layouts. `w_context` is written separately by the
-/// raise lowering; remaining pointer slots stay zeroed by GC pointer
-/// clearing (PY_NULL), matching `w_exception_new_empty`.
+/// subclasses use [`W_ExceptionExtended`].  Constructor-written fields
+/// share offsets across both layouts. `w_context` is written separately
+/// by the raise lowering; remaining pointer slots stay zeroed by GC
+/// pointer clearing (PY_NULL), matching `w_exception_new_empty`.
+///
+/// Positional order is declaration order with the two `ob_header` words
+/// dropped, matching `heaptracker.py all_fielddescrs` /
+/// `get_fielddescr_index_in`.  The class word is appended last so every
+/// real field keeps the index that walk numbers.
 fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
+    const SLIM_FIELDS: &[(&str, usize, usize, Type, bool, bool, bool)] = &[
+        ("kind", EXC_KIND_OFFSET, 1, Type::Int, false, false, false),
+        (
+            "args_w",
+            EXC_ARGS_W_OFFSET,
+            WORD,
+            Type::Ref,
+            false,
+            false,
+            false,
+        ),
+        (
+            "w_cause",
+            EXC_W_CAUSE_OFFSET,
+            WORD,
+            Type::Ref,
+            false,
+            false,
+            false,
+        ),
+        (
+            "w_context",
+            EXC_W_CONTEXT_OFFSET,
+            WORD,
+            Type::Ref,
+            false,
+            false,
+            false,
+        ),
+        (
+            "w_traceback",
+            EXC_W_TRACEBACK_OFFSET,
+            WORD,
+            Type::Ref,
+            false,
+            false,
+            false,
+        ),
+        (
+            "suppress_context",
+            EXC_SUPPRESS_CONTEXT_OFFSET,
+            1,
+            Type::Int,
+            false,
+            false,
+            false,
+        ),
+        (
+            "w_dict",
+            EXC_W_DICT_OFFSET,
+            WORD,
+            Type::Ref,
+            false,
+            false,
+            false,
+        ),
+        (
+            "w_weakreflifeline",
+            EXC_W_WEAKREF_OFFSET,
+            WORD,
+            Type::Ref,
+            false,
+            false,
+            false,
+        ),
+        (
+            "w_class",
+            W_CLASS_OFFSET,
+            WORD,
+            Type::Ref,
+            false,
+            false,
+            false,
+        ),
+    ];
     if !exc_kind_uses_extended_layout(kind) {
-        return build_object_descr_group_keyed_only(
+        return build_object_descr_group_with_extra_gc_edges(
             W_BASE_EXCEPTION_SIZE,
             pyre_object::interp_exceptions::W_BASE_EXCEPTION_GC_TYPE_ID,
             exc_kind_to_pytype(kind) as *const _ as usize,
-            &[
-                (
-                    "W_BaseException.kind",
-                    EXC_KIND_OFFSET,
-                    1,
-                    Type::Int,
-                    false,
-                    false,
-                    false,
-                ),
-                (
-                    "W_BaseException.w_class",
-                    W_CLASS_OFFSET,
-                    WORD,
-                    Type::Ref,
-                    false,
-                    false,
-                    false,
-                ),
-                (
-                    "W_BaseException.args_w",
-                    EXC_ARGS_W_OFFSET,
-                    WORD,
-                    Type::Ref,
-                    false,
-                    false,
-                    false,
-                ),
-                (
-                    "W_BaseException.w_context",
-                    EXC_W_CONTEXT_OFFSET,
-                    WORD,
-                    Type::Ref,
-                    false,
-                    false,
-                    false,
-                ),
-                (
-                    "W_BaseException.w_cause",
-                    EXC_W_CAUSE_OFFSET,
-                    WORD,
-                    Type::Ref,
-                    false,
-                    false,
-                    false,
-                ),
-                (
-                    "W_BaseException.w_traceback",
-                    EXC_W_TRACEBACK_OFFSET,
-                    WORD,
-                    Type::Ref,
-                    false,
-                    false,
-                    false,
-                ),
-                (
-                    "W_BaseException.w_dict",
-                    EXC_W_DICT_OFFSET,
-                    WORD,
-                    Type::Ref,
-                    false,
-                    false,
-                    false,
-                ),
-                (
-                    "W_BaseException.w_weakreflifeline",
-                    EXC_W_WEAKREF_OFFSET,
-                    WORD,
-                    Type::Ref,
-                    false,
-                    false,
-                    false,
-                ),
-                (
-                    "W_BaseException.suppress_context",
-                    EXC_SUPPRESS_CONTEXT_OFFSET,
-                    1,
-                    Type::Int,
-                    false,
-                    false,
-                    false,
-                ),
-            ],
+            SLIM_FIELDS,
             "W_BaseException",
+            "interp_exceptions::W_BaseException",
+            &[],
+            &[],
+            "W_BaseException",
+            false,
         );
     }
     let extended_tid = exception_extended_gc_type_id();
@@ -5377,7 +5351,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
     } else {
         extended_tid
     };
-    build_object_descr_group_keyed_only(
+    build_object_descr_group_with_extra_gc_edges(
         W_EXCEPTION_EXTENDED_SIZE,
         extended_tid,
         exc_kind_to_pytype(kind) as *const _ as usize,
@@ -5388,17 +5362,9 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             // appended last so every real field keeps the index that walk
             // numbers; the walk never numbers a header word.
             // `kind` is a `u8` tag (1 byte, unsigned).
+            ("kind", EXC_KIND_OFFSET, 1, Type::Int, false, false, false),
             (
-                "W_BaseException.kind",
-                EXC_KIND_OFFSET,
-                1,
-                Type::Int,
-                false,
-                false,
-                false,
-            ),
-            (
-                "W_BaseException.args_w",
+                "args_w",
                 EXC_ARGS_W_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5407,7 +5373,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.w_cause",
+                "w_cause",
                 EXC_W_CAUSE_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5420,7 +5386,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             // (`exc.w_context = ec.sys_exc_value`) so the optimizer can
             // track it on the virtual exception.
             (
-                "W_BaseException.w_context",
+                "w_context",
                 EXC_W_CONTEXT_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5429,7 +5395,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.w_traceback",
+                "w_traceback",
                 EXC_W_TRACEBACK_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5440,7 +5406,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             // This plain byte is not included in gc_fielddescrs, so a nursery
             // allocation must initialize it explicitly.
             (
-                "W_BaseException.suppress_context",
+                "suppress_context",
                 EXC_SUPPRESS_CONTEXT_OFFSET,
                 1,
                 Type::Int,
@@ -5449,7 +5415,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.w_object",
+                "w_object",
                 EXC_W_OBJECT_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5458,7 +5424,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.w_start",
+                "w_start",
                 EXC_W_START_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5467,7 +5433,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.w_end",
+                "w_end",
                 EXC_W_END_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5476,7 +5442,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.w_reason",
+                "w_reason",
                 EXC_W_REASON_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5485,7 +5451,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.w_encoding",
+                "w_encoding",
                 EXC_W_ENCODING_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5494,7 +5460,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.w_errno",
+                "w_errno",
                 EXC_W_ERRNO_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5503,7 +5469,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.w_winerror",
+                "w_winerror",
                 EXC_W_WINERROR_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5512,7 +5478,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.w_strerror",
+                "w_strerror",
                 EXC_W_STRERROR_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5521,7 +5487,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.w_filename",
+                "w_filename",
                 EXC_W_FILENAME_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5530,7 +5496,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.w_filename2",
+                "w_filename2",
                 EXC_W_FILENAME2_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5539,7 +5505,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.written",
+                "written",
                 EXC_WRITTEN_OFFSET,
                 std::mem::size_of::<i64>(),
                 Type::Int,
@@ -5548,7 +5514,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.blocking_written_arg",
+                "blocking_written_arg",
                 EXC_BLOCKING_WRITTEN_ARG_OFFSET,
                 1,
                 Type::Int,
@@ -5557,7 +5523,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.w_code",
+                "w_code",
                 EXC_W_CODE_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5566,7 +5532,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.w_value",
+                "w_value",
                 EXC_W_VALUE_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5575,7 +5541,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.w_exc_name",
+                "w_exc_name",
                 EXC_W_NAME_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5584,7 +5550,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.w_attr_obj",
+                "w_attr_obj",
                 EXC_W_ATTR_OBJ_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5593,7 +5559,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.w_import_path",
+                "w_import_path",
                 EXC_W_IMPORT_PATH_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5602,7 +5568,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.w_import_name_from",
+                "w_import_name_from",
                 EXC_W_IMPORT_NAME_FROM_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5611,7 +5577,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.w_import_msg",
+                "w_import_msg",
                 EXC_W_IMPORT_MSG_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5620,7 +5586,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.w_syntax_msg",
+                "w_syntax_msg",
                 EXC_W_SYNTAX_MSG_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5629,7 +5595,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.w_syntax_filename",
+                "w_syntax_filename",
                 EXC_W_SYNTAX_FILENAME_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5638,7 +5604,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.w_syntax_lineno",
+                "w_syntax_lineno",
                 EXC_W_SYNTAX_LINENO_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5647,7 +5613,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.w_syntax_offset",
+                "w_syntax_offset",
                 EXC_W_SYNTAX_OFFSET_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5656,7 +5622,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.w_syntax_text",
+                "w_syntax_text",
                 EXC_W_SYNTAX_TEXT_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5665,7 +5631,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.w_syntax_end_lineno",
+                "w_syntax_end_lineno",
                 EXC_W_SYNTAX_END_LINENO_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5674,7 +5640,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.w_syntax_end_offset",
+                "w_syntax_end_offset",
                 EXC_W_SYNTAX_END_OFFSET_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5683,7 +5649,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.w_syntax_print_file_and_line",
+                "w_syntax_print_file_and_line",
                 EXC_W_SYNTAX_PRINT_FILE_AND_LINE_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5692,7 +5658,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.w_syntax_metadata",
+                "w_syntax_metadata",
                 EXC_W_SYNTAX_METADATA_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5701,7 +5667,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.w_group_message",
+                "w_group_message",
                 EXC_W_GROUP_MESSAGE_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5710,7 +5676,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.w_group_exceptions",
+                "w_group_exceptions",
                 EXC_W_GROUP_EXCEPTIONS_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5719,7 +5685,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.w_group_exceptions_repr",
+                "w_group_exceptions_repr",
                 EXC_W_GROUP_EXCEPTIONS_REPR_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5728,7 +5694,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.w_dict",
+                "w_dict",
                 EXC_W_DICT_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5737,7 +5703,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.w_weakreflifeline",
+                "w_weakreflifeline",
                 EXC_W_WEAKREF_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5746,7 +5712,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "W_BaseException.w_class",
+                "w_class",
                 W_CLASS_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5755,10 +5721,15 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
         ],
+        "W_ExceptionExtended",
+        "interp_exceptions::W_ExceptionExtended",
+        &[],
+        &[],
         // Extra-field kinds share one STRUCT identity distinct from the
         // slim `W_BaseException` key above, so `_cache_size` cannot
         // first-write-wins the 72-byte SizeDescr onto an OSError.
         "W_ExceptionExtended",
+        false,
     )
 }
 
@@ -5844,22 +5815,18 @@ static PYTRACEBACK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
         PYTRACEBACK_W_CODE_OFFSET, PYTRACEBACK_W_NEXT_OFFSET,
     };
 
-    build_object_descr_group_keyed_only(
+    build_object_descr_group_with_extra_gc_edges(
         PYTRACEBACK_OBJECT_SIZE,
         PYTRACEBACK_GC_TYPE_ID,
         &PYTRACEBACK_TYPE as *const _ as usize,
         &[
+            // Positional order is `PyTraceback` declaration order with the
+            // two `ob_header` words dropped, matching `heaptracker.py
+            // all_fielddescrs` / `get_fielddescr_index_in`.  The class word is
+            // appended last so every real field keeps the index that walk
+            // numbers; the walk never numbers a header word.
             (
-                "PyTraceback.w_class",
-                W_CLASS_OFFSET,
-                WORD,
-                Type::Ref,
-                false,
-                false,
-                false,
-            ),
-            (
-                "PyTraceback.frame",
+                "frame",
                 PYTRACEBACK_FRAME_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5868,7 +5835,7 @@ static PYTRACEBACK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
                 false,
             ),
             (
-                "PyTraceback.lasti",
+                "lasti",
                 PYTRACEBACK_LASTI_OFFSET,
                 8,
                 Type::Int,
@@ -5877,7 +5844,7 @@ static PYTRACEBACK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
                 false,
             ),
             (
-                "PyTraceback.w_next",
+                "w_next",
                 PYTRACEBACK_W_NEXT_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5886,7 +5853,7 @@ static PYTRACEBACK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
                 false,
             ),
             (
-                "PyTraceback.lineno",
+                "lineno",
                 PYTRACEBACK_LINENO_OFFSET,
                 8,
                 Type::Int,
@@ -5895,7 +5862,7 @@ static PYTRACEBACK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
                 false,
             ),
             (
-                "PyTraceback.w_code",
+                "w_code",
                 PYTRACEBACK_W_CODE_OFFSET,
                 WORD,
                 Type::Ref,
@@ -5903,11 +5870,25 @@ static PYTRACEBACK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
                 false,
                 false,
             ),
+            (
+                "w_class",
+                W_CLASS_OFFSET,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
         ],
-        // Out of both name registries, but the `_cache_size` STRUCT identity
-        // still has to be its own: sharing the no-identity key hands
-        // `PYTRACEBACK_GC_TYPE_ID` to every keyless struct header write.
         "PyTraceback",
+        "pytraceback::PyTraceback",
+        &[],
+        &[],
+        // `_cache_size` STRUCT identity has to be its own: sharing the
+        // no-identity key hands `PYTRACEBACK_GC_TYPE_ID` to every keyless
+        // struct header write.
+        "PyTraceback",
+        false,
     )
 });
 
