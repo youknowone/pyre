@@ -88,7 +88,7 @@ pub fn fargs_of(ct: &W_CType) -> Vec<PyObjectRef> {
     if ct.fargs.is_null() {
         return Vec::new();
     }
-    unsafe { pyre_object::w_list_items_copy_as_vec(ct.fargs) }
+    unsafe { pyre_object::tupleobject::w_tuple_items_copy_as_vec(ct.fargs) }
 }
 
 /// `W_CTypeFunc.call` — the entry `W_CData.call` reaches.
@@ -121,31 +121,19 @@ pub fn call(ct: &W_CType, funcaddr: usize, args_w: &[PyObjectRef]) -> Result<PyO
     call_varargs(ct, funcaddr, args_w)
 }
 
-/// `self.fargs` as the object-strategy list `_immutable_fields_ =
-/// ['fargs[*]']` requires (`rclass.py _parse_field_list`).
-fn fargs_list(w_fargs: PyObjectRef) -> Option<&'static pyre_object::W_ListObject> {
-    if w_fargs.is_null() {
-        return None;
-    }
-    Some(unsafe { &*(w_fargs as *const pyre_object::W_ListObject) })
-}
-
 /// `len(self.fargs)` — the declared argument count of a function type.
 fn fargs_len(w_fargs: PyObjectRef) -> usize {
-    fargs_list(w_fargs)
-        .map(pyre_object::ll_list_obj_length)
-        .unwrap_or(0)
+    if w_fargs.is_null() {
+        return 0;
+    }
+    unsafe { pyre_object::tupleobject::w_tuple_len(w_fargs) }
 }
 
-/// `self.fargs[i]` — `ctypefunc.py` `_call`.  The list is never mutated
-/// (`fargs[*]`), so this is `ll_getitem_foldable_nonneg` (`rlist.py`)
-/// and the codewriter sees `list.obj_getitem_foldable`.
+/// `self.fargs[i]` — the declared ctype of argument `i`.
 fn farg(w_fargs: PyObjectRef, i: usize) -> PyObjectRef {
-    match fargs_list(w_fargs) {
-        Some(list) if i < pyre_object::ll_list_obj_length(list) => {
-            pyre_object::ll_list_obj_getitem_foldable(list, i)
-        }
-        _ => pyre_object::PY_NULL,
+    match unsafe { pyre_object::tupleobject::w_tuple_getitem(w_fargs, i as i64) } {
+        Some(w_farg) => w_farg,
+        None => pyre_object::PY_NULL,
     }
 }
 
@@ -169,11 +157,11 @@ fn call_varargs(
     let fvarargs = complete_argtypes(&fargs, args_w)?;
     let cif = build_cif_descr(&fvarargs, ct.ctitem, ct.abi, Some(fargs.len()))?;
     // `new_ctypefunc_completing_argtypes` builds a fresh function type and
-    // calls `_call` on it. The completed list is young and is not a field
+    // calls `_call` on it. The completed tuple is young and is not a field
     // of `ct`, so this opaque arm pins it for the conversions below.
     let roots = pyre_object::gc_roots::push_roots();
     let fargs_slot = roots.base();
-    let _ = roots.pin_root(pyre_object::w_list_new_object(fvarargs));
+    let _ = roots.pin_root(pyre_object::tupleobject::w_tuple_new(fvarargs));
     let result = do_call_fargs(roots.get(fargs_slot), ct.ctitem, cif, funcaddr, args_w);
     unsafe { free_cif_descr(cif) };
     result
@@ -204,7 +192,7 @@ fn complete_argtypes(
 ///
 /// Upstream reads `self.fargs[i]` off the promoted function type
 /// (`ctypefunc.py` `_call`). The ctype is `allocate_stable`, so `self` does
-/// not move and a collection rewrites the `fargs` field when the list does.
+/// not move and a collection rewrites the `fargs` field when the tuple does.
 /// Re-reading the field is that load; a second root bracket around a copy of
 /// the pointer was only there so the jitcode eraser could see a single pin.
 ///
@@ -235,9 +223,12 @@ fn do_call(ct: &W_CType, funcaddr: usize, args_w: &[PyObjectRef]) -> Result<PyOb
     let called = 'body: {
         for i in 0..args_w.len() {
             let data = cdataobj::raw_ptradd(buffer, unsafe { exchange_arg(cif, i) });
-            // `argtype = self.fargs[i]` (`ctypefunc.py` `_call`).  The list
-            // is `_immutable_fields_ = ['fargs[*]']`, so a promoted function
-            // type makes the element a trace constant.
+            // `argtype = self.fargs[i]` (`ctypefunc.py` `_call`).  The
+            // constant comes from `fargs[*]` (`W_CTypeFunc._immutable_fields_`)
+            // through the tuple's `wrappeditems[*]` (`rclass.py
+            // _parse_field_list` IR_IMMUTABLE_ARRAY): a promoted function
+            // type makes the field, the items block, and the element
+            // `getarrayitem_gc_r_pure`.
             let w_argtype = farg(ct.fargs, i);
             let argtype = match ctypeobj::ctype_arg(w_argtype) {
                 Ok(argtype) => argtype,
@@ -267,7 +258,7 @@ fn do_call(ct: &W_CType, funcaddr: usize, args_w: &[PyObjectRef]) -> Result<PyOb
     }
 }
 
-/// Variadic `_call`: the completed `fargs` list is not a field of `ct`.
+/// Variadic `_call`: the completed `fargs` tuple is not a field of `ct`.
 #[majit_macros::dont_look_inside]
 fn do_call_fargs(
     w_fargs: PyObjectRef,

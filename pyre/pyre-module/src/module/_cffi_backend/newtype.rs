@@ -1046,11 +1046,17 @@ fn function_type_matches(
     let Some(ctype) = ctypeobj::ctype_at(w_ctype) else {
         return false;
     };
-    ctype.kind == ctypeobj::KIND_FUNC
-        && ctype.ctitem == w_fresult
-        && ctype.has(ctypeobj::CTypeFlags::ELLIPSIS) == ellipsis
-        && ctype.abi == abi
-        && super::ctypefunc::fargs_of(ctype) == fargs
+    if ctype.kind != ctypeobj::KIND_FUNC
+        || ctype.ctitem != w_fresult
+        || ctype.has(ctypeobj::CTypeFlags::ELLIPSIS) != ellipsis
+        || ctype.abi != abi
+        || unsafe { pyre_object::w_tuple_len(ctype.fargs) } != fargs.len()
+    {
+        return false;
+    }
+    fargs.iter().enumerate().all(|(index, &expected)| {
+        (unsafe { pyre_object::w_tuple_getitem(ctype.fargs, index as i64) }) == Some(expected)
+    })
 }
 
 /// `newtype.py new_function_type`.
@@ -1139,7 +1145,7 @@ pub fn build_function_type(
     let ctype_slot = roots.base();
     let _ = roots.pin_root(w_ctype);
     let fargs_slot = ctype_slot + 1;
-    let _ = roots.pin_root(pyre_object::w_list_new_object(fargs.to_vec()));
+    let _ = roots.pin_root(pyre_object::w_tuple_new(fargs.to_vec()));
     let ct = ctypeobj::ctype_arg(roots.get(ctype_slot))?;
     ct.fargs = roots.get(fargs_slot);
     ct.abi = abi;

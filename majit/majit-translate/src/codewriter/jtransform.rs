@@ -627,6 +627,13 @@ pub struct Transformer<'a> {
     /// on `SETFIELD_GC` of a pointer, not on a residual or raw store.
     /// `None` until computed once per graph.
     gc_stored_bases: Option<std::collections::HashSet<crate::flowspace::model::Variable>>,
+    /// Results of `FieldRead`s whose `(owner, field)` is an immutable
+    /// array rank (`name[*]`, `rclass.py _parse_field_list`).  An
+    /// `ArrayRead` whose base (after `canonical_gc_base` and pointer
+    /// arithmetic) is one of these is `getarrayitem_gc_*_pure` —
+    /// `jtransform.py rewrite_op_getarrayitem` `ARRAY._immutable_field(None)`.
+    /// `None` until computed once per graph, same as `gc_stored_bases`.
+    immutable_array_vars: Option<std::collections::HashSet<crate::flowspace::model::Variable>>,
     notes: Vec<GraphTransformNote>,
     vable_rewrites: usize,
     calls_classified: usize,
@@ -979,6 +986,89 @@ fn collect_gc_stored_bases(
         }
     }
     set
+}
+
+/// Variables that hold an immutable array: each is the result of a
+/// `FieldRead` whose field has `IR_IMMUTABLE_ARRAY` rank
+/// (`rclass.py _parse_field_list` `name[*]`).  Computed once per graph.
+fn collect_immutable_array_vars(
+    graph: &FunctionGraph,
+    cc: Option<&crate::call::CallControl>,
+) -> std::collections::HashSet<crate::flowspace::model::Variable> {
+    let mut set = std::collections::HashSet::new();
+    let Some(cc) = cc else {
+        return set;
+    };
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let OpKind::FieldRead { field, .. } = &op.kind else {
+                continue;
+            };
+            let Some(rank) = cc.field_immutability(field.owner_root.as_deref(), &field.name) else {
+                continue;
+            };
+            if rank.is_array() && rank.is_immutable() {
+                if let Some(result) = op.result.clone() {
+                    set.insert(result);
+                }
+            }
+        }
+    }
+    set
+}
+
+/// Operand of a pointer-arithmetic Call that produced `var`, if any.
+/// The front's `items_block_items_base` accessor aliases to its receiver;
+/// a leftover `ptr::add` / `wrapping_add` of that receiver still names
+/// the array header in arg 0.
+fn ptr_arith_base_operand(
+    graph: &FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+) -> Option<crate::flowspace::model::Variable> {
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if op.result.as_ref() != Some(var) {
+                continue;
+            }
+            let OpKind::Call {
+                target: CallTarget::FunctionPath { segments },
+                args,
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            let leaf = segments.last()?.as_str();
+            if args.len() == 2 && (leaf == "add" || leaf == "wrapping_add") {
+                return args.first()?.as_variable().cloned();
+            }
+        }
+    }
+    None
+}
+
+/// Array pointer an `ArrayRead` indexes, after alias / identity-cast /
+/// pointer-arithmetic chasing.
+fn immutable_array_origin(
+    graph: &FunctionGraph,
+    aliases: &std::collections::HashMap<
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Variable,
+    >,
+    var: &crate::flowspace::model::Variable,
+) -> crate::flowspace::model::Variable {
+    let mut cur = canonical_gc_base(graph, aliases, var);
+    for _ in 0..32 {
+        let Some(src) = ptr_arith_base_operand(graph, &cur) else {
+            break;
+        };
+        let next = canonical_gc_base(graph, aliases, &src);
+        if next == cur {
+            break;
+        }
+        cur = next;
+    }
+    cur
 }
 
 /// `rtype_const_result` / `rtype_ptr_null` for a Default whose Self
@@ -1831,6 +1921,7 @@ impl<'a> Transformer<'a> {
             direct_ptradd_type_arg: None,
             header_stack_results: std::collections::HashSet::new(),
             gc_stored_bases: None,
+            immutable_array_vars: None,
             notes: Vec::new(),
             vable_rewrites: 0,
             calls_classified: 0,
@@ -1926,6 +2017,10 @@ impl<'a> Transformer<'a> {
         let exceptblock = rewritten.exceptblock;
         let graph_name = rewritten.name.clone();
         self.gc_stored_bases = Some(collect_gc_stored_bases(&rewritten));
+        self.immutable_array_vars = Some(collect_immutable_array_vars(
+            &rewritten,
+            self.callcontrol.as_deref(),
+        ));
         for block_idx in 0..rewritten.blocks.len() {
             self.optimize_block(&mut rewritten, block_idx, &graph_name, exceptblock);
         }
@@ -2816,7 +2911,7 @@ impl<'a> Transformer<'a> {
                 item_ty,
                 ..
             } if self.config.lower_virtualizable => {
-                self.rewrite_op_getarrayitem(op, base, index, item_ty, graph_name)
+                self.rewrite_op_getarrayitem(op, base, index, item_ty, graph_name, graph)
             }
             // ── rewrite_op_setarrayitem ──
             OpKind::ArrayWrite {
@@ -5163,6 +5258,7 @@ impl<'a> Transformer<'a> {
         index: &crate::flowspace::model::Variable,
         item_ty: &ValueType,
         graph_name: &str,
+        graph: &FunctionGraph,
     ) -> RewriteResult {
         let typed_item_ty = op
             .result
@@ -5210,14 +5306,30 @@ impl<'a> Transformer<'a> {
         // → `pure = '_pure'`. The front leaves ordinary reads `pure: false`;
         // the array type's immutability lives on
         // `CallControl.immutable_array_types` (`descr.py is_pure`).
+        // Object arrays share one type id, so a `name[*]` field's array
+        // is also recognised from the FieldRead that produced the base
+        // (`rclass.py _parse_field_list` IR_IMMUTABLE_ARRAY).
         // `OpHelpers.is_pure_with_descr` does not consult the descr for
         // `GETARRAYITEM_GC_*`, so the opcode itself must be the `_pure`
         // form.
-        let immutable = array_type_id.as_deref().is_some_and(|aid| {
-            self.callcontrol
-                .as_deref()
-                .is_some_and(|cc| cc.immutable_array_types.contains(aid))
-        });
+        if self.immutable_array_vars.is_none() {
+            self.immutable_array_vars = Some(collect_immutable_array_vars(
+                graph,
+                self.callcontrol.as_deref(),
+            ));
+        }
+        let from_star_field = {
+            let origin = immutable_array_origin(graph, &self.aliases, base);
+            self.immutable_array_vars
+                .as_ref()
+                .is_some_and(|vars| vars.contains(&origin) || vars.contains(base))
+        };
+        let immutable = from_star_field
+            || array_type_id.as_deref().is_some_and(|aid| {
+                self.callcontrol
+                    .as_deref()
+                    .is_some_and(|cc| cc.immutable_array_types.contains(aid))
+            });
         let pure = source_pure || immutable;
         if &typed_item_ty != item_ty || pure != source_pure {
             return RewriteResult::Replace(vec![SpaceOperation {
@@ -7879,42 +7991,6 @@ impl<'a> Transformer<'a> {
                                 ),
                                 nolength: false,
                                 pure: false,
-                            },
-                        },
-                    ],
-                )
-            }
-            // `ll_getitem_foldable_nonneg` (rlist.py, `oopspec =
-            // 'list.getitem_foldable(l, index)'`) — selected by
-            // `rtype_getitem` when `not listdef.listitem.mutated`
-            // (rlist.py:256-258).  Same items-then-element decomposition
-            // as `list.obj_getitem`, except the element load is the
-            // foldable `getarrayitem_gc_r_pure` (`pure: true`).
-            "list.obj_getitem_foldable" => {
-                let l = args.first()?.clone();
-                let index = args.get(1)?.clone();
-                let block = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-                (
-                    "list.obj_getitem_foldable → getfield_gc_r(items) + getarrayitem_gc_r_pure",
-                    vec![
-                        SpaceOperation {
-                            result: Some(block.clone()),
-                            kind: OpKind::FieldRead {
-                                base: l,
-                                field: FieldDescriptor::new("items", Some(LIST_OWNER.to_string())),
-                                ty: ValueType::Ref(None),
-                                pure: false,
-                            },
-                        },
-                        SpaceOperation {
-                            result: op.result.clone(),
-                            kind: OpKind::ArrayRead {
-                                base: block,
-                                index,
-                                item_ty: ValueType::Ref(None),
-                                array_type_id: None,
-                                nolength: false,
-                                pure: true,
                             },
                         },
                     ],
@@ -16605,6 +16681,229 @@ mod tests {
         );
     }
 
+    /// `rewrite_op_getarrayitem`: a base loaded from a `name[*]` field
+    /// (`IR_IMMUTABLE_ARRAY`) makes the element read `getarrayitem_gc_*_pure`.
+    #[test]
+    fn getarrayitem_from_star_field_is_pure() {
+        use crate::call::CallControl;
+        use crate::model::{FieldDescriptor, ImmutableRank};
+
+        let mut cc = CallControl::new();
+        cc.immutable_fields_by_struct.insert(
+            "Holder".to_string(),
+            vec![("payload".to_string(), ImmutableRank::ImmutableArray)],
+        );
+
+        let mut graph = FunctionGraph::new("read_star_item");
+        let holder = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "holder".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let index = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "i".to_string(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let arr = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: holder,
+                    field: FieldDescriptor::new("payload", Some("Holder".to_string())),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::ArrayRead {
+                base: arr,
+                index,
+                item_ty: ValueType::Ref(None),
+                array_type_id: None,
+                nolength: false,
+                pure: false,
+            },
+            true,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let result = transformer.transform(&graph);
+        assert!(
+            result
+                .graph
+                .block(graph.startblock)
+                .operations
+                .iter()
+                .any(|o| matches!(&o.kind, OpKind::ArrayRead { pure: true, .. })),
+            "ArrayRead from a [*] field must be rewritten pure"
+        );
+    }
+
+    /// A base loaded from a field that is not `name[*]` stays a mutable
+    /// `getarrayitem_gc_*`.
+    #[test]
+    fn getarrayitem_from_non_star_field_is_not_pure() {
+        use crate::call::CallControl;
+        use crate::model::FieldDescriptor;
+
+        let mut cc = CallControl::new();
+        let mut graph = FunctionGraph::new("read_list_item");
+        let list = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "list".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let index = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "i".to_string(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let arr = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: list,
+                    field: FieldDescriptor::new("items", Some("ListLike".to_string())),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::ArrayRead {
+                base: arr,
+                index,
+                item_ty: ValueType::Ref(None),
+                array_type_id: None,
+                nolength: false,
+                pure: false,
+            },
+            true,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let result = transformer.transform(&graph);
+        assert!(
+            result
+                .graph
+                .block(graph.startblock)
+                .operations
+                .iter()
+                .any(|o| matches!(&o.kind, OpKind::ArrayRead { pure: false, .. })),
+            "ArrayRead from a non-[*] field must stay non-pure"
+        );
+        assert!(
+            !result
+                .graph
+                .block(graph.startblock)
+                .operations
+                .iter()
+                .any(|o| matches!(&o.kind, OpKind::ArrayRead { pure: true, .. })),
+            "no ArrayRead should have been rewritten pure"
+        );
+    }
+
+    /// A base that is a block input has unknown provenance and stays
+    /// non-pure.
+    #[test]
+    fn getarrayitem_from_input_arg_is_not_pure() {
+        use crate::call::CallControl;
+
+        let mut cc = CallControl::new();
+        let mut graph = FunctionGraph::new("read_arg_item");
+        let arr = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "arr".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let index = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "i".to_string(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::ArrayRead {
+                base: arr,
+                index,
+                item_ty: ValueType::Ref(None),
+                array_type_id: None,
+                nolength: false,
+                pure: false,
+            },
+            true,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let result = transformer.transform(&graph);
+        assert!(
+            result
+                .graph
+                .block(graph.startblock)
+                .operations
+                .iter()
+                .any(|o| matches!(&o.kind, OpKind::ArrayRead { pure: false, .. })),
+            "ArrayRead of an input arg must stay non-pure"
+        );
+        assert!(
+            !result
+                .graph
+                .block(graph.startblock)
+                .operations
+                .iter()
+                .any(|o| matches!(&o.kind, OpKind::ArrayRead { pure: true, .. })),
+            "no ArrayRead should have been rewritten pure"
+        );
+    }
+
     #[test]
     fn handle_jit_marker_loop_header_emits_single_loop_header_op() {
         // jtransform.py `SpaceOperation('loop_header', [c_index], None)`.
@@ -22176,73 +22475,6 @@ mod tests {
                 assert_eq!(array_type_id, &Some(LIST_INT_ITEMS_ARRAY.to_string()));
                 assert!(!nolength);
                 // The foldable element load — `getarrayitem_gc_i_pure`.
-                assert!(pure);
-            }
-            other => panic!("expected ArrayRead, got {other:?}"),
-        }
-        assert_eq!(ops[1].result, Some(result));
-    }
-
-    /// `list.obj_getitem_foldable(l, i)` lowers to `getfield_gc_r(l,
-    /// items)` feeding the foldable `getarrayitem_gc_r_pure(block, i)`
-    /// (rlist.py `ll_getitem_foldable_nonneg`, oopspec
-    /// `list.getitem_foldable`).  The element load is `pure: true`; the
-    /// items FieldRead stays `pure: false`.
-    #[test]
-    fn handle_list_call_obj_getitem_foldable_emits_pure_arrayread() {
-        let config = GraphTransformConfig::default();
-        let mut graph = FunctionGraph::new("list_obj_getitem_foldable");
-        let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-        let index = graph.alloc_value_var_with_type(ConcreteType::Signed);
-        let result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-        let op = SpaceOperation {
-            result: Some(result.clone()),
-            kind: OpKind::ConstInt(0),
-        };
-        let mut transformer = Transformer::new(&config);
-        let rewrite = transformer
-            ._handle_list_call(
-                "list.obj_getitem_foldable",
-                &op,
-                &[l.clone(), index.clone()],
-                &mut graph,
-                "list_obj_getitem_foldable",
-            )
-            .expect("list.obj_getitem_foldable must lower");
-        let RewriteResult::Replace(ops) = rewrite else {
-            panic!("expected Replace");
-        };
-        assert_eq!(ops.len(), 2);
-        let block = match &ops[0].kind {
-            OpKind::FieldRead {
-                base,
-                field,
-                ty,
-                pure,
-            } => {
-                assert_eq!(base, &l);
-                assert_eq!(field.name, "items");
-                assert_eq!(field.owner_root.as_deref(), Some("W_ListObject"));
-                assert!(matches!(ty, ValueType::Ref(None)));
-                assert!(!pure);
-                ops[0].result.clone().expect("block result var")
-            }
-            other => panic!("expected FieldRead, got {other:?}"),
-        };
-        match &ops[1].kind {
-            OpKind::ArrayRead {
-                base,
-                index: idx,
-                item_ty,
-                array_type_id,
-                nolength,
-                pure,
-            } => {
-                assert_eq!(base, &block);
-                assert_eq!(idx, &index);
-                assert!(matches!(item_ty, ValueType::Ref(None)));
-                assert_eq!(array_type_id, &None);
-                assert!(!nolength);
                 assert!(pure);
             }
             other => panic!("expected ArrayRead, got {other:?}"),
