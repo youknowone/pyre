@@ -108,12 +108,13 @@ fn collect_sources(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
 /// `pyre_env::var` is not `std::env::var`. The qualifiers the real read sites
 /// carry — `::` before `env::var`, `getenv` and `host_os::var`, `.` before
 /// `getenv` and `environ.get` — all clear that boundary.
-const READ_FORMS: [&str; 5] = [
+const READ_FORMS: [&str; 6] = [
     "env::var",
     "host_os::var",
     "getenv",
     "environ.get",
     "read_uint_from_env",
+    "env_is_set",
 ];
 
 /// Cargo's build-script declaration that the build depends on a gate:
