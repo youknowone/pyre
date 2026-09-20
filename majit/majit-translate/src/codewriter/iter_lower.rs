@@ -409,7 +409,9 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
                         index: bp_idx.clone(),
                         item_ty: item_ty.clone(),
                         array_type_id: array_type_id.clone(),
-                        nolength: false,
+                        nolength: crate::front::typestr::nolength_from_array_type_id(
+                            array_type_id.as_deref(),
+                        ),
                         pure: false,
                     },
                     site.item.clone(),

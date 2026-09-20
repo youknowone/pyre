@@ -83,6 +83,43 @@ fn object_pointer_slices_have_no_headerless_descr() {
     }
 }
 
+/// `arraylen_gc` is `rewrite_op_getarraysize` → `cpu.arraydescrof(ARRAY)`.
+/// A pool entry with `len_offset is None` is the `nolength=True` shape;
+/// blackhole `bh_arraylen_gc` then panics (`llmodel.py:585`). The
+/// assembler must not emit that opcode against such a descr.
+#[test]
+fn arraylen_gc_descrs_carry_lendescr() {
+    let table = descr_table();
+    for jc in all_jitcodes() {
+        for op in decoded_ops(&jc.code) {
+            if op.key != "arraylen_gc/rd>i" {
+                continue;
+            }
+            for idx in descr_operands(&jc.code, &op) {
+                match table.get(idx) {
+                    Some(BhDescr::Array {
+                        len_offset,
+                        array_type_id,
+                        ..
+                    }) => {
+                        assert!(
+                            len_offset.is_some(),
+                            "{} arraylen_gc pool {idx} identity {array_type_id:?} \
+                             has no lendescr; bh_arraylen_gc panics on that descr",
+                            jc.name,
+                        );
+                    }
+                    other => panic!(
+                        "{} arraylen_gc descr operand {idx} is {other:?}, \
+                         expected Array with a length header",
+                        jc.name,
+                    ),
+                }
+            }
+        }
+    }
+}
+
 /// `get_array_descr` keys `_cache_array` on the ARRAY identity. A
 /// length-prefixed int or float block (`len_offset == Some(0)`) with no
 /// `array_type_id` is minted identity-less, so two sites that describe the

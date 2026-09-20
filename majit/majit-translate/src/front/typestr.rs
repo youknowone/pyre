@@ -52,7 +52,12 @@ pub fn first_top_level_generic_arg(args: &str) -> Option<&str> {
 /// `Vec<T>` / `GcArray<T>` / `Ptr(GcArray(T))` shapes carry a length
 /// header at offset 0 and therefore keep the PyPy default `False`.
 ///
-/// Only `codewriter::call` consumes it.
+/// The synthetic ARRAY names `[u8]` / `[str]` / `[i64]` / `[f64]` are
+/// the same length-prefixed GcArray identities the front stamps on
+/// bytes-block chars, string arrays, and int/float list items. Other
+/// `[T]` / `[T; N]` spellings stay headerless — they are item runs,
+/// not those wrappers. descr.py:348-362: `nolength` is a property of
+/// the ARRAY lltype, so one identity never answers both ways.
 pub fn nolength_from_array_type_id(array_type_id: Option<&str>) -> bool {
     let Some(s) = array_type_id else {
         return false;
@@ -70,7 +75,10 @@ pub fn nolength_from_array_type_id(array_type_id: Option<&str>) -> bool {
         }
     }
     if inner.starts_with('[') && inner.ends_with(']') {
-        return true;
+        // Length-prefixed synthetic ARRAY identities. Everything else
+        // in `[…]` — `[T; N]`, `[*mut PyObject]` before the object-gcarray
+        // remap — has no length word.
+        return !matches!(inner, "[u8]" | "[str]" | "[i64]" | "[f64]");
     }
     // Length-prefixed wrappers carry `<` (generic) or `(` (paren-style
     // lltype spelling such as `Ptr(GcArray(...))`).  Keep the PyPy
@@ -85,4 +93,38 @@ pub fn nolength_from_array_type_id(array_type_id: Option<&str>) -> bool {
     // (e.g. an `array_type_id` directly naming a struct that contains
     // an embedded array); preserve the PyPy default `False` for that.
     s.trim() != inner
+}
+
+#[cfg(test)]
+mod tests {
+    use super::nolength_from_array_type_id;
+
+    #[test]
+    fn synthetic_gcarray_spellings_are_length_prefixed() {
+        for id in [
+            "[u8]",
+            "[str]",
+            "[i64]",
+            "[f64]",
+            "&[u8]",
+            "Vec<u8>",
+            "GcArray<i64>",
+            "majit::object_ref_gcarray",
+        ] {
+            assert!(
+                !nolength_from_array_type_id(Some(id)),
+                "{id} must share one length-prefixed descr"
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_size_and_bare_item_pointers_are_headerless() {
+        for id in ["[i64;4]", "[i64; 4]", "[*mut PyObject]", "*const i64", "*mut Point"] {
+            assert!(
+                nolength_from_array_type_id(Some(id)),
+                "{id} has no length header"
+            );
+        }
+    }
 }

@@ -329,7 +329,9 @@ fn rewire_one_slice_first_site(
                     item_ty: site.payload_ty.clone(),
                     index: item_index,
                     array_type_id: site.array_type_id.clone(),
-                    nolength: false,
+                    nolength: crate::front::typestr::nolength_from_array_type_id(
+                        site.array_type_id.as_deref(),
+                    ),
                     pure: false,
                 }
             };

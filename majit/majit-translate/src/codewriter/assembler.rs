@@ -2428,9 +2428,10 @@ impl Assembler {
             }
             // `arraylen_gc(array, arraydescr)` — `len(l.items)` reads the
             // GcArray length header. Operand shape `rd>i`: base reg + descr
-            // + int result. The descr is `arraydescrof(item_ty, ...)` with
-            // the length word at offset 0 (`nolength=false`), the same
-            // shape ArrayRead/ArrayWrite mint for the items block.
+            // + int result. The descr is `arraydescrof(ARRAY)` with a
+            // length word (`jtransform.py rewrite_op_getarraysize`); a
+            // `nolength` ARRAY has `lendescr is None` and blackhole
+            // `bh_arraylen_gc` panics (llmodel.py:585).
             OpKind::ArrayLen {
                 base,
                 array_type_id,
@@ -2450,12 +2451,34 @@ impl Assembler {
                 state.code.push(reg);
                 argcodes.push(kc);
                 let len_offset = if *nolength { None } else { Some(0) };
-                let descr_idx = self.emit_ready_descr(arraydescrof(
+                let descr = arraydescrof(
                     &crate::model::ValueType::Ref(None),
                     array_type_id,
                     len_offset,
                     callcontrol,
-                ));
+                );
+                // `get_array_descr` answers a cache hit with the first
+                // mint of this ARRAY identity and drops a later
+                // `nolength=false` request, so the live descr — not the
+                // flag on this op — is what blackhole will read.
+                match &descr {
+                    crate::jitcode::BhDescr::Array {
+                        len_offset: Some(_),
+                        ..
+                    } => {}
+                    crate::jitcode::BhDescr::Array {
+                        len_offset: None,
+                        array_type_id: atid,
+                        ..
+                    } => panic!(
+                        "arraylen_gc requires ArrayDescr.lendescr \
+                         (llmodel.py bh_arraylen_gc); graph {:?} \
+                         array_type_id {:?} requested nolength={}",
+                        self.current_graph_name, atid, *nolength
+                    ),
+                    other => panic!("arraylen_gc descr must be Array, got {other:?}"),
+                }
+                let descr_idx = self.emit_ready_descr(descr);
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
@@ -8248,6 +8271,58 @@ mod tests {
         regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
         let mut regallocs = regalloc::perform_all_register_allocations(&graph);
         let mut flat = flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
+    }
+
+    /// `rewrite_op_getarraysize` always emits `arraylen_gc`. A `nolength`
+    /// ARRAY has no length word; shipping that opcode lets blackhole
+    /// `bh_arraylen_gc` panic at run time (`llmodel.py:585`).
+    #[test]
+    #[should_panic(expected = "arraylen_gc requires ArrayDescr.lendescr")]
+    fn assemble_arraylen_rejects_a_headerless_descr() {
+        use crate::flatten::flatten_graph;
+        use crate::jtransform::{GraphTransformConfig, Transformer};
+        use crate::model::{FunctionGraph, OpKind, ValueType};
+
+        let mut graph = FunctionGraph::new("headerless_arraylen");
+        let base_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "block".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let len_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::ArrayLen {
+                    base: base_var.clone(),
+                    array_type_id: Some("*const i64".into()),
+                    nolength: true,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(len_var.clone()));
+        FunctionGraph::set_concretetype_of_inline(
+            &base_var,
+            crate::codewriter::type_state::ConcreteType::GcRef,
+        );
+        FunctionGraph::set_concretetype_of_inline(
+            &len_var,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+
+        let config = GraphTransformConfig::default();
+        let mut rewritten = Transformer::new(&config).transform(&graph).graph;
+        regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten);
+        let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
+        let mut flat = flatten_graph(&rewritten, &mut regallocs);
         let mut asm = Assembler::new();
         let _ = asm.assemble(&mut flat, &regallocs);
     }
