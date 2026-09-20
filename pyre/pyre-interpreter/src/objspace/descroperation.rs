@@ -3506,29 +3506,31 @@ fn reverse_dunder(dunder: &str) -> Option<&'static str> {
     })
 }
 
-/// Try to call a unary dunder on an instance.
+/// Try to call a unary dunder resolved off the receiver's type.
 ///
-/// PyPy: `ObjSpace.call_function(space.lookup(w_obj, dunder), w_obj)`
+/// `descroperation.py _make_unaryop_impl`:
+/// `ObjSpace.call_function(space.lookup(w_obj, dunder), w_obj)`
 /// The Python-level OperationError must propagate to the caller; use the
 /// Result-returning call path so PENDING_CALL_ERROR is consumed.
-unsafe fn try_instance_unaryop(
-    a: PyObjectRef,
-    dunder: &str,
-) -> Result<Option<PyObjectRef>, PyError> {
-    if is_instance(a)
-        && let Some(method) = lookup(a, dunder)
-    {
-        let Some(w_type) = crate::typedef::r#type(a) else {
-            return Ok(None);
-        };
-        return Ok(Some(crate::baseobjspace::get_and_call_function(
-            method,
-            a,
-            w_type.as_ptr(),
-            &[],
-        )?));
-    }
-    Ok(None)
+///
+/// `lookup` is the whole gate, as it is upstream.  Screening the receiver for
+/// `is_instance` first answered `-C` for a class `C` whose METAclass defines
+/// `__neg__` with `bad operand type for unary -`, because a class object is
+/// not an instance: `lookup` reads the dunder off `type(C)`, which is the
+/// metaclass, and that is the resolution `-C` owes.
+unsafe fn try_lookup_unaryop(a: PyObjectRef, dunder: &str) -> Result<Option<PyObjectRef>, PyError> {
+    let Some(method) = lookup(a, dunder) else {
+        return Ok(None);
+    };
+    let Some(w_type) = crate::typedef::r#type(a) else {
+        return Ok(None);
+    };
+    Ok(Some(crate::baseobjspace::get_and_call_function(
+        method,
+        a,
+        w_type.as_ptr(),
+        &[],
+    )?))
 }
 
 /// True when `obj`'s type defines `dunder` in a class other than the
@@ -6777,7 +6779,7 @@ pub fn pos_inner(a: PyObjectRef) -> PyResult {
             let (ar, ai) = complex_val(a).unwrap();
             return Ok(w_complex_new(ar, ai));
         }
-        if let Some(result) = try_instance_unaryop(a, "__pos__")? {
+        if let Some(result) = try_lookup_unaryop(a, "__pos__")? {
             return Ok(result);
         }
         Err(bad_operand_type("unary +", a))
@@ -7196,7 +7198,7 @@ pub fn neg_inner(a: PyObjectRef) -> PyResult {
             return complex_neg(a);
         }
         // Instance __neg__
-        if let Some(result) = try_instance_unaryop(a, "__neg__")? {
+        if let Some(result) = try_lookup_unaryop(a, "__neg__")? {
             return Ok(result);
         }
         Err(bad_operand_type("unary -", a))
@@ -7280,7 +7282,7 @@ pub fn invert_inner(a: PyObjectRef) -> PyResult {
         if is_long(a) {
             return Ok(w_long_new(bigint_invert(w_long_get_value(a))));
         }
-        if let Some(result) = try_instance_unaryop(a, "__invert__")? {
+        if let Some(result) = try_lookup_unaryop(a, "__invert__")? {
             return Ok(result);
         }
         Err(bad_operand_type("unary ~", a))

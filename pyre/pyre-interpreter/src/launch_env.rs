@@ -172,6 +172,15 @@ fn is_set_nonempty(name: &str) -> bool {
 /// Whether the effective `LC_CTYPE` is the legacy C/POSIX locale, which is what
 /// coerces utf8_mode to 1; every named locale (en_US, C.UTF-8, …) leaves it 0.
 fn locale_implies_utf8_mode() -> bool {
+    // Windows has no such rule: `preconfig_init_utf8_mode` guards the whole
+    // locale block with `#ifndef MS_WINDOWS`, so there the mode stays 0 unless
+    // `-X utf8` or `PYTHONUTF8` asks for it. The variables the cascade below
+    // reads are normally unset on Windows, and an unset chain resolves to C --
+    // which would turn the mode on for every process on the platform whose
+    // streams the mode most changes.
+    if cfg!(windows) {
+        return false;
+    }
     // `_Py_SetLocaleFromEnv(LC_CTYPE)` and read the answer back, so the value
     // tested is the locale the C library actually installed rather than the
     // variables that asked for it. The two differ whenever the environment
