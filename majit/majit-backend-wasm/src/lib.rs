@@ -1591,7 +1591,7 @@ fn ca_inline_params(frame_bytes: u32) -> Option<codegen::CaInlineParams> {
 /// that registered no type id must get no reloads at all — a reload there would
 /// replace the running frame pointer with whatever root happens to sit on top.
 fn host_entry_frame_is_jitframe() -> bool {
-    wasm_jitframe_tid() != 0
+    cfg!(target_arch = "wasm32") || wasm_jitframe_tid() != 0
 }
 
 /// Address of the active jitframe shadow-stack top cell for ordinary trace
@@ -6769,8 +6769,7 @@ impl majit_backend::Backend for WasmBackend {
             // item[1 + i], surviving Ref homes rooted across the trace. A home
             // slot only ever holds null (entry init) or a valid GcRef
             // (store-on-def), so forwarding is safe. No collection moves this
-            // buffer, which is what `host_entry_frame_is_jitframe` reports to
-            // codegen so the body emits no frame reload. The release below is
+            // buffer; a body reload simply reads the same stack root. The release below is
             // straight-line and the wasm32 build is `panic=abort`, so
             // `glue::execute` cannot unwind and leak roots.
             //
@@ -6789,10 +6788,11 @@ impl majit_backend::Backend for WasmBackend {
             let sign = std::mem::size_of::<isize>();
             let depth = frame_size * 8 / sign;
             let alloc_size = majit_backend::jitframe::JitFrame::alloc_size(depth);
-            // An `i64` element type for the alignment a `JitFrame` needs and
-            // for the zero fill `JitFrame::init` requires.
-            let mut backing = vec![0i64; alloc_size.div_ceil(8)];
-            let jf = backing.as_mut_ptr() as *mut majit_backend::jitframe::JitFrame;
+            // Off-GC storage so a FINISH that returns the force token can
+            // hand the same block to `LibcJitFrameDeadFrame::owning`. A
+            // `Vec` on this stack would free the token's JitFrame.
+            let jf = majit_backend::jitframe::alloc_off_gc_jitframe(alloc_size);
+            assert!(!jf.is_null(), "wasm host-buffer JitFrame allocation failed");
             unsafe { majit_backend::jitframe::JitFrame::init(jf, std::ptr::null(), depth) };
             unsafe { (*jf).jf_gcmap = compiled.home_gcmap_ptr.get() as *const u8 };
             let items = (jf as usize + majit_backend::jitframe::FIRST_ITEM_OFFSET) as *mut i64;
@@ -6817,10 +6817,7 @@ impl majit_backend::Backend for WasmBackend {
                 glue::execute(func_handle, items as usize as u32);
             }
             majit_gc::shadow_stack::pop_jf_to(saved);
-            majit_gc::shadow_stack::unregister_libc_jitframe(jf as usize);
-            // Nothing reads the frame's interior through the gcmap any more,
-            // and the gcmap is about to go out of scope.
-            unsafe { (*jf).jf_gcmap = std::ptr::null() };
+            install_post_finish_force_gcmap(jf);
             for h in 0..compiled.frame.home_slots {
                 let slot = unsafe { items.add(home_base + h) } as *mut GcRef;
                 wasm_gc_remove_root(slot);
@@ -6834,9 +6831,20 @@ impl majit_backend::Backend for WasmBackend {
             let raw_values: Vec<i64> = (0..num_outputs)
                 .map(|i| exit_arg_word(items as usize, &fail_descr, i))
                 .collect();
+            // FINISH(force_token) parks this JitFrame pointer in raw_values.
+            // Own the off-GC block before `boxed` so a later `force` does
+            // not dereference a freed frame.
+            let owner = unsafe {
+                majit_backend::libc_deadframe::LibcJitFrameDeadFrame::owning(
+                    jf,
+                    jf,
+                    depth,
+                    fail_descr.clone() as majit_ir::DescrRef,
+                    None,
+                )
+            };
             let mut data = WasmFrameData::boxed(raw_values, fail_descr, exc_value);
-            data.seed_savedata_from_jf(jf);
-            drop(backing);
+            data.take_host_frame(owner);
             DeadFrame::Boxed(data)
         }
     }

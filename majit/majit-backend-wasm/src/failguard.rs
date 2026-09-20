@@ -92,6 +92,11 @@ pub struct WasmFrameData {
     /// mid-call. `set_savedata` writes `jf_savedata` there so the
     /// later GUARD_NOT_FORCED exit can copy the word back.
     origin_jf: Option<*mut majit_backend::jitframe::JitFrame>,
+    /// Off-GC host-buffer owner. `take_host_frame` keeps the entry
+    /// JitFrame alive after `execute_token` returns.
+    /// Read on the wasm32 `execute_token` host-buffer path.
+    #[allow(dead_code)]
+    host_frame: Option<majit_backend::libc_deadframe::LibcJitFrameDeadFrame>,
     /// Slots handed to [`crate::wasm_gc_add_roots`] by [`WasmFrameData::boxed`],
     /// released again in `Drop`.
     roots: Vec<usize>,
@@ -122,6 +127,7 @@ impl WasmFrameData {
             exc_value,
             savedata: 0,
             origin_jf: None,
+            host_frame: None,
             roots: Vec::new(),
         });
         let ref_count = data
@@ -191,6 +197,14 @@ impl WasmFrameData {
             crate::wasm_gc_remove_roots(std::iter::once(slot));
             self.roots.retain(|&s| s != slot);
         }
+    }
+
+    #[allow(dead_code)] // wasm32 `execute_token` host-buffer path
+    pub(crate) fn take_host_frame(
+        &mut self,
+        frame: majit_backend::libc_deadframe::LibcJitFrameDeadFrame,
+    ) {
+        self.host_frame = Some(frame);
     }
 }
 
