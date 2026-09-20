@@ -20,10 +20,10 @@
 # onwards.
 #
 # Expected output:
-#   4000 ('i', 'marker')
-#   4000 ('i', 'marker', 'odd_only')
+#   50000 ('i', 'marker')
+#   50000 ('i', 'marker', 'odd_only')
 
-N = 8000
+N = 100000
 
 
 def branchy(i):
