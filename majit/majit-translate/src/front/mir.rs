@@ -9306,9 +9306,9 @@ impl<'a> Lowering<'a> {
     ///     `UnwindResume`, `Drop`, `Assert`), plus calls and assignments that
     ///     do *not* write `_0`, are permitted: none of them define the const
     ///     value, so with no `Switch` the single `size_of` call is its
-    ///     unconditional sole definer.  Also `None` for a non-ADT type argument
-    ///     (primitive / pointer / tuple, which has no `TypeDecl` layout to
-    ///     read) or a layout Charon left unresolved.
+    ///     unconditional sole definer.  Primitive widths (`usize`, `u64`, …)
+    ///     fold through the same lane as an inline `size_of`/`align_of` call;
+    ///     a pointer / tuple / unresolved layout stays residual.
     fn fold_size_const_global(&self, def_id: u64) -> Option<OpKind> {
         let gd = self.llbc.global_by_id(def_id)?;
         if gd
@@ -9391,30 +9391,37 @@ impl<'a> Lowering<'a> {
         ))
     }
 
-    /// The build-time byte size / alignment Charon resolved for an ADT type
-    /// expression's layout, shared by [`Self::fold_size_const_global`] (the
+    /// The build-time byte size / alignment of a `size_of` / `align_of`
+    /// type argument, shared by [`Self::fold_size_const_global`] (the
     /// NamedConst-initializer form) and the inline `size_of`/`align_of` call
-    /// fold in [`Self::lower_call`].  `None` for a non-ADT type argument
-    /// (primitive / pointer / tuple, which has no `TypeDecl` layout to read)
-    /// or a layout Charon left unresolved.
+    /// fold in [`Self::lower_call`].
+    ///
+    /// ADT arguments read Charon's `layout_for_target` (wasm32 folds the
+    /// wasm32 width, not the host's). Primitive widths (`usize`, `u64`,
+    /// …) reuse [`primitive_size_align`], the same lane a NamedConst
+    /// initializer already uses, so an inline `align_of::<usize>()`
+    /// folds too.  `None` for a pointer / tuple / unresolved layout.
     fn size_align_const_from_tyexpr(
         &self,
         want_align: bool,
         ty: &serde_json::Value,
     ) -> Option<i64> {
-        let adt = self.resolve_tyexpr_to_adt_def_id(ty)?;
-        // Read the layout for the build's `TARGET` (empty for the host
-        // extraction target), matching the target-aware field-offset lookup
-        // in `record_struct_id`. A wasm32 cross-build folds the wasm32 byte
-        // size, not the host's.
-        let target = std::env::var("TARGET").unwrap_or_default();
-        let layout = self.llbc.type_by_id(adt)?.layout_for_target(&target)?;
-        let value = if want_align {
-            layout.align
-        } else {
-            layout.size
-        }?;
-        Some(value as i64)
+        if let Some(adt) = self.resolve_tyexpr_to_adt_def_id(ty) {
+            // Read the layout for the build's `TARGET` (empty for the host
+            // extraction target), matching the target-aware field-offset lookup
+            // in `record_struct_id`. A wasm32 cross-build folds the wasm32 byte
+            // size, not the host's.
+            let target = std::env::var("TARGET").unwrap_or_default();
+            let layout = self.llbc.type_by_id(adt)?.layout_for_target(&target)?;
+            let value = if want_align {
+                layout.align
+            } else {
+                layout.size
+            }?;
+            return Some(value as i64);
+        }
+        let body = tyexpr_body(self.llbc, ty)?;
+        i64::try_from(primitive_size_align(want_align, body.get("Literal")?)?).ok()
     }
 
     // -----------------------------------------------------------------------
@@ -9901,16 +9908,16 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 // Fold an inline `core::mem::size_of::<T>()` /
-                // `align_of::<T>()` call with a layout-resolvable ADT type
-                // argument to its build-time byte size / alignment — the same
-                // constant `fold_size_const_global` produces for the
-                // NamedConst-initializer form, applied here to the inline
-                // call shape (`gc_alloc_storage_box`'s
-                // `try_gc_alloc_stable_raw(tid, size_of::<T>())`). Removes the
-                // residual `<host std.mem.size_of>` call the rtyper cannot
-                // register.  Declines (falls through to the ordinary call
-                // path) for a non-ADT type argument, whose size is not read
-                // from a `TypeDecl` layout.
+                // `align_of::<T>()` call to its build-time byte size /
+                // alignment — the same constant `fold_size_const_global`
+                // produces for the NamedConst-initializer form, applied here
+                // to the inline call shape (`gc_alloc_storage_box`'s
+                // `try_gc_alloc_stable_raw(tid, size_of::<T>())`, and
+                // `Layout::from_size_align(_, align_of::<usize>())`).
+                // Removes the residual `<host std.mem.size_of>` /
+                // `align_of` call the rtyper cannot register.  Declines
+                // (falls through to the ordinary call path) for a pointer /
+                // tuple / unresolved layout.
                 if let CallKind::Fun(FunId::Regular { id }) = &reg.kind
                     && let Some(fd) = self.llbc.fn_by_id(*id)
                 {
