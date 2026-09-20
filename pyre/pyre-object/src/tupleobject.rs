@@ -283,6 +283,21 @@ pub fn jit_w_tuple1(item: PyObjectRef) -> PyObjectRef {
     w_tuple_new(vec![item])
 }
 
+/// Word-ABI residual of a 3-tuple.
+///
+/// The sibling of [`jit_w_tuple1`] for the call sites that reach
+/// `runtime_ops::jit_build_tuple_3`, whose elements are machine words: a Rust
+/// caller holding `PyObjectRef`s has to cast into and out of that helper, and
+/// `Transformer::rewrite_simple_call` leaves `lltype.cast_ptr_to_int` /
+/// `lltype.cast_int_to_ptr` as symbolic residual calls, which
+/// `collect_descent_unlowered_helper_blockers` then reads as un-lowered helpers
+/// and refuses to descend past. Three `PyObjectRef` arguments are three
+/// residual slots and spell the same tuple with no cast.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn jit_w_tuple3(a: PyObjectRef, b: PyObjectRef, c: PyObjectRef) -> PyObjectRef {
+    w_tuple_new_from_slice(&[a, b, c])
+}
+
 /// Allocate the array-backed `W_TupleObject` directly, bypassing
 /// arity-2 specialisation. Useful for tests and call sites that need
 /// the canonical layout.
