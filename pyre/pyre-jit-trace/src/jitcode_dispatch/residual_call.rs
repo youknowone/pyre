@@ -7177,6 +7177,25 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Err(DispatchError::ForceQuasiImmutable { pc: op.pc });
     }
 
+    // `function.py funccall_valuestack`'s `_code_of_sys_exc_info` test
+    // precedes `code.fast_natural_arity` dispatch, so this `exc_info_direct`
+    // fold sits immediately before the `fastcall_0`-equivalent
+    // `try_walker_inline_builtin_call` descent below.  The generated CALL has
+    // already become a CallFn residual at this seam, so reproduce the source
+    // fast path here with this inline level's own red frame and the shared
+    // EC red.  When the look-ahead declines, the descent is the `fastcall_0`
+    // fallback onto the regular builtin wrapper.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && spec_gate(SpecFold::SysExcInfo, || {
+            try_walker_specialize_sys_exc_info(ctx, code, op, &r_args, dst)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     // BuiltinCode.func is an indirect PBC target exactly like RPython's
     // gateway wrappers.  Enter its generated JitCode before considering the
     // user-function-only full-body walk below.
@@ -7951,22 +7970,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         })?
     {
         return Ok((outcome, op.next_pc));
-    }
-
-    // `function.py funccall_valuestack`'s exact `sys.exc_info` direct path.
-    // The generated CALL has already become a CallFn residual at this seam,
-    // so reproduce the source fast path here with this inline level's own red
-    // frame and the shared EC red. Unsafe look-ahead shapes and generator
-    // chain state decline to the regular builtin wrapper.
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate(SpecFold::SysExcInfo, || {
-            try_walker_specialize_sys_exc_info(ctx, code, op, &r_args, dst)
-        })?
-        .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
     // `math.sqrt(x)` / `float(x)` on an exact numeric argument: inline the
