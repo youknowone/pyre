@@ -29,9 +29,11 @@ def probe(*options, **env_overrides):
     import os
 
     env = dict(os.environ)
-    # The variable is read at startup; an inherited one would decide the
-    # answer before the case under test does.
+    # Both are read at startup; an inherited one would decide the answer
+    # before the case under test does.  `PYTHONUTF8` settles utf8_mode ahead
+    # of the locale, which is the very rule the first case reads.
     env.pop("PYTHONIOENCODING", None)
+    env.pop("PYTHONUTF8", None)
     env.update(env_overrides)
     result = subprocess.run(
         [sys.executable, *options, "-c", PROBE],
