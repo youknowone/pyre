@@ -38,6 +38,26 @@
 //! and no Python runs between the raise and the write. Measured on both, while
 //! both raise, deliver, and reach the printer identically.
 //!
+//! The stderr codec is the same trap wearing different clothes, and it is why
+//! every arm here names `PYTHONIOENCODING`. A built-in encoder renders the
+//! report in Rust; a legacy code page is an app-level `encodings.*` module, so
+//! encoding the buffer *is* a nested dispatch loop, with the same safepoint and
+//! the same major cycle over the same full heap. Measured on this shape, the
+//! report survives exactly when the encoder is built in, and utf8_mode decides
+//! nothing beyond which encoder that leaves:
+//!
+//! ```text
+//!   stderr cp949, utf8_mode 0     no report, fatal rung only
+//!   stderr cp949, utf8_mode 1     no report, fatal rung only
+//!   stderr utf-8, utf8_mode 0     MemoryError printed
+//!   stderr ascii, utf8_mode 0     MemoryError printed
+//! ```
+//!
+//! So the arms pin utf-8 for the same reason they name a file rather than
+//! `-c`: to leave the middle rung as the only thing the run can fail at. What
+//! it does not do is make the gap go away — a Windows host on its ANSI code
+//! page still cannot print this traceback, and nothing here claims otherwise.
+//!
 //! An `except MemoryError` in the program is no better, and that is what the
 //! second round established: `os._exit` is about as small as a handler gets,
 //! and it still lost the race on two of three hosts, because the exception
@@ -127,6 +147,8 @@ fn run_shape(env: &[(&str, &str)], args: &[&str], rounds: usize, words: usize) -
     let mut cmd = Command::new(PYRE);
     cmd.args(args);
     cmd.arg(&path);
+    // Ahead of `env`, so an arm can still name its own.
+    cmd.env("PYTHONIOENCODING", "utf-8");
     for (k, v) in env {
         cmd.env(k, v);
     }
