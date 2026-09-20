@@ -838,7 +838,7 @@ impl OptVirtualize {
             // its byte offset with a placeholder `index_in_parent: 0` and no
             // parent, because the positional census that assigns the real
             // indices deliberately does not list the field -- upstream carries
-            // it as `rvirtualizable.py:29`'s appended `('vable_token',
+            // it as `rvirtualizable.py` `_setup_repr_llfields`'s appended `('vable_token',
             // llmemory.GCREF)` and pyre registers it as an extra GC edge so
             // `clear_gc_fields` zeroes it.  Slot 0 of that layout is
             // `PyFrame.locals_cells_stack_w`, so `field_idx` addressed the
@@ -849,7 +849,7 @@ impl OptVirtualize {
             //
             // A field the positional list does not hold cannot have been stored
             // under its own identity either, so this is exactly
-            // `virtualize.py:188`'s state: the trace never stored it and the
+            // `virtualize.py` `optimize_GETFIELD_GC_I`'s state: the trace never stored it and the
             // read answers the zeroed allocation.  Skip the slot lookup and
             // take the zero fold below -- which for `vable_token` is the
             // correct value, a virtual frame having never been forced.

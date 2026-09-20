@@ -3054,7 +3054,7 @@ static W_SLICE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 /// does not list it, so without this edge a JIT-inlined
 /// `NewWithVtable(pyframe_size_descr())` leaves the slot holding recycled
 /// nursery bytes — which `emit_force_virtualizable`'s `GETFIELD_GC_R` then
-/// reads as a live GC reference (`pyjitpl.py:1148-1158`).
+/// reads as a live GC reference (`pyjitpl.py` `emit_force_virtualizable`).
 static PYFRAME_VABLE_TOKEN_FIELD_DESCR: LazyLock<Arc<dyn FieldDescr>> = LazyLock::new(|| {
     Arc::new(PyreFieldDescr {
         offset: crate::frame_layout::PYFRAME_VABLE_TOKEN_OFFSET,
