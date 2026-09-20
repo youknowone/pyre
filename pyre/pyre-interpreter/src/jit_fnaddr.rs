@@ -2854,13 +2854,18 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::w_code_lookup_exceptiontable",
         crate::pycode::w_code_lookup_exceptiontable_jit_abi,
     );
-    // `named_key_hash` residualizes `w_code_getname_w` (`dont_look_inside`).
-    // Without this row the codewriter mints a symbolic path hash and
-    // `interpret()` aborts the first LOAD_NAME / LOAD_GLOBAL walk.
+    // `w_code_realize_name_w` is the `dont_look_inside` miss of `getname_w`.
+    // The filled-slot load looks inside (`pyopcode.py getname_w`). This row
+    // covers a residual realize / a graph that still names the wrapper.
     up2(
         &mut entries,
         "pyre_interpreter::pycode::w_code_getname_w",
         crate::pycode::w_code_getname_w,
+    );
+    up2(
+        &mut entries,
+        "pyre_interpreter::pycode::w_code_realize_name_w",
+        crate::pycode::w_code_realize_name_w,
     );
     // `get_w_globals` is a quasi-immutable field read upstream. The body here
     // is an atomic load the translator declines, so the residual keeps the
@@ -6612,6 +6617,11 @@ mod tests {
         assert_eq!(
             bindings["pyre_interpreter::pycode::w_code_getname_w"],
             expected,
+        );
+        let realize = crate::pycode::w_code_realize_name_w as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::pycode::w_code_realize_name_w"],
+            realize,
         );
         let globals = crate::pycode::w_code_get_w_globals as *const () as usize as i64;
         assert_eq!(

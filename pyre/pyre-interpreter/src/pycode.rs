@@ -3263,10 +3263,10 @@ unsafe fn realize_code_const(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef
 /// `pyopcode.py getname_w(index) -> self.getcode().co_names_w[index]`
 /// — the one wrapped name this code object holds at `idx`.
 ///
-/// Realized on first demand with `w_str_new`, whose result is
-/// `malloc_typed`-immortal: the published pointer is fixed, so a slot is never
-/// forwarded and a thread losing the publish race abandons its candidate rather
-/// than freeing it.
+/// PyPy fills `co_names_w` in the constructor (`_immutable_fields_
+/// co_names_w[*]`), so this is an array read the trace records. Pyre
+/// realizes a slot on first demand; a filled slot is immortal and the
+/// load is the same read. The intern/CAS miss stays residual.
 ///
 /// Returns `PY_NULL` when the enclosing code or the slot cannot be resolved
 /// (test fixtures and gateway builtins carry no name table); callers fall back
@@ -3274,8 +3274,33 @@ unsafe fn realize_code_const(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef
 ///
 /// # Safety
 /// `w_code_obj` must point to a valid `PyCode`.
-#[majit_macros::dont_look_inside]
 pub unsafe fn w_code_getname_w(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
+    let existing = unsafe { w_code_peek_name_w(w_code_obj, idx) };
+    if !existing.is_null() {
+        return existing;
+    }
+    unsafe { w_code_realize_name_w(w_code_obj, idx) }
+}
+
+unsafe fn w_code_peek_name_w(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
+    if w_code_obj.is_null() {
+        return pyre_object::pyobject::PY_NULL;
+    }
+    let w_code = unsafe { &*(w_code_obj as *const PyCode) };
+    if w_code.co_names_w.is_null() {
+        return pyre_object::pyobject::PY_NULL;
+    }
+    let slot_table = unsafe { &*w_code.co_names_w };
+    let Some(slot) = slot_table.get(idx) else {
+        return pyre_object::pyobject::PY_NULL;
+    };
+    slot.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// First-demand intern into `co_names_w[idx]`. Residual: intern and the
+/// publish CAS are not the `getname_w` array read.
+#[majit_macros::dont_look_inside]
+pub(crate) unsafe fn w_code_realize_name_w(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
     if w_code_obj.is_null() {
         return pyre_object::pyobject::PY_NULL;
     }
@@ -3289,15 +3314,10 @@ pub unsafe fn w_code_getname_w(w_code_obj: PyObjectRef, idx: usize) -> PyObjectR
     let Some(slot) = slot_table.get(idx) else {
         return pyre_object::pyobject::PY_NULL;
     };
-    // PyPy's GIL serializes first access to its already-interned list. Pyre is
-    // free-threaded and realizes this slot lazily, so every reader and writer
-    // uses the AtomicPtr element stored in co_names_w.
     let existing = slot.load(std::sync::atomic::Ordering::Acquire);
     if !existing.is_null() {
         return existing;
     }
-    // Guard `code_ptr` before dereferencing it — the same null/alignment check
-    // the lazy-cache initializers use.
     let align_mask = std::mem::align_of::<crate::CodeObject>() as i64 - 1;
     if w_code.code_ptr.is_null() || (w_code.code_ptr as i64) & align_mask != 0 {
         return pyre_object::pyobject::PY_NULL;

@@ -13078,13 +13078,7 @@ fn init_type_type(ns: PyObjectRef) {
                     if !pyre_object::is_str(args[1]) {
                         return Err(crate::PyError::type_error("attribute name must be string"));
                     }
-                    let name = pyre_object::w_str_get_wtf8(args[1]);
-                    match name.as_str() {
-                        Ok(s) => crate::baseobjspace::object_setattr(args[0], s, args[2]),
-                        Err(_) => crate::baseobjspace::object_setattr_surrogate(
-                            args[0], args[1], name, args[2],
-                        ),
-                    }
+                    crate::baseobjspace::object_setattr(args[0], args[1], args[2])
                 },
                 3,
             ),
@@ -13098,13 +13092,7 @@ fn init_type_type(ns: PyObjectRef) {
                     if !pyre_object::is_str(args[1]) {
                         return Err(crate::PyError::type_error("attribute name must be string"));
                     }
-                    let name = pyre_object::w_str_get_wtf8(args[1]);
-                    match name.as_str() {
-                        Ok(s) => crate::baseobjspace::object_delattr(args[0], s),
-                        Err(_) => {
-                            crate::baseobjspace::object_delattr_surrogate(args[0], args[1], name)
-                        }
-                    }
+                    crate::baseobjspace::object_delattr(args[0], args[1])
                 },
                 2,
             ),
@@ -22742,15 +22730,7 @@ fn init_object_type(ns: PyObjectRef) {
                     // `object.__setattr__` is the terminal implementation
                     // that writes directly to the instance dict, bypassing
                     // any user __setattr__ override.
-                    let name = unsafe { pyre_object::w_str_get_wtf8(args[1]) };
-                    match name.as_str() {
-                        Ok(s) => crate::baseobjspace::object_setattr(args[0], s, args[2]),
-                        Err(_) => unsafe {
-                            crate::baseobjspace::object_setattr_surrogate(
-                                args[0], args[1], name, args[2],
-                            )
-                        },
-                    }
+                    crate::baseobjspace::object_setattr(args[0], args[1], args[2])
                 },
                 3,
                 "($self, name, value, /)",
@@ -22779,13 +22759,7 @@ fn init_object_type(ns: PyObjectRef) {
                     if !unsafe { pyre_object::is_str(args[1]) } {
                         return Err(crate::PyError::type_error("attribute name must be string"));
                     }
-                    let name = unsafe { pyre_object::w_str_get_wtf8(args[1]) };
-                    match name.as_str() {
-                        Ok(s) => crate::baseobjspace::object_delattr(args[0], s),
-                        Err(_) => unsafe {
-                            crate::baseobjspace::object_delattr_surrogate(args[0], args[1], name)
-                        },
-                    }
+                    crate::baseobjspace::object_delattr(args[0], args[1])
                 },
                 2,
                 "($self, name, /)",

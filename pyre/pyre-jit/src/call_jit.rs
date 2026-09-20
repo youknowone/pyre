@@ -6791,10 +6791,17 @@ pub extern "C" fn bh_load_method_self_fn(
         return pyre_object::PY_NULL as i64;
     }
     let name = code.names[idx].as_ref();
+    let w_name = unsafe {
+        pyre_interpreter::pycode::w_code_getname_w_or_new(
+            w_code_ptr as pyre_object::PyObjectRef,
+            idx,
+            name,
+        )
+    };
     pyre_interpreter::eval::compute_load_method_bound(
         obj as pyre_object::PyObjectRef,
         attr as pyre_object::PyObjectRef,
-        name,
+        w_name,
     ) as i64
 }
 

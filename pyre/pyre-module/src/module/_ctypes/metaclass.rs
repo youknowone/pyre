@@ -357,7 +357,7 @@ fn structure_setattr(args: &[PyObjectRef]) -> PyResult {
             name,
         )));
     }
-    pyre_interpreter::baseobjspace::object_setattr(obj, name, args[2])
+    pyre_interpreter::baseobjspace::object_setattr(obj, args[1], args[2])
 }
 
 fn finish_aggregate_base(tp: PyObjectRef, metaclass: PyObjectRef, paramfunc: &'static str) {
