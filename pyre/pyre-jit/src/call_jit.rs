@@ -632,12 +632,22 @@ fn park_residual_call_exception() -> ParkedResidualException {
     let scope = pyre_object::gc_roots::push_roots();
     let save = pyre_object::gc_roots::shadow_stack_len();
     let bh_pinned = bh != 0;
-    if bh_pinned {
-        let _ = pyre_object::gc_roots::pin_root(bh as pyre_object::PyObjectRef);
-    }
     let backend_pinned = backend != 0;
+    // Publish both cells before any normalize: `pin_root` queries after the
+    // first write and a collection there would move the still-unrooted one.
+    let mut parked = [pyre_object::PY_NULL; 2];
+    let mut n = 0;
+    if bh_pinned {
+        parked[n] = bh as pyre_object::PyObjectRef;
+        n += 1;
+    }
     if backend_pinned {
-        let _ = pyre_object::gc_roots::pin_root(backend as pyre_object::PyObjectRef);
+        parked[n] = backend as pyre_object::PyObjectRef;
+        n += 1;
+    }
+    if n > 0 {
+        let base = scope.publish(&parked[..n]);
+        scope.normalize(base, n);
     }
     majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
     drain_backend_jit_exc();
@@ -985,10 +995,10 @@ pub(crate) extern "C" fn record_inline_traceback_for_recording(
     let w_code = w_code_value as PyObjectRef;
     let w_globals = w_globals_value as PyObjectRef;
     let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[w_exc, w_code]);
-    let w_exc = pyre_object::gc_roots::shadow_stack_get(base);
-    let w_code = pyre_object::gc_roots::shadow_stack_get(base + 1);
-    let w_globals = pyre_object::gc_roots::pin_root(w_globals);
+    let base = _roots.pin_roots(&[w_exc, w_code, w_globals]);
+    let w_exc = _roots.get(base);
+    let w_code = _roots.get(base + 1);
+    let w_globals = _roots.get(base + 2);
     // `record_application_traceback` requires the traceback's own frame
     // identity. The recording walker cannot force the optimizer's virtual
     // locals, so materialize a traceback-only frame from the promoted callee
@@ -1067,10 +1077,10 @@ pub(crate) extern "C" fn record_discarded_level_traceback(
     let w_globals = unsafe { pyre_interpreter::w_code_get_w_globals(w_code) };
     let w_exc = exc_value as PyObjectRef;
     let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[w_exc, w_code]);
-    let w_exc = pyre_object::gc_roots::shadow_stack_get(base);
-    let w_code = pyre_object::gc_roots::shadow_stack_get(base + 1);
-    let w_globals = pyre_object::gc_roots::pin_root(w_globals);
+    let base = _roots.pin_roots(&[w_exc, w_code, w_globals]);
+    let w_exc = _roots.get(base);
+    let w_code = _roots.get(base + 1);
+    let w_globals = _roots.get(base + 2);
     let Ok(mut frame) = pyre_interpreter::createframe_obj(
         w_code as *const (),
         w_globals,
@@ -2127,10 +2137,16 @@ fn jit_blackhole_resume_from_guard(
     // in eval.rs. We do this BEFORE setting up resume state so deep
     // recursion through the blackhole interpreter cannot accumulate
     // further damage.
-    if let Err(exc) = pyre_interpreter::stack_check::drain_jit_pending_exception() {
-        // Stash for the eval loop to surface — same channel the
-        // blackhole/force callbacks already use for cross-FFI errors.
-        crate::call_jit::set_pending_ca_exception(exc);
+    if let Err(mut exc) = pyre_interpreter::stack_check::drain_jit_pending_exception() {
+        // This callback returns as the result of CALL_ASSEMBLER, whose caller
+        // immediately executes GUARD_NO_EXCEPTION.  Publish into the same two
+        // exception cells as every raising residual call; merely stashing the
+        // PyError for the outer eval loop would let the null call result reach
+        // bytecode consumers before that boundary.
+        let exc_obj = exc.to_exc_object();
+        if exc_obj != pyre_object::PY_NULL {
+            publish_residual_call_exception(exc_obj as i64);
+        }
         pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_reset();
         return None;
     }
@@ -2454,6 +2470,9 @@ fn exit_frame_exception_ref(
 ///
 /// Never returns: the caller is about to classify the value by its `ExcKind`
 /// tag, and there is no correct classification for a value that has no tag.
+/// Name lookups through `ob_type` / `w_class` are intentionally omitted —
+/// an aligned word is not a live type, and following one is how this
+/// reporter SIGSEGVed after already printing the header dump.
 fn reject_non_exception_channel_value(
     obj: PyObjectRef,
     site: &str,
@@ -2490,23 +2509,14 @@ fn reject_non_exception_channel_value(
     pyre_interpreter::host_seam::emit_stderr(
         format!("[jit][BUG] {site}: context: {}\n", context()).as_bytes(),
     );
-    // `words[0]` is `ob_type` and `words[1]` is `w_class`; only read through
-    // either when the pointer has the shape of one.  `ob_type` names the
-    // built-in layout ("object" for every instance of a Python class), so the
-    // `w_class` name is the one that identifies the value.
-    let type_name = if words[0] != 0 && words[0].is_multiple_of(8) {
-        unsafe { pyre_object::pyobject::type_name_of(obj) }
-    } else {
-        "<unreadable>"
-    };
-    let class_name = if words[1] != 0 && words[1].is_multiple_of(8) {
-        unsafe { pyre_object::w_type_get_name(words[1] as PyObjectRef).to_string() }
-    } else {
-        "<none>".to_string()
-    };
+    // Do not follow `ob_type` / `w_class`. Alignment is not a type proof —
+    // a reused nursery word that happens to be 8-aligned still faults
+    // `type_name_of` / `w_type_get_name`.
     panic!(
         "{site}: exception channel value is not a W_BaseException \
-         (obj={obj:p} tag_byte={tag} type={type_name} class={class_name})"
+         (obj={obj:p} tag_byte={tag} \
+         words=[{:#018x} {:#018x} {:#018x} {:#018x}])",
+        words[0], words[1], words[2], words[3]
     );
 }
 
@@ -5818,10 +5828,10 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
             && unsafe { pyre_interpreter::builtin_code_get_fast_natural_arity(code) as usize }
                 == positional_count;
         if exact_fixed_arity {
-            let _ = _roots.pin_root(code);
-            let _ = _roots.pin_root(receiver);
-            let code_slot = root_base + 2 + args.len();
-            let receiver_slot = code_slot + 1;
+            let extra = _roots.publish(&[code, receiver]);
+            _roots.normalize(extra, 2);
+            let code_slot = extra;
+            let receiver_slot = extra + 1;
             let mut call_args = [pyre_object::PY_NULL; 4];
             call_args[0] = _roots.get(receiver_slot);
             for (index, slot) in call_args[1..positional_count].iter_mut().enumerate() {
