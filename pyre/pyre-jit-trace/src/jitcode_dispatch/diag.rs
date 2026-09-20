@@ -388,6 +388,7 @@ spec_folds! {
     SetFunctionAttribute => ("set_function_attribute",   "residual_call", "-"),
     Newtuple             => ("newtuple",                 "residual_call", "-"),
     NewtupleObject       => ("newtuple_object",          "residual_call", "-"),
+    JitWTuple3           => ("jit_w_tuple3",             "residual_call", "-"),
     Newlist              => ("newlist",                  "residual_call", "-"),
     BuiltinLenDescent    => ("builtin_len_descent",      "inline_call",   "-"),
     BuiltinIsinstance    => ("builtin_isinstance",       "residual_call", "-"),
