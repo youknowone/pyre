@@ -4321,6 +4321,65 @@ fn int_truediv_and_newfloat_jitcodes_are_the_pypy_leaf() {
 }
 
 #[test]
+fn newutf8_and_int_descr_str_jitcodes_are_the_pypy_leaf() {
+    // `space.newutf8` / `W_UnicodeObject.__init__` (`objspace.py` /
+    // `unicodeobject.py`): field stores after `malloc_typed_managed`,
+    // which `fuse_boxing_alloc` rewrites to `new_with_vtable`.
+    // `intobject.py descr_str` is `ll_int2dec` then that wrap.
+    let newutf8 = crate::jitcode_runtime::newutf8_jitcode()
+        .expect("w_str_from_storage_and_length must be a discovered jitcode");
+    let descr_str = crate::jitcode_runtime::int_descr_str_jitcode()
+        .expect("int descr_str must be a discovered jitcode");
+    let dump = |code: &[u8], label: &str| {
+        let mut pc = 0;
+        while let Some(op) = crate::jitcode_runtime::decode_op_at(code, pc) {
+            eprintln!("  {label} [{:>3}] {}", op.pc, op.key);
+            pc = op.next_pc;
+        }
+    };
+    let newutf8_body =
+        super::sub_jitcode_body_by_index(newutf8.index()).expect("newutf8 body");
+    let newutf8_ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&newutf8.code)
+        .map(|op| op.opname)
+        .collect();
+    eprintln!(
+        "newutf8 i={} r={} f={} {} ops: {newutf8_ops:?}",
+        newutf8_body.num_regs_i,
+        newutf8_body.num_regs_r,
+        newutf8_body.num_regs_f,
+        newutf8_ops.len()
+    );
+    dump(&newutf8.code, "newutf8");
+    let descr_str_body =
+        super::sub_jitcode_body_by_index(descr_str.index()).expect("descr_str body");
+    let descr_str_ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&descr_str.code)
+        .map(|op| op.opname)
+        .collect();
+    eprintln!(
+        "descr_str i={} r={} f={} {} ops: {descr_str_ops:?}",
+        descr_str_body.num_regs_i,
+        descr_str_body.num_regs_r,
+        descr_str_body.num_regs_f,
+        descr_str_ops.len()
+    );
+    dump(&descr_str.code, "descr_str");
+    assert!(
+        newutf8_ops.iter().any(|op| *op == "new_with_vtable"),
+        "newutf8 must box via new_with_vtable; ops={newutf8_ops:?}"
+    );
+    assert!(
+        !newutf8_ops
+            .iter()
+            .any(|op| op.contains("residual") || *op == "residual_call"),
+        "fused newutf8 must not residualise malloc/strlen; ops={newutf8_ops:?}"
+    );
+    assert!(
+        newutf8_ops.len() < 32,
+        "fused newutf8 is New+setfields, not malloc_typed; ops={newutf8_ops:?}"
+    );
+}
+
+#[test]
 fn float_binop_leaves_are_the_pypy_leaf() {
     // floatobject.py `descr_add` after `_to_float`: `W_FloatObject(x + y)`.
     // The descent walks `_float_add`, which must contain the fused New.

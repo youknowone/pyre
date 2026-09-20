@@ -353,6 +353,7 @@ pub fn w_str_from_storage_and_length(
 }
 
 /// Residual ABI for [`w_str_from_storage_and_length`].
+#[majit_macros::dont_look_inside]
 pub extern "C" fn jit_w_str_from_storage_and_length(value: i64, length: i64) -> i64 {
     w_str_from_storage_and_length(value as *mut UnicodeValueStorage, length as usize) as i64
 }
