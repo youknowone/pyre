@@ -2,14 +2,15 @@
 //!
 //! ## Positioning
 //!
-//! `core::slice::<Impl>::get` is a foreign leaf whose body is Opaque in the
-//! LLBC (Charon cannot extract `core`), so the caller emits a residual `get`
-//! call — an unregistered callee the rtyper census Skips, which Skips the
-//! CALLING graph with it.  Its `Self` is the primitive slice `[T]` (not an
-//! ADT), so `lower_call` keeps the raw `FunctionPath` segments
-//! `["core","slice","<Impl>","get"]`, receiver in `args[0]` and index in
-//! `args[1]`.  `get` returns `Some(&slice[i])` iff `i` is in bounds, so this
-//! pass *synthesizes* the guard `i < len(slice)`:
+//! `core::slice::<Impl>::get` and `get_mut` are foreign leaves whose bodies
+//! are Opaque in the LLBC (Charon cannot extract `core`), so the caller emits
+//! a residual `get` / `get_mut` call — an unregistered callee the rtyper
+//! census Skips, which Skips the CALLING graph with it.  Its `Self` is the
+//! primitive slice `[T]` (not an ADT), so `lower_call` keeps the raw
+//! `FunctionPath` segments `["core","slice","<Impl>","get"]` (or `get_mut`),
+//! receiver in `args[0]` and index in `args[1]`.  Both return `Some(&slice[i])`
+//! / `Some(&mut slice[i])` iff `i` is in bounds, so this pass *synthesizes*
+//! the guard `i < len(slice)`:
 //!
 //! ```text
 //!     opt = get(slice, i)                // residual `get` call
@@ -86,6 +87,104 @@ use crate::front::bool_then::{
 };
 use crate::front::option_map_or::emit_narrow;
 use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
+
+/// `true` iff `path` is the FunDecl `name_path` of `<[T]>::get` or `<[T]>::get_mut`.
+///
+/// Two crate prefixes reach the residual, the same pair `to_vec` already
+/// distinguishes (`alloc::slice::<Impl>::to_vec` vs the `core` inherent impl):
+/// `core::slice::<Impl>::get{,_mut}` and `alloc::slice::<Impl>::get{,_mut}`.
+/// `core::slice::index::<Impl>::get` is a different function: its `self` is
+/// the index, so args[0]/args[1] are swapped and this diamond would read
+/// `len(index)`.
+pub(crate) fn is_slice_get_name_path(path: &str) -> bool {
+    slice_get_leaf_from_path(path).is_some()
+}
+
+/// `true` iff `path` is `<[T]>::get_mut` (not `get`).
+pub(crate) fn is_slice_get_mut_name_path(path: &str) -> bool {
+    slice_get_leaf_from_path(path) == Some(SliceGetLeaf::GetMut)
+}
+
+/// `true` iff `segments` name `<[T]>::get` or `<[T]>::get_mut`.
+///
+/// Anchored on `slice / <Impl> / get{,_mut}` so a crate-stripped spelling
+/// (`slice::<Impl>::get`) and the FunDecl spelling (`core::slice::<Impl>::get`)
+/// both match, while `slice::index::<Impl>::get` (last three: `index`,
+/// `<Impl>`, `get`) does not.
+pub(crate) fn is_slice_get_segments(segments: &[String]) -> bool {
+    slice_get_leaf_from_segments(segments).is_some()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SliceGetLeaf {
+    Get,
+    GetMut,
+}
+
+fn slice_get_leaf_from_path(path: &str) -> Option<SliceGetLeaf> {
+    slice_get_leaf_from_parts(&path.split("::").collect::<Vec<_>>())
+}
+
+fn slice_get_leaf_from_segments(segments: &[String]) -> Option<SliceGetLeaf> {
+    slice_get_leaf_from_parts(&segments.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+fn slice_get_leaf_from_parts(parts: &[&str]) -> Option<SliceGetLeaf> {
+    let n = parts.len();
+    if n < 3 || parts[n - 3] != "slice" || parts[n - 2] != "<Impl>" {
+        return None;
+    }
+    // `slice::index::<Impl>::get` has `index` immediately before `<Impl>`.
+    if n >= 4 && parts[n - 4] == "index" {
+        return None;
+    }
+    match parts[n - 1] {
+        "get" => Some(SliceGetLeaf::Get),
+        "get_mut" => Some(SliceGetLeaf::GetMut),
+        _ => None,
+    }
+}
+
+/// `get` may lower a scalar or a thin-pointer element. `get_mut` may lower
+/// only a thin pointer: `ArrayRead` copies the element, which for a pointer
+/// is the referent address (the consumer mutates that object) and for a
+/// scalar / `AtomicU64` / `Option<Entry>` is a stale copy.
+///
+/// `array_type_id` is `Some("[u8]")` for a scalar spelling and `None` only
+/// for a proven thin-pointer element (`SliceGetSite::array_type_id`).
+/// An `AtomicU64` or `Option<Entry>` never produces a proof, so it never
+/// reaches this gate.
+pub(crate) fn slice_get_element_may_record(
+    is_get_mut: bool,
+    array_type_id: Option<&String>,
+) -> bool {
+    if is_get_mut {
+        array_type_id.is_none()
+    } else {
+        true
+    }
+}
+
+/// `true` iff `target` is `Result::ok` — the Method-hint form the capture
+/// used to require, or the FunDecl `FunctionPath` the rewriter already
+/// accepts (`from_size_align::is_result_ok_target`).
+pub(crate) fn is_result_ok_call_target(target: &CallTarget) -> bool {
+    match target {
+        CallTarget::Method {
+            name,
+            receiver_root,
+            ..
+        } => name == "ok" && receiver_root.as_deref() == Some("Result"),
+        CallTarget::FunctionPath { segments, .. } => {
+            let n = segments.len();
+            n >= 3
+                && segments[n - 1] == "ok"
+                && matches!(segments[n - 2].as_str(), "Result" | "<Impl>")
+                && segments[n - 3] == "result"
+        }
+        _ => false,
+    }
+}
 
 /// A recognized `<[T]>::get(slice, i)` call site captured during body lowering
 /// (`front::mir` `recognize_slice_get_site`).  The owner strings are resolved
@@ -376,11 +475,20 @@ mod tests {
     }
 
     fn emit_call(g: &mut FunctionGraph, a: crate::model::BlockId, args: Vec<Variable>) -> Variable {
+        emit_named_call(g, a, args, "get")
+    }
+
+    fn emit_named_call(
+        g: &mut FunctionGraph,
+        a: crate::model::BlockId,
+        args: Vec<Variable>,
+        leaf: &str,
+    ) -> Variable {
         g.push_op_var(
             a,
             OpKind::Call {
                 target: CallTarget::FunctionPath {
-                    segments: vec!["core".into(), "slice".into(), "<Impl>".into(), "get".into()],
+                    segments: vec!["core".into(), "slice".into(), "<Impl>".into(), leaf.into()],
                     fun_decl_id: None,
                 },
                 args: crate::model::call_args(args),
@@ -396,7 +504,10 @@ mod tests {
             matches!(
                 &op.kind,
                 OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
-                    if segments.last().map(String::as_str) == Some("get")
+                    if matches!(
+                        segments.last().map(String::as_str),
+                        Some("get" | "get_mut")
+                    )
             )
         })
     }
@@ -686,5 +797,136 @@ mod tests {
             residual_get_survives(&g, a),
             "residual call survives on decline"
         );
+    }
+
+    fn segs(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// FunDecl / FunctionPath spellings the capture must accept, and the
+    /// `SliceIndex::get` form it must not (args[0] would be the index).
+    #[test]
+    fn slice_get_name_accepts_get_and_get_mut_and_rejects_index_trait() {
+        assert!(is_slice_get_name_path("core::slice::<Impl>::get"));
+        assert!(is_slice_get_name_path("core::slice::<Impl>::get_mut"));
+        assert!(is_slice_get_name_path("alloc::slice::<Impl>::get"));
+        assert!(is_slice_get_name_path("alloc::slice::<Impl>::get_mut"));
+        assert!(is_slice_get_mut_name_path("core::slice::<Impl>::get_mut"));
+        assert!(!is_slice_get_mut_name_path("core::slice::<Impl>::get"));
+        assert!(!is_slice_get_name_path("core::slice::index::<Impl>::get"));
+        assert!(!is_slice_get_name_path(
+            "core::slice::index::<Impl>::get_mut"
+        ));
+        assert!(!is_slice_get_name_path(
+            "core::slice::index::SliceIndex::get"
+        ));
+        assert!(!is_slice_get_name_path("core::slice::<Impl>::first"));
+        assert!(is_slice_get_segments(&segs(&[
+            "core", "slice", "<Impl>", "get"
+        ])));
+        assert!(is_slice_get_segments(&segs(&[
+            "core", "slice", "<Impl>", "get_mut"
+        ])));
+        assert!(is_slice_get_segments(&segs(&["slice", "<Impl>", "get"])));
+        assert!(!is_slice_get_segments(&segs(&[
+            "core", "slice", "index", "<Impl>", "get"
+        ])));
+    }
+
+    /// `get_mut` of a thin pointer is the same two-argument diamond as `get`:
+    /// `ArrayRead` yields the pointer value, which is what the consumer
+    /// mutates through. The rewriter never inspects the leaf name.
+    #[test]
+    fn rewrite_lifts_get_mut_on_thin_pointer() {
+        let mut g = FunctionGraph::new("test_slice_get_mut");
+        let a = g.startblock;
+        let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let index = g.push_op_var(a, OpKind::ConstInt(3), true).unwrap();
+        let opt = emit_named_call(&mut g, a, vec![slice, index], "get_mut");
+        let (b, _) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![opt.clone()]);
+
+        let mut site = slice_get_site(opt);
+        site.niche = true;
+        assert_eq!(rewire_slice_get_call_sites(&mut g, &[site]), 1);
+        assert!(
+            !residual_get_survives(&g, a),
+            "residual get_mut call removed from A"
+        );
+        assert!(
+            g.blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(op.kind, OpKind::ArrayRead { .. })),
+            "the Some arm reads the thin-pointer element"
+        );
+    }
+
+    /// `get_mut` of a scalar spelling is not recorded: `ArrayRead` would copy
+    /// the integer and a write through `&mut T` would miss the slot.
+    /// `portal_diag_bump`'s `[AtomicU64]::get` and `RDict` `Option<Entry>`
+    /// never produce a proof at all (`slice_get_element` is scalar /
+    /// thin-pointer only), so they stay residual even though the callee
+    /// spelling is `core::slice::<Impl>::get`.
+    #[test]
+    fn get_mut_scalar_and_aggregate_elements_stay_unrecorded() {
+        let u8_id = "[u8]".to_string();
+        assert!(
+            slice_get_element_may_record(false, Some(&u8_id)),
+            "get of a scalar is the existing diamond"
+        );
+        assert!(
+            slice_get_element_may_record(false, None),
+            "get of a thin pointer is the existing diamond"
+        );
+        assert!(
+            !slice_get_element_may_record(true, Some(&u8_id)),
+            "get_mut of a scalar would copy the slot"
+        );
+        assert!(
+            slice_get_element_may_record(true, None),
+            "get_mut of a thin pointer copies the pointer, which is the referent"
+        );
+        // No element proof ⇒ not recorded.  That is how `[AtomicU64]::get`
+        // (`portal_diag_bump`) and `Option<Entry>` stay residual: they are
+        // ADTs, neither a scalar spelling nor a thin pointer.
+        assert!(is_slice_get_name_path("core::slice::<Impl>::get"));
+        assert!(is_slice_get_name_path("core::slice::<Impl>::get_mut"));
+    }
+
+    /// The rewriter already accepts `FunctionPath` `Result::ok`; the capture
+    /// used to require `CallTarget::Method` and dropped the FunDecl spelling.
+    #[test]
+    fn result_ok_capture_accepts_method_and_functionpath() {
+        let method = CallTarget::Method {
+            name: "ok".into(),
+            receiver_root: Some("Result".into()),
+            resolved_path: None,
+            fun_decl_id: None,
+        };
+        let impl_path = CallTarget::FunctionPath {
+            segments: segs(&["core", "result", "<Impl>", "ok"]),
+            fun_decl_id: None,
+        };
+        let owner_path = CallTarget::FunctionPath {
+            segments: segs(&["core", "result", "Result", "ok"]),
+            fun_decl_id: None,
+        };
+        let option_ok = CallTarget::Method {
+            name: "ok".into(),
+            receiver_root: Some("Option".into()),
+            resolved_path: None,
+            fun_decl_id: None,
+        };
+        let unrelated = CallTarget::FunctionPath {
+            segments: segs(&["core", "option", "<Impl>", "ok"]),
+            fun_decl_id: None,
+        };
+        assert!(is_result_ok_call_target(&method));
+        assert!(is_result_ok_call_target(&impl_path));
+        assert!(is_result_ok_call_target(&owner_path));
+        assert!(!is_result_ok_call_target(&option_ok));
+        assert!(!is_result_ok_call_target(&unrelated));
     }
 }

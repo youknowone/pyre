@@ -119,7 +119,7 @@ fn is_iter_op_segments(segments: &[String]) -> bool {
 /// var).  Conservative: a var produced by any other op (a reborrow, a
 /// foreign iterator constructor) is not followed, so the walk returns
 /// `true` only on a positively-confirmed `iter` source.
-fn originates_from_iter_op(graph: &FunctionGraph, var: &Variable) -> bool {
+pub(crate) fn originates_from_iter_op(graph: &FunctionGraph, var: &Variable) -> bool {
     iter_op_container(graph, var).is_some()
 }
 
@@ -150,7 +150,7 @@ fn iter_op_container(graph: &FunctionGraph, var: &Variable) -> Option<Variable> 
 /// Conservative: a var produced by an op `probe` declines is not followed
 /// any further, so a result is always a positively-confirmed source rather
 /// than the absence of a contrary one.
-fn walk_back_to_source<T>(
+pub(crate) fn walk_back_to_source<T>(
     graph: &FunctionGraph,
     var: &Variable,
     probe: impl Fn(&SpaceOperation) -> Option<T>,
@@ -377,6 +377,43 @@ fn bool_const(value: bool) -> LinkArg {
     LinkArg::Const(Constant::new(ConstValue::Bool(value)))
 }
 
+/// The Some-arm inputarg that carries the Enumerate pair, creating one
+/// if the diamond did not already thread it (the body may not mention
+/// the adapter except on the back edge).
+fn enumerate_pair_in_some(
+    graph: &mut FunctionGraph,
+    a: usize,
+    c: usize,
+    some_target: usize,
+    some_link: &Link,
+    pair_in_a: &Variable,
+    normal_args: &mut Vec<LinkArg>,
+) -> Variable {
+    let pair_c = graph.blocks[a].exits.iter().find_map(|link| {
+        if link.target.0 != c {
+            return None;
+        }
+        link.args.iter().enumerate().find_map(|(i, arg)| {
+            matches!(arg, LinkArg::Value(v) if v == pair_in_a)
+                .then(|| graph.blocks[c].inputargs.get(i).cloned())
+                .flatten()
+        })
+    });
+    if let Some(pair_c) = pair_c
+        && let Some(pos) = some_link
+            .args
+            .iter()
+            .position(|arg| matches!(arg, LinkArg::Value(v) if *v == pair_c))
+        && let Some(v) = graph.blocks[some_target].inputargs.get(pos)
+    {
+        return v.clone();
+    }
+    let v = graph.alloc_value_var();
+    graph.blocks[some_target].inputargs.push(v.clone());
+    normal_args.push(LinkArg::Value(pair_in_a.clone()));
+    v
+}
+
 /// Rewrite every recorded `next()` call site into the `next` op +
 /// StopIteration handler shape.  Fail-safe: a site whose surrounding
 /// `Option` match does not fit the for-loop shape is left as the residual
@@ -507,23 +544,40 @@ fn rewire_one_next_site(
         .iter()
         .position(|op| op.result.as_ref() == Some(opt))
         .ok_or_else(|| format!("{name}: next() producer op vanished from block {a}"))?;
+    // The residual `next()` result, before any trailing recast.  The
+    // native op must replace this call — looking up the peeled
+    // scrutinee instead leaves `slice::iter::Iter::next` /
+    // `array::iter::IntoIter::next` in the block (`ll_listnext` never
+    // residualizes).
+    let raw_next_result = opt.clone();
 
     // Capture the iterator operand (the `next` op's single argument) from
     // the raw call, before peeling any recast narrows off its result.
-    let iter_arg = match &graph.blocks[a].operations[next_idx].kind {
-        OpKind::Call { args, .. } if args.len() == 1 => args[0].clone().into_variable(),
+    let (next_target, iter_arg) = match &graph.blocks[a].operations[next_idx].kind {
+        OpKind::Call { target, args, .. } if args.len() == 1 => {
+            (target.clone(), args[0].clone().into_variable())
+        }
         other => {
             return Err(format!(
                 "{name}: next() producer op is not a 1-arg call: {other:?}"
             ));
         }
     };
+    // `Enumerate::next` is the same Opaque-std class as slice `Iter::next`:
+    // lower the adapter into the loop it denotes (`iter_adapter`) so the
+    // inner list iterator can take the native `next` op.  Validate-only
+    // here — mutation waits until the diamond is confirmed.
+    let enumerate_inner =
+        crate::front::iter_adapter::enumerate_list_inner(graph, &next_target, &iter_arg)?;
+    let enum_pair = enumerate_inner.is_some().then(|| iter_arg.clone());
+    let next_iter = enumerate_inner.clone().unwrap_or_else(|| iter_arg.clone());
 
     // Read the element type off the still-unmutated graph: the backward
     // walk to the `iter` op's container has to see the block structure the
     // recording site saw, and the dead forwarded-slot removal below rewrites
-    // exactly that.
-    let item_ty = iter_next_item_type(graph, &iter_arg, recorded_item_ty);
+    // exactly that.  For Enumerate the recorded kind is the *inner* element
+    // (the tuple is packed on the Some arm after this next).
+    let item_ty = iter_next_item_type(graph, &next_iter, recorded_item_ty);
 
     // `lower_call` closes the block right after the raising call, so the
     // `next()` call is normally A's last op.  An UNREGISTERED `next()`
@@ -548,7 +602,7 @@ fn rewire_one_next_site(
     // to `["core", "slice", "iter"]`).  Anything else declines (the
     // residual call keeps the rtyper Skip), so a non-list iterator never
     // reaches the rewrite.
-    if !originates_from_iter_op(graph, &iter_arg) {
+    if enumerate_inner.is_none() && !originates_from_iter_op(graph, &iter_arg) {
         return Err(format!(
             "{name}: next() iterator operand does not originate from an iter op — \
              not a list-iterator for-loop"
@@ -803,6 +857,12 @@ fn rewire_one_next_site(
             payload_positions.len()
         ));
     }
+    if enum_pair.is_some() && (!aggregate_payload || payload_positions.is_empty()) {
+        return Err(format!(
+            "{name}: Enumerate::next Some arm is not an aggregate Option payload — \
+             the adapter packs (i, item) onto __pos_0"
+        ));
+    }
 
     // None arm (StopIteration exit): the loop-break continuation.  RPython's
     // `ll_listnext` raises `StopIteration` with NO value on the exhaustion
@@ -889,10 +949,40 @@ fn rewire_one_next_site(
 
     // --- All structural validation passed; mutate the graph. ---
 
+    if let Some(pair) = &enum_pair {
+        crate::front::iter_adapter::rewrite_enumerate_ctor_to_pair(graph, pair, &next_iter)?;
+    }
+
     // The Some target reads the payload via `opt.__pos_0`; with the `next`
     // result flowing directly, that read collapses to the carried value.
-    for pos in payload_positions {
-        collapse_pos0_read(graph, some_target, pos, &name)?;
+    // Enumerate packs `(count, item)` first and collapses onto that tuple.
+    if let Some(pair) = &enum_pair {
+        let item_pos = payload_positions[0];
+        let item_in_some = graph.blocks[some_target.0]
+            .inputargs
+            .get(item_pos)
+            .cloned()
+            .ok_or_else(|| format!("{name}: enumerate Some arm lacks payload slot {item_pos}"))?;
+        let pair_in_some = enumerate_pair_in_some(
+            graph,
+            a,
+            c,
+            some_target.0,
+            &some_link,
+            pair,
+            &mut normal_args,
+        );
+        crate::front::iter_adapter::pack_enumerate_payload(
+            graph,
+            some_target.0,
+            &item_in_some,
+            &pair_in_some,
+            &name,
+        )?;
+    } else {
+        for pos in payload_positions {
+            collapse_pos0_read(graph, some_target, pos, &name)?;
+        }
     }
 
     // Drop every dead slot in the transitive chain from its block's inputargs
@@ -917,10 +1007,24 @@ fn rewire_one_next_site(
 
     // Replace A's residual `next()` call with the native `next` op: the
     // `[__iter_next]` marker, the iterator as its single operand, `opt`
-    // reused as the element.  Any pure recast narrows that followed the raw
-    // call (peeled above) are dropped so the native `next` op — which
-    // produces the scrutinised `opt` directly — is A's last op and thus the
-    // block's `raising_op` under the `LastException` exitswitch below.
+    // (the peeled scrutinee) reused as the element.  Truncating after the
+    // raw call drops the recast tail so the native op is A's last / raising
+    // op under the `LastException` exitswitch below.
+    // Enumerate reads `pair.iter` first so the raising op's operand is the
+    // inner list iterator; ctor rewrite above may have shifted `next_idx`.
+    let mut next_idx = graph.blocks[a]
+        .operations
+        .iter()
+        .position(|op| op.result.as_ref() == Some(&raw_next_result))
+        .ok_or_else(|| format!("{name}: next() producer op vanished before native replacement"))?;
+    let native_iter = if let Some(pair) = &enum_pair {
+        let (inner_a, shifted) =
+            crate::front::iter_adapter::insert_pair_iter_read(graph, a, next_idx, pair);
+        next_idx = shifted;
+        inner_a
+    } else {
+        iter_arg
+    };
     graph.blocks[a].operations.truncate(next_idx + 1);
     graph.blocks[a].operations[next_idx] = SpaceOperation {
         result: Some(opt.clone()),
@@ -929,7 +1033,7 @@ fn rewire_one_next_site(
                 segments: next_op_segments(),
                 fun_decl_id: None,
             },
-            args: crate::model::call_args(vec![iter_arg]),
+            args: crate::model::call_args(vec![native_iter]),
             result_ty: item_ty,
         },
     };
@@ -1074,5 +1178,159 @@ mod tests {
         let (none, some) = split_niche_bool_exits(&exits, "test").expect("split niche exits");
         assert_eq!(none.target, none_target);
         assert_eq!(some.target, some_target);
+    }
+
+    fn slice_iter_next_target() -> CallTarget {
+        CallTarget::FunctionPath {
+            segments: ["slice", "iter", "Iter", "next"]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            fun_decl_id: None,
+        }
+    }
+
+    /// Residual `next()` plus a trailing `__cast_instance_intrinsic` recast
+    /// in the same block — the production shape of `for &x in &[PyObjectRef]`.
+    /// The rewrite must replace the residual call, not the recast; otherwise
+    /// `slice::iter::Iter::next` survives next to `[__iter_next]` and the
+    /// rtyper still Skips.
+    #[test]
+    fn recast_tail_does_not_leave_the_residual_next_call() {
+        use crate::model::{ExitCase, ExitSwitch, FieldDescriptor, Link};
+
+        let mut g = FunctionGraph::new("test_iter_next_recast_tail");
+        let n = g.startblock;
+        let container = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            "some".to_string(),
+                            "container".to_string(),
+                            "make".to_string(),
+                        ],
+                        fun_decl_id: None,
+                    },
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let it = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["core".to_string(), "slice".to_string(), "iter".to_string()],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![container]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+
+        let (a, a_args) = g.create_block_with_arg_vars(1);
+        let it_a = a_args[0].clone();
+        let raw = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: slice_iter_next_target(),
+                    args: crate::model::call_args(vec![it_a]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let opt = g
+            .push_op_var(
+                a,
+                crate::model::cast_instance_call_result("GCREF", raw.clone(), ValueType::Ref(None)),
+                true,
+            )
+            .unwrap();
+
+        let (c, c_args) = g.create_block_with_arg_vars(1);
+        let opt_c = c_args[0].clone();
+        let disc = g
+            .push_op_var(
+                c,
+                OpKind::FieldRead {
+                    base: opt_c.clone(),
+                    field: FieldDescriptor::new("__discriminant", None),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .unwrap();
+
+        let (some_t, some_args) = g.create_block_with_arg_vars(1);
+        let some_opt = some_args[0].clone();
+        g.push_op_var(
+            some_t,
+            OpKind::FieldRead {
+                base: some_opt,
+                field: FieldDescriptor::new("__pos_0", None),
+                ty: ValueType::Ref(None),
+                pure: true,
+            },
+            true,
+        );
+        g.set_return(some_t, None);
+
+        let (none_t, _none_args) = g.create_block_with_arg_vars(0);
+        g.set_return(none_t, None);
+
+        g.set_goto(n, a, vec![it]);
+        g.set_goto(a, c, vec![opt.clone()]);
+        g.block_mut(c).exitswitch = Some(ExitSwitch::Value(disc));
+        g.block_mut(c).exits = vec![
+            Link::new_mixed(
+                Vec::new(),
+                none_t,
+                Some(ExitCase::Const(ConstValue::Int(0))),
+            )
+            .with_prevblock(c),
+            Link::new_mixed(
+                vec![LinkArg::Value(opt_c)],
+                some_t,
+                Some(ExitCase::Const(ConstValue::Int(1))),
+            )
+            .with_prevblock(c),
+        ];
+
+        // Capture the raw `next()` result, the way `front::mir` records it.
+        let rewritten = rewire_next_call_sites(&mut g, &[(raw, ValueType::Ref(None))]);
+        assert_eq!(rewritten, 1, "the recast-tailed for-loop must fold");
+        let residual = g.blocks.iter().flat_map(|b| &b.operations).filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments == &["slice".to_string(), "iter".to_string(), "Iter".to_string(), "next".to_string()]
+            )
+        }).count();
+        assert_eq!(residual, 0, "residual slice::iter::Iter::next must be gone");
+        let native = g
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments == &["__iter_next".to_string()]
+                )
+            })
+            .count();
+        assert_eq!(
+            native, 1,
+            "native [__iter_next] replaces the residual and its recast"
+        );
     }
 }

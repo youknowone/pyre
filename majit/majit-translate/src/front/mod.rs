@@ -69,9 +69,11 @@ pub(crate) mod bool_then;
 pub(crate) mod checked_arith;
 pub(crate) mod checked_arith_uint;
 pub(crate) mod exc_from_raise;
+pub(crate) mod from_raw_parts;
 pub(crate) mod from_size_align;
 #[cfg(test)]
 pub(crate) mod graph_body;
+pub(crate) mod iter_adapter;
 pub(crate) mod iter_next;
 pub mod llbc_hints;
 pub mod mir;
@@ -90,11 +92,13 @@ pub(crate) mod result_as_ref;
 pub(crate) mod result_exc;
 pub(crate) mod result_map_err;
 pub(crate) mod rfloat_call;
+pub(crate) mod saturating_add;
 pub(crate) mod saturating_sub;
 pub mod semantic;
 pub(crate) mod slice_first;
 pub(crate) mod slice_get;
 pub(crate) mod slice_index;
+pub(crate) mod std_identity;
 pub(crate) mod str_find;
 pub mod typestr;
 

@@ -113,6 +113,26 @@ impl UintArith {
     }
 }
 
+/// The unsigned checked-arithmetic pass uses one machine-word operation
+/// and its carry/borrow test.  Charon's flattened [`ValueType::Unsigned`]
+/// erases the source width, so retain the literal atom at the capture
+/// gate: a narrow `u8`/`u16`/`u32` overflow is not necessarily a word
+/// overflow.
+pub(crate) fn is_word_sized_uint_atom(atom: &str) -> bool {
+    matches!(atom, "U64") || (atom == "Usize" && crate::layout::target_word_size() == 8)
+}
+
+/// Destination `Option<Self>` payload first (covers both-const
+/// `1usize.checked_add(2)`), then either operand Place.  A readable
+/// narrow payload declines even if an operand atom looks word-sized.
+pub(crate) fn unsigned_word_atom<'a>(
+    dest_payload_atom: Option<&'a str>,
+    operand_atoms: impl IntoIterator<Item = Option<&'a str>>,
+) -> Option<&'a str> {
+    let atom = dest_payload_atom.or_else(|| operand_atoms.into_iter().flatten().next())?;
+    is_word_sized_uint_atom(atom).then_some(atom)
+}
+
 fn rewire_one_checked_arith_uint_site(
     graph: &mut FunctionGraph,
     site: &CheckedArithUintSite,
@@ -292,6 +312,18 @@ pub(crate) fn push_const_int(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn checked_unsigned_capture_rejects_narrow_integer_atoms() {
+        for atom in ["U8", "U16", "U32", "U128"] {
+            assert!(!is_word_sized_uint_atom(atom));
+        }
+        assert!(is_word_sized_uint_atom("U64"));
+        assert_eq!(
+            is_word_sized_uint_atom("Usize"),
+            crate::layout::target_word_size() == 8
+        );
+    }
+
     use super::*;
     use crate::model::CallTarget;
 
@@ -490,5 +522,23 @@ mod tests {
             )),
             "the mul_ovf producer must survive untouched"
         );
+    }
+
+    #[test]
+    fn both_const_and_const_rhs_reach_word_sized_unsigned() {
+        assert_eq!(unsigned_word_atom(Some("U64"), [None, None]), Some("U64"));
+        assert_eq!(unsigned_word_atom(None, [Some("U64"), None]), Some("U64"));
+        assert_eq!(
+            unsigned_word_atom(Some("Usize"), [None, None]).is_some(),
+            crate::layout::target_word_size() == 8
+        );
+    }
+
+    #[test]
+    fn narrow_unsigned_dest_payload_declines() {
+        assert_eq!(unsigned_word_atom(Some("U32"), [Some("U64"), None]), None);
+        assert_eq!(unsigned_word_atom(Some("U8"), [None, None]), None);
+        assert_eq!(unsigned_word_atom(None, [Some("U16"), None]), None);
+        assert_eq!(unsigned_word_atom(None, [None, None]), None);
     }
 }
