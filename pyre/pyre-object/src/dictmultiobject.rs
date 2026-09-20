@@ -4949,8 +4949,17 @@ pub unsafe fn w_dict_lookup_or_null_unicode_strategy(
 /// `dictmultiobject.py del self.unerase(w_dict.dstorage)[self.unwrap(w_key)]`.
 /// Returns `true` if a key was removed.
 ///
+/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(i))` on
+/// `_ll_dict_del` (`rordereddict.py`).
+///
 /// # Safety
 /// Same as [`w_dict_store_int_strategy`].
+fn w_dict_delitem_int_strategy_iff(obj: PyObjectRef, key: PyObjectRef) -> bool {
+    let entries = unsafe { w_dict_int_storage(obj) };
+    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(&key)
+}
+
+#[majit_macros::look_inside_iff(w_dict_delitem_int_strategy_iff)]
 pub unsafe fn w_dict_delitem_int_strategy(obj: PyObjectRef, key: PyObjectRef) -> bool {
     lock_dict_refs!(_dict_guard, obj, key);
     let dict = &mut *(obj as *mut W_DictObject);
