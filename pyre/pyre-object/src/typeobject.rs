@@ -2266,7 +2266,14 @@ pub unsafe fn w_type_ready(w_self: PyObjectRef) {
         return;
     }
     let n = crate::w_tuple_len(bases);
+    // `add_subclass` allocates the weakref, so the type is the only value
+    // kept across it, as a root; `bases_w` is read back from it each time.
+    let _roots = crate::gc_roots::push_roots();
+    let self_idx = _roots.base();
+    let _ = _roots.pin_root(w_self);
     for i in 0..n as i64 {
+        let w_self = _roots.get(self_idx);
+        let bases = (*(w_self as *const W_TypeObject)).bases;
         let Some(w_base) = crate::w_tuple_getitem(bases, i) else {
             continue;
         };
