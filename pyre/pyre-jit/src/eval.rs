@@ -2519,27 +2519,19 @@ fn build_gc() -> Box<MiniMarkGC> {
         &pyre_object::setobject::FROZENSET_TYPE as *const _ as usize,
         w_set_tid,
     );
-    // W_BaseException carries an `ExcKind` tag, a `*mut String`
-    // pointer (raw heap, not a `PyObjectRef`), and a `args_w`
-    // tuple `PyObjectRef` (`interp_exceptions.py:123-124
-    // W_BaseException.descr_init` parity — the constructor stores
-    // the args tuple inline on the instance).  Register the
-    // `args_w` offset so the GC traces it across minor
-    // collections.
+    // Slim `W_BaseException` / `_new_exception` layout.  Extra-field
+    // subclasses (`W_OSError`, `W_ImportError`, …) get a tail TypeInfo
+    // so a ValueError stays on the slim SizeDescr (header + weakref).
     let w_exception_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
         std::mem::size_of::<pyre_object::interp_exceptions::W_BaseException>(),
         object_tid,
         pyre_object::interp_exceptions::W_BASE_EXCEPTION_GC_PTR_OFFSETS.to_vec(),
     ));
     debug_assert_eq!(w_exception_tid, W_BASE_EXCEPTION_GC_TYPE_ID);
-    // Pre-register every per-ExcKind PyType to the same
-    // `W_BaseException` GC tid — they share one storage layout
-    // (the per-kind discriminator lives in `ob_type`, payload is
-    // identical) so the GC must size them identically.  The
-    // `all_foreign_pytypes` loop below skips entries already in
-    // `pytype_to_tid`, so this pre-registration wins over its
-    // generic `object_subclass(sizeof(PyObject), parent_tid)`
-    // default which would underallocate `W_BaseException`.
+    // Pre-register fieldless ExcKind PyTypes to the slim tid.  Extra-field
+    // kinds are wired to the extended tid after that TypeInfo is
+    // registered (id 188).  The `all_foreign_pytypes` loop below skips
+    // entries already in `pytype_to_tid`.
     for kind_idx in 0u8..=(pyre_object::interp_exceptions::ExcKind::EOFError as u8) {
         // Round-trip the byte through the enum so we don't depend
         // on unsafe transmute; every value in [0, UnboundLocalError]
@@ -2902,8 +2894,8 @@ fn build_gc() -> Box<MiniMarkGC> {
     // `W_MODULE_DICT_GC_TYPE_ID = 48` is unchanged (one explicit
     // registration here, one fewer from the loop) — no downstream
     // hardcoded tid shifts.  Allocation routes through
-    // `try_gc_alloc_stable` (`w_pytraceback_new`), so the trace fires
-    // for real oldgen tracebacks.
+    // `try_gc_alloc` (`w_pytraceback_new`), so the trace fires
+    // for nursery traceback nodes.
     let w_pytraceback_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
         std::mem::size_of::<pyre_interpreter::pytraceback::PyTraceback>(),
         object_tid,
@@ -3306,10 +3298,22 @@ fn build_gc() -> Box<MiniMarkGC> {
         let parent_tid = parent_kind
             .map(|p| per_exc_tid[p as u8 as usize])
             .unwrap_or(W_BASE_EXCEPTION_GC_TYPE_ID);
+        let (exc_size, exc_offsets) =
+            if pyre_object::interp_exceptions::exc_kind_uses_extended_layout(*kind) {
+                (
+                    pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_SIZE,
+                    pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_GC_PTR_OFFSETS.to_vec(),
+                )
+            } else {
+                (
+                    std::mem::size_of::<pyre_object::interp_exceptions::W_BaseException>(),
+                    W_BASE_EXCEPTION_GC_PTR_OFFSETS.to_vec(),
+                )
+            };
         let new_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-            std::mem::size_of::<pyre_object::interp_exceptions::W_BaseException>(),
+            exc_size,
             parent_tid,
-            W_BASE_EXCEPTION_GC_PTR_OFFSETS.to_vec(),
+            exc_offsets,
         ));
         per_exc_tid[*kind as u8 as usize] = new_tid;
         let pytype_ptr = exc_kind_to_pytype(*kind) as *const _ as usize;
@@ -4787,6 +4791,14 @@ fn build_gc() -> Box<MiniMarkGC> {
     pyre_object::rbuilder::set_stringpiece_gc_type_id(stringpiece_tid);
     let _ = pyre_jit_trace::descr::stringpiece_size_descr();
 
+    // rlist.py LIST for exception args_w — length + items pointer.
+    let rlist_tid = gc.register_type(TypeInfo::with_gc_ptrs(
+        pyre_object::interp_exceptions::RLIST_SIZE,
+        vec![pyre_object::interp_exceptions::RLIST_ITEMS_OFFSET],
+    ));
+    pyre_object::interp_exceptions::set_rlist_gc_type_id(rlist_tid);
+    let _ = pyre_jit_trace::descr::rlist_size_descr();
+
     // gateway.py interp2app is an internal prebuilt W_Root, not an
     // app-level builtin type. Trace its Code reference like the hidden
     // WeakrefLifeline above. This is the tail of fixed layouts, BEFORE
@@ -4941,6 +4953,19 @@ fn build_gc() -> Box<MiniMarkGC> {
         pyre_interpreter::active_subclass_range_hierarchy(),
         "GC rclass.OBJECT registration order must match the shared subclass-range census",
     );
+    // Extra-field exception layout.  Registered after the census so the
+    // pinned ids do not move; no vtable / subclass-range entry, only the
+    // TypeInfo NewWithVtable and `w_exception_new_empty_extended` allocate.
+    let w_exception_extended_tid = gc.register_type(
+        TypeInfo::object_subclass_with_gc_ptrs(
+            pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_SIZE,
+            w_exception_tid,
+            pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_GC_PTR_OFFSETS.to_vec(),
+        )
+        .object_layout_without_subclass_range(),
+    );
+    pyre_object::interp_exceptions::set_exception_extended_gc_type_id(w_exception_extended_tid);
+
     // compile.py AllVirtuals — llopaque leaf hidden in jf_savedata.
     // Absolute tail so no hardcoded / `#[pyre_class(type_id = N)]` id
     // moves; published through `set_all_virtuals_gc_type_id`.
@@ -9027,6 +9052,9 @@ fn for_iter_frame_is_finally_duplicated(code: &pyre_interpreter::CodeObject) -> 
 /// tail — `STORE_FAST name; DELETE_FAST name; RERAISE 1` — reached only when the
 /// handler body itself raises (`raise name`, `raise Other(...)`, a bare `raise`).
 ///
+/// Module-level `except E as name` spells the same tail with `STORE_NAME` /
+/// `DELETE_NAME` (or the `GLOBAL` pair); the dropped-item hazard is identical.
+///
 /// That tail lowers to a `last_exc_value` jitcode op, and on a bridge walk the
 /// walker holds no active exception to answer it with, so the walk aborts with
 /// `LastExcValueWithoutActiveException` (`jitcode_dispatch` `last_exc_value/>r`;
@@ -9055,8 +9083,13 @@ fn for_iter_frame_has_raising_named_handler(code: &pyre_interpreter::CodeObject)
             continue;
         }
         // The match test is followed by the no-match branch and, for an
-        // `as name` handler, the `STORE_FAST name` binding the caught value.
-        // `except E:` pops it instead and binds nothing.
+        // `as name` handler, the store binding the caught value
+        // (`STORE_FAST` in a function, `STORE_NAME` / `STORE_GLOBAL` at
+        // module level).  `except E:` pops it instead and binds nothing.
+        enum Bound {
+            Fast(usize),
+            Name(usize),
+        }
         let mut bound = None;
         let mut scan = pc + 1;
         while scan < num_instrs {
@@ -9065,7 +9098,15 @@ fn for_iter_frame_has_raising_named_handler(code: &pyre_interpreter::CodeObject)
                     scan += 1;
                 }
                 Some((I::StoreFast { var_num }, op_arg)) => {
-                    bound = Some(var_num.get(op_arg).as_usize());
+                    bound = Some(Bound::Fast(var_num.get(op_arg).as_usize()));
+                    break;
+                }
+                Some((I::StoreName { namei }, op_arg)) => {
+                    bound = Some(Bound::Name(namei.get(op_arg) as usize));
+                    break;
+                }
+                Some((I::StoreGlobal { namei }, op_arg)) => {
+                    bound = Some(Bound::Name(namei.get(op_arg) as usize));
                     break;
                 }
                 _ => break,
@@ -9079,7 +9120,26 @@ fn for_iter_frame_has_raising_named_handler(code: &pyre_interpreter::CodeObject)
         for body_pc in (scan + 1)..num_instrs {
             match pyre_interpreter::decode_instruction_at(code, body_pc) {
                 Some((I::DeleteFast { var_num }, op_arg))
-                    if var_num.get(op_arg).as_usize() == bound =>
+                    if matches!(
+                        bound,
+                        Bound::Fast(slot) if var_num.get(op_arg).as_usize() == slot
+                    ) =>
+                {
+                    break;
+                }
+                Some((I::DeleteName { namei }, op_arg))
+                    if matches!(
+                        bound,
+                        Bound::Name(slot) if namei.get(op_arg) as usize == slot
+                    ) =>
+                {
+                    break;
+                }
+                Some((I::DeleteGlobal { namei }, op_arg))
+                    if matches!(
+                        bound,
+                        Bound::Name(slot) if namei.get(op_arg) as usize == slot
+                    ) =>
                 {
                     break;
                 }
@@ -16169,6 +16229,26 @@ mod tests {
         // The body opcodes themselves stay admissible; only the frame-level
         // handler shape declines.
         assert!(function_entry_trace_is_jit_safe(&code));
+        assert!(for_iter_frame_has_raising_named_handler(&code));
+        assert_eq!(
+            unsupported_jit_shape(&code),
+            (
+                UnsupportedJitShape::CurrentFrameOnly,
+                "FrameShape::CurrentFrameOnly/ForIterRaisingNamedHandler"
+            )
+        );
+    }
+
+    #[test]
+    fn for_iter_module_raising_named_handler_is_declined() {
+        // Module-level `except E as e: raise e` binds with STORE_NAME and
+        // clears with DELETE_NAME.  The dropped-item hazard is the same as
+        // the function-local STORE_FAST spelling above.
+        use pyre_interpreter::compile_exec;
+        let code = compile_exec(
+            "for i in range(3):\n    try:\n        try:\n            raise ValueError\n        except ValueError as e:\n            raise e\n    except ValueError:\n        pass\n",
+        )
+        .expect("test code should compile");
         assert!(for_iter_frame_has_raising_named_handler(&code));
         assert_eq!(
             unsupported_jit_shape(&code),

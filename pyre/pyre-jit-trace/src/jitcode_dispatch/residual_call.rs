@@ -7356,6 +7356,12 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // BELOW an emitted load of the same cell (the nested module-loop
     // `i = i + 1; while i < n` read the pre-increment value and ran one
     // extra iteration).
+    //
+    // An exception table is a reason to skip: folding the residual drops
+    // `GUARD_NOT_FORCED` / `GUARD_NO_EXCEPTION`, whose kept-stack snapshot
+    // is what blackhole/peel resume uses for the live FOR_ITER iterator.
+    // Without it, `ABORT_TOO_LONG` inside an inlined callee leaves a NULL
+    // TOS on the portal frame (`trace_too_long_inline_multiframe`).
     if ctx.is_authoritative_executor
         && dst_bank == 'v'
         && r_args.len() == 3
@@ -9189,7 +9195,9 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // LoadName: descend `typeobject.py unwrap_cell` for a name already
     // in the module dict.  A later `DELETE_NAME` (`except as`) still
     // forces `version?` (`opimpl_jit_force_quasi_immutable` →
-    // `SwitchToBlackhole(ABORT_FORCE_QUASIIMMUT)`).
+    // `SwitchToBlackhole(ABORT_FORCE_QUASIIMMUT)`).  Same exception-table
+    // gate as StoreName: the fold elides the residual's kept-stack guards,
+    // and a later `ABORT_TOO_LONG` then resumes with a NULL peeled slot.
     if ctx.is_authoritative_executor
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::LoadName
         && !walk_body_has_exception_handler(ctx, code)
@@ -9984,6 +9992,11 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                                     // (unicodeobject.py) answers from one WTF-8
                                     // ordering, which no numeric arm above can
                                     // express.
+                                    // TODO: tuple `==` currently stays a residual
+                                    // call. Record it by descending the interpreter
+                                    // `descr_eq` with a `look_inside_iff`-style
+                                    // small-tuple unroll (`tupleobject.py`
+                                    // `_unroll_condition_cmp`), not by a fold.
                                     None => spec_gate(SpecFold::CompareOpStr, || {
                                         try_walker_specialize_compare_op_str(
                                             ctx, op.pc, op_tag, &r_args, &allboxes, call_descr,

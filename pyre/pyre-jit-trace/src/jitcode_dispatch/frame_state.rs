@@ -460,7 +460,7 @@ mod tests {
 
     #[test]
     fn standing_exception_seed_keeps_its_young_children() {
-        use pyre_object::interp_exceptions::{ExcKind, W_BaseException, w_exception_new_empty};
+        use pyre_object::interp_exceptions::{ExcKind, W_ExceptionExtended, w_exception_new_empty};
         pyre_interpreter::typedef::init_typeobjects();
         let _pins = pyre_object::gc_roots::push_roots();
         let exception =
@@ -470,7 +470,7 @@ mod tests {
             pyre_object::gc_roots::pin_root(pyre_object::unicodeobject::w_str_new("forwarded"));
         let _stw = majit_gc::gc_sync::quiesce_mutators();
         unsafe {
-            (*(exception as *mut W_BaseException)).w_object = child;
+            (*(exception as *mut W_ExceptionExtended)).w_object = child;
         }
         let state = WalkFrameState::new(WalkFrameStateData {
             current_exception_seed_concrete: exception,
@@ -486,7 +486,7 @@ mod tests {
         });
         assert!(seen);
         assert_eq!(
-            unsafe { (*(exception as *const W_BaseException)).w_object },
+            unsafe { (*(exception as *const W_ExceptionExtended)).w_object },
             replacement
         );
     }

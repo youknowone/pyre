@@ -592,10 +592,11 @@ impl PyError {
         forward(&mut self.exc_object);
         forward(&mut self.w_name_context);
         forward(&mut self.w_obj_context);
-        // The exception carrier is non-moving (stable/malloc_typed), so root
-        // visitors no-op on it during a minor and never reach its fields;
-        // forward the raw child slots so young tracebacks/args parked across
-        // a collection stay valid.
+        // `forward` above relocates a nursery `exc_object`.  Exceptions may
+        // also use the off-GC malloc_typed fallback, in which case that
+        // visit is a no-op and the raw child slots still have to be
+        // forwarded so young tracebacks/args parked across a collection
+        // stay valid.
         unsafe { crate::eval::walk_raw_exception_roots(self.exc_object, visitor) };
     }
 }
@@ -766,8 +767,11 @@ impl PyError {
         name: &str,
     ) -> Self {
         let mut err = Self::new(PyErrorKind::AttributeError, msg);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_obj);
         err.w_name_context = pyre_object::w_str_new_managed(name);
-        err.w_obj_context = w_obj;
+        err.w_obj_context = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         err
     }
 
@@ -1011,15 +1015,17 @@ impl PyError {
                 pyre_object::gc_roots::shadow_stack_get(base),
             )
         };
-        if storage.is_null() || unsafe { !pyre_object::is_list(storage) } {
+        if storage.is_null() || unsafe { pyre_object::interp_exceptions::rlist_len(storage) } < 2 {
             return;
         }
-        let Some(w_msg) = (unsafe { pyre_object::w_list_getitem(storage, 0) }) else {
+        let w_msg = unsafe { pyre_object::interp_exceptions::rlist_getitem(storage, 0) };
+        if w_msg.is_null() {
             return;
-        };
-        let Some(details) = (unsafe { pyre_object::w_list_getitem(storage, 1) }) else {
+        }
+        let details = unsafe { pyre_object::interp_exceptions::rlist_getitem(storage, 1) };
+        if details.is_null() {
             return;
-        };
+        }
         if unsafe { !pyre_object::is_tuple(details) || pyre_object::w_tuple_len(details) < 6 } {
             return;
         }

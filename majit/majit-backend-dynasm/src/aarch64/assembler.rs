@@ -6943,12 +6943,46 @@ impl<'a> AssemblerARM64<'a> {
         }
     }
 
-    /// NEW_ARRAY / NEW_ARRAY_CLEAR: allocate an array.
+    /// NEW_ARRAY / NEW_ARRAY_CLEAR: allocate a typed GC array.
+    ///
+    /// Rewrite normally replaces these with `CALL_MALLOC_NURSERY_VARSIZE` /
+    /// `malloc_array`. This leftover path must still stamp the collector
+    /// type id and write length at the descr's `lendescr` offset — not
+    /// libc malloc with a string-header store at +8.
     fn genop_new_array(&mut self, op: &Op, arglocs: &[Loc]) {
-        let (base_size, item_size) = op
-            .with_array_descr(|ad| (ad.base_size() as i64, ad.item_size() as i64))
-            .unwrap_or((8, 8));
-        self.genop_alloc_varsize(op, arglocs, base_size, item_size);
+        let [len_loc, ..] = arglocs else {
+            panic!("varsize allocation expects a length location, got {arglocs:?}");
+        };
+        let (base_size, item_size, type_id, len_ofs) = op
+            .with_array_descr(|ad| {
+                (
+                    ad.base_size() as i64,
+                    ad.item_size() as i64,
+                    ad.type_id() as i64,
+                    ad.len_descr().map_or(0, |fd| fd.offset() as i64),
+                )
+            })
+            .unwrap_or((8, 8, 0, 0));
+        let clear = matches!(op.opcode, OpCode::NewArrayClear) as i64;
+        self.emit_load_to_rax(*len_loc);
+        dynasm!(self.mc ; .arch aarch64 ; mov x4, x0);
+        self.emit_mov_imm64(0, base_size);
+        self.emit_mov_imm64(1, item_size);
+        self.emit_mov_imm64(2, len_ofs);
+        self.emit_mov_imm64(3, type_id);
+        self.emit_mov_imm64(5, clear);
+        self.emit_mov_imm64(
+            8,
+            crate::runner::dynasm_malloc_new_array as *const () as i64,
+        );
+        dynasm!(self.mc ; .arch aarch64
+            ; stp x29, x30, [sp, #-16]!
+            ; blr x8
+            ; ldp x29, x30, [sp], #16
+        );
+        if !op.pos().get().is_none() {
+            self.store_rax_to_result(op.pos().get());
+        }
     }
 
     // ----------------------------------------------------------------
