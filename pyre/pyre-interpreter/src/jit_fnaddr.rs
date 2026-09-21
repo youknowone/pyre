@@ -1261,6 +1261,16 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // `list.append` stays traced). The registered target is its uniform i64
     // carrier adapter: the raw pointer arguments are wasm i32 values, while
     // residual Int/Ref operands use i64 carriers.
+    push_abi_unsound_fnaddr(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::float_w_must_be_real",
+        crate::baseobjspace::float_w_must_be_real as *const (),
+    );
+    push_abi_unsound_fnaddr(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::float_w_returned_non_float",
+        crate::baseobjspace::float_w_returned_non_float as *const (),
+    );
     cpa1(
         &mut entries,
         "pyre_interpreter::baseobjspace::next",
@@ -4591,6 +4601,14 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::PyError::to_exc_object",
         pyerror_to_exc_object,
     );
+    // `PyError::from_exc_object` — result_exc rebuilds `Err` from a caught
+    // exception object. PyError is not one residual word.
+    push_abi_unsound_alias_pair(
+        &mut entries,
+        "pyre_interpreter::error::PyError::from_exc_object",
+        "pyre_interpreter::PyError::from_exc_object",
+        crate::PyError::from_exc_object as *const (),
+    );
 
     // RPython convention (cross-reference `support.py:255-271` for
     // the C-trunc helpers, `rint.py:398/495` for the Python-floor
@@ -6607,8 +6625,8 @@ mod tests {
     #[test]
     fn jit_trace_fnaddrs_covers_copy_longdouble() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
-        let expected = crate::module::_cffi_backend::ctypeprim::copy_longdouble as *const ()
-            as usize as i64;
+        let expected =
+            crate::module::_cffi_backend::ctypeprim::copy_longdouble as *const () as usize as i64;
         assert_eq!(
             bindings["pyre_interpreter::module::_cffi_backend::ctypeprim::copy_longdouble"],
             expected
@@ -6622,8 +6640,8 @@ mod tests {
     #[test]
     fn jit_trace_fnaddrs_covers_raw_memcopy_opaque() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
-        let expected = crate::module::_cffi_backend::misc::raw_memcopy_opaque as *const ()
-            as usize as i64;
+        let expected =
+            crate::module::_cffi_backend::misc::raw_memcopy_opaque as *const () as usize as i64;
         assert_eq!(
             bindings["pyre_interpreter::module::_cffi_backend::misc::raw_memcopy_opaque"],
             expected
@@ -6654,8 +6672,8 @@ mod tests {
     #[test]
     fn jit_trace_fnaddrs_covers_raw_write_ptr() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
-        let expected = crate::module::_cffi_backend::cdataobj::raw_write_ptr as *const ()
-            as usize as i64;
+        let expected =
+            crate::module::_cffi_backend::cdataobj::raw_write_ptr as *const () as usize as i64;
         assert_eq!(
             bindings["pyre_interpreter::module::_cffi_backend::cdataobj::raw_write_ptr"],
             expected

@@ -101,24 +101,36 @@ pub fn call(ct: &W_CType, funcaddr: usize, args_w: &[PyObjectRef]) -> Result<PyO
     // `self = jit.promote(self)`.
     let ct: &W_CType = unsafe { &*majit_metainterp::jit::promote(ct as *const W_CType) };
     if funcaddr == 0 {
-        return Err(PyError::runtime_error(format!(
-            "cannot call null function pointer from cdata '{}'",
-            ct.name()
-        )));
+        return Err(cannot_call_null(ct));
     }
     let nargs = fargs_len(ct.fargs);
     if ct.cif_descr != 0 {
         if args_w.len() != nargs {
-            return Err(PyError::type_error(format!(
-                "'{}' expects {} arguments, got {}",
-                ct.name(),
-                nargs,
-                args_w.len()
-            )));
+            return Err(wrong_nargs(ct, nargs, args_w.len()));
         }
         return do_call(ct, funcaddr, args_w);
     }
     call_varargs(ct, funcaddr, args_w)
+}
+
+/// `W_CTypeFunc.call` — `oefmt("cannot call null function pointer from cdata '%s'")`.
+#[majit_macros::dont_look_inside]
+pub(crate) fn cannot_call_null(ct: &W_CType) -> PyError {
+    PyError::runtime_error(format!(
+        "cannot call null function pointer from cdata '{}'",
+        ct.name()
+    ))
+}
+
+/// `W_CTypeFunc.call` — `oefmt("'%s' expects %d arguments, got %d")`.
+#[majit_macros::dont_look_inside]
+pub(crate) fn wrong_nargs(ct: &W_CType, expected: usize, got: usize) -> PyError {
+    PyError::type_error(format!(
+        "'{}' expects {} arguments, got {}",
+        ct.name(),
+        expected,
+        got
+    ))
 }
 
 /// `len(self.fargs)` — the declared argument count of a function type.

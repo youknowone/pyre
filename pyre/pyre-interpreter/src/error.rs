@@ -2488,10 +2488,19 @@ impl PyError {
         }
     }
 
+    /// Empty display text when `exc_object` already holds the message.
+    ///
+    /// Not `Wtf8Buf::new()`: the translator rewrites that ctor as
     /// Create a PyError from a W_BaseException.
+    ///
+    /// `oefmt` keeps message construction off the look-inside graph; this
+    /// constructor is the same kind of exception-path residual. The body
+    /// only stores `exc_object`, but `Wtf8Buf` construction is `Vec::new`
+    /// / `from_bytes_unchecked` the wrap descent cannot lower.
     ///
     /// # Safety
     /// `obj` must point to a valid `W_BaseException`.
+    #[majit_macros::dont_look_inside]
     pub unsafe fn from_exc_object(obj: PyObjectRef) -> Self {
         unsafe {
             let kind = pyre_object::interp_exceptions::w_exception_get_kind(obj);

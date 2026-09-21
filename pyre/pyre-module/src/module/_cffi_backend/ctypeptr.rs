@@ -56,11 +56,18 @@ pub unsafe fn pointer_convert_from_object(
     let Some(source) = W_CData::from_obj(w_ob) else {
         return Err(ct.convert_error("cdata pointer", w_ob));
     };
-    let mut other = ctypeobj::ctype_at(source.ctype)
-        .ok_or_else(|| PyError::system_error("cdata without a ctype"))?;
+    // Spelled as a `match` rather than `Option::ok_or_else`: the closure
+    // the combinator takes is a callee of its own, and a traced cdata
+    // call would stop at it.
+    let mut other = match ctypeobj::ctype_at(source.ctype) {
+        Some(ct) => ct,
+        None => return Err(PyError::system_error("cdata without a ctype")),
+    };
     if other.kind == ctypeobj::KIND_ARRAY {
-        other = ctypeobj::ctype_at(other.ctptr)
-            .ok_or_else(|| PyError::system_error("array without a pointer type"))?;
+        other = match ctypeobj::ctype_at(other.ctptr) {
+            Some(ct) => ct,
+            None => return Err(PyError::system_error("array without a pointer type")),
+        };
     }
     // `W_CTypeFunc` and `W_CTypePointer` are both `W_CTypePtrBase` upstream.
     if !matches!(other.kind, ctypeobj::KIND_POINTER | ctypeobj::KIND_FUNC) {
@@ -78,15 +85,7 @@ pub unsafe fn pointer_convert_from_object(
             if !(ct.has(ctypeobj::CTypeFlags::ONEBYTE_PTR)
                 && other.has(ctypeobj::CTypeFlags::ONEBYTE_PTR))
             {
-                pyre_interpreter::warn::warn_category(
-                    &format!(
-                        "implicit cast from '{}' to '{}' will be forbidden in the future (check that the types are as you expect; use an explicit ffi.cast() if they are correct)",
-                        other.name(),
-                        ct.name()
-                    ),
-                    "UserWarning",
-                    1,
-                )?;
+                implicit_cast_warning(other, ct)?;
             }
         } else {
             return Err(ct.convert_error("compatible pointer", w_ob));
@@ -94,6 +93,55 @@ pub unsafe fn pointer_convert_from_object(
     }
     cdataobj::raw_write_ptr(cdata as usize, source.ptr);
     Ok(())
+}
+
+/// `W_CTypePtrBase.convert_from_object` — the `char *` compatibility warning.
+/// `oefmt`/`space.warn` formatting stays off the look-inside graph.
+#[majit_macros::dont_look_inside]
+pub(crate) fn implicit_cast_warning(other: &W_CType, ct: &W_CType) -> Result<(), PyError> {
+    pyre_interpreter::warn::warn_category(
+        &format!(
+            "implicit cast from '{}' to '{}' will be forbidden in the future (check that the types are as you expect; use an explicit ffi.cast() if they are correct)",
+            other.name(),
+            ct.name()
+        ),
+        "UserWarning",
+        1,
+    )
+}
+
+/// `W_CTypePtrOrArray._convert_array_from_listview` — `oefmt`.
+#[majit_macros::dont_look_inside]
+pub(crate) fn too_many_array_initializers(ct: &W_CType, got: usize) -> PyError {
+    PyError::index_error(format!(
+        "too many initializers for '{}' (got {})",
+        ct.name(),
+        got
+    ))
+}
+
+/// `W_CTypePtrOrArray.convert_array_from_object` — `oefmt` for a bytes initializer.
+#[majit_macros::dont_look_inside]
+pub(crate) fn initializer_string_too_long(ct: &W_CType, n: i64) -> PyError {
+    PyError::index_error(format!(
+        "initializer string is too long for '{}' (got {n} characters)",
+        ct.name()
+    ))
+}
+
+/// `W_CTypePtrOrArray.convert_array_from_object` — `oefmt` for a unicode initializer.
+#[majit_macros::dont_look_inside]
+pub(crate) fn initializer_unicode_too_long(ct: &W_CType, n: i64) -> PyError {
+    PyError::index_error(format!(
+        "initializer unicode string is too long for '{}' (got {n} characters)",
+        ct.name()
+    ))
+}
+
+/// `W_CTypePtrOrArray._must_be_string_of_zero_or_one`.
+#[majit_macros::dont_look_inside]
+pub(crate) fn bool_array_not_zero_or_one() -> PyError {
+    PyError::value_error("an array of _Bool can only contain \\x00 or \\x01")
 }
 
 /// `W_CTypeArray.convert_from_object`.
@@ -132,11 +180,7 @@ pub unsafe fn convert_array_from_object(
     if unsafe { pyre_object::pyobject::is_list(w_ob) || pyre_object::pyobject::is_tuple(w_ob) } {
         let items = pyre_interpreter::baseobjspace::unpackiterable(w_ob, -1)?;
         if !ct.within_bounds(items.len() as i64) {
-            return Err(PyError::index_error(format!(
-                "too many initializers for '{}' (got {})",
-                ct.name(),
-                items.len()
-            )));
+            return Err(too_many_array_initializers(ct, items.len()));
         }
         let roots = pyre_object::gc_roots::push_roots();
         let base = pyre_object::gc_roots::pin_roots(&items);
@@ -157,15 +201,10 @@ pub unsafe fn convert_array_from_object(
         let s = unsafe { pyre_object::bytesobject::w_bytes_data(w_ob) };
         let n = s.len() as i64;
         if ct.length >= 0 && n > ct.length {
-            return Err(PyError::index_error(format!(
-                "initializer string is too long for '{}' (got {n} characters)",
-                ct.name()
-            )));
+            return Err(initializer_string_too_long(ct, n));
         }
         if item.kind == ctypeobj::KIND_PRIM_BOOL && s.iter().any(|&c| c > 1) {
-            return Err(PyError::value_error(
-                "an array of _Bool can only contain \\x00 or \\x01",
-            ));
+            return Err(bool_array_not_zero_or_one());
         }
         unsafe {
             // `copy_string_to_raw` — residual memcpy of the initializer.
@@ -187,10 +226,7 @@ pub unsafe fn convert_array_from_object(
             value.code_points().count() as i64
         };
         if ct.length >= 0 && n > ct.length {
-            return Err(PyError::index_error(format!(
-                "initializer unicode string is too long for '{}' (got {n} characters)",
-                ct.name()
-            )));
+            return Err(initializer_unicode_too_long(ct, n));
         }
         let add_final_zero = n != ct.length;
         unsafe {
@@ -531,8 +567,12 @@ fn unpack_wide_string(item: &W_CType, ptr: *mut u8, length: i64) -> Result<PyObj
 
 /// `W_CTypePtrOrArray.ctitem`, which every pointer and array has.
 pub fn item_of(ct: &W_CType) -> Result<&'static mut W_CType, PyError> {
-    ctypeobj::ctype_at(ct.ctitem)
-        .ok_or_else(|| PyError::system_error("pointer or array without an item type"))
+    match ctypeobj::ctype_at(ct.ctitem) {
+        Some(item) => Ok(item),
+        None => Err(PyError::system_error(
+            "pointer or array without an item type",
+        )),
+    }
 }
 
 // ── passing a pointer as a call argument ────────────────────────────────

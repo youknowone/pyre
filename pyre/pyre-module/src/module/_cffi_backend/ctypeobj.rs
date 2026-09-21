@@ -295,6 +295,10 @@ impl W_CType {
 
     /// `W_CType._convert_error` — the initializer-mismatch TypeError, with
     /// the two special cases a same-named cdata gets.
+    ///
+    /// `oefmt` does not build the message until the value is needed.
+    /// `dont_look_inside` keeps `format!` off the convert descent.
+    #[majit_macros::dont_look_inside]
     pub fn convert_error(&self, expected: &str, w_got: PyObjectRef) -> PyError {
         let name = self.name();
         if let Some(got) = W_CData::from_obj(w_got)
@@ -484,11 +488,14 @@ pub unsafe fn convert_to_object(ct: &W_CType, cdata: usize) -> Result<PyObjectRe
         )),
         KIND_STRUCT | KIND_UNION => super::ctypestruct::convert_to_object(ct, cdata as *const u8),
         _ if ct.is_primitive() => unsafe { super::ctypeprim::convert_to_object(ct, cdata) },
-        _ => Err(PyError::type_error(format!(
-            "cannot return a cdata '{}'",
-            ct.name()
-        ))),
+        _ => Err(cannot_return_cdata(ct)),
     }
+}
+
+/// `W_CType.convert_to_object` — `oefmt("cannot return a cdata '%s'")`.
+#[majit_macros::dont_look_inside]
+pub(crate) fn cannot_return_cdata(ct: &W_CType) -> PyError {
+    PyError::type_error(format!("cannot return a cdata '{}'", ct.name()))
 }
 
 /// `W_CType.copy_and_convert_to_object` — `void` answers `None` rather than
@@ -530,11 +537,14 @@ pub unsafe fn convert_from_object(
             super::ctypestruct::convert_from_object(ct, cdata as *mut u8, w_ob)
         },
         _ if ct.is_primitive() => unsafe { super::ctypeprim::convert_from_object(ct, cdata, w_ob) },
-        _ => Err(PyError::type_error(format!(
-            "cannot initialize cdata '{}'",
-            ct.name()
-        ))),
+        _ => Err(cannot_initialize_cdata(ct)),
     }
+}
+
+/// `W_CType.convert_from_object` — `oefmt("cannot initialize cdata '%s'")`.
+#[majit_macros::dont_look_inside]
+pub(crate) fn cannot_initialize_cdata(ct: &W_CType) -> PyError {
+    PyError::type_error(format!("cannot initialize cdata '{}'", ct.name()))
 }
 
 /// `W_CType.cast`.
