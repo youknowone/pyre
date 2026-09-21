@@ -1643,6 +1643,18 @@ pub(crate) fn is_true_lookup(obj: PyObjectRef) -> Result<bool, PyError> {
     Ok(true)
 }
 
+/// One-word residual-call ABI for [`is_true_lookup`].
+///
+/// `Ok(false)` and a published error both answer 0. The residual is a
+/// raising `dont_look_inside` call, so `GUARD_NO_EXCEPTION` after it
+/// distinguishes them.
+pub extern "C" fn is_true_lookup_jit_abi(obj: i64) -> i64 {
+    match is_true_lookup(obj as PyObjectRef) {
+        Ok(value) => value as i64,
+        Err(error) => crate::runtime_ops::jit_publish_residual_error(error),
+    }
+}
+
 /// `descroperation.py` TypeError for a `__bool__` that did not return a bool,
 /// naming the type of the returned object.  The message allocates, so it stays
 /// off the look-inside graph.
@@ -1652,6 +1664,14 @@ pub(crate) fn bool_must_return_bool(w_res: PyObjectRef) -> PyError {
         "__bool__ should return bool, returned {}",
         object_functionstr_type_name(w_res),
     ))
+}
+
+/// One-word residual-call ABI for [`bool_must_return_bool`].
+///
+/// The helper only constructs an error; the bridge publishes it and
+/// returns 0.
+pub extern "C" fn bool_must_return_bool_jit_abi(obj: i64) -> i64 {
+    crate::runtime_ops::jit_publish_residual_error(bool_must_return_bool(obj as PyObjectRef))
 }
 
 /// Direct truthiness body for `is_true`: the by-layout fast paths for exact

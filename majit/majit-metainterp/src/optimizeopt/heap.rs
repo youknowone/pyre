@@ -241,7 +241,20 @@ impl CachedField {
     /// (FieldDescr.index_in_parent when a parent SizeDescr is bound,
     /// else Descr::index). Callers no longer need to gate manually.
     fn invalidate(&mut self, descr: &DescrRef, ctx: &mut OptContext) {
-        if descr.is_always_pure() {
+        // `CachedField.invalidate`: `if descr.is_always_pure(): return`.
+        // Upstream's word covers a quasi-immutable field too — `is_pure` is
+        // `_immutable_field(name) != False` and `IR_QUASIIMMUTABLE` is an
+        // instance, not `False` — so a `?` field's cache survives a call and
+        // the loop keeps one read, with `guard_not_invalidated` carrying the
+        // per-window check. pyre's `is_always_pure` answers false for a `?`
+        // field to withhold the const-fold that same word licenses, so the
+        // surviving-a-call half is spelled here instead. Without it every
+        // residual call forces a re-read; over the scored bench dir that is 2
+        // of the 5 `ExecutionContext.w_tracefunc` getfield+guard pairs left in
+        // a peeled body. The other three read a different struct box each
+        // time, so no cache can reach them: upstream gets one box per loop from
+        // `ThreadLocalReference(ExecutionContext, loop_invariant=True)`.
+        if descr.is_always_pure() || descr.is_quasi_immutable() {
             return;
         }
         let descr_idx = OptHeap::field_slot_index(descr);

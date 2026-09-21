@@ -1043,6 +1043,17 @@ impl TraceCtx {
         // SAFETY: cpu pointer was installed via `set_cpu` against a
         // backend that outlives this TraceCtx.
         let cpu = unsafe { &*cpu_ptr };
+        // `bh_arraylen_gc` reads the length word at `lendescr.offset`, so a
+        // nolength array descriptor has nothing for it to read and every
+        // backend aborts on one. That is the precondition of this helper, not
+        // of its callers: answer "no concrete" instead, which is already what
+        // a caller does with an unwired cpu.
+        if !descr
+            .as_array_descr()
+            .is_some_and(|a| a.len_descr().is_some())
+        {
+            return None;
+        }
         let bh_descr = descr_to_bh_array_descr(descr)?;
         Some(Value::Int(crate::executor::do_arraylen_gc(
             cpu,
@@ -5846,10 +5857,10 @@ impl TraceCtx {
             return cached_len;
         }
         // `execute_nonspec_const`'s ARRAYLEN_GC row reads the length through
-        // `ArrayDescr::len_descr` and fails loud without one, while
-        // `arraylen_sanity_load` reaches the backend directly and answers even
-        // for a descr that has none. Withhold the concrete in that case so the
-        // funnel records rather than entering a fold it cannot complete.
+        // `ArrayDescr::len_descr` and fails loud without one.  A caller that
+        // supplies a concrete (the unit test, or a path that did not go
+        // through `arraylen_sanity_load`) still needs the same withhold, so
+        // the funnel records rather than entering a fold it cannot complete.
         let concrete = concrete.filter(|_| {
             arraydescr
                 .as_array_descr()
