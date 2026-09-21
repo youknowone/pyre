@@ -319,7 +319,12 @@ pub struct TraceCtx {
     /// Lengths of each virtualizable array field, needed for flat index computation.
     virtualizable_array_lengths: Option<Vec<usize>>,
     /// Live virtualizable heap pointer (pyjitpl.py:3446 write_boxes target).
-    /// Mirrored from `MetaInterp::pending_vable_ptr` at trace/bridge-entry.  Used by
+    /// Seeded at trace entry from the virtualizable box, with
+    /// `MetaInterp::pending_vable_ptr` only as the fallback for a vable that is
+    /// not a red, and at bridge entry from the retrace's live vable.  It does
+    /// not stay put for the session: a compiled entry moves it to the frame
+    /// that entry runs and the exits put it back, and a residual call restores
+    /// it on return.  Used by
     /// `synchronize_virtualizable` to write `virtualizable_values` back to
     /// the live PyFrame after every standard vable setfield / setarrayitem
     /// (virtualizable.py write_boxes parity). `None` disables the
@@ -3249,10 +3254,15 @@ impl TraceCtx {
         if skip_when_outer_owned && info.outer_executor_owns_state {
             return;
         }
-        // Safety: `heap_ptr` is cached at trace/bridge entry from
-        // `virtualizable_heap_ptr`, which the JitState pins for the trace
-        // session's lifetime. `write_all_boxes` uses typed offsets derived
-        // from the same VirtualizableInfo used at the matching heap read.
+        // Safety: `heap_ptr` comes from `virtualizable_heap_ptr`, which names
+        // a frame kept alive for as long as the trace reads it.  The cell is
+        // not pinned for the session — see its declaration for the writers that
+        // move it — and `walk_virtualizable_value_refs` writes it directly,
+        // re-deriving it from the identity box on every collection.  That is
+        // the one writer outside `set_virtualizable_heap_ptr`, and the only
+        // one a collection can fire between this write and the read it pairs
+        // with. `write_all_boxes` uses typed offsets derived from the same
+        // VirtualizableInfo used at the matching heap read.
         unsafe {
             info.write_all_boxes(heap_ptr as *mut u8, &static_bits, &array_bits);
         }

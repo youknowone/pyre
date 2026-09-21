@@ -7823,8 +7823,10 @@ impl<S: JitState> JitDriver<S> {
         if let Some(ref info) = info_clone {
             if let Some(ptr) = state.virtualizable_heap_ptr(meta, &info.name, info) {
                 self.meta.set_vable_ptr(ptr.cast_const());
-                // The entry names the frame this run executes; `sync_after`
-                // puts the caller's frame back.
+                // The entry names the frame this run executes.  The exits
+                // put the caller's frame back through
+                // `restore_trace_vable_ptr`: `sync_after` for the ones that
+                // take it, the decline and finish exits directly.
                 if let Some(ctx) = self.meta.tracing.as_mut() {
                     ctx.set_virtualizable_heap_ptr(ptr.cast_const());
                 }
