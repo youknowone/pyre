@@ -332,19 +332,21 @@ fn w_tuple_new_array_backed_impl(
     // `std::alloc`'d `items_block` is invisible to the collector until
     // `wrappeditems` is set, so filling it before the tuple malloc would
     // leave it pointing at evacuated nursery slots.
+    // The livevar set spans two slices (the items, then `w_class` below), so
+    // every `publish` runs before the single `normalize`. A per-item
+    // `pin_root` would query the GC after the first write, and that query is a
+    // safepoint at which the items not yet published are invisible to a
+    // foreign collection — the window `publish_roots` is split out to close.
     let _roots = crate::gc_roots::push_roots();
-    let save_point = crate::gc_roots::shadow_stack_len();
     let len = items.len();
-    for &item in items {
-        let _ = crate::gc_roots::pin_root(item);
-    }
+    let save_point = _roots.publish(items);
 
     // `w_class` is a livevar of this frame for the same reason the items are:
     // every header below is written *after* the mallocs, so the class word this
-    // frame was handed can already name an evacuated slot. Pin it too, and
-    // build each header out of the slot the collector rewrites.
-    let class_slot = crate::gc_roots::shadow_stack_len();
-    let _ = crate::gc_roots::pin_root(w_class);
+    // frame was handed can already name an evacuated slot. It joins the same
+    // run, and each header is built out of the slot the collector rewrites.
+    let class_slot = _roots.publish(std::slice::from_ref(&w_class));
+    _roots.normalize(save_point, len + 1);
 
     // The only allocations that may collect: the type's lazy instantiate
     // map and the tuple header. Both run while every item is pinned.
