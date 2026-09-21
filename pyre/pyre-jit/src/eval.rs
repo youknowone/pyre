@@ -11338,80 +11338,74 @@ fn handle_fail(
 
     // compile.py: must_compile() AND not stack_almost_full()
     if should_bridge && !stack_almost_full() {
-        let is_tracing = {
-            let (driver, _) = driver_pair();
-            driver.is_tracing()
+        // compile.py try/finally: start_compiling() before
+        // bridge, done_compiling() on every unwind path.  The RAII
+        // guard packages both halves: ctor fires `start_compiling`
+        // via `descr.as_fail_descr()` (direct instance-method
+        // dispatch matching `compile.py:786-795`); drop fires
+        // `done_compiling` so a panic inside
+        // `trace_and_compile_from_bridge` cannot latch
+        // `ST_BUSY_FLAG`.
+        let resolution = {
+            let _guard = GuardCompilingScope::new(descr_arc);
+            // force_plain_eval prevents concrete calls during bridge
+            // tracing from re-entering compiled code.
+            let _plain = pyre_interpreter::call::force_plain_eval();
+            // `allow_finish_direct_return = true`: the general guard path
+            // can hand a concrete `Finish` result back to its portal.
+            crate::call_jit::trace_and_compile_from_bridge(
+                descr_arc,
+                frame,
+                raw_values,
+                exit_layout,
+                guard_exc,
+                true,
+            )
         };
-        if !is_tracing {
-            // compile.py try/finally: start_compiling() before
-            // bridge, done_compiling() on every unwind path.  The RAII
-            // guard packages both halves: ctor fires `start_compiling`
-            // via `descr.as_fail_descr()` (direct instance-method
-            // dispatch matching `compile.py:786-795`); drop fires
-            // `done_compiling` so a panic inside
-            // `trace_and_compile_from_bridge` cannot latch
-            // `ST_BUSY_FLAG`.
-            let resolution = {
-                let _guard = GuardCompilingScope::new(descr_arc);
-                // force_plain_eval prevents concrete calls during bridge
-                // tracing from re-entering compiled code.
-                let _plain = pyre_interpreter::call::force_plain_eval();
-                // `allow_finish_direct_return = true`: the general guard path
-                // can hand a concrete `Finish` result back to its portal.
-                crate::call_jit::trace_and_compile_from_bridge(
-                    descr_arc,
-                    frame,
-                    raw_values,
-                    exit_layout,
-                    guard_exc,
-                    true,
-                )
-            };
-            if matches!(
-                &resolution,
-                crate::call_jit::BridgeResolution::ResumeBlackhole
-            ) {
-                let (driver, _) = driver_pair();
-                if !driver
-                    .meta_interp_mut()
-                    .last_quasi_immutable_deps
-                    .is_empty()
-                {
-                    majit_metainterp::mc_diag_bump(77);
-                }
-            }
-            // compile.py record_loop_or_bridge registers dependencies
-            // for every compiled bridge, independent of its next resolution.
-            if let Some((green_key, _, _)) =
-                crate::call_jit::bridge_source_identity_from_descr(descr_arc)
+        if matches!(
+            &resolution,
+            crate::call_jit::BridgeResolution::ResumeBlackhole
+        ) {
+            let (driver, _) = driver_pair();
+            if !driver
+                .meta_interp_mut()
+                .last_quasi_immutable_deps
+                .is_empty()
             {
-                register_quasi_immutable_deps(green_key);
+                majit_metainterp::mc_diag_bump(77);
             }
-            match resolution {
-                crate::call_jit::BridgeResolution::CompiledContinue => {
-                    // compile.py:708: bridge compiled → ContinueRunningNormally.
-                    // RPython: the bridge is attached to the guard descr;
-                    // re-entering compiled code will follow the bridge.
-                    return HandleFailOutcome::BridgeCompiled;
-                }
-                crate::call_jit::BridgeResolution::Finished(cv) => {
-                    // #177: the walk ran the resumed frame forward to its
-                    // return and captured the concrete result; hand it back
-                    // as `DoneWithThisFrame` (`interpret()` raising it from
-                    // the post-walk state) rather than rewinding + re-running.
-                    // The bridge stays attached for subsequent guard failures.
-                    let v = match cv {
-                        // A void return stashes `Null`, i.e. Python `None`.
-                        pyre_jit_trace::state::ConcreteValue::Null => w_none(),
-                        other => other.to_pyobj(),
-                    };
-                    return HandleFailOutcome::BridgeFinished(v);
-                }
-                crate::call_jit::BridgeResolution::FinishedException(cv) => {
-                    return HandleFailOutcome::BridgeRaised(finish_concrete_raise_error(cv));
-                }
-                crate::call_jit::BridgeResolution::ResumeBlackhole => {}
+        }
+        // compile.py record_loop_or_bridge registers dependencies
+        // for every compiled bridge, independent of its next resolution.
+        if let Some((green_key, _, _)) =
+            crate::call_jit::bridge_source_identity_from_descr(descr_arc)
+        {
+            register_quasi_immutable_deps(green_key);
+        }
+        match resolution {
+            crate::call_jit::BridgeResolution::CompiledContinue => {
+                // compile.py:708: bridge compiled → ContinueRunningNormally.
+                // RPython: the bridge is attached to the guard descr;
+                // re-entering compiled code will follow the bridge.
+                return HandleFailOutcome::BridgeCompiled;
             }
+            crate::call_jit::BridgeResolution::Finished(cv) => {
+                // #177: the walk ran the resumed frame forward to its
+                // return and captured the concrete result; hand it back
+                // as `DoneWithThisFrame` (`interpret()` raising it from
+                // the post-walk state) rather than rewinding + re-running.
+                // The bridge stays attached for subsequent guard failures.
+                let v = match cv {
+                    // A void return stashes `Null`, i.e. Python `None`.
+                    pyre_jit_trace::state::ConcreteValue::Null => w_none(),
+                    other => other.to_pyobj(),
+                };
+                return HandleFailOutcome::BridgeFinished(v);
+            }
+            crate::call_jit::BridgeResolution::FinishedException(cv) => {
+                return HandleFailOutcome::BridgeRaised(finish_concrete_raise_error(cv));
+            }
+            crate::call_jit::BridgeResolution::ResumeBlackhole => {}
         }
     }
     // compile.py:710-716 / pyjitpl.py:2906 (SwitchToBlackhole):

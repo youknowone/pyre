@@ -319,7 +319,12 @@ pub struct TraceCtx {
     /// Lengths of each virtualizable array field, needed for flat index computation.
     virtualizable_array_lengths: Option<Vec<usize>>,
     /// Live virtualizable heap pointer (pyjitpl.py:3446 write_boxes target).
-    /// Mirrored from `MetaInterp::pending_vable_ptr` at trace/bridge-entry.  Used by
+    /// Seeded at trace entry from the virtualizable box, with
+    /// `MetaInterp::pending_vable_ptr` only as the fallback for a vable that is
+    /// not a red, and at bridge entry from the retrace's live vable.  It does
+    /// not stay put for the session: a compiled entry moves it to the frame
+    /// that entry runs and the exits put it back, and a residual call restores
+    /// it on return.  Used by
     /// `synchronize_virtualizable` to write `virtualizable_values` back to
     /// the live PyFrame after every standard vable setfield / setarrayitem
     /// (virtualizable.py write_boxes parity). `None` disables the
@@ -3267,10 +3272,13 @@ impl TraceCtx {
         if skip_when_outer_owned && info.outer_executor_owns_state {
             return;
         }
-        // Safety: `heap_ptr` is cached at trace/bridge entry from
-        // `virtualizable_heap_ptr`, which the JitState pins for the trace
-        // session's lifetime. `write_all_boxes` uses typed offsets derived
-        // from the same VirtualizableInfo used at the matching heap read.
+        // Safety: `heap_ptr` comes from `virtualizable_heap_ptr`, which names
+        // a frame kept alive for as long as the trace reads it.  The cell is
+        // not pinned for the session — see its declaration for the writers that
+        // move it — and a collection forwards the object it names
+        // (`walk_virtualizable_value_refs`). `write_all_boxes` uses typed
+        // offsets derived from the same VirtualizableInfo used at the matching
+        // heap read.
         unsafe {
             info.write_all_boxes(heap_ptr as *mut u8, &static_bits, &array_bits);
         }
@@ -3665,17 +3673,37 @@ impl TraceCtx {
         let Some(values) = self.virtualizable_values.as_mut() else {
             return;
         };
+        // The cell names either the identity or a different object: a frontend
+        // that traces against a GC-owned snapshot copy seeds it with the
+        // snapshot while the identity box names the live frame.  Forward the
+        // object the cell names; re-deriving it from the identity would move
+        // the synchronization target onto the live frame at whichever
+        // collection happens to fire.
+        let cell = self.virtualizable_heap_ptr;
+        let identity_before = match values.last() {
+            Some(Value::Ref(identity)) => Some(identity.as_usize()),
+            _ => None,
+        };
         for value in values.iter_mut() {
             if let Value::Ref(gcref) = value {
                 visitor(gcref);
             }
         }
-        if let Some(Value::Ref(identity)) = values.last() {
-            self.virtualizable_heap_ptr = if identity.is_null() {
-                None
-            } else {
-                Some(identity.as_usize() as *const u8)
-            };
+        match cell {
+            Some(ptr) if !ptr.is_null() && Some(ptr as usize) != identity_before => {
+                let mut target = majit_ir::GcRef(ptr as usize);
+                visitor(&mut target);
+                self.virtualizable_heap_ptr = Some(target.as_usize() as *const u8);
+            }
+            _ => {
+                if let Some(Value::Ref(identity)) = values.last() {
+                    self.virtualizable_heap_ptr = if identity.is_null() {
+                        None
+                    } else {
+                        Some(identity.as_usize() as *const u8)
+                    };
+                }
+            }
         }
     }
 
@@ -7297,6 +7325,87 @@ mod tests {
             ctx.current_merge_points.last().unwrap().vable_ptr,
             LIVE_FRAME,
             "merge point took the sync target instead of the identity",
+        );
+    }
+
+    /// A collection forwards the synchronization target; it does not retarget
+    /// it onto the identity.
+    ///
+    /// With the target on a snapshot copy and the identity on the live frame,
+    /// re-deriving the target from the identity box moved every later
+    /// `synchronize_virtualizable` onto the live frame at whichever collection
+    /// happened to fire. The live frame runs an iteration behind the walk, so a
+    /// read resumed from it saw the previous iteration's locals: a wrong answer
+    /// that only a small nursery exposes.
+    #[test]
+    fn a_collection_forwards_a_sync_target_that_is_not_the_identity() {
+        const LIVE_FRAME: usize = 0x5000;
+        const SNAPSHOT_COPY: usize = 0x9000;
+        const MOVED_BY: usize = 0x100;
+
+        let info = make_test_vable_info();
+        let mut recorder = Trace::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let box0 = recorder.record_input_arg(Type::Int);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable,
+            Value::Ref(majit_ir::GcRef(LIVE_FRAME)),
+            &[box0],
+            &[ph(Type::Int)],
+            &[],
+        );
+        ctx.set_virtualizable_heap_ptr(SNAPSHOT_COPY as *const u8);
+
+        ctx.walk_virtualizable_value_refs(|gcref| gcref.0 += MOVED_BY);
+
+        assert_eq!(
+            ctx.virtualizable_heap_ptr(),
+            Some((SNAPSHOT_COPY + MOVED_BY) as *const u8),
+            "the collection moved the sync target onto the identity",
+        );
+        assert_eq!(
+            ctx.standard_virtualizable_ptr(),
+            Some(LIVE_FRAME + MOVED_BY)
+        );
+    }
+
+    /// The same collection with the target ON the identity follows it: the
+    /// two name one object, so forwarding one forwards the other.
+    #[test]
+    fn a_collection_forwards_a_sync_target_that_is_the_identity() {
+        const LIVE_FRAME: usize = 0x5000;
+        const MOVED_BY: usize = 0x100;
+
+        let info = make_test_vable_info();
+        let mut recorder = Trace::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let box0 = recorder.record_input_arg(Type::Int);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable,
+            Value::Ref(majit_ir::GcRef(LIVE_FRAME)),
+            &[box0],
+            &[ph(Type::Int)],
+            &[],
+        );
+        ctx.set_virtualizable_heap_ptr(LIVE_FRAME as *const u8);
+
+        ctx.walk_virtualizable_value_refs(|gcref| gcref.0 += MOVED_BY);
+
+        assert_eq!(
+            ctx.virtualizable_heap_ptr(),
+            Some((LIVE_FRAME + MOVED_BY) as *const u8)
         );
     }
 

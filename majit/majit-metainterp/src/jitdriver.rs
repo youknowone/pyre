@@ -7372,6 +7372,17 @@ impl<S: JitState> JitDriver<S> {
         let vable = descriptor
             .as_deref()
             .and_then(JitDriverStaticData::virtualizable);
+        // Precondition: not entered while `is_tracing`.  The caller decides
+        // that a trace starts here, and one cannot start inside another.  So
+        // `sync_before` finds no recording context, writes no trace pointer,
+        // and the returns below have none to put back; the two
+        // `run_compiled_detailed_*` runners carry the save/restore instead,
+        // because a walk does reach those.  `initialize_virtualizable` seeds
+        // the cell on the context this call is about to build.
+        debug_assert!(
+            !self.is_tracing(),
+            "force_start_tracing entered while a recording is live"
+        );
         if !self.sync_before(state, &meta, vable) {
             return;
         }
@@ -7823,8 +7834,10 @@ impl<S: JitState> JitDriver<S> {
         if let Some(ref info) = info_clone {
             if let Some(ptr) = state.virtualizable_heap_ptr(meta, &info.name, info) {
                 self.meta.set_vable_ptr(ptr.cast_const());
-                // The entry names the frame this run executes; `sync_after`
-                // puts the caller's frame back.
+                // The entry names the frame this run executes.  The exits
+                // put the caller's frame back through
+                // `restore_trace_vable_ptr`: `sync_after` for the ones that
+                // take it, the decline and finish exits directly.
                 if let Some(ctx) = self.meta.tracing.as_mut() {
                     ctx.set_virtualizable_heap_ptr(ptr.cast_const());
                 }
@@ -8451,9 +8464,16 @@ impl<S: JitState> JitDriver<S> {
         // apply; this is the loop pyre actually runs, so leaving it out made
         // `MAJIT_NO_BRIDGE=1` report a bridge-free run while still compiling
         // every bridge.
+        // `is_tracing()` sits with the other conjuncts rather than at the
+        // consumer: a bridge cannot be recorded from inside a live recording,
+        // and this is the entry that reaches a guard failure with one live.
+        // Taking fuel before asking numbered bridges that never compiled,
+        // which is the property `MAJIT_MAX_BRIDGES` and the skip list are read
+        // for, and printed `@@@GUARD bridge=true` on the same failures.
         let should_bridge = must_compile
             && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full()
             && !no_bridge_enabled()
+            && !self.is_tracing()
             && bridge_fuel_take();
 
         // Same `@@@GUARD` line the sibling loops emit. Without it this loop —
@@ -8474,8 +8494,11 @@ impl<S: JitState> JitDriver<S> {
             );
         }
 
-        // Return raw guard failure data. State restoration and bridge/
-        // blackhole decision happen in the caller's handle_fail().
+        // Return raw guard failure data; state restoration is the caller's
+        // handle_fail().  The vable pointer `sync_before` moved to this
+        // entry's frame is deliberately left naming it: `should_bridge` is
+        // false while a recording is live, so the one outcome handle_fail has
+        // then is the blackhole, and that resumes on this entry's frame.
         DetailedDriverRunOutcome::GuardFailure {
             fail_index,
             trace_id,

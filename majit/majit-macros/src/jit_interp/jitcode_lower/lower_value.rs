@@ -1065,27 +1065,11 @@ impl<'c> Lowerer<'c> {
         if call.args.len() != 1 {
             return None;
         }
-        let segments = canonical_expr_segments(&call.func)?;
-        let n_seg = segments.len();
-        if n_seg < 2 {
-            return None;
-        }
-        let little_endian = match segments[n_seg - 1].as_str() {
-            "from_le_bytes" => true,
-            "from_be_bytes" => false,
-            _ => return None,
-        };
-        let ty_name = segments[n_seg - 2].as_str();
-        let (byte_width, acc_ty_name) = match ty_name {
-            "i16" | "u16" => (2usize, "u16"),
-            "i32" | "u32" => (4, "u32"),
-            "i64" | "u64" => (8, "u64"),
-            // `isize`/`usize` are deliberately absent: their width belongs to
-            // the TARGET, and this expansion runs on the host, so the host's
-            // `size_of` would be the wrong number to check the element count
-            // against on any cross build.
-            _ => return None,
-        };
+        let info = super::helpers::primitive_from_endian_bytes_path(&call.func)?;
+        let little_endian = info.little_endian;
+        let ty_name = info.ty_name;
+        let byte_width = info.byte_width;
+        let acc_ty_name = info.acc_ty_name;
         let Expr::Array(array) = &call.args[0] else {
             return None;
         };
