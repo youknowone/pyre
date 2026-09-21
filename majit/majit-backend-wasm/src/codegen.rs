@@ -7316,13 +7316,8 @@ fn build_function(
                 }
             }
 
-            // ── Interior field access ──
-            // rewrite.py transform_to_gc_load / unpack_interiorfielddescr:
-            // addr = base + index * itemsize + (basesize + field.offset).
-            // Wasm skips the GC rewrite, so the GET/SETINTERIORFIELD ops
-            // themselves carry that address, matching cranelift's
-            // emit_scaled_index_addr rather than being rewritten to
-            // GC_LOAD_INDEXED first.
+            // Pre-rewrite interior-field, string and raw-memory ops. The rewriter
+            // consumes these; reaching codegen with one is a producer bug.
             OpCode::GetinteriorfieldGcI
             | OpCode::GetinteriorfieldGcR
             | OpCode::GetinteriorfieldGcF
@@ -7346,85 +7341,6 @@ fn build_function(
                     "wasm codegen: {:?} reached codegen without the GC rewrite",
                     op.opcode
                 )));
-            }
-            OpCode::GetarrayitemRawR => {
-                let vi = op.pos().get().raw();
-                if !OpRef::raw_is_constant(vi) {
-                    let base_size = emit_array_addr(&mut sink, constants, value_types, op);
-                    let (item_size, signed) = array_item_access_size_sign(op);
-                    emit_sized_int_load(&mut sink, base_size, item_size, signed);
-                    sink.local_set(value_types.local(vi));
-                }
-            }
-            OpCode::SetinteriorfieldGc if unpack_interior_field(op).is_ptr => {
-                panic!(
-                    "wasm codegen: SetinteriorfieldGc must have been lowered by rewrite_ops_for_gc"
-                );
-            }
-            OpCode::SetinteriorfieldGc | OpCode::SetinteriorfieldRaw => {
-                let field = unpack_interior_field(op);
-                let base = emit_scaled_index_addr(
-                    &mut sink,
-                    constants,
-                    value_types,
-                    op.arg(0).to_opref(),
-                    op.arg(1).to_opref(),
-                    field.item_size,
-                    field.offset,
-                );
-                if field.is_float {
-                    emit_resolve_f64(&mut sink, constants, value_types, op.arg(2).to_opref());
-                    emit_float_store(&mut sink, base, field.field_size)?;
-                } else {
-                    emit_resolve(&mut sink, constants, value_types, op.arg(2).to_opref());
-                    emit_sized_int_store(&mut sink, base, field.access_size_sign().0);
-                }
-            }
-
-            // rewrite.py fills these from `str_descr` / `unicode_descr`.
-            // `inject_builtin_string_descrs` attaches the same ArrayDescr,
-            // so the length word and item stride are the array path.
-            OpCode::Strlen | OpCode::Unicodelen => {
-                let vi = op.pos().get().raw();
-                if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                    sink.i32_wrap_i64();
-                    let (len_offset, len_size) = array_len_layout_from_descr(op);
-                    emit_sized_int_load(&mut sink, len_offset, len_size, false);
-                    sink.local_set(value_types.local(vi));
-                }
-            }
-            OpCode::Strgetitem | OpCode::Unicodegetitem => {
-                let vi = op.pos().get().raw();
-                if !OpRef::raw_is_constant(vi) {
-                    // rewrite.py:299/311: STR `extra_item_after_alloc=1` is
-                    // already in `basesize`; subtract it before the index.
-                    let (base_size, item_size) = op
-                        .with_array_descr(|ad| {
-                            let item_size = ad.item_size() as u64;
-                            let base_size = if item_size == 1 {
-                                ad.base_size() as u64 - 1
-                            } else {
-                                ad.base_size() as u64
-                            };
-                            (base_size, item_size)
-                        })
-                        .unwrap_or_else(|| {
-                            missing_layout_descr("array descr (str/unicodegetitem)", op)
-                        });
-                    let disp = emit_scaled_index_addr(
-                        &mut sink,
-                        constants,
-                        value_types,
-                        op.arg(0).to_opref(),
-                        op.arg(1).to_opref(),
-                        item_size,
-                        base_size,
-                    );
-                    let (access_size, signed) = array_item_access_size_sign(op);
-                    emit_sized_int_load(&mut sink, disp, access_size, signed);
-                    sink.local_set(value_types.local(vi));
-                }
             }
             // ── GC rewrite memory ops ──
             // These descriptor-free forms carry their complete layout in
@@ -8149,83 +8065,6 @@ fn build_function(
                     skip,
                     frame,
                 );
-            }
-            OpCode::Strsetitem | OpCode::Unicodesetitem => {
-                let descr = op.getdescr().ok_or_else(|| {
-                    BackendError::Unsupported(
-                        "wasm codegen: str/unicodesetitem is missing its ArrayDescr".into(),
-                    )
-                })?;
-                let ad = descr.as_array_descr().ok_or_else(|| {
-                    BackendError::Unsupported(
-                        "wasm codegen: str/unicodesetitem descr is not an ArrayDescr".into(),
-                    )
-                })?;
-                let item_size = ad.item_size() as u64;
-                let base_size = if item_size == 1 {
-                    ad.base_size() as u64 - 1
-                } else {
-                    ad.base_size() as u64
-                };
-                let extra = emit_scaled_index_addr(
-                    &mut sink,
-                    constants,
-                    value_types,
-                    op.arg(0).to_opref(),
-                    op.arg(1).to_opref(),
-                    item_size,
-                    base_size,
-                );
-                emit_resolve(&mut sink, constants, value_types, op.arg(2).to_opref());
-                emit_sized_int_store(&mut sink, extra, ad.item_size());
-            }
-            OpCode::Copystrcontent | OpCode::Copyunicodecontent => {
-                let descr = op.getdescr().ok_or_else(|| {
-                    BackendError::Unsupported(
-                        "wasm codegen: copystr/unicodecontent is missing its ArrayDescr".into(),
-                    )
-                })?;
-                let ad = descr.as_array_descr().ok_or_else(|| {
-                    BackendError::Unsupported(
-                        "wasm codegen: copystr/unicodecontent descr is not an ArrayDescr".into(),
-                    )
-                })?;
-                let item_size = ad.item_size() as u64;
-                let base_size = if item_size == 1 {
-                    ad.base_size() as u64 - 1
-                } else {
-                    ad.base_size() as u64
-                };
-                let dst_extra = emit_scaled_index_addr(
-                    &mut sink,
-                    constants,
-                    value_types,
-                    op.arg(1).to_opref(),
-                    op.arg(3).to_opref(),
-                    item_size,
-                    base_size,
-                );
-                if dst_extra != 0 {
-                    sink.i32_const(dst_extra as i32);
-                    sink.i32_add();
-                }
-                let src_extra = emit_scaled_index_addr(
-                    &mut sink,
-                    constants,
-                    value_types,
-                    op.arg(0).to_opref(),
-                    op.arg(2).to_opref(),
-                    item_size,
-                    base_size,
-                );
-                if src_extra != 0 {
-                    sink.i32_const(src_extra as i32);
-                    sink.i32_add();
-                }
-                emit_resolve(&mut sink, constants, value_types, op.arg(4).to_opref());
-                sink.i32_wrap_i64();
-                emit_scale_index(&mut sink, item_size);
-                sink.memory_copy(0, 0);
             }
             // ── Misc ops ──
             OpCode::NurseryPtrIncrement => {
@@ -12502,48 +12341,4 @@ fn array_len_layout_from_descr(op: &Op) -> (u64, usize) {
     })
     .flatten()
     .unwrap_or_else(|| missing_layout_descr("array descr (len layout)", op))
-}
-
-/// `descr.py unpack_interiorfielddescr`: `ofs = basesize + field.offset`,
-/// plus the element stride and the field's own width / signedness / kind.
-struct InteriorFieldLayout {
-    /// `basesize + field.offset`, the displacement past the scaled index.
-    offset: u64,
-    /// The array's element stride.
-    item_size: u64,
-    /// The field's own width, and how a read of it extends.
-    field_size: usize,
-    signed: bool,
-    is_float: bool,
-    is_ptr: bool,
-}
-
-impl InteriorFieldLayout {
-    /// The width an access to this field moves, and how a read of it extends.
-    fn access_size_sign(&self) -> (usize, bool) {
-        if self.is_ptr {
-            (GUEST_PTR_SIZE, false)
-        } else {
-            (self.field_size, self.signed)
-        }
-    }
-}
-
-fn unpack_interior_field(op: &Op) -> InteriorFieldLayout {
-    let descr = op
-        .getdescr()
-        .unwrap_or_else(|| missing_layout_descr("interior-field descr", op));
-    let ifd = descr
-        .as_interior_field_descr()
-        .unwrap_or_else(|| missing_layout_descr("interior-field descr", op));
-    let ad = ifd.array_descr();
-    let fd = ifd.field_descr();
-    InteriorFieldLayout {
-        offset: (ad.base_size() + fd.offset()) as u64,
-        item_size: ad.item_size() as u64,
-        field_size: fd.field_size(),
-        signed: fd.is_field_signed(),
-        is_float: fd.is_float_field(),
-        is_ptr: fd.is_pointer_field(),
-    }
 }
