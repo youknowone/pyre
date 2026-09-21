@@ -10212,6 +10212,9 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                         if refused {
                             return Err(err);
                         }
+                        // `handle_operation_error` records the traceback, then
+                        // searches the table. The residual takes the live
+                        // `last_instr` word.
                         let last_instr = unsafe { &*f }.last_instr as i64;
                         let next_instr = pyre_interpreter::eval::dispatch_exception_handler(
                             unsafe { &mut *f },
@@ -10255,6 +10258,9 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                 if !majit_metainterp::jit::we_are_jitted() {
                     f = FrameView::reload(f);
                 }
+                // `handle_operation_error` records the traceback, then
+                // searches the table. The residual takes the live
+                // `last_instr` word.
                 let last_instr = unsafe { &*f }.last_instr as i64;
                 let next_instr = pyre_interpreter::eval::dispatch_exception_handler(
                     unsafe { &mut *f },

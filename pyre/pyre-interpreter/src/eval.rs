@@ -2166,372 +2166,254 @@ pub enum ContextSource {
     ResumedFrameOnly,
 }
 
-/// Shared body of [`handle_exception`] / [`handle_exception_with_context`].
-/// Expanded in both so each function's MIR contains the handler search;
-/// a callee call would residualise and the exception bridge would
-/// `Finish` instead of entering `except`.
-macro_rules! handle_operation_error_body {
-    ($frame:ident, $err:ident, $context_source:expr) => {{
-        let frame = $frame;
-        let err = $err;
-        let context_source = $context_source;
-        // An internal corruption marker is not a real Python exception and must
-        // never be dispatched via bytecode handlers.
-        if err.kind == crate::PyErrorKind::BytecodeCorruption {
-            return -1;
-        }
-        // pyopcode.py:135-148 — exception trace plumbing:
-        //   try:
-        //       trace = self.get_w_f_trace()
-        //       if trace is not None:
-        //           self.getorcreatedebug().w_f_trace = None
-        //       try:
-        //           ec.bytecode_trace_after_exception(self)
-        //       finally:
-        //           if trace is not None:
-        //               self.getorcreatedebug().w_f_trace = trace
-        //   except OperationError as e:
-        //       operr = e
-        //   pytraceback.record_application_traceback(
-        //       self.space, operr, self, self.last_instr)
-        //   ec.exception_trace(self, operr)
-        //
-        // bytecode_trace_after_exception + exception_trace are gated on a
-        // live tracefunc so the no-tracer hot path skips the f_trace
-        // save/restore dance.  record_application_traceback runs
-        // unconditionally per `:147-148`, so the traceback chain grows on
-        // every exception regardless of trace state.
-        // bytecode_trace_after_exception's exception is caught by the
-        // surrounding `except OperationError` and replaces operr;
-        // exception_trace's exception is NOT caught (line 148 stands
-        // outside the except), so it short-circuits the unrollstack search
-        // — pyre signals that by returning `false` after replacing `err`.
-        // `pyopcode.py handle_operation_error(attach_tb=True)` —
-        // the entire `if attach_tb:` block (bytecode_trace_after_exception,
-        // record_application_traceback, exception_trace) is gated on
-        // `attach_tb`.  RERAISE opcode raises `RaiseWithExplicitTraceback`
-        // which routes through the `attach_tb=False` branch, so all three
-        // tracing hooks are skipped per `:91-94`.  Pyre carries the same
-        // intent via `PyError.attach_tb` set by `eval.rs::reraise`.
-        let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
-        // Everything below allocates before it touches the frame again:
-        // `to_exc_object` materialises the exception, `chain_context` builds the
-        // `__context__` link, the trace hooks run arbitrary Python and
-        // `record_application_traceback` allocates a `PyTraceback`.  A frame the
-        // JIT built is a nursery object (`emit_new_pyframe_inline_with_params`),
-        // so `frame` names the abandoned copy after any of them collect.  Anchor it
-        // once and re-read at each point the frame is next used.
-        let frame_anchor = FrameAnchor::new(frame);
-        let exc_obj = err.to_exc_object();
-        if err.exc_object.is_null() {
-            err.exc_object = exc_obj;
-        }
-        // Nursery exception: every allocation below (`chain_context`'s cycle
-        // break, the trace hooks, `record_application_traceback`, `w_int_new`)
-        // can move it. The `PyError` field is not a root. Publish the instance
-        // and write the forwarded address back before each later use.
-        let _exc_roots = pyre_object::gc_roots::push_roots();
-        let exc_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(err.exc_object);
-        // PyPy `PyFrame.handle_bytecode` calls `OperationError.record_context`
-        // only on the ordinary OperationError arm. `RaiseWithExplicitTraceback`
-        // (RERAISE) goes straight to `handle_operation_error(attach_tb=False)`:
-        // the same exception is still propagating and must not acquire the
-        // exception handled by an intervening finally block as a new context.
-        //
-        // `error.py record_context` records it once and then marks the
-        // OperationError, so the frames the SAME error merely unwinds through never
-        // re-derive it.  `PyError::context_recorded` is that mark, and it rides the
-        // error outward because the dispatch loop moves the same value into
-        // `Err(err)` on propagation.  The mark is set below whether or not an active
-        // exception was found, mirroring the `finally`.
-        //
-        // # TODO: call `PyError::record_context`
-        //
-        // **Deviation.** The body is spelled here rather than going through the
-        // method that holds it, so this reads as three steps where upstream reads
-        // as one call.
-        //
-        // **Why.** `record_context`'s only callee is `chain_context`, which no
-        // annotated graph reaches, so it is absent from the CallRegistry and the
-        // method cannot be typed: Phase-A ends with `chain_context ... not
-        // registered in CallRegistry`, and the method joins the rtyper
-        // skip-subject census. Inlining it here does not cost an annotated graph
-        // — `handle_exception` is already a census entry for reasons of its own.
-        //
-        // **How to fix.** Make `chain_context` reachable from a graph the
-        // minting closure already walks, so the registry carries it; then this
-        // becomes `err.record_context(context_source)` and the method annotates
-        // wherever it is called.
-        if err.attach_tb && !err.context_recorded {
-            let last = match context_source {
-                ContextSource::GeneratorChain => get_sys_exception(),
-                ContextSource::ResumedFrameOnly => get_current_exception(),
-            };
-            crate::error::chain_context(pyre_object::gc_roots::shadow_stack_get(exc_slot), last);
-            err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
-            err.context_recorded = true;
-        }
-        let frame = unsafe { &mut *frame_anchor.live() };
-        if err.attach_tb {
-            if !ec.is_null() && unsafe { !(*ec).gettrace().is_null() } {
-                // The materialized exception is a nursery object and lives only in
-                // the `PyError` field plus the pin above. Publish the forwarded
-                // address as the in-flight root before the trace hook runs
-                // arbitrary Python. `record_application_traceback` re-publishes
-                // the possibly-replaced operr below.
-                err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
-                set_in_flight_exception(err.exc_object);
-                let saved_trace = frame.get_w_f_trace();
-                if !saved_trace.is_null() {
-                    frame.getorcreatedebug(-1).w_f_trace = pyre_object::PY_NULL;
-                }
-                let after_exc_result =
-                    unsafe { (*ec).bytecode_trace_after_exception(frame as *mut PyFrame) };
-                // The hook ran application code; restore the slot on the frame that
-                // survived it.
-                let frame = unsafe { &mut *frame_anchor.live() };
-                if !saved_trace.is_null() {
-                    frame.getorcreatedebug(-1).w_f_trace = saved_trace;
-                }
-                match after_exc_result {
-                    // pyopcode.py:144-145 — `except OperationError as e: operr = e`.
-                    Err(trace_err) => *err = trace_err,
-                    // The hook ran application code, so the field names the
-                    // pre-collection address; the pin holds the forwarded one.
-                    Ok(_) => err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot),
-                }
-            }
-            // pyopcode.py:144-149 — after `except OperationError as e: operr = e`,
-            // record/trace the (possibly tracer-replaced) operr, not the exception
-            // captured before the trace hook ran.  Re-derive from `err`: an
-            // unreplaced err returns the cached object; a replaced err
-            // materialises the replacement.  Cache it so record and trace share
-            // one object.
-            let operr_obj = err.to_exc_object();
-            if err.exc_object.is_null() {
-                err.exc_object = operr_obj;
-            }
-            pyre_object::gc_roots::shadow_stack_set(exc_slot, err.exc_object);
-            // `pyopcode.py pytraceback.record_application_traceback`
-            // — prepends a `PyTraceback` wrapping the current frame onto
-            // the exception's `w_traceback` chain.
-            // `w_pytraceback_new` copies this pointer into the node it allocates,
-            // so it has to be the address the frame has now.
-            let frame = unsafe { &mut *frame_anchor.live() };
-            unsafe {
-                crate::pytraceback::record_application_traceback(
-                    pyre_object::gc_roots::shadow_stack_get(exc_slot),
-                    frame as *mut PyFrame,
-                    frame.last_instr as i64,
-                );
-            }
-            err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
-        }
-        if err.attach_tb && !ec.is_null() && unsafe { !(*ec).gettrace().is_null() } {
-            // `record_application_traceback` above allocates, so the frame address
-            // is re-read from the anchor rather than reused.
-            let frame = unsafe { &mut *frame_anchor.live() };
-            // `pyopcode.py handle_operation_error` calls
-            // `ec.exception_trace(self, operr)` with the live carrier, and
-            // `executioncontext.py exception_trace` normalizes it in place to
-            // build the `(w_type, w_value, w_traceback)` argument — including the
-            // traceback read, so the caller does not assemble one.
-            err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
-            if let Err(trace_err) = unsafe { (*ec).exception_trace(frame as *mut PyFrame, err) } {
-                // The call sits outside the trace-ticker recovery block, so a tracer
-                // exception replaces the original error and propagates without
-                // searching this frame for a handler for the original.
-                *err = trace_err;
-                return -1;
-            }
-            // `exception_trace` normalizes the carrier in place, which keeps the
-            // same exception, then runs the tracer; the pin, not the field, holds
-            // its forwarded address.
-            err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
-        }
-        // `attach_tb=False` (RaiseWithExplicitTraceback) suppresses the traceback
-        // record for the frame that performed the re-raise only.  Once that frame's
-        // record/trace decision is made, the flag is cleared so that if no handler
-        // is found here and the exception propagates to the caller, that outer frame
-        // records its own traceback entry — mirroring the special-exception being
-        // unwrapped to a plain OperationError after one frame.
-        err.attach_tb = true;
-        // `record_application_traceback` and `exception_trace` above both allocate;
-        // `pycode` is read off the frame, so a stale frame yields a stale code
-        // object as well as a stale value stack.
-        let frame = unsafe { &mut *frame_anchor.live() };
-        // `pyopcode.py handle_operation_error`:
-        // `self.getcode().lookup_exceptiontable(self.last_instr)`.
-        // The method is `@jit.elidable`; call the PyCode wrapper so the
-        // residual ABI keys on the code object, not a table slice.
-        // pyre's `last_instr` is a rustpython code-unit index; the PyPy-shaped
-        // `lookup_exceptiontable` lookup takes byte offsets, so multiply by 2.
-        // (See pycode.rs: varint values are word offsets but the lookup
-        // operates in byte space, mirroring `pycode.py:241-246`.)
-        //
-        // `frame.last_instr == -1` is the pre-first-opcode sentinel
-        // (`pyframe.py:227-235` initialization).  An injected operr
-        // (`eval_frame_plain_with_operr`) drives `handle_exception` before any
-        // bytecode has executed, so the lookup must mirror PyPy
-        // `pycode.py:250-253`: with `instr_offset == -1`, the first entry's
-        // `start <= -1` is False and `start > -1` is True, returning the
-        // `depth == -1` sentinel (no handler).  Skip the table lookup outright
-        // rather than casting -1 to `u32::MAX` (panic in debug, wrap in
-        // release).
-        let lookup_result = if frame.last_instr < 0 {
-            None
-        } else {
-            let pc_bytes = (frame.last_instr as u32) * 2;
-            crate::pycode::unpack_exceptiontable_lookup(unsafe {
-                crate::pycode::w_code_lookup_exceptiontable(
-                    frame.pycode as pyre_object::PyObjectRef,
-                    pc_bytes,
-                )
-            })
-        };
-        let pc_units = if frame.last_instr < 0 {
-            0u32
-        } else {
-            frame.last_instr as u32
-        };
-
-        // `pypy/interpreter/pyopcode.py` exception-table dispatch.
-        if let Some((target_bytes, depth, lasti)) = lookup_result {
-            // `pyopcode.py:155-156` — depth is relative (0 = empty value
-            // stack); convert to absolute by adding the frame's locals+cells
-            // base, then drop the stack to that depth.
-            let target_depth = frame.nlocals() + frame.ncells() + depth as usize;
-            // `pyopcode.py handle_operation_error` → `dropvaluesuntil`.
-            frame.dropvaluesuntil(target_depth);
-            // `pyopcode.py:157-170` — lasti=True: push the raise-site offset
-            // as an int below the exception, so RERAISE N can read it for
-            // traceback/f_lineno correctness.  If this dispatch was triggered
-            // by RERAISE (reraise_lasti from PyError, mirroring PyPy's
-            // `handle_operation_error(reraise_lasti=...)`), use the original
-            // raise-site lasti the RERAISE carried; otherwise use the current
-            // instruction (the raising site itself).
-            if lasti {
-                let lasti_value: i64 = if err.reraise_lasti >= 0 {
-                    err.reraise_lasti as i64
-                } else {
-                    pc_units as i64
-                };
-                frame.push(pyre_object::w_int_new(lasti_value));
-                err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
-            }
-            // pyopcode.py: reraise_lasti is a local of handle_operation_error;
-            // OperationError raised from this function carries no lasti.  Clear
-            // here so a re-thrown PyError does not double-consume.
-            err.reraise_lasti = -1;
-            err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
-            let exc_obj = err.to_exc_object();
-            // Same shape as `opcode_build_list`: materialise, then push. The push
-            // has to land on the frame the materialisation left live.
-            let frame = unsafe { &mut *frame_anchor.live() };
-            pyre_object::gc_roots::shadow_stack_set(exc_slot, exc_obj);
-            frame.push(pyre_object::gc_roots::shadow_stack_get(exc_slot));
-            // The exception is now on this frame's handler.  Drop the backend
-            // `_store_exception` cells so a later compiled `GUARD_NO_EXCEPTION`
-            // does not re-deliver the value this except already consumed.
-            crate::runtime_ops::jit_clear_published_exception();
-            // The decoded `target` is a byte offset; pyre's `next_instr` is a
-            // code-unit index, so divide by 2.  Returned like
-            // `handle_operation_error` so the caller writes the loop-carried
-            // pc — a `&mut usize` third argument is a stack pointer the
-            // jitcode cannot pass.
-            return (target_bytes / 2) as i64;
-        }
-
-        // `pyopcode.py:175-185` no-handler propagation: if this unwind was
-        // triggered by RERAISE N, restore `last_instr` to the original
-        // raise-site offset so `frame.f_lineno` reports the right line.
-        if err.reraise_lasti >= 0 {
-            frame.last_instr = err.reraise_lasti as isize;
-        }
-        err.reraise_lasti = -1;
-        frame.set_frame_finished_execution(true);
-        err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
-
-        -1
-    }};
+/// Raising instruction for `handle_operation_error`.
+///
+/// `pyopcode.py handle_operation_error` reads `self.last_instr` for both
+/// `record_application_traceback` and `lookup_exceptiontable`. The portal
+/// passes that virtualizable as `passed` when it is positive, because a
+/// residual re-read of the field sees the stale heap value (0) after
+/// resume. A non-positive word, including the plain eval loop's `-1`,
+/// reads the live field (a trace hook may have just moved it), then the
+/// reraise coordinate, then the instruction before `next_instr`.
+fn operation_error_last_instr(frame: &PyFrame, err: &PyError, passed: i64) -> i64 {
+    if passed > 0 {
+        passed
+    } else if frame.last_instr > 0 {
+        frame.last_instr as i64
+    } else if err.reraise_lasti >= 0 {
+        err.reraise_lasti as i64
+    } else {
+        let next = frame.next_instr();
+        if next == 0 { -1 } else { next as i64 - 1 }
+    }
 }
 
-/// Try to dispatch an exception using the exception table or block stack.
+/// `pyopcode.py PyFrame.handle_operation_error`.
 ///
-/// Handler code-unit index, or `-1` if the exception should propagate.
-///
-/// `handle_operation_error` returns the target pc (and raises when there
-/// is no handler). The body is expanded here so the portal looks inside
-/// the handler search instead of residual-calling a forwarder.
+/// The application traceback is recorded first (`attach_tb`, and
+/// `hidden_applevel` inside `record_application_traceback`), then the
+/// exception table is searched. Every caller — the plain eval loop, a
+/// resumed generator, and the portal residual — goes through this
+/// function. `last_instr` is the raising instruction word.
 #[inline(never)]
 #[majit_macros::dont_look_inside_cannot_raise]
-pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError) -> i64 {
-    handle_operation_error_body!(frame, err, ContextSource::GeneratorChain)
-}
-
-/// [`handle_exception`] with an explicit context source
-/// (`pyframe.py:303-306` records the context of a thrown-in
-/// `SApplicationException` before the handler search).
-#[inline(never)]
-#[majit_macros::dont_look_inside_cannot_raise]
-pub fn handle_exception_with_context(
+pub fn handle_operation_error(
     frame: &mut PyFrame,
     err: &mut PyError,
+    last_instr: i64,
     context_source: ContextSource,
 ) -> i64 {
-    handle_operation_error_body!(frame, err, context_source)
-}
-
-/// Exception-table half of `handle_operation_error`: drop to the handler
-/// depth, push the exception, return the handler pc (or `-1`).
-///
-/// The portal calls this directly. `handle_exception` has no extracted
-/// jitcode (too large once traceback hooks are included), so a residual
-/// of that whole function becomes `Finish(ExitFrameWithException)` and
-/// never enters `except`.
-///
-/// `cannot_raise`: a leftover RAISE exception in the interpret TLS must
-/// not turn this i64-returning lookup into `Finish(ExitFrameWithException)`.
-/// `last_instr` is a virtualizable field. A residual that reads it off
-/// the concrete frame sees 0 after resume (the live value is in the
-/// vable box). The portal passes the box as this word so the except
-/// table lookup matches the raise.
-#[inline(never)]
-#[majit_macros::dont_look_inside_cannot_raise]
-pub fn dispatch_exception_handler(frame: &mut PyFrame, err: &mut PyError, last_instr: i64) -> i64 {
+    // An internal corruption marker is not a real Python exception and must
+    // never be dispatched via bytecode handlers.
     if err.kind == crate::PyErrorKind::BytecodeCorruption {
         return -1;
     }
+    // pyopcode.py handle_operation_error — exception trace plumbing:
+    //   try:
+    //       trace = self.get_w_f_trace()
+    //       if trace is not None:
+    //           self.getorcreatedebug().w_f_trace = None
+    //       try:
+    //           ec.bytecode_trace_after_exception(self)
+    //       finally:
+    //           if trace is not None:
+    //               self.getorcreatedebug().w_f_trace = trace
+    //   except OperationError as e:
+    //       operr = e
+    //   pytraceback.record_application_traceback(
+    //       self.space, operr, self, self.last_instr)
+    //   ec.exception_trace(self, operr)
+    //
+    // bytecode_trace_after_exception + exception_trace are gated on a
+    // live tracefunc so the no-tracer hot path skips the f_trace
+    // save/restore dance. record_application_traceback runs whenever
+    // `attach_tb` is set, so the traceback chain grows on every
+    // exception regardless of trace state.
+    // bytecode_trace_after_exception's exception is caught by the
+    // surrounding `except OperationError` and replaces operr;
+    // exception_trace's exception is NOT caught, so it short-circuits
+    // the handler search — signalled here by returning `-1` after
+    // replacing `err`.
+    // The entire `if attach_tb:` block is gated on `attach_tb`.
+    // RERAISE routes through `attach_tb=False`, so all three tracing
+    // hooks are skipped. `PyError.attach_tb` carries that flag.
+    let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
+    // Everything below allocates before it touches the frame again:
+    // `to_exc_object` materialises the exception, `chain_context` builds the
+    // `__context__` link, the trace hooks run arbitrary Python and
+    // `record_application_traceback` allocates a `PyTraceback`. A frame the
+    // JIT built is a nursery object, so `frame` names the abandoned copy
+    // after any of them collect. Anchor it once and re-read at each point
+    // the frame is next used.
     let frame_anchor = FrameAnchor::new(frame);
+    let exc_obj = err.to_exc_object();
+    if err.exc_object.is_null() {
+        err.exc_object = exc_obj;
+    }
+    // Nursery exception: every allocation below (`chain_context`'s cycle
+    // break, the trace hooks, `record_application_traceback`, `w_int_new`)
+    // can move it. The `PyError` field is not a root. Publish the instance
+    // and write the forwarded address back before each later use.
+    let _exc_roots = pyre_object::gc_roots::push_roots();
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(err.exc_object);
+    // `PyFrame.handle_bytecode` calls `OperationError.record_context`
+    // only on the ordinary OperationError arm. `RaiseWithExplicitTraceback`
+    // (RERAISE) goes straight to `handle_operation_error(attach_tb=False)`:
+    // the same exception is still propagating and must not acquire the
+    // exception handled by an intervening finally block as a new context.
+    //
+    // `error.py record_context` records it once and then marks the
+    // OperationError, so the frames the SAME error merely unwinds through
+    // never re-derive it. `PyError::context_recorded` is that mark.
+    //
+    // # TODO: call `PyError::record_context`
+    //
+    // **Deviation.** The body is spelled here rather than going through the
+    // method that holds it, so this reads as three steps where upstream reads
+    // as one call.
+    //
+    // **Why.** `record_context`'s only callee is `chain_context`, which no
+    // annotated graph reaches, so it is absent from the CallRegistry and the
+    // method cannot be typed: Phase-A ends with `chain_context ... not
+    // registered in CallRegistry`, and the method joins the rtyper
+    // skip-subject census. Inlining it here does not cost an annotated graph
+    // — `handle_exception` is already a census entry for reasons of its own.
+    //
+    // **How to fix.** Make `chain_context` reachable from a graph the
+    // minting closure already walks, so the registry carries it; then this
+    // becomes `err.record_context(context_source)` and the method annotates
+    // wherever it is called.
+    if err.attach_tb && !err.context_recorded {
+        let last = match context_source {
+            ContextSource::GeneratorChain => get_sys_exception(),
+            ContextSource::ResumedFrameOnly => get_current_exception(),
+        };
+        crate::error::chain_context(pyre_object::gc_roots::shadow_stack_get(exc_slot), last);
+        err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+        err.context_recorded = true;
+    }
     let frame = unsafe { &mut *frame_anchor.live() };
-    let code = unsafe { &*crate::pyframe_get_pycode(frame) };
-    let last_for_lookup = if last_instr > 0 {
-        last_instr as isize
-    } else if frame.last_instr > 0 {
-        frame.last_instr
-    } else if err.reraise_lasti >= 0 {
-        err.reraise_lasti as isize
-    } else {
-        let next = frame.next_instr();
-        if next == 0 { -1 } else { next as isize - 1 }
-    };
+    if err.attach_tb {
+        if !ec.is_null() && unsafe { !(*ec).gettrace().is_null() } {
+            // The materialized exception is a nursery object and lives only in
+            // the `PyError` field plus the pin above. Publish the forwarded
+            // address as the in-flight root before the trace hook runs
+            // arbitrary Python. `record_application_traceback` re-publishes
+            // the possibly-replaced operr below.
+            err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+            set_in_flight_exception(err.exc_object);
+            let saved_trace = frame.get_w_f_trace();
+            if !saved_trace.is_null() {
+                frame.getorcreatedebug(-1).w_f_trace = pyre_object::PY_NULL;
+            }
+            let after_exc_result =
+                unsafe { (*ec).bytecode_trace_after_exception(frame as *mut PyFrame) };
+            // The hook ran application code; restore the slot on the frame that
+            // survived it.
+            let frame = unsafe { &mut *frame_anchor.live() };
+            if !saved_trace.is_null() {
+                frame.getorcreatedebug(-1).w_f_trace = saved_trace;
+            }
+            match after_exc_result {
+                // pyopcode.py: `except OperationError as e: operr = e`.
+                Err(trace_err) => *err = trace_err,
+                // The hook ran application code, so the field names the
+                // pre-collection address; the pin holds the forwarded one.
+                Ok(_) => err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot),
+            }
+        }
+        // After `except OperationError as e: operr = e`, record/trace the
+        // (possibly tracer-replaced) operr, not the exception captured
+        // before the trace hook ran. Re-derive from `err`: an unreplaced
+        // err returns the cached object; a replaced err materialises the
+        // replacement. Cache it so record and trace share one object.
+        let operr_obj = err.to_exc_object();
+        if err.exc_object.is_null() {
+            err.exc_object = operr_obj;
+        }
+        pyre_object::gc_roots::shadow_stack_set(exc_slot, err.exc_object);
+        // `pytraceback.record_application_traceback` prepends a
+        // `PyTraceback` wrapping the current frame onto the exception's
+        // traceback chain. `w_pytraceback_new` copies this pointer into
+        // the node it allocates, so it has to be the address the frame
+        // has now. The instruction is the same word the table search
+        // uses below.
+        let frame = unsafe { &mut *frame_anchor.live() };
+        let record_lasti = operation_error_last_instr(frame, err, last_instr);
+        unsafe {
+            crate::pytraceback::record_application_traceback(
+                pyre_object::gc_roots::shadow_stack_get(exc_slot),
+                frame as *mut PyFrame,
+                record_lasti,
+            );
+        }
+        err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+    }
+    if err.attach_tb && !ec.is_null() && unsafe { !(*ec).gettrace().is_null() } {
+        // `record_application_traceback` above allocates, so the frame address
+        // is re-read from the anchor rather than reused.
+        let frame = unsafe { &mut *frame_anchor.live() };
+        // `ec.exception_trace(self, operr)` normalizes the live carrier in
+        // place to build the `(w_type, w_value, w_traceback)` argument.
+        err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+        if let Err(trace_err) = unsafe { (*ec).exception_trace(frame as *mut PyFrame, err) } {
+            // The call sits outside the trace-ticker recovery block, so a tracer
+            // exception replaces the original error and propagates without
+            // searching this frame for a handler for the original.
+            *err = trace_err;
+            return -1;
+        }
+        // `exception_trace` normalizes the carrier in place, which keeps the
+        // same exception, then runs the tracer; the pin, not the field, holds
+        // its forwarded address.
+        err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+    }
+    // `attach_tb=False` (RaiseWithExplicitTraceback) suppresses the traceback
+    // record for the frame that performed the re-raise only. Once that frame's
+    // record/trace decision is made, the flag is cleared so that if no handler
+    // is found here and the exception propagates to the caller, that outer frame
+    // records its own traceback entry.
+    err.attach_tb = true;
+    // `record_application_traceback` and `exception_trace` above both allocate;
+    // re-read the frame before the table search and the stack writes.
+    let frame = unsafe { &mut *frame_anchor.live() };
+    // `self.getcode().lookup_exceptiontable(self.last_instr)`.
+    // pyre's `last_instr` is a code-unit index; the lookup takes byte
+    // offsets, so multiply by 2.
+    //
+    // `last_instr == -1` is the pre-first-opcode sentinel. An injected
+    // operr drives this function before any bytecode has executed, so the
+    // lookup mirrors `pycode.py`: `instr_offset == -1` matches no entry.
+    let last_for_lookup = operation_error_last_instr(frame, err, last_instr);
     let lookup_result = if last_for_lookup < 0 {
         None
     } else {
         let pc_bytes = (last_for_lookup as u32) * 2;
-        crate::pycode::lookup_exceptiontable(&code.exceptiontable, pc_bytes)
+        crate::pycode::unpack_exceptiontable_lookup(unsafe {
+            crate::pycode::w_code_lookup_exceptiontable(
+                frame.pycode as pyre_object::PyObjectRef,
+                pc_bytes,
+            )
+        })
     };
-    let pc_units = if frame.last_instr < 0 {
+    let pc_units = if last_for_lookup < 0 {
         0u32
     } else {
-        frame.last_instr as u32
+        last_for_lookup as u32
     };
+
     if let Some((target_bytes, depth, lasti)) = lookup_result {
+        // depth is relative (0 = empty value stack); convert to absolute
+        // by adding the frame's locals+cells base, then drop the stack
+        // to that depth.
         let target_depth = frame.nlocals() + frame.ncells() + depth as usize;
-        while frame.valuestackdepth > target_depth {
-            frame.pop();
-        }
+        // `pyopcode.py handle_operation_error` → `dropvaluesuntil`.
+        frame.dropvaluesuntil(target_depth);
+        // lasti=True: push the raise-site offset as an int below the
+        // exception, so RERAISE N can read it. If this dispatch was
+        // triggered by RERAISE (`reraise_lasti`), use the original
+        // raise-site lasti; otherwise use the raising instruction.
         if lasti {
             let lasti_value: i64 = if err.reraise_lasti >= 0 {
                 err.reraise_lasti as i64
@@ -2539,19 +2421,83 @@ pub fn dispatch_exception_handler(frame: &mut PyFrame, err: &mut PyError, last_i
                 pc_units as i64
             };
             frame.push(pyre_object::w_int_new(lasti_value));
+            err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
         }
+        // reraise_lasti is a local of handle_operation_error. Clear it so
+        // a re-thrown PyError does not double-consume.
         err.reraise_lasti = -1;
+        err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
         let exc_obj = err.to_exc_object();
+        // Materialise, then push onto the frame the materialisation left live.
         let frame = unsafe { &mut *frame_anchor.live() };
-        frame.push(exc_obj);
+        pyre_object::gc_roots::shadow_stack_set(exc_slot, exc_obj);
+        frame.push(pyre_object::gc_roots::shadow_stack_get(exc_slot));
+        // The exception is now on this frame's handler. Drop the backend
+        // exception cells so a later compiled `GUARD_NO_EXCEPTION` does not
+        // re-deliver the value this except already consumed.
+        crate::runtime_ops::jit_clear_published_exception();
+        // The decoded `target` is a byte offset; `next_instr` is a
+        // code-unit index, so divide by 2.
         return (target_bytes / 2) as i64;
     }
+
+    // No handler: if this unwind was triggered by RERAISE N, restore
+    // `last_instr` to the original raise-site offset so `f_lineno`
+    // reports that line.
     if err.reraise_lasti >= 0 {
         frame.last_instr = err.reraise_lasti as isize;
     }
     err.reraise_lasti = -1;
     frame.set_frame_finished_execution(true);
+    err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+
     -1
+}
+
+/// Try to dispatch an exception using the exception table.
+///
+/// Handler code-unit index, or `-1` if the exception should propagate.
+#[inline(never)]
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError) -> i64 {
+    // `-1` means "read the live field". A trace hook inside
+    // `handle_operation_error` may move `last_instr` before the record.
+    handle_operation_error(frame, err, -1, ContextSource::GeneratorChain)
+}
+
+/// [`handle_exception`] with an explicit context source
+/// (`pyframe.py` records the context of a thrown-in exception before
+/// the handler search).
+#[inline(never)]
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn handle_exception_with_context(
+    frame: &mut PyFrame,
+    err: &mut PyError,
+    context_source: ContextSource,
+) -> i64 {
+    // `-1` means "read the live field" after the trace hook.
+    handle_operation_error(frame, err, -1, context_source)
+}
+
+/// Portal entry for [`handle_operation_error`].
+///
+/// `handle_exception` has no extracted jitcode (too large once traceback
+/// hooks are included), so a residual of that whole function becomes
+/// `Finish(ExitFrameWithException)` and never enters `except`. This
+/// wrapper keeps the word-sized `(frame, err, last_instr)` residual the
+/// portal already calls. Its first step is still the traceback record;
+/// the table search runs only after that.
+///
+/// `cannot_raise`: a leftover RAISE exception in the interpret TLS must
+/// not turn this i64-returning lookup into `Finish(ExitFrameWithException)`.
+/// `last_instr` is a virtualizable field. A residual that reads it off
+/// the concrete frame sees 0 after resume (the live value is in the
+/// vable box). The portal passes the box as this word so the record and
+/// the except-table lookup both see the raising instruction.
+#[inline(never)]
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn dispatch_exception_handler(frame: &mut PyFrame, err: &mut PyError, last_instr: i64) -> i64 {
+    handle_operation_error(frame, err, last_instr, ContextSource::GeneratorChain)
 }
 
 /// Execute a frame — pure interpreter, no JIT.
