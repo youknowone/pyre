@@ -7262,8 +7262,7 @@ where
                             &mp_green_ints,
                             &mp_green_refs,
                             &mp_green_floats,
-                        )
-                        else {
+                        ) else {
                             return TraceAction::Continue;
                         };
                         let inner_key = inner_key_typed.get_uhash();

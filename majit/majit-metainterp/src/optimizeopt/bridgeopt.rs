@@ -138,7 +138,8 @@ pub fn serialize_optimizer_knowledge(
         |opref: OpRef| opref.is_constant() || env.is_const(&env.get_box_replacement_operand(opref));
     let field_ok = |obj: OpRef, val: OpRef| {
         (is_const(obj) || available_boxes.contains_key(&env.get_box_replacement_operand(obj)))
-            && (is_const(val) || available_boxes.contains_key(&env.get_box_replacement_operand(val)))
+            && (is_const(val)
+                || available_boxes.contains_key(&env.get_box_replacement_operand(val)))
     };
     let triples_struct: Vec<(OpRef, i32, OpRef)> = knowledge
         .heap_fields

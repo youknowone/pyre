@@ -2582,7 +2582,10 @@ impl TraceCtx {
         refs: &[i64],
         floats: &[i64],
     ) -> Option<u64> {
-        Some(self.merge_point_green_key(pc, ints, refs, floats)?.get_uhash())
+        Some(
+            self.merge_point_green_key(pc, ints, refs, floats)?
+                .get_uhash(),
+        )
     }
 
     /// The typed form of [`Self::merge_point_green_key_hash`], for callers
@@ -3377,7 +3380,6 @@ impl TraceCtx {
             }
         }
     }
-
 
     /// Read a standard virtualizable box by flat index.
     ///

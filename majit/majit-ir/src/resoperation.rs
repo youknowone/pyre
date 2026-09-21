@@ -8440,14 +8440,14 @@ mod tests {
 
     #[test]
     fn intern_thin_stamped_reuses_id_and_roundtrips_fields() {
-        let id_a = intern_thin_stamped(3, 0xABCDEF01, 0x1111_2222_3333, 2)
-            .expect("intern first key");
-        let id_a_again = intern_thin_stamped(3, 0xABCDEF01, 0x1111_2222_3333, 2)
-            .expect("intern same key");
+        let id_a =
+            intern_thin_stamped(3, 0xABCDEF01, 0x1111_2222_3333, 2).expect("intern first key");
+        let id_a_again =
+            intern_thin_stamped(3, 0xABCDEF01, 0x1111_2222_3333, 2).expect("intern same key");
         assert_eq!(id_a, id_a_again);
 
-        let id_b = intern_thin_stamped(3, 0xABCDEF01, 0x1111_2222_4444, 2)
-            .expect("intern different key");
+        let id_b =
+            intern_thin_stamped(3, 0xABCDEF01, 0x1111_2222_4444, 2).expect("intern different key");
         assert_ne!(id_a, id_b);
 
         let word = (id_a << THIN_STAMPED_ID_SHIFT) | THIN_STAMPED_BIT;

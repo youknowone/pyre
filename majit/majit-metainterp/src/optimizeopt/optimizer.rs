@@ -1920,10 +1920,8 @@ impl Optimizer {
                     .unwrap_or_else(|| ctx.materialize_operand_at(arg))
             })
             .collect();
-        let preview_virtual_state = crate::optimizeopt::virtualstate::export_state_operands(
-            &preview_end_arg_boxes,
-            &ctx,
-        );
+        let preview_virtual_state =
+            crate::optimizeopt::virtualstate::export_state_operands(&preview_end_arg_boxes, &ctx);
         let vs_args = &post_force_args;
         // virtualstate.py:687-689 / unroll.py:154-158: a virtual-state
         // mismatch here raises `VirtualStatesCantMatch` and the outer
@@ -1935,9 +1933,9 @@ impl Optimizer {
         // `optimize_trace_with_constants_and_inputs_vable_out`) catches
         // and reroutes instead of crashing the worker thread.
         let (preview_label_args, preview_virtuals, preview_label_source_positions) =
-            match preview_virtual_state.make_inputargs_and_virtuals_with_source_positions(
-                vs_args, self, &mut ctx, false,
-            ) {
+            match preview_virtual_state
+                .make_inputargs_and_virtuals_with_source_positions(vs_args, self, &mut ctx, false)
+            {
                 Ok(pair) => pair,
                 Err(_) => {
                     // unroll.py:193,207-210: on the BRIDGE path the
@@ -1985,9 +1983,7 @@ impl Optimizer {
         let mut preview_short_args = preview_label_args.clone();
         preview_short_args.extend_from_slice(&preview_virtuals);
         let mut short_boxes =
-            crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(
-                &preview_short_args,
-            );
+            crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(&preview_short_args);
         for &arg in &preview_short_args {
             // RPython shortpreamble.py:255-259 parity: each label arg
             // is `box.type`, where Box objects intrinsically carry one
@@ -2174,16 +2170,13 @@ impl Optimizer {
                     same_as_source: produced.same_as_source.clone(),
                 })
             };
-        let exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp> =
-            produced
-                .into_iter()
-                .filter_map(|(result, produced)| convert_produced(result, produced, false))
-                .collect();
+        let exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp> = produced
+            .into_iter()
+            .filter_map(|(result, produced)| convert_produced(result, produced, false))
+            .collect();
         let exported_const_short_boxes = produced_const
             .into_iter()
-            .filter_map(|produced| {
-                convert_produced(produced.res.to_opref(), produced, true)
-            })
+            .filter_map(|produced| convert_produced(produced.res.to_opref(), produced, true))
             .collect();
         ctx.exported_const_short_boxes = exported_const_short_boxes;
         if crate::majit_log_enabled() {

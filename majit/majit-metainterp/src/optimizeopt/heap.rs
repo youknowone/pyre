@@ -546,7 +546,9 @@ impl ArrayCachedItem {
         let info1 = b1.as_ref().and_then(Operand::ptr_info);
         let info2 = b2.as_ref().and_then(Operand::ptr_info);
         match (info1.as_deref(), info2.as_deref()) {
-            (Some(PtrInfo::Array(a1)), Some(PtrInfo::Array(a2))) => a1.lenbound.known_ne(&a2.lenbound),
+            (Some(PtrInfo::Array(a1)), Some(PtrInfo::Array(a2))) => {
+                a1.lenbound.known_ne(&a2.lenbound)
+            }
             _ => false,
         }
     }
