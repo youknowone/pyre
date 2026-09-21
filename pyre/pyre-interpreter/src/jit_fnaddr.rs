@@ -1688,6 +1688,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::build_list_from_refs",
         crate::runtime_ops::build_list_from_refs_jit_abi,
     );
+    pa1(
+        &mut entries,
+        "pyre_object::bytesobject::jit_w_bytes_from_u8",
+        "pyre_object::jit_w_bytes_from_u8",
+        pyre_object::bytesobject::jit_w_bytes_from_u8,
+    );
     pa4(
         &mut entries,
         "pyre_object::bytesobject::jit_w_bytes_from_u8x4",
@@ -6626,6 +6632,20 @@ mod tests {
             bindings["pyre_interpreter::module::_cffi_backend::raw_memcopy_opaque"],
             expected
         );
+    }
+
+    /// `space.newbytes(cdata[0])` is the 1-byte `jit_w_bytes_from_u8`
+    /// residual. `&[u8]` is two words, so the slice form declines the
+    /// `_CDataBase` convert descent.
+    #[test]
+    fn jit_trace_fnaddrs_covers_jit_w_bytes_from_u8() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let expected = pyre_object::bytesobject::jit_w_bytes_from_u8 as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_object::bytesobject::jit_w_bytes_from_u8"],
+            expected
+        );
+        assert_eq!(bindings["pyre_object::jit_w_bytes_from_u8"], expected);
     }
 
     /// `rffi.cast(rffi.CCHARPP, data)[0] = value` is the `raw_write_ptr`

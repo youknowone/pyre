@@ -318,6 +318,17 @@ pub fn w_bytes_from_bytes(bytes: &[u8]) -> PyObjectRef {
     build_bytes(bytes.len(), alloc_bytes_block(bytes))
 }
 
+/// Word-ABI residual of [`w_bytes_from_bytes`] for a 1-byte payload.
+///
+/// `space.newbytes(cdata[0])` (`ctypeprim.py W_CTypePrimitiveChar.convert_to_object`).
+/// `&[u8]` is two words, so the slice form residualizes as a symbolic hash
+/// on the `_CDataBase` call descent.  One `u8` is one word, the same
+/// seam as [`jit_w_bytes_from_u8x4`].
+#[majit_macros::dont_look_inside]
+pub fn jit_w_bytes_from_u8(b0: u8) -> PyObjectRef {
+    w_bytes_from_bytes(&[b0])
+}
+
 /// Word-ABI residual of [`w_bytes_from_bytes`] for a 4-byte payload.
 ///
 /// `&[u8]` is two words, so `ResidualSlot` rejects `w_bytes_from_bytes` and
