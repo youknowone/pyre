@@ -5496,13 +5496,13 @@ mod tests {
             .expect("PyObject class_root must populate classdef");
         assert_eq!(classdef.borrow().name, "PyObject");
 
-        let pyobject_ref = bk.project_struct_field_type("PyObjectRef");
+        let projected_root_instance = bk.project_struct_field_type("PyObjectRef");
         assert!(
-            matches!(pyobject_ref, SomeValue::Instance(_)),
-            "PyObjectRef projects to SomeInstance(pyobject::PyObject), got {pyobject_ref:?}"
+            matches!(projected_root_instance, SomeValue::Instance(_)),
+            "PyObjectRef projects to SomeInstance(pyobject::PyObject), got {projected_root_instance:?}"
         );
         assert!(
-            !matches!(pyobject_ref, SomeValue::String(_)),
+            !matches!(projected_root_instance, SomeValue::String(_)),
             "PyObjectRef must not project to SomeString"
         );
 
