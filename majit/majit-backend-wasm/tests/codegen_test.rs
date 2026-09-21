@@ -8531,11 +8531,10 @@ fn interior_field_ops_compile() {
 }
 
 /// A ref-typed SETINTERIORFIELD_GC that the GC rewrite did not lower is
-/// declined. Codegen must not store the pointer itself.
+/// declined. Codegen returns `BackendError::Unsupported` instead of storing
+/// the pointer. `build_module_default` turns that error into `.expect`, so
+/// this test matches the error directly.
 #[test]
-#[should_panic(
-    expected = "wasm codegen: SetinteriorfieldGc reached codegen without the GC rewrite"
-)]
 fn setinteriorfield_gc_ref_without_rewrite_is_rejected() {
     use majit_ir::descr::{
         ArrayDescr, FieldDescr, SimpleArrayDescr, SimpleFieldDescr, SimpleInteriorFieldDescr,
@@ -8561,7 +8560,22 @@ fn setinteriorfield_gc_ref_without_rewrite_is_rejected() {
         InputArg::from_type_rc(Type::Ref, 2),
     ];
     let ops = vec![set, Op::new(OpCode::Finish, &[])];
-    let _ = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    // Same module inputs as `build_module_default`, including its rewrite
+    // gate. `SetinteriorfieldGc` is not in that gate, so the op reaches
+    // codegen unlowered.
+    let inputs = rewrite_module_inputs(inline_region_inputs(&inputargs, ops, vec![]));
+    match codegen::build_wasm_module(&inputs) {
+        Err(majit_backend::BackendError::Unsupported(msg)) => {
+            assert!(
+                msg.contains("SetinteriorfieldGc reached codegen without the GC rewrite"),
+                "ref SETINTERIORFIELD_GC must be declined: {msg}"
+            );
+        }
+        Ok(_) => panic!("ref SETINTERIORFIELD_GC without rewrite should be Unsupported, got Ok"),
+        Err(err) => {
+            panic!("ref SETINTERIORFIELD_GC without rewrite should be Unsupported, got {err}")
+        }
+    }
 }
 
 /// Count the operators a test cares about in the one code section entry.
