@@ -187,7 +187,7 @@ impl GreenBox {
     /// clone that Vec, then collect a parallel `Vec<OpRef>` and zip them.
     /// GreenBox exists so those two lists are never materialized
     /// (`pyjitpl.py` live_arg_boxes already carry type on the box).
-    fn from_recorder_inputargs(recorder: &Trace) -> Vec<Self> {
+    pub(crate) fn from_recorder_inputargs(recorder: &Trace) -> Vec<Self> {
         recorder
             .inputargs()
             .iter()
