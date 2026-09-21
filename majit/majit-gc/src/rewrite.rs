@@ -1408,13 +1408,10 @@ impl GcRewriterImpl {
             let size = round_up(descr.size());
             let result_pos = op.pos().get();
             let obj_ref = if self.can_use_nursery(size) {
-                // Headerless nursery allocations intentionally skip
-                // clear_gc_fields: there is no GC header/tid store, and the fast
-                // path exists for structs whose ref fields are fully initialized by
-                // immediate SETFIELD_GC ops before any can-collect operation.  A
-                // collector must never observe an uninitialized headerless ref
-                // field; keep new headerless users to that invariant instead of
-                // adding per-field zeroing here.
+                // No tid store: the payload is a raw nursery bump.  GC pointer
+                // fields still go through `clear_gc_fields` below
+                // (`handle_new_fixedsize`), so a leftover slot is NULLed at the
+                // next can-collect op unless `consider_setfield_gc` drops it.
                 st.emitting_an_operation_that_can_collect();
                 let size_ref = st.const_int(size as i64);
                 let malloc_op = mk_op(OpCode::CallMallocNurseryHeaderless, &[size_ref]);
@@ -1437,6 +1434,7 @@ impl GcRewriterImpl {
                 )
             };
             st.record_result_mapping(result_pos, obj_ref.clone());
+            self.clear_gc_fields(descr, obj_ref, st);
             return;
         }
 
@@ -4115,6 +4113,14 @@ mod tests {
     }
 
     fn headerless_size_descr(size: usize, type_id: u32) -> DescrRef {
+        headerless_size_descr_with_gc_fields(size, type_id, Vec::new())
+    }
+
+    fn headerless_size_descr_with_gc_fields(
+        size: usize,
+        type_id: u32,
+        gc_fields: Vec<Arc<dyn FieldDescr>>,
+    ) -> DescrRef {
         Arc::new(TestSizeDescr {
             size,
             type_id,
@@ -4122,7 +4128,7 @@ mod tests {
             w_class: None,
             headerless: true,
             non_moving: false,
-            gc_fields: Vec::new(),
+            gc_fields,
         })
     }
 
@@ -4836,6 +4842,88 @@ mod tests {
             null_offsets,
             vec![32],
             "SETFIELD_GC at ofs=24 must drop the pending-zero at ofs=24; only ofs=32 remains"
+        );
+    }
+
+    /// `handle_new_fixedsize` records delayed zeros for headerless NEW too:
+    /// leftover `gc_fielddescrs` flush as NULL stores at the next can-collect
+    /// / end-of-trace point when the allocator does not zero-fill.
+    #[test]
+    fn test_headerless_new_flushes_delayed_setfields() {
+        let mut rw = make_rewriter();
+        rw.malloc_zero_filled = false;
+        let gc_fields = vec![ref_field_descr_at(0), ref_field_descr_at(8)];
+        let descr = headerless_size_descr_with_gc_fields(16, 78, gc_fields);
+        let ops = vec![
+            Op::with_descr(OpCode::New, &[], descr),
+            Op::new(OpCode::Jump, &[]),
+        ];
+
+        let (result, _consts, _gcrefs) = rw.rewrite_ops_with_constants(&ops, &ConstMap::default());
+
+        assert!(
+            result
+                .iter()
+                .any(|o| o.opcode == OpCode::CallMallocNurseryHeaderless),
+            "headerless NEW must stay on CallMallocNurseryHeaderless, got {result:?}"
+        );
+        let mut seen_offsets: Vec<i64> = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GcStore)
+            .filter(|o| o.arg(2).to_opref().inline_const_bits() == Some(0))
+            .map(|o| {
+                o.arg(1)
+                    .to_opref()
+                    .inline_const_bits()
+                    .expect("inline ConstInt")
+            })
+            .collect();
+        seen_offsets.sort();
+        assert_eq!(
+            seen_offsets,
+            vec![0, 8],
+            "headerless pending-zero flush must emit one NULL store per GC field, got {result:?}"
+        );
+    }
+
+    /// An explicit SETFIELD_GC still cancels the matching delayed zero on a
+    /// headerless NEW, so the flush does not re-zero a field the caller wrote.
+    #[test]
+    fn test_headerless_consider_setfield_gc_drops_overwritten_offset() {
+        let mut rw = make_rewriter();
+        rw.malloc_zero_filled = false;
+        let gc_fields = vec![ref_field_descr_at(0), ref_field_descr_at(8)];
+        let descr = headerless_size_descr_with_gc_fields(16, 78, gc_fields);
+        let val = OpRef::const_ptr(majit_ir::GcRef(0x1234));
+        let new_op = Op::with_descr(OpCode::New, &[], descr);
+        new_op.pos().set(OpRef::ref_op(0));
+        let ops = vec![
+            new_op,
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[ro(OpRef::ref_op(0)), ro(val)],
+                ref_field_descr_ref_at(0),
+            ),
+            Op::new(OpCode::Jump, &[]),
+        ];
+
+        let (result, _consts, _gcrefs) = rw.rewrite_ops_with_constants(&ops, &ConstMap::default());
+
+        let null_offsets: Vec<i64> = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GcStore)
+            .filter(|o| o.arg(2).to_opref().inline_const_bits() == Some(0))
+            .map(|o| {
+                o.arg(1)
+                    .to_opref()
+                    .inline_const_bits()
+                    .expect("inline ConstInt")
+            })
+            .collect();
+        assert_eq!(
+            null_offsets,
+            vec![8],
+            "headerless SETFIELD_GC at ofs=0 must drop that pending-zero; only ofs=8 remains"
         );
     }
 
