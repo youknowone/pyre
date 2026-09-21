@@ -1415,31 +1415,12 @@ pub(crate) fn fbw_foriter_inflight_mark_attempt(body: InflightForiterBody) {
 /// committed while several FOR_ITER items are in flight is "after" every one
 /// of them — re-running ANY of their bodies on delivery re-applies it — so
 /// mark every active entry.
-///
-/// Unjournaled writes must not reach this mark: abort first with
-/// [`fbw_abort_unrecoverable_foriter_body_effect`] so the consume can still
-/// be restored.  This flag remains for effects discovered only after the
-/// residual has already run (a user-frame odometer bump).
 pub(crate) fn fbw_mark_foriter_body_effect_since_consume() {
     FBW_FORITER_INFLIGHT.with(|c| {
         for entry in c.borrow_mut().iter_mut() {
             entry.body_effect_since_consume = true;
         }
     });
-}
-
-/// Give up the walk before an unrecoverable FOR_ITER body effect executes.
-///
-/// `convert_and_run_from_pyjitpl` resumes at the abort pc with the same
-/// values (`_copy_data_from_miframe` `setposition`), so an abort cannot
-/// consume an iterator item.  This walk executes residuals against the live
-/// heap; once an unjournaled residual has run, both a rewound cursor (double)
-/// and a dropped item (lost iteration) are wrong.  Stopping before that
-/// residual runs leaves only journaled effects, which
-/// [`fbw_store_journal_rollback`] undoes, and [`fbw_foriter_inflight_take`]
-/// then restores the cursor on its `!committed_effect` arm.
-pub(crate) fn fbw_abort_unrecoverable_foriter_body_effect(pc: usize) -> DispatchError {
-    DispatchError::ForiterUnrecoverableBodyEffect { pc }
 }
 
 /// Drop every in-flight FOR_ITER entry (#32 S2): a committed branch-flush has

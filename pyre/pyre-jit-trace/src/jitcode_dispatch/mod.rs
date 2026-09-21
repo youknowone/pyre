@@ -2954,12 +2954,6 @@ pub enum DispatchError {
     /// rewind it and a deliver re-run would double it, so the walk declines BEFORE
     /// the commit and the location interprets permanently (`AbortPermanent`).
     InplaceContainerMutationUnsupported { pc: usize },
-    /// An in-flight FOR_ITER body was about to execute an unjournaled residual
-    /// (a Void / mutator-tagged write the store, list-append, and cell-store
-    /// journals do not cover).  Abort before that residual runs so
-    /// [`fbw_store_journal_rollback`] can undo the recoverable effects and
-    /// [`fbw_foriter_inflight_take`] can restore the iterator cursor.
-    ForiterUnrecoverableBodyEffect { pc: usize },
     /// Exception-edge bridge: `call_jit` routed the exc edge (published the
     /// standing exception and declined to hand the guard to the blackhole), but
     /// this frame carries no `catch_exception` covering the raise — a state the
@@ -3073,7 +3067,6 @@ impl DispatchError {
             Self::InplaceContainerMutationUnsupported { .. } => {
                 "InplaceContainerMutationUnsupported"
             }
-            Self::ForiterUnrecoverableBodyEffect { .. } => "ForiterUnrecoverableBodyEffect",
             Self::ExcEdgeNoInFrameCatch { .. } => "ExcEdgeNoInFrameCatch",
             Self::TraceTooLong { .. } => "TraceTooLong",
             Self::SegmentTraceSnapshotUnavailable { .. } => "SegmentTraceSnapshotUnavailable",
@@ -3141,7 +3134,6 @@ impl DispatchError {
             | Self::UnfoldableListAppendResidualUnsupported { pc, .. }
             | Self::BranchGuardUnrestorableKeptStackPermanent { pc, .. }
             | Self::InplaceContainerMutationUnsupported { pc, .. }
-            | Self::ForiterUnrecoverableBodyEffect { pc, .. }
             | Self::ExcEdgeNoInFrameCatch { pc, .. }
             | Self::TraceTooLong { pc, .. }
             | Self::SegmentTraceSnapshotUnavailable { pc, .. }

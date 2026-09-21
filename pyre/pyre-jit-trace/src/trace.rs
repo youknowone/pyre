@@ -7028,18 +7028,6 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 // location can never trace soundly — interpret it permanently
                 // (the loop runs correctly under the interpreter).
                 DE::InplaceContainerMutationUnsupported { .. } => TraceAction::AbortPermanent,
-                // Gave up before an unjournaled FOR_ITER body residual ran, so
-                // the abort epilogue can restore the iterator cursor.  Decline
-                // the green key: the same body reaches the same residual on
-                // every retrace.
-                DE::ForiterUnrecoverableBodyEffect { .. } => {
-                    fbw_decline(crate::driver::make_green_key(
-                        w_code,
-                        start_pc,
-                        is_being_profiled,
-                    ));
-                    TraceAction::Abort
-                }
                 DE::AbortPermanentMarkerReached { .. } => TraceAction::AbortPermanent,
                 DE::GuardSnapshotVableUntyped { .. }
                 | DE::MayForceNullRefArgUnsupported { .. }

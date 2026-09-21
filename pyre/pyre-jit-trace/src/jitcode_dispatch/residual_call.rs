@@ -4230,19 +4230,16 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // to be safer than.
     let writes_gc_liveness_root_only =
         helper == majit_ir::RuntimeHelperKind::ClearInFlightException;
-    let body_effect_candidate = !provably_side_effect_free
-        && !is_idempotent_gc_barrier
-        && !is_loop_var_binding_store
-        && !writes_gc_liveness_root_only
-        && writes_live_heap
-        && fbw_foriter_inflight_active();
     // Store / list-append journals (and the namespace journal for
     // `StoreName` / `StoreGlobal` / `DeleteName` / `DeleteGlobal`) have
     // rollback entry points; executing those residuals is recoverable.
-    // An unjournaled Void / mutator residual is not: abort before it runs
-    // so [`fbw_foriter_inflight_take`] can still restore the cursor.
-    // This gate is ahead of the vable token stamp below, matching the
-    // nested-residual decline: a declined residual must not strand a token.
+    // A transparent helper sub-walk (`write_cell`, `binary_value_from_tag`,
+    // …) is not a Python frame: its Void write-barrier residuals belong to
+    // the journaled outer store, not to the FOR_ITER body of the live
+    // frame.  Marking either class as `body_effect_since_consume` makes
+    // [`fbw_foriter_inflight_take`] refuse delivery and skip the cursor
+    // restore, which is how a module-level `for` over journaled STORE_NAME
+    // cells lost iterations.
     let residual_will_be_journaled = inplace_list_journal.is_some()
         || list_append_journal.is_some()
         || matches!(
@@ -4252,17 +4249,14 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                 | majit_ir::RuntimeHelperKind::DeleteName
                 | majit_ir::RuntimeHelperKind::DeleteGlobal
         );
-    if body_effect_candidate && !residual_will_be_journaled {
-        if fbw_debug_abort_enabled() {
-            eprintln!(
-                "[fbw-foriter] abort before unrecoverable body effect \
-                 (helper={helper:?} extraeffect={:?} result_type={:?} pc={op_pc})",
-                ei.extraeffect,
-                call_descr.result_type(),
-            );
-        }
-        return Err(fbw_abort_unrecoverable_foriter_body_effect(op_pc));
-    }
+    let body_effect_candidate = !provably_side_effect_free
+        && !is_idempotent_gc_barrier
+        && !is_loop_var_binding_store
+        && !writes_gc_liveness_root_only
+        && writes_live_heap
+        && fbw_foriter_inflight_active()
+        && !residual_will_be_journaled
+        && !ctx.fbw_mode.transparent_helper_subwalk;
     // `vinfo.tracing_before_residual_call(virtualizable)`
     // heap half: every decline gate has now passed, so the helper WILL
     // execute — set TOKEN_TRACING_RESCALL on the active virtualizable so a
@@ -5047,7 +5041,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // nothing but the never-double guarantee.
     let entered_user_frame = user_frame_snapshot
         .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before);
-    if entered_user_frame {
+    if body_effect_candidate || entered_user_frame {
         if fbw_debug_abort_enabled() {
             eprintln!(
                 "[fbw-foriter] body effect committed since consume (helper={helper:?} \
