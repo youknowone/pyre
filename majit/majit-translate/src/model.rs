@@ -3477,7 +3477,7 @@ pub fn remove_dead_aggregates(graph: &mut FunctionGraph) -> usize {
 /// corresponding identity is `StructId`; a bare leaf match is not admissible
 /// because two modules may define the same leaf.  Exact string hits remain
 /// valid for synthetic/test layouts that have no StructId registration.
-fn registered_struct_layout<'a>(
+pub(crate) fn registered_struct_layout<'a>(
     owner: &str,
     struct_field_attrs: &'a std::collections::HashMap<String, Vec<(String, ValueType)>>,
 ) -> Option<&'a Vec<(String, ValueType)>> {
@@ -4869,9 +4869,13 @@ pub fn fuse_boxing_alloc(
 
     let fused = sites.len();
     let fused_aggregates: Vec<_> = sites.iter().map(|site| site.aggregate.clone()).collect();
-    // Rewrite in reverse (block, op) order so the per-site `insert` does not
-    // shift the indices of not-yet-processed sites in the same block.
-    for site in sites.into_iter().rev() {
+    // Rewrite highest `(block, op)` first so an insert does not shift
+    // not-yet-processed rewrite indices. Removals of earlier `new_uninit` /
+    // `ptr::write` still shift remaining sites; update those indices after
+    // each mutation. Uninit-box rewrite locations are `assume_init`, which
+    // can invert allocation order inside one block.
+    sites.sort_by_key(|site| (site.block, site.op));
+    while let Some(site) = sites.pop() {
         let inserted = usize::from(site.w_class.is_some()) + site.payloads.len();
         {
             let block = &mut graph.blocks[site.block];
@@ -4909,6 +4913,16 @@ pub fn fuse_boxing_alloc(
                 );
             }
         }
+        for remaining in &mut sites {
+            if remaining.block == site.block && remaining.op > site.op {
+                remaining.op += inserted;
+            }
+            for (sbi, soi) in &mut remaining.dead_ops {
+                if *sbi == site.block && *soi > site.op {
+                    *soi += inserted;
+                }
+            }
+        }
         let mut dead = site.dead_ops;
         for (dbi, doi) in &mut dead {
             if *dbi == site.block && *doi > site.op {
@@ -4921,6 +4935,16 @@ pub fn fuse_boxing_alloc(
                 continue;
             }
             graph.blocks[dbi].operations.remove(doi);
+            for remaining in &mut sites {
+                if remaining.block == dbi && remaining.op > doi {
+                    remaining.op -= 1;
+                }
+                for (sbi, soi) in &mut remaining.dead_ops {
+                    if *sbi == dbi && *soi > doi {
+                        *soi -= 1;
+                    }
+                }
+            }
         }
     }
     sink_fused_boxing_aggregates_at_raw_writes(graph, &fused_aggregates);
@@ -9528,6 +9552,146 @@ mod tests {
                         || is_assume_init_path(segments, args)
             )),
             "new_uninit / ptr::write / assume_init must not survive the fusion: {ops:#?}"
+        );
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_two_same_block_uninit_clusters_with_reversed_assume_init_order() {
+        // Allocate A then B, but `assume_init` B before A. Rewrite locations
+        // are the `assume_init` ops, so discovery order and rewrite order
+        // disagree; removing A's earlier `new_uninit` must not leave B's
+        // rewrite index stale.
+        fn push_uninit_cluster(
+            graph: &mut FunctionGraph,
+            entry: crate::model::BlockId,
+            bits: u64,
+            ty_addr: i64,
+        ) -> crate::flowspace::model::Variable {
+            let v = graph
+                .push_op_var(entry, OpKind::ConstFloat(bits), true)
+                .unwrap();
+            let header = push_boxing_header(graph, entry, ty_addr);
+            let agg = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Call {
+                        target: CallTarget::synthetic_transparent_ctor("W_FloatObject"),
+                        args: crate::model::call_args(vec![]),
+                        result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.push_op_var(
+                entry,
+                OpKind::FieldWrite {
+                    base: agg.clone(),
+                    field: FieldDescriptor {
+                        name: "ob_header".into(),
+                        owner_root: Some("W_FloatObject".into()),
+                        owner_id: None,
+                        base_is_deref: None,
+                        taken_by_address: false,
+                    },
+                    value: LinkArg::Value(header),
+                    ty: ValueType::Ref(None),
+                },
+                false,
+            );
+            graph.push_op_var(
+                entry,
+                OpKind::FieldWrite {
+                    base: agg.clone(),
+                    field: FieldDescriptor {
+                        name: "floatval".into(),
+                        owner_root: Some("W_FloatObject".into()),
+                        owner_id: None,
+                        base_is_deref: None,
+                        taken_by_address: false,
+                    },
+                    value: LinkArg::Value(v),
+                    ty: ValueType::Ref(None),
+                },
+                false,
+            );
+            let uninit = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Call {
+                        target: CallTarget::function_path(["alloc", "boxed", "Box", "new_uninit"]),
+                        args: crate::model::call_args(vec![]),
+                        result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path(["core", "ptr", "write"]),
+                    args: crate::model::call_args(vec![uninit.clone(), agg]),
+                    result_ty: ValueType::Void,
+                },
+                false,
+            );
+            uninit
+        }
+
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let uninit_a = push_uninit_cluster(&mut graph, entry, 0.0f64.to_bits(), 4357049520);
+        let uninit_b = push_uninit_cluster(&mut graph, entry, 1.0f64.to_bits(), 4357049521);
+        let ret_b = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path(["boxed", "Box", "assume_init"]),
+                    args: crate::model::call_args(vec![uninit_b]),
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let ret_a = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path(["boxed", "Box", "assume_init"]),
+                    args: crate::model::call_args(vec![uninit_a]),
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            entry,
+            OpKind::Call {
+                target: CallTarget::function_path(["keep_both"]),
+                args: crate::model::call_args(vec![ret_a, ret_b]),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.set_return(entry, None);
+
+        let fused = fuse_boxing_alloc(&mut graph, &numeric_boxing_attrs());
+        assert_eq!(fused, 2, "both reversed-order uninit clusters must fuse");
+        let nwv = graph
+            .block(entry)
+            .operations
+            .iter()
+            .filter(|op| matches!(op.kind, OpKind::NewWithVtable { .. }))
+            .count();
+        assert_eq!(nwv, 2, "each cluster must emit NewWithVtable");
+        assert!(
+            !graph.block(entry).operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, args, .. }
+                    if is_box_new_uninit_path(segments, args)
+                        || is_core_ptr_write_path(segments, args)
+                        || is_assume_init_path(segments, args)
+            )),
+            "new_uninit / ptr::write / assume_init must not survive reversed-order fusion"
         );
     }
 

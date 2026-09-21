@@ -3122,15 +3122,13 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             .map_err(LowerError::Unsupported)?;
         }
         let closure_select_rewritten = closure_select_outcome.rewritten;
-        let disc_combinator_rewritten = if lo.disc_combinator_sites.is_empty() {
-            0
-        } else {
+        if !lo.disc_combinator_sites.is_empty() {
             rewire_disc_combinator_sites(
                 &mut lo.graph,
                 &lo.disc_combinator_sites,
                 static_addrs.error_carrier,
-            )
-        };
+            );
+        }
         // The `(a..=b).contains(&x)` fold (`front::range_contains`) splices
         // the residual `contains` method call in place with native
         // `bitand(le(a, x), ge(b, x))` compares and removes the paired
@@ -3168,6 +3166,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || from_size_align_expect_rewritten > 0
             || option_try_stats.rewritten > 0
             || result_try_stats.rewritten > 0
+            || !lo.result_try_sites.is_empty()
             || bool_then_rewritten > 0
             || slice_first_rewritten > 0
             || slice_get_rewritten > 0
@@ -3179,7 +3178,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || result_as_ref_rewritten > 0
             || map_or_rewritten > 0
             || closure_select_rewritten > 0
-            || disc_combinator_rewritten > 0
+            || !lo.disc_combinator_sites.is_empty()
         {
             crate::model::clear_unreachable_blocks(&mut lo.graph);
         }
@@ -4052,6 +4051,16 @@ fn boxing_cluster_ctor_results(graph: &FunctionGraph) -> std::collections::HashS
             cluster.extend(args.iter().filter_map(LinkArg::as_variable).cloned());
         }
     }
+    let mut incoming: std::collections::HashMap<crate::model::BlockId, Vec<(usize, usize)>> =
+        std::collections::HashMap::new();
+    for (pred_idx, pred) in graph.blocks.iter().enumerate() {
+        for (link_idx, link) in pred.exits.iter().enumerate() {
+            incoming
+                .entry(link.target)
+                .or_default()
+                .push((pred_idx, link_idx));
+        }
+    }
     let mut growing = true;
     while growing {
         growing = false;
@@ -4060,16 +4069,15 @@ fn boxing_cluster_ctor_results(graph: &FunctionGraph) -> std::collections::HashS
                 if !cluster.contains(arg) {
                     continue;
                 }
-                for pred in &graph.blocks {
-                    for link in &pred.exits {
-                        if link.target != block.id {
-                            continue;
-                        }
-                        if let Some(v) = link.args.get(slot).and_then(LinkArg::as_variable)
-                            && cluster.insert(v.clone())
-                        {
-                            growing = true;
-                        }
+                let Some(preds) = incoming.get(&block.id) else {
+                    continue;
+                };
+                for &(pred_idx, link_idx) in preds {
+                    let link = &graph.blocks[pred_idx].exits[link_idx];
+                    if let Some(v) = link.args.get(slot).and_then(LinkArg::as_variable)
+                        && cluster.insert(v.clone())
+                    {
+                        growing = true;
                     }
                 }
             }
@@ -12071,13 +12079,6 @@ impl<'a> Lowering<'a> {
                     // already rewrites to `newlist()` / `ll_newemptylist`.
                     (
                         vec!["vec".to_string(), "Vec".to_string(), "new".to_string()],
-                        None,
-                    )
-                } else if args.len() == 2 && is_alloc_vec_push_segments(&segments) {
-                    // `Vec::push` is list append.  The adapter already maps
-                    // `vec::Vec::push` onto `getattr(recv, "append")`.
-                    (
-                        vec!["vec".to_string(), "Vec".to_string(), "push".to_string()],
                         None,
                     )
                 } else if args.len() == 2
@@ -30427,14 +30428,6 @@ fn is_alloc_vec_new_segments(segments: &[String]) -> bool {
     )
 }
 
-fn is_alloc_vec_push_segments(segments: &[String]) -> bool {
-    matches!(
-        segments,
-        [a, b, c, d]
-            if a == "alloc" && b == "vec" && (c == "<Impl>" || c == "Vec") && d == "push"
-    )
-}
-
 fn is_core_option_method(path: &str, leaf: &str) -> bool {
     matches!(
         path.split("::").collect::<Vec<_>>().as_slice(),
@@ -34036,18 +34029,6 @@ mod tests {
             "<Impl>".into(),
             "with_capacity".into(),
         ]));
-        assert!(super::is_alloc_vec_push_segments(&[
-            "alloc".into(),
-            "vec".into(),
-            "<Impl>".into(),
-            "push".into(),
-        ]));
-        assert!(!super::is_alloc_vec_push_segments(&[
-            "alloc".into(),
-            "vec".into(),
-            "<Impl>".into(),
-            "push_str".into(),
-        ]));
     }
 
     #[test]
@@ -34373,7 +34354,7 @@ mod tests {
             .iter()
             .find_map(|op| match &op.kind {
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     args,
                     ..
                 } if segments.as_slice() == ["slice", "index"] => {
@@ -34605,6 +34586,77 @@ mod tests {
             .filter(|op| matches!(&op.kind, OpKind::New { .. }))
             .count();
         assert_eq!(news, 0);
+    }
+
+    #[test]
+    fn declined_disc_combinator_leaves_disconnected_blocks_that_cleanup_removes() {
+        let mut graph = FunctionGraph::new("result_map_missing_closure");
+        let entry = graph.startblock;
+        let recv = graph
+            .push_op_var(entry, OpKind::ConstInt(0), true)
+            .expect("receiver");
+        let result = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::method("map", Some("core::result::Result".to_string())),
+                    args: crate::model::call_args(vec![recv]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("map");
+        let cont = graph.create_block();
+        graph.set_goto(entry, cont, vec![]);
+        graph.set_return(cont, None);
+        let site = super::DiscCombinatorSite {
+            kind: super::DiscCombinator::ResultMap,
+            result_var: result,
+            recv_owner: "core::result::Result".into(),
+            recv_tag0_owner: "core::result::Result::Ok".into(),
+            recv_tag1_owner: "core::result::Result::Err".into(),
+            payload0_ty: ValueType::Int,
+            payload1_ty: ValueType::Int,
+            payload0_class: None,
+            payload1_class: None,
+            result_owner: "core::result::Result".into(),
+            result_tag0_owner: "core::result::Result::Ok".into(),
+            result_tag1_owner: "core::result::Result::Err".into(),
+            result_payload0_ty: ValueType::Int,
+            result_payload1_ty: ValueType::Int,
+            result_payload0_class: None,
+            result_payload1_class: None,
+            call_once_owner: String::new(),
+            args_tuple_suffix: String::new(),
+            call_result_ty: ValueType::Int,
+            call_result_class: None,
+        };
+        let live_before: std::collections::HashSet<_> =
+            graph.blocks.iter().map(|block| block.id).collect();
+        let rewritten = super::rewire_disc_combinator_sites(
+            &mut graph,
+            &[site],
+            crate::ErrorCarrierSpec::default(),
+        );
+        assert_eq!(rewritten, 0);
+        let leftovers: Vec<_> = graph
+            .blocks
+            .iter()
+            .filter(|block| !live_before.contains(&block.id))
+            .map(|block| block.id)
+            .collect();
+        assert!(
+            !leftovers.is_empty(),
+            "a declined combinator site must leave the blocks it created"
+        );
+        crate::model::clear_unreachable_blocks(&mut graph);
+        for id in leftovers {
+            let block = graph.block(id);
+            assert!(
+                block.operations.is_empty() && block.exits.is_empty(),
+                "clear_unreachable_blocks must empty disconnected decline leftovers"
+            );
+        }
     }
 
     fn boxing_cluster_with_nested_header() -> FunctionGraph {
@@ -39399,7 +39451,7 @@ mod tests {
     }
 
     #[test]
-    fn vec_push_retargets_to_list_append() {
+    fn vec_push_is_not_retargeted_to_list_append() {
         let vec_ty = serde_json::json!({"Adt": {"id": {"Adt": 0}, "generics": {"types": []}}});
         let i64_ty = serde_json::json!({"Literal": {"Int": "I64"}});
         let unit = serde_json::json!({
@@ -39421,9 +39473,24 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath { segments, .. },
                     ..
+                } if segments == &[
+                    "alloc".to_string(),
+                    "vec".to_string(),
+                    "<Impl>".to_string(),
+                    "push".to_string()
+                ]
+            )),
+            "alloc::vec::<Impl>::push must stay residual; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
                 } if segments == &["vec".to_string(), "Vec".to_string(), "push".to_string()]
             )),
-            "alloc::vec::<Impl>::push must retarget to vec::Vec::push; ops={ops:?}"
+            "Vec::push must not be a front-end list-append retarget; ops={ops:?}"
         );
     }
 
