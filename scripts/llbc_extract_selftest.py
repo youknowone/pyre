@@ -327,13 +327,14 @@ def run_charon_target_dir(engine) -> int:
     try:
         default = engine.charon_cargo_target_dir(root)
         expect(
-            "default target sits under the shared build dir",
-            default == root.parent / ".pyre-build" / "charon-target",
+            "default target is keyed by the worktree basename",
+            default == root.parent / ".pyre-build" / "charon-target" / root.name,
         )
         os.environ["PYRE_SHARED_BUILD"] = str(root / "shared")
         expect(
             "PYRE_SHARED_BUILD relocates the target",
-            engine.charon_cargo_target_dir(root) == root / "shared" / "charon-target",
+            engine.charon_cargo_target_dir(root)
+            == root / "shared" / "charon-target" / root.name,
         )
         os.environ["CHARON_TARGET_DIR"] = str(root / "explicit")
         expect(
