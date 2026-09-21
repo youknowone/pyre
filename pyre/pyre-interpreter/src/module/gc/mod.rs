@@ -16,7 +16,7 @@ use majit_gc::GcStepTransition;
 use pyre_object::*;
 use rustpython_wtf8::Wtf8;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, Ordering};
 
 pub mod hook;
 
@@ -1015,38 +1015,74 @@ fn format_gc_stat(value: i64) -> String {
     }
 }
 
+/// The `GcStats` class, and the slot the collector reads it through.
+/// Published once and never replaced, which is what lets the walk read it
+/// without coordinating with the thread that built it.
+static GC_STATS_TYPE: AtomicPtr<PyObjectRef> = AtomicPtr::new(std::ptr::null_mut());
+
+/// Forward the `GcStats` class.  `app_referents` keeps it in its own module
+/// dict; here it lives off-heap, so the collector has to be handed it.
+/// Between one `get_stats()` instance and the next this slot is the class's
+/// only owner, and a major collection that misses it sweeps the class out
+/// from under the instance the following call mints.
+pub(crate) fn walk_gc_stats_type_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
+    let slot = GC_STATS_TYPE.load(Ordering::Acquire);
+    if slot.is_null() {
+        return;
+    }
+    unsafe { visitor(&mut *slot) };
+}
+
 fn gc_stats_public_type() -> PyObjectRef {
-    static TYPE: OnceLock<usize> = OnceLock::new();
-    *TYPE.get_or_init(|| {
-        // PyPy `app_referents.GcStats` is an ordinary app-level class, not a
-        // second interpreter TypeDef beside `referents.W_GcStats`.  Build it
-        // through `type.__new__`, so it inherits object's allocator and owns
-        // the normal mapdict layout an app-level class receives.
-        let roots = pyre_object::gc_roots::push_roots();
-        let ns_slot = roots.base();
-        let _ = roots.pin_root(pyre_object::w_dict_new());
-        let store = |name: &str, value: PyObjectRef| unsafe {
-            pyre_object::w_dict_setitem_str_no_proxy(roots.get(ns_slot), name, value);
-        };
-        store("__module__", w_str_new("gc"));
-        store(
-            "__init__",
-            crate::make_builtin_function_with_arity("__init__", gc_stats_public_init, 2),
-        );
-        store(
-            "__repr__",
-            crate::make_builtin_function_with_arity("__repr__", gc_stats_repr, 1),
-        );
-        let bases_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = roots.pin_root(pyre_object::w_tuple_new(vec![crate::typedef::w_object()]));
-        let args = [
-            crate::typedef::w_type(),
-            w_str_new("GcStats"),
-            pyre_object::gc_roots::shadow_stack_get(bases_slot),
-            roots.get(ns_slot),
-        ];
-        crate::builtins::type_descr_new(&args).expect("construct app_referents.GcStats") as usize
-    }) as PyObjectRef
+    let published = GC_STATS_TYPE.load(Ordering::Acquire);
+    if !published.is_null() {
+        return unsafe { *published };
+    }
+    // PyPy `app_referents.GcStats` is an ordinary app-level class, not a
+    // second interpreter TypeDef beside `referents.W_GcStats`.  Build it
+    // through `type.__new__`, so it inherits object's allocator and owns
+    // the normal mapdict layout an app-level class receives.
+    let roots = pyre_object::gc_roots::push_roots();
+    let ns_slot = roots.base();
+    let _ = roots.pin_root(pyre_object::w_dict_new());
+    let store = |name: &str, value: PyObjectRef| unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(roots.get(ns_slot), name, value);
+    };
+    store("__module__", w_str_new("gc"));
+    store(
+        "__init__",
+        crate::make_builtin_function_with_arity("__init__", gc_stats_public_init, 2),
+    );
+    store(
+        "__repr__",
+        crate::make_builtin_function_with_arity("__repr__", gc_stats_repr, 1),
+    );
+    let bases_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(pyre_object::w_tuple_new(vec![crate::typedef::w_object()]));
+    let args = [
+        crate::typedef::w_type(),
+        w_str_new("GcStats"),
+        pyre_object::gc_roots::shadow_stack_get(bases_slot),
+        roots.get(ns_slot),
+    ];
+    let type_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots
+        .pin_root(crate::builtins::type_descr_new(&args).expect("construct app_referents.GcStats"));
+    let created = Box::into_raw(Box::new(roots.get(type_slot)));
+    match GC_STATS_TYPE.compare_exchange(
+        std::ptr::null_mut(),
+        created,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => unsafe { *created },
+        Err(existing) => {
+            // A loser's class is an ordinary unreachable object the collector
+            // takes; the host allocation is this call's to release.
+            drop(unsafe { Box::from_raw(created) });
+            unsafe { *existing }
+        }
+    }
 }
 
 fn gc_stats_public_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
