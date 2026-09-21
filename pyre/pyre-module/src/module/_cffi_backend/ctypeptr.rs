@@ -5,7 +5,7 @@
 //! `W_CTypeArray` all share `W_CType`'s typedef, so their overrides are the
 //! `match` arms below rather than four classes.
 
-use crate::PyError;
+use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
 use std::collections::HashSet;
 use std::ffi::{CString, c_char, c_int, c_void};
@@ -73,7 +73,7 @@ pub unsafe fn pointer_convert_from_object(
             if !(ct.has(ctypeobj::CTypeFlags::ONEBYTE_PTR)
                 && other.has(ctypeobj::CTypeFlags::ONEBYTE_PTR))
             {
-                crate::warn::warn_category(
+                pyre_interpreter::warn::warn_category(
                     &format!(
                         "implicit cast from '{}' to '{}' will be forbidden in the future (check that the types are as you expect; use an explicit ffi.cast() if they are correct)",
                         other.name(),
@@ -129,7 +129,7 @@ pub unsafe fn convert_array_from_object(
 ) -> Result<(), PyError> {
     let item = item_of(ct)?;
     if unsafe { pyre_object::pyobject::is_list(w_ob) || pyre_object::pyobject::is_tuple(w_ob) } {
-        let items = crate::baseobjspace::unpackiterable(w_ob, -1)?;
+        let items = pyre_interpreter::baseobjspace::unpackiterable(w_ob, -1)?;
         if !ct.within_bounds(items.len() as i64) {
             return Err(PyError::index_error(format!(
                 "too many initializers for '{}' (got {})",
@@ -353,7 +353,7 @@ pub fn array_newp(
 pub fn new_array_length(ct: &W_CType, w_value: PyObjectRef) -> Result<(PyObjectRef, i64), PyError> {
     unsafe {
         if pyre_object::pyobject::is_list(w_value) || pyre_object::pyobject::is_tuple(w_value) {
-            let length = crate::runtime_ops::sequence_len(w_value)? as i64;
+            let length = pyre_interpreter::runtime_ops::sequence_len(w_value)? as i64;
             return Ok((w_value, length));
         }
         if pyre_object::bytesobject::is_bytes(w_value) {
@@ -377,16 +377,17 @@ pub fn new_array_length(ct: &W_CType, w_value: PyObjectRef) -> Result<(PyObjectR
     }
     // `__index__` is arbitrary Python, so the name the TypeError reports is
     // read off the object before the conversion rather than after it.
-    let got = crate::type_methods::arg_type_name(w_value);
-    let length = crate::baseobjspace::index_int_w_preserve_negative(w_value).map_err(|e| {
-        if e.kind == crate::PyErrorKind::TypeError {
-            PyError::type_error(format!(
-                "expected new array length or list/tuple/str, not {got}"
-            ))
-        } else {
-            e
-        }
-    })?;
+    let got = pyre_interpreter::type_methods::arg_type_name(w_value);
+    let length =
+        pyre_interpreter::baseobjspace::index_int_w_preserve_negative(w_value).map_err(|e| {
+            if e.kind == pyre_interpreter::PyErrorKind::TypeError {
+                PyError::type_error(format!(
+                    "expected new array length or list/tuple/str, not {got}"
+                ))
+            } else {
+                e
+            }
+        })?;
     if length < 0 {
         return Err(PyError::value_error("negative array length"));
     }
@@ -432,7 +433,7 @@ pub fn string(w_cdata: PyObjectRef, maxlen: i64) -> Result<PyObjectRef, PyError>
         return Err(ctypeobj::unexpected_string_argument(ct));
     }
     if cdata.ptr == 0 {
-        let w_repr = crate::builtins::builtin_repr(&[w_cdata])?;
+        let w_repr = pyre_interpreter::builtins::builtin_repr(&[w_cdata])?;
         return Err(PyError::runtime_error(format!(
             "cannot use string() on {}",
             unsafe { pyre_object::w_str_get_value(w_repr) }
@@ -628,7 +629,7 @@ unsafe fn prepare_pointer_call_argument(
     let item = item_of(ct)?;
     let length = unsafe {
         if pyre_object::pyobject::is_list(w_init) || pyre_object::pyobject::is_tuple(w_init) {
-            crate::runtime_ops::sequence_len(w_init)? as i64
+            pyre_interpreter::runtime_ops::sequence_len(w_init)? as i64
         } else if pyre_object::bytesobject::is_bytes(w_init) {
             // From a string, we add the null terminator.
             pyre_object::bytesobject::w_bytes_data(w_init).len() as i64 + 1
@@ -710,7 +711,7 @@ fn lock_open_files() -> std::sync::MutexGuard<'static, HashSet<usize>> {
 
 /// The C `FILE` this stream already holds, if it holds one this module made.
 fn held_file(w_fileobj: PyObjectRef) -> Option<usize> {
-    let w_held = crate::baseobjspace::getdictvalue_native(w_fileobj, CFFI_FILEOBJ_SLOT)?;
+    let w_held = pyre_interpreter::baseobjspace::getdictvalue_native(w_fileobj, CFFI_FILEOBJ_SLOT)?;
     if !unsafe { pyre_object::pyobject::is_int(w_held) } {
         return None;
     }
@@ -721,7 +722,10 @@ fn held_file(w_fileobj: PyObjectRef) -> Option<usize> {
 /// `W_CTypePointer.prepare_file` — a stream answers with the C `FILE` over
 /// it, and anything else with a null pointer.
 fn prepare_file(w_ob: PyObjectRef) -> Result<*mut c_void, PyError> {
-    if !crate::baseobjspace::isinstance(w_ob, crate::module::_io::io_base_type())? {
+    if !pyre_interpreter::baseobjspace::isinstance(
+        w_ob,
+        pyre_interpreter::module::_io::io_base_type(),
+    )? {
         return Ok(std::ptr::null_mut());
     }
     prepare_file_argument(w_ob)
@@ -732,22 +736,23 @@ fn prepare_file_argument(w_fileobj: PyObjectRef) -> Result<*mut c_void, PyError>
     let roots = pyre_object::gc_roots::push_roots();
     let file_slot = roots.base();
     let _ = roots.pin_root(w_fileobj);
-    crate::baseobjspace::call_method_result(roots.get(file_slot), "flush", &[])?;
+    pyre_interpreter::baseobjspace::call_method_result(roots.get(file_slot), "flush", &[])?;
     if let Some(held) = held_file(roots.get(file_slot)) {
         return Ok(held as *mut c_void);
     }
 
-    let w_fd = crate::baseobjspace::call_method_result(roots.get(file_slot), "fileno", &[])?;
+    let w_fd =
+        pyre_interpreter::baseobjspace::call_method_result(roots.get(file_slot), "fileno", &[])?;
     let fd_slot = file_slot + 1;
     let _ = roots.pin_root(w_fd);
-    let fd = crate::baseobjspace::int_w(roots.get(fd_slot))?;
+    let fd = pyre_interpreter::baseobjspace::int_w(roots.get(fd_slot))?;
     if fd < 0 {
         return Err(PyError::value_error("file has no OS file descriptor"));
     }
-    let w_mode = crate::baseobjspace::getattr_str(roots.get(file_slot), "mode")?;
+    let w_mode = pyre_interpreter::baseobjspace::getattr_str(roots.get(file_slot), "mode")?;
     let mode_slot = fd_slot + 1;
     let _ = roots.pin_root(w_mode);
-    let mode = crate::baseobjspace::text_w(roots.get(mode_slot))?;
+    let mode = pyre_interpreter::baseobjspace::text_w(roots.get(mode_slot))?;
     let mode = CString::new(mode.as_bytes())
         .map_err(|_| PyError::value_error("embedded null character"))?;
 
@@ -769,7 +774,7 @@ fn prepare_file_argument(w_fileobj: PyObjectRef) -> Result<*mut c_void, PyError>
     lock_open_files().insert(address);
     let handle_slot = mode_slot + 1;
     let _ = roots.pin_root(pyre_object::w_int_new(address as i64));
-    crate::baseobjspace::setdictvalue(
+    pyre_interpreter::baseobjspace::setdictvalue(
         roots.get(file_slot),
         CFFI_FILEOBJ_SLOT,
         roots.get(handle_slot),
@@ -783,7 +788,11 @@ pub fn close_cffi_fileobj(w_fileobj: PyObjectRef) {
         return;
     };
     lock_open_files().remove(&address);
-    let _ = crate::baseobjspace::setdictvalue(w_fileobj, CFFI_FILEOBJ_SLOT, pyre_object::w_none());
+    let _ = pyre_interpreter::baseobjspace::setdictvalue(
+        w_fileobj,
+        CFFI_FILEOBJ_SLOT,
+        pyre_object::w_none(),
+    );
     unsafe { fclose(address as *mut c_void) };
 }
 

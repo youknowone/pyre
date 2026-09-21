@@ -914,7 +914,7 @@ unsafe fn queue_simplequeue_destructor(obj_addr: usize) {
 #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
 unsafe fn cffi_cdata_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_cffi_backend::cdataobj::w_cdata_dealloc(
+        pyre_module::module::_cffi_backend::cdataobj::w_cdata_dealloc(
             obj_addr as pyre_object::PyObjectRef,
         )
     };
@@ -925,7 +925,7 @@ unsafe fn cffi_cdata_destructor(obj_addr: usize) {
 #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
 unsafe fn cffi_library_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_cffi_backend::libraryobj::w_library_dealloc(
+        pyre_module::module::_cffi_backend::libraryobj::w_library_dealloc(
             obj_addr as pyre_object::PyObjectRef,
         )
     };
@@ -935,7 +935,7 @@ unsafe fn cffi_library_destructor(obj_addr: usize) {
 #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
 unsafe fn cffi_ffi_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_cffi_backend::ffi_obj::w_ffi_dealloc(
+        pyre_module::module::_cffi_backend::ffi_obj::w_ffi_dealloc(
             obj_addr as pyre_object::PyObjectRef,
         )
     };
@@ -945,7 +945,7 @@ unsafe fn cffi_ffi_destructor(obj_addr: usize) {
 #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
 unsafe fn cffi_lib_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_cffi_backend::lib_obj::w_lib_dealloc(
+        pyre_module::module::_cffi_backend::lib_obj::w_lib_dealloc(
             obj_addr as pyre_object::PyObjectRef,
         )
     };
@@ -4487,22 +4487,22 @@ fn build_gc() -> Box<MiniMarkGC> {
     #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
     {
         for descriptor in [
-            <pyre_interpreter::module::_cffi_backend::ctypeobj::W_CType
+            <pyre_module::module::_cffi_backend::ctypeobj::W_CType
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-            <pyre_interpreter::module::_cffi_backend::ctypearray::W_CDataIter
+            <pyre_module::module::_cffi_backend::ctypearray::W_CDataIter
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         ] {
             register_pyre_class(&mut gc, &mut pytype_to_tid, descriptor);
         }
         {
-            let descr = <pyre_interpreter::module::_cffi_backend::cdataobj::W_CData
+            let descr = <pyre_module::module::_cffi_backend::cdataobj::W_CData
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
             let tid = register_pyre_class_with_pressure(
                 &mut gc,
                 &mut pytype_to_tid,
                 descr,
                 Some(std::mem::offset_of!(
-                    pyre_interpreter::module::_cffi_backend::cdataobj::W_CData,
+                    pyre_module::module::_cffi_backend::cdataobj::W_CData,
                     special_memory_pressure
                 )),
             );
@@ -4511,19 +4511,19 @@ fn build_gc() -> Box<MiniMarkGC> {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_interpreter::module::_cffi_backend::ctypestruct::W_CField
+            <pyre_module::module::_cffi_backend::ctypestruct::W_CField
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         {
-            let descr = <pyre_interpreter::module::_cffi_backend::libraryobj::W_Library
+            let descr = <pyre_module::module::_cffi_backend::libraryobj::W_Library
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
             let tid = register_pyre_class(&mut gc, &mut pytype_to_tid, descr);
             gc.types.set_destructor(tid, cffi_library_destructor);
         }
         for descriptor in [
-            <pyre_interpreter::module::_cffi_backend::allocator::W_Allocator
+            <pyre_module::module::_cffi_backend::allocator::W_Allocator
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-            <pyre_interpreter::module::_cffi_backend::cbuffer::MiniBuffer
+            <pyre_module::module::_cffi_backend::cbuffer::MiniBuffer
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         ] {
             register_pyre_class(&mut gc, &mut pytype_to_tid, descriptor);
@@ -4531,11 +4531,11 @@ fn build_gc() -> Box<MiniMarkGC> {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_interpreter::module::_cffi_backend::func::OffsetInBytes
+            <pyre_module::module::_cffi_backend::func::OffsetInBytes
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         {
-            let descr = <pyre_interpreter::module::_cffi_backend::ffi_obj::W_FFIObject
+            let descr = <pyre_module::module::_cffi_backend::ffi_obj::W_FFIObject
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
             let tid = register_pyre_class(&mut gc, &mut pytype_to_tid, descr);
             gc.types.set_destructor(tid, cffi_ffi_destructor);
@@ -4543,19 +4543,19 @@ fn build_gc() -> Box<MiniMarkGC> {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_interpreter::module::_cffi_backend::realize_c_type::W_RawFuncType
+            <pyre_module::module::_cffi_backend::realize_c_type::W_RawFuncType
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         {
-            let descr = <pyre_interpreter::module::_cffi_backend::lib_obj::W_LibObject
+            let descr = <pyre_module::module::_cffi_backend::lib_obj::W_LibObject
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
             let tid = register_pyre_class(&mut gc, &mut pytype_to_tid, descr);
             gc.types.set_destructor(tid, cffi_lib_destructor);
         }
         for descriptor in [
-            <pyre_interpreter::module::_cffi_backend::cglob::W_GlobSupport
+            <pyre_module::module::_cffi_backend::cglob::W_GlobSupport
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-            <pyre_interpreter::module::_cffi_backend::wrapper::W_FunctionWrapper
+            <pyre_module::module::_cffi_backend::wrapper::W_FunctionWrapper
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         ] {
             register_pyre_class(&mut gc, &mut pytype_to_tid, descriptor);

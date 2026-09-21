@@ -1,7 +1,7 @@
 //! Saved foreign-call error state — PyPy:
 //! `pypy/module/_cffi_backend/cerrno.py`.
 
-use crate::PyError;
+use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
 use std::cell::Cell;
 
@@ -19,7 +19,7 @@ pub fn get_errno(_args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 
 /// `cerrno.py set_errno`.
 pub fn set_errno(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let value = crate::baseobjspace::int_w(args[0])? as i32;
+    let value = pyre_interpreter::baseobjspace::int_w(args[0])? as i32;
     SAVED_ALT_ERRNO.with(|saved| saved.set(value));
     Ok(pyre_object::w_none())
 }
@@ -43,7 +43,7 @@ pub fn errno_after() {
     // itself overwrite the Windows error state.
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     let last_error = rustpython_host_env::windows::get_last_error();
-    let value = crate::builtins::crt_errno();
+    let value = pyre_interpreter::builtins::crt_errno();
     SAVED_ALT_ERRNO.with(|saved| saved.set(value));
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     let _ = rustpython_host_env::ctypes::set_last_error(last_error);
@@ -53,7 +53,7 @@ pub fn errno_after() {
 #[cfg(windows)]
 pub fn getwinerror(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let code = match args.first() {
-        Some(&w_code) => crate::baseobjspace::int_w(w_code)? as i32,
+        Some(&w_code) => pyre_interpreter::baseobjspace::int_w(w_code)? as i32,
         None => -1,
     };
     let code = if code == -1 {
@@ -71,7 +71,7 @@ pub fn getwinerror(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let code_slot = roots.base();
     let _ = roots.pin_root(pyre_object::w_int_new(code as i64));
-    let message = crate::PyError::win32_strerror(code);
+    let message = pyre_interpreter::PyError::win32_strerror(code);
     // `w_tuple_new` allocates, so the message needs a root of its own rather
     // than only the Rust local.
     let _ = roots.pin_root(pyre_object::w_str_new_managed(&message));

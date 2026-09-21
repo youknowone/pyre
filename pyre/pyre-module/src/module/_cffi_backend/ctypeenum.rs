@@ -5,7 +5,7 @@
 //! only the two enumerator maps; [`ctypeobj::CTypeFlags::ENUM`] is what selects the
 //! mixin's overrides.
 
-use crate::PyError;
+use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
 
 use super::ctypeobj::{self, W_CType};
@@ -32,9 +32,11 @@ fn enumerator_of(ct: &W_CType, w_value: PyObjectRef) -> Result<Option<String>, P
     if ct.enumvalues2erators.is_null() {
         return Ok(None);
     }
-    match crate::baseobjspace::getitem(ct.enumvalues2erators, w_value) {
-        Ok(w_name) => Ok(Some(crate::baseobjspace::text_w(w_name)?.to_string())),
-        Err(e) if e.kind == crate::PyErrorKind::KeyError => Ok(None),
+    match pyre_interpreter::baseobjspace::getitem(ct.enumvalues2erators, w_value) {
+        Ok(w_name) => Ok(Some(
+            pyre_interpreter::baseobjspace::text_w(w_name)?.to_string(),
+        )),
+        Err(e) if e.kind == pyre_interpreter::PyErrorKind::KeyError => Ok(None),
         Err(e) => Err(e),
     }
 }
@@ -73,7 +75,7 @@ pub unsafe fn string(ct: &W_CType, cdata: *const u8) -> Result<PyObjectRef, PyEr
 /// `str(value)` for a boxed enum value, which may be wider than a machine
 /// word when the base type is an unsigned 64-bit one.
 fn value_str(w_value: PyObjectRef) -> Result<String, PyError> {
-    let w_text = crate::builtins::builtin_str(&[w_value])?;
+    let w_text = pyre_interpreter::builtins::builtin_str(&[w_value])?;
     Ok(unsafe { pyre_object::w_str_get_value(w_text) }.to_string())
 }
 
@@ -89,14 +91,21 @@ pub fn copy_map(w_dict: PyObjectRef) -> Result<PyObjectRef, PyError> {
     let _ = roots.pin_root(w_copy);
     let dict_slot = copy_slot + 1;
     let _ = roots.pin_root(w_dict);
-    let keys = crate::baseobjspace::fixedview(roots.get(dict_slot), -1)?;
+    let keys = pyre_interpreter::baseobjspace::fixedview(roots.get(dict_slot), -1)?;
     let keys_slot = pyre_object::gc_roots::shadow_stack_len();
     for &key in &keys {
         let _ = roots.pin_root(key);
     }
     for i in 0..keys.len() {
-        let w_value = crate::baseobjspace::getitem(roots.get(dict_slot), roots.get(keys_slot + i))?;
-        crate::baseobjspace::setitem(roots.get(copy_slot), roots.get(keys_slot + i), w_value)?;
+        let w_value = pyre_interpreter::baseobjspace::getitem(
+            roots.get(dict_slot),
+            roots.get(keys_slot + i),
+        )?;
+        pyre_interpreter::baseobjspace::setitem(
+            roots.get(copy_slot),
+            roots.get(keys_slot + i),
+            w_value,
+        )?;
     }
     Ok(roots.get(copy_slot))
 }

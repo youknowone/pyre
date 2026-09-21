@@ -1,7 +1,7 @@
 //! The module-level functions — PyPy:
 //! `pypy/module/_cffi_backend/func.py`.
 
-use crate::PyError;
+use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
 use std::sync::OnceLock;
 
@@ -10,7 +10,7 @@ use super::ctypeobj;
 use super::newtype;
 
 /// `func.py OffsetInBytes`.
-#[crate::pyre_class("_cffi_backend._OffsetInBytes")]
+#[pyre_interpreter::pyre_class("_cffi_backend._OffsetInBytes")]
 #[derive(Default)]
 pub struct OffsetInBytes {
     /// `OffsetInBytes.bytes`.
@@ -23,10 +23,10 @@ static OFFSET_IN_BYTES_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
 
 fn offset_in_bytes_type() -> PyObjectRef {
     *OFFSET_IN_BYTES_TYPE_OBJ.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type_with_layout(
+        let tp = pyre_interpreter::typedef::make_builtin_type_with_layout(
             "_cffi_backend._OffsetInBytes",
             |_| {},
-            crate::typedef::w_object(),
+            pyre_interpreter::typedef::w_object(),
             <OffsetInBytes as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
         );
         pyre_object::pyobject::set_instantiate(
@@ -52,7 +52,7 @@ pub(super) fn bind_entry_point(
     argnames: &[&'static str],
     required: usize,
 ) -> Result<Vec<PyObjectRef>, PyError> {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
     if positional.len() > argnames.len() {
         let takes = if required == argnames.len() {
             format!("takes {} positional arguments", argnames.len())
@@ -68,11 +68,17 @@ pub(super) fn bind_entry_point(
             "{name}() {takes} but {given} {were} given"
         )));
     }
-    crate::builtins::kwarg_reject_unknown(kwargs, argnames, name)?;
+    pyre_interpreter::builtins::kwarg_reject_unknown(kwargs, argnames, name)?;
     let mut bound = Vec::with_capacity(argnames.len());
     for (index, argname) in argnames.iter().enumerate() {
-        let value =
-            crate::builtins::bind_pos_or_kw(positional, kwargs, index, argname, name, index + 1)?;
+        let value = pyre_interpreter::builtins::bind_pos_or_kw(
+            positional,
+            kwargs,
+            index,
+            argname,
+            name,
+            index + 1,
+        )?;
         bound.push(value.unwrap_or(pyre_object::PY_NULL));
     }
     let missing: Vec<&str> = argnames[..required]
@@ -124,20 +130,22 @@ pub fn cast(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 
 /// `func.py callback`.
 pub fn callback(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
     if positional.len() > 4 {
         return Err(PyError::type_error(format!(
             "callback() takes at most 4 arguments ({} given)",
             positional.len()
         )));
     }
-    crate::builtins::kwarg_reject_unknown(
+    pyre_interpreter::builtins::kwarg_reject_unknown(
         kwargs,
         &["ctype", "callable", "error", "onerror"],
         "callback",
     )?;
     let bind = |slot, name, position| {
-        crate::builtins::bind_pos_or_kw(positional, kwargs, slot, name, "callback", position)
+        pyre_interpreter::builtins::bind_pos_or_kw(
+            positional, kwargs, slot, name, "callback", position,
+        )
     };
     let w_ctype = bind(0, "ctype", 1)?
         .ok_or_else(|| PyError::type_error("callback() missing required argument 'ctype'"))?;
@@ -184,7 +192,7 @@ pub fn alignof(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 /// `func.py getcname`.
 pub fn getcname(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let ct = ctypeobj::ctype_arg(args[0])?;
-    let replace_with = crate::baseobjspace::text_w(args[1])?;
+    let replace_with = pyre_interpreter::baseobjspace::text_w(args[1])?;
     let (name, _) = ct.insert_name(&replace_with, 0);
     Ok(pyre_object::w_str_new_managed(&name))
 }
@@ -193,7 +201,7 @@ pub fn getcname(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 pub fn string(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let a = bind_entry_point(args, "string", &["cdata", "maxlen"], 1)?;
     let maxlen = match optional(&a, 1) {
-        Some(w_maxlen) => crate::baseobjspace::int_w(w_maxlen)?,
+        Some(w_maxlen) => pyre_interpreter::baseobjspace::int_w(w_maxlen)?,
         None => -1,
     };
     ctypeobj::string(a[0], maxlen)
@@ -201,7 +209,7 @@ pub fn string(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 
 /// `func.py unpack`.
 pub fn unpack(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    cdataobj::unpack(args[0], crate::baseobjspace::int_w(args[1])?)
+    cdataobj::unpack(args[0], pyre_interpreter::baseobjspace::int_w(args[1])?)
 }
 
 /// `func.py typeoffsetof`.
@@ -213,7 +221,7 @@ pub fn typeoffsetof(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         2,
     )?;
     let following = match optional(&a, 2) {
-        Some(w_following) => crate::baseobjspace::int_w(w_following)? != 0,
+        Some(w_following) => pyre_interpreter::baseobjspace::int_w(w_following)? != 0,
         None => false,
     };
     let (w_ctype, offset) = direct_typeoffsetof(a[0], a[1], following)?;
@@ -254,10 +262,10 @@ pub fn direct_typeoffsetof(
                 "with a field name argument, expected a struct or union ctype",
             ));
         }
-        let fieldname = crate::baseobjspace::text_w(w_field_or_index)?;
+        let fieldname = pyre_interpreter::baseobjspace::text_w(w_field_or_index)?;
         return super::ctypestruct::typeoffsetof_field(owner, fieldname);
     }
-    let Ok(index) = crate::baseobjspace::int_w(w_field_or_index) else {
+    let Ok(index) = pyre_interpreter::baseobjspace::int_w(w_field_or_index) else {
         return Err(PyError::type_error("field name or array index expected"));
     };
     // `W_CTypePointer.typeoffsetof_index`, which an array reaches through
@@ -296,7 +304,7 @@ pub fn rawaddressof(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
             "expected a cdata struct/union/array/pointer object",
         ));
     }
-    let offset = crate::baseobjspace::int_w(a[2])?;
+    let offset = pyre_interpreter::baseobjspace::int_w(a[2])?;
     let ptr = cdata.ptr.wrapping_add_signed(offset as isize);
     Ok(cdataobj::new_cdata(ptr, a[0]))
 }
@@ -321,14 +329,15 @@ pub fn from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         ));
     }
     let require_writable = match optional(&a, 2) {
-        Some(w) => crate::baseobjspace::int_w(w)? != 0,
+        Some(w) => pyre_interpreter::baseobjspace::int_w(w)? != 0,
         None => false,
     };
     let (ptr, buffersize, owner) = if require_writable {
-        let (data, owner, _) = unsafe { crate::builtins::fileio_writebuf(roots.get(object_slot)) }?;
+        let (data, owner, _) =
+            unsafe { pyre_interpreter::builtins::fileio_writebuf(roots.get(object_slot)) }?;
         (data.as_mut_ptr(), data.len() as i64, owner)
     } else {
-        let data = unsafe { crate::builtins::acquire_readbuf(roots.get(object_slot)) }?;
+        let data = unsafe { pyre_interpreter::builtins::acquire_readbuf(roots.get(object_slot)) }?;
         (
             data.as_ptr().cast_mut(),
             data.len() as i64,
@@ -337,14 +346,14 @@ pub fn from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     };
     let owner_slot = object_slot + 1;
     let _ = roots.pin_root(owner);
-    let held = unsafe { crate::builtins::buffer_export_incref(roots.get(owner_slot)) };
+    let held = unsafe { pyre_interpreter::builtins::buffer_export_incref(roots.get(owner_slot)) };
 
     let arraylength = if ct.kind != ctypeobj::KIND_ARRAY {
         buffersize
     } else if ct.length >= 0 {
         if buffersize < ct.size {
             if held {
-                unsafe { crate::builtins::buffer_export_decref(roots.get(owner_slot)) };
+                unsafe { pyre_interpreter::builtins::buffer_export_decref(roots.get(owner_slot)) };
             }
             return Err(PyError::value_error(format!(
                 "buffer is too small ({buffersize} bytes) for '{}' ({} bytes)",
@@ -361,10 +370,10 @@ pub fn from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
             buffersize / itemsize
         } else {
             if held {
-                unsafe { crate::builtins::buffer_export_decref(roots.get(owner_slot)) };
+                unsafe { pyre_interpreter::builtins::buffer_export_decref(roots.get(owner_slot)) };
             }
             return Err(PyError::new(
-                crate::PyErrorKind::ZeroDivisionError,
+                pyre_interpreter::PyErrorKind::ZeroDivisionError,
                 format!(
                     "from_buffer('{}', ..): the actual length of the array cannot be computed",
                     ct.name()
@@ -391,7 +400,7 @@ pub fn gcp(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let destructor_slot = cdata_slot + 1;
     let _ = roots.pin_root(a[1]);
     let size = match optional(&a, 2) {
-        Some(w_size) => crate::baseobjspace::int_w(w_size)?,
+        Some(w_size) => pyre_interpreter::baseobjspace::int_w(w_size)?,
         None => 0,
     };
     cdataobj::with_gc(roots.get(cdata_slot), roots.get(destructor_slot), size)
@@ -403,14 +412,14 @@ pub fn offset_in_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     if !unsafe { pyre_object::bytesobject::is_bytes(a[0]) } {
         return Err(PyError::type_error(format!(
             "must be bytes, not {}",
-            crate::type_methods::arg_type_name(a[0])
+            pyre_interpreter::type_methods::arg_type_name(a[0])
         )));
     }
     let _ = offset_in_bytes_type();
     let roots = pyre_object::gc_roots::push_roots();
     let bytes_slot = roots.base();
     let _ = roots.pin_root(a[0]);
-    let offset = crate::baseobjspace::int_w(a[1])?;
+    let offset = pyre_interpreter::baseobjspace::int_w(a[1])?;
     let obj = OffsetInBytes::allocate_stable(OffsetInBytes {
         offset,
         ..Default::default()
@@ -430,7 +439,7 @@ pub fn memmove(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let src_slot = roots.base();
     let _ = roots.pin_root(args[1]);
-    let n = crate::baseobjspace::int_w(args[2])?;
+    let n = pyre_interpreter::baseobjspace::int_w(args[2])?;
     if n < 0 {
         return Err(PyError::value_error("negative size"));
     }
@@ -442,7 +451,8 @@ pub fn memmove(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let dest = if let Some(cdata) = W_CData::from_obj(args[0]) {
         unsafe_escaping_ptr_for_ptr_or_array(cdata)?
     } else {
-        dest_buffer = Some(unsafe { crate::builtins::WritableBuffer::acquire(args[0]) }?);
+        dest_buffer =
+            Some(unsafe { pyre_interpreter::builtins::WritableBuffer::acquire(args[0]) }?);
         let slice = unsafe { dest_buffer.as_mut().expect("just filled").as_mut_slice() };
         // `_fetch_as_write_buffer`'s non-raw arm writes with `setitem`, which
         // refuses an index past the end, so a request longer than the buffer
@@ -459,7 +469,9 @@ pub fn memmove(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let src = if let Some(cdata) = W_CData::from_obj(roots.get(src_slot)) {
         unsafe_escaping_ptr_for_ptr_or_array(cdata)?.cast_const()
     } else {
-        let Some(buffer) = crate::baseobjspace::simple_buffer_bytes(roots.get(src_slot))? else {
+        let Some(buffer) =
+            pyre_interpreter::baseobjspace::simple_buffer_bytes(roots.get(src_slot))?
+        else {
             return Err(PyError::type_error("expected a readable buffer"));
         };
         // `getslice(0, 1, n)` bounds the same read upstream.
@@ -517,7 +529,7 @@ pub fn get_types(_args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 
 /// `newtype.py new_primitive_type`.
 pub fn new_primitive_type(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let name = crate::baseobjspace::text_w(args[0])?;
+    let name = pyre_interpreter::baseobjspace::text_w(args[0])?;
     newtype::new_primitive_type(&name)
 }
 
@@ -539,16 +551,16 @@ pub fn new_array_type(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 
 /// `newtype.py new_struct_type`.
 pub fn new_struct_type(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    Ok(newtype::new_struct_type(crate::baseobjspace::text_w(
-        args[0],
-    )?))
+    Ok(newtype::new_struct_type(
+        pyre_interpreter::baseobjspace::text_w(args[0])?,
+    ))
 }
 
 /// `newtype.py new_union_type`.
 pub fn new_union_type(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    Ok(newtype::new_union_type(crate::baseobjspace::text_w(
-        args[0],
-    )?))
+    Ok(newtype::new_union_type(
+        pyre_interpreter::baseobjspace::text_w(args[0])?,
+    ))
 }
 
 /// `newtype.py complete_struct_or_union` — the third argument is ignored, as
@@ -570,7 +582,7 @@ pub fn complete_struct_or_union(args: &[PyObjectRef]) -> Result<PyObjectRef, PyE
     )?;
     let int_arg = |i: usize, default: i64| -> Result<i64, PyError> {
         match optional(&a, i) {
-            Some(w) => crate::baseobjspace::int_w(w),
+            Some(w) => pyre_interpreter::baseobjspace::int_w(w),
             None => Ok(default),
         }
     };
@@ -587,7 +599,7 @@ pub fn complete_struct_or_union(args: &[PyObjectRef]) -> Result<PyObjectRef, PyE
 
 /// `newtype.py new_enum_type`.
 pub fn new_enum_type(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let name = crate::baseobjspace::text_w(args[0])?;
+    let name = pyre_interpreter::baseobjspace::text_w(args[0])?;
     newtype::new_enum_type(name, args[1], args[2], args[3])
 }
 
@@ -600,11 +612,11 @@ pub fn new_function_type(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         2,
     )?;
     let ellipsis = match optional(&a, 2) {
-        Some(w) => crate::baseobjspace::int_w(w)? != 0,
+        Some(w) => pyre_interpreter::baseobjspace::int_w(w)? != 0,
         None => false,
     };
     let abi = match optional(&a, 3) {
-        Some(w) => crate::baseobjspace::int_w(w)?,
+        Some(w) => pyre_interpreter::baseobjspace::int_w(w)?,
         None => super::interp_cffi_backend::default_abi() as i64,
     };
     newtype::new_function_type(a[0], a[1], ellipsis, abi)
@@ -614,7 +626,7 @@ pub fn new_function_type(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 pub fn load_library(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let a = bind_entry_point(args, "load_library", &["filename", "flags"], 1)?;
     let flags = match optional(&a, 1) {
-        Some(w) => crate::baseobjspace::int_w(w)?,
+        Some(w) => pyre_interpreter::baseobjspace::int_w(w)?,
         None => 0,
     };
     super::libraryobj::load_library(a[0], flags)

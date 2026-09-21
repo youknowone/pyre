@@ -6221,7 +6221,7 @@ pub fn setdictvalue_native(obj: PyObjectRef, name: &str, value: PyObjectRef) -> 
 /// remaining `__import__` descent wall (`__majit_stringbuilder_new`,
 /// `W_*_USER_GC_TYPE_ID`, `Result.unwrap_or`).
 #[majit_macros::dont_look_inside]
-pub(crate) fn getdictvalue_native(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+pub fn getdictvalue_native(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
     getdictvalue(obj, name).unwrap_or(None)
 }
 
@@ -11529,7 +11529,7 @@ pub(crate) unsafe fn lookup_in_type_where_wtf8(
 }
 
 #[inline]
-pub(crate) unsafe fn lookup_in_type_where(w_type: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+pub unsafe fn lookup_in_type_where(w_type: PyObjectRef, name: &str) -> Option<PyObjectRef> {
     lookup_in_type_where_wtf8(w_type, Wtf8::new(name))
 }
 
@@ -14734,11 +14734,7 @@ unsafe fn coerce_to_list_for_args(value: PyObjectRef) -> Result<PyObjectRef, PyE
 ///         return True
 ///     return False
 /// ```
-pub(crate) fn setdictvalue(
-    obj: PyObjectRef,
-    name: &str,
-    value: PyObjectRef,
-) -> Result<bool, PyError> {
+pub fn setdictvalue(obj: PyObjectRef, name: &str, value: PyObjectRef) -> Result<bool, PyError> {
     // mapdict.py `MapdictDictSupport.setdictvalue` overrides the
     // `W_Root` default above for every mapdict carrier:
     //

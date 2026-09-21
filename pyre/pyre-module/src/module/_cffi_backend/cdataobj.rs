@@ -6,7 +6,7 @@
 //! typedef of its own, so the family is one Python type here as well; the
 //! subclass is carried as [`W_CData::flavor`].
 
-use crate::PyError;
+use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
 use std::sync::OnceLock;
 
@@ -37,7 +37,7 @@ pub const FLAVOR_NEW_NONSTD: i64 = 8;
 pub const FLAVOR_CALLBACK: i64 = 9;
 
 /// `cdataobj.py W_CData` and the RPython subclasses sharing its typedef.
-#[crate::pyre_class("_cffi_backend._CDataBase")]
+#[pyre_interpreter::pyre_class("_cffi_backend._CDataBase")]
 // `W_CData._immutable_fields_` names `_ptr` and `ctype`.  Declaring `ctype`
 // is what lets a call through a constant cdata fold its function type, and
 // with it the `cif_descr` behind it; declaring `ptr` folds the address the
@@ -149,7 +149,8 @@ impl W_CData {
                 let roots = pyre_object::gc_roots::push_roots();
                 let keepalive_slot = roots.base();
                 let _ = roots.pin_root(self.w_keepalive);
-                let w_repr = crate::builtins::builtin_repr(&[roots.get(keepalive_slot)])?;
+                let w_repr =
+                    pyre_interpreter::builtins::builtin_repr(&[roots.get(keepalive_slot)])?;
                 Ok(format!("handle to {}", unsafe {
                     pyre_object::w_str_get_value(w_repr)
                 }))
@@ -159,7 +160,7 @@ impl W_CData {
                 if self.w_keepalive.is_null() {
                     return Ok("buffer RELEASED".to_string());
                 }
-                let type_name = crate::type_methods::arg_type_name(self.w_keepalive);
+                let type_name = pyre_interpreter::type_methods::arg_type_name(self.w_keepalive);
                 if ct.kind == ctypeobj::KIND_ARRAY {
                     Ok(format!(
                         "buffer len {} from '{}' object",
@@ -174,7 +175,7 @@ impl W_CData {
                 let roots = pyre_object::gc_roots::push_roots();
                 let callable_slot = roots.base();
                 let _ = roots.pin_root(self.w_keepalive);
-                let w_repr = crate::builtins::builtin_repr(&[roots.get(callable_slot)])?;
+                let w_repr = pyre_interpreter::builtins::builtin_repr(&[roots.get(callable_slot)])?;
                 Ok(format!("calling {}", unsafe {
                     pyre_object::w_str_get_value(w_repr)
                 }))
@@ -190,7 +191,7 @@ pub fn cdata_arg(w_cdata: PyObjectRef) -> Result<&'static mut W_CData, PyError> 
         Some(cdata) => Ok(cdata),
         None => Err(PyError::type_error(format!(
             "expected a cdata object, got '{}'",
-            crate::type_methods::arg_type_name(w_cdata)
+            pyre_interpreter::type_methods::arg_type_name(w_cdata)
         ))),
     }
 }
@@ -305,7 +306,7 @@ pub fn new_cdata_from_buffer(
         .w_destructor = roots.get(owner_slot);
     pyre_object::gc_hook::try_gc_write_barrier_managed(obj.cast::<u8>());
     if export_held {
-        crate::executioncontext::register_finalizer(obj);
+        pyre_interpreter::executioncontext::register_finalizer(obj);
     }
     obj
 }
@@ -325,7 +326,7 @@ pub fn new_cdata_gcp(
         .expect("new_cdata_full returns a cdata")
         .w_destructor = roots.get(destructor_slot);
     pyre_object::gc_hook::try_gc_write_barrier_managed(obj.cast::<u8>());
-    crate::executioncontext::register_finalizer(obj);
+    pyre_interpreter::executioncontext::register_finalizer(obj);
     obj
 }
 
@@ -346,7 +347,7 @@ pub fn new_cdata_nonstd(
         .w_destructor = roots.get(free_slot);
     pyre_object::gc_hook::try_gc_write_barrier_managed(obj.cast::<u8>());
     if !roots.get(free_slot).is_null() {
-        crate::executioncontext::register_finalizer(obj);
+        pyre_interpreter::executioncontext::register_finalizer(obj);
     }
     obj
 }
@@ -525,7 +526,7 @@ pub fn raw_alloc(size: i64, zero: bool) -> Result<usize, PyError> {
     };
     if ptr.is_null() {
         return Err(PyError::new(
-            crate::PyErrorKind::MemoryError,
+            pyre_interpreter::PyErrorKind::MemoryError,
             "out of memory",
         ));
     }
@@ -566,6 +567,30 @@ pub fn finalize(w_cdata: PyObjectRef) -> Result<(), PyError> {
     }
 }
 
+/// `Some(calls_python)` when `obj` is a buffer/GCP/nonstd cdata this path
+/// handles. `None` leaves the object to the rest of the finalizer queue.
+pub fn ec_finalizer_kind(obj: PyObjectRef) -> Option<bool> {
+    let cdata = W_CData::from_obj(obj)?;
+    if !matches!(
+        cdata.flavor,
+        FLAVOR_FROM_BUFFER | FLAVOR_GCP | FLAVOR_NEW_NONSTD
+    ) {
+        return None;
+    }
+    Some(matches!(cdata.flavor, FLAVOR_GCP | FLAVOR_NEW_NONSTD))
+}
+
+/// Run [`finalize`] and write an unraisable if it raises.
+pub fn run_ec_finalize(obj: PyObjectRef) {
+    if let Err(mut error) = finalize(obj) {
+        error.write_unraisable(
+            pyre_object::w_none(),
+            rustpython_wtf8::Wtf8::new("Exception ignored in cffi destructor"),
+            obj,
+        );
+    }
+}
+
 /// `W_CDataGCP.invoke_finalizer` and `W_CDataNewNonStd._do_exit`.
 fn invoke_destructor(w_cdata: PyObjectRef) -> Result<(), PyError> {
     let roots = pyre_object::gc_roots::push_roots();
@@ -583,7 +608,7 @@ fn invoke_destructor(w_cdata: PyObjectRef) -> Result<(), PyError> {
     let original_slot = destructor_slot + 1;
     let _ = roots.pin_root(original);
     pyre_object::gc_hook::try_gc_write_barrier_managed(roots.get(cdata_slot).cast::<u8>());
-    crate::call::call_function_impl_result(
+    pyre_interpreter::call::call_function_impl_result(
         roots.get(destructor_slot),
         &[roots.get(original_slot)],
     )?;
@@ -594,7 +619,7 @@ fn invoke_destructor(w_cdata: PyObjectRef) -> Result<(), PyError> {
 fn release_buffer_export(w_cdata: PyObjectRef) -> Result<(), PyError> {
     let cdata = cdata_arg(w_cdata)?;
     if cdata.datasize != 0 && !cdata.w_destructor.is_null() {
-        unsafe { crate::builtins::buffer_export_decref(cdata.w_destructor) };
+        unsafe { pyre_interpreter::builtins::buffer_export_decref(cdata.w_destructor) };
         cdata.datasize = 0;
     }
     cdata.w_keepalive = pyre_object::PY_NULL;
@@ -610,10 +635,10 @@ static CDATA_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
 /// `_cffi_backend._CDataBase`.
 pub fn cdata_type() -> PyObjectRef {
     *CDATA_TYPE_OBJ.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type_with_layout(
+        let tp = pyre_interpreter::typedef::make_builtin_type_with_layout(
             "_cffi_backend._CDataBase",
             init_cdata_type,
-            crate::typedef::w_object(),
+            pyre_interpreter::typedef::w_object(),
             <W_CData as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
         );
         pyre_object::pyobject::set_instantiate(
@@ -634,11 +659,14 @@ fn init_cdata_type(ns: PyObjectRef) {
     // Both are typedef entries in PyPy, so they answer on an instance too.
     store("__module__", pyre_object::w_str_new("_cffi_backend"));
     store("__name__", pyre_object::w_str_new("<cdata>"));
-    store("__weakref__", crate::typedef::make_weakref_descr(ns));
+    store(
+        "__weakref__",
+        pyre_interpreter::typedef::make_weakref_descr(ns),
+    );
     for (name, f, arity) in [
         (
             "__repr__",
-            cdata_repr as crate::gateway::BuiltinCodeFn,
+            cdata_repr as pyre_interpreter::gateway::BuiltinCodeFn,
             1u16,
         ),
         ("__bool__", cdata_bool, 1),
@@ -666,17 +694,17 @@ fn init_cdata_type(ns: PyObjectRef) {
     ] {
         store(
             name,
-            crate::make_builtin_function_with_arity(name, f, arity),
+            pyre_interpreter::make_builtin_function_with_arity(name, f, arity),
         );
     }
     // `__call__` and `__exit__` take a variable number of arguments.
     store(
         "__call__",
-        crate::make_builtin_function("__call__", __majit_wrap_cdata_call),
+        pyre_interpreter::make_builtin_function("__call__", __majit_wrap_cdata_call),
     );
     store(
         "__exit__",
-        crate::make_builtin_function("__exit__", cdata_exit),
+        pyre_interpreter::make_builtin_function("__exit__", cdata_exit),
     );
 }
 
@@ -749,9 +777,9 @@ fn cdata_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     if ct.is_primitive() {
         let w_ob = unsafe { ctypeobj::convert_to_object(ct, cdata.ptr)? };
         if W_CData::from_obj(w_ob).is_none() {
-            return Ok(pyre_object::w_int_new(crate::baseobjspace::hash_w_strict(
-                w_ob,
-            )?));
+            return Ok(pyre_object::w_int_new(
+                pyre_interpreter::baseobjspace::hash_w_strict(w_ob)?,
+            ));
         }
     }
     // Pointers are hashed by address, folded so the always-zero alignment
@@ -810,7 +838,7 @@ pub fn enter_exit(w_cdata: PyObjectRef, exit_now: bool) -> Result<(), PyError> {
     if cdata.flavor == FLAVOR_FROM_BUFFER {
         if exit_now {
             release_buffer_export(w_cdata)?;
-            crate::executioncontext::may_ignore_finalizer(w_cdata);
+            pyre_interpreter::executioncontext::may_ignore_finalizer(w_cdata);
         }
         return Ok(());
     }
@@ -818,7 +846,7 @@ pub fn enter_exit(w_cdata: PyObjectRef, exit_now: bool) -> Result<(), PyError> {
     if cdata.flavor == FLAVOR_GCP {
         if exit_now {
             invoke_destructor(w_cdata)?;
-            crate::executioncontext::may_ignore_finalizer(w_cdata);
+            pyre_interpreter::executioncontext::may_ignore_finalizer(w_cdata);
         }
         return Ok(());
     }
@@ -844,7 +872,7 @@ fn do_exit(w_cdata: PyObjectRef) -> Result<(), PyError> {
             if cdata.datasize >= 0 {
                 add_memory_pressure(w_cdata, -cdata.datasize);
                 cdata.datasize = -1;
-                crate::executioncontext::may_ignore_finalizer(w_cdata);
+                pyre_interpreter::executioncontext::may_ignore_finalizer(w_cdata);
                 // The freed address stays in `ptr`: reading a released
                 // cdata is the caller's error, and `datasize` is what makes
                 // a second release a no-op.
@@ -856,7 +884,7 @@ fn do_exit(w_cdata: PyObjectRef) -> Result<(), PyError> {
                 add_memory_pressure(w_cdata, -cdata.sizeof()?);
             }
             invoke_destructor(w_cdata)?;
-            crate::executioncontext::may_ignore_finalizer(w_cdata);
+            pyre_interpreter::executioncontext::may_ignore_finalizer(w_cdata);
         }
         _ => {}
     }
@@ -878,7 +906,7 @@ pub fn with_gc(
         }
         cdata.w_destructor = pyre_object::PY_NULL;
         pyre_object::gc_hook::try_gc_write_barrier_managed(w_cdata.cast::<u8>());
-        crate::executioncontext::may_ignore_finalizer(w_cdata);
+        pyre_interpreter::executioncontext::may_ignore_finalizer(w_cdata);
         add_memory_pressure(w_cdata, size);
         return Ok(pyre_object::w_none());
     }
@@ -940,10 +968,11 @@ pub fn __majit_wrap_cdata_call(args: &[PyObjectRef]) -> Result<PyObjectRef, PyEr
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[linkme::distributed_slice(pyre_interpreter::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
 #[allow(non_upper_case_globals)]
-static __majit_builtin_wrapper_target_cdata_call: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
+static __majit_builtin_wrapper_target_cdata_call:
+    pyre_interpreter::gateway::BuiltinWrapperDescriptor =
+    pyre_interpreter::gateway::BuiltinWrapperDescriptor {
         path: concat!(module_path!(), "::", stringify!(__majit_wrap_cdata_call)),
         func: __majit_wrap_cdata_call,
     };
@@ -952,7 +981,7 @@ static __majit_builtin_wrapper_target_cdata_call: crate::gateway::BuiltinWrapper
 fn cdata_getattr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let cdata = cdata_arg(args[0])?;
     let ct = cdata.ctype_ref()?;
-    let field = ctypeobj::getcfield(ct, crate::baseobjspace::text_w(args[1])?, "read")?;
+    let field = ctypeobj::getcfield(ct, pyre_interpreter::baseobjspace::text_w(args[1])?, "read")?;
     unsafe { super::ctypestruct::read(field, cdata.ptr as *mut u8, args[0]) }
 }
 
@@ -965,7 +994,11 @@ fn cdata_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let _ = roots.pin_root(args[2]);
     let cdata = cdata_arg(args[0])?;
     let ct = cdata.ctype_ref()?;
-    let field = ctypeobj::getcfield(ct, crate::baseobjspace::text_w(args[1])?, "write")?;
+    let field = ctypeobj::getcfield(
+        ct,
+        pyre_interpreter::baseobjspace::text_w(args[1])?,
+        "write",
+    )?;
     unsafe { super::ctypestruct::write(field, cdata.ptr as *mut u8, roots.get(value_slot))? };
     Ok(pyre_object::w_none())
 }
@@ -1013,7 +1046,7 @@ fn compare_mode(w_self: PyObjectRef, w_other: PyObjectRef) -> Result<CompareMode
 
 fn compare(
     args: &[PyObjectRef],
-    op: crate::bytecode::ComparisonOperator,
+    op: pyre_interpreter::bytecode::ComparisonOperator,
     on_addresses: fn(usize, usize) -> bool,
 ) -> Result<PyObjectRef, PyError> {
     match compare_mode(args[0], args[1])? {
@@ -1021,14 +1054,18 @@ fn compare(
             Ok(pyre_object::boolobject::w_bool_from(on_addresses(a, b)))
         }
         CompareMode::Incomparable => Ok(pyre_object::special::w_not_implemented()),
-        CompareMode::Objects(a, b) => crate::opcode_ops::compare_value(a, b, op),
+        CompareMode::Objects(a, b) => pyre_interpreter::opcode_ops::compare_value(a, b, op),
     }
 }
 
 macro_rules! comparison {
     ($name:ident, $op:ident, $addr:expr) => {
         fn $name(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-            compare(args, crate::bytecode::ComparisonOperator::$op, $addr)
+            compare(
+                args,
+                pyre_interpreter::bytecode::ComparisonOperator::$op,
+                $addr,
+            )
         }
     };
 }
@@ -1049,7 +1086,7 @@ fn cdata_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     if unsafe { pyre_object::sliceobject::is_slice(w_index) } {
         return do_getslice(w_self, w_index);
     }
-    let i = crate::baseobjspace::getindex_w(w_index)?;
+    let i = pyre_interpreter::baseobjspace::getindex_w(w_index)?;
     let cdata = cdata_arg(w_self)?;
     let ct = check_subscript_index(cdata, i)?;
     // `W_CDataPtrToStructOrUnion._do_getitem` — `p[0]` is the struct itself.
@@ -1080,7 +1117,7 @@ fn cdata_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let value_slot = roots.base();
     let _ = roots.pin_root(w_value);
-    let i = crate::baseobjspace::getindex_w(w_index)?;
+    let i = pyre_interpreter::baseobjspace::getindex_w(w_index)?;
     let cdata = cdata_arg(w_self)?;
     let ct = check_subscript_index(cdata, i)?;
     let item = ctypeobj::ctype_at(ct.ctitem)
@@ -1160,11 +1197,11 @@ fn getslicearg(
     if unsafe { pyre_object::pyobject::is_none(roots.get(start_slot)) } {
         return Err(PyError::index_error("slice start must be specified"));
     }
-    let start = crate::baseobjspace::int_w(roots.get(start_slot))?;
+    let start = pyre_interpreter::baseobjspace::int_w(roots.get(start_slot))?;
     if unsafe { pyre_object::pyobject::is_none(roots.get(stop_slot)) } {
         return Err(PyError::index_error("slice stop must be specified"));
     }
-    let stop = crate::baseobjspace::int_w(roots.get(stop_slot))?;
+    let stop = pyre_interpreter::baseobjspace::int_w(roots.get(stop_slot))?;
     if !unsafe { pyre_object::pyobject::is_none(roots.get(step_slot)) } {
         return Err(PyError::index_error("slice with step not supported"));
     }
@@ -1288,11 +1325,11 @@ fn do_setslice(
     // stored before the error names the mismatch.
     let roots = pyre_object::gc_roots::push_roots();
     let iter_slot = roots.base();
-    let _ = roots.pin_root(crate::baseobjspace::iter(w_value)?);
+    let _ = roots.pin_root(pyre_interpreter::baseobjspace::iter(w_value)?);
     let item_slot = iter_slot + 1;
     let _ = roots.pin_root(pyre_object::PY_NULL);
     for i in 0..length {
-        match crate::baseobjspace::next(roots.get(iter_slot)) {
+        match pyre_interpreter::baseobjspace::next(roots.get(iter_slot)) {
             Ok(w_item) => roots.set(item_slot, w_item),
             Err(err) if err.matches_stop_iteration() => {
                 return Err(PyError::value_error(format!(
@@ -1304,7 +1341,7 @@ fn do_setslice(
         let element = target.wrapping_add_signed((i * item_size) as isize);
         unsafe { ctypeobj::convert_from_object(item, element as usize, roots.get(item_slot))? };
     }
-    match crate::baseobjspace::next(roots.get(iter_slot)) {
+    match pyre_interpreter::baseobjspace::next(roots.get(iter_slot)) {
         Ok(_) => Err(PyError::value_error(format!(
             "got more than {length} values to unpack"
         ))),
@@ -1367,7 +1404,7 @@ fn add_or_sub(
     w_other: PyObjectRef,
     sign: i64,
 ) -> Result<PyObjectRef, PyError> {
-    let i = sign * crate::baseobjspace::getindex_w(w_other)?;
+    let i = sign * pyre_interpreter::baseobjspace::getindex_w(w_other)?;
     let cdata = cdata_arg(w_self)?;
     ctypeobj::add(cdata.ctype, cdata.ptr as *mut u8, i)
 }
@@ -1393,7 +1430,7 @@ pub fn unpack(w_cdata: PyObjectRef, length: i64) -> Result<PyObjectRef, PyError>
         return Err(PyError::value_error("'length' cannot be negative"));
     }
     if cdata.ptr == 0 {
-        let w_repr = crate::builtins::builtin_repr(&[w_cdata])?;
+        let w_repr = pyre_interpreter::builtins::builtin_repr(&[w_cdata])?;
         return Err(PyError::runtime_error(format!(
             "cannot use unpack() on {}",
             unsafe { pyre_object::w_str_get_value(w_repr) }

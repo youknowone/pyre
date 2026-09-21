@@ -3568,7 +3568,7 @@ pub(crate) fn make_new_descr_with_doc(
 
 /// Signature-aware [`make_new_descr`] for builtin constructors with keyword
 /// or keyword-only parameters.
-pub(crate) fn make_new_descr_with_signature(
+pub fn make_new_descr_with_signature(
     func: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
     signature: crate::gateway::Signature,
 ) -> PyObjectRef {
@@ -12322,7 +12322,7 @@ fn make_getset_property(
 
 /// `GetSetProperty(fget, fset, fdel)` with explicit `name` — see
 /// `make_getset_descriptor_named` for the typedef.py:58 motivation.
-pub(crate) fn make_getset_property_named(
+pub fn make_getset_property_named(
     fget: pyre_object::PyObjectRef,
     fset: pyre_object::PyObjectRef,
     fdel: pyre_object::PyObjectRef,
@@ -12340,7 +12340,7 @@ pub(crate) fn make_getset_property_named(
 
 /// `GetSetProperty(..., doc=..., name=...)` — the full descriptor payload
 /// used by doc-bearing getsets such as `mapping`, `__dict__`, and `__weakref__`.
-pub(crate) fn make_getset_property_named_doc(
+pub fn make_getset_property_named_doc(
     fget: pyre_object::PyObjectRef,
     fset: pyre_object::PyObjectRef,
     fdel: pyre_object::PyObjectRef,
@@ -23771,12 +23771,8 @@ pub fn buffer_as_bytes_like(obj: PyObjectRef) -> Result<Option<PyObjectRef>, cra
             pyre_object::interp_array::w_array_bytes(obj)
         })));
     }
-    #[cfg(all(
-        feature = "host_env",
-        not(feature = "sandbox"),
-        not(target_arch = "wasm32")
-    ))]
-    if let Some((address, length)) = crate::module::_cffi_backend::cbuffer::mini_buffer_params(obj)
+    if let Some(hooks) = crate::importing::optional_module_hooks()
+        && let Some((address, length)) = (hooks.mini_buffer_params)(obj)
     {
         // A buffer over a NULL cdata is empty, and no slice may be built from
         // a null address even at length zero.

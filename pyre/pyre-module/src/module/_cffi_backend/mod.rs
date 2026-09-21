@@ -7,7 +7,7 @@
 //! declaration parser whose opcode stream is the format a compiled cffi
 //! extension embeds.
 
-crate::pyre_module_init!(interp_cffi_backend);
+pyre_interpreter::pyre_module_init!(interp_cffi_backend);
 
 pub mod allocator;
 pub mod cbuffer;

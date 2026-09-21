@@ -972,7 +972,7 @@ pub use shared_opcode::*;
 ///
 /// A cause already quoted by the message it would be appended to is left out,
 /// since a chain that repeats itself reads as two failures.
-pub(crate) fn with_causes(error: &dyn std::error::Error) -> String {
+pub fn with_causes(error: &dyn std::error::Error) -> String {
     let mut rendered = error.to_string();
     let mut cause = error.source();
     while let Some(source) = cause {
@@ -1124,11 +1124,6 @@ pub fn all_immortal_w_class_only_descriptors()
 pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeAlias> {
     use pyre_object::lltype::PyreClassPyTypeOf;
     use pyre_object::pyobject::subclass_range_alias;
-    #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32"), windows))]
-    const CFFI_FIRST_TYPE_ID: u32 = 199;
-    #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32"), not(windows)))]
-    const CFFI_FIRST_TYPE_ID: u32 = 196;
-
     fn typed<T: PyreClassPyTypeOf>() -> &'static pyre_object::PyType {
         // Every `#[pyre_class]` descriptor points at its macro-emitted static
         // PyType for the program lifetime.
@@ -1235,127 +1230,6 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         // participates in the same rclass hierarchy as every typed IO base.
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
         subclass_range_alias(198, typed::<crate::module::_io::W_WindowsConsoleIO>()),
-        // `_cffi_backend` is absent without `host_env`, on wasm32, and under
-        // `sandbox`, so its thirteen aliases sit at the tail where the active
-        // hierarchy filter can remove them as one contiguous trailing slice.
-        // The module-presence gate matches `module/mod.rs` exactly.
-        #[cfg(all(
-            feature = "host_env",
-            not(feature = "sandbox"),
-            not(target_arch = "wasm32")
-        ))]
-        subclass_range_alias(
-            CFFI_FIRST_TYPE_ID,
-            typed::<crate::module::_cffi_backend::ctypeobj::W_CType>(),
-        ),
-        #[cfg(all(
-            feature = "host_env",
-            not(feature = "sandbox"),
-            not(target_arch = "wasm32")
-        ))]
-        subclass_range_alias(
-            CFFI_FIRST_TYPE_ID + 1,
-            typed::<crate::module::_cffi_backend::ctypearray::W_CDataIter>(),
-        ),
-        #[cfg(all(
-            feature = "host_env",
-            not(feature = "sandbox"),
-            not(target_arch = "wasm32")
-        ))]
-        subclass_range_alias(
-            CFFI_FIRST_TYPE_ID + 2,
-            typed::<crate::module::_cffi_backend::cdataobj::W_CData>(),
-        ),
-        #[cfg(all(
-            feature = "host_env",
-            not(feature = "sandbox"),
-            not(target_arch = "wasm32")
-        ))]
-        subclass_range_alias(
-            CFFI_FIRST_TYPE_ID + 3,
-            typed::<crate::module::_cffi_backend::ctypestruct::W_CField>(),
-        ),
-        #[cfg(all(
-            feature = "host_env",
-            not(feature = "sandbox"),
-            not(target_arch = "wasm32")
-        ))]
-        subclass_range_alias(
-            CFFI_FIRST_TYPE_ID + 4,
-            typed::<crate::module::_cffi_backend::libraryobj::W_Library>(),
-        ),
-        #[cfg(all(
-            feature = "host_env",
-            not(feature = "sandbox"),
-            not(target_arch = "wasm32")
-        ))]
-        subclass_range_alias(
-            CFFI_FIRST_TYPE_ID + 5,
-            typed::<crate::module::_cffi_backend::allocator::W_Allocator>(),
-        ),
-        #[cfg(all(
-            feature = "host_env",
-            not(feature = "sandbox"),
-            not(target_arch = "wasm32")
-        ))]
-        subclass_range_alias(
-            CFFI_FIRST_TYPE_ID + 6,
-            typed::<crate::module::_cffi_backend::cbuffer::MiniBuffer>(),
-        ),
-        #[cfg(all(
-            feature = "host_env",
-            not(feature = "sandbox"),
-            not(target_arch = "wasm32")
-        ))]
-        subclass_range_alias(
-            CFFI_FIRST_TYPE_ID + 7,
-            typed::<crate::module::_cffi_backend::func::OffsetInBytes>(),
-        ),
-        #[cfg(all(
-            feature = "host_env",
-            not(feature = "sandbox"),
-            not(target_arch = "wasm32")
-        ))]
-        subclass_range_alias(
-            CFFI_FIRST_TYPE_ID + 8,
-            typed::<crate::module::_cffi_backend::ffi_obj::W_FFIObject>(),
-        ),
-        #[cfg(all(
-            feature = "host_env",
-            not(feature = "sandbox"),
-            not(target_arch = "wasm32")
-        ))]
-        subclass_range_alias(
-            CFFI_FIRST_TYPE_ID + 9,
-            typed::<crate::module::_cffi_backend::realize_c_type::W_RawFuncType>(),
-        ),
-        #[cfg(all(
-            feature = "host_env",
-            not(feature = "sandbox"),
-            not(target_arch = "wasm32")
-        ))]
-        subclass_range_alias(
-            CFFI_FIRST_TYPE_ID + 10,
-            typed::<crate::module::_cffi_backend::lib_obj::W_LibObject>(),
-        ),
-        #[cfg(all(
-            feature = "host_env",
-            not(feature = "sandbox"),
-            not(target_arch = "wasm32")
-        ))]
-        subclass_range_alias(
-            CFFI_FIRST_TYPE_ID + 11,
-            typed::<crate::module::_cffi_backend::cglob::W_GlobSupport>(),
-        ),
-        #[cfg(all(
-            feature = "host_env",
-            not(feature = "sandbox"),
-            not(target_arch = "wasm32")
-        ))]
-        subclass_range_alias(
-            CFFI_FIRST_TYPE_ID + 12,
-            typed::<crate::module::_cffi_backend::wrapper::W_FunctionWrapper>(),
-        ),
     ];
     if let Some(hooks) = crate::importing::optional_module_hooks() {
         aliases.extend((hooks.subclass_range_aliases)());

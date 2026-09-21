@@ -1,6 +1,6 @@
 //! CFFI generated-library objects — PyPy: `pypy/module/_cffi_backend/lib_obj.py`.
 
-use crate::PyError;
+use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
 use std::ffi::CStr;
 use std::sync::OnceLock;
@@ -14,7 +14,7 @@ pub const FLAVOR_STATIC: i64 = 0;
 pub const FLAVOR_DLOPEN: i64 = 1;
 
 /// `W_LibObject` and its `W_DlOpenLibObject` flavor.
-#[crate::pyre_class("_cffi_backend.Lib")]
+#[pyre_interpreter::pyre_class("_cffi_backend.Lib")]
 #[derive(Default)]
 pub struct W_LibObject {
     pub w_ffi: PyObjectRef,
@@ -29,7 +29,7 @@ fn lib_arg(w_lib: PyObjectRef) -> Result<&'static mut W_LibObject, PyError> {
     W_LibObject::from_obj(w_lib).ok_or_else(|| {
         PyError::type_error(format!(
             "expected a Lib object, got '{}'",
-            crate::type_methods::arg_type_name(w_lib)
+            pyre_interpreter::type_methods::arg_type_name(w_lib)
         ))
     })
 }
@@ -39,7 +39,7 @@ fn ffi_of(lib: &W_LibObject) -> Result<&'static mut W_FFIObject, PyError> {
 }
 
 fn libname(lib: &W_LibObject) -> Result<&'static str, PyError> {
-    crate::baseobjspace::text_w(lib.w_libname)
+    pyre_interpreter::baseobjspace::text_w(lib.w_libname)
 }
 
 pub fn new_lib(
@@ -96,7 +96,7 @@ pub fn make_includes_from(
             roots.get(part_slot + 1),
             roots.get(part_slot + 2),
         ]));
-        let module = crate::importing::dunder_import_name_obj(
+        let module = pyre_interpreter::importing::dunder_import_name_obj(
             roots.get(part_slot),
             pyre_object::PY_NULL,
             pyre_object::PY_NULL,
@@ -108,12 +108,12 @@ pub fn make_includes_from(
                 .and_then(|lib| libname(lib))
                 .unwrap_or("");
             PyError::new(
-                crate::PyErrorKind::ImportError,
+                pyre_interpreter::PyErrorKind::ImportError,
                 format!("while loading {name}: failed to import ffi, lib from {include_name}"),
             )
         })?;
         let _ = roots.pin_root(module);
-        let w_lib1 = crate::baseobjspace::getattr_str(roots.get(part_slot + 4), "lib")?;
+        let w_lib1 = pyre_interpreter::baseobjspace::getattr_str(roots.get(part_slot + 4), "lib")?;
         let _ = roots.pin_root(w_lib1);
         let lib1 = lib_arg(roots.get(part_slot + 5))?;
         let _ = roots.pin_root(lib1.w_ffi);
@@ -190,14 +190,14 @@ fn build_attr(w_lib: PyObjectRef, attr: &str) -> Result<Option<PyObjectRef>, PyE
     let w_result = if index < 0 {
         let included_slot = ffi_slot + 1;
         let _ = roots.pin_root(ffi.included_ffis_libs);
-        let included = crate::baseobjspace::fixedview(roots.get(included_slot), -1)?;
+        let included = pyre_interpreter::baseobjspace::fixedview(roots.get(included_slot), -1)?;
         let pair_roots = pyre_object::gc_roots::shadow_stack_len();
         for &pair in &included {
             let _ = roots.pin_root(pair);
         }
         let mut result = None;
         for i in 0..included.len() {
-            let pair = crate::baseobjspace::fixedview(roots.get(pair_roots + i), 2)?;
+            let pair = pyre_interpreter::baseobjspace::fixedview(roots.get(pair_roots + i), 2)?;
             let base = pyre_object::gc_roots::shadow_stack_len();
             for &item in &pair {
                 let _ = roots.pin_root(item);
@@ -327,7 +327,7 @@ fn get_attr(
     let _ = roots.pin_root(w_lib);
     let attr_slot = lib_slot + 1;
     let _ = roots.pin_root(w_attr);
-    let attr = crate::baseobjspace::text_w(roots.get(attr_slot))?.to_string();
+    let attr = pyre_interpreter::baseobjspace::text_w(roots.get(attr_slot))?.to_string();
     let value = match cached_attr(lib_arg(roots.get(lib_slot))?, &attr) {
         Some(value) => Some(value),
         None => build_attr(roots.get(lib_slot), &attr)?,
@@ -340,9 +340,11 @@ fn get_attr(
             "__all__" => return dir1(roots.get(lib_slot), true),
             "__dict__" => return full_dict_copy(roots.get(lib_slot)),
             "__class__" => {
-                return crate::typedef::gettypefor(&pyre_object::MODULE_TYPE as *const _)
-                    .map(|tp| tp.as_ptr())
-                    .ok_or_else(|| PyError::system_error("module type is not initialized"));
+                return pyre_interpreter::typedef::gettypefor(
+                    &pyre_object::MODULE_TYPE as *const _,
+                )
+                .map(|tp| tp.as_ptr())
+                .ok_or_else(|| PyError::system_error("module type is not initialized"));
             }
             "__name__" => {
                 return Ok(pyre_object::w_str_new_managed(&format!(
@@ -384,7 +386,7 @@ fn lib_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     } else {
         Err(PyError::attribute_error(format!(
             "cannot write to function or constant '{}'",
-            crate::baseobjspace::text_w(roots.get(base + 1))?
+            pyre_interpreter::baseobjspace::text_w(roots.get(base + 1))?
         )))
     }
 }
@@ -564,10 +566,10 @@ static LIB_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
 /// `_cffi_backend.Lib`.
 pub fn lib_type() -> PyObjectRef {
     *LIB_TYPE_OBJ.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type_with_layout(
+        let tp = pyre_interpreter::typedef::make_builtin_type_with_layout(
             "_cffi_backend.Lib",
             init_lib_type,
-            crate::typedef::w_object(),
+            pyre_interpreter::typedef::w_object(),
             <W_LibObject as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
         );
         pyre_object::pyobject::set_instantiate(
@@ -588,7 +590,11 @@ fn init_lib_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, value)
     };
     for (name, function, arity) in [
-        ("__repr__", lib_repr as crate::gateway::BuiltinCodeFn, 1u16),
+        (
+            "__repr__",
+            lib_repr as pyre_interpreter::gateway::BuiltinCodeFn,
+            1u16,
+        ),
         ("__getattribute__", lib_getattribute, 2),
         ("__setattr__", lib_setattr, 3),
         ("__delattr__", lib_delattr, 2),
@@ -596,7 +602,7 @@ fn init_lib_type(ns: PyObjectRef) {
     ] {
         store(
             name,
-            crate::make_builtin_function_with_arity(name, function, arity),
+            pyre_interpreter::make_builtin_function_with_arity(name, function, arity),
         );
     }
 }

@@ -2858,9 +2858,12 @@ dependencies = [
 name = "pyre-module"
 version = "0.0.2"
 dependencies = [
+ "bitflags 2.13.0",
  "ctor",
  "libc",
+ "libffi",
  "linkme",
+ "majit-gc",
  "majit-ir",
  "majit-macros",
  "majit-metainterp",

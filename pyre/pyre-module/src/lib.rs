@@ -26,6 +26,15 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("_abc", module::_abc::init);
     pyre_interpreter::importing::register_builtin_module("_bisect", module::_bisect::init);
     pyre_interpreter::importing::register_builtin_module("_blake2", module::_blake2::init);
+    #[cfg(all(
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    ))]
+    pyre_interpreter::importing::register_builtin_module(
+        "_cffi_backend",
+        module::_cffi_backend::init,
+    );
     pyre_interpreter::importing::register_builtin_module("_bz2", module::_bz2::init);
     pyre_interpreter::importing::register_builtin_module("_csv", module::_csv::init);
     pyre_interpreter::importing::register_builtin_module("_codecs_cn", module::_codecs_cn::init);
@@ -155,6 +164,110 @@ fn register_on_load() {
     register();
 }
 
+fn hook_mini_buffer_params(obj: pyre_object::PyObjectRef) -> Option<(*mut u8, usize)> {
+    #[cfg(all(
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    ))]
+    {
+        return module::_cffi_backend::cbuffer::mini_buffer_params(obj);
+    }
+    #[cfg(not(all(
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    )))]
+    {
+        let _ = obj;
+        None
+    }
+}
+
+fn hook_cffi_finalizer_kind(obj: pyre_object::PyObjectRef) -> Option<bool> {
+    #[cfg(all(
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    ))]
+    {
+        return module::_cffi_backend::cdataobj::ec_finalizer_kind(obj);
+    }
+    #[cfg(not(all(
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    )))]
+    {
+        let _ = obj;
+        None
+    }
+}
+
+fn hook_run_cffi_finalize(obj: pyre_object::PyObjectRef) {
+    #[cfg(all(
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    ))]
+    {
+        module::_cffi_backend::cdataobj::run_ec_finalize(obj);
+    }
+    #[cfg(not(all(
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    )))]
+    {
+        let _ = obj;
+    }
+}
+
+fn hook_close_cffi_fileobj(obj: pyre_object::PyObjectRef) {
+    #[cfg(all(
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    ))]
+    {
+        module::_cffi_backend::ctypeptr::close_cffi_fileobj(obj);
+    }
+    #[cfg(not(all(
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    )))]
+    {
+        let _ = obj;
+    }
+}
+
+fn hook_load_cffi1_module(
+    name: &str,
+    path: &std::path::Path,
+    init_address: usize,
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    #[cfg(all(
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    ))]
+    {
+        return module::_cffi_backend::cffi1_module::load_cffi1_module(name, path, init_address);
+    }
+    #[cfg(not(all(
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    )))]
+    {
+        let _ = (name, path, init_address);
+        Err(pyre_interpreter::PyError::system_error(
+            "_cffi_backend is not available",
+        ))
+    }
+}
+
 pub fn register() {
     pyre_interpreter::importing::set_optional_module_hooks(
         pyre_interpreter::importing::OptionalModuleHooks {
@@ -165,6 +278,11 @@ pub fn register() {
             },
             subclass_range_aliases: optional_subclass_range_aliases,
             publish_fnaddrs: publish_optional_fnaddrs,
+            mini_buffer_params: hook_mini_buffer_params,
+            cffi_finalizer_kind: hook_cffi_finalizer_kind,
+            run_cffi_finalize: hook_run_cffi_finalize,
+            close_cffi_fileobj: hook_close_cffi_fileobj,
+            load_cffi1_module: hook_load_cffi1_module,
         },
     );
 }
@@ -371,6 +489,524 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
             entries.push(("pyre_module::module::mmap::interp_mmap::mmap_type", addr));
         }
     }
+    #[cfg(all(
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    ))]
+    {
+        use module::_cffi_backend::{cdataobj, cerrno, ctypefunc, jit_libffi, misc};
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::cdataobj::raw_malloc_varsize_char",
+            cdataobj::raw_malloc_varsize_char as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::cdataobj::raw_malloc_varsize_char",
+            cdataobj::raw_malloc_varsize_char as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::cdataobj::raw_free",
+            cdataobj::raw_free as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::cdataobj::raw_free",
+            cdataobj::raw_free as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::cerrno::errno_before",
+            cerrno::errno_before as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::cerrno::errno_before",
+            cerrno::errno_before as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::cerrno::errno_after",
+            cerrno::errno_after as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::cerrno::errno_after",
+            cerrno::errno_after as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::ctypefunc::get_mustfree_flag",
+            ctypefunc::get_mustfree_flag as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::ctypefunc::get_mustfree_flag",
+            ctypefunc::get_mustfree_flag as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::exchange_size",
+            jit_libffi::exchange_size as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::jit_libffi::imp::exchange_size",
+            jit_libffi::exchange_size as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::exchange_size",
+            jit_libffi::exchange_size as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::jit_libffi::exchange_size",
+            jit_libffi::exchange_size as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::exchange_result",
+            jit_libffi::exchange_result as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::jit_libffi::imp::exchange_result",
+            jit_libffi::exchange_result as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::exchange_result",
+            jit_libffi::exchange_result as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::jit_libffi::exchange_result",
+            jit_libffi::exchange_result as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::exchange_arg",
+            jit_libffi::exchange_arg as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::jit_libffi::imp::exchange_arg",
+            jit_libffi::exchange_arg as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::exchange_arg",
+            jit_libffi::exchange_arg as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::jit_libffi::exchange_arg",
+            jit_libffi::exchange_arg as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::rtype",
+            jit_libffi::rtype as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::jit_libffi::imp::rtype",
+            jit_libffi::rtype as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::rtype",
+            jit_libffi::rtype as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::jit_libffi::rtype",
+            jit_libffi::rtype as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::nargs",
+            jit_libffi::nargs as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::jit_libffi::imp::nargs",
+            jit_libffi::nargs as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::nargs",
+            jit_libffi::nargs as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::jit_libffi::nargs",
+            jit_libffi::nargs as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::types::getkind",
+            jit_libffi::types::getkind as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::jit_libffi::imp::types::getkind",
+            jit_libffi::types::getkind as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::types::getkind",
+            jit_libffi::types::getkind as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::jit_libffi::types::getkind",
+            jit_libffi::types::getkind as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::types::getsize",
+            jit_libffi::types::getsize as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::jit_libffi::imp::types::getsize",
+            jit_libffi::types::getsize as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::types::getsize",
+            jit_libffi::types::getsize as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::jit_libffi::types::getsize",
+            jit_libffi::types::getsize as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::jit_ffi_call_impl_int",
+            jit_libffi::jit_ffi_call_impl_int as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::jit_libffi::imp::jit_ffi_call_impl_int",
+            jit_libffi::jit_ffi_call_impl_int as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_int",
+            jit_libffi::jit_ffi_call_impl_int as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_int",
+            jit_libffi::jit_ffi_call_impl_int as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::jit_ffi_call_impl_float",
+            jit_libffi::jit_ffi_call_impl_float as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::jit_libffi::imp::jit_ffi_call_impl_float",
+            jit_libffi::jit_ffi_call_impl_float as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_float",
+            jit_libffi::jit_ffi_call_impl_float as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_float",
+            jit_libffi::jit_ffi_call_impl_float as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::jit_ffi_call_impl_singlefloat",
+            jit_libffi::jit_ffi_call_impl_singlefloat as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::jit_libffi::imp::jit_ffi_call_impl_singlefloat",
+            jit_libffi::jit_ffi_call_impl_singlefloat as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_singlefloat",
+            jit_libffi::jit_ffi_call_impl_singlefloat as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_singlefloat",
+            jit_libffi::jit_ffi_call_impl_singlefloat as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::jit_ffi_call_impl_void",
+            jit_libffi::jit_ffi_call_impl_void as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::jit_libffi::imp::jit_ffi_call_impl_void",
+            jit_libffi::jit_ffi_call_impl_void as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_void",
+            jit_libffi::jit_ffi_call_impl_void as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_void",
+            jit_libffi::jit_ffi_call_impl_void as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::jit_ffi_call_impl_any",
+            jit_libffi::jit_ffi_call_impl_any as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::jit_libffi::imp::jit_ffi_call_impl_any",
+            jit_libffi::jit_ffi_call_impl_any as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_any",
+            jit_libffi::jit_ffi_call_impl_any as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_any",
+            jit_libffi::jit_ffi_call_impl_any as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::cdataobj::raw_ptradd",
+            cdataobj::raw_ptradd as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::cdataobj::raw_ptradd",
+            cdataobj::raw_ptradd as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::cdataobj::raw_read_ptr",
+            cdataobj::raw_read_ptr as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::cdataobj::raw_read_ptr",
+            cdataobj::raw_read_ptr as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_read_i8",
+            misc::raw_read_i8 as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::misc::raw_read_i8",
+            misc::raw_read_i8 as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_read_u8",
+            misc::raw_read_u8 as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::misc::raw_read_u8",
+            misc::raw_read_u8 as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_write_i8",
+            misc::raw_write_i8 as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::misc::raw_write_i8",
+            misc::raw_write_i8 as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_write_u8",
+            misc::raw_write_u8 as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::misc::raw_write_u8",
+            misc::raw_write_u8 as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_read_i16",
+            misc::raw_read_i16 as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::misc::raw_read_i16",
+            misc::raw_read_i16 as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_read_u16",
+            misc::raw_read_u16 as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::misc::raw_read_u16",
+            misc::raw_read_u16 as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_write_i16",
+            misc::raw_write_i16 as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::misc::raw_write_i16",
+            misc::raw_write_i16 as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_write_u16",
+            misc::raw_write_u16 as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::misc::raw_write_u16",
+            misc::raw_write_u16 as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_read_i32",
+            misc::raw_read_i32 as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::misc::raw_read_i32",
+            misc::raw_read_i32 as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_read_u32",
+            misc::raw_read_u32 as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::misc::raw_read_u32",
+            misc::raw_read_u32 as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_write_i32",
+            misc::raw_write_i32 as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::misc::raw_write_i32",
+            misc::raw_write_i32 as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_write_u32",
+            misc::raw_write_u32 as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::misc::raw_write_u32",
+            misc::raw_write_u32 as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_read_i64",
+            misc::raw_read_i64 as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::misc::raw_read_i64",
+            misc::raw_read_i64 as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_read_u64",
+            misc::raw_read_u64 as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::misc::raw_read_u64",
+            misc::raw_read_u64 as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_write_i64",
+            misc::raw_write_i64 as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::misc::raw_write_i64",
+            misc::raw_write_i64 as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_write_u64",
+            misc::raw_write_u64 as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::misc::raw_write_u64",
+            misc::raw_write_u64 as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_read_f32",
+            misc::raw_read_f32 as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::misc::raw_read_f32",
+            misc::raw_read_f32 as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_write_f32",
+            misc::raw_write_f32 as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::misc::raw_write_f32",
+            misc::raw_write_f32 as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_read_f64",
+            misc::raw_read_f64 as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::misc::raw_read_f64",
+            misc::raw_read_f64 as *const (),
+        );
+        single(
+            entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_write_f64",
+            misc::raw_write_f64 as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::misc::raw_write_f64",
+            misc::raw_write_f64 as *const (),
+        );
+    }
 }
 
 fn walk_optional_global_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
@@ -454,6 +1090,71 @@ fn optional_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRange
         196,
         typed::<module::_overlapped::W_Overlapped>(),
     ));
+    // `_cffi_backend` sits at the rclass tail (196 on Unix, 199 on Windows
+    // where overlapped/console occupy 196-198).
+    #[cfg(all(
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    ))]
+    {
+        #[cfg(windows)]
+        const CFFI_FIRST_TYPE_ID: u32 = 199;
+        #[cfg(not(windows))]
+        const CFFI_FIRST_TYPE_ID: u32 = 196;
+        aliases.push(subclass_range_alias(
+            CFFI_FIRST_TYPE_ID,
+            typed::<module::_cffi_backend::ctypeobj::W_CType>(),
+        ));
+        aliases.push(subclass_range_alias(
+            CFFI_FIRST_TYPE_ID + 1,
+            typed::<module::_cffi_backend::ctypearray::W_CDataIter>(),
+        ));
+        aliases.push(subclass_range_alias(
+            CFFI_FIRST_TYPE_ID + 2,
+            typed::<module::_cffi_backend::cdataobj::W_CData>(),
+        ));
+        aliases.push(subclass_range_alias(
+            CFFI_FIRST_TYPE_ID + 3,
+            typed::<module::_cffi_backend::ctypestruct::W_CField>(),
+        ));
+        aliases.push(subclass_range_alias(
+            CFFI_FIRST_TYPE_ID + 4,
+            typed::<module::_cffi_backend::libraryobj::W_Library>(),
+        ));
+        aliases.push(subclass_range_alias(
+            CFFI_FIRST_TYPE_ID + 5,
+            typed::<module::_cffi_backend::allocator::W_Allocator>(),
+        ));
+        aliases.push(subclass_range_alias(
+            CFFI_FIRST_TYPE_ID + 6,
+            typed::<module::_cffi_backend::cbuffer::MiniBuffer>(),
+        ));
+        aliases.push(subclass_range_alias(
+            CFFI_FIRST_TYPE_ID + 7,
+            typed::<module::_cffi_backend::func::OffsetInBytes>(),
+        ));
+        aliases.push(subclass_range_alias(
+            CFFI_FIRST_TYPE_ID + 8,
+            typed::<module::_cffi_backend::ffi_obj::W_FFIObject>(),
+        ));
+        aliases.push(subclass_range_alias(
+            CFFI_FIRST_TYPE_ID + 9,
+            typed::<module::_cffi_backend::realize_c_type::W_RawFuncType>(),
+        ));
+        aliases.push(subclass_range_alias(
+            CFFI_FIRST_TYPE_ID + 10,
+            typed::<module::_cffi_backend::lib_obj::W_LibObject>(),
+        ));
+        aliases.push(subclass_range_alias(
+            CFFI_FIRST_TYPE_ID + 11,
+            typed::<module::_cffi_backend::cglob::W_GlobSupport>(),
+        ));
+        aliases.push(subclass_range_alias(
+            CFFI_FIRST_TYPE_ID + 12,
+            typed::<module::_cffi_backend::wrapper::W_FunctionWrapper>(),
+        ));
+    }
     aliases
 }
 

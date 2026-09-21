@@ -9,6 +9,13 @@ pub mod _blake2;
 #[allow(non_snake_case)]
 pub mod _bz2;
 #[allow(non_snake_case)]
+#[cfg(all(
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+))]
+pub mod _cffi_backend;
+#[allow(non_snake_case)]
 pub mod _codecs_cn;
 #[allow(non_snake_case)]
 pub mod _codecs_hk;

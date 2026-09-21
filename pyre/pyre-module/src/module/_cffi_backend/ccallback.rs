@@ -1,6 +1,6 @@
 //! Callbacks — PyPy: `pypy/module/_cffi_backend/ccallback.py`.
 
-use crate::{PyError, PyErrorKind};
+use pyre_interpreter::{PyError, PyErrorKind};
 use pyre_object::PyObjectRef;
 
 use super::cdataobj::{self, W_CData};
@@ -134,20 +134,20 @@ pub fn make_callback(
     let mut unpublished = UnpublishedClosure(raw_closure);
 
     let functype = function_ctype(roots.get(base))?;
-    if !crate::baseobjspace::callable_w(roots.get(base + 1)) {
+    if !pyre_interpreter::baseobjspace::callable_w(roots.get(base + 1)) {
         return Err(PyError::type_error(format!(
             "expected a callable object, not {}",
-            crate::type_methods::arg_type_name(roots.get(base + 1))
+            pyre_interpreter::type_methods::arg_type_name(roots.get(base + 1))
         )));
     }
     let onerror = roots.get(base + 3);
     let has_onerror = if unsafe { pyre_object::is_none(onerror) } {
         false
     } else {
-        if !crate::baseobjspace::callable_w(onerror) {
+        if !pyre_interpreter::baseobjspace::callable_w(onerror) {
             return Err(PyError::type_error(format!(
                 "expected a callable object for 'onerror', not {}",
-                crate::type_methods::arg_type_name(onerror)
+                pyre_interpreter::type_methods::arg_type_name(onerror)
             )));
         }
         true
@@ -338,13 +338,17 @@ fn print_error(
     let base = roots.base();
     let _ = roots.pin_root(w_callback);
     let _ = roots.pin_root(callback_arg(roots.get(base))?.w_keepalive);
-    let w_repr = crate::builtins::builtin_repr(&[roots.get(base + 1)])?;
+    let w_repr = pyre_interpreter::builtins::builtin_repr(&[roots.get(base + 1)])?;
     let _ = roots.pin_root(w_repr);
     let repr = unsafe { pyre_object::unicodeobject::w_str_get_wtf8(roots.get(base + 2)) };
     let where_desc = if extra_line.is_empty() {
-        crate::display::wtf8_format!("Exception ignored from cffi callback ", repr)
+        pyre_interpreter::display::wtf8_format!("Exception ignored from cffi callback ", repr)
     } else {
-        crate::display::wtf8_format!("Exception ignored from cffi callback ", repr, extra_line)
+        pyre_interpreter::display::wtf8_format!(
+            "Exception ignored from cffi callback ",
+            repr,
+            extra_line
+        )
     };
     error.write_unraisable(pyre_object::w_none(), &where_desc, pyre_object::PY_NULL);
     Ok(())
@@ -379,16 +383,16 @@ fn handle_applevel_exception(
         }
     };
     let _ = roots.pin_root(w_value);
-    let w_type = crate::baseobjspace::exception_getclass(roots.get(base + 2));
+    let w_type = pyre_interpreter::baseobjspace::exception_getclass(roots.get(base + 2));
     let _ = roots.pin_root(w_type);
     let mut w_tb = error.get_traceback();
     if w_tb.is_null() {
         // A raise that never entered `handle_operation_error` still
         // owes `onerror` a traceback. Stamp the live callback frame.
-        let frame = crate::eval::current_frame();
+        let frame = pyre_interpreter::eval::current_frame();
         if !frame.is_null() && !error.exc_object.is_null() {
             unsafe {
-                crate::pytraceback::record_application_traceback(
+                pyre_interpreter::pytraceback::record_application_traceback(
                     error.exc_object,
                     frame,
                     (*frame).last_instr as i64,
@@ -401,7 +405,7 @@ fn handle_applevel_exception(
         }
     }
     let _ = roots.pin_root(w_tb);
-    match crate::call::call_function_impl_result(
+    match pyre_interpreter::call::call_function_impl_result(
         roots.get(base + 1),
         &[
             roots.get(base + 3),
@@ -433,7 +437,7 @@ fn print_onerror_exception(mut error: PyError) {
         .normalize_exception(pyre_object::w_none())
         .unwrap_or_else(|_| error.to_exc_object());
     let _ = roots.pin_root(w_value);
-    let w_type = crate::baseobjspace::exception_getclass(roots.get(base));
+    let w_type = pyre_interpreter::baseobjspace::exception_getclass(roots.get(base));
     let _ = roots.pin_root(w_type);
     let mut w_tb = error.get_traceback();
     if w_tb.is_null() {
@@ -468,14 +472,15 @@ unsafe fn do_invoke(w_callback: PyObjectRef, ll_res: *mut u8, ll_args: *mut *mut
             .expect("root remains a callback")
             .w_keepalive,
     );
-    let arguments = match crate::argument::Arguments::frompacked(Some(roots.get(base + 1)), None) {
-        Ok(arguments) => arguments,
-        Err(error) => {
-            handle_applevel_exception(roots.get(base), error, ll_res, "");
-            return;
-        }
-    };
-    let w_res = match crate::baseobjspace::call_args(roots.get(base + 2), &arguments) {
+    let arguments =
+        match pyre_interpreter::argument::Arguments::frompacked(Some(roots.get(base + 1)), None) {
+            Ok(arguments) => arguments,
+            Err(error) => {
+                handle_applevel_exception(roots.get(base), error, ll_res, "");
+                return;
+            }
+        };
+    let w_res = match pyre_interpreter::baseobjspace::call_args(roots.get(base + 2), &arguments) {
         Ok(result) => result,
         Err(error) => {
             handle_applevel_exception(roots.get(base), error, ll_res, "");
@@ -514,7 +519,8 @@ unsafe extern "C" fn invoke_callback(
         unsafe { std::ptr::write_bytes(ll_res.cast::<u8>(), 0, SIZE_OF_FFI_ARG) };
     }
     let invoked = catch_unwind(AssertUnwindSafe(|| {
-        let _callback = crate::module::thread::enter_external_callback_from_foreign_thread();
+        let _callback =
+            pyre_interpreter::module::thread::enter_external_callback_from_foreign_thread();
         super::cerrno::errno_after();
         if let Some(w_callback) = super::hide_reveal::reveal_callback(ll_userdata.cast::<u8>()) {
             let roots = pyre_object::gc_roots::push_roots();
@@ -522,7 +528,7 @@ unsafe extern "C" fn invoke_callback(
             let _ = roots.pin_root(w_callback);
             unsafe { do_invoke(roots.get(base), ll_res.cast::<u8>(), ll_args) };
         } else {
-            crate::host_seam::emit_stderr(
+            pyre_interpreter::host_seam::emit_stderr(
                 b"SystemError: invoking a callback that was already freed\n",
             );
         }
@@ -530,7 +536,8 @@ unsafe extern "C" fn invoke_callback(
     }));
     if invoked.is_err() {
         let _ = catch_unwind(AssertUnwindSafe(|| {
-            let _callback = crate::module::thread::enter_external_callback_from_foreign_thread();
+            let _callback =
+                pyre_interpreter::module::thread::enter_external_callback_from_foreign_thread();
             if let Some(w_callback) = super::hide_reveal::reveal_callback(ll_userdata.cast::<u8>())
                 && let Ok(callback) = callback_arg(w_callback)
             {

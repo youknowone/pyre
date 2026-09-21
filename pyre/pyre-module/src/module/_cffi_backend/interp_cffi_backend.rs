@@ -8,16 +8,16 @@ use super::parse_c_type;
 /// it tracks the vendored `lib_pypy/cffi` rather than anything of pyre's.
 pub const VERSION: &str = "1.18.0.dev0";
 
-pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
-    crate::module_ns_store(ns, "__version__", pyre_object::w_str_new(VERSION));
+pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
+    pyre_interpreter::module_ns_store(ns, "__version__", pyre_object::w_str_new(VERSION));
 
     // `clibffi.FFI_DEFAULT_ABI`.  `FFI_CDECL` is the win32 spelling of the
     // same value and is defined on every platform.
     let abi = default_abi() as i64;
-    crate::module_ns_store(ns, "FFI_DEFAULT_ABI", pyre_object::w_int_new(abi));
-    crate::module_ns_store(ns, "FFI_CDECL", pyre_object::w_int_new(abi));
+    pyre_interpreter::module_ns_store(ns, "FFI_DEFAULT_ABI", pyre_object::w_int_new(abi));
+    pyre_interpreter::module_ns_store(ns, "FFI_CDECL", pyre_object::w_int_new(abi));
     if let Some(stdcall) = super::ctypefunc::stdcall_abi() {
-        crate::module_ns_store(ns, "FFI_STDCALL", pyre_object::w_int_new(stdcall));
+        pyre_interpreter::module_ns_store(ns, "FFI_STDCALL", pyre_object::w_int_new(stdcall));
     }
 
     register_rtld_constants(ns);
@@ -28,17 +28,29 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     for (name, f, argnames) in [
         (
             "new_primitive_type",
-            super::func::new_primitive_type as crate::gateway::BuiltinCodeFn,
+            super::func::new_primitive_type as pyre_interpreter::gateway::BuiltinCodeFn,
             &["name"] as &[&'static str],
         ),
-        ("new_pointer_type", super::func::new_pointer_type, &["ctype"]),
-        ("new_array_type", super::func::new_array_type, &["ctptr", "length"]),
+        (
+            "new_pointer_type",
+            super::func::new_pointer_type,
+            &["ctype"],
+        ),
+        (
+            "new_array_type",
+            super::func::new_array_type,
+            &["ctptr", "length"],
+        ),
         ("new_void_type", super::func::new_void_type, &[]),
         ("cast", super::func::cast, &["ctype", "ob"]),
         ("typeof", super::func::typeof_, &["cdata"]),
         ("sizeof", super::func::sizeof, &["obj"]),
         ("alignof", super::func::alignof, &["ctype"]),
-        ("getcname", super::func::getcname, &["ctype", "replace_with"]),
+        (
+            "getcname",
+            super::func::getcname,
+            &["ctype", "replace_with"],
+        ),
         ("unpack", super::func::unpack, &["cdata", "length"]),
         ("release", super::func::release, &["cdata"]),
         ("newp_handle", super::handle::newp_handle, &["ctype", "x"]),
@@ -55,16 +67,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             &["name", "enumerators", "enumvalues", "basectype"],
         ),
     ] {
-        crate::module_ns_store(
+        pyre_interpreter::module_ns_store(
             ns,
             name,
-            crate::gateway::with_module(
+            pyre_interpreter::gateway::with_module(
                 MODULE,
-                crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                pyre_interpreter::gateway::make_module_builtin_function_with_arity_and_sig(
                     name,
                     f,
                     argnames.len() as u16,
-                    crate::gateway::Signature::new(argnames.to_vec(), None, None, 0, 0),
+                    pyre_interpreter::gateway::Signature::new(argnames.to_vec(), None, None, 0, 0),
                 ),
             ),
         );
@@ -73,11 +85,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // `typeoffsetof(ctype, field_or_index, following=0)` carry a default, and
     // the rest of this group binds its own arguments for the same reason.
     for (name, f) in [
-        ("newp", super::func::newp as crate::gateway::BuiltinCodeFn),
+        (
+            "newp",
+            super::func::newp as pyre_interpreter::gateway::BuiltinCodeFn,
+        ),
         ("string", super::func::string),
         ("typeoffsetof", super::func::typeoffsetof),
         ("rawaddressof", super::func::rawaddressof),
-        ("complete_struct_or_union", super::func::complete_struct_or_union),
+        (
+            "complete_struct_or_union",
+            super::func::complete_struct_or_union,
+        ),
         ("new_function_type", super::func::new_function_type),
         ("load_library", super::func::load_library),
         ("from_buffer", super::func::from_buffer),
@@ -85,55 +103,63 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         ("_offset_in_bytes", super::func::offset_in_bytes),
         ("callback", super::func::callback),
     ] {
-        crate::module_ns_store(
+        pyre_interpreter::module_ns_store(
             ns,
             name,
-            crate::gateway::with_module(MODULE, crate::make_module_builtin_function(name, f)),
+            pyre_interpreter::gateway::with_module(
+                MODULE,
+                pyre_interpreter::make_module_builtin_function(name, f),
+            ),
         );
     }
     // `func.py memmove(dest, src, n)` — a fixed arity, but its parameters are
     // positional-or-keyword upstream, so the registration carries the names.
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "memmove",
-        crate::gateway::with_module(
+        pyre_interpreter::gateway::with_module(
             MODULE,
-            crate::gateway::make_module_builtin_function_with_arity_and_sig(
+            pyre_interpreter::gateway::make_module_builtin_function_with_arity_and_sig(
                 "memmove",
-                super::func::memmove as crate::gateway::BuiltinCodeFn,
+                super::func::memmove as pyre_interpreter::gateway::BuiltinCodeFn,
                 3,
-                crate::gateway::Signature::new(vec!["dest", "src", "n"], None, None, 0, 0),
+                pyre_interpreter::gateway::Signature::new(
+                    vec!["dest", "src", "n"],
+                    None,
+                    None,
+                    0,
+                    0,
+                ),
             ),
         ),
     );
     // The types `moduledef.py` publishes.
-    crate::module_ns_store(ns, "CType", super::ctypeobj::ctype_type());
-    crate::module_ns_store(ns, "_CDataBase", super::cdataobj::cdata_type());
-    crate::module_ns_store(
-        ns,
-        "__CData_iterator",
-        super::ctypearray::cdata_iter_type(),
-    );
-    crate::module_ns_store(ns, "CField", super::ctypestruct::cfield_type());
-    crate::module_ns_store(ns, "CLibrary", super::libraryobj::clibrary_type());
-    crate::module_ns_store(ns, "__FFIAllocator", super::allocator::allocator_type());
-    crate::module_ns_store(ns, "buffer", super::cbuffer::buffer_type());
-    crate::module_ns_store(ns, "FFI", super::ffi_obj::ffi_type_object());
-    crate::module_ns_store(ns, "Lib", super::lib_obj::lib_type());
-    crate::module_ns_store(ns, "__FFIGlobSupport", super::cglob::glob_type());
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(ns, "CType", super::ctypeobj::ctype_type());
+    pyre_interpreter::module_ns_store(ns, "_CDataBase", super::cdataobj::cdata_type());
+    pyre_interpreter::module_ns_store(ns, "__CData_iterator", super::ctypearray::cdata_iter_type());
+    pyre_interpreter::module_ns_store(ns, "CField", super::ctypestruct::cfield_type());
+    pyre_interpreter::module_ns_store(ns, "CLibrary", super::libraryobj::clibrary_type());
+    pyre_interpreter::module_ns_store(ns, "__FFIAllocator", super::allocator::allocator_type());
+    pyre_interpreter::module_ns_store(ns, "buffer", super::cbuffer::buffer_type());
+    pyre_interpreter::module_ns_store(ns, "FFI", super::ffi_obj::ffi_type_object());
+    pyre_interpreter::module_ns_store(ns, "Lib", super::lib_obj::lib_type());
+    pyre_interpreter::module_ns_store(ns, "__FFIGlobSupport", super::cglob::glob_type());
+    pyre_interpreter::module_ns_store(
         ns,
         "__FFIFunctionWrapper",
         super::wrapper::function_wrapper_type(),
     );
 
     #[cfg(windows)]
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "getwinerror",
-        crate::gateway::with_module(
+        pyre_interpreter::gateway::with_module(
             MODULE,
-            crate::make_module_builtin_function("getwinerror", super::cerrno::getwinerror),
+            pyre_interpreter::make_module_builtin_function(
+                "getwinerror",
+                super::cerrno::getwinerror,
+            ),
         ),
     );
     Ok(())
@@ -195,7 +221,7 @@ pub(super) fn register_rtld_constants(ns: pyre_object::PyObjectRef) {
         ("RTLD_LOCAL", 0),
     ];
     for (name, value) in found {
-        crate::module_ns_store(ns, name, pyre_object::w_int_new(*value));
+        pyre_interpreter::module_ns_store(ns, name, pyre_object::w_int_new(*value));
     }
 }
 
@@ -203,11 +229,10 @@ pub(super) fn register_rtld_constants(ns: pyre_object::PyObjectRef) {
 /// for the type names every platform spells the same way.
 fn get_common_types(
     args: &[pyre_object::PyObjectRef],
-) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-    let w_dict = args
-        .first()
-        .copied()
-        .ok_or_else(|| crate::PyError::type_error("_get_common_types() missing dict argument"))?;
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    let w_dict = args.first().copied().ok_or_else(|| {
+        pyre_interpreter::PyError::type_error("_get_common_types() missing dict argument")
+    })?;
     let roots = pyre_object::gc_roots::push_roots();
     let _ = roots.pin_root(w_dict);
     let slot = roots.base();
@@ -223,7 +248,7 @@ fn get_common_types(
             }
         } else {
             let w_key = pyre_object::w_str_new(key);
-            crate::baseobjspace::setitem(roots.get(slot), w_key, w_value)?;
+            pyre_interpreter::baseobjspace::setitem(roots.get(slot), w_key, w_value)?;
         }
         index += 1;
     }

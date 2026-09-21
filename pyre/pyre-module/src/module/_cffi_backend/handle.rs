@@ -1,6 +1,6 @@
 //! CFFI object handles — PyPy: `pypy/module/_cffi_backend/handle.py`.
 
-use crate::PyError;
+use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
 
 use super::cdataobj;

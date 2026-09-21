@@ -1,7 +1,7 @@
 //! The compact raw-memory buffer — PyPy:
 //! `pypy/module/_cffi_backend/cbuffer.py`.
 
-use crate::PyError;
+use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
 use std::cmp::Ordering;
 use std::sync::OnceLock;
@@ -12,7 +12,7 @@ use super::ctypeobj;
 const DOC: &str = "ffi.buffer(cdata[, byte_size]):\nReturn a read-write buffer object that references the raw C data\npointed to by the given 'cdata'.  The 'cdata' must be a pointer or an\narray.  Can be passed to functions expecting a buffer, or directly\nmanipulated with:\n\n    buf[:]          get a copy of it in a regular string, or\n    buf[idx]        as a single character\n    buf[:] = ...\n    buf[idx] = ...  change the content\n";
 
 /// `cbuffer.py MiniBuffer`.
-#[crate::pyre_class("_cffi_backend.buffer")]
+#[pyre_interpreter::pyre_class("_cffi_backend.buffer")]
 #[derive(Default)]
 pub struct MiniBuffer {
     /// `LLBuffer.raw_cdata`.
@@ -41,7 +41,7 @@ fn mini_buffer_new(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     // app-level argument to `MiniBuffer___new__`.
     let explicit_size = args.get(2).is_some_and(|value| !value.is_null());
     let mut size = match args.get(2) {
-        Some(&w_size) if !w_size.is_null() => crate::baseobjspace::int_w(w_size)?,
+        Some(&w_size) if !w_size.is_null() => pyre_interpreter::baseobjspace::int_w(w_size)?,
         None => -1,
         Some(_) => -1,
     };
@@ -80,7 +80,7 @@ fn mini_buffer_new(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     if explicit_size {
         let max_size = cdataobj::maximum_buffer_size(w_cdata)?;
         if max_size >= 0 && size > max_size {
-            crate::warn::warn_category(
+            pyre_interpreter::warn::warn_category(
                 &format!(
                     "ffi.buffer(cdata, bytes): creating a buffer of {size} bytes over a cdata that owns only {max_size} bytes.  This will crash if you access the extra memory"
                 ),
@@ -115,7 +115,7 @@ fn mini_len(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 }
 
 fn adjusted_index(w_index: PyObjectRef, length: i64) -> Result<i64, PyError> {
-    let mut index = crate::baseobjspace::getindex_w(w_index)?;
+    let mut index = pyre_interpreter::baseobjspace::getindex_w(w_index)?;
     if index < 0 {
         index += length;
     }
@@ -130,14 +130,14 @@ fn mini_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let buffer = buffer_arg(args[0])?;
     if unsafe { pyre_object::sliceobject::is_slice(args[1]) } {
         let (start, stop, step) = unsafe {
-            crate::sliceobject::slice_unpack(
+            pyre_interpreter::sliceobject::slice_unpack(
                 pyre_object::sliceobject::w_slice_get_start(args[1]),
                 pyre_object::sliceobject::w_slice_get_stop(args[1]),
                 pyre_object::sliceobject::w_slice_get_step(args[1]),
             )?
         };
         let (start, _stop, step, length) =
-            crate::sliceobject::slice_adjust_indices(start, stop, step, buffer.size);
+            pyre_interpreter::sliceobject::slice_adjust_indices(start, stop, step, buffer.size);
         let mut data = Vec::with_capacity(length as usize);
         let mut at = start;
         for _ in 0..length {
@@ -159,7 +159,7 @@ fn mini_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let _ = roots.pin_root(args[2]);
     let (start, size) = if unsafe { pyre_object::sliceobject::is_slice(args[1]) } {
         let (raw_start, raw_stop, step) = unsafe {
-            crate::sliceobject::slice_unpack(
+            pyre_interpreter::sliceobject::slice_unpack(
                 pyre_object::sliceobject::w_slice_get_start(args[1]),
                 pyre_object::sliceobject::w_slice_get_stop(args[1]),
                 pyre_object::sliceobject::w_slice_get_step(args[1]),
@@ -167,7 +167,7 @@ fn mini_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         };
         let length = buffer_arg(args[0])?.size;
         let (start, _, step, size) =
-            crate::sliceobject::slice_adjust_indices(raw_start, raw_stop, step, length);
+            pyre_interpreter::sliceobject::slice_adjust_indices(raw_start, raw_stop, step, length);
         if step != 1 {
             return Err(PyError::not_implemented(""));
         }
@@ -176,7 +176,8 @@ fn mini_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         let index = adjusted_index(args[1], buffer_arg(args[0])?.size)?;
         (index, 1)
     };
-    let Some(value) = crate::baseobjspace::simple_buffer_bytes(roots.get(value_slot))? else {
+    let Some(value) = pyre_interpreter::baseobjspace::simple_buffer_bytes(roots.get(value_slot))?
+    else {
         return Err(PyError::type_error("a bytes-like object is required"));
     };
     if value.as_bytes().len() as i64 != size {
@@ -201,7 +202,7 @@ fn comparison(args: &[PyObjectRef], mode: fn(Ordering) -> bool) -> Result<PyObje
     if unsafe { pyre_object::unicodeobject::is_str(args[1]) } {
         return Ok(pyre_object::special::w_not_implemented());
     }
-    let Some(other) = crate::baseobjspace::simple_buffer_bytes(args[1])? else {
+    let Some(other) = pyre_interpreter::baseobjspace::simple_buffer_bytes(args[1])? else {
         return Ok(pyre_object::special::w_not_implemented());
     };
     let buffer = buffer_arg(args[0])?;
@@ -236,10 +237,10 @@ static BUFFER_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
 /// `_cffi_backend.buffer`.
 pub fn buffer_type() -> PyObjectRef {
     *BUFFER_TYPE_OBJ.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type_with_layout(
+        let tp = pyre_interpreter::typedef::make_builtin_type_with_layout(
             "_cffi_backend.buffer",
             init_buffer_type,
-            crate::typedef::w_object(),
+            pyre_interpreter::typedef::w_object(),
             <MiniBuffer as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
         );
         pyre_object::pyobject::set_instantiate(
@@ -262,13 +263,23 @@ fn init_buffer_type(ns: PyObjectRef) {
     store("__doc__", pyre_object::w_str_new(DOC));
     store(
         "__new__",
-        crate::typedef::make_new_descr_with_signature(
+        pyre_interpreter::typedef::make_new_descr_with_signature(
             mini_buffer_new,
-            crate::gateway::Signature::new(vec!["cls", "cdata", "size"], None, None, 0, 1),
+            pyre_interpreter::gateway::Signature::new(
+                vec!["cls", "cdata", "size"],
+                None,
+                None,
+                0,
+                1,
+            ),
         ),
     );
     for (name, f, arity) in [
-        ("__len__", mini_len as crate::gateway::BuiltinCodeFn, 1u16),
+        (
+            "__len__",
+            mini_len as pyre_interpreter::gateway::BuiltinCodeFn,
+            1u16,
+        ),
         ("__getitem__", mini_getitem, 2),
         ("__setitem__", mini_setitem, 3),
         ("__eq__", mini_eq, 2),
@@ -280,8 +291,11 @@ fn init_buffer_type(ns: PyObjectRef) {
     ] {
         store(
             name,
-            crate::make_builtin_function_with_arity(name, f, arity),
+            pyre_interpreter::make_builtin_function_with_arity(name, f, arity),
         );
     }
-    store("__weakref__", crate::typedef::make_weakref_descr(ns));
+    store(
+        "__weakref__",
+        pyre_interpreter::typedef::make_weakref_descr(ns),
+    );
 }

@@ -1,7 +1,7 @@
 //! Wide-character conversions — PyPy:
 //! `pypy/module/_cffi_backend/wchar_helper.py`.
 
-use crate::PyError;
+use pyre_interpreter::PyError;
 use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
 
 use super::misc;

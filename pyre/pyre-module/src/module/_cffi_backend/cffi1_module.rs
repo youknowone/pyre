@@ -6,7 +6,7 @@ use std::path::Path;
 use pyre_object::PyObjectRef;
 
 use super::{cdlopen, ffi_obj, lib_obj, parse_c_type};
-use crate::PyError;
+use pyre_interpreter::PyError;
 
 const VERSION_EXPORT: usize = 0x0a03;
 
@@ -38,7 +38,7 @@ pub fn load_cffi1_module(
     let version = export[0] as usize as i64;
     if !(cdlopen::VERSION_MIN..=cdlopen::VERSION_MAX).contains(&version) {
         return Err(PyError::new(
-            crate::PyErrorKind::ImportError,
+            pyre_interpreter::PyErrorKind::ImportError,
             format!(
                 "cffi extension module '{name}' uses an unknown version tag {version:#x}. \
                  This module might need a more recent version of PyPy. The current PyPy \
@@ -50,13 +50,13 @@ pub fn load_cffi1_module(
     let src_ctx = export[1].cast::<parse_c_type::TypeContextS>();
     if src_ctx.is_null() {
         return Err(PyError::new(
-            crate::PyErrorKind::ImportError,
+            pyre_interpreter::PyErrorKind::ImportError,
             format!("cffi extension module '{name}' did not provide a type context"),
         ));
     }
     if unsafe { (*src_ctx).flags & 1 } != 0 {
         return Err(PyError::new(
-            crate::PyErrorKind::ImportError,
+            pyre_interpreter::PyErrorKind::ImportError,
             format!(
                 "cffi extension module '{name}' uses extern \"Python\", which is not supported"
             ),
@@ -84,15 +84,15 @@ pub fn load_cffi1_module(
     let module_slot = lib_slot + 1;
     let _ = roots.pin_root(pyre_object::w_module_new_managed(name));
     let file_slot = module_slot + 1;
-    let _ = roots.pin_root(crate::gateway::fsdecode_os_str(path.as_os_str()));
+    let _ = roots.pin_root(pyre_interpreter::gateway::fsdecode_os_str(path.as_os_str()));
     // `module_ns_store` allocates, so neither the decoded pathname nor the
     // dictionary read off the module survives one as a native local: publish
     // the pathname, and take the dictionary off the rooted module each time.
     let dict = || unsafe { pyre_object::w_module_get_w_dict(roots.get(module_slot)) };
-    crate::module_ns_store(dict(), "__file__", roots.get(file_slot));
-    crate::module_ns_store(dict(), "ffi", roots.get(ffi_slot));
-    crate::module_ns_store(dict(), "lib", roots.get(lib_slot));
-    crate::importing::set_sys_module(name, roots.get(module_slot));
-    crate::importing::set_sys_module(&format!("{name}.lib"), roots.get(lib_slot));
+    pyre_interpreter::module_ns_store(dict(), "__file__", roots.get(file_slot));
+    pyre_interpreter::module_ns_store(dict(), "ffi", roots.get(ffi_slot));
+    pyre_interpreter::module_ns_store(dict(), "lib", roots.get(lib_slot));
+    pyre_interpreter::importing::set_sys_module(name, roots.get(module_slot));
+    pyre_interpreter::importing::set_sys_module(&format!("{name}.lib"), roots.get(lib_slot));
     Ok(roots.get(module_slot))
 }

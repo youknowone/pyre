@@ -5,7 +5,7 @@
 //! back an object that resolves symbols in it against a ctype the caller
 //! supplies.
 
-use crate::PyError;
+use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
 use std::sync::OnceLock;
 
@@ -13,7 +13,7 @@ use super::cdataobj;
 use super::ctypeobj;
 
 /// `libraryobj.py W_Library`.
-#[crate::pyre_class("_cffi_backend.CLibrary")]
+#[pyre_interpreter::pyre_class("_cffi_backend.CLibrary")]
 #[derive(Default)]
 pub struct W_Library {
     /// `W_Library.name`.
@@ -51,7 +51,7 @@ fn library_arg(w_self: PyObjectRef) -> Result<&'static mut W_Library, PyError> {
     W_Library::from_obj(w_self).ok_or_else(|| {
         PyError::type_error(format!(
             "expected a CLibrary object, got '{}'",
-            crate::type_methods::arg_type_name(w_self)
+            pyre_interpreter::type_methods::arg_type_name(w_self)
         ))
     })
 }
@@ -138,7 +138,7 @@ fn load_function(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
             ct.name()
         )));
     }
-    let name = crate::baseobjspace::text_w(args[2])?;
+    let name = pyre_interpreter::baseobjspace::text_w(args[2])?;
     let Some(address) = dlsym(lib.handle as usize, name, true) else {
         return Err(PyError::attribute_error(format!(
             "function/symbol '{name}' not found in library '{}'",
@@ -159,7 +159,7 @@ fn read_variable(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let lib = library_arg(args[0])?;
     lib.check_closed()?;
     let ct = ctypeobj::ctype_arg(args[1])?;
-    let name = crate::baseobjspace::text_w(args[2])?;
+    let name = pyre_interpreter::baseobjspace::text_w(args[2])?;
     let address = variable_address(lib, name)?;
     unsafe { ctypeobj::convert_to_object(ct, address as usize) }
 }
@@ -174,7 +174,7 @@ fn write_variable(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let lib = library_arg(args[0])?;
     lib.check_closed()?;
     let ct = ctypeobj::ctype_arg(args[1])?;
-    let name = crate::baseobjspace::text_w(args[2])?;
+    let name = pyre_interpreter::baseobjspace::text_w(args[2])?;
     let address = variable_address(lib, name)?;
     unsafe {
         ctypeobj::convert_from_object(ct, address.cast_mut() as usize, roots.get(value_slot))?
@@ -216,10 +216,10 @@ static CLIBRARY_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
 /// `_cffi_backend.CLibrary`.
 pub fn clibrary_type() -> PyObjectRef {
     *CLIBRARY_TYPE_OBJ.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type_with_layout(
+        let tp = pyre_interpreter::typedef::make_builtin_type_with_layout(
             "_cffi_backend.CLibrary",
             init_clibrary_type,
-            crate::typedef::w_object(),
+            pyre_interpreter::typedef::w_object(),
             <W_Library as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
         );
         pyre_object::pyobject::set_instantiate(
@@ -237,7 +237,7 @@ fn init_clibrary_type(ns: PyObjectRef) {
     for (name, f, arity) in [
         (
             "__repr__",
-            library_repr as crate::gateway::BuiltinCodeFn,
+            library_repr as pyre_interpreter::gateway::BuiltinCodeFn,
             1u16,
         ),
         ("load_function", load_function, 3),
@@ -247,7 +247,7 @@ fn init_clibrary_type(ns: PyObjectRef) {
     ] {
         store(
             name,
-            crate::make_builtin_function_with_arity(name, f, arity),
+            pyre_interpreter::make_builtin_function_with_arity(name, f, arity),
         );
     }
 }

@@ -1,6 +1,6 @@
 //! C parser opcode realization — PyPy: `pypy/module/_cffi_backend/realize_c_type.py`.
 
-use crate::{PyError, PyErrorKind};
+use pyre_interpreter::{PyError, PyErrorKind};
 use pyre_object::PyObjectRef;
 use std::ffi::CStr;
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -91,7 +91,7 @@ impl RealizeLock {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         while state.owner.as_ref().is_some_and(|owner| *owner != current) {
-            let _blocked = crate::module::thread::before_external_block();
+            let _blocked = pyre_interpreter::module::thread::before_external_block();
             state = self
                 .ready
                 .wait(state)
@@ -144,7 +144,7 @@ fn ffi_error(message: impl Into<String>) -> PyError {
     let mut args = pyre_object::gc_roots::RootedItems::new();
     args.push(newtype::ffi_error());
     args.push(pyre_object::w_str_new_managed(&message));
-    if let Ok(w_exc) = crate::builtins::exc_exception_new(&args.take()) {
+    if let Ok(w_exc) = pyre_interpreter::builtins::exc_exception_new(&args.take()) {
         error.exc_object = w_exc;
     }
     error
@@ -231,7 +231,7 @@ pub fn realize_global_int(
     match neg {
         0 if raw <= i64::MAX as u64 => Ok(pyre_object::w_int_new(raw as i64)),
         0 => Ok(pyre_object::longobject::w_long_new(
-            crate::PyBigInt::from_u128(raw as u128),
+            pyre_interpreter::PyBigInt::from_u128(raw as u128),
         )),
         1 => Ok(pyre_object::w_int_new(raw as i64)),
         2 => Err(ffi_error(format!(
@@ -250,7 +250,7 @@ pub fn realize_global_int(
 
 /// Temporary representation of an `OP_FUNCTION` that has not yet been
 /// required to be a pointer-to-function.
-#[crate::pyre_class("_cffi_backend.__RawFuncType")]
+#[pyre_interpreter::pyre_class("_cffi_backend.__RawFuncType")]
 // `W_RawFuncType._immutable_fields_`: `prepare_nostruct_fnptr` fills these
 // three in once, before any caller can read them, and nothing writes them
 // again.  A call through a promoted raw function type folds its
@@ -271,10 +271,10 @@ static RAW_FUNC_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
 
 fn raw_func_type() -> PyObjectRef {
     *RAW_FUNC_TYPE_OBJ.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type_with_layout(
+        let tp = pyre_interpreter::typedef::make_builtin_type_with_layout(
             "_cffi_backend.__RawFuncType",
             |_| {},
-            crate::typedef::w_object(),
+            pyre_interpreter::typedef::w_object(),
             <W_RawFuncType as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
         );
         pyre_object::pyobject::set_instantiate(
@@ -841,13 +841,13 @@ fn fetch_external_struct_or_union(
     }
     let list_slot = ffi_slot + 1;
     let _ = roots.pin_root(ffi.included_ffis_libs);
-    let included = crate::baseobjspace::fixedview(roots.get(list_slot), -1)?;
+    let included = pyre_interpreter::baseobjspace::fixedview(roots.get(list_slot), -1)?;
     let included_slot = pyre_object::gc_roots::shadow_stack_len();
     for &item in &included {
         let _ = roots.pin_root(item);
     }
     for i in 0..included.len() {
-        let pair = crate::baseobjspace::fixedview(roots.get(included_slot + i), 2)?;
+        let pair = pyre_interpreter::baseobjspace::fixedview(roots.get(included_slot + i), 2)?;
         let pair_slot = pyre_object::gc_roots::shadow_stack_len();
         for &item in &pair {
             let _ = roots.pin_root(item);

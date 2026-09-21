@@ -9,7 +9,7 @@
 //! signature is only known per call, so one is built and freed around the
 //! call itself.
 
-use crate::PyError;
+use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
 
 use super::cdataobj::{self, W_CData};
@@ -180,7 +180,7 @@ fn complete_argtypes(
             return Err(PyError::type_error(format!(
                 "argument {} passed in the variadic part needs to be a cdata object (got {})",
                 i + 1,
-                crate::type_methods::arg_type_name(w_obj)
+                pyre_interpreter::type_methods::arg_type_name(w_obj)
             )));
         };
         fvarargs.push(ctypeobj::get_vararg_type(cdata.ctype)?);
@@ -215,7 +215,7 @@ fn do_call(ct: &W_CType, funcaddr: usize, args_w: &[PyObjectRef]) -> Result<PyOb
     let buffer = cdataobj::raw_malloc_varsize_char(size);
     if buffer == 0 {
         return Err(PyError::new(
-            crate::PyErrorKind::MemoryError,
+            pyre_interpreter::PyErrorKind::MemoryError,
             "out of memory",
         ));
     }
@@ -287,7 +287,7 @@ fn do_call_fargs(
     let buffer = cdataobj::raw_malloc_varsize_char(size);
     if buffer == 0 {
         return Err(PyError::new(
-            crate::PyErrorKind::MemoryError,
+            pyre_interpreter::PyErrorKind::MemoryError,
             "out of memory",
         ));
     }

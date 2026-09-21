@@ -8,7 +8,7 @@
 //! module expresses as [`W_CType::kind`]: the subclass is data, and the
 //! methods it overrides are the `match` arms of the free functions below.
 
-use crate::PyError;
+use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
 use std::sync::OnceLock;
 
@@ -77,7 +77,7 @@ bitflags::bitflags! {
 /// ctypes through weak references (`W_CType._pointer_type`,
 /// `W_CTypePointer._array_types`).  Thus a derived ctype dies with its last
 /// user while a repeated constructor still returns the live memoized object.
-#[crate::pyre_class("_cffi_backend.CType")]
+#[pyre_interpreter::pyre_class("_cffi_backend.CType")]
 // The `_immutable_fields_` the RPython hierarchy spreads over its subclasses,
 // restricted to the ones this flattened struct still writes only while a ctype
 // is being constructed: `W_CType` names `name_position`, `W_CTypePtrOrArray`
@@ -318,7 +318,7 @@ impl W_CType {
         }
         PyError::type_error(format!(
             "initializer for ctype '{name}' must be a {expected}, not {}",
-            crate::type_methods::arg_type_name(w_got)
+            pyre_interpreter::type_methods::arg_type_name(w_got)
         ))
     }
 
@@ -338,7 +338,7 @@ impl W_CType {
             let roots = pyre_object::gc_roots::push_roots();
             let ob_slot = roots.base();
             let _ = roots.pin_root(unsafe { convert_to_object(self, cdata as usize)? });
-            let w_repr = crate::builtins::builtin_repr(&[roots.get(ob_slot)])?;
+            let w_repr = pyre_interpreter::builtins::builtin_repr(&[roots.get(ob_slot)])?;
             return Ok(unsafe { pyre_object::w_str_get_value(w_repr) }.to_string());
         }
         Ok(if cdata.is_null() {
@@ -370,7 +370,7 @@ pub fn ctype_arg(w_ctype: PyObjectRef) -> Result<&'static mut W_CType, PyError> 
         Some(ct) => Ok(ct),
         None => Err(PyError::type_error(format!(
             "expected a ctype object, got '{}'",
-            crate::type_methods::arg_type_name(w_ctype)
+            pyre_interpreter::type_methods::arg_type_name(w_ctype)
         ))),
     }
 }
@@ -747,10 +747,10 @@ static CTYPE_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
 /// `_cffi_backend.CType`.
 pub fn ctype_type() -> PyObjectRef {
     *CTYPE_TYPE_OBJ.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type_with_layout(
+        let tp = pyre_interpreter::typedef::make_builtin_type_with_layout(
             "_cffi_backend.CType",
             init_ctype_type,
-            crate::typedef::w_object(),
+            pyre_interpreter::typedef::w_object(),
             <W_CType as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
         );
         pyre_object::pyobject::set_instantiate(
@@ -783,13 +783,16 @@ fn init_ctype_type(ns: PyObjectRef) {
     };
     store(
         "__repr__",
-        crate::make_builtin_function_with_arity("__repr__", ctype_repr, 1),
+        pyre_interpreter::make_builtin_function_with_arity("__repr__", ctype_repr, 1),
     );
     store(
         "__dir__",
-        crate::make_builtin_function_with_arity("__dir__", ctype_dir, 1),
+        pyre_interpreter::make_builtin_function_with_arity("__dir__", ctype_dir, 1),
     );
-    store("__weakref__", crate::typedef::make_weakref_descr(ns));
+    store(
+        "__weakref__",
+        pyre_interpreter::typedef::make_weakref_descr(ns),
+    );
     for (name, doc, attrchar) in [
         ("kind", "kind", 'k'),
         ("cname", "C name", 'c'),
@@ -806,7 +809,7 @@ fn init_ctype_type(ns: PyObjectRef) {
         let getter = make_fget(name, attrchar);
         store(
             name,
-            crate::typedef::make_getset_property_named_doc(
+            pyre_interpreter::typedef::make_getset_property_named_doc(
                 getter,
                 pyre_object::PY_NULL,
                 pyre_object::PY_NULL,
@@ -823,7 +826,7 @@ fn init_ctype_type(ns: PyObjectRef) {
 fn make_fget(name: &'static str, attrchar: char) -> PyObjectRef {
     macro_rules! fget {
         ($c:literal) => {
-            crate::make_builtin_function_with_arity(
+            pyre_interpreter::make_builtin_function_with_arity(
                 name,
                 |args| {
                     // `typedef.py:361 self.fget(self, space, w_obj)` — the
@@ -927,7 +930,7 @@ fn ctype_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let base = roots.base();
     let mut count = 0;
     for name in ATTRIBUTE_NAMES {
-        if crate::baseobjspace::getattr_str(w_self, name).is_ok() {
+        if pyre_interpreter::baseobjspace::getattr_str(w_self, name).is_ok() {
             let _ = roots.pin_root(pyre_object::w_str_new(name));
             count += 1;
         }

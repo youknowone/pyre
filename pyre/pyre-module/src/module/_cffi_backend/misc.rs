@@ -6,7 +6,7 @@
 //! an ordinary `match` on the byte width, which is what those `rffi.sizeof`
 //! constants evaluate to.
 
-use crate::PyError;
+use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
 use std::ffi::{c_char, c_double, c_int};
 
@@ -354,11 +354,17 @@ pub fn signext(value: i64, size: i64) -> i64 {
 }
 
 fn bad_integer_size() -> PyError {
-    PyError::new(crate::PyErrorKind::NotImplementedError, "bad integer size")
+    PyError::new(
+        pyre_interpreter::PyErrorKind::NotImplementedError,
+        "bad integer size",
+    )
 }
 
 fn bad_float_size() -> PyError {
-    PyError::new(crate::PyErrorKind::NotImplementedError, "bad float size")
+    PyError::new(
+        pyre_interpreter::PyErrorKind::NotImplementedError,
+        "bad float size",
+    )
 }
 
 // ── object → C integer ──────────────────────────────────────────────────
@@ -412,7 +418,7 @@ pub fn as_long(w_ob: PyObjectRef) -> Result<i64, PyError> {
             }
         }
     }
-    crate::baseobjspace::int_w(w_ob)
+    pyre_interpreter::baseobjspace::int_w(w_ob)
 }
 
 /// `misc.py as_long_long`.  Same as [`as_long`] on a 64-bit word.
@@ -440,13 +446,13 @@ pub fn as_unsigned_long_long(w_ob: PyObjectRef, strict: bool) -> Result<u64, PyE
             }
         }
     }
-    let w_int = crate::baseobjspace::space_int(w_ob)?;
+    let w_int = pyre_interpreter::baseobjspace::space_int(w_ob)?;
     if strict {
         // `toulonglong` signals a negative value as `ValueError` and a value
         // too wide for the word as `OverflowError`; both surface here as an
         // `OverflowError`, under their own messages.
-        return crate::baseobjspace::uint_w(w_int).map_err(|err| {
-            let message = if err.kind == crate::error::PyErrorKind::ValueError {
+        return pyre_interpreter::baseobjspace::uint_w(w_int).map_err(|err| {
+            let message = if err.kind == pyre_interpreter::error::PyErrorKind::ValueError {
                 NEG_MSG
             } else {
                 OVF_MSG
@@ -501,13 +507,14 @@ pub fn object_as_bool(w_ob: PyObjectRef) -> Result<bool, PyError> {
     // `space.lookup(w_ob, '__float__')` — the class's slot, not the
     // instance's, so a cdata never takes the float branch.
     let has_float = !is_cdata
-        && crate::typedef::r#type(w_ob).is_some_and(|w_type| unsafe {
-            crate::baseobjspace::lookup_in_type_where(w_type.as_ptr(), "__float__").is_some()
+        && pyre_interpreter::typedef::r#type(w_ob).is_some_and(|w_type| unsafe {
+            pyre_interpreter::baseobjspace::lookup_in_type_where(w_type.as_ptr(), "__float__")
+                .is_some()
         });
     let w_io = if has_float {
-        pyre_object::w_float_new(crate::baseobjspace::float_w(w_ob)?)
+        pyre_object::w_float_new(pyre_interpreter::baseobjspace::float_w(w_ob)?)
     } else {
-        crate::baseobjspace::space_int(w_ob)?
+        pyre_interpreter::baseobjspace::space_int(w_ob)?
     };
     standard_object_as_bool(w_io).ok_or_else(|| PyError::type_error("integer/float expected"))
 }
@@ -562,7 +569,7 @@ pub fn dlopen_w(w_filename: PyObjectRef, flags: i64) -> Result<(String, usize, b
     let fname = if is_none {
         "<None>".to_string()
     } else {
-        crate::gateway::fsdecode_os_str_wtf8(&filename_of(w_filename)?).to_string()
+        pyre_interpreter::gateway::fsdecode_os_str_wtf8(&filename_of(w_filename)?).to_string()
     };
     let handle = open_library(w_filename, is_none, flags, &fname)?;
     Ok((fname, handle, true))
@@ -573,13 +580,13 @@ pub fn dlopen_w(w_filename: PyObjectRef, flags: i64) -> Result<(String, usize, b
 fn filename_of(w_filename: PyObjectRef) -> Result<std::ffi::OsString, PyError> {
     unsafe {
         if pyre_object::bytesobject::is_bytes(w_filename) {
-            return Ok(crate::gateway::os_string_from_fs_bytes(
+            return Ok(pyre_interpreter::gateway::os_string_from_fs_bytes(
                 pyre_object::bytesobject::w_bytes_data(w_filename),
             ));
         }
     }
-    Ok(crate::gateway::os_string_from_fs_bytes(
-        &crate::gateway::fsencode(w_filename)?,
+    Ok(pyre_interpreter::gateway::os_string_from_fs_bytes(
+        &pyre_interpreter::gateway::fsencode(w_filename)?,
     ))
 }
 
@@ -623,7 +630,7 @@ fn open_library(
     rustpython_host_env::ctypes::open_library_with_mode(&name, mode).map_err(|e| {
         PyError::os_error(format!(
             "cannot load library {fname}: {}",
-            crate::with_causes(&e)
+            pyre_interpreter::with_causes(&e)
         ))
     })
 }
@@ -642,7 +649,7 @@ fn open_library(
     rustpython_host_env::ctypes::open_library(&name).map_err(|e| {
         PyError::os_error(format!(
             "cannot load library {fname}: {}",
-            crate::with_causes(&e)
+            pyre_interpreter::with_causes(&e)
         ))
     })
 }

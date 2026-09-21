@@ -742,13 +742,8 @@ fn w_memoryview_new_with_flags_impl(
             // keeps its zero-copy window and derived geometry.
             return Ok(w_memoryview_copy_derived(w_obj));
         }
-        #[cfg(all(
-            feature = "host_env",
-            not(feature = "sandbox"),
-            not(target_arch = "wasm32")
-        ))]
-        if let Some((address, length)) =
-            crate::module::_cffi_backend::cbuffer::mini_buffer_params(w_obj)
+        if let Some(hooks) = crate::importing::optional_module_hooks()
+            && let Some((address, length)) = (hooks.mini_buffer_params)(w_obj)
         {
             use pyre_object::buffer::Buffer;
             use pyre_object::bufferview::BufferView;
@@ -8007,7 +8002,7 @@ pub(crate) fn set_crt_errno(value: i32) {
 }
 
 /// The errno the last C runtime call reported.
-pub(crate) fn crt_errno() -> i32 {
+pub fn crt_errno() -> i32 {
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     {
         rustpython_host_env::os::get_errno()
@@ -11412,7 +11407,7 @@ unsafe fn py_repr_obj(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
 }
 
 /// `repr(obj)` → string representation
-pub(crate) fn builtin_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn builtin_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() != 1 {
         return Err(crate::PyError::type_error(format!(
             "repr() takes exactly one argument ({} given)",
@@ -16746,7 +16741,7 @@ fn builtin_eval(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     exec_or_eval(source, globals_arg, locals_arg, true, pyre_object::PY_NULL)
 }
 
-pub(crate) fn exec_or_eval(
+pub fn exec_or_eval(
     source: PyObjectRef,
     globals_arg: PyObjectRef,
     locals_arg: PyObjectRef,
@@ -20334,13 +20329,8 @@ impl Drop for WritableBuffer {
 /// `array.array`'s element bytes, and a contiguous memoryview's window.
 pub unsafe fn acquire_readbuf<'a>(obj: PyObjectRef) -> Result<&'a [u8], crate::PyError> {
     unsafe {
-        #[cfg(all(
-            feature = "host_env",
-            not(feature = "sandbox"),
-            not(target_arch = "wasm32")
-        ))]
-        if let Some((address, length)) =
-            crate::module::_cffi_backend::cbuffer::mini_buffer_params(obj)
+        if let Some(hooks) = crate::importing::optional_module_hooks()
+            && let Some((address, length)) = (hooks.mini_buffer_params)(obj)
         {
             return Ok(std::slice::from_raw_parts(address, length));
         }
@@ -20400,13 +20390,8 @@ pub unsafe fn fileio_writebuf(
     }
 
     unsafe {
-        #[cfg(all(
-            feature = "host_env",
-            not(feature = "sandbox"),
-            not(target_arch = "wasm32")
-        ))]
-        if let Some((address, length)) =
-            crate::module::_cffi_backend::cbuffer::mini_buffer_params(obj)
+        if let Some(hooks) = crate::importing::optional_module_hooks()
+            && let Some((address, length)) = (hooks.mini_buffer_params)(obj)
         {
             return Ok((std::slice::from_raw_parts_mut(address, length), obj, false));
         }

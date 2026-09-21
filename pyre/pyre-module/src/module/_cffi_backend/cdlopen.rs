@@ -1,6 +1,6 @@
 //! ABI-mode library loading — PyPy: `pypy/module/_cffi_backend/cdlopen.py`.
 
-use crate::PyError;
+use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
 
 use super::{ffi_obj, lib_obj, misc, parse_c_type};
@@ -62,7 +62,7 @@ fn packed_bytes(w_obj: PyObjectRef) -> Result<&'static [u8], PyError> {
     if !unsafe { pyre_object::bytesobject::is_bytes(w_obj) } {
         return Err(PyError::type_error(format!(
             "expected bytes, got {} object",
-            crate::type_methods::arg_type_name(w_obj)
+            pyre_interpreter::type_methods::arg_type_name(w_obj)
         )));
     }
     Ok(unsafe { pyre_object::bytesobject::w_bytes_data(w_obj) })
@@ -71,7 +71,12 @@ fn packed_bytes(w_obj: PyObjectRef) -> Result<&'static [u8], PyError> {
 fn allocate_array<T>(w_ffi: PyObjectRef, nitems: usize) -> Result<*mut T, PyError> {
     let nbytes = nitems
         .checked_mul(core::mem::size_of::<T>())
-        .ok_or_else(|| PyError::new(crate::PyErrorKind::MemoryError, "FFI array is too large"))?;
+        .ok_or_else(|| {
+            PyError::new(
+                pyre_interpreter::PyErrorKind::MemoryError,
+                "FFI array is too large",
+            )
+        })?;
     ffi_obj::allocate_free_mem(w_ffi, nbytes).map(|ptr| ptr.cast())
 }
 
@@ -96,7 +101,7 @@ fn integer_value(w_integer: PyObjectRef) -> Result<(u64, i32), PyError> {
     }
     Err(PyError::type_error(format!(
         "expected an integer, got '{}'",
-        crate::type_methods::arg_type_name(w_integer)
+        pyre_interpreter::type_methods::arg_type_name(w_integer)
     )))
 }
 
@@ -130,7 +135,7 @@ pub fn ffiobj_init(
     }
     if !(VERSION_MIN..=VERSION_MAX).contains(&version) {
         return Err(PyError::new(
-            crate::PyErrorKind::ImportError,
+            pyre_interpreter::PyErrorKind::ImportError,
             format!(
                 "cffi out-of-line Python module '{module_name}' has unknown version {version:#x}"
             ),
@@ -159,7 +164,7 @@ pub fn ffiobj_init(
     }
 
     if !is_none_or_null(roots.get(ffi_slot + 1)) {
-        let globals = crate::baseobjspace::fixedview(roots.get(ffi_slot + 1), -1)?;
+        let globals = pyre_interpreter::baseobjspace::fixedview(roots.get(ffi_slot + 1), -1)?;
         if globals.len() % 2 != 0 {
             return Err(PyError::value_error(
                 "CFFI packed globals must contain string/value pairs",
@@ -202,7 +207,7 @@ pub fn ffiobj_init(
     }
 
     if !is_none_or_null(roots.get(ffi_slot + 2)) {
-        let struct_unions = crate::baseobjspace::fixedview(roots.get(ffi_slot + 2), -1)?;
+        let struct_unions = pyre_interpreter::baseobjspace::fixedview(roots.get(ffi_slot + 2), -1)?;
         let base = pyre_object::gc_roots::shadow_stack_len();
         for &item in &struct_unions {
             let _ = roots.pin_root(item);
@@ -210,7 +215,7 @@ pub fn ffiobj_init(
         let n = struct_unions.len();
         let mut nftot = 0usize;
         for i in 0..n {
-            nftot += crate::baseobjspace::fixedview(roots.get(base + i), -1)?
+            nftot += pyre_interpreter::baseobjspace::fixedview(roots.get(base + i), -1)?
                 .len()
                 .saturating_sub(1);
         }
@@ -218,7 +223,7 @@ pub fn ffiobj_init(
         let nfields = allocate_array::<parse_c_type::FieldS>(roots.get(ffi_slot), nftot)?;
         let mut nf = 0usize;
         for i in 0..n {
-            let desc = crate::baseobjspace::fixedview(roots.get(base + i), -1)?;
+            let desc = pyre_interpreter::baseobjspace::fixedview(roots.get(base + i), -1)?;
             let desc_base = pyre_object::gc_roots::shadow_stack_len();
             for &item in &desc {
                 let _ = roots.pin_root(item);
@@ -272,7 +277,7 @@ pub fn ffiobj_init(
     }
 
     if !is_none_or_null(roots.get(ffi_slot + 3)) {
-        let enums = crate::baseobjspace::fixedview(roots.get(ffi_slot + 3), -1)?;
+        let enums = pyre_interpreter::baseobjspace::fixedview(roots.get(ffi_slot + 3), -1)?;
         let base = pyre_object::gc_roots::shadow_stack_len();
         for &item in &enums {
             let _ = roots.pin_root(item);
@@ -296,7 +301,7 @@ pub fn ffiobj_init(
     }
 
     if !is_none_or_null(roots.get(ffi_slot + 4)) {
-        let typenames = crate::baseobjspace::fixedview(roots.get(ffi_slot + 4), -1)?;
+        let typenames = pyre_interpreter::baseobjspace::fixedview(roots.get(ffi_slot + 4), -1)?;
         let base = pyre_object::gc_roots::shadow_stack_len();
         for &item in &typenames {
             let _ = roots.pin_root(item);
@@ -318,7 +323,7 @@ pub fn ffiobj_init(
     }
 
     if !is_none_or_null(roots.get(ffi_slot + 5)) {
-        let includes = crate::baseobjspace::fixedview(roots.get(ffi_slot + 5), -1)?;
+        let includes = pyre_interpreter::baseobjspace::fixedview(roots.get(ffi_slot + 5), -1)?;
         let base = pyre_object::gc_roots::shadow_stack_len();
         for &item in &includes {
             let _ = roots.pin_root(item);

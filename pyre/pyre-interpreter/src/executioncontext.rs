@@ -3167,7 +3167,7 @@ impl UserDelAction {
     /// generators and coroutines, and `__del__`.  The remaining branches
     /// release a buffer export, which `tp_dealloc` does and `tp_finalize`
     /// does not.
-    fn begin_finalizer(&mut self, w_obj: PyObjectRef) -> bool {
+    pub fn begin_finalizer(&mut self, w_obj: PyObjectRef) -> bool {
         if self.gc_disabled(w_obj) {
             return false;
         }
@@ -3196,34 +3196,13 @@ impl UserDelAction {
             }
             return;
         }
-        #[cfg(all(
-            feature = "host_env",
-            not(feature = "sandbox"),
-            not(target_arch = "wasm32")
-        ))]
-        if let Some(cdata) = crate::module::_cffi_backend::cdataobj::W_CData::from_obj(current())
-            && matches!(
-                cdata.flavor,
-                crate::module::_cffi_backend::cdataobj::FLAVOR_FROM_BUFFER
-                    | crate::module::_cffi_backend::cdataobj::FLAVOR_GCP
-                    | crate::module::_cffi_backend::cdataobj::FLAVOR_NEW_NONSTD
-            )
+        if let Some(hooks) = crate::importing::optional_module_hooks()
+            && let Some(calls_python) = (hooks.cffi_finalizer_kind)(current())
         {
-            let calls_python = matches!(
-                cdata.flavor,
-                crate::module::_cffi_backend::cdataobj::FLAVOR_GCP
-                    | crate::module::_cffi_backend::cdataobj::FLAVOR_NEW_NONSTD
-            );
             if calls_python && !self.begin_finalizer(current()) {
                 return;
             }
-            if let Err(mut error) = crate::module::_cffi_backend::cdataobj::finalize(current()) {
-                error.write_unraisable(
-                    pyre_object::w_none(),
-                    rustpython_wtf8::Wtf8::new("Exception ignored in cffi destructor"),
-                    current(),
-                );
-            }
+            (hooks.run_cffi_finalize)(current());
             return;
         }
         if pyre_object::generator::AsyncGenASend::from_obj(current()).is_some()

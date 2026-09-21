@@ -5,7 +5,7 @@
 //! [`ctypeobj::KIND_STRUCT`] / [`ctypeobj::KIND_UNION`] arms here.  `W_CField`
 //! is a type of its own, as in PyPy.
 
-use crate::PyError;
+use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
 use std::sync::OnceLock;
 
@@ -21,7 +21,7 @@ pub const BS_EMPTY_ARRAY: i64 = -2;
 pub const BF_IGNORE_IN_CTOR: i64 = 0x01;
 
 /// `ctypestruct.py W_CField`.
-#[crate::pyre_class("_cffi_backend.CField")]
+#[pyre_interpreter::pyre_class("_cffi_backend.CField")]
 #[derive(Default)]
 pub struct W_CField {
     /// `W_CField.ctype`.
@@ -349,7 +349,7 @@ pub unsafe fn convert_struct_from_object(
     let is_seq =
         unsafe { pyre_object::pyobject::is_list(w_ob) || pyre_object::pyobject::is_tuple(w_ob) };
     if is_seq {
-        let items = crate::baseobjspace::unpackiterable(roots.get(ob_slot), -1)?;
+        let items = pyre_interpreter::baseobjspace::unpackiterable(roots.get(ob_slot), -1)?;
         let items_slot = pyre_object::gc_roots::shadow_stack_len();
         for &item in &items {
             let _ = roots.pin_root(item);
@@ -381,7 +381,7 @@ pub unsafe fn convert_struct_from_object(
         return Ok(optvarsize);
     }
     if unsafe { pyre_object::pyobject::is_dict(w_ob) } {
-        let keys = crate::baseobjspace::fixedview(roots.get(ob_slot), -1)?;
+        let keys = pyre_interpreter::baseobjspace::fixedview(roots.get(ob_slot), -1)?;
         let keys_slot = pyre_object::gc_roots::shadow_stack_len();
         for &key in &keys {
             let _ = roots.pin_root(key);
@@ -390,13 +390,16 @@ pub unsafe fn convert_struct_from_object(
         let _ = roots.pin_root(pyre_object::PY_NULL);
         for i in 0..keys.len() {
             let w_key = roots.get(keys_slot + i);
-            let key = crate::baseobjspace::text_w(w_key)?;
+            let key = pyre_interpreter::baseobjspace::text_w(w_key)?;
             let Ok(field) = ctypeobj::getcfield(ct, key, "write") else {
                 return Err(PyError::key_error_with_key(w_key));
             };
             roots.set(
                 value_slot,
-                crate::baseobjspace::getitem(roots.get(ob_slot), roots.get(keys_slot + i))?,
+                pyre_interpreter::baseobjspace::getitem(
+                    roots.get(ob_slot),
+                    roots.get(keys_slot + i),
+                )?,
             );
             optvarsize = unsafe { write_v(field, cdata, roots.get(value_slot), optvarsize)? };
         }
@@ -453,11 +456,11 @@ fn fields_dict_items(ct: &W_CType) -> Result<Vec<(String, PyObjectRef)>, PyError
     if ct.fields_dict.is_null() {
         return Ok(Vec::new());
     }
-    let keys = crate::baseobjspace::fixedview(ct.fields_dict, -1)?;
+    let keys = pyre_interpreter::baseobjspace::fixedview(ct.fields_dict, -1)?;
     let mut out = Vec::with_capacity(keys.len());
     for w_key in keys {
-        let name = crate::baseobjspace::text_w(w_key)?.to_string();
-        let w_value = crate::baseobjspace::getitem(ct.fields_dict, w_key)?;
+        let name = pyre_interpreter::baseobjspace::text_w(w_key)?.to_string();
+        let w_value = pyre_interpreter::baseobjspace::getitem(ct.fields_dict, w_key)?;
         out.push((name, w_value));
     }
     Ok(out)
@@ -505,10 +508,10 @@ static CFIELD_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
 /// `_cffi_backend.CField`.
 pub fn cfield_type() -> PyObjectRef {
     *CFIELD_TYPE_OBJ.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type_with_layout(
+        let tp = pyre_interpreter::typedef::make_builtin_type_with_layout(
             "_cffi_backend.CField",
             init_cfield_type,
-            crate::typedef::w_object(),
+            pyre_interpreter::typedef::w_object(),
             <W_CField as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
         );
         pyre_object::pyobject::set_instantiate(
@@ -532,7 +535,7 @@ fn init_cfield_type(ns: PyObjectRef) {
     ] {
         store(
             name,
-            crate::typedef::make_getset_property_named_doc(
+            pyre_interpreter::typedef::make_getset_property_named_doc(
                 make_fget(name),
                 pyre_object::PY_NULL,
                 pyre_object::PY_NULL,
@@ -548,7 +551,7 @@ fn init_cfield_type(ns: PyObjectRef) {
 fn make_fget(name: &'static str) -> PyObjectRef {
     macro_rules! fget {
         ($read:expr) => {
-            crate::make_builtin_function_with_arity(
+            pyre_interpreter::make_builtin_function_with_arity(
                 name,
                 |args| {
                     // `typedef.py:361 self.fget(self, space, w_obj)`.

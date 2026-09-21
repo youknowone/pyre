@@ -513,6 +513,12 @@ pub struct OptionalModuleHooks {
     /// hypot/atan2/…). `jit_trace_fnaddrs` appends these after the
     /// interpreter-owned table.
     pub publish_fnaddrs: fn(&mut Vec<(&'static str, i64)>),
+    pub mini_buffer_params: fn(PyObjectRef) -> Option<(*mut u8, usize)>,
+    /// `Some(calls_python)` when `obj` is a cdata flavor this path handles.
+    pub cffi_finalizer_kind: fn(PyObjectRef) -> Option<bool>,
+    pub run_cffi_finalize: fn(PyObjectRef),
+    pub close_cffi_fileobj: fn(PyObjectRef),
+    pub load_cffi1_module: fn(&str, &std::path::Path, usize) -> Result<PyObjectRef, crate::PyError>,
 }
 
 static OPTIONAL_MODULE_HOOKS: std::sync::OnceLock<OptionalModuleHooks> = std::sync::OnceLock::new();
@@ -773,12 +779,6 @@ pub fn install_builtin_modules() {
         // sigset calls and `pause`.
         pyre_install_module!("_signal"(signal));
         pyre_install_module!(_ctypes);
-        #[cfg(all(
-            feature = "host_env",
-            not(feature = "sandbox"),
-            not(target_arch = "wasm32")
-        ))]
-        pyre_install_module!(_cffi_backend);
     }
     pyre_install_module!(_locale);
     pyre_install_module!(_random);

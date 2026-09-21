@@ -1,7 +1,7 @@
 //! `_cffi_backend.__CData_iterator` — PyPy:
 //! `pypy/module/_cffi_backend/ctypearray.py`'s `W_CDataIter`.
 
-use crate::PyError;
+use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
 use std::sync::OnceLock;
 
@@ -9,7 +9,7 @@ use super::cdataobj;
 use super::ctypeobj;
 
 /// `ctypearray.py W_CDataIter`.
-#[crate::pyre_class("_cffi_backend.__CData_iterator")]
+#[pyre_interpreter::pyre_class("_cffi_backend.__CData_iterator")]
 #[derive(Default)]
 pub struct W_CDataIter {
     /// `W_CDataIter.ctitem`.
@@ -49,10 +49,10 @@ static CDATA_ITER_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
 /// `_cffi_backend.__CData_iterator`.
 pub fn cdata_iter_type() -> PyObjectRef {
     *CDATA_ITER_TYPE_OBJ.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type_with_layout(
+        let tp = pyre_interpreter::typedef::make_builtin_type_with_layout(
             "_cffi_backend.__CData_iterator",
             init_cdata_iter_type,
-            crate::typedef::w_object(),
+            pyre_interpreter::typedef::w_object(),
             <W_CDataIter as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
         );
         pyre_object::pyobject::set_instantiate(
@@ -65,14 +65,17 @@ pub fn cdata_iter_type() -> PyObjectRef {
 
 fn init_cdata_iter_type(ns: PyObjectRef) {
     for (name, f) in [
-        ("__iter__", iter_w as crate::gateway::BuiltinCodeFn),
+        (
+            "__iter__",
+            iter_w as pyre_interpreter::gateway::BuiltinCodeFn,
+        ),
         ("__next__", next_w),
     ] {
         unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                crate::make_builtin_function_with_arity(name, f, 1),
+                pyre_interpreter::make_builtin_function_with_arity(name, f, 1),
             );
         }
     }
@@ -88,7 +91,10 @@ fn next_w(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let it = W_CDataIter::from_obj(args[0])
         .ok_or_else(|| PyError::type_error("expected a __CData_iterator"))?;
     if std::ptr::eq(it.next, it.stop) {
-        return Err(PyError::new(crate::PyErrorKind::StopIteration, ""));
+        return Err(PyError::new(
+            pyre_interpreter::PyErrorKind::StopIteration,
+            "",
+        ));
     }
     let item = ctypeobj::ctype_at(it.ctitem)
         .ok_or_else(|| PyError::system_error("iterator without an item type"))?;

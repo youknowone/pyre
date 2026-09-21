@@ -24,10 +24,12 @@ pyre-native = { workspace = true }
 ctor = { workspace = true }
 libc = { workspace = true }
 linkme = { workspace = true }
+bitflags = { workspace = true }
 majit-ir = { workspace = true }
 majit-macros = { workspace = true }
 majit-metainterp = { workspace = true }
 majit-rlib = { workspace = true }
+majit-gc = { workspace = true }
 num-traits = { workspace = true }
 parking_lot = { workspace = true }
 num-complex = { workspace = true }
@@ -39,6 +41,9 @@ rustpython-compiler-core = { workspace = true }
 rustpython-host_env = { workspace = true, optional = true }
 rustpython-unicode = { workspace = true }
 rustpython-wtf8 = { workspace = true }
+
+[target.'cfg(all(any(target_os = "linux", target_os = "macos", target_os = "windows", target_os = "android"), not(any(target_env = "musl", target_env = "sgx"))))'.dependencies]
+libffi = { version = "5", features = ["system"] }
 
 [target.'cfg(windows)'.dependencies]
 # `faulthandler`'s vectored exception handler returns

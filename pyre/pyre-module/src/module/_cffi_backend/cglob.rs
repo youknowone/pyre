@@ -1,13 +1,13 @@
 //! CFFI global-variable support — PyPy: `pypy/module/_cffi_backend/cglob.py`.
 
-use crate::PyError;
+use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
 use std::sync::OnceLock;
 
 use super::{cdataobj, ctypeobj, ffi_obj, newtype};
 
 /// `W_GlobSupport`.
-#[crate::pyre_class("_cffi_backend.__FFIGlobSupport")]
+#[pyre_interpreter::pyre_class("_cffi_backend.__FFIGlobSupport")]
 #[derive(Default)]
 pub struct W_GlobSupport {
     pub w_name: PyObjectRef,
@@ -53,11 +53,11 @@ pub fn fetch_global_var_addr(w_glob: PyObjectRef) -> Result<*mut u8, PyError> {
     } else {
         type FetchAddr = unsafe extern "C" fn() -> *mut u8;
         let fetch_addr: FetchAddr = unsafe { core::mem::transmute(glob.fetch_addr) };
-        let _blocked = crate::module::thread::before_external_block();
+        let _blocked = pyre_interpreter::module::thread::before_external_block();
         unsafe { fetch_addr() }
     };
     if result.is_null() {
-        let name = crate::baseobjspace::text_w(glob.w_name)?.to_string();
+        let name = pyre_interpreter::baseobjspace::text_w(glob.w_name)?.to_string();
         return Err(ffi_obj::ffi_error(format!(
             "global variable '{name}' is at address NULL"
         )));
@@ -102,10 +102,10 @@ static GLOB_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
 /// `_cffi_backend.__FFIGlobSupport`.
 pub fn glob_type() -> PyObjectRef {
     *GLOB_TYPE_OBJ.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type_with_layout(
+        let tp = pyre_interpreter::typedef::make_builtin_type_with_layout(
             "_cffi_backend.__FFIGlobSupport",
             |_| {},
-            crate::typedef::w_object(),
+            pyre_interpreter::typedef::w_object(),
             <W_GlobSupport as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
         );
         pyre_object::pyobject::set_instantiate(

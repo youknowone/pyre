@@ -1357,7 +1357,7 @@ macro_rules! wtf8_format {
         buf
     }};
 }
-pub(crate) use wtf8_format;
+pub use wtf8_format;
 
 /// Format for str() — tries __str__ first, then __repr__.
 /// # Safety

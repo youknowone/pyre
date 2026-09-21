@@ -1,6 +1,6 @@
 //! `_cffi_backend.FFI` — PyPy: `pypy/module/_cffi_backend/ffi_obj.py`.
 
-use crate::PyError;
+use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
 use std::ffi::{CStr, CString};
 use std::sync::{Mutex, OnceLock};
@@ -25,7 +25,7 @@ pub struct FreeCtxObj {
 }
 
 /// `W_FFIObject`.
-#[crate::pyre_class("_cffi_backend.FFI", cpython_heaptype)]
+#[pyre_interpreter::pyre_class("_cffi_backend.FFI", cpython_heaptype)]
 pub struct W_FFIObject {
     /// Mapdict prefix used by subclasses of `FFI`.
     pub map: usize,
@@ -94,7 +94,7 @@ pub(crate) fn ffi_error(message: impl Into<String>) -> PyError {
     let mut args = pyre_object::gc_roots::RootedItems::new();
     args.push(newtype::ffi_error());
     args.push(pyre_object::w_str_new_managed(&message));
-    if let Ok(w_exc) = crate::builtins::exc_exception_new(&args.take()) {
+    if let Ok(w_exc) = pyre_interpreter::builtins::exc_exception_new(&args.take()) {
         error.exc_object = w_exc;
     }
     error
@@ -141,7 +141,7 @@ pub(crate) fn initialize_ffi(
         init_once_locks: Box::into_raw(Box::new(InitOnceLocks::default())),
         ..Default::default()
     });
-    Ok(crate::typedef::tag_subclass_instance(
+    Ok(pyre_interpreter::typedef::tag_subclass_instance(
         obj,
         roots.get(type_slot),
     ))
@@ -149,7 +149,7 @@ pub(crate) fn initialize_ffi(
 
 /// `make_plain_ffi_object`.
 pub fn make_plain_ffi_object(w_ffitype: PyObjectRef) -> Result<PyObjectRef, PyError> {
-    crate::typedef::check_user_subclass(ffi_type_object(), w_ffitype)?;
+    pyre_interpreter::typedef::check_user_subclass(ffi_type_object(), w_ffitype)?;
     initialize_ffi(w_ffitype, std::ptr::null())
 }
 
@@ -194,12 +194,12 @@ fn ffi_init(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let module_name = if roots.get(base + 1).is_null() {
         "?".to_string()
     } else {
-        crate::baseobjspace::text_w(roots.get(base + 1))?.to_string()
+        pyre_interpreter::baseobjspace::text_w(roots.get(base + 1))?.to_string()
     };
     let version = if roots.get(base + 2).is_null() {
         -1
     } else {
-        crate::baseobjspace::int_w(roots.get(base + 2))?
+        pyre_interpreter::baseobjspace::int_w(roots.get(base + 2))?
     };
     let types = if roots.get(base + 3).is_null() {
         Vec::new()
@@ -208,7 +208,7 @@ fn ffi_init(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     } else {
         return Err(PyError::type_error(format!(
             "expected bytes for _types, got '{}'",
-            crate::type_methods::arg_type_name(roots.get(base + 3))
+            pyre_interpreter::type_methods::arg_type_name(roots.get(base + 3))
         )));
     };
     cdlopen::ffiobj_init(
@@ -259,7 +259,7 @@ pub(crate) fn allocate_free_mem(w_ffi: PyObjectRef, nbytes: usize) -> Result<*mu
     let ptr = unsafe { libc::calloc(1, nbytes.max(1)) }.cast::<u8>();
     if ptr.is_null() {
         return Err(PyError::new(
-            crate::PyErrorKind::MemoryError,
+            pyre_interpreter::PyErrorKind::MemoryError,
             "cannot allocate FFI context memory",
         ));
     }
@@ -278,7 +278,7 @@ fn bind_method(
     names: &[&str],
     required: usize,
 ) -> Result<Vec<PyObjectRef>, PyError> {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
     if positional.is_empty() {
         return Err(PyError::type_error(format!(
             "{method}() missing FFI receiver"
@@ -291,12 +291,12 @@ fn bind_method(
             positional.len() - 1
         )));
     }
-    crate::builtins::kwarg_reject_unknown(kwargs, names, method)?;
+    pyre_interpreter::builtins::kwarg_reject_unknown(kwargs, names, method)?;
     let mut bound = Vec::with_capacity(names.len() + 1);
     bound.push(positional[0]);
     for (i, name) in names.iter().enumerate() {
         let positional_value = positional.get(i + 1).copied();
-        let keyword_value = crate::builtins::kwarg_get(kwargs, name);
+        let keyword_value = pyre_interpreter::builtins::kwarg_get(kwargs, name);
         let value = match (positional_value, keyword_value) {
             (Some(_), Some(_)) => {
                 return Err(PyError::type_error(format!(
@@ -320,8 +320,8 @@ fn no_keyword_varargs<'a>(
     args: &'a [PyObjectRef],
     method: &str,
 ) -> Result<&'a [PyObjectRef], PyError> {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if crate::builtins::real_kwarg_count(kwargs) != 0 {
+    let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
+    if pyre_interpreter::builtins::real_kwarg_count(kwargs) != 0 {
         return Err(PyError::type_error(format!(
             "{method}() takes no keyword arguments"
         )));
@@ -459,7 +459,7 @@ pub fn parse_string_to_type(
 /// `W_FFIObject.ffi_type`.
 pub fn ffi_type(w_ffi: PyObjectRef, w_x: PyObjectRef, accept: i64) -> Result<PyObjectRef, PyError> {
     if accept & ACCEPT_STRING != 0 && unsafe { pyre_object::unicodeobject::is_str(w_x) } {
-        let string = crate::baseobjspace::text_w(w_x)?.to_string();
+        let string = pyre_interpreter::baseobjspace::text_w(w_x)?.to_string();
         let consider = accept & CONSIDER_FN_AS_FNPTR != 0;
         if let Some(found) = get_string_to_type(w_ffi, &string, consider)? {
             return Ok(found);
@@ -487,7 +487,7 @@ pub fn ffi_type(w_ffi: PyObjectRef, w_x: PyObjectRef, accept: i64) -> Result<PyO
     Err(PyError::type_error(format!(
         "expected a {}, got '{}'",
         expected.join(" or "),
-        crate::type_methods::arg_type_name(w_x)
+        pyre_interpreter::type_methods::arg_type_name(w_x)
     )))
 }
 
@@ -511,13 +511,13 @@ pub fn fetch_int_constant(w_ffi: PyObjectRef, name: &str) -> Result<Option<PyObj
     }
     let included_list_slot = ffi_slot + 1;
     let _ = roots.pin_root(ffi.included_ffis_libs);
-    let included = crate::baseobjspace::fixedview(roots.get(included_list_slot), -1)?;
+    let included = pyre_interpreter::baseobjspace::fixedview(roots.get(included_list_slot), -1)?;
     let base = pyre_object::gc_roots::shadow_stack_len();
     for &item in &included {
         let _ = roots.pin_root(item);
     }
     for i in 0..included.len() {
-        let pair = crate::baseobjspace::fixedview(roots.get(base + i), 2)?;
+        let pair = pyre_interpreter::baseobjspace::fixedview(roots.get(base + i), 2)?;
         let pair_slot = pyre_object::gc_roots::shadow_stack_len();
         for &item in &pair {
             let _ = roots.pin_root(item);
@@ -540,7 +540,7 @@ fn ffi_addressof(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         let _ = roots.pin_root(arg);
     }
     if lib_obj::W_LibObject::from_obj(roots.get(base + 1)).is_some() && args.len() == 3 {
-        let name = crate::baseobjspace::text_w(roots.get(base + 2))?.to_string();
+        let name = pyre_interpreter::baseobjspace::text_w(roots.get(base + 2))?.to_string();
         return lib_obj::address_of_func_or_global_var(roots.get(base + 1), &name);
     }
     let mut w_ctype = ffi_type(roots.get(base), roots.get(base + 1), ACCEPT_CDATA)?;
@@ -643,15 +643,15 @@ fn ffi_callback(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     // lookup: generated CFFI modules are loaded by cpyext without first
     // importing the backend module itself, and their first callback must make
     // the builtin visible exactly as the app-level import does.
-    let w_module = match crate::importing::get_sys_module("_cffi_backend") {
+    let w_module = match pyre_interpreter::importing::get_sys_module("_cffi_backend") {
         Some(module) => module,
-        None => crate::importing::dunder_import(
+        None => pyre_interpreter::importing::dunder_import(
             "_cffi_backend",
             pyre_object::PY_NULL,
             pyre_object::PY_NULL,
             pyre_object::PY_NULL,
             0,
-            crate::call::getexecutioncontext(),
+            pyre_interpreter::call::getexecutioncontext(),
         )?,
     };
     let module_slot = onerror_slot + 1;
@@ -686,13 +686,12 @@ fn ffi_callback(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     // application has rebound that name.
     const DECORATOR: &str =
         "lambda python_callable: _cffi_backend.callback(ctype, python_callable, error, onerror)";
-    let code = crate::compile::compile_eval(DECORATOR)
+    let code = pyre_interpreter::compile::compile_eval(DECORATOR)
         .map_err(|_| PyError::system_error("could not compile the callback decorator"))?;
     let code_slot = globals_slot + 1;
-    let _ = roots.pin_root(crate::pycode::box_code_object_with_hidden_applevel(
-        code, true,
-    ));
-    crate::builtins::exec_or_eval(
+    let _ =
+        roots.pin_root(pyre_interpreter::pycode::box_code_object_with_hidden_applevel(code, true));
+    pyre_interpreter::builtins::exec_or_eval(
         roots.get(code_slot),
         roots.get(globals_slot),
         pyre_object::PY_NULL,
@@ -728,7 +727,7 @@ fn ffi_from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let writable = if roots.get(base + 3).is_null() {
         0
     } else {
-        crate::baseobjspace::int_w(roots.get(base + 3))?
+        pyre_interpreter::baseobjspace::int_w(roots.get(base + 3))?
     };
     func::from_buffer(&[w_ctype, w_buffer, pyre_object::w_int_new(writable)])
 }
@@ -751,7 +750,7 @@ fn ffi_gc(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let size = if roots.get(base + 3).is_null() {
         0
     } else {
-        crate::baseobjspace::int_w(roots.get(base + 3))?
+        pyre_interpreter::baseobjspace::int_w(roots.get(base + 3))?
     };
     cdataobj::with_gc(roots.get(base + 1), roots.get(base + 2), size)
 }
@@ -772,7 +771,7 @@ fn ffi_getctype(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let replacement = if roots.get(base + 2).is_null() {
         String::new()
     } else {
-        crate::baseobjspace::text_w(roots.get(base + 2))?
+        pyre_interpreter::baseobjspace::text_w(roots.get(base + 2))?
             .trim_matches(' ')
             .to_string()
     };
@@ -847,7 +846,7 @@ fn ffi_new_allocator(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let clear = if roots.get(base + 3).is_null() {
         true
     } else {
-        crate::baseobjspace::int_w(roots.get(base + 3))? != 0
+        pyre_interpreter::baseobjspace::int_w(roots.get(base + 3))? != 0
     };
     allocator::new_allocator(roots.get(base), w_alloc, w_free, clear)
 }
@@ -921,7 +920,7 @@ fn ffi_string(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let maxlen = if roots.get(base + 1).is_null() {
         -1
     } else {
-        crate::baseobjspace::int_w(roots.get(base + 1))?
+        pyre_interpreter::baseobjspace::int_w(roots.get(base + 1))?
     };
     ctypeobj::string(roots.get(base), maxlen)
 }
@@ -939,7 +938,7 @@ fn ffi_dlopen(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let flags = if a[2].is_null() {
         0
     } else {
-        crate::baseobjspace::int_w(a[2])?
+        pyre_interpreter::baseobjspace::int_w(a[2])?
     };
     cdlopen::dlopen(a[0], a[1], flags)
 }
@@ -952,7 +951,7 @@ fn ffi_dlclose(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 
 fn ffi_integer_const(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let a = bind_method(args, "integer_const", &["name"], 1)?;
-    let name = crate::baseobjspace::text_w(a[1])?.to_string();
+    let name = pyre_interpreter::baseobjspace::text_w(a[1])?.to_string();
     fetch_int_constant(a[0], &name)?
         .ok_or_else(|| PyError::attribute_error(format!("integer constant '{name}' not found")))
 }
@@ -1007,14 +1006,14 @@ fn ffi_unpack(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let base = roots.base();
     let _ = roots.pin_root(a[1]);
     let _ = roots.pin_root(a[2]);
-    let length = crate::baseobjspace::int_w(roots.get(base + 1))?;
+    let length = pyre_interpreter::baseobjspace::int_w(roots.get(base + 1))?;
     cdataobj::unpack(roots.get(base), length)
 }
 
 /// `W_InitOnceLock`.
 #[allow(non_camel_case_types)]
 pub struct W_InitOnceLock {
-    lock: *mut crate::baseobjspace::Lock,
+    lock: *mut pyre_interpreter::baseobjspace::Lock,
 }
 
 #[derive(Default)]
@@ -1030,7 +1029,7 @@ impl InitOnceLocks {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let index = values.len();
         values.push(Box::new(W_InitOnceLock {
-            lock: crate::baseobjspace::allocate_lock(),
+            lock: pyre_interpreter::baseobjspace::allocate_lock(),
         }));
         index
     }
@@ -1047,7 +1046,7 @@ impl InitOnceLocks {
 }
 
 struct InitOnceGuard<'a> {
-    lock: &'a crate::baseobjspace::Lock,
+    lock: &'a pyre_interpreter::baseobjspace::Lock,
 }
 
 impl Drop for InitOnceGuard<'_> {
@@ -1067,7 +1066,9 @@ fn placeholder_index(ffi: &W_FFIObject, value: PyObjectRef) -> Option<usize> {
         return None;
     }
     let index = unsafe { pyre_object::tupleobject::w_tuple_getitem(value, 1) }?;
-    crate::baseobjspace::int_w(index).ok().map(|i| i as usize)
+    pyre_interpreter::baseobjspace::int_w(index)
+        .ok()
+        .map(|i| i as usize)
 }
 
 /// `_init_once_elidable`.
@@ -1082,7 +1083,7 @@ fn init_once_elidable(
     let _ = roots.pin_root(w_tag);
     let cache_slot = tag_slot + 1;
     let _ = roots.pin_root(ffi_arg(roots.get(ffi_slot))?.w_init_once_cache);
-    crate::baseobjspace::finditem(roots.get(cache_slot), roots.get(tag_slot))
+    pyre_interpreter::baseobjspace::finditem(roots.get(cache_slot), roots.get(tag_slot))
 }
 
 /// `_init_once_slowpath`.
@@ -1109,7 +1110,7 @@ fn init_once_slowpath(
         roots.get(index_slot),
     ]));
     let selected_slot = placeholder_slot + 1;
-    let _ = roots.pin_root(crate::type_methods::dict_method_setdefault(&[
+    let _ = roots.pin_root(pyre_interpreter::type_methods::dict_method_setdefault(&[
         ffi_arg(roots.get(base))?.w_init_once_cache,
         roots.get(base + 2),
         roots.get(placeholder_slot),
@@ -1129,11 +1130,11 @@ fn init_once_slowpath(
         return Ok(result);
     }
     let result_slot = selected_slot + 1;
-    let _ = roots.pin_root(crate::call::call_function_impl_result(
+    let _ = roots.pin_root(pyre_interpreter::call::call_function_impl_result(
         roots.get(base + 1),
         &[],
     )?);
-    crate::baseobjspace::setitem(
+    pyre_interpreter::baseobjspace::setitem(
         ffi_arg(roots.get(base))?.w_init_once_cache,
         roots.get(base + 2),
         roots.get(result_slot),
@@ -1181,10 +1182,10 @@ static FFI_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
 /// `_cffi_backend.FFI`.
 pub fn ffi_type_object() -> PyObjectRef {
     *FFI_TYPE_OBJ.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type_with_layout(
+        let tp = pyre_interpreter::typedef::make_builtin_type_with_layout(
             "_cffi_backend.FFI",
             init_ffi_type,
-            crate::typedef::w_object(),
+            pyre_interpreter::typedef::w_object(),
             <W_FFIObject as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
         );
         pyre_object::pyobject::set_instantiate(
@@ -1290,13 +1291,19 @@ fn init_ffi_type(ns: PyObjectRef) {
     let store = |name: &str, value: PyObjectRef| unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, value)
     };
-    store("__new__", crate::typedef::make_new_descr(ffi_new));
+    store(
+        "__new__",
+        pyre_interpreter::typedef::make_new_descr(ffi_new),
+    );
     store(
         "__init__",
-        crate::make_builtin_function("__init__", ffi_init),
+        pyre_interpreter::make_builtin_function("__init__", ffi_init),
     );
     for (name, function) in [
-        ("addressof", ffi_addressof as crate::gateway::BuiltinCodeFn),
+        (
+            "addressof",
+            ffi_addressof as pyre_interpreter::gateway::BuiltinCodeFn,
+        ),
         ("alignof", ffi_alignof),
         ("cast", ffi_cast),
         ("callback", ffi_callback),
@@ -1322,7 +1329,7 @@ fn init_ffi_type(ns: PyObjectRef) {
     ] {
         store(
             name,
-            crate::make_builtin_function_with_doc(name, function, ffi_method_doc(name)),
+            pyre_interpreter::make_builtin_function_with_doc(name, function, ffi_method_doc(name)),
         );
     }
     // `ffi_obj.py` registers this one through `_extras` because it exists on
@@ -1331,17 +1338,22 @@ fn init_ffi_type(ns: PyObjectRef) {
     #[cfg(windows)]
     store(
         "getwinerror",
-        crate::make_builtin_function_with_doc(
+        pyre_interpreter::make_builtin_function_with_doc(
             "getwinerror",
             ffi_getwinerror,
             ffi_method_doc("getwinerror"),
         ),
     );
-    let getter = crate::make_builtin_function_with_arity("errno", errno_get, 2);
-    let setter = crate::make_builtin_function_with_arity("errno", errno_set, 3);
+    let getter = pyre_interpreter::make_builtin_function_with_arity("errno", errno_get, 2);
+    let setter = pyre_interpreter::make_builtin_function_with_arity("errno", errno_set, 3);
     store(
         "errno",
-        crate::typedef::make_getset_property_named(getter, setter, pyre_object::PY_NULL, "errno"),
+        pyre_interpreter::typedef::make_getset_property_named(
+            getter,
+            setter,
+            pyre_object::PY_NULL,
+            "errno",
+        ),
     );
     store("CData", super::cdataobj::cdata_type());
     store("CType", super::ctypeobj::ctype_type());

@@ -1,6 +1,6 @@
 //! CFFI API-function wrappers — PyPy: `pypy/module/_cffi_backend/wrapper.py`.
 
-use crate::PyError;
+use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
 use std::sync::OnceLock;
 
@@ -9,7 +9,7 @@ use super::realize_c_type::W_RawFuncType;
 use super::{allocator, cdataobj, ctypefunc, ctypeobj, ctypeptr};
 
 /// `W_FunctionWrapper`.
-#[crate::pyre_class("_cffi_backend.__FFIFunctionWrapper")]
+#[pyre_interpreter::pyre_class("_cffi_backend.__FFIFunctionWrapper")]
 // `W_FunctionWrapper._immutable_ = True`: every field is written once, by
 // `new_function_wrapper`, and only read afterwards.
 #[majit_macros::jit_immutable_fields(
@@ -149,7 +149,7 @@ fn wrapper_call(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let nargs_expected = raw.nostruct_nargs as usize;
     let nargs_given = args.len().saturating_sub(1);
     if nargs_given != nargs_expected {
-        let fnname = crate::baseobjspace::text_w(wrapper.w_fnname)?;
+        let fnname = pyre_interpreter::baseobjspace::text_w(wrapper.w_fnname)?;
         let message = match nargs_expected {
             0 => format!("{fnname}() takes no arguments ({nargs_given} given)"),
             1 => format!("{fnname}() takes exactly one argument ({nargs_given} given)"),
@@ -202,7 +202,7 @@ fn wrapper_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let wrapper = wrapper_arg(args[0])?;
     let raw = W_RawFuncType::from_obj(wrapper.w_rawfunctype)
         .ok_or_else(|| PyError::system_error("function wrapper lost its raw type"))?;
-    let fnname = crate::baseobjspace::text_w(wrapper.w_fnname)?.to_string();
+    let fnname = pyre_interpreter::baseobjspace::text_w(wrapper.w_fnname)?.to_string();
     let doc = raw.repr_fn_type(wrapper.w_ffi, &fnname)?;
     Ok(pyre_object::w_str_new_managed(&format!(
         "<FFIFunctionWrapper '{doc}'>"
@@ -213,8 +213,8 @@ fn wrapper_get_doc(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let wrapper = wrapper_arg(args[1])?;
     let raw = W_RawFuncType::from_obj(wrapper.w_rawfunctype)
         .ok_or_else(|| PyError::system_error("function wrapper lost its raw type"))?;
-    let fnname = crate::baseobjspace::text_w(wrapper.w_fnname)?.to_string();
-    let modulename = crate::baseobjspace::text_w(wrapper.w_modulename)?.to_string();
+    let fnname = pyre_interpreter::baseobjspace::text_w(wrapper.w_fnname)?.to_string();
+    let modulename = pyre_interpreter::baseobjspace::text_w(wrapper.w_modulename)?.to_string();
     let doc = raw.repr_fn_type(wrapper.w_ffi, &fnname)?;
     Ok(pyre_object::w_str_new_managed(&format!(
         "{doc};\n\nCFFI C function from {}.lib",
@@ -231,8 +231,8 @@ fn wrapper_get_module(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 }
 
 fn wrapper_get(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    crate::type_methods::arity_at_least(args, "__get__", 2)?;
-    crate::type_methods::arity_at_most(args, "__get__", 3)?;
+    pyre_interpreter::type_methods::arity_at_least(args, "__get__", 2)?;
+    pyre_interpreter::type_methods::arity_at_most(args, "__get__", 3)?;
     let _ = wrapper_arg(args[0])?;
     Ok(args[0])
 }
@@ -252,10 +252,10 @@ static FUNCTION_WRAPPER_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
 /// `_cffi_backend.__FFIFunctionWrapper`.
 pub fn function_wrapper_type() -> PyObjectRef {
     *FUNCTION_WRAPPER_TYPE_OBJ.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type_with_layout(
+        let tp = pyre_interpreter::typedef::make_builtin_type_with_layout(
             "_cffi_backend.__FFIFunctionWrapper",
             init_function_wrapper_type,
-            crate::typedef::w_object(),
+            pyre_interpreter::typedef::w_object(),
             <W_FunctionWrapper as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
         );
         pyre_object::pyobject::set_instantiate(
@@ -276,28 +276,28 @@ fn init_function_wrapper_type(ns: PyObjectRef) {
     };
     store(
         "__repr__",
-        crate::make_builtin_function_with_arity("__repr__", wrapper_repr, 1),
+        pyre_interpreter::make_builtin_function_with_arity("__repr__", wrapper_repr, 1),
     );
     store(
         "__call__",
-        crate::make_builtin_function("__call__", wrapper_call),
+        pyre_interpreter::make_builtin_function("__call__", wrapper_call),
     );
     store(
         "__get__",
-        crate::make_builtin_function("__get__", wrapper_get),
+        pyre_interpreter::make_builtin_function("__get__", wrapper_get),
     );
     for (name, getter) in [
         (
             "__name__",
-            wrapper_get_name as crate::gateway::BuiltinCodeFn,
+            wrapper_get_name as pyre_interpreter::gateway::BuiltinCodeFn,
         ),
         ("__module__", wrapper_get_module),
         ("__doc__", wrapper_get_doc),
     ] {
-        let getter = crate::make_builtin_function_with_arity(name, getter, 2);
+        let getter = pyre_interpreter::make_builtin_function_with_arity(name, getter, 2);
         store(
             name,
-            crate::typedef::make_getset_property_named(
+            pyre_interpreter::typedef::make_getset_property_named(
                 getter,
                 pyre_object::PY_NULL,
                 pyre_object::PY_NULL,

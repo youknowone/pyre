@@ -6,7 +6,7 @@
 //! The same ownership split matters here: pointer compatibility uses identity,
 //! but an otherwise-unreferenced derived ctype must still be collectable.
 
-use crate::PyError;
+use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_double, c_float, c_int, c_long, c_longlong, c_short};
@@ -405,7 +405,7 @@ pub fn array_length_arg(w_length: PyObjectRef) -> Result<i64, PyError> {
     }
     // `space.getindex_w(w_length, space.w_OverflowError)` — a length wider
     // than a `ssize_t` is an OverflowError rather than a silent clamp.
-    let length = crate::baseobjspace::index_int_w_preserve_negative(w_length)?;
+    let length = pyre_interpreter::baseobjspace::index_int_w_preserve_negative(w_length)?;
     if length < 0 {
         return Err(PyError::value_error("negative array length"));
     }
@@ -471,10 +471,13 @@ fn complete_sflags(mut sflags: i64) -> i64 {
 pub fn ffi_error() -> PyObjectRef {
     static FFI_ERROR: OnceLock<usize> = OnceLock::new();
     *FFI_ERROR.get_or_init(|| {
-        let w_exception = crate::builtins::lookup_exc_class("Exception")
+        let w_exception = pyre_interpreter::builtins::lookup_exc_class("Exception")
             .expect("Exception must be installed before _cffi_backend init");
-        crate::builtins::make_exc_type("ffi.error", crate::builtins::exc_exception_new, w_exception)
-            as usize
+        pyre_interpreter::builtins::make_exc_type(
+            "ffi.error",
+            pyre_interpreter::builtins::exc_exception_new,
+            w_exception,
+        ) as usize
     }) as PyObjectRef
 }
 
@@ -524,7 +527,7 @@ pub fn detect_custom_layout(
         args.push(pyre_object::w_str_new_managed(&format!(
             "{name}: {msg} (cdef says {cdef_value}, but C compiler says {compiler_value}). fix it or use \"...;\" as the last field in the cdef for {name} to make it flexible"
         )));
-        err.exc_object = crate::builtins::exc_exception_new(&args.take())?;
+        err.exc_object = pyre_interpreter::builtins::exc_exception_new(&args.take())?;
         return Err(err);
     }
     ct.flags |= ctypeobj::CTypeFlags::CUSTOM_FIELD_POS.bits();
@@ -872,14 +875,14 @@ fn read_field_descrs(ct: &W_CType, w_fields: PyObjectRef) -> Result<Vec<FieldDes
     let roots = pyre_object::gc_roots::push_roots();
     let fields_slot = roots.base();
     let _ = roots.pin_root(w_fields);
-    let fields_w = crate::baseobjspace::fixedview(roots.get(fields_slot), -1)?;
+    let fields_w = pyre_interpreter::baseobjspace::fixedview(roots.get(fields_slot), -1)?;
     let items_slot = pyre_object::gc_roots::shadow_stack_len();
     for &w_field in &fields_w {
         let _ = roots.pin_root(w_field);
     }
     let mut out = Vec::with_capacity(fields_w.len());
     for i in 0..fields_w.len() {
-        let field_w = crate::baseobjspace::fixedview(roots.get(items_slot + i), -1)?;
+        let field_w = pyre_interpreter::baseobjspace::fixedview(roots.get(items_slot + i), -1)?;
         if !(2..=4).contains(&field_w.len()) {
             return Err(PyError::type_error("bad field descr"));
         }
@@ -887,7 +890,7 @@ fn read_field_descrs(ct: &W_CType, w_fields: PyObjectRef) -> Result<Vec<FieldDes
         for &w_part in &field_w {
             let _ = roots.pin_root(w_part);
         }
-        let fname = crate::baseobjspace::text_w(roots.get(part_slot))?.to_string();
+        let fname = pyre_interpreter::baseobjspace::text_w(roots.get(part_slot))?.to_string();
         let w_ftype = roots.get(part_slot + 1);
         if ctypeobj::ctype_at(w_ftype).is_none() {
             return Err(PyError::type_error(format!(
@@ -896,12 +899,12 @@ fn read_field_descrs(ct: &W_CType, w_fields: PyObjectRef) -> Result<Vec<FieldDes
             )));
         }
         let fbitsize = if field_w.len() > 2 {
-            crate::baseobjspace::int_w(roots.get(part_slot + 2))?
+            pyre_interpreter::baseobjspace::int_w(roots.get(part_slot + 2))?
         } else {
             -1
         };
         let foffset = if field_w.len() > 3 {
-            crate::baseobjspace::int_w(roots.get(part_slot + 3))?
+            pyre_interpreter::baseobjspace::int_w(roots.get(part_slot + 3))?
         } else {
             -1
         };
@@ -927,12 +930,12 @@ pub fn new_enum_type(
     let roots = pyre_object::gc_roots::push_roots();
     let base_slot = roots.base();
     let _ = roots.pin_root(w_basectype);
-    let enumerators_w = crate::baseobjspace::fixedview(w_enumerators, -1)?;
+    let enumerators_w = pyre_interpreter::baseobjspace::fixedview(w_enumerators, -1)?;
     let names_slot = pyre_object::gc_roots::shadow_stack_len();
     for &w in &enumerators_w {
         let _ = roots.pin_root(w);
     }
-    let enumvalues_w = crate::baseobjspace::fixedview(w_enumvalues, -1)?;
+    let enumvalues_w = pyre_interpreter::baseobjspace::fixedview(w_enumvalues, -1)?;
     let values_slot = pyre_object::gc_roots::shadow_stack_len();
     for &w in &enumvalues_w {
         let _ = roots.pin_root(w);
@@ -988,8 +991,8 @@ pub fn new_enum_type(
     for i in (0..enumerators_w.len()).rev() {
         let w_name = roots.get(names_slot + i);
         let w_value = roots.get(values_slot + i);
-        crate::baseobjspace::setitem(roots.get(e2v_slot), w_name, w_value)?;
-        crate::baseobjspace::setitem(roots.get(v2e_slot), w_value, w_name)?;
+        pyre_interpreter::baseobjspace::setitem(roots.get(e2v_slot), w_name, w_value)?;
+        pyre_interpreter::baseobjspace::setitem(roots.get(v2e_slot), w_value, w_name)?;
     }
     let ct = ctypeobj::ctype_arg(roots.get(ctype_slot))?;
     ct.enumerators2values = roots.get(e2v_slot);
@@ -1066,7 +1069,7 @@ pub fn new_function_type(
     let roots = pyre_object::gc_roots::push_roots();
     let result_slot = roots.base();
     let _ = roots.pin_root(w_fresult);
-    let args_w = crate::baseobjspace::fixedview(w_fargs, -1)?;
+    let args_w = pyre_interpreter::baseobjspace::fixedview(w_fargs, -1)?;
     let mut fargs = Vec::with_capacity(args_w.len());
     for w_farg in args_w {
         let Some(farg) = ctypeobj::ctype_at(w_farg) else {
@@ -1154,7 +1157,7 @@ pub fn build_function_type(
         // call itself raises it if one is ever made.
         match super::ctypefunc::build_cif_descr(fargs, w_fresult, abi, None) {
             Ok(cif) => ct.cif_descr = cif,
-            Err(e) if e.kind == crate::PyErrorKind::NotImplementedError => {}
+            Err(e) if e.kind == pyre_interpreter::PyErrorKind::NotImplementedError => {}
             Err(e) => return Err(e),
         }
     }

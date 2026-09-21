@@ -9,13 +9,6 @@ pub mod __pypy__;
 #[allow(non_snake_case)]
 pub mod _ast;
 #[allow(non_snake_case)]
-#[cfg(all(
-    feature = "host_env",
-    not(feature = "sandbox"),
-    not(target_arch = "wasm32")
-))]
-pub mod _cffi_backend;
-#[allow(non_snake_case)]
 pub mod _codecs;
 #[allow(non_snake_case)]
 pub mod _collections;

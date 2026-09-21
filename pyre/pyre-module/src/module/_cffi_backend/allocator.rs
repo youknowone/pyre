@@ -1,7 +1,7 @@
 //! CFFI allocation policy — PyPy:
 //! `pypy/module/_cffi_backend/allocator.py`.
 
-use crate::PyError;
+use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
 use std::sync::OnceLock;
 
@@ -9,7 +9,7 @@ use super::cdataobj::{self, W_CData};
 use super::ctypeobj;
 
 /// `allocator.py W_Allocator`.
-#[crate::pyre_class("_cffi_backend.__FFIAllocator")]
+#[pyre_interpreter::pyre_class("_cffi_backend.__FFIAllocator")]
 #[derive(Default)]
 pub struct W_Allocator {
     /// `W_Allocator.ffi`; null for the two module-internal allocators.
@@ -50,14 +50,16 @@ pub fn allocate(
     let _ = roots.pin_root(w_ctype);
     let size_slot = ctype_slot + 1;
     let _ = roots.pin_root(pyre_object::w_int_new(datasize));
-    let w_raw =
-        crate::call::call_function_impl_result(roots.get(alloc_slot), &[roots.get(size_slot)])?;
+    let w_raw = pyre_interpreter::call::call_function_impl_result(
+        roots.get(alloc_slot),
+        &[roots.get(size_slot)],
+    )?;
     let raw_slot = size_slot + 1;
     let _ = roots.pin_root(w_raw);
     let raw = W_CData::from_obj(roots.get(raw_slot)).ok_or_else(|| {
         PyError::type_error(format!(
             "alloc() must return a cdata object (got {})",
-            crate::type_methods::arg_type_name(roots.get(raw_slot))
+            pyre_interpreter::type_methods::arg_type_name(roots.get(raw_slot))
         ))
     })?;
     let raw_ct = ctypeobj::ctype_at(raw.ctype)
@@ -70,7 +72,7 @@ pub fn allocate(
     }
     if raw.ptr == 0 {
         return Err(PyError::new(
-            crate::PyErrorKind::MemoryError,
+            pyre_interpreter::PyErrorKind::MemoryError,
             "alloc() returned NULL",
         ));
     }
@@ -132,10 +134,10 @@ static ALLOCATOR_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
 /// `_cffi_backend.__FFIAllocator`.
 pub fn allocator_type() -> PyObjectRef {
     *ALLOCATOR_TYPE_OBJ.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type_with_layout(
+        let tp = pyre_interpreter::typedef::make_builtin_type_with_layout(
             "_cffi_backend.__FFIAllocator",
             init_allocator_type,
-            crate::typedef::w_object(),
+            pyre_interpreter::typedef::w_object(),
             <W_Allocator as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
         );
         pyre_object::pyobject::set_instantiate(
@@ -155,7 +157,7 @@ fn init_allocator_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__call__",
-            crate::make_builtin_function("__call__", allocator_call),
+            pyre_interpreter::make_builtin_function("__call__", allocator_call),
         )
     }
 }

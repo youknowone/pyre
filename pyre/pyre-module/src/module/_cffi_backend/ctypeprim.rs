@@ -5,7 +5,7 @@
 //! [`super::ctypeobj`]), so each method they override becomes a `match` on
 //! [`W_CType::kind`].
 
-use crate::PyError;
+use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
 
 use super::cdataobj::{self, W_CData};
@@ -124,7 +124,7 @@ pub unsafe fn convert_from_object(
             }
             // `W_CTypePrimitiveFloat.convert_from_object`.
             ctypeobj::KIND_PRIM_FLOAT => {
-                let value = crate::baseobjspace::float_w(w_ob)?;
+                let value = pyre_interpreter::baseobjspace::float_w(w_ob)?;
                 misc::write_raw_float_data(cdata, value, ct.size)
             }
             // `W_CTypePrimitiveLongDouble.convert_from_object` — a long
@@ -143,7 +143,7 @@ pub unsafe fn convert_from_object(
                 }
                 misc::write_raw_longdouble_data(
                     cdata as *mut u8,
-                    crate::baseobjspace::float_w(w_ob)?,
+                    pyre_interpreter::baseobjspace::float_w(w_ob)?,
                 );
                 Ok(())
             }
@@ -231,7 +231,7 @@ fn cast_float(w_ctype: PyObjectRef, w_ob: PyObjectRef) -> Result<PyObjectRef, Py
     } else if unsafe { pyre_object::unicodeobject::is_str(w_ob) } {
         f64::from(cast_unicode(ct, w_ob)?)
     } else {
-        crate::baseobjspace::float_w(w_ob)?
+        pyre_interpreter::baseobjspace::float_w(w_ob)?
     };
     let w_cdata = cdataobj::new_cdata_mem(w_ctype)?;
     let cdata = W_CData::from_obj(w_cdata).expect("new_cdata_mem returns a cdata");
@@ -346,7 +346,7 @@ pub unsafe fn cast_to_int(ct: &W_CType, cdata: *const u8) -> Result<PyObjectRef,
             // `W_CTypePrimitiveFloat.cast_to_int` — `int(self.float(cdata))`.
             ctypeobj::KIND_PRIM_FLOAT | ctypeobj::KIND_PRIM_LONGDOUBLE => {
                 let w_value = float(ct, cdata)?;
-                crate::baseobjspace::space_int(w_value)
+                pyre_interpreter::baseobjspace::space_int(w_value)
             }
             _ if ct.is_primitive() => convert_to_object(ct, cdata as usize),
             _ => Err(PyError::type_error(format!(
@@ -623,16 +623,16 @@ fn convert_to_char_n_t(ct: &W_CType, w_ob: PyObjectRef) -> Result<u32, PyError> 
     Err(ct.convert_error("unicode string of length 1", w_ob))
 }
 
-/// `space.unpackcomplex`, which is [`crate::builtins::complex_coerce`] here:
+/// `space.unpackcomplex`, which is [`pyre_interpreter::builtins::complex_coerce`] here:
 /// it asks for `__complex__` before falling back on the real-number
 /// protocol, and that is how a cdata of a complex ctype answers.
 fn unpack_complex(w_ob: PyObjectRef) -> Result<(f64, f64), PyError> {
-    crate::builtins::complex_coerce(w_ob)
+    pyre_interpreter::builtins::complex_coerce(w_ob)
 }
 
 /// `W_CTypePrimitive._overflow`.
 fn overflow(ct: &W_CType, w_ob: PyObjectRef) -> PyError {
-    let rendered = crate::builtins::builtin_str(&[w_ob])
+    let rendered = pyre_interpreter::builtins::builtin_str(&[w_ob])
         .map(|w| unsafe { pyre_object::w_str_get_value(w) }.to_string())
         .unwrap_or_default();
     PyError::overflow_error(format!("integer {rendered} does not fit '{}'", ct.name()))

@@ -523,8 +523,9 @@ pub fn load_extension_module(
     let cffi_address = lookup_cffi_init(handle, name);
     let found = lookup_init(handle, name)?;
     if let Some(address) = cffi_address {
-        let module =
-            crate::module::_cffi_backend::cffi1_module::load_cffi1_module(name, path, address)?;
+        let module = crate::importing::optional_module_hooks()
+            .ok_or_else(|| crate::PyError::system_error("_cffi_backend is not available"))
+            .and_then(|hooks| (hooks.load_cffi1_module)(name, path, address))?;
         fixup_extension(module, name, path, handle);
         return Ok(module);
     }
