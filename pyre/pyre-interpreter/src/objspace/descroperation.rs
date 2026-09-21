@@ -6204,7 +6204,10 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
     // leaf is only reachable from [`compare_slot_rest`] and never
     // becomes a jitcode.  Every other layout's comparison, several of
     // which iterate, lives in [`compare_slot_rest`], a residual on the
-    // trace.
+    // trace.  Tuple comparison stays there: the container cycle's stack
+    // check is the first thing `compare_slot_rest` does, and a tuple arm
+    // ahead of that check would recurse through `compare_tuples` with no
+    // guard.  Short tuple equality is folded in the tracer instead.
     unsafe {
         if is_int_like(a) && is_int_like(b) {
             return match op {
@@ -6353,6 +6356,8 @@ fn compare_slot_rest(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult 
             }));
         }
         // Tuple lexicographic comparison — PyPy: tupleobject.py descr_lt / _eq / etc.
+        // Kept behind this function's stack check: nested tuples re-enter
+        // `compare` → `compare_slot` → here, and that is the container cycle.
         if is_tuple(a) && is_tuple(b) {
             return compare_tuples(a, b, op);
         }

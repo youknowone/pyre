@@ -10119,11 +10119,9 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                                     // (unicodeobject.py) answers from one WTF-8
                                     // ordering, which no numeric arm above can
                                     // express.
-                                    // TODO: tuple `==` currently stays a residual
-                                    // call. Record it by descending the interpreter
-                                    // `descr_eq` with a `look_inside_iff`-style
-                                    // small-tuple unroll (`tupleobject.py`
-                                    // `_unroll_condition_cmp`), not by a fold.
+                                    // Short exact tuples of ints or None are folded
+                                    // by `try_walker_fold_small_tuple_eq`. Longer
+                                    // tuples and subclasses still reach this residual.
                                     None => spec_gate(SpecFold::CompareOpStr, || {
                                         try_walker_specialize_compare_op_str(
                                             ctx, op.pc, op_tag, &r_args, &allboxes, call_descr,
