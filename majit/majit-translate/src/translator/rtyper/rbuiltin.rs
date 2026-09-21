@@ -3325,10 +3325,16 @@ pub fn rtype_direct_ptradd(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) 
     use crate::translator::rtyper::rtyper::GenopResult;
 
     let r_arg = arg_repr(hop, 0)?;
-    // upstream `assert isinstance(hop.args_r[0], rptr.PtrRepr)`
-    if !matches!(r_arg.repr_class_id(), ReprClassId::PtrRepr) {
+    // `assert isinstance(hop.args_r[0], rptr.PtrRepr)`.  A classdef-less
+    // raw pointer annotates as `SomeInstance` and rtypes to
+    // `InstanceRepr` (`Ptr(GcStruct(OBJECT))`); that is still a pointer
+    // operand, so the same `inputargs(ptr, Signed)` conversion applies.
+    if !matches!(
+        r_arg.repr_class_id(),
+        ReprClassId::PtrRepr | ReprClassId::InstanceRepr
+    ) {
         return Err(TyperError::message(format!(
-            "rtype_direct_ptradd: hop.args_r[0] must be PtrRepr, got {:?}",
+            "rtype_direct_ptradd: hop.args_r[0] must be PtrRepr or InstanceRepr, got {:?}",
             r_arg.repr_class_id()
         )));
     }

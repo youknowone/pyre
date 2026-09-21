@@ -10338,53 +10338,57 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `<*mut T>::add` / `<*const T>::add` is `raw_ptradd` scaled
-                // by the pointee size (`rewrite_op_direct_ptradd`).  The
-                // pointer is a Ref at this layer, so take the address
-                // integer first — otherwise the add assembles as
-                // `int_add/ri>i`, an opname with no blackhole handler.
+                // `<*mut T>::add` / `<*const T>::add` is `lltype.direct_ptradd`.
+                // The add stays pointer-typed so a `null_mut()` arm at the
+                // same return can union with it.  Pointee size is not a
+                // recoverable `TO.OF` on the erased pointer at jtransform
+                // time, so the count is scaled to a byte offset here
+                // (`n * sizeof(T)`, skipped for size 0/1) and the rewrite
+                // treats the shift as already-scaled, like `CCHARP`.
+                //
+                // Brick-1 accessors and brick-3 getarrayitem `.add`s have
+                // their own intercepts later in this match; do not steal
+                // those (the items-base collapse aliases to the header
+                // because the gcarray descr already folds `base_size`).
                 if args.len() == 2
                     && let Some(pointee_size) =
                         self.ptr_add_pointee_size(&reg, first_arg_ty.as_ref())
+                    && !self.ptr_add_has_later_intercept(
+                        &reg,
+                        args.len(),
+                        &arg_locals,
+                        first_arg_ty.as_ref(),
+                        dest_local,
+                    )
                 {
-                    let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
-                        let res =
-                            graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                        graph.block_mut(bb_id).operations.push(SpaceOperation {
-                            result: Some(res.clone()),
-                            kind,
-                        });
-                        res
-                    };
                     let offset = if pointee_size == 0 {
                         args[0].clone()
                     } else {
-                        let addr = push_cast_ptr_to_int(&mut self.graph, bb_id, args[0].clone());
-                        self.cast_ptr_to_int_src
-                            .insert(addr.clone(), args[0].clone());
-                        let rhs = if pointee_size == 1 {
+                        let count = if pointee_size == 1 {
                             args[1].clone()
                         } else {
-                            let scale = push_op(&mut self.graph, OpKind::ConstInt(pointee_size));
-                            push_op(
-                                &mut self.graph,
-                                OpKind::BinOp {
+                            let scale = self
+                                .graph
+                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                                result: Some(scale.clone()),
+                                kind: OpKind::ConstInt(pointee_size),
+                            });
+                            let scaled = self
+                                .graph
+                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                                result: Some(scaled.clone()),
+                                kind: OpKind::BinOp {
                                     op: "mul".to_string(),
                                     lhs: args[1].clone(),
                                     rhs: scale,
                                     result_ty: ValueType::Int,
                                 },
-                            )
+                            });
+                            scaled
                         };
-                        push_op(
-                            &mut self.graph,
-                            OpKind::BinOp {
-                                op: "add".to_string(),
-                                lhs: addr,
-                                rhs,
-                                result_ty: ValueType::Int,
-                            },
-                        )
+                        push_direct_ptradd(&mut self.graph, bb_id, args[0].clone(), count)
                     };
                     self.local_var[dest_local] = Some(offset);
                     let target_bb = self.block_id[target];
@@ -15777,8 +15781,8 @@ impl<'a> Lowering<'a> {
     }
 
     /// `<*mut T>::add` / `<*const T>::add` when the pointee has a known
-    /// byte size, so the existing `raw_ptradd` / `direct_ptradd` scaling
-    /// can run at the callsite.
+    /// byte size, so the count can be scaled to a byte offset before
+    /// `lltype.direct_ptradd`.
     fn ptr_add_pointee_size(&self, reg: &RegularCall, first_arg_ty: Option<&TyRef>) -> Option<i64> {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return None;
@@ -15792,6 +15796,32 @@ impl<'a> Lowering<'a> {
                 .or_else(|| tyref_peel_one_ref_node(ty, self.llbc))
         })?;
         json_ty_byte_size(pointee, self.llbc)
+    }
+
+    /// Later intercepts in this same `RegularCall` match already lower
+    /// some `.add` calls: items-base accessors alias to the header
+    /// (brick 1), string-array remove aliases the interior pointer,
+    /// and a `.add` consumed by one deref becomes getarrayitem
+    /// (brick 3).  Those must run instead of `direct_ptradd`.
+    fn ptr_add_has_later_intercept(
+        &self,
+        reg: &RegularCall,
+        args_len: usize,
+        arg_locals: &[Option<usize>],
+        first_arg_ty: Option<&TyRef>,
+        dest_local: usize,
+    ) -> bool {
+        (args_len == 2 && self.is_items_block_base_ptr_add(reg))
+            || (args_len == 2
+                && self.string_array_remove_owner().is_some()
+                && regular_call_is_ptr_add(reg, self.llbc))
+            || self
+                .string_items_elem_ptr_add(reg, args_len, arg_locals, first_arg_ty, dest_local)
+                .is_some()
+            || self.is_list_items_elem_ptr_add(reg, args_len, arg_locals, first_arg_ty, dest_local)
+            || self
+                .typed_items_elem_ptr_add(reg, args_len, arg_locals, first_arg_ty, dest_local)
+                .is_some()
     }
 
     /// `core::ptr::write` of a Copy scalar or thin pointer.  An aggregate
@@ -25265,6 +25295,40 @@ fn cast_call_segments(src: &ValueType, dst: &ValueType) -> Option<Vec<String>> {
 fn int_binop_needs_ptr_to_int(op: &str, lhs: Option<&ValueType>, rhs: Option<&ValueType>) -> bool {
     matches!(op, "lt" | "le" | "gt" | "ge" | "mod" | "floordiv" | "div")
         && (matches!(lhs, Some(ValueType::Ref(_))) || matches!(rhs, Some(ValueType::Ref(_))))
+}
+
+/// Emit `simple_call(lltype.direct_ptradd, p, n)` and return the pointer
+/// result.  The annotation is the pointer operand's (`ann_direct_ptradd`
+/// returns `s_p`), so a `null_mut()` arm of the same pointer unions with
+/// it.  `n` is a Signed/Unsigned byte offset — pointee scaling happens
+/// at the callsite when `TO.OF` is not recoverable later.
+fn push_direct_ptradd(
+    graph: &mut FunctionGraph,
+    bb_id: BlockId,
+    ptr: Variable,
+    count: Variable,
+) -> Variable {
+    let result = graph.alloc_value_var();
+    graph.block_mut(bb_id).operations.push(SpaceOperation {
+        result: Some(result.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: [
+                    "rpython",
+                    "rtyper",
+                    "lltypesystem",
+                    "lltype",
+                    "direct_ptradd",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            },
+            args: crate::model::call_args(vec![ptr, count]),
+            result_ty: ValueType::Ref(None),
+        },
+    });
+    result
 }
 
 /// Emit `simple_call(lltype.cast_ptr_to_int, p)` and return the Signed
@@ -34842,10 +34906,11 @@ mod tests {
         fn_ptr_family_for, int_binop_needs_ptr_to_int, is_class_pytype_assoc_const,
         is_core_result_map_err_path, json_ty_is_thin_pointer_element,
         json_ty_scalar_element_spelling, primitive_float_const, push_cast_ptr_to_int,
-        push_ptr_to_unsigned_cast, scalar_replace_named_struct_aggregates, shaped_array_parts,
-        simplify_lowered_graph, static_key_segments, type_decl_is_closure_env, tyref_array_suffix,
-        tyref_is_closure_env, tyref_is_raw_byte_ptr, tyref_positional_aggregate_root,
-        tyref_to_attr_value_type, tyref_to_attr_value_type_for_struct_field, tyref_to_value_type,
+        push_direct_ptradd, push_ptr_to_unsigned_cast, scalar_replace_named_struct_aggregates,
+        shaped_array_parts, simplify_lowered_graph, static_key_segments, type_decl_is_closure_env,
+        tyref_array_suffix, tyref_is_closure_env, tyref_is_raw_byte_ptr,
+        tyref_positional_aggregate_root, tyref_to_attr_value_type,
+        tyref_to_attr_value_type_for_struct_field, tyref_to_value_type,
     };
     use crate::flowspace::model::Variable;
     use crate::model::{
@@ -40472,7 +40537,7 @@ mod tests {
     }
 
     #[test]
-    fn ptr_add_of_bytes_is_unscaled_add() {
+    fn ptr_add_of_bytes_is_unscaled_direct_ptradd() {
         let ptr_ty = serde_json::json!({
             "RawPtr": [{"Literal": {"UInt": "U8"}}, "Mut"]
         });
@@ -40486,14 +40551,18 @@ mod tests {
         let graph = super::lower_function(&llbc, "add_u8").expect("lower *mut u8::add");
         let ops = graph_ops(&graph);
         assert!(
-            ops.iter()
-                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add")),
-            "*mut u8::add must become int_add; ops={ops:?}"
+            ops.iter().any(|op| is_lltype_direct_ptradd(op)),
+            "*mut u8::add must become direct_ptradd; ops={ops:?}"
         );
         assert!(
             !ops.iter()
                 .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "mul")),
             "*mut u8::add must not scale; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add")),
+            "*mut u8::add must not become int_add at the front; ops={ops:?}"
         );
         assert!(
             !call_leafs(&ops).iter().any(|leaf| *leaf == "add"),
@@ -40502,7 +40571,7 @@ mod tests {
     }
 
     #[test]
-    fn ptr_add_of_i64_scales_by_pointee_size() {
+    fn ptr_add_of_i64_scales_count_then_direct_ptradd() {
         let ptr_ty = serde_json::json!({
             "RawPtr": [{"Literal": {"Int": "I64"}}, "Mut"]
         });
@@ -40522,12 +40591,103 @@ mod tests {
         assert!(
             ops.iter()
                 .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "mul")),
-            "*const i64::add must emit int_mul; ops={ops:?}"
+            "*const i64::add must emit int_mul on the count; ops={ops:?}"
         );
         assert!(
-            ops.iter()
+            ops.iter().any(|op| is_lltype_direct_ptradd(op)),
+            "*const i64::add must become direct_ptradd; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter()
                 .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add")),
-            "*const i64::add must emit int_add; ops={ops:?}"
+            "*const i64::add must not become int_add at the front; ops={ops:?}"
+        );
+    }
+
+    fn is_lltype_direct_ptradd(op: &SpaceOperation) -> bool {
+        matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments },
+                result_ty: ValueType::Ref(_),
+                ..
+            } if segments.last().map(String::as_str) == Some("direct_ptradd")
+                && segments.iter().any(|s| s == "lltype")
+        )
+    }
+
+    fn return_merge_arm_value_types(graph: &crate::model::FunctionGraph) -> Vec<ValueType> {
+        use crate::model::LinkArg;
+        let returnblock = graph.returnblock;
+        let mut tys = Vec::new();
+        for block in &graph.blocks {
+            for link in &block.exits {
+                if link.target != returnblock {
+                    continue;
+                }
+                for arg in &link.args {
+                    let LinkArg::Value(v) = arg else {
+                        continue;
+                    };
+                    let def = graph
+                        .blocks
+                        .iter()
+                        .flat_map(|b| b.operations.iter())
+                        .find(|op| op.result.as_ref() == Some(v));
+                    if let Some(ty) = def.and_then(|op| match &op.kind {
+                        OpKind::Call { result_ty, .. }
+                        | OpKind::BinOp { result_ty, .. }
+                        | OpKind::UnaryOp { result_ty, .. } => Some(result_ty.clone()),
+                        OpKind::Input { ty, .. } => Some(ty.clone()),
+                        OpKind::ConstRefNull => Some(ValueType::Ref(None)),
+                        OpKind::ConstInt(_) => Some(ValueType::Int),
+                        OpKind::ConstUInt(_) => Some(ValueType::Unsigned),
+                        _ => None,
+                    }) {
+                        tys.push(ty);
+                    }
+                }
+            }
+        }
+        tys
+    }
+
+    fn return_merge_arm_kinds_agree(tys: &[ValueType]) -> bool {
+        tys.len() >= 2
+            && tys
+                .windows(2)
+                .all(|w| std::mem::discriminant(&w[0]) == std::mem::discriminant(&w[1]))
+    }
+
+    #[test]
+    fn null_or_offset_pointer_return_arms_share_one_value_type() {
+        let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+        let llbc = Llbc::load(path).expect("load real pyre-object LLBC");
+        let graph = super::lower_function(&llbc, "items_block_items_base")
+            .expect("lower items_block_items_base");
+        let ops = graph_ops(&graph);
+        assert!(
+            call_leafs(&ops).iter().any(|leaf| *leaf == "null_mut"),
+            "null arm must stay null_mut(); ops={ops:?}"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add")),
+            "offset arm must not become int_add at the front; ops={ops:?}"
+        );
+        let arm_tys = return_merge_arm_value_types(&graph);
+        assert_eq!(
+            arm_tys.len(),
+            2,
+            "items_block_items_base returns through two arms; got {arm_tys:?}"
+        );
+        assert!(
+            arm_tys.iter().all(|ty| matches!(ty, ValueType::Ref(_))),
+            "both return arms must be Ref; got {arm_tys:?}"
+        );
+        assert!(
+            return_merge_arm_kinds_agree(&arm_tys),
+            "null_mut and the offset arm must share one ValueType; got {arm_tys:?}"
         );
     }
 
@@ -42443,6 +42603,34 @@ mod tests {
             owner_root, "try_dispatch_binary_special::closure",
             "the shared leaf `closure` is withdrawn; the field keys the full path"
         );
+    }
+
+    #[test]
+    fn push_direct_ptradd_emits_the_lltype_helper() {
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let ptr = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0x1000), true)
+            .expect("pointer value");
+        let count = graph
+            .push_op_var(entry, OpKind::ConstInt(8), true)
+            .expect("count");
+        let result = push_direct_ptradd(&mut graph, entry, ptr.clone(), count.clone());
+        assert_eq!(
+            FunctionGraph::concretetype_of(&result),
+            crate::model::ConcreteType::Unknown,
+            "direct_ptradd result matches null_mut's unstamped pointer"
+        );
+        match &graph.block(entry).operations.last().unwrap().kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments },
+                args,
+                result_ty: ValueType::Ref(None),
+            } if segments.last().map(String::as_str) == Some("direct_ptradd") => {
+                assert_eq!(args, &crate::model::call_args(vec![ptr, count]));
+            }
+            other => panic!("expected direct_ptradd call, got {other:?}"),
+        }
     }
 
     #[test]

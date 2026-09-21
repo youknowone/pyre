@@ -519,11 +519,12 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // `extregistry.lookup`, which returns the SomeBuiltin whose
     // `compute_result_annotation` produces
     // `SomeInteger(knowntype=Ruint, unsigned=True)`.
-    // lltype.py — `@analyzer_for(cast_ptr_to_int)` and
-    // `@analyzer_for(cast_int_to_ptr)`.  `front::mir` lowers a
-    // `Ref ↔ Int` cast to a `simple_call` against the matching
+    // lltype.py — `@analyzer_for(cast_ptr_to_int)`,
+    // `@analyzer_for(cast_int_to_ptr)`, `@analyzer_for(direct_ptradd)`.
+    // `front::mir` lowers a `Ref ↔ Int` cast and a pointer-typed
+    // `<*mut T>::add` to a `simple_call` against the matching
     // `lltype.*` HostObject, so the annotation pass routes through these
-    // analyzers when the cast surface lands in user code.  Keyed by the
+    // analyzers when that surface lands in user code.  Keyed by the
     // `qualname` that
     // `HostObject::new_builtin_callable("lltype.cast_ptr_to_int")`
     // produces (`bookkeeper.rs`'s `immutablevalue_hostobject` reads
@@ -531,6 +532,7 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // for `SomeBuiltin.analyser_name`).
     analyzer_for(&mut reg, "lltype.cast_ptr_to_int", lltype_cast_ptr_to_int);
     analyzer_for(&mut reg, "lltype.cast_int_to_ptr", lltype_cast_int_to_ptr);
+    analyzer_for(&mut reg, "lltype.direct_ptradd", lltype_direct_ptradd);
     analyzer_for(
         &mut reg,
         "rpython.rlib.objectmodel.instantiate",
@@ -2026,6 +2028,39 @@ fn lltype_cast_ptr_to_int(
     Ok(SomeValue::Integer(SomeInteger::default()))
 }
 
+/// Upstream `ann_direct_ptradd(s_p, s_n)`
+/// (`rpython/rtyper/lltypesystem/lltype.py` `ann_direct_ptradd`).
+///
+/// ```python
+/// @analyzer_for(direct_ptradd)
+/// def ann_direct_ptradd(s_p, s_n):
+///     assert isinstance(s_p, SomePtr), "direct_* of non-pointer: %r" % s_p
+///     return s_p
+/// ```
+///
+/// The result annotation is the pointer operand's.  A classdef-less
+/// `SomeInstance` is the erased raw-pointer shell used here; `SomePtr`
+/// is the `lltype.Ptr` spelling.  Either is a pointer, so a
+/// `null_mut()` arm of the same pointer unions with the add.
+fn lltype_direct_ptradd(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if !kwds.is_empty() || args_s.len() != 2 {
+        return Err(AnnotatorError::new(
+            "direct_ptradd expects a pointer and a count",
+        ));
+    }
+    let s_p = arg_at(args_s, 0, "lltype.direct_ptradd");
+    match s_p {
+        SomeValue::Instance(_) | SomeValue::Ptr(_) => Ok(s_p.clone()),
+        other => Err(AnnotatorError::new(format!(
+            "direct_ptradd of non-pointer: {other:?}"
+        ))),
+    }
+}
+
 /// Upstream `ann_cast_int_to_ptr(PtrT, s_int)`
 /// (rpython/rtyper/lltypesystem/lltype.py:2379-2382).
 ///
@@ -3509,6 +3544,7 @@ mod tests {
             ("rpython.rlib.objectmodel", "free_non_gc_object"),
             ("rpython.rtyper.lltypesystem.lltype", "cast_ptr_to_int"),
             ("rpython.rtyper.lltypesystem.lltype", "cast_int_to_ptr"),
+            ("rpython.rtyper.lltypesystem.lltype", "direct_ptradd"),
         ];
         let mut missing: Vec<(String, String)> = Vec::new();
         for (module_path, attr) in cases {
@@ -3547,9 +3583,13 @@ mod tests {
         let cast_i2p = lltype
             .module_get("cast_int_to_ptr")
             .expect("F1 registered cast_int_to_ptr attr on lltype");
+        let direct_ptradd = lltype
+            .module_get("direct_ptradd")
+            .expect("F1 registered direct_ptradd attr on lltype");
         // What `immutablevalue_hostobject` will use as analyser_name.
         let q_p2i = cast_p2i.qualname();
         let q_i2p = cast_i2p.qualname();
+        let q_add = direct_ptradd.qualname();
         assert!(
             super::is_registered(q_p2i),
             "F2 analyzer must be registered under the qualname \
@@ -3560,6 +3600,12 @@ mod tests {
             super::is_registered(q_i2p),
             "F2 analyzer must be registered under the qualname \
              bookkeeper produces. Got qualname {q_i2p:?} which is \
+             NOT in BUILTIN_ANALYZERS — call_builtin would fail."
+        );
+        assert!(
+            super::is_registered(q_add),
+            "F2 analyzer must be registered under the qualname \
+             bookkeeper produces. Got qualname {q_add:?} which is \
              NOT in BUILTIN_ANALYZERS — call_builtin would fail."
         );
     }
