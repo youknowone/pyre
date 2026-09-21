@@ -4678,6 +4678,13 @@ fn try_compile_ca_bridge(
     descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
     raw_values: &[i64],
     guard_value_operand: Option<i64>,
+    // `cpu.grab_exc_value(deadframe)` (llmodel.py). `jit_ca_handle_guard_failure`
+    // re-reads `jf_guard_exc` and threads that word; the wasm deopt has already
+    // moved it into this argument (`dead_frame_from_ran_frame`'s `jit_exc_take`).
+    // `prepare_resume_from_failure` (pyjitpl.py) calls `execute_ll_raised` then
+    // `handle_possible_exception`, so the bridge enters the handler with the
+    // exception live. `0` is the no-exception resume.
+    guard_exc: i64,
 ) -> CaBridgeAttempt {
     if raw_values.is_empty() {
         return CaBridgeAttempt {
@@ -4734,7 +4741,7 @@ fn try_compile_ca_bridge(
     let frame = unsafe { &mut *frame_ptr };
     let _guard = crate::eval::GuardCompilingScope::new(descr_arc);
     let _compiled = matches!(
-        trace_and_compile_from_bridge(descr_arc, frame, raw_values, &exit_layout, 0, false),
+        trace_and_compile_from_bridge(descr_arc, frame, raw_values, &exit_layout, guard_exc, false,),
         BridgeResolution::CompiledContinue
     );
     // The wasm CALL_ASSEMBLER path likewise bypasses handle_fail's dependency drain.
@@ -4827,6 +4834,23 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             } else {
                 Outcome::Finished(result)
             }
+        } else if majit_backend_wasm::failguard::is_propagate_exception_descr(&descr_arc) {
+            // compile.py `PropagateExceptionDescr.handle_fail`
+            // (`compile_tmp_callback`). The guard's descr is the cpu's
+            // `propagate_exception_descr` singleton and its failargs are
+            // empty, so the resume-guard arm below has no `rd_numb` and
+            // the caller would continue as if the call returned NULL.
+            // `grab_exc_value` reads the exception the guard left in the
+            // frame; an empty cell falls back to `memory_error`. Publish
+            // it the way the ExitFrameWithException arm does, so the
+            // caller's GUARD_NO_EXCEPTION sees the raise.
+            let exc_val = backend.grab_exc_value(&frame).0 as i64;
+            let value = if exc_val != 0 {
+                exc_val
+            } else {
+                majit_backend::memory_error_singleton_ref()
+            };
+            Outcome::FinishedException(value)
         } else {
             let green_key = majit_backend::descr_owning_jct(descr)
                 .map(|jct| jct.green_key())
@@ -4901,7 +4925,8 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
                     exit_layout.is_traced_ref_slot(index)
                 })
             };
-            let attempt = try_compile_ca_bridge(&descr_arc, &raw_values, guard_value_operand);
+            let attempt =
+                try_compile_ca_bridge(&descr_arc, &raw_values, guard_value_operand, guard_exc);
             if attempt.terminal_declined {
                 // This target cannot reach compiled steady state: each CA
                 // invocation would blackhole.  Invalidate callers so the next
