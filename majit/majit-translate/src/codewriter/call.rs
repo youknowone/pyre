@@ -2542,6 +2542,21 @@ impl CallControl {
                 let ad_arc: std::sync::Arc<dyn majit_ir::descr::ArrayDescr> =
                     majit_ir::descr::descr_arc_as_array_descr(cached)
                         .expect("gc_cache._cache_array slot held a non-ArrayDescr Arc");
+                // descr.py:348-362: cache[ARRAY_OR_STRUCT] is keyed on the
+                // ARRAY lltype identity, and `nolength` is a property of
+                // that lltype.  A hit that disagrees on lendescr/base_size
+                // means two producers stamped the same atid with
+                // disagreeing `nolength`.
+                let cached_len_offset = ad_arc.len_descr().map(|fd| fd.offset());
+                let cached_base_size = ad_arc.base_size();
+                assert!(
+                    ad_arc.len_descr().is_some() == len_offset.is_some()
+                        && cached_base_size == base_size,
+                    "get_array_descr cache hit for atid {atid:?} disagrees \
+                     with this call: requested len_offset={len_offset:?} \
+                     base_size={base_size}, cached len_offset={cached_len_offset:?} \
+                     base_size={cached_base_size}",
+                );
                 // descr.py:372-375 — struct arrays get interior field
                 // descriptors.  `set_all_interiorfielddescrs` is
                 // `OnceLock` (first-call wins) so re-populating on

@@ -5673,7 +5673,9 @@ impl<'a> Lowering<'a> {
                         value: value.clone(),
                         item_ty: alias.item_ty,
                         array_type_id: alias.array_type_id.clone(),
-                        nolength: false,
+                        nolength: crate::front::typestr::nolength_from_array_type_id(
+                            alias.array_type_id.as_deref(),
+                        ),
                     }
                 } else if let Some(owner) = self.string_array_remove_owner() {
                     // Tail of RPython `ll_delitem_nonneg`: after
@@ -5729,7 +5731,9 @@ impl<'a> Lowering<'a> {
                         value: value.clone(),
                         item_ty: ValueType::Str,
                         array_type_id: Some(STRING_GCREF_GCARRAY_TYPE_ID.to_string()),
-                        nolength: false,
+                        nolength: crate::front::typestr::nolength_from_array_type_id(Some(
+                            STRING_GCREF_GCARRAY_TYPE_ID,
+                        )),
                     }
                 } else {
                     // `*p = val` — no IR-level FieldWrite/ArrayWrite
@@ -7477,10 +7481,13 @@ impl<'a> Lowering<'a> {
                         .string_array_view_locals
                         .iter()
                         .any(|(local, _)| place_references_local(&inner, *local));
-                    let (mut array_type_id, nolength) =
+                    let (mut array_type_id, mut nolength) =
                         array_projection_metadata(&inner.ty, self.llbc);
                     if string_array_view {
                         array_type_id = Some(STRING_GCREF_GCARRAY_TYPE_ID.to_string());
+                        nolength = crate::front::typestr::nolength_from_array_type_id(
+                            array_type_id.as_deref(),
+                        );
                     }
                     let base = self.resolve_place(mir_bb, *inner)?;
                     let bb_id = self.block_id[mir_bb];
@@ -10153,7 +10160,9 @@ impl<'a> Lowering<'a> {
                             index: args[1].clone(),
                             item_ty: item_ty.clone(),
                             array_type_id: array_type_id.clone(),
-                            nolength: false,
+                            nolength: crate::front::typestr::nolength_from_array_type_id(
+                                array_type_id.as_deref(),
+                            ),
                             pure: false,
                         },
                     });
@@ -10370,7 +10379,9 @@ impl<'a> Lowering<'a> {
                             index: args[1].clone(),
                             item_ty: item_ty.clone(),
                             array_type_id: Some(array_type_id.clone()),
-                            nolength: false,
+                            nolength: crate::front::typestr::nolength_from_array_type_id(Some(
+                                array_type_id.as_str(),
+                            )),
                             pure: false,
                         },
                     });
@@ -10463,7 +10474,9 @@ impl<'a> Lowering<'a> {
                             index: args[1].clone(),
                             item_ty: item_ty.clone(),
                             array_type_id: Some(array_type_id.clone()),
-                            nolength: false,
+                            nolength: crate::front::typestr::nolength_from_array_type_id(Some(
+                                array_type_id.as_str(),
+                            )),
                             pure: false,
                         },
                     });
@@ -15736,6 +15749,11 @@ impl<'a> Lowering<'a> {
     /// callsite to RPython's `longlong2float.longlong2float` external operation.
     /// Its rtyper specialization emits `convert_longlong_bytes_to_float`, the
     /// exact inverse of `float2longlong`.
+    ///
+    /// Matched as a `::`-segment suffix, not a substring: `str::contains`
+    /// / `str::ends_with("::from_bits")` also accept Grain's
+    /// `position_from_bits` and bitflags `from_bits`, which are not the
+    /// f64 bitcast (`path_ends_with_segments`).
     fn is_f64_from_bits(&self, reg: &RegularCall) -> bool {
         self.f64_inherent_method(reg, "from_bits")
     }
@@ -28243,6 +28261,43 @@ fn host_lltype_cast_llop(
             .then_some(("cast_int_to_ptr", dst.clone()));
     }
     None
+}
+
+#[cfg(test)]
+mod f64_bitcast_path_tests {
+    use super::path_ends_with_segments;
+
+    #[test]
+    fn f64_from_bits_is_a_path_suffix_not_a_substring() {
+        assert!(path_ends_with_segments(
+            "core::f64::<Impl>::from_bits",
+            "f64::<Impl>::from_bits"
+        ));
+        assert!(path_ends_with_segments(
+            "std::f64::<Impl>::from_bits",
+            "f64::<Impl>::from_bits"
+        ));
+        assert!(!path_ends_with_segments(
+            "rhai::grain::vm::jit::position_from_bits",
+            "f64::<Impl>::from_bits"
+        ));
+        assert!(!path_ends_with_segments(
+            "rhai::grain::format::StepFlags::<Impl>::from_bits",
+            "f64::<Impl>::from_bits"
+        ));
+    }
+
+    #[test]
+    fn f64_to_bits_is_a_path_suffix_not_a_substring() {
+        assert!(path_ends_with_segments(
+            "core::f64::<Impl>::to_bits",
+            "f64::<Impl>::to_bits"
+        ));
+        assert!(!path_ends_with_segments(
+            "some_host::position_to_bits",
+            "f64::<Impl>::to_bits"
+        ));
+    }
 }
 
 /// Whether an impl-owned global is exactly

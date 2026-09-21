@@ -64,7 +64,7 @@ use crate::model::{
 /// helper, not a bare `_ovf` twin), and the live integer fast paths spell
 /// those with explicit value guards (`int_floordiv` / `int_mod`), so they
 /// never reach this shape.
-fn checked_arith_ovf_opname(leaf: &str) -> Option<&'static str> {
+pub(crate) fn checked_arith_ovf_opname(leaf: &str) -> Option<&'static str> {
     match leaf {
         "checked_add" => Some("add_ovf"),
         "checked_sub" => Some("sub_ovf"),
