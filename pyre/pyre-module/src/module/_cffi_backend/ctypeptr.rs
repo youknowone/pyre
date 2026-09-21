@@ -169,13 +169,8 @@ pub unsafe fn array_convert_from_object(
 
 /// `W_CTypePtrOrArray.convert_array_from_object`.
 ///
-/// The fused `W_CType.convert_from_object` match still walks this arm on
-/// an int call; PyPy's class dispatch does not. The body is not a jitcode
-/// (`unpackiterable`, `Wtf8::code_points`), so it stays a bound residual.
-///
 /// # Safety
 /// `cdata` must be writable for as many items as `w_ob` supplies.
-#[majit_macros::dont_look_inside]
 pub unsafe fn convert_array_from_object(
     ct: &W_CType,
     cdata: *mut u8,

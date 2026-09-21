@@ -525,7 +525,11 @@ pub unsafe fn convert_from_object(
     cdata: usize,
     w_ob: PyObjectRef,
 ) -> Result<(), PyError> {
-    match ct.kind {
+    // `self = jit.promote(self)` then a subclass method: `kind` is the
+    // flattened class pointer (`jit_immutable_fields`), so promoting it
+    // makes this match the static overload the hierarchy gets for free.
+    let kind = majit_metainterp::jit::promote(ct.kind);
+    match kind {
         // `W_CTypeFunc(W_CTypePtrBase)` inherits the same conversion.
         KIND_POINTER | KIND_FUNC => unsafe {
             super::ctypeptr::pointer_convert_from_object(ct, cdata as *mut u8, w_ob)
