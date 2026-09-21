@@ -1137,15 +1137,23 @@ fn record_inline_application_traceback<Sym: WalkSym>(
     // A non-standard virtualizable frame in a bridge sub-walk carries the
     // `GcRef(usize::MAX)` sentinel (or null) as `w_code` instead of a real
     // `PyCode` — a synthetic frame with no Python code to anchor a node on.
-    // The host adapter (`record_inline_traceback_for_recording`) dereferences
-    // `w_code` through `createframe_obj`, so a sentinel / garbage pointer would
-    // SIGSEGV.  Skip null / sentinel / non-code; the null + sentinel checks run
-    // before `is_code`, whose `py_type_check` would deref the raw sentinel
-    // (`CAN_BE_TAGGED` is off).
-    if consts.w_code == 0 || consts.w_code == usize::MAX {
+    // Resolve the jitcode's own pycode rather than skipping: that skip is
+    // what left inlined raises with an empty traceback. The host adapter
+    // (`record_inline_traceback_for_recording`) dereferences `w_code` through
+    // `createframe_obj`, so a remaining sentinel / garbage pointer would
+    // SIGSEGV. The null + sentinel checks run before `is_code`, whose
+    // `py_type_check` would deref the raw sentinel (`CAN_BE_TAGGED` is off).
+    let w_code = if consts.w_code == 0 || consts.w_code == usize::MAX {
+        crate::state::code_for_jitcode_index(consts.jitcode_index)
+            .map(|ptr| ptr as usize)
+            .unwrap_or(0)
+    } else {
+        consts.w_code
+    };
+    if w_code == 0 || w_code == usize::MAX {
         return;
     }
-    if !unsafe { pyre_interpreter::pycode::is_code(consts.w_code as pyre_object::PyObjectRef) } {
+    if !unsafe { pyre_interpreter::pycode::is_code(w_code as pyre_object::PyObjectRef) } {
         return;
     }
     let ConcreteValue::Ref(mut exc_ptr) = *exc_concrete else {
@@ -1209,6 +1217,15 @@ fn record_inline_application_traceback<Sym: WalkSym>(
                     consts.jitcode_index,
                     opcode_position as i32,
                 )
+            } else {
+                let live = pyre_object::gc_roots::shadow_stack_get(slot);
+                majit_metainterp::record_inline_application_traceback_for_recording(
+                    live as usize as i64,
+                    w_code as i64,
+                    consts.w_globals as i64,
+                    consts.jitcode_index,
+                    opcode_position as i32,
+                );
             }
         });
         note_forwarded_exc(ctx, exc_concrete, old, exc_ptr);
@@ -1220,19 +1237,31 @@ fn record_inline_application_traceback<Sym: WalkSym>(
         })
         .unwrap_or(OpRef::NONE);
     let frame_hook = majit_metainterp::record_application_traceback_hook_address();
-    if emit_runtime && !frame_hook.is_null() && !exc.is_none() {
-        assert!(
-            !frame.is_none(),
-            "an inlined MIFrame must carry its own red PyFrame"
-        );
-        let jitcode = ctx.trace_ctx.const_int(i64::from(consts.jitcode_index));
-        let opcode = ctx.trace_ctx.const_int(opcode_position as i64);
-        ctx.trace_ctx.call_void_typed_with_effect(
-            frame_hook,
-            &[exc, frame, jitcode, opcode],
-            &[Type::Ref, Type::Ref, Type::Int, Type::Int],
-            default_effect_info(),
-        );
+    if emit_runtime && !exc.is_none() {
+        if !frame.is_none() && !frame_hook.is_null() {
+            let jitcode = ctx.trace_ctx.const_int(i64::from(consts.jitcode_index));
+            let opcode = ctx.trace_ctx.const_int(opcode_position as i64);
+            ctx.trace_ctx.call_void_typed_with_effect(
+                frame_hook,
+                &[exc, frame, jitcode, opcode],
+                &[Type::Ref, Type::Ref, Type::Int, Type::Int],
+                default_effect_info(),
+            );
+        } else {
+            let inline_hook = majit_metainterp::record_inline_application_traceback_hook_address();
+            if !inline_hook.is_null() {
+                let w_code_op = ctx.trace_ctx.const_ref(w_code as i64);
+                let w_globals_op = ctx.trace_ctx.const_ref(consts.w_globals as i64);
+                let jitcode = ctx.trace_ctx.const_int(i64::from(consts.jitcode_index));
+                let opcode = ctx.trace_ctx.const_int(opcode_position as i64);
+                ctx.trace_ctx.call_void_typed_with_effect(
+                    inline_hook,
+                    &[exc, w_code_op, w_globals_op, jitcode, opcode],
+                    &[Type::Ref, Type::Ref, Type::Ref, Type::Int, Type::Int],
+                    default_effect_info(),
+                );
+            }
+        }
     }
 }
 
@@ -1485,8 +1514,16 @@ fn traceback_node_site<Sym: WalkSym>(
         };
         (session.recording_jitcode_index, w_code)
     } else {
-        ctx.inline_callee_consts
-            .map_or((-1, 0), |consts| (consts.jitcode_index, consts.w_code))
+        ctx.inline_callee_consts.map_or((-1, 0), |consts| {
+            let w_code = if consts.w_code == 0 || consts.w_code == usize::MAX {
+                crate::state::code_for_jitcode_index(consts.jitcode_index)
+                    .map(|ptr| ptr as usize)
+                    .unwrap_or(0)
+            } else {
+                consts.w_code
+            };
+            (consts.jitcode_index, w_code)
+        })
     };
     if w_code == 0 || w_code == usize::MAX {
         return None;

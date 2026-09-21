@@ -3117,14 +3117,35 @@ pub fn record_discarded_level_traceback_hook_address() -> *const () {
 }
 
 fn record_application_traceback(exc_value: i64, frame_ptr: *const u8, frame: &MIFrame) {
-    if exc_value == 0 || frame_ptr.is_null() || frame.inline_frame {
+    if exc_value == 0 {
+        return;
+    }
+    let jitcode_index = frame.jitcode.try_index().map_or(-1, |index| index as i32);
+    let opcode_position = frame.last_opcode_position as i32;
+    // `pytraceback.py record_application_traceback` appends a node for every
+    // non-hidden frame. An inlined MIFrame is still that frame: skipping it
+    // left a raise inside an inlined callee with no node (`[()]` instead of
+    // the frame-name tuple). Route through the inline hook so the host can
+    // attach the node to this jitcode's own pycode rather than the portal
+    // virtualizable (which is the caller's frame).
+    if frame.inline_frame {
+        record_inline_application_traceback_for_recording(
+            exc_value,
+            0,
+            0,
+            jitcode_index,
+            opcode_position,
+        );
+        return;
+    }
+    if frame_ptr.is_null() {
         return;
     }
     record_application_traceback_for_recording(
         exc_value,
         frame_ptr as usize as i64,
-        frame.jitcode.try_index().map_or(-1, |index| index as i32),
-        frame.last_opcode_position as i32,
+        jitcode_index,
+        opcode_position,
     );
 }
 
@@ -3159,9 +3180,12 @@ pub fn record_inline_application_traceback_for_recording(
     jitcode_index: i32,
     opcode_position: i32,
 ) {
-    if exc_value == 0 || w_code == 0 {
+    if exc_value == 0 {
         return;
     }
+    // `w_code == 0` is not a skip: the host resolves this jitcode's own
+    // pycode (`code_for_jitcode_index`) and ignores a helper with no
+    // Python code. Passing a sentinel here used to drop inlined nodes.
     let Some(callback) = host_hooks().record_inline_application_traceback else {
         return;
     };
