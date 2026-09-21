@@ -145,12 +145,16 @@ impl FieldEntry {
     }
 
     /// View this slot the same way RPython reads `_fields[]` / `_items[]`
-    /// in non-forcing paths such as `serialize_optheap`,
-    /// `produce_short_preamble_ops`, and `_expand_infos_from_virtual`.
+    /// in non-forcing paths such as `produce_short_preamble_ops` and
+    /// `_expand_infos_from_virtual`.
     ///
     /// Normal values return the stored OpRef. `PreambleOp` entries expose
-    /// their original Phase 1 source box (`pop.op`), matching PyPy's
-    /// `get_box_replacement(PreambleOp(...))` behavior.
+    /// their carried Box (`pop.op`, `shortpreamble.py PreambleOp.op`).
+    /// That is **not** `AbstractValue.get_box_replacement` of the
+    /// `PreambleOp` itself — that walk returns the wrapper, whose
+    /// `AbstractValue.is_constant` is false — so `heap.py
+    /// serialize_optheap` must skip `is_preamble()` entries rather than
+    /// treating this payload as a serializable Const.
     pub fn as_seen_opref(&self) -> OpRef {
         if let Some(pop) = self.as_preamble() {
             pop.op.to_opref()
