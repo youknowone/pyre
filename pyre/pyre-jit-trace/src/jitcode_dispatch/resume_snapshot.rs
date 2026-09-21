@@ -11,20 +11,23 @@
 
 use super::*;
 
-/// True when a branch-guard's not-taken arm is still the same Python
-/// opcode as the `goto_if_not` itself.
+/// True when a branch-guard's not-taken arm is still JUMP_BACKWARD.
 ///
 /// The JUMP_BACKWARD eval-breaker poll is this shape: both arms keep the
 /// jump's frame state, so `get_list_of_active_boxes` (`pyjitpl.py`) reads
 /// the terminator's own `-live-`.  A Python `POP_JUMP_IF_*` / `FOR_ITER`
-/// not-taken arm is a different opcode, so this is false and the snapshot
-/// keeps the opcode-start resume marker (boxed TOS / exhausted-arm live
-/// set).
+/// / short-circuit / chained-compare not-taken arm may share the guard's
+/// own Python opcode (its trampoline block belongs to the same opcode)
+/// but is not the tick: this is false and the snapshot keeps the
+/// opcode-start resume marker / `encode_branch_orgpc` kept-slot recovery
+/// (`scope.branch_guard_kept_recovered`).
 pub(crate) fn branch_not_taken_stays_in_guard_opcode(
     guard_py_pc: Option<u32>,
     other_py_pc: Option<u32>,
+    guard_is_jump_backward: bool,
 ) -> bool {
-    matches!((guard_py_pc, other_py_pc), (Some(guard), Some(other)) if guard == other)
+    guard_is_jump_backward
+        && matches!((guard_py_pc, other_py_pc), (Some(guard), Some(other)) if guard == other)
 }
 
 /// Exact `jtransform.py handle_residual_call` trailing `-live-` marker.
@@ -1074,17 +1077,35 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // The opcode-start resume marker for that PC is the
                 // predecessor STORE_FAST trailing live and lists dead temps
                 // as kept stack colors (`BranchGuardKeptSlotUnsourced`).
-                let (guard_py, other_py) = unsafe {
-                    let table = &(&*sym.jitcode()).payload.metadata.py_exact_by_jit_pc;
-                    (
-                        scope.branch_guard_jitcode_pc.and_then(|gpc| {
-                            crate::pyjitcode::exact_py_pc_for_jitcode_pc(table, gpc)
-                        }),
-                        crate::pyjitcode::exact_py_pc_for_jitcode_pc(table, op_pc),
-                    )
+                // Same-opcode is not enough: a kept-stack `POP_JUMP_IF_*`
+                // trampoline can share the guard's Python opcode and must
+                // still take `encode_branch_orgpc` / kept-slot recovery.
+                let (guard_py, other_py, guard_is_jump_backward) = unsafe {
+                    let jc = &*sym.jitcode();
+                    let table = &jc.payload.metadata.py_exact_by_jit_pc;
+                    let guard_py = scope
+                        .branch_guard_jitcode_pc
+                        .and_then(|gpc| crate::pyjitcode::exact_py_pc_for_jitcode_pc(table, gpc));
+                    let other_py = crate::pyjitcode::exact_py_pc_for_jitcode_pc(table, op_pc);
+                    let guard_is_jump_backward = !jc.payload.code_ptr.is_null()
+                        && guard_py
+                            .and_then(|py| {
+                                pyre_interpreter::decode_instruction_at(
+                                    &*jc.payload.code_ptr,
+                                    py as usize,
+                                )
+                            })
+                            .is_some_and(|(instr, _)| {
+                                matches!(instr, pyre_interpreter::Instruction::JumpBackward { .. })
+                            });
+                    (guard_py, other_py, guard_is_jump_backward)
                 };
-                let same_opcode_poll =
-                    is_branch && branch_not_taken_stays_in_guard_opcode(guard_py, other_py);
+                let same_opcode_poll = is_branch
+                    && branch_not_taken_stays_in_guard_opcode(
+                        guard_py,
+                        other_py,
+                        guard_is_jump_backward,
+                    );
                 if same_opcode_poll
                     && ctx.live_before_jit_pc != usize::MAX
                     && unsafe {
