@@ -19,7 +19,7 @@
 //! is atomic-only.
 
 use crate::flowspace::model::Variable;
-use crate::model::{CallTarget, LinkArg, OpKind, ValueType};
+use crate::model::{CallTarget, LinkArg, OpKind};
 
 fn path_has(segments: &[String], needle: &str) -> bool {
     segments.iter().any(|s| s.as_str() == needle)
@@ -195,7 +195,7 @@ pub(crate) fn lower_std_primitive_op(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::call_args;
+    use crate::model::{ValueType, call_args};
 
     fn path(segments: &[&str]) -> CallTarget {
         CallTarget::FunctionPath {
