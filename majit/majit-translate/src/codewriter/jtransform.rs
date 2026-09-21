@@ -1055,7 +1055,7 @@ fn ptr_arith_base_operand(
                 continue;
             }
             let OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
+                target: CallTarget::FunctionPath { segments, .. },
                 args,
                 ..
             } = &op.kind
@@ -6389,7 +6389,7 @@ impl<'a> Transformer<'a> {
         // `*mut T` (`ptr/mod.rs from_ref` returns `r`). Same
         // `rewrite_op_cast_pointer` → `same_as` alias as the marker
         // above: no jitcode op, not a residual helper.
-        if let CallTarget::FunctionPath { segments } = target
+        if let CallTarget::FunctionPath { segments, .. } = target
             && is_ptr_from_ref_path(segments)
             && args.len() == 1
         {
