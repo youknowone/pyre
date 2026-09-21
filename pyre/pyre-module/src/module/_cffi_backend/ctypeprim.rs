@@ -201,33 +201,11 @@ pub unsafe fn convert_from_object(
                 }
             }
             // `W_CTypePrimitiveFloat.convert_from_object`.
-            ctypeobj::KIND_PRIM_FLOAT => {
-                let value = pyre_interpreter::baseobjspace::float_w(w_ob)?;
-                misc::write_raw_float_data(cdata, value, ct.size)
-            }
-            // `W_CTypePrimitiveLongDouble.convert_from_object` — a long
-            // double source is copied whole rather than narrowed.
-            ctypeobj::KIND_PRIM_LONGDOUBLE => {
-                if let Some(source) = W_CData::from_obj(w_ob)
-                    && let Some(s) = ctypeobj::ctype_at(source.ctype)
-                    && s.kind == ctypeobj::KIND_PRIM_LONGDOUBLE
-                {
-                    copy_longdouble(source.ptr, cdata);
-                    return Ok(());
-                }
-                misc::write_raw_longdouble_data(
-                    cdata as *mut u8,
-                    pyre_interpreter::baseobjspace::float_w(w_ob)?,
-                );
-                Ok(())
-            }
+            ctypeobj::KIND_PRIM_FLOAT => convert_from_object_float(ct, cdata, w_ob),
+            // `W_CTypePrimitiveLongDouble.convert_from_object`.
+            ctypeobj::KIND_PRIM_LONGDOUBLE => convert_from_object_longdouble(ct, cdata, w_ob),
             // `W_CTypePrimitiveComplex.convert_from_object`.
-            ctypeobj::KIND_PRIM_COMPLEX => {
-                let (real, imag) = unpack_complex(w_ob)?;
-                let half = ct.size >> 1;
-                misc::write_raw_float_data(cdata, real, half)?;
-                misc::write_raw_float_data(cdata + half as usize, imag, half)
-            }
+            ctypeobj::KIND_PRIM_COMPLEX => convert_from_object_complex(ct, cdata, w_ob),
             _ => Err(cannot_initialize_cdata(ct)),
         }
     }
@@ -680,7 +658,11 @@ fn convert_to_char(ct: &W_CType, w_ob: PyObjectRef) -> Result<u8, PyError> {
 }
 
 /// `W_CTypePrimitiveUniChar._convert_to_charN_t`.
-fn convert_to_char_n_t(ct: &W_CType, w_ob: PyObjectRef) -> Result<u32, PyError> {
+///
+/// `Wtf8::code_points` is un-lowered. The fused primitive convert match
+/// still walks this arm on an int call; PyPy's class dispatch does not.
+#[majit_macros::dont_look_inside]
+pub(crate) fn convert_to_char_n_t(ct: &W_CType, w_ob: PyObjectRef) -> Result<u32, PyError> {
     if unsafe { pyre_object::unicodeobject::is_str(w_ob) } {
         let value = unsafe { pyre_object::w_str_get_wtf8(w_ob) };
         let mut points = value.code_points();
@@ -708,6 +690,60 @@ fn convert_to_char_n_t(ct: &W_CType, w_ob: PyObjectRef) -> Result<u32, PyError> 
 /// protocol, and that is how a cdata of a complex ctype answers.
 fn unpack_complex(w_ob: PyObjectRef) -> Result<(f64, f64), PyError> {
     pyre_interpreter::builtins::complex_coerce(w_ob)
+}
+
+/// `W_CTypePrimitiveFloat.convert_from_object`.
+///
+/// `float_w` looks up `__float__` (`box_str_constant`). The fused primitive
+/// convert match still walks this arm on an int call; PyPy's class dispatch
+/// does not.
+#[majit_macros::dont_look_inside]
+pub(crate) unsafe fn convert_from_object_float(
+    ct: &W_CType,
+    cdata: usize,
+    w_ob: PyObjectRef,
+) -> Result<(), PyError> {
+    let value = pyre_interpreter::baseobjspace::float_w(w_ob)?;
+    unsafe { misc::write_raw_float_data(cdata, value, ct.size) }
+}
+
+/// `W_CTypePrimitiveLongDouble.convert_from_object`.
+#[majit_macros::dont_look_inside]
+pub(crate) unsafe fn convert_from_object_longdouble(
+    ct: &W_CType,
+    cdata: usize,
+    w_ob: PyObjectRef,
+) -> Result<(), PyError> {
+    let _ = ct;
+    if let Some(source) = W_CData::from_obj(w_ob)
+        && let Some(s) = ctypeobj::ctype_at(source.ctype)
+        && s.kind == ctypeobj::KIND_PRIM_LONGDOUBLE
+    {
+        copy_longdouble(source.ptr, cdata);
+        return Ok(());
+    }
+    unsafe {
+        misc::write_raw_longdouble_data(
+            cdata as *mut u8,
+            pyre_interpreter::baseobjspace::float_w(w_ob)?,
+        );
+    }
+    Ok(())
+}
+
+/// `W_CTypePrimitiveComplex.convert_from_object`.
+#[majit_macros::dont_look_inside]
+pub(crate) unsafe fn convert_from_object_complex(
+    ct: &W_CType,
+    cdata: usize,
+    w_ob: PyObjectRef,
+) -> Result<(), PyError> {
+    let (real, imag) = unpack_complex(w_ob)?;
+    let half = ct.size >> 1;
+    unsafe {
+        misc::write_raw_float_data(cdata, real, half)?;
+        misc::write_raw_float_data(cdata + half as usize, imag, half)
+    }
 }
 
 /// `W_CType.convert_to_object` — `oefmt("cannot return a cdata '%s'")`.

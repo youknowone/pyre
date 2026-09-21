@@ -1382,6 +1382,36 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
                 "pyre_module::module::_cffi_backend::ctypeprim::overflow_value",
                 ctypeprim::overflow_value as *const (),
             ),
+            (
+                "pyre_interpreter::module::_cffi_backend::ctypeptr::convert_array_from_object",
+                "pyre_module::module::_cffi_backend::ctypeptr::convert_array_from_object",
+                ctypeptr::convert_array_from_object as *const (),
+            ),
+            (
+                "pyre_interpreter::module::_cffi_backend::ctypestruct::convert_struct_from_object",
+                "pyre_module::module::_cffi_backend::ctypestruct::convert_struct_from_object",
+                ctypestruct::convert_struct_from_object as *const (),
+            ),
+            (
+                "pyre_interpreter::module::_cffi_backend::ctypeprim::convert_to_char_n_t",
+                "pyre_module::module::_cffi_backend::ctypeprim::convert_to_char_n_t",
+                ctypeprim::convert_to_char_n_t as *const (),
+            ),
+            (
+                "pyre_interpreter::module::_cffi_backend::ctypeprim::convert_from_object_float",
+                "pyre_module::module::_cffi_backend::ctypeprim::convert_from_object_float",
+                ctypeprim::convert_from_object_float as *const (),
+            ),
+            (
+                "pyre_interpreter::module::_cffi_backend::ctypeprim::convert_from_object_longdouble",
+                "pyre_module::module::_cffi_backend::ctypeprim::convert_from_object_longdouble",
+                ctypeprim::convert_from_object_longdouble as *const (),
+            ),
+            (
+                "pyre_interpreter::module::_cffi_backend::ctypeprim::convert_from_object_complex",
+                "pyre_module::module::_cffi_backend::ctypeprim::convert_from_object_complex",
+                ctypeprim::convert_from_object_complex as *const (),
+            ),
         ] {
             single(entries, interp, fnptr);
             single(entries, module, fnptr);
