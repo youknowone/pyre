@@ -2281,9 +2281,10 @@ const VABLE_VALUESTACKDEPTH_FIELD_IDX: u16 = 2;
 /// decr_by)` then `can_enter_jit`.  The walked fast path is the breaker-word
 /// poll (`raw_load_i` / `uint_ge` / `goto_if_not` → `GuardFalse`), matching
 /// `--TICK--` (`getfield_raw_i` / `int_lt` / `guard_false`).  The armed arm is
-/// a residual call that services the whole breaker word then runs
-/// `bytecode_trace`, so a blackhole or bridge from that guard executes the
-/// action dispatcher instead of jumping straight back into the loop.
+/// a residual call to `bytecode_trace`, so a blackhole or bridge from that
+/// guard executes the action dispatcher instead of jumping straight back into
+/// the loop.  The pyre-only breaker bits stay armed for `eval_loop_jit`
+/// (`bh_bytecode_trace_jitted_slow`).
 ///
 /// `emit_tick` is the true-portal `JUMP_BACKWARD` gate: a non-portal jitcode
 /// aliases `frame_var` to the outermost frame (same gap as ReturnValue's

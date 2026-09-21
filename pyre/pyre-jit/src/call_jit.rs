@@ -7473,49 +7473,21 @@ pub extern "C" fn bh_get_iter_fn(obj: i64) -> i64 {
     }
 }
 
-/// Residual callee for the jitted `jump_absolute` armed path.
+/// Residual callee for the jitted `jump_absolute` armed path:
+/// `ec.bytecode_trace(frame, decr_by)`.
 ///
 /// Void result (`residual_call_r_v`), matching `bh_delete_subscr_fn`:
 /// always returns 0; an exception is published through `BH_LAST_EXC_VALUE`
 /// for the trailing `GuardNoException`.
 ///
-/// pyre-adaptation: upstream has one ticker and no STW.  The walked
-/// guard fails on `word >= JIT_BREAKER_FLOOR` (any breaker bit:
-/// `EB_ASYNC`, `EB_STW`, `EB_FINALIZING`, `EB_GC`, `EB_MEMORY_ERROR`),
-/// so the armed arm must do what `eval_loop_jit` and `eval_loop` do at a
-/// bytecode boundary, in that order, then `bytecode_trace`.  The four
-/// short calls are duplicated rather than shared with those loops: they
-/// are hot and hand-inlined for a measured reason (`eval_loop_jit`:
-/// "The naive call … regresses hot benchmarks 28-29%").
+/// pyre-adaptation: the walked guard fails on `word >= JIT_BREAKER_FLOOR`,
+/// so it also fires for the pyre-only breaker bits (`EB_STW`,
+/// `EB_FINALIZING`, `EB_GC`, `EB_MEMORY_ERROR`).  This helper consumes only
+/// what `bytecode_trace` consumes and leaves those bits armed for the
+/// bytecode-boundary service in `eval_loop_jit`: that service collects
+/// through `gc_interp::safepoint`, which is safe only at the interpreter's
+/// dispatch safepoint, not from a residual call inside machine code.
 pub extern "C" fn bh_bytecode_trace_jitted_slow(ec_ptr: i64, frame_ptr: i64) -> i64 {
-    // The frame is GC-managed and can move only at a collection point.
-    // `park_if_finalizing`, `gc_interp::safepoint` and `gc_sync::safepoint_poll`
-    // below can collect; hold it on the shadow stack and re-read after.
-    let frame_anchor = if frame_ptr != 0 {
-        Some(unsafe { pyre_interpreter::eval::FrameAnchor::from_raw(frame_ptr as *mut PyFrame) })
-    } else {
-        None
-    };
-    let dispatch_breaker = majit_ir::eval_breaker_word::load();
-    if dispatch_breaker & majit_ir::eval_breaker_word::EB_FINALIZING != 0 {
-        pyre_interpreter::module::thread::park_if_finalizing();
-    }
-    if dispatch_breaker
-        & (majit_ir::eval_breaker_word::EB_GC_INTERP | majit_ir::eval_breaker_word::EB_GC)
-        != 0
-    {
-        pyre_object::gc_interp::safepoint();
-    }
-    if dispatch_breaker & majit_ir::eval_breaker_word::EB_STW != 0 {
-        majit_gc::gc_sync::safepoint_poll();
-    }
-    if majit_ir::eval_breaker_word::take_memory_error() {
-        majit_gc::gc_sync::safepoint_poll();
-        let mut err = pyre_interpreter::PyError::memory_error("");
-        publish_residual_call_exception(err.to_exc_object() as i64);
-        return 0;
-    }
-
     if ec_ptr == 0 {
         return 0;
     }
@@ -7525,11 +7497,7 @@ pub extern "C" fn bh_bytecode_trace_jitted_slow(ec_ptr: i64, frame_ptr: i64) -> 
         0
     };
     let ec = ec_ptr as *mut pyre_interpreter::PyExecutionContext;
-    let frame = match frame_anchor.as_ref() {
-        Some(anchor) => anchor.live(),
-        None => std::ptr::null_mut(),
-    };
-    match unsafe { (*ec).bytecode_trace(frame, decr_by) } {
+    match unsafe { (*ec).bytecode_trace(frame_ptr as *mut PyFrame, decr_by) } {
         Ok(()) => 0,
         Err(mut err) => {
             publish_residual_call_exception(err.to_exc_object() as i64);
