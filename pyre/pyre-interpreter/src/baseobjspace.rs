@@ -16713,22 +16713,35 @@ pub fn float_w(obj: PyObjectRef) -> Result<f64, PyError> {
         }
     }
     let Some(method) = (unsafe { lookup(obj, "__float__") }) else {
-        return Err(PyError::type_error(format!(
-            "must be real number, not {}",
-            object_functionstr_type_name(obj)
-        )));
+        return Err(float_w_must_be_real(obj));
     };
-    let w_type = crate::typedef::r#type(obj)
-        .map(|w_type| w_type.as_ptr())
-        .unwrap_or(obj);
+    let w_type = match crate::typedef::r#type(obj) {
+        Some(w_type) => w_type.as_ptr(),
+        None => obj,
+    };
     let w_result = unsafe { get_and_call_function(method, obj, w_type, &[]) }?;
     if unsafe { pyre_object::is_float(w_result) } {
         return Ok(unsafe { pyre_object::w_float_get_value(w_result) });
     }
-    Err(PyError::type_error(format!(
+    Err(float_w_returned_non_float(w_result))
+}
+
+/// `W_Root._typed_unwrap_error` / `oefmt("must be real number, not %T")`.
+#[majit_macros::dont_look_inside]
+pub(crate) fn float_w_must_be_real(obj: PyObjectRef) -> PyError {
+    PyError::type_error(format!(
+        "must be real number, not {}",
+        object_functionstr_type_name(obj)
+    ))
+}
+
+/// `oefmt("__float__ returned non-float (type '%T')")`.
+#[majit_macros::dont_look_inside]
+pub(crate) fn float_w_returned_non_float(w_result: PyObjectRef) -> PyError {
+    PyError::type_error(format!(
         "__float__ returned non-float (type '{}')",
         object_functionstr_type_name(w_result)
-    )))
+    ))
 }
 
 /// baseobjspace.py `getindex_w` with `w_exception=None` — apply

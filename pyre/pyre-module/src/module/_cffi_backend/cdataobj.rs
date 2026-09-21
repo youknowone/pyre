@@ -194,11 +194,17 @@ impl W_CData {
 pub fn cdata_arg(w_cdata: PyObjectRef) -> Result<&'static mut W_CData, PyError> {
     match W_CData::from_obj(w_cdata) {
         Some(cdata) => Ok(cdata),
-        None => Err(PyError::type_error(format!(
-            "expected a cdata object, got '{}'",
-            pyre_interpreter::type_methods::arg_type_name(w_cdata)
-        ))),
+        None => Err(expected_cdata_object(w_cdata)),
     }
+}
+
+/// `@unwrap_spec(w_cdata=cdataobj.W_CData)` miss — `oefmt`.
+#[majit_macros::dont_look_inside]
+pub(crate) fn expected_cdata_object(w_got: PyObjectRef) -> PyError {
+    PyError::type_error(format!(
+        "expected a cdata object, got '{}'",
+        pyre_interpreter::type_methods::arg_type_name(w_got)
+    ))
 }
 
 // ── construction ────────────────────────────────────────────────────────
@@ -997,10 +1003,16 @@ pub fn __majit_wrap_cdata_call(args: &[PyObjectRef]) -> Result<PyObjectRef, PyEr
     if ct.kind == ctypeobj::KIND_FUNC {
         return super::ctypefunc::call(ct, cdata.ptr, &args[1..]);
     }
-    Err(PyError::type_error(format!(
-        "cdata '{}' is not callable",
-        ct.name()
-    )))
+    Err(cdata_not_callable(ct))
+}
+
+/// `W_CType.call` — `oefmt("cdata '%s' is not callable", self.name)`.
+/// The format is `dont_look_inside` so `format!` (`__majit_stringbuilder_new`)
+/// stays off the `_CDataBase` `__call__` descent; `oefmt` does not build
+/// the message until the value is needed.
+#[majit_macros::dont_look_inside]
+pub(crate) fn cdata_not_callable(ct: &W_CType) -> PyError {
+    PyError::type_error(format!("cdata '{}' is not callable", ct.name()))
 }
 
 pyre_interpreter::builtin_wrapper_descriptor!(

@@ -746,7 +746,10 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
         not(target_arch = "wasm32")
     ))]
     {
-        use module::_cffi_backend::{cdataobj, cerrno, ctypefunc, jit_libffi, misc};
+        use module::_cffi_backend::{
+            cdataobj, cerrno, ctypefunc, ctypeobj, ctypeprim, ctypeptr, ctypestruct, jit_libffi,
+            misc,
+        };
         single(
             entries,
             "pyre_interpreter::module::_cffi_backend::cdataobj::raw_malloc_varsize_char",
@@ -1287,6 +1290,102 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
             "pyre_module::module::_cffi_backend::misc::raw_write_f64",
             misc::raw_write_f64 as *const (),
         );
+        // `oefmt` error leaves of the `_CDataBase` call descent.
+        for (interp, module, fnptr) in [
+            (
+                "pyre_interpreter::module::_cffi_backend::cdataobj::expected_cdata_object",
+                "pyre_module::module::_cffi_backend::cdataobj::expected_cdata_object",
+                cdataobj::expected_cdata_object as *const (),
+            ),
+            (
+                "pyre_interpreter::module::_cffi_backend::cdataobj::cdata_not_callable",
+                "pyre_module::module::_cffi_backend::cdataobj::cdata_not_callable",
+                cdataobj::cdata_not_callable as *const (),
+            ),
+            (
+                "pyre_interpreter::module::_cffi_backend::ctypefunc::cannot_call_null",
+                "pyre_module::module::_cffi_backend::ctypefunc::cannot_call_null",
+                ctypefunc::cannot_call_null as *const (),
+            ),
+            (
+                "pyre_interpreter::module::_cffi_backend::ctypefunc::wrong_nargs",
+                "pyre_module::module::_cffi_backend::ctypefunc::wrong_nargs",
+                ctypefunc::wrong_nargs as *const (),
+            ),
+            (
+                "pyre_interpreter::module::_cffi_backend::ctypeobj::cannot_return_cdata",
+                "pyre_module::module::_cffi_backend::ctypeobj::cannot_return_cdata",
+                ctypeobj::cannot_return_cdata as *const (),
+            ),
+            (
+                "pyre_interpreter::module::_cffi_backend::ctypeobj::cannot_initialize_cdata",
+                "pyre_module::module::_cffi_backend::ctypeobj::cannot_initialize_cdata",
+                ctypeobj::cannot_initialize_cdata as *const (),
+            ),
+            (
+                "pyre_interpreter::module::_cffi_backend::ctypeobj::W_CType::convert_error",
+                "pyre_module::module::_cffi_backend::ctypeobj::W_CType::convert_error",
+                ctypeobj::W_CType::convert_error as *const (),
+            ),
+            (
+                "pyre_interpreter::module::_cffi_backend::ctypeptr::implicit_cast_warning",
+                "pyre_module::module::_cffi_backend::ctypeptr::implicit_cast_warning",
+                ctypeptr::implicit_cast_warning as *const (),
+            ),
+            (
+                "pyre_interpreter::module::_cffi_backend::ctypeptr::too_many_array_initializers",
+                "pyre_module::module::_cffi_backend::ctypeptr::too_many_array_initializers",
+                ctypeptr::too_many_array_initializers as *const (),
+            ),
+            (
+                "pyre_interpreter::module::_cffi_backend::ctypeptr::initializer_string_too_long",
+                "pyre_module::module::_cffi_backend::ctypeptr::initializer_string_too_long",
+                ctypeptr::initializer_string_too_long as *const (),
+            ),
+            (
+                "pyre_interpreter::module::_cffi_backend::ctypeptr::initializer_unicode_too_long",
+                "pyre_module::module::_cffi_backend::ctypeptr::initializer_unicode_too_long",
+                ctypeptr::initializer_unicode_too_long as *const (),
+            ),
+            (
+                "pyre_interpreter::module::_cffi_backend::ctypeptr::bool_array_not_zero_or_one",
+                "pyre_module::module::_cffi_backend::ctypeptr::bool_array_not_zero_or_one",
+                ctypeptr::bool_array_not_zero_or_one as *const (),
+            ),
+            (
+                "pyre_interpreter::module::_cffi_backend::ctypestruct::too_many_struct_initializers",
+                "pyre_module::module::_cffi_backend::ctypestruct::too_many_struct_initializers",
+                ctypestruct::too_many_struct_initializers as *const (),
+            ),
+            (
+                "pyre_interpreter::module::_cffi_backend::ctypeprim::unichr_out_of_range",
+                "pyre_module::module::_cffi_backend::ctypeprim::unichr_out_of_range",
+                ctypeprim::unichr_out_of_range as *const (),
+            ),
+            (
+                "pyre_interpreter::module::_cffi_backend::ctypeprim::cannot_return_cdata",
+                "pyre_module::module::_cffi_backend::ctypeprim::cannot_return_cdata",
+                ctypeprim::cannot_return_cdata as *const (),
+            ),
+            (
+                "pyre_interpreter::module::_cffi_backend::ctypeprim::cannot_initialize_cdata",
+                "pyre_module::module::_cffi_backend::ctypeprim::cannot_initialize_cdata",
+                ctypeprim::cannot_initialize_cdata as *const (),
+            ),
+            (
+                "pyre_interpreter::module::_cffi_backend::ctypeprim::overflow",
+                "pyre_module::module::_cffi_backend::ctypeprim::overflow",
+                ctypeprim::overflow as *const (),
+            ),
+            (
+                "pyre_interpreter::module::_cffi_backend::ctypeprim::overflow_value",
+                "pyre_module::module::_cffi_backend::ctypeprim::overflow_value",
+                ctypeprim::overflow_value as *const (),
+            ),
+        ] {
+            single(entries, interp, fnptr);
+            single(entries, module, fnptr);
+        }
     }
     #[cfg(all(
         feature = "full",
