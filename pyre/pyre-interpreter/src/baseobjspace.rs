@@ -10443,9 +10443,8 @@ fn buffer_bytes(
             } else {
                 1
             };
-            #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
-            if let Some((_, _, _, _, c_itemsize, _)) =
-                crate::module::_ctypes::cdata::cdata_buffer_view(r_obj)
+            if let Some(hooks) = crate::importing::optional_module_hooks()
+                && let Some((_, _, _, _, c_itemsize, _)) = (hooks.ctypes_buffer_view)(r_obj)
             {
                 itemsize = c_itemsize as i64;
             }
@@ -11139,7 +11138,7 @@ pub unsafe fn _pure_version_tag(w_type: *mut PyObject) -> u64 {
 /// the value folds away on the trace.  Mirrors the nesting of
 /// `function.rs::getcode`.
 #[inline]
-pub(crate) unsafe fn w_type_version_tag(w_type: PyObjectRef) -> u64 {
+pub unsafe fn w_type_version_tag(w_type: PyObjectRef) -> u64 {
     if majit_metainterp::jit::we_are_jitted() {
         if !pyre_object::w_type_is_cpython_immutabletype(w_type) {
             // Heap types can still be mutated; read the live field (the

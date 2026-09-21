@@ -10,7 +10,7 @@ use pyre_object::{PyObjectRef, pyobject::is_none};
 ///
 /// Returns `w_int.__index__()` as an `i64`, converting to `TypeError`
 /// when the object has no `__index__` method.
-pub(crate) fn eval_slice_index(w_int: PyObjectRef) -> Result<i64, crate::PyError> {
+pub fn eval_slice_index(w_int: PyObjectRef) -> Result<i64, crate::PyError> {
     // A null bound is silently misread on wasm (offset 0 is valid memory), so
     // `getindex_w` reads `ob_type` at guest offset 0 and returns garbage. Trap
     // loudly instead so a wasm run pins the null-Ref provenance.

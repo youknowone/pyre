@@ -14,7 +14,7 @@
 /// Run `body` inside the fence, reporting a structured exception it raised as
 /// the OSError `SetException` would have set.
 #[cfg(not(all(windows, target_env = "msvc")))]
-pub(super) fn guard<T, F: FnOnce() -> T>(body: F) -> Result<T, crate::PyError> {
+pub(super) fn guard<T, F: FnOnce() -> T>(body: F) -> Result<T, pyre_interpreter::PyError> {
     Ok(body())
 }
 
@@ -48,7 +48,7 @@ mod msvc {
     /// faulted, for a read that is refused before it is attempted rather than
     /// one the fence caught: nothing dereferences the address, so no
     /// structured exception is ever raised to be filtered.
-    pub(in super::super) fn access_violation_reading(address: usize) -> crate::PyError {
+    pub(in super::super) fn access_violation_reading(address: usize) -> pyre_interpreter::PyError {
         exception(&Record {
             code: windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION as u32,
             info: [0, address as u64],
@@ -56,7 +56,9 @@ mod msvc {
         })
     }
 
-    pub(in super::super) fn guard<T, F: FnOnce() -> T>(body: F) -> Result<T, crate::PyError> {
+    pub(in super::super) fn guard<T, F: FnOnce() -> T>(
+        body: F,
+    ) -> Result<T, pyre_interpreter::PyError> {
         // The fence takes one plain function pointer, so the closure and its
         // result travel in a cell this frame owns.  `__except` unwinds
         // everything above `pyre_seh_guard` and leaves that frame — and this
@@ -97,7 +99,7 @@ mod msvc {
     /// `PyErr_SetFromWindowsErr`; the ones named here either carry
     /// information the code alone does not, or describe a fault the system
     /// message does not.
-    fn exception(record: &Record) -> crate::PyError {
+    fn exception(record: &Record) -> pyre_interpreter::PyError {
         use windows_sys::Win32::Foundation as win;
 
         let code = record.code as i32;
@@ -140,13 +142,13 @@ mod msvc {
             win::EXCEPTION_PRIV_INSTRUCTION => "exception: privileged instruction".to_string(),
             win::EXCEPTION_NONCONTINUABLE_EXCEPTION => "exception: nocontinuable".to_string(),
             _ => {
-                return crate::PyError::os_error_win32_syscall2(
+                return pyre_interpreter::PyError::os_error_win32_syscall2(
                     code,
                     pyre_object::PY_NULL,
                     pyre_object::PY_NULL,
                 );
             }
         };
-        crate::PyError::os_error(message)
+        pyre_interpreter::PyError::os_error(message)
     }
 }

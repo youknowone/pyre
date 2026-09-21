@@ -8,7 +8,7 @@
 //! call.  The submodules need `host_env`; without it the module is limited to
 //! the placeholder surface at the foot of `interp_ctypes`.
 
-crate::pyre_module_init!(interp_ctypes);
+pyre_interpreter::pyre_module_init!(interp_ctypes);
 
 /// Store into a builtin type's namespace — the dict `make_builtin_type` hands
 /// its init closure.  The type-namespace sibling of `module_ns_store`.
@@ -33,8 +33,8 @@ fn finish_cpython_type(
     let slot = roots.base();
     let w_module = pyre_object::w_str_new(module);
     let tp = roots.get(slot);
-    crate::type_dict_store(tp, "__module__", w_module);
-    crate::typedef::mark_cpython_heap_type(tp, immutable);
+    pyre_interpreter::type_dict_store(tp, "__module__", w_module);
+    pyre_interpreter::typedef::mark_cpython_heap_type(tp, immutable);
     tp
 }
 
@@ -59,7 +59,7 @@ mod tests {
 
     #[test]
     fn native_type_family_has_common_meta_and_cpython_314_owner() {
-        crate::typedef::init_typeobjects();
+        pyre_interpreter::typedef::init_typeobjects();
         const IMMUTABLETYPE: i64 =
             pyre_object::typeobject::TpFlags::PY_TPFLAGS_IMMUTABLETYPE.as_int();
         const HEAPTYPE: i64 = pyre_object::typeobject::TpFlags::PY_TPFLAGS_HEAPTYPE.as_int();
@@ -76,16 +76,22 @@ mod tests {
         ];
         for meta in metas {
             assert_eq!(
-                crate::baseobjspace::getattr_str(meta, "__base__").unwrap(),
+                pyre_interpreter::baseobjspace::getattr_str(meta, "__base__").unwrap(),
                 ctype
             );
-            assert!(crate::baseobjspace::getattr_str(meta, "from_address").is_ok());
+            assert!(pyre_interpreter::baseobjspace::getattr_str(meta, "from_address").is_ok());
         }
 
         let simple = cdata::simplecdata_type();
         let funcptr = funcptr::cfuncptr_type();
-        assert_eq!(crate::typedef::r#type(simple).unwrap().as_ptr(), metas[0]);
-        assert_eq!(crate::typedef::r#type(funcptr).unwrap().as_ptr(), metas[5]);
+        assert_eq!(
+            pyre_interpreter::typedef::r#type(simple).unwrap().as_ptr(),
+            metas[0]
+        );
+        assert_eq!(
+            pyre_interpreter::typedef::r#type(funcptr).unwrap().as_ptr(),
+            metas[5]
+        );
 
         for (name, ty, module) in [
             ("CType_Type", ctype, "_ctypes"),
@@ -110,7 +116,7 @@ mod tests {
                 MASK,
                 "{name}.__flags__"
             );
-            let w_module = crate::baseobjspace::getattr_str(ty, "__module__").unwrap();
+            let w_module = pyre_interpreter::baseobjspace::getattr_str(ty, "__module__").unwrap();
             assert_eq!(
                 unsafe { pyre_object::w_str_get_value(w_module) },
                 module,

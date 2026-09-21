@@ -69,7 +69,7 @@ static CFUNCPTR_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
 /// The native `CFuncPtr` type object (cached, `hasdict=true`).
 pub(super) fn cfuncptr_type() -> PyObjectRef {
     *CFUNCPTR_TYPE_OBJ.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type_with_base(
+        let tp = pyre_interpreter::typedef::make_builtin_type_with_base(
             "CFuncPtr",
             init_cfuncptr_type,
             cdata::cdata_type(),
@@ -84,62 +84,66 @@ pub(super) fn cfuncptr_type() -> PyObjectRef {
 }
 
 fn init_cfuncptr_type(ns: PyObjectRef) {
-    type_ns_store(ns, "__new__", crate::typedef::make_new_descr(cfuncptr_new));
+    type_ns_store(
+        ns,
+        "__new__",
+        pyre_interpreter::typedef::make_new_descr(cfuncptr_new),
+    );
     type_ns_store(
         ns,
         "__call__",
-        crate::make_builtin_function("__call__", cfuncptr_call),
+        pyre_interpreter::make_builtin_function("__call__", cfuncptr_call),
     );
     // `restype` / `argtypes` — settable data descriptors with class-attr
     // fallback to `_restype_` / `_argtypes_`.
     type_ns_store(
         ns,
         "restype",
-        crate::typedef::make_getset_property_named(
-            crate::make_builtin_function_with_arity("restype", restype_getter, 2),
-            crate::make_builtin_function_with_arity("restype", restype_setter, 3),
-            crate::make_builtin_function_with_arity("restype", restype_deleter, 2),
+        pyre_interpreter::typedef::make_getset_property_named(
+            pyre_interpreter::make_builtin_function_with_arity("restype", restype_getter, 2),
+            pyre_interpreter::make_builtin_function_with_arity("restype", restype_setter, 3),
+            pyre_interpreter::make_builtin_function_with_arity("restype", restype_deleter, 2),
             "restype",
         ),
     );
     type_ns_store(
         ns,
         "argtypes",
-        crate::typedef::make_getset_property_named(
-            crate::make_builtin_function_with_arity("argtypes", argtypes_getter, 2),
-            crate::make_builtin_function_with_arity("argtypes", argtypes_setter, 3),
-            crate::make_builtin_function_with_arity("argtypes", argtypes_deleter, 2),
+        pyre_interpreter::typedef::make_getset_property_named(
+            pyre_interpreter::make_builtin_function_with_arity("argtypes", argtypes_getter, 2),
+            pyre_interpreter::make_builtin_function_with_arity("argtypes", argtypes_setter, 3),
+            pyre_interpreter::make_builtin_function_with_arity("argtypes", argtypes_deleter, 2),
             "argtypes",
         ),
     );
     type_ns_store(
         ns,
         "errcheck",
-        crate::typedef::make_getset_property_named(
-            crate::make_builtin_function_with_arity("errcheck", errcheck_getter, 2),
-            crate::make_builtin_function_with_arity("errcheck", errcheck_setter, 3),
-            crate::make_builtin_function_with_arity("errcheck", errcheck_deleter, 2),
+        pyre_interpreter::typedef::make_getset_property_named(
+            pyre_interpreter::make_builtin_function_with_arity("errcheck", errcheck_getter, 2),
+            pyre_interpreter::make_builtin_function_with_arity("errcheck", errcheck_setter, 3),
+            pyre_interpreter::make_builtin_function_with_arity("errcheck", errcheck_deleter, 2),
             "errcheck",
         ),
     );
     type_ns_store(
         ns,
         "__repr__",
-        crate::make_builtin_function("__repr__", cfuncptr_repr),
+        pyre_interpreter::make_builtin_function("__repr__", cfuncptr_repr),
     );
     type_ns_store(
         ns,
         "__bool__",
-        crate::make_builtin_function("__bool__", cfuncptr_bool),
+        pyre_interpreter::make_builtin_function("__bool__", cfuncptr_bool),
     );
 }
 
 /// A COM method says which vtable slot it is; everything else reports the
 /// default `<T object at 0x...>`.
-fn cfuncptr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn cfuncptr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let obj = args[0];
     let name = cdata::value_type_name(obj);
-    let address = crate::display::repr_addr(obj as usize);
+    let address = pyre_interpreter::display::repr_addr(obj as usize);
     #[cfg(windows)]
     if let Some(index) = com_index(obj) {
         return Ok(pyre_object::w_str_new_managed(&format!(
@@ -153,7 +157,7 @@ fn cfuncptr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// A COM method is true whether or not it holds an address, because the vtable
 /// slot it names is all it ever needed.
-fn cfuncptr_bool(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn cfuncptr_bool(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let obj = args[0];
     #[cfg(windows)]
     if com_index(obj).is_some() {
@@ -172,9 +176,9 @@ fn com_index(obj: PyObjectRef) -> Option<i64> {
 // ── construction ──────────────────────────────────────────────────────
 
 /// `_CFuncPtr.__new__(cls, arg=None)`.
-fn cfuncptr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn cfuncptr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     if args.is_empty() || !unsafe { pyre_object::is_type(args[0]) } {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "CFuncPtr.__new__(): not enough arguments",
         ));
     }
@@ -184,7 +188,7 @@ fn cfuncptr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let rest: Vec<_> = (1..args.len())
         .map(|i| pyre_object::gc_roots::shadow_stack_get(cls_slot + i))
         .collect();
-    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(&rest);
+    let (pos, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(&rest);
     reject_kwargs(kwargs)?;
     let mut callback = pyre_object::PY_NULL;
     let mut paramflags = pyre_object::PY_NULL;
@@ -205,7 +209,7 @@ fn cfuncptr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         #[cfg(windows)]
         Some(a) if pos.len() >= 2 && unsafe { pyre_object::is_int(a) } => {
             if !unsafe { pyre_object::is_str(pos[1]) } {
-                return Err(crate::PyError::type_error(format!(
+                return Err(pyre_interpreter::PyError::type_error(format!(
                     "argument 2 must be str, not {}",
                     cdata::value_type_name(pos[1])
                 )));
@@ -220,8 +224,8 @@ fn cfuncptr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             (unsafe { pyre_object::w_int_get_value(a) }) as usize
         }
         Some(a) => {
-            if !crate::baseobjspace::callable_w(a) {
-                return Err(crate::PyError::type_error(
+            if !pyre_interpreter::baseobjspace::callable_w(a) {
+                return Err(pyre_interpreter::PyError::type_error(
                     "argument must be callable or integer function address",
                 ));
             }
@@ -264,7 +268,7 @@ fn cfuncptr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     store_funcptr_addr(pyre_object::gc_roots::shadow_stack_get(obj_slot), addr)?;
     if !callback.is_null() {
         let current_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-        let d = crate::baseobjspace::getdict_native(current_obj);
+        let d = pyre_interpreter::baseobjspace::getdict_native(current_obj);
         let _ = pyre_object::gc_roots::pin_root(d);
         let dict_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let callback = pyre_object::gc_roots::shadow_stack_get(callback_slot.unwrap());
@@ -327,32 +331,34 @@ fn owned_arg_as_call_arg(arg: &OwnedArg) -> host_ctypes::CallArg<'_> {
     }
 }
 
-fn call_error(e: host_ctypes::CallError) -> crate::PyError {
+fn call_error(e: host_ctypes::CallError) -> pyre_interpreter::PyError {
     match e {
         host_ctypes::CallError::NullFunctionPointer => {
-            crate::PyError::value_error("NULL function pointer")
+            pyre_interpreter::PyError::value_error("NULL function pointer")
         }
         host_ctypes::CallError::UnknownTypeCode(c) => {
-            crate::PyError::type_error(format!("unsupported type code {c:?}"))
+            pyre_interpreter::PyError::type_error(format!("unsupported type code {c:?}"))
         }
-        host_ctypes::CallError::BufferTooSmall { expected, got } => crate::PyError::value_error(
-            format!("aggregate argument buffer too small: expected {expected}, got {got}"),
-        ),
+        host_ctypes::CallError::BufferTooSmall { expected, got } => {
+            pyre_interpreter::PyError::value_error(format!(
+                "aggregate argument buffer too small: expected {expected}, got {got}"
+            ))
+        }
     }
 }
 
 /// `(name, dll)` → resolved symbol address.  `dll._handle` is the integer
 /// library handle; `name` is the symbol string/bytes.
-fn resolve_from_tuple(t: PyObjectRef) -> Result<usize, crate::PyError> {
+fn resolve_from_tuple(t: PyObjectRef) -> Result<usize, pyre_interpreter::PyError> {
     let name_obj = unsafe { pyre_object::w_tuple_getitem(t, 0) };
     let dll_obj = unsafe { pyre_object::w_tuple_getitem(t, 1) };
     let (Some(name_obj), Some(dll_obj)) = (name_obj, dll_obj) else {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "CFuncPtr constructor requires a (name, dll) pair",
         ));
     };
-    let handle_obj = crate::baseobjspace::getattr_str(dll_obj, "_handle")?;
-    let handle = crate::baseobjspace::int_w(handle_obj)? as usize;
+    let handle_obj = pyre_interpreter::baseobjspace::getattr_str(dll_obj, "_handle")?;
+    let handle = pyre_interpreter::baseobjspace::int_w(handle_obj)? as usize;
     let name_bytes: Vec<u8> = if unsafe { pyre_object::is_str(name_obj) } {
         unsafe { pyre_object::w_str_get_value(name_obj) }
             .as_bytes()
@@ -360,7 +366,7 @@ fn resolve_from_tuple(t: PyObjectRef) -> Result<usize, crate::PyError> {
     } else if unsafe { pyre_object::is_bytes(name_obj) } {
         unsafe { pyre_object::bytesobject::w_bytes_data(name_obj) }.to_vec()
     } else {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "function name must be string or bytes (ordinals not supported)",
         ));
     };
@@ -374,15 +380,17 @@ fn resolve_from_tuple(t: PyObjectRef) -> Result<usize, crate::PyError> {
     super::interp_ctypes::lookup_symbol(handle, &name_bytes).map_err(|e| {
         use rustpython_host_env::ctypes::LookupSymbolError as E;
         if matches!(e, E::LibraryNotFound) {
-            return crate::PyError::value_error("library not found");
+            return pyre_interpreter::PyError::value_error("library not found");
         }
         // A symbol name arrives as bytes, so it is decoded the way a name the
         // host handed us is: `format!` would fold a byte with no UTF-8
         // spelling to U+FFFD and report a symbol nobody asked for.
         let mut msg = rustpython_wtf8::Wtf8Buf::from_string("function '".to_string());
-        msg.push_wtf8(&crate::gateway::fsdecode_filename_wtf8(&name_bytes));
+        msg.push_wtf8(&pyre_interpreter::gateway::fsdecode_filename_wtf8(
+            &name_bytes,
+        ));
         msg.push_str("' not found");
-        crate::PyError::attribute_error(msg)
+        pyre_interpreter::PyError::attribute_error(msg)
     })
 }
 
@@ -392,11 +400,11 @@ pub(super) fn instance_get(obj: PyObjectRef, key: &str) -> Option<PyObjectRef> {
     // The dictionary `getdict` would answer is a view onto the instance's own
     // mapdict storage and the read goes through to it either way, so this asks
     // the storage directly and leaves the view unbuilt.
-    crate::baseobjspace::getdictvalue_native(obj, key)
+    pyre_interpreter::baseobjspace::getdictvalue_native(obj, key)
 }
 
 fn instance_set(obj: PyObjectRef, key: &str, value: PyObjectRef) {
-    let d = crate::baseobjspace::getdict_native(obj);
+    let d = pyre_interpreter::baseobjspace::getdict_native(obj);
     if d.is_null() {
         return;
     }
@@ -499,7 +507,7 @@ fn settled(obj: PyObjectRef) -> Option<Settled> {
     let record = unsafe { pyre_object::bytesobject::w_bytes_data(stored) };
     let cls = unsafe { pyre_object::w_instance_get_type(obj) };
     decode_settled(record, unsafe {
-        crate::baseobjspace::w_type_version_tag(cls)
+        pyre_interpreter::baseobjspace::w_type_version_tag(cls)
     })
 }
 
@@ -626,7 +634,7 @@ unsafe fn drop_settled(dict: PyObjectRef) {
 /// Record what this call settled, so the next one runs from it.
 fn store_settled(obj: PyObjectRef, settled: Settled) {
     let cls = unsafe { pyre_object::w_instance_get_type(obj) };
-    let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(cls) };
+    let version_tag = unsafe { pyre_interpreter::baseobjspace::w_type_version_tag(cls) };
     // A type with no version tag cannot be told apart from one that has since
     // changed, so nothing is settled against it.
     if version_tag == 0 {
@@ -641,7 +649,9 @@ fn store_settled(obj: PyObjectRef, settled: Settled) {
     let stored = pyre_object::bytesobject::w_bytes_from_bytes(&record);
     let stored_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(stored);
-    let d = crate::baseobjspace::getdict_native(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+    let d = pyre_interpreter::baseobjspace::getdict_native(
+        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+    );
     if d.is_null() {
         return;
     }
@@ -654,19 +664,19 @@ fn store_settled(obj: PyObjectRef, settled: Settled) {
     };
 }
 
-fn restype_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn restype_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let obj = args[1];
     if let Some(v) = instance_get(obj, RESTYPE_KEY) {
         return Ok(v);
     }
     let cls = unsafe { pyre_object::w_instance_get_type(obj) };
     Ok(
-        unsafe { crate::baseobjspace::lookup_in_type(cls, "_restype_") }
+        unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_restype_") }
             .unwrap_or_else(pyre_object::w_none),
     )
 }
 
-fn restype_setter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn restype_setter(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     instance_set(args[1], RESTYPE_KEY, args[2]);
     Ok(pyre_object::w_none())
 }
@@ -674,29 +684,29 @@ fn restype_setter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `_ctypes_CFuncPtr_restype_set_impl`'s `value == NULL` branch clears both
 /// `restype` and the `_check_retval_` checker it was derived from, leaving the
 /// getter to answer from the class again.
-fn restype_deleter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn restype_deleter(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     instance_del(args[1], RESTYPE_KEY);
     Ok(pyre_object::w_none())
 }
 
-fn argtypes_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn argtypes_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let obj = args[1];
     if let Some(v) = instance_get(obj, ARGTYPES_KEY) {
         return Ok(v);
     }
     let cls = unsafe { pyre_object::w_instance_get_type(obj) };
     Ok(
-        unsafe { crate::baseobjspace::lookup_in_type(cls, "_argtypes_") }
+        unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_argtypes_") }
             .unwrap_or_else(pyre_object::w_none),
     )
 }
 
-fn argtypes_setter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn argtypes_setter(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let value = args[2];
     // `_argtypes_` must be a sequence of types; a bare type (`fn.argtypes =
     // c_int`) or other non-sequence is rejected rather than silently ignored.
     if !unsafe { pyre_object::is_none(value) } && seq_to_vec(value).is_none() {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "argtypes must be a sequence of types",
         ));
     }
@@ -711,22 +721,22 @@ fn argtypes_setter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 
 /// `_ctypes_CFuncPtr_argtypes_set_impl` treats a NULL operand exactly as it
 /// treats `None`: the argtypes and their converters are cleared.
-fn argtypes_deleter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn argtypes_deleter(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     instance_del(args[1], ARGTYPES_KEY);
     Ok(pyre_object::w_none())
 }
 
-fn errcheck_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn errcheck_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     Ok(instance_get(args[1], ERRCHECK_KEY).unwrap_or_else(pyre_object::w_none))
 }
 
 /// The only thing ever done with an errcheck is calling it, so anything that
 /// cannot be called is refused — `None` included, which is why clearing one is
 /// spelled `del`.
-fn errcheck_setter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn errcheck_setter(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let value = args[2];
-    if !crate::baseobjspace::callable_w(value) {
-        return Err(crate::PyError::type_error(
+    if !pyre_interpreter::baseobjspace::callable_w(value) {
+        return Err(pyre_interpreter::PyError::type_error(
             "the errcheck attribute must be callable",
         ));
     }
@@ -734,7 +744,7 @@ fn errcheck_setter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     Ok(pyre_object::w_none())
 }
 
-fn errcheck_deleter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn errcheck_deleter(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     instance_del(args[1], ERRCHECK_KEY);
     Ok(pyre_object::w_none())
 }
@@ -743,7 +753,7 @@ fn errcheck_deleter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 /// key here reaches the plan, so the delete drops it the way [`instance_set`]
 /// does; deleting one that was never set is not an error.
 fn instance_del(obj: PyObjectRef, key: &str) {
-    let d = crate::baseobjspace::getdict_native(obj);
+    let d = pyre_interpreter::baseobjspace::getdict_native(obj);
     if d.is_null() {
         return;
     }
@@ -756,7 +766,7 @@ fn instance_del(obj: PyObjectRef, key: &str) {
 /// Reject keyword arguments: ctypes foreign calls and `_CFuncPtr(...)` take
 /// only positional arguments, so a stray `fn(x, foo=1)` is an error rather
 /// than a silently dropped `foo`.
-fn reject_kwargs(kwargs: Option<PyObjectRef>) -> Result<(), crate::PyError> {
+fn reject_kwargs(kwargs: Option<PyObjectRef>) -> Result<(), pyre_interpreter::PyError> {
     let Some(kw) = kwargs else { return Ok(()) };
     for (key_obj, _) in unsafe { pyre_object::w_dict_items(kw) } {
         if unsafe { pyre_object::is_str(key_obj) }
@@ -764,7 +774,7 @@ fn reject_kwargs(kwargs: Option<PyObjectRef>) -> Result<(), crate::PyError> {
         {
             continue;
         }
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "call takes no keyword arguments",
         ));
     }
@@ -786,10 +796,10 @@ pub(super) enum Ret {
     Aggregate(PyObjectRef),
 }
 
-pub(super) fn resolve_restype(obj: PyObjectRef) -> Result<Ret, crate::PyError> {
+pub(super) fn resolve_restype(obj: PyObjectRef) -> Result<Ret, pyre_interpreter::PyError> {
     let cls = unsafe { pyre_object::w_instance_get_type(obj) };
     let rt = instance_get(obj, RESTYPE_KEY)
-        .or_else(|| unsafe { crate::baseobjspace::lookup_in_type(cls, "_restype_") });
+        .or_else(|| unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_restype_") });
     match rt {
         // CDLL functions default to c_int when no restype is set.
         None => Ok(Ret::Code(DEFAULT_RESTYPE_CODE)),
@@ -805,7 +815,7 @@ pub(super) fn resolve_restype(obj: PyObjectRef) -> Result<Ret, crate::PyError> {
                 }
             }
             let tc = cdata::type_code_of(o)
-                .ok_or_else(|| crate::PyError::type_error("invalid restype"))?;
+                .ok_or_else(|| pyre_interpreter::PyError::type_error("invalid restype"))?;
             Ok(Ret::Code(tc))
         }
     }
@@ -817,11 +827,11 @@ pub(super) fn resolve_restype(obj: PyObjectRef) -> Result<Ret, crate::PyError> {
 fn resolve_checker(obj: PyObjectRef) -> Option<PyObjectRef> {
     let cls = unsafe { pyre_object::w_instance_get_type(obj) };
     let rt = instance_get(obj, RESTYPE_KEY)
-        .or_else(|| unsafe { crate::baseobjspace::lookup_in_type(cls, "_restype_") })?;
+        .or_else(|| unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_restype_") })?;
     if !unsafe { pyre_object::is_type(rt) } {
         return None;
     }
-    unsafe { crate::baseobjspace::lookup_in_type(rt, "_check_retval_") }
+    unsafe { pyre_interpreter::baseobjspace::lookup_in_type(rt, "_check_retval_") }
 }
 
 /// `errcheck(result, self, arguments)` — the last word on what a call returns.
@@ -832,7 +842,7 @@ fn apply_errcheck(
     self_obj: PyObjectRef,
     result: PyObjectRef,
     inargs: &[PyObjectRef],
-) -> Result<Option<PyObjectRef>, crate::PyError> {
+) -> Result<Option<PyObjectRef>, pyre_interpreter::PyError> {
     let Some(errcheck) = instance_get(self_obj, ERRCHECK_KEY) else {
         return Ok(None);
     };
@@ -846,7 +856,7 @@ fn apply_errcheck(
     let arguments = pyre_object::w_tuple_new(inargs.to_vec());
     let arguments_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(arguments);
-    let value = crate::call::call_function_impl_result(
+    let value = pyre_interpreter::call::call_function_impl_result(
         pyre_object::gc_roots::shadow_stack_get(base + 2),
         &[
             pyre_object::gc_roots::shadow_stack_get(base + 1),
@@ -862,11 +872,16 @@ fn apply_errcheck(
 }
 
 /// Wrap a returned pointer value `p` in a fresh instance of pointer type `rt`.
-fn wrap_pointer_result(rt: PyObjectRef, p: usize) -> Result<PyObjectRef, crate::PyError> {
+fn wrap_pointer_result(
+    rt: PyObjectRef,
+    p: usize,
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let obj = pyre_object::w_instance_new(rt);
-    let d = crate::baseobjspace::getdict_native(obj);
+    let d = pyre_interpreter::baseobjspace::getdict_native(obj);
     if d.is_null() {
-        return Err(crate::PyError::type_error("pointer instance has no dict"));
+        return Err(pyre_interpreter::PyError::type_error(
+            "pointer instance has no dict",
+        ));
     }
     // The instance dict moves, and the bytearray allocated below is a
     // collection point, so the dict word is read back out of a root slot at the
@@ -906,7 +921,7 @@ pub(super) fn resolve_argtypes(obj: PyObjectRef) -> Option<Vec<PyObjectRef>> {
 /// The `_argtypes_` declared on type `cls` — what a constructor has to check
 /// paramflags against, the instance having none of its own yet.
 fn type_argtypes(cls: PyObjectRef) -> Option<Vec<PyObjectRef>> {
-    argtypes_seq(unsafe { crate::baseobjspace::lookup_in_type(cls, "_argtypes_") }?)
+    argtypes_seq(unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_argtypes_") }?)
 }
 
 /// A settled `argtypes` value as a Vec; `None` means unset.
@@ -929,7 +944,7 @@ fn type_display_name(obj: PyObjectRef) -> String {
 /// `_check_outarg_type` — the callee writes an `out` parameter through the
 /// argument, so the argtype has to be something there is a through: a pointer
 /// or array type, or one of the simple codes that is already an address.
-fn check_outarg_type(at: PyObjectRef, index: usize) -> Result<(), crate::PyError> {
+fn check_outarg_type(at: PyObjectRef, index: usize) -> Result<(), pyre_interpreter::PyError> {
     if let Some(info) = stginfo::stginfo_of(at)
         && matches!(
             stginfo::stginfo_paramfunc(info),
@@ -941,7 +956,7 @@ fn check_outarg_type(at: PyObjectRef, index: usize) -> Result<(), crate::PyError
     if matches!(cdata::type_code_of(at).as_deref(), Some("P" | "z" | "Z")) {
         return Ok(());
     }
-    Err(crate::PyError::type_error(format!(
+    Err(pyre_interpreter::PyError::type_error(format!(
         "'out' parameter {index} must be a pointer type, not {}",
         type_display_name(at)
     )))
@@ -955,12 +970,12 @@ fn check_outarg_type(at: PyObjectRef, index: usize) -> Result<(), crate::PyError
 fn validate_paramflags(
     paramflags: PyObjectRef,
     argtypes: Option<&[PyObjectRef]>,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     if paramflags.is_null() || unsafe { pyre_object::is_none(paramflags) } {
         return Ok(pyre_object::w_none());
     }
     if !unsafe { pyre_object::is_tuple(paramflags) } {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "paramflags must be a tuple or None",
         ));
     }
@@ -969,12 +984,12 @@ fn validate_paramflags(
     };
     let len = unsafe { pyre_object::w_tuple_len(paramflags) };
     if len != argtypes.len() {
-        return Err(crate::PyError::value_error(
+        return Err(pyre_interpreter::PyError::value_error(
             "paramflags must have the same length as argtypes",
         ));
     }
     let malformed = || {
-        crate::PyError::type_error(
+        pyre_interpreter::PyError::type_error(
             "paramflags must be a sequence of (int [,string [,value]]) tuples",
         )
     };
@@ -1003,7 +1018,7 @@ fn validate_paramflags(
             PARAMFLAG_FOUT => check_outarg_type(at, i + 1)?,
             0 | PARAMFLAG_FIN | PARAMFLAG_FIN_FLCID | PARAMFLAG_FIN_FOUT => {}
             _ => {
-                return Err(crate::PyError::type_error(format!(
+                return Err(pyre_interpreter::PyError::type_error(format!(
                     "paramflag value {flag} not supported"
                 )));
             }
@@ -1034,7 +1049,7 @@ fn seq_to_vec(obj: PyObjectRef) -> Option<Vec<PyObjectRef>> {
 
 pub(super) fn funcptr_flags(obj: PyObjectRef) -> i64 {
     let cls = unsafe { pyre_object::w_instance_get_type(obj) };
-    match unsafe { crate::baseobjspace::lookup_in_type(cls, "_flags_") } {
+    match unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_flags_") } {
         Some(o) if unsafe { pyre_object::is_int(o) } => unsafe { pyre_object::w_int_get_value(o) },
         _ => 0,
     }
@@ -1050,7 +1065,10 @@ pub(super) fn funcptr_addr(obj: PyObjectRef) -> usize {
 /// Store a function address in both `_ptr` and the pointer-sized CData buffer.
 /// The object and boxed integer are rooted independently because either the
 /// integer allocation or the dict write may move the instance.
-pub(super) fn store_funcptr_addr(obj: PyObjectRef, addr: usize) -> Result<(), crate::PyError> {
+pub(super) fn store_funcptr_addr(
+    obj: PyObjectRef,
+    addr: usize,
+) -> Result<(), pyre_interpreter::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(obj);
@@ -1058,9 +1076,9 @@ pub(super) fn store_funcptr_addr(obj: PyObjectRef, addr: usize) -> Result<(), cr
     let addr_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_addr);
     let current_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-    let d = crate::baseobjspace::getdict_native(current_obj);
+    let d = pyre_interpreter::baseobjspace::getdict_native(current_obj);
     if d.is_null() {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "CFuncPtr instance has no instance dict",
         ));
     }
@@ -1102,9 +1120,12 @@ pub(super) fn is_simple_subclass(ty: PyObjectRef) -> bool {
             .is_some_and(|base| cdata::type_code_of(base).is_some())
 }
 
-fn callback_argument(ty: PyObjectRef, value: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+fn callback_argument(
+    ty: PyObjectRef,
+    value: PyObjectRef,
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     if is_simple_subclass(ty) {
-        crate::call::type_call_instantiate(ty, &[value])
+        pyre_interpreter::call::type_call_instantiate(ty, &[value])
     } else {
         Ok(value)
     }
@@ -1112,8 +1133,8 @@ fn callback_argument(ty: PyObjectRef, value: PyObjectRef) -> Result<PyObjectRef,
 
 pub(super) fn callback_result(
     obj: PyObjectRef,
-    result: Result<PyObjectRef, crate::PyError>,
-) -> Result<PyObjectRef, crate::PyError> {
+    result: Result<PyObjectRef, pyre_interpreter::PyError>,
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let result = match result {
         Ok(value) => value,
         Err(mut error) => {
@@ -1122,11 +1143,12 @@ pub(super) fn callback_result(
             let rendered = if callable.is_null() {
                 unknown()
             } else {
-                unsafe { crate::display::py_repr_wtf8(callable) }.unwrap_or_else(|_| unknown())
+                unsafe { pyre_interpreter::display::py_repr_wtf8(callable) }
+                    .unwrap_or_else(|_| unknown())
             };
             error.write_unraisable(
                 pyre_object::w_none(),
-                &crate::display::wtf8_format!(
+                &pyre_interpreter::display::wtf8_format!(
                     "Exception ignored while calling ctypes callback function ",
                     rendered
                 ),
@@ -1148,12 +1170,12 @@ pub(super) fn callback_result(
 fn call_python_callback(
     obj: PyObjectRef,
     args: &[PyObjectRef],
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let callable = instance_get(obj, CALLABLE_KEY)
-        .ok_or_else(|| crate::PyError::type_error("callback has no callable"))?;
+        .ok_or_else(|| pyre_interpreter::PyError::type_error("callback has no callable"))?;
     let argtypes = resolve_argtypes(obj).unwrap_or_default();
     if args.len() != argtypes.len() {
-        return Err(crate::PyError::type_error(format!(
+        return Err(pyre_interpreter::PyError::type_error(format!(
             "this function takes {} arguments ({} given)",
             argtypes.len(),
             args.len(),
@@ -1166,19 +1188,21 @@ fn call_python_callback(
         .collect::<Result<Vec<_>, _>>()?;
     callback_result(
         obj,
-        crate::call::call_function_impl_result(callable, &converted),
+        pyre_interpreter::call::call_function_impl_result(callable, &converted),
     )
 }
 
 /// `_CFuncPtr.__call__(self, *args)`.
-fn cfuncptr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn cfuncptr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     if args.is_empty() {
-        return Err(crate::PyError::type_error("__call__ requires self"));
+        return Err(pyre_interpreter::PyError::type_error(
+            "__call__ requires self",
+        ));
     }
     let self_obj = args[0];
     // A keyword argument only ever names a paramflag, and one that names
     // nothing is not an error — it simply goes unread.
-    let (inargs, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
+    let (inargs, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(&args[1..]);
     let settled_already = settled(self_obj);
     // A plan that turns out not to describe this call after all leaves the
     // general path to derive it again and record what it finds.
@@ -1239,13 +1263,14 @@ fn cfuncptr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         Some(argtypes) => {
             for (i, &at) in argtypes.iter().enumerate() {
                 let arg = *call_args.get(i).ok_or_else(|| {
-                    crate::PyError::type_error(format!(
+                    pyre_interpreter::PyError::type_error(format!(
                         "this function takes at least {} argument(s)",
                         argtypes.len()
                     ))
                 })?;
-                let kind = classify_argtype(at)
-                    .ok_or_else(|| crate::PyError::type_error("argtype has no valid '_type_'"))?;
+                let kind = classify_argtype(at).ok_or_else(|| {
+                    pyre_interpreter::PyError::type_error("argtype has no valid '_type_'")
+                })?;
                 kinds.push(kind);
                 owned.push(marshal_typed_arg(arg, at, kind, &mut keepalive)?);
             }
@@ -1276,7 +1301,9 @@ fn cfuncptr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         None => {
             let value = build_return_value(ret, result)?;
             match checker {
-                Some(checker) => crate::call::call_function_impl_result(checker, &[value])?,
+                Some(checker) => {
+                    pyre_interpreter::call::call_function_impl_result(checker, &[value])?
+                }
                 None => value,
             }
         }
@@ -1348,7 +1375,7 @@ fn invoke(
     owned: &[OwnedArg],
     ret: Ret,
     flags: i64,
-) -> Result<host_ctypes::CallValue, crate::PyError> {
+) -> Result<host_ctypes::CallValue, pyre_interpreter::PyError> {
     // Build the aggregate return layout (if any) up front so it outlives the
     // borrowed `CallRet` handed to the call.
     let ret_layout = match &ret {
@@ -1391,7 +1418,7 @@ fn invoke(
     // `seh::guard`, which is what stands between a faulting callee and the
     // process.
     let result = {
-        let _blocked = crate::module::thread::before_external_block();
+        let _blocked = pyre_interpreter::module::thread::before_external_block();
         super::seh::guard(|| host_ctypes::call(addr, host_args, restype, options))
     };
     result?.map_err(call_error)
@@ -1406,10 +1433,10 @@ fn call_settled(
     self_obj: PyObjectRef,
     plan: &CallPlan,
     inargs: &[PyObjectRef],
-) -> Result<Option<PyObjectRef>, crate::PyError> {
+) -> Result<Option<PyObjectRef>, pyre_interpreter::PyError> {
     let kinds = plan.kinds();
     if inargs.len() < kinds.len() {
-        return Err(crate::PyError::type_error(format!(
+        return Err(pyre_interpreter::PyError::type_error(format!(
             "this function takes at least {} argument(s)",
             kinds.len()
         )));
@@ -1469,7 +1496,7 @@ fn com_status(
     obj: PyObjectRef,
     com: Option<(usize, usize)>,
     result: &host_ctypes::CallValue,
-) -> Option<Result<PyObjectRef, crate::PyError>> {
+) -> Option<Result<PyObjectRef, pyre_interpreter::PyError>> {
     let (this_ptr, iid) = com_error_iid(obj, com)?;
     let hresult = scalar_int_result(result);
     Some(if hresult < 0 {
@@ -1484,7 +1511,7 @@ fn com_status(
     _obj: PyObjectRef,
     _com: Option<(usize, usize)>,
     _result: &host_ctypes::CallValue,
-) -> Option<Result<PyObjectRef, crate::PyError>> {
+) -> Option<Result<PyObjectRef, pyre_interpreter::PyError>> {
     None
 }
 
@@ -1526,7 +1553,7 @@ fn build_callargs(
     inargs: &[PyObjectRef],
     kwargs: Option<PyObjectRef>,
     is_com: bool,
-) -> Result<CallArgs, crate::PyError> {
+) -> Result<CallArgs, pyre_interpreter::PyError> {
     let passed = if is_com { &inargs[1..] } else { inargs };
     let plain = |args: Vec<PyObjectRef>| CallArgs {
         args,
@@ -1555,8 +1582,11 @@ fn build_callargs(
     let base = pyre_object::gc_roots::shadow_stack_len();
     let mut index = 0;
     for (i, &at) in argtypes.iter().enumerate() {
-        let malformed =
-            || crate::PyError::value_error("paramflags must have the same length as argtypes");
+        let malformed = || {
+            pyre_interpreter::PyError::value_error(
+                "paramflags must have the same length as argtypes",
+            )
+        };
         let item = unsafe {
             pyre_object::w_tuple_getitem(
                 pyre_object::gc_roots::shadow_stack_get(paramflags_slot),
@@ -1623,7 +1653,7 @@ fn get_arg(
     defval: Option<PyObjectRef>,
     inargs: &[PyObjectRef],
     kwargs: Option<PyObjectRef>,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     if *index < inargs.len() {
         let value = inargs[*index];
         *index += 1;
@@ -1639,25 +1669,27 @@ fn get_arg(
         return Ok(defval);
     }
     Err(match name {
-        Some(name) => crate::PyError::type_error(format!("required argument '{name}' missing")),
-        None => crate::PyError::type_error("not enough arguments"),
+        Some(name) => {
+            pyre_interpreter::PyError::type_error(format!("required argument '{name}' missing"))
+        }
+        None => pyre_interpreter::PyError::type_error("not enough arguments"),
     })
 }
 
 /// The instance an `out` parameter is given for the callee to write into.  The
 /// argtype points at the thing written, so that is what gets built — an array
 /// type being its own such thing.
-fn out_parameter(at: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+fn out_parameter(at: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let info = stginfo::stginfo_of(at);
     if info.is_some_and(|info| stginfo::stginfo_paramfunc(info) == ParamFunc::Array) {
-        return crate::call::type_call_instantiate(at, &[]);
+        return pyre_interpreter::call::type_call_instantiate(at, &[]);
     }
     match info.and_then(stginfo::stginfo_proto) {
         Some(proto) if unsafe { pyre_object::is_type(proto) } => {
-            crate::call::type_call_instantiate(proto, &[])
+            pyre_interpreter::call::type_call_instantiate(proto, &[])
         }
         // A simple pointer code points at no type there is an instance of.
-        _ => Err(crate::PyError::type_error(format!(
+        _ => Err(pyre_interpreter::PyError::type_error(format!(
             "{} 'out' parameter must be passed as default value",
             type_display_name(at)
         ))),
@@ -1666,7 +1698,10 @@ fn out_parameter(at: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
 
 /// `_build_result` — with no `out` parameters the call's own result stands;
 /// with one it is that parameter, and with several a tuple of them.
-fn build_result(result: PyObjectRef, callargs: &CallArgs) -> Result<PyObjectRef, crate::PyError> {
+fn build_result(
+    result: PyObjectRef,
+    callargs: &CallArgs,
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     if callargs.numretvals == 0 {
         return Ok(result);
     }
@@ -1704,16 +1739,16 @@ fn build_result(result: PyObjectRef, callargs: &CallArgs) -> Result<PyObjectRef,
     ))
 }
 
-fn from_outparam(value: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-    let method = crate::baseobjspace::getattr_str(value, "__ctypes_from_outparam__")?;
-    crate::call::call_function_impl_result(method, &[])
+fn from_outparam(value: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    let method = pyre_interpreter::baseobjspace::getattr_str(value, "__ctypes_from_outparam__")?;
+    pyre_interpreter::call::call_function_impl_result(method, &[])
 }
 
 /// The Python value a returned `CallValue` becomes under return type `ret`.
 fn build_return_value(
     ret: Ret,
     result: host_ctypes::CallValue,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     match ret {
         Ret::Pointer(rt) => {
             let p = match result {
@@ -1747,12 +1782,12 @@ fn build_return_value(
     }
 }
 
-fn argument_address(obj: PyObjectRef) -> Result<usize, crate::PyError> {
+fn argument_address(obj: PyObjectRef) -> Result<usize, pyre_interpreter::PyError> {
     if unsafe { pyre_object::is_none(obj) } {
         return Ok(0);
     }
     if unsafe { pyre_object::is_int(obj) } {
-        return Ok(crate::baseobjspace::int_w(obj)? as usize);
+        return Ok(pyre_interpreter::baseobjspace::int_w(obj)? as usize);
     }
     if unsafe { pyre_object::is_bytes(obj) } {
         return Ok(unsafe { pyre_object::bytesobject::w_bytes_data(obj) }.as_ptr() as usize);
@@ -1775,19 +1810,19 @@ fn argument_address(obj: PyObjectRef) -> Result<usize, crate::PyError> {
             ));
         }
         return cdata::cdata_addr(obj)
-            .ok_or_else(|| crate::PyError::type_error("ctypes instance has no buffer"));
+            .ok_or_else(|| pyre_interpreter::PyError::type_error("ctypes instance has no buffer"));
     }
     if super::interp_ctypes::is_carg(obj) {
         return Ok(super::interp_ctypes::carg_ptr(obj));
     }
-    Err(crate::PyError::type_error(
+    Err(pyre_interpreter::PyError::type_error(
         "wrong type: expected bytes, integer address, ctypes instance, or None",
     ))
 }
 
-fn internal_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn internal_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     if args.len() < 3 || !unsafe { pyre_object::is_type(args[2]) } {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "cast() argument 2 must be a pointer type",
         ));
     }
@@ -1800,12 +1835,12 @@ fn internal_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         || cdata::type_code_of(target)
             .is_some_and(|tc| matches!(tc.as_str(), "s" | "P" | "z" | "U" | "Z" | "X" | "O"));
     if !is_pointer {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "cast() argument 2 must be a pointer type",
         ));
     }
     let address = argument_address(args[0])?;
-    let result = crate::call::type_call_instantiate(target, &[])?;
+    let result = pyre_interpreter::call::type_call_instantiate(target, &[])?;
     if is_funcptr_type(target) {
         // A foreign function keeps its address beside the buffer, and that is
         // the copy a call reads.
@@ -1832,7 +1867,7 @@ fn internal_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// the pointer — so NULL is a bad address like any other and the fence names
 /// it the way it names the rest.
 #[cfg(all(windows, target_env = "msvc"))]
-fn declined_read(address: usize) -> crate::PyError {
+fn declined_read(address: usize) -> pyre_interpreter::PyError {
     super::seh::access_violation_reading(address)
 }
 
@@ -1840,24 +1875,26 @@ fn declined_read(address: usize) -> crate::PyError {
 /// so a read `host_env` refuses to attempt raises the refusal itself rather
 /// than taking the process down over it.
 #[cfg(not(all(windows, target_env = "msvc")))]
-fn declined_read(_address: usize) -> crate::PyError {
-    crate::PyError::value_error("NULL pointer access")
+fn declined_read(_address: usize) -> pyre_interpreter::PyError {
+    pyre_interpreter::PyError::value_error("NULL pointer access")
 }
 
-fn internal_string_at(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn internal_string_at(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     if args.is_empty() {
-        return Err(crate::PyError::type_error("string_at() missing address"));
+        return Err(pyre_interpreter::PyError::type_error(
+            "string_at() missing address",
+        ));
     }
     let size = args
         .get(1)
         .copied()
-        .map(crate::baseobjspace::int_w)
+        .map(pyre_interpreter::baseobjspace::int_w)
         .transpose()?
         .unwrap_or(-1);
     // `PyBytes_FromStringAndSize` rejects an impossible size before the
     // pointer converter runs.  Keep that ordering for huge explicit sizes.
     if size > isize::MAX as i64 / 2 {
-        return Err(crate::PyError::memory_error("size too large"));
+        return Err(pyre_interpreter::PyError::memory_error("size too large"));
     }
     let address = argument_address(args[0])?;
     // `PyBytes_FromStringAndSize` copies nothing for a zero size, so the
@@ -1869,7 +1906,7 @@ fn internal_string_at(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     // reaches `PyBytes_FromStringAndSize`, which refuses it before it copies,
     // so the address is not read for that either.
     if size < -1 {
-        return Err(crate::PyError::system_error(
+        return Err(pyre_interpreter::PyError::system_error(
             "Negative size passed to PyBytes_FromStringAndSize",
         ));
     }
@@ -1881,24 +1918,26 @@ fn internal_string_at(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         Ok(value) => value,
         Err(host_ctypes::StringAtError::NullPointer) => return Err(declined_read(address)),
         Err(host_ctypes::StringAtError::TooLong) => {
-            return Err(crate::PyError::memory_error("size too large"));
+            return Err(pyre_interpreter::PyError::memory_error("size too large"));
         }
     };
     Ok(pyre_object::bytesobject::w_bytes_from_bytes(&value))
 }
 
-fn internal_wstring_at(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn internal_wstring_at(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     if args.is_empty() {
-        return Err(crate::PyError::type_error("wstring_at() missing address"));
+        return Err(pyre_interpreter::PyError::type_error(
+            "wstring_at() missing address",
+        ));
     }
     let size = args
         .get(1)
         .copied()
-        .map(crate::baseobjspace::int_w)
+        .map(pyre_interpreter::baseobjspace::int_w)
         .transpose()?
         .unwrap_or(-1);
     if size > isize::MAX as i64 / std::mem::size_of::<libc::wchar_t>() as i64 {
-        return Err(crate::PyError::overflow_error("size too large"));
+        return Err(pyre_interpreter::PyError::overflow_error("size too large"));
     }
     let address = argument_address(args[0])?;
     // `PyUnicode_FromWideChar` copies nothing for a zero size, so the address
@@ -1915,7 +1954,7 @@ fn internal_wstring_at(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         let end =
             address.wrapping_add((size as isize as usize).wrapping_mul(size_of::<libc::wchar_t>()));
         if end <= address {
-            return Err(crate::PyError::system_error(
+            return Err(pyre_interpreter::PyError::system_error(
                 "Negative size passed to PyUnicode_New",
             ));
         }
@@ -1925,31 +1964,35 @@ fn internal_wstring_at(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         Ok(value) => value,
         Err(host_ctypes::StringAtError::NullPointer) => return Err(declined_read(address)),
         Err(host_ctypes::StringAtError::TooLong) => {
-            return Err(crate::PyError::overflow_error("size too large"));
+            return Err(pyre_interpreter::PyError::overflow_error("size too large"));
         }
     };
     Ok(pyre_object::w_str_from_wtf8_managed(value))
 }
 
-fn internal_memoryview_at(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn internal_memoryview_at(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     if args.len() < 2 {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "memoryview_at() needs address and size",
         ));
     }
     let address = argument_address(args[0])?;
     if !unsafe { pyre_object::is_int(args[1]) || pyre_object::is_long(args[1]) } {
-        return Err(crate::PyError::type_error("size must be an integer"));
+        return Err(pyre_interpreter::PyError::type_error(
+            "size must be an integer",
+        ));
     }
-    let size = crate::baseobjspace::int_w(args[1])
-        .map_err(|_| crate::PyError::value_error("size is too large"))?;
+    let size = pyre_interpreter::baseobjspace::int_w(args[1])
+        .map_err(|_| pyre_interpreter::PyError::value_error("size is too large"))?;
     if size < 0 {
-        return Err(crate::PyError::value_error("size must not be negative"));
+        return Err(pyre_interpreter::PyError::value_error(
+            "size must not be negative",
+        ));
     }
     let readonly = args
         .get(2)
         .copied()
-        .map(crate::baseobjspace::is_true)
+        .map(pyre_interpreter::baseobjspace::is_true)
         .transpose()?
         .unwrap_or(false);
     let roots = pyre_object::gc_roots::push_roots();
@@ -1976,14 +2019,16 @@ fn internal_memoryview_at(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     Ok(roots.get(mv_slot))
 }
 
-fn internal_pybytes_fromstringandsize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn internal_pybytes_fromstringandsize(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     if args.len() < 2 || !unsafe { pyre_object::is_bytes(args[0]) } {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "PyBytes_FromStringAndSize needs string and size",
         ));
     }
     let bytes = unsafe { pyre_object::bytesobject::w_bytes_data(args[0]) };
-    let size = crate::baseobjspace::int_w(args[1])?.max(0) as usize;
+    let size = pyre_interpreter::baseobjspace::int_w(args[1])?.max(0) as usize;
     Ok(pyre_object::bytesobject::w_bytes_from_bytes(
         &bytes[..size.min(bytes.len())],
     ))
@@ -1995,12 +2040,14 @@ fn internal_pybytes_fromstringandsize(args: &[PyObjectRef]) -> Result<PyObjectRe
 /// `.winerror` reports; a code the system has no message for is spelled
 /// `Windows Error 0x<code>`, which is what `test_windows_message` reads.
 #[cfg(windows)]
-fn internal_pyerr_setfromwindowserr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn internal_pyerr_setfromwindowserr(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     // `PyErr_SetExcFromWindowsErrWithFilenameObjects` reads `GetLastError()`
     // when the code it is handed is 0, so an explicit zero says the same
     // thing as no argument at all rather than naming `ERROR_SUCCESS`.
     let code = match args.first() {
-        Some(&arg) => crate::baseobjspace::int_w(arg)? as i32,
+        Some(&arg) => pyre_interpreter::baseobjspace::int_w(arg)? as i32,
         None => 0,
     };
     let code = if code == 0 {
@@ -2008,7 +2055,7 @@ fn internal_pyerr_setfromwindowserr(args: &[PyObjectRef]) -> Result<PyObjectRef,
     } else {
         code
     };
-    Err(crate::PyError::os_error_win32_syscall2(
+    Err(pyre_interpreter::PyError::os_error_win32_syscall2(
         code,
         pyre_object::PY_NULL,
         pyre_object::PY_NULL,
@@ -2020,14 +2067,16 @@ fn internal_pyerr_setfromwindowserr(args: &[PyObjectRef]) -> Result<PyObjectRef,
 /// default rules and the result is read as a C `int`.  `call_cdeclfunction` is
 /// the same call under `FUNCFLAG_CDECL`, which on this architecture is the
 /// only calling convention there is.
-pub(super) fn call_function(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(super) fn call_function(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let (Some(&addr), Some(&arguments)) = (args.first(), args.get(1)) else {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "call_function() takes exactly 2 arguments",
         ));
     };
     if !unsafe { pyre_object::is_tuple(arguments) } {
-        return Err(crate::PyError::type_error(format!(
+        return Err(pyre_interpreter::PyError::type_error(format!(
             "argument 2 must be tuple, not {}",
             cdata::value_type_name(arguments)
         )));
@@ -2041,7 +2090,7 @@ pub(super) fn call_function(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         .collect::<Result<Vec<_>, _>>()?;
     let host_args: Vec<host_ctypes::CallArg> = owned.iter().map(owned_arg_as_call_arg).collect();
     let result = {
-        let _blocked = crate::module::thread::before_external_block();
+        let _blocked = pyre_interpreter::module::thread::before_external_block();
         super::seh::guard(|| {
             host_ctypes::call(
                 addr,
@@ -2062,16 +2111,16 @@ pub(super) fn call_function(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     )))
 }
 
-fn internal_pyos_snprintf(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn internal_pyos_snprintf(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     if args.len() < 3
         || !cdata::is_cdata_instance(args[0])
         || !unsafe { pyre_object::is_bytes(args[2]) }
     {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "PyOS_snprintf needs buffer, size and format",
         ));
     }
-    let capacity = crate::baseobjspace::int_w(args[1])?.max(0) as usize;
+    let capacity = pyre_interpreter::baseobjspace::int_w(args[1])?.max(0) as usize;
     let format = unsafe { pyre_object::bytesobject::w_bytes_data(args[2]) };
     let mut rendered = Vec::new();
     let mut arg = 3usize;
@@ -2079,18 +2128,21 @@ fn internal_pyos_snprintf(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     while i < format.len() {
         if format[i] == b'%' && i + 1 < format.len() && matches!(format[i + 1], b's' | b'd') {
             let value = *args.get(arg).ok_or_else(|| {
-                crate::PyError::type_error("not enough arguments for format string")
+                pyre_interpreter::PyError::type_error("not enough arguments for format string")
             })?;
             arg += 1;
             if format[i + 1] == b's' {
                 if !unsafe { pyre_object::is_bytes(value) } {
-                    return Err(crate::PyError::type_error("%s requires bytes"));
+                    return Err(pyre_interpreter::PyError::type_error("%s requires bytes"));
                 }
                 rendered
                     .extend_from_slice(unsafe { pyre_object::bytesobject::w_bytes_data(value) });
             } else {
-                rendered
-                    .extend_from_slice(crate::baseobjspace::int_w(value)?.to_string().as_bytes());
+                rendered.extend_from_slice(
+                    pyre_interpreter::baseobjspace::int_w(value)?
+                        .to_string()
+                        .as_bytes(),
+                );
             }
             i += 2;
         } else {
@@ -2161,11 +2213,11 @@ pub(super) fn is_funcptr_type(t: PyObjectRef) -> bool {
     !t.is_null()
         && unsafe { pyre_object::is_type(t) }
         && !std::ptr::eq(t, cfuncptr_type())
-        && unsafe { crate::baseobjspace::lookup_in_type(t, "_flags_") }.is_some()
+        && unsafe { pyre_interpreter::baseobjspace::lookup_in_type(t, "_flags_") }.is_some()
 }
 
 fn is_funcptr_instance(obj: PyObjectRef) -> bool {
-    !obj.is_null() && unsafe { crate::baseobjspace::isinstance_w(obj, cfuncptr_type()) }
+    !obj.is_null() && unsafe { pyre_interpreter::baseobjspace::isinstance_w(obj, cfuncptr_type()) }
 }
 
 /// Append the field types declared in one `_fields_` sequence to `out`
@@ -2173,18 +2225,18 @@ fn is_funcptr_instance(obj: PyObjectRef) -> bool {
 fn collect_field_types(
     fields: PyObjectRef,
     out: &mut Vec<PyObjectRef>,
-) -> Result<(), crate::PyError> {
+) -> Result<(), pyre_interpreter::PyError> {
     let items = seq_to_vec(fields)
-        .ok_or_else(|| crate::PyError::type_error("_fields_ must be a sequence"))?;
+        .ok_or_else(|| pyre_interpreter::PyError::type_error("_fields_ must be a sequence"))?;
     for it in items {
         if !unsafe { pyre_object::is_tuple(it) } {
-            return Err(crate::PyError::type_error(
+            return Err(pyre_interpreter::PyError::type_error(
                 "_fields_ entries must be tuples",
             ));
         }
         let ft = unsafe { pyre_object::w_tuple_getitem(it, 1) }.unwrap_or(pyre_object::PY_NULL);
         if ft.is_null() || !unsafe { pyre_object::is_type(ft) } {
-            return Err(crate::PyError::type_error(
+            return Err(pyre_interpreter::PyError::type_error(
                 "field type must be a ctypes type",
             ));
         }
@@ -2196,23 +2248,23 @@ fn collect_field_types(
 /// The full, base-first field types of a struct/union type.  A subclass's
 /// `_fields_` lists only its own fields, so the inherited prefix is gathered by
 /// walking the MRO from the least-derived ancestor down to `t`.
-fn struct_field_types(t: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError> {
+fn struct_field_types(t: PyObjectRef) -> Result<Vec<PyObjectRef>, pyre_interpreter::PyError> {
     let mro = unsafe { pyre_object::typeobject::w_type_get_mro(t) };
     if mro.is_null() {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "struct/union type has no '_fields_'",
         ));
     }
     let mut out = Vec::new();
     let mut found = false;
     for &cls in unsafe { (*mro).as_slice() }.iter().rev() {
-        if let Some(fields) = crate::type_dict_lookup(cls, "_fields_") {
+        if let Some(fields) = pyre_interpreter::type_dict_lookup(cls, "_fields_") {
             found = true;
             collect_field_types(fields, &mut out)?;
         }
     }
     if !found {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "struct/union type has no '_fields_'",
         ));
     }
@@ -2222,25 +2274,29 @@ fn struct_field_types(t: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError
 /// Build the recursive `CTypeLayout` of a ctypes type, driven by its `StgInfo`
 /// `paramfunc`: simple → code, pointer → `Pointer`, array → element layout +
 /// length, struct/union → per-field layouts from `_fields_`.
-pub(super) fn build_layout(t: PyObjectRef) -> Result<host_ctypes::CTypeLayout, crate::PyError> {
+pub(super) fn build_layout(
+    t: PyObjectRef,
+) -> Result<host_ctypes::CTypeLayout, pyre_interpreter::PyError> {
     use host_ctypes::CTypeLayout;
     let info = stginfo::stginfo_of(t)
-        .ok_or_else(|| crate::PyError::type_error("type has no ctypes layout info"))?;
+        .ok_or_else(|| pyre_interpreter::PyError::type_error("type has no ctypes layout info"))?;
     let size = stginfo::stginfo_size(info);
     let paramfunc = stginfo::stginfo_paramfunc(info);
     match paramfunc {
         ParamFunc::Simple => {
-            let tc = cdata::type_code_of(t)
-                .ok_or_else(|| crate::PyError::type_error("simple type has no '_type_'"))?;
+            let tc = cdata::type_code_of(t).ok_or_else(|| {
+                pyre_interpreter::PyError::type_error("simple type has no '_type_'")
+            })?;
             let ch = tc
                 .as_char()
-                .ok_or_else(|| crate::PyError::type_error("empty '_type_' code"))?;
+                .ok_or_else(|| pyre_interpreter::PyError::type_error("empty '_type_' code"))?;
             Ok(CTypeLayout::Simple(ch))
         }
         ParamFunc::Pointer => Ok(CTypeLayout::Pointer),
         ParamFunc::Array => {
-            let element = stginfo::stginfo_proto(info)
-                .ok_or_else(|| crate::PyError::type_error("array type has no element type"))?;
+            let element = stginfo::stginfo_proto(info).ok_or_else(|| {
+                pyre_interpreter::PyError::type_error("array type has no element type")
+            })?;
             Ok(CTypeLayout::Array {
                 element: Box::new(build_layout(element)?),
                 length: stginfo::stginfo_length(info),
@@ -2264,10 +2320,15 @@ pub(super) fn build_layout(t: PyObjectRef) -> Result<host_ctypes::CTypeLayout, c
 
 /// Marshal a by-value aggregate argument `arg` of type `at`: build the layout
 /// and snapshot the instance's buffer bytes (padded to the layout size).
-fn marshal_aggregate_arg(arg: PyObjectRef, at: PyObjectRef) -> Result<OwnedArg, crate::PyError> {
+fn marshal_aggregate_arg(
+    arg: PyObjectRef,
+    at: PyObjectRef,
+) -> Result<OwnedArg, pyre_interpreter::PyError> {
     let layout = build_layout(at)?;
     let bytes = cdata::cdata_bytes(arg).ok_or_else(|| {
-        crate::PyError::type_error("by-value aggregate argument is not a ctypes instance")
+        pyre_interpreter::PyError::type_error(
+            "by-value aggregate argument is not a ctypes instance",
+        )
     })?;
     let buf = host_ctypes::copy_to_sized_bytes(bytes, layout.size());
     Ok(OwnedArg::Aggregate(layout, buf))
@@ -2275,7 +2336,10 @@ fn marshal_aggregate_arg(arg: PyObjectRef, at: PyObjectRef) -> Result<OwnedArg, 
 
 /// Create a fresh instance of aggregate type `ty` whose owned buffer holds the
 /// returned `bytes`.
-fn make_aggregate_instance(ty: PyObjectRef, bytes: &[u8]) -> Result<PyObjectRef, crate::PyError> {
+fn make_aggregate_instance(
+    ty: PyObjectRef,
+    bytes: &[u8],
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let size = stginfo::stginfo_of(ty)
         .map(stginfo::stginfo_size)
         .unwrap_or(bytes.len());
@@ -2285,9 +2349,9 @@ fn make_aggregate_instance(ty: PyObjectRef, bytes: &[u8]) -> Result<PyObjectRef,
         pyre_object::w_bytearray_data_mut(ba)[..n].copy_from_slice(&bytes[..n]);
     }
     let obj = pyre_object::w_instance_new(ty);
-    let d = crate::baseobjspace::getdict_native(obj);
+    let d = pyre_interpreter::baseobjspace::getdict_native(obj);
     if d.is_null() {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "aggregate instance has no instance dict",
         ));
     }
@@ -2302,7 +2366,7 @@ fn marshal_typed_arg(
     at: PyObjectRef,
     kind: ArgKind,
     keepalive: &mut Vec<Vec<u8>>,
-) -> Result<OwnedArg, crate::PyError> {
+) -> Result<OwnedArg, pyre_interpreter::PyError> {
     match kind {
         ArgKind::Pointer => Ok(OwnedArg::Pointer(pointer_argument_addr(
             arg, at, keepalive,
@@ -2317,7 +2381,10 @@ fn marshal_typed_arg(
 /// `PyCSimpleType.from_param` hands an instance of the argtype itself straight
 /// through and converts anything else, so a mismatched cdata cannot be
 /// reinterpreted through the wrong argtype.
-fn marshal_simple_arg(arg: PyObjectRef, tc: TypeCode) -> Result<OwnedArg, crate::PyError> {
+fn marshal_simple_arg(
+    arg: PyObjectRef,
+    tc: TypeCode,
+) -> Result<OwnedArg, pyre_interpreter::PyError> {
     if let Some(bytes) = cdata::same_type_bytes(&tc, arg) {
         return Ok(OwnedArg::Typed(tc, bytes));
     }
@@ -2329,7 +2396,7 @@ fn marshal_simple_arg(arg: PyObjectRef, tc: TypeCode) -> Result<OwnedArg, crate:
 fn marshal_default_arg(
     arg: PyObjectRef,
     keepalive: &mut Vec<Vec<u8>>,
-) -> Result<OwnedArg, crate::PyError> {
+) -> Result<OwnedArg, pyre_interpreter::PyError> {
     // `byref()` carrier → the address it wraps.
     if super::interp_ctypes::is_carg(arg) {
         return Ok(OwnedArg::Pointer(super::interp_ctypes::carg_ptr(arg)));
@@ -2340,8 +2407,9 @@ fn marshal_default_arg(
     // A scalar cdata is passed by value.
     if cdata::is_simplecdata_instance(arg) {
         let cls = unsafe { pyre_object::w_instance_get_type(arg) };
-        let tc = cdata::type_code_of(cls)
-            .ok_or_else(|| crate::PyError::type_error("argument type has no '_type_'"))?;
+        let tc = cdata::type_code_of(cls).ok_or_else(|| {
+            pyre_interpreter::PyError::type_error("argument type has no '_type_'")
+        })?;
         let buf = cdata::cdata_bytes(arg).unwrap_or(&[]).to_vec();
         return Ok(OwnedArg::Typed(tc, buf));
     }
@@ -2371,11 +2439,15 @@ fn marshal_default_arg(
     } else if unsafe { pyre_object::is_str(arg) } {
         Ok(OwnedArg::Pointer(wstr_pointer_addr(arg, keepalive)))
     } else if unsafe { pyre_object::is_float(arg) } {
-        Ok(OwnedArg::Double(crate::baseobjspace::float_w(arg)?))
+        Ok(OwnedArg::Double(pyre_interpreter::baseobjspace::float_w(
+            arg,
+        )?))
     } else if unsafe { pyre_object::is_int(arg) } {
-        Ok(OwnedArg::Int(crate::baseobjspace::int_w(arg)? as i32))
+        Ok(OwnedArg::Int(
+            pyre_interpreter::baseobjspace::int_w(arg)? as i32
+        ))
     } else {
-        Err(crate::PyError::type_error(
+        Err(pyre_interpreter::PyError::type_error(
             "Don't know how to convert parameter",
         ))
     }
@@ -2390,12 +2462,12 @@ fn pointer_argument_addr(
     arg: PyObjectRef,
     at: PyObjectRef,
     keepalive: &mut Vec<Vec<u8>>,
-) -> Result<usize, crate::PyError> {
+) -> Result<usize, pyre_interpreter::PyError> {
     if let Some(info) = stginfo::stginfo_of(at)
         && stginfo::stginfo_paramfunc(info) == ParamFunc::Pointer
         && let Some(proto) = stginfo::stginfo_proto(info)
         && unsafe { pyre_object::is_type(proto) }
-        && unsafe { crate::baseobjspace::isinstance_w(arg, proto) }
+        && unsafe { pyre_interpreter::baseobjspace::isinstance_w(arg, proto) }
         && let Some(addr) = cdata::cdata_addr(arg)
     {
         return Ok(addr);
@@ -2409,7 +2481,7 @@ fn pointer_argument_addr(
 pub(super) fn resolve_pointer_addr(
     arg: PyObjectRef,
     keepalive: &mut Vec<Vec<u8>>,
-) -> Result<usize, crate::PyError> {
+) -> Result<usize, pyre_interpreter::PyError> {
     if super::interp_ctypes::is_carg(arg) {
         return Ok(super::interp_ctypes::carg_ptr(arg));
     }
@@ -2440,7 +2512,7 @@ pub(super) fn resolve_pointer_addr(
     } else if unsafe { pyre_object::is_str(arg) } {
         Ok(wstr_pointer_addr(arg, keepalive))
     } else {
-        Err(crate::PyError::type_error(
+        Err(pyre_interpreter::PyError::type_error(
             "expected bytes, integer address, ctypes instance, or None",
         ))
     }

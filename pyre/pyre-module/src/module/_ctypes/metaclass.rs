@@ -22,7 +22,7 @@ use pyre_object::PyObjectRef;
 use rustpython_host_env::ctypes as host_ctypes;
 use std::sync::OnceLock;
 
-type PyResult = Result<PyObjectRef, crate::PyError>;
+type PyResult = Result<PyObjectRef, pyre_interpreter::PyError>;
 
 /// A ctypes metaclass derived from `type`, whose *instances* are therefore
 /// type objects.
@@ -36,9 +36,12 @@ type PyResult = Result<PyObjectRef, crate::PyError>;
 fn make_ctypes_metatype(name: &str, init: impl FnOnce(PyObjectRef)) -> PyObjectRef {
     let base = ctype_type();
     let layout = unsafe { pyre_object::w_type_get_layout_ptr(base) };
-    let tp = crate::typedef::make_builtin_type_with_overridetypedef(name, init, base, unsafe {
-        (*layout).typedef
-    });
+    let tp = pyre_interpreter::typedef::make_builtin_type_with_overridetypedef(
+        name,
+        init,
+        base,
+        unsafe { (*layout).typedef },
+    );
     super::finish_cpython_type(tp, "_ctypes", true)
 }
 
@@ -57,9 +60,9 @@ macro_rules! cached_type {
 // metaclass owner for every concrete ctypes metaclass.  Keeping the shared
 // methods here avoids the former pyre-only duplication on every child.
 cached_type!(CTYPE_TYPE, ctype_type, || {
-    let base = crate::typedef::w_type();
+    let base = pyre_interpreter::typedef::w_type();
     let layout = unsafe { pyre_object::w_type_get_layout_ptr(base) };
-    let tp = crate::typedef::make_builtin_type_with_overridetypedef(
+    let tp = pyre_interpreter::typedef::make_builtin_type_with_overridetypedef(
         "CType_Type",
         install_shared_meta,
         base,
@@ -100,7 +103,7 @@ cached_type!(PYCFUNCPTRTYPE, pycfuncptrtype_type, || {
 });
 
 cached_type!(STRUCTURE, structure_type, || {
-    let tp = crate::typedef::make_builtin_type_with_base(
+    let tp = pyre_interpreter::typedef::make_builtin_type_with_base(
         "Structure",
         init_aggregate_base,
         cdata::cdata_type(),
@@ -110,7 +113,7 @@ cached_type!(STRUCTURE, structure_type, || {
 });
 
 cached_type!(UNION, union_type, || {
-    let tp = crate::typedef::make_builtin_type_with_base(
+    let tp = pyre_interpreter::typedef::make_builtin_type_with_base(
         "Union",
         init_aggregate_base,
         cdata::cdata_type(),
@@ -120,41 +123,43 @@ cached_type!(UNION, union_type, || {
 });
 
 cached_type!(CFIELD, cfield_type, || {
-    let tp = crate::typedef::make_builtin_type("CField", |ns| {
+    let tp = pyre_interpreter::typedef::make_builtin_type("CField", |ns| {
         type_ns_store(
             ns,
             "__new__",
-            crate::typedef::make_new_descr(cfield_new_internal),
+            pyre_interpreter::typedef::make_new_descr(cfield_new_internal),
         );
         type_ns_store(
             ns,
             "__get__",
-            crate::make_builtin_function("__get__", cfield_get),
+            pyre_interpreter::make_builtin_function("__get__", cfield_get),
         );
         type_ns_store(
             ns,
             "__set__",
             // `cfield_set` reads its value out of the slice, so the arity is
             // declared rather than left to the body.
-            crate::make_builtin_function_with_arity("__set__", cfield_set, 3),
+            pyre_interpreter::make_builtin_function_with_arity("__set__", cfield_set, 3),
         );
         type_ns_store(
             ns,
             "__delete__",
-            crate::make_builtin_function("__delete__", |_args| {
-                Err(crate::PyError::type_error("can't delete attribute"))
+            pyre_interpreter::make_builtin_function("__delete__", |_args| {
+                Err(pyre_interpreter::PyError::type_error(
+                    "can't delete attribute",
+                ))
             }),
         );
         type_ns_store(
             ns,
             "__repr__",
-            crate::make_builtin_function("__repr__", cfield_repr),
+            pyre_interpreter::make_builtin_function("__repr__", cfield_repr),
         );
         type_ns_store(
             ns,
             "__setattr__",
-            crate::make_builtin_function("__setattr__", |_args| {
-                Err(crate::PyError::attribute_error(
+            pyre_interpreter::make_builtin_function("__setattr__", |_args| {
+                Err(pyre_interpreter::PyError::attribute_error(
                     "CField attributes are read-only",
                 ))
             }),
@@ -185,14 +190,17 @@ cached_type!(PYCPOINTERTYPE, pycpointertype_type, || {
 });
 
 cached_type!(ARRAY, array_type, || {
-    let tp =
-        crate::typedef::make_builtin_type_with_base("Array", init_array_base, cdata::cdata_type());
+    let tp = pyre_interpreter::typedef::make_builtin_type_with_base(
+        "Array",
+        init_array_base,
+        cdata::cdata_type(),
+    );
     finish_element_base(tp, pycarraytype_type());
     super::finish_cpython_type(tp, "_ctypes", true)
 });
 
 cached_type!(POINTER_BASE, pointer_base_type, || {
-    let tp = crate::typedef::make_builtin_type_with_base(
+    let tp = pyre_interpreter::typedef::make_builtin_type_with_base(
         "_Pointer",
         init_pointer_base,
         cdata::cdata_type(),
@@ -208,21 +216,25 @@ cached_type!(POINTER_BASE, pointer_base_type, || {
 /// `isinstance_w` reads the native `w_class` and walks the MRO, which is
 /// what the class hierarchy discriminates here — every cdata shares one
 /// Rust layout.
-pub(crate) fn is_array_instance(obj: PyObjectRef) -> bool {
-    unsafe { crate::baseobjspace::isinstance_w(obj, array_type()) }
+pub fn is_array_instance(obj: PyObjectRef) -> bool {
+    unsafe { pyre_interpreter::baseobjspace::isinstance_w(obj, array_type()) }
 }
 
 /// The same test against `PyCPointer_Type` for the `_Pointer` descriptors.
-pub(crate) fn is_pointer_instance(obj: PyObjectRef) -> bool {
-    unsafe { crate::baseobjspace::isinstance_w(obj, pointer_base_type()) }
+pub fn is_pointer_instance(obj: PyObjectRef) -> bool {
+    unsafe { pyre_interpreter::baseobjspace::isinstance_w(obj, pointer_base_type()) }
 }
 
-fn install_new(ns: PyObjectRef, f: crate::gateway::BuiltinCodeFn) {
-    type_ns_store(ns, "__new__", crate::typedef::make_new_descr(f));
+fn install_new(ns: PyObjectRef, f: pyre_interpreter::gateway::BuiltinCodeFn) {
+    type_ns_store(ns, "__new__", pyre_interpreter::typedef::make_new_descr(f));
 }
 
-fn install_init(ns: PyObjectRef, f: crate::gateway::BuiltinCodeFn) {
-    type_ns_store(ns, "__init__", crate::make_builtin_function("__init__", f));
+fn install_init(ns: PyObjectRef, f: pyre_interpreter::gateway::BuiltinCodeFn) {
+    type_ns_store(
+        ns,
+        "__init__",
+        pyre_interpreter::make_builtin_function("__init__", f),
+    );
 }
 
 /// `__mul__`, `__pointer_type__`, and `from_param` — shared by all metaclasses.
@@ -230,32 +242,44 @@ fn install_shared_meta(ns: PyObjectRef) {
     type_ns_store(
         ns,
         "from_address",
-        crate::make_builtin_function("from_address", cdata::cdata_from_address),
+        pyre_interpreter::make_builtin_function("from_address", cdata::cdata_from_address),
     );
     type_ns_store(
         ns,
         "in_dll",
-        crate::make_builtin_function("in_dll", cdata::cdata_in_dll),
+        pyre_interpreter::make_builtin_function("in_dll", cdata::cdata_in_dll),
     );
     type_ns_store(
         ns,
         "__mul__",
-        crate::make_builtin_function("__mul__", meta_mul),
+        pyre_interpreter::make_builtin_function("__mul__", meta_mul),
     );
     type_ns_store(
         ns,
         "__pointer_type__",
-        crate::typedef::make_getset_property_named(
-            crate::make_builtin_function_with_arity("__pointer_type__", pointer_type_get, 2),
-            crate::make_builtin_function_with_arity("__pointer_type__", pointer_type_set, 3),
-            crate::make_builtin_function_with_arity("__pointer_type__", pointer_type_del, 2),
+        pyre_interpreter::typedef::make_getset_property_named(
+            pyre_interpreter::make_builtin_function_with_arity(
+                "__pointer_type__",
+                pointer_type_get,
+                2,
+            ),
+            pyre_interpreter::make_builtin_function_with_arity(
+                "__pointer_type__",
+                pointer_type_set,
+                3,
+            ),
+            pyre_interpreter::make_builtin_function_with_arity(
+                "__pointer_type__",
+                pointer_type_del,
+                2,
+            ),
             "__pointer_type__",
         ),
     );
     type_ns_store(
         ns,
         "from_param",
-        crate::make_builtin_function("from_param", meta_from_param),
+        pyre_interpreter::make_builtin_function("from_param", meta_from_param),
     );
 }
 
@@ -268,9 +292,9 @@ fn install_fields_getset(ns: PyObjectRef) {
     type_ns_store(
         ns,
         "_fields_",
-        crate::typedef::make_getset_property_named(
-            crate::make_builtin_function_with_arity("_fields_", fields_get, 2),
-            crate::make_builtin_function_with_arity("_fields_", fields_set, 3),
+        pyre_interpreter::typedef::make_getset_property_named(
+            pyre_interpreter::make_builtin_function_with_arity("_fields_", fields_get, 2),
+            pyre_interpreter::make_builtin_function_with_arity("_fields_", fields_set, 3),
             pyre_object::PY_NULL,
             "_fields_",
         ),
@@ -278,41 +302,46 @@ fn install_fields_getset(ns: PyObjectRef) {
 }
 
 fn init_aggregate_base(ns: PyObjectRef) {
-    type_ns_store(ns, "__new__", crate::typedef::make_new_descr(structure_new));
+    type_ns_store(
+        ns,
+        "__new__",
+        pyre_interpreter::typedef::make_new_descr(structure_new),
+    );
     type_ns_store(
         ns,
         "__init__",
-        crate::make_builtin_function("__init__", structure_init),
+        pyre_interpreter::make_builtin_function("__init__", structure_init),
     );
     type_ns_store(
         ns,
         "__setattr__",
-        crate::make_builtin_function("__setattr__", structure_setattr),
+        pyre_interpreter::make_builtin_function("__setattr__", structure_setattr),
     );
 }
 
 fn structure_setattr(args: &[PyObjectRef]) -> PyResult {
     if args.len() < 3 || !unsafe { pyre_object::is_str(args[1]) } {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "attribute name must be a string",
         ));
     }
     let obj = args[0];
     let name = unsafe { pyre_object::w_str_get_value(args[1]) };
     let cls = unsafe { pyre_object::w_instance_get_type(obj) };
-    let slots_empty = crate::type_dict_lookup(cls, "__slots__").is_some_and(|slots| {
+    let slots_empty = pyre_interpreter::type_dict_lookup(cls, "__slots__").is_some_and(|slots| {
         (unsafe { pyre_object::is_tuple(slots) } && unsafe { pyre_object::w_tuple_len(slots) } == 0)
             || (unsafe { pyre_object::is_list(slots) }
                 && unsafe { pyre_object::w_list_len(slots) } == 0)
     });
-    if slots_empty && unsafe { crate::baseobjspace::lookup_in_type(cls, name) }.is_none() {
-        return Err(crate::PyError::attribute_error(format!(
+    if slots_empty && unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, name) }.is_none()
+    {
+        return Err(pyre_interpreter::PyError::attribute_error(format!(
             "'{}' object has no attribute '{}'",
             type_name(cls),
             name,
         )));
     }
-    crate::baseobjspace::object_setattr(obj, name, args[2])
+    pyre_interpreter::baseobjspace::object_setattr(obj, name, args[2])
 }
 
 fn finish_aggregate_base(tp: PyObjectRef, metaclass: PyObjectRef, paramfunc: &'static str) {
@@ -343,21 +372,21 @@ fn init_array_base(ns: PyObjectRef) {
     type_ns_store(
         ns,
         "__class_getitem__",
-        pyre_object::function::w_classmethod_new(crate::make_builtin_function(
+        pyre_object::function::w_classmethod_new(pyre_interpreter::make_builtin_function(
             "__class_getitem__",
-            crate::_pypy_generic_alias::generic_alias_class_getitem,
+            pyre_interpreter::_pypy_generic_alias::generic_alias_class_getitem,
         )),
     );
     install_new(ns, array_new);
     type_ns_store(
         ns,
         "__init__",
-        crate::make_builtin_function("__init__", array_init),
+        pyre_interpreter::make_builtin_function("__init__", array_init),
     );
     type_ns_store(
         ns,
         "__len__",
-        crate::make_builtin_function("__len__", array_len),
+        pyre_interpreter::make_builtin_function("__len__", array_len),
     );
     // These two read their key and value straight out of the slice, so the
     // declared arity is what stands between a short call and an
@@ -366,12 +395,12 @@ fn init_array_base(ns: PyObjectRef) {
     type_ns_store(
         ns,
         "__getitem__",
-        crate::make_builtin_function_with_arity("__getitem__", array_getitem, 2),
+        pyre_interpreter::make_builtin_function_with_arity("__getitem__", array_getitem, 2),
     );
     type_ns_store(
         ns,
         "__setitem__",
-        crate::make_builtin_function_with_arity("__setitem__", array_setitem, 3),
+        pyre_interpreter::make_builtin_function_with_arity("__setitem__", array_setitem, 3),
     );
 }
 
@@ -380,35 +409,35 @@ fn init_pointer_base(ns: PyObjectRef) {
     type_ns_store(
         ns,
         "__init__",
-        crate::make_builtin_function("__init__", pointer_init),
+        pyre_interpreter::make_builtin_function("__init__", pointer_init),
     );
     // Indexed the same way `_ctypes.Array`'s pair is, and unguarded the same
     // way before the arity was declared.
     type_ns_store(
         ns,
         "__getitem__",
-        crate::make_builtin_function_with_arity("__getitem__", pointer_getitem, 2),
+        pyre_interpreter::make_builtin_function_with_arity("__getitem__", pointer_getitem, 2),
     );
     type_ns_store(
         ns,
         "__setitem__",
-        crate::make_builtin_function_with_arity("__setitem__", pointer_setitem, 3),
+        pyre_interpreter::make_builtin_function_with_arity("__setitem__", pointer_setitem, 3),
     );
     type_ns_store(
         ns,
         "__bool__",
-        crate::make_builtin_function("__bool__", pointer_bool),
+        pyre_interpreter::make_builtin_function("__bool__", pointer_bool),
     );
     type_ns_store(
         ns,
         "contents",
-        crate::typedef::make_getset_property_named(
-            crate::make_builtin_function_with_arity("contents", contents_get, 2),
-            crate::make_builtin_function_with_arity("contents", contents_set, 3),
-            crate::make_builtin_function_with_arity(
+        pyre_interpreter::typedef::make_getset_property_named(
+            pyre_interpreter::make_builtin_function_with_arity("contents", contents_get, 2),
+            pyre_interpreter::make_builtin_function_with_arity("contents", contents_set, 3),
+            pyre_interpreter::make_builtin_function_with_arity(
                 "contents",
                 |_args| {
-                    Err(crate::PyError::type_error(
+                    Err(pyre_interpreter::PyError::type_error(
                         "Pointer does not support item deletion",
                     ))
                 },
@@ -420,7 +449,7 @@ fn init_pointer_base(ns: PyObjectRef) {
     type_ns_store(
         ns,
         "set_type",
-        pyre_object::function::w_classmethod_new(crate::make_builtin_function(
+        pyre_object::function::w_classmethod_new(pyre_interpreter::make_builtin_function(
             "set_type",
             pointer_set_type,
         )),
@@ -430,7 +459,7 @@ fn init_pointer_base(ns: PyObjectRef) {
 fn pointer_set_type(args: &[PyObjectRef]) -> PyResult {
     if args.len() < 2 || !unsafe { pyre_object::is_type(args[0]) && pyre_object::is_type(args[1]) }
     {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "set_type() requires a ctypes type",
         ));
     }
@@ -456,22 +485,22 @@ fn pointer_set_type(args: &[PyObjectRef]) -> PyResult {
 // ── metaclass `__new__` ────────────────────────────────────────────────
 
 fn csimpletype_new(args: &[PyObjectRef]) -> PyResult {
-    crate::builtins::type_descr_new(args)
+    pyre_interpreter::builtins::type_descr_new(args)
 }
 
 fn cstructtype_new(args: &[PyObjectRef]) -> PyResult {
-    crate::builtins::type_descr_new(args)
+    pyre_interpreter::builtins::type_descr_new(args)
 }
 
 fn cuniontype_new(args: &[PyObjectRef]) -> PyResult {
-    crate::builtins::type_descr_new(args)
+    pyre_interpreter::builtins::type_descr_new(args)
 }
 
 const META_INITIALIZED_KEY: &str = "_ctypes_stginfo_initialized";
 
 fn metaclass_init(args: &[PyObjectRef], initialize: fn(PyObjectRef) -> PyResult) -> PyResult {
     if args.len() < 4 {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "metaclass __init__ expects name, bases and namespace",
         ));
     }
@@ -479,10 +508,12 @@ fn metaclass_init(args: &[PyObjectRef], initialize: fn(PyObjectRef) -> PyResult)
         .first()
         .copied()
         .filter(|&obj| unsafe { pyre_object::is_type(obj) })
-        .ok_or_else(|| crate::PyError::type_error("metaclass __init__ requires a type"))?;
+        .ok_or_else(|| {
+            pyre_interpreter::PyError::type_error("metaclass __init__ requires a type")
+        })?;
     if own_dict_get(cls, META_INITIALIZED_KEY).is_some() {
-        return Err(crate::PyError::new(
-            crate::PyErrorKind::SystemError,
+        return Err(pyre_interpreter::PyError::new(
+            pyre_interpreter::PyErrorKind::SystemError,
             "already initialized",
         ));
     }
@@ -580,7 +611,7 @@ fn simple_init_stginfo(cls: PyObjectRef) -> PyResult {
         let bases = unsafe { pyre_object::typeobject::w_type_get_bases(cls) };
         let name = unsafe { pyre_object::typeobject::w_type_get_name(cls) };
         let w_name = pyre_object::w_str_new(name);
-        let swapped = crate::call::type_call_instantiate(
+        let swapped = pyre_interpreter::call::type_call_instantiate(
             pycsimpletype_type(),
             &[w_name, bases, roots.get(ns_slot)],
         )?;
@@ -625,7 +656,7 @@ fn first_base_stginfo(cls: PyObjectRef) -> Option<PyObjectRef> {
 }
 
 fn usize_attr(cls: PyObjectRef, name: &str, default: usize) -> usize {
-    match unsafe { crate::baseobjspace::lookup_in_type(cls, name) } {
+    match unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, name) } {
         Some(o) if unsafe { pyre_object::is_int(o) } => {
             (unsafe { pyre_object::w_int_get_value(o) }).max(0) as usize
         }
@@ -633,38 +664,38 @@ fn usize_attr(cls: PyObjectRef, name: &str, default: usize) -> usize {
     }
 }
 
-fn align_attr(cls: PyObjectRef) -> Result<usize, crate::PyError> {
-    match unsafe { crate::baseobjspace::lookup_in_type(cls, "_align_") } {
+fn align_attr(cls: PyObjectRef) -> Result<usize, pyre_interpreter::PyError> {
+    match unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_align_") } {
         Some(o) if unsafe { pyre_object::is_int(o) } => {
             let value = unsafe { pyre_object::w_int_get_value(o) };
             if value < 0 {
-                Err(crate::PyError::value_error(
+                Err(pyre_interpreter::PyError::value_error(
                     "_align_ must be a non-negative integer",
                 ))
             } else {
                 Ok((value as usize).max(1))
             }
         }
-        Some(_) => Err(crate::PyError::value_error(
+        Some(_) => Err(pyre_interpreter::PyError::value_error(
             "_align_ must be a non-negative integer",
         )),
         None => Ok(1),
     }
 }
 
-fn anonymous_names(cls: PyObjectRef) -> Result<Vec<String>, crate::PyError> {
-    let Some(value) = crate::type_dict_lookup(cls, "_anonymous_") else {
+fn anonymous_names(cls: PyObjectRef) -> Result<Vec<String>, pyre_interpreter::PyError> {
+    let Some(value) = pyre_interpreter::type_dict_lookup(cls, "_anonymous_") else {
         return Ok(Vec::new());
     };
     let items = seq_items(value)
-        .ok_or_else(|| crate::PyError::type_error("_anonymous_ must be a sequence"))?;
+        .ok_or_else(|| pyre_interpreter::PyError::type_error("_anonymous_ must be a sequence"))?;
     items
         .into_iter()
         .map(|item| {
             if unsafe { pyre_object::is_str(item) } {
                 Ok(unsafe { pyre_object::w_str_get_value(item) }.to_string())
             } else {
-                Err(crate::PyError::type_error(
+                Err(pyre_interpreter::PyError::type_error(
                     "_anonymous_ items must be strings",
                 ))
             }
@@ -679,16 +710,20 @@ fn promote_anonymous_fields(
     cls: PyObjectRef,
     proto: PyObjectRef,
     base_offset: usize,
-) -> Result<(), crate::PyError> {
+) -> Result<(), pyre_interpreter::PyError> {
     let anonymous = anonymous_names(proto)?;
-    let fields = unsafe { crate::baseobjspace::lookup_in_type(proto, "_fields_") }
-        .ok_or_else(|| crate::PyError::attribute_error("anonymous field has no _fields_"))?;
+    let fields = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(proto, "_fields_") }
+        .ok_or_else(|| {
+            pyre_interpreter::PyError::attribute_error("anonymous field has no _fields_")
+        })?;
     for entry in field_entries(fields)? {
         let name = entry.name;
         let child_proto = entry.ty;
-        let child =
-            unsafe { crate::baseobjspace::lookup_in_type(proto, &name) }.ok_or_else(|| {
-                crate::PyError::attribute_error(format!("type has no attribute '{name}'"))
+        let child = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(proto, &name) }
+            .ok_or_else(|| {
+                pyre_interpreter::PyError::attribute_error(format!(
+                    "type has no attribute '{name}'"
+                ))
             })?;
         let offset = base_offset + cf_usize(child, "offset");
         if anonymous.iter().any(|anon| anon == &name) {
@@ -708,11 +743,11 @@ fn promote_anonymous_fields(
             let roots = pyre_object::gc_roots::push_roots();
             let promoted = roots.pin_root(promoted);
             let d_slot = roots.base() + 1;
-            let _ = roots.pin_root(crate::baseobjspace::getdict_native(promoted));
+            let _ = roots.pin_root(pyre_interpreter::baseobjspace::getdict_native(promoted));
             unsafe {
                 for key in ["size", "bit_size", "bit_offset", "is_bitfield"] {
                     if let Some(value) = pyre_object::w_dict_getitem_str(
-                        crate::baseobjspace::getdict_native(child),
+                        pyre_interpreter::baseobjspace::getdict_native(child),
                         key,
                     ) {
                         pyre_object::w_dict_setitem_str(roots.get(d_slot), key, value);
@@ -733,34 +768,37 @@ struct FieldEntry {
 
 /// Parse `_fields_` into the same `(name, ctype[, bits])` records consumed by
 /// CPython/PyPy's aggregate layout builder.
-fn field_entries(fields: PyObjectRef) -> Result<Vec<FieldEntry>, crate::PyError> {
-    let items = seq_items(fields)
-        .ok_or_else(|| crate::PyError::type_error("_fields_ must be a sequence of 2-tuples"))?;
+fn field_entries(fields: PyObjectRef) -> Result<Vec<FieldEntry>, pyre_interpreter::PyError> {
+    let items = seq_items(fields).ok_or_else(|| {
+        pyre_interpreter::PyError::type_error("_fields_ must be a sequence of 2-tuples")
+    })?;
     let mut out = Vec::with_capacity(items.len());
     for it in items {
         if !unsafe { pyre_object::is_tuple(it) } {
-            return Err(crate::PyError::type_error(
+            return Err(pyre_interpreter::PyError::type_error(
                 "_fields_ entries must be tuples",
             ));
         }
         let n = unsafe { pyre_object::w_tuple_len(it) };
         if n < 2 {
-            return Err(crate::PyError::type_error(
+            return Err(pyre_interpreter::PyError::type_error(
                 "_fields_ entries must be (name, type) pairs",
             ));
         }
         if n > 3 {
-            return Err(crate::PyError::type_error(
+            return Err(pyre_interpreter::PyError::type_error(
                 "_fields_ entries must be (name, type) or (name, type, bits)",
             ));
         }
         let name = unsafe { pyre_object::w_tuple_getitem(it, 0) }.unwrap_or(pyre_object::PY_NULL);
         let ty = unsafe { pyre_object::w_tuple_getitem(it, 1) }.unwrap_or(pyre_object::PY_NULL);
         if name.is_null() || !unsafe { pyre_object::is_str(name) } {
-            return Err(crate::PyError::type_error("field name must be a string"));
+            return Err(pyre_interpreter::PyError::type_error(
+                "field name must be a string",
+            ));
         }
         if ty.is_null() || !unsafe { pyre_object::is_type(ty) } {
-            return Err(crate::PyError::type_error(
+            return Err(pyre_interpreter::PyError::type_error(
                 "field type must be a ctypes type",
             ));
         }
@@ -771,22 +809,24 @@ fn field_entries(fields: PyObjectRef) -> Result<Vec<FieldEntry>, crate::PyError>
             if value.is_null()
                 || !unsafe { pyre_object::is_int(value) || pyre_object::is_long(value) }
             {
-                return Err(crate::PyError::type_error("bit width must be an integer"));
+                return Err(pyre_interpreter::PyError::type_error(
+                    "bit width must be an integer",
+                ));
             }
             let tc = cdata::type_code_of(ty).unwrap_or_default();
             if !matches!(
                 tc.as_str(),
                 "b" | "B" | "h" | "H" | "i" | "I" | "l" | "L" | "q" | "Q" | "?"
             ) {
-                return Err(crate::PyError::type_error(format!(
+                return Err(pyre_interpreter::PyError::type_error(format!(
                     "bit fields not allowed for type {}",
                     type_name(ty),
                 )));
             }
             let size = stginfo::field_size_of(ty).unwrap_or(0);
-            let width = crate::baseobjspace::int_w(value).unwrap_or(-1);
+            let width = pyre_interpreter::baseobjspace::int_w(value).unwrap_or(-1);
             if width <= 0 || width as usize > size.saturating_mul(8) {
-                return Err(crate::PyError::value_error(format!(
+                return Err(pyre_interpreter::PyError::value_error(format!(
                     "number of bits invalid for bit field '{name}'",
                 )));
             }
@@ -837,8 +877,8 @@ fn mark_type_final(ty: PyObjectRef, size: usize, align: usize) {
 fn struct_union_init_stginfo(cls: PyObjectRef, is_union: bool) -> PyResult {
     // `_fields_` directly in the new class dict → process it; else clone the
     // first base's StgInfo (or a default).
-    let own_fields =
-        crate::type_dict_lookup(cls, "_fields_").filter(|&f| !unsafe { pyre_object::is_none(f) });
+    let own_fields = pyre_interpreter::type_dict_lookup(cls, "_fields_")
+        .filter(|&f| !unsafe { pyre_object::is_none(f) });
     match own_fields {
         Some(fields) => process_fields(cls, fields, is_union),
         None => {
@@ -887,26 +927,26 @@ fn process_fields(cls: PyObjectRef, fields: PyObjectRef, is_union: bool) -> PyRe
 
     for name in &anonymous {
         let Some(entry) = entries.iter().find(|entry| &entry.name == name) else {
-            return Err(crate::PyError::attribute_error(format!(
+            return Err(pyre_interpreter::PyError::attribute_error(format!(
                 "'{name}' is specified in _anonymous_ but not in _fields_"
             )));
         };
         if !matches!(proto_kind(entry.ty), ParamFunc::Struct | ParamFunc::Union) {
-            return Err(crate::PyError::type_error(
+            return Err(pyre_interpreter::PyError::type_error(
                 "anonymous field must be a structure or union",
             ));
         }
     }
 
     let is_swapped =
-        unsafe { crate::baseobjspace::lookup_in_type(cls, "_swappedbytes_") }.is_some();
+        unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_swappedbytes_") }.is_some();
     let pack = usize_attr(cls, "_pack_", 0);
     let forced = align_attr(cls)?;
     if pack > 0
         && !cfg!(windows)
-        && unsafe { crate::baseobjspace::lookup_in_type(cls, "_layout_") }.is_none()
+        && unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_layout_") }.is_none()
     {
-        crate::warn::warn_deprecation(
+        pyre_interpreter::warn::warn_deprecation(
             "_pack_ without explicit _layout_ uses deprecated MSVC layout",
         )?;
     }
@@ -918,7 +958,7 @@ fn process_fields(cls: PyObjectRef, fields: PyObjectRef, is_union: bool) -> PyRe
     if stginfo::stginfo_of(cls).is_some_and(stginfo::stginfo_is_final)
         || entries.iter().any(|entry| entry.ty == cls)
     {
-        return Err(crate::PyError::attribute_error(
+        return Err(pyre_interpreter::PyError::attribute_error(
             "Structure or union cannot contain itself",
         ));
     }
@@ -954,12 +994,13 @@ fn process_fields(cls: PyObjectRef, fields: PyObjectRef, is_union: bool) -> PyRe
                 || cdata::type_code_of(ftype)
                     .is_some_and(|code| matches!(code.as_str(), "u" | "P" | "z" | "Z" | "O")))
         {
-            return Err(crate::PyError::type_error(format!(
+            return Err(pyre_interpreter::PyError::type_error(format!(
                 "This type does not support other endian: {name}",
             )));
         }
-        let size = stginfo::field_size_of(ftype)
-            .ok_or_else(|| crate::PyError::type_error(format!("field '{name}' has no size")))?;
+        let size = stginfo::field_size_of(ftype).ok_or_else(|| {
+            pyre_interpreter::PyError::type_error(format!("field '{name}' has no size"))
+        })?;
         let align = stginfo::field_align_of(ftype).unwrap_or(1).max(1);
         let eff = if pack > 0 { pack.min(align) } else { align };
         max_align = max_align.max(eff);
@@ -1035,7 +1076,7 @@ fn process_fields(cls: PyObjectRef, fields: PyObjectRef, is_union: bool) -> PyRe
         let roots = pyre_object::gc_roots::push_roots();
         let cf = roots.pin_root(cf);
         let d_slot = roots.base() + 1;
-        let _ = roots.pin_root(crate::baseobjspace::getdict_native(cf));
+        let _ = roots.pin_root(pyre_interpreter::baseobjspace::getdict_native(cf));
         let put = |key: &str, value: PyObjectRef| {
             // SAFETY: the slot holds the descriptor dict pinned above.
             unsafe { pyre_object::w_dict_setitem_str(roots.get(d_slot), key, value) };
@@ -1104,22 +1145,22 @@ fn meta_mul(args: &[PyObjectRef]) -> PyResult {
     let cls = args[0];
     let count = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
     if count.is_null() || !unsafe { pyre_object::is_int(count) || pyre_object::is_long(count) } {
-        return Err(crate::PyError::not_implemented(
+        return Err(pyre_interpreter::PyError::not_implemented(
             "array length must be an int",
         ));
     }
     if unsafe { pyre_object::is_long(count) } {
         let big = unsafe { pyre_object::longobject::w_long_get_value(count) };
         if big.get_sign() < 0 {
-            return Err(crate::PyError::value_error(
+            return Err(pyre_interpreter::PyError::value_error(
                 "array length must not be negative",
             ));
         }
-        return Err(crate::PyError::overflow_error("array too large"));
+        return Err(pyre_interpreter::PyError::overflow_error("array too large"));
     }
     let n = unsafe { pyre_object::w_int_get_value(count) };
     if n < 0 {
-        return Err(crate::PyError::value_error(format!(
+        return Err(pyre_interpreter::PyError::value_error(format!(
             "Array length must be >= 0, not {n}"
         )));
     }
@@ -1140,12 +1181,12 @@ fn meta_from_param(args: &[PyObjectRef]) -> PyResult {
 /// `%R must have storage info`: `ctype_get_pointer_type` and
 /// `ctype_set_pointer_type` open with this refusal, and the setter is what
 /// serves a delete.
-fn no_storage_info(cls: PyObjectRef) -> crate::PyError {
-    let rendered = match unsafe { crate::display::py_repr_wtf8(cls) } {
+fn no_storage_info(cls: PyObjectRef) -> pyre_interpreter::PyError {
+    let rendered = match unsafe { pyre_interpreter::display::py_repr_wtf8(cls) } {
         Ok(rendered) => rendered,
         Err(error) => return error,
     };
-    crate::PyError::type_error(crate::display::wtf8_format!(
+    pyre_interpreter::PyError::type_error(pyre_interpreter::display::wtf8_format!(
         rendered,
         " must have storage info"
     ))
@@ -1162,9 +1203,9 @@ fn pointer_type_get(args: &[PyObjectRef]) -> PyResult {
     if let Some(pt) = stginfo::stginfo_pointer_type(info) {
         return Ok(pt);
     }
-    let rendered = unsafe { crate::display::py_repr_wtf8(cls) }?;
-    Err(crate::PyError::attribute_error(
-        crate::display::wtf8_format!(rendered, " has no attribute '__pointer_type__'"),
+    let rendered = unsafe { pyre_interpreter::display::py_repr_wtf8(cls) }?;
+    Err(pyre_interpreter::PyError::attribute_error(
+        pyre_interpreter::display::wtf8_format!(rendered, " has no attribute '__pointer_type__'"),
     ))
 }
 
@@ -1198,21 +1239,23 @@ fn pointer_type_set(args: &[PyObjectRef]) -> PyResult {
 
 fn fields_get(args: &[PyObjectRef]) -> PyResult {
     let cls = args[1];
-    unsafe { crate::baseobjspace::lookup_in_type(cls, "_fields_") }
+    unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_fields_") }
         .filter(|&f| !f.is_null())
-        .ok_or_else(|| crate::PyError::attribute_error("_fields_"))
+        .ok_or_else(|| pyre_interpreter::PyError::attribute_error("_fields_"))
 }
 
 fn fields_set(args: &[PyObjectRef]) -> PyResult {
     let cls = args[1];
     let value = args[2];
     let Some(info) = stginfo::stginfo_of(cls) else {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "ctypes state is not initialized",
         ));
     };
     if stginfo::stginfo_is_final(info) {
-        return Err(crate::PyError::attribute_error("_fields_ is final"));
+        return Err(pyre_interpreter::PyError::attribute_error(
+            "_fields_ is final",
+        ));
     }
     let is_union = stginfo::stginfo_paramfunc(info) == ParamFunc::Union;
     process_fields(cls, value, is_union)
@@ -1238,7 +1281,7 @@ fn cfield_new(
     let inst = roots.pin_root(inst);
     // The dict lands in the slot after `inst`.
     let d_slot = roots.base() + 1;
-    let _ = roots.pin_root(crate::baseobjspace::getdict_native(inst));
+    let _ = roots.pin_root(pyre_interpreter::baseobjspace::getdict_native(inst));
     let put = |key: &str, value: PyObjectRef| {
         // SAFETY: the slot holds the instance dict pinned above.
         unsafe { pyre_object::w_dict_setitem_str(roots.get(d_slot), key, value) };
@@ -1260,8 +1303,10 @@ fn cfield_new(
 }
 
 fn cf_obj(cfield: PyObjectRef, key: &str) -> PyObjectRef {
-    unsafe { pyre_object::w_dict_getitem_str(crate::baseobjspace::getdict_native(cfield), key) }
-        .unwrap_or(pyre_object::PY_NULL)
+    unsafe {
+        pyre_object::w_dict_getitem_str(pyre_interpreter::baseobjspace::getdict_native(cfield), key)
+    }
+    .unwrap_or(pyre_object::PY_NULL)
 }
 
 fn cf_usize(cfield: PyObjectRef, key: &str) -> usize {
@@ -1275,7 +1320,7 @@ fn cf_usize(cfield: PyObjectRef, key: &str) -> usize {
 
 fn cf_bool(cfield: PyObjectRef, key: &str) -> bool {
     let value = cf_obj(cfield, key);
-    !value.is_null() && crate::baseobjspace::is_true(value).unwrap_or(false)
+    !value.is_null() && pyre_interpreter::baseobjspace::is_true(value).unwrap_or(false)
 }
 
 fn bytes_to_native_uint(bytes: &[u8]) -> u64 {
@@ -1326,8 +1371,9 @@ fn field_needs_swap(obj: PyObjectRef, proto: PyObjectRef, size: usize) -> bool {
         return false;
     }
     let oc = unsafe { pyre_object::w_instance_get_type(obj) };
-    unsafe { crate::baseobjspace::lookup_in_type(oc, "_swappedbytes_") }.is_some()
-        || unsafe { crate::baseobjspace::lookup_in_type(proto, "_swappedbytes_") }.is_some()
+    unsafe { pyre_interpreter::baseobjspace::lookup_in_type(oc, "_swappedbytes_") }.is_some()
+        || unsafe { pyre_interpreter::baseobjspace::lookup_in_type(proto, "_swappedbytes_") }
+            .is_some()
 }
 
 fn cfield_get(args: &[PyObjectRef]) -> PyResult {
@@ -1338,7 +1384,9 @@ fn cfield_get(args: &[PyObjectRef]) -> PyResult {
         return Ok(cfield);
     }
     if !cdata::is_cdata_instance(obj) {
-        return Err(crate::PyError::type_error("not a ctypes instance"));
+        return Err(pyre_interpreter::PyError::type_error(
+            "not a ctypes instance",
+        ));
     }
     let proto = cf_obj(cfield, "proto");
     let offset = cf_usize(cfield, "offset");
@@ -1348,9 +1396,9 @@ fn cfield_get(args: &[PyObjectRef]) -> PyResult {
     match proto_kind(proto) {
         ParamFunc::Simple => {
             let tc = cdata::type_code_of(proto)
-                .ok_or_else(|| crate::PyError::type_error("field has no '_type_'"))?;
+                .ok_or_else(|| pyre_interpreter::PyError::type_error("field has no '_type_'"))?;
             let all = cdata::cdata_bytes(obj)
-                .ok_or_else(|| crate::PyError::type_error("instance has no buffer"))?;
+                .ok_or_else(|| pyre_interpreter::PyError::type_error("instance has no buffer"))?;
             let start = offset.min(all.len());
             let end = (offset + size).min(all.len());
             let mut field_bytes = all[start..end].to_vec();
@@ -1381,7 +1429,7 @@ fn cfield_get(args: &[PyObjectRef]) -> PyResult {
         ParamFunc::Array => {
             let element = stginfo::stginfo_of(proto).and_then(stginfo::stginfo_proto);
             let all = cdata::cdata_bytes(obj)
-                .ok_or_else(|| crate::PyError::type_error("instance has no buffer"))?;
+                .ok_or_else(|| pyre_interpreter::PyError::type_error("instance has no buffer"))?;
             let start = offset.min(all.len());
             let end = (offset + size).min(all.len());
             let field = &all[start..end];
@@ -1399,7 +1447,9 @@ fn cfield_get(args: &[PyObjectRef]) -> PyResult {
         ParamFunc::Struct | ParamFunc::Union | ParamFunc::Pointer => {
             Ok(cdata::make_indexed_subview(proto, obj, offset, size, index))
         }
-        _ => Err(crate::PyError::type_error("field type has no storage info")),
+        _ => Err(pyre_interpreter::PyError::type_error(
+            "field type has no storage info",
+        )),
     }
 }
 
@@ -1408,7 +1458,9 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
     let obj = args[1];
     let value = args[2];
     if !cdata::is_cdata_instance(obj) {
-        return Err(crate::PyError::type_error("not a ctypes instance"));
+        return Err(pyre_interpreter::PyError::type_error(
+            "not a ctypes instance",
+        ));
     }
     let proto = cf_obj(cfield, "proto");
     let offset = cf_usize(cfield, "offset");
@@ -1418,7 +1470,7 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
     match proto_kind(proto) {
         ParamFunc::Simple => {
             let tc = cdata::type_code_of(proto)
-                .ok_or_else(|| crate::PyError::type_error("field has no '_type_'"))?;
+                .ok_or_else(|| pyre_interpreter::PyError::type_error("field has no '_type_'"))?;
             if cf_bool(cfield, "is_bitfield") {
                 let bits = cf_usize(cfield, "bit_size");
                 let shift = cf_usize(cfield, "bit_offset");
@@ -1427,7 +1479,7 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
                 } else {
                     (1u64 << bits) - 1
                 };
-                let integer = crate::baseobjspace::int_w(value)? as u64;
+                let integer = pyre_interpreter::baseobjspace::int_w(value)? as u64;
                 let mut storage = cdata::cdata_bytes(obj)
                     .unwrap_or(&[])
                     .get(offset..offset.saturating_add(size))
@@ -1468,7 +1520,7 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
                 cdata::cdata_write(obj, offset, &vec![0; size]);
                 return Ok(pyre_object::w_none());
             }
-            let direct = unsafe { crate::baseobjspace::isinstance_w(value, proto) };
+            let direct = unsafe { pyre_interpreter::baseobjspace::isinstance_w(value, proto) };
             let expected = stginfo::stginfo_of(proto).and_then(stginfo::stginfo_proto);
             let array_decay = if cdata::is_cdata_instance(value) {
                 let value_cls = unsafe { pyre_object::w_instance_get_type(value) };
@@ -1483,14 +1535,14 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
                 cdata::cdata_bytes(value).unwrap_or(&[]).to_vec()
             } else if array_decay {
                 let addr = cdata::cdata_addr(value)
-                    .ok_or_else(|| crate::PyError::type_error("incompatible types"))?;
+                    .ok_or_else(|| pyre_interpreter::PyError::type_error("incompatible types"))?;
                 host_ctypes::simple_storage_value_to_bytes_endian(
                     "P",
                     host_ctypes::SimpleStorageValue::Pointer(addr),
                     false,
                 )
             } else {
-                return Err(crate::PyError::type_error("incompatible types"));
+                return Err(pyre_interpreter::PyError::type_error("incompatible types"));
             };
             cdata::cdata_write(obj, offset, &bytes[..size.min(bytes.len())]);
             let keep = if array_decay {
@@ -1505,11 +1557,13 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
             let element = stginfo::stginfo_of(proto).and_then(stginfo::stginfo_proto);
             match element.and_then(cdata::type_code_of).as_deref() {
                 Some("c") => {
-                    let source = crate::typedef::buffer_as_bytes_like(value)?
-                        .ok_or_else(|| crate::PyError::type_error("bytes-like object expected"))?;
+                    let source = pyre_interpreter::typedef::buffer_as_bytes_like(value)?
+                        .ok_or_else(|| {
+                            pyre_interpreter::PyError::type_error("bytes-like object expected")
+                        })?;
                     let bytes = unsafe { pyre_object::bytesobject::bytes_like_data(source) };
                     if bytes.len() > size {
-                        return Err(crate::PyError::value_error("bytes too long"));
+                        return Err(pyre_interpreter::PyError::value_error("bytes too long"));
                     }
                     // PyCField_set: a character-array field is assigned with
                     // string semantics, so bytes beyond the first NUL do not
@@ -1523,7 +1577,9 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
                 }
                 Some("u") => {
                     if !unsafe { pyre_object::is_str(value) } {
-                        return Err(crate::PyError::type_error("unicode string expected"));
+                        return Err(pyre_interpreter::PyError::type_error(
+                            "unicode string expected",
+                        ));
                     }
                     let mut field = cdata::cdata_bytes(obj)
                         .unwrap_or(&[])
@@ -1534,20 +1590,22 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
                     host_ctypes::write_wchar_array_value(&mut field, unsafe {
                         pyre_object::w_str_get_wtf8(value)
                     })
-                    .map_err(|_| crate::PyError::value_error("string too long"))?;
+                    .map_err(|_| pyre_interpreter::PyError::value_error("string too long"))?;
                     cdata::cdata_write(obj, offset, &field);
                     Ok(pyre_object::w_none())
                 }
                 _ => {
-                    let array_value = if unsafe { crate::baseobjspace::isinstance_w(value, proto) }
-                    {
+                    let array_value = if unsafe {
+                        pyre_interpreter::baseobjspace::isinstance_w(value, proto)
+                    } {
                         value
                     } else if unsafe { pyre_object::is_tuple(value) } {
                         let values = seq_items(value).unwrap_or_default();
-                        crate::call::type_call_instantiate(proto, &values)
-                            .map_err(|error| crate::PyError::runtime_error(error.message))?
+                        pyre_interpreter::call::type_call_instantiate(proto, &values).map_err(
+                            |error| pyre_interpreter::PyError::runtime_error(error.message),
+                        )?
                     } else {
-                        return Err(crate::PyError::type_error("incompatible types"));
+                        return Err(pyre_interpreter::PyError::type_error("incompatible types"));
                     };
                     let source = cdata::cdata_bytes(array_value).unwrap_or(&[]).to_vec();
                     cdata::cdata_write(obj, offset, &source[..source.len().min(size)]);
@@ -1562,8 +1620,8 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
         }
         // Structures and unions are copied by value.
         ParamFunc::Struct | ParamFunc::Union => {
-            if !unsafe { crate::baseobjspace::isinstance_w(value, proto) } {
-                return Err(crate::PyError::type_error("incompatible types"));
+            if !unsafe { pyre_interpreter::baseobjspace::isinstance_w(value, proto) } {
+                return Err(pyre_interpreter::PyError::type_error("incompatible types"));
             }
             // Snapshot the source: `s.f = s.f` aliases the destination buffer,
             // and `cdata_write`'s `copy_from_slice` assumes non-overlap.
@@ -1573,7 +1631,7 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
             cdata::keep_ref(obj, &index.to_string(), cdata::objects_for_keep(value));
             Ok(pyre_object::w_none())
         }
-        _ => Err(crate::PyError::type_error(
+        _ => Err(pyre_interpreter::PyError::type_error(
             "assignment to this field type is not supported in this slice",
         )),
     }
@@ -1597,9 +1655,9 @@ fn cfield_repr(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn cfield_new_internal(args: &[PyObjectRef]) -> PyResult {
-    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let (pos, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
     let get = |name: &str, position: usize| {
-        crate::builtins::resolve_pos_or_kw(
+        pyre_interpreter::builtins::resolve_pos_or_kw(
             pos.get(position).copied(),
             kwargs,
             name,
@@ -1608,33 +1666,37 @@ fn cfield_new_internal(args: &[PyObjectRef]) -> PyResult {
         )
     };
     let internal = get("_internal_use", 6)?
-        .is_some_and(|value| crate::baseobjspace::is_true(value).unwrap_or(false));
+        .is_some_and(|value| pyre_interpreter::baseobjspace::is_true(value).unwrap_or(false));
     if !internal {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "CField is not intended to be used directly",
         ));
     }
-    let name_obj = get("name", 1)?.ok_or_else(|| crate::PyError::type_error("missing name"))?;
-    let proto = get("type", 2)?.ok_or_else(|| crate::PyError::type_error("missing type"))?;
+    let name_obj =
+        get("name", 1)?.ok_or_else(|| pyre_interpreter::PyError::type_error("missing name"))?;
+    let proto =
+        get("type", 2)?.ok_or_else(|| pyre_interpreter::PyError::type_error("missing type"))?;
     let byte_size = get("byte_size", 3)?
-        .map(crate::baseobjspace::int_w)
+        .map(pyre_interpreter::baseobjspace::int_w)
         .transpose()?
-        .ok_or_else(|| crate::PyError::type_error("missing byte_size"))?;
+        .ok_or_else(|| pyre_interpreter::PyError::type_error("missing byte_size"))?;
     let byte_offset = get("byte_offset", 4)?
-        .map(crate::baseobjspace::int_w)
+        .map(pyre_interpreter::baseobjspace::int_w)
         .transpose()?
         .unwrap_or(0);
     let index = get("index", 5)?
-        .map(crate::baseobjspace::int_w)
+        .map(pyre_interpreter::baseobjspace::int_w)
         .transpose()?
         .unwrap_or(0);
     if !unsafe { pyre_object::is_str(name_obj) } || !unsafe { pyre_object::is_type(proto) } {
-        return Err(crate::PyError::type_error("invalid CField arguments"));
+        return Err(pyre_interpreter::PyError::type_error(
+            "invalid CField arguments",
+        ));
     }
     let expected = stginfo::field_size_of(proto)
-        .ok_or_else(|| crate::PyError::type_error("type has no size"))?;
+        .ok_or_else(|| pyre_interpreter::PyError::type_error("type has no size"))?;
     if byte_size < 0 || byte_size as usize != expected {
-        return Err(crate::PyError::value_error(
+        return Err(pyre_interpreter::PyError::value_error(
             "byte_size does not match type size",
         ));
     }
@@ -1650,15 +1712,15 @@ fn cfield_new_internal(args: &[PyObjectRef]) -> PyResult {
     let field_roots = pyre_object::gc_roots::push_roots();
     let field = field_roots.pin_root(field);
     let bit_size = get("bit_size", 7)?
-        .map(crate::baseobjspace::int_w)
+        .map(pyre_interpreter::baseobjspace::int_w)
         .transpose()?;
     let bit_offset = get("bit_offset", 8)?
-        .map(crate::baseobjspace::int_w)
+        .map(pyre_interpreter::baseobjspace::int_w)
         .transpose()?
         .unwrap_or(0);
     if let Some(bits) = bit_size {
         if bits <= 0 || bit_offset < 0 || bit_offset + bits > byte_size * 8 {
-            return Err(crate::PyError::value_error(format!(
+            return Err(pyre_interpreter::PyError::value_error(format!(
                 "bit field '{}' overflows its type ({} + {} > {})",
                 unsafe { pyre_object::w_str_get_value(name_obj) },
                 bit_offset,
@@ -1671,7 +1733,7 @@ fn cfield_new_internal(args: &[PyObjectRef]) -> PyResult {
         // the value already built.
         let roots = pyre_object::gc_roots::push_roots();
         let d_slot = roots.base();
-        let _ = roots.pin_root(crate::baseobjspace::getdict_native(field));
+        let _ = roots.pin_root(pyre_interpreter::baseobjspace::getdict_native(field));
         let put = |key: &str, value: PyObjectRef| {
             // SAFETY: the slot holds the field dict pinned above.
             unsafe { pyre_object::w_dict_setitem_str(roots.get(d_slot), key, value) };
@@ -1687,22 +1749,24 @@ fn cfield_new_internal(args: &[PyObjectRef]) -> PyResult {
 
 fn structure_new(args: &[PyObjectRef]) -> PyResult {
     if args.is_empty() || !unsafe { pyre_object::is_type(args[0]) } {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "Structure.__new__ requires a type",
         ));
     }
     let cls = args[0];
-    if unsafe { crate::baseobjspace::lookup_in_type(cls, "_abstract_") }.is_some() {
-        return Err(crate::PyError::type_error("abstract class"));
+    if unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_abstract_") }.is_some() {
+        return Err(pyre_interpreter::PyError::type_error("abstract class"));
     }
-    let info =
-        stginfo::stginfo_of(cls).ok_or_else(|| crate::PyError::type_error("abstract class"))?;
+    let info = stginfo::stginfo_of(cls)
+        .ok_or_else(|| pyre_interpreter::PyError::type_error("abstract class"))?;
     let size = stginfo::stginfo_size(info);
     stginfo::stginfo_mark_final(info);
     let obj = pyre_object::w_instance_new(cls);
-    let d = crate::baseobjspace::getdict_native(obj);
+    let d = pyre_interpreter::baseobjspace::getdict_native(obj);
     if d.is_null() {
-        return Err(crate::PyError::type_error("ctypes instance has no dict"));
+        return Err(pyre_interpreter::PyError::type_error(
+            "ctypes instance has no dict",
+        ));
     }
     // The instance `dict` moves and the buffer allocates, so the buffer is
     // built first and the dict word is read back out of a root slot for the
@@ -1720,7 +1784,7 @@ fn structure_new(args: &[PyObjectRef]) -> PyResult {
 fn field_names_base_first(cls: PyObjectRef) -> Vec<String> {
     let mut names = Vec::new();
     for &t in mro_items(cls).iter().rev() {
-        if let Some(f) = crate::type_dict_lookup(t, "_fields_")
+        if let Some(f) = pyre_interpreter::type_dict_lookup(t, "_fields_")
             && let Ok(entries) = field_entries(f)
         {
             names.extend(entries.into_iter().map(|entry| entry.name));
@@ -1731,7 +1795,9 @@ fn field_names_base_first(cls: PyObjectRef) -> Vec<String> {
 
 fn structure_init(args: &[PyObjectRef]) -> PyResult {
     if args.is_empty() {
-        return Err(crate::PyError::type_error("__init__ requires self"));
+        return Err(pyre_interpreter::PyError::type_error(
+            "__init__ requires self",
+        ));
     }
     // The argument slice is the caller's own native array, which no root
     // walker updates, so an initialiser that moves is named by its pre-move
@@ -1743,7 +1809,7 @@ fn structure_init(args: &[PyObjectRef]) -> PyResult {
         let _ = roots.pin_root(arg);
     }
     let obj = args[0];
-    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
+    let (pos, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(&args[1..]);
     let pos_len = pos.len();
     // The keyword carrier, when present, is the trailing argument.
     let kw_slot = kwargs.map(|_| args_slot + args.len() - 1);
@@ -1751,10 +1817,12 @@ fn structure_init(args: &[PyObjectRef]) -> PyResult {
     let names = field_names_base_first(cls);
 
     if pos_len > names.len() {
-        return Err(crate::PyError::type_error("too many initializers"));
+        return Err(pyre_interpreter::PyError::type_error(
+            "too many initializers",
+        ));
     }
     for i in 0..pos_len {
-        crate::baseobjspace::setattr_str(obj, &names[i], roots.get(args_slot + 1 + i))?;
+        pyre_interpreter::baseobjspace::setattr_str(obj, &names[i], roots.get(args_slot + 1 + i))?;
     }
 
     if let Some(kw_slot) = kw_slot {
@@ -1779,11 +1847,15 @@ fn structure_init(args: &[PyObjectRef]) -> PyResult {
             if let Some(pos_idx) = names.iter().position(|n| *n == key)
                 && pos_idx < pos_len
             {
-                return Err(crate::PyError::type_error(format!(
+                return Err(pyre_interpreter::PyError::type_error(format!(
                     "duplicate values for field '{key}'"
                 )));
             }
-            crate::baseobjspace::setattr_str(obj, &key, roots.get(items_slot + i * 2 + 1))?;
+            pyre_interpreter::baseobjspace::setattr_str(
+                obj,
+                &key,
+                roots.get(items_slot + i * 2 + 1),
+            )?;
         }
     }
     Ok(pyre_object::w_none())
@@ -1793,14 +1865,14 @@ fn structure_init(args: &[PyObjectRef]) -> PyResult {
 
 /// Read a key from `cls`'s **own** dict (never the MRO).
 fn own_dict_get(cls: PyObjectRef, key: &str) -> Option<PyObjectRef> {
-    crate::type_dict_lookup(cls, key)
+    pyre_interpreter::type_dict_lookup(cls, key)
 }
 
 /// Store a class attribute directly and invalidate the type cache for it.
 fn set_type_attr(cls: PyObjectRef, key: &str, value: PyObjectRef) {
-    if crate::type_dict_store(cls, key, value) {
+    if pyre_interpreter::type_dict_store(cls, key, value) {
         pyre_object::gc_hook::try_gc_write_barrier(cls as *mut u8);
-        unsafe { crate::baseobjspace::mutated(cls, Some(key)) };
+        unsafe { pyre_interpreter::baseobjspace::mutated(cls, Some(key)) };
     }
 }
 
@@ -1825,7 +1897,7 @@ fn type_name(cls: PyObjectRef) -> String {
 const ARRAY_TYPE_CACHE_KEY: &str = "_array_type_cache";
 
 fn carraytype_new(args: &[PyObjectRef]) -> PyResult {
-    crate::builtins::type_descr_new(args)
+    pyre_interpreter::builtins::type_descr_new(args)
 }
 
 fn carraytype_init(args: &[PyObjectRef]) -> PyResult {
@@ -1838,23 +1910,23 @@ fn array_init_stginfo(cls: PyObjectRef) -> PyResult {
     let length = match own_dict_get(cls, "_length_") {
         Some(v) => {
             if !unsafe { pyre_object::is_int(v) || pyre_object::is_long(v) } {
-                return Err(crate::PyError::type_error(
+                return Err(pyre_interpreter::PyError::type_error(
                     "The '_length_' attribute must be an integer",
                 ));
             }
             let n = if unsafe { pyre_object::is_long(v) } {
                 let big = unsafe { pyre_object::longobject::w_long_get_value(v) };
                 if big.get_sign() < 0 {
-                    return Err(crate::PyError::value_error(
+                    return Err(pyre_interpreter::PyError::value_error(
                         "The '_length_' attribute must not be negative",
                     ));
                 }
-                return Err(crate::PyError::overflow_error("array too large"));
+                return Err(pyre_interpreter::PyError::overflow_error("array too large"));
             } else {
                 unsafe { pyre_object::w_int_get_value(v) }
             };
             if n < 0 {
-                return Err(crate::PyError::value_error(
+                return Err(pyre_interpreter::PyError::value_error(
                     "The '_length_' attribute must not be negative",
                 ));
             }
@@ -1863,7 +1935,7 @@ fn array_init_stginfo(cls: PyObjectRef) -> PyResult {
         None => match first_base_stginfo(cls) {
             Some(bi) => stginfo::stginfo_length(bi),
             None => {
-                return Err(crate::PyError::attribute_error(
+                return Err(pyre_interpreter::PyError::attribute_error(
                     "class must define a '_length_' attribute",
                 ));
             }
@@ -1873,14 +1945,16 @@ fn array_init_stginfo(cls: PyObjectRef) -> PyResult {
     let elem = match own_dict_get(cls, "_type_") {
         Some(t) => {
             if !unsafe { pyre_object::is_type(t) } {
-                return Err(crate::PyError::type_error("_type_ must be a type"));
+                return Err(pyre_interpreter::PyError::type_error(
+                    "_type_ must be a type",
+                ));
             }
             t
         }
         None => match first_base_stginfo(cls).and_then(stginfo::stginfo_proto) {
             Some(p) => p,
             None => {
-                return Err(crate::PyError::attribute_error(
+                return Err(pyre_interpreter::PyError::attribute_error(
                     "class must define a '_type_' attribute",
                 ));
             }
@@ -1888,11 +1962,11 @@ fn array_init_stginfo(cls: PyObjectRef) -> PyResult {
     };
 
     let elem_size = stginfo::field_size_of(elem)
-        .ok_or_else(|| crate::PyError::type_error("_type_ must have storage info"))?;
+        .ok_or_else(|| pyre_interpreter::PyError::type_error("_type_ must have storage info"))?;
     let elem_align = stginfo::field_align_of(elem).unwrap_or(1).max(1);
     if elem_size != 0 && (length > usize::MAX / elem_size || elem_size * length > i64::MAX as usize)
     {
-        return Err(crate::PyError::overflow_error("array too large"));
+        return Err(pyre_interpreter::PyError::overflow_error("array too large"));
     }
 
     let mut data = StgInfoData::new(elem_size * length, elem_align, ParamFunc::Array);
@@ -1928,9 +2002,10 @@ fn array_type_from_ctype(elem: PyObjectRef, n: usize) -> PyResult {
     // back at every use.
     let roots = pyre_object::gc_roots::push_roots();
     let cache_slot = roots.base();
-    let cached = crate::type_dict_lookup(elem, ARRAY_TYPE_CACHE_KEY);
+    let cached = pyre_interpreter::type_dict_lookup(elem, ARRAY_TYPE_CACHE_KEY);
     let _ = roots.pin_root(cached.unwrap_or_else(pyre_object::w_dict_new));
-    if cached.is_none() && crate::type_dict_store(elem, ARRAY_TYPE_CACHE_KEY, roots.get(cache_slot))
+    if cached.is_none()
+        && pyre_interpreter::type_dict_store(elem, ARRAY_TYPE_CACHE_KEY, roots.get(cache_slot))
     {
         pyre_object::gc_hook::try_gc_write_barrier(elem as *mut u8);
     }
@@ -1948,7 +2023,7 @@ fn array_type_from_ctype(elem: PyObjectRef, n: usize) -> PyResult {
     }
     let bases = ns_roots.pin_root(pyre_object::w_tuple_new(vec![array_type()]));
     let w_name = ns_roots.pin_root(pyre_object::w_str_new_managed(&name));
-    let new_cls = crate::call::type_call_instantiate(
+    let new_cls = pyre_interpreter::call::type_call_instantiate(
         pycarraytype_type(),
         &[w_name, bases, ns_roots.get(ns_slot)],
     )?;
@@ -1963,12 +2038,12 @@ struct ArrayMeta {
     proto: PyObjectRef,
 }
 
-fn array_meta(obj: PyObjectRef) -> Result<ArrayMeta, crate::PyError> {
+fn array_meta(obj: PyObjectRef) -> Result<ArrayMeta, pyre_interpreter::PyError> {
     let cls = unsafe { pyre_object::w_instance_get_type(obj) };
-    let info =
-        stginfo::stginfo_of(cls).ok_or_else(|| crate::PyError::type_error("abstract class"))?;
-    let proto =
-        stginfo::stginfo_proto(info).ok_or_else(|| crate::PyError::type_error("abstract class"))?;
+    let info = stginfo::stginfo_of(cls)
+        .ok_or_else(|| pyre_interpreter::PyError::type_error("abstract class"))?;
+    let proto = stginfo::stginfo_proto(info)
+        .ok_or_else(|| pyre_interpreter::PyError::type_error("abstract class"))?;
     Ok(ArrayMeta {
         length: stginfo::stginfo_length(info),
         element_size: stginfo::stginfo_element_size(info),
@@ -1978,17 +2053,21 @@ fn array_meta(obj: PyObjectRef) -> Result<ArrayMeta, crate::PyError> {
 
 fn array_new(args: &[PyObjectRef]) -> PyResult {
     if args.is_empty() || !unsafe { pyre_object::is_type(args[0]) } {
-        return Err(crate::PyError::type_error("Array.__new__ requires a type"));
+        return Err(pyre_interpreter::PyError::type_error(
+            "Array.__new__ requires a type",
+        ));
     }
     let cls = args[0];
     let info = stginfo::stginfo_of(cls)
         .filter(|&i| stginfo::stginfo_proto(i).is_some())
-        .ok_or_else(|| crate::PyError::type_error("abstract class"))?;
+        .ok_or_else(|| pyre_interpreter::PyError::type_error("abstract class"))?;
     let size = stginfo::stginfo_size(info);
     let obj = pyre_object::w_instance_new(cls);
-    let d = crate::baseobjspace::getdict_native(obj);
+    let d = pyre_interpreter::baseobjspace::getdict_native(obj);
     if d.is_null() {
-        return Err(crate::PyError::type_error("ctypes instance has no dict"));
+        return Err(pyre_interpreter::PyError::type_error(
+            "ctypes instance has no dict",
+        ));
     }
     // The instance `dict` moves under the buffer allocation; `obj` does not
     // move and takes one pin for liveness.
@@ -2003,13 +2082,17 @@ fn array_new(args: &[PyObjectRef]) -> PyResult {
 
 fn array_init(args: &[PyObjectRef]) -> PyResult {
     if args.is_empty() {
-        return Err(crate::PyError::type_error("__init__ requires self"));
+        return Err(pyre_interpreter::PyError::type_error(
+            "__init__ requires self",
+        ));
     }
     let obj = args[0];
-    let (pos, _kw) = crate::builtins::split_builtin_kwargs(&args[1..]);
+    let (pos, _kw) = pyre_interpreter::builtins::split_builtin_kwargs(&args[1..]);
     let meta = array_meta(obj)?;
     if pos.len() > meta.length {
-        return Err(crate::PyError::index_error("too many initializers"));
+        return Err(pyre_interpreter::PyError::index_error(
+            "too many initializers",
+        ));
     }
     for (i, &val) in pos.iter().enumerate() {
         array_set_index(obj, &meta, i, val)?;
@@ -2022,12 +2105,12 @@ fn array_len(args: &[PyObjectRef]) -> PyResult {
     Ok(pyre_object::w_int_new(meta.length as i64))
 }
 
-fn normalize_index(mut i: i64, length: usize) -> Result<usize, crate::PyError> {
+fn normalize_index(mut i: i64, length: usize) -> Result<usize, pyre_interpreter::PyError> {
     if i < 0 {
         i += length as i64;
     }
     if i < 0 || i >= length as i64 {
-        return Err(crate::PyError::index_error("invalid index"));
+        return Err(pyre_interpreter::PyError::index_error("invalid index"));
     }
     Ok(i as usize)
 }
@@ -2043,7 +2126,9 @@ fn array_getitem(args: &[PyObjectRef]) -> PyResult {
     if unsafe { pyre_object::is_slice(key) } {
         return array_get_slice(obj, &meta, key);
     }
-    Err(crate::PyError::type_error("indices must be integers"))
+    Err(pyre_interpreter::PyError::type_error(
+        "indices must be integers",
+    ))
 }
 
 fn array_get_index(obj: PyObjectRef, meta: &ArrayMeta, idx: usize) -> PyResult {
@@ -2051,9 +2136,9 @@ fn array_get_index(obj: PyObjectRef, meta: &ArrayMeta, idx: usize) -> PyResult {
     match proto_kind(meta.proto) {
         ParamFunc::Simple => {
             let tc = cdata::type_code_of(meta.proto)
-                .ok_or_else(|| crate::PyError::type_error("element has no '_type_'"))?;
+                .ok_or_else(|| pyre_interpreter::PyError::type_error("element has no '_type_'"))?;
             let all = cdata::cdata_bytes(obj)
-                .ok_or_else(|| crate::PyError::type_error("instance has no buffer"))?;
+                .ok_or_else(|| pyre_interpreter::PyError::type_error("instance has no buffer"))?;
             let end = (offset + meta.element_size).min(all.len());
             let start = offset.min(end);
             Ok(cdata::decode_slot(&tc, &all[start..end]))
@@ -2061,7 +2146,7 @@ fn array_get_index(obj: PyObjectRef, meta: &ArrayMeta, idx: usize) -> PyResult {
         ParamFunc::Struct | ParamFunc::Union | ParamFunc::Array | ParamFunc::Pointer => Ok(
             cdata::make_indexed_subview(meta.proto, obj, offset, meta.element_size, idx),
         ),
-        _ => Err(crate::PyError::type_error(
+        _ => Err(pyre_interpreter::PyError::type_error(
             "element type has no storage info",
         )),
     }
@@ -2079,7 +2164,9 @@ fn array_setitem(args: &[PyObjectRef]) -> PyResult {
     if unsafe { pyre_object::is_slice(key) } {
         return array_set_slice(obj, &meta, key, value);
     }
-    Err(crate::PyError::type_error("indices must be integers"))
+    Err(pyre_interpreter::PyError::type_error(
+        "indices must be integers",
+    ))
 }
 
 fn array_set_index(obj: PyObjectRef, meta: &ArrayMeta, idx: usize, value: PyObjectRef) -> PyResult {
@@ -2087,7 +2174,7 @@ fn array_set_index(obj: PyObjectRef, meta: &ArrayMeta, idx: usize, value: PyObje
     match proto_kind(meta.proto) {
         ParamFunc::Simple => {
             let tc = cdata::type_code_of(meta.proto)
-                .ok_or_else(|| crate::PyError::type_error("element has no '_type_'"))?;
+                .ok_or_else(|| pyre_interpreter::PyError::type_error("element has no '_type_'"))?;
             // `value` is an arbitrary object under `"O"`, and the encode both
             // allocates and can run Python: pin it and read the slot back.
             let _roots = pyre_object::gc_roots::push_roots();
@@ -2103,8 +2190,8 @@ fn array_set_index(obj: PyObjectRef, meta: &ArrayMeta, idx: usize, value: PyObje
             Ok(pyre_object::w_none())
         }
         ParamFunc::Struct | ParamFunc::Union | ParamFunc::Array | ParamFunc::Pointer => {
-            if !unsafe { crate::baseobjspace::isinstance_w(value, meta.proto) } {
-                return Err(crate::PyError::type_error("incompatible types"));
+            if !unsafe { pyre_interpreter::baseobjspace::isinstance_w(value, meta.proto) } {
+                return Err(pyre_interpreter::PyError::type_error("incompatible types"));
             }
             // Snapshot the source: `a[i] = a[i]` aliases the destination
             // buffer, and `cdata_write`'s `copy_from_slice` assumes non-overlap.
@@ -2114,21 +2201,24 @@ fn array_set_index(obj: PyObjectRef, meta: &ArrayMeta, idx: usize, value: PyObje
             cdata::keep_ref(obj, &idx.to_string(), cdata::objects_for_keep(value));
             Ok(pyre_object::w_none())
         }
-        _ => Err(crate::PyError::type_error(
+        _ => Err(pyre_interpreter::PyError::type_error(
             "assignment to this element type is not supported in this slice",
         )),
     }
 }
 
 /// The concrete indices a slice selects over `length`, PySlice-adjusted.
-fn slice_index_list(slice: PyObjectRef, length: usize) -> Result<Vec<usize>, crate::PyError> {
-    let (start, stop, step) = crate::sliceobject::slice_unpack(
+fn slice_index_list(
+    slice: PyObjectRef,
+    length: usize,
+) -> Result<Vec<usize>, pyre_interpreter::PyError> {
+    let (start, stop, step) = pyre_interpreter::sliceobject::slice_unpack(
         unsafe { pyre_object::w_slice_get_start(slice) },
         unsafe { pyre_object::w_slice_get_stop(slice) },
         unsafe { pyre_object::w_slice_get_step(slice) },
     )?;
     let (start, _, step, slice_length) =
-        crate::sliceobject::slice_adjust_indices(start, stop, step, length as i64);
+        pyre_interpreter::sliceobject::slice_adjust_indices(start, stop, step, length as i64);
     let mut out = Vec::with_capacity(slice_length as usize);
     let mut i = start;
     for _ in 0..slice_length {
@@ -2193,9 +2283,9 @@ fn array_set_slice(
     // pyre reads the length and the item through `__len__` / `__getitem__`
     // where upstream uses the sequence-only pair, so a mapping of the matching
     // size reaches the item read rather than that refusal.
-    let other_len = crate::baseobjspace::len_w(value).unwrap_or(-1);
+    let other_len = pyre_interpreter::baseobjspace::len_w(value).unwrap_or(-1);
     if other_len != idxs.len() as i64 {
-        return Err(crate::PyError::value_error(
+        return Err(pyre_interpreter::PyError::value_error(
             "Can only assign sequence of same size",
         ));
     }
@@ -2206,7 +2296,7 @@ fn array_set_slice(
     let _ = pyre_object::gc_roots::pin_root(pyre_object::w_none());
     for (i, index) in idxs.into_iter().enumerate() {
         pyre_object::gc_roots::shadow_stack_set(idx_slot, pyre_object::w_int_new(i as i64));
-        let item = crate::baseobjspace::getitem(
+        let item = pyre_interpreter::baseobjspace::getitem(
             pyre_object::gc_roots::shadow_stack_get(base + 1),
             pyre_object::gc_roots::shadow_stack_get(idx_slot),
         )?;
@@ -2227,12 +2317,16 @@ fn install_char_array_getsets(cls: PyObjectRef) {
     set_type_attr(
         cls,
         "value",
-        crate::typedef::make_getset_property_named(
-            crate::make_builtin_function_with_arity("value", char_array_get_value, 2),
-            crate::make_builtin_function_with_arity("value", char_array_set_value, 3),
-            crate::make_builtin_function_with_arity(
+        pyre_interpreter::typedef::make_getset_property_named(
+            pyre_interpreter::make_builtin_function_with_arity("value", char_array_get_value, 2),
+            pyre_interpreter::make_builtin_function_with_arity("value", char_array_set_value, 3),
+            pyre_interpreter::make_builtin_function_with_arity(
                 "value",
-                |_args| Err(crate::PyError::type_error("can't delete attribute")),
+                |_args| {
+                    Err(pyre_interpreter::PyError::type_error(
+                        "can't delete attribute",
+                    ))
+                },
                 2,
             ),
             "value",
@@ -2241,12 +2335,16 @@ fn install_char_array_getsets(cls: PyObjectRef) {
     set_type_attr(
         cls,
         "raw",
-        crate::typedef::make_getset_property_named(
-            crate::make_builtin_function_with_arity("raw", char_array_get_raw, 2),
-            crate::make_builtin_function_with_arity("raw", char_array_set_raw, 3),
-            crate::make_builtin_function_with_arity(
+        pyre_interpreter::typedef::make_getset_property_named(
+            pyre_interpreter::make_builtin_function_with_arity("raw", char_array_get_raw, 2),
+            pyre_interpreter::make_builtin_function_with_arity("raw", char_array_set_raw, 3),
+            pyre_interpreter::make_builtin_function_with_arity(
                 "raw",
-                |_args| Err(crate::PyError::attribute_error("cannot delete attribute")),
+                |_args| {
+                    Err(pyre_interpreter::PyError::attribute_error(
+                        "cannot delete attribute",
+                    ))
+                },
                 2,
             ),
             "raw",
@@ -2266,12 +2364,14 @@ fn char_array_set_value(args: &[PyObjectRef]) -> PyResult {
     let obj = args[1];
     let value = args[2];
     if !unsafe { pyre_object::is_bytes(value) } {
-        return Err(crate::PyError::type_error("bytes expected"));
+        return Err(pyre_interpreter::PyError::type_error("bytes expected"));
     }
     let src = unsafe { pyre_object::bytesobject::w_bytes_data(value) };
     let size = cdata::cdata_len(obj).unwrap_or(0);
     if src.len() > size {
-        return Err(crate::PyError::value_error("byte string too long"));
+        return Err(pyre_interpreter::PyError::value_error(
+            "byte string too long",
+        ));
     }
     // Copy `src`, then a NUL terminator when the buffer has room (no tail zero).
     let mut buf = src.to_vec();
@@ -2291,12 +2391,14 @@ fn char_array_get_raw(args: &[PyObjectRef]) -> PyResult {
 fn char_array_set_raw(args: &[PyObjectRef]) -> PyResult {
     let obj = args[1];
     let value = args[2];
-    let source = crate::typedef::buffer_as_bytes_like(value)?
-        .ok_or_else(|| crate::PyError::type_error("bytes-like object expected"))?;
+    let source = pyre_interpreter::typedef::buffer_as_bytes_like(value)?
+        .ok_or_else(|| pyre_interpreter::PyError::type_error("bytes-like object expected"))?;
     let src = unsafe { pyre_object::bytesobject::bytes_like_data(source) };
     let size = cdata::cdata_len(obj).unwrap_or(0);
     if src.len() > size {
-        return Err(crate::PyError::value_error("byte string too long"));
+        return Err(pyre_interpreter::PyError::value_error(
+            "byte string too long",
+        ));
     }
     cdata::cdata_write(obj, 0, src);
     Ok(pyre_object::w_none())
@@ -2306,12 +2408,16 @@ fn install_wchar_array_getsets(cls: PyObjectRef) {
     set_type_attr(
         cls,
         "value",
-        crate::typedef::make_getset_property_named(
-            crate::make_builtin_function_with_arity("value", wchar_array_get_value, 2),
-            crate::make_builtin_function_with_arity("value", wchar_array_set_value, 3),
-            crate::make_builtin_function_with_arity(
+        pyre_interpreter::typedef::make_getset_property_named(
+            pyre_interpreter::make_builtin_function_with_arity("value", wchar_array_get_value, 2),
+            pyre_interpreter::make_builtin_function_with_arity("value", wchar_array_set_value, 3),
+            pyre_interpreter::make_builtin_function_with_arity(
                 "value",
-                |_args| Err(crate::PyError::type_error("can't delete attribute")),
+                |_args| {
+                    Err(pyre_interpreter::PyError::type_error(
+                        "can't delete attribute",
+                    ))
+                },
                 2,
             ),
             "value",
@@ -2329,7 +2435,9 @@ fn wchar_array_set_value(args: &[PyObjectRef]) -> PyResult {
     let obj = args[1];
     let value = args[2];
     if !unsafe { pyre_object::is_str(value) } {
-        return Err(crate::PyError::type_error("unicode string expected"));
+        return Err(pyre_interpreter::PyError::type_error(
+            "unicode string expected",
+        ));
     }
     let text = unsafe { pyre_object::w_str_get_wtf8(value) };
     let size = cdata::cdata_len(obj).unwrap_or(0);
@@ -2338,7 +2446,7 @@ fn wchar_array_set_value(args: &[PyObjectRef]) -> PyResult {
     let mut bytes = cdata::cdata_bytes(obj).unwrap_or(&[]).to_vec();
     bytes.resize(size, 0);
     host_ctypes::write_wchar_array_value(&mut bytes, text)
-        .map_err(|_| crate::PyError::value_error("string too long"))?;
+        .map_err(|_| pyre_interpreter::PyError::value_error("string too long"))?;
     cdata::cdata_write(obj, 0, &bytes);
     Ok(pyre_object::w_none())
 }
@@ -2346,7 +2454,7 @@ fn wchar_array_set_value(args: &[PyObjectRef]) -> PyResult {
 // ── PyCPointerType + _Pointer ──────────────────────────────────────────
 
 fn cpointertype_new(args: &[PyObjectRef]) -> PyResult {
-    crate::builtins::type_descr_new(args)
+    pyre_interpreter::builtins::type_descr_new(args)
 }
 
 fn cpointertype_init(args: &[PyObjectRef]) -> PyResult {
@@ -2356,12 +2464,14 @@ fn cpointertype_init(args: &[PyObjectRef]) -> PyResult {
 /// `PyCPointerType` layout: pointer-sized `StgInfo` with `ISPOINTER`, and
 /// memoise the pointer type on the pointed-to type (`POINTER` identity).
 fn pointer_init_stginfo(cls: PyObjectRef) -> PyResult {
-    let proto = unsafe { crate::baseobjspace::lookup_in_type(cls, "_type_") }
+    let proto = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_type_") }
         .filter(|&t| !t.is_null() && unsafe { pyre_object::is_type(t) });
     if let Some(p) = proto
         && stginfo::field_size_of(p).is_none()
     {
-        return Err(crate::PyError::type_error("_type_ must have storage info"));
+        return Err(pyre_interpreter::PyError::type_error(
+            "_type_ must have storage info",
+        ));
     }
     let psize = host_ctypes::pointer_size();
     let mut data = StgInfoData::new(psize, psize, ParamFunc::Pointer);
@@ -2421,7 +2531,7 @@ fn pointer_init_stginfo(cls: PyObjectRef) -> PyResult {
 
 fn pointer_new(args: &[PyObjectRef]) -> PyResult {
     if args.is_empty() || !unsafe { pyre_object::is_type(args[0]) } {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "_Pointer.__new__ requires a type",
         ));
     }
@@ -2430,14 +2540,16 @@ fn pointer_new(args: &[PyObjectRef]) -> PyResult {
         .and_then(stginfo::stginfo_proto)
         .is_none()
     {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "Cannot create instance: has no _type_",
         ));
     }
     let obj = pyre_object::w_instance_new(cls);
-    let d = crate::baseobjspace::getdict_native(obj);
+    let d = pyre_interpreter::baseobjspace::getdict_native(obj);
     if d.is_null() {
-        return Err(crate::PyError::type_error("ctypes instance has no dict"));
+        return Err(pyre_interpreter::PyError::type_error(
+            "ctypes instance has no dict",
+        ));
     }
     // The instance `dict` moves under the buffer allocation; `obj` does not
     // move and takes one pin for liveness.
@@ -2453,10 +2565,12 @@ fn pointer_new(args: &[PyObjectRef]) -> PyResult {
 
 fn pointer_init(args: &[PyObjectRef]) -> PyResult {
     if args.is_empty() {
-        return Err(crate::PyError::type_error("__init__ requires self"));
+        return Err(pyre_interpreter::PyError::type_error(
+            "__init__ requires self",
+        ));
     }
     let obj = args[0];
-    let (pos, _kw) = crate::builtins::split_builtin_kwargs(&args[1..]);
+    let (pos, _kw) = pyre_interpreter::builtins::split_builtin_kwargs(&args[1..]);
     if let Some(&val) = pos.first()
         && !unsafe { pyre_object::is_none(val) }
     {
@@ -2470,18 +2584,20 @@ fn pointer_set_contents(obj: PyObjectRef, value: PyObjectRef) -> PyResult {
     let cls = unsafe { pyre_object::w_instance_get_type(obj) };
     let proto = stginfo::stginfo_of(cls)
         .and_then(stginfo::stginfo_proto)
-        .ok_or_else(|| crate::PyError::type_error("Cannot create instance: has no _type_"))?;
+        .ok_or_else(|| {
+            pyre_interpreter::PyError::type_error("Cannot create instance: has no _type_")
+        })?;
     if !cdata::is_cdata_instance(value)
-        || !unsafe { crate::baseobjspace::isinstance_w(value, proto) }
+        || !unsafe { pyre_interpreter::baseobjspace::isinstance_w(value, proto) }
     {
-        return Err(crate::PyError::type_error(format!(
+        return Err(pyre_interpreter::PyError::type_error(format!(
             "expected {} instead of {}",
             type_name(proto),
             type_name(unsafe { pyre_object::w_instance_get_type(value) })
         )));
     }
     let addr = cdata::cdata_addr(value)
-        .ok_or_else(|| crate::PyError::type_error("target has no buffer"))?;
+        .ok_or_else(|| pyre_interpreter::PyError::type_error("target has no buffer"))?;
     let bytes = host_ctypes::simple_storage_value_to_bytes_endian(
         "P",
         host_ctypes::SimpleStorageValue::Pointer(addr),
@@ -2497,10 +2613,12 @@ fn contents_get(args: &[PyObjectRef]) -> PyResult {
     let cls = unsafe { pyre_object::w_instance_get_type(obj) };
     let proto = stginfo::stginfo_of(cls)
         .and_then(stginfo::stginfo_proto)
-        .ok_or_else(|| crate::PyError::type_error("has no _type_"))?;
+        .ok_or_else(|| pyre_interpreter::PyError::type_error("has no _type_"))?;
     let ptr = host_ctypes::read_pointer_from_buffer(cdata::cdata_bytes(obj).unwrap_or(&[]));
     if ptr == 0 {
-        return Err(crate::PyError::value_error("NULL pointer access"));
+        return Err(pyre_interpreter::PyError::value_error(
+            "NULL pointer access",
+        ));
     }
     let size = stginfo::field_size_of(proto).unwrap_or_else(host_ctypes::pointer_size);
     Ok(cdata::make_at_address(proto, ptr, size, obj))
@@ -2511,11 +2629,13 @@ fn contents_set(args: &[PyObjectRef]) -> PyResult {
 }
 
 /// `(proto, element_size, ptr_value)` for a pointer instance.
-fn pointer_meta(obj: PyObjectRef) -> Result<(PyObjectRef, usize, usize), crate::PyError> {
+fn pointer_meta(
+    obj: PyObjectRef,
+) -> Result<(PyObjectRef, usize, usize), pyre_interpreter::PyError> {
     let cls = unsafe { pyre_object::w_instance_get_type(obj) };
     let proto = stginfo::stginfo_of(cls)
         .and_then(stginfo::stginfo_proto)
-        .ok_or_else(|| crate::PyError::type_error("has no _type_"))?;
+        .ok_or_else(|| pyre_interpreter::PyError::type_error("has no _type_"))?;
     let element_size = stginfo::field_size_of(proto).unwrap_or_else(host_ctypes::pointer_size);
     let ptr = host_ctypes::read_pointer_from_buffer(cdata::cdata_bytes(obj).unwrap_or(&[]));
     Ok((proto, element_size, ptr))
@@ -2529,22 +2649,26 @@ fn pointer_getitem(args: &[PyObjectRef]) -> PyResult {
         let stop_obj = unsafe { pyre_object::sliceobject::w_slice_get_stop(key) };
         let step_obj = unsafe { pyre_object::sliceobject::w_slice_get_step(key) };
         if unsafe { pyre_object::is_none(stop_obj) } {
-            return Err(crate::PyError::value_error("slice stop is required"));
+            return Err(pyre_interpreter::PyError::value_error(
+                "slice stop is required",
+            ));
         }
         let step = if unsafe { pyre_object::is_none(step_obj) } {
             1
         } else {
-            crate::sliceobject::eval_slice_index(step_obj)?
+            pyre_interpreter::sliceobject::eval_slice_index(step_obj)?
         };
         if step == 0 {
-            return Err(crate::PyError::value_error("slice step cannot be zero"));
+            return Err(pyre_interpreter::PyError::value_error(
+                "slice step cannot be zero",
+            ));
         }
         let start = if unsafe { pyre_object::is_none(start_obj) } {
             if step < 0 { -1 } else { 0 }
         } else {
-            crate::sliceobject::eval_slice_index(start_obj)?
+            pyre_interpreter::sliceobject::eval_slice_index(start_obj)?
         };
-        let stop = crate::sliceobject::eval_slice_index(stop_obj)?;
+        let stop = pyre_interpreter::sliceobject::eval_slice_index(stop_obj)?;
         // Each element is freshly allocated and the next index allocates again,
         // so they are pinned as they arrive.
         let mut values = pyre_object::gc_roots::RootedItems::new();
@@ -2556,7 +2680,7 @@ fn pointer_getitem(args: &[PyObjectRef]) -> PyResult {
         return Ok(pyre_object::w_list_new(values.take()));
     }
     if !unsafe { pyre_object::is_int(key) } {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "Pointer indices must be integer",
         ));
     }
@@ -2566,13 +2690,15 @@ fn pointer_getitem(args: &[PyObjectRef]) -> PyResult {
 fn pointer_get_index(obj: PyObjectRef, index: isize) -> PyResult {
     let (proto, element_size, ptr) = pointer_meta(obj)?;
     if ptr == 0 {
-        return Err(crate::PyError::value_error("NULL pointer access"));
+        return Err(pyre_interpreter::PyError::value_error(
+            "NULL pointer access",
+        ));
     }
     let addr = host_ctypes::pointer_item_address(ptr, index, element_size);
     match proto_kind(proto) {
         ParamFunc::Simple => {
             let tc = cdata::type_code_of(proto)
-                .ok_or_else(|| crate::PyError::type_error("element has no '_type_'"))?;
+                .ok_or_else(|| pyre_interpreter::PyError::type_error("element has no '_type_'"))?;
             let bytes = unsafe { host_ctypes::borrow_memory(addr as *const u8, element_size) };
             Ok(cdata::decode_slot(&tc, bytes))
         }
@@ -2585,20 +2711,22 @@ fn pointer_setitem(args: &[PyObjectRef]) -> PyResult {
     let key = args[1];
     let value = args[2];
     if !unsafe { pyre_object::is_int(key) } {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "Pointer indices must be integer",
         ));
     }
     let (proto, element_size, ptr) = pointer_meta(obj)?;
     if ptr == 0 {
-        return Err(crate::PyError::value_error("NULL pointer access"));
+        return Err(pyre_interpreter::PyError::value_error(
+            "NULL pointer access",
+        ));
     }
     let index = unsafe { pyre_object::w_int_get_value(key) } as isize;
     let addr = host_ctypes::pointer_item_address(ptr, index, element_size);
     match proto_kind(proto) {
         ParamFunc::Simple => {
             let tc = cdata::type_code_of(proto)
-                .ok_or_else(|| crate::PyError::type_error("element has no '_type_'"))?;
+                .ok_or_else(|| pyre_interpreter::PyError::type_error("element has no '_type_'"))?;
             // `value` is an arbitrary object under `"O"`, and the encode both
             // allocates and can run Python: pin it and read the slot back.
             let _roots = pyre_object::gc_roots::push_roots();
@@ -2614,8 +2742,8 @@ fn pointer_setitem(args: &[PyObjectRef]) -> PyResult {
             Ok(pyre_object::w_none())
         }
         _ => {
-            if !unsafe { crate::baseobjspace::isinstance_w(value, proto) } {
-                return Err(crate::PyError::type_error("incompatible types"));
+            if !unsafe { pyre_interpreter::baseobjspace::isinstance_w(value, proto) } {
+                return Err(pyre_interpreter::PyError::type_error("incompatible types"));
             }
             let src = cdata::cdata_bytes(value).unwrap_or(&[]);
             unsafe { host_ctypes::copy_bytes_to_address(addr, src, element_size) };

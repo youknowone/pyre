@@ -2465,28 +2465,14 @@ pub(crate) fn method_owner(type_name: &str) -> Option<&'static crate::gateway::M
 /// nor without `host_env`, where the type is never created either, so the row
 /// above is dead there rather than wrong.
 fn ctypes_array_layout(obj: PyObjectRef) -> bool {
-    #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
-    {
-        crate::module::_ctypes::metaclass::is_array_instance(obj)
-    }
-    #[cfg(not(all(any(unix, windows), feature = "host_env", not(feature = "sandbox"))))]
-    {
-        let _ = obj;
-        false
-    }
+    crate::importing::optional_module_hooks()
+        .is_some_and(|hooks| (hooks.ctypes_array_instance)(obj))
 }
 
 /// `_ctypes._Pointer`'s layout test, gated the same way.
 fn ctypes_pointer_layout(obj: PyObjectRef) -> bool {
-    #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
-    {
-        crate::module::_ctypes::metaclass::is_pointer_instance(obj)
-    }
-    #[cfg(not(all(any(unix, windows), feature = "host_env", not(feature = "sandbox"))))]
-    {
-        let _ = obj;
-        false
-    }
+    crate::importing::optional_module_hooks()
+        .is_some_and(|hooks| (hooks.ctypes_pointer_instance)(obj))
 }
 
 /// `mmap.mmap`'s layout test.  The module is not built for wasm32 or under
@@ -23783,8 +23769,9 @@ pub fn buffer_as_bytes_like(obj: PyObjectRef) -> Result<Option<PyObjectRef>, cra
         };
         return Ok(Some(pyre_object::bytesobject::w_bytes_from_bytes(data)));
     }
-    #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
-    if let Some(data) = crate::module::_ctypes::cdata::cdata_bytes_object(obj) {
+    if let Some(hooks) = crate::importing::optional_module_hooks()
+        && let Some(data) = (hooks.ctypes_bytes_object)(obj)
+    {
         return Ok(Some(data));
     }
     // `W_MMap.readbuf_w` — the mapping is a bytes-like source in its own

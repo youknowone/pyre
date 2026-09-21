@@ -42,7 +42,7 @@ use crate::{
 /// holds a `usize` computed elsewhere.  It would also put a shadow-allocating
 /// call — i.e. a collection point — inside every address-printing repr.  Take
 /// that on with a witness in hand, not on the strength of the spelling.
-pub(crate) fn repr_addr(addr: usize) -> String {
+pub fn repr_addr(addr: usize) -> String {
     if cfg!(windows) {
         format!("0x{addr:0width$X}", width = size_of::<usize>() * 2)
     } else {

@@ -54,5 +54,8 @@ windows-sys = { version = "0.61", features = ["Win32_System_Diagnostics_Debug"] 
 # `rustpython_host_env::winapi::create_event_w` takes.
 widestring = "1.2"
 
+[build-dependencies]
+cc = "1.2"
+
 [dev-dependencies]
 pyre-interpreter = { workspace = true, features = ["test-hooks"] }

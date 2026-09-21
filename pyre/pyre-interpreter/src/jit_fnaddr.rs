@@ -2456,22 +2456,8 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::set_in_flight_exception",
         set_in_flight_exception,
     );
-    // `mmap_type` residual lives on the optional-module hook after the
-    // module moved. `cdata_bytes_object` carries the `_ctypes` module's own gate
-    // (`module/mod.rs`), so the row repeats it rather than resolving a path
-    // configured out of the build.
-    #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
-    {
-        let cdata_bytes_object: fn(pyre_object::PyObjectRef) -> Option<pyre_object::PyObjectRef> =
-            crate::module::_ctypes::cdata::cdata_bytes_object;
-        // ABI-UNSOUND: `Option<PyObjectRef>` is two words: a raw pointer has no niche.
-        push_abi_unsound_alias_pair(
-            &mut entries,
-            "pyre_interpreter::module::_ctypes::cdata::cdata_bytes_object",
-            "pyre_interpreter::cdata_bytes_object",
-            cdata_bytes_object as *const (),
-        );
-    }
+    // `mmap_type` / `cdata_bytes_object` residuals live on the optional-module
+    // hook after those modules moved.
     pa0(
         &mut entries,
         "pyre_object::gc_interp::note_eval_activation_enter",

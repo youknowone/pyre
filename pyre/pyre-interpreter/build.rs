@@ -65,16 +65,6 @@ fn main() {
             .compile("pyre_cpyext_c");
     }
 
-    // `__try`/`__except` is the only thing that reaches a structured exception
-    // and no Rust compiler emits one, so the fence a foreign call is made
-    // inside (`src/module/_ctypes/seh.rs`) is a C translation unit of its own.
-    if target.ends_with("-pc-windows-msvc") {
-        println!("cargo:rerun-if-changed=src/module/_ctypes/seh.c");
-        cc::Build::new()
-            .file("src/module/_ctypes/seh.c")
-            .compile("pyre_ctypes_seh");
-    }
-
     // `sys.version` names the C compiler the build used, and on an MSVC target
     // that name is the `MSC v.<_MSC_VER>` token
     // (`rpython/rlib/compilerinfo.py:22`).  `ctypes.util._get_build_version`

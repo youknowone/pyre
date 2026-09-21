@@ -30,6 +30,9 @@ pub mod _codecs_tw;
 #[allow(non_snake_case)]
 pub mod _csv;
 #[allow(non_snake_case)]
+#[cfg(not(feature = "sandbox"))]
+pub mod _ctypes;
+#[allow(non_snake_case)]
 pub mod _hashlib;
 #[allow(non_snake_case)]
 pub mod _heapq;

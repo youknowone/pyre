@@ -79,29 +79,29 @@ unsafe fn call3(this: usize, index: usize, a: usize, b: usize) -> i32 {
 pub(super) fn call_target(
     index: i64,
     inargs: &[PyObjectRef],
-) -> Result<(usize, usize), crate::PyError> {
+) -> Result<(usize, usize), pyre_interpreter::PyError> {
     let Some(&this) = inargs.first() else {
-        return Err(crate::PyError::value_error(
+        return Err(pyre_interpreter::PyError::value_error(
             "native com method call without 'this' parameter",
         ));
     };
     if !cdata::is_cdata_instance(this) {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "Expected a COM this pointer as first argument",
         ));
     }
     let this_ptr = host_ctypes::read_pointer_from_buffer(cdata::cdata_bytes(this).unwrap_or(&[]));
     match host_ctypes::resolve_com_vtable_entry(this_ptr, index.max(0) as usize) {
         Ok(entry) => Ok((this_ptr, entry.0 as usize)),
-        Err(host_ctypes::ComMethodError::NullComPointer) => {
-            Err(crate::PyError::value_error("NULL COM pointer access"))
-        }
-        Err(host_ctypes::ComMethodError::NullVtablePointer) => Err(crate::PyError::value_error(
-            "COM method call without VTable",
-        )),
-        Err(host_ctypes::ComMethodError::NullFunctionPointer) => {
-            Err(crate::PyError::value_error("NULL function pointer"))
-        }
+        Err(host_ctypes::ComMethodError::NullComPointer) => Err(
+            pyre_interpreter::PyError::value_error("NULL COM pointer access"),
+        ),
+        Err(host_ctypes::ComMethodError::NullVtablePointer) => Err(
+            pyre_interpreter::PyError::value_error("COM method call without VTable"),
+        ),
+        Err(host_ctypes::ComMethodError::NullFunctionPointer) => Err(
+            pyre_interpreter::PyError::value_error("NULL function pointer"),
+        ),
     }
 }
 
@@ -211,11 +211,11 @@ fn prog_id(guid: &[u8; 16]) -> PyObjectRef {
 }
 
 /// `GetComError` — the `COMError` a failed COM method call raises.
-pub(super) fn error(hresult: i32, iid: usize, this: usize) -> crate::PyError {
+pub(super) fn error(hresult: i32, iid: usize, this: usize) -> pyre_interpreter::PyError {
     // Every read below is a COM method call, and a COM method call must not
     // hold the interpreter: the callee is free to wait on another thread.
     let info = {
-        let _blocked = crate::module::thread::before_external_block();
+        let _blocked = pyre_interpreter::module::thread::before_external_block();
         collect_error_info(this, iid)
     };
     // Each value allocates, so each is pinned as it is built rather than
@@ -245,7 +245,11 @@ pub(super) fn error(hresult: i32, iid: usize, this: usize) -> crate::PyError {
     // Without the class there is nothing to raise but the report the id-less
     // form would have given, which is the same status by another name.
     let win32_error = || {
-        crate::PyError::os_error_win32_syscall2(hresult, pyre_object::PY_NULL, pyre_object::PY_NULL)
+        pyre_interpreter::PyError::os_error_win32_syscall2(
+            hresult,
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+        )
     };
     let Some(cls) = super::interp_ctypes::comerror_type() else {
         return win32_error();
@@ -255,7 +259,7 @@ pub(super) fn error(hresult: i32, iid: usize, this: usize) -> crate::PyError {
         pyre_object::gc_roots::shadow_stack_get(text_slot),
         pyre_object::gc_roots::shadow_stack_get(details_slot),
     ];
-    match crate::call::type_call_instantiate(cls, &args) {
+    match pyre_interpreter::call::type_call_instantiate(cls, &args) {
         Ok(instance) => {
             let instance_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(instance);

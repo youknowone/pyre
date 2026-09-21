@@ -519,6 +519,11 @@ pub struct OptionalModuleHooks {
     pub run_cffi_finalize: fn(PyObjectRef),
     pub close_cffi_fileobj: fn(PyObjectRef),
     pub load_cffi1_module: fn(&str, &std::path::Path, usize) -> Result<PyObjectRef, crate::PyError>,
+    pub ctypes_buffer_view:
+        fn(PyObjectRef) -> Option<(PyObjectRef, usize, usize, String, usize, Vec<usize>)>,
+    pub ctypes_bytes_object: fn(PyObjectRef) -> Option<PyObjectRef>,
+    pub ctypes_array_instance: fn(PyObjectRef) -> bool,
+    pub ctypes_pointer_instance: fn(PyObjectRef) -> bool,
 }
 
 static OPTIONAL_MODULE_HOOKS: std::sync::OnceLock<OptionalModuleHooks> = std::sync::OnceLock::new();
@@ -778,7 +783,6 @@ pub fn install_builtin_modules() {
         // handler table and `raise_signal`, and leaves out the itimers, the
         // sigset calls and `pause`.
         pyre_install_module!("_signal"(signal));
-        pyre_install_module!(_ctypes);
     }
     pyre_install_module!(_locale);
     pyre_install_module!(_random);

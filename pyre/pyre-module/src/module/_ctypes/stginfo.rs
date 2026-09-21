@@ -37,7 +37,7 @@ static STGINFO_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
 /// The private `StgInfo` carrier type (`hasdict=true`, never registered).
 fn stginfo_type() -> PyObjectRef {
     *STGINFO_TYPE_OBJ.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type("StgInfo", |_| {});
+        let tp = pyre_interpreter::typedef::make_builtin_type("StgInfo", |_| {});
         unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
         tp as usize
     }) as PyObjectRef
@@ -115,7 +115,7 @@ impl StgInfoData {
 }
 
 fn dict_of(info: PyObjectRef) -> PyObjectRef {
-    crate::baseobjspace::getdict_native(info)
+    pyre_interpreter::baseobjspace::getdict_native(info)
 }
 
 fn set_int(info: PyObjectRef, key: &str, v: i64) {
@@ -179,15 +179,15 @@ pub(super) fn stginfo_of(cls: PyObjectRef) -> Option<PyObjectRef> {
     if cls.is_null() || !unsafe { pyre_object::is_type(cls) } {
         return None;
     }
-    let info = crate::type_dict_lookup(cls, STGINFO_KEY)?;
+    let info = pyre_interpreter::type_dict_lookup(cls, STGINFO_KEY)?;
     (!unsafe { pyre_object::is_none(info) }).then_some(info)
 }
 
 /// Store `info` as `cls`'s `StgInfo` and invalidate the type cache.
 pub(super) fn stginfo_set(cls: PyObjectRef, info: PyObjectRef) {
-    if crate::type_dict_store(cls, STGINFO_KEY, info) {
+    if pyre_interpreter::type_dict_store(cls, STGINFO_KEY, info) {
         pyre_object::gc_hook::try_gc_write_barrier(cls as *mut u8);
-        unsafe { crate::baseobjspace::mutated(cls, Some(STGINFO_KEY)) };
+        unsafe { pyre_interpreter::baseobjspace::mutated(cls, Some(STGINFO_KEY)) };
     }
 }
 
@@ -235,7 +235,7 @@ pub(super) fn stginfo_format(info: PyObjectRef) -> Option<String> {
 
 pub(super) fn stginfo_big_endian(info: PyObjectRef) -> bool {
     match unsafe { pyre_object::w_dict_getitem_str(dict_of(info), K_BIG_ENDIAN) } {
-        Some(value) => crate::baseobjspace::is_true(value).unwrap_or(false),
+        Some(value) => pyre_interpreter::baseobjspace::is_true(value).unwrap_or(false),
         None => false,
     }
 }

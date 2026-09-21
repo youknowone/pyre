@@ -35,6 +35,8 @@ pub fn install_optional_modules() {
         "_cffi_backend",
         module::_cffi_backend::init,
     );
+    #[cfg(not(feature = "sandbox"))]
+    pyre_interpreter::importing::register_builtin_module("_ctypes", module::_ctypes::init);
     pyre_interpreter::importing::register_builtin_module("_bz2", module::_bz2::init);
     pyre_interpreter::importing::register_builtin_module("_csv", module::_csv::init);
     pyre_interpreter::importing::register_builtin_module("_codecs_cn", module::_codecs_cn::init);
@@ -242,6 +244,63 @@ fn hook_close_cffi_fileobj(obj: pyre_object::PyObjectRef) {
     }
 }
 
+fn hook_ctypes_buffer_view(
+    obj: pyre_object::PyObjectRef,
+) -> Option<(
+    pyre_object::PyObjectRef,
+    usize,
+    usize,
+    String,
+    usize,
+    Vec<usize>,
+)> {
+    #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
+    {
+        return module::_ctypes::cdata::cdata_buffer_view(obj);
+    }
+    #[cfg(not(all(any(unix, windows), feature = "host_env", not(feature = "sandbox"))))]
+    {
+        let _ = obj;
+        None
+    }
+}
+
+fn hook_ctypes_bytes_object(obj: pyre_object::PyObjectRef) -> Option<pyre_object::PyObjectRef> {
+    #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
+    {
+        return module::_ctypes::cdata::cdata_bytes_object(obj);
+    }
+    #[cfg(not(all(any(unix, windows), feature = "host_env", not(feature = "sandbox"))))]
+    {
+        let _ = obj;
+        None
+    }
+}
+
+fn hook_ctypes_array_instance(obj: pyre_object::PyObjectRef) -> bool {
+    #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
+    {
+        return module::_ctypes::metaclass::is_array_instance(obj);
+    }
+    #[cfg(not(all(any(unix, windows), feature = "host_env", not(feature = "sandbox"))))]
+    {
+        let _ = obj;
+        false
+    }
+}
+
+fn hook_ctypes_pointer_instance(obj: pyre_object::PyObjectRef) -> bool {
+    #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
+    {
+        return module::_ctypes::metaclass::is_pointer_instance(obj);
+    }
+    #[cfg(not(all(any(unix, windows), feature = "host_env", not(feature = "sandbox"))))]
+    {
+        let _ = obj;
+        false
+    }
+}
+
 fn hook_load_cffi1_module(
     name: &str,
     path: &std::path::Path,
@@ -283,6 +342,10 @@ pub fn register() {
             run_cffi_finalize: hook_run_cffi_finalize,
             close_cffi_fileobj: hook_close_cffi_fileobj,
             load_cffi1_module: hook_load_cffi1_module,
+            ctypes_buffer_view: hook_ctypes_buffer_view,
+            ctypes_bytes_object: hook_ctypes_bytes_object,
+            ctypes_array_instance: hook_ctypes_array_instance,
+            ctypes_pointer_instance: hook_ctypes_pointer_instance,
         },
     );
 }
@@ -1007,12 +1070,29 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
             misc::raw_write_f64 as *const (),
         );
     }
+    #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
+    {
+        let f = module::_ctypes::cdata::cdata_bytes_object as *const ();
+        single(
+            entries,
+            "pyre_interpreter::module::_ctypes::cdata::cdata_bytes_object",
+            f,
+        );
+        single(entries, "pyre_interpreter::cdata_bytes_object", f);
+        single(
+            entries,
+            "pyre_module::module::_ctypes::cdata::cdata_bytes_object",
+            f,
+        );
+    }
 }
 
 fn walk_optional_global_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     let _ = visitor;
     #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
     module::faulthandler::handler::walk_faulthandler_roots(visitor);
+    #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
+    module::_ctypes::cdata::walk_pyobj_container_roots(visitor);
 }
 
 fn optional_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeAlias> {

@@ -2307,7 +2307,7 @@ pub fn fsencode_path_or_fd_nullable_w(
 /// dropped. The path boundaries report a rejected argument this way, where the
 /// rest of the interpreter reports the qualified name (`array.array` becomes
 /// `array` here and stays `array.array` in, say, a concatenation error).
-pub(crate) fn short_type_name(obj: pyre_object::PyObjectRef) -> String {
+pub fn short_type_name(obj: pyre_object::PyObjectRef) -> String {
     let name = crate::type_methods::arg_type_name(obj);
     match name.rfind('.') {
         Some(dot) => name[dot + 1..].to_string(),

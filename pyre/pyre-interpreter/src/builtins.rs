@@ -673,7 +673,7 @@ unsafe fn w_memoryview_new_python_buffer(
 /// `memoryview(obj)` — acquire a 1-D byte view over a buffer-providing
 /// exporter.  Sharing another memoryview copies its view parameters (and
 /// reports the original exporter as `.obj`); a non-buffer raises TypeError.
-pub(crate) fn w_memoryview_new(w_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+pub fn w_memoryview_new(w_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     // `PyMemoryView_FromObject` requests the full read-only buffer interface.
     w_memoryview_new_with_flags(w_obj, 0x011c)
 }
@@ -770,9 +770,9 @@ fn w_memoryview_new_with_flags_impl(
             let (address, length, readonly) = view.map_err(crate::PyError::value_error)?;
             return Ok(w_memoryview_new_mmap(w_obj, address, length, readonly));
         }
-        #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
-        if let Some((backing_obj, offset, byte_len, fmt, itemsize, shape)) =
-            crate::module::_ctypes::cdata::cdata_buffer_view(w_obj)
+        if let Some(hooks) = crate::importing::optional_module_hooks()
+            && let Some((backing_obj, offset, byte_len, fmt, itemsize, shape)) =
+                (hooks.ctypes_buffer_view)(w_obj)
         {
             use pyre_object::buffer::Buffer;
             use pyre_object::bufferview::BufferView;
@@ -5592,7 +5592,7 @@ pub fn has_builtin_kwargs(args: &[PyObjectRef]) -> bool {
 /// raises the `argument.py:_match_keywords` TypeError
 /// "argument for X() given by name ('name') and position (N)" (N is the
 /// 1-based positional index of the slot).  An absent argument is `None`.
-pub(crate) fn resolve_pos_or_kw(
+pub fn resolve_pos_or_kw(
     positional: Option<PyObjectRef>,
     kwargs: Option<PyObjectRef>,
     name: &str,
@@ -6238,7 +6238,7 @@ fn min_max_multiple_args(
 /// slip past `precheck_for_new` and build a class, and it is why `_ast`'s
 /// `register_module` has to name `type` explicitly rather than rely on a scan
 /// to default it.
-pub(crate) fn type_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn type_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // The class-definition keywords arrive as a trailing `__pyre_kw__`
     // dict (the builtin kwargs ABI); strip it before the arity check and
     // hand it to __init_subclass__ via `type_descr_new_with_metaclass`.
@@ -20420,9 +20420,9 @@ pub unsafe fn fileio_writebuf(
                 ));
             }
         }
-        #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
-        if let Some((backing, offset, length, _format, _itemsize, _shape)) =
-            crate::module::_ctypes::cdata::cdata_buffer_view(obj)
+        if let Some(hooks) = crate::importing::optional_module_hooks()
+            && let Some((backing, offset, length, _format, _itemsize, _shape)) =
+                (hooks.ctypes_buffer_view)(obj)
         {
             let full = pyre_object::bytearrayobject::w_bytearray_data_mut(backing);
             if offset <= full.len() && length <= full.len() - offset {

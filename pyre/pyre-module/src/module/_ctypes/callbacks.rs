@@ -45,7 +45,9 @@ mod imp {
     static CALLBACK_THUNKS: LazyLock<Mutex<Vec<StoredThunk>>> =
         LazyLock::new(|| Mutex::new(Vec::new()));
 
-    pub(super) fn build_thunk(obj: PyObjectRef) -> Result<Option<usize>, crate::PyError> {
+    pub(super) fn build_thunk(
+        obj: PyObjectRef,
+    ) -> Result<Option<usize>, pyre_interpreter::PyError> {
         let _roots = pyre_object::gc_roots::push_roots();
         let obj_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(obj);
@@ -86,7 +88,9 @@ mod imp {
         Ok(Some(code))
     }
 
-    fn ffi_type_for_arg(at: PyObjectRef) -> Result<host_ctypes::FfiType, crate::PyError> {
+    fn ffi_type_for_arg(
+        at: PyObjectRef,
+    ) -> Result<host_ctypes::FfiType, pyre_interpreter::PyError> {
         if funcptr::argtype_is_pointer_kind(at) {
             return Ok(host_ctypes::ffi_pointer_type());
         }
@@ -103,13 +107,14 @@ mod imp {
     /// ABI; a byte-struct of the same size is not equivalent.
     fn ffi_type_for_layout(
         layout: &host_ctypes::CTypeLayout,
-    ) -> Result<host_ctypes::FfiType, crate::PyError> {
+    ) -> Result<host_ctypes::FfiType, pyre_interpreter::PyError> {
         use host_ctypes::CTypeLayout;
         match layout {
             CTypeLayout::Simple(code) => {
                 let mut buf = [0u8; 4];
-                host_ctypes::ffi_type_from_code(code.encode_utf8(&mut buf))
-                    .ok_or_else(|| crate::PyError::type_error("unknown callback argument type"))
+                host_ctypes::ffi_type_from_code(code.encode_utf8(&mut buf)).ok_or_else(|| {
+                    pyre_interpreter::PyError::type_error("unknown callback argument type")
+                })
             }
             CTypeLayout::Pointer => Ok(host_ctypes::ffi_pointer_type()),
             CTypeLayout::Struct { fields, .. } => fields
@@ -174,7 +179,9 @@ mod imp {
         }
     }
 
-    fn ffi_type_for_ret(ret: &funcptr::Ret) -> Result<host_ctypes::FfiType, crate::PyError> {
+    fn ffi_type_for_ret(
+        ret: &funcptr::Ret,
+    ) -> Result<host_ctypes::FfiType, pyre_interpreter::PyError> {
         match ret {
             funcptr::Ret::Void => Ok(host_ctypes::ffi_void_type()),
             funcptr::Ret::Code(c) => {
@@ -186,8 +193,8 @@ mod imp {
         }
     }
 
-    fn invalid_callback_result_type() -> crate::PyError {
-        crate::PyError::type_error("invalid result type for callback function")
+    fn invalid_callback_result_type() -> pyre_interpreter::PyError {
+        pyre_interpreter::PyError::type_error("invalid result type for callback function")
     }
 
     unsafe extern "C" fn thunk_callback(
@@ -215,7 +222,8 @@ mod imp {
         args: *const *const c_void,
         userdata: &ThunkUserdata,
     ) {
-        let _callback = crate::module::thread::enter_external_callback_from_foreign_thread();
+        let _callback =
+            pyre_interpreter::module::thread::enter_external_callback_from_foreign_thread();
         let _roots = pyre_object::gc_roots::push_roots();
         let obj_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(unsafe { *userdata.slot } as PyObjectRef);
@@ -224,10 +232,12 @@ mod imp {
         let call_result = match decode_args(current_obj(), args) {
             Ok(decoded) => host_ctypes::with_callback_errno_preserved(use_errno, || {
                 let callable = funcptr::instance_get(current_obj(), funcptr::CALLABLE_KEY)
-                    .ok_or_else(|| crate::PyError::type_error("callback has no callable"))?;
+                    .ok_or_else(|| {
+                        pyre_interpreter::PyError::type_error("callback has no callable")
+                    })?;
                 let _ = pyre_object::gc_roots::pin_root(callable);
                 let callable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-                crate::call::call_function_impl_result(
+                pyre_interpreter::call::call_function_impl_result(
                     pyre_object::gc_roots::shadow_stack_get(callable_slot),
                     &decoded,
                 )
@@ -265,7 +275,7 @@ mod imp {
     fn decode_args(
         obj: PyObjectRef,
         args: *const *const c_void,
-    ) -> Result<Vec<PyObjectRef>, crate::PyError> {
+    ) -> Result<Vec<PyObjectRef>, pyre_interpreter::PyError> {
         let argtypes = funcptr::resolve_argtypes(obj).unwrap_or_default();
         // Published as one set for the reason `pin_roots` documents: pinning
         // them one at a time makes the first query a safepoint at which the
@@ -293,7 +303,10 @@ mod imp {
             .collect())
     }
 
-    fn decode_arg(at: PyObjectRef, p: *const c_void) -> Result<PyObjectRef, crate::PyError> {
+    fn decode_arg(
+        at: PyObjectRef,
+        p: *const c_void,
+    ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         // A `_CFuncPtr` can expose the pointer type code too, but Python must
         // receive a callable function-pointer instance, not the integer that
         // the generic simple decoder would produce.  CPython's
@@ -301,7 +314,7 @@ mod imp {
         // scalar fallback.
         if funcptr::is_funcptr_type(at) {
             let address = unsafe { *(p as *const usize) };
-            let inst = crate::call::type_call_instantiate(at, &[])?;
+            let inst = pyre_interpreter::call::type_call_instantiate(at, &[])?;
             let inst_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(inst);
             funcptr::store_funcptr_addr(
@@ -324,21 +337,23 @@ mod imp {
             }));
         }
         if let Some(size) = cdata::ctype_size_of(at) {
-            let inst = crate::call::type_call_instantiate(at, &[])?;
+            let inst = pyre_interpreter::call::type_call_instantiate(at, &[])?;
             let inst_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(inst);
             let bytes = unsafe { host_ctypes::borrow_memory(p.cast::<u8>(), size) };
             cdata::cdata_write(pyre_object::gc_roots::shadow_stack_get(inst_slot), 0, bytes);
             return Ok(pyre_object::gc_roots::shadow_stack_get(inst_slot));
         }
-        Err(crate::PyError::type_error("cannot build parameter"))
+        Err(pyre_interpreter::PyError::type_error(
+            "cannot build parameter",
+        ))
     }
 
     fn write_result(
         obj: PyObjectRef,
         value: PyObjectRef,
         result: *mut c_void,
-    ) -> Result<(), crate::PyError> {
+    ) -> Result<(), pyre_interpreter::PyError> {
         match funcptr::resolve_restype(obj)? {
             funcptr::Ret::Void => Ok(()),
             funcptr::Ret::Code(c) => {
@@ -379,7 +394,9 @@ mod imp {
 mod imp {
     use super::PyObjectRef;
 
-    pub(super) fn build_thunk(_obj: PyObjectRef) -> Result<Option<usize>, crate::PyError> {
+    pub(super) fn build_thunk(
+        _obj: PyObjectRef,
+    ) -> Result<Option<usize>, pyre_interpreter::PyError> {
         Ok(None)
     }
 }
@@ -387,6 +404,6 @@ mod imp {
 /// Build a C-callable thunk for the callback `CFuncPtr` instance `obj` and
 /// return its code address, or `None` when this platform has no libffi closure
 /// support.
-pub(super) fn build_thunk(obj: PyObjectRef) -> Result<Option<usize>, crate::PyError> {
+pub(super) fn build_thunk(obj: PyObjectRef) -> Result<Option<usize>, pyre_interpreter::PyError> {
     imp::build_thunk(obj)
 }
