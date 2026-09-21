@@ -2650,7 +2650,15 @@ fn thin_with_forwarded(thin: u64, packed: u64) -> Option<u64> {
 }
 
 fn is_stamp_inline(w: u64) -> bool {
-    (w & !0xFFFF_FFFF) == SLOT_STAMP_INLINE_TAG
+    // Bits 48-62 = 0x7FFE is the stamp-only tag. A thin descr with interned
+    // wide-stamp id 0x1FFE sets the same bits, and on wasm32 bits 32-47 are
+    // zero (pointers are 32-bit), so the tag match alone would treat that
+    // GETFIELD as stamp-only and `getdescr()` would return None.
+    // Stamp-only words store `pack_stamp` in bits 0-31; every packed stamp
+    // has low 3 bits nonzero (`STAMP_VOID`/`STAMP_INT`/`STAMP_WIDE`). Thin
+    // descr payloads are 8-aligned Arc data pointers, so `w as u32 & 7`
+    // splits the two.
+    (w & !0xFFFF_FFFF) == SLOT_STAMP_INLINE_TAG && (w as u32) & 7 != 0
 }
 
 fn tagged_ptr(w: u64) -> usize {
