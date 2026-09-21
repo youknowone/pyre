@@ -120,7 +120,13 @@ mod tests {
 
     #[test]
     fn fixed_size_and_bare_item_pointers_are_headerless() {
-        for id in ["[i64;4]", "[i64; 4]", "[*mut PyObject]", "*const i64", "*mut Point"] {
+        for id in [
+            "[i64;4]",
+            "[i64; 4]",
+            "[*mut PyObject]",
+            "*const i64",
+            "*mut Point",
+        ] {
             assert!(
                 nolength_from_array_type_id(Some(id)),
                 "{id} has no length header"
