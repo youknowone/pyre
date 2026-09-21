@@ -3341,7 +3341,7 @@ pub fn install_default_builtins(ns: PyObjectRef) {
         crate::typedef::gettypeobject(&pyre_object::functional::REVERSED_TYPE)
     });
     crate::module_ns_get_or_insert_with(ns, "sorted", || {
-        make_module_builtin_function("sorted", __majit_wrap_builtin_sorted)
+        make_module_builtin_function("sorted", crate::app_functional::builtin_sorted)
     });
     crate::module_ns_get_or_insert_with(ns, "iter", || {
         make_module_builtin_function("iter", builtin_iter)

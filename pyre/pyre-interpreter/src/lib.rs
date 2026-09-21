@@ -148,6 +148,7 @@ pub mod host_seam {
         let _ = std::io::stdout().flush();
     }
 }
+pub mod app_functional;
 pub mod async_operation;
 pub mod codec_engine;
 pub mod jit_builtin_folds;

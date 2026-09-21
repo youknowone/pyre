@@ -8961,10 +8961,19 @@ pub(crate) unsafe fn resolve_inlinable_callee(
     callable: pyre_object::PyObjectRef,
 ) -> Option<(*const (), usize, bool)> {
     unsafe {
+        // `is_function` also admits METHOD_DESCRIPTOR_TYPE.  Inlinable
+        // callees are `function.py Function` and the MixedModule-wrapped
+        // `BuiltinFunction` that still carries PyCode (`_load_lazily`).
+        // Interp-level builtins have BuiltinCode and fail the CODE_TYPE
+        // check below.  Slot wrappers / method descriptors stay residual.
+        if !pyre_interpreter::is_function(callable) {
+            return None;
+        }
+        let ob_type = (*callable).ob_type as *const () as usize;
         let function_type_addr = &pyre_interpreter::FUNCTION_TYPE as *const _ as usize;
-        if !pyre_interpreter::is_function(callable)
-            || (*callable).ob_type as *const () as usize != function_type_addr
-        {
+        let builtin_function_type_addr =
+            &pyre_interpreter::BUILTIN_FUNCTION_TYPE as *const _ as usize;
+        if ob_type != function_type_addr && ob_type != builtin_function_type_addr {
             return None;
         }
         let w_code = pyre_interpreter::function_get_code(callable);
@@ -9041,26 +9050,34 @@ unsafe fn lookup_instance_dunder_call(
     Some((method, w_class, version_tag))
 }
 
-/// `typeobject.py descr_call` for a class whose `__new__` is a builtin gateway
-/// and whose `__init__` is `object`'s: the whole of `type.__call__` is then the
-/// `__new__` call, which `try_walker_inline_builtin_call` enters with the class
-/// as its receiver.
+/// `typeobject.py descr_call` for a class whose `__new__` is a builtin gateway.
 ///
-/// `object.__init__` rejects surplus arguments only when `__new__` is
-/// `object`'s or `__init__` is overridden, and neither holds here, so the
-/// `__init__` half of `descr_call` has no effect to reproduce.  That is true of
-/// the class named at the call; `descr_call` looks `__init__` up on the type of
-/// what `__new__` returned.  A builtin `__new__` handed the exact class returns
-/// another type only through a conversion dunder of an argument (`__int__`,
-/// `__str__`, ...), so every argument is required to be an instance of a
-/// builtin type, which the caller pins.
+/// When `__init__` is `object`'s, the whole of `type.__call__` is the `__new__`
+/// call, which `try_walker_inline_builtin_call` enters with the class as its
+/// receiver.  `object.__init__` rejects surplus arguments only when `__new__`
+/// is `object`'s or `__init__` is overridden, and neither holds here, so that
+/// half of `descr_call` has no effect to reproduce.
+///
+/// That is true of the class named at the call; `descr_call` looks `__init__`
+/// up on the type of what `__new__` returned.  A builtin `__new__` handed the
+/// exact class returns another type only through a conversion dunder of an
+/// argument (`__int__`, `__str__`, ...), so every argument is required to be
+/// an instance of a builtin type, which the caller pins — but only in the
+/// `__init__`-is-`object`'s case, where skipping `__init__` is valid only if
+/// the result type cannot change.
+///
+/// When `__init__` is itself a builtin gateway (`list.__init__` calling
+/// `extend`), `descr_call` runs both halves and the result type is the class
+/// being called.  The conversion-dunder pin does not apply: `list(x)` iterates
+/// `x` rather than converting it.  The second return is that `__init__`; the
+/// caller walks it after `__new__` and keeps the instance.
 ///
 /// # Safety
 /// `callable` and every entry of `args` must be valid objects.
 unsafe fn resolve_type_call_builtin_new(
     callable: pyre_object::PyObjectRef,
     args: &[ConcreteValue],
-) -> Option<pyre_object::PyObjectRef> {
+) -> Option<(pyre_object::PyObjectRef, Option<pyre_object::PyObjectRef>)> {
     if callable.is_null() || !unsafe { pyre_object::is_type(callable) } {
         return None;
     }
@@ -9091,9 +9108,15 @@ unsafe fn resolve_type_call_builtin_new(
     }
     let tp_init = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(callable, "__init__") };
     let obj_init = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_object, "__init__") };
-    if tp_init != obj_init {
-        return None;
-    }
+    let builtin_init = if tp_init == obj_init {
+        None
+    } else {
+        let init = tp_init?;
+        if !unsafe { pyre_interpreter::is_function_carrier(init) } {
+            return None;
+        }
+        Some(init)
+    };
     for arg in args {
         let ConcreteValue::Ref(arg) = arg else {
             return None;
@@ -9102,21 +9125,28 @@ unsafe fn resolve_type_call_builtin_new(
             return None;
         }
         let w_class = unsafe { (**arg).w_class };
-        if w_class.is_null()
-            || !unsafe { pyre_object::is_type(w_class) }
-            || unsafe { pyre_object::typeobject::w_type_is_heaptype(w_class) }
+        if w_class.is_null() || !unsafe { pyre_object::is_type(w_class) } {
+            return None;
+        }
+        // Skipping `__init__` is valid only when `__new__` cannot return
+        // another type through a conversion dunder.  Running a builtin
+        // `__init__` is the `descr_call` shape for `list(x)` / similar, and
+        // the result type is the class being called regardless of whether
+        // `x` is a heaptype (`FrameLocalsProxy` is one).
+        if builtin_init.is_none() && unsafe { pyre_object::typeobject::w_type_is_heaptype(w_class) }
         {
             return None;
         }
     }
-    Some(tp_new)
+    Some((tp_new, builtin_init))
 }
 
 /// [`lookup_instance_dunder_call`] narrowed to an app-level `__call__` the
 /// walker can inline.  A `__call__` that is not a plain inlinable function — a
 /// `classmethod`, another callable object — has no body to walk and declines
-/// here, exactly as `resolve_inlinable_callee` declines a non-`Function`
-/// callee; a builtin gateway `__call__` is `try_walker_inline_builtin_call`'s.
+/// here, exactly as `resolve_inlinable_callee` declines a callee that is
+/// neither `Function` nor a PyCode-carrying `BuiltinFunction`; a builtin
+/// gateway `__call__` is `try_walker_inline_builtin_call`'s.
 ///
 /// # Safety
 /// `callable` must be a valid object.

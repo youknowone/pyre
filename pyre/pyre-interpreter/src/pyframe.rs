@@ -755,6 +755,12 @@ pub mod frame_locals_proxy {
             crate::baseobjspace::iter(self.keys()?)
         }
 
+        /// The collect loop is bounded by the count [`Self::pin_entries`]
+        /// just produced from the green `locals_plus_names` array, so the
+        /// hint is the same one `fast2locals` carries.  Without it
+        /// `contains_loop` declines this graph even though `pin_entries` is
+        /// already hinted, and `reversed(fr.f_locals)` is one residual.
+        #[majit_macros::unroll_safe]
         fn __reversed__(&self) -> Result<PyObjectRef, crate::PyError> {
             // `framelocalsproxy_reversed` reverses the key LIST in place and
             // hands that back; it does not build a cursor.
@@ -791,6 +797,14 @@ pub mod frame_locals_proxy {
             crate::baseobjspace::contains(roots.get(extra_slot), roots.get(key_slot))
         }
 
+        /// The collect loop is bounded by the count [`Self::pin_entries`]
+        /// just produced from the green `locals_plus_names` array, so the
+        /// hint is the same one `fast2locals` carries.  Without it
+        /// `contains_loop` declines this graph even though `pin_entries` is
+        /// already hinted, and `sorted(fr.f_locals)` / `iter(fr.f_locals)`
+        /// (both `framelocalsproxy_iter` → `keys`) stay one residual call
+        /// per except-handler iteration.
+        #[majit_macros::unroll_safe]
         fn keys(&self) -> Result<PyObjectRef, crate::PyError> {
             let roots = pyre_object::gc_roots::push_roots();
             let base = roots.base();
@@ -802,6 +816,9 @@ pub mod frame_locals_proxy {
             Ok(pyre_object::w_list_new(keys))
         }
 
+        /// Same bound as [`Self::keys`]: the collect is the `pin_entries`
+        /// count, not a red dict length.
+        #[majit_macros::unroll_safe]
         fn values(&self) -> Result<PyObjectRef, crate::PyError> {
             let roots = pyre_object::gc_roots::push_roots();
             let base = roots.base();
@@ -813,6 +830,8 @@ pub mod frame_locals_proxy {
             Ok(pyre_object::w_list_new(values))
         }
 
+        /// Same bound as [`Self::keys`].
+        #[majit_macros::unroll_safe]
         fn items(&self) -> Result<PyObjectRef, crate::PyError> {
             // Each `w_tuple_new` allocates, so the pairs still queued in the
             // scan and the tuples already built are pre-allocation copies by

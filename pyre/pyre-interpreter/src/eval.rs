@@ -1525,6 +1525,7 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     crate::reduce_protocol::walk_handle_roots(visitor);
     // The aiter/anext app-level handles are the same off-GC-slot case.
     crate::async_operation::walk_handle_roots(visitor);
+    crate::app_functional::walk_handle_roots(visitor);
     // `_compat_pickle`'s fix_imports tables are `space.fromcache(State)` off-GC
     // slots; forward them on every collection so a minor move updates the cached
     // mapping pointers. Placed with the ungated handle roots (not the gated

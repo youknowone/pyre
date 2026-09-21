@@ -3781,8 +3781,9 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
                 .flatten()
             else {
                 // The callable's type is the whole answer here:
-                // `resolve_inlinable_callee` takes plain `function` only, so a
-                // `builtin_function_or_method` or a `method` reads as "not
+                // `resolve_inlinable_callee` takes `function` and a
+                // MixedModule `BuiltinFunction` that still carries PyCode,
+                // so a BuiltinCode builtin or a `method` reads as "not
                 // inlinable" for a reason no pc can convey.
                 decline!(format_args!(
                     "callee not inlinable (callable type {})",
@@ -4542,6 +4543,9 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // `descr_call` on a class whose `__new__` is a builtin gateway: the class
     // is the wrapper's receiver.  See `resolve_type_call_builtin_new`.
     let mut type_call_class = None;
+    // When `__init__` is also a builtin gateway (`list.__init__`), walk it
+    // after `__new__` and keep the instance — `typeobject.py descr_call`.
+    let mut type_call_init = None;
     // A type-dict `__call__` installed from a `BuiltinCode` is a slot wrapper:
     // the same `Function` carrier under `SLOT_WRAPPER_TYPE`, so the carrier
     // test admits it and the `Function.code` read below is the same load.
@@ -4557,7 +4561,25 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
                 (method, Some(callable_operand))
             }
             None => match unsafe { resolve_type_call_builtin_new(callable, &arg_concretes[2..]) } {
-                Some(tp_new) => {
+                Some((tp_new, tp_init)) => {
+                    // `__new__` allocates, which is an effect, so `__init__`
+                    // must be known-descendable before that walk starts:
+                    // a later decline cannot rewind the instance.
+                    if let Some(init) = tp_init {
+                        let init_items = 1 + r_args.len().saturating_sub(2);
+                        if let Some(why) = builtin_gateway_undescendable_reason(init, init_items) {
+                            if fbw_inline_diag_enabled() {
+                                eprintln!(
+                                    "[builtin-inline-decline] pc={} why=type.__call__ __init__ not descendable class={} detail={}",
+                                    op.pc,
+                                    unsafe { pyre_object::w_type_get_name(callable_operand) },
+                                    why,
+                                );
+                            }
+                            return Ok(None);
+                        }
+                        type_call_init = Some(init);
+                    }
                     type_call_class = Some(callable_operand);
                     (tp_new, Some(callable_operand))
                 }
@@ -5124,11 +5146,342 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
         DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
             Some(value) => {
                 let concrete = concrete_from_recorded_opref(ctx, value);
+                if let Some(tp_init) = type_call_init {
+                    return try_walker_inline_type_call_builtin_init(
+                        ctx,
+                        op,
+                        code,
+                        r_args,
+                        dst,
+                        tp_init,
+                        value,
+                        concrete,
+                        &arg_concretes,
+                    );
+                }
                 write_ref_reg(ctx, op.pc, dst, value, concrete)?;
                 Ok(Some((DispatchOutcome::Continue, op.next_pc)))
             }
             None => Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc }),
         },
+        DispatchOutcome::SubRaise { exc, exc_concrete } => {
+            if let Some(target) = try_catch_exception_at(code, op.next_pc) {
+                ctx.set_last_exc_value(exc, exc_concrete);
+                Ok(Some((DispatchOutcome::Continue, target)))
+            } else {
+                Ok(Some((
+                    DispatchOutcome::SubRaise { exc, exc_concrete },
+                    op.next_pc,
+                )))
+            }
+        }
+        DispatchOutcome::Terminate => Ok(Some((DispatchOutcome::Terminate, op.next_pc))),
+        DispatchOutcome::SwitchToBlackhole {
+            reason,
+            raising_exception,
+        } => Ok(Some((
+            DispatchOutcome::SwitchToBlackhole {
+                reason,
+                raising_exception,
+            },
+            op.next_pc,
+        ))),
+        DispatchOutcome::CloseLoop { .. }
+        | DispatchOutcome::CompileTracePending { .. }
+        | DispatchOutcome::SubLoopCalleeCallAssembler { .. }
+        | DispatchOutcome::SegmentTrace { .. } => {
+            Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
+        }
+        DispatchOutcome::Continue => {
+            unreachable!(
+                "walk() only exits on Terminate / SubReturn / SubRaise / SwitchToBlackhole"
+            )
+        }
+    }
+}
+
+/// Why `callable` cannot be descended with `wrapper_item_count` arguments,
+/// or `None` if it can.  `__new__` allocates, so `__init__` must pass this
+/// before that walk starts.
+fn builtin_gateway_undescendable_reason(
+    callable: pyre_object::PyObjectRef,
+    wrapper_item_count: usize,
+) -> Option<&'static str> {
+    if !unsafe { pyre_interpreter::is_function_carrier(callable) } {
+        return Some("not is_function_carrier");
+    }
+    let builtin_code =
+        unsafe { pyre_interpreter::function_get_code(callable) } as pyre_object::PyObjectRef;
+    if builtin_code.is_null() || !unsafe { pyre_interpreter::is_builtin_code(builtin_code) } {
+        return Some("not builtin_code");
+    }
+    let fnaddr = unsafe { pyre_interpreter::builtin_code_get(builtin_code) as usize };
+    let Some(jitcode) = crate::state::bytecode_for_address(fnaddr) else {
+        return Some("no jitcode for address");
+    };
+    if crate::jitcode_dispatch::sub_jitcode_body_by_index(jitcode.index()).is_none() {
+        return Some("no sub jitcode body");
+    }
+    if crate::state::ensure_build_time_jitcode_at(jitcode.index()).is_none() {
+        return Some("wrapper jitcode absent from the build-time table");
+    }
+    match descent_decline(jitcode.index(), &[(0, wrapper_item_count)]) {
+        None => None,
+        Some(DescentDecline::Helper(_)) => {
+            log_descent_unlowered_helper_blockers(jitcode.index());
+            Some("un-lowered helper after effect")
+        }
+        Some(DescentDecline::BodyNotWalked) => Some("body holds bytes the scan cannot decode"),
+    }
+}
+
+/// `typeobject.py descr_call`'s `__init__` half after a builtin `__new__`
+/// already ran: walk the builtin `__init__` with the instance as `self` and
+/// keep the instance as the CALL result.
+///
+/// `__new__` has already allocated, so a decline here cannot rewind the
+/// type-call.  The caller checked [`builtin_gateway_undescendable_reason`] first.
+fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    r_args: &[OpRef],
+    dst: usize,
+    tp_init: pyre_object::PyObjectRef,
+    instance: OpRef,
+    instance_concrete: ConcreteValue,
+    arg_concretes: &[ConcreteValue],
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    let ConcreteValue::Ref(instance_obj) = instance_concrete else {
+        write_ref_reg(ctx, op.pc, dst, instance, instance_concrete)?;
+        return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
+    };
+    // `descr_call` runs `__init__` only when `__new__` returned an instance
+    // of the called class.
+    if let Some(w_type) = walker_concrete_ref_object(ctx, r_args[0])
+        && !unsafe { pyre_interpreter::baseobjspace::isinstance_w(instance_obj, w_type) }
+    {
+        write_ref_reg(ctx, op.pc, dst, instance, instance_concrete)?;
+        return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
+    }
+    let builtin_code =
+        unsafe { pyre_interpreter::function_get_code(tp_init) } as pyre_object::PyObjectRef;
+    let fnaddr = unsafe { pyre_interpreter::builtin_code_get(builtin_code) as usize };
+    let Some(jitcode) = crate::state::bytecode_for_address(fnaddr) else {
+        write_ref_reg(ctx, op.pc, dst, instance, instance_concrete)?;
+        return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
+    };
+    let Some(body) = crate::jitcode_dispatch::sub_jitcode_body_by_index(jitcode.index()) else {
+        write_ref_reg(ctx, op.pc, dst, instance, instance_concrete)?;
+        return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
+    };
+    if crate::state::ensure_build_time_jitcode_at(jitcode.index()).is_none() {
+        write_ref_reg(ctx, op.pc, dst, instance, instance_concrete)?;
+        return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
+    }
+    if fbw_inline_diag_enabled() {
+        eprintln!(
+            "[type-call-init] pc={} class={} init={}",
+            op.pc,
+            unsafe {
+                walker_concrete_ref_object(ctx, r_args[0])
+                    .map(|t| pyre_object::w_type_get_name(t))
+                    .unwrap_or("")
+            },
+            unsafe { pyre_interpreter::function_get_name(tp_init) },
+        );
+    }
+
+    let nested_helper = ctx.fbw_mode.inline_subwalk;
+    let nested_helper_entry = if nested_helper {
+        match compute_inline_helper_call_entry_frame(ctx, op.pc) {
+            Ok(frame) => Some(frame),
+            Err(_) => {
+                write_ref_reg(ctx, op.pc, dst, instance, instance_concrete)?;
+                return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
+            }
+        }
+    } else {
+        None
+    };
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() {
+        write_ref_reg(ctx, op.pc, dst, instance, instance_concrete)?;
+        return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
+    }
+    let sym = unsafe { &*sym_ptr };
+    if sym.jitcode().is_null() {
+        write_ref_reg(ctx, op.pc, dst, instance, instance_concrete)?;
+        return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
+    }
+    let (call_site_py_pc, vsd_value, outer_jitcode_index, call_site_marker) = if nested_helper {
+        (
+            ctx.entry_py_pc(),
+            0,
+            ctx.outer_jitcode_index,
+            ctx.outer_resume_marker_jit_pc,
+        )
+    } else {
+        unsafe {
+            let jc = &*sym.jitcode();
+            let jc_index = jc.index as u32;
+            let marker = jc.payload.resume_marker_for_jitcode_pc(op.pc);
+            let mut py = jc
+                .payload
+                .forward_py_pc_for_jitcode_pc(op.pc)
+                .unwrap_or_else(|| {
+                    crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.payload.metadata, op.pc)
+                });
+            if jc.payload.code_ptr.is_null() {
+                (py, sym.valuestackdepth() as i64, jc_index, marker)
+            } else {
+                let codeobj = &*jc.payload.code_ptr;
+                py = skip_python_trivia_forward(codeobj, py as usize) as u32;
+                let depth = if jc.payload.depth_trivia_populated() {
+                    jc.payload.depth_trivia_for_jitcode_pc(op.pc)
+                } else {
+                    crate::liveness::liveness_for(jc.payload.code_ptr)
+                        .depth_at_py_pc()
+                        .get(py as usize)
+                        .copied()
+                };
+                let vsd = depth
+                    .map(|d| (sym.nlocals() + d as usize) as i64)
+                    .unwrap_or(sym.valuestackdepth() as i64);
+                (py, vsd, jc_index, marker)
+            }
+        }
+    };
+    let call_site_active = if nested_helper_entry.is_some() {
+        ctx.frame_state.borrow().outer_active_boxes.clone()
+    } else {
+        let call_site_word = call_site_marker
+            .map(|marker| marker as i32)
+            .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
+        let vstack_boxes = ctx.frame_state.borrow().vstack_boxes.clone();
+        let vstack = ctx.vstack_valid.then_some(vstack_boxes.as_slice());
+        collect_outer_active_boxes(
+            sym,
+            ctx.trace_ctx,
+            ctx.registers_i,
+            ctx.registers_r,
+            ctx.registers_f,
+            outer_jitcode_index,
+            false,
+            call_site_word,
+            op.pc as i32,
+            OuterActiveBoxesEntryTwin::Plain,
+            "builtin_wrapper_call_site",
+            vstack,
+            &[],
+            None,
+        )
+    };
+
+    let mut wrapper_items = Vec::with_capacity(1 + r_args.len().saturating_sub(2));
+    let mut wrapper_item_concretes = Vec::with_capacity(1 + arg_concretes.len().saturating_sub(2));
+    wrapper_items.push(instance);
+    wrapper_item_concretes.push(instance_concrete);
+    wrapper_items.extend_from_slice(&r_args[2..]);
+    wrapper_item_concretes.extend_from_slice(&arg_concretes[2..]);
+    for (&item, concrete) in wrapper_items.iter().zip(&wrapper_item_concretes) {
+        if let ConcreteValue::Ref(value) = concrete
+            && !value.is_null()
+        {
+            ctx.trace_ctx.try_set_opref_concrete(
+                item,
+                majit_ir::Value::Ref(majit_ir::GcRef(*value as usize)),
+            );
+        }
+    }
+
+    let array_descr = crate::state::pyobject_gcarray_descr();
+    let len = ctx.trace_ctx.const_int(wrapper_items.len() as i64);
+    let args_array =
+        ctx.trace_ctx
+            .record_op_with_descr(OpCode::NewArrayClear, &[len], array_descr.clone());
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .new_array(args_array, len, true);
+    for (index, &item) in wrapper_items.iter().enumerate() {
+        let index = ctx.trace_ctx.const_int(index as i64);
+        ctx.trace_ctx.record_op_with_descr(
+            OpCode::SetarrayitemGc,
+            &[args_array, index, item],
+            array_descr.clone(),
+        );
+        ctx.trace_ctx
+            .heapcache_setarrayitem(args_array, index, array_descr.index(), item);
+    }
+
+    if !nested_helper && sym.owns_virtualizable_shadow() {
+        let last_instr = call_site_py_pc as i64 - 1;
+        let last_instr_op = ctx.trace_ctx.const_int(last_instr);
+        crate::trace_opcode::mirror_vable_static_to_boxes(
+            ctx.trace_ctx,
+            "last_instr",
+            last_instr_op,
+            Value::Int(last_instr),
+        );
+        let vsd_op = ctx.trace_ctx.const_int(vsd_value);
+        crate::trace_opcode::mirror_vable_static_to_boxes(
+            ctx.trace_ctx,
+            "valuestackdepth",
+            vsd_op,
+            Value::Int(vsd_value),
+        );
+    }
+
+    let saved_entry = ctx.entry_py_pc;
+    let saved_marker = ctx.outer_resume_marker_jit_pc;
+    let saved_oji = ctx.outer_jitcode_index;
+    let saved_active = std::mem::take(&mut ctx.frame_state.borrow_mut().outer_active_boxes);
+    let saved_descr_refs = ctx.descr_refs;
+    let saved_raw_descrs = ctx.raw_descrs;
+    let saved_lookup = ctx.sub_jitcode_lookup;
+    let saved_fbw_mode = ctx.fbw_mode;
+    ctx.entry_py_pc = EntryPyPc::Jit(op.pc);
+    ctx.outer_resume_marker_jit_pc = call_site_marker;
+    ctx.outer_jitcode_index = outer_jitcode_index;
+    ctx.frame_state.borrow_mut().outer_active_boxes = call_site_active;
+    ctx.descr_refs = crate::jitcode_runtime::descr_ref_table();
+    ctx.raw_descrs = RawDescrPool::Global;
+    ctx.sub_jitcode_lookup = &GLOBAL_SUB_JITCODE_LOOKUP_FN;
+    ctx.fbw_mode.inline_subwalk = true;
+    ctx.fbw_mode.inline_caller_py_pc = Some(call_site_py_pc);
+    ctx.fbw_mode.transparent_helper_jitcode_index = Some(jitcode.index());
+    let _helper_frame = nested_helper_entry
+        .map(|frame| InlineFrameGuard::enter(ctx.session, 0, false, vec![frame]));
+    let exc_before_subwalk = ctx.last_exc_value();
+    let walk_result = run_sub_jitcode_walk(
+        ctx,
+        op.pc,
+        &body,
+        &[],
+        &[],
+        &[args_array],
+        &[ConcreteValue::Null],
+        &[],
+    );
+    ctx.fbw_mode = saved_fbw_mode;
+    ctx.entry_py_pc = saved_entry;
+    ctx.outer_resume_marker_jit_pc = saved_marker;
+    ctx.outer_jitcode_index = saved_oji;
+    ctx.frame_state.borrow_mut().outer_active_boxes = saved_active;
+    ctx.descr_refs = saved_descr_refs;
+    ctx.raw_descrs = saved_raw_descrs;
+    ctx.sub_jitcode_lookup = saved_lookup;
+
+    let walk_result = match walk_result {
+        Ok(outcome) => outcome,
+        Err(error) => return Err(error),
+    };
+    match promote_published_null_return_since(ctx, walk_result, op.pc, exc_before_subwalk) {
+        DispatchOutcome::SubReturn { result: _ } => {
+            // `descr_call` discards `__init__`'s None and returns the instance.
+            write_ref_reg(ctx, op.pc, dst, instance, instance_concrete)?;
+            Ok(Some((DispatchOutcome::Continue, op.next_pc)))
+        }
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 ctx.set_last_exc_value(exc, exc_concrete);

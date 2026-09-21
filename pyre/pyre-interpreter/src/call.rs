@@ -672,6 +672,8 @@ pub fn set_last_exec_ctx(ctx: *const crate::PyExecutionContext) {
         }
         if previous.is_null() && !ctx.is_null() {
             crate::module::thread::register_execution_context(ctx);
+            // appleveldef `sorted` needs a live EC (`appleveldef_install`).
+            crate::app_functional::install_applevel_builtins();
         } else if !previous.is_null() && ctx.is_null() {
             crate::module::thread::unregister_execution_context();
         } else if !previous.is_null() && !ctx.is_null() {
