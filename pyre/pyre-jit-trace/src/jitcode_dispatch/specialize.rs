@@ -6110,6 +6110,13 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
     if !ctx.is_authoritative_executor || w_code_ptr == 0 {
         return Ok(None);
     }
+    // Direct STORE_ATTR writes the live instance before returning.  With a
+    // FOR_ITER item in flight that write is unjournaled, so decline the fold
+    // and let the residual executor abort before executing the generic
+    // setattr (`fbw_abort_unrecoverable_foriter_body_effect`).
+    if fbw_foriter_inflight_active() {
+        return Ok(None);
+    }
     let (Some(concrete_obj), Some(concrete_value)) = (
         walker_concrete_ref_object(ctx, obj),
         walker_concrete_ref_object(ctx, value),

@@ -4198,6 +4198,71 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         }
         fbw_abort_nested_unjournaled_residual(ctx, op_pc, None)?;
     }
+    // The loop-variable binding store is the op at the in-flight FOR_ITER's
+    // `body_pc` (the FOR_ITER continue-arm fallthrough), a STORE_NAME/
+    // STORE_GLOBAL that writes the just-consumed item to the loop target (a
+    // module/global-scope `for i in …`; a function-scope loop var is a
+    // STORE_FAST frame local that never becomes a residual).  Re-delivery
+    // re-runs the body from `body_pc`, re-storing the SAME re-delivered item to
+    // the SAME name — an idempotent write, never an accumulating double.  Like
+    // the `is_idempotent_gc_barrier` write barrier it still EXECUTES concretely
+    // (the module dict must hold the binding for the walk's remaining reads) but
+    // it is not a body effect: keep it out of the R1 in-flight-FOR_ITER
+    // accounting so an escaping residual later in the same body does not
+    // refuse-drop the whole iteration.
+    // `vstack_cur_pypc` is the pc the walk is ABOUT TO ENTER
+    // (`reconcile_vstack_at_boundary` sets it to `new_pypc` after reconciling
+    // the PREVIOUS opcode), so at this residual it names the opcode being
+    // walked.  The loop-var store is recognised by the FOR_ITER body's own
+    // relation `body_pc + 1 == vstack_cur_pypc`, i.e. the walk has advanced one
+    // opcode past the recorded body pc — not by a next-instr convention.
+    let is_loop_var_binding_store = is_loop_var_binding_store(ctx, helper);
+    // PUSH_EXC_INFO's carrier clear is void-returning, so `writes_live_heap`
+    // alone counts it.  The slot it writes exists only to keep a propagating
+    // exception rooted for the collector — nothing reads it back as a value —
+    // and `push_exc_info` performs the same clear at the same point, so a
+    // re-run of the body reaches the same state rather than doubling anything.
+    // That is the `is_idempotent_gc_barrier` category, and BOTH accountings of
+    // it read this one binding: the gh#467 heap-write odometer below stated the
+    // exemption while the R1 discriminator on the next line did not, so a `for`
+    // body whose only committed residual was `except`'s clear had its delivery
+    // refused and the whole iteration dropped — the outcome the refusal exists
+    // to be safer than.
+    let writes_gc_liveness_root_only =
+        helper == majit_ir::RuntimeHelperKind::ClearInFlightException;
+    let body_effect_candidate = !provably_side_effect_free
+        && !is_idempotent_gc_barrier
+        && !is_loop_var_binding_store
+        && !writes_gc_liveness_root_only
+        && writes_live_heap
+        && fbw_foriter_inflight_active();
+    // Store / list-append journals (and the namespace journal for
+    // `StoreName` / `StoreGlobal` / `DeleteName` / `DeleteGlobal`) have
+    // rollback entry points; executing those residuals is recoverable.
+    // An unjournaled Void / mutator residual is not: abort before it runs
+    // so [`fbw_foriter_inflight_take`] can still restore the cursor.
+    // This gate is ahead of the vable token stamp below, matching the
+    // nested-residual decline: a declined residual must not strand a token.
+    let residual_will_be_journaled = inplace_list_journal.is_some()
+        || list_append_journal.is_some()
+        || matches!(
+            helper,
+            majit_ir::RuntimeHelperKind::StoreName
+                | majit_ir::RuntimeHelperKind::StoreGlobal
+                | majit_ir::RuntimeHelperKind::DeleteName
+                | majit_ir::RuntimeHelperKind::DeleteGlobal
+        );
+    if body_effect_candidate && !residual_will_be_journaled {
+        if fbw_debug_abort_enabled() {
+            eprintln!(
+                "[fbw-foriter] abort before unrecoverable body effect \
+                 (helper={helper:?} extraeffect={:?} result_type={:?} pc={op_pc})",
+                ei.extraeffect,
+                call_descr.result_type(),
+            );
+        }
+        return Err(fbw_abort_unrecoverable_foriter_body_effect(op_pc));
+    }
     // `vinfo.tracing_before_residual_call(virtualizable)`
     // heap half: every decline gate has now passed, so the helper WILL
     // execute — set TOKEN_TRACING_RESCALL on the active virtualizable so a
@@ -4344,56 +4409,6 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     } else {
         None
     };
-    // The loop-variable binding store is the op at the in-flight FOR_ITER's
-    // `body_pc` (the FOR_ITER continue-arm fallthrough), a STORE_NAME/
-    // STORE_GLOBAL that writes the just-consumed item to the loop target (a
-    // module/global-scope `for i in …`; a function-scope loop var is a
-    // STORE_FAST frame local that never becomes a residual).  Re-delivery
-    // re-runs the body from `body_pc`, re-storing the SAME re-delivered item to
-    // the SAME name — an idempotent write, never an accumulating double.  Like
-    // the `is_idempotent_gc_barrier` write barrier it still EXECUTES concretely
-    // (the module dict must hold the binding for the walk's remaining reads) but
-    // it is not a body effect: keep it out of the R1 in-flight-FOR_ITER
-    // accounting so an escaping residual later in the same body does not
-    // refuse-drop the whole iteration.
-    // `vstack_cur_pypc` is the pc the walk is ABOUT TO ENTER
-    // (`reconcile_vstack_at_boundary` sets it to `new_pypc` after reconciling
-    // the PREVIOUS opcode), so at this residual it names the opcode being
-    // walked.  The loop-var store is recognised by the FOR_ITER body's own
-    // relation `body_pc + 1 == vstack_cur_pypc`, i.e. the walk has advanced one
-    // opcode past the recorded body pc — not by a next-instr convention.
-    let is_loop_var_binding_store = is_loop_var_binding_store(ctx, helper);
-    // PUSH_EXC_INFO's carrier clear is void-returning, so `writes_live_heap`
-    // alone counts it.  The slot it writes exists only to keep a propagating
-    // exception rooted for the collector — nothing reads it back as a value —
-    // and `push_exc_info` performs the same clear at the same point, so a
-    // re-run of the body reaches the same state rather than doubling anything.
-    // That is the `is_idempotent_gc_barrier` category, and BOTH accountings of
-    // it read this one binding: the gh#467 heap-write odometer below stated the
-    // exemption while the R1 discriminator on the next line did not, so a `for`
-    // body whose only committed residual was `except`'s clear had its delivery
-    // refused and the whole iteration dropped — the outcome the refusal exists
-    // to be safer than.
-    let writes_gc_liveness_root_only =
-        helper == majit_ir::RuntimeHelperKind::ClearInFlightException;
-    // `cell_store_helper_subwalk` is write_cell-specific.  `write_cell`
-    // implements STORE_NAME / STORE_GLOBAL; its inner ops are `helper=None`
-    // Void writes, so the StoreName loop-var exemption above cannot see
-    // them.  The caller journals the cell (`FBW_CELL_STORE_JOURNAL`).
-    // Counting the descent as R1 body effect makes an abort after
-    // `for y in xs` refuse delivery and drop the item
-    // (`complex_abs_sub_hot`, `fbw_foriter_item_dropped`).
-    // A generator resume or an inlined builtin call also sets
-    // `transparent_helper_subwalk`, but those walks run real Python body
-    // code or unmodelled mutations with no journal, so they must not take
-    // this exemption.
-    let body_effect_candidate = !provably_side_effect_free
-        && !is_idempotent_gc_barrier
-        && !is_loop_var_binding_store
-        && !ctx.fbw_mode.cell_store_helper_subwalk
-        && !writes_gc_liveness_root_only
-        && writes_live_heap
-        && fbw_foriter_inflight_active();
     // #57 Option C (Finding #1, user-frame signal): the Void/helper-tag write
     // discriminator above cannot see a body effect committed through USER
     // PYTHON CODE by a value-returning (`Ref`), `RuntimeHelperKind::None`,
@@ -5032,7 +5047,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // nothing but the never-double guarantee.
     let entered_user_frame = user_frame_snapshot
         .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before);
-    if body_effect_candidate || entered_user_frame {
+    if entered_user_frame {
         if fbw_debug_abort_enabled() {
             eprintln!(
                 "[fbw-foriter] body effect committed since consume (helper={helper:?} \
