@@ -700,9 +700,8 @@ mod tests {
 
     #[test]
     fn every_unary_math_function_has_an_f64_method_llexternal() {
-        // `abs` is deliberately absent: the front no longer lowers `f64::abs`
-        // to `float_abs`. `core::f64::<Impl>::abs` is a registered
-        // `FOREIGN_STDLIB_EXTERNALS` residual with a faithful Float result.
+        // `abs` is deliberately absent: `float_abs` is an llop, so the front
+        // lowers `f64::abs` to the operation rather than to an external.
         for name in UNARY_MATH_FUNCTIONS {
             if *name == "fabs" {
                 continue;
