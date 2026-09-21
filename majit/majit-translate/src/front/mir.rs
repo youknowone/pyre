@@ -41611,28 +41611,19 @@ mod tests {
     }
 
     #[test]
-    fn collapse_fmt_chains_does_not_collapse_signed_hex_alternate() {
-        use super::{collapse_fmt_chains, collect_fmt_collapse};
+    fn collapse_fmt_chains_expands_signed_hex_alternate_to_hex_unop() {
+        use super::collapse_fmt_chains;
 
+        // `ll_int2hex` takes the sign of a Signed word (`i < 0` then `-`
+        // + magnitude). `hex(i)` is that helper; the format! shell's
+        // two's-complement `{:#x}` is what this rewrite replaces.
         let (mut graph, bf) = build_lower_hex_alternate_fmt_chain("Tuple<i64>");
-        assert!(
-            collect_fmt_collapse(&graph, bf, 0).is_none(),
-            "signed {{:#x}} must not collapse to hex"
-        );
-        assert_eq!(collapse_fmt_chains(&mut graph), 0);
+        assert_eq!(collapse_fmt_chains(&mut graph), 1);
         let bf_block = graph.blocks.iter().find(|b| b.id == bf).unwrap();
+        assert_eq!(bf_block.operations.len(), 1);
         match &bf_block.operations[0].kind {
-            OpKind::Call {
-                target: CallTarget::FunctionPath { segments, .. },
-                ..
-            } => {
-                assert_eq!(
-                    segments.last().map(String::as_str),
-                    Some("format"),
-                    "signed {{:#x}} chain must stay residual"
-                );
-            }
-            other => panic!("Bf op[0] not a residual format Call: {other:?}"),
+            OpKind::UnaryOp { op, .. } => assert_eq!(op, "hex"),
+            other => panic!("Bf op[0] not a hex UnaryOp: {other:?}"),
         }
     }
 
