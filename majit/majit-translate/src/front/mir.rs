@@ -109,8 +109,8 @@ use majit_charon_reader::{
 
 use crate::flowspace::model::{ConstValue, Variable};
 use crate::model::{
-    BlockId, CallTarget, ExitCase, ExitSwitch, FieldDescriptor, FrameState, FunctionGraph, Link,
-    LinkArg, OpKind, SpaceOperation, ValueType,
+    Block, BlockId, CallTarget, ExitCase, ExitSwitch, FieldDescriptor, FrameState, FunctionGraph,
+    Link, LinkArg, OpKind, SpaceOperation, ValueType,
 };
 
 /// Opaque non-null value for a prebuilt JIT-driver `NamedConst`.
@@ -3821,6 +3821,7 @@ fn scalar_replace_one_struct_aggregate(
         }
     }
 
+    let mut phi_copies: Vec<(BlockId, usize, Variable)> = Vec::new();
     let mut exits = std::mem::take(&mut graph.blocks[block_idx].exits);
     for link in &mut exits {
         for (slot, arg) in link.args.iter_mut().enumerate() {
@@ -3829,12 +3830,11 @@ fn scalar_replace_one_struct_aggregate(
             }
             let copy = emit_materialized_struct_copy(graph, &mut out, &owner, &fields);
             *arg = LinkArg::Value(copy.clone());
-            let target = link.target;
-            if let Some(block) = graph.blocks.iter_mut().find(|b| b.id == target)
-                && block.inputargs.get(slot) == Some(&result)
-            {
-                block.inputargs[slot] = copy;
-            }
+            // Each predecessor passes its own copy. The successor parameter
+            // stays one variable; renaming it to a single predecessor's copy
+            // and leaving the body on the old name made every later edge
+            // read the first copy.
+            phi_copies.push((link.target, slot, copy));
         }
         if link.last_exception.as_ref().and_then(LinkArg::as_variable) == Some(&result) {
             let copy = emit_materialized_struct_copy(graph, &mut out, &owner, &fields);
@@ -3847,7 +3847,82 @@ fn scalar_replace_one_struct_aggregate(
     }
     graph.blocks[block_idx].operations = out;
     graph.blocks[block_idx].exits = exits;
+    bind_struct_phi_copies(graph, &result, &phi_copies);
     true
+}
+
+/// When the successor parameter *is* the aggregate variable, point that
+/// parameter and every use in the successor at one phi. Predecessors keep
+/// the distinct copies already stored in their link args.
+fn bind_struct_phi_copies(
+    graph: &mut FunctionGraph,
+    from: &Variable,
+    copies: &[(BlockId, usize, Variable)],
+) {
+    let mut groups: Vec<(BlockId, usize, Vec<Variable>)> = Vec::new();
+    for (target, slot, copy) in copies {
+        if let Some((_, _, incoming)) = groups
+            .iter_mut()
+            .find(|(seen_target, seen_slot, _)| seen_target == target && *seen_slot == *slot)
+        {
+            incoming.push(copy.clone());
+        } else {
+            groups.push((*target, *slot, vec![copy.clone()]));
+        }
+    }
+    for (target, slot, incoming) in groups {
+        let Some(idx) = graph.blocks.iter().position(|block| block.id == target) else {
+            continue;
+        };
+        if graph.blocks[idx].inputargs.get(slot) != Some(from) {
+            continue;
+        }
+        let phi = if incoming.len() == 1 {
+            incoming[0].clone()
+        } else {
+            graph.alloc_value_var()
+        };
+        let block = &mut graph.blocks[idx];
+        block.inputargs[slot] = phi.clone();
+        remap_struct_phi_uses(block, from, &phi);
+    }
+}
+
+fn remap_struct_phi_uses(block: &mut Block, from: &Variable, to: &Variable) {
+    let remap = |var: &Variable| {
+        if var == from { to.clone() } else { var.clone() }
+    };
+    for op in &mut block.operations {
+        op.kind = crate::inline::remap_op_kind(&op.kind, &remap);
+    }
+    match &mut block.exitswitch {
+        Some(ExitSwitch::Value(var)) if var == from => *var = to.clone(),
+        Some(ExitSwitch::Fused { args, .. }) => {
+            for arg in args {
+                if arg == from {
+                    *arg = to.clone();
+                }
+            }
+        }
+        Some(ExitSwitch::LastException | ExitSwitch::Value(_)) | None => {}
+    }
+    for link in &mut block.exits {
+        for arg in &mut link.args {
+            retarget_link_arg(arg, from, to);
+        }
+        if let Some(arg) = link.last_exception.as_mut() {
+            retarget_link_arg(arg, from, to);
+        }
+        if let Some(arg) = link.last_exc_value.as_mut() {
+            retarget_link_arg(arg, from, to);
+        }
+    }
+}
+
+fn retarget_link_arg(arg: &mut LinkArg, from: &Variable, to: &Variable) {
+    if arg.as_variable() == Some(from) {
+        *arg = LinkArg::Value(to.clone());
+    }
 }
 
 fn upsert_struct_field(
@@ -34383,6 +34458,162 @@ mod tests {
             _ => None,
         });
         assert_eq!(mutated.as_ref(), join.inputargs.first());
+    }
+
+    /// The successor parameter is the aggregate variable itself. The body
+    /// must read the materialized copy, not the constructor variable the
+    /// replacement removed.
+    #[test]
+    fn shared_inputarg_reads_the_materialized_struct_copy() {
+        let mut graph = FunctionGraph::new("struct_ctor_shared_phi");
+        let entry = graph.startblock;
+        let owner = "error::DictKeyError";
+        let result = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_struct_ctor(
+                        vec!["error".to_string()],
+                        "DictKeyError",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some(owner.to_string())),
+                },
+                true,
+            )
+            .expect("struct ctor");
+        let payload = graph
+            .push_op_var(entry, OpKind::ConstInt(1), true)
+            .expect("payload");
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: result.clone(),
+                field: FieldDescriptor::new("kind", Some(owner.to_string())),
+                value: LinkArg::Value(payload),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        let (join, _) = graph.create_block_with_arg_vars(1);
+        graph.block_mut(join).inputargs = vec![result.clone()];
+        graph.push_op_var(
+            join,
+            OpKind::Call {
+                target: CallTarget::function_path(["slice", "index"]),
+                args: crate::model::call_args(vec![result.clone()]),
+                result_ty: ValueType::Int,
+            },
+            true,
+        );
+        graph.set_goto(entry, join, vec![result.clone()]);
+        graph.set_return(join, None);
+
+        assert_eq!(replace_struct_ctors(&mut graph), 1);
+        let news = struct_news(&graph);
+        assert_eq!(news.len(), 1);
+        let passed = graph.block(entry).exits[0]
+            .args
+            .first()
+            .and_then(LinkArg::as_variable)
+            .cloned();
+        assert_eq!(passed.as_ref(), Some(&news[0]));
+        let join_block = graph.block(join);
+        let call_arg = join_block.operations.iter().find_map(|op| match &op.kind {
+            OpKind::Call { args, .. } => args.first().and_then(LinkArg::as_variable).cloned(),
+            _ => None,
+        });
+        assert_eq!(call_arg.as_ref(), join_block.inputargs.first());
+        assert_eq!(call_arg, passed);
+    }
+
+    /// Two edges into one shared parameter each pass their own copy, and the
+    /// join reads one phi rather than the first edge's object.
+    #[test]
+    fn two_edges_into_a_shared_inputarg_keep_both_copies() {
+        let mut graph = FunctionGraph::new("struct_ctor_two_edges");
+        let entry = graph.startblock;
+        let owner = "error::DictKeyError";
+        let result = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_struct_ctor(
+                        vec!["error".to_string()],
+                        "DictKeyError",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some(owner.to_string())),
+                },
+                true,
+            )
+            .expect("struct ctor");
+        let payload = graph
+            .push_op_var(entry, OpKind::ConstInt(1), true)
+            .expect("payload");
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: result.clone(),
+                field: FieldDescriptor::new("kind", Some(owner.to_string())),
+                value: LinkArg::Value(payload),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        let cond = graph
+            .push_op_var(entry, OpKind::ConstBool(true), true)
+            .expect("cond");
+        let (join, _) = graph.create_block_with_arg_vars(1);
+        graph.block_mut(join).inputargs = vec![result.clone()];
+        graph.push_op_var(
+            join,
+            OpKind::Call {
+                target: CallTarget::function_path(["slice", "index"]),
+                args: crate::model::call_args(vec![result.clone()]),
+                result_ty: ValueType::Int,
+            },
+            true,
+        );
+        graph.set_return(join, None);
+        graph.block_mut(entry).exitswitch = Some(crate::model::ExitSwitch::Value(cond));
+        graph.block_mut(entry).exits = vec![
+            crate::model::Link::from_variables(
+                &graph,
+                vec![result.clone()],
+                join,
+                Some(crate::model::ExitCase::Bool(true)),
+            )
+            .with_prevblock(entry),
+            crate::model::Link::from_variables(
+                &graph,
+                vec![result.clone()],
+                join,
+                Some(crate::model::ExitCase::Bool(false)),
+            )
+            .with_prevblock(entry),
+        ];
+
+        assert_eq!(replace_struct_ctors(&mut graph), 1);
+        let news = struct_news(&graph);
+        assert_eq!(news.len(), 2);
+        let passed: Vec<_> = graph
+            .block(entry)
+            .exits
+            .iter()
+            .map(|link| link.args.first().and_then(LinkArg::as_variable).cloned())
+            .collect();
+        assert_eq!(passed[0].as_ref(), Some(&news[0]));
+        assert_eq!(passed[1].as_ref(), Some(&news[1]));
+        assert_ne!(passed[0], passed[1]);
+        let join_block = graph.block(join);
+        let call_arg = join_block.operations.iter().find_map(|op| match &op.kind {
+            OpKind::Call { args, .. } => args.first().and_then(LinkArg::as_variable).cloned(),
+            _ => None,
+        });
+        assert_eq!(call_arg.as_ref(), join_block.inputargs.first());
+        assert_ne!(call_arg, passed[0]);
+        assert_ne!(call_arg, passed[1]);
     }
 
     /// Two by-value copies of one aggregate are two allocations. Mutating
