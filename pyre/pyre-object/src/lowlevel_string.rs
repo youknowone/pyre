@@ -13,10 +13,18 @@
 //! They live here (not in `pyre-jit`) so the JIT fnaddr registry can reference
 //! [`jit_ll_shrink_array`] as a residual-call target.
 
+/// rstr `STR` / `UNICODE` header: `hash` then the varsize `len` word.
+/// `LLHelpers.ll_strlen` reads that word as `len(s.chars)`.
+#[repr(C)]
+struct LowlevelStringHeader {
+    hash: usize,
+    length: usize,
+}
+
 /// `len` field offset — one word past the `hash` field.
-pub const LOWLEVEL_STRING_LEN_OFFSET: usize = std::mem::size_of::<usize>();
+pub const LOWLEVEL_STRING_LEN_OFFSET: usize = std::mem::offset_of!(LowlevelStringHeader, length);
 /// `chars` array offset — two words past the start (`hash`, then `len`).
-pub const LOWLEVEL_STRING_CHARS_OFFSET: usize = 2 * std::mem::size_of::<usize>();
+pub const LOWLEVEL_STRING_CHARS_OFFSET: usize = std::mem::size_of::<LowlevelStringHeader>();
 /// STR base size includes a trailing null byte after the chars array.
 pub const LOWLEVEL_STR_BASE_SIZE: usize = LOWLEVEL_STRING_CHARS_OFFSET + 1;
 /// UNICODE base size has no trailing null.
@@ -89,12 +97,12 @@ pub fn bh_alloc_lowlevel_string(length: usize, base_size: usize, item_size: usiz
     ptr as i64
 }
 
-/// Read the `len` word.
+/// `LLHelpers.ll_strlen` — the `len` word of an rstr `STR` / `UNICODE`.
 pub fn bh_lowlevel_string_len(string: i64) -> usize {
     if string == 0 {
         return 0;
     }
-    unsafe { *((string as *const u8).add(LOWLEVEL_STRING_LEN_OFFSET) as *const usize) }
+    unsafe { (*(string as *const LowlevelStringHeader)).length }
 }
 
 /// Release a raw-fallback low-level string allocated by
@@ -312,9 +320,21 @@ pub fn ll_stringslice_startstop(
 /// result with `space.newutf8(res, len(res))`.
 #[majit_macros::elidable]
 pub extern "C" fn jit_ll_int2dec(val: i64) -> i64 {
-    let text = val.to_string();
-    let bytes = text.as_bytes();
-    let out = bh_alloc_lowlevel_string(bytes.len(), LOWLEVEL_STR_BASE_SIZE, 1);
+    let sign = usize::from(val < 0);
+    let mut uval = if val < 0 {
+        (val as u64).wrapping_neg()
+    } else {
+        val as u64
+    };
+    let is_zero = uval == 0;
+    let mut len = 0usize;
+    let mut i = uval;
+    while i != 0 {
+        len += 1;
+        i /= 10;
+    }
+    let total_len = sign + len + usize::from(is_zero);
+    let out = bh_alloc_lowlevel_string(total_len, LOWLEVEL_STR_BASE_SIZE, 1);
     // `descr_str` wraps the payload unchecked, as `ll_strconcat`'s callers do.
     assert!(
         out != 0,
@@ -322,7 +342,22 @@ pub extern "C" fn jit_ll_int2dec(val: i64) -> i64 {
     );
     unsafe {
         let dst = (out as *mut u8).add(LOWLEVEL_STRING_CHARS_OFFSET);
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+        let first = if sign != 0 {
+            Some(b'-')
+        } else if is_zero {
+            Some(b'0')
+        } else {
+            None
+        };
+        if let Some(ch) = first {
+            *dst = ch;
+        }
+        let mut j = 0usize;
+        while j < len {
+            *dst.add(total_len - j - 1) = b'0' + (uval % 10) as u8;
+            uval /= 10;
+            j += 1;
+        }
     }
     out
 }

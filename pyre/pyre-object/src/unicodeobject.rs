@@ -325,16 +325,19 @@ pub fn w_str_from_storage(value: *mut UnicodeValueStorage) -> *mut PyObject {
 /// `space.newutf8(utf8str, length)` — wrap a `STR` payload with an
 /// explicit code-point count (`W_UnicodeObject.__init__`).
 ///
-/// Residual wrap: the walker descends this body (`NewWithVtable` + field
-/// stores) when the generated graph is not looked inside.  Looking inside
-/// the constructor currently speeds dynasm more than wasm on `str_fstring`
-/// (4.3x wasm/dynasm).  Unseal once Utf8Str virtualizes through `newutf8`.
-#[majit_macros::dont_look_inside]
+/// Look-inside: `malloc_typed_managed` records `NewWithVtable` plus the
+/// field stores, so a walker descent of this body is the wrap the rtyper
+/// emits for `space.newutf8`.
 pub fn w_str_from_storage_and_length(
     value: *mut UnicodeValueStorage,
     length: usize,
 ) -> *mut PyObject {
-    let byte_len = crate::lowlevel_string::bh_lowlevel_string_len(value as i64);
+    // `len(utf8str)`: the rstr `STR` `len` word (`LLHelpers.ll_strlen`).
+    let byte_len = if value.is_null() {
+        0
+    } else {
+        unsafe { (*value).length }
+    };
     crate::lltype::malloc_typed_managed(W_UnicodeObject {
         ob_header: PyObject {
             ob_type: &STR_TYPE as *const PyType,

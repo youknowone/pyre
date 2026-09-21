@@ -10758,8 +10758,11 @@ fn call_malloc_nursery_variants_lower() {
     let inputs = nursery_new_inputs(vec![varsize, finish_int_arg0()], 53);
     let (bytes, _, _, _) = codegen::build_wasm_module(&inputs).expect("varsize should lower");
     validate_wasm(&bytes);
-    assert_eq!(nursery_top_compare_count(&bytes), 0);
-    assert!(const_immediates(&bytes).contains(&0x22));
+    assert_eq!(nursery_top_compare_count(&bytes), 1);
+    assert!(
+        const_immediates(&bytes).contains(&0x22),
+        "oversize / full-nursery arm keeps the array helper"
+    );
 }
 
 #[test]
