@@ -17782,6 +17782,46 @@ mod tests {
     }
 
     #[test]
+    fn cast_ptr_to_int_walks_and_folds_a_constant_ref() {
+        // Even (aligned) pointer: pyre pointers are raw words, so the
+        // walk must not require the lltype tagged-immediate odd-int bit.
+        const PTR: i64 = 0x1000;
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_r_value(0, PTR);
+        builder.record_cast_ptr_to_int(1, 0);
+        let folded = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(!folded.contains(&OpCode::CastPtrToInt));
+
+        let mut builder = JitCodeBuilder::new();
+        builder.record_cast_ptr_to_int(1, 0);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Ref],
+            &builder.finish(),
+            &[(JitArgKind::Ref, OpRef::input_arg_ref(0), PTR)],
+        );
+        assert!(recorded.contains(&OpCode::CastPtrToInt));
+    }
+
+    #[test]
+    fn cast_int_to_ptr_walks_and_folds_a_constant_int() {
+        const PTR: i64 = 0x1000;
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_i_value(0, PTR);
+        builder.record_cast_int_to_ptr(1, 0);
+        let folded = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(!folded.contains(&OpCode::CastIntToPtr));
+
+        let mut builder = JitCodeBuilder::new();
+        builder.record_cast_int_to_ptr(1, 0);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Int],
+            &builder.finish(),
+            &[(JitArgKind::Int, OpRef::input_arg_int(0), PTR)],
+        );
+        assert!(recorded.contains(&OpCode::CastIntToPtr));
+    }
+
+    #[test]
     fn cast_float_to_int_folds_in_range_and_records_out_of_range() {
         let mut builder = JitCodeBuilder::new();
         builder.load_const_f_value(0, 7.5f64.to_bits() as i64);

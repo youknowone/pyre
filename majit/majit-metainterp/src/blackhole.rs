@@ -4704,6 +4704,62 @@ mod tests {
             );
         }
 
+        /// `blackhole.py` `bhimpl_cast_ptr_to_int` / `bhimpl_cast_int_to_ptr`
+        /// are identity on the word. An even (aligned) pointer must round-trip;
+        /// pyre pointers are raw words, not lltype tagged immediates.
+        #[test]
+        fn convert_and_run_cast_ptr_int_is_identity_on_an_even_word() {
+            use crate::pyjitpl::{MIFrame, MIFrameStack};
+            use majit_translate::insns;
+
+            const PTR: i64 = 0x1000;
+            assert_eq!(PTR & 1, 0, "fixture: the word must be even");
+
+            let mut b = JitCodeBuilder::default();
+            b.record_cast_ptr_to_int(0, 0);
+            b.int_return(0);
+            let jitcode = std::sync::Arc::new(b.finish());
+            let mut frame = MIFrame::new(jitcode, 0);
+            frame.ref_values[0] = Some(PTR);
+            let framestack = MIFrameStack::new(frame);
+
+            let mut builder = BlackholeInterpBuilder::new();
+            let mut entries: indexmap::IndexMap<String, u8> = indexmap::IndexMap::new();
+            entries.insert("cast_ptr_to_int/r>i".to_string(), insns::BC_CAST_PTR_TO_INT);
+            entries.insert("int_return/i".to_string(), insns::BC_INT_RETURN);
+            builder.setup_insns(&entries);
+            wire_bhimpl_handlers(&mut builder);
+
+            let outcome =
+                convert_and_run_from_pyjitpl(&mut builder, &framestack, 0, false, None, None);
+            assert_eq!(
+                outcome,
+                crate::jitexc::JitException::DoneWithThisFrameInt(PTR)
+            );
+
+            let mut b = JitCodeBuilder::default();
+            b.record_cast_int_to_ptr(0, 0);
+            b.ref_return(0);
+            let jitcode = std::sync::Arc::new(b.finish());
+            let mut frame = MIFrame::new(jitcode, 0);
+            frame.int_values[0] = Some(PTR);
+            let framestack = MIFrameStack::new(frame);
+
+            let mut builder = BlackholeInterpBuilder::new();
+            let mut entries: indexmap::IndexMap<String, u8> = indexmap::IndexMap::new();
+            entries.insert("cast_int_to_ptr/i>r".to_string(), insns::BC_CAST_INT_TO_PTR);
+            entries.insert("ref_return/r".to_string(), insns::BC_REF_RETURN);
+            builder.setup_insns(&entries);
+            wire_bhimpl_handlers(&mut builder);
+
+            let outcome =
+                convert_and_run_from_pyjitpl(&mut builder, &framestack, 0, false, None, None);
+            assert_eq!(
+                outcome,
+                crate::jitexc::JitException::DoneWithThisFrameRef(GcRef(PTR as usize))
+            );
+        }
+
         /// `BlackholeInterpreter._copy_data_from_miframe` reads each
         /// `registers_r[i].getref_base()`. For a ConstPtr that means the
         /// GC-forwarded value stored on the box, never pyre's execution mirror.
@@ -5391,6 +5447,27 @@ mod tests {
                 slot as usize, placeholder as usize,
                 "`cast_float_to_int/f>i` (byte {byte}) is unwired in the production builder",
             );
+        }
+
+        /// `cast_ptr_to_int` / `cast_int_to_ptr` are ordinary
+        /// `pyjitpl.py` `opimpl_*` unaries. A guard-failure resume that
+        /// lands on either byte must hit the already-wired `bhimpl_*`
+        /// handlers, including on even (aligned) pointer words.
+        #[test]
+        fn production_bh_builder_wires_cast_ptr_int() {
+            use majit_translate::insns;
+            let builder = super::build_inline_call_only_bh_builder();
+            let placeholder = super::unwired_handler_placeholder as super::BhOpcodeHandler;
+            for (opname, byte) in [
+                ("cast_ptr_to_int/r>i", insns::BC_CAST_PTR_TO_INT),
+                ("cast_int_to_ptr/i>r", insns::BC_CAST_INT_TO_PTR),
+            ] {
+                let slot = builder.dispatch_table[byte as usize];
+                assert_ne!(
+                    slot as usize, placeholder as usize,
+                    "`{opname}` (byte {byte}) is unwired in the production builder",
+                );
+            }
         }
 
         /// `complex` arithmetic reaches the three interior-field loads in
@@ -12282,20 +12359,17 @@ fn handler_debug_fatalerror(
         .collect();
     panic!("{}", String::from_utf8_lossy(&bytes));
 }
-/// blackhole.py `bhimpl_cast_ptr_to_int(a)`. The cast is identity
-/// (the tagging arithmetic lives at the erase site, never here); the
-/// `ll_assert((i & 1) == 1)` checks the operand is a tagged immediate.
-/// `ll_assert` remains a translated runtime assertion.
+/// blackhole.py `bhimpl_cast_ptr_to_int(a)`. Identity reinterpret of a
+/// pointer word as an int. Upstream's `ll_assert((i & 1) == 1)` is
+/// lltype tagged-immediate specific; pyre pointers are raw words.
 fn bhimpl_cast_ptr_to_int(a: i64) -> i64 {
-    assert!((a & 1) == 1, "bhimpl_cast_ptr_to_int: not an odd int");
     a
 }
 
-/// blackhole.py `bhimpl_cast_int_to_ptr(i)`. Identity cast; the
-/// `ll_assert((i & 1) == 1)` checks the operand is a tagged immediate
-/// before it is reinterpreted as a `GCREF`.
+/// blackhole.py `bhimpl_cast_int_to_ptr(i)`. Identity reinterpret of an
+/// int word as a pointer. Upstream's `ll_assert((i & 1) == 1)` is
+/// lltype tagged-immediate specific; pyre pointers are raw words.
 fn bhimpl_cast_int_to_ptr(i: i64) -> i64 {
-    assert!((i & 1) == 1, "bhimpl_cast_int_to_ptr: not an odd int");
     i
 }
 
