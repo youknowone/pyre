@@ -298,6 +298,8 @@ with assert_raises(TypeError):
     sys._getframemodulename(0, depth=0)
 with assert_raises(TypeError):
     sys._getframemodulename("0")
+with assert_raises(TypeError):
+    sys._getframemodulename(0.0)
 
 # `sys__getframemodulename_impl` reads the module off the frame's function
 # object (`PyFunction_GetModule`). A frame here follows `pyframe.py`'s layout,
