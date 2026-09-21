@@ -16016,16 +16016,17 @@ impl CodeWriter {
 // Jump target calculation (RPython: flatten.py link following)
 // ---------------------------------------------------------------------------
 
-/// True when a backward bytecode jump is only a control-flow return from an
-/// exception handler to earlier code, rather than a loop backedge.  Python
-/// 3.14 lays handler blocks after the protected body, so a `break` / handler
-/// rejoin can be encoded as `JUMP_BACKWARD` even though its target is not a
-/// loop header.  A genuine loop backedge's target dominates the jump (every
-/// path to the jump enters through the loop header); a handler-return target
-/// does not, because the handler is reached from the protected body through
-/// the exception edge, bypassing that target.  `interp_jit.py:103-114`
-/// attaches `loop_header` / `can_enter_jit` to semantic loop backedges; do not
-/// manufacture a JIT loop header for a non-dominating backward coordinate.
+/// True when a backward bytecode jump returns from an exception handler to
+/// earlier code, rather than closing a loop.
+///
+/// `pypy/module/pypyjit/interp_jit.py` `PyFrame.jump_absolute` attaches
+/// `can_enter_jit` to every backward `JUMP_ABSOLUTE`, with no dominance
+/// test. This filter is a pyre adaptation for the 3.14 bytecode layout
+/// (`JUMP_BACKWARD` from an `except` or `break` rejoin), not an upstream
+/// semantic filter. Handler blocks sit after the protected body, so that
+/// rejoin's target does not dominate the jump: the handler is reached
+/// through the exception edge. A loop backedge's target does. Skip a JIT
+/// loop header for a non-dominating backward jump.
 fn backward_jump_is_handler_only_target(
     code: &CodeObject,
     source_pc: usize,

@@ -8939,28 +8939,19 @@ fn eval_with_jit_inner(
     if *PYRE_JIT_DISABLED.get_or_init(|| std::env::var("PYRE_JIT").as_deref() == Ok("0")) {
         return frame.execute_frame_plain(resume);
     }
-    // A profiled frame runs interpreted, and `c_call` / `c_return` are the
-    // whole of why.  The frame-level events would survive the JIT: measured
-    // with this test narrowed to `f_trace` alone and the arms below carrying
-    // `execute_frame`'s `call_trace` / `return_trace` bracket plus `leave`'s
-    // `_trace('leaveframe')`, a 2000-iteration tail entered with a hook
-    // installed reported `call` and `return` exactly, for the loop frame and
-    // for its callee alike, matching cpython 3.14.6.  Every builtin's `c_call`
-    // stopped at 1041, the entry threshold — `len`, `ord`, `divmod`, `hex`,
-    // `sorted`, `max` and `round` alike — and nothing about that is a missing
-    // check on a call path: probed at `call::c_profile_frame`, compiled code
-    // does not reach the interpreter's builtin call doors at all, folded or
-    // residual.  `is_being_profiled` is a green, so upstream's compiled loop
-    // carries the reporting it traced through `call_args`; this walker decides
-    // rather than traces, so a profiled trace would have to be RECORDED with
-    // the reporting in it.  Until it is, a profiled frame is served correctly
-    // and slowly rather than quickly and silently.
+    // This door tests only `frame_tracing_active`, which is true when the
+    // frame's `f_trace` is non-null (`pyframe.rs` `frame_tracing_active`).
+    // That frame owes a `line` event from `ec.bytecode_trace` in the
+    // dispatch loop, which compiled code does not call, so it runs
+    // interpreted. `is_being_profiled` is a green on
+    // `pypy/module/pypyjit/interp_jit.py` `PyPyJitDriver` (`pypyjitdriver`)
+    // and is not tested here.
     //
-    // A frame that arrives with its own `f_trace` already armed runs
-    // interpreted too.  One that gets it armed by the bracket below is past
-    // this test, and is kept off compiled code by `try_function_entry_jit` and
-    // by the portal merge point's debugdata guard instead, so its `line`
-    // events keep arriving from `eval_loop_jit`'s `bytecode_trace`.
+    // A frame that arrives with `f_trace` already armed takes this path.
+    // One that the bracket below arms is past this test; `try_function_entry_jit`
+    // and the portal merge point's debugdata guard keep it off compiled
+    // code, so its `line` events still come from `eval_loop_jit`'s
+    // `bytecode_trace`.
     if pyre_interpreter::pyframe::frame_tracing_active(frame) {
         return frame.execute_frame_plain(resume);
     }
@@ -11719,7 +11710,11 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     if !frame_root.frame().get_w_f_trace().is_null() {
         return None;
     }
-    // warmstate.py parity: PYRE_NO_JIT disables ALL JIT paths.
+    // `PYRE_NO_JIT` is pyre-local: this door returns without entering the
+    // JIT. `warmstate.py` has no such switch. Upstream turns tracing off
+    // with `rpython/rlib/jit.py` `set_user_param("off")`, which sets
+    // `threshold` to -1; `rpython/jit/metainterp/counter.py`
+    // `JitCounter.compute_threshold` then returns 0.0.
     static NO_JIT_FN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *NO_JIT_FN.get_or_init(|| std::env::var_os("PYRE_NO_JIT").is_some()) {
         return None;
