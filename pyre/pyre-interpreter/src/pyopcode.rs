@@ -1444,11 +1444,6 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         Err(crate::PyError::type_error("import_star not implemented"))
     }
 
-    // ── Stack manipulation ──
-    fn rotate3(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("rotate3 not implemented"))
-    }
-
     // ── Delete operations ──
     fn delete_fast(&mut self, _idx: usize) -> Result<(), PyError> {
         Err(crate::PyError::type_error("delete_fast not implemented"))
@@ -1661,11 +1656,6 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
             "load_build_class not implemented",
         ))
     }
-    fn load_super_attr(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error(
-            "load_super_attr not implemented",
-        ))
-    }
     fn load_super_attr_with(
         &mut self,
         _name_idx: usize,
@@ -1720,11 +1710,6 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     fn load_from_dict_or_deref(&mut self, _idx: usize, _name: &str) -> Result<(), PyError> {
         Err(crate::PyError::type_error(
             "load_from_dict_or_deref not implemented",
-        ))
-    }
-    fn match_stub(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error(
-            "pattern matching not implemented",
         ))
     }
     // MATCH_MAPPING / MATCH_SEQUENCE / MATCH_KEYS / MATCH_CLASS (PEP 634).
@@ -2598,13 +2583,6 @@ pub fn execute_cleanup_throw<E: OpcodeStepExecutor>(
     executor: &mut E,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
     executor.cleanup_throw()?;
-    Ok(StepResult::Continue)
-}
-
-pub fn execute_match_stub<E: OpcodeStepExecutor>(
-    executor: &mut E,
-) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
-    executor.match_stub()?;
     Ok(StepResult::Continue)
 }
 
