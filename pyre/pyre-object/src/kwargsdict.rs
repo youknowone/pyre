@@ -51,14 +51,16 @@ pub struct KwargsDictStrategy;
 /// `ll_getitem_fast` on the parallel `keys_w` / `values_w` lists
 /// (`kwargsdict.py` `keys_w[i]` / `values_w[i]`).
 fn kwargs_at(items: &[PyObjectRef], i: usize) -> PyObjectRef {
-    debug_assert!(i < items.len());
-    unsafe { *items.as_ptr().add(i) }
+    // Scalar slice index, not `as_ptr().add`: the front-end already
+    // lowers `core::slice::index::<Impl>::index` to `getitem`
+    // (`rlist.py` `ll_getitem_fast`).  A raw-pointer walk types the
+    // load as Integer and `__cast_instance_intrinsic` to PyObject fails.
+    items[i]
 }
 
 /// `ll_setitem_fast` on `values_w[i]`.
 fn kwargs_at_mut(items: &mut [PyObjectRef], i: usize) -> &mut PyObjectRef {
-    debug_assert!(i < items.len());
-    unsafe { &mut *items.as_mut_ptr().add(i) }
+    &mut items[i]
 }
 
 /// `pypy/objspace/std/kwargsdict.py KwargsDictStrategy`
