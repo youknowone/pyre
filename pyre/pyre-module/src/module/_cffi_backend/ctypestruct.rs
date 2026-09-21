@@ -332,13 +332,9 @@ pub unsafe fn convert_from_object(
 ///
 /// With `optvarsize` at -1 this writes the struct at `cdata`; otherwise it
 /// writes nothing and only reports how large a var-sized struct would be.
-/// The fused `W_CType.convert_from_object` match still walks this arm on
-/// an int call; PyPy's class dispatch does not. The body is not a jitcode,
-/// so it stays a bound residual.
 ///
 /// # Safety
 /// `cdata` must be writable for `ct.size` bytes when `optvarsize` is -1.
-#[majit_macros::dont_look_inside]
 pub unsafe fn convert_struct_from_object(
     ct: &W_CType,
     cdata: *mut u8,

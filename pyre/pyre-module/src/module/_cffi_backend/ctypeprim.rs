@@ -153,7 +153,8 @@ pub unsafe fn convert_from_object(
     w_ob: PyObjectRef,
 ) -> Result<(), PyError> {
     unsafe {
-        match ct.kind {
+        let kind = majit_metainterp::jit::promote(ct.kind);
+        match kind {
             // `W_CTypePrimitiveChar.convert_from_object` — `cdata[0] = value`.
             ctypeobj::KIND_PRIM_CHAR => {
                 misc::raw_write_u8(cdata, u64::from(convert_to_char(ct, w_ob)?));
@@ -658,11 +659,7 @@ fn convert_to_char(ct: &W_CType, w_ob: PyObjectRef) -> Result<u8, PyError> {
 }
 
 /// `W_CTypePrimitiveUniChar._convert_to_charN_t`.
-///
-/// `Wtf8::code_points` is un-lowered. The fused primitive convert match
-/// still walks this arm on an int call; PyPy's class dispatch does not.
-#[majit_macros::dont_look_inside]
-pub(crate) fn convert_to_char_n_t(ct: &W_CType, w_ob: PyObjectRef) -> Result<u32, PyError> {
+fn convert_to_char_n_t(ct: &W_CType, w_ob: PyObjectRef) -> Result<u32, PyError> {
     if unsafe { pyre_object::unicodeobject::is_str(w_ob) } {
         let value = unsafe { pyre_object::w_str_get_wtf8(w_ob) };
         let mut points = value.code_points();
@@ -693,12 +690,7 @@ fn unpack_complex(w_ob: PyObjectRef) -> Result<(f64, f64), PyError> {
 }
 
 /// `W_CTypePrimitiveFloat.convert_from_object`.
-///
-/// `float_w` looks up `__float__` (`box_str_constant`). The fused primitive
-/// convert match still walks this arm on an int call; PyPy's class dispatch
-/// does not.
-#[majit_macros::dont_look_inside]
-pub(crate) unsafe fn convert_from_object_float(
+unsafe fn convert_from_object_float(
     ct: &W_CType,
     cdata: usize,
     w_ob: PyObjectRef,
@@ -708,8 +700,7 @@ pub(crate) unsafe fn convert_from_object_float(
 }
 
 /// `W_CTypePrimitiveLongDouble.convert_from_object`.
-#[majit_macros::dont_look_inside]
-pub(crate) unsafe fn convert_from_object_longdouble(
+unsafe fn convert_from_object_longdouble(
     ct: &W_CType,
     cdata: usize,
     w_ob: PyObjectRef,
@@ -732,8 +723,7 @@ pub(crate) unsafe fn convert_from_object_longdouble(
 }
 
 /// `W_CTypePrimitiveComplex.convert_from_object`.
-#[majit_macros::dont_look_inside]
-pub(crate) unsafe fn convert_from_object_complex(
+unsafe fn convert_from_object_complex(
     ct: &W_CType,
     cdata: usize,
     w_ob: PyObjectRef,
