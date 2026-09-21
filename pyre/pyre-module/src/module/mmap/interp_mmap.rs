@@ -687,13 +687,14 @@ fn mmap_external_buffer_view(
 }
 
 /// `W_MMap.readbuf_w` / `writebuf_w` — expose the live mapping to the
-/// object-space buffer protocol.  `None` means the object is not an mmap;
-/// the inner error preserves the closed-mapping failure.
+/// object-space buffer protocol.  `None` means the object does not have
+/// the mmap layout (a Python subclass still does); the inner error
+/// preserves the closed-mapping failure.
 #[cfg(any(unix, windows))]
 pub(crate) fn mmap_buffer_view(
     obj: pyre_object::PyObjectRef,
 ) -> Option<Result<(usize, usize, bool), pyre_interpreter::PyError>> {
-    if !is_mmap(obj) {
+    if !has_mmap_layout(obj) {
         return None;
     }
     Some(mmap_ptr(obj).map(|(ptr, len)| {
