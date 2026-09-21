@@ -8453,9 +8453,16 @@ impl<S: JitState> JitDriver<S> {
         // apply; this is the loop pyre actually runs, so leaving it out made
         // `MAJIT_NO_BRIDGE=1` report a bridge-free run while still compiling
         // every bridge.
+        // `is_tracing()` sits with the other conjuncts rather than at the
+        // consumer: a bridge cannot be recorded from inside a live recording,
+        // and this is the entry that reaches a guard failure with one live.
+        // Taking fuel before asking numbered bridges that never compiled,
+        // which is the property `MAJIT_MAX_BRIDGES` and the skip list are read
+        // for, and printed `@@@GUARD bridge=true` on the same failures.
         let should_bridge = must_compile
             && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full()
             && !no_bridge_enabled()
+            && !self.is_tracing()
             && bridge_fuel_take();
 
         // Same `@@@GUARD` line the sibling loops emit. Without it this loop —
@@ -8476,8 +8483,11 @@ impl<S: JitState> JitDriver<S> {
             );
         }
 
-        // Return raw guard failure data. State restoration and bridge/
-        // blackhole decision happen in the caller's handle_fail().
+        // Return raw guard failure data; state restoration is the caller's
+        // handle_fail().  The vable pointer `sync_before` moved to this
+        // entry's frame is deliberately left naming it: `should_bridge` is
+        // false while a recording is live, so the one outcome handle_fail has
+        // then is the blackhole, and that resumes on this entry's frame.
         DetailedDriverRunOutcome::GuardFailure {
             fail_index,
             trace_id,
