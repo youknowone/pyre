@@ -3110,6 +3110,27 @@ fn walk_op_const_ptr_refs(op: &Op, visitor: &mut dyn FnMut(&mut GcRef)) {
     }
 }
 
+/// Values produced by the collection-capable half of
+/// `pyjitpl.py initialize_virtualizable`, consumed by the TraceCtx-writing
+/// half. Split so a parked recorder in `compile_tracing` is not borrowed
+/// across `bh_clear_vable_token`.
+struct InitializeVirtualizableState {
+    info: std::sync::Arc<VirtualizableInfo>,
+    virtualizable_ptr: *mut u8,
+    index_of_virtualizable: usize,
+    virtualizable_arg_index: Option<usize>,
+    num_green_args: usize,
+    num_reds: usize,
+    num_static: usize,
+    total_vable: usize,
+    array_lengths: Vec<usize>,
+    box_ref_index: usize,
+    identity_index: Option<usize>,
+    virtualizable_box: OpRef,
+    virtualizable_value: Value,
+    has_expanded_tail: bool,
+}
+
 impl<M: Clone> MetaInterp<M> {
     /// resume.py:1314 parity: `metainterp_sd.virtualref_info` shared
     /// `VirtualRefInfo` handed to `blackhole_from_resumedata` /
@@ -4834,19 +4855,70 @@ impl<M: Clone> MetaInterp<M> {
     /// The local `original_boxes = greens ++ reds` shape is restored
     /// (greens prepended as positional placeholders), matching RPython's
     /// `original_boxes[num_green_args + index_of_virtualizable]` read.
+    ///
+    /// Split at `vinfo.clear_vable_token` so a parked recorder in
+    /// `compile_tracing` is not mutably borrowed across the collection
+    /// in `force_now`. Driver-descriptor numbers are read first;
+    /// [`Self::initialize_virtualizable_force`] may collect and does not
+    /// touch the ctx; [`Self::initialize_virtualizable_write_ctx`] writes
+    /// the ctx and does not borrow `MetaInterp`.
     fn initialize_virtualizable(&mut self, ctx: &mut TraceCtx, live_values: &[Value]) {
+        let (num_green_args, virtualizable_arg_index, num_reds) =
+            Self::initialize_virtualizable_driver_layout(ctx);
+        let Some(state) = self.initialize_virtualizable_force(
+            live_values,
+            num_green_args,
+            virtualizable_arg_index,
+            num_reds,
+        ) else {
+            return;
+        };
+        Self::initialize_virtualizable_write_ctx(ctx, state, live_values);
+    }
+
+    /// `driver_descriptor()` numbers `initialize_virtualizable` needs
+    /// before [`Self::initialize_virtualizable_force`]. Plain copies so
+    /// no `TraceCtx` borrow is held across `clear_vable_token`.
+    fn initialize_virtualizable_driver_layout(ctx: &TraceCtx) -> (usize, Option<usize>, usize) {
+        (
+            ctx.driver_descriptor()
+                .map(|driver| driver.num_greens())
+                .unwrap_or(0),
+            ctx.driver_descriptor()
+                .and_then(|driver| driver.virtualizable_arg_index()),
+            ctx.driver_descriptor()
+                .map(|driver| driver.num_reds())
+                .unwrap_or(1),
+        )
+    }
+
+    /// Collection-capable half of `pyjitpl.py initialize_virtualizable`.
+    ///
+    /// Runs `vinfo.clear_vable_token` (which may allocate in `force_now`)
+    /// and the subsequent MetaInterp-owned layout reads. Does not borrow a
+    /// `TraceCtx`, so a recorder parked in `compile_tracing` stays
+    /// walkable without an overlapping `&mut TraceCtx`.
+    fn initialize_virtualizable_force(
+        &mut self,
+        live_values: &[Value],
+        num_green_args: usize,
+        virtualizable_arg_index: Option<usize>,
+        num_reds: usize,
+    ) -> Option<InitializeVirtualizableState> {
         // pyjitpl.py:3315: vinfo = self.jitdriver_sd.virtualizable_info
         // Prefer the trace-bound `active_jitdriver_sd` (RPython
         // `self.jitdriver_sd`); fall back to scanning when an
         // init-time / test caller has not yet elected one.
         let Some(idx) = self.resolve_active_jitdriver_sd_with_vinfo() else {
-            return;
+            return None;
         };
         let jd_sd = &self.staticdata.jitdrivers_sd[idx];
-        let info = jd_sd
-            .virtualizable_info
-            .as_ref()
-            .expect("resolve_active_jitdriver_sd_with_vinfo returned a slot without vinfo");
+        let info = std::sync::Arc::clone(
+            jd_sd
+                .virtualizable_info
+                .as_ref()
+                .expect("resolve_active_jitdriver_sd_with_vinfo returned a slot without vinfo"),
+        );
         // pyjitpl.py:3317-3319:
         //     index = (self.jitdriver_sd.num_green_args +
         //              self.jitdriver_sd.index_of_virtualizable)
@@ -4869,11 +4941,6 @@ impl<M: Clone> MetaInterp<M> {
         // `num_green_args` comes from the active driver descriptor.
         // The trace inputargs / entry stay reds-only, so the virtualizable's
         // ref-bank index (`box_ref_index`) decouples from the flat `index`.
-        let descriptor_num_greens = ctx
-            .driver_descriptor()
-            .map(|driver| driver.num_greens())
-            .unwrap_or(0);
-        let num_green_args = descriptor_num_greens;
         assert!(
             jd_sd.index_of_virtualizable >= 0,
             "pyjitpl.py:3317: jitdriver with virtualizable_info must have \
@@ -4925,27 +4992,10 @@ impl<M: Clone> MetaInterp<M> {
             // read (`initialize_virtualizable` / `clear_vable_token`).
             let root = majit_gc::shadow_stack::push(majit_ir::GcRef(virtualizable_ptr as usize));
             unsafe {
-                crate::virtualizable::bh_clear_vable_token(info, virtualizable_ptr);
+                crate::virtualizable::bh_clear_vable_token(&info, virtualizable_ptr);
             }
             virtualizable_ptr = majit_gc::shadow_stack::get(root).0 as *mut u8;
             majit_gc::shadow_stack::pop_to(root);
-            // Both `force_start_tracing` and `setup_tracing` call this
-            // before `self.tracing = Some(ctx)`. Write the forwarded
-            // pointer onto the ctx being initialized, not the empty slot.
-            ctx.set_virtualizable_heap_ptr(virtualizable_ptr as *const u8);
-            // `initial_inputarg_consts` was copied from `live_values` before
-            // this force. `walk_active_trace_refs` cannot forward those
-            // ConstPtrs until `self.tracing` is assigned.
-            // `orig_vable_ptr_from_trace_ctx` reads that slot first.
-            let vable_const_index = ctx
-                .driver_descriptor()
-                .and_then(|driver| driver.virtualizable_arg_index())
-                .unwrap_or(index_of_virtualizable);
-            if let Some(OpRef::ConstPtr(gcref)) =
-                ctx.initial_inputarg_consts.get_mut(vable_const_index)
-            {
-                *gcref = majit_ir::GcRef(virtualizable_ptr as usize);
-            }
         }
 
         let num_static = info.num_static_extra_boxes;
@@ -4956,7 +5006,7 @@ impl<M: Clone> MetaInterp<M> {
         // the physical array length straight off `live_values[index]` (the
         // virtualizable pointer).
         let array_lengths = {
-            let reported = self.trace_entry_vable_lengths(info);
+            let reported = self.trace_entry_vable_lengths(&info);
             if !reported.is_empty() {
                 reported
             } else if info.can_read_all_array_lengths_from_heap() {
@@ -4984,14 +5034,7 @@ impl<M: Clone> MetaInterp<M> {
         // directly to `virtualizable_arg_index()` and `startindex` becomes
         // `num_reds`. The expanded static/array slots occupy
         // `live_values[num_reds .. num_reds + total_vable]`.
-        let _vable_index = ctx
-            .driver_descriptor()
-            .and_then(|driver| driver.virtualizable_arg_index())
-            .unwrap_or(0);
-        let num_reds = ctx
-            .driver_descriptor()
-            .map(|driver| driver.num_reds())
-            .unwrap_or(1);
+        let _vable_index = virtualizable_arg_index.unwrap_or(0);
         // pyjitpl.py `initialize_virtualizable` only gates on
         // `vinfo is not None` and unconditionally calls
         // `vinfo.read_boxes(cpu, virtualizable, startindex)`. Callers
@@ -5013,7 +5056,7 @@ impl<M: Clone> MetaInterp<M> {
         // and `virtualizable_boxes.append(virtualizable_box)`.
         let _has_expanded_tail_outer = live_values.len() >= num_reds + total_vable;
         if !_has_expanded_tail_outer && virtualizable_ptr.is_null() {
-            return;
+            return None;
         }
         // pyjitpl.py:3317-3319: index = num_green_args + index_of_virtualizable.
         // The caller derives `index` above from jitdriver_sd so the bootstrap
@@ -5057,7 +5100,7 @@ impl<M: Clone> MetaInterp<M> {
         // `extract_live`.  A host that declares no position, or whose reds do
         // not agree with it, falls back to matching the pointer.
         let identity_index = if info.identity_ref_bank_index.is_some() {
-            Self::identity_live_position(info, live_values, virtualizable_ptr as *const u8)
+            Self::identity_live_position(&info, live_values, virtualizable_ptr as *const u8)
         } else {
             None
         };
@@ -5119,6 +5162,69 @@ impl<M: Clone> MetaInterp<M> {
         // inputargs from the live heap values.
         let has_expanded_tail =
             info.identity_ref_bank_index.is_none() && live_values.len() >= num_reds + total_vable;
+        Some(InitializeVirtualizableState {
+            info,
+            virtualizable_ptr,
+            index_of_virtualizable,
+            virtualizable_arg_index,
+            num_green_args,
+            num_reds,
+            num_static,
+            total_vable,
+            array_lengths,
+            box_ref_index,
+            identity_index,
+            virtualizable_box,
+            virtualizable_value,
+            has_expanded_tail,
+        })
+    }
+
+    /// TraceCtx-writing half of `pyjitpl.py initialize_virtualizable`.
+    ///
+    /// Does not borrow `MetaInterp`. At the parked
+    /// `initialize_state_from_start` site the caller passes
+    /// `self.compile_tracing.as_mut()`; that field borrow is the only
+    /// `TraceCtx` mutably reachable from `self`.
+    fn initialize_virtualizable_write_ctx(
+        ctx: &mut TraceCtx,
+        state: InitializeVirtualizableState,
+        live_values: &[Value],
+    ) {
+        let InitializeVirtualizableState {
+            info,
+            virtualizable_ptr,
+            index_of_virtualizable,
+            virtualizable_arg_index,
+            num_green_args,
+            num_reds,
+            num_static,
+            total_vable,
+            array_lengths,
+            box_ref_index,
+            identity_index,
+            virtualizable_box,
+            virtualizable_value,
+            has_expanded_tail,
+        } = state;
+
+        if !virtualizable_ptr.is_null() {
+            // Both `force_start_tracing` and `setup_tracing` call this
+            // before `self.tracing = Some(ctx)`. Write the forwarded
+            // pointer onto the ctx being initialized, not the empty slot.
+            ctx.set_virtualizable_heap_ptr(virtualizable_ptr as *const u8);
+            // `initial_inputarg_consts` was copied from `live_values` before
+            // this force. `walk_active_trace_refs` cannot forward those
+            // ConstPtrs until `self.tracing` is assigned.
+            // `orig_vable_ptr_from_trace_ctx` reads that slot first.
+            let vable_const_index = virtualizable_arg_index.unwrap_or(index_of_virtualizable);
+            if let Some(OpRef::ConstPtr(gcref)) =
+                ctx.initial_inputarg_consts.get_mut(vable_const_index)
+            {
+                *gcref = majit_ir::GcRef(virtualizable_ptr as usize);
+            }
+        }
+
         // pyjitpl.py:3326: virtualizable_boxes = vinfo.read_boxes(...)
         // pyjitpl.py appends these boxes to `original_boxes` before
         // create_empty_history() snapshots the trace inputargs. When the
@@ -5180,9 +5286,9 @@ impl<M: Clone> MetaInterp<M> {
                 info.identity_ref_bank_index, live_values,
             );
         }
-        ctx.install_virtualizable_info(std::sync::Arc::clone(info));
+        ctx.install_virtualizable_info(std::sync::Arc::clone(&info));
         ctx.init_virtualizable_boxes(
-            info,
+            &info,
             virtualizable_box,
             virtualizable_value,
             &vable_oprefs,
@@ -17090,13 +17196,22 @@ impl<M: Clone> MetaInterp<M> {
             // ConstPtrs. CompileTracingGuard is not used: it clears the slot
             // on drop, and this path must put the recorder back.
             self.compile_tracing = self.tracing.take();
-            let ctx_ptr = self.compile_tracing.as_mut().unwrap() as *mut TraceCtx;
-            // SAFETY: `initialize_virtualizable` mutates `ctx` and other
-            // MetaInterp fields, but not `compile_tracing` itself. The
-            // pointer is the same split that `tracing.take()` used to
-            // satisfy the borrow checker, parked so a collection in
-            // `force_now` can still walk the recorder.
-            self.initialize_virtualizable(unsafe { &mut *ctx_ptr }, &live);
+            let (num_green_args, virtualizable_arg_index, num_reds) =
+                Self::initialize_virtualizable_driver_layout(
+                    self.compile_tracing.as_ref().unwrap(),
+                );
+            if let Some(state) = self.initialize_virtualizable_force(
+                &live,
+                num_green_args,
+                virtualizable_arg_index,
+                num_reds,
+            ) {
+                Self::initialize_virtualizable_write_ctx(
+                    self.compile_tracing.as_mut().unwrap(),
+                    state,
+                    &live,
+                );
+            }
             self.tracing = self.compile_tracing.take();
         }
     }
