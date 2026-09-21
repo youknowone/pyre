@@ -3882,21 +3882,35 @@ impl Optimization for OptHeap {
                 // heap.py:838-839: structinfo = cf.cached_infos[i]
                 //                  box2 = structinfo.getfield(descr)
                 let resolved_box = ctx.resolve_operand_operand_opt(obj);
-                let Some(val) = resolved_box
+                let Some(entry) = resolved_box
                     .as_ref()
                     .and_then(Operand::ptr_info)
                     .and_then(|info| info.getfield(*field_idx))
-                    .map(|entry| entry.as_seen_opref())
                     .or_else(|| {
                         resolved_box
                             .as_ref()
                             .and_then(|b| ctx.get_const_info_mut_box(b, parent.clone()))
                             .and_then(|info| info.getfield(*field_idx))
-                            .map(|entry| entry.as_seen_opref())
                     })
                 else {
                     continue;
                 };
+                // heap.py serialize_optheap then does
+                // `box2 = box2.get_box_replacement()` and keeps the triple
+                // only when `box2.is_constant() or box2 in available_boxes`.
+                // An unforced `PreambleOp` is an `AbstractResOp`
+                // (`shortpreamble.py PreambleOp`):
+                // `AbstractValue.get_box_replacement` returns the
+                // `PreambleOp` itself, `AbstractValue.is_constant` is
+                // false, and the wrapper is not a livebox, so the triple
+                // is dropped. `FieldEntry::as_seen_opref` exposes
+                // `PreambleOp.op` (often a Const) instead, which would
+                // pass that filter and let a later bridge inherit a heap
+                // fact the short preamble never re-established.
+                if entry.is_preamble() {
+                    continue;
+                }
+                let val = entry.as_seen_opref();
                 // heap.py:842-843: if box2 is None: continue (cleared slot)
                 if val.is_none() {
                     continue;
@@ -4013,21 +4027,27 @@ impl Optimization for OptHeap {
                     }
                     let resolved_box = ctx.resolve_operand_operand_opt(obj);
                     // heap.py:860: box2 = arrayinfo.getitem(descr, index)
-                    let Some(val) = resolved_box
+                    let Some(entry) = resolved_box
                         .as_ref()
                         .and_then(Operand::ptr_info)
                         .and_then(|info| info.getitem(index as usize))
-                        .map(|entry| entry.as_seen_opref())
                         .or_else(|| {
                             resolved_box
                                 .as_ref()
                                 .and_then(|b| ctx.get_const_info_array_mut_box(b, descr.clone()))
                                 .and_then(|info| info.getitem(index as usize))
-                                .map(|entry| entry.as_seen_opref())
                         })
                     else {
                         continue;
                     };
+                    // Same `PreambleOp` filter as the struct half:
+                    // `serialize_optheap` keeps a triple only when the
+                    // replacement is a Const or a livebox, and an unforced
+                    // `PreambleOp` is neither.
+                    if entry.is_preamble() {
+                        continue;
+                    }
+                    let val = entry.as_seen_opref();
                     // heap.py:863-864: if box2 is None: continue (cleared slot)
                     if val.is_none() {
                         continue;
@@ -4286,6 +4306,9 @@ mod tests {
         fn index(&self) -> u32 {
             self.index
         }
+        fn get_descr_index(&self) -> i32 {
+            self.index as i32
+        }
         fn get_ei_index(&self) -> u32 {
             self.ei_index.load(Ordering::Relaxed)
         }
@@ -4539,6 +4562,65 @@ mod tests {
         heap.cache_field(&rooted_resop_operand(Type::Int, 0), &descr_b);
 
         assert_eq!(heap.cached_fields.len(), 2);
+    }
+
+    /// heap.py `serialize_optheap` drops an unforced `PreambleOp`:
+    /// `AbstractValue.get_box_replacement` returns the wrapper, which is
+    /// neither a Const nor a livebox. Exporting `PreambleOp.op` (a Const)
+    /// instead lets a bridge inherit a heap fact the short preamble never
+    /// replayed.
+    #[test]
+    fn export_cached_fields_skips_unforced_preamble_op() {
+        use crate::optimizeopt::info::PreambleOp;
+        use majit_ir::GcRef;
+
+        let descr = object_descr(3);
+        let mut heap = OptHeap::new();
+        let mut ctx = OptContext::new(256);
+        let obj = rooted_resop_operand(Type::Ref, 10);
+        ctx.seed_boxes_canonical(std::slice::from_ref(&obj));
+        ctx.set_ptr_info(&obj, PtrInfo::instance(None, None));
+        let const_code = OpRef::const_ptr(GcRef(0xaaa));
+        let mut replay = Op::with_descr(
+            OpCode::GetfieldGcR,
+            std::slice::from_ref(&obj),
+            descr.clone(),
+        );
+        replay.pos().set(OpRef::ref_op(11));
+        ctx.with_ptr_info_mut(&obj, |info| {
+            info.set_preamble_field(
+                OptHeap::field_slot_index(&descr),
+                PreambleOp {
+                    op: Operand::from_opref(const_code),
+                    invented_name: false,
+                    preamble_op: OpRc::new(replay),
+                    same_as_source: None,
+                },
+            );
+        })
+        .unwrap();
+        heap.cache_field(&obj, &descr);
+
+        let exported = heap.export_cached_fields(&mut ctx);
+        assert!(
+            exported.is_empty(),
+            "unforced PreambleOp must not serialize as its Const payload, got {exported:?}"
+        );
+
+        ctx.with_ptr_info_mut(&obj, |info| {
+            info.setfield(
+                OptHeap::field_slot_index(&descr),
+                Operand::from_opref(const_code),
+            );
+        })
+        .unwrap();
+        let exported = heap.export_cached_fields(&mut ctx);
+        assert_eq!(
+            exported.len(),
+            1,
+            "a forced Const field value is serializable"
+        );
+        assert_eq!(exported[0].2, const_code);
     }
 
     fn initialize_imported_short_heap_field(
