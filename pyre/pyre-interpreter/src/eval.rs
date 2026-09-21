@@ -1541,6 +1541,10 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         // first `_ast` import without a dirty bit, and the only owner of the
         // classes between one `_ast` module dict and the next.
         crate::module::_ast::moduledef::walk_ast_state_gc(&mut fwd);
+        // `gc.get_stats()`'s `GcStats` class is the same shape: built on the
+        // first call, named by no module dict, and owned by nothing else
+        // between one returned instance and the next.
+        crate::module::gc::walk_gc_stats_type_gc(&mut fwd);
         if let Some(hooks) = crate::importing::optional_module_hooks() {
             (hooks.walk_prebuilt_slots)(&mut fwd);
         }
