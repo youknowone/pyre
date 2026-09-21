@@ -4267,12 +4267,17 @@ fn init_someinstance_overrides(
                         }
                         // A classdef-less `SomeInstance` has no RPython analogue
                         // (`SomeInstance` upstream always carries a classdef).
-                        // It arises only from pyre's pointer erasure:
-                        // `project_struct_field_type` strips `*mut`/`*const`/`&`
-                        // and resolves the pointee — when the pointee is an
-                        // unregistered host struct the field becomes
-                        // `SomeInstance(classdef=None)`.  Any attr other than
-                        // the `is_null` ptr method above stays fail-loud.
+                        // The mint is `valuetype_to_someshell`'s `Ref(_)` arm
+                        // (`annotation_state.rs` `ref_fallback_instance`):
+                        // `legacy_annotator::setbinding` writes that shell
+                        // into `Variable.annotation` for every reference-typed
+                        // variable, discarding any `Ref(Some(root))` payload.
+                        // `project_struct_field_type` does not mint this for
+                        // an unregistered named root — that arm returns
+                        // `SomeValue::Impossible`.  It mints a classdef-less
+                        // `SomeInstance` only for a raw-pointer-to-scalar/unit
+                        // field and for the `"BigInt"` arm.  Any attr other
+                        // than the `is_null` ptr method above stays fail-loud.
                         panic!(
                             "AnnotatorError: SomeInstance.getattr({:?}) on classdef-less instance",
                             attr

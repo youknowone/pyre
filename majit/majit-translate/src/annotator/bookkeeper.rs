@@ -2721,6 +2721,10 @@ impl Bookkeeper {
                     | SomeValue::Char(_)
                     | SomeValue::None_(_)
             ) {
+                crate::codewriter::annotation_state::record_classdef_less_mint(
+                    "project_struct_field_type.raw_ptr_scalar",
+                    t,
+                );
                 return SomeValue::Instance(super::model::SomeInstance::new(
                     None,
                     false,
@@ -2775,6 +2779,10 @@ impl Bookkeeper {
             // `BigInt.from` builtin analyzer and foreign-method cutover:
             // retain a classdef-less `SomeInstance`, never lattice bottom.
             "BigInt" => {
+                crate::codewriter::annotation_state::record_classdef_less_mint(
+                    "project_struct_field_type.BigInt",
+                    "BigInt",
+                );
                 return SomeValue::Instance(super::model::SomeInstance::new(
                     None,
                     false,

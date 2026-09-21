@@ -12,10 +12,192 @@
 //! — annotation gaps surface fail-loud at the rtyper's `bindingrepr`
 //! instead of being bridged to a fabricated GC reference.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 use crate::annotator::model::{KnownType, SomeFloat, SomeInstance, SomeInteger, SomeValue};
 use crate::model::ValueType;
+
+/// `MAJIT_RTYPER_VERBOSE` census of classdef-less `SomeInstance` mints.
+///
+/// The `Ref(_)` shell projector discards any `Ref` payload; the ranked
+/// dump at the end of Phase A is what says whether the producer already
+/// knew the root.  `derive_subject_inputcells` records the per-graph
+/// fallthrough (variable + `class_root` + registry hit) because this
+/// projector has neither the variable nor the graph in hand.
+struct ClassdefLessRefCensus {
+    /// `valuetype_to_someshell(Ref(payload))` hits, keyed by payload
+    /// spelling (`"<none>"` when the producer left `Ref(None)`).
+    ref_payloads: BTreeMap<String, u64>,
+    /// Other deliberate classdef-less mints (`State`, bookkeeper
+    /// raw-pointer-to-scalar, `"BigInt"`), keyed by `site\tkey`.
+    other_mints: BTreeMap<String, u64>,
+    /// One row per `derive_subject_inputcells` Ref input that kept the
+    /// classdef-less shell: graph, var, payload, class_root, canon,
+    /// raw_known, canon_known, has_bk.
+    input_fallthroughs: Vec<ClassdefLessInputFallthrough>,
+}
+
+/// One `derive_subject_inputcells` Ref input that kept the classdef-less
+/// shell.  Formatted only when printing so the dump does not re-parse
+/// a line it built itself.
+struct ClassdefLessInputFallthrough {
+    graph: String,
+    var: String,
+    payload: String,
+    class_root: String,
+    canon: String,
+    raw_known: bool,
+    canon_known: bool,
+    has_bk: bool,
+}
+
+impl std::fmt::Display for ClassdefLessInputFallthrough {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "[classdef-less-ref] graph={} var={} payload={} \
+             class_root={} canon={} raw_known={} \
+             canon_known={} has_bk={}",
+            self.graph,
+            self.var,
+            self.payload,
+            self.class_root,
+            self.canon,
+            self.raw_known,
+            self.canon_known,
+            self.has_bk
+        )
+    }
+}
+
+impl ClassdefLessRefCensus {
+    fn new() -> Self {
+        Self {
+            ref_payloads: BTreeMap::new(),
+            other_mints: BTreeMap::new(),
+            input_fallthroughs: Vec::new(),
+        }
+    }
+}
+
+thread_local! {
+    static CLASSDEF_LESS_REF_CENSUS: RefCell<ClassdefLessRefCensus> =
+        RefCell::new(ClassdefLessRefCensus::new());
+}
+
+fn bump_map(map: &mut BTreeMap<String, u64>, key: String) {
+    *map.entry(key).or_insert(0) += 1;
+}
+
+fn record_ref_payload(payload: Option<&str>) {
+    if !crate::translator::rtyper::cutover::rtyper_verbose_enabled() {
+        return;
+    }
+    let key = payload.unwrap_or("<none>").to_string();
+    CLASSDEF_LESS_REF_CENSUS.with(|cell| bump_map(&mut cell.borrow_mut().ref_payloads, key));
+}
+
+/// Count a classdef-less `SomeInstance` minted outside the `Ref` arm.
+pub(crate) fn record_classdef_less_mint(site: &str, key: &str) {
+    if !crate::translator::rtyper::cutover::rtyper_verbose_enabled() {
+        return;
+    }
+    let row = format!("{site}\t{key}");
+    CLASSDEF_LESS_REF_CENSUS.with(|cell| bump_map(&mut cell.borrow_mut().other_mints, row));
+}
+
+/// A startblock `Ref` input that kept the classdef-less shell.
+pub(crate) fn record_classdef_less_input(
+    graph: &str,
+    var: &str,
+    payload: Option<&str>,
+    class_root: Option<&str>,
+    canon: Option<&str>,
+    raw_known: bool,
+    canon_known: bool,
+    has_bk: bool,
+) {
+    if !crate::translator::rtyper::cutover::rtyper_verbose_enabled() {
+        return;
+    }
+    let row = ClassdefLessInputFallthrough {
+        graph: graph.to_string(),
+        var: var.to_string(),
+        payload: payload.unwrap_or("<none>").to_string(),
+        class_root: class_root.unwrap_or("<none>").to_string(),
+        canon: canon.unwrap_or("<none>").to_string(),
+        raw_known,
+        canon_known,
+        has_bk,
+    };
+    eprintln!("{row}");
+    CLASSDEF_LESS_REF_CENSUS.with(|cell| cell.borrow_mut().input_fallthroughs.push(row));
+}
+
+/// Dump the classdef-less `Ref` census.  Called once after Phase A.
+pub(crate) fn dump_classdef_less_ref_census() {
+    if !crate::translator::rtyper::cutover::rtyper_verbose_enabled() {
+        return;
+    }
+    CLASSDEF_LESS_REF_CENSUS.with(|cell| {
+        let census = cell.borrow();
+        eprintln!(
+            "[classdef-less-ref-census] valuetype_to_someshell(Ref) hits: {}",
+            census.ref_payloads.values().sum::<u64>()
+        );
+        let mut payloads: Vec<(&String, u64)> =
+            census.ref_payloads.iter().map(|(k, v)| (k, *v)).collect();
+        payloads.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        for (key, n) in payloads.iter().take(40) {
+            eprintln!("[classdef-less-ref-census] payload {n:>8}  {key}");
+        }
+        eprintln!(
+            "[classdef-less-ref-census] other mints: {}",
+            census.other_mints.values().sum::<u64>()
+        );
+        let mut others: Vec<(&String, u64)> =
+            census.other_mints.iter().map(|(k, v)| (k, *v)).collect();
+        others.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        for (key, n) in others.iter().take(40) {
+            eprintln!("[classdef-less-ref-census] mint {n:>8}  {key}");
+        }
+        eprintln!(
+            "[classdef-less-ref-census] input fallthroughs: {}",
+            census.input_fallthroughs.len()
+        );
+        let mut by_root: BTreeMap<String, u64> = BTreeMap::new();
+        let mut by_flags: BTreeMap<String, u64> = BTreeMap::new();
+        for row in &census.input_fallthroughs {
+            bump_map(
+                &mut by_root,
+                format!("class_root={} payload={}", row.class_root, row.payload),
+            );
+            bump_map(
+                &mut by_flags,
+                format!(
+                    "class_root={} raw_known={} canon_known={}",
+                    row.class_root, row.raw_known, row.canon_known
+                ),
+            );
+        }
+        let mut roots: Vec<(&String, u64)> = by_root.iter().map(|(k, v)| (k, *v)).collect();
+        roots.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        for (key, n) in roots.iter().take(40) {
+            eprintln!("[classdef-less-ref-census] input-root {n:>8}  {key}");
+        }
+        let mut flags: Vec<(&String, u64)> = by_flags.iter().map(|(k, v)| (k, *v)).collect();
+        flags.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        for (key, n) in flags.iter().take(40) {
+            eprintln!("[classdef-less-ref-census] input-flags {n:>8}  {key}");
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn classdef_less_input_fallthrough_count() -> usize {
+    CLASSDEF_LESS_REF_CENSUS.with(|cell| cell.borrow().input_fallthroughs.len())
+}
 
 /// RPython `SomeValue` lattice projection of the legacy `ValueType`.
 ///
@@ -87,7 +269,7 @@ pub fn valuetype_to_someshell(vt: &ValueType) -> Option<SomeValue> {
         ValueType::StringBuilder => Some(SomeValue::StringBuilder(
             crate::annotator::model::SomeStringBuilder::new(),
         )),
-        ValueType::Ref(_) => {
+        ValueType::Ref(payload) => {
             // RPython typed pointers lift to `SomePtr(ll_ptrtype)`
             // (`llannotation.py:64-70`), but the correct Ptr must come
             // from the producer (annotator with bookkeeper / host-class
@@ -103,6 +285,7 @@ pub fn valuetype_to_someshell(vt: &ValueType) -> Option<SomeValue> {
             // than fabricating a `Ptr` from a bare name.  Routing a
             // host-registry lookup back into *this* shell projector
             // would be the rejected bare-name path.
+            record_ref_payload(payload.as_deref());
             Some(ref_fallback_instance())
         }
         ValueType::State => {
@@ -111,6 +294,7 @@ pub fn valuetype_to_someshell(vt: &ValueType) -> Option<SomeValue> {
             // `SomeInstance(classdef=None)` is a temporary fallback
             // that lets the rtyper resolve to `GcRef` without a real
             // bookkeeper-attached pyre `ClassDef`.
+            record_classdef_less_mint("valuetype_to_someshell", "State");
             Some(SomeValue::Instance(SomeInstance::new(
                 None,
                 false,
@@ -200,6 +384,23 @@ mod tests {
                 assert!(inst.flags.is_empty());
             }
             other => panic!("typed Ref must use fallback Instance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn typed_ref_payload_is_not_looked_up_in_a_global_registry() {
+        // The projector must keep discarding `Ref(Some(root))`.  A
+        // process-global bare-name index is the rejected path; the
+        // producer attaches the precise `Variable.annotation` instead.
+        let named = valuetype_to_someshell(&ValueType::Ref(Some("RootScope".to_string())))
+            .expect("named Ref projects");
+        let opaque = valuetype_to_someshell(&ValueType::Ref(None)).expect("opaque Ref projects");
+        match (named, opaque) {
+            (SomeValue::Instance(named), SomeValue::Instance(opaque)) => {
+                assert!(named.classdef.is_none());
+                assert!(opaque.classdef.is_none());
+            }
+            other => panic!("both Ref payloads must stay classdef-less, got {other:?}"),
         }
     }
 

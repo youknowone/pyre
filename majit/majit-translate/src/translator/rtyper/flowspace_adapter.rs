@@ -4025,6 +4025,40 @@ pub(crate) fn derive_subject_inputcells(
                     }
                 }
             }
+            if crate::translator::rtyper::cutover::rtyper_verbose_enabled()
+                && matches!(ty, crate::model::ValueType::Ref(_))
+            {
+                let payload = match ty {
+                    crate::model::ValueType::Ref(p) => p.as_deref(),
+                    _ => None,
+                };
+                let canon = class_root
+                    .as_deref()
+                    .map(majit_ir::descr::canonical_struct_name);
+                let (raw_known, canon_known) = match (bookkeeper, class_root.as_deref()) {
+                    (Some(bk), Some(root)) => {
+                        let guard = bk.struct_fields.borrow();
+                        let raw_known = guard
+                            .as_ref()
+                            .is_some_and(|reg| reg.fields.contains_key(root));
+                        let canon_known = canon.as_ref().is_some_and(|c| {
+                            guard.as_ref().is_some_and(|reg| reg.fields.contains_key(c))
+                        });
+                        (raw_known, canon_known)
+                    }
+                    _ => (false, false),
+                };
+                crate::codewriter::annotation_state::record_classdef_less_input(
+                    &legacy.name,
+                    &var.name_prefix(),
+                    payload,
+                    class_root.as_deref(),
+                    canon.as_deref(),
+                    raw_known,
+                    canon_known,
+                    bookkeeper.is_some(),
+                );
+            }
             cells.push(shell);
             continue;
         }
@@ -5292,6 +5326,44 @@ mod tests {
             .as_ref()
             .expect("source class_root must replace the classdef-less legacy shell");
         assert_eq!(classdef.borrow().name, "PyObject");
+    }
+
+    #[test]
+    fn derive_subject_inputcells_records_no_fallthrough_when_verbose_off() {
+        assert!(
+            !crate::translator::rtyper::cutover::rtyper_verbose_enabled(),
+            "this pin requires MAJIT_RTYPER_VERBOSE to be unset or not \"1\""
+        );
+        let mut graph = LegacyGraph::new("verbose_off_fallthrough");
+        let entry = graph.startblock;
+        let value = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "value".to_string(),
+                    ty: ValueType::Ref(Some("UnregisteredRoot".to_string())),
+                    class_root: Some("UnregisteredRoot".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, value);
+        let bk = Rc::new(Bookkeeper::new());
+        bk.set_struct_fields(Rc::new(crate::front::StructFieldRegistry::default()));
+
+        let before = crate::codewriter::annotation_state::classdef_less_input_fallthrough_count();
+        let cells = derive_subject_inputcells(&graph, Some(&bk))
+            .expect("unregistered Ref input keeps the classdef-less shell");
+        assert!(
+            matches!(&cells[0], SomeValue::Instance(inst) if inst.classdef.is_none()),
+            "unregistered root must keep the classdef-less shell, got {:?}",
+            cells[0],
+        );
+        assert_eq!(
+            crate::codewriter::annotation_state::classdef_less_input_fallthrough_count(),
+            before,
+            "verbose-off input fallthrough must record nothing",
+        );
     }
 
     #[test]

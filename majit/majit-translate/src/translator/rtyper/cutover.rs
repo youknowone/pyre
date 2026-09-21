@@ -3695,8 +3695,13 @@ pub(crate) fn run_two_phase_prepass(
 /// Whether the `MAJIT_RTYPER_VERBOSE` de-aggregating census is enabled.
 /// Matches the `== "1"` contract the codewriter's coverage gauge uses
 /// (`codewriter.rs`), so a literal `MAJIT_RTYPER_VERBOSE=0` stays off.
-fn rtyper_verbose_enabled() -> bool {
-    std::env::var_os("MAJIT_RTYPER_VERBOSE").is_some_and(|v| v == "1")
+/// Cached: the `Ref` shell projector consults this ~17 000 times per census.
+pub(crate) fn rtyper_verbose_enabled() -> bool {
+    thread_local! {
+        static ON: bool =
+            std::env::var_os("MAJIT_RTYPER_VERBOSE").is_some_and(|v| v == "1");
+    }
+    ON.with(|on| *on)
 }
 
 /// Map a captured prepass failure reason to its orthodox-disposition
@@ -4010,6 +4015,7 @@ fn run_two_phase_prepass_inner(
 
     if rtyper_verbose_enabled() {
         emit_disposition_histogram("phaseA", &phase_a_reasons);
+        crate::codewriter::annotation_state::dump_classdef_less_ref_census();
     }
 
     // ── compute_at_fixpoint runs per-subject inside drive_subject's
