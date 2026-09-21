@@ -54,13 +54,17 @@
 //!     lifetimes).
 //!   - `Cast` — same-Variable alias.
 //!   - `Discriminant(place)` — synthetic `FieldRead("__discriminant")`.
-//!   - `Aggregate` — a unique, unescaped named struct lowers to `New` +
-//!     `FieldWrite` (malloc then setfield). A stack value that is copied,
-//!     returned, stored, or merged through a phi stays a constructor, so
-//!     later mutation of one copy is not visible through the others.
-//!     Transparent newtype wrappers stay a no-op alias. Enum variants,
-//!     tuples, and arrays still emit `Call(SyntheticTransparentCtor)` for
-//!     later rewrites.
+//!   - `Aggregate` — a named struct is its fields (`OptVirtualize.make_vstruct`):
+//!     the constructor is a temporary marker so boxing fusion and the
+//!     consumer rewrites still see the construct-on-stack spelling, then
+//!     [`scalar_replace_named_struct_aggregates`] replaces field reads
+//!     with the stored SSA values. A by-value copy, return, store, or phi
+//!     use materialises one `New` + `setfield`s per use so later mutation
+//!     of one copy is not visible through the others. Closure environments
+//!     and field-less structs stay constructors: `rewrite_op_malloc` needs
+//!     a non-empty `all_fielddescrs`. Transparent newtype wrappers stay a
+//!     no-op alias. Enum variants, tuples, and arrays still emit
+//!     `Call(SyntheticTransparentCtor)` for later rewrites.
 //!   - `ShallowInitBox` — synthetic `Call(SyntheticTransparentCtor)`.
 //!   - `Repeat` / `Len` / `NullaryOp` — synthetic `Call(__array_repeat
 //!     / __len / __nullary_*)`.
@@ -3506,13 +3510,11 @@ fn simplify_lowered_graph(
     // `get_instantiate` / `gc_interp::enabled` calls).
     crate::model::thread_undefined_op_operands(graph);
     // Named-struct aggregates that boxing fusion did not consume become
-    // `new(descr)` only when the constructor is the unique, unescaped
-    // allocation — a stack value that is copied, returned, stored, or
-    // merged through a phi must stay a constructor. Only the final
-    // simplify runs this — the pre-pass still has consumer rewrites
-    // (`range_iter`, slice-index) that match the constructor.
+    // their fields. Only the final simplify runs this — the pre-pass
+    // still has consumer rewrites (`range_iter`, slice-index) that match
+    // the constructor.
     if sweep_dead_vars {
-        lower_struct_aggregate_ctors_to_new(graph);
+        scalar_replace_named_struct_aggregates(graph, struct_field_attrs);
     }
 }
 
@@ -3532,37 +3534,70 @@ fn call_target_is_gc_malloc(target: &CallTarget) -> bool {
         )
 }
 
-/// Rewrite a live named-struct aggregate constructor to `malloc` plus the
-/// field stores already emitted beside it.
+/// Replace a live named-struct aggregate with its fields.
 ///
-/// Construction is `p = malloc(S); p.f = v`. The MIR front first emits a
-/// `SyntheticTransparentCtor` so `fuse_boxing_alloc`,
+/// Construction is `p = malloc(S); p.f = v` (`rewrite_op_malloc`). The MIR
+/// front first emits a `SyntheticTransparentCtor` so `fuse_boxing_alloc`,
 /// `lower_struct_ptr_writes`, and `remove_dead_aggregates` still see the
-/// construct-on-stack spelling; after those passes, a remaining struct
-/// constructor that is the unique, unescaped allocation becomes
-/// [`OpKind::New`].
+/// construct-on-stack spelling. After those passes, a remaining named
+/// struct is the JIT virtual (`OptVirtualize.make_vstruct`): field reads
+/// become the stored SSA values, and a by-value copy does not exist in
+/// the source language, so each escape — return, residual call argument,
+/// store of the whole value, or phi/link copy — materialises one fresh
+/// `New` plus `setfield`s. Mutation of one copy is then a store to that
+/// object alone.
 ///
-/// A named struct on the stack is a value: `let b = a`, passing by value,
-/// returning it, storing it into a field, or merging it through a phi
-/// copies it, and later mutation of one copy must not be visible through
-/// the other. `New` gives the result reference identity, so those
-/// constructors stay constructors.
+/// An inlined substructure is the same rule: the value is its fields,
+/// never a residual constructor call (`rewrite_op_getsubstruct`,
+/// `rewrite_op_getinteriorfield`).
 ///
-/// Aggregates that still participate in a boxing cluster also stay
+/// Aggregates that still participate in a boxing cluster stay
 /// constructors: the malloc argument, any phi that carries it, and nested
 /// named structs stored into those (the header object fusion reads
 /// `ob_type` off). They are the cluster's stack value, not the heap
-/// object; rewriting them to `New` would allocate the header separately
-/// and leave fusion looking at a `New` instead of a
-/// `SyntheticTransparentCtor`.
+/// object.
+///
+/// Closure environments and field-less structs also stay constructors.
+/// `rewrite_op_malloc` refuses a size descr whose `all_fielddescrs` is
+/// empty, and a closure has no registered layout at all.
 #[expect(
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded"
 )]
-fn lower_struct_aggregate_ctors_to_new(graph: &mut FunctionGraph) -> usize {
+fn scalar_replace_named_struct_aggregates(
+    graph: &mut FunctionGraph,
+    struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+) -> usize {
     let malloc_args = boxing_cluster_ctor_results(graph);
+    let mut rewritten = 0usize;
+    loop {
+        let Some(site) = next_struct_aggregate_ctor(graph, &malloc_args, struct_field_attrs) else {
+            break;
+        };
+        if !scalar_replace_one_struct_aggregate(graph, site) {
+            break;
+        }
+        rewritten += 1;
+    }
+    rewritten
+}
 
-    let mut rewrite: Vec<(usize, usize, String)> = Vec::new();
+struct StructAggregateCtorSite {
+    block_idx: usize,
+    op_idx: usize,
+    result: Variable,
+    owner: String,
+}
+
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded"
+)]
+fn next_struct_aggregate_ctor(
+    graph: &FunctionGraph,
+    malloc_args: &std::collections::HashSet<Variable>,
+    struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+) -> Option<StructAggregateCtorSite> {
     for (block_idx, block) in graph.blocks.iter().enumerate() {
         for (op_idx, op) in block.operations.iter().enumerate() {
             let Some(result) = op.result.as_ref() else {
@@ -3574,7 +3609,9 @@ fn lower_struct_aggregate_ctors_to_new(graph: &mut FunctionGraph) -> usize {
             let OpKind::Call {
                 target:
                     CallTarget::SyntheticTransparentCtor {
-                        is_struct: true, ..
+                        name,
+                        is_struct: true,
+                        ..
                     },
                 args,
                 result_ty,
@@ -3585,37 +3622,92 @@ fn lower_struct_aggregate_ctors_to_new(graph: &mut FunctionGraph) -> usize {
             if !args.is_empty() {
                 continue;
             }
+            if majit_charon_reader::ullbc::is_closure_leaf(name) {
+                continue;
+            }
             let ValueType::Ref(Some(owner)) = result_ty else {
                 continue;
             };
             if owner.is_empty() {
                 continue;
             }
-            if struct_ctor_copied_by_value(graph, result) {
+            let layout_empty = struct_field_attrs
+                .get(owner)
+                .or_else(|| {
+                    owner
+                        .rsplit("::")
+                        .next()
+                        .and_then(|leaf| struct_field_attrs.get(leaf))
+                })
+                .is_some_and(|rows| rows.is_empty());
+            let discovered = struct_ctor_discovered_fields(graph, result);
+            if discovered.is_empty() {
                 continue;
             }
-            rewrite.push((block_idx, op_idx, owner.clone()));
+            if layout_empty && struct_ctor_has_whole_value_use(graph, result) {
+                continue;
+            }
+            return Some(StructAggregateCtorSite {
+                block_idx,
+                op_idx,
+                result: result.clone(),
+                owner: owner.clone(),
+            });
         }
     }
-    for (block_idx, op_idx, owner) in &rewrite {
-        graph.blocks[*block_idx].operations[*op_idx].kind = OpKind::New {
-            owner: owner.clone(),
-        };
-    }
-    rewrite.len()
+    None
 }
 
-/// Whether `result` is used as a by-value copy, move, or merge rather than
-/// as the unique object whose fields are initialized in place.
-///
-/// Those uses are the sites at which a stack aggregate is a value: a later
-/// `FieldWrite` on one copy must not be visible through the others, and a
-/// residual callee that takes the aggregate by value expects the stack
-/// layout, not a heap pointer.
-fn struct_ctor_copied_by_value(graph: &FunctionGraph, result: &Variable) -> bool {
+fn struct_ctor_discovered_fields(
+    graph: &FunctionGraph,
+    result: &Variable,
+) -> Vec<(
+    crate::model::FieldDescriptor,
+    crate::model::LinkArg,
+    ValueType,
+)> {
+    let mut fields: Vec<(
+        crate::model::FieldDescriptor,
+        crate::model::LinkArg,
+        ValueType,
+    )> = Vec::new();
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        let OpKind::FieldWrite {
+            base,
+            field,
+            value,
+            ty,
+        } = &op.kind
+        else {
+            continue;
+        };
+        if base != result {
+            continue;
+        }
+        if let Some(existing) = fields
+            .iter_mut()
+            .find(|(seen, _, _)| seen.name == field.name)
+        {
+            *existing = (field.clone(), value.clone(), ty.clone());
+        } else {
+            fields.push((field.clone(), value.clone(), ty.clone()));
+        }
+    }
+    fields
+}
+
+fn struct_ctor_has_whole_value_use(graph: &FunctionGraph, result: &Variable) -> bool {
     for block in &graph.blocks {
         if block.inputargs.iter().any(|arg| arg == result) {
             return true;
+        }
+        match &block.exitswitch {
+            Some(ExitSwitch::Value(var)) if var == result => return true,
+            Some(ExitSwitch::Fused { args, .. }) if args.iter().any(|arg| arg == result) => {
+                return true;
+            }
+            Some(ExitSwitch::LastException | ExitSwitch::Value(_) | ExitSwitch::Fused { .. })
+            | None => {}
         }
         for link in &block.exits {
             if link
@@ -3625,34 +3717,317 @@ fn struct_ctor_copied_by_value(graph: &FunctionGraph, result: &Variable) -> bool
             {
                 return true;
             }
+            if link.last_exception.as_ref().and_then(LinkArg::as_variable) == Some(result)
+                || link.last_exc_value.as_ref().and_then(LinkArg::as_variable) == Some(result)
+            {
+                return true;
+            }
         }
         for op in &block.operations {
-            match &op.kind {
-                OpKind::Call { target, args, .. } => {
-                    if args.iter().any(|arg| arg.as_variable() == Some(result))
-                        && !call_target_is_gc_malloc(target)
-                    {
-                        return true;
-                    }
-                }
-                OpKind::FieldWrite { value, .. } => {
-                    if value.as_variable() == Some(result) {
-                        return true;
-                    }
-                }
-                OpKind::FieldRead { base, .. } if base == result => {}
-                kind => {
-                    if crate::inline::op_variable_refs(kind)
-                        .iter()
-                        .any(|var| var == result)
-                    {
-                        return true;
-                    }
-                }
+            if struct_ctor_kind_has_whole_value_use(&op.kind, result) {
+                return true;
             }
         }
     }
     false
+}
+
+fn struct_ctor_kind_has_whole_value_use(kind: &OpKind, result: &Variable) -> bool {
+    match kind {
+        OpKind::FieldRead { base, .. } if base == result => false,
+        OpKind::FieldWrite { value, .. } => value.as_variable() == Some(result),
+        OpKind::Call { target, args, .. } => {
+            args.iter().any(|arg| arg.as_variable() == Some(result))
+                && !call_target_is_gc_malloc(target)
+        }
+        kind => crate::inline::op_variable_refs(kind)
+            .iter()
+            .any(|var| var == result),
+    }
+}
+
+fn scalar_replace_one_struct_aggregate(
+    graph: &mut FunctionGraph,
+    site: StructAggregateCtorSite,
+) -> bool {
+    let StructAggregateCtorSite {
+        block_idx,
+        op_idx,
+        result,
+        owner,
+    } = site;
+    let foreign_field_ops = graph.blocks.iter().enumerate().any(|(idx, block)| {
+        idx != block_idx
+            && block.operations.iter().any(|op| match &op.kind {
+                OpKind::FieldRead { base, .. } | OpKind::FieldWrite { base, .. } => base == &result,
+                _ => false,
+            })
+    });
+    if foreign_field_ops {
+        graph.blocks[block_idx].operations[op_idx].kind = OpKind::New {
+            owner: owner.clone(),
+        };
+        materialize_whole_value_copies_in_block(graph, block_idx, op_idx, &result, &owner);
+        return true;
+    }
+
+    let ops = std::mem::take(&mut graph.blocks[block_idx].operations);
+    let mut out: Vec<crate::model::SpaceOperation> = Vec::new();
+    let mut fields: Vec<(
+        crate::model::FieldDescriptor,
+        crate::model::LinkArg,
+        ValueType,
+    )> = Vec::new();
+    for (i, op) in ops.into_iter().enumerate() {
+        if i == op_idx {
+            continue;
+        }
+        match &op.kind {
+            OpKind::FieldWrite {
+                base,
+                field,
+                value,
+                ty,
+            } if base == &result => {
+                upsert_struct_field(&mut fields, field.clone(), value.clone(), ty.clone());
+                continue;
+            }
+            OpKind::FieldRead {
+                base, field, ty, ..
+            } if base == &result => {
+                if let Some((_, value, _)) =
+                    fields.iter().find(|(seen, _, _)| seen.name == field.name)
+                {
+                    if let Some(kind) = link_arg_as_alias_op(value, ty) {
+                        out.push(crate::model::SpaceOperation {
+                            result: op.result.clone(),
+                            kind,
+                        });
+                        continue;
+                    }
+                }
+            }
+            _ => {}
+        }
+        if struct_ctor_kind_has_whole_value_use(&op.kind, &result) {
+            let kind = replace_whole_value_uses_in_kind(
+                graph, &mut out, &op.kind, &result, &owner, &fields,
+            );
+            out.push(crate::model::SpaceOperation {
+                result: op.result.clone(),
+                kind,
+            });
+        } else {
+            out.push(op);
+        }
+    }
+
+    let mut exits = std::mem::take(&mut graph.blocks[block_idx].exits);
+    for link in &mut exits {
+        for (slot, arg) in link.args.iter_mut().enumerate() {
+            if arg.as_variable() != Some(&result) {
+                continue;
+            }
+            let copy = emit_materialized_struct_copy(graph, &mut out, &owner, &fields);
+            *arg = LinkArg::Value(copy.clone());
+            let target = link.target;
+            if let Some(block) = graph.blocks.iter_mut().find(|b| b.id == target)
+                && block.inputargs.get(slot) == Some(&result)
+            {
+                block.inputargs[slot] = copy;
+            }
+        }
+        if link.last_exception.as_ref().and_then(LinkArg::as_variable) == Some(&result) {
+            let copy = emit_materialized_struct_copy(graph, &mut out, &owner, &fields);
+            link.last_exception = Some(LinkArg::Value(copy));
+        }
+        if link.last_exc_value.as_ref().and_then(LinkArg::as_variable) == Some(&result) {
+            let copy = emit_materialized_struct_copy(graph, &mut out, &owner, &fields);
+            link.last_exc_value = Some(LinkArg::Value(copy));
+        }
+    }
+    graph.blocks[block_idx].operations = out;
+    graph.blocks[block_idx].exits = exits;
+    true
+}
+
+fn upsert_struct_field(
+    fields: &mut Vec<(
+        crate::model::FieldDescriptor,
+        crate::model::LinkArg,
+        ValueType,
+    )>,
+    field: crate::model::FieldDescriptor,
+    value: crate::model::LinkArg,
+    ty: ValueType,
+) {
+    if let Some(existing) = fields
+        .iter_mut()
+        .find(|(seen, _, _)| seen.name == field.name)
+    {
+        *existing = (field, value, ty);
+    } else {
+        fields.push((field, value, ty));
+    }
+}
+
+fn link_arg_as_alias_op(value: &crate::model::LinkArg, result_ty: &ValueType) -> Option<OpKind> {
+    match value {
+        LinkArg::Value(var) => Some(OpKind::UnaryOp {
+            op: "same_as".to_string(),
+            operand: var.clone(),
+            result_ty: result_ty.clone(),
+        }),
+        LinkArg::Const(constant) => match &constant.value {
+            crate::flowspace::model::ConstValue::Int(v) => Some(OpKind::ConstInt(*v)),
+            crate::flowspace::model::ConstValue::Int128(v) => Some(OpKind::ConstInt128(*v)),
+            crate::flowspace::model::ConstValue::UInt128(v) => Some(OpKind::ConstUInt128(*v)),
+            crate::flowspace::model::ConstValue::Float(v) => Some(OpKind::ConstFloat(*v)),
+            crate::flowspace::model::ConstValue::Bool(v) => Some(OpKind::ConstBool(*v)),
+            crate::flowspace::model::ConstValue::None => Some(OpKind::ConstNone),
+            crate::flowspace::model::ConstValue::ByteStr(v) => Some(OpKind::ConstStr(v.clone())),
+            _ => None,
+        },
+    }
+}
+
+fn emit_materialized_struct_copy(
+    graph: &mut FunctionGraph,
+    out: &mut Vec<crate::model::SpaceOperation>,
+    owner: &str,
+    fields: &[(
+        crate::model::FieldDescriptor,
+        crate::model::LinkArg,
+        ValueType,
+    )],
+) -> Variable {
+    let result = graph.alloc_value_var();
+    out.push(crate::model::SpaceOperation {
+        result: Some(result.clone()),
+        kind: OpKind::New {
+            owner: owner.to_string(),
+        },
+    });
+    for (field, value, ty) in fields {
+        out.push(crate::model::SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: result.clone(),
+                field: field.clone(),
+                value: value.clone(),
+                ty: ty.clone(),
+            },
+        });
+    }
+    result
+}
+
+fn replace_whole_value_uses_in_kind(
+    graph: &mut FunctionGraph,
+    out: &mut Vec<crate::model::SpaceOperation>,
+    kind: &OpKind,
+    result: &Variable,
+    owner: &str,
+    fields: &[(
+        crate::model::FieldDescriptor,
+        crate::model::LinkArg,
+        ValueType,
+    )],
+) -> OpKind {
+    match kind {
+        OpKind::Call {
+            target,
+            args,
+            result_ty,
+        } => {
+            let args = args
+                .iter()
+                .map(|arg| {
+                    if arg.as_variable() == Some(result) {
+                        LinkArg::Value(emit_materialized_struct_copy(graph, out, owner, fields))
+                    } else {
+                        arg.clone()
+                    }
+                })
+                .collect();
+            OpKind::Call {
+                target: target.clone(),
+                args,
+                result_ty: result_ty.clone(),
+            }
+        }
+        OpKind::FieldWrite {
+            base,
+            field,
+            value,
+            ty,
+        } if value.as_variable() == Some(result) => OpKind::FieldWrite {
+            base: base.clone(),
+            field: field.clone(),
+            value: LinkArg::Value(emit_materialized_struct_copy(graph, out, owner, fields)),
+            ty: ty.clone(),
+        },
+        other => {
+            let copy = emit_materialized_struct_copy(graph, out, owner, fields);
+            crate::inline::remap_op_kind(other, &|var| {
+                if var == result {
+                    copy.clone()
+                } else {
+                    var.clone()
+                }
+            })
+        }
+    }
+}
+
+fn materialize_whole_value_copies_in_block(
+    graph: &mut FunctionGraph,
+    block_idx: usize,
+    ctor_idx: usize,
+    result: &Variable,
+    owner: &str,
+) {
+    let ops = std::mem::take(&mut graph.blocks[block_idx].operations);
+    let mut out: Vec<crate::model::SpaceOperation> = Vec::new();
+    let mut fields: Vec<(
+        crate::model::FieldDescriptor,
+        crate::model::LinkArg,
+        ValueType,
+    )> = Vec::new();
+    for (i, op) in ops.into_iter().enumerate() {
+        if let OpKind::FieldWrite {
+            base,
+            field,
+            value,
+            ty,
+        } = &op.kind
+            && base == result
+        {
+            upsert_struct_field(&mut fields, field.clone(), value.clone(), ty.clone());
+        }
+        if i > ctor_idx && struct_ctor_kind_has_whole_value_use(&op.kind, result) {
+            let kind =
+                replace_whole_value_uses_in_kind(graph, &mut out, &op.kind, result, owner, &fields);
+            out.push(crate::model::SpaceOperation {
+                result: op.result.clone(),
+                kind,
+            });
+        } else {
+            out.push(op);
+        }
+    }
+    let mut exits = std::mem::take(&mut graph.blocks[block_idx].exits);
+    for link in &mut exits {
+        for arg in &mut link.args {
+            if arg.as_variable() != Some(result) {
+                continue;
+            }
+            let copy = emit_materialized_struct_copy(graph, &mut out, owner, &fields);
+            *arg = LinkArg::Value(copy);
+        }
+    }
+    graph.blocks[block_idx].operations = out;
+    graph.blocks[block_idx].exits = exits;
 }
 
 /// Variables that still belong to an unfused boxing cluster: each
@@ -6451,12 +6826,12 @@ impl<'a> Lowering<'a> {
             // `malloc(GcStruct)` plus one `setfield` per member; the
             // constructor call is a temporary marker so boxing fusion and
             // dead-aggregate sweep still see the construct-on-stack
-            // spelling, then [`lower_struct_aggregate_ctors_to_new`]
-            // rewrites it to `OpKind::New` only when that rewrite is a
-            // value-preserving allocation. Transparent newtype wrappers
-            // stay a no-op alias of their inner operand. Enum variants,
-            // tuples, and arrays keep `CallTarget::SyntheticTransparentCtor`
-            // for the later rewrites that still match that shape.
+            // spelling, then [`scalar_replace_named_struct_aggregates`]
+            // replaces it with per-field SSA and a `New` per by-value
+            // escape. Transparent newtype wrappers stay a no-op alias of
+            // their inner operand. Enum variants, tuples, and arrays keep
+            // `CallTarget::SyntheticTransparentCtor` for the later rewrites
+            // that still match that shape.
             Rvalue::Aggregate(kind, operands) => {
                 // A fieldless (C-like) enum variant carries no payload, so
                 // constructing it is just naming its discriminant integer
@@ -6620,8 +6995,8 @@ impl<'a> Lowering<'a> {
                 // `__init__` is not registered with the bookkeeper —
                 // the operand values flow through the FieldWrite chain
                 // below instead.  A named struct's constructor is the
-                // malloc marker; [`lower_struct_aggregate_ctors_to_new`]
-                // rewrites it to `OpKind::New` after boxing fusion.
+                // malloc marker; [`scalar_replace_named_struct_aggregates`]
+                // replaces it with per-field SSA after boxing fusion.
                 let ctor_target = if owner_path.is_empty() {
                     CallTarget::synthetic_transparent_ctor(ctor_name.clone())
                 } else if adt_is_struct {
@@ -33567,8 +33942,8 @@ mod tests {
         charon_type_value_to_ast_string, checked_arith_uint_atom_is_word_sized, decode_literal,
         fn_ptr_family_for, int_binop_needs_ptr_to_int, is_class_pytype_assoc_const,
         is_core_result_map_err_path, json_ty_is_thin_pointer_element,
-        json_ty_scalar_element_spelling, lower_struct_aggregate_ctors_to_new,
-        primitive_float_const, push_cast_ptr_to_int, push_ptr_to_unsigned_cast, shaped_array_parts,
+        json_ty_scalar_element_spelling, primitive_float_const, push_cast_ptr_to_int,
+        push_ptr_to_unsigned_cast, scalar_replace_named_struct_aggregates, shaped_array_parts,
         simplify_lowered_graph, type_decl_is_closure_env, tyref_array_suffix, tyref_is_closure_env,
         tyref_is_raw_byte_ptr, tyref_positional_aggregate_root, tyref_to_attr_value_type,
         tyref_to_attr_value_type_for_struct_field, tyref_to_value_type,
@@ -33926,42 +34301,194 @@ mod tests {
         (ctors, news, field_writes)
     }
 
-    /// A unique, unescaped named struct is `malloc(GcStruct)` plus one
-    /// `setfield` per member, not a residual constructor call. Transparent
-    /// newtype wrappers are a different arm and stay a no-op alias.
+    fn empty_struct_attrs() -> std::collections::HashMap<String, Vec<(String, ValueType)>> {
+        std::collections::HashMap::new()
+    }
+
+    fn replace_struct_ctors(graph: &mut FunctionGraph) -> usize {
+        scalar_replace_named_struct_aggregates(graph, &empty_struct_attrs())
+    }
+
+    fn same_as_count(graph: &FunctionGraph) -> usize {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as"))
+            .count()
+    }
+
+    fn struct_news(graph: &FunctionGraph) -> Vec<Variable> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::New { owner } if owner == "error::DictKeyError" => op.result.clone(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A unique, unescaped named struct becomes its fields: the constructor
+    /// and its stores disappear, and the field read is the stored SSA value.
+    /// Transparent newtype wrappers are a different arm and stay a no-op alias.
     #[test]
-    fn named_struct_aggregate_lowers_to_new_plus_field_stores() {
+    fn named_struct_aggregate_becomes_its_fields() {
         let mut graph = struct_ctor_graph(false);
         assert_eq!(struct_ctor_ops(&graph), (1, 0, 1));
-        assert_eq!(lower_struct_aggregate_ctors_to_new(&mut graph), 1);
-        assert_eq!(struct_ctor_ops(&graph), (0, 1, 1));
+        assert_eq!(replace_struct_ctors(&mut graph), 1);
+        assert_eq!(struct_ctor_ops(&graph), (0, 0, 0));
+        assert_eq!(same_as_count(&graph), 1);
     }
 
-    /// Returning the aggregate is a by-value move. `New` would give the
-    /// caller a pointer, so later copies share mutations of one object.
+    /// Returning the aggregate materialises one `New` at the escape. The
+    /// constructor is gone; later copies cannot share that object.
     #[test]
-    fn returned_struct_ctor_keeps_value_semantics() {
+    fn returned_struct_ctor_materializes_a_fresh_new() {
         let mut graph = struct_ctor_graph_escaping(false, StructCtorEscape::Returned);
-        assert_eq!(lower_struct_aggregate_ctors_to_new(&mut graph), 0);
-        assert_eq!(struct_ctor_ops(&graph), (1, 0, 1));
+        assert_eq!(replace_struct_ctors(&mut graph), 1);
+        assert_eq!(struct_ctor_ops(&graph), (0, 1, 1));
+        let news = struct_news(&graph);
+        assert_eq!(news.len(), 1);
+        let returned = graph.block(graph.startblock).exits[0]
+            .args
+            .first()
+            .and_then(LinkArg::as_variable);
+        assert_eq!(returned, Some(&news[0]));
     }
 
-    /// Passing the aggregate to a call is a by-value copy. Residual callees
-    /// expect the stack layout, not a heap pointer.
+    /// Passing the aggregate to a non-malloc call materialises one `New` at
+    /// that argument. The residual callee receives a distinct object.
     #[test]
-    fn by_value_call_arg_struct_ctor_is_not_rewritten() {
+    fn aggregate_passed_by_value_to_a_non_malloc_call() {
         let mut graph = struct_ctor_graph_escaping(false, StructCtorEscape::CallArg);
-        assert_eq!(lower_struct_aggregate_ctors_to_new(&mut graph), 0);
-        assert_eq!(struct_ctor_ops(&graph), (1, 0, 1));
+        assert_eq!(replace_struct_ctors(&mut graph), 1);
+        assert_eq!(struct_ctor_ops(&graph), (0, 1, 1));
+        let news = struct_news(&graph);
+        assert_eq!(news.len(), 1);
+        let call_arg = graph
+            .block(graph.startblock)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    args,
+                    ..
+                } if segments.as_slice() == ["slice", "index"] => {
+                    args.first().and_then(LinkArg::as_variable).cloned()
+                }
+                _ => None,
+            });
+        assert_eq!(call_arg.as_ref(), Some(&news[0]));
     }
 
-    /// A phi copy plus a later field write must not share one allocation:
-    /// each copy is a distinct value.
+    /// A phi copy plus a later field write is a distinct allocation: the
+    /// predecessor materialises a `New`, and the mutation writes that copy.
     #[test]
-    fn phi_mutated_struct_ctor_is_not_rewritten() {
+    fn aggregate_flowing_into_a_phi() {
         let mut graph = struct_ctor_graph_escaping(false, StructCtorEscape::Phi);
-        assert_eq!(lower_struct_aggregate_ctors_to_new(&mut graph), 0);
-        assert_eq!(struct_ctor_ops(&graph), (1, 0, 2));
+        assert_eq!(replace_struct_ctors(&mut graph), 1);
+        assert_eq!(struct_ctor_ops(&graph), (0, 1, 2));
+        let news = struct_news(&graph);
+        assert_eq!(news.len(), 1);
+        let entry = graph.block(graph.startblock);
+        let passed = entry.exits[0].args.first().and_then(LinkArg::as_variable);
+        assert_eq!(passed, Some(&news[0]));
+        let join = &graph.blocks[entry.exits[0].target.0];
+        let mutated = join.operations.iter().find_map(|op| match &op.kind {
+            OpKind::FieldWrite { base, field, .. } if field.name == "kind" => Some(base.clone()),
+            _ => None,
+        });
+        assert_eq!(mutated.as_ref(), join.inputargs.first());
+    }
+
+    /// Two by-value copies of one aggregate are two allocations. Mutating
+    /// one copy's field does not write the other.
+    #[test]
+    fn by_value_copy_then_mutation_does_not_change_the_other() {
+        let mut graph = FunctionGraph::new("struct_ctor_copy");
+        let entry = graph.startblock;
+        let owner = "error::DictKeyError";
+        let result = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_struct_ctor(
+                        vec!["error".to_string()],
+                        "DictKeyError",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some(owner.to_string())),
+                },
+                true,
+            )
+            .expect("struct ctor");
+        let payload = graph
+            .push_op_var(entry, OpKind::ConstInt(1), true)
+            .expect("payload");
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: result.clone(),
+                field: FieldDescriptor::new("kind", Some(owner.to_string())),
+                value: LinkArg::Value(payload.clone()),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        let (next, args) = graph.create_block_with_arg_vars(2);
+        let orig = args[0].clone();
+        let copy = args[1].clone();
+        graph.push_op_var(
+            next,
+            OpKind::FieldWrite {
+                base: copy.clone(),
+                field: FieldDescriptor::new("kind", Some(owner.to_string())),
+                value: LinkArg::Value(payload),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        graph.push_op_var(
+            next,
+            OpKind::FieldRead {
+                base: orig.clone(),
+                field: FieldDescriptor::new("kind", Some(owner.to_string())),
+                ty: ValueType::Int,
+                pure: true,
+            },
+            true,
+        );
+        graph.set_goto(entry, next, vec![result.clone(), result]);
+        graph.set_return(next, None);
+
+        assert_eq!(replace_struct_ctors(&mut graph), 1);
+        let news = struct_news(&graph);
+        assert_eq!(news.len(), 2);
+        assert_ne!(news[0], news[1]);
+        let entry = graph.block(graph.startblock);
+        let link_args: Vec<&Variable> = entry.exits[0]
+            .args
+            .iter()
+            .filter_map(LinkArg::as_variable)
+            .collect();
+        assert_eq!(link_args, vec![&news[0], &news[1]]);
+        let join = &graph.blocks[entry.exits[0].target.0];
+        assert_eq!(join.inputargs.len(), 2);
+        assert_ne!(join.inputargs[0], join.inputargs[1]);
+        let mutated = join.operations.iter().find_map(|op| match &op.kind {
+            OpKind::FieldWrite { base, field, .. } if field.name == "kind" => Some(base.clone()),
+            _ => None,
+        });
+        let read = join.operations.iter().find_map(|op| match &op.kind {
+            OpKind::FieldRead { base, field, .. } if field.name == "kind" => Some(base.clone()),
+            _ => None,
+        });
+        assert_eq!(mutated.as_ref(), Some(&join.inputargs[1]));
+        assert_eq!(read.as_ref(), Some(&join.inputargs[0]));
+        assert_ne!(mutated, read);
     }
 
     /// The rewrite is the last step of the final simplify, after boxing fusion
@@ -33970,10 +34497,11 @@ mod tests {
     #[test]
     fn final_simplify_rewrites_struct_ctors_prepass_does_not() {
         let mut graph = struct_ctor_graph(false);
-        simplify_lowered_graph(&mut graph, &std::collections::HashMap::new(), false);
+        simplify_lowered_graph(&mut graph, &empty_struct_attrs(), false);
         assert_eq!(struct_ctor_ops(&graph), (1, 0, 1));
-        simplify_lowered_graph(&mut graph, &std::collections::HashMap::new(), true);
-        assert_eq!(struct_ctor_ops(&graph), (0, 1, 1));
+        simplify_lowered_graph(&mut graph, &empty_struct_attrs(), true);
+        assert_eq!(struct_ctor_ops(&graph), (0, 0, 0));
+        assert_eq!(same_as_count(&graph), 1);
     }
 
     /// `malloc_typed(T { .. })` is the boxing cluster. Its stack aggregate
@@ -33981,8 +34509,102 @@ mod tests {
     #[test]
     fn malloc_typed_struct_ctor_is_left_for_boxing_fusion() {
         let mut graph = struct_ctor_graph(true);
-        assert_eq!(lower_struct_aggregate_ctors_to_new(&mut graph), 0);
+        assert_eq!(replace_struct_ctors(&mut graph), 0);
         assert_eq!(struct_ctor_ops(&graph), (1, 0, 1));
+    }
+
+    /// A field-less struct has no size descr (`all_fielddescrs` is empty),
+    /// so a by-value escape keeps the constructor rather than allocating.
+    #[test]
+    fn field_less_struct_ctor_is_not_allocated() {
+        let mut graph = FunctionGraph::new("unit_struct");
+        let entry = graph.startblock;
+        let owner = "ops::RangeFull";
+        let result = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_struct_ctor(
+                        vec!["ops".to_string()],
+                        "RangeFull",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some(owner.to_string())),
+                },
+                true,
+            )
+            .expect("struct ctor");
+        graph.set_return(entry, Some(result));
+        assert_eq!(replace_struct_ctors(&mut graph), 0);
+        let ctors = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::SyntheticTransparentCtor {
+                            is_struct: true,
+                            ..
+                        },
+                        ..
+                    }
+                )
+            })
+            .count();
+        let news = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| matches!(&op.kind, OpKind::New { .. }))
+            .count();
+        assert_eq!(ctors, 1);
+        assert_eq!(news, 0);
+    }
+
+    /// A closure environment has no registered layout, so it is never a `New`.
+    #[test]
+    fn closure_env_ctor_is_not_allocated() {
+        let mut graph = FunctionGraph::new("closure_ctor");
+        let entry = graph.startblock;
+        let owner = "body::closure";
+        let result = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_struct_ctor(
+                        vec!["body".to_string()],
+                        "closure",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some(owner.to_string())),
+                },
+                true,
+            )
+            .expect("closure ctor");
+        let payload = graph
+            .push_op_var(entry, OpKind::ConstInt(1), true)
+            .expect("capture");
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: result.clone(),
+                field: FieldDescriptor::new("capture", Some(owner.to_string())),
+                value: LinkArg::Value(payload),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        graph.set_return(entry, Some(result));
+        assert_eq!(replace_struct_ctors(&mut graph), 0);
+        let news = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| matches!(&op.kind, OpKind::New { .. }))
+            .count();
+        assert_eq!(news, 0);
     }
 
     fn boxing_cluster_with_nested_header() -> FunctionGraph {
@@ -34085,7 +34707,7 @@ mod tests {
     fn malloc_typed_nested_header_ctor_is_left_for_boxing_fusion() {
         let mut graph = boxing_cluster_with_nested_header();
         assert_eq!(boxing_cluster_ctor_new_counts(&graph), (2, 0));
-        assert_eq!(lower_struct_aggregate_ctors_to_new(&mut graph), 0);
+        assert_eq!(replace_struct_ctors(&mut graph), 0);
         assert_eq!(boxing_cluster_ctor_new_counts(&graph), (2, 0));
     }
 
