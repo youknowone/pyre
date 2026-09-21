@@ -4067,6 +4067,17 @@ pub fn compute_load_method_bound(obj: PyObjectRef, attr: PyObjectRef, name: &str
             // FunctionWithFixedCode (interp2app) attrs that getattr
             // returns unchanged, while staticmethods (str.maketrans) and
             // classmethods (dict.fromkeys) were already unwrapped.
+            //
+            // Gated like the instance arm, and for the same reason: the MRO
+            // shape below infers a binding from how getattr WOULD have
+            // resolved the name, which describes nothing once an override
+            // resolved it instead.  A subclass whose `__getattribute__`
+            // hands back the class's own function reaches this arm on its
+            // storage rather than the instance one, and binding there
+            // prepends a receiver the call site never wrote.
+            if !crate::baseobjspace::has_object_getattribute(w_type.as_ptr()) {
+                return PY_NULL;
+            }
             match crate::baseobjspace::lookup_in_type(w_type.as_ptr(), name) {
                 Some(d) if pyre_object::is_staticmethod(d) => PY_NULL,
                 // Exact for the reason given on the instance arm above.

@@ -1035,9 +1035,9 @@ impl TraceCtx {
     /// goes through the blackhole fallback wrapper which the bhimpl
     /// implements directly.  Returns `Some(Value::Int(len))` when
     /// `self.cpu` is wired and the descr resolves to a `BhDescr::
-    /// Array`; `None` otherwise.  Used by `opimpl_arraylen_gc` to
-    /// stamp the recorded `ArraylenGc` OpRef with its runtime concrete
-    /// (RPython `BoxInt(length)` carrier).
+    /// Array` carrying a length word; `None` otherwise.  Used by
+    /// `opimpl_arraylen_gc` to stamp the recorded `ArraylenGc` OpRef
+    /// with its runtime concrete (RPython `BoxInt(length)` carrier).
     pub fn arraylen_sanity_load(&self, array_ptr: i64, descr: &DescrRef) -> Option<Value> {
         let cpu_ptr = self.cpu?;
         // SAFETY: cpu pointer was installed via `set_cpu` against a
@@ -1055,6 +1055,13 @@ impl TraceCtx {
             return None;
         }
         let bh_descr = descr_to_bh_array_descr(descr)?;
+        // A raw `rffi.CArray` descr (`raw_carray_descrof`) resolves to an
+        // `Array` with no `lendescr`, because such an array carries no length
+        // word — `bh_arraylen_gc` has nothing to read and asserts.  Decline it
+        // here: `None` is the state the callers are written for, leaving the
+        // recorded op unstamped and the bounds check unproven, rather than
+        // aborting the process from a sanity read.
+        bh_descr.array_len_offset()?;
         Some(Value::Int(crate::executor::do_arraylen_gc(
             cpu,
             (),
@@ -6496,6 +6503,58 @@ mod tests {
             Some(Value::Float(2.5))
         );
         assert_eq!(ctx.field_sanity_load(0xCAFE_BABE, &descr, Type::Void), None);
+    }
+
+    /// An array descr with no `lendescr` describes an array that
+    /// carries no length word — `raw_carray_descrof`'s shape.  The
+    /// sanity load must decline it, which is the state its three
+    /// callers are written for: `dispatch.rs` leaves the recorded op
+    /// unstamped, `execute_and_record.rs` takes the unsanitised path,
+    /// and `index_in_array_bounds` returns `false`.  Reaching the
+    /// executor instead aborts the process, because `bh_arraylen_gc`
+    /// has no offset to read from.
+    #[test]
+    fn arraylen_sanity_load_declines_a_headerless_array_descr() {
+        let cpu = SanityTestCpu {
+            int_value: 0,
+            ref_value: majit_ir::GcRef(0),
+            float_value: 0.0,
+        };
+        let mut ctx = TraceCtx::for_test(0);
+        ctx.set_cpu(Some(&cpu));
+        let headerless = majit_ir::descr::make_array_descr_full(1, 0, 8, 0, Type::Int);
+        assert!(
+            ctx.arraylen_sanity_load(0xCAFE_BABE, &headerless).is_none(),
+            "a headerless array descr has no length word to sanity-read",
+        );
+    }
+
+    /// The companion: an array descr that does carry a length word
+    /// dispatches through `executor::do_arraylen_gc` and reads it, so
+    /// the decline above is a property of the descr and not of the
+    /// wiring.
+    #[test]
+    fn arraylen_sanity_load_wired_reads_the_length_word() {
+        let cpu = SanityTestCpu {
+            int_value: 0,
+            ref_value: majit_ir::GcRef(0),
+            float_value: 0.0,
+        };
+        let mut ctx = TraceCtx::for_test(0);
+        ctx.set_cpu(Some(&cpu));
+
+        // The default `bh_arraylen_gc` reads the machine word at
+        // `array_ptr + lendescr.offset()`, so the descr has to point at
+        // memory this test owns.
+        let header: [usize; 2] = [0xDEAD_BEEF, 5];
+        let mut with_len = majit_ir::descr::SimpleArrayDescr::new(1, 16, 8, 0, Type::Int);
+        with_len.lendescr = Some(majit_ir::make_field_descr_full(2, 8, 8, Type::Int, false));
+        let with_len: DescrRef = std::sync::Arc::new(with_len);
+
+        assert_eq!(
+            ctx.arraylen_sanity_load(header.as_ptr() as i64, &with_len),
+            Some(Value::Int(5))
+        );
     }
 
     /// vable_getfield_int cache-hit with Const Int cached and wired cpu:
