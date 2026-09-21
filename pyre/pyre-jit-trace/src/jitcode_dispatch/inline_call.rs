@@ -12562,6 +12562,17 @@ fn try_walker_inline_user_binop_reflected<Sym: WalkSym>(
                 unsafe { pyre_object::typeobject::w_type_get_name(w_class_l) }
             ));
         }
+        // The skip of the forward slot stands on the lhs type still
+        // resolving that name to the same builtin slot.  Only the
+        // version tag witnesses that; a zero tag is uncacheable and
+        // cannot be pinned.
+        if unsafe { pyre_object::typeobject::w_type_get_version_tag(w_class_l) } == 0 {
+            decline!(format_args!("lhs class {} has no version tag", unsafe {
+                pyre_object::typeobject::w_type_get_name(w_class_l)
+            }));
+        }
+        let w_class_l_const = ctx.trace_ctx.const_ref(w_class_l as i64);
+        walker_pin_type_version_tag(ctx, op.pc, w_class_l_const)?;
     }
     try_walker_inline_user_binop_dunder(
         ctx,

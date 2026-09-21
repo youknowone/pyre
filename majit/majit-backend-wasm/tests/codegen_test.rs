@@ -8401,6 +8401,41 @@ fn interior_field_ops_compile() {
     assert_eq!(shl, 1, "item_size 8 on the RAW store is get_scale 3");
 }
 
+/// A ref-typed SETINTERIORFIELD_GC that skipped rewrite must fail the same
+/// way SETFIELD_GC / SETARRAYITEM_GC do: rewrite emits COND_CALL_GC_WB
+/// before that store, and codegen must not write the pointer silently.
+#[test]
+#[should_panic(
+    expected = "wasm codegen: SetinteriorfieldGc must have been lowered by rewrite_ops_for_gc"
+)]
+fn setinteriorfield_gc_ref_without_rewrite_is_rejected() {
+    use majit_ir::descr::{
+        ArrayDescr, FieldDescr, SimpleArrayDescr, SimpleFieldDescr, SimpleInteriorFieldDescr,
+    };
+    use std::sync::Arc;
+
+    let array: Arc<dyn ArrayDescr> = Arc::new(SimpleArrayDescr::new(1, 8, 16, 55, Type::Ref));
+    let field: Arc<dyn FieldDescr> = Arc::new(SimpleFieldDescr::new(0, 0, 4, Type::Ref, false));
+    let interior = Arc::new(SimpleInteriorFieldDescr::new(0, array, field));
+    let set = make_op(
+        OpCode::SetinteriorfieldGc,
+        &[
+            OpRef::input_arg_ref(0),
+            OpRef::input_arg_int(1),
+            OpRef::input_arg_ref(2),
+        ],
+        OpRef::NONE,
+    );
+    set.setdescr(interior);
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Ref, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+        InputArg::from_type_rc(Type::Ref, 2),
+    ];
+    let ops = vec![set, Op::new(OpCode::Finish, &[])];
+    let _ = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+}
+
 /// Count the operators a test cares about in the one code section entry.
 fn count_operators(bytes: &[u8], mut f: impl FnMut(&wasmparser::Operator<'_>)) {
     for payload in wasmparser::Parser::new(0).parse_all(bytes) {

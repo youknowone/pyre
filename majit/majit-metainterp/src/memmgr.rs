@@ -271,6 +271,11 @@ impl MemoryManager {
             }
             !evict
         });
+        // memmgr.py `_kill_old_loops_now` only deletes the `alive_loops`
+        // entry; a token still reachable from a live jumper through
+        // `_keepalive_jitcell_tokens` stays alive. Break only garbage
+        // `record_jump_to` cycles so `JitCellToken::drop` can run.
+        self.trial_delete_keepalive_tokens(&evicted_tokens);
         if !evicted_tokens.is_empty() {
             self.evictions = self.evictions.wrapping_add(1);
         }
@@ -293,8 +298,111 @@ impl MemoryManager {
     pub fn release_all_loops(&mut self) {
         let _scope = crate::debug::scope("jit-mem-releaseall");
         crate::debug::debug_print(&format!("Loop tokens cleared: {}", self.alive_loops.len()));
-        self.alive_loops.clear();
+        // memmgr.py `release_all_loops` drops every `alive_loops` entry
+        // and lets the GC free unreachable tokens. Drain first so the
+        // trial deletion below can tell a still-held token from garbage.
+        let evicted_tokens: Vec<Arc<JitCellToken>> = std::mem::take(&mut self.alive_loops)
+            .into_iter()
+            .map(|(_, token)| token)
+            .collect();
+        self.trial_delete_keepalive_tokens(&evicted_tokens);
         self.evictions = self.evictions.wrapping_add(1);
+    }
+
+    /// Clear `keepalive_tokens` only on tokens that are garbage after
+    /// leaving `alive_loops`.
+    ///
+    /// `record_jump_to` stores a strong `Arc` in `keepalive_tokens`, so
+    /// two loops that jump to each other form a cycle that removing the
+    /// `alive_loops` entry will not drop. memmgr.py `_kill_old_loops_now`
+    /// / `release_all_loops` only delete that entry ("It will soon be
+    /// freed by the GC"): a token still reachable from a live token
+    /// through `_keepalive_jitcell_tokens` stays alive together with
+    /// everything it reaches. Trial-delete the evicted set so a chain
+    /// `C -> A -> B` with `C` still in `alive_loops` keeps A's hold on B.
+    fn trial_delete_keepalive_tokens(&self, evicted_tokens: &[Arc<JitCellToken>]) {
+        let mut candidates: Vec<Arc<JitCellToken>> = Vec::new();
+        for token in evicted_tokens {
+            let ptr = Arc::as_ptr(token);
+            if self.alive_loops.contains_key(&ptr) {
+                continue;
+            }
+            if candidates.iter().any(|t| Arc::as_ptr(t) == ptr) {
+                continue;
+            }
+            candidates.push(Arc::clone(token));
+        }
+        let mut i = 0;
+        while i < candidates.len() {
+            let target_ptrs: Vec<*const JitCellToken> = candidates[i]
+                .keepalive_tokens
+                .lock()
+                .iter()
+                .map(Arc::as_ptr)
+                .collect();
+            let mut new_ptrs = Vec::new();
+            for ptr in target_ptrs {
+                if self.alive_loops.contains_key(&ptr) {
+                    continue;
+                }
+                if candidates.iter().any(|t| Arc::as_ptr(t) == ptr) {
+                    continue;
+                }
+                if new_ptrs.contains(&ptr) {
+                    continue;
+                }
+                new_ptrs.push(ptr);
+            }
+            if !new_ptrs.is_empty() {
+                let clones: Vec<Arc<JitCellToken>> = candidates[i]
+                    .keepalive_tokens
+                    .lock()
+                    .iter()
+                    .filter(|t| new_ptrs.contains(&Arc::as_ptr(t)))
+                    .cloned()
+                    .collect();
+                candidates.extend(clones);
+            }
+            i += 1;
+        }
+
+        let mut live = vec![false; candidates.len()];
+        for (idx, token) in candidates.iter().enumerate() {
+            let ptr = Arc::as_ptr(token);
+            let mut internal = 0usize;
+            for held in evicted_tokens {
+                if Arc::as_ptr(held) == ptr {
+                    internal += 1;
+                }
+            }
+            for held in &candidates {
+                if Arc::as_ptr(held) == ptr {
+                    internal += 1;
+                }
+            }
+            for other in &candidates {
+                if Arc::as_ptr(other) == ptr {
+                    continue;
+                }
+                for kept in other.keepalive_tokens.lock().iter() {
+                    if Arc::as_ptr(kept) == ptr {
+                        internal += 1;
+                    }
+                }
+            }
+            if Arc::strong_count(token) > internal && !live[idx] {
+                live[idx] = true;
+                mark_keepalive_reachable_live(token, &candidates, &mut live);
+            }
+        }
+        for token in self.alive_loops.values() {
+            mark_keepalive_reachable_live(token, &candidates, &mut live);
+        }
+        for (idx, token) in candidates.iter().enumerate() {
+            if !live[idx] {
+                token.keepalive_tokens.lock().clear();
+            }
+        }
     }
 
     /// The counter [`Self::evictions`] documents.
@@ -318,5 +426,169 @@ impl MemoryManager {
     /// Test/debug accessor — `looptoken in self.alive_loops` upstream.
     pub fn contains(&self, looptoken: &Arc<JitCellToken>) -> bool {
         self.alive_loops.contains_key(&Arc::as_ptr(looptoken))
+    }
+}
+
+fn mark_keepalive_reachable_live(
+    start: &JitCellToken,
+    candidates: &[Arc<JitCellToken>],
+    live: &mut [bool],
+) {
+    let mut work: Vec<*const JitCellToken> = start
+        .keepalive_tokens
+        .lock()
+        .iter()
+        .map(Arc::as_ptr)
+        .collect();
+    while let Some(ptr) = work.pop() {
+        let Some(idx) = candidates.iter().position(|t| Arc::as_ptr(t) == ptr) else {
+            continue;
+        };
+        if live[idx] {
+            continue;
+        }
+        live[idx] = true;
+        work.extend(
+            candidates[idx]
+                .keepalive_tokens
+                .lock()
+                .iter()
+                .map(Arc::as_ptr),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keepalive_holds(jumper: &Arc<JitCellToken>, target: &Arc<JitCellToken>) -> bool {
+        jumper
+            .keepalive_tokens
+            .lock()
+            .iter()
+            .any(|t| Arc::ptr_eq(t, target))
+    }
+
+    #[test]
+    fn evicted_tokens_release_keepalive_cycle() {
+        let a = Arc::new(JitCellToken::new(1));
+        let b = Arc::new(JitCellToken::new(2));
+        a.record_jump_to(Arc::clone(&b));
+        b.record_jump_to(Arc::clone(&a));
+
+        let mut mgr = MemoryManager::new(1);
+        mgr.keep_loop_alive(&a);
+        mgr.keep_loop_alive(&b);
+
+        // Observer Arcs would look like an executing frame / JitCell hold
+        // and keep the cycle. Drop them so this is a pure garbage cycle.
+        let weak_a = Arc::downgrade(&a);
+        let weak_b = Arc::downgrade(&b);
+        drop(a);
+        drop(b);
+
+        let mut evicted = Vec::new();
+        while mgr.alive_count() > 0 {
+            evicted.extend(mgr.next_generation());
+        }
+        drop(evicted);
+
+        assert!(weak_a.upgrade().is_none());
+        assert!(weak_b.upgrade().is_none());
+    }
+
+    #[test]
+    fn evicted_chain_kept_by_alive_jumper() {
+        let a = Arc::new(JitCellToken::new(1));
+        let b = Arc::new(JitCellToken::new(2));
+        let c = Arc::new(JitCellToken::new(3));
+        c.record_jump_to(Arc::clone(&a));
+        a.record_jump_to(Arc::clone(&b));
+
+        // max_age=2, check_frequency=1: first sweep keeps gen=1 tokens,
+        // second sweep evicts them while a gen=2 token stays in alive_loops.
+        let mut mgr = MemoryManager::new(2);
+        mgr.keep_loop_alive(&a);
+        mgr.keep_loop_alive(&b);
+        assert!(mgr.next_generation().is_empty());
+        mgr.keep_loop_alive(&c);
+
+        let weak_a = Arc::downgrade(&a);
+        let weak_b = Arc::downgrade(&b);
+        drop(a);
+        drop(b);
+
+        let evicted = mgr.next_generation();
+        assert!(evicted.iter().any(|t| Arc::as_ptr(t) == weak_a.as_ptr()));
+        assert!(evicted.iter().any(|t| Arc::as_ptr(t) == weak_b.as_ptr()));
+        assert!(mgr.contains(&c));
+        drop(evicted);
+
+        let a = weak_a.upgrade().expect("C still jumps to A");
+        let b = weak_b.upgrade().expect("A still jumps to B");
+        assert!(keepalive_holds(&a, &b));
+    }
+
+    #[test]
+    fn evicted_token_held_externally_keeps_keepalive() {
+        let a = Arc::new(JitCellToken::new(1));
+        let b = Arc::new(JitCellToken::new(2));
+        a.record_jump_to(Arc::clone(&b));
+
+        let mut mgr = MemoryManager::new(1);
+        mgr.keep_loop_alive(&a);
+        mgr.keep_loop_alive(&b);
+
+        let executing = Arc::clone(&a);
+        drop(a);
+        let weak_b = Arc::downgrade(&b);
+        drop(b);
+
+        let mut evicted = Vec::new();
+        while mgr.alive_count() > 0 {
+            evicted.extend(mgr.next_generation());
+        }
+        drop(evicted);
+
+        let b = weak_b
+            .upgrade()
+            .expect("executing frame keeps A's jump target");
+        assert!(keepalive_holds(&executing, &b));
+    }
+
+    #[test]
+    fn release_all_loops_garbage_cycle_and_external_hold() {
+        let a = Arc::new(JitCellToken::new(1));
+        let b = Arc::new(JitCellToken::new(2));
+        a.record_jump_to(Arc::clone(&b));
+        b.record_jump_to(Arc::clone(&a));
+
+        let mut mgr = MemoryManager::new(1);
+        mgr.keep_loop_alive(&a);
+        mgr.keep_loop_alive(&b);
+        let weak_a = Arc::downgrade(&a);
+        let weak_b = Arc::downgrade(&b);
+        drop(a);
+        drop(b);
+        mgr.release_all_loops();
+        assert!(weak_a.upgrade().is_none());
+        assert!(weak_b.upgrade().is_none());
+
+        let held = Arc::new(JitCellToken::new(3));
+        let target = Arc::new(JitCellToken::new(4));
+        held.record_jump_to(Arc::clone(&target));
+        let mut mgr = MemoryManager::new(1);
+        mgr.keep_loop_alive(&held);
+        mgr.keep_loop_alive(&target);
+        let executing = Arc::clone(&held);
+        drop(held);
+        let weak_target = Arc::downgrade(&target);
+        drop(target);
+        mgr.release_all_loops();
+        let target = weak_target
+            .upgrade()
+            .expect("externally held token keeps its targets");
+        assert!(keepalive_holds(&executing, &target));
     }
 }

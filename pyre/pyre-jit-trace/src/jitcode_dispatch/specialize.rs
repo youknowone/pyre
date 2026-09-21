@@ -4162,7 +4162,7 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
     let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
         return Ok(None);
     };
-    let Some((w_type, version_tag, w_descr)) =
+    let Some((w_type, _version_tag, w_descr)) =
         (unsafe { pyre_interpreter::load_method_fast_path(concrete_obj, &name) })
     else {
         return Ok(None);
@@ -4736,10 +4736,13 @@ fn walker_emit_constant_descr_bound_method<Sym: WalkSym>(
 
 /// Fold `bh_load_method_self_fn(obj, attr, code, name_idx)` once both the
 /// receiver and the attribute are concrete.  The method-attribute fold above
-/// already guards class, type version, and instance map; this second residual
-/// is only the pure `compute_load_method_bound` binding decision.  A plain
-/// instance-method bind writes the original red receiver box, not a baked
-/// `ConstRef`, matching `callmethod.py f.pushvalue(w_obj)`.
+/// already guards class, type version, and instance map.  `callmethod.py
+/// LOAD_METHOD` decides both halves under one test (`f.pushvalue(w_descr);
+/// f.pushvalue(w_obj)`); this residual consumes that same
+/// `load_method_fast_path` verdict before re-deriving through
+/// `compute_load_method_bound`, so the two walker folds cannot disagree.
+/// A plain instance-method bind writes the original red receiver box, not a
+/// baked `ConstRef`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_walker_fold_load_method_self<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -4793,11 +4796,25 @@ pub(crate) fn try_walker_fold_load_method_self<Sym: WalkSym>(
     let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
         return Ok(None);
     };
+    // Same oracle the attribute fold asked: when it still answers the
+    // descriptor this residual was paired with, bind the receiver.
+    if let Some((_, _, w_descr)) =
+        unsafe { pyre_interpreter::baseobjspace::load_method_fast_path(concrete_obj, &name) }
+    {
+        if std::ptr::eq(w_descr, concrete_attr) {
+            write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, obj)?;
+            return Ok(Some(()));
+        }
+    }
     let bound =
         pyre_interpreter::eval::compute_load_method_bound(concrete_obj, concrete_attr, &name);
     let bound_op = if std::ptr::eq(bound, concrete_obj) {
         obj
     } else if bound == pyre_object::PY_NULL {
+        // The fallback arm pushes the receiver slot unconditionally empty
+        // (`callmethod.py LOAD_METHOD` `f.pushvalue_none()`), including when
+        // an instance attribute shadows the method.  Baking the constant
+        // keeps that arm folded rather than paying a residual for it.
         ctx.trace_ctx.const_ref(pyre_object::PY_NULL as i64)
     } else {
         return Ok(None);

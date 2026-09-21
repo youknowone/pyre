@@ -6262,14 +6262,7 @@ impl TraceCtx {
     /// starts empty. The walker path seeds itself and does not go through
     /// `setup_tracing`.
     pub fn seed_compile_and_run_once_merge_point(&mut self) {
-        let input_types = self.recorder.inputarg_types().to_vec();
-        let green_boxes: Vec<crate::trace_ctx::GreenBox> = input_types
-            .iter()
-            .enumerate()
-            .map(|(i, &tp)| {
-                crate::trace_ctx::GreenBox::new(majit_ir::OpRef::input_arg_typed(i as u32, tp), tp)
-            })
-            .collect();
+        let green_boxes = crate::trace_ctx::GreenBox::from_recorder_inputargs(&self.recorder);
         let key = self.green_key;
         let key_typed = self.green_key_values().cloned();
         let header_pc = self.header_pc;
