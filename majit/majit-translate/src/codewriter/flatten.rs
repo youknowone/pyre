@@ -1033,8 +1033,15 @@ impl<'a> GraphFlattener<'a> {
         // dst is always `Register` (Variable inputarg).
         let mut lst: Vec<(RegOrConst, Register)> = Vec::with_capacity(link.args.len());
         for (v, dst_var) in link.args.iter().zip(target_inputargs.iter()) {
-            // `flatten.py:310-311` skip extravars.
-            if Some(v) == link.last_exception.as_ref() || Some(v) == link.last_exc_value.as_ref() {
+            // `flatten.py insert_renamings`: skip only a Variable identical to
+            // `link.last_exception` / `link.last_exc_value`. A Constant is
+            // never those extras (`as_variable()` is None); comparing that
+            // None against a missing extra would drop a merge const.
+            let src_var = v.as_variable();
+            if src_var.is_some()
+                && (link.last_exception.as_ref().and_then(LinkArg::as_variable) == src_var
+                    || link.last_exc_value.as_ref().and_then(LinkArg::as_variable) == src_var)
+            {
                 continue;
             }
             // Skip Void inputargs (no color assigned by regalloc) — the
@@ -2645,6 +2652,74 @@ mod tests {
                 dst: int_reg(1),
                 src: RegOrConst::Const(Constant::new(ConstValue::Int(7))),
             }]
+        );
+    }
+
+    fn run_insert_renamings_with_exc(
+        link_args: Vec<LinkArg>,
+        target_inputargs: &[usize],
+        last_exception: Option<LinkArg>,
+        last_exc_value: Option<LinkArg>,
+    ) -> Vec<FlatOp> {
+        let max_id = target_inputargs.iter().copied().max().unwrap_or(0);
+        let mut graph = FunctionGraph::new("renamings_test");
+        let vars: Vec<crate::flowspace::model::Variable> = (0..=max_id)
+            .map(|_| graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed))
+            .collect();
+        let link =
+            Link::new_mixed(link_args, BlockId(0), None).extravars(last_exception, last_exc_value);
+        let target_input_vars: Vec<crate::flowspace::model::Variable> =
+            target_inputargs.iter().map(|&v| vars[v].clone()).collect();
+        let regallocs = identity_regallocs_from_vars(&vars, max_id + 1);
+        let mut f = GraphFlattener::new(&graph, &regallocs, false);
+        f.insert_renamings(&link, &target_input_vars);
+        f.ssarepr.insns
+    }
+
+    #[test]
+    fn insert_renamings_renames_constant_on_non_exception_link() {
+        // `flatten.py:310-311`: a Constant is not `link.last_exception` /
+        // `link.last_exc_value` (those extras are None on a merge link).
+        let ops = run_insert_renamings_with_exc(
+            vec![LinkArg::from(ConstValue::Int(1_000_000))],
+            &[1],
+            None,
+            None,
+        );
+        assert_eq!(
+            ops,
+            vec![FlatOp::Move {
+                dst: int_reg(1),
+                src: RegOrConst::Const(Constant::new(ConstValue::Int(1_000_000))),
+            }]
+        );
+    }
+
+    #[test]
+    fn insert_renamings_skips_only_last_exception_variable() {
+        let mut graph = FunctionGraph::new("renamings_test");
+        let vars: Vec<crate::flowspace::model::Variable> = (0..3)
+            .map(|_| graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed))
+            .collect();
+        let last_exception = LinkArg::Value(vars[0].clone());
+        let other = LinkArg::Value(vars[1].clone());
+        let link = Link::new_mixed(vec![last_exception.clone(), other], BlockId(0), None)
+            .extravars(Some(last_exception), None);
+        let target_input_vars = vec![vars[0].clone(), vars[2].clone()];
+        let regallocs = identity_regallocs_from_vars(&vars, 3);
+        let mut f = GraphFlattener::new(&graph, &regallocs, false);
+        f.insert_renamings(&link, &target_input_vars);
+        assert_eq!(
+            f.ssarepr.insns,
+            vec![
+                FlatOp::Move {
+                    dst: int_reg(2),
+                    src: RegOrConst::Reg(int_reg(1)),
+                },
+                // `generate_last_exc` materializes the skipped extra after
+                // the renaming list (`flatten.py`).
+                FlatOp::LastException { dst: int_reg(0) },
+            ]
         );
     }
 
