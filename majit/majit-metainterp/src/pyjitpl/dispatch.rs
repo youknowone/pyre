@@ -171,13 +171,10 @@ pub fn field_offset_from_bh(descr: &crate::blackhole::BhDescr, site: &str) -> us
 ///
 /// `heapcache.get_field_updater(box, fielddescr)` keys the per-box field
 /// cache on the descr object itself, so two fields of one struct can never
-/// share an entry.  The key here is `DescrRef::index()`, a `u32` whose
-/// unassigned answer is the `u32::MAX` sentinel (`descr.rs`) — one key
-/// standing for every field of every struct, which is an alias and not a
-/// cache.  The production codewriter numbers every field descr it mints
-/// (`call.rs get_field_descr`, on the parent-list hit and on the mint
-/// alike), so only a hand-assembled jitcode reaches the sentinel; those go
-/// uncached rather than sharing a slot.
+/// share an entry.  The key here is `DescrRef::index()`.  A codewriter
+/// slot is used when one was stamped (`call.rs get_field_descr`); otherwise
+/// `Descr::index()` allocates a unique identity so a hand-assembled
+/// jitcode does not collapse every field onto the `u32::MAX` sentinel.
 fn heapcache_field_key(fielddescr: &majit_ir::DescrRef) -> Option<u32> {
     let index = fielddescr.index();
     (index != u32::MAX).then_some(index)
@@ -14935,8 +14932,9 @@ mod tests {
     #[test]
     fn jitcode_new_then_field_round_trip_records_setfield_getfield() {
         // Node { value: i64 @0, next: ref @8 }: allocate, store both fields
-        // through the live struct ptr, then read them back.  Exercises the
-        // emit -> trace-dispatch -> record path for plain getfield/setfield_gc.
+        // through the live struct ptr, then read them back.  The stores
+        // record; the loads are served from the heapcache even when the
+        // descr pool was never numbered.
         let mut builder = JitCodeBuilder::new();
         builder.new_struct(
             0,
@@ -14962,23 +14960,9 @@ mod tests {
         let opcodes: Vec<_> = recorder.ops().iter().map(|o| o.opcode).collect();
         assert_eq!(
             opcodes,
-            vec![
-                OpCode::New,
-                OpCode::SetfieldGc,
-                OpCode::SetfieldGc,
-                OpCode::GetfieldGcI,
-                OpCode::GetfieldGcR,
-            ]
+            vec![OpCode::New, OpCode::SetfieldGc, OpCode::SetfieldGc],
+            "GETFIELD_GC reads of a just-stored field come from the heapcache",
         );
-        // The recorded getfield ops carry the resolved byte offset.
-        let off_i = recorder.ops()[3]
-            .getdescr()
-            .and_then(|d| d.as_field_descr().map(|f| f.offset()));
-        let off_r = recorder.ops()[4]
-            .getdescr()
-            .and_then(|d| d.as_field_descr().map(|f| f.offset()));
-        assert_eq!(off_i, Some(0));
-        assert_eq!(off_r, Some(8));
 
         // The New's SizeDescr carries the full struct layout
         // (`descr.py init_size_descr`) so the optimizer can size
@@ -15009,9 +14993,9 @@ mod tests {
     /// `add_bh_descr` already dedups structurally, so a field named by both a
     /// store and a load shares one pool entry and therefore one number —
     /// which is the property `heapcache.get_field_updater(box, fielddescr)`
-    /// gets for free by keying on the descr object itself.  Without this a
-    /// hand-assembled jitcode leaves every descr at the `u32::MAX` sentinel
-    /// and `heapcache_field_key` declines, so nothing caches.
+    /// gets for free by keying on the descr object itself.  Unnumbered
+    /// descrs still cache: `Descr::index()` allocates a unique identity
+    /// rather than declining the `u32::MAX` sentinel.
     fn number_the_descrs(jitcode: &JitCode) {
         for (slot, entry) in jitcode.exec.descrs.iter().enumerate() {
             if let Some(descr) = entry.as_optimizer_descr() {
@@ -15025,19 +15009,17 @@ mod tests {
     /// `_opimpl_getfield_gc_any_pureornot` returns `upd.currfieldbox` and
     /// records nothing when the updater has a value, and
     /// `_opimpl_setfield_gc_any`'s `upd.setfield(valuebox)` is what puts one
-    /// there.  Same jitcode as
-    /// `jitcode_new_then_field_round_trip_records_setfield_getfield` above,
-    /// which holds the shape an unnumbered descr pool gets: there both reads
-    /// record, here both are folded away.  The registers still answer, and
-    /// they answer with the stored box rather than a second load.
+    /// there.  Numbering the pool is the codewriter's shape; unnumbered
+    /// descrs take the same path because `Descr::index()` supplies a unique
+    /// identity.  The registers still answer, and they answer with the
+    /// stored box rather than a second load.
     #[test]
     fn a_stored_field_answers_from_the_heapcache_and_records_no_getfield() {
         // Its own type id and field names: `field_descr_ref_from_bh` answers
         // out of `gc_cache()._cache_field`, which is process-wide and keyed by
         // `(LLType::Struct(type_id), fieldname)`.  Numbering the descrs of a
         // struct a sibling test also names would number that test's descrs
-        // too, and the sibling above exists precisely to hold the unnumbered
-        // shape.
+        // too.
         let mut builder = JitCodeBuilder::new();
         builder.new_struct(
             0,
@@ -15072,6 +15054,45 @@ mod tests {
         );
     }
 
+    /// A hand-assembled jitcode never numbers its descr pool.  Two fields of
+    /// one box must still be distinct heapcache keys: a store answers a later
+    /// load of the same field, a sibling field of the same box records once
+    /// and then answers from the cache.
+    #[test]
+    fn unnumbered_descrs_cache_same_field_and_not_a_sibling() {
+        let mut builder = JitCodeBuilder::new();
+        builder.new_struct(
+            0,
+            16,
+            0xD1,
+            false,
+            &[
+                (0, false, "hc_size", 8, true),
+                (8, true, "hc_buf", 8, false),
+            ],
+            "",
+        );
+        builder.load_const_i_value(0, 99);
+        builder.setfield_gc_i(0, 0, 0, 0xD1, "hc_size");
+        builder.getfield_gc_i(1, 0, 0, 0xD1, "hc_size");
+        builder.getfield_gc_r(1, 0, 8, 0xD1, "hc_buf");
+        builder.getfield_gc_r(2, 0, 8, 0xD1, "hc_buf");
+        let jitcode = builder.finish();
+
+        let mut ctx = TraceCtx::for_test(0);
+        let mut sym = DummySym;
+        let action = trace_jitcode_with_args(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0, &[]);
+        assert!(matches!(action, TraceAction::Continue));
+
+        let recorder = ctx.into_recorder();
+        let opcodes: Vec<_> = recorder.ops().iter().map(|o| o.opcode).collect();
+        assert_eq!(
+            opcodes,
+            vec![OpCode::New, OpCode::SetfieldGc, OpCode::GetfieldGcR],
+            "size load and the second buf load should have come from the heapcache",
+        );
+    }
+
     /// `_record_helper` counts what it appends and `execute_and_record`
     /// counts what it executes, so a body built only from ops that reach the
     /// trace through that pair leaves `RECORDED_OPS` and `OPS` agreeing with
@@ -15091,7 +15112,10 @@ mod tests {
         );
         builder.load_const_i_value(0, 99);
         builder.setfield_gc_i(0, 0, 0, 0xCD, "value");
-        builder.getfield_gc_i(1, 0, 0, 0xCD, "value");
+        // Read the sibling field, which was never stored, so the miss path
+        // records a GETFIELD.  A read of `value` would hit the heapcache
+        // and drop out of RECORDED_OPS / OPS.
+        builder.getfield_gc_r(1, 0, 8, 0xCD, "next");
         let jitcode = builder.finish();
 
         let mut ctx = TraceCtx::for_test(0);
@@ -15105,7 +15129,7 @@ mod tests {
         // body ever stops reaching `BC_NEW` and `BC_SETFIELD_GC_I`.
         assert_eq!(
             opcodes,
-            vec![OpCode::New, OpCode::SetfieldGc, OpCode::GetfieldGcI],
+            vec![OpCode::New, OpCode::SetfieldGc, OpCode::GetfieldGcR],
         );
         assert_eq!(recorded, Some(opcodes.len()), "RECORDED_OPS");
         assert_eq!(executed, Some(opcodes.len()), "OPS");

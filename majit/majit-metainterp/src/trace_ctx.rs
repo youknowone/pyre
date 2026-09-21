@@ -6641,7 +6641,11 @@ mod tests {
         let a = majit_ir::make_field_descr_full(u32::MAX, 0, 8, Type::Int, false);
         let b = majit_ir::make_field_descr_full(u32::MAX, 8, 8, Type::Int, false);
         let value = ctx.const_int(42);
+        assert_ne!(a.index(), u32::MAX);
+        assert_ne!(b.index(), u32::MAX);
+        assert_ne!(a.index(), b.index());
         ctx.heapcache_getfield_now_known(obj, a.index(), value);
+        assert_eq!(ctx.heapcache_getfield_cached(obj, a.index()), Some(value));
         assert_eq!(ctx.heapcache_getfield_cached(obj, b.index()), None);
         ctx.heapcache_setfield_cached(obj, a.index(), value);
         assert_eq!(ctx.heapcache_getfield_cached(obj, b.index()), None);
