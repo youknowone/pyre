@@ -50211,6 +50211,93 @@ mod tests {
         );
     }
 
+    /// `[OpcodeStepExecutor, to_bool]` on the real interpreter LLBC is the
+    /// `PyFrame` override.  The census printed in a failure names which
+    /// uniqueness miss is live: several owner strings of one StructId, a
+    /// missing override row, or a direct path that stayed the trait default.
+    #[test]
+    #[ignore]
+    fn opcode_step_executor_to_bool_direct_path_is_pyframe_override() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real interpreter LLBC");
+        let mut owners = std::collections::BTreeSet::new();
+        let mut to_bool_override = false;
+        let mut to_bool_default = false;
+        for fd in llbc.iter_local_fns() {
+            let name_path = fd.item_meta.name_path();
+            let trait_path = super::trait_impl_trait_path_for_fundecl(&llbc, fd);
+            let trait_leaf = trait_path.as_deref().and_then(|p| p.rsplit("::").next());
+            if trait_leaf == Some("OpcodeStepExecutor")
+                && let Some((owner, method)) = super::impl_method_owner_for_fundecl(&llbc, fd)
+            {
+                owners.insert(owner);
+                if method == "to_bool" {
+                    to_bool_override = true;
+                }
+            }
+            if name_path.ends_with("::OpcodeStepExecutor::to_bool") {
+                to_bool_default = true;
+            }
+        }
+        let program =
+            super::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+                std::slice::from_ref(&llbc),
+                crate::HostStaticAddrs::default(),
+                &[],
+                &["to_bool"],
+            )
+            .expect("build filtered to_bool program");
+        let mut ids = Vec::new();
+        for owner in &owners {
+            let id = program
+                .struct_ids
+                .get(owner)
+                .copied()
+                .flatten()
+                .unwrap_or_else(|| majit_ir::descr::StructId::from_canonical(owner));
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        let leaf_identities = crate::distinct_struct_identities_by_leaf(&program);
+        let mut call_control = crate::call::CallControl::new();
+        crate::bind_trait_default_direct_paths(&program, &mut call_control, &leaf_identities);
+        let graph = call_control
+            .function_graphs()
+            .get(&crate::CallPath::from_segments([
+                "OpcodeStepExecutor",
+                "to_bool",
+            ]))
+            .expect("direct path registered");
+        assert!(
+            to_bool_default && to_bool_override,
+            "LLBC must contain both the trait default and the PyFrame override; \
+             owners={owners:?} ids={}",
+            ids.len()
+        );
+        assert_eq!(
+            ids.len(),
+            1,
+            "OpcodeStepExecutor owners must be one struct identity; owners={owners:?}"
+        );
+        assert!(
+            graph.name.contains("eval") && graph.name.contains("<Impl>"),
+            "direct to_bool graph is {:?}; owners={owners:?} ({} strings, {} struct ids); \
+             classified_override={to_bool_override}",
+            graph.name,
+            owners.len(),
+            ids.len()
+        );
+        assert!(
+            !graph.name.contains("OpcodeStepExecutor"),
+            "raising default stayed on the direct path: {}",
+            graph.name
+        );
+    }
+
     /// `range_list_length` stores the PyPy strategy length in an RPython
     /// Signed cell and converts it to Rust's indexing carrier.  The opaque
     /// core `TryFrom` shell must be decomposed by the MIR front rather than
