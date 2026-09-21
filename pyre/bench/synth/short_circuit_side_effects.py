@@ -1,5 +1,5 @@
 # pyre-check: max-pypy-ratio=30
-# pyre-check: spec-folds=truth_int,subscr
+# pyre-check: trace-shape=main:absent=CallMayForceI,absent=CallMayForceR
 # `truth_int` fires here more than anywhere else in the corpus (19); the
 # and/or chains below are what present a non-bool truthiness to the walker.
 # Short-circuit and/or chains whose operands call side-effecting helpers,
