@@ -106,7 +106,9 @@ pub fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32, Strin
     let memory = instance
         .get_memory(&store, "memory")
         .ok_or("main module is missing its `memory` export")?;
-    let table = instance.get_table(&store, "__indirect_function_table").ok_or(
+    let table = instance
+        .get_table(&store, "__indirect_function_table")
+        .ok_or(
         "main module is missing its `__indirect_function_table` export (build with --export-table)",
     )?;
     store.data_mut().memory = Some(memory);
@@ -137,6 +139,43 @@ pub fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32, Strin
                 .map_err(estr)?;
             set_path.call(&mut store, (p, nlen)).map_err(estr)?;
             dealloc.call(&mut store, (p, nlen)).map_err(estr)?;
+        }
+    }
+
+    // Same `pyre_set_gc_env` channel as the wasmtime path: the guest has no
+    // process environment, so `PYPY_GC_*` and `MAJIT_GC_STRESS` have to arrive
+    // before the first allocation builds the collector.
+    let gc_env_names = instance
+        .get_typed_func::<(), u64>(&store, "pyre_gc_env_names")
+        .ok();
+    let set_gc_env = instance
+        .get_typed_func::<(u32, u32), ()>(&store, "pyre_set_gc_env")
+        .ok();
+    if let (Some(names), Some(set_gc_env)) = (gc_env_names, set_gc_env) {
+        let packed = names.call(&mut store, ()).map_err(estr)?;
+        let (nptr, nlen) = ((packed >> 32) as u32, packed as u32);
+        let mut buf = vec![0u8; nlen as usize];
+        memory.read(&store, nptr as usize, &mut buf).map_err(estr)?;
+        dealloc.call(&mut store, (nptr, nlen)).map_err(estr)?;
+
+        let blob = String::from_utf8_lossy(&buf)
+            .split('\0')
+            .filter(|name| !name.is_empty())
+            .filter_map(|name| {
+                std::env::var(name)
+                    .ok()
+                    .map(|value| format!("{name}={value}"))
+            })
+            .collect::<Vec<_>>()
+            .join("\0");
+        let blen = blob.len() as u32;
+        if blen != 0 {
+            let p = alloc.call(&mut store, blen).map_err(estr)?;
+            memory
+                .write(&mut store, p as usize, blob.as_bytes())
+                .map_err(estr)?;
+            set_gc_env.call(&mut store, (p, blen)).map_err(estr)?;
+            dealloc.call(&mut store, (p, blen)).map_err(estr)?;
         }
     }
 
@@ -284,6 +323,16 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>, String> {
                 {
                     eprintln!("[jit_call_host] {e}");
                 }
+            },
+        )
+        .map_err(estr)?;
+
+    linker
+        .func_wrap(
+            "env",
+            "jit_func_sig",
+            |mut caller: Caller<'_, Host>, slot: i32| -> i64 {
+                jit_func_sig_of_slot(&mut caller, slot)
             },
         )
         .map_err(estr)?;
@@ -654,6 +703,13 @@ fn jit_compile_trace(
     linker
         .define("env", "jit_call_compact", Extern::Func(jit_call_compact))
         .map_err(estr)?;
+    let jit_func_sig = Func::wrap(
+        &mut *caller,
+        |mut inner: Caller<'_, Host>, slot: i32| -> i64 { jit_func_sig_of_slot(&mut inner, slot) },
+    );
+    linker
+        .define("env", "jit_func_sig", Extern::Func(jit_func_sig))
+        .map_err(estr)?;
     let instance = linker
         .instantiate_and_start(&mut *caller, &module)
         .map_err(|e| format!("instantiate trace module: {e}"))?;
@@ -794,6 +850,45 @@ fn jit_call_trampoline(
     };
     write_i64(&memory, &mut *caller, call_area, result)?;
     Ok(())
+}
+
+fn jit_func_sig_of_slot(caller: &mut Caller<'_, Host>, slot: i32) -> i64 {
+    if slot == 0 {
+        return 0;
+    }
+    let Some(table) = caller.data().table else {
+        return 0;
+    };
+    let func = match table.get(&*caller, slot as u64) {
+        Some(Val::FuncRef(fr)) => match func_of(&fr) {
+            Some(f) => f,
+            None => return 0,
+        },
+        _ => return 0,
+    };
+    let ty = func.ty(&*caller);
+    if ty.params().len() > majit_backend_wasm_host::MAX_CALL_ARGS || ty.results().len() > 1 {
+        return 0;
+    }
+    let mut params = Vec::with_capacity(ty.params().len());
+    for param in ty.params() {
+        params.push(match *param {
+            ValType::I32 => majit_backend_wasm_host::FuncSigVal::I32,
+            ValType::I64 => majit_backend_wasm_host::FuncSigVal::I64,
+            ValType::F32 => majit_backend_wasm_host::FuncSigVal::F32,
+            ValType::F64 => majit_backend_wasm_host::FuncSigVal::F64,
+            _ => return 0,
+        });
+    }
+    let result = match ty.results().first() {
+        None => None,
+        Some(ValType::I32) => Some(majit_backend_wasm_host::FuncSigVal::I32),
+        Some(ValType::I64) => Some(majit_backend_wasm_host::FuncSigVal::I64),
+        Some(ValType::F32) => Some(majit_backend_wasm_host::FuncSigVal::F32),
+        Some(ValType::F64) => Some(majit_backend_wasm_host::FuncSigVal::F64),
+        _ => return 0,
+    };
+    majit_backend_wasm_host::encode_func_sig(&params, result)
 }
 
 /// Resolve a funcref to its `Func`, copying the lightweight handle out.

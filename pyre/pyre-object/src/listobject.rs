@@ -2062,9 +2062,14 @@ pub fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy)
     // (`plain_int_w`, `w_float_get_value`); pinning all of them at
     // function entry covers every strategy uniformly.
     let _roots = crate::gc_roots::push_roots();
-    for &item in &items {
-        let _ = crate::gc_roots::pin_root(item);
-    }
+    // Publish every item, then normalize once: sequential `pin_root` would
+    // query after the first write and leave later values invisible to a
+    // collection. Reload the Vec from the slots so `build_list_storage` does
+    // not copy pre-move addresses into the items block.
+    let items_base = crate::gc_roots::pin_roots(&items);
+    let items: Vec<PyObjectRef> = (0..items.len())
+        .map(|i| crate::gc_roots::shadow_stack_get(items_base + i))
+        .collect();
 
     // The nursery `items_block` is allocated last and pinned across the
     // collecting header allocation — the only later allocation that can
@@ -2100,6 +2105,12 @@ pub fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy)
     // full.  The surrounding shadow-stack roots remain authoritative for all
     // item values and reload every block below; `allocation_root` supplies the
     // allocator's direct translated-livevar slot as well.
+    // Reload from the pin before that walk: the local is not rewritten by
+    // `pin_root` / `get_instantiate`.
+    if let Some(s) = block_root {
+        items_block = crate::gc_roots::shadow_stack_get(s) as *mut ItemsBlock;
+    }
+    storage.reload_typed_blocks();
     let mut allocation_root = match strategy {
         ListStrategy::Object => items_block as *mut u8,
         ListStrategy::Integer | ListStrategy::IntOrFloat => storage.int_items.block as *mut u8,
@@ -6381,6 +6392,23 @@ mod tests {
             assert_eq!(
                 crate::floatobject::w_float_get_value(w_list_getitem(list, 0).unwrap()),
                 2.0
+            );
+        }
+    }
+
+    #[test]
+    fn object_strategy_new_reloads_items_from_the_pin_set() {
+        let items = vec![w_int_new(1), w_int_new(2), w_int_new(3)];
+        let list = w_list_new_with_strategy(items, ListStrategy::Object);
+        unsafe {
+            assert_eq!(w_list_len(list), 3);
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_list_getitem(list, 0).unwrap()),
+                1
+            );
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_list_getitem(list, 2).unwrap()),
+                3
             );
         }
     }

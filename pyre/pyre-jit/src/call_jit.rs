@@ -805,14 +805,23 @@ pub(crate) extern "C" fn record_caught_blackhole_traceback(
     let Ok(opcode_position) = i32::try_from(opcode_position) else {
         return;
     };
-    let forwards_existing = pyre_jit_trace::state::jitcode_pc_raise_keeps_existing_traceback(
-        jitcode_index,
-        opcode_position,
-    );
     let frame_ptr = frame_value as *mut PyFrame;
     if frame_ptr.is_null() || exc_value == 0 {
         return;
     }
+    // Both operands are raw i64 copies of GC refs. The blackhole roots the
+    // interpreter's `virtualizable_ptr` / `exception_last_value` slots, not
+    // these argument copies; a wasm local is invisible to `walk_roots`, and
+    // an inlined-callee `PyFrame` is a nursery object. Pin the pair before
+    // any work that can collect (`decode_instruction_at`, traceback attach).
+    let frame_anchor = unsafe { pyre_interpreter::eval::FrameAnchor::from_raw(frame_ptr) };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(exc_value as pyre_object::PyObjectRef);
+    let forwards_existing = pyre_jit_trace::state::jitcode_pc_raise_keeps_existing_traceback(
+        jitcode_index,
+        opcode_position,
+    );
     // An explicit reraise preserves even a cleared or shortened traceback.
     // An iterator exception can instead arrive from an inlined callee whose
     // traceback does not yet contain this frame.
@@ -841,6 +850,8 @@ pub(crate) extern "C" fn record_caught_blackhole_traceback(
         if explicit_reraise {
             return;
         }
+        let exc_value = pyre_object::gc_roots::shadow_stack_get(exc_slot) as i64;
+        let frame_ptr = frame_anchor.live();
         let (owns_head, head_lasti) = unsafe {
             let head =
                 pyre_object::interp_exceptions::w_exception_get_traceback(exc_value as PyObjectRef);
@@ -871,6 +882,8 @@ pub(crate) extern "C" fn record_caught_blackhole_traceback(
     );
     let exact =
         pyre_jit_trace::py_coord::exact_py_pc_for_jitcode_pc_public(jitcode_index, opcode_position);
+    let exc_value = pyre_object::gc_roots::shadow_stack_get(exc_slot) as i64;
+    let frame_ptr = frame_anchor.live();
     let last_instruction = exact
         .or(resolved)
         .map_or(unsafe { (*frame_ptr).last_instr as i64 }, i64::from);
@@ -7985,5 +7998,10 @@ mod tests_bh_normalize_raise {
             err.message_text(),
             "exceptions must derive from BaseException"
         );
+    }
+
+    #[test]
+    fn record_caught_blackhole_traceback_ignores_null_operands() {
+        record_caught_blackhole_traceback(0, 0, 0, 0);
     }
 }

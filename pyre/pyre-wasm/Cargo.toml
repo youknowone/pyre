@@ -35,6 +35,11 @@ web = [
 # `--cfg getrandom_backend="custom"`, so the module carries no wasm-bindgen
 # imports a non-JS embedder could not satisfy.
 wasm-host = ["pyre-jit/wasm-host", "dep:majit-backend", "dep:majit-backend-wasm", "dep:majit-metainterp", "dep:pyre-jit-trace"]
+# Forwards `majit-gc/gc_stress` into the guest. Off by default so the
+# shipping wasm-host module keeps its inline nursery bump; a stress run
+# rebuilds with `--features wasm-host,gc_stress` and then opts in at
+# runtime via `MAJIT_GC_STRESS` through `pyre_set_gc_env`.
+gc_stress = ["pyre-jit/gc_stress"]
 # Diagnostic only: install a counting global allocator so the host runner can
 # read net-live guest-heap bytes/count (`pyre_heap_live_bytes` /
 # `pyre_heap_live_count`) and split a true Rust-heap leak from fragmentation.

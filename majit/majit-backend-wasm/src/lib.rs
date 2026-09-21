@@ -15,6 +15,9 @@
 /// the native arm.
 pub mod codegen;
 pub mod failguard;
+mod func_sig;
+
+pub use func_sig::{FuncSigVal, WasmSig, decode_func_sig, encode_func_sig};
 
 /// The wasm host compiles and resumes on the thread that ran the
 /// compiled frame (`eval.rs` post-`run_compiled`). cargo's default
@@ -390,6 +393,7 @@ fn classify_inline_install_error(error: &BackendError) {
 }
 
 static REEMIT_ENABLED: AtomicBool = AtomicBool::new(false);
+
 static INLINE_BRIDGE_ENABLED: AtomicBool = AtomicBool::new(true);
 /// On: non-header regions are placed outside the header `loop`, so they
 /// do not tax the fall-through path. See `inline_nonheader_enable`.
@@ -1486,11 +1490,12 @@ pub fn active_gc_collection_counts() -> (usize, usize) {
     with_wasm_active_gc(|gc| gc.collection_counts()).unwrap_or((0, 0))
 }
 
-/// Assemble the inline nursery-bump parameters for this trace's `New` /
-/// `NewWithVtable` ops (rewrite.py malloc-fast-path eligibility over the
-/// gc.py:525-531 nursery address surface), or `None` when no GC is active,
-/// the `gc_stress` feature is compiled in (the fast path would bypass its
-/// per-allocation stress collections), or no allocation op qualifies.
+/// Assemble the inline nursery-bump parameters for this trace's
+/// `CallMallocNursery*` ops (rewrite.py malloc-fast-path eligibility over
+/// the gc.py:525-531 nursery address surface), or `None` when no GC is
+/// active, the `gc_stress` feature is compiled in (the fast path would
+/// bypass its per-allocation stress collections), or no allocation op
+/// qualifies.
 fn nursery_alloc_params(ops: &[Op]) -> Option<codegen::NurseryAllocParams> {
     if majit_gc::gc_stress_enabled() {
         return None;
@@ -1543,7 +1548,7 @@ fn nursery_alloc_params(ops: &[Op]) -> Option<codegen::NurseryAllocParams> {
 }
 
 /// Assemble the direct CA arm's fixed-size nursery/frame parameters. This is
-/// deliberately separate from ordinary `New*` eligibility: a CA frame needs
+/// deliberately separate from ordinary `CallMallocNursery*` eligibility: a CA frame needs
 /// both the nursery words and the JitFrame shadow-stack top/limit cells.
 /// Missing active GC (or gc_stress) leaves the pre-existing helper path intact.
 fn ca_inline_params(frame_bytes: u32) -> Option<codegen::CaInlineParams> {
@@ -2329,7 +2334,6 @@ pub extern "C" fn wasm_malloc_big_fixedsize_oldgen(size: i64, type_id: i64) -> i
     let payload = (size as usize).saturating_sub(majit_gc::header::GcHeader::SIZE);
     wasm_jit_alloc_oldgen(type_id, payload as i64)
 }
-
 /// Exact guest-side implementation for the JIT IR's `FloatMod`. Keeping this
 /// in the interpreter module avoids both an incorrect arithmetic expansion
 /// (wasm has no remainder instruction) and a guest→host→guest call.
@@ -2344,21 +2348,17 @@ fn alloc_helpers() -> codegen::AllocHelpers {
     codegen::AllocHelpers {
         new_fn_ptr: wasm_jit_alloc as *const () as usize as i64,
         new_array_fn_ptr: wasm_jit_alloc_array as *const () as usize as i64,
-        new_oldgen_fn_ptr: wasm_jit_alloc_oldgen as *const () as usize as i64,
-        new_array_oldgen_fn_ptr: wasm_jit_alloc_array_oldgen as *const () as usize as i64,
         headerless_fn_ptr: wasm_jit_alloc_headerless as *const () as usize as i64,
         threadlocal_fn_ptr: wasm_jit_threadlocalref_get as *const () as usize as i64,
         fmod_fn_ptr: wasm_jit_fmod as *const () as usize as i64,
     }
 }
 
-/// JIT-trace write-barrier trampoline target for ref-storing `SetfieldGc` /
-/// `SetarrayitemGc` / `SetinteriorfieldGc`. Routes through the host `jit_call`
-/// trampoline; invokes the active GC's `write_barrier`, which adds an old
-/// object that may now hold a young reference to the remembered set (and clears
-/// TRACK_YOUNG_PTRS). A young base (no flag) or a null base is a no-op. wasm
-/// skips the native GC rewrite pass, so the trace emits this barrier directly
-/// instead of `COND_CALL_GC_WB`. Returns 0 — the store codegen ignores it.
+/// JIT-trace write-barrier trampoline for `CondCallGcWb`. Invokes the
+/// active GC's `write_barrier`, which adds an old object that may now
+/// hold a young reference to the remembered set (and clears
+/// TRACK_YOUNG_PTRS). A young base (no flag) or a null base is a no-op.
+/// Returns 0 — the store codegen ignores it.
 pub extern "C" fn wasm_jit_write_barrier(obj: i64) -> i64 {
     with_wasm_active_gc_mut(|gc| gc.write_barrier(GcRef(obj as usize)));
     0
@@ -3148,6 +3148,96 @@ pub(crate) fn residual_call_descr_is_faithful(addr: i64) -> bool {
     FAITHFUL_RESIDUAL_CALL_ADDRS.with(|set| set.borrow().contains(&addr))
 }
 
+thread_local! {
+    /// Per thread for the same reason [`FAITHFUL_RESIDUAL_CALL_ADDRS`] is.
+    /// Residual targets are guest-static table entries present from
+    /// instantiation (`fn as usize` on wasm32 is that table index), so both
+    /// a known encoding and a `0` unknown answer are stable for the life of
+    /// the instance and are cached.
+    static RESIDUAL_TARGET_SIG_CACHE: RefCell<HashMap<i64, i64>> =
+        RefCell::new(HashMap::new());
+}
+
+#[cfg(any(test, not(target_arch = "wasm32")))]
+thread_local! {
+    static TEST_RESIDUAL_TARGET_SIGS: RefCell<HashMap<i64, i64>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Install a `jit_func_sig` encoding for host-side tests and native compiles.
+#[cfg(any(test, not(target_arch = "wasm32")))]
+pub fn set_test_residual_target_sig(addr: i64, encoded: i64) {
+    TEST_RESIDUAL_TARGET_SIGS.with(|map| {
+        map.borrow_mut().insert(addr, encoded);
+    });
+    RESIDUAL_TARGET_SIG_CACHE.with(|cache| {
+        cache.borrow_mut().remove(&addr);
+    });
+}
+
+/// Drop every injected encoding and the guest-side cache.
+#[cfg(any(test, not(target_arch = "wasm32")))]
+pub fn clear_test_residual_target_sigs() {
+    TEST_RESIDUAL_TARGET_SIGS.with(|map| map.borrow_mut().clear());
+    RESIDUAL_TARGET_SIG_CACHE.with(|cache| cache.borrow_mut().clear());
+}
+
+/// The callee's real wasm signature, if the host oracle knows it.
+///
+/// Residual targets are guest-static function-table slots, so a miss is
+/// cached as well as a hit: the slot cannot be filled later with a different
+/// type.
+pub fn residual_target_sig(addr: i64) -> Option<WasmSig> {
+    let cached = RESIDUAL_TARGET_SIG_CACHE.with(|cache| cache.borrow().get(&addr).copied());
+    let encoded = cached.unwrap_or_else(|| {
+        let encoded = query_residual_target_sig(addr);
+        RESIDUAL_TARGET_SIG_CACHE.with(|cache| {
+            cache.borrow_mut().insert(addr, encoded);
+        });
+        encoded
+    });
+    decode_func_sig(encoded)
+}
+
+fn query_residual_target_sig(addr: i64) -> i64 {
+    #[cfg(any(test, not(target_arch = "wasm32")))]
+    {
+        if let Some(encoded) =
+            TEST_RESIDUAL_TARGET_SIGS.with(|map| map.borrow().get(&addr).copied())
+        {
+            return encoded;
+        }
+    }
+    #[cfg(all(target_arch = "wasm32", feature = "host-import"))]
+    {
+        return unsafe { jit_func_sig(addr as i32) };
+    }
+    #[cfg(all(target_arch = "wasm32", feature = "web"))]
+    {
+        return unsafe { jit_func_sig_web::jit_func_sig(addr as i32) };
+    }
+    #[cfg(not(all(target_arch = "wasm32", any(feature = "host-import", feature = "web"))))]
+    {
+        0
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "host-import"))]
+#[link(wasm_import_module = "env")]
+unsafe extern "C" {
+    fn jit_func_sig(slot: i32) -> i64;
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "web"))]
+mod jit_func_sig_web {
+    use wasm_bindgen::prelude::*;
+
+    #[wasm_bindgen(raw_module = "./jit_glue.js")]
+    unsafe extern "C" {
+        pub fn jit_func_sig(slot: i32) -> i64;
+    }
+}
+
 /// [`vouch_residual_call_addr`] for a target whose *result* is a word too, so
 /// its whole wasm signature is the uniform `(i64…) -> i64`.
 ///
@@ -3496,7 +3586,6 @@ impl WasmBackend {
         self.constants = new_constants;
         (ops, table)
     }
-
     /// `x86/assembler.py` `gcreftracers.append(tracer)` — keep the
     /// per-loop table alive for as long as the compiled trace that bakes its
     /// base address. `LIVE_GC_TABLES` holds only a `Weak`, so this strong
@@ -4050,9 +4139,9 @@ impl WasmBackend {
         // Key-0 still clears the full used-label range.
         inputs.ca.home_gcmap_min_ordinary = compiled.num_ref_homes.get();
         inputs.ca.home_gcmap_min_labels = compiled.used_label_homes.get();
-        // `intern_ref_constants` of the just-compiled bridge cleared the
-        // TLS ConstPtr map. Restore every table pinned on this token so
-        // owner/region force-arm ConstPtrs rematerialize after collection.
+        // The just-compiled bridge rebuilt the TLS ConstPtr map. Restore
+        // every table pinned on this token so owner/region force-arm
+        // ConstPtrs rematerialize after collection.
         Self::rebind_failarg_const_tables(token);
         let (wasm_bytes, guard_exits, merged_ref_homes, merged_labels) =
             codegen::build_wasm_module(&inputs)?;
@@ -4317,6 +4406,17 @@ impl WasmBackend {
 // so a thread hop cannot free the nursery on TLS teardown.
 unsafe impl Send for WasmBackend {}
 
+/// Report why a trace cannot be compiled by the wasm backend, or `None` if it
+/// can. Declined traces fall back to the interpreter (correct, unaccelerated)
+/// instead of producing an invalid trace module. `allow_ca` (set when every
+/// CALL_ASSEMBLER target is admitted) lifts the CALL_ASSEMBLER decline so the
+/// CA arm (guest→guest `call_indirect`) lowers it instead.
+///
+/// A JUMP whose target token is not defined by a local LABEL — the cross-loop
+/// terminal jump — is not judged here: it is lowered to
+/// `return_call_indirect(external_jump_slot)` and both callers resolve that
+/// slot through [`resolve_cross_loop_jump_target`].
+
 /// Stamp a position onto every non-Void-result op left unpositioned by the
 /// optimizer, so no operand resolves to `OpRef::NONE` during codegen.
 ///
@@ -4347,16 +4447,6 @@ fn normalize_ops_for_codegen(inputargs: &[InputArgRc], ops: &[OpRc]) -> Vec<Op> 
         .collect()
 }
 
-/// Report why a trace cannot be compiled by the wasm backend, or `None` if it
-/// can. Declined traces fall back to the interpreter (correct, unaccelerated)
-/// instead of producing an invalid trace module. `allow_ca` (set when every
-/// CALL_ASSEMBLER target is admitted) lifts the CALL_ASSEMBLER decline so the
-/// CA arm (guest→guest `call_indirect`) lowers it instead.
-///
-/// A JUMP whose target token is not defined by a local LABEL — the cross-loop
-/// terminal jump — is not judged here: it is lowered to
-/// `return_call_indirect(external_jump_slot)` and both callers resolve that
-/// slot through [`resolve_cross_loop_jump_target`].
 fn wasm_unsupported_trace_reason(ops: &[Op], allow_ca: bool) -> Option<String> {
     for op in ops {
         if op.opcode.is_call_assembler() && !allow_ca {
@@ -7738,6 +7828,327 @@ mod tests {
         let moved = table.slot(0);
         assert_ne!(moved, root, "remembered table slot must be forwarded");
         assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xA11C_E701);
+    }
+
+    /// Post-rewrite `CallMallocNursery*` traces must get nursery free/top
+    /// addresses. `nursery_alloc_params` is the private gatherer that feeds
+    /// `compile_loop`.
+    #[test]
+    fn nursery_alloc_params_accepts_call_malloc_nursery() {
+        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let gc = MiniMarkGC::new();
+        let mut backend = WasmBackend::new();
+        backend.set_gc_allocator(Box::new(gc));
+
+        let finish = majit_ir::Op::new(majit_ir::OpCode::Finish, &[]);
+        assert!(
+            nursery_alloc_params(&[finish.clone()]).is_none(),
+            "a trace with no allocation op must still return None"
+        );
+
+        let malloc = majit_ir::Op::new(
+            majit_ir::OpCode::CallMallocNursery,
+            &[rb(majit_ir::OpRef::const_int(32))],
+        );
+        malloc.pos().set(majit_ir::OpRef::ref_op(1));
+        let incr = majit_ir::Op::new(
+            majit_ir::OpCode::NurseryPtrIncrement,
+            &[
+                rb(majit_ir::OpRef::ref_op(1)),
+                rb(majit_ir::OpRef::const_int(32)),
+            ],
+        );
+        incr.pos().set(majit_ir::OpRef::ref_op(2));
+        let malloc_params = nursery_alloc_params(&[malloc, incr])
+            .expect("CallMallocNursery must qualify for the inline bump");
+        assert_ne!(malloc_params.free_addr, 0);
+        assert_ne!(malloc_params.top_addr, 0);
+
+        for opcode in [
+            majit_ir::OpCode::CallMallocNurseryHeaderless,
+            majit_ir::OpCode::CallMallocNurseryVarsizeFrame,
+        ] {
+            let op = majit_ir::Op::new(opcode, &[rb(majit_ir::OpRef::const_int(32))]);
+            op.pos().set(majit_ir::OpRef::ref_op(1));
+            assert!(
+                nursery_alloc_params(&[op]).is_some(),
+                "{opcode:?} must qualify for the inline bump"
+            );
+        }
+        let varsize = majit_ir::Op::new(
+            majit_ir::OpCode::CallMallocNurseryVarsize,
+            &[
+                rb(majit_ir::OpRef::const_int(0)),
+                rb(majit_ir::OpRef::const_int(8)),
+                rb(majit_ir::OpRef::const_int(4)),
+            ],
+        );
+        varsize.pos().set(majit_ir::OpRef::ref_op(1));
+        assert!(
+            nursery_alloc_params(&[varsize]).is_some(),
+            "CallMallocNurseryVarsize must qualify for the inline bump"
+        );
+        let _ = backend;
+    }
+
+    fn u1_new_setfield_ops(type_id: u32) -> (Vec<InputArgRc>, Vec<OpRc>) {
+        use majit_ir::descr::{SimpleFieldDescr, SimpleSizeDescr};
+        use std::sync::Arc;
+        let pointer_field = Arc::new(SimpleFieldDescr::new(
+            0,
+            0,
+            std::mem::size_of::<usize>(),
+            majit_ir::Type::Ref,
+            false,
+        ));
+        let size = Arc::new(SimpleSizeDescr::new(0, 16, type_id));
+        let new1 = majit_ir::Op::new(majit_ir::OpCode::New, &[]);
+        new1.setdescr(size.clone());
+        new1.pos().set(majit_ir::OpRef::ref_op(1));
+        let store1 = majit_ir::Op::new(
+            majit_ir::OpCode::SetfieldGc,
+            &[
+                rb(majit_ir::OpRef::ref_op(1)),
+                rb(majit_ir::OpRef::input_arg_ref(0)),
+            ],
+        );
+        store1.setdescr(pointer_field.clone());
+        let new2 = majit_ir::Op::new(majit_ir::OpCode::New, &[]);
+        new2.setdescr(size);
+        new2.pos().set(majit_ir::OpRef::ref_op(2));
+        let store2 = majit_ir::Op::new(
+            majit_ir::OpCode::SetfieldGc,
+            &[
+                rb(majit_ir::OpRef::ref_op(2)),
+                rb(majit_ir::OpRef::input_arg_ref(0)),
+            ],
+        );
+        store2.setdescr(pointer_field);
+        let finish = majit_ir::Op::new(majit_ir::OpCode::Finish, &[]);
+        let inputargs = vec![InputArg::from_type_rc(majit_ir::Type::Ref, 0)];
+        let ops = vec![
+            OpRc::new(new1),
+            OpRc::new(store1),
+            OpRc::new(new2),
+            OpRc::new(store2),
+            OpRc::new(finish),
+        ];
+        (inputargs, ops)
+    }
+
+    fn test_module_inputs(inputargs: Vec<InputArgRc>, ops: Vec<Op>) -> codegen::ModuleBuildInputs {
+        codegen::ModuleBuildInputs {
+            inputargs,
+            ops,
+            inlined_bridges: Vec::new(),
+            constants: indexmap::IndexMap::new(),
+            vtable_offset: Some(0),
+            classptr_to_typeid: HashMap::new(),
+            guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+            alloc: alloc_helpers(),
+            wb: wasm_write_barrier_helpers(),
+            nursery: None,
+            invalidated_flag_addr: 0,
+            gc_table_base: 0,
+            fail_index_base: 0,
+            bridge_cells_base: 0,
+            bridge_entry_arity: None,
+            bridge_param_dispatch: false,
+            trace_entry_census: None,
+            inline_trip: None,
+            external_jump_slot: 0,
+            external_jump_wide_slot: 0,
+            external_jump_key: 0,
+            frame: codegen::FrameGeometry::compact(5, 2, 0),
+            ca: codegen::CaParams::default(),
+        }
+    }
+
+    fn wasm_import_names(bytes: &[u8]) -> Vec<String> {
+        let mut names = Vec::new();
+        for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+            if let Ok(wasmparser::Payload::ImportSection(imports)) = payload {
+                for import in imports {
+                    if let Ok(import) = import {
+                        names.push(import.name.to_string());
+                    }
+                }
+            }
+        }
+        names
+    }
+
+    /// The normalize + GC rewrite half of [`WasmBackend::compile_loop`], with
+    /// the codegen that follows it left off.
+    fn prepare_ops_for_compile(
+        backend: &mut WasmBackend,
+        inputargs: &[InputArgRc],
+        ops: &[OpRc],
+    ) -> (Vec<Op>, Option<Arc<majit_gc::GcTable>>) {
+        let mut ops_owned = normalize_ops_for_codegen(inputargs, ops);
+        codegen::materialize_unbound_label_args(inputargs, &mut ops_owned);
+        backend.rewrite_ops_for_gc(ops_owned)
+    }
+
+    /// Adjacent `New`s merge into `CallMallocNursery` + `NurseryPtrIncrement`.
+    #[test]
+    fn gc_rewrite_on_merges_adjacent_news() {
+        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let mut gc = MiniMarkGC::new();
+        let type_id = gc.register_type(TypeInfo::simple(16));
+        let mut backend = WasmBackend::new();
+        backend.set_gc_allocator(Box::new(gc));
+        let (inputargs, ops) = u1_new_setfield_ops(type_id);
+        let (prepared, _) = prepare_ops_for_compile(&mut backend, &inputargs, &ops);
+        assert!(
+            prepared
+                .iter()
+                .any(|op| op.opcode == majit_ir::OpCode::CallMallocNursery),
+            "rewritten list must contain CallMallocNursery: {:?}",
+            prepared.iter().map(|op| op.opcode).collect::<Vec<_>>()
+        );
+        assert!(
+            prepared
+                .iter()
+                .any(|op| op.opcode == majit_ir::OpCode::NurseryPtrIncrement),
+            "adjacent mallocs must merge via NurseryPtrIncrement"
+        );
+        assert!(
+            prepared.iter().all(|op| op.opcode != majit_ir::OpCode::New),
+            "rewritten list must not contain New"
+        );
+    }
+
+    /// A ConstPtr used as an operand and as a failarg shares one gc table,
+    /// and the failarg is bound.
+    #[test]
+    fn gc_rewrite_on_one_table_for_operand_and_failarg_constptr() {
+        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let mut gc = MiniMarkGC::with_config(majit_gc::collector::GcConfig {
+            nursery_size: 65536,
+            large_object_threshold: 1024,
+            ..majit_gc::collector::GcConfig::default()
+        });
+        let type_id = gc.register_type(TypeInfo::simple(16));
+        let root = gc.alloc_with_type(type_id, 16);
+        let mut backend = WasmBackend::new();
+        backend.set_gc_allocator(Box::new(gc));
+        let same = majit_ir::Op::new(
+            majit_ir::OpCode::SameAsR,
+            &[rb(majit_ir::OpRef::const_ptr(root))],
+        );
+        same.pos().set(majit_ir::OpRef::ref_op(1));
+        let finish = majit_ir::Op::new(majit_ir::OpCode::Finish, &[rb(majit_ir::OpRef::ref_op(1))]);
+        finish.setfailargs(vec![rb(majit_ir::OpRef::const_ptr(root))].into());
+        let (prepared, table) =
+            prepare_ops_for_compile(&mut backend, &[], &[OpRc::new(same), OpRc::new(finish)]);
+        let table = table.expect("operand ConstPtr must intern into a gc table");
+        assert_eq!(table.slot(0), root);
+        assert!(
+            prepared
+                .iter()
+                .any(|op| op.opcode == majit_ir::OpCode::LoadFromGcTable),
+            "operand ConstPtr must become LoadFromGcTable"
+        );
+        let finish = prepared
+            .iter()
+            .find(|op| op.opcode == majit_ir::OpCode::Finish)
+            .expect("Finish");
+        let fa = finish.getfailargs().expect("failargs");
+        assert!(
+            fa.iter().any(|a| a.to_opref().inline_const_bits().is_some()
+                || matches!(a.const_value(), Some(majit_ir::Value::Ref(g)) if g == root)),
+            "failarg ConstPtr stays a constant; table still roots it"
+        );
+    }
+
+    /// Rewritten NewArray slow path (CallR malloc helper) must not import
+    /// jit_call.
+    #[test]
+    fn gc_rewrite_newarray_slow_path_has_no_jit_call() {
+        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        use majit_ir::descr::SimpleArrayDescr;
+        use std::sync::Arc;
+        let mut backend = WasmBackend::new();
+        let arr = majit_ir::Op::new(
+            majit_ir::OpCode::NewArray,
+            &[rb(majit_ir::OpRef::input_arg_int(0))],
+        );
+        arr.setdescr(Arc::new(SimpleArrayDescr::new(
+            1,
+            16,
+            8,
+            1,
+            majit_ir::Type::Int,
+        )));
+        arr.pos().set(majit_ir::OpRef::ref_op(1));
+        let finish = majit_ir::Op::new(majit_ir::OpCode::Finish, &[]);
+        let inputargs = vec![InputArg::from_type_rc(majit_ir::Type::Int, 0)];
+        let (prepared, _) = prepare_ops_for_compile(
+            &mut backend,
+            &inputargs,
+            &[OpRc::new(arr), OpRc::new(finish)],
+        );
+        assert!(
+            prepared
+                .iter()
+                .any(|op| op.opcode == majit_ir::OpCode::CallR),
+            "runtime-length NewArray without a nursery must take the CallR slow path: {:?}",
+            prepared.iter().map(|op| op.opcode).collect::<Vec<_>>()
+        );
+        let mut inputs = test_module_inputs(inputargs, prepared);
+        inputs.constants = backend.constants.clone();
+        let (bytes, _, _, _) = codegen::build_wasm_module(&inputs).expect("slow-path module");
+        let names = wasm_import_names(&bytes);
+        assert!(
+            names
+                .iter()
+                .all(|n| n != "jit_call" && n != "jit_call_compact"),
+            "rewritten NewArray slow path must not use the jit_call trampoline: {names:?}"
+        );
+    }
+
+    /// Rewritten `New` of a type with a ref field zero-inits that field at
+    /// `size_of::<usize>()` (not a host-literal 8).
+    #[test]
+    fn gc_rewrite_new_ref_field_zero_store_uses_usize_width() {
+        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        use majit_ir::descr::{SimpleFieldDescr, SimpleSizeDescr};
+        use std::sync::Arc;
+        let mut gc = MiniMarkGC::new();
+        let type_id = gc.register_type(TypeInfo::simple(16));
+        let mut backend = WasmBackend::new();
+        backend.set_gc_allocator(Box::new(gc));
+        let field = Arc::new(SimpleFieldDescr::new(
+            0,
+            0,
+            std::mem::size_of::<usize>(),
+            majit_ir::Type::Ref,
+            false,
+        ));
+        let size = SimpleSizeDescr::new(0, 16, type_id).with_all_fielddescrs(vec![
+            field as std::sync::Arc<dyn majit_ir::descr::FieldDescr>,
+        ]);
+        let new_op = majit_ir::Op::new(majit_ir::OpCode::New, &[]);
+        new_op.setdescr(Arc::new(size));
+        new_op.pos().set(majit_ir::OpRef::ref_op(1));
+        let finish = majit_ir::Op::new(majit_ir::OpCode::Finish, &[]);
+        let (prepared, _) =
+            prepare_ops_for_compile(&mut backend, &[], &[OpRc::new(new_op), OpRc::new(finish)]);
+        let word = std::mem::size_of::<usize>() as i64;
+        let sized = prepared.iter().any(|op| {
+            op.opcode == majit_ir::OpCode::GcStore
+                && op.arg(3).to_opref().inline_const_bits() == Some(word)
+        });
+        assert!(
+            sized,
+            "GcStore size operand must be size_of::<usize>()={word}: {:?}",
+            prepared
+                .iter()
+                .filter(|op| op.opcode == majit_ir::OpCode::GcStore)
+                .map(|op| op.arg(3).to_opref())
+                .collect::<Vec<_>>()
+        );
     }
 
     /// Spike for the wasm-JITFRAME refactor: prove the shared

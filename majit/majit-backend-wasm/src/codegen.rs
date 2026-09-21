@@ -173,10 +173,9 @@ pub fn bind_failarg_const_table(gcrefs: &[majit_ir::GcRef], gc_table_base: u32) 
 
 /// Merge one interned GC table into the force-arm ConstPtr map.
 ///
-/// `intern_ref_constants` of a later compile (an inline bridge) clears the
-/// TLS map. Re-emission must restore every retained region's table, each
-/// under its own `base_addr`, or a non-null owner ConstPtr falls through
-/// to a raw address.
+/// A later compile (an inline bridge) rebuilds the TLS map. Re-emission
+/// must restore every retained region's table, each under its own
+/// `base_addr`, or a non-null owner ConstPtr falls through to a raw address.
 pub fn extend_failarg_const_table_from_gc_table(table: &majit_gc::GcTable) {
     FAILARG_CONST_TABLE.with(|cell| {
         let mut map = cell.borrow_mut();
@@ -1134,64 +1133,6 @@ fn emit_sized_int_store(sink: &mut PeepSink<'_, '_>, offset: u64, size: usize) {
     };
 }
 
-/// `(field_size, is_signed)` from an op's FieldDescr. A field op always carries
-/// a FieldDescr; a missing one is an invariant violation, so panic rather than
-/// emit a silently-wrong width.
-fn field_size_sign_from_descr(op: &Op) -> (usize, bool) {
-    let descr = op.getdescr();
-    if let Some(fd) = descr.as_ref().and_then(|d| d.as_field_descr()) {
-        return (fd.field_size(), fd.is_field_signed());
-    }
-    missing_layout_descr("field descr (size/sign)", op)
-}
-
-/// Store width for a `SetfieldGc`/`SetfieldRaw`. A pointer (`Type::Ref`) field
-/// is stored at machine-word width regardless of the descr's recorded size: a
-/// pointer is 4 bytes on wasm32, so a fixed 8-byte store would clobber the
-/// adjacent field. There is no `SetfieldGcR` opcode, so the field type is the
-/// only signal — mirroring the `GetfieldGcR` read, which always loads pointers
-/// at i32 width. Non-pointer fields use the descr's true field width.
-fn setfield_store_size_from_descr(op: &Op) -> usize {
-    let descr = op.getdescr();
-    if let Some(fd) = descr.as_ref().and_then(|d| d.as_field_descr()) {
-        if fd.is_pointer_field() {
-            return std::mem::size_of::<usize>();
-        }
-        return fd.field_size();
-    }
-    missing_layout_descr("field descr (store size)", op)
-}
-
-fn field_is_float_from_descr(op: &Op) -> bool {
-    let descr = op.getdescr();
-    match descr.as_ref().and_then(|d| d.as_field_descr()) {
-        Some(fd) => fd.is_float_field(),
-        None => missing_layout_descr("field descr (is_float)", op),
-    }
-}
-
-fn emit_float_load(
-    sink: &mut PeepSink<'_, '_>,
-    offset: u64,
-    size: usize,
-) -> Result<(), BackendError> {
-    match size {
-        4 => {
-            sink.f32_load(mem32(offset));
-            sink.f64_promote_f32();
-        }
-        8 => {
-            sink.f64_load(mem64(offset));
-        }
-        other => {
-            return Err(BackendError::Unsupported(format!(
-                "wasm codegen: float load has size {other}"
-            )));
-        }
-    }
-    Ok(())
-}
-
 fn value_is_f64(value_types: &ValueLocals, val: OpRef) -> bool {
     if val.is_constant() {
         return val.ty() == Some(Type::Float);
@@ -1219,31 +1160,6 @@ fn emit_float_store(
         }
     }
     Ok(())
-}
-
-/// `(item_size, is_signed)` from an op's ArrayDescr. An array op always carries
-/// an ArrayDescr; a missing one is an invariant violation, so panic.
-fn array_item_size_sign_from_descr(op: &Op) -> (usize, bool) {
-    op.with_array_descr(|ad| (ad.item_size(), ad.is_item_signed()))
-        .unwrap_or_else(|| missing_layout_descr("array descr (item size/sign)", op))
-}
-
-/// `raw_load` / `raw_store` address `arg(0) + arg(1)` and nothing else: a raw
-/// buffer has no GC array header, so the descr's base size is not part of the
-/// address the way it is for the `GETARRAYITEM` family.
-fn emit_raw_addr(
-    sink: &mut PeepSink<'_, '_>,
-    constants: &indexmap::IndexMap<u32, i64>,
-    value_types: &ValueLocals,
-    op: &Op,
-) -> u64 {
-    emit_gc_offset_addr(
-        sink,
-        constants,
-        value_types,
-        op.arg(0).to_opref(),
-        op.arg(1).to_opref(),
-    )
 }
 
 /// Address the GC rewrite's descriptor-free `base + offset` memory form.
@@ -1337,11 +1253,6 @@ fn gc_rewrite_access_size(
         )));
     }
     Ok((size, encoded < 0))
-}
-
-fn array_item_is_float_from_descr(op: &Op) -> bool {
-    op.with_array_descr(|ad| ad.item_type() == Type::Float)
-        .unwrap_or_else(|| missing_layout_descr("array descr (item is_float)", op))
 }
 
 /// Dense census of every non-constant Ref-typed value (input arg / op result),
@@ -1982,32 +1893,17 @@ pub fn frame_value_slots(inputargs: &[InputArgRc], ops: &[Op]) -> usize {
     normal_frame_value_slots(inputargs, ops) + LabelResumeData::collect(inputargs, ops).scalar_slots
 }
 
-/// Argument index of the stored value for a GC ref-storing op. `SetfieldRaw` /
-/// `SetarrayitemRaw` store into non-GC memory and never need a write barrier,
-/// so only the `*Gc` variants are listed (rewrite.py only routes `SETFIELD_GC`
-/// / `SETARRAYITEM_GC` / `SETINTERIORFIELD_GC` through the barrier).
-fn ref_store_value_arg(op: &Op) -> Option<usize> {
-    match op.opcode {
-        OpCode::SetfieldGc => Some(1),
-        OpCode::SetarrayitemGc | OpCode::SetinteriorfieldGc => Some(2),
-        _ => None,
-    }
-}
-
-/// If `op` stores a (non-constant) reference into a GC object, return the base
-/// object operand that must be passed through the write barrier; otherwise
-/// `None`. [`RefValues`] records every non-constant Ref-typed input/result;
-/// [`RefHomes`] deliberately records only values that must survive a collecting
-/// position or be published for force/resume. This mirrors the native
-/// `handle_write_barrier_setfield` gate `v.type == 'r' and not ConstPtr`: a
-/// constant reference is an immortal/old object whose store never makes the base
-/// point to young, so it needs no barrier (rewrite.py:930-931).
+/// `CondCallGcWb` / `CondCallGcWbArray` are the rewriter's already-decided
+/// barrier ops (`rewrite.py gen_write_barrier` / `gen_write_barrier_array`);
+/// the stored value is no longer on the op, so the base is `arg(0)`.
 fn write_barrier_base(op: &Op, ref_values: &RefValues) -> Option<OpRef> {
+    if matches!(op.opcode, OpCode::CondCallGcWb | OpCode::CondCallGcWbArray) {
+        return Some(op.arg(0).to_opref());
+    }
     let val = op.arg(ref_store_value_arg(op)?).to_opref();
     // `contains` returns false for constants, matching the gate's `not ConstPtr`.
     ref_values.contains(val).then(|| op.arg(0).to_opref())
 }
-
 /// `llsupport/gc.py WriteBarrierDescr` as the emitted barrier reads it, paired
 /// with the addresses of the two helpers its arms call.
 ///
@@ -2171,9 +2067,8 @@ fn emit_wb_helper_call(
     sink.drop();
 }
 
-/// Emit a write-barrier check on `base_ref` before a ref-storing field/array
-/// store, standing in for the `COND_CALL_GC_WB` the native GC rewrite pass
-/// inserts.
+/// Emit a write-barrier check on `base_ref` for a rewriter `CondCallGcWb` /
+/// `CondCallGcWbArray`.
 ///
 /// With the residual type family declared (`residual_type_base`), this is
 /// `_write_barrier_fastpath`: one test of the flag byte, and only a flagged
@@ -2487,8 +2382,8 @@ fn call_can_collect(op: &Op) -> bool {
 }
 
 /// Static collecting-call positions whose gcmap-visible homes may be forwarded.
-/// Every `is_malloc` op (the whole `New..=Newunicode` range, string allocations
-/// included) routes through a collecting allocator. A residual call earns a
+/// Every `is_malloc` op (post-rewrite `CallMallocNursery*` included) routes
+/// through a collecting allocator. A residual call earns a
 /// position only where [`call_can_collect`] admits it, which is the predicate
 /// the reload side already applies: a home exists so a collection can forward
 /// the value, so a call that cannot collect would buy a home that nothing ever
@@ -3316,28 +3211,194 @@ fn residual_call_abi() -> ResidualCallAbi {
 
 /// Whether `op`'s callee may be called with the wasm type its descr's word
 /// types imply, rather than through the reflecting trampoline.
-fn residual_callee_abi_is_word_at(
+fn func_sig_val_to_valtype(val: crate::FuncSigVal) -> ValType {
+    match val {
+        crate::FuncSigVal::I32 => ValType::I32,
+        crate::FuncSigVal::I64 => ValType::I64,
+        crate::FuncSigVal::F32 => ValType::F32,
+        crate::FuncSigVal::F64 => ValType::F64,
+    }
+}
+
+fn wasm_sig_to_typed(sig: &crate::WasmSig) -> TypedResidualSig {
+    (
+        sig.params
+            .iter()
+            .copied()
+            .map(func_sig_val_to_valtype)
+            .collect(),
+        sig.result.map(func_sig_val_to_valtype),
+    )
+}
+
+/// Descr-derived wasm type the direct arm would use for this op.
+///
+/// CallN's void-word vs true-void result follows the oracle's real result
+/// when one is known; otherwise it follows `result_size`. Shared by the
+/// direct-vs-trampoline predicate and the emitter's type-index choice.
+fn expected_direct_wasm_sig(
+    op: &Op,
+    constants: &indexmap::IndexMap<u32, i64>,
+) -> Option<TypedResidualSig> {
+    expected_direct_wasm_sig_at(op, constants, residual_func_ofs(op.opcode))
+}
+
+fn expected_direct_wasm_sig_at(
     op: &Op,
     constants: &indexmap::IndexMap<u32, i64>,
     func_arg: usize,
-) -> bool {
-    match residual_call_abi() {
-        ResidualCallAbi::Word => true,
-        ResidualCallAbi::Vouched => {
-            // Only a compile-time callee can be checked against the list; a
-            // register-form func pointer is a different target on every
-            // execution.
-            let Some(func_ptr) = op.getarglist().get(func_arg).map(|arg| arg.to_opref()) else {
-                return false;
-            };
-            func_ptr.is_constant()
-                && crate::residual_call_descr_is_faithful(resolve_const_bits(constants, func_ptr))
+) -> Option<TypedResidualSig> {
+    let descr = op.getdescr()?;
+    let cd = descr.as_call_descr()?;
+    let arg_types = cd.arg_types();
+    let mut params = Vec::with_capacity(arg_types.len());
+    for ty in arg_types {
+        params.push(match ty {
+            Type::Float => ValType::F64,
+            Type::Int | Type::Ref => ValType::I64,
+            Type::Void => return None,
+        });
+    }
+    let nargs = op.num_args().saturating_sub(func_arg + 1);
+    if params.len() != nargs {
+        return None;
+    }
+    let is_void_op = matches!(
+        op.opcode,
+        OpCode::CallN
+            | OpCode::CallPureN
+            | OpCode::CallLoopinvariantN
+            | OpCode::CallMayForceN
+            | OpCode::CallReleaseGilN
+            | OpCode::CondCallN
+    );
+    let mut result = if is_void_op {
+        if cd.result_type() != Type::Void {
+            return None;
+        }
+        match cd.result_size() {
+            0 => None,
+            8 => Some(ValType::I64),
+            _ => return None,
+        }
+    } else {
+        if op.result_type() != cd.result_type() {
+            return None;
+        }
+        match cd.result_type() {
+            Type::Float => Some(ValType::F64),
+            Type::Int | Type::Ref => Some(ValType::I64),
+            Type::Void => return None,
+        }
+    };
+    if is_void_op
+        && let Some(addr) = const_funcptr_addr(op, constants, func_arg)
+        && let Some(real) = crate::residual_target_sig(addr)
+    {
+        match real.result {
+            None => result = None,
+            Some(crate::FuncSigVal::I64) | Some(crate::FuncSigVal::I32) => {
+                result = Some(ValType::I64)
+            }
+            Some(crate::FuncSigVal::F32) | Some(crate::FuncSigVal::F64) => {}
+        }
+    }
+    Some((params, result))
+}
+
+fn const_funcptr_addr(
+    op: &Op,
+    constants: &indexmap::IndexMap<u32, i64>,
+    func_arg: usize,
+) -> Option<i64> {
+    let func_ptr = op.getarglist().get(func_arg).map(|arg| arg.to_opref())?;
+    func_ptr
+        .is_constant()
+        .then(|| resolve_const_bits(constants, func_ptr))
+}
+
+/// True when `real` differs from `expected` only by i32 where the descr-derived
+/// type has i64 (Int/Ref on the JIT side). f32 anywhere is not this case.
+fn i32_abi_variance(expected: &TypedResidualSig, real: &TypedResidualSig) -> bool {
+    if expected.0.len() != real.0.len() {
+        return false;
+    }
+    if expected.1.is_some() != real.1.is_some() {
+        return false;
+    }
+    if real.0.contains(&ValType::F32) || real.1 == Some(ValType::F32) {
+        return false;
+    }
+    for (want, got) in expected.0.iter().zip(&real.0) {
+        match (*want, *got) {
+            (a, b) if a == b => {}
+            (ValType::I64, ValType::I32) => {}
+            _ => return false,
+        }
+    }
+    match (expected.1, real.1) {
+        (a, b) if a == b => true,
+        (Some(ValType::I64), Some(ValType::I32)) => true,
+        _ => false,
+    }
+}
+
+/// Emit signature for a direct call, or `None` to keep the trampoline.
+fn residual_callee_direct_emit_sig_at(
+    op: &Op,
+    constants: &indexmap::IndexMap<u32, i64>,
+    func_arg: usize,
+    expected: &TypedResidualSig,
+) -> Option<TypedResidualSig> {
+    let Some(func_ptr) = op.getarglist().get(func_arg).map(|arg| arg.to_opref()) else {
+        return None;
+    };
+    if !func_ptr.is_constant() {
+        return match residual_call_abi() {
+            ResidualCallAbi::Word if word_descr_shape(expected) => Some(expected.clone()),
+            _ => None,
+        };
+    }
+    let addr = resolve_const_bits(constants, func_ptr);
+    match crate::residual_target_sig(addr) {
+        Some(real) => {
+            if real.has_f32() {
+                return None;
+            }
+            let real_typed = wasm_sig_to_typed(&real);
+            if real_typed == *expected {
+                Some(expected.clone())
+            } else if i32_abi_variance(expected, &real_typed) {
+                Some(real_typed)
+            } else {
+                None
+            }
+        }
+        None => {
+            let all_float =
+                expected.1 == Some(ValType::F64) && expected.0.iter().all(|t| *t == ValType::F64);
+            if all_float
+                || (residual_call_abi() == ResidualCallAbi::Word && word_descr_shape(expected))
+                || crate::residual_call_descr_is_faithful(addr)
+            {
+                Some(expected.clone())
+            } else {
+                None
+            }
         }
     }
 }
 
-fn residual_callee_abi_is_word(op: &Op, constants: &indexmap::IndexMap<u32, i64>) -> bool {
-    residual_callee_abi_is_word_at(op, constants, residual_func_ofs(op.opcode))
+fn word_descr_shape(expected: &TypedResidualSig) -> bool {
+    expected.0.iter().all(|t| *t == ValType::I64) && matches!(expected.1, Some(ValType::I64) | None)
+}
+
+fn residual_direct_emit_sig(
+    op: &Op,
+    constants: &indexmap::IndexMap<u32, i64>,
+) -> Option<TypedResidualSig> {
+    let expected = expected_direct_wasm_sig(op, constants)?;
+    residual_callee_direct_emit_sig_at(op, constants, residual_func_ofs(op.opcode), &expected)
 }
 
 /// Direct uniform-word shapes for COND_CALL. Conditional calls place the
@@ -3374,10 +3435,19 @@ fn conditional_call_word_shape(
         return None;
     }
     let nargs = op.getarglist().len().saturating_sub(2);
-    if cd.arg_types().len() != nargs || !residual_callee_abi_is_word_at(op, constants, 1) {
+    if cd.arg_types().len() != nargs {
         return None;
     }
-    Some((nargs, returns_word || cd.result_size() == 8))
+    let expected = expected_direct_wasm_sig_at(op, constants, 1)?;
+    let emit = residual_callee_direct_emit_sig_at(op, constants, 1, &expected)?;
+    if emit.0.iter().any(|t| *t != ValType::I64) {
+        return None;
+    }
+    let emit_word = emit.1 == Some(ValType::I64);
+    if returns_word != emit_word && returns_word {
+        return None;
+    }
+    Some((emit.0.len(), emit_word))
 }
 
 fn conditional_call_i64_arity(op: &Op, constants: &indexmap::IndexMap<u32, i64>) -> Option<usize> {
@@ -3451,7 +3521,8 @@ fn residual_call_i64_arity(op: &Op, constants: &indexmap::IndexMap<u32, i64>) ->
     if arg_types.len() != nargs {
         return None;
     }
-    if !residual_callee_abi_is_word(op, constants) {
+    let emit = residual_direct_emit_sig(op, constants)?;
+    if emit.0.iter().any(|t| *t != ValType::I64) || emit.1 != Some(ValType::I64) {
         return None;
     }
     Some(nargs)
@@ -3506,62 +3577,7 @@ fn residual_call_typed_sig(
     {
         return None;
     }
-    let descr = op.getdescr()?;
-    let cd = descr.as_call_descr()?;
-    if op.result_type() != cd.result_type() {
-        return None;
-    }
-    let result = match cd.result_type() {
-        Type::Float => Some(ValType::F64),
-        Type::Int | Type::Ref => Some(ValType::I64),
-        // A callee that returns nothing still needs its own type when a float
-        // parameter puts it outside `residual_call_void_true_arity`'s uniform
-        // word family.  `all_float` below is false for it, so it reaches the
-        // allow-list check like every other mixed shape.
-        //
-        // Only a descr that records `()` names such a callee.  A void-recorded
-        // descr carrying `result_size == 8` (the `make_call_descr_void_word_abi`
-        // shape) names one that really returns a machine word, and an empty
-        // result list is a different type from the one the callee has.  The i64
-        // family `residual_call_void_word_arity` selects is where that ABI is
-        // spelled; where that family declines -- a float parameter it cannot
-        // carry -- the reflecting trampoline is the arm that stays correct.
-        Type::Void if cd.result_size() != 0 => return None,
-        Type::Void => None,
-    };
-    let arg_types = cd.arg_types();
-    // Every argument `f64` and an `f64` result is the shipped shape and needs
-    // no vouching: a float-only descr has no word parameter to be an `i32`
-    // pointer in disguise. Anything else -- a word beside a float, or a word
-    // result over float arguments -- is only as good as the descr, so the
-    // callee has to be named by `set_faithful_residual_call_addrs`.
-    let all_float = result == Some(ValType::F64) && arg_types.iter().all(|t| *t == Type::Float);
-    let func_ofs = residual_func_ofs(op.opcode);
-    if !all_float {
-        // Only a compile-time callee can be checked against the allow-list; a
-        // register-form func pointer is a different target on every execution.
-        let func_ptr = op.arg(func_ofs).to_opref();
-        if !func_ptr.is_constant() {
-            return None;
-        }
-        if !crate::residual_call_descr_is_faithful(resolve_const_bits(constants, func_ptr)) {
-            return None;
-        }
-    }
-    let mut params = Vec::with_capacity(arg_types.len());
-    for ty in arg_types {
-        params.push(match ty {
-            Type::Float => ValType::F64,
-            Type::Int | Type::Ref => ValType::I64,
-            Type::Void => return None,
-        });
-    }
-    // Ordinary CALL: func at arg 0. CALL_RELEASE_GIL: func at arg 1.
-    let nargs = op.num_args().saturating_sub(func_ofs + 1);
-    if params.len() != nargs {
-        return None;
-    }
-    Some((params, result))
+    residual_direct_emit_sig(op, constants)
 }
 
 /// Void-recorded counterpart of [`residual_call_i64_arity`]: an eligible
@@ -3588,7 +3604,7 @@ fn residual_call_void_word_arity(
     }
     let descr = op.getdescr()?;
     let cd = descr.as_call_descr()?;
-    if cd.result_type() != Type::Void || cd.result_size() != 8 {
+    if cd.result_type() != Type::Void {
         return None;
     }
     let arg_types = cd.arg_types();
@@ -3603,7 +3619,8 @@ fn residual_call_void_word_arity(
     if arg_types.len() != nargs {
         return None;
     }
-    if !residual_callee_abi_is_word(op, constants) {
+    let emit = residual_direct_emit_sig(op, constants)?;
+    if emit.0.iter().any(|t| *t != ValType::I64) || emit.1 != Some(ValType::I64) {
         return None;
     }
     Some(nargs)
@@ -3628,7 +3645,7 @@ fn residual_call_void_true_arity(
     }
     let descr = op.getdescr()?;
     let cd = descr.as_call_descr()?;
-    if cd.result_type() != Type::Void || cd.result_size() != 0 {
+    if cd.result_type() != Type::Void {
         return None;
     }
     let arg_types = cd.arg_types();
@@ -3643,17 +3660,18 @@ fn residual_call_void_true_arity(
     if arg_types.len() != nargs {
         return None;
     }
-    if !residual_callee_abi_is_word(op, constants) {
+    let emit = residual_direct_emit_sig(op, constants)?;
+    if emit.0.iter().any(|t| *t != ValType::I64) || emit.1.is_some() {
         return None;
     }
     Some(nargs)
 }
 
 /// Arity of `op`'s in-module `(i64×n) -> i64` lowering, if it has one: an
-/// eligible residual CALL (word-result or word-ABI void), a `New*`
-/// allocation (the `wasm_jit_alloc*` helper targets are plain
-/// `extern "C" fn(i64×n) -> i64` table entries), or a ref-storing store
-/// (its `wasm_jit_write_barrier` helper takes 1 arg). All of these share
+/// eligible residual CALL (word-result or word-ABI void), a
+/// `CallMallocNursery*` slow path (the `wasm_jit_alloc*` helper targets are
+/// plain `extern "C" fn(i64×n) -> i64` table entries), or a
+/// `CondCallGcWb*` (`wasm_jit_write_barrier` takes 1 arg). All of these share
 /// the i64-result residual-call type family, so one max covers them. True-void
 /// residuals use a separate result family and arity census.
 fn direct_helper_i64_arity(
@@ -3672,7 +3690,7 @@ fn direct_helper_i64_arity(
     }
     match op.opcode {
         // wasm_jit_alloc(type_id, size)
-        OpCode::New | OpCode::NewWithVtable | OpCode::CallMallocNursery => Some(2),
+        OpCode::CallMallocNursery => Some(2),
         OpCode::CallMallocNurseryHeaderless | OpCode::ThreadlocalrefGet => Some(1),
         OpCode::CallMallocNurseryVarsizeFrame => Some(2),
         // wasm_jit_alloc_array(type_id, base_size, item_size, length, len_offset)
@@ -3693,10 +3711,10 @@ fn direct_helper_i64_arity(
 /// invocation and therefore needs the corresponding function import.
 ///
 /// Keep this in lockstep with the individual emission arms below: the uniform
-/// i64, typed float, and true-void residual families, `New*`, and write
-/// barriers are direct as far as [`RESIDUAL_CALL_ABI`] lets each one be;
-/// non-uniform CALLs, an unvouched callee, and string allocation retain the
-/// trampoline.
+/// i64, typed float, and true-void residual families, `CallMallocNursery*`,
+/// and write barriers are direct as far as [`RESIDUAL_CALL_ABI`] lets each
+/// one be; non-uniform CALLs, an unvouched callee, and string allocation
+/// retain the trampoline.
 fn has_trampoline_calls(
     inputargs: &[InputArgRc],
     ops: &[Op],
@@ -3713,7 +3731,6 @@ fn has_trampoline_calls(
         // but neither emission arm calls anything: CheckMemoryError is an
         // inline null/exit test and RecordKnownResult is optimizer metadata.
         OpCode::CheckMemoryError | OpCode::RecordKnownResult => false,
-        OpCode::Newstr | OpCode::Newunicode => false,
         // Every residual CALL uses the trampoline unless its exact lowering
         // predicate supplies an i64, typed float, or true-void helper ABI.
         _ if op.opcode.is_call() => {
@@ -3722,7 +3739,7 @@ fn has_trampoline_calls(
                 && residual_call_void_true_arity(op, constants).is_none()
                 && conditional_call_true_void_arity(op, constants).is_none()
         }
-        // `New*` and ref-store write barriers are covered by
+        // `CallMallocNursery*` and `CondCallGcWb*` are covered by
         // `direct_helper_i64_arity`, so their direct-family arms do not touch
         // the frame call area.
         _ => false,
@@ -4051,12 +4068,12 @@ pub struct CaInlineParams {
     pub large_threshold: usize,
 }
 
-/// Inline nursery-bump fast-path parameters for `New`/`NewWithVtable`
-/// (rewrite.py's malloc fast path over the gc.py:525-531
-/// `get_nursery_free_addr`/`get_nursery_top_addr` surface, which the x86
-/// backend lowers as `malloc_cond`: load free, bump, compare top, call the
-/// slow path only on overflow). `None` keeps every allocation on the
-/// `wasm_jit_alloc` helper call.
+/// Inline nursery-bump fast-path parameters for post-rewrite
+/// `CallMallocNursery*` ops (rewrite.py's malloc fast path over the
+/// gc.py:525-531 `get_nursery_free_addr`/`get_nursery_top_addr` surface,
+/// which the x86 backend lowers as `malloc_cond`: load free, bump, compare
+/// top, call the slow path only on overflow). `None` keeps every allocation
+/// on the `wasm_jit_alloc` helper call.
 #[derive(Clone)]
 pub struct NurseryAllocParams {
     /// Linear-memory address of the GC's `nursery_free` bump pointer.
@@ -4070,7 +4087,6 @@ pub struct NurseryAllocParams {
     /// destructor / weakref side-list registration).
     pub plain_tids: std::collections::HashSet<u32>,
 }
-
 /// `Nursery::alloc` 8-aligns the total. The inline VarsizeFrame and
 /// headerless bumps write `nursery_free` themselves, so a wasm32 size that
 /// is only word-aligned has to be raised here or the next object header is
@@ -4078,6 +4094,41 @@ pub struct NurseryAllocParams {
 fn aligned_varsize_frame_bump(size: i64) -> Option<u32> {
     let size = u32::try_from(size).ok()?;
     Some(size.checked_add(7)? & !7)
+}
+
+/// `gen_initialize_tid` immediately after `CallMallocNursery`: a constant
+/// HALFWORD store of the type id into the header word at `obj - HDR_SIZE`.
+struct NurseryTidStore {
+    tid: i64,
+    offset: i64,
+    width: usize,
+}
+
+fn nursery_header_tid_store(
+    next: &Op,
+    malloc_result: OpRef,
+    constants: &indexmap::IndexMap<u32, i64>,
+) -> Option<NurseryTidStore> {
+    if next.opcode != OpCode::GcStore || next.num_args() < 4 {
+        return None;
+    }
+    if next.arg(0).to_opref() != malloc_result {
+        return None;
+    }
+    let offset = const_operand_value(constants, next.arg(1).to_opref())?;
+    if offset != -(GcHeader::SIZE as i64) {
+        return None;
+    }
+    let width = const_operand_value(constants, next.arg(3).to_opref())?;
+    if width != (std::mem::size_of::<usize>() / 2) as i64 {
+        return None;
+    }
+    let tid = const_operand_value(constants, next.arg(2).to_opref())?;
+    Some(NurseryTidStore {
+        tid,
+        offset,
+        width: width as usize,
+    })
 }
 
 pub(crate) const BUILTIN_STRING_HASH_OFFSET: usize = 0;
@@ -4226,21 +4277,12 @@ fn needs_builtin_string_descr(op: &Op) -> bool {
         && (builtin_string_array_descr(op.opcode).is_some()
             || builtin_string_hash_field_descr(op.opcode).is_some())
 }
-
 /// `__indirect_function_table` indices of the allocation helpers a compiled
-/// trace calls for `New*` / `NewArray*`.
-///
-/// Two generations, picked per operation from the descr's `non_moving` flag:
-/// the nursery pair is the default, the old-gen pair is for a descr whose
-/// object must not move (see `majit_backend_wasm::wasm_jit_alloc_oldgen`).
-/// The native backends make the same choice inside the GC rewrite pass, which
-/// the wasm backend bypasses in favour of this lowering.
+/// trace calls for `CallMallocNursery*` slow paths.
 #[derive(Clone, Copy, Default)]
 pub struct AllocHelpers {
     pub new_fn_ptr: i64,
     pub new_array_fn_ptr: i64,
-    pub new_oldgen_fn_ptr: i64,
-    pub new_array_oldgen_fn_ptr: i64,
     pub headerless_fn_ptr: i64,
     pub threadlocal_fn_ptr: i64,
     pub fmod_fn_ptr: i64,
@@ -4968,8 +5010,8 @@ pub fn build_wasm_module(
         has_trampoline_calls(&analysis_inputargs, &analysis_ops, constants, ca.emit_ca);
     // In-module residual calls ([`RESIDUAL_CALL_ABI`]): the largest
     // eligible `(i64×n)->i64` arity in this trace — residual CALLs (word
-    // result or word-ABI void) plus the `New*` / write-barrier helper
-    // targets, which share the same uniform-i64 ABI — or `None` if there
+    // result or word-ABI void) plus the `CallMallocNursery*` / write-barrier
+    // helper targets, which share the same uniform-i64 ABI — or `None` if there
     // are none. Each distinct arity `0..=max` gets its own function type
     // (declared below) so those arms can `call_indirect` with a static type.
     let residual_max_arity = {
@@ -5473,8 +5515,8 @@ fn build_function(
     frame: FrameGeometry,
     // Base wasm type index of the `(i64×n)->i64` residual-call types (type
     // `residual_type_base + n` for arity `n`), or `None` when the trace has no
-    // eligible residual call / `New*` / write barrier, so those arms always
-    // use the `jit_call` path.
+    // eligible residual call / `CallMallocNursery*` / write barrier, so those
+    // arms always use the `jit_call` path.
     residual_type_base: Option<u32>,
     // Exact wasm type indices for direct typed residual calls, keyed by their
     // descr-derived parameter sequence and result. Float SSA values are
@@ -5986,6 +6028,7 @@ fn build_function(
     let mut ovf_flag_live = false;
     let mut fused_guard_at: Option<usize> = None;
     let mut fused_condcall_at: Option<usize> = None;
+    let mut skip_nursery_tid_store_at: Option<usize> = None;
     let frame_can_escape = ops
         .iter()
         .any(|op| matches!(op.opcode, OpCode::GuardNotForced | OpCode::GuardNotForced2));
@@ -6027,6 +6070,10 @@ fn build_function(
     }
 
     for (op_idx, op) in ops.iter().enumerate() {
+        if skip_nursery_tid_store_at == Some(op_idx) {
+            skip_nursery_tid_store_at = None;
+            continue;
+        }
         set_failarg_lookup_base(table_base_by_op[op_idx]);
         if frame_can_escape && ref_homes.len() != 0 && op.opcode.can_malloc() {
             emit_jitframe_write_barrier(&mut sink, jit_call_idx, residual_type_base, wb);
@@ -7269,112 +7316,32 @@ fn build_function(
                 }
             }
 
-            // ── Interior field access ──
-            // rewrite.py transform_to_gc_load / unpack_interiorfielddescr:
-            // addr = base + index * itemsize + (basesize + field.offset).
-            // Wasm skips the GC rewrite, so the GET/SETINTERIORFIELD ops
-            // themselves carry that address, matching cranelift's
-            // emit_scaled_index_addr rather than being rewritten to
-            // GC_LOAD_INDEXED first.
+            // Pre-rewrite interior-field, string and raw-memory ops. The rewriter
+            // consumes these; reaching codegen with one is a producer bug.
             OpCode::GetinteriorfieldGcI
             | OpCode::GetinteriorfieldGcR
-            | OpCode::GetinteriorfieldGcF => {
-                let vi = op.pos().get().raw();
-                if !OpRef::raw_is_constant(vi) {
-                    let field = unpack_interior_field(op);
-                    let base = emit_scaled_index_addr(
-                        &mut sink,
-                        constants,
-                        value_types,
-                        op.arg(0).to_opref(),
-                        op.arg(1).to_opref(),
-                        field.item_size,
-                        field.offset,
-                    );
-                    // The opcode, not the descriptor, names the result's
-                    // register class — it is what the value local was declared
-                    // from — so it picks the load the same way the three
-                    // `Getarrayitem` arms do.
-                    if op.opcode == OpCode::GetinteriorfieldGcF {
-                        emit_float_load(&mut sink, base, field.field_size)?;
-                    } else {
-                        let (size, signed) = field.access_size_sign();
-                        emit_sized_int_load(&mut sink, base, size, signed);
-                    }
-                    sink.local_set(value_types.local(vi));
-                }
+            | OpCode::GetinteriorfieldGcF
+            | OpCode::SetinteriorfieldGc
+            | OpCode::SetinteriorfieldRaw
+            | OpCode::Strlen
+            | OpCode::Unicodelen
+            | OpCode::Strgetitem
+            | OpCode::Unicodegetitem
+            | OpCode::Strsetitem
+            | OpCode::Unicodesetitem
+            | OpCode::Strhash
+            | OpCode::Unicodehash
+            | OpCode::Copystrcontent
+            | OpCode::Copyunicodecontent
+            | OpCode::RawLoadI
+            | OpCode::RawLoadF
+            | OpCode::RawStore
+            | OpCode::GuardAlwaysFails => {
+                return Err(BackendError::Unsupported(format!(
+                    "wasm codegen: {:?} reached codegen without the GC rewrite",
+                    op.opcode
+                )));
             }
-            OpCode::SetinteriorfieldGc if unpack_interior_field(op).is_ptr => {
-                panic!(
-                    "wasm codegen: SetinteriorfieldGc must have been lowered by rewrite_ops_for_gc"
-                );
-            }
-            OpCode::SetinteriorfieldGc | OpCode::SetinteriorfieldRaw => {
-                let field = unpack_interior_field(op);
-                let base = emit_scaled_index_addr(
-                    &mut sink,
-                    constants,
-                    value_types,
-                    op.arg(0).to_opref(),
-                    op.arg(1).to_opref(),
-                    field.item_size,
-                    field.offset,
-                );
-                if field.is_float {
-                    emit_resolve_f64(&mut sink, constants, value_types, op.arg(2).to_opref());
-                    emit_float_store(&mut sink, base, field.field_size)?;
-                } else {
-                    emit_resolve(&mut sink, constants, value_types, op.arg(2).to_opref());
-                    emit_sized_int_store(&mut sink, base, field.access_size_sign().0);
-                }
-            }
-
-            // rewrite.py fills these from `str_descr` / `unicode_descr`.
-            // `inject_builtin_string_descrs` attaches the same ArrayDescr,
-            // so the length word and item stride are the array path.
-            OpCode::Strlen | OpCode::Unicodelen => {
-                let vi = op.pos().get().raw();
-                if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                    sink.i32_wrap_i64();
-                    let (len_offset, len_size) = array_len_layout_from_descr(op);
-                    emit_sized_int_load(&mut sink, len_offset, len_size, false);
-                    sink.local_set(value_types.local(vi));
-                }
-            }
-            OpCode::Strgetitem | OpCode::Unicodegetitem => {
-                let vi = op.pos().get().raw();
-                if !OpRef::raw_is_constant(vi) {
-                    // rewrite.py:299/311: STR `extra_item_after_alloc=1` is
-                    // already in `basesize`; subtract it before the index.
-                    let (base_size, item_size) = op
-                        .with_array_descr(|ad| {
-                            let item_size = ad.item_size() as u64;
-                            let base_size = if item_size == 1 {
-                                ad.base_size() as u64 - 1
-                            } else {
-                                ad.base_size() as u64
-                            };
-                            (base_size, item_size)
-                        })
-                        .unwrap_or_else(|| {
-                            missing_layout_descr("array descr (str/unicodegetitem)", op)
-                        });
-                    let disp = emit_scaled_index_addr(
-                        &mut sink,
-                        constants,
-                        value_types,
-                        op.arg(0).to_opref(),
-                        op.arg(1).to_opref(),
-                        item_size,
-                        base_size,
-                    );
-                    let (access_size, signed) = array_item_access_size_sign(op);
-                    emit_sized_int_load(&mut sink, disp, access_size, signed);
-                    sink.local_set(value_types.local(vi));
-                }
-            }
-
             // ── GC rewrite memory ops ──
             // These descriptor-free forms carry their complete layout in
             // operands. Supporting them here lets wasm consume the same
@@ -7492,30 +7459,6 @@ fn build_function(
                     emit_resolve(&mut sink, constants, value_types, val);
                     emit_sized_int_store(&mut sink, offset, size);
                 }
-            }
-
-            // ── Raw memory access ──
-            OpCode::RawLoadI | OpCode::RawLoadF => {
-                let vi = op.pos().get().raw();
-                if !OpRef::raw_is_constant(vi) {
-                    let offset = emit_raw_addr(&mut sink, constants, value_types, op);
-                    if op.opcode == OpCode::RawLoadF {
-                        sink.f64_load(mem64(offset));
-                    } else {
-                        let (item_size, signed) = array_item_size_sign_from_descr(op);
-                        emit_sized_int_load(&mut sink, offset, item_size, signed);
-                    }
-                    sink.local_set(value_types.local(vi));
-                }
-            }
-            OpCode::RawStore => {
-                let offset = emit_raw_addr(&mut sink, constants, value_types, op);
-                // `emit_resolve` hands back a Float operand as the `i64` its
-                // bits spell, so the width-sized integer store writes the same
-                // eight bytes an `f64.store` would.
-                emit_resolve(&mut sink, constants, value_types, op.arg(2).to_opref());
-                let (item_size, _signed) = array_item_size_sign_from_descr(op);
-                emit_sized_int_store(&mut sink, offset, item_size);
             }
 
             // ── Exception handling ──
@@ -8022,32 +7965,6 @@ fn build_function(
                 );
                 guard_idx += 1;
             }
-            OpCode::GuardAlwaysFails => {
-                // This guard always exits, and what it exits INTO is the
-                // interpreter: it is the cut a segmented trace ends with
-                // (`rewrite.py:419-426` lowers it to `GUARD_VALUE(SAME_AS_I(0),
-                // 1)` for the backends that run the GC rewrite, so those reach
-                // the ordinary GUARD_VALUE path). This backend does not run
-                // that rewrite, so the raw opcode arrives here and has to
-                // publish its own fail args — the resume rebuilds the frame
-                // from them, and an exit that writes none leaves the
-                // interpreter reading whatever the slots last held.
-                emit_guard_exit(
-                    &mut sink,
-                    constants,
-                    value_types,
-                    guard_idx,
-                    op,
-                    block_exit_depth,
-                    guard_dispatch,
-                    // Emitted at statement level: this guard has no passing
-                    // outcome, so no `if` stands between it and the region
-                    // blocks. A loop-closing bridge merges into exactly this
-                    // exit when the owner is a segmented trace's cut.
-                    0,
-                );
-                guard_idx += 1;
-            }
             // `reached_loop_header` mints this op only to donate its
             // `rd_resume_position` to the guards `jump_to_existing_trace` and
             // `inline_short_preamble` stamp; both `optimize_GUARD_FUTURE_CONDITION`
@@ -8149,84 +8066,6 @@ fn build_function(
                     frame,
                 );
             }
-            OpCode::Strsetitem | OpCode::Unicodesetitem => {
-                let descr = op.getdescr().ok_or_else(|| {
-                    BackendError::Unsupported(
-                        "wasm codegen: str/unicodesetitem is missing its ArrayDescr".into(),
-                    )
-                })?;
-                let ad = descr.as_array_descr().ok_or_else(|| {
-                    BackendError::Unsupported(
-                        "wasm codegen: str/unicodesetitem descr is not an ArrayDescr".into(),
-                    )
-                })?;
-                let item_size = ad.item_size() as u64;
-                let base_size = if item_size == 1 {
-                    ad.base_size() as u64 - 1
-                } else {
-                    ad.base_size() as u64
-                };
-                let extra = emit_scaled_index_addr(
-                    &mut sink,
-                    constants,
-                    value_types,
-                    op.arg(0).to_opref(),
-                    op.arg(1).to_opref(),
-                    item_size,
-                    base_size,
-                );
-                emit_resolve(&mut sink, constants, value_types, op.arg(2).to_opref());
-                emit_sized_int_store(&mut sink, extra, ad.item_size());
-            }
-            OpCode::Copystrcontent | OpCode::Copyunicodecontent => {
-                let descr = op.getdescr().ok_or_else(|| {
-                    BackendError::Unsupported(
-                        "wasm codegen: copystr/unicodecontent is missing its ArrayDescr".into(),
-                    )
-                })?;
-                let ad = descr.as_array_descr().ok_or_else(|| {
-                    BackendError::Unsupported(
-                        "wasm codegen: copystr/unicodecontent descr is not an ArrayDescr".into(),
-                    )
-                })?;
-                let item_size = ad.item_size() as u64;
-                let base_size = if item_size == 1 {
-                    ad.base_size() as u64 - 1
-                } else {
-                    ad.base_size() as u64
-                };
-                let dst_extra = emit_scaled_index_addr(
-                    &mut sink,
-                    constants,
-                    value_types,
-                    op.arg(1).to_opref(),
-                    op.arg(3).to_opref(),
-                    item_size,
-                    base_size,
-                );
-                if dst_extra != 0 {
-                    sink.i32_const(dst_extra as i32);
-                    sink.i32_add();
-                }
-                let src_extra = emit_scaled_index_addr(
-                    &mut sink,
-                    constants,
-                    value_types,
-                    op.arg(0).to_opref(),
-                    op.arg(2).to_opref(),
-                    item_size,
-                    base_size,
-                );
-                if src_extra != 0 {
-                    sink.i32_const(src_extra as i32);
-                    sink.i32_add();
-                }
-                emit_resolve(&mut sink, constants, value_types, op.arg(4).to_opref());
-                sink.i32_wrap_i64();
-                emit_scale_index(&mut sink, item_size);
-                sink.memory_copy(0, 0);
-            }
-
             // ── Misc ops ──
             OpCode::NurseryPtrIncrement => {
                 let vi = op.pos().get().raw();
@@ -8239,9 +8078,12 @@ fn build_function(
             }
             // rewrite.py `CALL_MALLOC_NURSERY(ConstInt(size))`: size is the
             // already-rounded header+payload total. Fast path is malloc_cond
-            // (bump, zero the header word, return free+HDR). Slow path is
-            // `wasm_jit_alloc(0, payload)` — tid is written afterwards by
-            // `gen_initialize_tid`.
+            // (bump, write the physical header word, return free+HDR). Slow
+            // path is `wasm_jit_alloc(0, payload)` — a following HALFWORD tid
+            // store keeps old-gen TRACK_YOUNG_PTRS. When that store is the
+            // next op, the fast path writes the tid in the same header store
+            // (flags and padding stay zero) and the HALFWORD store runs only
+            // on this slow arm.
             OpCode::CallMallocNursery => {
                 let vi = op.pos().get().raw();
                 let size_const = const_operand_value(constants, op.arg(0).to_opref());
@@ -8255,6 +8097,17 @@ fn build_function(
                 };
                 let inlined = matches!((nursery, bump_size, payload), (Some(_), Some(_), Some(_)));
                 if let (Some(na), Some(bump_size), Some(payload)) = (nursery, bump_size, payload) {
+                    let header_tid = if !OpRef::raw_is_constant(vi) {
+                        ops.get(op_idx + 1).and_then(|next| {
+                            nursery_header_tid_store(next, op.pos().get(), constants)
+                        })
+                    } else {
+                        None
+                    };
+                    let header_word = header_tid.as_ref().map(|s| s.tid).unwrap_or(0);
+                    if header_tid.is_some() {
+                        skip_nursery_tid_store_at = Some(op_idx + 1);
+                    }
                     sink.i32_const(na.free_addr as i32);
                     sink.i32_load(MemArg {
                         offset: 0,
@@ -8292,6 +8145,20 @@ fn build_function(
                         (!OpRef::raw_is_constant(vi)).then_some(vi),
                         frame,
                     );
+                    if let Some(tid_store) = header_tid {
+                        sink.local_tee(value_types.local(vi));
+                        sink.i64_eqz();
+                        sink.if_(BlockType::Empty);
+                        sink.else_();
+                        emit_resolve(&mut sink, constants, value_types, op.pos().get());
+                        sink.i32_wrap_i64();
+                        sink.i32_const(tid_store.offset as i32);
+                        sink.i32_add();
+                        sink.i64_const(tid_store.tid);
+                        emit_sized_int_store(&mut sink, 0, tid_store.width);
+                        sink.end();
+                        sink.local_get(value_types.local(vi));
+                    }
                     sink.else_();
                     sink.i32_const(na.free_addr as i32);
                     sink.local_get(alloc_size_local);
@@ -8300,9 +8167,11 @@ fn build_function(
                         align: 2,
                         memory_index: 0,
                     });
-                    // Fast path clears the header word; rewrite then stores tid.
+                    // Physical header word. Tid is the low half when the
+                    // following HALFWORD store was folded in; otherwise zero.
+                    // Payload stays dirty (`malloc_zero_filled = False`).
                     sink.local_get(alloc_scratch_local);
-                    sink.i64_const(0);
+                    sink.i64_const(header_word);
                     sink.i64_store(MemArg {
                         offset: 0,
                         align: 3,
@@ -8357,8 +8226,8 @@ fn build_function(
                         frame,
                     );
                 }
-                // Same spill as `New*`: `wasm_jit_alloc` can return old-gen
-                // when the nursery cannot hold the request.
+                // `wasm_jit_alloc` can return old-gen when the nursery cannot
+                // hold the request.
             }
             OpCode::CallMallocNurseryHeaderless => {
                 let vi = op.pos().get().raw();
@@ -8579,6 +8448,8 @@ fn build_function(
                         align: 2,
                         memory_index: 0,
                     });
+                    // Header word only: `CallMallocNurseryVarsizeFrame`
+                    // `mov QWORD [rcx], 0`. Payload stays dirty.
                     sink.local_get(alloc_scratch_local);
                     sink.i64_const(0);
                     sink.i64_store(MemArg {
@@ -8639,10 +8510,8 @@ fn build_function(
                 // hold the frame.
             }
             // `GcRewriterImpl::_gen_call_malloc_gc` emits this after a residual
-            // malloc. Use the same propagate-exception exit as the wasm
-            // backend's inline `New*` lowering. This is especially important
-            // on wasm: address zero is valid linear memory, so merely omitting
-            // the check would turn OOM into silent heap corruption.
+            // malloc. Address zero is valid linear memory, so omitting the
+            // check would turn OOM into silent heap corruption.
             OpCode::CheckMemoryError => {
                 emit_memory_error_check(
                     &mut sink,
@@ -9265,31 +9134,56 @@ fn build_function(
                             .map(|type_idx| (sig, type_idx))
                     })
                 {
-                    // Direct in-module typed residual call with the
-                    // descr-derived mixed `(i64/f64...) -> i64/f64` signature.
-                    let (params, _) = &sig;
+                    // Direct in-module typed residual call: descr-derived
+                    // mixed `(i64/f64…) -> i64/f64`, or the oracle's i32-ABI
+                    // twin (`i32.wrap_i64` / `i64.extend_i32_u`).
+                    let (params, result_ty) = &sig;
                     let call_args = &op.getarglist()[func_ofs + 1..];
                     debug_assert_eq!(call_args.len(), params.len());
                     for (arg, ty) in call_args.iter().zip(params) {
-                        if *ty == ValType::F64 {
-                            emit_resolve_f64(&mut sink, constants, value_types, arg.to_opref());
-                        } else {
-                            emit_resolve(&mut sink, constants, value_types, arg.to_opref());
+                        match *ty {
+                            ValType::F64 => {
+                                emit_resolve_f64(&mut sink, constants, value_types, arg.to_opref());
+                            }
+                            ValType::I32 => {
+                                emit_resolve(&mut sink, constants, value_types, arg.to_opref());
+                                sink.i32_wrap_i64();
+                            }
+                            _ => {
+                                emit_resolve(&mut sink, constants, value_types, arg.to_opref());
+                            }
                         }
                     }
                     // func_ptr (arg 0) is the table slot — wrap to i32 index.
                     emit_resolve(&mut sink, constants, value_types, func_ptr_ref);
                     sink.i32_wrap_i64();
                     sink.call_indirect(0, type_idx);
+                    let is_void_op = matches!(
+                        op.opcode,
+                        OpCode::CallN
+                            | OpCode::CallPureN
+                            | OpCode::CallMayForceN
+                            | OpCode::CallAssemblerN
+                            | OpCode::CallReleaseGilN
+                            | OpCode::CallLoopinvariantN
+                    );
                     // A void callee leaves nothing on the stack, so there is
                     // neither a local to home it in nor a value to drop.
-                    let homed = if sig.1.is_none() {
+                    // i32 results zero-extend, matching the host trampoline's
+                    // `(*v as u32) as i64`.
+                    let homed = if result_ty.is_none() {
+                        None
+                    } else if is_void_op {
+                        sink.drop();
                         None
                     } else if !OpRef::raw_is_constant(vi) {
+                        if *result_ty == Some(ValType::I32) {
+                            sink.i64_extend_i32_u();
+                        }
                         sink.local_set(value_types.local(vi));
                         Some(vi)
                     } else {
-                        sink.drop(); // value-producing call whose result is unused
+                        sink.drop();
                         None
                     };
                     if can_collect {
@@ -9414,7 +9308,6 @@ fn build_function(
                     op.opcode
                 );
             }
-
             // ── Misc ──
             OpCode::ForceToken => {
                 let vi = op.pos().get().raw();
@@ -10378,34 +10271,6 @@ fn const_operand_value(constants: &indexmap::IndexMap<u32, i64>, opref: OpRef) -
         .then(|| resolve_const_bits(constants, opref))
 }
 
-/// Extract field offset from op's descr (FieldDescr).
-fn field_offset_from_descr(op: &Op) -> u64 {
-    let __descr_arc_descr = op.getdescr();
-    if let Some(descr) = __descr_arc_descr.as_ref()
-        && let Some(fd) = descr.as_field_descr()
-    {
-        return fd.offset() as u64;
-    }
-    missing_layout_descr("field descr (offset)", op)
-}
-
-/// `(length-field offset, length-field size)` from an op's ArrayDescr length
-/// descriptor, mirroring `bh_arraylen_gc`, which reads the length at
-/// `len_descr().offset()` at machine-word width. The offset is taken from the
-/// registered descr (not hardcoded) so it tracks the real per-target layout,
-/// and the size lets the caller load at the field's true width — a word-sized
-/// length is 4 bytes on wasm32, so a fixed 8-byte read would pull the adjacent
-/// field into the high half. Falls back to the conventional offset / word
-/// width when no length descr is registered.
-fn array_len_layout_from_descr(op: &Op) -> (u64, usize) {
-    op.with_array_descr(|ad| {
-        ad.len_descr()
-            .map(|ld| (ld.offset() as u64, ld.field_size()))
-    })
-    .flatten()
-    .unwrap_or_else(|| missing_layout_descr("array descr (len layout)", op))
-}
-
 /// `llsupport/regalloc.py valid_addressing_size`: the scales x86 SIB (and a
 /// wasm `i32.shl`) can form without a multiply.
 fn valid_addressing_size(size: u64) -> bool {
@@ -10512,8 +10377,7 @@ fn emit_array_addr(
 const GUEST_PTR_SIZE: usize = 4;
 
 /// The width an access to one array item moves, and how a read of it extends.
-/// The array twin of [`InteriorFieldLayout::access_size`]; every
-/// `GETARRAYITEM` / `SETARRAYITEM` arm reads it from here.
+/// Every remaining `GETARRAYITEM_RAW_R` arm reads it from here.
 ///
 /// The address stride still comes from the descriptor's own `item_size`
 /// (`emit_array_addr`), which is what the allocation laid the array out with.
@@ -10526,53 +10390,6 @@ fn array_item_access_size_sign(op: &Op) -> (usize, bool) {
         }
     })
     .unwrap_or_else(|| missing_layout_descr("array descr (item size/sign)", op))
-}
-
-/// `descr.py unpack_interiorfielddescr`: `ofs = basesize + field.offset`,
-/// plus the element stride and the field's own width / signedness / kind.
-struct InteriorFieldLayout {
-    /// `basesize + field.offset`, the displacement past the scaled index.
-    offset: u64,
-    /// The array's element stride.
-    item_size: u64,
-    /// The field's own width, and how a read of it extends.
-    field_size: usize,
-    signed: bool,
-    is_float: bool,
-    is_ptr: bool,
-}
-
-impl InteriorFieldLayout {
-    /// The width an access to this field moves, and how a read of it extends.
-    /// A pointer is guest-pointer-wide and never extends as signed, whatever
-    /// the descriptor says; every reading and writing arm takes both from here
-    /// so the two cannot drift apart.
-    fn access_size_sign(&self) -> (usize, bool) {
-        if self.is_ptr {
-            (GUEST_PTR_SIZE, false)
-        } else {
-            (self.field_size, self.signed)
-        }
-    }
-}
-
-fn unpack_interior_field(op: &Op) -> InteriorFieldLayout {
-    let descr = op
-        .getdescr()
-        .unwrap_or_else(|| missing_layout_descr("interior-field descr", op));
-    let ifd = descr
-        .as_interior_field_descr()
-        .unwrap_or_else(|| missing_layout_descr("interior-field descr", op));
-    let ad = ifd.array_descr();
-    let fd = ifd.field_descr();
-    InteriorFieldLayout {
-        offset: (ad.base_size() + fd.offset()) as u64,
-        item_size: ad.item_size() as u64,
-        field_size: fd.field_size(),
-        signed: fd.is_field_signed(),
-        is_float: fd.is_float_field(),
-        is_ptr: fd.is_pointer_field(),
-    }
 }
 
 // ── Guard emission helpers ──
@@ -11302,10 +11119,8 @@ fn exit_fail_args(op: &Op) -> Vec<OpRef> {
 
 /// x86/assembler.py `genop_discard_check_memory_error`: the NULL test
 /// `rewrite.py` `_gen_call_malloc_gc` attaches to every collecting malloc.
-/// wasm lowers `New` / `NewArray` itself in place of the GC rewrite, so it owes
-/// itself the same check — address 0 is ordinary linear memory here, so the
-/// vtable, class-word and item stores that follow an allocation would corrupt
-/// it silently rather than fault.
+/// Address 0 is ordinary linear memory here, so stores that follow an
+/// allocation would corrupt it silently rather than fault.
 ///
 /// The failing arm is `_build_propagate_exception_path` in this backend's exit
 /// spelling. `_store_and_reset_exception` moves the `MemoryError` the
@@ -12423,4 +12238,107 @@ mod tests {
             }
         }
     }
+}
+
+/// `(field_size, is_signed)` from an op's FieldDescr. A field op always carries
+/// a FieldDescr; a missing one is an invariant violation, so panic rather than
+/// emit a silently-wrong width.
+fn field_size_sign_from_descr(op: &Op) -> (usize, bool) {
+    let descr = op.getdescr();
+    if let Some(fd) = descr.as_ref().and_then(|d| d.as_field_descr()) {
+        return (fd.field_size(), fd.is_field_signed());
+    }
+    missing_layout_descr("field descr (size/sign)", op)
+}
+
+/// Store width for a `SetfieldGc`/`SetfieldRaw`. A pointer (`Type::Ref`) field
+/// is stored at machine-word width regardless of the descr's recorded size: a
+/// pointer is 4 bytes on wasm32, so a fixed 8-byte store would clobber the
+/// adjacent field. There is no `SetfieldGcR` opcode, so the field type is the
+/// only signal — mirroring the `GetfieldGcR` read, which always loads pointers
+/// at i32 width. Non-pointer fields use the descr's true field width.
+fn setfield_store_size_from_descr(op: &Op) -> usize {
+    let descr = op.getdescr();
+    if let Some(fd) = descr.as_ref().and_then(|d| d.as_field_descr()) {
+        if fd.is_pointer_field() {
+            return std::mem::size_of::<usize>();
+        }
+        return fd.field_size();
+    }
+    missing_layout_descr("field descr (store size)", op)
+}
+
+fn field_is_float_from_descr(op: &Op) -> bool {
+    let descr = op.getdescr();
+    match descr.as_ref().and_then(|d| d.as_field_descr()) {
+        Some(fd) => fd.is_float_field(),
+        None => missing_layout_descr("field descr (is_float)", op),
+    }
+}
+
+fn emit_float_load(
+    sink: &mut PeepSink<'_, '_>,
+    offset: u64,
+    size: usize,
+) -> Result<(), BackendError> {
+    match size {
+        4 => {
+            sink.f32_load(mem32(offset));
+            sink.f64_promote_f32();
+        }
+        8 => {
+            sink.f64_load(mem64(offset));
+        }
+        other => {
+            return Err(BackendError::Unsupported(format!(
+                "wasm codegen: float load has size {other}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn array_item_is_float_from_descr(op: &Op) -> bool {
+    op.with_array_descr(|ad| ad.item_type() == Type::Float)
+        .unwrap_or_else(|| missing_layout_descr("array descr (item is_float)", op))
+}
+
+/// Argument index of the stored value for a GC ref-storing op. `SetfieldRaw` /
+/// `SetarrayitemRaw` store into non-GC memory and never need a write barrier,
+/// so only the `*Gc` variants are listed (rewrite.py only routes `SETFIELD_GC`
+/// / `SETARRAYITEM_GC` / `SETINTERIORFIELD_GC` through the barrier).
+fn ref_store_value_arg(op: &Op) -> Option<usize> {
+    match op.opcode {
+        OpCode::SetfieldGc => Some(1),
+        OpCode::SetarrayitemGc | OpCode::SetinteriorfieldGc => Some(2),
+        _ => None,
+    }
+}
+
+/// Extract field offset from op's descr (FieldDescr).
+fn field_offset_from_descr(op: &Op) -> u64 {
+    let __descr_arc_descr = op.getdescr();
+    if let Some(descr) = __descr_arc_descr.as_ref()
+        && let Some(fd) = descr.as_field_descr()
+    {
+        return fd.offset() as u64;
+    }
+    missing_layout_descr("field descr (offset)", op)
+}
+
+/// `(length-field offset, length-field size)` from an op's ArrayDescr length
+/// descriptor, mirroring `bh_arraylen_gc`, which reads the length at
+/// `len_descr().offset()` at machine-word width. The offset is taken from the
+/// registered descr (not hardcoded) so it tracks the real per-target layout,
+/// and the size lets the caller load at the field's true width — a word-sized
+/// length is 4 bytes on wasm32, so a fixed 8-byte read would pull the adjacent
+/// field into the high half. Falls back to the conventional offset / word
+/// width when no length descr is registered.
+fn array_len_layout_from_descr(op: &Op) -> (u64, usize) {
+    op.with_array_descr(|ad| {
+        ad.len_descr()
+            .map(|ld| (ld.offset() as u64, ld.field_size()))
+    })
+    .flatten()
+    .unwrap_or_else(|| missing_layout_descr("array descr (len layout)", op))
 }

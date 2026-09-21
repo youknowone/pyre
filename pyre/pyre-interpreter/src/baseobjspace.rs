@@ -7100,7 +7100,11 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
                             Err(err) => Err(err),
                         };
                     }
-                    return object_getattr_miss(obj, name, call_getattr);
+                    return object_getattr_miss(
+                        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                        name,
+                        call_getattr,
+                    );
                 }
                 let _name_roots = pyre_object::gc_roots::push_roots();
                 let name_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -7270,6 +7274,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
     // final say — matches `slot_tp_getattr_hook`: a class-level `__getattr__`'s
     // own AttributeError must reach the caller rather than be overwritten by the
     // generic module-miss message.
+    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     if call_getattr && unsafe { is_module(obj) } {
         let err = match object_getattr_miss(obj, name, false) {
             Ok(value) => return Ok(value),
@@ -7281,6 +7286,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
         return unsafe { module_getattr_fallback(obj, name, err, suppress) };
     }
 
+    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     let err = match object_getattr_miss(obj, name, call_getattr) {
         Ok(value) => return Ok(value),
         Err(e) => e,
@@ -8303,15 +8309,28 @@ unsafe fn instance_getattr_hook_or_err(
     w_type: PyObjectRef,
     obj: PyObjectRef,
     name: &str,
-    e: crate::PyError,
+    mut e: crate::PyError,
 ) -> PyResult {
     unsafe {
-        if let Some(getattr_fn) = lookup_in_type_where(w_type, "__getattr__") {
-            let _name_roots = pyre_object::gc_roots::push_roots();
-            let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(obj);
-            let type_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(w_type);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let live = pyre_object::gc_roots::pin_roots(&[w_type, obj]);
+        let name_ctx_slot = if !e.w_name_context.is_null() {
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(e.w_name_context);
+            Some(slot)
+        } else {
+            None
+        };
+        let obj_ctx_slot = if !e.w_obj_context.is_null() {
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(e.w_obj_context);
+            Some(slot)
+        } else {
+            None
+        };
+        if let Some(getattr_fn) =
+            lookup_in_type_where(pyre_object::gc_roots::shadow_stack_get(live), "__getattr__")
+        {
             let hook_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(getattr_fn);
             let name_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -8324,10 +8343,16 @@ unsafe fn instance_getattr_hook_or_err(
             // and read back after it.
             return get_and_call_function(
                 pyre_object::gc_roots::shadow_stack_get(hook_slot),
-                pyre_object::gc_roots::shadow_stack_get(obj_slot),
-                pyre_object::gc_roots::shadow_stack_get(type_slot),
+                pyre_object::gc_roots::shadow_stack_get(live + 1),
+                pyre_object::gc_roots::shadow_stack_get(live),
                 &[pyre_object::gc_roots::shadow_stack_get(name_slot)],
             );
+        }
+        if let Some(slot) = name_ctx_slot {
+            e.w_name_context = pyre_object::gc_roots::shadow_stack_get(slot);
+        }
+        if let Some(slot) = obj_ctx_slot {
+            e.w_obj_context = pyre_object::gc_roots::shadow_stack_get(slot);
         }
     }
     Err(e)
@@ -8343,19 +8368,35 @@ unsafe fn type_getattr_hook_or_err(
     obj: PyObjectRef,
     w_metaclasses: &[Option<PyObjectRef>; 2],
     name: &str,
-    e: crate::PyError,
+    mut e: crate::PyError,
     call_getattr: bool,
 ) -> PyResult {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let mc_vals: Vec<PyObjectRef> = w_metaclasses.iter().copied().flatten().collect();
+    let mc_base = pyre_object::gc_roots::pin_roots(&mc_vals);
+    let name_ctx_slot = if !e.w_name_context.is_null() {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(e.w_name_context);
+        Some(slot)
+    } else {
+        None
+    };
+    let obj_ctx_slot = if !e.w_obj_context.is_null() {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(e.w_obj_context);
+        Some(slot)
+    } else {
+        None
+    };
     if call_getattr && e.kind == PyErrorKind::AttributeError {
-        for w_metaclass in w_metaclasses.iter().flatten() {
-            let w_metaclass = *w_metaclass;
+        for i in 0..mc_vals.len() {
+            let w_metaclass = pyre_object::gc_roots::shadow_stack_get(mc_base + i);
             if unsafe { is_type(w_metaclass) }
                 && let Some(getattr_fn) =
                     unsafe { lookup_in_type_where(w_metaclass, "__getattr__") }
             {
-                let _name_roots = pyre_object::gc_roots::push_roots();
-                let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(obj);
                 let meta_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ = pyre_object::gc_roots::pin_root(w_metaclass);
                 let hook_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -8372,6 +8413,12 @@ unsafe fn type_getattr_hook_or_err(
                 };
             }
         }
+    }
+    if let Some(slot) = name_ctx_slot {
+        e.w_name_context = pyre_object::gc_roots::shadow_stack_get(slot);
+    }
+    if let Some(slot) = obj_ctx_slot {
+        e.w_obj_context = pyre_object::gc_roots::shadow_stack_get(slot);
     }
     Err(e)
 }
@@ -20133,26 +20180,56 @@ unsafe fn generator_invoke_execute_frame(
     prompt_finalization: bool,
 ) -> PyResult {
     use pyre_object::generator::*;
-    if w_generator_is_running(gen_obj) {
+    // `execute_generator_frame` runs application code and therefore
+    // collects. `gen_obj`, the frame, and the resume value are Rust
+    // locals / a `&mut PyFrame` the precise walker does not see; pin
+    // them and reload after the call. `pop_gen_or_coroutine` compares
+    // its argument with `current_gen_or_coroutine`, which the collector
+    // forwards in place.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let gen_null = gen_obj.is_null();
+    let gen_slot = pyre_object::gc_roots::shadow_stack_len();
+    if !gen_null {
+        let _ = pyre_object::gc_roots::pin_root(gen_obj);
+    }
+    let live_gen = || {
+        if gen_null {
+            gen_obj
+        } else {
+            pyre_object::gc_roots::shadow_stack_get(gen_slot)
+        }
+    };
+    let input_slot = w_inputvalue.and_then(|v| {
+        if v.is_null() {
+            None
+        } else {
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(v);
+            Some(slot)
+        }
+    });
+    let frame_anchor = crate::eval::FrameAnchor::new(frame);
+    if w_generator_is_running(live_gen()) {
         // generator.py:112 `"%s already executing" % self.KIND`.
         return Err(PyError::value_error(format!(
             "{} already executing",
-            generator_kind(gen_obj)
+            generator_kind(live_gen())
         )));
     }
-    w_generator_set_running(gen_obj, true);
+    w_generator_set_running(live_gen(), true);
     let ec = crate::call::getexecutioncontext() as *mut crate::executioncontext::ExecutionContext;
     if !ec.is_null() {
-        (*ec).push_gen_or_coroutine(gen_obj);
+        (*ec).push_gen_or_coroutine(live_gen());
     }
     // generator.py:_invoke_execute_frame uses the execution context of the
     // thread resuming the generator.  Like PyPy, the suspended frame stores no
     // EC of its own; `execute_generator_frame` reads the thread-owned slot at
     // this activation boundary.
-    let result = frame.execute_generator_frame(w_inputvalue, operr, throw_args);
+    let w_inputvalue = input_slot.map(pyre_object::gc_roots::shadow_stack_get);
+    let result = (*frame_anchor.live()).execute_generator_frame(w_inputvalue, operr, throw_args);
     let result = match result {
         Err(e) => {
-            generator_frame_is_finished(gen_obj, frame, prompt_finalization);
+            generator_frame_is_finished(live_gen(), &mut *frame_anchor.live(), prompt_finalization);
             // generator.py `_leak_stopiteration` and
             // `_leak_stopasynciteration`, which differ only in the name they
             // format after KIND.  The second is reachable on async generators
@@ -20162,14 +20239,14 @@ unsafe fn generator_invoke_execute_frame(
             // does and a flat `PyErrorKind` comparison would miss it.
             let leaked = if e.matches_stop_iteration() {
                 Some("StopIteration")
-            } else if is_async_generator(gen_obj) && e.matches_stop_async_iteration() {
+            } else if is_async_generator(live_gen()) && e.matches_stop_async_iteration() {
                 Some("StopAsyncIteration")
             } else {
                 None
             };
             match leaked {
                 Some(leaked) => {
-                    let message = format!("{} raised {leaked}", generator_kind(gen_obj));
+                    let message = format!("{} raised {leaked}", generator_kind(live_gen()));
                     Err(leak_generator_iteration(e, &message))
                 }
                 None => Err(e),
@@ -20178,10 +20255,10 @@ unsafe fn generator_invoke_execute_frame(
         result => result,
     };
     // generator.py:142-145 `finally`.
-    frame.f_backref = std::ptr::null_mut();
-    w_generator_set_running(gen_obj, false);
+    (*frame_anchor.live()).f_backref = std::ptr::null_mut();
+    w_generator_set_running(live_gen(), false);
     if !ec.is_null() {
-        (*ec).pop_gen_or_coroutine(gen_obj);
+        (*ec).pop_gen_or_coroutine(live_gen());
     }
     result
 }
@@ -20198,21 +20275,54 @@ fn generator_send_ex(
     closing: bool,
 ) -> PyResult {
     use pyre_object::generator::*;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let gen_null = gen_obj.is_null();
+    let gen_slot = pyre_object::gc_roots::shadow_stack_len();
+    if !gen_null {
+        let _ = pyre_object::gc_roots::pin_root(gen_obj);
+    }
+    let arg_null = w_arg.is_null();
+    let arg_slot = pyre_object::gc_roots::shadow_stack_len();
+    if !arg_null {
+        let _ = pyre_object::gc_roots::pin_root(w_arg);
+    }
+    let live_gen = || {
+        if gen_null {
+            gen_obj
+        } else {
+            pyre_object::gc_roots::shadow_stack_get(gen_slot)
+        }
+    };
+    let live_arg = || {
+        if arg_null {
+            w_arg
+        } else {
+            pyre_object::gc_roots::shadow_stack_get(arg_slot)
+        }
+    };
     unsafe {
         // `generator.py send_ex`: when already in a trace and the body
         // has two or more yields, hit `generatorentry_driver` instead of
         // inlining `_send_ex`. Single-yield bodies fall through and
         // look inside (`should_not_inline` is false).
-        let pycode = w_generator_get_pycode(gen_obj);
+        let pycode = w_generator_get_pycode(live_gen());
         if !pycode.is_null() {
-            let raw = crate::pycode::w_code_get_ptr(pycode) as *const crate::CodeObject;
+            let pycode_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(pycode);
+            let raw =
+                crate::pycode::w_code_get_ptr(pyre_object::gc_roots::shadow_stack_get(pycode_slot))
+                    as *const crate::CodeObject;
             if !raw.is_null() && majit_metainterp::jit::we_are_jitted() && should_not_inline(&*raw)
             {
-                generatorentry_driver.jit_merge_point(gen_obj, w_arg, pycode);
+                generatorentry_driver.jit_merge_point(
+                    live_gen(),
+                    live_arg(),
+                    pyre_object::gc_roots::shadow_stack_get(pycode_slot),
+                );
             }
         }
     }
-    generator_send_ex_body(gen_obj, w_arg, operr, throw_args, closing)
+    generator_send_ex_body(live_gen(), live_arg(), operr, throw_args, closing)
 }
 
 /// `generator.py` `_send_ex`.
@@ -20225,8 +20335,33 @@ fn generator_send_ex_body(
 ) -> PyResult {
     use pyre_object::generator::*;
     unsafe {
-        if w_generator_is_exhausted(gen_obj) {
-            if is_coroutine(gen_obj) && !closing {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let gen_null = gen_obj.is_null();
+        let gen_slot = pyre_object::gc_roots::shadow_stack_len();
+        if !gen_null {
+            let _ = pyre_object::gc_roots::pin_root(gen_obj);
+        }
+        let arg_null = w_arg.is_null();
+        let arg_slot = pyre_object::gc_roots::shadow_stack_len();
+        if !arg_null {
+            let _ = pyre_object::gc_roots::pin_root(w_arg);
+        }
+        let live_gen = || {
+            if gen_null {
+                gen_obj
+            } else {
+                pyre_object::gc_roots::shadow_stack_get(gen_slot)
+            }
+        };
+        let live_arg = || {
+            if arg_null {
+                w_arg
+            } else {
+                pyre_object::gc_roots::shadow_stack_get(arg_slot)
+            }
+        };
+        if w_generator_is_exhausted(live_gen()) {
+            if is_coroutine(live_gen()) && !closing {
                 return Err(PyError::runtime_error(
                     "cannot reuse already awaited coroutine",
                 ));
@@ -20234,17 +20369,17 @@ fn generator_send_ex_body(
             if let Some(err) = operr {
                 return Err(err);
             }
-            return Err(if is_async_generator(gen_obj) {
+            return Err(if is_async_generator(live_gen()) {
                 PyError::stop_async_iteration()
             } else {
                 PyError::stop_iteration()
             });
         }
 
-        let frame_ptr = w_generator_get_frame(gen_obj) as *mut crate::pyframe::PyFrame;
+        let frame_ptr = w_generator_get_frame(live_gen()) as *mut crate::pyframe::PyFrame;
         if frame_ptr.is_null() {
-            w_generator_set_exhausted(gen_obj);
-            if is_coroutine(gen_obj) && !closing {
+            w_generator_set_exhausted(live_gen());
+            if is_coroutine(live_gen()) && !closing {
                 return Err(PyError::runtime_error(
                     "cannot reuse already awaited coroutine",
                 ));
@@ -20252,24 +20387,24 @@ fn generator_send_ex_body(
             if let Some(err) = operr {
                 return Err(err);
             }
-            return Err(if is_async_generator(gen_obj) {
+            return Err(if is_async_generator(live_gen()) {
                 PyError::stop_async_iteration()
             } else {
                 PyError::stop_iteration()
             });
         }
-        let frame = &mut *frame_ptr;
-        let already_started = w_generator_is_started(gen_obj);
+        let frame_anchor = crate::eval::FrameAnchor::from_raw(frame_ptr);
+        let already_started = w_generator_is_started(live_gen());
 
-        if !already_started && operr.is_none() && !w_arg.is_null() && !is_none(w_arg) {
+        if !already_started && operr.is_none() && !live_arg().is_null() && !is_none(live_arg()) {
             return Err(PyError::type_error(format!(
                 "can't send non-None value to a just-started {}",
-                generator_kind(gen_obj)
+                generator_kind(live_gen())
             )));
         }
         if !already_started
-            && is_coroutine(gen_obj)
-            && !crate::pycode::w_code_yields_inside_try(w_generator_get_pycode(gen_obj))
+            && is_coroutine(live_gen())
+            && !crate::pycode::w_code_yields_inside_try(w_generator_get_pycode(live_gen()))
         {
             // generator.py `_invoke_execute_frame`: "after we've started a
             // Coroutine without CO_YIELD_INSIDE_TRY, then
@@ -20284,39 +20419,55 @@ fn generator_send_ex_body(
             // never-awaited warning for it — 3.14 emits it, and
             // `extra_tests/snippets/coroutine_never_awaited_survives_a_send_typeerror.py`
             // pins that.
-            crate::executioncontext::may_ignore_finalizer(gen_obj);
+            crate::executioncontext::may_ignore_finalizer(live_gen());
         }
-        w_generator_set_started(gen_obj);
+        w_generator_set_started(live_gen());
         // generator.py `_invoke_execute_frame` delegates the complete
         // resume to `frame.execute_frame(w_arg_or_err)`.  In particular,
         // `PyFrame.resume_execute_frame` handles `w_yielding_from` only after
         // the outer frame has entered the execution context.
-        let w_inputvalue = if already_started && operr.is_none() && !w_arg.is_null() {
-            Some(w_arg)
+        let w_inputvalue = if already_started && operr.is_none() && !live_arg().is_null() {
+            Some(live_arg())
         } else {
             None
         };
         match generator_invoke_execute_frame(
-            gen_obj,
-            frame,
+            live_gen(),
+            &mut *frame_anchor.live(),
             w_inputvalue,
             operr,
             throw_args,
             closing,
         ) {
             Ok(value) => {
+                // The resume result is a GC ref in a Rust local.
+                // `generator_frame_is_finished` clears the frame and can
+                // collect; pin before that walk and reload for the
+                // StopIteration constructor / yield return.
+                let value_null = value.is_null();
+                let value_slot = pyre_object::gc_roots::shadow_stack_len();
+                if !value_null {
+                    let _ = pyre_object::gc_roots::pin_root(value);
+                }
+                let live_value = || {
+                    if value_null {
+                        value
+                    } else {
+                        pyre_object::gc_roots::shadow_stack_get(value_slot)
+                    }
+                };
                 // generator.py:109-114 — if the frame marked itself finished,
                 // it was RETURNed from; otherwise it YIELDed.
-                if frame.frame_finished_execution() {
-                    generator_frame_is_finished(gen_obj, frame, closing);
-                    if is_async_generator(gen_obj) {
+                if (*frame_anchor.live()).frame_finished_execution() {
+                    generator_frame_is_finished(live_gen(), &mut *frame_anchor.live(), closing);
+                    if is_async_generator(live_gen()) {
                         return Err(PyError::stop_async_iteration());
                     }
                     // generator.py:117-119 / pyopcode.py RETURN_VALUE in
                     // generator frames — `raise StopIteration(returnvalue)`.
-                    Err(stop_iteration_with_value(value))
+                    Err(stop_iteration_with_value(live_value()))
                 } else {
-                    Ok(value)
+                    Ok(live_value())
                 }
             }
             Err(e) => Err(e),
@@ -20463,17 +20614,33 @@ fn finish_yield_from(frame: &mut crate::pyframe::PyFrame, err: PyError) -> Resul
 /// `StopIteration()`.
 fn stop_iteration_with_value(value: PyObjectRef) -> PyError {
     use pyre_object::interp_exceptions::*;
-    let exc = w_exception_new(ExcKind::StopIteration, "");
+    // `value` is the generator's return object and lives only in this
+    // argument. `w_exception_new` / `w_exception_args_new` collect, and
+    // the empty-message constructor does not pin `exc` across the args
+    // list the way the non-empty path does.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let value_null = value.is_null();
+    let value_slot = pyre_object::gc_roots::shadow_stack_len();
+    if !value_null {
+        let _ = pyre_object::gc_roots::pin_root(value);
+    }
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_exception_new(ExcKind::StopIteration, ""));
+    let value = if value_null {
+        value
+    } else {
+        pyre_object::gc_roots::shadow_stack_get(value_slot)
+    };
     if !value.is_null() && unsafe { !is_none(value) } {
         // `interp_exceptions.py W_BaseException.descr_init`
         // stores `args_w` as a list; pyre matches the shape so that
         // `e.args` materialises a fresh tuple each read.
         let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![value]);
         unsafe {
-            w_exception_set_args(exc, args_list);
+            w_exception_set_args(pyre_object::gc_roots::shadow_stack_get(exc_slot), args_list);
         }
     }
-    unsafe { PyError::from_exc_object(exc) }
+    unsafe { PyError::from_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot)) }
 }
 
 /// generator.py:326 / :399 / :643 `KIND` — the class attribute every generator
@@ -22931,6 +23098,23 @@ mod tests {
         crate::typedef::init_typeobjects();
         let s = object_functionstr(w_int_new(42)).expect("scalar fallback never propagates async");
         assert_eq!(s.as_str(), Ok("42"));
+    }
+
+    #[test]
+    fn stop_iteration_with_value_keeps_the_return_object_through_materialisation() {
+        crate::typedef::init_typeobjects();
+        crate::test_hooks::install_hash_hook();
+        let value = pyre_object::w_list_new(vec![w_int_new(7)]);
+        let mut err = stop_iteration_with_value(value);
+        let exc = err.to_exc_object();
+        assert!(!exc.is_null());
+        let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(exc) };
+        assert_eq!(unsafe { pyre_object::tupleobject::w_tuple_len(args) }, 1);
+        let stored = unsafe { pyre_object::tupleobject::w_tuple_getitem(args, 0) }
+            .expect("StopIteration.args[0]");
+        assert_eq!(unsafe { pyre_object::w_list_len(stored) }, 1);
+        let inner = unsafe { pyre_object::w_list_getitem(stored, 0) }.expect("returned list[0]");
+        assert_eq!(unsafe { w_int_get_value(inner) }, 7);
     }
 }
 

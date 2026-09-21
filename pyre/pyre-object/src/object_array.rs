@@ -619,10 +619,7 @@ pub unsafe fn alloc_list_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBlo
     let len = values.len();
     let cap = len.max(1);
     let _roots = crate::gc_roots::push_roots();
-    let save = crate::gc_roots::shadow_stack_len();
-    for &v in values {
-        let _ = crate::gc_roots::pin_root(v);
-    }
+    let save = crate::gc_roots::pin_roots(values);
     let block_slot = crate::gc_roots::shadow_stack_len();
     let block = unsafe { alloc_items_block_gc(cap) };
     // `alloc_items_block_gc` returns a fresh GCREF.  RPython's

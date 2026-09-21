@@ -5049,6 +5049,7 @@ mod tests {
                 .expect("inline ConstInt"),
             2
         ); // second type_id
+        let half = std::mem::size_of::<usize>() / 2;
         assert_eq!(
             tid_stores[1]
                 .arg(1)
@@ -5065,6 +5066,45 @@ mod tests {
                 .expect("inline ConstInt"),
             0
         );
+        assert_eq!(
+            tid_stores[1]
+                .arg(3)
+                .to_opref()
+                .inline_const_bits()
+                .expect("inline ConstInt"),
+            half as i64
+        );
+    }
+
+    #[test]
+    fn test_npi_flags_store_matches_flag_shift() {
+        let rw = make_rewriter();
+        let ops = vec![
+            Op::with_descr(OpCode::New, &[], size_descr(24, 1)),
+            Op::with_descr(OpCode::New, &[], size_descr(32, 2)),
+        ];
+        let (result, _, _) = rw.rewrite_ops_with_constants(&ops, &ConstMap::default());
+        let incr_idx = result
+            .iter()
+            .position(|o| o.opcode == OpCode::NurseryPtrIncrement)
+            .expect("batched New emits NurseryPtrIncrement");
+        let flags = &result[incr_idx + 1];
+        assert_eq!(flags.opcode, OpCode::GcStore);
+        let offset = flags
+            .arg(1)
+            .to_opref()
+            .inline_const_bits()
+            .expect("flags offset is ConstInt");
+        let width = flags
+            .arg(3)
+            .to_opref()
+            .inline_const_bits()
+            .expect("flags width is ConstInt");
+        assert_eq!(
+            offset + crate::header::GcHeader::SIZE as i64,
+            i64::from(crate::header::FLAG_SHIFT / 8)
+        );
+        assert_eq!(width * 8, i64::from(crate::header::FLAG_SHIFT));
     }
 
     // ── Test 7: A collecting operation between two NEWs prevents batching ──

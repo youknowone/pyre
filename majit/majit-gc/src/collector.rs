@@ -276,8 +276,9 @@ pub const DEBUG_ROTATING_NURSERIES: usize = 6;
 /// for an embedder that has to hand its environment over rather than share it.
 ///
 /// Published here so such a host does not keep its own copy of the list in step
-/// with the collector; the tracing knobs are absent because nothing in this
-/// file reads them.
+/// with the collector. `MAJIT_GC_STRESS` is presence-only (any value, including
+/// empty, opts in); the rest are size/rate pins. Tracing knobs stay absent
+/// because nothing in this file reads them.
 pub const GC_ENV_NAMES: &[&str] = &[
     "PYPY_GC_NURSERY",
     "PYPY_GC_MAX_PINNED",
@@ -289,6 +290,7 @@ pub const GC_ENV_NAMES: &[&str] = &[
     "PYPY_GC_MAX_DELTA",
     "PYPY_GC_NURSERY_DEBUG",
     "PYPY_GC_DEBUG",
+    "MAJIT_GC_STRESS",
 ];
 
 /// Environment an embedder supplies because the platform gives the process
@@ -319,6 +321,18 @@ fn env_var(varname: &str) -> Option<String> {
         .iter()
         .find(|(name, _)| name == varname)
         .map(|(_, value)| value.clone())
+}
+
+/// Presence of `varname` in the process environment or the embedder table.
+///
+/// Matches `std::env::var_os(name).is_some()` natively (empty counts as set)
+/// and the same name in [`SUPPLIED_ENV`] on a guest that has no process env.
+/// The `gc_stress` reader is the only production call; without that feature
+/// the name still travels in [`GC_ENV_NAMES`] so a host can forward it.
+#[cfg_attr(not(feature = "gc_stress"), allow(dead_code))]
+fn env_is_set(varname: &str) -> bool {
+    std::env::var_os(varname).is_some()
+        || SUPPLIED_ENV.read().iter().any(|(name, _)| name == varname)
 }
 
 /// env.py `_read_float_and_factor_from_env`. Parse `varname` as a float
@@ -1360,9 +1374,12 @@ impl MiniMarkGC {
             card_page_shift: 0,
             // gc.py:603-617 has no analogue; seeded from the `MAJIT_GC_STRESS`
             // env var so a whole binary can be stressed without code edits,
-            // while individual tests use `set_stress_collect`.
+            // while individual tests use `set_stress_collect`. Presence, not
+            // a numeric parse: empty is on, matching `var_os(...).is_some()`.
+            // `env_is_set` also sees the embedder table (`GC_ENV_NAMES`) so a
+            // wasm guest with no process environment still opts in.
             #[cfg(feature = "gc_stress")]
-            stress_collect: std::env::var_os("MAJIT_GC_STRESS").is_some(),
+            stress_collect: env_is_set("MAJIT_GC_STRESS"),
         };
         // incminimark.py:314-317
         if gc.config.card_page_indices > 0 {
@@ -9623,12 +9640,14 @@ mod tests {
     use super::*;
 
     static SHADOW_STACK_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    static SUPPLIED_ENV_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     /// A supplied environment answers a name the process does not define, and
     /// yields to one it does. The name is not in [`GC_ENV_NAMES`], so a
     /// concurrently built collector cannot see this table.
     #[test]
     fn supplied_env_fills_in_only_what_the_process_lacks() {
+        let _guard = SUPPLIED_ENV_TEST_LOCK.lock();
         let absent = "MAJIT_TEST_SUPPLIED_ENV_ABSENT";
         let present = "MAJIT_TEST_SUPPLIED_ENV_PRESENT";
         // SAFETY: single-threaded within this test; the names are unique to it.
@@ -9645,6 +9664,29 @@ mod tests {
         set_supplied_env(Vec::new());
         assert_eq!(read_uint_from_env(absent), None);
         unsafe { std::env::remove_var(present) };
+    }
+
+    /// Presence matches `var_os.is_some()`: an empty supplied value still
+    /// counts, and a unique name cannot collide with `MAJIT_GC_STRESS` that
+    /// `with_config` reads.
+    #[test]
+    fn supplied_env_presence_matches_var_os() {
+        let _guard = SUPPLIED_ENV_TEST_LOCK.lock();
+        let name = "MAJIT_TEST_SUPPLIED_PRESENCE";
+        // SAFETY: lock held; unique name.
+        unsafe { std::env::remove_var(name) };
+        set_supplied_env(Vec::new());
+        assert!(
+            !env_is_set(name),
+            "cleared process env and embedder table must read as unset"
+        );
+        set_supplied_env(vec![(name.to_string(), String::new())]);
+        assert!(
+            env_is_set(name),
+            "empty supplied value is still present, matching var_os.is_some"
+        );
+        set_supplied_env(Vec::new());
+        assert!(!env_is_set(name));
     }
 
     /// An array length whose eight-byte items carry a `total_size` past
