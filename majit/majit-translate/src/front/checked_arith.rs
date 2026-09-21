@@ -481,6 +481,73 @@ fn rewire_one_checked_arith_site(
     Ok(false)
 }
 
+/// Locate the recorded `ok_or_else` Call in `block`.
+///
+/// `remint_call_as_payload` retargets the Result shell onto a fresh
+/// payload Variable and leaves the Call.  The recorded `result_var` is
+/// then no longer an op result, so the fallback matches the Call by
+/// receiver (`opt_c`) and the recorded closure owner.
+fn find_ok_or_else_continuation(
+    graph: &FunctionGraph,
+    block: usize,
+    opt_c: &Variable,
+    sites: &[CheckedArithOkOrElseSite],
+) -> Option<(CheckedArithOkOrElseSite, usize)> {
+    if let Some(found) = sites.iter().find_map(|site| {
+        graph.blocks[block]
+            .operations
+            .iter()
+            .position(|op| op.result.as_ref() == Some(&site.result_var))
+            .map(|idx| (site.clone(), idx))
+    }) {
+        return Some(found);
+    }
+    sites.iter().find_map(|site| {
+        if graph.blocks.iter().any(|b| {
+            b.operations
+                .iter()
+                .any(|op| op.result.as_ref() == Some(&site.result_var))
+        }) {
+            return None;
+        }
+        graph.blocks[block]
+            .operations
+            .iter()
+            .enumerate()
+            .find_map(|(idx, op)| match &op.kind {
+                OpKind::Call {
+                    target:
+                        CallTarget::Method {
+                            name: method,
+                            receiver_root,
+                            ..
+                        },
+                    args,
+                    ..
+                } if method == "ok_or_else"
+                    && receiver_root.as_deref() == Some("Option")
+                    && args.len() == 2
+                    && args[0] == *opt_c =>
+                {
+                    let env = &args[1];
+                    let env_matches = graph.blocks[block].operations.iter().any(|env_op| {
+                        env_op.result.as_ref() == Some(env)
+                            && matches!(
+                                &env_op.kind,
+                                OpKind::Call {
+                                    target: CallTarget::SyntheticTransparentCtor { .. },
+                                    result_ty: ValueType::Ref(Some(root)),
+                                    ..
+                                } if root == &site.call_once_owner
+                            )
+                    });
+                    env_matches.then_some((site.clone(), idx))
+                }
+                _ => None,
+            })
+    })
+}
+
 /// Rewrite the signed-arithmetic `checked_*(lhs, rhs).ok_or_else(env)` shape.
 /// The `Option` is only an intermediate encoding: normal execution rebuilds
 /// `Result::Ok(sum)`, while the overflow edge invokes the existing niladic
@@ -500,13 +567,7 @@ fn rewire_checked_arith_ok_or_else(
     ovf_opname: &str,
     sites: &[CheckedArithOkOrElseSite],
 ) -> Result<(), String> {
-    let Some((site, ok_idx)) = sites.iter().find_map(|site| {
-        graph.blocks[c]
-            .operations
-            .iter()
-            .position(|op| op.result.as_ref() == Some(&site.result_var))
-            .map(|idx| (site.clone(), idx))
-    }) else {
+    let Some((site, ok_idx)) = find_ok_or_else_continuation(graph, c, opt_c, sites) else {
         return Err("no recorded Option::ok_or_else continuation".to_string());
     };
     if ok_idx + 1 != graph.blocks[c].operations.len() {
@@ -591,10 +652,16 @@ fn rewire_checked_arith_ok_or_else(
     {
         return Err("ok_or_else continuation exit is not a plain goto".to_string());
     }
+    // After remint the Call produces the payload Variable, not the
+    // recorded Result identity; the continuation forwards that live result.
+    let live_result = graph.blocks[c].operations[ok_idx]
+        .result
+        .clone()
+        .ok_or_else(|| "ok_or_else continuation has no result".to_string())?;
     if c_exit
         .args
         .iter()
-        .any(|arg| matches!(arg, LinkArg::Value(value) if *value != site.result_var))
+        .any(|arg| matches!(arg, LinkArg::Value(value) if *value != live_result))
     {
         return Err("ok_or_else continuation forwards a non-result value".to_string());
     }
@@ -1023,6 +1090,130 @@ mod tests {
                         if name == "call_once" && owner == "test::closure")
                 }),
             "the Err arm must invoke the ok_or_else closure"
+        );
+        assert!(
+            g.blocks[a.0]
+                .exits
+                .iter()
+                .any(|exit| exit.exitcase.as_ref() == Some(&overflowerror_exitcase())),
+            "the overflow link must carry the OverflowError exitcase"
+        );
+    }
+
+    /// rhai `add` is `checked_add(x, y).ok_or_else(|| make_err(..))` returned
+    /// from a Result graph.  `rewire_option_ok_or_else_try_sites` remints
+    /// that tail-forward (`remint_call_as_payload`) and then declines
+    /// because the Result is not a `?` diamond; the fold must still fire.
+    #[test]
+    fn rewrite_lifts_ok_or_else_after_result_exc_payload_remint() {
+        let mut g = FunctionGraph::new("test_checked_add_ok_or_else_after_remint");
+        let a = g.startblock;
+        let lhs = g.push_op_var(a, OpKind::ConstInt(1), true).unwrap();
+        let rhs = g.push_op_var(a, OpKind::ConstInt(2), true).unwrap();
+        let opt = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: checked_target(),
+                    args: crate::model::call_args(vec![lhs.clone(), rhs.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+
+        let (c, c_inputs) = g.create_block_with_arg_vars(3);
+        let opt_c = c_inputs[2].clone();
+        let env = g
+            .push_op_var(
+                c,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor_with_owner(
+                        vec!["test".into()],
+                        "closure",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("test::closure".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let result = g
+            .push_op_var(
+                c,
+                OpKind::Call {
+                    target: CallTarget::method("ok_or_else", Some("Option".into())),
+                    args: crate::model::call_args(vec![opt_c, env]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        g.set_goto(a, c, vec![lhs, rhs, opt.clone()]);
+        g.set_return(c, Some(result.clone()));
+
+        let try_site = crate::front::result_exc::OptionOkOrElseTrySite {
+            result_var: result.clone(),
+            option_owner: "core::option::Option".into(),
+            some_owner: "core::option::Option::Some".into(),
+            call_once_owner: "test::closure".into(),
+            payload_ty: ValueType::Int,
+            error_ty: ValueType::Ref(None),
+            niche: false,
+        };
+        let try_rewritten = crate::front::result_exc::rewire_option_ok_or_else_try_sites(
+            &mut g,
+            &[try_site],
+            true,
+            crate::ErrorCarrierSpec::default(),
+        );
+        assert_eq!(
+            try_rewritten, 0,
+            "ok_or_else is returned, not consumed by `?`"
+        );
+        assert!(
+            g.blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::Method { name, .. },
+                            ..
+                        } if name == "ok_or_else"
+                    ) && op.result.as_ref() != Some(&result)
+                }),
+            "result_exc remints the ok_or_else Result shell onto a payload Variable"
+        );
+
+        let paired = CheckedArithOkOrElseSite {
+            result_var: result,
+            call_once_owner: "test::closure".into(),
+            result_suffix: String::new(),
+            ok_payload_ty: ValueType::Int,
+            err_payload_ty: ValueType::Ref(None),
+        };
+        let rewritten =
+            rewire_checked_arith_call_sites(&mut g, std::slice::from_ref(&opt), &[paired]);
+        assert_eq!(rewritten.total, 1);
+        assert_eq!(rewritten.result_shells, 1);
+        assert!(matches!(
+            &g.blocks[a.0].operations.last().unwrap().kind,
+            OpKind::BinOp { op, .. } if op == "add_ovf"
+        ));
+        assert!(matches!(
+            g.blocks[a.0].exitswitch,
+            Some(ExitSwitch::LastException)
+        ));
+        assert!(
+            !g.blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| {
+                    matches!(&op.kind, OpKind::Call { target: CallTarget::Method { name, .. }, .. }
+                if name == "ok_or_else")
+                })
         );
         assert!(
             g.blocks[a.0]
