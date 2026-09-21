@@ -7372,6 +7372,17 @@ impl<S: JitState> JitDriver<S> {
         let vable = descriptor
             .as_deref()
             .and_then(JitDriverStaticData::virtualizable);
+        // Precondition: not entered while `is_tracing`.  The caller decides
+        // that a trace starts here, and one cannot start inside another.  So
+        // `sync_before` finds no recording context, writes no trace pointer,
+        // and the returns below have none to put back; the two
+        // `run_compiled_detailed_*` runners carry the save/restore instead,
+        // because a walk does reach those.  `initialize_virtualizable` seeds
+        // the cell on the context this call is about to build.
+        debug_assert!(
+            !self.is_tracing(),
+            "force_start_tracing entered while a recording is live"
+        );
         if !self.sync_before(state, &meta, vable) {
             return;
         }
