@@ -3357,10 +3357,16 @@ fn flatten_descr_by_ptr(descr: &super::flow::DescrByPtr) -> Operand {
             owner: owner.to_string(),
         }));
     }
+    // Graph-side `raw_load_i` of the eval-breaker word (and any other
+    // array descr that is not a PyFrame vable singleton) lowers through
+    // the same `BhDescr::from_array_descr` path BUILD_TUPLE uses.
+    if let Some(array) = descr_ref.as_array_descr() {
+        return Operand::descr(DescrOperand::Bh(BhDescr::from_array_descr(array)));
+    }
     panic!(
         "flatten_descr_by_ptr: unmapped DescrByPtr {} — only PyFrame vinfo \
-         array_field / array / static_field descrs, FieldDescr, and CallDescrStub \
-         are recognised today",
+         array_field / array / static_field descrs, FieldDescr, ArrayDescr, \
+         and CallDescrStub are recognised today",
         descr_ref.repr()
     )
 }

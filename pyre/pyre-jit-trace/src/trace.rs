@@ -4941,14 +4941,12 @@ fn run_perfn_walk<Sym: WalkSym>(
                 jump_args,
                 loop_header_pc,
                 loop_header_marker_jit_pc,
-                back_edge_pc,
-                back_edge_marker_jit_pc,
+                ..
             },
             _end_pc,
         )) = &mut walk_result
         {
             let loop_header_pc = *loop_header_pc;
-            let poll_resume_pc = back_edge_pc.unwrap_or(loop_header_pc);
             let restart_pc = close_loop_restart_pc.expect("close loop has a restart pc");
             // The handback only runs on the leg where the end-flush below
             // declined, and a decline keeps the legacy replay, whose contract
@@ -4962,16 +4960,14 @@ fn run_perfn_walk<Sym: WalkSym>(
             let handback_pc = (restart_pc != loop_header_pc).then_some(restart_pc);
             WALK_END_RESTART_PC.with(|c| c.set(handback_pc));
             // The closing frame and GuardFutureCondition remain anchored at
-            // the loop header; the synthesized poll receives its owning
-            // back-edge coordinate separately.
+            // the loop header.  The tick poll is walked inside JUMP_BACKWARD
+            // (`emit_jump_absolute_tick`), not synthesized here.
             *jump_args = sym.close_loop_args_at(
                 ctx,
                 cf_addr,
                 loop_header_pc,
                 Some(loop_header_pc),
                 *loop_header_marker_jit_pc,
-                poll_resume_pc,
-                *back_edge_marker_jit_pc,
             );
         }
         // pyjitpl.py raise_continue_running_normally parity: a

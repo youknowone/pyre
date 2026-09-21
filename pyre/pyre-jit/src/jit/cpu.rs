@@ -252,6 +252,10 @@ pub struct Cpu {
     /// MRO-aware Python exception match used by the FOR_ITER catch arm.
     /// Returns a raw bool-as-int and cannot raise.
     pub for_iter_exception_match_fn: extern "C" fn(i64, i64) -> i64,
+    /// interp_jit.py `jump_absolute` residual: breaker-word service then
+    /// `bytecode_trace` slow path.  Void result (`residual_call_r_v`):
+    /// always returns 0; an exception is published for `GuardNoException`.
+    pub bytecode_trace_jitted_slow_fn: extern "C" fn(i64, i64) -> i64,
     /// `bh_unary_negative_fn(value)` — UNARY_NEGATIVE `-value` residual
     /// (a user `__neg__` may run Python → fallible).
     pub unary_negative_fn: extern "C" fn(i64) -> i64,
@@ -568,6 +572,7 @@ impl Cpu {
             reraise_varargs_zero_fn: crate::call_jit::bh_reraise_varargs_zero,
             set_current_exception_fn: crate::call_jit::bh_set_current_exception,
             clear_in_flight_exception_fn: crate::call_jit::bh_clear_in_flight_exception,
+            bytecode_trace_jitted_slow_fn: crate::call_jit::bh_bytecode_trace_jitted_slow,
             rtyper,
             lowering_ctx: parking_lot::RwLock::new(None),
         }
