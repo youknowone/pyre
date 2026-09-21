@@ -100,18 +100,36 @@ fn is_identity_wrapper_target(
     }
 }
 
+fn segments_are(segments: &[String], want: &[&str]) -> bool {
+    segments.len() == want.len() && segments.iter().zip(want).all(|(seg, w)| seg == w)
+}
+
+/// The concrete `Copy` impls, spelled in full — the same items
+/// `mir.rs`'s `is_core_clone_path` / `is_core_default_path` recognise on
+/// the `RegularCall` route.
+///
+/// A leaf-name match would also take `core::clone::<Impl>::clone` and
+/// `core::default::Default::default`, which are the blanket impl and the
+/// trait item. Charon does not monomorphise them, so the destination
+/// width these folds read describes the declaration and not the
+/// instantiation, and folding either one answers for every `T` a caller
+/// might have instantiated. A method spelling carries no module path at
+/// all, so it can never be shown to be one of these items.
 pub(crate) fn is_clone_target(target: &CallTarget) -> bool {
     match target {
-        CallTarget::Method { name, .. } => name == "clone",
-        CallTarget::FunctionPath { segments, .. } => function_leaf(segments) == Some("clone"),
+        CallTarget::FunctionPath { segments, .. } => {
+            segments_are(segments, &["core", "clone", "impls", "<Impl>", "clone"])
+        }
         _ => false,
     }
 }
 
 pub(crate) fn is_default_target(target: &CallTarget) -> bool {
     match target {
-        CallTarget::Method { name, .. } => name == "default",
-        CallTarget::FunctionPath { segments, .. } => function_leaf(segments) == Some("default"),
+        CallTarget::FunctionPath { segments, .. } => {
+            segments_are(segments, &["core", "default", "<Impl>", "default"])
+                || segments_are(segments, &["core", "ptr", "mut_ptr", "<Impl>", "default"])
+        }
         _ => false,
     }
 }
@@ -497,6 +515,50 @@ mod tests {
         assert!(
             matches!(clone, OpKind::Call { .. }),
             "i32 is not the machine-word Copy width"
+        );
+    }
+
+    /// The blanket impl and the trait item share the leaf name with the
+    /// concrete `Copy` impls and arrive at the machine word width, so a
+    /// leaf-name match folds them too. `mir.rs` guards the same pair
+    /// through `lower_function`; this pins the predicate itself.
+    #[test]
+    fn the_blanket_clone_and_the_default_trait_item_stay_residual() {
+        let v = dummy_var();
+        let blanket = lower_std_primitive_op(
+            call(
+                path(&["core", "clone", "<Impl>", "clone"]),
+                vec![v],
+                ValueType::Int,
+            ),
+            None,
+            None,
+            Some("I64"),
+            None,
+            false,
+            true,
+        );
+        assert!(
+            matches!(blanket, OpKind::Call { .. }),
+            "core::clone::<Impl>::clone is not the impls identity"
+        );
+
+        let trait_item = lower_std_primitive_op(
+            call(
+                path(&["core", "default", "Default", "default"]),
+                vec![],
+                ValueType::Int,
+            ),
+            None,
+            None,
+            Some("I64"),
+            None,
+            false,
+            true,
+        );
+        assert!(
+            matches!(trait_item, OpKind::Call { .. }),
+            "Default::default names no impl to read a zero from"
         );
     }
 }
