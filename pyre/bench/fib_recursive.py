@@ -1,9 +1,7 @@
-# pyre-check: max-wasm-ratio=5.5
-# rustpython-common now compiles the xz-core lzma engine on every target,
-# including the wasm guest.  That grows the module the wasm backend compiles
-# per trace; fib_recursive is already bound by CALL_ASSEMBLER returns and
-# sat on the 4x default ceiling.  ubuntu-24.04 measured 4.7x after the lzma
-# share, so 5.5x is that reading plus WASM_RATIO_FIT_HEADROOM (15%).
+# The 5.5x wasm/dynasm allowance was ubuntu-24.04's 4.7x after the lzma
+# share, plus WASM_RATIO_FIT_HEADROOM. Three later ubuntu-24.04 runs
+# (35491772991, 35547723188, 35592344587) read 3.1x, 2.9x, 2.8x, all
+# inside 4.0 with that headroom, so the allowance is gone.
 def fib(n):
     if n < 2:
         return n
