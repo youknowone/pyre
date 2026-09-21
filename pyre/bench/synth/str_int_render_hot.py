@@ -1,4 +1,4 @@
-# pyre-check: spec-folds=str_call
+# pyre-check: trace-shape=hot_render:absent=CallMayForceR
 # Hot-loop `str(int)`. The Python-level call has to reach the same
 # `descr_repr` split the rtyper gives an unboxed `str(int)` -- elidable
 # `ll_int2dec` plus a `newutf8` wrap -- instead of the opaque

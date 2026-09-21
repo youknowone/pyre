@@ -1,4 +1,4 @@
-# pyre-check: spec-folds=builtin_divmod,builtin_divmod_long_int
+# pyre-check: trace-shape=side_exit_contracts:absent=CallMayForceR,held_across_calls:absent=CallMayForceR,hot_long_int_floordiv_mod:absent=CallMayForceR
 # `divmod(long, int)` at a traced call site. `_int_divmod` keeps the divisor
 # unwrapped and calls `rbigint.int_divmod`, whose rtyped return is a two-item
 # `GcStruct`: the walker emits one elidable call plus two `getfield_gc_r`, then

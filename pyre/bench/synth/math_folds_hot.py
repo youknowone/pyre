@@ -1,5 +1,5 @@
 # pyre-check: max-pypy-ratio=1.8
-# pyre-check: spec-folds=math_ceil,math_fabs,math_float1,math_float2,math_floor,math_isclose,math_log_trig,math_trunc,math_sqrt,float_call
+# pyre-check: trace-shape=run_round_to_int:absent=CallMayForceR,run_fabs:absent=CallMayForceR,run_unary:absent=CallMayForceR,run_binary:absent=CallMayForceR,run_isclose:absent=CallMayForceR,run_log_trig:absent=CallMayForceR,run_sqrt:absent=CallMayForceR
 # pyre-check: skip-cpython
 # This fixture carried a wasm allowance of 13, fitted to a darwin-arm64
 # reading of 8.1-9.0x.  Most of that was the host crossing: `isclose`, `frexp`

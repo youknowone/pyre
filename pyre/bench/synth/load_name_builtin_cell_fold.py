@@ -1,5 +1,5 @@
 # pyre-check: max-pypy-ratio=2.5
-# pyre-check: spec-folds=builtin_len_descent
+# pyre-check: trace-shape=<module>:absent=CallMayForceR
 # pyre-check: skip-cpython
 # A module-scope LOAD_NAME whose name misses the module dict resolves through
 # the frame's builtin module.  The builtins cell folds under the module dict's
