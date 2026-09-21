@@ -4712,39 +4712,13 @@ pub(crate) unsafe fn objspace_compare_floats(
     }
 }
 
-/// virtualizable.py:94 `getattr(virtualizable, fieldname)` parity for
-/// the `locals_cells_stack_w` array field. Materialises the array
-/// pointer that step 2 (`lst[i]` → `GETARRAYITEM_GC_R`) indexes.
-///
-/// TODO: the upstream-orthodox emission is
-/// `OpCode::GetfieldGcR` because `pyframe_locals_cells_stack_descr`
-/// is field 0 of `PYFRAME_DESCR_GROUP` with `field_type = Type::Ref`
-/// on a `PYFRAME_GC_TYPE_ID`-typed PyFrame, so the read goes through
-/// the GC barrier in RPython's `rclass.py` getfield emission.
-///
-/// Cranelift backend status (MAJIT_PROBE_GETFIELD_GC_R=1):
-///   - `OpCode::GetfieldGcR` lowering exists at
-///     `majit-backend-cranelift`'s `do_compile` getfield arm.
-///   - Direct swap on fib_recursive panics inside
-///     `gc_alloc_nursery_shim` with non-unwinding abort.  The
-///     post-getfield write-barrier path triggers a nursery
-///     allocation (remembered-set slot) which overflows or hits
-///     a missing slow-path stub.
-///
-/// The convergence path is to either (a) implement the missing
-/// nursery allocation slow-path for the post-GetfieldGcR remembered
-/// set write, or (b) audit why the GC barrier emits a nursery
-/// allocation here when dynasm doesn't.  Both are separate
-/// cranelift backend work that is not yet done.  Until then the
-/// emission stays
-/// `GetfieldRawI` and the runtime descr's `field_type = Type::Ref`
-/// preserves the optimizer's boxed-pointer view.
+/// virtualizable.py `read_boxes`: `lst = getattr(virtualizable, fieldname)`
+/// for `locals_cells_stack_w[*]`. That getattr is `opimpl_getfield_gc_r`
+/// (`GETFIELD_GC_R`); `compile.py` emits the same `GETFIELD_GC_R` in the
+/// array-field preamble. The result is a GCREF, so a minor collection
+/// forwards it (`rewrite.py` GETFIELD_GC_R, `_trace_drag_out`).
 pub(crate) fn frame_locals_cells_stack_array(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
-    ctx.record_op_with_descr(
-        OpCode::GetfieldRawI,
-        &[frame],
-        frame_locals_cells_stack_descr(),
-    )
+    opimpl_getfield_gc_r(ctx, frame, frame_locals_cells_stack_descr())
 }
 
 /// Read from frame's `locals_cells_stack_w` array. Caller passes the
@@ -8238,10 +8212,9 @@ fn reconstruct_materialized_frame_slots(
     });
     let array_box =
         pending_array_box.unwrap_or_else(|| frame_locals_cells_stack_array(ctx, frame_box));
-    // `frame_locals_cells_stack_array` currently emits GetfieldRawI for
-    // backend compatibility, but the field is a GC array Ref
-    // (virtualizable.py:94). Preserve that boxed-pointer view for the
-    // following GETARRAYITEM_GC_R operations and executor-side loads.
+    // `frame_locals_cells_stack_array` is `GETFIELD_GC_R` of the array
+    // field (`virtualizable.py` `read_boxes` getattr). Stamp the live
+    // array GCREF so the following `GETARRAYITEM_GC_R` loads see it.
     ctx.try_set_opref_concrete(
         array_box,
         majit_ir::Value::Ref(majit_ir::GcRef(arr_ptr as usize)),
