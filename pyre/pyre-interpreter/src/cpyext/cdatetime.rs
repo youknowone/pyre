@@ -148,6 +148,11 @@ fn build_api() -> Result<CPyDateTimeCAPI, crate::PyError> {
         Ok(pyobject::make_ref(class) as *mut CPyTypeObject)
     };
     let date_type = mirror("date")?;
+    // `date` was just sized for the datetime basestruct; put the header
+    // back before `datetime`'s mirror copies the larger of the two.
+    unsafe {
+        (*date_type).tp_basicsize = size_of::<CPyObject>() as isize;
+    }
     let datetime_type = mirror("datetime")?;
     let time_type = mirror("time")?;
     let delta_type = mirror("timedelta")?;
@@ -729,6 +734,7 @@ enum Shape {
     /// `timedelta`, which carries its three broken-down fields.
     Delta,
     /// `datetime` and `time`, which carry `hastzinfo` and the word beside it.
+    /// `date` is given the same block and then sized back down.
     WithTZInfo,
 }
 
@@ -757,9 +763,10 @@ fn declared_shape(w_type: PyObjectRef) -> Option<Shape> {
     if derived("timedelta") {
         return Some(Shape::Delta);
     }
-    // `datetime` before `date`, because it is one: only the more derived of
-    // the two carries the `tzinfo` word.
-    if derived("datetime") || derived("time") {
+    // date, datetime and time share the tzinfo-word basestruct.  The date
+    // type is then sized back to the header, so a zero here is not a request
+    // for the header.
+    if derived("datetime") || derived("time") || derived("date") {
         return Some(Shape::WithTZInfo);
     }
     None
