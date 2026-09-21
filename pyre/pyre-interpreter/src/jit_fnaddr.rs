@@ -4650,6 +4650,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::load_global_nameindex_w",
         crate::eval::load_global_nameindex_w,
     );
+    pa2(
+        &mut entries,
+        "pyre_interpreter::eval::load_name_nameindex_w",
+        "pyre_interpreter::load_name_nameindex_w",
+        crate::eval::load_name_nameindex_w,
+    );
     let exception_is_valid_class_w: unsafe fn(pyre_object::PyObjectRef) -> bool =
         crate::baseobjspace::exception_is_valid_class_w;
     upa1(

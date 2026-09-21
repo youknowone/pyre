@@ -844,6 +844,7 @@ unsafe fn walk_builtin_type_dicts_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) 
 /// takes a lock and scans the environment array, so an uncached read puts that
 /// scan on the return path of every Python-level call.
 #[cfg(not(feature = "sandbox"))]
+#[majit_macros::dont_look_inside]
 fn interp_return_log_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_INTERP_RETURN_LOG").is_some())
@@ -3374,6 +3375,35 @@ impl NamespaceOpcodeHandler for PyFrame {
 
     fn null_value(&mut self) -> Result<Self::Value, PyError> {
         Ok(PY_NULL)
+    }
+}
+
+/// Word residual for `LOAD_NAME`. Same reason as [`load_global_nameindex_w`]:
+/// `load_name_value` takes `&str`, which cannot be a residual argument.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub fn load_name_nameindex_w(frame: i64, nameindex: i64) -> PyObjectRef {
+    let frame = if frame == 0 {
+        CURRENT_FRAME.with(|c| c.get() as i64)
+    } else {
+        frame
+    };
+    if frame == 0 {
+        return PY_NULL;
+    }
+    let frame = unsafe { &mut *(frame as *mut PyFrame) };
+    let code = unsafe { &*crate::pyframe_get_pycode(frame) };
+    let idx = nameindex as usize;
+    if idx >= code.names.len() {
+        return PY_NULL;
+    }
+    let name = code.names[idx].as_ref();
+    match <PyFrame as crate::NamespaceOpcodeHandler>::load_name_value(frame, name, idx) {
+        Ok(value) => value,
+        Err(err) => {
+            crate::runtime_ops::jit_publish_residual_error(err);
+            PY_NULL
+        }
     }
 }
 
