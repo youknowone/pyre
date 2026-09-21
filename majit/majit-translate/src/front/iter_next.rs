@@ -87,7 +87,7 @@ pub(crate) fn is_iter_next_segments(segments: &[String]) -> bool {
 pub(crate) fn is_iterator_next_target(target: &CallTarget) -> bool {
     match target {
         CallTarget::Method { name, .. } => name == "next",
-        CallTarget::FunctionPath { segments } => segments.last().is_some_and(|s| s == "next"),
+        CallTarget::FunctionPath { segments, .. } => segments.last().is_some_and(|s| s == "next"),
         _ => false,
     }
 }
@@ -130,7 +130,7 @@ fn originates_from_iter_op(graph: &FunctionGraph, var: &Variable) -> bool {
 fn iter_op_container(graph: &FunctionGraph, var: &Variable) -> Option<Variable> {
     walk_back_to_source(graph, var, |op| match &op.kind {
         OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } if is_iter_op_segments(segments) => args.first().cloned().map(LinkArg::into_variable),
@@ -257,7 +257,7 @@ fn iter_next_item_type(
 fn produced_by_range_builtin(graph: &FunctionGraph, var: &Variable) -> bool {
     walk_back_to_source(graph, var, |op| match &op.kind {
         OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             ..
         } if segments.len() == 1 && segments[0] == crate::runtime_names::shims::RANGE => Some(()),
         _ => None,
@@ -704,7 +704,7 @@ fn rewire_one_next_site(
             null_indices.push(idx);
             match &op.kind {
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     args,
                     ..
                 } if args.is_empty() && segments == &["core", "ptr", "null_mut"] => break,
@@ -927,6 +927,7 @@ fn rewire_one_next_site(
         kind: OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: next_op_segments(),
+                fun_decl_id: None,
             },
             args: crate::model::call_args(vec![iter_arg]),
             result_ty: item_ty,
@@ -996,6 +997,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: container_segments,
+                        fun_decl_id: None,
                     },
                     args: Vec::new(),
                     result_ty: ValueType::Ref(None),
@@ -1009,6 +1011,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["core".to_string(), "slice".to_string(), "iter".to_string()],
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![container]),
                     result_ty: ValueType::Ref(None),

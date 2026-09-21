@@ -58,6 +58,10 @@ pub struct SemanticFunction {
     /// obtains the graph from the function object; the Rust port uses this id
     /// to keep same-named impl methods distinct in `CallPath`.
     pub trait_impl_id: Option<u64>,
+    /// Charon `FunDecl.def_id` of the declaration this function was
+    /// lowered from. Threaded onto `FunctionGraph` so `CallControl`
+    /// resolves a call site by decl identity rather than a name suffix.
+    pub fun_decl_id: Option<u64>,
     /// Module path of the defining file, crate-stripped (e.g.
     /// `"pyframe"` for `pyre-interpreter/src/pyframe.rs`), populated by
     /// `front::mir` from the module portion of Charon's `name_path()`.
@@ -923,7 +927,9 @@ fn class_roots(func: &SemanticFunction) -> std::collections::HashMap<u64, String
                     } if *is_struct => Some(name.clone()),
                     // `__cast_pointer` / `__cast_instance_intrinsic`
                     // carry the target class as a trailing ByteStr.
-                    CallTarget::FunctionPath { segments } if is_representation_cast(segments) => {
+                    CallTarget::FunctionPath { segments, .. }
+                        if is_representation_cast(segments) =>
+                    {
                         crate::model::cast_pointer_root(&op.kind)
                             .or_else(|| crate::model::cast_instance_root(&op.kind))
                             .map(str::to_string)
@@ -1002,7 +1008,7 @@ fn resolve_callee(
     method_index: &std::collections::HashMap<(String, String), Option<usize>>,
 ) -> Option<usize> {
     match target {
-        crate::model::CallTarget::FunctionPath { segments } => {
+        crate::model::CallTarget::FunctionPath { segments, .. } => {
             let joined = segments.join("::");
             *index.get(crate::front::mir::strip_crate_prefix(&joined).as_str())?
         }
@@ -1010,6 +1016,7 @@ fn resolve_callee(
             name,
             receiver_root,
             resolved_path,
+            ..
         } => {
             // `stamp_classdef_hints_on_graph` stamps the resolved path when
             // the receiver's classdef is known; it is the same key
@@ -1058,7 +1065,7 @@ fn alias_pairs(func: &SemanticFunction) -> Vec<(u64, u64)> {
             let crate::model::OpKind::Call { target, args, .. } = &op.kind else {
                 continue;
             };
-            let crate::model::CallTarget::FunctionPath { segments } = target else {
+            let crate::model::CallTarget::FunctionPath { segments, .. } = target else {
                 continue;
             };
             if !is_representation_cast(segments) {
@@ -1108,6 +1115,7 @@ mod tests {
             return_type: None,
             self_ty_root: None,
             trait_impl_id: None,
+            fun_decl_id: None,
             module_path: String::new(),
             hints: Vec::new(),
             trait_root: None,
@@ -1158,6 +1166,7 @@ mod tests {
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec![(*callee).to_string()],
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(args),
                     result_ty: ValueType::Void,
@@ -1216,6 +1225,7 @@ mod tests {
                     name: method.to_string(),
                     receiver_root: Some(receiver_root.to_string()),
                     resolved_path: None,
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![passed]),
                 result_ty: ValueType::Void,
@@ -1383,6 +1393,7 @@ mod tests {
                         name: "handle_bytecode".to_string(),
                         receiver_root: Some("PyFrame".to_string()),
                         resolved_path: None,
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![carried]),
                     result_ty: ValueType::Void,
@@ -1534,6 +1545,7 @@ mod tests {
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["call_function".to_string()],
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![normal]),
                     result_ty: ValueType::Void,
@@ -1601,6 +1613,7 @@ mod tests {
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["init_cells".to_string()],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![hinted]),
                 result_ty: ValueType::Void,
@@ -1656,6 +1669,7 @@ mod tests {
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["call_function".to_string()],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![merged]),
                 result_ty: ValueType::Void,
@@ -1712,7 +1726,7 @@ mod tests {
             .iter_mut()
             .find_map(|op| match &mut op.kind {
                 crate::model::OpKind::Call {
-                    target: crate::model::CallTarget::FunctionPath { segments },
+                    target: crate::model::CallTarget::FunctionPath { segments, .. },
                     args,
                     ..
                 } if segments.last().is_some_and(|leaf| leaf == "log") => Some(args),

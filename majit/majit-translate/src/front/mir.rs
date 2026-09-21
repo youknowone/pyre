@@ -1162,6 +1162,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         } else {
             graph.with_source_identity(fn_path.clone())
         };
+        let graph = graph.with_fun_decl_id(fd.def_id);
         // Surface trait identity for trait-impl methods so the
         // canonical registration loop can call `register_trait_method`
         // instead of routing through `extract_trait_impls`.  Inherent
@@ -1215,6 +1216,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             return_type,
             self_ty_root,
             trait_impl_id,
+            fun_decl_id: Some(fd.def_id),
             module_path,
             hints: Vec::new(),
             trait_root,
@@ -3517,7 +3519,7 @@ fn simplify_lowered_graph(
 /// Whether `target` is `lltype::malloc` / `malloc_typed` / the managed and
 /// stable flavors — the boxing-cluster allocator `fuse_boxing_alloc` keys on.
 fn call_target_is_gc_malloc(target: &CallTarget) -> bool {
-    let CallTarget::FunctionPath { segments } = target else {
+    let CallTarget::FunctionPath { segments, .. } = target else {
         return false;
     };
     let [.., parent, leaf] = segments.as_slice() else {
@@ -5752,6 +5754,7 @@ impl<'a> Lowering<'a> {
                     OpKind::Call {
                         target: CallTarget::FunctionPath {
                             segments: vec!["__deref_write".to_string()],
+                            fun_decl_id: None,
                         },
                         args: crate::model::call_args(vec![base, value_var(&value)]),
                         result_ty: ValueType::Void,
@@ -6109,6 +6112,7 @@ impl<'a> Lowering<'a> {
                                         .into_iter()
                                         .map(str::to_string)
                                         .collect(),
+                                    fun_decl_id: None,
                                 },
                                 args: crate::model::call_args(vec![arg]),
                                 result_ty: ValueType::Int,
@@ -6135,6 +6139,7 @@ impl<'a> Lowering<'a> {
                                         .into_iter()
                                         .map(str::to_string)
                                         .collect(),
+                                    fun_decl_id: None,
                                 },
                                 args: crate::model::call_args(vec![arg]),
                                 result_ty: ValueType::Unsigned,
@@ -6189,7 +6194,7 @@ impl<'a> Lowering<'a> {
                                 }
                                 (
                                     Some(OpKind::Call {
-                                        target: CallTarget::FunctionPath { segments },
+                                        target: CallTarget::function_path(segments),
                                         args: crate::model::call_args(vec![arg]),
                                         result_ty: dst_kind,
                                     }),
@@ -6322,6 +6327,7 @@ impl<'a> Lowering<'a> {
                     Some(OpKind::Call {
                         target: CallTarget::FunctionPath {
                             segments: vec!["__array_repeat".to_string()],
+                            fun_decl_id: None,
                         },
                         args: crate::model::call_args(args),
                         result_ty: ValueType::Int,
@@ -6407,6 +6413,7 @@ impl<'a> Lowering<'a> {
                     Some(OpKind::Call {
                         target: CallTarget::FunctionPath {
                             segments: vec![len_leaf.to_string()],
+                            fun_decl_id: None,
                         },
                         args: crate::model::call_args(vec![base]),
                         result_ty: ValueType::Int,
@@ -6432,9 +6439,7 @@ impl<'a> Lowering<'a> {
                     .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                 Ok((
                     Some(OpKind::Call {
-                        target: CallTarget::FunctionPath {
-                            segments: vec![format!("__nullary_{op_name}")],
-                        },
+                        target: CallTarget::function_path([format!("__nullary_{op_name}")]),
                         args: crate::model::call_args(vec![]),
                         result_ty: ValueType::Int,
                     }),
@@ -7004,6 +7009,7 @@ impl<'a> Lowering<'a> {
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::STRINGBUILDER_BUILD.to_string()],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![builder]),
                 result_ty: ValueType::Ref(None),
@@ -7093,7 +7099,7 @@ impl<'a> Lowering<'a> {
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
         Some((
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
+                target: CallTarget::function_path(segments),
                 args: crate::model::call_args(vec![arg.clone()]),
                 result_ty,
             },
@@ -7139,6 +7145,7 @@ impl<'a> Lowering<'a> {
             DecodedConst::Str(s) => OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__str_const".to_string(), s],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![]),
                 // A `&str` / `&[u8]` literal lowers to `Ptr(STR)` (getkind
@@ -7181,6 +7188,7 @@ impl<'a> Lowering<'a> {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: synthetic,
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![]),
                     result_ty: ValueType::Int,
@@ -7498,6 +7506,7 @@ impl<'a> Lowering<'a> {
                         OpKind::Call {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["__string_byte_getitem".to_string()],
+                                fun_decl_id: None,
                             },
                             args: crate::model::call_args(vec![base, idx_var]),
                             result_ty: ValueType::Int,
@@ -7843,7 +7852,7 @@ impl<'a> Lowering<'a> {
                         &segments.join("::"),
                     );
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::function_path(segments),
                         args: crate::model::call_args(vec![]),
                         result_ty: tyref_to_value_type(&place_ty, self.llbc),
                     }
@@ -8202,7 +8211,7 @@ impl<'a> Lowering<'a> {
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(void),
             kind: OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
+                target: CallTarget::function_path(segments),
                 args: crate::model::call_args(vec![base]),
                 result_ty: ValueType::Void,
             },
@@ -8548,7 +8557,7 @@ impl<'a> Lowering<'a> {
             segments.push(n.to_string());
         }
         Some(OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::function_path(segments),
             args: Vec::new(),
             result_ty: ValueType::Ref(None),
         })
@@ -9936,6 +9945,7 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::Call {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["__string_byte_getitem".to_string()],
+                                fun_decl_id: None,
                             },
                             args: crate::model::call_args(vec![args[0].clone(), args[1].clone()]),
                             // `ord` returns RPython Signed. Rust's `u8`
@@ -10297,6 +10307,7 @@ impl<'a> Lowering<'a> {
                                 segments: vec![
                                     crate::runtime_names::shims::LL_ARRAYMOVE.to_string(),
                                 ],
+                                fun_decl_id: None,
                             },
                             args: crate::model::call_args(vec![
                                 array,
@@ -10672,6 +10683,7 @@ impl<'a> Lowering<'a> {
                                 segments: vec![
                                     crate::runtime_names::shims::STRINGBUILDER_NEW.to_string(),
                                 ],
+                                fun_decl_id: None,
                             },
                             args: if builder_ctor_leaf == Some("with_capacity") {
                                 crate::model::call_args(args.clone())
@@ -10705,6 +10717,7 @@ impl<'a> Lowering<'a> {
                             kind: OpKind::Call {
                                 target: CallTarget::FunctionPath {
                                     segments: vec!["__majit_stringbuilder_append".to_string()],
+                                    fun_decl_id: None,
                                 },
                                 args: crate::model::call_args(vec![res.clone(), args[0].clone()]),
                                 result_ty: ValueType::Void,
@@ -10783,6 +10796,7 @@ impl<'a> Lowering<'a> {
                                         crate::runtime_names::shims::STRINGBUILDER_APPEND
                                             .to_string(),
                                     ],
+                                    fun_decl_id: None,
                                 },
                                 args: crate::model::call_args(vec![acc_val, piece_val]),
                                 result_ty: ValueType::Void,
@@ -11094,6 +11108,7 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::Call {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["ll_math".to_string(), leaf.to_string()],
+                                fun_decl_id: None,
                             },
                             args: crate::model::call_args(args.iter().cloned()),
                             result_ty: ValueType::Float,
@@ -11287,6 +11302,7 @@ impl<'a> Lowering<'a> {
                                     "longlong2float".to_string(),
                                     "float2longlong".to_string(),
                                 ],
+                                fun_decl_id: None,
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
                             result_ty: ValueType::Int,
@@ -11333,6 +11349,7 @@ impl<'a> Lowering<'a> {
                                     "longlong2float".to_string(),
                                     "float2longlong".to_string(),
                                 ],
+                                fun_decl_id: None,
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
                             result_ty: ValueType::Int,
@@ -11385,6 +11402,7 @@ impl<'a> Lowering<'a> {
                                     "slice".to_string(),
                                     "iter".to_string(),
                                 ],
+                                fun_decl_id: None,
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
                             result_ty: ValueType::Ref(None),
@@ -11408,6 +11426,7 @@ impl<'a> Lowering<'a> {
                         OpKind::Call {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["__strlen".to_string()],
+                                fun_decl_id: None,
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
                             result_ty: ValueType::Int,
@@ -11465,6 +11484,7 @@ impl<'a> Lowering<'a> {
                         OpKind::Call {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["__strlen".to_string()],
+                                fun_decl_id: None,
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
                             result_ty: ValueType::Int,
@@ -11547,6 +11567,7 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::Call {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["__len".to_string()],
+                                fun_decl_id: None,
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
                             result_ty: ValueType::Int,
@@ -11657,6 +11678,8 @@ impl<'a> Lowering<'a> {
                 // `unaryop.rs` (lib test
                 // `generic_handler_graphs_keep_symbolic_fnaddr_surface`).
                 let (segments, method_hint) = self.call_target_segments(mir_bb, &reg)?;
+                let original_segments = segments.clone();
+                let original_method_hint = method_hint.clone();
                 // `<[T]>::to_vec(slice)` copies the slice into an owned Vec —
                 // the RPython `list(slice)` builtin, whose `rtype_bltn_list`
                 // (`rlist.py`) `gendirectcall`s `ll_copy`. Retarget the
@@ -11909,6 +11932,7 @@ impl<'a> Lowering<'a> {
                                     "longobject".to_string(),
                                     "jit_bigint_from_i64".to_string(),
                                 ],
+                                fun_decl_id: None,
                             },
                             args: crate::model::call_args(vec![cst]),
                             result_ty: ValueType::Ref(None),
@@ -11994,6 +12018,7 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::Call {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["__strlen".to_string()],
+                                fun_decl_id: None,
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
                             result_ty: ValueType::Int,
@@ -12102,6 +12127,7 @@ impl<'a> Lowering<'a> {
                         OpKind::Call {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["__len".to_string()],
+                                fun_decl_id: None,
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
                             result_ty: ValueType::Int,
@@ -12245,17 +12271,22 @@ impl<'a> Lowering<'a> {
                     // shape as the `elidable_promote` wrapper's
                     // `hint_promote_or_string`.
                     let promote_marker = self.jit_promote_marker(&reg);
+                    let fun_decl_id = regular_call_fun_decl_id(&reg.kind);
                     let target = if let Some((trait_root, method_name)) =
                         abstract_trait_call_target(&reg, self.llbc)
                     {
                         CallTarget::indirect(trait_root, method_name)
                     } else if let Some(path) = scalar_inherent_method_path(&reg, self.llbc) {
-                        CallTarget::FunctionPath { segments: path }
+                        CallTarget::FunctionPath {
+                            segments: path,
+                            fun_decl_id: None,
+                        }
                     } else if args.len() == 1
                         && let Some(marker) = promote_marker
                     {
                         CallTarget::FunctionPath {
                             segments: vec![marker.to_string()],
+                            fun_decl_id: None,
                         }
                     } else {
                         // `CallTarget::Method` requires a receiver in `args[0]`
@@ -12269,11 +12300,34 @@ impl<'a> Lowering<'a> {
                         // panics at `flowspace_adapter.rs` ("Call::Method
                         // has empty args").  Fall back to the `FunctionPath`
                         // segments when there is no receiver to thread.
+                        let same_callee =
+                            segments == original_segments && method_hint == original_method_hint;
                         match method_hint {
                             Some((owner_root, leaf)) if !args.is_empty() => {
-                                CallTarget::method(leaf, Some(owner_root))
+                                // Method is this FunDecl: stamp its registered
+                                // path so `target_to_path` does not use the
+                                // owner leaf as a suffix of the impl key.
+                                let mut target = CallTarget::method(leaf, Some(owner_root));
+                                if let Some(id) = fun_decl_id {
+                                    target = target.with_fun_decl_id(id);
+                                    if let Some(fd) = self.llbc.fn_by_id(id) {
+                                        target = target.with_resolved_path(
+                                            registered_path_for_fun_decl(self.llbc, fd),
+                                        );
+                                    }
+                                }
+                                target
                             }
-                            _ => CallTarget::FunctionPath { segments },
+                            _ => {
+                                let mut target = CallTarget::FunctionPath {
+                                    segments,
+                                    fun_decl_id: None,
+                                };
+                                if same_callee && let Some(id) = fun_decl_id {
+                                    target = target.with_fun_decl_id(id);
+                                }
+                                target
+                            }
                         }
                     };
                     OpKind::Call {
@@ -12347,6 +12401,7 @@ impl<'a> Lowering<'a> {
                     OpKind::Call {
                         target: CallTarget::FunctionPath {
                             segments: vec!["__dyn_call".to_string()],
+                            fun_decl_id: None,
                         },
                         args: crate::model::call_args(full_args),
                         result_ty,
@@ -12382,7 +12437,7 @@ impl<'a> Lowering<'a> {
         // and `jtransform::rewrite_op_hint` rewrites it to the
         // `<kind>_guard_value` family.
         let op_kind = if let OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } = &op_kind
@@ -12405,7 +12460,7 @@ impl<'a> Lowering<'a> {
         // those exact formatting boundaries to one-word `BytesBlock*`
         // wrappers; the complex sign/parenthesis builder remains in its graph.
         let op_kind = if let OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } = &op_kind
@@ -12413,7 +12468,10 @@ impl<'a> Lowering<'a> {
             && let Some(residual) = crate::front::rfloat_call::repr_residual_path(segments)
         {
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments: residual },
+                target: CallTarget::FunctionPath {
+                    segments: residual,
+                    fun_decl_id: None,
+                },
                 args: args.clone(),
                 result_ty: ValueType::Ref(None),
             }
@@ -12434,7 +12492,7 @@ impl<'a> Lowering<'a> {
                 .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
             && tyref_is_rbigint(&call.dest.ty, self.llbc)
             && let Some(segments) = match target {
-                CallTarget::FunctionPath { segments } => segments
+                CallTarget::FunctionPath { segments, .. } => segments
                     .last()
                     .and_then(|leaf| crate::front::rbigint_call::clone_residual_for_method(leaf)),
                 CallTarget::Method { name, .. } => {
@@ -12443,7 +12501,7 @@ impl<'a> Lowering<'a> {
                 _ => None,
             } {
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
+                target: CallTarget::function_path(segments),
                 args: args.clone(),
                 result_ty: ValueType::Ref(None),
             }
@@ -12458,7 +12516,7 @@ impl<'a> Lowering<'a> {
         // duplicate the translated object. Wrap the existing payload pointer
         // directly, matching `W_LongObject(value)` in PyPy.
         let op_kind = if let OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } = &op_kind
@@ -12469,7 +12527,10 @@ impl<'a> Lowering<'a> {
             && let Some(residual) = crate::front::rbigint_call::long_box_residual_path(segments)
         {
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments: residual },
+                target: CallTarget::FunctionPath {
+                    segments: residual,
+                    fun_decl_id: None,
+                },
                 args: args.clone(),
                 result_ty: ValueType::Ref(None),
             }
@@ -12496,7 +12557,7 @@ impl<'a> Lowering<'a> {
                 .as_ref()
                 .is_some_and(|t| tyref_is_rbigint(t, self.llbc))
             && let Some(residual) = match target {
-                CallTarget::FunctionPath { segments } => {
+                CallTarget::FunctionPath { segments, .. } => {
                     crate::front::bigint_binop::bigint_binop_residual_path(segments)
                 }
                 CallTarget::Method { name, .. } => {
@@ -12505,7 +12566,10 @@ impl<'a> Lowering<'a> {
                 _ => None,
             } {
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments: residual },
+                target: CallTarget::FunctionPath {
+                    segments: residual,
+                    fun_decl_id: None,
+                },
                 args: args.clone(),
                 result_ty: ValueType::Ref(None),
             }
@@ -12530,7 +12594,7 @@ impl<'a> Lowering<'a> {
                 .as_ref()
                 .is_some_and(|ty| self.tyref_literal_int_atom(ty) == Some("I64"))
             && let Some(residual) = match target {
-                CallTarget::FunctionPath { segments } => segments.last().and_then(|leaf| {
+                CallTarget::FunctionPath { segments, .. } => segments.last().and_then(|leaf| {
                     crate::front::rbigint_call::int_binop_residual_for_method(leaf)
                 }),
                 CallTarget::Method { name, .. } => {
@@ -12539,7 +12603,10 @@ impl<'a> Lowering<'a> {
                 _ => None,
             } {
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments: residual },
+                target: CallTarget::FunctionPath {
+                    segments: residual,
+                    fun_decl_id: None,
+                },
                 args: args.clone(),
                 result_ty: ValueType::Ref(None),
             }
@@ -12568,7 +12635,7 @@ impl<'a> Lowering<'a> {
             && args.len() == 2
             && let Some(name) = match target {
                 CallTarget::Method { name, .. } => Some(name.as_str()),
-                CallTarget::FunctionPath { segments } => {
+                CallTarget::FunctionPath { segments, .. } => {
                     segments.last().map(std::string::String::as_str)
                 }
                 _ => None,
@@ -12596,7 +12663,7 @@ impl<'a> Lowering<'a> {
         let op_kind = if let OpKind::Call { target, args, .. } = &op_kind
             && args.len() == 2
             && let Some(leaf) = match target {
-                CallTarget::FunctionPath { segments } => {
+                CallTarget::FunctionPath { segments, .. } => {
                     crate::codewriter::minmax::cmp_binop_leaf(segments)
                 }
                 CallTarget::Method { name, .. } => match name.as_str() {
@@ -12647,7 +12714,7 @@ impl<'a> Lowering<'a> {
                 .as_ref()
                 .is_some_and(|ty| self.tyref_literal_int_atom(ty) == Some("I64"))
             && let Some(residual) = match target {
-                CallTarget::FunctionPath { segments } => segments.last().and_then(|leaf| {
+                CallTarget::FunctionPath { segments, .. } => segments.last().and_then(|leaf| {
                     crate::front::rbigint_call::int_comparison_residual_for_method(leaf)
                 }),
                 CallTarget::Method { name, .. } => {
@@ -12656,7 +12723,10 @@ impl<'a> Lowering<'a> {
                 _ => None,
             } {
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments: residual },
+                target: CallTarget::FunctionPath {
+                    segments: residual,
+                    fun_decl_id: None,
+                },
                 args: args.clone(),
                 result_ty: ValueType::Bool,
             }
@@ -12683,7 +12753,7 @@ impl<'a> Lowering<'a> {
                 )
             })
             && let Some(residual) = match target {
-                CallTarget::FunctionPath { segments } => {
+                CallTarget::FunctionPath { segments, .. } => {
                     crate::front::bigint_binop::bigint_shift_residual_path(segments)
                 }
                 CallTarget::Method { name, .. } => {
@@ -12692,7 +12762,10 @@ impl<'a> Lowering<'a> {
                 _ => None,
             } {
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments: residual },
+                target: CallTarget::FunctionPath {
+                    segments: residual,
+                    fun_decl_id: None,
+                },
                 args: args.clone(),
                 result_ty: ValueType::Ref(None),
             }
@@ -12711,7 +12784,7 @@ impl<'a> Lowering<'a> {
                 .as_ref()
                 .is_some_and(|t| tyref_is_rbigint(t, self.llbc))
             && let Some(residual) = match target {
-                CallTarget::FunctionPath { segments } => {
+                CallTarget::FunctionPath { segments, .. } => {
                     crate::front::bigint_binop::bigint_unop_residual_path(segments)
                 }
                 CallTarget::Method { name, .. } => {
@@ -12720,7 +12793,10 @@ impl<'a> Lowering<'a> {
                 _ => None,
             } {
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments: residual },
+                target: CallTarget::FunctionPath {
+                    segments: residual,
+                    fun_decl_id: None,
+                },
                 args: args.clone(),
                 result_ty: ValueType::Ref(None),
             }
@@ -12736,7 +12812,7 @@ impl<'a> Lowering<'a> {
         // sole operand and destination both the opaque `BigInt` ADT.  Same
         // pure-target-swap, fail-safe contract.
         let op_kind = if let OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } = &op_kind
@@ -12748,7 +12824,10 @@ impl<'a> Lowering<'a> {
             && let Some(residual) = crate::front::rbigint_call::unop_wrapper_residual_path(segments)
         {
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments: residual },
+                target: CallTarget::FunctionPath {
+                    segments: residual,
+                    fun_decl_id: None,
+                },
                 args: args.clone(),
                 result_ty: ValueType::Ref(None),
             }
@@ -12769,7 +12848,7 @@ impl<'a> Lowering<'a> {
                 .as_ref()
                 .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
             && match target {
-                CallTarget::FunctionPath { segments } => matches!(
+                CallTarget::FunctionPath { segments, .. } => matches!(
                     segments.last().map(String::as_str),
                     Some("digits" | "digits_mut")
                 ),
@@ -12809,7 +12888,7 @@ impl<'a> Lowering<'a> {
                 .as_ref()
                 .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
             && let Some(leaf) = match target {
-                CallTarget::FunctionPath { segments } => segments.last(),
+                CallTarget::FunctionPath { segments, .. } => segments.last(),
                 _ => None,
             }
             && matches!(
@@ -12847,7 +12926,7 @@ impl<'a> Lowering<'a> {
                 .as_ref()
                 .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
             && let Some(residual) = match target {
-                CallTarget::FunctionPath { segments } => {
+                CallTarget::FunctionPath { segments, .. } => {
                     crate::front::bigint_binop::bigint_comparison_residual_path(segments)
                 }
                 CallTarget::Method { name, .. } => {
@@ -12856,7 +12935,10 @@ impl<'a> Lowering<'a> {
                 _ => None,
             } {
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments: residual },
+                target: CallTarget::FunctionPath {
+                    segments: residual,
+                    fun_decl_id: None,
+                },
                 args: args.clone(),
                 result_ty: ValueType::Bool,
             }
@@ -12874,7 +12956,7 @@ impl<'a> Lowering<'a> {
                 .as_ref()
                 .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
             && let Some((segments, scalar_result)) = match target {
-                CallTarget::FunctionPath { segments } => segments
+                CallTarget::FunctionPath { segments, .. } => segments
                     .last()
                     .and_then(|leaf| crate::front::rbigint_call::scalar_residual_for_method(leaf)),
                 CallTarget::Method { name, .. } => {
@@ -12887,7 +12969,7 @@ impl<'a> Lowering<'a> {
                 crate::front::rbigint_call::ScalarResult::Bool => ValueType::Bool,
             };
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
+                target: CallTarget::function_path(segments),
                 args: args.clone(),
                 result_ty,
             }
@@ -12900,7 +12982,7 @@ impl<'a> Lowering<'a> {
         // whose C ABI returns `*mut RBigInt`; never narrow i128/u128, which
         // RPython's JIT deliberately has no register kind for.
         let op_kind = if let OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } = &op_kind
@@ -12921,7 +13003,10 @@ impl<'a> Lowering<'a> {
                     crate::front::rbigint_call::constructor_residual_path(segments, unsigned)
             {
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments: residual },
+                    target: CallTarget::FunctionPath {
+                        segments: residual,
+                        fun_decl_id: None,
+                    },
                     args: args.clone(),
                     result_ty: ValueType::Ref(None),
                 }
@@ -12936,7 +13021,7 @@ impl<'a> Lowering<'a> {
         // quotient/remainder projections. Retarget their direct RBigInt
         // results to the two pointer-ABI halves of upstream `divmod`.
         let op_kind = if let OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } = &op_kind
@@ -12952,7 +13037,10 @@ impl<'a> Lowering<'a> {
                 crate::front::rbigint_call::divmod_projection_residual_path(segments)
         {
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments: residual },
+                target: CallTarget::FunctionPath {
+                    segments: residual,
+                    fun_decl_id: None,
+                },
                 args: args.clone(),
                 result_ty: ValueType::Ref(None),
             }
@@ -12964,7 +13052,7 @@ impl<'a> Lowering<'a> {
         // LOAD_CONST seam.  The conversion result is the same translated
         // one-GC-reference RBigInt shape as every local constructor.
         let op_kind = if let OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } = &op_kind
@@ -12974,7 +13062,10 @@ impl<'a> Lowering<'a> {
                 crate::front::rbigint_call::compiler_bigint_residual_path(segments)
         {
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments: residual },
+                target: CallTarget::FunctionPath {
+                    segments: residual,
+                    fun_decl_id: None,
+                },
                 args: args.clone(),
                 result_ty: ValueType::Ref(None),
             }
@@ -12989,7 +13080,7 @@ impl<'a> Lowering<'a> {
         // the Result-of-PyError capture immediately below rewires the compiler
         // generated `?` diamond into LastException exits.
         let op_kind = if let OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } = &op_kind
@@ -13003,7 +13094,10 @@ impl<'a> Lowering<'a> {
             && let Some(residual) = crate::front::rbigint_call::pow_nomod_residual_path(segments)
         {
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments: residual },
+                target: CallTarget::FunctionPath {
+                    segments: residual,
+                    fun_decl_id: None,
+                },
                 args: args.clone(),
                 result_ty: ValueType::Ref(None),
             }
@@ -13018,7 +13112,7 @@ impl<'a> Lowering<'a> {
         // the Result diamond.  The `_make_ovf2long` seams take the same shape
         // with both operands already machine words.
         let op_kind = if let OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } = &op_kind
@@ -13051,7 +13145,10 @@ impl<'a> Lowering<'a> {
                 .or_else(|| crate::front::rbigint_call::ovf2long_residual_path(segments))
         {
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments: residual },
+                target: CallTarget::FunctionPath {
+                    segments: residual,
+                    fun_decl_id: None,
+                },
                 args: args.clone(),
                 result_ty: ValueType::Ref(None),
             }
@@ -13265,7 +13362,7 @@ impl<'a> Lowering<'a> {
         // leave the constant-operand form on the residual path for want of a
         // type the callee's signature already fixes.
         if let OpKind::Call { target, .. } = &op_kind
-            && let CallTarget::FunctionPath { segments } = target
+            && let CallTarget::FunctionPath { segments, .. } = target
             && matches!(
                 segments.last().map(String::as_str),
                 Some("checked_add" | "checked_sub" | "checked_mul")
@@ -13363,7 +13460,7 @@ impl<'a> Lowering<'a> {
         // resolution miss leaves the residual `then` call — an unregistered
         // callee the rtyper census Skips, so no graph regresses.
         if let OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } = &op_kind
@@ -13381,7 +13478,7 @@ impl<'a> Lowering<'a> {
         // `call_once`).  Same Opaque-core-combinator residual + census Skip as
         // `then`; a resolution miss leaves the residual call.
         if let OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } = &op_kind
@@ -13398,7 +13495,7 @@ impl<'a> Lowering<'a> {
         // unregistered callee the rtyper census Skips; a resolution miss leaves
         // the residual call.
         if let OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } = &op_kind
@@ -13412,7 +13509,7 @@ impl<'a> Lowering<'a> {
         // `<[T]>::last(slice)` is `first` with index `len-1` and the
         // same non-empty guard.
         if let OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } = &op_kind
@@ -13433,7 +13530,7 @@ impl<'a> Lowering<'a> {
         // range instantiation (whose payload is a sub-slice) and any other
         // resolution miss both leave the residual call.
         if let OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } = &op_kind
@@ -13452,7 +13549,7 @@ impl<'a> Lowering<'a> {
         // RangeFrom aggregate was captured at construction time; exact value
         // identity keeps this arm separate from arbitrary SliceIndex impls.
         if let OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } = &op_kind
@@ -13482,7 +13579,7 @@ impl<'a> Lowering<'a> {
         // `TYPE_MIN` (a different diamond) and stays residual.  A resolution
         // miss leaves the residual call.
         if let OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } = &op_kind
@@ -13508,7 +13605,7 @@ impl<'a> Lowering<'a> {
         // Skip).  The op is still emitted normally; the post-pass removes
         // it once the paired `contains` folds.
         if let OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } = &op_kind
@@ -13536,7 +13633,7 @@ impl<'a> Lowering<'a> {
         // recorded site with its producing `new` and declines on any
         // structural mismatch.
         if let OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } = &op_kind
@@ -15165,7 +15262,7 @@ impl<'a> Lowering<'a> {
                 matches!(
                     kind,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if segments.first().map(String::as_str) == Some("__str_const")
                 )
@@ -15912,6 +16009,7 @@ impl<'a> Lowering<'a> {
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["longlong2float".to_string(), leaf.to_string()],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![operand]),
                 result_ty,
@@ -18290,6 +18388,7 @@ impl<'a> Lowering<'a> {
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "cmp".into(), leaf.clone()],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(args.iter().cloned()),
                 result_ty,
@@ -18896,6 +18995,7 @@ impl<'a> Lowering<'a> {
                         "longobject".to_string(),
                         "jit_bigint_to_i64_value_or_zero".to_string(),
                     ],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![arg.clone()]),
                 result_ty: ValueType::Int,
@@ -18910,6 +19010,7 @@ impl<'a> Lowering<'a> {
                         "longobject".to_string(),
                         "jit_bigint_to_i64_fits".to_string(),
                     ],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![arg]),
                 result_ty: ValueType::Int,
@@ -19022,6 +19123,7 @@ impl<'a> Lowering<'a> {
                         "dictmultiobject".to_string(),
                         "wtf8_key_is_utf8".to_string(),
                     ],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![arg.clone()]),
                 result_ty: ValueType::Bool,
@@ -19182,6 +19284,7 @@ impl<'a> Lowering<'a> {
                             .into_iter()
                             .map(str::to_string)
                             .collect(),
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![arg]),
                     result_ty: ValueType::Unsigned,
@@ -19463,6 +19566,7 @@ impl<'a> Lowering<'a> {
                             .into_iter()
                             .map(str::to_string)
                             .collect(),
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![arg]),
                     result_ty: ValueType::Unsigned,
@@ -19481,6 +19585,7 @@ impl<'a> Lowering<'a> {
                             .into_iter()
                             .map(str::to_string)
                             .collect(),
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![arg]),
                     result_ty: ValueType::Int,
@@ -21404,6 +21509,30 @@ fn regular_call_name_path(reg: &RegularCall, llbc: &Llbc) -> Option<String> {
     llbc.fn_by_id(*id).map(|fd| fd.item_meta.name_path())
 }
 
+fn regular_call_fun_decl_id(kind: &CallKind) -> Option<u64> {
+    match kind {
+        CallKind::Fun(FunId::Regular { id }) => Some(*id),
+        CallKind::Trait(v) => v
+            .as_array()
+            .and_then(|arr| arr.get(2))
+            .and_then(serde_json::Value::as_u64),
+        _ => None,
+    }
+}
+
+/// The `CallPath` `lib.rs` registers for this FunDecl: crate-stripped
+/// free-function path, or `for_impl_method(owner, leaf)` for an impl
+/// method (`register_trait_method` / inherent registration). A trait-impl
+/// id is local to one LLBC and is not part of this key.
+fn registered_path_for_fun_decl(llbc: &Llbc, fd: &FunDecl) -> crate::parse::CallPath {
+    if let Some((owner, leaf)) = impl_method_owner_for_fundecl(llbc, fd) {
+        crate::parse::CallPath::for_impl_method(&owner, &leaf)
+    } else {
+        let stripped = strip_crate_prefix(&fd.item_meta.name_path());
+        crate::parse::CallPath::from_segments(stripped.split("::").filter(|s| !s.is_empty()))
+    }
+}
+
 /// True for the root-stack publication helper.  Both the free function and
 /// `RootScope` method spell the last two semantic components `gc_roots` and
 /// `pin_root`, with an optional `<Impl>` segment between them.
@@ -21450,7 +21579,7 @@ fn drop_lowers_as_glue_call(place: &Place, fn_ptr: &RegularCall, llbc: &Llbc) ->
 /// that walks a close has to see either spelling.
 pub(crate) fn is_root_scope_drop_glue_call(kind: &OpKind) -> bool {
     let OpKind::Call {
-        target: CallTarget::FunctionPath { segments },
+        target: CallTarget::FunctionPath { segments, .. },
         ..
     } = kind
     else {
@@ -24253,6 +24382,7 @@ fn push_cast_ptr_to_int(graph: &mut FunctionGraph, bb_id: BlockId, arg: Variable
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
+                fun_decl_id: None,
             },
             args: crate::model::call_args(vec![arg]),
             result_ty: ValueType::Int,
@@ -24282,6 +24412,7 @@ fn push_ptr_to_unsigned_cast(
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
+            fun_decl_id: None,
         },
         args: crate::model::call_args(vec![signed]),
         result_ty: ValueType::Unsigned,
@@ -27925,7 +28056,7 @@ const NON_ADT_OWNER_METHOD_ALLOWLIST: &[(&str, &str)] =
 /// Used by the `CallKind::Trait` arm of
 /// [`Lowering::call_target_segments`] to emit
 /// `CallTarget::FunctionPath { segments: [trait_leaf, method_leaf]
-/// }`, matching the direct-path key
+///, fun_decl_id: None }`, matching the direct-path key
 /// `register_function_graph(direct_path, …)` at `lib.rs`
 /// (`extract_trait_impls`'s `<default methods of <Trait>>` branch).
 fn trait_method_owner(fd: &FunDecl) -> Option<(String, String)> {
@@ -28708,6 +28839,7 @@ fn fold_named_const_on_llbc(llbc: &Llbc, def_id: u64) -> Option<OpKind> {
         DecodedConst::Str(s) => Some(OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: vec!["__str_const".to_string(), s],
+                fun_decl_id: None,
             },
             args: crate::model::call_args(vec![]),
             result_ty: ValueType::Ref(None),
@@ -31318,7 +31450,7 @@ fn extract_fmt_arg(
     let block = graph.blocks.iter().find(|b| b.id == block_id)?;
     let (kind, inner) = match &block.operations.get(idx)?.kind {
         OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } => (fmt_argument_ctor_kind(segments)?, args.first()?.clone()),
@@ -31350,7 +31482,7 @@ fn extract_fmt_chain(
     let block = graph.blocks.iter().find(|b| b.id == block_id)?;
     let (pieces_var, args_var) = match &block.operations.get(idx)?.kind {
         OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } if is_arguments_new_path(segments) => (args.first()?.clone(), args.get(1)?.clone()),
@@ -31407,6 +31539,7 @@ fn emit_str_const(graph: &mut FunctionGraph, bb_id: BlockId, text: &str) -> Vari
         kind: OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: vec!["__str_const".to_string(), text.to_string()],
+                fun_decl_id: None,
             },
             args: crate::model::call_args(vec![]),
             result_ty: ValueType::Ref(None),
@@ -31493,6 +31626,7 @@ fn emit_fmt_expansion_ops(
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__str_const".to_string(), text.to_string()],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![]),
                 result_ty: ValueType::Ref(None),
@@ -31584,6 +31718,7 @@ fn emit_lower_hex_byte_02_ops(
         kind: OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: vec!["__str_const".to_string(), "0123456789abcdef".to_string()],
+                fun_decl_id: None,
             },
             args: crate::model::call_args(vec![]),
             result_ty: ValueType::Ref(None),
@@ -31672,6 +31807,7 @@ fn emit_lower_hex_byte_02_ops(
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__str_const".to_string(), pieces[0].clone()],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![]),
                 result_ty: ValueType::Ref(None),
@@ -31688,6 +31824,7 @@ fn emit_lower_hex_byte_02_ops(
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__str_const".to_string(), pieces[1].clone()],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![]),
                 result_ty: ValueType::Ref(None),
@@ -31823,7 +31960,7 @@ fn navigate_single_arg_fmt_chain(
     let format_op = block_f.operations.get(fi)?;
     let (fmt_args, format_result) = match &format_op.kind {
         OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } if fmt_path_ends_with(segments, &["fmt", "format"]) => (
@@ -31855,7 +31992,7 @@ fn navigate_single_arg_fmt_chain(
     let block_p = graph.blocks.iter().find(|b| b.id == bp)?;
     let (pieces_var, args_var) = block_p.operations.iter().find_map(|op| match &op.kind {
         OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } if op.result.as_ref().map(|r| r.id()) == Some(arguments_var.id())
@@ -31882,7 +32019,7 @@ fn navigate_single_arg_fmt_chain(
     let block_0 = graph.blocks.iter().find(|b| b.id == b0)?;
     let (arg_ref, tuple_var) = block_0.operations.iter().find_map(|op| match &op.kind {
         OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } if op.result.as_ref().map(|r| r.id()) == Some(new_arg_var.id())
@@ -31984,7 +32121,7 @@ fn collapse_fmt_chains(graph: &mut FunctionGraph) -> usize {
                 .enumerate()
                 .filter_map(move |(fi, op)| match &op.kind {
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if fmt_path_ends_with(segments, &["fmt", "format"]) => Some((block.id, fi)),
                     _ => None,
@@ -32114,7 +32251,7 @@ fn collapse_lower_hex_byte_fmt_chains(graph: &mut FunctionGraph) -> usize {
                 .enumerate()
                 .filter_map(move |(fi, op)| match &op.kind {
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if fmt_path_ends_with(segments, &["fmt", "format"]) => Some((block.id, fi)),
                     _ => None,
@@ -32204,7 +32341,7 @@ fn collapse_const_fmt(graph: &mut FunctionGraph) -> usize {
     for block in &graph.blocks {
         for (fi, op) in block.operations.iter().enumerate() {
             let OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
+                target: CallTarget::FunctionPath { segments, .. },
                 args,
                 ..
             } = &op.kind
@@ -32228,7 +32365,11 @@ fn collapse_const_fmt(graph: &mut FunctionGraph) -> usize {
                 .map(|o| &o.kind)
             {
                 Some(OpKind::Call {
-                    target: CallTarget::FunctionPath { segments: pseg },
+                    target:
+                        CallTarget::FunctionPath {
+                            segments: pseg,
+                            fun_decl_id: None,
+                        },
                     args: pargs,
                     ..
                 }) if pargs.is_empty() && pseg.len() == 2 && pseg[0] == "__str_const" => {
@@ -32246,6 +32387,7 @@ fn collapse_const_fmt(graph: &mut FunctionGraph) -> usize {
             op.kind = OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__str_const".to_string(), text],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![]),
                 result_ty: ValueType::Ref(None),
@@ -32618,7 +32760,7 @@ fn collect_fmt_collapse_multi(
     let format_op = block_f.operations.get(fi)?;
     let fmt_args = match &format_op.kind {
         OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } if fmt_path_ends_with(segments, &["fmt", "format"]) => {
@@ -32654,7 +32796,7 @@ fn collect_fmt_collapse_multi(
     let args_new_op = block_p.operations.get(args_idx)?;
     let (pieces_var, args_var) = match &args_new_op.kind {
         OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } if is_arguments_new_path(segments) => (args.first()?.clone(), args.get(1)?.clone()),
@@ -32675,7 +32817,7 @@ fn collect_fmt_collapse_multi(
         let blk = graph.blocks.iter().find(|b| b.id == b_i)?;
         let inner = match &blk.operations.get(idx_i)?.kind {
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
+                target: CallTarget::FunctionPath { segments, .. },
                 args,
                 ..
             } if fmt_argument_ctor_kind(segments) == Some(FmtArgKind::Display) => {
@@ -32747,7 +32889,7 @@ fn collapse_fmt_chains_multi(graph: &mut FunctionGraph) -> usize {
                 .enumerate()
                 .filter_map(move |(fi, op)| match &op.kind {
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if fmt_path_ends_with(segments, &["fmt", "format"]) => Some((block.id, fi)),
                     _ => None,
@@ -33037,7 +33179,7 @@ fn collapse_debug_enum_fmt_chains(graph: &mut FunctionGraph, llbc: &Llbc) -> usi
                 .enumerate()
                 .filter_map(move |(fi, op)| match &op.kind {
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if fmt_path_ends_with(segments, &["fmt", "format"]) => Some((block.id, fi)),
                     _ => None,
@@ -33308,7 +33450,7 @@ fn panic_block_is_pure_message(block: &crate::model::Block) -> bool {
                 ..
             } => true,
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
+                target: CallTarget::FunctionPath { segments, .. },
                 ..
             } => is_message_extern(segments),
             _ => false,
@@ -34886,6 +35028,7 @@ mod tests {
                         "Argument".to_string(),
                         "new_display".to_string(),
                     ],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![arg_ref]),
                 result_ty: ValueType::Ref(Some("Argument".to_string())),
@@ -34953,6 +35096,7 @@ mod tests {
                         "Arguments".to_string(),
                         "new".to_string(),
                     ],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![pieces_arr.clone(), args_arr]),
                 result_ty: ValueType::Ref(Some("Arguments".to_string())),
@@ -35029,6 +35173,7 @@ mod tests {
                         .iter()
                         .map(|s| s.to_string())
                         .collect(),
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![arg_ref]),
                 result_ty: ValueType::Ref(None),
@@ -35092,6 +35237,7 @@ mod tests {
                         .iter()
                         .map(|s| s.to_string())
                         .collect(),
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![pieces_arr, args_arr]),
                 result_ty: ValueType::Ref(None),
@@ -35112,6 +35258,7 @@ mod tests {
                         .iter()
                         .map(|s| s.to_string())
                         .collect(),
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![fmt_args_in.clone()]),
                 result_ty: ValueType::Ref(None),
@@ -35133,7 +35280,7 @@ mod tests {
         assert_eq!(bf_block.operations.len(), 3);
         match &bf_block.operations[0].kind {
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
+                target: CallTarget::FunctionPath { segments, .. },
                 args,
                 ..
             } => {
@@ -35223,6 +35370,7 @@ mod tests {
                             .iter()
                             .map(|s| s.to_string())
                             .collect(),
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![fmt_args]),
                     result_ty: ValueType::Ref(None),
@@ -35264,7 +35412,7 @@ mod tests {
         let has_format = graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
             matches!(
                 &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if super::fmt_path_ends_with(segments, &["fmt", "format"])
             )
         });
@@ -35293,7 +35441,7 @@ mod tests {
             .flat_map(|b| &b.operations)
             .filter_map(|op| match &op.kind {
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments.first().map(String::as_str) == Some("__str_const") => {
                     segments.get(1).cloned()
@@ -35390,6 +35538,7 @@ mod tests {
 
         let fpath = |segs: &[&str]| CallTarget::FunctionPath {
             segments: segs.iter().map(|s| s.to_string()).collect(),
+            fun_decl_id: None,
         };
 
         // ── B0: Tuple{x, y} + FieldRead __pos_0 + new_display(&x) ──
@@ -35577,7 +35726,7 @@ mod tests {
         for b in &graph.blocks {
             for op in &b.operations {
                 if let OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } = &op.kind
                 {
@@ -35671,6 +35820,7 @@ mod tests {
 
         let fpath = |segs: &[&str]| CallTarget::FunctionPath {
             segments: segs.iter().map(|s| s.to_string()).collect(),
+            fun_decl_id: None,
         };
 
         // ── B0: Tuple{x, y} + both FieldWrites + FieldRead __pos_0 + new_display ──
@@ -35853,7 +36003,7 @@ mod tests {
         for b in &graph.blocks {
             for op in &b.operations {
                 if let OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } = &op.kind
                 {
@@ -35931,7 +36081,7 @@ mod tests {
         let str_const_text = |i: usize| -> String {
             match &ops[i].kind {
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments.first().map(String::as_str) == Some("__str_const") => {
                     segments[1].clone()
@@ -35999,7 +36149,7 @@ mod tests {
             !ops.iter().any(|op| matches!(
                 &op.kind,
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if super::fmt_path_ends_with(segments, &["fmt", "format"])
             )),
@@ -36011,7 +36161,7 @@ mod tests {
             ops.iter().any(|op| matches!(
                 &op.kind,
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments
                     == &[
@@ -36068,7 +36218,7 @@ mod tests {
             .filter(|op| {
                 matches!(
                     &op.kind,
-                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if super::fmt_path_ends_with(segments, &["Arguments", "from_str_nonconst"])
                 )
             })
@@ -36117,7 +36267,7 @@ mod tests {
                 matches!(
                     &op.kind,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if super::fmt_path_ends_with(segments, &["gc_alloc_storage_box"])
                 )
@@ -36256,7 +36406,7 @@ mod tests {
             matches!(
                 &op.kind,
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments.ends_with(&["Constants".to_string(), "index".to_string()])
             )
@@ -36287,7 +36437,7 @@ mod tests {
             matches!(
                 &op.kind,
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments.ends_with(&["Constants".to_string(), "deref".to_string()])
             )
@@ -36335,7 +36485,7 @@ mod tests {
                 .flat_map(|block| block.operations.iter())
                 .filter_map(|op| match &op.kind {
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } => Some(segments.as_slice()),
                     _ => None,
@@ -36385,7 +36535,7 @@ mod tests {
             matches!(
                 &op.kind,
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments.ends_with(&[
                     "vec".to_string(),
@@ -36398,7 +36548,7 @@ mod tests {
             matches!(
                 &op.kind,
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments.last().map(String::as_str) == Some("toint")
             )
@@ -36411,7 +36561,7 @@ mod tests {
                         matches!(
                             &op.kind,
                             OpKind::Call {
-                                target: CallTarget::FunctionPath { segments },
+                                target: CallTarget::FunctionPath { segments, .. },
                                 ..
                             } if segments.last().map(String::as_str) == Some(residual)
                         )
@@ -36499,7 +36649,7 @@ mod tests {
         let residual = ops.iter().any(|k| {
             matches!(
                 k,
-                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments.last().is_some_and(|s| s.ends_with("FUNCTION_OBJECT_SIZE"))
             )
         });
@@ -36537,7 +36687,7 @@ mod tests {
                 .filter(|op| {
                     matches!(
                         &op.kind,
-                        OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                             if super::fmt_path_ends_with(segments, leaf)
                     )
                 })
@@ -36557,7 +36707,7 @@ mod tests {
             .filter(|op| {
                 matches!(
                     &op.kind,
-                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if segments.first().is_some_and(|s| s == "__iter_next")
                 )
             })
@@ -36607,7 +36757,7 @@ mod tests {
                     .filter(|op| {
                         matches!(
                             &op.kind,
-                            OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                            OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                                 if super::fmt_path_ends_with(segments, leaf)
                         )
                     })
@@ -36646,7 +36796,7 @@ mod tests {
                 .filter(|op| {
                     matches!(
                         &op.kind,
-                        OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                             if segments == &["vec", "Vec", leaf]
                     )
                 })
@@ -36701,7 +36851,7 @@ mod tests {
             .flat_map(|block| block.operations.iter())
             .filter_map(|op| match &op.kind {
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } => Some(segments.as_slice()),
                 _ => None,
@@ -36744,7 +36894,7 @@ mod tests {
                 .flat_map(|block| block.operations.iter())
                 .filter_map(|op| match &op.kind {
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } => Some(segments.as_slice()),
                     _ => None,
@@ -36888,7 +37038,7 @@ mod tests {
                 .any(|op| matches!(
                     &op.kind,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         args,
                         ..
                     } if args.is_empty()
@@ -36975,7 +37125,7 @@ mod tests {
                     .filter(|op| {
                         matches!(
                             &op.kind,
-                            OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                            OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                                 if super::fmt_path_ends_with(
                                     segments,
                                     &["range", "RangeInclusive", leaf],
@@ -37040,7 +37190,7 @@ mod tests {
                 .filter(|op| {
                     matches!(
                         &op.kind,
-                        OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                             if super::fmt_path_ends_with(
                                 segments,
                                 &["range", "RangeInclusive", leaf],
@@ -37078,7 +37228,7 @@ mod tests {
             .flat_map(|b| b.operations.iter())
             .filter_map(|op| match &op.kind {
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } => Some(segments.as_slice()),
                 _ => None,
@@ -37121,7 +37271,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("lower {fname}: {e:?}"));
             assert!(
                 !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-                    matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if super::fmt_path_ends_with(
                             segments,
                             &["convert", "num", "<Impl>", "try_from"],
@@ -37621,6 +37771,7 @@ mod tests {
             return_type: None,
             self_ty_root: None,
             trait_impl_id: None,
+            fun_decl_id: None,
             module_path: String::new(),
             hints: Vec::new(),
             trait_root: None,
@@ -38335,7 +38486,7 @@ mod tests {
         ops.iter()
             .filter_map(|op| match &op.kind {
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } => segments.last().cloned(),
                 _ => None,
@@ -38617,7 +38768,7 @@ mod tests {
             ops.iter().any(|op| matches!(
                 &op.kind,
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments == &["vec".to_string(), "Vec".to_string(), "new".to_string()]
             )),
@@ -38646,7 +38797,7 @@ mod tests {
             ops.iter().any(|op| matches!(
                 &op.kind,
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments == &["vec".to_string(), "Vec".to_string(), "push".to_string()]
             )),
@@ -38670,7 +38821,7 @@ mod tests {
             ops.iter().any(|op| matches!(
                 &op.kind,
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments.last().is_some_and(|leaf| leaf == "with_capacity")
             )),
@@ -38680,7 +38831,7 @@ mod tests {
             !ops.iter().any(|op| matches!(
                 &op.kind,
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments == &["vec".to_string(), "Vec".to_string(), "new".to_string()]
             )),
@@ -38735,7 +38886,7 @@ mod tests {
             ops.iter().any(|op| matches!(
                 &op.kind,
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if matches!(segments.as_slice(), [a, b] if a == "longlong2float" && b == "float2longlong")
             )),
@@ -38756,7 +38907,7 @@ mod tests {
         assert!(
             !ops.iter().any(|op| match &op.kind {
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } => matches!(
                     segments.as_slice(),
@@ -38771,7 +38922,7 @@ mod tests {
             ops.iter().any(|op| matches!(
                 &op.kind,
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments.last().is_some_and(|leaf| leaf == "to_bits")
             )),
@@ -38801,7 +38952,7 @@ mod tests {
             ops.iter().any(|op| matches!(
                 &op.kind,
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments.last().is_some_and(|leaf| leaf == "to_int_unchecked")
             )),
@@ -38932,7 +39083,7 @@ mod tests {
             ops.iter().any(|op| matches!(
                 &op.kind,
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments.last().is_some_and(|leaf| leaf == "float2longlong")
             )),
@@ -38961,7 +39112,7 @@ mod tests {
                     matches!(
                         &op.kind,
                         OpKind::Call {
-                            target: CallTarget::FunctionPath { segments },
+                            target: CallTarget::FunctionPath { segments, .. },
                             ..
                         } if segments == &["core", "intrinsics", "transmute"]
                     )
@@ -39619,7 +39770,7 @@ mod tests {
         );
         match &graph.block(entry).operations.last().unwrap().kind {
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
+                target: CallTarget::FunctionPath { segments, .. },
                 args,
                 result_ty: ValueType::Int,
             } if segments.last().map(String::as_str) == Some("cast_ptr_to_int") => {
@@ -39662,7 +39813,7 @@ mod tests {
                 result: Some(signed),
                 kind:
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         args,
                         result_ty: ValueType::Int,
                     },
@@ -39677,7 +39828,7 @@ mod tests {
                 result: Some(actual_result),
                 kind:
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         args,
                         result_ty: ValueType::Unsigned,
                     },
@@ -40572,7 +40723,7 @@ mod tests {
                 .filter(|op| {
                     matches!(
                         &op.kind,
-                        OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                             if super::fmt_path_ends_with(segments, &["fmt", "format"])
                     )
                 })
@@ -40684,7 +40835,7 @@ mod tests {
             .flat_map(|b| &b.operations)
             .filter_map(|op| match &op.kind {
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments
                     == &[
@@ -40754,7 +40905,7 @@ mod tests {
             .filter(|op| {
                 matches!(
                     &op.kind,
-                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if super::fmt_path_ends_with(segments, &["vec", "Vec", "index_mut"])
                 )
             })
@@ -40798,7 +40949,7 @@ mod tests {
             .filter(|op| {
                 matches!(
                     &op.kind,
-                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if super::fmt_path_ends_with(segments, &["num", "<Impl>", "saturating_sub"])
                 )
             })
@@ -40901,7 +41052,7 @@ mod tests {
             .filter(|op| {
                 matches!(
                     &op.kind,
-                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if super::fmt_path_ends_with(segments, &["object_array", "<Impl>", "set_ref"])
                 )
             })
@@ -40998,7 +41149,7 @@ mod tests {
             .filter(|op| {
                 matches!(
                     &op.kind,
-                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if super::fmt_path_ends_with(segments, &["jit", "we_are_jitted"])
                 )
             })
@@ -41020,7 +41171,7 @@ mod tests {
             .filter(|op| {
                 matches!(
                     &op.kind,
-                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if super::fmt_path_ends_with(segments, &["baseobjspace", "_cached_lookup_where_name"])
                 )
             })
@@ -41056,7 +41207,7 @@ mod tests {
             .filter(|op| {
                 matches!(
                     &op.kind,
-                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if super::fmt_path_ends_with(segments, &["Argument", "new_debug"])
                 )
             })
@@ -41300,7 +41451,7 @@ mod tests {
             matches!(
                 &op.kind,
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if crate::model::cast_instance_root(&op.kind)
                     .is_some_and(|root| root.ends_with("PyObject"))
@@ -41450,7 +41601,7 @@ mod tests {
             .flat_map(|block| &block.operations)
             .filter_map(|op| match &op.kind {
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments
                     .iter()
@@ -41590,7 +41741,7 @@ mod tests {
                         .any(|op| matches!(
                             &op.kind,
                             OpKind::Call {
-                                target: CallTarget::FunctionPath { segments },
+                                target: CallTarget::FunctionPath { segments, .. },
                                 ..
                             } if segments.last().is_some_and(|leaf| leaf == offset_leaf)
                         )),
@@ -41619,7 +41770,7 @@ mod tests {
                 !operations.iter().any(|op| matches!(
                     &op.kind,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if segments == &["__deref_write".to_string()]
                 )),
@@ -41641,7 +41792,7 @@ mod tests {
                     .any(|op| matches!(
                         &op.kind,
                         OpKind::Call {
-                            target: CallTarget::FunctionPath { segments },
+                            target: CallTarget::FunctionPath { segments, .. },
                             ..
                         } if segments.last().is_some_and(|leaf| leaf == "from_raw_parts")
                     )),
@@ -41688,7 +41839,7 @@ mod tests {
                 !operations.iter().any(|operation| matches!(
                     &operation.kind,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if segments.last().is_some_and(|leaf| {
                         leaf == "from_raw_parts" || leaf == "__deref_write"
@@ -41701,7 +41852,7 @@ mod tests {
                     operations.iter().any(|operation| matches!(
                         &operation.kind,
                         OpKind::Call {
-                            target: CallTarget::FunctionPath { segments },
+                            target: CallTarget::FunctionPath { segments, .. },
                             ..
                         } if segments == &[crate::runtime_names::shims::LL_ARRAYMOVE.to_string()]
                     )),
@@ -41711,7 +41862,7 @@ mod tests {
                     !operations.iter().any(|operation| matches!(
                         &operation.kind,
                         OpKind::Call {
-                            target: CallTarget::FunctionPath { segments },
+                            target: CallTarget::FunctionPath { segments, .. },
                             ..
                         } if segments.as_slice() == ["core", "ptr", "copy"]
                             || segments.as_slice() == ["core", "ptr", "mut_ptr", "<Impl>", "add"]
@@ -41979,7 +42130,7 @@ mod tests {
             ops()
                 .filter(|op| match &op.kind {
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } => super::fmt_path_ends_with(segments, &["PyErrorKind", "ne"]),
                     _ => false,
@@ -42022,7 +42173,7 @@ mod tests {
                 .filter(|operation| matches!(
                     &operation.kind,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if super::fmt_path_ends_with(segments, &["cmp", "impls", "<Impl>", "ne"])
                 ))
@@ -42063,7 +42214,7 @@ mod tests {
             ops()
                 .filter(|op| matches!(
                     &op.kind,
-                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if super::fmt_path_ends_with(segments, &["cmp", "impls", "<Impl>", "eq"])
                 ))
                 .count(),
@@ -42209,7 +42360,7 @@ mod tests {
             .filter(|op| {
                 matches!(
                     &op.kind,
-                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if segments.last().map(String::as_str) == Some("from_raw_parts")
                 )
             })
@@ -42242,7 +42393,7 @@ mod tests {
             .flat_map(|block| block.operations.iter())
             .filter_map(|op| match &op.kind {
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } => Some(segments.clone()),
                 _ => None,
@@ -42287,7 +42438,7 @@ mod tests {
             .flat_map(|block| block.operations.iter())
             .filter_map(|op| match &op.kind {
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } => Some(segments.clone()),
                 _ => None,
@@ -42356,7 +42507,7 @@ mod tests {
                 .filter(|op| {
                     matches!(
                         &op.kind,
-                        OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                             if super::fmt_path_ends_with(
                                 segments,
                                 &["nonconst", "non_constant"],
@@ -42391,7 +42542,7 @@ mod tests {
             .filter(|op| {
                 matches!(
                     &op.kind,
-                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if segments.last().map(String::as_str) == Some("from_raw_parts")
                 )
             })
@@ -42427,7 +42578,7 @@ mod tests {
             .filter(|op| {
                 matches!(
                     &op.kind,
-                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if segments.last().map(String::as_str) == Some("from_raw_parts")
                 )
             })
@@ -42480,7 +42631,7 @@ mod tests {
             .filter(|op| {
                 matches!(
                     &op.kind,
-                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if segments.last().map(String::as_str)
                             == Some("gc_current_object_address")
                 )
@@ -42716,7 +42867,7 @@ mod tests {
             .filter(|op| {
                 matches!(
                     &op.kind,
-                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if segments.last().map(String::as_str) == Some("null_mut")
                 )
             })
@@ -42749,7 +42900,7 @@ mod tests {
                     matches!(
                         &op.kind,
                         OpKind::Call {
-                            target: crate::model::CallTarget::FunctionPath { segments },
+                            target: crate::model::CallTarget::FunctionPath { segments, .. },
                             ..
                         } if segments == &want
                     )
@@ -42790,7 +42941,7 @@ mod tests {
                 matches!(
                     &op.kind,
                     OpKind::Call {
-                        target: crate::model::CallTarget::FunctionPath { segments },
+                        target: crate::model::CallTarget::FunctionPath { segments, .. },
                         ..
                     } if segments == &["core", "array", "<Impl>", "index"]
                 )
@@ -42864,7 +43015,7 @@ mod tests {
                     matches!(
                         &op.kind,
                         OpKind::Call {
-                            target: CallTarget::FunctionPath { segments },
+                            target: CallTarget::FunctionPath { segments, .. },
                             ..
                         } if segments == &["core", "ptr", "null_mut"]
                     )
@@ -42926,7 +43077,7 @@ mod tests {
                 .graph;
             assert!(
                 !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-                    matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if segments == &["core", "ptr", "write"])
                 }),
                 "{name}: generic core::ptr::write must not survive as a shared callee"
@@ -42939,7 +43090,7 @@ mod tests {
                     (
                         Some(result),
                         OpKind::Call {
-                            target: CallTarget::FunctionPath { segments },
+                            target: CallTarget::FunctionPath { segments, .. },
                             ..
                         },
                     ) if crate::model::cast_instance_root(&op.kind) == Some(owner) => Some(result),
@@ -42973,7 +43124,7 @@ mod tests {
         let graph = super::lower_function(&llbc, "hash_slot").expect("lower hash_slot");
         assert!(
             !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments.last().map(String::as_str) == Some("from_ptr"))
             }),
             "AtomicI64::from_ptr must not survive as a graph-less core call"
@@ -43017,7 +43168,7 @@ mod tests {
         let graph = super::lower_function(&llbc, "deque_compare").expect("lower deque_compare");
         assert!(
             !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments == &["core".to_string(), "slice".to_string(), "<Impl>".to_string(), "get".to_string()])
             }),
             "scalar slice get must not survive as an opaque core call"
@@ -43059,7 +43210,7 @@ mod tests {
                 matches!(
                     &op.kind,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if segments == &["core", "ptr", "null_mut"]
                 )
@@ -43085,7 +43236,7 @@ mod tests {
             .unwrap_or_else(|err| panic!("lower {name}: {err:?}"));
         assert!(
             !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments == &["core", "slice", "<Impl>", "get"])
             }),
             "{name}: scalar slice get must not survive as an opaque core call"
@@ -43118,14 +43269,14 @@ mod tests {
             .unwrap_or_else(|err| panic!("lower {name}: {err:?}"));
         assert!(
             !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments == &["core", "slice", "<Impl>", "get"])
             }),
             "{name}: RangeFrom slice get must not survive as an opaque core call"
         );
         assert!(
             graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments == &["__getslice_rangefrom"])
             }),
             "{name}: successful get arm must carry the deferred getslice"
@@ -43184,7 +43335,7 @@ mod tests {
             .flat_map(|b| &b.operations)
             .find_map(|op| match &op.kind {
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     args,
                     ..
                 } if segments == &["__getslice_rangefrom"] => Some(args[1].clone()),
@@ -43253,7 +43404,7 @@ mod tests {
         let literal = ops
             .iter()
             .find(|op| {
-                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments.first().is_some_and(|s| s == "__str_const")
                         && segments.get(1).is_some_and(|s| s == "\\x"))
             })
@@ -43295,14 +43446,14 @@ mod tests {
             .expect("lower bytearray_repr_string");
         assert!(
             !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments.last().is_some_and(|leaf| leaf == "push" || leaf == "push_str"))
             }),
             "String::push/push_str must not survive the RPython builder lift"
         );
         assert!(
             !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments.iter().any(|segment| segment == "fmt")
                         || segments.last().is_some_and(|leaf| leaf == "new_lower_hex"))
             }),
@@ -43310,7 +43461,7 @@ mod tests {
         );
         assert!(
             graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments.first().is_some_and(|s| s == "__str_const")
                         && segments.get(1).is_some_and(|s| s == "\\x"))
             }),
@@ -43334,7 +43485,7 @@ mod tests {
         ] {
             assert!(
                 graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-                    matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if segments == &[marker])
                 }),
                 "missing builder marker {marker}"
@@ -43377,14 +43528,14 @@ mod tests {
             super::lower_function(&llbc, "bytes_repr_string").expect("lower bytes_repr_string");
         assert!(
             !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments.iter().any(|segment| segment == "AsciiEscape"))
             }),
             "external AsciiEscape must not survive the PyPy loop port"
         );
         assert!(
             !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments.last().is_some_and(|segment| segment == "HEX"))
             }),
             "the borrowed HEX table must be a prebuilt constant, not an accessor call"
@@ -43396,7 +43547,7 @@ mod tests {
         ] {
             assert!(
                 graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-                    matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if segments == &[marker])
                 }),
                 "missing builder marker {marker}"
@@ -43422,14 +43573,14 @@ mod tests {
             super::lower_function(&llbc, "format_wtf8_repr").expect("lower format_wtf8_repr");
         assert!(
             !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments.iter().any(|segment| segment == "UnicodeEscape"))
             }),
             "external UnicodeEscape must not survive the PyPy loop port"
         );
         assert!(
             !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments.last().is_some_and(|segment| segment == "HEX"))
             }),
             "the borrowed HEX table must be a prebuilt constant, not an accessor call"
@@ -43441,7 +43592,7 @@ mod tests {
         ] {
             assert!(
                 graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-                    matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if segments == &[marker])
                 }),
                 "missing builder marker {marker}"
@@ -43489,7 +43640,7 @@ mod tests {
                         && matches!(
                             &op.kind,
                             OpKind::Call {
-                                target: CallTarget::FunctionPath { segments },
+                                target: CallTarget::FunctionPath { segments, .. },
                                 ..
                             } if crate::model::cast_instance_root(&op.kind)
                                 .is_some_and(|root| root.starts_with("Vec<"))
@@ -43564,14 +43715,14 @@ mod tests {
             "native fallible conversion must construct concrete variants, not an enum root");
         assert!(
             !ops.iter().any(|op| {
-                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments == &["Wtf8", "as_str"])
             }),
             "the foreign Rust Result must not cross the translated graph: {graph:#?}"
         );
         assert!(
             ops.iter().any(|op| {
-                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, result_ty: ValueType::Bool, .. }
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, result_ty: ValueType::Bool, .. }
                     if segments.last().map(String::as_str) == Some("wtf8_key_is_utf8"))
             }),
             "the lone-surrogate decision must remain a runtime scalar: {graph:#?}"
@@ -43609,7 +43760,7 @@ mod tests {
             .iter()
             .flat_map(|block| &block.operations)
             .filter_map(|op| {
-                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments == &[crate::runtime_names::shims::STRINGBUILDER_NEW])
                 .then(|| op.result.as_ref().expect("builder new result").id())
             })
@@ -43654,7 +43805,7 @@ mod tests {
             .flat_map(|block| {
                 block.operations.iter().filter_map(|op| match &op.kind {
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         args,
                         ..
                     } if matches!(segments.as_slice(), [marker]
@@ -43679,7 +43830,7 @@ mod tests {
             .iter()
             .flat_map(|block| {
                 block.operations.iter().filter_map(move |op| {
-                    matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if segments == &["Wtf8Buf", "push_wtf8"])
                     .then_some((block.id, op))
                 })
@@ -43697,7 +43848,7 @@ mod tests {
                 matches!(
                     &op.kind,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if super::fmt_path_ends_with(segments, &["vec", "Vec", "index"])
                 )
@@ -43759,7 +43910,7 @@ mod tests {
                 matches!(
                     &op.kind,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if segments == &[
                         "core".to_string(),
@@ -43784,7 +43935,7 @@ mod tests {
                 matches!(
                     &op.kind,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if super::fmt_path_ends_with(segments, &["vec", "Vec", "index"])
                 )
@@ -43810,7 +43961,7 @@ mod tests {
                 matches!(
                     &op.kind,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if segments == &["__getslice_range".to_string()]
                 )
@@ -43822,7 +43973,7 @@ mod tests {
                 matches!(
                     &op.kind,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if segments == &[
                         "core".to_string(),
@@ -43840,7 +43991,7 @@ mod tests {
                 matches!(
                     &op.kind,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if segments == &[
                         "rpython".to_string(),
@@ -43882,7 +44033,7 @@ mod tests {
                     matches!(
                         &op.kind,
                         OpKind::Call {
-                            target: CallTarget::FunctionPath { segments },
+                            target: CallTarget::FunctionPath { segments, .. },
                             ..
                         } if super::fmt_path_ends_with(segments, &["vec", "Vec", "index"])
                     )
@@ -43933,14 +44084,14 @@ mod tests {
             .expect("lower exception_descr_str_wtf8");
         assert!(
             !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments == &["Wtf8".to_string(), "index".to_string()])
             }),
             "Wtf8 RangeFrom index must not survive as an opaque foreign call"
         );
         assert!(
             graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments == &["__getslice_rangefrom".to_string()])
             }),
             "runtime RangeFrom should use the post-annotation getslice marker"
@@ -43966,7 +44117,7 @@ mod tests {
             .flat_map(|b| &b.operations)
             .filter_map(|op| match &op.kind {
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } => Some(segments.as_slice()),
                 _ => None,
@@ -44007,7 +44158,7 @@ mod tests {
             .flat_map(|b| &b.operations)
             .filter_map(|op| match &op.kind {
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } => Some(segments.as_slice()),
                 _ => None,
@@ -44154,7 +44305,7 @@ mod tests {
                             && matches!(
                                 &producer.kind,
                                 OpKind::Call {
-                                    target: CallTarget::FunctionPath { segments },
+                                    target: CallTarget::FunctionPath { segments, .. },
                                     ..
                                 } if crate::model::cast_instance_root(&producer.kind)
                                     == Some("PyObject")
@@ -44203,7 +44354,7 @@ mod tests {
                     && matches!(
                         &op.kind,
                         OpKind::Call {
-                            target: CallTarget::FunctionPath { segments },
+                            target: CallTarget::FunctionPath { segments, .. },
                             ..
                         } if crate::model::cast_instance_root(&op.kind)
                             .is_some_and(|root| root.ends_with("DictStrategyRef"))
@@ -44240,7 +44391,7 @@ mod tests {
                         matches!(
                             &op.kind,
                             OpKind::Call {
-                                target: CallTarget::FunctionPath { segments },
+                                target: CallTarget::FunctionPath { segments, .. },
                                 ..
                             } if segments.last().map(String::as_str) == Some(method)
                                 && segments.iter().any(|part| part == "BufferRequest")
@@ -44398,7 +44549,7 @@ mod tests {
                 matches!(
                     &op.kind,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if segments.last().map(String::as_str) == Some("malloc_typed")
                 )
@@ -44432,7 +44583,7 @@ mod tests {
                     matches!(
                         &op.kind,
                         OpKind::Call {
-                            target: CallTarget::FunctionPath { segments },
+                            target: CallTarget::FunctionPath { segments, .. },
                             ..
                         } if segments == &want
                     )
@@ -44469,14 +44620,14 @@ mod tests {
                 .unwrap_or_else(|err| panic!("lower {fname}: {err}"));
             assert!(
                 !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-                    matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if super::fmt_path_ends_with(segments, &["core", "slice", "index", "<Impl>", "index"]))
                 }),
                 "{fname}: PyPy list slice must not remain an opaque Rust index"
             );
             assert!(
                 graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-                    matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if segments == &["__getslice_range".to_string()])
                 }),
                 "{fname}: Range slice must use the RPython getslice marker"
@@ -44639,7 +44790,7 @@ mod tests {
                 matches!(
                     &op.kind,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if super::fmt_path_ends_with(segments, &["Argument", "new_display"])
                         || super::is_arguments_new_path(segments)
@@ -44677,7 +44828,7 @@ mod tests {
             .flat_map(|block| &block.operations)
             .filter_map(|op| match &op.kind {
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments.last().map(String::as_str) == Some("next") => Some(segments.clone()),
                 _ => None,
@@ -44757,7 +44908,7 @@ mod tests {
                 .any(|op| {
                     matches!(&op.kind,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         args,
                         result_ty: ValueType::Ref(Some(owner)),
                     } if crate::model::cast_instance_root(&op.kind)
@@ -44924,7 +45075,7 @@ mod tests {
                         matches!(
                             &op.kind,
                             OpKind::Call {
-                                target: CallTarget::FunctionPath { segments },
+                                target: CallTarget::FunctionPath { segments, .. },
                                 ..
                             } if super::fmt_path_ends_with(segments, &["ptr", "read_volatile"])
                                 || super::fmt_path_ends_with(segments, &["ptr", "write_volatile"])
@@ -44969,7 +45120,7 @@ mod tests {
             .flat_map(|block| &block.operations)
             .filter_map(|op| match &op.kind {
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if matches!(
                     segments.last().map(String::as_str),
@@ -45008,7 +45159,7 @@ mod tests {
                 matches!(
                     &op.kind,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if segments.last().map(String::as_str) == Some("rotate_left")
                 )
@@ -45067,7 +45218,7 @@ mod tests {
             operations.iter().any(|op| matches!(
                 &op.kind,
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments == &[crate::runtime_names::shims::RANGE.to_string()]
             )),
@@ -45077,7 +45228,7 @@ mod tests {
             operations.iter().any(|op| matches!(
                 &op.kind,
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments == &["__iter_next".to_string()]
             )),

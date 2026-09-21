@@ -332,6 +332,7 @@ fn rewire_one_slice_get_site(graph: &mut FunctionGraph, site: &SliceGetSite) -> 
         kind: OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: vec!["__len".to_string()],
+                fun_decl_id: None,
             },
             args: crate::model::call_args(vec![slice]),
             result_ty: ValueType::Int,
@@ -380,6 +381,7 @@ mod tests {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "slice".into(), "<Impl>".into(), "get".into()],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(args),
                 result_ty: ValueType::Ref(None),
@@ -393,7 +395,7 @@ mod tests {
         g.blocks[a.0].operations.iter().any(|op| {
             matches!(
                 &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments.last().map(String::as_str) == Some("get")
             )
         })
@@ -429,7 +431,7 @@ mod tests {
         assert!(
             g.blocks[a.0].operations.iter().any(|op| matches!(
                 &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments.first().map(String::as_str) == Some("__len")
             )),
             "A synthesizes the __len guard"
@@ -526,7 +528,7 @@ mod tests {
                     matches!(
                         &op.kind,
                         OpKind::Call {
-                            target: CallTarget::FunctionPath { segments },
+                            target: CallTarget::FunctionPath { segments, .. },
                             ..
                         } if segments == &["core", "ptr", "null_mut"]
                     )
@@ -540,7 +542,7 @@ mod tests {
                 matches!(
                     &op.kind,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if crate::model::cast_instance_root(&op.kind) == Some("PyObject")
                 )
@@ -634,7 +636,7 @@ mod tests {
             .filter(|op| {
                 matches!(
                     &op.kind,
-                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if segments.first().map(String::as_str) == Some(crate::runtime_names::shims::CAST_INSTANCE)
                 )
             })

@@ -58,7 +58,7 @@ fn shape_of(llbc: &Llbc, name: &str) -> Shape {
                     shape.indirect_unknown_family += 1;
                 }
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     args,
                     ..
                 } if segments.last().map(String::as_str) == Some("__dyn_call") => {

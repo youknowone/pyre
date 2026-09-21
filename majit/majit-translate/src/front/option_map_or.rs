@@ -557,7 +557,7 @@ mod tests {
             .filter(|op| {
                 matches!(
                     &op.kind,
-                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if segments.first().map(String::as_str) == Some(crate::runtime_names::shims::CAST_INSTANCE)
                 )
             })
@@ -615,7 +615,7 @@ mod tests {
                         && matches!(
                             &op.kind,
                             OpKind::Call {
-                                target: CallTarget::FunctionPath { segments },
+                                target: CallTarget::FunctionPath { segments, .. },
                                 ..
                             } if crate::model::cast_instance_root(&op.kind) == Some("PyObject")
                         )

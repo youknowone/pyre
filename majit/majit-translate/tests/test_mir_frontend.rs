@@ -103,7 +103,7 @@ fn lowers_branch_loop_sum_with_calls_and_discriminant() {
                 // into its block; exclude those raise-machinery ops so
                 // the count characterizes the body's own calls.
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if matches!(
                     segments.first().map(String::as_str),
@@ -385,7 +385,7 @@ fn front_graph_carries_no_synthesized_exception_edges() {
                 matches!(
                     &op.kind,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if segments.len() == 1 && segments[0] == "__iter_next"
                 )
@@ -469,7 +469,7 @@ fn branch_loop_sum_next_yields_an_int_element() {
         .flat_map(|b| &b.operations)
         .filter_map(|op| match &op.kind {
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
+                target: CallTarget::FunctionPath { segments, .. },
                 result_ty,
                 ..
             } if segments.len() == 1 && segments[0] == "__iter_next" => Some(result_ty.clone()),
@@ -509,7 +509,7 @@ fn a_reference_element_stays_a_reference_through_either_iterator() {
             .flat_map(|b| &b.operations)
             .filter_map(|op| match &op.kind {
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     result_ty,
                     ..
                 } if segments.len() == 1 && segments[0] == "__iter_next" => Some(result_ty.clone()),
@@ -542,7 +542,7 @@ fn branch_loop_sum_lifts_next_to_iter_next_op() {
         for op in &b.operations {
             match &op.kind {
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments.len() == 1 && segments[0] == "__iter_next" => {
                     iter_next_blocks.push(i);
@@ -630,7 +630,7 @@ fn bool_then_closure_lifts_to_short_circuit_diamond() {
         for op in &b.operations {
             match &op.kind {
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments.last().map(String::as_str) == Some("then")
                     && segments.iter().any(|s| s == "bool") =>
@@ -697,7 +697,7 @@ fn bool_then_some_lifts_to_short_circuit_diamond() {
         for op in &b.operations {
             match &op.kind {
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments.last().map(String::as_str) == Some("then_some")
                     && segments.iter().any(|s| s == "bool") =>
@@ -847,7 +847,7 @@ fn header_read_narrows_to_a_typed_field_read() {
         for op in &b.operations {
             match &op.kind {
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if majit_translate::model::cast_instance_root(&op.kind)
                     == Some("ObjectHeader") =>
@@ -918,7 +918,7 @@ fn boxing_cluster_fuses_once_the_class_address_resolves() {
             let is_class_static = matches!(
                 &op.kind,
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments.last().map(String::as_str) == Some("INT_CLASS")
             );
@@ -948,7 +948,7 @@ fn boxing_cluster_fuses_once_the_class_address_resolves() {
                 OpKind::NewWithVtable { owner, vtable } => fused.push((owner.clone(), *vtable)),
                 OpKind::FieldWrite { field, .. } if field.name == "intval" => payload_stores += 1,
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments.last().map(String::as_str) == Some("malloc_typed") => {
                     residual_mallocs += 1
@@ -1002,7 +1002,7 @@ fn boxing_cluster_fuses_from_the_host_supplied_class_address() {
                 OpKind::NewWithVtable { owner, vtable } => fused.push((owner.clone(), *vtable)),
                 OpKind::FieldWrite { field, .. } if field.name == "intval" => payload_stores += 1,
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } => match segments.last().map(String::as_str) {
                     Some("malloc_typed") => residual_mallocs += 1,
@@ -1131,7 +1131,7 @@ fn boxing_cluster_fuses_where_the_header_declares_no_class_word() {
                     _ => {}
                 },
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments.last().map(String::as_str) == Some("malloc_typed") => {
                     residual_mallocs += 1
@@ -1175,7 +1175,7 @@ fn narrowing_chain_arm_lowers_to_a_direct_call() {
         for op in &b.operations {
             match &op.kind {
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } => match segments.last().map(String::as_str) {
                     Some("w_int_add") => direct_arm_calls += 1,
@@ -1249,7 +1249,7 @@ fn slot_read_shape(name: &str) -> SlotReadShape {
                         .push((array_type_id.clone(), *nolength));
                 }
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments.last().map(String::as_str) == Some("get") => shape.residual_gets += 1,
                 OpKind::Call {
@@ -1257,7 +1257,7 @@ fn slot_read_shape(name: &str) -> SlotReadShape {
                     ..
                 } if name == "get" => shape.residual_gets += 1,
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if matches!(
                     segments.last().map(String::as_str),
@@ -1490,7 +1490,7 @@ fn an_integer_widening_from_aliases_but_a_float_one_does_not() {
             .flat_map(|b| &b.operations)
             .filter(|op| match &op.kind {
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } => {
                     segments.iter().any(|s| s == "num")

@@ -424,6 +424,7 @@ fn range_builtin_call(result: Variable, start: Variable, end: Variable) -> Space
         kind: OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: vec![crate::runtime_names::shims::RANGE.to_string()],
+                fun_decl_id: None,
             },
             args: crate::model::call_args(vec![start, end]),
             result_ty: ValueType::Ref(None),
@@ -440,6 +441,7 @@ fn slice_iter_call(result: Variable, container: Variable) -> SpaceOperation {
         kind: OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: vec!["core".to_string(), "slice".to_string(), "iter".to_string()],
+                fun_decl_id: None,
             },
             args: crate::model::call_args(vec![container]),
             result_ty: ValueType::Ref(None),
@@ -479,7 +481,7 @@ mod tests {
             .flat_map(|b| &b.operations)
             .filter(|op| {
                 matches!(&op.kind,
-                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if segments.len() >= tail.len()
                             && segments[segments.len() - tail.len()..]
                                 .iter()

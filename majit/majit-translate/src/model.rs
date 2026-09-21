@@ -285,9 +285,19 @@ pub enum CallTarget {
         /// (`#[serde(skip)]`) — never reaches codegen / serde.
         #[serde(skip, default)]
         resolved_path: Option<crate::parse::CallPath>,
+        /// Caller's LLBC-local `FunDecl.def_id`. Unique only inside that
+        /// artefact; `graphs_from` / `target_to_path` resolve by
+        /// [`resolved_path`] / the FunctionPath segments the decl's
+        /// `name_path` maps to, never by this number. Transient
+        /// (`#[serde(skip)]`).
+        #[serde(skip, default)]
+        fun_decl_id: Option<u64>,
     },
     FunctionPath {
         segments: Vec<String>,
+        /// Caller's LLBC-local `FunDecl.def_id`. See [`Self::Method`].
+        #[serde(skip, default)]
+        fun_decl_id: Option<u64>,
     },
     /// Rust frontend adaptation for constructors that RPython's rtyper erases
     /// before jtransform. This variant must only be produced after frontend
@@ -346,7 +356,7 @@ pub const FN_CONST_HEAD: &str = "__fn_const";
 
 pub fn fn_const_segments(target: &CallTarget) -> Option<&[String]> {
     match target {
-        CallTarget::FunctionPath { segments }
+        CallTarget::FunctionPath { segments, .. }
             if segments.first().map(String::as_str) == Some(FN_CONST_HEAD)
                 && segments.len() > 1 =>
         {
@@ -362,6 +372,7 @@ impl CallTarget {
             name: name.into(),
             receiver_root,
             resolved_path: None,
+            fun_decl_id: None,
         }
     }
 
@@ -372,6 +383,35 @@ impl CallTarget {
         }
     }
 
+    /// Charon `FunDecl.def_id` stamped on a direct callee, if any.
+    pub fn fun_decl_id(&self) -> Option<u64> {
+        match self {
+            CallTarget::Method { fun_decl_id, .. }
+            | CallTarget::FunctionPath { fun_decl_id, .. } => *fun_decl_id,
+            _ => None,
+        }
+    }
+
+    /// Stamp the Charon `FunDecl.def_id` that names this callee.
+    pub fn with_fun_decl_id(mut self, id: u64) -> Self {
+        match &mut self {
+            CallTarget::Method { fun_decl_id, .. }
+            | CallTarget::FunctionPath { fun_decl_id, .. } => {
+                *fun_decl_id = Some(id);
+            }
+            _ => {}
+        }
+        self
+    }
+
+    /// Stamp the registered graph path for a method callee.
+    pub fn with_resolved_path(mut self, path: crate::parse::CallPath) -> Self {
+        if let CallTarget::Method { resolved_path, .. } = &mut self {
+            *resolved_path = Some(path);
+        }
+        self
+    }
+
     pub fn function_path<I, S>(segments: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -379,6 +419,7 @@ impl CallTarget {
     {
         Self::FunctionPath {
             segments: segments.into_iter().map(Into::into).collect(),
+            fun_decl_id: None,
         }
     }
 
@@ -463,7 +504,7 @@ impl CallTarget {
     pub fn path_segments(&self) -> Option<Vec<&str>> {
         match self {
             CallTarget::Method { name, .. } => Some(vec![name.as_str()]),
-            CallTarget::FunctionPath { segments } => {
+            CallTarget::FunctionPath { segments, .. } => {
                 Some(segments.iter().map(String::as_str).collect())
             }
             // `(owner_path, name)` is the lookup identity per the
@@ -532,7 +573,7 @@ impl fmt::Display for CallTarget {
                 receiver_root: None,
                 ..
             } => f.write_str(name),
-            CallTarget::FunctionPath { segments } => f.write_str(&segments.join("::")),
+            CallTarget::FunctionPath { segments, .. } => f.write_str(&segments.join("::")),
             CallTarget::SyntheticTransparentCtor {
                 name, owner_path, ..
             } => {
@@ -1919,7 +1960,7 @@ pub fn cast_instance_call_result(
 /// The target-struct root of a [`cast_instance_call`], if `kind` is one.
 pub fn cast_instance_root(kind: &OpKind) -> Option<&str> {
     let OpKind::Call {
-        target: CallTarget::FunctionPath { segments },
+        target: CallTarget::FunctionPath { segments, .. },
         args,
         ..
     } = kind
@@ -1956,7 +1997,7 @@ pub fn cast_pointer_call(
 /// The target-struct root of a [`cast_pointer_call`], if `kind` is one.
 pub fn cast_pointer_root(kind: &OpKind) -> Option<&str> {
     let OpKind::Call {
-        target: CallTarget::FunctionPath { segments },
+        target: CallTarget::FunctionPath { segments, .. },
         args,
         ..
     } = kind
@@ -3319,7 +3360,7 @@ pub fn remove_dead_aggregates(graph: &mut FunctionGraph) -> usize {
         // unused `Array` aggregate. Treat it as a removable ctor so the box,
         // its store, and (once un-pinned) the `Array` cascade out together.
         OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } => is_box_new_uninit_path(segments, args),
@@ -3600,7 +3641,7 @@ pub fn lower_struct_ptr_writes(
     for (bi, block) in graph.blocks.iter().enumerate() {
         for (oi, op) in block.operations.iter().enumerate() {
             let OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
+                target: CallTarget::FunctionPath { segments, .. },
                 args,
                 result_ty: ValueType::Void,
             } = &op.kind
@@ -3871,7 +3912,7 @@ pub fn fuse_boxing_alloc(
     // `nonmovable` hint raises `UnsupportedMallocFlags`, because the op it
     // would emit IS a nursery bump and nothing in the op can say otherwise.
     fn gc_malloc_flavor(target: &CallTarget) -> Option<&str> {
-        let CallTarget::FunctionPath { segments } = target else {
+        let CallTarget::FunctionPath { segments, .. } = target else {
             return None;
         };
         if segments.len() < 2 || segments[segments.len() - 2] != "lltype" {
@@ -4107,7 +4148,7 @@ pub fn fuse_boxing_alloc(
                     && matches!(
                         &op.kind,
                         OpKind::Call {
-                            target: CallTarget::FunctionPath { segments },
+                            target: CallTarget::FunctionPath { segments, .. },
                             args,
                             ..
                         } if segments.first().map(String::as_str)
@@ -4141,7 +4182,7 @@ pub fn fuse_boxing_alloc(
         for (bi, block) in graph.blocks.iter().enumerate() {
             for (oi, op) in block.operations.iter().enumerate() {
                 let OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     args,
                     ..
                 } = &op.kind
@@ -4174,7 +4215,7 @@ pub fn fuse_boxing_alloc(
         for (bi, block) in graph.blocks.iter().enumerate() {
             for (oi, op) in block.operations.iter().enumerate() {
                 let OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     args,
                     ..
                 } = &op.kind
@@ -4260,7 +4301,7 @@ pub fn fuse_boxing_alloc(
             return resolved;
         };
         if let OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } = &producer.kind
@@ -4286,7 +4327,7 @@ pub fn fuse_boxing_alloc(
     fn get_instantiate_arg_addr(graph: &FunctionGraph, var: &Variable, depth: u32) -> Option<i64> {
         resolve_addr(graph, var, depth, &|graph, kind, depth| match kind {
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
+                target: CallTarget::FunctionPath { segments, .. },
                 args,
                 ..
             } if args.len() == 1
@@ -4622,7 +4663,7 @@ pub fn fuse_boxing_alloc(
             let malloc_flavor = gc_malloc_flavor(target).filter(|_| args.len() == 1);
             let is_uninit = matches!(
                 target,
-                CallTarget::FunctionPath { segments } if is_box_new_uninit_path(segments, args)
+                CallTarget::FunctionPath { segments, .. } if is_box_new_uninit_path(segments, args)
             );
             let (flavor, agg_operand, result, rewrite_bi, rewrite_oi, dead_ops) =
                 if let Some(flavor) = malloc_flavor {
@@ -4922,7 +4963,7 @@ fn sink_fused_boxing_aggregates_at_raw_writes(
         )
     };
     let is_raw_write = |kind: &OpKind| {
-        matches!(kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, args, .. }
+        matches!(kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, args, .. }
             if is_core_ptr_write_path(segments, args))
     };
 
@@ -5196,7 +5237,7 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
             ..
         } => true,
         OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } => {
@@ -5256,7 +5297,7 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
                 ..
             } => true,
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
+                target: CallTarget::FunctionPath { segments, .. },
                 args,
                 ..
             } => is_box_new_uninit_path(segments, args),
@@ -6529,6 +6570,11 @@ pub struct FunctionGraph {
     /// Synthetic/test graphs leave this as `None` and retain the historical
     /// `(owner_root, name)` identity fallback.
     pub source_identity: Option<String>,
+    /// Caller's LLBC-local `FunDecl.def_id` of the declaration this graph
+    /// was lowered from. Unique within that artefact only; graph lookup
+    /// uses the registered path, never this number. `None` for synthetic
+    /// and test graphs.
+    pub fun_decl_id: Option<u64>,
     /// Impl-block self-type root for graphs produced from `impl <T> { fn m(&self, ...) }`.
     /// Mirrors PyPy's `graph.func.im_class` access (the bound-method's class
     /// reference): RPython lifts `self` as `SomeInstance(getuniqueclassdef(im_class))`
@@ -6695,6 +6741,7 @@ pub fn copygraph(graph: &FunctionGraph) -> FunctionGraph {
     FunctionGraph {
         name: graph.name.clone(),
         source_identity: graph.source_identity.clone(),
+        fun_decl_id: graph.fun_decl_id,
         owner_root: graph.owner_root.clone(),
         startblock: graph.startblock,
         returnblock: graph.returnblock,
@@ -6769,6 +6816,7 @@ impl FunctionGraph {
             return_type: None,
             owner_root: None,
             source_identity: None,
+            fun_decl_id: None,
             hints: Vec::new(),
             access_directly: false,
             func: FuncEffects::default(),
@@ -6808,6 +6856,11 @@ impl FunctionGraph {
 
     pub fn with_source_identity(mut self, identity: impl Into<String>) -> Self {
         self.source_identity = Some(identity.into());
+        self
+    }
+
+    pub fn with_fun_decl_id(mut self, id: u64) -> Self {
+        self.fun_decl_id = Some(id);
         self
     }
 
@@ -8880,6 +8933,7 @@ mod tests {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "ptr".into(), "write".into()],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![destination, carried[0].clone()]),
                 result_ty: ValueType::Void,
@@ -8896,7 +8950,7 @@ mod tests {
         assert!(graph.block(write_block).operations.iter().any(|op| {
             matches!(
                 &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments.iter().map(String::as_str).eq(["core", "ptr", "write"])
             )
         }));
@@ -8967,6 +9021,7 @@ mod tests {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "ptr".into(), "write".into()],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![destination, joined[0].clone()]),
                 result_ty: ValueType::Void,
@@ -9124,6 +9179,7 @@ mod tests {
                             "object_model".into(),
                             "get_instantiate".into(),
                         ],
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![instantiate_arg]),
                     result_ty: ValueType::Ref(Some("object".into())),
@@ -9225,6 +9281,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed".into(),
                         ],
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
                     result_ty: ValueType::Ref(Some("W_FloatObject".into())),
@@ -9257,7 +9314,7 @@ mod tests {
                 matches!(
                     &op.kind,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if segments.last().map(String::as_str) == Some("malloc_typed")
                 )
@@ -9278,7 +9335,7 @@ mod tests {
                 .find(|op| op.result.as_ref() == Some(&ret))
                 .expect("malloc operation");
             let OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
+                target: CallTarget::FunctionPath { segments, .. },
                 ..
             } = &mut allocation.kind
             else {
@@ -9326,7 +9383,7 @@ mod tests {
             assert!(
                 !ops.iter().any(|op| matches!(
                     &op.kind,
-                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if segments.last().map(String::as_str) == Some(allocator)
                 )),
                 "{allocator}: no allocation call may survive the fusion"
@@ -9400,6 +9457,7 @@ mod tests {
                             "Box".into(),
                             "new_uninit".into(),
                         ],
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![]),
                     result_ty: ValueType::Ref(Some("W_FloatObject".into())),
@@ -9412,6 +9470,7 @@ mod tests {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "ptr".into(), "write".into()],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![uninit.clone(), agg.clone()]),
                 result_ty: ValueType::Void,
@@ -9424,6 +9483,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["boxed".into(), "Box".into(), "assume_init".into()],
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![uninit.clone()]),
                     result_ty: ValueType::Ref(Some("W_FloatObject".into())),
@@ -9462,7 +9522,7 @@ mod tests {
         assert!(
             !ops.iter().any(|op| matches!(
                 &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments }, args, .. }
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, args, .. }
                     if is_box_new_uninit_path(segments, args)
                         || is_core_ptr_write_path(segments, args)
                         || is_assume_init_path(segments, args)
@@ -9531,6 +9591,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["boxed".into(), "Box".into(), "new".into()],
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
                     result_ty: ValueType::Ref(Some("W_FloatObject".into())),
@@ -9548,7 +9609,7 @@ mod tests {
         assert!(
             graph.block(entry).operations.iter().any(|op| matches!(
                 &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments.last().map(String::as_str) == Some("new")
             )),
             "the look-alike Box::new call must remain residual"
@@ -9627,6 +9688,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed".into(),
                         ],
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
                     result_ty: ValueType::Ref(Some("W_ComplexObject".into())),
@@ -9694,6 +9756,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed".into(),
                         ],
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
                     result_ty: ValueType::Ref(Some("SomeOtherStruct".into())),
@@ -9739,6 +9802,7 @@ mod tests {
                     OpKind::Call {
                         target: CallTarget::FunctionPath {
                             segments: path.iter().map(|s| (*s).to_string()).collect(),
+                            fun_decl_id: None,
                         },
                         args: crate::model::call_args(args),
                         result_ty: ValueType::Ref(Some("object".into())),
@@ -9874,7 +9938,7 @@ mod tests {
             let residual = graph.block(entry).operations.iter().any(|op| {
                 matches!(
                     &op.kind,
-                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if segments.last().map(String::as_str) == Some("malloc_typed")
                 )
             });
@@ -9952,6 +10016,7 @@ mod tests {
                     OpKind::Call {
                         target: CallTarget::FunctionPath {
                             segments: path.iter().map(|s| (*s).to_string()).collect(),
+                            fun_decl_id: None,
                         },
                         args: crate::model::call_args(args),
                         result_ty: ValueType::Ref(Some("object".into())),
@@ -10079,6 +10144,7 @@ mod tests {
                         .iter()
                         .map(|s| s.to_string())
                         .collect(),
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![gc_args[1].clone(), gc_args[0].clone()]),
                 result_ty: ValueType::Void,
@@ -10120,7 +10186,7 @@ mod tests {
             !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
                 matches!(
                     &op.kind,
-                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if segments.last().map(String::as_str) == Some("malloc_typed")
                 )
             }),
@@ -10135,7 +10201,7 @@ mod tests {
             .flat_map(|b| &b.operations)
             .find_map(|op| match &op.kind {
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     args,
                     ..
                 } if segments
@@ -10218,6 +10284,7 @@ mod tests {
                     OpKind::Call {
                         target: CallTarget::FunctionPath {
                             segments: path.iter().map(|s| (*s).to_string()).collect(),
+                            fun_decl_id: None,
                         },
                         args: crate::model::call_args(args),
                         result_ty: ValueType::Ref(Some("object".into())),
@@ -10412,7 +10479,7 @@ mod tests {
             let residual = graph.block(join).operations.iter().any(|op| {
                 matches!(
                     &op.kind,
-                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if segments.last().map(String::as_str) == Some("malloc_typed")
                 )
             });
@@ -10456,7 +10523,7 @@ mod tests {
         assert!(graph.block(join).operations.iter().any(|op| {
             matches!(
                 &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments.last().map(String::as_str) == Some("malloc_typed")
             )
         }));
@@ -10478,6 +10545,7 @@ mod tests {
                     OpKind::Call {
                         target: CallTarget::FunctionPath {
                             segments: path.iter().map(|s| (*s).to_string()).collect(),
+                            fun_decl_id: None,
                         },
                         args: crate::model::call_args(args),
                         result_ty: ValueType::Ref(Some("object".into())),
@@ -10646,7 +10714,7 @@ mod tests {
             let residual = graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
                 matches!(
                     &op.kind,
-                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if segments.last().map(String::as_str) == Some("malloc_typed")
                 )
             });
@@ -10716,6 +10784,7 @@ mod tests {
                             "object_model".into(),
                             "get_instantiate".into(),
                         ],
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![w_class_cast]),
                     result_ty: ValueType::Ref(Some("object".into())),
@@ -10777,6 +10846,7 @@ mod tests {
                             "lltype".into(),
                             "malloc_typed".into(),
                         ],
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
                     result_ty: ValueType::Ref(Some("W_FloatObject".into())),
@@ -10818,7 +10888,7 @@ mod tests {
         assert!(
             !ops.iter().any(|op| matches!(
                 &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments.last().map(String::as_str) == Some("get_instantiate")
             )),
             "the dead w_class instantiate read must be swept"
@@ -10920,6 +10990,7 @@ mod tests {
                             "lltype".into(),
                             "malloc".into(),
                         ],
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
                     result_ty: ValueType::Ref(Some("W_SetObject".into())),
@@ -10992,7 +11063,7 @@ mod tests {
         assert!(
             !ops.iter().any(|op| matches!(
                 &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments.last().map(String::as_str) == Some("malloc_typed")
             )),
             "no malloc_typed call may survive the fusion"
@@ -11029,6 +11100,7 @@ mod tests {
                     OpKind::Call {
                         target: CallTarget::FunctionPath {
                             segments: path.iter().map(|s| (*s).to_string()).collect(),
+                            fun_decl_id: None,
                         },
                         args: crate::model::call_args(args),
                         result_ty: ValueType::Ref(Some("object".into())),
@@ -11214,7 +11286,7 @@ mod tests {
             let residual = ops.iter().any(|op| {
                 matches!(
                     &op.kind,
-                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if segments.last().map(String::as_str) == Some("malloc_typed")
                 )
             });
@@ -11318,6 +11390,7 @@ mod tests {
                                         .iter()
                                         .map(|s| (*s).to_string())
                                         .collect(),
+                                        fun_decl_id: None,
                                     },
                                     args: crate::model::call_args(vec![base]),
                                     result_ty: ValueType::Ref(Some("object".into())),
@@ -11361,6 +11434,7 @@ mod tests {
                                 .iter()
                                 .map(|s| (*s).to_string())
                                 .collect(),
+                            fun_decl_id: None,
                         },
                         args: crate::model::call_args(vec![agg]),
                         result_ty: ValueType::Ref(Some("W_IntObject".into())),
@@ -11448,7 +11522,7 @@ mod tests {
             let residual = ops.iter().any(|op| {
                 matches!(
                     &op.kind,
-                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if segments.last().map(String::as_str) == Some(flavor)
                 )
             });
@@ -11608,6 +11682,7 @@ mod tests {
                     "object_model".into(),
                     "get_instantiate".into(),
                 ],
+                fun_decl_id: None,
             },
             args: crate::model::call_args(vec![arg.clone()]),
             result_ty: ValueType::Ref(Some("object".into())),
@@ -11725,7 +11800,7 @@ mod tests {
         assert!(
             !kinds.iter().any(|k| matches!(
                 k,
-                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments.last().map(String::as_str) == Some("get_instantiate")
             )),
             "the dead get_instantiate (w_class feed) must be swept once the header is dropped"
@@ -11769,6 +11844,7 @@ mod tests {
         let box_new_uninit = || OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: vec!["boxed".into(), "Box".into(), "new_uninit".into()],
+                fun_decl_id: None,
             },
             args: crate::model::call_args(vec![]),
             result_ty: ValueType::Ref(Some("Box".into())),
@@ -11820,7 +11896,7 @@ mod tests {
         assert!(
             !kinds.iter().any(|k| matches!(
                 k,
-                OpKind::Call { target: CallTarget::FunctionPath { segments }, args, .. }
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, args, .. }
                     if args.is_empty()
                         && segments.last().map(String::as_str) == Some("new_uninit")
             )),
@@ -12849,6 +12925,7 @@ mod tests {
             name: "foo".into(),
             receiver_root: Some("Bar".into()),
             resolved_path: Some(path),
+            fun_decl_id: None,
         };
         let json = serde_json::to_string(&t).expect("encode");
         assert!(

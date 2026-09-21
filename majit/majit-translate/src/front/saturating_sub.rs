@@ -254,6 +254,7 @@ mod tests {
                         "<Impl>".into(),
                         "saturating_sub".into(),
                     ],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(args),
                 result_ty: ValueType::Unsigned,
@@ -287,7 +288,7 @@ mod tests {
         assert!(
             !g.blocks[a.0].operations.iter().any(|op| matches!(
                 &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments.last().map(String::as_str) == Some("saturating_sub")
             )),
             "residual saturating_sub call removed from A"
@@ -341,7 +342,7 @@ mod tests {
         assert!(
             g.blocks[a.0].operations.iter().any(|op| matches!(
                 &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments.last().map(String::as_str) == Some("saturating_sub")
             )),
             "residual saturating_sub call is left untouched"

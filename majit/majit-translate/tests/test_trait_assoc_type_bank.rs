@@ -59,7 +59,7 @@ fn a_generic_caller_types_an_assoc_type_result_through_the_unique_impl() {
             else {
                 continue;
             };
-            let CallTarget::FunctionPath { segments } = target else {
+            let CallTarget::FunctionPath { segments, .. } = target else {
                 continue;
             };
             if segments.last().map(String::as_str) != Some("truth_value") {
@@ -91,7 +91,7 @@ fn opcode_unary_not_calls_space_not() {
             let OpKind::Call { target, .. } = &op.kind else {
                 continue;
             };
-            let CallTarget::FunctionPath { segments } = target else {
+            let CallTarget::FunctionPath { segments, .. } = target else {
                 continue;
             };
             let last = segments.last().map(String::as_str);
@@ -135,7 +135,7 @@ fn the_same_projection_resolves_in_a_provided_default_body() {
             let OpKind::Call { target, args, .. } = &op.kind else {
                 continue;
             };
-            let CallTarget::FunctionPath { segments } = target else {
+            let CallTarget::FunctionPath { segments, .. } = target else {
                 continue;
             };
             if segments.last().map(String::as_str) != Some("guard_truth_value") {

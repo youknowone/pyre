@@ -149,7 +149,7 @@ fn rewire_one_range_contains_site(
     //    (not a `CallTarget::Method`).
     let (range_v, x) = match &graph.blocks[c_idx].operations[call_idx].kind {
         OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } if segments_end_with(segments, &["range", "RangeInclusive", "contains"])
@@ -520,6 +520,7 @@ mod tests {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            fun_decl_id: None,
         }
     }
 
@@ -529,6 +530,7 @@ mod tests {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            fun_decl_id: None,
         }
     }
 
@@ -541,7 +543,7 @@ mod tests {
                 matches!(
                     &op.kind,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if segments_end_with(segments, tail)
                 )

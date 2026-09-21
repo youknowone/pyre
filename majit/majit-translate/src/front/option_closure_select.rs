@@ -699,7 +699,7 @@ mod tests {
 
     fn count_null_mut(g: &FunctionGraph) -> usize {
         count_calls(g, |t| {
-            matches!(t, CallTarget::FunctionPath { segments }
+            matches!(t, CallTarget::FunctionPath { segments, .. }
                 if segments == &["core", "ptr", "null_mut"].map(str::to_string))
         })
     }
@@ -738,7 +738,7 @@ mod tests {
                 && matches!(
                     &op.kind,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if crate::model::cast_instance_root(&op.kind) == Some("PyObject")
                 )

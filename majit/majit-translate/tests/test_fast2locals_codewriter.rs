@@ -322,7 +322,7 @@ fn a_range_loops_next_yields_an_int_element() {
     for block in &graph.blocks {
         for op in &block.operations {
             if let OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
+                target: CallTarget::FunctionPath { segments, .. },
                 ..
             } = &op.kind
                 && segments.len() == 1
@@ -346,7 +346,7 @@ fn a_range_loops_next_yields_an_int_element() {
         .flat_map(|b| b.operations.iter())
         .filter_map(|op| match &op.kind {
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
+                target: CallTarget::FunctionPath { segments, .. },
                 args,
                 ..
             } if segments.last().is_some_and(|s| s == "iter")
@@ -366,7 +366,7 @@ fn a_range_loops_next_yields_an_int_element() {
     for block in &graph.blocks {
         for op in &block.operations {
             let OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
+                target: CallTarget::FunctionPath { segments, .. },
                 args,
                 result_ty,
             } = &op.kind

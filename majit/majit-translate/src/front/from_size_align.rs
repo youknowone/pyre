@@ -205,7 +205,7 @@ fn rewire_one_from_size_align_site(
             result: Some(r),
             kind:
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     args,
                     ..
                 },
@@ -429,7 +429,7 @@ fn rewire_one_from_size_align_expect_site(
             result: Some(r),
             kind:
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     args,
                     ..
                 },
@@ -617,6 +617,7 @@ mod tests {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            fun_decl_id: None,
         }
     }
 
@@ -625,6 +626,7 @@ mod tests {
             name: "ok".to_string(),
             receiver_root: Some("Result".to_string()),
             resolved_path: None,
+            fun_decl_id: None,
         }
     }
 
@@ -828,6 +830,7 @@ mod tests {
             name: "expect".to_string(),
             receiver_root: Some("Result".to_string()),
             resolved_path: None,
+            fun_decl_id: None,
         }
     }
 

@@ -742,7 +742,7 @@ mod tests {
         assert!(!err_arm.operations.iter().any(|op| {
             matches!(
                 &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments == &["fixture".to_string(), "to_exc_object".to_string()]
             )
         }));
@@ -828,7 +828,7 @@ mod tests {
         assert!(err_arm.operations.iter().any(|op| {
             matches!(
                 &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments == &["fixture".to_string(), "to_exc_object".to_string()]
             )
         }));

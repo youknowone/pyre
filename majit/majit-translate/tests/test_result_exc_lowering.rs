@@ -54,7 +54,7 @@ fn interp() -> &'static Llbc {
 
 fn is_root_scope_close(op: &OpKind) -> bool {
     matches!(op,
-        OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+        OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
             if segments.last().map(String::as_str) == Some("root_scope_close")
                 || (segments.last().map(String::as_str) == Some("drop_in_place")
                     && segments.iter().any(|s| s == "RootScope")))
@@ -129,7 +129,7 @@ fn a_tail_forwarding_wrapper_retypes_its_calls_to_the_payload() {
             else {
                 continue;
             };
-            let CallTarget::FunctionPath { segments } = target else {
+            let CallTarget::FunctionPath { segments, .. } = target else {
                 continue;
             };
             let Some(leaf) = segments.last() else {
@@ -176,7 +176,7 @@ fn a_rewrapped_call_site_retypes_its_call_to_the_payload() {
         for block in &graph.blocks {
             for op in &block.operations {
                 let OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     result_ty,
                     ..
                 } = &op.kind
@@ -222,7 +222,7 @@ fn pop_value_lowers_to_raise_links() {
                 // opaque to the codewriter so the GC-root, exception-object
                 // and WTF-8 machinery under it does not land in this graph.
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments.last().map(String::as_str) == Some("pyerror_to_exc_object") => {
                     to_exc_object_calls += 1
@@ -352,7 +352,7 @@ fn unpackiterable_drain_match_fuses_to_kind_test() {
         .filter(|op| {
             matches!(
                 &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments.last().map(String::as_str)
                         == Some("exception_object_matches_stop_iteration")
             )
@@ -392,7 +392,7 @@ fn unpackiterable_drain_match_fuses_to_kind_test() {
         .find(|b| {
             b.operations.iter().any(|op| {
                 matches!(&op.kind,
-                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if segments.last().map(String::as_str)
                             == Some("exception_object_matches_stop_iteration"))
             })
@@ -418,7 +418,7 @@ fn unpackiterable_drain_match_fuses_to_kind_test() {
         .filter(|op| {
             matches!(
                 &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments.last().map(String::as_str) == Some("exc_kind_discriminant")
             )
         })
@@ -474,7 +474,7 @@ fn unpackiterable_drain_match_fuses_to_kind_test() {
         .filter(|op| {
             matches!(
                 &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments.last().map(String::as_str) == Some("shadow_stack_get")
             )
         })
@@ -503,7 +503,7 @@ fn eval_loop_custom_match_gets_catch_and_rewrap() {
             b.operations.iter().any(|op| {
                 matches!(
                     &op.kind,
-                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if segments.last().map(String::as_str) == Some("execute_opcode_step")
                 )
             })
@@ -541,7 +541,7 @@ fn raise_path_calls(name: &str) -> (usize, usize, usize) {
     for block in &graph.blocks {
         for op in &block.operations {
             let OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
+                target: CallTarget::FunctionPath { segments, .. },
                 ..
             } = &op.kind
             else {
@@ -598,7 +598,7 @@ fn gateway_wrapper_refusals_all_residualize() {
             .filter(|op| {
                 matches!(
                     &op.kind,
-                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if matches!(
                             segments.last().map(String::as_str),
                             Some("receiver_mismatch")

@@ -907,7 +907,7 @@ fn null_test_rewrite(
                     && match &def.kind {
                         OpKind::ConstRefNull => true,
                         OpKind::Call {
-                            target: CallTarget::FunctionPath { segments },
+                            target: CallTarget::FunctionPath { segments, .. },
                             args,
                             result_ty,
                         } => {
@@ -964,7 +964,7 @@ fn is_source_constant_variable(
                 | OpKind::ConstNone
                 | OpKind::ConstRefAddr(_) => true,
                 OpKind::Call { target, .. } => match target {
-                    CallTarget::FunctionPath { segments } => {
+                    CallTarget::FunctionPath { segments, .. } => {
                         segments.first().is_some_and(|s| s == "__str_const")
                             || crate::model::fn_const_segments(target).is_some()
                     }
@@ -3279,6 +3279,7 @@ impl<'a> Transformer<'a> {
                     kind: OpKind::Call {
                         target: CallTarget::FunctionPath {
                             segments: path.segments.clone(),
+                            fun_decl_id: None,
                         },
                         args: crate::model::call_args(std::iter::once(operand.clone())),
                         result_ty: ValueType::Int,
@@ -5012,7 +5013,7 @@ impl<'a> Transformer<'a> {
         // Match the `lltype.cast_*` host path `cast_call_segments` emits,
         // not a bare leaf — a user function named `cast_int_to_ptr` is
         // an ordinary call (`pointer_cast_function_names_do_not_alias`).
-        if let CallTarget::FunctionPath { segments } = target {
+        if let CallTarget::FunctionPath { segments, .. } = target {
             // `current_gc_ref` is the residual stand-in for the GC
             // transform's livevar reload (`rgc` rewrites the same box
             // in place). A new SSA box here lets heap CSE keep the
@@ -5105,7 +5106,7 @@ impl<'a> Transformer<'a> {
         // the helper address/effect descriptor and unsigned rounding on the
         // upstream path; it is removed when jtransform consumes the rtyped
         // graph directly.
-        if matches!(target, CallTarget::FunctionPath { segments } if segments == &["__builtin__", "float"])
+        if matches!(target, CallTarget::FunctionPath { segments, .. } if segments == &["__builtin__", "float"])
             && args.len() == 1
             && matches!(result_ty, ValueType::Float)
         {
@@ -5150,7 +5151,7 @@ impl<'a> Transformer<'a> {
         if crate::front::checked_arith::is_checked_arith_target(target)
             && args.len() == 2
             && matches!(result_ty, ValueType::Int | ValueType::Unknown)
-            && let CallTarget::FunctionPath { segments } = target
+            && let CallTarget::FunctionPath { segments, .. } = target
             && let Some(leaf) = segments.last()
             && let Some(ovf) = crate::front::checked_arith::checked_arith_ovf_opname(leaf)
         {
@@ -5194,6 +5195,7 @@ impl<'a> Transformer<'a> {
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: path.segments.clone(),
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(args.iter().cloned()),
                     result_ty: result_ty.clone(),
@@ -5221,6 +5223,7 @@ impl<'a> Transformer<'a> {
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: path.segments.clone(),
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(args.iter().cloned()),
                     result_ty: result_ty.clone(),
@@ -5246,6 +5249,7 @@ impl<'a> Transformer<'a> {
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: path.segments.clone(),
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(args.iter().cloned()),
                     result_ty: result_ty.clone(),
@@ -5271,6 +5275,7 @@ impl<'a> Transformer<'a> {
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: path.segments.clone(),
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(args.iter().cloned()),
                     result_ty: result_ty.clone(),
@@ -5294,6 +5299,7 @@ impl<'a> Transformer<'a> {
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: path.segments.clone(),
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(args.iter().cloned()),
                     result_ty: result_ty.clone(),
@@ -5305,7 +5311,7 @@ impl<'a> Transformer<'a> {
         // rtyper path expands `__string_byte_getitem` to `getitem`+`ord`;
         // a Skip-spine graph keeps the marker.  `pyre_cpu.bh_strgetitem`
         // reads the `W_UnicodeObject` (`rstring.py` `u_self[i]`).
-        if let CallTarget::FunctionPath { segments } = target
+        if let CallTarget::FunctionPath { segments, .. } = target
             && segments.as_slice() == ["__string_byte_getitem"]
             && args.len() == 2
         {
@@ -5321,7 +5327,7 @@ impl<'a> Transformer<'a> {
         // is `ll_strlen`.  The rtyper path routes `__len` through
         // `StringRepr.rtype_len`; `__strlen` is the Skip-spine marker
         // the frontend plants when the place is a byte view.
-        if let CallTarget::FunctionPath { segments } = target
+        if let CallTarget::FunctionPath { segments, .. } = target
             && segments.as_slice() == ["__strlen"]
             && args.len() == 1
         {
@@ -5382,7 +5388,7 @@ impl<'a> Transformer<'a> {
         // sits here and not earlier: the rtyper runs before jtransform and has
         // already picked `uint_lt` over `int_lt` wherever the annotation
         // mattered.  Both spellings name the same machine word.
-        if let CallTarget::FunctionPath { segments } = target
+        if let CallTarget::FunctionPath { segments, .. } = target
             && let [head @ .., leaf] = segments.as_slice()
             && head == ["rpython", "rlib", "rarithmetic"]
             && matches!(leaf.as_str(), "intmask" | "r_uint")
@@ -5684,7 +5690,7 @@ impl<'a> Transformer<'a> {
         // niche `Option<NonNull<T>>` / `Option<&T>` representation emitted by
         // `front::mir`; leaving it as a call would bake an unregistered
         // symbolic fnaddr into every generated nullity test.
-        if let CallTarget::FunctionPath { segments } = target
+        if let CallTarget::FunctionPath { segments, .. } = target
             && args.is_empty()
             && matches!(result_ty, ValueType::Ref(_))
             && resolves_to_null_ptr_builtin(segments)
@@ -5700,7 +5706,7 @@ impl<'a> Transformer<'a> {
         // `__cast_pointer/<Root>` marker (front::mir's carrier for the
         // upstream `cast_pointer` op, see `cast_pointer_marker_op`)
         // folds back to the operand alias and emits no jitcode op.
-        if let CallTarget::FunctionPath { segments } = target
+        if let CallTarget::FunctionPath { segments, .. } = target
             && segments.as_slice() == ["__cast_pointer"]
             && args.len() == 1
         {
@@ -5709,7 +5715,7 @@ impl<'a> Transformer<'a> {
         // Skip-path graphs never run `rtype_type`. Flatten's raise tail
         // reads only evalue (`flatten.py make_return`), so fold
         // `op.type(v)` to the operand and leave no residual call.
-        if let CallTarget::FunctionPath { segments } = target
+        if let CallTarget::FunctionPath { segments, .. } = target
             && segments.as_slice() == ["type"]
             && args.len() == 1
         {
@@ -5727,7 +5733,7 @@ impl<'a> Transformer<'a> {
         // same pointer too, and the JIT distinguishes a pointer no more
         // from its erasure than from its downcast, so it folds the same
         // way: the operand alias, no jitcode op.
-        if let CallTarget::FunctionPath { segments } = target
+        if let CallTarget::FunctionPath { segments, .. } = target
             && ((segments.as_slice() == [crate::runtime_names::shims::CAST_INSTANCE]
                 && args.len() == 1)
                 || (segments.as_slice() == [crate::runtime_names::shims::CAST_ADDRESS]
@@ -5780,7 +5786,7 @@ impl<'a> Transformer<'a> {
         // a `BinOp("eq")` over the two pointer operands — the assembler maps
         // the `rr` operand shape to `ptr_eq` — instead of residualising the
         // call to a symbolic helper fnaddr the executor cannot run.
-        if let CallTarget::FunctionPath { segments } = target
+        if let CallTarget::FunctionPath { segments, .. } = target
             && segments.len() == 3
             && segments[0] == "core"
             && segments[1] == "ptr"
@@ -9438,7 +9444,7 @@ fn tuple_pos_field_index(name: &str) -> Option<usize> {
 /// Convert a CallTarget to a CallPath for jitcode lookup.
 fn target_to_call_path(target: &CallTarget) -> crate::parse::CallPath {
     match target {
-        CallTarget::FunctionPath { segments } => {
+        CallTarget::FunctionPath { segments, .. } => {
             let segments = crate::model::fn_const_segments(target).unwrap_or(segments.as_slice());
             crate::parse::CallPath::from_segments(segments.iter().map(String::as_str))
         }
@@ -10125,7 +10131,7 @@ fn fold_we_are_jitted_calls(graph: &mut crate::model::FunctionGraph) {
     for block in graph.blocks.iter_mut() {
         for op in block.operations.iter_mut() {
             let OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
+                target: CallTarget::FunctionPath { segments, .. },
                 args,
                 ..
             } = &op.kind
@@ -10152,7 +10158,7 @@ fn classify_hint_target(target: &CallTarget) -> Option<crate::hints::HintKind> {
 /// The rtyper op `jit_force_virtualizable`, not `hint_force_virtualizable`.
 /// A method with the same name is not the rtyper primitive.
 fn is_jit_force_virtualizable_target(target: &CallTarget) -> bool {
-    matches!(target, CallTarget::FunctionPath { segments }
+    matches!(target, CallTarget::FunctionPath { segments, .. }
         if segments.last().is_some_and(|name| name == "jit_force_virtualizable"))
 }
 
@@ -10198,6 +10204,7 @@ fn call_target_matches_loose(pattern: &CallTarget, target: &CallTarget) -> bool 
                 name: tn,
                 receiver_root: tr,
                 resolved_path,
+                ..
             },
         ) => {
             if pn != tn {
@@ -10222,6 +10229,10 @@ fn call_target_matches_loose(pattern: &CallTarget, target: &CallTarget) -> bool 
                 _ => true,
             }
         }
+        (
+            CallTarget::FunctionPath { segments: ps, .. },
+            CallTarget::FunctionPath { segments: ts, .. },
+        ) => ps == ts,
         _ => pattern == target,
     }
 }
@@ -10654,9 +10665,11 @@ mod tests {
     fn function_path_override_matches_only_its_own_segmentation() {
         let split = CallTarget::FunctionPath {
             segments: vec!["core".into(), "ptr".into(), "null".into()],
+            fun_decl_id: None,
         };
         let unsplit = CallTarget::FunctionPath {
             segments: vec!["core::ptr".into(), "null".into()],
+            fun_decl_id: None,
         };
         assert_eq!(split.to_string(), unsplit.to_string());
         assert!(call_target_matches_loose(&split, &split));
@@ -10707,9 +10720,11 @@ mod tests {
     fn override_census_names_an_entry_that_matched_nothing() {
         let live = CallTarget::FunctionPath {
             segments: vec!["__probe135".into(), "live".into(), "leaf".into()],
+            fun_decl_id: None,
         };
         let inert = CallTarget::FunctionPath {
             segments: vec!["__probe135::inert".into(), "leaf".into()],
+            fun_decl_id: None,
         };
         let overrides = vec![
             CallEffectOverride::new(live.clone(), CallEffectKind::Elidable),
@@ -14669,6 +14684,7 @@ mod tests {
             name: "jit_force_virtualizable".to_string(),
             receiver_root: Some("Unrelated".to_string()),
             resolved_path: None,
+            fun_decl_id: None,
         };
         assert!(!is_jit_force_virtualizable_target(&method));
         assert!(is_jit_force_virtualizable_target(
@@ -16292,7 +16308,7 @@ mod tests {
             .fn_const_target_of(&graph, &result_var)
             .expect("rewritten __fn_const must remain recoverable");
         match recovered {
-            CallTarget::FunctionPath { segments } => {
+            CallTarget::FunctionPath { segments, .. } => {
                 assert_eq!(
                     segments,
                     [

@@ -144,7 +144,7 @@ fn rewire_one_checked_arith_uint_site(
             result: Some(r),
             kind:
                 OpKind::Call {
-                    target: target @ CallTarget::FunctionPath { segments },
+                    target: target @ CallTarget::FunctionPath { segments, .. },
                     args,
                     ..
                 },
@@ -301,6 +301,7 @@ mod tests {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            fun_decl_id: None,
         }
     }
 

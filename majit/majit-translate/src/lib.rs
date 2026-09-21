@@ -1774,7 +1774,7 @@ fn analyze_pipeline_from_module_paths(
                 // as `<Trait>::<method>(receiver, ...)` —
                 // `front::mir` lowers that into
                 // `CallTarget::FunctionPath { segments: [<Trait>,
-                // <method>] }`. The upstream-equivalent registration key
+                // <method>], fun_decl_id: None }`. The upstream-equivalent registration key
                 // is therefore `[<Trait>, <method>]`. The pseudo-type
                 // path `[<default methods of Trait>, <method>]` set by
                 // `register_trait_method` is retained so the filter logic
@@ -1881,7 +1881,7 @@ fn analyze_pipeline_from_module_paths(
     prof.mark("  trait-impl registration");
     // Single-impl devirtualization for REQUIRED trait methods.  A call
     // site `<Trait>::<method>(receiver, …)` lowers to
-    // `CallTarget::FunctionPath { segments: [<Trait>, <method>] }`
+    // `CallTarget::FunctionPath { segments: [<Trait>, <method>], fun_decl_id: None }`
     // (`front/mir.rs` `call_target_segments` `CallKind::Trait` arm).
     // Default bodies registered that direct path in the loop above; a
     // required method (declaration only, no default body) left it

@@ -43,6 +43,7 @@ fn build_caller_graph(name: &str, callee_path: &CallPath) -> FunctionGraph {
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: callee_path.segments.clone(),
+                    fun_decl_id: None,
                 },
                 args: Vec::new(),
                 result_ty: ValueType::Int,

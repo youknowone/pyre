@@ -17,7 +17,7 @@ const BOX_STR_CONSTANT_PATH: [&str; 3] = [
 
 fn is_box_str_constant_call(kind: &OpKind) -> Option<&Variable> {
     let OpKind::Call {
-        target: CallTarget::FunctionPath { segments },
+        target: CallTarget::FunctionPath { segments, .. },
         args,
         ..
     } = kind
@@ -43,7 +43,7 @@ pub(crate) fn str_literal_bytes(kind: &OpKind) -> Option<Vec<u8>> {
     match kind {
         OpKind::ConstStr(bytes) => Some(bytes.clone()),
         OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } if args.is_empty() && segments.len() == 2 && segments[0] == "__str_const" => {
@@ -146,6 +146,7 @@ mod tests {
         OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: vec!["__str_const".to_string(), payload.to_string()],
+                fun_decl_id: None,
             },
             args: crate::model::call_args(vec![]),
             result_ty: ValueType::Ref(None),
@@ -156,6 +157,7 @@ mod tests {
         OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: BOX_STR_CONSTANT_PATH.map(str::to_string).to_vec(),
+                fun_decl_id: None,
             },
             args: crate::model::call_args(vec![arg]),
             result_ty: ValueType::Ref(None),
