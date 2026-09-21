@@ -1585,6 +1585,16 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             crate::baseobjspace::walk_object_space_cache_roots(&mut forward_declaration);
             pyre_object::typedef::walk_typedef_roots(&mut forward_declaration);
         }
+        // Marking cannot enter an immortal `Function` carrier, and the tables
+        // below name only the carriers a builtin type dict, the method cache or
+        // a `MODULE_DICT_ROOTS` module publishes.  One a GC-managed module
+        // publishes — `_struct`'s `unpack`, which `pickletools` imports — is
+        // named by none of them, so the `w_module` stamped into it has no root
+        // and the next major sweep frees it under the live carrier.  The census
+        // names every carrier, whichever container holds it.
+        crate::function::for_each_prebuilt_function_root(&mut |func| {
+            walk_raw_function_roots(func, &mut *visitor);
+        });
         let mut forward = |slot: &mut PyObjectRef| {
             visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));
             walk_raw_function_roots(*slot, visitor);

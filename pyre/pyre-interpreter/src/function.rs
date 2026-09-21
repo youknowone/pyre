@@ -890,7 +890,52 @@ pub(crate) fn function_new_impl(
         }
     }
 
-    pyre_object::lltype::malloc_typed(function) as PyObjectRef
+    let obj = pyre_object::lltype::malloc_typed(function) as PyObjectRef;
+    register_prebuilt_function_root(obj);
+    obj
+}
+
+/// Every `Function` carrier the collector cannot trace.
+///
+/// The arm above hands a `BuiltinCode`-backed carrier a `malloc_typed` box, and
+/// a bootstrap allocation made before the GC hook exists lands on it too.
+/// Marking never enters such a box, so a GC-managed value stamped into one
+/// afterwards — `builtin_function_set_module`'s `w_module`,
+/// `function_set_qualname`'s `w_qualname`, `fget___module__`'s cached lookup —
+/// is named by nothing the marker can follow, and the next major sweep frees it
+/// under a carrier that keeps answering with the stale address.  `function.py`
+/// has no such split: `Function` is an ordinary GC object and the GC traces its
+/// fields.
+///
+/// `walk_raw_function_roots` reaches a carrier a walked table names directly — a
+/// builtin type dict, the method cache, or the dict of a module in
+/// `MODULE_DICT_ROOTS`.  That registry holds only the modules the collector does
+/// not own, so a carrier a GC-managed module publishes is named by no table at
+/// all: `_struct`'s dict holds the immortal `unpack`, the marker forwards the
+/// pointer and stops at the box, and `unpack.__module__` is left with no root.
+/// This census names every carrier instead, the compatibility-registry shape
+/// `pycode.rs`'s `W_GLOBALS_STAMPED_CODES` uses for stamped bootstrap code.
+///
+/// Append-only: each carrier registers once, at its own allocation, and an
+/// immortal box is never reclaimed.
+static PREBUILT_FUNCTION_ROOTS: parking_lot::Mutex<Vec<usize>> =
+    parking_lot::Mutex::new(Vec::new());
+
+/// Record an immortal `Function` carrier as a root of its own.
+fn register_prebuilt_function_root(obj: PyObjectRef) {
+    PREBUILT_FUNCTION_ROOTS.lock().push(obj as usize);
+}
+
+/// Hand every immortal `Function` carrier to `visit`.
+///
+/// Reached only from the collector's root walk, where every mutator is at a
+/// safepoint; that is what makes walking the carriers' fields sound here.
+#[majit_macros::dont_look_inside]
+pub fn for_each_prebuilt_function_root(visit: &mut dyn FnMut(PyObjectRef)) {
+    let roots = PREBUILT_FUNCTION_ROOTS.lock();
+    for &addr in roots.iter() {
+        visit(addr as PyObjectRef);
+    }
 }
 
 /// function.py — `class FunctionWithFixedCode(Function): can_change_code = False`
