@@ -3484,6 +3484,75 @@ fn raw_load_i_records_the_load_against_the_descr() {
     );
 }
 
+/// JUMP_BACKWARD's eval-breaker tick is `raw_load_i` of a constant address
+/// through the descr `add_raw_int_array_descr_signed` interns, then
+/// `uint_ge` against `JIT_BREAKER_FLOOR`, then `goto_if_not`.
+/// `pyjitpl.py MIFrame.opimpl_raw_load_i` runs `execute_with_descr`, which
+/// executes the load so the result box carries the word (`box.getint()`).
+/// The walk must stamp that word onto the recorded op the same way, or
+/// `uint_ge`/`goto_if_not` see a Null shadow and abort with
+/// `GotoIfNotValueNotConcrete`.
+#[test]
+fn raw_load_i_stamps_the_loaded_word_onto_the_result_box() {
+    let load_byte = *insns_opname_to_byte()
+        .get("raw_load_i/iid>i")
+        .expect("`raw_load_i/iid>i` must be in insns table");
+    // `iid>i`: 1B base + 1B offset + 2B descr + 1B dst.
+    let code = [load_byte, 0x00, 0x01, 0x00, 0x00, 0x02];
+    let item_size = majit_ir::eval_breaker_word::EVAL_BREAKER_WORD_SIZE;
+    let descr = crate::descr::raw_carray_descr(majit_ir::Type::Int, item_size, true);
+    assert!(
+        descr.as_array_descr().is_some(),
+        "the interned raw-int array descr must answer `as_array_descr`, \
+         matching `add_raw_int_array_descr_signed`"
+    );
+    let descr_pool = vec![descr];
+    let mut cell = [0u8; 16];
+    // Unarmed eval-breaker word: below `JIT_BREAKER_FLOOR`.
+    let loaded: i64 = 0;
+    unsafe {
+        std::ptr::write_unaligned(cell.as_mut_ptr().cast::<i64>(), loaded);
+    }
+    let addr = cell.as_ptr() as i64;
+    let mut tc = fresh_trace_ctx();
+    let base = tc.const_int(addr);
+    let offset = tc.const_int(0);
+    let mut regs_i = [base, offset, OpRef::NONE];
+    let mut concrete_i = [
+        ConcreteValue::Int(addr),
+        ConcreteValue::Int(0),
+        ConcreteValue::Null,
+    ];
+    let (outcome, next_pc) = run_hint_step_full(
+        &code,
+        &mut tc,
+        &mut [],
+        &mut [],
+        &mut regs_i,
+        &mut concrete_i,
+        &mut [],
+        &descr_pool,
+    )
+    .expect("`raw_load_i/iid>i` must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(
+        next_pc, 6,
+        "`iid>i` consumes 3 register bytes plus a 2B descr"
+    );
+    let last = tc.ops().last().expect("recorded op must exist");
+    assert_eq!(last.opcode, majit_ir::OpCode::RawLoadI);
+    assert_eq!(
+        concrete_i[2],
+        ConcreteValue::Int(loaded),
+        "the walk executes the load into the Int-bank shadow"
+    );
+    assert_eq!(
+        tc.concrete_of_opref(regs_i[2]),
+        Some(Value::Int(loaded)),
+        "pyjitpl.py MIFrame.opimpl_raw_load_i stamps box.value via execute_with_descr"
+    );
+}
+
 /// The walk executes a raw store as well as recording it, so the target has
 /// to be memory the test owns and every operand has to carry a concrete —
 /// `_opimpl_raw_store` goes through `execute_and_record`, and skipping the
