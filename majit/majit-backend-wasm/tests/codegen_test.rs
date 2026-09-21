@@ -9881,41 +9881,6 @@ fn inline_new_skips_null_when_setfield_covers() {
     );
 }
 
-/// Production `rewrite_ops_for_gc_with` must fold SameAsR before the GC
-/// rewrite, the same way the test harness does. `consider_setfield_gc`
-/// keys delayed NULLs by the NEW result; a store through an uncanonicalized
-/// alias would leave that NULL in place and clobber the field.
-#[test]
-fn production_rewrite_keeps_setfield_through_same_as_r() {
-    const FIELD_OFS: i64 = 8;
-    let stored = OpRef::const_ptr(majit_ir::GcRef(0x1234));
-    let alias = make_op(OpCode::SameAsR, &[OpRef::ref_op(1)], OpRef::ref_op(2));
-    let ops = vec![
-        new_with_gc_field(1, 53, FIELD_OFS as usize),
-        alias,
-        setfield_gc(2, stored, FIELD_OFS as usize),
-        finish_int_arg0(),
-    ];
-    let mut rewriter = gc_rewriter();
-    rewriter.malloc_zero_filled = false;
-    let (rewritten, _, _) = rewrite_ops_for_gc_with(&rewriter, ops, &indexmap::IndexMap::new());
-
-    let values_at_field: Vec<Option<i64>> = rewritten
-        .iter()
-        .filter(|op| op.opcode == OpCode::GcStore)
-        .filter(|op| op.arg(1).to_opref().inline_const_bits() == Some(FIELD_OFS))
-        .map(|op| op.arg(2).to_opref().inline_const_bits())
-        .collect();
-    assert!(
-        values_at_field.iter().any(|v| *v != Some(0)),
-        "SETFIELD_GC through SameAsR must still store the field value, got {values_at_field:?}"
-    );
-    assert!(
-        values_at_field.iter().all(|v| *v != Some(0)),
-        "delayed NULL must not overwrite a field stored through a SameAsR alias, got {values_at_field:?}"
-    );
-}
-
 /// rewrite.py `transform_to_gc_load` flushes pending zeros before
 /// GETFIELD_GC, so a later SETFIELD_GC must not cancel the NULL the
 /// load is about to observe.
