@@ -1596,23 +1596,30 @@ fn exc_info_result_needs_traceback(frame: &crate::pyframe::PyFrame) -> bool {
 /// Return the active exception as `(type, value, traceback-or-None)`.
 fn exc_info_tuple(include_traceback: bool) -> PyObjectRef {
     let exc = crate::eval::get_sys_exception();
-    if exc.is_null() {
-        pyre_object::tupleobject::jit_w_tuple3(w_none(), w_none(), w_none())
-    } else {
-        let exc_type = crate::baseobjspace::exception_getclass(exc);
-        let exc_type = if exc_type.is_null() {
-            w_none()
+    unsafe {
+        if exc.is_null() {
+            crate::runtime_ops::jit_build_tuple_3(
+                w_none() as i64,
+                w_none() as i64,
+                w_none() as i64,
+            ) as PyObjectRef
         } else {
-            exc_type
-        };
-        let w_tb = if include_traceback {
-            let tb = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exc) };
-            unsafe { crate::pytraceback::mark_traceback_escaped(tb) };
-            if tb.is_null() { w_none() } else { tb }
-        } else {
-            w_none()
-        };
-        pyre_object::tupleobject::jit_w_tuple3(exc_type, exc, w_tb)
+            let exc_type = crate::baseobjspace::exception_getclass(exc);
+            let exc_type = if exc_type.is_null() {
+                w_none()
+            } else {
+                exc_type
+            };
+            let w_tb = if include_traceback {
+                let tb = pyre_object::interp_exceptions::w_exception_get_traceback(exc);
+                crate::pytraceback::mark_traceback_escaped(tb);
+                if tb.is_null() { w_none() } else { tb }
+            } else {
+                w_none()
+            };
+            crate::runtime_ops::jit_build_tuple_3(exc_type as i64, exc as i64, w_tb as i64)
+                as PyObjectRef
+        }
     }
 }
 

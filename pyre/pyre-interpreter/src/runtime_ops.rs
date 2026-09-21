@@ -353,7 +353,6 @@ macro_rules! define_known_function_call_helper {
 
 macro_rules! define_flat_ref_helper {
     ($inner:ident, $name:ident $(, $arg:ident)*) => {
-        #[majit_macros::dont_look_inside]
         pub extern "C" fn $name($($arg: i64),*) -> i64 {
             $inner(&[$($arg as PyObjectRef),*])
         }

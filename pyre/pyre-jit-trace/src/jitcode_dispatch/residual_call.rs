@@ -50,21 +50,6 @@ fn walker_published_fnaddr(paths: &[&'static str], raw: i64) -> i64 {
         .unwrap_or(raw)
 }
 
-/// `cpa3` publishes both spellings from one `f as *const ()`; the codewriter
-/// lookup for `exc_info_tuple`'s call is the module-qualified path (Charon
-/// `name_path` keeps the crate root; `target_to_path` returns 3+-segment
-/// `FunctionPath`s verbatim; `register_macro_helper_trace_fnaddr` binds that
-/// unstripped spelling). Accept either published address.
-static JIT_W_TUPLE3_FNADDR: std::sync::LazyLock<i64> = std::sync::LazyLock::new(|| {
-    walker_published_fnaddr(
-        &[
-            "pyre_object::tupleobject::jit_w_tuple3",
-            "pyre_object::jit_w_tuple3",
-        ],
-        pyre_object::tupleobject::jit_w_tuple3 as *const () as usize as i64,
-    )
-});
-
 static TAKE_LAST_EXEC_CTX_FNADDR: std::sync::LazyLock<i64> = std::sync::LazyLock::new(|| {
     walker_published_fnaddr(
         &["pyre_interpreter::call::take_last_exec_ctx"],
@@ -7064,59 +7049,6 @@ fn try_walker_lower_getexecutioncontext<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// Lower a residual `jit_w_tuple3` to the virtual-aggregate shape
-/// [`try_walker_specialize_newtuple_object`] already emits.
-///
-/// `exc_info_with_tb` / `exc_info_without_tb` build the result with
-/// `space.newtuple([...])`. The tracer descends into `newtuple` and records
-/// `NEW_ARRAY` / `SETARRAYITEM_GC` / `NEW_WITH_VTABLE`, so `OptVirtualize`
-/// folds a non-escaping tuple. `jit_w_tuple3` is `dont_look_inside`, so the
-/// descended `exc_info_tuple` body otherwise leaves an opaque residual.
-/// Address-keyed like [`try_walker_lower_getexecutioncontext`]: decline to
-/// the generic residual when the callee is any other symbol or the three
-/// Ref arguments have no concrete shadows.
-fn try_walker_lower_jit_w_tuple3<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    funcptr: OpRef,
-    r_args: &[OpRef],
-    dst_bank: char,
-    dst: usize,
-) -> Result<Option<()>, DispatchError> {
-    if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 3 {
-        return Ok(None);
-    }
-    let Some(majit_ir::Value::Int(funcaddr)) = ctx.trace_ctx.box_value(funcptr) else {
-        return Ok(None);
-    };
-    if funcaddr != *JIT_W_TUPLE3_FNADDR {
-        return Ok(None);
-    }
-    let a = r_args[0];
-    let b = r_args[1];
-    let c = r_args[2];
-    let Some(ca) = walker_concrete_ref_object(ctx, a) else {
-        return Ok(None);
-    };
-    let Some(cb) = walker_concrete_ref_object(ctx, b) else {
-        return Ok(None);
-    };
-    let Some(cc) = walker_concrete_ref_object(ctx, c) else {
-        return Ok(None);
-    };
-    let result_concrete = pyre_object::w_tuple_new_array_backed(vec![ca, cb, cc]);
-    if result_concrete.is_null() {
-        return Ok(None);
-    }
-    let tuple_op = crate::helpers::emit_object_tuple_inline(ctx.trace_ctx, &[a, b, c]);
-    ctx.trace_ctx.set_opref_concrete(
-        tuple_op,
-        majit_ir::Value::Ref(majit_ir::GcRef(result_concrete as usize)),
-    );
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, tuple_op)?;
-    Ok(Some(()))
-}
-
 pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
@@ -7215,27 +7147,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // the helper's read, preventing both heap forwarding and exception
     // virtualization.
     if try_walker_lower_getexecutioncontext(ctx, op.pc, funcptr, &r_args, dst_bank, dst)?.is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-
-    // `jit_w_tuple3` is a `dont_look_inside` residual identified by address
-    // (`RuntimeHelperKind::None`), the same way
-    // [`try_walker_lower_getexecutioncontext`] matches `take_last_exec_ctx`.
-    // Lower it to `emit_object_tuple_inline` so a descended `exc_info_tuple`
-    // records the `space.newtuple` shape `OptVirtualize` already folds.
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && r_args.len() == 3
-        && matches!(
-            ctx.trace_ctx.box_value(funcptr),
-            Some(majit_ir::Value::Int(funcaddr))
-                if funcaddr == *JIT_W_TUPLE3_FNADDR
-        )
-        && spec_gate(SpecFold::JitWTuple3, || {
-            try_walker_lower_jit_w_tuple3(ctx, op.pc, funcptr, &r_args, dst_bank, dst)
-        })?
-        .is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }

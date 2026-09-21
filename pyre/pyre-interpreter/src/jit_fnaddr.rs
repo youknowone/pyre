@@ -1678,12 +1678,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::jit_w_tuple1",
         pyre_object::tupleobject::jit_w_tuple1,
     );
-    cpa3(
-        &mut entries,
-        "pyre_object::tupleobject::jit_w_tuple3",
-        "pyre_object::jit_w_tuple3",
-        pyre_object::tupleobject::jit_w_tuple3,
-    );
     upa2(
         &mut entries,
         "pyre_object::bytesobject::jit_w_bytes_getitem",
