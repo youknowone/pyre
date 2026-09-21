@@ -252,6 +252,45 @@ pub extern "C" fn jit_ll_strconcat(s1: i64, s2: i64) -> i64 {
     out
 }
 
+/// `rstr.py LLHelpers.ll_str_mul` — `@jit.elidable` on the STR payload.
+///
+/// `times < 0` clamps to 0 (`'0' * -1 == ''`).  `ovfcheck(len * times)` is
+/// MemoryError upstream; abort until that propagation is ported.  The
+/// doubling copy is `ll_str_mul`'s `copy_contents` loop.
+#[majit_macros::elidable]
+pub extern "C" fn jit_ll_str_mul(s: i64, mut times: i64) -> i64 {
+    if s == 0 {
+        return 0;
+    }
+    if times < 0 {
+        times = 0;
+    }
+    let n = bh_lowlevel_string_len(s);
+    let size = n
+        .checked_mul(times as usize)
+        .expect("ll_str_mul length overflow; MemoryError propagation is not ported yet");
+    let out = bh_alloc_lowlevel_string(size, LOWLEVEL_STR_BASE_SIZE, 1);
+    assert!(
+        out != 0,
+        "ll_str_mul failed to allocate; MemoryError propagation is not ported yet"
+    );
+    if size == 0 || n == 0 {
+        return out;
+    }
+    unsafe {
+        let src = (s as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET);
+        let dst = (out as *mut u8).add(LOWLEVEL_STRING_CHARS_OFFSET);
+        std::ptr::copy_nonoverlapping(src, dst, n);
+        let mut i = n;
+        while i < size {
+            let j = if i <= size - i { i } else { size - i };
+            std::ptr::copy_nonoverlapping(dst, dst.add(i), j);
+            i += j;
+        }
+    }
+    out
+}
+
 /// `rstr.py LLHelpers._ll_stringslice` — `@jit.elidable` +
 /// `@jit.oopspec('stroruni.slice(s1, start, stop)')`.
 ///
@@ -453,6 +492,24 @@ mod tests {
             assert_eq!(chars, expected);
             bh_free_lowlevel_string(buf, LOWLEVEL_STR_BASE_SIZE, 1);
         }
+    }
+
+    #[test]
+    fn jit_ll_str_mul_repeats_and_clamps_negative() {
+        let one = jit_ll_int2dec(0);
+        // `0` renders as `"0"` — one char, used as the fill.
+        assert_eq!(bh_lowlevel_string_len(one), 1);
+        let four = jit_ll_str_mul(one, 4);
+        assert_eq!(bh_lowlevel_string_len(four), 4);
+        assert_eq!(bh_read_lowlevel_string(four, 1), vec![b'0' as i64; 4]);
+        let empty = jit_ll_str_mul(one, 0);
+        assert_eq!(bh_lowlevel_string_len(empty), 0);
+        let also_empty = jit_ll_str_mul(one, -1);
+        assert_eq!(bh_lowlevel_string_len(also_empty), 0);
+        bh_free_lowlevel_string(one, LOWLEVEL_STR_BASE_SIZE, 1);
+        bh_free_lowlevel_string(four, LOWLEVEL_STR_BASE_SIZE, 1);
+        bh_free_lowlevel_string(empty, LOWLEVEL_STR_BASE_SIZE, 1);
+        bh_free_lowlevel_string(also_empty, LOWLEVEL_STR_BASE_SIZE, 1);
     }
 
     #[test]

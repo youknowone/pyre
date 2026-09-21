@@ -10192,3 +10192,11 @@ pub fn ll_strconcat_effectinfo() -> majit_ir::EffectInfo {
         majit_ir::OopSpecIndex::StrConcat,
     )
 }
+
+/// `rstr.py LLHelpers.ll_str_mul` is `@jit.elidable`; overflow is MemoryError.
+pub fn ll_str_mul_effectinfo() -> majit_ir::EffectInfo {
+    majit_ir::EffectInfo::const_new(
+        majit_ir::ExtraEffect::ElidableOrMemoryError,
+        majit_ir::OopSpecIndex::None,
+    )
+}
