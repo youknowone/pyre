@@ -7304,6 +7304,11 @@ fn build_function(
                     sink.local_set(value_types.local(vi));
                 }
             }
+            OpCode::SetinteriorfieldGc if unpack_interior_field(op).is_ptr => {
+                panic!(
+                    "wasm codegen: SetinteriorfieldGc must have been lowered by rewrite_ops_for_gc"
+                );
+            }
             OpCode::SetinteriorfieldGc | OpCode::SetinteriorfieldRaw => {
                 let field = unpack_interior_field(op);
                 let base = emit_scaled_index_addr(
