@@ -882,11 +882,10 @@ pub fn opcode_for_iter<H: IterOpcodeHandler + ControlFlowOpcodeHandler + ?Sized>
     let anchor = handler.anchor();
     match handler.iter_next(iter)? {
         Some(next) => {
-            let fallthrough = handler.fallthrough_target();
-            // On guard failure this bytecode exits through the exhaustion path.
-            handler.set_next_instr(target)?;
+            // `pyopcode.py FOR_ITER` exhausts only on StopIteration (`None`
+            // here). A guard fail at `space.next` is a deopt that re-runs
+            // `next` in the blackhole, not "iterator done".
             handler.record_for_iter_guard(next, true)?;
-            handler.set_next_instr(fallthrough)?;
             H::push_anchored(&anchor, next)
         }
         None => {
@@ -931,6 +930,22 @@ pub fn opcode_compare_op<H: ArithmeticOpcodeHandler + ?Sized>(
     let anchor = handler.anchor();
     let result = handler.compare_value(a, b, op)?;
     H::push_anchored(&anchor, result)
+}
+
+/// `pyopcode.py IS_OP` → `space.is_w`, then push the bool (inverted when
+/// `is not`).
+pub fn opcode_is_op<H>(handler: &mut H, invert: Invert) -> Result<(), PyError>
+where
+    H: SharedOpcodeHandler<Value = PyObjectRef> + ?Sized,
+{
+    let b = handler.pop_value()?;
+    let a = handler.pop_value()?;
+    let same = crate::baseobjspace::is_w(a, b);
+    let result = match invert {
+        Invert::No => same,
+        Invert::Yes => !same,
+    };
+    handler.push_value(pyre_object::w_bool_from(result))
 }
 
 pub fn opcode_unary_negative<H: ArithmeticOpcodeHandler + ?Sized>(
@@ -1460,15 +1475,38 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     fn contains_op(&mut self, _invert: crate::bytecode::Invert) -> Result<(), PyError> {
         Err(crate::PyError::type_error("contains_op not implemented"))
     }
-    fn is_op(&mut self, _invert: crate::bytecode::Invert) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("is_op not implemented"))
+    /// `pyopcode.py IS_OP` → `space.is_w`. A default that raises is not a
+    /// legal look-inside body: the unique-override bind may miss, and the
+    /// graph would then record this stub.
+    fn is_op(&mut self, invert: crate::bytecode::Invert) -> Result<(), PyError>
+    where
+        Self: SharedOpcodeHandler<Value = PyObjectRef>,
+    {
+        opcode_is_op(self, invert)
     }
 
     // Exception handling
-    fn push_exc_info(&mut self) -> Result<(), PyError> {
-        Ok(())
+    /// `pyopcode.py PUSH_EXC_INFO` — publish the caught exception onto
+    /// `ExecutionContext.sys_exc_info` so `sys.exc_info()` inside a compiled
+    /// handler sees it. A no-op default is not a legal look-inside body.
+    fn push_exc_info(&mut self) -> Result<(), PyError>
+    where
+        Self: SharedOpcodeHandler<Value = PyObjectRef>,
+    {
+        let exc = self.pop_value()?;
+        let prev = crate::eval::get_current_exception();
+        crate::eval::set_current_exception(exc);
+        crate::eval::set_in_flight_exception(pyre_object::PY_NULL);
+        self.push_value(prev)?;
+        self.push_value(exc)
     }
-    fn pop_except(&mut self) -> Result<(), PyError> {
+    /// `pyopcode.py POP_EXCEPT` — restore the previous `sys.exc_info`.
+    fn pop_except(&mut self) -> Result<(), PyError>
+    where
+        Self: SharedOpcodeHandler<Value = PyObjectRef>,
+    {
+        let prev_exc = self.pop_value()?;
+        crate::eval::set_current_exception(prev_exc);
         Ok(())
     }
     fn check_exc_match(&mut self) -> Result<(), PyError> {
@@ -2338,14 +2376,20 @@ pub fn execute_delete_subscr<E: OpcodeStepExecutor>(
 
 pub fn execute_push_exc_info<E: OpcodeStepExecutor>(
     executor: &mut E,
-) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: SharedOpcodeHandler<Value = PyObjectRef>,
+{
     executor.push_exc_info()?;
     Ok(StepResult::Continue)
 }
 
 pub fn execute_pop_except<E: OpcodeStepExecutor>(
     executor: &mut E,
-) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: SharedOpcodeHandler<Value = PyObjectRef>,
+{
     executor.pop_except()?;
     Ok(StepResult::Continue)
 }
@@ -3149,7 +3193,10 @@ pub fn execute_is_op<E: OpcodeStepExecutor>(
     executor: &mut E,
     instruction: Instruction,
     op_arg: OpArg,
-) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: SharedOpcodeHandler<Value = PyObjectRef>,
+{
     let Instruction::IsOp { invert } = instruction else {
         unreachable!()
     };

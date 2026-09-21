@@ -5062,24 +5062,6 @@ impl OpcodeStepExecutor for PyFrame {
         Self::push_anchored(&anchor, pyre_object::w_bool_from(inverted))
     }
 
-    // ── IsOp (is / is not) ──
-    // PyPy: pyopcode.py COMPARE_OP with 'is' / 'is not'
-
-    fn is_op(&mut self, invert: crate::bytecode::Invert) -> Result<(), PyError> {
-        let b = self.pop();
-        let a = self.pop();
-        // `COMPARE_OP 'is'` → `space.is_w` (descroperation.py): plain
-        // `int`s are identical by value (`W_IntObject.is_w`), everything
-        // else by pointer.
-        let same = crate::baseobjspace::is_w(a, b);
-        let result = match invert {
-            crate::bytecode::Invert::No => same,
-            crate::bytecode::Invert::Yes => !same,
-        };
-        self.push(pyre_object::w_bool_from(result));
-        Ok(())
-    }
-
     // ── ToBool ──
     // CPython 3.13: converts TOS to bool
 
