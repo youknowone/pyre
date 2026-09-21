@@ -9796,6 +9796,11 @@ impl<'a> Lowering<'a> {
             Operand::Copy(p) | Operand::Move(p) => Some(clone_tyref(&p.ty)),
             Operand::Const(_) => None,
         });
+        // Function-item identity of arg #1, captured before `call.args` is
+        // consumed.  `Option::map(opt, named_fn)` passes a `FnDef` constant
+        // (or a Copy/Move of a `FnDef`-typed local); that shape has no
+        // closure ADT, so `second_arg_ty` alone cannot name the callee.
+        let second_arg_fn_item = operand_fn_item_segments(self.llbc, call.args.get(1));
         // Third argument's MIR-declared type — `Option::map_or`'s closure env
         // operand.  Captured before the operands are consumed so the
         // `front::option_map_or` recording can resolve the closure ADT's
@@ -14505,14 +14510,16 @@ impl<'a> Lowering<'a> {
         {
             self.result_map_err_sites.push(site);
         }
-        // Capture `Option::map`/`and_then`/`unwrap_or_else(opt, closure)` sites
+        // Capture `Option::map`/`and_then`/`unwrap_or_else(opt, callable)` sites
         // for the discriminant closure-select `front::option_closure_select`
-        // synthesizes.  All three are Opaque (foreign `core`) with the `Option`
-        // ADT receiver, so `first_is_self` routes them to a two-arg
-        // `CallTarget::Method` (receiver `args[0]`, closure env `args[1]`).
-        // Resolving the `Option` field owners + closure `call_once` owner needs
-        // the receiver type (`first_arg_ty`), the env type (`second_arg_ty`),
-        // and the result type (`call.dest.ty`), all in hand here;
+        // synthesizes.  All five combinators are Opaque (foreign `core`) with
+        // the `Option` ADT receiver, so `first_is_self` routes them to a
+        // two-arg `CallTarget::Method` (receiver `args[0]`, callable
+        // `args[1]`).  The callable is a closure ADT (`second_arg_ty` →
+        // `call_once`) or a function item (`second_arg_fn_item` → a direct
+        // `Call(FunctionPath)`).  Resolving the `Option` field owners plus
+        // the callable needs the receiver type, the env type or `FnDef`
+        // path, and the result type (`call.dest.ty`), all in hand here;
         // `recognize_closure_select_site` also confirms the receiver is an
         // `Option`.  A resolution miss leaves the residual call.
         if let OpKind::Call {
@@ -14537,6 +14544,7 @@ impl<'a> Lowering<'a> {
                 kind,
                 first_arg_ty.as_ref(),
                 second_arg_ty.as_ref(),
+                second_arg_fn_item.clone(),
                 &call.dest.ty,
                 &result_var,
             )
@@ -18690,19 +18698,21 @@ impl<'a> Lowering<'a> {
     }
 
     /// Resolve a recognized `Option::map`/`and_then`/`unwrap_or_else(opt,
-    /// closure)` call into a
+    /// callable)` call into a
     /// [`crate::front::option_closure_select::ClosureSelectSite`] — the `Option`
-    /// enum root + `Some` variant owners, the closure env's `call_once` owner,
-    /// the payload type `T`, and the closure's `call_once` result type (`U` for
-    /// `map`, `Option<U>` for `and_then`, `T` for `unwrap_or_else`).  `None`
-    /// (leaving the residual call) when the receiver is not a resolvable
-    /// `Option`, the closure env does not resolve to an ADT, or (for `map`) the
+    /// enum root + `Some` variant owners, the callable (closure env
+    /// `call_once` owner, or function-item `FunctionPath` segments), the
+    /// payload type `T`, and the call result type (`U` for `map`, `Option<U>`
+    /// for `and_then`, `T` for `unwrap_or_else`).  `None` (leaving the residual
+    /// call) when the receiver is not a resolvable `Option`, the callable is
+    /// neither a closure ADT nor a named function item, or (for `map`) the
     /// result is not an `Option`.
     fn recognize_closure_select_site(
         &self,
         kind: crate::front::option_closure_select::ClosureCombinator,
         recv_ty: Option<&TyRef>,
         env_ty: Option<&TyRef>,
+        fn_item_segments: Option<Vec<String>>,
         dest_ty: &TyRef,
         result_var: &Variable,
     ) -> Option<crate::front::option_closure_select::ClosureSelectSite> {
@@ -18727,13 +18737,24 @@ impl<'a> Lowering<'a> {
         let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
         let payload_ty = self.tyref_option_payload_value_type(&recv_ty)?;
         let payload_class_root = self.option_payload_instance_class_root(&recv_ty);
-        let env_def_id = self.tyref_ref_adt_def_id(env_ty?)?;
-        let env_td = self.llbc.type_by_id(env_def_id)?;
-        let call_once_owner = env_td.item_meta.name_path();
-        // The single-element closure-`Args` tuple `(payload,)` the extracted
-        // `call_once` reads its `.0` from, keyed to the same `Tuple<X>` leaf
-        // the read side derives at `resolve_place`.
-        let args_tuple_suffix = option_payload_tuple_suffix(&recv_ty, self.llbc);
+        // Prefer a closure ADT (`call_once(env, (x,))`).  A function item has
+        // no ADT def id — `tyref_ref_adt_def_id` misses — so fall through to
+        // the `FnDef` path captured from the operand (or from `env_ty` when
+        // the item was spilled to a local).
+        let fn_item_segments = fn_item_segments
+            .or_else(|| env_ty.and_then(|ty| tyref_fn_def_call_segments(ty, self.llbc)));
+        let (call_once_owner, args_tuple_suffix, fn_item_segments) =
+            if let Some(env_def_id) = env_ty.and_then(|ty| self.tyref_ref_adt_def_id(ty)) {
+                let env_td = self.llbc.type_by_id(env_def_id)?;
+                (
+                    env_td.item_meta.name_path(),
+                    option_payload_tuple_suffix(&recv_ty, self.llbc),
+                    None,
+                )
+            } else {
+                let segments = fn_item_segments.filter(|s| !s.is_empty())?;
+                (String::new(), String::new(), Some(segments))
+            };
         // The type the closure's `call_once` returns: `map`'s dest is
         // `Option<U>` and its closure returns `U` (the dest payload);
         // `and_then`'s dest is `Option<U>` returned directly; `or_else`'s dest
@@ -18802,6 +18823,7 @@ impl<'a> Lowering<'a> {
             result_niche,
             result_fieldless_none_tag,
             call_once_owner,
+            fn_item_segments,
             payload_ty,
             payload_class_root,
             call_result_ty,
@@ -24075,6 +24097,27 @@ fn impl_method_owner_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<(String, S
     Some((owner_qualified, leaf))
 }
 
+/// Path segments used to *call* a function named by a `FnDef` constant or
+/// type — the same spelling `decode_constant` stores in a function-item
+/// value and `call_target_segments` emits for a direct call.  Impl-owned
+/// callees use `[qualified_owner, leaf]`; free functions keep `name_path()`
+/// split on `::`.
+fn fundecl_fn_item_segments(llbc: &Llbc, fd: &FunDecl) -> Vec<String> {
+    match impl_method_owner_for_fundecl(llbc, fd) {
+        Some((owner_qualified, leaf)) => {
+            let mut v: Vec<String> = owner_qualified.split("::").map(str::to_string).collect();
+            v.push(leaf);
+            v
+        }
+        None => fd
+            .item_meta
+            .name_path()
+            .split("::")
+            .map(|s| s.to_string())
+            .collect(),
+    }
+}
+
 /// For a `Deref` / `DerefMut` trait-impl method, resolve the leaf
 /// identifier of the implementing `Self` ADT (`Box`, `Rc`, `Arc`,
 /// `FrameBox`, …) directly from the impl's `Self` type, bypassing the
@@ -27054,6 +27097,59 @@ fn type_node_is_fn_ptr<'l>(mut node: &'l serde_json::Value, llbc: &'l Llbc) -> b
         return obj.get("FnPtr").is_some();
     }
     false
+}
+
+/// FunDecl id of a function-item (`FnDef`) type, after following
+/// serialization indirections.  `None` for a function pointer (`FnPtr`), a
+/// closure ADT, or any other shape.  Does not peel `Ref` / `RawPtr`: a
+/// function item is passed by value.
+fn type_node_fn_def_fun_id<'l>(mut node: &'l serde_json::Value, llbc: &'l Llbc) -> Option<u64> {
+    for _ in 0..24 {
+        let obj = node.as_object()?;
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            node = llbc.dedup_body(id)?;
+            continue;
+        }
+        if let Some(arr) = obj
+            .get("HashConsedValue")
+            .and_then(serde_json::Value::as_array)
+            && arr.len() == 2
+        {
+            node = &arr[1];
+            continue;
+        }
+        return obj
+            .get("FnDef")?
+            .as_object()?
+            .get("kind")?
+            .get("Fun")?
+            .get("Regular")?
+            .as_u64();
+    }
+    None
+}
+
+/// Direct-call `FunctionPath` segments of a `FnDef` type, or `None` when
+/// `ty` is not a named function item.
+fn tyref_fn_def_call_segments(ty: &TyRef, llbc: &Llbc) -> Option<Vec<String>> {
+    let fun_id = type_node_fn_def_fun_id(tyref_node(ty, llbc)?, llbc)?;
+    let fd = llbc.fn_by_id(fun_id)?;
+    let segments = fundecl_fn_item_segments(llbc, fd);
+    (!segments.is_empty()).then_some(segments)
+}
+
+/// Callable named by a combinator's second argument when that argument is a
+/// function item: a `FnDef` constant, or a Copy/Move of a `FnDef`-typed
+/// local.  `None` for a closure ADT (handled via `call_once`) and for any
+/// unproven shape.
+fn operand_fn_item_segments(llbc: &Llbc, op: Option<&Operand>) -> Option<Vec<String>> {
+    match op? {
+        Operand::Const(value) => match decode_constant(llbc, value) {
+            Ok(DecodedConst::FnPath(segments)) if !segments.is_empty() => Some(segments),
+            _ => None,
+        },
+        Operand::Copy(p) | Operand::Move(p) => tyref_fn_def_call_segments(&p.ty, llbc),
+    }
 }
 
 /// The pointee type node of a shared reference `&T` (`{"Ref": [region, ty,
@@ -30787,20 +30883,7 @@ fn decode_constant(llbc: &Llbc, value: &serde_json::Value) -> Result<DecodedCons
         // (`.map(Dynamic::flatten)`) could only ever miss.  A free function
         // keeps `name_path()`: that IS its registered spelling
         // (`free_function_alias_paths`).
-        let segments = match impl_method_owner_for_fundecl(llbc, fd) {
-            Some((owner_qualified, leaf)) => {
-                let mut v: Vec<String> = owner_qualified.split("::").map(str::to_string).collect();
-                v.push(leaf);
-                v
-            }
-            None => fd
-                .item_meta
-                .name_path()
-                .split("::")
-                .map(|s| s.to_string())
-                .collect(),
-        };
-        return Ok(DecodedConst::FnPath(segments));
+        return Ok(DecodedConst::FnPath(fundecl_fn_item_segments(llbc, fd)));
     }
     Err(LowerError::Unsupported(format!(
         "Operand::Const kind not yet handled: {value}"
