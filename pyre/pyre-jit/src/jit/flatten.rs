@@ -120,9 +120,9 @@ pub struct SSARepr {
     ///
     /// `pc_first_insn_pos` above cannot answer "which opcode owns this
     /// marker": it keeps only the FIRST position per Python PC, so a block
-    /// emitted out of source order — the `LoadFastCheck` null arm, appended
-    /// after the whole body — is attributed to whichever PC last opened a
-    /// segment.  Markers are the one op class that needs the exact inverse
+    /// emitted out of source order — appended after the whole body — is
+    /// attributed to whichever PC last opened a segment.  Markers are the one
+    /// op class that needs the exact inverse
     /// (`loop_body_abort_permanent_pc` decides a whole frame on it), and there
     /// are a handful per jitcode, so recording them exactly costs nothing that
     /// a dense per-op table would.

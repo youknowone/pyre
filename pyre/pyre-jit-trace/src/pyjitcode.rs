@@ -110,12 +110,11 @@ pub struct PyJitCodeMetadata {
     ///
     /// The floor table above answers the same question for ordinary ops, but
     /// only because they are emitted in source order.  A marker can sit in a
-    /// block the codewriter appends AFTER the whole body — the `LoadFastCheck`
-    /// null arm is the standing case — and `py_floor_by_jit_pc` keys each
-    /// Python PC to its FIRST offset, so that late block floors to whichever PC
-    /// last opened a segment instead of to its own opcode.  Markers are decided
-    /// on per frame by `loop_body_abort_permanent_pc`, so they get the exact
-    /// inverse.  Empty for skeleton / fixture metadata.
+    /// block the codewriter appends AFTER the whole body, and `py_floor_by_jit_pc`
+    /// keys each Python PC to its FIRST offset, so that late block floors to
+    /// whichever PC last opened a segment instead of to its own opcode.  Markers
+    /// are decided on per frame by `loop_body_abort_permanent_pc`, so they get
+    /// the exact inverse.  Empty for skeleton / fixture metadata.
     pub abort_permanent_py_pc_by_jit_pc: Vec<(u32, u32)>,
     /// Trace-entry green py_pc → JitCode byte offset where tracing enters
     /// for that green. This is the restriction of resume-marker resolution to

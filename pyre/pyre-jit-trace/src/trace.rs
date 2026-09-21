@@ -6091,28 +6091,11 @@ fn probe_walk_perfn_jitcode<Sym: WalkSym>(
 /// narrowing would have to seed every handler the walk can reach, which for
 /// these shapes is the whole tail again.
 ///
-/// The scan exempts one marker class: `LOAD_FAST_CHECK`'s null arm.  The
-/// decline above is a refusal over an *unported* opcode, whose arm bails
-/// without modelling the stack effect the walk then keeps interpreting.
-/// `LOAD_FAST_CHECK` is ported: the codewriter splits it on `ptr_nonzero`,
-/// compiles the bound arm normally, and sends the null arm to a dead-end block.
-/// A walk that finds the local bound takes the bound arm and never sees the
-/// marker; a walk that finds it unbound reaches the marker with the seeding
-/// intact and declines reactively, the ordinary path.  Neither leaves the loop
-/// guard mis-seeded, so the static refusal has nothing to prevent.
-///
-/// The widened `loop_in_try` tail is where this bites: putting the loop inside
-/// a `try` is itself what makes the tail read a loop variable through
-/// `LOAD_FAST_CHECK` rather than `LOAD_FAST` — the raise can reach the handler
-/// before the loop assigns the slot, so the slot is only conditionally bound on
-/// the join — and declining over that marker meant the widening's own predicate
-/// manufactured the marker it tripped on.
-///
 /// The owning opcode comes from `abort_permanent_py_pc_by_jit_pc`, the exact
-/// marker inverse, NOT from `py_floor_by_jit_pc`: the null arm's block is
-/// emitted after the whole body, and the floor table keys each Python PC to its
-/// FIRST jitcode offset, so it attributes that late block to whichever opcode
-/// last opened a segment.
+/// marker inverse, NOT from `py_floor_by_jit_pc`: a marker can sit in a block
+/// the codewriter appends after the whole body, and the floor table keys each
+/// Python PC to its FIRST jitcode offset, so it attributes that late block to
+/// whichever opcode last opened a segment.
 fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<usize> {
     let Some(pjc) = crate::state::pyjitcode_for_code(w_code) else {
         return None;
@@ -6217,7 +6200,7 @@ fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<us
             // conservative direction `abort_permanent_owner` documents.
             abort_permanent_owner(w_code, &pjc, *pc).is_none_or(|(py_pc, _)| py_pc >= handler_py_pc)
         })
-        .find(|pc| !marker_is_load_fast_check_null_arm(w_code, &pjc, *pc))
+        .next()
 }
 
 /// The Python PC and decoded opcode that emitted the `abort_permanent` at
@@ -6247,22 +6230,7 @@ fn abort_permanent_owner(
     Some((py_pc, instr))
 }
 
-/// True when the `abort_permanent` at `marker_jit_pc` is the dead-end arm
-/// `LOAD_FAST_CHECK` emits for a conditionally-bound slot (`codewriter.rs`
-/// `Instruction::LoadFastCheck`, the `emit_abort_permanent!(py_pc,
-/// closes_block)` leg).
-fn marker_is_load_fast_check_null_arm(
-    w_code: *const (),
-    pjc: &crate::pyjitcode::PyJitCodePayload,
-    marker_jit_pc: usize,
-) -> bool {
-    matches!(
-        abort_permanent_owner(w_code, pjc, marker_jit_pc),
-        Some((_, pyre_interpreter::Instruction::LoadFastCheck { .. }))
-    )
-}
-
-/// `"py_pc=47 LoadFastCheck"` for the `PYRE_FBW_DEBUG_ABORT` line, or
+/// `"py_pc=47 YieldValue"` for the `PYRE_FBW_DEBUG_ABORT` line, or
 /// `"owner=?"` when the inverse cannot name it.
 ///
 /// A bare jitcode offset does not say which opcode declined the frame, and the
