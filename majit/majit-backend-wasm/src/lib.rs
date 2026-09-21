@@ -2279,6 +2279,46 @@ pub fn rewrite_ops_for_gc(
     rewrite_ops_for_gc_with(&gc_rewriter(), ops, constants)
 }
 
+/// `get_box_replacement` treats SameAsR/I as a forwarding edge.
+/// `resolve` only follows `record_result_mapping`, so a store through an
+/// alias would miss the delayed NULL keyed by the original NEW result.
+/// Canonicalize those aliases before the GC rewrite sees the stores.
+fn fold_same_as_replacements(ops: Vec<Op>) -> Vec<Op> {
+    use majit_ir::{OpCode, OpRef};
+    let mut map = HashMap::<OpRef, OpRef>::new();
+    let resolve = |r: OpRef, map: &HashMap<OpRef, OpRef>| {
+        let mut cur = r;
+        for _ in 0..map.len().saturating_add(1) {
+            match map.get(&cur).copied() {
+                Some(next) if next != cur => cur = next,
+                _ => break,
+            }
+        }
+        cur
+    };
+    for op in &ops {
+        if matches!(op.opcode, OpCode::SameAsI | OpCode::SameAsR) {
+            let result = op.pos().get();
+            if result != OpRef::NONE && !result.is_constant() {
+                map.insert(result, resolve(op.arg(0).to_opref(), &map));
+            }
+        }
+    }
+    if map.is_empty() {
+        return ops;
+    }
+    for op in &ops {
+        for i in 0..op.num_args() {
+            let r = op.arg(i).to_opref();
+            let resolved = resolve(r, &map);
+            if resolved != r {
+                op.setarg(i, majit_ir::operand::Operand::bound_from_opref(resolved));
+            }
+        }
+    }
+    ops
+}
+
 /// [`rewrite_ops_for_gc`] with an explicit rewriter (tests that need
 /// IncrementalMiniMark `malloc_zero_filled=false` when no collector is bound).
 #[doc(hidden)]
@@ -2292,6 +2332,7 @@ pub fn rewrite_ops_for_gc_with(
     Option<Arc<majit_gc::GcTable>>,
 ) {
     use majit_gc::GcRewriter;
+    let ops = fold_same_as_replacements(ops);
     // rewrite.py `gen_malloc_str` parity: inject str_descr/unicode_descr for
     // NEWSTR/NEWUNICODE. The STRLEN/STRGETITEM/STRHASH arms read the length
     // and hash offsets off that descr, so the stream has to carry it before
