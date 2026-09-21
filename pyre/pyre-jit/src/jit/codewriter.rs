@@ -2324,10 +2324,33 @@ fn emit_jump_absolute_tick(
         //
         // Portal jitcode only (`emit_tick`): in a non-portal callee
         // `frame_var` aliases the outermost frame (ReturnValue arm).
+        //
+        // Split a new graph block for the poll.  JUMP_BACKWARD falls
+        // through from STORE_FAST in the same CFG block; appending the
+        // poll there made `derive_pc_live_indices_from_sparse` key the
+        // PC's first insn at the setfield, whose nearest `-live-` is
+        // STORE_FAST's trailing marker (dead boxed temps still SSA-live).
+        // The snapshot then treated those colors as kept operand-stack
+        // slots (`BranchGuardKeptSlotUnsourced`).  `get_list_of_active_boxes`
+        // (`pyjitpl.py`) reads the terminator's own `-live-`.  A fresh
+        // block's head `-live-` is the jump's frame-state variables — the
+        // same set the slow/hot arms already use — so the resume marker
+        // and the guard agree.
+        let mut tick_state = current_state.clone();
+        tick_state.next_offset = py_pc;
+        tick_state.blocklist = frame_blocks_for_offset(code, py_pc);
+        let tick_block = SpamBlockRef::new(graph.new_block(Vec::new()), Some(tick_state.clone()));
+        all_walker_blocks.push(tick_block.clone());
+        tick_block.block().borrow_mut().inputargs = tick_state.getvariables();
+        append_exit(
+            &current_block.block(),
+            output_link(current_state, &tick_state, tick_block.block()),
+        );
+
         let last_instr: super::flow::FlowValue =
             super::flow::Constant::signed(target_py_pc as i64).into();
         record_graph_op(
-            &current_block.block(),
+            &tick_block.block(),
             "setfield_vable_i",
             vable_setfield_int_graph_args(
                 frame_var.into(),
@@ -2340,7 +2363,7 @@ fn emit_jump_absolute_tick(
 
         let addr = emit_graph_op_with_result(
             graph,
-            &current_block.block(),
+            &tick_block.block(),
             "int_copy",
             vec![super::flow::Constant::signed(eb_addr as i64).into()],
             Kind::Int,
@@ -2348,7 +2371,7 @@ fn emit_jump_absolute_tick(
         );
         let offset = emit_graph_op_with_result(
             graph,
-            &current_block.block(),
+            &tick_block.block(),
             "int_copy",
             vec![super::flow::Constant::signed(0).into()],
             Kind::Int,
@@ -2362,7 +2385,7 @@ fn emit_jump_absolute_tick(
         );
         let word = emit_graph_op_with_result(
             graph,
-            &current_block.block(),
+            &tick_block.block(),
             "raw_load_i",
             vec![addr.into(), offset.into(), descr.into()],
             Kind::Int,
@@ -2370,7 +2393,7 @@ fn emit_jump_absolute_tick(
         );
         let floor = emit_graph_op_with_result(
             graph,
-            &current_block.block(),
+            &tick_block.block(),
             "int_copy",
             vec![
                 super::flow::Constant::signed(
@@ -2383,17 +2406,17 @@ fn emit_jump_absolute_tick(
         );
         let armed = emit_graph_op_with_result(
             graph,
-            &current_block.block(),
+            &tick_block.block(),
             "uint_ge",
             vec![word.into(), floor.into()],
             Kind::Int,
             py_pc as i64,
         );
 
-        current_block.block().borrow_mut().exitswitch =
+        tick_block.block().borrow_mut().exitswitch =
             Some(super::flow::ExitSwitch::Value(armed.into()));
 
-        let mut arm_state = current_state.clone();
+        let mut arm_state = tick_state.clone();
         arm_state.next_offset = py_pc;
         arm_state.blocklist = frame_blocks_for_offset(code, py_pc);
         let slow = SpamBlockRef::new(graph.new_block(Vec::new()), Some(arm_state.clone()));
@@ -2410,15 +2433,15 @@ fn emit_jump_absolute_tick(
         // goto_if_not jumps when the condition is 0, so linkfalse is the
         // unarmed (hot) arm and linktrue is the armed residual.
         append_exit(
-            &current_block.block(),
+            &tick_block.block(),
             super::flow::Link::new(slow_inputs, Some(slow.block()), None).into_ref(),
         );
-        set_last_bool_exitcase(&current_block.block(), true);
+        set_last_bool_exitcase(&tick_block.block(), true);
         append_exit(
-            &current_block.block(),
+            &tick_block.block(),
             super::flow::Link::new(hot_inputs.clone(), Some(hot.block()), None).into_ref(),
         );
-        set_last_bool_exitcase(&current_block.block(), false);
+        set_last_bool_exitcase(&tick_block.block(), false);
 
         let _ = record_residual_call_graph_op(
             graph,

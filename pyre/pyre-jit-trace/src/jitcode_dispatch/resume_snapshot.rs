@@ -11,6 +11,22 @@
 
 use super::*;
 
+/// True when a branch-guard's not-taken arm is still the same Python
+/// opcode as the `goto_if_not` itself.
+///
+/// The JUMP_BACKWARD eval-breaker poll is this shape: both arms keep the
+/// jump's frame state, so `get_list_of_active_boxes` (`pyjitpl.py`) reads
+/// the terminator's own `-live-`.  A Python `POP_JUMP_IF_*` / `FOR_ITER`
+/// not-taken arm is a different opcode, so this is false and the snapshot
+/// keeps the opcode-start resume marker (boxed TOS / exhausted-arm live
+/// set).
+pub(crate) fn branch_not_taken_stays_in_guard_opcode(
+    guard_py_pc: Option<u32>,
+    other_py_pc: Option<u32>,
+) -> bool {
+    matches!((guard_py_pc, other_py_pc), (Some(guard), Some(other)) if guard == other)
+}
+
 /// Exact `jtransform.py handle_residual_call` trailing `-live-` marker.
 ///
 /// The codewriter emits this immediately after every may-force/can-raise
@@ -1052,7 +1068,34 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     ctx.trace_ctx.last_guard_opcode(),
                     Some(OpCode::GuardTrue | OpCode::GuardFalse)
                 );
-                if is_branch
+                // JUMP_BACKWARD's eval-breaker `goto_if_not` keeps both arms
+                // on that same Python opcode.  `get_list_of_active_boxes`
+                // (`pyjitpl.py`) then reads the terminator's own `-live-`.
+                // The opcode-start resume marker for that PC is the
+                // predecessor STORE_FAST trailing live and lists dead temps
+                // as kept stack colors (`BranchGuardKeptSlotUnsourced`).
+                let (guard_py, other_py) = unsafe {
+                    let table = &(&*sym.jitcode()).payload.metadata.py_exact_by_jit_pc;
+                    (
+                        scope.branch_guard_jitcode_pc.and_then(|gpc| {
+                            crate::pyjitcode::exact_py_pc_for_jitcode_pc(table, gpc)
+                        }),
+                        crate::pyjitcode::exact_py_pc_for_jitcode_pc(table, op_pc),
+                    )
+                };
+                let same_opcode_poll =
+                    is_branch && branch_not_taken_stays_in_guard_opcode(guard_py, other_py);
+                if same_opcode_poll
+                    && ctx.live_before_jit_pc != usize::MAX
+                    && unsafe {
+                        (&*sym.jitcode())
+                            .payload
+                            .jitcode
+                            .can_decode_live_vars(ctx.live_before_jit_pc, crate::state::op_live())
+                    }
+                {
+                    ctx.live_before_jit_pc as i32
+                } else if is_branch
                     && ctx.live_before_jit_pc != usize::MAX
                     && ctx.live_before_jit_pc <= majit_ir::resumedata::BRANCH_ORGPC_MAX
                     && marker.is_some()
