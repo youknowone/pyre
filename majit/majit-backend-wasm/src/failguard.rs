@@ -92,6 +92,11 @@ pub struct WasmFrameData {
     /// mid-call. `set_savedata` writes `jf_savedata` there so the
     /// later GUARD_NOT_FORCED exit can copy the word back.
     origin_jf: Option<*mut majit_backend::jitframe::JitFrame>,
+    /// Off-GC host-buffer owner. `take_host_frame` keeps the entry
+    /// JitFrame alive after `execute_token` returns.
+    /// Read on the wasm32 `execute_token` host-buffer path.
+    #[allow(dead_code)]
+    host_frame: Option<majit_backend::libc_deadframe::LibcJitFrameDeadFrame>,
     /// Slots handed to [`crate::wasm_gc_add_roots`] by [`WasmFrameData::boxed`],
     /// released again in `Drop`.
     roots: Vec<usize>,
@@ -122,6 +127,7 @@ impl WasmFrameData {
             exc_value,
             savedata: 0,
             origin_jf: None,
+            host_frame: None,
             roots: Vec::new(),
         });
         let ref_count = data
@@ -176,10 +182,19 @@ impl WasmFrameData {
     pub fn set_savedata(&mut self, data: majit_ir::GcRef) {
         let was_nonzero = self.savedata != 0;
         let now_nonzero = !data.is_null();
-        self.savedata = data.0 as i64;
+        let mut data_slot = data.0 as i64;
         if let Some(jf) = self.origin_jf {
-            unsafe { (*jf).jf_savedata = data.0 };
+            let depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+            unsafe {
+                majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(&mut data_slot));
+            }
+            if crate::wasm_gc_owns_object(jf as usize) {
+                crate::wasm_active_gc_write_barrier(majit_ir::GcRef(jf as usize));
+            }
+            majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
+            unsafe { (*jf).jf_savedata = data_slot as usize };
         }
+        self.savedata = data_slot;
         if was_nonzero == now_nonzero {
             return;
         }
@@ -191,6 +206,14 @@ impl WasmFrameData {
             crate::wasm_gc_remove_roots(std::iter::once(slot));
             self.roots.retain(|&s| s != slot);
         }
+    }
+
+    #[allow(dead_code)] // wasm32 `execute_token` host-buffer path
+    pub(crate) fn take_host_frame(
+        &mut self,
+        frame: majit_backend::libc_deadframe::LibcJitFrameDeadFrame,
+    ) {
+        self.host_frame = Some(frame);
     }
 }
 

@@ -3356,7 +3356,19 @@ impl Backend for DynasmBackend {
 
     fn set_savedata_ref(&self, frame: &mut DeadFrame, data: GcRef) {
         match frame {
-            DeadFrame::JitFrame(jf) => jf.set_savedata_ref(data),
+            DeadFrame::JitFrame(jf) => {
+                // llmodel.py set_savedata_ref is a GCREF field store.
+                let mut data_slot = data.0 as i64;
+                let depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+                unsafe {
+                    majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(
+                        &mut data_slot,
+                    ));
+                }
+                majit_gc::gc_write_barrier(jf.jf_gcref());
+                majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
+                jf.set_savedata_ref(GcRef(data_slot as usize));
+            }
             DeadFrame::LibcJitFrame(jf) => jf.set_savedata_ref(data),
             DeadFrame::Boxed(_) => panic!("dynasm deadframe is a jitframe"),
         }

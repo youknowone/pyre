@@ -632,12 +632,22 @@ fn park_residual_call_exception() -> ParkedResidualException {
     let scope = pyre_object::gc_roots::push_roots();
     let save = pyre_object::gc_roots::shadow_stack_len();
     let bh_pinned = bh != 0;
-    if bh_pinned {
-        let _ = pyre_object::gc_roots::pin_root(bh as pyre_object::PyObjectRef);
-    }
     let backend_pinned = backend != 0;
+    // Publish both cells before any normalize: `pin_root` queries after the
+    // first write and a collection there would move the still-unrooted one.
+    let mut parked = [pyre_object::PY_NULL; 2];
+    let mut n = 0;
+    if bh_pinned {
+        parked[n] = bh as pyre_object::PyObjectRef;
+        n += 1;
+    }
     if backend_pinned {
-        let _ = pyre_object::gc_roots::pin_root(backend as pyre_object::PyObjectRef);
+        parked[n] = backend as pyre_object::PyObjectRef;
+        n += 1;
+    }
+    if n > 0 {
+        let base = scope.publish(&parked[..n]);
+        scope.normalize(base, n);
     }
     majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
     drain_backend_jit_exc();
@@ -985,10 +995,10 @@ pub(crate) extern "C" fn record_inline_traceback_for_recording(
     let w_code = w_code_value as PyObjectRef;
     let w_globals = w_globals_value as PyObjectRef;
     let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[w_exc, w_code]);
-    let w_exc = pyre_object::gc_roots::shadow_stack_get(base);
-    let w_code = pyre_object::gc_roots::shadow_stack_get(base + 1);
-    let w_globals = pyre_object::gc_roots::pin_root(w_globals);
+    let base = _roots.pin_roots(&[w_exc, w_code, w_globals]);
+    let w_exc = _roots.get(base);
+    let w_code = _roots.get(base + 1);
+    let w_globals = _roots.get(base + 2);
     // `record_application_traceback` requires the traceback's own frame
     // identity. The recording walker cannot force the optimizer's virtual
     // locals, so materialize a traceback-only frame from the promoted callee
@@ -1067,10 +1077,10 @@ pub(crate) extern "C" fn record_discarded_level_traceback(
     let w_globals = unsafe { pyre_interpreter::w_code_get_w_globals(w_code) };
     let w_exc = exc_value as PyObjectRef;
     let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[w_exc, w_code]);
-    let w_exc = pyre_object::gc_roots::shadow_stack_get(base);
-    let w_code = pyre_object::gc_roots::shadow_stack_get(base + 1);
-    let w_globals = pyre_object::gc_roots::pin_root(w_globals);
+    let base = _roots.pin_roots(&[w_exc, w_code, w_globals]);
+    let w_exc = _roots.get(base);
+    let w_code = _roots.get(base + 1);
+    let w_globals = _roots.get(base + 2);
     let Ok(mut frame) = pyre_interpreter::createframe_obj(
         w_code as *const (),
         w_globals,
@@ -2127,10 +2137,16 @@ fn jit_blackhole_resume_from_guard(
     // in eval.rs. We do this BEFORE setting up resume state so deep
     // recursion through the blackhole interpreter cannot accumulate
     // further damage.
-    if let Err(exc) = pyre_interpreter::stack_check::drain_jit_pending_exception() {
-        // Stash for the eval loop to surface — same channel the
-        // blackhole/force callbacks already use for cross-FFI errors.
-        crate::call_jit::set_pending_ca_exception(exc);
+    if let Err(mut exc) = pyre_interpreter::stack_check::drain_jit_pending_exception() {
+        // This callback returns as the result of CALL_ASSEMBLER, whose caller
+        // immediately executes GUARD_NO_EXCEPTION.  Publish into the same two
+        // exception cells as every raising residual call; merely stashing the
+        // PyError for the outer eval loop would let the null call result reach
+        // bytecode consumers before that boundary.
+        let exc_obj = exc.to_exc_object();
+        if exc_obj != pyre_object::PY_NULL {
+            publish_residual_call_exception(exc_obj as i64);
+        }
         pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_reset();
         return None;
     }
@@ -2258,15 +2274,16 @@ fn jit_blackhole_resume_from_guard(
         // instead of resuming the no-exception continuation with a NULL
         // result.
         // compile.py `ResumeGuardForcedDescr.handle_fail` fishes the
-        // cache `handle_async_forcing` saved; no other `handle_fail` does.
-        // `fail_values[0]` IS the callee's `PyFrame*` for the Python portal
-        // (the entry-green-key recovery above relies on the same contract), so
-        // it names the frame a force would have attached its cache to.
-        let all_virtuals = if descr_arc.is_guard_forced() {
-            crate::eval::take_forced_virtuals_for_frame(
-                fail0 as *const pyre_interpreter::pyframe::PyFrame,
-                crate::eval::savedata_from_jitframe(deadframe),
-            )
+        // cache `handle_async_forcing` saved via `cpu.get_savedata_ref(deadframe)`.
+        let savedata = crate::eval::savedata_from_jitframe(deadframe);
+        let mut savedata_slot = [savedata.map_or(0, majit_ir::GcRef::as_usize) as i64];
+        let _savedata_root = unsafe {
+            majit_metainterp::resume::DeadFrameRefRoots::enter(&mut savedata_slot, |_| {
+                savedata.is_some()
+            })
+        };
+        let all_virtuals = if descr_arc.is_guard_forced() && savedata.is_some() {
+            majit_metainterp::AllVirtuals::show(majit_ir::GcRef(savedata_slot[0] as usize))
         } else {
             None
         };
@@ -2454,6 +2471,9 @@ fn exit_frame_exception_ref(
 ///
 /// Never returns: the caller is about to classify the value by its `ExcKind`
 /// tag, and there is no correct classification for a value that has no tag.
+/// Name lookups through `ob_type` / `w_class` are intentionally omitted —
+/// an aligned word is not a live type, and following one is how this
+/// reporter SIGSEGVed after already printing the header dump.
 fn reject_non_exception_channel_value(
     obj: PyObjectRef,
     site: &str,
@@ -2490,23 +2510,14 @@ fn reject_non_exception_channel_value(
     pyre_interpreter::host_seam::emit_stderr(
         format!("[jit][BUG] {site}: context: {}\n", context()).as_bytes(),
     );
-    // `words[0]` is `ob_type` and `words[1]` is `w_class`; only read through
-    // either when the pointer has the shape of one.  `ob_type` names the
-    // built-in layout ("object" for every instance of a Python class), so the
-    // `w_class` name is the one that identifies the value.
-    let type_name = if words[0] != 0 && words[0].is_multiple_of(8) {
-        unsafe { pyre_object::pyobject::type_name_of(obj) }
-    } else {
-        "<unreadable>"
-    };
-    let class_name = if words[1] != 0 && words[1].is_multiple_of(8) {
-        unsafe { pyre_object::w_type_get_name(words[1] as PyObjectRef).to_string() }
-    } else {
-        "<none>".to_string()
-    };
+    // Do not follow `ob_type` / `w_class`. Alignment is not a type proof —
+    // a reused nursery word that happens to be 8-aligned still faults
+    // `type_name_of` / `w_type_get_name`.
     panic!(
         "{site}: exception channel value is not a W_BaseException \
-         (obj={obj:p} tag_byte={tag} type={type_name} class={class_name})"
+         (obj={obj:p} tag_byte={tag} \
+         words=[{:#018x} {:#018x} {:#018x} {:#018x}])",
+        words[0], words[1], words[2], words[3]
     );
 }
 
@@ -4565,14 +4576,14 @@ fn jit_ca_handle_guard_failure(
         // hands its stash to the blackhole hook via `CA_WALK_FINISHED_FRAME`
         // (`ResumeBlackhole`). A JUMP attach returns `CompiledContinue`
         // and `handle_fail` re-enters the portal instead of blackholing.
-        let raw_values: Vec<i64> = (0..n_fail_args)
+        let mut raw_values: Vec<i64> = (0..n_fail_args)
             .map(|i| unsafe { majit_backend::get_int_value(deadframe, descr_fd, i) })
             .collect();
         // The copy is not a JITFRAME: `jitframe_trace` cannot update it.
         // Root Ref slots for the same window `handle_fail` already covers
         // (`DeadFrameRefRoots` / `compute_gcmap`).
         let _deadframe_roots = unsafe {
-            majit_metainterp::resume::DeadFrameRefRoots::enter(&raw_values, |index| {
+            majit_metainterp::resume::DeadFrameRefRoots::enter(&mut raw_values, |index| {
                 // Slot 0 is the virtualizable (PyFrame). It is a GC
                 // object even when `exit_types` has not yet classified
                 // it; a CA bridge walk that forces `f_locals` reads it
@@ -4842,7 +4853,7 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             descr_arc,
             green_key,
             exit_layout,
-            raw_values,
+            mut raw_values,
             guard_value_operand,
             mut guard_exc,
             savedata,
@@ -4855,7 +4866,7 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             // carrier rooted at parity with dynasm if that invariant changes.
             let _guard_exc_root = BareRefRoot::register(&mut guard_exc);
             let _deadframe_roots = unsafe {
-                majit_metainterp::resume::DeadFrameRefRoots::enter(&raw_values, |index| {
+                majit_metainterp::resume::DeadFrameRefRoots::enter(&mut raw_values, |index| {
                     exit_layout.is_traced_ref_slot(index)
                 })
             };
@@ -4898,21 +4909,23 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             {
                 return result;
             }
-            // compile.py `ResumeGuardForcedDescr.handle_fail`: only a
-            // GUARD_NOT_FORCED failure fishes the cache the force saved, keyed
-            // by the callee frame `raw_values[0]` names.
-            let forced_cache_owner = if descr_arc.is_guard_forced() {
-                callee_frame as *const pyre_interpreter::pyframe::PyFrame
-            } else {
-                std::ptr::null()
+            // compile.py ResumeGuardForcedDescr.handle_fail reads
+            // `cpu.get_savedata_ref(deadframe)` after the bridge attempt.
+            // `dead_frame_from_ran_frame` already copied `jf_savedata`;
+            // root that copy across the same window.
+            let mut savedata_slot = [savedata.map_or(0, majit_ir::GcRef::as_usize) as i64];
+            let _savedata_root = unsafe {
+                majit_metainterp::resume::DeadFrameRefRoots::enter(&mut savedata_slot, |_| {
+                    savedata.is_some()
+                })
             };
+            let savedata = savedata.map(|_| majit_ir::GcRef(savedata_slot[0] as usize));
             let bh = crate::eval::resume_in_blackhole_from_exit_layout(
-                &raw_values,
+                &mut raw_values,
                 &exit_layout,
                 guard_exc,
-                forced_cache_owner,
                 false,
-                savedata,
+                descr_arc.is_guard_forced().then_some(savedata).flatten(),
             );
             handle_blackhole_result(bh, green_key).unwrap_or(0)
         }
@@ -5818,10 +5831,10 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
             && unsafe { pyre_interpreter::builtin_code_get_fast_natural_arity(code) as usize }
                 == positional_count;
         if exact_fixed_arity {
-            let _ = _roots.pin_root(code);
-            let _ = _roots.pin_root(receiver);
-            let code_slot = root_base + 2 + args.len();
-            let receiver_slot = code_slot + 1;
+            let extra = _roots.publish(&[code, receiver]);
+            _roots.normalize(extra, 2);
+            let code_slot = extra;
+            let receiver_slot = extra + 1;
             let mut call_args = [pyre_object::PY_NULL; 4];
             call_args[0] = _roots.get(receiver_slot);
             for (index, slot) in call_args[1..positional_count].iter_mut().enumerate() {

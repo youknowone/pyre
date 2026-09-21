@@ -4030,7 +4030,11 @@ impl TraceCtx {
 
         for field_index in 0..info.static_fields.len() {
             if let Some(&value) = boxes.get(field_index) {
-                let descr = info.static_field_descr(field_index);
+                // pyjitpl.py `gen_store_back_in_vable` records SETFIELD_GC
+                // with `vinfo.static_field_descrs[i]` (`cpu.fielddescrof`).
+                // OptHeap keys the lazy-set cache by descr identity, so
+                // reuse `static_field_struct_descr` or last_instr is stored twice.
+                let descr = info.static_field_struct_descr(field_index);
                 // pyjitpl.py `gen_store_back_in_vable`. A store has no
                 // `resvalue` and `SETFIELD_GC` is never pure, so no cpu.
                 self.execute_and_record(
@@ -4047,7 +4051,7 @@ impl TraceCtx {
         let mut flat_box_index = info.static_fields.len();
         for array_index in 0..info.array_fields.len() {
             let len = lengths.get(array_index).copied().unwrap_or(0);
-            let field_descr = info.array_pointer_field_descr(array_index);
+            let field_descr = info.array_pointer_struct_descr(array_index);
             let array_descr = info.array_item_descr(array_index);
             let array_ref = self.vable_getfield_ref_descr(vable_opref, field_descr);
             for item_index in 0..len {
@@ -7511,12 +7515,12 @@ mod tests {
         assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
         assert_eq!(
             ops[0].getdescr().map(|d| d.index()),
-            Some(info.static_field_descr(0).index())
+            Some(info.static_field_struct_descr(0).index())
         );
         assert_eq!(ops[1].opcode, OpCode::GetfieldGcR);
         assert_eq!(
             ops[1].getdescr().map(|d| d.index()),
-            Some(info.array_pointer_field_descr(0).index())
+            Some(info.array_pointer_struct_descr(0).index())
         );
         assert_eq!(ops[2].opcode, OpCode::SetarrayitemGc);
         assert_eq!(

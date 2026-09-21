@@ -1495,12 +1495,9 @@ fn emit_traceback_node<Sym: WalkSym>(
     w_next: OpRef,
     opcode_position: usize,
 ) -> Result<(), DispatchError> {
-    let traceback = ctx.trace_ctx.record_op_with_descr(
-        OpCode::NewWithVtable,
-        &[],
-        crate::descr::pytraceback_size_descr(),
-    );
-    ctx.trace_ctx.heap_cache_mut().new_object(traceback);
+    let traceback = ctx
+        .trace_ctx
+        .execute_new_with_vtable(crate::descr::pytraceback_size_descr());
     let fields = [
         (
             ctx.trace_ctx

@@ -7059,12 +7059,9 @@ fn walker_emit_specialised_tuple_ii<Sym: WalkSym>(
     v0: i64,
     v1: i64,
 ) -> Result<OpRef, DispatchError> {
-    let tuple = ctx.trace_ctx.record_op_with_descr(
-        OpCode::NewWithVtable,
-        &[],
-        crate::descr::specialised_tuple_ii_size_descr(),
-    );
-    ctx.trace_ctx.heap_cache_mut().new_object(tuple);
+    let tuple = ctx
+        .trace_ctx
+        .execute_new_with_vtable(crate::descr::specialised_tuple_ii_size_descr());
     crate::helpers::emit_tuple_hash_sentinel(
         ctx.trace_ctx,
         tuple,
@@ -13144,12 +13141,9 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
         length
     };
 
-    let new = ctx.trace_ctx.record_op_with_descr(
-        OpCode::NewWithVtable,
-        &[],
-        crate::descr::w_range_size_descr(),
-    );
-    ctx.trace_ctx.heap_cache_mut().new_object(new);
+    let new = ctx
+        .trace_ctx
+        .execute_new_with_vtable(crate::descr::w_range_size_descr());
 
     let field_descrs = [
         crate::descr::range_start_descr(),
@@ -13324,12 +13318,9 @@ pub(crate) fn try_walker_specialize_builtin_zip<Sym: WalkSym>(
     for (tuple_op, concrete_slot) in [(r_args[3], iter0_slot), (r_args[4], iter1_slot)] {
         walker_guard_class(ctx, op.pc, tuple_op, tuple_type as i64)?;
         walker_guard_exact_w_class(ctx, op.pc, tuple_op, tuple_class)?;
-        let iterator = ctx.trace_ctx.record_op_with_descr(
-            OpCode::NewWithVtable,
-            &[],
-            crate::descr::tuple_iter_size_descr(),
-        );
-        ctx.trace_ctx.heap_cache_mut().new_object(iterator);
+        let iterator = ctx
+            .trace_ctx
+            .execute_new_with_vtable(crate::descr::tuple_iter_size_descr());
         let seq_descr = crate::descr::tuple_iter_seq_descr();
         ctx.trace_ctx.record_op_with_descr(
             OpCode::SetfieldGc,
@@ -13366,12 +13357,9 @@ pub(crate) fn try_walker_specialize_builtin_zip<Sym: WalkSym>(
             unsafe { pyre_object::gc_roots::shadow_stack_get(list_slot) } as usize,
         )),
     );
-    let zip = ctx.trace_ctx.record_op_with_descr(
-        OpCode::NewWithVtable,
-        &[],
-        crate::descr::w_zip_size_descr(),
-    );
-    ctx.trace_ctx.heap_cache_mut().new_object(zip);
+    let zip = ctx
+        .trace_ctx
+        .execute_new_with_vtable(crate::descr::w_zip_size_descr());
     for (value, descr) in [
         (iterator_list, crate::descr::zip_iterators_descr()),
         (ctx.trace_ctx.const_int(1), crate::descr::zip_strict_descr()),

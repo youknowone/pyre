@@ -855,12 +855,7 @@ pub fn emit_bound_method_inline(
     w_class: OpRef,
     header_w_class: OpRef,
 ) -> OpRef {
-    let new_op = ctx.record_op_with_descr(
-        OpCode::NewWithVtable,
-        &[],
-        crate::descr::w_method_size_descr(),
-    );
-    ctx.heap_cache_mut().new_object(new_op);
+    let new_op = ctx.execute_new_with_vtable(crate::descr::w_method_size_descr());
     for (descr, value) in [
         (crate::descr::method_w_function_descr(), w_function),
         (crate::descr::method_w_self_descr(), w_self),
@@ -892,12 +887,7 @@ pub fn emit_super_inline(
     obj: OpRef,
     header_w_class: OpRef,
 ) -> OpRef {
-    let new_op = ctx.record_op_with_descr(
-        OpCode::NewWithVtable,
-        &[],
-        crate::descr::w_super_size_descr(),
-    );
-    ctx.heap_cache_mut().new_object(new_op);
+    let new_op = ctx.execute_new_with_vtable(crate::descr::w_super_size_descr());
     for (descr, value) in [
         (crate::descr::super_start_type_descr(), super_type),
         (crate::descr::super_obj_type_descr(), obj_type),
@@ -926,12 +916,7 @@ pub fn emit_super_inline(
 /// the optimizer virtualize the cell away for the common shape where the
 /// callee both creates and consumes it within one trace.
 pub fn emit_new_cell_inline(ctx: &mut TraceCtx, family: OpRef, header_w_class: OpRef) -> OpRef {
-    let new_op = ctx.record_op_with_descr(
-        OpCode::NewWithVtable,
-        &[],
-        crate::descr::w_cell_size_descr(),
-    );
-    ctx.heap_cache_mut().new_object(new_op);
+    let new_op = ctx.execute_new_with_vtable(crate::descr::w_cell_size_descr());
     for (descr, value) in [
         (crate::descr::cell_family_descr(), family),
         (crate::descr::cell_header_w_class_descr(), header_w_class),
@@ -971,12 +956,7 @@ pub fn emit_make_function_inline(
     w_builtins: OpRef,
     w_qualname: OpRef,
 ) -> OpRef {
-    let new_op = ctx.record_op_with_descr(
-        OpCode::NewWithVtable,
-        &[],
-        crate::descr::w_function_size_descr(),
-    );
-    ctx.heap_cache_mut().new_object(new_op);
+    let new_op = ctx.execute_new_with_vtable(crate::descr::w_function_size_descr());
     for (descr, value) in [
         (
             crate::descr::function_header_w_class_descr(),
@@ -1016,12 +996,7 @@ pub fn emit_make_function_inline(
 /// it never escapes the loop — the shape PyPy gets by tracing through
 /// `typeobject.py descr_call` → `space.allocate_instance`.
 pub fn emit_instance_inline(ctx: &mut TraceCtx, header_w_class: OpRef, map: OpRef) -> OpRef {
-    let new_op = ctx.record_op_with_descr(
-        OpCode::NewWithVtable,
-        &[],
-        crate::descr::w_object_object_size_descr(),
-    );
-    ctx.heap_cache_mut().new_object(new_op);
+    let new_op = ctx.execute_new_with_vtable(crate::descr::w_object_object_size_descr());
     for (descr, value) in [
         (crate::descr::object_header_w_class_descr(), header_w_class),
         (crate::descr::object_map_descr(), map),
@@ -1292,12 +1267,7 @@ pub fn emit_tuple_hash_sentinel(ctx: &mut TraceCtx, tuple: OpRef, hash_descr: ma
 /// dispatch on the inline-field layout; Python-level `type()` reads `w_class`,
 /// which every variant shares at the public `tuple` typedef.
 pub fn emit_specialised_tuple_oo_inline(ctx: &mut TraceCtx, value0: OpRef, value1: OpRef) -> OpRef {
-    let tuple = ctx.record_op_with_descr(
-        OpCode::NewWithVtable,
-        &[],
-        crate::descr::specialised_tuple_oo_size_descr(),
-    );
-    ctx.heap_cache_mut().new_object(tuple);
+    let tuple = ctx.execute_new_with_vtable(crate::descr::specialised_tuple_oo_size_descr());
     emit_tuple_hash_sentinel(ctx, tuple, crate::descr::specialised_tuple_oo_hash_descr());
     let w_class = pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE);
     if !w_class.is_null() {
@@ -1331,12 +1301,7 @@ pub fn emit_object_tuple_inline(ctx: &mut TraceCtx, items: &[OpRef]) -> OpRef {
         crate::state::trace_items_block_setitem_value(ctx, items_block, index, item);
     }
 
-    let tuple = ctx.record_op_with_descr(
-        OpCode::NewWithVtable,
-        &[],
-        crate::descr::w_tuple_size_descr(),
-    );
-    ctx.heap_cache_mut().new_object(tuple);
+    let tuple = ctx.execute_new_with_vtable(crate::descr::w_tuple_size_descr());
     emit_tuple_hash_sentinel(ctx, tuple, crate::descr::tuple_hash_descr());
     let w_class = pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE);
     let w_class = ctx.const_ref(w_class as i64);
