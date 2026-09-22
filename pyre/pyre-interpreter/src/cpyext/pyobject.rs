@@ -176,6 +176,13 @@ pub fn type_mirror(w_obj: PyObjectRef) -> *mut CPyTypeObject {
 /// never receive the plain `PyObject`-sized block a non-type receives — a
 /// `PyModule_AddObject` of a class would otherwise decide the shape.
 pub(super) fn ensure_mirror(w_obj: PyObjectRef) -> *mut CPyObject {
+    // pyobject.py `as_pyobj` / `create_ref`: the interpreter object must stay
+    // live across the allocation. A nursery collection inside `type_mirror`
+    // moves it; the address passed into `attach` would otherwise be the
+    // pre-move word.
+    let roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = roots.base();
+    let mut w_obj = roots.pin_root(w_obj);
     if unsafe { pyre_object::is_type(w_obj) } {
         let direct = unsafe { pyre_object::w_type_get_cpy_ref(w_obj) };
         if !direct.is_null() {
@@ -190,6 +197,7 @@ pub(super) fn ensure_mirror(w_obj: PyObjectRef) -> *mut CPyObject {
         // A type is an instance of its own metatype, so resolving `ob_type`
         // before the mirror is entered would recurse forever on `type`; the
         // second call finds this mirror in the table and terminates.
+        w_obj = roots.get(obj_slot);
         let mirror = attach(
             w_obj,
             REFCNT_FROM_PYPY,
@@ -207,21 +215,29 @@ pub(super) fn ensure_mirror(w_obj: PyObjectRef) -> *mut CPyObject {
             (*mirror).tp_as_mapping = &raw mut (*heap).as_mapping;
             (*mirror).tp_as_buffer = &raw mut (*heap).as_buffer;
         }
-        super::typeobject::describe_interpreter_type(mirror, w_obj);
-        // `typeobject.py:727-732`: the metatype is referenced from here only
-        // when it is itself a heap type.
-        let of_type = type_mirror(w_obj);
+        // Read the link into a local before each allocating call. A
+        // closure that borrows `mirror` cannot live across `set_ob_type`.
+        let w_type = unsafe { (*(mirror as *mut CPyObject)).ob_pyre_link };
+        super::typeobject::describe_interpreter_type(mirror, w_type);
+        // `typeobject.py` `type_setup`: the metatype is referenced from
+        // here only when it is itself a heap type.
+        let w_type = unsafe { (*(mirror as *mut CPyObject)).ob_pyre_link };
+        let of_type = type_mirror(w_type);
         unsafe { set_ob_type(&raw mut (*mirror).ob_base.ob_base, of_type) };
         // Only the startup table has a reason to defer this: every base a
         // mirror reached from here can name already has its own mirror, or
         // gets one from this same call a level down.
-        super::typeobject::finish_interpreter_type(mirror, w_obj);
+        let w_type = unsafe { (*(mirror as *mut CPyObject)).ob_pyre_link };
+        super::typeobject::finish_interpreter_type(mirror, w_type);
         return mirror as *mut CPyObject;
     }
+    w_obj = roots.get(obj_slot);
     let ob_type = type_mirror(w_obj);
+    w_obj = roots.get(obj_slot);
     // `allocate`'s `size += itemcount * itemsize`: a tuple's items are part of
     // its block, which is what lets `PyTuple_GET_ITEM` read one as a field.
     let size = mirror_size(ob_type) + super::tupleobject::item_bytes(w_obj, ob_type);
+    w_obj = roots.get(obj_slot);
     let raw = attach(w_obj, REFCNT_FROM_PYPY, ob_type, size);
     // Each fill allocates, so the object is read back through the mirror
     // before the next one rather than kept in a local: the block's address
