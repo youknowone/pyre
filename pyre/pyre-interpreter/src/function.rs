@@ -696,6 +696,52 @@ pub fn function_new_from_code(w_code: PyObjectRef, w_func_globals_obj: PyObjectR
     func
 }
 
+/// Field block `function_new_impl` publishes for a new `Function`.
+///
+/// `Function.__init__` leaves the attribute slots null. `mutate_slots` is a
+/// fresh null pointer — `quasiimmut` `mutate_<name>` stays null until the
+/// first read is recorded — so a caller that wraps an existing function must
+/// assign copied slots afterwards. Copying that function by value would share
+/// its watcher block.
+fn function_object_value(
+    ob_type: &'static PyType,
+    code: *const (),
+    name: *const String,
+    w_func_globals_obj: PyObjectRef,
+    closure: PyObjectRef,
+    w_builtins: PyObjectRef,
+    can_change_code: bool,
+) -> Function {
+    Function {
+        ob: PyObject {
+            ob_type: ob_type as *const PyType,
+            w_class: pyre_object::pyobject::get_instantiate(ob_type),
+        },
+        code,
+        can_change_code,
+        name,
+        w_name: PY_NULL,
+        closure,
+        defs_w: PY_NULL,
+        w_kw_defs: PY_NULL,
+        w_module: PY_NULL,
+        w_func_globals_obj,
+        w_builtins,
+        w_ann: PY_NULL,
+        w_annotate: PY_NULL,
+        w_func_dict: PY_NULL,
+        w_typeparams: PY_NULL,
+        w_doc: PY_NULL,
+        w_qualname: PY_NULL,
+        w_objclass: PY_NULL,
+        w_text_signature: PY_NULL,
+        w_new_self: PY_NULL,
+        w_moduleobj: PY_NULL,
+        // quasiimmut `mutate_<name>` — null until the first read is recorded.
+        mutate_slots: AtomicPtr::new(std::ptr::null_mut()),
+    }
+}
+
 /// Allocate a `Function` object, GC-managed for user code and immortal for
 /// builtin code.
 ///
@@ -800,34 +846,15 @@ pub(crate) fn function_new_impl(
             pyre_object::typeobject::name_storage_gc_type_id(),
         ) as *const String,
     };
-    let function = Function {
-        ob: PyObject {
-            ob_type: ob_type as *const PyType,
-            w_class: pyre_object::pyobject::get_instantiate(ob_type),
-        },
+    let function = function_object_value(
+        ob_type,
         code,
-        can_change_code,
-        name: name_ptr,
-        w_name: PY_NULL,
-        closure,
-        defs_w: PY_NULL,
-        w_kw_defs: PY_NULL,
-        w_module: PY_NULL,
+        name_ptr,
         w_func_globals_obj,
+        closure,
         w_builtins,
-        w_ann: PY_NULL,
-        w_annotate: PY_NULL,
-        w_func_dict: PY_NULL,
-        w_typeparams: PY_NULL,
-        w_doc: PY_NULL,
-        w_qualname: PY_NULL,
-        w_objclass: PY_NULL,
-        w_text_signature: PY_NULL,
-        w_new_self: PY_NULL,
-        w_moduleobj: PY_NULL,
-        // `quasiimmut.py:17-27` — null until the first read is recorded.
-        mutate_slots: AtomicPtr::new(std::ptr::null_mut()),
-    };
+        can_change_code,
+    );
 
     // A `BuiltinCode`-backed function is a permanent type / module slot (the
     // interp2app analogue of a translation-time prebuilt object): its code is
@@ -1232,6 +1259,81 @@ pub unsafe fn demote_module_function_to_builtin(obj: PyObjectRef) {
             (*obj).w_class = pyre_object::pyobject::get_instantiate(&BUILTIN_FUNCTION_TYPE);
         }
     }
+}
+
+/// GC-managed `BuiltinFunction.__init__` for `MixedModule._load_lazily`.
+///
+/// `_load_lazily` does not retag the module's function in place. It builds a
+/// new `BuiltinFunction(func)` and stores that object in the module dict, so
+/// the function is traced from the dict and dies with the module.
+/// `BuiltinFunction.__init__` copies `code`, `w_func_globals`, `defs_w`,
+/// `closure`, and `name` through `Function.__init__`, then copies `w_doc`,
+/// `w_func_dict`, `w_module`, `w_kw_defs`, and `w_text_signature`. pyre also
+/// copies `w_name`, the wrapped text kept beside `name`. `w_moduleobj` stays
+/// null; the caller binds the module once it exists. `w_qualname` stays null,
+/// the representation `function_new_impl` uses when a builtin's qualname is
+/// derived from `name` (`_load_lazily` sets `qualname = name`).
+///
+/// The value is a fresh `Function`: `can_change_code` is false
+/// (`BuiltinFunction`) and `mutate_slots` is a new null pointer. A bytewise
+/// copy of `func` would share its quasi-immutable watcher block. `ob_type`
+/// and `w_class` are tagged `BUILTIN_FUNCTION_TYPE` the same way
+/// `demote_module_function_to_builtin` tags them. Allocation is the
+/// GC-managed arm of `function_new_impl` (`try_gc_alloc_stable_raw` of
+/// `FUNCTION_GC_TYPE_ID` / `FUNCTION_OBJECT_SIZE`, then `ptr::write` and
+/// `function_write_barrier`). A null result means no GC hook is installed;
+/// the call then falls back to `demote_module_function_to_builtin` and
+/// returns `func`.
+///
+/// # Safety
+/// `func` must be a live `Function` carrier (`FUNCTION_TYPE` or
+/// `BUILTIN_FUNCTION_TYPE`).
+#[majit_macros::dont_look_inside]
+pub unsafe fn builtin_function_new_managed(func: PyObjectRef) -> PyObjectRef {
+    // `try_gc_alloc_stable_raw` does not collect, so the copied slots stay
+    // valid across it. End the source borrow before that allocation.
+    let src = unsafe { &*(func as *const Function) };
+    let code = src.code;
+    let name = src.name;
+    let w_name = src.w_name;
+    let closure = src.closure;
+    let defs_w = src.defs_w;
+    let w_func_globals_obj = src.w_func_globals_obj;
+    let w_doc = src.w_doc;
+    let w_func_dict = src.w_func_dict;
+    let w_module = src.w_module;
+    let w_kw_defs = src.w_kw_defs;
+    let w_text_signature = src.w_text_signature;
+    let mut function = function_object_value(
+        &BUILTIN_FUNCTION_TYPE,
+        code,
+        name,
+        w_func_globals_obj,
+        closure,
+        PY_NULL,
+        false,
+    );
+    function.w_name = w_name;
+    function.defs_w = defs_w;
+    function.w_doc = w_doc;
+    function.w_func_dict = w_func_dict;
+    function.w_module = w_module;
+    function.w_kw_defs = w_kw_defs;
+    function.w_text_signature = w_text_signature;
+
+    let raw =
+        pyre_object::gc_hook::try_gc_alloc_stable_raw(FUNCTION_GC_TYPE_ID, FUNCTION_OBJECT_SIZE);
+    if raw.is_null() {
+        unsafe { demote_module_function_to_builtin(func) };
+        return func;
+    }
+    unsafe {
+        std::ptr::write(raw as *mut Function, function);
+    }
+    // Same bulk-write barrier as the managed arm of `function_new_impl`:
+    // `ptr::write` publishes every slot before any setter runs.
+    function_write_barrier(raw as PyObjectRef);
+    raw as PyObjectRef
 }
 
 /// Stamp the `__self__` of a builtin `__new__` carrier — the defining
