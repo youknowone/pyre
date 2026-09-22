@@ -11040,7 +11040,7 @@ fn emit_module_dict_cell_fold<Sym: WalkSym>(
                 // `unwrap_cell`'s recording concrete becomes a
                 // `GUARD_VALUE` that deopts on the next in-place
                 // rebind and never retraces (`global_reassign`).
-                let pin_version = !specialize::code_has_any_delete_name_from_ptr(w_code_ptr);
+                let pin_version = specialize::code_pins_namespace_version(w_code_ptr, w_globals);
                 return emit_namespace_cell_fold(
                     ctx,
                     op_pc,

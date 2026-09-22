@@ -9625,7 +9625,7 @@ pub(crate) fn try_walker_orthodox_write_cell<Sym: WalkSym>(
     let Some(jc) = crate::jitcode_runtime::write_cell_jitcode() else {
         return Ok(false);
     };
-    let pin_version = !code_has_any_delete_name_from_ptr(w_code_ptr);
+    let pin_version = code_pins_namespace_version(w_code_ptr, ns);
     if pin_version && !walker_pin_namespace_version(ctx, op_pc, ns)? {
         return Ok(false);
     }
@@ -25786,7 +25786,7 @@ fn emit_builtins_cell_fold<Sym: WalkSym>(
     if !guard_current_frame_globals_identity(ctx, op_pc, w_globals)? {
         return Ok(false);
     }
-    let pin_version = !code_has_any_delete_name_from_ptr(w_code_ptr);
+    let pin_version = code_pins_namespace_version(w_code_ptr, w_globals);
     if pin_version && !walker_pin_namespace_version(ctx, op_pc, w_globals)? {
         return Ok(false);
     }
@@ -25859,6 +25859,99 @@ fn code_deletes_name_from_ptr(w_code_ptr: usize, name: &str) -> bool {
 pub(crate) fn code_has_any_delete_name_from_ptr(w_code_ptr: usize) -> bool {
     code_from_w_code_ptr(w_code_ptr)
         .is_some_and(|code| code_delete_name_indices(code).next().is_some())
+}
+
+/// Whether a cell fold may pin `ns`'s `version?`.
+///
+/// A `DELETE_NAME` always `mutated()`. A module `STORE_NAME` or any
+/// `STORE_GLOBAL` whose slot is still absent or a bare value also
+/// `mutated()` (`store_would_bump_version`: `StoreBare` / `Replace`) when
+/// that store sits in a `JUMP_BACKWARD` span of a body that also has an
+/// exception table. Either one, after this pin, aborts the trace at
+/// `opimpl_jit_force_quasi_immutable` (`with` / `as value`). A handler-free
+/// loop keeps the pin: skipping it on pickle's module `for` dropped
+/// compiled loops. A one-shot binding above the loop does not count, and
+/// an `ObjectMutableCell` or `IntMutableCell` takes the hot store in place.
+pub(crate) fn code_pins_namespace_version(w_code_ptr: usize, ns: pyre_object::PyObjectRef) -> bool {
+    !code_has_any_delete_name_from_ptr(w_code_ptr)
+        && !code_store_bumps_namespace_now(w_code_ptr, ns)
+}
+
+/// `STORE_NAME` on a module body, and every `STORE_GLOBAL`, write `ns`.
+/// A function `STORE_NAME` writes the frame locals and does not bump this dict.
+fn code_store_bumps_namespace_now(w_code_ptr: usize, ns: pyre_object::PyObjectRef) -> bool {
+    if ns.is_null() {
+        return false;
+    }
+    let Some(code) = code_from_w_code_ptr(w_code_ptr) else {
+        return false;
+    };
+    // A handler-free loop does not take this skip. `pickle`'s module
+    // `for` promotes `original` without an exception table; skipping the
+    // pin there dropped compiled loops. The abort this targets is the
+    // `with` body, which has both the backward jump and an exception table.
+    if code.exceptiontable.is_empty() {
+        return false;
+    }
+    let module_level = code.obj_name.as_str() == "<module>";
+    (0..code.instructions.len()).any(|pc| {
+        if !pc_is_in_backward_jump(code, pc) {
+            return false;
+        }
+        let Some((ins, arg)) = pyre_interpreter::decode_instruction_at(code, pc) else {
+            return false;
+        };
+        let namei = match ins {
+            pyre_interpreter::Instruction::StoreName { namei } if module_level => namei,
+            pyre_interpreter::Instruction::StoreGlobal { namei } => namei,
+            _ => return false,
+        };
+        let Some(name) =
+            pyre_interpreter::pyframe::load_name_from_code(code, namei.get(arg) as usize)
+        else {
+            return false;
+        };
+        namespace_slot_promotes_on_store(ns, name)
+    })
+}
+
+/// `pc` sits in some `JUMP_BACKWARD` span. A one-shot binding above the
+/// loop does not: pinning must stay for a loop whose cells are already
+/// stable (`read_global`), and only a loop store that still promotes the
+/// slot forces the skip.
+fn pc_is_in_backward_jump(code: &pyre_interpreter::CodeObject, pc: usize) -> bool {
+    (0..code.instructions.len()).any(|jpc| {
+        let Some((ins, arg)) = pyre_interpreter::decode_instruction_at(code, jpc) else {
+            return false;
+        };
+        let delta = match ins {
+            pyre_interpreter::Instruction::JumpBackward { delta }
+            | pyre_interpreter::Instruction::JumpBackwardNoInterrupt { delta } => delta,
+            _ => return false,
+        };
+        let target =
+            pyre_interpreter::pyopcode::jump_target_backward_decoded(code, jpc + 1, delta, arg);
+        target <= pc && pc < jpc
+    })
+}
+
+/// True when the next store of `name` cannot be an in-place cell write.
+/// Absent and bare slots promote (`StoreBare` / `Replace`) and bump
+/// `version?`. A mutable cell does not.
+fn namespace_slot_promotes_on_store(ns: pyre_object::PyObjectRef, name: &str) -> bool {
+    let Some(slot) = crate::state::module_dict_cell_slot_direct(ns, name) else {
+        return true;
+    };
+    let Some(stored) = crate::state::module_dict_cell_value_direct(ns, slot) else {
+        return true;
+    };
+    if stored.is_null() {
+        return true;
+    }
+    unsafe {
+        !pyre_object::celldict::is_object_mutable_cell(stored)
+            && !pyre_object::celldict::is_int_mutable_cell(stored)
+    }
 }
 
 fn frame_code_deletes_name(frame: &pyre_interpreter::pyframe::PyFrame, name: &str) -> bool {
