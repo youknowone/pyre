@@ -1,12 +1,11 @@
 # pyre-check: gate=1
 """A builtin function keeps its `__module__` across a major collection.
 
-`struct.unpack` is an interp-level carrier the collector cannot trace into,
-and `_struct` is a module the collector owns, so none of the tables the root
-walk visits names the carrier.  The `__module__` string stamped into it at
-module-install time is then reachable only through the carrier's own census;
-without that census a major collection sweeps the string while the carrier
-keeps answering with its address.
+`struct.unpack` is an ordinary function object stored on `_struct`, which the
+collector owns. The module dict marks the function, and the function's own
+trace marks the `__module__` string stamped at install time. A carrier the
+collector cannot enter would leave that string with no root, and the next
+major sweep would free it while the carrier kept answering with its address.
 
 A swept cell keeps its bytes until something else claims it, so reading the
 attribute is not enough on its own -- the short strings below are what puts

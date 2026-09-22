@@ -359,9 +359,11 @@ pub unsafe fn function_notify_quasi_immut(obj: PyObjectRef, slot: QuasiImmutSlot
 /// Drop glue for the `mutate_<name>` block, registered on
 /// `FUNCTION_GC_TYPE_ID`.
 ///
-/// Touches only that block. The `name` box is off-GC storage reclaimed by its
-/// own tid's drop glue, so this must not reach it — a holder destructor that
-/// did would double-free a box swept before its owner.
+/// Touches only that block. The `name` box is its own allocation — a GC
+/// storage box when the collector owns the function, `malloc_raw` on the
+/// pre-hook fallback — reclaimed by that box's drop glue when it is managed,
+/// so this must not reach it. A holder destructor that did would double-free
+/// a box swept before its owner.
 ///
 /// Reads the pointer with `swap`, so a `Function` reached twice frees once. The
 /// word is null on every function that no trace ever read a `?` field off,
@@ -518,11 +520,12 @@ pub const FUNCTION_OBJECT_SIZE: usize = std::mem::size_of::<Function>();
 /// closure / defs_w / w_kw_defs / w_module set.
 ///
 /// `can_change_code` is a `bool` and thus non-GC. `name` points at a
-/// GC-managed leaf storage box (`NameStorage`, off-GC storage) for a
-/// mortal (user, `PyCode`) function, so its slot is forwarded here; the box tid's
-/// drop glue reclaims it on sweep. An immortal builtin function's `malloc_raw`
-/// name is not collector-owned, so the walker's `is_managed_heap_object` guard
-/// skips that edge (the same immortal-holder skip as W_UnicodeObject's `value`).
+/// GC-managed leaf storage box (`NameStorage`) whenever the collector owns
+/// the function, builtin or user, so its slot is forwarded here; the box
+/// tid's drop glue reclaims it on sweep. A function minted before the
+/// collector hook exists keeps a `malloc_raw` name, which the walker's
+/// `is_managed_heap_object` guard skips (the same immortal-holder skip as
+/// W_UnicodeObject's `value`).
 ///
 /// `ob.w_class` is intentionally absent, mirroring how W_IntObject /
 /// W_FloatObject leave the typeptr-shaped header field out of their
@@ -530,8 +533,8 @@ pub const FUNCTION_OBJECT_SIZE: usize = std::mem::size_of::<Function>();
 /// not subject to nursery relocation.
 pub const FUNCTION_GC_PTR_OFFSETS: [usize; 18] = [
     FUNCTION_CODE_OFFSET,
-    // `name` — GC-managed `NameStorage` box for a mortal function (skipped by the
-    // walker's managed-object guard for an immortal builtin's `malloc_raw` name).
+    // `name` — GC-managed `NameStorage` box when the collector owns the function
+    // (skipped by the walker's managed-object guard for a pre-hook `malloc_raw` name).
     FUNCTION_NAME_OFFSET,
     // `function.py:51 self.name` — wrapped `__name__` stamped at construction
     // or via `f.__name__ = ...`.
@@ -742,12 +745,12 @@ fn function_object_value(
     }
 }
 
-/// Allocate a `Function` object, GC-managed for user code and immortal for
-/// builtin code.
+/// Allocate a `Function` object.
 ///
-/// Reads `FUNCTION_OBJECT_SIZE`/`FUNCTION_GC_TYPE_ID` and calls
-/// `lltype::malloc_typed` (`NewWithVtable`) the tracer cannot model; the JIT
-/// residualises the call instead of tracing into it
+/// `function.py` `class Function(W_Root)` — one GC object for builtin and
+/// user code. `try_gc_alloc_stable_raw` is that allocation once the collector
+/// hook is installed; `lltype::malloc_typed` is only the pre-hook fallback.
+/// The tracer cannot model either call, so the JIT residualises this function
 /// (`@dont_look_inside`, `rlib/jit.py`), the `box_str_constant` /
 /// `try_gc_add_root` twin.
 #[majit_macros::dont_look_inside]
@@ -825,20 +828,20 @@ pub(crate) fn function_new_impl(
     let w_func_globals_obj = pyre_object::gc_roots::shadow_stack_get(globals_slot);
     let w_builtins = pyre_object::gc_roots::shadow_stack_get(builtins_slot);
 
-    // A `BuiltinCode`-backed function is a permanent, immortal slot (see the
-    // `malloc_typed` rationale below); its name must stay a `malloc_raw` string
-    // because an immortal holder is never greyed and so could never keep an
-    // old-gen box alive. A user (`PyCode`) function is GC-managed and boxes its
-    // name in a GC-managed storage box (`NameStorage`) greyed through the
-    // `FUNCTION_NAME_OFFSET` gc-pointer edge; the box tid's drop glue reclaims it
-    // on sweep. The non-collecting old-gen alloc cannot sweep this box before it
-    // is stored into the Function below.
-    let is_builtin =
-        !code.is_null() && unsafe { crate::gateway::is_builtin_code(code as PyObjectRef) };
+    // `function.py` `Function` is one GC object whether or not its code is a
+    // `BuiltinCode`. `try_gc_alloc_stable_raw` returns null only when no
+    // collector hook is installed (`gc_hook.rs`); that call does not collect,
+    // so the name box below can be chosen from the result and stored before
+    // anything else runs. A managed carrier boxes the name in `NameStorage`,
+    // greyed through `FUNCTION_NAME_OFFSET`. The pre-hook carrier is immortal
+    // and keeps a `malloc_raw` name: nothing will ever grey it.
+    let raw =
+        pyre_object::gc_hook::try_gc_alloc_stable_raw(FUNCTION_GC_TYPE_ID, FUNCTION_OBJECT_SIZE);
+    let managed = !raw.is_null();
     let name_ptr = match name {
         // Already-permanent storage owned by the code object; nothing to box.
         FunctionName::Borrowed(ptr) => ptr,
-        FunctionName::Owned(name) if is_builtin => {
+        FunctionName::Owned(name) if !managed => {
             pyre_object::lltype::malloc_raw(name) as *const String
         }
         FunctionName::Owned(name) => pyre_object::gc_storage::gc_alloc_storage_box(
@@ -856,83 +859,67 @@ pub(crate) fn function_new_impl(
         can_change_code,
     );
 
-    // A `BuiltinCode`-backed function is a permanent type / module slot (the
-    // interp2app analogue of a translation-time prebuilt object): its code is
-    // immortal (`gateway.rs builtin_code_new_full` malloc_typed) and its only
-    // other fields are null for a freshly-made builtin. Allocate it immortal so
-    // a full mark-sweep can never reclaim it out of an off-GC builtin type dict
-    // — the collector assumes no immortal object holds heap pointers and so does
-    // not trace such dicts (collector.rs), which would otherwise free the
-    // method functions of a builtin type built lazily at runtime (weakref, …)
-    // after the GC hook is wired. Startup builtin functions are already immortal
-    // (no hook installed yet); this extends that to runtime-created ones. User
-    // functions (`PyCode`) stay GC-managed. `is_builtin` was computed above to
-    // gate the name allocation on the same mortality split.
-    if !is_builtin {
-        let raw = pyre_object::gc_hook::try_gc_alloc_stable_raw(
-            FUNCTION_GC_TYPE_ID,
-            FUNCTION_OBJECT_SIZE,
-        );
-        if !raw.is_null() {
-            unsafe {
-                std::ptr::write(raw as *mut Function, function);
-            }
-            // The fields were published by the `ptr::write` above, which no
-            // barrier sees. An old-gen Function that never joins the
-            // remembered set is not scanned by a minor collection, so a
-            // freshly nursery-born `w_func_globals_obj` reached only through
-            // it is neither forwarded nor kept alive. The setters barrier
-            // just ahead of their single store; a bulk write has no such
-            // point, so barrier once behind it for the whole initial set.
-            // Nothing collectable runs in between.
-            function_write_barrier(raw as PyObjectRef);
-            return raw as PyObjectRef;
+    // `function.py` `class Function(W_Root)`: builtin and user functions are
+    // the same GC object. The stable hook is old-gen and non-moving, and the
+    // builtin-type / module-dict root walks mark the pointer, so a major
+    // traces `FUNCTION_GC_PTR_OFFSETS` — including `w_module` stamped later
+    // by `builtin_function_set_module`.
+    if managed {
+        unsafe {
+            std::ptr::write(raw as *mut Function, function);
         }
+        // The fields were published by the `ptr::write` above, which no
+        // barrier sees. An old-gen Function that never joins the
+        // remembered set is not scanned by a minor collection, so a
+        // freshly nursery-born `w_func_globals_obj` reached only through
+        // it is neither forwarded nor kept alive. The setters barrier
+        // just ahead of their single store; a bulk write has no such
+        // point, so barrier once behind it for the whole initial set.
+        // Nothing collectable runs in between.
+        function_write_barrier(raw as PyObjectRef);
+        return raw as PyObjectRef;
     }
 
+    // No collector hook yet (bootstrap, unit tests). The box is immortal.
+    // Register it the way `pycode.rs` `register_prebuilt_code_root` registers
+    // a code wrapper minted in the same window: a later `w_module` store has
+    // no managed trace to follow.
     let obj = pyre_object::lltype::malloc_typed(function) as PyObjectRef;
     register_prebuilt_function_root(obj);
     obj
 }
 
-/// Every `Function` carrier the collector cannot trace.
+/// Bootstrap `Function` carriers allocated before the collector hook exists.
 ///
-/// The arm above hands a `BuiltinCode`-backed carrier a `malloc_typed` box, and
-/// a bootstrap allocation made before the GC hook exists lands on it too.
-/// Marking never enters such a box, so a GC-managed value stamped into one
-/// afterwards — `builtin_function_set_module`'s `w_module`,
-/// `function_set_qualname`'s `w_qualname`, `fget___module__`'s cached lookup —
-/// is named by nothing the marker can follow, and the next major sweep frees it
-/// under a carrier that keeps answering with the stale address.  `function.py`
-/// has no such split: `Function` is an ordinary GC object and the GC traces its
-/// fields.
-///
-/// `walk_raw_function_roots` reaches a carrier a walked table names directly — a
-/// builtin type dict, the method cache, or the dict of a module in
-/// `MODULE_DICT_ROOTS`.  That registry holds only the modules the collector does
-/// not own, so a carrier a GC-managed module publishes is named by no table at
-/// all: `_struct`'s dict holds the immortal `unpack`, the marker forwards the
-/// pointer and stops at the box, and `unpack.__module__` is left with no root.
-/// This census names every carrier instead, the compatibility-registry shape
-/// `pycode.rs`'s `W_GLOBALS_STAMPED_CODES` uses for stamped bootstrap code.
-///
-/// Append-only: each carrier registers once, at its own allocation, and an
-/// immortal box is never reclaimed.
-static PREBUILT_FUNCTION_ROOTS: parking_lot::Mutex<Vec<usize>> =
-    parking_lot::Mutex::new(Vec::new());
+/// `function.py` `Function` is an ordinary GC object, and `function_new_impl`
+/// allocates it that way once `try_gc_alloc_stable_raw` has a hook. This list
+/// is only the `malloc_typed` fallback from that arm — the same insertion-
+/// ordered registry `pycode.rs` `PREBUILT_CODE_ROOTS` keeps for bootstrap code
+/// wrappers. An immortal box is never reclaimed, so entries are not removed.
+static PREBUILT_FUNCTION_ROOTS: std::sync::OnceLock<parking_lot::Mutex<Vec<usize>>> =
+    std::sync::OnceLock::new();
 
-/// Record an immortal `Function` carrier as a root of its own.
+/// Record one pre-hook `Function` carrier as a root of its own fields.
 fn register_prebuilt_function_root(obj: PyObjectRef) {
-    PREBUILT_FUNCTION_ROOTS.lock().push(obj as usize);
+    let roots = PREBUILT_FUNCTION_ROOTS.get_or_init(|| parking_lot::Mutex::new(Vec::new()));
+    let mut roots = roots.lock();
+    let identity = obj as usize;
+    if !roots.contains(&identity) {
+        roots.push(identity);
+    }
 }
 
-/// Hand every immortal `Function` carrier to `visit`.
+/// Hand every pre-hook `Function` carrier to `visit`.
 ///
 /// Reached only from the collector's root walk, where every mutator is at a
 /// safepoint; that is what makes walking the carriers' fields sound here.
+/// No-op until the first pre-hook carrier registers.
 #[majit_macros::dont_look_inside]
-pub fn for_each_prebuilt_function_root(visit: &mut dyn FnMut(PyObjectRef)) {
-    let roots = PREBUILT_FUNCTION_ROOTS.lock();
+pub(crate) fn for_each_prebuilt_function_root(visit: &mut dyn FnMut(PyObjectRef)) {
+    let Some(roots) = PREBUILT_FUNCTION_ROOTS.get() else {
+        return;
+    };
+    let roots = roots.lock();
     for &addr in roots.iter() {
         visit(addr as PyObjectRef);
     }

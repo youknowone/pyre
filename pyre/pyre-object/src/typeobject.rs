@@ -449,11 +449,12 @@ pub const W_TYPE_NAME_OFFSET: usize = std::mem::offset_of!(W_TypeObject, name);
 /// `name` fields are both `String` behind a raw pointer.
 ///
 /// A leaf (`String` = heap `Vec<u8>`, no inner `PyObjectRef`); its GC box
-/// carries only drop glue that reclaims the buffer on sweep. Only *mortal*
-/// holders box their name — a heap type (`w_type_new`) and a user function
-/// (`PyCode`-backed `function_new_impl`). Immortal holders (builtin types and
-/// builtin functions) keep a `malloc_raw` name, because an immortal holder is
-/// never greyed and so could never keep an old-gen box alive. Mirrors
+/// carries only drop glue that reclaims the buffer on sweep. Holders the
+/// collector owns box their name — a heap type (`w_type_new`) and a `Function`
+/// from `function_new_impl` once the stable hook is installed, builtin code or
+/// not. Immortal holders (builtin types, and a function minted before that
+/// hook) keep a `malloc_raw` name, because an immortal holder is never greyed
+/// and so could never keep an old-gen box alive. Mirrors
 /// [`crate::unicodeobject::UnicodeValueStorage`] and the `longobject` bigint box.
 pub type NameStorage = String;
 
