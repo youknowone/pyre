@@ -22716,10 +22716,10 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
 ///   * `CurrentExceptionOrNone` — `current_exception_or_none()` (`[]→Ref`,
 ///     dst_bank `'r'`): the PUSH_EXC_INFO `prev` save.  It owns a matching
 ///     store and POP_EXCEPT restore, so it pushes the field onto the
-///     saved-prev stack.  Emit `GETFIELD_GC_R(ec, sys_exc_value)`, then the
-///     nullity guard `PUSH_EXC_INFO`'s `if prev_operr is not None` traces:
-///     GUARD_ISNULL with the prebuilt `None` as the result, or GUARD_NONNULL
-///     with the field as the result.
+///     saved-prev stack: emit `GETFIELD_GC_R(ec, sys_exc_value)` for the
+///     restore to reinstate.  The operand `PUSH_EXC_INFO` pushes is `None`
+///     for an empty slot and the field otherwise; the test becomes the
+///     nullity guard upstream records (see the read arm).
 ///   * `GetCurrentException` — `get_current_exception()` (`[]→Ref`,
 ///     dst_bank `'r'`): the read a catch-covered bare `raise` uses to obtain
 ///     the exception it re-raises.  Emit `GETFIELD_GC_R(ec, sys_exc_value)`
@@ -22843,18 +22843,6 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
             prev,
             majit_ir::Value::Ref(majit_ir::GcRef(prev_obj as usize)),
         );
-        // `PUSH_EXC_INFO` saves `space.w_None` when `ec.current_exception()`
-        // is None, and the field otherwise; the test is the nullity guard the
-        // trace of that `if` records.  The bare raise re-raises the field.
-        let w_prev = if is_covered_bare_raise_read {
-            prev
-        } else if prev_obj.is_null() {
-            walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardIsnull, &[prev])?;
-            ctx.trace_ctx.const_ref(pyre_object::w_none() as i64)
-        } else {
-            walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[prev])?;
-            prev
-        };
         // Only PUSH_EXC_INFO owns a matching set + POP_EXCEPT pair.  A covered
         // bare raise reads the same field to obtain the exception it
         // re-raises, but has no following PUSH store.  Treating that read as a
@@ -22869,8 +22857,34 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
         if !is_covered_bare_raise_read {
             FBW_EXC_PREV.with(|s| s.borrow_mut().push((prev, prev_obj)));
             FBW_EXC_PENDING_PUSH_SET.with(|c| c.set(true));
+            // The value `PUSH_EXC_INFO` pushes is `space.w_None` for an empty
+            // slot and the field otherwise.  Trace that test as the nullity
+            // guard `if prev_operr is not None` records.  It has to carry the
+            // walk's own `-live-` anchor: this opcode is an exception-table
+            // target, so its block head is the handler landing, which reads a
+            // `last_exception` value no guard failure carries.  With no anchor
+            // to carry, leave the test in the helper — decline the fold and
+            // let the call stand, which also keeps the pushed operand a value
+            // the resume image can name.  The field read above balances the
+            // save/store/restore triple either way.
+            let is_null = prev_obj.is_null();
+            let guard = if is_null {
+                OpCode::GuardIsnull
+            } else {
+                OpCode::GuardNonnull
+            };
+            if !walker_emit_anchored_fold_guard(ctx, op.pc, guard, &[prev])? {
+                return Ok(None);
+            }
+            let w_prev = if is_null {
+                ctx.trace_ctx.const_ref(pyre_object::w_none() as i64)
+            } else {
+                prev
+            };
+            write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', w_prev)?;
+            return Ok(Some(()));
         }
-        write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', w_prev)?;
+        write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', prev)?;
         return Ok(Some(()));
     }
 

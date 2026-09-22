@@ -10016,6 +10016,93 @@ fn walker_emit_fold_guard_with_snapshot<Sym: WalkSym>(
     walker_emit_guard_with_snapshot(ctx, op_pc, opcode, args)
 }
 
+/// [`walker_emit_fold_guard_with_snapshot`] for a fold inside a Python opcode
+/// that cannot be re-entered at its block head.
+///
+/// A guard ordinarily resumes at the block-head `-live-` of its Python
+/// opcode.  For an exception-table target that marker precedes the handler
+/// landing's `last_exception` / `last_exc_value` pair, and a guard failure
+/// carries no exception for those to read (`bhimpl_last_exc_value` asserts
+/// non-null).  Carry the walk's own `-live-` BEFORE anchor instead: it sits
+/// after the landing, on the operations the opcode has left to run, and is a
+/// decodable startpoint by construction (`pyjitpl.py` reads the normal guard
+/// resume at `self.pc - SIZE_LIVE_OP`).
+///
+/// `false` when the walk has no stepped anchor to carry, leaving the caller
+/// to decline its fold.
+fn walker_emit_anchored_fold_guard<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    opcode: OpCode,
+    args: &[OpRef],
+) -> Result<bool, DispatchError> {
+    let subject = args.first().copied();
+    // `pyjitpl.py _establish_nullity` / `heapcache.py is_nullity_known`, as
+    // in [`walker_emit_guard_with_snapshot`]: an answered question needs no
+    // guard, and the fold stands either way.
+    let nullity = match opcode {
+        OpCode::GuardNonnull => Some(true),
+        OpCode::GuardIsnull => Some(false),
+        _ => None,
+    };
+    if subject.is_some_and(|arg| arg.is_constant()) {
+        return Ok(true);
+    }
+    if let (Some(subject), Some(is_nonnull)) = (subject, nullity)
+        && ctx
+            .trace_ctx
+            .heap_cache()
+            .is_nullity_known(subject, walker_inline_const_word)
+            == Some(is_nonnull)
+    {
+        return Ok(true);
+    }
+    // The anchor answers only when the walk stepped past the block head: the
+    // `-live-` it names must be a LATER one, or it is the block head itself
+    // (or a stale word from a walk that entered mid-opcode) and carrying it
+    // resumes on the landing this exists to skip.  An inline sub-walk's
+    // `op_pc` is a callee coordinate the outer jitcode's tables do not hold,
+    // and its capture resumes at the CALL site instead, so the anchor is not
+    // this guard's to carry there.
+    let anchor = ctx.live_before_jit_pc;
+    if anchor == usize::MAX || ctx.fbw_mode.inline_subwalk {
+        return Ok(false);
+    }
+    let block_head = {
+        let sym = ctx.fbw_mode.snapshot_sym;
+        if sym.is_null() {
+            return Ok(false);
+        }
+        let jitcode = unsafe { (&*sym).jitcode() };
+        if jitcode.is_null() {
+            return Ok(false);
+        }
+        unsafe { (&*jitcode).payload.resume_marker_for_jitcode_pc(op_pc) }
+    };
+    let Some(block_head) = block_head else {
+        return Ok(false);
+    };
+    if anchor <= block_head {
+        return Ok(false);
+    }
+    stamp_guard_value_concrete(ctx.trace_ctx, opcode, args);
+    ctx.trace_ctx.record_guard(opcode, args, 0);
+    if let (Some(subject), Some(is_nonnull)) = (subject, nullity) {
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .nullity_now_known(subject, is_nonnull);
+    }
+    walker_capture_snapshot_for_last_guard_scoped(
+        ctx,
+        op_pc,
+        GuardCaptureScope {
+            carried_resume_jit_pc: Some(anchor),
+            ..GuardCaptureScope::default()
+        },
+    )?;
+    Ok(true)
+}
+
 fn walker_flush_guard_not_invalidated<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,

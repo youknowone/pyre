@@ -10287,16 +10287,15 @@ impl CodeWriter {
                             // reads/writes the same per-thread exception slot as
                             // the interpreter; `POP_EXCEPT` restores the saved
                             // `prev`, where `None` clears the slot.
-                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let exc_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             // A bare handler entry (no recorded catch-site
                             // FrameState) fills the
                             // symbolic stack with null sentinels, so the popped
                             // slot can be a `Constant` — illegal as an op result
                             // and unpinnable.  Bind a fresh Variable instead:
-                            // the `last_exc_value` re-read below becomes its
-                            // sole producer, which IS the caught exception this
-                            // slot holds at runtime.
+                            // the stack read below becomes its sole producer,
+                            // which IS the caught exception this slot holds at
+                            // runtime.
                             let exc_value = if exc_value.as_variable().is_some() {
                                 exc_value
                             } else {
@@ -10317,23 +10316,35 @@ impl CodeWriter {
                             // coalesce onto one colour — the handler's
                             // CHECK_EXC_MATCH then reads the cleared current
                             // exception (NULL) instead of the caught one.  Give
-                            // `exc_value` a resume-safe producer by re-reading the
-                            // last-exception value slot: it still holds the caught
-                            // exception (no `catch_exception` intervenes between
-                            // the landing and PUSH_EXC_INFO), the read is
-                            // graph-only so the walker stream is unchanged, and
-                            // the producer forces `exc_value` to interfere with
-                            // the `current_exception_or_none` result so regalloc
-                            // gives them distinct colours.  The slot pin below
-                            // must stay: dropping it perturbs the canonical-
+                            // `exc_value` a producer by reading the stack slot
+                            // the catch landing stored the caught exception in,
+                            // which is `w_exc = self.popvalue()` itself: the
+                            // producer forces `exc_value` to interfere with the
+                            // `current_exception_or_none` result so regalloc gives
+                            // them distinct colours.  It must be a stack read and
+                            // not a `last_exc_value` re-read, because a guard
+                            // inside this opcode resumes at the `-live-` that
+                            // precedes it: replaying a `last_exc_value` there
+                            // reads an exception no guard failure carries
+                            // (`bhimpl_last_exc_value` asserts non-null).  Emitted
+                            // before the pop, which clears the slot.  The slot pin
+                            // below must stay: dropping it perturbs the canonical-
                             // derived gate-off resume liveness.
+                            let exc_slot =
+                                stack_base_absolute + current_depth.saturating_sub(1) as usize;
+                            let exc_slot_idx: super::flow::FlowValue =
+                                super::flow::Constant::signed(exc_slot as i64).into();
                             record_graph_op(
                                 &current_block.block(),
-                                "last_exc_value",
-                                Vec::new(),
+                                "getarrayitem_vable_r",
+                                vable_getarrayitem_ref_graph_args(
+                                    frame_var.into(),
+                                    exc_slot_idx.into(),
+                                ),
                                 Some(exc_value.clone()),
                                 py_pc as i64,
                             );
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             // pyopcode.py:786 keeps `exc` in a local after
                             // `popvalue()`.  The trailing `push(exc)` targets a
                             // stable scratch register so the intervening
