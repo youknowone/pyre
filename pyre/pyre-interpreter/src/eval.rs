@@ -6507,11 +6507,12 @@ mod tests {
             // is a plain MRO walk, while anything going through
             // `has_object_getattribute` would memoize the default back and
             // hide exactly what this pins.
-            let w_descr = crate::baseobjspace::lookup_in_type(w_type, "m").expect("C.m");
+            let w_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new("m"));
+            let w_descr = crate::baseobjspace::lookup_in_type(w_type, w_name).expect("C.m");
             pyre_object::typeobject::w_type_set_uses_object_getattribute(w_type, false);
 
             assert!(
-                std::ptr::eq(compute_load_method_bound(obj, w_descr, "m"), obj),
+                std::ptr::eq(compute_load_method_bound(obj, w_descr, w_name), obj),
                 "an unmemoized default `__getattribute__` must still bind self",
             );
 
@@ -6519,7 +6520,7 @@ mod tests {
             // unbound — which is what makes the NULL above a dropped `self`
             // rather than a missed optimisation.  Last, because it memoizes.
             let (_, _, fast_descr) =
-                crate::baseobjspace::load_method_fast_path(obj, "m").expect("fast path admits C.m");
+                crate::baseobjspace::load_method_fast_path(obj, w_name).expect("fast path admits C.m");
             assert!(std::ptr::eq(fast_descr, w_descr));
         }
     }
