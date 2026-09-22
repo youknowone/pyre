@@ -774,12 +774,12 @@ pub fn opcode_store_fast_store_fast<H: LocalOpcodeHandler + ?Sized>(
 }
 
 /// The `nameindex` a caller passes when it addresses no `co_names_w` slot
-/// (`pycode.py:127-129`).
+/// (`pycode.py` `new_interned_str` fills every real index).
 ///
 /// `0` cannot say this — it is a valid index, and naming the first entry of the
-/// name table is exactly the wrong answer.  Out of range for every table, so
-/// `w_code_getname_w` resolves it to `PY_NULL` and the key is minted the way it
-/// was before the table existed.
+/// name table is exactly the wrong answer. Out of range for every table, so
+/// the caller interns the literal it already holds and does not read
+/// `co_names_w`.
 ///
 /// The caller that needs it is the implicit class-body `__class__` store, whose
 /// name is a literal rather than a `co_names` entry.  (The JIT's
