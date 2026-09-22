@@ -166,16 +166,11 @@ mod residual_host {
     ///
     /// Keep this an exact-function allow-list, not a signature inference: the
     /// macro spells one line per callee so the arity and the symbol stay
-    /// auditable together.  A mismatched arity deliberately falls through to
-    /// the reflective path.
+    /// auditable together.  A mismatched arity falls through to the reflective
+    /// path.
     ///
-    /// The membership is measured, not guessed.  `PYRE_WASM_CALL_HIST` reports
-    /// crossings per callee split by importer, and over the synth corpus every
-    /// remaining crossing arrives on this path (`src=host`) rather than from a
-    /// compiled trace; these are its heaviest callees.
-    ///
-    /// A `()` callee is listed separately.  The reflective host writes `0` when
-    /// the wasm result list is empty, so the direct arm does the same.
+    /// A `()` callee is listed separately and returns 0.  The reflective host
+    /// writes 0 when the wasm result list is empty.
     fn direct_uniform_i64_call(func_ptr: usize, args: &[i64]) -> Option<i64> {
         macro_rules! uniform_i64_allow_list {
             ($( [$($arg:ident),*] => $callee:path ),* $(,)?) => {

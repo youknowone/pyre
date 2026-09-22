@@ -1,7 +1,5 @@
-# Almost nothing but cross-loop JUMP. After the wasm32 stack-residency
-# fix, peeled loops compile instead of declining, so every JUMP pays
-# wasm's module-local br / jitframe-slot path where dynasm remaps
-# LABEL values in registers.
+# Almost nothing but cross-loop JUMP. wasm uses a module-local br and
+# jitframe slots; dynasm remaps LABEL values in registers.
 # Fannkuch-Redux benchmark (The Computer Language Benchmarks Game)
 # Ported for pyre: while-loop only, no range/list/enumerate
 
