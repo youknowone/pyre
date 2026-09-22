@@ -685,7 +685,7 @@ fn usize_attr(cls: PyObjectRef, name: &str, default: usize) -> usize {
     }
 }
 
-fn align_attr(cls: PyObjectRef) -> Result<usize, crate::PyError> {
+fn align_attr(cls: PyObjectRef) -> Result<usize, pyre_interpreter::PyError> {
     match unsafe {
         pyre_interpreter::baseobjspace::lookup_in_type(
             cls,
