@@ -852,7 +852,7 @@ use failguard::{
 };
 use majit_backend::{AsmInfo, BackendError, DeadFrame, JitCellToken};
 use majit_gc::GcAllocator;
-use majit_ir::{FailDescr, GcRef, InputArg, InputArgRc, Op, OpRc, Value};
+use majit_ir::{FailDescr, GcRef, InputArgRc, Op, OpRc, Value};
 
 /// `x86/assembler.py fixup_target_tokens`, called from BOTH `assemble_loop`
 /// (:612) and `assemble_bridge` (:706) — a LABEL assembled inside a bridge is a
@@ -864,7 +864,7 @@ use majit_ir::{FailDescr, GcRef, InputArg, InputArgRc, Op, OpRc, Value};
 /// LABEL in ordinal order, and the subset actually entered into
 /// `LABEL_TARGETS`. `compile_loop` keeps the first for its own JUMP
 /// resolution; `compile_bridge` hands the second to the source loop so
-/// `Drop` and `retract_bridge_label_targets_for_slots` retract them.
+/// `Drop` retracts them.
 fn stamp_and_publish_label_targets(
     func_handle: u32,
     frame: codegen::FrameGeometry,
@@ -2224,6 +2224,13 @@ pub extern "C" fn wasm_malloc_unicode(type_id: i64, length: i64) -> i64 {
 }
 
 /// Production GC rewriter used by `compile_loop` / `compile_bridge`.
+///
+/// `llsupport/gc.py` `get_ll_description` + `rewrite.py`
+/// `GcRewriterAssembler`. Native backends run this before assemble.
+/// Wasm leaves `jitframe_info` unset, so `CALL_ASSEMBLER` stays in
+/// place for the wasm-specific arm (`handle_call_assembler` needs
+/// `_ll_initial_locs` + 1-arg CA codegen). malloc / zero / barrier /
+/// `GC_LOAD` still come from the shared rewrite.
 #[doc(hidden)]
 pub fn gc_rewriter() -> majit_gc::rewrite::GcRewriterImpl {
     let collector = with_wasm_active_gc(|gc| {
@@ -2500,41 +2507,6 @@ pub extern "C" fn wasm_jit_ca_reload_frame() -> i64 {
 pub extern "C" fn wasm_jit_ca_reload_caller_frame() -> i64 {
     majit_gc::shadow_stack::jf_under_top_ptr().0 as i64
         + majit_backend::jitframe::FIRST_ITEM_OFFSET as i64
-}
-
-/// Build the per-frame `jf_gcmap` for a CA callee frame: mark only the home
-/// slots, in the `JitFrame`'s Signed-granular item indexing (see
-/// [`build_home_gcmap`] for the wasm32 layout).
-///
-/// Ref inputs are copied into those homes in the callee prologue before any
-/// later allocation. `FRAME_SLOT_BASE` is the value/fail-arg area and is
-/// reused by guard spills, so a static bit there would offer the collector an
-/// integer. `is_nursery_object_start` is only `non-null && in nursery`, so
-/// that integer is copied as an object if it happens to land in range.
-///
-/// Returned buffer is leaked by the caller (one per bridge) and lives for the
-/// program's life.
-fn build_callee_gcmap(frame: codegen::FrameGeometry) -> Box<[usize]> {
-    let sign = std::mem::size_of::<isize>();
-    let bits_per_word = std::mem::size_of::<usize>() * 8;
-    let mut indices: Vec<usize> = Vec::with_capacity(frame.home_slots);
-    for h in 0..frame.home_slots {
-        indices.push((frame.home_slot_base as usize + h * 8) / sign);
-    }
-    let max_index = indices.iter().copied().max().unwrap_or(0);
-    // `wasm_jit_ca_alloc_frame` sets `jf_frame` from `ca_frame_bytes`, not the
-    // full geometry. Homes must therefore fit that actual item allocation.
-    debug_assert!(
-        max_index < frame.ca_frame_bytes as usize / sign,
-        "CA gcmap exceeds the allocated JitFrame item area"
-    );
-    let num_words = max_index / bits_per_word + 1;
-    let mut buf = vec![0usize; 1 + num_words];
-    buf[0] = num_words;
-    for index in indices {
-        buf[1 + index / bits_per_word] |= 1usize << (index % bits_per_word);
-    }
-    buf.into_boxed_slice()
 }
 
 /// Host-side root-register trampoline.
@@ -2891,12 +2863,12 @@ impl PendingInline {
     }
 }
 
-/// Deferred merges by id, the id being what the bridge module passes back.
-///
-/// Thread-local: the stored `Op` graph holds non-atomic `Rc` (`OpRc`,
-/// `InputArgRc`). PyPy's cpu compiles and resumes on the thread that
-/// ran the compiled frame (`eval.rs` post-`run_compiled`). `memmgr`
-/// owns token GC globally; the IR itself stays on this cpu.
+// Deferred merges by id, the id being what the bridge module passes back.
+//
+// Thread-local: the stored `Op` graph holds non-atomic `Rc` (`OpRc`,
+// `InputArgRc`). PyPy's cpu compiles and resumes on the thread that
+// ran the compiled frame (`eval.rs` post-`run_compiled`). `memmgr`
+// owns token GC globally; the IR itself stays on this cpu.
 thread_local! {
     static PENDING_INLINES: RefCell<IndexMap<i64, PendingInline>> =
         RefCell::new(IndexMap::new());
@@ -3214,7 +3186,7 @@ fn query_residual_target_sig(addr: i64) -> i64 {
     }
     #[cfg(all(target_arch = "wasm32", feature = "web"))]
     {
-        return unsafe { jit_func_sig_web::jit_func_sig(addr as i32) };
+        return jit_func_sig_web::jit_func_sig(addr as i32);
     }
     #[cfg(not(all(target_arch = "wasm32", any(feature = "host-import", feature = "web"))))]
     {
@@ -3567,16 +3539,6 @@ impl WasmBackend {
         let gc_table_base = table.as_ref().map_or(0, |t| t.base_addr() as u32);
         codegen::bind_failarg_const_table(&gcrefs, gc_table_base);
         (ops, table)
-    }
-
-    /// `llsupport/gc.py` `get_ll_description` + `rewrite.py`
-    /// `GcRewriterAssembler`. Native backends run this before assemble.
-    /// Wasm leaves `jitframe_info` unset, so `CALL_ASSEMBLER` stays in
-    /// place for the wasm-specific arm (`handle_call_assembler` needs
-    /// `_ll_initial_locs` + 1-arg CA codegen). malloc / zero / barrier /
-    /// `GC_LOAD` still come from the shared rewrite.
-    fn gc_rewriter(&self) -> majit_gc::rewrite::GcRewriterImpl {
-        gc_rewriter()
     }
 
     /// Run `rewrite.py` then intern the gcref table. Replaces
@@ -4033,8 +3995,7 @@ impl WasmBackend {
         // on the error path. So install directly and let the build answer,
         // instead of asking it once as a trial and once for real.
         let old_inputs = source_loop.reemit.replace(Some(candidate));
-        let extra_retire: Vec<u32> = old_bridge_slots.iter().map(|&(_, slot)| slot).collect();
-        match self.reemit_loop_retiring(owner, &extra_retire) {
+        match self.reemit_loop(owner) {
             Ok(()) => {
                 diag_bump(31);
                 for _ in 0..attached {
@@ -4045,7 +4006,6 @@ impl WasmBackend {
                 // LABEL_TARGETS rows: inbound JUMPs still enter the old
                 // module, whose LABEL dest the replacement owner does not
                 // recreate.
-                let _ = extra_retire;
                 return (leftover, false);
             }
             Err(error) => {
@@ -4077,15 +4037,6 @@ impl WasmBackend {
     /// second GC reference table or change any reference-constant immediate.
     #[allow(unreachable_code, unused_variables)]
     pub fn reemit_loop(&mut self, token: &JitCellToken) -> Result<(), BackendError> {
-        self.reemit_loop_retiring(token, &[])
-    }
-
-    #[allow(unreachable_code, unused_variables)]
-    fn reemit_loop_retiring(
-        &mut self,
-        token: &JitCellToken,
-        _extra_retire_slots: &[u32],
-    ) -> Result<(), BackendError> {
         let compiled = token
             .compiled
             .get()
@@ -4964,10 +4915,11 @@ fn install_post_finish_force_gcmap(jf: *mut majit_backend::jitframe::JitFrame) {
     unsafe { (*jf).jf_gcmap = fail_descr.force_gcmap_ptr as *const u8 };
 }
 
-/// Drop the host execution root the way `wasm_jit_ca_pop_frame` drops a
-/// callee: remember the (old-gen) frame so a virtualizable token that still
-/// points at it can find young homes after the shadow-stack root is gone.
-#[cfg(any(target_arch = "wasm32", test))]
+/// The `run_compiled` frame pop, as one step: remember the (old-gen) frame so
+/// a virtualizable token that still points at it can find young homes after
+/// the shadow-stack root is gone. Production runs the same barrier and pop
+/// around `WasmFrameData::boxed`, which may collect between them.
+#[cfg(test)]
 fn remember_and_drop_execution_frame(jf: *mut majit_backend::jitframe::JitFrame, saved: usize) {
     wasm_jit_write_barrier(jf as i64);
     majit_gc::shadow_stack::pop_jf_to(saved);
@@ -7187,6 +7139,7 @@ mod tests {
     use majit_backend::{Backend, JitCellToken};
     use majit_gc::collector::MiniMarkGC;
     use majit_gc::trace::TypeInfo;
+    use majit_ir::InputArg;
     use majit_ir::forwarding::bound_operand_from_opref as rb;
 
     fn gcmap_marks(buf: &[usize], index: usize) -> bool {
@@ -7321,13 +7274,13 @@ mod tests {
     }
 
     #[test]
-    fn callee_gcmap_marks_homes_not_overwritable_input_slots() {
+    fn home_gcmap_marks_homes_not_overwritable_input_slots() {
         let _compile_guard = failguard::lock_cpu();
         // FRAME_SLOT_BASE is the value/fail-arg area. A static gcmap bit there
         // stays set after a guard spill overwrites the slot with an integer,
         // and `is_nursery_object_start` is only a nursery range check.
         let frame = codegen::FrameGeometry::compact(4, 2, 0);
-        let buf = build_callee_gcmap(frame);
+        let buf = codegen::build_home_gcmap(frame, 2, 0);
         let sign = std::mem::size_of::<isize>();
         let input0 = codegen::FRAME_SLOT_BASE as usize / sign;
         let home0 = frame.home_slot_base as usize / sign;
@@ -7362,8 +7315,7 @@ mod tests {
 
     #[test]
     fn gc_rewriter_registers_rewrite_abi_malloc_wrappers() {
-        let backend = WasmBackend::new();
-        let rewriter = backend.gc_rewriter();
+        let rewriter = gc_rewriter();
         assert_eq!(
             rewriter.malloc_array_fn,
             wasm_malloc_array as *const () as i64

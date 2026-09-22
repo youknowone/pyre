@@ -542,14 +542,6 @@ mod tests {
         super::retract_label_target_if_handle(id, 9);
         assert!(super::label_target(id).is_none());
     }
-
-    #[test]
-    fn retarget_slots_skips_the_owner_and_zero() {
-        let _serialized = super::lock_cpu();
-        // Native has no host table; the helper must still ignore the
-        // owner's own slot and a missing handle without panicking.
-        super::retarget_slots_to_module([0, 4, 4], 4, b"\0asm");
-    }
 }
 
 /// A resumable `LABEL` of a compiled loop, published in `LABEL_TARGETS` so a
@@ -1404,30 +1396,6 @@ pub(crate) fn write_bridge_cell_aliases(primary: u32, retained: u32, fail_index:
     }
 }
 
-/// Point retired table slots at `wasm_bytes` so a caller that baked
-/// `return_call_indirect(slot)` enters the replacement module.
-/// `assembler.py` `patch_jump_for_descr` rewrites the jump; wasm
-/// modules are immutable, so the slot is the patch site
-/// (`glue::replace_module` also rewrites the reserved wide half).
-pub(crate) fn retarget_slots_to_module(
-    slots: impl IntoIterator<Item = u32>,
-    owner_handle: u32,
-    wasm_bytes: &[u8],
-) {
-    #[cfg(target_arch = "wasm32")]
-    {
-        for slot in slots {
-            if slot != 0 && slot != owner_handle {
-                let _ = crate::glue::replace_module(slot, wasm_bytes);
-            }
-        }
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = (slots, owner_handle, wasm_bytes);
-    }
-}
-
 /// Guard-dispatch metadata of a bridge chained onto a loop, kept on the
 /// source loop's `CompiledWasmLoop.chained_trace_meta` keyed by the bridge's
 /// backend `trace_id`. Lets `compile_bridge` chain a NESTED sub-bridge onto a
@@ -1607,8 +1575,8 @@ pub struct CompiledWasmLoop {
     pub reemitted: Cell<bool>,
     /// `(descr identity, table slot)` for every label published by a bridge
     /// chained onto this loop. The bridge module lives as long as its source
-    /// loop, so `Drop` and `retract_bridge_label_targets_for_slots` retract
-    /// entries that still name that bridge's slot.
+    /// loop, so `Drop` retracts the entries that still name that bridge's
+    /// slot.
     pub bridge_owned_label_targets: RefCell<Vec<(usize, u32)>>,
     /// Set when `compile_bridge` accepts a self-recursive `CallAssemblerR`
     /// bridge (`PYRE_WASM_CA`) for this loop. While set, `compile_bridge`
@@ -1653,30 +1621,6 @@ impl CompiledWasmLoop {
             .asmmemmgr_gcreftracers
             .lock()
             .push(tracer);
-    }
-
-    /// Retract `LABEL_TARGETS` rows and `bridge_owned_label_targets`
-    /// entries whose table slot is being retired. A frame-entry bridge
-    /// that published a LABEL can still be selected by a later JUMP
-    /// after its guard cell is cleared; that immutable module still
-    /// carries the pre-growth home map.
-    pub(crate) fn retract_bridge_label_targets_for_slots(
-        &self,
-        slots: impl IntoIterator<Item = u32>,
-    ) {
-        let retired: Vec<u32> = slots.into_iter().filter(|&slot| slot != 0).collect();
-        if retired.is_empty() {
-            return;
-        }
-        let owned = self.bridge_owned_label_targets.borrow().clone();
-        for (id, slot) in owned {
-            if retired.contains(&slot) {
-                retract_label_target_if_handle(id, slot);
-            }
-        }
-        self.bridge_owned_label_targets
-            .borrow_mut()
-            .retain(|(_, slot)| !retired.contains(slot));
     }
 
     /// Materialize a lazily-installed root trace.  The wasm host is

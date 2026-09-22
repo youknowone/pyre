@@ -9679,7 +9679,7 @@ fn consecutive_allocations_home_and_reload_before_each_collection() {
     let memory = Memory::new(&mut store, MemoryType::new(1, None)).unwrap();
     let alloc = wasmi::Func::wrap(
         &mut store,
-        move |mut caller: wasmi::Caller<'_, Vec<i64>>, tid: i64, size: i64| -> i64 {
+        move |mut caller: wasmi::Caller<'_, Vec<i64>>, tid: i64, _size: i64| -> i64 {
             assert_eq!(tid, 0, "CallMallocNursery slow path stamps tid later");
             let prior = caller.data().clone();
             for (index, old) in prior.into_iter().enumerate() {
