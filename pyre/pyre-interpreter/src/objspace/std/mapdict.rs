@@ -3105,14 +3105,20 @@ pub trait MapdictObject {
 /// Remember an instance that may now hold a young attribute value, mirroring
 /// `dict_write_barrier` (dictmultiobject.rs). RPython's GC inserts the
 /// barrier implicitly at `self.storage[index] = value` (mapdict.py:918-919);
-/// pyre's `storage` is an off-GC `*mut Vec<PyObjectRef>`, so the store bypasses
-/// the collector's remembered-set tracking and must call the barrier
-/// explicitly. Without it a nursery value stored into an old-gen instance is
-/// not forwarded during a minor collection: `object_object_custom_trace`
-/// (`W_OBJECT_OBJECT_GC_TYPE_ID`) runs only for remembered-set objects in
-/// `do_collect_nursery`, never blanket-scanned.
+/// Remember the instance so a minor traces `object_object_custom_trace`
+/// (the storage pointer and every slot). The storage block is also a
+/// pointer array (`W_MAPDICT_STORAGE_GC_TYPE_ID`, `items_have_gc_ptrs`);
+/// `setarrayitem_gc` barriers that array, so the interpreter store does
+/// too — otherwise the block stays TRACK-set and a non-moving major's
+/// `debug_check_not_white` sees black storage → white nursery values.
 fn instance_write_barrier(obj: PyObjectRef) {
     pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+}
+
+fn mapdict_storage_write_barrier(storage: *mut pyre_object::object_array::ItemsBlock) {
+    if !storage.is_null() && pyre_object::gc_hook::try_gc_owns_object(storage as *mut u8) {
+        pyre_object::gc_hook::try_gc_write_barrier(storage as *mut u8);
+    }
 }
 
 impl MapdictObject for pyre_object::W_ObjectObject {
@@ -3153,6 +3159,10 @@ impl MapdictObject for pyre_object::W_ObjectObject {
         let owner = pyre_object::gc_roots::shadow_stack_get(self_slot);
         let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
         unsafe {
+            let owner = &mut *(owner as *mut Self);
+            mapdict_storage_write_barrier(owner.storage);
+            let owner = pyre_object::gc_roots::shadow_stack_get(self_slot);
+            let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
             let owner = &mut *(owner as *mut Self);
             let base = pyre_object::object_array::items_block_items_base(owner.storage);
             *base.add(storageindex) = value;
@@ -3252,7 +3262,9 @@ impl MapdictObject for pyre_object::W_ObjectObject {
             owner.storage = block;
             owner.map = map as usize;
             instance_write_barrier(owner as *mut Self as PyObjectRef);
-            if !std::ptr::eq(block, old) {
+            let owner = &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut Self);
+            mapdict_storage_write_barrier(owner.storage);
+            if !std::ptr::eq(owner.storage, old) {
                 pyre_object::object_array::dealloc_instance_items_block(old);
             }
         }
@@ -3287,6 +3299,8 @@ impl MapdictObject for pyre_object::W_ObjectObject {
             owner.storage = pyre_object::gc_roots::shadow_stack_get(fresh_slot) as *mut _;
             owner.map = map as usize;
             instance_write_barrier(owner as *mut Self as PyObjectRef);
+            let owner = &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut Self);
+            mapdict_storage_write_barrier(owner.storage);
             pyre_object::object_array::dealloc_instance_items_block(old);
         }
     }
@@ -3386,6 +3400,9 @@ impl MapdictObject for MapdictCarrier {
         unsafe {
             let owner = pyre_object::gc_roots::shadow_stack_get(self_slot);
             let carrier = mapdict_carrier(owner);
+            mapdict_storage_write_barrier(carrier.storage());
+            let owner = pyre_object::gc_roots::shadow_stack_get(self_slot);
+            let carrier = mapdict_carrier(owner);
             let base = pyre_object::object_array::items_block_items_base(carrier.storage());
             *base.add(storageindex) = pyre_object::gc_roots::shadow_stack_get(value_slot);
             self.obj = owner;
@@ -3462,7 +3479,10 @@ impl MapdictObject for MapdictCarrier {
             carrier.set_storage(block);
             carrier._set_mapdict_map(map);
             instance_write_barrier(owner);
-            if !std::ptr::eq(block, old) {
+            let owner = pyre_object::gc_roots::shadow_stack_get(self_slot);
+            carrier = mapdict_carrier(owner);
+            mapdict_storage_write_barrier(carrier.storage());
+            if !std::ptr::eq(carrier.storage(), old) {
                 pyre_object::object_array::dealloc_instance_items_block(old);
             }
             self.obj = owner;
@@ -3487,6 +3507,9 @@ impl MapdictObject for MapdictCarrier {
             carrier.set_storage(pyre_object::gc_roots::shadow_stack_get(fresh_slot) as *mut _);
             carrier._set_mapdict_map(map);
             instance_write_barrier(owner);
+            let owner = pyre_object::gc_roots::shadow_stack_get(self_slot);
+            carrier = mapdict_carrier(owner);
+            mapdict_storage_write_barrier(carrier.storage());
             pyre_object::object_array::dealloc_instance_items_block(old);
             self.obj = owner;
         }
