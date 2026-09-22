@@ -339,6 +339,11 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
     // belongs to the wasm host boundary; the shared frontend optimizer and IR
     // are unchanged.
     config.cranelift_opt_level(OptLevel::SpeedAndSize);
+    // Diagnostic: PYRE_WASM_PERFMAP=1 writes /tmp/perf-<pid>.map so `perf report`
+    // names main-module and JIT trace functions.
+    if std::env::var_os("PYRE_WASM_PERFMAP").is_some() {
+        config.profiler(wasmtime::ProfilingStrategy::PerfMap);
+    }
     // JIT trace modules emit `return_call_indirect` to chain a loop-closing bridge
     // back into its loop at constant stack depth (the tail-call proposal).
     config.wasm_tail_call(true);

@@ -1,0 +1,172 @@
+name: diag wasm fstring x86
+
+on:
+  push:
+    branches: ["diag/wasm-str-fstring-x86"]
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      # Same shared build dir and Charon pin as pyre-ci.yml.
+      PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
+      CHARON_VERSION: nightly-2026.05.29
+    steps:
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      with:
+        persist-credentials: false
+    - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+    - name: Set up CPython
+      id: cpython
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      with:
+        python-version: "3.14"
+    - name: Set up PyPy
+      id: pypy
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      with:
+        python-version: "pypy3.11"
+    - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      with:
+        cache-bin: false
+        shared-key: ${{ runner.arch }}
+        save-if: false
+    - name: Restore Charon binary
+      id: charon-cache
+      uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: .pyre-build/charon
+        key: charon-bin-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}
+        restore-keys: |
+          charon-bin-${{ runner.os }}-${{ runner.arch }}-
+    - name: Install Charon
+      # Misses only. install-charon.py also self-skips on a restored stamp.
+      if: steps.charon-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: scripts/install-charon.py
+    - name: Restore Charon cargo target
+      id: charon-target-cache
+      uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: .pyre-build/charon-target
+        key: charon-target-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ hashFiles('Cargo.lock') }}
+        restore-keys: |
+          charon-target-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-
+    - name: Compute LLBC fingerprints
+      id: llbc-fingerprint
+      shell: bash
+      run: |
+        # Outside the checkout: the redirect creates the file before the walk
+        # that would otherwise see it as an untracked input.
+        fingerprints="$RUNNER_TEMP/llbc-fingerprints.txt"
+        scripts/extract-llbc.py --fingerprint --per-crate \
+          majit-rlib pyre-object pyre-interpreter pyre-module pyre-jit > "$fingerprints"
+        for crate in majit-rlib pyre-object pyre-interpreter pyre-module pyre-jit; do
+          value="$(sed -n "s/^source\[$crate\]=//p" "$fingerprints")"
+          test -n "$value" || { echo "no source[$crate]= for $crate" >&2; exit 1; }
+          echo "${crate//-/_}=${value}" >> "$GITHUB_OUTPUT"
+        done
+    - name: Restore LLBC (majit-rlib)
+      id: llbc-cache-rlib
+      uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: |
+          build/llbc/majit-rlib.ullbc
+          build/llbc/majit-rlib.ullbc.fingerprint
+          build/llbc/majit-rlib.ullbc.readfiles
+          build/llbc/majit-rlib.*.layouts.ullbc
+        key: llbc3-majit-rlib-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.majit_rlib }}
+        restore-keys: |
+          llbc3-majit-rlib-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-
+    - name: Restore LLBC (pyre-object)
+      id: llbc-cache-object
+      uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: |
+          build/llbc/pyre-object.ullbc
+          build/llbc/pyre-object.ullbc.fingerprint
+          build/llbc/pyre-object.ullbc.readfiles
+          build/llbc/pyre-object.*.layouts.ullbc
+        key: llbc3-pyre-object-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_object }}
+        restore-keys: |
+          llbc3-pyre-object-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-
+    - name: Restore LLBC (pyre-interpreter)
+      id: llbc-cache-interpreter
+      uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: |
+          build/llbc/pyre-interpreter.ullbc
+          build/llbc/pyre-interpreter.ullbc.fingerprint
+          build/llbc/pyre-interpreter.ullbc.readfiles
+          build/llbc/pyre-interpreter.*.layouts.ullbc
+        key: llbc3-pyre-interpreter-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_interpreter }}
+        restore-keys: |
+          llbc3-pyre-interpreter-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-
+    - name: Restore LLBC (pyre-module)
+      id: llbc-cache-module
+      uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: |
+          build/llbc/pyre-module.ullbc
+          build/llbc/pyre-module.ullbc.fingerprint
+          build/llbc/pyre-module.ullbc.readfiles
+          build/llbc/pyre-module.*.layouts.ullbc
+        key: llbc3-pyre-module-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_module }}
+        restore-keys: |
+          llbc3-pyre-module-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-
+    - name: Restore LLBC (pyre-jit)
+      id: llbc-cache-jit
+      uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: |
+          build/llbc/pyre-jit.ullbc
+          build/llbc/pyre-jit.ullbc.fingerprint
+          build/llbc/pyre-jit.ullbc.readfiles
+        key: llbc3-pyre-jit-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_jit }}
+        restore-keys: |
+          llbc3-pyre-jit-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-
+    - name: Extract LLBC
+      # Unconditional: extract-llbc.py self-skips crates whose stamp is fresh.
+      shell: bash
+      env:
+        PYTHONUNBUFFERED: "1"
+      run: scripts/extract-llbc.py majit-rlib pyre-object pyre-interpreter pyre-module pyre-jit
+    - name: Add wasm32 target
+      run: rustup target add wasm32-unknown-unknown
+    - name: Build pyre backends
+      env:
+        PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}
+        PYRE_CHECK_PYPY3: ${{ steps.pypy.outputs.python-path }}
+      run: ${{ steps.cpython.outputs.python-path }} pyre/check.py --backend dynasm,wasm --build=only
+    - name: Install perf
+      continue-on-error: true
+      shell: bash
+      run: |
+        sudo apt-get update && (sudo apt-get install -y linux-tools-common "linux-tools-$(uname -r)" || sudo apt-get install -y linux-tools-generic)
+        sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+        if ! command -v perf >/dev/null 2>&1; then
+          perf_bin="$(ls -1 /usr/lib/linux-tools/*/perf 2>/dev/null | head -n 1 || true)"
+          if [ -n "${perf_bin}" ] && [ -e "${perf_bin}" ]; then
+            sudo ln -sfn "${perf_bin}" /usr/local/bin/perf
+          fi
+        fi
+    - name: Run diagnostic
+      shell: bash
+      run: |
+        ${{ steps.cpython.outputs.python-path }} diag/wasm_fstring_x86.py --out "$RUNNER_TEMP/diag"
+        {
+          echo '```'
+          cat "$RUNNER_TEMP/diag/summary.txt"
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+    - name: Upload diagnostic
+      if: ${{ !cancelled() }}
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: wasm-fstring-diag
+        path: ${{ runner.temp }}/diag
+        retention-days: 7
