@@ -1311,7 +1311,7 @@ mod tests {
         let residual = g.blocks.iter().flat_map(|b| &b.operations).filter(|op| {
             matches!(
                 &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments == &["slice".to_string(), "iter".to_string(), "Iter".to_string(), "next".to_string()]
             )
         }).count();
@@ -1323,7 +1323,7 @@ mod tests {
             .filter(|op| {
                 matches!(
                     &op.kind,
-                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if segments == &["__iter_next".to_string()]
                 )
             })

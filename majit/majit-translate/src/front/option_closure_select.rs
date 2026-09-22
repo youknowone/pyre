@@ -1199,6 +1199,7 @@ mod tests {
                             "host".into(),
                             "named_fn".into(),
                         ],
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![]),
                     result_ty: ValueType::Int,
@@ -1242,7 +1243,7 @@ mod tests {
                 matches!(
                     &op.kind,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if segments == &["host".to_string(), "named_fn".to_string()]
                 )

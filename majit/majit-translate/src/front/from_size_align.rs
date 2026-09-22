@@ -1193,6 +1193,7 @@ mod tests {
             name: "from_size_align".to_string(),
             receiver_root: Some("Layout".to_string()),
             resolved_path: None,
+            fun_decl_id: None,
         }
     }
 

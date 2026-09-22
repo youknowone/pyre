@@ -5441,6 +5441,7 @@ mod tests {
                     kind: OpKind::Call {
                         target: crate::model::CallTarget::FunctionPath {
                             segments: vec!["__strlen".to_string()],
+                            fun_decl_id: None,
                         },
                         args: crate::model::call_args(vec![obj.clone()]),
                         result_ty: ValueType::Int,
@@ -5514,6 +5515,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__strlen".to_string()],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![obj.clone()]),
                 result_ty: ValueType::Int,
@@ -5534,6 +5536,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__len".to_string()],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![obj.clone()]),
                 result_ty: ValueType::Int,
@@ -5731,6 +5734,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__strlen".to_string()],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![dest.clone()]),
                 result_ty: ValueType::Int,
@@ -5887,7 +5891,7 @@ mod tests {
         for block in &graph.blocks {
             for op in &block.operations {
                 let OpKind::Call {
-                    target: crate::model::CallTarget::FunctionPath { segments },
+                    target: crate::model::CallTarget::FunctionPath { segments, .. },
                     args,
                     ..
                 } = &op.kind

@@ -40692,7 +40692,7 @@ mod tests {
         matches!(
             &op.kind,
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
+                target: CallTarget::FunctionPath { segments, .. },
                 result_ty: ValueType::Ref(_),
                 ..
             } if segments.last().map(String::as_str) == Some("direct_ptradd")
@@ -42707,7 +42707,7 @@ mod tests {
         );
         match &graph.block(entry).operations.last().unwrap().kind {
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
+                target: CallTarget::FunctionPath { segments, .. },
                 args,
                 result_ty: ValueType::Ref(None),
             } if segments.last().map(String::as_str) == Some("direct_ptradd") => {
