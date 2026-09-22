@@ -1,14 +1,4 @@
 # pyre-check: max-pypy-ratio=25
-# pyre-check: max-wasm-ratio=9.4
-# The wasm allowance is a native-side improvement, not a wasm regression:
-# `linkme` has no wasm32 arm (wasm32 rejects its link section), so
-# `BUILTIN_WRAPPER_DESCRIPTORS` is empty there, every builtin wrapper lookup
-# ends at `no jitcode for address`, and `try_walker_inline_builtin_call`
-# cannot descend at all.  `PYRE_WASM_CALL_HIST` shows what is left: 66.7% of
-# this fixture's wasm residual calls are `bh_call_fn_0`, two per iteration --
-# the two `sys.exc_info()` calls dynasm folds away.  A fold-based builtin
-# such as `math_sqrt_hot` stays clean on wasm (2 residual calls total), so
-# this is the descent path alone.
 # Module-scope `for i in range(N)` whose body raises, catches, and reads
 # sys.exc_info() both inside and after the handler.  At module scope the loop
 # variable `i` is a STORE_NAME (a global-dict residual), not a STORE_FAST frame
