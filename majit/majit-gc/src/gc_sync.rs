@@ -623,6 +623,21 @@ impl Drop for ReentryGuard {
     }
 }
 
+/// Whether the current thread is inside [`gc_op`] (and therefore [`gc_query`],
+/// which is `gc_op`). `ReentryGuard` owns the flag and compiles it out of
+/// release builds, so this is false when the guard is absent.
+#[inline]
+pub(crate) fn in_gc_op() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        IN_GC_OP.load(Ordering::Relaxed)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        false
+    }
+}
+
 /// Execute a closure with `&MiniMarkGC` access (read-only query).
 /// Same fast/slow path as `gc_op`.
 #[inline]

@@ -1325,6 +1325,26 @@ pub trait GcAllocator: Send {
     /// Default no-op for stub allocators with no type table.
     fn freeze_types(&mut self) {}
 
+    /// Assign `subclassrange_{min,max}` now
+    /// (`normalizecalls.py assign_inheritance_ids`) without publishing
+    /// `frozen_layout_table`. Idempotent. `freeze_types`
+    /// (`gctypelayout.py encode_type_shapes_now`) calls this before it
+    /// closes the registry.
+    ///
+    /// Default no-op: an allocator without a type registry has no
+    /// inheritance ids to assign.
+    fn assign_inheritance_ids_now(&mut self) {}
+
+    /// Whether `frozen_layout_table` has been published, so
+    /// `get_translated_info_for_typeinfo` (`llsupport/gc.py`) can embed
+    /// its base address.
+    ///
+    /// Default `true`: an allocator without a type registry has no table
+    /// to publish and is already closed.
+    fn types_frozen(&self) -> bool {
+        true
+    }
+
     /// Whether this allocator keeps a type table at all
     /// (`gctypelayout.py` `TypeLayoutBuilder` — a collector translated
     /// without one has no `type_info_group` to name a shape in).
@@ -1508,6 +1528,44 @@ pub trait GcAllocator: Send {
     fn typeid_is_object(&self, _typeid: u32) -> Option<bool> {
         None
     }
+}
+
+static TYPE_REGISTRY_CLOSE_HOOK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Install the hook [`ensure_type_registry_closed`] runs before
+/// `freeze_types` (`gctypelayout.py encode_type_shapes_now`).
+///
+/// A second call with the same function is a no-op. A different function
+/// panics: one process-global owner closes the registry.
+pub fn set_type_registry_close_hook(hook: fn()) {
+    let installed = *TYPE_REGISTRY_CLOSE_HOOK.get_or_init(|| hook);
+    assert!(
+        std::ptr::fn_addr_eq(installed, hook),
+        "set_type_registry_close_hook: a different close hook is already installed"
+    );
+}
+
+/// Publish the singleton type registry if `frozen_layout_table` is not
+/// already published. `get_translated_info_for_typeinfo`
+/// (`llsupport/gc.py`) embeds that table's base address.
+///
+/// Must not be called from inside a `gc_op` or `gc_query` closure.
+/// `gc_query` is `gc_op`, and `gc_op` is not reentrant (`ReentryGuard`):
+/// the close hook and the `freeze_types` below both call `gc_op`. The hook
+/// therefore runs outside any `gc_sync` closure — the already-frozen check
+/// uses `gc_query_reentrant`, and that shared borrow ends before the hook.
+pub fn ensure_type_registry_closed() {
+    debug_assert!(
+        !gc_sync::in_gc_op(),
+        "ensure_type_registry_closed must not run inside gc_op or gc_query"
+    );
+    if gc_sync::gc_query_reentrant(|gc| gc.types_frozen()) {
+        return;
+    }
+    if let Some(hook) = TYPE_REGISTRY_CLOSE_HOOK.get().copied() {
+        hook();
+    }
+    gc_sync::gc_op(|gc| gc.freeze_types());
 }
 
 /// Forwarding handle to the process-global GC singleton via `gc_sync`.
@@ -1860,6 +1918,12 @@ impl GcAllocator for GcHandle {
     }
     fn freeze_types(&mut self) {
         gc_sync::gc_op(|gc| gc.freeze_types())
+    }
+    fn assign_inheritance_ids_now(&mut self) {
+        gc_sync::gc_op(|gc| gc.assign_inheritance_ids_now())
+    }
+    fn types_frozen(&self) -> bool {
+        gc_sync::gc_query_reentrant(|gc| gc.types_frozen())
     }
     fn has_type_registry(&self) -> bool {
         gc_sync::gc_query_reentrant(|gc| gc.has_type_registry())

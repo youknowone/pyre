@@ -9845,6 +9845,14 @@ impl GcAllocator for MiniMarkGC {
         self.types.freeze_types();
     }
 
+    fn assign_inheritance_ids_now(&mut self) {
+        self.types.assign_inheritance_ids_now();
+    }
+
+    fn types_frozen(&self) -> bool {
+        self.types.is_frozen()
+    }
+
     /// Owns a `TypeRegistry`, so a shape id can always be resolved against
     /// this allocator — including before anything has been registered in it.
     fn has_type_registry(&self) -> bool {
