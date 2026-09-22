@@ -671,12 +671,24 @@ fn extend_from_list(mut list: PyObjectRef, mut other: PyObjectRef) -> Result<(),
 /// storage writes without the lock helper in the traced graph.
 #[majit_macros::dont_look_inside]
 fn extend_from_tuple(list: PyObjectRef, other: PyObjectRef) -> Result<(), crate::PyError> {
+    // An integer- or float-specialised tuple boxes each item as it is read,
+    // so `w_tuple_getitem` allocates and both operands can move under the
+    // loop.  Keep them on the shadow stack and re-read them per item.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[list, other]);
     unsafe {
-        let n = w_tuple_len(other);
-        pyre_object::listobject::w_list_reserve_for_extend(list, n);
+        let n = w_tuple_len(pyre_object::gc_roots::shadow_stack_get(base + 1));
+        pyre_object::listobject::w_list_reserve_for_extend(
+            pyre_object::gc_roots::shadow_stack_get(base),
+            n,
+        );
         for i in 0..n {
+            let other = pyre_object::gc_roots::shadow_stack_get(base + 1);
             if let Some(item) = w_tuple_getitem(other, i as i64) {
-                pyre_object::listobject::w_list_append_preallocated(list, item);
+                pyre_object::listobject::w_list_append_preallocated(
+                    pyre_object::gc_roots::shadow_stack_get(base),
+                    item,
+                );
             }
         }
     }

@@ -5126,16 +5126,25 @@ fn tuple_new_slow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// call has to be recordable inside the transparent `tuple.__new__` walk.
 #[majit_macros::dont_look_inside_cannot_raise]
 fn tuple_from_exact_list(obj: PyObjectRef) -> PyObjectRef {
-    unsafe {
-        let n = pyre_object::w_list_len(obj);
-        let mut items = Vec::with_capacity(n);
-        for i in 0..n {
-            if let Some(item) = pyre_object::w_list_getitem(obj, i as i64) {
-                items.push(item);
-            }
+    // A range or unboxed list strategy boxes each element as it is read, so
+    // `w_list_getitem` allocates: the source list and every item already
+    // collected have to be on the shadow stack, not in a native `Vec`.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[obj]);
+    let n = unsafe { pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(base)) };
+    let mut count = 0usize;
+    for i in 0..n {
+        let obj = pyre_object::gc_roots::shadow_stack_get(base);
+        if let Some(item) = unsafe { pyre_object::w_list_getitem(obj, i as i64) } {
+            let _ = pyre_object::gc_roots::pin_root(item);
+            count += 1;
         }
-        pyre_object::w_tuple_new(items)
     }
+    let mut items = Vec::with_capacity(count);
+    for slot in 0..count {
+        items.push(pyre_object::gc_roots::shadow_stack_get(base + 1 + slot));
+    }
+    unsafe { pyre_object::w_tuple_new(items) }
 }
 
 /// `tuple(x)` for an iterable that is not an exact tuple or list.

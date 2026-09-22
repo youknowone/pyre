@@ -1801,7 +1801,13 @@ pub fn w_list_new_empty() -> PyObjectRef {
 /// records this as its last helper, matching a looked-into malloc.
 #[majit_macros::dont_look_inside]
 pub fn w_list_allocate_instance(w_listtype: PyObjectRef) -> PyObjectRef {
+    // The header allocation below can collect, and a user subtype is an
+    // ordinary movable object, so the class word has to survive it on the
+    // shadow stack and be re-read afterwards.
+    let _roots = crate::gc_roots::push_roots();
+    let w_listtype = crate::gc_roots::pin_root(w_listtype);
     let obj = w_list_new_with_strategy(Vec::new(), ListStrategy::Empty);
+    let w_listtype = crate::gc_roots::reload_top_root(w_listtype);
     if !w_listtype.is_null() {
         let list_class = get_instantiate(&LIST_TYPE);
         if w_listtype != list_class {
