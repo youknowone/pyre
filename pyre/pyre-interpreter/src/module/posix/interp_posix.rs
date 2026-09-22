@@ -4600,6 +4600,40 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     crate::module_ns_store(ns, "times_result", times_result_seq_type());
     crate::module_ns_store(ns, "uname_result", uname_result_seq_type());
 
+    // `interp_posix.device_encoding`: only a terminal has one. UTF-8 mode
+    // answers "utf-8"; otherwise the active locale's `nl_langinfo(CODESET)`,
+    // or None when that is empty. The Windows arm (console code pages) is
+    // registered in the `host_env` block below.
+    #[cfg(all(not(windows), not(feature = "sandbox")))]
+    crate::module_ns_store(
+        ns,
+        "device_encoding",
+        crate::make_builtin_function_with_arity(
+            "device_encoding",
+            |args| {
+                if args.is_empty() {
+                    return Err(crate::PyError::type_error(
+                        "device_encoding() requires 1 argument",
+                    ));
+                }
+                let fd = crate::baseobjspace::c_int_w(args[0])?;
+                if !crate::importing::host::os::isatty(fd) {
+                    return Ok(pyre_object::w_none());
+                }
+                if crate::importing::utf8_mode_flag() != 0 {
+                    return Ok(pyre_object::w_str_new_managed("utf-8"));
+                }
+                match rustpython_host_env::locale::nl_langinfo_codeset() {
+                    Some(codeset) if !codeset.is_empty() => Ok(pyre_object::w_str_new_managed(
+                        &String::from_utf8_lossy(&codeset),
+                    )),
+                    _ => Ok(pyre_object::w_none()),
+                }
+            },
+            1,
+        ),
+    );
+
     // ── posix.get_terminal_size(fd=1) → os.terminal_size(columns, lines) ──
     // The size belongs to the terminal the descriptor names, read through
     // `ioctl(TIOCGWINSZ)` or `GetConsoleScreenBufferInfo`.  A descriptor that

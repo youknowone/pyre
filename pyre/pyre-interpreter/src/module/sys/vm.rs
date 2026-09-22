@@ -4367,7 +4367,9 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
         pyre_object::gc_roots::shadow_stack_get(buffer_slot),
         &encoding,
         errors,
-        unbuffered || to_stderr,
+        // `create_stdio`: `line_buffering=unbuffered or fd == 2 or raw.isatty()`.
+        // `FileIO.isatty` (`file_method_isatty`) asks `isatty` of the descriptor.
+        unbuffered || to_stderr || crate::importing::host::os::isatty(fd),
         unbuffered,
     );
     crate::baseobjspace::setdictvalue_native(stream, "name", w_str_new(name));
