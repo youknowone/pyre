@@ -1068,7 +1068,7 @@ pub fn is_rewindable_root_bracket_residual_i64(fnaddr: i64) -> bool {
 /// source analyzer (`runtime_ops::foo`) and the crate-root re-export path
 /// (`foo`) that pyre's runtime helper code often calls directly.
 pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
-    build_jit_trace_fnaddrs().0
+    jit_trace_fnaddr_tables().0.clone()
 }
 
 /// True for an address published through [`push_abi_unsound_argument_fnaddr`]:
@@ -1081,11 +1081,17 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
 /// the model never wrote; declining the descent leaves the call to the
 /// interpreter, which passes the argument whole.
 pub fn is_abi_unsound_argument_residual(addr: usize) -> bool {
+    jit_trace_fnaddr_tables().1.contains(&(addr as i64))
+}
+
+/// [`build_jit_trace_fnaddrs`], built once per process.  Every input is fixed
+/// before `main` runs: function addresses, the macro registry (linked, or
+/// filled from constructors on wasm32) and the optional-module hooks, which
+/// `pyre-module` installs from its own constructor.
+fn jit_trace_fnaddr_tables() -> &'static (Vec<(&'static str, i64)>, Vec<i64>) {
     use std::sync::OnceLock;
-    static ADDRS: OnceLock<Vec<i64>> = OnceLock::new();
-    ADDRS
-        .get_or_init(|| build_jit_trace_fnaddrs().1)
-        .contains(&(addr as i64))
+    static TABLES: OnceLock<(Vec<(&'static str, i64)>, Vec<i64>)> = OnceLock::new();
+    TABLES.get_or_init(build_jit_trace_fnaddrs)
 }
 
 /// [`jit_trace_fnaddrs`] and the [`is_abi_unsound_argument_residual`] set,
