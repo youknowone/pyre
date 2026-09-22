@@ -6607,24 +6607,6 @@ mod tests {
         assert!(!super::is_stamp_inline(readable));
         assert_eq!(readable & super::THIN_DESCR_PTR_MASK, payload);
 
-        {
-            let mut table = super::THIN_STAMPED
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            while (table.len as u64) < super::THIN_STAMPED_ID_LIMIT {
-                let n = table.len as u32;
-                let key = super::ThinStamped {
-                    vtable: 255,
-                    stamp: 0xA000_0000 | n,
-                    data: usize::MAX,
-                    fwd_tag: 255,
-                };
-                let i = table.len;
-                let _ = super::THIN_STAMPED_SLOTS[i].set(key);
-                table.index.insert(key, i);
-                table.len += 1;
-            }
-        }
         let thin = payload | super::THIN_DESCR_BIT;
         // `pack_stamp` of an out-of-range int is `STAMP_WIDE | (id << 2)`.
         // The first ids fit the 6-bit thin field and never consult the
@@ -6635,16 +6617,38 @@ mod tests {
             probe -= 1;
             stamp = super::pack_stamp(crate::value::Value::Int(probe));
         }
-        assert!(super::thin_with_stamp(thin, stamp).is_none());
 
+        // `intern_thin_stamped` refuses once `len` hits
+        // `THIN_STAMPED_ID_LIMIT`, after the index hit. Raise `len` only.
+        // `THIN_STAMPED_SLOTS` is write-once: a dummy `set` survives any
+        // later rewind, the next intern's `set` fails, and
+        // `thin_stamped_at` reads the dummy.
+        let saved_len = {
+            let mut table = super::THIN_STAMPED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let saved = table.len;
+            table.len = super::THIN_STAMPED_ID_LIMIT as usize;
+            saved
+        };
+        let refused = super::thin_with_stamp(thin, stamp).is_none();
         let descr = crate::make_loop_target_descr(12, false);
         let op = Op::with_descr(OpCode::GetfieldGcI, &[], descr.clone());
         op.set_value(crate::value::Value::Int(probe));
+        let promoted_descr = op.descr.borrow();
+        let promoted_value = op.get_value();
+        {
+            let mut table = super::THIN_STAMPED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            table.len = saved_len;
+        }
+        assert!(refused);
         assert!(std::sync::Arc::ptr_eq(
-            &op.descr.borrow().expect("promoted stamp keeps the descr"),
+            &promoted_descr.expect("promoted stamp keeps the descr"),
             &descr,
         ));
-        assert_eq!(op.get_value(), Some(crate::value::Value::Int(probe)));
+        assert_eq!(promoted_value, Some(crate::value::Value::Int(probe)));
     }
 
     #[test]
