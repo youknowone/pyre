@@ -125,6 +125,18 @@ impl<'a> RegAllocator<'a> {
         self.make_dependencies_among(None);
     }
 
+    /// `_unionfind.find_rep(id)` when a pre-merge put `id` in the
+    /// union-find, `id` itself otherwise.  `find_rep` would answer the same
+    /// for an absent `id`, but it would also enter it as a new singleton,
+    /// which nothing here reads back.
+    fn merged_rep(&mut self, id: super::flow::VariableId) -> super::flow::VariableId {
+        if self._unionfind.contains(&id) {
+            self._unionfind.find_rep(id)
+        } else {
+            id
+        }
+    }
+
     /// `make_dependencies`, recording only the edges whose two endpoints are
     /// both in `tracked` (every edge when `None`).  Nodes are still added for
     /// every variable, and liveness is computed over all of them.
@@ -155,7 +167,7 @@ impl<'a> RegAllocator<'a> {
                         // When `_unionfind` has no pre-merges, find_rep
                         // returns the input ID unchanged so this matches
                         // upstream `regalloc.py:26-77` exactly.
-                        let rep = self._unionfind.find_rep(v.id);
+                        let rep = self.merged_rep(v.id);
                         die_at.insert(rep, 0);
                     }
                 }
@@ -164,14 +176,14 @@ impl<'a> RegAllocator<'a> {
                 for arg in &op.args {
                     for v in arg.variables() {
                         if v.kind == Some(kind) {
-                            let rep = self._unionfind.find_rep(v.id);
+                            let rep = self.merged_rep(v.id);
                             die_at.insert(rep, i);
                         }
                     }
                 }
                 if let Some(v) = op.result.as_ref().and_then(FlowValue::as_variable) {
                     if v.kind == Some(kind) {
-                        let rep = self._unionfind.find_rep(v.id);
+                        let rep = self.merged_rep(v.id);
                         die_at.insert(rep, i + 1);
                     }
                 }
@@ -179,7 +191,7 @@ impl<'a> RegAllocator<'a> {
             match &block_borrow.exitswitch {
                 Some(ExitSwitch::Value(value)) => {
                     if let Some(v) = value.as_variable() {
-                        let rep = self._unionfind.find_rep(v.id);
+                        let rep = self.merged_rep(v.id);
                         die_at.remove(&rep);
                     }
                 }
@@ -187,7 +199,7 @@ impl<'a> RegAllocator<'a> {
                     for value in values {
                         if let ExitSwitchElement::Value(value) = value {
                             if let Some(v) = value.as_variable() {
-                                let rep = self._unionfind.find_rep(v.id);
+                                let rep = self.merged_rep(v.id);
                                 die_at.remove(&rep);
                             }
                         }
@@ -198,7 +210,7 @@ impl<'a> RegAllocator<'a> {
             for link in &block_borrow.exits {
                 for arg in &link.borrow().args {
                     if let Some(v) = arg.as_ref().and_then(FlowValue::as_variable) {
-                        let rep = self._unionfind.find_rep(v.id);
+                        let rep = self.merged_rep(v.id);
                         die_at.remove(&rep);
                     }
                 }
@@ -215,7 +227,7 @@ impl<'a> RegAllocator<'a> {
                     .iter()
                     .filter_map(FlowValue::as_variable)
                     .filter(|v| v.kind == Some(kind))
-                    .map(|v| self._unionfind.find_rep(v.id)),
+                    .map(|v| self.merged_rep(v.id)),
             );
             for (i, &v) in livevar_reps.iter().enumerate() {
                 self._depgraph.add_node(v);
@@ -244,7 +256,7 @@ impl<'a> RegAllocator<'a> {
                 }
                 if let Some(result) = op.result.as_ref().and_then(FlowValue::as_variable) {
                     if result.kind == Some(kind) {
-                        let rep = self._unionfind.find_rep(result.id);
+                        let rep = self.merged_rep(result.id);
                         self._depgraph.add_node(rep);
                         // upstream (`regalloc.py:73`): add an edge from
                         // every live var to `result`.  `result` is added
@@ -393,7 +405,7 @@ impl<'a> RegAllocator<'a> {
     }
 
     fn getcolor(&mut self, v: Variable) -> Option<u16> {
-        let rep = self._unionfind.find_rep(v.id);
+        let rep = self.merged_rep(v.id);
         self._coloring.get(&rep).copied()
     }
 
