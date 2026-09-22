@@ -1386,18 +1386,20 @@ fn force_box_impl(
             alloc_ref
         }
         PtrInfo::VirtualArray(vinfo) => {
-            // info.py: AbstractVirtualPtrInfo.force_box does
-            // `newop.set_forwarded(self); self._is_virtual = False` — it keeps
-            // the SAME ArrayPtrInfo, now non-virtual, so getarrayinfo still
-            // recovers the array identity after forcing.
-            // PRE-EXISTING DIVERGENCE: pyre installs `nonnull()` instead,
-            // dropping the array identity (a later GETARRAYITEM residualizes
-            // rather than reading a tracked item). Convergence needs an
-            // `is_virtual` flag on `VirtualArrayInfo` plus an `is_virtual()`
-            // gate at the `matches!(PtrInfo::VirtualArray(_))` sites in
-            // virtualize.rs (same shape as the RawBuffer size=-1 sentinel).
+            // info.py `AbstractVirtualPtrInfo.force_box` forwards the
+            // allocation at this array info and then clears `_is_virtual`.
+            // The forced box keeps `descr` and the constant length, with no
+            // cached items: `_force_elements` forgets every item, so a later
+            // SETARRAYITEM_GC is not elided against the store just emitted.
+            // `optimize_ARRAYLEN_GC` only folds a still-virtual array, so the
+            // ARRAYLEN_GC pure registration below still publishes the length.
             let len = vinfo.items.len();
-            ctx.set_ptr_info(op, PtrInfo::nonnull());
+            let preserved = PtrInfo::Array(ArrayPtrInfo {
+                descr: vinfo.descr.clone(),
+                lenbound: IntBound::from_constant(len as i64),
+                items: Vec::new(),
+                last_guard_pos: -1,
+            });
 
             let len_ref = ctx.emit_constant_int(len as i64);
             let alloc_opcode = if vinfo.clear {
@@ -1410,6 +1412,13 @@ fn force_box_impl(
             alloc_op.pos().set(opref);
             alloc_op.setdescr(vinfo.descr.clone());
             let alloc_ref = emit_op(ctx, alloc_op);
+            // Install before the item stores. A child that points back at
+            // this box must see the non-virtual array, and `make_equal_to`
+            // copies whatever info `op` still holds onto the allocation.
+            ctx.set_ptr_info(op, preserved.clone());
+            if let Some(b) = ctx.get_box_replacement_operand_opt(alloc_ref) {
+                ctx.set_ptr_info(&b, preserved);
+            }
             if opref != alloc_ref {
                 let b_alloc = ctx.get_box_replacement_operand(alloc_ref);
                 ctx.make_equal_to(op, &b_alloc);
@@ -2144,6 +2153,61 @@ mod tests {
 
         assert!(!info.make_guards(OpRef::ref_op(1), &mut guards, &mut ctx));
         assert!(guards.is_empty());
+    }
+
+    #[test]
+    fn test_force_virtual_array_keeps_array_info_and_folds_arraylen() {
+        use crate::optimizeopt::Optimization;
+        use crate::optimizeopt::pure::OptPure;
+
+        let descr = byte_array_descr(true);
+        let length = 4usize;
+        let mut info = PtrInfo::virtual_array(descr.clone(), length, false);
+        // A written slot must not survive: `_force_elements` forgets items
+        // while emitting the initializing stores.
+        info.setitem(1, field_op(Type::Int, 7));
+
+        let mut ctx = OptContext::new(32);
+        ctx.in_final_emission = true;
+        let virtual_box = field_op(Type::Ref, 10);
+        let forced = info.force_box(&virtual_box, &mut ctx);
+
+        let forced_box = ctx.get_box_replacement_operand(forced);
+        let ptr = ctx
+            .peek_ptr_info(&forced_box)
+            .expect("forced box carries ptr info");
+        let PtrInfo::Array(array) = &ptr else {
+            panic!("forced virtual array must be PtrInfo::Array, got {ptr:?}");
+        };
+        assert!(
+            Arc::ptr_eq(&array.descr, &descr),
+            "forced array keeps the virtual array descr"
+        );
+        assert!(
+            array.lenbound.is_constant(),
+            "forced array length is the constant virtual length"
+        );
+        assert_eq!(array.lenbound.get_constant_int(), length as i64);
+        assert!(
+            array.items.is_empty(),
+            "forced array forgets cached items, got {:?}",
+            array.items
+        );
+
+        // The pure registration is descr-less (`pure_from_args` without a
+        // descr), so the following ARRAYLEN_GC carries no descr either.
+        let mut pure = OptPure::new();
+        let array_arg = ctx.materialize_operand_at(forced);
+        let mut len_op = Op::new(OpCode::ArraylenGc, &[array_arg]);
+        len_op.pos().set(OpRef::int_op(40));
+        let len_rc = OpRc::new(len_op);
+        let result = pure.propagate_forward(len_rc.as_ref(), &len_rc, &mut ctx);
+        assert!(
+            matches!(result, crate::optimizeopt::OptimizationResult::Remove),
+            "ARRAYLEN_GC on the forced array must fold, got {result:?}"
+        );
+        let folded = Operand::from_bound_op(&len_rc).get_box_replacement(false);
+        assert_eq!(folded.const_value(), Some(Value::Int(length as i64)));
     }
 
     #[test]
