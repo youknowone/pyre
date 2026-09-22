@@ -10290,13 +10290,11 @@ impl<'a> Lowering<'a> {
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: None,
                 kind: OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: vec![
-                            "pyre_interpreter".to_string(),
-                            "eval".to_string(),
-                            "frame_anchor_release".to_string(),
-                        ],
-                    },
+                    target: CallTarget::function_path([
+                        "pyre_interpreter",
+                        "eval",
+                        "frame_anchor_release",
+                    ]),
                     args: crate::model::call_args(vec![arg]),
                     result_ty: ValueType::Void,
                 },
@@ -25136,7 +25134,7 @@ pub(crate) fn is_root_scope_drop_glue_call(kind: &OpKind) -> bool {
 /// bypasses the forwarding block that held the Drop.
 pub(crate) fn is_frame_anchor_release_call(kind: &OpKind) -> bool {
     let OpKind::Call {
-        target: CallTarget::FunctionPath { segments },
+        target: CallTarget::FunctionPath { segments, .. },
         ..
     } = kind
     else {
