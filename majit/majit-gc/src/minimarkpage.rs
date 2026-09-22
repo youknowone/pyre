@@ -67,6 +67,13 @@ pub struct ArenaCollection {
     /// clears it; inserting leaves every existing range where it was.
     /// `(usize::MAX, 0)` is the empty state — no address satisfies it.
     last_range_hit: std::cell::Cell<(usize, usize, *mut ArenaReference)>,
+    /// Covering `[arena_bound_start, arena_bound_end)` of every entry in
+    /// `arena_ranges`. [`Self::contains`] rejects an address outside it before
+    /// the binary search; an address inside still takes the exact lookup.
+    /// `usize::MAX..0` is the empty bound and holds no address. Refreshed
+    /// wherever `arena_ranges` gains or loses an arena.
+    arena_bound_start: usize,
+    arena_bound_end: usize,
     min_empty_nfreepages: usize,
     pub num_uninitialized_pages: usize,
     pub total_memory_used: usize,
@@ -123,6 +130,8 @@ impl ArenaCollection {
             current_arena: ptr::null_mut(),
             arena_ranges: Vec::new(),
             last_range_hit: std::cell::Cell::new((usize::MAX, 0, ptr::null_mut())),
+            arena_bound_start: usize::MAX,
+            arena_bound_end: 0,
             min_empty_nfreepages: max_pages_per_arena,
             num_uninitialized_pages: 0,
             total_memory_used: 0,
@@ -280,6 +289,7 @@ impl ArenaCollection {
             .binary_search_by_key(&range.0, |&(start, _, _)| start)
             .unwrap_err();
         self.arena_ranges.insert(index, range);
+        self.refresh_arena_bound();
     }
 
     /// `ArenaCollection.mass_free_prepare`.
@@ -538,6 +548,23 @@ impl ArenaCollection {
         }
     }
 
+    /// Recompute the covering bound from `arena_ranges`. Arenas are few, and
+    /// this runs only when one is allocated or freed.
+    fn refresh_arena_bound(&mut self) {
+        let mut lowest = usize::MAX;
+        let mut highest = 0usize;
+        for &(start, end, _) in &self.arena_ranges {
+            if start < lowest {
+                lowest = start;
+            }
+            if end > highest {
+                highest = end;
+            }
+        }
+        self.arena_bound_start = lowest;
+        self.arena_bound_end = highest;
+    }
+
     /// Exact allocated-block membership for the arena allocator.
     ///
     /// RPython never needs this query: the translated pointer type proves that
@@ -550,6 +577,9 @@ impl ArenaCollection {
         let (start, end, arena) = self.last_range_hit.get();
         if addr >= start && addr < end {
             return unsafe { Self::block_is_live(arena, addr) };
+        }
+        if addr < self.arena_bound_start || addr >= self.arena_bound_end {
+            return false;
         }
         let index = self
             .arena_ranges
@@ -624,6 +654,7 @@ impl ArenaCollection {
                 .binary_search_by_key(&base, |&(start, _, _)| start)
                 .expect("freed arena missing from range index");
             self.arena_ranges.remove(index);
+            self.refresh_arena_bound();
             self.last_range_hit.set((usize::MAX, 0, ptr::null_mut()));
             alloc::dealloc((*arena).base, (*arena).layout);
             self.total_memory_alloced -= self.arena_size;
@@ -759,6 +790,30 @@ mod tests {
         ac.mass_free(|_| true);
         assert_eq!(ac.arenas_count, 0);
         assert!(!ac.contains(first));
+    }
+
+    #[test]
+    fn contains_bound_covers_every_arena_and_rejects_the_outside() {
+        let mut ac = ArenaCollection::new(ARENA_SIZE, PAGE_SIZE, THRESHOLD);
+        assert!(!ac.contains(0));
+        assert!(!ac.contains(usize::MAX));
+        let mut live = vec![ac.malloc(WORD)];
+        while ac.arenas_count < 2 {
+            live.push(ac.malloc(WORD));
+        }
+        let first = live[0] as usize;
+        let second = *live.last().unwrap() as usize;
+        assert_ne!(first, second);
+        assert!(ac.contains(first));
+        assert!(ac.contains(second));
+        assert!(!ac.contains(0));
+        assert!(!ac.contains(usize::MAX));
+        // Every block dies. A not-yet-full arena stays `current_arena`, so
+        // `arenas_count` need not hit zero; neither payload stays live.
+        ac.mass_free(|_| true);
+        assert!(!ac.contains(first));
+        assert!(!ac.contains(second));
+        assert!(!ac.contains(0));
     }
 
     #[test]
