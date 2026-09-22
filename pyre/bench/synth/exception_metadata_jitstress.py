@@ -2,12 +2,9 @@
 # Locals for except-as stop the module-dict `version?` revoke storm
 # (`celldict.py notify_version_watchers`), so pypy compiles these
 # sections. `run()`'s `for` deletes the `except E as e` name and then
-# reads it. That `LOAD_FAST_CHECK` null arm is an `abort_permanent`
-# emitted after the body, so `py_floor_by_jit_pc` attributes the marker
-# to the trailing `RERAISE`. The resume uses
-# `abort_permanent_py_pc_by_jit_pc` (`codewriter.rs`) and continues at
-# the check, which keeps the in-flight `FOR_ITER` item
-# (`fbw_foriter_inflight_clear` on the committed abort flush). Output
+# reads it. That `LOAD_FAST_CHECK` null arm raises `UnboundLocalError`
+# (`pyopcode.py` `LOAD_FAST` / `_load_fast_failed`) and the tracer
+# follows the `raise` into the `except NameError` handler. Output
 # matches pypy, including `name_cleared`. The ceiling stays 15.
 # JIT-stress twin of exception_metadata_hot: `pypyjit.set_param` lowers the
 # trace/function thresholds to 1 so recording fires on the earliest iterations
