@@ -860,7 +860,7 @@ fn snapshot_inputarg_for_stack_ptr(
 
 /// Recorder snapshot tag to a resume box. A stack-resident Const Ref
 /// remaps to the InputArg that already carries those bits.
-fn snapshot_tagged_to_box(
+pub(crate) fn snapshot_tagged_to_box(
     tagged: &crate::recorder::SnapshotTagged,
     inputargs: &[majit_ir::InputArgRc],
 ) -> SnapshotBox {
@@ -1125,6 +1125,93 @@ mod byte_snapshot_map_tests {
             OpRef::ConstPtr(GcRef(0x2000))
         );
     }
+
+    /// The guard's descr varint is the 0 placeholder (`patch_guard_descr`
+    /// is false). `get_iter_for_optimizer` overlays `FrontendSlot.resume`.
+    /// Numbering must use that sequential id: a void before the value makes
+    /// the recording raw differ from the TAGBOX index, and snapshot 0's pc
+    /// is not snapshot 1's.
+    #[test]
+    fn byte_guard_numbers_overlaid_resume_not_descr_varint() {
+        use crate::optimizeopt::OptContext;
+
+        let mut rec = Trace::new();
+        let input = rec.record_input_arg(Type::Int);
+        rec.attach_byte_buffer(Arc::new(crate::MetaInterpStaticData::new()));
+        let void_op = rec.record_op(OpCode::Keepalive, &[input]);
+        assert_eq!(void_op.ty(), Some(Type::Void));
+        let value = rec.record_op(OpCode::IntAdd, &[input, OpRef::const_int(1)]);
+        assert_eq!(value.raw(), 2);
+        rec.record_guard(OpCode::GuardTrue, &[value], None);
+        let id0 = rec.encode_captured_snapshot(&Snapshot {
+            frames: vec![SnapshotFrame {
+                jitcode_index: 1,
+                pc: 11,
+                py_pc: 11,
+                boxes: vec![SnapshotTagged::Box(input, Type::Int)],
+            }],
+            vable_boxes: vec![],
+            vref_boxes: vec![],
+        });
+        let id1 = rec.encode_captured_snapshot(&Snapshot {
+            frames: vec![SnapshotFrame {
+                jitcode_index: 9,
+                pc: 99,
+                py_pc: 77,
+                boxes: vec![
+                    SnapshotTagged::Box(value, Type::Int),
+                    SnapshotTagged::Const(7, Type::Int),
+                ],
+            }],
+            vable_boxes: vec![],
+            vref_boxes: vec![],
+        });
+        assert_eq!((id0, id1), (0, 1));
+        rec.set_last_guard_op_resume_position(id1);
+
+        let live = rec.inputargs().to_vec();
+        let (ops, _inputargs, cache) = rec.get_iter_for_optimizer(&live, 10).unwrap();
+        let guard = ops.iter().rev().find(|op| op.opcode.is_guard()).unwrap();
+        assert_eq!(guard.rd_resume_position(), id1);
+
+        let numb = |op: &majit_ir::Op| {
+            let descr = op.getdescr().expect("numbered guard descr");
+            let fail = descr.as_fail_descr().expect("fail descr");
+            fail.rd_numb().expect("rd_numb").to_vec()
+        };
+
+        let mut byte_ctx = OptContext::with_inputarg_types(8, &[Type::Int]);
+        byte_ctx.byte_bridge_resume = Some(crate::recorder::ByteBridgeResume::from_recorder(
+            &rec,
+            cache.clone(),
+        ));
+        let byte_guard = (**guard).clone();
+        byte_ctx.store_final_boxes_in_guard(&byte_guard, None, Vec::new());
+
+        let mut list_ctx = OptContext::with_inputarg_types(8, &[Type::Int]);
+        let maps = snapshot_map_from_byte_recorder(&rec, &mut Default::default());
+        list_ctx.snapshot_boxes = translate_trace_iter_box_map(maps.0, &cache);
+        list_ctx.snapshot_frame_sizes = maps.1;
+        list_ctx.snapshot_vable_boxes = translate_trace_iter_box_map(maps.2, &cache);
+        list_ctx.snapshot_vref_boxes = translate_trace_iter_box_map(maps.3, &cache);
+        list_ctx.snapshot_frame_pcs = maps.4;
+        let list_guard = (**guard).clone();
+        list_ctx.store_final_boxes_in_guard(&list_guard, None, Vec::new());
+        let numbered = numb(&byte_guard);
+        assert_eq!(numbered, numb(&list_guard));
+
+        let maps = snapshot_map_from_byte_recorder(&rec, &mut Default::default());
+        let mut other = OptContext::with_inputarg_types(8, &[Type::Int]);
+        other.snapshot_boxes = translate_trace_iter_box_map(maps.0, &cache);
+        other.snapshot_frame_sizes = maps.1;
+        other.snapshot_vable_boxes = translate_trace_iter_box_map(maps.2, &cache);
+        other.snapshot_vref_boxes = translate_trace_iter_box_map(maps.3, &cache);
+        other.snapshot_frame_pcs = maps.4;
+        let mut snapshot0 = (**guard).clone();
+        snapshot0.set_rd_resume_position(id0);
+        other.store_final_boxes_in_guard(&snapshot0, None, Vec::new());
+        assert_ne!(numbered, numb(&snapshot0));
+    }
 }
 
 struct PreparedBridgeTrace {
@@ -1140,6 +1227,10 @@ struct PreparedBridgeTrace {
     snapshot_frame_pcs: SnapshotFramePcs,
     pending_bridge_rd: Option<PendingBridgeRd>,
     runtime_boxes: Vec<OpRef>,
+    /// Byte-mode prepare cache, keyed by the recording `OpRef` raw.
+    /// `None` on the `Vec<Op>` recorder, whose snapshots were already
+    /// rewritten into `snapshot_boxes`.
+    byte_unique_cache: Option<Vec<Option<Operand>>>,
 }
 
 #[cfg(feature = "jit-audits")]
@@ -1174,7 +1265,10 @@ fn audit_prepare_generation() -> usize {
     AUDIT_PREPARE_GENERATION.with(std::cell::Cell::get)
 }
 
-fn translate_trace_iter_opref(opref: OpRef, cache: &[Option<majit_ir::operand::Operand>]) -> OpRef {
+pub(crate) fn translate_trace_iter_opref(
+    opref: OpRef,
+    cache: &[Option<majit_ir::operand::Operand>],
+) -> OpRef {
     if opref.is_none() || opref.is_constant() {
         return opref;
     }
@@ -1339,6 +1433,7 @@ fn prepare_bridge_trace_from_owned(
         bridge_inputargs,
         reminted_inputargs,
         cache,
+        false,
         snapshot_boxes,
         snapshot_frame_sizes,
         snapshot_vable_boxes,
@@ -1454,6 +1549,7 @@ fn prepare_bridge_from_byte_recorder(
         bridge_inputargs,
         reminted_inputargs,
         cache,
+        true,
         snapshot_boxes,
         snapshot_frame_sizes,
         snapshot_vable_boxes,
@@ -1469,6 +1565,7 @@ fn finish_prepared_bridge(
     original_inputargs: &[InputArgRc],
     reminted_inputargs: Vec<majit_ir::InputArgRc>,
     cache: Vec<Option<majit_ir::operand::Operand>>,
+    keep_unique_cache: bool,
     snapshot_boxes: SnapshotBoxes,
     snapshot_frame_sizes: SnapshotFrameSizes,
     snapshot_vable_boxes: SnapshotBoxes,
@@ -1502,6 +1599,7 @@ fn finish_prepared_bridge(
         snapshot_frame_pcs,
         pending_bridge_rd,
         runtime_boxes,
+        byte_unique_cache: keep_unique_cache.then_some(cache),
     }
 }
 
@@ -1604,6 +1702,7 @@ where
         snapshot_frame_pcs,
         pending_bridge_rd,
         runtime_boxes,
+        byte_unique_cache: None,
     }
 }
 
@@ -9396,13 +9495,29 @@ impl<M: Clone> MetaInterp<M> {
         // ConstantPool to snapshot — this typed-constant map starts fresh.
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let call_pure_results = ctx.call_pure_results.clone();
+        // Byte-mode bridges number each surviving guard from
+        // `SnapshotIterator` inside `store_final_boxes_in_guard`. Building
+        // the box lists here would allocate them for every snapshot,
+        // including guards the optimizer deletes. The `Vec<Op>` recorder
+        // still passes the lists. Loop compile keeps its own single build
+        // for the phase-2 remap.
         let (
             mut snapshot_boxes,
             snapshot_frame_sizes,
             mut snapshot_vable_boxes,
             mut snapshot_vref_boxes,
             snapshot_frame_pcs,
-        ) = snapshot_maps_from_ctx(ctx, &mut constants);
+        ) = if use_byte_iter {
+            (
+                SnapshotBoxes::new(),
+                SnapshotFrameSizes::new(),
+                SnapshotBoxes::new(),
+                SnapshotBoxes::new(),
+                SnapshotFramePcs::new(),
+            )
+        } else {
+            snapshot_maps_from_ctx(ctx, &mut constants)
+        };
         self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
             &mut snapshot_boxes,
             &mut snapshot_vable_boxes,
@@ -14598,7 +14713,7 @@ impl<M: Clone> MetaInterp<M> {
             .tracing
             .as_ref()
             .is_some_and(|ctx| ctx.recorder.has_byte_buffer());
-        let prepared = if use_byte_iter {
+        let mut prepared = if use_byte_iter {
             prepare_bridge_from_byte_recorder(
                 &self.tracing.as_ref().expect("checked").recorder,
                 bridge_inputargs,
@@ -14626,6 +14741,7 @@ impl<M: Clone> MetaInterp<M> {
                 bridge_inputarg_base,
             )
         };
+        let byte_unique_cache = prepared.byte_unique_cache.take();
         let bridge_inputargs = prepared.inputargs.as_slice();
         let bridge_ops = prepared.ops.as_slice();
         // unroll.py:187 `trace = trace.get_iter()` rewrote the runtime boxes
@@ -14651,6 +14767,16 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_vable_boxes = prepared.snapshot_vable_boxes;
         optimizer.snapshot_vref_boxes = prepared.snapshot_vref_boxes;
         optimizer.snapshot_frame_pcs = prepared.snapshot_frame_pcs;
+        if let Some(cache) = byte_unique_cache {
+            let recorder = &self
+                .tracing
+                .as_ref()
+                .expect("byte bridge recorder")
+                .recorder;
+            optimizer.byte_bridge_resume = Some(crate::recorder::ByteBridgeResume::from_recorder(
+                recorder, cache,
+            ));
+        }
         optimizer.trace_inputargs = bridge_inputargs
             .iter()
             .enumerate()
@@ -15393,6 +15519,7 @@ impl<M: Clone> MetaInterp<M> {
             snapshot_frame_pcs,
             pending_bridge_rd,
             runtime_boxes: prepared_runtime_boxes,
+            byte_unique_cache,
         } = prepared;
         // `TreeLoop::from_oprc` preserves the TraceIterator identities rather
         // than wrapping a second copy of every operation.  The inputargs on
@@ -15442,6 +15569,16 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_vable_boxes = snapshot_vable_boxes;
         optimizer.snapshot_vref_boxes = snapshot_vref_boxes;
         optimizer.snapshot_frame_pcs = snapshot_frame_pcs;
+        if let Some(cache) = byte_unique_cache {
+            let recorder = &self
+                .tracing
+                .as_ref()
+                .expect("byte bridge recorder")
+                .recorder;
+            optimizer.byte_bridge_resume = Some(crate::recorder::ByteBridgeResume::from_recorder(
+                recorder, cache,
+            ));
+        }
         // Store bridge inputarg types so export_state can mint typed
         // `renamed_inputargs` OpRefs that carry their type intrinsically
         // (history.py:220 InputArg{Int,Ref,Float}.type Box parity).

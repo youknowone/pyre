@@ -1352,6 +1352,8 @@ pub struct OptContext {
     pub snapshot_vref_boxes: SnapshotBoxes,
     /// Per-guard per-frame (jitcode_index, pc, py_pc) from tracing-time snapshots.
     pub snapshot_frame_pcs: SnapshotFramePcs,
+    /// Byte-mode bridge resume. See `Optimizer::byte_bridge_resume`.
+    pub(crate) byte_bridge_resume: Option<crate::recorder::ByteBridgeResume>,
     /// optimizer.py `self.inputargs = inputargs` parity.
     /// Typed InputArg OpRefs; slot `i` is `OpRef::input_arg_typed(i, tp)`.
     pub inputargs: Vec<majit_ir::OpRef>,
@@ -2305,6 +2307,7 @@ impl OptContext {
             minimum_virtualizable_size: -1,
             snapshot_vref_boxes: Vec::new(),
             snapshot_frame_pcs: SnapshotFramePcs::new(),
+            byte_bridge_resume: None,
 
             inputargs: Vec::new(),
             inputarg_refs: FxHashMap::with_capacity_and_hasher(
@@ -2988,6 +2991,7 @@ impl OptContext {
             minimum_virtualizable_size: -1,
             snapshot_vref_boxes: Vec::new(),
             snapshot_frame_pcs: SnapshotFramePcs::new(),
+            byte_bridge_resume: None,
 
             inputargs: Vec::new(),
             inputarg_refs: FxHashMap::with_capacity_and_hasher(
@@ -3084,6 +3088,7 @@ impl OptContext {
         self.minimum_virtualizable_size = -1;
         self.snapshot_vref_boxes.clear();
         self.snapshot_frame_pcs.clear();
+        self.byte_bridge_resume = None;
         self.inputargs.clear();
         self.inputarg_refs.clear();
         self.resop_refs.clear();
@@ -7264,7 +7269,17 @@ impl OptContext {
         self.store_final_boxes_in_guard(op, knowledge, pending_setfields);
     }
 
-    fn store_final_boxes_in_guard(
+    fn resume_snapshot_ready(&self, pos: i32) -> bool {
+        snapshot_contains(&self.snapshot_boxes, pos) || self.byte_resume_contains(pos)
+    }
+
+    fn byte_resume_contains(&self, pos: i32) -> bool {
+        self.byte_bridge_resume
+            .as_ref()
+            .is_some_and(|feed| feed.contains(pos))
+    }
+
+    pub(crate) fn store_final_boxes_in_guard(
         &mut self,
         op: &Op,
         knowledge: Option<crate::resume::OptimizerKnowledgeForResume>,
@@ -7341,7 +7356,7 @@ impl OptContext {
         // (unroll.py:336/409). No fallback — the position is always set
         // before store_final_boxes_in_guard runs.
         let resume_pos = op.rd_resume_position();
-        let has_snapshot = snapshot_contains(&self.snapshot_boxes, resume_pos);
+        let has_snapshot = self.resume_snapshot_ready(resume_pos);
         // resume.py: `assert resume_position >= 0` —
         // RPython asserts the position is set before calling
         // store_final_boxes_in_guard. Every guard from the production
@@ -7364,7 +7379,7 @@ impl OptContext {
                 .patchguardop
                 .as_ref()
                 .map(|p| p.rd_resume_position())
-                .filter(|&p| snapshot_contains(&self.snapshot_boxes, p));
+                .filter(|&p| self.resume_snapshot_ready(p));
             if let Some(fb_pos) = fallback_pos {
                 op.set_rd_resume_position(fb_pos);
                 // resume.py _add_optimizer_sections: forward knowledge
@@ -7391,6 +7406,25 @@ impl OptContext {
                 op.rd_resume_position()
             );
         }
+
+        // Byte-mode bridges have no prebuilt box list. Number from
+        // `SnapshotIterator` before any `snapshot_boxes` borrow: the feed
+        // has to move out of `self` for the `BoxEnv` borrow.
+        let use_byte = self.byte_resume_contains(resume_pos)
+            && !snapshot_contains(&self.snapshot_boxes, resume_pos);
+        let byte_numbered = if use_byte {
+            let min_vable = self.minimum_virtualizable_size;
+            let feed = self.byte_bridge_resume.take().expect("byte resume");
+            let numbered = {
+                let env = OptBoxEnv { ctx: self };
+                let mut memo = self.resumedata_memo.borrow_mut();
+                feed.number_guard(&mut memo, &env, op.rd_resume_position(), min_vable)
+            };
+            self.byte_bridge_resume = Some(feed);
+            Some(numbered)
+        } else {
+            None
+        };
 
         // RPython parity: snapshot path handles ALL guards with snapshots,
         // including guards with rd_virtuals. The snapshot uses original boxes
@@ -7422,7 +7456,7 @@ impl OptContext {
         // agreement. This complements the variant audit because `OpRef::ty()`
         // deliberately collapses variants within one type bank.
         #[cfg(feature = "jit-audits")]
-        if majit_ir::opref_audit::enabled() {
+        if !use_byte && majit_ir::opref_audit::enabled() {
             let mut agree = 0usize;
             let mut disagree = 0usize;
             let mut untyped = 0usize;
@@ -7453,7 +7487,7 @@ impl OptContext {
             );
         }
 
-        if crate::callee_rca_enabled() {
+        if !use_byte && crate::callee_rca_enabled() {
             let env = OptBoxEnv { ctx: self };
             let vable_debug: Vec<(OpRef, OpRef, bool, Type)> = vable_oprefs
                 .iter()
@@ -7477,7 +7511,7 @@ impl OptContext {
             );
         }
 
-        if majit_log_enabled() && op.opcode == OpCode::GuardNotForced2 {
+        if !use_byte && majit_log_enabled() && op.opcode == OpCode::GuardNotForced2 {
             let env = OptBoxEnv { ctx: self };
             let snapshot_debug: Vec<(OpRef, OpRef, bool, Type)> = snapshot_boxes
                 .iter()
@@ -7514,8 +7548,6 @@ impl OptContext {
         }
 
         // resume.py: delegate to ResumeDataVirtualAdder.finish()
-        let env = OptBoxEnv { ctx: self };
-        let mut memo = self.resumedata_memo.borrow_mut();
         // resume.py:403-405 passes `minimum_virtualizable_size` here, which
         // arms the `resume.py` length check inside `number()`. This
         // call site used to hardcode `-1`, so the check — ported faithfully in
@@ -7544,18 +7576,28 @@ impl OptContext {
         // cannot raise to abandon the trace (`protect_speculative_operation`
         // uses the same one). Both discard the compilation and leave the
         // interpreter to carry on from state the JIT never took over.
-        let Ok(numb_state) = memo.number_from_parts(
-            &snapshot_boxes,
-            frame_sizes,
-            frame_pcs,
-            vable_oprefs,
-            vref_oprefs,
-            &env,
-            self.minimum_virtualizable_size,
-        ) else {
+        let min_vable = self.minimum_virtualizable_size;
+        let numbered = if let Some(numbered) = byte_numbered {
+            numbered
+        } else {
+            let env = OptBoxEnv { ctx: self };
+            let mut memo = self.resumedata_memo.borrow_mut();
+            memo.number_from_parts(
+                &snapshot_boxes,
+                frame_sizes,
+                frame_pcs,
+                vable_oprefs,
+                vref_oprefs,
+                &env,
+                min_vable,
+            )
+        };
+        let Ok(numb_state) = numbered else {
             self.signal_invalid_loop("resume numbering: TagOverflow");
             return;
         };
+        let env = OptBoxEnv { ctx: self };
+        let mut memo = self.resumedata_memo.borrow_mut();
 
         // resume.py, 520-558: pending_setfields are passed to finish()
         // which handles register_box, visitor_walk_recursive, and tagging.

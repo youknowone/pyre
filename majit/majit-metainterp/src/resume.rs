@@ -4277,89 +4277,189 @@ impl ResumeDataLoopMemo {
         env: &dyn BoxEnv,
     ) -> Result<(), TagOverflow> {
         for snapshot_box in boxes {
-            let raw_opref = snapshot_box.opref();
-            if raw_opref.is_none() {
-                numb_state.append_short(NULLREF);
-                continue;
-            }
-            // resume.py ResumeDataLoopMemo._number_boxes retains the resolved
-            // box for both classification and the liveboxes identity lookup.
-            // Inline constants need no producer object or identity-map entry.
-            if let Some(bits) = raw_opref.inline_const_bits() {
-                numb_state.append_short(self.getconst(bits, raw_opref.ty().unwrap())?);
-                continue;
-            }
-            let b = env.get_box_replacement_operand(raw_opref);
-            let opref = b.to_opref();
-            if opref.is_none() {
-                numb_state.append_short(NULLREF);
-                continue;
-            }
-            // resume.py: isinstance(box, Const) → getconst
-            if env.is_const(&b) {
-                let (val, tp) = env.get_const(&b);
-                let tagged = self.getconst(val, tp)?;
-                numb_state.append_short(tagged);
-                continue;
-            }
-            // resume.py:206-208: liveboxes
-            if let Some(tagged) = numb_state.liveboxes.get(&b) {
-                numb_state.append_short(tagged);
-                continue;
-            }
-            // resume.py:201-212:
-            //
-            //     box = iter.get(...)
-            //     box = box.get_box_replacement()
-            //     ...
-            //     if box.type == 'r':
-            //
-            // The type used for virtual classification is the replacement
-            // box's type, not the original snapshot slot's fallback type.  A
-            // snapshot slot can carry an Int fallback from tracing but forward
-            // to a Ref virtual after optimization; keeping the stale fallback
-            // would number that virtual as a TAGBOX and the subsequent
-            // optimizer.py:681 fail-arg force would materialize it.
-            let box_type = opref.ty().unwrap_or_else(|| env.get_type(opref));
-            let is_virtual = match box_type {
-                majit_ir::Type::Ref => env.is_virtual_ref(&b),
-                majit_ir::Type::Int => env.is_virtual_raw(&b),
-                _ => false,
-            };
-            let tagged = if is_virtual {
-                let t = tag(numb_state.num_virtuals, TAGVIRTUAL)?;
-                numb_state.num_virtuals += 1;
-                t
-            } else {
-                // RPython Box.type parity: capture type alongside TAGBOX
-                // assignment. This is the equivalent of Box.type being
-                // intrinsic — the type is determined once at numbering time.
-                //
-                // Typed OpRef variants (resoperation.py:719-739
-                // InputArg{Int,Ref,Float}, resoperation.py:564-638 *Op
-                // mixins) carry the type intrinsically (variant tag IS
-                // RPython Box class identity). The `livebox_types`
-                // HashMap is a legacy side-table that must agree with
-                // `opref.ty()`; a divergence would indicate an
-                // encoder/decoder mismatch we want to fail-loud on. Remove the
-                // side-table once all consumers use the intrinsic type.
-                if let Some(intrinsic_tp) = opref.ty() {
-                    debug_assert_eq!(
-                        intrinsic_tp, box_type,
-                        "livebox numbering: typed OpRef {:?} intrinsic type {:?} \
-                         disagrees with snapshot/env type {:?}",
-                        opref, intrinsic_tp, box_type
-                    );
-                }
-                numb_state.livebox_types.insert(opref, box_type);
-                let t = tag(numb_state.num_boxes, TAGBOX)?;
-                numb_state.num_boxes += 1;
-                t
-            };
-            numb_state.liveboxes.insert(b, tagged);
-            numb_state.append_short(tagged);
+            self._number_one(*snapshot_box, numb_state, env)?;
         }
         Ok(())
+    }
+
+    /// One iteration of `ResumeDataLoopMemo._number_boxes`.
+    ///
+    /// `ResumeDataLoopMemo.number` pulls each box from `SnapshotIterator`
+    /// (`iter_vable_array` / `iter_vref_array` / `iter_array`) and numbers it
+    /// before the next box is decoded. Callers that already hold a slice use
+    /// `_number_boxes`; the byte-bridge walk calls this directly.
+    fn _number_one(
+        &mut self,
+        snapshot_box: SnapshotBox,
+        numb_state: &mut NumberingState,
+        env: &dyn BoxEnv,
+    ) -> Result<(), TagOverflow> {
+        let raw_opref = snapshot_box.opref();
+        if raw_opref.is_none() {
+            numb_state.append_short(NULLREF);
+            return Ok(());
+        }
+        // resume.py ResumeDataLoopMemo._number_boxes retains the resolved
+        // box for both classification and the liveboxes identity lookup.
+        // Inline constants need no producer object or identity-map entry.
+        if let Some(bits) = raw_opref.inline_const_bits() {
+            numb_state.append_short(self.getconst(bits, raw_opref.ty().unwrap())?);
+            return Ok(());
+        }
+        let b = env.get_box_replacement_operand(raw_opref);
+        let opref = b.to_opref();
+        if opref.is_none() {
+            numb_state.append_short(NULLREF);
+            return Ok(());
+        }
+        // resume.py: isinstance(box, Const) → getconst
+        if env.is_const(&b) {
+            let (val, tp) = env.get_const(&b);
+            let tagged = self.getconst(val, tp)?;
+            numb_state.append_short(tagged);
+            return Ok(());
+        }
+        // ResumeDataLoopMemo._number_boxes: liveboxes
+        if let Some(tagged) = numb_state.liveboxes.get(&b) {
+            numb_state.append_short(tagged);
+            return Ok(());
+        }
+        // ResumeDataLoopMemo._number_boxes:
+        //
+        //     box = iter.get(...)
+        //     box = box.get_box_replacement()
+        //     ...
+        //     if box.type == 'r':
+        //
+        // The type used for virtual classification is the replacement
+        // box's type, not the original snapshot slot's fallback type.  A
+        // snapshot slot can carry an Int fallback from tracing but forward
+        // to a Ref virtual after optimization; keeping the stale fallback
+        // would number that virtual as a TAGBOX and the subsequent
+        // fail-arg force would materialize it.
+        let box_type = opref.ty().unwrap_or_else(|| env.get_type(opref));
+        let is_virtual = match box_type {
+            majit_ir::Type::Ref => env.is_virtual_ref(&b),
+            majit_ir::Type::Int => env.is_virtual_raw(&b),
+            _ => false,
+        };
+        let tagged = if is_virtual {
+            let t = tag(numb_state.num_virtuals, TAGVIRTUAL)?;
+            numb_state.num_virtuals += 1;
+            t
+        } else {
+            // RPython Box.type parity: capture type alongside TAGBOX
+            // assignment. This is the equivalent of Box.type being
+            // intrinsic — the type is determined once at numbering time.
+            //
+            // Typed OpRef variants (InputArg{Int,Ref,Float} and the *Op
+            // mixins) carry the type intrinsically (variant tag IS
+            // RPython Box class identity). The `livebox_types`
+            // HashMap is a legacy side-table that must agree with
+            // `opref.ty()`; a divergence would indicate an
+            // encoder/decoder mismatch we want to fail-loud on. Remove the
+            // side-table once all consumers use the intrinsic type.
+            if let Some(intrinsic_tp) = opref.ty() {
+                debug_assert_eq!(
+                    intrinsic_tp, box_type,
+                    "livebox numbering: typed OpRef {:?} intrinsic type {:?} \
+                     disagrees with snapshot/env type {:?}",
+                    opref, intrinsic_tp, box_type
+                );
+            }
+            numb_state.livebox_types.insert(opref, box_type);
+            let t = tag(numb_state.num_boxes, TAGBOX)?;
+            numb_state.num_boxes += 1;
+            t
+        };
+        numb_state.liveboxes.insert(b, tagged);
+        numb_state.append_short(tagged);
+        Ok(())
+    }
+
+    /// `ResumeDataLoopMemo.number` section order, fed one box at a time.
+    ///
+    /// `vable_len` / `vref_len` are the array lengths (`vref_len` is the
+    /// pair count times two, matching `vref_array` before the `>> 1`
+    /// stored in the resume bytes). `frames` is
+    /// `(jitcode_index, pc, py_pc, box_count)`. `next_vable`, `next_vref`,
+    /// and `next_frame_box` are pulled that many times, in that order —
+    /// the same order `SnapshotIterator` yields.
+    pub(crate) fn number_sections(
+        &mut self,
+        vable_len: i64,
+        mut next_vable: impl FnMut() -> SnapshotBox,
+        vref_len: i64,
+        mut next_vref: impl FnMut() -> SnapshotBox,
+        frames: &[(i32, i32, i32, usize)],
+        mut next_frame_box: impl FnMut() -> SnapshotBox,
+        env: &dyn BoxEnv,
+        minimum_virtualizable_size: i64,
+    ) -> Result<NumberingState, TagOverflow> {
+        let size_hint = (vable_len.max(0) as usize)
+            + (vref_len.max(0) as usize)
+            + frames
+                .iter()
+                .map(|(_, _, _, boxes)| boxes + 3)
+                .sum::<usize>()
+            + 4;
+        let mut writer = majit_ir::resumecode::Writer {
+            current: std::mem::take(&mut self.writer_scratch),
+        };
+        writer.current.clear();
+        writer.current.reserve(size_hint);
+        let mut livebox_types = self.take_livebox_types();
+        livebox_types.reserve(size_hint);
+        let mut numb_state = NumberingState {
+            writer,
+            liveboxes: self.take_livebox_map(),
+            num_boxes: 0,
+            num_virtuals: 0,
+            livebox_types,
+        };
+
+        // resume.py number: patch later
+        numb_state.append_int(0); // slot 0: size of resume section
+        numb_state.append_int(0); // slot 1: number of failargs (patched by finish())
+
+        // resume.py number: if minimum_virtualizable_size != -1, the
+        // virtualizable itself is one entry in the array too, so use '>'.
+        if minimum_virtualizable_size != -1 {
+            debug_assert!(
+                vable_len > minimum_virtualizable_size,
+                "vable_array length {} not > minimum_virtualizable_size {}",
+                vable_len,
+                minimum_virtualizable_size
+            );
+        }
+
+        // resume.py number: virtualizable array, identity-first, unchanged.
+        numb_state.append_int(vable_len);
+        for _ in 0..vable_len.max(0) as usize {
+            self._number_one(next_vable(), &mut numb_state, env)?;
+        }
+
+        // resume.py number: virtualref array. The stored count is pairs.
+        debug_assert!(vref_len & 1 == 0, "vref_array length must be even");
+        numb_state.append_int(vref_len >> 1);
+        for _ in 0..vref_len.max(0) as usize {
+            self._number_one(next_vref(), &mut numb_state, env)?;
+        }
+
+        // resume.py number: frame chain.
+        // Per-frame: jitcode_index, pc, py_pc, [tagged_values...].
+        for &(jitcode_index, pc, py_pc, nboxes) in frames {
+            numb_state.append_int(jitcode_index as i64);
+            numb_state.append_int(pc as i64);
+            numb_state.append_int(py_pc as i64);
+            for _ in 0..nboxes {
+                self._number_one(next_frame_box(), &mut numb_state, env)?;
+            }
+        }
+
+        // resume.py number: patch total size
+        numb_state.patch_current_size(0);
+        Ok(numb_state)
     }
 
     /// resume.py number() — serialize a guard's full snapshot.
@@ -4397,6 +4497,50 @@ impl ResumeDataLoopMemo {
     /// RPython patches it later in ResumeDataVirtualAdder.finish()
     /// (resume.py:433). Callers must call
     /// `numb_state.writer.patch(1, num_liveboxes)` after finish().
+    fn number_slices(
+        &mut self,
+        vable_array: &[SnapshotBox],
+        vref_array: &[SnapshotBox],
+        frames: &[(i32, i32, i32, &[SnapshotBox])],
+        env: &dyn BoxEnv,
+        minimum_virtualizable_size: i64,
+    ) -> Result<NumberingState, TagOverflow> {
+        let frame_meta: SmallVec<[(i32, i32, i32, usize); 16]> = frames
+            .iter()
+            .map(|(jc, pc, py, boxes)| (*jc, *pc, *py, boxes.len()))
+            .collect();
+        let mut vable_i = 0usize;
+        let mut vref_i = 0usize;
+        let mut frame_i = 0usize;
+        let mut box_i = 0usize;
+        self.number_sections(
+            vable_array.len() as i64,
+            || {
+                let snap_box = vable_array[vable_i];
+                vable_i += 1;
+                snap_box
+            },
+            vref_array.len() as i64,
+            || {
+                let snap_box = vref_array[vref_i];
+                vref_i += 1;
+                snap_box
+            },
+            &frame_meta,
+            || {
+                while frames[frame_i].3.is_empty() || box_i == frames[frame_i].3.len() {
+                    frame_i += 1;
+                    box_i = 0;
+                }
+                let snap_box = frames[frame_i].3[box_i];
+                box_i += 1;
+                snap_box
+            },
+            env,
+            minimum_virtualizable_size,
+        )
+    }
+
     pub fn number(
         &mut self,
         snapshot: &Snapshot,
@@ -4468,90 +4612,6 @@ impl ResumeDataLoopMemo {
             env,
             minimum_virtualizable_size,
         )
-    }
-
-    fn number_slices(
-        &mut self,
-        vable_array: &[SnapshotBox],
-        vref_array: &[SnapshotBox],
-        frames: &[(i32, i32, i32, &[SnapshotBox])],
-        env: &dyn BoxEnv,
-        minimum_virtualizable_size: i64,
-    ) -> Result<NumberingState, TagOverflow> {
-        let size_hint = vable_array.len()
-            + vref_array.len()
-            + frames
-                .iter()
-                .map(|(_, _, _, boxes)| boxes.len() + 3)
-                .sum::<usize>()
-            + 4;
-        let mut writer = majit_ir::resumecode::Writer {
-            current: std::mem::take(&mut self.writer_scratch),
-        };
-        writer.current.clear();
-        writer.current.reserve(size_hint);
-        let mut livebox_types = self.take_livebox_types();
-        livebox_types.reserve(size_hint);
-        let mut numb_state = NumberingState {
-            writer,
-            liveboxes: self.take_livebox_map(),
-            num_boxes: 0,
-            num_virtuals: 0,
-            livebox_types,
-        };
-
-        // resume.py:231-232: patch later
-        numb_state.append_int(0); // slot 0: size of resume section
-        numb_state.append_int(0); // slot 1: number of failargs (patched by finish())
-
-        // resume.py:236-239: if minimum_virtualizable_size != -1: the
-        // virtualizable itself is one entry in the array too, so use '>'.
-        if minimum_virtualizable_size != -1 {
-            debug_assert!(
-                vable_array.len() as i64 > minimum_virtualizable_size,
-                "vable_array length {} not > minimum_virtualizable_size {}",
-                vable_array.len(),
-                minimum_virtualizable_size
-            );
-        }
-
-        // resume.py:240-241 virtualizable array.
-        //
-        // `metainterp.virtualizable_boxes` is payload-first, identity-last
-        // (`read_boxes(...)` then `append(virtualizable_box)`,
-        // pyjitpl.py:3326-3330) — but that is NOT the order arriving here. The
-        // snapshot writer already reordered it: `_list_of_boxes_virtualizable`
-        // (opencoder.py:718-726, `build_vable_snapshot_boxes` for the
-        // state-field path) moves `boxes[-1]` to slot 0, so `vable_array` is
-        // identity-FIRST and the readers pull the virtualizable out before its
-        // payload (`resume.py virtualizable = self.next_ref()`;
-        // `consume_vable_info`; `seed_bridge_virtualizable_boxes`'s
-        // `split_first`). Numbering must not reorder it again — running the
-        // whole array through `_number_boxes()` unchanged is the parity.
-        numb_state.append_int(vable_array.len() as i64);
-        self._number_boxes(vable_array, &mut numb_state, env)?;
-
-        // resume.py:243-247: virtualref array
-        let vref_len = vref_array.len();
-        debug_assert!(vref_len & 1 == 0, "vref_array length must be even");
-        numb_state.append_int((vref_len >> 1) as i64);
-        self._number_boxes(vref_array, &mut numb_state, env)?;
-
-        // resume.py:249-253: frame chain.
-        // Per-frame: jitcode_index, pc, py_pc, [tagged_values...].
-        // RPython uses jitcode.get_live_vars_info(pc) at decode time
-        // to know how many tagged values each frame has.
-        for &(jitcode_index, pc, py_pc, boxes) in frames {
-            numb_state.append_int(jitcode_index as i64);
-            numb_state.append_int(pc as i64);
-            numb_state.append_int(py_pc as i64);
-            self._number_boxes(boxes, &mut numb_state, env)?;
-        }
-
-        // resume.py:254: patch total size
-        numb_state.patch_current_size(0);
-
-        Ok(numb_state)
     }
 
     /// resume.py ResumeDataVirtualAdder.finish() — exact port.
