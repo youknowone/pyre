@@ -334,38 +334,39 @@ fn remove_repeated_live_with_remap_internal(ssarepr: &mut SSARepr) -> Vec<usize>
     // `liveness.py:83-85` `last_i_pos = None; i = 0; res = []`.
     let mut res: Vec<Insn> = Vec::with_capacity(ssarepr.insns.len());
     let mut remap: Vec<usize> = vec![0usize; ssarepr.insns.len()];
-    let mut i = 0usize;
+    // `res` replaces `ssarepr.insns` wholesale below, so each instruction is
+    // moved out of the old list instead of copied.
+    let mut insns = std::mem::take(&mut ssarepr.insns)
+        .into_iter()
+        .enumerate()
+        .peekable();
 
-    while i < ssarepr.insns.len() {
-        // `liveness.py:87` `insn = ssarepr.insns[i]`.
-        let insn = ssarepr.insns[i].clone();
+    while let Some((i, insn)) = insns.next() {
         // `liveness.py:88-91`.
         if !insn.is_live() {
             remap[i] = res.len();
             res.push(insn);
-            i += 1;
             continue;
         }
         // `liveness.py:92-95` — collect `lives` and `labels` runs.
-        i += 1;
         let mut labels: Vec<Insn> = Vec::new();
         let mut label_old_positions: Vec<usize> = Vec::new();
         let mut lives: Vec<Insn> = vec![insn];
-        let mut live_old_positions: Vec<usize> = vec![i - 1];
+        let mut live_old_positions: Vec<usize> = vec![i];
 
         // `liveness.py:97-106` inner loop.
-        while i < ssarepr.insns.len() {
-            let next = ssarepr.insns[i].clone();
-            if next.is_live() {
-                live_old_positions.push(i);
-                lives.push(next);
-                i += 1;
-            } else if matches!(next, Insn::Label(_)) {
-                label_old_positions.push(i);
-                labels.push(next);
-                i += 1;
-            } else {
+        while let Some((_, next)) = insns.peek() {
+            let is_live = next.is_live();
+            if !is_live && !matches!(next, Insn::Label(_)) {
                 break;
+            }
+            let (pos, next) = insns.next().expect("peeked above");
+            if is_live {
+                live_old_positions.push(pos);
+                lives.push(next);
+            } else {
+                label_old_positions.push(pos);
+                labels.push(next);
             }
         }
 
