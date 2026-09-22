@@ -5753,16 +5753,11 @@ impl<'a> Transformer<'a> {
         } = target
             && args.is_empty()
             && let ValueType::Ref(Some(owner)) = result_ty
-            && self.callcontrol.as_deref().is_some_and(|cc| {
-                crate::codewriter::assembler::bh_size_spec_from_callcontrol(cc, owner)
-                    .is_some_and(|spec| !spec.all_fielddescrs.is_empty())
-            })
+            && let Some(alloc_owner) = self.struct_ctor_alloc_owner(owner)
         {
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result.clone(),
-                kind: OpKind::New {
-                    owner: owner.clone(),
-                },
+                kind: OpKind::New { owner: alloc_owner },
             }]);
         }
         // RPython `rtyper` lowers a heap-carried sum-type variant to
@@ -8942,6 +8937,29 @@ impl<'a> Transformer<'a> {
                 kind: OpKind::Live,
             },
         ])
+    }
+
+    /// Owner string `OpKind::New` can allocate for a niladic struct ctor.
+    ///
+    /// Layouts are keyed by [`struct_id_for_name`]. A qualified spelling
+    /// (`pyre_object::pyobject::PyObject`) and the leaf (`PyObject`) are one
+    /// struct when only the leaf is registered. A spec with no fields is not
+    /// allocatable: the collector would treat the object as pointer-free.
+    fn struct_ctor_alloc_owner(&self, owner: &str) -> Option<String> {
+        let allocable = |name: &str| {
+            self.callcontrol.as_deref().is_some_and(|cc| {
+                crate::codewriter::assembler::bh_size_spec_from_callcontrol(cc, name)
+                    .is_some_and(|spec| !spec.all_fielddescrs.is_empty())
+            })
+        };
+        if allocable(owner) {
+            return Some(owner.to_string());
+        }
+        let leaf = owner.rsplit("::").next().unwrap_or(owner);
+        if leaf != owner && allocable(leaf) {
+            return Some(leaf.to_string());
+        }
+        None
     }
 
     /// Decide whether a `direct_call` is a transparent Rust prelude

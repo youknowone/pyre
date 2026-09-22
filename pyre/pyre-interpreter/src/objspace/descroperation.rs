@@ -5389,6 +5389,12 @@ pub(crate) fn try_call_special(
 /// (`dunder`) and reflected (`rdunder`) special methods through
 /// `lookup_where`, decide whether to try the reflected operand first by
 /// comparing the two defining classes, then invoke forward-then-reverse.
+/// Read a shadow-stack slot pinned at `base`. A capturing closure here is a
+/// niladic synthetic constructor with no host address.
+fn pinned_shadow_operand(base: usize, index: usize) -> PyObjectRef {
+    unsafe { pyre_object::gc_roots::shadow_stack_get(base + index) }
+}
+
 pub(crate) fn try_dispatch_binary_special(
     lhs: &mut PyObjectRef,
     rhs: &mut PyObjectRef,
@@ -5419,7 +5425,6 @@ pub(crate) fn try_dispatch_binary_special(
         let operands = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(*lhs);
         let _ = pyre_object::gc_roots::pin_root(*rhs);
-        let operand = |i: usize| pyre_object::gc_roots::shadow_stack_get(operands + i);
         let (w_left_src, mut w_left_impl) =
             match lookup_where_interned(w_typ1.as_ptr(), w_left_name) {
                 Some((src, imp)) => (Some(src), Some(imp)),
@@ -5461,25 +5466,35 @@ pub(crate) fn try_dispatch_binary_special(
         }
         let (first, second) = if swapped { (1, 0) } else { (0, 1) };
         // The reflected implementation has to survive the forward call too.
-        let right_slot = w_right_impl.map(|method| {
+        let right_slot = if let Some(method) = w_right_impl {
             let slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(method);
-            slot
-        });
+            Some(slot)
+        } else {
+            None
+        };
         let mut result = None;
         // descroperation.py — _invoke_binop(w_left_impl, w_obj1, w_obj2).
         if let Some(method) = w_left_impl {
-            result = invoke_binop(method, operand(first), operand(second))?;
+            result = invoke_binop(
+                method,
+                pinned_shadow_operand(operands, first),
+                pinned_shadow_operand(operands, second),
+            )?;
         }
         // descroperation.py — _invoke_binop(w_right_impl, w_obj2, w_obj1).
         if result.is_none()
             && let Some(slot) = right_slot
         {
             let method = pyre_object::gc_roots::shadow_stack_get(slot);
-            result = invoke_binop(method, operand(second), operand(first))?;
+            result = invoke_binop(
+                method,
+                pinned_shadow_operand(operands, second),
+                pinned_shadow_operand(operands, first),
+            )?;
         }
-        *lhs = operand(0);
-        *rhs = operand(1);
+        *lhs = pinned_shadow_operand(operands, 0);
+        *rhs = pinned_shadow_operand(operands, 1);
         Ok(result)
     }
 }

@@ -4732,7 +4732,11 @@ pub(crate) fn setitem_slot(obj: PyObjectRef, index: PyObjectRef, value: PyObject
 }
 
 #[inline(never)]
-unsafe fn setitem_list(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyResult {
+pub(crate) unsafe fn setitem_list(
+    obj: PyObjectRef,
+    index: PyObjectRef,
+    value: PyObjectRef,
+) -> PyResult {
     let mut obj = obj;
     let mut value = value;
     if is_slice(index) {
@@ -5362,9 +5366,15 @@ pub fn finditem_str_named(
             return Ok(unsafe { (*strategy).getitem_str(obj, key) });
         }
         // `finditem_str` / `getitem_str` take an rpython `str` (one GCREF).
-        // A realized `co_names_w` slot is that word; the borrowed `&str`
+        // A filled `co_names_w` slot is that word; the borrowed `&str`
         // spelling is two words and cannot be a residual argument.
-        let w_key = unsafe { crate::pycode::w_code_getname_w(pycode, nameindex) };
+        // `finditem_str` passes a null code object: it has no table, so the
+        // lookup is not asked to read one.
+        let w_key = if unsafe { crate::pycode::w_code_name_index_covered(pycode, nameindex) } {
+            unsafe { crate::pycode::w_code_getname_w(pycode, nameindex) }
+        } else {
+            pyre_object::PY_NULL
+        };
         if !w_key.is_null() {
             let hash = unsafe { pyre_object::unicodeobject::w_str_hash_memoized(w_key) };
             return match unsafe {
@@ -5443,6 +5453,9 @@ fn wrapped_key(key: &str, pycode: PyObjectRef, nameindex: usize) -> PyObjectRef 
 /// yet is realized (one interned string per name value), and a caller holding
 /// no code object gets zero.
 pub(crate) fn named_key_hash(key: &str, pycode: PyObjectRef, nameindex: usize) -> i64 {
+    if unsafe { !crate::pycode::w_code_name_index_covered(pycode, nameindex) } {
+        return 0;
+    }
     let w_name = unsafe { crate::pycode::w_code_getname_w(pycode, nameindex) };
     if w_name.is_null() {
         return 0;
@@ -8490,7 +8503,6 @@ unsafe fn instance_getattr_hook_or_err(
             pyre_object::gc_roots::shadow_stack_get(live),
             pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getattr__")),
         ) {
-
             let hook_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(getattr_fn);
             let name_slot = pyre_object::gc_roots::shadow_stack_len();

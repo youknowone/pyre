@@ -3014,7 +3014,8 @@ impl SharedOpcodeHandler for PyFrame {
         key: Self::Value,
         value: Self::Value,
     ) -> Result<(), PyError> {
-        setitem(obj, key, value).map(|_| ())
+        setitem(obj, key, value)?;
+        Ok(())
     }
 
     fn list_append(&mut self, list: Self::Value, value: Self::Value) -> Result<(), PyError> {
@@ -3059,7 +3060,8 @@ impl SharedOpcodeHandler for PyFrame {
         name: &str,
         value: Self::Value,
     ) -> Result<(), PyError> {
-        setattr_str(obj, name, value).map(|_| ())
+        setattr_str(obj, name, value)?;
+        Ok(())
     }
 }
 
