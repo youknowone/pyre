@@ -1,6 +1,9 @@
 //! Chordal graph coloring helper from `rpython/tool/algo/color.py`.
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use std::hash::BuildHasherDefault;
+
+use indexmap::IndexSet;
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
 /// Nodes are compiler-internal identities — a flow-graph `Variable`, a jitcode
 /// variable id — and upstream hashes them by object identity, so a probe there
@@ -118,23 +121,38 @@ impl<N: Eq + std::hash::Hash + Clone> DependencyGraph<N> {
     /// plus the length of each list in order, and every refinement writes the
     /// next `sigma` into a second pair of buffers that are then swapped in, so
     /// a step allocates nothing.
+    ///
+    /// The items of `sigma` are positions in `getnodes()`.  `x in neighb` is
+    /// answered from `marked[x]`, the step at which `x` was last entered as a
+    /// neighbour of the popped node, so a step looks up the popped node's
+    /// neighbours once instead of probing its neighbour set for every
+    /// remaining node.
     pub fn lexicographic_order(&self) -> Vec<N> {
-        let nodes = self.getnodes();
+        let nodes: IndexSet<N, BuildHasherDefault<FxHasher>> =
+            self.getnodes().into_iter().collect();
         if nodes.is_empty() {
             return Vec::new();
         }
-        let mut sigma_items: Vec<N> = nodes.into_iter().rev().collect();
+        let mut marked: Vec<usize> = vec![usize::MAX; nodes.len()];
+        let mut sigma_items: Vec<usize> = (0..nodes.len()).rev().collect();
         let mut sigma_lens: Vec<usize> = vec![sigma_items.len()];
-        let mut new_items: Vec<N> = Vec::with_capacity(sigma_items.len());
+        let mut new_items: Vec<usize> = Vec::with_capacity(sigma_items.len());
         let mut new_lens: Vec<usize> = Vec::new();
-        let mut s2: Vec<N> = Vec::new();
-        let mut result = Vec::new();
+        let mut s2: Vec<usize> = Vec::new();
+        let mut result = Vec::with_capacity(nodes.len());
         while !sigma_lens.is_empty() && sigma_lens[0] != 0 {
             // `v = sigma[0].pop()`: the popped item is left out of the
             // first list when it is split below.
-            let v = sigma_items[sigma_lens[0] - 1].clone();
-            let neighb = self.neighbours.get(&v);
-            result.push(v);
+            let v = &nodes[sigma_items[sigma_lens[0] - 1]];
+            let step = result.len();
+            if let Some(neighb) = self.neighbours.get(v) {
+                for n in neighb {
+                    if let Some(x) = nodes.get_index_of(n) {
+                        marked[x] = step;
+                    }
+                }
+            }
+            result.push(v.clone());
             new_items.clear();
             new_lens.clear();
             let mut start = 0;
@@ -145,11 +163,11 @@ impl<N: Eq + std::hash::Hash + Clone> DependencyGraph<N> {
                 // `s1` (the neighbours of `v`) goes straight into the new
                 // `sigma`; `s2` waits in its own buffer to follow it.
                 let s1_start = new_items.len();
-                for x in s {
-                    if neighb.is_some_and(|n| n.contains(x)) {
-                        new_items.push(x.clone());
+                for &x in s {
+                    if marked[x] == step {
+                        new_items.push(x);
                     } else {
-                        s2.push(x.clone());
+                        s2.push(x);
                     }
                 }
                 if new_items.len() != s1_start {
