@@ -640,14 +640,12 @@ pub fn bridge_fuel_take() -> bool {
     true
 }
 /// `MAJIT_NO_GUARD_RESUME_BRIDGE`: decline every bridge entry taken directly
-/// from a guard failure, so each one resumes through the blackhole and the
-/// bridge is grown from the next merge point instead.  Narrower than
-/// `MAJIT_NO_BRIDGE`, which suppresses bridge recording outright: this leaves
-/// the merge-point-grown bridges in place, so a wrong answer that survives
-/// `MAJIT_NO_BRIDGE` and disappears here is attributable to what the walk
-/// rebuilds from resume data rather than to bridges as such.  Costly — the
-/// blackhole arm reaches the merge point by interpreting — so it is a bisection
-/// tool, not a policy.  Off by default.
+/// from a guard failure. A decline means the blackhole resumes with no
+/// bridge.  Narrower than `MAJIT_NO_BRIDGE` only in which entry it declines:
+/// this flag returns before `start_bridge_tracing` inside
+/// `bridge_from_guard_resume_position`, and that failure records nothing.
+/// Costly — the blackhole arm reaches the merge point by interpreting — so
+/// it is a bisection tool, not a policy.  Off by default.
 fn no_guard_resume_bridge_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_NO_GUARD_RESUME_BRIDGE").is_some())
@@ -2025,17 +2023,6 @@ fn install_state_field_fvc(data: &StateFieldFvcData) {
         }
         *slot = Some(data.clone());
     });
-}
-
-/// The identity slots `base .. base + count` of a blackhole register bank,
-/// clamped to what the bank actually holds.
-///
-/// A frame whose jitcode declares fewer registers than the layout describes is
-/// not a frame the state can have been written through, so a clamped-empty span
-/// compares equal and says so.
-fn bank_span(bank_len: usize, base: usize, count: usize) -> std::ops::Range<usize> {
-    let start = base.min(bank_len);
-    start..(start + count).min(bank_len)
 }
 
 /// Why [`JitDriver::bridge_from_guard_resume_position`] gave the guard's own
@@ -5468,10 +5455,9 @@ impl<S: JitState> JitDriver<S> {
     /// own position — so the rest of the opcode the guard sits inside is
     /// recorded into the bridge.
     ///
-    /// Reaching the same point through the blackhole instead cannot record it:
-    /// the blackhole stops at the next merge point and the bridge is grown
-    /// from THAT position, so the opcode's tail runs once, here, and every
-    /// later failure jumps into a bridge that does not contain it.
+    /// A decline means the blackhole resumes with no bridge. The blackhole
+    /// stops at the next merge point and returns that pc, and nothing records
+    /// a trace from there.
     ///
     /// Returns the interpreter position to resume at, or `None` when the
     /// bridge could not be entered AT ALL — the caller then takes the
@@ -6903,44 +6889,10 @@ impl<S: JitState> JitDriver<S> {
                     // (resume.py:1028-1038 seeded it in slot order) and resume
                     // at the CRN green pc.
                     let mut cur_exc = exc;
-                    let mut bh_frames_popped = 0usize;
-                    bh.called_residual.set(false);
-                    // The state fields as the walk found them: the identity
-                    // slots of each bank, which for the int bank is the scalars
-                    // and every array element both.
-                    let sf_i = bank_span(
-                        bh.registers_i.len(),
-                        sf_layout.int_scalar_base,
-                        sf_layout.total_slots(),
-                    );
-                    let sf_r = bank_span(
-                        bh.registers_r.len(),
-                        sf_layout.ref_scalar_base,
-                        sf_layout.num_ref_scalars,
-                    );
-                    let sf_f = bank_span(
-                        bh.registers_f.len(),
-                        sf_layout.float_scalar_base,
-                        sf_layout.num_float_scalars,
-                    );
-                    // Three register-bank copies, and their only purpose is
-                    // `guard_may_bridge` below, whose only reader takes them
-                    // under `should_bridge`. A guard the counter has not
-                    // fired for pays them on every failure and asks nothing
-                    // of them, and that is the common case by orders of
-                    // magnitude.
-                    let sf_before = should_bridge.then(|| {
-                        (
-                            bh.registers_i[sf_i.clone()].to_vec(),
-                            bh.registers_r[sf_r.clone()].to_vec(),
-                            bh.registers_f[sf_f.clone()].to_vec(),
-                        )
-                    });
                     let outcome = loop {
                         match bh.resume_mainloop(cur_exc) {
                             Ok(next_exc) => match bh.nextblackholeinterp.take() {
                                 Some(caller) => {
-                                    bh_frames_popped += 1;
                                     // Layout + vinfo were seeded across the
                                     // whole chain before the loop started.
                                     bh_builder.release_interp(bh);
@@ -6961,55 +6913,14 @@ impl<S: JitState> JitDriver<S> {
                     if crate::majit_log_enabled() {
                         eprintln!("[bh] back_edge_internal: chain resume → {:?}", outcome);
                     }
-                    // Whether the guard may source a bridge FROM HERE.
-                    //
-                    // This is the fallback bridge — the one recorded from the
-                    // green pc the walk below reports, taken only when
-                    // `bridge_from_guard_resume_position` declined and the
-                    // blackhole ran. Its entry is the NEXT merge point, so
-                    // everything the walk ran to get there is the tail of the
-                    // opcode the guard sits inside, and the bridge does not
-                    // contain it: the first failure runs it here and every later
-                    // one jumps into the bridge and skips it. A bridge entered
-                    // at the guard's own position has no such gap and is not
-                    // gated.
-                    //
-                    // Values the tail computed are not the problem. The bridge
-                    // is recorded against the state the walk LEFT, so whatever
-                    // the tail derived it derives again. Two things do not come
-                    // back that way:
-                    //
-                    //   * a residual call, which left the interpreter once and
-                    //     is not a value the bridge can recompute, and
-                    //   * a state field the tail wrote, because the bridge is
-                    //     ENTERED with the guard's failargs, which hold the
-                    //     value from before the tail ran.
-                    //
-                    // Neither announces itself: the guard, the recovery layout
-                    // and this resume are all correct, and the loop keeps
-                    // running. Only a count of how often the opcode's tail
-                    // actually happened records it.
-                    //
-                    // A walk that crossed a frame boundary is not judged by one
-                    // frame's registers, so it does not qualify — and cannot be:
-                    // each pop above rebinds `bh` to its caller, while the spans
-                    // were measured against the bank of the frame the guard
-                    // failed in. The frame-count test therefore has to come
-                    // first, so the comparison is reached only while the spans
-                    // still describe the bank they are indexing.
-                    let guard_may_bridge = match &sf_before {
-                        Some((before_i, before_r, before_f)) => {
-                            bh_frames_popped == 0
-                                && !bh.called_residual.get()
-                                && bh.registers_i[sf_i] == before_i[..]
-                                && bh.registers_r[sf_r] == before_r[..]
-                                && bh.registers_f[sf_f] == before_f[..]
-                        }
-                        // Only reachable with `should_bridge` false, where the
-                        // reader below short-circuits before asking.
-                        None => false,
-                    };
-                    let mut portal_crn_handled = false;
+                    // `compile.py` `resume_in_blackhole`. The walk runs the
+                    // reconstructed chain to the next merge point (or out of
+                    // the frame) and hands that pc back to the interpreter.
+                    // It does not record a bridge: `handle_fail` already
+                    // tried `_trace_and_compile_from_bridge` from the guard's
+                    // own resumedescr, and a decline is the blackhole branch,
+                    // not a second trace started at the merge point the walk
+                    // stopped on.
                     let resume_pc = match outcome {
                         // Next merge point reached (loop back-edge): flush the
                         // register file into the live state and resume the
@@ -7035,7 +6946,7 @@ impl<S: JitState> JitDriver<S> {
                                 );
                             }
                             if let Some(pc) = green_pc {
-                                portal_crn_handled = crate::handle_portal_crn_hook(target_pc, pc);
+                                let _ = crate::handle_portal_crn_hook(target_pc, pc);
                             }
                             // `restore_banked` consumes both banks densely
                             // (int slot j at index j, ref scalar j at index
@@ -7179,51 +7090,12 @@ impl<S: JitState> JitDriver<S> {
                         }
                     };
                     bh_builder.release_interp(bh);
-                    // `start_bridge_tracing` below executes the portal while
-                    // this call is still on the stack.  Return the builder to
-                    // its pool first: otherwise that re-entrant execution sees
-                    // an empty `BACK_EDGE_BH_BUILDER`, constructs a second
-                    // builder, and then drops its blackhole frames (including
-                    // their merge-point Vec capacities) when the nested lease
-                    // cannot be re-pooled.  RPython's
                     // `BlackholeInterpBuilder.release_interp` makes the frame
-                    // reusable as soon as `_run_forever` is done; bridge
-                    // tracing does not retain the builder.
+                    // reusable as soon as `_run_forever` is done. The
+                    // interpreter may re-enter the portal on the pc we return,
+                    // so the builder goes back to the pool before that.
                     drop(bh_builder);
                     if let Some(pc) = resume_pc {
-                        // compile.py _trace_and_compile_from_bridge,
-                        // deferred to here so the bridge records from the GREEN
-                        // resume pc the blackhole reported (`pc`), not the
-                        // jitcode-space `guard_resume_pc`. `pc == usize::MAX`
-                        // means the frame ran to completion in the blackhole
-                        // (DoneWithThisFrame) with no forward green pc to trace
-                        // from — nothing to bridge, just exit. The blackhole has
-                        // already recovered `state` to the resume point, so the
-                        // bridge sees the post-guard-failure values.
-                        if should_bridge
-                            && guard_may_bridge
-                            && !portal_crn_handled
-                            && pc != usize::MAX
-                        {
-                            let raw_values = raw_values_for_bridge.get_or_insert_with(|| {
-                                result.deadframe.as_ref().map_or_else(Vec::new, |frame| {
-                                    self.meta.raw_exit_slots_from_deadframe(frame, fd)
-                                })
-                            });
-                            let bridge_ok = self.start_bridge_tracing(
-                                &descr_arc, state, env, raw_values, pc,
-                                // The blackhole above already applied this
-                                // guard's writes; recording is the whole
-                                // job here.
-                                false,
-                            );
-                            if crate::majit_log_enabled() {
-                                eprintln!(
-                                    "[bridge] start_bridge_tracing (green resume) key={} trace={} fail={} resume_pc={} ok={}",
-                                    green_key, trace_id, fail_index, pc, bridge_ok
-                                );
-                            }
-                        }
                         if let Some(raw_values) = raw_values_for_bridge {
                             self.exit_raw_scratch_out(raw_values);
                         }

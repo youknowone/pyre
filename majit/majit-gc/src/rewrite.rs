@@ -1186,36 +1186,6 @@ impl RewriteState {
         }
     }
 
-    /// True when a still-pending ZERO_ARRAY for `array` covers `index`.
-    ///
-    /// `emit_pending_zeros` trims an already-emitted ZERO_ARRAY using
-    /// every SETARRAYITEM index recorded so far, including stores that
-    /// run after this load.  If the load still depends on that zero
-    /// (the slot is in range and has not been stored yet), freeze the
-    /// range now so a later store cannot skip the cell being read.
-    /// A non-constant index is treated as covering, because it may
-    /// land anywhere in the pending range.  An already-stored slot
-    /// does not cover: the load observes the store, and trimming that
-    /// index stays valid.
-    fn pending_zero_covers_read(&self, array: &Operand, index: &Operand) -> bool {
-        let key = array.to_opref();
-        let Some(pz) = self.pending_zeros.iter().find(|pz| pz.array_ref == key) else {
-            return false;
-        };
-        match self.resolve_constant(index) {
-            None => true,
-            Some(idx) if idx < 0 => false,
-            Some(idx) => {
-                let idx = idx as usize;
-                idx < pz.length
-                    && !self
-                        .initialized_indices
-                        .get(&key)
-                        .is_some_and(|s| s.contains(&idx))
-            }
-        }
-    }
-
     /// rewrite.py emit_pending_zeros.
     ///
     /// Mutates each previously-emitted ZERO_ARRAY in place: trim from
@@ -2528,13 +2498,9 @@ impl GcRewriterImpl {
         (factor, offset, ScaledIndex::Passthrough(index_box.clone()))
     }
 
-    /// rewrite.py handle_getarrayitem.
-    /// Lowers GETARRAYITEM_{GC,RAW}_{I,R,F} (including the PURE variants,
-    /// per rewrite.py:216-219) into GC_LOAD / GC_LOAD_INDEXED by
-    /// forwarding the op through `emit_gc_load_or_indexed`.
-    /// If a pending ZERO_ARRAY still covers the index being read,
-    /// freeze that range first so a later SETARRAYITEM cannot trim
-    /// the already-emitted zero out from under the load.
+    /// rewrite.py `handle_getarrayitem`.
+    /// Lowers GETARRAYITEM_{GC,RAW}_{I,R,F}, including the PURE variants,
+    /// into GC_LOAD / GC_LOAD_INDEXED through `emit_gc_load_or_indexed`.
     fn handle_getarrayitem(&self, op: &Op, st: &mut RewriteState) {
         let descr = op.getdescr().expect("GETARRAYITEM needs ArrayDescr");
         let ad = descr
@@ -2545,9 +2511,6 @@ impl GcRewriterImpl {
         let sign = ad.is_item_signed();
         let ptr = st.resolve(op.arg(0));
         let index = st.resolve(op.arg(1));
-        if st.pending_zero_covers_read(&ptr, &index) {
-            st.emit_pending_zeros();
-        }
         self.emit_gc_load_or_indexed(op, ptr, index, itemsize, itemsize, ofs, sign, st);
     }
 
@@ -2747,9 +2710,6 @@ impl GcRewriterImpl {
             let sign = fd.is_field_signed();
             let ptr = st.resolve(op.arg(0));
             let index = st.resolve(op.arg(1));
-            if st.pending_zero_covers_read(&ptr, &index) {
-                st.emit_pending_zeros();
-            }
             self.emit_gc_load_or_indexed(op, ptr, index, fieldsize, itemsize, ofs, sign, st);
             return false;
         }
@@ -6073,75 +6033,6 @@ mod tests {
                 .expect("inline ConstInt"),
             12,
             "byte length"
-        );
-    }
-
-    #[test]
-    fn test_pending_zero_getarrayitem_before_setarrayitem() {
-        // NEW_ARRAY_CLEAR(5); GETARRAYITEM(0); SETARRAYITEM(0).
-        // emit_pending_zeros trims ZERO_ARRAY from both ends using every
-        // SETARRAYITEM index recorded before the flush, including stores
-        // that run after this load.  The GETARRAYITEM still depends on
-        // slot 0 being zeroed, so the pending range must freeze at the
-        // read: SETARRAYITEM(0) must not shrink ZERO_ARRAY off index 0.
-        let mut rw = make_rewriter();
-        rw.malloc_zero_filled = false;
-        let new_array = Op::with_descr(
-            OpCode::NewArrayClear,
-            &[ro(OpRef::int_op(5))],
-            array_descr_int(),
-        );
-        new_array.pos().set(OpRef::ref_op(0));
-        let constants = const_pool(&[(5, 5), (10, 0)]);
-        let get = Op::with_descr(
-            OpCode::GetarrayitemGcI,
-            &[ro(OpRef::ref_op(0)), ro(OpRef::int_op(10))],
-            array_descr_int(),
-        );
-        get.pos().set(OpRef::int_op(20));
-
-        let ops = vec![
-            new_array,
-            get,
-            Op::with_descr(
-                OpCode::SetarrayitemGc,
-                &[
-                    ro(OpRef::ref_op(0)),
-                    ro(OpRef::int_op(10)),
-                    ro(OpRef::int_op(100)),
-                ],
-                array_descr_int(),
-            ),
-            Op::new(OpCode::Finish, &[]),
-        ];
-
-        let (result, _out_consts, _gcrefs) = rw.rewrite_ops_with_constants(&ops, &constants);
-
-        let zeros: Vec<_> = result
-            .iter()
-            .filter(|o| o.opcode == OpCode::ZeroArray)
-            .collect();
-        assert_eq!(zeros.len(), 1, "should emit exactly one ZERO_ARRAY");
-        // item_size = 4: covering index 0 of length 5 → byte_start=0,
-        // byte_len=20.  A trim that skipped the read would be start=1
-        // (byte_start=4) or a zero-length no-op.
-        assert_eq!(
-            zeros[0]
-                .arg(1)
-                .to_opref()
-                .inline_const_bits()
-                .expect("inline ConstInt"),
-            0,
-            "byte start must still cover index 0"
-        );
-        assert_eq!(
-            zeros[0]
-                .arg(2)
-                .to_opref()
-                .inline_const_bits()
-                .expect("inline ConstInt"),
-            20,
-            "byte length must still cover index 0 of length 5"
         );
     }
 

@@ -3778,7 +3778,6 @@ mod tests {
             "getlistitem_gc_i/ridd>i",
             "getlistitem_gc_r/ridd>r",
             "guard_class/r>i",
-            "int_between/iii>i",
             "newlist/idddd>r",
             "newlist_clear/idddd>r",
             "newlist_hint/idddd>r",

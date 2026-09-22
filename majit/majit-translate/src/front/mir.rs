@@ -3130,8 +3130,9 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             );
         }
         // The `(a..=b).contains(&x)` fold (`front::range_contains`) splices
-        // the residual `contains` method call in place with native
-        // `bitand(le(a, x), ge(b, x))` compares and removes the paired
+        // the residual `contains` method call in place with
+        // `int_between(a, x, b + 1)` (two comparisons when `b` is
+        // `i64::MAX`) and removes the paired
         // residual `RangeInclusive::new` call in its predecessor block.  It
         // threads the `new` bounds into the `contains` block via
         // `ensure_variable_at_block` (touching predecessor link args /
@@ -3139,7 +3140,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // cross-block `new` producer leaves its threaded range value dangling
         // on the predecessor link arg, so a rewrite MUST be followed by
         // `prune_dead_phis` to reclaim the dead threaded range inputarg /
-        // link args (the compares never read them) — run it unconditionally
+        // link args (the folded predicate never reads them) — run it unconditionally
         // on any rewrite rather than relying on the gated sweep in
         // `simplify_lowered_graph`.  Fail-safe: a structural mismatch leaves
         // BOTH residual calls (rtyper Skip) and touches nothing.
@@ -4535,7 +4536,7 @@ struct Lowering<'a> {
     /// [`crate::front::saturating_sub::SaturatingSubSite`]).
     saturating_sub_sites: Vec<crate::front::saturating_sub::SaturatingSubSite>,
     /// `RangeInclusive::new(lo, hi)` call sites recorded for the
-    /// `(a..=b).contains(&x)` → `bitand(le, ge)` fold the
+    /// `(a..=b).contains(&x)` → `int_between(lo, x, hi + 1)` fold the
     /// `front::range_contains` post-pass synthesizes (see
     /// [`crate::front::range_contains::RangeInclusiveNewSite`]).
     range_inclusive_new_sites: Vec<crate::front::range_contains::RangeInclusiveNewSite>,
@@ -38003,7 +38004,7 @@ mod tests {
     /// (`(0..=255)`, constant bounds) and `c_int_w` (`(i32::MIN as
     /// i64..=i32::MAX as i64)`, NON-constant bounds).  For each, both
     /// residual range calls (`RangeInclusive::new` / `contains`) must be
-    /// gone and native `le` / `ge` / `bitand` compares present.  Ignored
+    /// gone and an `int_between` op present.  Ignored
     /// by default (loads the real LLBC); run with `cargo test -p
     /// majit-translate --lib range_contains_fold_real -- --ignored
     /// --nocapture`.
@@ -38039,14 +38040,18 @@ mod tests {
                     })
                     .count()
             };
-            let binops = |name: &str| {
-                graph
-                    .blocks
-                    .iter()
-                    .flat_map(|b| b.operations.iter())
-                    .filter(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == name))
-                    .count()
-            };
+            let int_between = graph
+                .blocks
+                .iter()
+                .flat_map(|b| b.operations.iter())
+                .filter(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::LoweredBlackholeOp { opname, args }
+                            if opname == "int_between" && args.len() == 3
+                    )
+                })
+                .count();
 
             assert_eq!(
                 range_call("new"),
@@ -38059,16 +38064,8 @@ mod tests {
                 "{fname}: residual contains removed"
             );
             assert!(
-                binops("le") >= 1,
-                "{fname}: at least one `le` compare emitted"
-            );
-            assert!(
-                binops("ge") >= 1,
-                "{fname}: at least one `ge` compare emitted"
-            );
-            assert!(
-                binops("bitand") >= 1,
-                "{fname}: at least one `bitand` emitted"
+                int_between >= 1,
+                "{fname}: int_between(lo, x, hi + 1) emitted"
             );
         }
     }
