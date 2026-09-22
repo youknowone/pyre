@@ -1185,6 +1185,7 @@ fn stamp_classdef_hints_on_graph(
                 target:
                     CallTarget::Method {
                         resolved_path: None,
+                        fun_decl_id: None,
                         name: method_name,
                         ..
                     },

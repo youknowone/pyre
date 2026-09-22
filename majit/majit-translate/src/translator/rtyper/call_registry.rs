@@ -74,7 +74,7 @@ use crate::flowspace::pygraph::PyGraph;
 
 /// Stable hashable key for a function path.
 ///
-/// Pyre's `CallTarget::FunctionPath { segments }` uses `Vec<String>`;
+/// Pyre's `CallTarget::FunctionPath { segments, .. }` uses `Vec<String>`;
 /// the registry keys directly off that vector so equal paths share
 /// the same entry without an intermediate hash truncation.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]

@@ -81,7 +81,7 @@ pub(crate) fn checked_arith_ovf_opname(leaf: &str) -> Option<&'static str> {
 /// type at the recording site, this records a checked-arith candidate;
 /// the rewrite itself validates the surrounding match shape.
 pub(crate) fn is_checked_arith_target(target: &CallTarget) -> bool {
-    let CallTarget::FunctionPath { segments } = target else {
+    let CallTarget::FunctionPath { segments, .. } = target else {
         return false;
     };
     let [first, .., module, impl_seg, leaf] = segments.as_slice() else {
@@ -245,7 +245,7 @@ fn rewire_one_checked_arith_site(
     // `_ovf` opname from the callee leaf.
     let (lhs, rhs, ovf_opname) = match &graph.blocks[a].operations[call_idx].kind {
         OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } if args.len() == 2 => {
@@ -711,6 +711,7 @@ mod tests {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            fun_decl_id: None,
         }
     }
 

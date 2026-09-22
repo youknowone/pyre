@@ -85,7 +85,7 @@ fn calls_to(graph: &FunctionGraph, leaf: &str) -> usize {
         .flat_map(|b| b.operations.iter())
         .filter(|op| match &op.kind {
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
+                target: CallTarget::FunctionPath { segments, .. },
                 ..
             } => segments.last().is_some_and(|s| s == leaf),
             _ => false,
@@ -454,7 +454,7 @@ fn reachable_closes(graph: &FunctionGraph) -> usize {
             .iter()
             .filter(|op| {
                 matches!(&op.kind,
-                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if segments.last().is_some_and(|s| s == "root_scope_close"))
             })
             .count();

@@ -144,7 +144,7 @@ fn vable_array_len_lowers_to_arraylen_not_a_call() {
                 // The `__len` retargeting `is_container_len` gives the
                 // non-virtualizable length-prefixed containers.
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     args,
                     ..
                 } if segments == &["__len".to_string()] && args.iter().any(|a| a == &array_var) => {
@@ -261,7 +261,7 @@ fn address_of_the_vable_array_slot_is_marked_not_a_read() {
                     b.operations.iter().any(|o| {
                         matches!(
                             &o.kind,
-                            OpKind::Call { target: CallTarget::FunctionPath { segments }, args, .. }
+                            OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, args, .. }
                                 if segments.last().is_some_and(|s| s == "try_gc_add_root")
                                     && args.iter().any(|a| carried.contains(a))
                         )

@@ -178,7 +178,7 @@ mod tests {
                 matches!(
                     &op.kind,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if segments.as_slice() == ["simple_call"]
                 )
@@ -204,7 +204,7 @@ mod tests {
             .iter()
             .find_map(|op| match &op.kind {
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments.as_slice() == ["simple_call"] => op.result.clone(),
                 _ => None,
@@ -215,7 +215,7 @@ mod tests {
             .iter()
             .find_map(|op| match &op.kind {
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     args,
                     ..
                 } if segments.as_slice() == ["type"] => Some((op.result.clone(), args.clone())),

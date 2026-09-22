@@ -646,6 +646,7 @@ fn emit_ll_arraycopy_call(
         OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: vec!["ll_arraycopy".into()],
+                fun_decl_id: None,
             },
             args: crate::model::call_args(vec![l1, new_list.clone(), start, dest_start, newlength]),
             result_ty: ValueType::Void,
@@ -666,7 +667,7 @@ pub fn is_getslice_rangefrom(op: &SpaceOperation) -> bool {
     matches!(
         &op.kind,
         OpKind::Call {
-            target: crate::model::CallTarget::FunctionPath { segments },
+            target: crate::model::CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } if segments.len() == 1 && segments[0] == "__getslice_rangefrom" && args.len() == 2
@@ -678,7 +679,7 @@ pub fn is_getslice_minusone(op: &SpaceOperation) -> bool {
     matches!(
         &op.kind,
         OpKind::Call {
-            target: crate::model::CallTarget::FunctionPath { segments },
+            target: crate::model::CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } if segments.len() == 1 && segments[0] == "__getslice_minusone" && args.len() == 1
@@ -690,7 +691,7 @@ pub fn is_getslice_rangeto(op: &SpaceOperation) -> bool {
     matches!(
         &op.kind,
         OpKind::Call {
-            target: crate::model::CallTarget::FunctionPath { segments },
+            target: crate::model::CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } if segments.len() == 1 && segments[0] == "__getslice_rangeto" && args.len() == 2
@@ -702,7 +703,7 @@ pub fn is_getslice_range(op: &SpaceOperation) -> bool {
     matches!(
         &op.kind,
         OpKind::Call {
-            target: crate::model::CallTarget::FunctionPath { segments },
+            target: crate::model::CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } if segments.len() == 1 && segments[0] == "__getslice_range" && args.len() == 3
@@ -741,7 +742,7 @@ mod tests {
             start.operations.iter().any(|op| matches!(
                 &op.kind,
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments == &["ll_arraycopy"]
             )),
@@ -784,7 +785,7 @@ mod tests {
                 matches!(
                     &op.kind,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if segments == &["ll_arraycopy"]
                 )
@@ -827,7 +828,7 @@ mod tests {
                 matches!(
                     &op.kind,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if segments == &["ll_arraycopy"]
                 )
@@ -838,6 +839,7 @@ mod tests {
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__getslice_rangeto".into()],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![Variable::new(), Variable::new()]),
                 result_ty: ValueType::Ref(None),
@@ -872,7 +874,7 @@ mod tests {
                 matches!(
                     &op.kind,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if segments == &["ll_arraycopy"]
                 )
@@ -889,6 +891,7 @@ mod tests {
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__getslice_range".into()],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![
                     Variable::new(),
@@ -1032,6 +1035,7 @@ mod tests {
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec![first.last_segment().unwrap().to_string()],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![Variable::new(), Variable::new()]),
                 result_ty: ValueType::Ref(None),
@@ -1056,6 +1060,7 @@ mod tests {
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec![first.last_segment().unwrap().to_string()],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![Variable::new()]),
                 result_ty: ValueType::Ref(None),
@@ -1067,6 +1072,7 @@ mod tests {
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__getslice_minusone".into()],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![Variable::new()]),
                 result_ty: ValueType::Ref(None),

@@ -8530,12 +8530,11 @@ fn interior_field_ops_compile() {
     assert_eq!(shl, 3, "two size-16 interior ops and one size-8 RAW store");
 }
 
-/// A ref-typed SETINTERIORFIELD_GC that skipped rewrite must fail the same
-/// way SETFIELD_GC / SETARRAYITEM_GC do: rewrite emits COND_CALL_GC_WB
-/// before that store, and codegen must not write the pointer silently.
+/// A ref-typed SETINTERIORFIELD_GC that the GC rewrite did not lower is
+/// declined. Codegen must not store the pointer itself.
 #[test]
 #[should_panic(
-    expected = "wasm codegen: SetinteriorfieldGc must have been lowered by rewrite_ops_for_gc"
+    expected = "wasm codegen: SetinteriorfieldGc reached codegen without the GC rewrite"
 )]
 fn setinteriorfield_gc_ref_without_rewrite_is_rejected() {
     use majit_ir::descr::{
@@ -10758,8 +10757,11 @@ fn call_malloc_nursery_variants_lower() {
     let inputs = nursery_new_inputs(vec![varsize, finish_int_arg0()], 53);
     let (bytes, _, _, _) = codegen::build_wasm_module(&inputs).expect("varsize should lower");
     validate_wasm(&bytes);
-    assert_eq!(nursery_top_compare_count(&bytes), 0);
-    assert!(const_immediates(&bytes).contains(&0x22));
+    assert_eq!(nursery_top_compare_count(&bytes), 1);
+    assert!(
+        const_immediates(&bytes).contains(&0x22),
+        "oversize / full-nursery arm keeps the array helper"
+    );
 }
 
 #[test]

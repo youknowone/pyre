@@ -4131,6 +4131,29 @@ fn nursery_header_tid_store(
     })
 }
 
+/// `CALL_MALLOC_NURSERY_VARSIZE` slow arm: the arity-5 array helper
+/// (`wasm_jit_alloc_array(type_id, base_size, item_size, length, len_offset)`).
+fn emit_alloc_array_helper(
+    sink: &mut PeepSink<'_, '_>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &ValueLocals,
+    type_id: i64,
+    base_size: i64,
+    itemsize: OpRef,
+    length: OpRef,
+    len_offset: i64,
+    new_array_fn_ptr: i64,
+    residual_type_base: u32,
+) {
+    sink.i64_const(type_id);
+    sink.i64_const(base_size);
+    emit_resolve(sink, constants, value_types, itemsize);
+    emit_resolve(sink, constants, value_types, length);
+    sink.i64_const(len_offset);
+    sink.i32_const(new_array_fn_ptr as i32);
+    sink.call_indirect(0, residual_type_base + 5);
+}
+
 pub(crate) const BUILTIN_STRING_HASH_OFFSET: usize = 0;
 pub(crate) const BUILTIN_STRING_HASH_SIZE: usize = std::mem::size_of::<usize>();
 pub(crate) const BUILTIN_STRING_LEN_OFFSET: usize = std::mem::size_of::<usize>();
@@ -8332,7 +8355,11 @@ fn build_function(
                 }
             }
             OpCode::CallMallocNurseryVarsize => {
-                // The arity-5 array helper can return old-gen.
+                // x86 `malloc_cond_varsize`: bump `nursery_free` by the
+                // 8-aligned `length * itemsize + basesize + header` when the
+                // length is young-sized, write tid, and return the payload.
+                // Oversize / a full nursery falls through to the arity-5
+                // array helper (which may return old-gen).
                 let vi = op.pos().get().raw();
                 let Some(base) = residual_type_base else {
                     return Err(BackendError::Unsupported(
@@ -8351,13 +8378,136 @@ fn build_function(
                     )
                 })?;
                 let len_offset = ad.len_descr().map_or(0i64, |ld| ld.offset() as i64);
-                sink.i64_const(ad.type_id() as i64);
-                sink.i64_const(ad.base_size() as i64);
-                emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref());
-                emit_resolve(&mut sink, constants, value_types, op.arg(2).to_opref());
-                sink.i64_const(len_offset);
-                sink.i32_const(alloc.new_array_fn_ptr as i32);
-                sink.call_indirect(0, base + 5);
+                let type_id = ad.type_id() as i64;
+                let base_size = ad.base_size() as i64;
+                let itemsize = op.arg(1).to_opref();
+                let length = op.arg(2).to_opref();
+                let header = GcHeader::SIZE as i64;
+                let word = std::mem::size_of::<usize>() as i64;
+                let inlined = nursery.is_some();
+                if let Some(na) = nursery {
+                    let max_length = na.large_threshold.saturating_sub(2 * word as usize) as i64;
+                    emit_resolve(&mut sink, constants, value_types, length);
+                    sink.i64_const(max_length);
+                    sink.i64_gt_u();
+                    sink.if_(BlockType::Result(ValType::I64));
+                    emit_alloc_array_helper(
+                        &mut sink,
+                        constants,
+                        value_types,
+                        type_id,
+                        base_size,
+                        itemsize,
+                        length,
+                        len_offset,
+                        alloc.new_array_fn_ptr,
+                        base,
+                    );
+                    emit_reload_frame_if_necessary(
+                        &mut sink,
+                        residual_type_base,
+                        ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
+                    );
+                    emit_reload_refs_from_homes(
+                        &mut sink,
+                        value_types,
+                        ref_homes,
+                        &liveness,
+                        op_idx,
+                        (!OpRef::raw_is_constant(vi)).then_some(vi),
+                        frame,
+                    );
+                    sink.else_();
+                    sink.i32_const(na.free_addr as i32);
+                    sink.i32_load(MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    sink.local_tee(alloc_scratch_local);
+                    emit_resolve(&mut sink, constants, value_types, length);
+                    emit_resolve(&mut sink, constants, value_types, itemsize);
+                    sink.i64_mul();
+                    sink.i64_const(base_size + header + 7);
+                    sink.i64_add();
+                    sink.i64_const(!7i64);
+                    sink.i64_and();
+                    sink.i32_wrap_i64();
+                    sink.i32_add();
+                    sink.local_tee(alloc_size_local);
+                    sink.i32_const(na.top_addr as i32);
+                    sink.i32_load(MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    sink.i32_gt_u();
+                    sink.if_(BlockType::Result(ValType::I64));
+                    emit_alloc_array_helper(
+                        &mut sink,
+                        constants,
+                        value_types,
+                        type_id,
+                        base_size,
+                        itemsize,
+                        length,
+                        len_offset,
+                        alloc.new_array_fn_ptr,
+                        base,
+                    );
+                    emit_reload_frame_if_necessary(
+                        &mut sink,
+                        residual_type_base,
+                        ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
+                    );
+                    emit_reload_refs_from_homes(
+                        &mut sink,
+                        value_types,
+                        ref_homes,
+                        &liveness,
+                        op_idx,
+                        (!OpRef::raw_is_constant(vi)).then_some(vi),
+                        frame,
+                    );
+                    sink.else_();
+                    sink.i32_const(na.free_addr as i32);
+                    sink.local_get(alloc_size_local);
+                    sink.i32_store(MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    // Fast path writes tid (`malloc_cond_varsize`); rewrite
+                    // does not emit `gen_initialize_tid` after a varsize bump.
+                    sink.local_get(alloc_scratch_local);
+                    sink.i64_const(type_id);
+                    sink.i64_store(MemArg {
+                        offset: 0,
+                        align: 3,
+                        memory_index: 0,
+                    });
+                    sink.local_get(alloc_scratch_local);
+                    sink.i32_const(GcHeader::SIZE as i32);
+                    sink.i32_add();
+                    sink.i64_extend_i32_u();
+                    sink.end();
+                    sink.end();
+                } else {
+                    emit_alloc_array_helper(
+                        &mut sink,
+                        constants,
+                        value_types,
+                        type_id,
+                        base_size,
+                        itemsize,
+                        length,
+                        len_offset,
+                        alloc.new_array_fn_ptr,
+                        base,
+                    );
+                }
                 if !OpRef::raw_is_constant(vi) {
                     sink.local_set(value_types.local(vi));
                 } else {
@@ -8372,22 +8522,24 @@ fn build_function(
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
                 );
-                let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
-                emit_reload_frame_if_necessary(
-                    &mut sink,
-                    residual_type_base,
-                    ca.ca_reload_fn_ptr,
-                    ca.jf_top_addr,
-                );
-                emit_reload_refs_from_homes(
-                    &mut sink,
-                    value_types,
-                    ref_homes,
-                    &liveness,
-                    op_idx,
-                    skip,
-                    frame,
-                );
+                if !inlined {
+                    let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
+                    emit_reload_frame_if_necessary(
+                        &mut sink,
+                        residual_type_base,
+                        ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
+                    );
+                    emit_reload_refs_from_homes(
+                        &mut sink,
+                        value_types,
+                        ref_homes,
+                        &liveness,
+                        op_idx,
+                        skip,
+                        frame,
+                    );
+                }
             }
             OpCode::CallMallocNurseryVarsizeFrame => {
                 let vi = op.pos().get().raw();

@@ -283,6 +283,7 @@ fn rewire_one_slice_first_site(
                     kind: OpKind::Call {
                         target: CallTarget::FunctionPath {
                             segments: vec!["__len".to_string()],
+                            fun_decl_id: None,
                         },
                         args: crate::model::call_args(vec![slice_in_then.clone()]),
                         result_ty: ValueType::Int,
@@ -317,6 +318,7 @@ fn rewire_one_slice_first_site(
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["__string_byte_getitem".to_string()],
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![slice_in_then, item_index]),
                     result_ty: ValueType::Int,
@@ -350,6 +352,7 @@ fn rewire_one_slice_first_site(
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["__getslice_rangefrom".to_string()],
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![slice_in_then, start_in_then]),
                     result_ty: site.payload_ty.clone(),
@@ -414,6 +417,7 @@ fn rewire_one_slice_first_site(
         kind: OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: vec!["__len".to_string()],
+                fun_decl_id: None,
             },
             args: crate::model::call_args(vec![slice.clone()]),
             result_ty: ValueType::Int,
@@ -434,6 +438,7 @@ fn rewire_one_slice_first_site(
                         "rarithmetic".to_string(),
                         "r_uint".to_string(),
                     ],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![len]),
                 result_ty: ValueType::Unsigned,
@@ -525,6 +530,7 @@ mod tests {
                             "<Impl>".into(),
                             "first".into(),
                         ],
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![slice.clone()]),
                     result_ty: ValueType::Ref(None),
@@ -545,7 +551,7 @@ mod tests {
         assert!(
             !g.blocks[a.0].operations.iter().any(|op| matches!(
                 &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments.last().map(String::as_str) == Some("first")
             )),
             "residual first call removed from A"
@@ -554,7 +560,7 @@ mod tests {
         assert!(
             g.blocks[a.0].operations.iter().any(|op| matches!(
                 &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments.first().map(String::as_str) == Some("__len")
             )),
             "A synthesizes the __len guard"
@@ -601,6 +607,7 @@ mod tests {
                             "<Impl>".into(),
                             "last".into(),
                         ],
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![slice]),
                     result_ty: ValueType::Ref(None),
@@ -661,6 +668,7 @@ mod tests {
                             "<Impl>".into(),
                             "last".into(),
                         ],
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![slice]),
                     result_ty: ValueType::Int,
@@ -704,6 +712,7 @@ mod tests {
                             "<Impl>".into(),
                             "last".into(),
                         ],
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![slice]),
                     result_ty: ValueType::Int,
@@ -724,7 +733,7 @@ mod tests {
                 matches!(
                     &op.kind,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if segments == &["__string_byte_getitem"]
                 )
@@ -758,6 +767,7 @@ mod tests {
                             "<Impl>".into(),
                             "first".into(),
                         ],
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![slice.clone()]),
                     result_ty: ValueType::Ref(None),
@@ -786,7 +796,7 @@ mod tests {
         assert!(
             !g.blocks[a.0].operations.iter().any(|op| matches!(
                 &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments.last().map(String::as_str) == Some("first")
             )),
             "residual first call removed from A"
@@ -799,7 +809,7 @@ mod tests {
             .filter(|op| {
                 matches!(
                     &op.kind,
-                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                         if segments.first().map(String::as_str) == Some(crate::runtime_names::shims::CAST_INSTANCE)
                 )
             })
@@ -825,6 +835,7 @@ mod tests {
                             "<Impl>".into(),
                             "first".into(),
                         ],
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![slice]),
                     result_ty: ValueType::Ref(None),
@@ -842,7 +853,7 @@ mod tests {
         assert!(
             g.blocks[a.0].operations.iter().any(|op| matches!(
                 &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments.last().map(String::as_str) == Some("first")
             )),
             "residual call survives on decline"

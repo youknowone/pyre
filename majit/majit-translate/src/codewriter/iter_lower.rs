@@ -524,7 +524,7 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
 
 fn is_slice_iter_call(kind: &OpKind) -> bool {
     matches!(kind, OpKind::Call {
-        target: CallTarget::FunctionPath { segments },
+        target: CallTarget::FunctionPath { segments, .. },
         args,
         ..
     } if args.len() == 1
@@ -537,7 +537,7 @@ fn is_slice_iter_call(kind: &OpKind) -> bool {
 fn is_marker_call(kind: &OpKind, name: &str, arity: usize) -> Option<Vec<Variable>> {
     match kind {
         OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } if segments.len() == 1 && segments[0] == name && args.len() == arity => {
@@ -567,6 +567,7 @@ mod tests {
         OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: segments.iter().map(|s| s.to_string()).collect(),
+                fun_decl_id: None,
             },
             args: crate::model::call_args(args),
             result_ty: ValueType::Ref(None),

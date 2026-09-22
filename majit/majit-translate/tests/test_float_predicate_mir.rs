@@ -16,7 +16,7 @@ fn float_power_lowers_infinity_predicates_to_arithmetic() {
     let graph = lower_function(&llbc, "float_pow_inner").expect("lower float power");
     let ops: Vec<_> = graph.blocks.iter().flat_map(|b| &b.operations).collect();
     assert!(!ops.iter().any(|op| matches!(&op.kind,
-        OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+        OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
         if segments.last().is_some_and(|s| s == "is_infinite"))));
     assert!(ops.iter().any(|op| matches!(op.kind,
         OpKind::ConstFloat(bits) if bits == (2.0_f64.powi(1020)).to_bits())));

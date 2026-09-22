@@ -444,7 +444,7 @@ fn call_target_repr(target: &crate::model::CallTarget) -> String {
             Some(root) => format!("$<* function '{root}.{name}'>"),
             None => format!("$<* function '{name}'>"),
         },
-        CallTarget::FunctionPath { segments } => {
+        CallTarget::FunctionPath { segments, .. } => {
             format!("$<* function '{}'>", segments.join("."))
         }
         CallTarget::SyntheticTransparentCtor {

@@ -381,6 +381,7 @@ fn rewire_one_slice_index_site(
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["__getslice_range".to_string()],
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![slice, start.clone(), end.clone()]),
                     result_ty: index_result_ty,
@@ -402,7 +403,7 @@ fn rewire_one_slice_index_site(
             graph.blocks[rb].operations[ri] = SpaceOperation {
                 result: Some(index_result),
                 kind: OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::function_path(segments),
                     args: crate::model::call_args(args),
                     result_ty: index_result_ty,
                 },
@@ -414,6 +415,7 @@ fn rewire_one_slice_index_site(
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["__getslice_rangefrom".to_string()],
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![slice, start.clone()]),
                     result_ty: index_result_ty,
@@ -595,7 +597,7 @@ fn is_slice_range_index_call(kind: &OpKind) -> bool {
     matches!(
         kind,
         OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             ..
         } if slice_index_segments_match(segments)
     )
@@ -809,6 +811,7 @@ mod tests {
                 "<Impl>".into(),
                 "index".into(),
             ],
+            fun_decl_id: None,
         }
     }
 
@@ -832,6 +835,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["__array_repeat".into()],
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(repeat_args),
                     result_ty: ValueType::Ref(None),
@@ -994,6 +998,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["__array_repeat".into()],
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![fill.clone(), count.clone()]),
                     result_ty: ValueType::Ref(None),
@@ -1007,6 +1012,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["__array_repeat".into()],
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![fill.clone(), count.clone()]),
                     result_ty: ValueType::Ref(None),
@@ -1057,6 +1063,7 @@ mod tests {
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["vec".into(), "Vec".into(), "push".into()],
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![site_args[0].clone(), fill]),
                     result_ty: ValueType::Void,
@@ -1147,7 +1154,7 @@ mod tests {
             .find(|op| op.result == original.result)
             .unwrap();
         let OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             result_ty: new_ty,
         } = &rewritten.kind
@@ -1169,6 +1176,7 @@ mod tests {
         OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: vec!["vec".into(), "Vec".into(), "push".into()],
+                fun_decl_id: None,
             },
             args: crate::model::call_args(vec![base.clone()]),
             result_ty: ValueType::Void,
@@ -1234,6 +1242,7 @@ mod tests {
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["util".into(), "get".into()],
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![receiver.clone(), receiver]),
                     result_ty: ValueType::Unsigned,
@@ -1309,6 +1318,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["__array_repeat".into()],
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![fill.clone(), count.clone()]),
                     result_ty: ValueType::Ref(None),
@@ -1322,6 +1332,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["__array_repeat".into()],
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![fill, count]),
                     result_ty: ValueType::Ref(None),
@@ -1532,6 +1543,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["__array_repeat".into()],
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![fill, count]),
                     result_ty: ValueType::Ref(None),
@@ -1602,7 +1614,7 @@ mod tests {
                 .filter(|op| matches!(
                     &op.kind,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if segments == &["__getslice_rangeto".to_string()]
                 ))
@@ -1715,6 +1727,7 @@ mod tests {
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec!["some".into(), "opaque".into(), "mutator".into()],
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![owner]),
                     result_ty: ValueType::Void,
@@ -1992,7 +2005,7 @@ mod tests {
                 matches!(
                     &op.kind,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if segments == &["__getslice_rangefrom".to_string()]
                 )
@@ -2147,7 +2160,7 @@ mod tests {
             matches!(
                 &op.kind,
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     args,
                     ..
                 } if segments == &["__getslice_minusone".to_string()] && args.len() == 1
@@ -2406,7 +2419,7 @@ mod tests {
                 .any(|op| matches!(
                     &op.kind,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         args,
                         ..
                     } if segments == &["__getslice_rangefrom".to_string()]

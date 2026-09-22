@@ -371,6 +371,7 @@ mod tests {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            fun_decl_id: None,
         }
     }
 
@@ -392,6 +393,7 @@ mod tests {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            fun_decl_id: None,
         }
     }
 
@@ -531,7 +533,7 @@ mod tests {
         // No residual `unwrap_or` call survives (the two arm casts remain).
         assert!(
             !g.blocks.iter().flat_map(|blk| &blk.operations).any(|op| {
-                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments.last().map(String::as_str) == Some("unwrap_or"))
             }),
             "residual unwrap_or call removed"
@@ -545,7 +547,7 @@ mod tests {
             .iter()
             .flat_map(|blk| &blk.operations)
             .filter(|op| {
-                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments.first().map(String::as_str) == Some(crate::runtime_names::shims::CAST_INSTANCE))
             })
             .count();

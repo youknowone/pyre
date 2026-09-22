@@ -750,7 +750,7 @@ fn is_str_const_define(kind: &OpKind) -> bool {
     matches!(
         kind,
         OpKind::Call {
-            target: crate::model::CallTarget::FunctionPath { segments },
+            target: crate::model::CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } if args.is_empty() && segments.len() == 2 && segments[0] == "__str_const"
@@ -781,7 +781,7 @@ fn is_const_int_array_define(kind: &OpKind) -> bool {
     matches!(
         kind,
         OpKind::Call {
-            target: crate::model::CallTarget::FunctionPath { segments },
+            target: crate::model::CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } if args.is_empty() && segments.len() >= 2 && segments[0] == "__const_int_array"
@@ -795,7 +795,7 @@ fn is_const_int_array_define(kind: &OpKind) -> bool {
 /// define-op shape.
 fn const_int_array_items(kind: &OpKind) -> Option<Vec<ConstValue>> {
     let OpKind::Call {
-        target: crate::model::CallTarget::FunctionPath { segments },
+        target: crate::model::CallTarget::FunctionPath { segments, .. },
         ..
     } = kind
     else {
@@ -1013,14 +1013,14 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
         // an exception edge the lowered op cannot take.  Matched before
         // the general `Call` arm.
         OpKind::Call {
-            target: crate::model::CallTarget::FunctionPath { segments },
+            target: crate::model::CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } if nonraising_core_bridge_opname(segments, args.len()).is_some() => false,
         // `__strlen` lowers (in `translate_op`) to the same `len` op as
         // `ArrayLen` on a string-byte-view; `len` raises nothing.
         OpKind::Call {
-            target: crate::model::CallTarget::FunctionPath { segments },
+            target: crate::model::CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } if segments.as_slice() == ["__strlen"] && args.len() == 1 => false,
@@ -1032,7 +1032,7 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
         // never actually a `?` operand — this keeps the table faithful.)
         // Matched before the general `Call` arm.
         OpKind::Call {
-            target: crate::model::CallTarget::FunctionPath { segments },
+            target: crate::model::CallTarget::FunctionPath { segments, .. },
             ..
         } if is_slice_reverse_segments(segments) => false,
         // `vec::Vec::{with_capacity,new}` lowers (in `translate_op`) to the
@@ -1041,7 +1041,7 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
         // tail op installs no exception edge the lowered op cannot take.
         // Matched before the general `Call` arm.
         OpKind::Call {
-            target: crate::model::CallTarget::FunctionPath { segments },
+            target: crate::model::CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } if is_vec_ctor_segments(segments) || is_vec_from_elem_segments(segments, args.len()) => {
@@ -1052,7 +1052,7 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
         // = [StopIteration, RuntimeError]`).  Matched before the general
         // `Call` arm, mirroring [`translate_op`]'s `[__iter_next]` arm.
         OpKind::Call {
-            target: crate::model::CallTarget::FunctionPath { segments },
+            target: crate::model::CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } if args.len() == 1 && crate::front::iter_next::is_iter_next_segments(segments) => true,
@@ -1883,7 +1883,7 @@ pub fn translate_op(
         // callable (or a Variable carrying a runtime function pointer).
         // Each `CallTarget` variant maps to a different shape:
         //
-        //   FunctionPath { segments }     — direct call to `path::func`.
+        //   FunctionPath { segments, .. }     — direct call to `path::func`.
         //                                    Wrap the joined qualname in
         //                                    a `HostObject::new_opaque(...)`
         //                                    Constant; rtyper's
@@ -1931,7 +1931,7 @@ pub fn translate_op(
                 // short-circuits on `bookkeeper.descs` (pre-populated
                 // by the registry) and routes through
                 // `FunctionRepr::call(hop)` (`rpbc.py`).
-                CallTarget::FunctionPath { segments } => {
+                CallTarget::FunctionPath { segments, .. } => {
                     // RPython `SimpleCall.opname = 'simple_call'`
                     // (`flowspace/operation.py`); `SimpleCall.eval`
                     // reads `w_callable, args_w = self.args[0],
@@ -3495,7 +3495,7 @@ fn legacy_const_define_hlvalue(
         // `legacy=GcRef, real=Unknown` divergence on every graph
         // containing a string literal.
         OpKind::Call {
-            target: crate::model::CallTarget::FunctionPath { segments },
+            target: crate::model::CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } if args.is_empty() && segments.len() == 2 && segments[0] == "__str_const" => {
@@ -5454,6 +5454,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["a".into(), "b".into()],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Int,
@@ -5493,6 +5494,7 @@ mod tests {
                         "executioncontext".into(),
                         "jit_force_virtualizable".into(),
                     ],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Void,
@@ -5538,6 +5540,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__array_repeat".into()],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![vars[1].clone(), vars[2].clone()]),
                 result_ty: ValueType::Int,
@@ -5572,6 +5575,7 @@ mod tests {
                         "builtins".into(),
                         "try_pyobject_vec_with_capacity".into(),
                     ],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![vars[0].clone()]),
                 result_ty: ValueType::Ref(None),
@@ -5605,7 +5609,7 @@ mod tests {
                 matches!(
                     &op.kind,
                     OpKind::Call {
-                        target: crate::model::CallTarget::FunctionPath { segments },
+                        target: crate::model::CallTarget::FunctionPath { segments, .. },
                         ..
                     } if is_vec_from_elem_segments(segments, 2)
                 )
@@ -5624,7 +5628,7 @@ mod tests {
                 matches!(
                     &op.kind,
                     OpKind::Call {
-                        target: crate::model::CallTarget::FunctionPath { segments },
+                        target: crate::model::CallTarget::FunctionPath { segments, .. },
                         ..
                     } if is_vec_from_elem_segments(segments, 2)
                 )
@@ -5653,6 +5657,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__getslice_minusone".into()],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![vars[0].clone()]),
                 result_ty: ValueType::Ref(None),
@@ -5690,6 +5695,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__getslice_rangeto".into()],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![vars[0].clone(), vars[1].clone()]),
                 result_ty: ValueType::Ref(None),
@@ -5724,6 +5730,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__getslice_rangefrom".into()],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![vars[0].clone(), vars[1].clone()]),
                 result_ty: ValueType::Ref(None),
@@ -5777,6 +5784,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["othermod".into(), "shared_leaf".into()],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Int,
@@ -5853,6 +5861,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["simple_call".into()],
+                    fun_decl_id: None,
                 },
                 args: vec![
                     LinkArg::from(ConstValue::HostObject(expected.clone())),
@@ -5901,6 +5910,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__dyn_call".into()],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![vars[1].clone(), vars[2].clone()]),
                 result_ty: ValueType::Int,
@@ -5926,7 +5936,7 @@ mod tests {
         // Single-segment FunctionPath unregistered in CallRegistry
         // falls back to HOST_ENV.lookup_builtin(name), letting frontend
         // `Expr::Cast` lowering emit
-        // `Call { target: FunctionPath { segments: vec!["int"] }, args }`
+        // `Call { target: FunctionPath { segments: vec!["int"], fun_decl_id: None }, args }`
         // and route through `BuiltinFunctionRepr.rtype_simple_call →
         // BUILTIN_TYPER["int"] → rtype_builtin_int`.  Mirrors upstream
         // `flowspace/flowcontext.py:LOAD_GLOBAL` resolving against
@@ -5941,6 +5951,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["int".into()],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Int,
@@ -5993,6 +6004,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__builtin__".into(), "float".into()],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Float,
@@ -6042,6 +6054,7 @@ mod tests {
                         "lltype".into(),
                         "cast_ptr_to_int".into(),
                     ],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Int,
@@ -6088,6 +6101,7 @@ mod tests {
                         "module".into(),
                         "path".into(),
                     ],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![]),
                 result_ty: ValueType::Int,
@@ -6246,6 +6260,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::STRINGBUILDER_NEW.into()],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![]),
                 result_ty: ValueType::Ref(None),
@@ -6277,6 +6292,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__majit_stringbuilder_new".into()],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![vars[2].clone()]),
                 result_ty: ValueType::Ref(None),
@@ -6309,6 +6325,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::STRINGBUILDER_APPEND.into()],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![vars[1].clone(), vars[2].clone()]),
                 result_ty: ValueType::Void,
@@ -6352,6 +6369,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::STRINGBUILDER_BUILD.into()],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Ref(None),
@@ -6453,6 +6471,7 @@ mod tests {
                 kind: OpKind::Call {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: segments.clone(),
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vars[..arity].iter().cloned()),
                     result_ty: ValueType::Bool,
@@ -6833,6 +6852,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__strlen".into()],
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Int,
@@ -6959,6 +6979,7 @@ mod tests {
         let core_call = |segs: &[&str], argc: usize| OpKind::Call {
             target: crate::model::CallTarget::FunctionPath {
                 segments: segs.iter().map(|s| s.to_string()).collect(),
+                fun_decl_id: None,
             },
             args: crate::model::call_args((0..argc).map(|_| Variable::new())),
             result_ty: ValueType::Int,
@@ -7751,6 +7772,7 @@ mod tests {
                     "2".to_string(),
                     "-3".to_string(),
                 ],
+                fun_decl_id: None,
             },
             args: Vec::new(),
             result_ty: ValueType::Ref(None),
@@ -7792,6 +7814,7 @@ mod tests {
         let str_const = OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: vec!["__str_const".to_string(), "hi".to_string()],
+                fun_decl_id: None,
             },
             args: Vec::new(),
             result_ty: ValueType::Ref(None),
@@ -7849,6 +7872,7 @@ mod tests {
                     "module".to_string(),
                     "function".to_string(),
                 ],
+                fun_decl_id: None,
             },
             args: Vec::new(),
             result_ty: ValueType::Int,

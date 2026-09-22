@@ -827,6 +827,7 @@ pub(crate) fn materialize_error_to_exc_object(
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: segments.iter().copied().map(str::to_string).collect(),
+                        fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![payload]),
                     result_ty: ValueType::Ref(None),
@@ -2033,41 +2034,36 @@ fn catch_and_rewrap(
     let (e_id, e_inputs) = graph.create_block_with_arg_vars(nonr_args.len() + 2);
     let e_exc_value_in = e_inputs[nonr_args.len() + 1].clone();
     let e_shell: Option<Variable> = if has_r {
-        // `PyError::from_exc_object(exc_value)` is an associated fn (no
-        // `self`), yet it is spelled as a `Method` target with `receiver_root
-        // = "PyError"` and the caught exception value as `args[0]`.  The
-        // codewriter resolves the recorded call statically, not by a runtime
-        // dispatch on the exception object: `call.rs::resolve_method` keys the
-        // `getfunctionptr(graph)` identity on
-        // `CallPath::for_impl_method(receiver_root, name)` →
-        // `for_impl_method("PyError", "from_exc_object")` and never on the
-        // runtime receiver's class, so `exc_value` flows positionally into
-        // the callee's first param (`obj`) — the same way the inherent
-        // `&self` `to_exc_object` above threads its receiver positionally.
-        // (The rtyper's annotator-facing lowering in `flowspace_adapter.rs`
-        // does turn every `Method` into `getattr(args[0], leaf) →
-        // simple_call`; that view drives type inference only — the
-        // codewriter's static `resolve_method` above mints the actual call.)
-        // A `FunctionPath(["PyError", "from_exc_object"])` would instead
-        // resolve to that bare two-segment path, which misses the
-        // module-qualified impl-method registration and falls back to a
-        // symbolic address.
+        // The rebuild is an associated fn on the carrier (no `self`),
+        // spelled as a `Method` whose `receiver_root` is the type leaf
+        // (`PyError`) so the annotator's getattr surface stays on that
+        // leaf. The codewriter resolves statically: `resolved_path` is
+        // the FunDecl's registered impl path
+        // (`for_impl_method` of the crate-stripped carrier, not the
+        // owner leaf). `exc_value` flows positionally into the callee's
+        // first param. A FunctionPath of just the leaf pair misses that
+        // registration.
         //
         // A carrier that declares no rebuild pair is its own exception
         // value (the mirror of the raise site's `None` arm), so the caught
         // word goes straight into the `Err` shell.
         let v_err = match spec.from_exc_object {
-            Some((receiver_root, method)) => graph
-                .push_op_var(
-                    e_id,
-                    OpKind::Call {
-                        target: CallTarget::method(method, Some(receiver_root.to_string())),
-                        args: crate::model::call_args(vec![e_exc_value_in]),
-                        result_ty: ValueType::Ref(None),
-                    },
-                    true,
-                )
-                .expect("from_exc_object must produce a value"),
+            Some((receiver_root, method)) => {
+                let owner = crate::front::mir::strip_crate_prefix(spec.carrier_path);
+                let target = CallTarget::method(method, Some(receiver_root.to_string()))
+                    .with_resolved_path(crate::parse::CallPath::for_impl_method(&owner, method));
+                graph
+                    .push_op_var(
+                        e_id,
+                        OpKind::Call {
+                            target,
+                            args: crate::model::call_args(vec![e_exc_value_in]),
+                            result_ty: ValueType::Ref(None),
+                        },
+                        true,
+                    )
+                    .expect("from_exc_object must produce a value")
+            }
             None => e_exc_value_in,
         };
         Some(build_shell(
@@ -3154,7 +3150,7 @@ fn forwards_to_returnblock_inner(
 /// dependence on where in the chain it sits. That is what lets the `Err`
 /// rewrite re-emit it at the raise site instead of declining the callee.
 fn is_root_bracket_close(kind: &OpKind) -> bool {
-    matches!(kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+    matches!(kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
         if segments.last().is_some_and(|s| s == super::mir::ROOT_SCOPE_CLOSE))
 }
 
@@ -3702,7 +3698,7 @@ pub(crate) fn fuse_kind_ctor_raise(graph: &mut FunctionGraph) {
             &[i, j] => {
                 let type_op = &succ.operations[j];
                 let OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     args: type_args,
                     ..
                 } = &type_op.kind
@@ -3720,7 +3716,7 @@ pub(crate) fn fuse_kind_ctor_raise(graph: &mut FunctionGraph) {
             _ => continue,
         };
         let OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } = &op.kind
@@ -3778,7 +3774,7 @@ pub(crate) fn fuse_kind_ctor_raise(graph: &mut FunctionGraph) {
             continue;
         };
         let OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } = &pred.operations[ctor_idx].kind
@@ -3811,6 +3807,7 @@ pub(crate) fn fuse_kind_ctor_raise(graph: &mut FunctionGraph) {
                 segments: [crate::runtime_names::crates::INTERPRETER, "error", helper]
                     .map(str::to_string)
                     .to_vec(),
+                fun_decl_id: None,
             };
         }
         // The constructor's result variable now holds the exception object.

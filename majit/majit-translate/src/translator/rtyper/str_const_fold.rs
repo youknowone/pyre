@@ -42,7 +42,7 @@ pub fn fold_str_consts(graph: &mut FunctionGraph) {
     for block in graph.blocks.iter_mut() {
         for op in block.operations.iter_mut() {
             let OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
+                target: CallTarget::FunctionPath { segments, .. },
                 args,
                 ..
             } = &op.kind
@@ -70,6 +70,7 @@ mod tests {
         OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: vec!["__str_const".to_string(), payload],
+                fun_decl_id: None,
             },
             args: vec![],
             result_ty: ValueType::Ref(None),

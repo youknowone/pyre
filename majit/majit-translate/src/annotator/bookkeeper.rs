@@ -4943,7 +4943,7 @@ mod tests {
                         && matches!(
                             &op.kind,
                             crate::model::OpKind::Call {
-                                target: crate::model::CallTarget::FunctionPath { segments },
+                                target: crate::model::CallTarget::FunctionPath { segments, .. },
                                 ..
                             } if crate::model::cast_instance_root(&op.kind) == Some("PyObject")
                         )

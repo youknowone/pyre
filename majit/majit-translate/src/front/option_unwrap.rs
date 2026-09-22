@@ -437,7 +437,7 @@ mod tests {
                 if name == "unwrap")
         }));
         assert!(g.blocks.iter().flat_map(|bb| &bb.operations).any(|op| {
-            matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+            matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                 if segments.first().map(String::as_str)
                     == Some(crate::runtime_names::shims::CAST_INSTANCE))
         }));

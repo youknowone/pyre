@@ -162,7 +162,7 @@ fn builtin_typer_map() -> &'static Mutex<HashMap<HostObject, BuiltinTyperFn>> {
 ///     `cast_int_to_ptr` (rbuiltin.py:543/551) are ported —
 ///     frontend `expr as T` for `Ref↔Int` emits `Call { target:
 ///     FunctionPath { segments: ["rpython", "rtyper", "lltypesystem",
-///     "lltype", "cast_*"] }, args }`, routed through the
+///     "lltype", "cast_*"], fun_decl_id: None }, args }`, routed through the
 ///     `flowspace_adapter` module-qualified HOST_ENV resolver to
 ///     `BuiltinFunctionRepr.rtype_simple_call → BUILTIN_TYPER →
 ///     rtype_cast_ptr_to_int / rtype_cast_int_to_ptr`.  The 2-arg
@@ -3538,7 +3538,7 @@ pub fn rtype_const_result(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -
 /// cast_ptr_to_int]` per `rbuiltin.py:14-15` registry pattern.
 /// `front::mir` lowers `expr as i64` for a Ref-typed source into
 /// `Call { target: FunctionPath { segments: ["rpython", "rtyper",
-/// "lltypesystem", "lltype", "cast_ptr_to_int"] }, args: [operand] }`,
+/// "lltypesystem", "lltype", "cast_ptr_to_int"], fun_decl_id: None }, args: [operand] }`,
 /// picked up by the flowspace_adapter's module-qualified FunctionPath
 /// resolver → HOST_ENV.import_module(...).module_get("cast_ptr_to_int")
 /// → BUILTIN_TYPER lookup.
@@ -3678,7 +3678,7 @@ pub fn rtype_same_as(hop: &HighLevelOp) -> RTypeResult {
 ///
 /// TODO: pyre's frontend emits a 1-arg
 /// `Call { target: FunctionPath { segments: ["rpython", "rtyper",
-/// "lltypesystem", "lltype", "cast_int_to_ptr"] }, args: [operand] }`
+/// "lltypesystem", "lltype", "cast_int_to_ptr"], fun_decl_id: None }, args: [operand] }`
 /// because at `Expr::Cast` lowering time the frontend has only
 /// `ValueType::Ref` (the opaque high-level surface type), not the
 /// concrete Ptr lltype.  This typer therefore takes a single `Signed`

@@ -46,7 +46,7 @@ fn dunder_import_lowers_rust_string_find_and_slices_to_rpython_ops() {
     assert!(ops.iter().any(|op| matches!(
         &op.kind,
         OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             ..
         } if segments == &["__getslice_rangeto".to_string()]
     )));
@@ -60,7 +60,7 @@ fn dunder_import_lowers_rust_string_find_and_slices_to_rpython_ops() {
     assert!(!ops.iter().any(|op| matches!(
         &op.kind,
         OpKind::Call {
-            target: CallTarget::FunctionPath { segments },
+            target: CallTarget::FunctionPath { segments, .. },
             ..
         } if segments.starts_with(&["core".to_string(), "str".to_string()])
             && matches!(segments.last().map(String::as_str), Some("find" | "index"))

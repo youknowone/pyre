@@ -17750,11 +17750,19 @@ fn try_walker_orthodox_int_descr_str<Sym: WalkSym>(
 ///
 /// Left or right ASCII pad is `ll_strconcat` of a constant prefix/suffix
 /// onto the `ll_int2dec` payload (`newformat.py` `_fill_number` for a
-/// constant spec and a known digit length).  A sign-interior pad (`-0042`)
-/// is not this shape and stays residual.
+/// constant spec and a known digit length).  A field width is
+/// `ll_str_mul(fill, width - strlen)` + `ll_strconcat` so a later
+/// digit-length does not deopt (`f"{i:05d}"`, `_calc_num_width`
+/// `n_padding = width - extra - n_digits`).  A sign-interior pad
+/// (`-0042`) is not this shape and stays residual.
 enum IntStrPad {
     Left(pyre_object::PyObjectRef),
     Right(pyre_object::PyObjectRef),
+    Fill {
+        fill: pyre_object::PyObjectRef,
+        width: i64,
+        left: bool,
+    },
 }
 
 fn walker_emit_jit_int_str<Sym: WalkSym>(
@@ -17852,6 +17860,84 @@ fn walker_emit_jit_int_str_padded<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// `newformat.py` `_fill_number`: `n_lpadding = width - n_digits`,
+/// `ll_str_mul(fill, n_lpadding)` when `n_lpadding > 0`, else the unpadded
+/// decimal.  `int_gt(n_pad, 0)` is the `if spec.n_lpadding` the oracle
+/// records; the False path is a bridge.
+fn walker_emit_int_str_fill<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    payload: OpRef,
+    length: OpRef,
+    fill: pyre_object::PyObjectRef,
+    width: i64,
+    left: bool,
+    boxed_result: pyre_object::PyObjectRef,
+) -> Result<(OpRef, OpRef), DispatchError> {
+    let unpadded_len = match ctx.trace_ctx.box_value(length) {
+        Some(majit_ir::Value::Int(n)) => n,
+        _ => unreachable!("Strlen concrete is set before wrap"),
+    };
+    let n_pad_val = width - unpadded_len;
+    let width_op = ctx.trace_ctx.const_int(width);
+    let n_pad = ctx.trace_ctx.record_op(OpCode::IntSub, &[width_op, length]);
+    ctx.trace_ctx
+        .set_opref_concrete(n_pad, majit_ir::Value::Int(n_pad_val));
+    let zero = ctx.trace_ctx.const_int(0);
+    let gt = ctx.trace_ctx.record_op(OpCode::IntGt, &[n_pad, zero]);
+    if n_pad_val > 0 {
+        ctx.trace_ctx
+            .set_opref_concrete(gt, majit_ir::Value::Int(1));
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[gt])?;
+
+        let fill_storage = unsafe { pyre_object::unicodeobject::w_str_storage(fill) };
+        let fill_payload = ctx.trace_ctx.const_ref(fill_storage as i64);
+        let mul_helper = pyre_object::lowlevel_string::jit_ll_str_mul as *const ();
+        let pad_payload = ctx.trace_ctx.call_typed_with_effect(
+            OpCode::CallR,
+            mul_helper,
+            &[fill_payload, n_pad],
+            &[majit_ir::Type::Ref, majit_ir::Type::Int],
+            majit_ir::Type::Ref,
+            crate::descr::ll_str_mul_effectinfo(),
+        );
+        let pad_storage =
+            pyre_object::lowlevel_string::jit_ll_str_mul(fill_storage as i64, n_pad_val);
+        ctx.trace_ctx.set_opref_concrete(
+            pad_payload,
+            majit_ir::Value::Ref(majit_ir::GcRef(pad_storage as usize)),
+        );
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
+
+        let concat_helper = pyre_object::lowlevel_string::jit_ll_strconcat as *const ();
+        let args = if left {
+            [pad_payload, payload]
+        } else {
+            [payload, pad_payload]
+        };
+        let concat = ctx.trace_ctx.call_typed_with_effect(
+            OpCode::CallR,
+            concat_helper,
+            &args,
+            &[majit_ir::Type::Ref, majit_ir::Type::Ref],
+            majit_ir::Type::Ref,
+            crate::descr::ll_strconcat_effectinfo(),
+        );
+        let concat_storage = unsafe { pyre_object::unicodeobject::w_str_storage(boxed_result) };
+        ctx.trace_ctx.set_opref_concrete(
+            concat,
+            majit_ir::Value::Ref(majit_ir::GcRef(concat_storage as usize)),
+        );
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
+        Ok((concat, width_op))
+    } else {
+        ctx.trace_ctx
+            .set_opref_concrete(gt, majit_ir::Value::Int(0));
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[gt])?;
+        Ok((payload, length))
+    }
+}
+
 fn walker_wrap_int_str_payload<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -17863,10 +17949,14 @@ fn walker_wrap_int_str_payload<Sym: WalkSym>(
 ) -> Result<(), DispatchError> {
     let (storage, wrap_len) = match pad {
         None => (payload, length),
+        Some(IntStrPad::Fill { fill, width, left }) => {
+            walker_emit_int_str_fill(ctx, op_pc, payload, length, fill, width, left, boxed_result)?
+        }
         Some(side) => {
             let (pad_obj, left) = match side {
                 IntStrPad::Left(obj) => (obj, true),
                 IntStrPad::Right(obj) => (obj, false),
+                IntStrPad::Fill { .. } => unreachable!("Fill handled above"),
             };
             let observed_len = unsafe {
                 (*(boxed_result as *const pyre_object::unicodeobject::W_UnicodeObject)).len as i64
@@ -18228,44 +18318,70 @@ fn spec_has_plus_or_space_sign(spec: &str) -> bool {
     i < n && matches!(chars[i], '+' | ' ')
 }
 
-/// Minimum-width digits after align / sign / `#` / `0` (`newformat.py`
-/// `_parse_spec`).  `formatted == unpadded` on a value that already
-/// fills the width must not select the no-pad arm: a later shorter
-/// value (`format(12345, "3d")` then `format(1, "3d")`) would drop
-/// the spaces.
-fn spec_has_field_width(spec: &str) -> bool {
+/// Field width, fill, and left-vs-right for a decimal spec (`_parse_spec`
+/// with default align `>`).  No width, `'^'` (both pads), or a non-ASCII
+/// fill is `None` — those stay on the constant-pad arm or decline.
+fn spec_decimal_pad_info(spec: &str) -> Option<(i64, char, bool)> {
     let chars: Vec<char> = spec.chars().collect();
     let n = chars.len();
     if n == 0 {
-        return false;
+        return None;
     }
     let mut i = 0;
+    let mut fill = ' ';
+    let mut align = '>';
+    let mut got_align = false;
     if n >= 2 && matches!(chars[1], '<' | '>' | '=' | '^') {
+        fill = chars[0];
+        align = chars[1];
+        got_align = true;
         i = 2;
     } else if matches!(chars[0], '<' | '>' | '=' | '^') {
+        align = chars[0];
+        got_align = true;
         i = 1;
     }
     if i < n && matches!(chars[i], '+' | '-' | ' ') {
         i += 1;
     }
+    if i < n && chars[i] == 'z' {
+        return None;
+    }
     if i < n && chars[i] == '#' {
         i += 1;
     }
     if i < n && chars[i] == '0' {
+        fill = '0';
+        if !got_align {
+            align = '=';
+        }
         i += 1;
     }
-    i < n && chars[i].is_ascii_digit()
+    if i >= n || !chars[i].is_ascii_digit() {
+        return None;
+    }
+    let mut width: i64 = 0;
+    while i < n && chars[i].is_ascii_digit() {
+        width = width
+            .checked_mul(10)?
+            .checked_add((chars[i] as i64) - (b'0' as i64))?;
+        i += 1;
+    }
+    if align == '^' || !fill.is_ascii() {
+        return None;
+    }
+    let left = matches!(align, '>' | '=');
+    Some((width, fill, left))
 }
 
 /// FORMAT_WITH_SPEC on an exact `int` plus a constant decimal spec.
 ///
-/// Empty spec is [`try_walker_specialize_format_simple`].  A non-empty
-/// spec whose formatted result is a left or right pad of `str(i)` is
-/// `ll_int2dec` + `ll_strconcat` of that pad — `newformat.py`
-/// `format_int_or_long` / `_int_to_base` (base 10 is `str(value)`) /
-/// `_fill_number`.  A sign-interior pad (`format(-42, "05d") == "-0042"`),
-/// a bool, a subclass, or a spec that is not a constant exact `str`
-/// declines (SAFE).
+/// Empty spec is [`try_walker_specialize_format_simple`].  A field width
+/// (`:05d` / `:5d`) is `ll_int2dec` + `ll_str_mul(fill, width - strlen)` +
+/// `ll_strconcat` — `newformat.py` `format_int_or_long` / `_int_to_base` /
+/// `_calc_num_width` / `_fill_number`.  A sign-interior pad
+/// (`format(-42, "05d") == "-0042"`), a bool, a subclass, or a spec that
+/// is not a constant exact `str` declines (SAFE).
 pub(crate) fn try_walker_specialize_format_with_spec_int<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
@@ -18350,8 +18466,37 @@ pub(crate) fn try_walker_specialize_format_with_spec_int<Sym: WalkSym>(
         return Ok(None);
     };
     let unpadded = pyre_object::unicodeobject::int_str_text(int_value);
-    let pad = if formatted == unpadded.as_str() {
-        None
+    let sign_interior = formatted != unpadded.as_str()
+        && formatted.strip_suffix(unpadded.as_str()).is_none()
+        && formatted.strip_prefix(unpadded.as_str()).is_none();
+    if sign_interior {
+        return Ok(None);
+    }
+    let plus_or_space = spec_has_plus_or_space_sign(spec_text);
+    let pad = if !plus_or_space {
+        if let Some((width, fill, left)) = spec_decimal_pad_info(spec_text) {
+            Some(IntStrPad::Fill {
+                fill: pyre_object::w_str_new(&fill.to_string()),
+                width,
+                left,
+            })
+        } else if formatted == unpadded.as_str() {
+            None
+        } else if let Some(prefix) = formatted.strip_suffix(unpadded.as_str()) {
+            if prefix.is_empty() {
+                return Ok(None);
+            }
+            Some(IntStrPad::Left(pyre_object::w_str_new(prefix)))
+        } else if let Some(suffix) = formatted.strip_prefix(unpadded.as_str()) {
+            if suffix.is_empty() {
+                return Ok(None);
+            }
+            Some(IntStrPad::Right(pyre_object::w_str_new(suffix)))
+        } else {
+            return Ok(None);
+        }
+    } else if formatted == unpadded.as_str() {
+        return Ok(None);
     } else if let Some(prefix) = formatted.strip_suffix(unpadded.as_str()) {
         if prefix.is_empty() {
             return Ok(None);
@@ -18365,10 +18510,6 @@ pub(crate) fn try_walker_specialize_format_with_spec_int<Sym: WalkSym>(
     } else {
         return Ok(None);
     };
-    if pad.is_none() && (spec_has_plus_or_space_sign(spec_text) || spec_has_field_width(spec_text))
-    {
-        return Ok(None);
-    }
     if !spec.is_constant() {
         let spec_const = ctx.trace_ctx.const_ref(concrete_spec as i64);
         walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[spec, spec_const])?;

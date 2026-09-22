@@ -82,7 +82,7 @@ fn as_double_effect_graph_keeps_upstream_bit_length_call() {
         .flat_map(|block| block.operations.iter())
         .filter_map(|op| match &op.kind {
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
+                target: CallTarget::FunctionPath { segments, .. },
                 ..
             } => segments.last().cloned(),
             OpKind::Call {
@@ -127,7 +127,7 @@ fn compiler_bigint_conversion_keeps_upstream_bit_length_call() {
         .flat_map(|block| block.operations.iter())
         .filter_map(|op| match &op.kind {
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
+                target: CallTarget::FunctionPath { segments, .. },
                 ..
             } => Some(segments.join("::")),
             _ => None,
@@ -801,7 +801,7 @@ fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
                         ..
                     } => matches!(name.as_str(), "digits" | "digits_mut"),
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } => matches!(
                         segments.last().map(String::as_str),
@@ -850,7 +850,7 @@ fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
                 .any(|operation| matches!(
                     &operation.kind,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if segments.last().is_some_and(|leaf| leaf == "jit_bigint_clone")
                 )),
@@ -888,7 +888,7 @@ fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
                         !matches!(
                             &operation.kind,
                             OpKind::Call {
-                                target: CallTarget::FunctionPath { segments },
+                                target: CallTarget::FunctionPath { segments, .. },
                                 ..
                             } if segments.last().is_some_and(|leaf| leaf == "jit_bigint_clone")
                         )
@@ -918,7 +918,7 @@ fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
                     !matches!(
                         &operation.kind,
                         OpKind::Call {
-                            target: CallTarget::FunctionPath { segments },
+                            target: CallTarget::FunctionPath { segments, .. },
                             ..
                         } if segments.last().is_some_and(|leaf| leaf == "jit_bigint_neg")
                     )
@@ -932,7 +932,7 @@ fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
         .flat_map(|block| &block.operations)
         .filter_map(|operation| match &operation.kind {
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
+                target: CallTarget::FunctionPath { segments, .. },
                 ..
             } => Some(segments.clone()),
             _ => None,
@@ -965,7 +965,7 @@ fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
         !range_bigint_calls.iter().any(|target| {
             matches!(
                 target,
-                CallTarget::FunctionPath { segments }
+                CallTarget::FunctionPath { segments, .. }
                     if segments.last().is_some_and(|leaf| leaf == "jit_bigint_clone")
             ) || matches!(
                 target,
@@ -1132,7 +1132,7 @@ fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
                     saw_mask = true;
                 }
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } => {
                     assert_ne!(
@@ -1187,7 +1187,7 @@ fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
             .any(|operation| matches!(
                 &operation.kind,
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments
                     == &["pyre_object", "longobject", "jit_bigint_lt"]
@@ -1212,7 +1212,7 @@ fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
             .any(|operation| matches!(
                 &operation.kind,
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments
                     == &["pyre_object", "longobject", "jit_bigint_sign_i64"]
@@ -1431,7 +1431,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         .flat_map(|block| &block.operations)
         .filter_map(|operation| {
             if let OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
+                target: CallTarget::FunctionPath { segments, .. },
                 ..
             } = &operation.kind
             {
@@ -1488,7 +1488,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
             .flat_map(|block| &block.operations)
             .filter_map(|operation| match &operation.kind {
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } => Some(segments.clone()),
                 _ => None,
@@ -1537,7 +1537,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         .flat_map(|block| &block.operations)
         .filter_map(|operation| match &operation.kind {
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
+                target: CallTarget::FunctionPath { segments, .. },
                 ..
             } => Some(segments.clone()),
             _ => None,
@@ -1586,7 +1586,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         .flat_map(|block| &block.operations)
         .filter_map(|operation| match &operation.kind {
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
+                target: CallTarget::FunctionPath { segments, .. },
                 ..
             } => Some(segments.clone()),
             _ => None,
@@ -1630,7 +1630,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
                 .any(|operation| matches!(
                     &operation.kind,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if segments.last().is_some_and(|leaf| leaf == "jit_bigint_clone")
                 )),
@@ -1654,7 +1654,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         .flat_map(|block| &block.operations)
         .filter_map(|operation| match &operation.kind {
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
+                target: CallTarget::FunctionPath { segments, .. },
                 ..
             } => Some(segments.clone()),
             _ => None,
@@ -1692,7 +1692,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         .flat_map(|block| &block.operations)
         .filter_map(|operation| match &operation.kind {
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
+                target: CallTarget::FunctionPath { segments, .. },
                 ..
             } => Some(segments.clone()),
             _ => None,
@@ -1732,7 +1732,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
             .flat_map(|block| &block.operations)
             .filter_map(|operation| match &operation.kind {
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } => Some(segments.clone()),
                 _ => None,
@@ -1762,7 +1762,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
             .flat_map(|block| &block.operations)
             .filter_map(|operation| match &operation.kind {
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } => Some(segments.clone()),
                 _ => None,
@@ -1805,7 +1805,7 @@ fn rbigint_add_residual_calls_the_gc_transformed_payload_body_once() {
     for block in &wrapper.graph.blocks {
         for operation in &block.operations {
             if let OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
+                target: CallTarget::FunctionPath { segments, .. },
                 ..
             } = &operation.kind
             {
@@ -1842,7 +1842,7 @@ fn rbigint_add_residual_calls_the_gc_transformed_payload_body_once() {
             matches!(
                 &operation.kind,
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments
                     == &[
@@ -1874,7 +1874,7 @@ fn rbigint_add_residual_calls_the_gc_transformed_payload_body_once() {
             .any(|operation| matches!(
                 &operation.kind,
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
+                    target: CallTarget::FunctionPath { segments, .. },
                     result_ty: ValueType::Ref(None),
                     ..
                 } if segments.last().is_some_and(|leaf| leaf == "jit_bigint_clone")
