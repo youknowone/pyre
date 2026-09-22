@@ -625,6 +625,9 @@ pub fn intern_liveness(live_i: &[u8], live_r: &[u8], live_f: &[u8]) -> Option<u1
         asm.all_liveness.extend(encoded_r);
         asm.all_liveness.extend(encoded_f);
         asm.all_liveness_length = asm.all_liveness.len();
+        // The mirror now holds a record no writer published, so the next
+        // `publish_state_from` must replace it wholesale.
+        asm.synced_with = None;
         Some((pos_u16, asm.all_liveness.clone()))
     })?;
 
