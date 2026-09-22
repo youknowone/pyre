@@ -129,13 +129,41 @@ pub(crate) fn walk_handle_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     }
 }
 
-/// `aiter(obj)` — delegates to the app-level `aiter`, whose `def aiter(obj)`
-/// signature enforces the single-argument arity.
+/// `aiter(obj)` — delegates to the app-level `aiter` after stripping the
+/// trailing `__pyre_kw__` marker and refusing keywords.  Clinic
+/// `builtin_aiter` takes no keywords and exactly one positional.
 pub fn builtin_aiter(args: &[PyObjectRef]) -> PyResult {
-    crate::call::call_function_impl_result(handle(AITER)?, args)
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if crate::builtins::has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "aiter() takes no keyword arguments",
+        ));
+    }
+    crate::gateway::check_declared_arity("aiter", 1, positional.len())?;
+    crate::call::call_function_impl_result(handle(AITER)?, positional)
 }
 
-/// `anext(iterator[, default])` — delegates to the app-level `anext`.
+/// `anext(iterator[, default])` — delegates to the app-level `anext` after
+/// stripping the trailing `__pyre_kw__` marker and refusing keywords.
+/// `_PyArg_CheckPositional` on `builtin_anext` is at least 1, at most 2.
 pub fn builtin_anext(args: &[PyObjectRef]) -> PyResult {
-    crate::call::call_function_impl_result(handle(ANEXT)?, args)
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if crate::builtins::has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
+            "anext() takes no keyword arguments",
+        ));
+    }
+    if positional.is_empty() {
+        return Err(crate::PyError::type_error(format!(
+            "anext expected at least 1 argument, got {}",
+            positional.len()
+        )));
+    }
+    if positional.len() > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "anext expected at most 2 arguments, got {}",
+            positional.len()
+        )));
+    }
+    crate::call::call_function_impl_result(handle(ANEXT)?, positional)
 }

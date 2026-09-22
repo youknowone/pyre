@@ -1,9 +1,11 @@
-# pyre-check: spec-folds=binary_op_descent,truth_bool,compare_op_descent,compare_op_int
-# The first three carry most of the corpus's fold traffic, and nothing
+# pyre-check: spec-folds=binary_op_descent,truth_bool,compare_op_descent
+# These three carry most of the corpus's fold traffic, and nothing
 # declared any of them, so switching one off was a silent change. This fixture
 # fires all three repeatedly, the widest margin of any fixture doing so.
-# `compare_op_int` fires 61 times here and nowhere else that declares it, so
-# it is named here rather than left uncoupled.
+# `compare_op_int` used to fire 61 times here, on the int compares whose
+# descent declined at a helper call inside the compare helper's body; that
+# call now resumes at the enclosing helper, the descent takes those sites, and
+# the fold is consulted only where the descent declines.
 # Memoized vs plain recursion with post-warm-up branch divergence. The
 # memo-dict store (memo[n] = r) once died with a TypeError after warm-up
 # (an empty-string type name from a clobbered class read on the dict-store

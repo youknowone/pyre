@@ -138,9 +138,10 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     // The undeduplicated `keys` / `values` / `items` scan behind the same
     // proxy, and the count `__len__` answers without materializing anything.
     // Both are bounded by the very `locals_plus_names` array `fast2locals`
-    // walks; each pairs that green scan with an extras half that is bounded by
-    // a dict length instead, which is why the extras half lives in its own
-    // unhinted function (`pin_extra_locals_entries`) and stays a residual call.
+    // walks.  The `f_extra_locals` half is bounded by a dict length instead:
+    // `entry_count` reads that length, and the collectors below append that
+    // half through `dont_look_inside` helpers (`append_extra_locals`,
+    // `append_extra_locals_items`) that stay residual calls.
     //
     // `entry_count` is named for what it counts rather than `length` because
     // this table matches by leaf and `length` is already the leaf of
@@ -168,9 +169,9 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
         "entry_count",
         "fast2locals' scan of the same locals-plus array, counted only",
     ),
-    // `keys` / `values` / `items` / `__reversed__` collect the pairs
-    // `pin_entries` just pinned.  The loop is bounded by that count — the
-    // same green `locals_plus_names` walk `fast2locals` unrolls — so the
+    // `collect_entries` (behind `keys` / `values`) and `items` collect the
+    // pairs `pin_entries` just pinned.  The loop is bounded by that count —
+    // the same green `locals_plus_names` walk `fast2locals` unrolls — so the
     // hint is the same one.  Without it `contains_loop` declines the
     // collect even though `pin_entries` is already hinted, and
     // `sorted(fr.f_locals)` (via `framelocalsproxy_iter` → `keys`) is one
@@ -178,50 +179,15 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     //
     // Evidence class is `frame_locals_proxy_snapshot`, not `*_nohidden`:
     // `exception_vable_frame_virtual_local` reaches `keys` from the
-    // traced `drive` except handler.  The extras half stays residual
-    // (`pin_extra_locals_entries` is unhinted).
-    ("keys", "fast2locals' scan collected as the proxy keys list"),
+    // traced `drive` except handler.  The extras half is not in these
+    // loops: it is appended by the residual `append_extra_locals{,_items}`.
     (
-        "values",
-        "fast2locals' scan collected as the proxy values list",
+        "collect_entries",
+        "fast2locals' scan collected as the proxy keys or values list",
     ),
     (
         "items",
         "fast2locals' scan collected as the proxy items list",
-    ),
-    (
-        "__reversed__",
-        "fast2locals' scan collected as the reversed proxy keys list",
-    ),
-    // `look_inside_iff` does `func = unroll_safe(func)` (`rlib/jit.py`
-    // `look_inside_iff.inner`).  Harvested name is the inlined original.
-    //
-    // `listobject.py ListStrategy._extend_from_tuple` carries
-    // `@jit.look_inside_iff(loop_unrolling_heuristic(tup_w, len, UNROLL_CUTOFF))`.
-    (
-        "_orig_extend_from_tuple",
-        "rlib/jit.py look_inside_iff unroll_safe(_extend_from_tuple)",
-    ),
-    // Same cutoff on the list and set donor arms so a descent of
-    // `list.__init__` → `extend` after `clear` does not see an un-lowered
-    // helper.  PyPy's `_extend_from_list` is per-strategy and residual when
-    // loopy; pyre's residual ABI cannot call a graph that has no jitcode.
-    (
-        "_orig_extend_from_list",
-        "listobject.py _extend_from_list small-source unroll (residual ABI)",
-    ),
-    (
-        "_orig_extend_from_set",
-        "listobject.py set donor arm, same UNROLL_CUTOFF as _extend_from_tuple",
-    ),
-    // PyPy's `_do_extend_from_iterable` is a `_do_extend_jitdriver` portal
-    // (`listobject.py`).  Until that driver is ported, a small iterator
-    // (length_hint <= UNROLL_CUTOFF) unrolls into the caller — the same
-    // cutoff `_extend_from_tuple` already uses.  A larger iterator stays
-    // residual, which is the fused-graph behaviour this split replaced.
-    (
-        "_orig_do_extend_from_iterable",
-        "listobject.py _do_extend_from_iterable small-source unroll until the JitDriver",
     ),
     // `pyopcode.py` `dispatch_bytecode` is `@jit.unroll_safe`; its
     // EXTENDED_ARG loop is split here into the interpreter decoder and the

@@ -1299,6 +1299,19 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         w_list_new_empty,
     );
     p0(&mut entries, "w_list_new_empty", w_list_new_empty);
+    let w_list_allocate_instance: fn(pyre_object::PyObjectRef) -> pyre_object::PyObjectRef =
+        pyre_object::listobject::w_list_allocate_instance;
+    pa1(
+        &mut entries,
+        "pyre_object::listobject::w_list_allocate_instance",
+        "pyre_object::w_list_allocate_instance",
+        w_list_allocate_instance,
+    );
+    p1(
+        &mut entries,
+        "w_list_allocate_instance",
+        w_list_allocate_instance,
+    );
     let w_list_new_object_with_sizehint: fn(i64) -> pyre_object::PyObjectRef =
         pyre_object::listobject::w_list_new_object_with_sizehint;
     pa1(

@@ -3403,6 +3403,16 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // `is_abi_unsound_argument_residual` names exactly the helpers published
     // with such a parameter, so the descent declines before running one and
     // the interpreter makes the call with the argument whole.
+    //
+    // A may-force residual inside a transparent helper is declined for the
+    // resume it would need.  Its GUARD_NOT_FORCED and GUARD_NO_EXCEPTION fail
+    // after the Python code it called back into has run: a callback that
+    // raises forces the caller's frame vref on `leave`, and so does one that
+    // escapes its frame.  `capture_resumedata` resumes such a guard inside the
+    // helper's own frame, past the call.  A transparent helper has no frame of
+    // its own, so its guards resume at the Python CALL that entered it, and
+    // the CALL runs the callback a second time -- or, with the exception still
+    // pending at that coordinate, lets it past the CALL's handler.
     let unsupported_funcbox = if ctx.fbw_mode.inline_subwalk
         && allboxes.first().is_some_and(|b| b.is_constant())
         && let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(allboxes[0])
@@ -3415,6 +3425,8 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // A real funcptr reached here, so there is no hash to carry, and
             // zero is what this variant spells for that.
             Some(("abi-unsound-arg", addr, 0))
+        } else if ctx.fbw_mode.transparent_helper_subwalk && call_opcode.is_call_may_force() {
+            Some(("may-force-in-transparent-helper", addr, 0))
         } else {
             None
         }

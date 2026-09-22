@@ -20314,20 +20314,35 @@ pub(crate) fn orthodox_list_append_body_and_sym<Sym: WalkSym>(
     Some((sub_body, sym_ptr))
 }
 
-/// The entry frame a helper sub-walk pushes when the walk is inside an
-/// inlined callee (`fbw_mode.inline_subwalk`): the callee preserved at the
-/// helper's entry, so a guard in the helper rebuilds it and re-executes the
-/// helper.  `None` at the root level, which stays on the caller-boundary
-/// resume (see `try_walker_inline_builtin_call`).  An `Err` is a decline:
-/// nothing has been recorded.
+/// Where the guards of a helper sub-walk resume.
+pub(crate) enum HelperEntry {
+    /// Root level: the caller-boundary resume at the full-body sym's
+    /// coordinate for the call (see `try_walker_inline_builtin_call`).
+    Root,
+    /// Inside an inlined Python callee: the callee paused at the helper's
+    /// CALL, pushed as the helper's entry frame, so a guard in the helper
+    /// rebuilds it and re-executes the helper.
+    Callee(InlineParentFrame),
+    /// Inside another canonical helper body.  That helper has no Python
+    /// frame of its own, so a guard here resumes where the enclosing
+    /// helper's guards do: the coordinates and paused levels it already
+    /// published, re-executing the outermost helper call.
+    EnclosingHelper,
+}
+
+/// The [`HelperEntry`] for a helper call at `op_pc` of the current walk.
+/// An `Err` is a decline: nothing has been recorded.
 fn orthodox_helper_nested_entry<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
-) -> Result<Option<InlineParentFrame>, InlineCallerFrameDecline> {
-    if !ctx.fbw_mode.inline_subwalk {
-        return Ok(None);
+) -> Result<HelperEntry, InlineCallerFrameDecline> {
+    if ctx.fbw_mode.transparent_helper_subwalk {
+        return Ok(HelperEntry::EnclosingHelper);
     }
-    compute_inline_helper_call_entry_frame(ctx, op_pc).map(Some)
+    if !ctx.fbw_mode.inline_subwalk {
+        return Ok(HelperEntry::Root);
+    }
+    compute_inline_helper_call_entry_frame(ctx, op_pc).map(HelperEntry::Callee)
 }
 
 /// Enter a canonical helper body as a sub-jitcode walk from a walker fold.
@@ -20350,11 +20365,11 @@ fn orthodox_helper_nested_entry<Sym: WalkSym>(
 /// `call_site_label` names it in the active-box collection.
 ///
 /// `nested_entry` is [`orthodox_helper_nested_entry`]'s answer for `op_pc`:
-/// inside an inlined callee the helper's guards resume at that callee's
-/// own coordinate (the entry frame it pushes plus the sub-walk's outer
-/// coordinate/active boxes), not at the full-body sym's -- the same model
-/// `try_walker_inline_builtin_call` applies.  Resolving the full-body
-/// coordinate from a callee `op_pc` restored the wrong frame image after
+/// inside an inlined callee or another helper the helper's guards resume at
+/// the enclosing coordinate (the entry frame pushed for a callee, plus the
+/// sub-walk's outer coordinate/active boxes), not at the full-body sym's --
+/// the same model `try_walker_inline_builtin_call` applies.  Resolving the
+/// full-body coordinate from a callee `op_pc` restored the wrong frame image after
 /// an overflow guard failed in `step` of `a, b = step(a, b)`.
 #[allow(clippy::too_many_arguments)]
 fn run_orthodox_helper_subwalk<Sym: WalkSym>(
@@ -20362,7 +20377,7 @@ fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     op_pc: usize,
     sym: &Sym,
     sub_body: &SubJitCodeBody,
-    nested_entry: Option<InlineParentFrame>,
+    nested_entry: HelperEntry,
     fallback_label: &'static str,
     call_site_label: &'static str,
     int_args: &[OpRef],
@@ -20371,7 +20386,7 @@ fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     ref_arg_concretes: &[ConcreteValue],
     float_args: &[OpRef],
 ) -> Result<(DispatchOutcome, majit_metainterp::recorder::TracePosition), DispatchError> {
-    let nested_helper = nested_entry.is_some();
+    let nested_helper = !matches!(nested_entry, HelperEntry::Root);
     let (call_site_py_pc, vsd_value, outer_jitcode_index, call_site_marker) = if nested_helper {
         (
             ctx.entry_py_pc(),
@@ -20488,8 +20503,12 @@ fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     let walk_start = ctx.trace_ctx.get_trace_position();
     let saved_fbw_mode = ctx.fbw_mode;
     ctx.fbw_mode.inline_subwalk = true;
-    let helper_frame =
-        nested_entry.map(|frame| InlineFrameGuard::enter(ctx.session, 0, false, vec![frame]));
+    let helper_frame = match nested_entry {
+        HelperEntry::Callee(frame) => {
+            Some(InlineFrameGuard::enter(ctx.session, 0, false, vec![frame]))
+        }
+        HelperEntry::Root | HelperEntry::EnclosingHelper => None,
+    };
     let walk_result = run_sub_jitcode_walk(
         ctx,
         op_pc,

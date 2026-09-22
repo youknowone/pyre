@@ -846,7 +846,12 @@ fn fill_user_function_args(
         let mut msg = Wtf8Buf::new();
         msg.push_wtf8(&fname);
         msg.push_str(&format!("() takes {takes_str} but {given_str} given"));
-        return Err(crate::PyError::type_error(msg));
+        return Err(crate::builtins::applevel_binding_error(
+            callable,
+            args,
+            &[],
+            crate::PyError::type_error(msg),
+        ));
     }
 
     // Lay out filled_args as `[positional[0..nparams], kwonly[0..nkwonly]]`
@@ -945,11 +950,13 @@ fn fill_user_function_args(
     }
     if !missing_positional.is_empty() {
         let fname = unsafe { crate::function_get_qualname(roots.get(header_base)) };
-        return Err(crate::PyError::type_error(format_missing_err(
-            &fname,
-            &missing_positional,
-            true,
-        )));
+        let err = crate::PyError::type_error(format_missing_err(&fname, &missing_positional, true));
+        return Err(crate::builtins::applevel_binding_error(
+            roots.get(header_base),
+            args,
+            &[],
+            err,
+        ));
     }
 
     let mut missing_kwonly: Vec<&str> = Vec::new();
@@ -961,11 +968,13 @@ fn fill_user_function_args(
     }
     if !missing_kwonly.is_empty() {
         let fname = unsafe { crate::function_get_qualname(roots.get(header_base)) };
-        return Err(crate::PyError::type_error(format_missing_err(
-            &fname,
-            &missing_kwonly,
-            false,
-        )));
+        let err = crate::PyError::type_error(format_missing_err(&fname, &missing_kwonly, false));
+        return Err(crate::builtins::applevel_binding_error(
+            roots.get(header_base),
+            args,
+            &[],
+            err,
+        ));
     }
 
     // Append positional overflow AFTER kwonly slots so `pack_varargs` sees
@@ -1044,6 +1053,35 @@ fn format_unknown_kwds_err(fname: &Wtf8, unmatched: &[Wtf8Buf]) -> Wtf8Buf {
         ));
     }
     msg
+}
+
+/// A `resolve_kwargs` binding error, split back into positionals and
+/// keyword names for `builtins::applevel_binding_error`.
+#[cold]
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn resolve_kwargs_binding_error(
+    callable: PyObjectRef,
+    args: &[PyObjectRef],
+    kwarg_names: PyObjectRef,
+    err: PyError,
+) -> PyError {
+    let nkw = if !kwarg_names.is_null() && unsafe { pyre_object::is_tuple(kwarg_names) } {
+        unsafe { pyre_object::w_tuple_len(kwarg_names) }
+    } else {
+        0
+    };
+    let mut kw_names = Vec::with_capacity(nkw);
+    for ki in 0..nkw {
+        match unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) } {
+            Some(name) if unsafe { pyre_object::is_str(name) } => {
+                kw_names.push(unsafe { pyre_object::w_str_get_wtf8(name) }.to_owned());
+            }
+            _ => return err,
+        }
+    }
+    let n_pos = args.len().saturating_sub(nkw);
+    crate::builtins::applevel_binding_error(callable, &args[..n_pos], &kw_names, err)
 }
 
 #[cold]
@@ -1321,7 +1359,20 @@ pub fn builtin_code_call_positional(
             let fname = unsafe {
                 crate::gateway::builtin_code_call_name(current_code, current_args.first().copied())
             };
-            let bound = bind_kwargs_to_signature(sig, &fname, current_args, &[])?;
+            let bound = match bind_kwargs_to_signature(sig, &fname, current_args, &[]) {
+                Ok(bound) => bound,
+                Err(err) => {
+                    return Err(unsafe {
+                        crate::gateway::builtin_code_binding_error(
+                            current_code,
+                            sig,
+                            current_args,
+                            &[],
+                            err,
+                        )
+                    });
+                }
+            };
             return unsafe { crate::builtin_code_call(current_code, &bound) };
         }
     }
@@ -2026,7 +2077,17 @@ fn call_kw_in_ctx_impl(
         (callable_unwrapped, None)
     };
     let call_args: &[PyObjectRef] = prepended.as_deref().unwrap_or(&args);
-    let resolved = resolve_kwargs(target_func, call_args, kwarg_names)?;
+    let resolved = match resolve_kwargs(target_func, call_args, kwarg_names) {
+        Ok(resolved) => resolved,
+        Err(err) => {
+            return Err(resolve_kwargs_binding_error(
+                target_func,
+                call_args,
+                kwarg_names,
+                err,
+            ));
+        }
+    };
     // Drop the temporary prepended buffer once resolved is built.
     prepended = None;
     let _ = prepended;
@@ -3338,7 +3399,22 @@ fn call_with_kwargs_in_ctx_impl(
                         pos_args.first().copied(),
                     )
                 };
-                let bound = bind_kwargs_to_signature(sig, &fname, pos_args, kwargs)?;
+                let bound = match bind_kwargs_to_signature(sig, &fname, pos_args, kwargs) {
+                    Ok(bound) => bound,
+                    Err(err) => {
+                        let kw_names: Vec<Wtf8Buf> =
+                            kwargs.iter().map(|(name, _)| name.clone()).collect();
+                        return Err(unsafe {
+                            crate::gateway::builtin_code_binding_error(
+                                code as pyre_object::PyObjectRef,
+                                sig,
+                                pos_args,
+                                &kw_names,
+                                err,
+                            )
+                        });
+                    }
+                };
                 // Under an active C-level profiler the call must still emit
                 // `c_call_trace` / `c_return_trace`, so route the bound flat
                 // slice through the profile-aware path like the marker branch
@@ -3540,6 +3616,19 @@ fn call_with_kwargs_in_ctx_impl(
             // (`argument.py:289`) so a duplicate/positional-only/unknown-keyword
             // error on the same call wins first.
             let too_many_args = pos_args.len() > n_pos_params && !has_varargs;
+            // Every binding error below goes through
+            // `builtins::applevel_binding_error` with the rooted words.
+            let binding_error = |err: PyError| {
+                let positional: Vec<PyObjectRef> =
+                    (0..pos_args.len()).map(current_pos_arg).collect();
+                let kw_names: Vec<Wtf8Buf> = kwargs.iter().map(|(name, _)| name.clone()).collect();
+                crate::builtins::applevel_binding_error(
+                    current_callable(),
+                    &positional,
+                    &kw_names,
+                    err,
+                )
+            };
 
             // Build parameter array
             let mut result = vec![pyre_object::PY_NULL; total_params];
@@ -3585,7 +3674,7 @@ fn call_with_kwargs_in_ctx_impl(
                             let mut msg = Wtf8Buf::new();
                             msg.push_wtf8(&fname);
                             msg.push_str(&format!("() got multiple values for argument '{key}'"));
-                            return Err(crate::PyError::type_error(msg));
+                            return Err(binding_error(crate::PyError::type_error(msg)));
                         }
                         result[pi] = value;
                         matched = true;
@@ -3603,12 +3692,14 @@ fn call_with_kwargs_in_ctx_impl(
 
             // argument.py — ArgErrPosonlyAsKwds, raised after the
             // full keyword scan and before ArgErrUnknownKwds.
-            raise_if_posonly_kwds(&posonly_kwds, &fname)?;
+            if let Err(err) = raise_if_posonly_kwds(&posonly_kwds, &fname) {
+                return Err(binding_error(err));
+            }
 
             // `argument.py:270-271` ArgErrUnknownKwds.
             if !unmatched_kw_names.is_empty() {
                 let msg = format_unknown_kwds_err(&fname, &unmatched_kw_names);
-                return Err(crate::PyError::type_error(msg));
+                return Err(binding_error(crate::PyError::type_error(msg)));
             }
 
             // `argument.py:289` — too-many-positionals raised here, after the
@@ -3647,7 +3738,7 @@ fn call_with_kwargs_in_ctx_impl(
                 let mut msg = Wtf8Buf::new();
                 msg.push_wtf8(&fname);
                 msg.push_str(&format!("() takes {takes_str} but {given_str} given"));
-                return Err(crate::PyError::type_error(msg));
+                return Err(binding_error(crate::PyError::type_error(msg)));
             }
 
             // Fill positional defaults from __defaults__ tuple, on the signed
@@ -3710,10 +3801,8 @@ fn call_with_kwargs_in_ctx_impl(
                 }
             }
             if !missing_positional.is_empty() {
-                return Err(crate::PyError::type_error(format_missing_err(
-                    &fname,
-                    &missing_positional,
-                    true,
+                return Err(binding_error(crate::PyError::type_error(
+                    format_missing_err(&fname, &missing_positional, true),
                 )));
             }
             let mut missing_kwonly: Vec<&str> = Vec::new();
@@ -3724,10 +3813,8 @@ fn call_with_kwargs_in_ctx_impl(
                 }
             }
             if !missing_kwonly.is_empty() {
-                return Err(crate::PyError::type_error(format_missing_err(
-                    &fname,
-                    &missing_kwonly,
-                    false,
+                return Err(binding_error(crate::PyError::type_error(
+                    format_missing_err(&fname, &missing_kwonly, false),
                 )));
             }
 

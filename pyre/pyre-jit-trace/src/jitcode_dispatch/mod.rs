@@ -9121,7 +9121,11 @@ unsafe fn resolve_type_call_builtin_new(
         let ConcreteValue::Ref(arg) = arg else {
             return None;
         };
-        if arg.is_null() || *arg == pyre_object::PY_NULL {
+        if arg.is_null()
+            || *arg == pyre_object::PY_NULL
+            || (pyre_object::tagged_int::CAN_BE_TAGGED
+                && pyre_object::tagged_int::is_tagged_int(*arg))
+        {
             return None;
         }
         let w_class = unsafe { (**arg).w_class };

@@ -59,6 +59,10 @@ fn wrap_as_builtin_function(func: PyObjectRef) -> PyObjectRef {
         payload.ob.w_class = pyre_object::pyobject::get_instantiate(&crate::BUILTIN_FUNCTION_TYPE);
         payload.can_change_code = false;
         payload.mutate_slots = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+        // BuiltinFunction.typedef has no instance dict (`hasdict=false`);
+        // a copied Function dict would leak `__code__` / `__defaults__`
+        // / `__globals__` as hasattr-true instance attributes.
+        payload.w_func_dict = pyre_object::PY_NULL;
         pyre_object::lltype::malloc_typed_stable(payload) as PyObjectRef
     }
 }
@@ -85,10 +89,22 @@ fn app_sorted() -> PyResult {
         &["sorted"],
     )?;
     let w_app_globals = pyre_object::gc_roots::shadow_stack_get(save_point);
-    let func = wrap_as_builtin_function(
-        unsafe { pyre_object::w_dict_getitem_str(w_app_globals, "sorted") }
-            .unwrap_or_else(|| panic!("app_functional: `sorted` not bound")),
+    let raw = unsafe { pyre_object::w_dict_getitem_str(w_app_globals, "sorted") }
+        .unwrap_or_else(|| panic!("app_functional: `sorted` not bound"));
+    let raw_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(raw);
+    // Stamp the doc on the still-mutable Function; wrap copies `w_doc`.
+    // `function.py` keeps PyPy's `sorted(...) --> new sorted list` on the
+    // PyCode; the GetSet reads `w_doc` first.
+    let doc = pyre_object::w_str_new(
+        "Return a new list containing all items from the iterable in ascending order.\n\nA custom key function can be supplied to customize the sort order, and the\nreverse flag can be set to request the result in descending order.",
     );
+    let raw = pyre_object::gc_roots::shadow_stack_get(raw_slot);
+    unsafe {
+        crate::function::function_set_doc(raw, doc).expect("app-level Function is mutable");
+    }
+    let raw = pyre_object::gc_roots::shadow_stack_get(raw_slot);
+    let func = wrap_as_builtin_function(raw);
     let mut handle = HANDLE.lock();
     if *handle == 0 {
         *handle = func as usize;
@@ -124,10 +140,21 @@ pub(crate) fn install_applevel_builtins() {
     // `func` is the old-gen BuiltinFunction; `w_str_new` may allocate in
     // the nursery.  Reload `func` after that alloc (it cannot move) and
     // let `fset_func_text_signature` run the old-to-young write barrier.
+    //
+    // `function.py BuiltinFunction.descr_builtinfunction__self__` is
+    // `always_none` unless `w_moduleobj` is set.  The clinic
+    // `$module` text signature plus the builtins module as `__self__`
+    // is what inspect.signature strips to `(iterable, /, *, key=None,
+    // reverse=False)`.
     let sig = pyre_object::w_str_new("($module, iterable, /, *, key=None, reverse=False)");
     let func = pyre_object::gc_roots::shadow_stack_get(func_slot);
     unsafe {
         crate::function::fset_func_text_signature(func, sig);
+    }
+    let func = pyre_object::gc_roots::shadow_stack_get(func_slot);
+    let w_builtin = unsafe { (*ctx).get_builtin() };
+    unsafe {
+        crate::function::builtin_function_set_module_obj(func, w_builtin);
     }
 }
 
@@ -141,9 +168,20 @@ pub(crate) fn walk_handle_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 /// Trampoline occupying `builtins.sorted` until
 /// [`install_applevel_builtins`] replaces it.  First call also publishes
 /// the app-level function, then delegates.
-pub fn builtin_sorted(args: &[PyObjectRef]) -> PyResult {
+///
+/// Named `__majit_wrap_*` because it is a `BuiltinCode.func`: the descriptor
+/// below puts it in that PBC family, which admits `__majit_wrap_` leaves only.
+pub fn __majit_wrap_builtin_sorted(args: &[PyObjectRef]) -> PyResult {
     install_applevel_builtins();
     crate::call::call_function_impl_result(app_sorted()?, args)
+}
+
+/// Identity of the published app-level `sorted` BuiltinFunction.  Compares
+/// addresses only, so a stale word never matches: the published object is
+/// allocated old and never moves.
+pub(crate) fn is_published_sorted(func: PyObjectRef) -> bool {
+    let cached = *HANDLE.lock();
+    cached != 0 && func as usize == cached
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -151,6 +189,10 @@ pub fn builtin_sorted(args: &[PyObjectRef]) -> PyResult {
 #[allow(non_upper_case_globals)]
 static __majit_builtin_wrapper_target_app_sorted: crate::gateway::BuiltinWrapperDescriptor =
     crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(module_path!(), "::", stringify!(builtin_sorted)),
-        func: builtin_sorted,
+        path: concat!(
+            module_path!(),
+            "::",
+            stringify!(__majit_wrap_builtin_sorted)
+        ),
+        func: __majit_wrap_builtin_sorted,
     };

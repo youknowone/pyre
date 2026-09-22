@@ -576,18 +576,24 @@ pub fn list_method_append(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     Ok(w_none())
 }
 
-/// `listobject.py UNROLL_CUTOFF`.  `_extend_from_tuple` looks inside iff
-/// `loop_unrolling_heuristic(tup_w, len(tup_w), UNROLL_CUTOFF)`.
-const LIST_UNROLL_CUTOFF: usize = 5;
-
 /// `listobject.py ListStrategy.extend` — dispatcher only.  Each arm's loop
 /// lives in its own function so `contains_loop` cannot decline this graph
 /// and turn `list(iterable)` / `sorted(x)` into one residual CALL.
 pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_list_receiver(args, "extend", true)?;
     arity_exact(args, "extend", 1)?;
-    let list = args[0];
-    let other = args[1];
+    list_extend_items(args[0], args[1])?;
+    Ok(w_none())
+}
+
+/// `ListStrategy.extend` without the gateway arity/receiver checks.
+/// `descr_init` calls this after its own receiver check so the descent
+/// scan of `list((i, 3, 1))` does not inherit `args.first` / `format!`
+/// from `require_list_receiver`.
+pub(crate) fn list_extend_items(
+    list: PyObjectRef,
+    other: PyObjectRef,
+) -> Result<(), crate::PyError> {
     // listobject.py extend only takes the storage-copy path when a
     // list/tuple uses its inherited iterator.  An overridden subclass
     // must use the generic incremental iterator path below.
@@ -603,22 +609,15 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     } else {
         extend_from_iterable(list, other)?;
     }
-    Ok(w_none())
+    Ok(())
 }
 
-/// `listobject.py ListStrategy._extend_from_list`.  Upstream is per-strategy
-/// and residual when loopy; pyre's residual ABI cannot call a graph that
-/// has no jitcode, so a descent of `list.__init__` → `extend` after `clear`
-/// would see an un-lowered helper and refuse the whole `list(x)`.  Same
-/// cutoff `_extend_from_tuple` already uses.  Convergence: residual-call
-/// loopy graphs, or the per-strategy split so this arm stays residual with
-/// its own jitcode.
-fn extend_from_list_iff(_list: PyObjectRef, other: PyObjectRef) -> bool {
-    let n = unsafe { w_list_len(other) };
-    majit_rlib::jit::loop_unrolling_heuristic(&other, n, LIST_UNROLL_CUTOFF)
-}
-
-#[majit_macros::look_inside_iff(extend_from_list_iff)]
+/// `listobject.py ListStrategy._extend_from_list`, a per-strategy storage
+/// copy (`l += ...`) the JIT calls rather than inlines.  The
+/// `dont_look_inside` call target gives that residual call a real fnaddr,
+/// which the descent scan of `descr_init` requires of every helper it can
+/// reach.
+#[majit_macros::dont_look_inside]
 fn extend_from_list(mut list: PyObjectRef, mut other: PyObjectRef) -> Result<(), crate::PyError> {
     unsafe {
         // BaseRangeListStrategy.extend switches its receiver before even
@@ -655,14 +654,17 @@ fn extend_from_list(mut list: PyObjectRef, mut other: PyObjectRef) -> Result<(),
     Ok(())
 }
 
-/// `listobject.py ListStrategy._extend_from_tuple`:
-/// `@jit.look_inside_iff(lambda self, w_list, tup_w: jit.loop_unrolling_heuristic(tup_w, len(tup_w), UNROLL_CUTOFF))`.
-fn extend_from_tuple_iff(_list: PyObjectRef, other: PyObjectRef) -> bool {
-    let n = unsafe { w_tuple_len(other) };
-    majit_rlib::jit::loop_unrolling_heuristic(&other, n, LIST_UNROLL_CUTOFF)
-}
-
-#[majit_macros::look_inside_iff(extend_from_tuple_iff)]
+/// `listobject.py ListStrategy._extend_from_tuple`.
+///
+/// PRE-EXISTING-ADAPTATION: upstream is
+/// `@jit.look_inside_iff(loop_unrolling_heuristic(tup_w, len(tup_w),
+/// UNROLL_CUTOFF))`.  Here it is residual, because the body's
+/// `w_list_reserve_for_extend` and `w_list_append_preallocated` both take
+/// `w_list_lock`, an un-lowered helper, and the descent scan of
+/// `descr_init` reaches this body whatever the tuple's length and so refuses
+/// every `list(x)` descent.  Restoring `look_inside_iff` needs those two
+/// storage writes without the lock helper in the traced graph.
+#[majit_macros::dont_look_inside]
 fn extend_from_tuple(list: PyObjectRef, other: PyObjectRef) -> Result<(), crate::PyError> {
     unsafe {
         let n = w_tuple_len(other);
@@ -677,16 +679,10 @@ fn extend_from_tuple(list: PyObjectRef, other: PyObjectRef) -> Result<(), crate:
 }
 
 /// Snapshot a builtin set/frozenset into the list.  `ListStrategy.extend`
-/// has no `_extend_from_set`; sets fall through `_extend_from_iterable`.
-/// This is the listview snapshot that already lived in `list_method_extend`,
-/// extracted so `contains_loop` cannot decline the dispatcher.  Same cutoff
-/// as `_extend_from_tuple` until `_do_extend_jitdriver` is ported.
-fn extend_from_set_iff(_list: PyObjectRef, other: PyObjectRef) -> bool {
-    let n = unsafe { pyre_object::w_set_len(other) };
-    majit_rlib::jit::loop_unrolling_heuristic(&other, n, LIST_UNROLL_CUTOFF)
-}
-
-#[majit_macros::look_inside_iff(extend_from_set_iff)]
+/// has no `_extend_from_set`; sets fall through `_extend_from_iterable`,
+/// whose drain upstream never inlines either.  Residual for the same
+/// fnaddr reason as `_extend_from_list`.
+#[majit_macros::dont_look_inside]
 fn extend_from_set(list: PyObjectRef, other: PyObjectRef) -> Result<(), crate::PyError> {
     // PyPy's listview optimization snapshots builtin set storage.
     // In free-threaded pyre this is also the operation boundary that
@@ -712,16 +708,11 @@ fn extend_from_set(list: PyObjectRef, other: PyObjectRef) -> Result<(), crate::P
     Ok(())
 }
 
-/// `listobject.py ListStrategy._extend_from_iterable`.  No loop of its own:
-/// `iter` / `length_hint` / reserve live here so `look_inside_graph` admits
-/// this graph, and the drain loop is `_do_extend_from_iterable`.
-///
-/// `listobject.py` obtains the iterator inside `_do_extend_from_iterable`
-/// because `_do_extend_jitdriver` rewrite lifts that prologue out of the
-/// portal.  Written here instead, matching `unpackiterable` /
-/// `_unpackiterable_unknown_length` (iterator created before the portal
-/// body).  `list_extend_iter_lock_held` also obtains the iterator before
-/// the original iterable's length hint.
+/// `listobject.py ListStrategy._extend_from_iterable`.  Upstream drains
+/// through the `_do_extend_jitdriver` portal, so the caller's trace never
+/// inlines the drain; here the whole arm is one residual call, which is
+/// what `list(FrameLocalsProxy)` calls with a real fnaddr.
+#[majit_macros::dont_look_inside]
 fn extend_from_iterable(list: PyObjectRef, other: PyObjectRef) -> Result<(), crate::PyError> {
     // Hint failures other than TypeError/AttributeError are observable and
     // propagate without appending a prefix.  Append each yielded value
@@ -771,7 +762,6 @@ fn extend_from_iterable(list: PyObjectRef, other: PyObjectRef) -> Result<(), cra
     do_extend_from_iterable(
         pyre_object::gc_roots::shadow_stack_get(root_base),
         pyre_object::gc_roots::shadow_stack_get(root_base + 2),
-        hint,
     )?;
     unsafe {
         pyre_object::listobject::w_list_finish_extend(pyre_object::gc_roots::shadow_stack_get(
@@ -781,27 +771,14 @@ fn extend_from_iterable(list: PyObjectRef, other: PyObjectRef) -> Result<(), cra
     Ok(())
 }
 
-/// `listobject.py _do_extend_from_iterable`.  PyPy's drain is a
-/// `_do_extend_jitdriver` portal (`greens=['strategy_type', 'greenkey']`);
-/// that driver is not ported yet, so a small iterator unrolls into the
-/// caller instead — the same cutoff `_extend_from_tuple` already uses.
-/// A larger iterator stays a residual CALL, which is today's fused-graph
-/// behaviour for this arm.
-fn do_extend_from_iterable_iff(_list: PyObjectRef, _w_iterator: PyObjectRef, hint: usize) -> bool {
-    // A default/unknown hint is 0; unrolling that would enter every
-    // generic iterator.  Only a positive, small hint unrolls — the same
-    // cutoff `_extend_from_tuple` already uses.  Empty is one
-    // StopIteration and stays residual.  The hint is the one
-    // `_extend_from_iterable` already computed from the original
-    // iterable (`FrameLocalsProxy.__len__` is the green `entry_count`).
-    hint > 0 && hint <= LIST_UNROLL_CUTOFF
-}
-
-#[majit_macros::look_inside_iff(do_extend_from_iterable_iff)]
+/// `listobject.py _do_extend_from_iterable`.  Upstream drains through the
+/// `_do_extend_jitdriver` portal (`greens=['strategy_type', 'greenkey']`),
+/// which is not ported; here the drain runs inside the residual
+/// [`extend_from_iterable`].  A length hint is advisory, so it cannot bound
+/// an unrolled drain either.
 fn do_extend_from_iterable(
     list: PyObjectRef,
     w_iterator: PyObjectRef,
-    _hint: usize,
 ) -> Result<(), crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::pin_roots(&[list, w_iterator]);
@@ -942,48 +919,10 @@ pub fn list_method_reverse(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     Ok(w_none())
 }
 
-/// PyPy: listobject.py descr_sort — list.sort()
+/// PyPy: listobject.py descr_sort — list.sort().  The body is the
+/// `interp2app` leaf [`crate::typedef::__majit_wrap_list_descr_sort`].
 pub fn list_method_sort(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_list_receiver(args, "sort", true)?;
-    // Keep the argument decoding shared with `sorted()` before changing the
-    // receiver's visible storage.
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    // `sort($self, /, *, key=None, reverse=False)` — the receiver is the only
-    // positional slot, so everything after it has to arrive by keyword.
-    crate::builtins::clinic_arity(
-        "sort",
-        positional.len() - 1,
-        crate::builtins::real_kwarg_count(kwargs),
-        0,
-        0,
-        2,
-    )?;
-    crate::builtins::kwarg_reject_unknown(kwargs, &["key", "reverse"], "sort")?;
-    // `reverse=` runs a user `__bool__`, which reaches a safepoint and can move
-    // the receiver and the key callable.  `args` is a native copy the collector
-    // does not update (`call.rs` `call_builtin_code_positional`), so both have
-    // to be pinned before the call and reloaded after, as `tuple_method_index`
-    // does around `eq_w`.  `w_none` stands in when no key was given, keeping the
-    // two roots adjacent so one base covers both.
-    let key_obj = crate::builtins::kwarg_get(kwargs, "key").unwrap_or_else(w_none);
-    let reverse_obj = crate::builtins::kwarg_get(kwargs, "reverse");
-    let _roots = pyre_object::gc_roots::push_roots();
-    let list_slot = if let Some(reverse_obj) = reverse_obj {
-        pyre_object::gc_roots::pin_roots(&[args[0], key_obj, reverse_obj])
-    } else {
-        pyre_object::gc_roots::pin_roots(&[args[0], key_obj])
-    };
-
-    let reverse = if reverse_obj.is_some() {
-        crate::baseobjspace::is_true(pyre_object::gc_roots::shadow_stack_get(list_slot + 2))?
-    } else {
-        false
-    };
-
-    let key_arg = pyre_object::gc_roots::shadow_stack_get(list_slot + 1);
-    let key_fn = unsafe { !pyre_object::is_none(key_arg) }.then_some(key_arg);
-    crate::builtins::sort_list_in_place(list_slot, key_fn, reverse)?;
-    Ok(w_none())
+    crate::typedef::__majit_wrap_list_descr_sort(args)
 }
 
 /// listobject.py `descr_index` — list.index(value[, start[, stop]]).

@@ -9589,7 +9589,17 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
             // Pyre shares the Rust Function representation, so preserve that
             // app-level distinction here: builtin functions do not expose
             // Python-function storage attributes.
-            if crate::is_builtin_code(crate::getcode(obj) as PyObjectRef)
+            //
+            // `function.py BuiltinFunction.typedef` copies Function's
+            // rawdict, so hasattr(__code__) is True on PyPy.  The
+            // published type is `PyCFunction_Type` (`meth_getsets` has
+            // no __code__/__defaults__/__globals__); interp-level
+            // builtins already hide via the BuiltinCode arm.  A
+            // MixedModule BuiltinFunction that still carries a PyCode
+            // (`app_functional.sorted`) takes the same hide.
+            let hide_func_storage = crate::is_builtin_code(crate::getcode(obj) as PyObjectRef)
+                || py_type_check(obj, &crate::function::BUILTIN_FUNCTION_TYPE);
+            if hide_func_storage
                 && matches!(
                     name,
                     "__code__" | "__globals__" | "__closure__" | "__defaults__" | "__kwdefaults__"

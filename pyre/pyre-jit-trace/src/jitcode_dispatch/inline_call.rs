@@ -3403,6 +3403,100 @@ unsafe fn fbw_reorder_call_kw_args(
     Some((out_args, out_conc))
 }
 
+/// Permute a builtin CALL_KW into the gateway Signature's parameter
+/// order.  Keyword VALUES stay the traced boxes; names come from the
+/// constant `kwnames` tuple.  Missing slots stay `PY_NULL` for the
+/// wrapper to default, never a ConstPtr baked from a recording-time
+/// object.
+///
+/// `r_args` layout is `[callable, self_or_null, kwnames, arg0..argN-1]`.
+fn builtin_call_kw_bind_signature(
+    r_args: &[OpRef],
+    arg_concretes: &[ConcreteValue],
+    sig: &pyre_interpreter::gateway::Signature,
+    receiver: Option<(OpRef, ConcreteValue)>,
+) -> Option<(Vec<OpRef>, Vec<ConcreteValue>)> {
+    // The permutation below is keyed on the recording-time names, which is
+    // only sound when the `kwnames` box is a constant: then no guard is
+    // needed for the trace to replay the same binding.
+    if r_args.len() < 3 || arg_concretes.len() < 3 || !r_args[2].is_constant() {
+        return None;
+    }
+    let ConcreteValue::Ref(kwnames) = arg_concretes[2] else {
+        return None;
+    };
+    if kwnames.is_null() || !unsafe { pyre_object::is_tuple(kwnames) } {
+        return None;
+    }
+    let args = &r_args[3..];
+    let arg_conc = &arg_concretes[3..];
+    let nargs = args.len();
+    if arg_conc.len() != nargs {
+        return None;
+    }
+    let nkw = unsafe { pyre_object::w_tuple_len(kwnames) };
+    if nkw > nargs {
+        return None;
+    }
+    let nparams = sig.argnames.len();
+    // `bind_kwargs_to_signature` appends packed `*args` / `**kwargs` slots
+    // after the named ones; this permutation builds only the named slots.
+    if nparams == 0 || sig.varargname.is_some() || sig.kwargname.is_some() {
+        return None;
+    }
+    let n_pos_params = sig.num_argnames();
+    let receiver_count = usize::from(receiver.is_some());
+    let n_pos = nargs - nkw;
+    if n_pos + receiver_count > n_pos_params {
+        return None;
+    }
+    let mut slot_args: Vec<Option<OpRef>> = vec![None; nparams];
+    let mut slot_conc: Vec<Option<ConcreteValue>> = vec![None; nparams];
+    if let Some((receiver_arg, receiver_concrete)) = receiver {
+        slot_args[0] = Some(receiver_arg);
+        slot_conc[0] = Some(receiver_concrete);
+    }
+    for k in 0..n_pos {
+        let pi = receiver_count + k;
+        slot_args[pi] = Some(args[k]);
+        slot_conc[pi] = Some(arg_conc[k]);
+    }
+    for j in 0..nkw {
+        let name_obj = unsafe { pyre_object::w_tuple_getitem(kwnames, j as i64) }?;
+        if !unsafe { pyre_object::is_str(name_obj) } {
+            return None;
+        }
+        let name = unsafe { pyre_object::w_str_get_wtf8(name_obj) }
+            .as_str()
+            .ok()?;
+        let pi = sig.find_argname(name);
+        if pi < 0 {
+            return None;
+        }
+        let pi = pi as usize;
+        if pi < sig.posonlyargcount || slot_args[pi].is_some() {
+            return None;
+        }
+        slot_args[pi] = Some(args[n_pos + j]);
+        slot_conc[pi] = Some(arg_conc[j + n_pos]);
+    }
+    let mut out_args = Vec::with_capacity(nparams);
+    let mut out_conc = Vec::with_capacity(nparams);
+    for k in 0..nparams {
+        match (slot_args[k], slot_conc[k]) {
+            (Some(op), Some(conc)) => {
+                out_args.push(op);
+                out_conc.push(conc);
+            }
+            _ => {
+                out_args.push(OpRef::NONE);
+                out_conc.push(ConcreteValue::Null);
+            }
+        }
+    }
+    Some((out_args, out_conc))
+}
+
 /// Unpack a `bh_call_function_ex_fn(callable, self_or_null, starargs,
 /// kwargs_or_null)` star tuple into the positional argument boxes the inline
 /// path seeds from, or `None` to leave the call a residual.
@@ -3600,6 +3694,27 @@ fn cut_declined_subwalk<Sym: WalkSym>(
 ) {
     ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
     ctx.trace_ctx.heap_cache_mut().reset();
+}
+
+/// The point a builtin descent cuts back to, with the effect state it was
+/// entered with.
+#[derive(Clone, Copy)]
+struct SubWalkRewind {
+    pre_fold_pos: majit_metainterp::recorder::TracePosition,
+    effects_before: usize,
+    unjournaled_before: bool,
+}
+
+impl SubWalkRewind {
+    /// Whether the walk applied nothing since the rewind point, so the
+    /// ordinary residual call applies every effect exactly once.  The
+    /// gateway's rollback arm in [`try_walker_inline_builtin_call`] says why
+    /// an unjournaled effect from before the rewind point also refuses.
+    fn nothing_applied(&self) -> bool {
+        fbw_executed_effect_count() == self.effects_before
+            && !self.unjournaled_before
+            && !fbw_has_unjournaled_effect()
+    }
 }
 
 fn callee_body_commits_nothing(w_code: *const ()) -> bool {
@@ -4486,13 +4601,13 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     dst_bank: char,
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    let is_call_kw = runtime_helper == majit_ir::RuntimeHelperKind::CallKw;
     if !ctx.is_authoritative_executor
-        // A `call_kw` residual carries its kwnames tuple in arg index 2, and
-        // keywords reach a builtin as the trailing `__pyre_kw__` marker dict
-        // that `split_builtin_kwargs` strips — a shape the flat
-        // `&[PyObjectRef]` array built below does not construct, so leave those
-        // calls to `bh_call_kw_<n>`.
-        || runtime_helper != majit_ir::RuntimeHelperKind::CallFn
+        // `CallKw` is admitted when the builtin has a Signature: keyword
+        // VALUES stay the traced boxes and are permuted into parameter
+        // slots (`Arguments` + gateway unwrap).  Building a marker dict
+        // from recording-time concretes as ConstPtr is forbidden.
+        || (runtime_helper != majit_ir::RuntimeHelperKind::CallFn && !is_call_kw)
         || r_args.len() < 2
         || dst_bank != 'r'
     {
@@ -4500,7 +4615,8 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     }
 
     let mut arg_concretes = read_ref_var_list_concrete(code, op, ref_operand_offset, ctx);
-    for i in 0..2 {
+    let concrete_lead = if is_call_kw { 3 } else { 2 };
+    for i in 0..concrete_lead.min(r_args.len()) {
         if matches!(arg_concretes.get(i), Some(ConcreteValue::Null)) {
             if let Some(majit_ir::Value::Ref(r)) = ctx.trace_ctx.box_value(r_args[i]) {
                 if r != majit_ir::GcRef::NO_CONCRETE && r.as_usize() != 0 {
@@ -4560,7 +4676,12 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
                 instance_call_class = Some((w_class, version_tag));
                 (method, Some(callable_operand))
             }
-            None => match unsafe { resolve_type_call_builtin_new(callable, &arg_concretes[2..]) } {
+            // A CALL_KW's third operand is the kwnames tuple, not an
+            // argument, so the type-call path admits positional calls only.
+            None => match (!is_call_kw)
+                .then(|| unsafe { resolve_type_call_builtin_new(callable, &arg_concretes[2..]) })
+                .flatten()
+            {
                 Some((tp_new, tp_init)) => {
                     // `__new__` allocates, which is an effect, so `__init__`
                     // must be known-descendable before that walk starts:
@@ -4694,7 +4815,17 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
             )
         })?
         .is_some();
-    let wrapper_item_count = usize::from(receiver.is_some()) + (r_args.len() - 2);
+    let builtin_sig =
+        unsafe { pyre_interpreter::gateway::builtin_code_get_signature(builtin_code) };
+    if is_call_kw && builtin_sig.is_none() {
+        builtin_inline_decline!("call_kw builtin has no Signature", fnaddr);
+        return Ok(None);
+    }
+    let wrapper_item_count = if is_call_kw {
+        builtin_sig.map(|s| s.argnames.len()).unwrap_or(0)
+    } else {
+        usize::from(receiver.is_some()) + (r_args.len() - 2)
+    };
     if !builtin_len_shortcut
         && let Some(decline) = descent_decline(jitcode.index(), &[(0, wrapper_item_count)])
     {
@@ -4725,7 +4856,12 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // lost its memo/`struct` round trip).  Keep the root level on the
     // caller-boundary resume until the resume side can carry a non-Python
     // section.
-    let nested_helper_entry = if nested_helper {
+    //
+    // Inside another canonical helper body there is no Python caller to
+    // preserve at this CALL: the enclosing helper already published its own
+    // caller's resume point, and this call inherits it
+    // (`specialize::HelperEntry::EnclosingHelper`).
+    let nested_helper_entry = if nested_helper && !ctx.fbw_mode.transparent_helper_subwalk {
         match compute_inline_helper_call_entry_frame(ctx, op.pc) {
             Ok(frame) => Some(frame),
             Err(_) => {
@@ -4918,12 +5054,44 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
 
     let mut wrapper_items = Vec::with_capacity(r_args.len().saturating_sub(1));
     let mut wrapper_item_concretes = Vec::with_capacity(arg_concretes.len().saturating_sub(1));
-    if let Some(receiver_op) = receiver_op {
-        wrapper_items.push(receiver_op);
-        wrapper_item_concretes.push(ConcreteValue::Ref(receiver.unwrap()));
+    if is_call_kw {
+        let Some(sig) = builtin_sig else {
+            builtin_inline_decline!("call_kw builtin has no Signature", fnaddr);
+            return Ok(None);
+        };
+        let bound_receiver = receiver_op.map(|op| {
+            (
+                op,
+                ConcreteValue::Ref(receiver.unwrap_or(pyre_object::PY_NULL)),
+            )
+        });
+        let Some((bound_ops, bound_conc)) =
+            builtin_call_kw_bind_signature(r_args, &arg_concretes, sig, bound_receiver)
+        else {
+            builtin_inline_decline!("call_kw signature bind declined", fnaddr);
+            return Ok(None);
+        };
+        wrapper_items = bound_ops;
+        wrapper_item_concretes = bound_conc;
+        for (op, conc) in wrapper_items
+            .iter_mut()
+            .zip(wrapper_item_concretes.iter_mut())
+        {
+            if *op == OpRef::NONE {
+                // Missing keyword-only slot: the wrapper defaults it.  A
+                // runtime PY_NULL box, not a recording-time value.
+                *op = ctx.trace_ctx.const_ref(0);
+                *conc = ConcreteValue::Null;
+            }
+        }
+    } else {
+        if let Some(receiver_op) = receiver_op {
+            wrapper_items.push(receiver_op);
+            wrapper_item_concretes.push(ConcreteValue::Ref(receiver.unwrap()));
+        }
+        wrapper_items.extend_from_slice(&r_args[2..]);
+        wrapper_item_concretes.extend_from_slice(&arg_concretes[2..]);
     }
-    wrapper_items.extend_from_slice(&r_args[2..]);
-    wrapper_item_concretes.extend_from_slice(&arg_concretes[2..]);
     for (&item, concrete) in wrapper_items.iter().zip(&wrapper_item_concretes) {
         if let ConcreteValue::Ref(value) = concrete
             && !value.is_null()
@@ -4997,6 +5165,11 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // something, the same question `latch_abort_call_resume` answers with it.
     let effects_before = fbw_executed_effect_count();
     let unjournaled_before = fbw_has_unjournaled_effect();
+    let rewind = SubWalkRewind {
+        pre_fold_pos,
+        effects_before,
+        unjournaled_before,
+    };
     ctx.entry_py_pc = EntryPyPc::Jit(op.pc);
     ctx.outer_resume_marker_jit_pc = call_site_marker;
     ctx.outer_jitcode_index = outer_jitcode_index;
@@ -5029,7 +5202,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // `transparent_helper_subwalk` is set by `run_sub_jitcode_walk` on the
     // sub-context it builds, so every descent into a canonical helper body
     // carries it — not just the ones entered from another sub-walk.
-    let _helper_frame = nested_helper_entry
+    let helper_frame = nested_helper_entry
         .map(|frame| InlineFrameGuard::enter(ctx.session, 0, false, vec![frame]));
     // Bracket the session-wide exception slot around the callee so a NULL
     // return only reads as a raise when the callee installed the exception.
@@ -5044,6 +5217,10 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
         &[ConcreteValue::Null],
         &[],
     );
+    // The helper's level ends with its walk.  A type-call `__init__` walked
+    // next computes its own entry frame, which must see the caller as the
+    // innermost level, not this finished helper.
+    drop(helper_frame);
     ctx.fbw_mode = saved_fbw_mode;
     ctx.entry_py_pc = saved_entry;
     ctx.outer_resume_marker_jit_pc = saved_marker;
@@ -5075,9 +5252,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
         // to the frame latch, which resumes forward at this opcode losing
         // nothing.
         Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic })
-            if fbw_executed_effect_count() == effects_before
-                && !unjournaled_before
-                && !fbw_has_unjournaled_effect() =>
+            if rewind.nothing_applied() =>
         {
             if fbw_inline_diag_enabled() {
                 eprintln!(
@@ -5145,7 +5320,12 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     match promote_published_null_return_since(ctx, walk_result, op.pc, exc_before_subwalk) {
         DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
             Some(value) => {
-                let concrete = concrete_from_recorded_opref(ctx, value);
+                let concrete = match concrete_from_recorded_opref(ctx, value) {
+                    ConcreteValue::Ref(p) if !p.is_null() => ConcreteValue::Ref(p),
+                    other => walker_concrete_ref_object(ctx, value)
+                        .map(ConcreteValue::Ref)
+                        .unwrap_or(other),
+                };
                 if let Some(tp_init) = type_call_init {
                     return try_walker_inline_type_call_builtin_init(
                         ctx,
@@ -5157,6 +5337,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
                         value,
                         concrete,
                         &arg_concretes,
+                        rewind,
                     );
                 }
                 write_ref_reg(ctx, op.pc, dst, value, concrete)?;
@@ -5225,22 +5406,38 @@ fn builtin_gateway_undescendable_reason(
     if crate::state::ensure_build_time_jitcode_at(jitcode.index()).is_none() {
         return Some("wrapper jitcode absent from the build-time table");
     }
-    match descent_decline(jitcode.index(), &[(0, wrapper_item_count)]) {
-        None => None,
-        Some(DescentDecline::Helper(_)) => {
-            log_descent_unlowered_helper_blockers(jitcode.index());
-            Some("un-lowered helper after effect")
-        }
-        Some(DescentDecline::BodyNotWalked) => Some("body holds bytes the scan cannot decode"),
+    if !descent_unlowered_helper_scan_enabled() {
+        return None;
     }
+    // The walk of `__init__` starts after `__new__` allocated, so every
+    // blocker in it is after an effect: an `__init__` whose blocker the scan
+    // counts as effect-free would still abort past the allocation.
+    let summary = descent_blocker_summary_for_entry_len(jitcode.index(), wrapper_item_count);
+    if summary.body_not_walked {
+        return Some("body holds bytes the scan cannot decode");
+    }
+    if summary
+        .blocker_after_effect
+        .or(summary.blocker_effect_free)
+        .is_some()
+    {
+        log_descent_unlowered_helper_blockers(jitcode.index());
+        return Some("un-lowered helper");
+    }
+    None
 }
 
 /// `typeobject.py descr_call`'s `__init__` half after a builtin `__new__`
 /// already ran: walk the builtin `__init__` with the instance as `self` and
 /// keep the instance as the CALL result.
 ///
-/// `__new__` has already allocated, so a decline here cannot rewind the
-/// type-call.  The caller checked [`builtin_gateway_undescendable_reason`] first.
+/// Returning the instance without running `__init__` would be a wrong answer,
+/// so a decline here aborts the walk.  The one exception is the `__init__`
+/// walk declining a call before it ran it, with nothing applied since
+/// `rewind` was taken: `__new__`'s unreferenced allocation is no effect, so
+/// the whole CALL is cut back and runs as the ordinary residual.  The caller
+/// checked [`builtin_gateway_undescendable_reason`] first.
+#[allow(clippy::too_many_arguments)]
 fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
@@ -5251,10 +5448,12 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
     instance: OpRef,
     instance_concrete: ConcreteValue,
     arg_concretes: &[ConcreteValue],
+    rewind: SubWalkRewind,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     let ConcreteValue::Ref(instance_obj) = instance_concrete else {
-        write_ref_reg(ctx, op.pc, dst, instance, instance_concrete)?;
-        return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
+        return Err(super::fbw_state::fbw_decline_inline_callee(
+            ctx, op.pc, None,
+        ));
     };
     // `descr_call` runs `__init__` only when `__new__` returned an instance
     // of the called class.
@@ -5268,16 +5467,19 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
         unsafe { pyre_interpreter::function_get_code(tp_init) } as pyre_object::PyObjectRef;
     let fnaddr = unsafe { pyre_interpreter::builtin_code_get(builtin_code) as usize };
     let Some(jitcode) = crate::state::bytecode_for_address(fnaddr) else {
-        write_ref_reg(ctx, op.pc, dst, instance, instance_concrete)?;
-        return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
+        return Err(super::fbw_state::fbw_decline_inline_callee(
+            ctx, op.pc, None,
+        ));
     };
     let Some(body) = crate::jitcode_dispatch::sub_jitcode_body_by_index(jitcode.index()) else {
-        write_ref_reg(ctx, op.pc, dst, instance, instance_concrete)?;
-        return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
+        return Err(super::fbw_state::fbw_decline_inline_callee(
+            ctx, op.pc, None,
+        ));
     };
     if crate::state::ensure_build_time_jitcode_at(jitcode.index()).is_none() {
-        write_ref_reg(ctx, op.pc, dst, instance, instance_concrete)?;
-        return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
+        return Err(super::fbw_state::fbw_decline_inline_callee(
+            ctx, op.pc, None,
+        ));
     }
     if fbw_inline_diag_enabled() {
         eprintln!(
@@ -5293,12 +5495,15 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
     }
 
     let nested_helper = ctx.fbw_mode.inline_subwalk;
-    let nested_helper_entry = if nested_helper {
+    // Same entry rule as `try_walker_inline_builtin_call`: a call from inside
+    // a canonical helper body inherits that helper's resume point.
+    let nested_helper_entry = if nested_helper && !ctx.fbw_mode.transparent_helper_subwalk {
         match compute_inline_helper_call_entry_frame(ctx, op.pc) {
             Ok(frame) => Some(frame),
             Err(_) => {
-                write_ref_reg(ctx, op.pc, dst, instance, instance_concrete)?;
-                return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
+                return Err(super::fbw_state::fbw_decline_inline_callee(
+                    ctx, op.pc, None,
+                ));
             }
         }
     } else {
@@ -5306,13 +5511,15 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
     };
     let sym_ptr = ctx.fbw_mode.snapshot_sym;
     if sym_ptr.is_null() {
-        write_ref_reg(ctx, op.pc, dst, instance, instance_concrete)?;
-        return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
+        return Err(super::fbw_state::fbw_decline_inline_callee(
+            ctx, op.pc, None,
+        ));
     }
     let sym = unsafe { &*sym_ptr };
     if sym.jitcode().is_null() {
-        write_ref_reg(ctx, op.pc, dst, instance, instance_concrete)?;
-        return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
+        return Err(super::fbw_state::fbw_decline_inline_callee(
+            ctx, op.pc, None,
+        ));
     }
     let (call_site_py_pc, vsd_value, outer_jitcode_index, call_site_marker) = if nested_helper {
         (
@@ -5450,7 +5657,7 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
     ctx.fbw_mode.inline_subwalk = true;
     ctx.fbw_mode.inline_caller_py_pc = Some(call_site_py_pc);
     ctx.fbw_mode.transparent_helper_jitcode_index = Some(jitcode.index());
-    let _helper_frame = nested_helper_entry
+    let helper_frame = nested_helper_entry
         .map(|frame| InlineFrameGuard::enter(ctx.session, 0, false, vec![frame]));
     let exc_before_subwalk = ctx.last_exc_value();
     let walk_result = run_sub_jitcode_walk(
@@ -5463,6 +5670,7 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
         &[ConcreteValue::Null],
         &[],
     );
+    drop(helper_frame);
     ctx.fbw_mode = saved_fbw_mode;
     ctx.entry_py_pc = saved_entry;
     ctx.outer_resume_marker_jit_pc = saved_marker;
@@ -5474,6 +5682,10 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
 
     let walk_result = match walk_result {
         Ok(outcome) => outcome,
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. }) if rewind.nothing_applied() => {
+            cut_declined_subwalk(ctx, rewind.pre_fold_pos);
+            return Ok(None);
+        }
         Err(error) => return Err(error),
     };
     match promote_published_null_return_since(ctx, walk_result, op.pc, exc_before_subwalk) {
