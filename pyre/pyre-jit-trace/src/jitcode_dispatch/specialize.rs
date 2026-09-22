@@ -22710,21 +22710,27 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
 /// `sys_exc_value` slot (`ec_sys_exc_value_descr`), and consume pyre's
 /// propagation-root clear without recording a runtime call.
 /// Recognised by the codewriter-stamped `runtime_helper` tag, NOT a funcptr
-/// address (the residual calls the cross-crate `cpu.{get,set}_current_
-/// exception_fn` wrappers in `pyre-jit`, which `pyre-jit-trace` cannot name).
+/// address (the residual calls the cross-crate `cpu.*_current_exception*_fn`
+/// wrappers in `pyre-jit`, which `pyre-jit-trace` cannot name).
 ///
+///   * `CurrentExceptionOrNone` — `current_exception_or_none()` (`[]→Ref`,
+///     dst_bank `'r'`): the PUSH_EXC_INFO `prev` save.  It owns a matching
+///     store and POP_EXCEPT restore, so it pushes the field onto the
+///     saved-prev stack.  Emit `GETFIELD_GC_R(ec, sys_exc_value)`, then the
+///     nullity guard `PUSH_EXC_INFO`'s `if prev_operr is not None` traces:
+///     GUARD_ISNULL with the prebuilt `None` as the result, or GUARD_NONNULL
+///     with the field as the result.
 ///   * `GetCurrentException` — `get_current_exception()` (`[]→Ref`,
-///     dst_bank `'r'`): the PUSH_EXC_INFO `prev` save, and also the read a
-///     catch-covered bare `raise` uses to obtain the exception it re-raises.
-///     Only the first owns a matching store and POP_EXCEPT restore, so only
-///     the first pushes onto the saved-prev stack.  Emit
-///     `GETFIELD_GC_R(ec, sys_exc_value)`, stamp the live `prev` concrete
-///     (the residual executor would have returned it) so a downstream read
-///     of the dst sees the right value.
+///     dst_bank `'r'`): the read a catch-covered bare `raise` uses to obtain
+///     the exception it re-raises.  Emit `GETFIELD_GC_R(ec, sys_exc_value)`
+///     and stamp the live value concrete (the residual executor would have
+///     returned it) so a downstream read of the dst sees the right value.
 ///   * `SetCurrentException` — `set_current_exception(exc)` (`[Ref]→void`,
 ///     dst_bank `'v'`): the PUSH_EXC_INFO store and the POP_EXCEPT restore.
 ///     Emit `SETFIELD_GC(ec, exc, sys_exc_value)` and apply the concrete
-///     write the authoritative walk's residual executor would have done.
+///     write the authoritative walk's residual executor would have done.  A
+///     restore with no matching save tests its operand against `None`
+///     (`set_sys_exc_info3`) and stores NULL for it.
 ///   * `ClearInFlightException` — `set_in_flight_exception(PY_NULL)`
 ///     (`[]→void`, dst_bank `'v'`): apply the clear to the authoritative
 ///     recording walk, but emit no IR.  PyPy keeps the propagating exception
@@ -22778,12 +22784,17 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
         return Ok(Some(()));
     }
 
-    if runtime_helper == majit_ir::RuntimeHelperKind::GetCurrentException {
-        // PUSH_EXC_INFO `prev = ec.sys_exc_value` — `[]→Ref`.
+    if matches!(
+        runtime_helper,
+        majit_ir::RuntimeHelperKind::GetCurrentException
+            | majit_ir::RuntimeHelperKind::CurrentExceptionOrNone
+    ) {
+        // PUSH_EXC_INFO `prev = ec.sys_exc_value`, or a covered bare raise's
+        // read of it — `[]→Ref`.
         if !r_args.is_empty() || dst_bank != 'r' {
             return Ok(None);
         }
-        // Two Python instructions lower to this helper, and they want
+        // The two Python instructions that lower to these helpers want
         // different things from a bridge seed.  A bare `raise` wants
         // the exception the bridge is resuming with — the compiled loop is free
         // to elide its `sys_exc_value` store (a balanced save/store/restore
@@ -22798,13 +22809,11 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
         // entry, so the slot is current.  A seed this walk stored itself is a
         // view of the field either way, and reusing its OpRef keeps the
         // save/store/restore triple balanced.
-        // The predicate is true for `RAISE_VARARGS 0`, `RERAISE` and `FOR_ITER`,
-        // but only the first can reach here: `RERAISE` reads its exception off
-        // the vable stack and `FOR_ITER` re-raises the value its own
-        // `catch_exception` caught, so neither emits this helper.  The name
-        // records the one shape that does.
+        // `GetCurrentException` is emitted only by a catch-covered bare
+        // `RAISE_VARARGS 0`; PUSH_EXC_INFO saves through
+        // `CurrentExceptionOrNone`.
         let is_covered_bare_raise_read =
-            super::recording_raise_keeps_existing_traceback(ctx, op.pc);
+            runtime_helper == majit_ir::RuntimeHelperKind::GetCurrentException;
         let seed_answers_this_read =
             ctx.fbw_mode.current_exception_seed_from_walk_store || is_covered_bare_raise_read;
         let (prev, prev_obj) = if let Some(seed) = ctx
@@ -22834,22 +22843,34 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
             prev,
             majit_ir::Value::Ref(majit_ir::GcRef(prev_obj as usize)),
         );
+        // `PUSH_EXC_INFO` saves `space.w_None` when `ec.current_exception()`
+        // is None, and the field otherwise; the test is the nullity guard the
+        // trace of that `if` records.  The bare raise re-raises the field.
+        let w_prev = if is_covered_bare_raise_read {
+            prev
+        } else if prev_obj.is_null() {
+            walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardIsnull, &[prev])?;
+            ctx.trace_ctx.const_ref(pyre_object::w_none() as i64)
+        } else {
+            walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[prev])?;
+            prev
+        };
         // Only PUSH_EXC_INFO owns a matching set + POP_EXCEPT pair.  A covered
-        // bare raise uses the same read helper to obtain the exception it
+        // bare raise reads the same field to obtain the exception it
         // re-raises, but has no following PUSH store.  Treating that read as a
         // save arms the next POP as a PUSH and leaves the bare raise's value on
         // this stack, so a second enclosing POP restores the inner exception.
-        // For PUSH_EXC_INFO, save (OpRef, concrete) for the matching restore and
-        // mark the immediately-following set as this PUSH's slot store.  The
-        // codewriter pushes `prev` then `exc` onto the operand stack and
-        // POP_EXCEPT pops them, but the walker resolves the popped `prev`
-        // operand to the caught exception, not the saved prev; the LIFO stack
-        // carries the authoritative value instead.
+        // For PUSH_EXC_INFO, save the field (OpRef, concrete) for the matching
+        // restore and mark the immediately-following set as this PUSH's slot
+        // store.  The codewriter pushes `prev` then `exc` onto the operand
+        // stack and POP_EXCEPT pops them, but the walker resolves the popped
+        // `prev` operand to the caught exception, not the saved prev; the LIFO
+        // stack carries the authoritative value instead.
         if !is_covered_bare_raise_read {
             FBW_EXC_PREV.with(|s| s.borrow_mut().push((prev, prev_obj)));
             FBW_EXC_PENDING_PUSH_SET.with(|c| c.set(true));
         }
-        write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', prev)?;
+        write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', w_prev)?;
         return Ok(Some(()));
     }
 
@@ -22885,7 +22906,11 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
                 Some(ConcreteValue::Null) | None => std::ptr::null_mut(),
                 _ => return Ok(None),
             };
-            (r_args[0], exc_concrete)
+            if is_push_set {
+                (r_args[0], exc_concrete)
+            } else {
+                walker_restore_exc_info_operand(ctx, op.pc, r_args[0], exc_concrete)?
+            }
         }
     };
     // A PUSH_EXC_INFO store publishes the exception being handled, which IS the
@@ -22937,6 +22962,39 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
     ctx.frame_state.borrow_mut().current_exception_seed_concrete = store_concrete;
     ctx.fbw_mode.current_exception_seed_from_walk_store = true;
     Ok(Some(()))
+}
+
+/// `POP_EXCEPT` → `PyFrame._restore_exc_info` →
+/// `ExecutionContext.set_sys_exc_info3(w_prev)` for a restore whose value
+/// comes off the operand stack: `space.is_none(w_prev)` clears the slot, and
+/// any other value becomes the handled exception.  Returns the value to store
+/// and its concrete.
+fn walker_restore_exc_info_operand<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    w_prev: OpRef,
+    w_prev_concrete: pyre_object::PyObjectRef,
+) -> Result<(OpRef, pyre_object::PyObjectRef), DispatchError> {
+    let is_none = !w_prev_concrete.is_null() && unsafe { pyre_object::is_none(w_prev_concrete) };
+    if !w_prev.is_constant() {
+        let none_const = ctx.trace_ctx.const_ref(pyre_object::w_none() as i64);
+        let is_w = ctx
+            .trace_ctx
+            .record_op(OpCode::PtrEq, &[w_prev, none_const]);
+        ctx.trace_ctx
+            .set_opref_concrete(is_w, majit_ir::Value::Int(is_none as i64));
+        let guard = if is_none {
+            OpCode::GuardTrue
+        } else {
+            OpCode::GuardFalse
+        };
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, guard, &[is_w])?;
+    }
+    Ok(if is_none {
+        (ctx.trace_ctx.const_ref(0), pyre_object::PY_NULL)
+    } else {
+        (w_prev, w_prev_concrete)
+    })
 }
 
 /// #62: walker-native speculative specialization for the `STORE_SUBSCR`

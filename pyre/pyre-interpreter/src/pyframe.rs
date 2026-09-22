@@ -91,6 +91,22 @@ pub mod frame_locals_proxy {
         unsafe { FrameLocalsProxy::from_obj(obj) }.map(|proxy| proxy.w_frame)
     }
 
+    /// Whether `obj` is a `FrameLocalsProxy`.  A class-pointer test, so
+    /// `list.__init__` can branch on it without entering `keys`.
+    pub fn is_frame_locals_proxy(obj: PyObjectRef) -> bool {
+        unsafe { FrameLocalsProxy::from_obj(obj) }.is_some()
+    }
+
+    /// `keys()` of a `FrameLocalsProxy`, or `None` when `obj` is not one.
+    ///
+    /// `list(f_locals)` reaches this from `ListStrategy.extend` instead of
+    /// `space.iter`: the proxy's `__iter__` is `iter(self.keys())`, and that
+    /// method call re-enters the interpreter once per extend.
+    pub fn keys_list(obj: PyObjectRef) -> Option<Result<PyObjectRef, crate::PyError>> {
+        let proxy = unsafe { FrameLocalsProxy::from_obj(obj) }?;
+        Some(proxy.keys())
+    }
+
     /// Pin every entry of `extra` as a `(key, value)` pair on top of the
     /// caller's bracket, and report how many.
     ///
@@ -540,7 +556,10 @@ pub mod frame_locals_proxy {
                 next_slot += 2;
                 let _ = roots.pin_root(pyre_object::PY_NULL);
                 let _ = roots.pin_root(value);
-                roots.set(key_slot, pyre_object::w_str_new_managed(name));
+                // `co_localsplusnames` entries are the code object's own strings.
+                // A fresh managed string per `keys` call allocated one object
+                // per bound local on every `list(f_locals)`.
+                roots.set(key_slot, pyre_object::intern_str_value(name));
                 count += 1;
             }
             count
@@ -5786,7 +5805,7 @@ impl PyFrame {
             if mark_top_of_stack(cur_stack) == StackKind::Except as i64 {
                 // The popped value is the saved previous exception; make
                 // it current again.
-                crate::eval::set_current_exception(self.popvalue());
+                crate::eval::restore_exc_info(self.popvalue());
             } else {
                 // `PyStackRef_XCLOSE(_PyFrame_StackPop(f->f_frame))` — the
                 // `X` is load-bearing.  A slot below the jump target can be

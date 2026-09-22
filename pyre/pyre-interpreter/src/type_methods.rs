@@ -606,6 +606,11 @@ pub(crate) fn list_extend_items(
             && (*other).w_class == pyre_object::get_instantiate(&*(*other).ob_type)
     } {
         extend_from_set(list, other)?;
+    } else if unsafe { crate::pyframe::frame_locals_proxy::is_frame_locals_proxy(other) } {
+        // `framelocalsproxy_iter` is `iter(self.keys())`.  The key list is
+        // built inside this residual so `descr_init`'s graph does not gain
+        // `keys`, and `list(f_locals)` does not re-enter the interpreter.
+        extend_from_frame_locals_proxy(list, other)?;
     } else {
         extend_from_iterable(list, other)?;
     }
@@ -708,10 +713,24 @@ fn extend_from_set(list: PyObjectRef, other: PyObjectRef) -> Result<(), crate::P
     Ok(())
 }
 
+/// `list(FrameLocalsProxy)` — `keys()` then the same storage copy as
+/// `list(list)`.  `dont_look_inside` so the key materialization stays out
+/// of `descr_init`.
+#[majit_macros::dont_look_inside]
+fn extend_from_frame_locals_proxy(
+    list: PyObjectRef,
+    other: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    let Some(keys) = crate::pyframe::frame_locals_proxy::keys_list(other) else {
+        return extend_from_iterable(list, other);
+    };
+    extend_from_list(list, keys?)
+}
+
 /// `listobject.py ListStrategy._extend_from_iterable`.  Upstream drains
 /// through the `_do_extend_jitdriver` portal, so the caller's trace never
-/// inlines the drain; here the whole arm is one residual call, which is
-/// what `list(FrameLocalsProxy)` calls with a real fnaddr.
+/// inlines the drain; here the whole arm is one residual call with a real
+/// fnaddr.  `FrameLocalsProxy` does not take this arm.
 #[majit_macros::dont_look_inside]
 fn extend_from_iterable(list: PyObjectRef, other: PyObjectRef) -> Result<(), crate::PyError> {
     // Hint failures other than TypeError/AttributeError are observable and
@@ -6772,6 +6791,27 @@ pub(crate) fn set_contains_checked(
         )
     }
 }
+
+/// `dictmultiobject.py descr_get`.  The body is this leaf so
+/// `BuiltinCode.func`'s PBC family has a jitcode for `d.get`; a closure
+/// registered under another name has no member and the call stays
+/// `no jitcode for address`.
+pub fn __majit_wrap_dict_descr_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    dict_method_get(args)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_builtin_wrapper_target_dict_descr_get: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(
+            module_path!(),
+            "::",
+            stringify!(__majit_wrap_dict_descr_get)
+        ),
+        func: __majit_wrap_dict_descr_get,
+    };
 
 pub fn dict_method_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "get", 1)?;

@@ -8367,6 +8367,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && matches!(
             ei.runtime_helper,
             majit_ir::RuntimeHelperKind::GetCurrentException
+                | majit_ir::RuntimeHelperKind::CurrentExceptionOrNone
                 | majit_ir::RuntimeHelperKind::SetCurrentException
                 | majit_ir::RuntimeHelperKind::ClearInFlightException
         )

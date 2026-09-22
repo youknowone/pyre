@@ -380,8 +380,11 @@ pub struct Cpu {
     /// `(frame: Ref, exc: Ref, cause: Ref) → Ref` — normalization reads the
     /// current activation's execution context, as `space.getexecutioncontext()`.
     pub normalize_raise_varargs_fn: extern "C" fn(i64, i64, i64) -> i64,
-    /// Read per-thread `CURRENT_EXCEPTION` — used by `PUSH_EXC_INFO`.
+    /// Read per-thread `CURRENT_EXCEPTION` — used by a catch-covered bare
+    /// `RAISE_VARARGS(0)`.
     pub get_current_exception_fn: extern "C" fn() -> i64,
+    /// The value `PUSH_EXC_INFO` saves: the current exception, or `None`.
+    pub current_exception_or_none_fn: extern "C" fn() -> i64,
     /// `raise_varargs(0)` value — the active exception, or a fresh
     /// `RuntimeError("No active exception to reraise")` when none is live.
     /// Used by a bare `RAISE_VARARGS(0)` with no static `last_exception` pair.
@@ -561,6 +564,7 @@ impl Cpu {
             build_slice_fn: crate::call_jit::bh_build_slice_fn,
             normalize_raise_varargs_fn: crate::call_jit::bh_normalize_raise_varargs_with_frame,
             get_current_exception_fn: crate::call_jit::bh_get_current_exception,
+            current_exception_or_none_fn: crate::call_jit::bh_current_exception_or_none,
             reraise_varargs_zero_fn: crate::call_jit::bh_reraise_varargs_zero,
             set_current_exception_fn: crate::call_jit::bh_set_current_exception,
             clear_in_flight_exception_fn: crate::call_jit::bh_clear_in_flight_exception,

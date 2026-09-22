@@ -199,6 +199,7 @@ mod residual_host {
         }
         let word = uniform_i64_allow_list![
             [] => pyre_jit::call_jit::bh_get_current_exception,
+            [] => pyre_jit::call_jit::bh_current_exception_or_none,
             [value] => pyre_jit::call_jit::bh_box_int_fn,
             [value] => pyre_jit::call_jit::bh_truth_fn,
             [value] => pyre_interpreter::opcode_ops::jit_baseobjspace_len,

@@ -19194,6 +19194,26 @@ pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 /// unwrap in `typedef::__majit_wrap_list_descr_sort` is what a traced
 /// CALL_KW descends.
 ///
+/// Strategy sorts that do not call Python: range, unboxed numbers, bytes,
+/// and ascii strings.  `false` means the list is object strategy (or
+/// otherwise unsorted) and [`sort_list_in_place_obj`] still has to run.
+///
+/// The return is `bool`, not `Result`.  A `dont_look_inside` `Result`
+/// helper's effect slot stays the most general one, and that call is
+/// may-force, which a transparent builtin walk cannot record.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn sort_list_without_key_native(list: PyObjectRef, reverse: bool) -> bool {
+    unsafe {
+        if pyre_object::listobject::w_list_sort_range(list, reverse) {
+            return true;
+        }
+        if pyre_object::listobject::w_list_sort_int_or_float(list, reverse) {
+            return true;
+        }
+        pyre_object::listobject::w_list_sort_strings(list, reverse)
+    }
+}
+
 /// `list` / `key` / `reverse` stay the runtime boxes; `is_true(reverse)`
 /// and the shadow-stack pin run here so the unwrap graph has no effect
 /// before this call.

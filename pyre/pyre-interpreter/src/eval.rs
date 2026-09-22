@@ -1764,6 +1764,29 @@ pub fn set_current_exception(exc: PyObjectRef) {
     }
 }
 
+/// The value `PUSH_EXC_INFO` saves below the caught exception: the exception
+/// being handled, or `space.w_None` when there is none.
+pub fn current_exception_or_none() -> PyObjectRef {
+    let prev = get_current_exception();
+    if prev.is_null() {
+        pyre_object::w_none()
+    } else {
+        prev
+    }
+}
+
+/// `PyFrame._restore_exc_info`: reinstate the value `PUSH_EXC_INFO` saved,
+/// as `ExecutionContext.set_sys_exc_info3` does — `None` means no exception
+/// was being handled.  A null slot means the same.
+pub fn restore_exc_info(w_prev: PyObjectRef) {
+    let exc = if !w_prev.is_null() && unsafe { pyre_object::is_none(w_prev) } {
+        PY_NULL
+    } else {
+        w_prev
+    };
+    set_current_exception(exc);
+}
+
 /// `pyopcode.py:764-766` — `raise Class` instantiates the class, and
 /// `normalize_exception` then validates the result.  `space.call_function`
 /// propagates the constructor's own error in RPython; pyre's returns
@@ -4872,7 +4895,7 @@ impl OpcodeStepExecutor for PyFrame {
         // `LocalKey::with` monomorphization — the same per-thread slot
         // the compiled trace reads/writes through
         // `get_current_exception_fn` / `set_current_exception_fn`.
-        let prev = get_current_exception();
+        let w_prev = current_exception_or_none();
         set_current_exception(exc);
         // `PUSH_EXC_INFO` transfers ownership from the propagating `PyError`
         // to the execution context.  Its `sys_exc_value` slot and raw
@@ -4880,7 +4903,7 @@ impl OpcodeStepExecutor for PyFrame {
         // root must no longer retain a completed handler's traceback.
         set_in_flight_exception(pyre_object::PY_NULL);
         // Push "previous exception" for later restore
-        self.push(prev);
+        self.push(w_prev);
         // Push the exception value back
         self.push(exc);
         Ok(())
@@ -4962,8 +4985,8 @@ impl OpcodeStepExecutor for PyFrame {
     fn pop_except(&mut self) -> Result<(), PyError> {
         // Restore previous exc_info from stack.  Named TLS accessor for
         // the same codewriter-resolvability reason as `push_exc_info`.
-        let prev_exc = self.pop();
-        set_current_exception(prev_exc);
+        let w_prev_exc = self.pop();
+        restore_exc_info(w_prev_exc);
         self.failed_attr_after_pop_except();
         Ok(())
     }

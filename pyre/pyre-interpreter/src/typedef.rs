@@ -5071,6 +5071,39 @@ static __majit_builtin_wrapper_target_list_descr_init: crate::gateway::BuiltinWr
 /// has a real fnaddr; a trampoline onto private `tuple_descr_new` aborted
 /// the wrapper walk at that symbolic call (`pc=3`).
 pub fn __majit_wrap_tuple_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // Type-call `tuple(x)` walks this with `[cls, iterable]` (length 2).
+    // `builtin_tuple`'s generic arm calls `__len__`, and that symbolic
+    // call sits after an effect on every red join, so the whole wrapper
+    // was declined.  Exact `tuple` and one positional stay here; keywords,
+    // a surplus positional, and a subclass `cls` are the residual.
+    if args.len() != 2 || args[0].is_null() {
+        return tuple_new_slow(args);
+    }
+    let cls = args[0];
+    let tuple_type = gettypeobject(&pyre_object::TUPLE_TYPE);
+    if !std::ptr::eq(cls, tuple_type) {
+        return tuple_new_slow(args);
+    }
+    let obj = args[1];
+    unsafe {
+        if pyre_object::is_exact_tuple(obj) {
+            return Ok(obj);
+        }
+        // Exact list copy does not call `__len__` or Python.  A
+        // `Result`-returning residual is may-force, and this wrapper is
+        // a transparent helper, so that call cannot be recorded.
+        if pyre_object::is_exact_list(obj) {
+            return Ok(tuple_from_exact_list(obj));
+        }
+    }
+    tuple_from_one(obj)
+}
+
+/// Keywords, the wrong arity, or a subclass `cls`.  Kept out of
+/// [`__majit_wrap_tuple_descr_new`]'s length-2 graph: `builtin_tuple`'s
+/// generic iterable calls `__len__`.
+#[majit_macros::dont_look_inside]
+fn tuple_new_slow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (params, kwargs) = crate::builtins::split_builtin_kwargs(args);
     let cls = params.first().copied().unwrap_or(pyre_object::PY_NULL);
     builtinclass_new_args_check(
@@ -5087,6 +5120,29 @@ pub fn __majit_wrap_tuple_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef,
         return tuple_subclass_retarget(value, sub);
     }
     Ok(value)
+}
+
+/// `tuple(exact list)` storage copy.  `PyObjectRef`, not `Result`: the
+/// call has to be recordable inside the transparent `tuple.__new__` walk.
+#[majit_macros::dont_look_inside_cannot_raise]
+fn tuple_from_exact_list(obj: PyObjectRef) -> PyObjectRef {
+    unsafe {
+        let n = pyre_object::w_list_len(obj);
+        let mut items = Vec::with_capacity(n);
+        for i in 0..n {
+            if let Some(item) = pyre_object::w_list_getitem(obj, i as i64) {
+                items.push(item);
+            }
+        }
+        pyre_object::w_tuple_new(items)
+    }
+}
+
+/// `tuple(x)` for an iterable that is not an exact tuple or list.
+/// `__len__` stays in this residual.
+#[majit_macros::dont_look_inside]
+fn tuple_from_one(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    crate::builtins::builtin_tuple(std::slice::from_ref(&obj))
 }
 
 fn tuple_subclass_retarget(
@@ -6372,6 +6428,24 @@ pub fn __majit_wrap_list_descr_sort(args: &[PyObjectRef]) -> Result<PyObjectRef,
     } else {
         pyre_object::PY_NULL
     };
+    // `sorted` passes `key=None, reverse=False`.  A bool reverse and an
+    // absent key stay on the strategy sort, which a traced `list.sort` can
+    // record.  Anything else (a key function, a non-bool reverse) is the
+    // general body.
+    let key_absent = key.is_null() || unsafe { pyre_object::is_none(key) };
+    let reverse = if reverse_obj.is_null() || unsafe { pyre_object::is_none(reverse_obj) } {
+        Some(false)
+    } else if unsafe { pyre_object::is_bool(reverse_obj) } {
+        Some(unsafe { pyre_object::w_bool_get_value(reverse_obj) })
+    } else {
+        None
+    };
+    if key_absent
+        && let Some(reverse) = reverse
+        && crate::builtins::sort_list_without_key_native(list, reverse)
+    {
+        return Ok(pyre_object::w_none());
+    }
     crate::builtins::sort_list_in_place_obj(list, key, reverse_obj)?;
     Ok(pyre_object::w_none())
 }
@@ -8076,7 +8150,7 @@ fn init_dict_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "get",
-            make_builtin_function("get", crate::type_methods::dict_method_get),
+            make_builtin_function("get", crate::type_methods::__majit_wrap_dict_descr_get),
         )
     };
     unsafe {
