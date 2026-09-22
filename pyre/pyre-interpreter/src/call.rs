@@ -4699,7 +4699,12 @@ fn type_call_vectorcall(
 /// `is_builtin_code`'s `is_function` set.  Read the carrier, not the
 /// public class.
 fn type_slot_accepts_keywords(w_type: PyObjectRef, name: &str) -> bool {
-    let Some(func) = (unsafe { crate::baseobjspace::lookup_in_type(w_type, name) }) else {
+    let Some(func) = (unsafe {
+        crate::baseobjspace::lookup_in_type(
+            w_type,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
+        )
+    }) else {
         return false;
     };
     if !unsafe { crate::function::is_function_carrier(func) } {
