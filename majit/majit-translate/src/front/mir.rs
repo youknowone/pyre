@@ -1014,6 +1014,19 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         &mut struct_fields,
     );
 
+    // Pass 2 paints each ADT as its bare leaf. A leaf `harden` emptied
+    // (`eval::Code` beside `module::struct::Code`) is not a class: the
+    // paint has to name the declaration actually being lowered, or the
+    // value seeds `SomeInstance(classdef=None)` and a later
+    // `__discriminant` read raises `MissingRTypeAttribute`.
+    let _tombstoned_leaves = TombstonedLeafGuard::install(
+        struct_origins
+            .iter()
+            .filter(|(_, module)| module.is_empty())
+            .map(|(leaf, _)| leaf.clone())
+            .collect(),
+    );
+
     // ── Pass 2: lower every function body and build SemanticFunctions ─
     // `@jit.dont_look_inside` (`rlib/jit.py`) callees declare a
     // FUNC.RESULT that the legacy walker reads off the Call op's
@@ -27233,7 +27246,20 @@ fn adt_node_class_root(node: &serde_json::Value, llbc: &Llbc) -> Option<String> 
             return None;
         }
     }
-    let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
+    let mut leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
+    // `harden_duplicate_leaf_metadata` clears the origin of a leaf shared
+    // by two declarations (`eval::Code` and `module::struct::Code`). The
+    // bare token then canonicalises to itself and matches no field row, so
+    // the value is a classdef-less instance and `__discriminant` has
+    // nowhere to resolve (`rclass.py` `InstanceRepr.getfieldrepr`). Paint
+    // this declaration's crate-stripped path; that key still carries the
+    // rows, and `canonical_struct_name` leaves a `::` path unchanged.
+    if struct_leaf_origin_is_tombstoned(&leaf) {
+        let qualified = strip_crate_prefix(&name);
+        if qualified != leaf {
+            leaf = qualified;
+        }
+    }
     // A reference-payload workspace enum instantiation projects to a
     // per-instantiation base class (`Result<Tuple>`) so its variant
     // payloads do not union across instantiations.  The discriminant
@@ -27246,6 +27272,33 @@ fn adt_node_class_root(node: &serde_json::Value, llbc: &Llbc) -> Option<String> 
         return Some(format!("{leaf}{suffix}"));
     }
     Some(leaf)
+}
+
+thread_local! {
+    static TOMBSTONED_STRUCT_LEAVES: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Leaves whose `struct_origins` entry `harden_duplicate_leaf_metadata`
+/// cleared. Installed for one crate's lowering and dropped with the guard,
+/// so a later `lower_function` on this thread does not inherit them.
+struct TombstonedLeafGuard;
+
+impl TombstonedLeafGuard {
+    fn install(leaves: std::collections::HashSet<String>) -> Self {
+        TOMBSTONED_STRUCT_LEAVES.with(|slot| *slot.borrow_mut() = leaves);
+        Self
+    }
+}
+
+impl Drop for TombstonedLeafGuard {
+    fn drop(&mut self) {
+        TOMBSTONED_STRUCT_LEAVES.with(|slot| slot.borrow_mut().clear());
+    }
+}
+
+fn struct_leaf_origin_is_tombstoned(leaf: &str) -> bool {
+    TOMBSTONED_STRUCT_LEAVES.with(|slot| slot.borrow().contains(leaf))
 }
 
 /// The pointee's monomorphic-ADT class root of an (already
@@ -39827,6 +39880,114 @@ mod tests {
             super::tyref_class_root(&mixed_ty, &llbc).as_deref(),
             Some("Opcode"),
             "intern key must be the Input.class_root leaf"
+        );
+    }
+
+    /// `eval::Code` and `module::struct::Code` share a leaf. Harden clears
+    /// that leaf's origin, and the bare token is not a class. The enum's
+    /// value must paint the declaration that still has the
+    /// `__discriminant` row (`module::struct::Code`), while a leaf harden
+    /// left alone stays bare.
+    #[test]
+    fn tombstoned_duplicate_leaf_paints_the_declaration_path() {
+        let span = || {
+            serde_json::json!({"data": {
+                "file_id": 0,
+                "beg": {"line": 1, "col": 0},
+                "end": {"line": 1, "col": 1}
+            }})
+        };
+        let item_meta = |segs: &[&str]| {
+            serde_json::json!({
+                "name": segs.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": true
+            })
+        };
+        let adt = |def_id: u64, hash: u64| {
+            serde_json::json!({"HashConsedValue": [hash, {
+                "Adt": {
+                    "id": {"Adt": def_id},
+                    "generics": {
+                        "regions": [],
+                        "types": [],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }
+            }]})
+        };
+        let variant = |name: &str, fields: Vec<serde_json::Value>, discriminant: u64| {
+            serde_json::json!({
+                "name": name,
+                "fields": fields,
+                "discriminant": {"Scalar": {"Unsigned": ["U8", discriminant.to_string()]}}
+            })
+        };
+        let field = |name: &str| {
+            serde_json::json!({
+                "name": name,
+                "ty": {"Literal": "Bool"},
+                "attr_info": null
+            })
+        };
+        let enum_code = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["pyre_interpreter", "module", "struct", "Code"]),
+            "kind": {"Enum": [
+                variant("Pad", vec![], 0),
+                variant("Int", vec![field("signed")], 1)
+            ]}
+        });
+        let struct_code = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta(&["pyre_interpreter", "eval", "Code"]),
+            "kind": {"Struct": [field("name")]}
+        });
+        let opcode = serde_json::json!({
+            "def_id": 2,
+            "item_meta": item_meta(&["fixture", "Opcode"]),
+            "kind": {"Enum": [
+                variant("Nop", vec![], 0),
+                variant("Int", vec![field("signed")], 1)
+            ]}
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "pyre_interpreter",
+                "type_decls": [enum_code, struct_code, opcode],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let code_ty = serde_json::from_value::<TyRef>(adt(0, 30)).expect("Code TyRef");
+        let opcode_ty = serde_json::from_value::<TyRef>(adt(2, 31)).expect("Opcode TyRef");
+        let _guard =
+            super::TombstonedLeafGuard::install(["Code".to_string()].into_iter().collect());
+        assert_eq!(
+            super::tyref_to_value_type(&code_ty, &llbc),
+            ValueType::Ref(Some("module::struct::Code".to_string()))
+        );
+        assert_eq!(
+            super::tyref_class_root(&code_ty, &llbc).as_deref(),
+            Some("module::struct::Code")
+        );
+        assert_eq!(
+            super::tyref_to_value_type(&opcode_ty, &llbc),
+            ValueType::Ref(Some("Opcode".to_string())),
+            "a leaf harden did not clear keeps its bare intern key"
         );
     }
 
