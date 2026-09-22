@@ -8371,15 +8371,13 @@ fn stage_propagate_exception_as_exit(
     unsafe {
         *result_jf.add(header_words) = exc_val;
     }
-    // When unattached (unit-test setup), leave `jf_descr` alone so the
-    // caller can fall through to the cranelift singleton.
-    // `AbstractDescr.hide`: the word readers compare is the cell address,
-    // not `Arc::as_ptr`'s data half.
+    // When unattached (unit-test setup) this writes 0, and
+    // `resolve_exit_descr` surfaces the cranelift singleton.
+    // `AbstractDescr.hide`: the attached word is the cell address, not
+    // `Arc::as_ptr`'s data half.
     let attached_exit = attachments.descr_ptrs().exit_frame_with_exception_descr_ref;
-    if attached_exit != 0 {
-        unsafe {
-            *result_jf.add(JF_DESCR_OFS as usize / 8) = attached_exit as i64;
-        }
+    unsafe {
+        *result_jf.add(JF_DESCR_OFS as usize / 8) = attached_exit as i64;
     }
 }
 
