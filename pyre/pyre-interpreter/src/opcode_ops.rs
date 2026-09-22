@@ -1089,9 +1089,11 @@ fn _dict_merge_loop(
         )?;
         let val_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(val);
-        let key = pyre_object::gc_roots::shadow_stack_get(key_slot);
-        if crate::baseobjspace::contains(dict(), key)? {
-            let key_str = unsafe { crate::display::py_str_wtf8(key) }?;
+        // `__contains__` runs Python, so the key is re-read from its slot
+        // after it rather than held across it.
+        let key = || pyre_object::gc_roots::shadow_stack_get(key_slot);
+        if crate::baseobjspace::contains(dict(), key())? {
+            let key_str = unsafe { crate::display::py_str_wtf8(key()) }?;
             return Err(crate::argument::raise_type_error(
                 w_callable(),
                 crate::display::wtf8_format!(
@@ -1104,7 +1106,7 @@ fn _dict_merge_loop(
         unsafe {
             pyre_object::w_dict_store(
                 dict(),
-                key,
+                key(),
                 pyre_object::gc_roots::shadow_stack_get(val_slot),
             )
         };
