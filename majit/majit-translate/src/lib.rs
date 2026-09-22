@@ -3116,6 +3116,7 @@ mod portal_driver_tests {
             trait_root: Some("OpcodeStepExecutor".into()),
             trait_qualified: Some("pyre_interpreter::pyopcode::OpcodeStepExecutor".into()),
             returns_objectptr: false,
+            fun_decl_id: None,
         };
         let to_bool = front::semantic::SemanticFunction {
             name: "to_bool".into(),
@@ -3128,6 +3129,7 @@ mod portal_driver_tests {
             trait_root: Some("OpcodeStepExecutor".into()),
             trait_qualified: Some("pyre_interpreter::pyopcode::OpcodeStepExecutor".into()),
             returns_objectptr: false,
+            fun_decl_id: None,
         };
         let mut overrides = std::collections::HashMap::new();
         overrides.insert(
@@ -3227,6 +3229,7 @@ mod portal_driver_tests {
             trait_root: trait_root.map(str::to_string),
             trait_qualified: trait_qualified.map(str::to_string),
             returns_objectptr: false,
+            fun_decl_id: None,
         }
     }
 

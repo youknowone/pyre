@@ -244,4 +244,106 @@ mod tests {
 
         assert_eq!(graph.block(entry).operations[1].kind, original);
     }
+
+    /// `dunder_overridden`'s caller boxes the literal, then passes the ref.
+    #[test]
+    fn folds_dunder_overridden_caller_literal() {
+        let mut graph = FunctionGraph::new("dunder_overridden_caller");
+        let entry = graph.startblock;
+        let literal = graph
+            .push_op_var(entry, str_const_call("__add__"), true)
+            .expect("string literal must produce a value");
+        let boxed = graph
+            .push_op_var(entry, box_str_constant_call(literal), true)
+            .expect("box call must produce a value");
+
+        fold_box_str_constants(&mut graph);
+
+        assert_eq!(
+            graph.block(entry).operations[1].kind,
+            OpKind::ConstInternedStr(b"__add__".to_vec())
+        );
+        assert_eq!(
+            graph.block(entry).operations[1].result.as_ref(),
+            Some(&boxed)
+        );
+    }
+
+    /// `try_reflected_binary_special`'s caller boxes the reflected literal.
+    #[test]
+    fn folds_reflected_binary_special_caller_literal() {
+        let mut graph = FunctionGraph::new("reflected_binary_special_caller");
+        let entry = graph.startblock;
+        let literal = graph
+            .push_op_var(entry, str_const_call("__radd__"), true)
+            .expect("string literal must produce a value");
+        let boxed = graph
+            .push_op_var(entry, box_str_constant_call(literal), true)
+            .expect("box call must produce a value");
+
+        fold_box_str_constants(&mut graph);
+
+        assert_eq!(
+            graph.block(entry).operations[1].kind,
+            OpKind::ConstInternedStr(b"__radd__".to_vec())
+        );
+        assert_eq!(
+            graph.block(entry).operations[1].result.as_ref(),
+            Some(&boxed)
+        );
+    }
+
+    /// `try_lookup_unaryop` is reached from a per-arm literal. Each arm has
+    /// one predecessor, so both boxes fold.
+    #[test]
+    fn folds_lookup_unaryop_per_arm_literals() {
+        let mut graph = FunctionGraph::new("lookup_unaryop_arms");
+        let entry = graph.startblock;
+        let cond = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "neg".to_string(),
+                    ty: ValueType::Bool,
+                    class_root: None,
+                },
+                true,
+            )
+            .expect("cond must produce a value");
+        let neg_arm = graph.create_block();
+        let pos_arm = graph.create_block();
+        graph.set_branch(entry, cond.clone(), neg_arm, vec![], pos_arm, vec![]);
+
+        let neg_lit = graph
+            .push_op_var(neg_arm, str_const_call("__neg__"), true)
+            .expect("neg literal");
+        let neg_box = graph
+            .push_op_var(neg_arm, box_str_constant_call(neg_lit), true)
+            .expect("neg box");
+        let pos_lit = graph
+            .push_op_var(pos_arm, str_const_call("__pos__"), true)
+            .expect("pos literal");
+        let pos_box = graph
+            .push_op_var(pos_arm, box_str_constant_call(pos_lit), true)
+            .expect("pos box");
+
+        fold_box_str_constants(&mut graph);
+
+        assert_eq!(
+            graph.block(neg_arm).operations[1].kind,
+            OpKind::ConstInternedStr(b"__neg__".to_vec())
+        );
+        assert_eq!(
+            graph.block(neg_arm).operations[1].result.as_ref(),
+            Some(&neg_box)
+        );
+        assert_eq!(
+            graph.block(pos_arm).operations[1].kind,
+            OpKind::ConstInternedStr(b"__pos__".to_vec())
+        );
+        assert_eq!(
+            graph.block(pos_arm).operations[1].result.as_ref(),
+            Some(&pos_box)
+        );
+    }
 }

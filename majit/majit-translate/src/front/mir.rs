@@ -42508,7 +42508,7 @@ mod tests {
                 matches!(
                     &op.kind,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
+                        target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if super::fmt_path_ends_with(segments, &["w_code_const"])
                 )
@@ -48634,6 +48634,7 @@ mod tests {
                     "eval".to_string(),
                     "frame_anchor_release".to_string(),
                 ],
+                fun_decl_id: None,
             },
             args: Vec::new(),
             result_ty: crate::model::ValueType::Void,
