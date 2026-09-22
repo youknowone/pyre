@@ -3155,24 +3155,29 @@ pub struct GuardGcTypeInfo {
     pub subclass_ranges: HashMap<i64, (i64, i64)>,
 }
 
-/// Check if any op in the trace is a CALL variant.
-/// Whether an eligible residual CALL may be lowered to a direct in-module
-/// `call_indirect` into the callee's `__indirect_function_table` slot, instead
-/// of routing through the `jit_call` host trampoline (guest→host→guest
-/// reflection + arg marshalling).
-///
-/// The lowering takes the callee's wasm type from the IR alone: word-typed
-/// arguments and result become `(i64×n) -> i64`, so the static type is fixed by
-/// the arity. That is a claim about the embedding language's residual helpers,
-/// and one the IR cannot check — a helper declared to take a pointer has an
-/// `i32` parameter on wasm32, and `call_indirect` type-checks its callee on
-/// every call, so a call lowered this way traps instead of reaching a helper
-/// whose real signature is narrower.
-///
-/// [`ResidualCallAbi`] is how an embedder says which of the two it is.
-///
-/// Read once per emitted call, so it must be set before the first compile.
-static RESIDUAL_CALL_ABI: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+// Whether an eligible residual CALL may be lowered to a direct in-module
+// `call_indirect` into the callee's `__indirect_function_table` slot, instead
+// of routing through the `jit_call` host trampoline (guest→host→guest
+// reflection + arg marshalling).
+//
+// The lowering takes the callee's wasm type from the IR alone: word-typed
+// arguments and result become `(i64×n) -> i64`, so the static type is fixed by
+// the arity. That is a claim about the embedding language's residual helpers,
+// and one the IR cannot check — a helper declared to take a pointer has an
+// `i32` parameter on wasm32, and `call_indirect` type-checks its callee on
+// every call, so a call lowered this way traps instead of reaching a helper
+// whose real signature is narrower.
+//
+// `ResidualCallAbi` is how an embedder says which of the two it is.
+//
+// Read once per emitted call, so it must be set before the first compile
+// on this thread. Per thread for the same reason
+// `FAITHFUL_RESIDUAL_CALL_ADDRS` is: a wasm32 module is one thread, and a
+// process-global value lets a test that selects `Vouched` change a sibling
+// test that is compiling under the default `Word` ABI.
+thread_local! {
+    static RESIDUAL_CALL_ABI: Cell<u8> = const { Cell::new(0) };
+}
 
 /// How faithfully a residual callee's call descr describes its real wasm
 /// signature.
@@ -3199,11 +3204,11 @@ pub fn set_residual_call_abi(abi: ResidualCallAbi) {
         ResidualCallAbi::Word => 0,
         ResidualCallAbi::Vouched => 1,
     };
-    RESIDUAL_CALL_ABI.store(encoded, std::sync::atomic::Ordering::Relaxed);
+    RESIDUAL_CALL_ABI.with(|cell| cell.set(encoded));
 }
 
 fn residual_call_abi() -> ResidualCallAbi {
-    match RESIDUAL_CALL_ABI.load(std::sync::atomic::Ordering::Relaxed) {
+    match RESIDUAL_CALL_ABI.with(|cell| cell.get()) {
         0 => ResidualCallAbi::Word,
         _ => ResidualCallAbi::Vouched,
     }

@@ -11008,6 +11008,16 @@ impl CraneliftBackend {
                         builder.ins().jump(*label_block, &args);
                     }
                     builder.switch_to_block(*label_block);
+                    // regalloc.py prepare_op_label: a LABEL argument keeps
+                    // only the location its JUMP writes (`_arm_arglocs`), and
+                    // one that arrives elsewhere is `mark_as_free`d. No JUMP
+                    // writes the dense words a `before_call` publish filled, so
+                    // on the back edge each one holds what the previous
+                    // iteration's last publish put there, an Int as readily as
+                    // a Ref. A binding made before this header would have the
+                    // body's first collecting call trace that word as the box
+                    // the fall-through edge left in it.
+                    dense_ref_bindings.clear();
                     // A later LABEL may receive a raw Box first demoted by an
                     // earlier LABEL. Re-materialize it from the forwarded root
                     // slot at this header so the fall-through transfer can pass
@@ -19932,6 +19942,123 @@ mod tests {
             "the guard published the address the ref had before the collection"
         );
         assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xD30F_0005);
+    }
+
+    static LOOP_TOP_SLOT0_PROBES: std::sync::Mutex<Vec<(bool, i64)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    extern "C" fn noop_may_force() {}
+
+    /// Record, for the call it is passed the frame of, whether the call's map
+    /// names `jf_frame[0]` and what that word holds.
+    extern "C" fn probe_loop_top_slot0(jf: i64) {
+        let jf = jf as usize;
+        let gcmap = unsafe { *((jf + JF_GCMAP_OFS as usize) as *const usize) } as *const isize;
+        let marked = !gcmap.is_null() && unsafe { *gcmap.add(1) } & 1 != 0;
+        let slot0 = unsafe { *((jf + JF_FRAME_ITEM0_OFS as usize) as *const i64) };
+        LOOP_TOP_SLOT0_PROBES.lock().unwrap().push((marked, slot0));
+    }
+
+    /// A GUARD_NOT_FORCED publishes its fail args into the dense `jf_frame`
+    /// words before its call, and a later call's map keeps naming a word whose
+    /// Ref box is still alive. The back edge does not write those words, so at
+    /// the loop LABEL they hold what the previous iteration's last publish put
+    /// there. Here the preamble publishes the loop-carried Ref into
+    /// `jf_frame[0]` and the body publishes an Int there; the first call after
+    /// the LABEL must not name that word, or a collection inside it traces the
+    /// Int as a reference from the second iteration on.
+    #[test]
+    fn a_loop_labels_first_call_does_not_trace_a_word_the_back_edge_left_an_int_in() {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 160,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let root = gc.alloc_with_type(0, 16);
+
+        let mut backend = backend_with_gc(gc);
+        let carried = OpRef::input_arg_ref(0);
+        let counter = OpRef::input_arg_int(1);
+        let int_word = OpRef::input_arg_int(2);
+        let may_force = make_call_descr(vec![], Type::Void);
+        let preamble_guard = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
+        preamble_guard.setfailargs(smallvec::smallvec![rb(carried)]);
+        let body_guard = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
+        body_guard.setfailargs(smallvec::smallvec![rb(int_word)]);
+        let exit_guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(7)], OpRef::NONE.raw());
+        exit_guard.setfailargs(smallvec::smallvec![rb(carried)]);
+        let ops = vec![
+            mk_op_with_descr(
+                OpCode::CallMayForceN,
+                &[OpRef::int_op(100)],
+                OpRef::NONE.raw(),
+                may_force.clone(),
+            ),
+            preamble_guard,
+            mk_op(
+                OpCode::Label,
+                &[carried, counter, int_word],
+                OpRef::NONE.raw(),
+            ),
+            mk_op(OpCode::ForceToken, &[], 4),
+            mk_op_with_descr(
+                OpCode::CallN,
+                &[OpRef::int_op(101), OpRef::ref_op(4)],
+                OpRef::NONE.raw(),
+                make_call_descr(vec![Type::Ref], Type::Void),
+            ),
+            mk_op_with_descr(
+                OpCode::CallMayForceN,
+                &[OpRef::int_op(100)],
+                OpRef::NONE.raw(),
+                may_force,
+            ),
+            body_guard,
+            mk_op(OpCode::IntSub, &[counter, OpRef::const_int(1)], 6),
+            mk_op(OpCode::IntGt, &[OpRef::int_op(6), OpRef::const_int(0)], 7),
+            exit_guard,
+            mk_op(
+                OpCode::Jump,
+                &[carried, OpRef::int_op(6), int_word],
+                OpRef::NONE.raw(),
+            ),
+        ];
+        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        constants.insert(100, noop_may_force as *const () as usize as i64);
+        constants.insert(101, probe_loop_top_slot0 as *const () as usize as i64);
+        backend.set_constants(constants);
+
+        let token = JitCellToken::new(1720);
+        backend
+            .compile_loop(
+                &[
+                    InputArg::new_ref_rc(0),
+                    InputArg::new_int_rc(1),
+                    InputArg::new_int_rc(2),
+                ],
+                &ops,
+                &token,
+            )
+            .unwrap();
+        LOOP_TOP_SLOT0_PROBES.lock().unwrap().clear();
+        let int_value: i64 = 0x1235;
+        backend.execute_token(
+            &token,
+            &[Value::Ref(root), Value::Int(3), Value::Int(int_value)],
+        );
+        let probes = LOOP_TOP_SLOT0_PROBES.lock().unwrap().clone();
+        assert_eq!(probes.len(), 3, "one probe per iteration");
+        assert_eq!(
+            probes[1].1, int_value,
+            "the body's GUARD_NOT_FORCED left its Int in jf_frame[0] across the back edge"
+        );
+        for (iteration, &(marked, word)) in probes.iter().enumerate() {
+            assert!(
+                !marked || word == root.0 as i64,
+                "iteration {iteration}: the call's gcmap names jf_frame[0] while it holds {word:#x}"
+            );
+        }
     }
 
     #[test]
