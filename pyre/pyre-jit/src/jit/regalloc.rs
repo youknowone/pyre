@@ -499,10 +499,21 @@ pub fn perform_register_allocation_with_pairs(
     allocator.find_node_coloring();
 
     let mut coloring = HashMap::default();
+    // A variable met again already has its color, so only its first
+    // occurrence asks the allocator.
+    let mut record = |v: Variable| {
+        if v.kind != Some(kind) {
+            return;
+        }
+        if let std::collections::hash_map::Entry::Vacant(entry) = coloring.entry(v.id) {
+            if let Some(color) = allocator.getcolor(v) {
+                entry.insert(color);
+            }
+        }
+    };
     for block in graph.iterblocks() {
         let block_borrow = block.borrow();
-        // `Block.getvariables()` walked in place: a variable met twice gets
-        // the color it already has.
+        // `Block.getvariables()` walked in place.
         let block_variables = block_borrow
             .inputargs
             .iter()
@@ -514,36 +525,21 @@ pub fn perform_register_allocation_with_pairs(
                     .chain(op.result.as_ref().and_then(FlowValue::as_variable))
             }));
         for variable in block_variables {
-            if variable.kind == Some(kind) {
-                if let Some(color) = allocator.getcolor(variable) {
-                    coloring.insert(variable.id, color);
-                }
-            }
+            record(variable);
         }
         for link in &block_borrow.exits {
             let link_borrow = link.borrow();
-            if let Some(v) = link_borrow.last_exception {
-                if v.kind == Some(kind) {
-                    if let Some(color) = allocator.getcolor(v) {
-                        coloring.insert(v.id, color);
-                    }
-                }
-            }
-            if let Some(v) = link_borrow.last_exc_value {
-                if v.kind == Some(kind) {
-                    if let Some(color) = allocator.getcolor(v) {
-                        coloring.insert(v.id, color);
-                    }
-                }
-            }
-            for arg in &link_borrow.args {
-                if let Some(v) = arg.as_ref().and_then(FlowValue::as_variable) {
-                    if v.kind == Some(kind) {
-                        if let Some(color) = allocator.getcolor(v) {
-                            coloring.insert(v.id, color);
-                        }
-                    }
-                }
+            let link_variables = [link_borrow.last_exception, link_borrow.last_exc_value]
+                .into_iter()
+                .flatten()
+                .chain(
+                    link_borrow
+                        .args
+                        .iter()
+                        .filter_map(|arg| arg.as_ref().and_then(FlowValue::as_variable)),
+                );
+            for v in link_variables {
+                record(v);
             }
         }
     }
