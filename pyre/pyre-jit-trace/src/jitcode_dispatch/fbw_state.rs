@@ -3098,12 +3098,19 @@ pub(crate) fn fbw_finish_is_exception() -> bool {
 }
 
 /// Map an `abort_permanent` marker's jitcode pc back to the Python opcode
-/// the interpreter must resume at.  `emit_abort_permanent` (codewriter)
-/// anchors the graph marker at `py_pc` and additionally stores
-/// `last_instr = py_pc - 1` into the frame red; the full-body walk reads the
-/// marker coordinate here to flush the abort-point frame instead of replaying
-/// the walked region.  Returns None when the sym's jitcode / `code_ptr` is
-/// unavailable (no resume coordinate derivable → legacy replay).
+/// the interpreter must resume at.  `emit_abort_permanent` anchors the graph
+/// marker at that opcode's `py_pc` and stores `last_instr = py_pc - 1`; the
+/// full-body walk flushes the frame there instead of replaying the walked
+/// region.  Returns None when the sym's jitcode / `code_ptr` is unavailable
+/// (no resume coordinate derivable → legacy replay).
+///
+/// `Instruction::LoadFastCheck`'s null arm is a dead-end block emitted after
+/// the rest of the body.  `py_floor_by_jit_pc` keys each Python PC to its
+/// first jitcode offset, so that late block floors onto whichever opcode last
+/// opened a segment — the back-edge jump — and resuming there skips the
+/// check.  `abort_permanent_py_pc_by_jit_pc` is the marker's own inverse
+/// (`loop_body_abort_permanent_pc` resolves the same table).  The floor
+/// lookup remains for a skeleton jitcode that carries no marker inverse.
 pub(crate) fn fbw_abort_resume_py_pc<Sym: WalkSym>(
     sym: &Sym,
     abort_jit_pc: usize,
@@ -3116,6 +3123,10 @@ pub(crate) fn fbw_abort_resume_py_pc<Sym: WalkSym>(
     let jc = unsafe { &*sym.jitcode() };
     if jc.payload.code_ptr.is_null() {
         return None;
+    }
+    let table = &jc.payload.metadata.abort_permanent_py_pc_by_jit_pc;
+    if let Ok(idx) = table.binary_search_by_key(&(abort_jit_pc as u32), |&(off, _)| off) {
+        return Some(table[idx].1 as usize);
     }
     Some(
         crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.payload.metadata, abort_jit_pc)
