@@ -369,20 +369,9 @@ impl<'a> RegAlloc<'a> {
             std::mem::swap(&mut arg1, &mut arg2);
         }
         self.make_sure_var_in_reg(arg2, Type::Int, &[], Some(EAX), false);
-        let l1 = self.loc(arg1, Type::Int);
-        // x86/regalloc.py:600-601 asserts l1 can be `MUL`'s operand:
-        // it must not be an immediate (immediate would need a scratch
-        // register to materialise, which the optimiser already folded),
-        // and it can only coincide with eax when arg1 IS arg2 (the
-        // swap above already pinned arg2 to eax).
-        assert!(
-            !matches!(l1, Loc::Immed(_) | Loc::ImmedFloat(_)),
-            "consider_uint_mul_high_j2: l1 must be a register/frame, got immediate {l1:?}"
-        );
-        assert!(
-            !matches!(l1, Loc::Reg(r) if r.value == EAX.value) || arg1 == arg2,
-            "consider_uint_mul_high_j2: l1==eax only allowed when arg1 is arg2"
-        );
+        // Same-register square: arg1 is arg2, already in EAX. Freeing that
+        // binding below drops the location, so keep this snapshot.
+        let l1_same = self.loc(arg1, Type::Int);
         self.possibly_free_var(arg2, Type::Int);
         let tmp = self.fresh_temp_var();
         self.longevity.set(
@@ -406,6 +395,28 @@ impl<'a> RegAlloc<'a> {
             false,
             &mut self.longevity,
             &mut self.fm,
+        );
+        // MUL's high half is EDX. If arg1 already lived there, claiming the
+        // result spills it, and a snapshot taken before the claim still names
+        // EDX. Read the operand after the claim. A same-register square stays
+        // on the EAX snapshot: that binding was freed above.
+        let l1 = if arg1 == arg2 {
+            l1_same
+        } else {
+            self.loc(arg1, Type::Int)
+        };
+        // x86/regalloc.py:600-601 asserts l1 can be `MUL`'s operand:
+        // it must not be an immediate (immediate would need a scratch
+        // register to materialise, which the optimiser already folded),
+        // and it can only coincide with eax when arg1 IS arg2 (the
+        // swap above already pinned arg2 to eax).
+        assert!(
+            !matches!(l1, Loc::Immed(_) | Loc::ImmedFloat(_)),
+            "consider_uint_mul_high_j2: l1 must be a register/frame, got immediate {l1:?}"
+        );
+        assert!(
+            !matches!(l1, Loc::Reg(r) if r.value == EAX.value) || arg1 == arg2,
+            "consider_uint_mul_high_j2: l1==eax only allowed when arg1 is arg2"
         );
         self.perform(i, [l1], Some(Loc::Reg(EDX)), output);
     }
