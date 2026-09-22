@@ -5055,8 +5055,15 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     let mut wrapper_items = Vec::with_capacity(r_args.len().saturating_sub(1));
     let mut wrapper_item_concretes = Vec::with_capacity(arg_concretes.len().saturating_sub(1));
     if is_call_kw {
+        // The bind decline below comes after the callable `GuardValue`, so it
+        // rewinds the way every other decline past `pre_fold_pos` does: the
+        // guard named a snapshot the cut hands to another operation, which
+        // the unroll's Phase 2 remap reports as a cache miss.  The missing
+        // `Signature` arm is already answered before that guard is recorded
+        // and only restates the invariant here.
         let Some(sig) = builtin_sig else {
             builtin_inline_decline!("call_kw builtin has no Signature", fnaddr);
+            cut_declined_subwalk(ctx, pre_fold_pos);
             return Ok(None);
         };
         let bound_receiver = receiver_op.map(|op| {
@@ -5069,6 +5076,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
             builtin_call_kw_bind_signature(r_args, &arg_concretes, sig, bound_receiver)
         else {
             builtin_inline_decline!("call_kw signature bind declined", fnaddr);
+            cut_declined_subwalk(ctx, pre_fold_pos);
             return Ok(None);
         };
         wrapper_items = bound_ops;
