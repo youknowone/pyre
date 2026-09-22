@@ -122,6 +122,17 @@ pub struct SemanticFunction {
 pub struct StructFieldRegistry {
     /// struct_name → [(field_name, full_field_type_string)]
     pub fields: HashMap<String, Vec<(String, String)>>,
+    /// Suffix buckets for the key set of `fields`. Built on the first query
+    /// that needs them and reused while `len` still equals `fields.len()`.
+    /// Replacing the rows of an existing key does not change the key set;
+    /// those queries read the rows from `fields` after the bucket narrows.
+    /// Inserting a new key changes `len`, so the next query rebuilds.
+    /// Removing a key goes through [`Self::remove_field`], which drops the
+    /// buckets — a later insert that restores `len` cannot reuse them.
+    /// Crate-visible so a struct literal can fill it with `..Default::default()`;
+    /// queries treat a missing or stale `len` as absent and rebuild.
+    #[serde(skip)]
+    pub(crate) field_path_index: std::cell::RefCell<Option<FieldPathIndex>>,
 }
 
 impl StructFieldRegistry {
@@ -181,13 +192,45 @@ impl StructFieldRegistry {
             return false;
         }
         let canonical_owner = majit_ir::descr::canonical_struct_name(owner);
-        self.fields.iter().any(|(key, rows)| {
-            let Some((parent, _variant)) = key.rsplit_once("::") else {
-                return false;
-            };
-            majit_ir::descr::canonical_struct_name(parent) == canonical_owner
-                && rows.iter().any(|(field, _)| field == field_name)
+        let parent_leaf = canonical_owner
+            .rsplit("::")
+            .next()
+            .unwrap_or(canonical_owner.as_str());
+        // Variant keys group by the parent path's last segment, the same
+        // leaf `canonical_struct_name` keeps. The row check still reads
+        // `fields`, so a replaced field list is visible.
+        self.ensure_field_path_index();
+        let index = self.field_path_index.borrow();
+        let index = index.as_ref().expect("path index built");
+        index.by_parent_last.get(parent_leaf).is_some_and(|bucket| {
+            bucket.iter().any(|key| {
+                key.rsplit_once("::").is_some_and(|(parent, _variant)| {
+                    majit_ir::descr::canonical_struct_name(parent) == canonical_owner
+                        && self
+                            .fields
+                            .get(key)
+                            .is_some_and(|rows| rows.iter().any(|(field, _)| field == field_name))
+                })
+            })
         })
+    }
+
+    /// Drop the suffix buckets. Key removal can restore a previous `len`
+    /// with a different key set; [`Self::remove_field`] clears them when it
+    /// removes a key, before any later insert.
+    pub(crate) fn invalidate_field_path_index(&self) {
+        self.field_path_index.borrow_mut().take();
+    }
+
+    /// Remove one registered key and drop the suffix buckets. Inserts of a
+    /// new key are observed by the `len` check; this is the path that can
+    /// put a different key set back at the same `len`.
+    pub(crate) fn remove_field(&mut self, key: &str) -> Option<Vec<(String, String)>> {
+        let removed = self.fields.remove(key);
+        if removed.is_some() {
+            self.invalidate_field_path_index();
+        }
+        removed
     }
 
     fn lookup_fields(&self, owner: &str) -> Option<&[(String, String)]> {
@@ -220,19 +263,85 @@ impl StructFieldRegistry {
     }
 
     fn unique_suffix_owner_key<'a>(&'a self, owner: &str) -> Option<&'a str> {
-        let mut found: Option<&str> = None;
-        for key in self.fields.keys() {
-            let matches =
-                is_path_suffix(owner, key.as_str()) || is_path_suffix(key.as_str(), owner);
-            if !matches {
-                continue;
+        // Two path-suffix-related keys share their last `::` segment, so
+        // the bucket is the full candidate set. More than one match is
+        // still `None`.
+        let leaf = owner.rsplit("::").next().unwrap_or(owner);
+        self.ensure_field_path_index();
+        let matched = {
+            let index = self.field_path_index.borrow();
+            let index = index.as_ref().expect("path index built");
+            let mut found: Option<String> = None;
+            let mut ambiguous = false;
+            if let Some(bucket) = index.by_last.get(leaf) {
+                for key in bucket {
+                    let matches = is_path_suffix(owner, key) || is_path_suffix(key, owner);
+                    if !matches {
+                        continue;
+                    }
+                    if found.is_some() {
+                        ambiguous = true;
+                        break;
+                    }
+                    found = Some(key.clone());
+                }
             }
-            if found.is_some() {
-                return None;
-            }
-            found = Some(key.as_str());
+            if ambiguous { None } else { found }
+        }?;
+        self.fields
+            .get_key_value(&matched)
+            .map(|(key, _)| key.as_str())
+    }
+
+    fn ensure_field_path_index(&self) {
+        let len = self.fields.len();
+        if self
+            .field_path_index
+            .borrow()
+            .as_ref()
+            .is_some_and(|index| index.len == len)
+        {
+            return;
         }
-        found
+        let built = FieldPathIndex::build(&self.fields);
+        *self.field_path_index.borrow_mut() = Some(built);
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FieldPathIndex {
+    len: usize,
+    /// Last `::` segment → keys ending with that segment.
+    by_last: rustc_hash::FxHashMap<String, Vec<String>>,
+    /// Last segment of the parent path → keys with that parent leaf.
+    by_parent_last: rustc_hash::FxHashMap<String, Vec<String>>,
+}
+
+impl FieldPathIndex {
+    fn build(fields: &HashMap<String, Vec<(String, String)>>) -> Self {
+        let mut by_last: rustc_hash::FxHashMap<String, Vec<String>> =
+            rustc_hash::FxHashMap::default();
+        let mut by_parent_last: rustc_hash::FxHashMap<String, Vec<String>> =
+            rustc_hash::FxHashMap::default();
+        for key in fields.keys() {
+            let leaf = key.rsplit("::").next().unwrap_or(key.as_str());
+            by_last
+                .entry(leaf.to_string())
+                .or_default()
+                .push(key.clone());
+            if let Some((parent, _variant)) = key.rsplit_once("::") {
+                let parent_leaf = parent.rsplit("::").next().unwrap_or(parent);
+                by_parent_last
+                    .entry(parent_leaf.to_string())
+                    .or_default()
+                    .push(key.clone());
+            }
+        }
+        Self {
+            len: fields.len(),
+            by_last,
+            by_parent_last,
+        }
     }
 }
 
@@ -1836,5 +1945,39 @@ mod tests {
         assert!(reg.owner_or_variant_has_field("buffer::Buffer", "w_obj"));
         assert!(reg.owner_or_variant_has_field("Buffer", "w_obj"));
         assert!(!reg.owner_or_variant_has_field("buffer::Buffer", "readonly"));
+    }
+
+    #[test]
+    fn suffix_index_follows_remove_then_insert_that_restores_len() {
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "a::Foo".to_string(),
+            vec![("x".to_string(), "i64".to_string())],
+        );
+        assert_eq!(reg.field_type("Foo", "x"), Some("i64"));
+        reg.remove_field("a::Foo");
+        reg.fields.insert(
+            "b::Foo".to_string(),
+            vec![("x".to_string(), "u8".to_string())],
+        );
+        assert_eq!(reg.field_type("Foo", "x"), Some("u8"));
+        assert_eq!(reg.field_type("Foo", "missing"), None);
+    }
+
+    #[test]
+    fn field_registry_serialized_shape_is_only_the_field_map() {
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "a::Foo".to_string(),
+            vec![("x".to_string(), "i64".to_string())],
+        );
+        assert_eq!(reg.field_type("Foo", "x"), Some("i64"));
+        let json = serde_json::to_value(&reg).expect("registry serializes");
+        let keys: Vec<_> = json.as_object().expect("object").keys().cloned().collect();
+        assert_eq!(keys, vec!["fields".to_string()]);
+        let restored: StructFieldRegistry =
+            serde_json::from_value(json).expect("registry deserializes");
+        assert_eq!(restored.field_type("Foo", "x"), Some("i64"));
+        assert!(restored.owner_or_variant_has_field("a::Foo", "x"));
     }
 }

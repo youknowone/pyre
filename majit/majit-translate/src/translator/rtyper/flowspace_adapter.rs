@@ -8420,6 +8420,7 @@ mod tests {
                     ("PlainObject".to_string(), vec![]),
                     ("TypedObject".to_string(), vec![]),
                 ]),
+                ..crate::front::StructFieldRegistry::default()
             }));
         let mut graph = LegacyGraph::new("allocation_variants_fixture");
 
