@@ -4518,6 +4518,45 @@ mod tests {
     }
 
     #[test]
+    fn uint_mul_high_then_wrapping_mul_keeps_both_operands() {
+        // `consider_finish` publishes only its first argument, so each
+        // product is its own trace. Both inputs stay live across
+        // `UINT_MUL_HIGH`, which clobbers EAX and EDX.
+        fn product(a: i64, b: i64) -> i64 {
+            let mut backend = DynasmBackend::new();
+            backend.attach_default_test_descrs();
+            let ops = vec![
+                mk_op(
+                    OpCode::UintMulHigh,
+                    &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                    2,
+                ),
+                mk_op(
+                    OpCode::IntMul,
+                    &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                    3,
+                ),
+                mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
+            ];
+            let token = JitCellToken::new(1501);
+            backend
+                .compile_loop(
+                    &[InputArg::new_int_rc(0), InputArg::new_int_rc(1)],
+                    &ops,
+                    &token,
+                )
+                .unwrap();
+            let frame = backend.execute_token(&token, &[Value::Int(a), Value::Int(b)]);
+            backend.get_int_value(&frame, 0)
+        }
+        for (a, b) in [(6i64, 7i64), (3125867703, 3442092617), (-1, 3)] {
+            let got = product(a, b) as u64;
+            let exp = (a as u64 as u128).wrapping_mul(b as u64 as u128) as u64;
+            assert_eq!(got, exp, "{a:#x} * {b:#x}");
+        }
+    }
+
+    #[test]
     fn test_gc_alloc_and_init_with_configured_runtime() {
         install_test_libc_jitframe_tracer();
         let mut gc = MiniMarkGC::new();
