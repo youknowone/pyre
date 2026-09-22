@@ -6979,10 +6979,12 @@ fn emit_indirect_call_from_parts(
 
 /// Emit a guard/finish side-exit.
 ///
-/// _build_failure_recovery (assembler.py:2080-2109) parity:
-///   1. _push_all_regs_to_frame  — save live values to jf_frame slots
-///   2. POP [ebp + jf_descr]     — store fail_descr index to jf_descr
-///   3. _call_footer              — mov eax, ebp; ret (return jitframe)
+/// `generate_quick_failure` parity: the per-guard stub.  It saves the
+/// fail-args to their jf_frame slots (`_push_all_regs_to_frame`, done here
+/// per value because the backend, not this code, chooses their registers),
+/// stores `jf_gcmap`, runs the attached-loop and bridge dispatches, and jumps
+/// to the function's [`FailureRecovery`] block with the fail descr, as the
+/// stub `PUSH`es the descr before its `JMP` to `failure_recovery_code`.
 ///
 /// x86/assembler.py _cmp_guard_class:
 ///   loc_ptr = locs[0]
@@ -7483,6 +7485,7 @@ fn emit_guard_exit(
     ref_root_base_ofs: i32,
     ptr_type: cranelift_codegen::ir::Type,
     call_conv: cranelift_codegen::isa::CallConv,
+    failure_recovery: &mut FailureRecovery,
 ) {
     // _push_all_regs_to_frame / save_into_mem parity:
     // store fail_args to jf_frame[slot]
@@ -7695,54 +7698,93 @@ fn emit_guard_exit(
         );
     }
 
-    // _build_failure_recovery (assembler.py:2089-2096) parity:
-    // if exc: MOV ebx, [pos_exc_value]; MOV [pos_exception], 0;
-    //         MOV [pos_exc_value], 0; MOV [jf_guard_exc], ebx
-    if info.must_save_exception {
-        // _store_and_reset_exception (assembler.py:1826-1842) parity:
-        // Store pos_exc_value → jf_guard_exc, clear both globals to 0.
-        // exc_class is derived from exc_value.typeptr (pyjitpl.py:3119-3123).
-        let exc_addr = builder
-            .ins()
-            .iconst(cl_types::I64, jit_exc_value_addr() as i64);
-        let exc_val = builder
-            .ins()
-            .load(cl_types::I64, MemFlagsData::trusted(), exc_addr, 0);
-        builder
-            .ins()
-            .store(MemFlagsData::trusted(), exc_val, jf_ptr, JF_GUARD_EXC_OFS);
-        let zero = builder.ins().iconst(cl_types::I64, 0);
-        builder
-            .ins()
-            .store(MemFlagsData::trusted(), zero, exc_addr, 0);
-        let exc_type_addr = builder
-            .ins()
-            .iconst(cl_types::I64, jit_exc_type_addr() as i64);
-        builder
-            .ins()
-            .store(MemFlagsData::trusted(), zero, exc_type_addr, 0);
+    let recovery = failure_recovery.block(builder, info.must_save_exception);
+    builder.ins().jump(recovery, &[BlockArg::from(descr_val)]);
+}
+
+/// `_build_failure_recovery(exc)`: the deadframe return every guard exit of a
+/// function shares, one block per `exc` flavour.  The block takes the fail
+/// descr the exit stub hands it (`POP [ebp + jf_descr]`), stages a pending
+/// exception into `jf_guard_exc` when `exc`, and returns the jitframe
+/// (`_call_footer`).
+#[derive(Default)]
+struct FailureRecovery {
+    blocks: [Option<Block>; 2],
+}
+
+impl FailureRecovery {
+    fn block(&mut self, builder: &mut FunctionBuilder, exc: bool) -> Block {
+        *self.blocks[usize::from(exc)].get_or_insert_with(|| {
+            let block = builder.create_block();
+            builder.append_block_param(block, cl_types::I64);
+            builder.set_cold_block(block);
+            block
+        })
     }
-    if info.must_save_exception {
-        // `jf_guard_exc` is a header GCREF field (jitframe.py:105-109), traced
-        // on every walk and independent of the gcmap, so the staging store
-        // above needs its own barrier. The fail-arg publish is covered by the
-        // barrier that runs before the dispatch tail-calls.
-        emit_jitframe_write_barrier(
-            builder,
-            ptr_type,
-            call_conv,
-            jf_ptr,
-            jitframe_write_barrier_flag(),
-        );
+
+    /// Fill the blocks some exit jumped to.  Runs once the body is emitted,
+    /// so every predecessor is known when a block is sealed.
+    fn emit(
+        self,
+        builder: &mut FunctionBuilder,
+        ptr_type: cranelift_codegen::ir::Type,
+        call_conv: cranelift_codegen::isa::CallConv,
+    ) {
+        for (exc, block) in self.blocks.into_iter().enumerate() {
+            let Some(block) = block else {
+                continue;
+            };
+            builder.switch_to_block(block);
+            builder.seal_block(block);
+            let descr_val = builder.block_params(block)[0];
+            let jf_ptr = builder.ins().get_pinned_reg(ptr_type);
+            if exc == 1 {
+                // _store_and_reset_exception (assembler.py) parity:
+                // Store pos_exc_value → jf_guard_exc, clear both globals to 0.
+                // exc_class is derived from exc_value.typeptr (pyjitpl.py handle_jitexception).
+                let exc_addr = builder
+                    .ins()
+                    .iconst(cl_types::I64, jit_exc_value_addr() as i64);
+                let exc_val =
+                    builder
+                        .ins()
+                        .load(cl_types::I64, MemFlagsData::trusted(), exc_addr, 0);
+                builder
+                    .ins()
+                    .store(MemFlagsData::trusted(), exc_val, jf_ptr, JF_GUARD_EXC_OFS);
+                let zero = builder.ins().iconst(cl_types::I64, 0);
+                builder
+                    .ins()
+                    .store(MemFlagsData::trusted(), zero, exc_addr, 0);
+                let exc_type_addr = builder
+                    .ins()
+                    .iconst(cl_types::I64, jit_exc_type_addr() as i64);
+                builder
+                    .ins()
+                    .store(MemFlagsData::trusted(), zero, exc_type_addr, 0);
+                // `jf_guard_exc` is a header GCREF field (jitframe.py JITFRAME),
+                // traced on every walk and independent of the gcmap, so the
+                // staging store above needs its own barrier. The fail-arg
+                // publish is covered by the barrier that runs before the
+                // dispatch tail-calls.
+                emit_jitframe_write_barrier(
+                    builder,
+                    ptr_type,
+                    call_conv,
+                    jf_ptr,
+                    jitframe_write_barrier_flag(),
+                );
+            }
+            builder
+                .ins()
+                .store(MemFlagsData::trusted(), descr_val, jf_ptr, JF_DESCR_OFS); // #2105
+            // assembler.py _call_footer → _call_footer_shadowstack:
+            // SUB [rootstacktop], 2*WORD — inline, no function call.
+            emit_call_footer_shadowstack(builder, ptr_type);
+            // _call_footer (assembler.py): mov eax, ebp; ret
+            builder.ins().return_(&[jf_ptr]);
+        }
     }
-    builder
-        .ins()
-        .store(MemFlagsData::trusted(), descr_val, jf_ptr, JF_DESCR_OFS); // #2105
-    // assembler.py:1101 _call_footer → _call_footer_shadowstack:
-    // SUB [rootstacktop], 2*WORD — inline, no function call.
-    emit_call_footer_shadowstack(builder, ptr_type);
-    // _call_footer (assembler.py:1097): mov eax, ebp; ret
-    builder.ins().return_(&[jf_ptr]);
 }
 
 // Compiled loop data
@@ -10180,6 +10222,7 @@ impl CraneliftBackend {
         // compile-local state for the duration of this invocation.
         let mut func_ctx = std::mem::replace(&mut self.func_ctx, FunctionBuilderContext::new());
         let mut builder = FunctionBuilder::new(&mut func, &mut func_ctx);
+        let mut failure_recovery = FailureRecovery::default();
 
         let entry_block = builder.create_block();
         builder.append_block_params_for_function_params(entry_block);
@@ -11593,6 +11636,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &mut failure_recovery,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -11628,6 +11672,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &mut failure_recovery,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -11680,6 +11725,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &mut failure_recovery,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -11734,6 +11780,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &mut failure_recovery,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -11780,6 +11827,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &mut failure_recovery,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -11833,6 +11881,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &mut failure_recovery,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -11895,6 +11944,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &mut failure_recovery,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -11933,6 +11983,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &mut failure_recovery,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -11982,6 +12033,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &mut failure_recovery,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -12112,6 +12164,7 @@ impl CraneliftBackend {
                             ref_root_base_ofs,
                             ptr_type,
                             call_conv,
+                            &mut failure_recovery,
                         );
 
                         builder.switch_to_block(cont_block);
@@ -12152,6 +12205,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &mut failure_recovery,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -12175,6 +12229,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &mut failure_recovery,
                     );
 
                     // Create a continuation block for subsequent ops (dead code).
@@ -12229,6 +12284,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &mut failure_recovery,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -12340,6 +12396,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &mut failure_recovery,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -12500,6 +12557,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &mut failure_recovery,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -15001,6 +15059,7 @@ impl CraneliftBackend {
                             ref_root_base_ofs,
                             ptr_type,
                             call_conv,
+                            &mut failure_recovery,
                         );
                     }
                 }
@@ -15020,6 +15079,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &mut failure_recovery,
                     );
                 }
 
@@ -15192,6 +15252,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &mut failure_recovery,
                     );
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -15225,6 +15286,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &mut failure_recovery,
                     );
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -16031,6 +16093,7 @@ impl CraneliftBackend {
         if label_blocks.is_empty() && loop_block != entry_block {
             builder.seal_block(loop_block);
         }
+        failure_recovery.emit(&mut builder, ptr_type, call_conv);
         builder.finalize(frontend_config);
         self.func_ctx = func_ctx;
         propagate_cold_blocks(&mut func);
