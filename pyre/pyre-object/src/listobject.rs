@@ -1805,9 +1805,9 @@ pub fn w_list_allocate_instance(w_listtype: PyObjectRef) -> PyObjectRef {
     // ordinary movable object, so the class word has to survive it on the
     // shadow stack and be re-read afterwards.
     let _roots = crate::gc_roots::push_roots();
-    let w_listtype = crate::gc_roots::pin_root(w_listtype);
+    let type_slot = crate::gc_roots::pin_roots(&[w_listtype]);
     let obj = w_list_new_with_strategy(Vec::new(), ListStrategy::Empty);
-    let w_listtype = crate::gc_roots::reload_top_root(w_listtype);
+    let w_listtype = crate::gc_roots::shadow_stack_get(type_slot);
     if !w_listtype.is_null() {
         let list_class = get_instantiate(&LIST_TYPE);
         if w_listtype != list_class {

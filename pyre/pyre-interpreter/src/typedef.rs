@@ -5132,18 +5132,19 @@ fn tuple_from_exact_list(obj: PyObjectRef) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(&[obj]);
     let n = unsafe { pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(base)) };
-    let mut count = 0usize;
+    let mut slots = Vec::with_capacity(n);
     for i in 0..n {
         let obj = pyre_object::gc_roots::shadow_stack_get(base);
         if let Some(item) = unsafe { pyre_object::w_list_getitem(obj, i as i64) } {
+            let slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(item);
-            count += 1;
+            slots.push(slot);
         }
     }
-    let mut items = Vec::with_capacity(count);
-    for slot in 0..count {
-        items.push(pyre_object::gc_roots::shadow_stack_get(base + 1 + slot));
-    }
+    let items = slots
+        .into_iter()
+        .map(pyre_object::gc_roots::shadow_stack_get)
+        .collect();
     unsafe { pyre_object::w_tuple_new(items) }
 }
 
