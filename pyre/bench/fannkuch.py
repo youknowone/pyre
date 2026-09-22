@@ -1,10 +1,7 @@
 # Almost nothing but cross-loop JUMP. After the wasm32 stack-residency
 # fix, peeled loops compile instead of declining, so every JUMP pays
 # wasm's module-local br / jitframe-slot path where dynasm remaps
-# LABEL values in registers. The 6.3x allowance was 5.4x plus
-# WASM_RATIO_FIT_HEADROOM. Three ubuntu-24.04 runs after the reflected
-# direct-call path (35491772991, 35547723188, 35592344587) read 2.6x,
-# 2.6x, 2.5x, inside the 4.0 default, so the allowance is gone.
+# LABEL values in registers.
 # Fannkuch-Redux benchmark (The Computer Language Benchmarks Game)
 # Ported for pyre: while-loop only, no range/list/enumerate
 

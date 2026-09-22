@@ -1,6 +1,4 @@
 # pyre-check: max-pypy-ratio=3.5
-# The 5.1x wasm/dynasm allowance is gone: ubuntu-24.04 runs 35491772991,
-# 35547723188, and 35592344587 read 1.8x, 1.9x, 1.5x.
 # A bare re-raise caught in the same frame keeps the original traceback: no
 # node is attached at a re-raise coordinate (RaiseWithExplicitTraceback,
 # attach_tb=False). The module-level loop makes the recording iteration itself
