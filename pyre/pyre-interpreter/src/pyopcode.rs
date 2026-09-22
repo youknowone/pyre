@@ -3523,23 +3523,14 @@ pub fn execute_load_name<E: OpcodeStepExecutor>(
     op_arg: OpArg,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
 where
-    E: NamespaceOpcodeHandler<Value = PyObjectRef>,
+    E: NamespaceOpcodeHandler,
 {
     let Instruction::LoadName { namei } = instruction else {
         unreachable!()
     };
     let idx = u32_as_usize(namei.get(op_arg));
-    // Residual-safe word helper: `load_name` takes `&str` and looks
-    // inside the dict strategy, which cannot be a residual argument.
-    let value = crate::eval::load_name_nameindex_w(executor.as_pyframe_ptr(), idx as i64);
-    if value.is_null() {
-        let name = code.names[idx].as_ref();
-        return Err(PyError::name_error_with_name(
-            format!("name '{name}' is not defined"),
-            name,
-        ));
-    }
-    executor.push_value(value)?;
+    // pyopcode.py LOAD_NAME: `getname_w` then `space.finditem_str`.
+    executor.load_name(code.names[idx].as_ref(), idx)?;
     Ok(StepResult::Continue)
 }
 
@@ -3550,7 +3541,7 @@ pub fn execute_load_global<E: OpcodeStepExecutor>(
     op_arg: OpArg,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
 where
-    E: NamespaceOpcodeHandler<Value = PyObjectRef>,
+    E: NamespaceOpcodeHandler,
 {
     let Instruction::LoadGlobal { namei } = instruction else {
         unreachable!()
@@ -3558,20 +3549,8 @@ where
     let raw = u32_as_usize(namei.get(op_arg));
     let name_idx = raw >> 1;
     let push_null = (raw & 1) != 0;
-    // Residual-safe word helper: `load_global` takes `&str` and looks
-    // inside the dict strategy, which compiles to `CallMayForceR(0)`.
-    let value = crate::eval::load_global_nameindex_w(executor.as_pyframe_ptr(), name_idx as i64);
-    if value.is_null() {
-        let name = code.names[name_idx].as_ref();
-        return Err(PyError::name_error_with_name(
-            format!("name '{name}' is not defined"),
-            name,
-        ));
-    }
-    executor.push_value(value)?;
-    if push_null {
-        executor.push_value(pyre_object::PY_NULL)?;
-    }
+    // pyopcode.py LOAD_GLOBAL: `getname_w` then `LOAD_GLOBAL_cached`.
+    executor.load_global(code.names[name_idx].as_ref(), name_idx, push_null)?;
     Ok(StepResult::Continue)
 }
 

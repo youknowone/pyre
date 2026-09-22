@@ -1017,6 +1017,16 @@ impl ModuleDictStrategy {
         self._getdictvalue_no_unwrapping_pure(self.version, w_dict, key)
     }
 
+    /// `getdictvalue_no_unwrapping` when the key is already the interned
+    /// unicode object `getname_w` returns. RPython `str` is one GCREF.
+    pub fn getdictvalue_no_unwrapping_w(
+        &self,
+        w_dict: PyObjectRef,
+        w_key: PyObjectRef,
+    ) -> Option<PyObjectRef> {
+        self._getdictvalue_no_unwrapping_pure_w(self.version, w_dict, w_key)
+    }
+
     /// `celldict.py _getdictvalue_no_unwrapping_pure` — keep the module dict
     /// object as the storage owner and unerase its `dstorage` here.  This is
     /// the load-bearing PyPy shape: callers never pass the concrete erased
@@ -1032,6 +1042,24 @@ impl ModuleDictStrategy {
         w_dict: PyObjectRef,
         key: &str,
     ) -> Option<PyObjectRef> {
+        unsafe { crate::dictmultiobject::w_module_dict_module_storage(w_dict).get(key) }
+    }
+
+    /// Same elidable as [`Self::_getdictvalue_no_unwrapping_pure`]. The key
+    /// is the interned unicode GCREF (`celldict.py`
+    /// `_getdictvalue_no_unwrapping_pure`).
+    #[majit_macros::elidable_promote(promote_args = "0,1,2")]
+    #[expect(
+        clippy::not_unsafe_ptr_arg_deref,
+        reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the object-space boundary"
+    )]
+    pub fn _getdictvalue_no_unwrapping_pure_w(
+        &self,
+        _version: VersionTag,
+        w_dict: PyObjectRef,
+        w_key: PyObjectRef,
+    ) -> Option<PyObjectRef> {
+        let key = unsafe { crate::unicodeobject::w_str_get_value(w_key) };
         unsafe { crate::dictmultiobject::w_module_dict_module_storage(w_dict).get(key) }
     }
 
@@ -1119,6 +1147,14 @@ impl ModuleDictStrategy {
         // `unwrap_cell` is null-tolerant and an `ObjectMutableCell` may hold a
         // null `w_value`; a null unwrap means the name has no live binding, so
         // report absence rather than `Some(null)`.
+        let v = unsafe { unwrap_cell(raw) };
+        if v.is_null() { None } else { Some(v) }
+    }
+
+    /// `celldict.py getitem_str` with the interned unicode key `getname_w`
+    /// returns.
+    pub fn getitem_str_w(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
+        let raw = self.getdictvalue_no_unwrapping_w(w_dict, w_key)?;
         let v = unsafe { unwrap_cell(raw) };
         if v.is_null() { None } else { Some(v) }
     }
