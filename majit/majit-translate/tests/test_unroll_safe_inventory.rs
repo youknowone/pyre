@@ -325,6 +325,14 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     ("_flat_pycall_defaults", "function.py _flat_pycall_defaults"),
     ("action_dispatcher", "executioncontext.py action_dispatcher"),
     ("match_signature", "argument.py _match_signature"),
+    (
+        "_orig__dict_merge_loop",
+        "pyopcode.py look_inside_iff unroll_safe(_dict_merge_loop)",
+    ),
+    (
+        "_unpackiterable_known_length_jitlook",
+        "baseobjspace.py _unpackiterable_known_length_jitlook",
+    ),
     ("save_float", "interp_pickle.py _Framer.write_binfloat"),
     // `rlib/jit.py look_inside_iff.inner` does `func = unroll_safe(func)`.
     // Harvested names are the inlined originals (`_orig_*`), not the
@@ -440,32 +448,19 @@ fn every_unroll_safe_in_the_shipped_llbc_is_a_reviewed_one() {
     }
 }
 
-/// `_unpackiterable_known_length_jitlook` quotes upstream's
-/// `@jit.unroll_safe` in its own doc comment, which reads as an unfinished
-/// port and has been picked up as one.  It is not.
-///
-/// Upstream hints that body for `unpackiterable_unroll`, whose
-/// `expected_length` is an UNPACK_SEQUENCE oparg; `unpackiterable` reaches
-/// it through `_unpackiterable_known_length`, which is
-/// `@jit.dont_look_inside` — "the JIT stopped looking inside already".  pyre
-/// has neither `unpackiterable_unroll` nor the shim, so `unpackiterable` is
-/// the body's only caller: the hinted path upstream keeps closed.  Carrying
-/// the attribute alone inverts that decision instead of matching it.
+/// `_unpackiterable_known_length` is `@jit.dont_look_inside`; the
+/// `@jit.unroll_safe` body is only `_unpackiterable_known_length_jitlook`,
+/// reached from `unpackiterable_unroll`.  The shim must stay unhinted.
 #[test]
-fn the_known_length_unpack_body_stays_unhinted_without_its_shim() {
+fn the_known_length_unpack_shim_stays_unhinted() {
     let Some(paths) = harvested_unroll_safe() else {
         return;
     };
     assert!(
         !paths
             .iter()
-            .any(|p| leaf(p) == "_unpackiterable_known_length_jitlook"),
-        "`unroll_safe` on _unpackiterable_known_length_jitlook opens the path \
-         upstream fences with the `@jit.dont_look_inside` shim \
-         `_unpackiterable_known_length`, which pyre does not have. Port the \
-         shim (and `unpackiterable_unroll`) with an ABI-correct publication \
-         first — the signature returns `Result<Vec<PyObjectRef>, PyError>`, \
-         which `helper_call_kind_for_type` answers `Unsupported` for. \
-         Harvested: {paths:?}",
+            .any(|p| leaf(p) == "_unpackiterable_known_length"),
+        "`unroll_safe` on _unpackiterable_known_length would open the path \
+         upstream fences with `@jit.dont_look_inside`. Harvested: {paths:?}",
     );
 }

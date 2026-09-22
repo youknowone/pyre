@@ -15700,7 +15700,11 @@ pub fn unpackiterable(
         Ok(drain_collect_items(w_list))
     } else {
         // baseobjspace.py:996-998 — known-length path with shape validation.
-        _unpackiterable_known_length_jitlook(w_iterator, expected_length as usize)
+        // `_unpackiterable_known_length` is `@jit.dont_look_inside`; the
+        // list it returns is copied here (`lst_w[:]`) so the caller gets a
+        // resizable `Vec`.
+        let w_list = _unpackiterable_known_length(w_iterator, expected_length as usize)?;
+        Ok(drain_collect_items(w_list))
     }
 }
 
@@ -16611,49 +16615,41 @@ fn build_default_pick_builtin_module() -> PyObjectRef {
 ///     return items
 /// ```
 ///
-/// The quoted `@jit.unroll_safe` is deliberately **not** carried on this
-/// function, and porting it alone would invert upstream's decision rather
-/// than match it.  Upstream reaches this body from two directions and hints
-/// only one of them:
+/// pypy/interpreter/baseobjspace.py `_unpackiterable_known_length`.
+/// `@jit.dont_look_inside` — "the JIT stopped looking inside already".
+#[majit_macros::dont_look_inside]
+fn _unpackiterable_known_length(
+    w_iterator: PyObjectRef,
+    expected_length: usize,
+) -> Result<PyObjectRef, crate::PyError> {
+    _unpackiterable_known_length_jitlook(w_iterator, expected_length)
+}
+
+/// pypy/interpreter/baseobjspace.py `_unpackiterable_known_length_jitlook`.
+/// `@jit.unroll_safe`.  Reached directly from [`unpackiterable_unroll`];
+/// [`unpackiterable`] goes through [`_unpackiterable_known_length`] so the
+/// JIT does not look inside that caller.
 ///
-/// * `unpackiterable` goes through `_unpackiterable_known_length`, which is
-///   `@jit.dont_look_inside` — "the JIT stopped looking inside already".
-/// * `unpackiterable_unroll` calls this body directly.  That is the caller
-///   the hint exists for, and its `expected_length` is an UNPACK_SEQUENCE
-///   oparg, so the unroll is bounded by a constant.
-///
-/// pyre has neither `unpackiterable_unroll` nor `fixedview_unroll`, so
-/// [`unpackiterable`] is this body's only caller — the one upstream fences
-/// off.  Being loopy and unhinted, the graph is rejected by
-/// `look_inside_graph` (`majit-translate` `codewriter/policy.rs`) and stays a
-/// residual call, which is the same boundary the shim buys upstream.  Adding
-/// the attribute here would open the fenced path and make `expected_length`
-/// — a plain red argument on a graph ~40 callers share — the unroll bound.
-///
-/// Restoring the split is the orthodox fix, but it is a larger change than
-/// the attribute: `#[majit_macros::dont_look_inside]` registers a helper
-/// call descriptor, and `helper_call_kind_for_type` answers `Unsupported`
-/// for this signature's `Result<Vec<PyObjectRef>, PyError>` (>16 bytes, so
-/// an sret aggregate).  The shim needs an ABI-correct `extern "C" fn(..) ->
-/// i64` publication first, the way `next` is published as
-/// `runtime_ops::bh_next`.  Port `_unpackiterable_known_length` and
-/// `unpackiterable_unroll` together with that publication, and only then the
-/// attribute.
+/// Returns a `W_List` (one residual word), matching RPython's interp-level
+/// list.  Callers that still need a `Vec` convert with [`drain_collect_items`]
+/// outside the unrolled body.
+#[majit_macros::unroll_safe]
 fn _unpackiterable_known_length_jitlook(
     w_iterator: PyObjectRef,
     expected_length: usize,
-) -> Result<Vec<PyObjectRef>, crate::PyError> {
+) -> Result<PyObjectRef, crate::PyError> {
     // Each `next` runs the iterator's `__next__`, so every loop turn is a
-    // collection point.  A plain `Vec` accumulator is scanned by no root
-    // walker, which would leave every item already pulled unreachable while
-    // the next one is produced, and `w_iterator` is a native copy the
-    // collector does not update.  `_unpackiterable_unknown_length`
-    // accumulates into a rooted `W_List` for this reason; the flat return
-    // shape here is rebuilt from the published set instead.
+    // collection point.  Accumulate into a rooted `W_List` the same way
+    // `_unpackiterable_unknown_length` does; a plain `Vec` is scanned by no
+    // root walker.
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_iterator);
+    let _ = pyre_object::gc_roots::pin_root(
+        pyre_object::listobject::w_list_new_object_with_sizehint(expected_length as i64),
+    );
     let iterator = || pyre_object::gc_roots::shadow_stack_get(root_base);
+    let items_slot = root_base + 1;
     let mut count = 0usize;
     loop {
         match next(iterator()) {
@@ -16663,7 +16659,7 @@ fn _unpackiterable_known_length_jitlook(
                         "too many values to unpack (expected {expected_length})",
                     )));
                 }
-                let _ = pyre_object::gc_roots::pin_root(w_item);
+                unsafe { drain_append_at(items_slot, w_item) };
                 count += 1;
             }
             Err(e) if e.matches_stop_iteration() => break,
@@ -16676,13 +16672,24 @@ fn _unpackiterable_known_length_jitlook(
             got = count,
         )));
     }
-    let mut items = Vec::with_capacity(count);
-    for index in 0..count {
-        items.push(pyre_object::gc_roots::shadow_stack_get(
-            root_base + 1 + index,
-        ));
-    }
-    Ok(items)
+    Ok(pyre_object::gc_roots::shadow_stack_get(items_slot))
+}
+
+/// pypy/interpreter/baseobjspace.py `unpackiterable_unroll`.
+///
+/// Like [`unpackiterable`], but for a known `expected_length` that should
+/// unroll when JITted.  Calls [`_unpackiterable_known_length_jitlook`]
+/// directly.
+pub fn unpackiterable_unroll(
+    w_iterable: PyObjectRef,
+    expected_length: usize,
+) -> Result<Vec<PyObjectRef>, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let iterable_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_iterable);
+    let w_iterator = iter(pyre_object::gc_roots::shadow_stack_get(iterable_slot))?;
+    let w_list = _unpackiterable_known_length_jitlook(w_iterator, expected_length)?;
+    Ok(drain_collect_items(w_list))
 }
 
 /// pypy/interpreter/baseobjspace.py:1159-1163 base default + the
@@ -17135,6 +17142,15 @@ pub fn fixedview(
     expected_length: isize,
 ) -> Result<Vec<PyObjectRef>, crate::PyError> {
     unpackiterable(w_iterable, expected_length)
+}
+
+/// pypy/objspace/std/objspace.py `fixedview_unroll`.
+/// `assert expected_length >= 0`; `fixedview(..., unroll=True)`.
+pub fn fixedview_unroll(
+    w_iterable: PyObjectRef,
+    expected_length: usize,
+) -> Result<Vec<PyObjectRef>, crate::PyError> {
+    unpackiterable_unroll(w_iterable, expected_length)
 }
 
 /// descroperation.py — `iter()` requires the object returned by a
