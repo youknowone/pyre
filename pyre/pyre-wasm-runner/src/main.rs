@@ -1021,7 +1021,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             // copy reads the wrong words and prints them as a walk outcome
             // instead of failing. Named rather than spelled inline so the
             // mirror is something a test can compare.
-            const RING_BASE: u32 = 20;
+            const RING_BASE: u32 = 18;
             const RING_ENTRIES: u32 = 24;
             const RING_STRIDE: u32 = 5;
             const NAME_SLOTS: u32 = 4;
