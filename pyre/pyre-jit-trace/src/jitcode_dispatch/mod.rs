@@ -11041,6 +11041,13 @@ fn emit_module_dict_cell_fold<Sym: WalkSym>(
                 // because an in-place rebind would otherwise become a
                 // `GUARD_VALUE` that never retraces (`global_reassign`).
                 let pin_version = specialize::code_pins_namespace_version(w_code_ptr, w_globals);
+                // A raw slot folded without `version?` is `unwrap_cell`'s
+                // identity return. A later promoting store would not revoke it.
+                if !pin_version
+                    && specialize::raw_fold_needs_version_pin(w_code_ptr, w_globals, stored)
+                {
+                    return Ok(false);
+                }
                 return emit_namespace_cell_fold(
                     ctx,
                     op_pc,

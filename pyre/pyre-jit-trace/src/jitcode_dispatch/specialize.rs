@@ -25787,6 +25787,12 @@ fn emit_builtins_cell_fold<Sym: WalkSym>(
         return Ok(false);
     }
     let pin_version = code_pins_namespace_version(w_code_ptr, w_globals);
+    // Absence of the name is what sends the lookup to builtins. Without
+    // the module-dict pin, a promoting store in this body can insert the
+    // name and the folded builtin would keep winning.
+    if !pin_version && code_store_bumps_namespace_now(w_code_ptr, w_globals) {
+        return Ok(false);
+    }
     if pin_version && !walker_pin_namespace_version(ctx, op_pc, w_globals)? {
         return Ok(false);
     }
@@ -25875,6 +25881,25 @@ pub(crate) fn code_has_any_delete_name_from_ptr(w_code_ptr: usize) -> bool {
 pub(crate) fn code_pins_namespace_version(w_code_ptr: usize, ns: pyre_object::PyObjectRef) -> bool {
     !code_has_any_delete_name_from_ptr(w_code_ptr)
         && !code_store_bumps_namespace_now(w_code_ptr, ns)
+}
+
+/// A raw module slot folded without `version?` is `unwrap_cell`'s identity
+/// return, stamped concrete. Nothing then revokes it when a later store
+/// promotes the slot. A mutable cell still folds: the compiled loop keeps
+/// that cell's live field.
+pub(crate) fn raw_fold_needs_version_pin(
+    w_code_ptr: usize,
+    ns: pyre_object::PyObjectRef,
+    stored: pyre_object::PyObjectRef,
+) -> bool {
+    if stored.is_null() {
+        return false;
+    }
+    let cell = unsafe {
+        pyre_object::celldict::is_object_mutable_cell(stored)
+            || pyre_object::celldict::is_int_mutable_cell(stored)
+    };
+    !cell && code_store_bumps_namespace_now(w_code_ptr, ns)
 }
 
 /// `STORE_NAME` on a module body, and every `STORE_GLOBAL`, write `ns`.
