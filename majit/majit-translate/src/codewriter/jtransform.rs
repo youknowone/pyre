@@ -921,7 +921,10 @@ fn is_ptr_from_ref_path(segments: &[String]) -> bool {
     }
     joined.starts_with("core::ptr::")
         || joined.starts_with("std::ptr::")
-        || segments.get(segments.len().saturating_sub(2)).map(String::as_str) == Some("ptr")
+        || segments
+            .get(segments.len().saturating_sub(2))
+            .map(String::as_str)
+            == Some("ptr")
 }
 
 /// Stored value of a GC-pointer `setfield_gc` / `setarrayitem_gc`.

@@ -37345,9 +37345,7 @@ fn collect_fmt_collapse(graph: &FunctionGraph, bf: BlockId, fi: usize) -> Option
         // (`i < 0` then `-` + magnitude); an Unsigned word is never
         // negative. Rust `{:#x}` on signed is two's-complement bits,
         // which is the format! shell this rewrite replaces.
-        FmtArgKind::LowerHex
-            if nav.placeholder.is_lower_hex_alternate() && nav.context_is_int =>
-        {
+        FmtArgKind::LowerHex if nav.placeholder.is_lower_hex_alternate() && nav.context_is_int => {
             "hex"
         }
         // `{:?}` Debug has no native rstr counterpart, so leave a Debug

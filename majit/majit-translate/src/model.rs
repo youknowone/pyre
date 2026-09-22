@@ -4165,14 +4165,12 @@ pub fn fuse_boxing_alloc_with_pytypes(
             // enough; the site loop still requires a synthetic-ctor
             // aggregate and a registered boxing layout.
             Some("allocate") | Some("allocate_stable") => Some("malloc_typed_stable"),
-            Some(flavor @ ("malloc"
-            | "malloc_typed"
-            | "malloc_typed_managed"
-            | "malloc_typed_stable"))
-                if segments.len() >= 2 && segments[segments.len() - 2] == "lltype" =>
-            {
-                Some(flavor)
-            }
+            Some(
+                flavor @ ("malloc"
+                | "malloc_typed"
+                | "malloc_typed_managed"
+                | "malloc_typed_stable"),
+            ) if segments.len() >= 2 && segments[segments.len() - 2] == "lltype" => Some(flavor),
             _ => None,
         }
     }
@@ -12164,14 +12162,13 @@ mod tests {
                 true,
             )
             .unwrap();
-        let field = |base: &crate::flowspace::model::Variable, name: &str, value, ty| {
-            OpKind::FieldWrite {
+        let field =
+            |base: &crate::flowspace::model::Variable, name: &str, value, ty| OpKind::FieldWrite {
                 base: base.clone(),
                 field: FieldDescriptor::new(name, Some("W_CData".into())),
                 value,
                 ty,
-            }
-        };
+            };
         graph.push_op_var(
             entry,
             field(&agg, "ctype", LinkArg::Value(ctype), ValueType::Ref(None)),
