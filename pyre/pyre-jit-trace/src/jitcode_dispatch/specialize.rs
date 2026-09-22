@@ -25869,9 +25869,9 @@ pub(crate) fn code_has_any_delete_name_from_ptr(w_code_ptr: usize) -> bool {
 /// that store sits in a `JUMP_BACKWARD` span of a body that also has an
 /// exception table. Either one, after this pin, aborts the trace at
 /// `opimpl_jit_force_quasi_immutable` (`with` / `as value`). A handler-free
-/// loop keeps the pin: skipping it on pickle's module `for` dropped
-/// compiled loops. A one-shot binding above the loop does not count, and
-/// an `ObjectMutableCell` or `IntMutableCell` takes the hot store in place.
+/// loop keeps the pin. A one-shot binding above the loop does not count,
+/// and an `ObjectMutableCell` or `IntMutableCell` takes the hot store in
+/// place.
 pub(crate) fn code_pins_namespace_version(w_code_ptr: usize, ns: pyre_object::PyObjectRef) -> bool {
     !code_has_any_delete_name_from_ptr(w_code_ptr)
         && !code_store_bumps_namespace_now(w_code_ptr, ns)
@@ -25886,16 +25886,22 @@ fn code_store_bumps_namespace_now(w_code_ptr: usize, ns: pyre_object::PyObjectRe
     let Some(code) = code_from_w_code_ptr(w_code_ptr) else {
         return false;
     };
-    // A handler-free loop does not take this skip. `pickle`'s module
-    // `for` promotes `original` without an exception table; skipping the
-    // pin there dropped compiled loops. The abort this targets is the
-    // `with` body, which has both the backward jump and an exception table.
+    // Only a body that already has an exception table. The skip is the
+    // `with` shape: a loop store promotes a bare name in the same trace
+    // as the pin. A handler-free loop keeps the pin.
     if code.exceptiontable.is_empty() {
         return false;
     }
     let module_level = code.obj_name.as_str() == "<module>";
+    // One pass over the backward jumps (`backward_jump_target`), then one
+    // pass over the stores. Membership is a handful of spans, not another
+    // decode of the whole body per pc.
+    let spans = backward_jump_spans(code);
+    if spans.is_empty() {
+        return false;
+    }
     (0..code.instructions.len()).any(|pc| {
-        if !pc_is_in_backward_jump(code, pc) {
+        if !spans.iter().any(|&(start, end)| start <= pc && pc < end) {
             return false;
         }
         let Some((ins, arg)) = pyre_interpreter::decode_instruction_at(code, pc) else {
@@ -25915,24 +25921,22 @@ fn code_store_bumps_namespace_now(w_code_ptr: usize, ns: pyre_object::PyObjectRe
     })
 }
 
-/// `pc` sits in some `JUMP_BACKWARD` span. A one-shot binding above the
-/// loop does not: pinning must stay for a loop whose cells are already
-/// stable (`read_global`), and only a loop store that still promotes the
-/// slot forces the skip.
-fn pc_is_in_backward_jump(code: &pyre_interpreter::CodeObject, pc: usize) -> bool {
-    (0..code.instructions.len()).any(|jpc| {
+/// Half-open `[target, jump)` spans of `JumpBackward` and
+/// `JumpBackwardNoInterrupt`, from `backward_jump_target`.
+fn backward_jump_spans(code: &pyre_interpreter::CodeObject) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    for jpc in 0..code.instructions.len() {
         let Some((ins, arg)) = pyre_interpreter::decode_instruction_at(code, jpc) else {
-            return false;
+            continue;
         };
-        let delta = match ins {
-            pyre_interpreter::Instruction::JumpBackward { delta }
-            | pyre_interpreter::Instruction::JumpBackwardNoInterrupt { delta } => delta,
-            _ => return false,
+        let Some(target) = pyre_interpreter::backward_jump_target(code, jpc, ins, arg) else {
+            continue;
         };
-        let target =
-            pyre_interpreter::pyopcode::jump_target_backward_decoded(code, jpc + 1, delta, arg);
-        target <= pc && pc < jpc
-    })
+        if target < jpc {
+            spans.push((target, jpc));
+        }
+    }
+    spans
 }
 
 /// True when the next store of `name` cannot be an in-place cell write.

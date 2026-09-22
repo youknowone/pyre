@@ -11031,15 +11031,15 @@ fn emit_module_dict_cell_fold<Sym: WalkSym>(
             if !stored.is_null() {
                 // `celldict.py getdictvalue_no_unwrapping` is
                 // `@elidable_promote` on `version?` for every lookup,
-                // cell or raw.  Skip that pin only when this CodeObject
-                // itself `DELETE_NAME`s: `delitem` always `mutated()`,
-                // and a watcher already installed makes
-                // `opimpl_jit_force_quasi_immutable` abort the same
-                // trace (`exception_reraise_tb_depth_hot`).  A cell
-                // load in a delete-free body still pins — otherwise
-                // `unwrap_cell`'s recording concrete becomes a
-                // `GUARD_VALUE` that deopts on the next in-place
-                // rebind and never retraces (`global_reassign`).
+                // cell or raw.  `code_pins_namespace_version` skips that
+                // pin when this CodeObject `DELETE_NAME`s (`delitem`
+                // always `mutated()`) or when a `JUMP_BACKWARD` span in
+                // a body with an exception table still stores a bare
+                // name (`store_would_bump_version`).  A watcher already
+                // installed makes `opimpl_jit_force_quasi_immutable`
+                // abort the same trace.  A load that still pins does so
+                // because an in-place rebind would otherwise become a
+                // `GUARD_VALUE` that never retraces (`global_reassign`).
                 let pin_version = specialize::code_pins_namespace_version(w_code_ptr, w_globals);
                 return emit_namespace_cell_fold(
                     ctx,
