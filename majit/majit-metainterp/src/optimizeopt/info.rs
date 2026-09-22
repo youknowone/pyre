@@ -1464,16 +1464,27 @@ fn force_box_impl(
             alloc_ref
         }
         PtrInfo::VirtualArrayStruct(vinfo) => {
-            // info.py ArrayStructInfo._force_elements
-            // virtualize.py:31: assert clear — ArrayStruct is always
-            // created with clear=True, so the original op is always
-            // NEW_ARRAY_CLEAR.
-            // info.py force_box keeps the SAME info (`set_forwarded(self);
-            // _is_virtual = False`). PRE-EXISTING DIVERGENCE: pyre installs
-            // `nonnull()`, dropping the array-struct identity — same convergence
-            // path as VirtualArray (an `is_virtual` flag + gated match sites).
+            // `AbstractVirtualPtrInfo.force_box` forwards the allocation at
+            // this `ArrayStructInfo` and clears `_is_virtual`. There is no
+            // non-virtual array-struct variant. After the force, interior
+            // field get/set and `VArrayStructStateInfo.enum_forced_boxes`
+            // both require `is_virtual()`, and the heap cache does not
+            // record interior fields, so the readers that still run
+            // (`getlenbound`, `make_guards`, `ensure_ptr_info_arg0`) see
+            // the same surface as a plain `ArrayPtrInfo`: this descr, a
+            // constant length, and no cached items. `_force_elements`
+            // emits the `SETINTERIORFIELD_GC` stores and does not publish
+            // those fields as array items, so the forced box carries
+            // `PtrInfo::Array`.
+            // An array struct is always allocated cleared, so the op is
+            // `NEW_ARRAY_CLEAR`.
             let num_elements = vinfo.element_fields.len();
-            ctx.set_ptr_info(op, PtrInfo::nonnull());
+            let preserved = PtrInfo::Array(ArrayPtrInfo {
+                descr: vinfo.descr.clone(),
+                lenbound: IntBound::from_constant(num_elements as i64),
+                items: Vec::new(),
+                last_guard_pos: -1,
+            });
 
             let len_ref = ctx.emit_constant_int(num_elements as i64);
             let arg_len = ctx.materialize_operand_at(len_ref);
@@ -1481,6 +1492,13 @@ fn force_box_impl(
             alloc_op.pos().set(opref);
             alloc_op.setdescr(vinfo.descr.clone());
             let alloc_ref = emit_op(ctx, alloc_op);
+            // Install before the interior stores. A child that points back
+            // at this box must see the non-virtual array, and `make_equal_to`
+            // copies whatever info `op` still holds onto the allocation.
+            ctx.set_ptr_info(op, preserved.clone());
+            if let Some(b) = ctx.get_box_replacement_operand_opt(alloc_ref) {
+                ctx.set_ptr_info(&b, preserved);
+            }
             if opref != alloc_ref {
                 let b_alloc = ctx.get_box_replacement_operand(alloc_ref);
                 ctx.make_equal_to(op, &b_alloc);
@@ -2208,6 +2226,64 @@ mod tests {
         );
         let folded = Operand::from_bound_op(&len_rc).get_box_replacement(false);
         assert_eq!(folded.const_value(), Some(Value::Int(length as i64)));
+    }
+
+    #[test]
+    fn test_force_virtual_array_struct_keeps_array_info() {
+        let descr = byte_array_descr(true);
+        let length = 2usize;
+        let mut info = PtrInfo::VirtualArrayStruct(ArrayStructInfo {
+            descr: descr.clone(),
+            element_fields: vec![
+                majit_ir::ptr_info::VirtualFieldList::new(),
+                majit_ir::ptr_info::VirtualFieldList::new(),
+            ],
+            fielddescrs: vec![Arc::new(ForceFieldDescr {
+                offset: 0,
+                field_size: 8,
+                field_type: Type::Int,
+                name: "real",
+            })],
+            last_guard_pos: -1,
+            avpi: AbstractVirtualPtrInfo::new(),
+        });
+        // A written interior field must not survive: the forced info keeps
+        // no item cache, so a later read is not elided against this store.
+        info.setinteriorfield_virtual(0, 0, field_op(Type::Int, 7));
+
+        let mut ctx = OptContext::new(32);
+        ctx.in_final_emission = true;
+        let virtual_box = field_op(Type::Ref, 10);
+        let forced = info.force_box(&virtual_box, &mut ctx);
+
+        let forced_box = ctx.get_box_replacement_operand(forced);
+        let ptr = ctx
+            .peek_ptr_info(&forced_box)
+            .expect("forced box carries ptr info");
+        let PtrInfo::Array(array) = &ptr else {
+            panic!("forced virtual array struct must be PtrInfo::Array, got {ptr:?}");
+        };
+        assert!(
+            Arc::ptr_eq(&array.descr, &descr),
+            "forced array struct keeps the virtual array descr"
+        );
+        assert!(
+            array.lenbound.is_constant(),
+            "forced array struct length is the constant virtual length"
+        );
+        assert_eq!(array.lenbound.get_constant_int(), length as i64);
+        assert!(
+            array.items.is_empty(),
+            "forced array struct forgets cached items, got {:?}",
+            array.items
+        );
+        assert_eq!(array.last_guard_pos, -1);
+        assert!(
+            ctx.new_operations
+                .iter()
+                .any(|op| op.opcode == OpCode::SetinteriorfieldGc),
+            "forcing an array struct emits SETINTERIORFIELD_GC for a written field"
+        );
     }
 
     #[test]
