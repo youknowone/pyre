@@ -741,22 +741,18 @@ impl OptString {
             ctx.make_equal_to(&b_old, &b_new);
             return OptimizationResult::Remove;
         }
-        // vstring.py:490-512: the char could not be folded. Continue the
-        // strgetitem dispatch on the residual — unwrap a virtual slice to its
-        // source (index → start+index) and recurse a virtual concat into the
-        // child that holds the position — then emit STRGETITEM on that target,
-        // forcing only the target. The slice/concat is left unreferenced rather
-        // than forced wholesale.
+        // `strgetitem`: the char could not be folded. Continue the dispatch
+        // on the residual — unwrap a virtual slice to its source
+        // (index → start+index) and recurse a virtual concat into the child
+        // that holds the position — then build STRGETITEM on that target.
+        // The slice/concat stays unreferenced.
         if let Some((target, index_box)) =
             self.strgetitem_rebase_residual(&str_ref, &op.arg(1), mode, ctx)
         {
-            // PRE-EXISTING DIVERGENCE: vstring.py `_strgetitem` only builds
-            // the STRGETITEM and hands it to emit_extra; the operand is forced
-            // later at final emission (optimizer.py force_box on args). pyre
-            // has no emit-time operand forcing for general ops, so the target is
-            // materialized here, ahead of upstream's timing. Convergence needs
-            // force_box to run over an emitted op's args at emission time.
-            self.force_if_virtual(&target, ctx);
+            // The residual STRGETITEM keeps the (possibly virtual) target.
+            // `OptEarlyForce::propagate_forward` force_boxes every argument of
+            // a general op, and `Optimizer::emit_operation_inner` force_boxes
+            // them again before the op is appended.
             let arg_s = ctx.resolve_operand_operand(&target);
             let arg_i = ctx.resolve_operand_operand(&index_box);
             let get_opcode = if mode == mode_unicode {
@@ -987,13 +983,12 @@ impl OptString {
         ctx.is_virtual(op)
     }
 
-    /// vstring.py _int_sub — constant-fold if both args are constant,
-    /// otherwise emit INT_SUB so downstream passes (int bounds, CSE) see it.
+    /// vstring.py `_int_sub`
     ///
-    /// PRE-EXISTING DIVERGENCE: vstring.py:389 uses
-    /// `optstring.optimizer.send_extra_operation(op)` (re-dispatch from
-    /// first_optimization); `emit_for_force` only routes from the next pass.
-    /// Same convergence note as the sibling `_int_add`.
+    /// Constant-folding INT_SUB: folds sub-0 and const-const at the optimizer
+    /// level. Non-constant subs emit an INT_SUB operation that is re-dispatched
+    /// from `first_optimization` via `send_extra_operation`, so OptIntBounds —
+    /// a pass before OptString — computes the result bound.
     fn int_sub(&self, a: &Operand, b: &Operand, ctx: &mut OptContext) -> Operand {
         if let Some(vb) = ctx
             .resolve_operand_operand_opt(b)
@@ -1013,7 +1008,8 @@ impl OptString {
         let arg_a = ctx.resolve_operand_operand(a);
         let arg_b = ctx.resolve_operand_operand(b);
         let op = Op::new(OpCode::IntSub, &[arg_a.clone(), arg_b.clone()]);
-        let __r = ctx.emit_for_force(op);
+        // `optimizer.send_extra_operation` re-dispatches from `first_optimization`.
+        let __r = ctx.send_extra_operation(op);
         ctx.materialize_operand_at(__r)
     }
 
@@ -2215,7 +2211,7 @@ mod tests {
         pass.setup();
         let mut ctx = OptContext::new(20);
 
-        // Non-virtual source ref so force_if_virtual leaves it as the source box.
+        // Non-virtual source ref: the residual STRGETITEM reads this box.
         // Materialize the source / start / index leaf positions so the residual
         // STRGETITEM (and its INT_ADD index) re-emit them as bound boxes
         // (`Operand::Op`) rather than position-only `from_opref` boxes.
