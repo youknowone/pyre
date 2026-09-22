@@ -215,16 +215,20 @@ pub(super) fn ensure_mirror(w_obj: PyObjectRef) -> *mut CPyObject {
             (*mirror).tp_as_mapping = &raw mut (*heap).as_mapping;
             (*mirror).tp_as_buffer = &raw mut (*heap).as_buffer;
         }
-        let linked = || unsafe { (*(mirror as *mut CPyObject)).ob_pyre_link };
-        super::typeobject::describe_interpreter_type(mirror, linked());
-        // `typeobject.py:727-732`: the metatype is referenced from here only
-        // when it is itself a heap type.
-        let of_type = type_mirror(linked());
+        // Read the link into a local before each allocating call. A
+        // closure that borrows `mirror` cannot live across `set_ob_type`.
+        let w_type = unsafe { (*(mirror as *mut CPyObject)).ob_pyre_link };
+        super::typeobject::describe_interpreter_type(mirror, w_type);
+        // `typeobject.py` `type_setup`: the metatype is referenced from
+        // here only when it is itself a heap type.
+        let w_type = unsafe { (*(mirror as *mut CPyObject)).ob_pyre_link };
+        let of_type = type_mirror(w_type);
         unsafe { set_ob_type(&raw mut (*mirror).ob_base.ob_base, of_type) };
         // Only the startup table has a reason to defer this: every base a
         // mirror reached from here can name already has its own mirror, or
         // gets one from this same call a level down.
-        super::typeobject::finish_interpreter_type(mirror, linked());
+        let w_type = unsafe { (*(mirror as *mut CPyObject)).ob_pyre_link };
+        super::typeobject::finish_interpreter_type(mirror, w_type);
         return mirror as *mut CPyObject;
     }
     w_obj = roots.get(obj_slot);
