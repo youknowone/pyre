@@ -588,7 +588,9 @@ pub const PARAMETERS: JitParameters = JitParameters {
     pureop_historylength: 16,
     max_retrace_guards: 15,
     max_unroll_loops: 0,
-    disable_unrolling: 200,
+    // rlib/jit.py:599 gives 200, a value nothing reads there. Here the
+    // threshold is consulted, so the default is the one that never fires.
+    disable_unrolling: u32::MAX,
     enable_opts: EnableOpts::All,
     max_unroll_recursion: 7,
     vec: false,
@@ -644,7 +646,7 @@ pub const UNROLL_PARAMETERS: &[(&str, i64)] = &[
     ("pureop_historylength", 16),
     ("max_retrace_guards", 15),
     ("max_unroll_loops", 0),
-    ("disable_unrolling", 200),
+    ("disable_unrolling", u32::MAX as i64),
     ("max_unroll_recursion", 7),
     ("vec", 0),
     ("vec_all", 0),

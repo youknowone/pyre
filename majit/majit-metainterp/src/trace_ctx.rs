@@ -2568,7 +2568,7 @@ impl TraceCtx {
     pub fn close_green_key(&self) -> Option<GreenKey> {
         let greens = self.close_greens.as_ref()?;
         let pc = self.close_green_pc?;
-        self.merge_point_green_key(pc, greens)
+        self.merge_point_green_key(pc, &greens.0, &greens.1, &greens.2)
     }
 
     /// pyjitpl.py / :3005 `get_procedure_token(greenboxes)` analog: the
@@ -2578,9 +2578,14 @@ impl TraceCtx {
     pub fn merge_point_green_key_hash(
         &self,
         pc: i64,
-        greens: &(Vec<i64>, Vec<i64>, Vec<i64>),
+        ints: &[i64],
+        refs: &[i64],
+        floats: &[i64],
     ) -> Option<u64> {
-        Some(self.merge_point_green_key(pc, greens)?.get_uhash())
+        Some(
+            self.merge_point_green_key(pc, ints, refs, floats)?
+                .get_uhash(),
+        )
     }
 
     /// The typed form of [`Self::merge_point_green_key_hash`], for callers
@@ -2588,10 +2593,11 @@ impl TraceCtx {
     pub fn merge_point_green_key(
         &self,
         pc: i64,
-        greens: &(Vec<i64>, Vec<i64>, Vec<i64>),
+        ints: &[i64],
+        refs: &[i64],
+        floats: &[i64],
     ) -> Option<GreenKey> {
-        let (ints, refs, floats) = greens;
-        let spec: smallvec::SmallVec<[GreenType; 4]> =
+        let spec: smallvec::SmallVec<[GreenType; majit_ir::GREEN_INLINE]> =
             if let Some(key) = self.green_key_values.as_ref() {
                 debug_assert_eq!(
                     key.types.first().copied(),
@@ -2608,8 +2614,8 @@ impl TraceCtx {
                 )
             };
 
-        let mut values = smallvec::SmallVec::<[i64; 4]>::new();
-        let mut types = smallvec::SmallVec::<[GreenType; 4]>::new();
+        let mut values = smallvec::SmallVec::<[i64; majit_ir::GREEN_INLINE]>::new();
+        let mut types = smallvec::SmallVec::<[GreenType; majit_ir::GREEN_INLINE]>::new();
         values.push(pc);
         types.push(GreenType::Int);
         let mut int_i = 0;
@@ -3031,7 +3037,7 @@ impl TraceCtx {
     ///
     /// Writes the concrete half of `virtualizable_boxes` (the
     /// `virtualizable_values` shadow) back to the live virtualizable via
-    /// `VirtualizableInfo::write_all_boxes`. The trailing identity slot
+    /// `write_field` / `write_array_item`. The trailing identity slot
     /// (`virtualizable_boxes[-1]`) is excluded — RPython's `write_boxes`
     /// stops at `self.num_arrays + self.static_fields.len()` and leaves the
     /// identity untouched. No-op when the heap pointer, `virtualizable_info`,
@@ -3236,27 +3242,6 @@ impl TraceCtx {
         let Some(lengths) = self.virtualizable_array_lengths.as_ref() else {
             return;
         };
-        let static_count = info.num_static_extra_boxes;
-        if values.len() < static_count {
-            return;
-        }
-        let mut static_bits: Vec<i64> = Vec::with_capacity(static_count);
-        for v in &values[..static_count] {
-            static_bits.push(value_to_raw_bits(*v));
-        }
-        let mut array_bits: Vec<Vec<i64>> = Vec::with_capacity(lengths.len());
-        let mut cursor = static_count;
-        for &len in lengths {
-            if cursor + len > values.len() {
-                return;
-            }
-            let mut items: Vec<i64> = Vec::with_capacity(len);
-            for v in &values[cursor..cursor + len] {
-                items.push(value_to_raw_bits(*v));
-            }
-            array_bits.push(items);
-            cursor += len;
-        }
         // When the merge point is the bare observer/replay form
         // (`jit_merge_point!()`), an outer executor (the macro-generated
         // mainloop) owns the live struct and writes it on every opcode. The
@@ -3272,15 +3257,42 @@ impl TraceCtx {
         if skip_when_outer_owned && info.outer_executor_owns_state {
             return;
         }
+        let static_count = info.num_static_extra_boxes;
+        if values.len() < static_count {
+            return;
+        }
+        let mut needed = static_count;
+        for &len in lengths {
+            needed = needed.saturating_add(len);
+            if needed > values.len() {
+                return;
+            }
+        }
+        // virtualizable.py write_boxes: setattr each static field, then each
+        // array item, with no intermediate collection.
         // Safety: `heap_ptr` comes from `virtualizable_heap_ptr`, which names
         // a frame kept alive for as long as the trace reads it.  The cell is
         // not pinned for the session — see its declaration for the writers that
         // move it — and a collection forwards the object it names
-        // (`walk_virtualizable_value_refs`). `write_all_boxes` uses typed
-        // offsets derived from the same VirtualizableInfo used at the matching
-        // heap read.
+        // (`walk_virtualizable_value_refs`). Offsets come from the same
+        // VirtualizableInfo used at the matching heap read.
         unsafe {
-            info.write_all_boxes(heap_ptr as *mut u8, &static_bits, &array_bits);
+            let dst = heap_ptr as *mut u8;
+            for (i, v) in values[..static_count].iter().enumerate() {
+                info.write_field(dst, i, value_to_raw_bits(*v));
+            }
+            let mut cursor = static_count;
+            for (array_index, &len) in lengths.iter().enumerate() {
+                for item_index in 0..len {
+                    info.write_array_item(
+                        dst,
+                        array_index,
+                        item_index,
+                        value_to_raw_bits(values[cursor]),
+                    );
+                    cursor += 1;
+                }
+            }
         }
     }
 
@@ -6629,7 +6641,11 @@ mod tests {
         let a = majit_ir::make_field_descr_full(u32::MAX, 0, 8, Type::Int, false);
         let b = majit_ir::make_field_descr_full(u32::MAX, 8, 8, Type::Int, false);
         let value = ctx.const_int(42);
+        assert_ne!(a.index(), u32::MAX);
+        assert_ne!(b.index(), u32::MAX);
+        assert_ne!(a.index(), b.index());
         ctx.heapcache_getfield_now_known(obj, a.index(), value);
+        assert_eq!(ctx.heapcache_getfield_cached(obj, a.index()), Some(value));
         assert_eq!(ctx.heapcache_getfield_cached(obj, b.index()), None);
         ctx.heapcache_setfield_cached(obj, a.index(), value);
         assert_eq!(ctx.heapcache_getfield_cached(obj, b.index()), None);

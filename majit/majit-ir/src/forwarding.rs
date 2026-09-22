@@ -633,6 +633,45 @@ pub(crate) fn unpack_forwarded(w: u64) -> Forwarded {
     }
 }
 
+/// Borrowed classification of a packed `_forwarded` word.
+/// Pointers are not owned; the slot that produced `w` keeps them alive.
+#[derive(Clone, Copy)]
+pub(crate) enum PackedForwarded {
+    None,
+    Op(*const Op),
+    InputArg(*const InputArg),
+    Const(*const Cell<Value>),
+    SmallConst(u64),
+    SmallWide(u64),
+    Info,
+}
+
+/// Same tag split as [`unpack_forwarded`], without cloning any Rc / Box.
+#[inline]
+pub(crate) fn classify_packed_forwarded(w: u64) -> PackedForwarded {
+    if w == 0 {
+        return PackedForwarded::None;
+    }
+    match w & FW_TAG {
+        FW_OP => PackedForwarded::Op(fwd_ptr(w) as *const Op),
+        FW_INPUTARG => PackedForwarded::InputArg(fwd_ptr(w) as *const InputArg),
+        FW_CONST => PackedForwarded::Const(fwd_ptr(w) as *const Cell<Value>),
+        FW_SMALL_CONST => {
+            let val = ((w >> 3) as u32) as u64;
+            let stamp = (w >> FWD_STAMP_SHIFT) & FWD_STAMP_MASK;
+            let id = if stamp == 0 {
+                w >> 35
+            } else {
+                (w >> 35) & ((1 << SMALL_CONST_ID_STAMP_BITS) - 1)
+            };
+            PackedForwarded::SmallConst((id << 32) | val)
+        }
+        FW_SMALL_WIDE => PackedForwarded::SmallWide(w >> 3),
+        FW_INFO_PTR | FW_INFO_BOUND | FW_INFO_OTHER => PackedForwarded::Info,
+        _ => PackedForwarded::None,
+    }
+}
+
 pub(crate) fn drop_packed_forwarded(w: u64) {
     if w == 0 {
         return;

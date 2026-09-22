@@ -770,13 +770,48 @@ impl LLType {
 
 static NEXT_CALL_DESCR_HEAPCACHE_INDEX: AtomicU32 = AtomicU32::new(1_000_000_000);
 
-/// Stable per-call-descr identity used by heapcache call-loop-invariant
-/// slots.  The allocation is shared by every `GcCache._cache_call`
-/// producer so a descriptor returned from `get_call_descr` and one
+/// Stable per-descr identity used as a heapcache key.
+///
+/// Call descrs use it for loop-invariant slots; field and array descrs
+/// use it when no codewriter slot was stamped, so two descrs never share
+/// the `u32::MAX` sentinel.  The counter starts at 1_000_000_000 so the
+/// numbers cannot collide with a codewriter slot.  Shared by every
+/// `GcCache._cache_call` producer and by field/array mint sites so a
+/// descriptor returned from `get_call_descr` / `get_field_descr` and one
 /// returned from metainterp's production factory have the same identity
 /// guarantees.
 pub fn next_call_descr_heapcache_index() -> u32 {
     NEXT_CALL_DESCR_HEAPCACHE_INDEX.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Replace the unassigned `Descr::index()` sentinel with a unique identity.
+///
+/// Heapcache keys field and array caches by this number.  `u32::MAX` is one
+/// key standing for every descr that no codewriter numbered, so two fields
+/// of one box would share an entry.  Leave any already-assigned slot
+/// (including a real codewriter `0`) untouched.
+fn heapcache_index_value(index: u32) -> u32 {
+    if index == u32::MAX {
+        next_call_descr_heapcache_index()
+    } else {
+        index
+    }
+}
+
+/// Read `index`, allocating a unique identity if it still holds the
+/// unassigned sentinel.  Construction sites go through
+/// [`heapcache_index_value`]; this covers a leftover struct-literal mint
+/// and racing first readers.
+fn ensure_heapcache_index(index: &AtomicU32) -> u32 {
+    let current = index.load(Ordering::Relaxed);
+    if current != u32::MAX {
+        return current;
+    }
+    let allocated = next_call_descr_heapcache_index();
+    match index.compare_exchange(u32::MAX, allocated, Ordering::Relaxed, Ordering::Relaxed) {
+        Ok(_) => allocated,
+        Err(existing) => existing,
+    }
 }
 
 /// Counters behind [`GcCache::field_position_census`]. Process-global like the
@@ -3523,8 +3558,10 @@ impl LoopTargetDescr for BasicLoopTargetDescr {
 ///
 /// Mirrors rpython/jit/metainterp/history.py AbstractDescr.
 pub trait Descr: Send + Sync + std::fmt::Debug {
-    /// Unique index of this descriptor (for serialization).
-    /// Returns u32::MAX if not assigned.
+    /// Unique index of this descriptor (for serialization and the
+    /// tracing-time heapcache key).  Returns u32::MAX if not assigned;
+    /// field and array descrs replace that sentinel with a unique
+    /// identity so two descrs cannot share a heapcache entry.
     fn index(&self) -> u32 {
         u32::MAX
     }
@@ -5528,15 +5565,18 @@ fn field_key_start(name: &str, field_key: &str) -> u32 {
 #[derive(Debug)]
 pub struct SimpleFieldDescr {
     /// Per-trace codewriter slot id (`descr_indices.field_index` from
-    /// `CallControl`). Pyre adaptation — PyPy's `FieldDescr` has no
-    /// equivalent (PyPy keys raw EI sets on Python `id(descr)` which
-    /// Rust models via `Arc::ptr_eq`). Atomic so the cache-or-mint
-    /// path (`gc_cache.get_field_descr`) can stamp the analyzer's
-    /// `idx` onto a shared `Arc<SimpleFieldDescr>` after a cache hit,
-    /// converging analyzer and runtime (`__majit_register_descrs`)
-    /// onto the same Arc instance while preserving the analyzer's
-    /// per-trace identity for `BhFieldSpec.index` round-trips in
-    /// `pyre-jit-trace::state` (line 5879 / 5933).
+    /// `CallControl`), or a unique heapcache identity when no codewriter
+    /// numbered this descr.  Pyre adaptation — PyPy's `FieldDescr` has no
+    /// equivalent (PyPy keys the heapcache on the descr object itself,
+    /// which Rust models via this number plus `Arc::ptr_eq` for EI sets).
+    /// Atomic so the cache-or-mint path (`gc_cache.get_field_descr`) can
+    /// stamp the analyzer's `idx` onto a shared `Arc<SimpleFieldDescr>`
+    /// after a cache hit, converging analyzer and runtime
+    /// (`__majit_register_descrs`) onto the same Arc instance while
+    /// preserving the analyzer's per-trace identity for `BhFieldSpec.index`
+    /// round-trips in `pyre-jit-trace::state` (line 5879 / 5933).
+    /// Construction replaces the `u32::MAX` sentinel with a unique value
+    /// so two fields of one box cannot share a heapcache entry.
     index: AtomicU32,
     /// history.py: BackendDescr.descr_index = -1
     descr_index: AtomicI32,
@@ -5756,7 +5796,7 @@ impl SimpleFieldDescr {
         // Default: Int→Signed (RPython Signed), Ref→Pointer, Float→Float.
         let flag = ArrayFlag::from_field_type(field_type);
         SimpleFieldDescr {
-            index: AtomicU32::new(index),
+            index: AtomicU32::new(heapcache_index_value(index)),
             descr_index: AtomicI32::new(-1),
             ei_index: AtomicU32::new(u32::MAX),
             name: Box::default(),
@@ -5799,7 +5839,7 @@ impl SimpleFieldDescr {
         let field_key_start = field_key_start(&name, &field_key);
         let class_word = ClassWordDeclaration::inferred(class_word_inferred_from_name(&name));
         SimpleFieldDescr {
-            index: AtomicU32::new(index),
+            index: AtomicU32::new(heapcache_index_value(index)),
             descr_index: AtomicI32::new(-1),
             ei_index: AtomicU32::new(u32::MAX),
             name: name.into_boxed_str(),
@@ -5961,7 +6001,7 @@ impl Descr for SimpleFieldDescr {
         Some(self)
     }
     fn index(&self) -> u32 {
-        self.index.load(Ordering::Relaxed)
+        ensure_heapcache_index(&self.index)
     }
     fn set_index(&self, index: u32) {
         self.index.store(index, Ordering::Relaxed);
@@ -6500,7 +6540,7 @@ fn make_simple_descr_group_inner(
             .map(|spec| {
                 let field_key_start = field_key_start(&spec.name, &spec.field_key);
                 Arc::new(SimpleFieldDescr {
-                    index: AtomicU32::new(spec.index),
+                    index: AtomicU32::new(heapcache_index_value(spec.index)),
                     descr_index: AtomicI32::new(-1),
                     ei_index: AtomicU32::new(u32::MAX),
                     name: spec.name.clone().into_boxed_str(),
@@ -6613,11 +6653,11 @@ pub fn make_simple_descr_group_with_flags(
 /// Simple concrete ArrayDescr.
 #[derive(Debug)]
 pub struct SimpleArrayDescr {
-    /// Per-trace codewriter slot id. See `SimpleFieldDescr.index` for
-    /// the rationale — atomic so the cache-or-mint
-    /// (`gc_cache.get_array_descr`) path can stamp the analyzer's
-    /// `idx` (from `descr_indices.array_index`) onto a shared
-    /// `Arc<SimpleArrayDescr>` after cache resolves.
+    /// Per-trace codewriter slot id, or a unique heapcache identity when
+    /// none was stamped. See `SimpleFieldDescr.index` for the rationale —
+    /// atomic so the cache-or-mint (`gc_cache.get_array_descr`) path can
+    /// stamp the analyzer's `idx` (from `descr_indices.array_index`) onto
+    /// a shared `Arc<SimpleArrayDescr>` after cache resolves.
     index: AtomicU32,
     /// history.py: BackendDescr.descr_index = -1
     descr_index: AtomicI32,
@@ -6706,7 +6746,7 @@ impl SimpleArrayDescr {
     ) -> Self {
         let flag = ArrayFlag::from_item_type(item_type, false);
         SimpleArrayDescr {
-            index: AtomicU32::new(index),
+            index: AtomicU32::new(heapcache_index_value(index)),
             descr_index: AtomicI32::new(-1),
             ei_index: AtomicU32::new(u32::MAX),
             base_size,
@@ -6734,7 +6774,7 @@ impl SimpleArrayDescr {
         flag: ArrayFlag,
     ) -> Self {
         SimpleArrayDescr {
-            index: AtomicU32::new(index),
+            index: AtomicU32::new(heapcache_index_value(index)),
             descr_index: AtomicI32::new(-1),
             ei_index: AtomicU32::new(u32::MAX),
             base_size,
@@ -6796,7 +6836,7 @@ impl Descr for SimpleArrayDescr {
         Some(self)
     }
     fn index(&self) -> u32 {
-        self.index.load(Ordering::Relaxed)
+        ensure_heapcache_index(&self.index)
     }
     fn set_index(&self, index: u32) {
         self.index.store(index, Ordering::Relaxed);
@@ -6967,7 +7007,7 @@ impl SimpleInteriorFieldDescr {
         field_descr: std::sync::Arc<dyn FieldDescr>,
     ) -> Self {
         SimpleInteriorFieldDescr {
-            index: AtomicU32::new(index),
+            index: AtomicU32::new(heapcache_index_value(index)),
             descr_index: AtomicI32::new(-1),
             ei_index: AtomicU32::new(u32::MAX),
             array_descr,
@@ -6983,7 +7023,7 @@ impl SimpleInteriorFieldDescr {
         owner_size_descr: std::sync::Arc<dyn SizeDescr>,
     ) -> Self {
         SimpleInteriorFieldDescr {
-            index: AtomicU32::new(index),
+            index: AtomicU32::new(heapcache_index_value(index)),
             descr_index: AtomicI32::new(-1),
             ei_index: AtomicU32::new(u32::MAX),
             array_descr,
@@ -6995,7 +7035,7 @@ impl SimpleInteriorFieldDescr {
 
 impl Descr for SimpleInteriorFieldDescr {
     fn index(&self) -> u32 {
-        self.index.load(Ordering::Relaxed)
+        ensure_heapcache_index(&self.index)
     }
     fn set_index(&self, index: u32) {
         self.index.store(index, Ordering::Relaxed);
@@ -8989,7 +9029,13 @@ pub fn make_size_descr_with_vtable(
 /// Create an array descriptor.
 /// Fresh constructor — does NOT go through GcCache.
 pub fn make_array_descr(base_size: usize, item_size: usize, item_type: Type) -> DescrRef {
-    Arc::new(SimpleArrayDescr::new(0, base_size, item_size, 0, item_type))
+    Arc::new(SimpleArrayDescr::new(
+        u32::MAX,
+        base_size,
+        item_size,
+        0,
+        item_type,
+    ))
 }
 
 /// Create an array descriptor with explicit signedness (`descr.py:241-254
@@ -9015,7 +9061,12 @@ pub fn make_array_descr_signed(
         ArrayFlag::from_item_type(item_type, false)
     };
     Arc::new(SimpleArrayDescr::with_flag(
-        0, base_size, item_size, 0, item_type, flag,
+        u32::MAX,
+        base_size,
+        item_size,
+        0,
+        item_type,
+        flag,
     ))
 }
 
@@ -9140,7 +9191,8 @@ pub fn make_array_descr_from_lltype_shape(
             Type::Void => ArrayFlag::Void,
         }
     };
-    let mut descr = SimpleArrayDescr::with_flag(0, base_size, item_size, type_id, item_type, flag);
+    let mut descr =
+        SimpleArrayDescr::with_flag(u32::MAX, base_size, item_size, type_id, item_type, flag);
     descr.lendescr = lendescr;
     descr.is_pure = is_pure;
     descr.set_is_gc_managed(is_gc_managed);

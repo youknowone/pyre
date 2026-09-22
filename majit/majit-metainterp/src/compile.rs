@@ -2097,25 +2097,35 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
     /// expanded inputarg Box. `OpRef::eq` is typed (`InputArgRef(n)` is
     /// not `IntOp(n)`); match the replacement Box or the inputarg itself,
     /// never a raw number across kinds.
+    ///
+    /// One walk for every slot: `slot_targets` is in slot order, and an
+    /// operand matched by two slots takes the later one.
     fn forward_residual_args_sharing_inputarg(
         ops: &[majit_ir::OpRc],
         forwarding: &mut LocalForwarding,
-        old_opref: OpRef,
-        target: &Operand,
+        slot_targets: &[(OpRef, Operand)],
     ) {
-        if !old_opref.is_input_arg() {
+        let slot_of: std::collections::HashMap<OpRef, usize> = slot_targets
+            .iter()
+            .enumerate()
+            .filter(|(_, (old_opref, _))| old_opref.is_input_arg())
+            .map(|(slot, (old_opref, _))| (*old_opref, slot))
+            .collect();
+        if slot_of.is_empty() {
             return;
         }
+        let mut forward = |arg: &Operand| {
+            let own = arg.to_opref();
+            let via = arg.get_box_replacement(false).to_opref();
+            let slot = slot_of.get(&via).copied().max(slot_of.get(&own).copied());
+            if let Some(slot) = slot {
+                set_local_forwarded(forwarding, own, slot_targets[slot].1.clone());
+            }
+        };
         for op in ops {
-            let args = op
-                .getarglist()
-                .into_iter()
-                .chain(op.getfailargs().into_iter().flatten());
-            for arg in args {
-                let via = arg.get_box_replacement(false);
-                if via.to_opref() == old_opref || arg.to_opref() == old_opref {
-                    set_local_forwarded(forwarding, arg.to_opref(), target.clone());
-                }
+            op.with_arglist(|args| args.iter().for_each(&mut forward));
+            if let Some(fail_args) = op.guard_fail_args() {
+                fail_args.iter().for_each(&mut forward);
             }
         }
     }
@@ -2220,6 +2230,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
 
     let mut forwarding = LocalForwarding::with_op_capacity(max_runtime_ref);
     let mut extra_ops: Vec<majit_ir::OpRc> = Vec::new();
+    let mut slot_targets: Vec<(OpRef, Operand)> = Vec::new();
     let mut i = entry_prefix_len;
 
     // compile.py:431-432 — i = jitdriver_sd.num_red_args; loop.inputargs =
@@ -2258,7 +2269,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         let op = OpRc::new(op);
         let target = Operand::from_bound_op(&op);
         set_local_forwarded(&mut forwarding, old_opref, target.clone());
-        forward_residual_args_sharing_inputarg(ops, &mut forwarding, old_opref, &target);
+        slot_targets.push((old_opref, target));
         extra_ops.push(op);
         i += 1;
     }
@@ -2381,7 +2392,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
             let elem_op = OpRc::new(elem_op);
             let target = Operand::from_bound_op(&elem_op);
             set_local_forwarded(&mut forwarding, old_opref, target.clone());
-            forward_residual_args_sharing_inputarg(ops, &mut forwarding, old_opref, &target);
+            slot_targets.push((old_opref, target));
             extra_ops.push(elem_op);
             i += 1;
         }
@@ -2398,6 +2409,8 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         "compile.py:458 assert i == len(inputargs) failed ({i} != {})",
         expanded_inputargs.len()
     );
+
+    forward_residual_args_sharing_inputarg(ops, &mut forwarding, &slot_targets);
 
     // compile.py — emit_op walks the existing ops re-emitting
     // each one with `get_box_replacement` applied to args + fail_args.

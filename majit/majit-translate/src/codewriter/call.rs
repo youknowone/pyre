@@ -6944,6 +6944,7 @@ impl CallControl {
         cache: &mut AnalysisCache,
         extradescrs: Option<Vec<DescrRef>>,
     ) -> CallDescriptor {
+        let caller_supplied_extraeffect = extraeffect.is_some();
         // Extract the direct-call target (if any) and indirect-call family
         // (if any).  Exactly one is Some after the initial dispatch;
         // downstream branches key off this.
@@ -7246,9 +7247,14 @@ impl CallControl {
         // that calls host code is exception-free. Honour it after the
         // analyzer so `RandomEffects` does not emit GUARD_NO_EXCEPTION.
         // Elidable assertions stay in the elidable arm (`EF_ELIDABLE_*`).
+        // A caller-supplied extraeffect is kept (call.py getcalldescr
+        // `if extraeffect is None`).
         let extraeffect = match shape {
             CallShape::Direct(target)
-                if !elidable && !loopinvariant && self.declares_cannot_raise(target) =>
+                if !elidable
+                    && !loopinvariant
+                    && self.declares_cannot_raise(target)
+                    && !caller_supplied_extraeffect =>
             {
                 ExtraEffect::CannotRaise
             }
@@ -11083,6 +11089,44 @@ mod tests {
             Vec::new(),
             Type::Void,
             OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CannotRaise);
+    }
+
+    #[test]
+    fn getcalldescr_keeps_caller_supplied_extraeffect_on_cannot_raise() {
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["int_py_div"]);
+        register_int_result_graph(&mut cc, path.clone(), simple_graph("int_py_div"));
+        cc.mark_cannot_raise_assertion(path);
+        cc.find_all_graphs_for_tests();
+
+        let target = CallTarget::function_path(["int_py_div"]);
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &direct_call_op(target.clone()),
+            Vec::new(),
+            Type::Int,
+            OopSpecIndex::IntPyDiv,
+            Some(ExtraEffect::ElidableCannotRaise),
+            &mut cache,
+            None,
+        );
+        assert_eq!(
+            descriptor.extra_info.extraeffect,
+            ExtraEffect::ElidableCannotRaise
+        );
+        assert_eq!(descriptor.extra_info.oopspecindex, OopSpecIndex::IntPyDiv);
+
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &direct_call_op(target),
+            Vec::new(),
+            Type::Int,
+            OopSpecIndex::IntPyDiv,
             None,
             &mut cache,
             None,

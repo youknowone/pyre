@@ -1109,15 +1109,15 @@ impl ShortBoxes {
         // shortpreamble.py add_potential_op: `CompoundOp(op, pop, prev_op)`
         // overwrites the OrderedDict value in place. `IndexMap::insert` on
         // an existing key does the same without shifting later entries.
-        if let Some(prev) = self.potential_ops.get(&key).cloned() {
-            self.potential_ops.insert(
-                key,
-                PotentialShortOp::Compound(CompoundOp {
-                    res: result,
-                    one: pop,
-                    two: Box::new(prev),
-                }),
-            );
+        // The previous value moves into the CompoundOp; cloning it would
+        // copy the whole `two` chain on every add to the same key.
+        if let Some(slot) = self.potential_ops.get_mut(&key) {
+            let prev = std::mem::replace(slot, PotentialShortOp::Preamble(pop.clone()));
+            *slot = PotentialShortOp::Compound(CompoundOp {
+                res: result,
+                one: pop,
+                two: Box::new(prev),
+            });
         } else {
             self.add_op(key, PotentialShortOp::Preamble(pop));
         }

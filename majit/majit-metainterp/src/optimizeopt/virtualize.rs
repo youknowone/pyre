@@ -2378,12 +2378,21 @@ pub(crate) fn parent_list_slot(field: &dyn FieldDescr) -> u32 {
     }
     if let Some(parent) = field.get_parent_descr()
         && let Some(size) = parent.as_size_descr()
-        && let Some(i) = size
-            .all_fielddescrs()
+    {
+        let fields = size.all_fielddescrs();
+        let minted = field.index_in_parent();
+        if fields
+            .get(minted)
+            .is_some_and(|slot| slot_holds_field(slot.as_ref(), field))
+        {
+            return minted as u32;
+        }
+        if let Some(i) = fields
             .iter()
             .position(|slot| slot_holds_field(slot.as_ref(), field))
-    {
-        return i as u32;
+        {
+            return i as u32;
+        }
     }
     field.index_in_parent() as u32
 }

@@ -9,12 +9,23 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use majit_ir::{OpCode, OpRef, Type, Value};
+use smallvec::SmallVec;
 
 use super::{MIFrame, MIFrameStack};
 use crate::jitcode::insns::MAX_HOST_CALL_ARITY;
 use crate::jitcode::{self, JitArgKind, JitCallArg, JitCallTarget, JitCode, JitCodeRuntimeExt};
 use crate::trace_ctx::{ClearReplaceFrames, VableArrayStore, VableEntryWrite};
 use crate::{TraceAction, TraceCtx};
+
+/// Residual-call argument lists. Eight slots cover the common helper arity
+/// (`MAX_HOST_CALL_ARITY` is 16); longer calls spill once.
+const CALL_INLINE: usize = 8;
+type CallOpRefs = SmallVec<[OpRef; CALL_INLINE]>;
+type CallI64s = SmallVec<[i64; CALL_INLINE]>;
+type CallTypes = SmallVec<[Type; CALL_INLINE]>;
+type CallArgs = SmallVec<[JitCallArg; CALL_INLINE]>;
+type CallValues = SmallVec<[Value; CALL_INLINE]>;
+type CallTriples = SmallVec<[(OpRef, i64, Type); CALL_INLINE]>;
 
 /// Which recorded op [`JitCodeMachine::publish_last_guard_resume_snapshot`]
 /// points at the snapshot it just captured.
@@ -160,13 +171,10 @@ pub fn field_offset_from_bh(descr: &crate::blackhole::BhDescr, site: &str) -> us
 ///
 /// `heapcache.get_field_updater(box, fielddescr)` keys the per-box field
 /// cache on the descr object itself, so two fields of one struct can never
-/// share an entry.  The key here is `DescrRef::index()`, a `u32` whose
-/// unassigned answer is the `u32::MAX` sentinel (`descr.rs`) — one key
-/// standing for every field of every struct, which is an alias and not a
-/// cache.  The production codewriter numbers every field descr it mints
-/// (`call.rs get_field_descr`, on the parent-list hit and on the mint
-/// alike), so only a hand-assembled jitcode reaches the sentinel; those go
-/// uncached rather than sharing a slot.
+/// share an entry.  The key here is `DescrRef::index()`.  A codewriter
+/// slot is used when one was stamped (`call.rs get_field_descr`); otherwise
+/// `Descr::index()` allocates a unique identity so a hand-assembled
+/// jitcode does not collapse every field onto the `u32::MAX` sentinel.
 fn heapcache_field_key(fielddescr: &majit_ir::DescrRef) -> Option<u32> {
     let index = fielddescr.index();
     (index != u32::MAX).then_some(index)
@@ -6423,13 +6431,13 @@ where
                 let mut mp_green_pc: Option<i64> = None;
                 // MAJIT_PCSEQ diagnostic: all int-green constants at this merge
                 // point (pc plus any scalar greens the consumer declares).
-                let mut mp_green_ints: Vec<i64> = Vec::new();
+                let mut mp_green_ints: CallI64s = SmallVec::new();
                 // pyjitpl.py same_greenkey compares EVERY green, not just
                 // the int slot.  Capture the ref (slot 1) and float (slot 2)
                 // green constants too so the header-close gate compares the full
                 // green tuple against the captured header greens (`header_greens`).
-                let mut mp_green_refs: Vec<i64> = Vec::new();
-                let mut mp_green_floats: Vec<i64> = Vec::new();
+                let mut mp_green_refs: CallI64s = SmallVec::new();
+                let mut mp_green_floats: CallI64s = SmallVec::new();
                 // Single-pass tracing: the walk closes back to an interpreter
                 // program pc; capture it (below) so the merge-point hook can
                 // resume the native loop there. The walk is the sole executor,
@@ -6442,15 +6450,17 @@ where
                 // records these as the inner loop's inputargs so the cross-loop
                 // cut can peel the outer prefix as preamble. Built during the
                 // tracing walk only — off the compiled hot path.
-                let mut live_arg_boxes: Vec<crate::trace_ctx::GreenBox> = Vec::new();
+                let mut live_arg_boxes: SmallVec<[crate::trace_ctx::GreenBox; CALL_INLINE]> =
+                    SmallVec::new();
                 // pyjitpl.py opimpl_jit_merge_point `redboxes`.
-                let mut redboxes: Vec<(OpRef, majit_ir::Type)> = Vec::new();
+                let mut redboxes: SmallVec<[(OpRef, majit_ir::Type); CALL_INLINE]> =
+                    SmallVec::new();
                 // Single-pass: accumulate the walk-final concrete RED values from
                 // the live value-bank shadow (slots 3-5 = reds I/R/F in operand
                 // order) so the merge-point hook can `restore_values` them into
                 // native state — completing the transfer that storage-only
                 // `recover` cannot (loop-carried reds never written to the heap).
-                let mut walk_reds: Vec<Value> = Vec::new();
+                let mut walk_reds: CallValues = SmallVec::new();
                 for (slot, &max) in max_regs.iter().enumerate().take(6) {
                     let count = frame.next_u8() as usize;
                     let is_green_slot = slot < 3;
@@ -6765,13 +6775,15 @@ where
                         // can answer yes for a loop stored under a key nothing
                         // enters, auto-stamp here, and close with nothing but
                         // the green-promotion ops recorded.
-                        let mp_greens = (
-                            mp_green_ints.clone(),
-                            mp_green_refs.clone(),
-                            mp_green_floats.clone(),
-                        );
                         let has_targets = mp_green_pc
-                            .and_then(|pc| ctx.merge_point_green_key_hash(pc, &mp_greens))
+                            .and_then(|pc| {
+                                ctx.merge_point_green_key_hash(
+                                    pc,
+                                    &mp_green_ints,
+                                    &mp_green_refs,
+                                    &mp_green_floats,
+                                )
+                            })
                             .zip(ctx.has_compiled_targets_fn.as_ref())
                             .is_some_and(|(key, f)| f(key));
                         depth_zero && has_targets
@@ -6788,9 +6800,9 @@ where
                 // so they never capture it.
                 if !ctx.is_bridge_trace && ctx.header_greens.is_none() {
                     ctx.header_greens = Some((
-                        mp_green_ints.clone(),
-                        mp_green_refs.clone(),
-                        mp_green_floats.clone(),
+                        mp_green_ints.to_vec(),
+                        mp_green_refs.to_vec(),
+                        mp_green_floats.to_vec(),
                     ));
                 }
                 // pyjitpl.py opimpl_jit_merge_point close-loop
@@ -7043,9 +7055,9 @@ where
                         // registry/pc close for bridges.
                         true
                     } else if let Some((h_ints, h_refs, h_floats)) = ctx.header_greens.as_ref() {
-                        &mp_green_ints == h_ints
-                            && &mp_green_refs == h_refs
-                            && &mp_green_floats == h_floats
+                        mp_green_ints.as_slice() == h_ints.as_slice()
+                            && mp_green_refs.as_slice() == h_refs.as_slice()
+                            && mp_green_floats.as_slice() == h_floats.as_slice()
                     } else {
                         // Header greens not captured (no prior visit): the (pc,
                         // code) hash is the loop identity — fall back to pc-only.
@@ -7068,9 +7080,9 @@ where
                         // pyjitpl.py `get_procedure_token(greenboxes)` —
                         // the greens of the merge point just reached.
                         let close_greens = (
-                            mp_green_ints.clone(),
-                            mp_green_refs.clone(),
-                            mp_green_floats.clone(),
+                            mp_green_ints.to_vec(),
+                            mp_green_refs.to_vec(),
+                            mp_green_floats.to_vec(),
                         );
                         ctx.close_greens = Some(close_greens.clone());
                         ctx.close_green_pc = mp_green_pc;
@@ -7108,7 +7120,7 @@ where
                                             .map(|(o, ty)| crate::trace_ctx::GreenBox::new(o, ty))
                                             .collect()
                                     }
-                                    None => live_arg_boxes.clone(),
+                                    None => live_arg_boxes.to_vec(),
                                 };
                                 if crate::mptrace_enabled() {
                                     eprintln!(
@@ -7135,7 +7147,7 @@ where
                             // hook (`restore_values`); storage caches re-derive via
                             // `recover`.
                             ctx.walk_final_pc = mp_green_pc.map(|p| p as usize);
-                            ctx.walk_final_reds = std::mem::take(&mut walk_reds);
+                            ctx.walk_final_reds = std::mem::take(&mut walk_reds).into_vec();
                         }
                         // GUARD_FUTURE_CONDITION already emitted unconditionally at
                         // the reached_loop_header entry above (pyjitpl.py).
@@ -7238,17 +7250,16 @@ where
                         // cannot reach while it holds the TraceCtx borrow —
                         // harmless while the lookup only decides a log line,
                         // and part of what the JUMP half has to carry.
-                        let mp_greens = (
-                            mp_green_ints.clone(),
-                            mp_green_refs.clone(),
-                            mp_green_floats.clone(),
-                        );
                         // The structured key first, hash second: this merge
                         // point is registered below and later read by the
                         // segmenting consumers, which install cell flags and
                         // so need a key a chain walk can match, not a bucket.
-                        let Some(inner_key_typed) = ctx.merge_point_green_key(pc, &mp_greens)
-                        else {
+                        let Some(inner_key_typed) = ctx.merge_point_green_key(
+                            pc,
+                            &mp_green_ints,
+                            &mp_green_refs,
+                            &mp_green_floats,
+                        ) else {
                             return TraceAction::Continue;
                         };
                         let inner_key = inner_key_typed.get_uhash();
@@ -7290,12 +7301,16 @@ where
                             // pyjitpl.py compile_trace is retried on every
                             // header visit (`if not self.partial_trace`).
                             crate::mc_diag_bump(70); // xloop_close_published
-                            ctx.close_greens = Some(mp_greens.clone());
+                            ctx.close_greens = Some((
+                                mp_green_ints.to_vec(),
+                                mp_green_refs.to_vec(),
+                                mp_green_floats.to_vec(),
+                            ));
                             ctx.close_green_pc = Some(pc);
                             ctx.close_jump_into_key = Some(inner_key);
                             if capture_walk_reds {
                                 ctx.walk_final_pc = Some(pc as usize);
-                                ctx.walk_final_reds = std::mem::take(&mut walk_reds);
+                                ctx.walk_final_reds = std::mem::take(&mut walk_reds).into_vec();
                             }
                             if crate::majit_log_enabled() {
                                 eprintln!(
@@ -7334,9 +7349,9 @@ where
                             // reached — here the INNER loop's, not the
                             // trace-start header's.
                             ctx.close_greens = Some((
-                                mp_green_ints.clone(),
-                                mp_green_refs.clone(),
-                                mp_green_floats.clone(),
+                                mp_green_ints.to_vec(),
+                                mp_green_refs.to_vec(),
+                                mp_green_floats.to_vec(),
                             ));
                             ctx.close_green_pc = Some(pc);
                             if capture_walk_reds {
@@ -7348,7 +7363,7 @@ where
                                 // (`restore_values`); storage caches are then
                                 // re-derived by `recover`.
                                 ctx.walk_final_pc = Some(pc as usize);
-                                ctx.walk_final_reds = std::mem::take(&mut walk_reds);
+                                ctx.walk_final_reds = std::mem::take(&mut walk_reds).into_vec();
                             }
                             // GUARD_FUTURE_CONDITION already emitted
                             // unconditionally at the reached_loop_header entry
@@ -7392,7 +7407,7 @@ where
                                         .map(|(o, ty)| crate::trace_ctx::GreenBox::new(o, ty))
                                         .collect()
                                 }
-                                None => live_arg_boxes,
+                                None => live_arg_boxes.into_vec(),
                             };
                             if crate::mptrace_enabled() {
                                 eprintln!(
@@ -7800,19 +7815,19 @@ where
                 let (target, args_i, args_r, args_f, calldescr, trace_descr) = {
                     let frame = self.frames.current_mut();
                     let funcptr_reg = frame.next_reg() as u16;
-                    let mut args_i: Vec<JitCallArg> = Vec::new();
+                    let mut args_i: CallArgs = SmallVec::new();
                     if has_int {
                         let count = frame.next_u8() as usize;
                         for _ in 0..count {
                             args_i.push(JitCallArg::int(frame.next_reg() as u16));
                         }
                     }
-                    let mut args_r: Vec<JitCallArg> = Vec::new();
+                    let mut args_r: CallArgs = SmallVec::new();
                     let count_r = frame.next_u8() as usize;
                     for _ in 0..count_r {
                         args_r.push(JitCallArg::reference(frame.next_reg() as u16));
                     }
-                    let mut args_f: Vec<JitCallArg> = Vec::new();
+                    let mut args_f: CallArgs = SmallVec::new();
                     if has_float {
                         let count = frame.next_u8() as usize;
                         for _ in 0..count {
@@ -8165,19 +8180,19 @@ where
                 let (target, args_i, args_r, args_f, calldescr, trace_descr, dst) = {
                     let frame = self.frames.current_mut();
                     let funcptr_reg = frame.next_reg() as u16;
-                    let mut args_i: Vec<JitCallArg> = Vec::new();
+                    let mut args_i: CallArgs = SmallVec::new();
                     if has_int {
                         let count = frame.next_u8() as usize;
                         for _ in 0..count {
                             args_i.push(JitCallArg::int(frame.next_reg() as u16));
                         }
                     }
-                    let mut args_r: Vec<JitCallArg> = Vec::new();
+                    let mut args_r: CallArgs = SmallVec::new();
                     let count_r = frame.next_u8() as usize;
                     for _ in 0..count_r {
                         args_r.push(JitCallArg::reference(frame.next_reg() as u16));
                     }
-                    let mut args_f: Vec<JitCallArg> = Vec::new();
+                    let mut args_f: CallArgs = SmallVec::new();
                     if has_float {
                         let count = frame.next_u8() as usize;
                         for _ in 0..count {
@@ -8447,7 +8462,8 @@ where
                     let traced = match patch_pos {
                         Some(patch_pos) if last_exc_value == 0 => {
                             let func_ref = ctx.const_int(trace_ptr as usize as i64);
-                            let mut call_args = vec![func_ref];
+                            let mut call_args: CallOpRefs = SmallVec::new();
+                            call_args.push(func_ref);
                             call_args.extend_from_slice(&args);
                             let concrete_values =
                                 build_concrete_values(trace_ptr, &concrete_args, &arg_types);
@@ -8519,19 +8535,19 @@ where
                 let (target, args_i, args_r, args_f, calldescr, trace_descr, dst) = {
                     let frame = self.frames.current_mut();
                     let funcptr_reg = frame.next_reg() as u16;
-                    let mut args_i: Vec<JitCallArg> = Vec::new();
+                    let mut args_i: CallArgs = SmallVec::new();
                     if has_int {
                         let count = frame.next_u8() as usize;
                         for _ in 0..count {
                             args_i.push(JitCallArg::int(frame.next_reg() as u16));
                         }
                     }
-                    let mut args_r: Vec<JitCallArg> = Vec::new();
+                    let mut args_r: CallArgs = SmallVec::new();
                     let count_r = frame.next_u8() as usize;
                     for _ in 0..count_r {
                         args_r.push(JitCallArg::reference(frame.next_reg() as u16));
                     }
-                    let mut args_f: Vec<JitCallArg> = Vec::new();
+                    let mut args_f: CallArgs = SmallVec::new();
                     if has_float {
                         let count = frame.next_u8() as usize;
                         for _ in 0..count {
@@ -8767,7 +8783,8 @@ where
                     let traced = match patch_pos {
                         Some(patch_pos) if last_exc_value == 0 => {
                             let func_ref = ctx.const_int(trace_ptr as usize as i64);
-                            let mut call_args = vec![func_ref];
+                            let mut call_args: CallOpRefs = SmallVec::new();
+                            call_args.push(func_ref);
                             call_args.extend_from_slice(&args);
                             let concrete_values =
                                 build_concrete_values(trace_ptr, &concrete_args, &arg_types);
@@ -8829,17 +8846,17 @@ where
                 let (target, args_i, args_r, args_f, calldescr, trace_descr, dst) = {
                     let frame = self.frames.current_mut();
                     let funcptr_reg = frame.next_reg() as u16;
-                    let mut args_i: Vec<JitCallArg> = Vec::new();
+                    let mut args_i: CallArgs = SmallVec::new();
                     let count_i = frame.next_u8() as usize;
                     for _ in 0..count_i {
                         args_i.push(JitCallArg::int(frame.next_reg() as u16));
                     }
-                    let mut args_r: Vec<JitCallArg> = Vec::new();
+                    let mut args_r: CallArgs = SmallVec::new();
                     let count_r = frame.next_u8() as usize;
                     for _ in 0..count_r {
                         args_r.push(JitCallArg::reference(frame.next_reg() as u16));
                     }
-                    let mut args_f: Vec<JitCallArg> = Vec::new();
+                    let mut args_f: CallArgs = SmallVec::new();
                     let count_f = frame.next_u8() as usize;
                     for _ in 0..count_f {
                         args_f.push(JitCallArg::float(frame.next_reg() as u16));
@@ -9062,7 +9079,8 @@ where
                     let traced = match patch_pos {
                         Some(patch_pos) if last_exc_value == 0 => {
                             let func_ref = ctx.const_int(trace_ptr as usize as i64);
-                            let mut call_args = vec![func_ref];
+                            let mut call_args: CallOpRefs = SmallVec::new();
+                            call_args.push(func_ref);
                             call_args.extend_from_slice(&args);
                             let concrete_values =
                                 build_concrete_values(trace_ptr, &concrete_args, &arg_types);
@@ -9269,12 +9287,12 @@ where
                     let first_reg = frame.next_reg() as u16;
                     let funcptr_reg = frame.next_reg() as u16;
                     let count_i = frame.next_u8() as usize;
-                    let mut args_i = Vec::with_capacity(count_i);
+                    let mut args_i = CallArgs::with_capacity(count_i);
                     for _ in 0..count_i {
                         args_i.push(JitCallArg::int(frame.next_reg() as u16));
                     }
                     let count_r = frame.next_u8() as usize;
-                    let mut args_r = Vec::with_capacity(count_r);
+                    let mut args_r = CallArgs::with_capacity(count_r);
                     for _ in 0..count_r {
                         args_r.push(JitCallArg::reference(frame.next_reg() as u16));
                     }
@@ -9341,8 +9359,9 @@ where
                             // skip
                         } else {
                             ctx.cond_call_void_typed(first_box, trace_ptr, &args, &arg_types, slot);
-                            let mut allboxes =
-                                vec![first_box, ctx.const_int(trace_ptr as usize as i64)];
+                            let mut allboxes: CallOpRefs = SmallVec::new();
+                            allboxes.push(first_box);
+                            allboxes.push(ctx.const_int(trace_ptr as usize as i64));
                             allboxes.extend_from_slice(&args);
                             // `_record_helper_varargs` invalidates before it
                             // appends. `cond_call_void_typed` only records.
@@ -9415,8 +9434,9 @@ where
                             let traced = ctx.cond_call_value_int_typed(
                                 first_box, trace_ptr, &args, &arg_types, slot,
                             );
-                            let mut allboxes =
-                                vec![first_box, ctx.const_int(trace_ptr as usize as i64)];
+                            let mut allboxes: CallOpRefs = SmallVec::new();
+                            allboxes.push(first_box);
+                            allboxes.push(ctx.const_int(trace_ptr as usize as i64));
                             allboxes.extend_from_slice(&args);
                             ctx.heapcache_invalidate_caches_varargs(
                                 OpCode::CondCallValueI,
@@ -9474,10 +9494,12 @@ where
                             // Skip the fold when the helper raised.
                             let last_exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
                             let traced = if last_exc == 0 {
-                                let mut call_args =
-                                    vec![first_box, ctx.const_int(trace_ptr as usize as i64)];
+                                let mut call_args: CallOpRefs = SmallVec::new();
+                                call_args.push(first_box);
+                                call_args.push(ctx.const_int(trace_ptr as usize as i64));
                                 call_args.extend_from_slice(&args);
-                                let mut concrete_values = vec![majit_ir::Value::Int(first_val)];
+                                let mut concrete_values: CallValues = SmallVec::new();
+                                concrete_values.push(majit_ir::Value::Int(first_val));
                                 concrete_values.extend(build_concrete_values(
                                     trace_ptr,
                                     &concrete_args,
@@ -9527,8 +9549,9 @@ where
                             let traced = ctx.cond_call_value_ref_typed(
                                 first_box, trace_ptr, &args, &arg_types, slot,
                             );
-                            let mut allboxes =
-                                vec![first_box, ctx.const_int(trace_ptr as usize as i64)];
+                            let mut allboxes: CallOpRefs = SmallVec::new();
+                            allboxes.push(first_box);
+                            allboxes.push(ctx.const_int(trace_ptr as usize as i64));
                             allboxes.extend_from_slice(&args);
                             ctx.heapcache_invalidate_caches_varargs(
                                 OpCode::CondCallValueR,
@@ -9583,11 +9606,14 @@ where
                             };
                             let last_exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
                             let traced = if last_exc == 0 {
-                                let mut call_args =
-                                    vec![first_box, ctx.const_int(trace_ptr as usize as i64)];
+                                let mut call_args: CallOpRefs = SmallVec::new();
+                                call_args.push(first_box);
+                                call_args.push(ctx.const_int(trace_ptr as usize as i64));
                                 call_args.extend_from_slice(&args);
-                                let mut concrete_values =
-                                    vec![majit_ir::Value::Ref(majit_ir::GcRef(first_val as usize))];
+                                let mut concrete_values: CallValues = SmallVec::new();
+                                concrete_values.push(majit_ir::Value::Ref(majit_ir::GcRef(
+                                    first_val as usize,
+                                )));
                                 concrete_values.extend(build_concrete_values(
                                     trace_ptr,
                                     &concrete_args,
@@ -9638,8 +9664,9 @@ where
                             majit_ir::Type::Int,
                             calldescr.extra_info.clone(),
                         );
-                        let mut allboxes =
-                            vec![first_box, ctx.const_int(trace_ptr as usize as i64)];
+                        let mut allboxes: CallOpRefs = SmallVec::new();
+                        allboxes.push(first_box);
+                        allboxes.push(ctx.const_int(trace_ptr as usize as i64));
                         allboxes.extend_from_slice(&args);
                         ctx.heapcache_invalidate_caches_varargs(
                             OpCode::RecordKnownResult,
@@ -9659,8 +9686,9 @@ where
                             majit_ir::Type::Ref,
                             calldescr.extra_info.clone(),
                         );
-                        let mut allboxes =
-                            vec![first_box, ctx.const_int(trace_ptr as usize as i64)];
+                        let mut allboxes: CallOpRefs = SmallVec::new();
+                        allboxes.push(first_box);
+                        allboxes.push(ctx.const_int(trace_ptr as usize as i64));
                         allboxes.extend_from_slice(&args);
                         ctx.heapcache_invalidate_caches_varargs(
                             OpCode::RecordKnownResult,
@@ -9753,8 +9781,9 @@ where
                             // skip
                         } else {
                             ctx.cond_call_void_typed(first_box, trace_ptr, &args, &arg_types, slot);
-                            let mut allboxes =
-                                vec![first_box, ctx.const_int(trace_ptr as usize as i64)];
+                            let mut allboxes: CallOpRefs = SmallVec::new();
+                            allboxes.push(first_box);
+                            allboxes.push(ctx.const_int(trace_ptr as usize as i64));
                             allboxes.extend_from_slice(&args);
                             ctx.heapcache_invalidate_caches_varargs(
                                 OpCode::CondCallN,
@@ -9820,8 +9849,9 @@ where
                             let traced = ctx.cond_call_value_int_typed(
                                 first_box, trace_ptr, &args, &arg_types, slot,
                             );
-                            let mut allboxes =
-                                vec![first_box, ctx.const_int(trace_ptr as usize as i64)];
+                            let mut allboxes: CallOpRefs = SmallVec::new();
+                            allboxes.push(first_box);
+                            allboxes.push(ctx.const_int(trace_ptr as usize as i64));
                             allboxes.extend_from_slice(&args);
                             ctx.heapcache_invalidate_caches_varargs(
                                 OpCode::CondCallValueI,
@@ -9876,10 +9906,12 @@ where
                             };
                             let last_exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
                             let traced = if last_exc == 0 {
-                                let mut call_args =
-                                    vec![first_box, ctx.const_int(trace_ptr as usize as i64)];
+                                let mut call_args: CallOpRefs = SmallVec::new();
+                                call_args.push(first_box);
+                                call_args.push(ctx.const_int(trace_ptr as usize as i64));
                                 call_args.extend_from_slice(&args);
-                                let mut concrete_values = vec![majit_ir::Value::Int(first_val)];
+                                let mut concrete_values: CallValues = SmallVec::new();
+                                concrete_values.push(majit_ir::Value::Int(first_val));
                                 concrete_values.extend(build_concrete_values(
                                     trace_ptr,
                                     &concrete_args,
@@ -9931,8 +9963,9 @@ where
                             let traced = ctx.cond_call_value_ref_typed(
                                 first_box, trace_ptr, &args, &arg_types, slot,
                             );
-                            let mut allboxes =
-                                vec![first_box, ctx.const_int(trace_ptr as usize as i64)];
+                            let mut allboxes: CallOpRefs = SmallVec::new();
+                            allboxes.push(first_box);
+                            allboxes.push(ctx.const_int(trace_ptr as usize as i64));
                             allboxes.extend_from_slice(&args);
                             ctx.heapcache_invalidate_caches_varargs(
                                 OpCode::CondCallValueR,
@@ -9987,11 +10020,14 @@ where
                             };
                             let last_exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
                             let traced = if last_exc == 0 {
-                                let mut call_args =
-                                    vec![first_box, ctx.const_int(trace_ptr as usize as i64)];
+                                let mut call_args: CallOpRefs = SmallVec::new();
+                                call_args.push(first_box);
+                                call_args.push(ctx.const_int(trace_ptr as usize as i64));
                                 call_args.extend_from_slice(&args);
-                                let mut concrete_values =
-                                    vec![majit_ir::Value::Ref(majit_ir::GcRef(first_val as usize))];
+                                let mut concrete_values: CallValues = SmallVec::new();
+                                concrete_values.push(majit_ir::Value::Ref(majit_ir::GcRef(
+                                    first_val as usize,
+                                )));
                                 concrete_values.extend(build_concrete_values(
                                     trace_ptr,
                                     &concrete_args,
@@ -10048,8 +10084,9 @@ where
                             majit_ir::Type::Int,
                             extra_info.clone(),
                         );
-                        let mut allboxes =
-                            vec![first_box, ctx.const_int(trace_ptr as usize as i64)];
+                        let mut allboxes: CallOpRefs = SmallVec::new();
+                        allboxes.push(first_box);
+                        allboxes.push(ctx.const_int(trace_ptr as usize as i64));
                         allboxes.extend_from_slice(&args);
                         ctx.heapcache_invalidate_caches_varargs(
                             OpCode::RecordKnownResult,
@@ -10073,8 +10110,9 @@ where
                             majit_ir::Type::Ref,
                             extra_info.clone(),
                         );
-                        let mut allboxes =
-                            vec![first_box, ctx.const_int(trace_ptr as usize as i64)];
+                        let mut allboxes: CallOpRefs = SmallVec::new();
+                        allboxes.push(first_box);
+                        allboxes.push(ctx.const_int(trace_ptr as usize as i64));
                         allboxes.extend_from_slice(&args);
                         ctx.heapcache_invalidate_caches_varargs(
                             OpCode::RecordKnownResult,
@@ -11184,31 +11222,31 @@ where
         args_r: &[JitCallArg],
         args_f: &[JitCallArg],
     ) -> (
-        Vec<OpRef>,
-        Vec<i64>,
-        Vec<majit_ir::Type>,
-        Vec<i64>,
-        Vec<i64>,
-        Vec<i64>,
+        CallOpRefs,
+        CallI64s,
+        CallTypes,
+        CallI64s,
+        CallI64s,
+        CallI64s,
     ) {
-        let mut values_i = Vec::with_capacity(args_i.len());
-        let mut raw_i = Vec::with_capacity(args_i.len());
+        let mut values_i = CallTriples::with_capacity(args_i.len());
+        let mut raw_i = CallI64s::with_capacity(args_i.len());
         for &arg in args_i {
             let value = self.read_call_arg(arg);
             raw_i.push(value.1);
             values_i.push(value);
         }
 
-        let mut values_r = Vec::with_capacity(args_r.len());
-        let mut raw_r = Vec::with_capacity(args_r.len());
+        let mut values_r = CallTriples::with_capacity(args_r.len());
+        let mut raw_r = CallI64s::with_capacity(args_r.len());
         for &arg in args_r {
             let value = self.read_call_arg(arg);
             raw_r.push(value.1);
             values_r.push(value);
         }
 
-        let mut values_f = Vec::with_capacity(args_f.len());
-        let mut raw_f = Vec::with_capacity(args_f.len());
+        let mut values_f = CallTriples::with_capacity(args_f.len());
+        let mut raw_f = CallI64s::with_capacity(args_f.len());
         for &arg in args_f {
             let value = self.read_call_arg(arg);
             raw_f.push(value.1);
@@ -11218,9 +11256,9 @@ where
         let mut next_i = 0usize;
         let mut next_r = 0usize;
         let mut next_f = 0usize;
-        let mut args = Vec::with_capacity(arg_classes.len());
-        let mut concrete_args = Vec::with_capacity(arg_classes.len());
-        let mut arg_types = Vec::with_capacity(arg_classes.len());
+        let mut args = CallOpRefs::with_capacity(arg_classes.len());
+        let mut concrete_args = CallI64s::with_capacity(arg_classes.len());
+        let mut arg_types = CallTypes::with_capacity(arg_classes.len());
         for class in arg_classes.chars() {
             let (arg, concrete, arg_type) = match class {
                 'i' | 'S' => {
@@ -12388,8 +12426,9 @@ fn build_concrete_values(
     func_ptr: *const (),
     concrete_args: &[i64],
     arg_types: &[majit_ir::Type],
-) -> Vec<majit_ir::Value> {
-    let mut values = vec![majit_ir::Value::Int(func_ptr as usize as i64)];
+) -> CallValues {
+    let mut values = CallValues::with_capacity(1 + concrete_args.len());
+    values.push(majit_ir::Value::Int(func_ptr as usize as i64));
     for (i, &v) in concrete_args.iter().enumerate() {
         let tp = arg_types[i];
         values.push(typed_value_from_raw(v, tp));
@@ -14893,8 +14932,9 @@ mod tests {
     #[test]
     fn jitcode_new_then_field_round_trip_records_setfield_getfield() {
         // Node { value: i64 @0, next: ref @8 }: allocate, store both fields
-        // through the live struct ptr, then read them back.  Exercises the
-        // emit -> trace-dispatch -> record path for plain getfield/setfield_gc.
+        // through the live struct ptr, then read them back.  The stores
+        // record; the loads are served from the heapcache even when the
+        // descr pool was never numbered.
         let mut builder = JitCodeBuilder::new();
         builder.new_struct(
             0,
@@ -14920,23 +14960,9 @@ mod tests {
         let opcodes: Vec<_> = recorder.ops().iter().map(|o| o.opcode).collect();
         assert_eq!(
             opcodes,
-            vec![
-                OpCode::New,
-                OpCode::SetfieldGc,
-                OpCode::SetfieldGc,
-                OpCode::GetfieldGcI,
-                OpCode::GetfieldGcR,
-            ]
+            vec![OpCode::New, OpCode::SetfieldGc, OpCode::SetfieldGc],
+            "GETFIELD_GC reads of a just-stored field come from the heapcache",
         );
-        // The recorded getfield ops carry the resolved byte offset.
-        let off_i = recorder.ops()[3]
-            .getdescr()
-            .and_then(|d| d.as_field_descr().map(|f| f.offset()));
-        let off_r = recorder.ops()[4]
-            .getdescr()
-            .and_then(|d| d.as_field_descr().map(|f| f.offset()));
-        assert_eq!(off_i, Some(0));
-        assert_eq!(off_r, Some(8));
 
         // The New's SizeDescr carries the full struct layout
         // (`descr.py init_size_descr`) so the optimizer can size
@@ -14967,9 +14993,9 @@ mod tests {
     /// `add_bh_descr` already dedups structurally, so a field named by both a
     /// store and a load shares one pool entry and therefore one number —
     /// which is the property `heapcache.get_field_updater(box, fielddescr)`
-    /// gets for free by keying on the descr object itself.  Without this a
-    /// hand-assembled jitcode leaves every descr at the `u32::MAX` sentinel
-    /// and `heapcache_field_key` declines, so nothing caches.
+    /// gets for free by keying on the descr object itself.  Unnumbered
+    /// descrs still cache: `Descr::index()` allocates a unique identity
+    /// rather than declining the `u32::MAX` sentinel.
     fn number_the_descrs(jitcode: &JitCode) {
         for (slot, entry) in jitcode.exec.descrs.iter().enumerate() {
             if let Some(descr) = entry.as_optimizer_descr() {
@@ -14983,19 +15009,17 @@ mod tests {
     /// `_opimpl_getfield_gc_any_pureornot` returns `upd.currfieldbox` and
     /// records nothing when the updater has a value, and
     /// `_opimpl_setfield_gc_any`'s `upd.setfield(valuebox)` is what puts one
-    /// there.  Same jitcode as
-    /// `jitcode_new_then_field_round_trip_records_setfield_getfield` above,
-    /// which holds the shape an unnumbered descr pool gets: there both reads
-    /// record, here both are folded away.  The registers still answer, and
-    /// they answer with the stored box rather than a second load.
+    /// there.  Numbering the pool is the codewriter's shape; unnumbered
+    /// descrs take the same path because `Descr::index()` supplies a unique
+    /// identity.  The registers still answer, and they answer with the
+    /// stored box rather than a second load.
     #[test]
     fn a_stored_field_answers_from_the_heapcache_and_records_no_getfield() {
         // Its own type id and field names: `field_descr_ref_from_bh` answers
         // out of `gc_cache()._cache_field`, which is process-wide and keyed by
         // `(LLType::Struct(type_id), fieldname)`.  Numbering the descrs of a
         // struct a sibling test also names would number that test's descrs
-        // too, and the sibling above exists precisely to hold the unnumbered
-        // shape.
+        // too.
         let mut builder = JitCodeBuilder::new();
         builder.new_struct(
             0,
@@ -15030,6 +15054,45 @@ mod tests {
         );
     }
 
+    /// A hand-assembled jitcode never numbers its descr pool.  Two fields of
+    /// one box must still be distinct heapcache keys: a store answers a later
+    /// load of the same field, a sibling field of the same box records once
+    /// and then answers from the cache.
+    #[test]
+    fn unnumbered_descrs_cache_same_field_and_not_a_sibling() {
+        let mut builder = JitCodeBuilder::new();
+        builder.new_struct(
+            0,
+            16,
+            0xD1,
+            false,
+            &[
+                (0, false, "hc_size", 8, true),
+                (8, true, "hc_buf", 8, false),
+            ],
+            "",
+        );
+        builder.load_const_i_value(0, 99);
+        builder.setfield_gc_i(0, 0, 0, 0xD1, "hc_size");
+        builder.getfield_gc_i(1, 0, 0, 0xD1, "hc_size");
+        builder.getfield_gc_r(1, 0, 8, 0xD1, "hc_buf");
+        builder.getfield_gc_r(2, 0, 8, 0xD1, "hc_buf");
+        let jitcode = builder.finish();
+
+        let mut ctx = TraceCtx::for_test(0);
+        let mut sym = DummySym;
+        let action = trace_jitcode_with_args(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0, &[]);
+        assert!(matches!(action, TraceAction::Continue));
+
+        let recorder = ctx.into_recorder();
+        let opcodes: Vec<_> = recorder.ops().iter().map(|o| o.opcode).collect();
+        assert_eq!(
+            opcodes,
+            vec![OpCode::New, OpCode::SetfieldGc, OpCode::GetfieldGcR],
+            "size load and the second buf load should have come from the heapcache",
+        );
+    }
+
     /// `_record_helper` counts what it appends and `execute_and_record`
     /// counts what it executes, so a body built only from ops that reach the
     /// trace through that pair leaves `RECORDED_OPS` and `OPS` agreeing with
@@ -15049,7 +15112,10 @@ mod tests {
         );
         builder.load_const_i_value(0, 99);
         builder.setfield_gc_i(0, 0, 0, 0xCD, "value");
-        builder.getfield_gc_i(1, 0, 0, 0xCD, "value");
+        // Read the sibling field, which was never stored, so the miss path
+        // records a GETFIELD.  A read of `value` would hit the heapcache
+        // and drop out of RECORDED_OPS / OPS.
+        builder.getfield_gc_r(1, 0, 8, 0xCD, "next");
         let jitcode = builder.finish();
 
         let mut ctx = TraceCtx::for_test(0);
@@ -15063,7 +15129,7 @@ mod tests {
         // body ever stops reaching `BC_NEW` and `BC_SETFIELD_GC_I`.
         assert_eq!(
             opcodes,
-            vec![OpCode::New, OpCode::SetfieldGc, OpCode::GetfieldGcI],
+            vec![OpCode::New, OpCode::SetfieldGc, OpCode::GetfieldGcR],
         );
         assert_eq!(recorded, Some(opcodes.len()), "RECORDED_OPS");
         assert_eq!(executed, Some(opcodes.len()), "OPS");

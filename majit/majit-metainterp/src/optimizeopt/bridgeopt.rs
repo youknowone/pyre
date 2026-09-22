@@ -70,18 +70,16 @@ pub fn serialize_optimizer_knowledge(
     optimizer_knowledge: Option<&crate::resume::OptimizerKnowledgeForResume>,
 ) -> Result<(), crate::resume::TagOverflow> {
     // bridgeopt.py `available_boxes = {}` followed by
-    // `available_boxes[box] = None` — RPython uses a dict as a
-    // membership set (values are always None). Pyre uses a Vec scanned
-    // linearly: the no-HashMap rule precludes a hash-backed mirror, and
-    // available_boxes per bridge is bounded by the live-box set.
-    let available_boxes: smallvec::SmallVec<[majit_ir::operand::Operand; 16]> = liveboxes
-        .iter()
-        .flatten()
+    // `available_boxes[box] = None`. Upstream's membership dict maps to
+    // LiveboxMap (identity-keyed: linear below 16, hash-indexed above).
+    let mut available_boxes = crate::resume::LiveboxMap::new();
+    for b in liveboxes.iter().flatten() {
         // bridgeopt.py serialize_optimizer_knowledge tests the numbered box
         // itself for membership in liveboxes_from_env.
-        .filter(|b| numb_state.liveboxes.contains_key(b))
-        .cloned()
-        .collect();
+        if numb_state.liveboxes.contains_key(b) {
+            available_boxes.insert(b.clone(), 0);
+        }
+    }
 
     // `serialize_optimizer_knowledge` records a known-class bit for each Ref
     // livebox by calling `getptrinfo(box).get_known_class(cpu)`.
@@ -139,20 +137,18 @@ pub fn serialize_optimizer_knowledge(
     let is_const =
         |opref: OpRef| opref.is_constant() || env.is_const(&env.get_box_replacement_operand(opref));
     let field_ok = |obj: OpRef, val: OpRef| {
-        (is_const(obj) || available_boxes.contains(&env.get_box_replacement_operand(obj)))
-            && (is_const(val) || available_boxes.contains(&env.get_box_replacement_operand(val)))
+        (is_const(obj) || available_boxes.contains_key(&env.get_box_replacement_operand(obj)))
+            && (is_const(val)
+                || available_boxes.contains_key(&env.get_box_replacement_operand(val)))
     };
-    numb_state.append_int(
-        knowledge
-            .heap_fields
-            .iter()
-            .filter(|&&(obj, _, val)| field_ok(obj, val))
-            .count() as i64,
-    );
-    for &(obj, descr_idx, val) in &knowledge.heap_fields {
-        if !field_ok(obj, val) {
-            continue;
-        }
+    let triples_struct: Vec<(OpRef, i32, OpRef)> = knowledge
+        .heap_fields
+        .iter()
+        .copied()
+        .filter(|&(obj, _, val)| field_ok(obj, val))
+        .collect();
+    numb_state.append_int(triples_struct.len() as i64);
+    for &(obj, descr_idx, val) in &triples_struct {
         let obj_tag = tag_box(obj, &numb_state.liveboxes, memo, env, new_liveboxes)?;
         numb_state.writer.append_short(obj_tag as i32);
         numb_state.append_int(descr_idx as i64);
@@ -160,17 +156,14 @@ pub fn serialize_optimizer_knowledge(
         numb_state.writer.append_short(val_tag as i32);
     }
     // bridgeopt.py:102-108: array items
-    numb_state.append_int(
-        knowledge
-            .heap_arrayitems
-            .iter()
-            .filter(|&&(obj, _, _, val)| field_ok(obj, val))
-            .count() as i64,
-    );
-    for &(obj, index, descr_idx, val) in &knowledge.heap_arrayitems {
-        if !field_ok(obj, val) {
-            continue;
-        }
+    let triples_array: Vec<(OpRef, i64, i32, OpRef)> = knowledge
+        .heap_arrayitems
+        .iter()
+        .copied()
+        .filter(|&(obj, _, _, val)| field_ok(obj, val))
+        .collect();
+    numb_state.append_int(triples_array.len() as i64);
+    for &(obj, index, descr_idx, val) in &triples_array {
         let obj_tag = tag_box(obj, &numb_state.liveboxes, memo, env, new_liveboxes)?;
         numb_state.writer.append_short(obj_tag as i32);
         // bridgeopt.py:106 numb_state.append_int(index) — pass the original
@@ -184,21 +177,17 @@ pub fn serialize_optimizer_knowledge(
     }
 
     // bridgeopt.py:113-122: loopinvariant results
-    numb_state.append_int(
-        knowledge
-            .loopinvariant_results
-            .iter()
-            .filter(|&&(_, result)| {
-                is_const(result)
-                    || available_boxes.contains(&env.get_box_replacement_operand(result))
-            })
-            .count() as i64,
-    );
-    for &(const_ptr, result) in &knowledge.loopinvariant_results {
-        if !(is_const(result) || available_boxes.contains(&env.get_box_replacement_operand(result)))
-        {
-            continue;
-        }
+    let tuples_loopinvariant: Vec<(i64, OpRef)> = knowledge
+        .loopinvariant_results
+        .iter()
+        .copied()
+        .filter(|&(_, result)| {
+            is_const(result)
+                || available_boxes.contains_key(&env.get_box_replacement_operand(result))
+        })
+        .collect();
+    numb_state.append_int(tuples_loopinvariant.len() as i64);
+    for &(const_ptr, result) in &tuples_loopinvariant {
         let const_tag = memo.getconst_int(const_ptr)?;
         numb_state.writer.append_short(const_tag as i32);
         let result_tag = tag_box(result, &numb_state.liveboxes, memo, env, new_liveboxes)?;

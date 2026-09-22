@@ -7906,7 +7906,13 @@ impl<M: Clone> MetaInterp<M> {
         let no_unroll_reason = crate::unroll_skip_reason(
             crate::no_unroll_enabled(),
             self.warm_state.get_enable_opts(),
-        );
+        )
+        .or_else(|| {
+            // rlib/jit.py `disable_unrolling`: "after how many operations we
+            // should not unroll".
+            (num_ops_before > self.warm_state.disable_unrolling_threshold() as usize)
+                .then_some("the recording is longer than `disable_unrolling`")
+        });
         let no_unroll = no_unroll_reason.is_some();
 
         // compile.py `compile_loop`: a simple-loop retry reads the same trace.

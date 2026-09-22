@@ -547,8 +547,10 @@ fn default_enable_opts() -> Vec<String> {
 /// not.
 pub const MAX_TRACE_ABORT_COUNT: u32 = 5;
 
-/// rlib/jit.py:599 disable_unrolling = 200
-const DEFAULT_DISABLE_UNROLLING: u32 = 200;
+/// rlib/jit.py:599 has `disable_unrolling = 200`, stored by
+/// `set_param_disable_unrolling` and read by nothing. This port reads it
+/// (`MetaInterp::compile_loop_body`), so the default never fires.
+const DEFAULT_DISABLE_UNROLLING: u32 = u32::MAX;
 
 static NEXT_GLOBAL_TOKEN_NUMBER: AtomicU64 = AtomicU64::new(1);
 
@@ -715,8 +717,9 @@ pub struct WarmEnterState {
     enable_opts: Vec<String>,
     /// warmstate.py: set_param_inlining — whether inlining is enabled.
     inlining: bool,
-    /// warmstate.py: set_param_disable_unrolling — threshold below
-    /// which loop unrolling is disabled.
+    /// warmstate.py: set_param_disable_unrolling — "after how many
+    /// operations we should not unroll": a recording longer than this
+    /// compiles as a simple loop.
     disable_unrolling_threshold: u32,
     /// warmstate.py: set_param_pureop_historylength — size of the
     /// pure operation history cache.
@@ -2299,7 +2302,7 @@ impl WarmEnterState {
         self.set_function_threshold(DEFAULT_FUNCTION_THRESHOLD); // 1619
         self.set_max_inline_depth(DEFAULT_MAX_INLINE_DEPTH); // 7
         self.inlining = true; // inlining = 1
-        self.disable_unrolling_threshold = DEFAULT_DISABLE_UNROLLING; // 200
+        self.disable_unrolling_threshold = DEFAULT_DISABLE_UNROLLING;
         self.pureop_historylength = 16;
         self.counter.set_decay(40);
         self.memory_manager.max_retrace_guards = 15;
@@ -7976,5 +7979,14 @@ mod tests {
                 "JC_{name} is {theirs:#x} in warmstate.py and {ours:#x} here"
             );
         }
+    }
+    #[test]
+    fn disable_unrolling_defaults_to_never_and_is_settable() {
+        let mut ws = WarmEnterState::new(3);
+        assert_eq!(ws.disable_unrolling_threshold(), u32::MAX);
+        ws.set_param("disable_unrolling", 6000);
+        assert_eq!(ws.disable_unrolling_threshold(), 6000);
+        ws.set_default_params();
+        assert_eq!(ws.disable_unrolling_threshold(), u32::MAX);
     }
 }
