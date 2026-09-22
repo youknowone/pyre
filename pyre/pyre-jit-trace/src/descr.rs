@@ -6859,7 +6859,9 @@ mod tests {
             .as_size_descr()
             .expect("W_BaseException SizeDescr")
             .all_fielddescrs();
-        assert_eq!(fields.len(), 40);
+        // Eight declaration-order fields after `ob_header`, plus the
+        // trailing class word. `ValueError` stays on this slim group.
+        assert_eq!(fields.len(), 9);
         for (i, field) in fields.iter().enumerate() {
             assert_eq!(
                 field.index_in_parent(),
@@ -6870,10 +6872,13 @@ mod tests {
                 field.index_in_parent(),
             );
         }
-        for i in 0..38 {
+        // The last entry is the class word at `W_CLASS_OFFSET`, so only the
+        // declaration-order prefix has to be strictly increasing.
+        let last_increasing = fields.len() - 2;
+        for i in 0..last_increasing {
             assert!(
                 fields[i].offset() < fields[i + 1].offset(),
-                "offsets 0..=38 must be strictly increasing: {}@{} then {}@{}",
+                "offsets 0..={last_increasing} must be strictly increasing: {}@{} then {}@{}",
                 fields[i].field_name(),
                 fields[i].offset(),
                 fields[i + 1].field_name(),
