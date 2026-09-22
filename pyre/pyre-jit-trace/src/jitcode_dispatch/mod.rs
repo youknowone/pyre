@@ -2294,6 +2294,13 @@ fn create_segmented_trace<Sym: WalkSym>(
     //
     // Before the guard: a refusal must leave no always-fails guard and no
     // FINISH behind, and the latch records nothing into the trace.
+    //
+    // `step_vstack_mirror` leaves a block-head marker on the opcode that
+    // entered it.  A JUMP_BACKWARD cut then publishes that STORE's entry
+    // value, and `bhimpl_jit_merge_point`'s ContinueRunningNormally resumes
+    // the loop header one slot deeper than `depth_at_py_pc` there.  Same
+    // post-step reconcile as `blackhole_if_trace_too_long`.
+    reconcile_vstack_to_resume_pc(ctx, mp_opcode_pc);
     if !latch_abort_blackhole(ctx, mp_opcode_pc, "segment-cut") {
         census_record("SegmentTrace::LatchRefused");
         return Ok(None);
