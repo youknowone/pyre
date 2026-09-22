@@ -293,6 +293,7 @@ two-phase-never-a-subject	pyre_interpreter::eval::prepare_frame_resume
 two-phase-never-a-subject	pyre_interpreter::eval::prepare_frame_resume_for_dispatch
 two-phase-never-a-subject	pyre_interpreter::eval::validate_check_exc_match_class
 two-phase-never-a-subject	pyre_interpreter::executioncontext::<Impl>::_trace
+two-phase-never-a-subject	pyre_interpreter::executioncontext::<Impl>::_trace::<Impl>::call
 two-phase-never-a-subject	pyre_interpreter::executioncontext::<Impl>::bytecode_only_trace
 two-phase-never-a-subject	pyre_interpreter::executioncontext::<Impl>::bytecode_trace
 two-phase-never-a-subject	pyre_interpreter::executioncontext::<Impl>::bytecode_trace_after_exception
@@ -353,6 +354,9 @@ two-phase-never-a-subject	pyre_interpreter::gateway::os_string_from_fs_bytes
 two-phase-never-a-subject	pyre_interpreter::gateway::path_or_fd_w
 two-phase-never-a-subject	pyre_interpreter::gateway::path_or_fd_w::<Impl>::call
 two-phase-never-a-subject	pyre_interpreter::gateway::short_type_name
+two-phase-never-a-subject	pyre_interpreter::host_seam::getenv
+two-phase-never-a-subject	pyre_interpreter::host_seam::ops::getenv
+two-phase-never-a-subject	pyre_interpreter::host_seam::real::<Impl>::getenv
 two-phase-never-a-subject	pyre_interpreter::importing::create_builtin_module
 two-phase-never-a-subject	pyre_interpreter::importing::dev_mode_flag
 two-phase-never-a-subject	pyre_interpreter::importing::dict_getitem_str_no_callback
@@ -912,6 +916,7 @@ two-phase-never-a-subject	pyre_interpreter::module::_lsprof::profiler_methods::<
 two-phase-never-a-subject	pyre_interpreter::module::_lsprof::profiler_methods::<Impl>::clear
 two-phase-never-a-subject	pyre_interpreter::module::_lsprof::profiler_methods::<Impl>::disable
 two-phase-never-a-subject	pyre_interpreter::module::_lsprof::profiler_methods::<Impl>::enable
+two-phase-never-a-subject	pyre_interpreter::module::_lsprof::profiler_methods::<Impl>::enable::<Impl>::call
 two-phase-never-a-subject	pyre_interpreter::module::_lsprof::profiler_methods::<Impl>::getstats
 two-phase-never-a-subject	pyre_interpreter::module::_lsprof::profiler_methods::__majit_wrap___new__
 two-phase-never-a-subject	pyre_interpreter::module::_lsprof::profiler_methods::__majit_wrap_clear
@@ -1015,6 +1020,7 @@ two-phase-never-a-subject	pyre_interpreter::module::_ssl::context_methods::<Impl
 two-phase-never-a-subject	pyre_interpreter::module::_ssl::context_methods::<Impl>::set_check_hostname
 two-phase-never-a-subject	pyre_interpreter::module::_ssl::context_methods::<Impl>::set_ciphers
 two-phase-never-a-subject	pyre_interpreter::module::_ssl::context_methods::<Impl>::set_default_verify_paths
+two-phase-never-a-subject	pyre_interpreter::module::_ssl::context_methods::<Impl>::set_default_verify_paths::<Impl>::call
 two-phase-never-a-subject	pyre_interpreter::module::_ssl::context_methods::<Impl>::set_ecdh_curve
 two-phase-never-a-subject	pyre_interpreter::module::_ssl::context_methods::<Impl>::set_keylog_filename
 two-phase-never-a-subject	pyre_interpreter::module::_ssl::context_methods::<Impl>::set_maximum_version
@@ -1834,7 +1840,6 @@ two-phase-never-a-subject	pyre_object::lltype::malloc_raw
 two-phase-never-a-subject	pyre_object::lltype::malloc_typed
 two-phase-never-a-subject	pyre_object::lltype::malloc_typed_stable
 two-phase-never-a-subject	pyre_object::lowlevel_string::bh_alloc_lowlevel_string
-two-phase-never-a-subject	pyre_object::lowlevel_string::bh_lowlevel_string_len
 two-phase-never-a-subject	pyre_object::memoryview::<Impl>::type_id
 two-phase-never-a-subject	pyre_object::memoryview::bufferview_alloc
 two-phase-never-a-subject	pyre_object::memoryview::w_memoryview_alloc_header
@@ -1891,6 +1896,7 @@ two-phase-never-a-subject	pyre_object::unicodeobject::alloc_raw_utf8_payload
 two-phase-never-a-subject	pyre_object::unicodeobject::alloc_utf8_payload
 two-phase-never-a-subject	pyre_object::unicodeobject::utf8_payload_bytes
 two-phase-never-a-subject	pyre_object::unicodeobject::utf8_payload_wtf8
+two-phase-never-a-subject	pyre_object::unicodeobject::w_str_from_storage_and_length
 two-phase-never-a-subject	pyre_object::unicodeobject::w_str_from_wtf8_immortal
 two-phase-never-a-subject	pyre_object::unicodeobject::w_str_from_wtf8_managed
 two-phase-never-a-subject	pyre_object::unicodeobject::w_str_from_wtf8_managed_collecting
