@@ -11833,6 +11833,13 @@ fn try_walker_specialize_subscr_str<Sym: WalkSym>(
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, raw)?;
     Ok(Some(()))
 }
+/// Whether `callable` is the `dict.get` method object.
+///
+/// The typedef registers the slot as
+/// `make_builtin_function("get", __majit_wrap_dict_descr_get)`, so that leaf
+/// is what `BuiltinCode.func` holds. Naming the `dict_method_get` body it
+/// forwards to instead compares two different functions, and answered true
+/// only while a build happened to give them one address.
 fn is_builtin_dict_get_function(callable: pyre_object::PyObjectRef) -> bool {
     if callable.is_null() || !unsafe { pyre_interpreter::is_function(callable) } {
         return false;
@@ -11841,7 +11848,7 @@ fn is_builtin_dict_get_function(callable: pyre_object::PyObjectRef) -> bool {
     !code.is_null()
         && unsafe { pyre_interpreter::is_builtin_code(code) }
         && unsafe { pyre_interpreter::builtin_code_get(code) as usize }
-            == pyre_interpreter::type_methods::dict_method_get as *const () as usize
+            == pyre_interpreter::type_methods::__majit_wrap_dict_descr_get as *const () as usize
 }
 
 #[derive(Clone, Copy)]
