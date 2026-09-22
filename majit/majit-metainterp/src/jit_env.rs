@@ -2,7 +2,8 @@
 //! environment to read them out of.
 //!
 //! `PYRE_NO_JIT`, `PYRE_JIT`, `MAJIT_NO_BRIDGE`, `PYRE_NO_JD1`, `PYRE_JD1`,
-//! `PYRE_JD1_NO_ENTER`, `PYRE_JD1_THRESHOLD`, and `MAJIT_BRIDGE_BAIL` change
+//! `PYRE_JD1_NO_ENTER`, `PYRE_JD1_THRESHOLD`, `MAJIT_BRIDGE_BAIL`,
+//! `MAJIT_MAX_BRIDGES`, and `MAJIT_SKIP_BRIDGES` change
 //! what the guest executes, not merely what it prints. `wasm32-unknown-unknown`
 //! has a permanently empty `std::env`, so without a supplied table those knobs
 //! read as unset no matter what the host was configured with.
@@ -24,6 +25,8 @@ pub const JIT_ENV_NAMES: &[&str] = &[
     "PYRE_JD1_NO_ENTER",
     "PYRE_JD1_THRESHOLD",
     "MAJIT_BRIDGE_BAIL",
+    "MAJIT_MAX_BRIDGES",
+    "MAJIT_SKIP_BRIDGES",
 ];
 
 /// Environment an embedder supplies because the platform gives the process

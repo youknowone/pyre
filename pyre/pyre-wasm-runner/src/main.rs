@@ -182,7 +182,7 @@ impl majit_backend_wasm_host::HostState for Host {
 /// `PYRE_STDLIB`, `MAJIT_STATS`, `PYRE_LOOP_CENSUS`), the knobs it forwards
 /// into the guest (`PYRE_NO_JIT`, `PYRE_JIT`, `MAJIT_NO_BRIDGE`, `PYRE_NO_JD1`,
 /// `PYRE_JD1`, `PYRE_JD1_NO_ENTER`, `PYRE_JD1_THRESHOLD`, `MAJIT_BRIDGE_BAIL`,
-/// `MAJIT_GC_STRESS`),
+/// `MAJIT_MAX_BRIDGES`, `MAJIT_SKIP_BRIDGES`, `MAJIT_GC_STRESS`),
 /// and `check.py`'s own `PYRE_CHECK_*` interpreter paths. A knob that later
 /// becomes host-interpreted must be added here; the prefix match needs no
 /// upkeep for new guest-side knobs.
@@ -199,6 +199,8 @@ fn warn_inert_guest_env() {
         "PYRE_JD1_NO_ENTER",
         "PYRE_JD1_THRESHOLD",
         "MAJIT_BRIDGE_BAIL",
+        "MAJIT_MAX_BRIDGES",
+        "MAJIT_SKIP_BRIDGES",
     ];
     // Forwarded into the guest through `pyre_set_gc_env` / `GC_ENV_NAMES`,
     // not interpreted here. Presence of the name is the native contract.
@@ -635,16 +637,16 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
         memory.read(&store, nptr as usize, &mut buf)?;
         dealloc.call(&mut store, (nptr, nlen))?;
 
-        // Presence flags, but the blob is still UTF-8 `NAME=VALUE`: a value
-        // that does not decode is left unset exactly as it would be natively
-        // for `env::var`. An empty value still counts as set.
+        // Presence flags, but the blob is still UTF-8 `NAME=VALUE`. Native
+        // presence reads use `var_os`, so a non-UTF-8 value is still "set";
+        // forward that as `NAME=` (empty still counts as set).
         let blob = String::from_utf8_lossy(&buf)
             .split('\0')
             .filter(|name| !name.is_empty())
             .filter_map(|name| {
-                std::env::var(name)
-                    .ok()
-                    .map(|value| format!("{name}={value}"))
+                std::env::var_os(name)?;
+                let value = std::env::var(name).unwrap_or_default();
+                Some(format!("{name}={value}"))
             })
             .collect::<Vec<_>>()
             .join("\0");

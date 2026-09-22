@@ -317,6 +317,7 @@ def run_charon_target_dir(engine) -> int:
             failures += 1
             print(f"FAIL {name}")
 
+    import hashlib
     import os
 
     root = pathlib.Path(tempfile.mkdtemp()).resolve()
@@ -326,15 +327,16 @@ def run_charon_target_dir(engine) -> int:
     }
     try:
         default = engine.charon_cargo_target_dir(root)
+        key = hashlib.sha256(os.fsencode(root.resolve())).hexdigest()[:16]
         expect(
-            "default target is keyed by the worktree basename",
-            default == root.parent / ".pyre-build" / "charon-target" / root.name,
+            "default target is keyed by a hash of the resolved worktree path",
+            default == root.parent / ".pyre-build" / "charon-target" / key,
         )
         os.environ["PYRE_SHARED_BUILD"] = str(root / "shared")
         expect(
             "PYRE_SHARED_BUILD relocates the target",
             engine.charon_cargo_target_dir(root)
-            == root / "shared" / "charon-target" / root.name,
+            == root / "shared" / "charon-target" / key,
         )
         os.environ["CHARON_TARGET_DIR"] = str(root / "explicit")
         expect(

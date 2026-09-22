@@ -254,16 +254,16 @@ pub fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32, Strin
         memory.read(&store, nptr as usize, &mut buf).map_err(estr)?;
         dealloc.call(&mut store, (nptr, nlen)).map_err(estr)?;
 
-        // Presence flags, but the blob is still UTF-8 `NAME=VALUE`: a value
-        // that does not decode is left unset exactly as it would be natively
-        // for `env::var`. An empty value still counts as set.
+        // Presence flags, but the blob is still UTF-8 `NAME=VALUE`. Native
+        // presence reads use `var_os`, so a non-UTF-8 value is still "set";
+        // forward that as `NAME=` (empty still counts as set).
         let blob = String::from_utf8_lossy(&buf)
             .split('\0')
             .filter(|name| !name.is_empty())
             .filter_map(|name| {
-                std::env::var(name)
-                    .ok()
-                    .map(|value| format!("{name}={value}"))
+                std::env::var_os(name)?;
+                let value = std::env::var(name).unwrap_or_default();
+                Some(format!("{name}={value}"))
             })
             .collect::<Vec<_>>()
             .join("\0");

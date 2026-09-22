@@ -11841,10 +11841,11 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     }
     if dump_bytecode_enabled() {
         if frame_root.frame().next_instr() == 0 {
-            use std::sync::OnceLock;
-            static DUMPED: OnceLock<()> = OnceLock::new();
-            if DUMPED.get().is_none() {
-                let _ = DUMPED.set(());
+            use std::sync::{Mutex, OnceLock};
+            static DUMPED: OnceLock<Mutex<std::collections::HashSet<usize>>> = OnceLock::new();
+            let dumped = DUMPED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+            let code_key = std::ptr::from_ref(code) as usize;
+            if dumped.lock().is_ok_and(|mut set| set.insert(code_key)) {
                 let mut state = pyre_interpreter::OpArgState::default();
                 eprintln!("-- {} bytecode dump --", code.obj_name.as_str());
                 for (pc, unit) in code.instructions.iter().copied().enumerate() {

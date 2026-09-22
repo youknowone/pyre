@@ -5138,6 +5138,18 @@ fn run_perfn_walk<Sym: WalkSym>(
         let keep_flushed_frame_after_applied = || {
             let _ = commit_walk_end(WalkEndCommitLeg::VableEscape, WalkEndResume::AfterApplied);
             crate::jitcode_dispatch::discard_escape_flush_undo();
+            // Same live→snapshot mirror as the exact-escape commit: the portal
+            // copies `executed_frame` onto the live frame, so a stale snapshot
+            // would overwrite the flushed resume state while heap writes stay
+            // committed and replay is off.
+            if live_root_addr != 0 && cf_addr != 0 && live_root_addr != cf_addr {
+                unsafe {
+                    (*(cf_addr as *mut pyre_interpreter::PyFrame)).restore_resume_state_from(
+                        &*(live_root_addr as *const pyre_interpreter::PyFrame),
+                    );
+                }
+            }
+            crate::jitcode_dispatch::fbw_foriter_inflight_clear();
         };
         if trace_too_long_adopted && crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!("[fbw-blackhole] adopted ABORT_TOO_LONG forward resume");
