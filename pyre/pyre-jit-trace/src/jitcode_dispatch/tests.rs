@@ -183,9 +183,10 @@ fn unbound_symbolic_residual_refuses_before_a_bound_residual_side_effect() {
 fn portal_reachable_symbolic_residual_scan_is_empty() {
     let _ = crate::jitcode_runtime::all_jitcodes();
     crate::jitcode_runtime::install_global_build_descr_pool();
-    let portal = crate::jitcode_runtime::portal_jitcode()
+    let canonical = crate::jitcode_runtime::portal_jitcode()
         .expect("the build-time table registers the eval portal");
-    let portal = majit_metainterp::JitCode::from_canonical((*portal).clone());
+    let portal = crate::jitcode_runtime::get_runtime_jitcode_by_index(canonical.index())
+        .expect("the eval portal index resolves to a runtime jitcode");
 
     let started = std::time::Instant::now();
     let scan = portal.reachable_symbolic_residuals();
@@ -195,6 +196,11 @@ fn portal_reachable_symbolic_residual_scan_is_empty() {
         scan.visited_jitcodes,
         elapsed.as_nanos(),
         scan.targets.len(),
+    );
+    let fresh = majit_metainterp::jitcode::compute_reachable_symbolic_residuals(&portal);
+    assert_eq!(
+        scan, &fresh,
+        "the build-time table must name the same closure a body scan walks",
     );
 
     assert!(
@@ -215,12 +221,18 @@ fn portal_reachable_symbolic_residual_scan_is_empty() {
 fn unpackiterable_portal_reachable_symbolic_residual_scan_is_empty() {
     let _ = crate::jitcode_runtime::all_jitcodes();
     crate::jitcode_runtime::install_global_build_descr_pool();
-    let portal =
+    let canonical =
         crate::jitcode_runtime::portal_jitcode_for_key("baseobjspace::unpackiterable_portal")
             .expect("the build-time table registers the unpackiterable portal");
-    let portal = majit_metainterp::JitCode::from_canonical((*portal).clone());
+    let portal = crate::jitcode_runtime::get_runtime_jitcode_by_index(canonical.index())
+        .expect("the unpackiterable portal index resolves to a runtime jitcode");
 
     let scan = portal.reachable_symbolic_residuals();
+    let fresh = majit_metainterp::jitcode::compute_reachable_symbolic_residuals(&portal);
+    assert_eq!(
+        scan, &fresh,
+        "the build-time table must name the same closure a body scan walks",
+    );
     assert!(
         scan.visited_jitcodes > 0,
         "the unpackiterable portal itself must be visited"

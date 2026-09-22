@@ -638,6 +638,9 @@ pub struct JitCode {
     /// wrapper's `constants_i` are five `#[test]` sites in `resume`, `frame`, and
     /// `pyre-jit-trace::state`; a future non-test mutator would require an
     /// invalidation hook here.
+    /// `with_reachable_symbolic_residuals` may fill the memo before the first
+    /// read. An empty memo still scans, which is the path `JitCodeBuilder`
+    /// bodies take.
     reachable_symbolic_residuals: std::sync::OnceLock<ReachableSymbolicResiduals>,
 }
 
@@ -755,9 +758,28 @@ impl JitCode {
         self.reachable_symbolic_residuals
             .get_or_init(|| compute_reachable_symbolic_residuals(self))
     }
+
+    /// Install the reachable-residual answer so the first read does not walk.
+    ///
+    /// Build-time jitcodes carry this from the serialized table, after symbolic
+    /// constants this process has already bound are removed. Hand-built bodies
+    /// leave the memo empty and scan on first read.
+    pub fn with_reachable_symbolic_residuals(self, residuals: ReachableSymbolicResiduals) -> Self {
+        self.reachable_symbolic_residuals
+            .set(residuals)
+            .unwrap_or_else(|_| panic!("reachable symbolic residuals already installed"));
+        self
+    }
 }
 
-fn compute_reachable_symbolic_residuals(root: &JitCode) -> ReachableSymbolicResiduals {
+/// Uncached form of [`JitCode::reachable_symbolic_residuals`].
+///
+/// Hand-built bodies leave the memo empty and reach this scan on first read.
+/// A build-time jitcode may install the same answer with
+/// [`JitCode::with_reachable_symbolic_residuals`] before the first read; this
+/// function still walks the body, so a test can compare the installed answer
+/// with a fresh scan.
+pub fn compute_reachable_symbolic_residuals(root: &JitCode) -> ReachableSymbolicResiduals {
     fn is_residual_call(opcode: u8) -> bool {
         matches!(
             opcode,

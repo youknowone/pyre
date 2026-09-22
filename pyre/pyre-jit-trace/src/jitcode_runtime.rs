@@ -180,6 +180,25 @@ fn runtime_jitcode_cells() -> &'static [std::sync::OnceLock<Arc<majit_metainterp
     })
 }
 
+fn seeded_reachable_symbolic_residuals(
+    index: usize,
+) -> majit_metainterp::jitcode::ReachableSymbolicResiduals {
+    let (values, visited) = jitcode_index()
+        .reachable_symbolic_residuals_at(index)
+        .unwrap_or_else(|| panic!("jitcode {index} has no reachable symbolic residual row"));
+    // Constants this process rewrote are no longer symbolic in the patched
+    // body. The table still names the build-time hashes.
+    let targets = values
+        .iter()
+        .copied()
+        .filter(|value| !crate::runtime_fnaddr_patch::is_bound_symbolic_fnaddr(*value))
+        .collect();
+    majit_metainterp::jitcode::ReachableSymbolicResiduals {
+        targets,
+        visited_jitcodes: visited as usize,
+    }
+}
+
 pub fn get_runtime_jitcode_by_index(
     index: usize,
 ) -> Option<Arc<majit_metainterp::jitcode::JitCode>> {
@@ -188,9 +207,10 @@ pub fn get_runtime_jitcode_by_index(
         cell.get_or_init(|| {
             let canonical = get_jitcode_by_index(index)
                 .expect("runtime JitCode cell index must resolve canonically");
-            Arc::new(majit_metainterp::jitcode::JitCode::from_canonical(
-                (*canonical).clone(),
-            ))
+            Arc::new(
+                majit_metainterp::jitcode::JitCode::from_canonical((*canonical).clone())
+                    .with_reachable_symbolic_residuals(seeded_reachable_symbolic_residuals(index)),
+            )
         })
         .clone(),
     )
@@ -356,11 +376,12 @@ pub fn portal_metainterp_jitcode() -> Option<Arc<majit_metainterp::jitcode::JitC
     static PORTAL_META: OnceLock<Option<Arc<majit_metainterp::jitcode::JitCode>>> = OnceLock::new();
     PORTAL_META
         .get_or_init(|| {
-            portal_jitcode().map(|canonical| {
-                Arc::new(majit_metainterp::jitcode::JitCode::from_canonical(
-                    (*canonical).clone(),
-                ))
-            })
+            let canonical = portal_jitcode()?;
+            let index = canonical.index();
+            Some(Arc::new(
+                majit_metainterp::jitcode::JitCode::from_canonical((*canonical).clone())
+                    .with_reachable_symbolic_residuals(seeded_reachable_symbolic_residuals(index)),
+            ))
         })
         .clone()
 }

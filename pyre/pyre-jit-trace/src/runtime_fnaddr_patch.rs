@@ -374,6 +374,15 @@ pub fn prime_address_correspondences() {
     LazyLock::force(&UNPAIRED_BUILD_ADDRS);
 }
 
+/// Whether [`patch_constants_i_fnaddrs`] rewrites `fnaddr`.
+///
+/// The correspondence maps a build-process address onto this process's
+/// address, and only when the two differ. A symbolic residual constant that
+/// is a key was replaced before any wrapper observed the body.
+pub fn is_bound_symbolic_fnaddr(fnaddr: i64) -> bool {
+    FNADDR_CORRESPONDENCE.contains_key(&fnaddr)
+}
+
 /// Resolve one build-process function address to this process's address.
 /// Used by the lazy indirect-call-target index, which needs the shell's
 /// `fnaddr` but deliberately does not deserialize the shell's JitCode body.
