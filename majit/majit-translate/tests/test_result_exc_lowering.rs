@@ -210,6 +210,44 @@ fn a_rewrapped_call_site_retypes_its_call_to_the_payload() {
     }
 }
 
+/// `int_w`'s hand-written `match` is `getindex_w`'s
+/// `try/except OperationError`: the normal edge returns the `int`, and the
+/// handler reads `PyError.kind`. The rebuilt `Result` shell must not survive
+/// into the rtyper — its `__discriminant` read is the unbound arg that
+/// phase B skips on `_check_len_result`.
+#[test]
+fn check_len_result_match_does_not_rebuild_a_result_shell() {
+    let graph = lower_function(
+        interp(),
+        "pyre_interpreter::baseobjspace::_check_len_result",
+    )
+    .expect("lower");
+    for block in &graph.blocks {
+        for op in &block.operations {
+            match &op.kind {
+                OpKind::FieldRead { field, .. } if field.name == "__discriminant" => {
+                    let owner = field.owner_root.as_deref().unwrap_or("");
+                    assert!(
+                        !owner.contains("Result"),
+                        "Result discriminant still read: {owner}"
+                    );
+                }
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { owner_path, .. },
+                    ..
+                } => {
+                    let owner = owner_path.join("::");
+                    assert!(
+                        !owner.contains("Result"),
+                        "Result shell ctor still built: {owner}"
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 #[test]
 fn pop_value_lowers_to_raise_links() {
     let llbc = interp();
