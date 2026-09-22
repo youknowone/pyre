@@ -3281,6 +3281,21 @@ impl MiniMarkGC {
         }
     }
 
+    /// incminimark.py `_minor_collection` STATE_MARKING arm: black objects on
+    /// `old_objects_pointing_to_young` / `old_objects_pointing_to_pinned` turn
+    /// gray so the cycle retraces what they wrote since the last visit.
+    fn regray_remembered_black_during_marking(&mut self) {
+        debug_assert_eq!(self.gc_state, GcState::Marking);
+        for index in 0..self.old_objects_pointing_to_young.len() {
+            let obj_addr = self.old_objects_pointing_to_young[index];
+            self.add_to_more_objects_to_trace_if_black(obj_addr);
+        }
+        for index in 0..self.old_objects_pointing_to_pinned.len() {
+            let obj_addr = self.old_objects_pointing_to_pinned[index];
+            self.add_to_more_objects_to_trace_if_black(obj_addr);
+        }
+    }
+
     /// incminimark.py `remove_young_arrays_from_old_objects_pointing_to_young`.
     ///
     /// An entry naming a young rawmalloced object is a contradiction: this
@@ -3341,14 +3356,7 @@ impl MiniMarkGC {
         // already-black remembered / pinned-parent objects gray again so the
         // active marking cycle rescans what they wrote since the last visit.
         if self.gc_state == GcState::Marking {
-            for index in 0..self.old_objects_pointing_to_young.len() {
-                let obj_addr = self.old_objects_pointing_to_young[index];
-                self.add_to_more_objects_to_trace_if_black(obj_addr);
-            }
-            for index in 0..self.old_objects_pointing_to_pinned.len() {
-                let obj_addr = self.old_objects_pointing_to_pinned[index];
-                self.add_to_more_objects_to_trace_if_black(obj_addr);
-            }
+            self.regray_remembered_black_during_marking();
         }
         // incminimark.py:1826-1832: replace the list before anything can append
         // to it, so parents discovered during this minor accumulate in the
@@ -3721,7 +3729,7 @@ impl MiniMarkGC {
         // heap is walked, so it is gated a level above the rotating nurseries
         // rather than on `PYPY_GC_DEBUG` being set at all.
         if self.config.debug >= 2 {
-            self.debug_check_consistency();
+            self.debug_check_consistency_at("minor");
         }
 
         // incminimark.py `self.root_walker.finished_minor_collection()`,
@@ -6481,7 +6489,17 @@ impl MiniMarkGC {
         let start = GcClock::start();
         let old_state = self.gc_state.encoded();
         self.oom_signalled_this_step = false;
-        self.debug_check_consistency();
+        // incminimark.py `gc_step_until` runs `_minor_collection` (and its
+        // MARKING `if_black` pass) before every `major_collection_step`.
+        // `do_collect_oldgen_nonmoving` uses `gc_step_until_scanning` with no
+        // minor, so a black remembered parent (TRACK clear, on
+        // `old_objects_pointing_to_young`) would keep a white child across
+        // this step. Re-grey those parents here, the way the skipped minor
+        // would have.
+        if self.oldgen_nonmoving_active && self.gc_state == GcState::Marking {
+            self.regray_remembered_black_during_marking();
+        }
+        self.debug_check_consistency_at("major_step");
 
         // incminimark.py:2406-2436: each state-machine step grants half a
         // nursery of promotion credit.
@@ -6533,18 +6551,24 @@ impl MiniMarkGC {
     /// assertions rather than `debug_assert!`s that a release build drops.
     /// `PYPY_GC_DEBUG` is the only way to arm them, and a run that sets it is
     /// asking to be aborted on a broken invariant.
-    fn debug_check_consistency(&self) {
+    fn debug_check_consistency_at(&self, site: &'static str) {
         if self.config.debug == 0 {
             return;
         }
-        assert!(
-            self.oldgen.young_rawmalloced_is_empty(),
-            "young raw-malloced objects in a major collection"
-        );
-        assert!(
-            self.young_objects_with_weakrefs.is_empty(),
-            "young objects with weakrefs in a major collection"
-        );
+        // `do_collect_oldgen_nonmoving` skips the leading minor on purpose, so
+        // young rawmalloced objects and young weakrefs are still live. Those
+        // two asserts are "we just finished `_minor_collection`" facts
+        // (`incminimark.py debug_check_consistency`); they do not hold here.
+        if !self.oldgen_nonmoving_active {
+            assert!(
+                self.oldgen.young_rawmalloced_is_empty(),
+                "young raw-malloced objects in a major collection"
+            );
+            assert!(
+                self.young_objects_with_weakrefs.is_empty(),
+                "young objects with weakrefs in a major collection"
+            );
+        }
         if self.oldgen.rawmalloc_sweep_pending() {
             assert_eq!(
                 self.gc_state,
@@ -6552,26 +6576,68 @@ impl MiniMarkGC {
                 "raw_malloc_might_sweep must be empty outside SWEEPING"
             );
         }
-        self.debug_check_reachable();
+        if self.gc_state == GcState::Marking && !self.oldgen_nonmoving_active {
+            // incminimark.py `_check_not_in_nursery`: ordinary marking never
+            // queues nursery objects. A non-moving major marks the nursery in
+            // place (`may_enter_marking_worklist`), so the assert does not
+            // apply there.
+            for &addr in self
+                .incr_state
+                .gray_stack
+                .iter()
+                .chain(self.incr_state.more_gray_stack.iter())
+            {
+                assert!(
+                    !self.is_in_nursery(addr),
+                    "'objects_to_trace' contains a nursery object"
+                );
+            }
+        }
+        // The reachable-graph walk (and the all-old-object MARKING walk) is
+        // `DEBUG >= 2`, matching `_minor_collection`'s `if self.DEBUG >= 2`.
+        // A full heap walk here changes collection timing enough to hide the
+        // live-object-freed crash.
+        if self.config.debug >= 2 {
+            self.debug_check_reachable(site);
+            if self.gc_state == GcState::Marking {
+                self.oldgen.for_each_allocated_object(|addr| {
+                    if self.is_managed_heap_object(addr) {
+                        self.debug_check_object_at(addr, site);
+                    }
+                });
+            }
+        }
     }
 
     /// gc/base.py `debug_check_consistency`'s heap half — enumerate every root
     /// and trace the whole reachable graph, checking each object once.
     ///
+    /// Roots include the shadow stack, jitframe gcmap slots, blackhole
+    /// registers, resume construction, extra areas (compile-window among
+    /// them), prebuilt/static objects, and registered finalizers
+    /// (`enumerate_all_root_values`).
+    ///
     /// Upstream keeps its seen set and pending stack as GC-side `AddressDict` /
     /// `AddressStack` because it has no other allocator; here they are ordinary
     /// Rust containers, which is the same structure without the bookkeeping.
-    fn debug_check_reachable(&self) {
+    fn debug_check_reachable(&self, site: &'static str) {
         let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
         let mut pending: Vec<usize> = Vec::new();
         let record =
             |addr: usize, seen: &mut std::collections::HashSet<usize>, pending: &mut Vec<usize>| {
+                // `base.py _debug_callback2` / `trace` only follow GC objects.
+                // A declared gc-ptr offset can name a host `Box` (Function.name
+                // for an immortal builtin); the live tracer skips those with
+                // `is_managed_heap_object`.
+                if addr == 0 || !self.is_managed_heap_object(addr) {
+                    return;
+                }
                 if seen.insert(addr) {
-                    self.debug_check_object(addr);
+                    self.debug_check_object_at(addr, site);
                     pending.push(addr);
                 }
             };
-        for root in self.enumerate_root_walker_values() {
+        for root in self.enumerate_all_root_values() {
             if !root.is_null() {
                 record(root.0, &mut seen, &mut pending);
             }
@@ -6598,14 +6664,24 @@ impl MiniMarkGC {
 
     /// incminimark.py `debug_check_object`: after a collection nothing is left
     /// in the nursery but the pinned objects, and neither of the two flags the
-    /// collection itself uses may survive it.
-    fn debug_check_object(&self, obj_addr: usize) {
+    /// collection itself uses may survive it.  State-specific arms match
+    /// `_debug_check_object_scanning` / `_marking` / `_sweeping` /
+    /// `_finalizing`.
+    fn debug_check_object_at(&self, obj_addr: usize, site: &'static str) {
         let hdr = unsafe { &*header_of(obj_addr) };
         if self.is_pinned(GcRef(obj_addr)) {
             assert!(
                 self.is_in_nursery(obj_addr),
                 "pinned object not in nursery at {obj_addr:#x}"
             );
+            return;
+        }
+        // A non-moving major leaves nursery / young-rawmalloced objects in
+        // place (flags=0, no TRACK_YOUNG_PTRS). The after-collection object
+        // arms below do not apply to them.
+        if self.oldgen_nonmoving_active
+            && (self.is_in_nursery(obj_addr) || self.oldgen.young_rawmalloced_contains(obj_addr))
+        {
             return;
         }
         assert!(
@@ -6620,6 +6696,233 @@ impl MiniMarkGC {
             !hdr.has_flag(GcFlags::GCFLAG_PINNED),
             "GCFLAG_PINNED outside the nursery after collection at {obj_addr:#x}"
         );
+        match self.gc_state {
+            GcState::Scanning => self.debug_check_object_scanning(obj_addr),
+            GcState::Marking => self.debug_check_object_marking(obj_addr, site),
+            GcState::Sweeping => self.debug_check_object_sweeping(obj_addr),
+            GcState::Finalizing => self.debug_check_object_scanning(obj_addr),
+        }
+    }
+
+    /// `write_barrier` / `remember_young_pointer` clears TRACK_YOUNG_PTRS and
+    /// must push `old_objects_pointing_to_young`. A black object with the flag
+    /// clear is only legal while it is on that list; `collect_oldrefs_to_nursery`
+    /// re-sets the flag. The bug class is the flag clear and the object absent
+    /// from the list.
+    fn debug_assert_track_young_ptrs_or_remembered(&self, obj_addr: usize, hdr: &GcHeader) {
+        if hdr.has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS)
+            || self.old_objects_pointing_to_young.contains(&obj_addr)
+        {
+            return;
+        }
+        panic!(
+            "missing GCFLAG_TRACK_YOUNG_PTRS {}",
+            self.debug_track_young_ptrs_context(obj_addr)
+        );
+    }
+
+    /// Format tid / flags / remembered-set membership for a TRACK_YOUNG_PTRS
+    /// failure so the first violation names whether `write_barrier` cleared the
+    /// flag without `collect_oldrefs_to_nursery` re-arming it.
+    fn debug_track_young_ptrs_context(&self, obj_addr: usize) -> String {
+        if obj_addr == 0 {
+            return "addr=0x0".to_string();
+        }
+        if !self.is_managed_heap_object(obj_addr) {
+            return format!("addr={obj_addr:#x} unmanaged");
+        }
+        let hdr = unsafe { &*header_of(obj_addr) };
+        format!(
+            "addr={obj_addr:#x} tid={} tid_and_flags={:#x} TRACK_YOUNG_PTRS={} \
+             VISITED={} HAS_CARDS={} CARDS_SET={} NO_HEAP_PTRS={} PINNED={} \
+             in_old_objects_pointing_to_young={} in_gray={} in_more_gray={} \
+             in_prebuilt_roots={} managed={} nursery={} oldgen={} young_raw={} gen={} \
+             gc_state={:?} oldgen_nonmoving={} minors={} majors={}",
+            hdr.type_id(),
+            hdr.tid_and_flags,
+            hdr.has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS),
+            hdr.has_flag(GcFlags::GCFLAG_VISITED),
+            hdr.has_flag(GcFlags::GCFLAG_HAS_CARDS),
+            hdr.has_flag(GcFlags::GCFLAG_CARDS_SET),
+            hdr.has_flag(GcFlags::GCFLAG_NO_HEAP_PTRS),
+            hdr.has_flag(GcFlags::GCFLAG_PINNED),
+            self.old_objects_pointing_to_young.contains(&obj_addr),
+            self.incr_state.gray_stack.contains(&obj_addr),
+            self.incr_state.more_gray_stack.contains(&obj_addr),
+            self.prebuilt_root_objects.contains(&obj_addr),
+            self.is_managed_heap_object(obj_addr),
+            self.nursery.contains(obj_addr),
+            self.oldgen.contains(obj_addr),
+            self.oldgen.young_rawmalloced_contains(obj_addr),
+            self.describe_generation(obj_addr),
+            self.gc_state,
+            self.oldgen_nonmoving_active,
+            self.minor_collections,
+            self.major_collections,
+        )
+    }
+
+    fn debug_is_visited_or_gray(&self, addr: usize) -> bool {
+        if addr == 0 || !self.is_managed_heap_object(addr) {
+            return true;
+        }
+        let hdr = unsafe { &*header_of(addr) };
+        hdr.has_flag(GcFlags::GCFLAG_VISITED)
+            || hdr.has_flag(GcFlags::GCFLAG_NO_HEAP_PTRS)
+            || self.is_pinned(GcRef(addr))
+            || self.incr_state.gray_stack.contains(&addr)
+            || self.incr_state.more_gray_stack.contains(&addr)
+            || self.prebuilt_root_objects.contains(&addr)
+    }
+
+    /// `incminimark.py` `_debug_check_not_white` over the remembered set and
+    /// the live root slots, at the MARKING→SWEEPING seam. A walk of every
+    /// old object (custom_trace of every dict) hid the crash without
+    /// panicking; this is the cheap set that still sees the same heap.
+    fn debug_check_visited_children_not_white(&self, site: &'static str) {
+        let check_obj = |addr: usize| {
+            if !self.is_managed_heap_object(addr) {
+                return;
+            }
+            let hdr = unsafe { &*header_of(addr) };
+            if !hdr.has_flag(GcFlags::GCFLAG_VISITED) {
+                return;
+            }
+            let type_id = hdr.type_id();
+            if (type_id as usize) >= self.types.len() {
+                return;
+            }
+            unsafe {
+                self.types.get(type_id).for_each_gc_ptr(addr, |slot| {
+                    let child = *slot;
+                    if !child.is_null() {
+                        self.debug_check_not_white(addr, slot as usize, child.0, site);
+                    }
+                });
+            }
+        };
+        for &addr in &self.old_objects_pointing_to_young {
+            check_obj(addr);
+        }
+        for &addr in &self.old_objects_pointing_to_pinned {
+            check_obj(addr);
+        }
+        for (gcref, label) in self.enumerate_labeled_root_walker_values() {
+            if gcref.is_null() {
+                continue;
+            }
+            if self.is_managed_heap_object(gcref.0)
+                && !self.debug_is_visited_or_gray(gcref.0)
+                && !(self.is_in_nursery(gcref.0) && !self.oldgen_nonmoving_active)
+            {
+                panic!(
+                    "white root at MARKING->SWEEPING site={site} label={label} {}",
+                    self.debug_track_young_ptrs_context(gcref.0),
+                );
+            }
+            check_obj(gcref.0);
+        }
+    }
+
+    /// incminimark.py `_debug_check_object_marking`.
+    fn debug_check_object_marking(&self, obj_addr: usize, site: &'static str) {
+        let hdr = unsafe { &*header_of(obj_addr) };
+        if !hdr.has_flag(GcFlags::GCFLAG_VISITED) {
+            return;
+        }
+        let type_id = hdr.type_id();
+        if (type_id as usize) >= self.types.len() {
+            return;
+        }
+        let has_gc_ptrs = self.types.get(type_id).has_gc_ptrs;
+        // pyre greys by setting VISITED at push (`seed_major_root`,
+        // `grey_child`); upstream `visit` sets it when tracing. An object
+        // still on the worklist is gray even though the flag is already on.
+        // A write_barrier may have cleared TRACK_YOUNG_PTRS (and recorded the
+        // object on old_objects_pointing_to_young) before `mark_object` pops
+        // it and re-sets both flags together.
+        if self.incr_state.gray_stack.contains(&obj_addr)
+            || self.incr_state.more_gray_stack.contains(&obj_addr)
+        {
+            return;
+        }
+        if has_gc_ptrs {
+            self.debug_assert_track_young_ptrs_or_remembered(obj_addr, hdr);
+        }
+        let mut children: Vec<(usize, usize)> = Vec::new();
+        unsafe {
+            self.types.get(type_id).for_each_gc_ptr(obj_addr, |slot| {
+                let child = *slot;
+                if !child.is_null() {
+                    children.push((slot as usize, child.0));
+                }
+            });
+        }
+        for (slot_addr, child_addr) in children {
+            self.debug_check_not_white(obj_addr, slot_addr, child_addr, site);
+        }
+    }
+
+    /// incminimark.py `_debug_check_not_white`: a black object must not
+    /// point at a white one.
+    fn debug_check_not_white(
+        &self,
+        holder_addr: usize,
+        slot_addr: usize,
+        child_addr: usize,
+        site: &'static str,
+    ) {
+        if !self.is_managed_heap_object(child_addr) {
+            return;
+        }
+        if self.debug_is_visited_or_gray(child_addr)
+            || (self.oldgen_nonmoving_active && self.is_in_nursery(child_addr))
+        {
+            return;
+        }
+        panic!(
+            "black -> white pointer found site={site} \
+             holder={} child={} slot_offset={:?}",
+            self.debug_track_young_ptrs_context(holder_addr),
+            self.debug_track_young_ptrs_context(child_addr),
+            slot_addr.checked_sub(holder_addr),
+        );
+    }
+
+    /// incminimark.py `_debug_check_object_sweeping`.
+    fn debug_check_object_sweeping(&self, obj_addr: usize) {
+        let hdr = unsafe { &*header_of(obj_addr) };
+        let type_id = hdr.type_id();
+        if (type_id as usize) < self.types.len() {
+            let info = self.types.get(type_id);
+            if info.has_gc_ptrs && !self.is_pinned(GcRef(obj_addr)) {
+                self.debug_assert_track_young_ptrs_or_remembered(obj_addr, hdr);
+            }
+        }
+        assert!(
+            !hdr.has_flag(GcFlags::GCFLAG_FINALIZATION_ORDERING),
+            "unexpected GCFLAG_FINALIZATION_ORDERING at {obj_addr:#x}"
+        );
+        assert!(
+            !hdr.has_flag(GcFlags::GCFLAG_CARDS_SET),
+            "unexpected GCFLAG_CARDS_SET at {obj_addr:#x}"
+        );
+        if hdr.has_flag(GcFlags::GCFLAG_NO_HEAP_PTRS) {
+            assert!(
+                hdr.has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS),
+                "GCFLAG_NO_HEAP_PTRS is set, but GCFLAG_TRACK_YOUNG_PTRS isn't! at {obj_addr:#x}"
+            );
+        }
+    }
+
+    /// incminimark.py `_debug_check_object_scanning`.
+    fn debug_check_object_scanning(&self, obj_addr: usize) {
+        let hdr = unsafe { &*header_of(obj_addr) };
+        assert!(
+            !hdr.has_flag(GcFlags::GCFLAG_VISITED),
+            "unexpected GCFLAG_VISITED at {obj_addr:#x}"
+        );
+        self.debug_check_object_sweeping(obj_addr);
     }
 
     /// Perform one incremental marking step.
@@ -7164,6 +7467,24 @@ impl MiniMarkGC {
         }
     }
 
+    /// `visit_all_objects` over both `objects_to_trace` and
+    /// `more_objects_to_trace`. A write barrier during MARKING may fill
+    /// `more_gray_stack` after the primary stack was already empty.
+    fn drain_marking_worklists(&mut self) {
+        loop {
+            if self.incr_state.gray_stack.is_empty() {
+                if self.incr_state.more_gray_stack.is_empty() {
+                    break;
+                }
+                std::mem::swap(
+                    &mut self.incr_state.gray_stack,
+                    &mut self.incr_state.more_gray_stack,
+                );
+            }
+            self.drain_gray_stack();
+        }
+    }
+
     /// Mark conditional edges to a fixed point.
     ///
     /// Two kinds, asked together because each can answer the other. RPython
@@ -7319,6 +7640,14 @@ impl MiniMarkGC {
             self.oldgen_nonmoving_active || !self.oldgen.has_young_rawmalloced(),
             "young raw-malloced objects in a major collection"
         );
+        // Finalizers and destructors run while still MARKING and may store
+        // into a live black object. The write barrier re-greys it onto
+        // `more_gray_stack`; drain that work before the sweep freezes
+        // VISITED (`visit_all_objects` until both stacks are empty).
+        self.drain_marking_worklists();
+        if self.config.debug >= 2 {
+            self.debug_check_visited_children_not_white("marking_sweep_seam");
+        }
         self.oldgen.sweep_prepare();
 
         // incminimark.py: dead old parents must leave the pin-parent
@@ -8046,6 +8375,16 @@ impl MiniMarkGC {
         self.oldgen_nonmoving_active = true;
         self.oldgen_nonmoving_young_marks.clear();
 
+        // This entry skips the leading minor, so the MARKING arm of
+        // `_minor_collection` (`_add_to_more_objects_to_trace_if_black` on
+        // the remembered set) never runs. Black old objects from the
+        // interrupted incremental cycle already had their children written
+        // since the last visit. Re-grey those remembered parents so the rest
+        // of this cycle traces those edges (`visit` / `mark_object`).
+        if self.gc_state == GcState::Marking {
+            self.regray_remembered_black_during_marking();
+        }
+
         // `do_collect_full` / incminimark.py `gc_step_until` first finishes
         // an in-progress major, then starts a fresh cycle whose root snapshot
         // is taken at the explicit collection boundary.  The non-moving twin
@@ -8241,6 +8580,15 @@ impl MiniMarkGC {
                 (*hdr).clear_flag(GcFlags::GCFLAG_NO_HEAP_PTRS);
                 self.prebuilt_root_objects.push(obj.0);
             }
+        }
+        // `_add_to_more_objects_to_trace_if_black` is the MARKING arm of
+        // `_minor_collection`. A store after that arm, when the next step is
+        // a major that empties the worklist (`do_collect_oldgen_nonmoving`,
+        // or the increment that calls `finish_incremental_marking`), would
+        // otherwise leave new children white. Re-grey the modified black
+        // object here so `visit` / `mark_object` retraces it.
+        if self.gc_state == GcState::Marking {
+            self.add_to_more_objects_to_trace_if_black(obj.0);
         }
     }
 
@@ -13317,6 +13665,30 @@ mod tests {
     }
 
     #[test]
+    fn write_barrier_during_marking_regreys_a_black_parent() {
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+        let parent = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
+        let child = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
+        unsafe {
+            (*header_of(parent.0)).set_flag(GcFlags::GCFLAG_VISITED);
+            (*header_of(parent.0)).set_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS);
+            *(parent.0 as *mut GcRef) = child;
+        }
+        gc.gc_state = GcState::Marking;
+        gc.incr_state.gray_stack.clear();
+        gc.incr_state.more_gray_stack.clear();
+        gc.do_write_barrier(parent);
+        assert!(
+            gc.incr_state.more_gray_stack.contains(&parent.0),
+            "MARKING write barrier must re-grey a black parent"
+        );
+        gc.drain_marking_worklists();
+        assert!(unsafe { (*header_of(child.0)).has_flag(GcFlags::GCFLAG_VISITED) });
+    }
+
+    #[test]
     fn test_incremental_marking_completes() {
         // A full incremental cycle (start -> repeated steps -> sweep)
         // produces the same result as a stop-the-world full collection:
@@ -13452,7 +13824,7 @@ mod tests {
         MiniMarkGC::with_config(GcConfig {
             nursery_size,
             large_object_threshold: nursery_size / 2,
-            debug: 1,
+            debug: 2,
             ..GcConfig::default()
         })
     }
@@ -13475,7 +13847,7 @@ mod tests {
         assert!(!gc.is_in_nursery(root.0), "the object promoted");
 
         unsafe { (*header_of(root.0)).set_flag(GcFlags::GCFLAG_VISITED_RMY) };
-        gc.debug_check_consistency();
+        gc.debug_check_consistency_at("unspecified");
     }
 
     /// The same walk over a heap nothing has broken reports nothing, so the
@@ -13488,8 +13860,31 @@ mod tests {
         let mut root = obj;
         unsafe { gc.roots.add(&mut root) };
         gc.do_collect_nursery();
-        gc.debug_check_consistency();
+        gc.debug_check_consistency_at("unspecified");
         gc.roots.clear();
+    }
+
+    /// incminimark.py `_debug_check_not_white`: a black parent must not point
+    /// at a white child. The walk starts from roots, so rooting the parent is
+    /// enough to reach the edge.
+    #[test]
+    #[should_panic(expected = "black -> white pointer found")]
+    fn debug_check_marking_rejects_black_to_white() {
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = debug_gc(4096);
+        let child_tid = gc.register_type(TypeInfo::simple(16));
+        let parent_tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+        let child = gc.alloc_in_oldgen_clear(child_tid, GcHeader::SIZE + 16);
+        let parent = gc.alloc_in_oldgen_clear(parent_tid, GcHeader::SIZE + ptr_size);
+        unsafe { *(parent.0 as *mut GcRef) = child };
+        let mut root = parent;
+        unsafe { gc.roots.add(&mut root) };
+        gc.gc_state = GcState::Marking;
+        unsafe {
+            (*header_of(parent.0)).set_flag(GcFlags::GCFLAG_VISITED);
+            (*header_of(parent.0)).set_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS);
+        }
+        gc.debug_check_consistency_at("unspecified");
     }
 
     /// Without the level the body returns before the first assertion, so the
@@ -13505,7 +13900,7 @@ mod tests {
         gc.do_collect_nursery();
 
         unsafe { (*header_of(root.0)).set_flag(GcFlags::GCFLAG_VISITED_RMY) };
-        gc.debug_check_consistency();
+        gc.debug_check_consistency_at("unspecified");
         unsafe { (*header_of(root.0)).clear_flag(GcFlags::GCFLAG_VISITED_RMY) };
         gc.roots.clear();
     }
@@ -13528,7 +13923,7 @@ mod tests {
         gc.oldgen.sweep_prepare();
         assert!(gc.oldgen.rawmalloc_sweep_pending());
         assert_eq!(gc.gc_state, GcState::Scanning);
-        gc.debug_check_consistency();
+        gc.debug_check_consistency_at("unspecified");
     }
 
     #[test]
@@ -15263,6 +15658,55 @@ cache size\t: 8192 kB\n";
         assert_eq!(after.0, target_root.0);
         assert_eq!(gc.old_objects_with_weakrefs.len(), 1);
 
+        gc.roots.clear();
+    }
+
+    /// `gc_step_until` runs `_minor_collection`'s MARKING `if_black` before
+    /// every major step. `do_collect_oldgen_nonmoving` finishes an in-progress
+    /// MARKING cycle with no minor; a black remembered parent must still be
+    /// retraced so a white old child stored since the last visit survives.
+    #[test]
+    fn nonmoving_major_regreys_remembered_black_parents() {
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+
+        let child = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
+        unsafe { *(child.0 as *mut GcRef) = GcRef::NULL };
+        let parent = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
+        unsafe { *(parent.0 as *mut GcRef) = GcRef::NULL };
+        let mut root = parent;
+        unsafe { gc.roots.add(&mut root) };
+
+        gc.set_mark_budget(1);
+        gc.start_incremental_cycle();
+        assert_eq!(gc.gc_state, GcState::Marking);
+        let mut steps = 0;
+        while gc.gc_state == GcState::Marking
+            && (gc.incr_state.gray_stack.contains(&parent.0)
+                || gc.incr_state.more_gray_stack.contains(&parent.0))
+        {
+            gc.incremental_mark_step();
+            steps += 1;
+            assert!(steps < 50, "parent should leave the marking worklist");
+        }
+        if gc.gc_state != GcState::Marking {
+            gc.roots.clear();
+            return;
+        }
+        assert!(unsafe { (*header_of(parent.0)).has_flag(GcFlags::GCFLAG_VISITED) });
+        assert!(unsafe { !(*header_of(child.0)).has_flag(GcFlags::GCFLAG_VISITED) });
+
+        gc.do_write_barrier(parent);
+        unsafe { *(parent.0 as *mut GcRef) = child };
+        assert!(gc.old_objects_pointing_to_young.contains(&parent.0));
+
+        gc.do_collect_oldgen_nonmoving();
+        assert_eq!(
+            gc.oldgen.object_count(),
+            2,
+            "white old child stored into a black remembered parent must survive the non-moving finish"
+        );
         gc.roots.clear();
     }
 

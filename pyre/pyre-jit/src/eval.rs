@@ -733,10 +733,11 @@ unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     let dict = unsafe { &mut *(obj_addr as *mut pyre_object::dictmultiobject::W_DictObject) };
     f(&mut dict.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     let strategy = unsafe { pyre_object::dictmultiobject::w_dict_get_strategy(w_dict) };
-    // Keep the stable leaf storage box alive by forwarding its owning
-    // `dstorage` field slot (off-GC storage). The box has no walker
-    // of its own; `walk_gc_refs` below forwards the interior PyObjectRef
-    // slots, matching the mapdict / set-items leaf-storage pattern. Only the
+    // Keep the storage box alive by forwarding its owning `dstorage` field
+    // slot. The box's own custom_trace (`object_dict_storage_custom_trace`)
+    // walks keys and values the way `dicttable` does; `walk_gc_refs` below
+    // is the same walk from the dict so a visit of either object greys the
+    // entries. Only the
     // storage-box strategies own their `dstorage`: a MapDictStrategy
     // `dstorage` is the backing instance and a ClassDictStrategy
     // `dstorage` is the type (GC edges that `walk_gc_refs` forwards),
@@ -762,6 +763,96 @@ unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
         f(slot as *mut majit_ir::GcRef);
     };
     unsafe { strategy.walk_gc_refs(w_dict, &mut adapter) };
+}
+
+/// `rordereddict.py` `dicttable` / `dictentry`: the storage box is a
+/// GcStruct whose trace walks every key and value. A write barrier that
+/// remembers this box (not the owning `W_DictObject`) must retrace the
+/// entries on the next `visit`.
+unsafe fn object_dict_storage_custom_trace(
+    obj_addr: usize,
+    f: &mut dyn FnMut(*mut majit_ir::GcRef),
+) {
+    let storage = &mut *(obj_addr as *mut pyre_object::dictmultiobject::ObjectDictStorage);
+    for (key, value) in storage.iter_mut() {
+        let key_ptr = key as *const pyre_object::dictmultiobject::ObjectKey
+            as *mut pyre_object::dictmultiobject::ObjectKey;
+        f(std::ptr::addr_of_mut!((*key_ptr).obj) as *mut majit_ir::GcRef);
+        f(value as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    }
+}
+
+/// Module-dict `dstorage` is the same dicttable shape keyed by owned
+/// `String`s: only the value slots are GC references.
+unsafe fn module_dict_storage_custom_trace(
+    obj_addr: usize,
+    f: &mut dyn FnMut(*mut majit_ir::GcRef),
+) {
+    let storage = &mut *(obj_addr as *mut pyre_object::celldict::ModuleDictStorage);
+    for value in storage.iter_values_mut() {
+        let mut forward = |slot: &mut pyre_object::PyObjectRef| {
+            f(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+        };
+        pyre_object::celldict::walk_module_value_slot(value, &mut forward);
+    }
+}
+
+/// `identitydict.py` traces `list[W_Root]` keys and values. The box is
+/// `dicttable`; greying it must grey every identity key and value.
+unsafe fn identity_dict_storage_custom_trace(
+    obj_addr: usize,
+    f: &mut dyn FnMut(*mut majit_ir::GcRef),
+) {
+    let storage = &mut *(obj_addr as *mut pyre_object::identitydict::IdentityDictStorage);
+    for (key, value) in storage.iter_mut() {
+        let key_ptr = key as *const pyre_object::identitydict::IdentityKey
+            as *mut pyre_object::identitydict::IdentityKey;
+        f(std::ptr::addr_of_mut!((*key_ptr).0) as *mut majit_ir::GcRef);
+        f(value as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    }
+}
+
+/// `kwargsdict.py` traces both `keys_w` and `values_w` as `list[W_Root]`.
+unsafe fn kwargs_dict_storage_custom_trace(
+    obj_addr: usize,
+    f: &mut dyn FnMut(*mut majit_ir::GcRef),
+) {
+    let storage = &mut *(obj_addr as *mut pyre_object::kwargsdict::KwargsDictStorage);
+    for slot in storage.0.iter_mut() {
+        f(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    }
+    for slot in storage.1.iter_mut() {
+        f(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    }
+}
+
+/// `rerased.new_erasing_pair("integer")`: only values are GC refs.
+unsafe fn int_dict_storage_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let storage = &mut *(obj_addr as *mut pyre_object::dictmultiobject::IntDictStorage);
+    for value in storage.values_mut() {
+        f(value as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    }
+}
+
+/// `rerased.new_erasing_pair("bytes")`: only values are GC refs.
+unsafe fn bytes_dict_storage_custom_trace(
+    obj_addr: usize,
+    f: &mut dyn FnMut(*mut majit_ir::GcRef),
+) {
+    let storage = &mut *(obj_addr as *mut pyre_object::dictmultiobject::BytesDictStorage);
+    for value in storage.values_mut() {
+        f(value as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    }
+}
+
+/// `rdict.py` `dicttable` for a set: each `ObjectKey.obj` is a GC ref.
+unsafe fn set_items_storage_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let storage = &mut *(obj_addr as *mut pyre_object::setobject::SetItemsStorage);
+    for (key, _) in storage.iter_mut() {
+        let key_ptr = key as *const pyre_object::dictmultiobject::ObjectKey
+            as *mut pyre_object::dictmultiobject::ObjectKey;
+        f(std::ptr::addr_of_mut!((*key_ptr).obj) as *mut majit_ir::GcRef);
+    }
 }
 
 /// Custom trace for `W_BytesObject`. `data` points at a GC-managed leaf storage
@@ -1173,10 +1264,10 @@ unsafe fn set_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_
     // releases the last other reference to a frozenset subclass immediately
     // before its instance finalizer resolves `__del__` through that class.
     f(&mut set.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    // Keep the stable leaf storage box alive by forwarding its owning field
-    // slot. The box has no walker of its own; this trace also walks its inner
-    // ObjectKey slots below, matching the mapdict leaf-storage pattern.
-    // A no-GC-hook fallback allocation is not collector-owned.
+    // Keep the storage box alive by forwarding its owning field slot. The
+    // box's own custom_trace also walks ObjectKey.obj, so a visit of either
+    // object greys the elements. A no-GC-hook fallback allocation is not
+    // collector-owned.
     if !set.items.is_null() && pyre_object::gc_hook::try_gc_owns_object(set.items as *mut u8) {
         let items_slot = std::ptr::addr_of_mut!(set.items);
         f(items_slot as *mut majit_ir::GcRef);
@@ -1828,9 +1919,7 @@ fn register_leaf_storage_box<T: 'static>(
 /// does for other traced owners of off-GC allocations.
 ///
 /// As with [`register_leaf_storage_box`], callers must add registrations only
-/// at the absolute tail of [`build_gc`], after all fixed-const type ids. S0 has
-/// no caller so the existing registration order remains unchanged.
-#[allow(dead_code)]
+/// at the absolute tail of [`build_gc`], after all fixed-const type ids.
 fn register_traced_storage_box<T: 'static>(
     gc: &mut dyn majit_gc::GcAllocator,
     custom_trace: majit_gc::trace::CustomTraceFn,
@@ -4573,63 +4662,66 @@ fn build_gc() -> Box<MiniMarkGC> {
     twister_descr.gc_type_id.set(twister_tid);
     // PyPy setobject.py:875/963 stores a copied r_dict behind the set's GC
     // pointer field; rdict.py:210 makes that table a GcStruct("dicttable").
-    // The box is a leaf because `set_object_custom_trace` owns both edges:
-    // it greys this box through `items` and forwards every ObjectKey.obj slot.
-    // Keep this runtime id at the absolute registration tail.
-    register_leaf_storage_box::<pyre_object::setobject::SetItemsStorage>(
+    // The box's custom_trace walks ObjectKey.obj the way dicttable does, so a
+    // write barrier that remembers the box (not the set header) still greys
+    // the elements. Keep this runtime id at the absolute registration tail.
+    register_traced_storage_box::<pyre_object::setobject::SetItemsStorage>(
         &mut gc,
+        set_items_storage_custom_trace,
         pyre_object::gc_storage::storage_box_destructor::<pyre_object::setobject::SetItemsStorage>,
         pyre_object::setobject::set_set_items_gc_type_id,
     );
-    // Regular-dict `dstorage` storage boxes (off-GC storage).
-    // dictmultiobject.py:47 `dstorage` erases an `r_dict` = GcStruct("dicttable")
-    // (rdict.py:210); each concrete strategy backs it with a native container
-    // now living in a GC-managed leaf box. `dict_object_custom_trace` greys the
-    // box through the `dstorage` field slot and `DictStrategy::walk_gc_refs`
-    // forwards the interior PyObjectRef slots — same leaf contract as the set
-    // items box. Keep these runtime ids at the absolute registration tail.
-    register_leaf_storage_box::<pyre_object::dictmultiobject::ObjectDictStorage>(
+    // Regular-dict `dstorage` storage boxes. dictmultiobject.py `W_DictMultiObject.dstorage`
+    // erases an `r_dict` = GcStruct("dicttable") (rdict.py `dicttable`); each concrete
+    // strategy backs it with a native container in a GC-managed box whose
+    // custom_trace walks the interior PyObjectRef slots the way dicttable
+    // does. Keep these runtime ids at the absolute registration tail.
+    register_traced_storage_box::<pyre_object::dictmultiobject::ObjectDictStorage>(
         &mut gc,
+        object_dict_storage_custom_trace,
         pyre_object::gc_storage::storage_box_destructor::<
             pyre_object::dictmultiobject::ObjectDictStorage,
         >,
         pyre_object::dictmultiobject::set_object_dict_storage_gc_type_id,
     );
-    register_leaf_storage_box::<pyre_object::dictmultiobject::IntDictStorage>(
+    register_traced_storage_box::<pyre_object::dictmultiobject::IntDictStorage>(
         &mut gc,
+        int_dict_storage_custom_trace,
         pyre_object::gc_storage::storage_box_destructor::<
             pyre_object::dictmultiobject::IntDictStorage,
         >,
         pyre_object::dictmultiobject::set_int_dict_storage_gc_type_id,
     );
-    register_leaf_storage_box::<pyre_object::dictmultiobject::BytesDictStorage>(
+    register_traced_storage_box::<pyre_object::dictmultiobject::BytesDictStorage>(
         &mut gc,
+        bytes_dict_storage_custom_trace,
         pyre_object::gc_storage::storage_box_destructor::<
             pyre_object::dictmultiobject::BytesDictStorage,
         >,
         pyre_object::dictmultiobject::set_bytes_dict_storage_gc_type_id,
     );
-    register_leaf_storage_box::<pyre_object::identitydict::IdentityDictStorage>(
+    register_traced_storage_box::<pyre_object::identitydict::IdentityDictStorage>(
         &mut gc,
+        identity_dict_storage_custom_trace,
         pyre_object::gc_storage::storage_box_destructor::<
             pyre_object::identitydict::IdentityDictStorage,
         >,
         pyre_object::identitydict::set_identity_dict_storage_gc_type_id,
     );
-    register_leaf_storage_box::<pyre_object::kwargsdict::KwargsDictStorage>(
+    register_traced_storage_box::<pyre_object::kwargsdict::KwargsDictStorage>(
         &mut gc,
+        kwargs_dict_storage_custom_trace,
         pyre_object::gc_storage::storage_box_destructor::<pyre_object::kwargsdict::KwargsDictStorage>,
         pyre_object::kwargsdict::set_kwargs_dict_storage_gc_type_id,
     );
-    // Module-dict `dstorage`, holder and owner storage boxes (off-GC storage
-    // epic S3). `module_dict_object_custom_trace` greys each box through its
-    // field slot and `w_module_dict_walk_gc_cells` forwards the interior
-    // PyObjectRef slots — same leaf contract as the regular-dict boxes above.
-    // The post-switch `dstorage` reuses the ObjectDictStorage box tid
-    // registered above (identical `IndexMap<ObjectKey, PyObjectRef>` type), so
-    // it needs no separate registration. Keep these ids at the absolute tail.
-    register_leaf_storage_box::<pyre_object::celldict::ModuleDictStorage>(
+    // Module-dict `dstorage`, holder and owner storage boxes. The traced
+    // `ModuleDictStorage` box walks value slots; strategy/owner boxes are
+    // leaves (no inner GC refs). The post-switch `dstorage` reuses the
+    // ObjectDictStorage box tid registered above. Keep these ids at the
+    // absolute tail.
+    register_traced_storage_box::<pyre_object::celldict::ModuleDictStorage>(
         &mut gc,
+        module_dict_storage_custom_trace,
         pyre_object::gc_storage::storage_box_destructor::<pyre_object::celldict::ModuleDictStorage>,
         pyre_object::celldict::set_module_dict_storage_gc_type_id,
     );

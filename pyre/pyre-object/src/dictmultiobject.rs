@@ -1249,8 +1249,18 @@ impl W_DictMultiObject for W_DictObject {
 }
 
 #[inline]
-fn dict_write_barrier(obj: PyObjectRef) {
+pub(crate) fn dict_write_barrier(obj: PyObjectRef) {
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    // `rordereddict.py` `dicttable` is the object the write barrier
+    // remembers: entries live in `dstorage`. A no-GC-hook fallback box
+    // is not collector-owned.
+    if obj.is_null() {
+        return;
+    }
+    let dstorage = unsafe { (*(obj as *const W_DictObject)).dstorage };
+    if !dstorage.is_null() && crate::gc_hook::try_gc_owns_object(dstorage) {
+        crate::gc_hook::try_gc_write_barrier(dstorage);
+    }
 }
 
 /// `pypy/objspace/std/dictmultiobject.py W_DictObject.get_strategy`

@@ -292,7 +292,7 @@ impl DictStrategy for IdentityDictStrategy {
             if w_dict_store_identity_strategy(w_dict, w_key, w_value) {
                 crate::dictmultiobject::w_dict_bump_keys_version(w_dict);
             }
-            crate::gc_hook::try_gc_write_barrier(w_dict as *mut u8);
+            crate::dictmultiobject::dict_write_barrier(w_dict);
             return;
         }
         self.switch_to_object_strategy(w_dict);

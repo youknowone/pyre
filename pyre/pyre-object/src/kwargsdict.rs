@@ -247,7 +247,7 @@ impl DictStrategy for KwargsDictStrategy {
             for i in 0..storage.0.len() {
                 if crate::dictmultiobject::dict_keys_equal(kwargs_at(&storage.0, i), w_key) {
                     *kwargs_at_mut(&mut storage.1, i) = w_value;
-                    crate::gc_hook::try_gc_write_barrier(w_dict as *mut u8);
+                    crate::dictmultiobject::dict_write_barrier(w_dict);
                     return;
                 }
             }
@@ -259,7 +259,7 @@ impl DictStrategy for KwargsDictStrategy {
             storage.0.push(w_key);
             storage.1.push(w_value);
             crate::dictmultiobject::w_dict_bump_keys_version(w_dict);
-            crate::gc_hook::try_gc_write_barrier(w_dict as *mut u8);
+            crate::dictmultiobject::dict_write_barrier(w_dict);
             return;
         }
         self.switch_to_object_strategy(w_dict);
