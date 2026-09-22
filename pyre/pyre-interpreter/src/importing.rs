@@ -1569,6 +1569,24 @@ fn init_tracemalloc(ns: PyObjectRef) -> Result<(), crate::PyError> {
     Ok(())
 }
 
+/// `MixedModule._load_lazily` builds `BuiltinFunction(func)` for a function
+/// that sits directly in the module. The carrier is a globals-less `Function`
+/// with no instance dict — the `demote_module_function_to_builtin` condition —
+/// or an object already tagged `BuiltinFunction`. A carrier the GC already
+/// owns is traced from the module dict and stays in place.
+///
+/// # Safety
+/// `value` must be a valid object pointer. Null fails the type check.
+unsafe fn untraced_mixed_module_function(value: PyObjectRef) -> bool {
+    let carrier = if unsafe { py_type_check(value, &crate::function::FUNCTION_TYPE) } {
+        let func = unsafe { &*(value as *const crate::function::Function) };
+        func.w_func_globals_obj.is_null() && func.w_func_dict.is_null()
+    } else {
+        unsafe { py_type_check(value, &crate::function::BUILTIN_FUNCTION_TYPE) }
+    };
+    carrier && !pyre_object::gc_hook::try_gc_owns_object(value as *mut u8)
+}
+
 /// Try to load a builtin module by name.
 ///
 /// PyPy equivalent: `find_module()` → C_BUILTIN path →
@@ -1608,6 +1626,13 @@ pub(crate) fn load_builtin_module(name: &str) -> Result<Option<PyObjectRef>, cra
     );
     // Run module-specific initializer (PyPy: interpleveldefs)
     (module_def.init)(w_dict)?;
+    // One flag for the holder and the module object. Before `sys.modules`
+    // exists, or for a legacy MixedModule, functions stay Box-immortal and
+    // are retagged in place. A collectible module follows
+    // `MixedModule._load_lazily`: each direct function becomes a fresh GC
+    // `BuiltinFunction` (`BuiltinFunction.__init__`) so the managed module
+    // name and the module object are traced from the module dict.
+    let managed_holder = !sys_modules_dict().is_null() && module_def.collectible;
     // MixedModule parity: interp-level builtin functions carry the module
     // name as `__module__`, so `pickle` can save them by reference
     // (`save_global`) without guessing via `whichmodule`. Snapshot owned
@@ -1620,11 +1645,30 @@ pub(crate) fn load_builtin_module(name: &str) -> Result<Option<PyObjectRef>, cra
         if let Some(value) =
             unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_dict, key) }
         {
+            let value = if managed_holder && unsafe { untraced_mixed_module_function(value) } {
+                // `BuiltinFunction(func)`. Pin the result before the dict
+                // store: until that store it is reachable only from this
+                // local, and `module_ns_store` can allocate. Reload it from
+                // the shadow stack after that store.
+                let created = unsafe { crate::function::builtin_function_new_managed(value) };
+                let created_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(created);
+                crate::module_ns_store(
+                    w_dict,
+                    key,
+                    pyre_object::gc_roots::shadow_stack_get(created_slot),
+                );
+                pyre_object::gc_roots::shadow_stack_get(created_slot)
+            } else {
+                unsafe {
+                    // MixedModule._load_lazily: every function directly in a
+                    // mixed-module is a non-descriptor `BuiltinFunction` (no
+                    // `__get__`), so storing it on a user class does not bind `self`.
+                    crate::function::demote_module_function_to_builtin(value);
+                }
+                value
+            };
             unsafe {
-                // MixedModule._load_lazily: every function directly in a
-                // mixed-module is a non-descriptor `BuiltinFunction` (no
-                // `__get__`), so storing it on a user class does not bind `self`.
-                crate::function::demote_module_function_to_builtin(value);
                 crate::function::builtin_function_set_module(
                     value,
                     pyre_object::gc_roots::shadow_stack_get(save_point + 1),
@@ -1633,7 +1677,8 @@ pub(crate) fn load_builtin_module(name: &str) -> Result<Option<PyObjectRef>, cra
             // The same name on the code object, where the error wordings read
             // it (`math.sqrt() takes exactly one argument`).  A module built by
             // a registration table already stamped its own functions, so this
-            // only reaches the hand-built namespaces.
+            // only reaches the hand-built namespaces. A managed copy shares
+            // `func.code`, so this stamps that code when init did not.
             crate::gateway::with_module(static_name, value);
         }
     }
@@ -1650,7 +1695,7 @@ pub(crate) fn load_builtin_module(name: &str) -> Result<Option<PyObjectRef>, cra
     // audited collectible module follows the PyPy `space.sys.modules` object
     // graph; legacy MixedModules retain the immortal holder until their
     // native/JIT caches have been migrated to traced owners.
-    let module = if sys_modules_dict().is_null() || !module_def.collectible {
+    let module = if !managed_holder {
         pyre_object::w_module_new_aliasing_dict(name, w_dict)
     } else {
         pyre_object::w_module_new_aliasing_dict_managed(name, w_dict)
