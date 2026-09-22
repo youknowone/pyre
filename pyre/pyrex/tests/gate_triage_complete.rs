@@ -117,7 +117,7 @@ fn collect_sources(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
 /// `pyre_env::var` is not `std::env::var`. The qualifiers the real read sites
 /// carry — `::` before `env::var`, `getenv` and `host_os::var`, `.` before
 /// `getenv` and `environ.get` — all clear that boundary.
-const READ_FORMS: [&str; 6] = [
+const READ_FORMS: [&str; 7] = [
     "env::var",
     "env_var",
     "host_os::var",
