@@ -5624,6 +5624,66 @@ pub(crate) fn disarm_folded_inline_callee_after_escape<Sym: WalkSym>(
     Ok(())
 }
 
+/// Publish the opcode this walk is inside onto the portal frame before a
+/// residual that hands that frame to Python.
+///
+/// `try_execute_residual_call_via_executor` does this ahead of a may-force
+/// call. `dispatch_bytecode` writes `last_instr` before every opcode; a
+/// portal loop carries only the merge point's coordinate in its
+/// virtualizable, and a reader inside the residual (`f_lineno` from an
+/// audit hook) otherwise reports that line. The mirror keeps the
+/// tracing-time shadow and live frame on this opcode.
+/// `vable_setfield_descr` is the store compiled code executes: the
+/// following call receives the frame, so the heap cache flushes the lazy
+/// store before the call.
+///
+/// Returns `None` when this walk is inside an inline callee — that frame's
+/// coordinate is [`record_and_publish_inline_callee_last_instr`], and
+/// `vstack_cur_pypc` indexes the outer code.
+pub(crate) fn publish_portal_executing_last_instr<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    frame_op: OpRef,
+    frame_ptr: *mut pyre_interpreter::PyFrame,
+) -> Option<u32> {
+    if current_inline_concrete_frame() != 0 {
+        return None;
+    }
+    let vable_ref = ctx.trace_ctx.standard_virtualizable_box()?;
+    if frame_op != vable_ref {
+        return None;
+    }
+    let py_pc = if ctx.fbw_mode.transparent_helper_subwalk {
+        ctx.fbw_mode
+            .inline_caller_py_pc
+            .unwrap_or(ctx.vstack_cur_pypc)
+    } else {
+        ctx.vstack_cur_pypc
+    };
+    if ctx.fbw_mode.transparent_helper_subwalk && py_pc == 0 {
+        return None;
+    }
+    let last_instr = ctx.trace_ctx.const_int(i64::from(py_pc));
+    crate::trace_opcode::mirror_vable_static_to_boxes(
+        ctx.trace_ctx,
+        "last_instr",
+        last_instr,
+        majit_ir::Value::Int(i64::from(py_pc)),
+    );
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    let idx = info.static_field_index_by_name("last_instr")?;
+    // Parent-struct descr, matching the publish in
+    // `try_execute_residual_call_via_executor`: the vinfo's own static
+    // descr numbers fields in vinfo order, which is not PyFrame's.
+    let descr = info.static_field_struct_descr(idx);
+    ctx.trace_ctx
+        .vable_setfield_descr(vable_ref, last_instr, descr);
+    if !frame_ptr.is_null() {
+        crate::jitcode_dispatch::fbw_note_last_instr_undo(frame_ptr as usize);
+        unsafe { (*frame_ptr).last_instr = py_pc as isize };
+    }
+    Some(py_pc)
+}
+
 pub(crate) fn maybe_walker_vable_and_vrefs_before_residual_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     jit_pc: usize,
@@ -7861,23 +7921,24 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
-    // `sys._getframe()` / `sys._getframe(0)` at the top walk level: publish the
-    // portal virtualizable directly, the shape upstream's
+    // `sys._getframe()` / `sys._getframe(depth)` : publish the per-level red
+    // frame directly, the shape upstream's
     // `@jit.look_inside_iff(jit.isconstant(depth))` produces by tracing the
     // constant-depth walk through.  Like the `locals()` arm this runs BEFORE
     // `try_execute_residual_call_via_executor` arms the vable token protocol,
-    // which is the point: `getframe`'s two `force_frame` calls clear that token
-    // from inside the residual and cost the loop.  Any non-matching shape falls
+    // which is the point: `getframe`'s `mark_as_escaped` / frame forces clear
+    // that token from inside the residual and cost the loop.  Armed audit
+    // hooks stay on this arm too: the walk is still in the trace and only
+    // `trigger_audit_events` is residual.  Any non-matching shape falls
     // through to the generic residual (SAFE).
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate(SpecFold::SysGetframe, || {
+        && let Some(outcome) = spec_gate(SpecFold::SysGetframe, || {
             try_walker_specialize_sys_getframe(ctx, code, op, &r_args, dst)
         })?
-        .is_some()
     {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
+        return Ok((outcome, op.next_pc));
     }
 
     // `function.py funccall_valuestack`'s exact `sys.exc_info` direct path.

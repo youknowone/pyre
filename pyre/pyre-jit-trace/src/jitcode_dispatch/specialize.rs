@@ -14906,9 +14906,11 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
 ///
 /// Returns `None` (fall through to the generic residual) for every other
 /// shape: a rebound `sys._getframe`, a bound receiver, a negative / non-int /
-/// inexact / non-constant depth, a walk with no frame identity, armed audit
-/// hooks, a top-level `topframeref` mismatch with the portal frame, a hop whose
-/// forced `f_backref` is null, or a hop whose result is hidden.
+/// inexact / non-constant depth, a walk with no frame identity, a missing
+/// audit holder, a top-level `topframeref` mismatch with the portal frame, a
+/// hop whose forced `f_backref` is null, or a hop whose result is hidden.
+/// Armed hooks stay on this arm: the walk and `mark_as_escaped` are traced
+/// and only `trigger_audit_events` is residual.
 /// Declines after emission rewind to the pre-specialization trace position and
 /// reset the heap cache before falling through.
 pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
@@ -14917,7 +14919,7 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     op: &DecodedOp,
     r_args: &[OpRef],
     dst: usize,
-) -> Result<Option<()>, DispatchError> {
+) -> Result<Option<DispatchOutcome>, DispatchError> {
     // `sys._getframe()` (2) or `sys._getframe(depth)` (3).
     if !(2..=3).contains(&r_args.len()) {
         return Ok(None);
@@ -14963,13 +14965,16 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     // `audit` takes its `holder.hooks_w is None` early-out (`vm.py`) and the
     // event costs nothing; the emission below pins that read so a later
     // `addaudithook` revokes this loop instead of silently missing the event.
-    // With a hook already installed the event reaches `trigger_audit_events`,
-    // which is `@objectmodel.dont_inline` — a residual call this arm has no
-    // channel for — so it declines and the generic residual `getframe` emits.
+    // With a hook already installed the walk and `mark_as_escaped` stay in
+    // the trace and only `trigger_audit_events` (`@objectmodel.dont_inline`)
+    // is a residual. Declining the whole arm would residualise `getframe`,
+    // whose `force_frame` clears the virtualizable token and the retrace
+    // never becomes a bridge.
     let audit_holder = pyre_interpreter::module::sys::vm::audit_holder_ptr();
-    if audit_holder.is_null() || pyre_interpreter::module::sys::vm::audit_hooks_armed() {
+    if audit_holder.is_null() {
         return Ok(None);
     }
+    let hooks_armed = pyre_interpreter::module::sys::vm::audit_hooks_armed();
     // Every MIFrame owns one red frame. At the root that is the standard
     // virtualizable; inside an inline sub-walk it is the callee frame seeded in
     // `dispatch_inline_call_dr_kind` and carried by `CalleeLocalsShadow`.
@@ -15390,16 +15395,58 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     // effect here too — the residual would have applied it before returning.
     unsafe { (*cur_ptr).mark_as_escaped() };
 
-    // `audit(space, "sys._getframe", [f])` — vm.py.  The gate above resolved
-    // it to the no-hook early-out, so all that is emitted is the marker for the
-    // read that reached that conclusion.
-    walker_pin_audit_hooks(ctx, op.pc, audit_holder)?;
-
     // `return f` — at depth 0 `cur_op` is still the standard virtualizable
     // `_do_jit_force_virtual` hands back as `standard_box`; each hop above
-    // advanced it to the frame the walk settled on.
+    // advanced it to the frame the walk settled on. The result stays that
+    // box: returning the audit call's box would hide the virtualizable, and
+    // the loop's later `f.f_lineno` would residualise into a force.
+    if !hooks_armed {
+        // The no-hook early-out: pin the quasi-immutable read so a later
+        // `addaudithook` revokes this loop.
+        walker_pin_audit_hooks(ctx, op.pc, audit_holder)?;
+        write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', cur_op)?;
+        return Ok(Some(DispatchOutcome::Continue));
+    }
+
+    // Depth 0 returns the frame executing this call. Publish that opcode
+    // before the hook reads `f_lineno`. An ancestor (depth > 0) keeps the
+    // coordinate its own caller CALL left on it.
+    if depth_value == 0 {
+        residual_call::publish_portal_executing_last_instr(ctx, cur_op, cur_ptr);
+    }
+    maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
+    let returned = pyre_interpreter::module::sys::vm::jit_audit_sys_getframe(
+        cur_ptr as pyre_object::PyObjectRef,
+    );
+    let effect = majit_ir::EffectInfo::new(
+        majit_ir::ExtraEffect::ForcesVirtualOrVirtualizable,
+        majit_ir::OopSpecIndex::None,
+    );
+    ctx.trace_ctx.call_void_typed_with_effect(
+        pyre_interpreter::module::sys::vm::jit_audit_sys_getframe as *const (),
+        &[cur_op],
+        &[majit_ir::Type::Ref],
+        effect,
+    );
+    if returned.is_null() {
+        let exc = pyre_interpreter::eval::get_current_exception();
+        let exc_op = ctx.trace_ctx.const_ref(exc as i64);
+        ctx.set_last_exc_value(exc_op, ConcreteValue::Ref(exc));
+        walker_record_guard_exception(ctx, op.pc);
+        let exc_concrete = ctx.last_exc_value_concrete();
+        let exc_box = ctx.last_exc_value().unwrap_or(exc_op);
+        return Ok(Some(DispatchOutcome::SubRaise {
+            exc: exc_box,
+            exc_concrete,
+        }));
+    }
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', cur_op)?;
-    Ok(Some(()))
+    ctx.live_after_jit_pc = op.next_pc;
+    ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    Ok(Some(DispatchOutcome::Continue))
 }
 
 // ── the generated `math` float folds ──────────────────────────────────
