@@ -1212,20 +1212,6 @@ unsafe fn jit_setitem_list(
     }
 }
 
-/// `OpcodeStepExecutor::call` is `(r, i) -> v` once `Result<(), PyError>`
-/// is erased. The unique impl is `PyFrame::call` (`call_valuestack`).
-/// A missing fnaddr leaves the symbolic path hash in `execute_call`.
-fn jit_opcode_executor_call(frame: *mut crate::pyframe::PyFrame, nargs: i64) {
-    if frame.is_null() {
-        return;
-    }
-    if let Err(error) =
-        unsafe { crate::pyopcode::OpcodeStepExecutor::call(&mut *frame, nargs as usize) }
-    {
-        let _ = crate::runtime_ops::jit_publish_residual_error(error);
-    }
-}
-
 /// `getitem_tuple` is the same `(r, r) -> r` erasure as `getitem_list`.
 unsafe fn jit_getitem_tuple(
     obj: pyre_object::PyObjectRef,
@@ -1289,23 +1275,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "pyre_interpreter::baseobjspace::setitem_list",
         jit_setitem_list,
-    );
-    p2(
-        &mut entries,
-        "OpcodeStepExecutor::call",
-        jit_opcode_executor_call,
-    );
-    pa2(
-        &mut entries,
-        "pyre_interpreter::pyopcode::OpcodeStepExecutor::call",
-        "pyre_interpreter::OpcodeStepExecutor::call",
-        jit_opcode_executor_call,
-    );
-    pa2(
-        &mut entries,
-        "pyre_interpreter::eval::PyFrame::call",
-        "PyFrame::call",
-        jit_opcode_executor_call,
     );
     p0(
         &mut entries,
