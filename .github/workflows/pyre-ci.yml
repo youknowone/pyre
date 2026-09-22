@@ -21,10 +21,10 @@ on:
       - ".pre-commit-config.yaml"
   pull_request:
     branches: [ "main", "py3.[0-9]+" ]
-    # `ready_for_review` beside the defaults: a draft runs the Linux legs only
-    # (see prepare-charon-llbc-macos), so leaving draft has to start the run
-    # that carries the other two platforms.
-    types: [opened, synchronize, reopened, ready_for_review]
+    # Leaving draft no longer starts a run. `pyre-ci-ready.yml` re-runs this
+    # run's `platform gate` job instead. The gate and its dependents are the
+    # only jobs that run again.
+    types: [opened, synchronize, reopened]
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
@@ -110,6 +110,36 @@ jobs:
       run: |
         python3 pyre/scripts/cpyext-abi.py check
         python3 pyre/scripts/cpyext-abi.py generate --check
+
+  platform-gate:
+    name: platform gate
+    runs-on: ubuntu-24.04
+    # A separate job so that re-running it re-runs only the platform legs.
+    # A re-run of `pre-commit` would re-run everything, because every job
+    # needs it. The draft state is read live through the API: a re-run
+    # attempt keeps the original event payload, so
+    # `github.event.pull_request.draft` stays `true` after the PR has left
+    # draft.
+    permissions:
+      pull-requests: read
+    outputs:
+      run: ${{ steps.draft.outputs.run }}
+    steps:
+    - id: draft
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PR: ${{ github.event.pull_request.number }}
+      run: |
+        if [ -z "$PR" ]; then
+          echo "run=true" >> "$GITHUB_OUTPUT"
+        else
+          draft="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" --jq .draft)"
+          if [ "$draft" = "true" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+        fi
 
   prepare-charon-llbc-linux:
     name: prepare Charon/LLBC (ubuntu-24.04)
@@ -522,12 +552,13 @@ jobs:
     # two platforms to `main` is worse again: 7 runs in that window went red
     # only on macOS or Windows, and under that rule they would have landed
     # first.
-    needs: pre-commit
-    # A draft PR runs Linux alone. The macOS and Windows legs were half of all
+    needs: [pre-commit, platform-gate]
+    # A draft PR runs Linux alone. `platform gate` is the job whose `run`
+    # output this `if` reads. The macOS and Windows legs were half of all
     # runner time over the 120 runs of 2026-09-17..18, and a draft is pushed to
     # many times before anyone asks whether it is portable. Every job of the
     # two platforms hangs off its prepare job, so skipping here skips them all.
-    if: ${{ github.event.pull_request.draft != true }}
+    if: ${{ needs.platform-gate.outputs.run == 'true' }}
     env: *charon-llbc-env
     steps: *prepare-charon-llbc-steps
 
@@ -542,8 +573,8 @@ jobs:
       actions: write
     # See prepare-charon-llbc-macos for why `pre-commit` is the only wait,
     # and for the draft condition.
-    needs: pre-commit
-    if: ${{ github.event.pull_request.draft != true }}
+    needs: [pre-commit, platform-gate]
+    if: ${{ needs.platform-gate.outputs.run == 'true' }}
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.05.29
