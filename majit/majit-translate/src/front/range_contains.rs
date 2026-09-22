@@ -1,4 +1,4 @@
-//! `(a..=b).contains(&x)` → `bitand(le(a, x), ge(b, x))`.
+//! `(a..=b).contains(&x)` → `int_between(a, x, b + 1)`.
 //!
 //! ## Positioning
 //!
@@ -14,23 +14,23 @@
 //! wall: it is emitted before `contains`, so the translation loop's
 //! failure surfaces on `new` first.
 //!
-//! The membership test `a <= x && b >= x` has a native lowering — two
-//! integer comparisons joined by a native bitwise-and, exactly the
-//! `a <= x <= b` shape the rtyper lowers.  This pass reproduces it:
+//! `int_between(n, m, p)` is the predicate `n <= m < p` (it assumes
+//! `n <= p`).  `RangeInclusive` is `a <= x <= b`, so the exclusive upper
+//! bound is `b + 1`:
 //!
 //! ```text
 //!     r = RangeInclusive::new(a, b)          // residual `new` call (block N)
 //!     ...
 //!     t = r.contains(&x)                     // residual `contains` call (block C)
 //! becomes
-//!     lo_le  = le(a, x)                      // a <= x
-//!     hi_ge  = ge(b, x)                      // b >= x
-//!     t      = bitand(lo_le, hi_ge)          // (block C)
+//!     upper = b + 1                          // constant when `b` is
+//!     t     = int_between(a, x, upper)      // a <= x < b + 1
 //! ```
 //!
-//! `le` / `ge` / `bitand` are all pure native binops (CSE/DCE-safe);
-//! `bitand`, not bare `and`, is emitted — bare `and`/`or` are reserved
-//! for short-circuit control flow and rejected downstream.
+//! A constant `b` of `i64::MAX` has no representable successor, and a
+//! non-constant `b` may be `i64::MAX` at run time; both keep the two
+//! comparisons `bitand(le(a, x), ge(b, x))`.  Exclusive `Range` (`a..b`, which
+//! is already `a <= x < b`) is not rewritten here.
 //!
 //! ## Cross-block shape
 //!
@@ -83,15 +83,15 @@ pub(crate) struct RangeInclusiveNewSite {
     /// The `new` call result (the `RangeInclusive` value) — locates the
     /// producer op and matches the `contains` receiver.
     pub result_var: Variable,
-    /// Lower bound `a` — the `le(a, x)` left operand.
+    /// Lower bound `a` — `int_between`'s first operand.
     pub lo: Variable,
-    /// Upper bound `b` — the `ge(b, x)` left operand.
+    /// Inclusive upper bound `b`.  The op's exclusive limit is `b + 1`.
     pub hi: Variable,
 }
 
 /// A recognized `RangeInclusive::contains(&self, &x)` call site captured
 /// during body lowering (`front::mir`).  Carries the result var (the
-/// membership bool) — the fold reuses it for the final `bitand`.
+/// membership bool) — the fold reuses it for `int_between`.
 #[derive(Clone)]
 pub(crate) struct RangeContainsSite {
     /// The `contains` call result (the membership `bool`) — locates the
@@ -99,8 +99,8 @@ pub(crate) struct RangeContainsSite {
     pub result_var: Variable,
 }
 
-/// Rewrite every recorded `(a..=b).contains(&x)` call site into the
-/// native `bitand(le(a, x), ge(b, x))` compare pair.  Fail-safe: a site
+/// Rewrite every recorded `(a..=b).contains(&x)` call site into
+/// `int_between(a, x, b + 1)`.  Fail-safe: a site
 /// that does not match the expected cross-block `new` → `contains` shape
 /// is left untouched (both residual calls survive, census Skip).  Returns
 /// the number of sites rewritten.
@@ -214,18 +214,10 @@ fn rewire_one_range_contains_site(
         ));
     }
 
-    // 6. Splice the compares into block C, replacing the `contains` op in
-    //    place and reusing its result Variable for the final `bitand`.
-    let lo_le = graph.alloc_value_var();
-    let hi_ge = graph.alloc_value_var();
-    let inserts = build_range_contains_compares(
-        &site.result_var,
-        lo_in_c,
-        hi_in_c,
-        x.into_variable(),
-        lo_le,
-        hi_ge,
-    );
+    // 6. Splice `int_between` into block C, replacing the `contains` op
+    //    in place and reusing its result Variable.
+    let inserts =
+        build_range_contains_compares(graph, &site.result_var, lo_in_c, hi_in_c, x.into_variable());
     let ops = &mut graph.blocks[c_idx].operations;
     ops.remove(call_idx);
     for (offset, op) in inserts.into_iter().enumerate() {
@@ -467,19 +459,50 @@ fn remove_op_by_result(graph: &mut FunctionGraph, result_var: &Variable) {
     }
 }
 
-/// Build the three native compare ops that replace `contains`:
-/// `lo_le = le(lo, x)`, `hi_ge = ge(hi, x)`, `result = bitand(lo_le, hi_ge)`.
-/// All `ValueType::Int` (bools fold to the int kind), reusing
-/// `result_var` for the final `bitand` so downstream reads are unchanged.
-fn build_range_contains_compares(
+/// The signed constant `var` is produced by, if its single producer is
+/// `ConstInt`.
+fn const_int_of(graph: &FunctionGraph, var: &Variable) -> Option<i64> {
+    graph.blocks.iter().find_map(|block| {
+        block
+            .operations
+            .iter()
+            .find_map(|op| match (&op.result, &op.kind) {
+                (Some(result), OpKind::ConstInt(value)) if result == var => Some(*value),
+                _ => None,
+            })
+    })
+}
+
+/// `int_between(lo, x, upper)` bound to `result_var`.  The result is a
+/// 0/1 integer in the signed register bank.
+fn int_between_op(
+    result_var: &Variable,
+    lo: Variable,
+    x: Variable,
+    upper: Variable,
+) -> SpaceOperation {
+    FunctionGraph::set_concretetype_of_inline(result_var, crate::model::ConcreteType::Signed);
+    SpaceOperation {
+        result: Some(result_var.clone()),
+        kind: OpKind::LoweredBlackholeOp {
+            opname: "int_between".to_string(),
+            args: vec![lo, x, upper],
+        },
+    }
+}
+
+/// `lo <= x <= hi` when `hi + 1` does not fit in `i64`:
+/// `bitand(le(lo, x), ge(hi, x))`.
+fn build_range_contains_compare_pair(
+    graph: &mut FunctionGraph,
     result_var: &Variable,
     lo: Variable,
     hi: Variable,
     x: Variable,
-    lo_le: Variable,
-    hi_ge: Variable,
-) -> [SpaceOperation; 3] {
-    [
+) -> Vec<SpaceOperation> {
+    let lo_le = graph.alloc_value_var();
+    let hi_ge = graph.alloc_value_var();
+    vec![
         SpaceOperation {
             result: Some(lo_le.clone()),
             kind: OpKind::BinOp {
@@ -508,6 +531,40 @@ fn build_range_contains_compares(
             },
         },
     ]
+}
+
+/// Replace `contains` with `int_between(lo, x, hi + 1)`.
+///
+/// `int_between(n, m, p)` is `n <= m < p`.  Inclusive `hi` therefore
+/// needs a successor.  A constant `i64::MAX` has none, and that case
+/// keeps the two-comparison form, as does a non-constant `hi`, whose
+/// run-time value may be `i64::MAX`.  Any other constant is materialised
+/// as `ConstInt(hi + 1)`.
+fn build_range_contains_compares(
+    graph: &mut FunctionGraph,
+    result_var: &Variable,
+    lo: Variable,
+    hi: Variable,
+    x: Variable,
+) -> Vec<SpaceOperation> {
+    let exclusive = const_int_of(graph, &hi).map(|value| value.checked_add(1));
+    match exclusive {
+        Some(None) => build_range_contains_compare_pair(graph, result_var, lo, hi, x),
+        Some(Some(upper)) => {
+            let upper_v = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+            vec![
+                SpaceOperation {
+                    result: Some(upper_v.clone()),
+                    kind: OpKind::ConstInt(upper),
+                },
+                int_between_op(result_var, lo, x, upper_v),
+            ]
+        }
+        // A non-constant `hi` may be `i64::MAX` at run time, where `hi + 1`
+        // wraps and `int_between` answers false for every `x`; the two
+        // comparisons are exact for every value.
+        None => build_range_contains_compare_pair(graph, result_var, lo, hi, x),
+    }
 }
 
 #[cfg(test)]
@@ -551,6 +608,47 @@ mod tests {
             .count()
     }
 
+    /// `(result, args)` of every `int_between` in the graph.
+    fn int_between_ops(g: &FunctionGraph) -> Vec<(Variable, Vec<Variable>)> {
+        g.blocks
+            .iter()
+            .flat_map(|blk| &blk.operations)
+            .filter_map(|sop| match &sop.kind {
+                OpKind::LoweredBlackholeOp { opname, args } if opname == "int_between" => Some((
+                    sop.result.clone().expect("int_between result"),
+                    args.clone(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `int_between(lo, x, exclusive)` bound to `result`, and no leftover
+    /// compare pair.
+    fn assert_int_between(
+        g: &FunctionGraph,
+        result: &Variable,
+        lo: &Variable,
+        x: &Variable,
+        exclusive: i64,
+    ) {
+        let sites = int_between_ops(g);
+        assert_eq!(sites.len(), 1, "one int_between, got {sites:?}");
+        let (bound, args) = &sites[0];
+        assert_eq!(bound, result, "int_between reuses the contains result");
+        assert_eq!(args.len(), 3);
+        assert_eq!(&args[0], lo, "lower bound is lo");
+        assert_eq!(&args[1], x, "middle value is x");
+        assert_eq!(
+            const_int_of(g, &args[2]),
+            Some(exclusive),
+            "exclusive upper bound is hi + 1",
+        );
+        assert!(binop_results(g, "le").is_empty(), "no leftover le");
+        assert!(binop_results(g, "ge").is_empty(), "no leftover ge");
+        assert!(binop_results(g, "bitand").is_empty(), "no leftover bitand");
+    }
+
     /// Result Variables of every `BinOp` with the given opname.
     fn binop_results(g: &FunctionGraph, op_name: &str) -> Vec<Variable> {
         g.blocks
@@ -565,8 +663,8 @@ mod tests {
 
     /// Build a two-block `new` → `contains` graph and assert the rewrite
     /// drops both residual FunctionPath calls (`new` + `contains`) and
-    /// emits `le` / `ge` / `bitand` with the `bitand` bound to the
-    /// original `contains` result var.
+    /// emits `int_between(lo, x, hi + 1)` bound to the original
+    /// `contains` result var.
     #[test]
     fn rewrite_folds_new_contains_to_compares() {
         let mut g = FunctionGraph::new("test_range_contains");
@@ -624,14 +722,8 @@ mod tests {
             0,
             "residual contains removed",
         );
-        assert_eq!(binop_results(&g, "le").len(), 1, "one `le` compare emitted");
-        assert_eq!(binop_results(&g, "ge").len(), 1, "one `ge` compare emitted");
-        let bitands = binop_results(&g, "bitand");
-        assert_eq!(bitands.len(), 1, "one `bitand` emitted");
-        assert_eq!(
-            bitands[0], contains,
-            "the bitand reuses the original contains result var",
-        );
+        // `(0..=255).contains` → `int_between(0, x, 256)`.
+        assert_int_between(&g, &contains, &a, &x, 256);
     }
 
     /// A second consumer of the range result (an iterator's stateful
@@ -875,7 +967,7 @@ mod tests {
                 c,
                 OpKind::Call {
                     target: contains_target(),
-                    args: crate::model::call_args(vec![range_in_c.clone(), x]),
+                    args: crate::model::call_args(vec![range_in_c.clone(), x.clone()]),
                     result_ty: ValueType::Int,
                 },
                 true,
@@ -909,7 +1001,7 @@ mod tests {
             &mut g,
             &[RangeInclusiveNewSite {
                 result_var: range,
-                lo: a,
+                lo: a.clone(),
                 hi: b,
             }],
             &[RangeContainsSite {
@@ -930,8 +1022,132 @@ mod tests {
             0,
             "residual contains removed",
         );
-        assert_eq!(binop_results(&g, "le").len(), 1, "one `le` compare emitted");
-        assert_eq!(binop_results(&g, "ge").len(), 1, "one `ge` compare emitted");
-        assert_eq!(binop_results(&g, "bitand").len(), 1, "one `bitand` emitted");
+        assert_int_between(&g, &contains, &a, &x, 256);
+    }
+
+    /// A constant inclusive upper bound of `i64::MAX` has no `hi + 1`.
+    /// Keep the two comparisons rather than wrapping the limit.
+    #[test]
+    fn rewrite_keeps_compares_when_upper_bound_is_i64_max() {
+        let mut g = FunctionGraph::new("test_range_contains_max");
+        let n = g.startblock;
+        let a = g.push_op_var(n, OpKind::ConstInt(0), true).unwrap();
+        let b = g.push_op_var(n, OpKind::ConstInt(i64::MAX), true).unwrap();
+        let range = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: new_target(),
+                    args: crate::model::call_args(vec![a.clone(), b.clone()]),
+                    result_ty: ValueType::Ref(Some("RangeInclusive".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let (c, c_args) = g.create_block_with_arg_vars(1);
+        let range_in_c = c_args[0].clone();
+        let x = g.push_op_var(c, OpKind::ConstInt(42), true).unwrap();
+        let contains = g
+            .push_op_var(
+                c,
+                OpKind::Call {
+                    target: contains_target(),
+                    args: crate::model::call_args(vec![range_in_c, x]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        g.set_return(c, Some(contains.clone()));
+        g.set_goto(n, c, vec![range.clone()]);
+
+        let rewritten = rewire_range_contains_call_sites(
+            &mut g,
+            &[RangeInclusiveNewSite {
+                result_var: range,
+                lo: a,
+                hi: b,
+            }],
+            &[RangeContainsSite {
+                result_var: contains.clone(),
+            }],
+        );
+        assert_eq!(rewritten, 1, "the overflow case still folds");
+        assert!(
+            int_between_ops(&g).is_empty(),
+            "i64::MAX must not wrap into int_between"
+        );
+        assert_eq!(binop_results(&g, "le").len(), 1);
+        assert_eq!(binop_results(&g, "ge").len(), 1);
+        assert_eq!(binop_results(&g, "bitand"), vec![contains]);
+    }
+
+    /// A non-constant inclusive upper bound may be `i64::MAX` at run
+    /// time, so it keeps the two comparisons instead of `int_between`.
+    #[test]
+    fn rewrite_keeps_compares_for_a_nonconstant_upper_bound() {
+        let mut g = FunctionGraph::new("test_range_contains_var_hi");
+        let n = g.startblock;
+        let a = g.push_op_var(n, OpKind::ConstInt(0), true).unwrap();
+        let hi_src = g.push_op_var(n, OpKind::ConstInt(10), true).unwrap();
+        let b = g
+            .push_op_var(
+                n,
+                OpKind::UnaryOp {
+                    op: "neg".to_string(),
+                    operand: hi_src,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let range = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: new_target(),
+                    args: crate::model::call_args(vec![a.clone(), b.clone()]),
+                    result_ty: ValueType::Ref(Some("RangeInclusive".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let (c, c_args) = g.create_block_with_arg_vars(1);
+        let range_in_c = c_args[0].clone();
+        let x = g.push_op_var(c, OpKind::ConstInt(42), true).unwrap();
+        let contains = g
+            .push_op_var(
+                c,
+                OpKind::Call {
+                    target: contains_target(),
+                    args: crate::model::call_args(vec![range_in_c, x.clone()]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        g.set_return(c, Some(contains.clone()));
+        g.set_goto(n, c, vec![range.clone()]);
+
+        let rewritten = rewire_range_contains_call_sites(
+            &mut g,
+            &[RangeInclusiveNewSite {
+                result_var: range,
+                lo: a.clone(),
+                hi: b.clone(),
+            }],
+            &[RangeContainsSite {
+                result_var: contains.clone(),
+            }],
+        );
+        assert_eq!(rewritten, 1);
+        assert!(
+            int_between_ops(&g).is_empty(),
+            "a run-time hi must not be wrapped into int_between"
+        );
+        assert_eq!(binop_results(&g, "le").len(), 1);
+        assert_eq!(binop_results(&g, "ge").len(), 1);
+        assert_eq!(binop_results(&g, "bitand"), vec![contains]);
+        let _ = (a, b, x);
     }
 }

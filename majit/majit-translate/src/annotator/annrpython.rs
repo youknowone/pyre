@@ -2586,6 +2586,12 @@ impl RPythonAnnotator {
                         "uint_lt" if sp.args.len() == 2 => {
                             Some(SomeValue::Bool(super::model::SomeBool::new()))
                         }
+                        // `int_between(n, m, p)` is `n <= m < p`, a bool.
+                        // The front emits it for `(lo..=hi).contains`;
+                        // flowspace has no operator of that name.
+                        "int_between" if sp.args.len() == 3 => {
+                            Some(SomeValue::Bool(super::model::SomeBool::new()))
+                        }
                         _ => None,
                     }
                 };

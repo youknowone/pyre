@@ -11165,6 +11165,9 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         ("strlen/r>i", majit_translate::insns::BC_STRLEN),
         ("strgetitem/ri>i", majit_translate::insns::BC_STRGETITEM),
         ("strgetitem/rc>i", majit_translate::insns::BC_STRGETITEM_C),
+        // `(lo..=hi).contains` emits `int_between/iii>i`. The decoder is
+        // `bhhandler_iii_i!` (`[a][b][c][dst]`), already wired below.
+        ("int_between/iii>i", majit_translate::insns::BC_INT_BETWEEN),
     ] {
         insns.insert(key.to_string(), byte);
     }

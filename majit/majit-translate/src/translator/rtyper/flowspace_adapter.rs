@@ -3186,6 +3186,22 @@ pub fn translate_op(
             fmt_op_result(op),
         ))),
 
+        // `(lo..=hi).contains(&x)` lowered by `front::range_contains`.
+        // `int_between(n, m, p)` is the llop `n <= m < p`.  It is not a
+        // flowspace operator, so it is carried through under its llop
+        // name; `flowin` binds the bool result and `translate_operation`
+        // emits the same llop.
+        OpKind::LoweredBlackholeOp { opname, args }
+            if opname == "int_between" && args.len() == 3 =>
+        {
+            let mut hl_args = Vec::with_capacity(args.len());
+            for (i, var) in args.iter().enumerate() {
+                hl_args.push(lookup_operand(value_map, var, op, &format!("arg{i}"))?);
+            }
+            let result = resolve_result_hlvalue(op, value_map)?;
+            Ok(vec![FlowspaceOp::new("int_between", hl_args, result)])
+        }
+
         // ─── Stage-invariant fail-loud catch-all ───
         // No remaining variants reach here legitimately: every legitimate
         // pre-rtyper input shape has an explicit arm above, every

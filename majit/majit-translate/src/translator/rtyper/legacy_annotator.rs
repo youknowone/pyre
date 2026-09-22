@@ -431,6 +431,8 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
         // kind is a function of the opname.
         OpKind::LoweredBlackholeOp { opname, .. } => match opname.as_str() {
             "strlen" | "unicodelen" | "strgetitem" | "unicodegetitem" => ValueType::Int,
+            // `n <= m < p`, a bool in the signed register bank.
+            "int_between" => ValueType::Bool,
             "newstr" | "newunicode" => ValueType::Ref(None),
             "strsetitem" | "unicodesetitem" | "copystrcontent" | "copyunicodecontent" => {
                 ValueType::Void

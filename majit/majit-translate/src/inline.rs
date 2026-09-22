@@ -1353,14 +1353,19 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         // (`call.rs`) and upstream `lloperation.LL_OPERATIONS` (sideeffects /
         // canfold) make.  The read family
         // (`strlen`/`unicodelen`/`strgetitem`/`unicodegetitem`) is
-        // pure/removable; the alloc/store/copy family
+        // pure/removable, as is `int_between` (`canfold`, no heap effect);
+        // the alloc/store/copy family
         // (`newstr`/`newunicode`/`strsetitem`/`unicodesetitem`/
         // `copystrcontent`/`copyunicodecontent`) mutates.  Any unlisted opname
         // falls through to side-effecting, so the dead-op sweep never drops a
         // store or an allocation by default.
         OpKind::LoweredBlackholeOp { opname, .. } => matches!(
             opname.as_str(),
-            "strlen" | "unicodelen" | "strgetitem" | "unicodegetitem"
+            "strlen"
+                | "unicodelen"
+                | "strgetitem"
+                | "unicodegetitem"
+                | "int_between"
         ),
     }
 }
@@ -1678,8 +1683,14 @@ mod tests {
             })
         };
         // Read family: pure/removable when the result is dead.
-        for name in ["strlen", "unicodelen", "strgetitem", "unicodegetitem"] {
-            assert!(pure(name), "{name} is a pure read");
+        for name in [
+            "strlen",
+            "unicodelen",
+            "strgetitem",
+            "unicodegetitem",
+            "int_between",
+        ] {
+            assert!(pure(name), "{name} is pure");
         }
         // Alloc / store / copy family: side-effecting, must never be dropped.
         for name in [

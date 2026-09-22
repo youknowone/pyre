@@ -1416,6 +1416,8 @@ fn variable_has_bool_repr(
                 op.as_str(),
                 "bool" | "int_is_zero" | "int_is_true" | "ptr_iszero" | "ptr_nonzero"
             ),
+            // `int_between` yields a 0/1 bool, same as an ordered compare.
+            OpKind::LoweredBlackholeOp { opname, .. } if opname == "int_between" => true,
             _ => false,
         }
     }

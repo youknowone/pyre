@@ -2256,6 +2256,21 @@ impl RPythonTyper {
             // `rtype_compare_template`, exactly as `mul` / `lt` route.
             "uint_mul_high" => super::rint::rtype_template(hop, "mul_high"),
             "uint_lt" => super::rint::rtype_compare_template(hop, "lt"),
+            // Front-end `(lo..=hi).contains` emits the llop directly:
+            // `n <= m < p`, result Bool.  Three signed inputs; it cannot raise.
+            "int_between" => {
+                let vlist = hop.inputargs(vec![
+                    ConvertedTo::LowLevelType(&LowLevelType::Signed),
+                    ConvertedTo::LowLevelType(&LowLevelType::Signed),
+                    ConvertedTo::LowLevelType(&LowLevelType::Signed),
+                ])?;
+                hop.exception_cannot_occur()?;
+                Ok(hop.genop(
+                    "int_between",
+                    vlist,
+                    GenopResult::LLType(LowLevelType::Bool),
+                ))
+            }
             // rtyper.py — `translate_op_newtuple` calls the
             // free function `rtuple.rtype_newtuple(hop)` which routes
             // to `TupleRepr._rtype_newtuple`. No per-Repr dispatch.
