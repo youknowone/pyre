@@ -729,7 +729,7 @@ fn finditem_str_named_and_attr_cached_lower() {
         .flat_map(|block| block.operations.iter())
         .filter_map(|op| match &op.kind {
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
+                target: CallTarget::FunctionPath { segments, .. },
                 ..
             } => segments.last().cloned(),
             _ => None,
