@@ -618,6 +618,58 @@ fall from 280 to 240 bytes: that field measures 72 bytes as a
 `SmallVec<[Operand; 3]>` against 32 as a `Vec` header. The remaining allocation traffic is still the
 largest majit-only cost; it is now smaller, not gone.
 
+#### Re-measured 2026-09-23: 1.835x, and the allocation bucket is no longer the largest
+
+Same instrument as the subsection above — retired-instruction slope over
+262,144 → 1,048,576 characters, five timed runs per point, `PYRE_REGEX_ROWS=2`
+so a process-wide counter charges the `and`/`or` row alone. Three rounds, the
+two binaries run back to back inside each round and the leading side
+alternated. 1-minute load 4.6 to 5.6 throughout.
+
+| round | RPython `--opt=jit` | majit | ratio |
+|---|---:|---:|---:|
+| 1 | 11,370 | 20,865 | 1.835 |
+| 2 | 11,372 | 20,855 | 1.834 |
+| 3 | 11,358 | 20,874 | 1.838 |
+
+The three ratios span 0.004. **The denominator arm is the instrument check**:
+RPython reads 11,358–11,372 here against the 11,354 tabulated above, 0.16%
+apart on a binary translated two weeks later. That is what makes this ratio
+comparable to the 2.42x recorded above rather than merely another sitting —
+and it is the check to run before quoting any ratio in this file against an
+older one. Wall clock in the same rounds: majit 666K–708K chars/s against
+RPython 972K–1,086K.
+
+The allocation census, at 65,536 characters, reads **1.3 allocations and
+396.5 B per character**, against the 9.7 and 1,649 recorded above; at 262,144
+it reads 1.2 and 337.4. Both reproduce to the printed digit across repeats,
+as this instrument is supposed to.
+
+That changes which bucket is worth working on. `sample` over the benchmark
+closure's subtree at 1,048,576 characters (1,424 samples), against the table
+at the head of this subsection:
+
+| | 2026-09-04 | 2026-09-23 |
+|---|---:|---:|
+| `malloc`/`free`, flat self time | ~16%, the largest single bucket | **2.2%** |
+| bridge compilation subtree | 44% | 30.5% |
+| ↳ `Optimizer::optimize_bridge` | 21% | 14.5% |
+| blackhole resume subtree | 15% | 20.8% |
+| resume-data decode, flat self time | — | **18.8%** |
+| `_tlv_get_addr` (thread-local access), flat | — | 2.9% |
+
+So "the remaining allocation traffic is still the largest majit-only cost",
+written above, no longer holds: it is 2.2%. The largest identifiable cluster
+is now the resume-data decode path, whose flat leaders are
+`BlackholeInterpreter::run_inner` 8.0%, `resume::blackhole_from_resumedata`
+3.7%, and `ResumeDataDirectReader`'s `decode_ref` 2.9% / `consume_one_section`
+1.9% / `decode_int` 1.6% / `next_int` 1.5%.
+
+One caveat on attribution. 2.42x → 1.835x spans nineteen days and many
+commits; this measurement says where the row is, not what moved it. The
+narrower window is that an idle-box reading on 2026-09-19 put majit at 22,011
+against RPython's 11,414, so 22,011 → 20,865 (5.2%) falls after that date.
+
 ### Driver ownership is now the same on both sides
 
 `marked.py` owns one module-level `JitDriver`; the old Rust wrapper built a new
