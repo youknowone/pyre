@@ -1243,12 +1243,40 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
 ///
 /// `_ssl` owns five native hierarchy slots, `mmap` owns one behind them,
 /// Windows owns three more where applicable, and `_cffi_backend` owns the last
-/// thirteen.  A sandbox build has none of those modules; because the groups form
-/// one contiguous tail of `SUBCLASS_RANGE_HIERARCHY`, dropping their combined
-/// slot count leaves exactly the ids such a build registers.
+/// thirteen.  Those three modules are absent without `full` and under
+/// `sandbox`.  wasm32 never lists the tail.  A sandbox build also leaves out
+/// `_overlapped.Overlapped`, `_winapi.Overlapped`, and `_WindowsConsoleIO`,
+/// so on every host except Windows-without-`full` the absent ids are a
+/// suffix of `SUBCLASS_RANGE_HIERARCHY`.  Windows without `full` keeps that
+/// overlapped trio, which sits between `mmap` and `_cffi_backend`.
 pub fn active_subclass_range_hierarchy() -> &'static [(u32, Option<u32>)] {
     let hierarchy = pyre_object::pyobject::SUBCLASS_RANGE_HIERARCHY;
-    #[cfg(all(not(target_arch = "wasm32"), feature = "sandbox"))]
+    #[cfg(any(
+        target_arch = "wasm32",
+        all(feature = "full", not(feature = "sandbox"))
+    ))]
+    {
+        hierarchy
+    }
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        not(all(feature = "full", not(feature = "sandbox")))
+    ))]
+    {
+        active_subclass_range_hierarchy_without_native_tail(hierarchy)
+    }
+}
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    not(all(feature = "full", not(feature = "sandbox")))
+))]
+fn active_subclass_range_hierarchy_without_native_tail(
+    hierarchy: &'static [(u32, Option<u32>)],
+) -> &'static [(u32, Option<u32>)] {
+    // Suffix slice.  False on Windows without `sandbox`: the overlapped trio
+    // stays, so `_ssl` / `mmap` and `_cffi_backend` are not one trailing run.
+    #[cfg(not(all(windows, not(feature = "sandbox"))))]
     {
         const SSL_HIERARCHY_SLOTS: usize = 5;
         const CFFI_HIERARCHY_SLOTS: usize = 13;
@@ -1256,11 +1284,9 @@ pub fn active_subclass_range_hierarchy() -> &'static [(u32, Option<u32>)] {
         const MMAP_HIERARCHY_SLOTS: usize = 1;
         #[cfg(not(any(unix, windows)))]
         const MMAP_HIERARCHY_SLOTS: usize = 0;
-        // `_overlapped.Overlapped`, `_winapi.Overlapped`, and the host-backed
-        // `_WindowsConsoleIO`, all of which a sandbox build leaves out.
-        #[cfg(windows)]
+        #[cfg(all(windows, feature = "sandbox"))]
         const OVERLAPPED_HIERARCHY_SLOTS: usize = 3;
-        #[cfg(not(windows))]
+        #[cfg(not(all(windows, feature = "sandbox")))]
         const OVERLAPPED_HIERARCHY_SLOTS: usize = 0;
         &hierarchy[..hierarchy.len()
             - SSL_HIERARCHY_SLOTS
@@ -1268,9 +1294,20 @@ pub fn active_subclass_range_hierarchy() -> &'static [(u32, Option<u32>)] {
             - OVERLAPPED_HIERARCHY_SLOTS
             - CFFI_HIERARCHY_SLOTS]
     }
-    #[cfg(not(all(not(target_arch = "wasm32"), feature = "sandbox")))]
+    #[cfg(all(windows, not(feature = "sandbox")))]
     {
-        hierarchy
+        use std::sync::OnceLock;
+        static FILTERED: OnceLock<Vec<(u32, Option<u32>)>> = OnceLock::new();
+        let filtered = FILTERED.get_or_init(|| {
+            hierarchy
+                .iter()
+                .copied()
+                .filter(|(type_id, _)| {
+                    !((190..196).contains(type_id) || (199..212).contains(type_id))
+                })
+                .collect()
+        });
+        filtered.as_slice()
     }
 }
 

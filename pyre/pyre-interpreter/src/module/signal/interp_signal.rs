@@ -826,7 +826,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // a socket (`signal_set_wakeup_fd_impl`).  WinSock answers
                 // every call with `WSANOTINITIALISED` until `WSAStartup` has
                 // run, which is why the import of `_socket` there is not just
-                // for the constants.
+                // for the constants. The probe itself calls `rsocket_rffi`,
+                // which stays in this crate when the `_socket` module is absent.
                 #[cfg(all(windows, not(feature = "sandbox")))]
                 {
                     use crate::rsocket_rffi as rffi;

@@ -914,35 +914,55 @@ unsafe fn hashlib_hmac_destructor(obj_addr: usize) {
     }
 }
 
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+#[cfg(all(
+    feature = "full",
+    not(target_arch = "wasm32"),
+    not(feature = "sandbox")
+))]
 unsafe fn ssl_context_destructor(obj_addr: usize) {
     unsafe {
         pyre_module::module::_ssl::w_ssl_context_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+#[cfg(all(
+    feature = "full",
+    not(target_arch = "wasm32"),
+    not(feature = "sandbox")
+))]
 unsafe fn memory_bio_destructor(obj_addr: usize) {
     unsafe {
         pyre_module::module::_ssl::w_memory_bio_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+#[cfg(all(
+    feature = "full",
+    not(target_arch = "wasm32"),
+    not(feature = "sandbox")
+))]
 unsafe fn ssl_session_destructor(obj_addr: usize) {
     unsafe {
         pyre_module::module::_ssl::w_ssl_session_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+#[cfg(all(
+    feature = "full",
+    not(target_arch = "wasm32"),
+    not(feature = "sandbox")
+))]
 unsafe fn ssl_socket_destructor(obj_addr: usize) {
     unsafe {
         pyre_module::module::_ssl::w_ssl_socket_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+#[cfg(all(
+    feature = "full",
+    not(target_arch = "wasm32"),
+    not(feature = "sandbox")
+))]
 unsafe fn mmap_destructor(obj_addr: usize) {
     unsafe { pyre_module::module::mmap::w_mmap_dealloc(obj_addr as pyre_object::PyObjectRef) };
 }
@@ -1001,7 +1021,11 @@ unsafe fn queue_simplequeue_destructor(obj_addr: usize) {
 
 /// Frees the block a `newp`-owned cdata malloc'd; a cdata that only borrows
 /// someone else's memory frees nothing.
-#[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+#[cfg(all(
+    feature = "full",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+))]
 unsafe fn cffi_cdata_destructor(obj_addr: usize) {
     unsafe {
         pyre_module::module::_cffi_backend::cdataobj::w_cdata_dealloc(
@@ -1012,7 +1036,11 @@ unsafe fn cffi_cdata_destructor(obj_addr: usize) {
 
 /// `W_Library._finalize_` — closes a library nothing names any more, unless
 /// the handle was opened by someone else.
-#[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+#[cfg(all(
+    feature = "full",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+))]
 unsafe fn cffi_library_destructor(obj_addr: usize) {
     unsafe {
         pyre_module::module::_cffi_backend::libraryobj::w_library_dealloc(
@@ -1022,7 +1050,11 @@ unsafe fn cffi_library_destructor(obj_addr: usize) {
 }
 
 /// `FreeCtxObj.__del__` — releases an FFI object's copied parser context.
-#[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+#[cfg(all(
+    feature = "full",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+))]
 unsafe fn cffi_ffi_destructor(obj_addr: usize) {
     unsafe {
         pyre_module::module::_cffi_backend::ffi_obj::w_ffi_dealloc(
@@ -1032,7 +1064,11 @@ unsafe fn cffi_ffi_destructor(obj_addr: usize) {
 }
 
 /// `W_DlOpenLibObject._finalize_` — closes an ABI library nothing names.
-#[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+#[cfg(all(
+    feature = "full",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+))]
 unsafe fn cffi_lib_destructor(obj_addr: usize) {
     unsafe {
         pyre_module::module::_cffi_backend::lib_obj::w_lib_dealloc(
@@ -1117,7 +1153,11 @@ unsafe fn random_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maj
 
 /// `_ssl._SSLContext` has the native-layout mapdict prefix plus the three
 /// Python callback/path references owned by the context wrapper.
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+#[cfg(all(
+    feature = "full",
+    not(target_arch = "wasm32"),
+    not(feature = "sandbox")
+))]
 unsafe fn ssl_context_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     unsafe { object_object_custom_trace(obj_addr, f) };
     let context = unsafe { &mut *(obj_addr as *mut pyre_module::module::_ssl::W_SSLContext) };
@@ -1128,14 +1168,22 @@ unsafe fn ssl_context_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
 
 /// `ssl.MemoryBIO` is subclassable and therefore carries mapdict storage even
 /// though its rustls transport state contains no Python references.
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+#[cfg(all(
+    feature = "full",
+    not(target_arch = "wasm32"),
+    not(feature = "sandbox")
+))]
 unsafe fn memory_bio_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     unsafe { object_object_custom_trace(obj_addr, f) };
 }
 
 /// `mmap.mmap` is subclassable and carries the same mapdict prefix; its
 /// mapping/fd payload contains no Python references.
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+#[cfg(all(
+    feature = "full",
+    not(target_arch = "wasm32"),
+    not(feature = "sandbox")
+))]
 unsafe fn mmap_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     unsafe { object_object_custom_trace(obj_addr, f) };
 }
@@ -1163,7 +1211,11 @@ unsafe fn queue_simplequeue_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut
 
 /// `_ssl._SSLSocket` owns its context, transport endpoints, public owner,
 /// and hostname directly on the typed object.
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+#[cfg(all(
+    feature = "full",
+    not(target_arch = "wasm32"),
+    not(feature = "sandbox")
+))]
 unsafe fn ssl_socket_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let socket = unsafe { &mut *(obj_addr as *mut pyre_module::module::_ssl::W_SSLSocket) };
     f(std::ptr::addr_of_mut!(socket.ob.w_class) as *mut majit_ir::GcRef);
@@ -4407,7 +4459,11 @@ fn build_gc() -> Box<MiniMarkGC> {
     // MemoryBIO are subclassable native layouts, so their marker walks the
     // mapdict prefix; Context additionally owns Python callbacks/path values.
     // Their sweep destructors release the opaque rustls allocations.
-    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+    #[cfg(all(
+        feature = "full",
+        not(target_arch = "wasm32"),
+        not(feature = "sandbox")
+    ))]
     {
         let context_descr = <pyre_module::module::_ssl::W_SSLContext
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
@@ -4503,7 +4559,11 @@ fn build_gc() -> Box<MiniMarkGC> {
     // PyPy's W_MMap directly owns rmmap.MMap.  The typed wrapper carries the
     // subclass mapdict prefix and a sweep destructor for the native mapping
     // and duplicated fd.
-    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+    #[cfg(all(
+        feature = "full",
+        not(target_arch = "wasm32"),
+        not(feature = "sandbox")
+    ))]
     {
         let mmap_descr = <pyre_module::module::mmap::W_MMap
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
@@ -4572,7 +4632,11 @@ fn build_gc() -> Box<MiniMarkGC> {
     // carrier hold ordinary traced fields; a cdata additionally owns the block
     // that `newp` malloc'd for it and a library owns its loader handle, which
     // their sweep destructors release.
-    #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+    #[cfg(all(
+        feature = "full",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    ))]
     {
         for descriptor in [
             <pyre_module::module::_cffi_backend::ctypeobj::W_CType
