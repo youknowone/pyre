@@ -7858,6 +7858,10 @@ impl<M: Clone> MetaInterp<M> {
     /// is dropped alongside it; if not (early-Cancelled paths), both
     /// halves stay live for continued tracing.
     pub fn compile_loop(&mut self, jump_args: &[OpRef], meta: M) -> CompileOutcome {
+        // `gctypelayout.py encode_type_shapes_now` closes `type_info_group`
+        // at translation. Close before the optimizer reads it. A trace that
+        // did not enter through `force_start_tracing` still reaches here.
+        majit_gc::ensure_type_registry_closed();
         self.remember_compiled_graph_write();
         let outcome = self.compile_loop_body(jump_args, meta);
         self.retire_speculative_cut_key(outcome);
@@ -11433,6 +11437,9 @@ impl<M: Clone> MetaInterp<M> {
         meta: M,
         exit_with_exception: bool,
     ) -> Result<(), SwitchToBlackhole> {
+        // Root FINISH optimizes here. `gctypelayout.py encode_type_shapes_now`
+        // closes `type_info_group` at translation; close before that read.
+        majit_gc::ensure_type_registry_closed();
         self.remember_compiled_graph_write();
         let _snapshot_guard = CompileSnapshotRootsGuard::new(
             &mut self.compile_snapshot_refs,
@@ -12015,6 +12022,9 @@ impl<M: Clone> MetaInterp<M> {
     /// Returns the green_key on success (caller must call
     /// attach_procedure_to_interp), None on failure.
     pub fn compile_simple_loop(&mut self, meta: M) -> Option<u64> {
+        // Segmented loops optimize here without `compile_loop`.
+        // `gctypelayout.py encode_type_shapes_now` closes at translation.
+        majit_gc::ensure_type_registry_closed();
         let _snapshot_guard = CompileSnapshotRootsGuard::new(
             &mut self.compile_snapshot_refs,
             &mut self.compile_short_preamble_producer,
@@ -15195,6 +15205,9 @@ impl<M: Clone> MetaInterp<M> {
     where
         T: std::borrow::Borrow<majit_ir::Op>,
     {
+        // Entry bridges optimize here. `gctypelayout.py encode_type_shapes_now`
+        // closes `type_info_group` at translation; close before that read.
+        majit_gc::ensure_type_registry_closed();
         if !self.compiled_loops.contains_key(&green_key) {
             crate::mc_diag_bump(34); // compile_entry_bridge: target has no compiled loop
             return false;
@@ -15817,6 +15830,9 @@ impl<M: Clone> MetaInterp<M> {
         // SimpleCompileData (optimize_loop) otherwise.
         ends_with_jump: bool,
     ) -> bool {
+        // `gctypelayout.py encode_type_shapes_now` closes `type_info_group`
+        // at translation. Close before bridge optimization reads it.
+        majit_gc::ensure_type_registry_closed();
         self.remember_compiled_graph_write();
         self.last_compiled_artifact_token = None;
         crate::mc_diag_bump(8); // compile_bridge entered

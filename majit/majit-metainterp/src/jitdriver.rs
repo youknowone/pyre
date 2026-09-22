@@ -7684,6 +7684,11 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         env: &S::Env,
     ) {
+        // `gctypelayout.py encode_type_shapes_now` closes `type_info_group`
+        // at translation. Close before tracing so a reader in this trace
+        // sees the frozen table, and JIT-only types can still register
+        // after startup.
+        majit_gc::ensure_type_registry_closed();
         // Note: no is_hot_or_tracing check here — the caller (try_function_entry_jit)
         // already verified the threshold. force_start_tracing must unconditionally start.
         //
@@ -9920,6 +9925,9 @@ impl<S: JitState> JitDriver<S> {
         // as `execute_and_record` does as well as record it.
         execute_replay: bool,
     ) -> bool {
+        // Same close as `force_start_tracing`: bridge codegen reads
+        // `type_info_group` (`gctypelayout.py encode_type_shapes_now`).
+        majit_gc::ensure_type_registry_closed();
         majit_metainterp::mc_diag_bump(12); // start_bridge_tracing entered
         // Same reason as the primary trace entry: the bridge compile decodes
         // frame value counts through the per-thread store, so aim it here.

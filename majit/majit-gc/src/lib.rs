@@ -1549,12 +1549,18 @@ pub fn set_type_registry_close_hook(hook: fn()) {
 /// already published. `get_translated_info_for_typeinfo`
 /// (`llsupport/gc.py`) embeds that table's base address.
 ///
+/// A no-op when `gc_sync` has no collector. Boxed allocators are closed by
+/// `set_gc_allocator` and are not this registry.
+///
 /// Must not be called from inside a `gc_op` or `gc_query` closure.
 /// `gc_query` is `gc_op`, and `gc_op` is not reentrant (`ReentryGuard`):
 /// the close hook and the `freeze_types` below both call `gc_op`. The hook
 /// therefore runs outside any `gc_sync` closure — the already-frozen check
 /// uses `gc_query_reentrant`, and that shared borrow ends before the hook.
 pub fn ensure_type_registry_closed() {
+    if !gc_sync::is_initialized() {
+        return;
+    }
     debug_assert!(
         !gc_sync::in_gc_op(),
         "ensure_type_registry_closed must not run inside gc_op or gc_query"

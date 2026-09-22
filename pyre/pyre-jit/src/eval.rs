@@ -3125,7 +3125,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     // `W_BASE_EXCEPTION_GC_TYPE_ID`) AFTER all hardcoded registrations.
     // Each new TypeInfo carries the W_BaseException layout
     // (size + GC ptr offsets) so allocation still works, and the
-    // correct `parent_typeid` so `freeze_types` builds the
+    // correct `parent_typeid` so `assign_inheritance_ids_now` builds the
     // preorder subclass tree.  Then `register_vtable_for_type`
     // overrides the earlier pytype → 31 mapping so
     // `subclass_range(pytype)` resolves to the per-class range.
@@ -4411,8 +4411,12 @@ fn build_gc() -> Box<MiniMarkGC> {
     }
 
     // rclass.py ClassRepr.fill_vtable_root owns subclassrange_{min,max}.
-    // freeze_types computes the collector's matching inheritance ids; it
-    // must not republish the interpreter's prebuilt vtables.
+    // assign_inheritance_ids_now computes the collector's matching
+    // inheritance ids and must not republish the interpreter's prebuilt
+    // vtables. `gctypelayout.py encode_type_shapes_now` closes
+    // `type_info_group` at translation; pyre leaves that table open here
+    // and closes it before the first reader, so JIT-only types can still
+    // be registered after startup.
     let object_aliases = pyre_object::pyobject::all_subclass_range_aliases();
     let interpreter_aliases = pyre_interpreter::all_subclass_range_aliases();
     let mut expected_aliases: Vec<_> = object_aliases
@@ -4468,7 +4472,7 @@ fn build_gc() -> Box<MiniMarkGC> {
         .with_destructor_fn(majit_metainterp::AllVirtuals::destructor),
     );
     majit_metainterp::set_all_virtuals_gc_type_id(all_virtuals_tid);
-    gc.freeze_types();
+    gc.assign_inheritance_ids_now();
     pyre_interpreter::typedef::init_subclass_ranges();
     assert_subclass_ranges(
         object_aliases
@@ -7070,6 +7074,9 @@ fn drive_portal_metatrace(
         ]
     };
     meta.initialize_state_from_start(jitcode, &args);
+    // `gctypelayout.py encode_type_shapes_now` closes `type_info_group`
+    // at translation. Close before the portal walk reads it.
+    majit_gc::ensure_type_registry_closed();
     let action = meta.interpret(&mut PortalMetatraceSym { header_pc }, loop_header_pc);
     let depth = meta.framestack.len();
     let top = meta.framestack.frames.last();
@@ -15963,7 +15970,7 @@ mod tests {
     }
 
     /// rclass.py `ll_issubclass(subcls, cls)` parity. After
-    /// `install_gc_standalone` runs `freeze_types`, the materialized
+    /// `build_gc` runs `assign_inheritance_ids_now`, the
     /// `(subclassrange_min, subclassrange_max)` for each registered
     /// PyType must satisfy `int_between(cls.min, subcls.min, cls.max)`
     /// for every (cls, subcls) pair where `subcls` Python-inherits from
