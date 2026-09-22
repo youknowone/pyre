@@ -157,7 +157,7 @@ mod residual_host {
     /// an `r` argument may be a real `i32` pointer, a void descriptor may name
     /// a word-returning target, and guessing either signature traps at a wasm
     /// `call_indirect`.  These targets are different: every one is declared as
-    /// an explicit `pub extern "C" fn(i64, ...) -> i64` wrapper, and the CPU
+    /// an explicit `pub extern "C"` wrapper, `(i64, ...) -> i64` or `()`, and the CPU
     /// function table stores those exact function addresses.  Comparing the
     /// table index (`fn as usize` on wasm32) therefore proves both the callee
     /// identity and its ABI.  Calling the named wrapper directly matches the
@@ -166,13 +166,11 @@ mod residual_host {
     ///
     /// Keep this an exact-function allow-list, not a signature inference: the
     /// macro spells one line per callee so the arity and the symbol stay
-    /// auditable together.  A mismatched arity deliberately falls through to
-    /// the reflective path.
+    /// auditable together.  A mismatched arity falls through to the reflective
+    /// path.
     ///
-    /// The membership is measured, not guessed.  `PYRE_WASM_CALL_HIST` reports
-    /// crossings per callee split by importer, and over the synth corpus every
-    /// remaining crossing arrives on this path (`src=host`) rather than from a
-    /// compiled trace; these are its heaviest callees.
+    /// A `()` callee is listed separately and returns 0.  The reflective host
+    /// writes 0 when the wasm result list is empty.
     fn direct_uniform_i64_call(func_ptr: usize, args: &[i64]) -> Option<i64> {
         macro_rules! uniform_i64_allow_list {
             ($( [$($arg:ident),*] => $callee:path ),* $(,)?) => {
@@ -186,28 +184,74 @@ mod residual_host {
                 }
             };
         }
-        uniform_i64_allow_list![
+        macro_rules! uniform_void_allow_list {
+            ($( [$($arg:ident),*] => $callee:path ),* $(,)?) => {
+                match args {
+                    $(
+                        [$($arg),*] if func_ptr == $callee as usize => {
+                            $callee($(*$arg),*);
+                            Some(0)
+                        }
+                    )*
+                    _ => None,
+                }
+            };
+        }
+        let word = uniform_i64_allow_list![
             [] => pyre_jit::call_jit::bh_get_current_exception,
             [value] => pyre_jit::call_jit::bh_box_int_fn,
             [value] => pyre_jit::call_jit::bh_truth_fn,
             [value] => pyre_interpreter::opcode_ops::jit_baseobjspace_len,
+            [value] => pyre_interpreter::opcode_ops::jit_baseobjspace_not_,
+            [value] => pyre_interpreter::opcode_ops::jit_descroperation_neg,
+            [iter] => pyre_interpreter::runtime_ops::jit_next,
             [obj, key] => pyre_interpreter::opcode_ops::jit_baseobjspace_delitem,
             [array] => pyre_jit::call_jit::bh_newtuple_from_array,
             [array] => pyre_jit::call_jit::bh_newlist_from_array,
+            [array] => pyre_jit::call_jit::bh_build_map_from_array,
             [subcls, cls] => pyre_object::pyobject::__majit_call_target_ll_issubclass,
             [index, seq] => pyre_jit::call_jit::bh_unpack_item_fn,
+            [count, seq] => pyre_jit::call_jit::bh_unpack_sequence_fn,
+            [obj] => pyre_jit::call_jit::bh_get_iter_fn,
+            [dunder_result] => pyre_jit_trace::operator_continuation::bh_len_tail,
+            [frame_ptr] => pyre_jit::call_jit::bh_load_build_class_fn,
             [callable, null_or_self] => pyre_jit::call_jit::bh_call_fn_0,
+            [globals, code_obj] => pyre_interpreter::runtime_ops::jit_make_function_from_globals,
+            [cell, value] => pyre_jit::call_jit::bh_store_deref_value_fn,
             [lhs, rhs, op_code] => pyre_interpreter::opcode_ops::jit_binary_value_from_tag,
             [lhs, rhs, op_code] => pyre_interpreter::opcode_ops::jit_compare_value_from_tag,
+            [frame_ptr, exc, cause] => pyre_jit::call_jit::bh_normalize_raise_varargs_with_frame,
+            [frame_ptr, w_name, value] => pyre_jit::call_jit::bh_store_global_fn,
+            [frame_ptr, w_name, value] => pyre_jit::call_jit::bh_store_name_fn,
+            [func, attr, flag] => pyre_interpreter::runtime_ops::jit_set_function_attribute,
+            [cell, w_code_ptr, deref_idx] => pyre_jit::call_jit::bh_load_deref_value_fn,
+            [dict, source, w_callable] => pyre_jit::call_jit::bh_dict_merge_fn,
             [obj, key, value] => pyre_interpreter::opcode_ops::bh_store_subscr_fn,
             [callable, null_or_self, arg0] => pyre_jit::call_jit::bh_call_fn,
             [obj, w_code_ptr, name_idx] => pyre_jit::call_jit::bh_load_attr_fn,
             [frame_ptr, w_name, namei] => pyre_jit::call_jit::bh_load_name_fn,
-            [frame_ptr, w_name, value] => pyre_jit::call_jit::bh_store_name_fn,
+            [argc, start, stop, step] => pyre_jit::call_jit::bh_build_slice_fn,
+            [subject, cls, kwd_attrs, count] => pyre_jit::call_jit::bh_match_class_fn,
+            [callable, self_or_null, starargs, kwargs_or_null] =>
+                pyre_jit::call_jit::bh_call_function_ex_fn,
             [callable, null_or_self, arg0, arg1] => pyre_jit::call_jit::bh_call_fn_2,
             [obj, attr, w_code_ptr, name_idx] => pyre_jit::call_jit::bh_load_method_self_fn,
+            [next_instr, is_being_profiled, pycode, frame_ptr, ec] =>
+                pyre_jit::call_jit::bh_portal_runner_c,
+            [callable, null_or_self, a0, a1, a2] => pyre_jit::call_jit::bh_call_fn_3,
             [namespace_ptr, w_code_ptr, frame_ptr, namei] =>
                 pyre_jit::call_jit::bh_load_global_fn,
+            [callable, null_or_self, a0, a1, a2, a3] => pyre_jit::call_jit::bh_call_fn_4,
+            [callable, null_or_self, kwnames, a0, a1, a2, a3] =>
+                pyre_jit::call_jit::bh_call_kw_4,
+        ];
+        if word.is_some() {
+            return word;
+        }
+        uniform_void_allow_list![
+            [] => pyre_jit::call_jit::bh_clear_in_flight_exception,
+            [exc] => pyre_jit::call_jit::bh_set_current_exception,
+            [w_obj, storageindex, value] => pyre_jit_trace::helpers::jit_mapdict_boxed_write,
         ]
     }
 
