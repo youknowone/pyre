@@ -337,16 +337,6 @@ pub struct BlackholeInterpreter {
     /// Unlike `aborted`, this indicates a Python-level exception that
     /// should propagate up the blackhole chain, not a JIT infrastructure error.
     pub got_exception: bool,
-    /// Set when this frame made a residual call.
-    ///
-    /// A guard's bridge is recorded from the merge point the resume walk stops
-    /// at, so everything the walk ran to get there is work the bridge does not
-    /// contain and will skip on every later failure. Values are safe — the
-    /// bridge re-derives them from the state the walk left behind — but a call
-    /// out of the interpreter is not: it happened once, here, and never again.
-    /// `back_edge_internal` reads this to decide whether the guard may source a
-    /// bridge at all.
-    pub called_residual: std::cell::Cell<bool>,
     /// Position of the last dispatched opcode (before position advances past operands).
     /// Used by handle_exception_in_frame for handler lookup — the faulting instruction
     /// PC, not the next instruction PC. Public so caller-chain propagation in
@@ -605,7 +595,6 @@ impl Default for BlackholeInterpreter {
             aborted: false,
             abort_permanent_bail: false,
             got_exception: false,
-            called_residual: std::cell::Cell::new(false),
             last_opcode_position: 0,
             entry_position: 0,
             exception_last_value: 0,
@@ -799,16 +788,7 @@ impl BlackholeInterpreter {
         self.aborted = false;
         self.abort_permanent_bail = false;
         self.got_exception = false;
-        self.called_residual.set(false);
         self.state_field_layout = StateFieldLayout::default();
-    }
-
-    /// Fold a byte-interpreted inline callee's residual flag onto the caller
-    /// before [`Self::reset_for_inline_reuse`] clears it.
-    fn fold_called_residual_from(&self, callee: &Self) {
-        if callee.called_residual.get() {
-            self.called_residual.set(true);
-        }
     }
 
     /// Copy the builder-shared context fields from `parent` onto `self`.
@@ -2417,7 +2397,6 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> i64 {
-        self.called_residual.set(true);
         self.cpu()
             .bh_call_i(func, None, Some(args_r), None, calldescr)
     }
@@ -2429,7 +2408,6 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
-        self.called_residual.set(true);
         self.cpu()
             .bh_call_r(func, None, Some(args_r), None, calldescr)
     }
@@ -2441,7 +2419,6 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) {
-        self.called_residual.set(true);
         self.cpu()
             .bh_call_v(func, None, Some(args_r), None, calldescr);
     }
@@ -2454,7 +2431,6 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> i64 {
-        self.called_residual.set(true);
         self.cpu()
             .bh_call_i(func, Some(args_i), Some(args_r), None, calldescr)
     }
@@ -2467,7 +2443,6 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
-        self.called_residual.set(true);
         self.cpu()
             .bh_call_r(func, Some(args_i), Some(args_r), None, calldescr)
     }
@@ -2480,7 +2455,6 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) {
-        self.called_residual.set(true);
         self.cpu()
             .bh_call_v(func, Some(args_i), Some(args_r), None, calldescr);
     }
@@ -2494,7 +2468,6 @@ impl BlackholeInterpreter {
         args_f: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> i64 {
-        self.called_residual.set(true);
         self.cpu()
             .bh_call_i(func, Some(args_i), Some(args_r), Some(args_f), calldescr)
     }
@@ -2508,7 +2481,6 @@ impl BlackholeInterpreter {
         args_f: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
-        self.called_residual.set(true);
         self.cpu()
             .bh_call_r(func, Some(args_i), Some(args_r), Some(args_f), calldescr)
     }
@@ -2522,7 +2494,6 @@ impl BlackholeInterpreter {
         args_f: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> f64 {
-        self.called_residual.set(true);
         self.cpu()
             .bh_call_f(func, Some(args_i), Some(args_r), Some(args_f), calldescr)
     }
@@ -2536,7 +2507,6 @@ impl BlackholeInterpreter {
         args_f: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) {
-        self.called_residual.set(true);
         self.cpu()
             .bh_call_v(func, Some(args_i), Some(args_r), Some(args_f), calldescr);
     }
@@ -2545,19 +2515,12 @@ impl BlackholeInterpreter {
     //
     // RPython unpacks `jitcode.fnaddr` and `jitcode.calldescr` from the
     // jitcode parameter; pyre passes them directly so the pyre tracer
-    // can reuse the helpers without a JitCode object.
-    //
-    // RPython has no `called_residual`. pyre's `guard_may_bridge`
-    // (`jitdriver.rs`) refuses a next-merge-point fallback bridge after
-    // the walk left the interpreter. `bhimpl_inline_call_*` is
-    // `cpu.bh_call_*` of `jitcode.fnaddr`, so it must mark the same way
-    // residual does.
-    //
-    // Convergence: `compile.py` `compile_bridge` records from the guard
-    // `resumedescr` (`pyjitpl.py` `handle_guard_failure`). The orthodox
-    // path is `bridge_from_guard_resume_position`. When that path always
-    // succeeds or declines without a next-merge fallback, delete
-    // `called_residual` and `guard_may_bridge`.
+    // can reuse the helpers without a JitCode object. The body is
+    // `cpu.bh_call_*` (`blackhole.py` `bhimpl_inline_call_*`). A bridge
+    // is recorded only from the guard's own `resumedescr`
+    // (`compile.py` `ResumeGuardDescr.handle_fail` →
+    // `_trace_and_compile_from_bridge`); `resume_in_blackhole` does not
+    // start one.
 
     /// blackhole.py `bhimpl_inline_call_r_i`
     pub fn bhimpl_inline_call_r_i(
@@ -2566,7 +2529,6 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> i64 {
-        self.called_residual.set(true);
         self.cpu()
             .bh_call_i(fnaddr, None, Some(args_r), None, calldescr)
     }
@@ -2577,7 +2539,6 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
-        self.called_residual.set(true);
         self.cpu()
             .bh_call_r(fnaddr, None, Some(args_r), None, calldescr)
     }
@@ -2588,7 +2549,6 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) {
-        self.called_residual.set(true);
         self.cpu()
             .bh_call_v(fnaddr, None, Some(args_r), None, calldescr);
     }
@@ -2600,7 +2560,6 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> i64 {
-        self.called_residual.set(true);
         self.cpu()
             .bh_call_i(fnaddr, Some(args_i), Some(args_r), None, calldescr)
     }
@@ -2612,7 +2571,6 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
-        self.called_residual.set(true);
         self.cpu()
             .bh_call_r(fnaddr, Some(args_i), Some(args_r), None, calldescr)
     }
@@ -2624,7 +2582,6 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) {
-        self.called_residual.set(true);
         self.cpu()
             .bh_call_v(fnaddr, Some(args_i), Some(args_r), None, calldescr);
     }
@@ -2637,7 +2594,6 @@ impl BlackholeInterpreter {
         args_f: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> i64 {
-        self.called_residual.set(true);
         self.cpu()
             .bh_call_i(fnaddr, Some(args_i), Some(args_r), Some(args_f), calldescr)
     }
@@ -2650,7 +2606,6 @@ impl BlackholeInterpreter {
         args_f: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
-        self.called_residual.set(true);
         self.cpu()
             .bh_call_r(fnaddr, Some(args_i), Some(args_r), Some(args_f), calldescr)
     }
@@ -2663,7 +2618,6 @@ impl BlackholeInterpreter {
         args_f: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> f64 {
-        self.called_residual.set(true);
         self.cpu()
             .bh_call_f(fnaddr, Some(args_i), Some(args_r), Some(args_f), calldescr)
     }
@@ -2676,7 +2630,6 @@ impl BlackholeInterpreter {
         args_f: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) {
-        self.called_residual.set(true);
         self.cpu()
             .bh_call_v(fnaddr, Some(args_i), Some(args_r), Some(args_f), calldescr);
     }
@@ -3264,21 +3217,11 @@ impl BlackholeInterpBuilder {
         // `scalar_slot`/`array_elem_slot` range checks are `debug_assert!`, so
         // a release build reads whatever slot the arithmetic lands on.
         interp.state_field_layout = StateFieldLayout::default();
-        // Two more pyre-only fields on the same footing as the ones above:
-        // they describe the run that just ended, and `acquire_interp` refreshes
-        // only the six builder-shared slots.
-        //
-        // `called_residual` is "this frame left the interpreter", set by every
-        // `bh_call_*` helper and cleared by `reset_for_inline_reuse` alone.  A
-        // pooled interp that kept it hands its next user the previous run's
-        // answer, which `jitdriver.rs` reads on the back-edge to decide whether
-        // the walk may treat the frame as never having escaped.
-        //
         // `record_caught_exception` is a callback the resume path installs on
         // every frame of a chain (`call_jit.rs`), and the chain goes back into
         // the same pool.  Handing the next user a hook it never asked for makes
         // it report exceptions to whoever owned the frame before it.
-        interp.called_residual.set(false);
+        // `acquire_interp` refreshes only the six builder-shared slots.
         interp.record_caught_exception = None;
         interp.back = self.blackholeinterps.take();
         self.blackholeinterps = Some(interp);
@@ -13587,7 +13530,6 @@ fn interpret_unresolved_inline_call(
         copy_inline_callee_tmpreg(bh, &mut callee, dest);
         Ok(post_p)
     };
-    bh.fold_called_residual_from(&callee);
     callee.reset_for_inline_reuse();
     bh.inline_callee_scratch = Some(callee);
     outcome
@@ -14454,7 +14396,6 @@ fn handler_inline_call_nested_ext(
         copy_inline_callee_tmpreg(bh, &mut callee, dest);
         Ok(p)
     };
-    bh.fold_called_residual_from(&callee);
     callee.reset_for_inline_reuse();
     bh.inline_callee_scratch = Some(callee);
     outcome
@@ -14631,7 +14572,6 @@ fn inline_call_native_rii(
     bh.last_exc().set(0);
     // Same `cpu.bh_call_*` leave as `bhimpl_inline_call_*`; this rii
     // fast path does not go through those helpers.
-    bh.called_residual.set(true);
     let args_root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
     unsafe {
         majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(&mut r0));
