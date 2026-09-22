@@ -10,6 +10,7 @@ pub mod _blake2;
 pub mod _bz2;
 #[allow(non_snake_case)]
 #[cfg(all(
+    feature = "full",
     feature = "host_env",
     not(feature = "sandbox"),
     not(target_arch = "wasm32")
@@ -32,7 +33,7 @@ pub mod _contextvars;
 #[allow(non_snake_case)]
 pub mod _csv;
 #[allow(non_snake_case)]
-#[cfg(not(feature = "sandbox"))]
+#[cfg(all(feature = "full", not(feature = "sandbox")))]
 pub mod _ctypes;
 #[allow(non_snake_case)]
 pub mod _functools;
@@ -72,10 +73,14 @@ pub mod _queue;
 #[cfg(target_os = "macos")]
 pub mod _scproxy;
 #[allow(non_snake_case)]
-#[cfg(not(feature = "sandbox"))]
+#[cfg(all(feature = "full", not(feature = "sandbox")))]
 pub mod _socket;
 #[allow(non_snake_case)]
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+#[cfg(all(
+    feature = "full",
+    not(target_arch = "wasm32"),
+    not(feature = "sandbox")
+))]
 pub mod _ssl;
 #[allow(non_snake_case)]
 pub mod _stat;
@@ -111,6 +116,7 @@ pub mod fcntl;
 pub mod grp;
 pub mod math;
 #[cfg(all(
+    feature = "full",
     not(target_arch = "wasm32"),
     feature = "host_env",
     not(feature = "sandbox")
@@ -124,7 +130,7 @@ pub mod pyexpat;
 pub mod pypyjit;
 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 pub mod resource;
-#[cfg(not(feature = "sandbox"))]
+#[cfg(all(feature = "full", not(feature = "sandbox")))]
 pub mod select;
 #[cfg(all(unix, not(feature = "sandbox")))]
 pub mod syslog;

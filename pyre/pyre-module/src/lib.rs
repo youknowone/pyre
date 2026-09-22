@@ -27,6 +27,7 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("_bisect", module::_bisect::init);
     pyre_interpreter::importing::register_builtin_module("_blake2", module::_blake2::init);
     #[cfg(all(
+        feature = "full",
         feature = "host_env",
         not(feature = "sandbox"),
         not(target_arch = "wasm32")
@@ -35,7 +36,7 @@ pub fn install_optional_modules() {
         "_cffi_backend",
         module::_cffi_backend::init,
     );
-    #[cfg(not(feature = "sandbox"))]
+    #[cfg(all(feature = "full", not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("_ctypes", module::_ctypes::init);
     pyre_interpreter::importing::register_builtin_module("_bz2", module::_bz2::init);
     pyre_interpreter::importing::register_builtin_module("_csv", module::_csv::init);
@@ -86,9 +87,13 @@ pub fn install_optional_modules() {
         module::_pypy_generic_alias::init,
     );
     pyre_interpreter::importing::register_builtin_module("_queue", module::_queue::init);
-    #[cfg(not(feature = "sandbox"))]
+    #[cfg(all(feature = "full", not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("_socket", module::_socket::init);
-    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+    #[cfg(all(
+        feature = "full",
+        not(target_arch = "wasm32"),
+        not(feature = "sandbox")
+    ))]
     pyre_interpreter::importing::register_builtin_module("_ssl", module::_ssl::init);
     // Frozen importlib imports `_stat` while bootstrapping a sandbox that
     // mounts no stdlib files, so this stays an unconditional builtin.
@@ -124,6 +129,7 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("msvcrt", module::msvcrt::init);
     pyre_interpreter::importing::register_builtin_module("pypyjit", module::pypyjit::init);
     #[cfg(all(
+        feature = "full",
         not(target_arch = "wasm32"),
         feature = "host_env",
         not(feature = "sandbox")
@@ -138,7 +144,7 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("pyexpat", module::pyexpat::init);
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("resource", module::resource::init);
-    #[cfg(not(feature = "sandbox"))]
+    #[cfg(all(feature = "full", not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("select", module::select::init);
     #[cfg(all(unix, not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("syslog", module::syslog::init);
@@ -162,11 +168,21 @@ pub fn all_immortal_w_class_only_descriptors()
     #[allow(unused_imports)]
     use pyre_object::lltype::PyreClassPyTypeOf;
     vec![
-        #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+        #[cfg(all(feature = "full", unix, feature = "host_env", not(feature = "sandbox")))]
         <module::select::interp_select::Poll as PyreClassPyTypeOf>::DESCRIPTOR,
-        #[cfg(all(target_os = "macos", feature = "host_env", not(feature = "sandbox")))]
+        #[cfg(all(
+            feature = "full",
+            target_os = "macos",
+            feature = "host_env",
+            not(feature = "sandbox")
+        ))]
         <module::select::interp_kqueue::W_Kqueue as PyreClassPyTypeOf>::DESCRIPTOR,
-        #[cfg(all(target_os = "macos", feature = "host_env", not(feature = "sandbox")))]
+        #[cfg(all(
+            feature = "full",
+            target_os = "macos",
+            feature = "host_env",
+            not(feature = "sandbox")
+        ))]
         <module::select::interp_kevent::W_Kevent as PyreClassPyTypeOf>::DESCRIPTOR,
     ]
 }
@@ -184,6 +200,7 @@ fn register_on_load() {
 
 fn hook_mini_buffer_params(obj: pyre_object::PyObjectRef) -> Option<(*mut u8, usize)> {
     #[cfg(all(
+        feature = "full",
         feature = "host_env",
         not(feature = "sandbox"),
         not(target_arch = "wasm32")
@@ -192,6 +209,7 @@ fn hook_mini_buffer_params(obj: pyre_object::PyObjectRef) -> Option<(*mut u8, us
         return module::_cffi_backend::cbuffer::mini_buffer_params(obj);
     }
     #[cfg(not(all(
+        feature = "full",
         feature = "host_env",
         not(feature = "sandbox"),
         not(target_arch = "wasm32")
@@ -204,6 +222,7 @@ fn hook_mini_buffer_params(obj: pyre_object::PyObjectRef) -> Option<(*mut u8, us
 
 fn hook_cffi_finalizer_kind(obj: pyre_object::PyObjectRef) -> Option<bool> {
     #[cfg(all(
+        feature = "full",
         feature = "host_env",
         not(feature = "sandbox"),
         not(target_arch = "wasm32")
@@ -212,6 +231,7 @@ fn hook_cffi_finalizer_kind(obj: pyre_object::PyObjectRef) -> Option<bool> {
         return module::_cffi_backend::cdataobj::ec_finalizer_kind(obj);
     }
     #[cfg(not(all(
+        feature = "full",
         feature = "host_env",
         not(feature = "sandbox"),
         not(target_arch = "wasm32")
@@ -224,6 +244,7 @@ fn hook_cffi_finalizer_kind(obj: pyre_object::PyObjectRef) -> Option<bool> {
 
 fn hook_run_cffi_finalize(obj: pyre_object::PyObjectRef) {
     #[cfg(all(
+        feature = "full",
         feature = "host_env",
         not(feature = "sandbox"),
         not(target_arch = "wasm32")
@@ -232,6 +253,7 @@ fn hook_run_cffi_finalize(obj: pyre_object::PyObjectRef) {
         module::_cffi_backend::cdataobj::run_ec_finalize(obj);
     }
     #[cfg(not(all(
+        feature = "full",
         feature = "host_env",
         not(feature = "sandbox"),
         not(target_arch = "wasm32")
@@ -243,6 +265,7 @@ fn hook_run_cffi_finalize(obj: pyre_object::PyObjectRef) {
 
 fn hook_close_cffi_fileobj(obj: pyre_object::PyObjectRef) {
     #[cfg(all(
+        feature = "full",
         feature = "host_env",
         not(feature = "sandbox"),
         not(target_arch = "wasm32")
@@ -251,6 +274,7 @@ fn hook_close_cffi_fileobj(obj: pyre_object::PyObjectRef) {
         module::_cffi_backend::ctypeptr::close_cffi_fileobj(obj);
     }
     #[cfg(not(all(
+        feature = "full",
         feature = "host_env",
         not(feature = "sandbox"),
         not(target_arch = "wasm32")
@@ -270,11 +294,21 @@ fn hook_ctypes_buffer_view(
     usize,
     Vec<usize>,
 )> {
-    #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
+    #[cfg(all(
+        feature = "full",
+        any(unix, windows),
+        feature = "host_env",
+        not(feature = "sandbox")
+    ))]
     {
         return module::_ctypes::cdata::cdata_buffer_view(obj);
     }
-    #[cfg(not(all(any(unix, windows), feature = "host_env", not(feature = "sandbox"))))]
+    #[cfg(not(all(
+        feature = "full",
+        any(unix, windows),
+        feature = "host_env",
+        not(feature = "sandbox")
+    )))]
     {
         let _ = obj;
         None
@@ -282,11 +316,21 @@ fn hook_ctypes_buffer_view(
 }
 
 fn hook_ctypes_bytes_object(obj: pyre_object::PyObjectRef) -> Option<pyre_object::PyObjectRef> {
-    #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
+    #[cfg(all(
+        feature = "full",
+        any(unix, windows),
+        feature = "host_env",
+        not(feature = "sandbox")
+    ))]
     {
         return module::_ctypes::cdata::cdata_bytes_object(obj);
     }
-    #[cfg(not(all(any(unix, windows), feature = "host_env", not(feature = "sandbox"))))]
+    #[cfg(not(all(
+        feature = "full",
+        any(unix, windows),
+        feature = "host_env",
+        not(feature = "sandbox")
+    )))]
     {
         let _ = obj;
         None
@@ -294,11 +338,21 @@ fn hook_ctypes_bytes_object(obj: pyre_object::PyObjectRef) -> Option<pyre_object
 }
 
 fn hook_ctypes_array_instance(obj: pyre_object::PyObjectRef) -> bool {
-    #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
+    #[cfg(all(
+        feature = "full",
+        any(unix, windows),
+        feature = "host_env",
+        not(feature = "sandbox")
+    ))]
     {
         return module::_ctypes::metaclass::is_array_instance(obj);
     }
-    #[cfg(not(all(any(unix, windows), feature = "host_env", not(feature = "sandbox"))))]
+    #[cfg(not(all(
+        feature = "full",
+        any(unix, windows),
+        feature = "host_env",
+        not(feature = "sandbox")
+    )))]
     {
         let _ = obj;
         false
@@ -306,11 +360,21 @@ fn hook_ctypes_array_instance(obj: pyre_object::PyObjectRef) -> bool {
 }
 
 fn hook_ctypes_pointer_instance(obj: pyre_object::PyObjectRef) -> bool {
-    #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
+    #[cfg(all(
+        feature = "full",
+        any(unix, windows),
+        feature = "host_env",
+        not(feature = "sandbox")
+    ))]
     {
         return module::_ctypes::metaclass::is_pointer_instance(obj);
     }
-    #[cfg(not(all(any(unix, windows), feature = "host_env", not(feature = "sandbox"))))]
+    #[cfg(not(all(
+        feature = "full",
+        any(unix, windows),
+        feature = "host_env",
+        not(feature = "sandbox")
+    )))]
     {
         let _ = obj;
         false
@@ -323,6 +387,7 @@ fn hook_load_cffi1_module(
     init_address: usize,
 ) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
     #[cfg(all(
+        feature = "full",
         feature = "host_env",
         not(feature = "sandbox"),
         not(target_arch = "wasm32")
@@ -331,6 +396,7 @@ fn hook_load_cffi1_module(
         return module::_cffi_backend::cffi1_module::load_cffi1_module(name, path, init_address);
     }
     #[cfg(not(all(
+        feature = "full",
         feature = "host_env",
         not(feature = "sandbox"),
         not(target_arch = "wasm32")
@@ -552,6 +618,7 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
         pymath::math::ulp as *const (),
     );
     #[cfg(all(
+        feature = "full",
         not(target_arch = "wasm32"),
         feature = "host_env",
         not(feature = "sandbox")
@@ -569,6 +636,7 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
         }
     }
     #[cfg(all(
+        feature = "full",
         feature = "host_env",
         not(feature = "sandbox"),
         not(target_arch = "wasm32")
@@ -1086,7 +1154,12 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
             misc::raw_write_f64 as *const (),
         );
     }
-    #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
+    #[cfg(all(
+        feature = "full",
+        any(unix, windows),
+        feature = "host_env",
+        not(feature = "sandbox")
+    ))]
     {
         let f = module::_ctypes::cdata::cdata_bytes_object as *const ();
         single(
@@ -1107,7 +1180,12 @@ fn walk_optional_global_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     let _ = visitor;
     #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
     module::faulthandler::handler::walk_faulthandler_roots(visitor);
-    #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
+    #[cfg(all(
+        feature = "full",
+        any(unix, windows),
+        feature = "host_env",
+        not(feature = "sandbox")
+    ))]
     module::_ctypes::cdata::walk_pyobj_container_roots(visitor);
 }
 
@@ -1152,7 +1230,11 @@ fn optional_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRange
     ];
     // The rustls-backed `_ssl` aliases preserve `build_gc`'s registration
     // order for `W_SSLContext`, `W_MemoryBIO`, and `W_SSLSession`.
-    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+    #[cfg(all(
+        feature = "full",
+        not(target_arch = "wasm32"),
+        not(feature = "sandbox")
+    ))]
     {
         aliases.push(subclass_range_alias(
             190,
@@ -1178,6 +1260,7 @@ fn optional_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRange
     // `mmap.mmap` follows the optional SSL tail on ordinary Unix/Windows
     // builds. A sandbox or host_env-off build has no `mmap` module at all.
     #[cfg(all(
+        feature = "full",
         not(target_arch = "wasm32"),
         feature = "host_env",
         not(feature = "sandbox")
@@ -1196,6 +1279,7 @@ fn optional_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRange
     // `_cffi_backend` sits at the rclass tail (196 on Unix, 199 on Windows
     // where overlapped/console occupy 196-198).
     #[cfg(all(
+        feature = "full",
         feature = "host_env",
         not(feature = "sandbox"),
         not(target_arch = "wasm32")
@@ -1301,6 +1385,7 @@ mod tests {
     }
 
     #[cfg(all(
+        feature = "full",
         not(target_arch = "wasm32"),
         feature = "host_env",
         not(feature = "sandbox")
@@ -1315,7 +1400,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(unix, not(feature = "sandbox")))]
+    #[cfg(all(feature = "full", unix, not(feature = "sandbox")))]
     #[test]
     fn jit_trace_fnaddrs_covers_moved_select_wrapper() {
         let bindings: HashMap<&'static str, i64> =
@@ -1361,6 +1446,11 @@ mod tests {
         );
     }
 
+    #[cfg(all(
+        feature = "full",
+        not(target_arch = "wasm32"),
+        not(feature = "sandbox")
+    ))]
     #[test]
     fn jit_trace_fnaddrs_covers_moved_ssl_wrapper() {
         let bindings: HashMap<&'static str, i64> =
