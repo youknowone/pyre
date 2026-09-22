@@ -1596,7 +1596,8 @@ impl RegisterManager {
                     break r;
                 };
                 let old_reg = self.reg_bindings_get(*v, longevity).unwrap();
-                self.spill_moves.push((Loc::Reg(old_reg), Loc::Reg(new_reg)));
+                self.spill_moves
+                    .push((Loc::Reg(old_reg), Loc::Reg(new_reg)));
                 self.reg_bindings_set(*v, new_reg, longevity);
                 new_free_regs.push(old_reg);
             }
