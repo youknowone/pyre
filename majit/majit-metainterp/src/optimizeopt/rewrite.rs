@@ -126,31 +126,10 @@ enum RangeBound {
 /// - Guard-no-exception removal after removed calls
 /// - Range-test fusion (two constant-bounded comparisons multiplied together)
 pub struct OptRewrite {
-    /// pyre-only side-cache: (opcode, arg0, arg1) → result OpRef, the sole
-    /// record of the comparisons this pass has seen. Operands are normalized
-    /// through forwarding before they are keyed on, as `OptPure.pure_from_args2`
-    /// (`pure.py`) does, so a probe and a store describe the same value the
-    /// same way.
+    /// Comparison keyed by its result, for `comparison_producing`.
     ///
-    /// Upstream has no such map: `find_rewritable_bool` / `try_boolinvers`
-    /// (`rewrite.py`) build a synthetic `ResOperation` and look the result up
-    /// with `get_pure_result` against the shared `_pure_operations` table.
-    /// Convergence: retire this cache and route the bool lookups through the
-    /// pure optimizer's `get_pure_result` / `pure_from_args2` (both already
-    /// present at `pure.rs`) keyed off the pure-op table — coupled to the
-    /// pure-optimizer subsystem.
-    ///
-    /// A repeated comparison overwrites its key, which is why the reverse
-    /// question gets its own map below rather than a backwards scan of this
-    /// one.
-    comparison_results: indexmap::IndexMap<(OpCode, OpRef, OpRef), OpRef>,
-    /// The same records keyed by the result, for `comparison_producing`.
-    ///
-    /// Results are unique per operation, so every comparison that passes
-    /// through keeps an entry here even when a later duplicate takes over its
-    /// forward key. A consumer asks under the result CSE left live, which is
-    /// the *earlier* of a duplicate pair — the one the forward map no longer
-    /// names.
+    /// Written as the comparison passes through this pass, so a consumer
+    /// can see it before a later pass emits it.
     comparison_by_result: indexmap::IndexMap<OpRef, (OpCode, OpRef, OpRef)>,
     /// rewrite.py:39: loop_invariant_results — cache for CALL_LOOPINVARIANT results.
     /// Key: function pointer (arg0 as i64).
@@ -164,7 +143,6 @@ pub struct OptRewrite {
 impl OptRewrite {
     pub fn new() -> Self {
         OptRewrite {
-            comparison_results: indexmap::IndexMap::new(),
             comparison_by_result: indexmap::IndexMap::new(),
             loop_invariant_results: indexmap::IndexMap::new(),
             loop_invariant_producer: indexmap::IndexMap::new(),
@@ -698,13 +676,10 @@ impl OptRewrite {
 
     /// Comparison folds (constant folds, knownbits eq/ne, eq_zero /
     /// eq_one / eq_sub_eq) live in OptIntBounds, as upstream. This arm
-    /// only records the comparison result for `find_rewritable_bool`
-    /// (inverse/reflex lookup).
+    /// records the comparison for `comparison_producing`.
     fn optimize_comparison(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.resolve_operand_operand(&op.arg(0)).to_opref();
         let arg1 = ctx.resolve_operand_operand(&op.arg(1)).to_opref();
-        self.comparison_results
-            .insert((op.opcode, arg0, arg1), op.pos().get());
         self.comparison_by_result
             .insert(op.pos().get(), (op.opcode, arg0, arg1));
 
@@ -1670,67 +1645,54 @@ impl OptRewrite {
 
     // ── Boolean inverse/reflex rewrites ──
 
-    /// For comparison ops that have a bool_inverse or bool_reflex:
-    /// Check if we already computed the inverse/reflex and can reuse that result.
+    /// `Optimization.get_pure_result` for a two-argument synthetic op.
     ///
-    /// This mirrors `find_rewritable_bool` from rewrite.py: if we see INT_LT(a, b)
-    /// and we previously computed INT_GE(a, b) = K (a constant 0 or 1), then
-    /// INT_LT(a, b) = 1 - K.
-    /// rewrite.py: find_rewritable_bool(op)
-    /// If we see INT_LT(a, b) and previously computed INT_GE(a, b) = K,
-    /// then INT_LT(a, b) = 1 - K (boolean inverse).
-    /// rewrite.py try_boolinvers — check if the inverse operation has
-    /// a cached boolean result and negate it.
-    ///
-    /// RPython uses get_pure_result(targs) + getintbound(oldop).known_eq_const()
-    /// which recognizes values that are guaranteed to be 0 or 1 even if not
-    /// explicitly constant-folded. We match this by checking IntBound in
-    /// addition to direct constant lookup.
-    fn try_boolinvers(
+    /// Builds the op `OptRewrite.try_boolinvers` / `find_rewritable_bool`
+    /// would hand to `get_pure_result`, then reads the ring `OptPure`
+    /// publishes. The ring is bounded (`pureop_historylength`); a miss
+    /// after that many pure ops is the same miss upstream takes. The
+    /// ring is cleared in `OptPure.setup` at the start of each optimize
+    /// run — `OptPure.flush` does not clear it, and no label op does
+    /// either — so this pass does not clear it again.
+    fn get_pure_result(
         &self,
-        op: &Op,
-        inverse_opcode: OpCode,
-        arg0: OpRef,
-        arg1: OpRef,
+        opcode: OpCode,
+        args: [Operand; 2],
         ctx: &mut OptContext,
-    ) -> Option<OptimizationResult> {
-        let key = (inverse_opcode, arg0, arg1);
-        let cached_ref = self.comparison_results.get(&key).copied()?;
-        // rewrite.py:60-65: b = self.getintbound(oldop)
-        // First try direct constant (fast path)
-        if let Some(val) = ctx
-            .get_box_replacement_operand_opt(cached_ref)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
-            let result = 1 - val;
-            let b = ctx.materialize_operand_at(op.pos().get());
-            ctx.make_constant_box(&b, Value::Int(result));
-            return Some(OptimizationResult::Remove);
-        }
-        // rewrite.py:61-65: b.known_eq_const(1) / b.known_eq_const(0)
-        // Intbound analysis: the value may be bounded to exactly 0 or 1
-        // even without being a constant in the optimizer's sense.
-        if let Some(bound) = ctx
-            .get_box_replacement_operand_opt(cached_ref)
-            .and_then(|b| ctx.peek_intbound_box(&b))
-        {
-            if bound.known_eq_const(1) {
-                let b = ctx.materialize_operand_at(op.pos().get());
-                ctx.make_constant_box(&b, Value::Int(0));
-                return Some(OptimizationResult::Remove);
-            } else if bound.known_eq_const(0) {
-                let b = ctx.materialize_operand_at(op.pos().get());
-                ctx.make_constant_box(&b, Value::Int(1));
-                return Some(OptimizationResult::Remove);
-            }
-        }
-        None
+    ) -> Option<OpRef> {
+        let synthetic = Op::new(opcode, &args);
+        ctx.get_pure_result(&synthetic)
     }
 
-    /// rewrite.py:68-93 find_rewritable_bool — three-phase boolean rewrite:
-    /// 1. boolinverse(same args)
-    /// 2. boolreflex(swapped args)
-    /// 3. boolreflex.boolinverse(swapped args)
+    /// `OptRewrite.try_boolinvers`: look up the synthetic inverse and,
+    /// when its intbound is exactly 0 or 1, fold this op to the other bit.
+    fn try_boolinvers(&self, op: &Op, top: &Op, ctx: &mut OptContext) -> bool {
+        let Some(old) = self.get_pure_result(top.opcode, [top.arg(0), top.arg(1)], ctx) else {
+            return false;
+        };
+        let resolved = match ctx.get_box_replacement_operand_opt(old) {
+            Some(b) => b,
+            None => ctx.materialize_operand_at(old),
+        };
+        let Some(bound) = ctx.peek_intbound_box(&resolved) else {
+            return false;
+        };
+        let value = if bound.known_eq_const(1) {
+            0
+        } else if bound.known_eq_const(0) {
+            1
+        } else {
+            return false;
+        };
+        let b = ctx.materialize_operand_at(op.pos().get());
+        ctx.make_constant_box(&b, Value::Int(value));
+        true
+    }
+
+    /// `OptRewrite.find_rewritable_bool`, three phases:
+    /// 1. `boolinverse` on the same args, via `try_boolinvers`
+    /// 2. `boolreflex` on the swapped args, aliased with `make_equal_to`
+    /// 3. `boolreflex`'s `boolinverse` on the swapped args, via `try_boolinvers`
     fn find_rewritable_bool(
         &self,
         op: &Op,
@@ -1740,37 +1702,32 @@ impl OptRewrite {
         if op.num_args() < 2 {
             return None;
         }
-        // Probe with the same normalization the recording arm stores under, so
-        // a value renamed by `make_equal_to` between the comparison and its
-        // consumer still finds its entry.
-        let arg0 = ctx.resolve_operand_operand(&op.arg(0)).to_opref();
-        let arg1 = ctx.resolve_operand_operand(&op.arg(1)).to_opref();
+        let arg0 = op.arg(0);
+        let arg1 = op.arg(1);
 
-        // rewrite.py:72-75: boolinverse(arg0, arg1)
-        if let Some(inverse_opcode) = op.opcode.bool_inverse()
-            && let Some(result) = self.try_boolinvers(op, inverse_opcode, arg0, arg1, ctx)
-        {
-            return Some(result);
-        }
-
-        // rewrite.py:77-83: boolreflex(arg1, arg0)
-        if let Some(reflex_opcode) = op.opcode.bool_reflex() {
-            let key = (reflex_opcode, arg1, arg0);
-            if let Some(&cached_ref) = self.comparison_results.get(&key) {
-                let b_old = Operand::from_bound_op(op_rc);
-                let b_cached = ctx.get_box_replacement_operand(cached_ref);
-                ctx.make_equal_to(&b_old, &b_cached);
+        if let Some(inverse) = op.opcode.bool_inverse() {
+            let top = Op::new(inverse, &[arg0.clone(), arg1.clone()]);
+            if self.try_boolinvers(op, &top, ctx) {
                 return Some(OptimizationResult::Remove);
             }
-
-            // rewrite.py:87-91: boolreflex.boolinverse(arg1, arg0)
-            if let Some(reflex_inverse) = reflex_opcode.bool_inverse()
-                && let Some(result) = self.try_boolinvers(op, reflex_inverse, arg1, arg0, ctx)
-            {
-                return Some(result);
-            }
         }
 
+        let Some(reflex) = op.opcode.bool_reflex() else {
+            return None;
+        };
+        let top = Op::new(reflex, &[arg1.clone(), arg0.clone()]);
+        if let Some(old) = self.get_pure_result(top.opcode, [top.arg(0), top.arg(1)], ctx) {
+            let b_old = Operand::from_bound_op(op_rc);
+            let b_cached = ctx.get_box_replacement_operand(old);
+            ctx.make_equal_to(&b_old, &b_cached);
+            return Some(OptimizationResult::Remove);
+        }
+        if let Some(reflex_inverse) = reflex.bool_inverse() {
+            let top = Op::new(reflex_inverse, &[arg1, arg0]);
+            if self.try_boolinvers(op, &top, ctx) {
+                return Some(OptimizationResult::Remove);
+            }
+        }
         None
     }
 
@@ -2593,7 +2550,6 @@ impl Optimization for OptRewrite {
         // ctx.last_op_removed is initialised by OptContext::new() and
         // maintained cross-pass by propagate_from_pass_range +
         // emit_operation — no per-pass setup needed.
-        self.comparison_results.clear();
         self.comparison_by_result.clear();
         self.loop_invariant_results.clear();
         self.loop_invariant_producer.clear();

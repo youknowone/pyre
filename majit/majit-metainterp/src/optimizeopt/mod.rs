@@ -1292,6 +1292,11 @@ pub struct OptContext {
     /// by OptPure. Each entry: (opcode, arg0, arg1, result) meaning
     /// pure(opcode, arg0, arg1) = result.
     pub pending_pure_from_args2: Vec<(OpCode, OpRef, OpRef, OpRef)>,
+    /// Live recent-ops ring. `OptPure` owns the allocation and publishes
+    /// the handle; `OptRewrite.find_rewritable_bool` reads it the way
+    /// `Optimization.get_pure_result` reads `optimizer.optpure`. Cleared
+    /// by `OptPure.setup` (each optimize run), not by a label op.
+    pub(crate) pure_ops: Option<pure::SharedPureOps>,
     /// optimizer.py: constant_fold allocator callback.
     /// When set, the optimizer can fold immutable virtuals filled with
     /// constants into compile-time constant pointers (info.py:140-145).
@@ -2286,6 +2291,7 @@ impl OptContext {
             pending_for_guard: Vec::new(),
             pending_pure_from_args: Vec::new(),
             pending_pure_from_args2: Vec::new(),
+            pure_ops: None,
             constant_fold_alloc: None,
             string_length_resolver: None,
             string_content_resolver: None,
@@ -2968,6 +2974,7 @@ impl OptContext {
             pending_for_guard: Vec::new(),
             pending_pure_from_args: Vec::new(),
             pending_pure_from_args2: Vec::new(),
+            pure_ops: None,
             constant_fold_alloc: None,
             string_length_resolver: None,
             string_content_resolver: None,
@@ -3065,6 +3072,7 @@ impl OptContext {
         self.pending_for_guard.clear();
         self.pending_pure_from_args.clear();
         self.pending_pure_from_args2.clear();
+        self.pure_ops = None;
         self.constant_fold_alloc = None;
         self.string_length_resolver = None;
         self.string_content_resolver = None;
@@ -5241,6 +5249,12 @@ impl OptContext {
     pub fn pure_from_args_arraylen(&mut self, array_ref: OpRef, length: i64) {
         let len_ref = self.emit_constant_int(length);
         self.register_pure_from_args1(OpCode::ArraylenGc, array_ref, len_ref);
+    }
+
+    /// Probe the pure-op ring for `op`. Empty until `OptPure` publishes.
+    pub fn get_pure_result(&mut self, op: &Op) -> Option<OpRef> {
+        let table = self.pure_ops.clone()?;
+        pure::shared_get_pure_result(&table, op, self)
     }
 
     /// optimizer.py: pure_from_args2 parity.
