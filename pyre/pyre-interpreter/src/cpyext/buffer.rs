@@ -528,25 +528,8 @@ pub unsafe fn release_view(mv: PyObjectRef, backing: PyObjectRef) -> bool {
 /// identity and a class derived from `bytearray` exports what `bytearray`
 /// does.
 pub(super) fn declares_buffer(w_type: PyObjectRef) -> bool {
-    let derived = |key: *const pyre_object::pyobject::PyType| {
-        crate::typedef::gettypefor(key).is_some_and(|class| unsafe {
-            crate::baseobjspace::issubtype_w(w_type, class.as_ptr())
-        })
-    };
-    // `bytes` is the read-only one; the rest export writable storage.
-    if derived(&pyre_object::bytesobject::BYTES_TYPE)
-        || derived(&pyre_object::bytearrayobject::BYTEARRAY_TYPE)
-        || derived(&pyre_object::memoryview::MEMORYVIEW_TYPE)
-        || derived(&pyre_object::interp_array::ARRAY_TYPE)
-    {
-        return true;
-    }
-    #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
-    if derived(<crate::module::mmap::interp_mmap::W_MMap as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE)
-    {
-        return true;
-    }
-    false
+    // TypeDef.__buffer, including a base that declared it.
+    unsafe { pyre_object::w_type_declares_buffer(w_type) }
 }
 
 /// What one export by [`interp_bf_getbuffer`] owns beyond the words it wrote

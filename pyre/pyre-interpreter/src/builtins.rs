@@ -79,8 +79,8 @@ pub(crate) unsafe fn backing_exports_incref(buffer: &pyre_object::buffer::Buffer
                 // unmap while this one still reads the mapping.
                 let _ = w_obj;
                 #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
-                if crate::module::mmap::interp_mmap::is_mmap(*w_obj) {
-                    crate::module::mmap::interp_mmap::mmap_exports_incref(*w_obj);
+                if pyre_object::buffer::has_external_buffer_layout(*w_obj) {
+                    unsafe { pyre_object::buffer::external_buffer_acquire(*w_obj) };
                 }
             }
             _ => {}
@@ -115,8 +115,8 @@ pub unsafe fn buffer_export_incref(obj: PyObjectRef) -> bool {
             return true;
         }
         #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
-        if crate::module::mmap::interp_mmap::is_mmap(obj) {
-            crate::module::mmap::interp_mmap::mmap_exports_incref(obj);
+        if pyre_object::buffer::has_external_buffer_layout(obj) {
+            unsafe { pyre_object::buffer::external_buffer_acquire(obj) };
             return true;
         }
     }
@@ -138,7 +138,7 @@ pub unsafe fn buffer_export_decref(obj: PyObjectRef) {
             pyre_object::memoryview::w_memoryview_exports_decref(obj);
         } else {
             #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
-            crate::module::mmap::interp_mmap::mmap_exports_decref(obj);
+            pyre_object::buffer::external_buffer_release(obj);
         }
     }
 }
@@ -502,7 +502,7 @@ unsafe fn w_memoryview_new_mmap(
         // Unlike the GC-owned exporters, the mapping is foreign memory that
         // `close`/`resize` hand straight back to the kernel, so the window
         // must keep it from being unmapped while this view can still read it.
-        crate::module::mmap::interp_mmap::mmap_exports_incref(r_obj);
+        pyre_object::buffer::external_buffer_acquire(r_obj);
         mv
     }
 }
@@ -673,7 +673,7 @@ unsafe fn w_memoryview_new_python_buffer(
 /// `memoryview(obj)` — acquire a 1-D byte view over a buffer-providing
 /// exporter.  Sharing another memoryview copies its view parameters (and
 /// reports the original exporter as `.obj`); a non-buffer raises TypeError.
-pub(crate) fn w_memoryview_new(w_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+pub fn w_memoryview_new(w_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     // `PyMemoryView_FromObject` requests the full read-only buffer interface.
     w_memoryview_new_with_flags(w_obj, 0x011c)
 }
@@ -742,13 +742,8 @@ fn w_memoryview_new_with_flags_impl(
             // keeps its zero-copy window and derived geometry.
             return Ok(w_memoryview_copy_derived(w_obj));
         }
-        #[cfg(all(
-            feature = "host_env",
-            not(feature = "sandbox"),
-            not(target_arch = "wasm32")
-        ))]
-        if let Some((address, length)) =
-            crate::module::_cffi_backend::cbuffer::mini_buffer_params(w_obj)
+        if let Some(hooks) = crate::importing::optional_module_hooks()
+            && let Some((address, length)) = (hooks.mini_buffer_params)(w_obj)
         {
             use pyre_object::buffer::Buffer;
             use pyre_object::bufferview::BufferView;
@@ -771,13 +766,13 @@ fn w_memoryview_new_with_flags_impl(
             return Ok(mv);
         }
         #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
-        if let Some(view) = crate::module::mmap::interp_mmap::mmap_buffer_view(w_obj) {
-            let (address, length, readonly) = view?;
+        if let Some(view) = pyre_object::buffer::external_buffer_view(w_obj) {
+            let (address, length, readonly) = view.map_err(crate::PyError::value_error)?;
             return Ok(w_memoryview_new_mmap(w_obj, address, length, readonly));
         }
-        #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
-        if let Some((backing_obj, offset, byte_len, fmt, itemsize, shape)) =
-            crate::module::_ctypes::cdata::cdata_buffer_view(w_obj)
+        if let Some(hooks) = crate::importing::optional_module_hooks()
+            && let Some((backing_obj, offset, byte_len, fmt, itemsize, shape)) =
+                (hooks.ctypes_buffer_view)(w_obj)
         {
             use pyre_object::buffer::Buffer;
             use pyre_object::bufferview::BufferView;
@@ -2076,8 +2071,8 @@ fn memoryview_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 /// release.  Returns `true` when it handled the backing.
 unsafe fn release_external_backing(mv: PyObjectRef, backing: PyObjectRef) -> bool {
     #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
-    if crate::module::mmap::interp_mmap::is_mmap(backing) {
-        unsafe { crate::module::mmap::interp_mmap::mmap_exports_decref(backing) };
+    if pyre_object::buffer::has_external_buffer_layout(backing) {
+        unsafe { pyre_object::buffer::external_buffer_release(backing) };
         return true;
     }
     // A C exporter's `bf_releasebuffer` is handed back the exact `Py_buffer`
@@ -5485,7 +5480,7 @@ pub fn has_real_kwargs(kwargs: Option<PyObjectRef>) -> bool {
 /// [`call_forwarding_args`] rebuilds the keywords with: `w_dict_str_entries`
 /// drops a `**{'\udc80': v}` key outright, which would make this report a
 /// keyword-free call and let the keyword be silently discarded.
-pub(crate) fn real_kwarg_count(kwargs: Option<PyObjectRef>) -> usize {
+pub fn real_kwarg_count(kwargs: Option<PyObjectRef>) -> usize {
     let Some(dict) = kwargs else {
         return 0;
     };
@@ -5564,7 +5559,7 @@ pub fn kwarg_reject_unknown(
 /// falls back to the matching keyword.  Raises the argument-clinic
 /// "given by name and position" TypeError when the same parameter is supplied
 /// both ways.  `pos_index` is the 1-based position used in that message.
-pub(crate) fn bind_pos_or_kw(
+pub fn bind_pos_or_kw(
     positional: &[PyObjectRef],
     kwargs: Option<PyObjectRef>,
     slot: usize,
@@ -5597,7 +5592,7 @@ pub fn has_builtin_kwargs(args: &[PyObjectRef]) -> bool {
 /// raises the `argument.py:_match_keywords` TypeError
 /// "argument for X() given by name ('name') and position (N)" (N is the
 /// 1-based positional index of the slot).  An absent argument is `None`.
-pub(crate) fn resolve_pos_or_kw(
+pub fn resolve_pos_or_kw(
     positional: Option<PyObjectRef>,
     kwargs: Option<PyObjectRef>,
     name: &str,
@@ -5630,7 +5625,7 @@ pub(crate) fn resolve_pos_or_kw(
 /// argument (2 given)"); only the positional message names an exact count,
 /// and only when every positional slot is required (`itertools.batched([], 1,
 /// 2)` reports "takes exactly 2 positional arguments (3 given)").
-pub(crate) fn clinic_arity(
+pub fn clinic_arity(
     fn_name: &str,
     npos: usize,
     nkw: usize,
@@ -5888,7 +5883,7 @@ fn parse_single_required(
 
 /// Reject `f(x, name=...)` when `name` already arrived positionally.
 /// The flat builtin ABI leaves this validation to each kw-aware method.
-pub(crate) fn kwarg_reject_duplicate(
+pub fn kwarg_reject_duplicate(
     kwargs: Option<PyObjectRef>,
     fn_name: &str,
     name: &str,
@@ -6243,7 +6238,7 @@ fn min_max_multiple_args(
 /// slip past `precheck_for_new` and build a class, and it is why `_ast`'s
 /// `register_module` has to name `type` explicitly rather than rely on a scan
 /// to default it.
-pub(crate) fn type_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn type_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // The class-definition keywords arrive as a trailing `__pyre_kw__`
     // dict (the builtin kwargs ABI); strip it before the arity check and
     // hand it to __init_subclass__ via `type_descr_new_with_metaclass`.
@@ -7774,7 +7769,7 @@ use crate::module::posix::interp_posix_wasm as wasm_fd;
 /// Kept in sync with the `errno` module's host_env-off fallback so the errno →
 /// OSError-subclass remap selects the subclass a given `errno.X` value implies.
 #[cfg(target_arch = "wasm32")]
-pub(crate) mod wasm_errno {
+pub mod wasm_errno {
     pub const EAGAIN: i32 = 35;
     pub const EWOULDBLOCK: i32 = 35;
     pub const EINPROGRESS: i32 = 36;
@@ -8007,7 +8002,7 @@ pub(crate) fn set_crt_errno(value: i32) {
 }
 
 /// The errno the last C runtime call reported.
-pub(crate) fn crt_errno() -> i32 {
+pub fn crt_errno() -> i32 {
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     {
         rustpython_host_env::os::get_errno()
@@ -8734,7 +8729,7 @@ fn os_error_family_new(
     Ok(exc)
 }
 
-pub(crate) fn exc_os_error_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn exc_os_error_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     os_error_family_new(args, exc_os_error)
 }
 
@@ -9543,7 +9538,7 @@ fn exception_overridetypedef(
 /// `UnicodeDecodeError.__new__(cls, *args)` call would inherit the
 /// typechecking that PyPy keeps confined to `descr_init` — see
 /// `_new` at `:274-284` (no per-arg validation).
-pub(crate) fn make_exc_type_with_init(
+pub fn make_exc_type_with_init(
     name: &'static str,
     doc: Option<&'static str>,
     new_fn: crate::gateway::BuiltinCodeFn,
@@ -10151,7 +10146,7 @@ pub(crate) fn make_exc_type_with_init(
 /// Both classes built this way — `io.UnsupportedOperation` and
 /// `ssl.SSLCertVerificationError` — come from `PyErr_NewException*`, so both
 /// are weak-referenceable for the reason [`new_exception_class`] gives.
-pub(crate) fn make_exc_type_multi(
+pub fn make_exc_type_multi(
     name: &'static str,
     new_fn: crate::gateway::BuiltinCodeFn,
     bases: &[PyObjectRef],
@@ -11225,7 +11220,7 @@ pub fn is_build_class_builtin(obj: PyObjectRef) -> bool {
 }
 
 /// `str(obj)` → convert to string
-pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (pos, kwargs) = split_builtin_kwargs(args);
     kwarg_reject_unknown(kwargs, &["object", "encoding", "errors"], "str")?;
     let kw_count = kwargs
@@ -11412,7 +11407,7 @@ unsafe fn py_repr_obj(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
 }
 
 /// `repr(obj)` → string representation
-pub(crate) fn builtin_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn builtin_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() != 1 {
         return Err(crate::PyError::type_error(format!(
             "repr() takes exactly one argument ({} given)",
@@ -11877,7 +11872,7 @@ pub(crate) fn int_max_str_digits_error(maxdigits: i32) -> crate::PyError {
 /// conversion guard. The bit-length lower bound rejects enormous values
 /// before the quadratic decimal conversion; the resulting string supplies
 /// the exact boundary check.
-pub(crate) unsafe fn int_to_decimal_string(obj: PyObjectRef) -> Result<String, crate::PyError> {
+pub unsafe fn int_to_decimal_string(obj: PyObjectRef) -> Result<String, crate::PyError> {
     let owned;
     let value = if pyre_object::is_bool(obj) {
         owned = BigInt::from(pyre_object::w_bool_get_value(obj) as i64);
@@ -12010,7 +12005,7 @@ pub(crate) fn builtin_int_float_dunder(
 }
 
 /// `float(obj)` → convert to float
-pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Ok(floatobject::w_float_new(0.0));
     }
@@ -16746,7 +16741,7 @@ fn builtin_eval(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     exec_or_eval(source, globals_arg, locals_arg, true, pyre_object::PY_NULL)
 }
 
-pub(crate) fn exec_or_eval(
+pub fn exec_or_eval(
     source: PyObjectRef,
     globals_arg: PyObjectRef,
     locals_arg: PyObjectRef,
@@ -20258,7 +20253,7 @@ fn file_check_writable(self_obj: PyObjectRef) -> Result<(), crate::PyError> {
 
 /// One `space.acquire_writebuf` export held for a FileIO `readinto` call.
 /// PyPy's `with view:` keeps this lock until after `output_slice`/`c_read`.
-pub(crate) struct WritableBuffer {
+pub struct WritableBuffer {
     _roots: pyre_object::gc_roots::RootScope,
     owner_slot: usize,
     held: bool,
@@ -20271,7 +20266,7 @@ pub(crate) struct WritableBuffer {
 }
 
 impl WritableBuffer {
-    pub(crate) unsafe fn acquire(obj: PyObjectRef) -> Result<Self, crate::PyError> {
+    pub unsafe fn acquire(obj: PyObjectRef) -> Result<Self, crate::PyError> {
         // `space.acquire_writebuf` owns a traced exporter for the complete
         // `with view:` extent.  Root both the requested object and the
         // concrete storage owner so Python called while the buffer is live
@@ -20308,7 +20303,7 @@ impl WritableBuffer {
         })
     }
 
-    pub(crate) unsafe fn as_mut_slice(&mut self) -> &mut [u8] {
+    pub unsafe fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.address, self.length) }
     }
 }
@@ -20334,13 +20329,8 @@ impl Drop for WritableBuffer {
 /// `array.array`'s element bytes, and a contiguous memoryview's window.
 pub unsafe fn acquire_readbuf<'a>(obj: PyObjectRef) -> Result<&'a [u8], crate::PyError> {
     unsafe {
-        #[cfg(all(
-            feature = "host_env",
-            not(feature = "sandbox"),
-            not(target_arch = "wasm32")
-        ))]
-        if let Some((address, length)) =
-            crate::module::_cffi_backend::cbuffer::mini_buffer_params(obj)
+        if let Some(hooks) = crate::importing::optional_module_hooks()
+            && let Some((address, length)) = (hooks.mini_buffer_params)(obj)
         {
             return Ok(std::slice::from_raw_parts(address, length));
         }
@@ -20349,8 +20339,8 @@ pub unsafe fn acquire_readbuf<'a>(obj: PyObjectRef) -> Result<&'a [u8], crate::P
         }
         // `W_MMap.readbuf_w` — the live mapping.
         #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
-        if let Some(view) = crate::module::mmap::interp_mmap::mmap_buffer_view(obj) {
-            let (address, length, _readonly) = view?;
+        if let Some(view) = pyre_object::buffer::external_buffer_view(obj) {
+            let (address, length, _readonly) = view.map_err(crate::PyError::value_error)?;
             return Ok(std::slice::from_raw_parts(address as *const u8, length));
         }
         if pyre_object::interp_array::is_array(obj) {
@@ -20400,13 +20390,8 @@ pub unsafe fn fileio_writebuf(
     }
 
     unsafe {
-        #[cfg(all(
-            feature = "host_env",
-            not(feature = "sandbox"),
-            not(target_arch = "wasm32")
-        ))]
-        if let Some((address, length)) =
-            crate::module::_cffi_backend::cbuffer::mini_buffer_params(obj)
+        if let Some(hooks) = crate::importing::optional_module_hooks()
+            && let Some((address, length)) = (hooks.mini_buffer_params)(obj)
         {
             return Ok((std::slice::from_raw_parts_mut(address, length), obj, false));
         }
@@ -20425,8 +20410,8 @@ pub unsafe fn fileio_writebuf(
             ));
         }
         #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
-        if let Some(view) = crate::module::mmap::interp_mmap::mmap_buffer_view(obj) {
-            let (address, length, readonly) = view?;
+        if let Some(view) = pyre_object::buffer::external_buffer_view(obj) {
+            let (address, length, readonly) = view.map_err(crate::PyError::value_error)?;
             if !readonly {
                 return Ok((
                     std::slice::from_raw_parts_mut(address as *mut u8, length),
@@ -20435,9 +20420,9 @@ pub unsafe fn fileio_writebuf(
                 ));
             }
         }
-        #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
-        if let Some((backing, offset, length, _format, _itemsize, _shape)) =
-            crate::module::_ctypes::cdata::cdata_buffer_view(obj)
+        if let Some(hooks) = crate::importing::optional_module_hooks()
+            && let Some((backing, offset, length, _format, _itemsize, _shape)) =
+                (hooks.ctypes_buffer_view)(obj)
         {
             let full = pyre_object::bytearrayobject::w_bytearray_data_mut(backing);
             if offset <= full.len() && length <= full.len() - offset {

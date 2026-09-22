@@ -5,8 +5,8 @@
 use crate::importing::BUILTIN_MODULES;
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
 use std::ffi::CString;
-use std::sync::atomic::{AtomicI64, AtomicPtr, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicI64, AtomicPtr, Ordering};
 
 struct FrozenModule {
     name: &'static str,
@@ -160,7 +160,7 @@ fn build_frozen_abi_table(entries: &[FrozenModule]) -> usize {
 /// concatenated order remains exactly `FROZEN_MODULES`, the list returned by
 /// `_imp._frozen_module_names()`.
 #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
-pub(crate) fn frozen_abi_pointer_variable(name: &str) -> Option<usize> {
+pub fn frozen_abi_pointer_variable(name: &str) -> Option<usize> {
     static BOOTSTRAP: OnceLock<usize> = OnceLock::new();
     static STDLIB: OnceLock<usize> = OnceLock::new();
     static TEST: OnceLock<usize> = OnceLock::new();
@@ -302,9 +302,7 @@ impl ImportRLock {
             // lock is allocated before user code runs and the branch stops
             // being observable either way.
             // importing.py:201-203
-            return Err(crate::PyError::runtime_error(
-                "not holding the import lock",
-            ));
+            return Err(crate::PyError::runtime_error("not holding the import lock"));
         }
         debug_assert!(self.lockcounter.load(Ordering::Relaxed) > 0);
         // importing.py:204-207 — clear the owner BEFORE releasing, so the
@@ -423,10 +421,7 @@ fn frozen_module(name: &Wtf8) -> Option<&'static FrozenModule> {
 }
 
 fn is_bootstrap_frozen(name: &str) -> bool {
-    matches!(
-        name,
-        "_frozen_importlib" | "_frozen_importlib_external"
-    )
+    matches!(name, "_frozen_importlib" | "_frozen_importlib_external")
 }
 
 fn frozen_module_served(entry: &FrozenModule) -> bool {
@@ -601,11 +596,7 @@ fn frozen_code(entry: &FrozenModule) -> Result<pyre_object::PyObjectRef, crate::
         &filename,
     )
     .map_err(|error| {
-        crate::builtins::compile_err_to_syntax_error(
-            error,
-            &source,
-            crate::compile::Mode::Exec,
-        )
+        crate::builtins::compile_err_to_syntax_error(error, &source, crate::compile::Mode::Exec)
     })?;
     let w_code = crate::box_code_object(code);
     if let Some(key) = cache_key {
@@ -639,7 +630,9 @@ pub(crate) fn load_pyc_script(bytes: &[u8]) -> Result<pyre_object::PyObjectRef, 
     };
     let w_code = crate::module::marshal::loads_bytes(payload)?;
     if !unsafe { crate::is_code(w_code) } {
-        return Err(crate::PyError::runtime_error("Bad code object in .pyc file"));
+        return Err(crate::PyError::runtime_error(
+            "Bad code object in .pyc file",
+        ));
     }
     Ok(w_code)
 }
@@ -669,10 +662,16 @@ fn frozen_cache_base() -> Option<&'static FrozenCacheBase> {
         let exe = std::env::current_exe().ok()?;
         let exe_name = exe.file_name()?.to_str()?.to_owned();
         let modified = std::fs::metadata(&exe).ok()?.modified().ok()?;
-        let binary_mtime =
-            modified.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos() as u64;
+        let binary_mtime = modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos() as u64;
         let dir = crate::importing::detect_stdlib_path()?.join("__pycache__");
-        Some(FrozenCacheBase { dir, exe_name, binary_mtime })
+        Some(FrozenCacheBase {
+            dir,
+            exe_name,
+            binary_mtime,
+        })
     })
     .as_ref()
 }
@@ -754,12 +753,16 @@ pub(crate) fn frozen_cache_store(cache_key: &str, source: &str, code: pyre_objec
 }
 
 #[cfg(any(not(feature = "host_env"), feature = "sandbox"))]
-pub(crate) fn frozen_cache_load(_cache_key: &str, _source: &str) -> Option<pyre_object::PyObjectRef> {
+pub(crate) fn frozen_cache_load(
+    _cache_key: &str,
+    _source: &str,
+) -> Option<pyre_object::PyObjectRef> {
     None
 }
 
 #[cfg(any(not(feature = "host_env"), feature = "sandbox"))]
-pub(crate) fn frozen_cache_store(_cache_key: &str, _source: &str, _code: pyre_object::PyObjectRef) {}
+pub(crate) fn frozen_cache_store(_cache_key: &str, _source: &str, _code: pyre_object::PyObjectRef) {
+}
 
 /// The `data` element of a `withdata=True` `find_frozen` result: a read-only
 /// `memoryview` over the frozen bytes, so `marshal.loads(bytes(data))`
@@ -1043,52 +1046,50 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // on; registering one would declare a call shape the closure does not
         // actually require.
         crate::make_builtin_function("get_frozen_object", |args| {
-                let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-                if crate::builtins::has_real_kwargs(kwargs) {
-                    return Err(crate::PyError::type_error(
-                        "_imp.get_frozen_object() takes no keyword arguments",
-                    ));
-                }
-                if positional.len() > 2 {
+            let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+            if crate::builtins::has_real_kwargs(kwargs) {
+                return Err(crate::PyError::type_error(
+                    "_imp.get_frozen_object() takes no keyword arguments",
+                ));
+            }
+            if positional.len() > 2 {
+                return Err(crate::PyError::type_error(format!(
+                    "get_frozen_object expected at most 2 arguments, got {}",
+                    positional.len()
+                )));
+            }
+            let name = frozen_name(positional, "get_frozen_object")?;
+            // `_imp_get_frozen_object_impl`: a `data` buffer stands in for
+            // the frozen table entry, so those bytes are unmarshalled
+            // directly and a stream that does not decode reports the object
+            // as invalid rather than as missing.
+            let data = positional
+                .get(1)
+                .copied()
+                .filter(|&data| !unsafe { pyre_object::is_none(data) });
+            if let Some(data) = data {
+                let Some(buffer) = crate::typedef::buffer_as_bytes_like(data)? else {
                     return Err(crate::PyError::type_error(format!(
-                        "get_frozen_object expected at most 2 arguments, got {}",
-                        positional.len()
+                        "get_frozen_object() argument 2 must be bytes, not {}",
+                        bad_argument_type_name(data)
+                    )));
+                };
+                // Owned before the unmarshal allocates: the buffer may be a
+                // freshly minted bytes that nothing roots.
+                let bytes = unsafe { pyre_object::bytesobject::bytes_like_data(buffer) }.to_vec();
+                let code = crate::module::marshal::loads_bytes(&bytes)
+                    .map_err(|_| invalid_frozen_error(&name))?;
+                if !unsafe { crate::is_code(code) } {
+                    return Err(crate::PyError::type_error(format!(
+                        "frozen object {} is not a code object",
+                        frozen_name_repr(&name)
                     )));
                 }
-                let name = frozen_name(positional, "get_frozen_object")?;
-                // `_imp_get_frozen_object_impl`: a `data` buffer stands in for
-                // the frozen table entry, so those bytes are unmarshalled
-                // directly and a stream that does not decode reports the object
-                // as invalid rather than as missing.
-                let data = positional
-                    .get(1)
-                    .copied()
-                    .filter(|&data| !unsafe { pyre_object::is_none(data) });
-                if let Some(data) = data {
-                    let Some(buffer) = crate::typedef::buffer_as_bytes_like(data)? else {
-                        return Err(crate::PyError::type_error(format!(
-                            "get_frozen_object() argument 2 must be bytes, not {}",
-                            bad_argument_type_name(data)
-                        )));
-                    };
-                    // Owned before the unmarshal allocates: the buffer may be a
-                    // freshly minted bytes that nothing roots.
-                    let bytes =
-                        unsafe { pyre_object::bytesobject::bytes_like_data(buffer) }.to_vec();
-                    let code = crate::module::marshal::loads_bytes(&bytes)
-                        .map_err(|_| invalid_frozen_error(&name))?;
-                    if !unsafe { crate::is_code(code) } {
-                        return Err(crate::PyError::type_error(format!(
-                            "frozen object {} is not a code object",
-                            frozen_name_repr(&name)
-                        )));
-                    }
-                    return Ok(code);
-                }
-                let entry =
-                    served_frozen_module(&name).ok_or_else(|| missing_frozen_error(&name))?;
-                frozen_code(entry)
-            }),
+                return Ok(code);
+            }
+            let entry = served_frozen_module(&name).ok_or_else(|| missing_frozen_error(&name))?;
+            frozen_code(entry)
+        }),
     );
     crate::module_ns_store(
         ns,
@@ -1131,13 +1132,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // reported by returning None, leaving the diagnostic to
                 // `BuiltinImporter.create_module`, which has already screened
                 // the name against `sys.builtin_module_names`.
-                Ok(
-                    crate::importing::create_builtin_module(
-                        &name,
-                        crate::call::getexecutioncontext(),
-                    )?
-                    .unwrap_or_else(pyre_object::w_none),
-                )
+                Ok(crate::importing::create_builtin_module(
+                    &name,
+                    crate::call::getexecutioncontext(),
+                )?
+                .unwrap_or_else(pyre_object::w_none))
             },
             1,
         ),

@@ -527,6 +527,12 @@ pub fn init_typeobjects() {
         // CPython 3.14 Modules/arraymodule.c:array_modexec uses
         // PyType_FromModuleAndSpec; array_spec carries IMMUTABLETYPE.
         mark_cpython_heap_type(array_type, true);
+        unsafe {
+            pyre_object::w_type_set_typedef_buffer(
+                array_type,
+                Some(pyre_object::TypeDefBuffer::ReadWrite),
+            );
+        }
         reg.insert(
             &pyre_object::interp_array::ARRAY_TYPE as *const PyType as usize,
             array_type as usize,
@@ -1084,25 +1090,39 @@ pub fn init_typeobjects() {
         );
 
         // bytearray — PyPy: bytearrayobject.py, bases=(object,)
+        let bytearray_type = new_typeobject_with_base_and_layout(
+            "bytearray",
+            init_bytearray_type,
+            object_type,
+            &pyre_object::bytearrayobject::BYTEARRAY_TYPE as *const PyType,
+        );
+        unsafe {
+            pyre_object::w_type_set_typedef_buffer(
+                bytearray_type,
+                Some(pyre_object::TypeDefBuffer::ReadWrite),
+            );
+        }
         reg.insert(
             &pyre_object::bytearrayobject::BYTEARRAY_TYPE as *const PyType as usize,
-            new_typeobject_with_base_and_layout(
-                "bytearray",
-                init_bytearray_type,
-                object_type,
-                &pyre_object::bytearrayobject::BYTEARRAY_TYPE as *const PyType,
-            ) as usize,
+            bytearray_type as usize,
         );
 
         // bytes — PyPy: bytesobject.py W_BytesObject, bases=(object,)
+        let bytes_type = new_typeobject_with_base_and_layout(
+            "bytes",
+            init_bytes_type,
+            object_type,
+            &pyre_object::bytesobject::BYTES_TYPE as *const PyType,
+        );
+        unsafe {
+            pyre_object::w_type_set_typedef_buffer(
+                bytes_type,
+                Some(pyre_object::TypeDefBuffer::Read),
+            );
+        }
         reg.insert(
             &pyre_object::bytesobject::BYTES_TYPE as *const PyType as usize,
-            new_typeobject_with_base_and_layout(
-                "bytes",
-                init_bytes_type,
-                object_type,
-                &pyre_object::bytesobject::BYTES_TYPE as *const PyType,
-            ) as usize,
+            bytes_type as usize,
         );
 
         // set / frozenset — PyPy: setobject.py, bases=(object,).
@@ -1295,6 +1315,10 @@ pub fn init_typeobjects() {
         unsafe {
             pyre_object::w_type_set_acceptable_as_base_class(memoryview_type, false);
             pyre_object::w_type_set_weakrefable(memoryview_type, true);
+            pyre_object::w_type_set_typedef_buffer(
+                memoryview_type,
+                Some(pyre_object::TypeDefBuffer::ReadWrite),
+            );
         }
         reg.insert(
             &pyre_object::memoryview::MEMORYVIEW_TYPE as *const PyType as usize,
@@ -2441,28 +2465,14 @@ pub(crate) fn method_owner(type_name: &str) -> Option<&'static crate::gateway::M
 /// nor without `host_env`, where the type is never created either, so the row
 /// above is dead there rather than wrong.
 fn ctypes_array_layout(obj: PyObjectRef) -> bool {
-    #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
-    {
-        crate::module::_ctypes::metaclass::is_array_instance(obj)
-    }
-    #[cfg(not(all(any(unix, windows), feature = "host_env", not(feature = "sandbox"))))]
-    {
-        let _ = obj;
-        false
-    }
+    crate::importing::optional_module_hooks()
+        .is_some_and(|hooks| (hooks.ctypes_array_instance)(obj))
 }
 
 /// `_ctypes._Pointer`'s layout test, gated the same way.
 fn ctypes_pointer_layout(obj: PyObjectRef) -> bool {
-    #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
-    {
-        crate::module::_ctypes::metaclass::is_pointer_instance(obj)
-    }
-    #[cfg(not(all(any(unix, windows), feature = "host_env", not(feature = "sandbox"))))]
-    {
-        let _ = obj;
-        false
-    }
+    crate::importing::optional_module_hooks()
+        .is_some_and(|hooks| (hooks.ctypes_pointer_instance)(obj))
 }
 
 /// `mmap.mmap`'s layout test.  The module is not built for wasm32 or under
@@ -2471,7 +2481,7 @@ fn ctypes_pointer_layout(obj: PyObjectRef) -> bool {
 fn mmap_layout(obj: PyObjectRef) -> bool {
     #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
     {
-        crate::module::mmap::interp_mmap::has_mmap_layout(obj)
+        pyre_object::buffer::has_external_buffer_layout(obj)
     }
     #[cfg(any(target_arch = "wasm32", feature = "sandbox"))]
     {
@@ -3116,6 +3126,9 @@ fn new_typeobject_with_metatype_and_layout(
             // before publication. W_TypeObject.__init__ consumes the selected
             // Layout.typedef, including when an override reuses a base.
             definition.method_descriptor = method_descriptor;
+            if !parent_layout.is_null() {
+                definition.buffer = (*(*parent_layout).typedef).buffer;
+            }
             pyre_object::lltype::malloc_raw(definition) as *const TypeDef
         } else {
             overridetypedef
@@ -3541,7 +3554,7 @@ pub(crate) fn make_new_descr_with_doc(
 
 /// Signature-aware [`make_new_descr`] for builtin constructors with keyword
 /// or keyword-only parameters.
-pub(crate) fn make_new_descr_with_signature(
+pub fn make_new_descr_with_signature(
     func: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
     signature: crate::gateway::Signature,
 ) -> PyObjectRef {
@@ -5738,7 +5751,7 @@ pub(crate) fn check_new_subtype(
 /// `ValueError`'s does not match, where the wrapper's own criterion — the
 /// `tp_new` the most-derived static base carries — finds both answering
 /// `BaseException.__new__` and allows it.
-pub(crate) fn check_user_subclass(
+pub fn check_user_subclass(
     w_self: PyObjectRef,
     w_subtype: PyObjectRef,
 ) -> Result<(), crate::PyError> {
@@ -12295,7 +12308,7 @@ fn make_getset_property(
 
 /// `GetSetProperty(fget, fset, fdel)` with explicit `name` — see
 /// `make_getset_descriptor_named` for the typedef.py:58 motivation.
-pub(crate) fn make_getset_property_named(
+pub fn make_getset_property_named(
     fget: pyre_object::PyObjectRef,
     fset: pyre_object::PyObjectRef,
     fdel: pyre_object::PyObjectRef,
@@ -12313,7 +12326,7 @@ pub(crate) fn make_getset_property_named(
 
 /// `GetSetProperty(..., doc=..., name=...)` — the full descriptor payload
 /// used by doc-bearing getsets such as `mapping`, `__dict__`, and `__weakref__`.
-pub(crate) fn make_getset_property_named_doc(
+pub fn make_getset_property_named_doc(
     fget: pyre_object::PyObjectRef,
     fset: pyre_object::PyObjectRef,
     fdel: pyre_object::PyObjectRef,
@@ -23744,12 +23757,8 @@ pub fn buffer_as_bytes_like(obj: PyObjectRef) -> Result<Option<PyObjectRef>, cra
             pyre_object::interp_array::w_array_bytes(obj)
         })));
     }
-    #[cfg(all(
-        feature = "host_env",
-        not(feature = "sandbox"),
-        not(target_arch = "wasm32")
-    ))]
-    if let Some((address, length)) = crate::module::_cffi_backend::cbuffer::mini_buffer_params(obj)
+    if let Some(hooks) = crate::importing::optional_module_hooks()
+        && let Some((address, length)) = (hooks.mini_buffer_params)(obj)
     {
         // A buffer over a NULL cdata is empty, and no slice may be built from
         // a null address even at length zero.
@@ -23760,16 +23769,17 @@ pub fn buffer_as_bytes_like(obj: PyObjectRef) -> Result<Option<PyObjectRef>, cra
         };
         return Ok(Some(pyre_object::bytesobject::w_bytes_from_bytes(data)));
     }
-    #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
-    if let Some(data) = crate::module::_ctypes::cdata::cdata_bytes_object(obj) {
+    if let Some(hooks) = crate::importing::optional_module_hooks()
+        && let Some(data) = (hooks.ctypes_bytes_object)(obj)
+    {
         return Ok(Some(data));
     }
     // `W_MMap.readbuf_w` — the mapping is a bytes-like source in its own
     // right, so `bytes(m)` / `bytearray(m)` copy it here instead of falling
     // through to the iterable path.
     #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
-    if let Some(view) = crate::module::mmap::interp_mmap::mmap_buffer_view(obj) {
-        let (address, length, _readonly) = view?;
+    if let Some(view) = pyre_object::buffer::external_buffer_view(obj) {
+        let (address, length, _readonly) = view.map_err(crate::PyError::value_error)?;
         let data = unsafe { std::slice::from_raw_parts(address as *const u8, length) };
         return Ok(Some(pyre_object::bytesobject::w_bytes_from_bytes(data)));
     }
@@ -25778,7 +25788,7 @@ pub(crate) fn fs_errors() -> &'static str {
 /// `surrogateescape` rescues every byte, so this only ever fails under
 /// `surrogatepass`, where a byte that begins no UTF-8 sequence has no spelling
 /// at all and the name is reported rather than invented.
-pub(crate) fn fsdecode_wtf8(data: &[u8]) -> Result<Wtf8Buf, crate::PyError> {
+pub fn fsdecode_wtf8(data: &[u8]) -> Result<Wtf8Buf, crate::PyError> {
     decode_utf8_with_errors(data, FS_ERRORS)
 }
 

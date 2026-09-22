@@ -43,6 +43,10 @@ const INTERPRETER_LLBC: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../build/llbc/pyre-interpreter.ullbc"
 );
+const MODULE_LLBC: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../build/llbc/pyre-module.ullbc"
+);
 
 /// `None` means the artefact is absent, which degrades the tests to a skip
 /// rather than a failure on a tree that has not run the extraction.
@@ -65,6 +69,11 @@ fn object_llbc() -> Option<&'static Llbc> {
 fn interpreter_llbc() -> Option<&'static Llbc> {
     static LLBC: OnceLock<Option<Llbc>> = OnceLock::new();
     llbc(INTERPRETER_LLBC, &LLBC)
+}
+
+fn module_llbc() -> Option<&'static Llbc> {
+    static LLBC: OnceLock<Option<Llbc>> = OnceLock::new();
+    llbc(MODULE_LLBC, &LLBC)
 }
 
 fn lower_named(llbc: &Llbc, leaf: &str) -> FunctionGraph {
@@ -123,9 +132,11 @@ fn bracket_closes_in_a_crate_that_only_imports_the_guard() {
 }
 
 /// The bracket a descended `lib.abs(x)` inlines into its trace.
+/// `_cffi_backend` lives in `pyre-module`, so the fixture is that crate's
+/// `do_call` rather than anything still in the interpreter artefact.
 #[test]
 fn bracket_closes_in_the_cffi_call_path() {
-    let Some(llbc) = interpreter_llbc() else {
+    let Some(llbc) = module_llbc() else {
         return;
     };
     assert_bracket_closes(llbc, "do_call");

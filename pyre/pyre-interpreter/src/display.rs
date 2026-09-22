@@ -42,7 +42,7 @@ use crate::{
 /// holds a `usize` computed elsewhere.  It would also put a shadow-allocating
 /// call — i.e. a collection point — inside every address-printing repr.  Take
 /// that on with a witness in hand, not on the strength of the spelling.
-pub(crate) fn repr_addr(addr: usize) -> String {
+pub fn repr_addr(addr: usize) -> String {
     if cfg!(windows) {
         format!("0x{addr:0width$X}", width = size_of::<usize>() * 2)
     } else {
@@ -1357,7 +1357,7 @@ macro_rules! wtf8_format {
         buf
     }};
 }
-pub(crate) use wtf8_format;
+pub use wtf8_format;
 
 /// Format for str() — tries __str__ first, then __repr__.
 /// # Safety
@@ -1462,7 +1462,7 @@ pub unsafe fn py_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
 ///
 /// # Safety
 /// `obj` must be a live `W_BaseException`.
-pub(crate) unsafe fn base_exception_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
+pub unsafe fn base_exception_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
     // `space.str(self.args_w[0])` re-enters `py_str_wtf8` on the element, which
     // for `e.args = (e,)` lands back here. The re-entry pushes no Python frame
     // and sits in tail position, so neither the frame counter nor the stack

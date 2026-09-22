@@ -12,6 +12,11 @@ const INTERP: &str = concat!(
     "/../../build/llbc/pyre-interpreter.ullbc",
 );
 
+const MODULE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../build/llbc/pyre-module.ullbc",
+);
+
 /// Load `pyre-interpreter.ullbc` once and share it across every test.
 ///
 /// The corpus is ~224MB on disk and its parsed `serde_json` form is
@@ -50,6 +55,11 @@ fn lower_function(
 fn interp() -> &'static Llbc {
     static LLBC: OnceLock<Llbc> = OnceLock::new();
     LLBC.get_or_init(|| Llbc::load(INTERP).expect("load pyre-interpreter.ullbc"))
+}
+
+fn optional_module() -> &'static Llbc {
+    static LLBC: OnceLock<Llbc> = OnceLock::new();
+    LLBC.get_or_init(|| Llbc::load(MODULE).expect("load pyre-module.ullbc"))
 }
 
 fn is_root_scope_close(op: &OpKind) -> bool {
@@ -658,38 +668,32 @@ fn pop_value_keeps_its_unfused_materialisation() {
     );
 }
 
-/// Family C: the dual-gate `v79`/`v94` slot on always-`Err` `__new__`
-/// wrappers is the `Result::Ok.__pos_0` extract, not the returnblock
-/// inputarg. The annotator never follows that arm (`links_followed`).
+/// Family C: the dual-gate slot on always-`Err` `__new__` wrappers is
+/// the `Result::Ok.__pos_0` extract, not the returnblock inputarg.
+/// The annotator never follows that arm (`links_followed`).  Indices
+/// move when the wrapper changes crates, so the test looks for the
+/// field rather than a frozen var number.
 #[test]
 fn wrap_new_always_err_ok_payload_is_result_fieldread() {
-    for (name, expected_idx) in [
-        (
-            "pyre_interpreter::module::_hashlib::hash_state_class::__majit_wrap___new__",
-            79usize,
-        ),
-        (
-            "pyre_interpreter::module::_ssl::ssl_session_methods::__majit_wrap___new__",
-            94usize,
-        ),
+    for name in [
+        "pyre_module::module::_hashlib::hash_state_class::__majit_wrap___new__",
+        "pyre_module::module::_ssl::ssl_session_methods::__majit_wrap___new__",
     ] {
-        let g = lower_function(interp(), name).unwrap_or_else(|e| panic!("lower {name}: {e}"));
-        let vars = g.iter_variables();
-        let var = vars
-            .get(expected_idx)
-            .unwrap_or_else(|| panic!("{name}: only {} vars, no v{expected_idx}", vars.len()));
+        let g =
+            lower_function(optional_module(), name).unwrap_or_else(|e| panic!("lower {name}: {e}"));
         let field = g.blocks.iter().find_map(|block| {
             block.operations.iter().find_map(|op| match &op.kind {
-                OpKind::FieldRead { field, .. } if op.result.as_ref() == Some(var) => Some(field),
+                OpKind::FieldRead { field, .. }
+                    if field.name == "__pos_0"
+                        && field.owner_root.as_deref() == Some("Result::Ok") =>
+                {
+                    Some(field)
+                }
                 _ => None,
             })
         });
-        let field =
-            field.unwrap_or_else(|| panic!("{name}: v{expected_idx} is not a FieldRead result"));
-        assert_eq!(field.name, "__pos_0", "{name}");
-        assert_eq!(
-            field.owner_root.as_deref(),
-            Some("Result::Ok"),
+        assert!(
+            field.is_some(),
             "{name}: family C slot must be the unfollowed Ok payload"
         );
     }

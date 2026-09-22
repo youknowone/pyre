@@ -163,11 +163,7 @@ pub(crate) fn arity_exact(
 /// TypeError for a method accepting at least `min` positional arguments
 /// after the receiver, called with fewer — the PyArg_UnpackTuple
 /// "X expected at least N arguments, got M" form (`str.index`, `dict.get`).
-pub(crate) fn arity_at_least(
-    args: &[PyObjectRef],
-    name: &str,
-    min: usize,
-) -> Result<(), crate::PyError> {
+pub fn arity_at_least(args: &[PyObjectRef], name: &str, min: usize) -> Result<(), crate::PyError> {
     reject_kwargs(args, name)?;
     if args.len() < min + 1 {
         return Err(crate::PyError::type_error(format!(
@@ -197,11 +193,7 @@ pub(crate) fn require_str_sub(args: &[PyObjectRef], method: &str) -> Result<(), 
 /// TypeError for a method accepting at most `max` positional arguments after
 /// the receiver, called with more — the METH_VARARGS "X expected at most N
 /// arguments, got M" form (`list.index`, `dict.pop`).
-pub(crate) fn arity_at_most(
-    args: &[PyObjectRef],
-    name: &str,
-    max: usize,
-) -> Result<(), crate::PyError> {
+pub fn arity_at_most(args: &[PyObjectRef], name: &str, max: usize) -> Result<(), crate::PyError> {
     reject_kwargs(args, name)?;
     if args.len() > max + 1 {
         return Err(crate::PyError::type_error(format!(
@@ -3628,7 +3620,7 @@ pub fn format_w(val: PyObjectRef, w_spec: PyObjectRef) -> Result<PyObjectRef, cr
 /// for instances, else the storage type name.
 /// `_PyArg_BadArgument`'s rendering of a rejected argument: `None` names
 /// itself where every other value names its type.
-pub(crate) fn clinic_arg_type_name(obj: PyObjectRef) -> String {
+pub fn clinic_arg_type_name(obj: PyObjectRef) -> String {
     if unsafe { pyre_object::is_none(obj) } {
         return "None".to_string();
     }

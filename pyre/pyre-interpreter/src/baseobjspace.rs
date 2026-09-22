@@ -6221,7 +6221,7 @@ pub fn setdictvalue_native(obj: PyObjectRef, name: &str, value: PyObjectRef) -> 
 /// remaining `__import__` descent wall (`__majit_stringbuilder_new`,
 /// `W_*_USER_GC_TYPE_ID`, `Result.unwrap_or`).
 #[majit_macros::dont_look_inside]
-pub(crate) fn getdictvalue_native(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+pub fn getdictvalue_native(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
     getdictvalue(obj, name).unwrap_or(None)
 }
 
@@ -9870,7 +9870,7 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
 /// Note: `__trunc__` is NOT consulted here. `__trunc__` belongs to the
 /// `int(...)` builtin path (`intobject.py _new_baseint`), not to
 /// `space.int()` / `space.int_w()`.
-pub(crate) fn space_int(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
+pub fn space_int(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
     // baseobjspace.py `w_impl = space.lookup(self, '__int__')`
     let w_impl = unsafe { lookup(obj, "__int__") }
         // baseobjspace.py `w_impl = space.lookup(self, '__index__')`
@@ -10443,9 +10443,8 @@ fn buffer_bytes(
             } else {
                 1
             };
-            #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
-            if let Some((_, _, _, _, c_itemsize, _)) =
-                crate::module::_ctypes::cdata::cdata_buffer_view(r_obj)
+            if let Some(hooks) = crate::importing::optional_module_hooks()
+                && let Some((_, _, _, _, c_itemsize, _)) = (hooks.ctypes_buffer_view)(r_obj)
             {
                 itemsize = c_itemsize as i64;
             }
@@ -10801,7 +10800,7 @@ pub(crate) unsafe fn lookup_where_class_uncached(
 /// bounded so a type that keeps mutating cannot livelock the lookup.
 /// Keeping the raw walk behind the two residuals contains its
 /// `<other> ∪ _ptr` phi-merge.
-pub(crate) unsafe fn lookup_where_pair(
+pub unsafe fn lookup_where_pair(
     w_type: PyObjectRef,
     name: &str,
 ) -> Option<(PyObjectRef, PyObjectRef)> {
@@ -11139,7 +11138,7 @@ pub unsafe fn _pure_version_tag(w_type: *mut PyObject) -> u64 {
 /// the value folds away on the trace.  Mirrors the nesting of
 /// `function.rs::getcode`.
 #[inline]
-pub(crate) unsafe fn w_type_version_tag(w_type: PyObjectRef) -> u64 {
+pub unsafe fn w_type_version_tag(w_type: PyObjectRef) -> u64 {
     if majit_metainterp::jit::we_are_jitted() {
         if !pyre_object::w_type_is_cpython_immutabletype(w_type) {
             // Heap types can still be mutated; read the live field (the
@@ -11529,7 +11528,7 @@ pub(crate) unsafe fn lookup_in_type_where_wtf8(
 }
 
 #[inline]
-pub(crate) unsafe fn lookup_in_type_where(w_type: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+pub unsafe fn lookup_in_type_where(w_type: PyObjectRef, name: &str) -> Option<PyObjectRef> {
     lookup_in_type_where_wtf8(w_type, Wtf8::new(name))
 }
 
@@ -14734,11 +14733,7 @@ unsafe fn coerce_to_list_for_args(value: PyObjectRef) -> Result<PyObjectRef, PyE
 ///         return True
 ///     return False
 /// ```
-pub(crate) fn setdictvalue(
-    obj: PyObjectRef,
-    name: &str,
-    value: PyObjectRef,
-) -> Result<bool, PyError> {
+pub fn setdictvalue(obj: PyObjectRef, name: &str, value: PyObjectRef) -> Result<bool, PyError> {
     // mapdict.py `MapdictDictSupport.setdictvalue` overrides the
     // `W_Root` default above for every mapdict carrier:
     //

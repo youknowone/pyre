@@ -829,7 +829,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // for the constants.
                 #[cfg(all(windows, not(feature = "sandbox")))]
                 {
-                    use crate::module::_socket::rsocket_rffi as rffi;
+                    use crate::rsocket_rffi as rffi;
                     rffi::init();
                     let mut error: libc::c_int = 0;
                     let mut len = size_of_val(&error) as rffi::SockLen;

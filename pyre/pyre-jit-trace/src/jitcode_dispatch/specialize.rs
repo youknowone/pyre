@@ -3884,7 +3884,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     // `module/mod.rs` gates `_cffi_backend` on the same two conditions.
     #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
     if let Some(lib) =
-        pyre_interpreter::module::_cffi_backend::lib_obj::W_LibObject::from_obj(concrete_obj)
+        pyre_module::module::_cffi_backend::lib_obj::W_LibObject::from_obj(concrete_obj)
         && spec_gate(SpecFold::LoadAttrCffiLib, || {
             let w_dict = lib.dict_w;
             if w_dict.is_null() || majit_gc::can_move(majit_ir::GcRef(w_dict as usize)) {
@@ -3902,7 +3902,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
                 // a live C-memory read; returning the dict cell would expose
                 // the support object itself, and `lib_setattr` does not mutate
                 // the dict version when it writes through the support object.
-                || pyre_interpreter::module::_cffi_backend::cglob::W_GlobSupport::from_obj(stored)
+                || pyre_module::module::_cffi_backend::cglob::W_GlobSupport::from_obj(stored)
                     .is_some()
             {
                 return Ok(None);

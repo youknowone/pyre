@@ -814,66 +814,62 @@ unsafe fn tokenizer_iter_destructor(obj_addr: usize) {
 
 unsafe fn hashlib_hash_state_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_hashlib::w_hash_state_dealloc(
-            obj_addr as pyre_object::PyObjectRef,
-        );
+        pyre_module::module::_hashlib::w_hash_state_dealloc(obj_addr as pyre_object::PyObjectRef);
     }
 }
 
 unsafe fn hashlib_hmac_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_hashlib::w_hmac_dealloc(obj_addr as pyre_object::PyObjectRef);
+        pyre_module::module::_hashlib::w_hmac_dealloc(obj_addr as pyre_object::PyObjectRef);
     }
 }
 
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 unsafe fn ssl_context_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_ssl::w_ssl_context_dealloc(obj_addr as pyre_object::PyObjectRef)
+        pyre_module::module::_ssl::w_ssl_context_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 unsafe fn memory_bio_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_ssl::w_memory_bio_dealloc(obj_addr as pyre_object::PyObjectRef)
+        pyre_module::module::_ssl::w_memory_bio_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 unsafe fn ssl_session_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_ssl::w_ssl_session_dealloc(obj_addr as pyre_object::PyObjectRef)
+        pyre_module::module::_ssl::w_ssl_session_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 unsafe fn ssl_socket_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_ssl::w_ssl_socket_dealloc(obj_addr as pyre_object::PyObjectRef)
+        pyre_module::module::_ssl::w_ssl_socket_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
-#[cfg(all(any(unix, windows), not(feature = "sandbox")))]
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 unsafe fn mmap_destructor(obj_addr: usize) {
-    unsafe { pyre_interpreter::module::mmap::w_mmap_dealloc(obj_addr as pyre_object::PyObjectRef) };
+    unsafe { pyre_module::module::mmap::w_mmap_dealloc(obj_addr as pyre_object::PyObjectRef) };
 }
 
 unsafe fn zlib_compress_destructor(obj_addr: usize) {
-    unsafe {
-        pyre_interpreter::module::zlib::w_compress_dealloc(obj_addr as pyre_object::PyObjectRef)
-    };
+    unsafe { pyre_module::module::zlib::w_compress_dealloc(obj_addr as pyre_object::PyObjectRef) };
 }
 
 unsafe fn zlib_decompress_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::zlib::w_decompress_dealloc(obj_addr as pyre_object::PyObjectRef)
+        pyre_module::module::zlib::w_decompress_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
 unsafe fn zlib_zdecompress_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::zlib::w_zdecompress_dealloc(obj_addr as pyre_object::PyObjectRef)
+        pyre_module::module::zlib::w_zdecompress_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
@@ -891,31 +887,25 @@ unsafe fn bz2_decompressor_destructor(obj_addr: usize) {
 
 unsafe fn lzma_compressor_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_lzma::w_lzmacompressor_dealloc(
-            obj_addr as pyre_object::PyObjectRef,
-        )
+        pyre_module::module::_lzma::w_lzmacompressor_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
 unsafe fn lzma_decompressor_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_lzma::w_lzmadecompressor_dealloc(
-            obj_addr as pyre_object::PyObjectRef,
-        )
+        pyre_module::module::_lzma::w_lzmadecompressor_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
 unsafe fn lsprof_profiler_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_lsprof::w_profiler_dealloc(obj_addr as pyre_object::PyObjectRef)
+        pyre_module::module::_lsprof::w_profiler_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
 unsafe fn queue_simplequeue_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_queue::w_simplequeue_dealloc(
-            obj_addr as pyre_object::PyObjectRef,
-        )
+        pyre_module::module::_queue::w_simplequeue_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
@@ -924,7 +914,7 @@ unsafe fn queue_simplequeue_destructor(obj_addr: usize) {
 #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
 unsafe fn cffi_cdata_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_cffi_backend::cdataobj::w_cdata_dealloc(
+        pyre_module::module::_cffi_backend::cdataobj::w_cdata_dealloc(
             obj_addr as pyre_object::PyObjectRef,
         )
     };
@@ -935,7 +925,7 @@ unsafe fn cffi_cdata_destructor(obj_addr: usize) {
 #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
 unsafe fn cffi_library_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_cffi_backend::libraryobj::w_library_dealloc(
+        pyre_module::module::_cffi_backend::libraryobj::w_library_dealloc(
             obj_addr as pyre_object::PyObjectRef,
         )
     };
@@ -945,7 +935,7 @@ unsafe fn cffi_library_destructor(obj_addr: usize) {
 #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
 unsafe fn cffi_ffi_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_cffi_backend::ffi_obj::w_ffi_dealloc(
+        pyre_module::module::_cffi_backend::ffi_obj::w_ffi_dealloc(
             obj_addr as pyre_object::PyObjectRef,
         )
     };
@@ -955,7 +945,7 @@ unsafe fn cffi_ffi_destructor(obj_addr: usize) {
 #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
 unsafe fn cffi_lib_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_cffi_backend::lib_obj::w_lib_dealloc(
+        pyre_module::module::_cffi_backend::lib_obj::w_lib_dealloc(
             obj_addr as pyre_object::PyObjectRef,
         )
     };
@@ -1040,7 +1030,7 @@ unsafe fn random_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maj
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 unsafe fn ssl_context_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     unsafe { object_object_custom_trace(obj_addr, f) };
-    let context = unsafe { &mut *(obj_addr as *mut pyre_interpreter::module::_ssl::W_SSLContext) };
+    let context = unsafe { &mut *(obj_addr as *mut pyre_module::module::_ssl::W_SSLContext) };
     f(std::ptr::addr_of_mut!(context.sni_callback) as *mut majit_ir::GcRef);
     f(std::ptr::addr_of_mut!(context.msg_callback) as *mut majit_ir::GcRef);
     f(std::ptr::addr_of_mut!(context.keylog_filename) as *mut majit_ir::GcRef);
@@ -1055,7 +1045,7 @@ unsafe fn memory_bio_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_
 
 /// `mmap.mmap` is subclassable and carries the same mapdict prefix; its
 /// mapping/fd payload contains no Python references.
-#[cfg(all(any(unix, windows), not(feature = "sandbox")))]
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 unsafe fn mmap_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     unsafe { object_object_custom_trace(obj_addr, f) };
 }
@@ -1072,20 +1062,20 @@ unsafe fn zlib_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
 /// inline payload offsets.
 unsafe fn lsprof_profiler_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     unsafe { object_object_custom_trace(obj_addr, f) };
-    unsafe { pyre_interpreter::module::_lsprof::w_profiler_custom_trace(obj_addr, f) };
+    unsafe { pyre_module::module::_lsprof::w_profiler_custom_trace(obj_addr, f) };
 }
 
 /// `_queue.SimpleQueue` is subclassable and owns a FIFO of Python objects.
 unsafe fn queue_simplequeue_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     unsafe { object_object_custom_trace(obj_addr, f) };
-    unsafe { pyre_interpreter::module::_queue::w_simplequeue_custom_trace(obj_addr, f) };
+    unsafe { pyre_module::module::_queue::w_simplequeue_custom_trace(obj_addr, f) };
 }
 
 /// `_ssl._SSLSocket` owns its context, transport endpoints, public owner,
 /// and hostname directly on the typed object.
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 unsafe fn ssl_socket_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
-    let socket = unsafe { &mut *(obj_addr as *mut pyre_interpreter::module::_ssl::W_SSLSocket) };
+    let socket = unsafe { &mut *(obj_addr as *mut pyre_module::module::_ssl::W_SSLSocket) };
     f(std::ptr::addr_of_mut!(socket.ob.w_class) as *mut majit_ir::GcRef);
     f(std::ptr::addr_of_mut!(socket.context) as *mut majit_ir::GcRef);
     f(std::ptr::addr_of_mut!(socket.socket) as *mut majit_ir::GcRef);
@@ -3956,7 +3946,10 @@ fn build_gc() -> Box<MiniMarkGC> {
     // Their immortal counterparts take no type id — the collector never walks
     // an `allocate`d object — so only the immortal-root walker's offset
     // registry learns the edge.
-    for descriptor in pyre_interpreter::all_immortal_w_class_only_descriptors() {
+    for descriptor in pyre_interpreter::all_immortal_w_class_only_descriptors()
+        .into_iter()
+        .chain(pyre_module::all_immortal_w_class_only_descriptors())
+    {
         pyre_object::gc_hook::register_pyre_class_offsets(
             descriptor.pytype_ptr as usize,
             descriptor.ptr_offsets,
@@ -3979,7 +3972,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_interpreter::module::unicodedata::W_UCD
+        <pyre_module::module::unicodedata::W_UCD
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     register_pyre_class(
@@ -4042,7 +4035,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     let hashlib_hash_state_tid = register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_interpreter::module::_hashlib::W_HashState
+        <pyre_module::module::_hashlib::W_HashState
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     gc.types
@@ -4050,7 +4043,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     let hashlib_hmac_tid = register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_interpreter::module::_hashlib::W_Hmac
+        <pyre_module::module::_hashlib::W_Hmac
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     gc.types
@@ -4088,17 +4081,17 @@ fn build_gc() -> Box<MiniMarkGC> {
     // before target-gated DirEntry/SSL/mmap so their ids agree on wasm/native.
     for (descr, destructor) in [
         (
-            <pyre_interpreter::module::zlib::W_Compress
+            <pyre_module::module::zlib::W_Compress
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
             zlib_compress_destructor as majit_gc::trace::DestructorFn,
         ),
         (
-            <pyre_interpreter::module::zlib::W_Decompress
+            <pyre_module::module::zlib::W_Decompress
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
             zlib_decompress_destructor as majit_gc::trace::DestructorFn,
         ),
         (
-            <pyre_interpreter::module::zlib::W_ZlibDecompressor
+            <pyre_module::module::zlib::W_ZlibDecompressor
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
             zlib_zdecompress_destructor as majit_gc::trace::DestructorFn,
         ),
@@ -4141,12 +4134,12 @@ fn build_gc() -> Box<MiniMarkGC> {
             bz2_decompressor_destructor as majit_gc::trace::DestructorFn,
         ),
         (
-            <pyre_interpreter::module::_lzma::W_LZMACompressor
+            <pyre_module::module::_lzma::W_LZMACompressor
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
             lzma_compressor_destructor as majit_gc::trace::DestructorFn,
         ),
         (
-            <pyre_interpreter::module::_lzma::W_LZMADecompressor
+            <pyre_module::module::_lzma::W_LZMADecompressor
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
             lzma_decompressor_destructor as majit_gc::trace::DestructorFn,
         ),
@@ -4173,7 +4166,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     // two stats result objects hold their code and call-list references in
     // inline fields and are not instantiable, so they register like any other
     // rclass owner.
-    let profiler_descr = <pyre_interpreter::module::_lsprof::W_Profiler
+    let profiler_descr = <pyre_module::module::_lsprof::W_Profiler
         as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
     let profiler_tid = gc.register_type(
         TypeInfo::object_subclass_with_custom_trace(
@@ -4198,19 +4191,19 @@ fn build_gc() -> Box<MiniMarkGC> {
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_interpreter::module::_lsprof::W_StatsEntry
+        <pyre_module::module::_lsprof::W_StatsEntry
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_interpreter::module::_lsprof::W_StatsSubEntry
+        <pyre_module::module::_lsprof::W_StatsSubEntry
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
 
     // `_queue.SimpleQueue` is unconditional, so it registers ahead of the
     // target-gated `posix` rclasses below and keeps one id on every target.
-    let simplequeue_descr = <pyre_interpreter::module::_queue::W_SimpleQueue
+    let simplequeue_descr = <pyre_module::module::_queue::W_SimpleQueue
         as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
     let simplequeue_tid = gc.register_type(
         TypeInfo::object_subclass_with_custom_trace(
@@ -4328,7 +4321,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     // Their sweep destructors release the opaque rustls allocations.
     #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
     {
-        let context_descr = <pyre_interpreter::module::_ssl::W_SSLContext
+        let context_descr = <pyre_module::module::_ssl::W_SSLContext
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
         let context_tid = gc.register_type(
             TypeInfo::object_subclass_with_custom_trace(
@@ -4350,7 +4343,7 @@ fn build_gc() -> Box<MiniMarkGC> {
             context_descr.ptr_offsets,
         );
 
-        let bio_descr = <pyre_interpreter::module::_ssl::W_MemoryBIO
+        let bio_descr = <pyre_module::module::_ssl::W_MemoryBIO
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
         let bio_tid = gc.register_type(
             TypeInfo::object_subclass_with_custom_trace(
@@ -4372,7 +4365,7 @@ fn build_gc() -> Box<MiniMarkGC> {
             bio_descr.ptr_offsets,
         );
 
-        let session_descr = <pyre_interpreter::module::_ssl::W_SSLSession
+        let session_descr = <pyre_module::module::_ssl::W_SSLSession
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
         let session_tid = gc.register_type(
             TypeInfo::object_subclass(session_descr.object_size, object_tid)
@@ -4390,7 +4383,7 @@ fn build_gc() -> Box<MiniMarkGC> {
             session_descr.ptr_offsets,
         );
 
-        let socket_descr = <pyre_interpreter::module::_ssl::W_SSLSocket
+        let socket_descr = <pyre_module::module::_ssl::W_SSLSocket
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
         let socket_tid = gc.register_type(
             TypeInfo::object_subclass_with_custom_trace(
@@ -4415,16 +4408,16 @@ fn build_gc() -> Box<MiniMarkGC> {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_interpreter::module::_ssl::W_Certificate
+            <pyre_module::module::_ssl::W_Certificate
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
     }
     // PyPy's W_MMap directly owns rmmap.MMap.  The typed wrapper carries the
     // subclass mapdict prefix and a sweep destructor for the native mapping
     // and duplicated fd.
-    #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
     {
-        let mmap_descr = <pyre_interpreter::module::mmap::W_MMap
+        let mmap_descr = <pyre_module::module::mmap::W_MMap
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
         let mmap_tid = gc.register_type(
             TypeInfo::object_subclass_with_custom_trace(
@@ -4494,22 +4487,22 @@ fn build_gc() -> Box<MiniMarkGC> {
     #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
     {
         for descriptor in [
-            <pyre_interpreter::module::_cffi_backend::ctypeobj::W_CType
+            <pyre_module::module::_cffi_backend::ctypeobj::W_CType
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-            <pyre_interpreter::module::_cffi_backend::ctypearray::W_CDataIter
+            <pyre_module::module::_cffi_backend::ctypearray::W_CDataIter
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         ] {
             register_pyre_class(&mut gc, &mut pytype_to_tid, descriptor);
         }
         {
-            let descr = <pyre_interpreter::module::_cffi_backend::cdataobj::W_CData
+            let descr = <pyre_module::module::_cffi_backend::cdataobj::W_CData
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
             let tid = register_pyre_class_with_pressure(
                 &mut gc,
                 &mut pytype_to_tid,
                 descr,
                 Some(std::mem::offset_of!(
-                    pyre_interpreter::module::_cffi_backend::cdataobj::W_CData,
+                    pyre_module::module::_cffi_backend::cdataobj::W_CData,
                     special_memory_pressure
                 )),
             );
@@ -4518,19 +4511,19 @@ fn build_gc() -> Box<MiniMarkGC> {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_interpreter::module::_cffi_backend::ctypestruct::W_CField
+            <pyre_module::module::_cffi_backend::ctypestruct::W_CField
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         {
-            let descr = <pyre_interpreter::module::_cffi_backend::libraryobj::W_Library
+            let descr = <pyre_module::module::_cffi_backend::libraryobj::W_Library
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
             let tid = register_pyre_class(&mut gc, &mut pytype_to_tid, descr);
             gc.types.set_destructor(tid, cffi_library_destructor);
         }
         for descriptor in [
-            <pyre_interpreter::module::_cffi_backend::allocator::W_Allocator
+            <pyre_module::module::_cffi_backend::allocator::W_Allocator
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-            <pyre_interpreter::module::_cffi_backend::cbuffer::MiniBuffer
+            <pyre_module::module::_cffi_backend::cbuffer::MiniBuffer
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         ] {
             register_pyre_class(&mut gc, &mut pytype_to_tid, descriptor);
@@ -4538,11 +4531,11 @@ fn build_gc() -> Box<MiniMarkGC> {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_interpreter::module::_cffi_backend::func::OffsetInBytes
+            <pyre_module::module::_cffi_backend::func::OffsetInBytes
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         {
-            let descr = <pyre_interpreter::module::_cffi_backend::ffi_obj::W_FFIObject
+            let descr = <pyre_module::module::_cffi_backend::ffi_obj::W_FFIObject
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
             let tid = register_pyre_class(&mut gc, &mut pytype_to_tid, descr);
             gc.types.set_destructor(tid, cffi_ffi_destructor);
@@ -4550,19 +4543,19 @@ fn build_gc() -> Box<MiniMarkGC> {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_interpreter::module::_cffi_backend::realize_c_type::W_RawFuncType
+            <pyre_module::module::_cffi_backend::realize_c_type::W_RawFuncType
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
         {
-            let descr = <pyre_interpreter::module::_cffi_backend::lib_obj::W_LibObject
+            let descr = <pyre_module::module::_cffi_backend::lib_obj::W_LibObject
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
             let tid = register_pyre_class(&mut gc, &mut pytype_to_tid, descr);
             gc.types.set_destructor(tid, cffi_lib_destructor);
         }
         for descriptor in [
-            <pyre_interpreter::module::_cffi_backend::cglob::W_GlobSupport
+            <pyre_module::module::_cffi_backend::cglob::W_GlobSupport
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-            <pyre_interpreter::module::_cffi_backend::wrapper::W_FunctionWrapper
+            <pyre_module::module::_cffi_backend::wrapper::W_FunctionWrapper
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         ] {
             register_pyre_class(&mut gc, &mut pytype_to_tid, descriptor);

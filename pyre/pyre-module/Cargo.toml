@@ -8,20 +8,28 @@ description = "Optional builtin modules for pyre interpreter"
 
 [features]
 default = ["host_env"]
-host_env = ["pyre-interpreter/host_env", "dep:rustpython-host_env"]
-sandbox = ["pyre-interpreter/sandbox"]
+host_env = [
+    "pyre-interpreter/host_env",
+    "dep:rustpython-host_env",
+    "pyre-native/host_env",
+]
+sandbox = ["pyre-interpreter/sandbox", "pyre-native/sandbox"]
 dynasm = ["pyre-interpreter/dynasm", "majit-metainterp/dynasm"]
 cranelift = ["pyre-interpreter/cranelift", "majit-metainterp/cranelift"]
 
 [dependencies]
 pyre-object = { workspace = true }
 pyre-interpreter = { workspace = true }
+pyre-native = { workspace = true }
 ctor = { workspace = true }
 libc = { workspace = true }
 linkme = { workspace = true }
+bitflags = { workspace = true }
 majit-ir = { workspace = true }
+majit-macros = { workspace = true }
 majit-metainterp = { workspace = true }
 majit-rlib = { workspace = true }
+majit-gc = { workspace = true }
 num-traits = { workspace = true }
 parking_lot = { workspace = true }
 num-complex = { workspace = true }
@@ -31,7 +39,11 @@ rustpython-common = { workspace = true }
 rustpython-compiler = { workspace = true }
 rustpython-compiler-core = { workspace = true }
 rustpython-host_env = { workspace = true, optional = true }
+rustpython-unicode = { workspace = true }
 rustpython-wtf8 = { workspace = true }
+
+[target.'cfg(all(any(target_os = "linux", target_os = "macos", target_os = "windows", target_os = "android"), not(any(target_env = "musl", target_env = "sgx"))))'.dependencies]
+libffi = { version = "5", features = ["system"] }
 
 [target.'cfg(windows)'.dependencies]
 # `faulthandler`'s vectored exception handler returns
@@ -41,3 +53,9 @@ windows-sys = { version = "0.61", features = ["Win32_System_Diagnostics_Debug"] 
 # `_overlapped.CreateEvent` builds the `WideCString` name
 # `rustpython_host_env::winapi::create_event_w` takes.
 widestring = "1.2"
+
+[build-dependencies]
+cc = "1.2"
+
+[dev-dependencies]
+pyre-interpreter = { workspace = true, features = ["test-hooks"] }

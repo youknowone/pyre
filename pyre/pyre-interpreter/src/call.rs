@@ -3830,51 +3830,27 @@ fn call_with_kwargs_in_ctx_impl(
         }
         // Types with acceptable_as_base_class=false (bool, NoneType) reject kwargs.
         // PyPy: boolobject.py descr_new uses @unwrap_spec (positional only).
-        // The `function`, `memoryview`, `_cffi_backend.buffer`, deque iterator,
-        // and `_lzma` stream
-        // types are non-acceptable-as-base too, but their `tp_new` functions
-        // accept keywords: FunctionType has `kwdefaults=...`, CPython 3.14
-        // exposes `memoryview(object=...)`, PyPy's `MiniBuffer___new__`
-        // accepts `cdata=` and `size=`, the deque iterator constructors
-        // accept (and ignore) `index=...`, both `_lzma` constructors take
-        // `format=`/`preset=`/`filters=`, and `select.kevent` takes the six
-        // `ident=`/`filter=`/`flags=`/`fflags=`/`data=`/`udata=` names.
-        // Route them through `__new__`.
-        // `select` is not built under the sandbox feature, so the kevent arm
-        // is answered before the chain rather than inside it.
-        #[cfg(not(feature = "sandbox"))]
-        let is_kevent = std::ptr::eq(current_type(), crate::module::select::kevent_type());
-        #[cfg(feature = "sandbox")]
-        let is_kevent = false;
-        #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
-        let is_cffi_buffer = std::ptr::eq(
-            current_type(),
-            crate::module::_cffi_backend::cbuffer::buffer_type(),
-        );
-        #[cfg(any(feature = "sandbox", target_arch = "wasm32"))]
-        let is_cffi_buffer = false;
+        // The `function`, `memoryview`, deque iterator, and constructors
+        // whose `__new__`/`__init__` Signature binds keywords (`cdata=`
+        // on `_cffi_backend.buffer`, `format=` on `_lzma`, `ident=` on
+        // `select.kevent`) are non-acceptable-as-base too. Route those
+        // through `__new__` / `__init__`.
         let accepts_keywords_despite_nonbase = std::ptr::eq(
             current_type(),
             crate::typedef::gettypeobject(&crate::FUNCTION_TYPE),
         ) || std::ptr::eq(
             current_type(),
             crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE),
-        ) || is_cffi_buffer
-            || std::ptr::eq(
-                current_type(),
-                crate::module::_collections::deque_iter::public_type(),
-            )
-            || std::ptr::eq(
-                current_type(),
-                crate::module::_collections::deque_rev_iter::public_type(),
-            )
-            || std::ptr::eq(
-                current_type(),
-                crate::module::_contextvars::context_var_type(),
-            )
-            || std::ptr::eq(current_type(), crate::module::_lzma::compressor_type())
-            || std::ptr::eq(current_type(), crate::module::_lzma::decompressor_type())
-            || is_kevent
+        ) || std::ptr::eq(
+            current_type(),
+            crate::module::_collections::deque_iter::public_type(),
+        ) || std::ptr::eq(
+            current_type(),
+            crate::module::_collections::deque_rev_iter::public_type(),
+        ) || std::ptr::eq(
+            current_type(),
+            crate::module::_contextvars::context_var_type(),
+        ) || type_new_accepts_keywords(current_type())
             || crate::_structseq::is_structseq_type(current_type());
         if !kwargs.is_empty()
             && !accepts_keywords_despite_nonbase
@@ -4387,6 +4363,43 @@ fn type_call_vectorcall(
     _kwargs: &[(Wtf8Buf, PyObjectRef)],
 ) -> Option<PyResult> {
     None
+}
+
+/// `gateway.py Signature` on a type slot — keyword-capable when it has
+/// `**kwargs`, kw-only names, or positional-or-keyword slots.  A
+/// positional-only builtin keeps a null Signature.
+///
+/// `__init__` is retagged as `wrapper_descriptor` (`is_slot_wrapper`),
+/// which reuses the Function/BuiltinCode payload but is not
+/// `is_builtin_code`'s `is_function` set.  Read the carrier, not the
+/// public class.
+fn type_slot_accepts_keywords(w_type: PyObjectRef, name: &str) -> bool {
+    let Some(func) = (unsafe { crate::baseobjspace::lookup_in_type(w_type, name) }) else {
+        return false;
+    };
+    if !unsafe { crate::function::is_function_carrier(func) } {
+        return false;
+    }
+    let code = unsafe { crate::getcode(func) };
+    if code.is_null() || !unsafe { crate::gateway::is_builtin_code(code) } {
+        return false;
+    }
+    let sig = unsafe { (*(code as *const crate::gateway::BuiltinCode)).sig };
+    if sig.is_null() {
+        return false;
+    }
+    let sig = unsafe { &*sig };
+    sig.has_kwarg()
+        || sig.num_kwonlyargnames() > 0
+        || sig.num_argnames() > sig.num_posonlyargnames()
+}
+
+/// `descr_call` forwards `__args__` to `__new__` and then `__init__`.
+/// `#[pyre_methods]` synthesizes a raw-args `__new__` (null Signature)
+/// when the impl only wrote `__init__`, and that `__init__` is a slot
+/// wrapper, so keywords belong to the initializer.
+fn type_new_accepts_keywords(w_type: PyObjectRef) -> bool {
+    type_slot_accepts_keywords(w_type, "__new__") || type_slot_accepts_keywords(w_type, "__init__")
 }
 
 /// `type.__call__(cls, *args)` — the metaclass-level instantiation entry

@@ -1982,6 +1982,50 @@ pub unsafe fn w_type_get_typedef_hasdict(obj: PyObjectRef) -> bool {
     }
 }
 
+/// TypeDef.__init__ `__buffer` on this type's own layout typedef.
+///
+/// # Safety
+/// `obj` must be a live `W_TypeObject` whose layout typedef is the
+/// mutable prebuilt declaration this type owns.
+pub unsafe fn w_type_set_typedef_buffer(
+    obj: PyObjectRef,
+    buffer: Option<crate::typedef::TypeDefBuffer>,
+) {
+    let layout = (*(obj as *const W_TypeObject)).layout;
+    if !layout.is_null() && !(*layout).typedef.is_null() {
+        (*((*layout).typedef as *mut crate::typedef::TypeDef)).buffer = buffer;
+    }
+}
+
+fn typedef_declares_buffer(w_type: PyObjectRef) -> bool {
+    unsafe {
+        let layout = (*(w_type as *const W_TypeObject)).layout;
+        !layout.is_null() && !(*layout).typedef.is_null() && (*(*layout).typedef).buffer.is_some()
+    }
+}
+
+/// Whether `w_type` declares `TypeDef.__buffer`, including a base
+/// that did.  A type that declares nothing takes its bases'
+/// declaration (`typedef.py TypeDef.__init__`).
+///
+/// # Safety
+/// `w_type` must be a live `W_TypeObject`.
+pub unsafe fn w_type_declares_buffer(w_type: PyObjectRef) -> bool {
+    if typedef_declares_buffer(w_type) {
+        return true;
+    }
+    let mro = w_type_get_mro(w_type);
+    if mro.is_null() {
+        return false;
+    }
+    for &cls in (*mro).as_slice() {
+        if !cls.is_null() && typedef_declares_buffer(cls) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Whether CPython 3.14 projects a non-zero `tp_itemsize` for this PyPy
 /// instance layout.  The exact byte count remains in the interpreter's
 /// `cpython_type_layout`; `type.__flags__` only needs the zero/non-zero split

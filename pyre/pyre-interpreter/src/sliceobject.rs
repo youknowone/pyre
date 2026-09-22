@@ -10,7 +10,7 @@ use pyre_object::{PyObjectRef, pyobject::is_none};
 ///
 /// Returns `w_int.__index__()` as an `i64`, converting to `TypeError`
 /// when the object has no `__index__` method.
-pub(crate) fn eval_slice_index(w_int: PyObjectRef) -> Result<i64, crate::PyError> {
+pub fn eval_slice_index(w_int: PyObjectRef) -> Result<i64, crate::PyError> {
     // A null bound is silently misread on wasm (offset 0 is valid memory), so
     // `getindex_w` reads `ob_type` at guest offset 0 and returns garbage. Trap
     // loudly instead so a wasm run pins the null-Ref provenance.
@@ -144,7 +144,7 @@ pub fn unwrap_start_stop(
 /// stack rather than carried in the argument it arrived in.  A caller that
 /// roots the slice keeps the bounds *reachable*, which is not the same as
 /// keeping its own copies of their addresses current.
-pub(crate) fn slice_unpack(
+pub fn slice_unpack(
     w_start: PyObjectRef,
     w_stop: PyObjectRef,
     w_step: PyObjectRef,
@@ -186,7 +186,7 @@ pub(crate) fn slice_unpack(
 /// `length`, clipping out-of-bounds endpoints consistently with
 /// extended-slice handling, and returns the triple plus the resulting
 /// `slicelength`.
-pub(crate) fn slice_adjust_indices(
+pub fn slice_adjust_indices(
     mut start: i64,
     mut stop: i64,
     step: i64,

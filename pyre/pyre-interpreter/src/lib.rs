@@ -160,6 +160,10 @@ pub mod pycode;
 pub mod pyopcode;
 pub mod pytraceback;
 pub mod reduce_protocol;
+/// Host socket layer — `rpython/rlib/_rsocket_rffi.py`.
+/// Signal uses this rlib API, not `pypy.module._socket`.
+#[cfg(any(unix, windows))]
+pub mod rsocket_rffi;
 pub mod runtime_ops;
 pub mod shared_opcode;
 pub mod sliceobject;
@@ -968,7 +972,7 @@ pub use shared_opcode::*;
 ///
 /// A cause already quoted by the message it would be appended to is left out,
 /// since a chain that repeats itself reads as two failures.
-pub(crate) fn with_causes(error: &dyn std::error::Error) -> String {
+pub fn with_causes(error: &dyn std::error::Error) -> String {
     let mut rendered = error.to_string();
     let mut cause = error.source();
     while let Some(source) = cause {
@@ -1107,19 +1111,9 @@ pub fn all_w_class_only_descriptors() -> Vec<&'static pyre_object::lltype::PyreC
 /// gate this crate spells exactly.
 pub fn all_immortal_w_class_only_descriptors()
 -> Vec<&'static pyre_object::lltype::PyreClassDescriptor> {
-    #[allow(unused_imports)]
-    use pyre_object::lltype::PyreClassPyTypeOf;
-    vec![
-        // `select` is compiled out of a sandbox build (`module/mod.rs`'s
-        // `pub mod select`), so
-        // its descriptors carry that gate too.
-        #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
-        <crate::module::select::interp_select::Poll as PyreClassPyTypeOf>::DESCRIPTOR,
-        #[cfg(all(target_os = "macos", feature = "host_env", not(feature = "sandbox")))]
-        <crate::module::select::interp_kqueue::W_Kqueue as PyreClassPyTypeOf>::DESCRIPTOR,
-        #[cfg(all(target_os = "macos", feature = "host_env", not(feature = "sandbox")))]
-        <crate::module::select::interp_kevent::W_Kevent as PyreClassPyTypeOf>::DESCRIPTOR,
-    ]
+    // `select.poll` / `kqueue` / `kevent` live on the optional-module
+    // crate; `pyre_module::all_immortal_w_class_only_descriptors` lists them.
+    vec![]
 }
 
 /// Interpreter-owned PyType aliases in the shared GC inheritance census.
@@ -1130,11 +1124,6 @@ pub fn all_immortal_w_class_only_descriptors()
 pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeAlias> {
     use pyre_object::lltype::PyreClassPyTypeOf;
     use pyre_object::pyobject::subclass_range_alias;
-    #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32"), windows))]
-    const CFFI_FIRST_TYPE_ID: u32 = 199;
-    #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32"), not(windows)))]
-    const CFFI_FIRST_TYPE_ID: u32 = 196;
-
     fn typed<T: PyreClassPyTypeOf>() -> &'static pyre_object::PyType {
         // Every `#[pyre_class]` descriptor points at its macro-emitted static
         // PyType for the program lifetime.
@@ -1188,9 +1177,9 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         // `functools.KeyWrapper` follows them at the append-only AUTO-ID
         // registration tail.
         subclass_range_alias(156, typed::<crate::module::_functools::W_KeyWrapper>()),
-        // `unicodedata.UCD` and `__pypy__.Bufferable` close that tail in the
-        // order `build_gc` registers them.
-        subclass_range_alias(157, typed::<crate::module::unicodedata::W_UCD>()),
+        // `unicodedata.UCD` alias 157 lives on the optional-module hook.
+        // `__pypy__.Bufferable` closes that tail in the order `build_gc`
+        // registers them.
         subclass_range_alias(
             158,
             typed::<crate::module::__pypy__::interp_buffer::bufferable_impl::W_Bufferable>(),
@@ -1199,10 +1188,7 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         // 159 as a bare `with_gc_ptrs` id and carries no vtable of its own.
         subclass_range_alias(160, typed::<crate::module::_io::W_BytesIO>()),
         subclass_range_alias(161, typed::<crate::module::_io::W_StringIO>()),
-        // `_hashlib`'s per-object digest/HMAC contexts follow their Python
-        // owners and have sweep-time native-state destructors in build_gc.
-        subclass_range_alias(164, typed::<crate::module::_hashlib::W_HashState>()),
-        subclass_range_alias(165, typed::<crate::module::_hashlib::W_Hmac>()),
+        // `_hashlib` aliases 164-165 live on the optional-module hook.
         // `gc.GcRef` keeps its raw referent as a traced wrapper field.
         // referent field is traced on the wrapper itself, as in
         // `pypy/module/gc/referents.py`.
@@ -1212,22 +1198,9 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         subclass_range_alias(167, typed::<crate::module::gc::hook::W_AppLevelHooks>()),
         // `gc._get_stats()` returns referents.py's native W_GcStats owner.
         subclass_range_alias(168, typed::<crate::module::gc::stats::W_GcStats>()),
-        // PyPy zlib stream wrappers own their native stream and lock directly.
-        // Keep these unconditional entries ahead of target-gated native types.
-        subclass_range_alias(169, typed::<crate::module::zlib::W_Compress>()),
-        subclass_range_alias(170, typed::<crate::module::zlib::W_Decompress>()),
-        subclass_range_alias(171, typed::<crate::module::zlib::W_ZlibDecompressor>()),
-        // `_lzma`'s two stream objects own their liblzma coder, unconditional
-        // for the same reason.
-        subclass_range_alias(174, typed::<crate::module::_lzma::W_LZMACompressor>()),
-        subclass_range_alias(175, typed::<crate::module::_lzma::W_LZMADecompressor>()),
-        // `_lsprof`'s profiler and stats result owners are unconditional.
-        subclass_range_alias(176, typed::<crate::module::_lsprof::W_Profiler>()),
-        subclass_range_alias(177, typed::<crate::module::_lsprof::W_StatsEntry>()),
-        subclass_range_alias(178, typed::<crate::module::_lsprof::W_StatsSubEntry>()),
-        // `_queue.SimpleQueue` is unconditional and carries a native FIFO, so
-        // it closes the ungated aliases ahead of the target-gated ones.
-        subclass_range_alias(179, typed::<crate::module::_queue::W_SimpleQueue>()),
+        // zlib / `_lsprof` / `_queue` aliases live on the optional-module
+        // hook (ids 169-171, 176-179). `_lzma` aliases 174-175 live on
+        // the same hook.
         // `_PyLineIterator` / `_PyPositionsIterator` / `_PyBranchesIterator` —
         // each retains the code object its suspended walk reads.  All three
         // are unconditional, so they close the ungated block ahead of the
@@ -1242,23 +1215,8 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         subclass_range_alias(188, typed::<crate::module::posix::W_DirEntry>()),
         #[cfg(not(target_arch = "wasm32"))]
         subclass_range_alias(189, typed::<crate::module::posix::W_ScandirIterator>()),
-        // The rustls-backed `_ssl` aliases preserve `build_gc`'s registration
-        // order for `W_SSLContext`, `W_MemoryBIO`, and `W_SSLSession`.
-        #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(190, typed::<crate::module::_ssl::W_SSLContext>()),
-        #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(191, typed::<crate::module::_ssl::W_MemoryBIO>()),
-        #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(192, typed::<crate::module::_ssl::W_SSLSession>()),
-        #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(193, typed::<crate::module::_ssl::W_SSLSocket>()),
-        #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(194, typed::<crate::module::_ssl::W_Certificate>()),
-        // `mmap.mmap` follows the optional SSL tail on ordinary Unix builds.
-        // A sandbox build has no `mmap` module at all (`module/mod.rs`), so it
-        // contributes no alias rather than sliding into the vacated SSL slot.
-        #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
-        subclass_range_alias(195, typed::<crate::module::mmap::W_MMap>()),
+        // rustls-backed `_ssl` aliases 190-194 live on the optional-module
+        // hook. `mmap.mmap` alias 195 lives on the same hook.
         // `_winapi.Overlapped` follows it: a second record of the same kind,
         // owning its own event and transfer buffer rather than retained
         // Python objects, so nothing of it is traced beyond the header.
@@ -1272,127 +1230,6 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         // participates in the same rclass hierarchy as every typed IO base.
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
         subclass_range_alias(198, typed::<crate::module::_io::W_WindowsConsoleIO>()),
-        // `_cffi_backend` is absent without `host_env`, on wasm32, and under
-        // `sandbox`, so its thirteen aliases sit at the tail where the active
-        // hierarchy filter can remove them as one contiguous trailing slice.
-        // The module-presence gate matches `module/mod.rs` exactly.
-        #[cfg(all(
-            feature = "host_env",
-            not(feature = "sandbox"),
-            not(target_arch = "wasm32")
-        ))]
-        subclass_range_alias(
-            CFFI_FIRST_TYPE_ID,
-            typed::<crate::module::_cffi_backend::ctypeobj::W_CType>(),
-        ),
-        #[cfg(all(
-            feature = "host_env",
-            not(feature = "sandbox"),
-            not(target_arch = "wasm32")
-        ))]
-        subclass_range_alias(
-            CFFI_FIRST_TYPE_ID + 1,
-            typed::<crate::module::_cffi_backend::ctypearray::W_CDataIter>(),
-        ),
-        #[cfg(all(
-            feature = "host_env",
-            not(feature = "sandbox"),
-            not(target_arch = "wasm32")
-        ))]
-        subclass_range_alias(
-            CFFI_FIRST_TYPE_ID + 2,
-            typed::<crate::module::_cffi_backend::cdataobj::W_CData>(),
-        ),
-        #[cfg(all(
-            feature = "host_env",
-            not(feature = "sandbox"),
-            not(target_arch = "wasm32")
-        ))]
-        subclass_range_alias(
-            CFFI_FIRST_TYPE_ID + 3,
-            typed::<crate::module::_cffi_backend::ctypestruct::W_CField>(),
-        ),
-        #[cfg(all(
-            feature = "host_env",
-            not(feature = "sandbox"),
-            not(target_arch = "wasm32")
-        ))]
-        subclass_range_alias(
-            CFFI_FIRST_TYPE_ID + 4,
-            typed::<crate::module::_cffi_backend::libraryobj::W_Library>(),
-        ),
-        #[cfg(all(
-            feature = "host_env",
-            not(feature = "sandbox"),
-            not(target_arch = "wasm32")
-        ))]
-        subclass_range_alias(
-            CFFI_FIRST_TYPE_ID + 5,
-            typed::<crate::module::_cffi_backend::allocator::W_Allocator>(),
-        ),
-        #[cfg(all(
-            feature = "host_env",
-            not(feature = "sandbox"),
-            not(target_arch = "wasm32")
-        ))]
-        subclass_range_alias(
-            CFFI_FIRST_TYPE_ID + 6,
-            typed::<crate::module::_cffi_backend::cbuffer::MiniBuffer>(),
-        ),
-        #[cfg(all(
-            feature = "host_env",
-            not(feature = "sandbox"),
-            not(target_arch = "wasm32")
-        ))]
-        subclass_range_alias(
-            CFFI_FIRST_TYPE_ID + 7,
-            typed::<crate::module::_cffi_backend::func::OffsetInBytes>(),
-        ),
-        #[cfg(all(
-            feature = "host_env",
-            not(feature = "sandbox"),
-            not(target_arch = "wasm32")
-        ))]
-        subclass_range_alias(
-            CFFI_FIRST_TYPE_ID + 8,
-            typed::<crate::module::_cffi_backend::ffi_obj::W_FFIObject>(),
-        ),
-        #[cfg(all(
-            feature = "host_env",
-            not(feature = "sandbox"),
-            not(target_arch = "wasm32")
-        ))]
-        subclass_range_alias(
-            CFFI_FIRST_TYPE_ID + 9,
-            typed::<crate::module::_cffi_backend::realize_c_type::W_RawFuncType>(),
-        ),
-        #[cfg(all(
-            feature = "host_env",
-            not(feature = "sandbox"),
-            not(target_arch = "wasm32")
-        ))]
-        subclass_range_alias(
-            CFFI_FIRST_TYPE_ID + 10,
-            typed::<crate::module::_cffi_backend::lib_obj::W_LibObject>(),
-        ),
-        #[cfg(all(
-            feature = "host_env",
-            not(feature = "sandbox"),
-            not(target_arch = "wasm32")
-        ))]
-        subclass_range_alias(
-            CFFI_FIRST_TYPE_ID + 11,
-            typed::<crate::module::_cffi_backend::cglob::W_GlobSupport>(),
-        ),
-        #[cfg(all(
-            feature = "host_env",
-            not(feature = "sandbox"),
-            not(target_arch = "wasm32")
-        ))]
-        subclass_range_alias(
-            CFFI_FIRST_TYPE_ID + 12,
-            typed::<crate::module::_cffi_backend::wrapper::W_FunctionWrapper>(),
-        ),
     ];
     if let Some(hooks) = crate::importing::optional_module_hooks() {
         aliases.extend((hooks.subclass_range_aliases)());

@@ -8699,7 +8699,7 @@ struct LibffiCallPlan {
 /// attribute names.
 #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
 fn libffi_call_plan(cif_description: usize, dst_bank: char) -> Option<LibffiCallPlan> {
-    use pyre_interpreter::module::_cffi_backend::jit_libffi::{self, kind, types};
+    use pyre_module::module::_cffi_backend::jit_libffi::{self, kind, types};
 
     // `ffi_result = cif_description.rtype; reskind = get_ffi_type_kind(...)`.
     let rtype = unsafe { jit_libffi::rtype(cif_description) };

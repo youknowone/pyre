@@ -44145,10 +44145,10 @@ mod tests {
         use crate::model::{CallTarget, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../build/llbc/pyre-module.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
-        let name = "pyre_interpreter::module::unicodedata::char_and_default";
+        let name = "pyre_module::module::unicodedata::char_and_default";
         let graph = super::lower_function(&llbc, name)
             .unwrap_or_else(|err| panic!("lower {name}: {err:?}"));
         assert!(
@@ -44178,10 +44178,10 @@ mod tests {
         use crate::model::{CallTarget, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../build/llbc/pyre-module.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
-        let name = "pyre_interpreter::module::unicodedata::ucd_method_args";
+        let name = "pyre_module::module::unicodedata::ucd_method_args";
         let graph = super::lower_function(&llbc, name)
             .unwrap_or_else(|err| panic!("lower {name}: {err:?}"));
         assert!(
@@ -44217,14 +44217,12 @@ mod tests {
         use crate::translator::rtyper::cutover::{DualGateOutcome, dual_gate_check_with_registry};
         let llbc = Llbc::load(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../build/llbc/pyre-module.ullbc"
         ))
         .expect("load real LLBC");
-        let graph = super::lower_function(
-            &llbc,
-            "pyre_interpreter::module::unicodedata::ucd_method_args",
-        )
-        .expect("lower actual RangeFrom get caller");
+        let graph =
+            super::lower_function(&llbc, "pyre_module::module::unicodedata::ucd_method_args")
+                .expect("lower actual RangeFrom get caller");
         let program =
             super::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
                 &[llbc],
