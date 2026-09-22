@@ -4519,9 +4519,11 @@ mod tests {
 
     #[test]
     fn uint_mul_high_then_wrapping_mul_keeps_both_operands() {
-        // `consider_finish` publishes only its first argument, so each
-        // product is its own trace. Both inputs stay live across
-        // `UINT_MUL_HIGH`, which clobbers EAX and EDX.
+        // `consider_finish` publishes only its first argument. The high
+        // half is a second argument so `UINT_MUL_HIGH` stays live:
+        // `has_no_side_effect` drops a result nobody reads, and then
+        // only `INT_MUL` would run. Both inputs stay live across the
+        // high multiply, which clobbers EAX and EDX.
         fn product(a: i64, b: i64) -> i64 {
             let mut backend = DynasmBackend::new();
             backend.attach_default_test_descrs();
@@ -4536,7 +4538,11 @@ mod tests {
                     &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                     3,
                 ),
-                mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
+                mk_op(
+                    OpCode::Finish,
+                    &[OpRef::int_op(3), OpRef::int_op(2)],
+                    OpRef::NONE.raw(),
+                ),
             ];
             let token = JitCellToken::new(1501);
             backend
