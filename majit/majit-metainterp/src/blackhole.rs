@@ -4996,7 +4996,10 @@ mod tests {
             assert_eq!(bh.registers_i[2], 42);
         }
 
+        // The range check is a debug_assert, so the panic exists only in
+        // debug builds.
         #[test]
+        #[cfg(debug_assertions)]
         #[should_panic(expected = "setarg_r: register index")]
         fn setarg_r_refuses_constant_table_slot() {
             let mut b = JitCodeBuilder::default();
@@ -5013,6 +5016,7 @@ mod tests {
         }
 
         #[test]
+        #[cfg(debug_assertions)]
         #[should_panic(expected = "setarg_f: register index")]
         fn setarg_f_refuses_constant_table_slot() {
             let mut b = JitCodeBuilder::default();
