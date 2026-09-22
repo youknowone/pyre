@@ -4175,7 +4175,7 @@ pub fn fuse_boxing_alloc_with_pytypes(
         }
     }
 
-    fn is_pyre_class_ctor(target: &CallTarget) -> bool {
+    fn is_class_allocate(target: &CallTarget) -> bool {
         matches!(
             target,
             CallTarget::FunctionPath { segments, .. }
@@ -5072,7 +5072,7 @@ pub fn fuse_boxing_alloc_with_pytypes(
                         value,
                         ty: payload_ty.clone(),
                     }),
-                    None if is_pyre_class_ctor(target) => {
+                    None if is_class_allocate(target) => {
                         // `..Default::default()` leaves the unlisted
                         // fields at the type's zero. Spell that zero
                         // rather than declining the cluster.
@@ -5138,7 +5138,7 @@ pub fn fuse_boxing_alloc_with_pytypes(
             // any header reason at all.
             let header = match resolve_header_plan(graph, agg, (rewrite_bi, rewrite_oi)) {
                 Some(header) => header,
-                None if is_pyre_class_ctor(target) => {
+                None if is_class_allocate(target) => {
                     // The header is built inside the residual
                     // `allocate[_stable]` stub. The owner's PyType
                     // address is the same `&TYPE` that stub would store.
