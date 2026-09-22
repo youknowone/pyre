@@ -3138,12 +3138,14 @@ impl NamespaceOpcodeHandler for PyFrame {
                 // namespace that cannot use the borrowed-key shortcut — a
                 // `dict` subclass, a non-dict mapping — wraps no key of its own
                 // per execution either.
-                if let Some(value) = crate::baseobjspace::finditem_str_named(
-                    w_locals,
-                    name,
-                    self.pycode as PyObjectRef,
-                    nameindex,
-                )? {
+                let w_key = unsafe {
+                    crate::pycode::w_code_getname_w_or_new(
+                        self.pycode as PyObjectRef,
+                        nameindex,
+                        name,
+                    )
+                };
+                if let Some(value) = crate::baseobjspace::finditem_str_w(w_locals, w_key)? {
                     return Ok(value);
                 }
                 // pyopcode.py:972 — a missing locals entry falls through to
@@ -3230,14 +3232,12 @@ impl NamespaceOpcodeHandler for PyFrame {
         // W_ModuleDictObject layouts and dispatches a dict subclass through
         // the general mapping object, so a raising key `__eq__` propagates
         // instead of being swallowed as a miss.
+        let w_key = unsafe {
+            crate::pycode::w_code_getname_w_or_new(self.pycode as PyObjectRef, nameindex, name)
+        };
         let w_globals = self.get_w_globals();
         if !w_globals.is_null()
-            && let Some(value) = crate::baseobjspace::finditem_str_named(
-                w_globals,
-                name,
-                self.pycode as PyObjectRef,
-                nameindex,
-            )?
+            && let Some(value) = crate::baseobjspace::finditem_str_w(w_globals, w_key)?
         {
             return Ok(value);
         }
@@ -3301,16 +3301,14 @@ impl NamespaceOpcodeHandler for PyFrame {
         } else if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
             let w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
             if !w_dict.is_null()
-                && let Some(value) = crate::baseobjspace::finditem_str(w_dict, name)?
+                && let Some(value) = crate::baseobjspace::finditem_str_w(w_dict, w_key)?
             {
                 return Ok(value);
             }
         }
         // `pyopcode.py _load_global_failed`: `@dont_inline` so the
         // `oefmt` / `format!` concat stays off the `_load_global` graph.
-        let w_varname = unsafe {
-            crate::pycode::w_code_getname_w_or_new(self.pycode as PyObjectRef, nameindex, name)
-        };
+        let w_varname = w_key;
         // Bridge interpret can lack a picked builtin Module and a live EC.
         // Resolve builtin exception types through the registry (`r` → `r`)
         // rather than a `&str` residual.
@@ -3323,65 +3321,6 @@ impl NamespaceOpcodeHandler for PyFrame {
 
     fn null_value(&mut self) -> Result<Self::Value, PyError> {
         Ok(PY_NULL)
-    }
-}
-
-/// Word residual for `LOAD_NAME`. Same reason as [`load_global_nameindex_w`]:
-/// `load_name_value` takes `&str`, which cannot be a residual argument.
-#[inline(never)]
-#[majit_macros::dont_look_inside]
-pub fn load_name_nameindex_w(frame: i64, nameindex: i64) -> PyObjectRef {
-    let frame = if frame == 0 {
-        CURRENT_FRAME.with(|c| c.get() as i64)
-    } else {
-        frame
-    };
-    if frame == 0 {
-        return PY_NULL;
-    }
-    let frame = unsafe { &mut *(frame as *mut PyFrame) };
-    let code = unsafe { &*crate::pyframe_get_pycode(frame) };
-    let idx = nameindex as usize;
-    if idx >= code.names.len() {
-        return PY_NULL;
-    }
-    let name = code.names[idx].as_ref();
-    match <PyFrame as crate::NamespaceOpcodeHandler>::load_name_value(frame, name, idx) {
-        Ok(value) => value,
-        Err(err) => {
-            crate::runtime_ops::jit_publish_residual_error(err);
-            PY_NULL
-        }
-    }
-}
-
-/// Word residual for `LOAD_GLOBAL`. The interpreter helper takes `&str` and
-/// looks inside the dict strategy; that compiles to `CallMayForceR(0)` on a
-/// ZST strategy data pointer. Portal look-inside residual-calls this instead.
-#[inline(never)]
-#[majit_macros::dont_look_inside]
-pub fn load_global_nameindex_w(frame: i64, nameindex: i64) -> PyObjectRef {
-    let frame = if frame == 0 {
-        CURRENT_FRAME.with(|c| c.get() as i64)
-    } else {
-        frame
-    };
-    if frame == 0 {
-        return PY_NULL;
-    }
-    let frame = unsafe { &mut *(frame as *mut PyFrame) };
-    let code = unsafe { &*crate::pyframe_get_pycode(frame) };
-    let idx = nameindex as usize;
-    if idx >= code.names.len() {
-        return PY_NULL;
-    }
-    let name = code.names[idx].as_ref();
-    match <PyFrame as crate::NamespaceOpcodeHandler>::load_global_value(frame, name, idx) {
-        Ok(value) => value,
-        Err(err) => {
-            crate::runtime_ops::jit_publish_residual_error(err);
-            PY_NULL
-        }
     }
 }
 
@@ -5950,7 +5889,7 @@ impl OpcodeStepExecutor for PyFrame {
     // The default trait impl always pushes [attr, NULL], which is what
     // the JIT tracer uses — no runtime branch in the shared path.
     fn load_method(&mut self, name: &str) -> Result<(), PyError> {
-        OpcodeStepExecutor::load_method_cached(self, name, 0)
+        OpcodeStepExecutor::load_method_cached(self, name, crate::pyopcode::NO_NAMEINDEX)
     }
 
     fn load_method_cached(&mut self, name: &str, nameindex: usize) -> Result<(), PyError> {
@@ -6018,9 +5957,8 @@ impl OpcodeStepExecutor for PyFrame {
             let roots = pyre_object::gc_roots::push_roots();
             let obj_slot = roots.base();
             let obj = roots.pin_root(obj);
-            let w_name = unsafe {
-                crate::pycode::w_code_getname_w_or_new(self.pycode as PyObjectRef, nameindex, name)
-            };
+            let w_name =
+                unsafe { crate::pycode::w_code_getname_w(self.pycode as PyObjectRef, nameindex) };
             return crate::baseobjspace::getattr(obj, w_name)
                 .map(|attr| {
                     let live = unsafe { &mut *FrameAnchor::new(self).live() };
@@ -6068,9 +6006,8 @@ impl OpcodeStepExecutor for PyFrame {
             // `space.setattr(w_obj, w_attributename, w_newvalue)`.
             let obj = self.pop_value()?;
             let value = self.pop_value()?;
-            let w_name = unsafe {
-                crate::pycode::w_code_getname_w_or_new(self.pycode as PyObjectRef, nameindex, name)
-            };
+            let w_name =
+                unsafe { crate::pycode::w_code_getname_w(self.pycode as PyObjectRef, nameindex) };
             crate::baseobjspace::setattr(obj, w_name, value)?;
             return Ok(());
         }
@@ -6342,7 +6279,7 @@ impl OpcodeStepExecutor for PyFrame {
     // ── delete_attr ──
     // PyPy: DELETE_ATTR → space.delattr(obj, name)
     fn delete_attr(&mut self, name: &str) -> Result<(), PyError> {
-        OpcodeStepExecutor::delete_attr_cached(self, name, 0)
+        OpcodeStepExecutor::delete_attr_cached(self, name, crate::pyopcode::NO_NAMEINDEX)
     }
 
     fn delete_attr_cached(&mut self, name: &str, nameindex: usize) -> Result<(), PyError> {

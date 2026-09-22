@@ -5337,6 +5337,32 @@ pub fn finditem_str(obj: PyObjectRef, key: &str) -> Result<Option<PyObjectRef>, 
     finditem_str_named(obj, key, pyre_object::PY_NULL, 0)
 }
 
+/// `objspace.py StdObjSpace.finditem_str` when the key is already the
+/// interned unicode `pyopcode.py getname_w` returns. RPython `str` is one
+/// GCREF; a borrowed `&str` is two words.
+pub fn finditem_str_w(
+    obj: PyObjectRef,
+    w_key: PyObjectRef,
+) -> Result<Option<PyObjectRef>, PyError> {
+    if w_key.is_null() {
+        return Ok(None);
+    }
+    if is_shortcut_dict(obj) {
+        let strategy = unsafe { pyre_object::dictmultiobject::w_module_dict_strategy_or_null(obj) };
+        if !strategy.is_null() {
+            return Ok(unsafe { (*strategy).getitem_str_w(obj, w_key) });
+        }
+        let hash = unsafe { pyre_object::unicodeobject::w_str_hash_memoized(w_key) };
+        return match unsafe {
+            pyre_object::dictmultiobject::w_dict_getitem_str_checked_hashed_w(obj, w_key, hash)
+        } {
+            Ok(hit) => Ok(hit),
+            Err(_) => Err(take_pending_dict_key_error(w_key)),
+        };
+    }
+    finditem(obj, w_key)
+}
+
 /// [`finditem_str`] for a caller that can name the key without allocating — a
 /// `(code object, name index)` pair addressing a `co_names_w` slot
 /// (`pycode.py:127-129`), as `pyopcode.py:965` reaches its varname.

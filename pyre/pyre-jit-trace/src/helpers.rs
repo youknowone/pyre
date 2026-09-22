@@ -976,44 +976,13 @@ pub fn portal_emit_set_current_exception(ctx: &mut TraceCtx, ec: OpRef, exc: OpR
     pyre_interpreter::eval::set_current_exception(exc_ptr as pyre_object::PyObjectRef);
 }
 
-/// `LOAD_GLOBAL` of a canonical builtin exception class. `pyopcode.py
-/// LOAD_GLOBAL` looks inside the module-dict cell; pin the namespace
-/// version (`walker_pin_namespace_version`) and keep the immortal
-/// class as `ConstPtr`.
+/// `pyopcode.py LOAD_GLOBAL` looks inside the module-dict cell, so the
+/// opcode is not a residual whose result this can fold.
 pub fn portal_try_fold_load_global_exc_class(
-    ctx: &mut TraceCtx,
-    raw_i: &[i64],
+    _ctx: &mut TraceCtx,
+    _raw_i: &[i64],
 ) -> Option<(OpRef, i64)> {
-    if raw_i.len() < 2 {
-        return None;
-    }
-    let value = pyre_interpreter::eval::load_global_nameindex_w(raw_i[0], raw_i[1]);
-    if value.is_null() || !pyre_object::interp_exceptions::is_canonical_exc_class(value) {
-        return None;
-    }
-    let frame_ptr = if raw_i[0] == 0 {
-        pyre_interpreter::eval::current_frame() as i64
-    } else {
-        raw_i[0]
-    };
-    if frame_ptr == 0 {
-        return None;
-    }
-    let frame = frame_ptr as *const pyre_interpreter::pyframe::PyFrame;
-    let globals = unsafe { (*frame).get_w_globals() };
-    if !globals.is_null() {
-        let strategy =
-            unsafe { pyre_object::dictmultiobject::w_module_dict_strategy_or_null(globals) };
-        if !strategy.is_null() {
-            let strategy_box = ctx.const_ref(strategy as i64);
-            crate::state::record_quasiimmut_field(
-                ctx,
-                strategy_box,
-                crate::descr::module_dict_version_descr(),
-            );
-        }
-    }
-    Some((ctx.const_ref(value as i64), value as i64))
+    None
 }
 
 /// `PyError.exc_object` when `to_exc_object` is identity

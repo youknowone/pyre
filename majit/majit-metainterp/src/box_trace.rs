@@ -436,7 +436,7 @@ pub struct ExceptionTraceResidual {
     /// Execute live (stack already moved) and keep the handler pc as a
     /// const so the virtual exception is not a residual argument.
     pub dispatch_handler_fnaddrs: Vec<i64>,
-    /// `eval.rs load_global_nameindex_w` of a canonical exception class.
+    /// Canonical exception class from a residual `LOAD_GLOBAL`.
     /// `pyopcode.py LOAD_GLOBAL` looks inside the module-dict cell.
     pub load_global_fnaddrs: Vec<i64>,
     pub emit_load_global_exc:

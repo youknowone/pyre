@@ -5207,16 +5207,7 @@ fn build_jit_driver_pair() -> JitDriverPair {
                     );
                     addrs
                 },
-                load_global_fnaddrs: {
-                    let mut addrs: Vec<i64> = pyre_interpreter::jit_trace_fnaddrs()
-                        .into_iter()
-                        .filter_map(|(name, addr)| {
-                            name.contains("load_global_nameindex_w").then_some(addr)
-                        })
-                        .collect();
-                    addrs.push(pyre_interpreter::eval::load_global_nameindex_w as *const () as i64);
-                    addrs
-                },
+                load_global_fnaddrs: Vec::new(),
                 emit_load_global_exc:
                     pyre_jit_trace::helpers::portal_try_fold_load_global_exc_class,
                 get_current_exception_fnaddrs: {
