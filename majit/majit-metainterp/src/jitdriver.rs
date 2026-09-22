@@ -6031,10 +6031,11 @@ impl<S: JitState> JitDriver<S> {
         Some(target_pc)
     }
 
-    /// `warmstate.py maybe_compile_and_run` `:465-480`: hash already in hand,
-    /// `lookup_chain` once, and if there is no enterable procedure token,
-    /// `jitcounter.tick` and return. A compiled token, a chained bucket, or a
-    /// non-empty pyre table continues into `back_edge_internal`.
+    /// `warmstate.py` `maybe_compile_and_run`, not-found arm: hash already
+    /// in hand, `lookup_chain` once, and if this hash owns no enterable
+    /// procedure token, `jitcounter.tick` and return. A compiled token, a
+    /// chained bucket, or a `JC_DONT_TRACE_HERE` cell this hash owns
+    /// continues into `back_edge_internal`.
     ///
     /// `Some(resume)` means this IS that cold case — including `Some(None)`
     /// when the tick did not overflow.
@@ -6060,32 +6061,43 @@ impl<S: JitState> JitDriver<S> {
         if !self.meta.cut_compiled_keys.is_empty() {
             return None;
         }
-        // A chained bucket needs comparekey; a live procedure token is the
-        // enter-assembler side. Both stay on `back_edge_internal`. A lone
-        // tokenless cell is the `:465-480` tick arm, including after a
-        // tracing start installed the cell and then cleared JC_TRACING.
+        // A chained bucket needs comparekey and stays on `back_edge_internal`.
+        // A lone cell is the tick arm only when this hash owns it.
         if let Some(cell) = self.meta.warm_state_ref().lookup_chain(green_key_hash) {
-            if cell.next.is_some() || cell.is_compiled() {
+            if cell.next.is_some() {
                 return None;
             }
-            if cell.is_tracing() {
-                return Some(None);
-            }
-            // Dead-token cleanup (`warmstate.py:483-500`) lives on the
-            // occupied door, including a latched cell that is also dead.
-            if cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none() {
-                return None;
-            }
-            // Same bump `maybe_compile_decision` makes at this refusal
-            // (`abort_ceiling_refused`). A latched cell never reaches
-            // `commit_start_tracing`, so slot 61 does not move; slot 81 is
-            // the one that counts the refusal itself.
-            if cell.abort_count >= MAX_TRACE_ABORT_COUNT {
-                crate::mc_diag_bump(81); // abort_ceiling_refused
-                return Some(None);
-            }
-            if cell.flags.contains(JcFlags::JC_DONT_TRACE_HERE) {
-                return Some(None);
+            // `lookup_chain` returns the table-slot head. `_get_index` keeps
+            // only the high bits of the low 32, so that head can belong to a
+            // different green key. Its compiled / tracing / dead-token /
+            // abort-ceiling / `JC_DONT_TRACE_HERE` state is not ours: the
+            // not-found arm of `maybe_compile_and_run` ticks this hash.
+            if cell.cell_bucket == green_key_hash {
+                if cell.is_compiled() {
+                    return None;
+                }
+                if cell.is_tracing() {
+                    return Some(None);
+                }
+                // Dead-token cleanup (`maybe_compile_and_run`) lives on the
+                // occupied door, including a latched cell that is also dead.
+                if cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none() {
+                    return None;
+                }
+                // Same bump `maybe_compile_decision` makes at this refusal
+                // (`abort_ceiling_refused`). A latched cell never reaches
+                // `commit_start_tracing`, so slot 61 does not move; slot 81 is
+                // the one that counts the refusal itself.
+                if cell.abort_count >= MAX_TRACE_ABORT_COUNT {
+                    crate::mc_diag_bump(81); // abort_ceiling_refused
+                    return Some(None);
+                }
+                if cell.flags.contains(JcFlags::JC_DONT_TRACE_HERE) {
+                    // `should_start_dont_trace_here_trace`: never traced
+                    // starts immediately, `JC_TRACING_OCCURRED` ticks. Both
+                    // stay on the occupied door.
+                    return None;
+                }
             }
         }
         if !state.can_trace() {
@@ -10498,6 +10510,111 @@ mod tests {
         assert!(
             driver.is_tracing(),
             "the early ceiling check and typed decision must select the same cell",
+        );
+    }
+
+    #[test]
+    fn a_colliding_green_key_in_a_single_cell_bucket_still_ticks_and_traces() {
+        // `_get_index` keeps the high bits of the low 32. Bit 0 never
+        // changes that index, so these two hashes share a table slot and
+        // differ everywhere the cell's own bucket is compared.
+        let occupant = 0x11u64 << 21;
+        let colliding = occupant | 1;
+        let mut driver = JitDriver::<CountingDoorState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        assert_eq!(
+            driver.meta.warm_state.counter._get_index(occupant),
+            driver.meta.warm_state.counter._get_index(colliding),
+            "fixture hashes must share one celltable slot",
+        );
+        driver
+            .meta
+            .warm_state_mut()
+            .disable_noninlinable_function(occupant);
+        let cell = driver
+            .meta
+            .warm_state
+            .lookup_chain(colliding)
+            .expect("the colliding hash must see the occupied slot");
+        assert!(cell.next.is_none(), "the bucket must be a single cell");
+        assert_eq!(cell.cell_bucket, occupant);
+        assert_ne!(cell.cell_bucket, colliding);
+        assert!(
+            cell.flags
+                .contains(crate::warmstate::JcFlags::JC_DONT_TRACE_HERE)
+        );
+
+        let increment = driver.meta.warm_state.counter.compute_threshold(2);
+        assert!(
+            !driver
+                .meta
+                .warm_state
+                .counter
+                .would_tick_fire(colliding, increment),
+            "the colliding hash has not been counted yet",
+        );
+        let mut state = CountingDoorState::default();
+        assert!(
+            driver
+                .back_edge_or_run_compiled_keyed(colliding, 7, &mut state, &(), || {})
+                .is_none()
+        );
+        assert!(!driver.is_tracing());
+        assert!(
+            driver
+                .meta
+                .warm_state
+                .counter
+                .would_tick_fire(colliding, increment),
+            "a stranger in the slot must not swallow this hash's tick",
+        );
+        assert!(
+            driver
+                .back_edge_or_run_compiled_keyed(colliding, 7, &mut state, &(), || {})
+                .is_none()
+        );
+        assert!(
+            driver.is_tracing(),
+            "the colliding hash must trace once its own counter fires",
+        );
+    }
+
+    #[test]
+    fn a_tokenless_dont_trace_here_cell_retries_from_the_back_edge() {
+        // `disable_noninlinable_function` installs `JC_DONT_TRACE_HERE`
+        // with no procedure token. `should_start_dont_trace_here_trace`
+        // starts that cell immediately; a later `JC_TRACING_OCCURRED`
+        // retries by ticking. Threshold 100 would stay cold if the back
+        // edge only counted.
+        let mut driver = JitDriver::<CountingDoorState>::new(100);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let key = 0xD017_u64;
+        driver
+            .meta
+            .warm_state_mut()
+            .disable_noninlinable_function(key);
+        let cell = driver
+            .meta
+            .warm_state
+            .lookup_chain(key)
+            .expect("disable_noninlinable_function installs a cell");
+        assert!(cell.next.is_none());
+        assert_eq!(cell.cell_bucket, key);
+        assert!(
+            cell.flags
+                .contains(crate::warmstate::JcFlags::JC_DONT_TRACE_HERE)
+        );
+        assert!(!cell.has_seen_a_procedure_token());
+
+        let mut state = CountingDoorState::default();
+        assert!(
+            driver
+                .back_edge_or_run_compiled_keyed(key, 7, &mut state, &(), || {})
+                .is_none()
+        );
+        assert!(
+            driver.is_tracing(),
+            "a tokenless JC_DONT_TRACE_HERE cell must trace on the first back edge",
         );
     }
 
