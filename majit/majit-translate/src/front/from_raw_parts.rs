@@ -391,6 +391,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect(),
+            fun_decl_id: None,
         }
     }
 
@@ -400,6 +401,7 @@ mod tests {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            fun_decl_id: None,
         }
     }
 
