@@ -34,6 +34,13 @@ pub fn gc_alloc_storage_box<T: 'static>(value: T, tid: u32) -> *mut T {
             unsafe {
                 std::ptr::write(raw as *mut T, value);
             }
+            // The payload write is a store into an old-gen box. During MARKING
+            // `oldgen_birth_flags` allocates it VISITED (black), so a filled
+            // table (dict `copy`, `switch_to_object_strategy` refill) can
+            // already hold white children. `write_barrier` /
+            // `remember_young_pointer` re-greys the box
+            // (`_add_to_more_objects_to_trace_if_black`).
+            crate::gc_hook::try_gc_write_barrier_managed(raw);
             return raw as *mut T;
         }
     }

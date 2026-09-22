@@ -5139,6 +5139,7 @@ pub unsafe fn w_dict_switch_int_to_object_strategy(w_dict: PyObjectRef) {
     let dict = &mut *(roots.get(dict_slot) as *mut W_DictObject);
     dict.dstorage = new_storage as *mut u8;
     dict.dstrategy = &OBJECT_DICT_STRATEGY_REF;
+    dict_write_barrier(roots.get(dict_slot));
 }
 
 /// Internal helper: `BytesDictStrategy::setitem` body —
@@ -5334,6 +5335,7 @@ pub unsafe fn w_dict_switch_bytes_to_object_strategy(w_dict: PyObjectRef) {
     let dict = &mut *(roots.get(dict_slot) as *mut W_DictObject);
     dict.dstorage = new_storage as *mut u8;
     dict.dstrategy = &OBJECT_DICT_STRATEGY_REF;
+    dict_write_barrier(roots.get(dict_slot));
 }
 
 /// Internal helper: `ObjectDictStrategy::items` body for pyre's

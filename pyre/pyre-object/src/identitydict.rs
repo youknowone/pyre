@@ -175,6 +175,7 @@ pub unsafe fn w_dict_switch_identity_to_object_strategy(w_dict: PyObjectRef) {
         crate::dictmultiobject::object_dict_storage_gc_type_id(),
     ) as *mut u8;
     dict.dstrategy = &crate::dictmultiobject::OBJECT_DICT_STRATEGY_REF;
+    crate::dictmultiobject::dict_write_barrier(w_dict);
 }
 
 #[inline]
