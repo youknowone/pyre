@@ -122,7 +122,15 @@ impl<'a> RegAllocator<'a> {
     }
 
     fn make_dependencies(&mut self) {
+        self.make_dependencies_among(None);
+    }
+
+    /// `make_dependencies`, recording only the edges whose two endpoints are
+    /// both in `tracked` (every edge when `None`).  Nodes are still added for
+    /// every variable, and liveness is computed over all of them.
+    fn make_dependencies_among(&mut self, tracked: Option<&HashSet<super::flow::VariableId>>) {
         let kind = self.kind;
+        let is_tracked = |v: &super::flow::VariableId| tracked.is_none_or(|set| set.contains(v));
         // Per-block tables, emptied at the end of each block rather than
         // reallocated for the next one.
         let mut die_at: HashMap<super::flow::VariableId, usize> = HashMap::default();
@@ -211,19 +219,23 @@ impl<'a> RegAllocator<'a> {
             );
             for (i, &v) in livevar_reps.iter().enumerate() {
                 self._depgraph.add_node(v);
+                if !is_tracked(&v) {
+                    continue;
+                }
                 for j in 0..i {
                     // Pre-merged inputargs can collapse to the same
                     // representative.  RPython's DependencyGraph asserts
                     // against self-edges, so skip the edge here instead
                     // of weakening the shared color.py port.
-                    if livevar_reps[j] != v {
+                    if livevar_reps[j] != v && is_tracked(&livevar_reps[j]) {
                         self._depgraph.add_edge(livevar_reps[j], v);
                     }
                 }
             }
-            // upstream: `livevars = set(livevars)`.
+            // upstream: `livevars = set(livevars)`.  An untracked variable
+            // takes part in no recorded edge, so it is left out.
             livevars.clear();
-            livevars.extend(livevar_reps.iter().copied());
+            livevars.extend(livevar_reps.iter().copied().filter(|v| is_tracked(v)));
             let mut die_index = 0;
             for (i, op) in block_borrow.operations.iter().enumerate() {
                 while die_list[die_index].0 == i {
@@ -240,12 +252,14 @@ impl<'a> RegAllocator<'a> {
                         // Pyre's pin pre-merge can make an already-live
                         // inputarg and this result share a representative,
                         // so keep the RPython add_edge invariant locally.
-                        for &v in &livevars {
-                            if v != rep {
-                                self._depgraph.add_edge(v, rep);
+                        if is_tracked(&rep) {
+                            for &v in &livevars {
+                                if v != rep {
+                                    self._depgraph.add_edge(v, rep);
+                                }
                             }
+                            livevars.insert(rep);
                         }
-                        livevars.insert(rep);
                     }
                 }
             }
@@ -572,7 +586,13 @@ pub fn filter_coalesce_pairs_by_interference(
     pairs: &[(super::flow::VariableId, super::flow::VariableId)],
 ) -> Vec<(super::flow::VariableId, super::flow::VariableId)> {
     let mut allocator = RegAllocator::new(graph, kind);
-    allocator.make_dependencies();
+    // Every `has_edge` below asks about two representatives of merged
+    // endpoint classes, and a merged node's neighbours are the union of its
+    // members' (`DependencyGraph.coalesce`).  So only edges between two pair
+    // endpoints can change an answer; the rest of the graph is not built.
+    let endpoints: HashSet<super::flow::VariableId> =
+        pairs.iter().flat_map(|&(v, w)| [v, w]).collect();
+    allocator.make_dependencies_among(Some(&endpoints));
     let mut kept = Vec::with_capacity(pairs.len());
     for &(v_id, w_id) in pairs {
         if v_id == w_id {
