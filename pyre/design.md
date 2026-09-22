@@ -690,11 +690,10 @@ need the inlining.
 
 **What does not hold it in place.** Fixture coverage of a fold is
 `# pyre-check: trace-shape=`: a code-object name and the operations the
-optimized loop must contain or omit. Four fixtures still carry `spec-folds=`
-(`binary_slice_index`, `for_iter_direct_store_double`,
-`getframe_method_call_residual_body_once`, `str_fstring`) because suppressing
-the named fold did not change an opcode of a compiled loop. Retirement is
-blocked by reach, not by headers.
+optimized loop must contain or omit. No fixture carries `spec-folds=`. Five folds
+have no trace-shape row because no loop compiles both with and without them
+and differs by an operation: `format_with_spec`, `str_endswith`,
+`store_attr_direct`, `load_type_attr`, `frame_lasti`. Retirement is blocked by reach, not by headers.
 
 **The bounded first step has been taken, and it does not settle the
 question.** The type-identity group — `builtin_type`, `builtin_isinstance`,
