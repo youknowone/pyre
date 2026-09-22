@@ -2352,10 +2352,10 @@ impl<'a> GraphFlattener<'a> {
         // PC dispatch via per-PC `Insn::Label("pc{N}")`; that runtime
         // mechanism remains on the walker side for now, but canonical
         // now matches upstream's structure exactly.
-        let operations = block.borrow().operations.clone();
-        let exits_len = block.borrow().exits.len();
-        let exitswitch_is_last_exception = block.borrow().canraise();
-        for op in &operations {
+        let block_borrow = block.borrow();
+        let exits_len = block_borrow.exits.len();
+        let exitswitch_is_last_exception = block_borrow.canraise();
+        for op in &block_borrow.operations {
             // `flatten.py:120-125` `_ovf` validity check: an overflow-
             // checked op must live in a canraise block with 2 or 3
             // exits; otherwise the rtyper-side guarantee that an
@@ -2382,6 +2382,7 @@ impl<'a> GraphFlattener<'a> {
                 break;
             }
         }
+        drop(block_borrow);
         self.insert_exits(&block, handling_ovf);
     }
 
