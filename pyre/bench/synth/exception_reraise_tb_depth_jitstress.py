@@ -1,12 +1,16 @@
 # pyre-check: max-pypy-ratio=15
 # Locals for except-as stop the module-dict `version?` revoke storm
 # (`celldict.py notify_version_watchers`), so pypy compiles the
-# driving loops. `run()` still has FOR_ITER plus `except E as e:
-# raise e` and is `for_iter_frame_has_raising_named_handler` — a
-# whole-frame CurrentFrameOnly screen (#57: abort with a FOR_ITER
-# item in flight drops that iteration). pyre interprets; pypy
-# compiles. CI sits at 11–12.5×; 15 is that ceiling plus 15%
-# headroom. Do not lift the screen to chase this gate.
+# driving loops. `run()`'s `for` re-raises through `except E as e`,
+# and its handler entry reads `last_exc_value`
+# (`pyjitpl.py opimpl_last_exc_value`). The bridge seeds that slot
+# from the frame (`seed_standing_exception_for_walk`), so
+# `can_enter_jit` (`interp_jit.py`) traces the `for` and the
+# traceback `while` on their own back-edges. A late `abort_permanent`
+# resumes at the opcode that emitted it
+# (`abort_permanent_py_pc_by_jit_pc`), not at the floor segment's
+# trailing `RERAISE`, so the live frame is not left on `END_FOR`.
+# The ceiling stays 15.
 # JIT-stress twin of exception_reraise_tb_depth_hot: `pypyjit.set_param`
 # lowers the trace/function thresholds to 1 so trace recording fires on the
 # earliest iterations rather than only after the ~1600-iteration warmup. That
