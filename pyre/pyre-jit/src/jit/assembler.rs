@@ -117,9 +117,9 @@ struct AssemblyState {
     label_positions: IndexMap<String, usize>,
     /// Builder adapter for `Label/TLabel` name → builder label id.
     /// RPython stores bytecode positions directly in `label_positions`; this
-    /// extra vector exists only because `JitCodeBuilder` patches jumps by
+    /// extra map exists only because `JitCodeBuilder` patches jumps by
     /// symbolic label id rather than by rewriting raw bytes in `fix_labels()`.
-    builder_labels: Vec<(String, u16)>,
+    builder_labels: IndexMap<String, u16>,
 }
 
 impl Assembler {
@@ -316,7 +316,7 @@ impl Assembler {
         let mut state = AssemblyState {
             builder,
             label_positions: IndexMap::new(),
-            builder_labels: Vec::new(),
+            builder_labels: IndexMap::new(),
         };
 
         ssarepr.insns_pos = Some(Vec::with_capacity(ssarepr.insns.len()));
@@ -717,15 +717,11 @@ fn dump_assembled_ssarepr(ssarepr: &SSARepr, jitcode: &JitCode) {
 }
 
 fn builder_label(state: &mut AssemblyState, name: &str) -> u16 {
-    if let Some((_, label)) = state
-        .builder_labels
-        .iter()
-        .find(|(existing, _)| existing == name)
-    {
-        return *label;
+    if let Some(&label) = state.builder_labels.get(name) {
+        return label;
     }
     let label = state.builder.new_label();
-    state.builder_labels.push((name.to_owned(), label));
+    state.builder_labels.insert(name.to_owned(), label);
     label
 }
 

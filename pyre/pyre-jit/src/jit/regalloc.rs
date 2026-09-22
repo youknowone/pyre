@@ -123,9 +123,14 @@ impl<'a> RegAllocator<'a> {
 
     fn make_dependencies(&mut self) {
         let kind = self.kind;
+        // Per-block tables, emptied at the end of each block rather than
+        // reallocated for the next one.
+        let mut die_at: HashMap<super::flow::VariableId, usize> = HashMap::default();
+        let mut die_list: Vec<(usize, super::flow::VariableId)> = Vec::new();
+        let mut livevar_reps: Vec<super::flow::VariableId> = Vec::new();
+        let mut livevars: HashSet<super::flow::VariableId> = HashSet::default();
         for block in self.graph.iterblocks() {
             let block_borrow = block.borrow();
-            let mut die_at: HashMap<super::flow::VariableId, usize> = HashMap::default();
             for arg in &block_borrow.inputargs {
                 if let Some(v) = arg.as_variable() {
                     if v.kind == Some(kind) {
@@ -190,18 +195,20 @@ impl<'a> RegAllocator<'a> {
                     }
                 }
             }
-            let mut die_list: Vec<(usize, super::flow::VariableId)> =
-                die_at.into_iter().map(|(var, time)| (time, var)).collect();
+            die_list.clear();
+            die_list.extend(die_at.drain().map(|(var, time)| (time, var)));
             die_list.sort_by_key(|(time, _)| *time);
             die_list.push((usize::MAX, super::flow::VariableId(u32::MAX)));
 
-            let livevar_reps: Vec<super::flow::VariableId> = block_borrow
-                .inputargs
-                .iter()
-                .filter_map(FlowValue::as_variable)
-                .filter(|v| v.kind == Some(kind))
-                .map(|v| self._unionfind.find_rep(v.id))
-                .collect();
+            livevar_reps.clear();
+            livevar_reps.extend(
+                block_borrow
+                    .inputargs
+                    .iter()
+                    .filter_map(FlowValue::as_variable)
+                    .filter(|v| v.kind == Some(kind))
+                    .map(|v| self._unionfind.find_rep(v.id)),
+            );
             for (i, &v) in livevar_reps.iter().enumerate() {
                 self._depgraph.add_node(v);
                 for j in 0..i {
@@ -214,9 +221,9 @@ impl<'a> RegAllocator<'a> {
                     }
                 }
             }
-            // upstream: `livevars = set(livevars)` — shadow the list
-            // with the set rather than renaming to `alive`.
-            let mut livevars: HashSet<super::flow::VariableId> = livevar_reps.into_iter().collect();
+            // upstream: `livevars = set(livevars)`.
+            livevars.clear();
+            livevars.extend(livevar_reps.iter().copied());
             let mut die_index = 0;
             for (i, op) in block_borrow.operations.iter().enumerate() {
                 while die_list[die_index].0 == i {
@@ -468,7 +475,19 @@ pub fn perform_register_allocation_with_pairs(
     let mut coloring = HashMap::default();
     for block in graph.iterblocks() {
         let block_borrow = block.borrow();
-        for variable in block_borrow.getvariables() {
+        // `Block.getvariables()` walked in place: a variable met twice gets
+        // the color it already has.
+        let block_variables = block_borrow
+            .inputargs
+            .iter()
+            .filter_map(FlowValue::as_variable)
+            .chain(block_borrow.operations.iter().flat_map(|op| {
+                op.args
+                    .iter()
+                    .flat_map(|arg| arg.variables())
+                    .chain(op.result.as_ref().and_then(FlowValue::as_variable))
+            }));
+        for variable in block_variables {
             if variable.kind == Some(kind) {
                 if let Some(color) = allocator.getcolor(variable) {
                     coloring.insert(variable.id, color);

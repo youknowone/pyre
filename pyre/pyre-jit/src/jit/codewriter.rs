@@ -15079,11 +15079,13 @@ impl CodeWriter {
             // marker.
             let mut shift: Vec<usize> = Vec::with_capacity(spliced.insns.len() + 1);
             let mut inserted = 0usize;
-            for (i, insn) in spliced.insns.iter().enumerate() {
+            let mut insns = std::mem::take(&mut spliced.insns).into_iter().peekable();
+            while let Some(insn) = insns.next() {
                 shift.push(inserted);
-                new_insns.push(insn.clone());
-                if matches!(insn, super::flatten::Insn::Label(_)) {
-                    let next_blocks_marker = spliced.insns.get(i + 1).map_or(true, |n| {
+                let is_label = matches!(insn, super::flatten::Insn::Label(_));
+                new_insns.push(insn);
+                if is_label {
+                    let next_blocks_marker = insns.peek().map_or(true, |n| {
                         n.is_live() || matches!(n, super::flatten::Insn::Label(_))
                     });
                     if !next_blocks_marker {
@@ -15165,13 +15167,13 @@ impl CodeWriter {
                 Vec::with_capacity(spliced.insns.len() + extra);
             let mut shift: Vec<usize> = Vec::with_capacity(spliced.insns.len() + 1);
             let mut inserted = 0usize;
-            for (i, insn) in spliced.insns.iter().enumerate() {
+            for (i, insn) in std::mem::take(&mut spliced.insns).into_iter().enumerate() {
                 if marker_before[i] {
                     new_insns.push(super::flatten::Insn::live(Vec::new()));
                     inserted += 1;
                 }
                 shift.push(inserted);
-                new_insns.push(insn.clone());
+                new_insns.push(insn);
             }
             shift.push(inserted);
             for pos in spliced.stream_positions_mut() {

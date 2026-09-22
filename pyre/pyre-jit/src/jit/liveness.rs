@@ -13,6 +13,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use rustc_hash::FxHashSet;
+
 use super::flatten::{DescrOperand, Insn, Operand, Register, SSARepr, TLabel};
 
 pub use majit_translate::liveness::{
@@ -112,8 +114,10 @@ fn _compute_liveness_must_continue(
     ssarepr: &mut SSARepr,
     label2alive: &mut HashMap<String, HashSet<Register>>,
 ) -> bool {
-    // `liveness.py:26` `alive = set()`.
-    let mut alive: HashSet<Register> = HashSet::new();
+    // `liveness.py` `alive = set()`.  Its iteration order only fixes the
+    // order of a `-live-` marker's registers, which every reader treats as
+    // a set.
+    let mut alive: FxHashSet<Register> = FxHashSet::default();
     // `liveness.py` `must_continue = False`.
     let mut must_continue = false;
 
@@ -126,7 +130,7 @@ fn _compute_liveness_must_continue(
     // semantic exactly.
     #[inline]
     fn follow_label(
-        alive: &mut HashSet<Register>,
+        alive: &mut FxHashSet<Register>,
         label2alive: &HashMap<String, HashSet<Register>>,
         lbl: &TLabel,
     ) {
@@ -137,18 +141,21 @@ fn _compute_liveness_must_continue(
 
     // `liveness.py` `for i in range(len(ssarepr.insns)-1, -1, -1):`.
     for i in (0..ssarepr.insns.len()).rev() {
-        // `liveness.py:34` `insn = ssarepr.insns[i]`.
-        // Clone so the borrow on `ssarepr` is released before the later
-        // `ssarepr.insns[i] = ...` write at `liveness.py:52`.
-        let insn = ssarepr.insns[i].clone();
+        // `liveness.py` `insn = ssarepr.insns[i]`.  Borrowed: the one
+        // write back, `ssarepr.insns[i] = ...` below, comes
+        // after the last read of `insn`.
+        let insn = &ssarepr.insns[i];
 
         // `liveness.py` `if isinstance(insn[0], Label)`.
-        let label_name = match &insn {
-            Insn::Label(label) => Some(label.name.clone()),
-            _ => None,
-        };
-        if let Some(name) = label_name {
-            let alive_at_point = label2alive.entry(name).or_default();
+        if let Insn::Label(label) = insn {
+            // `label2alive.setdefault(insn[0].name, set())`, keyed without
+            // copying the name once the label has an entry.
+            if !label2alive.contains_key(&label.name) {
+                label2alive.insert(label.name.clone(), HashSet::new());
+            }
+            let alive_at_point = label2alive
+                .get_mut(&label.name)
+                .expect("label2alive entry inserted above");
             // `liveness.py` `prevlength = len(alive_at_point)`.
             let prevlength = alive_at_point.len();
             // `liveness.py` `alive_at_point.update(alive)`.
@@ -195,7 +202,7 @@ fn _compute_liveness_must_continue(
         }
 
         // `liveness.py` `if insn[0] == '---':`.
-        if let Insn::Unreachable = &insn {
+        if let Insn::Unreachable = insn {
             // `liveness.py:56` `alive = set()`.
             alive.clear();
             // `liveness.py:57` `continue`.
@@ -208,7 +215,7 @@ fn _compute_liveness_must_continue(
         // trailing `'->', reg` pair means `reg` is defined here, so we
         // `alive.discard(reg)` and drop the last two slots before
         // consuming operands.
-        let (args, result) = match &insn {
+        let (args, result) = match insn {
             Insn::Op { args, result, .. } => (args.as_slice(), result),
             // `Label`, `-live-` (via `live_args`), and `Unreachable`
             // were handled above.
