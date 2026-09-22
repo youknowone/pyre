@@ -12,7 +12,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-latest]
+        # ubuntu-24.04 already reported (run 35711875375).
+        os: [windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 150
     env:
@@ -155,7 +156,7 @@ jobs:
       env:
         PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}
         PYRE_CHECK_PYPY3: ${{ steps.pypy800.outputs.python-path }}
-      run: ${{ steps.cpython.outputs.python-path }} pyre/check.py --backend dynasm --build=only
+      run: '"${{ steps.cpython.outputs.python-path }}" pyre/check.py --backend dynasm --build=only'
     - name: Install perf
       if: runner.os == 'Linux'
       continue-on-error: true
