@@ -15418,15 +15418,28 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     let returned = pyre_interpreter::module::sys::vm::jit_audit_sys_getframe(
         cur_ptr as pyre_object::PyObjectRef,
     );
-    let effect = majit_ir::EffectInfo::new(
-        majit_ir::ExtraEffect::ForcesVirtualOrVirtualizable,
-        majit_ir::OopSpecIndex::None,
-    );
+    // `graphanalyze.py analyze_external_call`: the hook is arbitrary Python,
+    // so the effect is `MOST_GENERAL`. `record_call_with_descr` then
+    // invalidates the tracing heap cache, and the optimizer's random-effects
+    // arm flushes lazy sets before the call. An empty write set left a later
+    // `state.x` read on the pre-hook value.
+    //
+    // The opcode stays `CallN`. `CallMayForceN` stores the following
+    // `GuardNotForced` resume descr (`_store_force_index_if_next_guard`),
+    // which is what an escaping hook needs, but it also arms the token.
+    // This hook then reads `f_lineno` from outside the trace and forces the
+    // portal frame on every iteration. That guard is `is_guard_forced` and
+    // is never bridged (`forced_never_compiled`). PyPy does not take that
+    // path: `trigger_audit_events` is `@dont_inline` but not
+    // `dont_look_inside`, and the bridge traces the hook, lowering
+    // `f_lineno` to `offset2lineno` on the call's constant pc
+    // (`virtualizables forced: 0`). Arming the force descr on this opaque
+    // residual is the opposite shape.
     ctx.trace_ctx.call_void_typed_with_effect(
         pyre_interpreter::module::sys::vm::jit_audit_sys_getframe as *const (),
         &[cur_op],
         &[majit_ir::Type::Ref],
-        effect,
+        majit_ir::EffectInfo::MOST_GENERAL.clone(),
     );
     if returned.is_null() {
         let exc = pyre_interpreter::eval::get_current_exception();
