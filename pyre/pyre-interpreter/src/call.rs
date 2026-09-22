@@ -3416,9 +3416,14 @@ fn call_with_kwargs_in_ctx_impl(
                     }
                 };
                 // Under an active C-level profiler the call must still emit
-                // `c_call_trace` / `c_return_trace`, so route the bound flat
-                // slice through the profile-aware path like the marker branch
-                // below rather than invoking the builtin directly.
+                // `c_call_trace` / `c_return_trace`
+                // (`baseobjspace.py call_args_and_c_profile`), so the two
+                // hooks bracket the same direct invocation the unprofiled
+                // tail below makes.  Routing the bound slice back through
+                // `call_function` instead binds it a second time, and the
+                // second binding reads a keyword-only parameter's bound slot
+                // as a positional argument: `scales.sort(reverse=True)` under
+                // a profiler raised "sort() takes no positional arguments".
                 let frame_ptr = c_profile_frame(profile_anchor.live());
                 if !frame_ptr.is_null() {
                     // The argument marshalling below allocates before the frame
@@ -3437,10 +3442,10 @@ fn call_with_kwargs_in_ctx_impl(
                     // the earlier `bound` slice. Reload from the entry bracket
                     // and rebind before the profiled call, as the marker
                     // branch below does.
-                    let keyword_names_w: Vec<pyre_object::PyObjectRef> = name_slots
-                        .iter()
-                        .map(|&slot| pyre_object::gc_roots::shadow_stack_get(slot))
-                        .collect();
+                    let current_kw_name =
+                        |index: usize| pyre_object::gc_roots::shadow_stack_get(name_slots[index]);
+                    let keyword_names_w: Vec<pyre_object::PyObjectRef> =
+                        (0..kwargs.len()).map(current_kw_name).collect();
                     let keywords_w: Vec<pyre_object::PyObjectRef> =
                         (0..kwargs.len()).map(current_kwarg).collect();
                     let refreshed_pos: Vec<pyre_object::PyObjectRef> =
@@ -3452,22 +3457,64 @@ fn call_with_kwargs_in_ctx_impl(
                         .collect();
                     let bound =
                         bind_kwargs_to_signature(sig, &fname, &refreshed_pos, &refreshed_kwargs)?;
-                    let mut arguments = crate::argument::Arguments::with_kw(
-                        &refreshed_pos,
-                        &keyword_names_w,
-                        &keywords_w,
-                    );
-                    let w_res = crate::baseobjspace::call_args_and_c_profile_args(
-                        unsafe { &mut *frame_anchor.live() },
-                        current_callable(),
-                        &mut arguments,
-                        &bound,
-                    );
-                    if w_res == pyre_object::PY_NULL {
-                        return Err(take_call_error()
-                            .unwrap_or_else(|| crate::PyError::value_error("call failed")));
+                    // Both hooks run application code.  Publish the bound
+                    // slice across the first one and read it back from those
+                    // slots, and rebuild the `Arguments` the second hook reads
+                    // from the same entry bracket.
+                    let bound_slot = pyre_object::gc_roots::shadow_stack_len();
+                    for &value in &bound {
+                        let _ = pyre_object::gc_roots::pin_root(value);
                     }
-                    return Ok(w_res);
+                    let current_bound =
+                        |index: usize| pyre_object::gc_roots::shadow_stack_get(bound_slot + index);
+                    let ec = getexecutioncontext() as *mut crate::PyExecutionContext;
+                    if !ec.is_null() {
+                        let arguments = crate::argument::Arguments::with_kw(
+                            &refreshed_pos,
+                            &keyword_names_w,
+                            &keywords_w,
+                        );
+                        unsafe {
+                            (*ec).c_call_trace(
+                                frame_anchor.live(),
+                                current_callable(),
+                                Some(&arguments),
+                            )
+                        }?;
+                    }
+                    let bound: Vec<PyObjectRef> = (0..bound.len()).map(current_bound).collect();
+                    let called = unsafe {
+                        let current_code = crate::getcode(current_callable());
+                        crate::builtin_code_call(current_code as pyre_object::PyObjectRef, &bound)
+                    };
+                    let w_res = match called {
+                        Ok(w_res) => w_res,
+                        Err(err) => {
+                            if !ec.is_null() {
+                                unsafe {
+                                    (*ec).c_exception_trace(frame_anchor.live(), current_callable())
+                                }?;
+                            }
+                            return Err(err);
+                        }
+                    };
+                    let result_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(w_res);
+                    if !ec.is_null() {
+                        let arguments = crate::argument::Arguments::with_kw(
+                            &(0..pos_args.len()).map(current_pos_arg).collect::<Vec<_>>(),
+                            &(0..kwargs.len()).map(current_kw_name).collect::<Vec<_>>(),
+                            &(0..kwargs.len()).map(current_kwarg).collect::<Vec<_>>(),
+                        );
+                        unsafe {
+                            (*ec).c_return_trace(
+                                frame_anchor.live(),
+                                current_callable(),
+                                Some(&arguments),
+                            )
+                        }?;
+                    }
+                    return Ok(pyre_object::gc_roots::shadow_stack_get(result_slot));
                 }
                 // `bound` is already the final flat slice (positional slots
                 // plus packed `*args` / `**kwargs` tail), so invoke the
