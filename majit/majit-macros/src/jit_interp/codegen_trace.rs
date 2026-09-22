@@ -505,7 +505,7 @@ fn match_scrutinee_is_opcode_fetch(m: &syn::ExprMatch, names: &[String]) -> bool
     }
 }
 
-fn unwrap_cast(expr: &syn::Expr) -> &syn::Expr {
+pub(crate) fn unwrap_cast(expr: &syn::Expr) -> &syn::Expr {
     match expr {
         syn::Expr::Cast(c) => unwrap_cast(&c.expr),
         other => other,
@@ -525,8 +525,10 @@ fn method_is_get_op_at_pc(mc: &syn::ExprMethodCall) -> bool {
             .is_some_and(|a| expr_is_ident(unwrap_cast(a), "pc"))
 }
 
-/// CEL portal fetch: `insn_op(program, pc)`. Not `insn_a` / `insn_b`.
-fn call_is_insn_op_at_pc(call: &syn::ExprCall) -> bool {
+/// The opcode-fetch call `insn_op(program, pc)`. Not `insn_a` / `insn_b`.
+/// Casts on either argument are ignored, so `insn_op(program as _, pc as _)`
+/// is the same fetch.
+pub(crate) fn call_is_insn_op_at_pc(call: &syn::ExprCall) -> bool {
     let is_insn_op = match call.func.as_ref() {
         syn::Expr::Path(p) => p.path.segments.last().is_some_and(|s| s.ident == "insn_op"),
         _ => false,
