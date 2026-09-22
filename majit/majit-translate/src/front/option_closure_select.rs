@@ -592,6 +592,7 @@ fn emit_fn_item_call(
         kind: OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: segments.to_vec(),
+                fun_decl_id: None,
             },
             args,
             result_ty,

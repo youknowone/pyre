@@ -611,9 +611,8 @@ fn bridge_fuel_skipped(n: u64) -> bool {
 /// every bridge that entry point reaches.
 pub fn bridge_fuel_take() -> bool {
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    let limit = *LIMIT.get_or_init(|| {
-        crate::jit_env::env_var("MAJIT_MAX_BRIDGES").and_then(|v| v.parse().ok())
-    });
+    let limit = *LIMIT
+        .get_or_init(|| crate::jit_env::env_var("MAJIT_MAX_BRIDGES").and_then(|v| v.parse().ok()));
     // The sequence number belongs to the pair, not to the limit: the skip list
     // names positions in this same count, so a run that configures only the
     // skip list still has to number the bridges it takes. Numbering only when a

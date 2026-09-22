@@ -25366,6 +25366,7 @@ fn push_direct_ptradd(
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
+                fun_decl_id: None,
             },
             args: crate::model::call_args(vec![ptr, count]),
             result_ty: ValueType::Ref(None),

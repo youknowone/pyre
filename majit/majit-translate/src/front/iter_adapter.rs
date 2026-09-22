@@ -510,7 +510,9 @@ pub(crate) fn is_map_collect_target(target: &CallTarget) -> bool {
 pub(crate) fn is_map_ctor_target(target: &CallTarget) -> bool {
     match target {
         CallTarget::Method { name, .. } => name == "map",
-        CallTarget::FunctionPath { segments, .. } => segments.last().map(String::as_str) == Some("map"),
+        CallTarget::FunctionPath { segments, .. } => {
+            segments.last().map(String::as_str) == Some("map")
+        }
         CallTarget::SyntheticTransparentCtor {
             name, owner_path, ..
         } => name == "Map" || owner_path.last().map(String::as_str) == Some("Map"),
