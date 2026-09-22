@@ -405,7 +405,7 @@ impl<'a> RegAlloc<'a> {
         } else {
             self.loc(arg1, Type::Int)
         };
-        // x86/regalloc.py:600-601 asserts l1 can be `MUL`'s operand:
+        // x86/regalloc.py `consider_uint_mul_high` asserts l1 can be `MUL`'s operand:
         // it must not be an immediate (immediate would need a scratch
         // register to materialise, which the optimiser already folded),
         // and it can only coincide with eax when arg1 IS arg2 (the
