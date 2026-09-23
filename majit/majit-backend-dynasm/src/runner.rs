@@ -1086,7 +1086,13 @@ fn dynasm_id_or_identityhash(addr: usize) -> usize {
     if let Some(r) = gc_box::with_mut_or_busy(addr, |gc| gc.id_or_identityhash(addr)) {
         return r;
     }
-    majit_gc::gc_sync::gc_op(|g| g.id_or_identityhash(addr))
+    // minimark.py `id_or_identityhash`: only a nursery object moves to a
+    // shadow. With no collector on this thread and no process singleton,
+    // there is no nursery the object could be in, so the identity is `addr`.
+    if majit_gc::gc_sync::is_initialized() {
+        return majit_gc::gc_sync::gc_op(|g| g.id_or_identityhash(addr));
+    }
+    addr
 }
 
 /// Host-side `is_managed_heap_object` trampoline. Lets host-side
@@ -4204,6 +4210,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn id_or_identityhash_without_collector_returns_addr() {
+        std::thread::spawn(|| {
+            assert!(!gc_box::present());
+            let marker = 0usize;
+            let addr = &marker as *const usize as usize;
+            let got = dynasm_id_or_identityhash(addr);
+            if !majit_gc::gc_sync::is_initialized() {
+                assert_eq!(got, addr);
+            }
+        })
+        .join()
+        .expect("id_or_identityhash must not panic without a collector");
+    }
+
+    #[test]
     fn reference_value_read_does_not_become_a_substructure_address() {
         let referent = 123usize;
         let field_words = [0usize, &referent as *const usize as usize];
@@ -4494,6 +4515,51 @@ mod tests {
 
         let frame = backend.execute_token(&token, &[Value::Int(4), Value::Int(5)]);
         assert_eq!(backend.get_int_value(&frame, 0), 9);
+    }
+
+    #[test]
+    fn uint_mul_high_then_wrapping_mul_keeps_both_operands() {
+        // `consider_finish` publishes only its first argument. The high
+        // half is a second argument so `UINT_MUL_HIGH` stays live:
+        // `has_no_side_effect` drops a result nobody reads, and then
+        // only `INT_MUL` would run. Both inputs stay live across the
+        // high multiply, which clobbers EAX and EDX.
+        fn product(a: i64, b: i64) -> i64 {
+            let mut backend = DynasmBackend::new();
+            backend.attach_default_test_descrs();
+            let ops = vec![
+                mk_op(
+                    OpCode::UintMulHigh,
+                    &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                    2,
+                ),
+                mk_op(
+                    OpCode::IntMul,
+                    &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                    3,
+                ),
+                mk_op(
+                    OpCode::Finish,
+                    &[OpRef::int_op(3), OpRef::int_op(2)],
+                    OpRef::NONE.raw(),
+                ),
+            ];
+            let token = JitCellToken::new(1501);
+            backend
+                .compile_loop(
+                    &[InputArg::new_int_rc(0), InputArg::new_int_rc(1)],
+                    &ops,
+                    &token,
+                )
+                .unwrap();
+            let frame = backend.execute_token(&token, &[Value::Int(a), Value::Int(b)]);
+            backend.get_int_value(&frame, 0)
+        }
+        for (a, b) in [(6i64, 7i64), (3125867703, 3442092617), (-1, 3)] {
+            let got = product(a, b) as u64;
+            let exp = (a as u64 as u128).wrapping_mul(b as u64 as u128) as u64;
+            assert_eq!(got, exp, "{a:#x} * {b:#x}");
+        }
     }
 
     #[test]

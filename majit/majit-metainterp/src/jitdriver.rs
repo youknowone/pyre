@@ -898,7 +898,7 @@ use crate::pyjitpl::{
 };
 use crate::resume::ResumeLayoutSummary;
 use crate::virtualizable::VirtualizableInfo;
-use crate::warmstate::{FunctionEntryStep, HotResult};
+use crate::warmstate::{FunctionEntryStep, HotResult, JcFlags, MAX_TRACE_ABORT_COUNT};
 use majit_gc::GcAllocator;
 use majit_ir::OpRef;
 use majit_ir::descr::DescrRef;
@@ -5171,6 +5171,11 @@ impl<S: JitState> JitDriver<S> {
         env: &S::Env,
         pre_run: impl FnOnce(),
     ) -> Option<usize> {
+        if let Some(handled) =
+            self.try_empty_chain_tick(target_pc as u64, None, target_pc, state, env)
+        {
+            return handled;
+        }
         self.back_edge_internal(
             target_pc as u64,
             None,
@@ -5192,6 +5197,9 @@ impl<S: JitState> JitDriver<S> {
         env: &S::Env,
         pre_run: impl FnOnce(),
     ) -> Option<usize> {
+        if let Some(handled) = self.try_empty_chain_tick(green_key, None, target_pc, state, env) {
+            return handled;
+        }
         self.back_edge_internal(
             green_key, None, None, target_pc, state, env, None, None, pre_run,
         )
@@ -5211,8 +5219,12 @@ impl<S: JitState> JitDriver<S> {
     /// This is upstream's split: `get_uhash(*greenargs)` hashes the greens in
     /// place on every back edge, and the greens are stored on the cell only
     /// when one is installed (warmstate.py:584-604).
-    #[cold]
-    #[inline(never)]
+    ///
+    /// Not `#[cold]`: this is the interpreter's per-iteration door, and the
+    /// empty-chain arm (`warmstate.py:465-469`) is the common path. The
+    /// compiled-entry / tracing-start bodies stay in `back_edge_internal`,
+    /// which is `#[inline(never)]` so they do not land in the dispatch loop.
+    #[inline]
     pub fn back_edge_structured(
         &mut self,
         green_key_hash: u64,
@@ -5222,6 +5234,11 @@ impl<S: JitState> JitDriver<S> {
         env: &S::Env,
         pre_run: impl FnOnce(),
     ) -> Option<usize> {
+        if let Some(handled) =
+            self.try_empty_chain_tick(green_key_hash, Some(&make_green_key), target_pc, state, env)
+        {
+            return handled;
+        }
         self.back_edge_internal(
             green_key_hash,
             Some(&make_green_key),
@@ -6014,6 +6031,92 @@ impl<S: JitState> JitDriver<S> {
         Some(target_pc)
     }
 
+    /// `warmstate.py` `maybe_compile_and_run`, not-found arm: hash already
+    /// in hand, `lookup_chain` once, and if this hash owns no enterable
+    /// procedure token, `jitcounter.tick` and return. A compiled token, a
+    /// chained bucket, or a `JC_DONT_TRACE_HERE` cell this hash owns
+    /// continues into `back_edge_internal`.
+    ///
+    /// `Some(resume)` means this IS that cold case — including `Some(None)`
+    /// when the tick did not overflow.
+    #[inline(always)]
+    fn try_empty_chain_tick(
+        &mut self,
+        green_key_hash: u64,
+        structured_green_key: Option<&dyn Fn() -> GreenKey>,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+    ) -> Option<Option<usize>> {
+        if self.meta.is_tracing() {
+            return Some(None);
+        }
+        // Cross-loop-cut decline and single-pass label handoff must stay
+        // ahead of the counter (`back_edge_internal` cites why). Empty
+        // tables are O(1) and allocation-free: check emptiness first so a
+        // never-compiled loop does not hash into them.
+        if self.meta.single_pass_label_entry_key.is_some() {
+            return None;
+        }
+        if !self.meta.cut_compiled_keys.is_empty() {
+            return None;
+        }
+        // A chained bucket needs comparekey and stays on `back_edge_internal`.
+        // A lone cell is the tick arm only when this hash owns it.
+        if let Some(cell) = self.meta.warm_state_ref().lookup_chain(green_key_hash) {
+            if cell.next.is_some() {
+                return None;
+            }
+            // `lookup_chain` returns the table-slot head. `_get_index` keeps
+            // only the high bits of the low 32, so that head can belong to a
+            // different green key. Its compiled / tracing / dead-token /
+            // abort-ceiling / `JC_DONT_TRACE_HERE` state is not ours: the
+            // not-found arm of `maybe_compile_and_run` ticks this hash.
+            if cell.cell_bucket == green_key_hash {
+                if cell.is_compiled() {
+                    return None;
+                }
+                if cell.is_tracing() {
+                    return Some(None);
+                }
+                // Dead-token cleanup (`maybe_compile_and_run`) lives on the
+                // occupied door, including a latched cell that is also dead.
+                if cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none() {
+                    return None;
+                }
+                // Same bump `maybe_compile_decision` makes at this refusal
+                // (`abort_ceiling_refused`). A latched cell never reaches
+                // `commit_start_tracing`, so slot 61 does not move; slot 81 is
+                // the one that counts the refusal itself.
+                if cell.abort_count >= MAX_TRACE_ABORT_COUNT {
+                    crate::mc_diag_bump(81); // abort_ceiling_refused
+                    return Some(None);
+                }
+                if cell.flags.contains(JcFlags::JC_DONT_TRACE_HERE) {
+                    // `should_start_dont_trace_here_trace`: never traced
+                    // starts immediately, `JC_TRACING_OCCURRED` ticks. Both
+                    // stay on the occupied door.
+                    return None;
+                }
+            }
+        }
+        if !state.can_trace() {
+            return Some(None);
+        }
+        if self.meta.warm_state_mut().tick_empty_chain(green_key_hash)
+            && self.commit_start_tracing(
+                green_key_hash,
+                structured_green_key,
+                target_pc,
+                state,
+                env,
+            )
+        {
+            return Some(Some(target_pc));
+        }
+        Some(None)
+    }
+
     /// RPython warmstate.py:482-501 / compile.py:711 parity.
     ///
     /// Returns `Some(pc)` when compiled code ran:
@@ -6024,6 +6127,7 @@ impl<S: JitState> JitDriver<S> {
         clippy::too_many_arguments,
         reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
     )]
+    #[inline(never)]
     fn back_edge_internal(
         &mut self,
         green_key_hash: u64,
@@ -6074,8 +6178,15 @@ impl<S: JitState> JitDriver<S> {
             Some(token) => (green_key_hash, Some(token)),
             None => self.resolved_entry_procedure_token(green_key_hash, structured_green_key),
         };
-        let single_pass_dispatch_key =
-            self.take_single_pass_label_entry_dispatch_key_for_back_edge(green_key);
+        // Single-pass label handoff must stay ahead of the counter so a
+        // CloseLoop arm's pending LABEL entry is consumed on the next back
+        // edge rather than ticking past it. The table is one `Option`; check
+        // emptiness first so a never-armed loop does not enter the take.
+        let single_pass_dispatch_key = if self.meta.single_pass_label_entry_key.is_some() {
+            self.take_single_pass_label_entry_dispatch_key_for_back_edge(green_key)
+        } else {
+            None
+        };
         if !state.can_trace() {
             return None;
         }
@@ -6112,7 +6223,14 @@ impl<S: JitState> JitDriver<S> {
         // `has_compiled_loop` leaves the merge point to arm tracing normally
         // rather than re-entering an artifact whose entry contract is unmet.
         let dispatch_key = dispatch_key.or(single_pass_dispatch_key);
-        if dispatch_key.is_none() && self.meta.is_cross_loop_cut_key(green_key) {
+        // `cut_compiled_keys` is empty until a cross-loop cut installs a
+        // loop; check that first so a never-compiled back edge does not
+        // hash-probe the set. The decline itself stays ahead of the
+        // counter: a cut key must not tick into `bound_reached` either.
+        if dispatch_key.is_none()
+            && !self.meta.cut_compiled_keys.is_empty()
+            && self.meta.is_cross_loop_cut_key(green_key)
+        {
             return None;
         }
         // `warmstate.py maybe_compile_and_run`: a cell whose token was
@@ -7169,6 +7287,9 @@ impl<S: JitState> JitDriver<S> {
         // continue;` it pre-empts (`target_pc == tgt`); 21 of the corpus's 23
         // `can_enter_jit!` sites are that shape. Re-entry cannot loop: the next
         // pass returns at the `is_tracing()` guard opening this function.
+        // Occupied bucket, no enterable token: the typed comparekey walk
+        // (`on_back_edge_typed_decision`) ticks the cell the greens own.
+        // Frontend snapshot work stays behind `StartTracing`.
         if self.maybe_start_tracing(green_key, structured_green_key, target_pc, state, env) {
             return Some(target_pc);
         }
@@ -7187,8 +7308,17 @@ impl<S: JitState> JitDriver<S> {
         if self.meta.is_tracing() {
             return None;
         }
-        let single_pass_dispatch_key =
-            self.take_single_pass_label_entry_dispatch_key_for_back_edge(green_key);
+        if let Some(handled) =
+            self.try_empty_chain_tick(green_key, structured_green_key, target_pc, state, env)
+        {
+            let _ = handled;
+            return None;
+        }
+        let single_pass_dispatch_key = if self.meta.single_pass_label_entry_key.is_some() {
+            self.take_single_pass_label_entry_dispatch_key_for_back_edge(green_key)
+        } else {
+            None
+        };
         if !state.can_trace() {
             if crate::debug::have_debug_prints() {
                 crate::debug::log_one(
@@ -7345,6 +7475,35 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         env: &S::Env,
     ) -> bool {
+        // Occupied-bucket path: keep the typed comparekey walk so a
+        // comparator-less cell at the hash cannot answer for a sibling
+        // (`chained_ceiling_latch_does_not_refuse_the_typed_sibling`).
+        // The empty-chain door never reaches here; it ticked already.
+        match self
+            .meta
+            .on_back_edge_typed_decision(green_key, (state.code_ptr(), target_pc))
+        {
+            HotResult::StartTracing => {
+                self.commit_start_tracing(green_key, structured_green_key, target_pc, state, env)
+            }
+            _ => false,
+        }
+    }
+
+    /// `warmstate.py bound_reached`: the tick has already fired, so build
+    /// the frontend snapshot and start the trace. Not reached on a cold
+    /// back edge — `maybe_compile_and_run` only calls `bound_reached` when
+    /// `tick` returns True.
+    #[cold]
+    #[inline(never)]
+    fn commit_start_tracing(
+        &mut self,
+        green_key: u64,
+        structured_green_key: Option<&dyn Fn() -> GreenKey>,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+    ) -> bool {
         if spdiag_enabled() {
             eprintln!("@@@SPDIAG maybe_start_tracing target_pc={target_pc} green_key={green_key}");
         }
@@ -7354,30 +7513,27 @@ impl<S: JitState> JitDriver<S> {
         // the same two checks, and folding three doors into one slot would say
         // nothing about any of them.
         crate::mc_diag_bump(61); // mst_entered
-        // The abort ceiling is NOT consulted separately here. It is a refusal
-        // the decision below already owns: `maybe_compile_decision_with_key`
-        // takes it in the position `warmstate.py maybe_compile_and_run` gives
-        // `confirm_enter_jit`, above the counter tick and above the
-        // `decay_all_counters` inside `bound_reached`, so a latched cell
-        // reaches neither — which is the whole reason the ceiling decides
-        // early. Asking first resolved the same cell through the same typed
-        // chain walk a second time, for an answer
-        // `is_ceiling_latched_agrees_with_the_decision_it_mirrors` pins equal
-        // to the one the decision reaches; `maybe_compile_and_run` binds its
-        // cell once ("to avoid computing the hash several times") and answers
-        // every question about it off that binding. Slot 81 counts the same
-        // population either way, because only one of the two refusals can fire
-        // for a given edge: every state in which the mirror answered `false`
-        // returns above the decision's ceiling arm or fails its condition.
-        match self
-            .meta
-            .on_back_edge_typed_decision(green_key, (state.code_ptr(), target_pc))
-        {
-            HotResult::NotHot | HotResult::AlreadyTracing | HotResult::RunCompiled => {
-                return false;
-            }
-            HotResult::StartTracing => {}
-        }
+        // Slot 61 counts entries into this bound_reached commit, not cold
+        // ticks. `warmstate.py maybe_compile_and_run` only calls
+        // `bound_reached` when `tick` returns True, so a NotHot back edge
+        // never arrives here. Slots 62/63 are refusals of this door and
+        // stay zero until 61 has moved. The abort ceiling is NOT consulted
+        // separately here. It is a refusal the decision below already owns:
+        // `maybe_compile_decision_with_key` takes it in the position
+        // `warmstate.py maybe_compile_and_run` gives `confirm_enter_jit`,
+        // above the counter tick and above the `decay_all_counters` inside
+        // `bound_reached`, so a latched cell reaches neither — which is the
+        // whole reason the ceiling decides early. Asking first resolved the
+        // same cell through the same typed chain walk a second time, for an
+        // answer `is_ceiling_latched_agrees_with_the_decision_it_mirrors`
+        // pins equal to the one the decision reaches; `maybe_compile_and_run`
+        // binds its cell once ("to avoid computing the hash several times")
+        // and answers every question about it off that binding. Slot 81
+        // counts the same population either way, because only one of the two
+        // refusals can fire for a given edge: every state in which the
+        // mirror answered `false` returns above the decision's ceiling arm
+        // or fails its condition. A latched cell on the empty-chain door
+        // bumps 81 there and never enters this function.
 
         // The liveness decoder's thread-local payload is only a publication
         // mechanism; ownership stays with this driver. Another live portal may
@@ -8596,6 +8752,14 @@ impl<S: JitState> JitDriver<S> {
     /// Returns `Some(resume_pc)` only when compiled code ran and left a
     /// resume point. FINISH is published on the same latch as
     /// [`Self::back_edge`].
+    ///
+    /// Not `#[cold]`: this is the interpreter's per-call door, and the
+    /// empty-chain arm (`warmstate.py:465-469` with
+    /// `increment_function_threshold`) is the common path. Compiled-entry
+    /// / tracing-start / chained-resolve bodies stay in
+    /// `function_entry_internal`, which is `#[inline(never)]` so they do
+    /// not land in the portal.
+    #[inline]
     pub fn function_entry_structured(
         &mut self,
         green_key_hash: u64,
@@ -8610,8 +8774,112 @@ impl<S: JitState> JitDriver<S> {
         if self.meta.is_tracing() {
             return None;
         }
+        if let Some(handled) = self.try_function_entry_cold_tick(
+            green_key_hash,
+            &make_green_key,
+            target_pc,
+            state,
+            env,
+        ) {
+            return handled;
+        }
+        self.function_entry_internal(green_key_hash, make_green_key, target_pc, state, env, false)
+    }
+
+    /// `warmstate.py maybe_compile_and_run` `:465-480` with
+    /// `increment_function_threshold`: hash already in hand, `lookup_chain`
+    /// once, and if there is no enterable procedure token, `jitcounter.tick`
+    /// and return. A compiled token, a chained bucket, a dead token, or a
+    /// `JC_DONT_TRACE_HERE` cell continues into `function_entry_internal`.
+    ///
+    /// `Some(resume)` means this IS that cold case — including `Some(None)`
+    /// when the tick did not overflow. A True tick is already consumed here
+    /// and is handed to `function_entry_internal` as `already_ticked` so
+    /// [`crate::warmstate::WarmEnterState::function_entry_step`] does not
+    /// increment a second time.
+    #[inline(always)]
+    fn try_function_entry_cold_tick(
+        &mut self,
+        green_key_hash: u64,
+        make_green_key: &impl Fn() -> GreenKey,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+    ) -> Option<Option<usize>> {
+        if let Some(cell) = self.meta.warm_state_ref().lookup_chain(green_key_hash) {
+            if cell.next.is_some() {
+                return None;
+            }
+            if cell.cell_bucket == green_key_hash {
+                if cell.is_compiled() {
+                    return None;
+                }
+                if cell.is_tracing() {
+                    // Slot 23/65/66 live on `function_entry_step`; keep them
+                    // on that walk so a JC_TRACING leak still tallies.
+                    return None;
+                }
+                if cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none() {
+                    return None;
+                }
+                if cell.abort_count >= MAX_TRACE_ABORT_COUNT {
+                    crate::mc_diag_bump(81); // abort_ceiling_refused
+                    return Some(None);
+                }
+                if cell.flags.contains(JcFlags::JC_DONT_TRACE_HERE) {
+                    // Immediate-Proceed (never traced) vs tick-normally
+                    // (TRACING_OCCURRED) stay on the occupied door.
+                    return None;
+                }
+                if cell.flags.contains(JcFlags::JC_TEMPORARY) {
+                    return None;
+                }
+            }
+            // Occupant of this slot is a different green key. Same as empty
+            // for our hash: tick our hash, do not inspect the stranger
+            // (`warmstate.py:465-469` not-found arm).
+        }
+        if self
+            .meta
+            .warm_state_mut()
+            .tick_function_entry_empty_chain(green_key_hash)
+        {
+            return Some(self.function_entry_internal(
+                green_key_hash,
+                make_green_key,
+                target_pc,
+                state,
+                env,
+                true,
+            ));
+        }
+        Some(None)
+    }
+
+    /// Occupied / overflow half of [`Self::function_entry_structured`].
+    ///
+    /// `already_ticked` is the empty-chain overflow: the counter already
+    /// returned True, so this skips [`Self::function_entry_step`] (which
+    /// would tick again) and takes the Proceed arm. RunCompiled, chained
+    /// `resolve_cell_key`, decay + `stack_almost_full` +
+    /// `force_start_tracing` all stay here.
+    #[inline(never)]
+    fn function_entry_internal(
+        &mut self,
+        green_key_hash: u64,
+        make_green_key: impl Fn() -> GreenKey,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+        already_ticked: bool,
+    ) -> Option<usize> {
         let cell_key = self.resolve_cell_key(green_key_hash, make_green_key);
-        match self.function_entry_step(cell_key, green_key_hash, (state.code_ptr(), target_pc)) {
+        let step = if already_ticked {
+            FunctionEntryStep::Proceed
+        } else {
+            self.function_entry_step(cell_key, green_key_hash, (state.code_ptr(), target_pc))
+        };
+        match step {
             FunctionEntryStep::RunCompiled(token) => {
                 self.back_edge_resolved(cell_key, token, target_pc, state, env, || {})
             }
@@ -10103,13 +10371,16 @@ mod tests {
 
     #[test]
     fn maybe_start_tracing_bumps_its_entry_counter_on_the_live_path() {
-        // Slots 62/63 count `maybe_start_tracing`'s two refusals and slot 61 is
+        // Slots 62/63 count `commit_start_tracing`'s two refusals and slot 61 is
         // their denominator, so a refusal reading 0 only means "did not fire"
-        // once 61 is known to move.  Pin the bump to the live back-edge path,
-        // not to the counter's own definition: an unreachable slot and a
+        // once 61 is known to move.  Pin the bump to the live bound_reached
+        // path, not to the counter's own definition: an unreachable slot and a
         // correctly-quiet one both read 0.  `MC_DIAG` is process-global and
         // shared with every other test in this binary, so a concurrent bump can
         // only inflate the delta — the assertion below is a lower bound.
+        //
+        // Cold edges (`warmstate.py:465-469`) tick and return without entering
+        // this door, so only the overflow that starts tracing is counted.
         let before = crate::mc_diag(61);
         let mut driver = JitDriver::<TypedRestoreState>::new(2);
         driver.meta.finish_setup_descrs_for_jitdrivers();
@@ -10119,7 +10390,6 @@ mod tests {
             ..Default::default()
         };
         // Threshold 2: the first back edge warms up, the second starts tracing.
-        // Both reach the door, so both are counted.
         for _ in 0..2 {
             assert!(
                 driver
@@ -10132,8 +10402,8 @@ mod tests {
             "drive must reach the StartTracing arm so that neither refusal fires"
         );
         assert!(
-            crate::mc_diag(61) >= before + 2,
-            "mst_entered did not move across two back edges that reached the door"
+            crate::mc_diag(61) >= before + 1,
+            "mst_entered did not move on the back edge that started tracing"
         );
     }
 
@@ -10240,6 +10510,111 @@ mod tests {
         assert!(
             driver.is_tracing(),
             "the early ceiling check and typed decision must select the same cell",
+        );
+    }
+
+    #[test]
+    fn a_colliding_green_key_in_a_single_cell_bucket_still_ticks_and_traces() {
+        // `_get_index` keeps the high bits of the low 32. Bit 0 never
+        // changes that index, so these two hashes share a table slot and
+        // differ everywhere the cell's own bucket is compared.
+        let occupant = 0x11u64 << 21;
+        let colliding = occupant | 1;
+        let mut driver = JitDriver::<CountingDoorState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        assert_eq!(
+            driver.meta.warm_state.counter._get_index(occupant),
+            driver.meta.warm_state.counter._get_index(colliding),
+            "fixture hashes must share one celltable slot",
+        );
+        driver
+            .meta
+            .warm_state_mut()
+            .disable_noninlinable_function(occupant);
+        let cell = driver
+            .meta
+            .warm_state
+            .lookup_chain(colliding)
+            .expect("the colliding hash must see the occupied slot");
+        assert!(cell.next.is_none(), "the bucket must be a single cell");
+        assert_eq!(cell.cell_bucket, occupant);
+        assert_ne!(cell.cell_bucket, colliding);
+        assert!(
+            cell.flags
+                .contains(crate::warmstate::JcFlags::JC_DONT_TRACE_HERE)
+        );
+
+        let increment = driver.meta.warm_state.counter.compute_threshold(2);
+        assert!(
+            !driver
+                .meta
+                .warm_state
+                .counter
+                .would_tick_fire(colliding, increment),
+            "the colliding hash has not been counted yet",
+        );
+        let mut state = CountingDoorState::default();
+        assert!(
+            driver
+                .back_edge_or_run_compiled_keyed(colliding, 7, &mut state, &(), || {})
+                .is_none()
+        );
+        assert!(!driver.is_tracing());
+        assert!(
+            driver
+                .meta
+                .warm_state
+                .counter
+                .would_tick_fire(colliding, increment),
+            "a stranger in the slot must not swallow this hash's tick",
+        );
+        assert!(
+            driver
+                .back_edge_or_run_compiled_keyed(colliding, 7, &mut state, &(), || {})
+                .is_none()
+        );
+        assert!(
+            driver.is_tracing(),
+            "the colliding hash must trace once its own counter fires",
+        );
+    }
+
+    #[test]
+    fn a_tokenless_dont_trace_here_cell_retries_from_the_back_edge() {
+        // `disable_noninlinable_function` installs `JC_DONT_TRACE_HERE`
+        // with no procedure token. `should_start_dont_trace_here_trace`
+        // starts that cell immediately; a later `JC_TRACING_OCCURRED`
+        // retries by ticking. Threshold 100 would stay cold if the back
+        // edge only counted.
+        let mut driver = JitDriver::<CountingDoorState>::new(100);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let key = 0xD017_u64;
+        driver
+            .meta
+            .warm_state_mut()
+            .disable_noninlinable_function(key);
+        let cell = driver
+            .meta
+            .warm_state
+            .lookup_chain(key)
+            .expect("disable_noninlinable_function installs a cell");
+        assert!(cell.next.is_none());
+        assert_eq!(cell.cell_bucket, key);
+        assert!(
+            cell.flags
+                .contains(crate::warmstate::JcFlags::JC_DONT_TRACE_HERE)
+        );
+        assert!(!cell.has_seen_a_procedure_token());
+
+        let mut state = CountingDoorState::default();
+        assert!(
+            driver
+                .back_edge_or_run_compiled_keyed(key, 7, &mut state, &(), || {})
+                .is_none()
+        );
+        assert!(
+            driver.is_tracing(),
+            "a tokenless JC_DONT_TRACE_HERE cell must trace on the first back edge",
         );
     }
 

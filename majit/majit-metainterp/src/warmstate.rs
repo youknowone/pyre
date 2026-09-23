@@ -1021,6 +1021,25 @@ impl WarmEnterState {
         self.counter.tick(bucket, self.increment_threshold)
     }
 
+    /// `warmstate.py maybe_compile_and_run` `:465-469`: the chain walk found
+    /// no cell, so `jitcounter.tick(hash, increment_threshold)` and nothing
+    /// else. The hash is the bucket itself — there is no minted cell key to
+    /// map back — matching `tick(hash, …)` on the `else` of that walk.
+    #[inline]
+    pub fn tick_empty_chain(&mut self, hash: u64) -> bool {
+        self.counter.tick(hash, self.increment_threshold)
+    }
+
+    /// `warmstate.py maybe_compile_and_run` `:256-257` / `:465-469` with
+    /// `increment_function_threshold`: the function-entry door's empty-chain
+    /// (or unchained not-compiled cell) tick. Slot 25 is the same bump
+    /// [`Self::function_entry_step`] makes before that tick.
+    #[inline]
+    pub fn tick_function_entry_empty_chain(&mut self, hash: u64) -> bool {
+        crate::mc_diag_bump(25);
+        self.counter.tick(hash, self.increment_function_threshold)
+    }
+
     /// The counter [`Self::cell_generation`] documents.
     pub fn cell_generation(&self) -> u64 {
         self.cell_generation
@@ -1184,6 +1203,7 @@ impl WarmEnterState {
 
     /// Compatibility form for callers whose compiled-loop metadata is wholly
     /// represented by the warm cell itself.
+    #[inline]
     pub fn maybe_compile_decision(&mut self, cell_key: u64) -> HotResult {
         self.maybe_compile_decision_with_meta(cell_key, |_| true)
     }
@@ -3523,6 +3543,7 @@ impl WarmEnterState {
     /// in this slot and not just the ones hashing to `hash`. Readers that must
     /// tell those apart go through [`Self::cell_keys_at`] or compare
     /// `comparekey`; this one hands back the slot as upstream does.
+    #[inline]
     pub fn lookup_chain(&self, hash: u64) -> Option<&BaseJitCell> {
         self.celltable[self.counter._get_index(hash)].as_deref()
     }
@@ -5452,6 +5473,19 @@ mod tests {
         assert!(ws.get_cell(key).is_none());
         assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
         assert!(matches!(ws.maybe_compile(key), HotResult::StartTracing));
+    }
+
+    #[test]
+    fn tick_empty_chain_is_the_counter_tick_on_an_unoccupied_hash() {
+        // warmstate.py:465-469: no cell → `jitcounter.tick(hash, increment)`.
+        // Threshold 2 fires on the second add (compute_threshold(2) ≈ 0.5).
+        let mut ws = WarmEnterState::new(2);
+        let hash = 0xA11C_u64;
+        assert!(ws.lookup_chain(hash).is_none());
+        assert!(!ws.tick_empty_chain(hash));
+        assert!(ws.lookup_chain(hash).is_none());
+        assert!(ws.tick_empty_chain(hash));
+        assert!(ws.lookup_chain(hash).is_none());
     }
 
     #[test]

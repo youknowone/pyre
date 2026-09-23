@@ -1,4 +1,5 @@
 use super::*;
+use crate::jit_interp::codegen_trace::{call_is_insn_op_at_pc, unwrap_cast};
 
 #[cfg(test)]
 mod find_dispatch_loop_body_tests {
@@ -1307,6 +1308,18 @@ fn pick_local_and_const_idents(lowerer: &Lowerer, cond: &Expr) -> Option<(u16, s
     }
 }
 
+/// `insn_op(program as _, pc as _)` is the same fetch as the bare call.
+/// `lower_value_expr` does not treat `as _` as transparent, so the call
+/// policy is applied to the idents the predicate already accepted.
+fn insn_op_call_with_bare_args(call: &syn::ExprCall) -> syn::ExprCall {
+    let mut bare = call.clone();
+    for arg in bare.args.iter_mut() {
+        let peeled = unwrap_cast(arg).clone();
+        *arg = peeled;
+    }
+    bare
+}
+
 /// Try to lower one of the two opcode-fetch IR patterns:
 ///
 /// 1. `let <name> = program[<index>];` where `<index>` is `pc` or `pc + N`
@@ -1384,6 +1397,37 @@ fn try_lower_opcode_fetch_stmt(lowerer: &mut Lowerer, stmt: &Stmt) -> bool {
         // `get_op` is registered as an elidable call policy. Emit
         // `call_pure_int` and bind the result so `lower_dispatch_chain`
         // finds the opcode register.
+        if opcode_fetch.is_none()
+            && let Expr::Call(call) = init_expr
+            && call_is_insn_op_at_pc(call)
+        {
+            let bare = insn_op_call_with_bare_args(call);
+            if let Some(binding) = lowerer.lower_value_expr(&syn::Expr::Call(bare)) {
+                if let Some(name) = pat_bound_ident_name(&local.pat) {
+                    lowerer.bindings.insert(
+                        name.clone(),
+                        Binding {
+                            reg: binding.reg,
+                            kind: binding.kind,
+                            depends_on_stack: false,
+                            struct_type: None,
+                        },
+                    );
+                    lowerer.opcode_var_name = Some(name);
+                }
+                return true;
+            }
+            // Recognized fetch, no call policy. `lower_dispatch_chain` would
+            // then emit no arms and the JitCode would not run the source
+            // dispatch. Same channel as an unlowerable dispatch pattern:
+            // `compile_error!` in the generated body.
+            lowerer.emit_aux(quote::quote! {
+                compile_error!(
+                    "opcode fetch `insn_op(program, pc)` has no call policy; register `insn_op` in `calls = { ... }`"
+                );
+            });
+            return true;
+        }
         if opcode_fetch.is_none()
             && let Expr::MethodCall(mc) = init_expr
         {
@@ -4226,4 +4270,80 @@ pub(crate) fn lower_dispatch_body(
         green_schema: green_schema_pairs,
         red_schema: red_schema_pairs,
     })
+}
+
+#[cfg(test)]
+mod insn_op_fetch_tests {
+    use super::*;
+
+    fn portal(fetch: &str) -> syn::ItemFn {
+        syn::parse_str(&format!(
+            "fn mainloop(program: &Program) {{
+                loop {{
+                    jit_merge_point!(driver, program, pc; state);
+                    {fetch}
+                    match opcode {{
+                        0 => {{}},
+                        1 => {{}},
+                        _ => break,
+                    }}
+                }}
+            }}"
+        ))
+        .expect("portal fixture must parse")
+    }
+
+    fn config(with_policy: bool) -> LowererConfig {
+        let mut config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
+        config.state_type_name = "Machine".to_string();
+        config.env_type_name = "Program".to_string();
+        if with_policy {
+            config.calls.push((
+                vec!["insn_op".to_string()],
+                CallPolicySpec::Explicit(crate::jit_interp::CallPolicyKind::ElidableInt),
+            ));
+        }
+        config
+    }
+
+    fn lower_portal(fetch: &str, with_policy: bool) -> String {
+        let func = portal(fetch);
+        let dispatch = crate::jit_interp::codegen_trace::find_dispatch_match(&func.block)
+            .expect("insn_op fetch must be the opcode dispatch");
+        let arms = crate::jit_interp::classify::classify_arms(&dispatch.arms);
+        let generated =
+            lower_dispatch_body(&config(with_policy), &func.block, &arms, &func.sig.output)
+                .expect("dispatch lowering must produce a body");
+        generated.body.to_string()
+    }
+
+    #[test]
+    fn cast_wrapped_insn_op_emits_dispatch_arms() {
+        let text = lower_portal("let opcode = insn_op(program as _, pc as _);", true);
+        assert!(
+            text.contains("goto_if_not_int_eq"),
+            "cast-wrapped insn_op must emit the opcode dispatch arms:\n{text}"
+        );
+        assert!(
+            !text.contains("compile_error"),
+            "a registered insn_op policy must not fail the portal:\n{text}"
+        );
+    }
+
+    #[test]
+    fn insn_op_without_a_call_policy_fails_the_portal() {
+        let text = lower_portal("let opcode = insn_op(program, pc);", false);
+        assert!(
+            text.contains("compile_error"),
+            "a recognized insn_op fetch with no call policy must fail loudly:\n{text}"
+        );
+        assert!(
+            text.contains("insn_op") && text.contains("calls ="),
+            "the diagnostic must name the calls registration:\n{text}"
+        );
+        assert!(
+            !text.contains("goto_if_not_int_eq"),
+            "no opcode binding must emit no dispatch arms:\n{text}"
+        );
+    }
 }
