@@ -8552,6 +8552,15 @@ const FLOAT_TRUEDIV_DESCENT: HelperDescent = HelperDescent {
     decline_tag: "FLOAT-TRUEDIV-SUBWALK",
 };
 
+/// floatobject.py `descr_pow` -> `_pow` (`float_pow_impl`). Distinct from
+/// [`FLOAT_POW_DESCENT`], which is the `math.pow` leaf.
+const FLOAT_DESCR_POW_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::float_pow_impl",
+    commit_label: "float_descr_pow_commit",
+    call_site_label: "float_descr_pow_call_site",
+    decline_tag: "FLOAT-DESCR-POW-SUBWALK",
+};
+
 /// floatobject.py `_compare` after `_to_float` for two floats.
 const FLOAT_LT_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_float_lt",
@@ -9769,7 +9778,10 @@ pub(crate) fn try_walker_orthodox_binary_op<Sym: WalkSym>(
     // `_ll_2_int_*` residual plus the sign-correction branch, measured
     // 63 → 79 ops on `i // (i % 3)`.
     //
-    // `**` descends only with a long operand; see the power gate below.
+    // `**`: a long operand descends `binary_value_from_tag`. Float and mixed
+    // `**` descend floatobject.py `descr_pow` -> `_pow` (`float_pow_impl`);
+    // a raising pair (`float_pow_would_raise`) is not descended. Machine
+    // int `**` int is not descended.
     use pyre_interpreter::bytecode::BinaryOperator as B;
     let plain = match pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag) {
         Some(B::Add | B::InplaceAdd) => B::Add,
@@ -9823,12 +9835,11 @@ pub(crate) fn try_walker_orthodox_binary_op<Sym: WalkSym>(
     let any_long =
         unsafe { pyre_object::is_long(operands[0].1) || pyre_object::is_long(operands[1].1) };
     // A variable machine-int exponent still declines inside `int_pow_nomod`
-    // (its `Option<i64>` result is not a word-ABI residual). Keep `**` off
-    // this descent until that call has a real address. A constant exponent
-    // does record when the call is admitted. A float operand stays on the
-    // float-pow fold: `float_pow` reaches `f64::is_infinite` and the float
-    // constructor, which this walk does not record.
-    if matches!(plain, B::Power) && (lhs_is_float || rhs_is_float || !any_long) {
+    // (its `Option<i64>` result is not a word-ABI residual). Machine int
+    // `**` int stays residual. Long `**` continues into
+    // `binary_value_from_tag`. Float and mixed `**` continue into
+    // `float_pow_impl` below.
+    if matches!(plain, B::Power) && !any_long && !lhs_is_float && !rhs_is_float {
         return Ok(None);
     }
     let all_int = !any_long
@@ -9859,6 +9870,7 @@ pub(crate) fn try_walker_orthodox_binary_op<Sym: WalkSym>(
             B::Subtract => Some(&FLOAT_SUB_DESCENT),
             B::Multiply => Some(&FLOAT_MUL_DESCENT),
             B::TrueDivide => Some(&FLOAT_TRUEDIV_DESCENT),
+            B::Power => Some(&FLOAT_DESCR_POW_DESCENT),
             _ => None,
         }) else {
             return Ok(None);
@@ -9874,6 +9886,11 @@ pub(crate) fn try_walker_orthodox_binary_op<Sym: WalkSym>(
             unsafe { pyre_object::w_int_get_value(operands[1].1) as f64 }
         };
         if matches!(plain, B::TrueDivide) && y == 0.0 {
+            return Ok(None);
+        }
+        if matches!(plain, B::Power)
+            && pyre_interpreter::objspace::descroperation::float_pow_would_raise(x, y)
+        {
             return Ok(None);
         }
         let xa = walker_coerce_dispatching_operand_to_float(
