@@ -4605,13 +4605,14 @@ fn load_source_module(
     let source = crate::compile::decode_source_bytes(&bytes, &path_text, false)?;
 
     let roots = pyre_object::gc_roots::push_roots();
-    // The two importlib bootstrap sources are imported by the native importer
-    // before `SourceFileLoader` exists, so they never reach the `.pyc` cache and
-    // otherwise recompile on every startup.  `_frozen_importlib._cached_compile`:
-    // reload a marshalled, source-validated code object when the cache holds one
-    // for this binary, recompiling only on a miss.
+    // The two importlib bootstrap sources and `zipimport` are imported by the
+    // native importer before `SourceFileLoader` exists, so they never reach the
+    // `.pyc` cache and otherwise recompile on every startup.
+    // `_frozen_importlib._cached_compile` (which `zipimport`'s moduledef also
+    // goes through): reload a marshalled, source-validated code object when the
+    // cache holds one for this binary, recompiling only on a miss.
     let cache_key = match modulename {
-        "importlib._bootstrap" | "importlib._bootstrap_external" => Some(modulename),
+        "importlib._bootstrap" | "importlib._bootstrap_external" | "zipimport" => Some(modulename),
         _ => None,
     };
     let (w_code, store) = match cache_key
