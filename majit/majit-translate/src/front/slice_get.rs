@@ -304,6 +304,24 @@ fn rewire_one_slice_get_site(graph: &mut FunctionGraph, site: &SliceGetSite) -> 
             ));
         }
     };
+    // `ll_getitem` returns the item. A pointer item is that address.
+    // `get_mut` of any other item is the slot address (`getinteriorfield`);
+    // copying it with `ArrayRead` drops a later store, so decline.
+    let is_get_mut = match &graph.blocks[a].operations[ci].kind {
+        OpKind::Call { target, .. } => match target {
+            CallTarget::FunctionPath { segments, .. } => {
+                segments.last().is_some_and(|leaf| leaf == "get_mut")
+            }
+            CallTarget::Method { name, .. } => name == "get_mut",
+            _ => false,
+        },
+        _ => false,
+    };
+    if is_get_mut && !matches!(site.payload_ty, ValueType::Ref(_)) {
+        return Err(format!(
+            "{name}: get_mut of a non-pointer element is not ll_getitem"
+        ));
+    }
 
     // A's single exit → B (the continuation consuming the Option).  Must be a
     // plain goto — `lower_call` closes with exactly this shape.
@@ -860,6 +878,36 @@ mod tests {
                 .flat_map(|block| &block.operations)
                 .any(|op| matches!(op.kind, OpKind::ArrayRead { .. })),
             "the Some arm reads the thin-pointer element"
+        );
+    }
+
+    /// `get_mut` of a non-pointer copies the element. The address of the slot
+    /// is an interior pointer; a copy then a store misses the write, so the
+    /// rewrite declines instead of emitting `ArrayRead`.
+    #[test]
+    fn get_mut_of_non_pointer_does_not_copy_the_element() {
+        let mut g = FunctionGraph::new("test_slice_get_mut_scalar");
+        let a = g.startblock;
+        let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let index = g.push_op_var(a, OpKind::ConstInt(1), true).unwrap();
+        let opt = emit_named_call(&mut g, a, vec![slice, index], "get_mut");
+        let (b, _) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![opt.clone()]);
+
+        let mut site = scalar_slice_get_site(opt);
+        site.array_type_id = Some("[u8]".into());
+        assert_eq!(
+            rewire_slice_get_call_sites(&mut g, &[site]),
+            0,
+            "get_mut of a non-pointer must not lower to a copied ArrayRead"
+        );
+        assert!(
+            !g.blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(op.kind, OpKind::ArrayRead { .. })),
+            "no copied element read"
         );
     }
 

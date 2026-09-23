@@ -14273,6 +14273,19 @@ impl<'a> Lowering<'a> {
             };
             value_type_bank(&recv_ty) == value_type_bank(&identity_dest_ty)
         });
+        let identity_layout = if matches!(
+            &op_kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().is_some_and(|leaf| leaf == "new")
+        ) {
+            self.adt_struct_fields(&call.dest.ty)
+        } else {
+            first_arg_ty
+                .as_ref()
+                .and_then(|ty| self.adt_struct_fields(ty))
+        };
         let op_kind = crate::front::std_identity::lower_std_primitive_op(
             op_kind,
             identity_recv.as_deref(),
@@ -14281,6 +14294,7 @@ impl<'a> Lowering<'a> {
             self.tyref_literal_uint_atom(&call.dest.ty),
             dest_is_bool,
             identity_banks_agree,
+            identity_layout.as_deref(),
         );
         // Capture `i64::checked_{add,sub,mul}()` results (`Option<i64>`-
         // typed) for the checked-arith rewiring pass
@@ -17618,6 +17632,28 @@ impl<'a> Lowering<'a> {
             return Some(arg.clone());
         }
         None
+    }
+
+    /// Named fields of a struct lltype, after peeling a borrow. `None`
+    /// when the declaration is missing or opaque, so a wrapper call
+    /// declines instead of aliasing the guard.
+    fn adt_struct_fields(&self, ty: &TyRef) -> Option<Vec<(String, ValueType)>> {
+        let peeled = self.tyref_peel_ref_to_pointee(ty);
+        let ty = peeled.as_ref().unwrap_or(ty);
+        let id = self.tyref_adt_def_id(ty)?;
+        let td = self.llbc.type_by_id(id)?;
+        let TypeDeclKind::Struct(fields) = &td.kind else {
+            return None;
+        };
+        Some(
+            fields
+                .iter()
+                .filter_map(|field| {
+                    let name = field.name.clone()?;
+                    Some((name, tyref_to_value_type(&field.ty, self.llbc)))
+                })
+                .collect(),
+        )
     }
 
     /// The ADT `def_id` behind a signature [`TyRef`], whether inline
