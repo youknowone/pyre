@@ -4463,16 +4463,33 @@ pub fn load_super_attr_value(
     )
 }
 
-/// `argument.py` `make_arguments` argument copy. `@jit.unroll_safe` so
-/// the fixed `nargs` walk does not make `call_valuestack` opaque.
-#[majit_macros::unroll_safe]
-fn pop_explicit_call_args(frame: &mut PyFrame, nargs: usize) -> Vec<PyObjectRef> {
-    let mut args = Vec::with_capacity(nargs);
-    for _ in 0..nargs {
-        args.push(frame.pop());
+impl PyFrame {
+    /// `argument.py` `make_arguments` copies the explicit args, then calls.
+    /// `@jit.unroll_safe` so the `nargs` walk is not a backedge of `call`.
+    /// The list stays here: returning a `Vec` is a pointer plus a length,
+    /// and `flatten.py` `insert_renamings` copies the length into the
+    /// pointer register.
+    #[majit_macros::unroll_safe]
+    fn call_explicit_args(&mut self, nargs: usize) -> Result<(), PyError> {
+        let mut args = Vec::with_capacity(nargs);
+        for _ in 0..nargs {
+            args.push(self.pop());
+        }
+        args.reverse();
+        let null_or_self = self.pop();
+        let callable = self.pop();
+        let anchor = FrameAnchor::new(self);
+        let result = if null_or_self.is_null() {
+            self.call_callable(callable, &args)?
+        } else {
+            let mut full_args = Vec::with_capacity(1 + args.len());
+            full_args.push(null_or_self);
+            full_args.extend_from_slice(&args);
+            self.call_callable(callable, &full_args)?
+        };
+        unsafe { &mut *anchor.live() }.push_on_self(result);
+        Ok(())
     }
-    args.reverse();
-    args
 }
 
 impl OpcodeStepExecutor for PyFrame {
@@ -6170,23 +6187,7 @@ impl OpcodeStepExecutor for PyFrame {
         // argument.py `make_arguments` is `@jit.unroll_safe`. The loop
         // stays out of `call` so `call_valuestack` itself has no backedge
         // (`policy.py` `look_inside_graph`).
-        let args = pop_explicit_call_args(self, nargs);
-        let null_or_self = self.pop();
-        let callable = self.pop();
-
-        let anchor = FrameAnchor::new(self);
-        let result = if null_or_self.is_null() {
-            call_callable(self, callable, &args)?
-        } else {
-            let mut full_args = Vec::with_capacity(1 + args.len());
-            full_args.push(null_or_self);
-            full_args.extend_from_slice(&args);
-            call_callable(self, callable, &full_args)?
-        };
-        // The callee may have relocated this frame via a minor collection;
-        // push onto the forwarded live frame, not the pre-call pointer.
-        unsafe { &mut *anchor.live() }.push_on_self(result);
-        Ok(())
+        self.call_explicit_args(nargs)
     }
 
     // ── call_function_ex ──
@@ -6529,8 +6530,8 @@ mod tests {
             // The companion admits the same receiver, and pushes `w_descr`
             // unbound — which is what makes the NULL above a dropped `self`
             // rather than a missed optimisation.  Last, because it memoizes.
-            let (_, _, fast_descr) =
-                crate::baseobjspace::load_method_fast_path(obj, w_name).expect("fast path admits C.m");
+            let (_, _, fast_descr) = crate::baseobjspace::load_method_fast_path(obj, w_name)
+                .expect("fast path admits C.m");
             assert!(std::ptr::eq(fast_descr, w_descr));
         }
     }
