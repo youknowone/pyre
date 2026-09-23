@@ -8550,19 +8550,18 @@ fn for_iter_frame_is_finally_duplicated(code: &pyre_interpreter::CodeObject) -> 
 }
 
 /// True when `code` holds an `except ... as name:` handler whose own body can
-/// raise. Binding the caught exception to a name emits an exceptional cleanup
-/// tail — `STORE_FAST name; DELETE_FAST name; RERAISE 1` — reached only when the
-/// handler body itself raises (`raise name`, `raise Other(...)`, a bare `raise`).
+/// raise. Binding the caught exception to a fast local emits an exceptional
+/// cleanup tail — `STORE_FAST name; DELETE_FAST name; RERAISE 1` — reached only
+/// when the handler body itself raises (`raise name`, `raise Other(...)`, a
+/// bare `raise`).
 ///
-/// Module-level `except E as name` spells the same tail with `STORE_NAME` /
-/// `DELETE_NAME` (or the `GLOBAL` pair); the dropped-item hazard is identical.
-///
-/// That tail lowers to a `last_exc_value` jitcode op, and on a bridge walk the
-/// walker holds no active exception to answer it with, so the walk aborts with
-/// `LastExcValueWithoutActiveException` (`jitcode_dispatch` `last_exc_value/>r`;
-/// the value RPython asserts on in `pyjitpl.py opimpl_last_exc_value`). The
-/// abort is not permanent, so the loop is retraced and re-aborts for its whole
-/// run — the abort count scales with the iteration count rather than settling.
+/// That tail lowers to a `last_exc_value` jitcode op. On a function frame the
+/// bridge walk can still arrive with no active exception, so the walk aborts
+/// with `LastExcValueWithoutActiveException` (`jitcode_dispatch`
+/// `last_exc_value/>r`; the value RPython asserts on in `pyjitpl.py
+/// opimpl_last_exc_value`). The abort is not permanent, so the loop is retraced
+/// and re-aborts for its whole run — the abort count scales with the iteration
+/// count rather than settling.
 ///
 /// The abort itself is survivable: a frame without a `FOR_ITER` keeps producing
 /// the right answer, it merely retraces. With a `FOR_ITER` in the frame the abort
@@ -8570,6 +8569,12 @@ fn for_iter_frame_is_finally_duplicated(code: &pyre_interpreter::CodeObject) -> 
 /// (#57) — the result is short by exactly one handler visit per abort. Such a
 /// frame must run in the interpreter. The caller applies this only to frames that
 /// hold a `FOR_ITER`.
+///
+/// Module-level `except E as name` spells the tail with `STORE_NAME` /
+/// `DELETE_NAME` (or the `GLOBAL` pair) and is not declined. The bridge seeds
+/// `last_exc_value` from `ExecutionContext.sys_exc_value`
+/// (`seed_standing_exception_for_walk`) before `opimpl_last_exc_value` reads it,
+/// so the module loop traces instead of retracing once per iteration.
 ///
 /// A handler that binds no name (`except E:`) emits no cleanup tail, and a
 /// binding handler that cannot raise never reaches its own tail; both keep
@@ -8586,13 +8591,10 @@ fn for_iter_frame_has_raising_named_handler(code: &pyre_interpreter::CodeObject)
         }
         // The match test is followed by the no-match branch and, for an
         // `as name` handler, the store binding the caught value
-        // (`STORE_FAST` in a function, `STORE_NAME` / `STORE_GLOBAL` at
-        // module level).  `except E:` pops it instead and binds nothing.
-        enum Bound {
-            Fast(usize),
-            Name(usize),
-        }
-        let mut bound = None;
+        // (`STORE_FAST` in a function).  `except E:` pops it instead and
+        // binds nothing.  Module `STORE_NAME` / `STORE_GLOBAL` stays
+        // traceable; see the function comment.
+        let mut bound_fast = None;
         let mut scan = pc + 1;
         while scan < num_instrs {
             match pyre_interpreter::decode_instruction_at(code, scan) {
@@ -8600,21 +8602,13 @@ fn for_iter_frame_has_raising_named_handler(code: &pyre_interpreter::CodeObject)
                     scan += 1;
                 }
                 Some((I::StoreFast { var_num }, op_arg)) => {
-                    bound = Some(Bound::Fast(var_num.get(op_arg).as_usize()));
-                    break;
-                }
-                Some((I::StoreName { namei }, op_arg)) => {
-                    bound = Some(Bound::Name(namei.get(op_arg) as usize));
-                    break;
-                }
-                Some((I::StoreGlobal { namei }, op_arg)) => {
-                    bound = Some(Bound::Name(namei.get(op_arg) as usize));
+                    bound_fast = Some(var_num.get(op_arg).as_usize());
                     break;
                 }
                 _ => break,
             }
         }
-        let Some(bound) = bound else {
+        let Some(slot) = bound_fast else {
             continue;
         };
         // The handler body runs until the cleanup that clears the bound name.
@@ -8622,26 +8616,7 @@ fn for_iter_frame_has_raising_named_handler(code: &pyre_interpreter::CodeObject)
         for body_pc in (scan + 1)..num_instrs {
             match pyre_interpreter::decode_instruction_at(code, body_pc) {
                 Some((I::DeleteFast { var_num }, op_arg))
-                    if matches!(
-                        bound,
-                        Bound::Fast(slot) if var_num.get(op_arg).as_usize() == slot
-                    ) =>
-                {
-                    break;
-                }
-                Some((I::DeleteName { namei }, op_arg))
-                    if matches!(
-                        bound,
-                        Bound::Name(slot) if namei.get(op_arg) as usize == slot
-                    ) =>
-                {
-                    break;
-                }
-                Some((I::DeleteGlobal { namei }, op_arg))
-                    if matches!(
-                        bound,
-                        Bound::Name(slot) if namei.get(op_arg) as usize == slot
-                    ) =>
+                    if var_num.get(op_arg).as_usize() == slot =>
                 {
                     break;
                 }
@@ -15358,23 +15333,17 @@ mod tests {
     }
 
     #[test]
-    fn for_iter_module_raising_named_handler_is_declined() {
-        // Module-level `except E as e: raise e` binds with STORE_NAME and
-        // clears with DELETE_NAME.  The dropped-item hazard is the same as
-        // the function-local STORE_FAST spelling above.
+    fn for_iter_module_raising_named_handler_still_jits() {
+        // Module-level `except E as e: raise e` binds with STORE_NAME.
+        // `seed_standing_exception_for_walk` answers `opimpl_last_exc_value`,
+        // so the frame stays in the tracer.
         use pyre_interpreter::compile_exec;
         let code = compile_exec(
             "for i in range(3):\n    try:\n        try:\n            raise ValueError\n        except ValueError as e:\n            raise e\n    except ValueError:\n        pass\n",
         )
         .expect("test code should compile");
-        assert!(for_iter_frame_has_raising_named_handler(&code));
-        assert_eq!(
-            unsupported_jit_shape(&code),
-            (
-                UnsupportedJitShape::CurrentFrameOnly,
-                "FrameShape::CurrentFrameOnly/ForIterRaisingNamedHandler"
-            )
-        );
+        assert!(!for_iter_frame_has_raising_named_handler(&code));
+        assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
     #[test]
