@@ -130,7 +130,7 @@ extern "C" fn bh_code_unit_at(code: i64, index: i64) -> i64 {
 /// residual call site is `(i64 x n) -> i64`.
 extern "C" fn code_pc_is_loop_header_word(code: i64, pc: i64) -> i64 {
     crate::loop_headers::code_pc_is_loop_header(
-        code as usize as *const crate::CodeObject,
+        code as usize as pyre_object::PyObjectRef,
         pc as usize,
     ) as i64
 }

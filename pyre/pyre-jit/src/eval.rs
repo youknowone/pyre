@@ -6631,10 +6631,7 @@ impl PyPyJitDriver {
         if code_ptr.is_null() {
             return false;
         }
-        if !pyre_interpreter::code_pc_is_loop_header(
-            code_ptr.cast::<pyre_interpreter::CodeObject>(),
-            next_instr,
-        ) {
+        if !pyre_interpreter::code_pc_is_loop_header(pycode, next_instr) {
             return false;
         }
         let env = PyreEnv;
