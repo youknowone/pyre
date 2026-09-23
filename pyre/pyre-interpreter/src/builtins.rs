@@ -6143,7 +6143,18 @@ fn min_max_sequence(
     Ok(pyre_object::gc_roots::shadow_stack_get(best_item_slot))
 }
 
-/// `pypy/module/__builtin__/functional.py min_max_multiple_args`.
+/// `pypy/module/__builtin__/functional.py min_max_multiple_args`:
+/// `@jit.look_inside_iff(lambda space, args_w, w_key, implementation_of:
+///         jit.loop_unrolling_heuristic(args_w, len(args_w), 3))`.
+fn min_max_multiple_args_iff(
+    positional: &[PyObjectRef],
+    _key_fn: Option<PyObjectRef>,
+    _want_max: bool,
+) -> bool {
+    majit_rlib::jit::loop_unrolling_heuristic(positional, positional.len(), 3)
+}
+
+#[majit_macros::look_inside_iff(min_max_multiple_args_iff)]
 fn min_max_multiple_args(
     positional: &[PyObjectRef],
     key_fn: Option<PyObjectRef>,

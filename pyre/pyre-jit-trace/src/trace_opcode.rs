@@ -747,9 +747,9 @@ pub(crate) fn write_stack_slot(
 /// stack writes route through the vable shadow, so the lazy-fill
 /// path is normally unused.  In the rare case it does fire (e.g.
 /// `pop_value` / `swap_stack_slots` reading a stack slot whose
-/// `registers_r` entry was never written), emit the
-/// `getfield_raw` for the array base on demand and cache it on the
-/// sym so subsequent fills reuse the same op.  Without this guard,
+/// `registers_r` entry was never written), emit `GETFIELD_GC_R` for
+/// the array base on demand and cache it on the sym so subsequent
+/// fills reuse the same GCREF.  Without this guard,
 /// `trace_array_getitem_value(NONE, idx)` would record a malformed
 /// `GetarrayitemGcR` with a NONE base operand.
 #[allow(dead_code)]
@@ -1728,25 +1728,12 @@ impl MIFrame {
                 //       for i in range(len(lst)):
                 //           boxes.append(wrap(cpu, lst[i], ...))  # :96
                 //
-                // Step 1 (`getattr`) yields the array pointer; step 2
-                // (`lst[i]`) is the indexed read.  pyre currently emits
-                // step 1 as `OpCode::GetfieldRawI` via
-                // `state.rs:frame_locals_cells_stack_array`.  The
-                // upstream-orthodox emission is `GETFIELD_GC_R` because
-                // `pyframe_locals_cells_stack_descr` is field 0 of
-                // `PYFRAME_DESCR_GROUP` with `field_type = Type::Ref`
-                // on a `PYFRAME_GC_TYPE_ID`-typed PyFrame.  The
-                // cranelift backend's GC-barrier coverage for the
-                // PYFRAME_DESCR_GROUP read path is incomplete — a
-                // direct swap to `GetfieldGcR` SIGABRTs in
-                // fib_recursive — so the swap is gated on bringing
-                // that barrier support up first.  Step 2 (`lst[i]`) is `GETARRAYITEM_GC_R`
-                // indexed off the array.  `trace_array_getitem_value`
-                // uses `pyobject_gcarray_descr` (`base_size =
-                // FIXED_ARRAY_ITEMS_OFFSET`) and so requires the array
-                // base, not the virtualizable (PyFrame*) pointer.
-                // Emit `frame_locals_cells_stack_array` to materialise
-                // the array OpRef before indexing.
+                // Step 1 (`getattr`) is `GETFIELD_GC_R` of the array
+                // field (`frame_locals_cells_stack_array` /
+                // `opimpl_getfield_gc_r`). Step 2 (`lst[i]`) is
+                // `GETARRAYITEM_GC_R` via `trace_array_getitem_value`,
+                // which indexes the array GCREF (`pyobject_gcarray_descr`
+                // `base_size` = items offset), not the frame pointer.
                 let frame_ref = s.frame;
                 let array_ref = crate::state::frame_locals_cells_stack_array(ctx, frame_ref);
                 let idx_const = ctx.const_int(idx as i64);

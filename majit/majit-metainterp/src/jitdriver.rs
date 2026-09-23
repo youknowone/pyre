@@ -4894,8 +4894,13 @@ impl<S: JitState> JitDriver<S> {
                         (current_ops == start_ops && current_total == start_total)
                             || (current_ops == start_ops + 1
                                 && current_total == start_total + 1
-                                && ctx.opcode_at(start_ops)
-                                    == Some(majit_ir::OpCode::GetfieldRawI))
+                                && matches!(
+                                    ctx.opcode_at(start_ops),
+                                    Some(
+                                        majit_ir::OpCode::GetfieldGcR
+                                            | majit_ir::OpCode::GetfieldRawI
+                                    )
+                                ))
                     }) {
                         self.meta
                             .bridge_info_cloned()

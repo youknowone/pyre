@@ -503,6 +503,26 @@ impl OldGen {
         self.old_rawmalloced_objects.len()
     }
 
+    /// Visit every allocated old-generation object (payload address).
+    ///
+    /// Arena blocks are recorded at their header; rawmalloc records the
+    /// payload. Both are converted to the payload address `debug_check_object`
+    /// reads. Young-rawmalloced and in-flight sweep candidates are included so
+    /// a non-moving major still sees every old-shaped block.
+    pub(crate) fn for_each_allocated_object(&self, mut visit: impl FnMut(usize)) {
+        self.ac.for_each_live_header(|header| {
+            visit(header + GcHeader::SIZE);
+        });
+        for object in self
+            .old_rawmalloced_objects
+            .iter()
+            .chain(self.young_rawmalloced_objects.iter())
+            .chain(self.raw_malloc_might_sweep.iter())
+        {
+            visit(object.header_addr + GcHeader::SIZE);
+        }
+    }
+
     /// Exact old-generation payload membership. `ArenaCollection` records its
     /// returned block starts, which are GC header addresses; rawmalloc records
     /// payloads because its card prefix makes the allocation start unsuitable.

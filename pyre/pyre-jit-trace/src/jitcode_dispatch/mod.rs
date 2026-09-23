@@ -3273,26 +3273,6 @@ pub fn census_record_frame_shape_decline(code_ptr: usize, kind: &'static str) {
     }
 }
 
-/// Record a loop-region FOR_ITER admission denial once per code object.
-/// `kind` names the predicate that denied the back-edge trace, so the
-/// pre-trace rejection remains attributable in the same census as frame-shape
-/// and traced-walk declines. Returns whether this was the first decline
-/// recorded for `code_ptr`.
-pub fn census_record_for_iter_gate_decline(code_ptr: usize, kind: &'static str) -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ENABLED.get_or_init(|| {
-        std::env::var_os("PYRE_FOR_ITER_GATE_DIAG").is_some()
-            || std::env::var_os("PYRE_FBW_DEBUG_ABORT").is_some()
-    }) {
-        return false;
-    }
-    let first = FRAME_SHAPE_DECLINE_SEEN.with(|s| s.borrow_mut().insert(code_ptr));
-    if first {
-        census_record(kind);
-    }
-    first
-}
-
 /// What became of one in-flight FOR_ITER continuation, from the walk that
 /// stashed it to the interpreter re-entry that either resumed its body or did
 /// not.  The three refusal columns are three different defects and only one of
@@ -3371,9 +3351,9 @@ pub(crate) fn census_foriter_inflight_reset() {
     FORITER_INFLIGHT_CENSUS.with(|c| c.borrow_mut().clear());
 }
 
-/// Record one legacy in-flight FOR_ITER delivery decision. Like
-/// [`census_record_for_iter_gate_decline`], the collection gate precedes the
-/// thread-local lookup, so the census costs nothing when diagnostics are off.
+/// Record one legacy in-flight FOR_ITER delivery decision. The collection
+/// gate precedes the thread-local lookup, so the census costs nothing when
+/// diagnostics are off.
 pub(crate) fn census_record_foriter_inflight(
     code_ptr: usize,
     body_pc: usize,

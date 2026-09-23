@@ -232,6 +232,18 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
         "_orig_getframe",
         "rlib/jit.py look_inside_iff unroll_safe(getframe)",
     ),
+    // `functional.py min_max_multiple_args` is
+    // `@jit.look_inside_iff(jit.loop_unrolling_heuristic(args_w, len(args_w), 3))`.
+    // `look_inside_iff.inner` does `func = unroll_safe(func)`, so the
+    // harvested name is `_orig_min_max_multiple_args`.
+    //
+    // Evidence: the cranelift re-record after this hint
+    // (`foriter_load_special_with`, `global_store_plain_dict_globals`)
+    // kept `fbw_rolled_back_with_effects=0`.
+    (
+        "_orig_min_max_multiple_args",
+        "rlib/jit.py look_inside_iff unroll_safe(min_max_multiple_args)",
+    ),
     // Same `func = unroll_safe(func)` as above, for
     // `stringmethods.py _str_join_many_items`.
     (

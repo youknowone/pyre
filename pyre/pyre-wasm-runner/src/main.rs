@@ -1021,7 +1021,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             // copy reads the wrong words and prints them as a walk outcome
             // instead of failing. Named rather than spelled inline so the
             // mirror is something a test can compare.
-            const RING_BASE: u32 = 20;
+            const RING_BASE: u32 = 18;
             const RING_ENTRIES: u32 = 24;
             const RING_STRIDE: u32 = 5;
             const NAME_SLOTS: u32 = 4;
@@ -1378,8 +1378,6 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             "fbw_blackhole_adopted_single_frame",
             "fbw_blackhole_adopted_multi_frame",
             "gate_declined_shape",
-            "gate_declined_for_iter_region",
-            "gate_declined_function_entry",
             "bridge_ec_from_portal_red",
             "bridge_ec_missing",
             "fbw_foriter_item_dropped",

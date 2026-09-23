@@ -1,5 +1,8 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=loop_genexp,prefix_next
+# pyre-check: selfcheck-compiles=entry-bridge:loop_genexp,loop:run_genexp,prefix_next
+# `loop_genexp` is reached as an entry bridge and its body compiles inside
+# `run_genexp`'s loop, which is why both arms are named: the generator half
+# of the guard is only covered while that caller loop still compiles.
 # A merge point reached with `force_finish_trace` armed and the recording past
 # 0.8x `trace_limit` cuts the trace there and blackholes back to the
 # interpreter rather than jumping into the segment it just compiled, "because

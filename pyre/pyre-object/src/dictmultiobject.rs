@@ -1249,8 +1249,18 @@ impl W_DictMultiObject for W_DictObject {
 }
 
 #[inline]
-fn dict_write_barrier(obj: PyObjectRef) {
+pub(crate) fn dict_write_barrier(obj: PyObjectRef) {
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    // `rordereddict.py` `dicttable` is the object the write barrier
+    // remembers: entries live in `dstorage`. A no-GC-hook fallback box
+    // is not collector-owned.
+    if obj.is_null() {
+        return;
+    }
+    let dstorage = unsafe { (*(obj as *const W_DictObject)).dstorage };
+    if !dstorage.is_null() && crate::gc_hook::try_gc_owns_object(dstorage) {
+        crate::gc_hook::try_gc_write_barrier(dstorage);
+    }
 }
 
 /// `pypy/objspace/std/dictmultiobject.py W_DictObject.get_strategy`
@@ -4949,8 +4959,17 @@ pub unsafe fn w_dict_lookup_or_null_unicode_strategy(
 /// `dictmultiobject.py del self.unerase(w_dict.dstorage)[self.unwrap(w_key)]`.
 /// Returns `true` if a key was removed.
 ///
+/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(i))` on
+/// `_ll_dict_del` (`rordereddict.py`).
+///
 /// # Safety
 /// Same as [`w_dict_store_int_strategy`].
+fn w_dict_delitem_int_strategy_iff(obj: PyObjectRef, key: PyObjectRef) -> bool {
+    let entries = unsafe { w_dict_int_storage(obj) };
+    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(&key)
+}
+
+#[majit_macros::look_inside_iff(w_dict_delitem_int_strategy_iff)]
 pub unsafe fn w_dict_delitem_int_strategy(obj: PyObjectRef, key: PyObjectRef) -> bool {
     lock_dict_refs!(_dict_guard, obj, key);
     let dict = &mut *(obj as *mut W_DictObject);
@@ -5120,6 +5139,7 @@ pub unsafe fn w_dict_switch_int_to_object_strategy(w_dict: PyObjectRef) {
     let dict = &mut *(roots.get(dict_slot) as *mut W_DictObject);
     dict.dstorage = new_storage as *mut u8;
     dict.dstrategy = &OBJECT_DICT_STRATEGY_REF;
+    dict_write_barrier(roots.get(dict_slot));
 }
 
 /// Internal helper: `BytesDictStrategy::setitem` body —
@@ -5315,6 +5335,7 @@ pub unsafe fn w_dict_switch_bytes_to_object_strategy(w_dict: PyObjectRef) {
     let dict = &mut *(roots.get(dict_slot) as *mut W_DictObject);
     dict.dstorage = new_storage as *mut u8;
     dict.dstrategy = &OBJECT_DICT_STRATEGY_REF;
+    dict_write_barrier(roots.get(dict_slot));
 }
 
 /// Internal helper: `ObjectDictStrategy::items` body for pyre's

@@ -733,10 +733,11 @@ unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     let dict = unsafe { &mut *(obj_addr as *mut pyre_object::dictmultiobject::W_DictObject) };
     f(&mut dict.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     let strategy = unsafe { pyre_object::dictmultiobject::w_dict_get_strategy(w_dict) };
-    // Keep the stable leaf storage box alive by forwarding its owning
-    // `dstorage` field slot (off-GC storage). The box has no walker
-    // of its own; `walk_gc_refs` below forwards the interior PyObjectRef
-    // slots, matching the mapdict / set-items leaf-storage pattern. Only the
+    // Keep the storage box alive by forwarding its owning `dstorage` field
+    // slot. The box's own custom_trace (`object_dict_storage_custom_trace`)
+    // walks keys and values the way `dicttable` does; `walk_gc_refs` below
+    // is the same walk from the dict so a visit of either object greys the
+    // entries. Only the
     // storage-box strategies own their `dstorage`: a MapDictStrategy
     // `dstorage` is the backing instance and a ClassDictStrategy
     // `dstorage` is the type (GC edges that `walk_gc_refs` forwards),
@@ -762,6 +763,96 @@ unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
         f(slot as *mut majit_ir::GcRef);
     };
     unsafe { strategy.walk_gc_refs(w_dict, &mut adapter) };
+}
+
+/// `rordereddict.py` `dicttable` / `dictentry`: the storage box is a
+/// GcStruct whose trace walks every key and value. A write barrier that
+/// remembers this box (not the owning `W_DictObject`) must retrace the
+/// entries on the next `visit`.
+unsafe fn object_dict_storage_custom_trace(
+    obj_addr: usize,
+    f: &mut dyn FnMut(*mut majit_ir::GcRef),
+) {
+    let storage = &mut *(obj_addr as *mut pyre_object::dictmultiobject::ObjectDictStorage);
+    for (key, value) in storage.iter_mut() {
+        let key_ptr = key as *const pyre_object::dictmultiobject::ObjectKey
+            as *mut pyre_object::dictmultiobject::ObjectKey;
+        f(std::ptr::addr_of_mut!((*key_ptr).obj) as *mut majit_ir::GcRef);
+        f(value as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    }
+}
+
+/// Module-dict `dstorage` is the same dicttable shape keyed by owned
+/// `String`s: only the value slots are GC references.
+unsafe fn module_dict_storage_custom_trace(
+    obj_addr: usize,
+    f: &mut dyn FnMut(*mut majit_ir::GcRef),
+) {
+    let storage = &mut *(obj_addr as *mut pyre_object::celldict::ModuleDictStorage);
+    for value in storage.iter_values_mut() {
+        let mut forward = |slot: &mut pyre_object::PyObjectRef| {
+            f(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+        };
+        pyre_object::celldict::walk_module_value_slot(value, &mut forward);
+    }
+}
+
+/// `identitydict.py` traces `list[W_Root]` keys and values. The box is
+/// `dicttable`; greying it must grey every identity key and value.
+unsafe fn identity_dict_storage_custom_trace(
+    obj_addr: usize,
+    f: &mut dyn FnMut(*mut majit_ir::GcRef),
+) {
+    let storage = &mut *(obj_addr as *mut pyre_object::identitydict::IdentityDictStorage);
+    for (key, value) in storage.iter_mut() {
+        let key_ptr = key as *const pyre_object::identitydict::IdentityKey
+            as *mut pyre_object::identitydict::IdentityKey;
+        f(std::ptr::addr_of_mut!((*key_ptr).0) as *mut majit_ir::GcRef);
+        f(value as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    }
+}
+
+/// `kwargsdict.py` traces both `keys_w` and `values_w` as `list[W_Root]`.
+unsafe fn kwargs_dict_storage_custom_trace(
+    obj_addr: usize,
+    f: &mut dyn FnMut(*mut majit_ir::GcRef),
+) {
+    let storage = &mut *(obj_addr as *mut pyre_object::kwargsdict::KwargsDictStorage);
+    for slot in storage.0.iter_mut() {
+        f(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    }
+    for slot in storage.1.iter_mut() {
+        f(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    }
+}
+
+/// `rerased.new_erasing_pair("integer")`: only values are GC refs.
+unsafe fn int_dict_storage_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let storage = &mut *(obj_addr as *mut pyre_object::dictmultiobject::IntDictStorage);
+    for value in storage.values_mut() {
+        f(value as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    }
+}
+
+/// `rerased.new_erasing_pair("bytes")`: only values are GC refs.
+unsafe fn bytes_dict_storage_custom_trace(
+    obj_addr: usize,
+    f: &mut dyn FnMut(*mut majit_ir::GcRef),
+) {
+    let storage = &mut *(obj_addr as *mut pyre_object::dictmultiobject::BytesDictStorage);
+    for value in storage.values_mut() {
+        f(value as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    }
+}
+
+/// `rdict.py` `dicttable` for a set: each `ObjectKey.obj` is a GC ref.
+unsafe fn set_items_storage_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let storage = &mut *(obj_addr as *mut pyre_object::setobject::SetItemsStorage);
+    for (key, _) in storage.iter_mut() {
+        let key_ptr = key as *const pyre_object::dictmultiobject::ObjectKey
+            as *mut pyre_object::dictmultiobject::ObjectKey;
+        f(std::ptr::addr_of_mut!((*key_ptr).obj) as *mut majit_ir::GcRef);
+    }
 }
 
 /// Custom trace for `W_BytesObject`. `data` points at a GC-managed leaf storage
@@ -1173,10 +1264,10 @@ unsafe fn set_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_
     // releases the last other reference to a frozenset subclass immediately
     // before its instance finalizer resolves `__del__` through that class.
     f(&mut set.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    // Keep the stable leaf storage box alive by forwarding its owning field
-    // slot. The box has no walker of its own; this trace also walks its inner
-    // ObjectKey slots below, matching the mapdict leaf-storage pattern.
-    // A no-GC-hook fallback allocation is not collector-owned.
+    // Keep the storage box alive by forwarding its owning field slot. The
+    // box's own custom_trace also walks ObjectKey.obj, so a visit of either
+    // object greys the elements. A no-GC-hook fallback allocation is not
+    // collector-owned.
     if !set.items.is_null() && pyre_object::gc_hook::try_gc_owns_object(set.items as *mut u8) {
         let items_slot = std::ptr::addr_of_mut!(set.items);
         f(items_slot as *mut majit_ir::GcRef);
@@ -1828,9 +1919,7 @@ fn register_leaf_storage_box<T: 'static>(
 /// does for other traced owners of off-GC allocations.
 ///
 /// As with [`register_leaf_storage_box`], callers must add registrations only
-/// at the absolute tail of [`build_gc`], after all fixed-const type ids. S0 has
-/// no caller so the existing registration order remains unchanged.
-#[allow(dead_code)]
+/// at the absolute tail of [`build_gc`], after all fixed-const type ids.
 fn register_traced_storage_box<T: 'static>(
     gc: &mut dyn majit_gc::GcAllocator,
     custom_trace: majit_gc::trace::CustomTraceFn,
@@ -4573,63 +4662,66 @@ fn build_gc() -> Box<MiniMarkGC> {
     twister_descr.gc_type_id.set(twister_tid);
     // PyPy setobject.py:875/963 stores a copied r_dict behind the set's GC
     // pointer field; rdict.py:210 makes that table a GcStruct("dicttable").
-    // The box is a leaf because `set_object_custom_trace` owns both edges:
-    // it greys this box through `items` and forwards every ObjectKey.obj slot.
-    // Keep this runtime id at the absolute registration tail.
-    register_leaf_storage_box::<pyre_object::setobject::SetItemsStorage>(
+    // The box's custom_trace walks ObjectKey.obj the way dicttable does, so a
+    // write barrier that remembers the box (not the set header) still greys
+    // the elements. Keep this runtime id at the absolute registration tail.
+    register_traced_storage_box::<pyre_object::setobject::SetItemsStorage>(
         &mut gc,
+        set_items_storage_custom_trace,
         pyre_object::gc_storage::storage_box_destructor::<pyre_object::setobject::SetItemsStorage>,
         pyre_object::setobject::set_set_items_gc_type_id,
     );
-    // Regular-dict `dstorage` storage boxes (off-GC storage).
-    // dictmultiobject.py:47 `dstorage` erases an `r_dict` = GcStruct("dicttable")
-    // (rdict.py:210); each concrete strategy backs it with a native container
-    // now living in a GC-managed leaf box. `dict_object_custom_trace` greys the
-    // box through the `dstorage` field slot and `DictStrategy::walk_gc_refs`
-    // forwards the interior PyObjectRef slots — same leaf contract as the set
-    // items box. Keep these runtime ids at the absolute registration tail.
-    register_leaf_storage_box::<pyre_object::dictmultiobject::ObjectDictStorage>(
+    // Regular-dict `dstorage` storage boxes. dictmultiobject.py `W_DictMultiObject.dstorage`
+    // erases an `r_dict` = GcStruct("dicttable") (rdict.py `dicttable`); each concrete
+    // strategy backs it with a native container in a GC-managed box whose
+    // custom_trace walks the interior PyObjectRef slots the way dicttable
+    // does. Keep these runtime ids at the absolute registration tail.
+    register_traced_storage_box::<pyre_object::dictmultiobject::ObjectDictStorage>(
         &mut gc,
+        object_dict_storage_custom_trace,
         pyre_object::gc_storage::storage_box_destructor::<
             pyre_object::dictmultiobject::ObjectDictStorage,
         >,
         pyre_object::dictmultiobject::set_object_dict_storage_gc_type_id,
     );
-    register_leaf_storage_box::<pyre_object::dictmultiobject::IntDictStorage>(
+    register_traced_storage_box::<pyre_object::dictmultiobject::IntDictStorage>(
         &mut gc,
+        int_dict_storage_custom_trace,
         pyre_object::gc_storage::storage_box_destructor::<
             pyre_object::dictmultiobject::IntDictStorage,
         >,
         pyre_object::dictmultiobject::set_int_dict_storage_gc_type_id,
     );
-    register_leaf_storage_box::<pyre_object::dictmultiobject::BytesDictStorage>(
+    register_traced_storage_box::<pyre_object::dictmultiobject::BytesDictStorage>(
         &mut gc,
+        bytes_dict_storage_custom_trace,
         pyre_object::gc_storage::storage_box_destructor::<
             pyre_object::dictmultiobject::BytesDictStorage,
         >,
         pyre_object::dictmultiobject::set_bytes_dict_storage_gc_type_id,
     );
-    register_leaf_storage_box::<pyre_object::identitydict::IdentityDictStorage>(
+    register_traced_storage_box::<pyre_object::identitydict::IdentityDictStorage>(
         &mut gc,
+        identity_dict_storage_custom_trace,
         pyre_object::gc_storage::storage_box_destructor::<
             pyre_object::identitydict::IdentityDictStorage,
         >,
         pyre_object::identitydict::set_identity_dict_storage_gc_type_id,
     );
-    register_leaf_storage_box::<pyre_object::kwargsdict::KwargsDictStorage>(
+    register_traced_storage_box::<pyre_object::kwargsdict::KwargsDictStorage>(
         &mut gc,
+        kwargs_dict_storage_custom_trace,
         pyre_object::gc_storage::storage_box_destructor::<pyre_object::kwargsdict::KwargsDictStorage>,
         pyre_object::kwargsdict::set_kwargs_dict_storage_gc_type_id,
     );
-    // Module-dict `dstorage`, holder and owner storage boxes (off-GC storage
-    // epic S3). `module_dict_object_custom_trace` greys each box through its
-    // field slot and `w_module_dict_walk_gc_cells` forwards the interior
-    // PyObjectRef slots — same leaf contract as the regular-dict boxes above.
-    // The post-switch `dstorage` reuses the ObjectDictStorage box tid
-    // registered above (identical `IndexMap<ObjectKey, PyObjectRef>` type), so
-    // it needs no separate registration. Keep these ids at the absolute tail.
-    register_leaf_storage_box::<pyre_object::celldict::ModuleDictStorage>(
+    // Module-dict `dstorage`, holder and owner storage boxes. The traced
+    // `ModuleDictStorage` box walks value slots; strategy/owner boxes are
+    // leaves (no inner GC refs). The post-switch `dstorage` reuses the
+    // ObjectDictStorage box tid registered above. Keep these ids at the
+    // absolute tail.
+    register_traced_storage_box::<pyre_object::celldict::ModuleDictStorage>(
         &mut gc,
+        module_dict_storage_custom_trace,
         pyre_object::gc_storage::storage_box_destructor::<pyre_object::celldict::ModuleDictStorage>,
         pyre_object::celldict::set_module_dict_storage_gc_type_id,
     );
@@ -8436,9 +8528,7 @@ fn cached_unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> Unsuppor
 /// on coverage alone took every function holding a comprehension plus any other
 /// loop out of the JIT entirely.
 ///
-/// A single `FOR_ITER` keeps JITting because the count stays at one, and
-/// genuinely nested `FOR_ITER` frames are already declined by
-/// [`pyre_interpreter::function_entry_trace_is_jit_safe`].
+/// A single `FOR_ITER` keeps JITting because the count stays at one.
 fn for_iter_frame_is_finally_duplicated(code: &pyre_interpreter::CodeObject) -> bool {
     let entries: Vec<_> =
         pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable).collect();
@@ -8941,28 +9031,19 @@ fn eval_with_jit_inner(
     if *PYRE_JIT_DISABLED.get_or_init(|| std::env::var("PYRE_JIT").as_deref() == Ok("0")) {
         return frame.execute_frame_plain(resume);
     }
-    // A profiled frame runs interpreted, and `c_call` / `c_return` are the
-    // whole of why.  The frame-level events would survive the JIT: measured
-    // with this test narrowed to `f_trace` alone and the arms below carrying
-    // `execute_frame`'s `call_trace` / `return_trace` bracket plus `leave`'s
-    // `_trace('leaveframe')`, a 2000-iteration tail entered with a hook
-    // installed reported `call` and `return` exactly, for the loop frame and
-    // for its callee alike, matching cpython 3.14.6.  Every builtin's `c_call`
-    // stopped at 1041, the entry threshold — `len`, `ord`, `divmod`, `hex`,
-    // `sorted`, `max` and `round` alike — and nothing about that is a missing
-    // check on a call path: probed at `call::c_profile_frame`, compiled code
-    // does not reach the interpreter's builtin call doors at all, folded or
-    // residual.  `is_being_profiled` is a green, so upstream's compiled loop
-    // carries the reporting it traced through `call_args`; this walker decides
-    // rather than traces, so a profiled trace would have to be RECORDED with
-    // the reporting in it.  Until it is, a profiled frame is served correctly
-    // and slowly rather than quickly and silently.
+    // This door tests only `frame_tracing_active`, which is true when the
+    // frame's `f_trace` is non-null (`pyframe.rs` `frame_tracing_active`).
+    // That frame owes a `line` event from `ec.bytecode_trace` in the
+    // dispatch loop, which compiled code does not call, so it runs
+    // interpreted. `is_being_profiled` is a green on
+    // `pypy/module/pypyjit/interp_jit.py` `PyPyJitDriver` (`pypyjitdriver`)
+    // and is not tested here.
     //
-    // A frame that arrives with its own `f_trace` already armed runs
-    // interpreted too.  One that gets it armed by the bracket below is past
-    // this test, and is kept off compiled code by `try_function_entry_jit` and
-    // by the portal merge point's debugdata guard instead, so its `line`
-    // events keep arriving from `eval_loop_jit`'s `bytecode_trace`.
+    // A frame that arrives with `f_trace` already armed takes this path.
+    // One that the bracket below arms is past this test; `try_function_entry_jit`
+    // and the portal merge point's debugdata guard keep it off compiled
+    // code, so its `line` events still come from `eval_loop_jit`'s
+    // `bytecode_trace`.
     if pyre_interpreter::pyframe::frame_tracing_active(frame) {
         return frame.execute_frame_plain(resume);
     }
@@ -10350,24 +10431,6 @@ fn maybe_compile_and_run(
         pyre_jit_trace::trace::fbw_diag::record_gate_declined_shape();
         return None;
     }
-    if !pyre_interpreter::cached_loop_region_for_iter_bodies_all_jit_safe(
-        code as *const _,
-        loop_header_pc,
-    ) {
-        pyre_jit_trace::trace::fbw_diag::record_gate_declined_for_iter_region();
-        const DENIAL: &str = "BackedgeGate::ForIter/UnsafeLoopRegion";
-        let first_decline = pyre_jit_trace::jitcode_dispatch::census_record_for_iter_gate_decline(
-            code as *const _ as usize,
-            DENIAL,
-        );
-        if first_decline && pyre_interpreter::for_iter_gate_diag_enabled() {
-            eprintln!(
-                "[for-iter-gate-decline] code={} source={} loop_header_pc={loop_header_pc} predicate={DENIAL}",
-                code.qualname, code.source_path
-            );
-        }
-        return None;
-    }
     if let Some(expected_vsd) =
         pyre_jit_trace::state::depth_based_vsd_for_wcode(frame.pycode as usize, loop_header_pc)
     {
@@ -11739,7 +11802,11 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     if !frame_root.frame().get_w_f_trace().is_null() {
         return None;
     }
-    // warmstate.py parity: PYRE_NO_JIT disables ALL JIT paths.
+    // `PYRE_NO_JIT` is pyre-local: this door returns without entering the
+    // JIT. `warmstate.py` has no such switch. Upstream turns tracing off
+    // with `rpython/rlib/jit.py` `set_user_param("off")`, which sets
+    // `threshold` to -1; `rpython/jit/metainterp/counter.py`
+    // `JitCounter.compute_threshold` then returns 0.0.
     static NO_JIT_FN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *NO_JIT_FN.get_or_init(|| std::env::var_os("PYRE_NO_JIT").is_some()) {
         return None;
@@ -12060,15 +12127,6 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     }
 
     if driver.is_tracing() {
-        return None;
-    }
-
-    // A function-entry walk can reach every loop in the frame. Decline only
-    // this newly armed trace when one of those bodies is unsafe; the frame
-    // continues in `eval_loop_jit`, where its back-edges tick independently
-    // and consult their own natural loop regions.
-    if !pyre_interpreter::cached_function_entry_trace_is_jit_safe(code as *const _) {
-        pyre_jit_trace::trace::fbw_diag::record_gate_declined_function_entry();
         return None;
     }
 
@@ -14974,7 +15032,6 @@ mod tests {
         let module = compile_exec("def f(n):\n    return [i for i in range(n)]\n")
             .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -15004,7 +15061,6 @@ mod tests {
         ] {
             let module = compile_exec(source).expect("test code should compile");
             let code = function_code_from_module(&module, "f");
-            assert!(function_entry_trace_is_jit_safe(&code));
             assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
         }
     }
@@ -15023,7 +15079,6 @@ mod tests {
         ] {
             let module = compile_exec(source).expect("test code should compile");
             let code = function_code_from_module(&module, "f");
-            assert!(function_entry_trace_is_jit_safe(&code));
             assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
         }
     }
@@ -15043,7 +15098,6 @@ mod tests {
         ] {
             let module = compile_exec(source).expect("test code should compile");
             let code = function_code_from_module(&module, "f");
-            assert!(function_entry_trace_is_jit_safe(&code));
             assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
         }
     }
@@ -15056,43 +15110,7 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
-    }
-
-    #[test]
-    fn for_iter_body_deleting_a_namespace_name_is_refused() {
-        // The counterpart to the `STORE_NAME` and `STORE_GLOBAL` admission: a
-        // store settles after its first version bump, a delete bumps on every
-        // iteration and forces the trace every time, so the loop it would
-        // admit never compiles. Only a module or class frame spells
-        // `DELETE_NAME` -- a function's `del x` is `DELETE_FAST`, which stays
-        // admitted, so the store-only loop below has to keep passing.
-        use pyre_interpreter::compile_exec;
-        let stores =
-            compile_exec("total = 0\nfor i in range(10):\n    x = i * 2\n    total += x\n")
-                .expect("test code should compile");
-        assert!(function_entry_trace_is_jit_safe(&stores));
-
-        let deletes = compile_exec(
-            "total = 0\nfor i in range(10):\n    x = i * 2\n    total += x\n    del x\n",
-        )
-        .expect("test code should compile");
-        assert!(!function_entry_trace_is_jit_safe(&deletes));
-
-        let del_global = compile_exec(
-            "g = 0\ndef f(n):\n    global g\n    c = 0\n    for i in range(n):\n        g = i\n        c += g\n        del g\n    return c\n",
-        )
-        .expect("test code should compile");
-        let code = function_code_from_module(&del_global, "f");
-        assert!(!function_entry_trace_is_jit_safe(&code));
-
-        let del_fast = compile_exec(
-            "def f(n):\n    c = 0\n    for i in range(n):\n        x = i * 2\n        c += x\n        del x\n    return c\n",
-        )
-        .expect("test code should compile");
-        let code = function_code_from_module(&del_fast, "f");
-        assert!(function_entry_trace_is_jit_safe(&code));
     }
 
     #[test]
@@ -15103,7 +15121,6 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -15113,21 +15130,7 @@ mod tests {
         let module = compile_exec("def f(n):\n    for _ in range(n):\n        import os\n")
             .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
-    }
-
-    #[test]
-    fn for_iter_single_level_binaryop_mutation_body_is_jit_safe() {
-        // single-level `s += t` (in-place list extend via BINARY_OP) recovers on
-        // abort (verified by /tmp/inplace_probe.py) -> body is all allow-listed.
-        use pyre_interpreter::compile_exec;
-        let module = compile_exec(
-            "def h(src, t):\n    s = []\n    for x in src:\n        s += t\n    return len(s)\n",
-        )
-        .expect("test code should compile");
-        let code = function_code_from_module(&module, "h");
-        assert!(function_entry_trace_is_jit_safe(&code));
     }
 
     #[test]
@@ -15140,7 +15143,6 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "g");
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -15154,235 +15156,7 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "k");
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
-    }
-
-    #[test]
-    fn unsafe_later_loop_does_not_blacklist_an_earlier_loop() {
-        // The trailing loop holds a `with`, whose LOAD_SPECIAL is deliberately
-        // withheld from the body allow-list, so it is the whole-code scan's
-        // sole refusal.
-        use pyre_interpreter::{Instruction as I, compile_exec};
-        let module = compile_exec(
-            "def run(n, cm):\n    escaped = []\n    i = 0\n    while i < n:\n        for value in range(3):\n            pass\n        escaped.append(range(i, i + 3))\n        i += 1\n    out = []\n    for item in escaped:\n        with cm:\n            out.append(len(item))\n    return out\n",
-        )
-        .expect("test code should compile");
-        let code = function_code_from_module(&module, "run");
-        assert!(!function_entry_trace_is_jit_safe(&code));
-        assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
-
-        let mut outer_header = usize::MAX;
-        let mut final_for_iter = None;
-        let mut arg_state = pyre_interpreter::OpArgState::default();
-        for (pc, unit) in code.instructions.iter().copied().enumerate() {
-            let (instr, op_arg) = arg_state.get(unit);
-            match instr {
-                I::ForIter { .. } => final_for_iter = Some(pc),
-                I::JumpBackward { delta } => {
-                    let target =
-                        skip_caches(&code, pc + 1).saturating_sub(delta.get(op_arg).as_usize());
-                    outer_header = outer_header.min(target);
-                }
-                I::JumpBackwardNoInterrupt { delta } => {
-                    let target = (pc + 1).saturating_sub(delta.get(op_arg).as_usize());
-                    outer_header = outer_header.min(target);
-                }
-                _ => {}
-            }
-        }
-        assert_ne!(outer_header, usize::MAX);
-        assert!(loop_region_for_iter_bodies_all_jit_safe(
-            &code,
-            outer_header
-        ));
-        assert!(!for_iter_body_is_jit_safe_at(
-            &code,
-            final_for_iter.expect("fixture must contain the final comprehension")
-        ));
-    }
-
-    #[test]
-    fn loop_region_includes_out_of_line_handler_rejoining_mid_body() {
-        // The handler holds a loop of its own whose body opens a `with`, and
-        // LOAD_SPECIAL is deliberately withheld from the body allow-list. The
-        // region scan reaches that inner FOR_ITER only if it follows the
-        // out-of-line handler past the back edge.
-        use pyre_interpreter::{Instruction as I, compile_exec};
-        let module = compile_exec(
-            "def run(items, k, cm):\n    out = []\n    seen = []\n    for x in items:\n        try:\n            items[x + 100]\n        except IndexError:\n            for y in range(k):\n                with cm:\n                    out.append(y)\n        seen.append(len(range(x)))\n        out.append(x)\n    return out, seen\n",
-        )
-        .expect("test code should compile");
-        let code = function_code_from_module(&module, "run");
-
-        let backward_target = |pc: usize, instr: I, op_arg: pyre_interpreter::OpArg| match instr {
-            I::JumpBackward { delta } => {
-                Some(skip_caches(&code, pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
-            }
-            I::JumpBackwardNoInterrupt { delta } => {
-                Some((pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
-            }
-            _ => None,
-        };
-
-        let mut outer_header = usize::MAX;
-        let mut arg_state = pyre_interpreter::OpArgState::default();
-        for (pc, unit) in code.instructions.iter().copied().enumerate() {
-            let (instr, op_arg) = arg_state.get(unit);
-            if let Some(target) = backward_target(pc, instr, op_arg) {
-                outer_header = outer_header.min(target);
-            }
-        }
-
-        let mut direct_end = None;
-        let mut arg_state = pyre_interpreter::OpArgState::default();
-        for (pc, unit) in code.instructions.iter().copied().enumerate() {
-            let (instr, op_arg) = arg_state.get(unit);
-            if let Some(target) = backward_target(pc, instr, op_arg) {
-                if target == outer_header {
-                    direct_end = Some(direct_end.map_or(pc, |end: usize| end.max(pc)));
-                }
-            }
-        }
-
-        let direct_end = direct_end.expect("fixture must contain the outer backedge");
-        let ranges = loop_region_ranges(&code, outer_header);
-        assert!(ranges.iter().any(|range| *range.start() > direct_end));
-        assert!(!loop_region_for_iter_bodies_all_jit_safe(
-            &code,
-            outer_header
-        ));
-    }
-
-    /// A `return` leg is reachable from the header and never returns to it, so
-    /// it is not in the region and its `FOR_ITER`s cannot run in this
-    /// backedge's trace.
-    ///
-    /// The span from the header to the last backedge contains that leg, so
-    /// reading the region off the layout declines the loop for an unsafe
-    /// `FOR_ITER` the loop can only reach on its way out.
-    #[test]
-    fn an_inner_loops_region_excludes_the_loop_that_encloses_it() {
-        use pyre_interpreter::{Instruction as I, compile_exec};
-        // Two backedges: the outer `for`, and the inlined comprehension nested
-        // in its body. Control does leave the inner loop, finish the outer body
-        // and come back round to the inner header — so the inner header's
-        // strongly connected component is the whole outer loop. Its natural
-        // loop is not.
-        let module = compile_exec(
-            "def run(rows, k):\n    total = 0\n    for row in rows:\n        total += sum([y * k for y in row])\n    return total\n",
-        )
-        .expect("test code should compile");
-        let code = function_code_from_module(&module, "run");
-
-        let mut headers: Vec<usize> = Vec::new();
-        let mut arg_state = pyre_interpreter::OpArgState::default();
-        for (pc, unit) in code.instructions.iter().copied().enumerate() {
-            let (instr, op_arg) = arg_state.get(unit);
-            let target = match instr {
-                I::JumpBackward { delta } => {
-                    Some(skip_caches(&code, pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
-                }
-                I::JumpBackwardNoInterrupt { delta } => {
-                    Some((pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
-                }
-                _ => None,
-            };
-            if let Some(target) = target {
-                headers.push(target);
-            }
-        }
-        headers.sort_unstable();
-        headers.dedup();
-        assert_eq!(
-            headers.len(),
-            2,
-            "fixture must nest one loop inside another"
-        );
-        let (outer_header, inner_header) = (headers[0], headers[1]);
-
-        let inner = loop_region_ranges(&code, inner_header);
-        let outer = loop_region_ranges(&code, outer_header);
-        assert!(
-            !inner.is_empty() && !outer.is_empty(),
-            "both have backedges"
-        );
-
-        assert!(
-            !inner.iter().any(|range| range.contains(&outer_header)),
-            "the enclosing loop's header is not in the inner loop's region",
-        );
-        assert!(
-            outer.iter().any(|range| range.contains(&inner_header)),
-            "the inner header is in the enclosing loop's region",
-        );
-        let count = |ranges: &[std::ops::RangeInclusive<usize>]| -> usize {
-            ranges
-                .iter()
-                .map(|range| range.end() + 1 - range.start())
-                .sum()
-        };
-        assert!(
-            count(&inner) < count(&outer),
-            "the inner region is the smaller of the two, not the same set",
-        );
-    }
-
-    #[test]
-    fn loop_region_excludes_a_return_leg_inside_the_body_span() {
-        use pyre_interpreter::{Instruction as I, compile_exec};
-        let module = compile_exec(
-            "def run(items, k):\n    out = []\n    for x in items:\n        if x < 0:\n            return [str(y) for y in range(k)]\n        out.append(x)\n    return out\n",
-        )
-        .expect("test code should compile");
-        let code = function_code_from_module(&module, "run");
-
-        let mut header = usize::MAX;
-        let mut last_backedge = 0usize;
-        let mut arg_state = pyre_interpreter::OpArgState::default();
-        for (pc, unit) in code.instructions.iter().copied().enumerate() {
-            let (instr, op_arg) = arg_state.get(unit);
-            let target = match instr {
-                I::JumpBackward { delta } => {
-                    Some(skip_caches(&code, pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
-                }
-                I::JumpBackwardNoInterrupt { delta } => {
-                    Some((pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
-                }
-                _ => None,
-            };
-            if let Some(target) = target {
-                header = header.min(target);
-                last_backedge = last_backedge.max(pc);
-            }
-        }
-        assert!(header != usize::MAX, "fixture must contain a backedge");
-
-        // The comprehension's FOR_ITER is the one on the return leg: it sits
-        // inside the header..=last_backedge span but is not the loop's own.
-        let mut return_leg_for_iter = None;
-        let mut arg_state = pyre_interpreter::OpArgState::default();
-        for (pc, unit) in code.instructions.iter().copied().enumerate() {
-            let (instr, _) = arg_state.get(unit);
-            if matches!(instr, I::ForIter { .. }) && pc > header && pc < last_backedge {
-                return_leg_for_iter = Some(pc);
-            }
-        }
-        let return_leg_for_iter =
-            return_leg_for_iter.expect("fixture must inline the comprehension in the body span");
-
-        let ranges = loop_region_ranges(&code, header);
-        assert!(!ranges.is_empty(), "the header has a backedge");
-        assert!(
-            ranges.iter().any(|range| range.contains(&header)),
-            "the header is in its own region",
-        );
-        assert!(
-            !ranges
-                .iter()
-                .any(|range| range.contains(&return_leg_for_iter)),
-            "a return leg does not reach the header, so it is outside the region",
-        );
     }
 
     #[test]
@@ -15397,7 +15171,6 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "s");
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -15426,7 +15199,6 @@ mod tests {
         .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
 
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -15468,7 +15240,6 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -15481,7 +15252,6 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -15495,7 +15265,6 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -15514,7 +15283,6 @@ mod tests {
                 .copied()
                 .any(|unit| { matches!(arg_state.get(unit).0, Instruction::StoreDeref { .. }) })
         );
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -15528,7 +15296,6 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -15542,7 +15309,6 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -15554,7 +15320,6 @@ mod tests {
             compile_exec("def w(src, o):\n    for i in src:\n        o.x = i\n    return o.x\n")
                 .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -15566,7 +15331,6 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -15582,7 +15346,6 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "r");
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert!(!for_iter_frame_has_raising_named_handler(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
@@ -15599,9 +15362,6 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "r");
-        // The body opcodes themselves stay admissible; only the frame-level
-        // handler shape declines.
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert!(for_iter_frame_has_raising_named_handler(&code));
         assert_eq!(
             unsupported_jit_shape(&code),
@@ -15668,8 +15428,7 @@ mod tests {
         // lowered as a residual with the exception disposition preserved across
         // the guard-failure bridge. The frame is admitted for tracing.
         // The body is kept free of `FOR_ITER` so the only classification axis
-        // is the `WITH_EXCEPT_START` shape; a `for` loop whose body is not
-        // allow-listed declines independently via `function_entry_trace_is_jit_safe`.
+        // is the `WITH_EXCEPT_START` shape.
         use pyre_interpreter::compile_exec;
         let module = compile_exec(
             "def wf(cm):\n    total = 0\n    with cm:\n        total += 1\n    return total\n",

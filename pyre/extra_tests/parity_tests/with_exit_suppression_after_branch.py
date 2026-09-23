@@ -20,12 +20,9 @@ Counting happens in the loop and the assertions run after it -- an assertion
 inside the body reads the counters and stops the loop compiling, which would
 leave the compiled path untested.
 
-Every loop here is a `while`. `for_iter_body_op_is_jit_safe` is an allowlist
-naming neither `LoadSpecial` nor `WithExceptStart`, so a `with` inside a `for`
-body declines the whole region: on `for` these shapes compiled two loops, took
-no guard failure at all and entered no blackhole, while on `while` they compile
-six loops and seven bridges, take 1595 guard failures and run the blackhole's
-`_run_forever` 1588 times.
+Every loop here is a `while`. The fixture pins a second suppressing `__exit__`
+on a compiled branch arm; the `while` spelling is the shape that already
+reached that path.
 """
 
 ROUNDS = 20000

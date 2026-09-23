@@ -344,10 +344,19 @@ pub unsafe fn is_set_or_frozenset(obj: PyObjectRef) -> bool {
 /// `items` slots when the set is reached by a collection; an old-gen set
 /// that stored a young element is reached on a minor GC only if it sits in
 /// the remembered set, so the barrier must run after every insert. Mirrors
-/// `dict_write_barrier`.
+/// `dict_write_barrier`: `rordereddict.py` `dicttable` is the box the
+/// barrier remembers, and a no-GC-hook fallback allocation is not
+/// collector-owned.
 #[inline]
 fn set_write_barrier(obj: PyObjectRef) {
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    if obj.is_null() {
+        return;
+    }
+    let items = unsafe { (*(obj as *const W_SetObject)).items };
+    if !items.is_null() && crate::gc_hook::try_gc_owns_object(items as *mut u8) {
+        crate::gc_hook::try_gc_write_barrier(items as *mut u8);
+    }
 }
 
 /// Allocate an empty `set`.

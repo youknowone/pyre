@@ -515,6 +515,29 @@ impl ArenaCollection {
         }
     }
 
+    /// Visit every live arena block start (GC header address).
+    ///
+    /// `live_words` is one bit per arena word set only at `malloc` of a
+    /// payload block, so each set bit is an allocated header rather than an
+    /// interior word. `debug_check_consistency` walks these so a black object
+    /// the current root trace did not reach still gets `_debug_check_object_marking`.
+    pub(crate) fn for_each_live_header(&self, mut visit: impl FnMut(usize)) {
+        for &(base, end, arena) in &self.arena_ranges {
+            let live_words = unsafe { &(*arena).live_words };
+            for (word_idx, &bits) in live_words.iter().enumerate() {
+                let mut bits = bits;
+                while bits != 0 {
+                    let bit = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    let header = base + (word_idx * usize::BITS as usize + bit) * WORD;
+                    if header < end {
+                        visit(header);
+                    }
+                }
+            }
+        }
+    }
+
     /// Exact allocated-block membership for the arena allocator.
     ///
     /// RPython never needs this query: the translated pointer type proves that

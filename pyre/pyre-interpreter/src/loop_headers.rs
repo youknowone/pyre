@@ -131,10 +131,12 @@ pub fn target_dominates(succ: &[Vec<usize>], target_pc: usize, source_pc: usize)
 /// `transform_graph_to_jitcode` would emit `BC_JUMP_TARGET` and where
 /// `jit_merge_point` is evaluated.
 ///
-/// Corresponds to `jtransform.py handle_jit_marker__loop_header`,
-/// which walks the flow graph looking for `jit_marker('loop_header', ...)`
-/// operations. pyre's "graph" is raw Python bytecode, so the equivalent scan
-/// looks for `JUMP_BACKWARD` instructions and resolves their target PCs.
+/// The flow-graph scan is `warmspot.py` `_find_jit_marker`, via
+/// `find_can_enter_jit` and `find_loop_headers`
+/// (`WarmRunnerDesc.rewrite_can_enter_jits`).
+/// `jtransform.py` `Transformer.handle_jit_marker__loop_header` only
+/// rewrites one already-present marker into a `loop_header` op. Bytecode
+/// carries no `jit_marker`, so this walk resolves `JUMP_BACKWARD` targets.
 pub fn find_loop_header_pcs(code: &CodeObject) -> HashSet<usize> {
     let num_instrs = code.instructions.len();
     let succ = code_successors(code);
