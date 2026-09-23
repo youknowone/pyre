@@ -6839,15 +6839,25 @@ pub fn _float_pos(x: f64) -> PyResult {
     }) as PyObjectRef)
 }
 
-/// ll_math.py `sqrt_nonneg` after the domain pin: `W_FloatObject(sqrt(x))`.
+/// ll_math.py `sqrt_nonneg`: `math_sqrt(x)`. The domain check stays in the
+/// caller. `@jit.elidable` plus `sqrt_nonneg.oopspec = "math.sqrt_nonneg(x)"`.
+#[majit_macros::elidable]
+#[majit_macros::oopspec("math.sqrt_nonneg(x)")]
+#[inline(never)]
+pub(crate) fn sqrt_nonneg(x: f64) -> f64 {
+    x.sqrt()
+}
+
+/// ll_math.py `ll_math_sqrt` after the domain pin: `W_FloatObject(sqrt_nonneg(x))`.
 #[inline(never)]
 pub(crate) fn _float_sqrt(x: f64) -> PyResult {
+    let floatval = sqrt_nonneg(x);
     Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
         ob_header: PyObject {
             ob_type: &FLOAT_TYPE as *const PyType,
             w_class: get_instantiate(&FLOAT_TYPE),
         },
-        floatval: x.sqrt(),
+        floatval,
         w_dict: PY_NULL,
         w_slots: PY_NULL,
     }) as PyObjectRef)

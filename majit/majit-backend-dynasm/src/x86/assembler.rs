@@ -4449,9 +4449,10 @@ impl<'a> Assembler386<'a> {
             | OpCode::CallReleaseGilI
             | OpCode::CallReleaseGilF
             | OpCode::CallReleaseGilN => {
-                let is_raw_free = op.opcode == OpCode::CallN
-                    && op.with_call_descr(|cd| cd.get_extra_info().oopspecindex)
-                        == Some(majit_ir::OopSpecIndex::RawFree);
+                let oopspec = op.with_call_descr(|cd| cd.get_extra_info().oopspecindex);
+                let is_raw_free =
+                    op.opcode == OpCode::CallN && oopspec == Some(majit_ir::OopSpecIndex::RawFree);
+                let is_math_sqrt = oopspec == Some(majit_ir::OopSpecIndex::MathSqrt);
                 if matches!(
                     op.opcode,
                     OpCode::CallMayForceI
@@ -4464,7 +4465,10 @@ impl<'a> Assembler386<'a> {
                 ) {
                     self._store_force_index_if_next_guard(ops, op_index, fail_index);
                 }
-                if is_raw_free {
+                if is_math_sqrt {
+                    // assembler.py `genop_math_sqrt`: SQRTSD(arglocs[0], resloc).
+                    self.genop_math_sqrt(result_loc);
+                } else if is_raw_free {
                     self.genop_nursery_free_inline_x86(op, arglocs);
                 } else {
                     self.genop_call_with_arglocs(op, arglocs);
@@ -7296,6 +7300,15 @@ impl<'a> Assembler386<'a> {
         self.emit_call_from_arglocs(op, arglocs, func_index);
         if op.opcode.result_type() == Type::Int {
             self.ensure_call_result_bit_extension(arglocs);
+        }
+    }
+
+    /// assembler.py `genop_math_sqrt`: `SQRTSD(arglocs[0], resloc)`.
+    /// `_consider_math_sqrt` force-results into the source register, so the
+    /// input already sits in `resloc`.
+    fn genop_math_sqrt(&mut self, result_loc: Option<&Loc>) {
+        if let Some(Loc::Reg(r)) = result_loc {
+            dynasm!(self.mc ; .arch x64 ; sqrtsd Rx(r.value), Rx(r.value));
         }
     }
 
