@@ -5719,7 +5719,18 @@ def main():
         # runner (2x-tight), so its c_vs_py gate is raised 2->3.
         #             name              script                          timeout  d_vs_cp  d_vs_py  c_vs_cp  c_vs_py
         chk.run_bench("int_loop",       f"{B}/int_loop.py",             5,       None,    2,       None,    3)
-        chk.run_bench("float_loop",     f"{B}/float_loop.py",           5,       None,    1.5,     None,    1.5)
+        # float_loop's pypy ceilings follow the oracle to PyPy 8.0.0. Its x86
+        # backend breaks cvtsi2sd's false dependency on the destination
+        # register (`genop_cast_int_to_float`), which halves pypy's execution of
+        # this loop on x86 and leaves aarch64 unchanged. pyre's x86 loop already
+        # does the same, and its loop runs within ~15% of pypy's. What remains
+        # is pyre's startup above pypy's, which stays in every pyre reading
+        # (see fib_recursive below), against a pypy execution that is now
+        # 0.13-0.20s. Measured on one runner with the three interpreters
+        # interleaved: windows dynasm 2.0x, ubuntu dynasm 1.6x. Both ceilings
+        # are fitted to the widest reading with a quarter's headroom. The derived
+        # floor of 0.42x stays under macos, which reads ~0.7x.
+        chk.run_bench("float_loop",     f"{B}/float_loop.py",           5,       None,    2.5,     None,    2.5)
         # fib_loop's dynasm ceiling was 2.1 because the 0.5x floor that 3
         # derives was exactly what windows read.  Windows now reads 0.8x and
         # ubuntu 2.3x, so both bounds fit 3 again.

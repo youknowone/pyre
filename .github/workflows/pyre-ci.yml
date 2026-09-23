@@ -1110,7 +1110,12 @@ jobs:
       id: pypy
       uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
       with:
-        python-version: "pypy3.11"
+        # Pinned, because the oracle's version is part of every pyre-vs-pypy
+        # ratio. A bare `pypy3.11` resolves per runner image: on 2026-09-22
+        # windows-latest installed 8.0.0 while ubuntu-24.04 still installed
+        # 7.3.23, and float_loop's pypy time on x86 halved with 8.0.0, so the
+        # same tree read 2.0x on one host and 0.7x on another.
+        python-version: "pypy3.11-v8.0.0"
     - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       with:
         cache-bin: false
