@@ -41619,6 +41619,7 @@ mod tests {
                         .iter()
                         .map(|s| s.to_string())
                         .collect(),
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![arg_ref]),
                 result_ty: ValueType::Ref(None),
@@ -41683,6 +41684,7 @@ mod tests {
                         .iter()
                         .map(|s| s.to_string())
                         .collect(),
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![pieces_arr, args_arr]),
                 result_ty: ValueType::Ref(None),
@@ -41702,6 +41704,7 @@ mod tests {
                         .iter()
                         .map(|s| s.to_string())
                         .collect(),
+                    fun_decl_id: None,
                 },
                 args: crate::model::call_args(vec![fmt_args_in.clone()]),
                 result_ty: ValueType::Ref(None),
