@@ -506,13 +506,15 @@ pub unsafe fn walk_raw_code_roots(
 
 /// Mark the GC-managed children of a `W_BaseException`.
 ///
-/// Exception allocation is split: an ordinary exception goes to the non-moving
-/// oldgen via `try_gc_alloc_stable_raw`, while the immortal singletons and the
-/// GC-allocation-failure fallback use `malloc_typed` (`interp_exceptions.rs`
-/// `new_exception`). For the `malloc_typed` family the collector never traces
-/// the exception at all — the root visitor's `is_managed_heap_object` guard
-/// short-circuits and `mark_object` is never reached — and for the oldgen
-/// family a minor reaches the children only through the remembered set. Its
+/// Exception allocation is a nursery `malloc_fixedsize`
+/// (`alloc_exception_nursery` → `try_gc_alloc_collecting_rooted`, which runs
+/// `collect_and_reserve` when the nursery is full). Immortal singletons and
+/// the GC-allocation-failure fallback still use `malloc_typed`
+/// (`interp_exceptions.rs`). For the `malloc_typed` family the collector
+/// never traces the exception at all — the root visitor's
+/// `is_managed_heap_object` guard short-circuits and `mark_object` is never
+/// reached — and a minor moves a nursery instance, forwarding this slot
+/// before it traces the children. Its
 /// `args_w` tuple, `w_errno` / `w_strerror` / `w_filename` ints/strings,
 /// `w_traceback` / `w_context` / `w_cause`, `w_dict`, … are ordinary GC-managed
 /// objects, so when an exception is the only holder of those children (a caught
@@ -1449,11 +1451,10 @@ thread_local! {
     /// stack. Between the raising frame's `record_application_traceback` and
     /// the frame that finally catches it, the exception is held only in the
     /// Rust `PyError` value in flight — not on any frame's value stack or in
-    /// `ec.sys_exc_value` yet. `W_BaseException` is std::alloc-backed (outside
-    /// the managed nursery/old-gen), so the collector never reaches it as a
-    /// root and never traces its slots; a dispatch-loop safepoint running the
-    /// non-moving old-gen major would sweep its old-gen traceback chain from
-    /// under it. Mirrors `tstate->current_exception`: keep the in-flight
+    /// `ec.sys_exc_value` yet. The instance is a nursery object
+    /// (`alloc_exception_nursery`), so a minor collection moves it and a
+    /// dispatch-loop safepoint would drop an unrooted traceback chain.
+    /// Mirrors `tstate->current_exception`: keep the in-flight
     /// exception's traceback chain a GC root until the exception is caught.
     static IN_FLIGHT_EXCEPTION: Cell<PyObjectRef> = const { Cell::new(pyre_object::PY_NULL) };
 }
@@ -1488,9 +1489,9 @@ unsafe fn walk_in_flight_exception_area(
     if exc.is_null() {
         return;
     }
-    // Forward the exception OBJECT slot itself. A GC-managed exception
-    // (oldgen-stable `w_exception_new_empty`) is marked here and the collector
-    // then recurses into its slots via offset tracing.
+    // Forward the exception OBJECT slot itself. A nursery exception
+    // (`w_exception_new_empty` → `alloc_exception_nursery`) moves; the
+    // collector rewrites this cell, then recurses into its slots.
     let slot = c.as_ptr();
     unsafe { visitor(&mut *(slot as *mut majit_ir::GcRef)) };
     // Off-GC fallback exceptions are malloc_typed, so explicitly trace their
@@ -2132,6 +2133,13 @@ pub fn handle_exception_with_context(
     if err.exc_object.is_null() {
         err.exc_object = exc_obj;
     }
+    // Nursery exception: every allocation below (`chain_context`'s cycle
+    // break, the trace hooks, `record_application_traceback`, `w_int_new`)
+    // can move it. The `PyError` field is not a root. Publish the instance
+    // and write the forwarded address back before each later use.
+    let _exc_roots = pyre_object::gc_roots::push_roots();
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(err.exc_object);
     // PyPy `PyFrame.handle_bytecode` calls `OperationError.record_context`
     // only on the ordinary OperationError arm. `RaiseWithExplicitTraceback`
     // (RERAISE) goes straight to `handle_operation_error(attach_tb=False)`:
@@ -2149,17 +2157,19 @@ pub fn handle_exception_with_context(
             ContextSource::GeneratorChain => get_sys_exception(),
             ContextSource::ResumedFrameOnly => get_current_exception(),
         };
-        crate::error::chain_context(err.exc_object, active);
+        crate::error::chain_context(pyre_object::gc_roots::shadow_stack_get(exc_slot), active);
+        err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
         err.context_recorded = true;
     }
     let frame = unsafe { &mut *frame_anchor.live() };
     if err.attach_tb {
         if !ec.is_null() && unsafe { !(*ec).gettrace().is_null() } {
-            // The materialized exception is old-gen managed but lives only in the
-            // `PyError` local; publish it as the in-flight root before the trace hook
-            // runs arbitrary Python that can allocate and drive a major collection to
-            // sweep an unrooted (white) exception. `record_application_traceback`
-            // re-publishes the possibly-replaced operr below.
+            // The materialized exception is a nursery object and lives only in
+            // the `PyError` field plus the pin above. Publish the forwarded
+            // address as the in-flight root before the trace hook runs
+            // arbitrary Python. `record_application_traceback` re-publishes
+            // the possibly-replaced operr below.
+            err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
             set_in_flight_exception(err.exc_object);
             let saved_trace = frame.get_w_f_trace();
             if !saved_trace.is_null() {
@@ -2188,6 +2198,7 @@ pub fn handle_exception_with_context(
         if err.exc_object.is_null() {
             err.exc_object = operr_obj;
         }
+        pyre_object::gc_roots::shadow_stack_set(exc_slot, err.exc_object);
         // `pyopcode.py pytraceback.record_application_traceback`
         // — prepends a `PyTraceback` wrapping the current frame onto
         // the exception's `w_traceback` chain.
@@ -2196,11 +2207,12 @@ pub fn handle_exception_with_context(
         let frame = unsafe { &mut *frame_anchor.live() };
         unsafe {
             crate::pytraceback::record_application_traceback(
-                operr_obj,
+                pyre_object::gc_roots::shadow_stack_get(exc_slot),
                 frame as *mut PyFrame,
                 frame.last_instr as i64,
             );
         }
+        err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
     }
     if err.attach_tb && !ec.is_null() && unsafe { !(*ec).gettrace().is_null() } {
         // `record_application_traceback` above allocates, so the frame address
@@ -2211,6 +2223,7 @@ pub fn handle_exception_with_context(
         // `executioncontext.py exception_trace` normalizes it in place to
         // build the `(w_type, w_value, w_traceback)` argument — including the
         // traceback read, so the caller does not assemble one.
+        err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
         if let Err(trace_err) = unsafe { (*ec).exception_trace(frame as *mut PyFrame, err) } {
             // The call sits outside the trace-ticker recovery block, so a tracer
             // exception replaces the original error and propagates without
@@ -2218,6 +2231,8 @@ pub fn handle_exception_with_context(
             *err = trace_err;
             return false;
         }
+        pyre_object::gc_roots::shadow_stack_set(exc_slot, err.exc_object);
+        err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
     }
     // `attach_tb=False` (RaiseWithExplicitTraceback) suppresses the traceback
     // record for the frame that performed the re-raise only.  Once that frame's
@@ -2287,16 +2302,19 @@ pub fn handle_exception_with_context(
                 pc_units as i64
             };
             frame.push(pyre_object::w_int_new(lasti_value));
+            err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
         }
         // pyopcode.py: reraise_lasti is a local of handle_operation_error;
         // OperationError raised from this function carries no lasti.  Clear
         // here so a re-thrown PyError does not double-consume.
         err.reraise_lasti = -1;
+        err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
         let exc_obj = err.to_exc_object();
         // Same shape as `opcode_build_list`: materialise, then push. The push
         // has to land on the frame the materialisation left live.
         let frame = unsafe { &mut *frame_anchor.live() };
-        frame.push(exc_obj);
+        pyre_object::gc_roots::shadow_stack_set(exc_slot, exc_obj);
+        frame.push(pyre_object::gc_roots::shadow_stack_get(exc_slot));
         // The exception is now on this frame's handler.  Drop the backend
         // `_store_exception` cells so a later compiled `GUARD_NO_EXCEPTION`
         // does not re-deliver the value this except already consumed.
@@ -2315,6 +2333,7 @@ pub fn handle_exception_with_context(
     }
     err.reraise_lasti = -1;
     frame.set_frame_finished_execution(true);
+    err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
 
     false
 }
@@ -4545,8 +4564,19 @@ impl OpcodeStepExecutor for PyFrame {
                 let w_value = self.pop();
                 unsafe {
                     if crate::baseobjspace::exception_is_valid_obj_as_class_w(w_value) {
-                        // pyopcode.py:711-713 — class raise: call the type.
-                        let result = instantiate_raised_class(w_value)?;
+                        // The class is a nursery object only when it is a heap
+                        // type. `instantiate_raised_class` allocates the
+                        // instance (`malloc_fixedsize` → `collect_and_reserve`),
+                        // so pin the class and re-read it afterwards.
+                        let _roots = pyre_object::gc_roots::push_roots();
+                        let value_slot = pyre_object::gc_roots::shadow_stack_len();
+                        let _ = pyre_object::gc_roots::pin_root(w_value);
+                        let result = instantiate_raised_class(
+                            pyre_object::gc_roots::shadow_stack_get(value_slot),
+                        )?;
+                        // Re-read the class. `attach_raise_cause` does not use
+                        // it; the read is what drops the pre-move local.
+                        let _ = pyre_object::gc_roots::shadow_stack_get(value_slot);
                         attach_raise_cause(result, None)?;
                         Err(PyError::from_exc_object(result))
                     } else if pyre_object::is_exception(w_value) {
@@ -4570,17 +4600,29 @@ impl OpcodeStepExecutor for PyFrame {
                 let w_value = self.pop();
                 unsafe {
                     if crate::baseobjspace::exception_is_valid_obj_as_class_w(w_value) {
-                        // Root the normalized `cause` across the class
-                        // instantiation: it is a fresh oldgen exception held only
-                        // in this Rust local, invisible to the precise collector
-                        // until `attach_raise_cause` reads it, and `call_function`
-                        // below can drive a collection.
+                        // Root the class and the normalized `cause` across the
+                        // instantiation. `instantiate_raised_class` allocates
+                        // (`malloc_fixedsize` → `collect_and_reserve`), and both
+                        // live only in this Rust local until `attach_raise_cause`
+                        // reads them. Re-read each slot afterwards.
                         let _roots = pyre_object::gc_roots::push_roots();
-                        if let Some(c) = &cause {
+                        let value_slot = pyre_object::gc_roots::shadow_stack_len();
+                        let _ = pyre_object::gc_roots::pin_root(w_value);
+                        let cause_slot = cause.as_ref().map(|c| {
+                            let slot = pyre_object::gc_roots::shadow_stack_len();
                             let _ = pyre_object::gc_roots::pin_root(c.w_cause);
-                        }
-                        // pyopcode.py:711-713 — class raise: call the type.
-                        let result = instantiate_raised_class(w_value)?;
+                            slot
+                        });
+                        let result = instantiate_raised_class(
+                            pyre_object::gc_roots::shadow_stack_get(value_slot),
+                        )?;
+                        let _ = pyre_object::gc_roots::shadow_stack_get(value_slot);
+                        let cause = cause.map(|mut c| {
+                            if let Some(slot) = cause_slot {
+                                c.w_cause = pyre_object::gc_roots::shadow_stack_get(slot);
+                            }
+                            c
+                        });
                         attach_raise_cause(result, cause)?;
                         Err(PyError::from_exc_object(result))
                     } else if pyre_object::is_exception(w_value) {

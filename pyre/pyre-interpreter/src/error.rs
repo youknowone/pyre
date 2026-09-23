@@ -1731,18 +1731,22 @@ impl PyError {
         // shadow-stack slot for the `ImportError` `msg` stamp), so letting the
         // message helper build a first string + list here only to overwrite
         // both allocated two W_Str/W_List pairs per raise and threw one away.
-        let exc = pyre_object::interp_exceptions::w_exception_new_empty(self.to_exc_kind());
-        // Root the fresh managed exception across the message/context stamping
-        // below: `exc` lives only in this Rust local while `w_list_new` (and the
-        // setters) run, so a collection there could sweep the unrooted
-        // (non-moving oldgen) exception before it is written through.
-        let exc = pyre_object::gc_roots::pin_root(exc);
+        let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(
+            pyre_object::interp_exceptions::w_exception_new_empty(self.to_exc_kind()),
+        );
+        // The exception is a nursery object (`alloc_exception_nursery` →
+        // `collect_and_reserve`). `pin_root` keeps it alive without keeping
+        // the local in place: `w_exception_args_new` collects, so every use
+        // below re-reads the slot.
+        let exc = || pyre_object::gc_roots::shadow_stack_get(exc_slot);
         if self.has_display_message() {
             let msg_slot = pyre_object::gc_roots::shadow_stack_len();
             let msg = pyre_object::w_str_from_wtf8_managed(self.display_message_buf());
-            let msg = pyre_object::gc_roots::pin_root(msg);
+            let _ = pyre_object::gc_roots::pin_root(msg);
+            let msg = pyre_object::gc_roots::shadow_stack_get(msg_slot);
             let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![msg]);
-            unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
+            unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc(), args_list) };
             // `ImportError` / `ModuleNotFoundError` expose the message through a
             // dedicated `msg` slot (`ImportError.__init__` stores `args[0]`
             // there). The raw-message raise path bypasses `__init__`, so stamp
@@ -1755,14 +1759,14 @@ impl PyError {
                 // alive, but `w_list_new` may have relocated the young string,
                 // leaving this raw local pointing at the old address.
                 let msg = pyre_object::gc_roots::shadow_stack_get(msg_slot);
-                unsafe { pyre_object::interp_exceptions::w_exception_set_import_msg(exc, msg) };
+                unsafe { pyre_object::interp_exceptions::w_exception_set_import_msg(exc(), msg) };
             }
             // `W_SyntaxError.descr_init` likewise stores `args_w[0]` in its
             // dedicated `w_msg` field.  Internal parser/codegen errors use
             // this raw-message path, so mirror that store here.
             if self.kind == PyErrorKind::SyntaxError {
                 let msg = pyre_object::gc_roots::shadow_stack_get(msg_slot);
-                unsafe { pyre_object::interp_exceptions::w_exception_set_syntax_msg(exc, msg) };
+                unsafe { pyre_object::interp_exceptions::w_exception_set_syntax_msg(exc(), msg) };
             }
         }
         // Stamp the deferred `name` / `obj` context onto the freshly
@@ -1779,18 +1783,20 @@ impl PyError {
         if !self.w_name_context.is_null() {
             let w_name_context = pyre_object::gc_roots::shadow_stack_get(name_ctx_slot);
             self.w_name_context = w_name_context;
-            unsafe { pyre_object::interp_exceptions::w_exception_set_name(exc, w_name_context) };
+            unsafe { pyre_object::interp_exceptions::w_exception_set_name(exc(), w_name_context) };
         }
         if !self.w_obj_context.is_null() {
             let w_obj_context = pyre_object::gc_roots::shadow_stack_get(obj_ctx_slot);
             self.w_obj_context = w_obj_context;
-            unsafe { pyre_object::interp_exceptions::w_exception_set_attr_obj(exc, w_obj_context) };
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_attr_obj(exc(), w_obj_context)
+            };
         }
         // Write-once memo (`get_w_value` self.w_value): cache the materialised
         // instance so a second call returns the same object (identity `e1 is e2`)
         // instead of a fresh allocation.
-        self.exc_object = exc;
-        exc
+        self.exc_object = exc();
+        self.exc_object
     }
 
     /// `error.py OperationError.normalize_exception` is `@jit.unroll_safe`.

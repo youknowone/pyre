@@ -7730,13 +7730,15 @@ fn os_error_build(
         interp_exceptions::w_exception_new_wtf8(kind, &msg)
     };
     // Seed `args_w` so a deferred-init instance (`_use_init`, no `__new__`
-    // slot fill) still reports the empty tuple until `__init__` runs.  `exc`
-    // is pinned over the tuple mint: it holds no heap edge yet, and building
-    // a tuple instantiates the type's lazy map.  An instance is old-gen, so
-    // the pin is for liveness and the value is used as it is.
-    let exc = pyre_object::gc_roots::pin_root(exc);
+    // slot fill) still reports the empty tuple until `__init__` runs.
+    // The instance is a nursery object (`alloc_exception_nursery`), and
+    // `w_exception_args_new` collects, so the pin is re-read before the
+    // store and before the return.
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(exc);
     let args_list =
         pyre_object::interp_exceptions::w_exception_args_new((0..args.len()).map(arg).collect());
+    let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
     unsafe { interp_exceptions::w_exception_set_args(exc, args_list) };
     exc
 }
@@ -7911,7 +7913,9 @@ fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) -> Result<(), cra
     // either has run.
     let _roots = pyre_object::gc_roots::push_roots();
     let args_base = pyre_object::gc_roots::pin_roots(args);
-    let exc = pyre_object::gc_roots::pin_root(exc);
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(exc);
+    let exc = || pyre_object::gc_roots::shadow_stack_get(exc_slot);
     let arg = |index: usize| pyre_object::gc_roots::shadow_stack_get(args_base + index);
     let arg_opt = |index: usize| (index < args.len()).then(|| arg(index));
     // `_parse_init_args`: only a 2..=5 argument call carries errno/strerror
@@ -7924,11 +7928,11 @@ fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) -> Result<(), cra
         // `e.args[0]` and `e.errno` agree even where a Windows error code in
         // the fourth argument replaced the one that was passed.
         unsafe {
-            interp_exceptions::w_exception_set_errno(exc, w_errno);
-            interp_exceptions::w_exception_set_strerror(exc, arg(1));
+            interp_exceptions::w_exception_set_errno(exc(), w_errno);
+            interp_exceptions::w_exception_set_strerror(exc(), arg(1));
             #[cfg(windows)]
             if let Some(w_winerror) = arg_opt(3) {
-                interp_exceptions::w_exception_set_winerror(exc, w_winerror);
+                interp_exceptions::w_exception_set_winerror(exc(), w_winerror);
             }
             // idx 2 = filename, idx 3 = winerror (unread off Windows),
             // idx 4 = filename2.
@@ -7941,18 +7945,18 @@ fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) -> Result<(), cra
             // propagates instead of falling back here.  PyPy catches
             // (`_init_error` 637-643), consistent there because it never trims
             // `args_w`; pyre does, so the fallback lands on neither.  gh#1150.
-            let is_written_arg = exc_is_blocking_io_error(exc)
+            let is_written_arg = exc_is_blocking_io_error(exc())
                 && w_filename.is_some_and(|f| crate::baseobjspace::number_check(f));
             if is_written_arg {
                 let value = crate::baseobjspace::getindex_w_written(
                     w_filename.expect("is_written_arg implies a third argument"),
                 )?;
-                interp_exceptions::w_exception_set_written(exc, value);
-                interp_exceptions::w_exception_set_blocking_written_arg(exc);
+                interp_exceptions::w_exception_set_written(exc(), value);
+                interp_exceptions::w_exception_set_blocking_written_arg(exc());
             } else if let Some(fname) = w_filename {
-                interp_exceptions::w_exception_set_filename(exc, fname);
+                interp_exceptions::w_exception_set_filename(exc(), fname);
                 if let Some(f2) = arg_opt(4).filter(|&f| !pyre_object::is_none(f)) {
-                    interp_exceptions::w_exception_set_filename2(exc, f2);
+                    interp_exceptions::w_exception_set_filename2(exc(), f2);
                 }
                 // `_init_error`: filename is removed from the args tuple.
                 trimmed = true;
@@ -7969,7 +7973,7 @@ fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) -> Result<(), cra
         (None, _) => (0..args.len()).map(&arg).collect(),
     };
     let args_list = interp_exceptions::w_exception_args_new(args_w);
-    unsafe { interp_exceptions::w_exception_set_args(exc, args_list) };
+    unsafe { interp_exceptions::w_exception_set_args(exc(), args_list) };
     Ok(())
 }
 
@@ -8820,9 +8824,23 @@ fn exc_import_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
         interp_exceptions::w_exception_set_import_path(w_self, w_path);
         interp_exceptions::w_exception_set_import_name_from(w_self, w_name_from);
         interp_exceptions::w_exception_set_import_msg(w_self, w_msg);
-        // Only the positional arguments reach `args_w`.
-        let args_list = pyre_object::interp_exceptions::w_exception_args_new(positional.to_vec());
-        interp_exceptions::w_exception_set_args(w_self, args_list);
+        // Only the positional arguments reach `args_w`. The receiver is a
+        // nursery exception; `w_exception_args_new` collects, so re-read it.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let self_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_self);
+        let args_base = pyre_object::gc_roots::shadow_stack_len();
+        for &arg in positional {
+            let _ = pyre_object::gc_roots::pin_root(arg);
+        }
+        let rooted: Vec<_> = (0..positional.len())
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(args_base + i))
+            .collect();
+        let args_list = pyre_object::interp_exceptions::w_exception_args_new(rooted);
+        interp_exceptions::w_exception_set_args(
+            pyre_object::gc_roots::shadow_stack_get(self_slot),
+            args_list,
+        );
     }
     Ok(pyre_object::w_none())
 }
@@ -8844,8 +8862,21 @@ fn exc_name_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         // `self.w_name = w_name` (WrappedDefault(None)) — unconditional
         // re-stamp so a repeated `__init__` resets a stale name.
         interp_exceptions::w_exception_set_name(w_self, w_name);
-        let args_list = pyre_object::interp_exceptions::w_exception_args_new(positional.to_vec());
-        interp_exceptions::w_exception_set_args(w_self, args_list);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let self_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_self);
+        let args_base = pyre_object::gc_roots::shadow_stack_len();
+        for &arg in positional {
+            let _ = pyre_object::gc_roots::pin_root(arg);
+        }
+        let rooted: Vec<_> = (0..positional.len())
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(args_base + i))
+            .collect();
+        let args_list = pyre_object::interp_exceptions::w_exception_args_new(rooted);
+        interp_exceptions::w_exception_set_args(
+            pyre_object::gc_roots::shadow_stack_get(self_slot),
+            args_list,
+        );
     }
     Ok(pyre_object::w_none())
 }
@@ -8871,8 +8902,21 @@ fn exc_attribute_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         // Unconditional re-stamp so a repeated `__init__` resets stale slots.
         interp_exceptions::w_exception_set_name(w_self, w_name);
         interp_exceptions::w_exception_set_attr_obj(w_self, w_obj);
-        let args_list = pyre_object::interp_exceptions::w_exception_args_new(positional.to_vec());
-        interp_exceptions::w_exception_set_args(w_self, args_list);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let self_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_self);
+        let args_base = pyre_object::gc_roots::shadow_stack_len();
+        for &arg in positional {
+            let _ = pyre_object::gc_roots::pin_root(arg);
+        }
+        let rooted: Vec<_> = (0..positional.len())
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(args_base + i))
+            .collect();
+        let args_list = pyre_object::interp_exceptions::w_exception_args_new(rooted);
+        interp_exceptions::w_exception_set_args(
+            pyre_object::gc_roots::shadow_stack_get(self_slot),
+            args_list,
+        );
     }
     Ok(pyre_object::w_none())
 }

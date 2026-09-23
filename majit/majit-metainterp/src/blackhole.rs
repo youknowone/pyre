@@ -1167,7 +1167,12 @@ impl BlackholeInterpreter {
         if current_exc != 0 && !self.handle_exception_in_frame(current_exc) {
             // No handler: propagate.  The exception leaves this frame here,
             // so record its node — see [`Self::record_frame_traceback`].
-            self.record_frame_traceback(current_exc);
+            // Publish into the walked slot first: the record allocates a
+            // nursery traceback and the minor moves the exception. Re-read
+            // the slot afterwards; `current_exc` is not rewritten.
+            self.exception_last_value = current_exc;
+            self.record_frame_traceback(self.exception_last_value);
+            let current_exc = self.exception_last_value;
             if self.nextblackholeinterp.is_none() {
                 return Err(self.exit_frame_with_exception(current_exc));
             }
@@ -1202,7 +1207,10 @@ impl BlackholeInterpreter {
             let exc = self.exception_last_value;
             // `run` reached the end of the frame with an uncaught exception, so
             // the frame is left here — see [`Self::record_frame_traceback`].
+            // The record moves the nursery exception. `exception_last_value`
+            // is the walked root; the local is stale once it returns.
             self.record_frame_traceback(exc);
+            let exc = self.exception_last_value;
             if self.nextblackholeinterp.is_none() {
                 // blackhole.py:1629
                 return Err(self.exit_frame_with_exception(exc));
@@ -1540,9 +1548,11 @@ impl BlackholeInterpreter {
             // `RaiseException` arm below routes it into
             // `handle_exception_in_frame` → `route_to_catch`, which records a
             // traceback node — an allocation — before it performs that store.
-            // Exception objects are non-moving (`w_exception_new_empty` uses
-            // the stable old gen), but old gen is mark-sweep, so an unrooted
-            // one in that window is collectable.  `route_to_catch` clears the
+            // The exception is a nursery object (`w_exception_new_empty` →
+            // `alloc_exception_nursery`, `malloc_fixedsize` →
+            // `collect_and_reserve`), so the traceback allocation moves it.
+            // An unrooted local in that window is left pointing at the
+            // pre-move address.  `route_to_catch` clears the
             // cell only *after* the record for the same reason
             // (blackhole.py:407 parity); `exception_last_value` is a
             // `walk_bh_regs` root, so writing it first keeps the value covered
@@ -1624,9 +1634,10 @@ impl BlackholeInterpreter {
         // moment: `handler_inline_call_nested_ext` reads
         // `callee.exception_last_value` after `callee.run()` returned, which
         // popped the callee's `push_bh_regs` entry, and a callee-local `raise`
-        // never went through `BH_LAST_EXC_VALUE`.  Exception objects do not
-        // move (`w_exception_new_empty` allocates in the stable old gen), but
-        // old gen is mark-sweep, so an unrooted one is collectable.
+        // never went through `BH_LAST_EXC_VALUE`.  The exception is a nursery
+        // object (`w_exception_new_empty` → `alloc_exception_nursery`), so
+        // the record moves it; the walked slot is what the collector
+        // rewrites.  A local copied before the record is stale afterwards.
         self.exception_last_value = exc_value;
         self.record_frame_traceback(exc_value);
         self.position = target;
@@ -6064,8 +6075,8 @@ mod tests {
         /// only root: `handler_inline_call_nested_ext` reads
         /// `callee.exception_last_value` after `callee.run()` popped the
         /// callee's `push_bh_regs` entry, and a callee-local raise never went
-        /// through `BH_LAST_EXC_VALUE`.  Exceptions do not move but old gen is
-        /// mark-sweep, so an unrooted one there is collectable.
+        /// through `BH_LAST_EXC_VALUE`.  The exception is a nursery object, so
+        /// the record moves it; an unrooted local there is stale.
         #[test]
         fn test_bh_route_to_catch_roots_the_exception_before_recording() {
             const EXC_VAL: i64 = 0xCAFE_F00D;
@@ -6189,8 +6200,8 @@ mod tests {
         /// (`walk_bh_last_exc_value`), and the `RaiseException` handoff runs
         /// `handle_exception_in_frame` → `route_to_catch`, which records a
         /// traceback node — an allocation — before it stores the value itself.
-        /// Exceptions are non-moving but old gen is mark-sweep, so clearing the
-        /// cell first leaves the exception collectable across that allocation.
+        /// The exception is a nursery object, so clearing the cell first
+        /// leaves it unrooted across that allocation and the minor moves it.
         /// `exception_last_value` is a `walk_bh_regs` root, so it must already
         /// carry the exception at the moment the cell goes to zero.
         #[test]

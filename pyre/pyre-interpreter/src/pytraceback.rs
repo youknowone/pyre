@@ -166,14 +166,24 @@ pub fn w_pytraceback_new(
     let inputs = pyre_object::gc_roots::pin_roots(&[w_next, w_code, frame as PyObjectRef]);
 
     // Nursery, same as `space.allocate_instance(PyTraceback)` /
-    // `malloc_fixedsize`.  The host-side constructor used to take
-    // `try_gc_alloc_stable_raw` so a Rust caller could hold the address
-    // unrooted; pin the block instead so a minor can move it.  JIT-emitted
-    // nodes already use the ordinary movable SizeDescr.  Before the GC
-    // hook is wired (bootstrap, tests) `try_gc_alloc` returns `None`;
-    // fall back to the leaked `malloc_typed` block.
-    let raw = pyre_object::gc_hook::try_gc_alloc(PYTRACEBACK_GC_TYPE_ID, PYTRACEBACK_OBJECT_SIZE)
-        .unwrap_or(std::ptr::null_mut());
+    // `malloc_fixedsize` → `collect_and_reserve`.  The host-side constructor
+    // used to take the no-collect hook and spill old when the nursery was
+    // full.  `w_next` is the chain child handed to the rooted slot; `w_code`
+    // and `frame` stay on the shadow stack this bracket already published
+    // and are re-read below.  Before the GC hook is wired (bootstrap, tests)
+    // the collecting hook returns `None`; fall back to the leaked
+    // `malloc_typed` block.
+    let mut allocation_root = roots.get(inputs) as *mut u8;
+    let mut needs_write_barrier = true;
+    let raw = unsafe {
+        pyre_object::gc_hook::try_gc_alloc_collecting_rooted(
+            PYTRACEBACK_GC_TYPE_ID,
+            PYTRACEBACK_OBJECT_SIZE,
+            &mut allocation_root,
+            &mut needs_write_barrier,
+        )
+    }
+    .unwrap_or(std::ptr::null_mut());
     let tb_slot = if raw.is_null() {
         None
     } else {
@@ -208,7 +218,9 @@ pub fn w_pytraceback_new(
     }
     // The node may point at a still-young `w_next` / `w_code` (and, once
     // GC-owned, the frame); remember it if this alloc spilled old.
-    pyre_object::gc_hook::try_gc_write_barrier(raw);
+    if needs_write_barrier {
+        pyre_object::gc_hook::try_gc_write_barrier(raw);
+    }
     raw as PyObjectRef
 }
 
@@ -437,9 +449,18 @@ pub unsafe fn record_application_traceback(
         };
         // Keep the exception now being propagated GC-reachable: until a frame
         // catches it, it lives only in the in-flight Rust `PyError`, so a
-        // safepoint's major would otherwise sweep the oldgen exception (and
-        // the traceback chain it roots) (`tstate->current_exception` parity).
+        // safepoint would otherwise miss the nursery exception (and the
+        // traceback chain it roots) (`tstate->current_exception` parity).
+        // The in-flight cell is a walked root. Pin as well: `w_pytraceback_new`
+        // collects, and the local below is not rewritten. Re-read the pin
+        // after that constructor — the same address the walker writes back
+        // into the in-flight cell.
         crate::eval::set_in_flight_exception(w_exc_object);
+        let _exc_roots = pyre_object::gc_roots::push_roots();
+        let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_exc_object);
+        let frame_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(frame as PyObjectRef);
         // `pytraceback.py self.lineno = offset2lineno(self.frame
         // .pycode, self.lasti)` — pyre resolves the line number eagerly
         // here rather than leaving the sentinel for the getter.
@@ -467,18 +488,35 @@ pub unsafe fn record_application_traceback(
         // stays GC-rooted in that same case — readers (e.g.
         // `write_traceback_chain` in `error.rs`) MUST go through
         // `w_code` rather than dereferencing the `frame` pointer.
+        let frame =
+            pyre_object::gc_roots::shadow_stack_get(frame_slot) as *mut crate::pyframe::PyFrame;
         let w_code = (*frame).pycode as PyObjectRef;
+        let code_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_code);
         let lineno = if w_code.is_null() {
             LINENO_NOT_COMPUTED
         } else {
-            crate::pyframe::offset2lineno(w_code, last_instruction as isize) as i64
+            crate::pyframe::offset2lineno(
+                pyre_object::gc_roots::shadow_stack_get(code_slot),
+                last_instruction as isize,
+            ) as i64
         };
         // `tb = operror.get_traceback()` — the read that grows the chain
         // marks the previous head's frame, matching `get_traceback`.
+        let w_exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
         let prev_tb = pyre_object::interp_exceptions::w_exception_get_traceback(w_exc_object);
         mark_traceback_escaped(prev_tb);
         // `last_instruction` counts instructions; the slot holds bytes.
+        // `offset2lineno` may have collected, so the constructor sees the
+        // forwarded frame, code, and previous node rather than the locals.
+        let frame =
+            pyre_object::gc_roots::shadow_stack_get(frame_slot) as *mut crate::pyframe::PyFrame;
+        let prev_tb = pyre_object::interp_exceptions::w_exception_get_traceback(
+            pyre_object::gc_roots::shadow_stack_get(exc_slot),
+        );
+        let w_code = pyre_object::gc_roots::shadow_stack_get(code_slot);
         let new_tb = w_pytraceback_new(frame, last_instruction * 2, prev_tb, lineno, w_code);
+        let w_exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
         pyre_object::interp_exceptions::w_exception_set_traceback(w_exc_object, new_tb);
     }
 }

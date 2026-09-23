@@ -3253,18 +3253,19 @@ pub fn blackhole_resume_via_rd_numb<'df>(
             // exception lives only in a Rust local — and this block
             // allocates: `record_application_traceback` builds a traceback
             // node, and so does the caller's `handle_exception_in_frame` →
-            // `route_to_catch`.  Exception objects do not move
-            // (`w_exception_new_empty` uses the stable old gen) but old gen is
-            // mark-sweep, so an unrooted one in that window is collectable and
-            // its block reusable — which is what hands
-            // `exit_frame_exception_ref` a mapped object of the wrong class.
+            // `route_to_catch`.  The exception is a nursery object
+            // (`w_exception_new_empty` → `alloc_exception_nursery`,
+            // `malloc_fixedsize` → `collect_and_reserve`), so that allocation
+            // moves it.  An unrooted local keeps the pre-move address, which
+            // is what hands `exit_frame_exception_ref` a mapped object of the
+            // wrong class.
             // `blackhole.py _run_forever` keeps every interp in the chain
             // — and with it `exception_last_value` — transitively traced for
             // its whole life; root the value across the equivalent window.
             let _exc_roots = pyre_object::gc_roots::push_roots();
             let exc_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(bh.exception_last_value as PyObjectRef);
-            let exc_value = bh.exception_last_value;
+            let exc_value = pyre_object::gc_roots::shadow_stack_get(exc_slot) as i64;
             let next = bh.nextblackholeinterp.take();
             let frame_ptr = bh.virtualizable_ptr as *mut PyFrame;
             let jitcode_index = bh.jitcode.try_index().map(|v| v as i32);
@@ -3316,6 +3317,7 @@ pub fn blackhole_resume_via_rd_numb<'df>(
             // pytraceback.py record_application_traceback at every Python
             // frame boundary. A forwarding raise preserves the existing chain.
             if !keeps_existing_traceback && !frame_ptr.is_null() {
+                let exc_value = pyre_object::gc_roots::shadow_stack_get(exc_slot) as i64;
                 if let Some(jitcode_index) = jitcode_index {
                     record_caught_blackhole_traceback(
                         exc_value,
