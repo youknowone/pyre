@@ -8571,25 +8571,22 @@ fn for_iter_frame_is_finally_duplicated(code: &pyre_interpreter::CodeObject) -> 
 /// handler body itself raises (`raise name`, `raise Other(...)`, a bare `raise`).
 ///
 /// Module-level `except E as name` spells the same tail with `STORE_NAME` /
-/// `DELETE_NAME` (or the `GLOBAL` pair); the dropped-item hazard is identical.
+/// `DELETE_NAME` (or the `GLOBAL` pair).
 ///
-/// That tail lowers to a `last_exc_value` jitcode op, and on a bridge walk the
-/// walker holds no active exception to answer it with, so the walk aborts with
-/// `LastExcValueWithoutActiveException` (`jitcode_dispatch` `last_exc_value/>r`;
-/// the value RPython asserts on in `pyjitpl.py opimpl_last_exc_value`). The
-/// abort is not permanent, so the loop is retraced and re-aborts for its whole
-/// run — the abort count scales with the iteration count rather than settling.
-///
-/// The abort itself is survivable: a frame without a `FOR_ITER` keeps producing
-/// the right answer, it merely retraces. With a `FOR_ITER` in the frame the abort
-/// can land while an item is in flight, and that item's iteration is dropped
-/// (#57) — the result is short by exactly one handler visit per abort. Such a
-/// frame must run in the interpreter. The caller applies this only to frames that
-/// hold a `FOR_ITER`.
+/// The tail's handler entry reads `last_exc_value` (`pyjitpl.py
+/// opimpl_last_exc_value`). A bridge that starts on that read used to walk
+/// with no standing exception and abort (`LastExcValueWithoutActiveException`),
+/// and an abort with a `FOR_ITER` item in flight dropped the iteration. The
+/// bridge now seeds that slot from the frame's current exception
+/// (`seed_standing_exception_for_walk`), which is the value the metainterp
+/// already holds when it continues past the guard. `can_enter_jit`
+/// (`interp_jit.py`) therefore traces the loop. This predicate only names
+/// the shape.
 ///
 /// A handler that binds no name (`except E:`) emits no cleanup tail, and a
 /// binding handler that cannot raise never reaches its own tail; both keep
 /// JITting, as does a raise sitting in the `try` block rather than the handler.
+#[cfg(test)]
 fn for_iter_frame_has_raising_named_handler(code: &pyre_interpreter::CodeObject) -> bool {
     use pyre_interpreter::Instruction as I;
     let num_instrs = code.instructions.len();
@@ -8864,7 +8861,7 @@ fn const_pool_slot_upper_bound(c: &pyre_interpreter::ConstantData) -> usize {
 /// already relies on.
 ///
 /// The second element is the census key for the decline, naming the specific
-/// arm that produced it. `CurrentFrameOnly` is reached from four unrelated
+/// arm that produced it. `CurrentFrameOnly` is reached from three unrelated
 /// predicates, so the shape alone does not say which defect kept the frame
 /// interpreted; the key does. It is `""` for [`UnsupportedJitShape::None`].
 fn unsupported_jit_shape(
@@ -9001,22 +8998,11 @@ fn unsupported_jit_shape_uncached(
         // A `finally`-duplicated loop stays interpreted: its exhaustion
         // side-exit resumes through the lossy carry-forward `pc_map` and lands
         // at the exceptional copy with an empty stack (see
-        // `for_iter_frame_is_finally_duplicated`). A handler that binds the
-        // caught exception and then raises re-aborts the walk for the whole run,
-        // and an abort with an item in flight drops that iteration (see
-        // `for_iter_frame_has_raising_named_handler`).
-        // Tested one at a time rather than as one `||` so the census names the
-        // predicate that fired; the three are unrelated defects.
+        // `for_iter_frame_is_finally_duplicated`).
         if for_iter_frame_is_finally_duplicated(code) {
             return (
                 UnsupportedJitShape::CurrentFrameOnly,
                 "FrameShape::CurrentFrameOnly/ForIterFinallyDuplicated",
-            );
-        }
-        if for_iter_frame_has_raising_named_handler(code) {
-            return (
-                UnsupportedJitShape::CurrentFrameOnly,
-                "FrameShape::CurrentFrameOnly/ForIterRaisingNamedHandler",
             );
         }
     }
@@ -9080,7 +9066,7 @@ fn eval_with_jit_inner(
     // Every declining shape runs the frame in the plain interpreter, so the
     // tracer never sees it. Record the decline in the census — keyed by the
     // predicate that fired, not just the shape — rather than leaving a silent
-    // no-token gap. `CurrentFrameOnly` covers four unrelated defects and
+    // no-token gap. `CurrentFrameOnly` covers three unrelated defects and
     // `ConstEncodingOverflow` is not a defect at all (the frame genuinely
     // cannot be encoded), so one key per shape cannot rank them. The key comes
     // from the memoized `unsupported_jit_shape`, read only on the decline path
@@ -15352,11 +15338,10 @@ mod tests {
     }
 
     #[test]
-    fn for_iter_frame_with_raising_named_handler_is_declined() {
-        // `except ValueError as e:` whose body re-raises reaches the `as`
-        // cleanup tail (`DELETE_FAST e; RERAISE 1`) on every visit. Tracing that
-        // tail re-aborts for the whole run, and an abort with a `FOR_ITER` item
-        // in flight drops that iteration, so the frame must stay interpreted.
+    fn for_iter_frame_with_raising_named_handler_still_traces() {
+        // `except ValueError as e: raise e` reaches the cleanup tail. The
+        // bridge seeds `last_exc_value` from the frame, so the loop stays
+        // traceable (`can_enter_jit` is unconditional upstream).
         use pyre_interpreter::compile_exec;
         let module = compile_exec(
             "def r(n):\n    acc = 0\n    for i in range(n):\n        try:\n            try:\n                if i % 3 == 0:\n                    raise ValueError\n            except ValueError as e:\n                raise e\n        except ValueError:\n            acc += 9\n    return acc\n",
@@ -15364,33 +15349,65 @@ mod tests {
         .expect("test code should compile");
         let code = function_code_from_module(&module, "r");
         assert!(for_iter_frame_has_raising_named_handler(&code));
-        assert_eq!(
-            unsupported_jit_shape(&code),
-            (
-                UnsupportedJitShape::CurrentFrameOnly,
-                "FrameShape::CurrentFrameOnly/ForIterRaisingNamedHandler"
-            )
+        assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
+    }
+
+    #[test]
+    fn traceback_while_beside_raising_named_handler_still_traces() {
+        // `exception_reraise_tb_depth_hot`: both the `for` that re-raises
+        // through `except as` and the traceback `while` are natural loops
+        // `can_enter_jit` traces on their own back-edges.
+        use pyre_interpreter::{Instruction as I, compile_exec};
+        let module = compile_exec(
+            "def hot(n):\n    s = set()\n    for i in range(n):\n        try:\n            try:\n                raise KeyError(i)\n            except KeyError as e:\n                raise e\n        except KeyError as e2:\n            tb = e2.__traceback__\n            d = 0\n            while tb is not None:\n                d += 1\n                tb = tb.tb_next\n            s.add(d)\n    return len(s)\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&module, "hot");
+        assert!(for_iter_frame_has_raising_named_handler(&code));
+        assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
+
+        let backward_target = |pc: usize, instr: I, op_arg: pyre_interpreter::OpArg| match instr {
+            I::JumpBackward { delta } => {
+                Some(skip_caches(&code, pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
+            }
+            I::JumpBackwardNoInterrupt { delta } => {
+                Some((pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
+            }
+            _ => None,
+        };
+        let mut for_header = None;
+        let mut headers: Vec<usize> = Vec::new();
+        let mut arg_state = pyre_interpreter::OpArgState::default();
+        for (pc, unit) in code.instructions.iter().copied().enumerate() {
+            let (instr, op_arg) = arg_state.get(unit);
+            if matches!(instr, I::ForIter { .. }) {
+                for_header = Some(pc);
+            }
+            if let Some(target) = backward_target(pc, instr, op_arg)
+                && !headers.contains(&target)
+            {
+                headers.push(target);
+            }
+        }
+        let for_header = for_header.expect("for header");
+        assert!(
+            headers.iter().any(|header| *header != for_header),
+            "the traceback while is a separate back-edge"
         );
     }
 
     #[test]
-    fn for_iter_module_raising_named_handler_is_declined() {
+    fn for_iter_module_raising_named_handler_still_traces() {
         // Module-level `except E as e: raise e` binds with STORE_NAME and
-        // clears with DELETE_NAME.  The dropped-item hazard is the same as
-        // the function-local STORE_FAST spelling above.
+        // clears with DELETE_NAME. The bridge seed covers that tail the same
+        // way as the function-local spelling, so the module frame is traced.
         use pyre_interpreter::compile_exec;
         let code = compile_exec(
             "for i in range(3):\n    try:\n        try:\n            raise ValueError\n        except ValueError as e:\n            raise e\n    except ValueError:\n        pass\n",
         )
         .expect("test code should compile");
         assert!(for_iter_frame_has_raising_named_handler(&code));
-        assert_eq!(
-            unsupported_jit_shape(&code),
-            (
-                UnsupportedJitShape::CurrentFrameOnly,
-                "FrameShape::CurrentFrameOnly/ForIterRaisingNamedHandler"
-            )
-        );
+        assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
     #[test]

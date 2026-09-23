@@ -7276,9 +7276,7 @@ impl CodeWriter {
             // arms that `continue` out of the dispatch instead of completing
             // their stack model — the `Call` nargs > 14 arm (which bails
             // before touching the operands, so nothing pushes the call result
-            // the fall-through PC expects) and the `LoadFastCheck` unbound arm
-            // (which switches into a dedicated dead-end block that has no
-            // successor by construction).
+            // the fall-through PC expects).
             ($py_pc:expr, closes_block) => {{
                 emit_abort_permanent!(@emit $py_pc, true)
             }};
@@ -7512,6 +7510,45 @@ impl CodeWriter {
                     append_exit(&current_block.block(), link);
                 }
                 needs_fallthrough = false;
+            }};
+        }
+
+        // Unbound-local raise shared by `LOAD_FAST_CHECK` (`pyopcode.py`
+        // `_load_fast_failed`) and both `DELETE_FAST` arms. `last_instr`
+        // stays at the failing opcode so exception unwind and deopt share
+        // its frame coordinate.
+        macro_rules! emit_unbound_local_raise {
+            ($idx:expr, $py_pc:expr) => {{
+                let py_pc: usize = $py_pc;
+                let v_li: super::flow::FlowValue =
+                    super::flow::Constant::signed(py_pc as i64 - 1).into();
+                record_graph_op(
+                    &current_block.block(),
+                    "setfield_vable_i",
+                    vable_setfield_int_graph_args(
+                        frame_var.into(),
+                        v_li.into(),
+                        VABLE_LAST_INSTR_FIELD_IDX,
+                    ),
+                    None,
+                    py_pc as i64,
+                );
+                let code_const: super::flow::FlowValue = super::flow::Constant::new(
+                    super::flow::ConstantValue::Signed(w_code as i64),
+                    Some(Kind::Ref),
+                )
+                .into();
+                let name_idx_const: super::flow::FlowValue =
+                    super::flow::Constant::signed($idx as i64).into();
+                let exc_value = emit_graph_op_with_result(
+                    &mut graph,
+                    &current_block.block(),
+                    "unbound_local_error",
+                    vec![code_const.into(), name_idx_const.into()],
+                    Kind::Ref,
+                    py_pc as i64,
+                );
+                emit_raise!(0u16, exc_value.into(), py_pc as i64, true);
             }};
         }
 
@@ -13114,9 +13151,15 @@ impl CodeWriter {
                             // `ConstantValue::None` sentinel represents the
                             // statically-unbound form. The walker has no SSA
                             // value for either shape, so read the physical frame
-                            // slot and guard its nullness. The bound arm keeps
-                            // compiling; the null arm aborts at this opcode so
-                            // the interpreter re-runs LOAD_FAST_CHECK and raises.
+                            // slot and guard its nullness. `pyopcode.py`
+                            // `LOAD_FAST` pushes only after that test;
+                            // `if w_value is None: self._load_fast_failed(varindex)`
+                            // and `_load_fast_failed` is `@dont_inline` and raises
+                            // `UnboundLocalError`. The null arm builds that
+                            // exception with `unbound_local_error` and `raise`,
+                            // the same split as `DELETE_FAST`: the helper takes
+                            // the code object and the name index, not the null
+                            // local. `emit_raise!` attaches the handler edge.
                             let local_value = current_state.local_value_at(idx as usize);
                             if local_value.is_none()
                                 || matches!(
@@ -13125,7 +13168,6 @@ impl CodeWriter {
                                         if c.value == super::flow::ConstantValue::None
                                 )
                             {
-                                exception_edge_handled = true;
                                 emit_load_fast_ref!(current_depth, idx, py_pc);
                                 let _value_reg = emit_popvalue_ref!(current_depth, py_pc);
                                 let value_value = pop_ref_or_fresh(&mut current_state, &mut graph);
@@ -13140,28 +13182,45 @@ impl CodeWriter {
                                 current_block.block().borrow_mut().exitswitch =
                                     Some(super::flow::ExitSwitch::Value(truth.into()));
 
-                                push_and_bump!(value_value, py_pc);
+                                // The result push belongs on each arm, not on
+                                // the switch block: a push before the branch
+                                // would publish a slot the raising arm never
+                                // pushed (`LOAD_FAST` pushes only on the
+                                // non-null path).
+                                // The dynamic null check splits the raising arm
+                                // explicitly (`emit_raise!`). Its successful
+                                // continuation cannot raise and must not
+                                // receive the generic per-op catch edge.
+                                exception_edge_handled = true;
                                 let fallthrough_py_pc = py_pc + 1;
-                                mergeblock(
-                                    code,
-                                    &mut graph,
-                                    &mut joinpoints,
-                                    &current_block,
-                                    &{
-                                        let mut s = current_state.clone();
-                                        s.next_offset = fallthrough_py_pc;
-                                        s.blocklist =
-                                            frame_blocks_for_offset(code, fallthrough_py_pc);
-                                        s
-                                    },
-                                    fallthrough_py_pc,
-                                    &mut pendingblocks,
-                                    &mut all_walker_blocks,
+                                let arm_depth = current_depth;
+                                let threaded_local =
+                                    value_value.as_variable().map(super::flow::FlowValue::from);
+
+                                let bound_state = current_state.clone();
+                                let bound_block = SpamBlockRef::new(
+                                    graph.new_block(Vec::new()),
+                                    Some(bound_state.clone()),
+                                );
+                                let mut bound_inputs = bound_state.getvariables();
+                                if let Some(threaded) = threaded_local.clone()
+                                    && !bound_inputs.iter().any(|arg| arg == &threaded)
+                                {
+                                    bound_inputs.push(threaded);
+                                }
+                                bound_block.block().borrow_mut().inputargs = bound_inputs.clone();
+                                all_walker_blocks.push(bound_block.clone());
+                                append_exit(
+                                    &current_block.block(),
+                                    super::flow::Link::new(
+                                        bound_inputs,
+                                        Some(bound_block.block()),
+                                        None,
+                                    )
+                                    .into_ref(),
                                 );
                                 set_last_bool_exitcase(&current_block.block(), true);
 
-                                current_state.stack.pop();
-                                current_depth = current_depth.saturating_sub(1);
                                 let mut unbound_state = current_state.clone();
                                 unbound_state.next_offset = py_pc;
                                 unbound_state.blocklist = frame_blocks_for_offset(code, py_pc);
@@ -13182,34 +13241,60 @@ impl CodeWriter {
                                 );
                                 set_last_bool_exitcase(&current_block.block(), false);
 
+                                current_block = bound_block;
+                                current_state = bound_state;
+                                current_depth = arm_depth;
+                                push_and_bump!(value_value, py_pc);
+                                mergeblock(
+                                    code,
+                                    &mut graph,
+                                    &mut joinpoints,
+                                    &current_block,
+                                    &{
+                                        let mut s = current_state.clone();
+                                        s.next_offset = fallthrough_py_pc;
+                                        s.blocklist =
+                                            frame_blocks_for_offset(code, fallthrough_py_pc);
+                                        s
+                                    },
+                                    fallthrough_py_pc,
+                                    &mut pendingblocks,
+                                    &mut all_walker_blocks,
+                                );
+
+                                // `pyopcode.py` `_load_fast_failed` raises
+                                // before any push.
                                 current_block = unbound_block;
                                 current_state = unbound_state;
-                                // `closes_block`: the null arm's block is a
-                                // dead end by construction — the bound arm
-                                // already merged the fall-through PC above, so
-                                // nothing follows to close this one.
-                                emit_abort_permanent!(py_pc, closes_block);
-                                continue;
+                                current_depth = arm_depth;
+                                emit_unbound_local_raise!(idx, py_pc);
+                                needs_fallthrough = false;
+                            } else {
+                                let code_const: super::flow::FlowValue =
+                                    super::flow::Constant::new(
+                                        super::flow::ConstantValue::Signed(w_code as i64),
+                                        Some(Kind::Ref),
+                                    )
+                                    .into();
+                                let name_idx_const: super::flow::FlowValue =
+                                    super::flow::Constant::signed(idx as i64).into();
+                                emit_load_fast_ref!(current_depth, idx, py_pc);
+                                let _value_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let value_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                                let result_value = emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "load_fast_check",
+                                    vec![
+                                        value_value.into(),
+                                        code_const.into(),
+                                        name_idx_const.into(),
+                                    ],
+                                    Kind::Ref,
+                                    py_pc as i64,
+                                );
+                                push_and_bump!(result_value.into(), py_pc);
                             }
-                            let code_const: super::flow::FlowValue = super::flow::Constant::new(
-                                super::flow::ConstantValue::Signed(w_code as i64),
-                                Some(Kind::Ref),
-                            )
-                            .into();
-                            let name_idx_const: super::flow::FlowValue =
-                                super::flow::Constant::signed(idx as i64).into();
-                            emit_load_fast_ref!(current_depth, idx, py_pc);
-                            let _value_reg = emit_popvalue_ref!(current_depth, py_pc);
-                            let value_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            let result_value = emit_graph_op_with_result(
-                                &mut graph,
-                                &current_block.block(),
-                                "load_fast_check",
-                                vec![value_value.into(), code_const.into(), name_idx_const.into()],
-                                Kind::Ref,
-                                py_pc as i64,
-                            );
-                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // Loads that push +1.
@@ -13517,13 +13602,6 @@ impl CodeWriter {
                             let local_slot = local_to_vable_slot(idx) as i64;
                             let v_idx: super::flow::FlowValue =
                                 super::flow::Constant::signed(local_slot).into();
-                            let code_const: super::flow::FlowValue = super::flow::Constant::new(
-                                super::flow::ConstantValue::Signed(w_code as i64),
-                                Some(Kind::Ref),
-                            )
-                            .into();
-                            let name_idx_const: super::flow::FlowValue =
-                                super::flow::Constant::signed(idx as i64).into();
                             // pyopcode.py DELETE_FAST checks for an
                             // unbound local before clearing its slot. A
                             // statically unbound slot therefore raises
@@ -13533,29 +13611,7 @@ impl CodeWriter {
                                 Some(super::flow::FlowValue::Constant(c))
                                     if c.value == super::flow::ConstantValue::None
                             ) {
-                                let v_li: super::flow::FlowValue =
-                                    super::flow::Constant::signed(py_pc as i64 - 1).into();
-                                record_graph_op(
-                                    &current_block.block(),
-                                    "setfield_vable_i",
-                                    vable_setfield_int_graph_args(
-                                        frame_var.into(),
-                                        v_li.into(),
-                                        VABLE_LAST_INSTR_FIELD_IDX,
-                                    ),
-                                    None,
-                                    py_pc as i64,
-                                );
-                                let exc_value = emit_graph_op_with_result(
-                                    &mut graph,
-                                    &current_block.block(),
-                                    "unbound_local_error",
-                                    vec![code_const.into(), name_idx_const.into()],
-                                    Kind::Ref,
-                                    py_pc as i64,
-                                );
-                                let exc_flow: super::flow::FlowValue = exc_value.into();
-                                emit_raise!(0u16, exc_flow, py_pc as i64, true);
+                                emit_unbound_local_raise!(idx, py_pc);
                                 continue;
                             }
                             // The dynamic bound check below splits the
@@ -13604,35 +13660,10 @@ impl CodeWriter {
                             set_last_bool_exitcase(&current_block.block(), false);
 
                             // The unbound arm raises before any clear,
-                            // matching pyopcode.py DELETE_FAST. Keep
-                            // last_instr at the deleting instruction so
-                            // exception unwind and deopt share its frame
-                            // coordinate.
+                            // matching pyopcode.py DELETE_FAST.
                             current_block = unbound_block;
                             current_state = unbound_state;
-                            let v_li: super::flow::FlowValue =
-                                super::flow::Constant::signed(py_pc as i64 - 1).into();
-                            record_graph_op(
-                                &current_block.block(),
-                                "setfield_vable_i",
-                                vable_setfield_int_graph_args(
-                                    frame_var.into(),
-                                    v_li.into(),
-                                    VABLE_LAST_INSTR_FIELD_IDX,
-                                ),
-                                None,
-                                py_pc as i64,
-                            );
-                            let exc_value = emit_graph_op_with_result(
-                                &mut graph,
-                                &current_block.block(),
-                                "unbound_local_error",
-                                vec![code_const.into(), name_idx_const.into()],
-                                Kind::Ref,
-                                py_pc as i64,
-                            );
-                            let exc_flow: super::flow::FlowValue = exc_value.into();
-                            emit_raise!(0u16, exc_flow, py_pc as i64, true);
+                            emit_unbound_local_raise!(idx, py_pc);
 
                             // The bound arm is the continuing block. The
                             // clear is one PY_NULL write, matching
@@ -18600,8 +18631,16 @@ def f(n):
             .map(|op| op.opname)
             .collect();
         assert!(
-            opnames.contains(&"abort_permanent"),
-            "the undefined LOAD_FAST_CHECK must bail to the interpreter"
+            opnames.contains(&"ptr_nonzero"),
+            "the undefined LOAD_FAST_CHECK still null-tests the frame slot"
+        );
+        assert!(
+            opnames.contains(&"raise"),
+            "the null arm must raise UnboundLocalError"
+        );
+        assert!(
+            !opnames.contains(&"abort_permanent"),
+            "the undefined LOAD_FAST_CHECK must raise, not abort the trace"
         );
     }
 
@@ -18677,7 +18716,14 @@ def f(n):
             .map(|op| op.opname)
             .collect();
         assert!(opnames.contains(&"ptr_nonzero"));
-        assert!(opnames.contains(&"abort_permanent"));
+        assert!(
+            opnames.contains(&"raise"),
+            "the null arm must raise UnboundLocalError"
+        );
+        assert!(
+            !opnames.contains(&"abort_permanent"),
+            "an unbound LOAD_FAST_CHECK must raise, not abort the trace"
+        );
     }
 
     #[test]

@@ -5953,12 +5953,21 @@ pub(crate) fn flush_locals_region_to_frame(ctx: &TraceCtx, frame: usize) -> bool
             return false;
         };
         let boxed = boxed_slot_value_for_type(Type::Ref, &value);
+        // Boxing an Int/Float slot allocates. A JIT-created frame can be
+        // nursery-resident, so a minor collection here moves it; store
+        // through the frame's current address and its current array.
+        let frame_now =
+            pyre_object::gc_hook::try_gc_current_object_address(frame as *mut u8) as usize;
+        let arr_ptr = unsafe {
+            *((frame_now as *const u8).add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+                as *const *mut pyre_object::FixedObjectArray)
+        };
         unsafe {
             (*arr_ptr).as_mut_slice()[abs] = boxed;
         }
-        // Boxing an Int/Float slot allocates, and each minor collection
-        // consumes the array's remembered-set entry, so re-arm per store.
-        frame_array_write_barrier(frame as *mut u8, arr_ptr);
+        // Each minor collection consumes the array's remembered-set entry,
+        // so re-arm per store.
+        frame_array_write_barrier(frame_now as *mut u8, arr_ptr);
     }
     if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
         eprintln!("[fbw-flush] locals-region written: nlocals={nlocals} clobbered={clobbered:?}");

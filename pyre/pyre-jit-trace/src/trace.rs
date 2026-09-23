@@ -5233,10 +5233,17 @@ fn run_perfn_walk<Sym: WalkSym>(
         // `walk_abort_adopted` is a blackhole terminal in exactly that sense:
         // the chain ran forward from the flushed frame, so restoring the
         // pre-flush image here would roll the vable back underneath it.
+        // A loop-end flush that already committed is the same kind of owner:
+        // the portal copies that snapshot onto the live frame after this
+        // returns, and restoring first would only be undone. The marker
+        // flush below has not run yet, so a walk that is still uncommitted
+        // restores, and a marker commit that then succeeds replaces the
+        // snapshot the portal copies.
         if crate::jitcode_dispatch::take_escape_flush_undo_pending()
             && !force_blackhole_adopted
             && !escape_pc_adopted
             && !walk_abort_adopted
+            && !WALK_END_FLUSH_COMMITTED.with(|c| c.get())
         {
             crate::jitcode_dispatch::restore_escape_flush_undo();
         }
@@ -5408,6 +5415,12 @@ fn run_perfn_walk<Sym: WalkSym>(
                             }
                             // The abort pc IS where the walk stopped; the
                             // unjournaled/sub-walk check above is the gate.
+                            // The resume is that opcode, which is already past
+                            // the `FOR_ITER` consume when the marker sits in
+                            // the loop body (`LOAD_FAST_CHECK`'s null arm).
+                            // Drop the in-flight item so the legacy deliver
+                            // cannot push it again or roll the cursor back.
+                            crate::jitcode_dispatch::fbw_foriter_inflight_clear();
                             let _ =
                                 commit_walk_end(WalkEndCommitLeg::AbortPc, WalkEndResume::Terminal);
                         } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {

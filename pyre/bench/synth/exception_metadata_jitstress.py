@@ -1,13 +1,11 @@
 # pyre-check: max-pypy-ratio=15
 # Locals for except-as stop the module-dict `version?` revoke storm
 # (`celldict.py notify_version_watchers`), so pypy compiles these
-# sections. The same `run()` still has FOR_ITER plus
-# `except E as e: raise ...` and is
-# `for_iter_frame_has_raising_named_handler` — a whole-frame
-# CurrentFrameOnly screen, because an abort with a FOR_ITER item in
-# flight drops that iteration (#57). pyre therefore interprets while
-# pypy compiles. CI cranelift/dynasm sit at 6–12×; 15 is that ceiling
-# plus 15% headroom. Do not lift the screen to chase this gate.
+# sections. `run()`'s `for` deletes the `except E as e` name and then
+# reads it. That `LOAD_FAST_CHECK` null arm raises `UnboundLocalError`
+# (`pyopcode.py` `LOAD_FAST` / `_load_fast_failed`) and the tracer
+# follows the `raise` into the `except NameError` handler. Output
+# matches pypy, including `name_cleared`. The ceiling stays 15.
 # JIT-stress twin of exception_metadata_hot: `pypyjit.set_param` lowers the
 # trace/function thresholds to 1 so recording fires on the earliest iterations
 # of every section rather than only after the ~1600-iteration warmup. That
