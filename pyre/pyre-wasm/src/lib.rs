@@ -1152,7 +1152,7 @@ fn run_python_impl(source: &str) -> String {
     // pylifecycle.c init_importlib, the step `run_script_path` runs before
     // `site`: install the importlib bootstrap so `builtins.__import__` routes
     // imports through `sys.meta_path` / `sys.path_hooks` from the first user
-    // statement. Without it `sys.modules` holds no `importlib._bootstrap` and
+    // statement. Without it `sys.modules` holds no `_frozen_importlib` and
     // every import on this launcher is served natively, so `sys.meta_path`
     // stays empty and no module carries a real `__spec__`.
     //
