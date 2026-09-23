@@ -572,7 +572,7 @@ pub fn spdiag_enabled() -> bool {
 /// "bridges are off" while they keep recording.
 pub fn no_bridge_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("MAJIT_NO_BRIDGE").is_some())
+    *FLAG.get_or_init(|| crate::jit_env::env_var_os("MAJIT_NO_BRIDGE").is_some())
 }
 /// `MAJIT_SKIP_BRIDGES=a,b,...` (diagnostic): decline exactly the listed
 /// `MAJIT_MAX_BRIDGES` sequence numbers and take every other one.  Where the
@@ -584,7 +584,7 @@ pub fn no_bridge_enabled() -> bool {
 fn bridge_fuel_skip_set() -> &'static [u64] {
     static SET: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     SET.get_or_init(|| {
-        std::env::var("MAJIT_SKIP_BRIDGES")
+        crate::jit_env::env_var("MAJIT_SKIP_BRIDGES")
             .map(|v| v.split(',').filter_map(|p| p.trim().parse().ok()).collect())
             .unwrap_or_default()
     })
@@ -611,11 +611,8 @@ fn bridge_fuel_skipped(n: u64) -> bool {
 /// every bridge that entry point reaches.
 pub fn bridge_fuel_take() -> bool {
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    let limit = *LIMIT.get_or_init(|| {
-        std::env::var("MAJIT_MAX_BRIDGES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-    });
+    let limit = *LIMIT
+        .get_or_init(|| crate::jit_env::env_var("MAJIT_MAX_BRIDGES").and_then(|v| v.parse().ok()));
     // The sequence number belongs to the pair, not to the limit: the skip list
     // names positions in this same count, so a run that configures only the
     // skip list still has to number the bridges it takes. Numbering only when a

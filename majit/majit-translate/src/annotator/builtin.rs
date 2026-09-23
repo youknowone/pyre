@@ -519,11 +519,12 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // `extregistry.lookup`, which returns the SomeBuiltin whose
     // `compute_result_annotation` produces
     // `SomeInteger(knowntype=Ruint, unsigned=True)`.
-    // lltype.py — `@analyzer_for(cast_ptr_to_int)` and
-    // `@analyzer_for(cast_int_to_ptr)`.  `front::mir` lowers a
-    // `Ref ↔ Int` cast to a `simple_call` against the matching
+    // lltype.py — `@analyzer_for(cast_ptr_to_int)`,
+    // `@analyzer_for(cast_int_to_ptr)`, `@analyzer_for(direct_ptradd)`.
+    // `front::mir` lowers a `Ref ↔ Int` cast and a pointer-typed
+    // `<*mut T>::add` to a `simple_call` against the matching
     // `lltype.*` HostObject, so the annotation pass routes through these
-    // analyzers when the cast surface lands in user code.  Keyed by the
+    // analyzers when that surface lands in user code.  Keyed by the
     // `qualname` that
     // `HostObject::new_builtin_callable("lltype.cast_ptr_to_int")`
     // produces (`bookkeeper.rs`'s `immutablevalue_hostobject` reads
@@ -531,6 +532,7 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // for `SomeBuiltin.analyser_name`).
     analyzer_for(&mut reg, "lltype.cast_ptr_to_int", lltype_cast_ptr_to_int);
     analyzer_for(&mut reg, "lltype.cast_int_to_ptr", lltype_cast_int_to_ptr);
+    analyzer_for(&mut reg, "lltype.direct_ptradd", lltype_direct_ptradd);
     analyzer_for(
         &mut reg,
         "rpython.rlib.objectmodel.instantiate",
@@ -2026,6 +2028,39 @@ fn lltype_cast_ptr_to_int(
     Ok(SomeValue::Integer(SomeInteger::default()))
 }
 
+/// Upstream `ann_direct_ptradd(s_p, s_n)`
+/// (`rpython/rtyper/lltypesystem/lltype.py` `ann_direct_ptradd`).
+///
+/// ```python
+/// @analyzer_for(direct_ptradd)
+/// def ann_direct_ptradd(s_p, s_n):
+///     assert isinstance(s_p, SomePtr), "direct_* of non-pointer: %r" % s_p
+///     return s_p
+/// ```
+///
+/// The result annotation is the pointer operand's.  A classdef-less
+/// `SomeInstance` is the erased raw-pointer shell used here; `SomePtr`
+/// is the `lltype.Ptr` spelling.  Either is a pointer, so a
+/// `null_mut()` arm of the same pointer unions with the add.
+fn lltype_direct_ptradd(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if !kwds.is_empty() || args_s.len() != 2 {
+        return Err(AnnotatorError::new(
+            "direct_ptradd expects a pointer and a count",
+        ));
+    }
+    let s_p = arg_at(args_s, 0, "lltype.direct_ptradd");
+    match s_p {
+        SomeValue::Instance(_) | SomeValue::Ptr(_) => Ok(s_p.clone()),
+        other => Err(AnnotatorError::new(format!(
+            "direct_ptradd of non-pointer: {other:?}"
+        ))),
+    }
+}
+
 /// Upstream `ann_cast_int_to_ptr(PtrT, s_int)`
 /// (rpython/rtyper/lltypesystem/lltype.py:2379-2382).
 ///
@@ -2935,6 +2970,33 @@ mod tests {
     }
 
     #[test]
+    fn cast_instance_intrinsic_wtf8_root_projects_root_instance_to_somestring() {
+        // `w_str_get_wtf8(obj)` paints dest through this string-root
+        // marker (`front/mir.rs` `cast_instance_call_result("Wtf8", …,
+        // ValueType::Str)`).  `project_struct_field_type("Wtf8")` is
+        // SomeString; a PyObject instance operand must narrow to that
+        // shell rather than keep SomeInstance.
+        let bk = bk();
+        let classdef = ClassDef::new_standalone("pyobject::PyObject", None);
+        let s_obj =
+            SomeValue::Instance(SomeInstance::new(Some(classdef), false, Default::default()));
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("Wtf8"))
+            .expect("Wtf8 root constant");
+        let out = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_obj), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("string-root cast_instance_intrinsic must accept a PyObject instance");
+        assert!(
+            matches!(out, SomeValue::String(_)),
+            "Wtf8 root must project dest as SomeString, got {out:?}"
+        );
+    }
+
+    #[test]
     fn call_builtin_unknown_name_errors() {
         let bk = bk();
         let err = call_builtin(&bk, "definitely_not_a_builtin", &[], &no_kwds()).unwrap_err();
@@ -3482,6 +3544,7 @@ mod tests {
             ("rpython.rlib.objectmodel", "free_non_gc_object"),
             ("rpython.rtyper.lltypesystem.lltype", "cast_ptr_to_int"),
             ("rpython.rtyper.lltypesystem.lltype", "cast_int_to_ptr"),
+            ("rpython.rtyper.lltypesystem.lltype", "direct_ptradd"),
         ];
         let mut missing: Vec<(String, String)> = Vec::new();
         for (module_path, attr) in cases {
@@ -3520,9 +3583,13 @@ mod tests {
         let cast_i2p = lltype
             .module_get("cast_int_to_ptr")
             .expect("F1 registered cast_int_to_ptr attr on lltype");
+        let direct_ptradd = lltype
+            .module_get("direct_ptradd")
+            .expect("F1 registered direct_ptradd attr on lltype");
         // What `immutablevalue_hostobject` will use as analyser_name.
         let q_p2i = cast_p2i.qualname();
         let q_i2p = cast_i2p.qualname();
+        let q_add = direct_ptradd.qualname();
         assert!(
             super::is_registered(q_p2i),
             "F2 analyzer must be registered under the qualname \
@@ -3533,6 +3600,12 @@ mod tests {
             super::is_registered(q_i2p),
             "F2 analyzer must be registered under the qualname \
              bookkeeper produces. Got qualname {q_i2p:?} which is \
+             NOT in BUILTIN_ANALYZERS — call_builtin would fail."
+        );
+        assert!(
+            super::is_registered(q_add),
+            "F2 analyzer must be registered under the qualname \
+             bookkeeper produces. Got qualname {q_add:?} which is \
              NOT in BUILTIN_ANALYZERS — call_builtin would fail."
         );
     }

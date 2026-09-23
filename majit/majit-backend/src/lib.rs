@@ -4316,11 +4316,11 @@ pub trait Backend: Send {
     ///   struct = lltype.cast_opaque_ptr(rclass.OBJECTPTR, struct)
     ///   return ptr2int(struct.typeptr)
     ///
-    /// That is the same `struct.typeptr` read `cls_of_box` performs, so both
+    /// That is the same `struct.typeptr` read `cls_of_gcref` performs, so both
     /// go through one place and a backend with a different object model
-    /// overrides `cls_of_box` alone.
+    /// overrides `cls_of_gcref` alone.
     fn bh_classof(&self, obj_ptr: i64) -> i64 {
-        self.cls_of_box(obj_ptr)
+        self.cls_of_gcref(obj_ptr)
     }
     /// RPython rclass.ll_issubclass(typeptr, bounding_class).
     /// Returns true if `typeptr` is a subclass of `bounding_class`.
@@ -4422,16 +4422,12 @@ pub trait Backend: Send {
         gcref.as_usize() as i64
     }
 
-    /// model.py cpu.cls_of_box(box):
-    ///   obj = lltype.cast_opaque_ptr(OBJECTPTR, box.getref_base())
-    ///   return ConstInt(ptr2int(obj.typeptr))
-    ///
-    /// Read the class pointer (typeptr/vtable) from a runtime Ref object.
+    /// Read the class word (typeptr/vtable) at offset 0 of a raw gcref.
     /// Default reads offset 0 (standard RPython object layout).
     /// Backends with different object models (e.g. gcremovetypeptr)
     /// should override.
-    fn cls_of_box(&self, raw_ref: i64) -> i64 {
-        debug_assert!(raw_ref != 0, "cls_of_box: null ref");
+    fn cls_of_gcref(&self, raw_ref: i64) -> i64 {
+        debug_assert!(raw_ref != 0, "cls_of_gcref: null ref");
         unsafe { *(raw_ref as *const usize) as i64 }
     }
 }

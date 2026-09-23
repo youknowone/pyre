@@ -17,6 +17,12 @@ use super::rmodel::{Repr, ReprState};
 pub enum ExternalAnnotation {
     Float,
     Int,
+    /// `SomeInteger(unsigned=True)` / `KnownType::Ruint` — the annotation
+    /// `rint.py` `IntegerRepr` lowers to `Unsigned`.  `register_external`
+    /// takes Python `int` upstream; the unsigned split is the rtyper
+    /// knowntype, surfaced here so a `u32` residual result does not
+    /// collapse to signed `Int`.
+    Unsigned,
     Bool,
     None,
     Tuple(Vec<ExternalAnnotation>),
@@ -27,6 +33,7 @@ impl ExternalAnnotation {
         match self {
             ExternalAnnotation::Float => s_float(),
             ExternalAnnotation::Int => s_int(),
+            ExternalAnnotation::Unsigned => s_unsigned(),
             ExternalAnnotation::Bool => s_bool(),
             ExternalAnnotation::None => SomeValue::None_(SomeNone::new()),
             ExternalAnnotation::Tuple(items) => {
@@ -290,6 +297,10 @@ fn s_int() -> SomeValue {
     SomeValue::Integer(SomeInteger::new(false, false))
 }
 
+fn s_unsigned() -> SomeValue {
+    SomeValue::Integer(SomeInteger::new(false, true))
+}
+
 fn s_bool() -> SomeValue {
     SomeValue::Bool(SomeBool::new())
 }
@@ -353,5 +364,17 @@ mod tests {
         assert!(matches!(repr.lowleveltype(), LowLevelType::Void));
         let ptr = repr.get_funcptr(vec![LowLevelType::Float], LowLevelType::Float);
         assert!(is_external(&ConstValue::LLPtr(Box::new(ptr))));
+    }
+
+    #[test]
+    fn unsigned_external_annotation_is_nonconst_ruint() {
+        let s = ExternalAnnotation::Unsigned.annotation();
+        match s {
+            SomeValue::Integer(si) => {
+                assert!(si.unsigned);
+                assert!(si.base.const_box.is_none());
+            }
+            other => panic!("expected SomeInteger, got {other:?}"),
+        }
     }
 }

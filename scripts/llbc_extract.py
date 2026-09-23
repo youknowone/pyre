@@ -1466,14 +1466,20 @@ def charon_cargo_target_dir(root: Path) -> Path:
     Charon's rustc is a different compiler from the stable build. Sharing
     `target/` with it either rebuilds the whole graph (metadata rustc hash)
     or, with incremental on, fuses CGUs from the two sessions. A dedicated
-    directory lets CI cache the nightly deps without bloating rust-cache,
-    and lets worktrees share them via `PYRE_SHARED_BUILD`.
+    directory lets CI cache the nightly deps without bloating rust-cache.
+    Peer worktrees must not share one cache: two checkouts compiling the
+    same crate at different revisions produce phantom E0425 errors against
+    a mixed incremental store, so the default is a subdirectory keyed by
+    a hash of the resolved worktree path — basename collides when two
+    checkouts share a folder name. An explicit `CHARON_TARGET_DIR` still
+    wins.
     """
     if value := os.environ.get("CHARON_TARGET_DIR"):
         return Path(value)
     repo_parent = root.parent
     shared = Path(os.environ.get("PYRE_SHARED_BUILD", repo_parent / ".pyre-build"))
-    return shared / "charon-target"
+    key = hashlib.sha256(os.fsencode(root.resolve())).hexdigest()[:16]
+    return shared / "charon-target" / key
 
 
 def llbc_dest_path(out_dir: Path, root: Path) -> Path:

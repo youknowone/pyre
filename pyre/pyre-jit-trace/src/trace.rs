@@ -5129,6 +5129,28 @@ fn run_perfn_walk<Sym: WalkSym>(
         let force_blackhole_adopted = vable_escaped
             && try_adopt_blackhole(ctx, cf_addr, live_root_addr, WalkEndCommitLeg::VableEscape);
         let mut escape_pc_adopted = false;
+        // What a VableEscape whose adopt did not commit must do once the walk
+        // has already applied heap writes: replaying the traced region would
+        // execute those writes a second time, so keep the flushed frame
+        // (`virtualizable.py write_boxes` has no undo once the vable is
+        // forced) and take the no-replay resume instead of legacy replay.
+        // `AfterApplied` is always provable, so this commit always lands.
+        let keep_flushed_frame_after_applied = || {
+            let _ = commit_walk_end(WalkEndCommitLeg::VableEscape, WalkEndResume::AfterApplied);
+            crate::jitcode_dispatch::discard_escape_flush_undo();
+            // Same live→snapshot mirror as the exact-escape commit: the portal
+            // copies `executed_frame` onto the live frame, so a stale snapshot
+            // would overwrite the flushed resume state while heap writes stay
+            // committed and replay is off.
+            if live_root_addr != 0 && cf_addr != 0 && live_root_addr != cf_addr {
+                unsafe {
+                    (*(cf_addr as *mut pyre_interpreter::PyFrame)).restore_resume_state_from(
+                        &*(live_root_addr as *const pyre_interpreter::PyFrame),
+                    );
+                }
+            }
+            crate::jitcode_dispatch::fbw_foriter_inflight_clear();
+        };
         if trace_too_long_adopted && crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!("[fbw-blackhole] adopted ABORT_TOO_LONG forward resume");
         }
@@ -5174,6 +5196,10 @@ fn run_perfn_walk<Sym: WalkSym>(
                 // the legacy deliver cannot re-apply one.
                 crate::jitcode_dispatch::fbw_foriter_inflight_clear();
                 WALK_END_RESTART_PC.with(|c| c.set(Some(resume_py_pc)));
+            } else if crate::jitcode_dispatch::fbw_executed_effect_count() > 0 {
+                // The rewind commit was declined, but the walk already applied
+                // heap writes, so the pre-flush restore below is not available.
+                keep_flushed_frame_after_applied();
             } else {
                 // Put the live frame back to its pre-flush state: the legacy
                 // replay's contract is that the frame still holds pre-walk
@@ -5187,6 +5213,13 @@ fn run_perfn_walk<Sym: WalkSym>(
                     );
                 }
             }
+        }
+        // No adopt took the escape, and the walk already applied heap writes.
+        if vable_escaped
+            && !WALK_END_FLUSH_COMMITTED.with(|c| c.get())
+            && crate::jitcode_dispatch::fbw_executed_effect_count() > 0
+        {
+            keep_flushed_frame_after_applied();
         }
         // The force arm withdrew its commit and DEFERRED the frame restore to
         // here.  Neither continuation that keeps the flushed frame ran, so the

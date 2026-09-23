@@ -117,6 +117,12 @@ pub fn fbw_depth_census_summary() -> String {
 /// builds the interpreter with.
 pub use majit_gc::collector::{GC_ENV_NAMES, set_supplied_env as set_gc_supplied_env};
 
+/// The `PYRE_NO_JIT` / `MAJIT_NO_BRIDGE` variables the JIT knobs resolve
+/// against, and the setter for an embedder whose platform hands the process
+/// no environment to read them out of. Re-exported so such a host reaches
+/// them through the crate it already builds the interpreter with.
+pub use majit_metainterp::jit_env::{JIT_ENV_NAMES, set_supplied_env as set_jit_supplied_env};
+
 /// Diagnostic only: `(oldgen_total_bytes, nursery_used_bytes)` of the wasm
 /// backend's GC on this thread. Lets the wasm runner attribute guest
 /// linear-memory growth to GC-retained objects vs. host-heap allocations.

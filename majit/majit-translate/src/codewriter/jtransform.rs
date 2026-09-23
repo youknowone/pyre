@@ -4079,6 +4079,64 @@ impl<'a> Transformer<'a> {
         )
     }
 
+    /// `jtransform.py rewrite_op_direct_ptradd`.  The count is already a
+    /// byte offset (front scaled `n * sizeof(T)` when the pointee size
+    /// was known), so this is the `CCHARP` arm: `int_add` of the
+    /// address integer and the shift.  Raw pointers are Ref here, so
+    /// the add is `cast_ptr_to_int` + `int_add` + `cast_int_to_ptr`
+    /// rather than `int_add` of two ints — each alias stays inside one
+    /// bank (`value_type_bank`).
+    fn rewrite_op_direct_ptradd(
+        &mut self,
+        op: &SpaceOperation,
+        args: &[crate::flowspace::model::Variable],
+        result_ty: &ValueType,
+        graph: &mut FunctionGraph,
+    ) -> RewriteResult {
+        let [ptr, shift] = args else {
+            return RewriteResult::Keep;
+        };
+        let (addr, mut ops) = self.coerce_operand_to_int(graph, ptr);
+        let (shift_i, shift_ops) = self.coerce_operand_to_int(graph, shift);
+        ops.extend(shift_ops);
+        if matches!(result_ty, ValueType::Ref(_)) {
+            let sum = self.fresh_synthetic_variable_typed(
+                graph,
+                crate::codewriter::type_state::ConcreteType::Signed,
+            );
+            ops.push(SpaceOperation {
+                result: Some(sum.clone()),
+                kind: OpKind::BinOp {
+                    op: "add".to_string(),
+                    lhs: addr,
+                    rhs: shift_i,
+                    result_ty: ValueType::Int,
+                },
+            });
+            self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
+            ops.push(SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::UnaryOp {
+                    op: "cast_int_to_ptr".into(),
+                    operand: sum,
+                    result_ty: result_ty.clone(),
+                },
+            });
+        } else {
+            self.stamp_value_kind_from_value_type(graph, op.result.clone(), &ValueType::Int);
+            ops.push(SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::BinOp {
+                    op: "add".to_string(),
+                    lhs: addr,
+                    rhs: shift_i,
+                    result_ty: ValueType::Int,
+                },
+            });
+        }
+        RewriteResult::Replace(ops)
+    }
+
     /// `jtransform.py rewrite_op_jit_force_virtualizable`.
     ///
     /// ```text
@@ -5049,6 +5107,9 @@ impl<'a> Transformer<'a> {
                 }
                 return RewriteResult::Identity(src);
             }
+            if is_lltype_cast_path(segments, "direct_ptradd") && args.len() == 2 {
+                return self.rewrite_op_direct_ptradd(op, args, result_ty, graph);
+            }
             if is_lltype_cast_path(segments, "cast_int_to_ptr")
                 && args.len() == 1
                 && matches!(result_ty, ValueType::Ref(_))
@@ -5326,9 +5387,10 @@ impl<'a> Transformer<'a> {
             }]);
         }
         // `len(s)` / `Wtf8::len` / `as_bytes().len()` on a string-byte-view
-        // is `ll_strlen`.  The rtyper path routes `__len` through
-        // `StringRepr.rtype_len`; `__strlen` is the Skip-spine marker
-        // the frontend plants when the place is a byte view.
+        // is `ll_strlen`.  The rtyper path routes `__len` / `__strlen`
+        // through `StringRepr.rtype_len`; a Skip-spine graph still sees
+        // the residual `__strlen` Call the frontend plants on a byte
+        // view, and this arm is that marker.
         if let CallTarget::FunctionPath { segments, .. } = target
             && segments.as_slice() == ["__strlen"]
             && args.len() == 1
@@ -14259,6 +14321,107 @@ mod tests {
             ValueType::Int,
         );
         assert_projected_unary(&rewritten, &arg, "cast_ptr_to_int", ValueType::Int);
+    }
+
+    #[test]
+    fn lltype_direct_ptradd_call_stays_bank_consistent() {
+        let mut graph = FunctionGraph::new("direct_ptradd_test");
+        let ptr = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "ptr".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&ptr, ConcreteType::GcRef);
+        let shift = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "n".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&shift, ConcreteType::Signed);
+        let result_ty = ValueType::Ref(None);
+        let target = CallTarget::function_path([
+            "rpython",
+            "rtyper",
+            "lltypesystem",
+            "lltype",
+            "direct_ptradd",
+        ]);
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: target.clone(),
+                    args: crate::model::call_args(vec![ptr.clone(), shift.clone()]),
+                    result_ty: result_ty.clone(),
+                },
+                true,
+            )
+            .unwrap();
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![ptr.clone(), shift.clone()]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let rewritten = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            &[ptr.clone(), shift.clone()],
+            &result_ty,
+            "direct_ptradd_test",
+            &mut graph,
+        );
+        match rewritten {
+            RewriteResult::Replace(ops) => {
+                assert!(
+                    ops.iter().any(|op| matches!(
+                        &op.kind,
+                        OpKind::UnaryOp { op, operand, result_ty: ty }
+                            if op == "cast_ptr_to_int" && operand == &ptr && *ty == ValueType::Int
+                    )),
+                    "direct_ptradd must take the address integer first; ops={ops:?}"
+                );
+                assert!(
+                    ops.iter().any(|op| matches!(
+                        &op.kind,
+                        OpKind::BinOp { op, result_ty: ty, .. }
+                            if op == "add" && *ty == ValueType::Int
+                    )),
+                    "direct_ptradd must int_add the byte offset; ops={ops:?}"
+                );
+                assert!(
+                    ops.iter().any(|op| matches!(
+                        &op.kind,
+                        OpKind::UnaryOp { op, result_ty: ty, .. }
+                            if op == "cast_int_to_ptr" && *ty == ValueType::Ref(None)
+                    )),
+                    "direct_ptradd must restore the Ref bank; ops={ops:?}"
+                );
+                assert!(
+                    !ops.iter()
+                        .any(|op| matches!(op.kind, OpKind::CallResidual { .. })),
+                    "direct_ptradd must not residualize; ops={ops:?}"
+                );
+            }
+            RewriteResult::Keep => panic!("direct_ptradd must rewrite, got Keep"),
+            RewriteResult::Identity(_) => panic!("direct_ptradd must rewrite, got Identity"),
+        }
     }
 
     #[test]

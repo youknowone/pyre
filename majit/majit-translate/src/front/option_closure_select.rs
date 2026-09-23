@@ -5,10 +5,13 @@
 //!
 //! These three `core::option::<Impl>` combinators are foreign (Opaque body in
 //! the LLBC) with the `Option` ADT receiver, so `first_is_self` routes each to
-//! a two-arg `CallTarget::Method` (receiver in `args[0]`, closure env in
-//! `args[1]`).  Like [`crate::front::option_map_or`] they carry a single closure
-//! and imply a two-way select on the receiver's tag, which this pass *creates*.
-//! They differ only in how each arm produces its result:
+//! a two-arg `CallTarget::Method` (receiver in `args[0]`, callable in
+//! `args[1]`).  The callable is either a closure ADT (its `call_once` runs on
+//! the selected arm) or a function item (`FnDef`: a zero-sized value naming
+//! one function, called directly as `f(x)` / `f()`).  Like
+//! [`crate::front::option_map_or`] they imply a two-way select on the
+//! receiver's tag, which this pass *creates*.  They differ only in how each
+//! arm produces its result:
 //!
 //! ```text
 //!     map(opt, f):            Some(x) => Some(f(x))   None => None
@@ -18,14 +21,14 @@
 //!     is_some_and(opt, f):    Some(x) => f(x)         None => false
 //! ```
 //!
-//! `map`/`and_then`/`is_some_and` run the closure on the `Some` payload;
-//! `unwrap_or_else` and `or_else` run their niladic closure on the `None` arm
+//! `map`/`and_then`/`is_some_and` run the callable on the `Some` payload;
+//! `unwrap_or_else` and `or_else` run their niladic callable on the `None` arm
 //! instead.  On `Some`, `unwrap_or_else` forwards the payload directly while
 //! `or_else` forwards the whole receiver `Option` unchanged (no `__pos_0`
-//! read).  `map` wraps the closure result back into `Some`, and both
+//! read).  `map` wraps the call result back into `Some`, and both
 //! `map`/`and_then` build a fresh `None` on the empty arm; `unwrap_or_else`
 //! returns a bare `T`, `or_else` an `Option<T>`, and `is_some_and` a bare
-//! `bool` whose `None` arm is the constant `false` (no closure, no `Option`).
+//! `bool` whose `None` arm is the constant `false` (no callable, no `Option`).
 //! Everything else — locating the residual call, absorbing the trailing
 //! `*mut <registered ADT>` narrowing cast, threading the live values through
 //! the arms, and closing the `bool(disc)` branch — is the
@@ -59,12 +62,13 @@ pub(crate) enum ClosureCombinator {
     IsSomeAnd,
 }
 
-/// A recognized `Option::map`/`and_then`/`unwrap_or_else(opt, closure_env)`
+/// A recognized `Option::map`/`and_then`/`unwrap_or_else(opt, callable)`
 /// call site captured during body lowering (`front::mir`
 /// `recognize_closure_select_site`).  The owner strings are resolved at the
-/// recording site where the receiver `Option` and the closure env type are in
-/// hand; the post-pass only needs them to spell the field reads, the closure
-/// `call_once`, and any `Some`/`None` it builds.
+/// recording site where the receiver `Option` and the callable (closure env
+/// type, or function-item `FnDef` path) are in hand; the post-pass only
+/// needs them to spell the field reads, the arm call, and any `Some`/`None`
+/// it builds.
 #[derive(Clone)]
 pub(crate) struct ClosureSelectSite {
     /// Which combinator — selects the per-arm result construction.
@@ -93,7 +97,14 @@ pub(crate) struct ClosureSelectSite {
     /// numbered fieldless enum.  `Some(e)` is the scalar `e` itself.
     pub result_fieldless_none_tag: Option<i64>,
     /// The closure env ADT `name_path` — the `call_once` inherent-method owner.
+    /// Empty when [`Self::fn_item_segments`] is set: a function item has no
+    /// closure env and the selected arm calls the named function directly.
     pub call_once_owner: String,
+    /// When `Some`, the callable is a function item.  The selected arm emits
+    /// a direct `Call(FunctionPath)` to these segments — the same op a Rust
+    /// `f(x)` (or niladic `f()`) call site lowers to — instead of
+    /// `call_once(env, (x,))`.
+    pub fn_item_segments: Option<Vec<String>>,
     /// The receiver `Option`'s payload `T` projected to a [`ValueType`] — the
     /// `Some::__pos_0` read kind and the `(x,)` args-tuple element.
     pub payload_ty: ValueType,
@@ -239,12 +250,14 @@ fn rewire_one_closure_select_site(
         }
     }
 
-    // `map`/`and_then`/`is_some_and` run the closure on the `Some` arm (so need
-    // `env` there), while `unwrap_or_else`/`or_else` run their closure on the
-    // `None` arm instead.  The `Some` arm always needs `opt` — to read
-    // `opt.__pos_0` (`map`/`and_then`/`unwrap_or_else`/`is_some_and`) or to
-    // forward the receiver unchanged (`or_else`).  Thread each arm exactly the
-    // sources it consumes.
+    // `map`/`and_then`/`is_some_and` run the callable on the `Some` arm (so a
+    // closure env is needed there), while `unwrap_or_else`/`or_else` run theirs
+    // on the `None` arm instead.  A function item has no env: the arm calls
+    // the named function directly.  The `Some` arm always needs `opt` — to
+    // read `opt.__pos_0` (`map`/`and_then`/`unwrap_or_else`/`is_some_and`) or
+    // to forward the receiver unchanged (`or_else`).  Thread each arm exactly
+    // the sources it consumes.
+    let is_fn_item = site.fn_item_segments.is_some();
     let closure_on_some = !matches!(
         site.kind,
         ClosureCombinator::UnwrapOrElse | ClosureCombinator::OrElse
@@ -253,11 +266,11 @@ fn rewire_one_closure_select_site(
     if !then_sources.contains(&opt) {
         then_sources.push(opt.clone().into_variable());
     }
-    if closure_on_some && !then_sources.contains(&env) {
+    if closure_on_some && !is_fn_item && !then_sources.contains(&env) {
         then_sources.push(env.clone().into_variable());
     }
     let mut else_sources = carried.clone();
-    if !closure_on_some && !else_sources.contains(&env) {
+    if !closure_on_some && !is_fn_item && !else_sources.contains(&env) {
         else_sources.push(env.clone().into_variable());
     }
     let (then_bb, then_inputs) = graph.create_block_with_arg_vars(then_sources.len());
@@ -276,24 +289,29 @@ fn rewire_one_closure_select_site(
             then_bb,
             then_inputs.clone(),
         ),
-        // `map`/`and_then`/`is_some_and` run the closure on the payload.
+        // `map`/`and_then`/`is_some_and` run the callable on the payload.
         ClosureCombinator::Map | ClosureCombinator::AndThen | ClosureCombinator::IsSomeAnd => {
             let payload = read_some_payload(graph, then_bb, opt_in_then, site);
-            let env_in_then = map_source(&then_sources, &then_inputs, &env)
-                .ok_or_else(|| format!("{name}: closure env not threaded into Some arm"))?;
-            let call_result = emit_call_once(
+            let env_in_then = if is_fn_item {
+                None
+            } else {
+                Some(
+                    map_source(&then_sources, &then_inputs, &env)
+                        .ok_or_else(|| format!("{name}: closure env not threaded into Some arm"))?,
+                )
+            };
+            let call_result = emit_site_callable(
                 graph,
                 then_bb,
+                site,
                 env_in_then,
                 Some((
                     payload,
                     site.payload_ty.clone(),
                     site.payload_class_root.clone(),
                 )),
-                &site.call_once_owner,
-                site.call_result_ty.clone(),
-                &site.args_tuple_suffix,
-            );
+                &name,
+            )?;
             let (finish_bb, finish_inputs, call_result) = if let Some((suffix, payload_ty)) =
                 &site.call_once_result_exc
             {
@@ -388,20 +406,18 @@ fn rewire_one_closure_select_site(
             });
             (false_var, else_bb, else_inputs.clone())
         }
-        // `unwrap_or_else`/`or_else` run their niladic closure and forward its
+        // `unwrap_or_else`/`or_else` run their niladic callable and forward its
         // result (`T` for `unwrap_or_else`, `Option<T>` for `or_else`).
         ClosureCombinator::UnwrapOrElse | ClosureCombinator::OrElse => {
-            let env_in_else = map_source(&else_sources, &else_inputs, &env)
-                .ok_or_else(|| format!("{name}: closure env not threaded into None arm"))?;
-            let call_result = emit_call_once(
-                graph,
-                else_bb,
-                env_in_else,
-                None,
-                &site.call_once_owner,
-                site.call_result_ty.clone(),
-                &site.args_tuple_suffix,
-            );
+            let env_in_else = if is_fn_item {
+                None
+            } else {
+                Some(
+                    map_source(&else_sources, &else_inputs, &env)
+                        .ok_or_else(|| format!("{name}: closure env not threaded into None arm"))?,
+                )
+            };
+            let call_result = emit_site_callable(graph, else_bb, site, env_in_else, None, &name)?;
             if let Some((suffix, payload_ty)) = &site.call_once_result_exc {
                 let (finish_bb, finish_inputs) =
                     graph.create_block_with_arg_vars(else_sources.len() + 1);
@@ -522,6 +538,69 @@ fn read_some_payload(
     payload
 }
 
+/// Run the site's callable in `block`.  A function item is a direct
+/// `Call(FunctionPath)` with the payload (or no args); a closure is
+/// `call_once(env, (payload,))`.
+fn emit_site_callable(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    site: &ClosureSelectSite,
+    env: Option<Variable>,
+    payload: Option<(Variable, ValueType, Option<String>)>,
+    name: &str,
+) -> Result<Variable, String> {
+    if let Some(segments) = site.fn_item_segments.as_ref() {
+        Ok(emit_fn_item_call(
+            graph,
+            block,
+            segments,
+            payload.map(|(value, _, _)| value),
+            site.call_result_ty.clone(),
+        ))
+    } else {
+        let env = env.ok_or_else(|| format!("{name}: closure env not threaded"))?;
+        Ok(emit_call_once(
+            graph,
+            block,
+            env,
+            payload,
+            &site.call_once_owner,
+            site.call_result_ty.clone(),
+            &site.args_tuple_suffix,
+        ))
+    }
+}
+
+/// Emit `f(x)` / `f()` in `block` as a direct `Call(FunctionPath)` — the
+/// same op an ordinary free-function call site lowers to.  `arg` is the
+/// payload for `map`/`and_then`/`is_some_and`, or `None` for a niladic
+/// `unwrap_or_else`/`or_else`.
+fn emit_fn_item_call(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    segments: &[String],
+    arg: Option<Variable>,
+    result_ty: ValueType,
+) -> Variable {
+    let call_result = graph.alloc_value_var();
+    let args = match arg {
+        Some(payload) => crate::model::call_args(vec![payload]),
+        None => crate::model::call_args(vec![]),
+    };
+    graph.block_mut(block).operations.push(SpaceOperation {
+        result: Some(call_result.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: segments.to_vec(),
+                fun_decl_id: None,
+            },
+            args,
+            result_ty,
+        },
+    });
+    call_result
+}
+
 /// Emit `call_once(env, args)` in `block`, returning the call result.  `arg` is
 /// the single closure argument (a `(x,)` tuple) or `None` for a niladic closure
 /// (an empty tuple the opaque body ignores) — the same `Args`-tuple shape
@@ -615,6 +694,7 @@ mod tests {
             option_owner: RECV_OPTION.into(),
             some_owner: RECV_SOME.into(),
             call_once_owner: "test::closure".into(),
+            fn_item_segments: None,
             payload_ty: ValueType::Int,
             payload_class_root: None,
             call_result_ty: ValueType::Int,
@@ -1102,6 +1182,88 @@ mod tests {
             "the None arm yields a fresh constant false"
         );
         assert_eq!(g.blocks[a].exits.len(), 2, "A branches to Some/None arms");
+    }
+
+    #[test]
+    fn map_fn_item_calls_function_in_some_arm() {
+        let mut g = FunctionGraph::new("test_map_fn_item");
+        let a = g.startblock;
+        let opt = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let fn_item = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::model::FN_CONST_HEAD.into(),
+                            "host".into(),
+                            "named_fn".into(),
+                        ],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let result = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::method("map", Some(RECV_OPTION.into())),
+                    args: crate::model::call_args(vec![opt, fn_item]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _b_args) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![result.clone()]);
+        let mut fn_site = site(ClosureCombinator::Map, result);
+        fn_site.fn_item_segments = Some(vec!["host".into(), "named_fn".into()]);
+
+        let outcome = rewire_closure_select_call_sites(&mut g, &[fn_site]);
+        assert_eq!(outcome.rewritten, 1, "map(opt, fn_item) must be rewritten");
+        assert!(residual_gone(&g, "map"), "residual map call removed");
+        assert_eq!(
+            count_calls(
+                &g,
+                |t| matches!(t, CallTarget::Method { name, .. } if name == "call_once")
+            ),
+            0,
+            "a function item must not go through call_once"
+        );
+        let named_fn_calls: Vec<&crate::model::SpaceOperation> = g
+            .blocks
+            .iter()
+            .flat_map(|blk| &blk.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments == &["host".to_string(), "named_fn".to_string()]
+                )
+            })
+            .collect();
+        assert_eq!(
+            named_fn_calls.len(),
+            1,
+            "the Some arm calls the named function directly"
+        );
+        let OpKind::Call { args, .. } = &named_fn_calls[0].kind else {
+            panic!("named function call");
+        };
+        assert_eq!(
+            args.len(),
+            1,
+            "the Some arm calls f(payload), not a 0-arg define"
+        );
+        assert_eq!(g.blocks[a.0].exits.len(), 2, "A branches to Some/None arms");
+        assert_eq!(count_ctors(&g), 2, "map still builds Some(U) and None");
     }
 
     #[test]

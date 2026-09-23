@@ -698,3 +698,51 @@ fn wrap_new_always_err_ok_payload_is_result_fieldread() {
         );
     }
 }
+
+/// `finditem_str_named` / `load_attr_cached` / `store_attr_cached` each
+/// collect a scoped Result call on the `if not we_are_jitted()`
+/// interpreter arm.  The front folds `we_are_jitted()` to
+/// `ConstBool(true)` and `fold_constant_exitswitch` clears that arm,
+/// so the collected var has no producer; the live arm still lowers.
+#[test]
+fn finditem_str_named_and_attr_cached_lower() {
+    let mut named = None;
+    for name in [
+        "pyre_interpreter::baseobjspace::finditem_str_named",
+        "pyre_interpreter::eval::<Impl>::load_attr_cached",
+        "pyre_interpreter::eval::<Impl>::store_attr_cached",
+    ] {
+        let graph = lower_function(interp(), name).unwrap_or_else(|err| panic!("{name}: {err}"));
+        assert_eq!(
+            count_result_ctors(&graph),
+            0,
+            "{name}: Result shells must be gone"
+        );
+        if name.ends_with("finditem_str_named") {
+            named = Some(graph);
+        }
+    }
+    let named = named.expect("finditem_str_named lowered");
+    let leaves: Vec<String> = named
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().cloned(),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        leaves.iter().any(|leaf| leaf == "finditem_str_generic"),
+        "jitted-false arm is gone; the generic tail-forward stays: {leaves:?}"
+    );
+    assert!(
+        leaves
+            .iter()
+            .all(|leaf| leaf != "finditem_str_shortcut_interp"),
+        "we_are_jitted ConstBool(true) clears the interpreter shortcut: {leaves:?}"
+    );
+}

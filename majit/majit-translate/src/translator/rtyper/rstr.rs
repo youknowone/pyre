@@ -5900,6 +5900,54 @@ mod tests {
         );
     }
 
+    /// rstr.py `STR` is `{hash: Signed, chars: Array(Char)}`.  The
+    /// varsize `chars` length word sits immediately after `hash`, i.e.
+    /// at offset 8 on a 64-bit target — the same word `ll_strlen`
+    /// (`len(s.chars)`) / `bh_strlen` read.  That is the WTF-8 **byte**
+    /// length, not a code-point `__len__`.
+    #[test]
+    fn ll_strlen_reads_str_chars_length_word_at_offset_8() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::rstr::STR;
+
+        let LowLevelType::ForwardReference(fwd) = STR.clone() else {
+            panic!("STR must be a ForwardReference");
+        };
+        let body = fwd.resolved().expect("STR ForwardReference resolved");
+        let LowLevelType::Struct(st) = body else {
+            panic!("STR must resolve to Struct, got {body:?}");
+        };
+        assert_eq!(
+            st._names,
+            vec!["hash".to_string(), "chars".to_string()],
+            "STR field order is hash then chars"
+        );
+        assert_eq!(
+            st._flds.get("hash"),
+            Some(&LowLevelType::Signed),
+            "hash is a machine-word Signed"
+        );
+        assert_eq!(
+            std::mem::size_of::<i64>(),
+            8,
+            "Signed is 8 bytes; chars length word is at offset 8"
+        );
+        let helper = build_ll_strlen_helper_graph("ll_strlen", STRPTR.clone())
+            .expect("build_ll_strlen_helper_graph");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        let opnames: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(opnames, vec!["getsubstruct", "getarraysize"]);
+        let Hlvalue::Constant(c) = &startblock.operations[0].args[1] else {
+            panic!("getsubstruct field name must be a Constant");
+        };
+        assert!(matches!(c.value, ConstValue::ByteStr(ref b) if b == b"chars"));
+    }
+
     /// rstr.py mirror for UnicodeRepr — same shape, different
     /// helper identity (`ll_unilen`) and pointer lltype (Ptr(UNICODE)).
     #[test]

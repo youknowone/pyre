@@ -101,11 +101,12 @@
 use majit_charon_reader::{
     Llbc,
     ullbc::{
-        BasicBlock, CallClass, CallFunc, CallKind, CallPayload, FunDecl, FunId, NameSeg, Operand,
-        Place, PlaceKind, ProjectionElem, RegularCall, Rvalue, StmtKind, SwitchTargets, TermKind,
-        TyRef, TypeDecl, TypeDeclKind, Unstructured,
+        BasicBlock, CallClass, CallFunc, CallKind, CallPayload, FunDecl, FunId, GlobalDecl,
+        NameSeg, Operand, Place, PlaceKind, ProjectionElem, RegularCall, Rvalue, StmtKind,
+        SwitchTargets, TermKind, TyRef, TypeDecl, TypeDeclKind, Unstructured,
     },
 };
+use std::cell::RefCell;
 
 use crate::flowspace::model::{ConstValue, Variable};
 use crate::model::{
@@ -210,7 +211,8 @@ pub(crate) fn build_semantic_program_from_llbcs_with_static_addrs_module_paths_a
 }
 
 /// Lower one already-linked artefact. The caller applied
-/// [`discover_transparent_scalar_kinds`] across the whole set first so
+/// [`discover_transparent_scalar_kinds`] and
+/// [`discover_foldable_const_lits`] across the whole set first so
 /// this crate can be dropped before the next file is parsed.
 pub(crate) fn build_semantic_program_from_prelinked_llbc(
     llbc: &Llbc,
@@ -2851,6 +2853,21 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // `["core","slice","iter"]` op and folds the loop.  Runs on the same
         // simplified graph; fail-safe — an unpaired / multi-consumer range
         // aggregate stays the ordinary ADT ctor (census Skip).
+        // `map(it, f).collect()` denotes a loop.  Rewrite it at the
+        // construction site — where `f` is a concrete closure ADT —
+        // into `Vec::new` + `next` + `call_once` + `push` BEFORE the
+        // range divert and `next`-diamond run, so those passes see the
+        // synthesized `next` the same way they see a source-level
+        // for-loop.  Fail-safe: a site whose closure env is not a
+        // concrete ADT, or whose inner iterator is not a list `iter` /
+        // exclusive Range, is left as the residual `collect`.
+        if !lo.map_collect_sites.is_empty() {
+            let synthesized = crate::front::iter_adapter::rewire_map_collect_sites(
+                &mut lo.graph,
+                &lo.map_collect_sites,
+            );
+            lo.next_call_results.extend(synthesized);
+        }
         if !lo.range_iter_new_sites.is_empty() && !lo.next_call_results.is_empty() {
             // The range rewrite only locates the `next()` producer; the
             // element kind recorded beside it belongs to the diamond fold.
@@ -3021,6 +3038,30 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             0
         } else {
             crate::front::slice_get::rewire_slice_get_call_sites(&mut lo.graph, &lo.slice_get_sites)
+        };
+        // Header-view `slice::from_raw_parts{,_mut}` (`front::from_raw_parts`)
+        // aliases the residual fat slice to the length-prefixed GC string
+        // header.  In-place `same_as`; no new blocks.
+        let _from_raw_parts_rewritten =
+            crate::front::from_raw_parts::rewire_from_raw_parts_sites(&mut lo.graph);
+        // Word-sized `saturating_add` clamp (`front::saturating_add`) splits
+        // the residual call into `sum = a + b; if uint_lt(sum, a) { MAX } else
+        // { sum }`.  Sites share `saturating_sub_sites`; the add pass matches
+        // the `saturating_add` leaf and declines sub producers.  No new
+        // unreachable blocks (both arms forward to the original
+        // continuation), so the sweep gate below does not need the count.
+        let saturating_add_vars: Vec<Variable> = lo
+            .saturating_sub_sites
+            .iter()
+            .map(|site| site.result_var.clone())
+            .collect();
+        let _saturating_add_rewritten = if saturating_add_vars.is_empty() {
+            0
+        } else {
+            crate::front::saturating_add::rewire_saturating_add_call_sites(
+                &mut lo.graph,
+                &saturating_add_vars,
+            )
         };
         // The `saturating_sub` clamp rewrite (`front::saturating_sub`) splits
         // the residual `saturating_sub` call block into an `if a < b { 0 } else
@@ -4483,6 +4524,10 @@ struct Lowering<'a> {
     /// place the element's kind is still readable, since the fold's op
     /// carries the iterator and not the container's item type.
     next_call_results: Vec<(Variable, ValueType)>,
+    /// `Map::collect` construction sites recorded for the loop rewrite
+    /// `front::iter_adapter` synthesizes before the `next`-diamond runs
+    /// (see [`crate::front::iter_adapter::MapCollectSite`]).
+    map_collect_sites: Vec<crate::front::iter_adapter::MapCollectSite>,
     /// `i64::checked_{add,sub,mul}()` call results (`Option<i64>`-typed)
     /// recorded for the checked-arith rewiring pass
     /// (`front::checked_arith`) that runs after the body lowering
@@ -4898,6 +4943,7 @@ impl<'a> Lowering<'a> {
             result_as_ref_sites: Vec::new(),
             result_expect_sites: Vec::new(),
             next_call_results: Vec::new(),
+            map_collect_sites: Vec::new(),
             checked_arith_call_results: Vec::new(),
             checked_arith_ok_or_else_sites: Vec::new(),
             checked_arith_uint_sites: Vec::new(),
@@ -8296,7 +8342,8 @@ impl<'a> Lowering<'a> {
                     .or_else(|| self.fold_size_const_global(id))
                     .or_else(|| self.fold_named_const_int_array_global(id))
                     .or_else(|| primitive_float_const(&segments))
-                    .or_else(|| code_flags_const(&segments));
+                    .or_else(|| code_flags_const(&segments))
+                    .or_else(|| bitflags_trait_empty_const(&segments));
                 // No lane produced a value for this static.  The synthetic
                 // nullary call below targets the static's own path, which is
                 // not a function, so the failure only becomes visible two
@@ -8841,16 +8888,17 @@ impl<'a> Lowering<'a> {
 
     /// Resolve a global `def_id` to its fully-qualified path segments
     /// via the reader's `global_decls` table.
+    ///
+    /// Uses [`static_key_segments`] rather than `item_meta.name_path()`:
+    /// `name_path` drops every Ident disambiguator except `closure#N`, so
+    /// two function-local statics that share a leaf (`method_owner::OWNER`)
+    /// collapse onto one key and neither `HostStaticAddrs` row can name
+    /// just one of them. Charon stores the disambiguator as the `u64` of
+    /// `NameSeg::Ident`; the key keeps it.
     fn global_segments(&self, mir_bb: usize, def_id: u64) -> Result<Vec<String>, LowerError> {
         self.llbc
             .global_by_id(def_id)
-            .map(|g| {
-                g.item_meta
-                    .name_path()
-                    .split("::")
-                    .map(|s| s.to_string())
-                    .collect()
-            })
+            .map(|g| static_key_segments(&g.item_meta.name))
             .ok_or_else(|| {
                 LowerError::Schema(format!(
                     "bb{mir_bb}: Place::Global references unknown GlobalDecl id {def_id}"
@@ -9193,8 +9241,14 @@ impl<'a> Lowering<'a> {
     /// flow graphs carry module-level constants as `Constant(value)`,
     /// so config bools like `WITHPREBUILTINT` constant-fold their
     /// guarded branches instead of minting a synthetic 0-arg call no
-    /// registry can resolve.  Non-trivial initializers (multi-block,
-    /// calls, aggregates) return `None` and keep the Call fallback.
+    /// registry can resolve.  Aggregates and any `Call` other than
+    /// `core::mem::size_of` / `align_of` return `None` and keep the
+    /// Call fallback.
+    ///
+    /// A defining crate's initializer is absent from a dependent
+    /// artefact (`opacity: Foreign`). After the local body and the
+    /// `core::num` associated-const lanes fail, fold to the literal
+    /// harvested from the crate that owns the const.
     fn const_eval_global(&self, def_id: u64) -> Option<OpKind> {
         let g = self.llbc.global_by_id(def_id)?;
         // Only an immutable, non-thread-local global folds to its init
@@ -9206,29 +9260,26 @@ impl<'a> Lowering<'a> {
         // is taken elsewhere.)  `global_kind` does not distinguish
         // `static mut` from `static`, so the mutability comes from the
         // `static mut` keyword in Charon's recorded `source_text`.
-        if g.rest
-            .get("global_kind")
-            .and_then(serde_json::Value::as_str)
-            == Some("ThreadLocal")
-        {
+        if global_is_thread_local(g) {
             return None;
         }
-        let is_static_mut = g
+        if global_source_text_is_static_mut(g) {
+            return None;
+        }
+        let local = g
             .rest
-            .get("item_meta")
-            .and_then(|m| m.get("source_text"))
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|s| s.contains("static mut"));
-        if is_static_mut {
-            return None;
-        }
-        let init_id = g.rest.get("init")?.as_u64()?;
-        let fd = self.llbc.fn_by_id(init_id)?;
-        if let Some(u) = fd.unstructured() {
-            const_eval_init_body(self.llbc, &u)
-        } else {
-            const_eval_core_num_associated_const(self.llbc, def_id).and_then(const_lit_to_op)
-        }
+            .get("init")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|init_id| self.llbc.fn_by_id(init_id))
+            .and_then(|fd| {
+                if let Some(u) = fd.unstructured() {
+                    const_eval_init_body(self.llbc, &u)
+                } else {
+                    const_eval_core_num_associated_const(self.llbc, def_id)
+                        .and_then(const_lit_to_op)
+                }
+            });
+        local.or_else(|| foldable_const_lit(&g.item_meta.name_path()))
     }
 
     /// Fold a `NamedConst` global whose initializer is exactly
@@ -9255,9 +9306,9 @@ impl<'a> Lowering<'a> {
     ///     `UnwindResume`, `Drop`, `Assert`), plus calls and assignments that
     ///     do *not* write `_0`, are permitted: none of them define the const
     ///     value, so with no `Switch` the single `size_of` call is its
-    ///     unconditional sole definer.  Also `None` for a non-ADT type argument
-    ///     (primitive / pointer / tuple, which has no `TypeDecl` layout to
-    ///     read) or a layout Charon left unresolved.
+    ///     unconditional sole definer.  Primitive widths (`usize`, `u64`, …)
+    ///     fold through the same lane as an inline `size_of`/`align_of` call;
+    ///     a pointer / tuple / unresolved layout stays residual.
     fn fold_size_const_global(&self, def_id: u64) -> Option<OpKind> {
         let gd = self.llbc.global_by_id(def_id)?;
         if gd
@@ -9340,30 +9391,37 @@ impl<'a> Lowering<'a> {
         ))
     }
 
-    /// The build-time byte size / alignment Charon resolved for an ADT type
-    /// expression's layout, shared by [`Self::fold_size_const_global`] (the
+    /// The build-time byte size / alignment of a `size_of` / `align_of`
+    /// type argument, shared by [`Self::fold_size_const_global`] (the
     /// NamedConst-initializer form) and the inline `size_of`/`align_of` call
-    /// fold in [`Self::lower_call`].  `None` for a non-ADT type argument
-    /// (primitive / pointer / tuple, which has no `TypeDecl` layout to read)
-    /// or a layout Charon left unresolved.
+    /// fold in [`Self::lower_call`].
+    ///
+    /// ADT arguments read Charon's `layout_for_target` (wasm32 folds the
+    /// wasm32 width, not the host's). Primitive widths (`usize`, `u64`,
+    /// …) reuse [`primitive_size_align`], the same lane a NamedConst
+    /// initializer already uses, so an inline `align_of::<usize>()`
+    /// folds too.  `None` for a pointer / tuple / unresolved layout.
     fn size_align_const_from_tyexpr(
         &self,
         want_align: bool,
         ty: &serde_json::Value,
     ) -> Option<i64> {
-        let adt = self.resolve_tyexpr_to_adt_def_id(ty)?;
-        // Read the layout for the build's `TARGET` (empty for the host
-        // extraction target), matching the target-aware field-offset lookup
-        // in `record_struct_id`. A wasm32 cross-build folds the wasm32 byte
-        // size, not the host's.
-        let target = std::env::var("TARGET").unwrap_or_default();
-        let layout = self.llbc.type_by_id(adt)?.layout_for_target(&target)?;
-        let value = if want_align {
-            layout.align
-        } else {
-            layout.size
-        }?;
-        Some(value as i64)
+        if let Some(adt) = self.resolve_tyexpr_to_adt_def_id(ty) {
+            // Read the layout for the build's `TARGET` (empty for the host
+            // extraction target), matching the target-aware field-offset lookup
+            // in `record_struct_id`. A wasm32 cross-build folds the wasm32 byte
+            // size, not the host's.
+            let target = std::env::var("TARGET").unwrap_or_default();
+            let layout = self.llbc.type_by_id(adt)?.layout_for_target(&target)?;
+            let value = if want_align {
+                layout.align
+            } else {
+                layout.size
+            }?;
+            return Some(value as i64);
+        }
+        let body = tyexpr_body(self.llbc, ty)?;
+        i64::try_from(primitive_size_align(want_align, body.get("Literal")?)?).ok()
     }
 
     // -----------------------------------------------------------------------
@@ -9647,8 +9705,15 @@ impl<'a> Lowering<'a> {
         } else {
             tyref_to_value_type(&call.dest.ty, self.llbc)
         };
-        // A call returning `*mut <registered ADT>` (a `PyObjectRef`) collapses
-        // to a classdef-less `Ref(None)` — `tyref_to_value_type` erases the
+        // A typed `Ref(Some(root))` already carries the intern key
+        // (`tyref_to_value_type` paints a payload-carrying enum this way).
+        // `__cast_instance_intrinsic` then intern's that root through
+        // `getuniqueclassdef_for_struct_root` so the call result is
+        // `SomeInstance(classdef)` rather than the classdef-less shell
+        // `valuetype_to_someshell(Ref)` would seed.
+        //
+        // A call returning `*mut <registered ADT>` (a `PyObjectRef`) still
+        // collapses to `Ref(None)` — `tyref_to_value_type` erases the
         // pointee class root.  Capture the pointee root now so the result can be
         // narrowed to `SomeInstance(root)` after the call op: the call-result
         // twin of the FieldRead-base and ptr-identity-cast `__cast_instance_intrinsic`
@@ -9656,8 +9721,9 @@ impl<'a> Lowering<'a> {
         // resolve instead of blocking the annotator on a classdef-less instance.
         // Gated on the raw-pointer pointee (not a bare ADT) so foreign value
         // types (`BigInt` / `Wtf8Buf` — no registered struct) are excluded.
-        let result_narrow_root: Option<String> = if matches!(result_ty, ValueType::Ref(None)) {
-            tyref_node(&call.dest.ty, self.llbc)
+        let result_narrow_root: Option<String> = match &result_ty {
+            ValueType::Ref(Some(root)) => Some(root.clone()),
+            ValueType::Ref(None) => tyref_node(&call.dest.ty, self.llbc)
                 .and_then(|n| strip_ty_wrappers(n, self.llbc))
                 .and_then(|n| raw_ptr_pointee_class_root(n, self.llbc))
                 // `Option<&mut RegisteredStruct>` is a nullable pointer
@@ -9679,13 +9745,12 @@ impl<'a> Lowering<'a> {
                 .or_else(|| self.option_residual_narrow_root(&call.dest.ty))
                 // A tuple/array returned across a call boundary has the same
                 // synthetic positional layout as one built in the caller,
-                // but `tyref_to_value_type` deliberately classifies every
-                // non-scalar as `Ref(None)`.  Recover the exact shaped owner
+                // but `tyref_to_value_type` still classifies those
+                // non-scalars as `Ref(None)`.  Recover the exact shaped owner
                 // here so the caller's `.N` reads see the TupleRepr fields
                 // registered from the callee's aggregate construction.
-                .or_else(|| tyref_positional_aggregate_root(&call.dest.ty, self.llbc))
-        } else {
-            None
+                .or_else(|| tyref_positional_aggregate_root(&call.dest.ty, self.llbc)),
+            _ => None,
         };
 
         // Resolve arguments before deciding the call shape so receiver
@@ -9731,6 +9796,11 @@ impl<'a> Lowering<'a> {
             Operand::Copy(p) | Operand::Move(p) => Some(clone_tyref(&p.ty)),
             Operand::Const(_) => None,
         });
+        // Function-item identity of arg #1, captured before `call.args` is
+        // consumed.  `Option::map(opt, named_fn)` passes a `FnDef` constant
+        // (or a Copy/Move of a `FnDef`-typed local); that shape has no
+        // closure ADT, so `second_arg_ty` alone cannot name the callee.
+        let second_arg_fn_item = operand_fn_item_segments(self.llbc, call.args.get(1));
         // Third argument's MIR-declared type — `Option::map_or`'s closure env
         // operand.  Captured before the operands are consumed so the
         // `front::option_map_or` recording can resolve the closure ADT's
@@ -9748,7 +9818,16 @@ impl<'a> Lowering<'a> {
         let (slice_get_index_is_scalar, slice_get_element, slice_first_element) = match &call.func {
             CallFunc::Regular(reg) => {
                 let scalar = self.is_slice_get_scalar_call(reg, second_arg_ty.as_ref());
-                let element = scalar.then(|| self.slice_get_element(reg)).flatten();
+                let is_get_mut = self.is_slice_get_mut_call(reg);
+                let element = scalar
+                    .then(|| self.slice_get_element(reg))
+                    .flatten()
+                    .filter(|(_, array_type_id)| {
+                        crate::front::slice_get::slice_get_element_may_record(
+                            is_get_mut,
+                            array_type_id.as_ref(),
+                        )
+                    });
                 // `first` / `last` share `get`'s `T` generic; the same
                 // ARRAY identity / thin-pointer proof feeds their
                 // `ArrayRead`. Skip the generic walk on every other
@@ -9834,16 +9913,16 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 // Fold an inline `core::mem::size_of::<T>()` /
-                // `align_of::<T>()` call with a layout-resolvable ADT type
-                // argument to its build-time byte size / alignment — the same
-                // constant `fold_size_const_global` produces for the
-                // NamedConst-initializer form, applied here to the inline
-                // call shape (`gc_alloc_storage_box`'s
-                // `try_gc_alloc_stable_raw(tid, size_of::<T>())`). Removes the
-                // residual `<host std.mem.size_of>` call the rtyper cannot
-                // register.  Declines (falls through to the ordinary call
-                // path) for a non-ADT type argument, whose size is not read
-                // from a `TypeDecl` layout.
+                // `align_of::<T>()` call to its build-time byte size /
+                // alignment — the same constant `fold_size_const_global`
+                // produces for the NamedConst-initializer form, applied here
+                // to the inline call shape (`gc_alloc_storage_box`'s
+                // `try_gc_alloc_stable_raw(tid, size_of::<T>())`, and
+                // `Layout::from_size_align(_, align_of::<usize>())`).
+                // Removes the residual `<host std.mem.size_of>` /
+                // `align_of` call the rtyper cannot register.  Declines
+                // (falls through to the ordinary call path) for a pointer /
+                // tuple / unresolved layout.
                 if let CallKind::Fun(FunId::Regular { id }) = &reg.kind
                     && let Some(fd) = self.llbc.fn_by_id(*id)
                 {
@@ -10165,15 +10244,36 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `w_str_get_wtf8(obj)` is `_utf8`.  pyre_cpu's `bh_str*`
-                // family reads the `W_UnicodeObject` itself (byte_len +
-                // the `value` indirection), so the field is identity on
-                // the object — the same model `as_bytes` uses one step
-                // down.  Alias and mark the dest as a byte view so
-                // `as_bytes()[i]` / `len` become `strgetitem` / `strlen`
-                // on the object, not on a fat `&Wtf8`.
+                // `w_str_get_wtf8(obj)` is `_utf8`.  The receiver is a
+                // `PyObjectRef`, so aliasing dest to args[0] would paint
+                // dest `SomeInstance(pyobject::PyObject)` and every later
+                // string op would union `String ∪ Instance` or dispatch
+                // `InstanceRepr` (no `rtype_len` / `rtype_eq`).  Project
+                // dest as `ValueType::Str` through the existing
+                // `__cast_instance_intrinsic` string-root seam
+                // (`project_struct_field_type("Wtf8")` → `SomeString`;
+                // `cast_instance_call_result` result_ty `Str`).  The
+                // marker is jitcode-identity (`cast_pointer` /
+                // `cast_opaque_ptr` → `same_as`; Skip folds it to the
+                // operand), so the machine value stays the receiver.
+                // Mark dest a byte view so `as_bytes()[i]` / `len` still
+                // plant `strgetitem` / `strlen`.
                 if args.len() == 1 && self.is_w_str_get_wtf8_identity(&reg) {
-                    self.alias_dest_to_arg0(dest_local, args[0].clone(), true);
+                    let dest = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(dest.clone()),
+                        kind: crate::model::cast_instance_call_result(
+                            "Wtf8",
+                            args[0].clone(),
+                            ValueType::Str,
+                        ),
+                    });
+                    self.local_var[dest_local] = Some(dest);
+                    if !self.string_byte_view_locals.contains(&dest_local) {
+                        self.string_byte_view_locals.push(dest_local);
+                    }
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -10243,53 +10343,57 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `<*mut T>::add` / `<*const T>::add` is `raw_ptradd` scaled
-                // by the pointee size (`rewrite_op_direct_ptradd`).  The
-                // pointer is a Ref at this layer, so take the address
-                // integer first — otherwise the add assembles as
-                // `int_add/ri>i`, an opname with no blackhole handler.
+                // `<*mut T>::add` / `<*const T>::add` is `lltype.direct_ptradd`.
+                // The add stays pointer-typed so a `null_mut()` arm at the
+                // same return can union with it.  Pointee size is not a
+                // recoverable `TO.OF` on the erased pointer at jtransform
+                // time, so the count is scaled to a byte offset here
+                // (`n * sizeof(T)`, skipped for size 0/1) and the rewrite
+                // treats the shift as already-scaled, like `CCHARP`.
+                //
+                // Brick-1 accessors and brick-3 getarrayitem `.add`s have
+                // their own intercepts later in this match; do not steal
+                // those (the items-base collapse aliases to the header
+                // because the gcarray descr already folds `base_size`).
                 if args.len() == 2
                     && let Some(pointee_size) =
                         self.ptr_add_pointee_size(&reg, first_arg_ty.as_ref())
+                    && !self.ptr_add_has_later_intercept(
+                        &reg,
+                        args.len(),
+                        &arg_locals,
+                        first_arg_ty.as_ref(),
+                        dest_local,
+                    )
                 {
-                    let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
-                        let res =
-                            graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                        graph.block_mut(bb_id).operations.push(SpaceOperation {
-                            result: Some(res.clone()),
-                            kind,
-                        });
-                        res
-                    };
                     let offset = if pointee_size == 0 {
                         args[0].clone()
                     } else {
-                        let addr = push_cast_ptr_to_int(&mut self.graph, bb_id, args[0].clone());
-                        self.cast_ptr_to_int_src
-                            .insert(addr.clone(), args[0].clone());
-                        let rhs = if pointee_size == 1 {
+                        let count = if pointee_size == 1 {
                             args[1].clone()
                         } else {
-                            let scale = push_op(&mut self.graph, OpKind::ConstInt(pointee_size));
-                            push_op(
-                                &mut self.graph,
-                                OpKind::BinOp {
+                            let scale = self
+                                .graph
+                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                                result: Some(scale.clone()),
+                                kind: OpKind::ConstInt(pointee_size),
+                            });
+                            let scaled = self
+                                .graph
+                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                                result: Some(scaled.clone()),
+                                kind: OpKind::BinOp {
                                     op: "mul".to_string(),
                                     lhs: args[1].clone(),
                                     rhs: scale,
                                     result_ty: ValueType::Int,
                                 },
-                            )
+                            });
+                            scaled
                         };
-                        push_op(
-                            &mut self.graph,
-                            OpKind::BinOp {
-                                op: "add".to_string(),
-                                lhs: addr,
-                                rhs,
-                                result_ty: ValueType::Int,
-                            },
-                        )
+                        push_direct_ptradd(&mut self.graph, bb_id, args[0].clone(), count)
                     };
                     self.local_var[dest_local] = Some(offset);
                     let target_bb = self.block_id[target];
@@ -13727,15 +13831,42 @@ impl<'a> Lowering<'a> {
             // assumed unconditionally before this was carried, so an
             // unreadable type keeps today's behaviour instead of inventing a
             // new one.
-            let iterator_added_a_reference = first_arg_ty
-                .as_ref()
-                .and_then(|receiver| self.tyref_ref_adt_path(receiver))
-                .is_some_and(|path| iterator_adds_a_reference(&path));
+            let enumerate_next = crate::front::iter_adapter::is_enumerate_next_target(target);
+            let iterator_added_a_reference = if enumerate_next {
+                // `Enumerate<I>::next` yields `(usize, I::Item)`; the native
+                // `next` runs on `I`, so the reference-peel follows I, not
+                // the adapter.  `Enumerate`'s first type argument is I.
+                first_arg_ty
+                    .as_ref()
+                    .and_then(|receiver| self.tyref_peel_ref_to_pointee(receiver))
+                    .and_then(|enum_ty| {
+                        let body = match &enum_ty {
+                            TyRef::Inline { value: (_, v) } | TyRef::Other(v) => v,
+                            TyRef::Dedup { id } => self.llbc.dedup_body(*id)?,
+                        };
+                        let inner = body.get("Adt")?.get("generics")?.get("types")?.get(0)?;
+                        let inner_ty = serde_json::from_value::<TyRef>(inner.clone()).ok()?;
+                        self.tyref_ref_adt_path(&inner_ty)
+                    })
+                    .is_some_and(|path| iterator_adds_a_reference(&path))
+            } else {
+                first_arg_ty
+                    .as_ref()
+                    .and_then(|receiver| self.tyref_ref_adt_path(receiver))
+                    .is_some_and(|path| iterator_adds_a_reference(&path))
+            };
             let item_ty = crate::front::result_exc::tyref_option_payload(&call.dest.ty, self.llbc)
                 .and_then(|payload| {
                     let body = match &payload {
                         TyRef::Inline { value: (_, v) } | TyRef::Other(v) => v,
                         TyRef::Dedup { id } => self.llbc.dedup_body(*id)?,
+                    };
+                    // `Option<(usize, I::Item)>` — the inner next yields
+                    // `I::Item`, packed into the tuple on the Some arm.
+                    let body = if enumerate_next {
+                        body.get("Adt")?.get("generics")?.get("types")?.get(1)?
+                    } else {
+                        body
                     };
                     let item =
                         iterator_payload_element(body, self.llbc, iterator_added_a_reference)?;
@@ -13745,6 +13876,82 @@ impl<'a> Lowering<'a> {
                 .unwrap_or(ValueType::Ref(None));
             self.next_call_results.push((result_var.clone(), item_ty));
         }
+        // Capture `Map::collect` at the construction site, where the
+        // closure env is a concrete ADT.  The adapter body is
+        // polymorphic (Charon does not monomorphise per closure); the
+        // caller is not.  A miss — non-Map receiver, non-Vec dest, or
+        // env that does not resolve to an ADT — leaves the residual.
+        if let OpKind::Call { target, args, .. } = &op_kind
+            && args.len() == 1
+            && crate::front::iter_adapter::is_map_collect_target(target)
+            && tyref_is_vec_value(&call.dest.ty, self.llbc)
+            && let Some(recv_ty) = first_arg_ty.as_ref()
+            && adt_path_of_tyref(recv_ty, self.llbc)
+                .as_deref()
+                .is_some_and(crate::front::iter_adapter::is_map_adapter_path)
+            && let Some(i_ty) = self.tyref_adt_type_arg(recv_ty, 0)
+            && let Some(f_ty) = self.tyref_adt_type_arg(recv_ty, 1)
+            && let Some(env_def_id) = self
+                .tyref_adt_def_id(&f_ty)
+                .or_else(|| self.tyref_ref_adt_def_id(&f_ty))
+            && let Some(env_td) = self.llbc.type_by_id(env_def_id)
+        {
+            let call_once_owner = env_td.item_meta.name_path();
+            if !call_once_owner.is_empty() {
+                let iter_ty = match self.tyref_peel_ref_to_pointee(&i_ty) {
+                    Some(ty) => ty,
+                    None => i_ty,
+                };
+                let item_tyref = self
+                    .tyref_adt_type_arg(&iter_ty, 0)
+                    .unwrap_or_else(|| clone_tyref(&iter_ty));
+                let payload_ty = tyref_to_value_type(&item_tyref, self.llbc);
+                let payload_class_root = enum_payload_instance_class_root(&item_tyref, self.llbc);
+                let args_tuple_suffix = payload_tuple_suffix(&item_tyref, self.llbc);
+                let elem_tyref = self
+                    .tyref_adt_type_arg(&call.dest.ty, 0)
+                    .unwrap_or_else(|| clone_tyref(&call.dest.ty));
+                let call_result_ty = tyref_to_value_type(&elem_tyref, self.llbc);
+                self.map_collect_sites
+                    .push(crate::front::iter_adapter::MapCollectSite {
+                        result_var: result_var.clone(),
+                        call_once_owner,
+                        payload_ty: payload_ty.clone(),
+                        payload_class_root,
+                        args_tuple_suffix,
+                        call_result_ty,
+                        inner_item_ty: payload_ty,
+                    });
+            }
+        }
+        // Transparent std wrappers (`Cell::{new,get}`, `Atomic*::new`,
+        // `Box::as_ref`, `Ref`/`MutexGuard` deref) are operations, not
+        // residual calls.  Rewrite the Call before the capture gates
+        // below see it.
+        let identity_recv = first_arg_ty
+            .as_ref()
+            .and_then(|ty| adt_path_of_tyref(ty, self.llbc));
+        let identity_dest = adt_path_of_tyref(&call.dest.ty, self.llbc);
+        let identity_dest_ty = tyref_to_value_type(&call.dest.ty, self.llbc);
+        // A borrow carries no representation of its own here -- `Rvalue::Ref`
+        // aliases the place's Variable -- so the receiver's bank is the
+        // pointee's.  `Box`/`Ref`/`MutexGuard` still read `Ref` through it
+        // and keep their identity; a wrapper the LLBC leaves Opaque reads
+        // `Ref` against a scalar destination and declines, because that
+        // member is a load, not an alias.
+        let identity_banks_agree = first_arg_ty.as_ref().is_some_and(|ty| {
+            let recv_ty = match self.tyref_peel_ref_to_pointee(ty) {
+                Some(pointee) => tyref_to_value_type(&pointee, self.llbc),
+                None => tyref_to_value_type(ty, self.llbc),
+            };
+            value_type_bank(&recv_ty) == value_type_bank(&identity_dest_ty)
+        });
+        let op_kind = crate::front::std_identity::lower_std_primitive_op(
+            op_kind,
+            identity_recv.as_deref(),
+            identity_dest.as_deref(),
+            identity_banks_agree,
+        );
         // Capture `i64::checked_{add,sub,mul}()` results (`Option<i64>`-
         // typed) for the checked-arith rewiring pass
         // (`front::checked_arith`), which rewrites each into the native
@@ -13756,18 +13963,44 @@ impl<'a> Lowering<'a> {
         // atoms are only in hand here (Charon renders every inherent integer
         // impl as `<Impl>`, and `tyref_to_value_type` colors every signed
         // width `Int`), and the emitted `*_ovf` tests the machine-word bound,
-        // so a narrower operand would answer the wrong question.  Same
-        // placement rationale as the unsigned pass's signedness gate below.
+        // so a narrower operand would answer the wrong question.  A literal
+        // operand (`needed.checked_add(63)`) has no Place type, so the
+        // destination `Option<Self>` payload is the width; either operand
+        // is only a fallback.  Same placement rationale as the unsigned
+        // pass's signedness gate below.
         if let OpKind::Call { target, .. } = &op_kind
             && crate::front::checked_arith::is_checked_arith_target(target)
             && crate::front::result_exc::tyref_is_option(&call.dest.ty, self.llbc)
-            && [first_arg_ty.as_ref(), second_arg_ty.as_ref()]
-                .into_iter()
-                .all(|operand| {
-                    operand
-                        .and_then(|ty| self.tyref_literal_int_atom(ty))
-                        .is_some_and(crate::front::checked_arith::is_ovf_width_int_atom)
-                })
+            && {
+                let dest_payload =
+                    crate::front::result_exc::tyref_option_payload(&call.dest.ty, self.llbc);
+                let dest_atom = dest_payload
+                    .as_ref()
+                    .and_then(|ty| self.tyref_literal_int_atom(ty));
+                let peel0 = first_arg_ty
+                    .as_ref()
+                    .and_then(|ty| self.tyref_peel_ref_to_pointee(ty));
+                let peel1 = second_arg_ty
+                    .as_ref()
+                    .and_then(|ty| self.tyref_peel_ref_to_pointee(ty));
+                let op0 = first_arg_ty
+                    .as_ref()
+                    .and_then(|ty| self.tyref_literal_int_atom(ty))
+                    .or_else(|| {
+                        peel0
+                            .as_ref()
+                            .and_then(|ty| self.tyref_literal_int_atom(ty))
+                    });
+                let op1 = second_arg_ty
+                    .as_ref()
+                    .and_then(|ty| self.tyref_literal_int_atom(ty))
+                    .or_else(|| {
+                        peel1
+                            .as_ref()
+                            .and_then(|ty| self.tyref_literal_int_atom(ty))
+                    });
+                crate::front::checked_arith::signed_ovf_width_reaches(dest_atom, [op0, op1])
+            }
         {
             self.checked_arith_call_results.push(result_var.clone());
         }
@@ -13812,7 +14045,9 @@ impl<'a> Lowering<'a> {
         // literal operand carries no `Place` to read a type from, which is
         // what `n.checked_sub(1)` spells, so demanding that both resolve would
         // leave the constant-operand form on the residual path for want of a
-        // type the callee's signature already fixes.
+        // type the callee's signature already fixes.  Both-const
+        // (`1usize.checked_add(2)`) has no operand Place at all; the
+        // destination `Option<Self>` payload is then the width.
         if let OpKind::Call { target, .. } = &op_kind
             && let CallTarget::FunctionPath { segments, .. } = target
             && matches!(
@@ -13821,14 +14056,63 @@ impl<'a> Lowering<'a> {
             )
             && crate::front::checked_arith::is_checked_arith_target(target)
             && crate::front::result_exc::tyref_is_option(&call.dest.ty, self.llbc)
-            && let Some(operand_atom) = first_arg_ty
-                .as_ref()
-                .or(second_arg_ty.as_ref())
-                .and_then(|t| self.tyref_literal_uint_atom(t))
-            && checked_arith_uint_atom_is_word_sized(operand_atom)
+            && {
+                let dest_payload =
+                    crate::front::result_exc::tyref_option_payload(&call.dest.ty, self.llbc);
+                let dest_atom = dest_payload
+                    .as_ref()
+                    .and_then(|ty| self.tyref_literal_uint_atom(ty));
+                let peel0 = first_arg_ty
+                    .as_ref()
+                    .and_then(|ty| self.tyref_peel_ref_to_pointee(ty));
+                let peel1 = second_arg_ty
+                    .as_ref()
+                    .and_then(|ty| self.tyref_peel_ref_to_pointee(ty));
+                let op0 = first_arg_ty
+                    .as_ref()
+                    .and_then(|ty| self.tyref_literal_uint_atom(ty))
+                    .or_else(|| {
+                        peel0
+                            .as_ref()
+                            .and_then(|ty| self.tyref_literal_uint_atom(ty))
+                    });
+                let op1 = second_arg_ty
+                    .as_ref()
+                    .and_then(|ty| self.tyref_literal_uint_atom(ty))
+                    .or_else(|| {
+                        peel1
+                            .as_ref()
+                            .and_then(|ty| self.tyref_literal_uint_atom(ty))
+                    });
+                crate::front::checked_arith_uint::unsigned_word_atom(dest_atom, [op0, op1])
+                    .is_some()
+            }
             && let Some(site) = self.recognize_checked_arith_uint_site(&call.dest.ty, &result_var)
         {
             self.checked_arith_uint_sites.push(site);
+        }
+        // Word-sized `{u64,usize}::saturating_add`.  Narrow unsigned
+        // saturating add is not a word carry (`u32::MAX + 1` does not wrap
+        // in the u64 bank), so the dest atom is required here — the same
+        // width gate as unsigned `checked_add`.  Recorded on
+        // `saturating_sub_sites` (identical `{ result_var }` shape); the
+        // add pass matches the `saturating_add` leaf and declines sub
+        // producers.
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
+            && fmt_path_ends_with(segments, &["num", "<Impl>", "saturating_add"])
+            && self
+                .tyref_literal_uint_atom(&call.dest.ty)
+                .is_some_and(crate::front::checked_arith_uint::is_word_sized_uint_atom)
+        {
+            self.saturating_sub_sites
+                .push(crate::front::saturating_sub::SaturatingSubSite {
+                    result_var: result_var.clone(),
+                });
         }
         // Capture `Result::ok()` results whose payload is `Layout`
         // (`Option<Layout>`) for the `from_size_align` bound-check rewiring pass
@@ -13838,19 +14122,11 @@ impl<'a> Lowering<'a> {
         // here, and the post-pass validates the preceding `from_size_align`
         // residual + folded-const align before mutating.  A miss leaves both
         // residual calls for the existing Skip fallback.
-        if let OpKind::Call {
-            target:
-                CallTarget::Method {
-                    name,
-                    receiver_root,
-                    ..
-                },
-            args,
-            ..
-        } = &op_kind
-            && name == "ok"
-            && receiver_root.as_deref() == Some("Result")
+        // Method-hint (`Result::ok`) and FunDecl (`result::<Impl>::ok`)
+        // spellings both record: the rewriter already accepts both.
+        if let OpKind::Call { target, args, .. } = &op_kind
             && args.len() == 1
+            && crate::front::slice_get::is_result_ok_call_target(target)
             && crate::front::result_exc::tyref_is_option(&call.dest.ty, self.llbc)
             && let Some(site) = self.recognize_from_size_align_ok_site(&call.dest.ty, &result_var)
         {
@@ -13973,21 +14249,25 @@ impl<'a> Lowering<'a> {
             self.annotate_slice_first_site(&mut site, &arg_locals, slice_first_element.clone());
             self.slice_first_sites.push(site);
         }
-        // Capture `<[T]>::get(slice, i)` sites for the bounds-checked
-        // `Option<&T>` diamond `front::slice_get` synthesizes.  `get` is the
-        // general case of `first` — the same foreign leaf, the same raw
-        // `FunctionPath` segments and the same unregistered-callee census Skip
-        // — with the subscript in `args[1]`.  `recognize_slice_get_site` pins
-        // the scalar `SliceIndex` instantiation off that operand's type, so a
-        // range instantiation (whose payload is a sub-slice) and any other
-        // resolution miss both leave the residual call.
+        // Capture `<[T]>::get(slice, i)` / `get_mut` sites for the
+        // bounds-checked `Option<&T>` diamond `front::slice_get` synthesizes.
+        // `get` is the general case of `first` — the same foreign leaf, the
+        // same raw `FunctionPath` segments and the same unregistered-callee
+        // census Skip — with the subscript in `args[1]`.  `get_mut` is the
+        // same two-argument call; the rewriter already consumes that shape.
+        // `recognize_slice_get_site` pins the scalar `SliceIndex` instantiation
+        // off that operand's type, so a range instantiation (whose payload is
+        // a sub-slice) and any other resolution miss both leave the residual
+        // call.  `slice_get_element` is scalar / thin-pointer only: an
+        // `AtomicU64` or `Option<Entry>` element never produces a proof, and
+        // `get_mut` of a scalar is dropped because `ArrayRead` would copy it.
         if let OpKind::Call {
             target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } = &op_kind
             && args.len() == 2
-            && fmt_path_ends_with(segments, &["slice", "<Impl>", "get"])
+            && crate::front::slice_get::is_slice_get_segments(segments)
             && slice_get_index_is_scalar
             && let Some((item_ty, array_type_id)) = slice_get_element.clone()
             && let Some(site) =
@@ -14230,14 +14510,16 @@ impl<'a> Lowering<'a> {
         {
             self.result_map_err_sites.push(site);
         }
-        // Capture `Option::map`/`and_then`/`unwrap_or_else(opt, closure)` sites
+        // Capture `Option::map`/`and_then`/`unwrap_or_else(opt, callable)` sites
         // for the discriminant closure-select `front::option_closure_select`
-        // synthesizes.  All three are Opaque (foreign `core`) with the `Option`
-        // ADT receiver, so `first_is_self` routes them to a two-arg
-        // `CallTarget::Method` (receiver `args[0]`, closure env `args[1]`).
-        // Resolving the `Option` field owners + closure `call_once` owner needs
-        // the receiver type (`first_arg_ty`), the env type (`second_arg_ty`),
-        // and the result type (`call.dest.ty`), all in hand here;
+        // synthesizes.  All five combinators are Opaque (foreign `core`) with
+        // the `Option` ADT receiver, so `first_is_self` routes them to a
+        // two-arg `CallTarget::Method` (receiver `args[0]`, callable
+        // `args[1]`).  The callable is a closure ADT (`second_arg_ty` →
+        // `call_once`) or a function item (`second_arg_fn_item` → a direct
+        // `Call(FunctionPath)`).  Resolving the `Option` field owners plus
+        // the callable needs the receiver type, the env type or `FnDef`
+        // path, and the result type (`call.dest.ty`), all in hand here;
         // `recognize_closure_select_site` also confirms the receiver is an
         // `Option`.  A resolution miss leaves the residual call.
         if let OpKind::Call {
@@ -14262,6 +14544,7 @@ impl<'a> Lowering<'a> {
                 kind,
                 first_arg_ty.as_ref(),
                 second_arg_ty.as_ref(),
+                second_arg_fn_item.clone(),
                 &call.dest.ty,
                 &result_var,
             )
@@ -14740,20 +15023,34 @@ impl<'a> Lowering<'a> {
         is_index && callsite_index_is_scalar
     }
 
-    /// `<[T]>::get::<I>(slice, index)` with a scalar `I`.  For a local index,
-    /// MIR supplies the type through the operand Place; for a literal index it
-    /// only survives in Charon's method generics (`[T, I]`).  Preserve that
-    /// distinction so `get(1)` takes the guarded-item Option diamond while
-    /// `get(1..)` continues through `front::slice_index` as a subslice.
+    /// `<[T]>::get::<I>(slice, index)` / `get_mut` with a scalar `I`.  For a
+    /// local index, MIR supplies the type through the operand Place; for a
+    /// literal index it only survives in Charon's method generics (`[T, I]`).
+    /// Preserve that distinction so `get(1)` takes the guarded-item Option
+    /// diamond while `get(1..)` continues through `front::slice_index` as a
+    /// subslice.  The FunDecl spelling is `core::slice::<Impl>::get{,_mut}`
+    /// (and the `alloc::slice` twin); `core::slice::index::<Impl>::get` is
+    /// not this function.
     fn is_slice_get_scalar_call(&self, reg: &RegularCall, index_ty: Option<&TyRef>) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
         };
-        let is_get = self
-            .llbc
-            .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path() == "core::slice::<Impl>::get");
+        let is_get = self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            crate::front::slice_get::is_slice_get_name_path(&fd.item_meta.name_path())
+        });
         is_get && callsite_or_generic_index_is_scalar(reg, index_ty, self.llbc)
+    }
+
+    /// `true` when `reg` is `<[T]>::get_mut` (not `get`).  `get_mut` of a
+    /// thin pointer is the same two-argument diamond as `get`; `get_mut` of
+    /// a scalar is not recorded (`slice_get_element_may_record`).
+    fn is_slice_get_mut_call(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            crate::front::slice_get::is_slice_get_mut_name_path(&fd.item_meta.name_path())
+        })
     }
 
     /// `true` when `reg` is `core::slice::<Impl>::first` or `last`.
@@ -14779,6 +15076,9 @@ impl<'a> Lowering<'a> {
     /// other inline Rust aggregate declines — including a string or tuple
     /// element, which is one GC pointer only inside a list the translation
     /// builds, never inside the host slice this call reads.
+    /// `AtomicU64` (`portal_diag_bump`) and `Option<Entry>` (`RDict` slots)
+    /// are that decline: an `ArrayRead` would copy the aggregate, and the
+    /// consumer mutates the live slot (`fetch_add`, `*slot = …`).
     /// The outer `Option` is the proof, while the inner one is the optional
     /// ARRAY identity (`Some(None)` means the proven thin-pointer case).
     fn slice_get_element(&self, reg: &RegularCall) -> Option<(ValueType, Option<String>)> {
@@ -15353,8 +15653,10 @@ impl<'a> Lowering<'a> {
         tyref_strips_to_str(dest_ty, self.llbc)
     }
 
-    /// `w_str_get_wtf8(obj)` — `_utf8`.  pyre_cpu treats the
-    /// `W_UnicodeObject` as the STR, so the field is identity.
+    /// `w_str_get_wtf8(obj)` — `_utf8`.  Dest is the receiver's
+    /// machine value projected as `ValueType::Str` (`Wtf8` string-root
+    /// `__cast_instance_intrinsic`), not a residual call and not an
+    /// alias that keeps the `PyObject` instance type.
     fn is_w_str_get_wtf8_identity(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
@@ -15487,8 +15789,8 @@ impl<'a> Lowering<'a> {
     }
 
     /// `<*mut T>::add` / `<*const T>::add` when the pointee has a known
-    /// byte size, so the existing `raw_ptradd` / `direct_ptradd` scaling
-    /// can run at the callsite.
+    /// byte size, so the count can be scaled to a byte offset before
+    /// `lltype.direct_ptradd`.
     fn ptr_add_pointee_size(&self, reg: &RegularCall, first_arg_ty: Option<&TyRef>) -> Option<i64> {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return None;
@@ -15502,6 +15804,32 @@ impl<'a> Lowering<'a> {
                 .or_else(|| tyref_peel_one_ref_node(ty, self.llbc))
         })?;
         json_ty_byte_size(pointee, self.llbc)
+    }
+
+    /// Later intercepts in this same `RegularCall` match already lower
+    /// some `.add` calls: items-base accessors alias to the header
+    /// (brick 1), string-array remove aliases the interior pointer,
+    /// and a `.add` consumed by one deref becomes getarrayitem
+    /// (brick 3).  Those must run instead of `direct_ptradd`.
+    fn ptr_add_has_later_intercept(
+        &self,
+        reg: &RegularCall,
+        args_len: usize,
+        arg_locals: &[Option<usize>],
+        first_arg_ty: Option<&TyRef>,
+        dest_local: usize,
+    ) -> bool {
+        (args_len == 2 && self.is_items_block_base_ptr_add(reg))
+            || (args_len == 2
+                && self.string_array_remove_owner().is_some()
+                && regular_call_is_ptr_add(reg, self.llbc))
+            || self
+                .string_items_elem_ptr_add(reg, args_len, arg_locals, first_arg_ty, dest_local)
+                .is_some()
+            || self.is_list_items_elem_ptr_add(reg, args_len, arg_locals, first_arg_ty, dest_local)
+            || self
+                .typed_items_elem_ptr_add(reg, args_len, arg_locals, first_arg_ty, dest_local)
+                .is_some()
     }
 
     /// `core::ptr::write` of a Copy scalar or thin pointer.  An aggregate
@@ -17725,7 +18053,7 @@ impl<'a> Lowering<'a> {
         let payload_ty_ref = self.tyref_adt_type_arg(dest_ty, 0)?;
         let layout_def_id = self.tyref_adt_def_id(&payload_ty_ref)?;
         let layout_owner = self.llbc.type_by_id(layout_def_id)?.item_meta.name_path();
-        if layout_owner != "core::alloc::layout::Layout" {
+        if !crate::front::from_size_align::is_layout_adt_owner(&layout_owner) {
             return None;
         }
         Some(crate::front::from_size_align::FromSizeAlignSite {
@@ -17752,7 +18080,7 @@ impl<'a> Lowering<'a> {
     ) -> Option<crate::front::from_size_align::FromSizeAlignExpectSite> {
         let layout_def_id = self.tyref_adt_def_id(dest_ty)?;
         let layout_owner = self.llbc.type_by_id(layout_def_id)?.item_meta.name_path();
-        if layout_owner != "core::alloc::layout::Layout" {
+        if !crate::front::from_size_align::is_layout_adt_owner(&layout_owner) {
             return None;
         }
         Some(crate::front::from_size_align::FromSizeAlignExpectSite {
@@ -18370,19 +18698,21 @@ impl<'a> Lowering<'a> {
     }
 
     /// Resolve a recognized `Option::map`/`and_then`/`unwrap_or_else(opt,
-    /// closure)` call into a
+    /// callable)` call into a
     /// [`crate::front::option_closure_select::ClosureSelectSite`] — the `Option`
-    /// enum root + `Some` variant owners, the closure env's `call_once` owner,
-    /// the payload type `T`, and the closure's `call_once` result type (`U` for
-    /// `map`, `Option<U>` for `and_then`, `T` for `unwrap_or_else`).  `None`
-    /// (leaving the residual call) when the receiver is not a resolvable
-    /// `Option`, the closure env does not resolve to an ADT, or (for `map`) the
+    /// enum root + `Some` variant owners, the callable (closure env
+    /// `call_once` owner, or function-item `FunctionPath` segments), the
+    /// payload type `T`, and the call result type (`U` for `map`, `Option<U>`
+    /// for `and_then`, `T` for `unwrap_or_else`).  `None` (leaving the residual
+    /// call) when the receiver is not a resolvable `Option`, the callable is
+    /// neither a closure ADT nor a named function item, or (for `map`) the
     /// result is not an `Option`.
     fn recognize_closure_select_site(
         &self,
         kind: crate::front::option_closure_select::ClosureCombinator,
         recv_ty: Option<&TyRef>,
         env_ty: Option<&TyRef>,
+        fn_item_segments: Option<Vec<String>>,
         dest_ty: &TyRef,
         result_var: &Variable,
     ) -> Option<crate::front::option_closure_select::ClosureSelectSite> {
@@ -18407,13 +18737,24 @@ impl<'a> Lowering<'a> {
         let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
         let payload_ty = self.tyref_option_payload_value_type(&recv_ty)?;
         let payload_class_root = self.option_payload_instance_class_root(&recv_ty);
-        let env_def_id = self.tyref_ref_adt_def_id(env_ty?)?;
-        let env_td = self.llbc.type_by_id(env_def_id)?;
-        let call_once_owner = env_td.item_meta.name_path();
-        // The single-element closure-`Args` tuple `(payload,)` the extracted
-        // `call_once` reads its `.0` from, keyed to the same `Tuple<X>` leaf
-        // the read side derives at `resolve_place`.
-        let args_tuple_suffix = option_payload_tuple_suffix(&recv_ty, self.llbc);
+        // Prefer a closure ADT (`call_once(env, (x,))`).  A function item has
+        // no ADT def id — `tyref_ref_adt_def_id` misses — so fall through to
+        // the `FnDef` path captured from the operand (or from `env_ty` when
+        // the item was spilled to a local).
+        let fn_item_segments = fn_item_segments
+            .or_else(|| env_ty.and_then(|ty| tyref_fn_def_call_segments(ty, self.llbc)));
+        let (call_once_owner, args_tuple_suffix, fn_item_segments) =
+            if let Some(env_def_id) = env_ty.and_then(|ty| self.tyref_ref_adt_def_id(ty)) {
+                let env_td = self.llbc.type_by_id(env_def_id)?;
+                (
+                    env_td.item_meta.name_path(),
+                    option_payload_tuple_suffix(&recv_ty, self.llbc),
+                    None,
+                )
+            } else {
+                let segments = fn_item_segments.filter(|s| !s.is_empty())?;
+                (String::new(), String::new(), Some(segments))
+            };
         // The type the closure's `call_once` returns: `map`'s dest is
         // `Option<U>` and its closure returns `U` (the dest payload);
         // `and_then`'s dest is `Option<U>` returned directly; `or_else`'s dest
@@ -18482,6 +18823,7 @@ impl<'a> Lowering<'a> {
             result_niche,
             result_fieldless_none_tag,
             call_once_owner,
+            fn_item_segments,
             payload_ty,
             payload_class_root,
             call_result_ty,
@@ -20881,14 +21223,6 @@ impl<'a> Lowering<'a> {
             self.block_entry_string_byte_view_locals[target_bb].remove(local_idx);
         }
     }
-}
-
-/// The unsigned checked-arithmetic pass uses one machine-word operation and
-/// its carry/borrow test.  Charon's flattened [`ValueType::Unsigned`] erases
-/// the source width, so retain the literal atom at the capture gate: a narrow
-/// `u8`/`u16`/`u32` overflow is not necessarily a word overflow.
-fn checked_arith_uint_atom_is_word_sized(atom: &str) -> bool {
-    matches!(atom, "U64") || (atom == "Usize" && crate::layout::target_word_size() == 8)
 }
 
 /// Which PBC family an `OpKind::IndirectCall` through a bare function
@@ -23763,6 +24097,27 @@ fn impl_method_owner_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<(String, S
     Some((owner_qualified, leaf))
 }
 
+/// Path segments used to *call* a function named by a `FnDef` constant or
+/// type — the same spelling `decode_constant` stores in a function-item
+/// value and `call_target_segments` emits for a direct call.  Impl-owned
+/// callees use `[qualified_owner, leaf]`; free functions keep `name_path()`
+/// split on `::`.
+fn fundecl_fn_item_segments(llbc: &Llbc, fd: &FunDecl) -> Vec<String> {
+    match impl_method_owner_for_fundecl(llbc, fd) {
+        Some((owner_qualified, leaf)) => {
+            let mut v: Vec<String> = owner_qualified.split("::").map(str::to_string).collect();
+            v.push(leaf);
+            v
+        }
+        None => fd
+            .item_meta
+            .name_path()
+            .split("::")
+            .map(|s| s.to_string())
+            .collect(),
+    }
+}
+
 /// For a `Deref` / `DerefMut` trait-impl method, resolve the leaf
 /// identifier of the implementing `Self` ADT (`Box`, `Rc`, `Arc`,
 /// `FrameBox`, …) directly from the impl's `Self` type, bypassing the
@@ -23879,6 +24234,179 @@ pub(crate) fn collect_policy_opaque_fn_stubs_from_llbc(
     collect_fn_stubs_from_llbc_if(llbc, error_carrier, |fd| {
         marked.contains(&strip_crate_prefix(&fd.item_meta.name_path()))
     })
+}
+
+/// Collect signature-only [`DeclinedFunDecl`] rows for every local function
+/// whose unstructured body contains a non-`Relaxed` `Atomic*::load`.
+///
+/// Re-derives the same condition `build_semantic_program_from_llbcs`
+/// records in its local `skipped` vec (`LowerError::Unsupported` whose
+/// Display contains `atomic load ordering`).  The skip list is a
+/// `(leaf, message)` pair and never leaves that function, so a sibling
+/// of [`collect_policy_opaque_fn_stubs_from_llbc`] walks the LLBC and
+/// rebuilds the full declaration (path segments, scalar lltypes, the
+/// Display string) instead of threading `skipped` out.
+pub(crate) fn collect_atomic_load_declined_fun_decls(
+    llbc: &Llbc,
+) -> Vec<crate::translator::rtyper::lltypesystem::module::ll_extaccessor::DeclinedFunDecl> {
+    use crate::translator::rtyper::lltypesystem::module::ll_extaccessor::DeclinedFunDecl;
+    let mut out = Vec::new();
+    for fd in llbc.iter_local_fns() {
+        if fd.is_global_initializer.is_some() {
+            continue;
+        }
+        let Some(body) = fd.unstructured() else {
+            continue;
+        };
+        let Some(ordering) = first_non_relaxed_atomic_load_ordering(llbc, &body) else {
+            continue;
+        };
+        let segments: Vec<String> = fd
+            .item_meta
+            .name_path()
+            .split("::")
+            .map(String::from)
+            .collect();
+        out.push(DeclinedFunDecl {
+            segments,
+            arg_lltypes: fd
+                .signature
+                .inputs
+                .iter()
+                .map(|ty| tyref_to_external_lltype(ty, llbc))
+                .collect(),
+            result_lltype: tyref_to_external_lltype(&fd.signature.output, llbc),
+            has_translatable_body: false,
+            decline_reason: format!(
+                "unsupported MIR: atomic load ordering {ordering} requires \
+                 address-preserving ordered lowering"
+            ),
+        });
+    }
+    out
+}
+
+fn first_non_relaxed_atomic_load_ordering(llbc: &Llbc, body: &Unstructured) -> Option<String> {
+    let mut ordering_locals: std::collections::HashMap<usize, String> =
+        std::collections::HashMap::new();
+    for bb in &body.body {
+        for stmt in &bb.statements {
+            let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
+                continue;
+            };
+            if let PlaceKind::Local(index) = dest.kind
+                && let Some(name) = atomic_ordering_variant_of(llbc, &rvalue)
+            {
+                ordering_locals.insert(index as usize, name);
+            }
+        }
+        let Ok(TermKind::Call { call, .. }) = bb.term() else {
+            continue;
+        };
+        if call.args.len() != 2 {
+            continue;
+        }
+        let CallFunc::Regular(reg) = &call.func else {
+            continue;
+        };
+        if !call_is_atomic_load(reg, llbc) {
+            continue;
+        }
+        let ordering = operand_local_index(&call.args[1])
+            .and_then(|local| ordering_locals.get(&local).cloned())
+            .unwrap_or_else(|| "unknown".to_string());
+        if ordering != "Relaxed" {
+            return Some(ordering);
+        }
+    }
+    None
+}
+
+fn call_is_atomic_load(reg: &RegularCall, llbc: &Llbc) -> bool {
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return false;
+    };
+    let Some(fd) = llbc.fn_by_id(*id) else {
+        return false;
+    };
+    if fd.item_meta.name_path().rsplit("::").next() != Some("load") {
+        return false;
+    }
+    fd.signature.inputs.first().is_some_and(|ty| {
+        adt_path_of_tyref(ty, llbc).is_some_and(|path| {
+            path.contains("::sync::atomic::")
+                && path
+                    .rsplit("::")
+                    .next()
+                    .is_some_and(|leaf| leaf.starts_with("Atomic"))
+        })
+    })
+}
+
+fn atomic_ordering_variant_of(llbc: &Llbc, rvalue: &Rvalue) -> Option<String> {
+    let Rvalue::Aggregate(kind, _) = rvalue else {
+        return None;
+    };
+    let adt = kind.as_object()?.get("Adt")?.as_array()?;
+    let head = adt.first()?;
+    let type_id = match head.as_u64() {
+        Some(id) => id,
+        None => head.get("id")?.get("Adt")?.as_u64()?,
+    };
+    let td = llbc.type_by_id(type_id)?;
+    if td.item_meta.name_path() != "core::sync::atomic::Ordering" {
+        return None;
+    }
+    let TypeDeclKind::Enum(variants) = &td.kind else {
+        return None;
+    };
+    let variant_idx = adt.get(1).and_then(serde_json::Value::as_u64)? as usize;
+    Some(variants.get(variant_idx)?.name.clone())
+}
+
+fn operand_local_index(op: &Operand) -> Option<usize> {
+    let place = match op {
+        Operand::Copy(place) | Operand::Move(place) => place,
+        Operand::Const(_) => return None,
+    };
+    match &place.kind {
+        PlaceKind::Local(index) => Some(*index as usize),
+        _ => None,
+    }
+}
+
+fn tyref_to_external_lltype(
+    ty: &TyRef,
+    llbc: &Llbc,
+) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    if is_unit_type(ty, llbc) {
+        return LowLevelType::Void;
+    }
+    // `tyref_to_value_type` peels `&T` and types an atomic wrapper as
+    // its inner scalar, so a pointer argument would look like a word.
+    // The residual-call ABI refuses pointer args; keep them Address.
+    if output_type_is_ref(ty, llbc) || tyref_is_raw_pointer(ty, llbc) {
+        return LowLevelType::Address;
+    }
+    match tyref_to_value_type(ty, llbc) {
+        ValueType::Int => LowLevelType::Signed,
+        ValueType::Unsigned => LowLevelType::Unsigned,
+        ValueType::Int128 => LowLevelType::SignedLongLongLong,
+        ValueType::UInt128 => LowLevelType::UnsignedLongLongLong,
+        ValueType::Bool => LowLevelType::Bool,
+        ValueType::Float => LowLevelType::Float,
+        ValueType::SingleFloat => LowLevelType::SingleFloat,
+        ValueType::Void => LowLevelType::Void,
+        _ => LowLevelType::Address,
+    }
+}
+
+fn tyref_is_raw_pointer(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|node| strip_ty_indirections(node, llbc))
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|obj| obj.contains_key("RawPtr"))
 }
 
 fn collect_fn_stubs_from_llbc_if(
@@ -24656,7 +25184,7 @@ fn clone_tyref(ty: &TyRef) -> TyRef {
 /// `Bool`) shares the `'int'` bank, `Ref` the `'ref'` bank, `Float` the
 /// `'float'` bank.  Non-value kinds (`Void` / `State` / `Unknown`) get a
 /// distinct discriminant so they never compare equal to a real bank.
-fn value_type_bank(ty: &ValueType) -> u8 {
+pub(crate) fn value_type_bank(ty: &ValueType) -> u8 {
     match ty {
         ValueType::Int | ValueType::Unsigned | ValueType::Bool => 0,
         ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder => 1,
@@ -24810,6 +25338,41 @@ fn cast_call_segments(src: &ValueType, dst: &ValueType) -> Option<Vec<String>> {
 fn int_binop_needs_ptr_to_int(op: &str, lhs: Option<&ValueType>, rhs: Option<&ValueType>) -> bool {
     matches!(op, "lt" | "le" | "gt" | "ge" | "mod" | "floordiv" | "div")
         && (matches!(lhs, Some(ValueType::Ref(_))) || matches!(rhs, Some(ValueType::Ref(_))))
+}
+
+/// Emit `simple_call(lltype.direct_ptradd, p, n)` and return the pointer
+/// result.  The annotation is the pointer operand's (`ann_direct_ptradd`
+/// returns `s_p`), so a `null_mut()` arm of the same pointer unions with
+/// it.  `n` is a Signed/Unsigned byte offset — pointee scaling happens
+/// at the callsite when `TO.OF` is not recoverable later.
+fn push_direct_ptradd(
+    graph: &mut FunctionGraph,
+    bb_id: BlockId,
+    ptr: Variable,
+    count: Variable,
+) -> Variable {
+    let result = graph.alloc_value_var();
+    graph.block_mut(bb_id).operations.push(SpaceOperation {
+        result: Some(result.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: [
+                    "rpython",
+                    "rtyper",
+                    "lltypesystem",
+                    "lltype",
+                    "direct_ptradd",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+                fun_decl_id: None,
+            },
+            args: crate::model::call_args(vec![ptr, count]),
+            result_ty: ValueType::Ref(None),
+        },
+    });
+    result
 }
 
 /// Emit `simple_call(lltype.cast_ptr_to_int, p)` and return the Signed
@@ -25040,6 +25603,27 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     // `StringRepr`.
     if tyref_is_string_value(ty, llbc) || tyref_raw_ptr_pointee_is_string_value(ty, llbc) {
         return ValueType::Str;
+    }
+    // A payload-carrying enum (any variant has a non-ZST field) is a
+    // `SomeInstance` of its interned enum-base classdef.  Fieldless
+    // (C-like) enums are already `Int` above; a mixed enum would
+    // otherwise fall through to `Ref(None)` and
+    // `valuetype_to_someshell(Ref)` would seed `SomeInstance(classdef=None)`,
+    // which `union(Instance, Instance)` absorbs over every typed variant.
+    //
+    // `ValueType::Str` is the same kind of precise paint (a string field
+    // must not seed the classdef-less `Ref` shell).  Enums intern through
+    // `ClassDef` like structs, so the existing `Ref(Some(root))` carrier
+    // is the paint: the intern key is the same class root
+    // `Input.class_root` and `getuniqueclassdef_for_struct_root` already
+    // consume (`tyref_class_root` → `adt_node_class_root`, the ADT leaf
+    // plus a per-instantiation suffix when the head splits).
+    // `InstanceRepr.rtype_getattr` (`rclass.rs`) then reads
+    // `__discriminant` off that interned base; a classdef-less root
+    // falls to `getclsfield`, which is the upstream path — do not
+    // synthesize a tag there.
+    if let Some(root) = tyref_payload_enum_class_root(ty, llbc) {
+        return ValueType::Ref(Some(root));
     }
     ValueType::Ref(None)
 }
@@ -25482,6 +26066,27 @@ fn tyref_fieldless_enum_class_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
     Some(strip_crate_prefix(&td.item_meta.name_path()))
 }
 
+/// Interned class-root spelling of a payload-carrying enum `ty`.
+///
+/// Fieldless (C-like) enums, including a borrow of one, are the tag
+/// integer and have no instance classdef.  A mixed enum — any variant
+/// carries a non-ZST field — is a `SomeInstance` of the enum-base class
+/// `Bookkeeper::getuniqueclassdef_for_struct_root` intern's.  The
+/// spelling matches `OpKind::Input.class_root` ([`tyref_class_root`]):
+/// the ADT leaf, plus a per-instantiation suffix when the head splits.
+/// `None` when `ty` is not such an enum, or when the root resolver
+/// declines it (the core/std/alloc container family, which has dedicated
+/// annotator models rather than a classdef).
+fn tyref_payload_enum_class_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
+    if tyref_is_fieldless_enum_free(ty, llbc) || tyref_is_borrowed_fieldless_enum_free(ty, llbc) {
+        return None;
+    }
+    if !tyref_is_enum_free(ty, llbc) {
+        return None;
+    }
+    tyref_class_root(ty, llbc)
+}
+
 /// Encode the FUNC.RESULT of a `dont_look_inside` callee into the
 /// canonical `FunctionGraph.return_type` token the rtyper stub
 /// classifier (`cutover.rs` `dont_look_inside` arm) decodes, so the
@@ -25630,9 +26235,11 @@ fn tyref_is_int_range_inclusive(ty: &TyRef, llbc: &Llbc) -> bool {
 /// `valuetype_to_someshell`
 /// picks `SomeInteger { unsigned: true }`, matching the per-field shells
 /// the syn classifier produced for `u8`..`usize`.  `char` and every
-/// signed width fold to `Int`; `bool`/`float` keep their classes; every
-/// non-scalar shape (named struct/enum, reference, raw pointer, tuple, slice,
-/// array, `Box`/`Rc`/`Arc` wrapper) folds to `Ref(None)` whose someshell ignores
+/// signed width fold to `Int`; `bool`/`float` keep their classes; a
+/// payload-carrying enum paints `Ref(Some(root))` so the FORCE-attr intern
+/// keys the same classdef `Input.class_root` does; every other non-scalar
+/// shape (named struct, reference, raw pointer, tuple, slice, array,
+/// `Box`/`Rc`/`Arc` wrapper) folds to `Ref(None)` whose someshell ignores
 /// the payload. A `repr(transparent)` scalar wrapper keeps its inner register
 /// class, as it does at ordinary value sites.
 fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
@@ -25717,6 +26324,12 @@ fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     // records the physical pointer-sized slot independently.
     if tyref_is_string_value(ty, llbc) || tyref_raw_ptr_pointee_is_string_value(ty, llbc) {
         return ValueType::Str;
+    }
+    // Matching [`tyref_to_value_type`]: a payload-carrying enum field
+    // seeds `Ref(Some(root))` so the FORCE-attr / call-result narrow
+    // intern the enum base instead of the classdef-less `Ref(None)` shell.
+    if let Some(root) = tyref_payload_enum_class_root(ty, llbc) {
+        return ValueType::Ref(Some(root));
     }
     ValueType::Ref(None)
 }
@@ -26022,6 +26635,123 @@ fn tyref_transparent_inner_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueTy
     }
 }
 
+thread_local! {
+    /// Foldable const literals harvested from the whole linked LLBC set.
+    ///
+    /// The streaming driver parses one artefact at a time and drops it,
+    /// so a defining crate's initializer body is gone by the time a
+    /// dependent crate's read is lowered. The harvest stores the folded
+    /// value, keyed by the full `item_meta.name_path()`, for
+    /// [`Lowering::const_eval_global`] to consult after the local
+    /// initializer lanes fail. Thread-local, not a process-global lock:
+    /// one translate pipeline runs on one thread, matching
+    /// [`crate::local_crates::register_local_crate_roots`].
+    static FOLDABLE_CONST_LITS: RefCell<Vec<(String, OpKind)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+fn global_is_thread_local(g: &GlobalDecl) -> bool {
+    g.rest
+        .get("global_kind")
+        .and_then(serde_json::Value::as_str)
+        == Some("ThreadLocal")
+}
+
+fn global_source_text_is_static_mut(g: &GlobalDecl) -> bool {
+    g.item_meta
+        .source_text
+        .as_deref()
+        .is_some_and(|s| s.contains("static mut"))
+        || g.rest
+            .get("item_meta")
+            .and_then(|m| m.get("source_text"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| s.contains("static mut"))
+}
+
+/// Harvest foldable const literals from one artefact.
+///
+/// A global whose initializer Charon kept as a body folds under the
+/// same gates as [`Lowering::const_eval_global`]: not a `ThreadLocal`,
+/// not a `static mut`, body present, and [`const_eval_init_body_lit`]
+/// succeeds — including a `size_of` / `align_of` Call, which is the
+/// only Call shape that evaluator will fold. Dependency artefacts
+/// record the same item as `opacity: Foreign` with no body; the
+/// defining crate's harvest is what a later lowering consults for
+/// those reads.
+///
+/// `item_meta.name_path()` renders every trait-impl segment as
+/// `"<Impl>"`, so two associated consts in one module share a path
+/// (`::<Impl>::CPYTHON_IMMUTABLETYPE`) and can fold to different
+/// values. A path that names more than one global in this artefact is
+/// not an identity, so it is left unharvested rather than folded or
+/// asserted.
+pub(crate) fn discover_foldable_const_lits(llbc: &Llbc) -> Vec<(String, OpKind)> {
+    let mut paths: Vec<String> = llbc
+        .iter_global_decls()
+        .map(|g| g.item_meta.name_path())
+        .collect();
+    paths.sort();
+    let mut ambiguous: Vec<String> = Vec::new();
+    for pair in paths.windows(2) {
+        if pair[0] == pair[1] && ambiguous.last() != Some(&pair[0]) {
+            ambiguous.push(pair[0].clone());
+        }
+    }
+    let mut discovered = Vec::new();
+    for g in llbc.iter_global_decls() {
+        if global_is_thread_local(g) || global_source_text_is_static_mut(g) {
+            continue;
+        }
+        let path = g.item_meta.name_path();
+        if ambiguous.binary_search(&path).is_ok() {
+            continue;
+        }
+        let Some(init_id) = g.rest.get("init").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        let Some(fd) = llbc.fn_by_id(init_id) else {
+            continue;
+        };
+        let Some(u) = fd.unstructured() else {
+            continue;
+        };
+        let Some(op) = const_eval_init_body(llbc, &u) else {
+            continue;
+        };
+        discovered.push((path, op));
+    }
+    discovered
+}
+
+/// Replace this thread's harvested foldable-const set with one
+/// pipeline invocation's merged literals. A later invocation on the
+/// same thread overwrites. Two artefacts that fold the same full path
+/// to different values is a bug, not a silent winner.
+pub(crate) fn register_foldable_const_lits(entries: impl IntoIterator<Item = (String, OpKind)>) {
+    let mut lits: Vec<(String, OpKind)> = Vec::new();
+    for (path, lit) in entries {
+        match lits.binary_search_by(|(known, _)| known.cmp(&path)) {
+            Ok(index) => assert_eq!(
+                lits[index].1, lit,
+                "foldable const {path} has inconsistent linked definitions"
+            ),
+            Err(index) => lits.insert(index, (path, lit)),
+        }
+    }
+    FOLDABLE_CONST_LITS.with(|slot| *slot.borrow_mut() = lits);
+}
+
+fn foldable_const_lit(path: &str) -> Option<OpKind> {
+    FOLDABLE_CONST_LITS.with(|slot| {
+        let lits = slot.borrow();
+        let index = lits
+            .binary_search_by(|(known, _)| known.as_str().cmp(path))
+            .ok()?;
+        Some(lits[index].1.clone())
+    })
+}
+
 /// Link complete transparent-scalar declarations to opaque dependency views.
 ///
 /// Charon keeps `repr(transparent)` in an external declaration's layout but
@@ -26057,14 +26787,19 @@ pub(crate) fn discover_transparent_scalar_kinds(
 
 fn link_transparent_scalar_types(llbcs: &[Llbc]) {
     let mut discovered = Vec::new();
+    let mut foldable_consts = Vec::new();
     for llbc in llbcs {
         discovered.extend(discover_transparent_scalar_kinds(llbc));
+        foldable_consts.extend(discover_foldable_const_lits(llbc));
     }
     discovered.sort_by(|a, b| a.0.cmp(&b.0));
     discovered.dedup();
+    foldable_consts.sort_by(|a, b| a.0.cmp(&b.0));
+    foldable_consts.dedup();
     for llbc in llbcs {
         llbc.register_transparent_scalar_kinds(discovered.iter().cloned());
     }
+    register_foldable_const_lits(foldable_consts);
 }
 
 /// `Arg<T>` from `rustpython_compiler_core::bytecode::instruction` —
@@ -26363,6 +27098,59 @@ fn type_node_is_fn_ptr<'l>(mut node: &'l serde_json::Value, llbc: &'l Llbc) -> b
         return obj.get("FnPtr").is_some();
     }
     false
+}
+
+/// FunDecl id of a function-item (`FnDef`) type, after following
+/// serialization indirections.  `None` for a function pointer (`FnPtr`), a
+/// closure ADT, or any other shape.  Does not peel `Ref` / `RawPtr`: a
+/// function item is passed by value.
+fn type_node_fn_def_fun_id<'l>(mut node: &'l serde_json::Value, llbc: &'l Llbc) -> Option<u64> {
+    for _ in 0..24 {
+        let obj = node.as_object()?;
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            node = llbc.dedup_body(id)?;
+            continue;
+        }
+        if let Some(arr) = obj
+            .get("HashConsedValue")
+            .and_then(serde_json::Value::as_array)
+            && arr.len() == 2
+        {
+            node = &arr[1];
+            continue;
+        }
+        return obj
+            .get("FnDef")?
+            .as_object()?
+            .get("kind")?
+            .get("Fun")?
+            .get("Regular")?
+            .as_u64();
+    }
+    None
+}
+
+/// Direct-call `FunctionPath` segments of a `FnDef` type, or `None` when
+/// `ty` is not a named function item.
+fn tyref_fn_def_call_segments(ty: &TyRef, llbc: &Llbc) -> Option<Vec<String>> {
+    let fun_id = type_node_fn_def_fun_id(tyref_node(ty, llbc)?, llbc)?;
+    let fd = llbc.fn_by_id(fun_id)?;
+    let segments = fundecl_fn_item_segments(llbc, fd);
+    (!segments.is_empty()).then_some(segments)
+}
+
+/// Callable named by a combinator's second argument when that argument is a
+/// function item: a `FnDef` constant, or a Copy/Move of a `FnDef`-typed
+/// local.  `None` for a closure ADT (handled via `call_once`) and for any
+/// unproven shape.
+fn operand_fn_item_segments(llbc: &Llbc, op: Option<&Operand>) -> Option<Vec<String>> {
+    match op? {
+        Operand::Const(value) => match decode_constant(llbc, value) {
+            Ok(DecodedConst::FnPath(segments)) if !segments.is_empty() => Some(segments),
+            _ => None,
+        },
+        Operand::Copy(p) | Operand::Move(p) => tyref_fn_def_call_segments(&p.ty, llbc),
+    }
 }
 
 /// The pointee type node of a shared reference `&T` (`{"Ref": [region, ty,
@@ -28507,8 +29295,8 @@ const NON_ADT_OWNER_METHOD_ALLOWLIST: &[(&str, &str)] =
 ///
 /// Used by the `CallKind::Trait` arm of
 /// [`Lowering::call_target_segments`] to emit
-/// `CallTarget::FunctionPath { segments: [trait_leaf, method_leaf]
-///, fun_decl_id: None }`, matching the direct-path key
+/// `CallTarget::FunctionPath { segments: [trait_leaf, method_leaf] }`,
+/// matching the direct-path key
 /// `register_function_graph(direct_path, …)` at `lib.rs`
 /// (`extract_trait_impls`'s `<default methods of <Trait>>` branch).
 fn trait_method_owner(fd: &FunDecl) -> Option<(String, String)> {
@@ -28904,10 +29692,48 @@ fn static_key_matches(full: &str, stripped: &str, key: &str) -> bool {
         || path_has_suffix_ignoring_raw(stripped, key)
 }
 
+/// Path segments of a Global place, including the Ident disambiguator
+/// Charon records as `Ident [name, n]`.
+///
+/// `item_meta.name_path()` is the human-facing label and is not injective:
+/// it keeps `closure#N` so co-located closure envs stay distinct ClassDefs,
+/// but drops every other Ident's `n`. Function-local statics reuse a leaf
+/// (`OWNER` inside `method_owner`, rustc `n` in `0..57`) and would all
+/// look up as one key. `n == 0` stays the bare ident so existing
+/// module-level table keys keep matching; `n > 0` is spelled `name#n`,
+/// the same shape `name_path` already uses for closures. Other segments
+/// still render as `<Variant>` — a label, recovered by
+/// `item_meta.trait_impl_id()` when identity is required.
+fn static_key_segments(name: &[NameSeg]) -> Vec<String> {
+    name.iter().map(static_key_segment).collect()
+}
+
+fn static_key_segment(seg: &NameSeg) -> String {
+    match seg {
+        NameSeg::Ident {
+            ident: (s, disambiguator),
+        } => {
+            if *disambiguator > 0 {
+                format!("{s}#{disambiguator}")
+            } else {
+                s.clone()
+            }
+        }
+        NameSeg::Other(v) => {
+            let label = v
+                .as_object()
+                .and_then(|m| m.keys().next().cloned())
+                .unwrap_or_else(|| "?".into());
+            format!("<{label}>")
+        }
+    }
+}
+
 /// Supply the value of a primitive `f64` associated constant whose
 /// initializer Charon records as an `Opaque` body — `core` defines
-/// `f64::INFINITY` as `1.0_f64 / 0.0_f64`, so no in-LLBC init survives
-/// for [`Lowering::const_eval_global`] to evaluate.  The value is a
+/// `f64::INFINITY` as `1.0_f64 / 0.0_f64` and `f64::NAN` as
+/// `0.0_f64 / 0.0_f64`, so no in-LLBC init survives for
+/// [`Lowering::const_eval_global`] to evaluate.  The value is a
 /// fixed IEEE-754 bit pattern the host (rustc) already computed, so
 /// emit it as the same by-value `ConstFloat` an inline float literal
 /// lowers to (mirroring `rfloat.INFINITY` reaching the flow graph as a
@@ -28929,11 +29755,27 @@ fn primitive_float_const(segments: &[String]) -> Option<OpKind> {
         .map(String::as_str)
         .collect();
     let bits = match tail.as_slice() {
-        ["f64", "<Impl>", "INFINITY"] => f64::INFINITY.to_bits(),
+        ["f64", "<Impl>", name] => primitive_f64_assoc_bits(name)?,
         ["f64", "consts", name] => float_consts_value(name)?.to_bits(),
         _ => return None,
     };
     Some(OpKind::ConstFloat(bits))
+}
+
+/// IEEE-754 bits of `f64::<NAME>` associated constants.  Integer-valued
+/// siblings (`RADIX`, `MANTISSA_DIGITS`, the `*_EXP` family) are not
+/// floats and stay residual.
+fn primitive_f64_assoc_bits(name: &str) -> Option<u64> {
+    Some(match name {
+        "INFINITY" => f64::INFINITY.to_bits(),
+        "NEG_INFINITY" => f64::NEG_INFINITY.to_bits(),
+        "NAN" => f64::NAN.to_bits(),
+        "EPSILON" => f64::EPSILON.to_bits(),
+        "MIN" => f64::MIN.to_bits(),
+        "MAX" => f64::MAX.to_bits(),
+        "MIN_POSITIVE" => f64::MIN_POSITIVE.to_bits(),
+        _ => return None,
+    })
 }
 
 /// The value `core::f64::consts::<NAME>` holds.  Spelled through the host's
@@ -28990,6 +29832,37 @@ fn known_array_layout_const(segments: &[String]) -> Option<OpKind> {
     let header = crate::layout::target_word_size();
     let items_offset = header.next_multiple_of(align_of::<u64>());
     Some(OpKind::ConstInt(items_offset as i64))
+}
+
+/// Supply the value of `bitflags::traits::Bits::EMPTY`.
+///
+/// Charon records the associated const's initializer as an `Opaque`
+/// body: the impl lives in `bitflags`, which is outside the extraction
+/// set, so [`Lowering::const_eval_global`] finds nothing to evaluate.
+/// Every primitive `Bits` impl defines `EMPTY` as `0` (`impl_bits!`),
+/// so emit that `0` as the same by-value `ConstInt` an inline integer
+/// literal lowers to.  The crate + trait-module + associated-item leaf
+/// select the value; the impl identity is unused, because every
+/// primitive `Bits` impl holds the same `0` and Charon renders every
+/// one as `<Impl>`.
+///
+/// `Bits::ALL` is type-width-specific (`u8::MAX` vs `u64::MAX`) under
+/// the same non-injective path, so it stays residual.
+fn bitflags_trait_empty_const(segments: &[String]) -> Option<OpKind> {
+    if segments.first().map(String::as_str) != Some("bitflags") {
+        return None;
+    }
+    let tail: Vec<&str> = segments
+        .iter()
+        .rev()
+        .take(3)
+        .rev()
+        .map(String::as_str)
+        .collect();
+    match tail.as_slice() {
+        ["traits", "<Impl>", "EMPTY"] => Some(OpKind::ConstInt(0)),
+        _ => None,
+    }
 }
 
 /// Supply the value of a `CodeFlags` associated constant. `bitflags!`
@@ -29309,8 +30182,9 @@ fn fold_named_const_on_llbc(llbc: &Llbc, def_id: u64) -> Option<OpKind> {
 /// a shift or negation drags an overflow-assert diamond along — so fold
 /// it here: execute literal assigns, follow each `Assert` whose
 /// condition evaluates to its `expected` value (rustc already
-/// const-checked the initializer), and bail to the residual `Call`
-/// lowering on any other shape.
+/// const-checked the initializer), fold a `core::mem::size_of` /
+/// `align_of` Call terminator to the target layout width, and bail to
+/// the residual `Call` lowering on any other shape.
 fn const_eval_init_body(llbc: &Llbc, u: &Unstructured) -> Option<OpKind> {
     const_lit_to_op(const_eval_init_body_lit(llbc, u, 0)?)
 }
@@ -29384,7 +30258,9 @@ fn const_eval_init_body_lit(llbc: &Llbc, u: &Unstructured, depth: usize) -> Opti
         let block = u.body.get(bb)?;
         for stmt in &block.statements {
             match stmt.stmt_kind() {
-                Ok(StmtKind::StorageLive(_)) | Ok(StmtKind::StorageDead(_)) => {}
+                Ok(StmtKind::StorageLive(_))
+                | Ok(StmtKind::StorageDead(_))
+                | Ok(StmtKind::PlaceMention(_)) => {}
                 Ok(StmtKind::Assign(place, rvalue)) => {
                     let PlaceKind::Local(dst) = place.kind else {
                         return None;
@@ -29424,10 +30300,125 @@ fn const_eval_init_body_lit(llbc: &Llbc, u: &Unstructured, depth: usize) -> Opti
                 }
                 bb = target as usize;
             }
+            TermKind::Call { call, target, .. } => {
+                let PlaceKind::Local(dst) = call.dest.kind else {
+                    return None;
+                };
+                locals.insert(dst, const_eval_size_align_call(llbc, &call)?);
+                bb = target as usize;
+            }
             _ => return None,
         }
     }
     None
+}
+
+/// Fold a const-init `Call` terminator only when it is nullary
+/// `core::mem::size_of` / `align_of`. Any other callee stays unharvested:
+/// that refusal is the fail-closed default
+/// [`const_eval_init_body_lit`] used before this exemption.
+fn const_eval_size_align_call(llbc: &Llbc, call: &CallPayload) -> Option<ConstLit> {
+    if !call.args.is_empty() {
+        return None;
+    }
+    let CallFunc::Regular(reg) = &call.func else {
+        return None;
+    };
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return None;
+    };
+    let want_align = match llbc.fn_by_id(*id)?.item_meta.name_path().as_str() {
+        "core::mem::size_of" => false,
+        "core::mem::align_of" => true,
+        _ => return None,
+    };
+    let ty = reg.generics.get("types")?.as_array()?.first()?;
+    let bytes = size_align_of_tyexpr(llbc, want_align, ty)?;
+    Some(const_narrow_to_target(
+        const_literal_ty(llbc, &call.dest.ty),
+        ConstLit::UInt(bytes),
+    ))
+}
+
+/// Byte size / alignment of a `size_of` / `align_of` type argument.
+///
+/// Primitive widths (including `usize` / `isize`) come from the
+/// translation target, not from the host `size_of::<usize>()` and not
+/// from the artefact's extraction-host `target_pointer_size`. Harvest
+/// runs inside the translation pipeline
+/// (`discover_foldable_const_lits` via
+/// `build_semantic_program_via_active_frontend` and the prepass), once
+/// per TARGET. `layout::target_word_size` reads
+/// `CARGO_CFG_TARGET_POINTER_WIDTH` — Cargo sets that to the crate
+/// target even in a build.rs running on a wider host — and only falls
+/// back to the host width when that cfg is unset (the host *is* the
+/// target). A wasm32 prepass therefore harvests 4, not the host's 8.
+///
+/// ADT arguments reuse the same Charon `layout_for_target` lane
+/// [`Lowering::fold_size_const_global`] uses. Anything else (tuple,
+/// slice, an unresolved layout) stays unharvested.
+fn size_align_of_tyexpr(llbc: &Llbc, want_align: bool, ty: &serde_json::Value) -> Option<u64> {
+    let body = tyexpr_body(llbc, ty)?;
+    if let Some(lit) = body.get("Literal") {
+        return primitive_size_align(want_align, lit);
+    }
+    let adt = inline_adt_def_id(body).or_else(|| resolve_tyexpr_to_adt_def_id_free(llbc, ty))?;
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let layout = llbc.type_by_id(adt)?.layout_for_target(&target)?;
+    if want_align {
+        layout.align
+    } else {
+        layout.size
+    }
+}
+
+fn tyexpr_body<'a>(llbc: &'a Llbc, ty: &'a serde_json::Value) -> Option<&'a serde_json::Value> {
+    if let Some(arr) = ty
+        .get("HashConsedValue")
+        .and_then(serde_json::Value::as_array)
+    {
+        return arr.get(1);
+    }
+    if let Some(id) = ty.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+        return llbc.dedup_body(id);
+    }
+    Some(ty)
+}
+
+fn primitive_size_align(want_align: bool, lit: &serde_json::Value) -> Option<u64> {
+    let word = crate::layout::target_word_size() as u64;
+    let (size, align) = if let Some(width) = lit.get("UInt").and_then(serde_json::Value::as_str) {
+        match width {
+            "U8" => (1, 1),
+            "U16" => (2, 2),
+            "U32" => (4, 4),
+            "U64" => (8, 8),
+            "U128" => (16, 16),
+            "Usize" => (word, word),
+            _ => return None,
+        }
+    } else if let Some(width) = lit.get("Int").and_then(serde_json::Value::as_str) {
+        match width {
+            "I8" => (1, 1),
+            "I16" => (2, 2),
+            "I32" => (4, 4),
+            "I64" => (8, 8),
+            "I128" => (16, 16),
+            "Isize" => (word, word),
+            _ => return None,
+        }
+    } else if let Some(width) = lit.get("Float").and_then(serde_json::Value::as_str) {
+        match width {
+            "F32" => (4, 4),
+            "F64" => (8, 8),
+            _ => return None,
+        }
+    } else if lit.get("Bool").is_some() {
+        (1, 1)
+    } else {
+        return None;
+    };
+    Some(if want_align { align } else { size })
 }
 
 fn decode_const_lit(value: &serde_json::Value) -> Option<ConstLit> {
@@ -29893,20 +30884,7 @@ fn decode_constant(llbc: &Llbc, value: &serde_json::Value) -> Result<DecodedCons
         // (`.map(Dynamic::flatten)`) could only ever miss.  A free function
         // keeps `name_path()`: that IS its registered spelling
         // (`free_function_alias_paths`).
-        let segments = match impl_method_owner_for_fundecl(llbc, fd) {
-            Some((owner_qualified, leaf)) => {
-                let mut v: Vec<String> = owner_qualified.split("::").map(str::to_string).collect();
-                v.push(leaf);
-                v
-            }
-            None => fd
-                .item_meta
-                .name_path()
-                .split("::")
-                .map(|s| s.to_string())
-                .collect(),
-        };
-        return Ok(DecodedConst::FnPath(segments));
+        return Ok(DecodedConst::FnPath(fundecl_fn_item_segments(llbc, fd)));
     }
     Err(LowerError::Unsupported(format!(
         "Operand::Const kind not yet handled: {value}"
@@ -34006,22 +34984,26 @@ fn collapse_panic_message_chains(graph: &mut FunctionGraph) -> usize {
 mod tests {
     use super::harden_duplicate_leaf_metadata;
     use super::{
-        DecodedConst, FnPtrFamily, adt_field_read_value_type, cast_call_segments,
-        cast_kind_is_raw_ptr, cast_pointer_marker_op, charon_const_generic_to_string,
-        charon_type_value_to_ast_string, checked_arith_uint_atom_is_word_sized, decode_literal,
+        DecodedConst, FnPtrFamily, adt_field_read_value_type, bitflags_trait_empty_const,
+        cast_call_segments, cast_kind_is_raw_ptr, cast_pointer_marker_op,
+        charon_const_generic_to_string, charon_type_value_to_ast_string, decode_literal,
         fn_ptr_family_for, int_binop_needs_ptr_to_int, is_class_pytype_assoc_const,
         is_core_result_map_err_path, json_ty_is_thin_pointer_element,
         json_ty_scalar_element_spelling, primitive_float_const, push_cast_ptr_to_int,
-        push_ptr_to_unsigned_cast, scalar_replace_named_struct_aggregates, shaped_array_parts,
-        simplify_lowered_graph, type_decl_is_closure_env, tyref_array_suffix, tyref_is_closure_env,
-        tyref_is_raw_byte_ptr, tyref_positional_aggregate_root, tyref_to_attr_value_type,
+        push_direct_ptradd, push_ptr_to_unsigned_cast, scalar_replace_named_struct_aggregates,
+        shaped_array_parts, simplify_lowered_graph, static_key_segments, type_decl_is_closure_env,
+        tyref_array_suffix, tyref_is_closure_env, tyref_is_raw_byte_ptr,
+        tyref_positional_aggregate_root, tyref_to_attr_value_type,
         tyref_to_attr_value_type_for_struct_field, tyref_to_value_type,
     };
     use crate::flowspace::model::Variable;
     use crate::model::{
         CallTarget, FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType,
     };
-    use majit_charon_reader::{Llbc, ullbc::TyRef};
+    use majit_charon_reader::{
+        Llbc,
+        ullbc::{NameSeg, TyRef},
+    };
 
     #[test]
     fn map_err_capture_requires_the_core_result_callee() {
@@ -34105,18 +35087,6 @@ mod tests {
             "<Impl>".into(),
             "with_capacity".into(),
         ]));
-    }
-
-    #[test]
-    fn checked_unsigned_capture_rejects_narrow_integer_atoms() {
-        for atom in ["U8", "U16", "U32", "U128"] {
-            assert!(!checked_arith_uint_atom_is_word_sized(atom));
-        }
-        assert!(checked_arith_uint_atom_is_word_sized("U64"));
-        assert_eq!(
-            checked_arith_uint_atom_is_word_sized("Usize"),
-            crate::layout::target_word_size() == 8
-        );
     }
 
     #[test]
@@ -38394,10 +39364,149 @@ mod tests {
             super::tyref_to_value_type(&only_zst_ty, &llbc),
             ValueType::Int
         );
-        assert!(matches!(
+        assert_eq!(
             super::tyref_to_value_type(&mixed_ty, &llbc),
-            ValueType::Ref(_)
+            ValueType::Ref(Some("Mixed".to_string()))
+        );
+    }
+
+    /// A mixed enum (fieldless variants plus a payload-carrying one) is a
+    /// `SomeInstance` of its interned enum-base classdef, not the untyped
+    /// `Ref(None)` fallback.  The intern key is the ADT leaf
+    /// `tyref_class_root` / `Input.class_root` already use, so
+    /// `getuniqueclassdef_for_struct_root` and `__cast_instance_intrinsic`
+    /// resolve the same class object the bookkeeper intern's for variant
+    /// subclasses.  A fieldless-only sibling stays `Int`.
+    #[test]
+    fn payload_carrying_enum_paints_typed_ref_of_intern_leaf() {
+        let span = || {
+            serde_json::json!({"data": {
+                "file_id": 0,
+                "beg": {"line": 1, "col": 0},
+                "end": {"line": 1, "col": 1}
+            }})
+        };
+        let item_meta = |name: &str| {
+            serde_json::json!({
+                "name": [
+                    {"Ident": ["fixture", 0]},
+                    {"Ident": [name, 0]}
+                ],
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": true
+            })
+        };
+        let adt = |def_id: u64, hash: u64| {
+            serde_json::json!({"HashConsedValue": [hash, {
+                "Adt": {
+                    "id": {"Adt": def_id},
+                    "generics": {
+                        "regions": [],
+                        "types": [],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }
+            }]})
+        };
+        let field = |name: &str, ty: serde_json::Value| serde_json::json!({"name": name, "ty": ty, "attr_info": null});
+        let variant = |name: &str, fields: Vec<serde_json::Value>, discriminant: u64| {
+            serde_json::json!({
+                "name": name,
+                "fields": fields,
+                "discriminant": {"Scalar": {"Unsigned": ["U8", discriminant.to_string()]}}
+            })
+        };
+        let layout = |size: u64, field_offsets: Vec<u64>| {
+            serde_json::json!([{
+                "key": "fixture-target",
+                "value": {
+                    "size": size,
+                    "align": 1,
+                    "variant_layouts": [{"field_offsets": field_offsets}],
+                    "repr": {"transparent": false}
+                }
+            }])
+        };
+        // Fieldless-only sibling: every variant is payload-free, so the
+        // value is the discriminant integer.
+        let fieldless = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta("AccessMode"),
+            "kind": {"Enum": [
+                variant("ReadWrite", vec![], 0),
+                variant("ReadOnly", vec![], 1)
+            ]},
+            "layout": layout(1, vec![])
+        });
+        // Mixed: fieldless variants plus one payload-carrying variant.
+        // Shape of `Code` (ten unit variants + `Int { signed }`) without
+        // naming that enum — the paint is driven by the payload, not the
+        // ident.
+        let mixed = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta("Opcode"),
+            "kind": {"Enum": [
+                variant("Nop", vec![], 0),
+                variant("LoadConst", vec![], 1),
+                variant(
+                    "Int",
+                    vec![field("signed", serde_json::json!({"Literal": "Bool"}))],
+                    2
+                )
+            ]},
+            "layout": layout(2, vec![1])
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [fieldless, mixed],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let fieldless_ty = serde_json::from_value::<TyRef>(adt(0, 10)).expect("fieldless TyRef");
+        let mixed_ty = serde_json::from_value::<TyRef>(adt(1, 11)).expect("mixed TyRef");
+
+        assert!(super::type_decl_is_fieldless_enum(
+            llbc.type_by_id(0).expect("AccessMode declaration"),
+            &llbc
         ));
+        assert!(!super::type_decl_is_fieldless_enum(
+            llbc.type_by_id(1).expect("Opcode declaration"),
+            &llbc
+        ));
+        assert_eq!(
+            super::tyref_to_value_type(&fieldless_ty, &llbc),
+            ValueType::Int
+        );
+        assert_eq!(
+            super::tyref_to_value_type(&mixed_ty, &llbc),
+            ValueType::Ref(Some("Opcode".to_string())),
+            "payload-carrying enum must paint Ref(Some(leaf)), not Ref(None)"
+        );
+        assert_eq!(
+            super::tyref_to_attr_value_type(&mixed_ty, &llbc),
+            ValueType::Ref(Some("Opcode".to_string())),
+            "FORCE-attr paint must agree with the value-site paint"
+        );
+        assert_eq!(
+            super::tyref_class_root(&mixed_ty, &llbc).as_deref(),
+            Some("Opcode"),
+            "intern key must be the Input.class_root leaf"
+        );
     }
 
     /// `rclass.InstanceRepr._setup_repr` declares a subclass as
@@ -39512,7 +40621,7 @@ mod tests {
     }
 
     #[test]
-    fn ptr_add_of_bytes_is_unscaled_add() {
+    fn ptr_add_of_bytes_is_unscaled_direct_ptradd() {
         let ptr_ty = serde_json::json!({
             "RawPtr": [{"Literal": {"UInt": "U8"}}, "Mut"]
         });
@@ -39526,14 +40635,18 @@ mod tests {
         let graph = super::lower_function(&llbc, "add_u8").expect("lower *mut u8::add");
         let ops = graph_ops(&graph);
         assert!(
-            ops.iter()
-                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add")),
-            "*mut u8::add must become int_add; ops={ops:?}"
+            ops.iter().any(|op| is_lltype_direct_ptradd(op)),
+            "*mut u8::add must become direct_ptradd; ops={ops:?}"
         );
         assert!(
             !ops.iter()
                 .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "mul")),
             "*mut u8::add must not scale; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add")),
+            "*mut u8::add must not become int_add at the front; ops={ops:?}"
         );
         assert!(
             !call_leafs(&ops).iter().any(|leaf| *leaf == "add"),
@@ -39542,7 +40655,7 @@ mod tests {
     }
 
     #[test]
-    fn ptr_add_of_i64_scales_by_pointee_size() {
+    fn ptr_add_of_i64_scales_count_then_direct_ptradd() {
         let ptr_ty = serde_json::json!({
             "RawPtr": [{"Literal": {"Int": "I64"}}, "Mut"]
         });
@@ -39562,12 +40675,103 @@ mod tests {
         assert!(
             ops.iter()
                 .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "mul")),
-            "*const i64::add must emit int_mul; ops={ops:?}"
+            "*const i64::add must emit int_mul on the count; ops={ops:?}"
         );
         assert!(
-            ops.iter()
+            ops.iter().any(|op| is_lltype_direct_ptradd(op)),
+            "*const i64::add must become direct_ptradd; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter()
                 .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add")),
-            "*const i64::add must emit int_add; ops={ops:?}"
+            "*const i64::add must not become int_add at the front; ops={ops:?}"
+        );
+    }
+
+    fn is_lltype_direct_ptradd(op: &SpaceOperation) -> bool {
+        matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                result_ty: ValueType::Ref(_),
+                ..
+            } if segments.last().map(String::as_str) == Some("direct_ptradd")
+                && segments.iter().any(|s| s == "lltype")
+        )
+    }
+
+    fn return_merge_arm_value_types(graph: &crate::model::FunctionGraph) -> Vec<ValueType> {
+        use crate::model::LinkArg;
+        let returnblock = graph.returnblock;
+        let mut tys = Vec::new();
+        for block in &graph.blocks {
+            for link in &block.exits {
+                if link.target != returnblock {
+                    continue;
+                }
+                for arg in &link.args {
+                    let LinkArg::Value(v) = arg else {
+                        continue;
+                    };
+                    let def = graph
+                        .blocks
+                        .iter()
+                        .flat_map(|b| b.operations.iter())
+                        .find(|op| op.result.as_ref() == Some(v));
+                    if let Some(ty) = def.and_then(|op| match &op.kind {
+                        OpKind::Call { result_ty, .. }
+                        | OpKind::BinOp { result_ty, .. }
+                        | OpKind::UnaryOp { result_ty, .. } => Some(result_ty.clone()),
+                        OpKind::Input { ty, .. } => Some(ty.clone()),
+                        OpKind::ConstRefNull => Some(ValueType::Ref(None)),
+                        OpKind::ConstInt(_) => Some(ValueType::Int),
+                        OpKind::ConstUInt(_) => Some(ValueType::Unsigned),
+                        _ => None,
+                    }) {
+                        tys.push(ty);
+                    }
+                }
+            }
+        }
+        tys
+    }
+
+    fn return_merge_arm_kinds_agree(tys: &[ValueType]) -> bool {
+        tys.len() >= 2
+            && tys
+                .windows(2)
+                .all(|w| std::mem::discriminant(&w[0]) == std::mem::discriminant(&w[1]))
+    }
+
+    #[test]
+    fn null_or_offset_pointer_return_arms_share_one_value_type() {
+        let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+        let llbc = Llbc::load(path).expect("load real pyre-object LLBC");
+        let graph = super::lower_function(&llbc, "items_block_items_base")
+            .expect("lower items_block_items_base");
+        let ops = graph_ops(&graph);
+        assert!(
+            call_leafs(&ops).iter().any(|leaf| *leaf == "null_mut"),
+            "null arm must stay null_mut(); ops={ops:?}"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add")),
+            "offset arm must not become int_add at the front; ops={ops:?}"
+        );
+        let arm_tys = return_merge_arm_value_types(&graph);
+        assert_eq!(
+            arm_tys.len(),
+            2,
+            "items_block_items_base returns through two arms; got {arm_tys:?}"
+        );
+        assert!(
+            arm_tys.iter().all(|ty| matches!(ty, ValueType::Ref(_))),
+            "both return arms must be Ref; got {arm_tys:?}"
+        );
+        assert!(
+            return_merge_arm_kinds_agree(&arm_tys),
+            "null_mut and the offset arm must share one ValueType; got {arm_tys:?}"
         );
     }
 
@@ -40335,6 +41539,819 @@ mod tests {
             "i64"
         );
     }
+
+    fn span_json() -> serde_json::Value {
+        serde_json::json!({"data": {
+            "file_id": 0,
+            "beg": {"line": 1, "col": 0},
+            "end": {"line": 1, "col": 16}
+        }})
+    }
+
+    fn item_meta_json(path: &[&str], source_text: &str, is_local: bool) -> serde_json::Value {
+        serde_json::json!({
+            "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": span_json(),
+            "source_text": source_text,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": is_local
+        })
+    }
+
+    fn u32_ty() -> serde_json::Value {
+        serde_json::json!({"Literal": {"UInt": "U32"}})
+    }
+
+    fn usize_ty() -> serde_json::Value {
+        serde_json::json!({"Literal": {"UInt": "Usize"}})
+    }
+
+    fn empty_generics() -> serde_json::Value {
+        serde_json::json!({"regions": [], "types": [], "const_generics": [], "trait_refs": []})
+    }
+
+    fn unsigned_const(width: &str, text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "kind": {"Literal": {"Scalar": {"Unsigned": [width, text]}}},
+            "ty": u32_ty()
+        })
+    }
+
+    fn literal_init_body(value: &str) -> serde_json::Value {
+        let ty = u32_ty();
+        serde_json::json!({"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": [
+                {"index": 0, "name": null, "span": span_json(), "ty": ty}
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": span_json(),
+                    "kind": {"Assign": [
+                        {"kind": {"Local": 0}, "ty": ty},
+                        {"Use": {"Const": unsigned_const("U32", value)}}
+                    ]}
+                }],
+                "terminator": {"span": span_json(), "kind": "Return"}
+            }]
+        }})
+    }
+
+    fn add_init_body(lhs: &str, rhs: &str) -> serde_json::Value {
+        let ty = u32_ty();
+        serde_json::json!({"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": [
+                {"index": 0, "name": null, "span": span_json(), "ty": ty}
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": span_json(),
+                    "kind": {"Assign": [
+                        {"kind": {"Local": 0}, "ty": ty},
+                        {"BinaryOp": [
+                            "Add",
+                            {"Const": unsigned_const("U32", lhs)},
+                            {"Const": unsigned_const("U32", rhs)}
+                        ]}
+                    ]}
+                }],
+                "terminator": {"span": span_json(), "kind": "Return"}
+            }]
+        }})
+    }
+
+    fn call_init_body() -> serde_json::Value {
+        let ty = u32_ty();
+        serde_json::json!({"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": [
+                {"index": 0, "name": null, "span": span_json(), "ty": ty}
+            ]},
+            "body": [{
+                "statements": [],
+                "terminator": {"span": span_json(), "kind": {"Call": {
+                    "call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": {"Regular": 2}},
+                            "generics": empty_generics()
+                        }},
+                        "args": [],
+                        "dest": {"kind": {"Local": 0}, "ty": ty}
+                    },
+                    "target": 1,
+                    "on_unwind": 1
+                }}}
+            }, {
+                "statements": [],
+                "terminator": {"span": span_json(), "kind": "Return"}
+            }]
+        }})
+    }
+
+    fn unsigned_usize_const(text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "kind": {"Literal": {"Scalar": {"Unsigned": ["Usize", text]}}},
+            "ty": usize_ty()
+        })
+    }
+
+    fn size_of_fun(def_id: u64) -> serde_json::Value {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": item_meta_json(&["core", "mem", "size_of"], "", false),
+            "signature": {"is_unsafe": false, "inputs": [], "output": usize_ty()},
+            "body": "Opaque"
+        })
+    }
+
+    fn init_usize_fun(def_id: u64, path: &[&str], body: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": item_meta_json(path, "", true),
+            "signature": {"is_unsafe": false, "inputs": [], "output": usize_ty()},
+            "is_global_initializer": def_id,
+            "body": body
+        })
+    }
+
+    fn named_usize_const_global(
+        def_id: u64,
+        path: &[&str],
+        source_text: &str,
+        is_local: bool,
+        init: u64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": item_meta_json(path, source_text, is_local),
+            "global_kind": "NamedConst",
+            "ty": usize_ty(),
+            "init": init
+        })
+    }
+
+    fn size_of_usize_init_body(size_of_id: u64) -> serde_json::Value {
+        let ty = usize_ty();
+        serde_json::json!({"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": [
+                {"index": 0, "name": null, "span": span_json(), "ty": ty}
+            ]},
+            "body": [{
+                "statements": [],
+                "terminator": {"span": span_json(), "kind": {"Call": {
+                    "call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": {"Regular": size_of_id}},
+                            "generics": {
+                                "regions": [],
+                                "types": [ty],
+                                "const_generics": [],
+                                "trait_refs": []
+                            }
+                        }},
+                        "args": [],
+                        "dest": {"kind": {"Local": 0}, "ty": ty}
+                    },
+                    "target": 2,
+                    "on_unwind": 1
+                }}}
+            }, {
+                "statements": [],
+                "terminator": {"span": span_json(), "kind": "UnwindResume"}
+            }, {
+                "statements": [],
+                "terminator": {"span": span_json(), "kind": "Return"}
+            }]
+        }})
+    }
+
+    fn two_times_size_of_usize_init_body(size_of_id: u64) -> serde_json::Value {
+        let ty = usize_ty();
+        serde_json::json!({"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": [
+                {"index": 0, "name": null, "span": span_json(), "ty": ty},
+                {"index": 1, "name": null, "span": span_json(), "ty": ty}
+            ]},
+            "body": [{
+                "statements": [],
+                "terminator": {"span": span_json(), "kind": {"Call": {
+                    "call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": {"Regular": size_of_id}},
+                            "generics": {
+                                "regions": [],
+                                "types": [ty],
+                                "const_generics": [],
+                                "trait_refs": []
+                            }
+                        }},
+                        "args": [],
+                        "dest": {"kind": {"Local": 1}, "ty": ty}
+                    },
+                    "target": 1,
+                    "on_unwind": 1
+                }}}
+            }, {
+                "statements": [{
+                    "span": span_json(),
+                    "kind": {"Assign": [
+                        {"kind": {"Local": 0}, "ty": ty},
+                        {"BinaryOp": [
+                            "Mul",
+                            {"Const": unsigned_usize_const("2")},
+                            {"Copy": {"kind": {"Local": 1}, "ty": ty}}
+                        ]}
+                    ]}
+                }],
+                "terminator": {"span": span_json(), "kind": "Return"}
+            }]
+        }})
+    }
+
+    fn add_named_const_init_body(global_id: u64, rhs: &str) -> serde_json::Value {
+        let ty = usize_ty();
+        serde_json::json!({"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": [
+                {"index": 0, "name": null, "span": span_json(), "ty": ty}
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": span_json(),
+                    "kind": {"Assign": [
+                        {"kind": {"Local": 0}, "ty": ty},
+                        {"BinaryOp": [
+                            "Add",
+                            {"Copy": {"kind": {"Global": {
+                                "generics": empty_generics(),
+                                "id": global_id
+                            }}, "ty": ty}},
+                            {"Const": unsigned_usize_const(rhs)}
+                        ]}
+                    ]}
+                }],
+                "terminator": {"span": span_json(), "kind": "Return"}
+            }]
+        }})
+    }
+
+    fn reader_usize_fun(path: &[&str], global_id: u64) -> serde_json::Value {
+        let ty = usize_ty();
+        serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(path, "", true),
+            "signature": {"is_unsafe": false, "inputs": [], "output": ty},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 0, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": ty}
+                ]},
+                "body": [{
+                    "statements": [{
+                        "span": span_json(),
+                        "kind": {"Assign": [
+                            {"kind": {"Local": 0}, "ty": ty},
+                            {"Use": {"Copy": {
+                                "kind": {"Global": {"generics": empty_generics(), "id": global_id}},
+                                "ty": ty
+                            }}}
+                        ]}
+                    }],
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }]
+            }}
+        })
+    }
+
+    fn init_fun(def_id: u64, path: &[&str], body: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": item_meta_json(path, "", true),
+            "signature": {"is_unsafe": false, "inputs": [], "output": u32_ty()},
+            "is_global_initializer": def_id,
+            "body": body
+        })
+    }
+
+    fn named_const_global(
+        def_id: u64,
+        path: &[&str],
+        source_text: &str,
+        is_local: bool,
+        global_kind: &str,
+        init: u64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": item_meta_json(path, source_text, is_local),
+            "global_kind": global_kind,
+            "ty": u32_ty(),
+            "init": init
+        })
+    }
+
+    fn reader_fun(path: &[&str], global_id: u64) -> serde_json::Value {
+        let ty = u32_ty();
+        serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(path, "", true),
+            "signature": {"is_unsafe": false, "inputs": [], "output": ty},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 0, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": ty}
+                ]},
+                "body": [{
+                    "statements": [{
+                        "span": span_json(),
+                        "kind": {"Assign": [
+                            {"kind": {"Local": 0}, "ty": ty},
+                            {"Use": {"Copy": {
+                                "kind": {"Global": {"generics": empty_generics(), "id": global_id}},
+                                "ty": ty
+                            }}}
+                        ]}
+                    }],
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }]
+            }}
+        })
+    }
+
+    fn const_artifact(
+        crate_name: &str,
+        fun_decls: serde_json::Value,
+        global_decls: serde_json::Value,
+    ) -> Llbc {
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": crate_name,
+                "type_decls": [],
+                "fun_decls": fun_decls,
+                "global_decls": global_decls,
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes()).expect("const fixture Llbc parses")
+    }
+
+    fn folded_uints(graph: &crate::model::FunctionGraph) -> Vec<u64> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match op.kind {
+                OpKind::ConstUInt(n) => Some(n),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn nullary_calls_ending(graph: &crate::model::FunctionGraph, leaf: &str) -> usize {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        args,
+                        ..
+                    } if args.is_empty() && segments.last().map(String::as_str) == Some(leaf)
+                )
+            })
+            .count()
+    }
+
+    #[test]
+    fn discover_foldable_const_lits_harvests_named_const_literal() {
+        let path = ["pyre_object", "intobject", "W_INT_USER_GC_TYPE_ID"];
+        let defining = const_artifact(
+            "pyre_object",
+            serde_json::json!([null, init_fun(1, &path, literal_init_body("185"))]),
+            serde_json::json!([
+                null,
+                named_const_global(
+                    1,
+                    &path,
+                    "pub const W_INT_USER_GC_TYPE_ID: u32 = 185;",
+                    true,
+                    "NamedConst",
+                    1
+                )
+            ]),
+        );
+        assert_eq!(
+            super::discover_foldable_const_lits(&defining),
+            vec![(
+                "pyre_object::intobject::W_INT_USER_GC_TYPE_ID".into(),
+                OpKind::ConstUInt(185)
+            )]
+        );
+    }
+
+    #[test]
+    fn discover_foldable_const_lits_skips_thread_local_static_mut_and_call() {
+        let tl = const_artifact(
+            "fixture",
+            serde_json::json!([
+                null,
+                init_fun(1, &["fixture", "TLS"], literal_init_body("1"))
+            ]),
+            serde_json::json!([
+                null,
+                named_const_global(
+                    1,
+                    &["fixture", "TLS"],
+                    "thread_local!",
+                    true,
+                    "ThreadLocal",
+                    1
+                )
+            ]),
+        );
+        let static_mut = const_artifact(
+            "fixture",
+            serde_json::json!([
+                null,
+                init_fun(1, &["fixture", "COUNTER"], literal_init_body("0"))
+            ]),
+            serde_json::json!([
+                null,
+                named_const_global(
+                    1,
+                    &["fixture", "COUNTER"],
+                    "pub static mut COUNTER: u32 = 0;",
+                    true,
+                    "Static",
+                    1
+                )
+            ]),
+        );
+        let call = const_artifact(
+            "fixture",
+            serde_json::json!([
+                null,
+                init_fun(1, &["fixture", "COMPUTED"], call_init_body())
+            ]),
+            serde_json::json!([
+                null,
+                named_const_global(
+                    1,
+                    &["fixture", "COMPUTED"],
+                    "pub const COMPUTED: u32 = f();",
+                    true,
+                    "NamedConst",
+                    1
+                )
+            ]),
+        );
+        assert!(super::discover_foldable_const_lits(&tl).is_empty());
+        assert!(super::discover_foldable_const_lits(&static_mut).is_empty());
+        assert!(super::discover_foldable_const_lits(&call).is_empty());
+    }
+
+    #[test]
+    fn discover_foldable_const_lits_skips_non_unique_name_path() {
+        let path = ["fixture", "<Impl>", "CPYTHON_IMMUTABLETYPE"];
+        let shared = const_artifact(
+            "fixture",
+            serde_json::json!([
+                null,
+                init_fun(1, &path, literal_init_body("1")),
+                init_fun(2, &path, literal_init_body("0"))
+            ]),
+            serde_json::json!([
+                null,
+                named_const_global(
+                    1,
+                    &path,
+                    "const CPYTHON_IMMUTABLETYPE: bool = true;",
+                    true,
+                    "NamedConst",
+                    1
+                ),
+                named_const_global(
+                    2,
+                    &path,
+                    "const CPYTHON_IMMUTABLETYPE: bool = false;",
+                    true,
+                    "NamedConst",
+                    2
+                )
+            ]),
+        );
+        assert!(super::discover_foldable_const_lits(&shared).is_empty());
+    }
+
+    #[test]
+    fn discover_foldable_const_lits_harvests_size_of_usize() {
+        let path = ["fixture", "LOWLEVEL_STRING_LEN_OFFSET"];
+        let defining = const_artifact(
+            "fixture",
+            serde_json::json!([
+                null,
+                init_usize_fun(1, &path, size_of_usize_init_body(2)),
+                size_of_fun(2)
+            ]),
+            serde_json::json!([
+                null,
+                named_usize_const_global(
+                    1,
+                    &path,
+                    "pub const LOWLEVEL_STRING_LEN_OFFSET: usize = size_of::<usize>();",
+                    true,
+                    1
+                )
+            ]),
+        );
+        let word = crate::layout::target_word_size() as u64;
+        assert_eq!(
+            super::discover_foldable_const_lits(&defining),
+            vec![(
+                "fixture::LOWLEVEL_STRING_LEN_OFFSET".into(),
+                OpKind::ConstUInt(word)
+            )]
+        );
+    }
+
+    #[test]
+    fn discover_foldable_const_lits_harvests_composed_size_of_arith() {
+        let chars_path = ["fixture", "LOWLEVEL_STRING_CHARS_OFFSET"];
+        let base_path = ["fixture", "LOWLEVEL_STR_BASE_SIZE"];
+        let defining = const_artifact(
+            "fixture",
+            serde_json::json!([
+                null,
+                null,
+                size_of_fun(2),
+                init_usize_fun(3, &chars_path, two_times_size_of_usize_init_body(2)),
+                init_usize_fun(4, &base_path, add_named_const_init_body(1, "1"))
+            ]),
+            serde_json::json!([
+                null,
+                named_usize_const_global(
+                    1,
+                    &chars_path,
+                    "pub const LOWLEVEL_STRING_CHARS_OFFSET: usize = 2 * size_of::<usize>();",
+                    true,
+                    3
+                ),
+                named_usize_const_global(
+                    2,
+                    &base_path,
+                    "pub const LOWLEVEL_STR_BASE_SIZE: usize = LOWLEVEL_STRING_CHARS_OFFSET + 1;",
+                    true,
+                    4
+                )
+            ]),
+        );
+        let word = crate::layout::target_word_size() as u64;
+        let harvested = super::discover_foldable_const_lits(&defining);
+        assert_eq!(
+            harvested,
+            vec![
+                (
+                    "fixture::LOWLEVEL_STRING_CHARS_OFFSET".into(),
+                    OpKind::ConstUInt(word * 2)
+                ),
+                (
+                    "fixture::LOWLEVEL_STR_BASE_SIZE".into(),
+                    OpKind::ConstUInt(word * 2 + 1)
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn linked_foldable_const_lit_folds_foreign_composed_size_of() {
+        let chars_path = ["fixture", "LOWLEVEL_STRING_CHARS_OFFSET"];
+        let base_path = ["fixture", "LOWLEVEL_STR_BASE_SIZE"];
+        let defining = const_artifact(
+            "fixture",
+            serde_json::json!([
+                null,
+                null,
+                size_of_fun(2),
+                init_usize_fun(3, &chars_path, two_times_size_of_usize_init_body(2)),
+                init_usize_fun(4, &base_path, add_named_const_init_body(1, "1"))
+            ]),
+            serde_json::json!([
+                null,
+                named_usize_const_global(
+                    1,
+                    &chars_path,
+                    "pub const LOWLEVEL_STRING_CHARS_OFFSET: usize = 2 * size_of::<usize>();",
+                    true,
+                    3
+                ),
+                named_usize_const_global(
+                    2,
+                    &base_path,
+                    "pub const LOWLEVEL_STR_BASE_SIZE: usize = LOWLEVEL_STRING_CHARS_OFFSET + 1;",
+                    true,
+                    4
+                )
+            ]),
+        );
+        let mut opaque_init = init_usize_fun(1, &base_path, serde_json::json!("Opaque"));
+        opaque_init["item_meta"]["is_local"] = serde_json::json!(false);
+        let dependent = const_artifact(
+            "dependent",
+            serde_json::json!([
+                reader_usize_fun(&["dependent", "read_base"], 1),
+                opaque_init
+            ]),
+            serde_json::json!([
+                null,
+                named_usize_const_global(
+                    1,
+                    &base_path,
+                    "pub const LOWLEVEL_STR_BASE_SIZE: usize = LOWLEVEL_STRING_CHARS_OFFSET + 1;",
+                    false,
+                    1
+                )
+            ]),
+        );
+        let llbcs = [defining, dependent];
+        super::register_foldable_const_lits(Vec::new());
+        let unlinked = super::lower_function(&llbcs[1], "read_base").expect("unlinked lowers");
+        assert!(
+            folded_uints(&unlinked).is_empty(),
+            "a Foreign size_of-arith const without a harvest must not fold: {unlinked:?}"
+        );
+        assert_eq!(
+            nullary_calls_ending(&unlinked, "LOWLEVEL_STR_BASE_SIZE"),
+            1,
+            "the unlinked read stays a nullary call on the const path"
+        );
+
+        super::link_transparent_scalar_types(&llbcs);
+        let graph = super::lower_function(&llbcs[1], "read_base").expect("linked lowers");
+        let word = crate::layout::target_word_size() as u64;
+        assert_eq!(folded_uints(&graph), vec![word * 2 + 1]);
+        assert_eq!(
+            nullary_calls_ending(&graph, "LOWLEVEL_STR_BASE_SIZE"),
+            0,
+            "the linked composed size_of read must not remain a nullary call: {graph:?}"
+        );
+    }
+
+    #[test]
+    fn linked_foldable_const_lit_folds_foreign_global_to_literal() {
+        let path = ["pyre_object", "intobject", "W_INT_USER_GC_TYPE_ID"];
+        let defining = const_artifact(
+            "pyre_object",
+            serde_json::json!([null, init_fun(1, &path, literal_init_body("185"))]),
+            serde_json::json!([
+                null,
+                named_const_global(
+                    1,
+                    &path,
+                    "pub const W_INT_USER_GC_TYPE_ID: u32 = 185;",
+                    true,
+                    "NamedConst",
+                    1
+                )
+            ]),
+        );
+        let mut opaque_init = init_fun(1, &path, serde_json::json!("Opaque"));
+        opaque_init["item_meta"]["is_local"] = serde_json::json!(false);
+        let dependent = const_artifact(
+            "pyre_interpreter",
+            serde_json::json!([reader_fun(&["pyre_interpreter", "read_id"], 1), opaque_init]),
+            serde_json::json!([
+                null,
+                named_const_global(
+                    1,
+                    &path,
+                    "pub const W_INT_USER_GC_TYPE_ID: u32 = 185;",
+                    false,
+                    "NamedConst",
+                    1
+                )
+            ]),
+        );
+        let llbcs = [defining, dependent];
+        super::register_foldable_const_lits(Vec::new());
+        let unlinked = super::lower_function(&llbcs[1], "read_id").expect("unlinked lowers");
+        assert!(
+            folded_uints(&unlinked).is_empty(),
+            "a Foreign const without a harvest must not fold: {unlinked:?}"
+        );
+        assert_eq!(
+            nullary_calls_ending(&unlinked, "W_INT_USER_GC_TYPE_ID"),
+            1,
+            "the unlinked read stays a nullary call on the const path"
+        );
+
+        super::link_transparent_scalar_types(&llbcs);
+        let graph = super::lower_function(&llbcs[1], "read_id").expect("linked lowers");
+        assert_eq!(folded_uints(&graph), vec![185]);
+        assert_eq!(
+            nullary_calls_ending(&graph, "W_INT_USER_GC_TYPE_ID"),
+            0,
+            "the linked read must not remain a nullary call: {graph:?}"
+        );
+    }
+
+    #[test]
+    fn linked_foldable_const_lit_keys_the_full_name_path() {
+        let a = const_artifact(
+            "crate_a",
+            serde_json::json!([
+                null,
+                init_fun(1, &["crate_a", "SIZE"], literal_init_body("4"))
+            ]),
+            serde_json::json!([
+                null,
+                named_const_global(
+                    1,
+                    &["crate_a", "SIZE"],
+                    "pub const SIZE: u32 = 4;",
+                    true,
+                    "NamedConst",
+                    1
+                )
+            ]),
+        );
+        let b = const_artifact(
+            "crate_b",
+            serde_json::json!([
+                null,
+                init_fun(1, &["crate_b", "SIZE"], literal_init_body("8"))
+            ]),
+            serde_json::json!([
+                null,
+                named_const_global(
+                    1,
+                    &["crate_b", "SIZE"],
+                    "pub const SIZE: u32 = 8;",
+                    true,
+                    "NamedConst",
+                    1
+                )
+            ]),
+        );
+        super::link_transparent_scalar_types(&[a, b]);
+        assert_eq!(
+            super::foldable_const_lit("crate_a::SIZE"),
+            Some(OpKind::ConstUInt(4))
+        );
+        assert_eq!(
+            super::foldable_const_lit("crate_b::SIZE"),
+            Some(OpKind::ConstUInt(8))
+        );
+        assert!(super::foldable_const_lit("SIZE").is_none());
+    }
+
+    #[test]
+    fn linked_foldable_const_lit_local_body_wins_over_linked() {
+        let path = ["fixture", "VALUE"];
+        let local = const_artifact(
+            "fixture",
+            serde_json::json!([
+                reader_fun(&["fixture", "read_value"], 1),
+                init_fun(1, &path, add_init_body("90", "9"))
+            ]),
+            serde_json::json!([
+                null,
+                named_const_global(
+                    1,
+                    &path,
+                    "pub const VALUE: u32 = 90 + 9;",
+                    true,
+                    "NamedConst",
+                    1
+                )
+            ]),
+        );
+        super::register_foldable_const_lits(vec![(
+            "fixture::VALUE".into(),
+            OpKind::ConstUInt(185),
+        )]);
+        let graph = super::lower_function(&local, "read_value").expect("local body lowers");
+        assert_eq!(folded_uints(&graph), vec![99]);
+        assert_eq!(nullary_calls_ending(&graph, "VALUE"), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "inconsistent linked definitions")]
+    fn register_foldable_const_lits_asserts_inconsistent_values() {
+        super::register_foldable_const_lits([
+            ("crate::SIZE".into(), OpKind::ConstUInt(4)),
+            ("crate::SIZE".into(), OpKind::ConstUInt(8)),
+        ]);
+    }
+
     /// The `Vec` index fold must accept a `usize` index.
     ///
     /// `usize` types as `Unsigned`, not `Int`, so gating on `Int` alone left
@@ -40670,6 +42687,34 @@ mod tests {
             owner_root, "try_dispatch_binary_special::closure",
             "the shared leaf `closure` is withdrawn; the field keys the full path"
         );
+    }
+
+    #[test]
+    fn push_direct_ptradd_emits_the_lltype_helper() {
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let ptr = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0x1000), true)
+            .expect("pointer value");
+        let count = graph
+            .push_op_var(entry, OpKind::ConstInt(8), true)
+            .expect("count");
+        let result = push_direct_ptradd(&mut graph, entry, ptr.clone(), count.clone());
+        assert_eq!(
+            FunctionGraph::concretetype_of(&result),
+            crate::model::ConcreteType::Unknown,
+            "direct_ptradd result matches null_mut's unstamped pointer"
+        );
+        match &graph.block(entry).operations.last().unwrap().kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                result_ty: ValueType::Ref(None),
+            } if segments.last().map(String::as_str) == Some("direct_ptradd") => {
+                assert_eq!(args, &crate::model::call_args(vec![ptr, count]));
+            }
+            other => panic!("expected direct_ptradd call, got {other:?}"),
+        }
     }
 
     #[test]
@@ -46162,6 +48207,19 @@ mod tests {
             Some(OpKind::ConstFloat(bits)) => assert_eq!(bits, f64::INFINITY.to_bits()),
             other => panic!("expected ConstFloat(INFINITY), got {other:?}"),
         }
+        match primitive_float_const(&["core".into(), "f64".into(), "<Impl>".into(), "NAN".into()]) {
+            Some(OpKind::ConstFloat(bits)) => assert_eq!(bits, f64::NAN.to_bits()),
+            other => panic!("expected ConstFloat(NAN), got {other:?}"),
+        }
+        match primitive_float_const(&[
+            "std".into(),
+            "f64".into(),
+            "<Impl>".into(),
+            "NEG_INFINITY".into(),
+        ]) {
+            Some(OpKind::ConstFloat(bits)) => assert_eq!(bits, f64::NEG_INFINITY.to_bits()),
+            other => panic!("expected ConstFloat(NEG_INFINITY), got {other:?}"),
+        }
         match primitive_float_const(&["std".into(), "f64".into(), "consts".into(), "PI".into()]) {
             Some(OpKind::ConstFloat(bits)) => {
                 assert_eq!(bits, std::f64::consts::PI.to_bits())
@@ -46180,6 +48238,10 @@ mod tests {
                 "NO_SUCH".into()
             ])
             .is_none()
+        );
+        assert!(
+            primitive_float_const(&["core".into(), "f64".into(), "<Impl>".into(), "RADIX".into()])
+                .is_none()
         );
         assert!(primitive_float_const(&["unrelated".into()]).is_none());
     }
@@ -46443,5 +48505,254 @@ mod tests {
             result_disc >= 1,
             "desugar_mix: expected a Result discriminant switch"
         );
+    }
+
+    #[test]
+    fn bitflags_trait_empty_const_folds_zero_and_rejects_all() {
+        match bitflags_trait_empty_const(&[
+            "bitflags".into(),
+            "traits".into(),
+            "<Impl>".into(),
+            "EMPTY".into(),
+        ]) {
+            Some(OpKind::ConstInt(0)) => {}
+            other => panic!("expected ConstInt(0), got {other:?}"),
+        }
+        assert!(
+            bitflags_trait_empty_const(&[
+                "bitflags".into(),
+                "traits".into(),
+                "<Impl>".into(),
+                "ALL".into()
+            ])
+            .is_none(),
+            "Bits::ALL is width-specific under the same non-injective path"
+        );
+        assert!(
+            bitflags_trait_empty_const(&[
+                "core".into(),
+                "traits".into(),
+                "<Impl>".into(),
+                "EMPTY".into()
+            ])
+            .is_none()
+        );
+        assert!(bitflags_trait_empty_const(&["unrelated".into()]).is_none());
+    }
+
+    #[test]
+    fn opaque_f64_nan_global_read_folds_to_const_float() {
+        super::register_foldable_const_lits(Vec::new());
+        let path = ["core", "f64", "<Impl>", "NAN"];
+        let mut opaque_init = init_fun(1, &path, serde_json::json!("Opaque"));
+        opaque_init["item_meta"]["is_local"] = serde_json::json!(false);
+        let artifact = const_artifact(
+            "fixture",
+            serde_json::json!([reader_fun(&["fixture", "read_nan"], 1), opaque_init]),
+            serde_json::json!([
+                null,
+                named_const_global(1, &path, "", false, "NamedConst", 1)
+            ]),
+        );
+        let graph = super::lower_function(&artifact, "read_nan").expect("lower");
+        let bits: Vec<u64> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match op.kind {
+                OpKind::ConstFloat(bits) => Some(bits),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bits, vec![f64::NAN.to_bits()]);
+        assert_eq!(
+            nullary_calls_ending(&graph, "NAN"),
+            0,
+            "the Opaque f64::NAN read must not remain a nullary call: {graph:?}"
+        );
+    }
+
+    #[test]
+    fn opaque_bitflags_empty_global_read_folds_to_zero() {
+        super::register_foldable_const_lits(Vec::new());
+        let path = ["bitflags", "traits", "<Impl>", "EMPTY"];
+        let mut opaque_init = init_fun(1, &path, serde_json::json!("Opaque"));
+        opaque_init["item_meta"]["is_local"] = serde_json::json!(false);
+        let artifact = const_artifact(
+            "fixture",
+            serde_json::json!([reader_fun(&["fixture", "read_empty"], 1), opaque_init]),
+            serde_json::json!([
+                null,
+                named_const_global(1, &path, "", false, "NamedConst", 1)
+            ]),
+        );
+        let graph = super::lower_function(&artifact, "read_empty").expect("lower");
+        let ints: Vec<i64> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match op.kind {
+                OpKind::ConstInt(n) => Some(n),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ints, vec![0]);
+        assert_eq!(
+            nullary_calls_ending(&graph, "EMPTY"),
+            0,
+            "the Opaque Bits::EMPTY read must not remain a nullary call: {graph:?}"
+        );
+    }
+
+    /// Charon records a function-local static as
+    /// `Ident [leaf, n]` under the enclosing function. `name_path`
+    /// drops `n` (except `closure#N`), so two `OWNER` statics inside
+    /// `method_owner` collapse onto one key. The Global-place key keeps
+    /// `n` as `leaf#n` for `n > 0`.
+    #[test]
+    fn function_local_static_key_keeps_ident_disambiguator() {
+        let owner = |n: u64| {
+            static_key_segments(&[
+                NameSeg::Ident {
+                    ident: ("pyre_interpreter".into(), 0),
+                },
+                NameSeg::Ident {
+                    ident: ("typedef".into(), 0),
+                },
+                NameSeg::Ident {
+                    ident: ("method_owner".into(), 0),
+                },
+                NameSeg::Ident {
+                    ident: ("OWNER".into(), n),
+                },
+            ])
+        };
+        assert_eq!(
+            owner(0).join("::"),
+            "pyre_interpreter::typedef::method_owner::OWNER"
+        );
+        assert_eq!(
+            owner(1).join("::"),
+            "pyre_interpreter::typedef::method_owner::OWNER#1"
+        );
+        assert_eq!(
+            owner(56).join("::"),
+            "pyre_interpreter::typedef::method_owner::OWNER#56"
+        );
+        assert_ne!(owner(0), owner(1));
+        // Trait-impl Other segments still render as a label, matching
+        // `name_path`, so existing `f64::<Impl>::NAN` keys keep matching.
+        let impl_seg = NameSeg::Other(serde_json::json!({"Impl": {"Trait": 1}}));
+        assert_eq!(
+            static_key_segments(&[
+                NameSeg::Ident {
+                    ident: ("core".into(), 0),
+                },
+                NameSeg::Ident {
+                    ident: ("f64".into(), 0),
+                },
+                impl_seg,
+                NameSeg::Ident {
+                    ident: ("NAN".into(), 0),
+                },
+            ]),
+            ["core", "f64", "<Impl>", "NAN"]
+        );
+        // `closure#N` keeps the same spelling `name_path` already used.
+        assert_eq!(
+            static_key_segments(&[NameSeg::Ident {
+                ident: ("closure".into(), 3),
+            }]),
+            ["closure#3"]
+        );
+    }
+
+    /// Two function-local statics that share a leaf bind distinct
+    /// `HostStaticAddrs` rows once the Ident disambiguator is part of
+    /// the key. Suffix matching is segment-exact, so `OWNER#1` does
+    /// not bind the un-numbered `OWNER` row.
+    #[test]
+    fn function_local_static_globals_resolve_through_disambiguated_keys() {
+        super::register_foldable_const_lits(Vec::new());
+        let owner = |n: u64| {
+            [
+                ("fixture", 0u64),
+                ("typedef", 0),
+                ("method_owner", 0),
+                ("OWNER", n),
+            ]
+        };
+        let artifact = const_artifact(
+            "fixture",
+            serde_json::json!([
+                reader_fun_at(0, &["fixture", "read_owner_0"], 1),
+                reader_fun_at(1, &["fixture", "read_owner_1"], 2),
+            ]),
+            serde_json::json!([
+                null,
+                static_global_with_idents(1, &owner(0)),
+                static_global_with_idents(2, &owner(1)),
+            ]),
+        );
+        let refs = [
+            ("typedef::method_owner::OWNER", 0x1111i64),
+            ("typedef::method_owner::OWNER#1", 0x2222i64),
+        ];
+        let addrs = crate::HostStaticAddrs {
+            refs: &refs,
+            ..Default::default()
+        };
+        let graph0 = super::lower_function_with_static_addrs(&artifact, "read_owner_0", addrs)
+            .expect("lower OWNER");
+        let graph1 = super::lower_function_with_static_addrs(&artifact, "read_owner_1", addrs)
+            .expect("lower OWNER#1");
+        let addrs0: Vec<i64> = graph0
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match op.kind {
+                OpKind::ConstRefAddr(addr) => Some(addr),
+                _ => None,
+            })
+            .collect();
+        let addrs1: Vec<i64> = graph1
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match op.kind {
+                OpKind::ConstRefAddr(addr) => Some(addr),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(addrs0, vec![0x1111]);
+        assert_eq!(addrs1, vec![0x2222]);
+        assert_eq!(
+            nullary_calls_ending(&graph0, "OWNER")
+                + nullary_calls_ending(&graph1, "OWNER")
+                + nullary_calls_ending(&graph1, "OWNER#1"),
+            0,
+            "disambiguated statics must not remain residual calls: {graph0:?} {graph1:?}"
+        );
+    }
+
+    fn reader_fun_at(def_id: u64, path: &[&str], global_id: u64) -> serde_json::Value {
+        let mut fun = reader_fun(path, global_id);
+        fun["def_id"] = serde_json::json!(def_id);
+        fun
+    }
+
+    fn static_global_with_idents(def_id: u64, idents: &[(&str, u64)]) -> serde_json::Value {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": {
+                "name": idents.iter().map(|(s, d)| serde_json::json!({"Ident": [s, d]})).collect::<Vec<_>>(),
+                "span": span_json(),
+                "source_text": "",
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": false},
+                "is_local": true
+            },
+            "global_kind": "Static",
+            "ty": u32_ty()
+        })
     }
 }

@@ -19,8 +19,9 @@
 //!     ([`crate::front::checked_arith_uint`]).
 //!
 //! `from_size_align(size, align)` returns `Ok(Layout { size, align })` iff
-//! `align.is_power_of_two()` and `size <= isize::MAX - (align - 1)`.  An earlier
-//! commit folds `align_of::<T>()` to a compile-time `ConstInt` power of two, so
+//! `align.is_power_of_two()` and `size <= isize::MAX - (align - 1)`.  The
+//! frontend folds `align_of::<T>()` — ADT layouts and primitive widths
+//! including `usize` — to a compile-time `ConstInt` power of two, so
 //! `align.is_power_of_two()` is statically true and the bound `isize::MAX -
 //! (align - 1)` is a constant.  The residual pair therefore has a native form:
 //!   - `too_big = uint_lt(bound, size)` — `size > bound`, the overflowed case;
@@ -116,66 +117,127 @@ pub(crate) fn rewire_from_size_align_sites(
     rewritten
 }
 
-/// `true` iff `segments` names `Layout::from_size_align` (the last two path
-/// components), whatever the crate/module prefix Charon emits
-/// (`alloc::layout::Layout` here).
-fn is_layout_from_size_align(segments: &[String]) -> bool {
-    matches!(segments.last().map(String::as_str), Some("from_size_align"))
-        && matches!(
-            segments
-                .get(segments.len().wrapping_sub(2))
-                .map(String::as_str),
-            Some("Layout")
-        )
+/// `true` iff `path` names the `Layout` ADT, whatever crate Charon prefixes
+/// (`core::alloc::layout::Layout` from the TypeDecl, `alloc::layout::Layout`
+/// after `strip_crate_prefix`).
+pub(crate) fn is_layout_adt_owner(path: &str) -> bool {
+    path == "core::alloc::layout::Layout" || path == "alloc::layout::Layout"
 }
 
-fn rewire_one_from_size_align_site(
-    graph: &mut FunctionGraph,
-    site: &FromSizeAlignSite,
-) -> Result<(), String> {
-    let name = graph.name.clone();
-    let ok = &site.ok_result;
-
-    // Block Q: the `.ok()` residual call producing `ok`, closed by `lower_call`
-    // with a single forwarding exit.  The call must still be Q's last op — a
-    // `Result::ok` Method call with a single arg (the `from_size_align` result).
-    let q = graph
-        .blocks
-        .iter()
-        .position(|b| b.operations.iter().any(|op| op.result.as_ref() == Some(ok)))
-        .ok_or_else(|| format!("{name}: .ok() result var has no producer block"))?;
-    let ok_idx = graph.blocks[q].operations.len() - 1;
-    let ok_arg = match &graph.blocks[q].operations[ok_idx] {
-        SpaceOperation {
-            result: Some(r),
-            kind:
-                OpKind::Call {
-                    target:
-                        CallTarget::Method {
-                            name: method,
-                            receiver_root,
-                            ..
-                        },
-                    args,
-                    ..
-                },
-        } if r == ok
-            && method == "ok"
-            && receiver_root.as_deref() == Some("Result")
-            && args.len() == 1 =>
-        {
-            args[0].clone()
+/// `true` iff `segments` names `Layout::from_size_align`.
+///
+/// Two Charon spellings reach the residual:
+/// - associated-function owner qualification `[.., "layout", "Layout", "from_size_align"]`
+///   (the call-site `CallTarget::FunctionPath` after `impl_method_owner_for_fundecl`);
+/// - the FunDecl `name_path` `[.., "layout", "<Impl>", "from_size_align"]`
+///   (`core::alloc::layout::<Impl>::from_size_align`), used when the Method hint
+///   is declined and the raw declaration path is kept.
+fn is_layout_from_size_align(segments: &[String]) -> bool {
+    if segments.last().map(String::as_str) != Some("from_size_align") {
+        return false;
+    }
+    match segments
+        .get(segments.len().wrapping_sub(2))
+        .map(String::as_str)
+    {
+        Some("Layout") => true,
+        Some("<Impl>") => {
+            segments
+                .get(segments.len().wrapping_sub(3))
+                .map(String::as_str)
+                == Some("layout")
         }
-        _ => {
-            return Err(format!(
-                "{name}: block {q} last op is not the Result::ok call producing {ok:?}"
-            ));
-        }
-    };
+        _ => false,
+    }
+}
 
-    // Block P: the `from_size_align` residual producing `fsa_res` as its last
-    // op — a 2-arg `[..]::Layout::from_size_align` FunctionPath call.
-    let (p, fsa_res, fsa_in_q) = graph
+fn is_layout_from_size_align_target(target: &CallTarget) -> bool {
+    match target {
+        CallTarget::FunctionPath { segments, .. } => is_layout_from_size_align(segments),
+        CallTarget::Method {
+            name,
+            receiver_root,
+            ..
+        } => name == "from_size_align" && receiver_root.as_deref() == Some("Layout"),
+        _ => false,
+    }
+}
+
+/// `true` iff `segments` names `Result::ok` — Method-hint owner qualification
+/// `[.., "result", "Result", "ok"]` or the FunDecl `name_path`
+/// `[.., "result", "<Impl>", "ok"]`.
+fn result_method_segments(segments: &[String], leaf: &str) -> bool {
+    if segments.last().map(String::as_str) != Some(leaf) {
+        return false;
+    }
+    match segments
+        .get(segments.len().wrapping_sub(2))
+        .map(String::as_str)
+    {
+        Some("Result") => true,
+        Some("<Impl>") => {
+            segments
+                .get(segments.len().wrapping_sub(3))
+                .map(String::as_str)
+                == Some("result")
+        }
+        _ => false,
+    }
+}
+
+fn is_result_ok_target(target: &CallTarget) -> bool {
+    match target {
+        CallTarget::Method {
+            name,
+            receiver_root,
+            ..
+        } => name == "ok" && receiver_root.as_deref() == Some("Result"),
+        CallTarget::FunctionPath { segments, .. } => result_method_segments(segments, "ok"),
+        _ => false,
+    }
+}
+
+fn is_result_expect_target(target: &CallTarget) -> bool {
+    match target {
+        CallTarget::Method {
+            name,
+            receiver_root,
+            ..
+        } => name == "expect" && receiver_root.as_deref() == Some("Result"),
+        CallTarget::FunctionPath { segments, .. } => result_method_segments(segments, "expect"),
+        _ => false,
+    }
+}
+
+fn result_ok_receiver(kind: &OpKind) -> Option<LinkArg> {
+    match kind {
+        OpKind::Call { target, args, .. } if args.len() == 1 && is_result_ok_target(target) => {
+            Some(args[0].clone())
+        }
+        _ => None,
+    }
+}
+
+fn result_expect_receiver(kind: &OpKind) -> Option<LinkArg> {
+    match kind {
+        OpKind::Call { target, args, .. } if args.len() == 2 && is_result_expect_target(target) => {
+            Some(args[0].clone())
+        }
+        _ => None,
+    }
+}
+
+/// Locate the unique predecessor whose last op is threaded into `recv` on
+/// the single edge into `q`.  Returns `(p_index, produced_var, q_input)`.
+/// `produced_var` is the predecessor result; `q_input` is the block-Q
+/// inputarg that received it — they differ when the edge is an SSA copy.
+fn find_from_size_align_pred(
+    graph: &FunctionGraph,
+    q: usize,
+    recv: &LinkArg,
+    name: &str,
+) -> Result<(usize, Variable, Variable), String> {
+    graph
         .blocks
         .iter()
         .enumerate()
@@ -194,25 +256,95 @@ fn rewire_one_from_size_align_site(
                     let LinkArg::Value(source) = arg else {
                         return None;
                     };
-                    (source == produced && (input == &ok_arg || source == &ok_arg))
+                    (source == produced && (input == recv || source == recv))
                         .then(|| (index, source.clone(), input.clone()))
                 })
         })
-        .ok_or_else(|| format!("{name}: from_size_align result is not threaded into .ok()"))?;
+        .ok_or_else(|| format!("{name}: from_size_align result is not threaded into the consumer"))
+}
+
+/// The numeric align passed to `from_size_align`, recovered from a
+/// `ConstInt` / `ConstUInt` producer.  Follows a unique SSA copy across
+/// block inputargs (`resolve_to_producer_op`) so a folded `align_of` that
+/// lives in a predecessor still counts; a merge or a residual call
+/// declines.
+fn folded_align_const(
+    graph: &FunctionGraph,
+    align_arg: &Variable,
+    name: &str,
+) -> Result<i64, String> {
+    let decline = format!("{name}: from_size_align align arg is not a folded ConstInt");
+    let (block_id, idx) = crate::front::mir::resolve_to_producer_op(graph, align_arg)
+        .ok_or_else(|| decline.clone())?;
+    let block = graph
+        .blocks
+        .iter()
+        .find(|b| b.id == block_id)
+        .ok_or_else(|| decline.clone())?;
+    let align = match block.operations.get(idx).map(|op| &op.kind) {
+        Some(OpKind::ConstInt(n)) => *n,
+        Some(OpKind::ConstUInt(n)) => i64::try_from(*n).map_err(|_| decline.clone())?,
+        _ => return Err(decline),
+    };
+    if align <= 0 || !(align as u64).is_power_of_two() {
+        return Err(format!(
+            "{name}: from_size_align align {align} is not a power of two"
+        ));
+    }
+    Ok(align)
+}
+
+fn from_size_align_operands(kind: &OpKind) -> Option<(Variable, Variable)> {
+    match kind {
+        OpKind::Call { target, args, .. }
+            if args.len() == 2 && is_layout_from_size_align_target(target) =>
+        {
+            Some((
+                args[0].clone().into_variable(),
+                args[1].clone().into_variable(),
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn rewire_one_from_size_align_site(
+    graph: &mut FunctionGraph,
+    site: &FromSizeAlignSite,
+) -> Result<(), String> {
+    let name = graph.name.clone();
+    let ok = &site.ok_result;
+
+    // Block Q: the `.ok()` residual call producing `ok`, closed by `lower_call`
+    // with a single forwarding exit.  The call must still be Q's last op — a
+    // `Result::ok` Method call with a single arg (the `from_size_align` result).
+    let q = graph
+        .blocks
+        .iter()
+        .position(|b| b.operations.iter().any(|op| op.result.as_ref() == Some(ok)))
+        .ok_or_else(|| format!("{name}: .ok() result var has no producer block"))?;
+    let ok_idx = graph.blocks[q].operations.len() - 1;
+    let ok_op = &graph.blocks[q].operations[ok_idx];
+    let ok_arg = match (&ok_op.result, result_ok_receiver(&ok_op.kind)) {
+        (Some(r), Some(arg)) if r == ok => arg,
+        _ => {
+            return Err(format!(
+                "{name}: block {q} last op is not the Result::ok call producing {ok:?}"
+            ));
+        }
+    };
+
+    // Block P: the `from_size_align` residual producing `fsa_res` as its last
+    // op — a 2-arg `[..]::Layout::from_size_align` FunctionPath call.
+    let (p, fsa_res, fsa_in_q) = find_from_size_align_pred(graph, q, &ok_arg, &name)?;
     let fsa_idx = graph.blocks[p].operations.len() - 1;
     let (size, align_arg) = match &graph.blocks[p].operations[fsa_idx] {
         SpaceOperation {
             result: Some(r),
-            kind:
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    args,
-                    ..
-                },
-        } if r == &fsa_res && is_layout_from_size_align(segments) && args.len() == 2 => (
-            args[0].clone().into_variable(),
-            args[1].clone().into_variable(),
-        ),
+            kind,
+        } if r == &fsa_res => from_size_align_operands(kind).ok_or_else(|| {
+            format!("{name}: block {p} last op is not the 2-arg Layout::from_size_align call")
+        })?,
         _ => {
             return Err(format!(
                 "{name}: block {p} last op is not the 2-arg Layout::from_size_align call"
@@ -220,27 +352,10 @@ fn rewire_one_from_size_align_site(
         }
     };
 
-    // The folded `align_of::<T>()` constant — the `from_size_align` align arg
-    // must be a `ConstInt` power of two (else the pow2 branch is not statically
-    // true and the bound is not a constant).  Resolved from its unique producer
-    // op anywhere in the graph before any mutation.
-    let align = graph
-        .blocks
-        .iter()
-        .flat_map(|b| &b.operations)
-        .find_map(|op| match &op.kind {
-            OpKind::ConstInt(n) if op.result.as_ref() == Some(&align_arg) => Some(*n),
-            OpKind::ConstUInt(n) if op.result.as_ref() == Some(&align_arg) => {
-                i64::try_from(*n).ok()
-            }
-            _ => None,
-        })
-        .ok_or_else(|| format!("{name}: from_size_align align arg is not a folded ConstInt"))?;
-    if align <= 0 || !(align as u64).is_power_of_two() {
-        return Err(format!(
-            "{name}: from_size_align align {align} is not a power of two"
-        ));
-    }
+    // Folded `align_of::<T>()` — a `ConstInt` power of two, possibly an SSA
+    // copy of a predecessor's const (MIR often emits `align_of` in its own
+    // block).  A residual call or a phi merge declines.
+    let align = folded_align_const(graph, &align_arg, &name)?;
     // `Ok` iff `size <= isize::MAX - (align - 1)`.  `isize::MAX == i64::MAX`.
     let bound = i64::MAX - (align - 1);
 
@@ -388,23 +503,12 @@ fn rewire_one_from_size_align_expect_site(
         })
         .ok_or_else(|| format!("{name}: .expect() result var has no producer block"))?;
     let expect_idx = graph.blocks[q].operations.len() - 1;
-    let fsa_res = match &graph.blocks[q].operations[expect_idx].kind {
-        OpKind::Call {
-            target:
-                CallTarget::Method {
-                    name: method,
-                    receiver_root,
-                    ..
-                },
-            args,
-            ..
-        } if graph.blocks[q].operations[expect_idx].result.as_ref() == Some(result)
-            && method == "expect"
-            && receiver_root.as_deref() == Some("Result")
-            && args.len() == 2 =>
-        {
-            args[0].clone().into_variable()
-        }
+    let expect_op = &graph.blocks[q].operations[expect_idx];
+    let expect_arg = match (
+        expect_op.result.as_ref(),
+        result_expect_receiver(&expect_op.kind),
+    ) {
+        (Some(r), Some(arg)) if r == result => arg,
         _ => {
             return Err(format!(
                 "{name}: block {q} last op is not the Result::expect call producing {result:?}"
@@ -413,30 +517,17 @@ fn rewire_one_from_size_align_expect_site(
     };
 
     // Block P: the `from_size_align` residual producing `fsa_res` as its last op
-    // — a 2-arg `[..]::Layout::from_size_align` FunctionPath call.
-    let p = graph
-        .blocks
-        .iter()
-        .position(|b| {
-            b.operations
-                .iter()
-                .any(|op| op.result.as_ref() == Some(&fsa_res))
-        })
-        .ok_or_else(|| format!("{name}: from_size_align result var has no producer block"))?;
+    // — a 2-arg `[..]::Layout::from_size_align` FunctionPath call.  The expect
+    // receiver is often Q's inputarg (an SSA copy), not P's result var.
+    let (p, fsa_res, fsa_in_q) = find_from_size_align_pred(graph, q, &expect_arg, &name)?;
     let fsa_idx = graph.blocks[p].operations.len() - 1;
     let (size, align_arg) = match &graph.blocks[p].operations[fsa_idx] {
         SpaceOperation {
             result: Some(r),
-            kind:
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    args,
-                    ..
-                },
-        } if r == &fsa_res && is_layout_from_size_align(segments) && args.len() == 2 => (
-            args[0].clone().into_variable(),
-            args[1].clone().into_variable(),
-        ),
+            kind,
+        } if r == &fsa_res => from_size_align_operands(kind).ok_or_else(|| {
+            format!("{name}: block {p} last op is not the 2-arg Layout::from_size_align call")
+        })?,
         _ => {
             return Err(format!(
                 "{name}: block {p} last op is not the 2-arg Layout::from_size_align call"
@@ -444,26 +535,9 @@ fn rewire_one_from_size_align_expect_site(
         }
     };
 
-    // The folded `align_of::<T>()` constant — the align arg must be a `ConstInt`
-    // power of two (else the pow2 branch is not statically true and the bound is
-    // not a constant).  Resolved before any mutation.
-    let align = graph
-        .blocks
-        .iter()
-        .flat_map(|b| &b.operations)
-        .find_map(|op| match &op.kind {
-            OpKind::ConstInt(n) if op.result.as_ref() == Some(&align_arg) => Some(*n),
-            OpKind::ConstUInt(n) if op.result.as_ref() == Some(&align_arg) => {
-                i64::try_from(*n).ok()
-            }
-            _ => None,
-        })
-        .ok_or_else(|| format!("{name}: from_size_align align arg is not a folded ConstInt"))?;
-    if align <= 0 || !(align as u64).is_power_of_two() {
-        return Err(format!(
-            "{name}: from_size_align align {align} is not a power of two"
-        ));
-    }
+    // Folded `align_of::<T>()` — a `ConstInt` power of two, possibly an SSA
+    // copy of a predecessor's const.  A residual call or a phi merge declines.
+    let align = folded_align_const(graph, &align_arg, &name)?;
     // `Ok` iff `size <= isize::MAX - (align - 1)`.  `isize::MAX == i64::MAX`.
     let bound = i64::MAX - (align - 1);
 
@@ -542,15 +616,16 @@ fn rewire_one_from_size_align_expect_site(
     // the raise arm.
     graph.set_branch(p_id, disc, q_id, p_goto_args, else_bb, Vec::new());
 
-    // Block Q: drop the `.expect()` call and alias its result to the block-P
-    // `Layout` threaded across the P→Q edge (`fsa_res` is a Q inputarg).
+    // Block Q: drop the `.expect()` call and alias its result to the Q input
+    // that received P's virtualized `Layout` (`fsa_res` is P's result; the
+    // edge copy is `fsa_in_q`).
     graph.blocks[q].operations.truncate(expect_idx);
     for exit in &mut graph.blocks[q].exits {
         for arg in &mut exit.args {
             if let LinkArg::Value(v) = arg
                 && v == result
             {
-                *v = fsa_res.clone();
+                *v = fsa_in_q.clone();
             }
         }
     }
@@ -775,6 +850,53 @@ mod tests {
         assert_eq!(layout_fields, vec!["__pos_0", "__pos_1"]);
     }
 
+    /// Real MIR emits `align_of` (folded to `ConstInt`) in its own block and
+    /// SSA-copies it into the `from_size_align` block.  The rewrite must
+    /// follow that unique incoming link.
+    #[test]
+    fn from_size_align_ok_lowers_when_align_const_is_ssa_copied() {
+        let mut g = FunctionGraph::new("test_from_size_align_ssa_align");
+        let consts = g.startblock;
+        let size = g.push_op_var(consts, OpKind::ConstInt(64), true).unwrap();
+        let align = g.push_op_var(consts, OpKind::ConstInt(8), true).unwrap();
+        let (p, p_args) = g.create_block_with_arg_vars(2);
+        let fsa = g
+            .push_op_var(
+                p,
+                OpKind::Call {
+                    target: fsa_target(),
+                    args: crate::model::call_args(vec![p_args[0].clone(), p_args[1].clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (q, q_args) = g.create_block_with_arg_vars(1);
+        let ok = g
+            .push_op_var(
+                q,
+                OpKind::Call {
+                    target: ok_target(),
+                    args: crate::model::call_args(vec![q_args[0].clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (cont, _) = g.create_block_with_arg_vars(1);
+        g.set_return(cont, None);
+        g.set_goto(q, cont, vec![ok.clone()]);
+        g.set_goto(p, q, vec![fsa]);
+        g.set_goto(consts, p, vec![size, align]);
+
+        let rewritten = rewire_from_size_align_sites(&mut g, &[site_for(&ok)]);
+        assert_eq!(rewritten, 1, "SSA-copied align ConstInt must rewrite");
+        assert!(
+            !residual_from_size_align_survives(&g),
+            "from_size_align residual must be gone"
+        );
+    }
+
     #[test]
     fn declines_when_align_is_not_a_folded_const() {
         let mut g = FunctionGraph::new("test_dynamic_align");
@@ -949,6 +1071,55 @@ mod tests {
         assert_eq!(raises, 1, "the overflow arm raises to exceptblock");
     }
 
+    /// Real MIR threads the `from_size_align` result into `.expect()` as a
+    /// block inputarg (an SSA copy), not as the predecessor's result var.
+    #[test]
+    fn from_size_align_expect_lowers_when_result_is_ssa_threaded() {
+        let mut g = FunctionGraph::new("test_from_size_align_expect_ssa");
+        let p = g.startblock;
+        let size = g.push_op_var(p, OpKind::ConstInt(64), true).unwrap();
+        let align = g.push_op_var(p, OpKind::ConstInt(8), true).unwrap();
+        let fsa = g
+            .push_op_var(
+                p,
+                OpKind::Call {
+                    target: fsa_target(),
+                    args: crate::model::call_args(vec![size, align]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (q, q_args) = g.create_block_with_arg_vars(1);
+        let msg = g.push_op_var(q, OpKind::ConstInt(1), true).unwrap();
+        let layout = g
+            .push_op_var(
+                q,
+                OpKind::Call {
+                    target: expect_target(),
+                    args: crate::model::call_args(vec![q_args[0].clone(), msg]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (cont, _) = g.create_block_with_arg_vars(1);
+        g.set_return(cont, None);
+        g.set_goto(q, cont, vec![layout.clone()]);
+        g.set_goto(p, q, vec![fsa]);
+
+        let rewritten = rewire_from_size_align_expect_sites(&mut g, &[expect_site_for(&layout)]);
+        assert_eq!(rewritten, 1, "SSA-threaded expect receiver must rewrite");
+        assert!(
+            !residual_from_size_align_survives(&g),
+            "from_size_align residual must be gone"
+        );
+        assert!(
+            matches!(&g.block(q).exits[0].args[0], LinkArg::Value(value) if value == &q_args[0]),
+            ".expect() must forward the Q input, not the deleted P result"
+        );
+    }
+
     #[test]
     fn expect_declines_when_align_is_not_a_folded_const() {
         let mut g = FunctionGraph::new("test_expect_dynamic_align");
@@ -996,5 +1167,175 @@ mod tests {
 
         let rewritten = rewire_from_size_align_expect_sites(&mut g, &[expect_site_for(&layout)]);
         assert_eq!(rewritten, 0, "a non-const align must decline");
+    }
+
+    fn residual_from_size_align_survives(g: &FunctionGraph) -> bool {
+        g.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call { target, .. } if is_layout_from_size_align_target(target)
+            )
+        })
+    }
+
+    fn fsa_impl_target() -> CallTarget {
+        CallTarget::FunctionPath {
+            segments: ["alloc", "layout", "<Impl>", "from_size_align"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            fun_decl_id: None,
+        }
+    }
+
+    fn fsa_method_target() -> CallTarget {
+        CallTarget::Method {
+            name: "from_size_align".to_string(),
+            receiver_root: Some("Layout".to_string()),
+            resolved_path: None,
+            fun_decl_id: None,
+        }
+    }
+
+    fn ok_impl_target() -> CallTarget {
+        CallTarget::FunctionPath {
+            segments: ["core", "result", "<Impl>", "ok"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            fun_decl_id: None,
+        }
+    }
+
+    fn build_ok_site_with(fsa: CallTarget, ok: CallTarget) -> (FunctionGraph, Variable) {
+        let mut g = FunctionGraph::new("test_from_size_align_spelling");
+        let p = g.startblock;
+        let size = g.push_op_var(p, OpKind::ConstInt(64), true).unwrap();
+        let align = g.push_op_var(p, OpKind::ConstInt(8), true).unwrap();
+        let fsa_res = g
+            .push_op_var(
+                p,
+                OpKind::Call {
+                    target: fsa,
+                    args: crate::model::call_args(vec![size, align]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (q, q_args) = g.create_block_with_arg_vars(1);
+        let ok_res = g
+            .push_op_var(
+                q,
+                OpKind::Call {
+                    target: ok,
+                    args: crate::model::call_args(vec![q_args[0].clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (cont, _) = g.create_block_with_arg_vars(1);
+        g.set_return(cont, None);
+        g.set_goto(q, cont, vec![ok_res.clone()]);
+        g.set_goto(p, q, vec![fsa_res]);
+        (g, ok_res)
+    }
+
+    #[test]
+    fn layout_from_size_align_accepts_impl_declaration_spelling() {
+        let layout: Vec<String> = ["alloc", "layout", "Layout", "from_size_align"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let impl_path: Vec<String> = ["alloc", "layout", "<Impl>", "from_size_align"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let core_impl: Vec<String> = ["core", "alloc", "layout", "<Impl>", "from_size_align"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let unrelated: Vec<String> = ["core", "num", "<Impl>", "from_size_align"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(is_layout_from_size_align(&layout));
+        assert!(is_layout_from_size_align(&impl_path));
+        assert!(is_layout_from_size_align(&core_impl));
+        assert!(!is_layout_from_size_align(&unrelated));
+        assert!(is_layout_adt_owner("core::alloc::layout::Layout"));
+        assert!(is_layout_adt_owner("alloc::layout::Layout"));
+        assert!(!is_layout_adt_owner("core::result::Result"));
+    }
+
+    #[test]
+    fn from_size_align_ok_impl_spelling_lowers() {
+        let (mut g, ok) = build_ok_site_with(fsa_impl_target(), ok_target());
+        let rewritten = rewire_from_size_align_sites(&mut g, &[site_for(&ok)]);
+        assert_eq!(rewritten, 1, "the <Impl> FunDecl spelling must rewrite");
+        assert!(
+            !residual_from_size_align_survives(&g),
+            "the <Impl> residual must be gone"
+        );
+    }
+
+    #[test]
+    fn from_size_align_ok_method_target_lowers() {
+        let (mut g, ok) = build_ok_site_with(fsa_method_target(), ok_target());
+        let rewritten = rewire_from_size_align_sites(&mut g, &[site_for(&ok)]);
+        assert_eq!(
+            rewritten, 1,
+            "the Method Layout::from_size_align form must rewrite"
+        );
+        assert!(
+            !residual_from_size_align_survives(&g),
+            "the Method residual must be gone"
+        );
+    }
+
+    #[test]
+    fn from_size_align_ok_functionpath_result_ok_lowers() {
+        let (mut g, ok) = build_ok_site_with(fsa_target(), ok_impl_target());
+        let rewritten = rewire_from_size_align_sites(&mut g, &[site_for(&ok)]);
+        assert_eq!(
+            rewritten, 1,
+            "Result::ok as core::result::<Impl>::ok must rewrite"
+        );
+        assert!(
+            !residual_from_size_align_survives(&g),
+            "from_size_align residual must be gone when .ok() is a FunctionPath"
+        );
+    }
+
+    /// The four census callers must consume their `from_size_align` residual.
+    /// Ignored: loads the real extracted LLBCs.
+    #[test]
+    #[ignore]
+    fn four_from_size_align_callers_have_no_residual() {
+        use crate::front::mir::lower_function;
+        use majit_charon_reader::Llbc;
+
+        let object = Llbc::load(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        ))
+        .expect("load pyre-object.ullbc");
+        let rlib = Llbc::load(crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC)
+            .expect("load majit-rlib.ullbc");
+
+        for (llbc, name) in [
+            (&object, "bh_alloc_lowlevel_string"),
+            (&object, "alloc_raw_utf8_payload"),
+            (&object, "try_items_block_layout"),
+            (&rlib, "try_typed_items_block_layout"),
+        ] {
+            let graph =
+                lower_function(llbc, name).unwrap_or_else(|err| panic!("lower {name}: {err}"));
+            assert!(
+                !residual_from_size_align_survives(&graph),
+                "{name} still has a residual Layout::from_size_align"
+            );
+        }
     }
 }

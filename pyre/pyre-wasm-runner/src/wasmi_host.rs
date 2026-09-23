@@ -124,6 +124,161 @@ pub fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32, Strin
         .get_typed_func::<(u32, u32), ()>(&store, "pyre_dealloc")
         .map_err(estr)?;
 
+    // The environment `-P`, `-O`, PYTHONWARNINGS and the rest resolve against.
+    // The guest's own is permanently empty, so without this every one of them
+    // reads as unset there while working natively; the runner only forwards the
+    // values, the fold stays in `launch_env::finalize` where the launcher's is.
+    // The module names which variables it wants, so the two never drift apart.
+    //
+    // A module predating `pyre_set_launch_env` still understands the `-P` half
+    // through `pyre_set_safe_path`; one predating both keeps its previous
+    // behaviour of always seeding `sys.path[0]`. Both halves are resolved before
+    // either is used, so a module carrying only one degrades to the fallback
+    // instead of failing the run.
+    let launch_env_names = instance
+        .get_typed_func::<(), u64>(&store, "pyre_launch_env_names")
+        .ok();
+    let set_launch_env = instance
+        .get_typed_func::<(u32, u32), ()>(&store, "pyre_set_launch_env")
+        .ok();
+    if let (Some(names), Some(set_launch_env)) = (launch_env_names, set_launch_env) {
+        let packed = names.call(&mut store, ()).map_err(estr)?;
+        let (nptr, nlen) = ((packed >> 32) as u32, packed as u32);
+        let mut buf = vec![0u8; nlen as usize];
+        memory.read(&store, nptr as usize, &mut buf).map_err(estr)?;
+        dealloc.call(&mut store, (nptr, nlen)).map_err(estr)?;
+
+        // Values are forwarded undecoded. The fold reads all but one of these
+        // names through `env::var` and so drops a value that is not UTF-8 on
+        // its own, matching the native launcher; the exception is the
+        // `PYTHONSAFEPATH` presence flag, which `_Py_GetEnv` tests on raw
+        // bytes. Decoding here would make such a value read as unset and leave
+        // `sys.path[0]` seeded rather than suppressed, so the decision belongs
+        // to the fold, not the transport. `into_encoded_bytes` round-trips a
+        // valid-UTF-8 `OsString` to exactly its UTF-8 bytes, so the guest's
+        // `from_utf8` reproduces `env::var`'s accept/reject split unchanged.
+        let mut blob: Vec<u8> = Vec::new();
+        for name in String::from_utf8_lossy(&buf)
+            .split('\0')
+            .filter(|name| !name.is_empty())
+        {
+            let Some(value) = std::env::var_os(name) else {
+                continue;
+            };
+            if !blob.is_empty() {
+                blob.push(0);
+            }
+            blob.extend_from_slice(name.as_bytes());
+            blob.push(b'=');
+            blob.extend_from_slice(&value.into_encoded_bytes());
+        }
+
+        let blen = blob.len() as u32;
+        if blen == 0 {
+            set_launch_env.call(&mut store, (0, 0)).map_err(estr)?;
+        } else {
+            let p = alloc.call(&mut store, blen).map_err(estr)?;
+            memory.write(&mut store, p as usize, &blob).map_err(estr)?;
+            set_launch_env.call(&mut store, (p, blen)).map_err(estr)?;
+            dealloc.call(&mut store, (p, blen)).map_err(estr)?;
+        }
+    } else if std::env::var_os("PYTHONSAFEPATH").is_some_and(|value| !value.is_empty())
+        && let Ok(set_safe_path) = instance.get_typed_func::<u32, ()>(&store, "pyre_set_safe_path")
+    {
+        set_safe_path.call(&mut store, 1).map_err(estr)?;
+    }
+
+    // The environment the collector sizes itself from, forwarded the same way
+    // and for the same reason. It is not a diagnostic knob: `PYPY_GC_MIN` and
+    // `PYPY_GC_NURSERY` fix where the major-collection threshold falls, the
+    // major step arms the eval-breaker word, and every compiled loop's back edge
+    // polls that word through a real guard — so a guest that cannot read them
+    // counts a different number of guard failures than the native backends run
+    // beside it, from the same settings. Absent on a module predating the
+    // export, which then keeps its built-in defaults.
+    let gc_env_names = instance
+        .get_typed_func::<(), u64>(&store, "pyre_gc_env_names")
+        .ok();
+    let set_gc_env = instance
+        .get_typed_func::<(u32, u32), ()>(&store, "pyre_set_gc_env")
+        .ok();
+    if let (Some(names), Some(set_gc_env)) = (gc_env_names, set_gc_env) {
+        let packed = names.call(&mut store, ()).map_err(estr)?;
+        let (nptr, nlen) = ((packed >> 32) as u32, packed as u32);
+        let mut buf = vec![0u8; nlen as usize];
+        memory.read(&store, nptr as usize, &mut buf).map_err(estr)?;
+        dealloc.call(&mut store, (nptr, nlen)).map_err(estr)?;
+
+        // `env::var`, not `var_os`: the guest parses these as numbers, so a
+        // value that does not decode could not have been one and is left unset
+        // exactly as it would be natively.
+        let blob = String::from_utf8_lossy(&buf)
+            .split('\0')
+            .filter(|name| !name.is_empty())
+            .filter_map(|name| {
+                std::env::var(name)
+                    .ok()
+                    .map(|value| format!("{name}={value}"))
+            })
+            .collect::<Vec<_>>()
+            .join("\0");
+
+        let blen = blob.len() as u32;
+        if blen != 0 {
+            let p = alloc.call(&mut store, blen).map_err(estr)?;
+            memory
+                .write(&mut store, p as usize, blob.as_bytes())
+                .map_err(estr)?;
+            set_gc_env.call(&mut store, (p, blen)).map_err(estr)?;
+            dealloc.call(&mut store, (p, blen)).map_err(estr)?;
+        }
+    }
+
+    // The environment the JIT knobs resolve against, forwarded the same way
+    // and for the same reason. It is not a diagnostic knob: `PYRE_NO_JIT`
+    // disables every compiled path and `MAJIT_NO_BRIDGE` sends every guard
+    // failure through the blackhole — so a guest that cannot read them
+    // executes a different program than the native backends run beside it,
+    // from the same settings. Absent on a module predating the export, which
+    // then keeps both knobs unset.
+    let jit_env_names = instance
+        .get_typed_func::<(), u64>(&store, "pyre_jit_env_names")
+        .ok();
+    let set_jit_env = instance
+        .get_typed_func::<(u32, u32), ()>(&store, "pyre_set_jit_env")
+        .ok();
+    if let (Some(names), Some(set_jit_env)) = (jit_env_names, set_jit_env) {
+        let packed = names.call(&mut store, ()).map_err(estr)?;
+        let (nptr, nlen) = ((packed >> 32) as u32, packed as u32);
+        let mut buf = vec![0u8; nlen as usize];
+        memory.read(&store, nptr as usize, &mut buf).map_err(estr)?;
+        dealloc.call(&mut store, (nptr, nlen)).map_err(estr)?;
+
+        // Presence flags, but the blob is still UTF-8 `NAME=VALUE`. Native
+        // presence reads use `var_os`, so a non-UTF-8 value is still "set";
+        // forward that as `NAME=` (empty still counts as set).
+        let blob = String::from_utf8_lossy(&buf)
+            .split('\0')
+            .filter(|name| !name.is_empty())
+            .filter_map(|name| {
+                std::env::var_os(name)?;
+                let value = std::env::var(name).unwrap_or_default();
+                Some(format!("{name}={value}"))
+            })
+            .collect::<Vec<_>>()
+            .join("\0");
+
+        let blen = blob.len() as u32;
+        if blen != 0 {
+            let p = alloc.call(&mut store, blen).map_err(estr)?;
+            memory
+                .write(&mut store, p as usize, blob.as_bytes())
+                .map_err(estr)?;
+            set_jit_env.call(&mut store, (p, blen)).map_err(estr)?;
+            dealloc.call(&mut store, (p, blen)).map_err(estr)?;
+        }
+    }
+
     // Name the script so the guest compiles it under its real path: that is
     // what a traceback prints, what its source-line lookup reads back through
     // `pyre_host.host_read`, and the directory that heads `sys.path`. Absent

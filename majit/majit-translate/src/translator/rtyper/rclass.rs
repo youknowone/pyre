@@ -3369,8 +3369,16 @@ impl InstanceRepr {
             let Some((mangled_name, r)) = self._get_field(name) else {
                 continue;
             };
+            // `rclass.py _parse_field_list`: `isinstance(r, AbstractBaseListRepr)`.
+            // Both `ListRepr` and `FixedSizeListRepr` inherit that base
+            // (`rlist.py AbstractFixedSizeListRepr(AbstractBaseListRepr)`);
+            // `[*]` / `?[*]` therefore accepts a never-resized list
+            // (`Ptr(GcArray)`), not only the resized `ListRepr` header.
             if matches!(rank, IR_IMMUTABLE_ARRAY | IR_QUASIIMMUTABLE_ARRAY)
-                && r.repr_class_id() != ReprClassId::ListRepr
+                && !matches!(
+                    r.repr_class_id(),
+                    ReprClassId::ListRepr | ReprClassId::FixedSizeListRepr
+                )
             {
                 return Err(TyperError::message(format!(
                     "_immutable_fields_ = [{fullname:?}] in {:?}, but {name:?} is not a list \
@@ -3831,6 +3839,19 @@ impl Repr for InstanceRepr {
         };
         if attr == "__discriminant" && receiver_is_nullable_instance {
             use crate::translator::rtyper::rtyper::GenopResult;
+            // Result lltype follows `hop.r_result`: a switch on tags
+            // 0..n specialises `SomeInteger` to Ruint/Unsigned; a
+            // discriminant that never gained knowntypedata stays Signed.
+            let disc_lltype = hop
+                .r_result
+                .borrow()
+                .as_ref()
+                .map(|r| r.lowleveltype().clone())
+                .unwrap_or(LowLevelType::Signed);
+            let cast_op = match &disc_lltype {
+                LowLevelType::Unsigned | LowLevelType::UnsignedLongLong => "cast_bool_to_uint",
+                _ => "cast_bool_to_int",
+            };
             let v_nonzero = hop
                 .genop(
                     "ptr_nonzero",
@@ -3842,11 +3863,7 @@ impl Repr for InstanceRepr {
                         "InstanceRepr.rtype_getattr: ptr_nonzero produced no result var",
                     )
                 })?;
-            return Ok(hop.genop(
-                "cast_bool_to_int",
-                vec![v_nonzero],
-                GenopResult::LLType(LowLevelType::Signed),
-            ));
+            return Ok(hop.genop(cast_op, vec![v_nonzero], GenopResult::LLType(disc_lltype)));
         }
 
         // upstream: `else:`

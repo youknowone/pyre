@@ -109,6 +109,31 @@ pub(crate) fn is_ovf_width_int_atom(atom: &str) -> bool {
     matches!(atom, "I64" | "Isize")
 }
 
+/// Whether a signed `checked_*` site may reach the `*_ovf` rewrite.
+///
+/// Charon leaves a literal operand (`n.checked_add(1)`) without a Place
+/// type (`Operand::Const` → no `second_arg_ty`), so demanding both
+/// operands would drop the constant-rhs form the integer fast paths
+/// spell (`RBuilder::grow_by_sizes` `needed.checked_add(63)`).  The
+/// destination is `Option<Self>` and is always present; its payload atom
+/// *is* the overflow width `add_ovf` will test.  Either operand is only
+/// a fallback when that payload is unreadable.  A readable narrow
+/// payload (`I32`) declines even if an operand atom looks word-sized —
+/// the destination is the type the source asked about.
+pub(crate) fn signed_ovf_width_reaches<'a>(
+    dest_payload_atom: Option<&'a str>,
+    operand_atoms: impl IntoIterator<Item = Option<&'a str>>,
+) -> bool {
+    let atom = match dest_payload_atom {
+        Some(atom) => atom,
+        None => match operand_atoms.into_iter().flatten().next() {
+            Some(atom) => atom,
+            None => return false,
+        },
+    };
+    is_ovf_width_int_atom(atom)
+}
+
 /// The `Option::ok_or_else` continuation paired with a signed checked-arith
 /// result.  The MIR collector resolves the type-owned names while the Rust
 /// types are still in hand; the post-pass validates that the call immediately
@@ -725,6 +750,41 @@ mod tests {
         for atom in ["I8", "I16", "I32", "I128", "U64", "Usize"] {
             assert!(!is_ovf_width_int_atom(atom), "{atom} should decline");
         }
+    }
+
+    /// Constant rhs (`needed.checked_add(63)`) and both-const
+    /// (`1i64.checked_add(2)`) have no Place type on the literal; the
+    /// destination `Option<Self>` payload still names the width.
+    #[test]
+    fn const_operand_and_dest_payload_reach_signed_ovf() {
+        assert!(
+            signed_ovf_width_reaches(Some("I64"), [None, None]),
+            "both-const: dest Option<i64> payload is the width"
+        );
+        assert!(
+            signed_ovf_width_reaches(None, [Some("I64"), None]),
+            "const rhs: the receiver Place is I64"
+        );
+        assert!(
+            signed_ovf_width_reaches(None, [None, Some("Isize")]),
+            "const lhs: the other Place is Isize"
+        );
+        assert!(
+            signed_ovf_width_reaches(Some("Isize"), [None, Some("I64")]),
+            "dest payload is preferred and is still a machine word"
+        );
+    }
+
+    #[test]
+    fn narrow_dest_payload_declines_even_if_an_operand_looks_wide() {
+        assert!(
+            !signed_ovf_width_reaches(Some("I32"), [Some("I64"), None]),
+            "i32::checked_add overflow is not add_ovf"
+        );
+        assert!(!signed_ovf_width_reaches(Some("I8"), [None, None]));
+        assert!(!signed_ovf_width_reaches(None, [Some("I32"), None]));
+        assert!(!signed_ovf_width_reaches(None, [None, None]));
+        assert!(!signed_ovf_width_reaches(Some("U64"), [None, None]));
     }
 
     #[test]

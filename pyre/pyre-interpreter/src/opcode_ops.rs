@@ -978,8 +978,11 @@ pub fn dict_merge_value(
     // `space.len_w` is a generic `__len__` dispatch — a raw `w_dict_len`
     // would be UB on a dict subclass whose layout is not `W_DictObject`.
     let l1 = crate::baseobjspace::len_w(dict())?;
+    // pyopcode.py `_dict_merge`: `unroll_safe = jit.isvirtual(w_dict) and l1 < 10`.
+    let mut unroll_safe = majit_rlib::jit::isvirtual(&dict()) && l1 < 10;
     let source_is_dict = unsafe { crate::baseobjspace::isinstance_w(source(), w_dict_type) };
     if !source_is_dict {
+        unroll_safe = false;
         // `if not space.ismapping_w(w_item): raise oefmt(... "%s argument
         // after ** must be a mapping, not %T")`.
         if !crate::baseobjspace::ismapping_w(source()) {
@@ -1019,14 +1022,38 @@ pub fn dict_merge_value(
         if l2 == 0 {
             return Ok(());
         }
+        unroll_safe = unroll_safe && majit_rlib::jit::isvirtual(&source()) && l2 < 10;
     }
-    // `_dict_merge_loop`: iterate `iter(w_item.keys())`, look each value up
-    // with `space.getitem`, reject a key already present in the target with
-    // `"%s got multiple values for keyword argument '%S'"`, then store.
+    _dict_merge_loop(dict(), source(), unroll_safe, w_callable())
+}
+
+/// pyopcode.py `_dict_merge_loop`.
+/// `@jit.look_inside_iff(lambda space, w_dict, w_item, unroll_safe, w_function: unroll_safe)`.
+fn _dict_merge_loop_iff(
+    _w_dict: PyObjectRef,
+    _w_item: PyObjectRef,
+    unroll_safe: bool,
+    _w_function: PyObjectRef,
+) -> bool {
+    unroll_safe
+}
+
+#[majit_macros::look_inside_iff(_dict_merge_loop_iff)]
+fn _dict_merge_loop(
+    w_dict: PyObjectRef,
+    w_item: PyObjectRef,
+    _unroll_safe: bool,
+    w_function: PyObjectRef,
+) -> Result<(), PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = _roots.pin_roots(&[w_dict, w_item, w_function]);
+    let dict = || pyre_object::gc_roots::shadow_stack_get(root_base);
+    let source = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+    let w_callable = || pyre_object::gc_roots::shadow_stack_get(root_base + 2);
     let keys_method = match crate::baseobjspace::getattr_str(source(), "keys") {
         Ok(m) => m,
         Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
-            let type_name = unsafe { (*(*source()).ob_type).name };
+            let type_name = crate::error::type_name_of(source());
             return Err(crate::argument::raise_type_error(
                 w_callable(),
                 format!("argument after ** must be a mapping, not {type_name}"),
@@ -1042,18 +1069,29 @@ pub fn dict_merge_value(
     )?;
     let keys_obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(keys_obj);
-    let keys =
-        crate::builtins::collect_iterable(pyre_object::gc_roots::shadow_stack_get(keys_obj_slot))?;
-    let keys_base = pyre_object::gc_roots::pin_roots(&keys);
-    for index in 0..keys.len() {
-        let key = || pyre_object::gc_roots::shadow_stack_get(keys_base + index);
-        let val = crate::baseobjspace::getitem(source(), key())?;
-        // `val` is fresh and `__contains__` runs Python; it needs a root of its
-        // own for that call, released again each turn so the bracket stays
-        // fixed-size.
+    let w_iterator =
+        crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(keys_obj_slot))?;
+    let iter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_iterator);
+    loop {
+        let w_key =
+            match crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(iter_slot)) {
+                Ok(k) => k,
+                Err(e) if e.matches_stop_iteration() => break,
+                Err(e) => return Err(e),
+            };
         let _iteration_roots = pyre_object::gc_roots::push_roots();
+        let key_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_key);
+        let val = crate::baseobjspace::getitem(
+            source(),
+            pyre_object::gc_roots::shadow_stack_get(key_slot),
+        )?;
         let val_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(val);
+        // `__contains__` runs Python, so the key is re-read from its slot
+        // after it rather than held across it.
+        let key = || pyre_object::gc_roots::shadow_stack_get(key_slot);
         if crate::baseobjspace::contains(dict(), key())? {
             let key_str = unsafe { crate::display::py_str_wtf8(key()) }?;
             return Err(crate::argument::raise_type_error(

@@ -3369,6 +3369,36 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::jit_ll_shrink_array",
         pyre_object::lowlevel_string::jit_ll_shrink_array,
     );
+    // Word-only Acquire readers of the runtime-assigned GC type ids.
+    // Each body is `AtomicU32::load(Acquire)` of a process-global cell
+    // and a return of that `u32`; the id is published at run time by
+    // `pyre-jit::eval` `build_gc`, so the residual must call the
+    // function rather than bake a translation-time constant.  `u32` is
+    // in `residual_scalar!`.
+    pa0(
+        &mut entries,
+        "pyre_object::lowlevel_string::lowlevel_str_gc_type_id",
+        "pyre_object::lowlevel_str_gc_type_id",
+        pyre_object::lowlevel_string::lowlevel_str_gc_type_id,
+    );
+    pa0(
+        &mut entries,
+        "pyre_object::lowlevel_string::lowlevel_unicode_gc_type_id",
+        "pyre_object::lowlevel_unicode_gc_type_id",
+        pyre_object::lowlevel_string::lowlevel_unicode_gc_type_id,
+    );
+    pa0(
+        &mut entries,
+        "pyre_object::rbuilder::stringbuilder_gc_type_id",
+        "pyre_object::stringbuilder_gc_type_id",
+        pyre_object::rbuilder::stringbuilder_gc_type_id,
+    );
+    pa0(
+        &mut entries,
+        "pyre_object::rbuilder::stringpiece_gc_type_id",
+        "pyre_object::stringpiece_gc_type_id",
+        pyre_object::rbuilder::stringpiece_gc_type_id,
+    );
     // `rgc.ll_arraymove` / `list.ll_arraymove` keeps PyPy's four-argument
     // residual ABI. The target recovers the registered array token from the
     // GC TYPE_INFO row, runs the before-move barrier for reference items, and
@@ -5308,6 +5338,14 @@ pub fn jit_static_ref_addrs() -> Vec<(&'static str, i64)> {
             "baseobjspace::OBJECT_SPACE",
             &crate::baseobjspace::OBJECT_SPACE as *const _ as i64,
         ),
+        // Address of the process-wide stack-check cache.  The Atomic
+        // fields are written after startup; this row is the static's
+        // identity so a translated field load is a memory access
+        // through a constant pointer, not a baked initial value.
+        (
+            "stack_check::PYRE_STACKTOOBIG",
+            &crate::stack_check::PYRE_STACKTOOBIG as *const _ as i64,
+        ),
     ]
 }
 
@@ -5542,6 +5580,46 @@ mod tests {
             !bindings.contains_key("pyre_interpreter::register_frame_locals_slot"),
             "short alias shared by two full paths must not be emitted"
         );
+    }
+
+    #[test]
+    fn jit_trace_fnaddrs_covers_word_only_atomic_gc_type_id_readers() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let rows: &[(&str, &str, fn() -> u32)] = &[
+            (
+                "pyre_object::lowlevel_string::lowlevel_str_gc_type_id",
+                "pyre_object::lowlevel_str_gc_type_id",
+                pyre_object::lowlevel_string::lowlevel_str_gc_type_id,
+            ),
+            (
+                "pyre_object::lowlevel_string::lowlevel_unicode_gc_type_id",
+                "pyre_object::lowlevel_unicode_gc_type_id",
+                pyre_object::lowlevel_string::lowlevel_unicode_gc_type_id,
+            ),
+            (
+                "pyre_object::rbuilder::stringbuilder_gc_type_id",
+                "pyre_object::stringbuilder_gc_type_id",
+                pyre_object::rbuilder::stringbuilder_gc_type_id,
+            ),
+            (
+                "pyre_object::rbuilder::stringpiece_gc_type_id",
+                "pyre_object::stringpiece_gc_type_id",
+                pyre_object::rbuilder::stringpiece_gc_type_id,
+            ),
+        ];
+        for (module_path, root_path, func) in rows {
+            let expected = *func as *const () as usize as i64;
+            assert_eq!(
+                bindings.get(module_path),
+                Some(&expected),
+                "missing {module_path}"
+            );
+            assert_eq!(
+                bindings.get(root_path),
+                Some(&expected),
+                "missing {root_path}"
+            );
+        }
     }
 
     #[test]
@@ -5972,6 +6050,10 @@ mod tests {
         assert_eq!(
             bindings["objspace::std::mapdict::MAP_DICT_STRATEGY_REF"],
             &crate::objspace::std::mapdict::MAP_DICT_STRATEGY_REF as *const _ as i64
+        );
+        assert_eq!(
+            bindings["stack_check::PYRE_STACKTOOBIG"],
+            &crate::stack_check::PYRE_STACKTOOBIG as *const _ as i64
         );
     }
 

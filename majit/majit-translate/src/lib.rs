@@ -239,18 +239,21 @@ fn build_semantic_program_via_active_frontend(
             // `repr(transparent)` scalar returns resolve; that extra
             // parse is the cost of not keeping every tree live.
             let mut discovered = Vec::new();
+            let mut foldable_consts = Vec::new();
             let mut crate_names = Vec::new();
             let mut hints: std::collections::HashMap<String, Vec<String>> =
                 std::collections::HashMap::new();
             let mut immutable_fields = std::collections::HashMap::new();
             let mut unsafe_fn_stubs = Vec::new();
             let mut foreign_opaque_method_externals = Vec::new();
+            let mut atomic_load_decls = Vec::new();
             for p in &paths {
                 let llbc = majit_charon_reader::Llbc::load(p)
                     .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"));
                 prof.mark(&format!("    harvest {p}"));
                 crate_names.push(llbc.crate_name().to_string());
                 discovered.extend(front::mir::discover_transparent_scalar_kinds(&llbc));
+                foldable_consts.extend(front::mir::discover_foldable_const_lits(&llbc));
                 for (k, v) in
                     front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(&llbc))
                 {
@@ -264,7 +267,10 @@ fn build_semantic_program_via_active_frontend(
             }
             discovered.sort_by(|a, b| a.0.cmp(&b.0));
             discovered.dedup();
+            foldable_consts.sort_by(|a, b| a.0.cmp(&b.0));
+            foldable_consts.dedup();
             crate::local_crates::register_local_crate_roots(crate_names);
+            front::mir::register_foldable_const_lits(foldable_consts);
 
             let mut merged = None;
             let mut seen_function_keys = std::collections::HashSet::new();
@@ -286,6 +292,7 @@ fn build_semantic_program_via_active_frontend(
                     .extend(front::mir::collect_marked_class_ctor_stubs_from_llbc(&llbc));
                 foreign_opaque_method_externals
                     .extend(front::mir::collect_foreign_opaque_method_externals(&llbc));
+                atomic_load_decls.extend(front::mir::collect_atomic_load_declined_fun_decls(&llbc));
                 let prog = front::mir::build_semantic_program_from_prelinked_llbc(
                     &llbc,
                     static_addrs,
@@ -328,6 +335,9 @@ fn build_semantic_program_via_active_frontend(
             program.immutable_fields = immutable_fields;
             program.unsafe_fn_stubs = unsafe_fn_stubs;
             program.foreign_opaque_method_externals = foreign_opaque_method_externals;
+            crate::translator::rtyper::lltypesystem::module::ll_extaccessor::register_harvested_atomic_load_decls(
+                atomic_load_decls,
+            );
             return program;
         }
     }
