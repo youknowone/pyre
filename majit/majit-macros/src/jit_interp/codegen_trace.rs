@@ -526,8 +526,10 @@ fn method_is_get_op_at_pc(mc: &syn::ExprMethodCall) -> bool {
 }
 
 /// The opcode-fetch call `insn_op(program, pc)`. Not `insn_a` / `insn_b`.
-/// Casts on either argument are ignored, so `insn_op(program as _, pc as _)`
-/// is the same fetch.
+/// Both arguments must be the bare identifiers. A cast on either one
+/// (`insn_op(program as _, pc as _)`) is a different fetch: lowering it
+/// as the bare call would drop a narrowing conversion and make the
+/// traced opcode disagree with the interpreter.
 pub(crate) fn call_is_insn_op_at_pc(call: &syn::ExprCall) -> bool {
     let is_insn_op = match call.func.as_ref() {
         syn::Expr::Path(p) => p.path.segments.last().is_some_and(|s| s.ident == "insn_op"),
@@ -535,8 +537,8 @@ pub(crate) fn call_is_insn_op_at_pc(call: &syn::ExprCall) -> bool {
     };
     is_insn_op
         && call.args.len() == 2
-        && expr_is_ident(unwrap_cast(&call.args[0]), "program")
-        && expr_is_ident(unwrap_cast(&call.args[1]), "pc")
+        && expr_is_ident(&call.args[0], "program")
+        && expr_is_ident(&call.args[1], "pc")
 }
 
 fn expr_is_ident(expr: &syn::Expr, name: &str) -> bool {
