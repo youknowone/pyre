@@ -10704,10 +10704,6 @@ pub(crate) fn correct_resume_vsd(frame: &mut PyFrame, resume_pc: usize) {
 /// at the merge-point next_instr of the condition, not the leftover
 /// const).
 fn loop_header_for_exit_pop_jump(code: &pyre_interpreter::CodeObject, pc: usize) -> Option<usize> {
-    let headers = cached_loop_header_pcs(code);
-    if headers.is_empty() {
-        return None;
-    }
     // Nearest header before `pc`. The while-condition `POP_JUMP` sits
     // a few opcodes after the header (`LOAD`/`COMPARE`/`POP_JUMP`).
     // A later `if` `POP_JUMP` (rem==0 at pc=23) is much farther; do
@@ -10716,9 +10712,11 @@ fn loop_header_for_exit_pop_jump(code: &pyre_interpreter::CodeObject, pc: usize)
     // `code_successors` also inserts exception-table edges, so a
     // farthest-successor walk from the rem==0 jump wrongly spans the
     // `JUMP_BACKWARD` and looks like a loop-exit.
+    // Membership is `loop_headers::code_pc_is_loop_header` — the set
+    // itself stays in the interpreter crate.
     let mut header = None;
     for candidate in 0..pc {
-        if headers.contains(&candidate) {
+        if pyre_interpreter::code_pc_is_loop_header(code, candidate) {
             header = Some(candidate);
         }
     }
@@ -10762,7 +10760,7 @@ fn apply_blackhole_crn_handoff(frame: &mut PyFrame, green_int: &[i64]) {
     if let Some(header) = loop_header_for_exit_pop_jump(code, ni) {
         frame.set_last_instr_from_next_instr(header);
         correct_resume_vsd(frame, header);
-    } else if cached_loop_header_pcs(code).contains(&ni) {
+    } else if pyre_interpreter::code_pc_is_loop_header(code, ni) {
         correct_resume_vsd(frame, ni);
     }
 }
