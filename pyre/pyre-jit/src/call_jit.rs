@@ -2318,6 +2318,16 @@ fn jit_blackhole_resume_from_guard(
     // RPython compile.py:701-716 parity: every guard must have rd_numb
     // from capture_resumedata + store_final_boxes_in_guard (resume.py:397).
     // Hitting this path means a guard was compiled without snapshot data.
+    //
+    // `PropagateExceptionDescr.handle_fail` (compile.py) still has to
+    // re-raise: the failure stub stored the exception in `jf_guard_exc`
+    // and this function already received it as `guard_exc`. Dropping it
+    // and returning no result makes the CALL_ASSEMBLER caller observe a
+    // NULL return with no exception set.
+    if guard_exc != 0 {
+        publish_residual_call_exception(guard_exc);
+        return Some(0);
+    }
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[blackhole-resume] no rd_numb for key={} trace={} fail={} (force_fn fallback)",

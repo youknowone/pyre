@@ -661,6 +661,9 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             // fold's freshly minted `ConstPtr` sits in a bank no root area
             // reaches.
             let _bank_guard = crate::trace::InlineRegisterBankGuard::enter(wc.registers_r);
+            // After the register banks and the vstack mirror exist, so the
+            // guard's resume snapshot can rebuild this frame.
+            pin_nonconst_standing_exception_class(&mut wc, walk_position)?;
             walk(jitcode_code, walk_position, &mut wc)
         };
         if matches!(

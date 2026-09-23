@@ -5271,8 +5271,60 @@ fn seed_standing_exception_for_walk<Sym: WalkSym>(
         sym.set_current_exc_box(exc_box);
         sym.set_last_exc_value(current);
         sym.set_last_exc_box(exc_box);
-        sym.set_class_of_last_exc_is_const(true);
+        // `execute_ll_raised`: the class is a Const only after
+        // GUARD_EXCEPTION or GUARD_CLASS. A live `GetfieldGcR` of
+        // `sys_exc_value` has no such guard, so the flag stays false and
+        // `handle_possible_exception` keeps the guard op as `last_exc_box`
+        // instead of a `ConstPtr` of the recording-time object.
+        // `pin_nonconst_standing_exception_class` records the GUARD_CLASS
+        // (`opimpl_raise`) once the walk can capture its resume snapshot.
+        sym.set_class_of_last_exc_is_const(exc_box.is_constant());
     }
+}
+
+/// `opimpl_raise` / `handle_possible_exception`: a seeded exception whose
+/// box is not a constant gets `GUARD_CLASS` before
+/// `class_of_last_exc_is_const` becomes true. Consumers
+/// (`opimpl_last_exception`, `opimpl_goto_if_exception_mismatch`) then
+/// fold the class off a pinned value.
+pub(crate) fn pin_nonconst_standing_exception_class<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+) -> Result<(), DispatchError> {
+    if ctx.fbw_mode.class_of_last_exc_is_const {
+        return Ok(());
+    }
+    let Some(exc) = ctx.last_exc_value() else {
+        return Ok(());
+    };
+    if exc.is_constant() {
+        ctx.fbw_mode.class_of_last_exc_is_const = true;
+        return Ok(());
+    }
+    if ctx.trace_ctx.heap_cache().is_class_known(exc) {
+        ctx.fbw_mode.class_of_last_exc_is_const = true;
+        return Ok(());
+    }
+    let ConcreteValue::Ref(exc_ptr) = ctx.last_exc_value_concrete() else {
+        return Ok(());
+    };
+    if exc_ptr.is_null() || !unsafe { pyre_object::is_exception(exc_ptr) } {
+        return Ok(());
+    }
+    let exc_class_ptr = unsafe {
+        (*(exc_ptr as *const pyre_object::interp_exceptions::W_BaseException))
+            .ob_header
+            .ob_type
+    };
+    let cls_const = ctx.trace_ctx.const_int(exc_class_ptr as usize as i64);
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardClass, &[exc, cls_const], 0);
+    walker_capture_snapshot_for_last_guard(ctx, pc)?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(exc, exc_class_ptr as usize as i64);
+    ctx.fbw_mode.class_of_last_exc_is_const = true;
+    Ok(())
 }
 
 /// Box for a current-exception seed: a live `GetfieldGcR` of
