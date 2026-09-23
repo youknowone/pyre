@@ -8419,7 +8419,9 @@ mod tests {
                 fields: HashMap::from([
                     ("PlainObject".to_string(), vec![]),
                     ("TypedObject".to_string(), vec![]),
-                ]),
+                ])
+                .into(),
+                ..crate::front::StructFieldRegistry::default()
             }));
         let mut graph = LegacyGraph::new("allocation_variants_fixture");
 

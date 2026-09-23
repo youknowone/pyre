@@ -19,6 +19,7 @@
 use serde::Deserialize;
 use serde_json::Value;
 use serde_json::value::RawValue;
+use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
 // FunDecl + meta
@@ -536,7 +537,7 @@ pub struct Signature {
 // not walked here.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum TyRef {
     /// Pointer into the global type-dedup table.
@@ -597,15 +598,37 @@ pub struct Local {
 pub struct BasicBlock {
     pub statements: Vec<Statement>,
     pub terminator: Terminator,
+    /// First successful or failed projection of [`terminator`](Self::terminator).
+    /// Later [`term`](Self::term) calls clone this value instead of parsing
+    /// the raw JSON again.
+    #[serde(skip)]
+    term_cache: OnceLock<Result<TermKind, String>>,
 }
 
 impl BasicBlock {
     /// Project the terminator into the typed [`TermKind`] enum.
     /// Returns the raw JSON in the error if a variant is unknown so
     /// callers can decide whether to fail-loud or fall back.
+    ///
+    /// The projection is stored on the block. Every later call returns
+    /// the same `Ok` value or the same `Err` string.
     pub fn term(&self) -> Result<TermKind, String> {
-        let kind = &self.terminator.kind;
-        serde_json::from_value(kind.clone()).map_err(|e| format!("{e}; raw kind: {kind}"))
+        self.term_cached().clone()
+    }
+
+    /// Borrow the cached [`term`](Self::term) projection.
+    pub fn term_ref(&self) -> Result<&TermKind, &str> {
+        match self.term_cached() {
+            Ok(kind) => Ok(kind),
+            Err(err) => Err(err.as_str()),
+        }
+    }
+
+    fn term_cached(&self) -> &Result<TermKind, String> {
+        self.term_cache.get_or_init(|| {
+            let kind = &self.terminator.kind;
+            serde_json::from_value(kind.clone()).map_err(|e| format!("{e}; raw kind: {kind}"))
+        })
     }
 }
 
@@ -632,13 +655,35 @@ pub struct Statement {
     /// Raw statement-kind JSON.
     pub kind: Value,
     pub span: Span,
+    /// First successful or failed projection of [`kind`](Self::kind).
+    /// Later [`stmt_kind`](Self::stmt_kind) calls clone this value instead
+    /// of parsing the raw JSON again.
+    #[serde(skip)]
+    stmt_cache: OnceLock<Result<StmtKind, String>>,
 }
 
 impl Statement {
     /// Project to the typed [`StmtKind`] enum.
+    ///
+    /// The projection is stored on the statement. Every later call returns
+    /// the same `Ok` value or the same `Err` string.
     pub fn stmt_kind(&self) -> Result<StmtKind, String> {
-        serde_json::from_value::<StmtKind>(self.kind.clone())
-            .map_err(|e| format!("{e}; raw kind: {}", self.kind))
+        self.stmt_cached().clone()
+    }
+
+    /// Borrow the cached [`stmt_kind`](Self::stmt_kind) projection.
+    pub fn stmt_kind_ref(&self) -> Result<&StmtKind, &str> {
+        match self.stmt_cached() {
+            Ok(kind) => Ok(kind),
+            Err(err) => Err(err.as_str()),
+        }
+    }
+
+    fn stmt_cached(&self) -> &Result<StmtKind, String> {
+        self.stmt_cache.get_or_init(|| {
+            serde_json::from_value::<StmtKind>(self.kind.clone())
+                .map_err(|e| format!("{e}; raw kind: {}", self.kind))
+        })
     }
 }
 
@@ -646,7 +691,7 @@ impl Statement {
 // Statements
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub enum StmtKind {
     /// Local enters scope.
     StorageLive(u64),
@@ -664,7 +709,7 @@ pub enum StmtKind {
     Unknown,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AssertStmt {
     pub cond: Operand,
     pub expected: bool,
@@ -675,13 +720,13 @@ pub struct AssertStmt {
 // Places, operands, rvalues
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Place {
     pub kind: PlaceKind,
     pub ty: TyRef,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub enum PlaceKind {
     Local(u64),
     Projection(Box<Place>, ProjectionElem),
@@ -695,7 +740,7 @@ pub enum PlaceKind {
     Unknown,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum ProjectionElem {
     /// `"Deref"` and similar atom variants.
@@ -719,7 +764,7 @@ impl ProjectionElem {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub enum Rvalue {
     Use(Operand),
     /// `BinaryOp(op, lhs, rhs)`. `op` is a tagged variant — primitive
@@ -759,7 +804,7 @@ pub enum Rvalue {
     Unknown,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub enum Operand {
     Copy(Place),
     Move(Place),
@@ -770,7 +815,7 @@ pub enum Operand {
 // Terminators
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub enum TermKind {
     Return,
     UnwindResume,
@@ -805,7 +850,7 @@ pub enum TermKind {
     Unknown,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub enum SwitchTargets {
     /// Boolean switch: `[then_bb, else_bb]`.
     If(u64, u64),
@@ -813,7 +858,7 @@ pub enum SwitchTargets {
     SwitchInt(Value, Vec<(Value, u64)>, u64),
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CallPayload {
     pub func: CallFunc,
     pub args: Vec<Operand>,
@@ -827,7 +872,7 @@ pub struct CallPayload {
 /// The inner `kind` of `Regular` further distinguishes `Fun(Regular n)`
 /// (monomorphized direct call), `Fun(Trait …)` (trait-bound generic
 /// resolved at extraction time), or `Ptr` (function-pointer call).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub enum CallFunc {
     Regular(RegularCall),
     /// `dyn Trait` virtual call. The operand carries the fat pointer
@@ -837,13 +882,13 @@ pub enum CallFunc {
     Unknown,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct RegularCall {
     pub kind: CallKind,
     pub generics: Value,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub enum CallKind {
     /// Statically resolved function call: `Fun { Regular(fn_id) }` or
     /// `Fun { Trait(...) }`.
@@ -856,7 +901,7 @@ pub enum CallKind {
     Unknown,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum FunId {
     Regular {

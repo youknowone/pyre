@@ -69,6 +69,10 @@ pub struct Llbc {
     /// retain layout attributes but may expose the type body as `Opaque`; the
     /// defining crate supplies the missing one-field scalar shape.
     transparent_scalar_kinds: parking_lot::RwLock<Vec<(String, TransparentScalarKind)>>,
+    /// Trait-decl id → associated-type bindings of its unique impl.
+    /// `trait_impls` is immutable after parse, so the map is built once.
+    /// See [`TraitAssocIndex`].
+    trait_assoc_index: std::sync::OnceLock<TraitAssocIndex>,
 }
 
 /// Register-bank shape of a `#[repr(transparent)]` scalar wrapper.
@@ -78,6 +82,80 @@ pub enum TransparentScalarKind {
     Unsigned,
     Bool,
     Float,
+}
+
+/// Charon-reader lookup index over `trait_impls`. It has no RPython/PyPy
+/// owner. Iteration order is never observed: queries are by trait-decl id
+/// and only a unique impl answers. The first `TraitType` row per assoc
+/// wins, matching the linear scan this index replaced.
+///
+/// `trait decl id → Some(unique impl bindings)` or `None` when a second
+/// impl of that trait was seen. Missing keys have no impl.
+type TraitAssocIndex = std::collections::HashMap<u64, Option<UniqueTraitImpl>>;
+
+#[derive(Debug)]
+struct UniqueTraitImpl {
+    impl_index: usize,
+    by_assoc: std::collections::HashMap<serde_json::Value, AssocBind>,
+}
+
+#[derive(Debug)]
+enum AssocBind {
+    /// `types[entry].skip_binder.value` is present.
+    Found(usize),
+    /// The first `TraitType` row for this assoc has no value. A later
+    /// row does not replace it.
+    Absent,
+}
+
+fn build_trait_assoc_index(rows: &[serde_json::Value]) -> TraitAssocIndex {
+    let mut index: TraitAssocIndex = std::collections::HashMap::new();
+    for (impl_index, row) in rows.iter().enumerate() {
+        let Some(trait_id) = row
+            .get("impl_trait")
+            .and_then(|impl_trait| impl_trait.get("id"))
+            .and_then(serde_json::Value::as_u64)
+        else {
+            continue;
+        };
+        if let Some(slot) = index.get_mut(&trait_id) {
+            *slot = None;
+            continue;
+        }
+        let mut by_assoc = std::collections::HashMap::new();
+        if let Some(entries) = row.get("types").and_then(serde_json::Value::as_array) {
+            for (entry_index, entry) in entries.iter().enumerate() {
+                let Some(kind) = entry
+                    .get("kind")
+                    .and_then(|kind| kind.get("TraitType"))
+                    .and_then(serde_json::Value::as_array)
+                else {
+                    continue;
+                };
+                if kind.len() != 2 || by_assoc.contains_key(&kind[1]) {
+                    continue;
+                }
+                let bind = if entry
+                    .get("skip_binder")
+                    .and_then(|binder| binder.get("value"))
+                    .is_some()
+                {
+                    AssocBind::Found(entry_index)
+                } else {
+                    AssocBind::Absent
+                };
+                by_assoc.insert(kind[1].clone(), bind);
+            }
+        }
+        index.insert(
+            trait_id,
+            Some(UniqueTraitImpl {
+                impl_index,
+                by_assoc,
+            }),
+        );
+    }
+    index
 }
 
 /// One hash-consed type body, kept as its raw JSON text and exploded to a
@@ -140,6 +218,7 @@ impl Llbc {
             dedup_adt,
             dedup_body,
             transparent_scalar_kinds: parking_lot::RwLock::new(Vec::new()),
+            trait_assoc_index: std::sync::OnceLock::new(),
         })
     }
 
@@ -294,6 +373,38 @@ impl Llbc {
     /// type in its `types[].skip_binder.value`.
     pub fn trait_impls_raw(&self) -> &[serde_json::Value] {
         &self.file.translated.trait_impls
+    }
+
+    /// The type value the unique impl of `trait_decl_id` binds `assoc` to.
+    ///
+    /// `None` when that trait has zero impls or more than one, when no
+    /// `types[]` entry selects `assoc`, or when the first selecting entry
+    /// has no `skip_binder.value`. A later duplicate does not override the
+    /// first, matching one forward scan of [`Self::trait_impls_raw`].
+    pub fn unique_trait_assoc_value(
+        &self,
+        trait_decl_id: u64,
+        assoc: &serde_json::Value,
+    ) -> Option<&serde_json::Value> {
+        let (impl_index, entry_index) = {
+            let index = self
+                .trait_assoc_index
+                .get_or_init(|| build_trait_assoc_index(&self.file.translated.trait_impls));
+            let bindings = index.get(&trait_decl_id)?.as_ref()?;
+            match bindings.by_assoc.get(assoc)? {
+                AssocBind::Absent => return None,
+                AssocBind::Found(entry_index) => (bindings.impl_index, *entry_index),
+            }
+        };
+        self.file
+            .translated
+            .trait_impls
+            .get(impl_index)?
+            .get("types")?
+            .as_array()?
+            .get(entry_index)?
+            .get("skip_binder")?
+            .get("value")
     }
 
     /// The `trait_impls` row whose `def_id` is `id` — the impl block

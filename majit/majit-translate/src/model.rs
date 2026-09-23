@@ -3522,6 +3522,256 @@ fn synthetic_transparent_ctor_owner(
     }
 }
 
+/// Immediate dominators for [`lower_struct_ptr_writes`].
+///
+/// Same answers as the iterative dataflow that starts every non-entry
+/// block at the full block set: `dom(start) = {start}`, and for every
+/// other block `dom(b) = {b} ∪ ⋂ dom(p)` over its predecessors. An empty
+/// predecessor set intersects to nothing, so a non-start block with no
+/// predecessors is dominated only by itself. A block that never meets
+/// `start` or one of those predecessor-less roots keeps the top set —
+/// every block dominates it.
+///
+/// The tree hangs those roots off one virtual root (index `n`) so a walk
+/// up [`Self::dominates`] is the membership test. Blocks the walk never
+/// reaches stay `DOM_UNDEF` and answer as the top set.
+const DOM_UNDEF: u32 = u32::MAX;
+
+struct BlockDominators {
+    /// Immediate dominator of each block, plus the virtual root at `n`.
+    idom: Vec<u32>,
+    n: usize,
+}
+
+impl BlockDominators {
+    fn compute(graph: &FunctionGraph) -> Self {
+        let n = graph.blocks.len();
+        let start = graph.startblock.0;
+        let vr = n as u32;
+        let mut preds: Vec<Vec<u32>> = vec![Vec::new(); n];
+        let mut succs: Vec<Vec<u32>> = vec![Vec::new(); n + 1];
+        for (src, block) in graph.blocks.iter().enumerate() {
+            for link in &block.exits {
+                let dst = link.target.0;
+                preds[dst].push(src as u32);
+                succs[src].push(dst as u32);
+            }
+        }
+        for pred in &mut preds {
+            pred.sort_unstable();
+            pred.dedup();
+        }
+        for block in 0..n {
+            // `start` keeps `{start}` even when a back-edge targets it.
+            // Every other block with no predecessor is its own root.
+            if block == start || preds[block].is_empty() {
+                succs[n].push(block as u32);
+                preds[block] = vec![vr];
+            }
+        }
+
+        let mut seen = vec![false; n + 1];
+        let mut post = Vec::with_capacity(n + 1);
+        let mut stack = vec![(vr, 0usize)];
+        seen[n] = true;
+        while let Some(&(node, next_i)) = stack.last() {
+            if next_i < succs[node as usize].len() {
+                let child = succs[node as usize][next_i];
+                stack.last_mut().expect("dominator dfs frame").1 = next_i + 1;
+                if !seen[child as usize] {
+                    seen[child as usize] = true;
+                    stack.push((child, 0));
+                }
+            } else {
+                post.push(node);
+                stack.pop();
+            }
+        }
+        post.reverse();
+        let mut rpo_of = vec![DOM_UNDEF; n + 1];
+        for (index, &node) in post.iter().enumerate() {
+            rpo_of[node as usize] = index as u32;
+        }
+
+        let mut idom = vec![DOM_UNDEF; n + 1];
+        idom[n] = vr;
+        let mut changed = true;
+        let mut passes = 0usize;
+        while changed {
+            passes += 1;
+            if passes > n.saturating_mul(n).saturating_add(1) {
+                panic!("block dominators did not converge");
+            }
+            changed = false;
+            for &block in post.iter().skip(1) {
+                let mut chosen: Option<u32> = None;
+                for &pred in &preds[block as usize] {
+                    if idom[pred as usize] == DOM_UNDEF {
+                        continue;
+                    }
+                    chosen = Some(match chosen {
+                        None => pred,
+                        Some(current) => intersect_idoms(current, pred, &idom, &rpo_of),
+                    });
+                }
+                let Some(new_idom) = chosen else {
+                    continue;
+                };
+                if idom[block as usize] != new_idom {
+                    idom[block as usize] = new_idom;
+                    changed = true;
+                }
+            }
+        }
+        Self { idom, n }
+    }
+
+    /// `true` when `dominator` is in `dom(block)`, including the top-set
+    /// answer for a block unreachable from every root.
+    fn dominates(&self, dominator: usize, block: usize) -> bool {
+        if dominator == block {
+            return true;
+        }
+        if self.idom.get(block).copied().unwrap_or(DOM_UNDEF) == DOM_UNDEF {
+            return true;
+        }
+        let vr = self.n as u32;
+        let target = dominator as u32;
+        let mut finger = block as u32;
+        for _ in 0..=self.n {
+            if finger == target {
+                return true;
+            }
+            if finger == vr {
+                return false;
+            }
+            let next = self.idom[finger as usize];
+            if next == DOM_UNDEF || next == finger {
+                return false;
+            }
+            finger = next;
+        }
+        false
+    }
+}
+
+fn intersect_idoms(mut finger1: u32, mut finger2: u32, idom: &[u32], rpo_of: &[u32]) -> u32 {
+    let guard = idom.len();
+    let mut steps = 0usize;
+    while finger1 != finger2 {
+        steps += 1;
+        if steps > guard {
+            panic!("block dominator intersect did not converge");
+        }
+        while rpo_of[finger1 as usize] > rpo_of[finger2 as usize] {
+            finger1 = idom[finger1 as usize];
+        }
+        while rpo_of[finger2 as usize] > rpo_of[finger1 as usize] {
+            finger2 = idom[finger2 as usize];
+        }
+    }
+    finger1
+}
+
+/// Op-result and phi-input index for [`lower_struct_ptr_writes`]'s
+/// producer walk. One scan replaces the per-step rescan of every block.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Variable equality and hashing use immutable identity IDs while annotations are excluded"
+)]
+struct ProducerIndex<'g> {
+    graph: &'g FunctionGraph,
+    defined: rustc_hash::FxHashSet<crate::flowspace::model::Variable>,
+    input_slot: rustc_hash::FxHashMap<crate::flowspace::model::Variable, (BlockId, usize)>,
+    incoming: rustc_hash::FxHashMap<BlockId, Vec<(usize, usize)>>,
+    memo: rustc_hash::FxHashMap<
+        (crate::flowspace::model::Variable, u32),
+        Option<crate::flowspace::model::Variable>,
+    >,
+}
+
+impl<'g> ProducerIndex<'g> {
+    fn build(graph: &'g FunctionGraph) -> Self {
+        let mut defined = rustc_hash::FxHashSet::default();
+        let mut input_slot = rustc_hash::FxHashMap::default();
+        let mut incoming: rustc_hash::FxHashMap<BlockId, Vec<(usize, usize)>> =
+            rustc_hash::FxHashMap::default();
+        for (block_idx, block) in graph.blocks.iter().enumerate() {
+            for op in &block.operations {
+                if let Some(result) = op.result.as_ref() {
+                    defined.insert(result.clone());
+                }
+            }
+            for (slot, input) in block.inputargs.iter().enumerate() {
+                input_slot.entry(input.clone()).or_insert((block.id, slot));
+            }
+            for (exit_idx, link) in block.exits.iter().enumerate() {
+                incoming
+                    .entry(link.target)
+                    .or_default()
+                    .push((block_idx, exit_idx));
+            }
+        }
+        Self {
+            graph,
+            defined,
+            input_slot,
+            incoming,
+            memo: rustc_hash::FxHashMap::default(),
+        }
+    }
+
+    fn root(
+        &mut self,
+        var: &crate::flowspace::model::Variable,
+        depth: u32,
+    ) -> Option<crate::flowspace::model::Variable> {
+        if let Some(cached) = self.memo.get(&(var.clone(), depth)) {
+            return cached.clone();
+        }
+        let found = self.root_uncached(var, depth);
+        self.memo.insert((var.clone(), depth), found.clone());
+        found
+    }
+
+    fn root_uncached(
+        &mut self,
+        var: &crate::flowspace::model::Variable,
+        depth: u32,
+    ) -> Option<crate::flowspace::model::Variable> {
+        if depth == 0 {
+            return None;
+        }
+        if self.defined.contains(var) {
+            return Some(var.clone());
+        }
+        let (target, slot) = self.input_slot.get(var).copied()?;
+        let mut incoming_vars = Vec::new();
+        if let Some(links) = self.incoming.get(&target) {
+            incoming_vars.reserve(links.len());
+            for &(block_idx, exit_idx) in links {
+                let arg = self.graph.blocks[block_idx].exits[exit_idx]
+                    .args
+                    .get(slot)?;
+                incoming_vars.push(arg.as_variable()?.clone());
+            }
+        }
+        if incoming_vars.is_empty() {
+            return None;
+        }
+        let mut root = None;
+        for incoming in incoming_vars {
+            let incoming_root = self.root(&incoming, depth - 1)?;
+            match &root {
+                None => root = Some(incoming_root),
+                Some(seen) if seen == &incoming_root => {}
+                Some(_) => return None,
+            }
+        }
+        root
+    }
+}
+
 /// Lower `core::ptr::write(raw as *mut T, T { fields... })` to field stores.
 ///
 /// This is the Rust-source spelling of RPython's ordinary alloc-then-init
@@ -3551,42 +3801,29 @@ pub fn lower_struct_ptr_writes(
 ) -> usize {
     use crate::flowspace::model::Variable;
 
-    fn producer_root(graph: &FunctionGraph, var: &Variable, depth: u32) -> Option<Variable> {
-        if depth == 0 {
-            return None;
-        }
-        if graph
-            .blocks
-            .iter()
-            .flat_map(|block| &block.operations)
-            .any(|op| op.result.as_ref() == Some(var))
-        {
-            return Some(var.clone());
-        }
-        let (target, slot) = graph.blocks.iter().find_map(|block| {
-            block
-                .inputargs
-                .iter()
-                .position(|input| input == var)
-                .map(|slot| (block.id, slot))
-        })?;
-        let mut root: Option<Variable> = None;
-        let mut saw_predecessor = false;
-        for link in graph.blocks.iter().flat_map(|block| &block.exits) {
-            if link.target != target {
-                continue;
-            }
-            saw_predecessor = true;
-            let incoming = link.args.get(slot)?.as_variable()?;
-            let incoming_root = producer_root(graph, incoming, depth - 1)?;
-            match &root {
-                None => root = Some(incoming_root),
-                Some(seen) if seen == &incoming_root => {}
-                Some(_) => return None,
-            }
-        }
-        saw_predecessor.then_some(root).flatten()
+    // Most lowered graphs never call `core::ptr::write`. Dominators and the
+    // producer index are both quadratic in the size of the ones that do, so
+    // they wait until a call of that shape is actually present.
+    let has_ptr_write = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            let OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                result_ty: ValueType::Void,
+            } = &op.kind
+            else {
+                return false;
+            };
+            is_core_ptr_write_path(segments, args)
+        })
+    });
+    if !has_ptr_write {
+        return 0;
     }
+    let mut producers = ProducerIndex::build(graph);
+    // Filled on the first cross-block store. Same-block stores compare
+    // operation order and never ask.
+    let mut dominators: Option<BlockDominators> = None;
 
     #[derive(Clone)]
     struct Rewrite {
@@ -3595,46 +3832,6 @@ pub fn lower_struct_ptr_writes(
         destination: Variable,
         stores: Vec<(FieldDescriptor, LinkArg, ValueType)>,
         result: Option<Variable>,
-    }
-
-    // `checkgraph` validates SSI scope, but validity alone does not prove that
-    // a store observed while scanning the whole graph executes before the
-    // ptr::write.  Compute ordinary block dominators and require every source
-    // FieldWrite to dominate the call site before moving it there.
-    let block_count = graph.blocks.len();
-    let mut predecessors = vec![HashSet::new(); block_count];
-    for (source, block) in graph.blocks.iter().enumerate() {
-        for link in &block.exits {
-            predecessors[link.target.0].insert(source);
-        }
-    }
-    let all_blocks: HashSet<usize> = (0..block_count).collect();
-    let start = graph.startblock.0;
-    let mut dominators = vec![all_blocks.clone(); block_count];
-    dominators[start] = HashSet::from([start]);
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for block in 0..block_count {
-            if block == start {
-                continue;
-            }
-            let mut predecessor_iter = predecessors[block].iter().copied();
-            let mut next = if let Some(first) = predecessor_iter.next() {
-                let mut intersection = dominators[first].clone();
-                for predecessor in predecessor_iter {
-                    intersection.retain(|candidate| dominators[predecessor].contains(candidate));
-                }
-                intersection
-            } else {
-                HashSet::new()
-            };
-            next.insert(block);
-            if next != dominators[block] {
-                dominators[block] = next;
-                changed = true;
-            }
-        }
     }
 
     let mut rewrites = Vec::new();
@@ -3657,7 +3854,7 @@ pub fn lower_struct_ptr_writes(
                 continue;
             }
             let destination = &args[0];
-            let Some(aggregate) = producer_root(graph, &args[1], 16) else {
+            let Some(aggregate) = producers.root(&args[1], 16) else {
                 continue;
             };
             let destination_owner = block.operations[..oi].iter().find_map(|candidate| {
@@ -3723,17 +3920,23 @@ pub fn lower_struct_ptr_writes(
                         field,
                         value,
                         ty,
-                    } if producer_root(graph, base, 16).as_ref() == Some(&aggregate) => {
+                    } if producers.root(base, 16).as_ref() == Some(&aggregate) => {
                         Some((store_bi, store_oi, field.clone(), value.clone(), ty.clone()))
                     }
                     _ => None,
                 })
                 .collect();
+            // A store dominates the call when it is earlier in the same block,
+            // or its block dominates the call block. Cross-block dominators are
+            // built on the first such store — graphs with only same-block
+            // stores never build them.
             if stores.iter().any(|(store_bi, store_oi, _, value, _)| {
                 let store_dominates_call = if *store_bi == bi {
                     *store_oi < oi
                 } else {
-                    dominators[bi].contains(store_bi)
+                    dominators
+                        .get_or_insert_with(|| BlockDominators::compute(graph))
+                        .dominates(*store_bi, bi)
                 };
                 !store_dominates_call || !value_is_in_scope(value)
             }) {
@@ -5891,6 +6094,56 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
     remove_duplicate_inputargs(graph);
 }
 
+/// `true` when [`remove_duplicate_inputargs`] can change link arity or merge
+/// a phi column. Equal raw columns are what the first fixpoint round merges
+/// while every representative is still itself; a length mismatch is the
+/// truncation (or the missing-arg panic) of the rewrite.
+fn phi_columns_need_merge(
+    graph: &FunctionGraph,
+    entries: &std::collections::HashMap<BlockId, Vec<(usize, usize)>>,
+) -> bool {
+    use std::hash::{Hash, Hasher};
+
+    let mut buckets: rustc_hash::FxHashMap<u64, Vec<usize>> = rustc_hash::FxHashMap::default();
+    for (&block_id, links) in entries {
+        let arity = graph.block(block_id).inputargs.len();
+        for &(pred_idx, link_idx) in links {
+            if graph.blocks[pred_idx].exits[link_idx].args.len() != arity {
+                return true;
+            }
+        }
+        if arity < 2 {
+            continue;
+        }
+        buckets.clear();
+        for col in 0..arity {
+            let mut hasher = rustc_hash::FxHasher::default();
+            for &(pred_idx, link_idx) in links {
+                graph.blocks[pred_idx].exits[link_idx].args[col].hash(&mut hasher);
+            }
+            let fingerprint = hasher.finish();
+            let mut duplicated = false;
+            if let Some(previous) = buckets.get(&fingerprint) {
+                for &earlier in previous {
+                    let same = links.iter().all(|&(pred_idx, link_idx)| {
+                        let args = &graph.blocks[pred_idx].exits[link_idx].args;
+                        args[earlier] == args[col]
+                    });
+                    if same {
+                        duplicated = true;
+                        break;
+                    }
+                }
+            }
+            if duplicated {
+                return true;
+            }
+            buckets.entry(fingerprint).or_default().push(col);
+        }
+    }
+    false
+}
+
 /// Crate-local [`FunctionGraph`] port of RPython
 /// `translator/simplify.py remove_identical_vars_SSA`.
 ///
@@ -5917,9 +6170,6 @@ pub fn remove_duplicate_inputargs(graph: &mut FunctionGraph) {
         fn absorb(&mut self, _other: Self) {}
     }
 
-    let mut uf: UnionFind<LinkArg, Representative> =
-        UnionFind::new(|arg: &LinkArg| Representative { rep: arg.clone() });
-
     let mut entries: HashMap<BlockId, Vec<(usize, usize)>> = HashMap::new();
     for (pred_idx, block) in graph.blocks.iter().enumerate() {
         for (link_idx, link) in block.exits.iter().enumerate() {
@@ -5933,45 +6183,104 @@ pub fn remove_duplicate_inputargs(graph: &mut FunctionGraph) {
         }
     }
 
-    let mut inputs: HashMap<BlockId, Vec<(crate::flowspace::model::Variable, Vec<LinkArg>)>> =
-        HashMap::new();
+    // No duplicate raw column and every incoming link already matches the
+    // block's input arity: the fixpoint's first round would insert each
+    // link arg as its own representative and remove nothing, and the
+    // rewrite would copy those args back. Leave the graph untouched.
+    if !phi_columns_need_merge(graph, &entries) {
+        return;
+    }
+
+    let mut uf: UnionFind<LinkArg, Representative> =
+        UnionFind::new(|arg: &LinkArg| Representative { rep: arg.clone() });
+
+    struct PhiCols {
+        original_len: usize,
+        cols: Vec<(usize, crate::flowspace::model::Variable)>,
+    }
+
+    let mut inputs: HashMap<BlockId, PhiCols> = HashMap::new();
     for (&block_id, links) in &entries {
         let inputargs = graph.block(block_id).inputargs.clone();
-        let mut phis = Vec::with_capacity(inputargs.len());
-        for (arg_i, input) in inputargs.into_iter().enumerate() {
-            let mut phi_args = Vec::with_capacity(links.len());
-            for (pred_idx, link_idx) in links {
-                let link = &graph.blocks[*pred_idx].exits[*link_idx];
-                let arg = link.args.get(arg_i).unwrap_or_else(|| {
+        for (arg_i, _) in inputargs.iter().enumerate() {
+            for &(pred_idx, link_idx) in links {
+                if graph.blocks[pred_idx].exits[link_idx]
+                    .args
+                    .get(arg_i)
+                    .is_none()
+                {
                     panic!(
                         "remove_identical_vars_SSA: link.args[{arg_i}] missing \
                          (graph {}, target {:?})",
                         graph.name, block_id,
-                    )
-                });
-                phi_args.push(arg.clone());
+                    );
+                }
             }
-            phis.push((input, phi_args));
         }
-        inputs.insert(block_id, phis);
+        let original_len = inputargs.len();
+        inputs.insert(
+            block_id,
+            PhiCols {
+                original_len,
+                cols: inputargs.into_iter().enumerate().collect(),
+            },
+        );
     }
 
-    #[expect(
-        clippy::mutable_key_type,
-        reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
-    )]
+    fn resolve_phi_arg(uf: &mut UnionFind<LinkArg, Representative>, arg: &LinkArg) -> LinkArg {
+        // Constants are never unioned. A variable's representative changes
+        // only after `union`, which inserts it; until then it is its own root.
+        let LinkArg::Value(var) = arg else {
+            return arg.clone();
+        };
+        let key = LinkArg::Value(var.clone());
+        if uf.contains(&key) {
+            uf.find_rep(key)
+        } else {
+            key
+        }
+    }
+
     fn simplify_phis(
         uf: &mut UnionFind<LinkArg, Representative>,
-        phis: &mut Vec<(crate::flowspace::model::Variable, Vec<LinkArg>)>,
+        graph: &FunctionGraph,
+        links: &[(usize, usize)],
+        cols: &mut Vec<(usize, crate::flowspace::model::Variable)>,
     ) -> bool {
+        use std::hash::{Hash, Hasher};
+
         let mut to_remove: Vec<usize> = Vec::new();
-        let mut unique_phis: HashMap<Vec<LinkArg>, crate::flowspace::model::Variable> =
-            HashMap::new();
-        for (i, (input, phi_args)) in phis.iter().enumerate() {
-            let new_args: Vec<LinkArg> = phi_args
-                .iter()
-                .map(|arg| uf.find_rep(arg.clone()))
-                .collect();
+        // Resolved column keys share one buffer. `kept` records the first
+        // column of each distinct key; a later equal key unions into it.
+        let mut arena: Vec<LinkArg> = Vec::new();
+        struct Kept {
+            start: usize,
+            input: crate::flowspace::model::Variable,
+        }
+        let mut kept: Vec<Kept> = Vec::new();
+        let mut buckets: rustc_hash::FxHashMap<u64, Vec<usize>> = rustc_hash::FxHashMap::default();
+        let width = links.len();
+        for (index, &(orig_col, ref input)) in cols.iter().enumerate() {
+            let start = arena.len();
+            let mut hasher = rustc_hash::FxHasher::default();
+            (width as u64).hash(&mut hasher);
+            for &(pred_idx, link_idx) in links {
+                let resolved =
+                    resolve_phi_arg(uf, &graph.blocks[pred_idx].exits[link_idx].args[orig_col]);
+                resolved.hash(&mut hasher);
+                arena.push(resolved);
+            }
+            let fingerprint = hasher.finish();
+            let mut existing = None;
+            if let Some(candidates) = buckets.get(&fingerprint) {
+                for &kept_index in candidates {
+                    let prior = &arena[kept[kept_index].start..kept[kept_index].start + width];
+                    if prior == &arena[start..start + width] {
+                        existing = Some(kept[kept_index].input.clone());
+                        break;
+                    }
+                }
+            }
             // PRE-EXISTING-ADAPTATION: the all-equal phi collapse of
             // `simplify.py` (`if all_equal(new_args):
             // uf.union(new_args[0], input)`) is omitted here.  Upstream that
@@ -5992,31 +6301,57 @@ pub fn remove_duplicate_inputargs(graph: &mut FunctionGraph) {
             // no-op net of the repair, and skipping it yields the same graph
             // with the column left threaded.  The codewriter's phi-tuple
             // equivalence (`simplify.py:565-568`) is the duplicate-column merge
-            // handled by `unique_phis` below, which is SSI-safe because both
-            // columns are inputargs of the same block.  Convergence path: port
+            // handled below, which is SSI-safe because both columns are
+            // inputargs of the same block.  Convergence path: port
             // `SSA_to_SSI` to `crate::model` (or unify the two `FunctionGraph`
             // IRs and run the standard `all_passes` including `ssa_to_ssi`).
-            if let Some(existing) = unique_phis.get(&new_args).cloned() {
+            if let Some(existing) = existing {
                 uf.union(LinkArg::Value(existing), LinkArg::Value(input.clone()));
-                to_remove.push(i);
+                to_remove.push(index);
+                arena.truncate(start);
             } else {
-                unique_phis.insert(new_args, input.clone());
+                buckets.entry(fingerprint).or_default().push(kept.len());
+                kept.push(Kept {
+                    start,
+                    input: input.clone(),
+                });
             }
         }
-        for i in to_remove.iter().rev() {
-            phis.remove(*i);
+        for index in to_remove.iter().rev() {
+            cols.remove(*index);
         }
         !to_remove.is_empty()
     }
 
     let block_ids: Vec<BlockId> = inputs.keys().copied().collect();
-    let mut progress = true;
-    while progress {
-        progress = false;
+    // A block's resolved columns change only after some `union`. Re-walking
+    // a block that already observed the current union-find removes nothing.
+    // The epoch stored is the one the block observed, before its own unions
+    // advance it: those unions can make the block's earlier columns equal,
+    // and `remove_identical_vars_SSA` walks every block again while
+    // `progress` is set.
+    let mut epoch: u64 = 0;
+    let mut seen_epoch: HashMap<BlockId, u64> = HashMap::new();
+    loop {
+        let mut progress = false;
         for block_id in &block_ids {
-            if simplify_phis(&mut uf, inputs.get_mut(block_id).expect("inputs block")) {
+            let observed = epoch;
+            if seen_epoch.get(block_id).copied() == Some(observed) {
+                continue;
+            }
+            let changed = {
+                let links = entries.get(block_id).expect("entry list for input block");
+                let state = inputs.get_mut(block_id).expect("inputs block");
+                simplify_phis(&mut uf, graph, links, &mut state.cols)
+            };
+            if changed {
+                epoch += 1;
                 progress = true;
             }
+            seen_epoch.insert(*block_id, observed);
+        }
+        if !progress {
+            break;
         }
     }
 
@@ -6041,9 +6376,20 @@ pub fn remove_duplicate_inputargs(graph: &mut FunctionGraph) {
         }
     }
 
-    for (&block_id, phis) in &inputs {
+    for (&block_id, state) in &inputs {
+        let links = entries
+            .get(&block_id)
+            .expect("entry list for input block")
+            .clone();
+        let removed = state.cols.len() != state.original_len;
+        let truncate = links.iter().any(|&(pred_idx, link_idx)| {
+            graph.blocks[pred_idx].exits[link_idx].args.len() != state.original_len
+        });
+        if !removed && !truncate {
+            continue;
+        }
         let surviving: Vec<crate::flowspace::model::Variable> =
-            phis.iter().map(|(input, _)| input.clone()).collect();
+            state.cols.iter().map(|(_, input)| input.clone()).collect();
         {
             // simplify.py drops the phi slot from `block.inputargs` and the
             // predecessor `link.args`.  Pyre phi blocks also carry a matching
@@ -6073,15 +6419,13 @@ pub fn remove_duplicate_inputargs(graph: &mut FunctionGraph) {
                 }
             }
         }
-        let links = entries
-            .get(&block_id)
-            .expect("entry list for input block")
-            .clone();
-        for (link_pos, (pred_idx, link_idx)) in links.into_iter().enumerate() {
-            graph.blocks[pred_idx].exits[link_idx].args = phis
+        for (pred_idx, link_idx) in links {
+            let new_args: Vec<LinkArg> = state
+                .cols
                 .iter()
-                .map(|(_, phi_args)| phi_args[link_pos].clone())
+                .map(|(col, _)| graph.blocks[pred_idx].exits[link_idx].args[*col].clone())
                 .collect();
+            graph.blocks[pred_idx].exits[link_idx].args = new_args;
         }
     }
 
@@ -9059,6 +9403,364 @@ mod tests {
             vec![("item".to_string(), ValueType::Int)],
         )]);
         assert_eq!(lower_struct_ptr_writes(&mut graph, &attrs), 0);
+    }
+
+    #[test]
+    fn block_dominators_match_iterative_dataflow() {
+        use std::collections::HashSet;
+
+        fn reference(graph: &FunctionGraph) -> Vec<HashSet<usize>> {
+            let block_count = graph.blocks.len();
+            let mut predecessors = vec![HashSet::new(); block_count];
+            for (source, block) in graph.blocks.iter().enumerate() {
+                for link in &block.exits {
+                    predecessors[link.target.0].insert(source);
+                }
+            }
+            let all_blocks: HashSet<usize> = (0..block_count).collect();
+            let start = graph.startblock.0;
+            let mut dominators = vec![all_blocks.clone(); block_count];
+            dominators[start] = HashSet::from([start]);
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for block in 0..block_count {
+                    if block == start {
+                        continue;
+                    }
+                    let mut predecessor_iter = predecessors[block].iter().copied();
+                    let mut next = if let Some(first) = predecessor_iter.next() {
+                        let mut intersection = dominators[first].clone();
+                        for predecessor in predecessor_iter {
+                            intersection
+                                .retain(|candidate| dominators[predecessor].contains(candidate));
+                        }
+                        intersection
+                    } else {
+                        HashSet::new()
+                    };
+                    next.insert(block);
+                    if next != dominators[block] {
+                        dominators[block] = next;
+                        changed = true;
+                    }
+                }
+            }
+            dominators
+        }
+
+        fn assert_same(graph: &FunctionGraph) {
+            let expected = reference(graph);
+            let got = super::BlockDominators::compute(graph);
+            for block in 0..graph.blocks.len() {
+                for dominator in 0..graph.blocks.len() {
+                    assert_eq!(
+                        got.dominates(dominator, block),
+                        expected[block].contains(&dominator),
+                        "start {} block {block} dominator {dominator} edges {:?}",
+                        graph.startblock.0,
+                        graph
+                            .blocks
+                            .iter()
+                            .enumerate()
+                            .flat_map(|(src, block)| {
+                                block.exits.iter().map(move |link| (src, link.target.0))
+                            })
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+
+        // Predecessor-less blocks are their own dominator set. An edge from
+        // one of them into a block also reached from start wipes every
+        // proper dominator. A cycle with no root stays dominated by all.
+        let mut graph = FunctionGraph::new("dom-edges");
+        let isolated = graph.create_block();
+        let join = graph.create_block();
+        let cycle_a = graph.create_block();
+        let cycle_b = graph.create_block();
+        let entry = graph.startblock;
+        graph.blocks[entry.0]
+            .exits
+            .push(Link::new_mixed(vec![], join, None));
+        graph.blocks[isolated.0]
+            .exits
+            .push(Link::new_mixed(vec![], join, None));
+        graph.blocks[cycle_a.0]
+            .exits
+            .push(Link::new_mixed(vec![], cycle_b, None));
+        graph.blocks[cycle_b.0]
+            .exits
+            .push(Link::new_mixed(vec![], cycle_a, None));
+        assert_same(&graph);
+
+        let mut state = 0xC0FFEE_u64;
+        for _trial in 0..80 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let n = 3 + (state as usize % 12);
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let mut graph = FunctionGraph::new("dom-random");
+            while graph.blocks.len() < n {
+                graph.create_block();
+            }
+            let start = (state as usize) % n;
+            graph.startblock = BlockId(start);
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let edge_count = (state as usize) % (n * 2 + 1);
+            for _ in 0..edge_count {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let src = (state as usize) % n;
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let dst = (state as usize) % n;
+                graph.blocks[src]
+                    .exits
+                    .push(Link::new_mixed(vec![], BlockId(dst), None));
+            }
+            assert_same(&graph);
+        }
+    }
+
+    #[test]
+    fn remove_duplicate_inputargs_keeps_distinct_phi_columns() {
+        let mut graph = FunctionGraph::new("distinct-phi");
+        let entry = graph.startblock;
+        let v1 = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let v2 = graph.push_op_var(entry, OpKind::ConstInt(2), true).unwrap();
+        let merge = graph.create_block();
+        let p = install_phi(&mut graph, merge, "p");
+        let q = install_phi(&mut graph, merge, "q");
+        graph.set_goto(entry, merge, vec![v1.clone(), v2.clone()]);
+
+        remove_duplicate_inputargs(&mut graph);
+
+        assert_eq!(graph.block(merge).inputargs, vec![p, q]);
+        assert_eq!(
+            graph.block(entry).exits[0].args,
+            vec![LinkArg::Value(v1), LinkArg::Value(v2)]
+        );
+    }
+
+    #[test]
+    fn remove_duplicate_inputargs_merges_duplicate_columns_across_blocks() {
+        let mut graph = FunctionGraph::new("dup-phi");
+        let entry = graph.startblock;
+        let v1 = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let merge = graph.create_block();
+        let p = install_phi(&mut graph, merge, "p");
+        let q = install_phi(&mut graph, merge, "q");
+        graph.set_goto(entry, merge, vec![v1.clone(), v1.clone()]);
+        let q_use = graph
+            .push_op_var(
+                merge,
+                OpKind::BinOp {
+                    op: "int_add".into(),
+                    lhs: q.clone(),
+                    rhs: q.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let next = graph.create_block();
+        let a = install_phi(&mut graph, next, "a");
+        let b = install_phi(&mut graph, next, "b");
+        graph.set_goto(merge, next, vec![p.clone(), q.clone()]);
+        let b_use = graph
+            .push_op_var(
+                next,
+                OpKind::BinOp {
+                    op: "int_add".into(),
+                    lhs: b.clone(),
+                    rhs: b.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+
+        remove_duplicate_inputargs(&mut graph);
+
+        assert_eq!(graph.block(merge).inputargs, vec![p.clone()]);
+        assert_eq!(graph.block(next).inputargs, vec![a.clone()]);
+        assert_eq!(graph.block(entry).exits[0].args, vec![LinkArg::Value(v1)]);
+        assert_eq!(
+            graph.block(merge).exits[0].args,
+            vec![LinkArg::Value(p.clone())]
+        );
+        let q_op = graph
+            .block(merge)
+            .operations
+            .iter()
+            .find(|op| op.result.as_ref() == Some(&q_use))
+            .expect("q's reader survives");
+        assert!(
+            matches!(
+                &q_op.kind,
+                OpKind::BinOp { lhs, rhs, .. } if lhs == &p && rhs == &p
+            ),
+            "the merged phi is renamed to the surviving column"
+        );
+        let b_op = graph
+            .block(next)
+            .operations
+            .iter()
+            .find(|op| op.result.as_ref() == Some(&b_use))
+            .expect("b's reader survives");
+        assert!(
+            matches!(
+                &b_op.kind,
+                OpKind::BinOp { lhs, rhs, .. } if lhs == &a && rhs == &a
+            ),
+            "a downstream phi fed by the merged pair collapses too"
+        );
+    }
+
+    /// One predecessor feeds `[v2, v0, v2]` into `[v0, v1, v2]`. The first
+    /// walk unions `v2` into `v0`; that union makes the `v0` column equal
+    /// to `v1`, so the same block has to be walked again.
+    #[test]
+    fn remove_duplicate_inputargs_rewalks_block_after_its_own_unions() {
+        let mut graph = FunctionGraph::new("self-union-phi");
+        let entry = graph.startblock;
+        let merge = graph.create_block();
+        let v0 = install_phi(&mut graph, merge, "v0");
+        let v1 = install_phi(&mut graph, merge, "v1");
+        let v2 = install_phi(&mut graph, merge, "v2");
+        graph.set_goto(entry, merge, vec![v2.clone(), v0.clone(), v2.clone()]);
+        let v1_use = graph
+            .push_op_var(
+                merge,
+                OpKind::BinOp {
+                    op: "int_add".into(),
+                    lhs: v1.clone(),
+                    rhs: v1.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let v2_use = graph
+            .push_op_var(
+                merge,
+                OpKind::BinOp {
+                    op: "int_add".into(),
+                    lhs: v2.clone(),
+                    rhs: v2.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+
+        remove_duplicate_inputargs(&mut graph);
+
+        assert_eq!(graph.block(merge).inputargs, vec![v0.clone()]);
+        assert_eq!(
+            graph.block(entry).exits[0].args,
+            vec![LinkArg::Value(v0.clone())]
+        );
+        for use_var in [v1_use, v2_use] {
+            let op = graph
+                .block(merge)
+                .operations
+                .iter()
+                .find(|op| op.result.as_ref() == Some(&use_var))
+                .expect("renamed reader survives");
+            assert!(
+                matches!(
+                    &op.kind,
+                    OpKind::BinOp { lhs, rhs, .. } if lhs == &v0 && rhs == &v0
+                ),
+                "v1 and v2 are renamed to the surviving column"
+            );
+        }
+    }
+
+    /// Entry `(x, x, y, y)` and back edge `(c, d, e, e)` into `(a, b, c, d)`.
+    /// The first walk drops `d` into `c`; the next walk, seeing that union,
+    /// drops `b` into `a`. Two columns remain.
+    #[test]
+    fn remove_duplicate_inputargs_rewalks_back_edge_phi() {
+        let mut graph = FunctionGraph::new("back-edge-phi");
+        let entry = graph.startblock;
+        let x = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let y = graph.push_op_var(entry, OpKind::ConstInt(2), true).unwrap();
+        let e = graph.push_op_var(entry, OpKind::ConstInt(3), true).unwrap();
+        let loop_block = graph.create_block();
+        let a = install_phi(&mut graph, loop_block, "a");
+        let b = install_phi(&mut graph, loop_block, "b");
+        let c = install_phi(&mut graph, loop_block, "c");
+        let d = install_phi(&mut graph, loop_block, "d");
+        graph.set_goto(
+            entry,
+            loop_block,
+            vec![x.clone(), x.clone(), y.clone(), y.clone()],
+        );
+        graph.set_goto(
+            loop_block,
+            loop_block,
+            vec![c.clone(), d.clone(), e.clone(), e.clone()],
+        );
+        let b_use = graph
+            .push_op_var(
+                loop_block,
+                OpKind::BinOp {
+                    op: "int_add".into(),
+                    lhs: b.clone(),
+                    rhs: b.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let d_use = graph
+            .push_op_var(
+                loop_block,
+                OpKind::BinOp {
+                    op: "int_add".into(),
+                    lhs: d.clone(),
+                    rhs: d.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+
+        remove_duplicate_inputargs(&mut graph);
+
+        assert_eq!(
+            graph.block(loop_block).inputargs,
+            vec![a.clone(), c.clone()]
+        );
+        assert_eq!(
+            graph.block(entry).exits[0].args,
+            vec![LinkArg::Value(x), LinkArg::Value(y)]
+        );
+        assert_eq!(
+            graph.block(loop_block).exits[0].args,
+            vec![LinkArg::Value(c.clone()), LinkArg::Value(e)]
+        );
+        let b_op = graph
+            .block(loop_block)
+            .operations
+            .iter()
+            .find(|op| op.result.as_ref() == Some(&b_use))
+            .expect("b's reader survives");
+        assert!(matches!(
+            &b_op.kind,
+            OpKind::BinOp { lhs, rhs, .. } if lhs == &a && rhs == &a
+        ));
+        let d_op = graph
+            .block(loop_block)
+            .operations
+            .iter()
+            .find(|op| op.result.as_ref() == Some(&d_use))
+            .expect("d's reader survives");
+        assert!(matches!(
+            &d_op.kind,
+            OpKind::BinOp { lhs, rhs, .. } if lhs == &c && rhs == &c
+        ));
     }
 
     /// `registered_struct_layout` resolves a spelling that is not a key by

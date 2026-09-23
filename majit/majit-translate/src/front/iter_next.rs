@@ -120,22 +120,40 @@ fn is_iter_op_segments(segments: &[String]) -> bool {
 /// foreign iterator constructor) is not followed, so the walk returns
 /// `true` only on a positively-confirmed `iter` source.
 pub(crate) fn originates_from_iter_op(graph: &FunctionGraph, var: &Variable) -> bool {
-    iter_op_container(graph, var).is_some()
+    iter_op_container_with(graph, &BackEdges::build(graph), var).is_some()
 }
 
-/// The container an `iter` op constructed `var` over, when the backward walk
-/// confirms one.  `originates_from_iter_op` is this with the container
-/// discarded; [`iter_next_item_type`] needs it, because the container is the
-/// only thing that separates the two iterator reprs.
-fn iter_op_container(graph: &FunctionGraph, var: &Variable) -> Option<Variable> {
-    walk_back_to_source(graph, var, |op| match &op.kind {
+fn iter_probe(op: &SpaceOperation) -> Option<Variable> {
+    match &op.kind {
         OpKind::Call {
             target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
         } if is_iter_op_segments(segments) => args.first().cloned().map(LinkArg::into_variable),
         _ => None,
-    })
+    }
+}
+
+fn range_probe(op: &SpaceOperation) -> Option<()> {
+    match &op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } if segments.len() == 1 && segments[0] == crate::runtime_names::shims::RANGE => Some(()),
+        _ => None,
+    }
+}
+
+/// The container an `iter` op constructed `var` over, when the backward walk
+/// confirms one.  `originates_from_iter_op` is this with the container
+/// discarded; [`iter_next_item_type`] needs it, because the container is the
+/// only thing that separates the two iterator reprs.
+fn iter_op_container_with(
+    graph: &FunctionGraph,
+    edges: &BackEdges,
+    var: &Variable,
+) -> Option<Variable> {
+    walk_back_with(graph, edges, var, iter_probe)
 }
 
 /// Walk backwards from `var` to the op that produced it, asking `probe`
@@ -150,8 +168,24 @@ fn iter_op_container(graph: &FunctionGraph, var: &Variable) -> Option<Variable> 
 /// Conservative: a var produced by an op `probe` declines is not followed
 /// any further, so a result is always a positively-confirmed source rather
 /// than the absence of a contrary one.
+///
+/// One call indexes every op result and every incoming link in the same
+/// block/op order the scan below used to walk, then reads those indexes.
+/// The visited set, the stack order, and the first `Some` from `probe` are
+/// unchanged. The indexes live only for this call: a later rewrite mutates
+/// the graph.
 pub(crate) fn walk_back_to_source<T>(
     graph: &FunctionGraph,
+    var: &Variable,
+    probe: impl Fn(&SpaceOperation) -> Option<T>,
+) -> Option<T> {
+    let edges = BackEdges::build(graph);
+    walk_back_with(graph, &edges, var, probe)
+}
+
+fn walk_back_with<T>(
+    graph: &FunctionGraph,
+    edges: &BackEdges,
     var: &Variable,
     probe: impl Fn(&SpaceOperation) -> Option<T>,
 ) -> Option<T> {
@@ -162,31 +196,193 @@ pub(crate) fn walk_back_to_source<T>(
             continue;
         }
         visited.push(v.clone());
-        for b in &graph.blocks {
-            for op in &b.operations {
-                if op.result.as_ref() == Some(&v)
-                    && let Some(found) = probe(op)
-                {
-                    return Some(found);
-                }
+        let Some(vi) = edges.var_index(&v) else {
+            continue;
+        };
+        let (prod_start, prod_end) = edges.producer_range[vi];
+        for k in prod_start..prod_end {
+            let (bi, oi) = edges.producer_at[k as usize];
+            let op = &graph.blocks[bi as usize].operations[oi as usize];
+            if let Some(found) = probe(op) {
+                return Some(found);
             }
         }
-        for b in &graph.blocks {
-            if let Some(pos) = b.inputargs.iter().position(|iv| iv == &v) {
-                let target_id = b.id;
-                for pb in &graph.blocks {
-                    for link in &pb.exits {
-                        if link.target == target_id
-                            && let Some(LinkArg::Value(src)) = link.args.get(pos)
-                        {
-                            stack.push(src.clone());
-                        }
-                    }
+        let (slot_start, slot_end) = edges.slot_range[vi];
+        for k in slot_start..slot_end {
+            let (bi, pos) = edges.slot_at[k as usize];
+            let bi = bi as usize;
+            let pos = pos as usize;
+            let (in_start, in_end) = edges.incoming_range[bi];
+            for ik in in_start..in_end {
+                let (pred, ei) = edges.incoming_at[ik as usize];
+                let link = &graph.blocks[pred as usize].exits[ei as usize];
+                if let Some(LinkArg::Value(src)) = link.args.get(pos) {
+                    stack.push(src.clone());
                 }
             }
         }
     }
     None
+}
+
+/// Producers, inputarg slots, and incoming links for one backward walk.
+///
+/// Variable rows are a dense numbering of the ids that occur in this
+/// graph, assigned in first-seen order. Ids minted for other graphs are
+/// not rows. Each row's slice is in the order a scan of `graph.blocks`
+/// visits that fact: op results in block/op order, the first inputarg
+/// slot of the var in each block, and links that enter a block in
+/// predecessor-block then exit order.
+struct BackEdges {
+    row_of: rustc_hash::FxHashMap<u64, u32>,
+    producer_range: Vec<(u32, u32)>,
+    producer_at: Vec<(u32, u32)>,
+    incoming_range: Vec<(u32, u32)>,
+    incoming_at: Vec<(u32, u32)>,
+    slot_range: Vec<(u32, u32)>,
+    slot_at: Vec<(u32, u32)>,
+}
+
+impl BackEdges {
+    fn build(graph: &FunctionGraph) -> Self {
+        let mut row_of: rustc_hash::FxHashMap<u64, u32> = rustc_hash::FxHashMap::default();
+        let mut note = |id: u64| {
+            let next = row_of.len() as u32;
+            row_of.entry(id).or_insert(next);
+        };
+        for b in &graph.blocks {
+            for op in &b.operations {
+                if let Some(result) = &op.result {
+                    note(result.id());
+                }
+            }
+            for iv in &b.inputargs {
+                note(iv.id());
+            }
+            for link in &b.exits {
+                for arg in &link.args {
+                    if let LinkArg::Value(src) = arg {
+                        note(src.id());
+                    }
+                }
+            }
+        }
+        if row_of.is_empty() {
+            return Self::empty();
+        }
+        let n = row_of.len();
+        let row = |id: u64| row_of[&id] as usize;
+        let nblocks = graph.blocks.len();
+        let mut prod_count = vec![0u32; n];
+        let mut slot_count = vec![0u32; n];
+        let mut last_block = vec![u32::MAX; n];
+        let mut in_count = vec![0u32; nblocks];
+        for (bi, b) in graph.blocks.iter().enumerate() {
+            let bi_u = bi as u32;
+            for op in &b.operations {
+                if let Some(result) = &op.result {
+                    prod_count[row(result.id())] += 1;
+                }
+            }
+            for iv in &b.inputargs {
+                let i = row(iv.id());
+                if last_block[i] != bi_u {
+                    last_block[i] = bi_u;
+                    slot_count[i] += 1;
+                }
+            }
+            for link in &b.exits {
+                let target = link.target.0;
+                if target < nblocks {
+                    in_count[target] += 1;
+                }
+            }
+        }
+        let producer_range = exclusive_ranges(&prod_count);
+        let slot_range = exclusive_ranges(&slot_count);
+        let incoming_range = exclusive_ranges(&in_count);
+        let mut producer_at =
+            vec![(0u32, 0u32); producer_range.last().map(|r| r.1).unwrap_or(0) as usize];
+        let mut slot_at = vec![(0u32, 0u32); slot_range.last().map(|r| r.1).unwrap_or(0) as usize];
+        let mut incoming_at =
+            vec![(0u32, 0u32); incoming_range.last().map(|r| r.1).unwrap_or(0) as usize];
+        let mut prod_fill: Vec<u32> = producer_range.iter().map(|r| r.0).collect();
+        let mut slot_fill: Vec<u32> = slot_range.iter().map(|r| r.0).collect();
+        let mut in_fill: Vec<u32> = incoming_range.iter().map(|r| r.0).collect();
+        last_block.fill(u32::MAX);
+        for (bi, b) in graph.blocks.iter().enumerate() {
+            let bi_u = bi as u32;
+            for (oi, op) in b.operations.iter().enumerate() {
+                if let Some(result) = &op.result {
+                    let i = row(result.id());
+                    let at = prod_fill[i] as usize;
+                    producer_at[at] = (bi_u, oi as u32);
+                    prod_fill[i] += 1;
+                }
+            }
+            for (pos, iv) in b.inputargs.iter().enumerate() {
+                let i = row(iv.id());
+                if last_block[i] == bi_u {
+                    continue;
+                }
+                last_block[i] = bi_u;
+                let at = slot_fill[i] as usize;
+                slot_at[at] = (bi_u, pos as u32);
+                slot_fill[i] += 1;
+            }
+            for (ei, link) in b.exits.iter().enumerate() {
+                let target = link.target.0;
+                if target < nblocks {
+                    let at = in_fill[target] as usize;
+                    incoming_at[at] = (bi_u, ei as u32);
+                    in_fill[target] += 1;
+                }
+            }
+        }
+        Self {
+            row_of,
+            producer_range,
+            producer_at,
+            incoming_range,
+            incoming_at,
+            slot_range,
+            slot_at,
+        }
+    }
+
+    fn empty() -> Self {
+        Self {
+            row_of: rustc_hash::FxHashMap::default(),
+            producer_range: Vec::new(),
+            producer_at: Vec::new(),
+            incoming_range: Vec::new(),
+            incoming_at: Vec::new(),
+            slot_range: Vec::new(),
+            slot_at: Vec::new(),
+        }
+    }
+
+    fn var_index(&self, var: &Variable) -> Option<usize> {
+        self.row_of.get(&var.id()).map(|&row| row as usize)
+    }
+
+    /// First op in block/op order whose result is `var`.
+    fn first_producer(&self, var: &Variable) -> Option<(u32, u32)> {
+        let i = self.var_index(var)?;
+        let (start, end) = self.producer_range[i];
+        (start < end).then(|| self.producer_at[start as usize])
+    }
+}
+
+fn exclusive_ranges(counts: &[u32]) -> Vec<(u32, u32)> {
+    let mut ranges = Vec::with_capacity(counts.len());
+    let mut cursor = 0u32;
+    for count in counts {
+        let start = cursor;
+        cursor += count;
+        ranges.push((start, cursor));
+    }
+    ranges
 }
 
 /// The element type the native `next` op yields for the iterator `var`.
@@ -222,14 +418,15 @@ pub(crate) fn walk_back_to_source<T>(
 /// `Option<T>` at the recording site, which is the only place it survives.
 fn iter_next_item_type(
     graph: &FunctionGraph,
+    edges: &BackEdges,
     iterator: &Variable,
     recorded: &ValueType,
 ) -> ValueType {
     // `rrange.py ll_rangenext_*` hands back a `Signed` whatever the Rust
     // range's own spelling is, so the range arm answers before the recorded
     // element type is consulted — a `0..n` over `usize` records `Unsigned`.
-    let over_a_range = iter_op_container(graph, iterator)
-        .is_some_and(|container| produced_by_range_builtin(graph, &container));
+    let over_a_range = iter_op_container_with(graph, edges, iterator)
+        .is_some_and(|container| produced_by_range_builtin(graph, edges, &container));
     if over_a_range {
         return ValueType::Int;
     }
@@ -254,15 +451,8 @@ fn iter_next_item_type(
 /// otherwise flip the answer back to `Ref`, and the failure mode is the
 /// assembler reject [`iter_next_item_type`] exists to prevent rather than a
 /// graceful degrade.
-fn produced_by_range_builtin(graph: &FunctionGraph, var: &Variable) -> bool {
-    walk_back_to_source(graph, var, |op| match &op.kind {
-        OpKind::Call {
-            target: CallTarget::FunctionPath { segments, .. },
-            ..
-        } if segments.len() == 1 && segments[0] == crate::runtime_names::shims::RANGE => Some(()),
-        _ => None,
-    })
-    .is_some()
+fn produced_by_range_builtin(graph: &FunctionGraph, edges: &BackEdges, var: &Variable) -> bool {
+    walk_back_with(graph, edges, var, range_probe).is_some()
 }
 
 /// Transitive closure of dead forwarded inputarg slots starting from
@@ -423,14 +613,23 @@ pub(crate) fn rewire_next_call_sites(
     graph: &mut FunctionGraph,
     sites: &[(Variable, ValueType)],
 ) -> usize {
+    // One index for every site that has not yet mutated the graph. A site
+    // that reached the mutation phase changed blocks and links, whether it
+    // then succeeded or declined, so the next site builds a fresh index; a
+    // decline during validation leaves the graph alone and keeps this one.
+    let mut edges = BackEdges::build(graph);
     let mut rewritten = 0;
     for (opt, recorded_item_ty) in sites {
-        match rewire_one_next_site(graph, opt, recorded_item_ty) {
+        let mut mutated = false;
+        match rewire_one_next_site(graph, &edges, opt, recorded_item_ty, &mut mutated) {
             Ok(()) => rewritten += 1,
             Err(_decline) => {
                 // Leave the residual `next` call; the unregistered callee
                 // makes the rtyper census Skip this graph (no regression).
             }
+        }
+        if mutated {
+            edges = BackEdges::build(graph);
         }
     }
     rewritten
@@ -524,26 +723,19 @@ pub(crate) fn peel_recast_chain(
 
 fn rewire_one_next_site(
     graph: &mut FunctionGraph,
+    edges: &BackEdges,
     opt: &Variable,
     recorded_item_ty: &ValueType,
+    mutated: &mut bool,
 ) -> Result<(), String> {
     let name = graph.name.clone();
     // Block A: the block whose op produces `opt` — the residual `next()`
     // call, closed by lower_call with a single forwarding exit.
-    let a = graph
-        .blocks
-        .iter()
-        .position(|b| {
-            b.operations
-                .iter()
-                .any(|op| op.result.as_ref() == Some(opt))
-        })
+    let (a, next_idx) = edges
+        .first_producer(opt)
         .ok_or_else(|| format!("{name}: next() result var has no producer block"))?;
-    let next_idx = graph.blocks[a]
-        .operations
-        .iter()
-        .position(|op| op.result.as_ref() == Some(opt))
-        .ok_or_else(|| format!("{name}: next() producer op vanished from block {a}"))?;
+    let a = a as usize;
+    let next_idx = next_idx as usize;
     // The residual `next()` result, before any trailing recast.  The
     // native op must replace this call — looking up the peeled
     // scrutinee instead leaves `slice::iter::Iter::next` /
@@ -577,7 +769,7 @@ fn rewire_one_next_site(
     // recording site saw, and the dead forwarded-slot removal below rewrites
     // exactly that.  For Enumerate the recorded kind is the *inner* element
     // (the tuple is packed on the Some arm after this next).
-    let item_ty = iter_next_item_type(graph, &next_iter, recorded_item_ty);
+    let item_ty = iter_next_item_type(graph, edges, &next_iter, recorded_item_ty);
 
     // `lower_call` closes the block right after the raising call, so the
     // `next()` call is normally A's last op.  An UNREGISTERED `next()`
@@ -602,7 +794,7 @@ fn rewire_one_next_site(
     // to `["core", "slice", "iter"]`).  Anything else declines (the
     // residual call keeps the rtyper Skip), so a non-list iterator never
     // reaches the rewrite.
-    if enumerate_inner.is_none() && !originates_from_iter_op(graph, &iter_arg) {
+    if enumerate_inner.is_none() && iter_op_container_with(graph, edges, &iter_arg).is_none() {
         return Err(format!(
             "{name}: next() iterator operand does not originate from an iter op — \
              not a list-iterator for-loop"
@@ -904,17 +1096,22 @@ fn rewire_one_next_site(
     // several slots of `none_target`, into the chain — not just `none_target`.
     // Block A's pre-rewrite exit targets C (not a removal-set block), so A is
     // not yet among these; its new StopIteration link is built post-removal.
+    // `edges` already lists those predecessor links in the same block/exit
+    // order. `collapse_pos0_read` below rewrites exit args but keeps each
+    // exit and its target, so the recorded slots still name the links.
     for &b in dead.keys() {
         let arity = graph.blocks[b].inputargs.len();
-        for blk in &graph.blocks {
-            for l in &blk.exits {
-                if l.target.0 == b && l.args.len() != arity {
-                    return Err(format!(
-                        "{name}: predecessor link to block {b} has arity {} != {arity} — \
-                         unsafe to prune the transitive dead-Option chain",
-                        l.args.len()
-                    ));
-                }
+        let (start, end) = edges.incoming_range[b];
+        for k in start..end {
+            let (pred, exit_i) = edges.incoming_at[k as usize];
+            let nargs = graph.blocks[pred as usize].exits[exit_i as usize]
+                .args
+                .len();
+            if nargs != arity {
+                return Err(format!(
+                    "{name}: predecessor link to block {b} has arity {nargs} != {arity} — \
+                     unsafe to prune the transitive dead-Option chain"
+                ));
             }
         }
     }
@@ -948,6 +1145,7 @@ fn rewire_one_next_site(
     }
 
     // --- All structural validation passed; mutate the graph. ---
+    *mutated = true;
 
     if let Some(pair) = &enum_pair {
         crate::front::iter_adapter::rewrite_enumerate_ctor_to_pair(graph, pair, &next_iter)?;
@@ -995,12 +1193,12 @@ fn rewire_one_next_site(
     for (&b, slots) in dead.iter().rev() {
         for &s in slots.iter().rev() {
             graph.blocks[b].inputargs.remove(s);
-            for blk in &mut graph.blocks {
-                for l in &mut blk.exits {
-                    if l.target.0 == b {
-                        l.args.remove(s);
-                    }
-                }
+            let (start, end) = edges.incoming_range[b];
+            for k in start..end {
+                let (pred, exit_i) = edges.incoming_at[k as usize];
+                graph.blocks[pred as usize].exits[exit_i as usize]
+                    .args
+                    .remove(s);
             }
         }
     }
@@ -1134,7 +1332,7 @@ mod tests {
     fn a_range_container_answers_int_over_its_recorded_element() {
         let (g, it) = graph_with_iter(true);
         assert_eq!(
-            iter_next_item_type(&g, &it, &ValueType::Unsigned),
+            iter_next_item_type(&g, &BackEdges::build(&g), &it, &ValueType::Unsigned),
             ValueType::Int,
         );
     }
@@ -1146,7 +1344,12 @@ mod tests {
     fn a_gc_reference_element_answers_a_classdefless_ref() {
         let (g, it) = graph_with_iter(false);
         assert_eq!(
-            iter_next_item_type(&g, &it, &ValueType::Ref(Some("PyObject".into()))),
+            iter_next_item_type(
+                &g,
+                &BackEdges::build(&g),
+                &it,
+                &ValueType::Ref(Some("PyObject".into()))
+            ),
             ValueType::Ref(None),
         );
     }
@@ -1160,7 +1363,7 @@ mod tests {
         let (g, it) = graph_with_iter(false);
         for recorded in [ValueType::Int, ValueType::Unsigned, ValueType::Float] {
             assert_eq!(
-                iter_next_item_type(&g, &it, &recorded),
+                iter_next_item_type(&g, &BackEdges::build(&g), &it, &recorded),
                 recorded,
                 "{recorded:?} element must not be retyped as a GC reference",
             );

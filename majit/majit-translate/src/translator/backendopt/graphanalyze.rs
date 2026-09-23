@@ -612,21 +612,22 @@ where
 /// `DependencyTracker` (`graphanalyze.py`). Tracks the
 /// active call-stack so cycles in the analysed call graph can be
 /// detected and merged via the shared
-/// [`crate::tool::algo::unionfind::UnionFind`] cache. Pyre's
-/// `UnionFind` keys on `usize` (the graph identity hash); the result
+/// [`crate::tool::algo::unionfind::UnionFind`] cache. The key is the
+/// caller's graph identity (`GraphKey::as_usize()` for a flowspace
+/// graph; a codewriter analyzer may key on `CallPath`). The result
 /// lattice value lives inside [`Dependency`].
-pub struct DependencyTracker<R: AnalyzerResult> {
-    current_stack: Vec<usize>,
+pub struct DependencyTracker<R: AnalyzerResult, K: Eq + std::hash::Hash + Clone = usize> {
+    current_stack: Vec<K>,
     _phantom: std::marker::PhantomData<R>,
 }
 
-impl<R: AnalyzerResult> Default for DependencyTracker<R> {
+impl<R: AnalyzerResult, K: Eq + std::hash::Hash + Clone> Default for DependencyTracker<R, K> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<R: AnalyzerResult> DependencyTracker<R> {
+impl<R: AnalyzerResult, K: Eq + std::hash::Hash + Clone> DependencyTracker<R, K> {
     pub fn new() -> Self {
         Self {
             current_stack: Vec::new(),
@@ -638,9 +639,9 @@ impl<R: AnalyzerResult> DependencyTracker<R> {
     /// when the graph is new (caller must analyse it); `false` when
     /// the graph is already on the stack (caller reads the cached
     /// result and merges the strongly-connected component).
-    pub fn enter(&mut self, key: usize, analyzed: &mut UnionFind<usize, Dependency<R>>) -> bool {
+    pub fn enter(&mut self, key: K, analyzed: &mut UnionFind<K, Dependency<R>>) -> bool {
         if !analyzed.contains(&key) {
-            self.current_stack.push(key);
+            self.current_stack.push(key.clone());
             // Upstream `:236 self.graph_results.find(graph)` —
             // initialises the union-find slot through the factory
             // passed at `UnionFind::new` time.
@@ -649,12 +650,12 @@ impl<R: AnalyzerResult> DependencyTracker<R> {
         } else {
             // Upstream `:239-247`: cycle detection — find the
             // shared rep and union every stack frame above it.
-            let graph_rep = analyzed.find_rep(key);
+            let graph_rep = analyzed.find_rep(key.clone());
             for j in 0..self.current_stack.len() {
-                let other_rep = analyzed.find_rep(self.current_stack[j]);
+                let other_rep = analyzed.find_rep(self.current_stack[j].clone());
                 if graph_rep == other_rep {
                     for i in j..self.current_stack.len() {
-                        analyzed.union(self.current_stack[i], key);
+                        analyzed.union(self.current_stack[i].clone(), key.clone());
                     }
                     break;
                 }
@@ -664,12 +665,7 @@ impl<R: AnalyzerResult> DependencyTracker<R> {
     }
 
     /// `leave_with(result)` (`graphanalyze.py`).
-    pub fn leave_with(
-        &mut self,
-        _key: usize,
-        result: R,
-        analyzed: &mut UnionFind<usize, Dependency<R>>,
-    ) {
+    pub fn leave_with(&mut self, _key: K, result: R, analyzed: &mut UnionFind<K, Dependency<R>>) {
         let popped = self.current_stack.pop().expect("leave_with: stack empty");
         if let Some(dep) = analyzed.get_mut(&popped) {
             dep.merge_with_result(result);
@@ -677,11 +673,7 @@ impl<R: AnalyzerResult> DependencyTracker<R> {
     }
 
     /// `get_cached_result(graph)` (`graphanalyze.py`).
-    pub fn get_cached_result(
-        &self,
-        key: usize,
-        analyzed: &mut UnionFind<usize, Dependency<R>>,
-    ) -> R {
+    pub fn get_cached_result(&self, key: K, analyzed: &mut UnionFind<K, Dependency<R>>) -> R {
         analyzed
             .get(&key)
             .map_or_else(R::bottom_result, |d| d.result())

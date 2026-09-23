@@ -1118,7 +1118,8 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // production keeps going with a degraded SemanticProgram —
         // failing-loud on the single broken function rather than
         // erroring out at program-build time.
-        let builder_mode = graph_has_builder_accumulator(llbc, &body);
+        let accum = AccumulatorFacts::build(llbc, &body);
+        let builder_mode = accum.has_builder;
         let graph = match lower_unstructured_with_static_addrs_and_attrs(
             llbc,
             fd,
@@ -1128,6 +1129,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             &struct_field_attrs,
             &dont_look_inside,
             builder_mode,
+            &accum,
         ) {
             Ok(g) => g,
             Err(e) => {
@@ -2278,6 +2280,23 @@ pub(crate) fn harden_duplicate_leaf_metadata(
         }
         unique
     }
+    // The same parent path is tested once per key. `is_enum_base` is pure
+    // for the duration of this loop: rows are not mutated until the
+    // withdrawals below.
+    fn cached_enum_base(
+        reg: &crate::front::semantic::StructFieldRegistry,
+        owner: &str,
+        memo: &mut std::collections::HashMap<String, bool>,
+    ) -> bool {
+        if let Some(&known) = memo.get(owner) {
+            return known;
+        }
+        let known = reg.is_enum_base(owner);
+        memo.insert(owner.to_string(), known);
+        known
+    }
+    let mut enum_base_memo: std::collections::HashMap<String, bool> =
+        std::collections::HashMap::new();
     let mut by_leaf: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
     for key in struct_fields.fields.keys() {
         if let Some((head, leaf)) = key.rsplit_once("::") {
@@ -2293,7 +2312,9 @@ pub(crate) fn harden_duplicate_leaf_metadata(
             // type-vs-variant name collision, leaving every other
             // variant-leaf bucket (whose withdrawal the resume numbering
             // depends on) intact.
-            if struct_fields.is_enum_base(head) && struct_fields.is_enum_base(leaf) {
+            if cached_enum_base(struct_fields, head, &mut enum_base_memo)
+                && cached_enum_base(struct_fields, leaf, &mut enum_base_memo)
+            {
                 continue;
             }
             by_leaf.entry(leaf).or_default().push(key);
@@ -2334,8 +2355,10 @@ pub(crate) fn harden_duplicate_leaf_metadata(
         }
     }
     drop(by_leaf);
+    // Withdrawals change the key set. `remove_field` drops the suffix
+    // index so a later insert that restores `fields.len()` cannot reuse it.
     for leaf in drop_field_aliases {
-        struct_fields.fields.remove(&leaf);
+        struct_fields.remove_field(&leaf);
     }
     for leaf in tombstone_origins {
         if let Some(module) = struct_origins.get_mut(&leaf) {
@@ -2382,7 +2405,7 @@ pub(crate) fn harden_duplicate_leaf_metadata(
     }
     drop(variant_by_alias);
     for alias in drop_variant_aliases {
-        struct_fields.fields.remove(&alias);
+        struct_fields.remove_field(&alias);
     }
     // `enum_variant_by_discriminant` dual-publishes the same bare-leaf
     // alias (qualified path + leaf), so a cross-decl leaf collision
@@ -2427,7 +2450,7 @@ pub(crate) fn harden_duplicate_leaf_metadata(
             .get(&leaf)
             .is_some_and(|rows| rows.len() == 1 && rows[0].0 == "__discriminant")
         {
-            struct_fields.fields.remove(&leaf);
+            struct_fields.remove_field(&leaf);
         }
     }
 }
@@ -2590,7 +2613,8 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
             fd.item_meta.name_path()
         ))
     })?;
-    let builder_mode = graph_has_builder_accumulator(llbc, &u);
+    let accum = AccumulatorFacts::build(llbc, &u);
+    let builder_mode = accum.has_builder;
     lower_unstructured_with_static_addrs_and_attrs(
         llbc,
         fd,
@@ -2600,6 +2624,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         struct_field_attrs,
         &dont_look_inside,
         builder_mode,
+        &accum,
     )
 }
 
@@ -2619,10 +2644,10 @@ fn builder_ctor_dest_locals<'a>(
     let n_locals = body.locals.locals.len();
     let arg_count = body.locals.arg_count as usize;
     body.body.iter().filter_map(move |bb| {
-        if let Ok(TermKind::Call { call, .. }) = bb.term()
-            && let PlaceKind::Local(i) = call.dest.kind
+        if let Ok(TermKind::Call { call, .. }) = bb.term_ref()
+            && let &PlaceKind::Local(i) = &call.dest.kind
             && (arg_count + 1..n_locals).contains(&(i as usize))
-            && is_str_builder_ctor(wtf8buf_method_leaf(llbc, &call))
+            && is_str_builder_ctor(wtf8buf_method_leaf(llbc, call))
         {
             Some(i as usize)
         } else {
@@ -2633,9 +2658,10 @@ fn builder_ctor_dest_locals<'a>(
 
 /// Whether `u` (the body of `fd`) contains at least one builder-mode string
 /// accumulator ([`is_builder_mode_accumulator`]) — the pre-check that selects
-/// the canonical builder-form lowering.
-fn graph_has_builder_accumulator(llbc: &Llbc, u: &Unstructured) -> bool {
-    builder_ctor_dest_locals(u, llbc).any(|c| is_builder_mode_accumulator(u, llbc, c))
+/// the canonical builder-form lowering. `builder_mode[c]` is that predicate
+/// for local `c`, already computed for this body.
+fn graph_has_builder_accumulator(llbc: &Llbc, u: &Unstructured, builder_mode: &[bool]) -> bool {
+    builder_ctor_dest_locals(u, llbc).any(|c| builder_mode.get(c).copied().unwrap_or(false))
 }
 
 /// Lower `fd` from an already-projected `Unstructured` body.
@@ -2659,6 +2685,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     // caller sets this directly from [`graph_has_builder_accumulator`], so
     // qualifying functions have one canonical marker-emitting graph.
     builder_mode: bool,
+    accum: &AccumulatorFacts,
 ) -> Result<FunctionGraph, LowerError> {
     let name = fd.item_meta.name_path();
     // The Result-of-PyError exception-link lowering's callee rule
@@ -3302,6 +3329,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             jitdriver_receiver_roots,
             fd.generics.as_ref(),
             dont_look_inside,
+            accum,
         )?;
         if builder_mode {
             lo.enable_builder_mode();
@@ -3345,6 +3373,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         jitdriver_receiver_roots,
         fd.generics.as_ref(),
         dont_look_inside,
+        accum,
     )?;
     if builder_mode {
         lo.enable_builder_mode();
@@ -3374,6 +3403,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 jitdriver_receiver_roots,
                 fd.generics.as_ref(),
                 dont_look_inside,
+                accum,
             )?;
             if builder_mode {
                 lo.enable_builder_mode();
@@ -4407,10 +4437,11 @@ struct Lowering<'a> {
     /// `__majit_stringbuilder_{new,append,build}` markers (`flowspace_adapter` →
     /// `newstringbuilder` / `append` / `build`) instead of a parallel
     /// `ll_strconcat` graph. Whether a given local *is* such an
-    /// accumulator is resolved on demand from `body`
-    /// ([`is_builder_mode_accumulator`]) at each emit site — no per-local side
-    /// table, so nothing can drift from the MIR that is the source of truth.
+    /// accumulator is [`accum`](Self::accum), filled once from
+    /// [`is_builder_mode_accumulator`] when this lowering starts.
     builder_mode: bool,
+    /// Per-local string-builder recognizer answers for this body.
+    accum: AccumulatorFacts,
     /// MIR locals bound by a devirtualized workspace `Index::index` /
     /// `IndexMut::index_mut` call, mapped to the `(base, index)`
     /// operand pair.  Those impls bottom out at raw-slice
@@ -4669,6 +4700,7 @@ impl<'a> Lowering<'a> {
         jitdriver_receiver_roots: &'a [String],
         generics: Option<&serde_json::Value>,
         dont_look_inside: &'a std::collections::HashSet<String>,
+        accum: &AccumulatorFacts,
     ) -> Result<Self, LowerError> {
         let mut graph = FunctionGraph::new(name);
         let n_locals = body.locals.locals.len();
@@ -4930,6 +4962,7 @@ impl<'a> Lowering<'a> {
             positional_aggregate_locals: std::collections::HashMap::new(),
             binop_result_locals: compute_binop_result_locals(body),
             builder_mode: false,
+            accum: accum.clone(),
             index_elem_alias: std::collections::HashMap::new(),
             atomic_ref_place: std::collections::HashMap::new(),
             atomic_ordering_locals: std::collections::HashMap::new(),
@@ -4981,13 +5014,38 @@ impl<'a> Lowering<'a> {
     /// ([`is_builder_mode_accumulator`]) emit the `StringBuilder` markers
     /// instead of `ll_strconcat`. The canonical frontend selects this before
     /// lowering whenever [`graph_has_builder_accumulator`] succeeds.
-    /// Returns whether any accumulator was found. Membership is resolved on demand at each emit site,
-    /// so this records no per-local table — only the mode flag.
+    /// Returns whether any accumulator was found. Per-local membership is
+    /// [`accum`](Self::accum); this records only the mode flag.
     fn enable_builder_mode(&mut self) -> bool {
         self.builder_mode = true;
         // Same "any builder-mode accumulator?" question as the pre-check, over
         // the ctor-dest candidates only (see [`builder_ctor_dest_locals`]).
-        graph_has_builder_accumulator(self.llbc, self.body)
+        self.accum.has_builder
+    }
+
+    fn accumulator_is_builder_mode(&self, c: usize) -> bool {
+        match self.accum.builder_mode.get(c) {
+            Some(flag) => *flag,
+            None => {
+                let cache = ScanCache::new(self.body.locals.locals.len());
+                cache.precompute_fresh(self.body, self.llbc);
+                is_builder_mode_accumulator(&cache, self.body, self.llbc, c)
+            }
+        }
+    }
+
+    fn accumulator_of_append_arg(&self, rt: usize) -> Option<usize> {
+        match self.accum.append_accumulator.get(rt) {
+            Some(hit) => *hit,
+            None => append_accumulator_of_arg_temp(self.body, self.llbc, rt),
+        }
+    }
+
+    fn piece_accumulator_of_append_arg(&self, rt: usize) -> Option<usize> {
+        match self.accum.append_piece_accumulator.get(rt) {
+            Some(hit) => *hit,
+            None => append_piece_accumulator_of_arg_temp(self.body, self.llbc, rt),
+        }
     }
 
     fn lower(&mut self, order: BlockOrder) -> Result<(), LowerError> {
@@ -7482,10 +7540,10 @@ impl<'a> Lowering<'a> {
                 // `SomeString`) instead of moving the concat accumulator out.
                 // Only a bare `Local(c)` move qualifies; a projection falls
                 // through. Inert unless this function selected builder mode and
-                // the local is an accumulator (resolved on demand from `body`).
+                // the local is an accumulator (read from the per-body table).
                 if let PlaceKind::Local(i) = place.kind
                     && self.builder_mode
-                    && is_builder_mode_accumulator(self.body, self.llbc, i as usize)
+                    && self.accumulator_is_builder_mode(i as usize)
                 {
                     return self.resolve_builder_build(mir_bb, i as usize);
                 }
@@ -10322,7 +10380,7 @@ impl<'a> Lowering<'a> {
                     // for a builder-only method.
                     && !(self.builder_mode
                         && str_builder_ctor_leaf(self.llbc, &reg).is_some()
-                        && is_builder_mode_accumulator(self.body, self.llbc, dest_local))
+                        && self.accumulator_is_builder_mode(dest_local))
                 {
                     self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
@@ -11223,7 +11281,7 @@ impl<'a> Lowering<'a> {
                 // mutate it in place.  Placed before the method-specific arms
                 // so it preempts any generic ctor lowering. Inert unless
                 // [`enable_builder_mode`] selected this canonical form; the
-                // accumulator test resolves on demand from `body`.
+                // accumulator test reads the per-body table.
                 //
                 // The ctor operands ride the marker verbatim: `new()` carries
                 // none and `with_capacity(n)` carries the size `n`
@@ -11233,9 +11291,7 @@ impl<'a> Lowering<'a> {
                 // no arg selects `ll_new(INIT_SIZE)`, the size arg threads
                 // `ll_new(n)`.
                 let builder_ctor_leaf = str_builder_ctor_leaf(self.llbc, &reg);
-                if self.builder_mode
-                    && is_builder_mode_accumulator(self.body, self.llbc, dest_local)
-                {
+                if self.builder_mode && self.accumulator_is_builder_mode(dest_local) {
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -11306,8 +11362,8 @@ impl<'a> Lowering<'a> {
                 // string.  `str_builder_append_args` gives the accumulator and
                 // piece arg positions (push / push_str / push_wtf8: acc 0, piece 1;
                 // push_onto: acc 1, piece 0).  The `&mut buf` accumulator
-                // arrives as a per-site ref-temp; `append_accumulator_of_arg_temp`
-                // traces it back to `buf` on demand from the MIR body, resolving
+                // arrives as a per-site ref-temp; the per-body table answers
+                // [`append_accumulator_of_arg_temp`] for it, resolving
                 // to `buf` only when `buf` is a fresh `new` / `with_capacity`
                 // local whose every borrow feeds such an append, so a
                 // `&mut`-parameter accumulator (whose caller observes the
@@ -11320,7 +11376,7 @@ impl<'a> Lowering<'a> {
                         .get(acc_i)
                         .copied()
                         .flatten()
-                        .and_then(|rt| append_accumulator_of_arg_temp(self.body, self.llbc, rt))
+                        .and_then(|rt| self.accumulator_of_append_arg(rt))
                 {
                     // Concatenate onto the accumulator's current binding
                     // (`local_var[buf_local]`), not `args[acc_i]`: the latter is
@@ -11334,15 +11390,13 @@ impl<'a> Lowering<'a> {
                     let piece_val = if self.builder_mode
                         && let Some(piece_temp) = arg_locals.get(piece_i).copied().flatten()
                         && let Some(piece_builder) =
-                            append_piece_accumulator_of_arg_temp(self.body, self.llbc, piece_temp)
+                            self.piece_accumulator_of_append_arg(piece_temp)
                     {
                         self.resolve_builder_build(mir_bb, piece_builder)?
                     } else {
                         args[piece_i].clone()
                     };
-                    if self.builder_mode
-                        && is_builder_mode_accumulator(self.body, self.llbc, buf_local)
-                    {
+                    if self.builder_mode && self.accumulator_is_builder_mode(buf_local) {
                         // Builder form: `b.append(piece)` mutates the buffer in
                         // place and returns `()`, so — unlike the concat rebind
                         // below — the accumulator binding is unchanged.  Emit the
@@ -21517,28 +21571,178 @@ fn operand_reads_local(op: &Operand, l: usize) -> bool {
     matches!(op, Operand::Copy(p) | Operand::Move(p) if place_references_local(p, l))
 }
 
+/// Memo of the per-local string-builder recognizers for one body.
+///
+/// Each slot is filled at most once. A repeat query returns the stored
+/// answer, which is the answer the uncached scan produced for that local.
+struct ScanCache {
+    fresh: std::cell::RefCell<Vec<Option<bool>>>,
+    builder: std::cell::RefCell<Vec<Option<bool>>>,
+    clean: std::cell::RefCell<Vec<Option<Option<Vec<usize>>>>>,
+    piece: std::cell::RefCell<Vec<Option<Option<usize>>>>,
+    /// `sole[local][accumulator as usize]`.
+    sole: std::cell::RefCell<Vec<[Option<bool>; 2]>>,
+    alias: std::cell::RefCell<Vec<Option<Option<usize>>>>,
+    /// `arg_of[local][accumulator as usize]` = [`append_arg_of_borrow`].
+    arg_of: std::cell::RefCell<Vec<[Option<Option<usize>>; 2]>>,
+    material: std::cell::RefCell<Vec<Option<usize>>>,
+}
+
+impl ScanCache {
+    fn new(n: usize) -> Self {
+        Self {
+            fresh: std::cell::RefCell::new(vec![None; n]),
+            builder: std::cell::RefCell::new(vec![None; n]),
+            clean: std::cell::RefCell::new(vec![None; n]),
+            piece: std::cell::RefCell::new(vec![None; n]),
+            sole: std::cell::RefCell::new(vec![[None, None]; n]),
+            alias: std::cell::RefCell::new(vec![None; n]),
+            arg_of: std::cell::RefCell::new(vec![[None, None]; n]),
+            material: std::cell::RefCell::new(vec![None; n]),
+        }
+    }
+
+    fn n(&self) -> usize {
+        self.fresh.borrow().len()
+    }
+
+    /// One pass of [`is_fresh_str_builder`] over every local.
+    fn precompute_fresh(&self, body: &Unstructured, llbc: &Llbc) {
+        let n = self.n();
+        let mut def_count = vec![0usize; n];
+        let mut ctor_def = vec![false; n];
+        for bb in &body.body {
+            for st in &bb.statements {
+                if let Ok(StmtKind::Assign(place, _)) = st.stmt_kind_ref()
+                    && let &PlaceKind::Local(i) = &place.kind
+                    && (i as usize) < n
+                {
+                    def_count[i as usize] += 1;
+                }
+            }
+            if let Ok(TermKind::Call { call, .. }) = bb.term_ref()
+                && let &PlaceKind::Local(i) = &call.dest.kind
+                && (i as usize) < n
+            {
+                let i = i as usize;
+                def_count[i] += 1;
+                ctor_def[i] = is_str_builder_ctor(wtf8buf_method_leaf(llbc, call));
+            }
+        }
+        let mut fresh = self.fresh.borrow_mut();
+        for i in 0..n {
+            fresh[i] = Some(def_count[i] == 1 && ctor_def[i]);
+        }
+    }
+}
+
+/// Per-body answers of the string-builder recognizers, indexed by MIR local.
+///
+/// Built once when lowering starts. In-range queries are the values
+/// [`is_builder_mode_accumulator`], [`append_accumulator_of_arg_temp`], and
+/// [`append_piece_accumulator_of_arg_temp`] return for this body; an index
+/// past the local list falls back to those functions.
+#[derive(Clone)]
+struct AccumulatorFacts {
+    builder_mode: Vec<bool>,
+    append_accumulator: Vec<Option<usize>>,
+    append_piece_accumulator: Vec<Option<usize>>,
+    has_builder: bool,
+}
+
+impl AccumulatorFacts {
+    fn build(llbc: &Llbc, body: &Unstructured) -> Self {
+        let n = body.locals.locals.len();
+        let cache = ScanCache::new(n);
+        cache.precompute_fresh(body, llbc);
+        let mut builder_mode = vec![false; n];
+        for c in 0..n {
+            let fresh = cache.fresh.borrow()[c] == Some(true);
+            if fresh {
+                builder_mode[c] = is_builder_mode_accumulator(&cache, body, llbc, c);
+            }
+        }
+        let ctor_dests: Vec<usize> = builder_ctor_dest_locals(body, llbc).collect();
+        let mut append_accumulator = vec![None; n];
+        for c in ctor_dests.iter().copied() {
+            let fresh = c < n && cache.fresh.borrow()[c] == Some(true);
+            if !fresh {
+                continue;
+            }
+            let Some(receivers) = clean_accumulator_ref_temps(&cache, body, llbc, c) else {
+                continue;
+            };
+            for rt in receivers {
+                if let Some(slot) = append_accumulator.get_mut(rt)
+                    && slot.is_none()
+                {
+                    *slot = Some(c);
+                }
+            }
+        }
+        let mut append_piece_accumulator = vec![None; n];
+        for c in ctor_dests {
+            if c >= n || !builder_mode[c] {
+                continue;
+            }
+            for block in &body.body {
+                for stmt in &block.statements {
+                    let Ok(StmtKind::Assign(place, Rvalue::Ref { place: source, .. })) =
+                        stmt.stmt_kind_ref()
+                    else {
+                        continue;
+                    };
+                    if matches!(&source.kind, &PlaceKind::Local(i) if i as usize == c)
+                        && let &PlaceKind::Local(direct_borrow) = &place.kind
+                        && let Some(piece) =
+                            append_piece_of_borrow(&cache, body, llbc, direct_borrow as usize)
+                        && let Some(slot) = append_piece_accumulator.get_mut(piece)
+                        && slot.is_none()
+                    {
+                        *slot = Some(c);
+                    }
+                }
+            }
+        }
+        let has_builder = graph_has_builder_accumulator(llbc, body, &builder_mode);
+        Self {
+            builder_mode,
+            append_accumulator,
+            append_piece_accumulator,
+            has_builder,
+        }
+    }
+}
+
 /// Whether a builder borrow temp is used exactly once in the selected role of
 /// a recognised append (`accumulator == true` selects the receiver, false the
 /// appended piece) and nowhere else.  A temp that also escapes declines.
 fn ref_temp_is_sole_append_arg(
+    cache: &ScanCache,
     body: &Unstructured,
     llbc: &Llbc,
     rt: usize,
     accumulator: bool,
 ) -> bool {
+    let slot = usize::from(accumulator);
+    if rt < cache.n()
+        && let Some(hit) = cache.sole.borrow()[rt][slot]
+    {
+        return hit;
+    }
     let mut selected = 0usize;
     let mut other = 0usize;
     for bb in &body.body {
         for st in &bb.statements {
-            match st.stmt_kind() {
+            match st.stmt_kind_ref() {
                 Ok(StmtKind::Assign(place, rvalue)) => {
                     let (mut derefs, mut others) = (0usize, 0usize);
-                    scan_rvalue_dest_ref(&rvalue, rt, &mut derefs, &mut others);
+                    scan_rvalue_dest_ref(rvalue, rt, &mut derefs, &mut others);
                     other += derefs + others;
                     // A write through a projection of `rt` (`*rt = v`) reads
                     // `rt`; a bare `rt := ..` def does not.
                     if matches!(&place.kind, PlaceKind::Projection(..))
-                        && place_references_local(&place, rt)
+                        && place_references_local(place, rt)
                     {
                         other += 1;
                     }
@@ -21551,7 +21755,7 @@ fn ref_temp_is_sole_append_arg(
                 _ => {}
             }
         }
-        match bb.term() {
+        match bb.term_ref() {
             Ok(TermKind::Call { call, .. }) => {
                 let selected_idx = match &call.func {
                     CallFunc::Regular(reg) => str_builder_append_args(llbc, reg)
@@ -21574,7 +21778,7 @@ fn ref_temp_is_sole_append_arg(
                 }
             }
             Ok(TermKind::Switch { discr, .. }) => {
-                if operand_reads_local(&discr, rt) {
+                if operand_reads_local(discr, rt) {
                     other += 1;
                 }
             }
@@ -21586,7 +21790,11 @@ fn ref_temp_is_sole_append_arg(
             _ => {}
         }
     }
-    selected == 1 && other == 0
+    let result = selected == 1 && other == 0;
+    if rt < cache.n() {
+        cache.sole.borrow_mut()[rt][slot] = Some(result);
+    }
+    result
 }
 
 /// Given a single-def `Wtf8Buf::new` / `with_capacity` accumulator local
@@ -21601,24 +21809,47 @@ fn ref_temp_is_sole_append_arg(
 /// temps are the call-argument locals the append arm resolves against
 /// ([`append_accumulator_of_arg_temp`]), which for a reborrowed `&mut` argument
 /// is the reborrow, not the direct borrow.
-fn clean_accumulator_ref_temps(body: &Unstructured, llbc: &Llbc, c: usize) -> Option<Vec<usize>> {
+fn clean_accumulator_ref_temps(
+    cache: &ScanCache,
+    body: &Unstructured,
+    llbc: &Llbc,
+    c: usize,
+) -> Option<Vec<usize>> {
+    if c < cache.n()
+        && let Some(hit) = cache.clean.borrow()[c].clone()
+    {
+        return hit;
+    }
+    let result = clean_accumulator_ref_temps_scan(cache, body, llbc, c);
+    if c < cache.n() {
+        cache.clean.borrow_mut()[c] = Some(result.clone());
+    }
+    result
+}
+
+fn clean_accumulator_ref_temps_scan(
+    cache: &ScanCache,
+    body: &Unstructured,
+    llbc: &Llbc,
+    c: usize,
+) -> Option<Vec<usize>> {
     let mut ref_temps: Vec<usize> = Vec::new();
     for bb in &body.body {
         for st in &bb.statements {
-            match st.stmt_kind() {
+            match st.stmt_kind_ref() {
                 Ok(StmtKind::Assign(place, rvalue)) => {
                     // A write into `c`'s storage through a projection
                     // (`*c = ..` / `c.field = ..`) mutates the buffer
                     // out-of-band.
                     if matches!(&place.kind, PlaceKind::Projection(..))
-                        && place_references_local(&place, c)
+                        && place_references_local(place, c)
                     {
                         return None;
                     }
-                    match &rvalue {
+                    match rvalue {
                         Rvalue::Ref { place: rp, .. } | Rvalue::RawPtr { place: rp, .. } => {
-                            if matches!(rp.kind, PlaceKind::Local(i) if i as usize == c) {
-                                let PlaceKind::Local(r) = place.kind else {
+                            if matches!(&rp.kind, &PlaceKind::Local(i) if i as usize == c) {
+                                let &PlaceKind::Local(r) = &place.kind else {
                                     return None; // borrow assigned into a projection
                                 };
                                 ref_temps.push(r as usize);
@@ -21667,7 +21898,7 @@ fn clean_accumulator_ref_temps(body: &Unstructured, llbc: &Llbc, c: usize) -> Op
                 Err(_) => return None,
             }
         }
-        match bb.term() {
+        match bb.term_ref() {
             Ok(TermKind::Call { call, .. }) => {
                 if let CallFunc::Dynamic(op) = &call.func
                     && c_operand_kind(op, c).is_some()
@@ -21685,7 +21916,7 @@ fn clean_accumulator_ref_temps(body: &Unstructured, llbc: &Llbc, c: usize) -> Op
                 }
             }
             Ok(TermKind::Switch { discr, .. }) => {
-                if c_operand_kind(&discr, c).is_some() {
+                if c_operand_kind(discr, c).is_some() {
                     return None;
                 }
             }
@@ -21699,9 +21930,9 @@ fn clean_accumulator_ref_temps(body: &Unstructured, llbc: &Llbc, c: usize) -> Op
     }
     let mut receivers = Vec::with_capacity(ref_temps.len());
     for &rt in &ref_temps {
-        if let Some(receiver) = append_receiver_of_borrow(body, llbc, rt) {
+        if let Some(receiver) = append_receiver_of_borrow(cache, body, llbc, rt) {
             receivers.push(receiver);
-        } else if append_piece_of_borrow(body, llbc, rt).is_none() {
+        } else if append_piece_of_borrow(cache, body, llbc, rt).is_none() {
             return None;
         }
     }
@@ -21718,8 +21949,13 @@ fn clean_accumulator_ref_temps(body: &Unstructured, llbc: &Llbc, c: usize) -> Op
 /// is that single reborrow and `recv` is itself a sole append receiver.  The
 /// returned temp is the call's accumulator-argument local the append arm
 /// resolves against ([`append_accumulator_of_arg_temp`]).
-fn append_receiver_of_borrow(body: &Unstructured, llbc: &Llbc, rt: usize) -> Option<usize> {
-    append_arg_of_borrow(body, llbc, rt, true)
+fn append_receiver_of_borrow(
+    cache: &ScanCache,
+    body: &Unstructured,
+    llbc: &Llbc,
+    rt: usize,
+) -> Option<usize> {
+    append_arg_of_borrow(cache, body, llbc, rt, true)
 }
 
 /// [`append_receiver_of_borrow`]'s twin for the appended PIECE: walk the
@@ -21732,15 +21968,31 @@ fn append_receiver_of_borrow(body: &Unstructured, llbc: &Llbc, rt: usize) -> Opt
 /// real LLBC produces (`&Wtf8Buf` -> `&Wtf8` -> `&str` is three), and a
 /// chain longer than that simply declines the builder lift and leaves the
 /// residual — the same fail-safe every recognizer in this file takes.
-fn append_piece_of_borrow(body: &Unstructured, llbc: &Llbc, rt: usize) -> Option<usize> {
-    let mut current = rt;
-    for _ in 0..ALIAS_WALK_HOPS {
-        if ref_temp_is_sole_append_arg(body, llbc, current, false) {
-            return Some(current);
-        }
-        current = sole_string_alias_successor(body, llbc, current)?;
+fn append_piece_of_borrow(
+    cache: &ScanCache,
+    body: &Unstructured,
+    llbc: &Llbc,
+    rt: usize,
+) -> Option<usize> {
+    if rt < cache.n()
+        && let Some(hit) = cache.piece.borrow()[rt]
+    {
+        return hit;
     }
-    None
+    let result = (|| {
+        let mut current = rt;
+        for _ in 0..ALIAS_WALK_HOPS {
+            if ref_temp_is_sole_append_arg(cache, body, llbc, current, false) {
+                return Some(current);
+            }
+            current = sole_string_alias_successor(cache, body, llbc, current)?;
+        }
+        None
+    })();
+    if rt < cache.n() {
+        cache.piece.borrow_mut()[rt] = Some(result);
+    }
+    result
 }
 
 /// Hop budget for a reference/coercion alias walk over MIR temps.  See
@@ -21750,7 +22002,29 @@ const ALIAS_WALK_HOPS: usize = 8;
 /// Follow one Rust reference/coercion shell which the lowered string value
 /// model aliases away: an immediate reborrow, or `Deref::deref` between two
 /// string-family types.  The source temp must have exactly this one use.
-fn sole_string_alias_successor(body: &Unstructured, llbc: &Llbc, source: usize) -> Option<usize> {
+fn sole_string_alias_successor(
+    cache: &ScanCache,
+    body: &Unstructured,
+    llbc: &Llbc,
+    source: usize,
+) -> Option<usize> {
+    if source < cache.n()
+        && let Some(hit) = cache.alias.borrow()[source]
+    {
+        return hit;
+    }
+    let result = sole_string_alias_successor_scan(body, llbc, source);
+    if source < cache.n() {
+        cache.alias.borrow_mut()[source] = Some(result);
+    }
+    result
+}
+
+fn sole_string_alias_successor_scan(
+    body: &Unstructured,
+    llbc: &Llbc,
+    source: usize,
+) -> Option<usize> {
     fn record(slot: &mut Option<usize>, other: &mut usize, candidate: usize) {
         if slot.replace(candidate).is_some() {
             *other += 1;
@@ -21760,13 +22034,13 @@ fn sole_string_alias_successor(body: &Unstructured, llbc: &Llbc, source: usize) 
     let mut other = 0usize;
     for block in &body.body {
         for stmt in &block.statements {
-            match stmt.stmt_kind() {
+            match stmt.stmt_kind_ref() {
                 Ok(StmtKind::Assign(place, rvalue)) => {
                     if let Rvalue::Ref { place: inner, .. } | Rvalue::RawPtr { place: inner, .. } =
-                        &rvalue
+                        rvalue
                         && place_is_immediate_deref_of(inner, source)
                     {
-                        if let PlaceKind::Local(dest) = place.kind {
+                        if let &PlaceKind::Local(dest) = &place.kind {
                             record(&mut successor, &mut other, dest as usize);
                         } else {
                             other += 1;
@@ -21774,10 +22048,10 @@ fn sole_string_alias_successor(body: &Unstructured, llbc: &Llbc, source: usize) 
                         continue;
                     }
                     let (mut derefs, mut others) = (0usize, 0usize);
-                    scan_rvalue_dest_ref(&rvalue, source, &mut derefs, &mut others);
+                    scan_rvalue_dest_ref(rvalue, source, &mut derefs, &mut others);
                     other += derefs + others;
                     if matches!(&place.kind, PlaceKind::Projection(..))
-                        && place_references_local(&place, source)
+                        && place_references_local(place, source)
                     {
                         other += 1;
                     }
@@ -21788,7 +22062,7 @@ fn sole_string_alias_successor(body: &Unstructured, llbc: &Llbc, source: usize) 
                 _ => {}
             }
         }
-        match block.term() {
+        match block.term_ref() {
             Ok(TermKind::Call { call, .. }) => {
                 let reads = call
                     .args
@@ -21804,7 +22078,7 @@ fn sole_string_alias_successor(body: &Unstructured, llbc: &Llbc, source: usize) 
                     false
                 };
                 if string_deref {
-                    if let PlaceKind::Local(dest) = call.dest.kind {
+                    if let &PlaceKind::Local(dest) = &call.dest.kind {
                         record(&mut successor, &mut other, dest as usize);
                     } else {
                         other += 1;
@@ -21817,7 +22091,7 @@ fn sole_string_alias_successor(body: &Unstructured, llbc: &Llbc, source: usize) 
                 }
             }
             Ok(TermKind::Switch { discr, .. }) => {
-                other += usize::from(operand_reads_local(&discr, source));
+                other += usize::from(operand_reads_local(discr, source));
             }
             Ok(TermKind::Assert { assert, .. }) => {
                 other += usize::from(operand_reads_local(&assert.cond, source));
@@ -21833,12 +22107,34 @@ fn sole_string_alias_successor(body: &Unstructured, llbc: &Llbc, source: usize) 
 /// selected append argument, else the single temp that borrows it and is.
 /// More than one such borrower is ambiguous and declines.
 fn append_arg_of_borrow(
+    cache: &ScanCache,
     body: &Unstructured,
     llbc: &Llbc,
     rt: usize,
     accumulator: bool,
 ) -> Option<usize> {
-    let is_selected = |candidate| ref_temp_is_sole_append_arg(body, llbc, candidate, accumulator);
+    let slot = usize::from(accumulator);
+    if rt < cache.n()
+        && let Some(hit) = cache.arg_of.borrow()[rt][slot]
+    {
+        return hit;
+    }
+    let result = append_arg_of_borrow_scan(cache, body, llbc, rt, accumulator);
+    if rt < cache.n() {
+        cache.arg_of.borrow_mut()[rt][slot] = Some(result);
+    }
+    result
+}
+
+fn append_arg_of_borrow_scan(
+    cache: &ScanCache,
+    body: &Unstructured,
+    llbc: &Llbc,
+    rt: usize,
+    accumulator: bool,
+) -> Option<usize> {
+    let is_selected =
+        |candidate| ref_temp_is_sole_append_arg(cache, body, llbc, candidate, accumulator);
     if is_selected(rt) {
         return Some(rt);
     }
@@ -21846,13 +22142,12 @@ fn append_arg_of_borrow(
     let mut other = 0usize;
     for bb in &body.body {
         for st in &bb.statements {
-            match st.stmt_kind() {
+            match st.stmt_kind_ref() {
                 Ok(StmtKind::Assign(place, rvalue)) => {
-                    if let Rvalue::Ref { place: rp, .. } | Rvalue::RawPtr { place: rp, .. } =
-                        &rvalue
+                    if let Rvalue::Ref { place: rp, .. } | Rvalue::RawPtr { place: rp, .. } = rvalue
                         && place_is_immediate_deref_of(rp, rt)
                     {
-                        let PlaceKind::Local(r) = place.kind else {
+                        let &PlaceKind::Local(r) = &place.kind else {
                             return None; // reborrow assigned into a projection
                         };
                         if recv.replace(r as usize).is_some() {
@@ -21861,10 +22156,10 @@ fn append_arg_of_borrow(
                         continue;
                     }
                     let (mut derefs, mut others) = (0usize, 0usize);
-                    scan_rvalue_dest_ref(&rvalue, rt, &mut derefs, &mut others);
+                    scan_rvalue_dest_ref(rvalue, rt, &mut derefs, &mut others);
                     other += derefs + others;
                     if matches!(&place.kind, PlaceKind::Projection(..))
-                        && place_references_local(&place, rt)
+                        && place_references_local(place, rt)
                     {
                         other += 1;
                     }
@@ -21879,7 +22174,7 @@ fn append_arg_of_borrow(
         }
         // `rt` is consumed by the reborrow statement; it must not reach any
         // terminator (the append call receives `recv`, not `rt`).
-        match bb.term() {
+        match bb.term_ref() {
             Ok(TermKind::Call { call, .. }) => {
                 if let CallFunc::Dynamic(op) = &call.func
                     && operand_reads_local(op, rt)
@@ -21891,7 +22186,7 @@ fn append_arg_of_borrow(
                 }
             }
             Ok(TermKind::Switch { discr, .. }) => {
-                if operand_reads_local(&discr, rt) {
+                if operand_reads_local(discr, rt) {
                     other += 1;
                 }
             }
@@ -21914,7 +22209,12 @@ fn append_arg_of_borrow(
 /// exactly one def and that def is an [`is_str_builder_ctor`] call.  A local
 /// with a second def, or one defined by a non-ctor rvalue, is not a fresh
 /// accumulator and keeps its residual.
-fn is_fresh_str_builder(body: &Unstructured, llbc: &Llbc, c: usize) -> bool {
+fn is_fresh_str_builder(cache: &ScanCache, body: &Unstructured, llbc: &Llbc, c: usize) -> bool {
+    if c < cache.n()
+        && let Some(hit) = cache.fresh.borrow()[c]
+    {
+        return hit;
+    }
     let mut def_count = 0usize;
     let mut ctor_def = false;
     for bb in &body.body {
@@ -21932,7 +22232,11 @@ fn is_fresh_str_builder(body: &Unstructured, llbc: &Llbc, c: usize) -> bool {
             ctor_def = is_str_builder_ctor(wtf8buf_method_leaf(llbc, &call));
         }
     }
-    def_count == 1 && ctor_def
+    let result = def_count == 1 && ctor_def;
+    if c < cache.n() {
+        cache.fresh.borrow_mut()[c] = Some(result);
+    }
+    result
 }
 
 /// Resolve the accumulator local a recognised append rebinds, given the MIR
@@ -21941,9 +22245,9 @@ fn is_fresh_str_builder(body: &Unstructured, llbc: &Llbc, c: usize) -> bool {
 /// borrows the accumulator directly (method autoref) or through a single
 /// two-phase reborrow; the owning `buf` is the [`is_str_builder_ctor`] local
 /// whose every borrow feeds such an append and whose append-receiver set
-/// ([`clean_accumulator_ref_temps`]) contains `rt`.  Resolved on demand from
-/// the MIR body, so the recognizer keeps no per-local side table; the append
-/// call-lowering arm then rebinds `buf`'s slot to `ll_strconcat(buf, piece)`.
+/// ([`clean_accumulator_ref_temps`]) contains `rt`.  Lowering records the
+/// answer for every local once per body; the append arm reads that table
+/// and rebinds `buf`'s slot to `ll_strconcat(buf, piece)`.
 fn append_accumulator_of_arg_temp(body: &Unstructured, llbc: &Llbc, rt: usize) -> Option<usize> {
     // Only an [`is_str_builder_ctor`] dest can pass [`is_fresh_str_builder`]
     // ([`builder_ctor_dest_locals`], which already excludes locals 0 / the
@@ -21951,9 +22255,14 @@ fn append_accumulator_of_arg_temp(body: &Unstructured, llbc: &Llbc, rt: usize) -
     // accumulator's receiver set contains `rt`; check those candidates instead
     // of every local — dropping the `n_locals` factor — and first-match order
     // is therefore irrelevant.
+    //
+    // Call lowering reads the per-body [`AccumulatorFacts`] table. This scan
+    // remains for an index outside that table.
+    let cache = ScanCache::new(body.locals.locals.len());
+    cache.precompute_fresh(body, llbc);
     builder_ctor_dest_locals(body, llbc).find(|&c| {
-        is_fresh_str_builder(body, llbc, c)
-            && clean_accumulator_ref_temps(body, llbc, c)
+        is_fresh_str_builder(&cache, body, llbc, c)
+            && clean_accumulator_ref_temps(&cache, body, llbc, c)
                 .is_some_and(|receivers| receivers.contains(&rt))
     })
 }
@@ -21962,13 +22271,18 @@ fn append_accumulator_of_arg_temp(body: &Unstructured, llbc: &Llbc, rt: usize) -
 /// inner builder it borrows.  Membership is proven from the MIR definition of
 /// `rt` and the same single-use append-piece test accepted by
 /// [`clean_accumulator_ref_temps`].
+///
+/// Call lowering reads the per-body [`AccumulatorFacts`] table. This scan
+/// remains for an index outside that table.
 fn append_piece_accumulator_of_arg_temp(
     body: &Unstructured,
     llbc: &Llbc,
     rt: usize,
 ) -> Option<usize> {
+    let cache = ScanCache::new(body.locals.locals.len());
+    cache.precompute_fresh(body, llbc);
     for candidate in builder_ctor_dest_locals(body, llbc) {
-        if !is_builder_mode_accumulator(body, llbc, candidate) {
+        if !is_builder_mode_accumulator(&cache, body, llbc, candidate) {
             continue;
         }
         for block in &body.body {
@@ -21980,7 +22294,8 @@ fn append_piece_accumulator_of_arg_temp(
                 };
                 if matches!(source.kind, PlaceKind::Local(i) if i as usize == candidate)
                     && let PlaceKind::Local(direct_borrow) = place.kind
-                    && append_piece_of_borrow(body, llbc, direct_borrow as usize) == Some(rt)
+                    && append_piece_of_borrow(&cache, body, llbc, direct_borrow as usize)
+                        == Some(rt)
                 {
                     return Some(candidate);
                 }
@@ -21997,21 +22312,31 @@ fn append_piece_accumulator_of_arg_temp(
 /// must run `ll_build`.  Counted so the builder lift only fires when the build
 /// point is unambiguous (see [`is_builder_mode_accumulator`]).
 #[allow(dead_code)] // wired into the ctor/append/terminal arms in this change
-fn accumulator_materialization_site_count(body: &Unstructured, llbc: &Llbc, c: usize) -> usize {
+fn accumulator_materialization_site_count(
+    cache: &ScanCache,
+    body: &Unstructured,
+    llbc: &Llbc,
+    c: usize,
+) -> usize {
+    if c < cache.n()
+        && let Some(hit) = cache.material.borrow()[c]
+    {
+        return hit;
+    }
     let is_move = |op: &Operand| c_operand_kind(op, c) == Some(true);
     let mut moves = 0usize;
     for bb in &body.body {
         for st in &bb.statements {
-            if let Ok(StmtKind::Assign(_, rvalue)) = st.stmt_kind() {
-                if let Rvalue::Ref { place: source, .. } = &rvalue
-                    && matches!(source.kind, PlaceKind::Local(i) if i as usize == c)
-                    && let Ok(StmtKind::Assign(place, _)) = st.stmt_kind()
-                    && let PlaceKind::Local(rt) = place.kind
-                    && append_piece_of_borrow(body, llbc, rt as usize).is_some()
+            if let Ok(StmtKind::Assign(_, rvalue)) = st.stmt_kind_ref() {
+                if let Rvalue::Ref { place: source, .. } = rvalue
+                    && matches!(&source.kind, &PlaceKind::Local(i) if i as usize == c)
+                    && let Ok(StmtKind::Assign(place, _)) = st.stmt_kind_ref()
+                    && let &PlaceKind::Local(rt) = &place.kind
+                    && append_piece_of_borrow(cache, body, llbc, rt as usize).is_some()
                 {
                     moves += 1;
                 }
-                match &rvalue {
+                match rvalue {
                     Rvalue::Use(op)
                     | Rvalue::UnaryOp(_, op)
                     | Rvalue::Cast(_, op, _)
@@ -22035,13 +22360,16 @@ fn accumulator_materialization_site_count(body: &Unstructured, llbc: &Llbc, c: u
                 }
             }
         }
-        if let Ok(TermKind::Call { call, .. }) = bb.term() {
+        if let Ok(TermKind::Call { call, .. }) = bb.term_ref() {
             for a in &call.args {
                 if is_move(a) {
                     moves += 1;
                 }
             }
         }
+    }
+    if c < cache.n() {
+        cache.material.borrow_mut()[c] = Some(moves);
     }
     moves
 }
@@ -22058,13 +22386,27 @@ fn accumulator_materialization_site_count(body: &Unstructured, llbc: &Llbc, c: u
 ///
 /// Zero or several terminal moves keep the `ll_strconcat` fallback so the
 /// builder rewrite only fires where the ctor, the appends, and the one build
-/// point are all unambiguous.  Resolved on demand from `body`, so the
-/// recognizer keeps no per-local side table.
+/// point are all unambiguous.  Lowering records the answer for every local
+/// once per body; emit sites read that table.
 #[allow(dead_code)] // wired into the ctor/append/terminal arms in this change
-fn is_builder_mode_accumulator(body: &Unstructured, llbc: &Llbc, c: usize) -> bool {
-    is_fresh_str_builder(body, llbc, c)
-        && clean_accumulator_ref_temps(body, llbc, c).is_some()
-        && accumulator_materialization_site_count(body, llbc, c) == 1
+fn is_builder_mode_accumulator(
+    cache: &ScanCache,
+    body: &Unstructured,
+    llbc: &Llbc,
+    c: usize,
+) -> bool {
+    if c < cache.n()
+        && let Some(hit) = cache.builder.borrow()[c]
+    {
+        return hit;
+    }
+    let result = is_fresh_str_builder(cache, body, llbc, c)
+        && clean_accumulator_ref_temps(cache, body, llbc, c).is_some()
+        && accumulator_materialization_site_count(cache, body, llbc, c) == 1;
+    if c < cache.n() {
+        cache.builder.borrow_mut()[c] = Some(result);
+    }
+    result
 }
 
 /// Whether a statically-resolved [`RegularCall`] is a workspace
@@ -28472,33 +28814,10 @@ fn resolve_trait_assoc_type_value<'a>(
     llbc: &'a Llbc,
 ) -> Option<&'a serde_json::Value> {
     let trait_id = traitref_decl_id(traitref, llbc, 0)?;
-    let mut unique: Option<&serde_json::Value> = None;
-    for ti in llbc.trait_impls_raw() {
-        let Some(impl_trait) = ti.get("impl_trait") else {
-            continue;
-        };
-        if impl_trait.get("id").and_then(serde_json::Value::as_u64) != Some(trait_id) {
-            continue;
-        }
-        if unique.is_some() {
-            return None;
-        }
-        unique = Some(ti);
-    }
-    let entries = unique?.get("types")?.as_array()?;
-    for entry in entries {
-        let Some(kind) = entry
-            .get("kind")
-            .and_then(|k| k.get("TraitType"))
-            .and_then(serde_json::Value::as_array)
-        else {
-            continue;
-        };
-        if kind.len() == 2 && &kind[1] == assoc {
-            return entry.get("skip_binder")?.get("value");
-        }
-    }
-    None
+    // One index per LLBC: the same projection is rendered once per
+    // instantiation, and scanning every impl each time is quadratic in
+    // the crate.
+    llbc.unique_trait_assoc_value(trait_id, assoc)
 }
 
 /// Recover the trait decl id a `TraitRef` names —
@@ -39228,6 +39547,7 @@ mod tests {
             }))
             .unwrap();
             let dont_look_inside = std::collections::HashSet::new();
+            let accum = super::AccumulatorFacts::build(&llbc, &body);
             let lowering = Lowering::new(
                 &llbc,
                 "fixture".into(),
@@ -39236,6 +39556,7 @@ mod tests {
                 &[],
                 None,
                 &dont_look_inside,
+                &accum,
             )
             .unwrap();
             assert_eq!(
@@ -42668,6 +42989,7 @@ mod tests {
         }))
         .unwrap();
         let dont_look_inside = std::collections::HashSet::new();
+        let accum = super::AccumulatorFacts::build(&llbc, &body);
         let lowering = Lowering::new(
             &llbc,
             "fixture".into(),
@@ -42676,6 +42998,7 @@ mod tests {
             &[],
             None,
             &dont_look_inside,
+            &accum,
         )
         .unwrap();
         let payload = serde_json::json!([{"Adt": [0, null]}, 0]);
