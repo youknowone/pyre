@@ -175,6 +175,7 @@ pub fn build_semantic_program_from_llbcs_with_static_addrs(
         None,
         None,
         true,
+        empty_harvested_adt_layouts(),
     )
 }
 
@@ -207,6 +208,7 @@ pub(crate) fn build_semantic_program_from_llbcs_with_static_addrs_module_paths_a
         module_filter.as_ref(),
         None,
         true,
+        empty_harvested_adt_layouts(),
     )
 }
 
@@ -219,6 +221,7 @@ pub(crate) fn build_semantic_program_from_prelinked_llbc(
     static_addrs: crate::HostStaticAddrs<'_>,
     module_paths: &[&str],
     jitdriver_receiver_roots: &[String],
+    harvested: &HarvestedAdtLayouts,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
     let module_filter = normalize_module_filter(module_paths);
     build_semantic_program_from_llbcs_with_static_addrs_filtered(
@@ -228,6 +231,7 @@ pub(crate) fn build_semantic_program_from_prelinked_llbc(
         module_filter.as_ref(),
         None,
         false,
+        harvested,
     )
 }
 
@@ -262,6 +266,7 @@ pub fn build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         module_filter.as_ref(),
         function_filter.as_ref(),
         true,
+        empty_harvested_adt_layouts(),
     )
 }
 
@@ -352,6 +357,7 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
     module_filter: Option<&std::collections::HashSet<String>>,
     function_filter: Option<&std::collections::HashSet<String>>,
     link_scalars: bool,
+    harvested: &HarvestedAdtLayouts,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
     if link_scalars {
         link_transparent_scalar_types(llbcs);
@@ -390,6 +396,9 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
     let mut seen_struct_names = std::collections::HashSet::new();
     let mut seen_trait_names = std::collections::HashSet::new();
     let dedup_key = semantic_function_dedup_key;
+    // Prior crates' layouts, plus each artefact in this batch after it has
+    // been lowered. The first `name_path` wins.
+    let mut layouts = harvested.clone();
     for llbc in llbcs {
         let prog = build_semantic_program_from_llbc_with_static_addrs_filtered(
             llbc,
@@ -397,7 +406,9 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
             jitdriver_receiver_roots,
             module_filter,
             function_filter,
+            &layouts,
         )?;
+        harvest_transparent_adt_layouts(llbc, &mut layouts);
         absorb_semantic_program(
             &mut merged,
             prog,
@@ -841,6 +852,7 @@ pub fn build_semantic_program_from_llbc_with_static_addrs(
         &jitdriver_receiver_roots,
         None,
         None,
+        empty_harvested_adt_layouts(),
     )
 }
 
@@ -947,6 +959,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     jitdriver_receiver_roots: &[String],
     module_filter: Option<&std::collections::HashSet<String>>,
     function_filter: Option<&std::collections::HashSet<String>>,
+    adt_layouts: &HarvestedAdtLayouts,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
     // ── Pass 1: walk type_decls + trait_decls ─────────────────────
     let (
@@ -1130,6 +1143,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             &dont_look_inside,
             builder_mode,
             &accum,
+            adt_layouts,
         ) {
             Ok(g) => g,
             Err(e) => {
@@ -2625,6 +2639,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         &dont_look_inside,
         builder_mode,
         &accum,
+        empty_harvested_adt_layouts(),
     )
 }
 
@@ -2686,6 +2701,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     // qualifying functions have one canonical marker-emitting graph.
     builder_mode: bool,
     accum: &AccumulatorFacts,
+    harvested: &HarvestedAdtLayouts,
 ) -> Result<FunctionGraph, LowerError> {
     let name = fd.item_meta.name_path();
     // The Result-of-PyError exception-link lowering's callee rule
@@ -3330,6 +3346,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             fd.generics.as_ref(),
             dont_look_inside,
             accum,
+            harvested,
         )?;
         if builder_mode {
             lo.enable_builder_mode();
@@ -3374,6 +3391,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         fd.generics.as_ref(),
         dont_look_inside,
         accum,
+        harvested,
     )?;
     if builder_mode {
         lo.enable_builder_mode();
@@ -3404,6 +3422,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 fd.generics.as_ref(),
                 dont_look_inside,
                 accum,
+                harvested,
             )?;
             if builder_mode {
                 lo.enable_builder_mode();
@@ -4360,6 +4379,9 @@ struct Lowering<'a> {
     /// hint for a callee in this set so it routes as a `FunctionPath` the
     /// registry resolves to the same residual fnaddr.
     dont_look_inside: &'a std::collections::HashSet<String>,
+    /// Layouts of ADTs that are `Opaque` in this artefact, harvested from
+    /// the crates that define them. The multi-crate loop owns the map.
+    harvested: &'a HarvestedAdtLayouts,
     body: &'a Unstructured,
     static_addrs: crate::HostStaticAddrs<'a>,
     /// Configured receiver-type paths whose marker methods identify a
@@ -4701,6 +4723,7 @@ impl<'a> Lowering<'a> {
         generics: Option<&serde_json::Value>,
         dont_look_inside: &'a std::collections::HashSet<String>,
         accum: &AccumulatorFacts,
+        harvested: &'a HarvestedAdtLayouts,
     ) -> Result<Self, LowerError> {
         let mut graph = FunctionGraph::new(name);
         let n_locals = body.locals.locals.len();
@@ -4740,7 +4763,7 @@ impl<'a> Lowering<'a> {
             // (mirrors the `parse.rs` arg-binding path).
             graph.name_value_var(&var, name.clone());
             *slot = Some(var.clone());
-            let ty = tyref_to_value_type(&local.ty, llbc);
+            let ty = tyref_to_value_type_with(&local.ty, llbc, harvested);
             // A parameter with no runtime representation (`Arg<T>`'s
             // `PhantomData` marker is the case in point — rustc gives it no
             // ABI slot) has to read as `Void` here, matching upstream's
@@ -4936,6 +4959,7 @@ impl<'a> Lowering<'a> {
             graph,
             llbc,
             dont_look_inside,
+            harvested,
             body,
             static_addrs,
             jitdriver_receiver_roots,
@@ -6075,7 +6099,7 @@ impl<'a> Lowering<'a> {
         // poolable `ConstPtr`, so they fall through to the materialised
         // path.
         match (
-            tyref_to_value_type(dest_ty, self.llbc),
+            tyref_to_value_type_with(dest_ty, self.llbc, self.harvested),
             decode_constant(self.llbc, value).ok()?,
         ) {
             (ValueType::Int, DecodedConst::Int(n)) => Some(ConstValue::Int(n)),
@@ -6158,7 +6182,7 @@ impl<'a> Lowering<'a> {
                     base,
                     field: FieldDescriptor::new(flat_name, Some(owner)).with_owner_id(owner_id),
                     value,
-                    ty: tyref_to_value_type(dest_ty, self.llbc),
+                    ty: tyref_to_value_type_with(dest_ty, self.llbc, self.harvested),
                 },
             });
             return Ok(());
@@ -6359,7 +6383,7 @@ impl<'a> Lowering<'a> {
                                 FieldDescriptor::new(field_name, Some(owner_root))
                                     .with_owner_id(owner_id)
                                     .with_base_is_deref(base_is_deref),
-                                tyref_to_value_type(dest_ty, self.llbc),
+                                tyref_to_value_type_with(dest_ty, self.llbc, self.harvested),
                             )
                         }
                         None => (
@@ -6379,7 +6403,7 @@ impl<'a> Lowering<'a> {
                         base,
                         index: idx_var,
                         value: value.clone(),
-                        item_ty: tyref_to_value_type(dest_ty, self.llbc),
+                        item_ty: tyref_to_value_type_with(dest_ty, self.llbc, self.harvested),
                         array_type_id: projection_array_type_id,
                         nolength: projection_array_nolength,
                     }
@@ -6529,8 +6553,10 @@ impl<'a> Lowering<'a> {
                 // type before choosing the annotation shell: in particular,
                 // a `usize` subtraction is an unsigned/non-negative value by
                 // type, even though its MIR destination is a tuple.
-                let scalar_ty = tyref_checked_binop_value_type(dest_ty, self.llbc)
-                    .unwrap_or_else(|| tyref_to_value_type(dest_ty, self.llbc));
+                let scalar_ty =
+                    tyref_checked_binop_value_type(dest_ty, self.llbc).unwrap_or_else(|| {
+                        tyref_to_value_type_with(dest_ty, self.llbc, self.harvested)
+                    });
                 let result_ty = match scalar_ty {
                     ValueType::Float => ValueType::Float,
                     ValueType::Unsigned => ValueType::Unsigned,
@@ -6641,7 +6667,7 @@ impl<'a> Lowering<'a> {
                     let src_kind = self.operand_value_kind(&operand);
                     let src_root = self.operand_class_root(&operand);
                     let arg = self.resolve_operand(mir_bb, operand)?;
-                    let dst_kind = tyref_to_value_type(dest_ty, self.llbc);
+                    let dst_kind = tyref_to_value_type_with(dest_ty, self.llbc, self.harvested);
                     // The Rust-only current-address adapter is erased as a
                     // whole GCREF identity.  Its `ptr -> usize -> ptr`
                     // round-trip exists only to call the host GC query; once
@@ -6824,7 +6850,7 @@ impl<'a> Lowering<'a> {
                 // The latter match RPython's LONG_TYPE/ULONG_TYPE carrier
                 // through annotation/rtyping even though the JIT codewriter
                 // deliberately has no 128-bit register kind.
-                let result_ty = match tyref_to_value_type(dest_ty, self.llbc) {
+                let result_ty = match tyref_to_value_type_with(dest_ty, self.llbc, self.harvested) {
                     ValueType::Float => ValueType::Float,
                     ValueType::Unsigned => ValueType::Unsigned,
                     ValueType::Int128 => ValueType::Int128,
@@ -7588,9 +7614,11 @@ impl<'a> Lowering<'a> {
     /// type here; a const-source cast aliases its operand).
     fn operand_value_kind(&self, op: &Operand) -> Option<ValueType> {
         match op {
-            Operand::Copy(place) | Operand::Move(place) => {
-                Some(tyref_to_value_type(&place.ty, self.llbc))
-            }
+            Operand::Copy(place) | Operand::Move(place) => Some(tyref_to_value_type_with(
+                &place.ty,
+                self.llbc,
+                self.harvested,
+            )),
             Operand::Const(_) => None,
         }
     }
@@ -7640,7 +7668,10 @@ impl<'a> Lowering<'a> {
         arg: &Variable,
     ) -> Option<(OpKind, Variable)> {
         if !matches!(src_kind, Some(ValueType::Ref(_)))
-            || !matches!(tyref_to_value_type(dest_ty, self.llbc), ValueType::Ref(_))
+            || !matches!(
+                tyref_to_value_type_with(dest_ty, self.llbc, self.harvested),
+                ValueType::Ref(_)
+            )
         {
             return None;
         }
@@ -7972,7 +8003,8 @@ impl<'a> Lowering<'a> {
                     // read off the container before the base resolve
                     // consumes `inner`.  It selects the payload projection
                     // below.
-                    let container_is_enum = tyref_is_enum_free(&inner.ty, self.llbc);
+                    let container_is_enum =
+                        tyref_is_enum_free(&inner.ty, self.llbc, self.harvested);
                     // A closure env is identified from the type decl's
                     // `src: Closure` origin, not from the `closure` name
                     // leaf.  Needed before `resolve_place` consumes `inner`.
@@ -8081,7 +8113,7 @@ impl<'a> Lowering<'a> {
                             item_ty: if string_array_view {
                                 ValueType::Str
                             } else {
-                                tyref_to_value_type(&place_ty, self.llbc)
+                                tyref_to_value_type_with(&place_ty, self.llbc, self.harvested)
                             },
                             array_type_id,
                             nolength,
@@ -8120,7 +8152,7 @@ impl<'a> Lowering<'a> {
                     // `.0` read back to feed the `match` switch, so a blanket
                     // `Ref` here types that switch value as a pointer and
                     // `flatten.py assert kind == 'int'` rejects the graph.
-                    let ty = tyref_to_value_type(&place_ty, self.llbc);
+                    let ty = tyref_to_value_type_with(&place_ty, self.llbc, self.harvested);
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -8214,7 +8246,7 @@ impl<'a> Lowering<'a> {
                         } else {
                             base
                         };
-                        let ty = tyref_to_value_type(&place_ty, self.llbc);
+                        let ty = tyref_to_value_type_with(&place_ty, self.llbc, self.harvested);
                         let res = self
                             .graph
                             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -8418,7 +8450,7 @@ impl<'a> Lowering<'a> {
                     OpKind::Call {
                         target: CallTarget::function_path(segments),
                         args: crate::model::call_args(vec![]),
-                        result_ty: tyref_to_value_type(&place_ty, self.llbc),
+                        result_ty: tyref_to_value_type_with(&place_ty, self.llbc, self.harvested),
                     }
                 });
                 let res = self
@@ -8555,13 +8587,25 @@ impl<'a> Lowering<'a> {
         };
         let variant_idx = adt.get(1).and_then(serde_json::Value::as_u64)? as usize;
         let td = self.llbc.type_by_id(type_id)?;
-        let TypeDeclKind::Enum(variants) = &td.kind else {
-            return None;
-        };
-        if !type_decl_is_fieldless_enum(td, self.llbc) {
-            return None;
+        match &td.kind {
+            TypeDeclKind::Enum(variants) => {
+                if !type_decl_is_fieldless_enum(td, self.llbc) {
+                    return None;
+                }
+                variants.get(variant_idx)?.discriminant_i64()
+            }
+            TypeDeclKind::Opaque => {
+                let HarvestedAdt::Enum {
+                    variants,
+                    fieldless: true,
+                } = self.harvested.get(&td.item_meta.name_path())?
+                else {
+                    return None;
+                };
+                variants.get(variant_idx)?.discriminant
+            }
+            _ => None,
         }
-        variants.get(variant_idx)?.discriminant_i64()
     }
 
     /// The trailing `bool` is `true` when the decl is a `TypeDeclKind::Struct`.
@@ -8599,6 +8643,60 @@ impl<'a> Lowering<'a> {
         let variant_idx = adt.get(1).and_then(serde_json::Value::as_u64);
         let td = self.llbc.type_by_id(type_id)?;
         let name_path = td.item_meta.name_path();
+        if matches!(td.kind, TypeDeclKind::Opaque)
+            && let Some(layout) = self.harvested.get(&name_path)
+        {
+            let head_adt = head.as_object();
+            let mut segments: Vec<String> = name_path.split("::").map(str::to_string).collect();
+            let type_leaf = segments.pop().unwrap_or_default();
+            match layout {
+                HarvestedAdt::Struct(fields) => {
+                    let field_rows: Vec<(String, String, Option<TyRef>)> = fields
+                        .iter()
+                        .map(|f| (f.name.clone(), f.ast.clone(), None))
+                        .collect();
+                    let template =
+                        majit_ir::descr::StructId::from_canonical(&strip_crate_prefix(&name_path));
+                    return Some((
+                        segments,
+                        type_leaf,
+                        field_rows,
+                        concrete_adt_struct_id(template, head_adt, self.llbc),
+                        true,
+                        None,
+                    ));
+                }
+                HarvestedAdt::Enum { variants, .. } => {
+                    let idx = variant_idx? as usize;
+                    let v = variants.get(idx)?;
+                    let mut variant_owner = segments;
+                    let leaf =
+                        match head_adt.and_then(|h| adt_head_instantiation_suffix(h, self.llbc)) {
+                            Some(suffix) => format!("{type_leaf}{suffix}"),
+                            None => type_leaf,
+                        };
+                    variant_owner.push(leaf);
+                    let field_rows: Vec<(String, String, Option<TyRef>)> = v
+                        .fields
+                        .iter()
+                        .map(|f| (f.name.clone(), f.ast.clone(), None))
+                        .collect();
+                    let template = majit_ir::descr::StructId::from_canonical(&format!(
+                        "{}::{}",
+                        strip_crate_prefix(&name_path),
+                        v.name
+                    ));
+                    return Some((
+                        variant_owner,
+                        v.name.clone(),
+                        field_rows,
+                        concrete_adt_struct_id(template, head_adt, self.llbc),
+                        false,
+                        Some(idx as i64),
+                    ));
+                }
+            }
+        }
         let head_adt = head.as_object();
         let mut segments: Vec<String> = name_path.split("::").map(str::to_string).collect();
         let type_leaf = segments.pop().unwrap_or_default();
@@ -8852,6 +8950,15 @@ impl<'a> Lowering<'a> {
                 None => owner_leaf,
             }
         };
+        if matches!(td.kind, TypeDeclKind::Opaque) {
+            return self.resolve_harvested_adt_field(
+                &name_path,
+                &owner_root,
+                variant_idx,
+                field_idx,
+                head_adt,
+            );
+        }
         match (&td.kind, variant_idx) {
             (TypeDeclKind::Struct(fields), None) => {
                 let f = fields.get(field_idx)?;
@@ -8889,6 +8996,45 @@ impl<'a> Lowering<'a> {
             }
             _ => None,
         }
+    }
+
+    /// Field projection of an `Opaque` ADT whose layout was harvested from
+    /// the crate that defines it. The field's register class is the one
+    /// recorded there; this artefact has no body to re-derive it from.
+    fn resolve_harvested_adt_field(
+        &self,
+        name_path: &str,
+        owner_root: &str,
+        variant_idx: Option<u64>,
+        field_idx: usize,
+        head_adt: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Option<(String, String, TyRef, Option<majit_ir::descr::StructId>)> {
+        let layout = self.harvested.get(name_path)?;
+        let (owner, field, template_path) = match layout {
+            HarvestedAdt::Struct(fields) => {
+                if variant_idx.is_some() {
+                    return None;
+                }
+                let field = fields.get(field_idx)?;
+                (owner_root.to_string(), field, strip_crate_prefix(name_path))
+            }
+            HarvestedAdt::Enum { variants, .. } => {
+                let variant = variants.get(variant_idx? as usize)?;
+                let field = variant.fields.get(field_idx)?;
+                (
+                    format!("{owner_root}::{}", variant.name),
+                    field,
+                    format!("{}::{}", strip_crate_prefix(name_path), variant.name),
+                )
+            }
+        };
+        let template = majit_ir::descr::StructId::from_canonical(&template_path);
+        Some((
+            owner,
+            field.name.clone(),
+            tyref_for_harvested_bank(&field.bank),
+            Some(concrete_adt_struct_id(template, head_adt, self.llbc)),
+        ))
     }
 
     /// Decode an inline-Field `dyn Trait` call operand into the
@@ -9761,7 +9907,7 @@ impl<'a> Lowering<'a> {
         let result_ty = if is_unit_type(&call.dest.ty, self.llbc) {
             ValueType::Void
         } else {
-            tyref_to_value_type(&call.dest.ty, self.llbc)
+            tyref_to_value_type_with(&call.dest.ty, self.llbc, self.harvested)
         };
         // A typed `Ref(Some(root))` already carries the intern key
         // (`tyref_to_value_type` paints a payload-carrying enum this way).
@@ -10845,7 +10991,11 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::ArrayRead {
                             base: items,
                             index: args[1].clone(),
-                            item_ty: tyref_to_value_type(&call.dest.ty, self.llbc),
+                            item_ty: tyref_to_value_type_with(
+                                &call.dest.ty,
+                                self.llbc,
+                                self.harvested,
+                            ),
                             array_type_id: None,
                             nolength: false,
                             pure: false,
@@ -11209,7 +11359,7 @@ impl<'a> Lowering<'a> {
                     let elem_tyref = self.slice_swap_elem_tyref(&reg);
                     let elem_ty = elem_tyref
                         .as_ref()
-                        .map(|ty| tyref_to_value_type(ty, self.llbc))
+                        .map(|ty| tyref_to_value_type_with(ty, self.llbc, self.harvested))
                         .unwrap_or(ValueType::Ref(None));
                     let elem_array_type_id = elem_tyref
                         .as_ref()
@@ -11445,7 +11595,8 @@ impl<'a> Lowering<'a> {
                     // blocks at the annotator.  The receiver is already a
                     // raw pointer (`is_ptr_identity_cast`), so this is a
                     // genuine `cast_pointer` (ptr→ptr).
-                    if let ValueType::Ref(_) = tyref_to_value_type(&call.dest.ty, self.llbc)
+                    if let ValueType::Ref(_) =
+                        tyref_to_value_type_with(&call.dest.ty, self.llbc, self.harvested)
                         && let Some(root) = tyref_class_root(&call.dest.ty, self.llbc)
                     {
                         let res = self
@@ -11849,8 +12000,8 @@ impl<'a> Lowering<'a> {
                     let path = fd.item_meta.name_path();
                     let src = first_arg_ty
                         .as_ref()
-                        .map(|ty| tyref_to_value_type(ty, self.llbc));
-                    let dst = tyref_to_value_type(&call.dest.ty, self.llbc);
+                        .map(|ty| tyref_to_value_type_with(ty, self.llbc, self.harvested));
+                    let dst = tyref_to_value_type_with(&call.dest.ty, self.llbc, self.harvested);
                     if let Some(to_float) = host_longlong2float_llop(&path, src.as_ref(), &dst) {
                         return self.emit_float_bytes_llop(
                             mir_bb,
@@ -13358,7 +13509,7 @@ impl<'a> Lowering<'a> {
                 .is_some_and(|t| tyref_is_rbigint(t, self.llbc))
             && second_arg_ty.as_ref().is_some_and(|t| {
                 matches!(
-                    tyref_to_value_type(t, self.llbc),
+                    tyref_to_value_type_with(t, self.llbc, self.harvested),
                     ValueType::Int | ValueType::Unsigned
                 )
             })
@@ -13732,9 +13883,10 @@ impl<'a> Lowering<'a> {
                     first_arg_ty
                         .as_ref()
                         .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
-                        && second_arg_ty
-                            .as_ref()
-                            .is_some_and(|ty| tyref_to_value_type(ty, self.llbc) == ValueType::Int)
+                        && second_arg_ty.as_ref().is_some_and(|ty| {
+                            tyref_to_value_type_with(ty, self.llbc, self.harvested)
+                                == ValueType::Int
+                        })
                 }
                 Some(
                     "bigint_lshift_int_int_result"
@@ -13742,12 +13894,11 @@ impl<'a> Lowering<'a> {
                     | "bigint_sub_int_int"
                     | "bigint_mul_int_int",
                 ) => {
-                    first_arg_ty
-                        .as_ref()
-                        .is_some_and(|ty| tyref_to_value_type(ty, self.llbc) == ValueType::Int)
-                        && second_arg_ty
-                            .as_ref()
-                            .is_some_and(|ty| tyref_to_value_type(ty, self.llbc) == ValueType::Int)
+                    first_arg_ty.as_ref().is_some_and(|ty| {
+                        tyref_to_value_type_with(ty, self.llbc, self.harvested) == ValueType::Int
+                    }) && second_arg_ty.as_ref().is_some_and(|ty| {
+                        tyref_to_value_type_with(ty, self.llbc, self.harvested) == ValueType::Int
+                    })
                 }
                 _ => false,
             }
@@ -13926,7 +14077,7 @@ impl<'a> Lowering<'a> {
                         iterator_payload_element(body, self.llbc, iterator_added_a_reference)?;
                     serde_json::from_value::<TyRef>(item.clone()).ok()
                 })
-                .map(|ty| tyref_to_value_type(&ty, self.llbc))
+                .map(|ty| tyref_to_value_type_with(&ty, self.llbc, self.harvested))
                 .unwrap_or(ValueType::Ref(None));
             self.next_call_results.push((result_var.clone(), item_ty));
         }
@@ -13959,13 +14110,14 @@ impl<'a> Lowering<'a> {
                 let item_tyref = self
                     .tyref_adt_type_arg(&iter_ty, 0)
                     .unwrap_or_else(|| clone_tyref(&iter_ty));
-                let payload_ty = tyref_to_value_type(&item_tyref, self.llbc);
+                let payload_ty = tyref_to_value_type_with(&item_tyref, self.llbc, self.harvested);
                 let payload_class_root = enum_payload_instance_class_root(&item_tyref, self.llbc);
                 let args_tuple_suffix = payload_tuple_suffix(&item_tyref, self.llbc);
                 let elem_tyref = self
                     .tyref_adt_type_arg(&call.dest.ty, 0)
                     .unwrap_or_else(|| clone_tyref(&call.dest.ty));
-                let call_result_ty = tyref_to_value_type(&elem_tyref, self.llbc);
+                let call_result_ty =
+                    tyref_to_value_type_with(&elem_tyref, self.llbc, self.harvested);
                 self.map_collect_sites
                     .push(crate::front::iter_adapter::MapCollectSite {
                         result_var: result_var.clone(),
@@ -13986,7 +14138,7 @@ impl<'a> Lowering<'a> {
             .as_ref()
             .and_then(|ty| adt_path_of_tyref(ty, self.llbc));
         let identity_dest = adt_path_of_tyref(&call.dest.ty, self.llbc);
-        let identity_dest_ty = tyref_to_value_type(&call.dest.ty, self.llbc);
+        let identity_dest_ty = tyref_to_value_type_with(&call.dest.ty, self.llbc, self.harvested);
         // A borrow carries no representation of its own here -- `Rvalue::Ref`
         // aliases the place's Variable -- so the receiver's bank is the
         // pointee's.  `Box`/`Ref`/`MutexGuard` still read `Ref` through it
@@ -13995,8 +14147,8 @@ impl<'a> Lowering<'a> {
         // member is a load, not an alias.
         let identity_banks_agree = first_arg_ty.as_ref().is_some_and(|ty| {
             let recv_ty = match self.tyref_peel_ref_to_pointee(ty) {
-                Some(pointee) => tyref_to_value_type(&pointee, self.llbc),
-                None => tyref_to_value_type(ty, self.llbc),
+                Some(pointee) => tyref_to_value_type_with(&pointee, self.llbc, self.harvested),
+                None => tyref_to_value_type_with(ty, self.llbc, self.harvested),
             };
             value_type_bank(&recv_ty) == value_type_bank(&identity_dest_ty)
         });
@@ -15147,7 +15299,7 @@ impl<'a> Lowering<'a> {
         // same RPython getarrayitem operation as `Index::index`: it produces
         // T, not a Rust slot reference.  Read the bank from the call's T
         // generic before looking at the reference-wrapped destination.
-        let item_ty = tyref_to_value_type(&element_ty, self.llbc);
+        let item_ty = tyref_to_value_type_with(&element_ty, self.llbc, self.harvested);
         // An object-pointer slice names its ARRAY; see `slice_object_element`
         // at the `Index::index` arm.
         if json_ty_is_objectptr(element, self.llbc) {
@@ -15917,7 +16069,7 @@ impl<'a> Lowering<'a> {
         let kind = if json_ty_is_thin_pointer_element(node, self.llbc) {
             OpKind::ConstRefNull
         } else {
-            match tyref_to_value_type(dest_ty, self.llbc) {
+            match tyref_to_value_type_with(dest_ty, self.llbc, self.harvested) {
                 ValueType::Int => OpKind::ConstInt(0),
                 ValueType::Unsigned => OpKind::ConstUInt(0),
                 ValueType::Bool => OpKind::ConstBool(false),
@@ -16605,7 +16757,7 @@ impl<'a> Lowering<'a> {
         };
         let register_int = |ty: &TyRef| {
             matches!(
-                tyref_to_value_type(ty, self.llbc),
+                tyref_to_value_type_with(ty, self.llbc, self.harvested),
                 ValueType::Int | ValueType::Unsigned
             )
         };
@@ -18409,7 +18561,8 @@ impl<'a> Lowering<'a> {
                             .map(|ty| payload_tuple_suffix(&ty, self.llbc))
                             .unwrap_or_default();
                 } else {
-                    site.call_result_ty = tyref_to_value_type(&dest, self.llbc);
+                    site.call_result_ty =
+                        tyref_to_value_type_with(&dest, self.llbc, self.harvested);
                     site.args_tuple_suffix =
                         crate::front::result_exc::tyref_result_ok(&recv_ty, self.llbc)
                             .map(|ty| payload_tuple_suffix(&ty, self.llbc))
@@ -18417,7 +18570,7 @@ impl<'a> Lowering<'a> {
                 }
             }
             DiscCombinator::ResultUnwrapOrElse => {
-                site.call_result_ty = tyref_to_value_type(dest_ty, self.llbc);
+                site.call_result_ty = tyref_to_value_type_with(dest_ty, self.llbc, self.harvested);
                 site.args_tuple_suffix =
                     crate::front::result_exc::tyref_result_err(&recv_ty, self.llbc)
                         .map(|ty| payload_tuple_suffix(&ty, self.llbc))
@@ -18434,7 +18587,7 @@ impl<'a> Lowering<'a> {
                 site.result_payload1_ty = err_ty;
                 site.result_payload0_class = site.payload0_class.clone();
                 site.result_payload1_class = err_class;
-                site.call_result_ty = tyref_to_value_type(&dest, self.llbc);
+                site.call_result_ty = tyref_to_value_type_with(&dest, self.llbc, self.harvested);
                 site.args_tuple_suffix =
                     crate::front::result_exc::tyref_result_err(&recv_ty, self.llbc)
                         .map(|ty| payload_tuple_suffix(&ty, self.llbc))
@@ -18495,7 +18648,7 @@ impl<'a> Lowering<'a> {
         let env_def_id = self.tyref_ref_adt_def_id(env_ty?)?;
         let env_td = self.llbc.type_by_id(env_def_id)?;
         let call_once_owner = env_td.item_meta.name_path();
-        let result_ty = tyref_to_value_type(dest_ty, self.llbc);
+        let result_ty = tyref_to_value_type_with(dest_ty, self.llbc, self.harvested);
         // The single-element closure-`Args` tuple `(payload,)` the extracted
         // `call_once` reads its `.0` from, keyed to the same `Tuple<X>` leaf
         // the read side derives at `resolve_place`.
@@ -18543,7 +18696,7 @@ impl<'a> Lowering<'a> {
         let env_def_id = self.tyref_ref_adt_def_id(env_ty?)?;
         let call_once_owner = self.llbc.type_by_id(env_def_id)?.item_meta.name_path();
         let error_ty = crate::front::result_exc::tyref_result_err(dest_ty, self.llbc)
-            .map(|ty| tyref_to_value_type(&ty, self.llbc))
+            .map(|ty| tyref_to_value_type_with(&ty, self.llbc, self.harvested))
             .unwrap_or(ValueType::Ref(None));
         Some(crate::front::result_exc::OptionOkOrElseTrySite {
             result_var: result_var.clone(),
@@ -18642,7 +18795,7 @@ impl<'a> Lowering<'a> {
             if tyref_to_ast_string(source, self.llbc) != tyref_to_ast_string(&pointee, self.llbc) {
                 return None;
             }
-            let ty = tyref_to_value_type(source, self.llbc);
+            let ty = tyref_to_value_type_with(source, self.llbc, self.harvested);
             if !matches!(
                 ty,
                 ValueType::Int
@@ -18824,7 +18977,8 @@ impl<'a> Lowering<'a> {
             | ClosureCombinator::UnwrapOrElse
             | ClosureCombinator::IsSomeAnd => clone_tyref(dest_ty),
         };
-        let call_result_ty = tyref_to_value_type(&call_result_tyref, self.llbc);
+        let call_result_ty =
+            tyref_to_value_type_with(&call_result_tyref, self.llbc, self.harvested);
         let call_once_result_exc = crate::front::result_exc::tyref_is_result_of_carrier(
             &call_result_tyref,
             self.llbc,
@@ -18837,7 +18991,7 @@ impl<'a> Lowering<'a> {
             );
             let payload_ty =
                 crate::front::result_exc::tyref_result_ok(&call_result_tyref, self.llbc)
-                    .map(|ty| tyref_to_value_type(&ty, self.llbc))
+                    .map(|ty| tyref_to_value_type_with(&ty, self.llbc, self.harvested))
                     .unwrap_or(ValueType::Ref(None));
             (suffix, payload_ty)
         });
@@ -18898,7 +19052,11 @@ impl<'a> Lowering<'a> {
     fn tyref_is_fieldless_enum(&self, ty: &TyRef) -> bool {
         self.tyref_adt_def_id(ty)
             .and_then(|def_id| self.llbc.type_by_id(def_id))
-            .is_some_and(|td| type_decl_is_fieldless_enum(td, self.llbc))
+            .is_some_and(|td| {
+                type_decl_is_fieldless_enum(td, self.llbc)
+                    || (matches!(td.kind, TypeDeclKind::Opaque)
+                        && harvested_enum_is_fieldless(self.harvested, &td.item_meta.name_path()))
+            })
     }
 
     /// [`Self::tyref_is_fieldless_enum`] through a `&` borrow — the shape a
@@ -18909,7 +19067,11 @@ impl<'a> Lowering<'a> {
     fn tyref_is_borrowed_fieldless_enum(&self, ty: &TyRef) -> bool {
         self.tyref_ref_adt_def_id(ty)
             .and_then(|def_id| self.llbc.type_by_id(def_id))
-            .is_some_and(|td| type_decl_is_fieldless_enum(td, self.llbc))
+            .is_some_and(|td| {
+                type_decl_is_fieldless_enum(td, self.llbc)
+                    || (matches!(td.kind, TypeDeclKind::Opaque)
+                        && harvested_enum_is_fieldless(self.harvested, &td.item_meta.name_path()))
+            })
     }
 
     /// `true` when `ty` is represented as a one-word nullable `Option` in
@@ -19223,7 +19385,7 @@ impl<'a> Lowering<'a> {
         if !matches!(leaf.as_str(), "min" | "max") {
             return Ok(false);
         }
-        let result_ty = tyref_to_value_type(dest_ty, self.llbc);
+        let result_ty = tyref_to_value_type_with(dest_ty, self.llbc, self.harvested);
         if crate::codewriter::minmax::minmax_value_ty(&result_ty).is_none() {
             return Ok(false);
         }
@@ -19316,7 +19478,7 @@ impl<'a> Lowering<'a> {
         }
         let peeled = self.tyref_peel_ref_to_pointee(ty);
         let ty = peeled.as_ref().unwrap_or(ty);
-        match tyref_to_value_type(ty, self.llbc) {
+        match tyref_to_value_type_with(ty, self.llbc, self.harvested) {
             ty @ (ValueType::Int | ValueType::Unsigned | ValueType::Float | ValueType::Bool) => {
                 Some(ty)
             }
@@ -20375,7 +20537,8 @@ impl<'a> Lowering<'a> {
         // `try_lower_usize_try_from` uses). Bool is the RPython BoolRepr
         // sibling: converting it to Unsigned emits `cast_bool_to_uint`
         // through the ordinary `r_uint` builtin (`rbool.py:63-74`).
-        let src_is_bool = tyref_to_value_type(src, self.llbc) == ValueType::Bool;
+        let src_is_bool =
+            tyref_to_value_type_with(src, self.llbc, self.harvested) == ValueType::Bool;
         let src_is_small_uint = matches!(
             self.tyref_literal_uint_atom(src),
             Some("U8" | "U16" | "U32")
@@ -24578,6 +24741,147 @@ pub(crate) fn collect_policy_opaque_fn_stubs_from_llbc(
     })
 }
 
+/// One variant of a harvested enum. Field types are the defining crate's
+/// rendered spellings; dedup ids are per artefact and are not stored.
+#[derive(Clone, Debug)]
+pub(crate) struct HarvestedVariant {
+    name: String,
+    discriminant: Option<i64>,
+    fields: Vec<HarvestedField>,
+}
+
+/// Transparent ADT layout recorded from the crate that defines it.
+/// A later crate sees the same `name_path` as `TypeDeclKind::Opaque`.
+#[derive(Clone, Debug)]
+pub(crate) enum HarvestedAdt {
+    Struct(Vec<HarvestedField>),
+    Enum {
+        variants: Vec<HarvestedVariant>,
+        /// Every variant carries zero payload bytes, so the value is its
+        /// discriminant integer.
+        fieldless: bool,
+    },
+}
+
+/// Layouts keyed by the defining crate's full `name_path`. The multi-crate
+/// loop owns the map; the first definition in load order wins.
+pub(crate) type HarvestedAdtLayouts = std::collections::HashMap<String, HarvestedAdt>;
+
+pub(crate) fn empty_harvested_adt_layouts() -> &'static HarvestedAdtLayouts {
+    static EMPTY: std::sync::OnceLock<HarvestedAdtLayouts> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(HarvestedAdtLayouts::new)
+}
+
+/// One field of a harvested struct or variant. `bank` is the defining
+/// crate's register class; the dependent artefact cannot re-derive it
+/// from a dedup id that belongs to the other file.
+#[derive(Clone, Debug)]
+pub(crate) struct HarvestedField {
+    name: String,
+    ast: String,
+    bank: ValueType,
+}
+
+fn harvested_field_rows(
+    fields: &[majit_charon_reader::ullbc::FieldDecl],
+    llbc: &Llbc,
+) -> Vec<HarvestedField> {
+    fields
+        .iter()
+        .enumerate()
+        .map(|(i, f)| HarvestedField {
+            name: f.name.clone().unwrap_or_else(|| format!("__pos_{i}")),
+            ast: tyref_to_ast_string(&f.ty, llbc),
+            bank: tyref_to_value_type(&f.ty, llbc),
+        })
+        .collect()
+}
+
+fn tyref_for_harvested_bank(bank: &ValueType) -> TyRef {
+    let value = match bank {
+        ValueType::Bool => serde_json::json!({"Literal": "Bool"}),
+        ValueType::Int | ValueType::Int128 => serde_json::json!({"Literal": {"Int": "I64"}}),
+        ValueType::Unsigned | ValueType::UInt128 => {
+            serde_json::json!({"Literal": {"UInt": "U64"}})
+        }
+        ValueType::Float => serde_json::json!({"Literal": {"Float": "F64"}}),
+        ValueType::SingleFloat => serde_json::json!({"Literal": {"Float": "F32"}}),
+        ValueType::Str | ValueType::StringBuilder => {
+            serde_json::json!({"Adt": {"id": {"Builtin": "Str"}}})
+        }
+        ValueType::Ref(_) | ValueType::Void | ValueType::State | ValueType::Unknown => {
+            serde_json::json!({})
+        }
+    };
+    TyRef::Other(value)
+}
+
+/// Record this artefact's transparent struct and enum layouts. Keys already
+/// present stay: the first definition in load order wins.
+pub(crate) fn harvest_transparent_adt_layouts(llbc: &Llbc, map: &mut HarvestedAdtLayouts) {
+    for td in llbc.iter_type_decls() {
+        let path = td.item_meta.name_path();
+        if path.is_empty() || map.contains_key(&path) {
+            continue;
+        }
+        match &td.kind {
+            TypeDeclKind::Struct(fields) => {
+                map.insert(
+                    path,
+                    HarvestedAdt::Struct(harvested_field_rows(fields, llbc)),
+                );
+            }
+            TypeDeclKind::Enum(variants) => {
+                let fieldless = type_decl_is_fieldless_enum(td, llbc);
+                let harvested = variants
+                    .iter()
+                    .map(|v| HarvestedVariant {
+                        name: v.name.clone(),
+                        discriminant: v.discriminant_i64(),
+                        fields: harvested_field_rows(&v.fields, llbc),
+                    })
+                    .collect();
+                map.insert(
+                    path,
+                    HarvestedAdt::Enum {
+                        variants: harvested,
+                        fieldless,
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+fn harvested_enum_is_fieldless(map: &HarvestedAdtLayouts, name_path: &str) -> bool {
+    matches!(
+        map.get(name_path),
+        Some(HarvestedAdt::Enum {
+            fieldless: true,
+            ..
+        })
+    )
+}
+
+/// Signature stubs for functions whose bodies were dropped because they
+/// contain a non-`Relaxed` atomic load.  Same carrier as
+/// [`collect_policy_opaque_fn_stubs_from_llbc`]: the body is not a jitcode,
+/// but the call site must still resolve.
+pub(crate) fn collect_ordered_atomic_load_fn_stubs_from_llbc(
+    llbc: &Llbc,
+    error_carrier: crate::ErrorCarrierSpec<'_>,
+) -> Vec<(
+    Vec<String>,
+    crate::flowspace::argument::Signature,
+    Option<String>,
+)> {
+    collect_fn_stubs_from_llbc_if(llbc, error_carrier, |fd| {
+        fd.unstructured()
+            .is_some_and(|body| first_non_relaxed_atomic_load_ordering(llbc, &body).is_some())
+    })
+}
+
 /// Collect signature-only [`DeclinedFunDecl`] rows for every local function
 /// whose unstructured body contains a non-`Relaxed` `Atomic*::load`.
 ///
@@ -25778,6 +26082,10 @@ fn push_ptr_to_unsigned_cast(
 }
 
 fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
+    tyref_to_value_type_with(ty, llbc, empty_harvested_adt_layouts())
+}
+
+fn tyref_to_value_type_with(ty: &TyRef, llbc: &Llbc, harvested: &HarvestedAdtLayouts) -> ValueType {
     // The HashConsedValue arm carries the body inline; primitives
     // typically land here.  The Deduplicated arm carries only an
     // ID; consult the dedup-body index to recover the inline shape
@@ -25869,7 +26177,7 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     // `record_branch_guard(_, truth, ..)` wanting `r`, and no kind for the
     // caller's variable satisfies both.
     if let Some(resolved) = trait_assoc_projection_target(value, llbc) {
-        return tyref_to_value_type(&resolved, llbc);
+        return tyref_to_value_type_with(&resolved, llbc, harvested);
     }
     // RPython `history.getkind` classifies `Ptr(FuncType)` through the raw
     // pointer arm, hence as `int`.  Charon's equivalent is a top-level
@@ -25917,7 +26225,7 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     // construction, `Discriminant` read): `Rvalue::Discriminant` then
     // aliases the int directly instead of reading a `__discriminant`
     // field off an aggregate `Ref` base whose enum has no rtype clsfield.
-    if tyref_is_fieldless_enum_free(ty, llbc) {
+    if tyref_is_fieldless_enum_free(ty, llbc, harvested) {
         return ValueType::Int;
     }
     // "At every site" above includes a BORROW of such an enum: `Rvalue::Ref`
@@ -25930,7 +26238,7 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     // hands a ref-kinded operand to a `SwitchInt`, which
     // `codewriter/flatten.rs` rejects outright (`switch exitswitch must be
     // int`).  `match self { .. }` on a C-like enum is the shape that hits it.
-    if tyref_is_borrowed_fieldless_enum_free(ty, llbc) {
+    if tyref_is_borrowed_fieldless_enum_free(ty, llbc, harvested) {
         return ValueType::Int;
     }
     // A `str`/`String`/`Wtf8`/`Wtf8Buf` value is the single immutable
@@ -25964,7 +26272,7 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     // `__discriminant` off that interned base; a classdef-less root
     // falls to `getclsfield`, which is the upstream path — do not
     // synthesize a tag there.
-    if let Some(root) = tyref_payload_enum_class_root(ty, llbc) {
+    if let Some(root) = tyref_payload_enum_class_root(ty, llbc, harvested) {
         return ValueType::Ref(Some(root));
     }
     ValueType::Ref(None)
@@ -26106,12 +26414,19 @@ fn tyref_enum_payload_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
 /// Peels `Ref` on the way in ([`strip_ty_wrappers`]) so a `match *slot { .. }`
 /// whose base is a borrow answers the same as a by-value one: the borrow adds
 /// no variant and no payload.
-fn tyref_is_enum_free(ty: &TyRef, llbc: &Llbc) -> bool {
+fn tyref_is_enum_free(ty: &TyRef, llbc: &Llbc, harvested: &HarvestedAdtLayouts) -> bool {
     tyref_node(ty, llbc)
         .and_then(|node| strip_ty_wrappers(node, llbc))
         .and_then(adt_node_def_id)
         .and_then(|def_id| llbc.type_by_id(def_id))
-        .is_some_and(|td| matches!(td.kind, TypeDeclKind::Enum(_)))
+        .is_some_and(|td| {
+            matches!(td.kind, TypeDeclKind::Enum(_))
+                || (matches!(td.kind, TypeDeclKind::Opaque)
+                    && matches!(
+                        harvested.get(&td.item_meta.name_path()),
+                        Some(HarvestedAdt::Enum { .. })
+                    ))
+        })
 }
 
 /// Whether `ty` resolves to a type Charon's resolved layout reports as
@@ -26135,8 +26450,11 @@ fn tyref_is_zero_sized(ty: &TyRef, llbc: &Llbc) -> bool {
 /// standalone [`tyref_to_value_type`] helper (which holds no `Lowering`):
 /// `true` when `ty` resolves to an enum with at least one variant and
 /// every variant carrying zero payload fields.
-fn tyref_is_fieldless_enum_free(ty: &TyRef, llbc: &Llbc) -> bool {
-    tyref_fieldless_enum_def(ty, llbc).is_some()
+fn tyref_is_fieldless_enum_free(ty: &TyRef, llbc: &Llbc, harvested: &HarvestedAdtLayouts) -> bool {
+    if tyref_fieldless_enum_def(ty, llbc).is_some() {
+        return true;
+    }
+    adt_path_of_tyref(ty, llbc).is_some_and(|path| harvested_enum_is_fieldless(harvested, &path))
 }
 
 /// `ty` is a **borrow** of a fieldless (C-like) enum — `&E` / `&mut E` for an
@@ -26153,7 +26471,11 @@ fn tyref_is_fieldless_enum_free(ty: &TyRef, llbc: &Llbc) -> bool {
 /// `*const E` / `*mut E` is a genuine pointer value that some other code is
 /// free to compare, offset or null-check; folding it to the tag would be a
 /// wrong answer rather than a missed optimization.  A borrow is not.
-fn tyref_is_borrowed_fieldless_enum_free(ty: &TyRef, llbc: &Llbc) -> bool {
+fn tyref_is_borrowed_fieldless_enum_free(
+    ty: &TyRef,
+    llbc: &Llbc,
+    harvested: &HarvestedAdtLayouts,
+) -> bool {
     let mut v: &serde_json::Value = match ty {
         TyRef::Inline { value: (_, v) } | TyRef::Other(v) => v,
         TyRef::Dedup { id } => match llbc.dedup_body(*id) {
@@ -26194,7 +26516,11 @@ fn tyref_is_borrowed_fieldless_enum_free(ty: &TyRef, llbc: &Llbc) -> bool {
         return peeled_a_ref
             && inline_adt_def_id(v)
                 .and_then(|def_id| llbc.type_by_id(def_id))
-                .is_some_and(|td| type_decl_is_fieldless_enum(td, llbc));
+                .is_some_and(|td| {
+                    type_decl_is_fieldless_enum(td, llbc)
+                        || (matches!(td.kind, TypeDeclKind::Opaque)
+                            && harvested_enum_is_fieldless(harvested, &td.item_meta.name_path()))
+                });
     }
 }
 
@@ -26419,11 +26745,17 @@ fn tyref_fieldless_enum_class_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
 /// `None` when `ty` is not such an enum, or when the root resolver
 /// declines it (the core/std/alloc container family, which has dedicated
 /// annotator models rather than a classdef).
-fn tyref_payload_enum_class_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
-    if tyref_is_fieldless_enum_free(ty, llbc) || tyref_is_borrowed_fieldless_enum_free(ty, llbc) {
+fn tyref_payload_enum_class_root(
+    ty: &TyRef,
+    llbc: &Llbc,
+    harvested: &HarvestedAdtLayouts,
+) -> Option<String> {
+    if tyref_is_fieldless_enum_free(ty, llbc, harvested)
+        || tyref_is_borrowed_fieldless_enum_free(ty, llbc, harvested)
+    {
         return None;
     }
-    if !tyref_is_enum_free(ty, llbc) {
+    if !tyref_is_enum_free(ty, llbc, harvested) {
         return None;
     }
     tyref_class_root(ty, llbc)
@@ -26652,7 +26984,7 @@ fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     // seeds a classdef-less `SomeInstance(None)` shell and the first typed
     // write (`err.kind = PyErrorKind::…`) unions `Integer ∪ Instance` with
     // no `pair(SomeInteger, SomeInstance).union()` handler and walls.
-    if tyref_is_fieldless_enum_free(ty, llbc) {
+    if tyref_is_fieldless_enum_free(ty, llbc, empty_harvested_adt_layouts()) {
         return ValueType::Int;
     }
     // A `str`/`String`/`Wtf8` field seeds a `SomeString` attr shell (via
@@ -26670,7 +27002,7 @@ fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     // Matching [`tyref_to_value_type`]: a payload-carrying enum field
     // seeds `Ref(Some(root))` so the FORCE-attr / call-result narrow
     // intern the enum base instead of the classdef-less `Ref(None)` shell.
-    if let Some(root) = tyref_payload_enum_class_root(ty, llbc) {
+    if let Some(root) = tyref_payload_enum_class_root(ty, llbc, empty_harvested_adt_layouts()) {
         return ValueType::Ref(Some(root));
     }
     ValueType::Ref(None)
@@ -39557,6 +39889,7 @@ mod tests {
                 None,
                 &dont_look_inside,
                 &accum,
+                super::empty_harvested_adt_layouts(),
             )
             .unwrap();
             assert_eq!(
@@ -41839,6 +42172,7 @@ mod tests {
             &jitdriver_receiver_roots,
             None,
             None,
+            super::empty_harvested_adt_layouts(),
         )
         .unwrap();
         let linked_ty = serde_json::from_value::<super::TyRef>(serde_json::json!({
@@ -42999,6 +43333,7 @@ mod tests {
             None,
             &dont_look_inside,
             &accum,
+            super::empty_harvested_adt_layouts(),
         )
         .unwrap();
         let payload = serde_json::json!([{"Adt": [0, null]}, 0]);

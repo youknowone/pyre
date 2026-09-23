@@ -273,6 +273,10 @@ fn build_semantic_program_via_active_frontend(
             front::mir::register_foldable_const_lits(foldable_consts);
 
             let mut merged = None;
+            // Layouts of structs and enums, filled after each crate is
+            // lowered. A later crate's `Opaque` copy of the same
+            // `name_path` reads this map. The first definition wins.
+            let mut harvested_adt_layouts = front::mir::HarvestedAdtLayouts::new();
             let mut seen_function_keys = std::collections::HashSet::new();
             let mut seen_struct_names = std::collections::HashSet::new();
             let mut seen_trait_names = std::collections::HashSet::new();
@@ -290,6 +294,14 @@ fn build_semantic_program_via_active_frontend(
                 ));
                 unsafe_fn_stubs
                     .extend(front::mir::collect_marked_class_ctor_stubs_from_llbc(&llbc));
+                // A body dropped for an ordered atomic load is the same kind of
+                // omitted callee as `#[dont_look_inside]`: the call site still
+                // names it, and without a signature stub the caller's Phase A
+                // fails "not registered" and the graph is never a subject.
+                unsafe_fn_stubs.extend(front::mir::collect_ordered_atomic_load_fn_stubs_from_llbc(
+                    &llbc,
+                    static_addrs.error_carrier,
+                ));
                 foreign_opaque_method_externals
                     .extend(front::mir::collect_foreign_opaque_method_externals(&llbc));
                 atomic_load_decls.extend(front::mir::collect_atomic_load_declined_fun_decls(&llbc));
@@ -298,8 +310,10 @@ fn build_semantic_program_via_active_frontend(
                     static_addrs,
                     module_paths,
                     jitdriver_receiver_roots,
+                    &harvested_adt_layouts,
                 )
                 .unwrap_or_else(|e| panic!("Step 4.4 cutover: lower {p}: {e}"));
+                front::mir::harvest_transparent_adt_layouts(&llbc, &mut harvested_adt_layouts);
                 prof.mark(&format!("    lower {p}"));
                 front::mir::absorb_semantic_program(
                     &mut merged,
