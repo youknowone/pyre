@@ -258,10 +258,6 @@ fn type_namespace(w_type: PyObjectRef) -> PyObjectRef {
 /// watcher on that field stays valid.  A type with no tag stores the raw
 /// value and always mutates, matching the untagged arm.
 ///
-/// `dont_look_inside`: the version read is the quasi-immutable field a
-/// traced load already watches.  Tracing it again inside the store plants
-/// a second watcher that this same store's `mutated()` revokes.
-#[majit_macros::dont_look_inside]
 pub(crate) unsafe fn type_setdictvalue_wtf8(
     w_type: PyObjectRef,
     name: &Wtf8,
@@ -301,10 +297,17 @@ pub(crate) unsafe fn type_setdictvalue_wtf8(
                 }
                 return Ok(());
             }
-            // An `ObjectMutableCell` would sit in the namespace where a later
-            // reader that does not go through `unwrap_cell` (a type-parameter
-            // bound, for one) would observe the cell.  Keep that value raw.
-            // The int cell is the one an in-place update has to absorb.
+            // NARROWER THAN UPSTREAM, and this is debt, not a design choice.
+            // `write_cell` wraps every replacing store, so upstream parks an
+            // `ObjectMutableCell` in the namespace here.  pyre still has a
+            // reader that reaches a type-dict resident without going through
+            // `unwrap_cell` -- a type-parameter bound is the one that showed
+            // it -- and that reader would observe the cell.  Storing the raw
+            // value and moving the tag is observationally identical; it only
+            // costs the version-tag stability an object-valued attribute
+            // could have had.  Converging means auditing every type-dict
+            // reader for `unwrap_cell` first, then deleting this arm.  The
+            // int cell is the one an in-place update has to absorb.
             Some(stored) if pyre_object::celldict::is_object_mutable_cell(stored) => {}
             Some(stored) => w_value = stored,
         }
