@@ -2543,8 +2543,13 @@ fn analyze_pipeline_from_module_paths(
     };
 
     mark_phase!("call_control + canonical_trait_impls + register graphs");
-    let (jitcodes, indirectcalltarget_indices, insns, descrs, all_liveness) =
-        make_jitcodes(&config.pipeline, &mut call_control, &mut prof);
+    let (jitcodes, indirectcalltarget_indices, insns, descrs, all_liveness) = make_jitcodes(
+        &config.pipeline,
+        &mut call_control,
+        &mut prof,
+        static_addrs.pytypes,
+        static_addrs.pytypes_by_struct,
+    );
     mark_phase!("make_jitcodes");
     // warmspot.py `WarmRunnerDesc.finish` after `make_jitcodes`: unique
     // `vinfo.finish()` then `replace_force_virtualizable_with_call` over
@@ -2797,6 +2802,8 @@ fn make_jitcodes(
     pipeline_config: &pipeline::PipelineConfig,
     call_control: &mut call::CallControl,
     prof: &mut PhaseProfiler,
+    pytypes: &[(&str, i64)],
+    pytypes_by_struct: &[(&str, i64)],
 ) -> (
     Vec<std::sync::Arc<jitcode::JitCode>>,
     Vec<usize>,
@@ -2813,6 +2820,12 @@ fn make_jitcodes(
     // invariant).
     call_control.set_struct_storage(&pipeline_config.transform.struct_storage);
     let mut codewriter = codewriter::CodeWriter::new();
+    // `Assembler.constants_r` is filled while this codewriter runs.
+    // The name rows live on that assembler, not a process-global map.
+    codewriter.assembler.intern_type_static_addrs(pytypes);
+    codewriter
+        .assembler
+        .intern_type_static_addrs(pytypes_by_struct);
 
     // `warmspot.py:262-264` `vrefinfo = VirtualRefInfo(self);
     //  self.codewriter.setup_vrefinfo(vrefinfo)` — installs the
@@ -3539,8 +3552,13 @@ mod portal_driver_tests {
         let mut policy = policy::DefaultJitPolicy::new();
         call_control.find_all_graphs(&mut policy);
 
-        let (jitcodes, _, _, _, _) =
-            make_jitcodes(&config, &mut call_control, &mut PhaseProfiler::new());
+        let (jitcodes, _, _, _, _) = make_jitcodes(
+            &config,
+            &mut call_control,
+            &mut PhaseProfiler::new(),
+            &[],
+            &[],
+        );
         assert_eq!(jitcodes.len(), 1);
         assert_eq!(jitcodes[0].index(), 0);
         assert!(call_control.jitcodes().contains_key(&portal));
@@ -3738,8 +3756,13 @@ mod portal_driver_tests {
         let mut policy = policy::DefaultJitPolicy::new();
         call_control.find_all_graphs(&mut policy);
 
-        let (jitcodes, _, _, _, _) =
-            make_jitcodes(&config, &mut call_control, &mut PhaseProfiler::new());
+        let (jitcodes, _, _, _, _) = make_jitcodes(
+            &config,
+            &mut call_control,
+            &mut PhaseProfiler::new(),
+            &[],
+            &[],
+        );
         assert_eq!(jitcodes[0].name, "eval_loop_jit_portal");
         let merge = jitcodes[0]
             .body()
