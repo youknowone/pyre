@@ -9830,6 +9830,50 @@ impl CodeWriter {
                                     py_pc as i64,
                                 );
                             }
+                            // `pyopcode.py` `RETURN_VALUE` stores
+                            // `frame_finished_execution = True` on this frame
+                            // before the return. The bit shares `PyFrame.flags`
+                            // with `escaped`, so the store is the same
+                            // read-or-write `set_frame_finished_execution`
+                            // performs. `YIELD_VALUE` raises `Yield` and does
+                            // not store it; `generator.py` `send_ex` reads the
+                            // bit to tell the two apart. Every executor
+                            // replays this jitcode store. `frame_var` is this
+                            // jitcode's own frame input, including a non-portal
+                            // callee, so an inlined return finishes that
+                            // callee rather than the virtualizable of the
+                            // outermost frame.
+                            {
+                                let flags_descr = pyre_jit_trace::descr::pyframe_flags_descr();
+                                let live_flags = emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "getfield_gc_i",
+                                    vec![frame_var.into(), flags_descr.clone().into()],
+                                    Kind::Int,
+                                    py_pc as i64,
+                                );
+                                let finished_bit: super::flow::FlowValue =
+                                    super::flow::Constant::signed(i64::from(
+                                        pyre_interpreter::PyFrame::FLAG_FRAME_FINISHED,
+                                    ))
+                                    .into();
+                                let new_flags = emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "int_or",
+                                    vec![live_flags.into(), finished_bit.into()],
+                                    Kind::Int,
+                                    py_pc as i64,
+                                );
+                                record_graph_op(
+                                    &current_block.block(),
+                                    "setfield_gc_i",
+                                    vec![frame_var.into(), new_flags.into(), flags_descr.into()],
+                                    None,
+                                    py_pc as i64,
+                                );
+                            }
                             // ref_return reads from the stack slot
                             // directly — the obj_tmp0 staging was redundant since
                             // this is the terminating op of the block.
@@ -14061,52 +14105,50 @@ impl CodeWriter {
                         // StoreName pops 1 value from the stack.
                         // (This is separate from the above because pyopcode.rs pops.)
 
-                        // YieldValue: pops yielded value, pushes placeholder back. Net: 0.
-                        // Replace shadow value. rpython/flowspace/flowcontext.py:721,
-                        // `liveness.rs`'s `Instruction::YieldValue` arm,
-                        // assemble.py:1543.
+                        // YieldValue: the suspension leaves the yielded value on
+                        // the stack; the fall-through model then replaces it
+                        // with the value the next resume sends. Net: 0.
                         //
-                        // YIELD_VALUE suspends the frame (StepResult::Yield) and
-                        // resumes it later in a different stack context, which no
-                        // residual this compiler can emit expresses; flowspace's
-                        // `record_pure_op("yield")` is an analysis artifact (flow
-                        // purity, not runtime effect-freedom), not a signal that a
-                        // residual is possible.
+                        // `pyopcode.py` `YIELD_VALUE` (not an async generator)
+                        // does not pop: it raises `Yield` with the value still
+                        // on the value stack. `interp_jit.py` `dispatch`'s
+                        // `except Yield` does `popvalue()` and returns that
+                        // value; `pyframe.py` `execute_frame` pops the same
+                        // way. `emit_abort_permanent!` materializes
+                        // `pre_opcode_stack` — the stack as this opcode was
+                        // entered, top slot the yielded value — and sets
+                        // `last_instr` to `py_pc - 1`, so a bail re-runs
+                        // `YIELD_VALUE`. A generator-resume sub-walk reads
+                        // that top slot (`generator_resume_yield`) and
+                        // publishes `last_instr` at the yield so the next
+                        // resume enters after it. Every other walk treats
+                        // the marker as the frame exit `dispatch`'s
+                        // `except Yield` is: the yielded value finishes
+                        // the trace (`compile_done_with_this_frame`).
                         //
-                        // The marker was long unreachable for a reason that sat
-                        // one level up — a resumption ran
-                        // `PyFrame::execute_generator_frame`, which called the
-                        // plain evaluator directly instead of the registered
-                        // eval override, so no frame of a generator was ever
-                        // offered to the tracer and no loop in a generator body
-                        // could compile, yield or not.  That entry now goes
-                        // through the override, so a loop that stays clear of
-                        // the yield compiles and this arm is what stops a trace
-                        // at the suspension itself.
-                        //
-                        // Upstream additionally gives the resumption a merge
-                        // point of its own (`generator.py:604`
-                        // `generatorentry_driver`, taken at `:63` when
-                        // `should_not_inline` (`:614`) counts two or more
-                        // yields; below that the body is inlined into the
-                        // caller's trace).  Pyre has no such driver yet, so a
-                        // resumption enters the portal as an ordinary frame.
+                        // The pop and fresh ref run AFTER the marker. They
+                        // are the sent value the following opcodes expect
+                        // (`liveness.rs` net 0), not the value the suspension
+                        // returns. Emitting them first would not change the
+                        // marker — it reads the entry snapshot — but the
+                        // marker has to be the suspension, recorded while the
+                        // yielded value is still the modelled TOS.
                         Instruction::YieldValue { .. } => {
+                            emit_abort_permanent!(py_pc);
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
-                            emit_abort_permanent!(py_pc);
                         }
 
                         // ReturnGenerator: pushes 1. Net: +1.
-                        // Portable (a plain push-None in flowspace) but useless:
-                        // it only heads a generator/coroutine body, whose
-                        // YIELD_VALUE aborts anyway (frame suspension is not
-                        // traceable), so a residual would never let a generator
-                        // loop compile. No residual.
+                        // On the first resume of an already-built generator the
+                        // opcode pushes a dummy `None` for the following
+                        // `POP_TOP` and continues (`return_generator`). It is
+                        // not a suspension: the frame exit is the later
+                        // `YIELD_VALUE`. Aborting here ends a walk that started
+                        // at the code object's entry before any yielded value
+                        // exists.
                         Instruction::ReturnGenerator => {
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            emit_abort_permanent!(py_pc);
+                            push_and_bump!(pyobject_const_ref_value(pyre_object::w_none()), py_pc,);
                         }
 
                         // Send: pops sent value, peeks iter, pushes next result. Net: 0.
