@@ -733,10 +733,20 @@ fn extend_from_frame_locals_proxy(
     list: PyObjectRef,
     other: PyObjectRef,
 ) -> Result<(), crate::PyError> {
-    let Some(keys) = crate::pyframe::frame_locals_proxy::keys_list(other) else {
-        return extend_from_iterable(list, other);
+    // `keys_list` materializes the key list, so both operands can move
+    // under it.  `extend_from_list` pins what it is handed, which is too
+    // late for an address this frame captured before the allocation.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[list, other]);
+    let Some(keys) = crate::pyframe::frame_locals_proxy::keys_list(
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+    ) else {
+        return extend_from_iterable(
+            pyre_object::gc_roots::shadow_stack_get(base),
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+        );
     };
-    extend_from_list(list, keys?)
+    extend_from_list(pyre_object::gc_roots::shadow_stack_get(base), keys?)
 }
 
 /// `listobject.py ListStrategy._extend_from_iterable`.  Upstream drains
