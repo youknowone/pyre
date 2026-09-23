@@ -28491,13 +28491,19 @@ fn json_ty_raw_store_descr(
 /// lowered against that borrow. `tyref_to_value_type` keeps `&i64` in the
 /// Ref bank and `i64` in the int bank, so recording `T` writes `__pos_0`
 /// as `Int` while the body reads `Ref`.
-fn map_collect_payload_value_type(
-    item_ty: &TyRef,
-    llbc: &Llbc,
-    adds_reference: bool,
-) -> ValueType {
-    let _ = adds_reference;
-    tyref_to_value_type(item_ty, llbc)
+fn map_collect_payload_value_type(item_ty: &TyRef, llbc: &Llbc, adds_reference: bool) -> ValueType {
+    if !adds_reference {
+        return tyref_to_value_type(item_ty, llbc);
+    }
+    let node = match item_ty {
+        TyRef::Inline { value: (_, v) } | TyRef::Other(v) => v.clone(),
+        TyRef::Dedup { id } => llbc
+            .dedup_body(*id)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    };
+    let borrowed = serde_json::json!({"Ref": ["Erased", node, "Shared"]});
+    tyref_to_value_type(&TyRef::Other(borrowed), llbc)
 }
 
 /// Plain `next` peels the reference [`iterator_adds_a_reference`] added
@@ -28506,8 +28512,11 @@ fn map_collect_payload_value_type(
 /// slice iterator — the same bank `pack_enumerate_payload` writes into
 /// `__pos_1`.
 fn enumerate_item_peel(enumerate_next: bool, iterator_added_a_reference: bool) -> bool {
-    let _ = enumerate_next;
-    iterator_added_a_reference
+    if enumerate_next {
+        false
+    } else {
+        iterator_added_a_reference
+    }
 }
 
 fn iterator_adds_a_reference(path: &str) -> bool {
@@ -35909,9 +35918,7 @@ mod tests {
             ValueType::Ref(None),
             "&i64 and i64 must not share a bank"
         );
-        assert!(super::iterator_adds_a_reference(
-            "core::slice::iter::Iter"
-        ));
+        assert!(super::iterator_adds_a_reference("core::slice::iter::Iter"));
         assert_eq!(
             super::map_collect_payload_value_type(&scalar, &llbc, true),
             ValueType::Ref(None),
@@ -35934,18 +35941,19 @@ mod tests {
         let peeled = super::iterator_payload_element(&node, &llbc, true)
             .and_then(|item| serde_json::from_value::<TyRef>(item.clone()).ok())
             .map(|ty| tyref_to_value_type(&ty, &llbc));
-        assert_eq!(peeled, Some(ValueType::Int), "the peel itself still yields i64");
+        assert_eq!(
+            peeled,
+            Some(ValueType::Int),
+            "the peel itself still yields i64"
+        );
         assert!(
             !super::enumerate_item_peel(true, true),
             "Enumerate::next must not peel I::Item; plain next still peels"
         );
-        let kept = super::iterator_payload_element(
-            &node,
-            &llbc,
-            super::enumerate_item_peel(true, true),
-        )
-        .and_then(|item| serde_json::from_value::<TyRef>(item.clone()).ok())
-        .map(|ty| tyref_to_value_type(&ty, &llbc));
+        let kept =
+            super::iterator_payload_element(&node, &llbc, super::enumerate_item_peel(true, true))
+                .and_then(|item| serde_json::from_value::<TyRef>(item.clone()).ok())
+                .map(|ty| tyref_to_value_type(&ty, &llbc));
         assert_eq!(kept, Some(ValueType::Ref(None)));
         assert!(
             super::enumerate_item_peel(false, true),
@@ -41808,9 +41816,7 @@ mod tests {
             "i64::wrapping_neg must become int_neg; ops={ops:?}"
         );
         assert!(
-            !call_leafs(&ops)
-                .iter()
-                .any(|leaf| *leaf == "wrapping_neg"),
+            !call_leafs(&ops).iter().any(|leaf| *leaf == "wrapping_neg"),
             "i64::wrapping_neg must not residualize; ops={ops:?}"
         );
     }
@@ -41834,9 +41840,7 @@ mod tests {
             "usize::wrapping_shl must become lshift; ops={ops:?}"
         );
         assert!(
-            !call_leafs(&ops)
-                .iter()
-                .any(|leaf| *leaf == "wrapping_shl"),
+            !call_leafs(&ops).iter().any(|leaf| *leaf == "wrapping_shl"),
             "usize::wrapping_shl must not residualize; ops={ops:?}"
         );
     }

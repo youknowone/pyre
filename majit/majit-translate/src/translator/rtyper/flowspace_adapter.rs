@@ -2450,18 +2450,15 @@ pub fn translate_op(
                     // `__strlen` is a fourth frontend spelling
                     // (`front/mir.rs` plants it for `Rvalue::Len` /
                     // `slice::len` / `Wtf8::len` on a
-                    // `string_byte_view_locals` place).  The receiver at
-                    // real `w_str_get_wtf8` sites is the dest of
-                    // `__cast_instance_intrinsic` with a `Wtf8` root and
-                    // `ValueType::Str` — `SomeString` / `StringRepr` —
-                    // so this is the same `len` op as `__len` on a
-                    // `&str`.  `StringRepr.rtype_len` → `ll_strlen`
-                    // (`rstr.py`) reads the rstr `STR` `chars` length
-                    // (the `len` word at offset 8).  The Skip spine
-                    // still rewrites a residual `__strlen` Call to the
-                    // `strlen` blackhole; both spines keep the machine
-                    // value as that dest pointer.  See
-                    // `strlen_arg_at_real_w_str_get_wtf8_sites_annotates_as_somestring`.
+                    // `string_byte_view_locals` place).  A receiver that
+                    // is already the rstr takes this `len` op
+                    // (`StringRepr.rtype_len` → `ll_strlen`, `rstr.py`).
+                    // A `Wtf8`/`Str` cast of a wrapper is not that rstr:
+                    // [`rewrite_wtf8_view_strlen`] turns it into
+                    // `getattr` of the wrapper's one string field
+                    // (`W_UnicodeObject._utf8`, `len(w._utf8)`) before
+                    // this arm runs.  `ll_strlen` on the wrapper would
+                    // read `PyObject.w_class` at offset 8.
                     let is_len_op = (segments.len() == 1
                         && (segments[0] == "__len" || segments[0] == "__strlen"))
                         || (segments.len() == 4
@@ -4099,6 +4096,167 @@ pub(crate) fn derive_subject_inputcells(
 /// flag covers only the framestate path's explicit marking
 /// (`mir.rs::lower_framestate`); startblock reachability is the general
 /// case the `dead` skip sites below also honour.
+/// `__strlen` on a `Wtf8`/`Str` cast reads the wrapper. `W_UnicodeObject._utf8`
+/// is the rstr (`unicodeobject.py`); the length is `len` of that one
+/// string-typed field. A layout with any other count of string fields
+/// declines — `ll_strlen` on the wrapper reads `PyObject.w_class`.
+///
+/// `Ok(None)` when this call is not that cast, so a real string receiver
+/// still lowers as `len`.
+fn rewrite_wtf8_view_strlen(
+    legacy: &FunctionGraph,
+    op: &SpaceOperation,
+    value_map: &HashMap<Variable, Hlvalue>,
+    call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
+) -> Result<Option<Vec<FlowspaceOp>>, TyperError> {
+    let Some(view) = strlen_call_arg(&op.kind) else {
+        return Ok(None);
+    };
+    let Some(cast) = op_defining(legacy, view) else {
+        return Ok(None);
+    };
+    let Some(obj) = wtf8_str_cast_source(&cast.kind) else {
+        return Ok(None);
+    };
+    let class_name = op_defining(legacy, obj)
+        .and_then(|producer| input_class_name(&producer.kind))
+        .unwrap_or("");
+    let field_name = unique_string_field(call_registry, class_name).map_err(|why| {
+        TyperError::message(format!(
+            "__strlen on a Wtf8 view of {class_name} has no unique string field ({why})"
+        ))
+    })?;
+    let receiver = lookup_operand(value_map, obj, op, "strlen receiver")?;
+    let field = Hlvalue::Variable(Variable::new());
+    let result = resolve_result_hlvalue(op, value_map)?;
+    Ok(Some(vec![
+        FlowspaceOp::new(
+            "getattr",
+            vec![
+                receiver,
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str(field_name))),
+            ],
+            field.clone(),
+        ),
+        FlowspaceOp::new("len", vec![field], result),
+    ]))
+}
+
+fn strlen_call_arg(kind: &OpKind) -> Option<&Variable> {
+    let OpKind::Call {
+        target: crate::model::CallTarget::FunctionPath { segments, .. },
+        args,
+        ..
+    } = kind
+    else {
+        return None;
+    };
+    if segments.as_slice() != ["__strlen"] || args.len() != 1 {
+        return None;
+    }
+    args.first().and_then(LinkArg::as_variable)
+}
+
+fn op_defining<'a>(legacy: &'a FunctionGraph, var: &Variable) -> Option<&'a SpaceOperation> {
+    legacy.blocks.iter().find_map(|block| {
+        block
+            .operations
+            .iter()
+            .find(|op| op.result.as_ref() == Some(var))
+    })
+}
+
+fn wtf8_str_cast_source(kind: &OpKind) -> Option<&Variable> {
+    if crate::model::cast_instance_root(kind) != Some("Wtf8") {
+        return None;
+    }
+    let OpKind::Call {
+        result_ty, args, ..
+    } = kind
+    else {
+        return None;
+    };
+    if *result_ty != crate::model::ValueType::Str {
+        return None;
+    }
+    args.first().and_then(LinkArg::as_variable)
+}
+
+fn input_class_name(kind: &OpKind) -> Option<&str> {
+    let OpKind::Input { class_root, ty, .. } = kind else {
+        return None;
+    };
+    if let Some(name) = class_root.as_deref().filter(|name| !name.is_empty()) {
+        return Some(name);
+    }
+    match ty {
+        crate::model::ValueType::Ref(Some(name)) => Some(name.as_str()),
+        _ => None,
+    }
+}
+
+fn unique_string_field(
+    call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
+    class_name: &str,
+) -> Result<String, &'static str> {
+    let bk = call_registry.bookkeeper();
+    let rows = {
+        let borrowed = bk.struct_fields.borrow();
+        let Some(reg) = borrowed.as_ref() else {
+            return Err("no struct field layout");
+        };
+        let Some(rows) = layout_rows(reg, class_name) else {
+            return Err("class has no registered fields");
+        };
+        rows.to_vec()
+    };
+    let mut found: Option<String> = None;
+    for (name, ty) in &rows {
+        if !matches!(
+            bk.project_struct_field_type(ty),
+            crate::annotator::model::SomeValue::String(_)
+        ) {
+            continue;
+        }
+        if found.is_some() {
+            return Err("more than one string field");
+        }
+        found = Some(name.clone());
+    }
+    found.ok_or("no string field")
+}
+
+fn layout_rows<'a>(
+    reg: &'a crate::front::StructFieldRegistry,
+    class_name: &str,
+) -> Option<&'a [(String, String)]> {
+    if class_name.is_empty() {
+        return None;
+    }
+    if let Some(rows) = reg.fields.get(class_name) {
+        return Some(rows.as_slice());
+    }
+    let leaf = class_name.rsplit("::").next().unwrap_or(class_name);
+    let canonical = majit_ir::descr::canonical_struct_name(leaf);
+    if let Some(rows) = reg.fields.get(&canonical) {
+        return Some(rows.as_slice());
+    }
+    let mut found: Option<&[(String, String)]> = None;
+    for (key, rows) in &reg.fields {
+        let suffix = key.ends_with(&format!("::{class_name}"))
+            || class_name.ends_with(&format!("::{key}"))
+            || key == leaf;
+        if !suffix {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(rows.as_slice());
+    }
+    found
+}
+
 fn reachable_block_ids(legacy: &FunctionGraph) -> std::collections::HashSet<BlockId> {
     // Index lookup instead of `FunctionGraph::block` (a dense
     // `blocks[id.0]` projection): final blocks reached as link targets
@@ -4626,6 +4784,18 @@ fn function_graph_to_flowspace_inner(
             if let OpKind::FieldWrite { base, .. } = &legacy_op.kind
                 && array_list_elements.contains_key(base)
             {
+                continue;
+            }
+            if let Some(ops) =
+                rewrite_wtf8_view_strlen(legacy, legacy_op, &value_map, call_registry)?
+            {
+                translated_ops.extend(ops);
+                if let Some(result_var) = legacy_op.result.as_ref()
+                    && let Some(name) = legacy.value_name_for(result_var)
+                    && let Some(value) = value_map.get(result_var).cloned()
+                {
+                    name_to_value.insert(name.to_string(), value);
+                }
                 continue;
             }
             translated_ops.extend(translate_op_or_frontier(
@@ -5712,12 +5882,8 @@ mod tests {
     ) -> (LegacyGraph, CallRegistry, crate::flowspace::model::Variable) {
         let registry = empty_call_registry();
         let mut fields = crate::front::StructFieldRegistry::default();
-        fields
-            .fields
-            .insert("W_UnicodeObject".to_string(), rows);
-        registry
-            .bookkeeper()
-            .set_struct_fields(Rc::new(fields));
+        fields.fields.insert("W_UnicodeObject".to_string(), rows);
+        registry.bookkeeper().set_struct_fields(Rc::new(fields));
 
         let mut graph = LegacyGraph::new("strlen_wtf8_dest");
         let vars = mint_vars(&mut graph, 4);
@@ -5738,11 +5904,7 @@ mod tests {
                 },
                 SpaceOperation {
                     result: Some(dest.clone()),
-                    kind: crate::model::cast_instance_call_result(
-                        "Wtf8",
-                        obj,
-                        ValueType::Str,
-                    ),
+                    kind: crate::model::cast_instance_call_result("Wtf8", obj, ValueType::Str),
                 },
                 SpaceOperation {
                     result: Some(len_result.clone()),
@@ -5777,9 +5939,7 @@ mod tests {
         (graph, registry, dest)
     }
 
-    fn flow_ops(
-        output: &FlowspaceAdapterOutput,
-    ) -> Vec<crate::flowspace::model::SpaceOperation> {
+    fn flow_ops(output: &FlowspaceAdapterOutput) -> Vec<crate::flowspace::model::SpaceOperation> {
         let graph = output.graph.borrow();
         graph
             .iterblocks()
@@ -5810,8 +5970,8 @@ mod tests {
             ("byte_len".to_string(), "usize".to_string()),
             ("len".to_string(), "usize".to_string()),
         ]);
-        let output = function_graph_to_flowspace(&graph, &registry)
-            .expect("proven string field must lower");
+        let output =
+            function_graph_to_flowspace(&graph, &registry).expect("proven string field must lower");
         let ops = flow_ops(&output);
         let getattr = ops
             .iter()
