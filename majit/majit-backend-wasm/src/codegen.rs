@@ -10997,6 +10997,31 @@ fn emit_guard_bridge_dispatch(
     sink.local_set(dispatch.bridge_slot_local);
 }
 
+/// Opcodes whose assembler publishes `jf_force_descr` before the call.
+///
+/// `aarch64/assembler.rs _store_force_index_if_next_guard` runs only for
+/// `CallMayForce*`, `CallReleaseGil*`, and `CallAssembler*`. A plain `CallN`
+/// followed by `GuardNotForced` does not arm the frame. Arming it anyway
+/// makes a callee that reads `f_lineno` (`force` once `jf_force_descr` is
+/// set) fail that guard on every iteration, and `is_guard_forced` never
+/// bridges the exit.
+fn call_publishes_force_descr(opcode: OpCode) -> bool {
+    matches!(
+        opcode,
+        OpCode::CallMayForceI
+            | OpCode::CallMayForceR
+            | OpCode::CallMayForceF
+            | OpCode::CallMayForceN
+            | OpCode::CallReleaseGilI
+            | OpCode::CallReleaseGilF
+            | OpCode::CallReleaseGilN
+            | OpCode::CallAssemblerI
+            | OpCode::CallAssemblerR
+            | OpCode::CallAssemblerF
+            | OpCode::CallAssemblerN
+    )
+}
+
 /// x86 `_store_force_index_if_next_guard`: a call that may force is bracketed
 /// by the `GUARD_NOT_FORCED` immediately after it, so publish that guard's
 /// coordinate before the call runs.
@@ -11010,6 +11035,9 @@ fn emit_force_bracket_before_call(
     op_idx: usize,
     guard_idx: u32,
 ) {
+    if !call_publishes_force_descr(ops[op_idx].opcode) {
+        return;
+    }
     let Some(next_op) = ops.get(op_idx + 1) else {
         return;
     };

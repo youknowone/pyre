@@ -10885,6 +10885,65 @@ fn a_constant_fail_arg_in_a_force_bracket_is_published_as_a_literal() {
     validate_wasm(&bytes);
 }
 
+/// A plain `CallN` does not publish `jf_force_descr`, even when
+/// `GuardNotForced` follows it. `CallMayForce*` does. Dynasm's
+/// `_store_force_index_if_next_guard` is gated on the call opcode the same
+/// way; arming every such pair makes the guard fail for a callee that only
+/// reads the frame.
+#[test]
+fn plain_call_before_guard_not_forced_does_not_arm_the_force_descr() {
+    fn module(opcode: OpCode) -> Vec<u8> {
+        let call = make_op(opcode, &[OpRef::const_int(42)], OpRef::int_op(1));
+        call.setdescr(majit_ir::descr::make_call_descr_full(
+            0,
+            vec![],
+            Type::Int,
+            false,
+            8,
+            EffectInfo::default(),
+        ));
+        let guard = Op::new(OpCode::GuardNotForced, &[]);
+        guard.setfailargs(smallvec![rb(OpRef::input_arg_ref(0))]);
+        let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_ref(0))]);
+        finish.setfailargs(smallvec![rb(OpRef::input_arg_ref(0))]);
+        build_module_with_write_barrier_target(
+            &[InputArg::from_type_rc(Type::Ref, 0)],
+            &[call, guard, finish],
+            127,
+        )
+    }
+    let stores_force_descr = |bytes: &[u8]| {
+        let mut pat = vec![0x36u8, 0x02];
+        let mut offset = majit_backend::jitframe::JF_FORCE_DESCR_OFS as u64;
+        loop {
+            let mut byte = (offset & 0x7f) as u8;
+            offset >>= 7;
+            if offset != 0 {
+                byte |= 0x80;
+            }
+            pat.push(byte);
+            if offset == 0 {
+                break;
+            }
+        }
+        bytes
+            .windows(pat.len())
+            .any(|window| window == pat.as_slice())
+    };
+    let plain = module(OpCode::CallN);
+    let may_force = module(OpCode::CallMayForceI);
+    validate_wasm(&plain);
+    validate_wasm(&may_force);
+    assert!(
+        !stores_force_descr(&plain),
+        "CallN must not store jf_force_descr"
+    );
+    assert!(
+        stores_force_descr(&may_force),
+        "CallMayForce must store jf_force_descr before GuardNotForced"
+    );
+}
+
 /// Post-rewrite `CondCallGcWb(obj)` + `GcStore` emits the same barrier helper
 /// sequence a non-elided `SetfieldGc` would; `GcStore` itself stays
 /// barrier-free.
