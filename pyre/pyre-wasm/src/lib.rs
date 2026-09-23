@@ -928,17 +928,6 @@ thread_local! {
     /// compiles as `<string>` and a traceback can name neither the file nor
     /// the offending line.
     static SCRIPT_PATH: RefCell<Option<String>> = const { RefCell::new(None) };
-    /// The `PYTHON*` and locale variables the launcher options resolve
-    /// against (`launch_env::LAUNCH_ENV_NAMES`). wasm32's `std::env` is
-    /// permanently empty, so `-P`, `-O`, PYTHONWARNINGS and the rest would every
-    /// one of them read as unset here; the embedder passes over whatever its own
-    /// environment carries and `run_python_impl` folds them the way the native
-    /// launcher does. Only the native-host binding seeds this — the browser has
-    /// no environment to seed it from.
-    /// Values are raw bytes: `_Py_GetEnv` tests presence on the undecoded
-    /// bytes, so a `PYTHONSAFEPATH` the host cannot decode is still set.
-    #[cfg(feature = "wasm-host")]
-    static LAUNCH_ENV: RefCell<Vec<(String, Vec<u8>)>> = const { RefCell::new(Vec::new()) };
 }
 
 #[cfg(any(feature = "web", feature = "wasm-host"))]
@@ -980,7 +969,10 @@ fn run_python_impl(source: &str) -> String {
     #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
     {
         use pyre_interpreter::launch_env::{self, LaunchFlags};
-        launch_env::set_launch_env(LAUNCH_ENV.with(|e| e.borrow().clone()));
+        // The host installed one environment. The launcher fold still takes
+        // its snapshot through `set_launch_env`; that snapshot is this map,
+        // not a third table.
+        launch_env::set_launch_env(majit_metainterp::jit_env::entries());
         // `-B`, because the seam this target sees a filesystem through reads
         // and does not write.  The source loader would otherwise try to cache
         // the bytecode of every module it compiles, and `_write_atomic` reaches
@@ -1256,10 +1248,10 @@ pub fn run_python(source: &str) -> String {
 ///      and `pyre_exit_code()` → the status to exit with.
 ///
 /// `pyre_set_script_path(ptr, len)` may precede step 2 to name the file the
-/// source came from, `pyre_set_launch_env(ptr, len)` to supply the environment
-/// the launcher options resolve against, `pyre_set_gc_env(ptr, len)` the one
-/// the collector sizes itself from, and `pyre_set_jit_env(ptr, len)` the
-/// `PYRE_NO_JIT` / `MAJIT_NO_BRIDGE` knobs — the guest has none of its own.
+/// source came from, and `pyre_set_env(ptr, len)` to install the one environment
+/// the launcher, the collector and the JIT knobs all read — the guest has none
+/// of its own. `pyre_set_launch_env`, `pyre_set_gc_env` and `pyre_set_jit_env`
+/// upsert into that same map for a host that still sends one blob per group.
 #[cfg(feature = "wasm-host")]
 mod host_abi {
     use super::run_python_impl;
@@ -1349,32 +1341,40 @@ mod host_abi {
         super::SCRIPT_PATH.with(|p| *p.borrow_mut() = path);
     }
 
-    /// Supply the `PYTHON*` and locale variables the launcher options resolve
-    /// against, as NUL-separated `NAME=VALUE` records. The guest's environment
-    /// is permanently empty, so without this every one of them reads as unset
-    /// and `sys.flags` reports the defaults no matter what the host was run
-    /// with. `pyre_launch_env_names` lists the names worth sending; anything
-    /// else is carried but never read. A record without `=`, or with an empty
-    /// or non-UTF-8 name, is dropped.
-    ///
-    /// The blob is read as bytes, not text: a VALUE that is not valid UTF-8 is
-    /// carried through undecoded, because `_Py_GetEnv` tests presence on the
-    /// raw bytes and `PYTHONSAFEPATH` is set by any nonempty value whether or
-    /// not it decodes. Names are ASCII by construction.
+    /// Install the one guest environment, as NUL-separated `NAME=VALUE` records.
+    /// Replaces the map. The launcher, the collector and the JIT knobs all read
+    /// it. A VALUE that is not valid UTF-8 is carried through undecoded:
+    /// `PYTHONSAFEPATH` is set by any nonempty value. A record without `=`, or
+    /// with an empty or non-UTF-8 name, is dropped. Call before
+    /// `pyre_run_python`: the collector and the JIT knobs cache on first read.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_set_env(ptr: *const u8, len: usize) {
+        let Some(blob) = guest_bytes(ptr, len) else {
+            return;
+        };
+        majit_metainterp::jit_env::install(parse_env_blob(&blob));
+    }
+
+    /// Every name the one environment is worth being given: launcher, collector
+    /// and JIT knobs, NUL-separated. The host frees the buffer with
+    /// `pyre_dealloc`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_env_names() -> u64 {
+        let mut names = pyre_interpreter::launch_env::LAUNCH_ENV_NAMES.to_vec();
+        names.extend_from_slice(pyre_jit::GC_ENV_NAMES);
+        names.extend_from_slice(pyre_jit::JIT_ENV_NAMES);
+        pack_into_guest(names.join("\0").into_bytes())
+    }
+
+    /// Upsert launcher names into the one environment. Same blob as
+    /// [`pyre_set_env`]. Kept so a host that still sends this group does not
+    /// write a second table.
     #[unsafe(no_mangle)]
     pub extern "C" fn pyre_set_launch_env(ptr: *const u8, len: usize) {
         let Some(blob) = guest_bytes(ptr, len) else {
             return;
         };
-        let entries = blob
-            .split(|&b| b == 0)
-            .filter_map(|record| {
-                let eq = record.iter().position(|&b| b == b'=')?;
-                let name = std::str::from_utf8(&record[..eq]).ok()?;
-                (!name.is_empty()).then(|| (name.to_string(), record[eq + 1..].to_vec()))
-            })
-            .collect();
-        super::LAUNCH_ENV.with(|e| *e.borrow_mut() = entries);
+        majit_metainterp::jit_env::extend(parse_env_blob(&blob));
     }
 
     /// The names [`pyre_set_launch_env`] is worth being given, as NUL-separated
@@ -1405,17 +1405,10 @@ mod host_abi {
     /// script's own first line.
     #[unsafe(no_mangle)]
     pub extern "C" fn pyre_set_gc_env(ptr: *const u8, len: usize) {
-        let Some(blob) = guest_str(ptr, len) else {
+        let Some(blob) = guest_bytes(ptr, len) else {
             return;
         };
-        let entries = blob
-            .split('\0')
-            .filter_map(|record| {
-                let (name, value) = record.split_once('=')?;
-                (!name.is_empty()).then(|| (name.to_string(), value.to_string()))
-            })
-            .collect();
-        pyre_jit::set_gc_supplied_env(entries);
+        majit_metainterp::jit_env::extend(parse_env_blob(&blob));
     }
 
     /// The names [`pyre_set_gc_env`] is worth being given, as NUL-separated
@@ -1438,17 +1431,10 @@ mod host_abi {
     /// first compiled path does — so this must precede `pyre_run_python`.
     #[unsafe(no_mangle)]
     pub extern "C" fn pyre_set_jit_env(ptr: *const u8, len: usize) {
-        let Some(blob) = guest_str(ptr, len) else {
+        let Some(blob) = guest_bytes(ptr, len) else {
             return;
         };
-        let entries = blob
-            .split('\0')
-            .filter_map(|record| {
-                let (name, value) = record.split_once('=')?;
-                (!name.is_empty()).then(|| (name.to_string(), value.to_string()))
-            })
-            .collect();
-        pyre_jit::set_jit_supplied_env(entries);
+        majit_metainterp::jit_env::extend(parse_env_blob(&blob));
     }
 
     /// The names [`pyre_set_jit_env`] is worth being given, as NUL-separated
@@ -1460,21 +1446,27 @@ mod host_abi {
         pack_into_guest(pyre_jit::JIT_ENV_NAMES.join("\0").into_bytes())
     }
 
-    /// Set `-P` / PYTHONSAFEPATH for the next `pyre_run_python`, suppressing the
-    /// `sys.path[0]` entry `pyre_set_script_path` would otherwise seed. Kept for
-    /// a host predating [`pyre_set_launch_env`], which carries the same flag
-    /// along with the rest of the block; the two write the same entry, but
-    /// `pyre_set_launch_env` replaces the whole table, so a host calling both
-    /// must call this one second.
+    /// Set `-P` / PYTHONSAFEPATH on the one environment for the next
+    /// `pyre_run_python`. Kept for a host predating [`pyre_set_env`]. A host
+    /// that also sends the environment blob must call this second: the blob
+    /// upserts the same name.
     #[unsafe(no_mangle)]
     pub extern "C" fn pyre_set_safe_path(enabled: u32) {
-        super::LAUNCH_ENV.with(|e| {
-            let mut entries = e.borrow_mut();
-            entries.retain(|(name, _)| name != "PYTHONSAFEPATH");
-            if enabled != 0 {
-                entries.push(("PYTHONSAFEPATH".to_string(), b"1".to_vec()));
-            }
-        });
+        if enabled != 0 {
+            majit_metainterp::jit_env::upsert("PYTHONSAFEPATH", b"1".to_vec());
+        } else {
+            majit_metainterp::jit_env::remove("PYTHONSAFEPATH");
+        }
+    }
+
+    fn parse_env_blob(blob: &[u8]) -> Vec<(String, Vec<u8>)> {
+        blob.split(|&b| b == 0)
+            .filter_map(|record| {
+                let eq = record.iter().position(|&b| b == b'=')?;
+                let name = std::str::from_utf8(&record[..eq]).ok()?;
+                (!name.is_empty()).then(|| (name.to_string(), record[eq + 1..].to_vec()))
+            })
+            .collect()
     }
 
     /// Copy `[ptr, ptr+len)` out of linear memory as UTF-8. The embedder

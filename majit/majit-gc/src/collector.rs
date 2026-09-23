@@ -7,7 +7,6 @@
 //!
 //! Modeled after incminimark's minor/major collection.
 use majit_ir::GcRef;
-use parking_lot::RwLock;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
@@ -293,46 +292,32 @@ pub const GC_ENV_NAMES: &[&str] = &[
     "MAJIT_GC_STRESS",
 ];
 
-/// Environment an embedder supplies because the platform gives the process
-/// none. Read only where `std::env` misses, so a host that has a real
-/// environment resolves against it exactly as before.
-///
-/// `wasm32-unknown-unknown` is the case that needs it: `std::env::var` there
-/// always fails, so every name in [`GC_ENV_NAMES`] reads as unset and a guest
-/// runs the built-in defaults no matter what its host was configured with. The
-/// interpreter's launcher options have the same problem and the same answer
-/// (`pyre-wasm`'s `LAUNCH_ENV`).
-static SUPPLIED_ENV: RwLock<Vec<(String, String)>> = RwLock::new(Vec::new());
-
-/// Install the environment [`GC_ENV_NAMES`] resolves against when the process
-/// has none. Call before the first allocation: the values are read once, when
-/// the collector is built.
+/// Install [`GC_ENV_NAMES`] into the one environment ([`majit_ir::environ`]).
+/// Call before the first allocation: the values are read once, when the
+/// collector is built. Replaces the whole map — the host installs once.
 pub fn set_supplied_env(entries: Vec<(String, String)>) {
-    *SUPPLIED_ENV.write() = entries;
+    majit_ir::environ::install(
+        entries
+            .into_iter()
+            .map(|(name, value)| (name, value.into_bytes()))
+            .collect(),
+    );
 }
 
-/// `std::env::var`, falling back to what the embedder supplied.
+/// `read_from_env`'s `os.environ.get`: the process environment, then the one
+/// map the host installed for a guest that has none.
 fn env_var(varname: &str) -> Option<String> {
-    if let Ok(value) = std::env::var(varname) {
-        return Some(value);
-    }
-    let supplied = SUPPLIED_ENV.read();
-    supplied
-        .iter()
-        .find(|(name, _)| name == varname)
-        .map(|(_, value)| value.clone())
+    majit_ir::environ::env_var(varname)
 }
 
-/// Presence of `varname` in the process environment or the embedder table.
-///
-/// Matches `std::env::var_os(name).is_some()` natively (empty counts as set)
-/// and the same name in [`SUPPLIED_ENV`] on a guest that has no process env.
-/// The `gc_stress` reader is the only production call; without that feature
-/// the name still travels in [`GC_ENV_NAMES`] so a host can forward it.
+/// Presence of `varname`. Matches `std::env::var_os(name).is_some()` natively
+/// (empty counts as set) and the same name in the one installed environment
+/// on a guest that has no process env. The `gc_stress` reader is the only
+/// production call; without that feature the name still travels in
+/// [`GC_ENV_NAMES`] so a host can forward it.
 #[cfg_attr(not(feature = "gc_stress"), allow(dead_code))]
 fn env_is_set(varname: &str) -> bool {
-    std::env::var_os(varname).is_some()
-        || SUPPLIED_ENV.read().iter().any(|(name, _)| name == varname)
+    majit_ir::environ::env_is_set(varname)
 }
 
 /// env.py `_read_float_and_factor_from_env`. Parse `varname` as a float
