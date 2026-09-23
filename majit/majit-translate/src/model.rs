@@ -5087,9 +5087,14 @@ pub fn fuse_boxing_alloc_with_pytypes(
                                     crate::flowspace::model::ConstValue::Float(0.0f64.to_bits()),
                                 ))
                             }
-                            ValueType::Ref(_) | ValueType::Str => {
+                            ValueType::Ref(_) => {
                                 LinkArg::Const(crate::flowspace::model::Constant::new(
                                     crate::flowspace::model::ConstValue::None,
+                                ))
+                            }
+                            ValueType::Str => {
+                                LinkArg::Const(crate::flowspace::model::Constant::new(
+                                    crate::flowspace::model::ConstValue::UniStr(String::new()),
                                 ))
                             }
                             _ => {

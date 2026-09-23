@@ -794,11 +794,7 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
             "libc::malloc",
             cdataobj::raw_malloc_varsize_char as *const (),
         );
-        single(
-            entries,
-            "libc::unix::free",
-            cdataobj::raw_free as *const (),
-        );
+        single(entries, "libc::unix::free", cdataobj::raw_free as *const ());
         single(entries, "libc::free", cdataobj::raw_free as *const ());
         single(
             entries,
