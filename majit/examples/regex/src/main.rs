@@ -36,20 +36,27 @@ pub mod shortcircuit;
 
 #[cfg(feature = "alloc-census")]
 #[global_allocator]
-static ALLOC: alloc_census::Counting = alloc_census::Counting;
+static ALLOC: majit_gc::HostNurseryClock<alloc_census::Counting> =
+    majit_gc::HostNurseryClock(alloc_census::Counting);
 
 // The census wraps this same allocator. Selecting `fast-alloc` must not
 // silently select System when the timing build leaves the counters out.
 #[cfg(all(feature = "fast-alloc", not(feature = "alloc-census")))]
 #[global_allocator]
-static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static ALLOC: majit_gc::HostNurseryClock<mimalloc::MiMalloc> =
+    majit_gc::HostNurseryClock(mimalloc::MiMalloc);
+
+#[cfg(not(any(feature = "alloc-census", feature = "fast-alloc")))]
+#[global_allocator]
+static ALLOC: majit_gc::HostNurseryClock<std::alloc::System> =
+    majit_gc::HostNurseryClock(std::alloc::System);
 
 #[test]
 #[cfg(all(feature = "fast-alloc", not(feature = "alloc-census")))]
 fn fast_allocator_is_selected_without_the_census() {
     // A dependency feature alone does not replace Rust's global allocator.
     // Pin the actual global's type in the clean timing configuration.
-    let _: &mimalloc::MiMalloc = &ALLOC;
+    let _: &majit_gc::HostNurseryClock<mimalloc::MiMalloc> = &ALLOC;
 }
 
 use regex::{NodeRec, bench_regex, bench_regex_left, count, depth, lower, nonmatching, vectors};
