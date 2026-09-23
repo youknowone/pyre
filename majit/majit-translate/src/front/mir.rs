@@ -26136,11 +26136,40 @@ fn push_direct_ptradd(
     count: Variable,
     item: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
 ) -> Variable {
-    let ptr_ty = ptr
+    // A Rust `*const T` / `*mut T` is `rffi.CArrayPtr(T)` (`Ptr(Array)` with
+    // `nolength`), and a byte pointer is `CCHARP`. An earlier cast may have
+    // stamped `Signed` or a GC pointer; `rewrite_op_direct_ptradd` scales
+    // from `TO.OF`, so the operand has to carry the array pointer.
+    // Stamp the array pointer on an int-kind value. A GC-pointer (or
+    // still-unstamped) operand keeps its own concretetype: overwriting
+    // it changes the register bank, and a later result-kind commit puts
+    // the ref back under an `int_add`. `cast_ptr_to_int` yields a fresh
+    // `Signed` that can carry `CArrayPtr` / `CCHARP`.
+    let already_int = ptr
         .concretetype()
-        .unwrap_or_else(|| raw_nolength_array_ptr(item));
-    if ptr.concretetype().is_none() {
+        .as_ref()
+        .is_some_and(|ty| crate::model::getkind(ty) == crate::model::ConcreteType::Signed);
+    let ptr_ty = lltype_for_direct_ptradd_pointer(
+        if already_int {
+            ptr.concretetype()
+        } else {
+            None
+        },
+        item,
+    );
+    let ptr = if already_int {
         ptr.set_concretetype(Some(ptr_ty.clone()));
+        ptr
+    } else {
+        let fresh = push_cast_ptr_to_int(graph, bb_id, ptr);
+        fresh.set_concretetype(Some(ptr_ty.clone()));
+        fresh
+    };
+    // An unstamped count reads as ref (`Unknown` → `'r'`), and
+    // `rewrite_op_direct_ptradd` then refuses the scale. The count is
+    // an item index: `lltype.Signed`.
+    if FunctionGraph::concretetype_of(&count) == crate::model::ConcreteType::Unknown {
+        FunctionGraph::set_concretetype_of_inline(&count, crate::model::ConcreteType::Signed);
     }
     let result = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
     result.set_concretetype(Some(ptr_ty));
@@ -26167,17 +26196,28 @@ fn push_direct_ptradd(
     result
 }
 
-fn raw_nolength_array_ptr(
+fn is_raw_array_ptr(ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType) -> bool {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    matches!(ty, LowLevelType::Ptr(ptr) if matches!(ptr.TO, PtrTarget::Array(_)))
+}
+
+/// `CArrayPtr(item)`, or `CCHARP` when the item is a byte (`lltype.Char`).
+/// An existing `Ptr(Array)` is already that shape and is kept.
+pub(crate) fn lltype_for_direct_ptradd_pointer(
+    existing: Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType>,
     item: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
 ) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
-    use crate::flowspace::model::ConstValue;
-    use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Ptr, PtrTarget};
-    LowLevelType::Ptr(Box::new(Ptr {
-        TO: PtrTarget::Array(Array::with_hints(
-            item.clone(),
-            vec![("nolength".into(), ConstValue::Bool(true))],
-        )),
-    }))
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::lltypesystem::rffi::{CArrayPtr, CCHARP};
+    if let Some(existing) = existing.as_ref()
+        && is_raw_array_ptr(existing)
+    {
+        return existing.clone();
+    }
+    if *item == LowLevelType::Char {
+        return (*CCHARP).clone();
+    }
+    CArrayPtr(item.clone())
 }
 
 /// Item type whose `llmemory.sizeof` is `n` bytes, so
@@ -43960,6 +44000,7 @@ mod tests {
         let ptr = graph
             .push_op_var(entry, OpKind::ConstRefAddr(0x1000), true)
             .expect("pointer value");
+        FunctionGraph::set_concretetype_of_inline(&ptr, crate::model::ConcreteType::Signed);
         let count = graph
             .push_op_var(entry, OpKind::ConstInt(8), true)
             .expect("count");
