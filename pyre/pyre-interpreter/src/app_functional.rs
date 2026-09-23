@@ -127,6 +127,14 @@ pub(crate) fn install_applevel_builtins() {
     if builtins.is_null() {
         return;
     }
+    // A worker thread's first EC registration reaches this again, and
+    // `clone_for_thread` hands it the builtins dict the running threads
+    // share.  The delete below would leave `sorted` unbound until the store,
+    // so a `LOAD_GLOBAL sorted` crossing that window raises `NameError`.
+    // A binding that is already the published function needs neither.
+    if crate::module_ns_get(builtins, "sorted").is_some_and(is_published_sorted) {
+        return;
+    }
     // `typeobject.py write_cell`: overwriting the trampoline wraps the
     // slot in `ObjectMutableCell`.  Delete first so the insert is
     // `StoreBare` — MixedModule._load_lazily writes the applevel
