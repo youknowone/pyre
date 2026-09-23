@@ -2882,7 +2882,18 @@ impl<S: JitState> JitDriver<S> {
     /// whose per-element slots have no sym-side collector.  No frontend
     /// currently declares one — the supported loop-carried form is
     /// `[.. ; virt]`.
+    pub fn take_interpret_bail_residual(&mut self) -> Option<String> {
+        self.meta.interpret_bail_residual.take()
+    }
+
+    pub fn interpret_abort_reason_label(&self) -> Option<&'static str> {
+        self.meta
+            .last_interpret_abort_reason
+            .map(abort_counter_name)
+    }
+
     pub fn run_pending_abort_blackhole(&mut self, state: &mut S, env: &S::Env) -> Option<usize> {
+        self.meta.interpret_bail_residual = None;
         let pending = self.meta.pending_abort_blackhole.take()?;
         let PendingAbortBlackhole {
             framestack,
@@ -3113,6 +3124,14 @@ impl<S: JitState> JitDriver<S> {
                 // back panics in `virt_restore_scalars_raw` and would
                 // smash the live frame residuals already updated.
                 // Leave `state` as the heap left it.
+                // Upstream's blackhole never returns. The interpret
+                // portal panics with this residual instead of rewinding.
+                self.meta.interpret_bail_residual = Some(
+                    terminal
+                        .as_ref()
+                        .and_then(|image| image.bail_residual.clone())
+                        .unwrap_or_else(|| "BailToInterpreter".to_owned()),
+                );
                 self.meta.single_pass_finish = true;
                 Some(usize::MAX)
             }
@@ -10400,6 +10419,18 @@ fn crn_restore_banks<'a>(
     }
 }
 
+fn abort_counter_name(reason: i32) -> &'static str {
+    match reason {
+        crate::pyjitpl::counters::ABORT_TOO_LONG => "ABORT_TOO_LONG",
+        crate::pyjitpl::counters::ABORT_BRIDGE => "ABORT_BRIDGE",
+        crate::pyjitpl::counters::ABORT_BAD_LOOP => "ABORT_BAD_LOOP",
+        crate::pyjitpl::counters::ABORT_ESCAPE => "ABORT_ESCAPE",
+        crate::pyjitpl::counters::ABORT_FORCE_QUASIIMMUT => "ABORT_FORCE_QUASIIMMUT",
+        crate::pyjitpl::counters::ABORT_SEGMENTED_TRACE => "ABORT_SEGMENTED_TRACE",
+        _ => "ABORT",
+    }
+}
+
 fn abort_blackhole_restore_banks<'a>(
     layout: &crate::blackhole::StateFieldLayout,
     terminal: &'a crate::blackhole::BlackholeTerminalImage,
@@ -10466,6 +10497,7 @@ mod tests {
             position: 0,
             last_opcode_position: 0,
             abort_permanent_bail: false,
+            bail_residual: None,
         };
         let args = ContinueRunningNormallyArgs {
             green_int: vec![34, 0],

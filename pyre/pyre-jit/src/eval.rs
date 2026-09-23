@@ -11470,13 +11470,6 @@ fn compile_and_run_once(
 
     let starting_tracing_key = driver.starting_green_key().unwrap_or(green_key);
     let mut propagated_exception = None;
-    // Residuals mutate the live PyFrame. If interpret aborts and the
-    // blackhole cannot finish the opcode (`BailToInterpreter`), restore
-    // this snapshot so the interpreter can replay the opcode.
-    // `convert_and_run_from_pyjitpl` always raises upstream. pyre still
-    // has unbound residuals the blackhole declines. The snapshot is
-    // only consumed by the interpret arm.
-    let abort_snapshot = interpret.then(|| frame_root.frame().snapshot_for_tracing());
     // pyjitpl.py `_compile_and_run_once`. Default arm is `trace_bytecode`.
     // `PYRE_PORTAL_INTERPRET=1` walks the seeded portal with `interpret`.
     let outcome = driver.jit_merge_point_keyed(
@@ -11575,20 +11568,18 @@ fn compile_and_run_once(
             if majit_metainterp::majit_log_enabled() {
                 eprintln!("[interpret] abort blackhole resume_pc={bh_pc}");
             }
+            if let Some(name) = driver.take_interpret_bail_residual() {
+                panic!("interpret blackhole bailed on residual {name}");
+            }
             if bh_pc != usize::MAX {
                 frame_root.frame().set_last_instr_from_next_instr(bh_pc);
                 correct_resume_vsd(frame_root.frame(), bh_pc);
-            } else if let Some(abort_snapshot) = abort_snapshot.as_ref() {
-                // Blackhole declined a residual and bailed. The opcode is
-                // half-applied; rewind so replay is sound.
-                frame_root.frame().restore_resume_state_from(abort_snapshot);
             }
         } else if outcome.is_none()
             && !driver.has_compiled_loop(green_key)
-            && let Some(abort_snapshot) = abort_snapshot.as_ref()
+            && let Some(reason) = driver.interpret_abort_reason_label()
         {
-            // Abort arm did not stage a blackhole. Rewind so replay is sound.
-            frame_root.frame().restore_resume_state_from(abort_snapshot);
+            panic!("interpret abort {reason} was not blackholed");
         }
     }
     let compiled_key = driver.last_compiled_key().unwrap_or(green_key);

@@ -2682,6 +2682,19 @@ pub struct MetaInterp<M: Clone> {
     /// that gives the trace up records its reason here rather than tallying
     /// itself — tallying at both ends counts one aborted trace twice.
     pub(crate) pending_abort_reason: Option<i32>,
+    /// Set by [`MetaInterp::interpret`]. `abort_trace` then stages
+    /// `pending_abort_blackhole` from the live framestack, the same stack
+    /// `run_blackhole_interp_to_cancel_tracing` reads after
+    /// `SwitchToBlackhole`. The bytecode walker leaves this false and keeps
+    /// publishing `aborted_framestack` itself.
+    pub(crate) interpret_framestack_for_abort: bool,
+    /// `Counters.ABORT_*` from the interpret walk's `aborted_tracing`.
+    /// `None` when that walk did not abort.
+    pub(crate) last_interpret_abort_reason: Option<i32>,
+    /// Residual named by a `BailToInterpreter` from
+    /// `run_pending_abort_blackhole`. The interpret portal panics on it;
+    /// upstream's blackhole never returns.
+    pub(crate) interpret_bail_residual: Option<String>,
 
     /// pyjitpl.py `MetaInterp.last_exc_box = None` (class
     /// attribute).  Set by `handle_possible_exception` to the boxed
@@ -4201,6 +4214,9 @@ impl<M: Clone> MetaInterp<M> {
             pending_abort_green_key: None,
             pending_abort_reason: None,
             pending_abort_permanent: false,
+            interpret_framestack_for_abort: false,
+            last_interpret_abort_reason: None,
+            interpret_bail_residual: None,
             last_exc_box: None,
             class_of_last_exc_is_const: false,
             forced_virtualizable: 0,
@@ -6719,6 +6735,11 @@ impl<M: Clone> MetaInterp<M> {
         // so the jitted arm is the one recorded. The residual hook
         // otherwise reads JIT_MODE_FLAG, which is only set in compiled
         // code, and would keep interpreter-only reload/ticker in the trace.
+        // `_compile_and_run_once` catches `SwitchToBlackhole` with this
+        // stack still on the metainterp. Later `abort_trace` calls stage
+        // it; the bytecode walker does not.
+        self.interpret_framestack_for_abort = true;
+        self.last_interpret_abort_reason = None;
         let _jitted = crate::JittedGuard::enter();
         let cpu = self.cpu.clone();
         let issubclass = self.issubclass;
@@ -11059,6 +11080,52 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
+    /// `pyjitpl.py compile_loop` / `reached_loop_header` raise
+    /// `SwitchToBlackhole` with `self.framestack` still intact.
+    /// `run_blackhole_interp_to_cancel_tracing` then runs
+    /// `convert_and_run_from_pyjitpl` on that stack. The bytecode walker
+    /// publishes its own `aborted_framestack` from the Abort arm; this
+    /// covers the interpret walk's `abort_trace` sites (`ABORT_BAD_LOOP`
+    /// included), which return `CompileOutcome::Aborted` instead of
+    /// `TraceAction::Abort`.
+    fn stage_interpret_abort_blackhole(&mut self) {
+        if !self.interpret_framestack_for_abort
+            || self.pending_abort_blackhole.is_some()
+            || self.framestack.is_empty()
+        {
+            return;
+        }
+        let (virt_array_values, virtualizable_ptr, raising_exception) = self
+            .tracing
+            .as_ref()
+            .map(|ctx| {
+                (
+                    ctx.collect_virtualizable_element_values(),
+                    ctx.virtualizable_heap_ptr().map_or(0, |p| p as i64),
+                    ctx.pending_switch_to_blackhole
+                        .as_ref()
+                        .is_some_and(|stb| stb.raising_exception),
+                )
+            })
+            .unwrap_or((None, 0, false));
+        // `MIFrame.pc` is the cursor after operand decode
+        // (`run_blackhole_interp_to_cancel_tracing`). CloseLoop aborts
+        // return before `interpret` stamps it.
+        if let Some(top) = self.framestack.frames.last_mut() {
+            top.pc = top.code_cursor;
+        }
+        let framestack = std::mem::replace(&mut self.framestack, MIFrameStack::empty());
+        self.pending_abort_blackhole = Some(crate::PendingAbortBlackhole {
+            framestack,
+            scalar_values: Vec::new(),
+            ref_scalar_values: Vec::new(),
+            virt_array_values,
+            virtualizable_ptr,
+            last_exc_value: self.last_exc_value,
+            raising_exception,
+        });
+    }
+
     /// Abort the current trace.
     ///
     /// If `permanent` is true, this location will never be traced again.
@@ -11080,6 +11147,7 @@ impl<M: Clone> MetaInterp<M> {
     /// single `on_trace_abort`; the split lands when pyre's hook surface
     /// is fully ported).
     pub fn abort_trace(&mut self, permanent: bool) {
+        self.stage_interpret_abort_blackhole();
         self.abort_trace_live(permanent);
         // A compile step that already decided to give the trace up staged its
         // `Counters.ABORT_*` reason; this is the catch that turns it into the
@@ -17747,6 +17815,9 @@ impl<M: Clone> MetaInterp<M> {
     /// `reason` is the upstream `Counters.ABORT_*` int (pyre routes
     /// `AbortReason::as_int()` through here).
     pub fn aborted_tracing(&mut self, reason: i32) {
+        if self.interpret_framestack_for_abort {
+            self.last_interpret_abort_reason = Some(reason);
+        }
         // pyjitpl.py:2761: profiler.count(reason) — reason-keyed bump
         // lands on the matching `staticdata.profiler.abort_*` atomic.
         self.count(reason, 1);
