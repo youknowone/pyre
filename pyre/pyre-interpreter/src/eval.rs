@@ -4463,6 +4463,18 @@ pub fn load_super_attr_value(
     )
 }
 
+/// `argument.py` `make_arguments` argument copy. `@jit.unroll_safe` so
+/// the fixed `nargs` walk does not make `call_valuestack` opaque.
+#[majit_macros::unroll_safe]
+fn pop_explicit_call_args(frame: &mut PyFrame, nargs: usize) -> Vec<PyObjectRef> {
+    let mut args = Vec::with_capacity(nargs);
+    for _ in 0..nargs {
+        args.push(frame.pop());
+    }
+    args.reverse();
+    args
+}
+
 impl OpcodeStepExecutor for PyFrame {
     fn last_instr(&self) -> isize {
         self.last_instr
@@ -6155,12 +6167,10 @@ impl OpcodeStepExecutor for PyFrame {
             unsafe { &mut *anchor.live() }.push_on_self(result);
             return Ok(());
         }
-        // Must allocate Vec for args.
-        let mut args = Vec::with_capacity(nargs);
-        for _ in 0..nargs {
-            args.push(self.pop());
-        }
-        args.reverse();
+        // argument.py `make_arguments` is `@jit.unroll_safe`. The loop
+        // stays out of `call` so `call_valuestack` itself has no backedge
+        // (`policy.py` `look_inside_graph`).
+        let args = pop_explicit_call_args(self, nargs);
         let null_or_self = self.pop();
         let callable = self.pop();
 
