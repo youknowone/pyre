@@ -108,6 +108,20 @@ pub fn stamp_host_virtualizable(host: &HostObject, class_key: &str) {
     host.class_set("_virtualizable_", ConstValue::List(items));
 }
 
+/// Whether `owner`'s `_virtualizable_` list declares `field_name` as an array
+/// (`name[*]`). The codewriter keys the same declaration; the front end asks
+/// it so a safe `Index` of that field pairs with the array read.
+pub fn is_declared_array_field(owner_root: Option<&str>, field_name: &str) -> bool {
+    let Some(owner) = owner_root else {
+        return false;
+    };
+    let needle = format!("{field_name}[*]");
+    REGISTERED.with(|registered| {
+        let registered = registered.borrow();
+        lookup(&registered, owner).is_some_and(|fields| fields.iter().any(|field| field == &needle))
+    })
+}
+
 fn field_names_for(class_key: &str) -> Option<Vec<String>> {
     let fields = REGISTERED.with(|registered| lookup(&registered.borrow(), class_key).cloned())?;
     if fields.is_empty() {
@@ -206,6 +220,23 @@ mod tests {
                 vec!["a".to_string(), "b".to_string(), "items[*]".to_string()]
             )]
         );
+    }
+
+    #[test]
+    fn is_declared_array_field_matches_the_star_entry_only() {
+        register_virtualizable_declarations([(
+            "GrainFrame".to_string(),
+            vec!["scope".to_string(), "operand_words[*]".to_string()],
+        )]);
+        assert!(is_declared_array_field(Some("GrainFrame"), "operand_words"));
+        assert!(is_declared_array_field(
+            Some("vm::GrainFrame"),
+            "operand_words"
+        ));
+        assert!(!is_declared_array_field(Some("GrainFrame"), "scope"));
+        assert!(!is_declared_array_field(Some("Other"), "operand_words"));
+        assert!(!is_declared_array_field(None, "operand_words"));
+        register_virtualizable_declarations(std::iter::empty::<(String, Vec<String>)>());
     }
 
     #[test]
