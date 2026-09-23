@@ -1049,6 +1049,12 @@ impl GraphStore {
         self.path_to_key.insert(path, key);
     }
 
+    /// `GraphKey` of the funcobj `path` names. Alias spellings of one
+    /// source graph share this key; a path with no registration has none.
+    pub(crate) fn key_for(&self, path: &CallPath) -> Option<GraphKey> {
+        self.path_to_key.get(path).cloned()
+    }
+
     pub(crate) fn get(&self, path: &CallPath) -> Option<&FunctionGraph> {
         self.graphs
             .get(self.path_to_key.get(path)?)
@@ -1716,8 +1722,11 @@ pub struct CallControl {
     /// Local read/write ops of one graph, scanned once. Later queries
     /// replay this list with a fresh `seen` set, so descr-mint side
     /// effects stay in the same DFS order as a walk of the live graph.
-    /// A graph that is not registered yet is left out of the map.
-    readwrite_replay: std::cell::RefCell<HashMap<CallPath, std::sync::Arc<ReadWriteReplay>>>,
+    /// Keyed by [`GraphKey`] (resolved through `path_to_key`): every alias
+    /// spelling of one source funcobj shares the entry, and a mutation of
+    /// that graph drops exactly that entry. A graph that is not registered
+    /// yet is left out of the map.
+    readwrite_replay: std::cell::RefCell<HashMap<GraphKey, std::sync::Arc<ReadWriteReplay>>>,
     /// Names passed to `compute_struct_size_with_path` while a
     /// `fielddescrof_concrete` miss is running. `None` when not recording.
     struct_size_log: std::cell::RefCell<Option<Vec<String>>>,
@@ -1777,8 +1786,9 @@ pub struct CallControl {
     /// Pre-computed struct layouts from actual runtime (std::mem::offset_of! etc.).
     /// When registered, provides exact (offset, size) for struct fields,
     /// bypassing the type-string heuristic. The runtime/proc-macro populates
-    /// this via `set_struct_layout()`.
-    pub struct_layouts: HashMap<majit_ir::descr::StructId, StructLayout>,
+    /// this via `set_struct_layout()`. Writes go through that setter so
+    /// `fielddescrof_memo` is dropped with the layout.
+    struct_layouts: HashMap<majit_ir::descr::StructId, StructLayout>,
     /// Consumer-supplied low-level storage kind, keyed by the same nominal
     /// struct identity as `struct_layouts`. RPython stores this on the lltype
     /// STRUCT; the Rust source declaration alone cannot distinguish a host
@@ -3480,7 +3490,14 @@ impl CallControl {
             graph.func.merge_from(&pending);
         }
         self.function_graphs.insert(path.clone(), graph);
-        self.readwrite_replay.borrow_mut().remove(&path);
+        // A new key has no replay yet. An overwrite merges into the slot
+        // this path now names (`GraphStore::insert`): that shared graph is
+        // the one whose replay is stale, including every alias already
+        // pointing at the same key. A previous key this path left behind
+        // is not modified.
+        if let Some(key) = self.function_graphs.key_for(&path) {
+            self.readwrite_replay.borrow_mut().remove(&key);
+        }
     }
 
     /// Read the [`FuncEffects`](crate::model::FuncEffects) for `path`:
@@ -5577,8 +5594,11 @@ impl CallControl {
         op_idx: usize,
         resolved: CallPath,
     ) {
-        // A replay holds only its own graph's ops, so only the caller's goes stale.
-        self.readwrite_replay.borrow_mut().remove(caller);
+        // Replay is keyed by the shared graph, so every alias of this
+        // caller drops together. The stamp mutates that one graph.
+        if let Some(key) = self.function_graphs.key_for(caller) {
+            self.readwrite_replay.borrow_mut().remove(&key);
+        }
         let Some(graph) = self.function_graphs.get_mut(caller) else {
             return;
         };
@@ -8640,18 +8660,23 @@ fn readwrite_replay_ops(
     function_graphs: &GraphStore,
     cc: &CallControl,
 ) -> std::sync::Arc<ReadWriteReplay> {
-    if let Some(hit) = cc.readwrite_replay.borrow().get(path) {
+    // A graph registered later must still be walked. Caching the miss
+    // would freeze an empty op list for every later query. The key is the
+    // shared funcobj, so an alias analysed after a sibling hits the same
+    // entry and a mutation of that funcobj drops it for every alias.
+    let Some(key) = function_graphs.key_for(path) else {
+        return std::sync::Arc::new(ReadWriteReplay::default());
+    };
+    if let Some(hit) = cc.readwrite_replay.borrow().get(&key) {
         return std::sync::Arc::clone(hit);
     }
-    // A graph registered later must still be walked. Caching the miss
-    // would freeze an empty op list for every later query.
     let Some(graph) = function_graphs.get(path) else {
         return std::sync::Arc::new(ReadWriteReplay::default());
     };
     let built = std::sync::Arc::new(build_readwrite_replay(graph));
     cc.readwrite_replay
         .borrow_mut()
-        .insert(path.clone(), std::sync::Arc::clone(&built));
+        .insert(key, std::sync::Arc::clone(&built));
     built
 }
 
@@ -13828,6 +13853,45 @@ mod tests {
             analyze_readwrite_indirect_family(None, &cc.function_graphs, &cc, &cc.descr_indices);
         assert!(unknown.is_top);
         assert!(unknown.write_fields.is_empty());
+    }
+
+    /// Two alias paths name one graph. Analysing through B fills the shared
+    /// replay; stamping the method resolution through A mutates that graph,
+    /// so the next analysis through B must walk the updated call.
+    #[test]
+    fn readwrite_replay_invalidates_every_alias_of_a_mutated_graph() {
+        let mut cc = CallControl::new();
+        rw_register(&mut cc, "leaf", vec![rw_write_field("Leaf", "x")]);
+
+        let caller = || {
+            let mut graph = FunctionGraph::new("caller_source");
+            let entry = graph.startblock;
+            graph.push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::method("leaf", None),
+                    args: Vec::new(),
+                    result_ty: ValueType::Void,
+                },
+                false,
+            );
+            graph
+        };
+        let alias_a = CallPath::from_segments(["alias_a"]);
+        let alias_b = CallPath::from_segments(["alias_b"]);
+        cc.register_function_graph(alias_a.clone(), caller());
+        cc.register_function_graph(alias_b.clone(), caller());
+
+        assert!(
+            rw_of(&cc, "alias_b").write_fields.is_empty(),
+            "the unresolved method is not followed"
+        );
+        cc.stamp_method_resolved_path(&alias_a, 0, 0, CallPath::from_segments(["leaf"]));
+        assert_eq!(
+            rw_of(&cc, "alias_b").write_fields,
+            vec![0],
+            "alias B observes the stamp applied through alias A"
+        );
     }
 
     /// A cycle stops when `seen` already holds the graph. The root's

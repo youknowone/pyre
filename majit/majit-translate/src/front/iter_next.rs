@@ -227,12 +227,14 @@ fn walk_back_with<T>(
 
 /// Producers, inputarg slots, and incoming links for one backward walk.
 ///
-/// Variable rows are `id - id_base`. Each row's slice is in the order a
-/// scan of `graph.blocks` visits that fact: op results in block/op order,
-/// the first inputarg slot of the var in each block, and links that enter
-/// a block in predecessor-block then exit order.
+/// Variable rows are a dense numbering of the ids that occur in this
+/// graph, assigned in first-seen order. Ids minted for other graphs are
+/// not rows. Each row's slice is in the order a scan of `graph.blocks`
+/// visits that fact: op results in block/op order, the first inputarg
+/// slot of the var in each block, and links that enter a block in
+/// predecessor-block then exit order.
 struct BackEdges {
-    id_base: u64,
+    row_of: rustc_hash::FxHashMap<u64, u32>,
     producer_range: Vec<(u32, u32)>,
     producer_at: Vec<(u32, u32)>,
     incoming_range: Vec<(u32, u32)>,
@@ -243,13 +245,10 @@ struct BackEdges {
 
 impl BackEdges {
     fn build(graph: &FunctionGraph) -> Self {
-        let mut id_base = u64::MAX;
-        let mut id_end = 0u64;
-        let mut saw = false;
+        let mut row_of: rustc_hash::FxHashMap<u64, u32> = rustc_hash::FxHashMap::default();
         let mut note = |id: u64| {
-            saw = true;
-            id_base = id_base.min(id);
-            id_end = id_end.max(id);
+            let next = row_of.len() as u32;
+            row_of.entry(id).or_insert(next);
         };
         for b in &graph.blocks {
             for op in &b.operations {
@@ -268,10 +267,11 @@ impl BackEdges {
                 }
             }
         }
-        if !saw {
+        if row_of.is_empty() {
             return Self::empty();
         }
-        let n = (id_end - id_base) as usize + 1;
+        let n = row_of.len();
+        let row = |id: u64| row_of[&id] as usize;
         let nblocks = graph.blocks.len();
         let mut prod_count = vec![0u32; n];
         let mut slot_count = vec![0u32; n];
@@ -281,11 +281,11 @@ impl BackEdges {
             let bi_u = bi as u32;
             for op in &b.operations {
                 if let Some(result) = &op.result {
-                    prod_count[(result.id() - id_base) as usize] += 1;
+                    prod_count[row(result.id())] += 1;
                 }
             }
             for iv in &b.inputargs {
-                let i = (iv.id() - id_base) as usize;
+                let i = row(iv.id());
                 if last_block[i] != bi_u {
                     last_block[i] = bi_u;
                     slot_count[i] += 1;
@@ -314,14 +314,14 @@ impl BackEdges {
             let bi_u = bi as u32;
             for (oi, op) in b.operations.iter().enumerate() {
                 if let Some(result) = &op.result {
-                    let i = (result.id() - id_base) as usize;
+                    let i = row(result.id());
                     let at = prod_fill[i] as usize;
                     producer_at[at] = (bi_u, oi as u32);
                     prod_fill[i] += 1;
                 }
             }
             for (pos, iv) in b.inputargs.iter().enumerate() {
-                let i = (iv.id() - id_base) as usize;
+                let i = row(iv.id());
                 if last_block[i] == bi_u {
                     continue;
                 }
@@ -340,7 +340,7 @@ impl BackEdges {
             }
         }
         Self {
-            id_base,
+            row_of,
             producer_range,
             producer_at,
             incoming_range,
@@ -352,7 +352,7 @@ impl BackEdges {
 
     fn empty() -> Self {
         Self {
-            id_base: 0,
+            row_of: rustc_hash::FxHashMap::default(),
             producer_range: Vec::new(),
             producer_at: Vec::new(),
             incoming_range: Vec::new(),
@@ -363,8 +363,7 @@ impl BackEdges {
     }
 
     fn var_index(&self, var: &Variable) -> Option<usize> {
-        let i = var.id().checked_sub(self.id_base)? as usize;
-        (i < self.producer_range.len()).then_some(i)
+        self.row_of.get(&var.id()).map(|&row| row as usize)
     }
 
     /// First op in block/op order whose result is `var`.

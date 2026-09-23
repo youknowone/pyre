@@ -6326,12 +6326,17 @@ pub fn remove_duplicate_inputargs(graph: &mut FunctionGraph) {
     let block_ids: Vec<BlockId> = inputs.keys().copied().collect();
     // A block's resolved columns change only after some `union`. Re-walking
     // a block that already observed the current union-find removes nothing.
+    // The epoch stored is the one the block observed, before its own unions
+    // advance it: those unions can make the block's earlier columns equal,
+    // and `remove_identical_vars_SSA` walks every block again while
+    // `progress` is set.
     let mut epoch: u64 = 0;
     let mut seen_epoch: HashMap<BlockId, u64> = HashMap::new();
     loop {
         let mut progress = false;
         for block_id in &block_ids {
-            if seen_epoch.get(block_id).copied() == Some(epoch) {
+            let observed = epoch;
+            if seen_epoch.get(block_id).copied() == Some(observed) {
                 continue;
             }
             let changed = {
@@ -6343,7 +6348,7 @@ pub fn remove_duplicate_inputargs(graph: &mut FunctionGraph) {
                 epoch += 1;
                 progress = true;
             }
-            seen_epoch.insert(*block_id, epoch);
+            seen_epoch.insert(*block_id, observed);
         }
         if !progress {
             break;
@@ -9609,6 +9614,153 @@ mod tests {
             ),
             "a downstream phi fed by the merged pair collapses too"
         );
+    }
+
+    /// One predecessor feeds `[v2, v0, v2]` into `[v0, v1, v2]`. The first
+    /// walk unions `v2` into `v0`; that union makes the `v0` column equal
+    /// to `v1`, so the same block has to be walked again.
+    #[test]
+    fn remove_duplicate_inputargs_rewalks_block_after_its_own_unions() {
+        let mut graph = FunctionGraph::new("self-union-phi");
+        let entry = graph.startblock;
+        let merge = graph.create_block();
+        let v0 = install_phi(&mut graph, merge, "v0");
+        let v1 = install_phi(&mut graph, merge, "v1");
+        let v2 = install_phi(&mut graph, merge, "v2");
+        graph.set_goto(entry, merge, vec![v2.clone(), v0.clone(), v2.clone()]);
+        let v1_use = graph
+            .push_op_var(
+                merge,
+                OpKind::BinOp {
+                    op: "int_add".into(),
+                    lhs: v1.clone(),
+                    rhs: v1.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let v2_use = graph
+            .push_op_var(
+                merge,
+                OpKind::BinOp {
+                    op: "int_add".into(),
+                    lhs: v2.clone(),
+                    rhs: v2.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+
+        remove_duplicate_inputargs(&mut graph);
+
+        assert_eq!(graph.block(merge).inputargs, vec![v0.clone()]);
+        assert_eq!(
+            graph.block(entry).exits[0].args,
+            vec![LinkArg::Value(v0.clone())]
+        );
+        for use_var in [v1_use, v2_use] {
+            let op = graph
+                .block(merge)
+                .operations
+                .iter()
+                .find(|op| op.result.as_ref() == Some(&use_var))
+                .expect("renamed reader survives");
+            assert!(
+                matches!(
+                    &op.kind,
+                    OpKind::BinOp { lhs, rhs, .. } if lhs == &v0 && rhs == &v0
+                ),
+                "v1 and v2 are renamed to the surviving column"
+            );
+        }
+    }
+
+    /// Entry `(x, x, y, y)` and back edge `(c, d, e, e)` into `(a, b, c, d)`.
+    /// The first walk drops `d` into `c`; the next walk, seeing that union,
+    /// drops `b` into `a`. Two columns remain.
+    #[test]
+    fn remove_duplicate_inputargs_rewalks_back_edge_phi() {
+        let mut graph = FunctionGraph::new("back-edge-phi");
+        let entry = graph.startblock;
+        let x = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let y = graph.push_op_var(entry, OpKind::ConstInt(2), true).unwrap();
+        let e = graph.push_op_var(entry, OpKind::ConstInt(3), true).unwrap();
+        let loop_block = graph.create_block();
+        let a = install_phi(&mut graph, loop_block, "a");
+        let b = install_phi(&mut graph, loop_block, "b");
+        let c = install_phi(&mut graph, loop_block, "c");
+        let d = install_phi(&mut graph, loop_block, "d");
+        graph.set_goto(
+            entry,
+            loop_block,
+            vec![x.clone(), x.clone(), y.clone(), y.clone()],
+        );
+        graph.set_goto(
+            loop_block,
+            loop_block,
+            vec![c.clone(), d.clone(), e.clone(), e.clone()],
+        );
+        let b_use = graph
+            .push_op_var(
+                loop_block,
+                OpKind::BinOp {
+                    op: "int_add".into(),
+                    lhs: b.clone(),
+                    rhs: b.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let d_use = graph
+            .push_op_var(
+                loop_block,
+                OpKind::BinOp {
+                    op: "int_add".into(),
+                    lhs: d.clone(),
+                    rhs: d.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+
+        remove_duplicate_inputargs(&mut graph);
+
+        assert_eq!(
+            graph.block(loop_block).inputargs,
+            vec![a.clone(), c.clone()]
+        );
+        assert_eq!(
+            graph.block(entry).exits[0].args,
+            vec![LinkArg::Value(x), LinkArg::Value(y)]
+        );
+        assert_eq!(
+            graph.block(loop_block).exits[0].args,
+            vec![LinkArg::Value(c.clone()), LinkArg::Value(e)]
+        );
+        let b_op = graph
+            .block(loop_block)
+            .operations
+            .iter()
+            .find(|op| op.result.as_ref() == Some(&b_use))
+            .expect("b's reader survives");
+        assert!(matches!(
+            &b_op.kind,
+            OpKind::BinOp { lhs, rhs, .. } if lhs == &a && rhs == &a
+        ));
+        let d_op = graph
+            .block(loop_block)
+            .operations
+            .iter()
+            .find(|op| op.result.as_ref() == Some(&d_use))
+            .expect("d's reader survives");
+        assert!(matches!(
+            &d_op.kind,
+            OpKind::BinOp { lhs, rhs, .. } if lhs == &c && rhs == &c
+        ));
     }
 
     /// `registered_struct_layout` resolves a spelling that is not a key by

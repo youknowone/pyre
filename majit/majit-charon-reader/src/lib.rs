@@ -71,6 +71,7 @@ pub struct Llbc {
     transparent_scalar_kinds: parking_lot::RwLock<Vec<(String, TransparentScalarKind)>>,
     /// Trait-decl id → associated-type bindings of its unique impl.
     /// `trait_impls` is immutable after parse, so the map is built once.
+    /// See [`TraitAssocIndex`].
     trait_assoc_index: std::sync::OnceLock<TraitAssocIndex>,
 }
 
@@ -83,6 +84,11 @@ pub enum TransparentScalarKind {
     Float,
 }
 
+/// Charon-reader lookup index over `trait_impls`. It has no RPython/PyPy
+/// owner. Iteration order is never observed: queries are by trait-decl id
+/// and only a unique impl answers. The first `TraitType` row per assoc
+/// wins, matching the linear scan this index replaced.
+///
 /// `trait decl id → Some(unique impl bindings)` or `None` when a second
 /// impl of that trait was seen. Missing keys have no impl.
 type TraitAssocIndex = std::collections::HashMap<u64, Option<UniqueTraitImpl>>;

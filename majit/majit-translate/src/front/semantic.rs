@@ -121,18 +121,151 @@ pub struct SemanticFunction {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StructFieldRegistry {
     /// struct_name → [(field_name, full_field_type_string)]
-    pub fields: HashMap<String, Vec<(String, String)>>,
+    pub fields: FieldRows,
     /// Suffix buckets for the key set of `fields`. Built on the first query
-    /// that needs them and reused while `len` still equals `fields.len()`.
-    /// Replacing the rows of an existing key does not change the key set;
-    /// those queries read the rows from `fields` after the bucket narrows.
-    /// Inserting a new key changes `len`, so the next query rebuilds.
-    /// Removing a key goes through [`Self::remove_field`], which drops the
-    /// buckets — a later insert that restores `len` cannot reuse them.
+    /// that needs them and reused while the key-set fingerprint still
+    /// matches. Replacing the rows of an existing key does not change the
+    /// key set; those queries read the rows from `fields` after the bucket
+    /// narrows. Inserting or removing a key changes the fingerprint, so
+    /// the next query rebuilds — including a remove followed by an insert
+    /// that restores `len`.
     /// Crate-visible so a struct literal can fill it with `..Default::default()`;
-    /// queries treat a missing or stale `len` as absent and rebuild.
+    /// queries treat a missing or stale fingerprint as absent and rebuild.
     #[serde(skip)]
     pub(crate) field_path_index: std::cell::RefCell<Option<FieldPathIndex>>,
+}
+
+/// `struct_name → [(field_name, full_field_type_string)]`, with an O(1)
+/// key-set fingerprint. `insert` / `remove` / `entry` update the xor of
+/// the keys' hashes; a lookup compares that word and `len` and does not
+/// rescan the map. Reads deref to the inner map.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(
+    from = "HashMap<String, Vec<(String, String)>>",
+    into = "HashMap<String, Vec<(String, String)>>"
+)]
+pub struct FieldRows {
+    map: HashMap<String, Vec<(String, String)>>,
+    /// Xor of [`field_key_fp`] over the current keys. `0` when empty.
+    key_fp: std::cell::Cell<u64>,
+}
+
+impl Default for FieldRows {
+    fn default() -> Self {
+        Self {
+            map: HashMap::new(),
+            key_fp: std::cell::Cell::new(0),
+        }
+    }
+}
+
+impl From<HashMap<String, Vec<(String, String)>>> for FieldRows {
+    fn from(map: HashMap<String, Vec<(String, String)>>) -> Self {
+        let key_fp = map.keys().fold(0u64, |acc, key| acc ^ field_key_fp(key));
+        Self {
+            map,
+            key_fp: std::cell::Cell::new(key_fp),
+        }
+    }
+}
+
+impl From<FieldRows> for HashMap<String, Vec<(String, String)>> {
+    fn from(rows: FieldRows) -> Self {
+        rows.map
+    }
+}
+
+impl std::ops::Deref for FieldRows {
+    type Target = HashMap<String, Vec<(String, String)>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+impl IntoIterator for FieldRows {
+    type Item = (String, Vec<(String, String)>);
+    type IntoIter = std::collections::hash_map::IntoIter<String, Vec<(String, String)>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.map.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a FieldRows {
+    type Item = (&'a String, &'a Vec<(String, String)>);
+    type IntoIter = std::collections::hash_map::Iter<'a, String, Vec<(String, String)>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.map.iter()
+    }
+}
+
+fn field_key_fp(key: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
+    key.hash(&mut hasher);
+    hasher.finish()
+}
+
+impl FieldRows {
+    /// Xor of the current keys' hashes. Compared by the path index in O(1).
+    pub(crate) fn key_fp(&self) -> u64 {
+        self.key_fp.get()
+    }
+
+    pub fn insert(
+        &mut self,
+        key: String,
+        value: Vec<(String, String)>,
+    ) -> Option<Vec<(String, String)>> {
+        let piece = field_key_fp(&key);
+        let replaced = self.map.insert(key, value);
+        if replaced.is_none() {
+            self.key_fp.set(self.key_fp.get() ^ piece);
+        }
+        replaced
+    }
+
+    pub fn remove(&mut self, key: &str) -> Option<Vec<(String, String)>> {
+        let removed = self.map.remove(key)?;
+        self.key_fp.set(self.key_fp.get() ^ field_key_fp(key));
+        Some(removed)
+    }
+
+    pub fn entry(&mut self, key: String) -> FieldRowsEntry<'_> {
+        FieldRowsEntry {
+            inner: self.map.entry(key),
+            key_fp: &self.key_fp,
+        }
+    }
+}
+
+/// [`HashMap::entry`] for [`FieldRows`]. `or_insert` folds a new key into
+/// the fingerprint; an occupied key leaves it unchanged.
+pub struct FieldRowsEntry<'a> {
+    inner: std::collections::hash_map::Entry<'a, String, Vec<(String, String)>>,
+    key_fp: &'a std::cell::Cell<u64>,
+}
+
+impl<'a> FieldRowsEntry<'a> {
+    pub fn or_insert(self, default: Vec<(String, String)>) -> &'a mut Vec<(String, String)> {
+        self.or_insert_with(|| default)
+    }
+
+    pub fn or_insert_with<F>(self, default: F) -> &'a mut Vec<(String, String)>
+    where
+        F: FnOnce() -> Vec<(String, String)>,
+    {
+        match self.inner {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                self.key_fp
+                    .set(self.key_fp.get() ^ field_key_fp(entry.key()));
+                entry.insert(default())
+            }
+        }
+    }
 }
 
 impl StructFieldRegistry {
@@ -215,16 +348,14 @@ impl StructFieldRegistry {
         })
     }
 
-    /// Drop the suffix buckets. Key removal can restore a previous `len`
-    /// with a different key set; [`Self::remove_field`] clears them when it
-    /// removes a key, before any later insert.
+    /// Drop the suffix buckets. [`FieldRows`] also records a key-set
+    /// fingerprint, so a later lookup rebuilds after any key insert or
+    /// remove; this drops the buckets immediately.
     pub(crate) fn invalidate_field_path_index(&self) {
         self.field_path_index.borrow_mut().take();
     }
 
-    /// Remove one registered key and drop the suffix buckets. Inserts of a
-    /// new key are observed by the `len` check; this is the path that can
-    /// put a different key set back at the same `len`.
+    /// Remove one registered key and drop the suffix buckets.
     pub(crate) fn remove_field(&mut self, key: &str) -> Option<Vec<(String, String)>> {
         let removed = self.fields.remove(key);
         if removed.is_some() {
@@ -295,15 +426,16 @@ impl StructFieldRegistry {
 
     fn ensure_field_path_index(&self) {
         let len = self.fields.len();
+        let key_fp = self.fields.key_fp();
         if self
             .field_path_index
             .borrow()
             .as_ref()
-            .is_some_and(|index| index.len == len)
+            .is_some_and(|index| index.len == len && index.key_fp == key_fp)
         {
             return;
         }
-        let built = FieldPathIndex::build(&self.fields);
+        let built = FieldPathIndex::build(&self.fields, key_fp);
         *self.field_path_index.borrow_mut() = Some(built);
     }
 }
@@ -311,6 +443,8 @@ impl StructFieldRegistry {
 #[derive(Clone, Debug)]
 pub(crate) struct FieldPathIndex {
     len: usize,
+    /// [`FieldRows::key_fp`] at the time the buckets were built.
+    key_fp: u64,
     /// Last `::` segment → keys ending with that segment.
     by_last: rustc_hash::FxHashMap<String, Vec<String>>,
     /// Last segment of the parent path → keys with that parent leaf.
@@ -318,7 +452,7 @@ pub(crate) struct FieldPathIndex {
 }
 
 impl FieldPathIndex {
-    fn build(fields: &HashMap<String, Vec<(String, String)>>) -> Self {
+    fn build(fields: &HashMap<String, Vec<(String, String)>>, key_fp: u64) -> Self {
         let mut by_last: rustc_hash::FxHashMap<String, Vec<String>> =
             rustc_hash::FxHashMap::default();
         let mut by_parent_last: rustc_hash::FxHashMap<String, Vec<String>> =
@@ -339,6 +473,7 @@ impl FieldPathIndex {
         }
         Self {
             len: fields.len(),
+            key_fp,
             by_last,
             by_parent_last,
         }
@@ -1216,6 +1351,24 @@ fn close_ids_over_aliases(pairs: &[(u64, u64)], ids: &mut std::collections::Hash
 mod tests {
     use super::*;
     use crate::model::FunctionGraph;
+
+    /// `remove` then `insert` of a different key restores `len`. The suffix
+    /// lookup has to observe the new row.
+    #[test]
+    fn field_path_index_rebuilds_after_same_len_key_replacement() {
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "a::Foo".to_string(),
+            vec![("x".to_string(), "i64".to_string())],
+        );
+        assert_eq!(reg.field_type("Foo", "x"), Some("i64"));
+        reg.fields.remove("a::Foo");
+        reg.fields.insert(
+            "b::Foo".to_string(),
+            vec![("x".to_string(), "u8".to_string())],
+        );
+        assert_eq!(reg.field_type("Foo", "x"), Some("u8"));
+    }
 
     fn free_fn(name: &str) -> SemanticFunction {
         SemanticFunction {
