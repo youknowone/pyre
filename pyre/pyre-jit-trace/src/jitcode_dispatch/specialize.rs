@@ -2468,6 +2468,30 @@ fn walker_frame_executing_py_pc<Sym: WalkSym>(
     Some((frame_box, ctx.vstack_cur_pypc))
 }
 
+/// Pin a frame-attribute receiver to the frame type's getset.
+///
+/// Its class, its `w_class` and the frame type's `version_tag` are guarded, so
+/// rebinding the getset on the type revokes the loop instead of the fold
+/// outliving the descriptor that produced it.  This is the half of
+/// [`walker_prove_owned_frame_pc`] that does not ask whether the receiver is
+/// the frame the walk is executing: `f_back` records a field on the object,
+/// and `pyframe.py get_f_back` derefs `f_backref` without forcing, so a
+/// receiver that merely *is* a frame still owes these guards.
+fn walker_guard_frame_attr_receiver<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    concrete_obj: pyre_object::PyObjectRef,
+) -> Result<bool, DispatchError> {
+    let w_type = pyre_interpreter::typedef::gettypeobject(&pyre_interpreter::pyframe::FRAME_TYPE);
+    let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) };
+    if version_tag == 0 || unsafe { (*concrete_obj).w_class } != w_type {
+        return Ok(false);
+    }
+    walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
+    Ok(true)
+}
+
 /// Prove the receiver IS the frame the walk is executing, and answer that
 /// frame's executing pc.
 ///
@@ -2475,13 +2499,13 @@ fn walker_frame_executing_py_pc<Sym: WalkSym>(
 /// walk holds rather than the one the frame's own field records and therefore
 /// owe the same proof about the object in hand.
 ///
-/// The receiver is pinned two ways.  Its class, its `w_class` and the frame
-/// type's `version_tag` are guarded, so rebinding the getset on the type
-/// revokes the loop instead of the fold outliving the descriptor that produced
-/// it.  And when the receiver arrives in a box other than the frame's own —
-/// a local the loop hoisted the frame into — a `ptr_eq` against that box is
-/// guarded, so a later entry holding a different frame side-exits to the
-/// residual rather than reading this trace's coordinate.
+/// The receiver is pinned two ways.  [`walker_guard_frame_attr_receiver`]
+/// guards the type.  And when the receiver arrives in a box other than the
+/// frame's own — a local the loop hoisted the frame into — a `ptr_eq` against
+/// that box is guarded, so a later entry holding a different frame side-exits
+/// to the residual rather than reading this trace's coordinate.  That second
+/// pin is only meaningful once [`walker_frame_executing_py_pc`] has named the
+/// frame this walk is executing.
 fn walker_prove_owned_frame_pc<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -2491,12 +2515,9 @@ fn walker_prove_owned_frame_pc<Sym: WalkSym>(
     let Some((frame_box, py_pc)) = walker_frame_executing_py_pc(ctx, concrete_obj, op_pc) else {
         return Ok(None);
     };
-    let w_type = pyre_interpreter::typedef::gettypeobject(&pyre_interpreter::pyframe::FRAME_TYPE);
-    let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) };
-    if version_tag == 0 || unsafe { (*concrete_obj).w_class } != w_type {
+    if !walker_guard_frame_attr_receiver(ctx, op_pc, obj, concrete_obj)? {
         return Ok(None);
     }
-    walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
     if obj != frame_box {
         let is_own_frame = ctx.trace_ctx.record_op(OpCode::PtrEq, &[obj, frame_box]);
         ctx.trace_ctx
@@ -2668,10 +2689,14 @@ fn try_walker_specialize_frame_lineno<Sym: WalkSym>(
 
 /// `pyframe.py fget_f_back` → `get_f_back` → `getnextframe_nohidden`.
 ///
-/// The first hop is `f_backref` (unforced). When that names the standard
-/// virtualizable, `_do_jit_force_virtual` short-circuits on identity and
-/// `opimpl_getfield_vable` never runs. Emit that hop plus the identity
-/// guard; a farther or hidden hop still falls through.
+/// The first hop is `f_backref` (unforced). `PyFrame._virtualizable_` does
+/// not name that field, so `rvirtualizable.py hook_access_field` injects no
+/// force and the read does not have to be the frame the walk is executing.
+/// When the hop names the standard virtualizable, `_do_jit_force_virtual`
+/// short-circuits on identity and `opimpl_getfield_vable` never runs. Emit
+/// that hop plus the identity guard; a farther or hidden hop still falls
+/// through.  The type guards stay: rebinding the getset must still revoke
+/// the loop.
 fn try_walker_specialize_frame_f_back<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -2680,7 +2705,7 @@ fn try_walker_specialize_frame_f_back<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
-    if walker_prove_owned_frame_pc(ctx, op_pc, obj, concrete_obj)?.is_none() {
+    if !walker_guard_frame_attr_receiver(ctx, op_pc, obj, concrete_obj)? {
         return Ok(None);
     }
     let frame = concrete_obj as *mut pyre_interpreter::PyFrame;
@@ -3314,6 +3339,42 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     // the locals region out of the virtualizable image, so the fold has to
     // write that region itself.
     let inline_frame = current_inline_concrete_frame();
+    // `pyjitpl.py MIFrame._nonstandard_virtualizable`: a box that is not
+    // `virtualizable_boxes[-1]` but points at it is still the standard
+    // virtualizable.  The check records `PTR_EQ` + `implement_guard_value`
+    // and, when the pointers match, `replace_box`s the alias onto the
+    // standard box.  `f_locals` then takes the existing standard-frame arm.
+    // A failed identity falls through to `emit_force_virtualizable` and this
+    // fold declines, the same as a receiver that was never the portal frame.
+    let mut obj = obj;
+    if name == "f_locals"
+        && ctx.trace_ctx.standard_virtualizable_ptr() == Some(concrete_obj as usize)
+        && ctx
+            .trace_ctx
+            .standard_virtualizable_box()
+            .is_some_and(|standard| standard != obj)
+        && let Some(info) = ctx.trace_ctx.virtualizable_info().cloned()
+    {
+        // `locals_cells_stack_w` is the virtualizable array `f_locals` reads,
+        // so its descr carries the active vinfo (`vinfo is fielddescr.get_vinfo()`).
+        let fielddescr = info.array_pointer_field_descr(0);
+        let guards_before = ctx.trace_ctx.num_guards();
+        let nonstandard = vable_ops::with_replace_frames(ctx, |ctx| {
+            ctx.trace_ctx
+                .nonstandard_virtualizable(op_pc, obj, &fielddescr)
+        });
+        resume_snapshot::walker_capture_inline_nonstandard_vable_guard(
+            ctx,
+            op_pc,
+            guards_before,
+            None,
+        )?;
+        if !nonstandard
+            && let Some(standard) = ctx.trace_ctx.standard_virtualizable_box()
+        {
+            obj = standard;
+        }
+    }
     let is_inline_frame = inline_frame != 0
         && concrete_obj as usize == inline_frame
         && ctx

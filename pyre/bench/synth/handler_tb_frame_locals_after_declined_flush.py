@@ -1,7 +1,9 @@
-# A forced frame read from INSIDE a Python expression, so the merge-point
-# escape flush declines and only the locals region is written.
+# A frame read from INSIDE a Python expression. Forcing it would make the
+# merge-point escape flush decline and write only the locals region.
 #
-# `'i' in tb.tb_frame.f_locals` forces the frame while the operand stack holds
+# `'i' in tb.tb_frame.f_locals` reads the portal frame through a different box.
+# The alias is promoted onto the standard virtualizable, so the read does not
+# force the frame.  A residual force would land while the operand stack holds
 # `[seen, add, <bool being computed>]`.  A mid-expression stack slot reads NULL
 # from the virtualizable shadow, so `flush_walk_end_state_to_frame_inner`
 # declines the whole write and `flush_locals_region_to_frame` writes slots
@@ -16,7 +18,7 @@
 # the replay re-enters one opcode late on an empty stack -- `value-stack
 # underflow: depth=N base=N`, a JIT-only panic with no output at all.
 #
-# The handler is what puts the force inside an expression whose stack is deep
+# The handler is what puts the read inside an expression whose stack is deep
 # enough to notice: the `seen.add(...)` receiver and its bound method are both
 # live below the value being computed.
 import sys

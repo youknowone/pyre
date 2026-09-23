@@ -5,8 +5,9 @@
 # interpreters' startup and reads whatever the host's process spawn cost
 # happens to be that run. The jitstats baselines gate it.
 # Regression guard: a callee stores its OWN frame (sys._getframe(0)); the loop
-# body later walks .f_back.f_locals as a SEPARATE residual. That read forces
-# the traced caller mid-expression; the escape flush must commit with the
+# body later walks .f_back.f_locals. That hop is the caller's frame, so it
+# folds without forcing. A residual force would hit the traced caller
+# mid-expression; the escape flush must commit with the
 # operand-stack mirror (the vable shadow's stack region is NULL there) and
 # resume forward AT the escaping opcode. Before the latched-stack escape
 # flush, the flush declined, the FOR_ITER inflight deliver was refused, and
