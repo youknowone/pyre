@@ -4746,6 +4746,14 @@ impl MiniMarkGC {
         let shadow_obj = shadow_hdr_ptr as usize + GcHeader::SIZE;
         unsafe {
             (*(shadow_hdr_ptr as *mut GcHeader)).tid_and_flags = (*hdr_ptr).tid_and_flags;
+            // `_allocate_shadow` copies the full tid and its XXX notes that a
+            // pinned source leaves GCFLAG_PINNED (== PINNED_OBJECT_PARENT_KNOWN)
+            // on the old-gen shadow. Upstream's reachable-only debug walk never
+            // meets an unreferenced shadow; the MARKING all-allocated walk in
+            // `debug_check_consistency_at` does, and asserts PINNED outside the
+            // nursery. The bit means nothing on the shadow: the copy at the
+            // next minor overwrites the whole header.
+            (*(shadow_hdr_ptr as *mut GcHeader)).clear_flag(GcFlags::GCFLAG_PINNED);
             // The shadow lives in old-gen, so it carries TRACK_YOUNG_PTRS like
             // every other old-gen object — the write barrier tracks it through
             // that flag. (The source header was copied from the nursery object,

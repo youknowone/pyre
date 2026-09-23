@@ -125,29 +125,13 @@ extern "C" fn bh_code_unit_at(code: i64, index: i64) -> i64 {
     i64::from(crate::pyopcode::code_unit_at(code, index as usize))
 }
 
-/// Word-ABI bridges for the three loop-header predicates. Residual calls
-/// use a word ABI; on wasm32 the raw signatures use `i32` for pointer/`bool`
-/// while the residual call site is `(i64 x n) -> i64`.
+/// Word-ABI bridge for the loop-header predicate. Residual calls use a word
+/// ABI; on wasm32 the raw signature uses `i32` for pointer/`bool` while the
+/// residual call site is `(i64 x n) -> i64`.
 extern "C" fn code_pc_is_loop_header_word(code: i64, pc: i64) -> i64 {
     crate::loop_headers::code_pc_is_loop_header(
         code as usize as *const crate::CodeObject,
         pc as usize,
-    ) as i64
-}
-
-extern "C" fn cached_loop_region_for_iter_bodies_all_jit_safe_word(
-    code: i64,
-    loop_header_pc: i64,
-) -> i64 {
-    crate::loop_headers::cached_loop_region_for_iter_bodies_all_jit_safe(
-        code as usize as *const crate::CodeObject,
-        loop_header_pc as usize,
-    ) as i64
-}
-
-extern "C" fn cached_function_entry_trace_is_jit_safe_word(code: i64) -> i64 {
-    crate::loop_headers::cached_function_entry_trace_is_jit_safe(
-        code as usize as *const crate::CodeObject,
     ) as i64
 }
 
@@ -1110,29 +1094,16 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     let mut entries = Vec::new();
     let mut abi_unsound_arguments = Vec::new();
 
-    // `eval::FrameAnchor` is interpreter runtime rooting, outside the LLBC
-    // module set.  `majit-translate` declares these three functions through
-    // its annotator-only `register_external` carrier; publish an address for
-    // each declared path here so a residual call never falls back to a
-    // symbolic hash.  The addresses are the word-ABI bridges above, not the
-    // raw functions, for the reason their doc gives.
+    // `code_pc_is_loop_header` is interpreter bytecode analysis, outside the
+    // LLBC module set. `majit-translate` declares it through its annotator-only
+    // `register_external` carrier; publish an address so a residual call never
+    // falls back to a symbolic hash. The address is the word-ABI bridge above,
+    // not the raw function, for the reason its doc gives.
     cpa2(
         &mut entries,
         "pyre_interpreter::loop_headers::code_pc_is_loop_header",
         "pyre_interpreter::code_pc_is_loop_header",
         code_pc_is_loop_header_word,
-    );
-    cpa2(
-        &mut entries,
-        "pyre_interpreter::loop_headers::cached_loop_region_for_iter_bodies_all_jit_safe",
-        "pyre_interpreter::cached_loop_region_for_iter_bodies_all_jit_safe",
-        cached_loop_region_for_iter_bodies_all_jit_safe_word,
-    );
-    cpa1(
-        &mut entries,
-        "pyre_interpreter::loop_headers::cached_function_entry_trace_is_jit_safe",
-        "pyre_interpreter::cached_function_entry_trace_is_jit_safe",
-        cached_function_entry_trace_is_jit_safe_word,
     );
     cp1(
         &mut entries,

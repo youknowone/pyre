@@ -14800,10 +14800,6 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pyre_interpreter::{
-        for_iter_body_is_jit_safe_at, function_entry_trace_is_jit_safe,
-        loop_region_for_iter_bodies_all_jit_safe, loop_region_ranges,
-    };
 
     #[test]
     fn opcode_method_name_underscores_numeric_suffixes() {

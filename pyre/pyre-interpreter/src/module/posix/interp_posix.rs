@@ -4623,7 +4623,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 if crate::importing::utf8_mode_flag() != 0 {
                     return Ok(pyre_object::w_str_new_managed("utf-8"));
                 }
-                match rustpython_host_env::locale::nl_langinfo_codeset() {
+                #[cfg(feature = "host_env")]
+                let codeset = rustpython_host_env::locale::nl_langinfo_codeset();
+                // host_env owns nl_langinfo; without it there is no locale to ask.
+                #[cfg(not(feature = "host_env"))]
+                let codeset: Option<Vec<u8>> = None;
+                match codeset {
                     Some(codeset) if !codeset.is_empty() => Ok(pyre_object::w_str_new_managed(
                         &String::from_utf8_lossy(&codeset),
                     )),
