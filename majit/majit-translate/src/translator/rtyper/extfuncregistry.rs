@@ -97,6 +97,20 @@ pub(crate) fn register_external_functions() -> Result<&'static [ExtFuncEntry], T
         // naming worlds meet.  Result is always `float`: that is the C
         // llexternal / `register_external(..., [float], float)` annotation,
         // even when `ll_math_ceil` (the wrapper) returns `Result`.
+        for row in super::lltypesystem::module::ll_extaccessor::WORD_LOAD_LLEXTERNALS {
+            let qualname = row.segments.join(".");
+            entries.push(extfunc::register_llexternal(
+                HostObject::new_builtin_callable(&qualname),
+                vec![],
+                Some(ExternalAnnotation::Unsigned),
+                Some(qualname),
+                None,
+                None,
+                true,
+                row.random_effects_on_gcobjs,
+                row.releasegil,
+            )?);
+        }
         for row in super::lltypesystem::module::ll_math::F64_METHOD_LLEXTERNALS {
             let args = vec![ExternalAnnotation::Float; row.arity];
             entries.push(extfunc::register_external(

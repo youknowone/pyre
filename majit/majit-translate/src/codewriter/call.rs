@@ -1860,6 +1860,10 @@ pub struct CallControl {
         crate::flowspace::argument::Signature,
         crate::model::ValueType,
     )>,
+    /// Ordered-load declines recorded by the MIR loop on
+    /// [`crate::front::semantic::SemanticProgram::atomic_load_decls`].
+    pub atomic_load_decls:
+        Vec<crate::translator::rtyper::lltypesystem::module::ll_extaccessor::DeclinedFunDecl>,
 }
 
 /// Heuristic struct layout — NOT equivalent to RPython's `symbolic.get_field_token()`.
@@ -2319,6 +2323,7 @@ impl CallControl {
             immutable_array_types: HashSet::new(),
             unsafe_fn_stubs: Vec::new(),
             foreign_opaque_method_externals: Vec::new(),
+            atomic_load_decls: Vec::new(),
         }
     }
 

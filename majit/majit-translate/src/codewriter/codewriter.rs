@@ -179,6 +179,7 @@ impl CodeWriter {
                 callcontrol.function_graphs(),
                 &callcontrol.unsafe_fn_stubs,
                 &callcontrol.foreign_opaque_method_externals,
+                &callcontrol.atomic_load_decls,
                 &registry,
             );
         if let Err(err) = populate_result {

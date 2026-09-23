@@ -7399,7 +7399,7 @@ mod tests {
             let mut graphs = GraphStore::default();
             graphs.insert(CallPath::from_segments(segments.clone()), body);
             let registry = empty_call_registry();
-            populate_call_registry_from_call_graphs(&graphs, &[], &[], &registry)
+            populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry)
                 .expect("register ordinary helper body");
             let entry = registry
                 .lookup(&FunctionPathKey::from_segments(segments))

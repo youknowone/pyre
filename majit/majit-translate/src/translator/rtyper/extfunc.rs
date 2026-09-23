@@ -228,6 +228,10 @@ pub struct ExtFuncEntry {
     pub name: String,
     pub lltypeimpl: Option<_ptr>,
     pub lltypefakeimpl: Option<HostObject>,
+    /// `llexternal(..., random_effects_on_gcobjs=...)`.
+    pub random_effects_on_gcobjs: bool,
+    /// `llexternal(..., releasegil=...)`. `false` is a pure short call.
+    pub releasegil: bool,
 }
 
 impl ExtFuncEntry {
@@ -255,6 +259,31 @@ pub fn register_external(
     llfakeimpl: Option<HostObject>,
     sandboxsafe: bool,
 ) -> Result<ExtFuncEntry, TyperError> {
+    register_llexternal(
+        function,
+        args,
+        result,
+        export_name,
+        llimpl,
+        llfakeimpl,
+        sandboxsafe,
+        false,
+        false,
+    )
+}
+
+/// `rffi.py` `llexternal` effect kwargs on the same registration path.
+pub fn register_llexternal(
+    function: HostObject,
+    args: Vec<ExternalAnnotation>,
+    result: Option<ExternalAnnotation>,
+    export_name: Option<String>,
+    llimpl: Option<_ptr>,
+    llfakeimpl: Option<HostObject>,
+    sandboxsafe: bool,
+    random_effects_on_gcobjs: bool,
+    releasegil: bool,
+) -> Result<ExtFuncEntry, TyperError> {
     let name = export_name.unwrap_or_else(|| function.simple_name().to_string());
     let entry = ExtFuncEntry {
         function: function.clone(),
@@ -264,6 +293,8 @@ pub fn register_external(
         name,
         lltypeimpl: llimpl,
         lltypefakeimpl: llfakeimpl,
+        random_effects_on_gcobjs,
+        releasegil,
     };
     super::extregistry::register_host_value(
         function,

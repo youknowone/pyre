@@ -239,7 +239,8 @@ fn build_semantic_program_via_active_frontend(
             // `repr(transparent)` scalar returns resolve; that extra
             // parse is the cost of not keeping every tree live.
             let mut discovered = Vec::new();
-            let mut foldable_consts = Vec::new();
+            let mut foldable_cross = Vec::new();
+            let mut foldable_impl_by_ord = Vec::new();
             let mut duplicate_leaf_facts = front::mir::DuplicateLeafFacts::default();
             let mut crate_names = Vec::new();
             let mut hints: std::collections::HashMap<String, Vec<String>> =
@@ -247,15 +248,22 @@ fn build_semantic_program_via_active_frontend(
             let mut immutable_fields = std::collections::HashMap::new();
             let mut unsafe_fn_stubs = Vec::new();
             let mut foreign_opaque_method_externals = Vec::new();
-            let mut atomic_load_decls = Vec::new();
             for p in &paths {
                 let llbc = majit_charon_reader::Llbc::load(p)
                     .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"));
                 prof.mark(&format!("    harvest {p}"));
                 crate_names.push(llbc.crate_name().to_string());
                 discovered.extend(front::mir::discover_transparent_scalar_kinds(&llbc));
-                foldable_consts.extend(front::mir::discover_foldable_const_lits(&llbc));
                 duplicate_leaf_facts.absorb(front::mir::DuplicateLeafFacts::discover(&llbc));
+                let mut impl_folds = Vec::new();
+                for (path, op) in front::mir::discover_foldable_const_lits(&llbc) {
+                    if path.contains('<') {
+                        impl_folds.push((path, op));
+                    } else {
+                        foldable_cross.push((path, op));
+                    }
+                }
+                foldable_impl_by_ord.push(impl_folds);
                 for (k, v) in
                     front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(&llbc))
                 {
@@ -269,20 +277,20 @@ fn build_semantic_program_via_active_frontend(
             }
             discovered.sort_by(|a, b| a.0.cmp(&b.0));
             discovered.dedup();
-            foldable_consts.sort_by(|a, b| a.0.cmp(&b.0));
-            foldable_consts.dedup();
+            let foldable_cross = front::mir::register_foldable_const_lits(foldable_cross);
             let cross_tombstoned_leaves = duplicate_leaf_facts.tombstoned_leaves();
             crate::local_crates::register_local_crate_roots(crate_names);
-            front::mir::register_foldable_const_lits(foldable_consts);
 
             let mut merged = None;
             let mut seen_function_keys = std::collections::HashSet::new();
             let mut seen_struct_names = std::collections::HashSet::new();
             let mut seen_trait_names = std::collections::HashSet::new();
-            for p in &paths {
+            for (ord, p) in paths.iter().enumerate() {
                 let llbc = majit_charon_reader::Llbc::load(p)
                     .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"));
                 llbc.register_transparent_scalar_kinds(discovered.iter().cloned());
+                front::mir::attach_foldable_const_lits(&llbc, &foldable_cross);
+                front::mir::attach_foldable_const_lits(&llbc, &foldable_impl_by_ord[ord]);
                 unsafe_fn_stubs.extend(front::mir::collect_unsafe_fn_stubs_from_llbc(
                     &llbc,
                     static_addrs.error_carrier,
@@ -295,7 +303,6 @@ fn build_semantic_program_via_active_frontend(
                     .extend(front::mir::collect_marked_class_ctor_stubs_from_llbc(&llbc));
                 foreign_opaque_method_externals
                     .extend(front::mir::collect_foreign_opaque_method_externals(&llbc));
-                atomic_load_decls.extend(front::mir::collect_atomic_load_declined_fun_decls(&llbc));
                 let prog = front::mir::build_semantic_program_from_prelinked_llbc(
                     &llbc,
                     static_addrs,
@@ -328,6 +335,7 @@ fn build_semantic_program_via_active_frontend(
                 struct_ids: std::collections::HashMap::new(),
                 unsafe_fn_stubs: Vec::new(),
                 foreign_opaque_method_externals: Vec::new(),
+                atomic_load_decls: Vec::new(),
             });
             front::mir::harden_duplicate_leaf_metadata(
                 &mut program.struct_fields,
@@ -339,9 +347,6 @@ fn build_semantic_program_via_active_frontend(
             program.immutable_fields = immutable_fields;
             program.unsafe_fn_stubs = unsafe_fn_stubs;
             program.foreign_opaque_method_externals = foreign_opaque_method_externals;
-            crate::translator::rtyper::lltypesystem::module::ll_extaccessor::register_harvested_atomic_load_decls(
-                atomic_load_decls,
-            );
             return program;
         }
     }
@@ -1438,6 +1443,7 @@ fn analyze_pipeline_from_module_paths(
     // `CallControl::unsafe_fn_stubs`.  Sourced from Charon and populated on the
     // SemanticProgram in `build_semantic_program_via_active_frontend`.
     call_control.unsafe_fn_stubs = program.unsafe_fn_stubs.clone();
+    call_control.atomic_load_decls = program.atomic_load_decls.clone();
     // `rpython.rtyper.extregistry.register_external` parity for the three
     // shadow-stack operations `eval::FrameAnchor` reaches.  `majit_gc` is not
     // one of the crates lowered by `scripts/extract-llbc.py` (see the

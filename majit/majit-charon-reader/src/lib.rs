@@ -69,6 +69,11 @@ pub struct Llbc {
     /// retain layout attributes but may expose the type body as `Opaque`; the
     /// defining crate supplies the missing one-field scalar shape.
     transparent_scalar_kinds: parking_lot::RwLock<Vec<(String, TransparentScalarKind)>>,
+    /// Folded initializer of one global, keyed by that global's `def_id`
+    /// inside this artefact. The encoded literal is owned by the global
+    /// the lowering already loads with `global_by_id`; it is not a path
+    /// string and not a thread-local.
+    foldable_const_lits: parking_lot::RwLock<Vec<(u64, String)>>,
     /// Trait-decl id → associated-type bindings of its unique impl.
     /// `trait_impls` is immutable after parse, so the map is built once.
     /// See [`TraitAssocIndex`].
@@ -218,6 +223,7 @@ impl Llbc {
             dedup_adt,
             dedup_body,
             transparent_scalar_kinds: parking_lot::RwLock::new(Vec::new()),
+            foldable_const_lits: parking_lot::RwLock::new(Vec::new()),
             trait_assoc_index: std::sync::OnceLock::new(),
         })
     }
@@ -238,6 +244,29 @@ impl Llbc {
                 Err(index) => kinds.insert(index, (path, kind)),
             }
         }
+    }
+
+    /// Store one folded initializer on the global `def_id` names.
+    ///
+    /// Two writes of the same id must carry the same literal. The id is
+    /// this artefact's decl id, so a sibling global that renders the same
+    /// `name_path` keeps its own slot.
+    pub fn register_foldable_const_lit(&self, def_id: u64, encoded: String) {
+        let mut lits = self.foldable_const_lits.write();
+        match lits.binary_search_by_key(&def_id, |row| row.0) {
+            Ok(index) => assert_eq!(
+                lits[index].1, encoded,
+                "foldable const def_id {def_id} has inconsistent linked definitions"
+            ),
+            Err(index) => lits.insert(index, (def_id, encoded)),
+        }
+    }
+
+    /// The folded initializer stored on `def_id`, if this artefact has one.
+    pub fn foldable_const_lit(&self, def_id: u64) -> Option<String> {
+        let lits = self.foldable_const_lits.read();
+        let index = lits.binary_search_by_key(&def_id, |row| row.0).ok()?;
+        Some(lits[index].1.clone())
     }
 
     /// Look up the linked scalar shape of an opaque transparent declaration.

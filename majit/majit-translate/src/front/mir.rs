@@ -106,7 +106,6 @@ use majit_charon_reader::{
         SwitchTargets, TermKind, TyRef, TypeDecl, TypeDeclKind, Unstructured,
     },
 };
-use std::cell::RefCell;
 
 use crate::flowspace::model::{ConstValue, Variable};
 use crate::model::{
@@ -346,6 +345,7 @@ pub(crate) fn absorb_semantic_program(
                     })
                     .or_insert(id);
             }
+            acc.atomic_load_decls.extend(prog.atomic_load_decls);
         }
     }
 }
@@ -454,6 +454,7 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
             struct_ids: std::collections::HashMap::new(),
             unsafe_fn_stubs: Vec::new(),
             foreign_opaque_method_externals: Vec::new(),
+            atomic_load_decls: Vec::new(),
         }),
     )
 }
@@ -1086,6 +1087,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         .collect();
     let mut functions = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
+    let mut atomic_load_decls = Vec::new();
     for fd in llbc.iter_local_fns() {
         // Charon emits static / const initialiser bodies (e.g. the
         // body that builds `static NONE_SINGLETON`) as ordinary
@@ -1167,7 +1169,11 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         ) {
             Ok(g) => g,
             Err(e) => {
-                skipped.push((name.clone(), e.to_string()));
+                let msg = e.to_string();
+                if msg.contains("atomic load ordering") {
+                    atomic_load_decls.push(declined_atomic_load_fun_decl(llbc, fd, msg.clone()));
+                }
+                skipped.push((name.clone(), msg));
                 continue;
             }
         };
@@ -1347,6 +1353,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // (it iterates the full LLBC set), mirroring `merge_hints_from_llbcs`.
         unsafe_fn_stubs: Vec::new(),
         foreign_opaque_method_externals: Vec::new(),
+        atomic_load_decls,
     })
 }
 
@@ -9588,7 +9595,7 @@ impl<'a> Lowering<'a> {
                         .and_then(const_lit_to_op)
                 }
             });
-        local.or_else(|| foldable_const_lit(&g.item_meta.name_path()))
+        local.or_else(|| attached_foldable_lit(self.llbc, def_id))
     }
 
     /// Fold a `NamedConst` global whose initializer is exactly
@@ -25020,142 +25027,33 @@ pub(crate) fn collect_policy_opaque_fn_stubs_from_llbc(
     })
 }
 
-/// Collect signature-only [`DeclinedFunDecl`] rows for every local function
-/// whose unstructured body contains a non-`Relaxed` `Atomic*::load`.
+/// Signature row for a function the MIR loop already declined.
 ///
-/// Re-derives the same condition `build_semantic_program_from_llbcs`
-/// records in its local `skipped` vec (`LowerError::Unsupported` whose
-/// Display contains `atomic load ordering`).  The skip list is a
-/// `(leaf, message)` pair and never leaves that function, so a sibling
-/// of [`collect_policy_opaque_fn_stubs_from_llbc`] walks the LLBC and
-/// rebuilds the full declaration (path segments, scalar lltypes, the
-/// Display string) instead of threading `skipped` out.
-pub(crate) fn collect_atomic_load_declined_fun_decls(
+/// The decline string is the `LowerError` the lowering produced. This
+/// does not walk the body again.
+fn declined_atomic_load_fun_decl(
     llbc: &Llbc,
-) -> Vec<crate::translator::rtyper::lltypesystem::module::ll_extaccessor::DeclinedFunDecl> {
+    fd: &FunDecl,
+    decline_reason: String,
+) -> crate::translator::rtyper::lltypesystem::module::ll_extaccessor::DeclinedFunDecl {
     use crate::translator::rtyper::lltypesystem::module::ll_extaccessor::DeclinedFunDecl;
-    let mut out = Vec::new();
-    for fd in llbc.iter_local_fns() {
-        if fd.is_global_initializer.is_some() {
-            continue;
-        }
-        let Some(body) = fd.unstructured() else {
-            continue;
-        };
-        let Some(ordering) = first_non_relaxed_atomic_load_ordering(llbc, &body) else {
-            continue;
-        };
-        let segments: Vec<String> = fd
-            .item_meta
-            .name_path()
-            .split("::")
-            .map(String::from)
-            .collect();
-        out.push(DeclinedFunDecl {
-            segments,
-            arg_lltypes: fd
-                .signature
-                .inputs
-                .iter()
-                .map(|ty| tyref_to_external_lltype(ty, llbc))
-                .collect(),
-            result_lltype: tyref_to_external_lltype(&fd.signature.output, llbc),
-            has_translatable_body: false,
-            decline_reason: format!(
-                "unsupported MIR: atomic load ordering {ordering} requires \
-                 address-preserving ordered lowering"
-            ),
-        });
-    }
-    out
-}
-
-fn first_non_relaxed_atomic_load_ordering(llbc: &Llbc, body: &Unstructured) -> Option<String> {
-    let mut ordering_locals: std::collections::HashMap<usize, String> =
-        std::collections::HashMap::new();
-    for bb in &body.body {
-        for stmt in &bb.statements {
-            let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
-                continue;
-            };
-            if let PlaceKind::Local(index) = dest.kind
-                && let Some(name) = atomic_ordering_variant_of(llbc, &rvalue)
-            {
-                ordering_locals.insert(index as usize, name);
-            }
-        }
-        let Ok(TermKind::Call { call, .. }) = bb.term() else {
-            continue;
-        };
-        if call.args.len() != 2 {
-            continue;
-        }
-        let CallFunc::Regular(reg) = &call.func else {
-            continue;
-        };
-        if !call_is_atomic_load(reg, llbc) {
-            continue;
-        }
-        let ordering = operand_local_index(&call.args[1])
-            .and_then(|local| ordering_locals.get(&local).cloned())
-            .unwrap_or_else(|| "unknown".to_string());
-        if ordering != "Relaxed" {
-            return Some(ordering);
-        }
-    }
-    None
-}
-
-fn call_is_atomic_load(reg: &RegularCall, llbc: &Llbc) -> bool {
-    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-        return false;
-    };
-    let Some(fd) = llbc.fn_by_id(*id) else {
-        return false;
-    };
-    if fd.item_meta.name_path().rsplit("::").next() != Some("load") {
-        return false;
-    }
-    fd.signature.inputs.first().is_some_and(|ty| {
-        adt_path_of_tyref(ty, llbc).is_some_and(|path| {
-            path.contains("::sync::atomic::")
-                && path
-                    .rsplit("::")
-                    .next()
-                    .is_some_and(|leaf| leaf.starts_with("Atomic"))
-        })
-    })
-}
-
-fn atomic_ordering_variant_of(llbc: &Llbc, rvalue: &Rvalue) -> Option<String> {
-    let Rvalue::Aggregate(kind, _) = rvalue else {
-        return None;
-    };
-    let adt = kind.as_object()?.get("Adt")?.as_array()?;
-    let head = adt.first()?;
-    let type_id = match head.as_u64() {
-        Some(id) => id,
-        None => head.get("id")?.get("Adt")?.as_u64()?,
-    };
-    let td = llbc.type_by_id(type_id)?;
-    if td.item_meta.name_path() != "core::sync::atomic::Ordering" {
-        return None;
-    }
-    let TypeDeclKind::Enum(variants) = &td.kind else {
-        return None;
-    };
-    let variant_idx = adt.get(1).and_then(serde_json::Value::as_u64)? as usize;
-    Some(variants.get(variant_idx)?.name.clone())
-}
-
-fn operand_local_index(op: &Operand) -> Option<usize> {
-    let place = match op {
-        Operand::Copy(place) | Operand::Move(place) => place,
-        Operand::Const(_) => return None,
-    };
-    match &place.kind {
-        PlaceKind::Local(index) => Some(*index as usize),
-        _ => None,
+    let segments: Vec<String> = fd
+        .item_meta
+        .name_path()
+        .split("::")
+        .map(String::from)
+        .collect();
+    DeclinedFunDecl {
+        segments,
+        arg_lltypes: fd
+            .signature
+            .inputs
+            .iter()
+            .map(|ty| tyref_to_external_lltype(ty, llbc))
+            .collect(),
+        result_lltype: tyref_to_external_lltype(&fd.signature.output, llbc),
+        has_translatable_body: false,
+        decline_reason,
     }
 }
 
@@ -27556,19 +27454,32 @@ fn tyref_transparent_inner_value_type(
     }
 }
 
-thread_local! {
-    /// Foldable const literals harvested from the whole linked LLBC set.
-    ///
-    /// The streaming driver parses one artefact at a time and drops it,
-    /// so a defining crate's initializer body is gone by the time a
-    /// dependent crate's read is lowered. The harvest stores the folded
-    /// value, keyed by the full `item_meta.name_path()`, for
-    /// [`Lowering::const_eval_global`] to consult after the local
-    /// initializer lanes fail. Thread-local, not a process-global lock:
-    /// one translate pipeline runs on one thread, matching
-    /// [`crate::local_crates::register_local_crate_roots`].
-    static FOLDABLE_CONST_LITS: RefCell<Vec<(String, OpKind)>> =
-        const { RefCell::new(Vec::new()) };
+fn encode_foldable_op(op: &OpKind) -> Option<String> {
+    match op {
+        OpKind::ConstInt(n) => Some(format!("i{n}")),
+        OpKind::ConstUInt(n) => Some(format!("u{n}")),
+        OpKind::ConstBool(b) => Some(format!("b{}", u8::from(*b))),
+        OpKind::ConstFloat(bits) => Some(format!("f{bits}")),
+        OpKind::ConstSingleFloat(bits) => Some(format!("s{bits}")),
+        _ => None,
+    }
+}
+
+fn decode_foldable_op(encoded: &str) -> Option<OpKind> {
+    let (tag, rest) = encoded.split_at(encoded.chars().next()?.len_utf8());
+    match tag {
+        "i" => Some(OpKind::ConstInt(rest.parse().ok()?)),
+        "u" => Some(OpKind::ConstUInt(rest.parse().ok()?)),
+        "b" => Some(OpKind::ConstBool(rest == "1")),
+        "f" => Some(OpKind::ConstFloat(rest.parse().ok()?)),
+        "s" => Some(OpKind::ConstSingleFloat(rest.parse().ok()?)),
+        _ => None,
+    }
+}
+
+/// Literal previously written onto this artefact's global `def_id`.
+pub(crate) fn attached_foldable_lit(llbc: &Llbc, def_id: u64) -> Option<OpKind> {
+    decode_foldable_op(&llbc.foldable_const_lit(def_id)?)
 }
 
 fn global_is_thread_local(g: &GlobalDecl) -> bool {
@@ -27645,11 +27556,15 @@ pub(crate) fn discover_foldable_const_lits(llbc: &Llbc) -> Vec<(String, OpKind)>
     discovered
 }
 
-/// Replace this thread's harvested foldable-const set with one
-/// pipeline invocation's merged literals. A later invocation on the
-/// same thread overwrites. Two artefacts that fold the same full path
-/// to different values is a bug, not a silent winner.
-pub(crate) fn register_foldable_const_lits(entries: impl IntoIterator<Item = (String, OpKind)>) {
+/// Merge foldable literals that share an injective path.
+///
+/// A path containing `<` is not an identity (`name_path` renders every
+/// trait impl as `<Impl>`). Callers keep those on the defining global's
+/// decl id and do not pass them here. Two artefacts that fold one
+/// injective path to different values is a bug, not a silent winner.
+pub(crate) fn register_foldable_const_lits(
+    entries: impl IntoIterator<Item = (String, OpKind)>,
+) -> Vec<(String, OpKind)> {
     let mut lits: Vec<(String, OpKind)> = Vec::new();
     for (path, lit) in entries {
         match lits.binary_search_by(|(known, _)| known.cmp(&path)) {
@@ -27660,17 +27575,29 @@ pub(crate) fn register_foldable_const_lits(entries: impl IntoIterator<Item = (St
             Err(index) => lits.insert(index, (path, lit)),
         }
     }
-    FOLDABLE_CONST_LITS.with(|slot| *slot.borrow_mut() = lits);
+    lits
 }
 
-fn foldable_const_lit(path: &str) -> Option<OpKind> {
-    FOLDABLE_CONST_LITS.with(|slot| {
-        let lits = slot.borrow();
-        let index = lits
-            .binary_search_by(|(known, _)| known.as_str().cmp(path))
-            .ok()?;
-        Some(lits[index].1.clone())
-    })
+/// Write each harvested literal onto the global in `llbc` whose
+/// `name_path` matches, stored under that global's decl id.
+pub(crate) fn attach_foldable_const_lits(llbc: &Llbc, entries: &[(String, OpKind)]) {
+    if entries.is_empty() {
+        return;
+    }
+    let mut entries = entries.to_vec();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+    for g in llbc.iter_global_decls() {
+        let path = g.item_meta.name_path();
+        let Ok(index) = entries.binary_search_by(|(known, _)| known.as_str().cmp(path.as_str()))
+        else {
+            continue;
+        };
+        let Some(encoded) = encode_foldable_op(&entries[index].1) else {
+            continue;
+        };
+        llbc.register_foldable_const_lit(g.def_id, encoded);
+    }
 }
 
 /// Link complete transparent-scalar declarations to opaque dependency views.
@@ -27708,19 +27635,28 @@ pub(crate) fn discover_transparent_scalar_kinds(
 
 fn link_transparent_scalar_types(llbcs: &[Llbc]) {
     let mut discovered = Vec::new();
-    let mut foldable_consts = Vec::new();
+    let mut foldable_cross = Vec::new();
+    let mut foldable_impl: Vec<Vec<(String, OpKind)>> = Vec::new();
     for llbc in llbcs {
         discovered.extend(discover_transparent_scalar_kinds(llbc));
-        foldable_consts.extend(discover_foldable_const_lits(llbc));
+        let mut impl_folds = Vec::new();
+        for (path, op) in discover_foldable_const_lits(llbc) {
+            if path.contains('<') {
+                impl_folds.push((path, op));
+            } else {
+                foldable_cross.push((path, op));
+            }
+        }
+        foldable_impl.push(impl_folds);
     }
     discovered.sort_by(|a, b| a.0.cmp(&b.0));
     discovered.dedup();
-    foldable_consts.sort_by(|a, b| a.0.cmp(&b.0));
-    foldable_consts.dedup();
-    for llbc in llbcs {
+    let foldable_cross = register_foldable_const_lits(foldable_cross);
+    for (llbc, impl_folds) in llbcs.iter().zip(foldable_impl) {
         llbc.register_transparent_scalar_kinds(discovered.iter().cloned());
+        attach_foldable_const_lits(llbc, &foldable_cross);
+        attach_foldable_const_lits(llbc, &impl_folds);
     }
-    register_foldable_const_lits(foldable_consts);
 }
 
 /// `Arg<T>` from `rustpython_compiler_core::bytecode::instruction` —
@@ -30815,20 +30751,13 @@ fn known_array_layout_const(segments: &[String]) -> Option<OpKind> {
 /// `Bits::ALL` is type-width-specific (`u8::MAX` vs `u64::MAX`) under
 /// the same non-injective path, so it stays residual.
 fn bitflags_trait_empty_const(segments: &[String]) -> Option<OpKind> {
-    if segments.first().map(String::as_str) != Some("bitflags") {
-        return None;
-    }
-    let tail: Vec<&str> = segments
-        .iter()
-        .rev()
-        .take(3)
-        .rev()
-        .map(String::as_str)
-        .collect();
-    match tail.as_slice() {
-        ["traits", "<Impl>", "EMPTY"] => Some(OpKind::ConstInt(0)),
-        _ => None,
-    }
+    // `Bits::EMPTY` is the impl's own initializer (`impl_bits!`), keyed by
+    // the concrete Self type the way `fold_size_const_global` keys a layout.
+    // Charon renders every impl as `<Impl>` and leaves the external impl
+    // body opaque, so a leaf match cannot see that Self. Leave the read
+    // residual; a defining initializer still folds through `const_eval_global`.
+    let _ = segments;
+    None
 }
 
 /// Supply the value of a `CodeFlags` associated constant. `bitflags!`
@@ -43587,16 +43516,17 @@ mod tests {
                 )
             ]),
         );
-        super::link_transparent_scalar_types(&[a, b]);
+        let llbcs = [a, b];
+        super::link_transparent_scalar_types(&llbcs);
         assert_eq!(
-            super::foldable_const_lit("crate_a::SIZE"),
+            super::attached_foldable_lit(&llbcs[0], 1),
             Some(OpKind::ConstUInt(4))
         );
         assert_eq!(
-            super::foldable_const_lit("crate_b::SIZE"),
+            super::attached_foldable_lit(&llbcs[1], 1),
             Some(OpKind::ConstUInt(8))
         );
-        assert!(super::foldable_const_lit("SIZE").is_none());
+        assert!(super::attached_foldable_lit(&llbcs[0], 0).is_none());
     }
 
     #[test]
@@ -43620,10 +43550,10 @@ mod tests {
                 )
             ]),
         );
-        super::register_foldable_const_lits(vec![(
-            "fixture::VALUE".into(),
-            OpKind::ConstUInt(185),
-        )]);
+        super::attach_foldable_const_lits(
+            &local,
+            &[("fixture::VALUE".into(), OpKind::ConstUInt(185))],
+        );
         let graph = super::lower_function(&local, "read_value").expect("local body lowers");
         assert_eq!(folded_uints(&graph), vec![99]);
         assert_eq!(nullary_calls_ending(&graph, "VALUE"), 0);
@@ -43636,6 +43566,39 @@ mod tests {
             ("crate::SIZE".into(), OpKind::ConstUInt(4)),
             ("crate::SIZE".into(), OpKind::ConstUInt(8)),
         ]);
+    }
+
+    #[test]
+    fn impl_associated_const_literal_is_not_shared_across_decl_ids() {
+        let path = ["fixture", "<Impl>", "EMPTY"];
+        let a = const_artifact(
+            "crate_a",
+            serde_json::json!([
+                reader_fun(&["crate_a", "read_a"], 1),
+                init_fun(1, &path, literal_init_body("1"))
+            ]),
+            serde_json::json!([
+                null,
+                named_const_global(1, &path, "const EMPTY: u32 = 1;", true, "NamedConst", 1)
+            ]),
+        );
+        let b = const_artifact(
+            "crate_b",
+            serde_json::json!([
+                reader_fun(&["crate_b", "read_b"], 1),
+                init_fun(1, &path, literal_init_body("7"))
+            ]),
+            serde_json::json!([
+                null,
+                named_const_global(1, &path, "const EMPTY: u32 = 7;", true, "NamedConst", 1)
+            ]),
+        );
+        let llbcs = [a, b];
+        super::link_transparent_scalar_types(&llbcs);
+        let ga = super::lower_function(&llbcs[0], "read_a").expect("a lowers");
+        let gb = super::lower_function(&llbcs[1], "read_b").expect("b lowers");
+        assert_eq!(folded_uints(&ga), vec![1]);
+        assert_eq!(folded_uints(&gb), vec![7]);
     }
 
     /// The `Vec` index fold must accept a `usize` index.
@@ -50066,15 +50029,16 @@ mod tests {
 
     #[test]
     fn bitflags_trait_empty_const_folds_zero_and_rejects_all() {
-        match bitflags_trait_empty_const(&[
-            "bitflags".into(),
-            "traits".into(),
-            "<Impl>".into(),
-            "EMPTY".into(),
-        ]) {
-            Some(OpKind::ConstInt(0)) => {}
-            other => panic!("expected ConstInt(0), got {other:?}"),
-        }
+        assert!(
+            bitflags_trait_empty_const(&[
+                "bitflags".into(),
+                "traits".into(),
+                "<Impl>".into(),
+                "EMPTY".into(),
+            ])
+            .is_none(),
+            "EMPTY is not a leaf fold; it comes from the impl initializer"
+        );
         assert!(
             bitflags_trait_empty_const(&[
                 "bitflags".into(),
@@ -50130,8 +50094,7 @@ mod tests {
     }
 
     #[test]
-    fn opaque_bitflags_empty_global_read_folds_to_zero() {
-        super::register_foldable_const_lits(Vec::new());
+    fn opaque_bitflags_empty_global_read_stays_residual() {
         let path = ["bitflags", "traits", "<Impl>", "EMPTY"];
         let mut opaque_init = init_fun(1, &path, serde_json::json!("Opaque"));
         opaque_init["item_meta"]["is_local"] = serde_json::json!(false);
@@ -50153,11 +50116,14 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(ints, vec![0]);
+        assert!(
+            ints.is_empty(),
+            "opaque Bits::EMPTY must not leaf-fold to 0, got {ints:?}"
+        );
         assert_eq!(
             nullary_calls_ending(&graph, "EMPTY"),
-            0,
-            "the Opaque Bits::EMPTY read must not remain a nullary call: {graph:?}"
+            1,
+            "the Opaque Bits::EMPTY read stays a nullary call: {graph:?}"
         );
     }
 
