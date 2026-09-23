@@ -110,12 +110,11 @@ pub fn __majit_struct_type_id_path(module_path: &str, type_path: &str, is_gc_man
 pub mod blackhole;
 pub mod box_trace;
 pub use box_trace::{
-    CompareOpResidual, ElidableIntResidual, ExactIntFalseResidual, ExceptionTraceResidual,
-    FrameAnchorLiveResidual, FrameAnchorPushResidual, IdentityRefResidual, IntPyModResidual,
-    VoidSkipResidual, register_compare_op_residual, register_elidable_int_residual,
-    register_exact_int_false_residual, register_exception_trace_residual,
-    register_frame_anchor_live_residual, register_frame_anchor_push_residual,
-    register_identity_ref_residual, register_int_py_mod_residual, register_void_skip_residual,
+    ElidableIntResidual, ExceptionTraceResidual, FrameAnchorLiveResidual, FrameAnchorPushResidual,
+    IdentityRefResidual, IntPyModResidual, VoidSkipResidual, register_elidable_int_residual,
+    register_exception_trace_residual, register_frame_anchor_live_residual,
+    register_frame_anchor_push_residual, register_identity_ref_residual,
+    register_int_py_mod_residual, register_void_skip_residual,
 };
 pub(crate) mod call_descr;
 pub(crate) mod compile;

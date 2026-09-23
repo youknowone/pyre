@@ -281,71 +281,6 @@ pub fn frame_anchor_live_residual() -> Option<&'static FrameAnchorLiveResidual> 
     FRAME_ANCHOR_LIVE_RESIDUAL.get()
 }
 
-/// Residual `Ref, Ref, Int -> Int` override gates that are false for
-/// exact builtin ints (`needs_numeric_binop_dispatch`).
-/// `descroperation.py _call_binop_impl` looks inside; the exact-int
-/// path is a constant false. Fold only when both operands are exact
-/// ints and the helper answered 0.
-#[derive(Clone)]
-pub struct ExactIntFalseResidual {
-    pub fnaddrs: Vec<i64>,
-    pub is_exact_int: fn(i64) -> bool,
-}
-
-impl ExactIntFalseResidual {
-    pub fn matches(&self, fnaddr: i64) -> bool {
-        self.fnaddrs.contains(&fnaddr)
-    }
-}
-
-static EXACT_INT_FALSE_RESIDUAL: std::sync::OnceLock<ExactIntFalseResidual> =
-    std::sync::OnceLock::new();
-
-pub fn register_exact_int_false_residual(spec: ExactIntFalseResidual) {
-    let _ = EXACT_INT_FALSE_RESIDUAL.set(spec);
-}
-
-pub fn exact_int_false_residual() -> Option<&'static ExactIntFalseResidual> {
-    EXACT_INT_FALSE_RESIDUAL.get()
-}
-
-/// Host-registered rewrite of a residual int COMPARE_OP.
-///
-/// `compare_slot` residualizes through `compare_slot_jit_abi` (the
-/// word-ABI bridge `jit_fnaddr.rs` publishes). The call is may-force, so
-/// portal interpret records `ForceToken` + `CallMayForceR`. That escapes
-/// virtual int boxes; the compiled exception bridge then const-folds
-/// `W_IntObject.intval` (`heap.py` always-pure getfield on ConstPtr).
-///
-/// FBW `try_walker_specialize_compare_op_int` already emits unbox +
-/// `int_OP` + `space.newbool` (`baseobjspace.py:895-900`) for the same
-/// helper. Interpret records that shape here so the call does not force:
-/// `GuardTrue`/`GuardFalse` on the live compare, then the immortal
-/// `w_True`/`w_False` singleton. The following `w_class`/`ob_type`/
-/// `intval` checks see a bool, not a `NewWithVtable` int — specialising
-/// the same residual as wrapint made `GUARD_ISNULL(w_class)` an
-/// `InvalidLoop`.
-#[derive(Clone)]
-pub struct CompareOpResidual {
-    pub fnaddrs: Vec<i64>,
-    pub intval_descr: majit_ir::DescrRef,
-    pub int_type_addr: i64,
-    pub w_true: i64,
-    pub w_false: i64,
-    pub newbool_fnaddr: i64,
-    /// Generated `bool_value_from_truth` / `w_bool_from` jitcode
-    /// (`space.newbool`). Portal interpret descends it so `if b:` is a
-    /// real `goto_if_not` with its own `-live-` marker.
-    pub newbool_jitcode: Option<std::sync::Arc<crate::jitcode::JitCode>>,
-    pub bool_intval_descr: majit_ir::DescrRef,
-    pub w_class_descr: majit_ir::DescrRef,
-    pub ob_type_descr: majit_ir::DescrRef,
-    pub bool_type_addr: i64,
-    pub truth_fnaddrs: Vec<i64>,
-    pub is_exact_int: fn(i64) -> bool,
-    pub is_bool: fn(i64) -> bool,
-}
-
 /// Residual `Int, Int -> Int` Python rem (`rint.py ll_int_py_mod`).
 /// `int_mod` looks inside; the oopspec helper is residual so the
 /// sign-correction stays out of the trace. Record `CallI` with
@@ -369,22 +304,6 @@ pub fn register_int_py_mod_residual(spec: IntPyModResidual) {
 
 pub fn int_py_mod_residual() -> Option<&'static IntPyModResidual> {
     INT_PY_MOD_RESIDUAL.get()
-}
-
-impl CompareOpResidual {
-    pub fn matches(&self, fnaddr: i64) -> bool {
-        self.fnaddrs.contains(&fnaddr)
-    }
-}
-
-static COMPARE_OP_RESIDUAL: std::sync::OnceLock<CompareOpResidual> = std::sync::OnceLock::new();
-
-pub fn register_compare_op_residual(spec: CompareOpResidual) {
-    let _ = COMPARE_OP_RESIDUAL.set(spec);
-}
-
-pub fn compare_op_residual() -> Option<&'static CompareOpResidual> {
-    COMPARE_OP_RESIDUAL.get()
 }
 
 /// Portal-interpret counterpart of FBW

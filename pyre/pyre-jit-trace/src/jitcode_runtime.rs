@@ -610,14 +610,6 @@ pub fn list_getitem_jitcode() -> Option<Arc<JitCode>> {
     get_jitcode_by_index(idx)
 }
 
-/// `space.newbool` body (`bool_value_from_truth` / `w_bool_from`).
-/// Prefer the interpreter wrapper: `w_bool_from` is `#[inline]` and may
-/// not have a standalone graph. Either graph is the `if b: w_True
-/// else: w_False` look-inside (`baseobjspace.py:896-900`).
-pub fn newbool_jitcode() -> Option<Arc<majit_metainterp::jitcode::JitCode>> {
-    pathed_runtime_jitcode_cached("pyre_interpreter::opcode_ops::bool_value_from_truth")
-        .or_else(|| pathed_runtime_jitcode_cached("pyre_object::boolobject::w_bool_from"))
-}
 /// The wrapped-name interpreter-source value half of `LOAD_SUPER_ATTR`, resolved by the
 /// graph key the codewriter allocated it under and cached process-wide.
 pub fn load_super_attr_value_jitcode() -> Option<Arc<JitCode>> {

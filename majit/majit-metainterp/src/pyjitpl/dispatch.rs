@@ -1546,9 +1546,6 @@ pub struct JitCodeMachine<'mi, S, R> {
     /// because the previous arm's `BC_LOOP_HEADER` handler stamped it.
     /// Pyre's typed `i32` mirrors RPython's `int` (sentinel `-1`).
     seen_loop_header_for_jdindex: i32,
-    /// Compare-folded `newbool` CallR. Replaced after `IntIsTrue` of
-    /// the live compare so JUMP_IF does not list it as a failarg.
-    pending_newbool: Option<(OpRef, i64, OpRef)>,
     /// Inline-built exception from a folded `CallFn` constructor.
     /// The following `RaiseVarargs` consumes it (`FBW_BUILT_EXC`).
     pending_built_exc: Option<(OpRef, i64)>,
@@ -1651,163 +1648,6 @@ where
     S: JitCodeSym,
     R: JitCodeRuntime,
 {
-    /// Specialise residual `compare_slot_jit_abi` of two ints to unbox +
-    /// `int_OP` + `newbool`, before `ForceToken` escapes the boxes.
-    /// A mid-helper `GuardTrue` fail-resumes with a desynced snapshot
-    /// (hang). Cache `intval` on the elidable `newbool` box instead:
-    /// JUMP_IF's `is_true` hits the cache and records `GuardTrue` at
-    /// its own live marker, then the unused `CallR` DCEs.
-    fn try_record_int_compare(
-        &mut self,
-        ctx: &mut TraceCtx,
-        _sym: &mut S,
-        concrete_ptr: i64,
-        trace_ptr: i64,
-        args: &[OpRef],
-        arg_types: &[majit_ir::Type],
-        raw_i: &[i64],
-        raw_r: &[i64],
-        arg_classes: &str,
-        dst: usize,
-    ) -> Option<TraceAction> {
-        let spec = crate::box_trace::compare_op_residual()?;
-        if !spec.matches(concrete_ptr) && !spec.matches(trace_ptr) {
-            return None;
-        }
-        if arg_types
-            != [
-                majit_ir::Type::Ref,
-                majit_ir::Type::Ref,
-                majit_ir::Type::Int,
-            ]
-        {
-            return None;
-        }
-        if args.len() < 3 || raw_r.len() < 2 {
-            return None;
-        }
-        if !(spec.is_exact_int)(raw_r[0]) || !(spec.is_exact_int)(raw_r[1]) {
-            return None;
-        }
-        let tag = if let Some(majit_ir::Value::Int(t)) = ctx.box_value(args[2]) {
-            t
-        } else {
-            *raw_i.last().unwrap_or(&i64::MIN)
-        };
-        let opcode = crate::box_trace::int_compare_op_kind(tag)?;
-        if concrete_ptr == 0 || majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr)
-        {
-            return None;
-        }
-        self.clear_exception();
-        let boxed_ptr = unsafe {
-            majit_backend::call_stub::bh_call_i_by_classes(
-                concrete_ptr as usize,
-                arg_classes,
-                Some(raw_i),
-                Some(raw_r),
-                Some(&[]),
-            )
-        };
-        if crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get()) != 0 || boxed_ptr == 0 {
-            return None;
-        }
-        if boxed_ptr != spec.w_true && boxed_ptr != spec.w_false {
-            return None;
-        }
-        let truth = crate::box_trace::trace_int_compare(
-            ctx,
-            args[0],
-            args[1],
-            opcode,
-            spec.int_type_addr,
-            spec.intval_descr.clone(),
-        );
-        // `baseobjspace.py newbool` is look-inside. The residual CallR
-        // is only a heapcache key so JUMP_IF can read `IntLt`; it is
-        // replaced after `IntIsTrue` and dropped by OptSimplify when
-        // unused (`CALL_PURE` would otherwise become a residual CALL).
-        let boxed = ctx.call_typed_with_effect_pure(
-            OpCode::CallR,
-            spec.newbool_fnaddr as *const (),
-            &[truth],
-            &[majit_ir::Type::Int],
-            majit_ir::Type::Ref,
-            crate::ELIDABLE_CANNOT_RAISE_EFFECT_INFO,
-            &[
-                majit_ir::Value::Int(spec.newbool_fnaddr),
-                majit_ir::Value::Int(if boxed_ptr == spec.w_true { 1 } else { 0 }),
-            ],
-            majit_ir::Value::Ref(majit_ir::GcRef(boxed_ptr as usize)),
-        );
-        ctx.heap_cache_mut()
-            .class_now_known(boxed, spec.bool_type_addr);
-        ctx.heapcache_setfield_cached(boxed, spec.bool_intval_descr.index(), truth);
-        let w_class_null = ctx.const_ref(0);
-        ctx.heapcache_setfield_cached(boxed, spec.w_class_descr.index(), w_class_null);
-        let ob_type = ctx.const_ref(spec.bool_type_addr);
-        ctx.heapcache_setfield_cached(boxed, spec.ob_type_descr.index(), ob_type);
-        ctx.set_opref_concrete(
-            boxed,
-            majit_ir::Value::Ref(majit_ir::GcRef(boxed_ptr as usize)),
-        );
-        self.set_ref_reg(dst, Some(boxed), Some(boxed_ptr));
-        self.pending_newbool = Some((boxed, boxed_ptr, truth));
-        Some(TraceAction::Continue)
-    }
-
-    /// FBW `try_walker_specialize_truth_bool`: `is_true` of a bool is
-    /// `intval` then `int_is_true`. The compare fold caches `intval` on
-    /// the newbool box so this Getfield hits and JUMP_IF guards the
-    /// live compare at its own snapshot.
-    fn try_record_truth_bool(
-        &mut self,
-        ctx: &mut TraceCtx,
-        _sym: &mut S,
-        concrete_ptr: i64,
-        trace_ptr: i64,
-        args: &[OpRef],
-        raw_r: &[i64],
-        arg_classes: &str,
-        dst: usize,
-    ) -> Option<TraceAction> {
-        let spec = crate::box_trace::compare_op_residual()?;
-        if !spec.truth_fnaddrs.contains(&concrete_ptr) && !spec.truth_fnaddrs.contains(&trace_ptr) {
-            return None;
-        }
-        if args.len() != 1 || raw_r.is_empty() {
-            return None;
-        }
-        if !(spec.is_bool)(raw_r[0]) {
-            return None;
-        }
-        if concrete_ptr == 0 || majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr)
-        {
-            return None;
-        }
-        self.clear_exception();
-        let concrete = unsafe {
-            majit_backend::call_stub::bh_call_i_by_classes(
-                concrete_ptr as usize,
-                arg_classes,
-                Some(&[]),
-                Some(raw_r),
-                Some(&[]),
-            )
-        };
-        if crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get()) != 0 {
-            return None;
-        }
-        // Cached `intval` only — `trace_unbox_int` would `GuardClass`
-        // the boxed CallR and pin it in that snapshot.
-        let raw = ctx.heapcache_getfield_cached(args[0], spec.bool_intval_descr.index())?;
-        let is_true = ctx.record_op(OpCode::IntIsTrue, &[raw]);
-        ctx.set_opref_concrete(is_true, majit_ir::Value::Int(concrete));
-        self.set_int_reg(dst, Some(is_true), Some(concrete));
-        self.replace_pending_newbool_if_truth(ctx, raw);
-        Some(TraceAction::Continue)
-    }
-
     fn active_standard_virtualizable(&self, ctx: &TraceCtx) -> Option<ActiveStandardVirtualizable> {
         let vable_opref = ctx.standard_virtualizable_box()?;
         let info = ctx.virtualizable_info()?.clone();
@@ -2777,20 +2617,6 @@ where
         Some(TraceAction::Continue)
     }
 
-    /// `space.newbool` after `if b:` is the immortal singleton.
-    /// Replace once `is_true` has read the cached compare.
-    fn replace_pending_newbool_if_truth(&mut self, ctx: &mut TraceCtx, src: OpRef) {
-        let Some((old, ptr, truth)) = self.pending_newbool else {
-            return;
-        };
-        if src != truth {
-            return;
-        }
-        self.pending_newbool = None;
-        let singleton = ctx.const_ref(ptr);
-        self.replace_box(ctx, old, singleton, Type::Ref);
-    }
-
     /// pyjitpl.py `MIFrame._create_segmented_trace_and_blackhole`,
     /// recording half.
     ///
@@ -3275,7 +3101,6 @@ where
             outer_program_pc: None,
             // pyjitpl.py:2882 / :2916 — sentinel "no loop_header seen yet".
             seen_loop_header_for_jdindex: -1,
-            pending_newbool: None,
             pending_built_exc: None,
             fresh_virtual_exc: None,
             marker: PhantomData,
@@ -6595,7 +6420,6 @@ where
                     Some(majit_ir::Value::Int(cond_value)),
                     self.last_exception_value,
                 );
-                self.replace_pending_newbool_if_truth(ctx, src);
                 self.goto_if_not(ctx, sym, opcode_pc, cond, cond_value, target, false);
             }
             // pyjitpl.py opimpl_goto_if_not_int_is_zero(box, target):
@@ -9018,20 +8842,6 @@ where
                         return TraceAction::Continue;
                     }
 
-                    // `is_true` of a compare-folded bool: unbox `intval`
-                    // (heapcache hit) before `ForceToken`.
-                    if let Some(action) = self.try_record_truth_bool(
-                        ctx,
-                        sym,
-                        concrete_ptr as i64,
-                        trace_ptr as i64,
-                        &args,
-                        &raw_r,
-                        &calldescr.arg_classes,
-                        dst,
-                    ) {
-                        return action;
-                    }
                     if let Some(action) = self.try_record_dispatch_exception_handler(
                         ctx,
                         concrete_ptr as i64,
@@ -9111,32 +8921,6 @@ where
                     {
                         let folded = ctx.const_int(concrete);
                         self.set_int_reg(dst, Some(folded), Some(concrete));
-                        if is_forces
-                            && matches!(
-                                self.finalize_standard_virtualizable_may_force(
-                                    ctx,
-                                    sym,
-                                    active_vable
-                                ),
-                                TraceAction::Abort
-                            )
-                        {
-                            return TraceAction::Abort;
-                        }
-                        return TraceAction::Continue;
-                    }
-                    // `descroperation.py _call_binop_impl` looks inside;
-                    // exact builtin ints never override, so the gate is
-                    // the constant 0.
-                    if let Some(spec) = crate::box_trace::exact_int_false_residual()
-                        && (spec.matches(concrete_ptr as i64) || spec.matches(trace_ptr as i64))
-                        && concrete == 0
-                        && raw_r.len() >= 2
-                        && (spec.is_exact_int)(raw_r[0])
-                        && (spec.is_exact_int)(raw_r[1])
-                    {
-                        let folded = ctx.const_int(0);
-                        self.set_int_reg(dst, Some(folded), Some(0));
                         if is_forces
                             && matches!(
                                 self.finalize_standard_virtualizable_may_force(
@@ -9509,28 +9293,6 @@ where
                     {
                         self.set_ref_reg(dst, Some(cached_traced), Some(cached_concrete));
                         return TraceAction::Continue;
-                    }
-
-                    // Int COMPARE_OP (`jit_compare_value_from_tag`):
-                    // specialise before `ForceToken`. FBW
-                    // `try_walker_specialize_compare_op_int` emits unbox +
-                    // int_OP + newbool so the call does not escape virtual
-                    // int boxes. Matching wrapint (an int `NewWithVtable`)
-                    // here made the following `GUARD_ISNULL(w_class)` an
-                    // InvalidLoop — bools have a null `w_class`.
-                    if let Some(action) = self.try_record_int_compare(
-                        ctx,
-                        sym,
-                        concrete_ptr as i64,
-                        trace_ptr as i64,
-                        &args,
-                        &arg_types,
-                        &raw_i,
-                        &raw_r,
-                        &calldescr.arg_classes,
-                        dst,
-                    ) {
-                        return action;
                     }
 
                     // FBW `try_walker_trace_exception_new` /
@@ -12640,9 +12402,6 @@ where
             Some(majit_ir::Value::Int(value)),
             self.last_exception_value,
         );
-        if opcode == OpCode::IntIsTrue {
-            self.replace_pending_newbool_if_truth(ctx, src);
-        }
         self.set_int_reg(dst, Some(opref), Some(value));
     }
 
