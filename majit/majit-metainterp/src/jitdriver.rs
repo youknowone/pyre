@@ -2128,6 +2128,22 @@ enum SteadyCompiledEntry {
     Done(Option<usize>),
 }
 
+/// `warmstate.py` `maybe_compile_and_run` before it builds assembler args.
+///
+/// [`BackEdgeWarmth::Interpret`] is the not-found arm after `jitcounter.tick`
+/// returned false: no cell install, no descriptor, no live-value list.
+/// [`BackEdgeWarmth::Trace`] is that same tick returning true; the counter is
+/// already reset, so the caller publishes live values and calls
+/// [`JitDriver::commit_back_edge_trace`] without ticking again.
+/// [`BackEdgeWarmth::Full`] is every arm that continues past the cheap lookup
+/// (a compiled token, a chain, a dead token, `JC_DONT_TRACE_HERE`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackEdgeWarmth {
+    Interpret,
+    Trace,
+    Full,
+}
+
 impl<S: JitState> JitDriver<S> {
     /// Create a new JitDriver with the given hot-counting threshold.
     pub fn new(threshold: u32) -> Self {
@@ -7812,6 +7828,69 @@ impl<S: JitState> JitDriver<S> {
             }
             _ => false,
         }
+    }
+
+    /// Same decision as [`Self::try_empty_chain_tick`], without building the
+    /// live-value list. A true tick is consumed here and reported as
+    /// [`BackEdgeWarmth::Trace`]; [`Self::commit_back_edge_trace`] is the
+    /// `bound_reached` half and must not tick again.
+    #[inline]
+    pub fn back_edge_warmth(&mut self, green_key_hash: u64, state: &S) -> BackEdgeWarmth {
+        if self.meta.is_tracing() {
+            return BackEdgeWarmth::Full;
+        }
+        if self.meta.single_pass_label_entry_key.is_some() {
+            return BackEdgeWarmth::Full;
+        }
+        if !self.meta.cut_compiled_keys.is_empty() {
+            return BackEdgeWarmth::Full;
+        }
+        if let Some(cell) = self.meta.warm_state_ref().lookup_chain(green_key_hash) {
+            if cell.next.is_some() {
+                return BackEdgeWarmth::Full;
+            }
+            if cell.cell_bucket == green_key_hash {
+                if cell.is_compiled() {
+                    return BackEdgeWarmth::Full;
+                }
+                if cell.is_tracing() {
+                    return BackEdgeWarmth::Interpret;
+                }
+                if cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none() {
+                    return BackEdgeWarmth::Full;
+                }
+                if cell.abort_count >= MAX_TRACE_ABORT_COUNT {
+                    crate::mc_diag_bump(81); // abort_ceiling_refused
+                    return BackEdgeWarmth::Interpret;
+                }
+                if cell.flags.contains(JcFlags::JC_DONT_TRACE_HERE) {
+                    return BackEdgeWarmth::Full;
+                }
+            }
+        }
+        if !state.can_trace() {
+            return BackEdgeWarmth::Interpret;
+        }
+        if self.meta.warm_state_mut().tick_empty_chain(green_key_hash) {
+            BackEdgeWarmth::Trace
+        } else {
+            BackEdgeWarmth::Interpret
+        }
+    }
+
+    /// `warmstate.py` `bound_reached` after the caller has published live values.
+    /// The counter tick already fired; this does not tick again.
+    #[cold]
+    #[inline(never)]
+    pub fn commit_back_edge_trace(
+        &mut self,
+        green_key_hash: u64,
+        make_green_key: impl Fn() -> GreenKey,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+    ) -> bool {
+        self.commit_start_tracing(green_key_hash, Some(&make_green_key), target_pc, state, env)
     }
 
     /// `warmstate.py bound_reached`: the tick has already fired, so build
