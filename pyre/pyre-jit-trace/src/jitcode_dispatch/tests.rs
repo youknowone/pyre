@@ -4337,8 +4337,7 @@ fn newutf8_and_int_descr_str_jitcodes_are_the_pypy_leaf() {
             pc = op.next_pc;
         }
     };
-    let newutf8_body =
-        super::sub_jitcode_body_by_index(newutf8.index()).expect("newutf8 body");
+    let newutf8_body = super::sub_jitcode_body_by_index(newutf8.index()).expect("newutf8 body");
     let newutf8_ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&newutf8.code)
         .map(|op| op.opname)
         .collect();

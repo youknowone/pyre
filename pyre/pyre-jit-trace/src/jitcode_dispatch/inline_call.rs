@@ -16121,7 +16121,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
     let is_binary_from_tag = ctx
         .raw_descrs
         .runtime_jitcode_at(descr_index)
-        .is_some_and(|jc| jc.name().contains("binary_value_from_tag"))
+        .is_some_and(|jc| super::specialize::jitcode_name_is_binary_value_from_tag(jc.name()))
         || super::specialize::jitcode_is_binary_value_from_tag(sub_index, &sub_body);
     let op_tag = match int_arg_concretes.first() {
         Some(ConcreteValue::Int(tag)) if is_binary_from_tag => Some(*tag),
@@ -16272,22 +16272,6 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
             }
             if spec_gate(SpecFold::BinaryOpLong, || {
                 super::specialize::try_walker_specialize_binary_op_long(
-                    ctx,
-                    op.pc,
-                    op_tag,
-                    &ref_args,
-                    &setup.allboxes,
-                    call_descr,
-                    dst,
-                    dst_bank,
-                )
-            })?
-            .is_some()
-            {
-                return Ok((DispatchOutcome::Continue, op.next_pc));
-            }
-            if spec_gate(SpecFold::TruedivOpLong, || {
-                super::specialize::try_walker_specialize_truediv_op_long(
                     ctx,
                     op.pc,
                     op_tag,

@@ -1858,6 +1858,42 @@ fn rbigint_add_residual_calls_the_gc_transformed_payload_body_once() {
         "RBigInt::from(i64) must return one GC reference through its residual"
     );
 
+    // `long_pow`'s zero-exponent arm is `BigInt::from(1)`, an `Operand::Const`
+    // of `I32`. The place-only constructor gate used to leave that call as
+    // `rbigint::RBigInt::from`.
+    if std::path::Path::new(INTERPRETER_LLBC).is_file() {
+        let interpreter = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter.ullbc");
+        let long_pow = lower_function(&interpreter, "long_pow").expect("lower long_pow");
+        let long_pow_calls: Vec<Vec<String>> = long_pow
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|operation| match &operation.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => Some(segments.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            long_pow_calls.iter().any(|segments| {
+                segments
+                    .last()
+                    .is_some_and(|leaf| leaf == "jit_bigint_from_i64")
+            }),
+            "long_pow constant word constructors must retarget: {long_pow_calls:?}"
+        );
+        assert!(
+            !long_pow_calls.iter().any(|segments| {
+                segments.len() >= 2
+                    && segments[segments.len() - 2] == "RBigInt"
+                    && segments.last().is_some_and(|leaf| leaf == "from")
+            }),
+            "long_pow must not residualize rbigint::RBigInt::from: {long_pow_calls:?}"
+        );
+    }
+
     let clone_caller = program
         .functions
         .iter()

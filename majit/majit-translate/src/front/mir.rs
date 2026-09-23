@@ -10317,6 +10317,10 @@ impl<'a> Lowering<'a> {
             Operand::Copy(p) | Operand::Move(p) => Some(clone_tyref(&p.ty)),
             Operand::Const(_) => None,
         });
+        // Captured before `call.args` is consumed. A constant word
+        // (`RBigInt::from(1)`) has no place type; its `ty` is what the
+        // constructor residual below classifies.
+        let const_arg_ty = call.args.first().and_then(const_operand_tyref);
         // Captured before `call.args` is consumed: `slice::len` on
         // `Copy(*byte_view)` must see the mark `Rvalue::Len` already follows.
         let first_arg_is_string_byte_view = call
@@ -14116,6 +14120,11 @@ impl<'a> Lowering<'a> {
         // GC reference. Retarget word-sized Rust constructors to wrappers
         // whose C ABI returns `*mut RBigInt`; never narrow i128/u128, which
         // RPython's JIT deliberately has no register kind for.
+        //
+        // A constant word argument (`RBigInt::from(1)` in `long_pow`) has no
+        // place type; `const_arg_ty` is its declared type, so it retargets
+        // the same way a place argument does.
+        let ctor_arg_ty = first_arg_ty.as_ref().or(const_arg_ty.as_ref());
         let op_kind = if let OpKind::Call {
             target: CallTarget::FunctionPath { segments, .. },
             args,
@@ -14123,12 +14132,14 @@ impl<'a> Lowering<'a> {
         } = &op_kind
             && args.len() == 1
             && tyref_is_rbigint(&call.dest.ty, self.llbc)
-            && let Some(arg_ty) = first_arg_ty.as_ref()
+            && let Some(arg_ty) = ctor_arg_ty
         {
+            // `bool` is `frombool`: 0 or 1 in the signed word, same residual
+            // as `I32`/`I64`. `U128`/`I128` stay out of this list.
             let signed = matches!(
                 self.tyref_literal_int_atom(arg_ty),
                 Some("I8" | "I16" | "I32" | "I64" | "Isize")
-            );
+            ) || tyref_is_literal_bool(arg_ty, self.llbc);
             let unsigned = matches!(
                 self.tyref_literal_uint_atom(arg_ty),
                 Some("U8" | "U16" | "U32" | "U64" | "Usize")
@@ -23710,6 +23721,30 @@ fn operand_tyref(op: &Operand) -> Option<&TyRef> {
         Operand::Copy(p) | Operand::Move(p) => Some(&p.ty),
         Operand::Const(_) => None,
     }
+}
+
+/// Declared type of an `Operand::Const`.
+///
+/// Charon stores it beside the literal (`{"ty": {"Deduplicated": N}}` or an
+/// inline `HashConsedValue`). [`operand_tyref`] stays place-only; the rbigint
+/// constructor gate is the caller that has to see a constant word.
+fn const_operand_tyref(op: &Operand) -> Option<TyRef> {
+    let Operand::Const(value) = op else {
+        return None;
+    };
+    let ty = value.as_object()?.get("ty")?;
+    serde_json::from_value(ty.clone()).ok()
+}
+
+/// `{"Literal": "Bool"}` or `{"Literal": {"Bool": ...}}`, after dedup.
+fn tyref_is_literal_bool(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc) else {
+        return false;
+    };
+    let Some(lit) = node.as_object().and_then(|obj| obj.get("Literal")) else {
+        return false;
+    };
+    lit.as_str() == Some("Bool") || lit.as_object().is_some_and(|obj| obj.contains_key("Bool"))
 }
 
 /// The decomposed brick-3 element-`add` gate

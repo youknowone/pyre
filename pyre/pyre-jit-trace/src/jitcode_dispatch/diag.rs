@@ -443,7 +443,6 @@ spec_folds! {
     BinaryOpIntZeroDiv   => ("binary_op_int_zero_div",   "residual_call,inline_call", "-"),
     BinaryOpLongIntPow   => ("binary_op_long_int_pow",   "residual_call", "-"),
     BinaryOpLong         => ("binary_op_long",           "residual_call", "-"),
-    TruedivOpLong        => ("truediv_op_long",          "residual_call", "-"),
     CompareOpLongInt     => ("compare_op_long_int",      "residual_call", "-"),
     CompareOpLong        => ("compare_op_long",          "residual_call", "-"),
     CompareOpStr         => ("compare_op_str",           "residual_call", "-"),

@@ -1302,9 +1302,8 @@ pub(crate) fn try_walker_specialize_binary_op_long_int_shift<Sym: WalkSym>(
 /// Specialized for add/sub/mul/and/or/xor (allocate → `EF_ELIDABLE_OR_MEMORYERROR`)
 /// and floordiv/mod/lshift/rshift (`EF_ELIDABLE_CAN_RAISE`); both classes have
 /// `check_can_raise()` true, so every op carries a trailing `GUARD_NO_EXCEPTION`.
-/// True-divide has its own float fast path
-/// ([`try_walker_specialize_truediv_op_long`]); pow and any non-`W_LongObject`
-/// operand return `Ok(None)` so the caller falls through to the generic record,
+/// True-divide returns a float, and pow and any non-`W_LongObject` operand
+/// return `Ok(None)` so the caller falls through to the generic record,
 /// preserving the `__op__` semantics.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_walker_specialize_binary_op_long<Sym: WalkSym>(
@@ -1470,103 +1469,6 @@ pub(crate) fn try_walker_specialize_binary_op_long<Sym: WalkSym>(
         crate::descr::w_long_size_descr(),
         crate::descr::long_value_descr(),
     );
-    ctx.trace_ctx.set_opref_concrete(
-        result,
-        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
-    );
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
-    Ok(Some(()))
-}
-
-/// W_LongObject true-divide specialization — the float analogue of
-/// [`try_walker_specialize_binary_op_long`].  Both operands are `int`-typed but
-/// bigint-stored: guard each against `LONG_TYPE`, then `CallPureF` the elidable
-/// `jit_w_long_truediv_raw` (correctly-rounded f64 quotient; raises
-/// ZeroDivision/Overflow → `EF_ELIDABLE_CAN_RAISE` ⇒ trailing `GuardNoException`)
-/// and box the f64 with `wrapfloat` (transparent `new_with_vtable` +
-/// `setfield_gc_f`, the trace analogue of `_truediv`'s `space.newfloat(f)`), so a
-/// downstream float op keeps the quotient unboxed.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn try_walker_specialize_truediv_op_long<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    op_tag: i64,
-    r_args: &[OpRef],
-    allboxes: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<()>, DispatchError> {
-    if !ctx.is_authoritative_executor || r_args.len() != 2 || dst_bank != 'r' {
-        return Ok(None);
-    }
-    use pyre_interpreter::bytecode::BinaryOperator;
-    match pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag) {
-        Some(BinaryOperator::TrueDivide) | Some(BinaryOperator::InplaceTrueDivide) => {}
-        _ => return Ok(None),
-    }
-    let lhs = r_args[0];
-    let rhs = r_args[1];
-    let (Some(lhs_obj), Some(rhs_obj)) = (
-        walker_concrete_ref_object(ctx, lhs),
-        walker_concrete_ref_object(ctx, rhs),
-    ) else {
-        return Ok(None);
-    };
-    if !unsafe { pyre_object::is_long(lhs_obj) && pyre_object::is_long(rhs_obj) } {
-        return Ok(None);
-    }
-    let (Some(lhs_class), Some(rhs_class)) = (unsafe {
-        (
-            walker_exact_builtin_class(lhs_obj),
-            walker_exact_builtin_class(rhs_obj),
-        )
-    }) else {
-        return Ok(None);
-    };
-    // Authentic boxed float via the generic execute path; a NULL / raised result
-    // (zero divisor, float overflow) defers to the generic record.
-    let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
-        return Ok(None);
-    };
-    let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
-    walker_guard_class(ctx, op_pc, lhs, long_type_addr)?;
-    walker_guard_class(ctx, op_pc, rhs, long_type_addr)?;
-    walker_guard_exact_w_class(ctx, op_pc, lhs, lhs_class)?;
-    walker_guard_exact_w_class(ctx, op_pc, rhs, rhs_class)?;
-    // Pure `rbigint.truediv` → correctly-rounded f64 (CallPureF). The op already
-    // ran authentically above, so the divisor is nonzero / non-overflowing here;
-    // the trailing GuardNoException covers a divide-by-zero / overflow on replay.
-    let truediv_fn =
-        pyre_interpreter::objspace::descroperation::jit_w_long_truediv_raw as *const ();
-    let f_concrete = pyre_interpreter::objspace::descroperation::jit_w_long_truediv_raw(
-        lhs_obj as i64,
-        rhs_obj as i64,
-    );
-    let concrete_args = [
-        majit_ir::Value::Int(truediv_fn as usize as i64),
-        majit_ir::Value::Ref(majit_ir::GcRef(lhs_obj as usize)),
-        majit_ir::Value::Ref(majit_ir::GcRef(rhs_obj as usize)),
-    ];
-    let raw = ctx.trace_ctx.call_typed_with_effect_pure_can_raise(
-        OpCode::CallF,
-        truediv_fn,
-        &[lhs, rhs],
-        &[majit_ir::Type::Ref, majit_ir::Type::Ref],
-        majit_ir::Type::Float,
-        majit_metainterp::ELIDABLE_EFFECT_INFO,
-        &concrete_args,
-        majit_ir::Value::Float(f_concrete),
-    );
-    ctx.trace_ctx
-        .set_opref_concrete(raw, majit_ir::Value::Float(f_concrete));
-    // pyjitpl.py: no GuardNoException when the pure call folded to a Const.
-    if raw.inline_const_to_value().is_none() {
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
-    }
-    // Box the f64 with the transparent float NEW (`new_with_vtable` +
-    // `setfield_gc_f`), mirroring `space.newfloat(f)`.
-    let result = crate::state::wrapfloat(ctx.trace_ctx, raw);
     ctx.trace_ctx.set_opref_concrete(
         result,
         majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
@@ -10055,6 +9957,15 @@ pub(crate) fn binary_value_from_tag_jitcode()
     crate::jitcode_runtime::pathed_runtime_jitcode_cached(BINARY_OP_DESCENT.path)
 }
 
+/// The `binary_value_from_tag` wrapper leaf, not `binary_value_from_tag_inner`.
+///
+/// The wrapper's entry `inline_call` of the inner is already the helper walk
+/// (`perform_call`). Opening a descent of the wrapper there would suspend at
+/// pc 0 inside the active driver, and the driver would push the wrapper again.
+pub(crate) fn jitcode_name_is_binary_value_from_tag(name: &str) -> bool {
+    name.ends_with("binary_value_from_tag")
+}
+
 /// True when `sub_body` is the `binary_value_from_tag` helper the
 /// codewriter inlines for BINARY.  The per-index name table can miss a
 /// helper that `pathed_jitcode_cached` still owns, and a name-only
@@ -10065,7 +9976,7 @@ pub(crate) fn jitcode_is_binary_value_from_tag(
     sub_body: &super::SubJitCodeBody,
 ) -> bool {
     if crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)
-        .is_some_and(|jc| jc.name.contains("binary_value_from_tag"))
+        .is_some_and(|jc| jitcode_name_is_binary_value_from_tag(&jc.name))
     {
         return true;
     }
@@ -10085,7 +9996,7 @@ pub(crate) fn binary_op_tag_for_helper_index(
     let name = crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)?
         .name
         .as_str();
-    if name.contains("binary_value_from_tag") {
+    if jitcode_name_is_binary_value_from_tag(name) {
         return match int_concretes.first() {
             Some(ConcreteValue::Int(tag)) => Some(*tag),
             _ => None,
@@ -10937,9 +10848,7 @@ pub(crate) fn try_walker_orthodox_binary_op<Sym: WalkSym>(
     // `_ll_2_int_*` residual plus the sign-correction branch, measured
     // 63 → 79 ops on `i // (i % 3)`.
     //
-    // `**` stays with the fold: `float_pow` reaches `f64::is_infinite`
-    // and the `float` constructor, neither lowered, so the sub-walk declined
-    // at every `(n + 1.25) ** 1.5` of `synth/wasm_ca_trampoline_decline`.
+    // `**` descends only with a long operand; see the power gate below.
     use pyre_interpreter::bytecode::BinaryOperator as B;
     let plain = match pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag) {
         Some(B::Add | B::InplaceAdd) => B::Add,
@@ -10952,6 +10861,7 @@ pub(crate) fn try_walker_orthodox_binary_op<Sym: WalkSym>(
         // `int_truediv_ovf2long`, so the helper walk no longer records
         // `rbigint.truediv`.
         Some(B::TrueDivide | B::InplaceTrueDivide) => B::TrueDivide,
+        Some(B::Power | B::InplacePower) => B::Power,
         Some(B::Lshift | B::InplaceLshift) => B::Lshift,
         Some(B::Rshift | B::InplaceRshift) => B::Rshift,
         Some(B::And | B::InplaceAnd) => B::And,
@@ -10970,17 +10880,17 @@ pub(crate) fn try_walker_orthodox_binary_op<Sym: WalkSym>(
         // SAFETY: `obj` is a live concrete `PyObjectRef` from the walker
         // shadow.
         //
-        // No `long`: its arms run rbigint, which this build does not lower,
-        // so the sub-walk declined every time (137 cuts in one
-        // `synth/wasm_ca_trampoline_decline` run, each a rewound trace).
         // Exact builtin float is admitted: `_float_*` is the unboxed
         // descr_* leaf (`float_*` + in-graph `new_with_vtable`), so the
         // walk no longer hits the synthetic `w_float_new` constructor.
+        // Exact builtin long is admitted on the same descent: its arms are
+        // `W_LongObject.descr_*` over rbigint.
         let admitted = unsafe {
             pyre_object::is_exact_builtin_instance(obj)
                 && (pyre_object::is_int(obj)
                     || pyre_object::is_bool(obj)
-                    || pyre_object::is_float(obj))
+                    || pyre_object::is_float(obj)
+                    || pyre_object::is_long(obj))
         };
         if !admitted {
             return Ok(None);
@@ -10989,7 +10899,17 @@ pub(crate) fn try_walker_orthodox_binary_op<Sym: WalkSym>(
     }
     let lhs_is_float = unsafe { pyre_object::is_float(operands[0].1) };
     let rhs_is_float = unsafe { pyre_object::is_float(operands[1].1) };
-    let all_int = !lhs_is_float
+    let any_long =
+        unsafe { pyre_object::is_long(operands[0].1) || pyre_object::is_long(operands[1].1) };
+    // Float and machine-int `**` are not descended. Both stop in
+    // `pow_binary`: float at its `Result::map`, machine int at `int_pow`
+    // with a non-constant exponent (upstream `_pow_nomod` is
+    // `look_inside_iff(isconstant(iw))`, so that call stays residual there).
+    if matches!(plain, B::Power) && !any_long {
+        return Ok(None);
+    }
+    let all_int = !any_long
+        && !lhs_is_float
         && !rhs_is_float
         && unsafe {
             (pyre_object::is_int(operands[0].1) || pyre_object::is_bool(operands[0].1))
@@ -11010,7 +10930,7 @@ pub(crate) fn try_walker_orthodox_binary_op<Sym: WalkSym>(
     // the unboxed leaf whose graph is `float_*` + `new_with_vtable`.
     // Mixed int/float is the same leaf (`float_loop` `i * 0.1`,
     // `spectral_norm` `v[j] / int`).
-    if !all_int {
+    if !any_long && !all_int {
         let Some(descent) = (match plain {
             B::Add => Some(&FLOAT_ADD_DESCENT),
             B::Subtract => Some(&FLOAT_SUB_DESCENT),
@@ -11066,7 +10986,7 @@ pub(crate) fn try_walker_orthodox_binary_op<Sym: WalkSym>(
     // zero, two `cast_int_to_float`, float_truediv, in-graph
     // `new_with_vtable`.  Wide ints raise into residual
     // `int_truediv_ovf2long` (`_make_ovf2long`).
-    if matches!(plain, B::TrueDivide) {
+    if !any_long && matches!(plain, B::TrueDivide) {
         const MANTISSA_LIM: i64 = 1 << 53;
         let x = unsafe { pyre_object::w_int_get_value(operands[0].1) };
         let y = unsafe { pyre_object::w_int_get_value(operands[1].1) };

@@ -10006,16 +10006,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                                 )
                             })?;
                         }
-                        if specialized.is_none() {
-                            // Two-long true-divide → float fast path
-                            // (CallPureF + wrapfloat).
-                            specialized = spec_gate(SpecFold::TruedivOpLong, || {
-                                try_walker_specialize_truediv_op_long(
-                                    ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
-                                    dst_bank,
-                                )
-                            })?;
-                        }
                         specialized
                     }
                 } else if op_tag == 10 && ctx.is_authoritative_executor {

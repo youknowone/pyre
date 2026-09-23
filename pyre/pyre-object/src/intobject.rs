@@ -326,8 +326,8 @@ pub unsafe fn w_int_get_value(obj: PyObjectRef) -> i64 {
 #[inline(never)]
 pub unsafe fn descr_str(obj: PyObjectRef) -> PyObjectRef {
     let v = unsafe { w_int_get_value(obj) };
-    let payload = crate::lowlevel_string::jit_ll_int2dec(v)
-        as *mut crate::unicodeobject::UnicodeValueStorage;
+    let payload =
+        crate::lowlevel_string::jit_ll_int2dec(v) as *mut crate::unicodeobject::UnicodeValueStorage;
     // `len(res)` (`descr_repr`): `LLHelpers.ll_strlen` on the `ll_int2dec`
     // STR.  Keep the payload a `Ptr(STR)` so the rtyper emits STRLEN
     // rather than a Signed residual of `bh_lowlevel_string_len`.
