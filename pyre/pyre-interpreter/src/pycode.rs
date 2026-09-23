@@ -747,6 +747,21 @@ pub struct PyCode {
     /// same code object), and one slot answers only whichever of them asked
     /// last.
     pub addr2line_memo: [std::sync::atomic::AtomicI64; ADDR2LINE_MEMO_WAYS],
+    /// Per-code loop-header set.
+    ///
+    /// `pycode.py` `PyCode._initialize` keeps derived per-code data on the
+    /// code object (`_args_as_cellvars`, `cell_families`, `_globals_caches`).
+    /// The loop-header set has no upstream counterpart: `interp_jit.py`
+    /// `jump_absolute` only compares `jumpto >= next_instr`. pyre scans
+    /// bytecode because 3.14 emits handler-rejoin backward jumps, so the
+    /// scan lives here (`LoopHeaderInfo`) instead of an address-keyed side
+    /// table.
+    ///
+    /// Null until the first query. Built from `code_ptr` and published with
+    /// `compare_exchange`; the loser drops its box. Stays null when
+    /// `code_ptr` is null or unaligned, the same case `globals_caches` leaves
+    /// empty.
+    pub loop_header_info: std::sync::atomic::AtomicPtr<crate::loop_headers::LoopHeaderInfo>,
 }
 
 /// Field offset of `code_ptr` within `PyCode`.
@@ -1299,6 +1314,7 @@ fn w_code_new_owned(code_ptr: *const (), hidden_applevel: bool, owner: usize) ->
         addr2line_memo: std::array::from_fn(|_| {
             std::sync::atomic::AtomicI64::new(ADDR2LINE_MEMO_EMPTY)
         }),
+        loop_header_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
     };
     // The raw-address JIT compatibility seam described above requires a
     // stable wrapper address. `malloc_typed_stable` is still a managed
@@ -4228,6 +4244,12 @@ pub unsafe fn pycode_destructor(obj_addr: usize) {
     if !code.mapdict_caches.is_null() {
         drop(unsafe { Box::from_raw(code.mapdict_caches) });
         code.mapdict_caches = std::ptr::null_mut();
+    }
+    let loop_header_info = code
+        .loop_header_info
+        .swap(std::ptr::null_mut(), std::sync::atomic::Ordering::Acquire);
+    if !loop_header_info.is_null() {
+        drop(unsafe { Box::from_raw(loop_header_info) });
     }
     if !code.co_consts_w.is_null() {
         drop(unsafe { Box::from_raw(code.co_consts_w) });

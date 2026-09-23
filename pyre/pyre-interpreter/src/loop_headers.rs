@@ -1,13 +1,12 @@
-//! Bytecode loop-header analysis and the portal-nameable predicates.
+//! Bytecode loop-header analysis and the portal-nameable predicate.
 //!
 //! Upstream fixes loop headers while the codewriter builds the graph's
 //! JitCode (`rpython/jit/codewriter/jtransform.py handle_jit_marker__loop_header`); here the
 //! scan is interpreter-side bytecode analysis so the accessor is nameable
 //! by the fnaddr table.
 
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::atomic::Ordering;
 
 use rustpython_compiler_core::bytecode::{Instruction, OpArg, OpArgState};
 
@@ -153,37 +152,62 @@ pub fn find_loop_header_pcs(code: &CodeObject) -> HashSet<usize> {
     loop_header_pcs
 }
 
-thread_local! {
-    static LOOP_HEADER_PCS: RefCell<HashMap<usize, Arc<HashSet<usize>>>> =
-        RefCell::new(HashMap::new());
-}
-
-fn cached_loop_header_pcs(code: &CodeObject) -> Arc<HashSet<usize>> {
-    let key = code as *const CodeObject as usize;
-    LOOP_HEADER_PCS.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if let Some(hit) = cache.get(&key) {
-            return Arc::clone(hit);
-        }
-        let computed = Arc::new(find_loop_header_pcs(code));
-        cache.insert(key, Arc::clone(&computed));
-        computed
-    })
-}
-
-/// Two-word predicate for the portal arm: is `pc` a loop header of `code`?
+/// Per-code loop-header scan, owned by the `PyCode` wrapper.
 ///
-/// Collapses `CodeWriter::instance()` → `callcontrol()` →
-/// `get_loop_header_pcs()` → `Arc::deref` → set membership into one residual
-/// the fnaddr table can name. The set and its per-code-address cache stay
-/// behind this call.
-#[majit_macros::dont_look_inside]
-pub fn code_pc_is_loop_header(code: *const CodeObject, pc: usize) -> bool {
-    if code.is_null() {
-        return false;
+/// `header_pcs` is `find_loop_header_pcs` sorted for binary search.
+pub struct LoopHeaderInfo {
+    pub header_pcs: Vec<usize>,
+}
+
+/// Publish `LoopHeaderInfo` on `w_code` at the first query.
+///
+/// A null wrapper, or a null/unaligned `code_ptr` (the case in which
+/// `w_code_new_owned` leaves `globals_caches` null), builds nothing and
+/// returns `None`. The loser of `compare_exchange` drops its box.
+fn ensure_loop_header_info(w_code: pyre_object::PyObjectRef) -> Option<*const LoopHeaderInfo> {
+    if w_code.is_null() {
+        return None;
     }
-    let code = unsafe { &*code };
-    cached_loop_header_pcs(code).contains(&pc)
+    let pycode = unsafe { &*(w_code as *const crate::pycode::PyCode) };
+    let code_ptr = pycode.code_ptr;
+    let align_mask = std::mem::align_of::<CodeObject>() as i64 - 1;
+    if code_ptr.is_null() || (code_ptr as i64) & align_mask != 0 {
+        return None;
+    }
+    let existing = pycode.loop_header_info.load(Ordering::Acquire);
+    if !existing.is_null() {
+        return Some(existing);
+    }
+    let code = unsafe { &*(code_ptr as *const CodeObject) };
+    let mut header_pcs: Vec<usize> = find_loop_header_pcs(code).into_iter().collect();
+    header_pcs.sort_unstable();
+    let built = Box::into_raw(Box::new(LoopHeaderInfo { header_pcs }));
+    match pycode.loop_header_info.compare_exchange(
+        std::ptr::null_mut(),
+        built,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => Some(built),
+        Err(winner) => {
+            drop(unsafe { Box::from_raw(built) });
+            Some(winner)
+        }
+    }
+}
+
+/// Two-word predicate for the portal arm: is `pc` a loop header of `w_code`?
+///
+/// Collapses the per-code header scan into one residual the fnaddr table can
+/// name. The sorted set lives on `PyCode.loop_header_info`. A null wrapper,
+/// or a null or unaligned `code_ptr`, answers false.
+#[majit_macros::dont_look_inside]
+pub fn code_pc_is_loop_header(w_code: pyre_object::PyObjectRef, pc: usize) -> bool {
+    let Some(info) = ensure_loop_header_info(w_code) else {
+        return false;
+    };
+    let info = unsafe { &*info };
+    info.header_pcs.binary_search(&pc).is_ok()
 }
 
 #[cfg(test)]
@@ -202,6 +226,10 @@ mod tests {
                 _ => None,
             })
             .expect("expected nested function code object")
+    }
+
+    fn wrapper_for(code: &CodeObject) -> pyre_object::PyObjectRef {
+        crate::box_code_object(code.clone())
     }
 
     fn dominating_backedge_targets(code: &CodeObject) -> Vec<usize> {
@@ -226,19 +254,17 @@ mod tests {
         let code = first_function_code(
             "def f(n):\n    s = 0\n    for i in range(n):\n        for j in range(n):\n            s += 1\n    return s\n",
         );
+        let w_code = wrapper_for(&code);
         let headers = find_loop_header_pcs(&code);
         let expected = dominating_backedge_targets(&code);
         assert_eq!(headers.len(), 2);
         assert_eq!(expected.len(), 2);
         for &pc in &expected {
             assert!(headers.contains(&pc), "missing header {pc}");
-            assert!(code_pc_is_loop_header(&code as *const _, pc));
+            assert!(code_pc_is_loop_header(w_code, pc));
         }
         for pc in 0..code.instructions.len() {
-            assert_eq!(
-                code_pc_is_loop_header(&code as *const _, pc),
-                headers.contains(&pc)
-            );
+            assert_eq!(code_pc_is_loop_header(w_code, pc), headers.contains(&pc));
         }
     }
 
@@ -247,13 +273,14 @@ mod tests {
         let code = first_function_code(
             "def f(n):\n    s = 0\n    i = 0\n    while i < n:\n        i += 1\n        if i % 2 == 0:\n            continue\n        s += i\n    return s\n",
         );
+        let w_code = wrapper_for(&code);
         let headers = find_loop_header_pcs(&code);
         let expected = dominating_backedge_targets(&code);
         assert_eq!(headers.len(), 1);
         assert_eq!(expected.len(), 1);
         let header = expected[0];
         assert!(headers.contains(&header));
-        assert!(code_pc_is_loop_header(&code as *const _, header));
+        assert!(code_pc_is_loop_header(w_code, header));
         let mut continue_targets = Vec::new();
         let mut scan_state = OpArgState::default();
         for pc in 0..code.instructions.len() {
@@ -267,10 +294,7 @@ mod tests {
             "continue must land on the while header"
         );
         for &target in &continue_targets {
-            assert_eq!(
-                code_pc_is_loop_header(&code as *const _, target),
-                target == header
-            );
+            assert_eq!(code_pc_is_loop_header(w_code, target), target == header);
         }
     }
 
@@ -279,12 +303,13 @@ mod tests {
         let code = first_function_code(
             "def run(n):\n    acc = 0\n    for i in range(n):\n        try:\n            raise ValueError\n        except ValueError:\n            acc += 1\n    return acc\n",
         );
+        let w_code = wrapper_for(&code);
         let headers = find_loop_header_pcs(&code);
         let expected = dominating_backedge_targets(&code);
         assert_eq!(expected.len(), 1);
         assert_eq!(headers.len(), 1);
         assert!(headers.contains(&expected[0]));
-        assert!(code_pc_is_loop_header(&code as *const _, expected[0]));
+        assert!(code_pc_is_loop_header(w_code, expected[0]));
 
         let succ = code_successors(&code);
         let mut handler_only = Vec::new();
@@ -299,7 +324,7 @@ mod tests {
         }
         for target in handler_only {
             assert!(
-                !code_pc_is_loop_header(&code as *const _, target),
+                !code_pc_is_loop_header(w_code, target),
                 "handler-rejoin target {target} must not be a loop header"
             );
         }
