@@ -56,12 +56,6 @@ pub(crate) fn rewire_from_raw_parts_sites(graph: &mut FunctionGraph) -> usize {
                 _ => continue,
             };
             let canonical = canonical_source(graph, &header);
-            let Some(header_ty) = var_value_type(graph, &canonical) else {
-                continue;
-            };
-            if value_type_bank(&header_ty) != value_type_bank(&result_ty) {
-                continue;
-            }
             sites.push((bi, oi, canonical, result_ty));
         }
     }
@@ -70,6 +64,12 @@ pub(crate) fn rewire_from_raw_parts_sites(graph: &mut FunctionGraph) -> usize {
         let Some(live) = ensure_live_rep(graph, bi, &canonical) else {
             continue;
         };
+        let Some(live_ty) = var_value_type(graph, &live) else {
+            continue;
+        };
+        if value_type_bank(&live_ty) != value_type_bank(&result_ty) {
+            continue;
+        }
         graph.blocks[bi].operations[oi].kind = OpKind::UnaryOp {
             op: "same_as".to_string(),
             operand: live,
@@ -90,7 +90,8 @@ fn header_for_from_raw_parts(graph: &FunctionGraph, op: &SpaceOperation) -> Opti
     let ptr = args[0].clone().into_variable();
     let len = args[1].clone().into_variable();
     if let Some(header) = chars_field_header(graph, &ptr) {
-        return Some(header);
+        let header = peel_ptr_int_casts(graph, &header);
+        return len_names_same_header(graph, &len, &header).then_some(header);
     }
     let header = ptr_add_chars_offset_header(graph, &ptr)?;
     let header = peel_ptr_int_casts(graph, &header);
@@ -194,9 +195,9 @@ fn chars_field_header(graph: &FunctionGraph, ptr: &Variable) -> Option<Variable>
 }
 
 fn is_chars_offset(n: i64) -> bool {
-    // STR / rpy_string chars sit two words past the header (`hash`, then `len`).
-    // Translate-time `usize` is the host's; wasm32 leftovers use a 4-byte word.
-    n == 8 || n == 16
+    // `llmemory.offsetof(STR, 'chars')` — hash, then len, then chars.
+    // pyre lays that out as `LOWLEVEL_STRING_CHARS_OFFSET` (two words).
+    n == (2 * std::mem::size_of::<usize>()) as i64
 }
 
 fn const_int_of(graph: &FunctionGraph, var: &Variable) -> Option<i64> {
@@ -434,7 +435,24 @@ mod tests {
                 true,
             )
             .unwrap();
-        let len = g.push_op_var(a, OpKind::ConstInt(4), true).unwrap();
+        let len = g
+            .push_op_var(
+                a,
+                OpKind::FieldRead {
+                    base: header.clone(),
+                    field: FieldDescriptor {
+                        name: "length".to_string(),
+                        owner_root: Some("BytesBlock".to_string()),
+                        owner_id: None,
+                        base_is_deref: None,
+                        taken_by_address: false,
+                    },
+                    ty: ValueType::Unsigned,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
         let slice = g
             .push_op_var(
                 a,
@@ -598,6 +616,187 @@ mod tests {
             g.blocks[b_frp.0].inputargs.len(),
             3,
             "header must be threaded onto the unique predecessor edge"
+        );
+    }
+
+    #[test]
+    fn chars_field_with_constant_length_stays_residual() {
+        let mut g = FunctionGraph::new("test_from_raw_parts_chars_const_len");
+        let a = g.startblock;
+        let header = g
+            .push_op_var(
+                a,
+                OpKind::Input {
+                    name: "block".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let chars = g
+            .push_op_var(
+                a,
+                OpKind::FieldRead {
+                    base: header,
+                    field: FieldDescriptor {
+                        name: "chars".to_string(),
+                        owner_root: Some("BytesBlock".to_string()),
+                        owner_id: None,
+                        base_is_deref: None,
+                        taken_by_address: true,
+                    },
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        let len = g.push_op_var(a, OpKind::ConstInt(1), true).unwrap();
+        let slice = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: from_raw_parts_target(),
+                    args: crate::model::call_args(vec![chars, len]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        g.set_return(a, Some(slice));
+
+        assert_eq!(rewire_from_raw_parts_sites(&mut g), 0);
+        assert!(
+            residual_from_raw_parts(&g),
+            "a chars view whose length is not the STR length must stay residual"
+        );
+    }
+
+    #[test]
+    fn word_offset_is_not_the_chars_displacement() {
+        // `len` sits one word in; `chars` sits at `2 * word`. Accepting
+        // every literal in {8, 16} aliases a length-word address.
+        let mut g = FunctionGraph::new("test_from_raw_parts_word_ofs");
+        let a = g.startblock;
+        let header = str_header(&mut g, a);
+        let offset = g
+            .push_op_var(
+                a,
+                OpKind::ConstInt(std::mem::size_of::<usize>() as i64),
+                true,
+            )
+            .unwrap();
+        let chars = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: ptr_add_target(),
+                    args: crate::model::call_args(vec![header.clone(), offset]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let len = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: string_len_target(),
+                    args: crate::model::call_args(vec![header]),
+                    result_ty: ValueType::Unsigned,
+                },
+                true,
+            )
+            .unwrap();
+        let slice = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: from_raw_parts_target(),
+                    args: crate::model::call_args(vec![chars, len]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        g.set_return(a, Some(slice));
+
+        assert_eq!(rewire_from_raw_parts_sites(&mut g), 0);
+        assert!(residual_from_raw_parts(&g));
+    }
+
+    #[test]
+    fn int_bank_header_rep_is_not_aliased() {
+        let mut g = FunctionGraph::new("test_from_raw_parts_int_rep");
+        let a = g.startblock;
+        let header = str_header(&mut g, a);
+        let as_int = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: cast_ptr_to_int_target(),
+                    args: crate::model::call_args(vec![header.clone()]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let (b, b_args) = g.create_block_with_arg_vars(1);
+        let live_int = b_args[0].clone();
+        g.set_goto(a, b, vec![as_int]);
+        let offset = g
+            .push_op_var(
+                b,
+                OpKind::ConstInt((2 * std::mem::size_of::<usize>()) as i64),
+                true,
+            )
+            .unwrap();
+        let chars = g
+            .push_op_var(
+                b,
+                OpKind::Call {
+                    target: ptr_add_target(),
+                    args: crate::model::call_args(vec![live_int.clone(), offset]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let len = g
+            .push_op_var(
+                b,
+                OpKind::Call {
+                    target: string_len_target(),
+                    args: crate::model::call_args(vec![live_int]),
+                    result_ty: ValueType::Unsigned,
+                },
+                true,
+            )
+            .unwrap();
+        let slice = g
+            .push_op_var(
+                b,
+                OpKind::Call {
+                    target: from_raw_parts_target(),
+                    args: crate::model::call_args(vec![chars, len]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        g.set_return(b, Some(slice));
+
+        assert_eq!(rewire_from_raw_parts_sites(&mut g), 0);
+        assert!(
+            residual_from_raw_parts(&g),
+            "same_as must not take an int-bank cast of the header"
+        );
+        assert!(
+            !g.blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| { matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as") })
         );
     }
 

@@ -4054,6 +4054,36 @@ impl<'a> Transformer<'a> {
         )
     }
 
+    /// `llmemory.sizeof(concretetype.TO.OF)` as a byte count.
+    /// `CCHARP` is handled by the caller and never reaches this.
+    fn direct_ptradd_item_bytes(
+        ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    ) -> Option<i64> {
+        use crate::flowspace::model::ConstValue;
+        use crate::translator::rtyper::lltypesystem::llmemory::{self, OffsetLayout};
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+
+        let LowLevelType::Ptr(ptr) = ty else {
+            return None;
+        };
+        let PtrTarget::Array(arr) = &ptr.TO else {
+            return None;
+        };
+        let ConstValue::AddressOffset(addr) = llmemory::sizeof(&arr.OF, None).ok()? else {
+            return None;
+        };
+        struct NoLayout;
+        impl OffsetLayout for NoLayout {
+            fn field_offset(&self, _struct_name: &str, _fldname: &str) -> Option<i64> {
+                None
+            }
+            fn struct_size(&self, _struct_name: &str) -> Option<i64> {
+                None
+            }
+        }
+        addr.byte_size(&NoLayout).ok()
+    }
+
     /// Recovery helper — no direct RPython precedent. Inserts
     /// `cast_ptr_to_int` for a Ref operand at an integer site.
     /// The producer is `front::mir` `BinaryOp` (`simple_call` to
@@ -4086,61 +4116,76 @@ impl<'a> Transformer<'a> {
         )
     }
 
-    /// `jtransform.py rewrite_op_direct_ptradd`.  The count is already a
-    /// byte offset (front scaled `n * sizeof(T)` when the pointee size
-    /// was known), so this is the `CCHARP` arm: `int_add` of the
-    /// address integer and the shift.  Raw pointers are Ref here, so
-    /// the add is `cast_ptr_to_int` + `int_add` + `cast_int_to_ptr`
-    /// rather than `int_add` of two ints — each alias stays inside one
-    /// bank (`value_type_bank`).
+    /// `Transformer.rewrite_op_direct_ptradd` (`jtransform.py`).
+    ///
+    /// A non-`CCHARP` pointer scales the count by `llmemory.sizeof(TO.OF)`.
+    /// The pointer and the shift then meet in one `int_add` whose result
+    /// stays a raw pointer (int kind).
     fn rewrite_op_direct_ptradd(
         &mut self,
         op: &SpaceOperation,
         args: &[crate::flowspace::model::Variable],
-        result_ty: &ValueType,
+        _result_ty: &ValueType,
         graph: &mut FunctionGraph,
     ) -> RewriteResult {
         let [ptr, shift] = args else {
             return RewriteResult::Keep;
         };
-        let (addr, mut ops) = self.coerce_operand_to_int(graph, ptr);
-        let (shift_i, shift_ops) = self.coerce_operand_to_int(graph, shift);
-        ops.extend(shift_ops);
-        if matches!(result_ty, ValueType::Ref(_)) {
-            let sum = self.fresh_synthetic_variable_typed(
+        if self.get_value_kind_var(shift) == 'r' {
+            return RewriteResult::Keep;
+        }
+        let ptr_ty = ptr.concretetype();
+        let is_ccharp = ptr_ty
+            .as_ref()
+            .is_some_and(|ty| ty == &*crate::translator::rtyper::lltypesystem::rffi::CCHARP);
+        let mut shift_v = shift.clone();
+        let mut ops = Vec::new();
+        if !is_ccharp {
+            let Some(by) = ptr_ty.as_ref().and_then(Self::direct_ptradd_item_bytes) else {
+                return RewriteResult::Keep;
+            };
+            let c_by = self.fresh_synthetic_variable_typed(
                 graph,
                 crate::codewriter::type_state::ConcreteType::Signed,
             );
             ops.push(SpaceOperation {
-                result: Some(sum.clone()),
+                result: Some(c_by.clone()),
+                kind: OpKind::ConstInt(by),
+            });
+            let prod = self.fresh_synthetic_variable_typed(
+                graph,
+                crate::codewriter::type_state::ConcreteType::Signed,
+            );
+            ops.push(SpaceOperation {
+                result: Some(prod.clone()),
                 kind: OpKind::BinOp {
-                    op: "add".to_string(),
-                    lhs: addr,
-                    rhs: shift_i,
+                    op: "int_mul".to_string(),
+                    lhs: shift.clone(),
+                    rhs: c_by,
                     result_ty: ValueType::Int,
                 },
             });
-            self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
-            ops.push(SpaceOperation {
-                result: op.result.clone(),
-                kind: OpKind::UnaryOp {
-                    op: "cast_int_to_ptr".into(),
-                    operand: sum,
-                    result_ty: result_ty.clone(),
-                },
-            });
-        } else {
-            self.stamp_value_kind_from_value_type(graph, op.result.clone(), &ValueType::Int);
-            ops.push(SpaceOperation {
-                result: op.result.clone(),
-                kind: OpKind::BinOp {
-                    op: "add".to_string(),
-                    lhs: addr,
-                    rhs: shift_i,
-                    result_ty: ValueType::Int,
-                },
-            });
+            shift_v = prod;
         }
+        if let Some(result) = op.result.clone() {
+            if let Some(ty) = ptr_ty.clone() {
+                result.set_concretetype(Some(ty));
+            }
+            self.stamp_value_kind(
+                graph,
+                Some(result),
+                crate::codewriter::type_state::ConcreteType::Signed,
+            );
+        }
+        ops.push(SpaceOperation {
+            result: op.result.clone(),
+            kind: OpKind::BinOp {
+                op: "int_add".to_string(),
+                lhs: ptr.clone(),
+                rhs: shift_v,
+                result_ty: ValueType::Int,
+            },
+        });
         RewriteResult::Replace(ops)
     }
 
@@ -14482,7 +14527,9 @@ mod tests {
                 true,
             )
             .unwrap();
-        FunctionGraph::set_concretetype_of_inline(&ptr, ConcreteType::GcRef);
+        ptr.set_concretetype(Some(
+            crate::translator::rtyper::lltypesystem::rffi::CCHARP.clone(),
+        ));
         let shift = graph
             .push_op_var(
                 graph.startblock,
@@ -14537,26 +14584,17 @@ mod tests {
                 assert!(
                     ops.iter().any(|op| matches!(
                         &op.kind,
-                        OpKind::UnaryOp { op, operand, result_ty: ty }
-                            if op == "cast_ptr_to_int" && operand == &ptr && *ty == ValueType::Int
+                        OpKind::BinOp { op, lhs, rhs, result_ty: ty }
+                            if op == "int_add" && lhs == &ptr && rhs == &shift && *ty == ValueType::Int
                     )),
-                    "direct_ptradd must take the address integer first; ops={ops:?}"
+                    "CCHARP direct_ptradd is one int_add; ops={ops:?}"
                 );
                 assert!(
-                    ops.iter().any(|op| matches!(
+                    !ops.iter().any(|op| matches!(
                         &op.kind,
-                        OpKind::BinOp { op, result_ty: ty, .. }
-                            if op == "add" && *ty == ValueType::Int
+                        OpKind::UnaryOp { op, .. } if op == "cast_ptr_to_int" || op == "cast_int_to_ptr"
                     )),
-                    "direct_ptradd must int_add the byte offset; ops={ops:?}"
-                );
-                assert!(
-                    ops.iter().any(|op| matches!(
-                        &op.kind,
-                        OpKind::UnaryOp { op, result_ty: ty, .. }
-                            if op == "cast_int_to_ptr" && *ty == ValueType::Ref(None)
-                    )),
-                    "direct_ptradd must restore the Ref bank; ops={ops:?}"
+                    "direct_ptradd must not cast the address into a GC ref; ops={ops:?}"
                 );
                 assert!(
                     !ops.iter()
@@ -14564,6 +14602,158 @@ mod tests {
                     "direct_ptradd must not residualize; ops={ops:?}"
                 );
             }
+            RewriteResult::Keep => panic!("direct_ptradd must rewrite, got Keep"),
+            RewriteResult::Identity(_) => panic!("direct_ptradd must rewrite, got Identity"),
+        }
+    }
+
+    /// `Transformer.rewrite_op_direct_ptradd`: a `CCHARP` shift is already
+    /// in bytes, so the rewrite is one `int_add` into an int-kind result.
+    #[test]
+    fn direct_ptradd_ccharp_is_int_add_not_a_ref_cast() {
+        use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+
+        let (ops, result) = rewrite_direct_ptradd_of((*CCHARP).clone(), ValueType::Ref(None));
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, .. } if op == "cast_ptr_to_int" || op == "cast_int_to_ptr"
+            )),
+            "raw pointer add must not cast through a GC ref; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::BinOp { op, lhs, rhs, result_ty }
+                    if op == "int_add"
+                        && lhs == &result.0
+                        && rhs == &result.1
+                        && *result_ty == ValueType::Int
+            )),
+            "CCHARP direct_ptradd is int_add of the pointer and the shift; ops={ops:?}"
+        );
+        let out = ops.last().and_then(|op| op.result.as_ref()).unwrap();
+        assert_eq!(
+            FunctionGraph::concretetype_of(out),
+            ConcreteType::Signed,
+            "a raw pointer result is int kind"
+        );
+    }
+
+    /// Non-`CCHARP` item pointers scale the count by `sizeof(TO.OF)`
+    /// before the same `int_add`.
+    #[test]
+    fn direct_ptradd_non_char_multiplies_by_item_size() {
+        use crate::translator::rtyper::lltypesystem::rffi::SIGNEDP;
+
+        let (ops, (ptr, shift)) = rewrite_direct_ptradd_of((*SIGNEDP).clone(), ValueType::Int);
+        let mul = ops.iter().find(|op| {
+            matches!(&op.kind, OpKind::BinOp { op, lhs, .. } if op == "int_mul" && lhs == &shift)
+        });
+        let Some(mul) = mul else {
+            panic!("non-char direct_ptradd must int_mul the shift; ops={ops:?}");
+        };
+        let prod = mul.result.clone().unwrap();
+        let scale = match &mul.kind {
+            OpKind::BinOp { rhs, .. } => rhs.clone(),
+            _ => unreachable!(),
+        };
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::ConstInt(n) if op.result.as_ref() == Some(&scale) && *n == 8)),
+            "sizeof(Signed) is the scale; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::BinOp { op, lhs, rhs, result_ty }
+                    if op == "int_add" && lhs == &ptr && rhs == &prod && *result_ty == ValueType::Int
+            )),
+            "the scaled shift is int_add-ed onto the pointer; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, .. } if op == "cast_ptr_to_int" || op == "cast_int_to_ptr"
+            )),
+            "ops={ops:?}"
+        );
+    }
+
+    fn rewrite_direct_ptradd_of(
+        ptr_ty: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+        result_ty: ValueType,
+    ) -> (
+        Vec<SpaceOperation>,
+        (
+            crate::flowspace::model::Variable,
+            crate::flowspace::model::Variable,
+        ),
+    ) {
+        let mut graph = FunctionGraph::new("direct_ptradd_item");
+        let ptr = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "ptr".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        ptr.set_concretetype(Some(ptr_ty));
+        let shift = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "n".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&shift, ConcreteType::Signed);
+        let target = CallTarget::function_path([
+            "rpython",
+            "rtyper",
+            "lltypesystem",
+            "lltype",
+            "direct_ptradd",
+        ]);
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: target.clone(),
+                    args: crate::model::call_args(vec![ptr.clone(), shift.clone()]),
+                    result_ty: result_ty.clone(),
+                },
+                true,
+            )
+            .unwrap();
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: OpKind::Call {
+                target,
+                args: crate::model::call_args(vec![ptr.clone(), shift.clone()]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        let rewritten = Transformer::new(&GraphTransformConfig::default()).rewrite_op_direct_call(
+            &op,
+            match &op.kind {
+                OpKind::Call { target, .. } => target,
+                _ => unreachable!(),
+            },
+            &[ptr.clone(), shift.clone()],
+            &result_ty,
+            "direct_ptradd_item",
+            &mut graph,
+        );
+        match rewritten {
+            RewriteResult::Replace(ops) => (ops, (ptr, shift)),
             RewriteResult::Keep => panic!("direct_ptradd must rewrite, got Keep"),
             RewriteResult::Identity(_) => panic!("direct_ptradd must rewrite, got Identity"),
         }

@@ -10653,15 +10653,11 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 // `<*mut T>::add` / `<*const T>::add` / `::sub` is
-                // `lltype.direct_ptradd`.  `sub` is the same scaled byte
-                // offset with the count negated (`pyframe.rs` header
-                // prefix: `(ptr as *mut u8).sub(GC_HEADER_SIZE)`).
-                // The add stays pointer-typed so a `null_mut()` arm at the
-                // same return can union with it.  Pointee size is not a
-                // recoverable `TO.OF` on the erased pointer at jtransform
-                // time, so the count is scaled to a byte offset here
-                // (`n * sizeof(T)`, skipped for size 0/1) and the rewrite
-                // treats the shift as already-scaled, like `CCHARP`.
+                // `lltype.direct_ptradd(ptr, unscaled_count)`.  `sub`
+                // negates the count.  The pointer's concretetype carries
+                // `TO.OF` so `rewrite_op_direct_ptradd` can scale; a char
+                // pointer is `CCHARP` and stays unscaled.  The result is
+                // a raw pointer (int kind).
                 //
                 // Brick-1 accessors and brick-3 getarrayitem `.add`s have
                 // their own intercepts later in this match; do not steal
@@ -10681,30 +10677,7 @@ impl<'a> Lowering<'a> {
                     let offset = if pointee_size == 0 {
                         args[0].clone()
                     } else {
-                        let mut count = if pointee_size == 1 {
-                            args[1].clone()
-                        } else {
-                            let scale = self
-                                .graph
-                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                                result: Some(scale.clone()),
-                                kind: OpKind::ConstInt(pointee_size),
-                            });
-                            let scaled = self
-                                .graph
-                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                                result: Some(scaled.clone()),
-                                kind: OpKind::BinOp {
-                                    op: "mul".to_string(),
-                                    lhs: args[1].clone(),
-                                    rhs: scale,
-                                    result_ty: ValueType::Int,
-                                },
-                            });
-                            scaled
-                        };
+                        let mut count = args[1].clone();
                         if self.ptr_offset_is_sub(&reg) {
                             let neg = self
                                 .graph
@@ -10719,7 +10692,8 @@ impl<'a> Lowering<'a> {
                             });
                             count = neg;
                         }
-                        push_direct_ptradd(&mut self.graph, bb_id, args[0].clone(), count)
+                        let item = item_lltype_for_size(pointee_size);
+                        push_direct_ptradd(&mut self.graph, bb_id, args[0].clone(), count, &item)
                     };
                     self.local_var[dest_local] = Some(offset);
                     let target_bb = self.block_id[target];
@@ -26116,18 +26090,26 @@ fn int_binop_needs_ptr_to_int(op: &str, lhs: Option<&ValueType>, rhs: Option<&Va
         && (matches!(lhs, Some(ValueType::Ref(_))) || matches!(rhs, Some(ValueType::Ref(_))))
 }
 
-/// Emit `simple_call(lltype.direct_ptradd, p, n)` and return the pointer
-/// result.  The annotation is the pointer operand's (`ann_direct_ptradd`
-/// returns `s_p`), so a `null_mut()` arm of the same pointer unions with
-/// it.  `n` is a Signed/Unsigned byte offset — pointee scaling happens
-/// at the callsite when `TO.OF` is not recoverable later.
+/// Emit `simple_call(lltype.direct_ptradd, p, n)` and return the raw
+/// pointer.  `ann_direct_ptradd` returns `s_p`.  `n` is an unscaled item
+/// count.  `item` is `TO.OF`: a `Char` builds `CCHARP` (byte shift);
+/// anything else is what `rewrite_op_direct_ptradd` multiplies by.
+/// The result kind is int.
 fn push_direct_ptradd(
     graph: &mut FunctionGraph,
     bb_id: BlockId,
     ptr: Variable,
     count: Variable,
+    item: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
 ) -> Variable {
-    let result = graph.alloc_value_var();
+    let ptr_ty = ptr
+        .concretetype()
+        .unwrap_or_else(|| raw_nolength_array_ptr(item));
+    if ptr.concretetype().is_none() {
+        ptr.set_concretetype(Some(ptr_ty.clone()));
+    }
+    let result = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+    result.set_concretetype(Some(ptr_ty));
     graph.block_mut(bb_id).operations.push(SpaceOperation {
         result: Some(result.clone()),
         kind: OpKind::Call {
@@ -26145,10 +26127,45 @@ fn push_direct_ptradd(
                 fun_decl_id: None,
             },
             args: crate::model::call_args(vec![ptr, count]),
-            result_ty: ValueType::Ref(None),
+            result_ty: ValueType::Int,
         },
     });
     result
+}
+
+fn raw_nolength_array_ptr(
+    item: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
+    use crate::flowspace::model::ConstValue;
+    use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Ptr, PtrTarget};
+    LowLevelType::Ptr(Box::new(Ptr {
+        TO: PtrTarget::Array(Array::with_hints(
+            item.clone(),
+            vec![("nolength".into(), ConstValue::Bool(true))],
+        )),
+    }))
+}
+
+/// Item type whose `llmemory.sizeof` is `n` bytes, so
+/// `rewrite_op_direct_ptradd` can read `TO.OF`.  One byte is `Char`
+/// (`CCHARP` skips the multiply).
+fn item_lltype_for_size(n: i64) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
+    use crate::translator::rtyper::lltypesystem::lltype::{FixedSizeArray, LowLevelType};
+    let word = crate::layout::target_word_size() as i64;
+    if n == 1 {
+        LowLevelType::Char
+    } else if n == word {
+        LowLevelType::Signed
+    } else if n == 4 {
+        LowLevelType::UniChar
+    } else if n == 16 {
+        LowLevelType::SignedLongLongLong
+    } else {
+        LowLevelType::FixedSizeArray(Box::new(FixedSizeArray::new(
+            LowLevelType::Char,
+            n as usize,
+        )))
+    }
 }
 
 /// Emit `simple_call(lltype.cast_ptr_to_int, p)` and return the Signed
@@ -41745,13 +41762,13 @@ mod tests {
         let graph = super::lower_function(&llbc, "add_i64").expect("lower *const i64::add");
         let ops = graph_ops(&graph);
         assert!(
-            ops.iter().any(|op| matches!(op.kind, OpKind::ConstInt(8))),
-            "*const i64::add must multiply by 8; ops={ops:?}"
+            !ops.iter().any(|op| matches!(op.kind, OpKind::ConstInt(8))),
+            "*const i64::add must leave scaling to rewrite_op_direct_ptradd; ops={ops:?}"
         );
         assert!(
-            ops.iter()
+            !ops.iter()
                 .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "mul")),
-            "*const i64::add must emit int_mul on the count; ops={ops:?}"
+            "*const i64::add must not scale the count; ops={ops:?}"
         );
         assert!(
             ops.iter().any(|op| is_lltype_direct_ptradd(op)),
@@ -41761,6 +41778,43 @@ mod tests {
             !ops.iter()
                 .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add")),
             "*const i64::add must not become int_add at the front; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn ptr_add_of_i64_emits_unscaled_count() {
+        let ptr_ty = serde_json::json!({
+            "RawPtr": [{"Literal": {"Int": "I64"}}, "Mut"]
+        });
+        let usize_ty = serde_json::json!({"Literal": {"UInt": "Usize"}});
+        let llbc = std_extern_call_fixture(
+            "add_i64_unscaled",
+            &["core", "ptr", "const_ptr", "<Impl>", "add"],
+            &[ptr_ty.clone(), usize_ty],
+            ptr_ty,
+        );
+        let graph =
+            super::lower_function(&llbc, "add_i64_unscaled").expect("lower *const i64::add");
+        let ops = graph_ops(&graph);
+        assert!(
+            !ops.iter().any(|op| matches!(op.kind, OpKind::ConstInt(8))),
+            "item scaling belongs to rewrite_op_direct_ptradd; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "mul")),
+            "the count must stay unscaled; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    result_ty: ValueType::Int,
+                    ..
+                } if segments.last().map(String::as_str) == Some("direct_ptradd")
+            )),
+            "direct_ptradd result is a raw pointer (int kind); ops={ops:?}"
         );
     }
 
@@ -41850,7 +41904,7 @@ mod tests {
             &op.kind,
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments, .. },
-                result_ty: ValueType::Ref(_),
+                result_ty: ValueType::Int,
                 ..
             } if segments.last().map(String::as_str) == Some("direct_ptradd")
                 && segments.iter().any(|s| s == "lltype")
@@ -43875,17 +43929,23 @@ mod tests {
         let count = graph
             .push_op_var(entry, OpKind::ConstInt(8), true)
             .expect("count");
-        let result = push_direct_ptradd(&mut graph, entry, ptr.clone(), count.clone());
+        let result = push_direct_ptradd(
+            &mut graph,
+            entry,
+            ptr.clone(),
+            count.clone(),
+            &crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Char,
+        );
         assert_eq!(
             FunctionGraph::concretetype_of(&result),
-            crate::model::ConcreteType::Unknown,
-            "direct_ptradd result matches null_mut's unstamped pointer"
+            crate::model::ConcreteType::Signed,
+            "direct_ptradd result is a raw pointer (int kind)"
         );
         match &graph.block(entry).operations.last().unwrap().kind {
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments, .. },
                 args,
-                result_ty: ValueType::Ref(None),
+                result_ty: ValueType::Int,
             } if segments.last().map(String::as_str) == Some("direct_ptradd") => {
                 assert_eq!(args, &crate::model::call_args(vec![ptr, count]));
             }
