@@ -4415,9 +4415,9 @@ pub fn holder_typ_descr() -> DescrRef {
 /// The declaration is on the hook list itself; the field watched here is the
 /// byte `AuditHolder` projects it onto, because a `Box<[W_Root]>` has no
 /// target-stable null spelling.  That projection carries the whole datum a
-/// reader needs: `vm.py:481` tests only `hooks_w is None`, and the one fold
-/// that reads it (`try_walker_specialize_sys_getframe`) declines outright once
-/// a hook exists.
+/// reader needs: `vm.py:481` tests only `hooks_w is None`, and the no-hook
+/// fold (`try_walker_specialize_sys_getframe`) pins that read. Once a hook
+/// exists the same fold residuals `trigger_audit_events` instead.
 ///
 /// A reserved index and `QUASIIMMUT_FIELD`-only, for the reasons the map-node
 /// descrs above document.

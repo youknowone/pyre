@@ -3861,6 +3861,29 @@ pub fn audit_w(
     trigger_audit_events(unsafe { &*holder }, w_event, args_w)
 }
 
+/// Traced `sys._getframe` event once hooks are armed.
+///
+/// `vm.py trigger_audit_events` is `@objectmodel.dont_inline`. The walker
+/// keeps the frame walk and `mark_as_escaped` in the trace and residuals
+/// only this call, so `getframe` itself does not force the portal
+/// virtualizable. A raising hook publishes the exception and returns null.
+#[majit_macros::dont_look_inside]
+pub fn jit_audit_sys_getframe(frame: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
+    if frame.is_null() {
+        return frame;
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let frame_slot = pyre_object::gc_roots::pin_roots(&[frame]);
+    let frame = pyre_object::gc_roots::shadow_stack_get(frame_slot);
+    match audit("sys._getframe", &[frame]) {
+        Ok(()) => pyre_object::gc_roots::shadow_stack_get(frame_slot),
+        Err(mut err) => {
+            crate::eval::set_current_exception(err.to_exc_object());
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// `vm.py audit` — `space.audit(event, args_w)` for interpreter-level
 /// emitters.  Free when no hook is installed, which is what lets a caller on a
 /// hot path emit unconditionally.
