@@ -2234,9 +2234,9 @@ fn build_gc() -> Box<MiniMarkGC> {
     // instances are the same Rust struct, so the vtable map sends
     // both PyTypes to `function_tid`. The destructor reclaims only the inline
     // `mutate_<name>` slots (`function.py:34-42 _immutable_fields_`), which the
-    // function owns outright: a mortal function's `name` box is reclaimed by
-    // its own tid's drop glue (off-GC storage), and reaching it from here would
-    // double-free a box swept before its owner.
+    // function owns outright: a managed function's `name` box is reclaimed by
+    // its own tid's drop glue, and reaching it from here would double-free a
+    // box swept before its owner.
     let function_tid = gc.register_type(
         TypeInfo::object_subclass_with_gc_ptrs(
             std::mem::size_of::<pyre_interpreter::function::Function>(),

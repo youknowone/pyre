@@ -1585,6 +1585,15 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             crate::baseobjspace::walk_object_space_cache_roots(&mut forward_declaration);
             pyre_object::typedef::walk_typedef_roots(&mut forward_declaration);
         }
+        // `function.py` `Function` is a GC object once the collector hook
+        // exists, so a module dict or builtin type dict that holds it is what
+        // marks it. Carriers minted before that hook are `malloc_typed` and
+        // stay off the marker; this list is that fallback family
+        // (`function.rs` `register_prebuilt_function_root`), the same shape as
+        // `walk_prebuilt_code_roots` above.
+        crate::function::for_each_prebuilt_function_root(&mut |func| {
+            walk_raw_function_roots(func, &mut *visitor);
+        });
         let mut forward = |slot: &mut PyObjectRef| {
             visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));
             walk_raw_function_roots(*slot, visitor);
