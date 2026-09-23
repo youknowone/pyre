@@ -19515,6 +19515,16 @@ impl<'a> Lowering<'a> {
         else {
             return false;
         };
+        // `opcode_for_iter`'s match is `Option<H::Value>`. The only
+        // `IterOpcodeHandler` impl binds `Value = *mut PyObject`, which
+        // Rust represents as a null niche. The generic body still spells
+        // the payload as a trait projection, so peel that unique binding
+        // before the raw-pointer test. A multi-impl projection stays
+        // unresolved and keeps the tagged aggregate.
+        let resolved_assoc = trait_payload_node(payload, self.llbc)
+            .and_then(|node| trait_assoc_projection_target(node, self.llbc));
+        let resolved_body = resolved_assoc.as_ref().and_then(|ty| self.tyref_body(ty));
+        let payload = resolved_body.unwrap_or(payload);
         if type_node_is_mut_ref(payload, self.llbc) {
             return true;
         }
@@ -19597,12 +19607,19 @@ impl<'a> Lowering<'a> {
         if let Some(raw_pointee) = type_node_raw_ptr_pointee(payload, self.llbc)
             && let Some(stripped) = strip_ty_wrappers(raw_pointee, self.llbc)
             && let Some(def_id) = adt_node_def_id(stripped)
-            && self
-                .llbc
-                .type_by_id(def_id)
-                .and_then(|td| td.layout_for_target(&std::env::var("TARGET").unwrap_or_default()))
-                .and_then(|l| l.size)
-                .is_some()
+            && self.llbc.type_by_id(def_id).is_some_and(|td| {
+                // A recorded layout must name a concrete size (a DST is not
+                // one word). A cross-crate nominal pointee often has no
+                // layout in this ullbc at all; `RawPtr` is already the thin
+                // spelling, so a missing layout is still the nullable
+                // pointer, not a two-word shell. Reading `__discriminant`
+                // off that pointer loads the pointee header and the match
+                // falls into `unreachable`.
+                match td.layout_for_target(&std::env::var("TARGET").unwrap_or_default()) {
+                    Some(layout) => layout.size.is_some(),
+                    None => td.layout.is_none(),
+                }
+            })
         {
             return true;
         }
@@ -29698,6 +29715,31 @@ fn trait_assoc_projection_target<'a>(
     // consed or a dedup id, and `TyRef`'s own deserializer is what knows
     // the three shapes apart.
     serde_json::from_value::<TyRef>(resolved?.clone()).ok()
+}
+
+/// Peel `Deduplicated` / `HashConsedValue` so a trait projection in an
+/// ADT generic argument is visible to [`trait_assoc_projection_target`].
+fn trait_payload_node<'a>(
+    mut node: &'a serde_json::Value,
+    llbc: &'a Llbc,
+) -> Option<&'a serde_json::Value> {
+    for _ in 0..8 {
+        let obj = node.as_object()?;
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            node = llbc.dedup_body(id)?;
+            continue;
+        }
+        if let Some(arr) = obj
+            .get("HashConsedValue")
+            .and_then(serde_json::Value::as_array)
+            && arr.len() == 2
+        {
+            node = &arr[1];
+            continue;
+        }
+        break;
+    }
+    Some(node)
 }
 
 /// The `[traitref, assoc]` pair of an unresolved `Self::Assoc` projection,
@@ -46145,6 +46187,13 @@ mod tests {
     /// arm, so the resulting graph directly exposes whether the classifier
     /// chose aggregate construction or the nullable-pointer identities.
     fn lower_option_source_with_payload(payload: serde_json::Value) -> FunctionGraph {
+        lower_option_source_with_payload_ext(payload, false)
+    }
+
+    fn lower_option_source_with_payload_ext(
+        mut payload: serde_json::Value,
+        inject_layoutless_nominal: bool,
+    ) -> FunctionGraph {
         fn replace_dedup(
             value: &mut serde_json::Value,
             payload_id: u64,
@@ -46203,6 +46252,50 @@ mod tests {
                 })
             })
             .expect("Option type declaration in corpus");
+        if inject_layoutless_nominal {
+            let decls = translated
+                .get_mut("type_decls")
+                .and_then(serde_json::Value::as_array_mut)
+                .expect("corpus type_decls");
+            // `type_by_id` indexes this array by `def_id`. A hole is the
+            // only free index a copy can occupy.
+            let hole = decls
+                .iter()
+                .position(serde_json::Value::is_null)
+                .expect("corpus type_decls has a null hole");
+            let mut copy = decls
+                .iter()
+                .find(|decl| decl.get("def_id").and_then(serde_json::Value::as_u64) == Some(4))
+                .expect("sized nominal def-id 4")
+                .clone();
+            copy["def_id"] = serde_json::json!(hole);
+            copy.as_object_mut()
+                .expect("type decl object")
+                .remove("layout");
+            decls[hole] = copy;
+            // The fixture payload names Adt 1000 as the stand-in. Point it
+            // at the hole the copy actually occupies.
+            fn retarget(value: &mut serde_json::Value, hole: u64) {
+                let hit = value.get("Adt").and_then(serde_json::Value::as_u64) == Some(1000);
+                if hit {
+                    value["Adt"] = serde_json::json!(hole);
+                }
+                match value {
+                    serde_json::Value::Array(items) => {
+                        for item in items {
+                            retarget(item, hole);
+                        }
+                    }
+                    serde_json::Value::Object(map) => {
+                        for item in map.values_mut() {
+                            retarget(item, hole);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            retarget(&mut payload, hole as u64);
+        }
 
         let fun = translated
             .get_mut("fun_decls")
@@ -46300,6 +46393,45 @@ mod tests {
         assert_eq!(
             transparent_ctors, 0,
             "Some(raw nominal pointer) must be the payload identity, with no Option aggregate"
+        );
+    }
+
+    #[test]
+    fn niche_option_raw_nominal_ptr_without_layout_is_null_test() {
+        use crate::model::OpKind;
+        // Cross-crate pointees often have a type decl and no `layout`
+        // entry. `Option<*mut That>` is still the nullable pointer:
+        // `None` is null and the discriminant is a null test, not a
+        // `__discriminant` load of the pointee header.
+        let payload = serde_json::json!({
+            "RawPtr": [
+                {
+                    "Adt": {
+                        "id": { "Adt": 1000 },
+                        "generics": {
+                            "regions": [], "types": [],
+                            "const_generics": [], "trait_refs": []
+                        }
+                    }
+                },
+                "Mut"
+            ]
+        });
+        let graph = lower_option_source_with_payload_ext(payload, true);
+        let (null_muts, transparent_ctors) = niche_ctor_shape(&graph);
+        assert_eq!(null_muts, 1, "None must lower to one null pointer");
+        assert_eq!(transparent_ctors, 0, "Some must be the pointer identity");
+        let discriminant_reads = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "__discriminant")
+            })
+            .count();
+        assert_eq!(
+            discriminant_reads, 0,
+            "a layout-less nominal raw pointer must not read __discriminant"
         );
     }
 
@@ -46783,6 +46915,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `opcode_for_iter` matches `Option<H::Value>`. The sole impl binds
+    /// `Value = *mut PyObject`, a null niche. The generic body spells that
+    /// payload as a trait projection; the discriminant must be a null test.
+    #[test]
+    #[ignore]
+    fn opcode_for_iter_option_assoc_payload_is_null_test() {
+        use crate::model::OpKind;
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real interpreter LLBC");
+        let graph = super::lower_function(&llbc, "pyre_interpreter::pyopcode::opcode_for_iter")
+            .expect("lower opcode_for_iter");
+        let null_muts = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(&op.kind, OpKind::Call { target, .. }
+                    if target.to_string() == "core::ptr::null_mut")
+            })
+            .count();
+        assert!(
+            null_muts >= 1,
+            "opcode_for_iter Option match must null-test the pointer (null_muts={null_muts})"
+        );
     }
 
     #[test]

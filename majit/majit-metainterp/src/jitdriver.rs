@@ -3003,16 +3003,9 @@ impl<S: JitState> JitDriver<S> {
             let Some(terminal) = terminal.as_ref() else {
                 return;
             };
-            let int_base = layout.int_scalar_base.min(terminal.registers_i.len());
-            let ref_base = layout.ref_scalar_base.min(terminal.registers_r.len());
-            let float_base = layout.float_scalar_base.min(terminal.registers_f.len());
+            let (ints, refs, floats) = abort_blackhole_restore_banks(&layout, terminal);
             let meta = S::build_meta(state, resume_pc, env);
-            state.restore_banked3(
-                &meta,
-                &terminal.registers_i[int_base..],
-                &terminal.registers_r[ref_base..],
-                &terminal.registers_f[float_base..],
-            );
+            state.restore_banked3(&meta, ints, refs, floats);
             state.recover_after_compiled_run();
         };
         match outcome {
@@ -3040,7 +3033,19 @@ impl<S: JitState> JitDriver<S> {
                     return Some(usize::MAX);
                 };
                 let resume_pc = resume_pc as usize;
-                writeback(state, resume_pc);
+                // `iirrr` portal registers pack greens in front of reds
+                // (`next_instr`, `is_being_profiled`, then `pycode`). A
+                // state with no scalar identity slots has `int_scalar_base`
+                // 0, so the int bank's first word is that green pc.
+                // `restore` reads `values[0]` as the red frame.
+                // `ContinueRunningNormally` already split the colors
+                // (`warmspot.py handle_jitexception`); re-enter with the
+                // reds. A state-field machine keeps the identity-slot
+                // slice: its reds live past `int_scalar_base`.
+                let meta = S::build_meta(state, resume_pc, env);
+                let (ints, refs, floats) = crn_restore_banks(&layout, terminal.as_ref(), args);
+                state.restore_banked3(&meta, ints, refs, floats);
+                state.recover_after_compiled_run();
                 Some(resume_pc)
             }
             // The portal itself returned inside the blackhole
@@ -10359,6 +10364,56 @@ impl<S: JitState> JitDriver<S> {
     }
 }
 
+/// A jitdriver with no scalar identity slots. The portal is this shape:
+/// its reds are the virtualizable frame and `ec`, not `#[jit_interp]`
+/// scalars, and `state_field_layout` stays the empty default.
+fn layout_has_no_scalar_identity(layout: &crate::blackhole::StateFieldLayout) -> bool {
+    layout.num_scalars == 0
+        && layout.num_ref_scalars == 0
+        && layout.num_float_scalars == 0
+        && layout.num_vable_identity_slots == 0
+        && layout.array_lens.is_empty()
+}
+
+/// `ContinueRunningNormally` restore inputs.
+///
+/// No scalar identity slots: the portal calldescr is `iirrr`, so the
+/// int bank is greens (`next_instr`, `is_being_profiled`) and the ref
+/// bank leads with the green `pycode`. The red frame is
+/// `args.red_ref[0]` (`interp_jit.py` reds `['frame', 'ec']`).
+/// Passing the int bank to `restore` stores the green pc as that frame.
+///
+/// A state-field layout keeps the identity-slot slice of the terminal
+/// register file. `terminal` is absent only when the chain produced no
+/// image; the reds are still the CRN arguments.
+fn crn_restore_banks<'a>(
+    layout: &crate::blackhole::StateFieldLayout,
+    terminal: Option<&'a crate::blackhole::BlackholeTerminalImage>,
+    args: &'a crate::jitexc::ContinueRunningNormallyArgs,
+) -> (&'a [i64], &'a [i64], &'a [i64]) {
+    if layout_has_no_scalar_identity(layout) {
+        return (&args.red_int, &args.red_ref, &args.red_float);
+    }
+    match terminal {
+        Some(terminal) => abort_blackhole_restore_banks(layout, terminal),
+        None => (&args.red_int, &args.red_ref, &args.red_float),
+    }
+}
+
+fn abort_blackhole_restore_banks<'a>(
+    layout: &crate::blackhole::StateFieldLayout,
+    terminal: &'a crate::blackhole::BlackholeTerminalImage,
+) -> (&'a [i64], &'a [i64], &'a [i64]) {
+    let int_base = layout.int_scalar_base.min(terminal.registers_i.len());
+    let ref_base = layout.ref_scalar_base.min(terminal.registers_r.len());
+    let float_base = layout.float_scalar_base.min(terminal.registers_f.len());
+    (
+        &terminal.registers_i[int_base..],
+        &terminal.registers_r[ref_base..],
+        &terminal.registers_f[float_base..],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10395,6 +10450,37 @@ mod tests {
             seed_deopt_vinfo_ptr(Some(&heap_vable)).is_null(),
             "a token_offset>0 heap virtualizable must keep the null-vinfo contract",
         );
+    }
+
+    #[test]
+    fn portal_iirrr_crn_restore_feeds_red_frame_not_green_pc() {
+        use crate::blackhole::{BlackholeTerminalImage, StateFieldLayout};
+        use crate::jitexc::ContinueRunningNormallyArgs;
+
+        let layout = StateFieldLayout::default();
+        let terminal = BlackholeTerminalImage {
+            jitcode_index: 0,
+            registers_i: vec![34, 0],
+            registers_r: vec![0x111, 0x222, 0x333],
+            registers_f: Vec::new(),
+            position: 0,
+            last_opcode_position: 0,
+            abort_permanent_bail: false,
+        };
+        let args = ContinueRunningNormallyArgs {
+            green_int: vec![34, 0],
+            green_ref: vec![0x111],
+            red_ref: vec![0xABC0, 0xEC],
+            ..ContinueRunningNormallyArgs::default()
+        };
+        let (ints, refs, floats) = crn_restore_banks(&layout, Some(&terminal), &args);
+        assert!(
+            ints.is_empty(),
+            "green pc must not be the first restored int"
+        );
+        assert_eq!(refs, &[0xABC0, 0xEC]);
+        assert!(floats.is_empty());
+        assert_ne!(refs.first().copied(), Some(34));
     }
 
     #[derive(Default)]

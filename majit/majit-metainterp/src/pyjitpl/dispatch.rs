@@ -3364,16 +3364,23 @@ where
             if !matches!(action, TraceAction::Continue) {
                 if crate::majit_log_enabled() || crate::tldbg_enabled() {
                     let fr = self.frames.current_mut();
+                    let last_op = fr
+                        .jitcode
+                        .code
+                        .get(fr.last_opcode_position)
+                        .copied()
+                        .unwrap_or(0xff);
+                    let why = match last_op {
+                        jitcode::insns::BC_UNREACHABLE => "unreachable",
+                        jitcode::insns::BC_ABORT => "abort",
+                        jitcode::insns::BC_ABORT_PERMANENT => "abort-permanent",
+                        _ => "",
+                    };
                     eprintln!(
-                        "[interpret] run_to_end action={:?} steps={step_count} ops={} cursor={} last_op=0x{:02x} jitcode={}",
+                        "[interpret] run_to_end action={:?} steps={step_count} ops={} cursor={} last_op=0x{last_op:02x} reason={why} jitcode={}",
                         action,
                         ctx.num_recorded_ops(),
                         fr.code_cursor,
-                        fr.jitcode
-                            .code
-                            .get(fr.last_opcode_position)
-                            .copied()
-                            .unwrap_or(0xff),
                         fr.jitcode.name(),
                     );
                 }
