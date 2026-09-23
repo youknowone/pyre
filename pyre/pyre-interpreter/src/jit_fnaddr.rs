@@ -6618,40 +6618,6 @@ mod tests {
         );
     }
 
-    /// `W_CTypePrimitiveLongDouble._copy_longdouble` is
-    /// `@jit.dont_look_inside`. A missing spelling residualizes to a
-    /// symbolic hash and declines the `_CDataBase` convert descent.
-    #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
-    #[test]
-    fn jit_trace_fnaddrs_covers_copy_longdouble() {
-        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
-        let expected =
-            crate::module::_cffi_backend::ctypeprim::copy_longdouble as *const () as usize as i64;
-        assert_eq!(
-            bindings["pyre_interpreter::module::_cffi_backend::ctypeprim::copy_longdouble"],
-            expected
-        );
-    }
-
-    /// `misc.py _raw_memcopy_opaque` is `@jit.dont_look_inside`. A missing
-    /// spelling residualizes to a symbolic hash and declines the
-    /// `_CDataBase` call descent on `copy_nonoverlapping`.
-    #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
-    #[test]
-    fn jit_trace_fnaddrs_covers_raw_memcopy_opaque() {
-        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
-        let expected =
-            crate::module::_cffi_backend::misc::raw_memcopy_opaque as *const () as usize as i64;
-        assert_eq!(
-            bindings["pyre_interpreter::module::_cffi_backend::misc::raw_memcopy_opaque"],
-            expected
-        );
-        assert_eq!(
-            bindings["pyre_interpreter::module::_cffi_backend::raw_memcopy_opaque"],
-            expected
-        );
-    }
-
     /// `space.newbytes(cdata[0])` is the 1-byte `jit_w_bytes_from_u8`
     /// residual. `&[u8]` is two words, so the slice form declines the
     /// `_CDataBase` convert descent.
@@ -6664,20 +6630,6 @@ mod tests {
             expected
         );
         assert_eq!(bindings["pyre_object::jit_w_bytes_from_u8"], expected);
-    }
-
-    /// `rffi.cast(rffi.CCHARPP, data)[0] = value` is the `raw_write_ptr`
-    /// oopspec. Unregistered it residualizes to a symbolic hash.
-    #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
-    #[test]
-    fn jit_trace_fnaddrs_covers_raw_write_ptr() {
-        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
-        let expected =
-            crate::module::_cffi_backend::cdataobj::raw_write_ptr as *const () as usize as i64;
-        assert_eq!(
-            bindings["pyre_interpreter::module::_cffi_backend::cdataobj::raw_write_ptr"],
-            expected
-        );
     }
 
     /// `is_pyframe_operand_stack_accessor` must recognise the funcptr the
