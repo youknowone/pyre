@@ -5388,9 +5388,9 @@ impl<'a> Transformer<'a> {
         }
         // `len(s)` / `Wtf8::len` / `as_bytes().len()` on a string-byte-view
         // is `ll_strlen`.  The rtyper path routes `__len` / `__strlen`
-        // through `StringRepr.rtype_len`; a Skip-spine graph still sees
-        // the residual `__strlen` Call the frontend plants on a byte
-        // view, and this arm is that marker.
+        // through `StringRepr.rtype_len` (`AbstractStringRepr.rtype_len`);
+        // a Skip-spine graph still sees the residual `__strlen` Call the
+        // frontend plants on a byte view, and this arm is that marker.
         if let CallTarget::FunctionPath { segments, .. } = target
             && segments.as_slice() == ["__strlen"]
             && args.len() == 1

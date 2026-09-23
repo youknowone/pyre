@@ -758,7 +758,16 @@ impl Bookkeeper {
                 .filter(|(root, _)| root.contains("::") || root.contains('<'))
                 .filter_map(|(root, by_discr)| {
                     let leaf = root.rsplit("::").next().unwrap_or(root);
-                    reg.is_enum_base(leaf).then(|| {
+                    // The bare leaf is the usual enum-base alias. Harden
+                    // withdraws it when another declaration shares the leaf
+                    // (`eval::Code` beside `module::struct::Code`); the
+                    // qualified row is still the discriminant-only base, so
+                    // a miss on the leaf must not skip the subtree.
+                    let stripped = crate::front::mir::strip_crate_prefix(root);
+                    let is_base = reg.is_enum_base(leaf)
+                        || reg.is_enum_base(root)
+                        || (stripped.as_str() != root && reg.is_enum_base(&stripped));
+                    is_base.then(|| {
                         let mut names: Vec<String> = by_discr.values().cloned().collect();
                         names.sort();
                         names.dedup();
@@ -5342,6 +5351,74 @@ mod tests {
             inst.classdef.as_ref().map(|c| c.borrow().name.clone())
         );
         assert!(!inst.can_be_none, "Code is a non-nullable sum type");
+    }
+
+    /// Harden withdraws the bare `Code` alias when `eval::Code` shares the
+    /// leaf. The prologue must still mint `module::struct::Code`'s variant
+    /// subclasses from the qualified `__discriminant` row.
+    #[test]
+    fn withdrawn_bare_enum_leaf_still_pre_registers_the_qualified_base() {
+        use crate::front::StructFieldRegistry;
+        use std::collections::HashMap;
+
+        let bk = bk();
+        let base = "pyre_interpreter::module::struct::Code";
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            base.to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(format!("{base}::Pad"), vec![]);
+        reg.fields.insert(
+            format!("{base}::Int"),
+            vec![("signed".to_string(), "bool".to_string())],
+        );
+        reg.fields.insert(
+            "pyre_interpreter::eval::Code".to_string(),
+            vec![("name".to_string(), "String".to_string())],
+        );
+        assert!(
+            !reg.is_enum_base("Code"),
+            "the bare leaf is withdrawn; the qualified path is the enum base"
+        );
+        bk.set_struct_fields(Rc::new(reg));
+
+        let mut by_discr = HashMap::new();
+        by_discr.insert(0, "Pad".to_string());
+        by_discr.insert(1, "Int".to_string());
+        let mut map = HashMap::new();
+        map.insert(base.to_string(), by_discr);
+        bk.set_enum_variant_by_discriminant(Rc::new(map));
+
+        assert!(
+            bk.classdef_snapshot().is_empty(),
+            "the registry alone does not mint classdefs"
+        );
+        bk.pre_register_enum_variant_classes();
+        let names: Vec<String> = bk
+            .classdef_snapshot()
+            .iter()
+            .map(|classdef| classdef.borrow().name.clone())
+            .collect();
+        assert!(
+            names.iter().any(|name| name.ends_with("Code::Pad")),
+            "qualified Code variants must be pre-minted, got {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name.ends_with("Code::Int")),
+            "the payload variant must be pre-minted with the fieldless one, got {names:?}"
+        );
+        let base_cd = bk
+            .getuniqueclassdef_for_struct_root(base)
+            .expect("qualified Code base");
+        let pad = bk
+            .getuniqueclassdef_for_enum_variant(base, "Pad")
+            .expect("Pad");
+        assert!(
+            pad.borrow().issubclass(&base_cd),
+            "Pad must subclass the discriminant-only Code base"
+        );
+        assert!(base_cd.borrow().attrs.contains_key("__discriminant"));
     }
 
     #[test]

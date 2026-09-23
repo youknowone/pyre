@@ -839,23 +839,24 @@ fn rewire_one_map_collect_site(
         .unwrap_or(ctor_idx);
     graph.blocks[emit_block].operations.remove(ctor_idx);
 
-    if emit_block == a {
-        let ci = graph.blocks[a]
-            .operations
-            .iter()
-            .position(|op| op.result.as_ref() == Some(&site.result_var))
-            .ok_or_else(|| format!("{name}: Map::collect call vanished before removal"))?;
-        let ops_len = graph.blocks[a].operations.len();
-        let last = if ci + 1 < ops_len && is_recast_kind(&graph.blocks[a].operations[ci + 1].kind) {
-            ci + 1
-        } else {
-            ci
-        };
-        for _ in ci..=last {
-            graph.blocks[a].operations.remove(ci);
-        }
+    // The constructor may live in an earlier block. Validation only
+    // requires `collect` to be the last call here, so a preceding
+    // assignment in this block (`state.field = value; mapped.collect()`)
+    // stays. Drop the call and a following recast, the same as when the
+    // constructor shares the block.
+    let ci = graph.blocks[a]
+        .operations
+        .iter()
+        .position(|op| op.result.as_ref() == Some(&site.result_var))
+        .ok_or_else(|| format!("{name}: Map::collect call vanished before removal"))?;
+    let ops_len = graph.blocks[a].operations.len();
+    let last = if ci + 1 < ops_len && is_recast_kind(&graph.blocks[a].operations[ci + 1].kind) {
+        ci + 1
     } else {
-        graph.blocks[a].operations.clear();
+        ci
+    };
+    for _ in ci..=last {
+        graph.blocks[a].operations.remove(ci);
     }
 
     let out = graph.alloc_value_var();
@@ -1417,6 +1418,45 @@ mod tests {
         assert!(!is_map_adapter_path(
             "core::iter::adapters::filter_map::FilterMap"
         ));
+    }
+
+    /// An assignment in the collect block stays. Validation only requires
+    /// `collect` to be the last call, so `state.field = value; mapped.collect()`
+    /// must keep the field write.
+    #[test]
+    fn rewrite_keeps_an_assignment_before_map_collect() {
+        let (mut g, collected) = build_map_collect_two_blocks();
+        let collect_block = g
+            .blocks
+            .iter()
+            .position(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call { target, .. } if is_map_collect_target(target)
+                    )
+                })
+            })
+            .expect("collect block");
+        let kept = g.alloc_value_var();
+        g.blocks[collect_block].operations.insert(
+            0,
+            SpaceOperation {
+                result: Some(kept),
+                kind: OpKind::ConstInt(11),
+            },
+        );
+        let nexts = rewire_map_collect_sites(&mut g, &[collect_site(collected)]);
+        assert_eq!(nexts.len(), 1, "the map.collect chain must fold");
+        assert!(
+            g.blocks.iter().any(|block| {
+                block
+                    .operations
+                    .iter()
+                    .any(|op| matches!(op.kind, OpKind::ConstInt(11)))
+            }),
+            "the assignment before Map::collect must survive"
+        );
     }
 
     /// `xs.iter().map(f).collect()` becomes `Vec::new` + `next` +

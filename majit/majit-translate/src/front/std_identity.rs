@@ -1,11 +1,13 @@
-//! Transparent one-field std wrappers as identity, not residual calls.
+//! Transparent one-field std wrappers and scalar Copy combinators as
+//! identity / zero, not residual calls.
 //!
 //! RPython has no `Cell` / `Ref` / `MutexGuard` / `Box` / `AtomicUsize`
 //! types: the field *is* the value.  Charon still emits residual
 //! `FunctionPath` / `Method` calls to those bodies (Opaque in the LLBC),
 //! and every caller then dies at `translate_op` with an unregistered
 //! `CallRegistry` miss.  The call is not a graph and not a foreign
-//! function — it is `same_as`.
+//! function — it is `same_as` (or a typed zero for `Default` on a
+//! machine-word integer / bool).
 //!
 //! `core::mem::replace` is recognised but *not* rewritten here.  The
 //! front models `&mut T` as the referent value (`Rvalue::Ref` aliases
@@ -98,8 +100,55 @@ fn is_identity_wrapper_target(
     }
 }
 
-/// Rewrite a residual std wrapper call in place when the wrapper shape
-/// is already in hand.  Unknown shapes are returned unchanged.
+fn segments_are(segments: &[String], want: &[&str]) -> bool {
+    segments.len() == want.len() && segments.iter().zip(want).all(|(seg, w)| seg == w)
+}
+
+/// The concrete `Copy` impls, spelled in full — the same items
+/// `mir.rs`'s `is_core_clone_path` / `is_core_default_path` recognise on
+/// the `RegularCall` route.
+///
+/// A leaf-name match would also take `core::clone::<Impl>::clone` and
+/// `core::default::Default::default`, which are the blanket impl and the
+/// trait item. Charon does not monomorphise them, so the destination
+/// width these folds read describes the declaration and not the
+/// instantiation, and folding either one answers for every `T` a caller
+/// might have instantiated. A method spelling carries no module path at
+/// all, so it can never be shown to be one of these items.
+pub(crate) fn is_clone_target(target: &CallTarget) -> bool {
+    match target {
+        CallTarget::FunctionPath { segments, .. } => {
+            segments_are(segments, &["core", "clone", "impls", "<Impl>", "clone"])
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn is_default_target(target: &CallTarget) -> bool {
+    match target {
+        CallTarget::FunctionPath { segments, .. } => {
+            segments_are(segments, &["core", "default", "<Impl>", "default"])
+                || segments_are(segments, &["core", "ptr", "mut_ptr", "<Impl>", "default"])
+        }
+        _ => false,
+    }
+}
+
+/// Machine-word integer / bool `Copy` — the only `Clone::clone` /
+/// `Default::default` instantiations with one uniform answer.
+pub(crate) fn is_scalar_copy_width(
+    dest_int_atom: Option<&str>,
+    dest_uint_atom: Option<&str>,
+    dest_is_bool: bool,
+) -> bool {
+    dest_is_bool
+        || dest_int_atom.is_some_and(crate::front::checked_arith::is_ovf_width_int_atom)
+        || dest_uint_atom.is_some_and(crate::front::checked_arith_uint::is_word_sized_uint_atom)
+}
+
+/// Rewrite a residual std primitive call in place when the destination
+/// width / wrapper shape is already in hand.  Unknown shapes are
+/// returned unchanged.
 ///
 /// `banks_agree` is the caller's verdict that the receiver and the
 /// destination occupy the same register bank (`flatten.py getkind`).
@@ -114,6 +163,9 @@ pub(crate) fn lower_std_primitive_op(
     op_kind: OpKind,
     receiver_path: Option<&str>,
     dest_path: Option<&str>,
+    dest_int_atom: Option<&str>,
+    dest_uint_atom: Option<&str>,
+    dest_is_bool: bool,
     banks_agree: bool,
 ) -> OpKind {
     let OpKind::Call {
@@ -130,6 +182,30 @@ pub(crate) fn lower_std_primitive_op(
             operand,
             result_ty: result_ty.clone(),
         };
+    }
+    if args.len() == 1
+        && is_clone_target(target)
+        && is_scalar_copy_width(dest_int_atom, dest_uint_atom, dest_is_bool)
+    {
+        let Some(operand) = args[0].as_variable().cloned() else {
+            return op_kind;
+        };
+        return OpKind::UnaryOp {
+            op: "same_as".to_string(),
+            operand,
+            result_ty: result_ty.clone(),
+        };
+    }
+    if args.is_empty() && is_default_target(target) {
+        if dest_int_atom.is_some_and(crate::front::checked_arith::is_ovf_width_int_atom) {
+            return OpKind::ConstInt(0);
+        }
+        if dest_uint_atom.is_some_and(crate::front::checked_arith_uint::is_word_sized_uint_atom) {
+            return OpKind::ConstUInt(0);
+        }
+        if dest_is_bool {
+            return OpKind::ConstBool(false);
+        }
     }
     op_kind
 }
@@ -174,6 +250,9 @@ mod tests {
             ),
             Some("core::cell::Cell"),
             None,
+            Some("I64"),
+            None,
+            false,
             false,
         );
         assert!(
@@ -193,6 +272,9 @@ mod tests {
             ),
             Some("core::cell::Cell"),
             None,
+            Some("I64"),
+            None,
+            false,
             true,
         );
         match get {
@@ -211,6 +293,9 @@ mod tests {
             ),
             None,
             Some("core::sync::atomic::AtomicUsize"),
+            None,
+            Some("Usize"),
+            false,
             true,
         );
         assert!(
@@ -230,6 +315,9 @@ mod tests {
             ),
             None,
             Some("core::cell::Cell"),
+            None,
+            None,
+            false,
             true,
         );
         assert!(matches!(
@@ -245,6 +333,9 @@ mod tests {
             ),
             None,
             Some("core::cell::RefCell"),
+            None,
+            None,
+            false,
             true,
         );
         assert!(
@@ -264,6 +355,9 @@ mod tests {
             ),
             Some("alloc::boxed::Box"),
             None,
+            None,
+            None,
+            false,
             true,
         );
         assert!(matches!(
@@ -279,6 +373,9 @@ mod tests {
             ),
             Some("sync::poison::mutex::MutexGuard"),
             None,
+            None,
+            None,
+            false,
             true,
         );
         assert!(matches!(
@@ -288,17 +385,180 @@ mod tests {
     }
 
     #[test]
-    fn mem_replace_stays_residual() {
+    fn word_sized_clone_and_default_lower_to_identity_and_zero() {
         let v = dummy_var();
+        let clone = lower_std_primitive_op(
+            call(
+                path(&["core", "clone", "impls", "<Impl>", "clone"]),
+                vec![v.clone()],
+                ValueType::Int,
+            ),
+            None,
+            None,
+            Some("I64"),
+            None,
+            false,
+            true,
+        );
+        assert!(matches!(
+            clone,
+            OpKind::UnaryOp { ref op, .. } if op == "same_as"
+        ));
+
+        let default_i = lower_std_primitive_op(
+            call(
+                path(&["core", "default", "<Impl>", "default"]),
+                vec![],
+                ValueType::Int,
+            ),
+            None,
+            None,
+            Some("I64"),
+            None,
+            false,
+            true,
+        );
+        assert!(matches!(default_i, OpKind::ConstInt(0)));
+
+        let default_u = lower_std_primitive_op(
+            call(
+                path(&["core", "default", "<Impl>", "default"]),
+                vec![],
+                ValueType::Unsigned,
+            ),
+            None,
+            None,
+            None,
+            Some("Usize"),
+            false,
+            true,
+        );
+        assert!(matches!(default_u, OpKind::ConstUInt(0)));
+
+        let default_bool = lower_std_primitive_op(
+            call(
+                path(&["core", "default", "<Impl>", "default"]),
+                vec![],
+                ValueType::Bool,
+            ),
+            None,
+            None,
+            None,
+            None,
+            true,
+            true,
+        );
+        assert!(matches!(default_bool, OpKind::ConstBool(false)));
+    }
+
+    #[test]
+    fn adt_clone_default_and_mem_replace_stay_residual() {
+        let v = dummy_var();
+        let clone_adt = lower_std_primitive_op(
+            call(
+                CallTarget::method("clone", Some("W_ListObject".into())),
+                vec![v.clone()],
+                ValueType::Ref(Some("W_ListObject".into())),
+            ),
+            Some("pyre_object::listobject::W_ListObject"),
+            Some("pyre_object::listobject::W_ListObject"),
+            None,
+            None,
+            false,
+            true,
+        );
+        assert!(matches!(clone_adt, OpKind::Call { .. }));
+
+        let tuple_default = lower_std_primitive_op(
+            call(
+                path(&["core", "tuple", "<Impl>", "default"]),
+                vec![],
+                ValueType::Ref(None),
+            ),
+            None,
+            Some("Tuple"),
+            None,
+            None,
+            false,
+            true,
+        );
+        assert!(matches!(tuple_default, OpKind::Call { .. }));
+
         let replace = call(
             path(&["core", "mem", "replace"]),
-            vec![v, dummy_var()],
+            vec![v.clone(), dummy_var()],
             ValueType::Int,
         );
-        let replace = lower_std_primitive_op(replace, None, None, true);
+        let replace = lower_std_primitive_op(replace, None, None, Some("I64"), None, false, true);
         assert!(
             matches!(replace, OpKind::Call { .. }),
             "replace cannot lower without the borrowed Place"
+        );
+    }
+
+    #[test]
+    fn i32_clone_is_not_word_sized_copy() {
+        let v = dummy_var();
+        let clone = lower_std_primitive_op(
+            call(
+                path(&["core", "clone", "impls", "<Impl>", "clone"]),
+                vec![v],
+                ValueType::Int,
+            ),
+            None,
+            None,
+            Some("I32"),
+            None,
+            false,
+            true,
+        );
+        assert!(
+            matches!(clone, OpKind::Call { .. }),
+            "i32 is not the machine-word Copy width"
+        );
+    }
+
+    /// The blanket impl and the trait item share the leaf name with the
+    /// concrete `Copy` impls and arrive at the machine word width, so a
+    /// leaf-name match folds them too. `mir.rs` guards the same pair
+    /// through `lower_function`; this pins the predicate itself.
+    #[test]
+    fn the_blanket_clone_and_the_default_trait_item_stay_residual() {
+        let v = dummy_var();
+        let blanket = lower_std_primitive_op(
+            call(
+                path(&["core", "clone", "<Impl>", "clone"]),
+                vec![v],
+                ValueType::Int,
+            ),
+            None,
+            None,
+            Some("I64"),
+            None,
+            false,
+            true,
+        );
+        assert!(
+            matches!(blanket, OpKind::Call { .. }),
+            "core::clone::<Impl>::clone is not the impls identity"
+        );
+
+        let trait_item = lower_std_primitive_op(
+            call(
+                path(&["core", "default", "Default", "default"]),
+                vec![],
+                ValueType::Int,
+            ),
+            None,
+            None,
+            Some("I64"),
+            None,
+            false,
+            true,
+        );
+        assert!(
+            matches!(trait_item, OpKind::Call { .. }),
+            "Default::default names no impl to read a zero from"
         );
     }
 }

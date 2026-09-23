@@ -1014,6 +1014,19 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         &mut struct_fields,
     );
 
+    // Pass 2 paints each ADT as its bare leaf. A leaf `harden` emptied
+    // (`eval::Code` beside `module::struct::Code`) is not a class: the
+    // paint has to name the declaration actually being lowered, or the
+    // value seeds `SomeInstance(classdef=None)` and a later
+    // `__discriminant` read raises `MissingRTypeAttribute`. The set is
+    // lowering input, the same kind of program metadata as
+    // `struct_origins`, not a per-thread cache.
+    let tombstoned_leaves: std::collections::HashSet<String> = struct_origins
+        .iter()
+        .filter(|(_, module)| module.is_empty())
+        .map(|(leaf, _)| leaf.clone())
+        .collect();
+
     // ── Pass 2: lower every function body and build SemanticFunctions ─
     // `@jit.dont_look_inside` (`rlib/jit.py`) callees declare a
     // FUNC.RESULT that the legacy walker reads off the Call op's
@@ -1128,6 +1141,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             jitdriver_receiver_roots,
             &struct_field_attrs,
             &dont_look_inside,
+            &tombstoned_leaves,
             builder_mode,
             &accum,
         ) {
@@ -2615,6 +2629,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
     })?;
     let accum = AccumulatorFacts::build(llbc, &u);
     let builder_mode = accum.has_builder;
+    let tombstoned_leaves = std::collections::HashSet::new();
     lower_unstructured_with_static_addrs_and_attrs(
         llbc,
         fd,
@@ -2623,6 +2638,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         jitdriver_receiver_roots,
         struct_field_attrs,
         &dont_look_inside,
+        &tombstoned_leaves,
         builder_mode,
         &accum,
     )
@@ -2679,6 +2695,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     jitdriver_receiver_roots: &[String],
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
     dont_look_inside: &std::collections::HashSet<String>,
+    tombstoned_leaves: &std::collections::HashSet<String>,
     // When set, each strategy's `Lowering` is switched to builder form
     // ([`Lowering::enable_builder_mode`]) so a string accumulator
     // emits the `StringBuilder` markers instead of `ll_strconcat`.  The
@@ -3329,6 +3346,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             jitdriver_receiver_roots,
             fd.generics.as_ref(),
             dont_look_inside,
+            tombstoned_leaves,
             accum,
         )?;
         if builder_mode {
@@ -3373,6 +3391,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         jitdriver_receiver_roots,
         fd.generics.as_ref(),
         dont_look_inside,
+        tombstoned_leaves,
         accum,
     )?;
     if builder_mode {
@@ -3403,6 +3422,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 jitdriver_receiver_roots,
                 fd.generics.as_ref(),
                 dont_look_inside,
+                tombstoned_leaves,
                 accum,
             )?;
             if builder_mode {
@@ -4360,6 +4380,11 @@ struct Lowering<'a> {
     /// hint for a callee in this set so it routes as a `FunctionPath` the
     /// registry resolves to the same residual fnaddr.
     dont_look_inside: &'a std::collections::HashSet<String>,
+    /// Leaves whose `struct_origins` entry `harden_duplicate_leaf_metadata`
+    /// cleared. A duplicated leaf is not a class; [`adt_node_class_root_with`]
+    /// paints the declaration path instead. Owned by the program build
+    /// that computed `struct_origins`, and borrowed for this lowering.
+    tombstoned_leaves: &'a std::collections::HashSet<String>,
     body: &'a Unstructured,
     static_addrs: crate::HostStaticAddrs<'a>,
     /// Configured receiver-type paths whose marker methods identify a
@@ -4700,6 +4725,7 @@ impl<'a> Lowering<'a> {
         jitdriver_receiver_roots: &'a [String],
         generics: Option<&serde_json::Value>,
         dont_look_inside: &'a std::collections::HashSet<String>,
+        tombstoned_leaves: &'a std::collections::HashSet<String>,
         accum: &AccumulatorFacts,
     ) -> Result<Self, LowerError> {
         let mut graph = FunctionGraph::new(name);
@@ -4740,7 +4766,7 @@ impl<'a> Lowering<'a> {
             // (mirrors the `parse.rs` arg-binding path).
             graph.name_value_var(&var, name.clone());
             *slot = Some(var.clone());
-            let ty = tyref_to_value_type(&local.ty, llbc);
+            let ty = tyref_to_value_type_with(&local.ty, llbc, tombstoned_leaves);
             // A parameter with no runtime representation (`Arg<T>`'s
             // `PhantomData` marker is the case in point — rustc gives it no
             // ABI slot) has to read as `Void` here, matching upstream's
@@ -4791,7 +4817,7 @@ impl<'a> Lowering<'a> {
                 Some("GCREF".to_string())
             } else {
                 match &ty {
-                    ValueType::Ref(_) => tyref_input_class_root(&local.ty, llbc)
+                    ValueType::Ref(_) => tyref_input_class_root(&local.ty, llbc, tombstoned_leaves)
                         // A `&str` / `str` param strips to the `str` builtin
                         // (not an ADT), so `tyref_class_root` answers `None`;
                         // name it `"str"` so `derive_subject_inputcells` seeds
@@ -4936,6 +4962,7 @@ impl<'a> Lowering<'a> {
             graph,
             llbc,
             dont_look_inside,
+            tombstoned_leaves,
             body,
             static_addrs,
             jitdriver_receiver_roots,
@@ -6075,7 +6102,7 @@ impl<'a> Lowering<'a> {
         // poolable `ConstPtr`, so they fall through to the materialised
         // path.
         match (
-            tyref_to_value_type(dest_ty, self.llbc),
+            tyref_to_value_type_with(dest_ty, self.llbc, self.tombstoned_leaves),
             decode_constant(self.llbc, value).ok()?,
         ) {
             (ValueType::Int, DecodedConst::Int(n)) => Some(ConstValue::Int(n)),
@@ -6158,7 +6185,7 @@ impl<'a> Lowering<'a> {
                     base,
                     field: FieldDescriptor::new(flat_name, Some(owner)).with_owner_id(owner_id),
                     value,
-                    ty: tyref_to_value_type(dest_ty, self.llbc),
+                    ty: tyref_to_value_type_with(dest_ty, self.llbc, self.tombstoned_leaves),
                 },
             });
             return Ok(());
@@ -6359,7 +6386,11 @@ impl<'a> Lowering<'a> {
                                 FieldDescriptor::new(field_name, Some(owner_root))
                                     .with_owner_id(owner_id)
                                     .with_base_is_deref(base_is_deref),
-                                tyref_to_value_type(dest_ty, self.llbc),
+                                tyref_to_value_type_with(
+                                    dest_ty,
+                                    self.llbc,
+                                    self.tombstoned_leaves,
+                                ),
                             )
                         }
                         None => (
@@ -6379,7 +6410,11 @@ impl<'a> Lowering<'a> {
                         base,
                         index: idx_var,
                         value: value.clone(),
-                        item_ty: tyref_to_value_type(dest_ty, self.llbc),
+                        item_ty: tyref_to_value_type_with(
+                            dest_ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                        ),
                         array_type_id: projection_array_type_id,
                         nolength: projection_array_nolength,
                     }
@@ -6423,9 +6458,13 @@ impl<'a> Lowering<'a> {
             let node = strip_ty_indirections(tyref_node(ty, self.llbc)?, self.llbc)?;
             if let Some(reference) = node.as_object()?.get("Ref") {
                 let pointee = reference.as_array()?.get(1)?;
-                return adt_node_class_root(strip_ty_indirections(pointee, self.llbc)?, self.llbc);
+                return adt_node_class_root_with(
+                    strip_ty_indirections(pointee, self.llbc)?,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                );
             }
-            raw_ptr_pointee_class_root(node, self.llbc)
+            raw_ptr_pointee_class_root_with(node, self.llbc, self.tombstoned_leaves)
                 .or_else(|| raw_ptr_pointee_container_root(node, self.llbc))
         }) else {
             return value;
@@ -6529,8 +6568,10 @@ impl<'a> Lowering<'a> {
                 // type before choosing the annotation shell: in particular,
                 // a `usize` subtraction is an unsigned/non-negative value by
                 // type, even though its MIR destination is a tuple.
-                let scalar_ty = tyref_checked_binop_value_type(dest_ty, self.llbc)
-                    .unwrap_or_else(|| tyref_to_value_type(dest_ty, self.llbc));
+                let scalar_ty =
+                    tyref_checked_binop_value_type(dest_ty, self.llbc).unwrap_or_else(|| {
+                        tyref_to_value_type_with(dest_ty, self.llbc, self.tombstoned_leaves)
+                    });
                 let result_ty = match scalar_ty {
                     ValueType::Float => ValueType::Float,
                     ValueType::Unsigned => ValueType::Unsigned,
@@ -6633,15 +6674,18 @@ impl<'a> Lowering<'a> {
                     // `uN` as Unsigned; the latter remains the source of
                     // truth for wrapped/field place types.
                     let src_attr = match &operand {
-                        Operand::Copy(p) | Operand::Move(p) => {
-                            Some(tyref_to_attr_value_type(&p.ty, self.llbc))
-                        }
+                        Operand::Copy(p) | Operand::Move(p) => Some(tyref_to_attr_value_type_with(
+                            &p.ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                        )),
                         Operand::Const(_) => None,
                     };
                     let src_kind = self.operand_value_kind(&operand);
                     let src_root = self.operand_class_root(&operand);
                     let arg = self.resolve_operand(mir_bb, operand)?;
-                    let dst_kind = tyref_to_value_type(dest_ty, self.llbc);
+                    let dst_kind =
+                        tyref_to_value_type_with(dest_ty, self.llbc, self.tombstoned_leaves);
                     // The Rust-only current-address adapter is erased as a
                     // whole GCREF identity.  Its `ptr -> usize -> ptr`
                     // round-trip exists only to call the host GC query; once
@@ -6663,7 +6707,14 @@ impl<'a> Lowering<'a> {
                     // `HOST_ENV.import_module(rpython.rlib.rarithmetic)
                     // .module_get(intmask)` path (`flowspace_adapter.rs`).
                     if matches!(src_attr, Some(ValueType::Unsigned))
-                        && matches!(tyref_to_attr_value_type(dest_ty, self.llbc), ValueType::Int)
+                        && matches!(
+                            tyref_to_attr_value_type_with(
+                                dest_ty,
+                                self.llbc,
+                                self.tombstoned_leaves
+                            ),
+                            ValueType::Int
+                        )
                     {
                         let res = self
                             .graph
@@ -6688,7 +6739,11 @@ impl<'a> Lowering<'a> {
                     // bits but changes the annotation/repr to Unsigned.
                     if matches!(src_attr, Some(ValueType::Int))
                         && matches!(
-                            tyref_to_attr_value_type(dest_ty, self.llbc),
+                            tyref_to_attr_value_type_with(
+                                dest_ty,
+                                self.llbc,
+                                self.tombstoned_leaves
+                            ),
                             ValueType::Unsigned
                         )
                     {
@@ -6824,13 +6879,14 @@ impl<'a> Lowering<'a> {
                 // The latter match RPython's LONG_TYPE/ULONG_TYPE carrier
                 // through annotation/rtyping even though the JIT codewriter
                 // deliberately has no 128-bit register kind.
-                let result_ty = match tyref_to_value_type(dest_ty, self.llbc) {
-                    ValueType::Float => ValueType::Float,
-                    ValueType::Unsigned => ValueType::Unsigned,
-                    ValueType::Int128 => ValueType::Int128,
-                    ValueType::UInt128 => ValueType::UInt128,
-                    _ => ValueType::Int,
-                };
+                let result_ty =
+                    match tyref_to_value_type_with(dest_ty, self.llbc, self.tombstoned_leaves) {
+                        ValueType::Float => ValueType::Float,
+                        ValueType::Unsigned => ValueType::Unsigned,
+                        ValueType::Int128 => ValueType::Int128,
+                        ValueType::UInt128 => ValueType::UInt128,
+                        _ => ValueType::Int,
+                    };
                 Ok((
                     Some(OpKind::UnaryOp {
                         op: op_label,
@@ -7096,7 +7152,8 @@ impl<'a> Lowering<'a> {
                 // only operand. Constructing a separate instance would split
                 // one machine word into incompatible scalar and reference
                 // annotations at later merges.
-                if tyref_transparent_inner_value_type(dest_ty, self.llbc).is_some()
+                if tyref_transparent_inner_value_type(dest_ty, self.llbc, self.tombstoned_leaves)
+                    .is_some()
                     && operands.len() == 1
                 {
                     let value = self.resolve_operand(
@@ -7588,9 +7645,11 @@ impl<'a> Lowering<'a> {
     /// type here; a const-source cast aliases its operand).
     fn operand_value_kind(&self, op: &Operand) -> Option<ValueType> {
         match op {
-            Operand::Copy(place) | Operand::Move(place) => {
-                Some(tyref_to_value_type(&place.ty, self.llbc))
-            }
+            Operand::Copy(place) | Operand::Move(place) => Some(tyref_to_value_type_with(
+                &place.ty,
+                self.llbc,
+                self.tombstoned_leaves,
+            )),
             Operand::Const(_) => None,
         }
     }
@@ -7602,7 +7661,9 @@ impl<'a> Lowering<'a> {
     /// source already carries no pointee class.
     fn operand_class_root(&self, op: &Operand) -> Option<String> {
         match op {
-            Operand::Copy(place) | Operand::Move(place) => tyref_class_root(&place.ty, self.llbc),
+            Operand::Copy(place) | Operand::Move(place) => {
+                tyref_class_root_with(&place.ty, self.llbc, self.tombstoned_leaves)
+            }
             Operand::Const(_) => None,
         }
     }
@@ -7640,7 +7701,10 @@ impl<'a> Lowering<'a> {
         arg: &Variable,
     ) -> Option<(OpKind, Variable)> {
         if !matches!(src_kind, Some(ValueType::Ref(_)))
-            || !matches!(tyref_to_value_type(dest_ty, self.llbc), ValueType::Ref(_))
+            || !matches!(
+                tyref_to_value_type_with(dest_ty, self.llbc, self.tombstoned_leaves),
+                ValueType::Ref(_)
+            )
         {
             return None;
         }
@@ -7651,7 +7715,7 @@ impl<'a> Lowering<'a> {
                     ValueType::Ref(None),
                 )
             } else {
-                let root = tyref_class_root(dest_ty, self.llbc)?;
+                let root = tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves)?;
                 let res = self
                     .graph
                     .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -7888,7 +7952,12 @@ impl<'a> Lowering<'a> {
                     // emitting a FieldRead would try to dereference that word
                     // as an aggregate base.
                     if field_name == "__pos_0"
-                        && tyref_transparent_inner_value_type(&inner.ty, self.llbc).is_some()
+                        && tyref_transparent_inner_value_type(
+                            &inner.ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                        )
+                        .is_some()
                     {
                         return self.resolve_place(mir_bb, *inner);
                     }
@@ -7955,7 +8024,13 @@ impl<'a> Lowering<'a> {
                         PlaceKind::Projection(pre, ProjectionElem::Atom(s)) if s == "Deref" => {
                             tyref_node(&pre.ty, self.llbc)
                                 .and_then(|n| strip_ty_wrappers(n, self.llbc))
-                                .and_then(|n| raw_ptr_pointee_class_root(n, self.llbc))
+                                .and_then(|n| {
+                                    raw_ptr_pointee_class_root_with(
+                                        n,
+                                        self.llbc,
+                                        self.tombstoned_leaves,
+                                    )
+                                })
                         }
                         _ => None,
                     };
@@ -8016,6 +8091,7 @@ impl<'a> Lowering<'a> {
                         container_is_enum,
                         owner_is_closure_env,
                         self.llbc,
+                        self.tombstoned_leaves,
                     );
                     let res = self
                         .graph
@@ -8081,7 +8157,11 @@ impl<'a> Lowering<'a> {
                             item_ty: if string_array_view {
                                 ValueType::Str
                             } else {
-                                tyref_to_value_type(&place_ty, self.llbc)
+                                tyref_to_value_type_with(
+                                    &place_ty,
+                                    self.llbc,
+                                    self.tombstoned_leaves,
+                                )
                             },
                             array_type_id,
                             nolength,
@@ -8120,7 +8200,7 @@ impl<'a> Lowering<'a> {
                     // `.0` read back to feed the `match` switch, so a blanket
                     // `Ref` here types that switch value as a pointer and
                     // `flatten.py assert kind == 'int'` rejects the graph.
-                    let ty = tyref_to_value_type(&place_ty, self.llbc);
+                    let ty = tyref_to_value_type_with(&place_ty, self.llbc, self.tombstoned_leaves);
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -8214,7 +8294,8 @@ impl<'a> Lowering<'a> {
                         } else {
                             base
                         };
-                        let ty = tyref_to_value_type(&place_ty, self.llbc);
+                        let ty =
+                            tyref_to_value_type_with(&place_ty, self.llbc, self.tombstoned_leaves);
                         let res = self
                             .graph
                             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -8272,7 +8353,9 @@ impl<'a> Lowering<'a> {
                 // upstream's `SomeNone ∪ SomeInstance(W_Root)` keeps W_Root
                 // and only sets `can_be_None`.
                 if fmt_path_ends_with(&segments, &["pyobject", "PY_NULL"])
-                    && tyref_class_root(&place_ty, self.llbc).as_deref() == Some("PyObject")
+                    && tyref_class_root_with(&place_ty, self.llbc, self.tombstoned_leaves)
+                        .as_deref()
+                        == Some("PyObject")
                 {
                     let bb_id = self.block_id[mir_bb];
                     let raw = self.graph.push_null_mut_ptr(bb_id);
@@ -8326,7 +8409,8 @@ impl<'a> Lowering<'a> {
                 if let Some(addr) = self
                     .pytype_addr_by_impl_identity(id)
                     .or_else(|| self.pytype_static_addr(&segments))
-                    && let Some(root) = tyref_class_root(&place_ty, self.llbc)
+                    && let Some(root) =
+                        tyref_class_root_with(&place_ty, self.llbc, self.tombstoned_leaves)
                 {
                     let bb_id = self.block_id[mir_bb];
                     let raw = self
@@ -8418,7 +8502,11 @@ impl<'a> Lowering<'a> {
                     OpKind::Call {
                         target: CallTarget::function_path(segments),
                         args: crate::model::call_args(vec![]),
-                        result_ty: tyref_to_value_type(&place_ty, self.llbc),
+                        result_ty: tyref_to_value_type_with(
+                            &place_ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                        ),
                     }
                 });
                 let res = self
@@ -9761,7 +9849,7 @@ impl<'a> Lowering<'a> {
         let result_ty = if is_unit_type(&call.dest.ty, self.llbc) {
             ValueType::Void
         } else {
-            tyref_to_value_type(&call.dest.ty, self.llbc)
+            tyref_to_value_type_with(&call.dest.ty, self.llbc, self.tombstoned_leaves)
         };
         // A typed `Ref(Some(root))` already carries the intern key
         // (`tyref_to_value_type` paints a payload-carrying enum this way).
@@ -9783,7 +9871,7 @@ impl<'a> Lowering<'a> {
             ValueType::Ref(Some(root)) => Some(root.clone()),
             ValueType::Ref(None) => tyref_node(&call.dest.ty, self.llbc)
                 .and_then(|n| strip_ty_wrappers(n, self.llbc))
-                .and_then(|n| raw_ptr_pointee_class_root(n, self.llbc))
+                .and_then(|n| raw_ptr_pointee_class_root_with(n, self.llbc, self.tombstoned_leaves))
                 // `Option<&mut RegisteredStruct>` is a nullable pointer
                 // niche, not a boxed Option object. RPython represents it as
                 // `SomeInstance(Struct, can_be_None=True)`: narrow to the
@@ -10689,7 +10777,11 @@ impl<'a> Lowering<'a> {
                             Some(STRING_GCREF_GCARRAY_TYPE_ID.to_string()),
                         );
                     }
-                    let item_ty = tyref_deref_value_type(&call.dest.ty, self.llbc);
+                    let item_ty = tyref_deref_value_type_with(
+                        &call.dest.ty,
+                        self.llbc,
+                        self.tombstoned_leaves,
+                    );
                     // The `pyre_`-fenced workspace arm has exactly three
                     // element banks — `FixedObjectArray`, `IntArray`,
                     // `FloatArray` — so a `*mut PyObject` element there IS
@@ -10845,7 +10937,11 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::ArrayRead {
                             base: items,
                             index: args[1].clone(),
-                            item_ty: tyref_to_value_type(&call.dest.ty, self.llbc),
+                            item_ty: tyref_to_value_type_with(
+                                &call.dest.ty,
+                                self.llbc,
+                                self.tombstoned_leaves,
+                            ),
                             array_type_id: None,
                             nolength: false,
                             pure: false,
@@ -11209,7 +11305,7 @@ impl<'a> Lowering<'a> {
                     let elem_tyref = self.slice_swap_elem_tyref(&reg);
                     let elem_ty = elem_tyref
                         .as_ref()
-                        .map(|ty| tyref_to_value_type(ty, self.llbc))
+                        .map(|ty| tyref_to_value_type_with(ty, self.llbc, self.tombstoned_leaves))
                         .unwrap_or(ValueType::Ref(None));
                     let elem_array_type_id = elem_tyref
                         .as_ref()
@@ -11445,8 +11541,10 @@ impl<'a> Lowering<'a> {
                     // blocks at the annotator.  The receiver is already a
                     // raw pointer (`is_ptr_identity_cast`), so this is a
                     // genuine `cast_pointer` (ptr→ptr).
-                    if let ValueType::Ref(_) = tyref_to_value_type(&call.dest.ty, self.llbc)
-                        && let Some(root) = tyref_class_root(&call.dest.ty, self.llbc)
+                    if let ValueType::Ref(_) =
+                        tyref_to_value_type_with(&call.dest.ty, self.llbc, self.tombstoned_leaves)
+                        && let Some(root) =
+                            tyref_class_root_with(&call.dest.ty, self.llbc, self.tombstoned_leaves)
                     {
                         let res = self
                             .graph
@@ -11849,8 +11947,9 @@ impl<'a> Lowering<'a> {
                     let path = fd.item_meta.name_path();
                     let src = first_arg_ty
                         .as_ref()
-                        .map(|ty| tyref_to_value_type(ty, self.llbc));
-                    let dst = tyref_to_value_type(&call.dest.ty, self.llbc);
+                        .map(|ty| tyref_to_value_type_with(ty, self.llbc, self.tombstoned_leaves));
+                    let dst =
+                        tyref_to_value_type_with(&call.dest.ty, self.llbc, self.tombstoned_leaves);
                     if let Some(to_float) = host_longlong2float_llop(&path, src.as_ref(), &dst) {
                         return self.emit_float_bytes_llop(
                             mir_bb,
@@ -13358,7 +13457,7 @@ impl<'a> Lowering<'a> {
                 .is_some_and(|t| tyref_is_rbigint(t, self.llbc))
             && second_arg_ty.as_ref().is_some_and(|t| {
                 matches!(
-                    tyref_to_value_type(t, self.llbc),
+                    tyref_to_value_type_with(t, self.llbc, self.tombstoned_leaves),
                     ValueType::Int | ValueType::Unsigned
                 )
             })
@@ -13732,9 +13831,10 @@ impl<'a> Lowering<'a> {
                     first_arg_ty
                         .as_ref()
                         .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
-                        && second_arg_ty
-                            .as_ref()
-                            .is_some_and(|ty| tyref_to_value_type(ty, self.llbc) == ValueType::Int)
+                        && second_arg_ty.as_ref().is_some_and(|ty| {
+                            tyref_to_value_type_with(ty, self.llbc, self.tombstoned_leaves)
+                                == ValueType::Int
+                        })
                 }
                 Some(
                     "bigint_lshift_int_int_result"
@@ -13742,12 +13842,13 @@ impl<'a> Lowering<'a> {
                     | "bigint_sub_int_int"
                     | "bigint_mul_int_int",
                 ) => {
-                    first_arg_ty
-                        .as_ref()
-                        .is_some_and(|ty| tyref_to_value_type(ty, self.llbc) == ValueType::Int)
-                        && second_arg_ty
-                            .as_ref()
-                            .is_some_and(|ty| tyref_to_value_type(ty, self.llbc) == ValueType::Int)
+                    first_arg_ty.as_ref().is_some_and(|ty| {
+                        tyref_to_value_type_with(ty, self.llbc, self.tombstoned_leaves)
+                            == ValueType::Int
+                    }) && second_arg_ty.as_ref().is_some_and(|ty| {
+                        tyref_to_value_type_with(ty, self.llbc, self.tombstoned_leaves)
+                            == ValueType::Int
+                    })
                 }
                 _ => false,
             }
@@ -13860,7 +13961,7 @@ impl<'a> Lowering<'a> {
                 self.llbc,
             );
             let payload_ty = crate::front::result_exc::tyref_result_ok(&call.dest.ty, self.llbc)
-                .map(|ty| tyref_enum_payload_value_type(&ty, self.llbc))
+                .map(|ty| tyref_enum_payload_value_type(&ty, self.llbc, self.tombstoned_leaves))
                 .unwrap_or(ValueType::Ref(None));
             self.result_exc_call_results
                 .push((result_var.clone(), suffix, payload_ty));
@@ -13926,7 +14027,7 @@ impl<'a> Lowering<'a> {
                         iterator_payload_element(body, self.llbc, iterator_added_a_reference)?;
                     serde_json::from_value::<TyRef>(item.clone()).ok()
                 })
-                .map(|ty| tyref_to_value_type(&ty, self.llbc))
+                .map(|ty| tyref_to_value_type_with(&ty, self.llbc, self.tombstoned_leaves))
                 .unwrap_or(ValueType::Ref(None));
             self.next_call_results.push((result_var.clone(), item_ty));
         }
@@ -13959,13 +14060,19 @@ impl<'a> Lowering<'a> {
                 let item_tyref = self
                     .tyref_adt_type_arg(&iter_ty, 0)
                     .unwrap_or_else(|| clone_tyref(&iter_ty));
-                let payload_ty = tyref_to_value_type(&item_tyref, self.llbc);
-                let payload_class_root = enum_payload_instance_class_root(&item_tyref, self.llbc);
+                let payload_ty =
+                    tyref_to_value_type_with(&item_tyref, self.llbc, self.tombstoned_leaves);
+                let payload_class_root = enum_payload_instance_class_root(
+                    &item_tyref,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                );
                 let args_tuple_suffix = payload_tuple_suffix(&item_tyref, self.llbc);
                 let elem_tyref = self
                     .tyref_adt_type_arg(&call.dest.ty, 0)
                     .unwrap_or_else(|| clone_tyref(&call.dest.ty));
-                let call_result_ty = tyref_to_value_type(&elem_tyref, self.llbc);
+                let call_result_ty =
+                    tyref_to_value_type_with(&elem_tyref, self.llbc, self.tombstoned_leaves);
                 self.map_collect_sites
                     .push(crate::front::iter_adapter::MapCollectSite {
                         result_var: result_var.clone(),
@@ -13986,7 +14093,9 @@ impl<'a> Lowering<'a> {
             .as_ref()
             .and_then(|ty| adt_path_of_tyref(ty, self.llbc));
         let identity_dest = adt_path_of_tyref(&call.dest.ty, self.llbc);
-        let identity_dest_ty = tyref_to_value_type(&call.dest.ty, self.llbc);
+        let identity_dest_ty =
+            tyref_to_value_type_with(&call.dest.ty, self.llbc, self.tombstoned_leaves);
+        let dest_is_bool = matches!(identity_dest_ty, ValueType::Bool);
         // A borrow carries no representation of its own here -- `Rvalue::Ref`
         // aliases the place's Variable -- so the receiver's bank is the
         // pointee's.  `Box`/`Ref`/`MutexGuard` still read `Ref` through it
@@ -13995,8 +14104,10 @@ impl<'a> Lowering<'a> {
         // member is a load, not an alias.
         let identity_banks_agree = first_arg_ty.as_ref().is_some_and(|ty| {
             let recv_ty = match self.tyref_peel_ref_to_pointee(ty) {
-                Some(pointee) => tyref_to_value_type(&pointee, self.llbc),
-                None => tyref_to_value_type(ty, self.llbc),
+                Some(pointee) => {
+                    tyref_to_value_type_with(&pointee, self.llbc, self.tombstoned_leaves)
+                }
+                None => tyref_to_value_type_with(ty, self.llbc, self.tombstoned_leaves),
             };
             value_type_bank(&recv_ty) == value_type_bank(&identity_dest_ty)
         });
@@ -14004,6 +14115,9 @@ impl<'a> Lowering<'a> {
             op_kind,
             identity_recv.as_deref(),
             identity_dest.as_deref(),
+            self.tyref_literal_int_atom(&call.dest.ty),
+            self.tyref_literal_uint_atom(&call.dest.ty),
+            dest_is_bool,
             identity_banks_agree,
         );
         // Capture `i64::checked_{add,sub,mul}()` results (`Option<i64>`-
@@ -15147,7 +15261,7 @@ impl<'a> Lowering<'a> {
         // same RPython getarrayitem operation as `Index::index`: it produces
         // T, not a Rust slot reference.  Read the bank from the call's T
         // generic before looking at the reference-wrapped destination.
-        let item_ty = tyref_to_value_type(&element_ty, self.llbc);
+        let item_ty = tyref_to_value_type_with(&element_ty, self.llbc, self.tombstoned_leaves);
         // An object-pointer slice names its ARRAY; see `slice_object_element`
         // at the `Index::index` arm.
         if json_ty_is_objectptr(element, self.llbc) {
@@ -15631,7 +15745,7 @@ impl<'a> Lowering<'a> {
         {
             return None;
         }
-        tyref_class_root(dest_ty, self.llbc)
+        tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves)
     }
 
     /// `<String as Deref>::deref(&self) -> &str` / `<Vec<T> as
@@ -15917,7 +16031,7 @@ impl<'a> Lowering<'a> {
         let kind = if json_ty_is_thin_pointer_element(node, self.llbc) {
             OpKind::ConstRefNull
         } else {
-            match tyref_to_value_type(dest_ty, self.llbc) {
+            match tyref_to_value_type_with(dest_ty, self.llbc, self.tombstoned_leaves) {
                 ValueType::Int => OpKind::ConstInt(0),
                 ValueType::Unsigned => OpKind::ConstUInt(0),
                 ValueType::Bool => OpKind::ConstBool(false),
@@ -16605,7 +16719,7 @@ impl<'a> Lowering<'a> {
         };
         let register_int = |ty: &TyRef| {
             matches!(
-                tyref_to_value_type(ty, self.llbc),
+                tyref_to_value_type_with(ty, self.llbc, self.tombstoned_leaves),
                 ValueType::Int | ValueType::Unsigned
             )
         };
@@ -17442,6 +17556,7 @@ impl<'a> Lowering<'a> {
         Some(tyref_enum_payload_value_type(
             &TyRef::Other(inner.clone()),
             self.llbc,
+            self.tombstoned_leaves,
         ))
     }
 
@@ -17462,13 +17577,15 @@ impl<'a> Lowering<'a> {
                 .get(0)?,
             self.llbc,
         )?;
-        if let Some(root) = raw_ptr_pointee_class_root(payload, self.llbc) {
+        if let Some(root) =
+            raw_ptr_pointee_class_root_with(payload, self.llbc, self.tombstoned_leaves)
+        {
             return Some(root);
         }
         let pointee = payload.as_object()?.get("Ref")?.as_array()?.get(1)?;
         let pointee = strip_ty_wrappers(pointee, self.llbc)?;
-        raw_ptr_pointee_class_root(pointee, self.llbc)
-            .or_else(|| adt_node_class_root(pointee, self.llbc))
+        raw_ptr_pointee_class_root_with(pointee, self.llbc, self.tombstoned_leaves)
+            .or_else(|| adt_node_class_root_with(pointee, self.llbc, self.tombstoned_leaves))
     }
 
     /// The per-instantiation `Option` enum root for a residual-call
@@ -17515,13 +17632,15 @@ impl<'a> Lowering<'a> {
             .get("types")?
             .get(0)?;
         let payload_node = strip_ty_wrappers(payload, self.llbc)?;
-        let payload_ok = raw_ptr_pointee_class_root(payload_node, self.llbc).is_some()
-            || payload_node
-                .as_object()
-                .and_then(|o| o.get("Adt"))
-                .and_then(serde_json::Value::as_object)
-                .and_then(|adt| adt_head_instantiation_suffix(adt, self.llbc))
-                .is_some();
+        let payload_ok =
+            raw_ptr_pointee_class_root_with(payload_node, self.llbc, self.tombstoned_leaves)
+                .is_some()
+                || payload_node
+                    .as_object()
+                    .and_then(|o| o.get("Adt"))
+                    .and_then(serde_json::Value::as_object)
+                    .and_then(|adt| adt_head_instantiation_suffix(adt, self.llbc))
+                    .is_some();
         if !payload_ok {
             return None;
         }
@@ -17568,7 +17687,11 @@ impl<'a> Lowering<'a> {
             .get(0)?;
         let stripped = strip_ty_wrappers(payload, self.llbc)?;
         let rendered = charon_type_value_to_ast_string(stripped, self.llbc, 0);
-        let payload_ty = tyref_enum_payload_value_type(&TyRef::Other(payload.clone()), self.llbc);
+        let payload_ty = tyref_enum_payload_value_type(
+            &TyRef::Other(payload.clone()),
+            self.llbc,
+            self.tombstoned_leaves,
+        );
         if matches!(payload_ty, ValueType::Str) {
             return Some((rendered, ValueType::Str));
         }
@@ -18047,8 +18170,12 @@ impl<'a> Lowering<'a> {
             result_var: result_var.clone(),
             call_once_owner,
             result_suffix,
-            ok_payload_ty: tyref_enum_payload_value_type(&ok_ty, self.llbc),
-            err_payload_ty: tyref_enum_payload_value_type(&err_ty, self.llbc),
+            ok_payload_ty: tyref_enum_payload_value_type(&ok_ty, self.llbc, self.tombstoned_leaves),
+            err_payload_ty: tyref_enum_payload_value_type(
+                &err_ty,
+                self.llbc,
+                self.tombstoned_leaves,
+            ),
         })
     }
 
@@ -18241,9 +18368,9 @@ impl<'a> Lowering<'a> {
             result_owner,
             ok_owner,
             err_owner,
-            tyref_enum_payload_value_type(&ok_tyref, self.llbc),
-            tyref_enum_payload_value_type(&err_tyref, self.llbc),
-            enum_payload_instance_class_root(&err_tyref, self.llbc),
+            tyref_enum_payload_value_type(&ok_tyref, self.llbc, self.tombstoned_leaves),
+            tyref_enum_payload_value_type(&err_tyref, self.llbc, self.tombstoned_leaves),
+            enum_payload_instance_class_root(&err_tyref, self.llbc, self.tombstoned_leaves),
         ))
     }
 
@@ -18348,7 +18475,9 @@ impl<'a> Lowering<'a> {
             site.payload0_ty = ok_ty;
             site.payload1_ty = err_ty;
             site.payload0_class = crate::front::result_exc::tyref_result_ok(&recv_ty, self.llbc)
-                .and_then(|ty| enum_payload_instance_class_root(&ty, self.llbc));
+                .and_then(|ty| {
+                    enum_payload_instance_class_root(&ty, self.llbc, self.tombstoned_leaves)
+                });
             site.payload1_class = err_class;
         }
 
@@ -18383,7 +18512,9 @@ impl<'a> Lowering<'a> {
                         self.tyref_peel_ref_to_pointee(ty)
                             .or_else(|| Some(clone_tyref(ty)))
                     })
-                    .and_then(|ty| enum_payload_instance_class_root(&ty, self.llbc));
+                    .and_then(|ty| {
+                        enum_payload_instance_class_root(&ty, self.llbc, self.tombstoned_leaves)
+                    });
             }
             DiscCombinator::ResultMap | DiscCombinator::ResultAndThen => {
                 let dest = self.peel_to_option_or_result(dest_ty)?;
@@ -18400,16 +18531,20 @@ impl<'a> Lowering<'a> {
                 site.result_payload1_class = err_class;
                 if kind == DiscCombinator::ResultMap {
                     site.call_result_ty = ok_ty;
-                    site.call_result_class =
-                        crate::front::result_exc::tyref_result_ok(&dest, self.llbc)
-                            .and_then(|ty| enum_payload_instance_class_root(&ty, self.llbc));
+                    site.call_result_class = crate::front::result_exc::tyref_result_ok(
+                        &dest, self.llbc,
+                    )
+                    .and_then(|ty| {
+                        enum_payload_instance_class_root(&ty, self.llbc, self.tombstoned_leaves)
+                    });
                     site.result_payload0_class = site.call_result_class.clone();
                     site.args_tuple_suffix =
                         crate::front::result_exc::tyref_result_ok(&recv_ty, self.llbc)
                             .map(|ty| payload_tuple_suffix(&ty, self.llbc))
                             .unwrap_or_default();
                 } else {
-                    site.call_result_ty = tyref_to_value_type(&dest, self.llbc);
+                    site.call_result_ty =
+                        tyref_to_value_type_with(&dest, self.llbc, self.tombstoned_leaves);
                     site.args_tuple_suffix =
                         crate::front::result_exc::tyref_result_ok(&recv_ty, self.llbc)
                             .map(|ty| payload_tuple_suffix(&ty, self.llbc))
@@ -18417,7 +18552,8 @@ impl<'a> Lowering<'a> {
                 }
             }
             DiscCombinator::ResultUnwrapOrElse => {
-                site.call_result_ty = tyref_to_value_type(dest_ty, self.llbc);
+                site.call_result_ty =
+                    tyref_to_value_type_with(dest_ty, self.llbc, self.tombstoned_leaves);
                 site.args_tuple_suffix =
                     crate::front::result_exc::tyref_result_err(&recv_ty, self.llbc)
                         .map(|ty| payload_tuple_suffix(&ty, self.llbc))
@@ -18434,7 +18570,8 @@ impl<'a> Lowering<'a> {
                 site.result_payload1_ty = err_ty;
                 site.result_payload0_class = site.payload0_class.clone();
                 site.result_payload1_class = err_class;
-                site.call_result_ty = tyref_to_value_type(&dest, self.llbc);
+                site.call_result_ty =
+                    tyref_to_value_type_with(&dest, self.llbc, self.tombstoned_leaves);
                 site.args_tuple_suffix =
                     crate::front::result_exc::tyref_result_err(&recv_ty, self.llbc)
                         .map(|ty| payload_tuple_suffix(&ty, self.llbc))
@@ -18495,7 +18632,7 @@ impl<'a> Lowering<'a> {
         let env_def_id = self.tyref_ref_adt_def_id(env_ty?)?;
         let env_td = self.llbc.type_by_id(env_def_id)?;
         let call_once_owner = env_td.item_meta.name_path();
-        let result_ty = tyref_to_value_type(dest_ty, self.llbc);
+        let result_ty = tyref_to_value_type_with(dest_ty, self.llbc, self.tombstoned_leaves);
         // The single-element closure-`Args` tuple `(payload,)` the extracted
         // `call_once` reads its `.0` from, keyed to the same `Tuple<X>` leaf
         // the read side derives at `resolve_place`.
@@ -18543,7 +18680,7 @@ impl<'a> Lowering<'a> {
         let env_def_id = self.tyref_ref_adt_def_id(env_ty?)?;
         let call_once_owner = self.llbc.type_by_id(env_def_id)?.item_meta.name_path();
         let error_ty = crate::front::result_exc::tyref_result_err(dest_ty, self.llbc)
-            .map(|ty| tyref_to_value_type(&ty, self.llbc))
+            .map(|ty| tyref_to_value_type_with(&ty, self.llbc, self.tombstoned_leaves))
             .unwrap_or(ValueType::Ref(None));
         Some(crate::front::result_exc::OptionOkOrElseTrySite {
             result_var: result_var.clone(),
@@ -18599,12 +18736,28 @@ impl<'a> Lowering<'a> {
             result_ok_owner,
             result_err_owner,
             call_once_owner: env_decl.item_meta.name_path(),
-            ok_ty: tyref_enum_payload_value_type(&recv_ok, self.llbc),
-            ok_class_root: enum_payload_instance_class_root(&dest_ok, self.llbc),
-            err_ty: tyref_enum_payload_value_type(&recv_err, self.llbc),
-            err_class_root: enum_payload_instance_class_root(&recv_err, self.llbc),
-            mapped_err_ty: tyref_enum_payload_value_type(&dest_err, self.llbc),
-            mapped_err_class_root: enum_payload_instance_class_root(&dest_err, self.llbc),
+            ok_ty: tyref_enum_payload_value_type(&recv_ok, self.llbc, self.tombstoned_leaves),
+            ok_class_root: enum_payload_instance_class_root(
+                &dest_ok,
+                self.llbc,
+                self.tombstoned_leaves,
+            ),
+            err_ty: tyref_enum_payload_value_type(&recv_err, self.llbc, self.tombstoned_leaves),
+            err_class_root: enum_payload_instance_class_root(
+                &recv_err,
+                self.llbc,
+                self.tombstoned_leaves,
+            ),
+            mapped_err_ty: tyref_enum_payload_value_type(
+                &dest_err,
+                self.llbc,
+                self.tombstoned_leaves,
+            ),
+            mapped_err_class_root: enum_payload_instance_class_root(
+                &dest_err,
+                self.llbc,
+                self.tombstoned_leaves,
+            ),
             args_tuple_suffix: payload_tuple_suffix(&recv_err, self.llbc),
             closure_env_is_trivially_dropless,
         })
@@ -18642,7 +18795,7 @@ impl<'a> Lowering<'a> {
             if tyref_to_ast_string(source, self.llbc) != tyref_to_ast_string(&pointee, self.llbc) {
                 return None;
             }
-            let ty = tyref_to_value_type(source, self.llbc);
+            let ty = tyref_to_value_type_with(source, self.llbc, self.tombstoned_leaves);
             if !matches!(
                 ty,
                 ValueType::Int
@@ -18650,7 +18803,8 @@ impl<'a> Lowering<'a> {
                     | ValueType::Bool
                     | ValueType::Float
                     | ValueType::Str
-            ) || ty != tyref_enum_payload_value_type(&destination, self.llbc)
+            ) || ty
+                != tyref_enum_payload_value_type(&destination, self.llbc, self.tombstoned_leaves)
             {
                 return None;
             }
@@ -18824,7 +18978,8 @@ impl<'a> Lowering<'a> {
             | ClosureCombinator::UnwrapOrElse
             | ClosureCombinator::IsSomeAnd => clone_tyref(dest_ty),
         };
-        let call_result_ty = tyref_to_value_type(&call_result_tyref, self.llbc);
+        let call_result_ty =
+            tyref_to_value_type_with(&call_result_tyref, self.llbc, self.tombstoned_leaves);
         let call_once_result_exc = crate::front::result_exc::tyref_is_result_of_carrier(
             &call_result_tyref,
             self.llbc,
@@ -18837,7 +18992,7 @@ impl<'a> Lowering<'a> {
             );
             let payload_ty =
                 crate::front::result_exc::tyref_result_ok(&call_result_tyref, self.llbc)
-                    .map(|ty| tyref_to_value_type(&ty, self.llbc))
+                    .map(|ty| tyref_to_value_type_with(&ty, self.llbc, self.tombstoned_leaves))
                     .unwrap_or(ValueType::Ref(None));
             (suffix, payload_ty)
         });
@@ -19223,7 +19378,7 @@ impl<'a> Lowering<'a> {
         if !matches!(leaf.as_str(), "min" | "max") {
             return Ok(false);
         }
-        let result_ty = tyref_to_value_type(dest_ty, self.llbc);
+        let result_ty = tyref_to_value_type_with(dest_ty, self.llbc, self.tombstoned_leaves);
         if crate::codewriter::minmax::minmax_value_ty(&result_ty).is_none() {
             return Ok(false);
         }
@@ -19316,7 +19471,7 @@ impl<'a> Lowering<'a> {
         }
         let peeled = self.tyref_peel_ref_to_pointee(ty);
         let ty = peeled.as_ref().unwrap_or(ty);
-        match tyref_to_value_type(ty, self.llbc) {
+        match tyref_to_value_type_with(ty, self.llbc, self.tombstoned_leaves) {
             ty @ (ValueType::Int | ValueType::Unsigned | ValueType::Float | ValueType::Bool) => {
                 Some(ty)
             }
@@ -20375,7 +20530,8 @@ impl<'a> Lowering<'a> {
         // `try_lower_usize_try_from` uses). Bool is the RPython BoolRepr
         // sibling: converting it to Unsigned emits `cast_bool_to_uint`
         // through the ordinary `r_uint` builtin (`rbool.py:63-74`).
-        let src_is_bool = tyref_to_value_type(src, self.llbc) == ValueType::Bool;
+        let src_is_bool =
+            tyref_to_value_type_with(src, self.llbc, self.tombstoned_leaves) == ValueType::Bool;
         let src_is_small_uint = matches!(
             self.tyref_literal_uint_atom(src),
             Some("U8" | "U16" | "U32")
@@ -20696,7 +20852,7 @@ impl<'a> Lowering<'a> {
     /// resolves to: the fully-qualified `name_path()` plus the `<…>`
     /// instantiation suffix ([`adt_head_instantiation_suffix`]) when the
     /// ADT is a reference-payload enum whose args all split.  This is the
-    /// same spelling the receiver-type ([`adt_node_class_root`]),
+    /// same spelling the receiver-type ([`adt_node_class_root_with`]),
     /// constructor ([`resolve_aggregate_adt`]) and field-read
     /// ([`resolve_adt_field`]) sites project, so a `Discriminant` read
     /// keys the SAME per-instantiation base class the constructor wrote
@@ -25777,7 +25933,19 @@ fn push_ptr_to_unsigned_cast(
     (retype, result)
 }
 
-fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
+/// Empty set for paint calls outside a program lowering. Duplicate-leaf
+/// tombstones belong to the lowering that computed `struct_origins`.
+fn no_tombstoned_leaves() -> &'static std::collections::HashSet<String> {
+    static EMPTY: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
+    EMPTY.get_or_init(std::collections::HashSet::new)
+}
+
+fn tyref_to_value_type_with(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> ValueType {
     // The HashConsedValue arm carries the body inline; primitives
     // typically land here.  The Deduplicated arm carries only an
     // ID; consult the dedup-body index to recover the inline shape
@@ -25869,7 +26037,7 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     // `record_branch_guard(_, truth, ..)` wanting `r`, and no kind for the
     // caller's variable satisfies both.
     if let Some(resolved) = trait_assoc_projection_target(value, llbc) {
-        return tyref_to_value_type(&resolved, llbc);
+        return tyref_to_value_type_with(&resolved, llbc, tombstoned);
     }
     // RPython `history.getkind` classifies `Ptr(FuncType)` through the raw
     // pointer arm, hence as `int`.  Charon's equivalent is a top-level
@@ -25897,7 +26065,7 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     // its field. Charon records the representation in `TypeDecl.layout`, so
     // preserve the field's register bank instead of treating the wrapper as
     // a GC reference.
-    if let Some(inner) = tyref_transparent_inner_value_type(ty, llbc) {
+    if let Some(inner) = tyref_transparent_inner_value_type(ty, llbc, tombstoned) {
         return inner;
     }
     // `OpArg` and compiler-core's `newtype_oparg!` wrappers are transparent
@@ -25964,10 +26132,14 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     // `__discriminant` off that interned base; a classdef-less root
     // falls to `getclsfield`, which is the upstream path — do not
     // synthesize a tag there.
-    if let Some(root) = tyref_payload_enum_class_root(ty, llbc) {
+    if let Some(root) = tyref_payload_enum_class_root_with(ty, llbc, tombstoned) {
         return ValueType::Ref(Some(root));
     }
     ValueType::Ref(None)
+}
+
+fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
+    tyref_to_value_type_with(ty, llbc, no_tombstoned_leaves())
 }
 
 /// Register-bank kind of the value behind a Charon reference destination.
@@ -25976,11 +26148,15 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
 /// devirtualized flow operation is RPython's `getarrayitem`, whose result is
 /// `T`. Preserve that distinction instead of banking the reference wrapper
 /// itself as a GC ref.
-fn tyref_deref_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
+fn tyref_deref_value_type_with(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> ValueType {
     let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_wrappers(node, llbc)) else {
         return ValueType::Ref(None);
     };
-    tyref_to_value_type(&TyRef::Other(node.clone()), llbc)
+    tyref_to_value_type_with(&TyRef::Other(node.clone()), llbc, tombstoned)
 }
 
 /// Register-bank kind of an ADT field read.
@@ -26001,11 +26177,12 @@ fn adt_field_read_value_type(
     container_is_enum: bool,
     owner_is_closure_env: bool,
     llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
 ) -> ValueType {
     let declared = if container_is_enum {
-        tyref_enum_payload_value_type(place_ty, llbc)
+        tyref_enum_payload_value_type(place_ty, llbc, tombstoned)
     } else {
-        tyref_to_value_type(place_ty, llbc)
+        tyref_to_value_type_with(place_ty, llbc, tombstoned)
     };
     match declared {
         ValueType::Ref(None) => {
@@ -26015,7 +26192,7 @@ fn adt_field_read_value_type(
             {
                 return peeled;
             }
-            tyref_to_value_type(field_ty, llbc)
+            tyref_to_value_type_with(field_ty, llbc, tombstoned)
         }
         resolved => resolved,
     }
@@ -26054,7 +26231,7 @@ fn tyref_shared_borrow_primitive_value(ty: &TyRef, llbc: &Llbc) -> Option<ValueT
 /// there for a primitive `P`: `<[u8]>::get` returns `Option<&u8>`, so
 /// `let tag = *code.get(pc)?; match tag { .. }` reaches the switch through
 /// the variant payload rather than through `Index::index` (which
-/// [`tyref_deref_value_type`] already covers).  That borrow carries no
+/// [`tyref_deref_value_type_with`] already covers).  That borrow carries no
 /// representation of its own — `lltype.py` `class Ptr.__new__` raises
 /// `TypeError("can only point to a Container type")`, so `Ptr(Signed)` /
 /// `Ptr(Char)` do not exist and the byte is the only representable model —
@@ -26070,9 +26247,13 @@ fn tyref_shared_borrow_primitive_value(ty: &TyRef, llbc: &Llbc) -> Option<ValueT
 /// integer bank.  A `&&i64` reaching here peels to nothing for the same
 /// reason [`tyref_shared_borrow_primitive_pointee`] declines it: its
 /// pointee is another reference, not a primitive.
-fn tyref_enum_payload_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
+fn tyref_enum_payload_value_type(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> ValueType {
     if let Some(pointee) = tyref_shared_borrow_primitive_pointee(ty, llbc) {
-        return tyref_to_value_type(&TyRef::Other(pointee), llbc);
+        return tyref_to_value_type_with(&TyRef::Other(pointee), llbc, tombstoned);
     }
     // A payload slot read straight out of `generics.types` may still carry
     // the `HashConsedValue` / `Deduplicated` wrappers that
@@ -26080,7 +26261,7 @@ fn tyref_enum_payload_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     // `TyRef::Dedup`, not a node reached through one), so strip them the way
     // the peel above already does internally.
     match tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc)) {
-        Some(node) => tyref_to_value_type(&TyRef::Other(node.clone()), llbc),
+        Some(node) => tyref_to_value_type_with(&TyRef::Other(node.clone()), llbc, tombstoned),
         None => ValueType::Ref(None),
     }
 }
@@ -26419,14 +26600,18 @@ fn tyref_fieldless_enum_class_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
 /// `None` when `ty` is not such an enum, or when the root resolver
 /// declines it (the core/std/alloc container family, which has dedicated
 /// annotator models rather than a classdef).
-fn tyref_payload_enum_class_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
+fn tyref_payload_enum_class_root_with(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
     if tyref_is_fieldless_enum_free(ty, llbc) || tyref_is_borrowed_fieldless_enum_free(ty, llbc) {
         return None;
     }
     if !tyref_is_enum_free(ty, llbc) {
         return None;
     }
-    tyref_class_root(ty, llbc)
+    tyref_class_root_with(ty, llbc, tombstoned)
 }
 
 /// Encode the FUNC.RESULT of a `dont_look_inside` callee into the
@@ -26585,6 +26770,14 @@ fn tyref_is_int_range_inclusive(ty: &TyRef, llbc: &Llbc) -> bool {
 /// the payload. A `repr(transparent)` scalar wrapper keeps its inner register
 /// class, as it does at ordinary value sites.
 fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
+    tyref_to_attr_value_type_with(ty, llbc, no_tombstoned_leaves())
+}
+
+fn tyref_to_attr_value_type_with(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> ValueType {
     let value = match ty {
         TyRef::Inline { value: (_, v) } => v,
         TyRef::Other(v) => v,
@@ -26641,7 +26834,7 @@ fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     if let Some(inner) = tyref_atomic_inner_value_type(ty, llbc) {
         return inner;
     }
-    if let Some(inner) = tyref_transparent_inner_value_type(ty, llbc) {
+    if let Some(inner) = tyref_transparent_inner_value_type(ty, llbc, tombstoned) {
         return inner;
     }
     // A fieldless (C-like) enum field is represented by-value as its
@@ -26670,7 +26863,7 @@ fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     // Matching [`tyref_to_value_type`]: a payload-carrying enum field
     // seeds `Ref(Some(root))` so the FORCE-attr / call-result narrow
     // intern the enum base instead of the classdef-less `Ref(None)` shell.
-    if let Some(root) = tyref_payload_enum_class_root(ty, llbc) {
+    if let Some(root) = tyref_payload_enum_class_root_with(ty, llbc, tombstoned) {
         return ValueType::Ref(Some(root));
     }
     ValueType::Ref(None)
@@ -26716,8 +26909,17 @@ fn tyref_to_attr_value_type_for_struct_field(
 ///     a generic decl carry unresolved type-variable field strings, so
 ///     a seeded classdef would project bogus attr shells.
 fn tyref_class_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
+    tyref_class_root_with(ty, llbc, no_tombstoned_leaves())
+}
+
+fn tyref_class_root_with(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
-    adt_node_class_root(node, llbc).or_else(|| raw_ptr_pointee_class_root(node, llbc))
+    adt_node_class_root_with(node, llbc, tombstoned)
+        .or_else(|| raw_ptr_pointee_class_root_with(node, llbc, tombstoned))
 }
 
 /// The underlying JSON type node of a `TyRef`, resolving the `Dedup`
@@ -26861,8 +27063,12 @@ fn adt_declares_field(td: &TypeDecl, name: &str) -> bool {
 /// registry key) so `derive_subject_inputcells` projects the captured
 /// fields rather than seeding a classdef-less `SomeInstance(None)` shell
 /// its `self.<capture>` reads would wall on.  RPython forbids closures.
-fn tyref_input_class_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
-    let leaf = tyref_class_root(ty, llbc);
+fn tyref_input_class_root(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let leaf = tyref_class_root_with(ty, llbc, tombstoned);
     if leaf
         .as_deref()
         .is_some_and(majit_charon_reader::ullbc::is_closure_leaf)
@@ -26943,7 +27149,11 @@ fn tyref_atomic_inner_scalar_str(ty: &TyRef, llbc: &Llbc) -> Option<&'static str
     }
 }
 
-fn tyref_transparent_inner_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
+fn tyref_transparent_inner_value_type(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<ValueType> {
     // Peel the reference the way the atomic sibling does. A borrow of the
     // wrapper has to answer with the same bank as the wrapper itself:
     // `Rvalue::Ref` aliases the referent's Variable rather than introducing a
@@ -26963,7 +27173,7 @@ fn tyref_transparent_inner_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueTy
             let [field] = fields.as_slice() else {
                 return None;
             };
-            Some(tyref_to_value_type(&field.ty, llbc))
+            Some(tyref_to_value_type_with(&field.ty, llbc, tombstoned))
         }
         TypeDeclKind::Opaque => llbc
             .transparent_scalar_kind(&decl.item_meta.name_path())
@@ -27207,7 +27417,11 @@ fn adt_node_def_id(node: &serde_json::Value) -> Option<u64> {
 
 /// The monomorphic-ADT class root of an (already wrapper-stripped)
 /// type node, or `None` for non-ADTs and generic instantiations.
-fn adt_node_class_root(node: &serde_json::Value, llbc: &Llbc) -> Option<String> {
+fn adt_node_class_root_with(
+    node: &serde_json::Value,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
     let adt = node.as_object()?.get("Adt")?.as_object()?;
     let def_id = adt_node_def_id(node)?;
     let has_type_args = adt
@@ -27233,7 +27447,20 @@ fn adt_node_class_root(node: &serde_json::Value, llbc: &Llbc) -> Option<String> 
             return None;
         }
     }
-    let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
+    let mut leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
+    // `harden_duplicate_leaf_metadata` clears the origin of a leaf shared
+    // by two declarations (`eval::Code` and `module::struct::Code`). The
+    // bare token then canonicalises to itself and matches no field row, so
+    // the value is a classdef-less instance and `__discriminant` has
+    // nowhere to resolve (`rclass.py` `InstanceRepr.getfieldrepr`). Paint
+    // this declaration's crate-stripped path; that key still carries the
+    // rows, and `canonical_struct_name` leaves a `::` path unchanged.
+    if tombstoned.contains(&leaf) {
+        let qualified = strip_crate_prefix(&name);
+        if qualified != leaf {
+            leaf = qualified;
+        }
+    }
     // A reference-payload workspace enum instantiation projects to a
     // per-instantiation base class (`Result<Tuple>`) so its variant
     // payloads do not union across instantiations.  The discriminant
@@ -27252,8 +27479,16 @@ fn adt_node_class_root(node: &serde_json::Value, llbc: &Llbc) -> Option<String> 
 /// wrapper-stripped) `RawPtr` type node, or `None` when the node is
 /// not a raw pointer onto a plain ADT.
 fn raw_ptr_pointee_class_root(node: &serde_json::Value, llbc: &Llbc) -> Option<String> {
+    raw_ptr_pointee_class_root_with(node, llbc, no_tombstoned_leaves())
+}
+
+fn raw_ptr_pointee_class_root_with(
+    node: &serde_json::Value,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
     let raw = node.as_object()?.get("RawPtr")?.as_array()?;
-    adt_node_class_root(strip_ty_wrappers(raw.first()?, llbc)?, llbc)
+    adt_node_class_root_with(strip_ty_wrappers(raw.first()?, llbc)?, llbc, tombstoned)
 }
 
 /// The projected list root of a raw pointer onto a Rust container.
@@ -29329,17 +29564,22 @@ fn payload_tuple_suffix(payload: &TyRef, llbc: &Llbc) -> String {
 /// and closure-tuple field write.  RPython derives the field repr from that
 /// class annotation (`rclass.py:InstanceRepr._setup_repr`); the register-bank
 /// [`ValueType`] alone cannot distinguish two reference classes.
-fn enum_payload_instance_class_root(payload: &TyRef, llbc: &Llbc) -> Option<String> {
+fn enum_payload_instance_class_root(
+    payload: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
     let payload = strip_ty_indirections(tyref_node(payload, llbc)?, llbc)?;
-    if let Some(root) = raw_ptr_pointee_class_root(payload, llbc) {
+    if let Some(root) = raw_ptr_pointee_class_root_with(payload, llbc, tombstoned) {
         return Some(root);
     }
-    if let Some(root) = adt_node_class_root(payload, llbc) {
+    if let Some(root) = adt_node_class_root_with(payload, llbc, tombstoned) {
         return Some(root);
     }
     let pointee = payload.as_object()?.get("Ref")?.as_array()?.get(1)?;
     let pointee = strip_ty_wrappers(pointee, llbc)?;
-    raw_ptr_pointee_class_root(pointee, llbc).or_else(|| adt_node_class_root(pointee, llbc))
+    raw_ptr_pointee_class_root_with(pointee, llbc, tombstoned)
+        .or_else(|| adt_node_class_root_with(pointee, llbc, tombstoned))
 }
 
 /// A type-argument drives a per-instantiation variant-class split unless
@@ -29389,7 +29629,7 @@ fn type_arg_splits_per_instantiation(arg: &str) -> bool {
 /// collide are `Result::Ok` / `Option::Some`, minted by the constructor
 /// path, so the split must reach `core::result::Result` /
 /// `core::option::Option`.  The receiver-type projection
-/// [`adt_node_class_root`] keeps its own container exclusion so
+/// [`adt_node_class_root_with`] keeps its own container exclusion so
 /// `Vec<T>` / `Box<T>` still map to their annotator models.
 pub(crate) fn adt_head_instantiation_suffix(
     adt: &serde_json::Map<String, serde_json::Value>,
@@ -35308,11 +35548,11 @@ mod tests {
         charon_const_generic_to_string, charon_type_value_to_ast_string, decode_literal,
         fn_ptr_family_for, int_binop_needs_ptr_to_int, is_class_pytype_assoc_const,
         is_core_result_map_err_path, json_ty_is_thin_pointer_element,
-        json_ty_scalar_element_spelling, primitive_float_const, push_cast_ptr_to_int,
-        push_direct_ptradd, push_ptr_to_unsigned_cast, scalar_replace_named_struct_aggregates,
-        shaped_array_parts, simplify_lowered_graph, static_key_segments, type_decl_is_closure_env,
-        tyref_array_suffix, tyref_is_closure_env, tyref_is_raw_byte_ptr,
-        tyref_positional_aggregate_root, tyref_to_attr_value_type,
+        json_ty_scalar_element_spelling, no_tombstoned_leaves, primitive_float_const,
+        push_cast_ptr_to_int, push_direct_ptradd, push_ptr_to_unsigned_cast,
+        scalar_replace_named_struct_aggregates, shaped_array_parts, simplify_lowered_graph,
+        static_key_segments, type_decl_is_closure_env, tyref_array_suffix, tyref_is_closure_env,
+        tyref_is_raw_byte_ptr, tyref_positional_aggregate_root, tyref_to_attr_value_type,
         tyref_to_attr_value_type_for_struct_field, tyref_to_value_type,
     };
     use crate::flowspace::model::Variable;
@@ -39548,6 +39788,7 @@ mod tests {
             .unwrap();
             let dont_look_inside = std::collections::HashSet::new();
             let accum = super::AccumulatorFacts::build(&llbc, &body);
+            let tombstoned_leaves = std::collections::HashSet::new();
             let lowering = Lowering::new(
                 &llbc,
                 "fixture".into(),
@@ -39556,6 +39797,7 @@ mod tests {
                 &[],
                 None,
                 &dont_look_inside,
+                &tombstoned_leaves,
                 &accum,
             )
             .unwrap();
@@ -39827,6 +40069,113 @@ mod tests {
             super::tyref_class_root(&mixed_ty, &llbc).as_deref(),
             Some("Opcode"),
             "intern key must be the Input.class_root leaf"
+        );
+    }
+
+    /// `eval::Code` and `module::struct::Code` share a leaf. Harden clears
+    /// that leaf's origin, and the bare token is not a class. The enum's
+    /// value must paint the declaration that still has the
+    /// `__discriminant` row (`module::struct::Code`), while a leaf harden
+    /// left alone stays bare.
+    #[test]
+    fn tombstoned_duplicate_leaf_paints_the_declaration_path() {
+        let span = || {
+            serde_json::json!({"data": {
+                "file_id": 0,
+                "beg": {"line": 1, "col": 0},
+                "end": {"line": 1, "col": 1}
+            }})
+        };
+        let item_meta = |segs: &[&str]| {
+            serde_json::json!({
+                "name": segs.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": true
+            })
+        };
+        let adt = |def_id: u64, hash: u64| {
+            serde_json::json!({"HashConsedValue": [hash, {
+                "Adt": {
+                    "id": {"Adt": def_id},
+                    "generics": {
+                        "regions": [],
+                        "types": [],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }
+            }]})
+        };
+        let variant = |name: &str, fields: Vec<serde_json::Value>, discriminant: u64| {
+            serde_json::json!({
+                "name": name,
+                "fields": fields,
+                "discriminant": {"Scalar": {"Unsigned": ["U8", discriminant.to_string()]}}
+            })
+        };
+        let field = |name: &str| {
+            serde_json::json!({
+                "name": name,
+                "ty": {"Literal": "Bool"},
+                "attr_info": null
+            })
+        };
+        let enum_code = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["pyre_interpreter", "module", "struct", "Code"]),
+            "kind": {"Enum": [
+                variant("Pad", vec![], 0),
+                variant("Int", vec![field("signed")], 1)
+            ]}
+        });
+        let struct_code = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta(&["pyre_interpreter", "eval", "Code"]),
+            "kind": {"Struct": [field("name")]}
+        });
+        let opcode = serde_json::json!({
+            "def_id": 2,
+            "item_meta": item_meta(&["fixture", "Opcode"]),
+            "kind": {"Enum": [
+                variant("Nop", vec![], 0),
+                variant("Int", vec![field("signed")], 1)
+            ]}
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "pyre_interpreter",
+                "type_decls": [enum_code, struct_code, opcode],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let code_ty = serde_json::from_value::<TyRef>(adt(0, 30)).expect("Code TyRef");
+        let opcode_ty = serde_json::from_value::<TyRef>(adt(2, 31)).expect("Opcode TyRef");
+        let tombstoned = ["Code".to_string()].into_iter().collect();
+        assert_eq!(
+            super::tyref_to_value_type_with(&code_ty, &llbc, &tombstoned),
+            ValueType::Ref(Some("module::struct::Code".to_string()))
+        );
+        assert_eq!(
+            super::tyref_class_root_with(&code_ty, &llbc, &tombstoned).as_deref(),
+            Some("module::struct::Code")
+        );
+        assert_eq!(
+            super::tyref_to_value_type(&opcode_ty, &llbc),
+            ValueType::Ref(Some("Opcode".to_string())),
+            "a leaf harden did not clear keeps its bare intern key"
         );
     }
 
@@ -42923,12 +43272,26 @@ mod tests {
             "the global projection stays non-peeling for &usize"
         );
         assert_eq!(
-            adt_field_read_value_type(&ref_u8, &ref_u8, false, false, &llbc),
+            adt_field_read_value_type(
+                &ref_u8,
+                &ref_u8,
+                false,
+                false,
+                &llbc,
+                no_tombstoned_leaves()
+            ),
             ValueType::Ref(None),
             "an ordinary struct's &u8 field is a stored pointer"
         );
         assert_eq!(
-            adt_field_read_value_type(&ref_usize, &ref_usize, false, true, &llbc),
+            adt_field_read_value_type(
+                &ref_usize,
+                &ref_usize,
+                false,
+                true,
+                &llbc,
+                no_tombstoned_leaves()
+            ),
             ValueType::Unsigned,
             "a closure-env &usize capture is the usize"
         );
@@ -42990,6 +43353,7 @@ mod tests {
         .unwrap();
         let dont_look_inside = std::collections::HashSet::new();
         let accum = super::AccumulatorFacts::build(&llbc, &body);
+        let tombstoned_leaves = std::collections::HashSet::new();
         let lowering = Lowering::new(
             &llbc,
             "fixture".into(),
@@ -42998,6 +43362,7 @@ mod tests {
             &[],
             None,
             &dont_look_inside,
+            &tombstoned_leaves,
             &accum,
         )
         .unwrap();

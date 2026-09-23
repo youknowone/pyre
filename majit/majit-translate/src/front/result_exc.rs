@@ -2073,22 +2073,23 @@ fn catch_and_rewrap(
         .cloned()
         .collect();
     let (n_id, n_inputs) = graph.create_block_with_arg_vars(value_args.len());
-    let n_shell: Option<Variable> = if has_r {
+    let (n_shell, ok_payload): (Option<Variable>, Option<Variable>) = if has_r {
         let r_value_idx = value_args
             .iter()
             .position(&is_r)
             .expect("has_r implies a Value position");
         let payload = n_inputs[r_value_idx].clone();
-        Some(build_shell(
+        let shell = build_shell(
             graph,
             n_id,
             "Ok",
-            payload,
+            payload.clone(),
             payload_ty.clone(),
             suffix,
-        ))
+        );
+        (Some(shell), Some(payload))
     } else {
-        None
+        (None, None)
     };
     let mut vi = 0usize;
     let n_exit_args: Vec<LinkArg> = orig
@@ -2124,7 +2125,7 @@ fn catch_and_rewrap(
         .collect();
     let (e_id, e_inputs) = graph.create_block_with_arg_vars(nonr_args.len() + 2);
     let e_exc_value_in = e_inputs[nonr_args.len() + 1].clone();
-    let e_shell: Option<Variable> = if has_r {
+    let (e_shell, err_payload): (Option<Variable>, Option<Variable>) = if has_r {
         // The rebuild is an associated fn on the carrier (no `self`),
         // spelled as a `Method` whose `receiver_root` is the type leaf
         // (`PyError`) so the annotator's getattr surface stays on that
@@ -2157,16 +2158,17 @@ fn catch_and_rewrap(
             }
             None => e_exc_value_in,
         };
-        Some(build_shell(
+        let shell = build_shell(
             graph,
             e_id,
             "Err",
-            v_err,
+            v_err.clone(),
             ValueType::Ref(None),
             suffix,
-        ))
+        );
+        (Some(shell), Some(v_err))
     } else {
-        None
+        (None, None)
     };
     let mut ei = 0usize;
     let e_exit_args: Vec<LinkArg> = orig
@@ -2223,6 +2225,333 @@ fn catch_and_rewrap(
         Some(ExitSwitch::LastException),
         vec![Link::new_mixed(value_args, n_id, None), exc_link],
     );
+    // The shells exist only so the hand-written `match` can unwrap them.
+    // When that match is a pure `__pos_0` unwrap, feed the payload straight
+    // into the arms (`getindex_w`'s `try/except OperationError`). A shape
+    // that still inspects the shell keeps the rebuild.
+    if let (Some(ok_shell), Some(err_shell), Some(ok_payload), Some(err_payload)) =
+        (n_shell, e_shell, ok_payload, err_payload)
+    {
+        let _ = collapse_rebuilt_shell_match(
+            graph,
+            n_id.0,
+            e_id.0,
+            &ok_shell,
+            &err_shell,
+            &ok_payload,
+            &err_payload,
+        );
+    }
+    Ok(())
+}
+
+/// Drop the `Ok`/`Err` shells [`catch_and_rewrap`] just built when the
+/// match they feed only reads `__pos_0` and forwards that payload.
+///
+/// `getindex_w` is `try: int_w(...) except OperationError`. The rebuilt
+/// shell plus the discriminant switch is that `try` spelled as a `Result`.
+/// Bypassing the switch leaves the normal edge on the unwrapped `int` and
+/// the handler on the `PyError`, which is the value `err.match` reads.
+///
+/// Fail-safe: any other use of the shell returns `Err` with the graph
+/// unchanged. Every check runs before the first edit.
+fn collapse_rebuilt_shell_match(
+    graph: &mut FunctionGraph,
+    normal: usize,
+    handler: usize,
+    ok_shell: &Variable,
+    err_shell: &Variable,
+    ok_payload: &Variable,
+    err_payload: &Variable,
+) -> Result<(), String> {
+    let n_exit = single_exit(graph, normal)?;
+    let e_exit = single_exit(graph, handler)?;
+    if n_exit.target != e_exit.target {
+        return Err("rebuilt shells do not meet at one match".to_string());
+    }
+    let m = n_exit.target.0;
+    let preds: Vec<usize> = graph
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, block)| block.exits.iter().any(|link| link.target.0 == m))
+        .map(|(i, _)| i)
+        .collect();
+    if preds.len() != 2 || !preds.contains(&normal) || !preds.contains(&handler) {
+        return Err(format!(
+            "match block {m} is not private to the rebuilt shells"
+        ));
+    }
+    let (_, disc, shell_in) = match_discriminant(graph, m)?;
+    if graph.blocks[m].operations.len() != 1 {
+        return Err(format!("match block {m} is not a pure discriminant switch"));
+    }
+    let (ok_link, err_link) = split_diamond_exits(&graph.blocks[m].exits, "rebuilt shell match")?;
+    let ok_arm = ok_link.target.0;
+    let err_arm = err_link.target.0;
+    assert_single_pred(graph, ok_arm, "rebuilt shell match")?;
+    assert_single_pred(graph, err_arm, "rebuilt shell match")?;
+    let ok_shell_arm = arm_shell_var(graph, &ok_link, &shell_in)?;
+    let err_shell_arm = arm_shell_var(graph, &err_link, &shell_in)?;
+    let ok_reads = shell_pos0_reads(graph, ok_arm, &ok_shell_arm)?;
+    let err_reads = shell_pos0_reads(graph, err_arm, &err_shell_arm)?;
+    let ok_args = project_arm_args(
+        &n_exit.args,
+        &graph.blocks[m].inputargs,
+        &ok_link.args,
+        &shell_in,
+        ok_payload,
+        &disc,
+        0,
+    )?;
+    let err_args = project_arm_args(
+        &e_exit.args,
+        &graph.blocks[m].inputargs,
+        &err_link.args,
+        &shell_in,
+        err_payload,
+        &disc,
+        1,
+    )?;
+    remove_shell_build(graph, normal, ok_shell)?;
+    remove_shell_build(graph, handler, err_shell)?;
+    graph.blocks[normal].exits = vec![Link::new_mixed(ok_args, ok_link.target, None)];
+    graph.blocks[normal].exitswitch = None;
+    graph.blocks[handler].exits = vec![Link::new_mixed(err_args, err_link.target, None)];
+    graph.blocks[handler].exitswitch = None;
+    for (block, pos) in ok_reads.into_iter().chain(err_reads) {
+        collapse_pos0_read(graph, BlockId(block), pos, "rebuilt shell match")?;
+    }
+    Ok(())
+}
+
+fn single_exit(graph: &FunctionGraph, block: usize) -> Result<Link, String> {
+    match graph.blocks[block].exits.as_slice() {
+        [link] if graph.blocks[block].exitswitch.is_none() => Ok(link.clone()),
+        _ => Err(format!("block {block} is not a single unconditional exit")),
+    }
+}
+
+/// The match block's one `__discriminant` read, and the inputarg it reads.
+fn match_discriminant(
+    graph: &FunctionGraph,
+    block: usize,
+) -> Result<(usize, Variable, Variable), String> {
+    let found = graph.blocks[block]
+        .operations
+        .iter()
+        .enumerate()
+        .find_map(|(i, op)| match &op.kind {
+            OpKind::FieldRead { base, field, .. }
+                if field.name == "__discriminant"
+                    && field
+                        .owner_root
+                        .as_deref()
+                        .is_some_and(owner_is_result_of_pyerror) =>
+            {
+                op.result.clone().map(|disc| (i, disc, base.clone()))
+            }
+            _ => None,
+        });
+    let Some((idx, disc, shell)) = found else {
+        return Err(format!("block {block} lacks a Result __discriminant read"));
+    };
+    match &graph.blocks[block].exitswitch {
+        Some(ExitSwitch::Value(sw)) if *sw == disc => {}
+        _ => return Err(format!("block {block} does not switch on the discriminant")),
+    }
+    if !graph.blocks[block]
+        .inputargs
+        .iter()
+        .any(|arg| arg == &shell)
+    {
+        return Err(format!(
+            "block {block} discriminant base is not an inputarg"
+        ));
+    }
+    Ok((idx, disc, shell))
+}
+
+/// The arm inputarg bound from the match link's shell argument.
+fn arm_shell_var(
+    graph: &FunctionGraph,
+    link: &Link,
+    shell_in_match: &Variable,
+) -> Result<Variable, String> {
+    let pos = link
+        .args
+        .iter()
+        .position(|arg| matches!(arg, LinkArg::Value(v) if v == shell_in_match))
+        .ok_or_else(|| "match arm does not receive the shell".to_string())?;
+    graph.blocks[link.target.0]
+        .inputargs
+        .get(pos)
+        .cloned()
+        .ok_or_else(|| format!("arm block {} lacks inputarg {pos}", link.target.0))
+}
+
+/// Blocks reachable from `start` whose shell alias is only a `__pos_0`
+/// read or a forwarded link arg. Each entry is `(block, inputarg position)`
+/// of a read [`collapse_pos0_read`] can delete.
+fn shell_pos0_reads(
+    graph: &FunctionGraph,
+    start: usize,
+    shell: &Variable,
+) -> Result<Vec<(usize, usize)>, String> {
+    let mut reads = Vec::new();
+    let mut seen: Vec<(usize, u64)> = Vec::new();
+    let mut work = vec![(start, shell.clone())];
+    while let Some((block, var)) = work.pop() {
+        if seen.iter().any(|(b, id)| *b == block && *id == var.id()) {
+            continue;
+        }
+        seen.push((block, var.id()));
+        let mut read_result: Option<Variable> = None;
+        for op in &graph.blocks[block].operations {
+            if !op_operand_vars(&op.kind)
+                .iter()
+                .any(|operand| operand == &var)
+            {
+                continue;
+            }
+            match &op.kind {
+                OpKind::FieldRead { base, field, .. }
+                    if base == &var
+                        && field.name == "__pos_0"
+                        && field.owner_root.as_deref().is_some_and(|owner| {
+                            owner_is_result_variant(owner, "Ok")
+                                || owner_is_result_variant(owner, "Err")
+                        }) =>
+                {
+                    if read_result.is_some() {
+                        return Err(format!("block {block} reads __pos_0 twice"));
+                    }
+                    let Some(result) = op.result.clone() else {
+                        return Err(format!("block {block} __pos_0 read has no result"));
+                    };
+                    read_result = Some(result);
+                }
+                _ => {
+                    return Err(format!(
+                        "block {block} uses the Result shell outside __pos_0"
+                    ));
+                }
+            }
+        }
+        if read_result.is_some() {
+            let pos = graph.blocks[block]
+                .inputargs
+                .iter()
+                .position(|arg| arg == &var)
+                .ok_or_else(|| format!("block {block} shell alias is not an inputarg"))?;
+            reads.push((block, pos));
+        }
+        if let Some(ExitSwitch::Value(sw)) = &graph.blocks[block].exitswitch
+            && (sw == &var || read_result.as_ref() == Some(sw))
+        {
+            return Err(format!("block {block} switches on the Result shell"));
+        }
+        for link in &graph.blocks[block].exits {
+            for (i, arg) in link.args.iter().enumerate() {
+                let carries = match arg {
+                    LinkArg::Value(v) if v == &var => true,
+                    LinkArg::Value(v) if read_result.as_ref() == Some(v) => true,
+                    _ => false,
+                };
+                if !carries {
+                    continue;
+                }
+                let target = link.target.0;
+                if target == graph.returnblock.0 || target == graph.exceptblock.0 {
+                    continue;
+                }
+                let Some(next) = graph.blocks[target].inputargs.get(i).cloned() else {
+                    return Err(format!("block {target} lacks inputarg {i}"));
+                };
+                work.push((target, next));
+            }
+        }
+    }
+    Ok(reads)
+}
+
+/// Rebuild `arm_args` from the predecessor's exit. A match input becomes
+/// the predecessor arg that bound it; the shell input becomes `payload`.
+fn project_arm_args(
+    pred_args: &[LinkArg],
+    match_inputs: &[Variable],
+    arm_args: &[LinkArg],
+    shell_in_match: &Variable,
+    payload: &Variable,
+    disc: &Variable,
+    disc_case: i64,
+) -> Result<Vec<LinkArg>, String> {
+    arm_args
+        .iter()
+        .map(|arg| match arg {
+            LinkArg::Const(constant) => Ok(LinkArg::Const(constant.clone())),
+            LinkArg::Value(var) if var == shell_in_match => Ok(LinkArg::Value(payload.clone())),
+            // The switch value is this arm's tag. The arm no longer goes
+            // through the discriminant block, so pass the tag as a constant.
+            LinkArg::Value(var) if var == disc => {
+                Ok(LinkArg::Const(crate::flowspace::model::Constant::new(
+                    crate::flowspace::model::ConstValue::Int(disc_case),
+                )))
+            }
+            LinkArg::Value(var) => {
+                let pos = match_inputs
+                    .iter()
+                    .position(|input| input == var)
+                    .ok_or_else(|| {
+                        format!(
+                            "arm arg {}#{} is not a match input [{}]",
+                            var.name(),
+                            var.id(),
+                            match_inputs
+                                .iter()
+                                .map(|input| format!("{}#{}", input.name(), input.id()))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    })?;
+                pred_args
+                    .get(pos)
+                    .cloned()
+                    .ok_or_else(|| format!("predecessor lacks arg {pos}"))
+            }
+        })
+        .collect()
+}
+
+fn remove_shell_build(
+    graph: &mut FunctionGraph,
+    block: usize,
+    shell: &Variable,
+) -> Result<(), String> {
+    let mut remove = Vec::new();
+    let mut saw_ctor = false;
+    let mut saw_write = false;
+    for (i, op) in graph.blocks[block].operations.iter().enumerate() {
+        if op.result.as_ref() == Some(shell) {
+            saw_ctor = true;
+            remove.push(i);
+        }
+        if let OpKind::FieldWrite { base, field, .. } = &op.kind
+            && base == shell
+            && field.name == "__pos_0"
+        {
+            saw_write = true;
+            remove.push(i);
+        }
+    }
+    if !saw_ctor || !saw_write {
+        return Err(format!("block {block} is not an Ok/Err shell build"));
+    }
+    remove.sort_unstable();
+    remove.dedup();
+    for index in remove.into_iter().rev() {
+        graph.blocks[block].operations.remove(index);
+    }
     Ok(())
 }
 
