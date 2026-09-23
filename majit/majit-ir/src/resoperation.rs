@@ -6596,12 +6596,17 @@ mod tests {
     }
 
     #[test]
-    fn low_pointer_thin_stamp_does_not_publish_the_stamp_inline_tag() {
-        // Id 0x1FFE plus a 32-bit payload is `SLOT_STAMP_INLINE_TAG`.
-        // wasm32 descr pointers are 32-bit; publishing that word makes
-        // `borrow` return None.
+    fn low_pointer_thin_stamp_is_not_read_as_stamp_inline() {
+        // Id 0x1FFE plus a 32-bit payload sets the `SLOT_STAMP_INLINE_TAG`
+        // bits, and wasm32 descr pointers are 32-bit, so bits 32-47 are
+        // clear. `is_stamp_inline` tells the two apart by the low three
+        // bits: a packed stamp is never 8-aligned, a descr payload always
+        // is. The word stays a readable thin descr, and `intern_thin_stamped`
+        // still never issues that id.
         let payload = 0x00ec9ee8u64;
-        assert!(super::thin_stamped_payload_word(payload, 0x1FFE).is_none());
+        let aliased = super::thin_stamped_payload_word(payload, 0x1FFE).unwrap();
+        assert!(super::is_thin_descr(aliased));
+        assert!(!super::is_stamp_inline(aliased));
         let readable = super::thin_stamped_payload_word(payload, 1).unwrap();
         assert!(super::is_thin_descr(readable));
         assert!(!super::is_stamp_inline(readable));
