@@ -361,7 +361,7 @@ unsafe fn classify_cell_write(w_cell: Option<PyObjectRef>, w_value: PyObjectRef)
     }
     // If the new value and the current value are the same, don't
     // create a level of indirection, or mutate the version.
-    if std::ptr::eq(w_cell, w_value) {
+    if crate::pyobject::is_w(w_cell, w_value) {
         return CellWrite::Unchanged;
     }
     CellWrite::Replace
