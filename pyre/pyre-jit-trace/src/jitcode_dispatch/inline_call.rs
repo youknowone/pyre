@@ -12113,7 +12113,7 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
     let Some(concrete_item) = walker_concrete_ref_object(ctx, item_op) else {
         return Err(DispatchError::callee_inline_unsupported(op.pc));
     };
-    fbw_foriter_inflight_capture(concrete_item, body_coord);
+    fbw_foriter_inflight_capture(concrete_item, body_coord, false);
     ctx.frame_state.borrow_mut().vstack_last_ref = item_op;
     Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
@@ -13324,7 +13324,7 @@ fn walk_generator_resume<Sym: WalkSym>(
         return Ok(None);
     };
     write_ref_reg(ctx, op.pc, dst, item, ConcreteValue::Ref(concrete_item))?;
-    fbw_foriter_inflight_capture(concrete_item, body_coord);
+    fbw_foriter_inflight_capture(concrete_item, body_coord, false);
     ctx.frame_state.borrow_mut().vstack_last_ref = item;
     let _ = code_root;
     Ok(Some((DispatchOutcome::Continue, op.next_pc)))

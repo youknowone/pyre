@@ -21762,7 +21762,7 @@ fn try_walker_specialize_zip_two_tuple_iters<Sym: WalkSym>(
         tuple_op,
         Value::Ref(majit_ir::GcRef(concrete_tuple as usize)),
     );
-    fbw_foriter_inflight_capture(concrete_tuple, body);
+    fbw_foriter_inflight_capture(concrete_tuple, body, true);
     ctx.frame_state.borrow_mut().vstack_last_ref = tuple_op;
     Ok(Some(tuple_op))
 }
@@ -22046,7 +22046,7 @@ fn try_walker_specialize_for_iter_list<Sym: WalkSym>(
         fbw_bridge_list_iter_journal_push(iter_obj, seq_obj, index);
     }
     unsafe { pyre_object::iterobject::w_list_iter_set_index(iter_obj, index + 1) };
-    fbw_foriter_inflight_capture(concrete_item, body);
+    fbw_foriter_inflight_capture(concrete_item, body, true);
     ctx.frame_state.borrow_mut().vstack_last_ref = item;
     Ok(Some(item))
 }
@@ -22180,7 +22180,7 @@ fn try_walker_specialize_for_iter_range_step_one<Sym: WalkSym>(
     // snapshot that refuse cannot restore, so the next FOR_ITER
     // yields the following item (`fbw_foriter_item_dropped`).
     fbw_bridge_iter_journal_push(iter_obj, concrete_current, concrete_remaining);
-    fbw_foriter_inflight_capture(concrete_item_ptr, body);
+    fbw_foriter_inflight_capture(concrete_item_ptr, body, true);
     ctx.frame_state.borrow_mut().vstack_last_ref = item;
 
     Ok(Some(item))
@@ -22396,7 +22396,7 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
     // Same journal as the step-one shape: a root abort that then
     // refuses in-flight delivery must be able to restore the cursor.
     fbw_bridge_iter_journal_push(iter_obj, concrete_current, concrete_remaining);
-    fbw_foriter_inflight_capture(concrete_item_ptr, body);
+    fbw_foriter_inflight_capture(concrete_item_ptr, body, true);
     // Range iteration stays at the C level, so the operand-stack mirror
     // remains valid and must receive the item produced by FOR_ITER.  Its
     // virtual state is captured by subsequent body-guard snapshots.

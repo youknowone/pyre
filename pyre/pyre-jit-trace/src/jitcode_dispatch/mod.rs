@@ -3266,7 +3266,18 @@ impl DispatchError {
             let loc = std::panic::Location::caller();
             eprintln!("[lb-site] {}:{} pc={pc}", loc.file(), loc.line());
         }
-        Self::callee_inline_abort(pc, false)
+        // Most call sites have no MIFrame session, so they cannot see the
+        // per-frame effect delta `fbw_decline_inline_callee` reads.  An
+        // in-flight consume those sites still have to honor: a generator,
+        // map, dict/set iterator, itertools iterator, or user `__next__`
+        // has no cursor to roll back, and re-entering the CALL runs
+        // `__next__` again.  `convert_and_run_from_pyjitpl` continues the
+        // framestack instead.  A journaled cursor stays replayable here
+        // unless a body effect already stands.
+        let blackhole_required = fbw_state::fbw_foriter_unjournaled_consume()
+            || (fbw_state::fbw_foriter_inflight_active()
+                && fbw_state::fbw_foriter_any_body_effect_signal());
+        Self::callee_inline_abort(pc, blackhole_required)
     }
 
     /// Classify a nested residual decline by whether the aborting MIFrame has
@@ -7165,6 +7176,10 @@ struct InflightForiter {
     item: pyre_object::PyObjectRef,
     body: InflightForiterBody,
     body_effect_since_consume: bool,
+    /// [`fbw_bridge_iter_journal_capture`] pushed a cursor for this consume.
+    /// False for a generator, `map`, dict/set iterator, itertools, or user
+    /// `__next__`: entry replay would call `__next__` again.
+    consume_journaled: bool,
     /// The walk re-reached this FOR_ITER's consume after the item's body ran
     /// (a NEW `for_iter_next` attempt was dispatched for the same body).
     /// A completed entry must never be re-delivered — its body already ran

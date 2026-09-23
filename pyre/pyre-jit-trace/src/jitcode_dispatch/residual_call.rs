@@ -4228,10 +4228,19 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             | majit_ir::RuntimeHelperKind::NewlistFromArray
             | majit_ir::RuntimeHelperKind::BuildStringFromArray
     );
+    // A journaled cursor is replay-safe: `fbw_bridge_iter_journal_rollback`
+    // puts it back.  A generator, `map`, dict/set iterator, itertools
+    // iterator, or user `__next__` records nothing, so the consume is not
+    // free — entry replay would call `__next__` again.
+    // `convert_and_run_from_pyjitpl` continues from the framestack instead.
+    let for_iter_journaled = helper == majit_ir::RuntimeHelperKind::ForIterNext
+        && args
+            .first()
+            .is_some_and(|&iter| fbw_bridge_iter_journalable(iter as pyre_object::PyObjectRef));
     let provably_side_effect_free = reentrant_residual
         || is_rerunnable_bookkeeping
         || is_rewindable_root_bracket
-        || helper == majit_ir::RuntimeHelperKind::ForIterNext
+        || for_iter_journaled
         || observed_exact_scalar_str
         || observed_exact_str_iter
         || observed_exact_str_ord
@@ -4500,7 +4509,8 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         // the delivery site, which restores it only when it could not hand the
         // item back at the loop header.
         if let Some(&iter) = args.first() {
-            fbw_bridge_iter_journal_capture(iter as pyre_object::PyObjectRef);
+            let recorded = fbw_bridge_iter_journal_capture(iter as pyre_object::PyObjectRef);
+            debug_assert_eq!(recorded, for_iter_journaled);
         }
         let body = fbw_foriter_body_from_op_pc(ctx, op_pc)
             .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
@@ -5107,7 +5117,13 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // nothing but the never-double guarantee.
     let entered_user_frame = user_frame_snapshot
         .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before);
-    if body_effect_candidate || entered_user_frame {
+    // The consume itself is not a body effect.  Marking it would make
+    // `fbw_foriter_inflight_take` take the `REFUSED_EFFECT` arm and keep a
+    // journaled cursor advanced, dropping that item.  The fresh capture below
+    // still starts with a clear body-effect flag.
+    if helper != majit_ir::RuntimeHelperKind::ForIterNext
+        && (body_effect_candidate || entered_user_frame)
+    {
         if fbw_debug_abort_enabled() {
             eprintln!(
                 "[fbw-foriter] body effect committed since consume (helper={helper:?} \
@@ -5157,6 +5173,12 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                 func_ptr as usize,
             );
         }
+        fbw_bump_executed_effect("residual");
+    } else if helper == majit_ir::RuntimeHelperKind::ForIterNext && !for_iter_journaled {
+        // Unjournaled `__next__` does not write through `writes_live_heap` and
+        // a dict/set/itertools iterator enters no user frame, so the arm above
+        // would not see it.  The odometer is what `fbw_decline_inline_callee`
+        // and the bridge drain consult before `try_adopt_blackhole`.
         fbw_bump_executed_effect("residual");
     }
     match exec_result {
@@ -5247,7 +5269,11 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                 // is correct for the loop-header FOR_ITER.
                 let body = fbw_foriter_body_from_op_pc(ctx, op_pc)
                     .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
-                fbw_foriter_inflight_capture(result_i64 as usize as pyre_object::PyObjectRef, body);
+                fbw_foriter_inflight_capture(
+                    result_i64 as usize as pyre_object::PyObjectRef,
+                    body,
+                    for_iter_journaled,
+                );
                 // #73/#267: the item lands on the operand-stack TOS through the
                 // codewriter's `pin!` slot binding (FOR_ITER lowering), not a
                 // `setarrayitem_vable_r` push, and the residual result is
