@@ -1470,6 +1470,11 @@ thread_local! {
 /// shape). One single-word argument, `()` result, and it cannot raise.
 #[majit_macros::dont_look_inside]
 pub fn set_in_flight_exception(exc: PyObjectRef) {
+    // The cell is a walked root. A caller that copied the exception
+    // before `collect_and_reserve` still holds the pre-move address;
+    // publishing that word makes the next major seed the corpse.
+    // Same reload as `gc_roots::pin_root` (`gc_current_object_address`).
+    let exc = pyre_object::interp_exceptions::live_nursery_ref(exc);
     IN_FLIGHT_EXCEPTION.with(|c| c.set(exc));
 }
 
@@ -1761,7 +1766,10 @@ pub fn set_current_exception(exc: PyObjectRef) {
         return;
     }
     unsafe {
-        (*ec).sys_exc_value = exc;
+        // Nursery exceptions move. This slot is the EC root
+        // `walk_pyframe_roots_area` forwards; store the post-forward
+        // address, matching `gc_roots::pin_root`.
+        (*ec).sys_exc_value = pyre_object::interp_exceptions::live_nursery_ref(exc);
     }
 }
 

@@ -436,6 +436,10 @@ pub unsafe fn w_generator_get_saved_exc_value(obj: PyObjectRef) -> PyObjectRef {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_generator_set_saved_exc_value(obj: PyObjectRef, value: PyObjectRef) {
+    // `generator.py GeneratorOrCoroutine.saved_operr`. The generator is
+    // old-gen; the exception is nursery (`alloc_exception_nursery`) and
+    // a minor may already have forwarded the local this stores.
+    let value = crate::interp_exceptions::live_nursery_ref(value);
     unsafe { (*(obj as *mut GeneratorIterator)).saved_exc_value = value };
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }

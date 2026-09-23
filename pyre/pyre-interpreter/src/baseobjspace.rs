@@ -20644,16 +20644,23 @@ unsafe fn generator_kind(gen_obj: PyObjectRef) -> &'static str {
 /// return, which surfaces through the `Ok`/`frame_finished_execution` path.
 unsafe fn leak_generator_iteration(mut e: PyError, message: &str) -> PyError {
     use pyre_object::interp_exceptions::*;
+    // `generator.py _leak_stopiteration` / `chain_exceptions_from_cause`:
+    // the leaked exception becomes both `__context__` and `__cause__` of the
+    // RuntimeError. It is a nursery object (`alloc_exception_nursery`), and
+    // `w_exception_new` collects (`collect_and_reserve`), so the pin is the
+    // root the minor rewrites. The `PyError` cache and this local are not.
     let w_stopiter = e.to_exc_object();
-    // Root the leaked StopIteration across the RuntimeError allocation below:
-    // it lives only in this Rust local, which the precise collector does not
-    // scan, so a collection inside `w_exception_new` could sweep it before it
-    // is stamped onto `rt` as `__context__` / `__cause__`.
     let _roots = pyre_object::gc_roots::push_roots();
+    let stop_slot = pyre_object::gc_roots::shadow_stack_len();
     if !w_stopiter.is_null() {
         let _ = pyre_object::gc_roots::pin_root(w_stopiter);
     }
     let rt = w_exception_new(ExcKind::RuntimeError, message);
+    let w_stopiter = if w_stopiter.is_null() {
+        w_stopiter
+    } else {
+        pyre_object::gc_roots::shadow_stack_get(stop_slot)
+    };
     if pyre_object::is_exception(rt) && !w_stopiter.is_null() {
         w_exception_set_context(rt, w_stopiter);
         w_exception_set_cause(rt, w_stopiter);
