@@ -385,14 +385,15 @@ fn run_startup_file(
         );
     }
     // The script and `-c` paths compile through `compile_with_codegen_warnings`
-    // so an invalid escape is a SyntaxWarning; the filename bytes still name
-    // the unit the way `compile_source_named_by_bytes` does.
+    // so an invalid escape is a SyntaxWarning. The warning takes the fsdecoded
+    // spelling; the compiler's `source_path` stays a `str` and the code object
+    // is renamed afterwards the way `compile_source_named_by_bytes` does.
     let (source_path, filename_bytes) =
         pyre_interpreter::split_code_filename_bytes(filename_bytes, None);
     let compiled = pyre_interpreter::syntax_warnings::compile_with_codegen_warnings(
         &source,
         Mode::Exec,
-        &source_path,
+        &display,
         CompileOpts {
             optimize: importing::optimize_flag(),
             debug_ranges: importing::code_debug_ranges_flag(),

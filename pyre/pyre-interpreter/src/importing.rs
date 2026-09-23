@@ -4218,7 +4218,7 @@ fn parse_source_module(
     crate::syntax_warnings::compile_with_codegen_warnings(
         source,
         Mode::Exec,
-        pathname,
+        rustpython_wtf8::Wtf8::new(pathname),
         CompileOpts {
             optimize: optimize_flag(),
             debug_ranges: code_debug_ranges_flag(),

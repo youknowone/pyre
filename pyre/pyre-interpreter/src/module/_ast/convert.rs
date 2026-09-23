@@ -265,7 +265,7 @@ pub fn compile_object(
         module,
         source_file,
         &text,
-        filename,
+        rustpython_wtf8::Wtf8::new(filename),
         mode,
         opts,
     )

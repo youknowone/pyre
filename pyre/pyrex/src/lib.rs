@@ -2621,7 +2621,7 @@ fn eval_program_in_main(
             let code = match pyre_interpreter::syntax_warnings::compile_with_codegen_warnings(
                 &text,
                 mode,
-                filename,
+                rustpython_wtf8::Wtf8::new(filename),
                 CompileOpts {
                     optimize: importing::optimize_flag(),
                     debug_ranges: importing::code_debug_ranges_flag(),
