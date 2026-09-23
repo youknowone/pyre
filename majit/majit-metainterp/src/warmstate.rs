@@ -1361,6 +1361,34 @@ impl WarmEnterState {
         None
     }
 
+    /// Give a lone comparekey-less `JC_TEMPORARY` cell this key's comparekey.
+    ///
+    /// `get_assembler_token` files that cell through `ensure_cell_by_key`, so
+    /// `comparekey_matches` refuses it. `maybe_compile_and_run` still hands
+    /// the found cell to `bound_reached`; without this stamp
+    /// `ensure_cell_for_key` installs another cell in the same bucket.
+    /// A chain, a different bucket in the same table slot, or a cell that
+    /// already stores a comparekey is left alone — those are not the cell
+    /// the empty-chain door found.
+    fn reuse_lone_temporary_cell(&mut self, key: &GreenKey) {
+        if self.lookup_chain_with_key(key).is_some() {
+            return;
+        }
+        let hash = key.get_uhash();
+        let index = self.counter._get_index(hash);
+        let Some(cell) = self.celltable[index].as_deref_mut() else {
+            return;
+        };
+        if cell.next.is_some()
+            || cell.cell_bucket != hash
+            || cell.comparekey.is_some()
+            || !cell.flags.contains(JcFlags::JC_TEMPORARY)
+        {
+            return;
+        }
+        cell.set_comparekey(key);
+    }
+
     /// warmstate.py `WarmEnterState.bound_reached` —
     /// typed-key variant of [`Self::start_tracing_cell`].
     ///
@@ -1379,6 +1407,7 @@ impl WarmEnterState {
         self.counter.reset(hash);
         self.tracing_generation += 1;
         let current_generation = self.tracing_generation;
+        self.reuse_lone_temporary_cell(key);
         self.ensure_cell_for_key(key);
         let cell = self
             .lookup_chain_with_key_mut(key)

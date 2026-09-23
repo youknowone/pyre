@@ -12303,6 +12303,84 @@ mod tests {
         );
     }
 
+    /// `maybe_compile_and_run` calls `bound_reached(hash, cell, *args)` with
+    /// the `JC_TEMPORARY` cell it found. A non-zero `code_ptr` takes
+    /// `bound_reached`'s typed arm (`force_start_tracing_for_key`); that arm
+    /// must set `JC_TRACING` on this cell and not install a second one.
+    /// `code_ptr == 0` stays on `ensure_cell_by_key` and cannot show the split.
+    #[test]
+    fn a_temporary_cell_starts_tracing_on_the_found_cell() {
+        // `WarmEnterState::new` installs the Ref hash resolver. Hash the
+        // portal greens after that, or the key will not match the one
+        // `with_typed_decision_key` rebuilds.
+        let mut driver = JitDriver::<CountingDoorState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let target_pc = 7usize;
+        let code_ptr = 0x1234usize;
+        let key = GreenKey::with_types(
+            vec![target_pc as i64, 0, code_ptr as i64],
+            vec![Type::Int, Type::Int, Type::Ref],
+        );
+        let green_key = majit_ir::pypyjit_greenkey_uhash(target_pc, false, code_ptr as u64);
+        assert_eq!(green_key, key.get_uhash());
+        attach_tmp_callback_cell(&mut driver, green_key);
+
+        let token_number = {
+            let cell = driver
+                .meta
+                .warm_state
+                .lookup_chain(green_key)
+                .expect("the temporary callback installed one cell");
+            assert!(cell.next.is_none(), "the fast path only owns a lone cell");
+            assert_eq!(cell.cell_bucket, green_key);
+            assert!(cell.comparekey.is_none());
+            assert!(cell.flags.contains(crate::warmstate::JcFlags::JC_TEMPORARY));
+            assert!(!cell.is_tracing());
+            cell.get_procedure_token()
+                .expect("the callback token is live")
+                .number
+        };
+        assert_eq!(driver.meta.warm_state.get_stats().num_cells, 1);
+
+        let mut state = CountingDoorState {
+            code_ptr,
+            ..Default::default()
+        };
+        assert_eq!(
+            driver.back_edge_keyed(green_key, target_pc, &mut state, &(), || {}),
+            None,
+            "the first tick must not start tracing",
+        );
+        assert!(!driver.meta.is_tracing());
+        assert_eq!(
+            driver.back_edge_keyed(green_key, target_pc, &mut state, &(), || {}),
+            Some(target_pc),
+        );
+        assert!(driver.meta.is_tracing());
+        assert_eq!(
+            driver.meta.warm_state.get_stats().num_cells,
+            1,
+            "bound_reached must mark the found cell, not install another",
+        );
+
+        let cell = driver
+            .meta
+            .warm_state
+            .lookup_chain(green_key)
+            .expect("the original cell is still the bucket");
+        assert!(cell.next.is_none());
+        assert!(cell.is_tracing());
+        assert!(cell.flags.contains(crate::warmstate::JcFlags::JC_TEMPORARY));
+        assert!(cell.comparekey_matches(&key));
+        assert_eq!(cell.cell_key, Some(green_key));
+        assert_eq!(
+            cell.get_procedure_token()
+                .expect("the callback token stays on the found cell")
+                .number,
+            token_number,
+        );
+    }
+
     /// `warmstate.py` resolves the cell by `comparekey(*greenargs)`
     /// before reading a token off it. On a chained bucket the head is a
     /// different cell, so the hash form and the typed form answer differently
