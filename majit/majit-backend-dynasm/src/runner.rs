@@ -11,6 +11,7 @@ use majit_backend::deadframe::{ExitDescr, JitFrameDeadFrame};
 use majit_backend::jitframe::{
     HostHeapGc, check_jitframe_descr, jitframe_is_gc_object, jitframe_write_barrier,
     malloc_entry_jitframe, malloc_host_jitframe, malloc_jitframe, malloc_jitframe_no_collect,
+    reuse_off_gc_jitframe,
 };
 use majit_backend::libc_deadframe::{LibcJitFrameDeadFrame, free_jitframe_chain};
 use majit_backend::{AsmInfo, Backend, BackendError, DeadFrame, JitCellToken};
@@ -308,6 +309,35 @@ fn with_gc_ll_descr<R>(f: impl FnOnce(&mut dyn majit_gc::GcAllocator) -> R) -> R
         return majit_gc::gc_sync::gc_op(|gc| f(gc));
     }
     f(&mut HostHeapGc)
+}
+
+/// Logging and dump gates, read once per process. Each flag is itself a
+/// cached env lookup; OR-ing them on every entry was five loads for a
+/// steady run where every one is false.
+#[inline]
+fn exec_diag_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        crate::majit_log_enabled()
+            || crate::majit_dump_enabled()
+            || crate::dynasm_exec_diag_enabled()
+            || majit_ir::debug::have_debug_prints()
+            || crate::gc_freelist_diag_enabled()
+    });
+    *ENABLED
+}
+
+/// Release the host frame `DoneWithThisFrameDescrInt` just finished.
+///
+/// A single frame with nothing forwarded is parked on the token
+/// (`llmodel.py execute_token` does not free). A chain, or a slot that
+/// already holds a frame, is freed: those blocks are still referenced
+/// or are a second live frame.
+fn release_done_int_frame(token: &JitCellToken, ran: &RanFrame) {
+    let single = ran.tip == ran.head && unsafe { (*ran.head).jf_forward.is_null() };
+    if single && token.park_entry_frame(ran.head) {
+        return;
+    }
+    unsafe { free_jitframe_chain(ran.head) };
 }
 
 type EntryArgRoots = smallvec::SmallVec<[majit_gc::shadow_stack::OwnerRootGuard; 4]>;
@@ -2528,11 +2558,7 @@ impl DynasmBackend {
     /// compiled buffer is only for the debug dumps, which are off on a
     /// steady run.
     fn run_compiled_frame(&self, token: &JitCellToken, args: &[Value]) -> RanFrame {
-        let diag = crate::majit_log_enabled()
-            || crate::majit_dump_enabled()
-            || crate::dynasm_exec_diag_enabled()
-            || majit_ir::debug::have_debug_prints()
-            || crate::gc_freelist_diag_enabled();
+        let diag = exec_diag_enabled();
         let compiled = diag.then(|| Self::get_compiled(token));
         let entry = match compiled {
             Some(code) => code.entry_ptr(),
@@ -2572,10 +2598,15 @@ impl DynasmBackend {
         );
         let frame_bytes = JitFrame::alloc_size(num_slots);
         // No collector: `malloc_jitframe` is a host block and the input refs
-        // are not forwarded. Skip the empty root vector.
+        // are not forwarded. Skip the empty root vector. The steady
+        // finish-with-an-int case reuses the token's parked frame
+        // (`llmodel.py execute_token` bump) instead of a TLS free list.
         let (jf_ptr, gc_object, arg_roots) = if majit_gc::collector_installed() {
             let (ptr, gc_object, roots) = alloc_entry_jitframe(frame_bytes, args);
             (ptr, gc_object, Some(roots))
+        } else if let Some(ptr) = token.take_entry_frame(frame_bytes) {
+            unsafe { reuse_off_gc_jitframe(ptr) };
+            (ptr, false, None)
         } else {
             (malloc_host_jitframe(frame_bytes), false, None)
         };
@@ -2603,7 +2634,9 @@ impl DynasmBackend {
         // slots through compiled execution would add them to every GC scan.
         drop(arg_roots);
 
-        if majit_ir::debug::have_debug_prints() {
+        // Each flag is folded into `diag`. A steady run takes the one
+        // false test and does not call into the loggers.
+        if diag && majit_ir::debug::have_debug_prints() {
             let _s = majit_ir::debug::scope("jit-running");
             for (i, arg) in args.iter().enumerate() {
                 let raw = unsafe {
@@ -2621,7 +2654,7 @@ impl DynasmBackend {
             ));
         }
 
-        if crate::majit_dump_enabled() {
+        if diag && crate::majit_dump_enabled() {
             // Independent debug toggle — MAJIT_DUMP must produce output
             // regardless of whether MAJIT_LOG is set, so emit via plain
             // eprintln (debug_print would silently no-op without
@@ -2651,7 +2684,7 @@ impl DynasmBackend {
         }
 
         // Debug: verify bridge patches are visible
-        if crate::majit_log_enabled() {
+        if diag && crate::majit_log_enabled() {
             for descr in compiled.unwrap().fail_descrs.iter() {
                 if let Some(fd) = descr.as_fail_descr() {
                     let bridge_addr =
@@ -2676,7 +2709,7 @@ impl DynasmBackend {
         // manual push_jf/pop_jf_to around the call.
         let func: unsafe extern "C" fn(*mut JitFrame, *const i64) -> *mut JitFrame =
             unsafe { std::mem::transmute(entry) };
-        if crate::dynasm_exec_diag_enabled() {
+        if diag && crate::dynasm_exec_diag_enabled() {
             let compiled = compiled.unwrap();
             eprintln!(
                 "[dynasm-exec] trace={} header={} entry={entry:p} len={} args={args:?}",
@@ -2685,17 +2718,17 @@ impl DynasmBackend {
                 compiled.buffer.len(),
             );
         }
-        if crate::gc_freelist_diag_enabled() {
+        if diag && crate::gc_freelist_diag_enabled() {
             let trace_id = compiled.unwrap().trace_id;
             debug_validate_oldgen_freeblocks(format_args!("before trace {trace_id}"));
         }
         let result_jf = unsafe { func(jf_ptr, crate::jit_threadlocalref_base()) };
-        if crate::gc_freelist_diag_enabled() {
+        if diag && crate::gc_freelist_diag_enabled() {
             let trace_id = compiled.unwrap().trace_id;
             debug_validate_oldgen_freeblocks(format_args!("after trace {trace_id}"));
         }
 
-        if crate::majit_log_enabled() {
+        if diag && crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm] execute_token returned: result_jf={:?} (expected={:?}) same={}",
                 result_jf,
@@ -3289,12 +3322,14 @@ impl Backend for DynasmBackend {
             let descr_raw = unsafe { crate::llmodel::get_latest_descr(ran.tip) };
             if self.finish_is_done_int(descr_raw) {
                 // `DoneWithThisFrameDescrInt.get_result` →
-                // `get_int_value(deadframe, 0)`. Empty `rd_locs` is slot 0,
-                // where `genop_finish` stored the word; a stamped table wins.
-                let descr = unsafe { ExitDescr::from_cell(descr_raw) };
-                let value =
-                    unsafe { crate::llmodel::get_int_value(ran.tip, descr.as_fail_descr(), 0) };
-                unsafe { free_jitframe_chain(ran.head) };
+                // `get_int_value(deadframe, 0)`. That descr's `rd_locs` stays
+                // empty (`set_rd_locs` is resume-guard only), so the word
+                // `genop_finish` stored is `jf_frame[0]`.
+                let value = unsafe {
+                    let tip = JitFrame::resolve(ran.tip);
+                    crate::llmodel::get_int_value_direct(tip, 0) as i64
+                };
+                release_done_int_frame(token, &ran);
                 return Ok(value);
             }
         }

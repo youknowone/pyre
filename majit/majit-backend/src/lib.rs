@@ -1529,6 +1529,14 @@ pub struct JitCellToken {
     /// the F.6 retirement plan — the per-target descr identity is the
     /// part PyPy parity care about for `has_compiled_targets`.
     pub target_tokens: parking_lot::Mutex<Vec<majit_ir::DescrRef>>,
+    /// One off-GC frame parked after `DoneWithThisFrameDescrInt`.
+    ///
+    /// `llmodel.py execute_token` bump-allocates out of the nursery and never
+    /// frees. With no collector the frame is a host block; the steady
+    /// finish-with-an-int entry takes this slot instead of a thread-local
+    /// free list. A frame a deadframe or a guard-failure resume still names
+    /// is not stored here, so it cannot be handed out again.
+    entry_frame: AtomicPtr<crate::jitframe::JitFrame>,
 }
 
 impl JitCellToken {
@@ -1605,7 +1613,65 @@ impl JitCellToken {
             // empty-Vec equivalent so `has_target_tokens` is one
             // `is_empty()` check away.
             target_tokens: parking_lot::Mutex::new(Vec::new()),
+            entry_frame: AtomicPtr::new(std::ptr::null_mut()),
         }
+    }
+
+    /// Take the parked off-GC frame when it is at least `size_bytes`.
+    ///
+    /// `None` allocates. A block that is too small is released here so the
+    /// next finish can park the larger one. The slot is empty after this
+    /// returns until [`Self::park_entry_frame`].
+    pub fn take_entry_frame(&self, size_bytes: usize) -> Option<*mut crate::jitframe::JitFrame> {
+        let frame = self
+            .entry_frame
+            .swap(std::ptr::null_mut(), Ordering::Acquire);
+        if frame.is_null() {
+            return None;
+        }
+        // Caller has already established that no collector is installed.
+        // A parked frame is an unregistered host block; handing it out
+        // under a collector would skip `register_libc_jitframe`.
+        let usable = unsafe { crate::jitframe::off_gc_payload_size(frame) } >= size_bytes;
+        if !usable {
+            unsafe { crate::jitframe::free_off_gc_jitframe(frame) };
+            return None;
+        }
+        #[cfg(debug_assertions)]
+        {
+            majit_gc::shadow_stack::note_unregistered_host_jitframe();
+            if majit_gc::collector_installed() {
+                majit_gc::shadow_stack::register_libc_jitframe(frame as usize);
+                majit_gc::shadow_stack::release_unregistered_host_jitframe();
+            }
+        }
+        Some(frame)
+    }
+
+    /// Park `frame` for the next finish-with-an-int entry on this token.
+    ///
+    /// `false` means the slot is already occupied; the caller still owns
+    /// `frame` and must release it. A frame that is still referenced is
+    /// simply not passed here.
+    ///
+    /// The parked block is idle, so the host-frame note taken by
+    /// `malloc_host_jitframe` is dropped here — the same release
+    /// `free_jitframe_chain` does before a block may be reused.
+    pub fn park_entry_frame(&self, frame: *mut crate::jitframe::JitFrame) -> bool {
+        let parked = self
+            .entry_frame
+            .compare_exchange(
+                std::ptr::null_mut(),
+                frame,
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
+            .is_ok();
+        if parked {
+            #[cfg(debug_assertions)]
+            crate::jitframe::release_malloc_host_jitframe(frame);
+        }
+        parked
     }
 
     /// Clone the current `compiled_loop_token` handle out of its `Mutex`.
@@ -2049,6 +2115,13 @@ impl majit_ir::QuasiImmutLoopToken for LoopInvalidation {
 
 impl Drop for JitCellToken {
     fn drop(&mut self) {
+        let parked = self
+            .entry_frame
+            .swap(std::ptr::null_mut(), Ordering::Acquire);
+        if !parked.is_null() {
+            // `park_entry_frame` already dropped the host-frame note.
+            unsafe { crate::jitframe::free_off_gc_jitframe(parked) };
+        }
         // `model.CompiledLoopToken` owns both invalidate_positions and the
         // code they name. Our thread-safe registry projection shares only the
         // former; detach it before Rust drops compiled/asmmemmgr_blocks.
