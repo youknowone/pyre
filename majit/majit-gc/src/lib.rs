@@ -1899,24 +1899,24 @@ pub trait GcRewriter: Send {
     /// `self.newops` — no `Op` clone at the backend boundary.
     fn rewrite_for_gc(&self, ops: &[OpRc]) -> Vec<OpRc>;
     /// Rewrite with access to the constant pool.
-    /// Returns (rewritten ops, merged constants, gc_table gcrefs). Each
-    /// `Const` box carries its own type via `Const::get_type`, so a separate
-    /// type side-table is no longer threaded through the return. The third
-    /// element is the per-loop reference-constant list collected by
-    /// `remove_constptr` (rewrite.py `gcrefs_output_list`); the
-    /// backend builds a `GcTable` from it and bakes its base address into the
-    /// `LoadFromGcTable` loads.
+    /// Returns (rewritten ops, gc_table gcrefs). Each `Const` box carries
+    /// its own type via `Const::get_type`. The gcrefs list is the per-loop
+    /// reference-constant list collected by `remove_constptr`
+    /// (`GcRewriterAssembler.rewrite`'s `gcrefs_output_list`); the backend
+    /// builds a `GcTable` from it and bakes its base address into the
+    /// `LoadFromGcTable` loads. The caller's pool is not returned: the
+    /// rewrite only reads it.
     ///
-    /// The default impl forwards to `rewrite_for_gc` and preserves the
-    /// caller's constants verbatim. `rewrite_for_gc` may leave `Const*`
-    /// operands untouched, so returning an empty map would silently strand
-    /// downstream readers that resolve `ConstInt.raw()` against this table.
+    /// The pool is borrowed. `GcRewriterAssembler.rewrite` does not copy
+    /// one, and `resolve_constant` only reads it, so the caller's map is
+    /// left in place.
     fn rewrite_for_gc_with_constants(
         &self,
         ops: &[OpRc],
         constants: &ConstMap<Const>,
-    ) -> (Vec<OpRc>, ConstMap<Const>, Vec<GcRef>) {
-        (self.rewrite_for_gc(ops), constants.clone(), Vec::new())
+    ) -> (Vec<OpRc>, Vec<GcRef>) {
+        let _ = constants;
+        (self.rewrite_for_gc(ops), Vec::new())
     }
 }
 

@@ -2189,19 +2189,10 @@ impl DynasmBackend {
         {
             let rewriter = self.gc_rewriter();
             use majit_gc::GcRewriter;
-            // The rewriter takes the typed `Const` pool directly; each box
-            // variant carries its own type (`Const::get_type`).
-            let (result, new_constants, gcrefs) =
-                rewriter.rewrite_for_gc_with_constants(ops, &self.constants);
-            // `new_constants` is the full typed pool: the rewriter clones the
-            // current pool and only appends fresh ConstInts (size/offset/
-            // helper-address keys minted above the existing max index — see
-            // `next_const_idx` seeding in `with_constants`), never overwriting
-            // a pre-existing key, so a move-replace is equivalent to re-merging
-            // every key. The old `entry`/`or_insert` merge rescanned the whole
-            // Vec-backed pool per fresh key (O(n^2), quadratic on large
-            // traces).
-            self.constants = new_constants;
+            // `GcRewriterAssembler.rewrite` does not copy a constant pool.
+            // `RewriteState::resolve_constant` only reads it, so the
+            // backend's map stays put.
+            let (result, gcrefs) = rewriter.rewrite_for_gc_with_constants(ops, &self.constants);
             (result, gcrefs)
         }
     }
