@@ -10,9 +10,9 @@
 # N cannot be raised to clear `FLOOR_GATE_MIN_BASELINE_S`: generator resume
 # has no merge point (`caro_no_merge_entry`), so gouter/ginner stay
 # interpreted and the true ratio is ~100x.  Lengthening only makes that
-# honest.  20000 is the original size; the 20x ceiling is the compiled
-# `run()` loop's budget, not the residual generator path.
-N = 20000
+# honest.  40000 is twice the original size, so pypy's execution clears the
+# 0.00s reading; the 20x ceiling is the compiled `run()` loop's budget.
+N = 40000
 
 
 class Shared:
