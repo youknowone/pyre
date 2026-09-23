@@ -3444,7 +3444,7 @@ pub fn install_default_builtins(ns: PyObjectRef) {
         "BaseException",
         Some("Common base class for all exceptions"),
         exc_base_exception_new,
-        Some(exc_base_exception_init),
+        Some(__majit_wrap_base_exception_descr_init),
         crate::typedef::w_object(),
     );
     crate::module_ns_store(ns, "BaseException", base_exc);
@@ -3547,7 +3547,7 @@ pub fn install_default_builtins(ns: PyObjectRef) {
     let value_error = make_exc_type_with_doc(
         "ValueError",
         "Inappropriate argument value (of correct type).",
-        exc_value_error_new,
+        __majit_wrap_exc_value_error_descr_new,
         exception,
     );
     crate::module_ns_store(ns, "ValueError", value_error);
@@ -7269,6 +7269,145 @@ exc_constructor!(
 /// arguments".  pyre's flat builtin ABI has no signature to enforce that,
 /// so the keyword dict is policed here directly; the type name comes from
 /// `self`, matching `_PyArg_NoKeywords(Py_TYPE(self)->tp_name, kwds)`.
+/// `BaseException.__init__`.  `ValueError(x)` is `[self, x]`.  That arm
+/// stores `args` without the kwargs dict walk, so the traced call is one
+/// cannot-raise residual.  Keywords and any other arity stay in
+/// [`exc_base_exception_init`].
+pub fn __majit_wrap_base_exception_descr_init(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() == 2 && !args[0].is_null() {
+        exc_init_one_positional(args[0], args[1]);
+        return Ok(pyre_object::w_none());
+    }
+    let slot = |i: usize| args.get(i).copied().unwrap_or(pyre_object::PY_NULL);
+    exc_base_exception_init_slow(
+        slot(0),
+        slot(1),
+        slot(2),
+        slot(3),
+        slot(4),
+        slot(5),
+        args.len() as i64,
+    )
+}
+
+/// Word ABI for the same reason as `dict_get_slow`: the traced wrapper
+/// cannot pass the args slice through.
+#[majit_macros::dont_look_inside]
+fn exc_base_exception_init_slow(
+    a0: PyObjectRef,
+    a1: PyObjectRef,
+    a2: PyObjectRef,
+    a3: PyObjectRef,
+    a4: PyObjectRef,
+    a5: PyObjectRef,
+    n: i64,
+) -> Result<PyObjectRef, crate::PyError> {
+    let buf = [a0, a1, a2, a3, a4, a5];
+    let n = n.clamp(0, buf.len() as i64) as usize;
+    exc_base_exception_init(&buf[..n])
+}
+
+#[majit_macros::dont_look_inside_cannot_raise]
+fn exc_init_one_positional(w_self: PyObjectRef, arg: PyObjectRef) {
+    if exception_args_already(w_self, &[arg]) {
+        return;
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_self);
+    let arg_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(arg);
+    let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![
+        pyre_object::gc_roots::shadow_stack_get(arg_slot),
+    ]);
+    unsafe {
+        pyre_object::interp_exceptions::w_exception_set_args(
+            pyre_object::gc_roots::shadow_stack_get(self_slot),
+            args_list,
+        );
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_wrap_base_exception_descr_init_target: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(
+            module_path!(),
+            "::",
+            "__majit_wrap_base_exception_descr_init"
+        ),
+        func: __majit_wrap_base_exception_descr_init,
+    };
+
+/// `ValueError(x)` — one positional.  The general `exc_value_error_new`
+/// graph has no jitcode of its own, so `ValueError(...)` declined with
+/// `no jitcode for address`.
+pub fn __majit_wrap_exc_value_error_descr_new(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() == 2 && !args[0].is_null() {
+        return Ok(value_error_one_arg(args[0], args[1]));
+    }
+    let slot = |i: usize| args.get(i).copied().unwrap_or(pyre_object::PY_NULL);
+    exc_value_error_new_slow(slot(0), slot(1), slot(2), slot(3), args.len() as i64)
+}
+
+#[majit_macros::dont_look_inside]
+fn exc_value_error_new_slow(
+    a0: PyObjectRef,
+    a1: PyObjectRef,
+    a2: PyObjectRef,
+    a3: PyObjectRef,
+    n: i64,
+) -> Result<PyObjectRef, crate::PyError> {
+    let buf = [a0, a1, a2, a3];
+    let n = n.clamp(0, buf.len() as i64) as usize;
+    exc_value_error_new(&buf[..n])
+}
+
+#[majit_macros::dont_look_inside_cannot_raise]
+fn value_error_one_arg(cls: PyObjectRef, arg: PyObjectRef) -> PyObjectRef {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let arg_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(arg);
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(cls);
+    let exc = unsafe {
+        pyre_object::interp_exceptions::w_exception_new_empty_for_class(
+            pyre_object::interp_exceptions::ExcKind::ValueError,
+            pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        )
+    };
+    let exc = crate::typedef::tag_subclass_instance(
+        exc,
+        pyre_object::gc_roots::shadow_stack_get(cls_slot),
+    );
+    let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![
+        pyre_object::gc_roots::shadow_stack_get(arg_slot),
+    ]);
+    unsafe {
+        pyre_object::interp_exceptions::w_exception_set_args(exc, args_list);
+    }
+    exc
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_wrap_exc_value_error_descr_new_target: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(
+            module_path!(),
+            "::",
+            "__majit_wrap_exc_value_error_descr_new"
+        ),
+        func: __majit_wrap_exc_value_error_descr_new,
+    };
+
 fn exc_base_exception_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let w_self = *args.first().ok_or_else(|| {
         crate::PyError::type_error("__init__() missing 1 required positional argument: 'self'")

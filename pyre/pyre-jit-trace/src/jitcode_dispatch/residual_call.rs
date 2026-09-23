@@ -3356,6 +3356,33 @@ fn residual_callable_has_closure_or_cells<Sym: WalkSym>(
     }
 }
 
+/// `dont_look_inside_cannot_raise` helpers whose descr stays
+/// `EF_RANDOM_EFFECTS`. Recording the call inside a transparent helper
+/// is sound: they do not call Python, so `GUARD_NOT_FORCED` does not fail.
+fn records_inside_transparent_helper(addr: i64) -> bool {
+    if addr <= 0 {
+        return false;
+    }
+    pyre_interpreter::jit_trace_fnaddrs()
+        .iter()
+        .any(|(path, registered)| *registered == addr && transparent_helper_recordable_leaf(path))
+}
+
+fn transparent_helper_recordable_leaf(path: &str) -> bool {
+    path.rsplit("::").next().is_some_and(|leaf| {
+        let leaf = leaf.strip_prefix("__majit_call_target_").unwrap_or(leaf);
+        matches!(
+            leaf,
+            "tuple_from_exact_list"
+                | "dict_get_plain"
+                | "dict_get_plain_applies"
+                | "exc_init_one_positional"
+                | "value_error_one_arg"
+                | "extend_from_frame_locals_proxy"
+        )
+    })
+}
+
 /// The symbolic decline, minted in one place so it carries provenance.
 ///
 /// Ten preconditions inside [`try_execute_residual_call_via_executor`] end in
@@ -3461,7 +3488,15 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // A real funcptr reached here, so there is no hash to carry, and
             // zero is what this variant spells for that.
             Some(("abi-unsound-arg", addr, 0))
-        } else if ctx.fbw_mode.transparent_helper_subwalk && call_opcode.is_call_may_force() {
+        } else if ctx.fbw_mode.transparent_helper_subwalk
+            && call_opcode.is_call_may_force()
+            && !records_inside_transparent_helper(addr)
+        {
+            // These helpers are `dont_look_inside_cannot_raise`. Their
+            // call descr is still `EF_RANDOM_EFFECTS` because the graph
+            // is top, so the opcode is may-force. They do not call back
+            // into Python, so the guard the comment above is about does
+            // not fail and the call can be recorded.
             Some(("may-force-in-transparent-helper", addr, 0))
         } else {
             None
