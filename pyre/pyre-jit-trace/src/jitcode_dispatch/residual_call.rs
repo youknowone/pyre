@@ -2249,7 +2249,12 @@ fn record_escape_flush_image(frame: usize) {
         if undo.frame != frame {
             return;
         }
-        let pf = unsafe { &*(frame as *const pyre_interpreter::PyFrame) };
+        // The flush boxes Int/Float locals, and a minor collection there
+        // moves a nursery-resident frame; read the image from where the
+        // frame lives now, as `restore_escape_flush_undo` does.
+        let frame_now =
+            pyre_object::gc_hook::try_gc_current_object_address(frame as *mut u8) as usize;
+        let pf = unsafe { &*(frame_now as *const pyre_interpreter::PyFrame) };
         undo.flush_image = locals_w!(pf).as_slice().to_vec();
     });
 }

@@ -7513,6 +7513,45 @@ impl CodeWriter {
             }};
         }
 
+        // Unbound-local raise shared by `LOAD_FAST_CHECK` (`pyopcode.py`
+        // `_load_fast_failed`) and both `DELETE_FAST` arms. `last_instr`
+        // stays at the failing opcode so exception unwind and deopt share
+        // its frame coordinate.
+        macro_rules! emit_unbound_local_raise {
+            ($idx:expr, $py_pc:expr) => {{
+                let py_pc: usize = $py_pc;
+                let v_li: super::flow::FlowValue =
+                    super::flow::Constant::signed(py_pc as i64 - 1).into();
+                record_graph_op(
+                    &current_block.block(),
+                    "setfield_vable_i",
+                    vable_setfield_int_graph_args(
+                        frame_var.into(),
+                        v_li.into(),
+                        VABLE_LAST_INSTR_FIELD_IDX,
+                    ),
+                    None,
+                    py_pc as i64,
+                );
+                let code_const: super::flow::FlowValue = super::flow::Constant::new(
+                    super::flow::ConstantValue::Signed(w_code as i64),
+                    Some(Kind::Ref),
+                )
+                .into();
+                let name_idx_const: super::flow::FlowValue =
+                    super::flow::Constant::signed($idx as i64).into();
+                let exc_value = emit_graph_op_with_result(
+                    &mut graph,
+                    &current_block.block(),
+                    "unbound_local_error",
+                    vec![code_const.into(), name_idx_const.into()],
+                    Kind::Ref,
+                    py_pc as i64,
+                );
+                emit_raise!(0u16, exc_value.into(), py_pc as i64, true);
+            }};
+        }
+
         // RPython parity:
         // `flatten.py` emits the zero-arg `self.emitline("reraise")` for
         // the re-raise edge; `assembler.py:220` turns it into
@@ -13224,43 +13263,11 @@ impl CodeWriter {
                                 );
 
                                 // `pyopcode.py` `_load_fast_failed` raises
-                                // before any push. Keep `last_instr` at this
-                                // opcode so unwind and deopt share its frame
-                                // coordinate, matching `DELETE_FAST`.
+                                // before any push.
                                 current_block = unbound_block;
                                 current_state = unbound_state;
                                 current_depth = arm_depth;
-                                let v_li: super::flow::FlowValue =
-                                    super::flow::Constant::signed(py_pc as i64 - 1).into();
-                                record_graph_op(
-                                    &current_block.block(),
-                                    "setfield_vable_i",
-                                    vable_setfield_int_graph_args(
-                                        frame_var.into(),
-                                        v_li.into(),
-                                        VABLE_LAST_INSTR_FIELD_IDX,
-                                    ),
-                                    None,
-                                    py_pc as i64,
-                                );
-                                let code_const: super::flow::FlowValue =
-                                    super::flow::Constant::new(
-                                        super::flow::ConstantValue::Signed(w_code as i64),
-                                        Some(Kind::Ref),
-                                    )
-                                    .into();
-                                let name_idx_const: super::flow::FlowValue =
-                                    super::flow::Constant::signed(idx as i64).into();
-                                let exc_value = emit_graph_op_with_result(
-                                    &mut graph,
-                                    &current_block.block(),
-                                    "unbound_local_error",
-                                    vec![code_const.into(), name_idx_const.into()],
-                                    Kind::Ref,
-                                    py_pc as i64,
-                                );
-                                let exc_flow: super::flow::FlowValue = exc_value.into();
-                                emit_raise!(0u16, exc_flow, py_pc as i64, true);
+                                emit_unbound_local_raise!(idx, py_pc);
                                 needs_fallthrough = false;
                             } else {
                                 let code_const: super::flow::FlowValue =
@@ -13595,13 +13602,6 @@ impl CodeWriter {
                             let local_slot = local_to_vable_slot(idx) as i64;
                             let v_idx: super::flow::FlowValue =
                                 super::flow::Constant::signed(local_slot).into();
-                            let code_const: super::flow::FlowValue = super::flow::Constant::new(
-                                super::flow::ConstantValue::Signed(w_code as i64),
-                                Some(Kind::Ref),
-                            )
-                            .into();
-                            let name_idx_const: super::flow::FlowValue =
-                                super::flow::Constant::signed(idx as i64).into();
                             // pyopcode.py DELETE_FAST checks for an
                             // unbound local before clearing its slot. A
                             // statically unbound slot therefore raises
@@ -13611,29 +13611,7 @@ impl CodeWriter {
                                 Some(super::flow::FlowValue::Constant(c))
                                     if c.value == super::flow::ConstantValue::None
                             ) {
-                                let v_li: super::flow::FlowValue =
-                                    super::flow::Constant::signed(py_pc as i64 - 1).into();
-                                record_graph_op(
-                                    &current_block.block(),
-                                    "setfield_vable_i",
-                                    vable_setfield_int_graph_args(
-                                        frame_var.into(),
-                                        v_li.into(),
-                                        VABLE_LAST_INSTR_FIELD_IDX,
-                                    ),
-                                    None,
-                                    py_pc as i64,
-                                );
-                                let exc_value = emit_graph_op_with_result(
-                                    &mut graph,
-                                    &current_block.block(),
-                                    "unbound_local_error",
-                                    vec![code_const.into(), name_idx_const.into()],
-                                    Kind::Ref,
-                                    py_pc as i64,
-                                );
-                                let exc_flow: super::flow::FlowValue = exc_value.into();
-                                emit_raise!(0u16, exc_flow, py_pc as i64, true);
+                                emit_unbound_local_raise!(idx, py_pc);
                                 continue;
                             }
                             // The dynamic bound check below splits the
@@ -13682,35 +13660,10 @@ impl CodeWriter {
                             set_last_bool_exitcase(&current_block.block(), false);
 
                             // The unbound arm raises before any clear,
-                            // matching pyopcode.py DELETE_FAST. Keep
-                            // last_instr at the deleting instruction so
-                            // exception unwind and deopt share its frame
-                            // coordinate.
+                            // matching pyopcode.py DELETE_FAST.
                             current_block = unbound_block;
                             current_state = unbound_state;
-                            let v_li: super::flow::FlowValue =
-                                super::flow::Constant::signed(py_pc as i64 - 1).into();
-                            record_graph_op(
-                                &current_block.block(),
-                                "setfield_vable_i",
-                                vable_setfield_int_graph_args(
-                                    frame_var.into(),
-                                    v_li.into(),
-                                    VABLE_LAST_INSTR_FIELD_IDX,
-                                ),
-                                None,
-                                py_pc as i64,
-                            );
-                            let exc_value = emit_graph_op_with_result(
-                                &mut graph,
-                                &current_block.block(),
-                                "unbound_local_error",
-                                vec![code_const.into(), name_idx_const.into()],
-                                Kind::Ref,
-                                py_pc as i64,
-                            );
-                            let exc_flow: super::flow::FlowValue = exc_value.into();
-                            emit_raise!(0u16, exc_flow, py_pc as i64, true);
+                            emit_unbound_local_raise!(idx, py_pc);
 
                             // The bound arm is the continuing block. The
                             // clear is one PY_NULL write, matching
