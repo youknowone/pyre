@@ -819,7 +819,9 @@ fn bh_alloc_struct(sizedescr: &majit_translate::jitcode::BhDescr) -> *mut libc::
     // `do_malloc_fixedsize_clear`; NULL is its OOM result and is converted to
     // `MemoryError` by blackhole.py `_get_method`.  Falling through to a raw
     // block for a typed descr loses the GC header and tracing layout.
-    if type_id != 0 && !sizedescr.is_headerless() {
+    // A process with no collector (grain) has no header to lose: the blackhole
+    // still has to run the `new` and continue to the next `jit_merge_point`.
+    if type_id != 0 && !sizedescr.is_headerless() && majit_gc::gc_sync::is_initialized() {
         return std::ptr::null_mut();
     }
     let ptr = unsafe { libc::malloc(size) };
