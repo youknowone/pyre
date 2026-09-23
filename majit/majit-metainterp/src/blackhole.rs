@@ -10098,9 +10098,8 @@ fn debug_assert_constant_slot_untouched(index: usize, num_regs: usize, who: &str
 }
 
 /// Rewrite a `symbolic_fnaddr_for_path` hash the host published for
-/// blackhole-only execute. The walker must still see the hash so it can
-/// fold (`try_record_newbool_singleton`); resume has no fold and needs
-/// the real address.
+/// blackhole-only execute. An address that stays unresolved is not a
+/// callable.
 fn require_callable_fnaddr(bh: &mut BlackholeInterpreter, func: i64) -> Result<i64, DispatchError> {
     if is_callable_fnaddr(func) {
         return Ok(func);
