@@ -872,6 +872,48 @@ pub(crate) fn is_generic_default_path(segments: &[String]) -> bool {
     joined == "Default" || joined.starts_with("core::default") || joined.starts_with("std::default")
 }
 
+/// Supply the value of a `CTypeFlags` associated constant.
+///
+/// `bitflags!` generates each flag as `impl CTypeFlags { const NAME: Self }`
+/// whose initializer Charon records as an `Opaque` body (the impl module
+/// anonymizes to `_`), so `const_eval_global` finds no in-LLBC init.
+/// The bits are a fixed compile-time `i64` mask (`ctypeobj.rs`
+/// `CTypeFlags`). `W_CType.has(CTypeFlags::SIGNED_WCHAR)` is then the
+/// integer bit-and PyPy's immutable `is_signed_wchar` field reads as
+/// after promotion.
+pub(crate) fn ctype_flags_const(segments: &[String]) -> Option<OpKind> {
+    let [.., owner, impl_seg, leaf] = segments else {
+        return None;
+    };
+    if owner.as_str() != "_" || impl_seg.as_str() != "<Impl>" {
+        return None;
+    }
+    let path = segments.join("::");
+    if !path.contains("ctypeobj") {
+        return None;
+    }
+    let bits: i64 = match leaf.as_str() {
+        "PRIMITIVE_INTEGER" => 1 << 0,
+        "NONFUNC_POINTER_OR_ARRAY" => 1 << 1,
+        "ACCEPT_STR" => 1 << 2,
+        "VOID_PTR" => 1 << 3,
+        "VOIDCHAR_PTR" => 1 << 4,
+        "ONEBYTE_PTR" => 1 << 5,
+        "FILE_PTR" => 1 << 6,
+        "VALUE_FITS_LONG" => 1 << 7,
+        "VALUE_SMALLER_THAN_LONG" => 1 << 8,
+        "VALUE_FITS_ULONG" => 1 << 9,
+        "SIGNED_WCHAR" => 1 << 10,
+        "ELLIPSIS" => 1 << 11,
+        "ENUM" => 1 << 12,
+        "CUSTOM_FIELD_POS" => 1 << 13,
+        "WITH_VAR_ARRAY" => 1 << 14,
+        "WITH_PACKED_CHANGE" => 1 << 15,
+        _ => return None,
+    };
+    Some(OpKind::ConstInt(bits))
+}
+
 /// `try_gc_write_barrier` / `try_gc_write_barrier_managed` — the
 /// interpreter stand-in for a raw store. `rewrite.py
 /// handle_write_barrier_setfield` emits `COND_CALL_GC_WB` on
