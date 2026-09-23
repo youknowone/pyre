@@ -11,10 +11,7 @@
 //! `_descr_dict` shape before bytecode emission.
 
 use parking_lot::Mutex;
-use std::{
-    collections::{BTreeSet, HashMap},
-    sync::LazyLock,
-};
+use std::collections::{BTreeSet, HashMap};
 
 use crate::call::{CallControl, extract_element_type_from_str};
 use crate::flatten::{FlatOp, IntOvfOp, Label, RegKind, SSARepr};
@@ -308,6 +305,7 @@ trait AssemblerEncode {
         &mut self,
         bytes: Vec<u8>,
         precomputed_hash: i64,
+        as_unicode_object: bool,
         state: &mut AssemblyState,
     ) -> u8;
 
@@ -319,6 +317,10 @@ trait AssemblerEncode {
     ) -> u8;
 
     fn emit_const_r_bits(&mut self, bits: i64, state: &mut AssemblyState) -> u8;
+
+    fn emit_type_static_or_bits(&mut self, bits: i64, state: &mut AssemblyState) -> u8;
+
+    fn emit_type_static_const_r(&mut self, name: String, state: &mut AssemblyState) -> u8;
 
     fn emit_const_f(&mut self, value: &ConstValue, state: &mut AssemblyState) -> u8;
 }
@@ -3296,10 +3298,13 @@ impl AssemblerEncode for Assembler {
         {
             return self.emit_unit_variant_const_r(qualname, tag, state);
         }
-        if let ConstValue::HostObject(obj) = value
-            && let Some(name) = type_static_const_by_addr(obj.identity_id() as i64)
-        {
-            return self.emit_type_static_const_r(name, state);
+        if let ConstValue::HostObject(obj) = value {
+            let type_name = self
+                .type_static_const_by_addr(obj.identity_id() as i64)
+                .map(str::to_string);
+            if let Some(name) = type_name {
+                return self.emit_type_static_const_r(name, state);
+            }
         }
         let bits = match value {
             // assembler.py::Assembler.emit_const casts ref constants to
@@ -3397,7 +3402,8 @@ impl AssemblerEncode for Assembler {
     /// Pool a type-static sentinel when `bits` names an interned
     /// `PyType` singleton; otherwise pool the raw bits.
     fn emit_type_static_or_bits(&mut self, bits: i64, state: &mut AssemblyState) -> u8 {
-        if let Some(name) = type_static_const_by_addr(bits) {
+        let type_name = self.type_static_const_by_addr(bits).map(str::to_string);
+        if let Some(name) = type_name {
             return self.emit_type_static_const_r(name, state);
         }
         self.emit_const_r_bits(bits, state)
@@ -3552,38 +3558,6 @@ fn type_static_const_sentinel(ordinal: usize) -> i64 {
         "too many type-static constants in one jitcode"
     );
     TYPE_STATIC_CONST_SENTINEL_BASE | ordinal as i64
-}
-
-/// Translator-local `(address, name)` rows for host `PyType` singletons.
-/// The assembler names a `constants_r` slot by `name`; the runtime
-/// load pass re-pairs that name with the live `&INT_TYPE`.
-static TYPE_STATIC_BY_ADDR: LazyLock<Mutex<Vec<(i64, String)>>> =
-    LazyLock::new(|| Mutex::new(Vec::new()));
-
-/// Record host `PyType` singleton addresses so [`emit_const_r`] can
-/// emit a named sentinel instead of a translator-local pointer.
-/// Duplicate addresses keep the first name.
-pub fn intern_type_static_addrs(rows: &[(&str, i64)]) {
-    let mut cache = TYPE_STATIC_BY_ADDR.lock();
-    for (name, addr) in rows {
-        if *addr == 0 {
-            continue;
-        }
-        if !cache.iter().any(|(existing, _)| *existing == *addr) {
-            cache.push((*addr, (*name).to_string()));
-        }
-    }
-}
-
-fn type_static_const_by_addr(addr: i64) -> Option<String> {
-    if addr == 0 {
-        return None;
-    }
-    TYPE_STATIC_BY_ADDR
-        .lock()
-        .iter()
-        .find(|(existing, _)| *existing == addr)
-        .map(|(_, name)| name.clone())
 }
 
 /// Per-assembly state (RPython: Assembler.setup() fields).
@@ -6895,9 +6869,9 @@ mod tests {
 
     #[test]
     fn emit_const_r_records_type_static_descriptor_and_dedups() {
-        intern_type_static_addrs(&[("pyobject::INT_TYPE", 0x1020_3040)]);
         let mut state = empty_state();
         let mut asm = Assembler::new();
+        asm.intern_type_static_addrs(&[("pyobject::INT_TYPE", 0x1020_3040)]);
         let reg = asm.emit_type_static_or_bits(0x1020_3040, &mut state);
         assert_eq!(state.type_static_consts.len(), 1);
         assert_eq!(state.type_static_consts[0].name, "pyobject::INT_TYPE");
