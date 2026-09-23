@@ -8158,6 +8158,17 @@ impl<'a> Lowering<'a> {
         Ok(var)
     }
 
+    /// A safe `Index` / `IndexMut` / `.len()` of a `Vec` or slice takes the
+    /// field's address (`&frame.items`). For a declared virtualizable array
+    /// that address is the array the codewriter pairs with `getarrayitem`:
+    /// clear the address mark so the field read enters `vable_array_vars`.
+    /// An address taken for any other consumer keeps the mark.
+    ///
+    /// Returns whether `base` is that declared array field.
+    fn release_declared_vable_array_address(&mut self, base: &Variable) -> bool {
+        release_declared_vable_array_address(&mut self.graph, base)
+    }
+
     /// Whether `&<place>` / `&raw [mut] <place>` takes the address of a
     /// place, as opposed to reading the value one holds.
     ///
@@ -11288,6 +11299,12 @@ impl<'a> Lowering<'a> {
                 if let Some((item_ty, array_type_id)) = index_element
                     && (workspace_index || array_type_id.is_some() || element_is_addressable)
                 {
+                    // `&frame.items[i]` is a bounds-checked index (`nolength:
+                    // false` below). When `items` is a declared virtualizable
+                    // array, the address mark would keep the field read out of
+                    // `vable_array_vars` and the index would stay a plain
+                    // `getarrayitem_gc`.
+                    self.release_declared_vable_array_address(&args[0]);
                     // A trait-associated `Index::Output` can stay a TypeVar
                     // in this call's destination even though the workspace
                     // gate has resolved the concrete receiver. In that case
@@ -12619,6 +12636,9 @@ impl<'a> Lowering<'a> {
                 // `Rvalue::Len` rewrites to `__strlen`: the view is the
                 // `W_UnicodeObject`, not a GcArray header.
                 if args.len() == 1 && self.is_slice_len(&reg) {
+                    // `.len()` of a declared virtualizable array is
+                    // `arraylen_vable`, which needs the field read unmarked.
+                    self.release_declared_vable_array_address(&args[0]);
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -12704,16 +12724,29 @@ impl<'a> Lowering<'a> {
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(res.clone()),
-                        kind: OpKind::Call {
+                    // `Vec::len` on a declared virtualizable array field is
+                    // `arraylen_vable` (`rewrite_op_getarraysize`), not a
+                    // residual `__len` that would carry the array out of the
+                    // block. The index check uses the same length.
+                    let kind = if self.release_declared_vable_array_address(&args[0]) {
+                        OpKind::ArrayLen {
+                            base: args[0].clone(),
+                            array_type_id: None,
+                            nolength: false,
+                        }
+                    } else {
+                        OpKind::Call {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["__len".to_string()],
                                 fun_decl_id: None,
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
                             result_ty: ValueType::Int,
-                        },
+                        }
+                    };
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind,
                     });
                     self.local_var[dest_local] = Some(res);
                     let target_bb = self.block_id[target];
@@ -23675,6 +23708,35 @@ fn is_builder_mode_accumulator(
         cache.builder.borrow_mut()[c] = Some(result);
     }
     result
+}
+
+/// Clear `taken_by_address` on the field read that produced `base` when that
+/// field is a declared virtualizable array. See
+/// [`Lowering::release_declared_vable_array_address`].
+pub(crate) fn release_declared_vable_array_address(
+    graph: &mut FunctionGraph,
+    base: &Variable,
+) -> bool {
+    let mut released = false;
+    for block in &mut graph.blocks {
+        for op in &mut block.operations {
+            if op.result.as_ref() != Some(base) {
+                continue;
+            }
+            let OpKind::FieldRead { field, .. } = &mut op.kind else {
+                continue;
+            };
+            if !crate::virtualizable_decl::is_declared_array_field(
+                field.owner_root.as_deref(),
+                &field.name,
+            ) {
+                continue;
+            }
+            field.taken_by_address = false;
+            released = true;
+        }
+    }
+    released
 }
 
 /// Whether a statically-resolved [`RegularCall`] is a workspace

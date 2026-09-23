@@ -7442,6 +7442,145 @@ mod tests {
         );
     }
 
+    /// Safe `Index` / `IndexMut` / `.len()` of a virtualizable `Vec<i64>`
+    /// field. The front end's address-of mark is cleared because the field is
+    /// the declared array, and the codewriter then emits the `_vable` forms.
+    /// `nolength: false` is the bounds check the index implies.
+    #[test]
+    fn vec_index_of_a_vable_array_field_lowers_to_vable_int_ops() {
+        use crate::flatten::flatten_graph;
+        use crate::front::mir::release_declared_vable_array_address;
+        use crate::jtransform::{GraphTransformConfig, Transformer, VirtualizableFieldDescriptor};
+        use crate::model::{FieldDescriptor, FunctionGraph, LinkArg, OpKind, ValueType};
+        use crate::virtualizable_decl::register_virtualizable_declarations;
+
+        register_virtualizable_declarations([("Frame".to_string(), vec!["words[*]".to_string()])]);
+        struct ClearDecl;
+        impl Drop for ClearDecl {
+            fn drop(&mut self) {
+                register_virtualizable_declarations(std::iter::empty::<(String, Vec<String>)>());
+            }
+        }
+        let _clear = ClearDecl;
+
+        let mut graph = FunctionGraph::new("vec_vable_index");
+        let frame = push_input_var(&mut graph, "frame", ValueType::Ref(None));
+        let index = push_input_var(&mut graph, "index", ValueType::Int);
+        let stored = push_input_var(&mut graph, "stored", ValueType::Int);
+        let array = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: frame.clone(),
+                    field: FieldDescriptor::new("words", Some("Frame".into()))
+                        .with_taken_by_address(true),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        assert!(
+            release_declared_vable_array_address(&mut graph, &array),
+            "the declared array field's address mark must clear"
+        );
+        let loaded = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::ArrayRead {
+                    base: array.clone(),
+                    index: index.clone(),
+                    item_ty: ValueType::Int,
+                    array_type_id: Some("[Signed]".to_string()),
+                    nolength: false,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::ArrayWrite {
+                base: array.clone(),
+                index: index.clone(),
+                value: LinkArg::Value(stored.clone()),
+                item_ty: ValueType::Int,
+                array_type_id: Some("[Signed]".to_string()),
+                nolength: false,
+            },
+            false,
+        );
+        let len = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::ArrayLen {
+                    base: array,
+                    array_type_id: None,
+                    nolength: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(loaded.clone()));
+        FunctionGraph::set_concretetype_of_inline(
+            &frame,
+            crate::codewriter::type_state::ConcreteType::GcRef,
+        );
+        for var in [&index, &stored, &loaded, &len] {
+            FunctionGraph::set_concretetype_of_inline(
+                var,
+                crate::codewriter::type_state::ConcreteType::Signed,
+            );
+        }
+
+        let config = GraphTransformConfig {
+            vable_arrays: vec![VirtualizableFieldDescriptor::new_with_arraydescr(
+                "words",
+                Some("Frame".into()),
+                0,
+                8,
+                true,
+            )],
+            ..Default::default()
+        };
+        let mut rewritten = Transformer::new(&config).transform(&graph).graph;
+        let names: Vec<String> = rewritten
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .map(|op| op_kind_to_opname(&op.kind))
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "getarrayitem_vable_i"),
+            "expected getarrayitem_vable_i, got {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name == "setarrayitem_vable_i"),
+            "expected setarrayitem_vable_i, got {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name == "arraylen_vable"),
+            "expected arraylen_vable, got {names:?}"
+        );
+
+        regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten);
+        let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
+        let mut flat = flatten_graph(&rewritten, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
+        for key in [
+            "getarrayitem_vable_i/ridd>i",
+            "setarrayitem_vable_i/riidd",
+            "arraylen_vable/rdd>i",
+        ] {
+            assert!(
+                asm.insns.contains_key(key),
+                "{key} missing, got {:?}",
+                asm.insns.keys().collect::<Vec<_>>()
+            );
+        }
+    }
+
     #[test]
     fn assemble_typed_reads_use_canonical_non_v_opnames() {
         use crate::flatten::flatten_graph;
