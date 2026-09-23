@@ -234,6 +234,10 @@ pub struct LowererConfig {
     /// `get/setarrayitem_gc_i` — never `arraylen_gc`, since the buffer
     /// carries no header length.
     pub(super) array_fields: HashMap<String, (syn::Path, Ident, syn::Path)>,
+    /// `ElementType in Header` entries, same key as `array_fields`.
+    /// The value is the header struct; element 0 is its `items` field,
+    /// and the element op is `get/setarrayitem_gc_r`.
+    pub(super) array_headers: HashMap<String, syn::Path>,
     /// Sub-word integer struct field declarations.  Key = `"StructType::field"`,
     /// value = `(rust_int_type, is_signed)`.  Source:
     /// `JitInterpConfig.int_fields`.  A field listed here registers its real
@@ -978,27 +982,44 @@ fn int_fields_map(
 /// `"StructLastSegment::field"` -> `(struct_path, field_ident, element_path)` —
 /// so the lowerer resolves an array field off a binding's `struct_type`
 /// exactly as it resolves a ref field.
+fn array_field_key(entry: &crate::jit_interp::ArrayFieldEntry) -> String {
+    let struct_name = entry
+        .struct_type
+        .segments
+        .last()
+        .map(|s| s.ident.to_string())
+        .unwrap_or_default();
+    format!("{}::{}", struct_name, entry.field)
+}
+
 fn build_array_fields_map(
     array_fields: &[crate::jit_interp::ArrayFieldEntry],
 ) -> HashMap<String, (syn::Path, Ident, syn::Path)> {
     array_fields
         .iter()
         .map(|entry| {
-            let struct_name = entry
-                .struct_type
-                .segments
-                .last()
-                .map(|s| s.ident.to_string())
-                .unwrap_or_default();
-            let key = format!("{}::{}", struct_name, entry.field);
             (
-                key,
+                array_field_key(entry),
                 (
                     entry.struct_type.clone(),
                     entry.field.clone(),
                     entry.element_type.clone(),
                 ),
             )
+        })
+        .collect()
+}
+
+fn build_array_headers_map(
+    array_fields: &[crate::jit_interp::ArrayFieldEntry],
+) -> HashMap<String, syn::Path> {
+    array_fields
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .header
+                .clone()
+                .map(|header| (array_field_key(entry), header))
         })
         .collect()
 }
@@ -1015,6 +1036,7 @@ impl LowererConfig {
         inlined_prefix: &[crate::jit_interp::InlinedPrefixEntry],
     ) -> Self {
         let array_fields_map = build_array_fields_map(array_fields);
+        let array_headers_map = build_array_headers_map(array_fields);
         let ref_fields_map: HashMap<String, (syn::Path, Ident, syn::Path)> = ref_fields
             .iter()
             .map(|entry| {
@@ -1058,6 +1080,7 @@ impl LowererConfig {
             pool_arrays: Vec::new(),
             ref_fields: ref_fields_map,
             array_fields: array_fields_map,
+            array_headers: array_headers_map,
             int_fields: int_fields_map(int_fields),
             consulted_field_keys: Default::default(),
             call_returns: HashMap::new(),
@@ -1289,6 +1312,7 @@ impl LowererConfig {
             })
             .collect();
         let array_fields_map = build_array_fields_map(array_fields);
+        let array_headers_map = build_array_headers_map(array_fields);
         // Build the ref_fields lookup: key = "StructLastSegment::field",
         // value = (struct_path, field_ident, pointee_path).
         let ref_fields_map: HashMap<String, (syn::Path, Ident, syn::Path)> = ref_fields
@@ -1353,6 +1377,7 @@ impl LowererConfig {
             residual_writes,
             ref_fields: ref_fields_map,
             array_fields: array_fields_map,
+            array_headers: array_headers_map,
             int_fields: int_fields_map(int_fields),
             consulted_field_keys: Default::default(),
             call_returns: call_returns
@@ -2195,6 +2220,64 @@ mod tests {
                 .lower_stmt(&syn::parse_quote!(state.value = 7;))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn a_ref_state_field_virtualizable_lowers_to_vable_ops() {
+        let mut config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
+        config.vable_var = Some("frame".into());
+        config.vable_input_ref_reg = Some(1);
+        config
+            .vable_fields
+            .insert("last_instr".into(), (0, ValueKind::Int));
+        config
+            .vable_fields
+            .insert("valuestackdepth".into(), (1, ValueKind::Int));
+        config
+            .vable_arrays
+            .insert("locals_stack_w".into(), (0, ValueKind::Ref));
+        config
+            .state_ref_scalars
+            .insert("frame".into(), (0, syn::parse_quote!(Frame)));
+        let mut lowerer = Lowerer::new(Some(&config));
+        lowerer.install_vable_input_binding();
+        lowerer
+            .bindings
+            .insert("depth".into(), binding(4, BindingKind::Int));
+        lowerer
+            .bindings
+            .insert("w".into(), binding(5, BindingKind::Ref));
+
+        assert!(
+            lowerer
+                .lower_value_expr(&syn::parse_quote!(state.frame.last_instr))
+                .is_some()
+        );
+        assert!(
+            lowerer
+                .lower_stmt(&syn::parse_quote!(state.frame.valuestackdepth = depth;))
+                .is_some()
+        );
+        assert!(
+            lowerer
+                .lower_value_expr(&syn::parse_quote!(state.frame.locals_stack_w[depth]))
+                .is_some()
+        );
+        assert!(
+            lowerer
+                .lower_stmt(&syn::parse_quote!(state.frame.locals_stack_w[depth] = w;))
+                .is_some()
+        );
+        let statements = &lowerer.statements;
+        let body = quote::quote!(#(#statements)*).to_string();
+        assert!(body.contains("vable_getfield_int_with_base"), "{body}");
+        assert!(body.contains("vable_setfield_int_with_base"), "{body}");
+        assert!(body.contains("vable_getarrayitem_ref_with_base"), "{body}");
+        assert!(body.contains("vable_setarrayitem_ref_with_base"), "{body}");
+        assert!(!body.contains("getfield_gc"), "{body}");
+        assert!(!body.contains("setfield_gc"), "{body}");
+        assert!(!body.contains("getarrayitem_gc"), "{body}");
+        assert!(!body.contains("setarrayitem_gc"), "{body}");
     }
 
     #[test]

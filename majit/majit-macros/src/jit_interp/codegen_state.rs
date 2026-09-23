@@ -4,7 +4,169 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{Ident, ItemFn};
 
-use super::{JitInterpConfig, StateFieldKind};
+use super::{JitInterpConfig, StateFieldKind, VableArrayLayoutDecl, VirtualizableDecl};
+
+fn vable_ir_type(field_type: &syn::Ident) -> TokenStream {
+    if field_type == "ref" {
+        quote! { majit_ir::Type::Ref }
+    } else if field_type == "float" {
+        quote! { majit_ir::Type::Float }
+    } else {
+        quote! { majit_ir::Type::Int }
+    }
+}
+
+fn vable_array_add_tokens(array: &super::VableArrayDecl) -> TokenStream {
+    let aname = array.name.to_string();
+    let tp = vable_ir_type(&array.item_type);
+    let item_size = quote! { majit_metainterp::virtualizable::item_size_for_type(#tp) };
+    match &array.layout {
+        VableArrayLayoutDecl::Direct {
+            field_offset,
+            length_offset,
+            items_offset,
+        } => {
+            let length_offset = length_offset
+                .clone()
+                .unwrap_or_else(|| syn::parse_quote!(0usize));
+            let items_offset = items_offset
+                .clone()
+                .unwrap_or_else(|| syn::parse_quote!(0usize));
+            quote! {
+                __info.add_array_field(
+                    #aname,
+                    #tp,
+                    #field_offset,
+                    #length_offset,
+                    #items_offset,
+                    majit_ir::make_array_descr(#items_offset, #item_size, #tp),
+                );
+            }
+        }
+        VableArrayLayoutDecl::Embedded {
+            field_offset,
+            ptr_offset,
+            length_offset,
+            items_offset,
+        } => quote! {
+            __info.add_embedded_array_field(
+                #aname,
+                #tp,
+                #field_offset,
+                #ptr_offset,
+                #length_offset,
+                #items_offset,
+                majit_ir::make_array_descr(#items_offset, #item_size, #tp),
+            );
+        },
+    }
+}
+
+/// `VirtualizableInfo` for a heap object stored in a `ref` state field.
+///
+/// `virtualizable.py` `VirtualizableInfo.__init__` plus
+/// `warmstate.py` `execute_assembler`'s `clear_vable_token`: the object
+/// is the storage, so entry and exit only reset the token. Field boxes
+/// are read off the object (`read_all_boxes`) when a compiled entry
+/// still expects the expanded input list.
+fn heap_frame_virtualizable_methods(
+    decl: &VirtualizableDecl,
+    struct_path: &syn::Path,
+    identity_live_index: usize,
+    identity_ref_bank_index: usize,
+) -> TokenStream {
+    let var_name = &decl.var_name;
+    let token_offset = &decl.token_offset;
+    let name_str = decl.var_name.to_string();
+    let field_adds: Vec<TokenStream> = decl
+        .fields
+        .iter()
+        .map(|f| {
+            let fname = f.name.to_string();
+            let offset = &f.offset;
+            let tp = vable_ir_type(&f.field_type);
+            quote! {
+                __info.add_field(#fname, #tp, #offset);
+            }
+        })
+        .collect();
+    let array_adds: Vec<TokenStream> = decl.arrays.iter().map(vable_array_add_tokens).collect();
+    quote! {
+        #[allow(non_snake_case)]
+        fn __build_virtualizable_info()
+        -> Option<::std::sync::Arc<majit_metainterp::virtualizable::VirtualizableInfo>> {
+            use majit_metainterp::virtualizable::VirtualizableInfo;
+            let mut __info = VirtualizableInfo::new(#token_offset);
+            __info.name = #name_str.to_string();
+            // Flat inputarg slot of the object (`warmspot.py`
+            // `index_of_virtualizable`). `identity_ref_bank_index` is the
+            // JitCode ref register the dispatch walk passes as the vable
+            // base; `Some` tells the optimizer not to treat inputarg 0 as
+            // that object.
+            __info.identity_live_index = Some(#identity_live_index);
+            __info.identity_ref_bank_index = Some(#identity_ref_bank_index);
+            #(#field_adds)*
+            #(#array_adds)*
+            Some(__info.finalize_arc(
+                majit_ir::descr::make_size_descr(::std::mem::size_of::<#struct_path>()),
+            ))
+        }
+
+        fn virtualizable_heap_ptr(
+            &self,
+            _meta: &Self::Meta,
+            _virtualizable: &str,
+            _info: &majit_metainterp::virtualizable::VirtualizableInfo,
+        ) -> Option<*mut u8> {
+            let __ptr = self.#var_name as *mut u8;
+            if __ptr.is_null() {
+                None
+            } else {
+                Some(__ptr)
+            }
+        }
+
+        fn sync_virtualizable_before_jit(
+            &mut self,
+            meta: &Self::Meta,
+            virtualizable: &str,
+            info: &majit_metainterp::virtualizable::VirtualizableInfo,
+        ) -> bool {
+            // `warmstate.py` `execute_assembler`: enter with the token clear.
+            // A zero token is `TOKEN_NONE` (`virtualizable.py`); resetting it
+            // is a no-op until a compiled loop has stored one.
+            if let Some(__obj) = self.virtualizable_heap_ptr(meta, virtualizable, info) {
+                unsafe { info.reset_vable_token(__obj) };
+            }
+            true
+        }
+
+        fn sync_virtualizable_after_jit(
+            &mut self,
+            meta: &Self::Meta,
+            virtualizable: &str,
+            info: &majit_metainterp::virtualizable::VirtualizableInfo,
+        ) {
+            if let Some(__obj) = self.virtualizable_heap_ptr(meta, virtualizable, info) {
+                unsafe { info.reset_vable_token(__obj) };
+            }
+        }
+
+        fn export_virtualizable_boxes(
+            &self,
+            meta: &Self::Meta,
+            virtualizable: &str,
+            info: &majit_metainterp::virtualizable::VirtualizableInfo,
+        ) -> Option<(::std::vec::Vec<i64>, ::std::vec::Vec<::std::vec::Vec<i64>>)> {
+            let __ptr = self.virtualizable_heap_ptr(meta, virtualizable, info)?;
+            if !info.can_read_all_array_lengths_from_heap() {
+                return None;
+            }
+            let __lengths = unsafe { info.read_array_lengths_from_heap(__ptr) };
+            Some(unsafe { info.read_all_boxes(__ptr, &__lengths) })
+        }
+    }
+}
 
 /// Generate the JitState types and implementation.
 pub fn generate_jit_state(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
@@ -217,6 +379,30 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         + portal_ref_greens
         + usize::from(config.virtualizable_decl.is_some() || num_virt_arrays > 0);
     let ref_identity_end: usize = ref_identity_base + num_ref_scalars;
+    // A `virtualizable_fields` object that is a `ref` state field, not the
+    // state struct. `[.. ; virt]` already makes the state itself the
+    // virtualizable; the two do not combine.
+    let heap_vable_index: Option<usize> = if num_virt_arrays == 0 {
+        config.virtualizable_decl.as_ref().map(|decl| {
+            if !arrays.is_empty() {
+                panic!(
+                    "virtualizable_fields cannot share a state with a fixed-length array; \
+                     the object's live index would depend on that array's runtime length"
+                );
+            }
+            let name = decl.var_name.to_string();
+            let ref_pos = ref_scalars
+                .iter()
+                .position(|(_, f)| f.name == name)
+                .unwrap_or_else(|| {
+                    panic!("virtualizable_fields var `{name}` must be a `ref(_)` state field")
+                });
+            num_scalars + ref_pos
+        })
+    } else {
+        None
+    };
+    let carry_vable_boxes = num_virt_arrays >= 1 || heap_vable_index.is_some();
     // First int-bank register available for scalar/array identity slots —
     // the int-bank mirror of `ref_identity_base`. The dispatch JitCode's
     // only int argument is `pc` at i0; aliasing it lets the guard-time
@@ -1407,7 +1593,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             quote! { args.push((sym.#fname, majit_ir::Type::Float)); }
         })
         .collect();
-    let typed_element_splice: TokenStream = if num_virt_arrays >= 1 {
+    let typed_element_splice: TokenStream = if carry_vable_boxes {
         quote! {
             let __elem_count = __boxes.len().saturating_sub(1);
             args.extend_from_slice(&__boxes[..__elem_count]);
@@ -1439,7 +1625,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             args
         }
     };
-    let collect_jump_args_with_boxes_method: TokenStream = if num_virt_arrays >= 1 {
+    let collect_jump_args_with_boxes_method: TokenStream = if carry_vable_boxes {
         quote! {
             fn collect_jump_args_with_boxes(
                 sym: &#sym_ty,
@@ -2032,21 +2218,22 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // a `[.. ; virt]` array whose length can vary while the greens stay fixed
     // must not be block-backed — and it cannot be checked here: the lengths live
     // on state instances that do not exist at install time.
-    let arm_flat_entry_contract: TokenStream = if num_virt_arrays > 0 && arrays.is_empty() {
-        let entry_len =
-            num_scalars + num_vable_identity_slots + num_ref_scalars + num_float_scalars;
-        let index_of_virtualizable = num_scalars;
-        quote! {
-            driver.arm_flat_entry_contract(
-                majit_metainterp::FlatEntryContract {
-                    len: #entry_len,
-                    index_of_virtualizable: #index_of_virtualizable,
-                },
-            );
-        }
-    } else {
-        quote! {}
-    };
+    let arm_flat_entry_contract: TokenStream =
+        if (num_virt_arrays > 0 && arrays.is_empty()) || heap_vable_index.is_some() {
+            let entry_len =
+                num_scalars + num_vable_identity_slots + num_ref_scalars + num_float_scalars;
+            let index_of_virtualizable = heap_vable_index.unwrap_or(num_scalars);
+            quote! {
+                driver.arm_flat_entry_contract(
+                    majit_metainterp::FlatEntryContract {
+                        len: #entry_len,
+                        index_of_virtualizable: #index_of_virtualizable,
+                    },
+                );
+            }
+        } else {
+            quote! {}
+        };
 
     // pyjitpl.py `rebuild_state_after_failure`:
     //     if vinfo is not None:
@@ -2092,7 +2279,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     } else {
         quote! {}
     };
-    let seed_bridge_vable: TokenStream = if num_virt_arrays > 0 {
+    let seed_bridge_vable: TokenStream = if num_virt_arrays > 0 || heap_vable_index.is_some() {
         quote! {
             if let Some(__vinfo) = Self::__build_virtualizable_info() {
                 let __seeded = majit_metainterp::seed_bridge_virtualizable_boxes(
@@ -2416,6 +2603,23 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 true
             }
         }
+    } else if let (Some(decl), Some(index)) = (config.virtualizable_decl.as_ref(), heap_vable_index)
+    {
+        let struct_path = ref_scalars.iter().find_map(|(_, f)| match &f.kind {
+            StateFieldKind::Ref(path) if f.name == decl.var_name => Some(path),
+            _ => None,
+        });
+        let Some(struct_path) = struct_path else {
+            panic!(
+                "virtualizable_fields var `{}` must be a `ref(_)` state field",
+                decl.var_name
+            );
+        };
+        // The vable base register follows the portal's ref greens
+        // (`with_vable_input_ref_reg` in codegen_trace). `ref_identity_base`
+        // is the first state ref scalar, one past that register.
+        let identity_ref_bank_index = ref_identity_base.saturating_sub(1);
+        heap_frame_virtualizable_methods(decl, struct_path, index, identity_ref_bank_index)
     } else {
         quote! {}
     };

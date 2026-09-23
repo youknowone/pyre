@@ -1394,6 +1394,14 @@ impl<'c> Lowerer<'c> {
         Some(())
     }
 
+    /// Lower the inside of `unsafe { ... }` as ordinary statements.
+    fn lower_unsafe_block(&mut self, block: &syn::Block) -> Option<()> {
+        for stmt in &block.stmts {
+            self.lower_stmt(stmt)?;
+        }
+        Some(())
+    }
+
     fn lower_expr_stmt(&mut self, expr: &Expr) -> Option<()> {
         // Green-pc inline dispatch: a `pc += N` / `pc = target` write inside
         // an inlined arm body must land in pc's pinned register (reg0), not
@@ -1402,6 +1410,12 @@ impl<'c> Lowerer<'c> {
         // generic reassign / drop path; a no-op when `!self.pc_pinned`.
         if let Some(()) = self.lower_pc_pinned_write(expr) {
             return Some(());
+        }
+        // An `unsafe` block is the same statements as its body. The
+        // interpreter still type-checks the block; the trace does not
+        // grow an op for the brace.
+        if let Expr::Unsafe(inner) = expr {
+            return self.lower_unsafe_block(&inner.block);
         }
         // jtransform.py rewrite_op_hint — `hint(x, promote=True)` in
         // statement context.  Routes both `x = promote(arg)` (plain local
@@ -1432,6 +1446,18 @@ impl<'c> Lowerer<'c> {
         if let Some(()) = self.lower_state_field_write(expr) {
             return Some(());
         }
+        // `state.<vable>.<field> =` / `state.<vable>.<array>[i] =` before the
+        // heap setfield / setarrayitem rewrites. `jtransform.py`
+        // `setfield_vable_*` / `setarrayitem_vable_*`.
+        if let Some(()) = self.lower_vable_field_write(expr) {
+            return Some(());
+        }
+        if let Some(()) = self.lower_vable_array_update(expr) {
+            return Some(());
+        }
+        if let Some(()) = self.lower_vable_array_write(expr) {
+            return Some(());
+        }
         // Field write-through a `ref(T)` state scalar:
         // `state.<ref>.<member> = <int expr>` → setfield_gc_i (invalidates the
         // matching cached getfield). After lower_state_field_write (which only
@@ -1459,17 +1485,6 @@ impl<'c> Lowerer<'c> {
             return Some(());
         }
         if let Some(()) = self.lower_state_array_write(expr) {
-            return Some(());
-        }
-        if let Some(()) = self.lower_vable_array_update(expr) {
-            return Some(());
-        }
-        // RPython jtransform.py:923 — virtualizable field write rewrite.
-        if let Some(()) = self.lower_vable_field_write(expr) {
-            return Some(());
-        }
-        // RPython jtransform.py:794 — virtualizable array write rewrite.
-        if let Some(()) = self.lower_vable_array_write(expr) {
             return Some(());
         }
         // RPython jtransform.py:650 — hint_force_virtualizable rewrite.

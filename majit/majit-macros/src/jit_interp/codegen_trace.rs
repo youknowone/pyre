@@ -169,7 +169,38 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
                 .any(|f| matches!(f.kind, crate::jit_interp::StateFieldKind::VirtArray(_)))
         })
         .unwrap_or(false);
-    let push_virtualizable_argbox = if config.virtualizable_decl.is_some() || state_has_virt_array {
+    // `pyjitpl.py` `_nonstandard_virtualizable` step 3: the walk's vable
+    // base is standard only when it IS `virtualizable_boxes[-1]`. A heap
+    // frame's entry index is not that box on a bridge (fail args are not
+    // the loop's reds), so the declaration pushes the identity box itself.
+    // A state-level `[.. ; virt]` array keeps the entry-index argbox: its
+    // identity slot and `virtualizable_boxes[-1]` are the same inputarg.
+    let push_virtualizable_argbox = if config.virtualizable_decl.is_some() {
+        quote! {
+            let __vable_argbox = match (
+                __ctx.standard_virtualizable_box(),
+                __ctx.standard_virtualizable_concrete(),
+            ) {
+                (Some(__op), Some(majit_ir::Value::Ref(__r))) => (
+                    majit_metainterp::JitArgKind::Ref,
+                    __op,
+                    __r.as_usize() as i64,
+                ),
+                (Some(__op), Some(majit_ir::Value::Int(__bits))) => (
+                    majit_metainterp::JitArgKind::Ref,
+                    __op,
+                    __bits,
+                ),
+                _ => {
+                    let Some(__fallback) = __ctx.standard_virtualizable_jitcode_argbox() else {
+                        return TraceAction::Abort;
+                    };
+                    __fallback
+                }
+            };
+            __jitcode_args.push(__vable_argbox);
+        }
+    } else if state_has_virt_array {
         quote! {
             let Some(__vable_argbox) = __ctx.standard_virtualizable_jitcode_argbox() else {
                 return TraceAction::Abort;
