@@ -659,7 +659,7 @@ fn convert_to_char(ct: &W_CType, w_ob: PyObjectRef) -> Result<u8, PyError> {
 }
 
 /// `W_CTypePrimitiveUniChar._convert_to_charN_t`.
-fn convert_to_char_n_t(ct: &W_CType, w_ob: PyObjectRef) -> Result<u32, PyError> {
+pub(crate) fn convert_to_char_n_t(ct: &W_CType, w_ob: PyObjectRef) -> Result<u32, PyError> {
     if unsafe { pyre_object::unicodeobject::is_str(w_ob) } {
         let value = unsafe { pyre_object::w_str_get_wtf8(w_ob) };
         let mut points = value.code_points();
@@ -690,7 +690,7 @@ fn unpack_complex(w_ob: PyObjectRef) -> Result<(f64, f64), PyError> {
 }
 
 /// `W_CTypePrimitiveFloat.convert_from_object`.
-unsafe fn convert_from_object_float(
+pub(crate) unsafe fn convert_from_object_float(
     ct: &W_CType,
     cdata: usize,
     w_ob: PyObjectRef,
@@ -700,7 +700,7 @@ unsafe fn convert_from_object_float(
 }
 
 /// `W_CTypePrimitiveLongDouble.convert_from_object`.
-unsafe fn convert_from_object_longdouble(
+pub(crate) unsafe fn convert_from_object_longdouble(
     ct: &W_CType,
     cdata: usize,
     w_ob: PyObjectRef,
@@ -723,7 +723,7 @@ unsafe fn convert_from_object_longdouble(
 }
 
 /// `W_CTypePrimitiveComplex.convert_from_object`.
-unsafe fn convert_from_object_complex(
+pub(crate) unsafe fn convert_from_object_complex(
     ct: &W_CType,
     cdata: usize,
     w_ob: PyObjectRef,

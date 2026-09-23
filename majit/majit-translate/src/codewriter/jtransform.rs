@@ -919,12 +919,7 @@ fn is_ptr_from_ref_path(segments: &[String]) -> bool {
     if joined.contains("slice") || joined.contains("NonNull") || joined.contains("non_null") {
         return false;
     }
-    joined.starts_with("core::ptr::")
-        || joined.starts_with("std::ptr::")
-        || segments
-            .get(segments.len().saturating_sub(2))
-            .map(String::as_str)
-            == Some("ptr")
+    joined.starts_with("core::ptr::") || joined.starts_with("std::ptr::")
 }
 
 /// Stored value of a GC-pointer `setfield_gc` / `setarrayitem_gc`.

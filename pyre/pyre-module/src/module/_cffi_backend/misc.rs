@@ -209,13 +209,13 @@ pub fn raw_memcopy(source: usize, dest: usize, size: usize) {
 /// `misc.py _raw_memcopy_opaque`.
 ///
 /// `@jit.dont_look_inside`: the body is `llmemory.raw_memcopy`, which
-/// is not a jitcode op. Leaving `copy_nonoverlapping` in a convert
-/// body residualizes as an un-lowered helper on the `_CDataBase` call
-/// descent.
+/// is not a jitcode op. `ptr::copy` keeps overlapping struct
+/// self-assignment (`_copy_from_same`) defined; leaving a raw copy
+/// in a convert body residualizes as an un-lowered helper.
 #[majit_macros::dont_look_inside]
 pub fn raw_memcopy_opaque(source: usize, dest: usize, size: usize) {
     unsafe {
-        std::ptr::copy_nonoverlapping(source as *const u8, dest as *mut u8, size);
+        std::ptr::copy(source as *const u8, dest as *mut u8, size);
     }
 }
 
