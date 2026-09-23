@@ -249,10 +249,23 @@ fn type_namespace(w_type: PyObjectRef) -> PyObjectRef {
 }
 
 /// `W_TypeObject.setdictvalue`.
-unsafe fn type_setdictvalue_wtf8(
+///
+/// When the type has a version tag, `write_cell` (`typeobject.py`) either
+/// updates an existing `MutableCell` in place and returns `None`, or returns
+/// the object the namespace must store (the raw value on the first write, a
+/// fresh cell once the previous value cannot absorb the new one).  `None`
+/// skips `mutated()`, so `_version_tag` does not move and a quasi-immutable
+/// watcher on that field stays valid.  A type with no tag stores the raw
+/// value and always mutates, matching the untagged arm.
+///
+/// `dont_look_inside`: the version read is the quasi-immutable field a
+/// traced load already watches.  Tracing it again inside the store plants
+/// a second watcher that this same store's `mutated()` revokes.
+#[majit_macros::dont_look_inside]
+pub(crate) unsafe fn type_setdictvalue_wtf8(
     w_type: PyObjectRef,
     name: &Wtf8,
-    w_value: PyObjectRef,
+    mut w_value: PyObjectRef,
 ) -> Result<(), PyError> {
     if !pyre_object::w_type_is_heaptype(w_type) {
         return Err(PyError::type_error(format!(
@@ -261,11 +274,41 @@ unsafe fn type_setdictvalue_wtf8(
             pyre_object::w_type_get_name(w_type),
         )));
     }
-    // Upstream `setdictvalue` first offers the store to `write_cell` and
-    // returns without `mutated` when the existing MutableCell absorbs it.
-    // Pyre's type dicts hold raw values everywhere (cells are module-dict
-    // only; `object_setattr`'s type arm stores raw too), so the read-side
-    // `unwrap_cell` is a no-op and the cell step has nothing to update.
+    // `version_tag()` is `None` when the field is 0.
+    let version_tag = crate::baseobjspace::w_type_version_tag(w_type);
+    if version_tag != 0 {
+        // `W_TypeObject.setdictvalue` reads through
+        // `_pure_getdictvalue_no_unwrapping`, which does not unwrap.
+        let w_name = pyre_object::unicodeobject::box_str_constant(name);
+        let raw = crate::baseobjspace::_pure_getdictvalue_no_unwrapping(
+            w_type, w_name, version_tag,
+        );
+        let w_curr = if raw.is_null() { None } else { Some(raw) };
+        // `write_cell` returns `None` for three different stores: an
+        // `IntMutableCell` updated in place, an `ObjectMutableCell` updated
+        // in place, and the same object stored again.  Only the int cell
+        // may skip `mutated()`.  Its payload is read with `getfield`, so the
+        // version tag has to stay put.  The other two keep the tag moving:
+        // method folds bake the unwrapped function under it, and a repeated
+        // store of one object used to bump the tag on every assignment.
+        let inplace_int = w_curr.is_some_and(|cell| {
+            pyre_object::celldict::is_int_mutable_cell(cell)
+        });
+        match pyre_object::celldict::write_cell(w_curr, w_value) {
+            None => {
+                if !inplace_int {
+                    crate::baseobjspace::mutated(w_type, name.as_str().ok());
+                }
+                return Ok(());
+            }
+            // An `ObjectMutableCell` would sit in the namespace where a later
+            // reader that does not go through `unwrap_cell` (a type-parameter
+            // bound, for one) would observe the cell.  Keep that value raw.
+            // The int cell is the one an in-place update has to absorb.
+            Some(stored) if pyre_object::celldict::is_object_mutable_cell(stored) => {}
+            Some(stored) => w_value = stored,
+        }
+    }
     crate::baseobjspace::mutated(w_type, name.as_str().ok());
     crate::type_dict_store_wtf8(w_type, name, w_value);
     Ok(())

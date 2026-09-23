@@ -1839,6 +1839,14 @@ pub unsafe fn class_attr_fast_path(
     if version_tag == 0 {
         return None;
     }
+    // The LOAD_ATTR fold bakes `w_descr` as a constant under this version
+    // pin.  Decline when the namespace holds a `MutableCell`: the pin does
+    // not move on an in-place cell write, so the baked value would be stale.
+    if unsafe {
+        crate::baseobjspace::type_attr_stored_is_cell(w_type, rustpython_wtf8::Wtf8::new(name))
+    } {
+        return None;
+    }
     let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) }?;
     if unsafe { crate::baseobjspace::is_data_descr(w_descr) } {
         return None;
@@ -2189,6 +2197,9 @@ unsafe fn property_descr_fast_path_wtf8(
     if version_tag == 0 {
         return None;
     }
+    if unsafe { crate::baseobjspace::type_attr_stored_is_cell(w_type, name) } {
+        return None;
+    }
     let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where_wtf8(w_type, name) }?;
     // Exact type: the fold calls `fget`/`fset` directly, which stands in for
     // `type(w_descr).__get__` only where that cannot have been overridden
@@ -2283,6 +2294,11 @@ pub unsafe fn data_descriptor_get_fast_path(
     }
     let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(w_type) };
     if version_tag == 0 {
+        return None;
+    }
+    if unsafe {
+        crate::baseobjspace::type_attr_stored_is_cell(w_type, rustpython_wtf8::Wtf8::new(name))
+    } {
         return None;
     }
     let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) }?;

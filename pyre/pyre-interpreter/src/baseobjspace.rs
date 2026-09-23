@@ -11389,9 +11389,8 @@ pub(crate) unsafe fn walk_method_cache_gc(forward: &mut dyn FnMut(&mut PyObjectR
 /// only on `version_tag is None`, never on `we_are_jitted()`): promote
 /// the type and its `version_tag`, then consult the
 /// `(version_tag, name)`-keyed `MethodCache` for the `(w_class,
-/// w_value)` pair.  pyre's type namespaces hold plain values (no
-/// `MutableCell` strategy yet), so the `typeobject.py
-/// unwrap_cell` boundary has nothing to unwrap.
+/// w_value)` pair.  The cache stores the cell.  A `MutableCell` is
+/// unwrapped here; any other value is returned in the cached tuple.
 pub(crate) unsafe fn lookup_where_with_method_cache(
     w_type: PyObjectRef,
     name: &str,
@@ -11411,11 +11410,7 @@ pub(crate) unsafe fn lookup_where_with_method_cache(
     }
     if !majit_metainterp::jit::we_are_jitted() {
         let (w_class, w_value) = _cached_lookup_where_name(w_type, Wtf8::new(name), version_tag);
-        return if w_value.is_null() {
-            None
-        } else {
-            Some((w_class, w_value))
-        };
+        return unwrap_method_cache_value(w_class, w_value);
     }
     // typeobject.py:510-511 — `w_class, w_value =
     // self._pure_lookup_where_with_method_cache(name, version_tag)`.  The
@@ -11437,8 +11432,32 @@ pub(crate) unsafe fn lookup_where_with_method_cache(
         None
     } else {
         let w_class = _pure_lookup_class_with_method_cache(w_type, w_name, version_tag);
-        Some((w_class, w_value))
+        // `isinstance(w_value, MutableCell): return w_class, unwrap`.
+        // A non-cell keeps the cached pair.
+        unwrap_method_cache_value(w_class, w_value)
     }
+}
+
+/// `lookup_where_with_method_cache`'s cell boundary.
+///
+/// `None` from a null value.  A `MutableCell` unwraps to its payload and
+/// pairs it with `w_class`.  Anything else returns the two pointers unchanged.
+unsafe fn unwrap_method_cache_value(
+    w_class: PyObjectRef,
+    w_value: PyObjectRef,
+) -> Option<(PyObjectRef, PyObjectRef)> {
+    if w_value.is_null() {
+        return None;
+    }
+    if pyre_object::celldict::is_mutable_cell(w_value) {
+        let unwrapped = pyre_object::celldict::unwrap_cell(w_value);
+        return if unwrapped.is_null() {
+            None
+        } else {
+            Some((w_class, unwrapped))
+        };
+    }
+    Some((w_class, w_value))
 }
 
 /// `typeobject.py W_TypeObject.getdictvalue` — the read of a type's own
@@ -11454,9 +11473,9 @@ pub(crate) unsafe fn lookup_where_with_method_cache(
 /// through an elidable whose every argument is one word keeps the descent
 /// going, and folds the probe besides.
 ///
-/// pyre's type namespaces hold plain values (no `MutableCell` strategy yet), so
-/// the `unwrap_cell` boundary either side of the elidable has nothing to
-/// unwrap.
+/// Both arms pass the stored object through `unwrap_cell`
+/// (`W_TypeObject.getdictvalue`).  `_pure_getdictvalue_no_unwrapping` itself
+/// stays raw: the method cache holds the cell.
 pub(crate) unsafe fn w_type_getdictvalue(
     w_type: PyObjectRef,
     name: &Wtf8,
@@ -11482,7 +11501,8 @@ pub(crate) unsafe fn w_type_getdictvalue(
         // does.  Nothing is lost by routing the interpreter through the
         // elidable, whose body is the same `type_dict_lookup_wtf8` this arm
         // calls directly.
-        return crate::type_dict_lookup_wtf8(w_type, name);
+        return crate::type_dict_lookup_wtf8(w_type, name)
+            .map(|w_value| pyre_object::celldict::unwrap_cell(w_value));
     }
     // `w_name` is the caller's own wrapped name, not a fresh
     // `box_str_constant`.  `LOAD_SUPER_ATTR` already carries it
@@ -11496,7 +11516,12 @@ pub(crate) unsafe fn w_type_getdictvalue(
     if w_value.is_null() {
         None
     } else {
-        Some(w_value)
+        let unwrapped = pyre_object::celldict::unwrap_cell(w_value);
+        if unwrapped.is_null() {
+            None
+        } else {
+            Some(unwrapped)
+        }
     }
 }
 
@@ -11522,7 +11547,7 @@ pub(crate) unsafe fn lookup_in_type_where_wtf8(
     }
     if !majit_metainterp::jit::we_are_jitted() {
         let v = _cached_lookup_where_name(w_type, name, version_tag).1;
-        return if v.is_null() { None } else { Some(v) };
+        return unwrap_looked_up_value(v);
     }
     // The JIT elidable projection takes an interned, immortal str object
     // (`box_str_constant`: content-keyed, never freed) because its residual
@@ -11534,7 +11559,116 @@ pub(crate) unsafe fn lookup_in_type_where_wtf8(
     let w_name = pyre_object::unicodeobject::box_str_constant(name);
     // typeobject.py — `_pure_lookup_where_with_method_cache(name, version_tag)`.
     let v = _pure_lookup_where_with_method_cache(w_type, w_name, version_tag);
-    if v.is_null() { None } else { Some(v) }
+    unwrap_looked_up_value(v)
+}
+
+/// Raw method-cache / MRO value, before `unwrap_cell`.  Folds that would
+/// bake a type-dict resident as a constant ask this and decline when the
+/// resident is a `MutableCell`: an in-place cell write does not move
+/// `_version_tag`, so the unwrapped snapshot would go stale.
+pub(crate) unsafe fn type_attr_stored(w_type: PyObjectRef, name: &Wtf8) -> Option<PyObjectRef> {
+    let version_tag = unsafe { w_type_version_tag(w_type) };
+    if version_tag == 0 {
+        return unsafe { lookup_where_wtf8(w_type, name) }.map(|(_, value)| value);
+    }
+    let value = unsafe { _cached_lookup_where_name(w_type, name, version_tag) }.1;
+    if value.is_null() { None } else { Some(value) }
+}
+
+pub(crate) unsafe fn type_attr_stored_is_cell(w_type: PyObjectRef, name: &Wtf8) -> bool {
+    unsafe { type_attr_stored(w_type, name) }
+        .is_some_and(|value| pyre_object::celldict::is_mutable_cell(value))
+}
+
+/// The class-namespace value is a `MutableCell` an in-place write can update
+/// without moving `_version_tag`.  The caller pins the tag (so a replacing
+/// store still revokes the trace) and reads the payload with `getfield`.
+///
+/// # Safety
+/// `w_obj` must be a valid object pointer (null tolerated).
+pub unsafe fn type_attr_cell_fast_path(
+    w_obj: PyObjectRef,
+    name: &Wtf8,
+) -> Option<(PyObjectRef, u64, PyObjectRef)> {
+    if w_obj.is_null() || !pyre_object::typeobject::is_type(w_obj) {
+        return None;
+    }
+    let w_type = w_obj;
+    let metatype = crate::typedef::r#type(w_obj)?.as_ptr();
+    if !std::ptr::eq(metatype, crate::typedef::w_type()) {
+        return None;
+    }
+    let version_tag = pyre_object::typeobject::w_type_get_version_tag(w_type);
+    if version_tag == 0 {
+        return None;
+    }
+    if lookup_in_type_where_wtf8(metatype, name).is_some_and(|descr| is_data_descr(descr)) {
+        return None;
+    }
+    let stored = type_attr_stored(w_type, name)?;
+    if !pyre_object::celldict::is_mutable_cell(stored) {
+        return None;
+    }
+    let unwrapped = pyre_object::celldict::unwrap_cell(stored);
+    if unwrapped.is_null() {
+        return None;
+    }
+    // A function or staticmethod is a different fold.  This path is the
+    // unbound value `get` returns unchanged.
+    let value_type = crate::typedef::r#type(unwrapped)?.as_ptr();
+    if lookup_in_type(value_type, "__get__").is_some()
+        || pyre_object::w_type_is_heaptype(value_type)
+        || pyre_object::is_exact_type(unwrapped, &pyre_object::function::STATICMETHOD_TYPE)
+        || std::ptr::eq((*unwrapped).ob_type, &crate::FUNCTION_TYPE as *const _)
+        || std::ptr::eq(
+            (*unwrapped).ob_type,
+            &crate::METHOD_DESCRIPTOR_TYPE as *const _,
+        )
+    {
+        return None;
+    }
+    Some((w_type, version_tag, stored))
+}
+
+/// `load_method_fast_path` for a name whose namespace entry is an
+/// `ObjectMutableCell`.  The cell pointer is stable under `_version_tag`;
+/// the function inside it is not, so the caller `getfield`s `w_value`.
+///
+/// # Safety
+/// `w_obj` must be a valid object pointer (null tolerated).
+pub unsafe fn load_method_cell_fast_path(
+    w_obj: PyObjectRef,
+    name: &str,
+) -> Option<(PyObjectRef, u64, PyObjectRef)> {
+    if w_obj.is_null() {
+        return None;
+    }
+    let w_type = crate::typedef::r#type(w_obj)?.as_ptr();
+    let version_tag = pyre_object::typeobject::w_type_get_version_tag(w_type);
+    if version_tag == 0 || !has_object_getattribute(w_type) {
+        return None;
+    }
+    let stored = type_attr_stored(w_type, Wtf8::new(name))?;
+    if !pyre_object::celldict::is_object_mutable_cell(stored) {
+        return None;
+    }
+    let w_descr = pyre_object::celldict::unwrap_cell(stored);
+    let w_descr_type = crate::typedef::r#type(w_descr)?;
+    if !pyre_object::typeobject::w_type_get_flag_method_descriptor(w_descr_type.as_ptr()) {
+        return None;
+    }
+    instance_dict_does_not_shadow(w_obj, name)?;
+    Some((w_type, version_tag, stored))
+}
+
+/// Value half of `lookup_where_with_method_cache`: unwrap a `MutableCell`,
+/// pass every other object through.  Null stays absent.
+unsafe fn unwrap_looked_up_value(w_value: PyObjectRef) -> Option<PyObjectRef> {
+    if w_value.is_null() {
+        return None;
+    }
+    let unwrapped = pyre_object::celldict::unwrap_cell(w_value);
+    if unwrapped.is_null() { None } else { Some(unwrapped) }
 }
 
 #[inline]
@@ -11847,6 +11981,9 @@ pub unsafe fn classmethod_on_type_fast_path(
     if version_tag == 0 {
         return None;
     }
+    if type_attr_stored_is_cell(w_type, Wtf8::new(name)) {
+        return None;
+    }
     let w_descr = lookup_in_type(w_type, name)?;
     // EXACT, for the reason the `__getattr__`-hook arm records: a `classmethod`
     // subclass overriding `__get__` binds through that override, so unwrapping
@@ -11939,6 +12076,13 @@ pub unsafe fn type_attr_value_fast_path(
     // typeobject.py:814-823: a metatype data descriptor preempts the class's
     // own MRO, while a non-data metatype entry loses to the class value.
     if lookup_in_type_where_wtf8(metatype, name).is_some_and(|descr| is_data_descr(descr)) {
+        return None;
+    }
+    // `try_walker_specialize_load_type_attr` and
+    // `try_walker_specialize_builtin_type_getattr` bake this value as a
+    // constant under the version pin.  A `MutableCell` must not take that
+    // path: the pin survives an in-place write.
+    if type_attr_stored_is_cell(w_type, name) {
         return None;
     }
     let w_value = lookup_in_type_where_wtf8(w_type, name)?;
@@ -12134,6 +12278,9 @@ pub unsafe fn bound_method_attr_fast_path_wtf8(
     if owes_shadow_guard {
         unsafe { instance_dict_does_not_shadow_wtf8(w_obj, name)? };
     } else if !getdict_backing_native(w_obj).is_null() {
+        return None;
+    }
+    if type_attr_stored_is_cell(w_type, name) {
         return None;
     }
     let w_descr = unsafe { lookup_in_type_where_wtf8(w_type, name)? };
@@ -14285,16 +14432,23 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
                 } else {
                     None
                 };
-                crate::type_dict_store(obj, name, value);
+                // `descr__setattr__` ends in `w_obj.setdictvalue`.  For a
+                // heap type that is `W_TypeObject.setdictvalue`: `write_cell`
+                // absorbs an in-place update and skips `mutated()`.
+                if pyre_object::w_type_is_heaptype(obj) {
+                    crate::objspace::std::classdict::type_setdictvalue_wtf8(
+                        obj,
+                        Wtf8::new(name),
+                        value,
+                    )?;
+                } else {
+                    crate::type_dict_store(obj, name, value);
+                    mutated(obj, Some(name));
+                }
                 pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
                 if let Some(a) = abstract_flag {
                     pyre_object::w_type_set_abstract(obj, a);
                 }
-                // typeobject.py — `self.mutated(name)` after the
-                // dict_w write so cached `compares_by_identity_status`
-                // (and future per-type caches) reset on this type and
-                // every entry in `weak_subclasses` recursively.
-                mutated(obj, Some(name));
                 return Ok(w_none());
             }
         }

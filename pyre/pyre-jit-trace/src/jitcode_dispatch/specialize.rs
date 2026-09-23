@@ -4464,6 +4464,76 @@ pub(crate) fn try_walker_specialize_load_type_name_attr<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+fn walker_read_object_mutable_cell<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    cell: pyre_object::PyObjectRef,
+) -> OpRef {
+    let cell_op = ctx.trace_ctx.const_ref(cell as i64);
+    let value = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        cell_op,
+        crate::descr::object_mutable_cell_value_descr(),
+    );
+    let live = unsafe { (*(cell as *const pyre_object::celldict::ObjectMutableCell)).w_value };
+    ctx.trace_ctx.set_opref_concrete(
+        value,
+        majit_ir::Value::Ref(majit_ir::GcRef(live as usize)),
+    );
+    value
+}
+
+fn walker_read_int_mutable_cell<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    cell: pyre_object::PyObjectRef,
+) -> Result<OpRef, DispatchError> {
+    let cell_op = ctx.trace_ctx.const_ref(cell as i64);
+    let raw = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        cell_op,
+        crate::descr::int_mutable_cell_value_descr(),
+    );
+    let live = unsafe { (*(cell as *const pyre_object::celldict::IntMutableCell)).intvalue };
+    ctx.trace_ctx
+        .set_opref_concrete(raw, majit_ir::Value::Int(live));
+    let boxed = walker_box_int(ctx, op_pc, raw, live)?;
+    let live_ptr = pyre_object::w_int_new(live) as i64;
+    ctx.trace_ctx
+        .set_opref_concrete(boxed, box_int_concrete(live, live_ptr));
+    Ok(boxed)
+}
+
+/// `LOAD_ATTR` of a type attribute stored in a `MutableCell`.  The cell
+/// pointer is constant under the type's `_version_tag`; the payload is a
+/// `getfield`, so an in-place write stays visible.
+fn walker_fold_type_attr_cell<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    concrete_obj: pyre_object::PyObjectRef,
+    name: &str,
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    let Some((w_type, _version_tag, cell)) = (unsafe {
+        pyre_interpreter::type_attr_cell_fast_path(concrete_obj, Wtf8::new(name))
+    }) else {
+        return Ok(None);
+    };
+    let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[obj, w_type_const])?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(obj, w_type_const);
+    walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
+    let value = if unsafe { pyre_object::celldict::is_int_mutable_cell(cell) } {
+        walker_read_int_mutable_cell(ctx, op_pc, cell)?
+    } else {
+        walker_read_object_mutable_cell(ctx, cell)
+    };
+    write_residual_call_result_to_dst(ctx, op_pc, dst, 'r', value)?;
+    Ok(Some(()))
+}
+
 /// Fold `LOAD_ATTR` on a type receiver when
 /// [`pyre_interpreter::type_attr_value_fast_path`] resolves
 /// `typeobject.py` `getattribute`'s `space.get(w_value, w_None, self)` to a
@@ -4503,7 +4573,7 @@ pub(crate) fn try_walker_specialize_load_type_attr<Sym: WalkSym>(
     let Some((w_type, _version_tag, w_value, binding)) = (unsafe {
         pyre_interpreter::type_attr_value_fast_path(concrete_obj, Wtf8::new(name.as_str()))
     }) else {
-        return Ok(None);
+        return walker_fold_type_attr_cell(ctx, op_pc, obj, concrete_obj, name.as_str(), dst);
     };
 
     let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
