@@ -13,7 +13,7 @@ try:
 except ImportError:
     pass
 
-N = 3
+N = 15
 
 
 def echo():
@@ -127,7 +127,7 @@ assert sent == [0, 1, 3, 6], sent
 assert throwed == [2, 3, 16, 17], throwed
 assert delegated == [4950, 9], delegated
 assert closed == 1, closed
-expected = 19_999_900_000
-assert returned(terminal(200_000)) == expected
-assert returned(async_terminal(200_000)) == expected
+expected = 499_999_500_000
+assert returned(terminal(1_000_000)) == expected
+assert returned(async_terminal(1_000_000)) == expected
 print("PASS")

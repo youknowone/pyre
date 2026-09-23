@@ -21,7 +21,7 @@ class Derived(Base):
 def main():
     total = 0
     i = 0
-    while i < 50000:
+    while i < 300000:
         total += Derived.scaled(i) + Base.scaled(i)
         i += 1
     print(total)

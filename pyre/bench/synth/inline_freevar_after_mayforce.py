@@ -70,7 +70,7 @@ INPUTS = tuple(Ratio(i + 1, 97) for i in range(97))
 
 # Low thresholds make both required compilation arms deterministic; additional
 # iterations only repeat Ratio allocation and no longer strengthen the test.
-N = 6000
+N = 36000
 
 
 def make_forwarder():

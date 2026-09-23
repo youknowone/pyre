@@ -8,7 +8,7 @@ try:
 except ImportError:
     pass
 
-N = 20000
+N = 200000
 
 
 def delete_neg3_open():

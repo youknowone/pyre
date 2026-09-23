@@ -23,7 +23,7 @@ def f(n):
 
 t = 0
 k = 0
-while k < 220:
+while k < 6600:
     t += len(f(300))
     k += 1
 print(t)

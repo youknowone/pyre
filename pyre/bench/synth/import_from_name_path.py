@@ -1,4 +1,4 @@
-# No `max-pypy-ratio`: the loop runs in 0.01s against pypy's 0.01s, so a ratio
+# No `max-pypy-ratio`: the loop runs in a few hundredths of a second, as does pypy, so a ratio
 # reads whatever the host's process spawn cost happens to be that run rather
 # than any generated code. The jitstats baselines gate it.
 #
@@ -11,7 +11,7 @@
 # path is install-dependent, so only its basename is checked.  `keyword` is a
 # pure-Python stdlib module importable on every backend (including wasm, which
 # has no `os`/`posix`).  Output verified against CPython/PyPy.
-N = 8000
+N = 56000
 
 
 def main():

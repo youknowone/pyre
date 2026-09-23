@@ -19,7 +19,7 @@ def m(label, fn):
 
 
 def main():
-    print("warm", warm(15000))
+    print("warm", warm(450000))
     # normal / moderately large shifts compute
     m("1<<10", lambda: 1 << 10)
     m("255<<8", lambda: 255 << 8)

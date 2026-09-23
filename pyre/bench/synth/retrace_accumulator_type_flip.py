@@ -34,7 +34,7 @@ def f(n):
     s = 0
     i = 0
     while i < n:
-        if i > 4000:
+        if i > 100000:
             s = s + 0.5
         else:
             s = s + 1
@@ -42,4 +42,4 @@ def f(n):
     return s
 
 
-print(f(60000))
+print(f(1500000))

@@ -24,6 +24,6 @@ class StatefulDecoder:
 
 
 decoder = StatefulDecoder()
-result = decoder.decode(b"abcd" * 2_000)
-assert result == "abcd" * 2_000, (len(result), result[:8], result[-8:])
+result = decoder.decode(b"abcd" * 60_000)
+assert result == "abcd" * 60_000, (len(result), result[:8], result[-8:])
 print(len(result), result[:4], result[-4:])

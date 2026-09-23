@@ -4,7 +4,7 @@
 # Zero-argument super() must read that live Cell.contents in the traced portal
 # frame; treating the cell object itself as the receiver either misbinds the
 # proxy or leaves the whole lookup residual.
-N = 20000
+N = 600000
 
 
 class Base:

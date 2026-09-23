@@ -6,7 +6,7 @@
 # blackhole, which must propagate the handler-raised exception out of the
 # function (a sibling clause does NOT catch a handler-raised exception) so the
 # caller routes it to the correct `except`. Output verified against CPython/PyPy.
-N = 18000
+N = 540000
 
 
 def f(i):

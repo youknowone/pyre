@@ -74,7 +74,7 @@ def fold(acc, r):
 
 def run():
     acc = 0
-    for i in range(1000):
+    for i in range(30000):
         # Exact int on ~1/113 of iterations, a plain user class otherwise; the
         # `w + w` site dispatches int.__add__ vs C0.__add__.
         w = i if i % 113 == 0 else C0(i)

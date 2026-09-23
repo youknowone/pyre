@@ -37,7 +37,7 @@ class Plain:
 
 def main():
     prop = getattr_ = plain = None
-    for _ in range(20000):
+    for _ in range(200000):
         prop = ByProp.where()
         getattr_ = ByGetattr.ping()
         # an ordinary class still binds its classmethod's cls

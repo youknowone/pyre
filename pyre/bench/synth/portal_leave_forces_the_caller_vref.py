@@ -49,7 +49,7 @@
 # diff against when the defect fires.
 import sys
 
-WARM = 4000
+WARM = 120000
 ESCAPE_AT = WARM - 5
 
 

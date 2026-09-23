@@ -63,7 +63,7 @@ def main():
 
     # a hot loop over the routed surrogate access stays stable once compiled
     ok = 0
-    for _ in range(20000):
+    for _ in range(100000):
         if getattr(m, SUR) == ("dict", SUR):
             ok += 1
     print("hot", ok)

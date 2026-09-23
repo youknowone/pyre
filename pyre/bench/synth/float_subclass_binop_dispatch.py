@@ -40,7 +40,7 @@ try:
 except ImportError:
     pass
 
-N = 2000
+N = 50000
 
 
 class MyFloat(float):

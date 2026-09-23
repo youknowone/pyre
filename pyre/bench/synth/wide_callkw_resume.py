@@ -30,6 +30,6 @@ def run(n):
 
 total = 0
 for _ in range(3):
-    args, kwargs = run(20000)
+    args, kwargs = run(600000)
     total += sum(args) + kwargs["kw"]
 print(total, len(CALLS))

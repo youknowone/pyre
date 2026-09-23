@@ -32,7 +32,7 @@
 # would then gate the interpreter it was written to leave.
 import sys
 
-N = 20000
+N = 100000
 
 
 class GetOverridingClassMethod(classmethod):

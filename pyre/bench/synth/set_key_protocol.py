@@ -117,7 +117,7 @@ def leftover():
 
 
 def main():
-    print("warm", warm(15000))
+    print("warm", warm(150000))
     # an element is hashed once per store, not once to check and once to place
     c("h_set_ctor", lambda: set([Counted()]))
     c("h_set_add", lambda: set().add(Counted()))

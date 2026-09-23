@@ -11,7 +11,7 @@ import sys
 def main():
     total = 0
     seen = []
-    for i in range(20000):
+    for i in range(600000):
         fr = sys._getframe(0)
         seen.append(len(fr.f_locals))
         total += i
