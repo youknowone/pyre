@@ -548,7 +548,7 @@ unsafe fn alloc_mapdict_storage_block(cap: usize) -> *mut ItemsBlock {
 /// NULL) before a collection can observe the block. Falls back to the
 /// `std::alloc` [`alloc_items_block`] when the gate is off or no GC hook
 /// is installed (pure interpreter / early startup). Items are left
-/// uninitialised either way.
+/// uninitialised either way. The bool is whether the block is GC-owned.
 ///
 /// # Why `try_gc_alloc` and not the collecting hook
 ///
@@ -570,12 +570,14 @@ unsafe fn alloc_mapdict_storage_block(cap: usize) -> *mut ItemsBlock {
 /// blocker the born-old stepping stone in `gc_interp.rs` names, not a separate
 /// one, and it is why the entry point here stays the no-collect one until the
 /// root-set census is re-graded for liveness rather than for movement.
-unsafe fn alloc_items_block_gc(cap: usize) -> *mut ItemsBlock {
+unsafe fn alloc_items_block_gc(cap: usize) -> (*mut ItemsBlock, bool) {
     unsafe { try_alloc_items_block_gc(cap).unwrap_or_else(|| items_block_alloc_failed(cap)) }
 }
 
 /// [`alloc_items_block_gc`] for a capacity that came from Python.
-unsafe fn try_alloc_items_block_gc(cap: usize) -> Option<*mut ItemsBlock> {
+/// The bool is whether the block came from `try_gc_alloc` (GC-owned)
+/// rather than `std::alloc`.
+unsafe fn try_alloc_items_block_gc(cap: usize) -> Option<(*mut ItemsBlock, bool)> {
     if itemsblock_gc_enabled() {
         let payload = try_items_block_layout(cap)?.size();
         if let Some(raw) = crate::gc_hook::try_gc_alloc(PY_OBJECT_ARRAY_GC_TYPE_ID, payload)
@@ -596,10 +598,10 @@ unsafe fn try_alloc_items_block_gc(cap: usize) -> Option<*mut ItemsBlock> {
                 std::ptr::write_bytes(raw, 0, payload);
                 (*block).capacity = cap;
             }
-            return Some(block);
+            return Some((block, true));
         }
     }
-    unsafe { try_alloc_items_block(cap) }
+    unsafe { try_alloc_items_block(cap).map(|block| (block, false)) }
 }
 
 /// List-construction allocator on the Phase L2 nursery path. Pins each
@@ -621,22 +623,19 @@ pub unsafe fn alloc_list_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBlo
     let _roots = crate::gc_roots::push_roots();
     let save = crate::gc_roots::pin_roots(values);
     let block_slot = crate::gc_roots::shadow_stack_len();
-    let block = unsafe { alloc_items_block_gc(cap) };
+    let (block, owns_block) = unsafe { alloc_items_block_gc(cap) };
     // `alloc_items_block_gc` returns a fresh GCREF.  RPython's
     // gct_fv_gc_malloc pop_roots makes that result live before the next
     // collecting operation, so the fresh array is published here rather than
     // carried only in this frame's native copy.
     let _ = crate::gc_roots::pin_root(block as PyObjectRef);
     // The barrier is the last thing before the items land, the way
-    // `writebarrier_before_copy` precedes `ll_arraycopy`'s memcpy.  Asking the
-    // ownership question after the fill instead would leave the young elements
-    // in an unregistered old-gen block, where a minor collection does not
-    // trace them.  Both generations are managed, so the answer holds either
-    // way; the address is taken from the published slot, which is the one
+    // `writebarrier_before_copy` precedes `ll_arraycopy`'s memcpy.  Running
+    // the fill first would leave the young elements in an unregistered
+    // old-gen block, where a minor collection does not trace them.
+    // `owns_block` is the placement `try_alloc_items_block_gc` already
+    // knew; the address is taken from the published slot, which is the one
     // authority a promotion rewrites.
-    let owns_block = crate::gc_hook::try_gc_owns_object(crate::gc_roots::shadow_stack_get(
-        block_slot,
-    ) as *mut u8);
     let block = crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock;
     let base = unsafe { items_block_items_base(block) };
     // Old→young barrier if the block landed in old-gen (see
@@ -728,14 +727,11 @@ pub unsafe fn try_grow_list_items_block_gc(
         Some(slot)
     };
     let new_block_slot = crate::gc_roots::shadow_stack_len();
-    let new_block = unsafe { try_alloc_items_block_gc(new_cap)? };
+    let (new_block, owns_new) = unsafe { try_alloc_items_block_gc(new_cap)? };
     let _ = crate::gc_roots::pin_root(new_block as PyObjectRef);
-    // The ownership query is the safepoint, so it runs before the barrier and
-    // the copy — see `alloc_list_items_block_gc` for why the barrier cannot
-    // follow the items.
-    let owns_new = crate::gc_hook::try_gc_owns_object(crate::gc_roots::shadow_stack_get(
-        new_block_slot,
-    ) as *mut u8);
+    // Barrier before the copy — see `alloc_list_items_block_gc` for why
+    // the barrier cannot follow the items. `owns_new` is the placement
+    // `try_alloc_items_block_gc` already knew.
     let new_block = crate::gc_roots::shadow_stack_get(new_block_slot) as *mut ItemsBlock;
     let new_base = unsafe { items_block_items_base(new_block) };
     let old = old_slot
@@ -776,13 +772,10 @@ pub unsafe fn alloc_tuple_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBl
         let _ = crate::gc_roots::pin_root(v);
     }
     let block_slot = crate::gc_roots::shadow_stack_len();
-    let block = unsafe { alloc_items_block_gc(cap) };
+    let (block, owns_block) = unsafe { alloc_items_block_gc(cap) };
     let _ = crate::gc_roots::pin_root(block as PyObjectRef);
-    // The ownership query is the safepoint, so it runs before the barrier and
-    // the fill — see `alloc_list_items_block_gc`.
-    let owns_block = crate::gc_hook::try_gc_owns_object(crate::gc_roots::shadow_stack_get(
-        block_slot,
-    ) as *mut u8);
+    // Barrier before the fill — see `alloc_list_items_block_gc`.
+    // `owns_block` is the placement `try_alloc_items_block_gc` already knew.
     let block = crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock;
     let base = unsafe { items_block_items_base(block) };
     // The block may have landed in old-gen (nursery-full fallback) while its

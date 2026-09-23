@@ -308,6 +308,142 @@ pub struct Trace {
     py_pc_spans: Vec<(u32, u32)>,
 }
 
+/// TAGBOX index to the recording `OpRef`, without borrowing the whole
+/// recorder, so a `SnapshotIterator` can hold the snapshot bytes at the
+/// same time. Inputarg indices below `inputargs.len()` stay inputargs;
+/// later indices go through `box_to_unique`.
+fn box_index_to_opref_parts(
+    inputargs: &[InputArgRc],
+    slots: &[FrontendSlot],
+    box_index: u32,
+    box_to_unique: &[u32],
+) -> OpRef {
+    let n = inputargs.len() as u32;
+    if box_index < n {
+        return OpRef::input_arg_typed(box_index, inputargs[box_index as usize].tp.get());
+    }
+    let unique = *box_to_unique.get(box_index as usize).unwrap_or(&u32::MAX);
+    if unique == u32::MAX {
+        panic!("decode snapshot: TAGBOX({box_index}) has no unique OpRef");
+    }
+    if unique < n {
+        return OpRef::input_arg_typed(unique, inputargs[unique as usize].tp.get());
+    }
+    let slot = &slots[(unique - n) as usize];
+    OpRef::op_typed(unique, slot.opcode.result_type())
+}
+
+/// `Trace::untag_snapshot` over already-split const pools.
+fn untag_snapshot_pools(
+    inputargs: &[InputArgRc],
+    slots: &[FrontendSlot],
+    box_to_unique: &[u32],
+    refs: &[u64],
+    floats: &[u64],
+    bigints: &[i64],
+    tagged: i64,
+) -> SnapshotTagged {
+    use crate::opencoder::{TAG_MASK, TAG_SHIFT, TAGBOX, TAGCONSTOTHER, TAGCONSTPTR, TAGINT};
+    let tag = (tagged & TAG_MASK as i64) as u8;
+    let v = tagged >> TAG_SHIFT;
+    match tag {
+        TAGBOX => {
+            debug_assert!(v >= 0, "TAGBOX value must be non-negative, got {v}");
+            let opref = box_index_to_opref_parts(inputargs, slots, v as u32, box_to_unique);
+            SnapshotTagged::Box(opref, opref.ty().unwrap_or(Type::Int))
+        }
+        TAGINT => SnapshotTagged::Const(v, Type::Int),
+        TAGCONSTPTR => SnapshotTagged::Const(refs[v as usize] as i64, Type::Ref),
+        TAGCONSTOTHER => {
+            let pool_idx = (v >> 1) as usize;
+            if v & 1 != 0 {
+                SnapshotTagged::Const(floats[pool_idx] as i64, Type::Float)
+            } else {
+                SnapshotTagged::Const(bigints[pool_idx], Type::Int)
+            }
+        }
+        other => panic!("decode snapshot: unknown tag {other}"),
+    }
+}
+
+/// Untag one snapshot word and rewrite it into the prepare cache's namespace.
+fn snapshot_box_from_tagged(
+    tagged: i64,
+    inputargs: &[InputArgRc],
+    slots: &[FrontendSlot],
+    box_to_unique: &[u32],
+    refs: &[u64],
+    floats: &[u64],
+    bigints: &[i64],
+    unique_cache: &[Option<Operand>],
+) -> crate::resume::SnapshotBox {
+    let decoded = untag_snapshot_pools(
+        inputargs,
+        slots,
+        box_to_unique,
+        refs,
+        floats,
+        bigints,
+        tagged,
+    );
+    let snap_box = crate::pyjitpl::snapshot_tagged_to_box(&decoded, inputargs);
+    snap_box.map_opref(|opref| crate::pyjitpl::translate_trace_iter_opref(opref, unique_cache))
+}
+
+/// One byte-mode bridge's resume source.
+///
+/// `ResumeDataLoopMemo.number` walks `Trace.get_snapshot_iter` when a guard
+/// is numbered. This holds that buffer plus the prepare-time cache that
+/// rewrites recording `OpRef`s into the optimizer's `_fresh` namespace.
+/// A guard the optimizer never emits never builds its box vectors.
+///
+/// `recorder` stays valid while `MetaInterp.tracing` owns the `Trace`.
+/// `OptContext::reset_keep_capacity` drops this value without reading the
+/// pointer, before a later compile can free the trace.
+pub(crate) struct ByteBridgeResume {
+    recorder: *const Trace,
+    box_to_unique: Vec<u32>,
+    unique_cache: Vec<Option<Operand>>,
+}
+
+impl ByteBridgeResume {
+    pub(crate) fn from_recorder(recorder: &Trace, unique_cache: Vec<Option<Operand>>) -> Self {
+        Self {
+            recorder: recorder as *const Trace,
+            box_to_unique: recorder.box_to_unique_map(),
+            unique_cache,
+        }
+    }
+
+    pub(crate) fn contains(&self, resume_pos: i32) -> bool {
+        if resume_pos < 0 {
+            return false;
+        }
+        // The trace outlives optimize. Reset clears the pointer without
+        // dereferencing it.
+        let rec = unsafe { &*self.recorder };
+        (resume_pos as usize) < rec.snapshot_offsets.len()
+    }
+
+    pub(crate) fn number_guard(
+        &self,
+        memo: &mut crate::resume::ResumeDataLoopMemo,
+        env: &dyn crate::resume::BoxEnv,
+        resume_pos: i32,
+        minimum_virtualizable_size: i64,
+    ) -> Result<crate::resume::NumberingState, crate::resume::TagOverflow> {
+        let rec = unsafe { &*self.recorder };
+        rec.number_byte_snapshot(
+            resume_pos,
+            &self.box_to_unique,
+            &self.unique_cache,
+            memo,
+            env,
+            minimum_virtualizable_size,
+        )
+    }
+}
+
 impl Trace {
     /// Create a new, empty trace recorder.
     ///
@@ -472,49 +608,130 @@ impl Trace {
         }
     }
 
-    fn box_index_to_opref(&self, box_index: u32, box_to_unique: &[u32]) -> OpRef {
-        let n = self.inputargs.len() as u32;
-        if box_index < n {
-            return OpRef::input_arg_typed(box_index, self.inputargs[box_index as usize].tp.get());
-        }
-        let unique = *box_to_unique.get(box_index as usize).unwrap_or(&u32::MAX);
-        if unique == u32::MAX {
-            panic!("decode snapshot: TAGBOX({box_index}) has no unique OpRef");
-        }
-        if unique < n {
-            return OpRef::input_arg_typed(unique, self.inputargs[unique as usize].tp.get());
-        }
-        let slot = &self.slots[(unique - n) as usize];
-        OpRef::op_typed(unique, slot.opcode.result_type())
+    pub(crate) fn untag_snapshot(&self, tagged: i64, box_to_unique: &[u32]) -> SnapshotTagged {
+        let trb = self.trb.as_ref().expect("untag_snapshot requires TRB");
+        untag_snapshot_pools(
+            &self.inputargs,
+            &self.slots,
+            box_to_unique,
+            &trb._refs,
+            &trb._floats,
+            &trb._bigints,
+            tagged,
+        )
     }
 
-    pub(crate) fn untag_snapshot(&self, tagged: i64, box_to_unique: &[u32]) -> SnapshotTagged {
-        use crate::opencoder::{TAG_MASK, TAG_SHIFT, TAGBOX, TAGCONSTOTHER, TAGCONSTPTR, TAGINT};
-        let tag = (tagged & TAG_MASK as i64) as u8;
-        let v = tagged >> TAG_SHIFT;
-        match tag {
-            TAGBOX => {
-                debug_assert!(v >= 0, "TAGBOX value must be non-negative, got {v}");
-                let opref = self.box_index_to_opref(v as u32, box_to_unique);
-                SnapshotTagged::Box(opref, opref.ty().unwrap_or(Type::Int))
-            }
-            TAGINT => SnapshotTagged::Const(v, Type::Int),
-            TAGCONSTPTR => {
-                let trb = self.trb.as_ref().expect("untag_snapshot requires TRB");
-                let addr = trb._refs[v as usize];
-                SnapshotTagged::Const(addr as i64, Type::Ref)
-            }
-            TAGCONSTOTHER => {
-                let trb = self.trb.as_ref().expect("untag_snapshot requires TRB");
-                let pool_idx = (v >> 1) as usize;
-                if v & 1 != 0 {
-                    SnapshotTagged::Const(trb._floats[pool_idx] as i64, Type::Float)
-                } else {
-                    SnapshotTagged::Const(trb._bigints[pool_idx], Type::Int)
-                }
-            }
-            other => panic!("decode snapshot: unknown tag {other}"),
+    /// `ResumeDataLoopMemo.number` for one captured snapshot.
+    ///
+    /// `resume_pos` is the sequential id on the guard after
+    /// `get_iter_for_optimizer` overlays `FrontendSlot.resume` — not the
+    /// descr varint, which stays 0 while `patch_guard_descr` is false.
+    /// The byte offset is `snapshot_offsets[resume_pos]`.
+    /// TAGBOX goes through `box_to_unique` (the coordinate frame registers
+    /// hold) and then the prepare cache, the same rewrite
+    /// `translate_trace_iter_box_map` applies to a prebuilt list.
+    fn number_byte_snapshot(
+        &self,
+        resume_pos: i32,
+        box_to_unique: &[u32],
+        unique_cache: &[Option<Operand>],
+        memo: &mut crate::resume::ResumeDataLoopMemo,
+        env: &dyn crate::resume::BoxEnv,
+        minimum_virtualizable_size: i64,
+    ) -> Result<crate::resume::NumberingState, crate::resume::TagOverflow> {
+        use crate::opencoder::SnapshotIterator;
+        use smallvec::SmallVec;
+
+        let offset = self.snapshot_offsets[resume_pos as usize];
+        let (py_start, py_len) = self
+            .py_pc_spans
+            .get(resume_pos as usize)
+            .copied()
+            .unwrap_or((0, 0));
+        let py_pcs = &self.py_pc_data[py_start as usize..py_start as usize + py_len as usize];
+        let inputargs = self.inputargs.as_slice();
+        let slots = self.slots.as_slice();
+        let trb = self
+            .trb
+            .as_ref()
+            .expect("number_byte_snapshot requires TraceRecordBuffer");
+        let it = SnapshotIterator::new(&trb._snapshot_data, &trb._snapshot_array_data, offset);
+        let refs = trb._refs.as_slice();
+        let floats = trb._floats.as_slice();
+        let bigints = trb._bigints.as_slice();
+
+        let vable_len = it.iter_vable_array().total_length;
+        let vref_len = it.iter_vref_array().total_length;
+        // Copy the frame offsets out of `framestack` before calling back into
+        // `it`: the iterator borrow and `iter_array` cannot overlap.
+        let snaps: SmallVec<[usize; 16]> = it.framestack.iter().copied().collect();
+        let mut headers: SmallVec<[(i32, i32, i32, usize); 16]> = SmallVec::new();
+        for (fi, &snap) in snaps.iter().enumerate() {
+            let nboxes = it.iter_array(snap).len();
+            let (jc, pc) = it.unpack_jitcode_pc(snap);
+            let py_pc = py_pcs.get(fi).copied().unwrap_or(pc as u32) as i32;
+            headers.push((
+                Self::decode_jitcode_index(jc) as i32,
+                pc as i32,
+                py_pc,
+                nboxes,
+            ));
         }
+
+        let mut vable = it.iter_vable_array();
+        let mut vref = it.iter_vref_array();
+        let mut frame_iters: SmallVec<[_; 16]> = SmallVec::new();
+        for &snap in &snaps {
+            frame_iters.push(it.iter_array(snap));
+        }
+        let mut frame_i = 0usize;
+        memo.number_sections(
+            vable_len,
+            || {
+                snapshot_box_from_tagged(
+                    vable.next().expect("vable snapshot box"),
+                    inputargs,
+                    slots,
+                    box_to_unique,
+                    refs,
+                    floats,
+                    bigints,
+                    unique_cache,
+                )
+            },
+            vref_len,
+            || {
+                snapshot_box_from_tagged(
+                    vref.next().expect("vref snapshot box"),
+                    inputargs,
+                    slots,
+                    box_to_unique,
+                    refs,
+                    floats,
+                    bigints,
+                    unique_cache,
+                )
+            },
+            &headers,
+            || {
+                while frame_iters[frame_i].len() == 0 {
+                    frame_i += 1;
+                }
+                let tagged = frame_iters[frame_i].next().expect("frame snapshot box");
+                snapshot_box_from_tagged(
+                    tagged,
+                    inputargs,
+                    slots,
+                    box_to_unique,
+                    refs,
+                    floats,
+                    bigints,
+                    unique_cache,
+                )
+            },
+            env,
+            minimum_virtualizable_size,
+        )
     }
 
     /// `_list_of_boxes` from tagged snapshot values, encoding each box

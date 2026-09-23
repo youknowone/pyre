@@ -1012,9 +1012,11 @@ impl<'a> Iterator for ByteTraceIter<'a> {
             let resolved = if descr_index == 0 || opcode.is_guard() {
                 None
             } else {
-                let all_descrs = self.trace.metainterp_sd.all_descrs().lock();
-                let all_descr_len = all_descrs.len() as i64;
+                // The boundary is the one `Trace::new` captured, not the
+                // live length — see `Trace::all_descr_len`.
+                let all_descr_len = self.trace.all_descr_len as i64;
                 if descr_index < all_descr_len + 1 {
+                    let all_descrs = self.trace.metainterp_sd.all_descrs().lock();
                     Some(all_descrs[(descr_index - 1) as usize].clone())
                 } else {
                     Some(
@@ -1604,12 +1606,31 @@ pub struct Trace {
 
     /// opencoder.py:472 `self.metainterp_sd = metainterp_sd`.
     ///
-    /// Stores the full static data object so `_encode_descr` and
-    /// `TraceIterator` can read `metainterp_sd.all_descrs` (length +
-    /// contents) for descriptor index arithmetic. Held as
+    /// Stores the full static data object so the decode path can read
+    /// `metainterp_sd.all_descrs`' contents for a global descr index (the
+    /// length both sides classify against is `all_descr_len`). Held as
     /// `Arc<MetaInterpStaticData>` so the Trace can outlive its
     /// creating MetaInterp frame without reshuffling the reference.
     pub metainterp_sd: std::sync::Arc<crate::MetaInterpStaticData>,
+
+    /// opencoder.py `TraceIterator.__init__` `self.all_descr_len =
+    /// len(metainterp_sd.all_descrs)` — the boundary between global and
+    /// local descr indices, captured once.
+    ///
+    /// Upstream reads the live list on both sides of the codec because
+    /// `MetaInterpStaticData.finish_setup` builds `all_descrs` exactly once
+    /// (`descr.py setup_descrs` walks the caches at translation time), so
+    /// encoder and decoder always measure the same number. Pyre's list is
+    /// process-global (`descr_registry.rs`) and grows at runtime whenever
+    /// `pyjitpl.rs take_back_all_descrs` publishes a longer one, so a live
+    /// read would let the decoder use a larger boundary than the encoder
+    /// did and resolve a local index against the global table — a silently
+    /// wrong descr. Capturing the boundary per trace restores, for that
+    /// trace, the frozen-list property upstream relies on.
+    ///
+    /// The captured value never exceeds the live length: the published list
+    /// only ever grows, as `take_back_all_descrs` documents.
+    pub all_descr_len: u32,
 }
 
 impl BaseTrace for Trace {}
@@ -1630,6 +1651,7 @@ impl Trace {
         // prefix: `INIT_SIZE` alone is 4096, and a virtualizable array
         // can reserve more inputargs than that
         // (`create_empty_history` after `initialize_virtualizable`).
+        let all_descr_len = metainterp_sd.all_descrs().lock().len() as u32;
         let mut t = Trace {
             _ops: vec![0u8; INIT_SIZE.max(max_num_inputargs as usize)],
             _pos: max_num_inputargs as usize,
@@ -1666,19 +1688,12 @@ impl Trace {
             _consts_ptr_nodict: 0,
             _deadranges: None,
             metainterp_sd,
+            all_descr_len,
         };
         // opencoder.py — `append_snapshot_array_data_int(0)` so all
         // zero-length arrays share index 0.
         t.append_snapshot_array_data_int(0);
         t
-    }
-
-    /// opencoder.py `len(self.metainterp_sd.all_descrs)` — read
-    /// the global descriptor table length from the attached
-    /// metainterp_sd.
-    #[allow(dead_code)]
-    fn all_descrs_len(&self) -> u32 {
-        self.metainterp_sd.all_descrs().lock().len() as u32
     }
 
     /// opencoder.py set_inputargs(inputargs).
@@ -2597,22 +2612,28 @@ impl Trace {
     /// opencoder.py `_encode_descr(descr)`.
     ///
     /// Two-tier descr numbering mirroring RPython:
-    ///   * Global descrs — `descr.get_descr_index() >= 0`. Encoded as
-    ///     `global_index + 1`. Index range `[1, all_descrs_len + 1)`.
-    ///   * Local descrs — `get_descr_index() == -1`. Appended to
+    ///   * Global descrs — `descr.get_descr_index()` inside
+    ///     `[0, all_descr_len)`. Encoded as `global_index + 1`, so the
+    ///     encoded range is `[1, all_descr_len + 1)`.
+    ///   * Local descrs — everything else. Appended to
     ///     `self._descrs` (which starts with a `None` sentinel at [0]
     ///     so index 0 means "no descr") and encoded as
-    ///     `all_descrs_len + len(_descrs) - 1 + 1`. The TraceIterator
+    ///     `all_descr_len + len(_descrs) - 1 + 1`. The TraceIterator
     ///     decode path looks up such descrs via
     ///     `_descrs[descr_index - all_descr_len - 1]`.
     ///
-    /// Reads `len(self.metainterp_sd.all_descrs)` at encode time —
-    /// this field is populated by `Trace::new` (opencoder.py
-    /// `Trace.__init__(max_num_inputargs, metainterp_sd)`).
+    /// The boundary is `self.all_descr_len`, captured by `Trace::new`, and
+    /// the decode path uses that same captured value — so the two stay
+    /// exact inverses however the process-global list grows afterwards. A
+    /// descr whose global index falls at or past the boundary (stamped
+    /// after this trace started recording) is recorded locally: the decoder
+    /// would otherwise read such an index as local and resolve it against
+    /// `_descrs`.
     pub(crate) fn _encode_descr(&mut self, descr: &majit_ir::DescrRef) -> i64 {
-        let descr_index = descr.get_descr_index();
-        if descr_index >= 0 {
-            return (descr_index as i64) + 1;
+        let all_descr_len = self.all_descr_len as i64;
+        let descr_index = descr.get_descr_index() as i64;
+        if descr_index >= 0 && descr_index < all_descr_len {
+            return descr_index + 1;
         }
         self._descrs.push(Some(descr.clone()));
         // _descrs[0] is the sentinel None; new descrs append from
@@ -2620,7 +2641,7 @@ impl Trace {
         // + 1`. `len - 1` because index 0 is reserved; we want the
         // local-only offset.
         let local_index = (self._descrs.len() as i64) - 1;
-        local_index + (self.all_descrs_len() as i64) + 1
+        local_index + all_descr_len + 1
     }
 
     /// opencoder.py _op_start(opnum, num_argboxes).
@@ -4332,8 +4353,8 @@ mod tests {
     }
 
     /// Phase B4 + S smoke test: `_encode_descr` returns `global_index
-    /// + 1` for descrs with a global index and appends local descrs to
-    /// `_descrs` (RPython opencoder.py:702-707).
+    /// + 1` for descrs inside the captured global range and appends the
+    /// rest to `_descrs` (opencoder.py `_encode_descr`).
     #[test]
     fn test_encode_descr_reads_metainterp_sd() {
         use std::sync::Arc;
@@ -4352,17 +4373,19 @@ mod tests {
         }
 
         let mut buf = TraceRecordBuffer::new(0, empty_sd());
+        // `empty_sd()` captures whatever the process-global registry holds.
+        // Pin the boundary so both tiers are exercised deterministically,
+        // and so `idx: 3` below names a slot that is really inside it.
+        buf.all_descr_len = 4;
 
         // Global descr returns `get_descr_index() + 1`.
         let d_global: majit_ir::DescrRef = Arc::new(D { idx: 3 });
         assert_eq!(buf._encode_descr(&d_global), 4);
         assert_eq!(buf._descrs.len(), 1, "global descr must not append");
 
-        // A local descr's encoded index includes the process-global registry
-        // length, so only assert properties independent of that shared value.
+        // A local descr's encoded index is offset past the boundary.
         let d_local: majit_ir::DescrRef = Arc::new(D { idx: -1 });
-        let encoded = buf._encode_descr(&d_local);
-        assert!(encoded >= 2);
+        assert_eq!(buf._encode_descr(&d_local), 1 + 4 + 1);
         assert_eq!(buf._descrs.len(), 2);
         assert!(Arc::ptr_eq(
             buf._descrs[1].as_ref().expect("local descr appended"),
@@ -4608,6 +4631,92 @@ mod tests {
         assert_eq!(pos_e, pos_a);
         assert_eq!(expected._ops[..expected._pos], actual._ops[..actual._pos]);
         assert_eq!(expected._descrs.len(), actual._descrs.len());
+    }
+
+    /// A descr whose global `descr_index` is fixed at construction, so a
+    /// test can place it inside or past a trace's captured `all_descr_len`.
+    fn descr_with_index(index: i32) -> majit_ir::DescrRef {
+        use std::sync::Arc;
+        #[derive(Debug)]
+        struct D(i32);
+        impl majit_ir::Descr for D {
+            fn index(&self) -> u32 {
+                0
+            }
+            fn get_descr_index(&self) -> i32 {
+                self.0
+            }
+        }
+        Arc::new(D(index))
+    }
+
+    /// `_encode_descr` splits global from local against the boundary
+    /// `Trace::new` captured, never against the live process-global list.
+    #[test]
+    fn encode_descr_classifies_against_the_captured_boundary() {
+        let mut t = TraceRecordBuffer::new(1, empty_sd());
+        t.all_descr_len = 3;
+
+        // Inside the boundary: global, encoded as `descr_index + 1` and
+        // not copied into `_descrs`.
+        assert_eq!(t._encode_descr(&descr_with_index(2)), 3);
+        assert_eq!(t._descrs.len(), 1);
+
+        // At the boundary: local, even though it carries a global index.
+        // Such a descr was stamped after this trace captured its boundary,
+        // so the decoder would read `descr_index + 1` as a local slot.
+        assert_eq!(t._encode_descr(&descr_with_index(3)), 1 + 3 + 1);
+        assert_eq!(t._descrs.len(), 2);
+
+        // Never stamped: local, as upstream.
+        assert_eq!(t._encode_descr(&descr_with_index(-1)), 2 + 3 + 1);
+        assert_eq!(t._descrs.len(), 3);
+    }
+
+    /// Round-trip for a descr carrying a global index at or past the
+    /// trace's captured boundary. Encoding it as `descr_index + 1` puts it
+    /// in the decoder's local range, which resolves against `_descrs` — a
+    /// different descr, or an out-of-bounds slot.
+    #[test]
+    fn a_descr_stamped_past_the_captured_boundary_round_trips() {
+        let mut t = TraceRecordBuffer::new(2, empty_sd());
+        let i0 = t.record_input_arg(Type::Int);
+        let descr = descr_with_index(5);
+        assert!(
+            t.all_descr_len <= 5,
+            "test needs a descr index at or past the captured boundary"
+        );
+        t.record_op(OpCode::CallN, &[Box::ResOp(i0.raw())], Some(&descr));
+
+        let mut it = ByteTraceIter::new(&t, t._start as usize, t._pos, t.max_num_inputargs);
+        let op = it.next().expect("recorded CallN");
+        let decoded = op.getdescr().expect("CallN kept its descr");
+        assert!(
+            std::sync::Arc::ptr_eq(&decoded, &descr),
+            "decoded descr is not the one that was recorded"
+        );
+    }
+
+    /// The decoder offsets a local slot by the boundary the trace captured,
+    /// not by the live length of the process-global list. Those differ as
+    /// soon as `pyjitpl.rs take_back_all_descrs` publishes a longer list
+    /// between a trace's encode and a later decode of it.
+    #[test]
+    fn decode_resolves_a_local_descr_against_the_captured_boundary() {
+        let mut t = TraceRecordBuffer::new(2, empty_sd());
+        // As if the list had held four descrs when this trace was created.
+        t.all_descr_len = 4;
+        let i0 = t.record_input_arg(Type::Int);
+        let descr = descr_with_index(-1);
+        t.record_op(OpCode::CallN, &[Box::ResOp(i0.raw())], Some(&descr));
+
+        let mut it = ByteTraceIter::new(&t, t._start as usize, t._pos, t.max_num_inputargs);
+        let op = it.next().expect("recorded CallN");
+        let decoded = op.getdescr().expect("CallN kept its descr");
+        assert!(
+            std::sync::Arc::ptr_eq(&decoded, &descr),
+            "decoded descr is not the one that was recorded"
+        );
     }
 
     #[test]

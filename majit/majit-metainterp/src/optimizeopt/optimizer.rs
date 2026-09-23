@@ -518,6 +518,10 @@ pub struct Optimizer {
     pub snapshot_vref_boxes: SnapshotBoxes,
     /// Per-guard per-frame (jitcode_index, pc, py_pc) from tracing-time snapshots.
     pub snapshot_frame_pcs: SnapshotFramePcs,
+    /// Byte-mode bridge only. `store_final_boxes_in_guard` numbers one
+    /// guard from `SnapshotIterator` through this source. Loop compile and
+    /// the `Vec<Op>` recorder leave it `None` and use `snapshot_boxes`.
+    pub(crate) byte_bridge_resume: Option<crate::recorder::ByteBridgeResume>,
     /// Phase 1 emit ops carried into Phase 2's lookup surface (6).
     ///
     /// Mirror of `OptContext.phase1_emit_ops`; populated at the end of
@@ -1559,6 +1563,7 @@ impl Optimizer {
             minimum_virtualizable_size: -1,
             snapshot_vref_boxes: Vec::new(),
             snapshot_frame_pcs: SnapshotFramePcs::new(),
+            byte_bridge_resume: None,
             phase1_emit_ops: Vec::new(),
             opt_ops_emitted: 0,
             opt_guards_emitted: 0,
@@ -1606,6 +1611,7 @@ impl Optimizer {
         self.snapshot_vable_boxes = Vec::new();
         self.snapshot_vref_boxes = Vec::new();
         self.snapshot_frame_pcs.clear();
+        self.byte_bridge_resume = None;
         self.phase1_emit_ops.clear();
         self.opt_ops_emitted = 0;
         self.opt_guards_emitted = 0;
@@ -3115,6 +3121,7 @@ impl Optimizer {
         ctx.minimum_virtualizable_size = self.minimum_virtualizable_size;
         ctx.snapshot_vref_boxes = std::mem::take(&mut self.snapshot_vref_boxes);
         ctx.snapshot_frame_pcs = std::mem::take(&mut self.snapshot_frame_pcs);
+        ctx.byte_bridge_resume = self.byte_bridge_resume.take();
 
         sanitize_backend_constants_for_ops(ops.iter().map(|op| &**op), constants);
         // Pre-populate known constants so passes can see them.

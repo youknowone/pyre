@@ -986,43 +986,62 @@ mod jitcode_handle_serde {
 /// three packed bitsets (int, ref, float) via `LivenessIterator`, invoking
 /// the matching callback for each live register index.
 ///
+/// `enumerate_vars` is `jitcode.py` `enumerate_vars`. The by-bank form
+/// ([`enumerate_vars_by_bank`]) is the same walk with the bank passed
+/// instead of selected by callback, because Rust cannot hold three `&mut`
+/// borrows of one closure at once. This entry dispatches on that bank so
+/// existing callers keep the three-callback shape.
+///
 /// RPython places this in `rpython/jit/codewriter/jitcode.py` (not in
 /// metainterp). majit follows the same module placement.
 pub fn enumerate_vars(
-    mut offset: usize,
+    offset: usize,
     all_liveness: &[u8],
     mut callback_i: impl FnMut(u32),
     mut callback_r: impl FnMut(u32),
     mut callback_f: impl FnMut(u32),
 ) {
+    enumerate_vars_by_bank(offset, all_liveness, |bank, index| match bank {
+        majit_ir::Type::Int => callback_i(index),
+        majit_ir::Type::Ref => callback_r(index),
+        majit_ir::Type::Float => callback_f(index),
+        majit_ir::Type::Void => {
+            unreachable!("enumerate_vars walks the int, ref, and float banks only")
+        }
+    });
+}
+
+/// Same walk as `jitcode.py` `enumerate_vars`, tagging each live index with
+/// its bank (`Int`, `Ref`, `Float`). One callback receives the bank because
+/// Rust cannot hold three `&mut` borrows of one closure at once.
+pub fn enumerate_vars_by_bank(
+    mut offset: usize,
+    all_liveness: &[u8],
+    mut callback: impl FnMut(majit_ir::Type, u32),
+) {
     use crate::liveness::LivenessIterator;
-    // jitcode.py:149-151
     let length_i = all_liveness[offset] as u32;
     let length_r = all_liveness[offset + 1] as u32;
     let length_f = all_liveness[offset + 2] as u32;
-    // jitcode.py:152
     offset += 3;
-    // jitcode.py:153-157
     if length_i != 0 {
         let mut it = LivenessIterator::new(offset, length_i, all_liveness);
         for index in &mut it {
-            callback_i(index);
+            callback(majit_ir::Type::Int, index);
         }
         offset = it.offset;
     }
-    // jitcode.py:158-162
     if length_r != 0 {
         let mut it = LivenessIterator::new(offset, length_r, all_liveness);
         for index in &mut it {
-            callback_r(index);
+            callback(majit_ir::Type::Ref, index);
         }
         offset = it.offset;
     }
-    // jitcode.py:163-166
     if length_f != 0 {
         let mut it = LivenessIterator::new(offset, length_f, all_liveness);
         for index in &mut it {
-            callback_f(index);
+            callback(majit_ir::Type::Float, index);
         }
     }
 }
@@ -1481,6 +1500,29 @@ impl BhCallDescr {
             void_word_abi: false,
             extra_info,
             translated_effect_info_id: None,
+            call_stub: OnceLock::new(),
+        }
+    }
+
+    /// Copy of this descr with a different residual-call signature and an
+    /// unresolved stub.
+    ///
+    /// `descr.py CallDescr.create_call_stub` derives the stub from the descr's
+    /// own ARGS and RESULT at the moment the descr is made. A clone that then
+    /// rewrites `arg_classes` / `result_type` would keep a stub built for the
+    /// original signature. [`Clone`] itself may keep a resolved stub when the
+    /// signature is unchanged.
+    pub fn with_signature(&self, arg_classes: String, result_type: char) -> Self {
+        debug_assert_dispatchable(&arg_classes);
+        Self {
+            arg_classes,
+            result_type,
+            result_signed: self.result_signed,
+            result_size: self.result_size,
+            result_erased: self.result_erased,
+            void_word_abi: self.void_word_abi,
+            extra_info: self.extra_info.clone(),
+            translated_effect_info_id: self.translated_effect_info_id,
             call_stub: OnceLock::new(),
         }
     }

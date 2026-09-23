@@ -21,22 +21,26 @@ thread_local! {
     /// rebuilding it on every guard failure is pure waste (the dominant
     /// per-deopt cost). Built once, lent via [`BackEdgeBhBuilder`], and
     /// re-pooled on drop, mirroring `call_jit.rs`'s `BH_BUILDER_RD`.
-    static BACK_EDGE_BH_BUILDER: std::cell::RefCell<Option<crate::blackhole::BlackholeInterpBuilder>> =
+    /// The slot holds a `Box` so a lease moves one pointer rather than the
+    /// builder itself (`warmspot.py` keeps one `BlackholeInterpBuilder` and
+    /// `blackhole.py resume_in_blackhole` reaches it through
+    /// `metainterp_sd.blackholeinterpbuilder`).
+    static BACK_EDGE_BH_BUILDER: std::cell::RefCell<Option<Box<crate::blackhole::BlackholeInterpBuilder>>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// RAII lease of the thread-local back-edge blackhole builder. Takes the
-/// pooled builder out for the duration of one resume and returns it on drop,
+/// pooled `Box` out for the duration of one resume and returns it on drop,
 /// so every early `return` in the resume path re-pools it. If the slot is
 /// empty — first use, or a re-entrant resume already holds it — a fresh
 /// builder is constructed; the surplus is simply dropped when re-pooling.
-struct BackEdgeBhBuilder(Option<crate::blackhole::BlackholeInterpBuilder>);
+struct BackEdgeBhBuilder(Option<Box<crate::blackhole::BlackholeInterpBuilder>>);
 
 impl BackEdgeBhBuilder {
     fn lease() -> Self {
         let builder = BACK_EDGE_BH_BUILDER
             .with(|c| c.borrow_mut().take())
-            .unwrap_or_else(crate::blackhole::build_inline_call_only_bh_builder);
+            .unwrap_or_else(|| Box::new(crate::blackhole::build_inline_call_only_bh_builder()));
         Self(Some(builder))
     }
 }
@@ -52,13 +56,13 @@ impl Drop for BackEdgeBhBuilder {
 impl std::ops::Deref for BackEdgeBhBuilder {
     type Target = crate::blackhole::BlackholeInterpBuilder;
     fn deref(&self) -> &Self::Target {
-        self.0.as_ref().expect("builder leased")
+        self.0.as_deref().expect("builder leased")
     }
 }
 
 impl std::ops::DerefMut for BackEdgeBhBuilder {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.0.as_mut().expect("builder leased")
+        self.0.as_deref_mut().expect("builder leased")
     }
 }
 
@@ -5770,46 +5774,79 @@ impl<S: JitState> JitDriver<S> {
             let mut frames = Vec::with_capacity(sections.len());
             for (depth, (jitcode, pc)) in sections.into_iter().enumerate() {
                 let values = &resume.frames[depth].values;
-                // Every frame reads its own liveness at its own position, which
-                // is what `consume_boxes` does per `f.get_current_position_info()`.
-                // The root's copy is already on the ctx for `setup_bridge_sym`;
-                // recomputing it here keeps one rule for every frame.
-                let reg_indices = crate::resume::read_frame_liveness_reg_indices(
-                    &jitcode,
-                    pc,
-                    op_live,
-                    &all_liveness,
-                );
+                // Every frame visits its own liveness at its own position,
+                // which is what `ResumeDataBoxReader::consume_boxes` does per
+                // `f.get_current_position_info()`: `enumerate_vars` calls one
+                // bank callback per live index and stores nothing. Rebuilt
+                // values follow that bank order (int, then ref, then float;
+                // see `FrameLivenessRegIndices`), so one cursor pairs each
+                // index with the next value. The root frame's materialized
+                // indices stay on the trace ctx for `setup_bridge_sym`, which
+                // is static and has no jitcode.
+                //
+                // The same two conditions `read_frame_liveness_reg_indices`
+                // declines on produce empty banks here, and the count check
+                // then declines unless `values` is empty too.
+                let header = if !jitcode.can_decode_live_vars(pc, op_live) {
+                    if crate::bridge_debug_enabled() {
+                        eprintln!(
+                            "[bridgeB] read_frame_liveness_reg_indices: no liveness startpoint at pc={pc} op_live={op_live} — declining (empty banks)"
+                        );
+                    }
+                    None
+                } else {
+                    let info = jitcode.get_live_vars_info(pc, op_live);
+                    if info + 2 >= all_liveness.len() {
+                        if crate::bridge_debug_enabled() {
+                            eprintln!(
+                                "[bridgeB] read_frame_liveness_reg_indices: liveness info {info} out of range (len={}) at pc={pc} — declining (empty banks)",
+                                all_liveness.len()
+                            );
+                        }
+                        None
+                    } else {
+                        Some((
+                            all_liveness[info] as u32,
+                            all_liveness[info + 1] as u32,
+                            all_liveness[info + 2] as u32,
+                            info,
+                        ))
+                    }
+                };
                 // `consume_boxes` fills every live register of the frame, so a
                 // count that disagrees means the two sides read different
                 // liveness and no per-register pairing off them is trustworthy.
-                if reg_indices.total_len() != values.len() {
+                // `enumerate_vars` walks exactly `length_i + length_r + length_f`
+                // indices, which is that count; the bytes alone decide it.
+                let live_count = match header {
+                    Some((length_i, length_r, length_f, _)) => {
+                        length_i as usize + length_r as usize + length_f as usize
+                    }
+                    None => 0,
+                };
+                if live_count != values.len() {
                     if crate::bridge_debug_enabled() {
                         eprintln!(
-                            "[bridgeB] DECLINE depth={depth} pc={pc} liveness {} != values {}",
-                            reg_indices.total_len(),
+                            "[bridgeB] DECLINE depth={depth} pc={pc} liveness {live_count} != values {}",
                             values.len()
                         );
                     }
                     return Err(Decline::RegCountMismatch);
                 }
-                let banks: [(majit_ir::Type, &Vec<u32>, usize); 3] = [
-                    (majit_ir::Type::Int, &reg_indices.int, 0),
-                    (
-                        majit_ir::Type::Ref,
-                        &reg_indices.ref_,
-                        reg_indices.int.len(),
-                    ),
-                    (
-                        majit_ir::Type::Float,
-                        &reg_indices.float,
-                        reg_indices.int.len() + reg_indices.ref_.len(),
-                    ),
-                ];
                 if crate::bridge_debug_enabled() {
+                    let shown = if header.is_some() {
+                        crate::resume::read_frame_liveness_reg_indices(
+                            &jitcode,
+                            pc,
+                            op_live,
+                            &all_liveness,
+                        )
+                    } else {
+                        crate::resume::FrameLivenessRegIndices::default()
+                    };
                     eprintln!(
                         "[bridgeB] liveness pc={pc} i={:?} r={:?} f={:?}",
-                        reg_indices.int, reg_indices.ref_, reg_indices.float
+                        shown.int, shown.ref_, shown.float
                     );
                     let code = &jitcode.code;
                     let n = code.len().saturating_sub(pc).min(16);
@@ -5820,76 +5857,100 @@ impl<S: JitState> JitDriver<S> {
                     eprintln!();
                 }
                 let mut regs = Vec::with_capacity(values.len());
-                for (bank, indices, base) in banks {
-                    for (i, &index) in indices.iter().enumerate() {
-                        let (opref, value) = match &values[base + i] {
-                            RebuiltValue::Box(n, kind) => crate::jit_state::bridge_decode_red(
-                                *n,
-                                *kind,
-                                raw_values,
-                                &fail_types,
-                            ),
-                            RebuiltValue::Const(c) => {
-                                let bits = c.as_raw_i64();
-                                let opref = match bank {
-                                    majit_ir::Type::Ref => ctx.const_ref(bits),
-                                    majit_ir::Type::Float => ctx.const_float(bits),
-                                    _ => ctx.const_int(bits),
-                                };
-                                (opref, bits)
+                if let Some((_, _, _, info)) = header {
+                    let mut decline: Option<Decline> = None;
+                    let mut cursor = 0usize;
+                    {
+                        let mut consume = |bank: majit_ir::Type, index: u32| {
+                            if decline.is_some() {
+                                return;
                             }
-                            // resume.py consume_boxes → getvirtual: a virtual
-                            // is allocated and the register holds the object.
-                            // Unassigned still has nothing to execute.
-                            RebuiltValue::Virtual(vidx) => {
-                                let rd_virtuals =
-                                    resume.storage.as_ref().map(|storage| storage.rd_virtuals());
-                                let opref = crate::materialize_bridge_virtual(
-                                    ctx,
-                                    *vidx,
-                                    rd_virtuals,
-                                    resume,
-                                    &mut virt_cache,
-                                );
-                                let bits = if opref.is_none() {
-                                    None
-                                } else {
-                                    virt_cache.concrete_root_of(opref).or_else(|| {
-                                        ctx.box_value(opref).and_then(|value| match value {
-                                            majit_ir::Value::Ref(r) => Some(r.as_usize() as i64),
-                                            majit_ir::Value::Int(i) => Some(i),
-                                            majit_ir::Value::Float(f) => Some(f.to_bits() as i64),
-                                            majit_ir::Value::Void => None,
+                            let (opref, value) = match &values[cursor] {
+                                RebuiltValue::Box(n, kind) => crate::jit_state::bridge_decode_red(
+                                    *n,
+                                    *kind,
+                                    raw_values,
+                                    &fail_types,
+                                ),
+                                RebuiltValue::Const(c) => {
+                                    let bits = c.as_raw_i64();
+                                    let opref = match bank {
+                                        majit_ir::Type::Ref => ctx.const_ref(bits),
+                                        majit_ir::Type::Float => ctx.const_float(bits),
+                                        _ => ctx.const_int(bits),
+                                    };
+                                    (opref, bits)
+                                }
+                                // resume.py consume_boxes → getvirtual: a virtual
+                                // is allocated and the register holds the object.
+                                // Unassigned still has nothing to execute.
+                                RebuiltValue::Virtual(vidx) => {
+                                    let rd_virtuals = resume
+                                        .storage
+                                        .as_ref()
+                                        .map(|storage| storage.rd_virtuals());
+                                    let opref = crate::materialize_bridge_virtual(
+                                        ctx,
+                                        *vidx,
+                                        rd_virtuals,
+                                        resume,
+                                        &mut virt_cache,
+                                    );
+                                    let bits = if opref.is_none() {
+                                        None
+                                    } else {
+                                        virt_cache.concrete_root_of(opref).or_else(|| {
+                                            ctx.box_value(opref).and_then(|value| match value {
+                                                majit_ir::Value::Ref(r) => {
+                                                    Some(r.as_usize() as i64)
+                                                }
+                                                majit_ir::Value::Int(i) => Some(i),
+                                                majit_ir::Value::Float(f) => {
+                                                    Some(f.to_bits() as i64)
+                                                }
+                                                majit_ir::Value::Void => None,
+                                            })
                                         })
-                                    })
-                                };
-                                let Some(bits) = bits else {
+                                    };
+                                    let Some(bits) = bits else {
+                                        if crate::bridge_debug_enabled() {
+                                            eprintln!(
+                                                "[bridgeB] DECLINE depth={depth} virtual {vidx} \
+                                                 has no concrete"
+                                            );
+                                        }
+                                        decline = Some(Decline::UnreadableRegister);
+                                        return;
+                                    };
+                                    (opref, bits)
+                                }
+                                RebuiltValue::Unassigned => {
                                     if crate::bridge_debug_enabled() {
                                         eprintln!(
-                                            "[bridgeB] DECLINE depth={depth} virtual {vidx} \
-                                             has no concrete"
+                                            "[bridgeB] DECLINE depth={depth} unreadable slot {:?}",
+                                            values[cursor]
                                         );
                                     }
-                                    return Err(Decline::UnreadableRegister);
-                                };
-                                (opref, bits)
-                            }
-                            RebuiltValue::Unassigned => {
-                                if crate::bridge_debug_enabled() {
-                                    eprintln!(
-                                        "[bridgeB] DECLINE depth={depth} unreadable slot {:?}",
-                                        values[base + i]
-                                    );
+                                    decline = Some(Decline::UnreadableRegister);
+                                    return;
                                 }
-                                return Err(Decline::UnreadableRegister);
-                            }
+                            };
+                            regs.push(crate::jit_state::GuardResumeReg {
+                                bank,
+                                index,
+                                opref,
+                                value,
+                            });
+                            cursor += 1;
                         };
-                        regs.push(crate::jit_state::GuardResumeReg {
-                            bank,
-                            index,
-                            opref,
-                            value,
-                        });
+                        majit_translate::codewriter::jitcode::enumerate_vars_by_bank(
+                            info,
+                            &all_liveness,
+                            |bank, index| consume(bank, index),
+                        );
+                    }
+                    if let Some(why) = decline {
+                        return Err(why);
                     }
                 }
                 if crate::bridge_debug_enabled() {

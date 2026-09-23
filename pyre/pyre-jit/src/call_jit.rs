@@ -2924,10 +2924,17 @@ pub fn blackhole_resume_via_rd_numb<'df>(
                 // `[frame:r, ec:r]` (`interp_jit.py:67-68`) = 2 int + 3 ref.
                 // `bh.jitcode.calldescr` is the traced function's own frame-based
                 // residual-call descr and does not describe the runner.
-                let mut d = bh.jitcode.calldescr.clone();
-                d.arg_classes = "iirrr".to_string();
-                d.result_type = 'r';
-                d
+                // Fresh descr so `descr.py CallDescr.create_call_stub` sees
+                // `"iirrr"` / `'r'`. Cloning `bh.jitcode.calldescr` and
+                // rewriting those two fields would keep a stub selected for
+                // the traced function (`BhCallDescr::clone` copies a resolved
+                // `call_stub`). `from_arg_classes` leaves the stub unresolved
+                // and keeps extra_info.
+                majit_metainterp::blackhole::BhCallDescr::from_arg_classes(
+                    "iirrr".to_string(),
+                    'r',
+                    bh.jitcode.calldescr.extra_info.clone(),
+                )
             },
             // `get_portal_runner` reaches this table by INDEX
             // (`jitdrivers_sd[jdindex]`), so the driver never has to be found

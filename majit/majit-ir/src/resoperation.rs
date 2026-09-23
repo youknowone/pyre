@@ -2499,6 +2499,12 @@ const THIN_STAMP_MASK: u64 = 0x3f;
 const THIN_STAMPED_BIT: u64 = 1u64 << 61;
 const THIN_STAMPED_ID_SHIFT: u32 = 48;
 const THIN_STAMPED_ID_MASK: u64 = 0x1fff;
+/// Id `0x1FFE` is not issued. With [`THIN_STAMPED_BIT`] and
+/// [`THIN_DESCR_BIT`] it is bit-identical to [`SLOT_STAMP_INLINE_TAG`],
+/// so a payload whose bits 32-47 are clear (every wasm32 pointer) is
+/// read back as a stamp-only word and [`DescrSlot::borrow`] drops the
+/// descr. Callers already promote when intern returns `None`.
+const THIN_STAMPED_ID_LIMIT: u64 = 0x1FFE;
 const THIN_STAMPED_SLOT_COUNT: usize = THIN_STAMPED_ID_MASK as usize + 1;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -2569,7 +2575,9 @@ fn is_stamp_box(w: u64) -> bool {
 }
 
 fn thin_stamped_at(w: u64) -> Option<ThinStamped> {
-    if w & THIN_STAMPED_BIT == 0 {
+    // A stamp-only word shares bit 61 with a thin stamp. Do not look
+    // that tag up: intern id `0x1FFE` lives at the same index.
+    if w & THIN_STAMPED_BIT == 0 || is_stamp_inline(w) {
         return None;
     }
     let id = ((w >> THIN_STAMPED_ID_SHIFT) & THIN_STAMPED_ID_MASK) as usize;
@@ -2597,6 +2605,15 @@ fn thin_fwd_from_word(w: u64) -> u64 {
     }
 }
 
+/// Thin-stamped slot word, or `None` when that word would be
+/// bit-identical to a stamp-only slot. Callers promote to
+/// [`ThinStamp`] / [`ThinFwd`], which already store both.
+fn thin_stamped_payload_word(payload: u64, id: u64) -> Option<u64> {
+    debug_assert_eq!(payload & !THIN_DESCR_PTR_MASK, 0);
+    let w = payload | (id << THIN_STAMPED_ID_SHIFT) | THIN_STAMPED_BIT | THIN_DESCR_BIT;
+    if is_stamp_inline(w) { None } else { Some(w) }
+}
+
 fn thin_with_stamp(thin: u64, stamp: u32) -> Option<u64> {
     let data = thin & THIN_DESCR_PTR_MASK;
     let vtable_id = thin_vtable_id(thin);
@@ -2605,14 +2622,15 @@ fn thin_with_stamp(thin: u64, stamp: u32) -> Option<u64> {
     }
     if stamp < 64 && stamp & (1 << 5) == 0 {
         // Bit 5 would set THIN_STAMPED_BIT (61); those values intern.
-        return Some(
-            data | (u64::from(vtable_id) << THIN_DESCR_ID_SHIFT)
-                | (u64::from(stamp) << THIN_STAMP_SHIFT)
-                | THIN_DESCR_BIT,
-        );
+        let w = data
+            | (u64::from(vtable_id) << THIN_DESCR_ID_SHIFT)
+            | (u64::from(stamp) << THIN_STAMP_SHIFT)
+            | THIN_DESCR_BIT;
+        if !is_stamp_inline(w) {
+            return Some(w);
+        }
     }
-    intern_thin_stamped(vtable_id, stamp, 0, 0)
-        .map(|id| data | (id << THIN_STAMPED_ID_SHIFT) | THIN_STAMPED_BIT | THIN_DESCR_BIT)
+    intern_thin_stamped(vtable_id, stamp, 0, 0).and_then(|id| thin_stamped_payload_word(data, id))
 }
 
 fn intern_thin_stamped(vtable: u8, stamp: u32, data: usize, fwd_tag: u8) -> Option<u64> {
@@ -2626,7 +2644,9 @@ fn intern_thin_stamped(vtable: u8, stamp: u32, data: usize, fwd_tag: u8) -> Opti
     if let Some(&i) = v.index.get(&key) {
         return Some(i as u64);
     }
-    if v.len >= THIN_STAMPED_SLOT_COUNT {
+    // Stop before id `0x1FFE`. The slot array still covers the whole
+    // 13-bit mask so a word stamped under the old limit can be read.
+    if v.len >= THIN_STAMPED_ID_LIMIT as usize {
         return None;
     }
     let i = v.len;
@@ -2646,7 +2666,7 @@ fn thin_with_forwarded(thin: u64, packed: u64) -> Option<u64> {
     let tag = (packed & 7) as u8;
     let id = intern_thin_stamped(thin_vtable_id(thin), thin_stamp(thin), data, tag)?;
     let fwd = packed & THIN_DESCR_PTR_MASK & !7;
-    Some(fwd | (id << THIN_STAMPED_ID_SHIFT) | THIN_STAMPED_BIT | THIN_DESCR_BIT)
+    thin_stamped_payload_word(fwd, id)
 }
 
 fn is_stamp_inline(w: u64) -> bool {
@@ -2988,18 +3008,17 @@ impl DescrSlot {
         }
         if is_thin_descr(w) {
             if thin_fwd_from_word(w) != 0 {
-                if let Some(id) = intern_thin_stamped(
-                    thin_vtable_id(w),
-                    stamp,
-                    thin_data_ptr(w),
-                    thin_stamped_at(w).map(|e| e.fwd_tag).unwrap_or(0),
-                ) {
+                let fwd_tag = thin_stamped_at(w).map(|e| e.fwd_tag).unwrap_or(0);
+                if let Some(id) =
+                    intern_thin_stamped(thin_vtable_id(w), stamp, thin_data_ptr(w), fwd_tag)
+                {
                     let fwd = w & THIN_DESCR_PTR_MASK;
-                    unsafe {
-                        *self.word.get() =
-                            fwd | (id << THIN_STAMPED_ID_SHIFT) | THIN_STAMPED_BIT | THIN_DESCR_BIT;
+                    if let Some(nw) = thin_stamped_payload_word(fwd, id) {
+                        unsafe {
+                            *self.word.get() = nw;
+                        }
+                        return;
                     }
-                    return;
                 }
             } else if let Some(thin) = thin_with_stamp(w, stamp) {
                 unsafe {
@@ -6544,6 +6563,97 @@ mod tests {
         assert_eq!(op.get_value(), Some(crate::value::Value::Int(42)));
         op.set_value(crate::value::Value::Int(-7));
         assert_eq!(op.get_value(), Some(crate::value::Value::Int(-7)));
+    }
+
+    #[test]
+    fn descr_and_stamp_coexist_in_either_order() {
+        let descr = crate::make_loop_target_descr(11, false);
+        let stamped_after = Op::with_descr(OpCode::GetfieldGcI, &[], descr.clone());
+        stamped_after.set_value(crate::value::Value::Int(0x123456));
+        assert!(std::sync::Arc::ptr_eq(
+            &stamped_after
+                .descr
+                .borrow()
+                .expect("descr survives a later stamp"),
+            &descr,
+        ));
+        assert_eq!(
+            stamped_after.get_value(),
+            Some(crate::value::Value::Int(0x123456))
+        );
+
+        let descr_after = Op::new(OpCode::GetfieldGcR, &[]);
+        descr_after.set_value(crate::value::Value::Int(-42));
+        descr_after.setdescr(descr.clone());
+        assert!(std::sync::Arc::ptr_eq(
+            &descr_after
+                .descr
+                .borrow()
+                .expect("stamp survives a later descr"),
+            &descr,
+        ));
+        assert_eq!(descr_after.get_value(), Some(crate::value::Value::Int(-42)));
+    }
+
+    #[test]
+    fn low_pointer_thin_stamp_is_not_read_as_stamp_inline() {
+        // Id 0x1FFE plus a 32-bit payload sets the `SLOT_STAMP_INLINE_TAG`
+        // bits, and wasm32 descr pointers are 32-bit, so bits 32-47 are
+        // clear. `is_stamp_inline` tells the two apart by the low three
+        // bits: a packed stamp is never 8-aligned, a descr payload always
+        // is. The word stays a readable thin descr, and `intern_thin_stamped`
+        // still never issues that id.
+        let payload = 0x00ec9ee8u64;
+        let aliased = super::thin_stamped_payload_word(payload, 0x1FFE).unwrap();
+        assert!(super::is_thin_descr(aliased));
+        assert!(!super::is_stamp_inline(aliased));
+        let readable = super::thin_stamped_payload_word(payload, 1).unwrap();
+        assert!(super::is_thin_descr(readable));
+        assert!(!super::is_stamp_inline(readable));
+        assert_eq!(readable & super::THIN_DESCR_PTR_MASK, payload);
+
+        let thin = payload | super::THIN_DESCR_BIT;
+        // `pack_stamp` of an out-of-range int is `STAMP_WIDE | (id << 2)`.
+        // The first ids fit the 6-bit thin field and never consult the
+        // intern table. Advance until the stamp must intern.
+        let mut probe = i64::MAX;
+        let mut stamp = super::pack_stamp(crate::value::Value::Int(probe));
+        while stamp < 64 && stamp & (1 << 5) == 0 {
+            probe -= 1;
+            stamp = super::pack_stamp(crate::value::Value::Int(probe));
+        }
+
+        // `intern_thin_stamped` refuses once `len` hits
+        // `THIN_STAMPED_ID_LIMIT`, after the index hit. Raise `len` only.
+        // `THIN_STAMPED_SLOTS` is write-once: a dummy `set` survives any
+        // later rewind, the next intern's `set` fails, and
+        // `thin_stamped_at` reads the dummy.
+        let saved_len = {
+            let mut table = super::THIN_STAMPED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let saved = table.len;
+            table.len = super::THIN_STAMPED_ID_LIMIT as usize;
+            saved
+        };
+        let refused = super::thin_with_stamp(thin, stamp).is_none();
+        let descr = crate::make_loop_target_descr(12, false);
+        let op = Op::with_descr(OpCode::GetfieldGcI, &[], descr.clone());
+        op.set_value(crate::value::Value::Int(probe));
+        let promoted_descr = op.descr.borrow();
+        let promoted_value = op.get_value();
+        {
+            let mut table = super::THIN_STAMPED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            table.len = saved_len;
+        }
+        assert!(refused);
+        assert!(std::sync::Arc::ptr_eq(
+            &promoted_descr.expect("promoted stamp keeps the descr"),
+            &descr,
+        ));
+        assert_eq!(promoted_value, Some(crate::value::Value::Int(probe)));
     }
 
     #[test]

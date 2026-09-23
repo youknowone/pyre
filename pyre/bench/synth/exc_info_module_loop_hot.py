@@ -1,4 +1,12 @@
-# pyre-check: max-pypy-ratio=25
+# pyre-check: max-pypy-ratio=5
+# Fitted 2026-09-23, darwin-arm64, dynasm and cranelift, execution-only
+# ratios as check.py printed them:
+#   run 1, 1-min load 14.63 at start: dynasm 3.7x (0.37s vs pypy 0.11s),
+#     cranelift 3.8x (0.39s vs pypy 0.11s)
+#   run 2, 1-min load 31.96 at start: dynasm 2.4x (0.35s vs pypy 0.16s),
+#     cranelift 2.7x (0.39s vs pypy 0.16s)
+# 5 is above the slowest reading, 3.8x. 6 times the fastest, 2.4x, is 14.4,
+# and the derived floor 5/6 is 0.833, under 2.4x.
 # Module-scope `for i in range(N)` whose body raises, catches, and reads
 # sys.exc_info() both inside and after the handler.  At module scope the loop
 # variable `i` is a STORE_NAME (a global-dict residual), not a STORE_FAST frame
@@ -11,7 +19,7 @@
 
 import sys
 
-N = 50000
+N = 15_000_000
 
 exc_info_inside = 0
 exc_info_after_none = 0

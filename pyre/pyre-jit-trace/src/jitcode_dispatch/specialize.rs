@@ -11327,6 +11327,254 @@ pub(crate) fn try_walker_orthodox_binary_op<Sym: WalkSym>(
     Ok(outcome)
 }
 
+/// `==` / `!=` of two exact array-backed tuples no longer than
+/// [`pyre_object::tupleobject::UNROLL_CUTOFF`].
+///
+/// Element equality is only folded for exact ints and `None`. Anything
+/// else — a specialised layout, a subclass, a nested tuple — stays the
+/// residual `compare_value_from_tag`, which would force both operands.
+/// Item `__eq__` of an int or `None` has no side effect, so comparing
+/// every element (instead of returning at the first difference) is the
+/// same answer `compare_tuples` produces.
+fn try_walker_fold_small_tuple_eq<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    op_tag: i64,
+    lhs: OpRef,
+    rhs: OpRef,
+    lhs_obj: pyre_object::PyObjectRef,
+    rhs_obj: pyre_object::PyObjectRef,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
+        return Ok(None);
+    }
+    let negate = match op_tag {
+        4 => false,
+        5 => true,
+        _ => return Ok(None),
+    };
+    let tuple_type = &pyre_object::TUPLE_TYPE as *const pyre_object::pyobject::PyType;
+    let mut lhs_items = Vec::new();
+    let mut rhs_items = Vec::new();
+    unsafe {
+        if !pyre_object::is_exact_tuple(lhs_obj)
+            || !pyre_object::is_exact_tuple(rhs_obj)
+            || !std::ptr::eq((*lhs_obj).ob_type, tuple_type)
+            || !std::ptr::eq((*rhs_obj).ob_type, tuple_type)
+        {
+            return Ok(None);
+        }
+        let lhs_len = pyre_object::w_tuple_len(lhs_obj);
+        let rhs_len = pyre_object::w_tuple_len(rhs_obj);
+        if lhs_len > pyre_object::tupleobject::UNROLL_CUTOFF
+            || rhs_len > pyre_object::tupleobject::UNROLL_CUTOFF
+        {
+            return Ok(None);
+        }
+        for index in 0..lhs_len {
+            let Some(item) = pyre_object::w_tuple_getitem(lhs_obj, index as i64) else {
+                return Ok(None);
+            };
+            lhs_items.push(item);
+        }
+        for index in 0..rhs_len {
+            let Some(item) = pyre_object::w_tuple_getitem(rhs_obj, index as i64) else {
+                return Ok(None);
+            };
+            rhs_items.push(item);
+        }
+    }
+
+    enum Pair {
+        None,
+        Int(i64, i64, pyre_object::PyObjectRef, pyre_object::PyObjectRef),
+    }
+    let mut pairs = Vec::new();
+    if lhs_items.len() == rhs_items.len() {
+        let int_typeobj = pyre_object::get_instantiate(&pyre_object::INT_TYPE);
+        let exact_int = |obj: pyre_object::PyObjectRef| -> Option<i64> {
+            if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj)
+            {
+                return None;
+            }
+            unsafe {
+                if !pyre_object::is_exact_type(obj, &pyre_object::INT_TYPE)
+                    || !std::ptr::eq((*obj).w_class, int_typeobj)
+                {
+                    return None;
+                }
+                Some(pyre_object::w_int_get_value(obj))
+            }
+        };
+        for (&left, &right) in lhs_items.iter().zip(rhs_items.iter()) {
+            if unsafe { pyre_object::is_none(left) && pyre_object::is_none(right) } {
+                pairs.push(Pair::None);
+            } else if let (Some(left_raw), Some(right_raw)) = (exact_int(left), exact_int(right)) {
+                pairs.push(Pair::Int(left_raw, right_raw, left, right));
+            } else {
+                return Ok(None);
+            }
+        }
+    }
+
+    let tuple_type_addr = tuple_type as i64;
+    let tuple_class = pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE);
+    walker_guard_class(ctx, op_pc, lhs, tuple_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, lhs, tuple_class)?;
+    walker_guard_class(ctx, op_pc, rhs, tuple_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, rhs, tuple_class)?;
+
+    let items_descr = crate::descr::tuple_wrappeditems_descr();
+    let array_descr = crate::state::pyobject_gcarray_descr();
+    let load_block = |ctx: &mut WalkContext<'_, '_, Sym>,
+                      tuple: OpRef,
+                      tuple_obj: pyre_object::PyObjectRef|
+     -> OpRef {
+        let block = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, tuple, items_descr.clone());
+        let wrapped = unsafe {
+            (*(tuple_obj as *const pyre_object::tupleobject::W_TupleObject)).wrappeditems
+        };
+        ctx.trace_ctx.set_opref_concrete(
+            block,
+            majit_ir::Value::Ref(majit_ir::GcRef(wrapped as usize)),
+        );
+        block
+    };
+    let lhs_block = load_block(ctx, lhs, lhs_obj);
+    let rhs_block = load_block(ctx, rhs, rhs_obj);
+    let pin_len = |ctx: &mut WalkContext<'_, '_, Sym>,
+                   block: OpRef,
+                   len: usize|
+     -> Result<(), DispatchError> {
+        let len_op = crate::state::opimpl_arraylen_gc(ctx.trace_ctx, block, array_descr.clone());
+        if !len_op.is_constant() {
+            let expected = ctx.trace_ctx.const_int(len as i64);
+            let same = ctx.trace_ctx.record_op(OpCode::IntEq, &[len_op, expected]);
+            ctx.trace_ctx
+                .set_opref_concrete(same, majit_ir::Value::Int(1));
+            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[same])?;
+        }
+        Ok(())
+    };
+    pin_len(ctx, lhs_block, lhs_items.len())?;
+    pin_len(ctx, rhs_block, rhs_items.len())?;
+
+    let (truth, observed) = if lhs_items.len() != rhs_items.len() {
+        let value = i64::from(negate);
+        (ctx.trace_ctx.const_int(value), negate)
+    } else {
+        let none_obj = pyre_object::w_none();
+        let mut acc = ctx.trace_ctx.const_int(1);
+        let mut acc_value = 1i64;
+        for (index, pair) in pairs.iter().enumerate() {
+            let index_op = ctx.trace_ctx.const_int(index as i64);
+            let left = crate::state::trace_items_block_getitem_value_pure(
+                ctx.trace_ctx,
+                lhs_block,
+                index_op,
+            );
+            let right = crate::state::trace_items_block_getitem_value_pure(
+                ctx.trace_ctx,
+                rhs_block,
+                index_op,
+            );
+            match *pair {
+                Pair::None => {
+                    ctx.trace_ctx.set_opref_concrete(
+                        left,
+                        majit_ir::Value::Ref(majit_ir::GcRef(none_obj as usize)),
+                    );
+                    ctx.trace_ctx.set_opref_concrete(
+                        right,
+                        majit_ir::Value::Ref(majit_ir::GcRef(none_obj as usize)),
+                    );
+                    let expected = ctx.trace_ctx.const_ref(none_obj as i64);
+                    walker_emit_fold_guard_with_snapshot(
+                        ctx,
+                        op_pc,
+                        OpCode::GuardValue,
+                        &[left, expected],
+                    )?;
+                    walker_emit_fold_guard_with_snapshot(
+                        ctx,
+                        op_pc,
+                        OpCode::GuardValue,
+                        &[right, expected],
+                    )?;
+                }
+                Pair::Int(left_raw, right_raw, left_obj, right_obj) => {
+                    ctx.trace_ctx.set_opref_concrete(
+                        left,
+                        majit_ir::Value::Ref(majit_ir::GcRef(left_obj as usize)),
+                    );
+                    ctx.trace_ctx.set_opref_concrete(
+                        right,
+                        majit_ir::Value::Ref(majit_ir::GcRef(right_obj as usize)),
+                    );
+                    let (left_type, left_descr) =
+                        crate::state::int_or_bool_unbox_type_descr(left_obj);
+                    let (right_type, right_descr) =
+                        crate::state::int_or_bool_unbox_type_descr(right_obj);
+                    let left_unboxed = walker_unbox_int_exact(
+                        ctx,
+                        op_pc,
+                        left,
+                        left_type,
+                        left_descr,
+                        walker_numeric_builtin_class(left_obj),
+                    )?;
+                    let right_unboxed = walker_unbox_int_exact(
+                        ctx,
+                        op_pc,
+                        right,
+                        right_type,
+                        right_descr,
+                        walker_numeric_builtin_class(right_obj),
+                    )?;
+                    let eq = ctx
+                        .trace_ctx
+                        .record_op(OpCode::IntEq, &[left_unboxed, right_unboxed]);
+                    let eq_value = i64::from(left_raw == right_raw);
+                    ctx.trace_ctx
+                        .set_opref_concrete(eq, majit_ir::Value::Int(eq_value));
+                    let next = ctx.trace_ctx.record_op(OpCode::IntAnd, &[acc, eq]);
+                    acc_value &= eq_value;
+                    ctx.trace_ctx
+                        .set_opref_concrete(next, majit_ir::Value::Int(acc_value));
+                    acc = next;
+                }
+            }
+        }
+        if negate {
+            let one = ctx.trace_ctx.const_int(1);
+            let inverted = ctx.trace_ctx.record_op(OpCode::IntXor, &[acc, one]);
+            let inverted_value = acc_value ^ 1;
+            ctx.trace_ctx
+                .set_opref_concrete(inverted, majit_ir::Value::Int(inverted_value));
+            (inverted, inverted_value != 0)
+        } else {
+            (acc, acc_value != 0)
+        }
+    };
+    let boxed = match walker_newbool_guarded(ctx, op_pc, truth, observed, dst_bank)? {
+        Some(boxed) => boxed,
+        None => {
+            let boxed =
+                crate::helpers::emit_trace_bool_value_from_truth(ctx.trace_ctx, truth, false);
+            let result_obj = pyre_object::w_bool_from(observed);
+            ctx.trace_ctx.set_opref_concrete(
+                boxed,
+                majit_ir::Value::Ref(majit_ir::GcRef(result_obj as usize)),
+            );
+            boxed
+        }
+    };
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
+    Ok(Some(()))
+}
+
 /// `COMPARE_OP` on two exact builtin machine ints (`int`, `bool`): descend
 /// `compare_value_from_tag` → `compare` → `compare_slot` → `int_lt` and its
 /// siblings instead of re-emitting the arm by hand
@@ -11375,6 +11623,20 @@ pub(crate) fn try_walker_orthodox_compare_op<Sym: WalkSym>(
     }
     if !(0..=5).contains(&op_tag) {
         return Ok(None);
+    }
+    // `compare_tuples` is `@jit.look_inside_iff(unroll_condition)`, but
+    // `unroll_condition` is false outside the JIT (`isconstant` is
+    // residual). The concrete lengths are known here, so a short exact
+    // pair is folded directly. A `CallMayForce` would force both tuples.
+    if let (Some(lhs_obj), Some(rhs_obj)) = (
+        walker_concrete_ref_object(ctx, r_args[0]),
+        walker_concrete_ref_object(ctx, r_args[1]),
+    ) && try_walker_fold_small_tuple_eq(
+        ctx, op_pc, op_tag, r_args[0], r_args[1], lhs_obj, rhs_obj, dst, dst_bank,
+    )?
+    .is_some()
+    {
+        return Ok(Some(DispatchOutcome::Continue));
     }
     let mut operands = [(OpRef::NONE, std::ptr::null_mut()); 2];
     for (slot, &operand) in operands.iter_mut().zip(r_args) {

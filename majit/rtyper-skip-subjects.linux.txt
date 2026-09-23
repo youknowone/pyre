@@ -1249,7 +1249,6 @@ two-phase-never-a-subject	pyre_interpreter::pyopcode::opcode_unary_not
 two-phase-never-a-subject	pyre_interpreter::pytraceback::record_application_traceback
 two-phase-never-a-subject	pyre_interpreter::pytraceback::w_pytraceback_new
 two-phase-never-a-subject	pyre_interpreter::runtime_ops::build_map_from_refs
-two-phase-never-a-subject	pyre_interpreter::runtime_ops::build_tuple_from_args
 two-phase-never-a-subject	pyre_interpreter::runtime_ops::classify_callable
 two-phase-never-a-subject	pyre_interpreter::runtime_ops::jit_build_tuple_3
 two-phase-never-a-subject	pyre_interpreter::runtime_ops::jit_clear_published_exception

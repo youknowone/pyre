@@ -10,6 +10,7 @@ pub use gcreftracer::{GcTable, install_gc_table_walker};
 ///
 /// Reference: rpython/memory/gc/incminimark.py, rpython/jit/backend/llsupport/gc.py
 use majit_ir::{Const, ConstMap, GcRef, OpRc};
+pub use nursery_clock::HostNurseryClock;
 pub use trace::{
     ClassTypeLayout, CustomDataLayout, TypeEntry, TypeEntryTail, TypeInfo, TypeInfoLayout,
     VarSizeTypeInfoLayout,
@@ -37,6 +38,7 @@ pub mod hook;
 pub mod hook_cell;
 pub mod minimarkpage;
 pub mod nursery;
+pub mod nursery_clock;
 pub mod oldgen;
 pub mod rawrefcount;
 pub mod rewrite;

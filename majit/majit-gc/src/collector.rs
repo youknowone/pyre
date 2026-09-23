@@ -653,7 +653,7 @@ fn estimate_best_nursery_size() -> usize {
 /// `nonlarge_max + 1` directly as the large-object cutoff, so the doubling is
 /// of the cutoff itself.  A nursery below this cannot hold one non-large
 /// object, which is why upstream never lets the environment configure one.
-const LARGE_OBJECT_THRESHOLD: usize = (16384 + 512) * std::mem::size_of::<usize>();
+pub(crate) const LARGE_OBJECT_THRESHOLD: usize = (16384 + 512) * std::mem::size_of::<usize>();
 
 /// incminimark.py:459-473 — the environment-configured nursery size, and the
 /// `debug_tiny_nursery` budget a request below `minsize` turns into.
@@ -1261,6 +1261,9 @@ impl MiniMarkGC {
     /// Create a new GC with custom configuration.
     pub fn with_config(config: GcConfig) -> Self {
         let nursery_size = config.nursery_size;
+        // The host-allocation decay clock ticks once per nursery's worth of
+        // host bytes (`nursery_clock`).
+        crate::nursery_clock::set_quantum(nursery_size);
 
         // incminimark.py:261,268,475-481 — major_collection_threshold /
         // growth_rate_max from TRANSLATION_PARAMS, overridable by env.

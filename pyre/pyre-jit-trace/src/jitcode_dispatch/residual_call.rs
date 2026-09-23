@@ -32,6 +32,31 @@ fn fnaddr_set(pred: impl Fn(&str) -> bool) -> std::collections::HashSet<i64> {
         .collect()
 }
 
+/// Address a walker fold compares a residual's funcbox against.
+///
+/// The JitCode constant is patched from `jit_trace_fnaddrs` (`fnaddr_for_target`
+/// / `direct_funcptr_value`, then `patch_constants_i_fnaddrs`), so the match
+/// must use [`crate::runtime_fnaddr_patch::runtime_fnaddr_by_path`] rather than
+/// a second `fn as usize`: wasm32 table slots are not stable across cast sites.
+///
+/// `None` on every path falls back to `raw` so an unpublished name cannot
+/// silently disable the fold on native, where the two casts agree. An
+/// unpublished path is a unit-test failure, not a production decline.
+fn walker_published_fnaddr(paths: &[&'static str], raw: i64) -> i64 {
+    paths
+        .iter()
+        .copied()
+        .find_map(crate::runtime_fnaddr_patch::runtime_fnaddr_by_path)
+        .unwrap_or(raw)
+}
+
+static TAKE_LAST_EXEC_CTX_FNADDR: std::sync::LazyLock<i64> = std::sync::LazyLock::new(|| {
+    walker_published_fnaddr(
+        &["pyre_interpreter::call::take_last_exec_ctx"],
+        pyre_interpreter::call::take_last_exec_ctx as *const () as usize as i64,
+    )
+});
+
 /// Residuals whose registered path names a `bigint` helper: their Ref slots
 /// carry `*mut BigInt` payloads, not `PyObject`s.
 static BIGINT_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
@@ -4173,6 +4198,65 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         }
         fbw_abort_nested_unjournaled_residual(ctx, op_pc, None)?;
     }
+    // The loop-variable binding store is the op at the in-flight FOR_ITER's
+    // `body_pc` (the FOR_ITER continue-arm fallthrough), a STORE_NAME/
+    // STORE_GLOBAL that writes the just-consumed item to the loop target (a
+    // module/global-scope `for i in …`; a function-scope loop var is a
+    // STORE_FAST frame local that never becomes a residual).  Re-delivery
+    // re-runs the body from `body_pc`, re-storing the SAME re-delivered item to
+    // the SAME name — an idempotent write, never an accumulating double.  Like
+    // the `is_idempotent_gc_barrier` write barrier it still EXECUTES concretely
+    // (the module dict must hold the binding for the walk's remaining reads) but
+    // it is not a body effect: keep it out of the R1 in-flight-FOR_ITER
+    // accounting so an escaping residual later in the same body does not
+    // refuse-drop the whole iteration.
+    // `vstack_cur_pypc` is the pc the walk is ABOUT TO ENTER
+    // (`reconcile_vstack_at_boundary` sets it to `new_pypc` after reconciling
+    // the PREVIOUS opcode), so at this residual it names the opcode being
+    // walked.  The loop-var store is recognised by the FOR_ITER body's own
+    // relation `body_pc + 1 == vstack_cur_pypc`, i.e. the walk has advanced one
+    // opcode past the recorded body pc — not by a next-instr convention.
+    let is_loop_var_binding_store = is_loop_var_binding_store(ctx, helper);
+    // PUSH_EXC_INFO's carrier clear is void-returning, so `writes_live_heap`
+    // alone counts it.  The slot it writes exists only to keep a propagating
+    // exception rooted for the collector — nothing reads it back as a value —
+    // and `push_exc_info` performs the same clear at the same point, so a
+    // re-run of the body reaches the same state rather than doubling anything.
+    // That is the `is_idempotent_gc_barrier` category, and BOTH accountings of
+    // it read this one binding: the gh#467 heap-write odometer below stated the
+    // exemption while the R1 discriminator on the next line did not, so a `for`
+    // body whose only committed residual was `except`'s clear had its delivery
+    // refused and the whole iteration dropped — the outcome the refusal exists
+    // to be safer than.
+    let writes_gc_liveness_root_only =
+        helper == majit_ir::RuntimeHelperKind::ClearInFlightException;
+    // Store / list-append journals (and the namespace journal for
+    // `StoreName` / `StoreGlobal` / `DeleteName` / `DeleteGlobal`) have
+    // rollback entry points; executing those residuals is recoverable.
+    // A transparent helper sub-walk (`write_cell`, `binary_value_from_tag`,
+    // …) is not a Python frame: its Void write-barrier residuals belong to
+    // the journaled outer store, not to the FOR_ITER body of the live
+    // frame.  Marking either class as `body_effect_since_consume` makes
+    // [`fbw_foriter_inflight_take`] refuse delivery and skip the cursor
+    // restore, which is how a module-level `for` over journaled STORE_NAME
+    // cells lost iterations.
+    let residual_will_be_journaled = inplace_list_journal.is_some()
+        || list_append_journal.is_some()
+        || matches!(
+            helper,
+            majit_ir::RuntimeHelperKind::StoreName
+                | majit_ir::RuntimeHelperKind::StoreGlobal
+                | majit_ir::RuntimeHelperKind::DeleteName
+                | majit_ir::RuntimeHelperKind::DeleteGlobal
+        );
+    let body_effect_candidate = !provably_side_effect_free
+        && !is_idempotent_gc_barrier
+        && !is_loop_var_binding_store
+        && !writes_gc_liveness_root_only
+        && writes_live_heap
+        && fbw_foriter_inflight_active()
+        && !residual_will_be_journaled
+        && !ctx.fbw_mode.transparent_helper_subwalk;
     // `vinfo.tracing_before_residual_call(virtualizable)`
     // heap half: every decline gate has now passed, so the helper WILL
     // execute — set TOKEN_TRACING_RESCALL on the active virtualizable so a
@@ -4319,56 +4403,6 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     } else {
         None
     };
-    // The loop-variable binding store is the op at the in-flight FOR_ITER's
-    // `body_pc` (the FOR_ITER continue-arm fallthrough), a STORE_NAME/
-    // STORE_GLOBAL that writes the just-consumed item to the loop target (a
-    // module/global-scope `for i in …`; a function-scope loop var is a
-    // STORE_FAST frame local that never becomes a residual).  Re-delivery
-    // re-runs the body from `body_pc`, re-storing the SAME re-delivered item to
-    // the SAME name — an idempotent write, never an accumulating double.  Like
-    // the `is_idempotent_gc_barrier` write barrier it still EXECUTES concretely
-    // (the module dict must hold the binding for the walk's remaining reads) but
-    // it is not a body effect: keep it out of the R1 in-flight-FOR_ITER
-    // accounting so an escaping residual later in the same body does not
-    // refuse-drop the whole iteration.
-    // `vstack_cur_pypc` is the pc the walk is ABOUT TO ENTER
-    // (`reconcile_vstack_at_boundary` sets it to `new_pypc` after reconciling
-    // the PREVIOUS opcode), so at this residual it names the opcode being
-    // walked.  The loop-var store is recognised by the FOR_ITER body's own
-    // relation `body_pc + 1 == vstack_cur_pypc`, i.e. the walk has advanced one
-    // opcode past the recorded body pc — not by a next-instr convention.
-    let is_loop_var_binding_store = is_loop_var_binding_store(ctx, helper);
-    // PUSH_EXC_INFO's carrier clear is void-returning, so `writes_live_heap`
-    // alone counts it.  The slot it writes exists only to keep a propagating
-    // exception rooted for the collector — nothing reads it back as a value —
-    // and `push_exc_info` performs the same clear at the same point, so a
-    // re-run of the body reaches the same state rather than doubling anything.
-    // That is the `is_idempotent_gc_barrier` category, and BOTH accountings of
-    // it read this one binding: the gh#467 heap-write odometer below stated the
-    // exemption while the R1 discriminator on the next line did not, so a `for`
-    // body whose only committed residual was `except`'s clear had its delivery
-    // refused and the whole iteration dropped — the outcome the refusal exists
-    // to be safer than.
-    let writes_gc_liveness_root_only =
-        helper == majit_ir::RuntimeHelperKind::ClearInFlightException;
-    // `cell_store_helper_subwalk` is write_cell-specific.  `write_cell`
-    // implements STORE_NAME / STORE_GLOBAL; its inner ops are `helper=None`
-    // Void writes, so the StoreName loop-var exemption above cannot see
-    // them.  The caller journals the cell (`FBW_CELL_STORE_JOURNAL`).
-    // Counting the descent as R1 body effect makes an abort after
-    // `for y in xs` refuse delivery and drop the item
-    // (`complex_abs_sub_hot`, `fbw_foriter_item_dropped`).
-    // A generator resume or an inlined builtin call also sets
-    // `transparent_helper_subwalk`, but those walks run real Python body
-    // code or unmodelled mutations with no journal, so they must not take
-    // this exemption.
-    let body_effect_candidate = !provably_side_effect_free
-        && !is_idempotent_gc_barrier
-        && !is_loop_var_binding_store
-        && !ctx.fbw_mode.cell_store_helper_subwalk
-        && !writes_gc_liveness_root_only
-        && writes_live_heap
-        && fbw_foriter_inflight_active();
     // #57 Option C (Finding #1, user-frame signal): the Void/helper-tag write
     // discriminator above cannot see a body effect committed through USER
     // PYTHON CODE by a value-returning (`Ref`), `RuntimeHelperKind::None`,
@@ -6992,9 +7026,7 @@ fn try_walker_lower_getexecutioncontext<Sym: WalkSym>(
     let Some(majit_ir::Value::Int(funcaddr)) = ctx.trace_ctx.box_value(funcptr) else {
         return Ok(None);
     };
-    let take_last_exec_ctx =
-        pyre_interpreter::call::take_last_exec_ctx as *const () as usize as i64;
-    if funcaddr != take_last_exec_ctx {
+    if funcaddr != *TAKE_LAST_EXEC_CTX_FNADDR {
         return Ok(None);
     }
 
@@ -7175,6 +7207,25 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         crate::state::note_force_quasi_immut_abort();
         prepare_force_quasi_immutable_abort(ctx, op.pc);
         return Err(DispatchError::ForceQuasiImmutable { pc: op.pc });
+    }
+
+    // `function.py funccall_valuestack`'s `_code_of_sys_exc_info` test
+    // precedes `code.fast_natural_arity` dispatch, so this `exc_info_direct`
+    // fold sits immediately before the `fastcall_0`-equivalent
+    // `try_walker_inline_builtin_call` descent below.  The generated CALL has
+    // already become a CallFn residual at this seam, so reproduce the source
+    // fast path here with this inline level's own red frame and the shared
+    // EC red.  When the look-ahead declines, the descent is the `fastcall_0`
+    // fallback onto the regular builtin wrapper.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && spec_gate(SpecFold::SysExcInfo, || {
+            try_walker_specialize_sys_exc_info(ctx, code, op, &r_args, dst)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
     // BuiltinCode.func is an indirect PBC target exactly like RPython's
@@ -7951,22 +8002,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         })?
     {
         return Ok((outcome, op.next_pc));
-    }
-
-    // `function.py funccall_valuestack`'s exact `sys.exc_info` direct path.
-    // The generated CALL has already become a CallFn residual at this seam,
-    // so reproduce the source fast path here with this inline level's own red
-    // frame and the shared EC red. Unsafe look-ahead shapes and generator
-    // chain state decline to the regular builtin wrapper.
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate(SpecFold::SysExcInfo, || {
-            try_walker_specialize_sys_exc_info(ctx, code, op, &r_args, dst)
-        })?
-        .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
     // `math.sqrt(x)` / `float(x)` on an exact numeric argument: inline the
@@ -10084,11 +10119,9 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                                     // (unicodeobject.py) answers from one WTF-8
                                     // ordering, which no numeric arm above can
                                     // express.
-                                    // TODO: tuple `==` currently stays a residual
-                                    // call. Record it by descending the interpreter
-                                    // `descr_eq` with a `look_inside_iff`-style
-                                    // small-tuple unroll (`tupleobject.py`
-                                    // `_unroll_condition_cmp`), not by a fold.
+                                    // Short exact tuples of ints or None are folded
+                                    // by `try_walker_fold_small_tuple_eq`. Longer
+                                    // tuples and subclasses still reach this residual.
                                     None => spec_gate(SpecFold::CompareOpStr, || {
                                         try_walker_specialize_compare_op_str(
                                             ctx, op.pc, op_tag, &r_args, &allboxes, call_descr,
