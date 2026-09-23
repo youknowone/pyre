@@ -31,4 +31,4 @@ def f(n):
     return bad
 
 
-print("mismatches:", f(3000))
+print("mismatches:", f(90000))

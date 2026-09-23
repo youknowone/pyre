@@ -82,7 +82,7 @@ class Sub(dict):
 
 
 def main():
-    print("warm", warm(15000))
+    print("warm", warm(130000))
     # the source is walked once, not once by __new__ and again by __init__
     calls("mapping_ctor", lambda: dict(Mapping()))
     calls("mapping_update", lambda: {}.update(Mapping()))

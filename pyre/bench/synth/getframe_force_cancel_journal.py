@@ -34,7 +34,7 @@ o = Obj()
 def main():
     seen = []
     total = 0
-    for i in range(20000):
+    for i in range(300000):
         seen.append(i)      # journaled append BEFORE the forcing read
         total += o.peek
     print(total, len(seen), sum(seen) % 1000003)

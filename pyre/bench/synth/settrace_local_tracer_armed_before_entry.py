@@ -35,7 +35,7 @@
 # statement per iteration, no more and no fewer.
 import sys
 
-N = 4000
+N = 60000
 
 events = []
 

@@ -16,7 +16,7 @@
 #
 # The printed total counts one callee entry per iteration, so a resume that
 # replays the region or re-delivers an iteration prints something other than
-# 30000.
+# 900000.
 import sys
 
 _gf = sys._getframe
@@ -30,7 +30,7 @@ def leaf(x):
 def main():
     total = 0
     i = 0
-    while i < 30000:
+    while i < 900000:
         total = leaf(total)
         i = i + 1
     return total

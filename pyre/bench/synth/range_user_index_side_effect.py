@@ -8,7 +8,7 @@
 # the reason a body carrying a store is not admitted at all. The `& 1` makes
 # the range alternate empty and non-empty, which is what makes the emptiness
 # guard flip and the second call observable.
-N = 40000
+N = 400000
 
 
 class Alt:
@@ -29,4 +29,4 @@ def main():
 
 
 main()
-# Expected: 40000 20000
+# Expected: 400000 200000

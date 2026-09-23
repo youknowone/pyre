@@ -50,7 +50,7 @@ def drive():
     # Drive a reduce/replay hot so a compiled trace exercises the cursor path.
     total = 0
     k = 0
-    while k < 20000:
+    while k < 260000:
         h = iter([1, 2, 3, 4])
         next(h)
         rr = h.__reduce__()

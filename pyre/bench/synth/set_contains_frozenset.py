@@ -61,7 +61,7 @@ def discard_to_empty_readd():
 
 
 def main():
-    print("warm", warm(15000))
+    print("warm", warm(400000))
     # a set argument is looked up as the frozenset with the same elements
     m("in_frozen_member", lambda: {1} in {frozenset([1])})
     m("in_frozen_nonmember", lambda: {9} in {frozenset([1])})

@@ -5,7 +5,7 @@ try:
 except ImportError:
     pass
 
-N = 10000
+N = 80000
 
 
 class MyExit(SystemExit):

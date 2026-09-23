@@ -55,7 +55,7 @@ def do_symdiff_update(x):
 
 
 def main():
-    print("warm", warm(15000))
+    print("warm", warm(160000))
     # a raising __hash__ propagates from every ingestion path
     m("ctor_raising_hash", lambda: set([RaisingHash()]))
     m("frozenset_raising_hash", lambda: frozenset([RaisingHash()]))

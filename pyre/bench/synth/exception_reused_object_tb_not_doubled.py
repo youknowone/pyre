@@ -12,7 +12,7 @@
 # measures the workload rather than process startup.
 #
 # Expected output: [(('drive', ('e', 'k', 'seen')), 'mid')]
-N = 8000
+N = 60000
 ERR = ValueError("boom")
 
 

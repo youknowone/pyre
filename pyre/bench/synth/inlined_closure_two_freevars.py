@@ -43,7 +43,7 @@
 # involved and an ordinary decorator or callback is in range.
 # `a_two_name_lambda` covers the arm where `co_freevars` is not in source
 # order.  Each of the three failed on its own before the fix.
-EXPECTED = (9000000, 17997000, 36003000)
+EXPECTED = (8100000000, 16199910000, 32400090000)
 
 
 def make(a, b):
@@ -86,7 +86,7 @@ def a_two_name_lambda(n):
     return t
 
 
-got = (defined_in_the_loop(3000), made_by_a_factory(3000), a_two_name_lambda(3000))
+got = (defined_in_the_loop(90000), made_by_a_factory(90000), a_two_name_lambda(90000))
 if got == EXPECTED:
     print("PASS inlined closure two freevars")
 else:

@@ -23,7 +23,7 @@ def bump(x):
 
 def main():
     total = 0
-    for i in range(20000):
+    for i in range(120000):
         total += bump(i)
     print(total, c.n)
 

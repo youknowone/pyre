@@ -51,7 +51,7 @@ def check():
 
 
 try:
-    for _ in range(200):
+    for _ in range(6000):
         check()
 finally:
     os.rmdir(EXISTING)

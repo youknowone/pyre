@@ -56,7 +56,7 @@ def m(label, fn):
 
 
 def main():
-    print("warm", warm(500))
+    print("warm", warm(10000))
     m("proto_positional", lambda: roundtrip("abc", 2))
     m("proto_positional_hi", lambda: roundtrip(("x", "y", "z"), 5))
     m("proto_keyword", lambda: roundtrip_kw({"a": 1, "b": 2}, 4, True))

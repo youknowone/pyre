@@ -284,9 +284,9 @@ def main():
     live_walk_cases()
     plain_comparison_cases()
     # The same walks under the JIT, after the loop above has compiled.
-    hot = warm(3000)
-    if hot != 3000 * 4:
-        failures.append("warm() answered %d, expected %d" % (hot, 3000 * 4))
+    hot = warm(90000)
+    if hot != 90000 * 4:
+        failures.append("warm() answered %d, expected %d" % (hot, 90000 * 4))
     # The interpreter-level cases again, now that the walks are compiled.
     lazy_isdisjoint_cases()
     live_walk_cases()

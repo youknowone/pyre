@@ -17,7 +17,7 @@
 # already left.
 import sys
 
-N = 20000
+N = 120000
 
 FIRST = sys._getframe().f_lineno
 

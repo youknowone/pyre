@@ -20,7 +20,7 @@ try:
 except ImportError:
     pass
 
-N = 20000
+N = 600000
 
 
 def main():
@@ -35,4 +35,4 @@ def main():
 
 
 main()
-# Expected: 200010000
+# Expected: 180000300000

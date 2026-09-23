@@ -7,7 +7,7 @@ SCALE = 3
 def main():
     total = 0
     n = 0
-    while n < 20000:
+    while n < 220000:
         for x in range(10):
             total += x * SCALE
         n += 1
@@ -15,4 +15,4 @@ def main():
 
 result = main()
 print(result)
-# Expected: 20000 * sum(x*3 for x in range(10)) = 20000 * 135 = 2700000
+# Expected: 220000 * sum(x*3 for x in range(10)) = 220000 * 135 = 29700000
