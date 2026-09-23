@@ -14,23 +14,27 @@
 //! wall: it is emitted before `contains`, so the translation loop's
 //! failure surfaces on `new` first.
 //!
-//! `int_between(n, m, p)` is the predicate `n <= m < p` (it assumes
-//! `n <= p`).  `RangeInclusive` is `a <= x <= b`, so the exclusive upper
-//! bound is `b + 1`:
+//! `int_between(n, m, p)` is the predicate `n <= m < p` and assumes
+//! `n <= p`.  `RangeInclusive` is `a <= x <= b`, so the exclusive upper
+//! bound is `b + 1`.  The fold emits `int_between(a, x, b + 1)` only when
+//! both bounds are constants, `a <= b`, and `b != i64::MAX` (then `b + 1`
+//! exists and `a <= b + 1`):
 //!
 //! ```text
 //!     r = RangeInclusive::new(a, b)          // residual `new` call (block N)
 //!     ...
 //!     t = r.contains(&x)                     // residual `contains` call (block C)
 //! becomes
-//!     upper = b + 1                          // constant when `b` is
+//!     upper = b + 1                          // ConstInt; both bounds constant
 //!     t     = int_between(a, x, upper)      // a <= x < b + 1
 //! ```
 //!
-//! A constant `b` of `i64::MAX` has no representable successor, and a
-//! non-constant `b` may be `i64::MAX` at run time; both keep the two
-//! comparisons `bitand(le(a, x), ge(b, x))`.  Exclusive `Range` (`a..b`, which
-//! is already `a <= x < b`) is not rewritten here.
+//! Every other shape keeps `bitand(le(a, x), ge(b, x))`.  A non-constant
+//! bound cannot prove `a <= b + 1`.  `b == i64::MAX` has no representable
+//! successor, so `b + 1` wraps.  `a > b` is an empty range, and the
+//! wrapping expansion of `int_between` answers true for some `x` there.
+//! Exclusive `Range` (`a..b`, which is already `a <= x < b`) is not
+//! rewritten here.
 //!
 //! ## Cross-block shape
 //!
@@ -99,8 +103,9 @@ pub(crate) struct RangeContainsSite {
     pub result_var: Variable,
 }
 
-/// Rewrite every recorded `(a..=b).contains(&x)` call site into
-/// `int_between(a, x, b + 1)`.  Fail-safe: a site
+/// Rewrite every recorded `(a..=b).contains(&x)` call site into a bounds
+/// check: `int_between(a, x, b + 1)` when both bounds are constants with
+/// `a <= b` and `b != i64::MAX`, otherwise the two comparisons.  Fail-safe: a site
 /// that does not match the expected cross-block `new` → `contains` shape
 /// is left untouched (both residual calls survive, census Skip).  Returns
 /// the number of sites rewritten.
@@ -214,8 +219,8 @@ fn rewire_one_range_contains_site(
         ));
     }
 
-    // 6. Splice `int_between` into block C, replacing the `contains` op
-    //    in place and reusing its result Variable.
+    // 6. Splice the bounds check into block C, replacing the `contains`
+    //    op in place and reusing its result Variable.
     let inserts =
         build_range_contains_compares(graph, &site.result_var, lo_in_c, hi_in_c, x.into_variable());
     let ops = &mut graph.blocks[c_idx].operations;
@@ -474,7 +479,9 @@ fn const_int_of(graph: &FunctionGraph, var: &Variable) -> Option<i64> {
 }
 
 /// `int_between(lo, x, upper)` bound to `result_var`.  The result is a
-/// 0/1 integer in the signed register bank.
+/// 0/1 integer in the signed register bank.  The predicate is
+/// `lo <= x < upper` and requires `lo <= upper`; the caller proves that
+/// from constant bounds before emitting this op.
 fn int_between_op(
     result_var: &Variable,
     lo: Variable,
@@ -491,8 +498,10 @@ fn int_between_op(
     }
 }
 
-/// `lo <= x <= hi` when `hi + 1` does not fit in `i64`:
-/// `bitand(le(lo, x), ge(hi, x))`.
+/// `lo <= x <= hi` as `bitand(le(lo, x), ge(hi, x))`.
+///
+/// Exact for every pair of bounds, including an empty range (`lo > hi`)
+/// and `hi == i64::MAX`.
 fn build_range_contains_compare_pair(
     graph: &mut FunctionGraph,
     result_var: &Variable,
@@ -533,13 +542,14 @@ fn build_range_contains_compare_pair(
     ]
 }
 
-/// Replace `contains` with `int_between(lo, x, hi + 1)`.
+/// Replace `contains` with `int_between(lo, x, hi + 1)` when that op's
+/// contract holds, and with the compare pair otherwise.
 ///
-/// `int_between(n, m, p)` is `n <= m < p`.  Inclusive `hi` therefore
-/// needs a successor.  A constant `i64::MAX` has none, and that case
-/// keeps the two-comparison form, as does a non-constant `hi`, whose
-/// run-time value may be `i64::MAX`.  Any other constant is materialised
-/// as `ConstInt(hi + 1)`.
+/// `int_between(n, m, p)` is `n <= m < p` and requires `n <= p`.  Inclusive
+/// `hi` therefore needs a successor `upper = hi + 1`, and the requirement
+/// is `lo <= upper`.  Both hold for constants precisely when `lo <= hi`
+/// and `hi + 1` does not wrap.  That successor is materialised as
+/// `ConstInt(hi + 1)`.
 fn build_range_contains_compares(
     graph: &mut FunctionGraph,
     result_var: &Variable,
@@ -547,10 +557,14 @@ fn build_range_contains_compares(
     hi: Variable,
     x: Variable,
 ) -> Vec<SpaceOperation> {
-    let exclusive = const_int_of(graph, &hi).map(|value| value.checked_add(1));
-    match exclusive {
-        Some(None) => build_range_contains_compare_pair(graph, result_var, lo, hi, x),
-        Some(Some(upper)) => {
+    // `int_between` only when both bounds are constants, `lo <= hi`, and
+    // `hi + 1` fits.  `checked_add` is `None` exactly for `hi == i64::MAX`.
+    let exclusive_upper = match (const_int_of(graph, &lo), const_int_of(graph, &hi)) {
+        (Some(lo_value), Some(hi_value)) if lo_value <= hi_value => hi_value.checked_add(1),
+        _ => None,
+    };
+    match exclusive_upper {
+        Some(upper) => {
             let upper_v = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
             vec![
                 SpaceOperation {
@@ -560,9 +574,15 @@ fn build_range_contains_compares(
                 int_between_op(result_var, lo, x, upper_v),
             ]
         }
-        // A non-constant `hi` may be `i64::MAX` at run time, where `hi + 1`
-        // wraps and `int_between` answers false for every `x`; the two
-        // comparisons are exact for every value.
+        // Keep the compare pair for every shape that cannot prove
+        // `lo <= upper`: a non-constant `lo`, a non-constant `hi`,
+        // `lo > hi`, and `hi == i64::MAX`.  `int_between` requires
+        // `lo <= upper`.  A non-constant bound cannot establish it, and
+        // `lo > hi` is an empty range — the wrapping `int_sub` + `uint_lt`
+        // expansion answers true for some `x` (for example `(10..=5)`
+        // against `10`).  `hi == i64::MAX` has no representable successor,
+        // so `hi + 1` wraps.  The two comparisons are exact for every one
+        // of these shapes, including an empty range.
         None => build_range_contains_compare_pair(graph, result_var, lo, hi, x),
     }
 }
@@ -1144,6 +1164,133 @@ mod tests {
         assert!(
             int_between_ops(&g).is_empty(),
             "a run-time hi must not be wrapped into int_between"
+        );
+        assert_eq!(binop_results(&g, "le").len(), 1);
+        assert_eq!(binop_results(&g, "ge").len(), 1);
+        assert_eq!(binop_results(&g, "bitand"), vec![contains]);
+        let _ = (a, b, x);
+    }
+
+    /// Constant bounds with `lo > hi` (`10..=5`) are an empty range.
+    /// `int_between` assumes `lo <= upper`; keep the two comparisons.
+    #[test]
+    fn rewrite_keeps_compares_when_constant_lo_exceeds_hi() {
+        let mut g = FunctionGraph::new("test_range_contains_empty");
+        let n = g.startblock;
+        let a = g.push_op_var(n, OpKind::ConstInt(10), true).unwrap();
+        let b = g.push_op_var(n, OpKind::ConstInt(5), true).unwrap();
+        let range = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: new_target(),
+                    args: crate::model::call_args(vec![a.clone(), b.clone()]),
+                    result_ty: ValueType::Ref(Some("RangeInclusive".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let (c, c_args) = g.create_block_with_arg_vars(1);
+        let range_in_c = c_args[0].clone();
+        let x = g.push_op_var(c, OpKind::ConstInt(10), true).unwrap();
+        let contains = g
+            .push_op_var(
+                c,
+                OpKind::Call {
+                    target: contains_target(),
+                    args: crate::model::call_args(vec![range_in_c, x.clone()]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        g.set_return(c, Some(contains.clone()));
+        g.set_goto(n, c, vec![range.clone()]);
+
+        let rewritten = rewire_range_contains_call_sites(
+            &mut g,
+            &[RangeInclusiveNewSite {
+                result_var: range,
+                lo: a.clone(),
+                hi: b.clone(),
+            }],
+            &[RangeContainsSite {
+                result_var: contains.clone(),
+            }],
+        );
+        assert_eq!(rewritten, 1, "an empty constant range still folds");
+        assert!(
+            int_between_ops(&g).is_empty(),
+            "lo > hi must not become int_between"
+        );
+        assert_eq!(binop_results(&g, "le").len(), 1);
+        assert_eq!(binop_results(&g, "ge").len(), 1);
+        assert_eq!(binop_results(&g, "bitand"), vec![contains]);
+        let _ = (a, b, x);
+    }
+
+    /// A non-constant `lo` cannot prove `lo <= hi + 1`, even when `hi` is
+    /// a constant other than `i64::MAX`.  Keep the two comparisons.
+    #[test]
+    fn rewrite_keeps_compares_for_a_nonconstant_lower_bound() {
+        let mut g = FunctionGraph::new("test_range_contains_var_lo");
+        let n = g.startblock;
+        let lo_src = g.push_op_var(n, OpKind::ConstInt(0), true).unwrap();
+        let a = g
+            .push_op_var(
+                n,
+                OpKind::UnaryOp {
+                    op: "neg".to_string(),
+                    operand: lo_src,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let b = g.push_op_var(n, OpKind::ConstInt(10), true).unwrap();
+        let range = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: new_target(),
+                    args: crate::model::call_args(vec![a.clone(), b.clone()]),
+                    result_ty: ValueType::Ref(Some("RangeInclusive".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let (c, c_args) = g.create_block_with_arg_vars(1);
+        let range_in_c = c_args[0].clone();
+        let x = g.push_op_var(c, OpKind::ConstInt(42), true).unwrap();
+        let contains = g
+            .push_op_var(
+                c,
+                OpKind::Call {
+                    target: contains_target(),
+                    args: crate::model::call_args(vec![range_in_c, x.clone()]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        g.set_return(c, Some(contains.clone()));
+        g.set_goto(n, c, vec![range.clone()]);
+
+        let rewritten = rewire_range_contains_call_sites(
+            &mut g,
+            &[RangeInclusiveNewSite {
+                result_var: range,
+                lo: a.clone(),
+                hi: b.clone(),
+            }],
+            &[RangeContainsSite {
+                result_var: contains.clone(),
+            }],
+        );
+        assert_eq!(rewritten, 1);
+        assert!(
+            int_between_ops(&g).is_empty(),
+            "a run-time lo must not be wrapped into int_between"
         );
         assert_eq!(binop_results(&g, "le").len(), 1);
         assert_eq!(binop_results(&g, "ge").len(), 1);
