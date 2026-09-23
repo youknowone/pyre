@@ -19,11 +19,13 @@
 //!     ([`crate::front::checked_arith_uint`]).
 //!
 //! `from_size_align(size, align)` returns `Ok(Layout { size, align })` iff
-//! `align.is_power_of_two()` and `size <= isize::MAX - (align - 1)`.  The
-//! frontend folds `align_of::<T>()` — ADT layouts and primitive widths
-//! including `usize` — to a compile-time `ConstInt` power of two, so
-//! `align.is_power_of_two()` is statically true and the bound `isize::MAX -
-//! (align - 1)` is a constant.  The residual pair therefore has a native form:
+//! `align.is_power_of_two()` and `size <= Signed max - (align - 1)`.  `Signed`
+//! (`getintegerrepr`) is the target machine word: `sys.maxint` is `i64::MAX`
+//! when the word is 8 bytes and `i32::MAX` when it is 4.  The frontend folds
+//! `align_of::<T>()` — ADT layouts and primitive widths including `usize` —
+//! to a compile-time `ConstInt` power of two, so `align.is_power_of_two()` is
+//! statically true and the bound is a constant.  The residual pair therefore
+//! has a native form:
 //!   - `too_big = uint_lt(bound, size)` — `size > bound`, the overflowed case;
 //!   - the `Option` tag is `Some` (`1`) iff `too_big` is `0` (fits), else `None`.
 //!
@@ -31,16 +33,16 @@
 //!
 //! The `.ok()` residual (block Q) produces the `Option<Layout>`; its single arg
 //! is the `from_size_align` residual result (block P).  The rewrite drops both
-//! residuals and, **in place** in block P, emits the native sequence plus a
-//! virtualized nested aggregate reusing the `from_size_align` result var as the
-//! `Option` ctor result:
-//!   - `bound = ConstInt(isize::MAX - (align - 1))`, `too_big = uint_lt(bound,
+//! residuals.  Block P emits the bound check and `set_branch`es to two fresh
+//! blocks:
+//!   - `bound = ConstInt(Signed max - (align - 1))`, `too_big = uint_lt(bound,
 //!     size)`, `disc = eq(too_big, 0)`;
-//!   - `layout = <transparent Layout ctor>{ __pos_0 = size, __pos_1 = align }`;
-//!   - `opt = <transparent Option ctor>{ __discriminant = disc, __pos_0(Some) =
-//!     layout }`.
-//!     Block Q's `ok` call is deleted and its result aliased to the block-P
-//!     `Option` value threaded across the P→Q edge — no diamond, no exit rewiring.
+//!   - the fitting arm builds `layout = <transparent Layout ctor>{ __pos_0 =
+//!     size, __pos_1 = align }` and `opt = <transparent Some ctor>{ __pos_0 =
+//!     layout }`;
+//!   - the overflow arm builds the `None` ctor and allocates no `Layout`.
+//!     Both arms forward to P's original continuation.  Block Q's `ok` call is
+//!     deleted and its result aliased to the `Option` value threaded into Q.
 //!
 //! Like [`crate::front::checked_arith_uint`] it is **order-independent** and
 //! **fail-safe**: any structural mismatch returns `Err`, the caller leaves both
@@ -98,9 +100,17 @@ pub(crate) fn rewire_from_size_align_sites(
     graph: &mut FunctionGraph,
     sites: &[FromSizeAlignSite],
 ) -> usize {
+    rewire_from_size_align_sites_for(graph, sites, crate::layout::target_word_size())
+}
+
+pub(crate) fn rewire_from_size_align_sites_for(
+    graph: &mut FunctionGraph,
+    sites: &[FromSizeAlignSite],
+    word_bytes: usize,
+) -> usize {
     let mut rewritten = 0;
     for site in sites {
-        match rewire_one_from_size_align_site(graph, site) {
+        match rewire_one_from_size_align_site(graph, site, word_bytes) {
             Ok(()) => rewritten += 1,
             Err(_decline) => {
                 if std::env::var_os("MAJIT_MIR_FRONTEND_DEBUG").is_some() {
@@ -294,6 +304,14 @@ fn folded_align_const(
     Ok(align)
 }
 
+/// `Signed` max minus `(align - 1)`. `None` when `align` does not fit under
+/// the target word (`getintegerrepr(Signed)` / `sys.maxint`).
+fn signed_layout_bound(align: i64, word_bytes: usize) -> Option<i64> {
+    let max = crate::front::checked_arith_uint::signed_word_max(word_bytes);
+    let bound = max.checked_sub(align - 1)?;
+    (bound >= 0).then_some(bound)
+}
+
 fn from_size_align_operands(kind: &OpKind) -> Option<(Variable, Variable)> {
     match kind {
         OpKind::Call { target, args, .. }
@@ -311,6 +329,7 @@ fn from_size_align_operands(kind: &OpKind) -> Option<(Variable, Variable)> {
 fn rewire_one_from_size_align_site(
     graph: &mut FunctionGraph,
     site: &FromSizeAlignSite,
+    word_bytes: usize,
 ) -> Result<(), String> {
     let name = graph.name.clone();
     let ok = &site.ok_result;
@@ -356,8 +375,10 @@ fn rewire_one_from_size_align_site(
     // copy of a predecessor's const (MIR often emits `align_of` in its own
     // block).  A residual call or a phi merge declines.
     let align = folded_align_const(graph, &align_arg, &name)?;
-    // `Ok` iff `size <= isize::MAX - (align - 1)`.  `isize::MAX == i64::MAX`.
-    let bound = i64::MAX - (align - 1);
+    // `Ok` iff `size <= Signed max - (align - 1)`.
+    let bound = signed_layout_bound(align, word_bytes).ok_or_else(|| {
+        format!("{name}: from_size_align align {align} exceeds the target Signed max")
+    })?;
 
     // --- All structural validation passed; mutate the graph. ---
 
@@ -463,9 +484,17 @@ pub(crate) fn rewire_from_size_align_expect_sites(
     graph: &mut FunctionGraph,
     sites: &[FromSizeAlignExpectSite],
 ) -> usize {
+    rewire_from_size_align_expect_sites_for(graph, sites, crate::layout::target_word_size())
+}
+
+pub(crate) fn rewire_from_size_align_expect_sites_for(
+    graph: &mut FunctionGraph,
+    sites: &[FromSizeAlignExpectSite],
+    word_bytes: usize,
+) -> usize {
     let mut rewritten = 0;
     for site in sites {
-        match rewire_one_from_size_align_expect_site(graph, site) {
+        match rewire_one_from_size_align_expect_site(graph, site, word_bytes) {
             Ok(()) => rewritten += 1,
             Err(_decline) => {
                 if std::env::var_os("MAJIT_MIR_FRONTEND_DEBUG").is_some() {
@@ -485,6 +514,7 @@ pub(crate) fn rewire_from_size_align_expect_sites(
 fn rewire_one_from_size_align_expect_site(
     graph: &mut FunctionGraph,
     site: &FromSizeAlignExpectSite,
+    word_bytes: usize,
 ) -> Result<(), String> {
     let name = graph.name.clone();
     let result = &site.result_var;
@@ -538,8 +568,10 @@ fn rewire_one_from_size_align_expect_site(
     // Folded `align_of::<T>()` — a `ConstInt` power of two, possibly an SSA
     // copy of a predecessor's const.  A residual call or a phi merge declines.
     let align = folded_align_const(graph, &align_arg, &name)?;
-    // `Ok` iff `size <= isize::MAX - (align - 1)`.  `isize::MAX == i64::MAX`.
-    let bound = i64::MAX - (align - 1);
+    // `Ok` iff `size <= Signed max - (align - 1)`.
+    let bound = signed_layout_bound(align, word_bytes).ok_or_else(|| {
+        format!("{name}: from_size_align align {align} exceeds the target Signed max")
+    })?;
 
     // Block P must forward `fsa_res` to Q via a single plain goto — the shape
     // the branch replaces (the `Ok` arm re-forwards P's original link args).
@@ -751,6 +783,93 @@ mod tests {
         g.set_goto(q, cont, vec![ok.clone()]);
         g.set_goto(p, q, vec![fsa]);
         (g, ok)
+    }
+
+    fn build_site_sized(size_val: i64, align_val: i64) -> (FunctionGraph, Variable) {
+        let mut g = FunctionGraph::new("test_from_size_align_width");
+        let p = g.startblock;
+        let size = g.push_op_var(p, OpKind::ConstInt(size_val), true).unwrap();
+        let align = g.push_op_var(p, OpKind::ConstInt(align_val), true).unwrap();
+        let fsa = g
+            .push_op_var(
+                p,
+                OpKind::Call {
+                    target: fsa_target(),
+                    args: crate::model::call_args(vec![size, align]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (q, q_args) = g.create_block_with_arg_vars(1);
+        let ok = g
+            .push_op_var(
+                q,
+                OpKind::Call {
+                    target: ok_target(),
+                    args: crate::model::call_args(vec![q_args[0].clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (cont, _) = g.create_block_with_arg_vars(1);
+        g.set_return(cont, None);
+        g.set_goto(q, cont, vec![ok.clone()]);
+        g.set_goto(p, q, vec![fsa]);
+        (g, ok)
+    }
+
+    fn uint_lt_bound(g: &FunctionGraph) -> i64 {
+        let bound_var = g
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .find_map(|op| match &op.kind {
+                OpKind::BinOp { op, lhs, .. } if op == "uint_lt" => Some(lhs.clone()),
+                _ => None,
+            })
+            .expect("uint_lt bound operand");
+        g.blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .find_map(|op| {
+                if op.result.as_ref() == Some(&bound_var) {
+                    if let OpKind::ConstInt(n) = op.kind {
+                        return Some(n);
+                    }
+                }
+                None
+            })
+            .expect("bound ConstInt")
+    }
+
+    /// `size = 3_000_000_000` overflows `Signed` on a 4-byte target
+    /// (`isize::MAX` is `i32::MAX`) and fits on an 8-byte target.
+    #[test]
+    fn from_size_align_ok_bound_follows_target_signed_max() {
+        let size = 3_000_000_000i64;
+        let align = 1i64;
+        for word_bytes in [8usize, 4] {
+            let signed_max = match word_bytes {
+                8 => i64::MAX,
+                4 => i32::MAX as i64,
+                _ => unreachable!(),
+            };
+            let (mut g, ok) = build_site_sized(size, align);
+            let rewritten = rewire_from_size_align_sites_for(&mut g, &[site_for(&ok)], word_bytes);
+            assert_eq!(rewritten, 1);
+            let bound = uint_lt_bound(&g);
+            assert_eq!(bound, signed_max - (align - 1));
+            if word_bytes == 4 {
+                assert!(
+                    bound < size,
+                    "wasm32 from_size_align(3_000_000_000) must be Err"
+                );
+            } else {
+                assert!(bound >= size);
+            }
+        }
     }
 
     #[test]
@@ -993,6 +1112,72 @@ mod tests {
         g.set_goto(q, cont, vec![layout.clone()]);
         g.set_goto(p, q, vec![fsa]);
         (g, layout)
+    }
+
+    fn build_expect_site_sized(size_val: i64, align_val: i64) -> (FunctionGraph, Variable) {
+        let mut g = FunctionGraph::new("test_from_size_align_expect_width");
+        let p = g.startblock;
+        let size = g.push_op_var(p, OpKind::ConstInt(size_val), true).unwrap();
+        let align = g.push_op_var(p, OpKind::ConstInt(align_val), true).unwrap();
+        let fsa = g
+            .push_op_var(
+                p,
+                OpKind::Call {
+                    target: fsa_target(),
+                    args: crate::model::call_args(vec![size, align]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (q, _q_args) = g.create_block_with_arg_vars(1);
+        let msg = g.push_op_var(q, OpKind::ConstInt(1), true).unwrap();
+        let layout = g
+            .push_op_var(
+                q,
+                OpKind::Call {
+                    target: expect_target(),
+                    args: crate::model::call_args(vec![fsa.clone(), msg]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (cont, _) = g.create_block_with_arg_vars(1);
+        g.set_return(cont, None);
+        g.set_goto(q, cont, vec![layout.clone()]);
+        g.set_goto(p, q, vec![fsa]);
+        (g, layout)
+    }
+
+    #[test]
+    fn from_size_align_expect_bound_follows_target_signed_max() {
+        let size = 3_000_000_000i64;
+        let align = 1i64;
+        for word_bytes in [8usize, 4] {
+            let signed_max = match word_bytes {
+                8 => i64::MAX,
+                4 => i32::MAX as i64,
+                _ => unreachable!(),
+            };
+            let (mut g, layout) = build_expect_site_sized(size, align);
+            let rewritten = rewire_from_size_align_expect_sites_for(
+                &mut g,
+                &[FromSizeAlignExpectSite {
+                    result_var: layout,
+                    layout_owner: "core::alloc::layout::Layout".to_string(),
+                }],
+                word_bytes,
+            );
+            assert_eq!(rewritten, 1);
+            let bound = uint_lt_bound(&g);
+            assert_eq!(bound, signed_max - (align - 1));
+            if word_bytes == 4 {
+                assert!(bound < size, "wasm32 expect(3_000_000_000) must raise");
+            } else {
+                assert!(bound >= size);
+            }
+        }
     }
 
     fn expect_site_for(result_var: &Variable) -> FromSizeAlignExpectSite {

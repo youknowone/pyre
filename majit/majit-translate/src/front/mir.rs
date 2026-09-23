@@ -3223,22 +3223,17 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         let _from_raw_parts_rewritten =
             crate::front::from_raw_parts::rewire_from_raw_parts_sites(&mut lo.graph);
         // Word-sized `saturating_add` clamp (`front::saturating_add`) splits
-        // the residual call into `sum = a + b; if uint_lt(sum, a) { MAX } else
-        // { sum }`.  Sites share `saturating_sub_sites`; the add pass matches
-        // the `saturating_add` leaf and declines sub producers.  No new
+        // the residual call into `sum = a + b; if uint_lt(sum, a) { Unsigned
+        // max } else { sum }`.  `int_add` is its own op, so the sites live on
+        // `saturating_add_sites`, not `saturating_sub_sites`.  No new
         // unreachable blocks (both arms forward to the original
         // continuation), so the sweep gate below does not need the count.
-        let saturating_add_vars: Vec<Variable> = lo
-            .saturating_sub_sites
-            .iter()
-            .map(|site| site.result_var.clone())
-            .collect();
-        let _saturating_add_rewritten = if saturating_add_vars.is_empty() {
+        let _saturating_add_rewritten = if lo.saturating_add_sites.is_empty() {
             0
         } else {
             crate::front::saturating_add::rewire_saturating_add_call_sites(
                 &mut lo.graph,
-                &saturating_add_vars,
+                &lo.saturating_add_sites,
             )
         };
         // Word-sized `saturating_mul` clamp (`front::saturating_mul`) splits
@@ -4781,6 +4776,10 @@ struct Lowering<'a> {
     /// `front::saturating_sub` post-pass synthesizes after body lowering (see
     /// [`crate::front::saturating_sub::SaturatingSubSite`]).
     saturating_sub_sites: Vec<crate::front::saturating_sub::SaturatingSubSite>,
+    /// Word-sized `{usize,u64}::saturating_add(a, b)` call sites. `int_add`
+    /// is a separate op from `int_sub`, so these are not stored on
+    /// `saturating_sub_sites`.
+    saturating_add_sites: Vec<crate::front::saturating_add::SaturatingAddSite>,
     /// Word-sized `{u64,usize}::saturating_mul(a, b)` call results recorded
     /// for the unsigned high-word clamp diamond `front::saturating_mul`
     /// synthesizes after body lowering.
@@ -5164,6 +5163,7 @@ impl<'a> Lowering<'a> {
             slice_first_sites: Vec::new(),
             slice_get_sites: Vec::new(),
             saturating_sub_sites: Vec::new(),
+            saturating_add_sites: Vec::new(),
             saturating_mul_sites: Vec::new(),
             range_inclusive_new_sites: Vec::new(),
             range_iter_new_sites: Vec::new(),
@@ -14423,11 +14423,9 @@ impl<'a> Lowering<'a> {
         }
         // Word-sized `{u64,usize}::saturating_add`.  Narrow unsigned
         // saturating add is not a word carry (`u32::MAX + 1` does not wrap
-        // in the u64 bank), so the dest atom is required here — the same
-        // width gate as unsigned `checked_add`.  Recorded on
-        // `saturating_sub_sites` (identical `{ result_var }` shape); the
-        // add pass matches the `saturating_add` leaf and declines sub
-        // producers.
+        // in the word bank), so the dest atom is required here — the same
+        // width gate as unsigned `checked_add`.  `int_add` is recorded on
+        // its own site list; the sub pass never sees these producers.
         if let OpKind::Call {
             target: CallTarget::FunctionPath { segments, .. },
             args,
@@ -14439,8 +14437,8 @@ impl<'a> Lowering<'a> {
                 .tyref_literal_uint_atom(&call.dest.ty)
                 .is_some_and(crate::front::checked_arith_uint::is_word_sized_uint_atom)
         {
-            self.saturating_sub_sites
-                .push(crate::front::saturating_sub::SaturatingSubSite {
+            self.saturating_add_sites
+                .push(crate::front::saturating_add::SaturatingAddSite {
                     result_var: result_var.clone(),
                 });
         }
