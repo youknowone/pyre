@@ -11230,7 +11230,6 @@ fn emit_module_dict_cell_fold<Sym: WalkSym>(
     dst_bank: char,
     w_globals: pyre_object::PyObjectRef,
     name: &str,
-    w_code_ptr: usize,
 ) -> Result<bool, DispatchError> {
     // Cell fast path applies only to a module dict still in strategy mode
     // whose slot holds a raw value, an `ObjectMutableCell`, or an
@@ -11238,35 +11237,13 @@ fn emit_module_dict_cell_fold<Sym: WalkSym>(
     if let Some(slot) = crate::state::module_dict_cell_slot_direct(w_globals, name) {
         if let Some(stored) = crate::state::module_dict_cell_value_direct(w_globals, slot) {
             if !stored.is_null() {
-                // `celldict.py getdictvalue_no_unwrapping` is
-                // `@elidable_promote` on `version?` for every lookup,
-                // cell or raw.  `code_pins_namespace_version` skips that
-                // pin when this CodeObject `DELETE_NAME`s (`delitem`
-                // always `mutated()`) or when a `JUMP_BACKWARD` span in
-                // a body with an exception table still stores a bare
-                // name (`store_would_bump_version`).  A watcher already
-                // installed makes `opimpl_jit_force_quasi_immutable`
-                // abort the same trace.  A load that still pins does so
-                // because an in-place rebind would otherwise become a
-                // `GUARD_VALUE` that never retraces (`global_reassign`).
-                let pin_version = specialize::code_pins_namespace_version(w_code_ptr, w_globals);
-                // A raw slot folded without `version?` is `unwrap_cell`'s
-                // identity return. A later promoting store would not revoke it.
-                if !pin_version
-                    && specialize::raw_fold_needs_version_pin(w_code_ptr, w_globals, stored)
-                {
-                    return Ok(false);
-                }
+                // `celldict.py getdictvalue_no_unwrapping` promotes `self`
+                // and reads `version?` on every lookup, cell or raw.
+                // `_setitem_str_cell_known` and `delitem` call `mutated()`.
+                // A watcher already installed makes
+                // `pyjitpl.py opimpl_jit_force_quasi_immutable` abort the trace.
                 return emit_namespace_cell_fold(
-                    ctx,
-                    op_pc,
-                    dst,
-                    dst_bank,
-                    w_globals,
-                    slot,
-                    stored,
-                    true,
-                    pin_version,
+                    ctx, op_pc, dst, dst_bank, w_globals, slot, stored, true, true,
                 );
             }
         }
