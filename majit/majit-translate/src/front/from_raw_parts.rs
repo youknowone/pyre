@@ -113,7 +113,7 @@ fn is_ptr_add_target(target: &CallTarget) -> bool {
     };
     matches!(
         segments.last().map(String::as_str),
-        Some("add" | "wrapping_add")
+        Some("add" | "wrapping_add" | "sub" | "wrapping_sub")
     ) && segments
         .iter()
         .any(|s| s == "const_ptr" || s == "mut_ptr" || s == "ptr")

@@ -10652,7 +10652,10 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `<*mut T>::add` / `<*const T>::add` is `lltype.direct_ptradd`.
+                // `<*mut T>::add` / `<*const T>::add` / `::sub` is
+                // `lltype.direct_ptradd`.  `sub` is the same scaled byte
+                // offset with the count negated (`pyframe.rs` header
+                // prefix: `(ptr as *mut u8).sub(GC_HEADER_SIZE)`).
                 // The add stays pointer-typed so a `null_mut()` arm at the
                 // same return can union with it.  Pointee size is not a
                 // recoverable `TO.OF` on the erased pointer at jtransform
@@ -10678,7 +10681,7 @@ impl<'a> Lowering<'a> {
                     let offset = if pointee_size == 0 {
                         args[0].clone()
                     } else {
-                        let count = if pointee_size == 1 {
+                        let mut count = if pointee_size == 1 {
                             args[1].clone()
                         } else {
                             let scale = self
@@ -10702,6 +10705,20 @@ impl<'a> Lowering<'a> {
                             });
                             scaled
                         };
+                        if self.ptr_offset_is_sub(&reg) {
+                            let neg = self
+                                .graph
+                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                                result: Some(neg.clone()),
+                                kind: OpKind::UnaryOp {
+                                    op: "neg".to_string(),
+                                    operand: count,
+                                    result_ty: ValueType::Int,
+                                },
+                            });
+                            count = neg;
+                        }
                         push_direct_ptradd(&mut self.graph, bb_id, args[0].clone(), count)
                     };
                     self.local_var[dest_local] = Some(offset);
@@ -12683,6 +12700,11 @@ impl<'a> Lowering<'a> {
                 )? {
                     return Ok(());
                 }
+                if self.try_lower_wrapping_unop(
+                    mir_bb, &reg.kind, &segments, &args, dest_local, target,
+                )? {
+                    return Ok(());
+                }
                 if self.try_lower_cmp_minmax(
                     mir_bb,
                     &segments,
@@ -14186,8 +14208,11 @@ impl<'a> Lowering<'a> {
                     } else {
                         body
                     };
-                    let item =
-                        iterator_payload_element(body, self.llbc, iterator_added_a_reference)?;
+                    let item = iterator_payload_element(
+                        body,
+                        self.llbc,
+                        enumerate_item_peel(enumerate_next, iterator_added_a_reference),
+                    )?;
                     serde_json::from_value::<TyRef>(item.clone()).ok()
                 })
                 .map(|ty| tyref_to_value_type_with(&ty, self.llbc, self.tombstoned_leaves))
@@ -16136,15 +16161,16 @@ impl<'a> Lowering<'a> {
             && tyref_is_copy_scalar_or_thin_ptr(dest_ty, self.llbc)
     }
 
-    /// `<*mut T>::add` / `<*const T>::add` when the pointee has a known
-    /// byte size, so the count can be scaled to a byte offset before
+    /// `<*mut T>::add` / `<*const T>::add` / `::sub` when the pointee has a
+    /// known byte size, so the count can be scaled to a byte offset before
     /// `lltype.direct_ptradd`.
     fn ptr_add_pointee_size(&self, reg: &RegularCall, first_arg_ty: Option<&TyRef>) -> Option<i64> {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return None;
         };
         let fd = self.llbc.fn_by_id(*id)?;
-        if !is_core_ptr_add_path(fd.item_meta.name_path().as_str()) {
+        let path = fd.item_meta.name_path();
+        if !is_core_ptr_add_path(path.as_str()) && !is_core_ptr_sub_path(path.as_str()) {
             return None;
         }
         let pointee = first_arg_ty.and_then(|ty| {
@@ -16152,6 +16178,15 @@ impl<'a> Lowering<'a> {
                 .or_else(|| tyref_peel_one_ref_node(ty, self.llbc))
         })?;
         json_ty_byte_size(pointee, self.llbc)
+    }
+
+    fn ptr_offset_is_sub(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| is_core_ptr_sub_path(fd.item_meta.name_path().as_str()))
     }
 
     /// Later intercepts in this same `RegularCall` match already lower
@@ -19694,6 +19729,8 @@ impl<'a> Lowering<'a> {
             "wrapping_mul" => ("mul", false),
             "wrapping_div" => ("floordiv", true),
             "wrapping_rem" => ("mod", true),
+            "wrapping_shl" => ("lshift", false),
+            "wrapping_shr" => ("rshift", false),
             _ => return Ok(false),
         };
         let [lhs, rhs] = args else {
@@ -19728,6 +19765,67 @@ impl<'a> Lowering<'a> {
                 op: op.to_string(),
                 lhs: lhs.clone(),
                 rhs: rhs.clone(),
+                result_ty: if unsigned_word {
+                    ValueType::Unsigned
+                } else {
+                    ValueType::Int
+                },
+            },
+        });
+        self.local_var[dest_local] = Some(res);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    /// `i64`/`u64`/`isize`/`usize::wrapping_neg` is `llop.int_neg`.  The
+    /// binary wrapping table cannot take it: the method is unary.
+    fn try_lower_wrapping_unop(
+        &mut self,
+        mir_bb: usize,
+        kind: &CallKind,
+        segments: &[String],
+        args: &[Variable],
+        dest_local: usize,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let [first, .., module, impl_seg, leaf] = segments else {
+            return Ok(false);
+        };
+        if first.as_str() != "core"
+            || module.as_str() != "num"
+            || impl_seg.as_str() != "<Impl>"
+            || leaf.as_str() != "wrapping_neg"
+        {
+            return Ok(false);
+        }
+        let [operand] = args else {
+            return Ok(false);
+        };
+        let CallKind::Fun(FunId::Regular { id }) = kind else {
+            return Ok(false);
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return Ok(false);
+        };
+        let Some(src) = fd.signature.inputs.first() else {
+            return Ok(false);
+        };
+        let signed_word = matches!(self.tyref_literal_int_atom(src), Some("I64" | "Isize"));
+        let unsigned_word = matches!(self.tyref_literal_uint_atom(src), Some("U64" | "Usize"));
+        if !signed_word && !unsigned_word {
+            return Ok(false);
+        }
+        let bb_id = self.block_id[mir_bb];
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::UnaryOp {
+                op: "neg".to_string(),
+                operand: operand.clone(),
                 result_ty: if unsigned_word {
                     ValueType::Unsigned
                 } else {
@@ -28388,6 +28486,30 @@ fn json_ty_raw_store_descr(
 /// Recognition is positive-only: an unlisted or unreadable receiver does not
 /// peel, which leaves a `&T` payload typed `Ref` — the answer the fold
 /// assumed unconditionally before any element type was carried.
+/// `Map<I, F>::collect` records the closure argument. `slice::Iter<T>`'s
+/// type argument is `T`, but `Iterator::Item` is `&T` and the closure is
+/// lowered against that borrow. `tyref_to_value_type` keeps `&i64` in the
+/// Ref bank and `i64` in the int bank, so recording `T` writes `__pos_0`
+/// as `Int` while the body reads `Ref`.
+fn map_collect_payload_value_type(
+    item_ty: &TyRef,
+    llbc: &Llbc,
+    adds_reference: bool,
+) -> ValueType {
+    let _ = adds_reference;
+    tyref_to_value_type(item_ty, llbc)
+}
+
+/// Plain `next` peels the reference [`iterator_adds_a_reference`] added
+/// ([`iterator_payload_element`]). `Enumerate<I>::next` yields
+/// `(usize, I::Item)` and the loop reads `I::Item` — the borrow, for a
+/// slice iterator — the same bank `pack_enumerate_payload` writes into
+/// `__pos_1`.
+fn enumerate_item_peel(enumerate_next: bool, iterator_added_a_reference: bool) -> bool {
+    let _ = enumerate_next;
+    iterator_added_a_reference
+}
+
 fn iterator_adds_a_reference(path: &str) -> bool {
     matches!(
         path,
@@ -32214,6 +32336,13 @@ fn is_core_ptr_add_path(path: &str) -> bool {
     )
 }
 
+fn is_core_ptr_sub_path(path: &str) -> bool {
+    matches!(
+        path.split("::").collect::<Vec<_>>().as_slice(),
+        ["core", "ptr", "mut_ptr" | "const_ptr", "<Impl>", "sub"]
+    )
+}
+
 fn is_core_ptr_write_path(path: &str) -> bool {
     path == "core::ptr::write"
 }
@@ -35749,6 +35878,81 @@ mod tests {
         ullbc::{NameSeg, TyRef},
     };
 
+    fn empty_llbc() -> Llbc {
+        Llbc::from_slice(
+            br#"{"charon_version":"t","has_errors":false,"translated":{"crate_name":"c","fun_decls":[],"files":[]}}"#,
+        )
+        .expect("empty llbc")
+    }
+
+    fn literal_i64() -> TyRef {
+        serde_json::from_value(serde_json::json!({"Literal": {"Int": "I64"}})).unwrap()
+    }
+
+    fn shared_i64() -> TyRef {
+        serde_json::from_value(
+            serde_json::json!({"Ref": ["Erased", {"Literal": {"Int": "I64"}}, "Shared"]}),
+        )
+        .unwrap()
+    }
+
+    /// `&i64` and `i64` are different banks. `slice::Iter<i64>`'s type
+    /// argument is the scalar; the closure reads the borrow.
+    #[test]
+    fn map_collect_slice_iter_records_the_borrow_the_closure_reads() {
+        let llbc = empty_llbc();
+        let scalar = literal_i64();
+        let borrow = shared_i64();
+        assert_eq!(tyref_to_value_type(&scalar, &llbc), ValueType::Int);
+        assert_eq!(
+            tyref_to_value_type(&borrow, &llbc),
+            ValueType::Ref(None),
+            "&i64 and i64 must not share a bank"
+        );
+        assert!(super::iterator_adds_a_reference(
+            "core::slice::iter::Iter"
+        ));
+        assert_eq!(
+            super::map_collect_payload_value_type(&scalar, &llbc, true),
+            ValueType::Ref(None),
+            "Map::collect must record Iterator::Item &i64, not the type argument i64"
+        );
+    }
+
+    /// `Enumerate<slice::Iter<i64>>::next` yields `(usize, &i64)`. The
+    /// loop's `tuple.1` read is that borrow. Peeling to `i64` stores an
+    /// int in the ref field `__pos_1`.
+    #[test]
+    fn enumerate_slice_iter_next_records_the_borrow_the_loop_reads() {
+        let llbc = empty_llbc();
+        let borrow = shared_i64();
+        let node = match &borrow {
+            TyRef::Other(v) => v.clone(),
+            other => panic!("fixture ref must be inline, got {other:?}"),
+        };
+        assert_eq!(tyref_to_value_type(&borrow, &llbc), ValueType::Ref(None));
+        let peeled = super::iterator_payload_element(&node, &llbc, true)
+            .and_then(|item| serde_json::from_value::<TyRef>(item.clone()).ok())
+            .map(|ty| tyref_to_value_type(&ty, &llbc));
+        assert_eq!(peeled, Some(ValueType::Int), "the peel itself still yields i64");
+        assert!(
+            !super::enumerate_item_peel(true, true),
+            "Enumerate::next must not peel I::Item; plain next still peels"
+        );
+        let kept = super::iterator_payload_element(
+            &node,
+            &llbc,
+            super::enumerate_item_peel(true, true),
+        )
+        .and_then(|item| serde_json::from_value::<TyRef>(item.clone()).ok())
+        .map(|ty| tyref_to_value_type(&ty, &llbc));
+        assert_eq!(kept, Some(ValueType::Ref(None)));
+        assert!(
+            super::enumerate_item_peel(false, true),
+            "plain slice::Iter::next still peels the reference it added"
+        );
+    }
+
     #[test]
     fn map_err_capture_requires_the_core_result_callee() {
         for path in [
@@ -35807,6 +36011,15 @@ mod tests {
         ));
         assert!(!super::is_core_ptr_add_path(
             "core::ptr::mut_ptr::<Impl>::offset"
+        ));
+        assert!(super::is_core_ptr_sub_path(
+            "core::ptr::mut_ptr::<Impl>::sub"
+        ));
+        assert!(super::is_core_ptr_sub_path(
+            "core::ptr::const_ptr::<Impl>::sub"
+        ));
+        assert!(!super::is_core_ptr_sub_path(
+            "core::ptr::mut_ptr::<Impl>::add"
         ));
 
         assert!(super::is_core_ptr_write_path("core::ptr::write"));
@@ -41540,6 +41753,91 @@ mod tests {
             !ops.iter()
                 .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add")),
             "*const i64::add must not become int_add at the front; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn ptr_sub_of_bytes_is_unscaled_direct_ptradd_with_negated_count() {
+        let ptr_ty = serde_json::json!({
+            "RawPtr": [{"Literal": {"UInt": "U8"}}, "Mut"]
+        });
+        let usize_ty = serde_json::json!({"Literal": {"UInt": "Usize"}});
+        let llbc = std_extern_call_fixture(
+            "sub_u8",
+            &["core", "ptr", "mut_ptr", "<Impl>", "sub"],
+            &[ptr_ty.clone(), usize_ty],
+            ptr_ty,
+        );
+        let graph = super::lower_function(&llbc, "sub_u8").expect("lower *mut u8::sub");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| is_lltype_direct_ptradd(op)),
+            "*mut u8::sub must become direct_ptradd; ops={ops:?}"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "neg")),
+            "*mut u8::sub must negate the byte count; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "mul")),
+            "*mut u8::sub must not scale; ops={ops:?}"
+        );
+        assert!(
+            !call_leafs(&ops).iter().any(|leaf| *leaf == "sub"),
+            "*mut u8::sub must not residualize; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn wrapping_neg_of_i64_is_int_neg() {
+        let i64_ty = serde_json::json!({"Literal": {"Int": "I64"}});
+        let llbc = std_extern_call_fixture(
+            "wrapping_neg_i64",
+            &["core", "num", "<Impl>", "wrapping_neg"],
+            &[i64_ty.clone()],
+            i64_ty,
+        );
+        let graph =
+            super::lower_function(&llbc, "wrapping_neg_i64").expect("lower i64::wrapping_neg");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "neg")),
+            "i64::wrapping_neg must become int_neg; ops={ops:?}"
+        );
+        assert!(
+            !call_leafs(&ops)
+                .iter()
+                .any(|leaf| *leaf == "wrapping_neg"),
+            "i64::wrapping_neg must not residualize; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn wrapping_shl_of_usize_is_lshift() {
+        let usize_ty = serde_json::json!({"Literal": {"UInt": "Usize"}});
+        let u32_ty = serde_json::json!({"Literal": {"UInt": "U32"}});
+        let llbc = std_extern_call_fixture(
+            "wrapping_shl_usize",
+            &["core", "num", "<Impl>", "wrapping_shl"],
+            &[usize_ty.clone(), u32_ty],
+            usize_ty,
+        );
+        let graph =
+            super::lower_function(&llbc, "wrapping_shl_usize").expect("lower usize::wrapping_shl");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "lshift")),
+            "usize::wrapping_shl must become lshift; ops={ops:?}"
+        );
+        assert!(
+            !call_leafs(&ops)
+                .iter()
+                .any(|leaf| *leaf == "wrapping_shl"),
+            "usize::wrapping_shl must not residualize; ops={ops:?}"
         );
     }
 
