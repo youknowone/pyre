@@ -3746,13 +3746,15 @@ impl<'g> ProducerIndex<'g> {
             return Some(var.clone());
         }
         let (target, slot) = self.input_slot.get(var).copied()?;
-        let links = self.incoming.get(&target).cloned().unwrap_or_default();
-        let mut incoming_vars = Vec::with_capacity(links.len());
-        for (block_idx, exit_idx) in links {
-            let arg = self.graph.blocks[block_idx].exits[exit_idx]
-                .args
-                .get(slot)?;
-            incoming_vars.push(arg.as_variable()?.clone());
+        let mut incoming_vars = Vec::new();
+        if let Some(links) = self.incoming.get(&target) {
+            incoming_vars.reserve(links.len());
+            for &(block_idx, exit_idx) in links {
+                let arg = self.graph.blocks[block_idx].exits[exit_idx]
+                    .args
+                    .get(slot)?;
+                incoming_vars.push(arg.as_variable()?.clone());
+            }
         }
         if incoming_vars.is_empty() {
             return None;

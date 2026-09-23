@@ -120,7 +120,7 @@ fn is_iter_op_segments(segments: &[String]) -> bool {
 /// foreign iterator constructor) is not followed, so the walk returns
 /// `true` only on a positively-confirmed `iter` source.
 pub(crate) fn originates_from_iter_op(graph: &FunctionGraph, var: &Variable) -> bool {
-    iter_op_container(graph, var).is_some()
+    iter_op_container_with(graph, &BackEdges::build(graph), var).is_some()
 }
 
 fn iter_probe(op: &SpaceOperation) -> Option<Variable> {
@@ -148,11 +148,6 @@ fn range_probe(op: &SpaceOperation) -> Option<()> {
 /// confirms one.  `originates_from_iter_op` is this with the container
 /// discarded; [`iter_next_item_type`] needs it, because the container is the
 /// only thing that separates the two iterator reprs.
-fn iter_op_container(graph: &FunctionGraph, var: &Variable) -> Option<Variable> {
-    let edges = BackEdges::build(graph);
-    iter_op_container_with(graph, &edges, var)
-}
-
 fn iter_op_container_with(
     graph: &FunctionGraph,
     edges: &BackEdges,
@@ -424,24 +419,15 @@ fn exclusive_ranges(counts: &[u32]) -> Vec<(u32, u32)> {
 /// `Option<T>` at the recording site, which is the only place it survives.
 fn iter_next_item_type(
     graph: &FunctionGraph,
+    edges: &BackEdges,
     iterator: &Variable,
     recorded: &ValueType,
 ) -> ValueType {
     // `rrange.py ll_rangenext_*` hands back a `Signed` whatever the Rust
     // range's own spelling is, so the range arm answers before the recorded
     // element type is consulted — a `0..n` over `usize` records `Unsigned`.
-    let edges = BackEdges::build(graph);
-    iter_next_item_type_with(graph, &edges, iterator, recorded)
-}
-
-fn iter_next_item_type_with(
-    graph: &FunctionGraph,
-    edges: &BackEdges,
-    iterator: &Variable,
-    recorded: &ValueType,
-) -> ValueType {
     let over_a_range = iter_op_container_with(graph, edges, iterator)
-        .is_some_and(|container| produced_by_range_with(graph, edges, &container));
+        .is_some_and(|container| produced_by_range_builtin(graph, edges, &container));
     if over_a_range {
         return ValueType::Int;
     }
@@ -466,12 +452,7 @@ fn iter_next_item_type_with(
 /// otherwise flip the answer back to `Ref`, and the failure mode is the
 /// assembler reject [`iter_next_item_type`] exists to prevent rather than a
 /// graceful degrade.
-fn produced_by_range_builtin(graph: &FunctionGraph, var: &Variable) -> bool {
-    let edges = BackEdges::build(graph);
-    produced_by_range_with(graph, &edges, var)
-}
-
-fn produced_by_range_with(graph: &FunctionGraph, edges: &BackEdges, var: &Variable) -> bool {
+fn produced_by_range_builtin(graph: &FunctionGraph, edges: &BackEdges, var: &Variable) -> bool {
     walk_back_with(graph, edges, var, range_probe).is_some()
 }
 
@@ -789,7 +770,7 @@ fn rewire_one_next_site(
     // recording site saw, and the dead forwarded-slot removal below rewrites
     // exactly that.  For Enumerate the recorded kind is the *inner* element
     // (the tuple is packed on the Some arm after this next).
-    let item_ty = iter_next_item_type_with(graph, edges, &next_iter, recorded_item_ty);
+    let item_ty = iter_next_item_type(graph, edges, &next_iter, recorded_item_ty);
 
     // `lower_call` closes the block right after the raising call, so the
     // `next()` call is normally A's last op.  An UNREGISTERED `next()`
@@ -1352,7 +1333,7 @@ mod tests {
     fn a_range_container_answers_int_over_its_recorded_element() {
         let (g, it) = graph_with_iter(true);
         assert_eq!(
-            iter_next_item_type(&g, &it, &ValueType::Unsigned),
+            iter_next_item_type(&g, &BackEdges::build(&g), &it, &ValueType::Unsigned),
             ValueType::Int,
         );
     }
@@ -1364,7 +1345,12 @@ mod tests {
     fn a_gc_reference_element_answers_a_classdefless_ref() {
         let (g, it) = graph_with_iter(false);
         assert_eq!(
-            iter_next_item_type(&g, &it, &ValueType::Ref(Some("PyObject".into()))),
+            iter_next_item_type(
+                &g,
+                &BackEdges::build(&g),
+                &it,
+                &ValueType::Ref(Some("PyObject".into()))
+            ),
             ValueType::Ref(None),
         );
     }
@@ -1378,7 +1364,7 @@ mod tests {
         let (g, it) = graph_with_iter(false);
         for recorded in [ValueType::Int, ValueType::Unsigned, ValueType::Float] {
             assert_eq!(
-                iter_next_item_type(&g, &it, &recorded),
+                iter_next_item_type(&g, &BackEdges::build(&g), &it, &recorded),
                 recorded,
                 "{recorded:?} element must not be retyped as a GC reference",
             );

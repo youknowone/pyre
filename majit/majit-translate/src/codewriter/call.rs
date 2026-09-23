@@ -370,11 +370,27 @@ enum ReadWriteReplayOp {
     Indirect(Option<Vec<CallPath>>),
 }
 
+/// What `producer_array_identity` reads off a result. The answer is still
+/// computed at lookup from `CallControl`, because field types and callee
+/// return types can change after the graph is scanned.
+enum ValueProducer {
+    Field {
+        owner_root: Option<String>,
+        name: String,
+    },
+    Array {
+        array_type_id: String,
+    },
+    Call {
+        target: CallTarget,
+    },
+}
+
 /// Local ops of one graph, scanned once. `value_producers` / `phi_sources`
 /// keep the shape `resolve_array_identity` reads off the live graph.
 struct ReadWriteReplay {
     ops: Vec<ReadWriteReplayOp>,
-    value_producers: HashMap<crate::flowspace::model::Variable, OpKind>,
+    value_producers: HashMap<crate::flowspace::model::Variable, ValueProducer>,
     phi_sources: HashMap<crate::flowspace::model::Variable, Option<LinkArg>>,
 }
 
@@ -388,19 +404,17 @@ impl Default for ReadWriteReplay {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct FieldDescrofKey {
-    idx: u32,
-    owner: String,
-    owner_id: Option<majit_ir::descr::StructId>,
-    name: String,
-}
-
 #[derive(Clone, Default)]
 struct FieldDescrofMemoEntry {
     sized_structs: Vec<String>,
     owner_id_miss: bool,
     offset_source: Option<majit_ir::descr::FieldOffsetSource>,
+    /// `struct_id_for_name` / `canonical_struct_name` / field rank at the
+    /// miss. A hit misses again when any of them has changed: those live
+    /// outside the setters that clear this memo.
+    registry_struct_id: Option<majit_ir::descr::StructId>,
+    canonical_owner: String,
+    immutability: Option<crate::model::ImmutableRank>,
     mint: Option<(
         majit_ir::effectinfo::DescrSetMember,
         majit_ir::effectinfo::DescrMintSpec,
@@ -410,6 +424,18 @@ struct FieldDescrofMemoEntry {
         majit_ir::effectinfo::DescrSetMember,
     )>,
 }
+
+/// `idx → owner → owner_id → name`. A hit borrows `&str` keys.
+type FieldDescrofMemo = HashMap<
+    u32,
+    HashMap<
+        String,
+        HashMap<
+            Option<majit_ir::descr::StructId>,
+            HashMap<String, std::sync::Arc<FieldDescrofMemoEntry>>,
+        >,
+    >,
+>;
 
 /// Call descriptor — `AbstractDescr`-equivalent metadata for a call op.
 ///
@@ -1699,8 +1725,7 @@ pub struct CallControl {
     field_footprint: std::cell::RefCell<FieldDescrofMemoEntry>,
     /// Repeat `fielddescrof_keyed` hits replay the mint records and return
     /// the cached descr. The layout walk runs once per key.
-    fielddescrof_memo:
-        std::cell::RefCell<HashMap<FieldDescrofKey, std::sync::Arc<FieldDescrofMemoEntry>>>,
+    fielddescrof_memo: std::cell::RefCell<FieldDescrofMemo>,
 
     /// RPython: known struct types for `get_type_flag(ARRAY.OF)` → FLAG_STRUCT.
     /// If an array's element type is in this set, the array descriptor gets
@@ -2333,11 +2358,13 @@ impl CallControl {
     /// RPython: register struct type names for get_type_flag(ARRAY.OF).
     pub fn set_known_struct_names(&mut self, names: HashSet<String>) {
         self.known_struct_names = names;
+        self.clear_fielddescrof_memo();
     }
 
     /// RPython: register struct field types for op.args[0].concretetype resolution.
     pub fn set_struct_fields(&mut self, registry: crate::front::StructFieldRegistry) {
         self.struct_fields = registry;
+        self.clear_fielddescrof_memo();
     }
 
     /// Program-wide struct field shapes accumulated at pipeline init.
@@ -2398,6 +2425,11 @@ impl CallControl {
         layout: StructLayout,
     ) {
         self.struct_layouts.insert(struct_id, layout);
+        self.clear_fielddescrof_memo();
+    }
+
+    fn clear_fielddescrof_memo(&self) {
+        self.fielddescrof_memo.borrow_mut().clear();
     }
 
     /// Install the embedding runtime's lltype storage classification.
@@ -2869,16 +2901,21 @@ impl CallControl {
         majit_ir::descr::DescrRef,
         majit_ir::effectinfo::DescrSetMember,
     )> {
-        let key = FieldDescrofKey {
-            idx,
-            owner: owner_root.to_string(),
-            owner_id,
-            name: field_name.to_string(),
-        };
+        let registry_struct_id = majit_ir::descr::struct_id_for_name(owner_root);
+        let canonical_owner = majit_ir::descr::canonical_struct_name(owner_root);
+        let immutability = self.field_immutability(Some(owner_root), field_name);
         if let Some(hit) = self
             .fielddescrof_memo
             .borrow()
-            .get(&key)
+            .get(&idx)
+            .and_then(|by_owner| by_owner.get(owner_root))
+            .and_then(|by_id| by_id.get(&owner_id))
+            .and_then(|by_name| by_name.get(field_name))
+            .filter(|hit| {
+                hit.registry_struct_id == registry_struct_id
+                    && hit.canonical_owner == canonical_owner
+                    && hit.immutability == immutability
+            })
             .map(std::sync::Arc::clone)
         {
             replay_fielddescrof_hit(self, &hit, idx);
@@ -2888,12 +2925,21 @@ impl CallControl {
         *self.struct_size_log.borrow_mut() = Some(Vec::new());
         let result = self.fielddescrof_concrete(idx, owner_root, owner_id, field_name);
         let sized = self.struct_size_log.borrow_mut().take().unwrap_or_default();
-        let mut entry = self.field_footprint.borrow_mut().clone();
+        let mut entry = std::mem::take(&mut *self.field_footprint.borrow_mut());
         entry.sized_structs = sized;
+        entry.registry_struct_id = registry_struct_id;
+        entry.canonical_owner = canonical_owner;
+        entry.immutability = immutability;
         entry.result = result.clone();
         self.fielddescrof_memo
             .borrow_mut()
-            .insert(key, std::sync::Arc::new(entry));
+            .entry(idx)
+            .or_default()
+            .entry(owner_root.to_string())
+            .or_default()
+            .entry(owner_id)
+            .or_default()
+            .insert(field_name.to_string(), std::sync::Arc::new(entry));
         result
     }
 
@@ -3433,7 +3479,8 @@ impl CallControl {
         if let Some(pending) = self.external_funcobjs.remove(&path) {
             graph.func.merge_from(&pending);
         }
-        self.function_graphs.insert(path, graph);
+        self.function_graphs.insert(path.clone(), graph);
+        self.readwrite_replay.borrow_mut().remove(&path);
     }
 
     /// Read the [`FuncEffects`](crate::model::FuncEffects) for `path`:
@@ -4255,6 +4302,7 @@ impl CallControl {
     /// argument (`op.args = [c_funcptr, op.args[0]]`). The residual
     /// helper is already `executioncontext::jit_force_virtualizable`.
     fn replace_force_virtualizable_with_call(&mut self) -> usize {
+        self.readwrite_replay.borrow_mut().clear();
         let mut count = 0;
         for graph in self.function_graphs.values_mut() {
             for block in &mut graph.blocks {
@@ -4443,6 +4491,7 @@ impl CallControl {
     /// and the recursive effect analyzers inspect the registered source graph
     /// first and would read `graphs: None` as an unknown family/top result.
     fn materialize_deferred_indirect_families(&mut self) {
+        self.readwrite_replay.borrow_mut().clear();
         let trait_method_impls = &self.trait_method_impls;
         let function_graphs = &mut self.function_graphs;
         for graph in function_graphs.values_mut() {
@@ -5528,6 +5577,8 @@ impl CallControl {
         op_idx: usize,
         resolved: CallPath,
     ) {
+        // A replay holds only its own graph's ops, so only the caller's goes stale.
+        self.readwrite_replay.borrow_mut().remove(caller);
         let Some(graph) = self.function_graphs.get_mut(caller) else {
             return;
         };
@@ -8160,35 +8211,30 @@ fn subtract_index_set(read: &[u32], write: &[u32]) -> Vec<u32> {
 fn resolve_array_identity(
     base: &crate::flowspace::model::Variable,
     op_array_type_id: &Option<String>,
-    value_producers: &HashMap<crate::flowspace::model::Variable, &crate::model::OpKind>,
+    value_producers: &HashMap<crate::flowspace::model::Variable, ValueProducer>,
     phi_sources: &HashMap<crate::flowspace::model::Variable, Option<LinkArg>>,
     cc: &CallControl,
 ) -> Option<String> {
     fn producer_array_identity(
         value: &crate::flowspace::model::Variable,
-        value_producers: &HashMap<crate::flowspace::model::Variable, &crate::model::OpKind>,
+        value_producers: &HashMap<crate::flowspace::model::Variable, ValueProducer>,
         cc: &CallControl,
     ) -> Option<String> {
         let producer = value_producers.get(value)?;
         match producer {
             // FieldRead: self.array → full ARRAY type from struct registry.
             // RPython: op.args[0].concretetype is the ARRAY lltype directly.
-            OpKind::FieldRead { field, .. } => field
-                .owner_root
+            ValueProducer::Field { owner_root, name } => owner_root
                 .as_deref()
-                .and_then(|owner| cc.field_type(owner, &field.name))
+                .and_then(|owner| cc.field_type(owner, name))
                 .map(ToOwned::to_owned),
             // ArrayRead with known array_type_id: propagate.
-            OpKind::ArrayRead { array_type_id, .. } if array_type_id.is_some() => {
-                array_type_id.clone()
-            }
+            ValueProducer::Array { array_type_id } => Some(array_type_id.clone()),
             // Call result: RPython resolves via result.concretetype → full type.
-            OpKind::Call { target, .. } => cc
+            ValueProducer::Call { target } => cc
                 .target_to_path(target)
                 .and_then(|callee_path| cc.function_graphs().get(&callee_path))
                 .and_then(|g| g.return_type.clone()),
-            OpKind::Input { .. } => None,
-            _ => None,
         }
     }
 
@@ -8309,11 +8355,6 @@ fn apply_readwrite_replay(
         return;
     }
     let replay = readwrite_replay_ops(path, function_graphs, cc);
-    let producers: HashMap<crate::flowspace::model::Variable, &OpKind> = replay
-        .value_producers
-        .iter()
-        .map(|(var, kind)| (var.clone(), kind))
-        .collect();
     for op in &replay.ops {
         match op {
             ReadWriteReplayOp::FieldRead {
@@ -8351,7 +8392,7 @@ fn apply_readwrite_replay(
                 let resolved_id = resolve_array_identity(
                     base,
                     array_type_id,
-                    &producers,
+                    &replay.value_producers,
                     &replay.phi_sources,
                     cc,
                 )
@@ -8376,7 +8417,7 @@ fn apply_readwrite_replay(
                 let resolved_id = resolve_array_identity(
                     base,
                     array_type_id,
-                    &producers,
+                    &replay.value_producers,
                     &replay.phi_sources,
                     cc,
                 )
@@ -8400,7 +8441,7 @@ fn apply_readwrite_replay(
                 let resolved_id = resolve_array_identity(
                     base,
                     array_type_id,
-                    &producers,
+                    &replay.value_producers,
                     &replay.phi_sources,
                     cc,
                 )
@@ -8431,7 +8472,7 @@ fn apply_readwrite_replay(
                 let resolved_id = resolve_array_identity(
                     base,
                     array_type_id,
-                    &producers,
+                    &replay.value_producers,
                     &replay.phi_sources,
                     cc,
                 )
@@ -8615,12 +8656,42 @@ fn readwrite_replay_ops(
 }
 
 fn build_readwrite_replay(graph: &FunctionGraph) -> ReadWriteReplay {
-    let value_producers: HashMap<crate::flowspace::model::Variable, OpKind> = graph
-        .blocks
-        .iter()
-        .flat_map(|b| &b.operations)
-        .filter_map(|op| op.result.as_ref().map(|v| (v.clone(), op.kind.clone())))
-        .collect();
+    let mut value_producers: HashMap<crate::flowspace::model::Variable, ValueProducer> =
+        HashMap::new();
+    for op in graph.blocks.iter().flat_map(|b| &b.operations) {
+        let Some(var) = op.result.as_ref() else {
+            continue;
+        };
+        // `producer_array_identity` returns `None` for every other kind,
+        // including `ArrayRead` with no `array_type_id` and `Input`, the
+        // same answer as a missing key. A later ignored result clears an
+        // earlier kept one so last-insert still wins. `Call` keeps only
+        // `target`; the lookup reads the callee return type from `cc`.
+        let kept = match &op.kind {
+            OpKind::FieldRead { field, .. } => Some(ValueProducer::Field {
+                owner_root: field.owner_root.clone(),
+                name: field.name.clone(),
+            }),
+            OpKind::ArrayRead {
+                array_type_id: Some(array_type_id),
+                ..
+            } => Some(ValueProducer::Array {
+                array_type_id: array_type_id.clone(),
+            }),
+            OpKind::Call { target, .. } => Some(ValueProducer::Call {
+                target: target.clone(),
+            }),
+            _ => None,
+        };
+        match kept {
+            Some(kind) => {
+                value_producers.insert(var.clone(), kind);
+            }
+            None => {
+                value_producers.remove(var);
+            }
+        }
+    }
     let mut phi_sources: HashMap<crate::flowspace::model::Variable, Option<LinkArg>> =
         HashMap::new();
     for block in &graph.blocks {
@@ -11310,7 +11381,7 @@ mod tests {
         let cc = CallControl::new();
         let base = Variable::new();
         let forwarded = Variable::new();
-        let value_producers: HashMap<Variable, &OpKind> = HashMap::new();
+        let value_producers: HashMap<Variable, ValueProducer> = HashMap::new();
         let mut phi_sources: HashMap<Variable, Option<LinkArg>> = HashMap::new();
         phi_sources.insert(base.clone(), Some(LinkArg::Value(forwarded.clone())));
         phi_sources.insert(
@@ -13809,5 +13880,102 @@ mod tests {
         let m = rw_of(&cc, "m");
         assert!(!m.is_top);
         assert_eq!(m.write_fields, vec![0]);
+    }
+
+    /// A layout registered after the first mint has to be visible on the
+    /// next call. The first call has no `struct_layouts` row, so the offset
+    /// source is the accumulator; `set_struct_layout` then makes the same
+    /// key a template hit (size 32, `x` at 16).
+    #[test]
+    fn fielddescrof_keyed_sees_layout_registered_after_first_mint() {
+        let sid = majit_ir::descr::StructId::from_canonical("FooMemoLayout");
+        let _registry = crate::test_support::register_struct_ids_serialized(HashMap::from([(
+            "FooMemoLayout".to_string(),
+            Some(sid),
+        )]));
+        majit_ir::descr::reset_field_mint_census();
+        let mut cc = CallControl::new();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "FooMemoLayout".to_string(),
+            vec![("x".into(), "i64".into())],
+        );
+        cc.set_struct_fields(fields);
+        assert!(
+            cc.fielddescrof_keyed(0, "FooMemoLayout", None, "x")
+                .is_some()
+        );
+        cc.set_struct_layout(
+            sid,
+            StructLayout {
+                size: 32,
+                fields: vec![StructFieldLayout {
+                    name: "x".to_string(),
+                    offset: 16,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Signed,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+            },
+        );
+        let before = majit_ir::descr::field_mint_census_snapshot();
+        // The field cache still holds the first mint (offset 0). The second
+        // call asks for offset 16 / layout size 32 and records
+        // `FieldOffsetSource::TemplateHit` before `get_field_descr`'s
+        // debug disagreement check unwinds.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cc.fielddescrof_keyed(0, "FooMemoLayout", None, "x")
+        }));
+        let after = majit_ir::descr::field_mint_census_snapshot();
+        assert!(after.offset_template_hit > before.offset_template_hit);
+        assert!(after.cache_hit_offset > before.cache_hit_offset);
+    }
+
+    /// Replacing the graph stored under a path drops the replay of the
+    /// previous body.
+    #[test]
+    fn readwrite_reregistered_graph_drops_cached_effects() {
+        let mut cc = CallControl::new();
+        rw_register(&mut cc, "g", vec![rw_write_field("G", "slot")]);
+        assert_eq!(rw_of(&cc, "g").write_fields, vec![0]);
+        cc.register_function_graph(
+            CallPath::from_segments(["g"]),
+            FunctionGraph::new("g_replacement"),
+        );
+        let again = rw_of(&cc, "g");
+        assert!(!again.is_top);
+        assert!(again.write_fields.is_empty());
+    }
+
+    /// An indirect call cached while `graphs` is still `None` is `top_set`.
+    /// Filling the family afterwards unions the members instead of replaying
+    /// that top result.
+    #[test]
+    fn readwrite_materialized_indirect_family_replaces_cached_top() {
+        let mut cc = CallControl::new();
+        let mut impl_graph = FunctionGraph::new("impl_m");
+        let entry = impl_graph.startblock;
+        impl_graph.push_op_var(entry, rw_write_field("Impl", "slot"), false);
+        cc.register_trait_method("m", Some("Trait"), "Impl", impl_graph);
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        caller.push_op_var(
+            entry,
+            OpKind::IndirectCall {
+                funcptr: crate::flowspace::model::Variable::named("fnptr"),
+                args: Vec::new(),
+                graphs: None,
+                family_key: Some(("Trait".to_string(), "m".to_string())),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        cc.register_function_graph(CallPath::from_segments(["caller"]), caller);
+        assert!(rw_of(&cc, "caller").is_top);
+        cc.find_all_graphs_for_tests();
+        let again = rw_of(&cc, "caller");
+        assert!(!again.is_top);
+        assert_eq!(again.write_fields, vec![0]);
     }
 }
