@@ -3241,6 +3241,17 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &saturating_add_vars,
             )
         };
+        // Word-sized `saturating_mul` clamp (`front::saturating_mul`) splits
+        // the residual call into `lo = a * b; hi = uint_mul_high(a, b); if
+        // uint_ne(hi, 0) { MAX } else { lo }`.  Same fail-safe as add.
+        let _saturating_mul_rewritten = if lo.saturating_mul_sites.is_empty() {
+            0
+        } else {
+            crate::front::saturating_mul::rewire_saturating_mul_call_sites(
+                &mut lo.graph,
+                &lo.saturating_mul_sites,
+            )
+        };
         // The `saturating_sub` clamp rewrite (`front::saturating_sub`) splits
         // the residual `saturating_sub` call block into an `if a < b { 0 } else
         // { a - b }` diamond, same post-lowering shape and fail-safe contract as
@@ -4770,6 +4781,10 @@ struct Lowering<'a> {
     /// `front::saturating_sub` post-pass synthesizes after body lowering (see
     /// [`crate::front::saturating_sub::SaturatingSubSite`]).
     saturating_sub_sites: Vec<crate::front::saturating_sub::SaturatingSubSite>,
+    /// Word-sized `{u64,usize}::saturating_mul(a, b)` call results recorded
+    /// for the unsigned high-word clamp diamond `front::saturating_mul`
+    /// synthesizes after body lowering.
+    saturating_mul_sites: Vec<Variable>,
     /// `RangeInclusive::new(lo, hi)` call sites recorded for the
     /// `(a..=b).contains(&x)` → `int_between(lo, x, hi + 1)` fold the
     /// `front::range_contains` post-pass synthesizes (see
@@ -5149,6 +5164,7 @@ impl<'a> Lowering<'a> {
             slice_first_sites: Vec::new(),
             slice_get_sites: Vec::new(),
             saturating_sub_sites: Vec::new(),
+            saturating_mul_sites: Vec::new(),
             range_inclusive_new_sites: Vec::new(),
             range_iter_new_sites: Vec::new(),
             slice_index_rangefrom_sites: Vec::new(),
@@ -14428,6 +14444,23 @@ impl<'a> Lowering<'a> {
                 .push(crate::front::saturating_sub::SaturatingSubSite {
                     result_var: result_var.clone(),
                 });
+        }
+        // Word-sized `{u64,usize}::saturating_mul`.  Narrow unsigned
+        // saturating mul is not a word high-word test (`u32::MAX *
+        // u32::MAX` fits in u64), so the dest atom is required here —
+        // the same width gate as unsigned `checked_mul`.
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
+            && fmt_path_ends_with(segments, &["num", "<Impl>", "saturating_mul"])
+            && self
+                .tyref_literal_uint_atom(&call.dest.ty)
+                .is_some_and(crate::front::checked_arith_uint::is_word_sized_uint_atom)
+        {
+            self.saturating_mul_sites.push(result_var.clone());
         }
         // Capture `Result::ok()` results whose payload is `Layout`
         // (`Option<Layout>`) for the `from_size_align` bound-check rewiring pass
