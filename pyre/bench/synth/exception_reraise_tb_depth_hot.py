@@ -1,4 +1,13 @@
-# pyre-check: max-pypy-ratio=3.5
+# pyre-check: max-pypy-ratio=4.7
+# The ceiling is fitted to readings, not to a margin over a target.  3.5 was
+# fitted while the runners resolved `pypy3.11` to 7.3.23, which ran this
+# fixture in 0.23-0.25s against pyre's 0.49-0.51s on ubuntu-cranelift.
+# `Pin the CI PyPy oracle to 8.0.0` moved every runner to 8.0.0, whose
+# x86-64 speedup halves the oracle to 0.12-0.13s while pyre's own execution
+# is unchanged at 0.50-0.52s; the same runner then reads 3.7x and 4.1x.  A
+# same-machine A/B of base against branch measured both sides equal with
+# identical jit-stats, so what moved is the oracle.  4.7 is the highest
+# reading plus 15%.
 # A bare re-raise caught in the same frame keeps the original traceback: no
 # node is attached at a re-raise coordinate (RaiseWithExplicitTraceback,
 # attach_tb=False). The module-level loop's recording iteration runs that
