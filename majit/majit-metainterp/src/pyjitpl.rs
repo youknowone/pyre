@@ -4479,13 +4479,23 @@ impl<M: Clone> MetaInterp<M> {
             .get_mut(index)
     }
 
-    /// call.py:147 `jd.mainjitcode` for a `jitdrivers_sd` slot.
+    /// `call.py grab_initial_jitcodes` `jd.mainjitcode` for a `jitdrivers_sd`
+    /// slot. The eager field wins; otherwise a bound loader decodes once into
+    /// the slot's `OnceLock` and stamps `jitdriver_sd` the way
+    /// `JitDriver::install_extracted_portal_jitcode` does.
     pub fn mainjitcode_of(&self, index: usize) -> Option<&std::sync::Arc<crate::jitcode::JitCode>> {
-        self.staticdata
-            .jitdrivers_sd
-            .get(index)?
-            .mainjitcode
-            .as_ref()
+        let jd = self.staticdata.jitdrivers_sd.get(index)?;
+        if let Some(jitcode) = jd.mainjitcode.as_ref() {
+            return Some(jitcode);
+        }
+        let loader = jd.mainjitcode_loader?;
+        if jd.mainjitcode_loaded.get().is_none() {
+            if let Some(jitcode) = loader() {
+                jitcode.set_jitdriver_sd(index);
+                let _ = jd.mainjitcode_loaded.set(jitcode);
+            }
+        }
+        jd.mainjitcode_loaded.get()
     }
 
     /// Whether the driver in `jitdrivers_sd[index]` carries a
@@ -22752,6 +22762,8 @@ mod metainterp_static_data_tests {
             result_type: majit_ir::Type::Ref,
             is_recursive: false,
             mainjitcode: None,
+            mainjitcode_loader: None,
+            mainjitcode_loaded: std::sync::OnceLock::new(),
             portal_runner_adr: 0,
             virtualizable_info: None,
             greenfield_info: None,

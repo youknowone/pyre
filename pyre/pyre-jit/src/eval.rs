@@ -5045,6 +5045,24 @@ fn active_jit_backend_memory_stats() -> (usize, usize) {
     majit_backend::process_assembler_memory_stats()
 }
 
+/// One portal `Arc` for every clone of the driver static data.
+/// `call.py grab_initial_jitcodes` binds `jd.mainjitcode` during translation;
+/// pyre defers only the decode until the first reader.
+static PORTAL_MAINJITCODE: std::sync::OnceLock<Option<std::sync::Arc<majit_metainterp::JitCode>>> =
+    std::sync::OnceLock::new();
+
+fn load_portal_mainjitcode() -> Option<std::sync::Arc<majit_metainterp::JitCode>> {
+    PORTAL_MAINJITCODE
+        .get_or_init(|| {
+            pyre_jit_trace::jitcode_runtime::portal_jitcode().map(|canonical| {
+                std::sync::Arc::new(majit_metainterp::JitCode::from_canonical(
+                    (*canonical).clone(),
+                ))
+            })
+        })
+        .clone()
+}
+
 fn build_jit_driver_pair() -> JitDriverPair {
     majit_metainterp::set_record_application_traceback_hook(Some(
         crate::call_jit::record_caught_blackhole_traceback,
@@ -5165,15 +5183,11 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // warmstate.py get_unique_id(greenkey) → interp_jit.py get_unique_id.
     jd.get_unique_id = Some(portal_unique_id_from_greens);
     d.meta_interp_mut().register_jitdriver_sd(jd);
-    // call.py grab_initial_jitcodes: `jd.mainjitcode = self.get_jitcode(jd.portal_graph)`.
-    // Production never calls `register_dispatch_jitcode`; without this the
-    // portal interpret seeds an empty framestack.
-    if let Some(canonical) = pyre_jit_trace::jitcode_runtime::portal_jitcode() {
-        let jitcode = std::sync::Arc::new(majit_metainterp::JitCode::from_canonical(
-            (*canonical).clone(),
-        ));
-        d.install_extracted_portal_jitcode(jitcode);
-    }
+    // call.py grab_initial_jitcodes binds `jd.mainjitcode` during translation.
+    // Production never calls `register_dispatch_jitcode`; without this binding
+    // the portal interpret seeds an empty framestack. The decode itself waits
+    // for the first `mainjitcode_of` read.
+    d.install_extracted_portal_jitcode_loader(load_portal_mainjitcode);
     // baseobjspace.py `unpackiterable_driver = JitDriver(greens=['greenkey'],
     // reds='auto', ...)` — the second portal driver (jd1) for the
     // unknown-length unpack loop `unpackiterable_portal`. Registered
