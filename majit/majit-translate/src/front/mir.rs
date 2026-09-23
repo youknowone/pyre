@@ -14095,6 +14095,7 @@ impl<'a> Lowering<'a> {
         let identity_dest = adt_path_of_tyref(&call.dest.ty, self.llbc);
         let identity_dest_ty =
             tyref_to_value_type_with(&call.dest.ty, self.llbc, self.tombstoned_leaves);
+        let dest_is_bool = matches!(identity_dest_ty, ValueType::Bool);
         // A borrow carries no representation of its own here -- `Rvalue::Ref`
         // aliases the place's Variable -- so the receiver's bank is the
         // pointee's.  `Box`/`Ref`/`MutexGuard` still read `Ref` through it
@@ -14114,6 +14115,9 @@ impl<'a> Lowering<'a> {
             op_kind,
             identity_recv.as_deref(),
             identity_dest.as_deref(),
+            self.tyref_literal_int_atom(&call.dest.ty),
+            self.tyref_literal_uint_atom(&call.dest.ty),
+            dest_is_bool,
             identity_banks_agree,
         );
         // Capture `i64::checked_{add,sub,mul}()` results (`Option<i64>`-
