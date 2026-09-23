@@ -4290,9 +4290,7 @@ fn build_gc() -> Box<MiniMarkGC> {
 
     // gateway.py interp2app is an internal prebuilt W_Root, not an
     // app-level builtin type. Trace its Code reference like the hidden
-    // WeakrefLifeline above. This is the tail of fixed layouts, BEFORE
-    // register_unresolved_struct_tids: that dynamic cache registers only
-    // previously unresolved descriptors, so its count differs on GC rebuild.
+    // WeakrefLifeline above.
     let gateway_descr =
         <pyre_object::gateway::interp2app as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
     let gateway_tid = gc.register_type(TypeInfo::with_gc_ptrs(
@@ -4309,20 +4307,11 @@ fn build_gc() -> Box<MiniMarkGC> {
         gateway_descr.ptr_offsets,
     );
 
-    // `gc.py GcLLDescr_framework.init_size_descr` asks the
-    // gctypelayout layoutbuilder for a collector type id after the translated
-    // GC layouts are known, and only walks Size/Array objects already in
-    // GcCache.  Materialize those (plus Field slots, which publish the
-    // parent Size) without pulling `rehydrate_build_descr_raw_sets` —
-    // EffectInfo/Call restoration — into process startup. PyPy populates
-    // descriptors during translation; `MetaInterpStaticData.finish_setup_descrs`
-    // enumerates them, and `_setup_once` does not mint descriptors.
-    pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs();
-    let _registered_synthetic_structs = majit_ir::descr::gc_cache()
-        .lock()
-        .register_unresolved_struct_tids(|size, offsets| {
-            gc.register_type(TypeInfo::with_gc_ptrs(size, offsets))
-        });
+    // `GcLLDescr_framework.init_size_descr` asks `TypeLayoutBuilder.get_type_id`
+    // for synthetic struct tids during translation. pyre stamps them on the
+    // first JIT use (`materialize_gccache_owned_descrs`, installed below as
+    // the type-registry close hook) so a process that never traces does not
+    // decode the descr table.
 
     // `bytes` `data` block — `rstr.py`'s `STR.chars`, an
     // `Array(Char)`. A varsize GcArray of bytes with no inner refs, so it
@@ -4332,7 +4321,8 @@ fn build_gc() -> Box<MiniMarkGC> {
     // header. `bytes_object_custom_trace` greys it through the `data` field
     // slot, the same edge the storage box was reached by.
     //
-    // Registered after every other type, synthetic structs included. A tid is a
+    // Registered at the tail of the fixed layouts. Synthetic struct tids are
+    // stamped on the first JIT use and do not occupy a slot here. A tid is a
     // position in this chain, and the interpreter spells many of them as
     // literals — `W_BYTES_GC_TYPE_ID` is 27, `W_LIST_GC_TYPE_ID` is 7 — so an
     // insertion anywhere earlier renumbers every registration below it while the
@@ -4995,6 +4985,12 @@ pub fn init_gc_subsystem() {
         install_gc_into_backend();
         GC_TLS_INSTALLED.with(|c| c.set(true));
     }
+    // `ensure_type_registry_closed` runs this before `freeze_types`, so the
+    // synthetic struct tids are registered whichever comes first — a rehydrate
+    // or a close.
+    majit_gc::set_type_registry_close_hook(
+        pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs,
+    );
     // rbigint.py constructs `_parts_cache_10` at module import.  Force pyre's
     // translated prebuilt equivalent before any collector root walk rather
     // than lazily manufacturing it from inside the walker. After registration,
