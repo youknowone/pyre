@@ -763,18 +763,47 @@ fn declared_shape(w_type: PyObjectRef) -> Option<Shape> {
     if derived("timedelta") {
         return Some(Shape::Delta);
     }
-    // date, datetime and time share the tzinfo-word basestruct.  The date
-    // type is then sized back to the header, so a zero here is not a request
-    // for the header.
-    if derived("datetime") || derived("time") || derived("date") {
+    if derived("datetime") || derived("time") {
+        return Some(Shape::WithTZInfo);
+    }
+    // Exact `date` is sized as the datetime basestruct, then shrunk by
+    // `_PyDateTime_Import`. A later subclass inherits that shrunk `tp_basicsize`
+    // from the base (`type_attach`), so it is not this shape.
+    let date = datetime_class("date");
+    if !date.is_null() && std::ptr::eq(w_type, date) {
         return Some(Shape::WithTZInfo);
     }
     None
 }
 
+/// A subclass of `date` that is not a `datetime` or a `time`.
+fn pure_date_subclass(w_type: PyObjectRef) -> bool {
+    let date = datetime_class("date");
+    if date.is_null() || std::ptr::eq(w_type, date) {
+        return false;
+    }
+    if unsafe { !crate::baseobjspace::issubtype_w(w_type, date) } {
+        return false;
+    }
+    let later = |name: &str| {
+        let class = datetime_class(name);
+        !class.is_null() && unsafe { crate::baseobjspace::issubtype_w(w_type, class) }
+    };
+    !later("datetime") && !later("time")
+}
+
 /// What `tp_basicsize` a synthesized mirror of `w_type` carries.
 pub(super) fn basicsize(w_type: PyObjectRef) -> isize {
-    declared_shape(w_type).map_or(0, Shape::size)
+    if let Some(shape) = declared_shape(w_type) {
+        return shape.size();
+    }
+    // `_PyDateTime_Import` shrinks the exact date type to `sizeof(PyObject)`.
+    // A heap subclass created afterwards inherits that size. The slot table
+    // would otherwise append the date layout's words on top of the header.
+    if pure_date_subclass(w_type) {
+        return size_of::<CPyObject>() as isize;
+    }
+    0
 }
 
 /// The shape a block carries, read off its type mirror — `type_attach`

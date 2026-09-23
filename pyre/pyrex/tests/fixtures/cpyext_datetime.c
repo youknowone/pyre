@@ -274,9 +274,33 @@ static PyObject *checks_of(PyObject *self, PyObject *object)
         "tzinfo_exact", PyTZInfo_CheckExact(object) ? Py_True : Py_False);
 }
 
+/* Extra instance storage past the base. A pure `date` subclass follows
+   the shrunk date header, so this is 0 rather than the tzinfo words. */
+static PyObject *type_data_size(PyObject *self, PyObject *type)
+{
+    (void)self;
+    if (!PyType_Check(type)) {
+        PyErr_SetString(PyExc_TypeError, "expected a type");
+        return NULL;
+    }
+    return PyLong_FromSsize_t(PyType_GetTypeDataSize((PyTypeObject *)type));
+}
+
+static PyObject *basicsize_of(PyObject *self, PyObject *type)
+{
+    (void)self;
+    if (!PyType_Check(type)) {
+        PyErr_SetString(PyExc_TypeError, "expected a type");
+        return NULL;
+    }
+    return PyLong_FromSsize_t(((PyTypeObject *)type)->tp_basicsize);
+}
+
 static PyMethodDef methods[] = {
     {"table", table, METH_NOARGS, NULL},
     {"sizes", sizes, METH_NOARGS, NULL},
+    {"type_data_size", type_data_size, METH_O, NULL},
+    {"basicsize_of", basicsize_of, METH_O, NULL},
     {"make_date", make_date, METH_VARARGS, NULL},
     {"make_datetime", make_datetime, METH_VARARGS, NULL},
     {"make_datetime_fold", make_datetime_fold, METH_VARARGS, NULL},
