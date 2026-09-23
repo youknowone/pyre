@@ -102,20 +102,20 @@ pyrex = { version = "0.0.2", path = "pyre/pyrex" }
 # `ssl` is rustls-free; `rustls` is the engine.
 # Then through youknowone/host-env-scandir (#8734 @ b01f472c),
 # on #8733: `nt::scandir` (`FindFirstFileW` / `FindNextFileW`).
-# Then through youknowone/host-env-win-consts (50d79a1e8): Windows
-# socket, faulthandler, Win32 file/exception, and winsound constants
-# in host_env. Common/compiler trees stay on #8734.
+# Then through RustPython/RustPython #8792 plus unix SemHandle::from_raw
+# (ac4b82020 on youknowone/merged-8792): remaining Windows socket
+# constants, and the host_env/common/compiler tree at that merge.
 #
-rustpython-common = { git = "https://github.com/youknowone/RustPython.git", rev = "50d79a1e8fce976cf32be092066d865df7060b57", features = ["binascii", "bz2", "cjk-codecs", "inet", "json", "lzma", "zlib"] }
-rustpython-literal = { git = "https://github.com/youknowone/RustPython.git", rev = "50d79a1e8fce976cf32be092066d865df7060b57" }
-rustpython-compiler = { git = "https://github.com/youknowone/RustPython.git", rev = "50d79a1e8fce976cf32be092066d865df7060b57" }
-rustpython-compiler-core = { git = "https://github.com/youknowone/RustPython.git", rev = "50d79a1e8fce976cf32be092066d865df7060b57" }
+rustpython-common = { git = "https://github.com/youknowone/RustPython.git", rev = "ac4b8202004e51d1c6f44bed618f7b32b863fea2", features = ["binascii", "bz2", "cjk-codecs", "inet", "json", "lzma", "zlib"] }
+rustpython-literal = { git = "https://github.com/youknowone/RustPython.git", rev = "ac4b8202004e51d1c6f44bed618f7b32b863fea2" }
+rustpython-compiler = { git = "https://github.com/youknowone/RustPython.git", rev = "ac4b8202004e51d1c6f44bed618f7b32b863fea2" }
+rustpython-compiler-core = { git = "https://github.com/youknowone/RustPython.git", rev = "ac4b8202004e51d1c6f44bed618f7b32b863fea2" }
 ruff-text-size = { package = "rustpython-ruff_text_size", version = "0.16.5" }
 num-complex = "0.4"
-rustpython-host_env = { git = "https://github.com/youknowone/RustPython.git", rev = "50d79a1e8fce976cf32be092066d865df7060b57" }
-rustpython-wtf8 = { git = "https://github.com/youknowone/RustPython.git", rev = "50d79a1e8fce976cf32be092066d865df7060b57" }
-rustpython-unicode = { git = "https://github.com/youknowone/RustPython.git", rev = "50d79a1e8fce976cf32be092066d865df7060b57" }
-sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/youknowone/RustPython.git", rev = "50d79a1e8fce976cf32be092066d865df7060b57" }
+rustpython-host_env = { git = "https://github.com/youknowone/RustPython.git", rev = "ac4b8202004e51d1c6f44bed618f7b32b863fea2" }
+rustpython-wtf8 = { git = "https://github.com/youknowone/RustPython.git", rev = "ac4b8202004e51d1c6f44bed618f7b32b863fea2" }
+rustpython-unicode = { git = "https://github.com/youknowone/RustPython.git", rev = "ac4b8202004e51d1c6f44bed618f7b32b863fea2" }
+sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/youknowone/RustPython.git", rev = "ac4b8202004e51d1c6f44bed618f7b32b863fea2" }
 
 # majit JIT framework
 majit = { version = "0.0.2", path = "majit/majit" }
@@ -138,7 +138,7 @@ majit-charon-reader = { version = "0.0.2", path = "majit/majit-charon-reader" }
 
 # shared dependencies
 parking_lot = "0.12"
-malachite-bigint = "0.11"
+malachite-bigint = "0.12"
 num-traits = "0.2"
 num-integer = "0.1"
 bit-set = "0.10"
