@@ -6215,6 +6215,23 @@ pub fn driver_pair() -> &'static mut JitDriverPair {
     })
 }
 
+/// The thread-local driver when this thread has already built one.
+///
+/// `driver_pair` also runs `init_gc_subsystem` and constructs the driver
+/// on first use. `WarmRunnerDesc.add_finish` calls `profiler.finish` only
+/// when `profiler.initialized` is set, which is never true before that
+/// build, so shutdown must not construct a driver just to read the flag.
+#[majit_macros::dont_look_inside]
+pub fn existing_driver_pair() -> Option<&'static mut JitDriverPair> {
+    JIT_DRIVER.with(|cell| unsafe {
+        let slot = &mut *cell.get();
+        match slot {
+            Some(pair) => Some(&mut *(pair as *mut JitDriverPair)),
+            None => None,
+        }
+    })
+}
+
 /// framework.py `root_walker.walk_roots` hook for
 /// `storage.rd_consts` (resume.py:451) across every live compiled
 /// trace.

@@ -3207,7 +3207,7 @@ impl GcRewriterImpl {
         // already exist before the rewriter sees CALL_ASSEMBLER.
         let callee_locs = lookup(token)
             .expect("CALL_ASSEMBLER target metadata must be registered before rewriter runs");
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!(
                 "[gc-rewrite][call-assembler] token={} frame_info_ptr=0x{:x} ll_initial_locs={:?} frame_depth={} index_of_virtualizable={}",
                 token,

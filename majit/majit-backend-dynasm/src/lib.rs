@@ -46,17 +46,15 @@ pub mod x86;
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
-/// Whether `MAJIT_LOG` is set, cached at first access.
+/// Whether a `debug_print` would be emitted on this thread.
 ///
-/// `std::env::var_os` acquires a global env lock and walks the env table on
-/// every call. The flag never changes after process startup, so checking it
-/// from hot dispatch paths shows up in profiles. The `LazyLock` caches the
-/// boolean. Mirrors the equivalent helper in `majit-backend-cranelift`.
+/// `have_debug_prints` — true only inside a debug section the `MAJIT_LOG`
+/// prefix filter accepts, so a category filter silences these sites.
+/// Not a cached `std::env::var_os`: the ready bit changes when a section
+/// opens. Mirrors the equivalent helper in `majit-backend-cranelift`.
 #[inline]
 pub fn majit_log_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("MAJIT_LOG").is_some());
-    *ENABLED
+    majit_ir::debug::have_debug_prints()
 }
 
 /// Log backend emission events without enabling per-execution diagnostics.

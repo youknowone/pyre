@@ -73,14 +73,10 @@ mod slice_x2_probe {
 
 /// Whether `MAJIT_LOG` is set, cached at first access.
 ///
-/// `std::env::var_os` acquires a global env lock and walks the env table on
-/// every call. The flag never changes after process startup, so checking it
-/// from hot dispatch paths (e.g. `run_compiled_code_inner` per bridge hop)
-/// shows up in profiles. `LazyLock` caches the boolean.
+/// `have_debug_prints` — true only inside a debug section the `MAJIT_LOG`
+/// prefix filter accepts, so a category filter silences these sites.
 fn majit_log_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("MAJIT_LOG").is_some());
-    *ENABLED
+    majit_ir::debug::have_debug_prints()
 }
 
 /// The three flags a compiled entry reads, resolved together.
@@ -3957,7 +3953,7 @@ fn call_assembler_shim_inner(
         "call_assembler shim outcome buffer must be non-null"
     );
 
-    if std::env::var_os("MAJIT_LOG").is_some() {
+    if majit_log_enabled() {
         let i0 = input_slice.first().copied().unwrap_or(-1);
         eprintln!(
             "[ca-shim] entering trace_id={} num_inputs={} input0={:#x}",
@@ -3995,7 +3991,7 @@ fn call_assembler_shim_inner(
             Type::Void => 0,
         })
         .collect();
-    if std::env::var_os("MAJIT_LOG").is_some() {
+    if majit_log_enabled() {
         eprintln!(
             "[ca-shim] guard fail_idx={} nvals={}",
             fail_index,
@@ -4989,7 +4985,7 @@ fn validate_oprefs_for_compile(
                 || is_rewriter_immediate_arg(op.opcode, 0)
                 || seen.contains(&arg.to_opref().raw());
             if !bound {
-                if std::env::var_os("MAJIT_LOG").is_some() {
+                if majit_log_enabled() {
                     eprintln!(
                         "[validate-oprefs] op[{}] {:?} dereferences undefined OpRef::int_op({}) — InvalidLoop",
                         op_idx,
@@ -5644,7 +5640,7 @@ fn build_ref_root_slots(
     // majit's flat, typeless OpRef can (SameAsF/SameAsI replacing a Ref).
     // Report it rather than compensating for it: a trace that reaches the
     // backend ill-typed is a defect upstream of codegen.
-    if std::env::var_os("MAJIT_LOG").is_some() {
+    if majit_log_enabled() {
         log_internal_jump_type_mismatches(ops, type_index, overrides);
     }
 
@@ -5688,7 +5684,7 @@ fn build_ref_root_slots(
             slots.push((input.index, slots.len()));
         } else if input.tp.get() == Type::Ref
             && !used_inputargs.contains(&input.index)
-            && std::env::var_os("MAJIT_LOG").is_some()
+            && majit_log_enabled()
         {
             eprintln!(
                 "[ref-root] SKIP inputarg idx={}: not referenced by ops (constant-folded)",
@@ -5701,7 +5697,7 @@ fn build_ref_root_slots(
         if op.result_type() == Type::Ref {
             let vi = op_var_index(op, op_idx, inputargs.len()) as u32;
             if !force_tokens.contains(&vi) && seen.insert(vi) {
-                if std::env::var_os("MAJIT_LOG").is_some() {
+                if majit_log_enabled() {
                     eprintln!(
                         "[ref-root] op idx={} opcode={:?} vi={}",
                         op_idx, op.opcode, vi
@@ -9149,7 +9145,7 @@ impl CraneliftBackend {
                             && !fail_descr_has_bridge(as_fd(&new_d))
                             && let Some(b) = fail_descr_bridge_ref(as_fd(prev_d))
                         {
-                            if std::env::var_os("MAJIT_LOG").is_some() {
+                            if majit_log_enabled() {
                                 eprintln!(
                                     "[jit] propagate bridge tid={} fi={} to new token",
                                     tid, fi,
@@ -10435,7 +10431,7 @@ impl CraneliftBackend {
         // RPython: refs are always in jf_frame; gcmap marks which slots
         // are live at each GC point (regalloc.py get_gcmap).
         let ref_root_base_ofs = JF_FRAME_ITEM0_OFS + (max_output_slots as i32) * 8;
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if majit_log_enabled() {
             eprintln!(
                 "[codegen] max_output={} ref_roots={} longevity={:?}",
                 max_output_slots,
@@ -16214,7 +16210,7 @@ impl CraneliftBackend {
             .module
             .define_function(entry_id, &mut wrapper_compile_ctx)
         {
-            if std::env::var_os("MAJIT_LOG").is_some() {
+            if majit_log_enabled() {
                 eprintln!(
                     "[jit][clif-error] wrapper {e}\nCLIF IR:\n{}",
                     wrapper_compile_ctx.func.display()
@@ -16262,7 +16258,7 @@ impl CraneliftBackend {
             })?;
             asm_memory_blocks.push(block);
         }
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if majit_log_enabled() {
             let fail_descr_preview: Vec<(u32, usize)> = fail_descrs
                 .iter()
                 .map(|descr| {
@@ -16723,7 +16719,7 @@ fn collect_guards(
         } else {
             None
         };
-        if std::env::var_os("MAJIT_LOG").is_some() && guard_resume_pc.is_some() {
+        if majit_log_enabled() && guard_resume_pc.is_some() {
             eprintln!(
                 "[guard-resume] fail_index={} last_ref={:?} resume_pc={:?}",
                 fail_index,
@@ -17224,7 +17220,7 @@ fn collect_guards(
             }
             descr
         };
-        if std::env::var_os("MAJIT_LOG").is_some() && !is_finish && !is_external_jump {
+        if majit_log_enabled() && !is_finish && !is_external_jump {
             eprintln!(
                 "[cl-guard-token] fail_index={} op_index={} opcode={:?} fail_args={:?} fail_arg_types={:?}",
                 fail_index,
