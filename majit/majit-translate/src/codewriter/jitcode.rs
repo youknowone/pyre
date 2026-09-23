@@ -986,43 +986,62 @@ mod jitcode_handle_serde {
 /// three packed bitsets (int, ref, float) via `LivenessIterator`, invoking
 /// the matching callback for each live register index.
 ///
+/// `enumerate_vars` is `jitcode.py` `enumerate_vars`. The by-bank form
+/// ([`enumerate_vars_by_bank`]) is the same walk with the bank passed
+/// instead of selected by callback, because Rust cannot hold three `&mut`
+/// borrows of one closure at once. This entry dispatches on that bank so
+/// existing callers keep the three-callback shape.
+///
 /// RPython places this in `rpython/jit/codewriter/jitcode.py` (not in
 /// metainterp). majit follows the same module placement.
 pub fn enumerate_vars(
-    mut offset: usize,
+    offset: usize,
     all_liveness: &[u8],
     mut callback_i: impl FnMut(u32),
     mut callback_r: impl FnMut(u32),
     mut callback_f: impl FnMut(u32),
 ) {
+    enumerate_vars_by_bank(offset, all_liveness, |bank, index| match bank {
+        majit_ir::Type::Int => callback_i(index),
+        majit_ir::Type::Ref => callback_r(index),
+        majit_ir::Type::Float => callback_f(index),
+        majit_ir::Type::Void => {
+            unreachable!("enumerate_vars walks the int, ref, and float banks only")
+        }
+    });
+}
+
+/// Same walk as `jitcode.py` `enumerate_vars`, tagging each live index with
+/// its bank (`Int`, `Ref`, `Float`). One callback receives the bank because
+/// Rust cannot hold three `&mut` borrows of one closure at once.
+pub fn enumerate_vars_by_bank(
+    mut offset: usize,
+    all_liveness: &[u8],
+    mut callback: impl FnMut(majit_ir::Type, u32),
+) {
     use crate::liveness::LivenessIterator;
-    // jitcode.py:149-151
     let length_i = all_liveness[offset] as u32;
     let length_r = all_liveness[offset + 1] as u32;
     let length_f = all_liveness[offset + 2] as u32;
-    // jitcode.py:152
     offset += 3;
-    // jitcode.py:153-157
     if length_i != 0 {
         let mut it = LivenessIterator::new(offset, length_i, all_liveness);
         for index in &mut it {
-            callback_i(index);
+            callback(majit_ir::Type::Int, index);
         }
         offset = it.offset;
     }
-    // jitcode.py:158-162
     if length_r != 0 {
         let mut it = LivenessIterator::new(offset, length_r, all_liveness);
         for index in &mut it {
-            callback_r(index);
+            callback(majit_ir::Type::Ref, index);
         }
         offset = it.offset;
     }
-    // jitcode.py:163-166
     if length_f != 0 {
         let mut it = LivenessIterator::new(offset, length_f, all_liveness);
         for index in &mut it {
-            callback_f(index);
+            callback(majit_ir::Type::Float, index);
         }
     }
 }

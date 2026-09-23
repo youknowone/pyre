@@ -8750,25 +8750,30 @@ impl FrameLivenessRegIndices {
     }
 }
 
-/// jitcode.py `enumerate_vars` parity: read the per-bank live
-/// register indices at a resolved JitCode `pc`. `all_liveness` is
-/// `metainterp_sd.liveness_info`; `op_live` is `metainterp_sd.op_live`.
-/// Returns empty banks when `pc` is not a valid liveness startpoint, so the
-/// caller can decline to seed rather than panic in `get_live_vars_info`.
+/// Materialized `enumerate_vars` kept for `JitDriver::start_bridge_tracing`
+/// → `setup_bridge_sym`.
 ///
-/// jitcode.py `get_live_vars_info` asserts on a missing startpoint
-/// (MissingLiveness); we deliberately soft-decline instead, because a frame
-/// resuming through the Python `pc` legitimately has no JitCode liveness at
-/// this coordinate.  An empty return can however mask a genuinely bad resume
-/// coordinate (the caller then seeds nothing), so each decline is logged
-/// under `MAJIT_BRIDGE_DEBUG` rather than being fully silent.
+/// `setup_bridge_sym` is static and metainterp-blind: it runs in a different
+/// function and has no jitcode, so it cannot walk `enumerate_vars` itself.
+/// `start_bridge_tracing` stores these three banks on the trace ctx and the
+/// macro reads them back. `bridge_from_guard_resume_position` does not use
+/// this; it drives `enumerate_vars` once and pairs each index with the next
+/// rebuilt value in the callback.
+///
+/// Returns empty banks when `pc` is not a decodable liveness startpoint
+/// (`JitCode::can_decode_live_vars` is false, or the three length bytes do
+/// not fit in `all_liveness`). `JitCode::get_live_vars_info` asserts on a
+/// missing startpoint (`MissingLiveness`); a frame resuming through the
+/// Python pc legitimately has no JitCode liveness at this coordinate, so
+/// this declines instead of panicking. An empty return can mask a genuinely
+/// bad resume coordinate (the caller then seeds nothing), so each decline
+/// is logged under `MAJIT_BRIDGE_DEBUG`.
 pub fn read_frame_liveness_reg_indices(
     jitcode: &crate::jitcode::JitCode,
     pc: usize,
     op_live: u8,
     all_liveness: &[u8],
 ) -> FrameLivenessRegIndices {
-    use majit_translate::liveness::LivenessIterator;
     if !jitcode.can_decode_live_vars(pc, op_live) {
         if crate::bridge_debug_enabled() {
             eprintln!(
@@ -8787,26 +8792,17 @@ pub fn read_frame_liveness_reg_indices(
         }
         return FrameLivenessRegIndices::default();
     }
-    // jitcode.py:149-151 — three length bytes; jitcode.py:152 — body offset.
-    let length_i = all_liveness[info] as u32;
-    let length_r = all_liveness[info + 1] as u32;
-    let length_f = all_liveness[info + 2] as u32;
-    let mut offset = info + 3;
-    fn read_bank(offset: &mut usize, length: u32, all_liveness: &[u8]) -> Vec<u32> {
-        if length == 0 {
-            return Vec::new();
-        }
-        let mut it = LivenessIterator::new(*offset, length, all_liveness);
-        let mut out = Vec::with_capacity(length as usize);
-        for reg_idx in it.by_ref() {
-            out.push(reg_idx);
-        }
-        *offset = it.offset;
-        out
-    }
-    let int = read_bank(&mut offset, length_i, all_liveness);
-    let ref_ = read_bank(&mut offset, length_r, all_liveness);
-    let float = read_bank(&mut offset, length_f, all_liveness);
+    // `enumerate_vars` yields exactly these many indices per bank.
+    let mut int = Vec::with_capacity(all_liveness[info] as usize);
+    let mut ref_ = Vec::with_capacity(all_liveness[info + 1] as usize);
+    let mut float = Vec::with_capacity(all_liveness[info + 2] as usize);
+    majit_translate::codewriter::jitcode::enumerate_vars(
+        info,
+        all_liveness,
+        |index| int.push(index),
+        |index| ref_.push(index),
+        |index| float.push(index),
+    );
     FrameLivenessRegIndices { int, ref_, float }
 }
 
