@@ -893,7 +893,7 @@ fn derive_pc_live_indices_from_sparse(
             // `backward_jump_target` keeps the JumpBackward (skip_caches)
             // vs JumpBackwardNoInterrupt (direct `pc + 1`) base distinction
             // in one place, matching the interpreter's dispatch.
-            _ => backward_jump_target(code, pc, instr, op_arg),
+            _ => pyre_interpreter::backward_jump_target(code, pc, instr, op_arg),
         }
     };
     // Branch guards (`goto_if_not` / `goto_if_not_*` / `switch`) resume at
@@ -6928,7 +6928,7 @@ impl CodeWriter {
         // `jump_absolute` Python wrapper — the equivalent is to pre-scan
         // `JumpBackward` opcodes and record their targets; each target PC
         // becomes a `loop_header` site.
-        let loop_header_pcs = find_loop_header_pcs(code);
+        let loop_header_pcs = pyre_interpreter::find_loop_header_pcs(code);
         // Pre-scanned set of every block-entry PC.  Used
         // by emit_mark_label_pc to force a block boundary (call
         // mergeblock to close current_block + create/match a fresh
@@ -9240,12 +9240,12 @@ impl CodeWriter {
                         // plain variable (not a tuple of a foldable comparison op).
                         // bhimpl_goto_if_not takes the target when `a == 0`.
                         Instruction::PopJumpIfFalse { delta } => {
-                            let target_py_pc = jump_target_forward(
-                                code,
-                                num_instrs,
+                            let target_py_pc = pyre_interpreter::jump_target_forward(
+                                &code.instructions,
                                 py_pc + 1,
                                 delta.get(op_arg).as_usize(),
-                            );
+                            )
+                            .min(num_instrs);
                             // truth_fn reads cond directly from the popped
                             // stack slot; `popvalue_ref` leaves the value at
                             // `stack_base + current_depth` (the slot below the new
@@ -9332,12 +9332,12 @@ impl CodeWriter {
                         // in the link ordering: jump target = True path, fallthrough =
                         // False path.
                         Instruction::PopJumpIfTrue { delta } => {
-                            let target_py_pc = jump_target_forward(
-                                code,
-                                num_instrs,
+                            let target_py_pc = pyre_interpreter::jump_target_forward(
+                                &code.instructions,
                                 py_pc + 1,
                                 delta.get(op_arg).as_usize(),
-                            );
+                            )
+                            .min(num_instrs);
                             // See PopJumpIfFalse — no obj_tmp0 staging
                             // needed; the residual call reads the popped stack slot.
                             let _cond_reg = emit_popvalue_ref!(current_depth, py_pc);
@@ -9421,12 +9421,12 @@ impl CodeWriter {
 
                         // RPython flatten.py: goto Label
                         Instruction::JumpForward { delta } => {
-                            let target_py_pc = jump_target_forward(
-                                code,
-                                num_instrs,
+                            let target_py_pc = pyre_interpreter::jump_target_forward(
+                                &code.instructions,
                                 py_pc + 1,
                                 delta.get(op_arg).as_usize(),
-                            );
+                            )
+                            .min(num_instrs);
                             if target_py_pc < num_instrs {
                                 emit_goto!(target_py_pc);
                             }
@@ -9434,7 +9434,7 @@ impl CodeWriter {
 
                         instr @ Instruction::JumpBackward { .. } => {
                             if let Some(target_py_pc) =
-                                backward_jump_target(code, py_pc, instr, op_arg)
+                                pyre_interpreter::backward_jump_target(code, py_pc, instr, op_arg)
                             {
                                 if target_py_pc < num_instrs {
                                     // interp_jit.py `can_enter_jit` at each
@@ -9940,7 +9940,7 @@ impl CodeWriter {
                         // lockstep.  interp_jit.py:103 + jtransform.py:1714.
                         instr @ Instruction::JumpBackwardNoInterrupt { .. } => {
                             if let Some(target_py_pc) =
-                                backward_jump_target(code, py_pc, instr, op_arg)
+                                pyre_interpreter::backward_jump_target(code, py_pc, instr, op_arg)
                             {
                                 if target_py_pc < num_instrs {
                                     // Same `can_enter_jit` → `loop_header`
@@ -11433,12 +11433,12 @@ impl CodeWriter {
                             // jump target so the interpreter re-runs FOR_ITER
                             // and ends the loop). Mirrors the GuardNonnull and
                             // PopJumpIfFalse two-exit CFG shape.
-                            let exhaust_target = jump_target_forward(
-                                code,
-                                num_instrs,
+                            let exhaust_target = pyre_interpreter::jump_target_forward(
+                                &code.instructions,
                                 py_pc + 1,
                                 delta.get(op_arg).as_usize(),
-                            );
+                            )
+                            .min(num_instrs);
                             let truth = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
@@ -12181,12 +12181,12 @@ impl CodeWriter {
                                 Instruction::PopJumpIfNone { .. } => "ptr_eq",
                                 _ => "ptr_ne",
                             };
-                            let target_py_pc = jump_target_forward(
-                                code,
-                                num_instrs,
+                            let target_py_pc = pyre_interpreter::jump_target_forward(
+                                &code.instructions,
                                 py_pc + 1,
                                 delta.get(op_arg).as_usize(),
-                            );
+                            )
+                            .min(num_instrs);
                             let _cond_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let cond_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let none_value = pyobject_const_ref_value(pyre_object::w_none());
@@ -15485,7 +15485,7 @@ impl CodeWriter {
         // and the replayed prologue stores them into locals.  Publishing no
         // entry makes `merge_entry_for` answer `None`, which both the walk and
         // `compile_and_run_once` read as "interpret this green".
-        let mut trace_entry_pcs: Vec<usize> = find_loop_header_pcs(code)
+        let mut trace_entry_pcs: Vec<usize> = pyre_interpreter::find_loop_header_pcs(code)
             .iter()
             .copied()
             .filter(|&py_pc| {
@@ -16016,131 +16016,6 @@ impl CodeWriter {
 // Jump target calculation (RPython: flatten.py link following)
 // ---------------------------------------------------------------------------
 
-/// Forward jump target: skip_caches(next_instr) + delta.
-/// Must match pyre-interpreter/pyopcode.rs:jump_target_forward.
-fn jump_target_forward(
-    code: &CodeObject,
-    num_instrs: usize,
-    next_instr: usize,
-    delta: usize,
-) -> usize {
-    let target = skip_caches(code, next_instr) + delta;
-    target.min(num_instrs)
-}
-
-/// Single-source-of-truth backward-jump target calculation used by both
-/// the loop-header pre-scan (pypy/module/pypyjit/interp_jit.py:103) and
-/// the emitter (jtransform.py `handle_jit_marker__loop_header`).
-///
-/// Returns the target PC for `JumpBackward` (with `skip_caches` on the
-/// next-PC base) and `JumpBackwardNoInterrupt` (direct `py_pc + 1 - delta`
-/// arithmetic to match the interpreter's dispatch in pyopcode.rs).
-/// Returns `None` for any non-backward-jump opcode.
-fn backward_jump_target(
-    code: &CodeObject,
-    py_pc: usize,
-    instr: Instruction,
-    op_arg: pyre_interpreter::OpArg,
-) -> Option<usize> {
-    match instr {
-        Instruction::JumpBackward { delta } => {
-            Some(skip_caches(code, py_pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
-        }
-        Instruction::JumpBackwardNoInterrupt { delta } => {
-            Some((py_pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
-        }
-        _ => None,
-    }
-}
-
-/// Control-flow successors of every code-unit index: fall-through (except
-/// after an unconditional transfer), forward and backward jump targets, and
-/// the exception edge from each protected pc to its handler landing.  Built in
-/// one sequential decode pass so an `EXTENDED_ARG` prefix folds into the
-/// following opcode's argument, matching the edge model of
-/// `find_branch_target_pcs`.
-pub(crate) fn code_successors(code: &CodeObject) -> Vec<Vec<usize>> {
-    let num_instrs = code.instructions.len();
-    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); num_instrs];
-    let mut scan_state = OpArgState::default();
-    for pc in 0..num_instrs {
-        let (instr, op_arg) = scan_state.get(code.instructions[pc]);
-        if let Some(target) = backward_jump_target(code, pc, instr, op_arg) {
-            if target < num_instrs {
-                succ[pc].push(target);
-            }
-        }
-        let forward_delta = match instr {
-            Instruction::PopJumpIfFalse { delta }
-            | Instruction::PopJumpIfTrue { delta }
-            | Instruction::PopJumpIfNone { delta }
-            | Instruction::PopJumpIfNotNone { delta }
-            | Instruction::JumpForward { delta }
-            | Instruction::ForIter { delta } => Some(delta.get(op_arg).as_usize()),
-            _ => None,
-        };
-        if let Some(delta) = forward_delta {
-            let target = jump_target_forward(code, num_instrs, pc + 1, delta);
-            if target < num_instrs {
-                succ[pc].push(target);
-            }
-        }
-        let terminates = matches!(
-            instr,
-            Instruction::JumpForward { .. }
-                | Instruction::JumpBackward { .. }
-                | Instruction::JumpBackwardNoInterrupt { .. }
-                | Instruction::ReturnValue
-                | Instruction::RaiseVarargs { .. }
-                | Instruction::Reraise { .. }
-        );
-        if !terminates {
-            let fallthrough = pc + 1;
-            if fallthrough < num_instrs {
-                succ[pc].push(fallthrough);
-            }
-        }
-    }
-    for entry in pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable) {
-        let start = entry.start as usize / 2;
-        let end = (entry.end as usize / 2).min(num_instrs);
-        let handler = entry.target as usize / 2;
-        if handler < num_instrs {
-            for pc in start..end {
-                succ[pc].push(handler);
-            }
-        }
-    }
-    succ
-}
-
-/// True when `target_pc` dominates `source_pc`: every control-flow path from
-/// the code entry (pc 0) to `source_pc` passes through `target_pc`.  Answered
-/// by a forward reachability from the entry that never enters `target_pc` — if
-/// `source_pc` stays unreachable, `target_pc` dominates it.
-fn target_dominates(succ: &[Vec<usize>], target_pc: usize, source_pc: usize) -> bool {
-    let num_instrs = succ.len();
-    if target_pc == source_pc || target_pc == 0 {
-        return true;
-    }
-    if source_pc >= num_instrs {
-        return false;
-    }
-    let mut seen = vec![false; num_instrs];
-    let mut stack = vec![0usize];
-    seen[0] = true;
-    while let Some(pc) = stack.pop() {
-        for &next in &succ[pc] {
-            if next == target_pc || seen[next] {
-                continue;
-            }
-            seen[next] = true;
-            stack.push(next);
-        }
-    }
-    !seen[source_pc]
-}
-
 /// True when a backward bytecode jump is only a control-flow return from an
 /// exception handler to earlier code, rather than a loop backedge.  Python
 /// 3.14 lays handler blocks after the protected body, so a `break` / handler
@@ -16156,22 +16031,8 @@ fn backward_jump_is_handler_only_target(
     source_pc: usize,
     target_pc: usize,
 ) -> bool {
-    let succ = code_successors(code);
-    !target_dominates(&succ, target_pc, source_pc)
-}
-
-/// Match pyre-interpreter/pyopcode.rs:skip_caches.
-fn skip_caches(code: &CodeObject, mut pos: usize) -> usize {
-    let mut state = OpArgState::default();
-    while pos < code.instructions.len() {
-        let (instruction, _) = state.get(code.instructions[pos]);
-        if matches!(instruction, Instruction::Cache) {
-            pos += 1;
-        } else {
-            break;
-        }
-    }
-    pos
+    let succ = pyre_interpreter::code_successors(code);
+    !pyre_interpreter::target_dominates(&succ, target_pc, source_pc)
 }
 
 // ---------------------------------------------------------------------------
@@ -16198,6 +16059,23 @@ fn skip_caches(code: &CodeObject, mut pos: usize) -> usize {
 /// in the interpreter.
 pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject) -> bool {
     let writer = CodeWriter::instance();
+    let code_ptr = code as *const pyre_interpreter::CodeObject;
+    // `call.py get_jitcode` / `self.jitcodes[graph]` after the one
+    // `codewriter.py make_jitcodes` drain. RPython runs that drain once at
+    // warmspot; a later `compile_and_run_once` of the same portal only looks
+    // the populated entry up. The lookup must also confirm the portal was
+    // registered, because the jitcode cache is shared with callee compilation.
+    if writer
+        .callcontrol()
+        .jitdriver_sd_from_portal_graph(code_ptr)
+        .is_some()
+        && writer
+            .callcontrol()
+            .find_compiled_jitcode_arc(code_ptr)
+            .is_some()
+    {
+        return true;
+    }
     // codewriter.py `setup_jitdriver(jd)` — register the
     // portal so `grab_initial_jitcodes` finds it.
     writer.setup_jitdriver(super::call::JitDriverStaticData {
@@ -16427,35 +16305,6 @@ fn compile_jitcode_via_raw_code(
         .find_compiled_jitcode_arc(code as *const _)
 }
 
-/// Scan `code` for JUMP_BACKWARD targets — the PCs where
-/// `transform_graph_to_jitcode` would emit `BC_JUMP_TARGET` and where
-/// `jit_merge_point` is evaluated.
-///
-/// RPython parity: corresponds to `jtransform.py:1714-1718`
-/// `handle_jit_marker__loop_header`, which walks the flow graph looking
-/// for `jit_marker('loop_header', ...)` operations. pyre's "graph" is
-/// raw Python bytecode, so the equivalent scan looks for
-/// `JUMP_BACKWARD` instructions and resolves their target PCs.
-///
-/// Used by `transform_graph_to_jitcode` to decide where loop markers
-/// belong. Portal classification itself comes from
-/// `CallControl.jitdrivers_sd`, matching codewriter.py:37.
-pub fn find_loop_header_pcs(code: &pyre_interpreter::CodeObject) -> VecSet<usize> {
-    let num_instrs = code.instructions.len();
-    let succ = code_successors(code);
-    let mut loop_header_pcs: VecSet<usize> = VecSet::new();
-    let mut scan_state = OpArgState::default();
-    for scan_pc in 0..num_instrs {
-        let (scan_instr, scan_arg) = scan_state.get(code.instructions[scan_pc]);
-        if let Some(target) = backward_jump_target(code, scan_pc, scan_instr, scan_arg) {
-            if target < num_instrs && target_dominates(&succ, target, scan_pc) {
-                loop_header_pcs.insert(target);
-            }
-        }
-    }
-    loop_header_pcs
-}
-
 /// All PCs that are block-entry points: PC 0, every forward jump
 /// target, every backward jump target, and every exception handler
 /// entry.  Mirrors upstream's set of `joinpoints` keys after
@@ -16482,13 +16331,15 @@ pub fn find_branch_target_pcs(code: &pyre_interpreter::CodeObject) -> VecSet<usi
     for scan_pc in 0..num_instrs {
         let (scan_instr, scan_arg) = scan_state.get(code.instructions[scan_pc]);
         // Backward jumps reuse the canonical helper.
-        if let Some(target) = backward_jump_target(code, scan_pc, scan_instr, scan_arg) {
+        if let Some(target) =
+            pyre_interpreter::backward_jump_target(code, scan_pc, scan_instr, scan_arg)
+        {
             if target < num_instrs {
                 targets.insert(target);
             }
         }
         // Forward conditional / unconditional jumps.  Targets compute
-        // via `jump_target_forward(code, num_instrs, py_pc + 1, delta)`
+        // via `jump_target_forward(instructions, py_pc + 1, delta)`
         // matching the walker's PopJumpIfFalse / PopJumpIfTrue /
         // PopJumpIfNone / PopJumpIfNotNone / JumpForward arms.
         let forward_delta = match scan_instr {
@@ -16501,7 +16352,8 @@ pub fn find_branch_target_pcs(code: &pyre_interpreter::CodeObject) -> VecSet<usi
             _ => None,
         };
         if let Some(delta) = forward_delta {
-            let target = jump_target_forward(code, num_instrs, scan_pc + 1, delta);
+            let target =
+                pyre_interpreter::jump_target_forward(&code.instructions, scan_pc + 1, delta);
             if target < num_instrs {
                 targets.insert(target);
             }
@@ -18380,7 +18232,9 @@ mod tests {
         let mut ordinary_targets = Vec::new();
         for pc in 0..code.instructions.len() {
             let (instruction, op_arg) = arg_state.get(code.instructions[pc]);
-            let Some(target) = backward_jump_target(&code, pc, instruction, op_arg) else {
+            let Some(target) =
+                pyre_interpreter::backward_jump_target(&code, pc, instruction, op_arg)
+            else {
                 continue;
             };
             if backward_jump_is_handler_only_target(&code, pc, target) {
@@ -18392,7 +18246,7 @@ mod tests {
 
         assert!(!handler_only_targets.is_empty());
         assert!(!ordinary_targets.is_empty());
-        let loop_headers = find_loop_header_pcs(&code);
+        let loop_headers = pyre_interpreter::find_loop_header_pcs(&code);
         assert!(
             handler_only_targets
                 .iter()
@@ -18418,13 +18272,15 @@ mod tests {
         let mut backedge_targets = Vec::new();
         for pc in 0..code.instructions.len() {
             let (instruction, op_arg) = arg_state.get(code.instructions[pc]);
-            if let Some(target) = backward_jump_target(&code, pc, instruction, op_arg) {
+            if let Some(target) =
+                pyre_interpreter::backward_jump_target(&code, pc, instruction, op_arg)
+            {
                 backedge_targets.push(target);
             }
         }
         // The sole backward jump is the `while` backedge.
         assert_eq!(backedge_targets.len(), 1);
-        let loop_headers = find_loop_header_pcs(&code);
+        let loop_headers = pyre_interpreter::find_loop_header_pcs(&code);
         assert!(loop_headers.contains(&backedge_targets[0]));
     }
 

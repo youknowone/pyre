@@ -1167,6 +1167,55 @@ pub(crate) fn step_vstack_mirror<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym
     reconcile_vstack_at_boundary(ctx, code, new_pypc, new_depth);
 }
 
+/// Advance the operand-stack mirror to the post-step resume coordinate.
+///
+/// [`step_vstack_mirror`] runs at the top of the next `step`.  Aborting
+/// first leaves the mirror on the completed opcode's on-entry stack.
+/// RPython's MIFrame after `run_one_step` already holds the post-step
+/// registers (`_copy_data_from_miframe`).
+///
+/// A block-head merge point is the measured hole: `vstack_step_py_pc`
+/// keeps the previous opcode so the walk does not apply that opcode's
+/// effect before the destination block runs.  `blackhole_if_trace_too_long`
+/// aborts AT that marker (`pyjitpl.py`), and the CRN green is the
+/// destination `next_instr`.  FOR_ITER continue then publishes
+/// `[total, iter]` while STORE_NAME needs `[total, iter, n]`.
+pub(crate) fn reconcile_vstack_to_resume_pc<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    jit_pc: usize,
+) {
+    step_vstack_mirror(ctx, jit_pc);
+    if !ctx.vstack_valid || ctx.fbw_mode.inline_subwalk {
+        return;
+    }
+    let full_body_sym = ctx.fbw_mode.snapshot_sym;
+    if full_body_sym.is_null() {
+        return;
+    }
+    let (dest_py, code_ptr, depth) = unsafe {
+        let sym = &*full_body_sym;
+        if sym.jitcode().is_null() {
+            return;
+        }
+        let jc = &*sym.jitcode();
+        if jc.payload.code_ptr.is_null() {
+            return;
+        }
+        let Some(dest_py) = metadata_block_head_py_pc(&jc.payload.metadata, jit_pc) else {
+            return;
+        };
+        if dest_py == ctx.vstack_cur_pypc {
+            return;
+        }
+        let depth = vstack_step_depth(&jc.payload, jit_pc, dest_py);
+        (dest_py, jc.payload.code_ptr, depth)
+    };
+    if !ctx.fbw_mode.inline_subwalk {
+        fbw_note_opcode_entry_effects(dest_py as usize);
+    }
+    reconcile_vstack_at_boundary(ctx, unsafe { &*code_ptr }, dest_py, depth);
+}
+
 pub(crate) fn seed_callee_vstack_mirror<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     frame: &ActiveResumeFrame,

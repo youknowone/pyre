@@ -9607,6 +9607,8 @@ pub(crate) fn try_walker_orthodox_unwrap_cell<Sym: WalkSym>(
 /// Pin `version?` and re-read the slot before baking `stored`: a later
 /// delete or replacing store mutates the dict and must revoke this
 /// compiled write, which otherwise mutates the detached old cell.
+/// Skip the pin when this CodeObject `DELETE_NAME`s: the watcher is
+/// whole-dict and `DELETE_NAME` of another name would invalidate this write.
 pub(crate) fn try_walker_orthodox_write_cell<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -9615,6 +9617,7 @@ pub(crate) fn try_walker_orthodox_write_cell<Sym: WalkSym>(
     stored: pyre_object::PyObjectRef,
     value_opref: OpRef,
     new_value: pyre_object::PyObjectRef,
+    w_code_ptr: usize,
 ) -> Result<bool, DispatchError> {
     if stored.is_null() || new_value.is_null() {
         return Ok(false);
@@ -9622,22 +9625,25 @@ pub(crate) fn try_walker_orthodox_write_cell<Sym: WalkSym>(
     let Some(jc) = crate::jitcode_runtime::write_cell_jitcode() else {
         return Ok(false);
     };
-    if !walker_pin_namespace_version(ctx, op_pc, ns)? {
+    let pin_version = code_pins_namespace_version(w_code_ptr, ns);
+    if pin_version && !walker_pin_namespace_version(ctx, op_pc, ns)? {
         return Ok(false);
     }
     if crate::state::module_dict_cell_value_direct(ns, slot) != Some(stored) {
         return Ok(false);
     }
     let cell_opref = ctx.trace_ctx.const_ref(stored as i64);
-    if descend_named_cell_helper(
+    let saved_fbw_mode = ctx.fbw_mode;
+    ctx.fbw_mode.cell_store_helper_subwalk = true;
+    let descended = descend_named_cell_helper(
         ctx,
         op_pc,
         jc.index(),
         &[(cell_opref, stored), (value_opref, new_value)],
         &WRITE_CELL_DESCENT,
-    )?
-    .is_none()
-    {
+    );
+    ctx.fbw_mode = saved_fbw_mode;
+    if descended?.is_none() {
         return Ok(false);
     }
     if unsafe { pyre_object::celldict::is_int_mutable_cell(stored) } {
@@ -25457,7 +25463,10 @@ pub(crate) fn try_walker_load_global_cell_fold<Sym: WalkSym>(
             None => return Ok(false),
         }
     };
-    if emit_module_dict_cell_fold(ctx, op_pc, dst, dst_bank, w_globals, &name, true)? {
+    if code_deletes_name_from_ptr(w_code_ptr, &name) {
+        return Ok(false);
+    }
+    if emit_module_dict_cell_fold(ctx, op_pc, dst, dst_bank, w_globals, &name, w_code_ptr)? {
         return Ok(true);
     }
 
@@ -25508,7 +25517,9 @@ pub(crate) fn try_walker_load_global_cell_fold<Sym: WalkSym>(
         unsafe { pyre_object::w_dict_getitem_str(w_globals, "__builtins__") }
             .unwrap_or(pyre_object::PY_NULL)
     };
-    emit_builtins_cell_fold(ctx, op_pc, dst, dst_bank, w_globals, w_builtin, &name)
+    emit_builtins_cell_fold(
+        ctx, op_pc, dst, dst_bank, w_globals, w_builtin, &name, w_code_ptr,
+    )
 }
 
 /// Trace the three frame reads at the head of `pyopcode.py IMPORT_NAME`.
@@ -25735,6 +25746,7 @@ fn emit_builtins_cell_fold<Sym: WalkSym>(
     w_globals: pyre_object::PyObjectRef,
     w_builtin: pyre_object::PyObjectRef,
     name: &str,
+    w_code_ptr: usize,
 ) -> Result<bool, DispatchError> {
     // `emit_module_dict_cell_fold` returns `false` for BOTH an absent name and
     // a present-but-unfoldable one (`IntMutableCell` / strategy switched).
@@ -25768,11 +25780,20 @@ fn emit_builtins_cell_fold<Sym: WalkSym>(
     // is what proves that: the new-key insert that would shadow the builtin
     // runs `mutated()`, which fails GUARD_NOT_INVALIDATED.  It is the same
     // field a present-name fold on this namespace pins, so the two share one
-    // marker.
+    // marker.  A `version?` pin on the *module* dict is too coarse when this
+    // CodeObject `DELETE_NAME`s: `except as` always `mutated()` and would
+    // invalidate every loop that loaded `None` / `KeyError`.
     if !guard_current_frame_globals_identity(ctx, op_pc, w_globals)? {
         return Ok(false);
     }
-    if !walker_pin_namespace_version(ctx, op_pc, w_globals)? {
+    let pin_version = code_pins_namespace_version(w_code_ptr, w_globals);
+    // Absence of the name is what sends the lookup to builtins. Without
+    // the module-dict pin, a promoting store in this body can insert the
+    // name and the folded builtin would keep winning.
+    if !pin_version && code_store_bumps_namespace_now(w_code_ptr, w_globals) {
+        return Ok(false);
+    }
+    if pin_version && !walker_pin_namespace_version(ctx, op_pc, w_globals)? {
         return Ok(false);
     }
     // Guard (b): the builtins value for `name` must be unchanged.  The
@@ -25796,6 +25817,174 @@ fn emit_builtins_cell_fold<Sym: WalkSym>(
         return Ok(false);
     }
     Ok(true)
+}
+
+/// Resolve a `w_code` wrapper pointer to its live `CodeObject`.
+fn code_from_w_code_ptr(w_code_ptr: usize) -> Option<&'static pyre_interpreter::CodeObject> {
+    if w_code_ptr == 0 {
+        return None;
+    }
+    let code_ptr =
+        unsafe { pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef) };
+    if code_ptr.is_null() {
+        return None;
+    }
+    Some(unsafe { &*(code_ptr as *const pyre_interpreter::CodeObject) })
+}
+
+/// Yield each `DELETE_NAME` / `DELETE_GLOBAL` `co_names` index in `code`.
+fn code_delete_name_indices(
+    code: &pyre_interpreter::CodeObject,
+) -> impl Iterator<Item = usize> + '_ {
+    (0..code.instructions.len()).filter_map(|pc| {
+        let (ins, arg) = pyre_interpreter::decode_instruction_at(code, pc)?;
+        let namei = match ins {
+            pyre_interpreter::Instruction::DeleteName { namei }
+            | pyre_interpreter::Instruction::DeleteGlobal { namei } => namei,
+            _ => return None,
+        };
+        Some(namei.get(arg) as usize)
+    })
+}
+
+/// `except as` compiles to `STORE_NAME` + `DELETE_NAME` of that name
+/// (`pyopcode.py DELETE_NAME`).  Baking its cell would read the detached
+/// object after the delete and the next store allocated a replacement.
+fn code_deletes_name(code: &pyre_interpreter::CodeObject, name: &str) -> bool {
+    code_delete_name_indices(code)
+        .any(|idx| pyre_interpreter::pyframe::load_name_from_code(code, idx) == Some(name))
+}
+
+fn code_deletes_name_from_ptr(w_code_ptr: usize, name: &str) -> bool {
+    code_from_w_code_ptr(w_code_ptr).is_some_and(|code| code_deletes_name(code, name))
+}
+
+/// True when this `CodeObject` contains any `DELETE_NAME` / `DELETE_GLOBAL`.
+/// A raw-slot `version?` pin on such a body aborts the same trace at the
+/// delete (`opimpl_jit_force_quasi_immutable`).
+pub(crate) fn code_has_any_delete_name_from_ptr(w_code_ptr: usize) -> bool {
+    code_from_w_code_ptr(w_code_ptr)
+        .is_some_and(|code| code_delete_name_indices(code).next().is_some())
+}
+
+/// Whether a cell fold may pin `ns`'s `version?`.
+///
+/// A `DELETE_NAME` always `mutated()`. A module `STORE_NAME` or any
+/// `STORE_GLOBAL` whose slot is still absent or a bare value also
+/// `mutated()` (`store_would_bump_version`: `StoreBare` / `Replace`) when
+/// that store sits in a `JUMP_BACKWARD` span of a body that also has an
+/// exception table. Either one, after this pin, aborts the trace at
+/// `opimpl_jit_force_quasi_immutable` (`with` / `as value`). A handler-free
+/// loop keeps the pin. A one-shot binding above the loop does not count,
+/// and an `ObjectMutableCell` or `IntMutableCell` takes the hot store in
+/// place.
+pub(crate) fn code_pins_namespace_version(w_code_ptr: usize, ns: pyre_object::PyObjectRef) -> bool {
+    !code_has_any_delete_name_from_ptr(w_code_ptr)
+        && !code_store_bumps_namespace_now(w_code_ptr, ns)
+}
+
+/// A raw module slot folded without `version?` is `unwrap_cell`'s identity
+/// return, stamped concrete. Nothing then revokes it when a later store
+/// promotes the slot. A mutable cell still folds: the compiled loop keeps
+/// that cell's live field.
+pub(crate) fn raw_fold_needs_version_pin(
+    w_code_ptr: usize,
+    ns: pyre_object::PyObjectRef,
+    stored: pyre_object::PyObjectRef,
+) -> bool {
+    if stored.is_null() {
+        return false;
+    }
+    let cell = unsafe {
+        pyre_object::celldict::is_object_mutable_cell(stored)
+            || pyre_object::celldict::is_int_mutable_cell(stored)
+    };
+    !cell && code_store_bumps_namespace_now(w_code_ptr, ns)
+}
+
+/// `STORE_NAME` on a module body, and every `STORE_GLOBAL`, write `ns`.
+/// A function `STORE_NAME` writes the frame locals and does not bump this dict.
+fn code_store_bumps_namespace_now(w_code_ptr: usize, ns: pyre_object::PyObjectRef) -> bool {
+    if ns.is_null() {
+        return false;
+    }
+    let Some(code) = code_from_w_code_ptr(w_code_ptr) else {
+        return false;
+    };
+    // Only a body that already has an exception table. The skip is the
+    // `with` shape: a loop store promotes a bare name in the same trace
+    // as the pin. A handler-free loop keeps the pin.
+    if code.exceptiontable.is_empty() {
+        return false;
+    }
+    let module_level = code.obj_name.as_str() == "<module>";
+    // One pass over the backward jumps (`backward_jump_target`), then one
+    // pass over the stores. Membership is a handful of spans, not another
+    // decode of the whole body per pc.
+    let spans = backward_jump_spans(code);
+    if spans.is_empty() {
+        return false;
+    }
+    (0..code.instructions.len()).any(|pc| {
+        if !spans.iter().any(|&(start, end)| start <= pc && pc < end) {
+            return false;
+        }
+        let Some((ins, arg)) = pyre_interpreter::decode_instruction_at(code, pc) else {
+            return false;
+        };
+        let namei = match ins {
+            pyre_interpreter::Instruction::StoreName { namei } if module_level => namei,
+            pyre_interpreter::Instruction::StoreGlobal { namei } => namei,
+            _ => return false,
+        };
+        let Some(name) =
+            pyre_interpreter::pyframe::load_name_from_code(code, namei.get(arg) as usize)
+        else {
+            return false;
+        };
+        namespace_slot_promotes_on_store(ns, name)
+    })
+}
+
+/// Half-open `[target, jump)` spans of `JumpBackward` and
+/// `JumpBackwardNoInterrupt`, from `backward_jump_target`.
+fn backward_jump_spans(code: &pyre_interpreter::CodeObject) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    for jpc in 0..code.instructions.len() {
+        let Some((ins, arg)) = pyre_interpreter::decode_instruction_at(code, jpc) else {
+            continue;
+        };
+        let Some(target) = pyre_interpreter::backward_jump_target(code, jpc, ins, arg) else {
+            continue;
+        };
+        if target < jpc {
+            spans.push((target, jpc));
+        }
+    }
+    spans
+}
+
+/// True when the next store of `name` cannot be an in-place cell write.
+/// Absent and bare slots promote (`StoreBare` / `Replace`) and bump
+/// `version?`. A mutable cell does not.
+fn namespace_slot_promotes_on_store(ns: pyre_object::PyObjectRef, name: &str) -> bool {
+    let Some(slot) = crate::state::module_dict_cell_slot_direct(ns, name) else {
+        return true;
+    };
+    let Some(stored) = crate::state::module_dict_cell_value_direct(ns, slot) else {
+        return true;
+    };
+    if stored.is_null() {
+        return true;
+    }
+    unsafe {
+        !pyre_object::celldict::is_object_mutable_cell(stored)
+            && !pyre_object::celldict::is_int_mutable_cell(stored)
+    }
+}
+
+fn frame_code_deletes_name(frame: &pyre_interpreter::pyframe::PyFrame, name: &str) -> bool {
+    code_deletes_name_from_ptr(frame.pycode as usize, name)
 }
 
 /// LoadName cell fold — module-scope LOAD_NAME mirror of
@@ -25844,7 +26033,18 @@ pub(crate) fn try_walker_load_name_cell_fold<Sym: WalkSym>(
     let name = unsafe {
         pyre_object::unicodeobject::w_str_get_value(w_name_ptr as pyre_object::PyObjectRef)
     };
-    if emit_module_dict_cell_fold(ctx, op_pc, dst, dst_bank, w_globals, name, true)? {
+    if frame_code_deletes_name(frame, name) {
+        return Ok(false);
+    }
+    if emit_module_dict_cell_fold(
+        ctx,
+        op_pc,
+        dst,
+        dst_bank,
+        w_globals,
+        name,
+        frame.pycode as usize,
+    )? {
         return Ok(true);
     }
     emit_builtins_cell_fold(
@@ -25855,6 +26055,7 @@ pub(crate) fn try_walker_load_name_cell_fold<Sym: WalkSym>(
         w_globals,
         frame.get_builtin(),
         name,
+        frame.pycode as usize,
     )
 }
 
@@ -25889,6 +26090,9 @@ pub(crate) fn try_walker_store_name_cell_fold<Sym: WalkSym>(
     let name = unsafe {
         pyre_object::unicodeobject::w_str_get_value(w_name_ptr as pyre_object::PyObjectRef)
     };
+    if frame_code_deletes_name(frame, name) {
+        return Ok(false);
+    }
     let Some(slot) = crate::state::module_dict_cell_slot_direct(w_globals, name) else {
         return Ok(false);
     };
@@ -25920,5 +26124,14 @@ pub(crate) fn try_walker_store_name_cell_fold<Sym: WalkSym>(
     if !in_place {
         return Ok(false);
     }
-    try_walker_orthodox_write_cell(ctx, op_pc, w_globals, slot, stored, value_opref, new_value)
+    try_walker_orthodox_write_cell(
+        ctx,
+        op_pc,
+        w_globals,
+        slot,
+        stored,
+        value_opref,
+        new_value,
+        frame.pycode as usize,
+    )
 }

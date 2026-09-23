@@ -19,6 +19,7 @@
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, LazyLock, Once, OnceLock};
 
 use majit_ir::DescrRef;
@@ -804,33 +805,93 @@ pub fn publish_runtime_insn(key: &str, byte: u8) {
     let mut table = RUNTIME_INSNS_BYTE_TO_OPNAME
         .write()
         .expect("runtime insn table poisoned");
-    let entry = table.entry(byte).or_insert_with(|| match build_time {
-        // The build-time table claims this byte for something else, so no
-        // single key can answer for it.
-        Some(_) => RuntimeInsn::Ambiguous,
-        None => RuntimeInsn::Unique(Box::leak(key.to_string().into_boxed_str())),
-    });
-    if !matches!(entry, RuntimeInsn::Unique(recorded) if *recorded == key) {
-        *entry = RuntimeInsn::Ambiguous;
+    let changed = match table.entry(byte) {
+        std::collections::hash_map::Entry::Vacant(vacant) => {
+            let insn = match build_time {
+                // The build-time table claims this byte for something else, so no
+                // single key can answer for it.
+                Some(_) => RuntimeInsn::Ambiguous,
+                None => RuntimeInsn::Unique(Box::leak(key.to_string().into_boxed_str())),
+            };
+            vacant.insert(insn);
+            true
+        }
+        std::collections::hash_map::Entry::Occupied(mut occupied) => match *occupied.get() {
+            RuntimeInsn::Ambiguous => false,
+            RuntimeInsn::Unique(recorded) if recorded == key => false,
+            RuntimeInsn::Unique(_) => {
+                *occupied.get_mut() = RuntimeInsn::Ambiguous;
+                true
+            }
+        },
+    };
+    drop(table);
+    if changed {
+        rebuild_decode_snap();
     }
 }
 
-/// Resolve an opcode byte to its `opname/argcodes` key.
-///
-/// The runtime table is consulted first because it is the one that knows a byte
-/// is ambiguous; only a byte it has never seen falls through to the build-time
-/// table.
-fn key_for_opcode_byte(byte: u8) -> Option<&'static str> {
+/// Pre-split `opname/argcodes` for one opcode byte. `blackhole.py`
+/// `setup_insns` builds the dispatch table once; the walker indexes it.
+#[derive(Clone, Copy)]
+struct DecodeInsn {
+    key: &'static str,
+    opname: &'static str,
+    argcodes: &'static str,
+}
+
+struct DecodeSnap {
+    by_byte: [Option<DecodeInsn>; 256],
+}
+
+/// Snapshot of the byte → insn table. Rebuilt when `publish_runtime_insn`
+/// grows `Assembler.insns`; the walker loads it with Acquire and never
+/// takes the runtime `RwLock`.
+static DECODE_SNAP: AtomicPtr<DecodeSnap> = AtomicPtr::new(std::ptr::null_mut());
+
+fn decode_insn_from_key(key: &'static str) -> DecodeInsn {
+    let (opname, argcodes) = split_key(key);
+    DecodeInsn {
+        key,
+        opname,
+        argcodes,
+    }
+}
+
+fn rebuild_decode_snap() {
     let runtime = RUNTIME_INSNS_BYTE_TO_OPNAME
         .read()
-        .expect("runtime insn table poisoned")
-        .get(&byte)
-        .copied();
-    match runtime {
-        Some(RuntimeInsn::Unique(key)) => Some(key),
-        Some(RuntimeInsn::Ambiguous) => None,
-        None => INSNS_BYTE_TO_OPNAME.get(&byte).map(String::as_str),
+        .expect("runtime insn table poisoned");
+    let mut by_byte = [None; 256];
+    for (byte, key) in INSNS_BYTE_TO_OPNAME.iter() {
+        by_byte[*byte as usize] = Some(decode_insn_from_key(key.as_str()));
     }
+    for (byte, insn) in runtime.iter() {
+        match insn {
+            RuntimeInsn::Unique(key) => {
+                by_byte[*byte as usize] = Some(decode_insn_from_key(key));
+            }
+            RuntimeInsn::Ambiguous => {
+                by_byte[*byte as usize] = None;
+            }
+        }
+    }
+    let snap = Box::new(DecodeSnap { by_byte });
+    // Walkers may still be reading the previous table; leak it. Rebuilds
+    // happen only when `publish_runtime_insn` grows `Assembler.insns`.
+    let _old = DECODE_SNAP.swap(Box::into_raw(snap), Ordering::Release);
+}
+
+fn insn_for_opcode_byte(byte: u8) -> Option<DecodeInsn> {
+    let mut ptr = DECODE_SNAP.load(Ordering::Acquire);
+    if ptr.is_null() {
+        rebuild_decode_snap();
+        ptr = DECODE_SNAP.load(Ordering::Acquire);
+        if ptr.is_null() {
+            return None;
+        }
+    }
+    unsafe { (*ptr).by_byte[byte as usize] }
 }
 
 /// RPython `setup_insns(insns)` — full opname → opcode-byte table.
@@ -2329,8 +2390,10 @@ fn pyre_p_payload_len(opname: &str, code: &[u8], cursor: usize) -> Option<usize>
 /// `blackhole.py` (`bhimpl_live(pc): return pc + OFFSET_SIZE`).
 pub fn decode_op_at(code: &[u8], pc: usize) -> Option<DecodedOp> {
     let opcode_byte = *code.get(pc)?;
-    let key: &'static str = key_for_opcode_byte(opcode_byte)?;
-    let (opname, argcodes) = split_key(key);
+    let insn = insn_for_opcode_byte(opcode_byte)?;
+    let key = insn.key;
+    let opname = insn.opname;
+    let argcodes = insn.argcodes;
 
     let mut cursor = pc + 1;
     if opname == "live" {

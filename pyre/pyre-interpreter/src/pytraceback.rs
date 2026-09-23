@@ -158,17 +158,10 @@ pub fn w_pytraceback_new(
     // `frame` is pinned alongside the two managed fields, because the
     // allocation below can safepoint and a raw `*mut PyFrame` held only in
     // this function's locals is reachable from no root walker.  Most frames
-    // are allocated non-moving (`FrameBox::new`), which is what lets raw
-    // copies exist elsewhere at all — `FrameBox::deref` reads its raw field
-    // while holding a forwarding-capable `owner_root` it never reads back,
-    // `eval_loop` runs behind a `&mut PyFrame` across a safepoint, and the
-    // blackhole keeps the virtualizable as a bare integer.  It is not every
-    // frame: a compiled trace's inlined-callee frame is a nursery
-    // allocation, so a minor collection triggered by this very allocation
-    // recycles it and any slot built from a pre-allocation copy names freed
-    // bytes for the rest of the node's life.  Upstream needs no bracket
-    // here — a minor relocates the frame and rewrites the slot
-    // (`incminimark.py:2237` / `:2252`).
+    // are allocated non-moving (`FrameBox::new`).  A compiled trace's
+    // inlined-callee frame is a nursery object, so a minor triggered here
+    // would recycle an unrooted copy.  Upstream relocates that frame and
+    // rewrites the slot (`incminimark.py minor_collection`).
     let roots = pyre_object::gc_roots::push_roots();
     let inputs = pyre_object::gc_roots::pin_roots(&[w_next, w_code, frame as PyObjectRef]);
 
@@ -444,8 +437,8 @@ pub unsafe fn record_application_traceback(
         };
         // Keep the exception now being propagated GC-reachable: until a frame
         // catches it, it lives only in the in-flight Rust `PyError`, so a
-        // safepoint's non-moving major would otherwise sweep its old-gen
-        // traceback chain (`tstate->current_exception` parity).
+        // safepoint's major would otherwise sweep the oldgen exception (and
+        // the traceback chain it roots) (`tstate->current_exception` parity).
         crate::eval::set_in_flight_exception(w_exc_object);
         // `pytraceback.py self.lineno = offset2lineno(self.frame
         // .pycode, self.lasti)` — pyre resolves the line number eagerly

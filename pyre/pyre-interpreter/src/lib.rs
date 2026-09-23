@@ -155,6 +155,7 @@ pub mod jit_fnaddr;
 pub mod launch_env;
 pub mod listobject;
 pub mod listsort;
+pub mod loop_headers;
 pub mod opcode_ops;
 pub mod pycode;
 pub mod pyopcode;
@@ -949,6 +950,7 @@ pub use gateway::{
     make_slot_wrapper, make_slot_wrapper_with_arity,
 };
 pub use jit_fnaddr::*;
+pub use loop_headers::*;
 pub use majit_rlib::rbigint::RBigInt as PyBigInt;
 pub use opcode_ops::*;
 pub use pycode::*;
