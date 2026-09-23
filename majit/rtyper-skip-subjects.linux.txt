@@ -909,6 +909,7 @@ two-phase-never-a-subject	pyre_interpreter::module::thread::lock_class::<Impl>::
 two-phase-never-a-subject	pyre_interpreter::module::thread::lock_class::<Impl>::_at_fork_reinit
 two-phase-never-a-subject	pyre_interpreter::module::thread::lock_class::<Impl>::acquire
 two-phase-never-a-subject	pyre_interpreter::module::thread::lock_class::<Impl>::default
+two-phase-never-a-subject	pyre_interpreter::module::thread::lock_class::<Impl>::locked
 two-phase-never-a-subject	pyre_interpreter::module::thread::lock_class::<Impl>::release
 two-phase-never-a-subject	pyre_interpreter::module::thread::lock_class::__majit_wrap___enter__
 two-phase-never-a-subject	pyre_interpreter::module::thread::lock_class::__majit_wrap___exit__
