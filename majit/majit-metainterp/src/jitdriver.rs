@@ -2917,12 +2917,18 @@ impl<S: JitState> JitDriver<S> {
             state.writeback_virt_array_state_fields_from_values(&values);
             self.meta.single_pass_virt_array_values = None;
         }
-        // `jitdriver.rs seed_deopt_vinfo_ptr`: a state-field machine's
-        // `bh_clear_vable_token` is inert, so a non-null vinfo is safe and lets
-        // mid-body vable-array opcodes resolve; a real heap virtualizable
-        // (`token_offset > 0`, e.g. PyFrame) keeps the null-vinfo resume
-        // contract and reaches the chain with `virtualizable_info` unset.
-        let vinfo_ptr = seed_deopt_vinfo_ptr(self.meta.virtualizable_info());
+        // Guard-failure resume still uses `seed_deopt_vinfo_ptr` (null for a
+        // heap virtualizable). This drive re-executes the aborted opcode,
+        // including vable ops inside an inlined callee. Upstream reads that
+        // handle from `fielddescr.get_vinfo()` (`blackhole.py`
+        // `bhimpl_getfield_vable_*`), which every interpreter can see.
+        // pyre keeps it on the interpreter, so the chain — and any child
+        // `interpret_unresolved_inline_call` clones from it — must carry the
+        // driver's `virtualizable_info` rather than the null resume seed.
+        let vinfo_held = self.meta.virtualizable_info().cloned();
+        let vinfo_ptr = vinfo_held
+            .as_ref()
+            .map_or(std::ptr::null(), std::sync::Arc::as_ptr);
         let root = framestack.frames.first_mut()?;
         if let Some(slot) = layout.vable_identity_slot()
             && slot < root.int_values.len()

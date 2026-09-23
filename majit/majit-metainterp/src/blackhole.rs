@@ -6315,6 +6315,8 @@ mod tests {
             // "callee-default".
             parent.virtualizable_ptr = 0xDEAD_BEEF;
             parent.virtualizable_stack_base = 7;
+            let vinfo = Box::leak(Box::new(crate::virtualizable::VirtualizableInfo::new(8)));
+            parent.virtualizable_info = vinfo;
 
             let mut callee = BlackholeInterpreter::default();
             callee.clone_context_from(&parent);
@@ -6334,6 +6336,11 @@ mod tests {
                 "clone_context_from must alias the parent table"
             );
             assert_eq!(callee.virtualizable_ptr, parent.virtualizable_ptr);
+            assert!(
+                std::ptr::eq(callee.virtualizable_info, parent.virtualizable_info),
+                "inline callee must inherit the parent's virtualizable_info \
+                 (interpret_unresolved_inline_call clones through here)"
+            );
             assert_eq!(
                 callee.virtualizable_stack_base,
                 parent.virtualizable_stack_base

@@ -7324,22 +7324,35 @@ impl<'a> Lowering<'a> {
                         }
                     }
                 }
-                // A transparent one-field aggregate is represented by its
-                // only operand. Constructing a separate instance would split
-                // one machine word into incompatible scalar and reference
-                // annotations at later merges.
+                // A `repr(transparent)` aggregate is its one sized field.
+                // Zero-sized markers are not stored, so the operand is that
+                // field rather than whichever single operand arrived. An
+                // opaque newtype, or a wrapper whose only field is zero-sized,
+                // still has one operand and stays the identity. Constructing
+                // a separate instance would split one machine word into
+                // incompatible scalar and reference annotations at later
+                // merges. The bank comes from the tombstoned classifier.
                 if tyref_transparent_inner_value_type(dest_ty, self.llbc, self.tombstoned_leaves)
                     .is_some()
-                    && operands.len() == 1
                 {
-                    let value = self.resolve_operand(
-                        mir_bb,
-                        operands
-                            .into_iter()
-                            .next()
-                            .expect("one transparent aggregate operand"),
-                    )?;
-                    return Ok((None, value));
+                    if let Some((index, _)) = tyref_transparent_nonzst_field(dest_ty, self.llbc) {
+                        let Some(operand) = operands.into_iter().nth(index) else {
+                            return Err(LowerError::Unsupported(format!(
+                                "bb{mir_bb}: transparent aggregate missing field {index}"
+                            )));
+                        };
+                        let value = self.resolve_operand(mir_bb, operand)?;
+                        return Ok((None, value));
+                    } else if operands.len() == 1 {
+                        let value = self.resolve_operand(
+                            mir_bb,
+                            operands
+                                .into_iter()
+                                .next()
+                                .expect("one transparent aggregate operand"),
+                        )?;
+                        return Ok((None, value));
+                    }
                 }
                 // Resolve operand Variables up front; they flow into the
                 // synthesised FieldWrite chain rather than the ctor's
@@ -8122,11 +8135,22 @@ impl<'a> Lowering<'a> {
                     && let Some((owner_root, field_name, field_ty, owner_id)) =
                         self.resolve_adt_field(field_payload)
                 {
-                    // Projecting the sole field of a transparent wrapper is
-                    // the identity on its low-level value. The wrapper and
-                    // field share one register bank and one machine word, so
-                    // emitting a FieldRead would try to dereference that word
-                    // as an aggregate base.
+                    // Projecting the sized field of a `repr(transparent)`
+                    // wrapper is the identity on its low-level value, including
+                    // through a borrow: the borrow carries no representation of
+                    // its own, the same way [`Self::tyref_is_borrowed_fieldless_enum`]
+                    // treats a fieldless enum. A zero-sized marker in the same
+                    // struct still has no bytes. Emitting a FieldRead would
+                    // try to dereference that word as an aggregate base.
+                    if let Some((_, name)) = tyref_transparent_nonzst_field(&inner.ty, self.llbc) {
+                        if field_name == name {
+                            return self.resolve_place(mir_bb, *inner);
+                        }
+                        return Ok(self.emit_unit(self.block_id[mir_bb]));
+                    }
+                    // An opaque dependency view has no field list, but the
+                    // linked scalar bank still types the wrapper as its inner
+                    // word. The only projection that view emits is `__pos_0`.
                     if field_name == "__pos_0"
                         && tyref_transparent_inner_value_type(
                             &inner.ty,
@@ -9985,6 +10009,37 @@ impl<'a> Lowering<'a> {
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
         Ok(true)
+    }
+
+    /// A residual or `dont_look_inside` callee expects a real address for
+    /// `&T`. A `repr(transparent)` scalar wrapper's borrow is the word, so
+    /// passing it would hand that word to the callee as a pointer.
+    fn refuse_borrowed_transparent_scalar_residual(
+        &self,
+        mir_bb: usize,
+        reg: &RegularCall,
+    ) -> Result<(), LowerError> {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return Ok(());
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return Ok(());
+        };
+        let path = strip_crate_prefix(&fd.item_meta.name_path());
+        let residual = fd.unstructured().is_none() || self.dont_look_inside.contains(&path);
+        if !residual {
+            return Ok(());
+        }
+        for (index, ty) in fd.signature.inputs.iter().enumerate() {
+            if tyref_is_borrowed_transparent_scalar(ty, self.llbc, self.tombstoned_leaves) {
+                return Err(LowerError::Unsupported(format!(
+                    "bb{mir_bb}: residual `{}` argument {index} borrows a \
+                     repr(transparent) scalar; the word is not an address",
+                    fd.item_meta.name_path()
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn lower_call(
@@ -13153,6 +13208,7 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 {
+                    self.refuse_borrowed_transparent_scalar_residual(mir_bb, &reg)?;
                     // `jit::promote(x)` (and its `promote_string` /
                     // `promote_unicode` siblings) rewrites to the synthesised
                     // `hint_promote*` marker so the residual `OpKind::Call`
@@ -27553,6 +27609,94 @@ fn tyref_atomic_inner_scalar_str(ty: &TyRef, llbc: &Llbc) -> Option<&'static str
     }
 }
 
+/// Index and name of the one sized field of a `#[repr(transparent)]` struct.
+///
+/// Zero-sized fields occupy no bytes and are ignored, so a wrapper whose
+/// only sized field is a scalar (plus a marker) is that scalar.
+/// [`strip_ty_wrappers`] peels `&T` / `&mut T` and leaves `RawPtr` alone, so
+/// a borrow of the wrapper is the same word a fieldless-enum borrow is
+/// ([`tyref_is_borrowed_fieldless_enum`]). A raw pointer remains an address.
+fn transparent_nonzst_field(decl: &TypeDecl, llbc: &Llbc) -> Option<(usize, String)> {
+    if !decl.is_repr_transparent() {
+        return None;
+    }
+    let TypeDeclKind::Struct(fields) = &decl.kind else {
+        return None;
+    };
+    let mut found = None;
+    for (index, field) in fields.iter().enumerate() {
+        if field_is_zst(&field.ty, llbc) {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        let name = field
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("__pos_{index}"));
+        found = Some((index, name));
+    }
+    found
+}
+
+fn tyref_transparent_nonzst_field(ty: &TyRef, llbc: &Llbc) -> Option<(usize, String)> {
+    let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
+    let decl = llbc.type_by_id(adt_node_def_id(node)?)?;
+    transparent_nonzst_field(decl, llbc)
+}
+
+fn field_is_zst(ty: &TyRef, llbc: &Llbc) -> bool {
+    if is_unit_type(ty, llbc) || tyref_is_zero_sized(ty, llbc) {
+        return true;
+    }
+    let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc)) else {
+        return false;
+    };
+    if json_ty_byte_size(node, llbc) == Some(0) {
+        return true;
+    }
+    let Some(adt) = node
+        .as_object()
+        .and_then(|obj| obj.get("Adt"))
+        .and_then(|adt| adt.as_object())
+    else {
+        return false;
+    };
+    let is_tuple = adt.get("id").and_then(|id| id.as_str()) == Some("Tuple");
+    let empty = adt
+        .get("generics")
+        .and_then(|generics| generics.get("types"))
+        .and_then(|types| types.as_array())
+        .is_some_and(|types| types.is_empty());
+    is_tuple && empty
+}
+
+/// `&T` / `&mut T` where `T` is a `repr(transparent)` wrapper of a scalar.
+/// A residual callee expects a real address for that borrow; the word is not
+/// one. A raw pointer is left alone.
+fn tyref_is_borrowed_transparent_scalar(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> bool {
+    if !output_type_is_ref(ty, llbc) {
+        return false;
+    }
+    matches!(
+        tyref_transparent_inner_value_type(ty, llbc, tombstoned),
+        Some(
+            ValueType::Int
+                | ValueType::Unsigned
+                | ValueType::Bool
+                | ValueType::Float
+                | ValueType::SingleFloat
+                | ValueType::Int128
+                | ValueType::UInt128
+        )
+    )
+}
+
 fn tyref_transparent_inner_value_type(
     ty: &TyRef,
     llbc: &Llbc,
@@ -27574,7 +27718,11 @@ fn tyref_transparent_inner_value_type(
     }
     match &decl.kind {
         TypeDeclKind::Struct(fields) => {
-            let [field] = fields.as_slice() else {
+            let field = if let Some((index, _)) = transparent_nonzst_field(decl, llbc) {
+                fields.get(index)?
+            } else if let [only] = fields.as_slice() {
+                only
+            } else {
                 return None;
             };
             Some(tyref_to_value_type_with(&field.ty, llbc, tombstoned))
@@ -27796,7 +27944,10 @@ pub(crate) fn discover_transparent_scalar_kinds(
         let TypeDeclKind::Struct(fields) = &decl.kind else {
             continue;
         };
-        let [field] = fields.as_slice() else {
+        let Some((index, _)) = transparent_nonzst_field(decl, llbc) else {
+            continue;
+        };
+        let Some(field) = fields.get(index) else {
             continue;
         };
         let kind = match tyref_to_value_type(&field.ty, llbc) {
@@ -29248,7 +29399,8 @@ fn tyref_to_field_layout_string(ty: &TyRef, llbc: &Llbc) -> String {
         return tyref_to_ast_string(ty, llbc);
     }
     if let TypeDeclKind::Struct(fields) = &decl.kind
-        && let [field] = fields.as_slice()
+        && let Some((index, _)) = transparent_nonzst_field(decl, llbc)
+        && let Some(field) = fields.get(index)
         && !matches!(
             tyref_to_value_type(&field.ty, llbc),
             ValueType::Ref(_)
@@ -42712,6 +42864,70 @@ mod tests {
         assert_eq!(
             super::tyref_to_value_type(&word_ty, &llbc),
             crate::model::ValueType::Int
+        );
+    }
+
+    #[test]
+    fn borrowed_one_scalar_struct_uses_the_field_bank() {
+        let type_decl = serde_json::json!({
+            "def_id": 1,
+            "item_meta": {
+                "name": [{"Ident": ["fixture", 0]}, {"Ident": ["DepthWord", 0]}],
+                "span": {"data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 4, "col": 1}
+                }},
+                "source_text": "struct Anchor { depth: usize, _not_send: () }",
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            },
+            "kind": {"Struct": [
+                {
+                    "name": "depth",
+                    "ty": {"HashConsedValue": [7, {"Literal": {"UInt": "Usize"}}]},
+                    "attr_info": null
+                },
+                {
+                    "name": "_not_send",
+                    "ty": {"HashConsedValue": [9, {"Adt": {"id": "Tuple", "generics": {"types": []}}}]},
+                    "attr_info": null
+                }
+            ]},
+            "layout": [{
+                "key": "aarch64-apple-darwin",
+                "value": {
+                    "size": 8,
+                    "align": 8,
+                    "variant_layouts": [{"field_offsets": [0, 8]}],
+                    "repr": {"repr_algo": "Rust", "transparent": true}
+                }
+            }]
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [null, type_decl],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let borrowed = serde_json::from_value::<super::TyRef>(serde_json::json!({
+            "HashConsedValue": [8, {
+                "Ref": ["r", {
+                    "Adt": {"id": {"Adt": 1}, "generics": {"types": []}}
+                }, "Shared"]
+            }]
+        }))
+        .expect("borrowed TyRef parses");
+        assert_eq!(
+            super::tyref_to_value_type(&borrowed, &llbc),
+            crate::model::ValueType::Unsigned
         );
     }
 
