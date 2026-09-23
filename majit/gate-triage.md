@@ -18,6 +18,7 @@ cover the condition they diagnose.
 | `MAJIT_CALLEE_CENSUS_ROWS` | value | Limits rows printed by `MAJIT_CALLEE_CENSUS`; remove with that census. |
 | `MAJIT_CALLEE_RCA` | OFF | Reports metainterpreter callee-resolution decisions; remove when those decisions are covered by focused tests. |
 | `MAJIT_CL_NO_CLOSING_JUMP` | OFF | Disables Cranelift's in-code closing jump to exercise external jump dispatch; remove when that fallback no longer needs comparison coverage. |
+| `MAJIT_CL_SIGN_RETURN` | OFF | Restores the aarch64 return-address signing `cranelift_native` turns on for Apple hosts, which brackets each compiled body with `pacibz`/`retabz`; remove when that pair no longer needs a runtime comparison path. |
 | `MAJIT_DESCR_POOL_CENSUS` | OFF | Reports descriptor interning and duplication; remove when descriptor identity is covered by ordinary tests. |
 | `MAJIT_DETERMINISM_TRACE` | OFF | Prints inputs used to diagnose nondeterministic translation output; remove when deterministic output is enforced structurally. |
 | `MAJIT_DTRACE_CONST_BT` | OFF | Adds a backtrace to constant-propagation diagnostics; remove with those diagnostics. |
