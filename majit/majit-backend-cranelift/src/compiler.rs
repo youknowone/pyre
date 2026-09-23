@@ -261,31 +261,26 @@ fn match_metainterp_finish_descr(
     attachments: &'static CpuDescrAttachments,
 ) -> Option<&'static DescrRef> {
     let ptr = jf_descr_raw as usize;
-    fn check(
-        slot: &'static Option<majit_ir::DescrRef>,
-        expected: usize,
-    ) -> Option<&'static majit_ir::DescrRef> {
-        slot.as_ref()
-            .filter(|arc| Arc::as_ptr(arc) as *const () as usize == expected)
+    if ptr == 0 {
+        return None;
     }
-    // The attached descr and nothing beside it. Each of these has a cranelift
-    // singleton twin (`DONE_WITH_THIS_FRAME_DESCR_*`,
-    // `EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL`), but the twin is what the
-    // *unattached* fall-through below reaches for; naming it here read one
-    // `LazyLock` per candidate and cloned an `Arc` the caller dropped unread,
-    // on the arm every finished entry takes.
-    for slot in [
-        &attachments.done_with_this_frame_descr_int,
-        &attachments.done_with_this_frame_descr_float,
-        &attachments.done_with_this_frame_descr_ref,
-        &attachments.done_with_this_frame_descr_void,
-        &attachments.exit_frame_with_exception_descr_ref,
-    ] {
-        if let Some(arc) = check(slot, ptr) {
-            return Some(arc);
-        }
-    }
-    None
+    // `jf_descr` is the FailDescrCell address `descr_ptrs` bakes, the same
+    // word `AbstractDescr.show` casts. Compare that word, not `Arc::as_ptr`.
+    let ptrs = attachments.descr_ptrs();
+    let slot = if ptr == ptrs.done_with_this_frame_descr_int {
+        &attachments.done_with_this_frame_descr_int
+    } else if ptr == ptrs.done_with_this_frame_descr_float {
+        &attachments.done_with_this_frame_descr_float
+    } else if ptr == ptrs.done_with_this_frame_descr_ref {
+        &attachments.done_with_this_frame_descr_ref
+    } else if ptr == ptrs.done_with_this_frame_descr_void {
+        &attachments.done_with_this_frame_descr_void
+    } else if ptr == ptrs.exit_frame_with_exception_descr_ref {
+        &attachments.exit_frame_with_exception_descr_ref
+    } else {
+        return None;
+    };
+    slot.as_ref()
 }
 
 // JitFrame layout constants (`jitframe.py:61-83`)
@@ -3718,6 +3713,14 @@ fn call_assembler_guard_failure_inner(
         done_with_this_frame_descr_float: None,
         exit_frame_with_exception_descr_ref: None,
         propagate_exception_descr: None,
+        cached_ptrs: majit_backend::AttachedDescrPtrs {
+            done_with_this_frame_descr_void: 0,
+            done_with_this_frame_descr_int: 0,
+            done_with_this_frame_descr_ref: 0,
+            done_with_this_frame_descr_float: 0,
+            exit_frame_with_exception_descr_ref: 0,
+            propagate_exception_descr: 0,
+        },
     };
     let attachments: &'static CpuDescrAttachments = if cpu_handle.is_null() {
         &NO_ATTACHMENTS
@@ -8523,10 +8526,7 @@ fn run_compiled_code_inner(
     // clear) and stage the result into `jf_frame[0]` so
     // `EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL`'s consumer path
     // (compile.py:660) reads it through the existing accessor.
-    let propagate_descr_ptr = attachments
-        .propagate_exception_descr
-        .as_ref()
-        .map_or(0, |arc| Arc::as_ptr(arc) as *const () as usize);
+    let propagate_descr_ptr = attachments.descr_ptrs().propagate_exception_descr;
     if propagate_descr_ptr != 0 && jf_descr_raw as usize == propagate_descr_ptr {
         let header_words = JF_FRAME_ITEM0_OFS as usize / 8;
         let exc_val = unsafe {
@@ -8552,10 +8552,7 @@ fn run_compiled_code_inner(
         // match arm picks up the ExitFrameWithExceptionRef tail.
         // When unattached (unit-test setup), fall through to the
         // cranelift singleton via `direct_descr` below.
-        let attached_exit = attachments
-            .exit_frame_with_exception_descr_ref
-            .as_ref()
-            .map_or(0, |arc| Arc::as_ptr(arc) as *const () as usize);
+        let attached_exit = attachments.descr_ptrs().exit_frame_with_exception_descr_ref;
         if attached_exit != 0 {
             unsafe {
                 *result_jf.add(JF_DESCR_OFS as usize / 8) = attached_exit as i64;

@@ -67,6 +67,7 @@ use std::time::Instant;
 
 /// Whether `MAJIT_LOG` is set, cached at first access.  Mirrors PyPy's
 /// `PYPYLOG` env-var check (`rpython/rlib/debug.py:31-38`).
+#[inline]
 pub fn majit_log_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("MAJIT_LOG").is_some())
@@ -94,6 +95,7 @@ thread_local! {
 
 /// `rlib/debug.py have_debug_prints()` — true when log output
 /// is enabled at all.  Pyre keys this off `MAJIT_LOG`.
+#[inline]
 pub fn have_debug_prints() -> bool {
     majit_log_enabled()
 }

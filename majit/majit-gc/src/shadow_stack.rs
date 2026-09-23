@@ -21,6 +21,8 @@
 use parking_lot::{Mutex, RwLock};
 use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
+#[cfg(debug_assertions)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use majit_ir::GcRef;
 
@@ -147,31 +149,111 @@ pub fn register_libc_jitframe_tracer(tracer: LibcJitframeTracer) {
     let _ = LIBC_JF_TRACER.set(tracer);
 }
 
-// Track which pointers refer to libc-allocated jitframes so the GC
-// visitor can safely dispatch to the registered tracer. Without this
-// set the visitor cannot tell a libc-alloc'd jitframe from an
-// unrelated foreign pointer that happens to sit on the shadow stack.
-static LIBC_JF_REGISTRY: OnceLock<RwLock<indexmap::IndexSet<usize>>> = OnceLock::new();
+// Live libc jitframe addresses. A collector that walks the JF shadow stack
+// cannot tell one of these from an unrelated foreign pointer, so the walk
+// asks [`is_libc_jitframe`] before tracing interiors.
+//
+// The set is a flat `Vec`, not a hashed map: a thread holds one frame per
+// nested compiled entry, and push / swap-remove of that list is O(1) at
+// that length. `REGISTRY_USED` stays false until the first registration, so
+// a process whose frames are never published (no collector is walking)
+// pays one relaxed load in unregister and nothing else.
+static LIBC_JF_REGISTRY_USED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static LIBC_JF_REGISTRY: OnceLock<RwLock<Vec<usize>>> = OnceLock::new();
 
-fn libc_jf_registry() -> &'static RwLock<indexmap::IndexSet<usize>> {
-    LIBC_JF_REGISTRY.get_or_init(|| RwLock::new(indexmap::IndexSet::new()))
+fn libc_jf_registry() -> &'static RwLock<Vec<usize>> {
+    LIBC_JF_REGISTRY.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+fn libc_jf_insert(set: &mut Vec<usize>, addr: usize) {
+    if !set.contains(&addr) {
+        set.push(addr);
+    }
+}
+
+fn libc_jf_remove(set: &mut Vec<usize>, addr: usize) {
+    if let Some(index) = set.iter().position(|&slot| slot == addr) {
+        set.swap_remove(index);
+    }
 }
 
 /// Register a libc-allocated jitframe payload address. Must be called
 /// before pushing the jitframe onto the JF shadow stack.
 pub fn register_libc_jitframe(addr: usize) {
-    libc_jf_registry().write().insert(addr);
+    LIBC_JF_REGISTRY_USED.store(true, std::sync::atomic::Ordering::Release);
+    libc_jf_insert(&mut libc_jf_registry().write(), addr);
 }
 
 /// Unregister a libc-allocated jitframe address. Call once the
 /// jitframe memory is about to be freed.
 pub fn unregister_libc_jitframe(addr: usize) {
-    libc_jf_registry().write().swap_remove(&addr);
+    if !LIBC_JF_REGISTRY_USED.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    libc_jf_remove(&mut libc_jf_registry().write(), addr);
 }
 
 /// Check whether an address was registered as a libc-allocated jitframe.
 pub fn is_libc_jitframe(addr: usize) -> bool {
+    if !LIBC_JF_REGISTRY_USED.load(std::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
     libc_jf_registry().read().contains(&addr)
+}
+
+/// Remove `addr` from [`LIBC_JF_REGISTRY`] when it is present.
+///
+/// `false` means the address was never registered: a host jitframe allocated
+/// while no collector was installed, counted by
+/// [`note_unregistered_host_jitframe`].
+#[cfg(debug_assertions)]
+pub fn unregister_libc_jitframe_if_present(addr: usize) -> bool {
+    if !LIBC_JF_REGISTRY_USED.load(Ordering::Acquire) {
+        return false;
+    }
+    let mut set = libc_jf_registry().write();
+    if let Some(index) = set.iter().position(|&slot| slot == addr) {
+        set.swap_remove(index);
+        true
+    } else {
+        false
+    }
+}
+
+/// Live host jitframes allocated while [`crate::collector_installed`] was false.
+///
+/// Debug-only. A release entry does not pay for the count. Those blocks are
+/// not inserted into [`LIBC_JF_REGISTRY`], and an owning deadframe over one
+/// is not inserted into `LIVE_DEADFRAMES`. `gc_sync::store_singleton` checks
+/// the count before publishing the process collector.
+#[cfg(debug_assertions)]
+static UNREGISTERED_HOST_JITFRAMES: AtomicUsize = AtomicUsize::new(0);
+
+/// Count one host jitframe allocated while no collector was installed.
+#[cfg(debug_assertions)]
+#[inline]
+pub fn note_unregistered_host_jitframe() {
+    UNREGISTERED_HOST_JITFRAMES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Drop one count taken by [`note_unregistered_host_jitframe`].
+#[cfg(debug_assertions)]
+#[inline]
+pub fn release_unregistered_host_jitframe() {
+    let prev = UNREGISTERED_HOST_JITFRAMES.fetch_sub(1, Ordering::Relaxed);
+    debug_assert!(prev > 0, "unregistered host jitframe count underflow");
+}
+
+/// Fail a process-collector install that would miss live host frames.
+#[cfg(debug_assertions)]
+pub(crate) fn assert_no_unregistered_host_jitframes() {
+    let count = UNREGISTERED_HOST_JITFRAMES.load(Ordering::Relaxed);
+    if count != 0 {
+        panic!(
+            "installing a collector with {count} host jitframe(s) allocated while no collector was installed; those frames were not entered in LIBC_JF_REGISTRY or LIVE_DEADFRAMES and will not be traced"
+        );
+    }
 }
 
 /// Invoke the registered tracer if any. Returns true if tracer ran.

@@ -113,6 +113,11 @@ pub fn store_singleton(gc: Box<MiniMarkGC>) {
     if GC_INITIALIZED.load(Ordering::Acquire) {
         return;
     }
+    // Debug builds count host jitframes allocated with no collector. This
+    // singleton walks every mutator, so a non-zero count is a frame neither
+    // `LIBC_JF_REGISTRY` nor `LIVE_DEADFRAMES` will trace.
+    #[cfg(debug_assertions)]
+    crate::shadow_stack::assert_no_unregistered_host_jitframes();
     // SAFETY: install_mutex held and no mutator has registered yet, so there is
     // no concurrent access.
     unsafe {
@@ -133,6 +138,12 @@ pub fn store_singleton(gc: Box<MiniMarkGC>) {
 /// collections.
 pub fn replace_singleton_leaking_old(gc: Box<MiniMarkGC>) {
     let _guard = GC_SYNC.install_mutex.lock().unwrap();
+    // Same debug gate as `store_singleton`: a live pre-collector host jitframe
+    // is invisible to both `LIBC_JF_REGISTRY` and `LIVE_DEADFRAMES`.
+    #[cfg(debug_assertions)]
+    if !GC_INITIALIZED.load(Ordering::Acquire) {
+        crate::shadow_stack::assert_no_unregistered_host_jitframes();
+    }
     // SAFETY: install_mutex held; the gc_stress harness runs tests serially, so
     // no concurrent gc_op is in flight during the swap.
     unsafe {
@@ -146,6 +157,7 @@ pub fn replace_singleton_leaking_old(gc: Box<MiniMarkGC>) {
 }
 
 /// Check if the GC singleton has been initialized.
+#[inline]
 pub fn is_initialized() -> bool {
     GC_INITIALIZED.load(Ordering::Acquire)
 }

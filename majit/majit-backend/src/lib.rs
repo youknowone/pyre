@@ -8,7 +8,7 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 #[cfg(not(target_arch = "wasm32"))]
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use majit_ir::{Const, Descr, FailDescr, GcRef, InputArg, InputArgRc, Op, OpRc, Type, Value};
@@ -1138,7 +1138,7 @@ impl CompiledLoopToken {
     ) {
         // `model.py` `new_fi = self.frame_info`
         // `model.py` `new_loop_tokens = []`
-        let new_fi_depth = self.frame_info.lock().jfi_frame_depth as i64;
+        let new_fi_depth = self.frame_info.lock().depth() as i64;
         let mut new_loop_tokens: Vec<std::sync::Weak<CompiledLoopToken>> = Vec::new();
         // `model.py:319-324` propagate depth through the old token's
         // existing redirect chain, dropping dead weak refs (`ref()` →
@@ -1402,6 +1402,14 @@ pub struct JitCellToken {
     /// previously baked CLT pointer). Read a cloned handle via
     /// `compiled_loop_token()`.
     pub compiled_loop_token: parking_lot::Mutex<Option<Arc<CompiledLoopToken>>>,
+    /// Address of the `Arc` in [`Self::compiled_loop_token`].
+    ///
+    /// `execute_token` reads `frame_info` off this pointer. Cloning the
+    /// `Arc` out of the mutex took the lock on every entry;
+    /// `make_execute_token` reads `clt.frame_info` with no lock. The mutex
+    /// still owns the `Arc`, so the address stays live until
+    /// [`Self::set_compiled_loop_token`] publishes a replacement.
+    clt_ptr: AtomicPtr<CompiledLoopToken>,
     /// `rpython/jit/backend/x86/assembler.py:599`
     /// `looptoken._ll_function_addr = rawstart + functionpos` —
     /// address of the compiled loop entry.
@@ -1550,6 +1558,8 @@ impl JitCellToken {
         let invalidated = Arc::new(AtomicBool::new(false));
         let bridge_invalidation_flags = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let invalidate_sites = Arc::new(parking_lot::Mutex::new(InvalidateSites::default()));
+        let clt = Arc::new(CompiledLoopToken::new(number));
+        let clt_ptr = Arc::as_ptr(&clt) as *mut CompiledLoopToken;
         JitCellToken {
             number,
             green_key: Cell::new(0),
@@ -1572,9 +1582,8 @@ impl JitCellToken {
             // `compiled_loop_token` at the start of `assemble_loop` —
             // i.e., lazily when the backend compiles the token. pyre
             // initializes it eagerly here so the field is always present.
-            compiled_loop_token: parking_lot::Mutex::new(Some(Arc::new(CompiledLoopToken::new(
-                number,
-            )))),
+            compiled_loop_token: parking_lot::Mutex::new(Some(clt)),
+            clt_ptr: AtomicPtr::new(clt_ptr),
             _ll_function_addr: AtomicUsize::new(0),
             _ll_raw_start: AtomicUsize::new(0),
             // memmgr.py default; first keep_loop_alive overwrites this.
@@ -1602,7 +1611,22 @@ impl JitCellToken {
     /// stable across a token-number re-registration.
     #[inline]
     pub fn set_compiled_loop_token(&self, clt: Option<Arc<CompiledLoopToken>>) {
+        let ptr = clt
+            .as_ref()
+            .map(|arc| Arc::as_ptr(arc) as *mut CompiledLoopToken)
+            .unwrap_or(std::ptr::null_mut());
+        // Publish the new address while `clt` still owns it, then move that
+        // owner into the mutex. A reader that loaded the previous address
+        // can still be inside `frame_info`; replacement happens at
+        // registration, before entries run against the new token.
+        self.clt_ptr.store(ptr, Ordering::Release);
         *self.compiled_loop_token.lock() = clt;
+    }
+
+    /// The CLT `execute_token` reads. Never null after [`Self::new`].
+    #[inline]
+    pub fn compiled_loop_token_ptr(&self) -> *const CompiledLoopToken {
+        self.clt_ptr.load(Ordering::Acquire)
     }
 
     /// The token's `compiled_loop_token`, panicking if absent. Callers keep
@@ -1709,6 +1733,7 @@ impl JitCellToken {
 
     /// model.py: has_compiled_code()
     /// Whether this token has compiled code attached.
+    #[inline]
     pub fn has_compiled_code(&self) -> bool {
         self.compiled.get().is_some()
     }
@@ -2219,24 +2244,36 @@ pub struct CpuDescrAttachments {
     pub done_with_this_frame_descr_float: Option<majit_ir::DescrRef>,
     pub exit_frame_with_exception_descr_ref: Option<majit_ir::DescrRef>,
     pub propagate_exception_descr: Option<majit_ir::DescrRef>,
+    /// Cell addresses of the six slots. Filled by [`Self::recompute_cached_ptrs`]
+    /// when a setter publishes; a direct field write without that step leaves
+    /// zeros, which is the unattached answer.
+    pub cached_ptrs: AttachedDescrPtrs,
 }
 
 impl CpuDescrAttachments {
     /// Snapshot the six attached pointers for emission / dispatch sites
     /// that need compile-time or runtime-immediate access.
+    ///
+    /// Each word is a [`majit_ir::FailDescrCell`] address (`AbstractDescr.hide`),
+    /// not `Arc::as_ptr`'s data half, so `show` is a cast.
+    #[inline]
     pub fn descr_ptrs(&self) -> AttachedDescrPtrs {
-        fn ptr(d: &Option<majit_ir::DescrRef>) -> usize {
-            d.as_ref()
-                .map_or(0, |arc| Arc::as_ptr(arc) as *const () as usize)
+        self.cached_ptrs
+    }
+
+    /// Rebuild [`Self::cached_ptrs`] after a slot assignment.
+    pub fn recompute_cached_ptrs(&mut self) {
+        fn ptr(slot: &Option<majit_ir::DescrRef>) -> usize {
+            slot.as_ref().map(majit_ir::descr_instance_ptr).unwrap_or(0)
         }
-        AttachedDescrPtrs {
+        self.cached_ptrs = AttachedDescrPtrs {
             done_with_this_frame_descr_void: ptr(&self.done_with_this_frame_descr_void),
             done_with_this_frame_descr_int: ptr(&self.done_with_this_frame_descr_int),
             done_with_this_frame_descr_ref: ptr(&self.done_with_this_frame_descr_ref),
             done_with_this_frame_descr_float: ptr(&self.done_with_this_frame_descr_float),
             exit_frame_with_exception_descr_ref: ptr(&self.exit_frame_with_exception_descr_ref),
             propagate_exception_descr: ptr(&self.propagate_exception_descr),
-        }
+        };
     }
 }
 
@@ -2292,6 +2329,7 @@ impl CpuDescrCell {
         let _writer = self.publish.lock();
         let mut next = Box::new(self.read().clone());
         f(&mut next);
+        next.recompute_cached_ptrs();
         let next: &'static CpuDescrAttachments = Box::leak(next);
         self.current.store(
             next as *const CpuDescrAttachments as *mut CpuDescrAttachments,
@@ -3115,6 +3153,31 @@ pub trait Backend: Send {
 
     /// Execute compiled code starting at the given token.
     fn execute_token(&self, token: &JitCellToken, args: &[Value]) -> DeadFrame;
+
+    /// `warmstate.py execute_assembler` when `result_type == INT` and the
+    /// fail descr is `DoneWithThisFrameDescrInt`: `get_int_value(deadframe, 0)`,
+    /// then the frame is released. `Err` is every other exit and still owns
+    /// the deadframe.
+    ///
+    /// The default runs [`Backend::execute_token`] and reads the descr back.
+    /// A backend that can see `jf_descr` before building a deadframe overrides
+    /// this so a finished int portal does not construct one.
+    fn execute_token_done_int(
+        &self,
+        token: &JitCellToken,
+        args: &[Value],
+    ) -> Result<i64, DeadFrame> {
+        let frame = self.execute_token(token, args);
+        let descr = self.get_latest_descr(&frame);
+        let int_finish = descr.is_finish()
+            && !descr.is_exit_frame_with_exception()
+            && descr.fail_arg_types() == [Type::Int];
+        if int_finish {
+            let value = self.get_int_value(&frame, 0);
+            return Ok(value);
+        }
+        Err(frame)
+    }
 
     /// Execute compiled code starting at a backend-specific dispatch key.
     ///

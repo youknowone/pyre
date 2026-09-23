@@ -10,9 +10,9 @@ use std::sync::atomic::Ordering;
 use majit_backend::deadframe::{ExitDescr, JitFrameDeadFrame};
 use majit_backend::jitframe::{
     HostHeapGc, check_jitframe_descr, jitframe_is_gc_object, jitframe_write_barrier,
-    malloc_entry_jitframe, malloc_jitframe, malloc_jitframe_no_collect,
+    malloc_entry_jitframe, malloc_host_jitframe, malloc_jitframe, malloc_jitframe_no_collect,
 };
-use majit_backend::libc_deadframe::LibcJitFrameDeadFrame;
+use majit_backend::libc_deadframe::{LibcJitFrameDeadFrame, free_jitframe_chain};
 use majit_backend::{AsmInfo, Backend, BackendError, DeadFrame, JitCellToken};
 // `gc_sync` hands out the concrete collector; the trait must be in scope for
 // its methods to resolve on that type.
@@ -94,11 +94,8 @@ pub(crate) fn lookup_call_assembler_callee_locs(
         let clt = target.compiled_loop_token.upgrade()?;
         // `JitFrameInfo` is `#[repr(C)]` and the Arc keeps the allocation
         // pinned, matching cranelift's `compiler.rs` pattern.
-        let frame_info_ptr = {
-            let info = clt.frame_info.lock();
-            &*info as *const majit_backend::JitFrameInfo as usize
-        };
-        let frame_depth = clt.frame_info.lock().jfi_frame_depth as usize;
+        let frame_info_ptr = clt.frame_info.data_ptr() as usize;
+        let frame_depth = unsafe { (*clt.frame_info.data_ptr()).depth() as usize };
         let ll_initial_locs = clt._ll_initial_locs.lock().clone();
         Some(majit_gc::rewrite::CallAssemblerCalleeLocs {
             _ll_initial_locs: ll_initial_locs,
@@ -316,6 +313,14 @@ fn with_gc_ll_descr<R>(f: impl FnOnce(&mut dyn majit_gc::GcAllocator) -> R) -> R
 
 type EntryArgRoots = smallvec::SmallVec<[majit_gc::shadow_stack::OwnerRootGuard; 4]>;
 
+/// The frame `make_execute_token` returns, before it is wrapped as a deadframe.
+struct RanFrame {
+    head: *mut JitFrame,
+    tip: *mut JitFrame,
+    gc_object: bool,
+    num_slots: usize,
+}
+
 /// `gc_ll_descr.malloc_jitframe(frame_info)` (`llmodel.py:298`) for a
 /// compiled entry.
 ///
@@ -327,6 +332,16 @@ type EntryArgRoots = smallvec::SmallVec<[majit_gc::shadow_stack::OwnerRootGuard;
 /// Returns whether the frame is a collector object, which decides the
 /// deadframe that later owns it.
 fn alloc_entry_jitframe(size_bytes: usize, args: &[Value]) -> (*mut JitFrame, bool, EntryArgRoots) {
+    // `make_execute_token` allocates through `gc_ll_descr`. With no collector
+    // installed that descr is `HostHeapGc` and the vtable query is a call
+    // that always answers "host block".
+    if !majit_gc::collector_installed() {
+        return (
+            malloc_host_jitframe(size_bytes),
+            false,
+            EntryArgRoots::new(),
+        );
+    }
     with_gc_ll_descr(|gc| {
         let gc_object = jitframe_is_gc_object(gc);
         let roots: EntryArgRoots = if gc_object {
@@ -838,10 +853,17 @@ fn dynasm_collect_step() -> majit_gc::GcStepTransition {
 /// Takes `format_args!` rather than a built `String`: the callers sit on the
 /// per-residual-call and per-trace-entry paths, where formatting the site name
 /// for a diagnostic that is off costs a heap allocation every time.
+#[inline]
 fn debug_validate_oldgen_freeblocks(site: std::fmt::Arguments<'_>) {
     if !crate::gc_freelist_diag_enabled() {
         return;
     }
+    debug_validate_oldgen_freeblocks_slow(site);
+}
+
+#[cold]
+#[inline(never)]
+fn debug_validate_oldgen_freeblocks_slow(site: std::fmt::Arguments<'_>) {
     let site = site.to_string();
     if gc_box::with_ref(|g| g.debug_validate_oldgen_freeblocks(&site)).is_some() {
         return;
@@ -1723,6 +1745,10 @@ pub struct DynasmBackend {
     /// owning backend — matches the lifetime guarantee RPython gets from
     /// `cpu` being a long-lived Python object.
     descr_attachments: crate::guard::CpuDescrHandle,
+    /// Cell address of `done_with_this_frame_descr_int`, published when the
+    /// singleton is attached. The entry compares `jf_descr` to this word;
+    /// `descr_attachments`' lock is not taken on that path.
+    done_int_cell: std::sync::atomic::AtomicUsize,
     /// Arch-specific per-CPU state PyPy keeps on `Assembler386` /
     /// `AssemblerARM64` (e.g. `self.malloc_slowpath`,
     /// `self.propagate_exception_path` at `assembler.py:63,344` and
@@ -1829,6 +1855,7 @@ impl DynasmBackend {
             constants: majit_ir::ConstMap::default(),
             vtable_offset: None,
             descr_attachments: Arc::new(crate::guard::CpuDescrCell::default()),
+            done_int_cell: std::sync::atomic::AtomicUsize::new(0),
             arch_cpu_ext: ArchCpuExt::new(asm_memory_manager),
         }
     }
@@ -2332,147 +2359,55 @@ impl DynasmBackend {
         (Self::input_slot(position) * crate::jitframe::SIZEOFSIGNED) as i32
     }
 
-    /// Resolve a raw `jf_descr` pointer to its `DescrRef`, as
-    /// `LLGraphCPU.get_latest_descr` does.  After the descriptors attached
-    /// to the cpu itself are ruled out by pointer identity, the pointer is
-    /// cast straight back to its `FailDescrCell` — RPython does this via
-    /// `AbstractDescr.show()`, which works for any descr from any
-    /// loop/bridge without consulting the executing token.
+    /// `llmodel.py get_latest_descr`: cast `jf_descr` through
+    /// `AbstractDescr.show`. The word is a [`majit_ir::FailDescrCell`]
+    /// address for both guard cells and the cpu-attached singletons.
     ///
-    /// `compile.py`'s four `DoneWithThisFrame*` descriptors
-    /// + `ExitFrameWithExceptionDescrRef` singletons attached to
-    ///   `self.cpu` are compared by pointer identity against the raw
-    ///   `jf_descr` value — same as RPython
-    ///   `llgraph/runner.py`'s `LLGraphCPU.execute_token`
-    ///   (`faildescr == self.cpu.done_with_this_frame_descr_*`).
-    ///
-    /// Panics if not found — RPython uses object identity, so lookup
-    /// failure is impossible in well-formed execution.
-    ///
-    /// `frame_ptr` lets the `propagate_exception_descr` arm implement
-    /// `PropagateExceptionDescr.handle_fail`: read `jf_guard_exc`, clear it,
-    /// and stage the value into `jf_frame[0]` before synthesizing the
-    /// exit-frame-with-exception descr the toplevel consumer expects.
-    fn find_descr_by_ptr(&self, ptr: usize, frame_ptr: *mut JitFrame) -> majit_ir::DescrRef {
-        let attached = self.attached_descr_ptrs();
-        // Check all four `DoneWithThisFrameDescr` variants.
-        // Forward through `meta_descr` so the metainterp class hierarchy
-        // (DoneWithThisFrameDescr{Void,Int,Ref,Float}) answers
-        // `is_finish` / `fail_arg_types` etc. via `compile.py:624 final_descr=True`.
-        if ptr != 0
-            && (ptr == attached.done_with_this_frame_descr_void
-                || ptr == attached.done_with_this_frame_descr_int
-                || ptr == attached.done_with_this_frame_descr_ref
-                || ptr == attached.done_with_this_frame_descr_float)
-        {
-            // Return the metainterp `DoneWithThisFrameDescr*` Arc directly.
-            // The `DoneWithThisFrameDescr` class hierarchy answers
-            // `is_finish`/`fail_arg_types` via its own FailDescr impl —
-            // no backend wrapper is needed.
-            let att = self.descr_attachments.read();
-            let meta = if ptr == attached.done_with_this_frame_descr_void {
-                att.done_with_this_frame_descr_void.clone()
-            } else if ptr == attached.done_with_this_frame_descr_float {
-                att.done_with_this_frame_descr_float.clone()
-            } else if ptr == attached.done_with_this_frame_descr_ref {
-                att.done_with_this_frame_descr_ref.clone()
-            } else {
-                att.done_with_this_frame_descr_int.clone()
-            };
-            return meta.expect(
-                "matched Done*WithThisFrameDescr ptr but slot is unattached — \
-                 attach_default_test_descrs / MetaInterp::new must have installed it",
-            );
-        }
-
-        // compile.py ExitFrameWithExceptionDescrRef — return the
-        // attached metainterp Arc directly; its class identity carries
-        // is_exit_frame_with_exception()=true.
-        if ptr != 0 && ptr == attached.exit_frame_with_exception_descr_ref {
-            return self
-                .descr_attachments
-                .read()
-                .exit_frame_with_exception_descr_ref
-                .clone()
-                .expect("matched exit_frame_with_exception ptr but slot is unattached");
-        }
-
-        // pyjitpl.py:2283 propagate_exception_descr — stamped into
-        // jf_descr by the inline propagate path emitted at
-        // OpCode::CheckMemoryError when a malloc helper returns NULL.
-        //
-        // compile.py `PropagateExceptionDescr.handle_fail`:
-        //     exception = cpu.grab_exc_value(deadframe)
-        //     if not exception:
-        //         exception = cast_instance_to_gcref(memory_error)
-        //     raise jitexc.ExitFrameWithExceptionRef(exception)
-        //
-        // pyre routes this through the same FailDescr the toplevel
-        // consumer (eval.rs) already understands —
-        // `is_exit_frame_with_exception=true` + `fail_arg_types=[Ref]`
-        // — by transferring `jf_guard_exc` (set by Layer 3's emitted
-        // _store_and_reset_exception, x86/assembler.rs) into
-        // `jf_frame[0]` so the existing slot-0 Ref reader picks it up.
-        if ptr != 0 && ptr == attached.propagate_exception_descr {
-            // grab_exc_value reads jf_guard_exc (llmodel.py); the
-            // clear is pyre's — the value moves into jf_frame[0] below and
-            // the slot must not hand a second copy to a later grab.
-            let exc_val = unsafe {
-                let slot = &mut (*frame_ptr).jf_guard_exc;
-                let v = *slot;
-                *slot = 0;
-                v
-            };
-            // memory_error fallback (compile.py) for the unlikely
-            // case where the propagate path fired without Layer 1's
-            // singleton store winning the race (or the singleton
-            // provider was never registered — unit tests).
-            let exc_val = if exc_val != 0 {
-                exc_val as i64
-            } else {
-                majit_backend::memory_error_singleton_ref()
-            };
-            // Stage into jf_frame[0] so EXIT_FRAME_WITH_EXCEPTION
-            // dispatch reads the exc value through the standard
-            // get_ref_value(0) path (compile.py:660).
-            unsafe { crate::llmodel::set_int_value(frame_ptr, 0, exc_val as isize) };
-            // `compile.py PropagateExceptionDescr.handle_fail`
-            // raises `jitexc.ExitFrameWithExceptionRef(exception)`.  pyre's
-            // flat dispatcher reads `is_exit_frame_with_exception()`, so
-            // return the ExitFrameWithExceptionDescrRef metainterp Arc
-            // directly (its class identity answers the predicate true).
-            return self
-                .descr_attachments
-                .read()
-                .exit_frame_with_exception_descr_ref
-                .clone()
-                .expect(
-                    "Propagate path requires exit_frame_with_exception_descr_ref to be attached",
-                );
-        }
-
-        // Every remaining `ptr` is the address of a live
-        // `Arc<FailDescrCell>`: the cell that `append_guard_token*` /
-        // `_store_force_index_if_next_guard` baked into the machine code is
-        // the same cell that goes into `CompiledCode::fail_descrs`, and
-        // `register_fail_descrs` pins that slice onto the owning CLT's
-        // `asmmemmgr_gcreftracers` for both `compile_loop` and
-        // `compile_bridge`.  So the cast below answers for a root loop's
-        // guard, for a bridge's guard, and for the cross-token case where a
-        // bridge attached to loop A JUMPs into loop B and B's guard fires
-        // while `token` is still A.  RPython's `AbstractDescr.show(jf_descr)`
-        // dereferences the pointer the same way.
-        //
-        // A 0 `ptr` here means the JIT-baked code never wrote `jf_descr`
-        // (e.g. a force-token flow that bypassed both
-        // `_store_force_index_if_next_guard` and the inline guard-exit
-        // stub).  `Arc::from_raw(0)` is UB; refuse to recover and surface
-        // the producer-side defect.
+    /// `frame_ptr` is only for `PropagateExceptionDescr.handle_fail`:
+    /// read `jf_guard_exc`, clear it, stage it into `jf_frame[0]`, and
+    /// answer the exit-frame descr the toplevel consumer already matches.
+    fn find_descr_by_ptr(
+        &self,
+        ptr: usize,
+        frame_ptr: *mut JitFrame,
+    ) -> majit_backend::deadframe::ExitDescr {
         assert_ne!(
             ptr, 0,
             "find_descr_by_ptr: jf_descr was not written; refusing to recover a null FailDescrCell"
         );
-        unsafe { majit_ir::recover_fail_descr_cell(ptr) }
+        let attached = self.descr_attachments.read().descr_ptrs();
+        let ptr = if ptr == attached.propagate_exception_descr {
+            Self::stage_propagate_exception(frame_ptr);
+            assert_ne!(
+                attached.exit_frame_with_exception_descr_ref, 0,
+                "Propagate path requires exit_frame_with_exception_descr_ref to be attached"
+            );
+            attached.exit_frame_with_exception_descr_ref
+        } else {
+            ptr
+        };
+        unsafe { majit_backend::deadframe::ExitDescr::from_cell(ptr) }
+    }
+
+    /// `compile.py PropagateExceptionDescr.handle_fail`.
+    ///
+    /// `grab_exc_value` reads `jf_guard_exc`; the clear keeps a later grab
+    /// from seeing the same value. Empty falls back to `memory_error`.
+    /// The value is staged in `jf_frame[0]` so the exit-frame reader picks
+    /// it up through `get_ref_value(0)`.
+    fn stage_propagate_exception(frame_ptr: *mut JitFrame) {
+        let exc_val = unsafe {
+            let slot = &mut (*frame_ptr).jf_guard_exc;
+            let v = *slot;
+            *slot = 0;
+            v
+        };
+        let exc_val = if exc_val != 0 {
+            exc_val as i64
+        } else {
+            majit_backend::memory_error_singleton_ref()
+        };
+        unsafe { crate::llmodel::set_int_value(frame_ptr, 0, exc_val as isize) };
     }
 
     /// `rpython/jit/backend/x86/assembler.py:599` parity: store
@@ -2535,6 +2470,257 @@ impl DynasmBackend {
     /// `jfi_frame_size` accounting (jitframe.py:19-22).
     fn get_baseofs_of_frame_field() -> i64 {
         crate::jitframe::FIRST_ITEM_OFFSET as i64
+    }
+}
+
+impl DynasmBackend {
+    /// `llmodel.py make_execute_token`: allocate, store args, call.
+    ///
+    /// The entry address is `looptoken._ll_function_addr`. Downcasting the
+    /// compiled buffer is only for the debug dumps, which are off on a
+    /// steady run.
+    fn run_compiled_frame(&self, token: &JitCellToken, args: &[Value]) -> RanFrame {
+        let diag = crate::majit_log_enabled()
+            || crate::majit_dump_enabled()
+            || crate::dynasm_exec_diag_enabled()
+            || majit_ir::debug::have_debug_prints()
+            || crate::gc_freelist_diag_enabled();
+        let compiled = diag.then(|| Self::get_compiled(token));
+        let entry = match compiled {
+            Some(code) => code.entry_ptr(),
+            None => token.ll_function_addr() as *const u8,
+        };
+
+        // jitframe.py — every JITFRAME carries a non-null JITFRAMEINFO
+        // so the bridge-entry `_check_frame_depth` realloc slowpath
+        // (`_frame_realloc_slowpath` → `dynasm_realloc_frame`) can read
+        // `jfi_frame_depth` / `jfi_frame_size` to size a grown frame.
+        // Mirror the CALL_ASSEMBLER callee template
+        // (`lookup_call_assembler_callee_locs` above): the Arc-pinned
+        // `frame_info` pointer is stable, and `jfi_frame_depth` alone sizes
+        // the frame — the same sizing the JIT uses for the callee frames it
+        // allocates itself, so the former `.max(args/fail*4/64)` cushion was
+        // a runner-only over-allocation with no upstream basis.
+        let clt = unsafe { &*token.compiled_loop_token_ptr() };
+        // `jfi_frame_depth` / `jfi_frame_size` live in the CLT's
+        // `JITFRAMEINFO`. The pointer is stable for the token's life;
+        // `depth()` is the word `rewrite.py` loads, without the mutex.
+        let (fi_ptr, num_slots) = {
+            let info = unsafe { &*clt.frame_info.data_ptr() };
+            (
+                info as *const majit_backend::JitFrameInfo,
+                info.depth() as usize,
+            )
+        };
+        // `jfi_frame_depth` is floored at `JITFRAME_FIXED_SIZE + inputargs`
+        // by construction, so every input slot fits.  Assert it (release):
+        // dropping the `.max(64)` cushion removes the silent-OOB mask, so a
+        // depth/arg mismatch must surface loudly instead of corrupting.
+        assert!(
+            num_slots >= Self::input_slot(args.len()),
+            "execute_token: frame depth {num_slots} < input top {} for {} args",
+            Self::input_slot(args.len()),
+            args.len()
+        );
+        let frame_bytes = JitFrame::alloc_size(num_slots);
+        // No collector: `malloc_jitframe` is a host block and the input refs
+        // are not forwarded. Skip the empty root vector.
+        let (jf_ptr, gc_object, arg_roots) = if majit_gc::collector_installed() {
+            let (ptr, gc_object, roots) = alloc_entry_jitframe(frame_bytes, args);
+            (ptr, gc_object, Some(roots))
+        } else {
+            (malloc_host_jitframe(frame_bytes), false, None)
+        };
+        unsafe { JitFrame::init(jf_ptr, fi_ptr, num_slots) };
+
+        let mut ref_index = 0;
+        for (i, arg) in args.iter().enumerate() {
+            let raw = match arg {
+                Value::Int(v) => *v,
+                Value::Ref(r) => {
+                    let current = match arg_roots.as_ref() {
+                        Some(roots) => roots.get(ref_index).map_or(*r, |root| root.get()),
+                        None => *r,
+                    };
+                    ref_index += 1;
+                    current.0 as i64
+                }
+                Value::Float(f) => f.to_bits() as i64,
+                Value::Void => 0,
+            };
+            unsafe { crate::llmodel::set_int_value(jf_ptr, Self::input_slot(i), raw as isize) };
+        }
+        // These roots exist only to span the collecting frame allocation.
+        // Once the forwarded refs are in the frame, keeping their owner-root
+        // slots through compiled execution would add them to every GC scan.
+        drop(arg_roots);
+
+        if majit_ir::debug::have_debug_prints() {
+            let _s = majit_ir::debug::scope("jit-running");
+            for (i, arg) in args.iter().enumerate() {
+                let raw = unsafe {
+                    crate::llmodel::get_int_value_direct(jf_ptr, Self::input_slot(i)) as i64
+                };
+                majit_ir::debug::debug_print(&format!(
+                    "  arg[{i}] = {:#018x} ({arg:?})",
+                    raw as u64
+                ));
+            }
+            majit_ir::debug::debug_print(&format!(
+                "execute_token: entry={entry:?} jf_ptr={jf_ptr:?} num_args={} num_slots={num_slots} code_len={}",
+                args.len(),
+                compiled.unwrap().buffer.len()
+            ));
+        }
+
+        if crate::majit_dump_enabled() {
+            // Independent debug toggle — MAJIT_DUMP must produce output
+            // regardless of whether MAJIT_LOG is set, so emit via plain
+            // eprintln (debug_print would silently no-op without
+            // MAJIT_LOG and lose the dump).
+            let compiled = compiled.unwrap();
+            let rawstart = codebuf::buffer_ptr(&compiled.buffer);
+            let code = unsafe { std::slice::from_raw_parts(rawstart, compiled.buffer.len()) };
+            eprintln!(
+                "[dynasm] CODE DUMP ({} bytes at {:?}, entry {:?}):",
+                code.len(),
+                rawstart,
+                entry
+            );
+            for (i, chunk) in code.chunks(4).enumerate() {
+                let word = u32::from_le_bytes([
+                    chunk.first().copied().unwrap_or(0),
+                    chunk.get(1).copied().unwrap_or(0),
+                    chunk.get(2).copied().unwrap_or(0),
+                    chunk.get(3).copied().unwrap_or(0),
+                ]);
+                eprint!("{word:08x} ");
+                if (i + 1) % 8 == 0 {
+                    eprintln!();
+                }
+            }
+            eprintln!();
+        }
+
+        // Debug: verify bridge patches are visible
+        if crate::majit_log_enabled() {
+            for descr in compiled.unwrap().fail_descrs.iter() {
+                if let Some(fd) = descr.as_fail_descr() {
+                    let bridge_addr =
+                        self.lookup_bridge_addr(token, fd.trace_id(), fd.fail_index_per_trace());
+                    if bridge_addr != 0 && fd.adr_jump_offset() == 0 {
+                        eprintln!(
+                            "[dynasm] bridge-patched guard fi={} bridge_addr={:#x} ajo=0 (patched)",
+                            fd.fail_index_per_trace(),
+                            bridge_addr
+                        );
+                    }
+                }
+            }
+        }
+
+        // llmodel.py `make_execute_token` fixes the entry signature as
+        // `(jitframe, threadlocal_addr) -> jitframe`, and `:317-323` reads the
+        // address with `llop.threadlocalref_addr` before the call. The compiled
+        // prologue (gen_shadowstack_header) / epilogue
+        // (gen_footer_shadowstack) push/pop the jf_ptr onto the shadow
+        // stack inline, matching aarch64/assembler.py:1422/1438 — no
+        // manual push_jf/pop_jf_to around the call.
+        let func: unsafe extern "C" fn(*mut JitFrame, *const i64) -> *mut JitFrame =
+            unsafe { std::mem::transmute(entry) };
+        if crate::dynasm_exec_diag_enabled() {
+            let compiled = compiled.unwrap();
+            eprintln!(
+                "[dynasm-exec] trace={} header={} entry={entry:p} len={} args={args:?}",
+                compiled.trace_id,
+                compiled.header_pc,
+                compiled.buffer.len(),
+            );
+        }
+        if crate::gc_freelist_diag_enabled() {
+            let trace_id = compiled.unwrap().trace_id;
+            debug_validate_oldgen_freeblocks(format_args!("before trace {trace_id}"));
+        }
+        let result_jf = unsafe { func(jf_ptr, crate::jit_threadlocalref_base()) };
+        if crate::gc_freelist_diag_enabled() {
+            let trace_id = compiled.unwrap().trace_id;
+            debug_validate_oldgen_freeblocks(format_args!("after trace {trace_id}"));
+        }
+
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[dynasm] execute_token returned: result_jf={:?} (expected={:?}) same={}",
+                result_jf,
+                jf_ptr,
+                result_jf == jf_ptr
+            );
+        }
+
+        RanFrame {
+            head: jf_ptr,
+            tip: result_jf,
+            gc_object,
+            num_slots,
+        }
+    }
+
+    /// `llmodel.py return ll_frame` — the deadframe IS the frame the run
+    /// returned. A collector object takes a movable owner-root slot; a
+    /// host frame is owned, and its chain freed, by the deadframe.
+    fn deadframe_from_run(&self, _token: &JitCellToken, ran: RanFrame) -> DeadFrame {
+        let jf_descr_raw = unsafe { crate::llmodel::get_latest_descr(ran.tip) };
+        let descr = self.find_descr_by_ptr(jf_descr_raw, ran.tip);
+        let descr_fd = descr.as_fail_descr();
+
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[dynasm] descr: fi={} finish={} types={} rd_locs={:?}",
+                descr_fd.fail_index_per_trace(),
+                descr_fd.is_finish(),
+                descr_fd.fail_arg_types().len(),
+                descr_fd.rd_locs()
+            );
+        }
+
+        if ran.gc_object {
+            DeadFrame::JitFrame(JitFrameDeadFrame::new(
+                GcRef(ran.tip as usize),
+                descr,
+                None,
+                None,
+            ))
+        } else {
+            DeadFrame::LibcJitFrame(unsafe {
+                LibcJitFrameDeadFrame::owning(ran.head, ran.tip, ran.num_slots, descr, None)
+            })
+        }
+    }
+
+    /// `jf_descr` equals the `DoneWithThisFrameDescrInt` cell
+    /// `set_done_with_this_frame_descr_int` published.
+    ///
+    /// `compile.py make_and_attach_done_descrs` attaches that singleton
+    /// before any compiled code runs, so the exit is one compare.
+    fn finish_is_done_int(&self, descr_raw: usize) -> bool {
+        let cached = self
+            .done_int_cell
+            .load(std::sync::atomic::Ordering::Acquire);
+        descr_raw != 0 && descr_raw == cached
+    }
+
+    /// Cell address published by `set_done_with_this_frame_descr_int`.
+    /// Zero until `make_and_attach_done_descrs` runs.
+    pub fn done_with_this_frame_descr_int_cell(&self) -> usize {
+        self.done_int_cell
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The attached cell `descr_ptrs` hands to codegen.
+    pub fn attached_done_with_this_frame_descr_int(&self) -> usize {
+        self.descr_attachments
+            .read()
+            .descr_ptrs()
+            .done_with_this_frame_descr_int
     }
 }
 
@@ -2737,6 +2923,13 @@ impl Backend for DynasmBackend {
     fn set_done_with_this_frame_descr_int(&mut self, descr: majit_ir::DescrRef) {
         self.descr_attachments
             .update(|a| a.done_with_this_frame_descr_int = Some(descr));
+        let ptr = self
+            .descr_attachments
+            .read()
+            .descr_ptrs()
+            .done_with_this_frame_descr_int;
+        self.done_int_cell
+            .store(ptr, std::sync::atomic::Ordering::Release);
     }
     fn set_done_with_this_frame_descr_ref(&mut self, descr: majit_ir::DescrRef) {
         self.descr_attachments
@@ -3020,196 +3213,37 @@ impl Backend for DynasmBackend {
     }
 
     fn execute_token(&self, token: &JitCellToken, args: &[Value]) -> DeadFrame {
-        // assembler.py:1080 `_call_header_with_stack_check` emits the
-        // inline probe at the top of every compiled loop, matching
-        // cranelift's `jit_prologue_stack_check_shim` call in
-        // `compiler.rs`. The prior runner-level `jit_prologue_stack_check`
-        // call only guarded top-level entry and missed compiled-to-
-        // compiled CALL_ASSEMBLER recursion.
-        let compiled = Self::get_compiled(token);
-        let entry = compiled.entry_ptr();
+        let ran = self.run_compiled_frame(token, args);
+        self.deadframe_from_run(token, ran)
+    }
 
-        // jitframe.py — every JITFRAME carries a non-null JITFRAMEINFO
-        // so the bridge-entry `_check_frame_depth` realloc slowpath
-        // (`_frame_realloc_slowpath` → `dynasm_realloc_frame`) can read
-        // `jfi_frame_depth` / `jfi_frame_size` to size a grown frame.
-        // Mirror the CALL_ASSEMBLER callee template
-        // (`lookup_call_assembler_callee_locs` above): the Arc-pinned
-        // `frame_info` pointer is stable, and `jfi_frame_depth` alone sizes
-        // the frame — the same sizing the JIT uses for the callee frames it
-        // allocates itself, so the former `.max(args/fail*4/64)` cushion was
-        // a runner-only over-allocation with no upstream basis.
-        let clt = token.compiled_loop_token_expect();
-        let (fi_ptr, num_slots) = {
-            let info = clt.frame_info.lock();
-            // The Arc-pinned `JitFrameInfo` address stays valid past the
-            // guard drop; pass it as the frame's `jf_frame_info` so the
-            // bridge realloc slowpath can read `jfi_frame_depth` /
-            // `jfi_frame_size` (jitframe.py:51).  Mirrors the CALL_ASSEMBLER
-            // callee path (`lookup_call_assembler_callee_locs`).
-            (
-                &*info as *const majit_backend::JitFrameInfo,
-                info.jfi_frame_depth as usize,
-            )
-        };
-        // `jfi_frame_depth` is floored at `JITFRAME_FIXED_SIZE + inputargs`
-        // by construction, so every input slot fits.  Assert it (release):
-        // dropping the `.max(64)` cushion removes the silent-OOB mask, so a
-        // depth/arg mismatch must surface loudly instead of corrupting.
-        assert!(
-            num_slots >= Self::input_slot(args.len()),
-            "execute_token: frame depth {num_slots} < input top {} for {} args",
-            Self::input_slot(args.len()),
-            args.len()
-        );
-        let (jf_ptr, gc_object, arg_roots) =
-            alloc_entry_jitframe(JitFrame::alloc_size(num_slots), args);
-        unsafe { JitFrame::init(jf_ptr, fi_ptr, num_slots) };
-
-        let mut ref_index = 0;
-        for (i, arg) in args.iter().enumerate() {
-            let raw = match arg {
-                Value::Int(v) => *v,
-                Value::Ref(r) => {
-                    let current = arg_roots.get(ref_index).map_or(*r, |root| root.get());
-                    ref_index += 1;
-                    current.0 as i64
-                }
-                Value::Float(f) => f.to_bits() as i64,
-                Value::Void => 0,
-            };
-            unsafe { crate::llmodel::set_int_value(jf_ptr, Self::input_slot(i), raw as isize) };
-        }
-        // These roots exist only to span the collecting frame allocation.
-        // Once the forwarded refs are in the frame, keeping their owner-root
-        // slots through compiled execution would add them to every GC scan.
-        drop(arg_roots);
-
-        if majit_ir::debug::have_debug_prints() {
-            let _s = majit_ir::debug::scope("jit-running");
-            for (i, arg) in args.iter().enumerate() {
-                let raw = unsafe {
-                    crate::llmodel::get_int_value_direct(jf_ptr, Self::input_slot(i)) as i64
-                };
-                majit_ir::debug::debug_print(&format!(
-                    "  arg[{i}] = {:#018x} ({arg:?})",
-                    raw as u64
-                ));
-            }
-            majit_ir::debug::debug_print(&format!(
-                "execute_token: entry={entry:?} jf_ptr={jf_ptr:?} num_args={} num_slots={num_slots} code_len={}",
-                args.len(),
-                compiled.buffer.len()
-            ));
-        }
-
-        if crate::majit_dump_enabled() {
-            // Independent debug toggle — MAJIT_DUMP must produce output
-            // regardless of whether MAJIT_LOG is set, so emit via plain
-            // eprintln (debug_print would silently no-op without
-            // MAJIT_LOG and lose the dump).
-            let rawstart = codebuf::buffer_ptr(&compiled.buffer);
-            let code = unsafe { std::slice::from_raw_parts(rawstart, compiled.buffer.len()) };
-            eprintln!(
-                "[dynasm] CODE DUMP ({} bytes at {:?}, entry {:?}):",
-                code.len(),
-                rawstart,
-                entry
-            );
-            for (i, chunk) in code.chunks(4).enumerate() {
-                let word = u32::from_le_bytes([
-                    chunk.first().copied().unwrap_or(0),
-                    chunk.get(1).copied().unwrap_or(0),
-                    chunk.get(2).copied().unwrap_or(0),
-                    chunk.get(3).copied().unwrap_or(0),
-                ]);
-                eprint!("{word:08x} ");
-                if (i + 1) % 8 == 0 {
-                    eprintln!();
-                }
-            }
-            eprintln!();
-        }
-
-        // Debug: verify bridge patches are visible
-        if crate::majit_log_enabled() {
-            for descr in compiled.fail_descrs.iter() {
-                if let Some(fd) = descr.as_fail_descr() {
-                    let bridge_addr =
-                        self.lookup_bridge_addr(token, fd.trace_id(), fd.fail_index_per_trace());
-                    if bridge_addr != 0 && fd.adr_jump_offset() == 0 {
-                        eprintln!(
-                            "[dynasm] bridge-patched guard fi={} bridge_addr={:#x} ajo=0 (patched)",
-                            fd.fail_index_per_trace(),
-                            bridge_addr
-                        );
-                    }
-                }
+    /// `warmstate.py execute_assembler` int fast path, on the frame
+    /// `make_execute_token` just returned.
+    ///
+    /// `genop_finish` stores the result at `jf_frame[0]` and
+    /// `handle_fail_done_with_this_frame` reads that slot for
+    /// `done_with_this_frame_descr_int`. The frame is released here, which
+    /// is the deadframe drop the general path would run after `get_int_value`.
+    fn execute_token_done_int(
+        &self,
+        token: &JitCellToken,
+        args: &[Value],
+    ) -> Result<i64, DeadFrame> {
+        let ran = self.run_compiled_frame(token, args);
+        if !ran.gc_object {
+            let descr_raw = unsafe { crate::llmodel::get_latest_descr(ran.tip) };
+            if self.finish_is_done_int(descr_raw) {
+                // `DoneWithThisFrameDescrInt.get_result` →
+                // `get_int_value(deadframe, 0)`. Empty `rd_locs` is slot 0,
+                // where `genop_finish` stored the word; a stamped table wins.
+                let descr = unsafe { ExitDescr::from_cell(descr_raw) };
+                let value =
+                    unsafe { crate::llmodel::get_int_value(ran.tip, descr.as_fail_descr(), 0) };
+                unsafe { free_jitframe_chain(ran.head) };
+                return Ok(value);
             }
         }
-
-        // llmodel.py `make_execute_token` fixes the entry signature as
-        // `(jitframe, threadlocal_addr) -> jitframe`, and `:317-323` reads the
-        // address with `llop.threadlocalref_addr` before the call. The compiled
-        // prologue (gen_shadowstack_header) / epilogue
-        // (gen_footer_shadowstack) push/pop the jf_ptr onto the shadow
-        // stack inline, matching aarch64/assembler.py:1422/1438 — no
-        // manual push_jf/pop_jf_to around the call.
-        let func: unsafe extern "C" fn(*mut JitFrame, *const i64) -> *mut JitFrame =
-            unsafe { std::mem::transmute(entry) };
-        if crate::dynasm_exec_diag_enabled() {
-            eprintln!(
-                "[dynasm-exec] trace={} header={} entry={entry:p} len={} args={args:?}",
-                compiled.trace_id,
-                compiled.header_pc,
-                compiled.buffer.len(),
-            );
-        }
-        debug_validate_oldgen_freeblocks(format_args!("before trace {}", compiled.trace_id));
-        let result_jf = unsafe { func(jf_ptr, crate::jit_threadlocalref_base()) };
-        debug_validate_oldgen_freeblocks(format_args!("after trace {}", compiled.trace_id));
-
-        if crate::majit_log_enabled() {
-            eprintln!(
-                "[dynasm] execute_token returned: result_jf={:?} (expected={:?}) same={}",
-                result_jf,
-                jf_ptr,
-                result_jf == jf_ptr
-            );
-        }
-
-        // llmodel.py get_latest_descr: read jf_descr from frame.
-        let jf_descr_raw = unsafe { crate::llmodel::get_latest_descr(result_jf) as i64 };
-        let descr = self.find_descr_by_ptr(jf_descr_raw as usize, result_jf);
-        let descr_fd = descr
-            .as_fail_descr()
-            .expect("find_descr_by_ptr result must implement FailDescr");
-
-        if crate::majit_log_enabled() {
-            eprintln!(
-                "[dynasm] descr: fi={} finish={} types={} rd_locs={:?}",
-                descr_fd.fail_index_per_trace(),
-                descr_fd.is_finish(),
-                descr_fd.fail_arg_types().len(),
-                descr_fd.rd_locs()
-            );
-        }
-
-        // `llmodel.py return ll_frame` — the deadframe IS the frame the run
-        // returned. A collector object takes a movable owner-root slot; a
-        // host frame is owned, and its chain freed, by the deadframe.
-        if gc_object {
-            DeadFrame::JitFrame(JitFrameDeadFrame::new(
-                GcRef(result_jf as usize),
-                ExitDescr::owned(descr),
-                None,
-                None,
-            ))
-        } else {
-            DeadFrame::LibcJitFrame(unsafe {
-                LibcJitFrameDeadFrame::owning(jf_ptr, result_jf, num_slots, descr, None)
-            })
-        }
+        Err(self.deadframe_from_run(token, ran))
     }
 
     /// Override execute_token_ints_raw to return the FULL jitframe
@@ -3231,14 +3265,12 @@ impl Backend for DynasmBackend {
         // `execute_token` (jitframe.py) — the bridge realloc slowpath
         // needs the frame_info, and the depth matches cranelift's
         // `max_output_slots`-sized raw outputs (compiler.rs).
-        let clt = token.compiled_loop_token_expect();
+        let clt = unsafe { &*token.compiled_loop_token_ptr() };
         let (fi_ptr, num_slots) = {
-            let info = clt.frame_info.lock();
-            // Same non-null frame_info + `jfi_frame_depth` sizing as
-            // `execute_token`.
+            let info = unsafe { &*clt.frame_info.data_ptr() };
             (
-                &*info as *const majit_backend::JitFrameInfo,
-                info.jfi_frame_depth as usize,
+                info as *const majit_backend::JitFrameInfo,
+                info.depth() as usize,
             )
         };
         assert!(
@@ -3259,11 +3291,9 @@ impl Backend for DynasmBackend {
             unsafe { std::mem::transmute(entry) };
         let result_jf = unsafe { func(jf_ptr, crate::jit_threadlocalref_base()) };
 
-        let jf_descr_raw = unsafe { crate::llmodel::get_latest_descr(result_jf) as i64 };
-        let descr = self.find_descr_by_ptr(jf_descr_raw as usize, result_jf);
-        let descr_fd = descr
-            .as_fail_descr()
-            .expect("find_descr_by_ptr result must implement FailDescr");
+        let jf_descr_raw = unsafe { crate::llmodel::get_latest_descr(result_jf) };
+        let descr = self.find_descr_by_ptr(jf_descr_raw, result_jf);
+        let descr_fd = descr.as_fail_descr();
 
         let fail_arg_types = descr_fd.fail_arg_types();
         let num_fail_args = fail_arg_types.len();
@@ -3298,8 +3328,9 @@ impl Backend for DynasmBackend {
                 Type::Int => Value::Int(raw),
             });
         }
+        let descr_arc = descr.to_arc();
         let exit_layout = Some(crate::guard::layout_for_fail_descr(
-            &descr,
+            &descr_arc,
             descr_fd.fail_index_per_trace(),
             descr_fd.trace_id(),
         ));
@@ -3316,7 +3347,6 @@ impl Backend for DynasmBackend {
             unsafe { majit_backend::libc_deadframe::free_jitframe_chain(jf_ptr) };
         }
 
-        let descr_arc: majit_ir::DescrRef = descr.clone();
         majit_backend::RawExecResult {
             outputs,
             typed_outputs,
@@ -3336,10 +3366,7 @@ impl Backend for DynasmBackend {
     fn get_latest_descr<'a>(&'a self, frame: &'a DeadFrame) -> &'a dyn FailDescr {
         match frame {
             DeadFrame::JitFrame(data) => data.fail_descr.as_fail_descr(),
-            DeadFrame::LibcJitFrame(data) => data
-                .fail_descr
-                .as_fail_descr()
-                .expect("LibcJitFrameDeadFrame::fail_descr must implement FailDescr"),
+            DeadFrame::LibcJitFrame(data) => data.fail_descr.as_fail_descr(),
             DeadFrame::Boxed(_) => panic!("dynasm deadframe is a jitframe"),
         }
     }
@@ -3371,7 +3398,12 @@ impl Backend for DynasmBackend {
             )))
         } else {
             Some(DeadFrame::LibcJitFrame(unsafe {
-                LibcJitFrameDeadFrame::borrowing(frame, num_slots, descr, None)
+                LibcJitFrameDeadFrame::borrowing(
+                    frame,
+                    num_slots,
+                    majit_backend::deadframe::ExitDescr::owned(descr),
+                    None,
+                )
             }))
         }
     }
@@ -3387,7 +3419,7 @@ impl Backend for DynasmBackend {
     fn get_latest_descr_arc(&self, frame: &DeadFrame) -> Arc<dyn majit_ir::Descr> {
         match frame {
             DeadFrame::JitFrame(data) => data.fail_descr.to_arc(),
-            DeadFrame::LibcJitFrame(data) => Arc::clone(&data.fail_descr),
+            DeadFrame::LibcJitFrame(data) => data.fail_descr.to_arc(),
             DeadFrame::Boxed(_) => panic!("dynasm deadframe is a jitframe"),
         }
     }

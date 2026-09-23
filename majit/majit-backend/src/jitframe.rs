@@ -38,13 +38,20 @@ pub const NULLGCMAP: *const u8 = std::ptr::null();
 ///     ('jfi_frame_size', lltype.Signed),
 /// )
 /// ```
-#[derive(Debug, Default)]
+/// Two `lltype.Signed` words (`JITFRAMEINFO`), the layout `gen_malloc_frame`
+/// loads with `GC_LOAD_I`.
+///
+/// The fields are atomics so a store in `jitframeinfo_update_depth` racing a
+/// load is not a data race. The ordering stays relaxed: that update is a
+/// plain assignment, and `GC_LOAD_I` carries no ordering. `set_ll_function_addr`
+/// is what publishes the machine code; the entry loads the depth only after
+/// that, and allocates the frame bytes after the load.
 #[repr(C)]
 pub struct JitFrameInfo {
     /// jfi_frame_depth: Signed — number of word-sized slots in jf_frame.
-    pub jfi_frame_depth: isize,
+    pub jfi_frame_depth: std::sync::atomic::AtomicIsize,
     /// jfi_frame_size: Signed — total byte size of the JitFrame allocation.
-    pub jfi_frame_size: isize,
+    pub jfi_frame_size: std::sync::atomic::AtomicIsize,
 }
 
 // jitframe.py:28
@@ -54,26 +61,72 @@ const _: () = assert!(std::mem::size_of::<JitFrameInfo>() == JITFRAMEINFO_SIZE);
 
 // jitframe.py — jitframeinfo_update_depth
 // jitframe.py — jitframeinfo_clear
-impl JitFrameInfo {
-    /// jitframe.py `jitframeinfo_update_depth(jfi, base_ofs, new_depth)`.
-    ///
-    /// The fields are `isize` (lltype.Signed = machine word); the frame-depth
-    /// call sites (CompiledLoopToken / backend assemblers) thread `base_ofs`
-    /// and `new_depth` as `i64`, so the word-width conversion is localized
-    /// here.
-    pub fn update_frame_depth(&mut self, base_ofs: i64, new_depth: i64) {
-        let base_ofs = base_ofs as isize;
-        let new_depth = new_depth as isize;
-        if new_depth > self.jfi_frame_depth {
-            self.jfi_frame_depth = new_depth;
-            self.jfi_frame_size = base_ofs + new_depth * SIZEOFSIGNED as isize;
+impl Default for JitFrameInfo {
+    fn default() -> Self {
+        Self {
+            jfi_frame_depth: std::sync::atomic::AtomicIsize::new(0),
+            jfi_frame_size: std::sync::atomic::AtomicIsize::new(0),
         }
     }
+}
 
-    /// jitframe.py:24-26
-    pub fn clear(&mut self) {
-        self.jfi_frame_size = 0;
-        self.jfi_frame_depth = 0;
+impl std::fmt::Debug for JitFrameInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JitFrameInfo")
+            .field("jfi_frame_depth", &self.depth())
+            .field("jfi_frame_size", &self.size())
+            .finish()
+    }
+}
+
+impl JitFrameInfo {
+    /// `jfi_frame_depth` — `GC_LOAD_I` of the `lltype.Signed` word.
+    #[inline]
+    pub fn depth(&self) -> isize {
+        self.jfi_frame_depth
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// `jfi_frame_size` — `GC_LOAD_I` of the `lltype.Signed` word.
+    #[inline]
+    pub fn size(&self) -> isize {
+        self.jfi_frame_size
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// jitframe.py `jitframeinfo_update_depth(jfi, base_ofs, new_depth)`.
+    ///
+    /// The fields are machine words (`lltype.Signed`); the frame-depth call
+    /// sites thread `base_ofs` and `new_depth` as `i64`, so the conversion
+    /// stays here.
+    ///
+    /// `jitframeinfo_update_depth` assigns only when the depth grows. A bridge
+    /// compile and `realloc_frame` both call this, so the depth moves with
+    /// `fetch_max` and a smaller store cannot replace a larger one.
+    /// `gen_malloc_frame` loads `jfi_frame_size` and `jfi_frame_depth` with
+    /// separate `GC_LOAD_I`s: the size is raised first and only grows, then
+    /// the depth is published. A reader that observes this depth has a size
+    /// at least as large. A reader that still observes the old depth with the
+    /// new size over-allocates.
+    pub fn update_frame_depth(&self, base_ofs: i64, new_depth: i64) {
+        let base_ofs = base_ofs as isize;
+        let new_depth = new_depth as isize;
+        if new_depth <= self.depth() {
+            return;
+        }
+        let new_size = base_ofs + new_depth * SIZEOFSIGNED as isize;
+        self.jfi_frame_size
+            .fetch_max(new_size, std::sync::atomic::Ordering::Relaxed);
+        self.jfi_frame_depth
+            .fetch_max(new_depth, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// jitframe.py:24-26 — `jitframeinfo_clear` assigns both words.
+    pub fn clear(&self) {
+        self.jfi_frame_size
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.jfi_frame_depth
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -220,7 +273,9 @@ fn off_gc_layout(total: usize) -> Option<std::alloc::Layout> {
 ///
 /// The block comes off the thread's free list when
 /// [`crate::deadframe::jitframe_pool_enabled`] says so, and from the
-/// allocator otherwise; either way it is zeroed through `size_bytes`.
+/// allocator otherwise. A recycled block clears the header word and the
+/// fixed fields only; a fresh block also clears the spill area so those
+/// bytes are not uninit.
 ///
 /// Returns null when the allocation fails.
 pub fn alloc_off_gc_jitframe(size_bytes: usize) -> *mut JitFrame {
@@ -231,21 +286,40 @@ pub fn alloc_off_gc_jitframe(size_bytes: usize) -> *mut JitFrame {
         return std::ptr::null_mut();
     };
     if let Some(base) = crate::deadframe::take_pooled_block(total) {
-        // A parked block keeps its own size slot; only the bytes this frame
-        // will read are cleared.
-        unsafe {
-            std::ptr::write_bytes(base.add(OFF_GC_SIZE_SLOT), 0, total - OFF_GC_SIZE_SLOT);
-            return base.add(OFF_GC_PREFIX) as *mut JitFrame;
-        }
+        // A parked block keeps its size slot. Zero the header word and the
+        // fixed JITFRAME fields (`jf_gcmap` must be null before any walk).
+        // Spill slots are written by the entry before they are read or
+        // published through a gcmap; `jitframe_allocate` does not scrub a
+        // recycled nursery object per slot either — the nursery reset did
+        // that in bulk, and a parked block is this path's recycle.
+        zero_off_gc_frame_prefix(base);
+        return unsafe { base.add(OFF_GC_PREFIX) as *mut JitFrame };
     }
-    let base = unsafe { std::alloc::alloc_zeroed(layout) };
+    let base = unsafe { std::alloc::alloc(layout) };
     if base.is_null() {
         return std::ptr::null_mut();
     }
     unsafe {
         *(base as *mut u64) = total as u64;
-        base.add(OFF_GC_PREFIX) as *mut JitFrame
+        zero_off_gc_frame_prefix(base);
+        // The length word and spill area of a fresh block were not part of
+        // the prefix clear. `JitFrame::init` writes the length; spill slots
+        // follow the same write-before-read contract as a pooled block.
+        // Zero them once so a read of an unwritten slot is not uninit memory.
+        let frame = base.add(OFF_GC_PREFIX);
+        let tail = OFF_GC_PREFIX + std::mem::size_of::<JitFrame>();
+        if total > tail {
+            std::ptr::write_bytes(frame.add(std::mem::size_of::<JitFrame>()), 0, total - tail);
+        }
+        frame as *mut JitFrame
     }
+}
+
+/// Header word plus the fixed `JITFRAME` fields. Does not touch the size
+/// slot at `base`, or the spill array.
+fn zero_off_gc_frame_prefix(base: *mut u8) {
+    let n = OFF_GC_HEADER + std::mem::size_of::<JitFrame>();
+    unsafe { std::ptr::write_bytes(base.add(OFF_GC_SIZE_SLOT), 0, n) };
 }
 
 /// Release a frame from [`alloc_off_gc_jitframe`].
@@ -385,11 +459,55 @@ pub fn malloc_jitframe_no_collect(
 
 /// The host-heap arm of [`malloc_jitframe`]: an off-GC block, registered so
 /// the collector's root walk finds its ref slots.
-fn malloc_host_jitframe(size_bytes: usize) -> *mut JitFrame {
+pub fn malloc_host_jitframe(size_bytes: usize) -> *mut JitFrame {
     let frame = alloc_off_gc_jitframe(size_bytes);
     assert!(!frame.is_null(), "JITFRAME host allocation failed");
-    majit_gc::shadow_stack::register_libc_jitframe(frame as usize);
+    // A collector walking the shadow stack has to recognise this block.
+    // With no collector installed nothing walks, and `make_execute_token`
+    // does not publish the frame. Debug builds count that case so a later
+    // `store_singleton` fails instead of leaving the block out of
+    // `LIBC_JF_REGISTRY` and `LIVE_DEADFRAMES`.
+    if majit_gc::collector_installed() {
+        majit_gc::shadow_stack::register_libc_jitframe(frame as usize);
+    } else {
+        #[cfg(debug_assertions)]
+        {
+            majit_gc::shadow_stack::note_unregistered_host_jitframe();
+            // The install flag may have been published between the check and
+            // the note. Register in that window so the frame is not left out
+            // of the set.
+            if majit_gc::collector_installed() {
+                majit_gc::shadow_stack::register_libc_jitframe(frame as usize);
+                majit_gc::shadow_stack::release_unregistered_host_jitframe();
+            }
+        }
+    }
     frame
+}
+
+/// Drop the registry entry of a [`malloc_host_jitframe`] block.
+///
+/// A release build only calls `unregister_libc_jitframe`. Debug builds also
+/// drop the pre-collector count when the block was never registered.
+#[inline(always)]
+pub(crate) fn release_malloc_host_jitframe(frame: *mut JitFrame) {
+    #[cfg(not(debug_assertions))]
+    {
+        majit_gc::shadow_stack::unregister_libc_jitframe(frame as usize);
+    }
+    #[cfg(debug_assertions)]
+    {
+        if frame.is_null() {
+            return;
+        }
+        let addr = frame as usize;
+        if majit_gc::collector_installed()
+            && majit_gc::shadow_stack::unregister_libc_jitframe_if_present(addr)
+        {
+            return;
+        }
+        majit_gc::shadow_stack::release_unregistered_host_jitframe();
+    }
 }
 
 /// Release a frame from [`malloc_jitframe`] that no compiled code, shadow
@@ -414,7 +532,7 @@ pub unsafe fn free_jitframe(gc: &dyn majit_gc::GcAllocator, frame: *mut JitFrame
 /// # Safety
 /// As [`free_jitframe`].
 pub unsafe fn free_host_jitframe(frame: *mut JitFrame) {
-    majit_gc::shadow_stack::unregister_libc_jitframe(frame as usize);
+    release_malloc_host_jitframe(frame);
     unsafe { free_off_gc_jitframe(frame) };
 }
 
@@ -816,15 +934,15 @@ where
     unsafe {
         // llmodel.py:132-139 — widen frame_info when we need more depth.
         let fi = (*old_jf).jf_frame_info as *mut JitFrameInfo;
-        if expected_depth > (*fi).jfi_frame_depth {
+        if expected_depth > (*fi).depth() {
             (*fi).update_frame_depth(base_ofs as i64, expected_depth as i64);
         }
-        let size_bytes = (*fi).jfi_frame_size;
+        let size_bytes = (*fi).size();
 
         // llmodel.py:140 — new_frame = jitframe.JITFRAME.allocate(frame_info)
         let new_jf = alloc(size_bytes);
         debug_assert!(!new_jf.is_null(), "realloc_frame: alloc returned null");
-        JitFrame::init(new_jf, fi, (*fi).jfi_frame_depth as usize);
+        JitFrame::init(new_jf, fi, (*fi).depth() as usize);
 
         // llmodel.py:141 — frame.jf_forward = new_frame
         (*old_jf).jf_forward = new_jf;
@@ -929,5 +1047,36 @@ mod tests {
             gc.is_in_nursery(frame as usize),
             "a false prefer-oldgen flag must not land the frame in mark-sweep old-gen"
         );
+    }
+
+    /// Two callers of `jitframeinfo_update_depth` with different depths leave
+    /// the larger depth in place, and `jfi_frame_size` consistent with it.
+    #[test]
+    fn update_frame_depth_concurrent_callers_keep_the_larger_depth() {
+        use std::sync::{Arc, Barrier};
+
+        let info = Arc::new(JitFrameInfo::default());
+        let barrier = Arc::new(Barrier::new(2));
+        let base_ofs = 24i64;
+        let low = 5i64;
+        let high = 48i64;
+        let run = |depth: i64| {
+            let info = Arc::clone(&info);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..4_000 {
+                    info.update_frame_depth(base_ofs, depth);
+                }
+            })
+        };
+        let low_thread = run(low);
+        let high_thread = run(high);
+        low_thread.join().expect("low depth updater");
+        high_thread.join().expect("high depth updater");
+
+        assert_eq!(info.depth(), high as isize);
+        let consistent = base_ofs as isize + (high as isize) * SIZEOFSIGNED as isize;
+        assert_eq!(info.size(), consistent);
     }
 }

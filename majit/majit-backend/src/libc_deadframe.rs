@@ -15,6 +15,7 @@ use std::sync::OnceLock;
 use majit_ir::DescrRef;
 use majit_ir::GcRef;
 
+use crate::deadframe::ExitDescr;
 use crate::jitframe::JitFrame;
 
 /// Concrete data stored in DeadFrame by a backend whose frames live off the
@@ -46,8 +47,9 @@ pub struct LibcJitFrameDeadFrame {
     /// Number of slots the frame carries. Bounds the index space the
     /// accessors answer for; an index past it reads 0.
     num_slots: usize,
-    /// Backend-local fail descriptor used for slot decoding / bridge data.
-    pub fail_descr: DescrRef,
+    /// `jf_descr` cast back through [`ExitDescr::from_cell`] /
+    /// [`ExitDescr::owned`].
+    pub fail_descr: ExitDescr,
     /// Original `jf_descr` object identity when the exit used an attached
     /// metainterp descr (`DoneWithThisFrame*` / `ExitFrameWithExceptionDescrRef`).
     pub latest_descr: Option<DescrRef>,
@@ -58,7 +60,7 @@ impl std::fmt::Debug for LibcJitFrameDeadFrame {
         f.debug_struct("LibcJitFrameDeadFrame")
             .field("num_values", &self.num_slots)
             .field("owns_frame", &self.owned_head.is_some())
-            .field("fail_descr", &self.fail_descr.repr())
+            .field("fail_descr", &self.fail_descr.get().repr())
             .field(
                 "latest_descr",
                 &self.latest_descr.as_ref().map(|descr| descr.repr()),
@@ -80,10 +82,14 @@ impl LibcJitFrameDeadFrame {
         head: *mut JitFrame,
         tip: *mut JitFrame,
         num_slots: usize,
-        fail_descr: DescrRef,
+        fail_descr: ExitDescr,
         latest_descr: Option<DescrRef>,
     ) -> Self {
-        register_live_deadframe(tip as usize);
+        // Interior refs are only roots while a collector can run. With none
+        // installed, publishing the address is a set nothing walks.
+        if majit_gc::collector_installed() {
+            register_live_deadframe(tip as usize);
+        }
         LibcJitFrameDeadFrame {
             tip,
             owned_head: Some(head),
@@ -100,7 +106,7 @@ impl LibcJitFrameDeadFrame {
     pub unsafe fn borrowing(
         frame: *mut JitFrame,
         num_slots: usize,
-        fail_descr: DescrRef,
+        fail_descr: ExitDescr,
         latest_descr: Option<DescrRef>,
     ) -> Self {
         LibcJitFrameDeadFrame {
@@ -134,7 +140,7 @@ impl LibcJitFrameDeadFrame {
     /// sparse resume data can have more failarg positions than this fallback
     /// bound, while a late failarg still maps to a valid live frame slot.
     fn slot_of(&self, index: usize) -> Option<usize> {
-        let descr = self.fail_descr.as_fail_descr()?;
+        let descr = self.fail_descr.as_fail_descr();
         let locs = descr.rd_locs();
         if let Some(&pos) = locs.get(index) {
             (pos != 0xFFFF).then_some(pos as usize)
@@ -214,7 +220,7 @@ pub unsafe fn free_jitframe_chain(head: *mut JitFrame) {
     let mut cur = head;
     while !cur.is_null() {
         let next = unsafe { (*cur).jf_forward };
-        majit_gc::shadow_stack::unregister_libc_jitframe(cur as usize);
+        crate::jitframe::release_malloc_host_jitframe(cur);
         // Frees the block base, which sits one header word behind `cur`.
         unsafe { crate::jitframe::free_off_gc_jitframe(cur) };
         cur = next;
@@ -247,18 +253,34 @@ impl Drop for LibcJitFrameDeadFrame {
 /// `shadow_stack::register_libc_jitframe`'s own registry: a collection can run
 /// on a thread other than the one holding the deadframe, and a thread-local set
 /// would be invisible to it.
-static LIVE_DEADFRAMES: OnceLock<RwLock<indexmap::IndexSet<usize>>> = OnceLock::new();
+// Same shape as `shadow_stack`'s libc-jitframe list: a flat vec, and a
+// flag so a process that never publishes a deadframe does not take the lock
+// on every drop. A collection walks the vec; hashing the address added a
+// SipHash on every entry and exit.
+static LIVE_DEADFRAMES_USED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static LIVE_DEADFRAMES: OnceLock<RwLock<Vec<usize>>> = OnceLock::new();
 
-fn live_deadframes() -> &'static RwLock<indexmap::IndexSet<usize>> {
-    LIVE_DEADFRAMES.get_or_init(|| RwLock::new(indexmap::IndexSet::new()))
+fn live_deadframes() -> &'static RwLock<Vec<usize>> {
+    LIVE_DEADFRAMES.get_or_init(|| RwLock::new(Vec::new()))
 }
 
 fn register_live_deadframe(addr: usize) {
-    live_deadframes().write().insert(addr);
+    LIVE_DEADFRAMES_USED.store(true, std::sync::atomic::Ordering::Release);
+    let mut set = live_deadframes().write();
+    if !set.contains(&addr) {
+        set.push(addr);
+    }
 }
 
 fn unregister_live_deadframe(addr: usize) {
-    live_deadframes().write().swap_remove(&addr);
+    if !LIVE_DEADFRAMES_USED.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    let mut set = live_deadframes().write();
+    if let Some(index) = set.iter().position(|&slot| slot == addr) {
+        set.swap_remove(index);
+    }
 }
 
 /// [`majit_gc::LiveDeadFrameWalkerFn`] for the off-GC frame registry.
@@ -287,8 +309,14 @@ mod tests {
         // No frame access is performed: this test isolates `_decode_pos`'s
         // logical-to-physical ordering. The borrowed null owner is therefore
         // safe for the lifetime of the deadframe.
-        let frame =
-            unsafe { LibcJitFrameDeadFrame::borrowing(std::ptr::null_mut(), 36, descr, None) };
+        let frame = unsafe {
+            LibcJitFrameDeadFrame::borrowing(
+                std::ptr::null_mut(),
+                36,
+                ExitDescr::owned(descr),
+                None,
+            )
+        };
 
         assert_eq!(frame.slot_of(40), Some(15));
         assert_eq!(frame.slot_of(41), Some(13));

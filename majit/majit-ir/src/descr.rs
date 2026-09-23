@@ -229,6 +229,31 @@ pub unsafe fn recover_fail_descr_cell(addr: usize) -> DescrRef {
     cell.descr.clone()
 }
 
+/// `AbstractDescr.hide`: a stable address `show` casts straight back.
+///
+/// `Arc<dyn Descr>` is a fat pointer, so the word baked into `jf_descr`
+/// cannot be the data half alone. One leaked [`FailDescrCell`] per Arc
+/// allocation holds that fat pointer. Guard exits already bake a cell
+/// from [`FailDescrStore`]; cpu-attached singletons go through here so
+/// both kinds of word are a cell address.
+pub fn descr_instance_ptr(descr: &DescrRef) -> usize {
+    struct Entry {
+        key: usize,
+        addr: usize,
+    }
+    static CELLS: std::sync::OnceLock<Mutex<Vec<Entry>>> = std::sync::OnceLock::new();
+    let key = Arc::as_ptr(descr) as *const () as usize;
+    let cells = CELLS.get_or_init(|| Mutex::new(Vec::new()));
+    let mut guard = cells.lock();
+    if let Some(found) = guard.iter().find(|entry| entry.key == key) {
+        return found.addr;
+    }
+    let cell = Box::leak(Box::new(FailDescrCell::new(Arc::clone(descr))));
+    let addr = FailDescrCell::thin_ptr(cell);
+    guard.push(Entry { key, addr });
+    addr
+}
+
 /// descr.py: GcCache dict keys.
 ///
 /// RPython uses the actual lltype object (STRUCT, ARRAY_OR_STRUCT,

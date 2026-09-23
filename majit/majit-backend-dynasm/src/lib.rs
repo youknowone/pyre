@@ -52,6 +52,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 /// every call. The flag never changes after process startup, so checking it
 /// from hot dispatch paths shows up in profiles. The `LazyLock` caches the
 /// boolean. Mirrors the equivalent helper in `majit-backend-cranelift`.
+#[inline]
 pub fn majit_log_enabled() -> bool {
     static ENABLED: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("MAJIT_LOG").is_some());
@@ -73,6 +74,7 @@ pub fn majit_ops_log_enabled() -> bool {
 }
 
 /// Whether `MAJIT_DUMP` is set, cached at first access.
+#[inline]
 pub fn majit_dump_enabled() -> bool {
     static ENABLED: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("MAJIT_DUMP").is_some());
@@ -90,6 +92,7 @@ pub fn majit_j2plan_log_enabled() -> bool {
 ///
 /// Read once per residual call and twice per compiled-trace entry, so the
 /// uncached form put `getenv` on the hottest paths the backend has.
+#[inline]
 pub fn gc_freelist_diag_enabled() -> bool {
     // One cache for the whole process: `majit_gc` reads the same variable in
     // `free_arena`.
@@ -97,6 +100,7 @@ pub fn gc_freelist_diag_enabled() -> bool {
 }
 
 /// Whether `MAJIT_DYNASM_EXEC_DIAG` is set, cached at first access.
+#[inline]
 pub fn dynasm_exec_diag_enabled() -> bool {
     static ENABLED: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("MAJIT_DYNASM_EXEC_DIAG").is_some());
@@ -112,6 +116,11 @@ static JIT_EXC_TYPE: AtomicI64 = AtomicI64::new(0);
 /// `llmodel.py:319-322` does the same in untranslated runs, handing the entry a
 /// dummy container instead of the real `pypy_threadlocal_s`.
 static DUMMY_THREADLOCAL_SLOT: i64 = 0;
+/// Set by [`jit_threadlocalref_set`]. Until then every entry receives the
+/// dummy word: `llop.threadlocalref_addr` is one load, and an empty
+/// `RefCell<Vec>` borrow on the unset path was that load plus a TLS flag.
+static THREADLOCAL_SLOTS_USED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 thread_local! {
     /// llmodel.py / :317-323 `threadlocalref_addr` parity: compiled
@@ -180,6 +189,7 @@ pub fn jit_exc_type_addr() -> usize {
 
 /// Write a thread-local slot that compiled entrypoints may read back.
 pub fn jit_threadlocalref_set(offset: i64, value: i64) {
+    THREADLOCAL_SLOTS_USED.store(true, std::sync::atomic::Ordering::Release);
     JIT_THREADLOCAL_SLOTS.with(|slots| {
         let mut slots = slots.borrow_mut();
         let idx = (offset / 8) as usize;
@@ -191,7 +201,11 @@ pub fn jit_threadlocalref_set(offset: i64, value: i64) {
 }
 
 /// Return the base pointer passed to compiled entrypoints as x1.
+#[inline]
 pub(crate) fn jit_threadlocalref_base() -> *const i64 {
+    if !THREADLOCAL_SLOTS_USED.load(std::sync::atomic::Ordering::Acquire) {
+        return &raw const DUMMY_THREADLOCAL_SLOT;
+    }
     JIT_THREADLOCAL_SLOTS.with(|slots| {
         let slots = slots.borrow();
         if slots.is_empty() {

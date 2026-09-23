@@ -221,6 +221,7 @@ pub fn gc_lifetime_log_enabled() -> bool {
 /// `free_arena`, which runs at the end of every completed sweep, and upstream's
 /// whole-arena-empty branch (minimarkpage.py:404-411) touches no environment
 /// at all.
+#[inline]
 pub fn gc_freelist_diag_enabled() -> bool {
     static ENABLED: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("MAJIT_GC_FREELIST_DIAG").is_some());
@@ -2388,6 +2389,16 @@ pub fn gc_box_installed() -> bool {
 #[inline(always)]
 pub fn gc_box_installed() -> bool {
     false
+}
+
+/// Whether a collector can run and therefore has to find live jitframes.
+///
+/// `gc_box_installed` is the thread-confined heap; `gc_sync::is_initialized`
+/// is the process-global one. Neither means frames are ordinary allocations
+/// and nothing walks them (`GcLLDescr_boehm` with no collection in progress).
+#[inline]
+pub fn collector_installed() -> bool {
+    gc_box_installed() || gc_sync::is_initialized()
 }
 
 // ── Host-side nursery allocation hook ───────────────────────────────
