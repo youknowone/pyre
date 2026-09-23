@@ -5137,22 +5137,6 @@ fn build_jit_driver_pair() -> JitDriverPair {
                     .collect(),
             },
         );
-        majit_metainterp::register_exact_int_false_residual(
-            majit_metainterp::ExactIntFalseResidual {
-                fnaddrs: pyre_interpreter::jit_trace_fnaddrs()
-                    .into_iter()
-                    .filter_map(|(name, addr)| {
-                        name.contains("needs_numeric_binop_dispatch")
-                            .then_some(addr)
-                    })
-                    .collect(),
-                is_exact_int: |ptr| {
-                    let obj = ptr as pyre_object::PyObjectRef;
-                    !obj.is_null()
-                        && unsafe { pyre_object::is_int(obj) && !pyre_object::is_bool(obj) }
-                },
-            },
-        );
         majit_metainterp::register_void_skip_residual(majit_metainterp::VoidSkipResidual {
             fnaddrs: pyre_interpreter::jit_trace_fnaddrs()
                 .into_iter()
@@ -5239,60 +5223,6 @@ fn build_jit_driver_pair() -> JitDriverPair {
                 current_ec_ptr: || pyre_interpreter::call::getexecutioncontext() as i64,
             },
         );
-        majit_metainterp::register_compare_op_residual(majit_metainterp::CompareOpResidual {
-            fnaddrs: {
-                let mut addrs: Vec<i64> = pyre_interpreter::jit_trace_fnaddrs()
-                    .into_iter()
-                    .filter_map(|(name, addr)| {
-                        (name.contains("compare_slot")
-                            || name.contains("jit_compare_value_from_tag"))
-                        .then_some(addr)
-                    })
-                    .collect();
-                addrs.push(
-                    pyre_interpreter::objspace::descroperation::compare_slot_jit_abi as *const ()
-                        as i64,
-                );
-                addrs.push(
-                    pyre_interpreter::opcode_ops::jit_compare_value_from_tag as *const () as i64,
-                );
-                addrs.push(
-                    pyre_interpreter::opcode_ops::__majit_call_target_jit_compare_value_from_tag
-                        as *const () as i64,
-                );
-                addrs
-            },
-            intval_descr: pyre_jit_trace::descr::int_intval_descr(),
-            int_type_addr: &pyre_object::INT_TYPE as *const _ as i64,
-            w_true: pyre_object::w_bool_from(true) as i64,
-            w_false: pyre_object::w_bool_from(false) as i64,
-            newbool_fnaddr: pyre_interpreter::opcode_ops::jit_bool_value_from_truth as *const ()
-                as i64,
-            newbool_jitcode: pyre_jit_trace::jitcode_runtime::newbool_jitcode(),
-            bool_intval_descr: pyre_jit_trace::descr::bool_intval_descr(),
-            w_class_descr: pyre_jit_trace::descr::pyobject_w_class_stable_descr(),
-            ob_type_descr: pyre_jit_trace::descr::pyobject_ob_type_stable_descr(),
-            bool_type_addr: &pyre_object::BOOL_TYPE as *const _ as i64,
-            truth_fnaddrs: {
-                let mut addrs: Vec<i64> = pyre_interpreter::jit_trace_fnaddrs()
-                    .into_iter()
-                    .filter_map(|(name, addr)| {
-                        (name.contains("jit_truth_value") || name.contains("truth_value"))
-                            .then_some(addr)
-                    })
-                    .collect();
-                addrs.push(pyre_interpreter::opcode_ops::jit_truth_value as *const () as i64);
-                addrs
-            },
-            is_exact_int: |ptr| {
-                let obj = ptr as pyre_object::PyObjectRef;
-                !obj.is_null() && unsafe { pyre_object::is_int(obj) && !pyre_object::is_bool(obj) }
-            },
-            is_bool: |ptr| {
-                let obj = ptr as pyre_object::PyObjectRef;
-                !obj.is_null() && unsafe { pyre_object::is_bool(obj) }
-            },
-        });
         majit_metainterp::register_int_py_mod_residual(majit_metainterp::IntPyModResidual {
             fnaddrs: {
                 let mut addrs: Vec<i64> = pyre_interpreter::jit_trace_fnaddrs()
@@ -10693,40 +10623,6 @@ pub(crate) fn correct_resume_vsd(frame: &mut PyFrame, resume_pc: usize) {
     }
 }
 
-/// If `pc` is the loop-condition `POP_JUMP` whose taken target is the
-/// loop exit, return the header pc.
-///
-/// After-opt unboxes `i < n` to `IntLt` + `GuardTrue`. The fail
-/// leftover still pushes the traced `True` (`space.newbool` folded on
-/// the success path). `portal_ptr` at that `POP_JUMP` then falls into
-/// the body past `i >= n`. Rewind to the header so dispatch re-reads
-/// the heap locals (`warmspot.py` `handle_jitexception` → `portal_ptr`
-/// at the merge-point next_instr of the condition, not the leftover
-/// const).
-fn loop_header_for_exit_pop_jump(code: &pyre_interpreter::CodeObject, pc: usize) -> Option<usize> {
-    // Nearest header before `pc`. The while-condition `POP_JUMP` sits
-    // a few opcodes after the header (`LOAD`/`COMPARE`/`POP_JUMP`).
-    // A later `if` `POP_JUMP` (rem==0 at pc=23) is much farther; do
-    // not rewind that one — its leftover True is the correct raise arm.
-    //
-    // `code_successors` also inserts exception-table edges, so a
-    // farthest-successor walk from the rem==0 jump wrongly spans the
-    // `JUMP_BACKWARD` and looks like a loop-exit.
-    // Membership is `loop_headers::code_pc_is_loop_header` — the set
-    // itself stays in the interpreter crate.
-    let mut header = None;
-    for candidate in 0..pc {
-        if pyre_interpreter::code_pc_is_loop_header(code, candidate) {
-            header = Some(candidate);
-        }
-    }
-    let header = header?;
-    if pc - header > 6 {
-        return None;
-    }
-    Some(header)
-}
-
 /// Blackhole `ContinueRunningNormally` handoff: resume `frame` at the
 /// merge-point next_instr.
 ///
@@ -10736,16 +10632,10 @@ fn loop_header_for_exit_pop_jump(code: &pyre_interpreter::CodeObject, pc: usize)
 /// the loop-entry pc (the label inputarg). Prefer the live field when it
 /// has moved.
 ///
-/// `correct_resume_vsd` is only for the loop-header merge point, where
-/// the guard's recorded depth over-counts. A COMPARE / `POP_JUMP`
-/// merge already has the bool BH just pushed; shrinking vsd from
-/// header liveness wipes it and the interpreter then takes the wrong
-/// arm (`warmspot.py` `handle_jitexception` → `portal_ptr` does not
-/// rewrite vsd).
-///
-/// Exception: the loop-exit `POP_JUMP` after an unboxed `i < n`
-/// `GuardTrue` fail. The leftover bool is the traced `True`; rewind
-/// to the header and reset vsd so dispatch re-evaluates the condition.
+/// `warmspot.py` `handle_jitexception` resumes at `portal_ptr` (the
+/// green `next_instr` the exception carries). `correct_resume_vsd` is
+/// only for a loop-header merge, where the guard's recorded depth
+/// over-counts.
 #[majit_macros::dont_look_inside]
 fn apply_blackhole_crn_handoff(frame: &mut PyFrame, green_int: &[i64]) {
     let green_pc = green_int.first().copied().unwrap_or(0) as usize;
@@ -10757,10 +10647,7 @@ fn apply_blackhole_crn_handoff(frame: &mut PyFrame, green_int: &[i64]) {
     }
     frame.set_last_instr_from_next_instr(ni);
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
-    if let Some(header) = loop_header_for_exit_pop_jump(code, ni) {
-        frame.set_last_instr_from_next_instr(header);
-        correct_resume_vsd(frame, header);
-    } else if pyre_interpreter::code_pc_is_loop_header(code, ni) {
+    if pyre_interpreter::code_pc_is_loop_header(code, ni) {
         correct_resume_vsd(frame, ni);
     }
 }

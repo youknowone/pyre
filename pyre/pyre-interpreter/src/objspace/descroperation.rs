@@ -4004,10 +4004,8 @@ unsafe fn numeric_operand_overrides(
 /// reflected special method.  The seq/bytes analogs are
 /// [`needs_seq_binop_dispatch`]/[`needs_bytes_binop_dispatch`].
 ///
-/// `dont_look_inside`: the type-static + typeobject-registry loads stay in
-/// this residual helper, off the traced numeric graph; the hot int path is
-/// specialized separately via `guard_class` in the JIT.
-#[majit_macros::dont_look_inside]
+/// `_call_binop_impl` looks inside. Exact builtins take the false arm in
+/// `needs_numeric_binop_dispatch_unless_exact` (`both_exact_builtin_instances_promoted`).
 pub(crate) unsafe fn needs_numeric_binop_dispatch(
     a: PyObjectRef,
     b: PyObjectRef,
