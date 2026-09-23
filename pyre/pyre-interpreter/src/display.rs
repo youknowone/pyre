@@ -358,10 +358,10 @@ fn repr_leave_at(index: usize) {
 /// RAII cycle guard.  `enter` returns `None` when `obj` is already being
 /// repr'd on this thread — the caller emits the `...` placeholder — and
 /// otherwise records `obj`, removing it again when the guard drops.
-pub(crate) struct ReprGuard(Option<usize>);
+pub struct ReprGuard(Option<usize>);
 
 impl ReprGuard {
-    pub(crate) fn enter(obj: PyObjectRef) -> Option<ReprGuard> {
+    pub fn enter(obj: PyObjectRef) -> Option<ReprGuard> {
         repr_enter(obj).then(|| ReprGuard(repr_active().map(|active| active.borrow().len() - 1)))
     }
 }

@@ -7,7 +7,7 @@
 //! Open/Query/Enum/Set/Delete key & value functions are registered when the
 //! `host_env` feature is on (they delegate every Win32 `Reg*` call to
 //! `rustpython_host_env::winreg`).
-crate::py_module! {
+pyre_interpreter::py_module! {
     "winreg",
     int_constants: {
         // Predefined root handles (winreg.h). Python surfaces these as the
@@ -111,11 +111,11 @@ mod imp {
     // read it back.  A closed handle is left as 0.
     // Qualified, so the type reports `winreg` as its `__module__` the way a
     // static type with a dotted `tp_name` does; `__name__` stays `PyHKEY`.
-    crate::py_class! {
+    pyre_interpreter::py_class! {
         "winreg.PyHKEY",
         methods: {
             #[doc = "Closes the underlying Windows handle.\n\nIf the handle is already closed, no error is raised."]
-            fn Close(self_obj: PyObjectRef) -> Result<(), crate::PyError> {
+            fn Close(self_obj: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
                 let raw = take_handle(self_obj);
                 if !raw.is_null() {
                     host_reg::close_key(raw);
@@ -140,7 +140,7 @@ mod imp {
                 _exc_type: PyObjectRef,
                 _exc_value: PyObjectRef,
                 _traceback: PyObjectRef,
-            ) -> Result<bool, crate::PyError> {
+            ) -> Result<bool, pyre_interpreter::PyError> {
                 let raw = take_handle(self_obj);
                 if !raw.is_null() {
                     host_reg::close_key(raw);
@@ -175,7 +175,7 @@ mod imp {
     }
 
     fn store_handle(obj: PyObjectRef, raw: HKEY) {
-        let d = crate::baseobjspace::getdict_native(obj);
+        let d = pyre_interpreter::baseobjspace::getdict_native(obj);
         if !d.is_null() {
             unsafe { w_dict_setitem_str(d, "_handle", int_from_ptr(raw)) };
         }
@@ -201,12 +201,12 @@ mod imp {
     /// The stored `_handle` value, if `obj` is a `PyHKEY`.  `uint_w` reads both
     /// the small-int and long forms a handle pointer may take.
     fn stored_handle(obj: PyObjectRef) -> Option<HKEY> {
-        let d = crate::baseobjspace::getdict_native(obj);
+        let d = pyre_interpreter::baseobjspace::getdict_native(obj);
         if d.is_null() {
             return None;
         }
         let value = unsafe { w_dict_getitem_str(d, "_handle") }?;
-        crate::baseobjspace::uint_w(value)
+        pyre_interpreter::baseobjspace::uint_w(value)
             .ok()
             .map(|u| u as usize as HKEY)
     }
@@ -214,19 +214,19 @@ mod imp {
     /// `PyHKEY_Check` — the handle object this module hands out, and nothing
     /// that merely happens to carry a `_handle` entry.
     fn is_pyhkey(obj: PyObjectRef) -> bool {
-        crate::typedef::r#type(obj).map(|w_type| w_type.as_ptr()) == Some(type_object())
+        pyre_interpreter::typedef::r#type(obj).map(|w_type| w_type.as_ptr()) == Some(type_object())
     }
 
     /// `PyHKEY_AsHKEY` — a key argument is a `PyHKEY`, an integer handle (the
     /// predefined `HKEY_*` roots are published as their pointer value), or
     /// `None` at `CloseKey`, the one boundary that reads it as the null
     /// handle rather than as a mistake.
-    fn as_hkey(obj: PyObjectRef, none_ok: bool) -> Result<HKEY, crate::PyError> {
+    fn as_hkey(obj: PyObjectRef, none_ok: bool) -> Result<HKEY, pyre_interpreter::PyError> {
         if unsafe { is_none(obj) } {
             if none_ok {
                 return Ok(core::ptr::null_mut());
             }
-            return Err(crate::PyError::type_error(
+            return Err(pyre_interpreter::PyError::type_error(
                 "None is not a valid HKEY in this context",
             ));
         }
@@ -234,9 +234,9 @@ mod imp {
             return Ok(get_handle(obj));
         }
         if unsafe { is_int_or_long(obj) } {
-            return Ok(crate::baseobjspace::uint_w(obj)? as usize as HKEY);
+            return Ok(pyre_interpreter::baseobjspace::uint_w(obj)? as usize as HKEY);
         }
-        Err(crate::PyError::type_error(
+        Err(pyre_interpreter::PyError::type_error(
             "The object is not a PyHKEY object",
         ))
     }
@@ -244,8 +244,8 @@ mod imp {
     /// The wording a boundary with no keyword table gives one anyway. It
     /// qualifies itself with the module, which the clinic's keyword binder
     /// does not.
-    fn no_keywords(name: &str) -> crate::PyError {
-        crate::PyError::type_error(format!("winreg.{name}() takes no keyword arguments"))
+    fn no_keywords(name: &str) -> pyre_interpreter::PyError {
+        pyre_interpreter::PyError::type_error(format!("winreg.{name}() takes no keyword arguments"))
     }
 
     /// A positional-only call of fixed arity — `_PyArg_CheckPositional`
@@ -254,13 +254,13 @@ mod imp {
         args: &'a [PyObjectRef],
         name: &str,
         count: usize,
-    ) -> Result<&'a [PyObjectRef], crate::PyError> {
-        let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-        if crate::builtins::has_real_kwargs(kwargs) {
+    ) -> Result<&'a [PyObjectRef], pyre_interpreter::PyError> {
+        let (pos, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
+        if pyre_interpreter::builtins::has_real_kwargs(kwargs) {
             return Err(no_keywords(name));
         }
         if pos.len() != count {
-            return Err(crate::PyError::type_error(format!(
+            return Err(pyre_interpreter::PyError::type_error(format!(
                 "{name} expected {count} arguments, got {}",
                 pos.len()
             )));
@@ -270,13 +270,16 @@ mod imp {
 
     /// `METH_O` — the single key the seven one-argument calls take, whose
     /// count is checked by the call machinery rather than by a converter.
-    fn single_arg(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, crate::PyError> {
-        let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-        if crate::builtins::has_real_kwargs(kwargs) {
+    fn single_arg(
+        args: &[PyObjectRef],
+        name: &str,
+    ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+        let (pos, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
+        if pyre_interpreter::builtins::has_real_kwargs(kwargs) {
             return Err(no_keywords(name));
         }
         if pos.len() != 1 {
-            return Err(crate::PyError::type_error(format!(
+            return Err(pyre_interpreter::PyError::type_error(format!(
                 "winreg.{name}() takes exactly one argument ({} given)",
                 pos.len()
             )));
@@ -296,10 +299,10 @@ mod imp {
         args: &[PyObjectRef],
         name: &str,
         params: [&str; 4],
-    ) -> Result<[Option<PyObjectRef>; 4], crate::PyError> {
-        let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    ) -> Result<[Option<PyObjectRef>; 4], pyre_interpreter::PyError> {
+        let (pos, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
         if pos.len() > params.len() {
-            return Err(crate::PyError::type_error(format!(
+            return Err(pyre_interpreter::PyError::type_error(format!(
                 "{name}() takes at most {} arguments ({} given)",
                 params.len(),
                 pos.len()
@@ -307,16 +310,23 @@ mod imp {
         }
         let mut bound = [None; 4];
         for (index, key) in params.iter().enumerate() {
-            let value = crate::builtins::bind_pos_or_kw(pos, kwargs, index, key, name, index + 1)?;
+            let value = pyre_interpreter::builtins::bind_pos_or_kw(
+                pos,
+                kwargs,
+                index,
+                key,
+                name,
+                index + 1,
+            )?;
             if value.is_none() && index < 2 {
-                return Err(crate::PyError::type_error(format!(
+                return Err(pyre_interpreter::PyError::type_error(format!(
                     "{name}() missing required argument '{key}' (pos {})",
                     index + 1
                 )));
             }
             bound[index] = value;
         }
-        crate::builtins::kwarg_reject_unknown(kwargs, &params, name)?;
+        pyre_interpreter::builtins::kwarg_reject_unknown(kwargs, &params, name)?;
         Ok(bound)
     }
 
@@ -329,7 +339,7 @@ mod imp {
         label: &str,
         accept_none: bool,
         obj: PyObjectRef,
-    ) -> crate::PyError {
+    ) -> pyre_interpreter::PyError {
         let none = if accept_none { " or None" } else { "" };
         let label = if label.is_empty() {
             String::new()
@@ -341,9 +351,9 @@ mod imp {
         let got = if unsafe { is_none(obj) } {
             "None".to_string()
         } else {
-            crate::error::type_name_of(obj)
+            pyre_interpreter::error::type_name_of(obj)
         };
-        crate::PyError::type_error(format!(
+        pyre_interpreter::PyError::type_error(format!(
             "{func}() argument {label}must be str{none}, not {got}"
         ))
     }
@@ -353,7 +363,7 @@ mod imp {
         obj: PyObjectRef,
         func: &str,
         label: &str,
-    ) -> Result<Option<&'static Wtf8>, crate::PyError> {
+    ) -> Result<Option<&'static Wtf8>, pyre_interpreter::PyError> {
         if unsafe { is_none(obj) } {
             return Ok(None);
         }
@@ -369,7 +379,7 @@ mod imp {
         obj: PyObjectRef,
         func: &str,
         label: &str,
-    ) -> Result<&'static Wtf8, crate::PyError> {
+    ) -> Result<&'static Wtf8, pyre_interpreter::PyError> {
         if unsafe { is_str(obj) } {
             return Ok(unsafe { w_str_get_wtf8(obj) });
         }
@@ -386,14 +396,14 @@ mod imp {
     /// unit that cannot travel, because the terminator is what marks the end;
     /// the size-less `PyUnicode_AsWideCharString` the clinic's `Py_UNICODE`
     /// converter calls refuses it rather than truncating there.
-    fn wide(text: &Wtf8) -> Result<WideCString, crate::PyError> {
+    fn wide(text: &Wtf8) -> Result<WideCString, pyre_interpreter::PyError> {
         WideCString::from_vec(text.encode_wide().collect::<Vec<u16>>())
-            .map_err(|_| crate::PyError::value_error("embedded null character"))
+            .map_err(|_| pyre_interpreter::PyError::value_error("embedded null character"))
     }
 
     /// The name a sub-key argument spells; absent and `None` both mean the key
     /// itself, which the Win32 calls take as the empty name.
-    fn wide_or_empty(text: Option<&Wtf8>) -> Result<WideCString, crate::PyError> {
+    fn wide_or_empty(text: Option<&Wtf8>) -> Result<WideCString, pyre_interpreter::PyError> {
         wide(text.unwrap_or_default())
     }
 
@@ -413,35 +423,35 @@ mod imp {
         max: u64,
         negative: &str,
         too_big: &str,
-    ) -> Result<u64, crate::PyError> {
+    ) -> Result<u64, pyre_interpreter::PyError> {
         let raw = if unsafe { is_bool(value) } {
             (unsafe { pyre_object::boolobject::w_bool_get_value(value) }) as i64 as u64
         } else if unsafe { is_int(value) } {
             let signed = unsafe { pyre_object::intobject::w_int_get_value(value) };
             if signed < 0 {
-                return Err(crate::PyError::overflow_error(negative));
+                return Err(pyre_interpreter::PyError::overflow_error(negative));
             }
             signed as u64
         } else {
             let big = unsafe { pyre_object::w_long_get_value(value) };
             if big.get_sign() < 0 {
-                return Err(crate::PyError::overflow_error(negative));
+                return Err(pyre_interpreter::PyError::overflow_error(negative));
             }
             if pyre_object::longobject::jit_bigint_to_u64_fits(big) == 0 {
-                return Err(crate::PyError::overflow_error(too_big));
+                return Err(pyre_interpreter::PyError::overflow_error(too_big));
             }
             pyre_object::longobject::jit_bigint_to_u64_value(big)
         };
         if raw > max {
-            return Err(crate::PyError::overflow_error(too_big));
+            return Err(pyre_interpreter::PyError::overflow_error(too_big));
         }
         Ok(raw)
     }
 
     /// `_PyLong_UnsignedLong_Converter` — a `DWORD` argument: an access mask,
     /// a reserved word, or a value type.
-    fn dword_arg(obj: PyObjectRef) -> Result<u32, crate::PyError> {
-        let value = crate::baseobjspace::space_index(obj)?;
+    fn dword_arg(obj: PyObjectRef) -> Result<u32, pyre_interpreter::PyError> {
+        let value = pyre_interpreter::baseobjspace::space_index(obj)?;
         unsigned_w(
             value,
             u64::from(u32::MAX),
@@ -452,30 +462,31 @@ mod imp {
     }
 
     /// `_PyLong_AsInt` — the `index` the two Enum calls count with.
-    fn int_arg(obj: PyObjectRef) -> Result<i32, crate::PyError> {
-        let value = crate::baseobjspace::space_index(obj)?;
+    fn int_arg(obj: PyObjectRef) -> Result<i32, pyre_interpreter::PyError> {
+        let value = pyre_interpreter::baseobjspace::space_index(obj)?;
         // `space_index` answers an int, so the only reading left to fail is
         // the width.
-        let raw = crate::baseobjspace::int_w(value).map_err(|_| {
-            crate::PyError::overflow_error("Python int too large to convert to C int")
+        let raw = pyre_interpreter::baseobjspace::int_w(value).map_err(|_| {
+            pyre_interpreter::PyError::overflow_error("Python int too large to convert to C int")
         })?;
-        i32::try_from(raw)
-            .map_err(|_| crate::PyError::overflow_error("Python int too large to convert to C int"))
+        i32::try_from(raw).map_err(|_| {
+            pyre_interpreter::PyError::overflow_error("Python int too large to convert to C int")
+        })
     }
     /// The `OSError` a failed `Reg*` call raises.  These report `LSTATUS`
     /// codes, which are Win32 error codes, so the code is kept in `.winerror`
     /// and `str(e)` opens `[WinError 2]` rather than `[Errno 2]`
     /// (`PyErr_SetFromWindowsErrWithFunction`) -- the errno and its subclass
     /// are derived from it.
-    fn win_err(code: u32) -> crate::PyError {
-        crate::PyError::os_error_win32_syscall2(
+    fn win_err(code: u32) -> pyre_interpreter::PyError {
+        pyre_interpreter::PyError::os_error_win32_syscall2(
             code as i32,
             pyre_object::PY_NULL,
             pyre_object::PY_NULL,
         )
     }
 
-    fn check(code: u32) -> Result<PyObjectRef, crate::PyError> {
+    fn check(code: u32) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         if code != 0 {
             Err(win_err(code))
         } else {
@@ -559,12 +570,12 @@ mod imp {
     /// buffer can be taken from — or no exception at all, which the caller
     /// turns into a `ValueError` naming neither.
     enum Py2RegError {
-        Raised(crate::PyError),
+        Raised(pyre_interpreter::PyError),
         Unconvertible,
     }
 
-    impl From<crate::PyError> for Py2RegError {
-        fn from(error: crate::PyError) -> Self {
+    impl From<pyre_interpreter::PyError> for Py2RegError {
+        fn from(error: pyre_interpreter::PyError) -> Self {
             Py2RegError::Raised(error)
         }
     }
@@ -638,10 +649,12 @@ mod imp {
                 if unsafe { pyre_object::bytesobject::is_bytes_like(value) } {
                     Ok(unsafe { pyre_object::bytesobject::bytes_like_data(value) }.to_vec())
                 } else {
-                    Err(Py2RegError::Raised(crate::PyError::type_error(format!(
-                        "Objects of type '{}' can not be used as binary registry values",
-                        crate::error::type_name_of(value)
-                    ))))
+                    Err(Py2RegError::Raised(pyre_interpreter::PyError::type_error(
+                        format!(
+                            "Objects of type '{}' can not be used as binary registry values",
+                            pyre_interpreter::error::type_name_of(value)
+                        ),
+                    )))
                 }
             }
         }
@@ -650,7 +663,10 @@ mod imp {
     // ── module functions ──
     /// `OpenKey` and `OpenKeyEx` are one implementation under two names, and
     /// each names itself in what it refuses.
-    fn open_key_named(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, crate::PyError> {
+    fn open_key_named(
+        args: &[PyObjectRef],
+        name: &str,
+    ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         let bound = bind_key_args(args, name, ["key", "sub_key", "reserved", "access"])?;
         let key = as_hkey(bound[0].expect("key is required"), false)?;
         let wide_sub = wide_or_empty(opt_text(
@@ -671,15 +687,15 @@ mod imp {
         Ok(make_pyhkey(out))
     }
 
-    fn open_key(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    fn open_key(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         open_key_named(args, "OpenKey")
     }
 
-    fn open_key_ex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    fn open_key_ex(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         open_key_named(args, "OpenKeyEx")
     }
 
-    fn create_key_ex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    fn create_key_ex(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         // `CreateKey`'s form with the mask to open it under, which is the only
         // way to reach a 32-bit view (`KEY_WOW64_32KEY`) of a key.
         let bound = bind_key_args(
@@ -718,7 +734,7 @@ mod imp {
         Ok(make_pyhkey(out))
     }
 
-    fn delete_key_ex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    fn delete_key_ex(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         // The access mask comes before `reserved` here, the other way round
         // from CreateKeyEx.
         let bound = bind_key_args(
@@ -740,7 +756,7 @@ mod imp {
         check(unsafe { host_reg::delete_key_ex(key, &wide(sub_key)?, access, reserved) })
     }
 
-    fn load_key(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    fn load_key(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         // Restores a hive a `SaveKey` wrote.  Both it and SaveKey need
         // SE_RESTORE_NAME/SE_BACKUP_NAME, so an ordinary account gets
         // ERROR_PRIVILEGE_NOT_HELD rather than a result.
@@ -751,14 +767,14 @@ mod imp {
         check(unsafe { host_reg::load_key(key, &wide(sub_key)?, &wide(file_name)?) })
     }
 
-    fn save_key(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    fn save_key(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         let pos = exact_args(args, "SaveKey", 2)?;
         let key = as_hkey(pos[0], false)?;
         let file_name = req_text(pos[1], "SaveKey", "2")?;
         check(unsafe { host_reg::save_key(key, &wide(file_name)?) })
     }
 
-    fn close_key(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    fn close_key(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         // `PyHKEY_Close` takes `None` as the null handle, so closing what was
         // never opened is not an error.
         let obj = single_arg(args, "CloseKey")?;
@@ -779,7 +795,10 @@ mod imp {
     /// units hold an unpaired surrogate has no spelling it can give back; the
     /// units are read here instead and carried across as themselves
     /// (`PyUnicode_FromWideChar`).
-    fn query_default_value(key: HKEY, sub_key: &WideCStr) -> Result<Wtf8Buf, crate::PyError> {
+    fn query_default_value(
+        key: HKEY,
+        sub_key: &WideCStr,
+    ) -> Result<Wtf8Buf, pyre_interpreter::PyError> {
         use windows_sys::Win32::Foundation::{
             ERROR_FILE_NOT_FOUND, ERROR_INVALID_DATA, ERROR_INVALID_HANDLE, ERROR_MORE_DATA,
         };
@@ -841,7 +860,7 @@ mod imp {
         result
     }
 
-    fn query_value(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    fn query_value(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         let pos = exact_args(args, "QueryValue", 2)?;
         let key = as_hkey(pos[0], false)?;
         let wide_sub = wide_or_empty(opt_text(pos[1], "QueryValue", "2")?)?;
@@ -850,7 +869,7 @@ mod imp {
         )?))
     }
 
-    fn query_value_ex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    fn query_value_ex(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         let pos = exact_args(args, "QueryValueEx", 2)?;
         let key = as_hkey(pos[0], false)?;
         let name = wide_or_empty(opt_text(pos[1], "QueryValueEx", "2")?)?;
@@ -865,7 +884,7 @@ mod imp {
         }
     }
 
-    fn enum_key(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    fn enum_key(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         let pos = exact_args(args, "EnumKey", 2)?;
         let key = as_hkey(pos[0], false)?;
         let index = int_arg(pos[1])? as u32;
@@ -881,7 +900,7 @@ mod imp {
         )))
     }
 
-    fn enum_value(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    fn enum_value(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         let pos = exact_args(args, "EnumValue", 2)?;
         let key = as_hkey(pos[0], false)?;
         let index = int_arg(pos[1])? as u32;
@@ -949,7 +968,7 @@ mod imp {
         }
     }
 
-    fn query_info_key(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    fn query_info_key(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         let key = as_hkey(single_arg(args, "QueryInfoKey")?, false)?;
         match host_reg::query_info_key_full(key) {
             Ok(info) => {
@@ -963,14 +982,14 @@ mod imp {
         }
     }
 
-    fn flush_key(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    fn flush_key(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         check(host_reg::flush_key(as_hkey(
             single_arg(args, "FlushKey")?,
             false,
         )?))
     }
 
-    fn create_key(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    fn create_key(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         let pos = exact_args(args, "CreateKey", 2)?;
         let key = as_hkey(pos[0], false)?;
         let wide_sub = wide_or_empty(opt_text(pos[1], "CreateKey", "2")?)?;
@@ -982,7 +1001,7 @@ mod imp {
         Ok(make_pyhkey(out))
     }
 
-    fn set_value(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    fn set_value(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         // SetValue only writes REG_SZ, and the type is read before it is
         // judged, so a non-integer is an integer's complaint rather than the
         // wrong-type one.  Every argument is spelled before any of them is
@@ -994,13 +1013,17 @@ mod imp {
         let typ = dword_arg(pos[2])?;
         let value = req_text(pos[3], "SetValue", "4")?;
         if typ != host_reg::REG_SZ {
-            return Err(crate::PyError::type_error("type must be winreg.REG_SZ"));
+            return Err(pyre_interpreter::PyError::type_error(
+                "type must be winreg.REG_SZ",
+            ));
         }
         // `(length + 1) * sizeof(WCHAR)` — the stored `REG_SZ` carries its
         // terminator, and the byte count has to fit a `DWORD`.
         let units: Vec<u16> = value.encode_wide().chain(std::iter::once(0)).collect();
         if u32::try_from(units.len() * size_of::<u16>()).is_err() {
-            return Err(crate::PyError::overflow_error("value is too long"));
+            return Err(pyre_interpreter::PyError::overflow_error(
+                "value is too long",
+            ));
         }
         if key == host_reg::HKEY_PERFORMANCE_DATA {
             use windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE;
@@ -1014,7 +1037,7 @@ mod imp {
         ))
     }
 
-    fn set_value_ex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    fn set_value_ex(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         let pos = exact_args(args, "SetValueEx", 5)?;
         let key = as_hkey(pos[0], false)?;
         let name = opt_text(pos[1], "SetValueEx", "2")?;
@@ -1023,9 +1046,9 @@ mod imp {
         let typ = dword_arg(pos[3])?;
         let data = py2reg(pos[4], typ).map_err(|error| match error {
             Py2RegError::Raised(error) => error,
-            Py2RegError::Unconvertible => {
-                crate::PyError::value_error("Could not convert the data to the specified type.")
-            }
+            Py2RegError::Unconvertible => pyre_interpreter::PyError::value_error(
+                "Could not convert the data to the specified type.",
+            ),
         })?;
         let wide_name = name.map(wide).transpose()?;
         let rc = unsafe {
@@ -1043,14 +1066,14 @@ mod imp {
         Ok(w_none())
     }
 
-    fn delete_key(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    fn delete_key(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         let pos = exact_args(args, "DeleteKey", 2)?;
         let key = as_hkey(pos[0], false)?;
         let sub_key = req_text(pos[1], "DeleteKey", "2")?;
         check(unsafe { host_reg::delete_key(key, &wide(sub_key)?) })
     }
 
-    fn delete_value(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    fn delete_value(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         let pos = exact_args(args, "DeleteValue", 2)?;
         let key = as_hkey(pos[0], false)?;
         let name = opt_text(pos[1], "DeleteValue", "2")?;
@@ -1058,7 +1081,7 @@ mod imp {
         check(unsafe { host_reg::delete_value(key, wide_name.as_deref()) })
     }
 
-    fn connect_registry(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    fn connect_registry(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         let pos = exact_args(args, "ConnectRegistry", 2)?;
         let computer = opt_text(pos[0], "ConnectRegistry", "1")?;
         let key = as_hkey(pos[1], false)?;
@@ -1082,7 +1105,9 @@ mod imp {
             .map(|units| Wtf8Buf::from_wide(&units))
     }
 
-    fn expand_environment_strings(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    fn expand_environment_strings(
+        args: &[PyObjectRef],
+    ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         // The only boundary whose refusal names neither a parameter nor a
         // position, because it has just the one argument.
         let input = req_text(
@@ -1098,21 +1123,27 @@ mod imp {
         }
     }
 
-    fn disable_reflection_key(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    fn disable_reflection_key(
+        args: &[PyObjectRef],
+    ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         check(host_reg::disable_reflection_key(as_hkey(
             single_arg(args, "DisableReflectionKey")?,
             false,
         )?))
     }
 
-    fn enable_reflection_key(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    fn enable_reflection_key(
+        args: &[PyObjectRef],
+    ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         check(host_reg::enable_reflection_key(as_hkey(
             single_arg(args, "EnableReflectionKey")?,
             false,
         )?))
     }
 
-    fn query_reflection_key(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    fn query_reflection_key(
+        args: &[PyObjectRef],
+    ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         let key = as_hkey(single_arg(args, "QueryReflectionKey")?, false)?;
         let mut disabled: i32 = 0;
         let rc = unsafe { host_reg::query_reflection_key(key, &mut disabled) };
@@ -1125,7 +1156,7 @@ mod imp {
     pub fn install(ns: PyObjectRef) {
         // The handle type is bound under one name only: the class calls itself
         // `PyHKEY`, and `winreg` publishes it as `HKEYType`.
-        crate::module_ns_store(ns, "HKEYType", type_object());
+        pyre_interpreter::module_ns_store(ns, "HKEYType", type_object());
         // `Py_tp_doc`, and the signature line clinic writes ahead of each
         // `PyHKEY_methods` docstring. The type has just been built by the line
         // above and nothing has read it yet, so the class dict takes them
@@ -1149,13 +1180,16 @@ mod imp {
                 let Some(function) = pyre_object::w_dict_getitem_str(class_ns, method) else {
                     continue;
                 };
-                crate::function::fset_func_text_signature(function, w_str_new(signature));
+                pyre_interpreter::function::fset_func_text_signature(
+                    function,
+                    w_str_new(signature),
+                );
             }
         }
         // `winreg.error` is `OSError` itself rather than a module-specific
         // class, so `except winreg.error` catches what the Reg* calls raise.
-        if let Some(os_error) = crate::builtins::lookup_exc_class("OSError") {
-            crate::module_ns_store(ns, "error", os_error);
+        if let Some(os_error) = pyre_interpreter::builtins::lookup_exc_class("OSError") {
+            pyre_interpreter::module_ns_store(ns, "error", os_error);
         }
         // The predefined roots are exposed as their full (sign-extended)
         // pointer value, matching `PyLong_FromVoidPtr` — this overrides the
@@ -1169,7 +1203,7 @@ mod imp {
             ("HKEY_CURRENT_CONFIG", host_reg::HKEY_CURRENT_CONFIG),
             ("HKEY_DYN_DATA", host_reg::HKEY_DYN_DATA),
         ] {
-            crate::module_ns_store(ns, name, int_from_ptr(root));
+            pyre_interpreter::module_ns_store(ns, name, int_from_ptr(root));
         }
         // Each call carries the clinic's own signature line and
         // docstring, which is what `help(winreg.X)` and
@@ -1177,7 +1211,7 @@ mod imp {
         for (name, func, signature, doc) in [
             (
                 "OpenKey",
-                open_key as fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+                open_key as fn(&[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError>,
                 "($module, /, key, sub_key, reserved=0, access=winreg.KEY_READ)",
                 "Opens the specified key.\n\n  key\n    An already open key, or any one of the predefined HKEY_* constants.\n  sub_key\n    A string that identifies the sub_key to open.\n  reserved\n    A reserved integer that must be zero.  Default is zero.\n  access\n    An integer that specifies an access mask that describes the desired\n    security access for the key.  Default is KEY_READ.\n\nThe result is a new handle to the specified key.\nIf the function fails, an OSError exception is raised.",
             ),
@@ -1314,14 +1348,14 @@ mod imp {
                 "Returns the reflection state for the specified key as a bool.\n\n  key\n    An already open key, or any one of the predefined HKEY_* constants.\n\nWill generally raise NotImplementedError if executed on a 32bit OS.",
             ),
         ] {
-            let function = crate::make_builtin_function_with_doc(name, func, doc);
+            let function = pyre_interpreter::make_builtin_function_with_doc(name, func, doc);
             unsafe {
-                crate::function::fset_func_text_signature(
+                pyre_interpreter::function::fset_func_text_signature(
                     function,
                     pyre_object::w_str_new(signature),
                 );
             }
-            crate::module_ns_store(ns, name, function);
+            pyre_interpreter::module_ns_store(ns, name, function);
         }
     }
 }

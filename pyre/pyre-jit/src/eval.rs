@@ -1051,7 +1051,7 @@ unsafe fn overlapped_destructor(obj_addr: usize) {
 #[cfg(all(windows, not(feature = "sandbox")))]
 unsafe fn winapi_overlapped_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_winapi::overlapped::w_overlapped_dealloc(
+        pyre_module::module::_winapi::overlapped::w_overlapped_dealloc(
             obj_addr as pyre_object::PyObjectRef,
         )
     };
@@ -4067,7 +4067,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_interpreter::module::_functools::W_KeyWrapper
+        <pyre_module::module::_functools::W_KeyWrapper
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     // `unicodedata.UCD` and `__pypy__.Bufferable`: `allocate_stable` types with
@@ -4562,7 +4562,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     // is freed, then closes that event.
     #[cfg(all(windows, not(feature = "sandbox")))]
     {
-        let descr = <pyre_interpreter::module::_winapi::overlapped::W_Overlapped
+        let descr = <pyre_module::module::_winapi::overlapped::W_Overlapped
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
         let tid = register_pyre_class(&mut gc, &mut pytype_to_tid, descr);
         gc.types.set_destructor(tid, winapi_overlapped_destructor);

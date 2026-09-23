@@ -31,17 +31,17 @@ use windows_sys::Win32::Foundation::HANDLE;
 #[cfg(feature = "host_env")]
 use rustpython_host_env::winapi as host_winapi;
 
-use crate::PyError;
+use pyre_interpreter::PyError;
 
 /// Map the current thread's last OS error to an `OSError`
 /// (`PyErr_SetFromWindowsErr`): the code is the one `winerror` reports.
-fn last_os_error() -> crate::PyError {
+fn last_os_error() -> pyre_interpreter::PyError {
     win32_err(std::io::Error::last_os_error())
 }
 
 /// The `OSError` a failed Win32 call reports (`PyErr_SetFromWindowsErr`).
-fn win32_err(error: std::io::Error) -> crate::PyError {
-    crate::PyError::os_error_win32_syscall2(
+fn win32_err(error: std::io::Error) -> pyre_interpreter::PyError {
+    pyre_interpreter::PyError::os_error_win32_syscall2(
         error.raw_os_error().unwrap_or(0),
         pyre_object::PY_NULL,
         pyre_object::PY_NULL,
@@ -50,8 +50,12 @@ fn win32_err(error: std::io::Error) -> crate::PyError {
 
 /// [`win32_err`] for a call that reports its error code rather than setting
 /// the thread's.
-fn win32_code(code: u32) -> crate::PyError {
-    crate::PyError::os_error_win32_syscall2(code as i32, pyre_object::PY_NULL, pyre_object::PY_NULL)
+fn win32_code(code: u32) -> pyre_interpreter::PyError {
+    pyre_interpreter::PyError::os_error_win32_syscall2(
+        code as i32,
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+    )
 }
 
 /// How a call names an integer argument in the `TypeError` it raises for one
@@ -72,9 +76,9 @@ enum IntArg<'a> {
 /// be written either way round too.
 fn masked_int_w(w_value: pyre_object::PyObjectRef, argument: IntArg<'_>) -> Result<i64, PyError> {
     if !unsafe { pyre_object::pyobject::is_int_or_long(w_value) }
-        && unsafe { crate::baseobjspace::lookup(w_value, "__index__") }.is_none()
+        && unsafe { pyre_interpreter::baseobjspace::lookup(w_value, "__index__") }.is_none()
     {
-        let got = crate::gateway::short_type_name(w_value);
+        let got = pyre_interpreter::gateway::short_type_name(w_value);
         return Err(PyError::type_error(match argument {
             IntArg::Only(function) => format!("{function}() argument must be int, not {got}"),
             IntArg::At { function, position } => {
@@ -86,7 +90,9 @@ fn masked_int_w(w_value: pyre_object::PyObjectRef, argument: IntArg<'_>) -> Resu
     // `PyLong_AsNativeBytes` reads the value under
     // `Py_ASNATIVEBYTES_ALLOW_INDEX`, so `__index__` decides it and `__int__`
     // is never asked for one.
-    crate::baseobjspace::truncatedint_w(crate::baseobjspace::space_index(w_value)?)
+    pyre_interpreter::baseobjspace::truncatedint_w(pyre_interpreter::baseobjspace::space_index(
+        w_value,
+    )?)
 }
 
 /// [`masked_int_w`] for a `HANDLE` parameter.
@@ -135,16 +141,20 @@ mod process {
 
     use super::{IntArg, handle_w, w_handle, win32_err};
 
-    fn arg(args: &[PyObjectRef], index: usize, name: &str) -> Result<PyObjectRef, crate::PyError> {
+    fn arg(
+        args: &[PyObjectRef],
+        index: usize,
+        name: &str,
+    ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         args.get(index).copied().ok_or_else(|| {
-            crate::PyError::type_error(format!("{name}() missing required argument"))
+            pyre_interpreter::PyError::type_error(format!("{name}() missing required argument"))
         })
     }
 
     /// `_winapi.GetStdHandle(std_handle)` — `None` for a stream the process
     /// does not have, which is what the caller tests for before making a pipe
     /// of its own.
-    pub fn get_std_handle(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    pub fn get_std_handle(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         let id = super::dword_w(arg(args, 0, "GetStdHandle")?, IntArg::Only("GetStdHandle"))?;
         match host_winapi::get_std_handle(id) {
             Ok(Some(handle)) => Ok(w_handle(handle)),
@@ -155,13 +165,15 @@ mod process {
 
     /// `_winapi.GetCurrentProcess()` — the pseudo handle, which names this
     /// process to `DuplicateHandle` without being a handle to close.
-    pub fn get_current_process(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    pub fn get_current_process(
+        _args: &[PyObjectRef],
+    ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         Ok(w_handle(host_winapi::get_current_process()))
     }
 
     /// `_winapi.GetFileType(handle)` — a console handle is the one kind that
     /// cannot be passed in an inherited handle list.
-    pub fn get_file_type(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    pub fn get_file_type(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         let handle = handle_w(arg(args, 0, "GetFileType")?, IntArg::Only("GetFileType"))?;
         host_winapi::get_file_type(handle)
             .map(|file_type| w_int_new(file_type as i64))
@@ -169,7 +181,7 @@ mod process {
     }
 
     /// `_winapi.GetLastError()`
-    pub fn get_last_error(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    pub fn get_last_error(_args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         Ok(w_int_new(host_winapi::get_last_error() as i64))
     }
 
@@ -191,7 +203,9 @@ mod process {
     /// because on a truncation the call reports the whole buffer while the
     /// loader has already terminated the string inside it — taking the reported
     /// count would append that terminator to the path.
-    pub fn get_module_file_name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    pub fn get_module_file_name(
+        args: &[PyObjectRef],
+    ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         const MAX_PATH: usize = 260;
         let module = handle_w(
             arg(args, 0, "GetModuleFileName")?,
@@ -210,7 +224,9 @@ mod process {
     }
 
     /// `_winapi.TerminateProcess(handle, exit_code)`
-    pub fn terminate_process(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    pub fn terminate_process(
+        args: &[PyObjectRef],
+    ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         let handle = handle_w(
             arg(args, 0, "TerminateProcess")?,
             IntArg::At {
@@ -235,7 +251,7 @@ mod process {
     /// attributes argument is the security descriptor, which the call takes
     /// the default of; neither end is inheritable until one is duplicated
     /// into an inheritable copy.
-    pub fn create_pipe(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    pub fn create_pipe(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         let size = super::dword_w(
             arg(args, 1, "CreatePipe")?,
             IntArg::At {
@@ -252,7 +268,9 @@ mod process {
 
     /// `_winapi.DuplicateHandle(source_process, source, target_process,
     /// desired_access, inherit_handle, options=0)` -> handle
-    pub fn duplicate_handle(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    pub fn duplicate_handle(
+        args: &[PyObjectRef],
+    ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         const NAME: &str = "DuplicateHandle";
         let at = |position| IntArg::At {
             function: NAME,
@@ -262,7 +280,7 @@ mod process {
         let source = handle_w(arg(args, 1, NAME)?, at(2))?;
         let target_process = handle_w(arg(args, 2, NAME)?, at(3))?;
         let access = super::dword_w(arg(args, 3, NAME)?, at(4))?;
-        let inherit = crate::baseobjspace::index_c_int_w(arg(args, 4, NAME)?)?;
+        let inherit = pyre_interpreter::baseobjspace::index_c_int_w(arg(args, 4, NAME)?)?;
         let options = match args.get(5) {
             Some(&w) => super::dword_w(w, at(6))?,
             None => 0,
@@ -291,7 +309,7 @@ mod process {
     ///
     /// `LCMapStringEx` reports `ERROR_INVALID_PARAMETER` for an empty name,
     /// and that is the error an empty name raises.
-    fn environment_sort_key(name: &[u16]) -> Result<Wtf8Buf, crate::PyError> {
+    fn environment_sort_key(name: &[u16]) -> Result<Wtf8Buf, pyre_interpreter::PyError> {
         // `LOCALE_NAME_INVARIANT` is the empty locale name.
         let mapped = host_winapi::lc_map_string_ex(&WideCString::new(), LCMAP_UPPERCASE, name)
             .map_err(win32_err)?;
@@ -321,22 +339,24 @@ mod process {
     /// last spelling — and that spelling's value — is the one carried.  Names
     /// and values travel as UTF-16 throughout, so an unpaired surrogate
     /// reaches the child as the code unit it is.
-    fn environment_block(w_env: PyObjectRef) -> Result<Vec<u16>, crate::PyError> {
+    fn environment_block(w_env: PyObjectRef) -> Result<Vec<u16>, pyre_interpreter::PyError> {
         const EQUALS: u16 = b'=' as u16;
 
         // What a subscript cannot be taken from is no mapping.
-        if unsafe { crate::baseobjspace::lookup(w_env, "__getitem__") }.is_none() {
-            return Err(crate::PyError::type_error(
+        if unsafe { pyre_interpreter::baseobjspace::lookup(w_env, "__getitem__") }.is_none() {
+            return Err(pyre_interpreter::PyError::type_error(
                 "environment must be dictionary or None",
             ));
         }
-        let w_keys = crate::baseobjspace::call_method(w_env, "keys", &[]);
+        let w_keys = pyre_interpreter::baseobjspace::call_method(w_env, "keys", &[]);
         if w_keys.is_null() {
-            return Err(crate::call::take_call_error().unwrap_or_else(|| {
-                crate::PyError::type_error("environment must be dictionary or None")
-            }));
+            return Err(
+                pyre_interpreter::call::take_call_error().unwrap_or_else(|| {
+                    pyre_interpreter::PyError::type_error("environment must be dictionary or None")
+                }),
+            );
         }
-        let keys = crate::baseobjspace::unpackiterable(w_keys, -1)?;
+        let keys = pyre_interpreter::baseobjspace::unpackiterable(w_keys, -1)?;
         // `getitem` runs the mapping's own `__getitem__`, which allocates, so
         // the mapping and every key are published and read back per iteration
         // rather than kept in plain locals.
@@ -354,7 +374,7 @@ mod process {
                 // The sort maps the name through `PyUnicode_AsWideCharString`,
                 // which answers a name that is no string with
                 // `PyErr_BadArgument` rather than a message of its own.
-                return Err(crate::PyError::type_error(
+                return Err(pyre_interpreter::PyError::type_error(
                     "bad argument type for built-in operation",
                 ));
             }
@@ -380,14 +400,16 @@ mod process {
                 // never gets to; the last name enters no comparison and so is
                 // spelled only there.
                 if name.contains(&0) || next.contains(&0) {
-                    return Err(crate::PyError::value_error("embedded null character"));
+                    return Err(pyre_interpreter::PyError::value_error(
+                        "embedded null character",
+                    ));
                 }
                 if environment_names_equal(&name, next) {
                     continue;
                 }
             }
             let _entry_roots = pyre_object::gc_roots::push_roots();
-            let w_value = crate::baseobjspace::getitem(
+            let w_value = pyre_interpreter::baseobjspace::getitem(
                 pyre_object::gc_roots::shadow_stack_get(env_slot),
                 pyre_object::gc_roots::shadow_stack_get(keys_base + index),
             )?;
@@ -404,12 +426,14 @@ mod process {
         let mut block = Vec::new();
         for (name, value) in entries {
             let Some(value) = value else {
-                return Err(crate::PyError::type_error(
+                return Err(pyre_interpreter::PyError::type_error(
                     "environment can only contain strings",
                 ));
             };
             if name.contains(&0) || value.contains(&0) {
-                return Err(crate::PyError::value_error("embedded null character"));
+                return Err(pyre_interpreter::PyError::value_error(
+                    "embedded null character",
+                ));
             }
             // The `=` is looked for from the second unit on, because a name
             // that starts with one is a hidden per-drive variable and the
@@ -418,7 +442,7 @@ mod process {
             // plane, and the second unit of an astral name is a low surrogate
             // rather than any character.
             if name.is_empty() || name[1..].contains(&EQUALS) {
-                return Err(crate::PyError::value_error(
+                return Err(pyre_interpreter::PyError::value_error(
                     "illegal environment variable name",
                 ));
             }
@@ -438,12 +462,15 @@ mod process {
 
     /// Read one of `STARTUPINFO`'s fields.  A field left as `None` is the
     /// zero the structure is built with (`getulong` / `gethandle`).
-    fn startup_info_field(w_info: PyObjectRef, name: &str) -> Result<i64, crate::PyError> {
-        let w_value = crate::baseobjspace::getattr_str(w_info, name)?;
+    fn startup_info_field(
+        w_info: PyObjectRef,
+        name: &str,
+    ) -> Result<i64, pyre_interpreter::PyError> {
+        let w_value = pyre_interpreter::baseobjspace::getattr_str(w_info, name)?;
         if unsafe { pyre_object::is_none(w_value) } {
             return Ok(0);
         }
-        crate::baseobjspace::int_w(w_value)
+        pyre_interpreter::baseobjspace::int_w(w_value)
     }
 
     /// The handles `lpAttributeList["handle_list"]` names, which are the ones
@@ -453,8 +480,8 @@ mod process {
     /// handle, and `getattributelist` drops it rather than building one that
     /// `CreateProcess` answers `ERROR_BAD_LENGTH` to.  `subprocess.STARTUPINFO`
     /// starts out with exactly that empty list.
-    fn handle_list(w_info: PyObjectRef) -> Result<Option<Vec<usize>>, crate::PyError> {
-        let w_attrs = crate::baseobjspace::getattr_str(w_info, "lpAttributeList")?;
+    fn handle_list(w_info: PyObjectRef) -> Result<Option<Vec<usize>>, pyre_interpreter::PyError> {
+        let w_attrs = pyre_interpreter::baseobjspace::getattr_str(w_info, "lpAttributeList")?;
         if w_attrs.is_null() || !unsafe { pyre_object::is_dict(w_attrs) } {
             return Ok(None);
         }
@@ -462,13 +489,13 @@ mod process {
         else {
             return Ok(None);
         };
-        let items = crate::baseobjspace::unpackiterable(w_handles, -1)?;
+        let items = pyre_interpreter::baseobjspace::unpackiterable(w_handles, -1)?;
         if items.is_empty() {
             return Ok(None);
         }
         let mut handles = Vec::with_capacity(items.len());
         for w_handle in items {
-            handles.push(crate::baseobjspace::int_w(w_handle)? as usize);
+            handles.push(pyre_interpreter::baseobjspace::int_w(w_handle)? as usize);
         }
         Ok(Some(handles))
     }
@@ -479,7 +506,7 @@ mod process {
     ///
     /// The two attribute arguments are security descriptors, which the call
     /// takes the defaults of.
-    pub fn create_process(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    pub fn create_process(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         use super::host::{WideArg, wide_or_none};
 
         let application_name = wide_or_none(arg(args, 0, "CreateProcess")?, WideArg::Unnamed)?;
@@ -493,8 +520,10 @@ mod process {
             },
         )?
         .map(|line| line.into_vec_with_nul());
-        let inherit_handles = crate::baseobjspace::int_w(arg(args, 4, "CreateProcess")?)?;
-        let creation_flags = crate::baseobjspace::c_uint_w(arg(args, 5, "CreateProcess")?)?;
+        let inherit_handles =
+            pyre_interpreter::baseobjspace::int_w(arg(args, 4, "CreateProcess")?)?;
+        let creation_flags =
+            pyre_interpreter::baseobjspace::c_uint_w(arg(args, 5, "CreateProcess")?)?;
         let w_env = arg(args, 6, "CreateProcess")?;
         let environment = if w_env.is_null() || unsafe { pyre_object::is_none(w_env) } {
             None
@@ -532,7 +561,7 @@ mod process {
     }
 }
 
-crate::py_module! {
+pyre_interpreter::py_module! {
     "_winapi",
     int_constants: {
         // CopyFileEx / CopyFile2 flags (winbase.h).
@@ -699,18 +728,18 @@ crate::py_module! {
     inline_functions: {
         fn NeedCurrentDirectoryForExePath(
             exe_name: &str,
-        ) -> Result<bool, crate::PyError> {
+        ) -> Result<bool, pyre_interpreter::PyError> {
             // The wide string ends at its first NUL, so a name carrying one
             // would be answered for a shorter name than was passed.
             let mut exe_name_w: Vec<u16> = exe_name.encode_utf16().collect();
             if exe_name_w.contains(&0) {
-                return Err(crate::PyError::value_error("embedded null character"));
+                return Err(pyre_interpreter::PyError::value_error("embedded null character"));
             }
             exe_name_w.push(0);
             #[cfg(not(feature = "host_env"))]
             {
                 let _ = exe_name_w;
-                return Err(crate::PyError::not_implemented(
+                return Err(pyre_interpreter::PyError::not_implemented(
                     "_winapi.NeedCurrentDirectoryForExePath requires host_env",
                 ));
             }
@@ -724,12 +753,12 @@ crate::py_module! {
         // `subprocess.Handle.Close` captures `_winapi.CloseHandle` as a default
         // argument at class-definition time, so the attribute must exist for
         // `import subprocess` to succeed.
-        fn CloseHandle(handle: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
+        fn CloseHandle(handle: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
             let handle = handle_w(handle, IntArg::Only("CloseHandle"))?;
             #[cfg(not(feature = "host_env"))]
             {
                 let _ = handle;
-                return Err(crate::PyError::not_implemented(
+                return Err(pyre_interpreter::PyError::not_implemented(
                     "_winapi.CloseHandle requires host_env",
                 ));
             }
@@ -748,7 +777,7 @@ crate::py_module! {
         fn WaitForSingleObject(
             handle: pyre_object::PyObjectRef,
             milliseconds: pyre_object::PyObjectRef,
-        ) -> Result<i64, crate::PyError> {
+        ) -> Result<i64, pyre_interpreter::PyError> {
             const NAME: &str = "WaitForSingleObject";
             let handle = handle_w(handle, IntArg::At { function: NAME, position: 1 })?;
             let milliseconds =
@@ -764,13 +793,13 @@ crate::py_module! {
             #[cfg(not(feature = "host_env"))]
             {
                 let _ = (handle, milliseconds);
-                return Err(crate::PyError::not_implemented(
+                return Err(pyre_interpreter::PyError::not_implemented(
                     "_winapi.WaitForSingleObject requires host_env",
                 ));
             }
             #[cfg(feature = "host_env")]
             let (result, error) = {
-                let _blocked = crate::module::thread::before_external_block();
+                let _blocked = pyre_interpreter::module::thread::before_external_block();
                 let result = host_winapi::wait_for_single_object(handle, milliseconds);
                 match result {
                     Ok(result) => (result, 0),
@@ -785,12 +814,12 @@ crate::py_module! {
             }
             Ok(i64::from(result))
         }
-        fn GetExitCodeProcess(handle: pyre_object::PyObjectRef) -> Result<i64, crate::PyError> {
+        fn GetExitCodeProcess(handle: pyre_object::PyObjectRef) -> Result<i64, pyre_interpreter::PyError> {
             let handle = handle_w(handle, IntArg::Only("GetExitCodeProcess"))?;
             #[cfg(not(feature = "host_env"))]
             {
                 let _ = handle;
-                return Err(crate::PyError::not_implemented(
+                return Err(pyre_interpreter::PyError::not_implemented(
                     "_winapi.GetExitCodeProcess requires host_env",
                 ));
             }
@@ -803,7 +832,7 @@ crate::py_module! {
     extra_init: |ns| {
         // The handle sentinel is `(HANDLE)-1` (handleapi.h), which prints as
         // the unsigned value and so does not fit the `int_constants` table.
-        crate::module_ns_store(
+        pyre_interpreter::module_ns_store(
             ns,
             "INVALID_HANDLE_VALUE",
             w_handle(windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE),
@@ -815,7 +844,7 @@ crate::py_module! {
         {
             host::install(ns);
             for (name, arity, function) in [
-                ("GetStdHandle", 1, process::get_std_handle as crate::BuiltinCodeFn),
+                ("GetStdHandle", 1, process::get_std_handle as pyre_interpreter::BuiltinCodeFn),
                 ("GetCurrentProcess", 0, process::get_current_process),
                 ("GetFileType", 1, process::get_file_type),
                 ("GetLastError", 0, process::get_last_error),
@@ -823,12 +852,12 @@ crate::py_module! {
                 ("TerminateProcess", 2, process::terminate_process),
                 ("CreatePipe", 2, process::create_pipe),
             ] {
-                crate::module_ns_store(
+                pyre_interpreter::module_ns_store(
                     ns,
                     name,
-                    crate::gateway::with_module(
+                    pyre_interpreter::gateway::with_module(
                         "_winapi",
-                        crate::make_module_builtin_function_with_arity(name, function, arity),
+                        pyre_interpreter::make_module_builtin_function_with_arity(name, function, arity),
                     ),
                 );
             }
@@ -836,14 +865,14 @@ crate::py_module! {
             // arguments (`gateway.py BuiltinCode0..BuiltinCode4`), and
             // CreateProcess takes nine. It still needs an exact-arity check, so
             // register it through the general call path with a checked body.
-            crate::module_ns_store(
+            pyre_interpreter::module_ns_store(
                 ns,
                 "CreateProcess",
-                crate::gateway::with_module(
+                pyre_interpreter::gateway::with_module(
                     "_winapi",
-                    crate::make_module_builtin_function(
+                    pyre_interpreter::make_module_builtin_function(
                         "CreateProcess",
-                        crate::py_checked_arity_fn!(
+                        pyre_interpreter::py_checked_arity_fn!(
                             "CreateProcess",
                             9,
                             process::create_process
@@ -853,12 +882,12 @@ crate::py_module! {
             );
             // `options` is the one argument with a default (`0`), so the
             // count is not fixed.
-            crate::module_ns_store(
+            pyre_interpreter::module_ns_store(
                 ns,
                 "DuplicateHandle",
-                crate::gateway::with_module(
+                pyre_interpreter::gateway::with_module(
                     "_winapi",
-                    crate::make_module_builtin_function(
+                    pyre_interpreter::make_module_builtin_function(
                         "DuplicateHandle",
                         process::duplicate_handle,
                     ),

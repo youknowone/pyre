@@ -21,8 +21,12 @@ use super::{IntArg, handle_w, w_handle, win32_code};
 
 /// [`super::win32_err`] for the two file-mapping calls, which name the mapping
 /// in the error the way a failed open names its file.
-fn win32_err_named(error: std::io::Error, w_name: PyObjectRef) -> crate::PyError {
-    crate::PyError::os_error_win32_syscall2(error.raw_os_error().unwrap_or(0), w_name, PY_NULL)
+fn win32_err_named(error: std::io::Error, w_name: PyObjectRef) -> pyre_interpreter::PyError {
+    pyre_interpreter::PyError::os_error_win32_syscall2(
+        error.raw_os_error().unwrap_or(0),
+        w_name,
+        PY_NULL,
+    )
 }
 
 /// How a call names a wide-string argument in the `TypeError` it raises for a
@@ -47,7 +51,7 @@ pub(super) enum WideArg<'a> {
 pub(super) fn wide(
     w_text: PyObjectRef,
     argument: WideArg<'_>,
-) -> Result<WideCString, crate::PyError> {
+) -> Result<WideCString, pyre_interpreter::PyError> {
     if !unsafe { pyre_object::is_str(w_text) } {
         return Err(wide_type_error(&argument, "str", w_text));
     }
@@ -56,15 +60,22 @@ pub(super) fn wide(
     // terminator it appends itself and accept the string.
     let units = wide_units(w_text);
     if units.contains(&0) {
-        return Err(crate::PyError::value_error("embedded null character"));
+        return Err(pyre_interpreter::PyError::value_error(
+            "embedded null character",
+        ));
     }
-    WideCString::from_vec(units).map_err(|_| crate::PyError::value_error("embedded null character"))
+    WideCString::from_vec(units)
+        .map_err(|_| pyre_interpreter::PyError::value_error("embedded null character"))
 }
 
 /// The `TypeError` a wide-string argument raises for a value it cannot take.
-fn wide_type_error(argument: &WideArg<'_>, accepted: &str, w_text: PyObjectRef) -> crate::PyError {
-    let got = crate::gateway::short_type_name(w_text);
-    crate::PyError::type_error(match argument {
+fn wide_type_error(
+    argument: &WideArg<'_>,
+    accepted: &str,
+    w_text: PyObjectRef,
+) -> pyre_interpreter::PyError {
+    let got = pyre_interpreter::gateway::short_type_name(w_text);
+    pyre_interpreter::PyError::type_error(match argument {
         WideArg::Unnamed => format!("argument must be {accepted}, not {got}"),
         WideArg::Named { function, argument } => {
             format!("{function}() argument '{argument}' must be {accepted}, not {got}")
@@ -80,7 +91,7 @@ fn wide_type_error(argument: &WideArg<'_>, accepted: &str, w_text: PyObjectRef) 
 pub(super) fn wide_or_none(
     w_text: PyObjectRef,
     argument: WideArg<'_>,
-) -> Result<Option<WideCString>, crate::PyError> {
+) -> Result<Option<WideCString>, pyre_interpreter::PyError> {
     if w_text.is_null() || unsafe { pyre_object::is_none(w_text) } {
         return Ok(None);
     }
@@ -107,27 +118,27 @@ fn w_wide(units: &[u16]) -> PyObjectRef {
 }
 
 /// A `DWORD` argument `None` leaves alone.
-fn c_uint_or_none(w_value: PyObjectRef) -> Result<Option<u32>, crate::PyError> {
+fn c_uint_or_none(w_value: PyObjectRef) -> Result<Option<u32>, pyre_interpreter::PyError> {
     if unsafe { pyre_object::is_none(w_value) } {
         return Ok(None);
     }
-    crate::baseobjspace::c_uint_w(w_value).map(Some)
+    pyre_interpreter::baseobjspace::c_uint_w(w_value).map(Some)
 }
 
 /// The handles a `handle_seq` argument names.
 ///
 /// `PySequence_Check` is what guards these two calls, so a mapping is turned
 /// away along with everything that has no subscript at all.
-fn sequence_handles(w_seq: PyObjectRef) -> Result<Vec<HANDLE>, crate::PyError> {
+fn sequence_handles(w_seq: PyObjectRef) -> Result<Vec<HANDLE>, pyre_interpreter::PyError> {
     let is_sequence = !unsafe { pyre_object::is_dict(w_seq) }
-        && unsafe { crate::baseobjspace::lookup(w_seq, "__getitem__") }.is_some();
+        && unsafe { pyre_interpreter::baseobjspace::lookup(w_seq, "__getitem__") }.is_some();
     if !is_sequence {
-        return Err(crate::PyError::type_error(format!(
+        return Err(pyre_interpreter::PyError::type_error(format!(
             "sequence type expected, got '{}'",
-            crate::gateway::short_type_name(w_seq)
+            pyre_interpreter::gateway::short_type_name(w_seq)
         )));
     }
-    let items = crate::baseobjspace::unpackiterable(w_seq, -1)?;
+    let items = pyre_interpreter::baseobjspace::unpackiterable(w_seq, -1)?;
     let mut handles = Vec::with_capacity(items.len());
     for w_item in items {
         handles.push(handle_w(w_item, IntArg::Element)?);
@@ -138,13 +149,13 @@ fn sequence_handles(w_seq: PyObjectRef) -> Result<Vec<HANDLE>, crate::PyError> {
 // ── locale and version ──
 
 /// `_winapi.GetACP()` — the process's ANSI code page.
-#[crate::pyre_function]
+#[pyre_interpreter::pyre_function]
 pub fn GetACP() -> i64 {
     host_winapi::get_acp() as i64
 }
 
 /// `_winapi.GetVersion()` — the packed version word `GetVersion` reports.
-#[crate::pyre_function]
+#[pyre_interpreter::pyre_function]
 pub fn GetVersion() -> i64 {
     host_winapi::get_version() as i64
 }
@@ -156,24 +167,24 @@ pub fn GetVersion() -> i64 {
 /// than text are rejected: the result would not be a string.  An empty `src`
 /// is not special-cased — `LCMapStringEx` reports `ERROR_INVALID_PARAMETER`
 /// for it, and that is the error the caller sees.
-#[crate::pyre_function]
+#[pyre_interpreter::pyre_function]
 pub fn LCMapStringEx(
     locale: PyObjectRef,
     flags: PyCUInt,
     src: PyObjectRef,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     const UNSUPPORTED: u32 = host_winapi::LCMAP_SORTHANDLE_FLAG
         | host_winapi::LCMAP_HASH_FLAG
         | host_winapi::LCMAP_BYTEREV_FLAG
         | host_winapi::LCMAP_SORTKEY_FLAG;
     if flags & UNSUPPORTED != 0 {
-        return Err(crate::PyError::value_error("unsupported flags"));
+        return Err(pyre_interpreter::PyError::value_error("unsupported flags"));
     }
     let locale = wide(locale, WideArg::Unnamed)?;
     if !unsafe { pyre_object::is_str(src) } {
-        return Err(crate::PyError::type_error(format!(
+        return Err(pyre_interpreter::PyError::type_error(format!(
             "LCMapStringEx() argument 3 must be str, not {}",
-            crate::gateway::short_type_name(src)
+            pyre_interpreter::gateway::short_type_name(src)
         )));
     }
     // The source is passed by length, so an embedded NUL is a character like
@@ -187,8 +198,8 @@ pub fn LCMapStringEx(
 // ── paths ──
 
 /// `_winapi.GetLongPathName(path)`
-#[crate::pyre_function]
-pub fn GetLongPathName(path: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+#[pyre_interpreter::pyre_function]
+pub fn GetLongPathName(path: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let path = wide(
         path,
         WideArg::Named {
@@ -202,8 +213,8 @@ pub fn GetLongPathName(path: PyObjectRef) -> Result<PyObjectRef, crate::PyError>
 }
 
 /// `_winapi.GetShortPathName(path)`
-#[crate::pyre_function]
-pub fn GetShortPathName(path: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+#[pyre_interpreter::pyre_function]
+pub fn GetShortPathName(path: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let path = wide(
         path,
         WideArg::Named {
@@ -219,8 +230,11 @@ pub fn GetShortPathName(path: PyObjectRef) -> Result<PyObjectRef, crate::PyError
 /// `_winapi.CreateJunction(src_path, dst_path)` — a directory junction, the
 /// reparse point `os.symlink` falls back to for a directory when the process
 /// may not create a real symlink.
-#[crate::pyre_function]
-pub fn CreateJunction(src_path: PyObjectRef, dst_path: PyObjectRef) -> Result<(), crate::PyError> {
+#[pyre_interpreter::pyre_function]
+pub fn CreateJunction(
+    src_path: PyObjectRef,
+    dst_path: PyObjectRef,
+) -> Result<(), pyre_interpreter::PyError> {
     let src = wide(
         src_path,
         WideArg::Numbered {
@@ -239,7 +253,7 @@ pub fn CreateJunction(src_path: PyObjectRef, dst_path: PyObjectRef) -> Result<()
     let dst = std::ffi::OsString::from_wide(dst.as_slice());
     // Scoped to the call alone, as `releasegil=True` is — see `CreateFile`.
     let result = {
-        let _blocked = crate::module::thread::before_external_block();
+        let _blocked = pyre_interpreter::module::thread::before_external_block();
         host_winapi::create_junction(std::path::Path::new(&src), std::path::Path::new(&dst))
     };
     result.map_err(super::win32_err)
@@ -254,18 +268,18 @@ pub fn CreateJunction(src_path: PyObjectRef, dst_path: PyObjectRef) -> Result<()
 /// exists so a caller only has to test for `CopyFile2` itself, and the code
 /// that would put the callback in the extended parameters is commented out
 /// upstream.
-#[crate::pyre_function]
+#[pyre_interpreter::pyre_function]
 pub fn CopyFile2(
     existing_file_name: PyObjectRef,
     new_file_name: PyObjectRef,
     flags: PyCUInt,
     #[default(pyre_object::w_none())] progress_routine: PyObjectRef,
-) -> Result<(), crate::PyError> {
+) -> Result<(), pyre_interpreter::PyError> {
     let _ = progress_routine;
     let existing = wide(existing_file_name, WideArg::Unnamed)?;
     let new = wide(new_file_name, WideArg::Unnamed)?;
     let result = {
-        let _blocked = crate::module::thread::before_external_block();
+        let _blocked = pyre_interpreter::module::thread::before_external_block();
         host_winapi::copy_file2(&existing, &new, flags)
     };
     result.map_err(super::win32_err)
@@ -274,12 +288,12 @@ pub fn CopyFile2(
 // ── processes ──
 
 /// `_winapi.OpenProcess(desired_access, inherit_handle, process_id)`
-#[crate::pyre_function]
+#[pyre_interpreter::pyre_function]
 pub fn OpenProcess(
     desired_access: PyCUInt,
     inherit_handle: PyIndexCInt,
     process_id: PyCUInt,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     host_winapi::open_process(desired_access, inherit_handle != 0, process_id)
         .map(w_handle)
         .map_err(super::win32_err)
@@ -287,8 +301,8 @@ pub fn OpenProcess(
 
 /// `_winapi.ExitProcess(ExitCode)` — the process ends inside the call, so
 /// nothing after it runs and no buffered stream is flushed.
-#[crate::pyre_function]
-pub fn ExitProcess(ExitCode: PyCUInt) -> Result<(), crate::PyError> {
+#[pyre_interpreter::pyre_function]
+pub fn ExitProcess(ExitCode: PyCUInt) -> Result<(), pyre_interpreter::PyError> {
     host_winapi::exit_process(ExitCode)
 }
 
@@ -299,13 +313,13 @@ pub fn ExitProcess(ExitCode: PyCUInt) -> Result<(), crate::PyError> {
 ///
 /// The security descriptor is required as an int and then left at the call's
 /// default, the way `CreateProcess` treats its two attribute arguments.
-#[crate::pyre_function]
+#[pyre_interpreter::pyre_function]
 pub fn CreateEventW(
     security_attributes: PyObjectRef,
     manual_reset: PyIndexCInt,
     initial_state: PyIndexCInt,
     name: PyObjectRef,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let _ = handle_w(
         security_attributes,
         IntArg::At {
@@ -321,12 +335,12 @@ pub fn CreateEventW(
 
 /// `_winapi.OpenEventW(desired_access, inherit_handle, name)` — `None` when
 /// there is no event of that name, rather than an error.
-#[crate::pyre_function]
+#[pyre_interpreter::pyre_function]
 pub fn OpenEventW(
     desired_access: PyCUInt,
     inherit_handle: PyIndexCInt,
     name: PyObjectRef,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let name = wide(name, WideArg::Unnamed)?;
     Ok(
         match host_winapi::open_event_w(desired_access, inherit_handle != 0, &name) {
@@ -337,8 +351,8 @@ pub fn OpenEventW(
 }
 
 /// `_winapi.SetEvent(event)`
-#[crate::pyre_function]
-pub fn SetEvent(event: PyObjectRef) -> Result<(), crate::PyError> {
+#[pyre_interpreter::pyre_function]
+pub fn SetEvent(event: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
     let event = handle_w(
         event,
         IntArg::At {
@@ -350,8 +364,8 @@ pub fn SetEvent(event: PyObjectRef) -> Result<(), crate::PyError> {
 }
 
 /// `_winapi.ResetEvent(event)`
-#[crate::pyre_function]
-pub fn ResetEvent(event: PyObjectRef) -> Result<(), crate::PyError> {
+#[pyre_interpreter::pyre_function]
+pub fn ResetEvent(event: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
     let event = handle_w(
         event,
         IntArg::At {
@@ -363,12 +377,12 @@ pub fn ResetEvent(event: PyObjectRef) -> Result<(), crate::PyError> {
 }
 
 /// `_winapi.CreateMutexW(security_attributes, initial_owner, name)`
-#[crate::pyre_function]
+#[pyre_interpreter::pyre_function]
 pub fn CreateMutexW(
     security_attributes: PyObjectRef,
     initial_owner: PyIndexCInt,
     name: PyObjectRef,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let _ = handle_w(
         security_attributes,
         IntArg::At {
@@ -384,12 +398,12 @@ pub fn CreateMutexW(
 
 /// `_winapi.OpenMutexW(desired_access, inherit_handle, name)` — `None` when
 /// there is no mutex of that name, as with [`OpenEventW`].
-#[crate::pyre_function]
+#[pyre_interpreter::pyre_function]
 pub fn OpenMutexW(
     desired_access: PyCUInt,
     inherit_handle: PyIndexCInt,
     name: PyObjectRef,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let name = wide(name, WideArg::Unnamed)?;
     Ok(
         match host_winapi::open_mutex_w(desired_access, inherit_handle != 0, &name) {
@@ -400,8 +414,8 @@ pub fn OpenMutexW(
 }
 
 /// `_winapi.ReleaseMutex(mutex)`
-#[crate::pyre_function]
-pub fn ReleaseMutex(mutex: PyObjectRef) -> Result<(), crate::PyError> {
+#[pyre_interpreter::pyre_function]
+pub fn ReleaseMutex(mutex: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
     let mutex = handle_w(
         mutex,
         IntArg::At {
@@ -434,21 +448,21 @@ const WAIT_TIMEOUT: u32 = 258;
 /// its timeout instead of ending in `InterruptedError`.  Wiring one in belongs
 /// with Windows signal delivery, not here; `lib_pypy/_winapi.py:379` leaves
 /// the same gap.
-#[crate::pyre_function]
+#[pyre_interpreter::pyre_function]
 pub fn WaitForMultipleObjects(
     handle_seq: PyObjectRef,
     wait_flag: PyIndexCInt,
     #[default(host_winapi::INFINITE_TIMEOUT)] milliseconds: PyCUInt,
-) -> Result<i64, crate::PyError> {
+) -> Result<i64, pyre_interpreter::PyError> {
     let handles = sequence_handles(handle_seq)?;
     if handles.len() > MAXIMUM_HANDLES {
-        return Err(crate::PyError::value_error(format!(
+        return Err(pyre_interpreter::PyError::value_error(format!(
             "need at most {MAXIMUM_HANDLES} handles, got a sequence of length {}",
             handles.len()
         )));
     }
     let result = {
-        let _blocked = crate::module::thread::before_external_block();
+        let _blocked = pyre_interpreter::module::thread::before_external_block();
         host_winapi::wait_for_multiple_objects(&handles, wait_flag != 0, milliseconds)
     };
     result.map(i64::from).map_err(super::win32_err)
@@ -461,12 +475,12 @@ pub fn WaitForMultipleObjects(
 /// Unlike the call above this one takes any number of handles, splitting them
 /// across worker threads that each wait on a batch of 63, and reports a
 /// timeout as `TimeoutError` rather than as a return value.
-#[crate::pyre_function]
+#[pyre_interpreter::pyre_function]
 pub fn BatchedWaitForMultipleObjects(
     handle_seq: PyObjectRef,
     wait_all: PyIndexCInt,
     #[default(host_winapi::INFINITE_TIMEOUT)] milliseconds: PyCUInt,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let handles = sequence_handles(handle_seq)?;
     // Nothing to wait for: `wait_all` is satisfied at once and the other form
     // has no handle to name, neither of which is a timeout.
@@ -474,7 +488,7 @@ pub fn BatchedWaitForMultipleObjects(
         return Ok(batched_wait_answer(wait_all != 0, Vec::new()));
     }
     let result = {
-        let _blocked = crate::module::thread::before_external_block();
+        let _blocked = pyre_interpreter::module::thread::before_external_block();
         host_winapi::batched_wait_for_multiple_objects(&handles, wait_all != 0, milliseconds, None)
     };
     let indices = match result {
@@ -487,7 +501,10 @@ pub fn BatchedWaitForMultipleObjects(
         // of; the wait that saw one reports it as the interrupted syscall it
         // is.
         Err(host_winapi::BatchedWaitError::Interrupted) => {
-            return Err(crate::PyError::os_error_syscall(libc::EINTR, PY_NULL));
+            return Err(pyre_interpreter::PyError::os_error_syscall(
+                libc::EINTR,
+                PY_NULL,
+            ));
         }
         Err(host_winapi::BatchedWaitError::Os(code)) => return Err(win32_code(code)),
     };
@@ -512,7 +529,7 @@ fn batched_wait_answer(wait_all: bool, indices: Vec<usize>) -> PyObjectRef {
 /// The security descriptor and the template file are required and then left
 /// at the call's defaults; every caller passes `NULL` for both.
 #[allow(clippy::too_many_arguments)]
-#[crate::pyre_function]
+#[pyre_interpreter::pyre_function]
 pub fn CreateFile(
     file_name: PyObjectRef,
     desired_access: PyCUInt,
@@ -521,7 +538,7 @@ pub fn CreateFile(
     creation_disposition: PyCUInt,
     flags_and_attributes: PyCUInt,
     template_file: PyObjectRef,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let at = |position| IntArg::At {
         function: "CreateFile",
         position,
@@ -540,7 +557,7 @@ pub fn CreateFile(
     // that `multiprocessing.connection.PipeClient` runs next reports
     // `ERROR_INVALID_HANDLE`.
     let result = {
-        let _blocked = crate::module::thread::before_external_block();
+        let _blocked = pyre_interpreter::module::thread::before_external_block();
         host_winapi::create_file_w(
             &file_name,
             desired_access,
@@ -555,7 +572,7 @@ pub fn CreateFile(
 /// `_winapi.CreateNamedPipe(name, open_mode, pipe_mode, max_instances,
 /// out_buffer_size, in_buffer_size, default_timeout, security_attributes)`
 #[allow(clippy::too_many_arguments)]
-#[crate::pyre_function]
+#[pyre_interpreter::pyre_function]
 pub fn CreateNamedPipe(
     name: PyObjectRef,
     open_mode: PyCUInt,
@@ -565,7 +582,7 @@ pub fn CreateNamedPipe(
     in_buffer_size: PyCUInt,
     default_timeout: PyCUInt,
     security_attributes: PyObjectRef,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let _ = handle_w(
         security_attributes,
         IntArg::At {
@@ -589,13 +606,13 @@ pub fn CreateNamedPipe(
 
 /// `_winapi.SetNamedPipeHandleState(named_pipe, mode, max_collection_count,
 /// collect_data_timeout)` — each `None` leaves that part of the state alone.
-#[crate::pyre_function]
+#[pyre_interpreter::pyre_function]
 pub fn SetNamedPipeHandleState(
     named_pipe: PyObjectRef,
     mode: PyObjectRef,
     max_collection_count: PyObjectRef,
     collect_data_timeout: PyObjectRef,
-) -> Result<(), crate::PyError> {
+) -> Result<(), pyre_interpreter::PyError> {
     let named_pipe = handle_w(
         named_pipe,
         IntArg::At {
@@ -613,11 +630,11 @@ pub fn SetNamedPipeHandleState(
 }
 
 /// `_winapi.WaitNamedPipe(name, timeout)`
-#[crate::pyre_function]
-pub fn WaitNamedPipe(name: PyObjectRef, timeout: PyCUInt) -> Result<(), crate::PyError> {
+#[pyre_interpreter::pyre_function]
+pub fn WaitNamedPipe(name: PyObjectRef, timeout: PyCUInt) -> Result<(), pyre_interpreter::PyError> {
     let name = wide(name, WideArg::Unnamed)?;
     let result = {
-        let _blocked = crate::module::thread::before_external_block();
+        let _blocked = pyre_interpreter::module::thread::before_external_block();
         host_winapi::wait_named_pipe_w(&name, timeout)
     };
     result.map_err(super::win32_err)
@@ -628,11 +645,11 @@ pub fn WaitNamedPipe(name: PyObjectRef, timeout: PyCUInt) -> Result<(), crate::P
 /// `_winapi.ConnectNamedPipe(handle, overlapped=False)` — `None` once the
 /// connection is made, or the `Overlapped` to wait on.
 #[cfg(not(feature = "sandbox"))]
-#[crate::pyre_function]
+#[pyre_interpreter::pyre_function]
 pub fn ConnectNamedPipe(
     handle_: PyObjectRef,
     #[default(pyre_object::w_bool_from(false))] overlapped: PyObjectRef,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let pipe = handle_w(
         handle_,
         IntArg::At {
@@ -640,18 +657,18 @@ pub fn ConnectNamedPipe(
             position: 1,
         },
     )?;
-    let use_overlapped = crate::baseobjspace::is_true(overlapped)?;
+    let use_overlapped = pyre_interpreter::baseobjspace::is_true(overlapped)?;
     super::overlapped::connect_named_pipe(pipe, use_overlapped)
 }
 
 /// `_winapi.ReadFile(handle, size, overlapped=False)`
 #[cfg(not(feature = "sandbox"))]
-#[crate::pyre_function]
+#[pyre_interpreter::pyre_function]
 pub fn ReadFile(
     handle_: PyObjectRef,
     size: PyCUInt,
     #[default(pyre_object::w_bool_from(false))] overlapped: PyObjectRef,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let file = handle_w(
         handle_,
         IntArg::At {
@@ -659,18 +676,18 @@ pub fn ReadFile(
             position: 1,
         },
     )?;
-    let use_overlapped = crate::baseobjspace::is_true(overlapped)?;
+    let use_overlapped = pyre_interpreter::baseobjspace::is_true(overlapped)?;
     super::overlapped::read_file(file, size, use_overlapped)
 }
 
 /// `_winapi.WriteFile(handle, buffer, overlapped=False)`
 #[cfg(not(feature = "sandbox"))]
-#[crate::pyre_function]
+#[pyre_interpreter::pyre_function]
 pub fn WriteFile(
     handle_: PyObjectRef,
     buffer: PyObjectRef,
     #[default(pyre_object::w_bool_from(false))] overlapped: PyObjectRef,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let file = handle_w(
         handle_,
         IntArg::At {
@@ -678,11 +695,11 @@ pub fn WriteFile(
             position: 1,
         },
     )?;
-    let use_overlapped = crate::baseobjspace::is_true(overlapped)?;
-    let Some(data) = crate::baseobjspace::simple_buffer_bytes(buffer)? else {
-        return Err(crate::PyError::type_error(format!(
+    let use_overlapped = pyre_interpreter::baseobjspace::is_true(overlapped)?;
+    let Some(data) = pyre_interpreter::baseobjspace::simple_buffer_bytes(buffer)? else {
+        return Err(pyre_interpreter::PyError::type_error(format!(
             "a bytes-like object is required, not '{}'",
-            crate::gateway::short_type_name(buffer)
+            pyre_interpreter::gateway::short_type_name(buffer)
         )));
     };
     // The write reads from the buffer for as long as it is in flight, and the
@@ -695,11 +712,11 @@ pub fn WriteFile(
 
 /// `_winapi.PeekNamedPipe(handle, size=0)` -> `(available, left_this_message)`,
 /// and `(data, available, left_this_message)` once a size is asked for.
-#[crate::pyre_function]
+#[pyre_interpreter::pyre_function]
 pub fn PeekNamedPipe(
     handle_: PyObjectRef,
     #[default(0u32)] size: PyCUInt,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let pipe = handle_w(
         handle_,
         IntArg::At {
@@ -722,7 +739,7 @@ pub fn PeekNamedPipe(
 
 /// `_winapi.CreateFileMapping(file_handle, security_attributes, protect,
 /// max_size_high, max_size_low, name)`
-#[crate::pyre_function]
+#[pyre_interpreter::pyre_function]
 pub fn CreateFileMapping(
     file_handle: PyObjectRef,
     security_attributes: PyObjectRef,
@@ -730,7 +747,7 @@ pub fn CreateFileMapping(
     max_size_high: PyCUInt,
     max_size_low: PyCUInt,
     name: PyObjectRef,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let at = |position| IntArg::At {
         function: "CreateFileMapping",
         position,
@@ -744,12 +761,12 @@ pub fn CreateFileMapping(
 }
 
 /// `_winapi.OpenFileMapping(desired_access, inherit_handle, name)`
-#[crate::pyre_function]
+#[pyre_interpreter::pyre_function]
 pub fn OpenFileMapping(
     desired_access: PyCUInt,
     inherit_handle: PyIndexCInt,
     name: PyObjectRef,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let wide_name = wide(name, WideArg::Unnamed)?;
     host_winapi::open_file_mapping_w(desired_access, inherit_handle != 0, &wide_name)
         .map(w_handle)
@@ -758,14 +775,14 @@ pub fn OpenFileMapping(
 
 /// `_winapi.MapViewOfFile(file_map, desired_access, file_offset_high,
 /// file_offset_low, number_bytes)` -> the address of the mapped view.
-#[crate::pyre_function]
+#[pyre_interpreter::pyre_function]
 pub fn MapViewOfFile(
     file_map: PyObjectRef,
     desired_access: PyCUInt,
     file_offset_high: PyCUInt,
     file_offset_low: PyCUInt,
     number_bytes: PyIndexInt,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let mapping = handle_w(
         file_map,
         IntArg::At {
@@ -785,8 +802,8 @@ pub fn MapViewOfFile(
 }
 
 /// `_winapi.UnmapViewOfFile(address)`
-#[crate::pyre_function]
-pub fn UnmapViewOfFile(address: PyObjectRef) -> Result<(), crate::PyError> {
+#[pyre_interpreter::pyre_function]
+pub fn UnmapViewOfFile(address: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
     let address = handle_w(address, IntArg::Only("UnmapViewOfFile"))? as isize;
     host_winapi::unmap_view_of_file(address).map_err(super::win32_err)
 }
@@ -794,8 +811,8 @@ pub fn UnmapViewOfFile(address: PyObjectRef) -> Result<(), crate::PyError> {
 /// `_winapi.VirtualQuerySize(address)` -> the size of the region the address
 /// falls in, which is how a mapped view's length is recovered from the address
 /// alone.
-#[crate::pyre_function]
-pub fn VirtualQuerySize(address: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+#[pyre_interpreter::pyre_function]
+pub fn VirtualQuerySize(address: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let address = handle_w(address, IntArg::Only("VirtualQuerySize"))? as isize;
     host_winapi::virtual_query_size(address)
         .map(|size| w_int_new(size as i64))
@@ -810,13 +827,15 @@ pub fn VirtualQuerySize(address: PyObjectRef) -> Result<PyObjectRef, crate::PyEr
 ///
 /// The whole walk lives behind one call because doing it a key at a time
 /// through `winreg` is what made `mimetypes.init()` slow enough to matter.
-#[crate::pyre_function]
-pub fn _mimetypes_read_windows_registry(on_type_read: PyObjectRef) -> Result<(), crate::PyError> {
+#[pyre_interpreter::pyre_function]
+pub fn _mimetypes_read_windows_registry(
+    on_type_read: PyObjectRef,
+) -> Result<(), pyre_interpreter::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let callback_slot = roots.base();
     let _ = roots.pin_root(on_type_read);
     host_winapi::read_windows_mimetype_registry_in_batches(
-        |entries: &mut Vec<(String, String)>| -> Result<(), crate::PyError> {
+        |entries: &mut Vec<(String, String)>| -> Result<(), pyre_interpreter::PyError> {
             // The host refills the batch it hands over, so it has to be
             // drained here rather than merely read.
             for (mime_type, extension) in entries.drain(..) {
@@ -828,7 +847,7 @@ pub fn _mimetypes_read_windows_registry(on_type_read: PyObjectRef) -> Result<(),
                     pyre_object::gc_roots::pin_roots(&[pyre_object::w_str_new_managed(&mime_type)]);
                 let extension_slot =
                     pyre_object::gc_roots::pin_roots(&[pyre_object::w_str_new_managed(&extension)]);
-                crate::call::call_function_impl_result(
+                pyre_interpreter::call::call_function_impl_result(
                     roots.get(callback_slot),
                     &[
                         pyre_object::gc_roots::shadow_stack_get(type_slot),
@@ -847,7 +866,7 @@ pub fn _mimetypes_read_windows_registry(on_type_read: PyObjectRef) -> Result<(),
 
 /// Bind the functions above into the module dict under their own names.
 ///
-/// `keywords` keeps the `Signature` `#[crate::pyre_function]` derives, so a
+/// `keywords` keeps the `Signature` `#[pyre_interpreter::pyre_function]` derives, so a
 /// caller may name those parameters; `positional` drops it, which is what
 /// makes the gateway refuse a keyword call for the definitions whose
 /// parameters are all positional-only.
@@ -862,12 +881,12 @@ pub fn _mimetypes_read_windows_registry(on_type_read: PyObjectRef) -> Result<(),
 macro_rules! install {
     ($ns:expr, keywords: [$($kw:ident),* $(,)?], positional: [$($pos:ident),* $(,)?]) => {
         $(
-            crate::module_ns_store(
+            pyre_interpreter::module_ns_store(
                 $ns,
                 stringify!($kw),
-                crate::gateway::with_module(
+                pyre_interpreter::gateway::with_module(
                     "_winapi",
-                    crate::make_module_builtin_function_with_arity_and_maybe_sig(
+                    pyre_interpreter::make_module_builtin_function_with_arity_and_maybe_sig(
                         stringify!($kw),
                         $kw,
                         ::paste::paste! { [<$kw _pyre_arity>]() },
@@ -877,12 +896,12 @@ macro_rules! install {
             );
         )*
         $(
-            crate::module_ns_store(
+            pyre_interpreter::module_ns_store(
                 $ns,
                 stringify!($pos),
-                crate::gateway::with_module(
+                pyre_interpreter::gateway::with_module(
                     "_winapi",
-                    crate::make_module_builtin_function_with_arity_and_maybe_sig(
+                    pyre_interpreter::make_module_builtin_function_with_arity_and_maybe_sig(
                         stringify!($pos),
                         $pos,
                         ::paste::paste! { [<$pos _pyre_arity>]() },
@@ -897,16 +916,16 @@ macro_rules! install {
 pub fn install(ns: PyObjectRef) {
     // `LOCALE_NAME_USER_DEFAULT` is the null locale name, which is `None`
     // rather than a string; the other two are the reserved names themselves.
-    crate::module_ns_store(ns, "LOCALE_NAME_INVARIANT", pyre_object::w_str_new(""));
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(ns, "LOCALE_NAME_INVARIANT", pyre_object::w_str_new(""));
+    pyre_interpreter::module_ns_store(
         ns,
         "LOCALE_NAME_SYSTEM_DEFAULT",
         pyre_object::w_str_new("!x-sys-default-locale"),
     );
-    crate::module_ns_store(ns, "LOCALE_NAME_USER_DEFAULT", w_none());
+    pyre_interpreter::module_ns_store(ns, "LOCALE_NAME_USER_DEFAULT", w_none());
     #[cfg(not(feature = "sandbox"))]
     {
-        crate::module_ns_store(ns, "Overlapped", super::overlapped::overlapped_type());
+        pyre_interpreter::module_ns_store(ns, "Overlapped", super::overlapped::overlapped_type());
         install!(ns, keywords: [ConnectNamedPipe, ReadFile, WriteFile], positional: []);
     }
     install!(

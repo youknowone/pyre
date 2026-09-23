@@ -12,10 +12,6 @@ pub mod _ast;
 pub mod _codecs;
 #[allow(non_snake_case)]
 pub mod _collections;
-#[allow(non_snake_case)]
-pub mod _contextvars;
-#[allow(non_snake_case)]
-pub mod _functools;
 pub mod _io;
 #[allow(non_snake_case)]
 pub mod _locale;
@@ -28,11 +24,6 @@ pub mod _sre;
 pub mod _types;
 pub mod _warnings;
 pub mod _weakref;
-#[allow(non_snake_case)]
-#[cfg(windows)]
-pub mod _winapi;
-#[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-pub mod _wmi;
 pub mod array;
 pub mod gc;
 #[allow(non_snake_case)]
@@ -40,11 +31,8 @@ pub mod imp;
 pub mod importlib;
 pub mod itertools;
 pub mod marshal;
-#[cfg(all(windows, feature = "host_env"))]
-pub mod msvcrt;
 pub mod operator;
 pub mod posix;
-pub mod pypyjit;
 #[allow(non_snake_case)]
 pub mod signal;
 #[allow(non_snake_case)]
@@ -53,8 +41,3 @@ pub mod sys;
 #[allow(non_snake_case)]
 pub mod thread;
 pub mod time;
-#[cfg(windows)]
-pub mod winreg;
-#[allow(non_snake_case)]
-#[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-pub mod winsound;

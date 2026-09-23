@@ -1177,9 +1177,7 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         subclass_range_alias(153, typed::<crate::module::thread::W_Lock>()),
         subclass_range_alias(154, typed::<crate::module::thread::W_RLock>()),
         subclass_range_alias(155, typed::<crate::module::thread::W_ThreadHandle>()),
-        // `functools.KeyWrapper` follows them at the append-only AUTO-ID
-        // registration tail.
-        subclass_range_alias(156, typed::<crate::module::_functools::W_KeyWrapper>()),
+        // `functools.KeyWrapper` alias 156 lives on the optional-module hook.
         // `unicodedata.UCD` alias 157 lives on the optional-module hook.
         // `__pypy__.Bufferable` closes that tail in the order `build_gc`
         // registers them.
@@ -1219,15 +1217,8 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         #[cfg(not(target_arch = "wasm32"))]
         subclass_range_alias(189, typed::<crate::module::posix::W_ScandirIterator>()),
         // rustls-backed `_ssl` aliases 190-194 live on the optional-module
-        // hook. `mmap.mmap` alias 195 lives on the same hook.
-        // `_winapi.Overlapped` follows it: a second record of the same kind,
-        // owning its own event and transfer buffer rather than retained
-        // Python objects, so nothing of it is traced beyond the header.
-        #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-        subclass_range_alias(
-            197,
-            typed::<crate::module::_winapi::overlapped::W_Overlapped>(),
-        ),
+        // hook. `mmap.mmap` alias 195 and `_winapi.Overlapped` alias 197
+        // live on the same hook.
         // PEP 528's raw console stream follows the two overlapped owners at
         // the append-only Windows tail.  It is subclassable and therefore
         // participates in the same rclass hierarchy as every typed IO base.

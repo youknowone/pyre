@@ -708,30 +708,8 @@ pub fn install_builtin_modules() {
     // (PyPy: pypy/module/* mixed modules).
     pyre_install_module!(_weakref);
     pyre_install_module!(_warnings);
-    // `sys.platform == "win32"` sends shutil (and so tempfile) through the
-    // `_winapi` import even though the Windows build installs `posix`.
-    #[cfg(windows)]
-    pyre_install_module!(_winapi);
-    // CPython's private `_wmi` module reaches the local WMI service through
-    // COM and is therefore present only on an unsandboxed Windows host.
-    #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-    pyre_install_module!(_wmi);
-    // `importlib._bootstrap_external` eagerly `import winreg`s on win32; the
-    // module must exist for the import machinery (and `import site`) to start.
-    #[cfg(windows)]
-    pyre_install_module!(winreg);
-    // `subprocess` picks its Windows implementation from the presence of
-    // `msvcrt`; `getpass` reads the console through it.
-    #[cfg(all(windows, feature = "host_env"))]
-    pyre_install_module!(msvcrt);
-    // winsound reaches the host sound device directly, so it belongs with the
-    // other host-access modules a sandbox build leaves out.
-    #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-    pyre_install_module!(winsound);
-    pyre_install_module!(_functools);
     pyre_install_module!("_thread"(thread));
     pyre_install_module!(itertools);
-    pyre_install_module!(_contextvars);
     pyre_install_module!(_codecs);
     // PyPy `_codecs/moduledef.py:87-100 Module.__init__` performs this beside
     // MixedModule installation, not inside the translated CodecState ctor.
@@ -765,13 +743,11 @@ pub fn install_builtin_modules() {
     pyre_install_module!("__pypy__.builders" => crate::module::__pypy__::builders::init);
     pyre_install_module!("__pypy__.bufferable" => crate::module::__pypy__::bufferable::init);
 
-    // pypyjit — runtime JIT-parameter control (`set_param`).
-    pyre_install_module!("pypyjit" => crate::module::pypyjit::init);
-
     // Host-access modules — arbitrary FFI (`_ctypes`), real signals.
     // `select`, `mmap`, `_socket`/`_ssl`, `pwd`/`grp`, `errno`, `_stat`,
-    // `_abc`, `_typing`, `_symtable`, `_pypy_generic_alias`, `atexit` and
-    // the other optional modules live in `pyre-module`.  None of the host
+    // `_abc`, `_typing`, `_symtable`, `_pypy_generic_alias`, `atexit`,
+    // `pypyjit`, `_contextvars`, `_functools`, and the Windows host modules
+    // live in `pyre-module`.  None of the host
     // ones belong to the mediated ll_os/ll_time surface, so the sandbox
     // interpreter omits them entirely: `import _ctypes` then raises
     // ModuleNotFoundError, as in a build whose syscall code is absent.

@@ -28,10 +28,14 @@ pub mod _codecs_kr;
 #[allow(non_snake_case)]
 pub mod _codecs_tw;
 #[allow(non_snake_case)]
+pub mod _contextvars;
+#[allow(non_snake_case)]
 pub mod _csv;
 #[allow(non_snake_case)]
 #[cfg(not(feature = "sandbox"))]
 pub mod _ctypes;
+#[allow(non_snake_case)]
+pub mod _functools;
 #[allow(non_snake_case)]
 pub mod _hashlib;
 #[allow(non_snake_case)]
@@ -90,6 +94,11 @@ pub mod _typing;
 #[allow(non_snake_case)]
 #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
 pub mod _uuid;
+#[allow(non_snake_case)]
+#[cfg(windows)]
+pub mod _winapi;
+#[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+pub mod _wmi;
 pub mod atexit;
 pub mod binascii;
 pub mod cmath;
@@ -107,9 +116,12 @@ pub mod math;
     not(feature = "sandbox")
 ))]
 pub mod mmap;
+#[cfg(all(windows, feature = "host_env"))]
+pub mod msvcrt;
 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 pub mod pwd;
 pub mod pyexpat;
+pub mod pypyjit;
 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 pub mod resource;
 #[cfg(not(feature = "sandbox"))]
@@ -119,4 +131,9 @@ pub mod syslog;
 #[cfg(all(unix, not(feature = "sandbox")))]
 pub mod termios;
 pub mod unicodedata;
+#[cfg(windows)]
+pub mod winreg;
+#[allow(non_snake_case)]
+#[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+pub mod winsound;
 pub mod zlib;

@@ -39,6 +39,11 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("_ctypes", module::_ctypes::init);
     pyre_interpreter::importing::register_builtin_module("_bz2", module::_bz2::init);
     pyre_interpreter::importing::register_builtin_module("_csv", module::_csv::init);
+    pyre_interpreter::importing::register_builtin_module(
+        "_contextvars",
+        module::_contextvars::init,
+    );
+    pyre_interpreter::importing::register_builtin_module("_functools", module::_functools::init);
     pyre_interpreter::importing::register_builtin_module("_codecs_cn", module::_codecs_cn::init);
     pyre_interpreter::importing::register_builtin_module("_codecs_hk", module::_codecs_hk::init);
     pyre_interpreter::importing::register_builtin_module(
@@ -97,6 +102,10 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("_template", module::_template::init);
     pyre_interpreter::importing::register_builtin_module("_tokenize", module::_tokenize::init);
     pyre_interpreter::importing::register_builtin_module("_typing", module::_typing::init);
+    #[cfg(windows)]
+    pyre_interpreter::importing::register_builtin_module("_winapi", module::_winapi::init);
+    #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+    pyre_interpreter::importing::register_builtin_module("_wmi", module::_wmi::init);
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("_uuid", module::_uuid::init);
     #[cfg(target_os = "macos")]
@@ -111,6 +120,9 @@ pub fn install_optional_modules() {
         module::faulthandler::init,
     );
     pyre_interpreter::importing::register_builtin_module("math", module::math::init);
+    #[cfg(all(windows, feature = "host_env"))]
+    pyre_interpreter::importing::register_builtin_module("msvcrt", module::msvcrt::init);
+    pyre_interpreter::importing::register_builtin_module("pypyjit", module::pypyjit::init);
     #[cfg(all(
         not(target_arch = "wasm32"),
         feature = "host_env",
@@ -132,6 +144,10 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("syslog", module::syslog::init);
     #[cfg(all(unix, not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("termios", module::termios::init);
+    #[cfg(windows)]
+    pyre_interpreter::importing::register_builtin_module("winreg", module::winreg::init);
+    #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+    pyre_interpreter::importing::register_builtin_module("winsound", module::winsound::init);
     pyre_interpreter::importing::register_builtin_module("unicodedata", module::unicodedata::init);
     pyre_interpreter::importing::register_builtin_module("zlib", module::zlib::init);
 }
@@ -1131,6 +1147,8 @@ fn optional_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRange
         // `_queue.SimpleQueue` is unconditional and carries a native FIFO, so
         // it closes the ungated aliases ahead of the target-gated ones.
         subclass_range_alias(179, typed::<module::_queue::W_SimpleQueue>()),
+        // `functools.KeyWrapper` keeps the id it had beside the thread types.
+        subclass_range_alias(156, typed::<module::_functools::W_KeyWrapper>()),
     ];
     // The rustls-backed `_ssl` aliases preserve `build_gc`'s registration
     // order for `W_SSLContext`, `W_MemoryBIO`, and `W_SSLSession`.
@@ -1169,6 +1187,11 @@ fn optional_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRange
     aliases.push(subclass_range_alias(
         196,
         typed::<module::_overlapped::W_Overlapped>(),
+    ));
+    #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+    aliases.push(subclass_range_alias(
+        197,
+        typed::<module::_winapi::overlapped::W_Overlapped>(),
     ));
     // `_cffi_backend` sits at the rclass tail (196 on Unix, 199 on Windows
     // where overlapped/console occupy 196-198).
