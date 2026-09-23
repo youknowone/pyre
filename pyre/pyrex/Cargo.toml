@@ -32,8 +32,11 @@ name = "allocsites"
 path = "examples/allocsites.rs"
 
 [features]
-default = ["dynasm", "host_env", "mimalloc"]
-host_env = ["pyre-interpreter/host_env"]
+default = ["dynasm", "host_env", "mimalloc", "full"]
+# The whole builtin module set (see pyre-interpreter). Off, the launcher is
+# the fast-building core: `--no-default-features --features dynasm,mimalloc`.
+full = ["pyre-interpreter/full", "pyre-jit/full", "pyre-module/full"]
+host_env = ["pyre-interpreter/host_env", "pyre-module/host_env"]
 jit = []  # meta feature: enabled by cranelift or dynasm
 # The native launchers run the interpreter's importlib bootstrap.  Keep the
 # caller and the interpreter owner under the same cfg when defaults are off;
@@ -71,8 +74,13 @@ seccomp = ["sandbox"]
 parking_lot = { workspace = true }
 pyre-object = { workspace = true }
 pyre-interpreter = { workspace = true }
+# `host_env` and `full` arrive through this package's features. A core build
+# does not name `full`. Workspace `pyre-module` already has defaults off.
 pyre-module = { workspace = true }
-pyre-jit = { workspace = true }
+# `prepass` is on for every launcher. The backend feature (`dynasm` /
+# `cranelift`) is forwarded by this package's own features, so a
+# cranelift-only build does not also compile dynasm.
+pyre-jit = { workspace = true, features = ["prepass"] }
 majit-metainterp = { workspace = true }
 majit-gc = { workspace = true }
 lexopt = { workspace = true }
@@ -92,7 +100,7 @@ pyre-sandbox = { workspace = true }
 # The repl `#[test]`s build str-keyed dicts without booting the JIT (which is
 # where production installs the hash hook), so enable pyre-interpreter's
 # `test-hooks` feature to install the thread-local hook on the test threads.
-pyre-interpreter = { workspace = true, features = ["test-hooks"] }
+pyre-interpreter = { workspace = true, features = ["host_env", "test-hooks"] }
 
 [package.metadata.dist]
 # All three declared executables are one cargo-dist application.  The two

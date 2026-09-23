@@ -914,35 +914,55 @@ unsafe fn hashlib_hmac_destructor(obj_addr: usize) {
     }
 }
 
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+#[cfg(all(
+    feature = "full",
+    not(target_arch = "wasm32"),
+    not(feature = "sandbox")
+))]
 unsafe fn ssl_context_destructor(obj_addr: usize) {
     unsafe {
         pyre_module::module::_ssl::w_ssl_context_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+#[cfg(all(
+    feature = "full",
+    not(target_arch = "wasm32"),
+    not(feature = "sandbox")
+))]
 unsafe fn memory_bio_destructor(obj_addr: usize) {
     unsafe {
         pyre_module::module::_ssl::w_memory_bio_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+#[cfg(all(
+    feature = "full",
+    not(target_arch = "wasm32"),
+    not(feature = "sandbox")
+))]
 unsafe fn ssl_session_destructor(obj_addr: usize) {
     unsafe {
         pyre_module::module::_ssl::w_ssl_session_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+#[cfg(all(
+    feature = "full",
+    not(target_arch = "wasm32"),
+    not(feature = "sandbox")
+))]
 unsafe fn ssl_socket_destructor(obj_addr: usize) {
     unsafe {
         pyre_module::module::_ssl::w_ssl_socket_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+#[cfg(all(
+    feature = "full",
+    not(target_arch = "wasm32"),
+    not(feature = "sandbox")
+))]
 unsafe fn mmap_destructor(obj_addr: usize) {
     unsafe { pyre_module::module::mmap::w_mmap_dealloc(obj_addr as pyre_object::PyObjectRef) };
 }
@@ -1001,7 +1021,11 @@ unsafe fn queue_simplequeue_destructor(obj_addr: usize) {
 
 /// Frees the block a `newp`-owned cdata malloc'd; a cdata that only borrows
 /// someone else's memory frees nothing.
-#[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+#[cfg(all(
+    feature = "full",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+))]
 unsafe fn cffi_cdata_destructor(obj_addr: usize) {
     unsafe {
         pyre_module::module::_cffi_backend::cdataobj::w_cdata_dealloc(
@@ -1012,7 +1036,11 @@ unsafe fn cffi_cdata_destructor(obj_addr: usize) {
 
 /// `W_Library._finalize_` — closes a library nothing names any more, unless
 /// the handle was opened by someone else.
-#[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+#[cfg(all(
+    feature = "full",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+))]
 unsafe fn cffi_library_destructor(obj_addr: usize) {
     unsafe {
         pyre_module::module::_cffi_backend::libraryobj::w_library_dealloc(
@@ -1022,7 +1050,11 @@ unsafe fn cffi_library_destructor(obj_addr: usize) {
 }
 
 /// `FreeCtxObj.__del__` — releases an FFI object's copied parser context.
-#[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+#[cfg(all(
+    feature = "full",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+))]
 unsafe fn cffi_ffi_destructor(obj_addr: usize) {
     unsafe {
         pyre_module::module::_cffi_backend::ffi_obj::w_ffi_dealloc(
@@ -1032,7 +1064,11 @@ unsafe fn cffi_ffi_destructor(obj_addr: usize) {
 }
 
 /// `W_DlOpenLibObject._finalize_` — closes an ABI library nothing names.
-#[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+#[cfg(all(
+    feature = "full",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+))]
 unsafe fn cffi_lib_destructor(obj_addr: usize) {
     unsafe {
         pyre_module::module::_cffi_backend::lib_obj::w_lib_dealloc(
@@ -1117,7 +1153,11 @@ unsafe fn random_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maj
 
 /// `_ssl._SSLContext` has the native-layout mapdict prefix plus the three
 /// Python callback/path references owned by the context wrapper.
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+#[cfg(all(
+    feature = "full",
+    not(target_arch = "wasm32"),
+    not(feature = "sandbox")
+))]
 unsafe fn ssl_context_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     unsafe { object_object_custom_trace(obj_addr, f) };
     let context = unsafe { &mut *(obj_addr as *mut pyre_module::module::_ssl::W_SSLContext) };
@@ -1128,14 +1168,22 @@ unsafe fn ssl_context_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
 
 /// `ssl.MemoryBIO` is subclassable and therefore carries mapdict storage even
 /// though its rustls transport state contains no Python references.
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+#[cfg(all(
+    feature = "full",
+    not(target_arch = "wasm32"),
+    not(feature = "sandbox")
+))]
 unsafe fn memory_bio_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     unsafe { object_object_custom_trace(obj_addr, f) };
 }
 
 /// `mmap.mmap` is subclassable and carries the same mapdict prefix; its
 /// mapping/fd payload contains no Python references.
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+#[cfg(all(
+    feature = "full",
+    not(target_arch = "wasm32"),
+    not(feature = "sandbox")
+))]
 unsafe fn mmap_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     unsafe { object_object_custom_trace(obj_addr, f) };
 }
@@ -1163,7 +1211,11 @@ unsafe fn queue_simplequeue_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut
 
 /// `_ssl._SSLSocket` owns its context, transport endpoints, public owner,
 /// and hostname directly on the typed object.
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+#[cfg(all(
+    feature = "full",
+    not(target_arch = "wasm32"),
+    not(feature = "sandbox")
+))]
 unsafe fn ssl_socket_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let socket = unsafe { &mut *(obj_addr as *mut pyre_module::module::_ssl::W_SSLSocket) };
     f(std::ptr::addr_of_mut!(socket.ob.w_class) as *mut majit_ir::GcRef);
@@ -4425,7 +4477,11 @@ fn build_gc() -> Box<MiniMarkGC> {
     // MemoryBIO are subclassable native layouts, so their marker walks the
     // mapdict prefix; Context additionally owns Python callbacks/path values.
     // Their sweep destructors release the opaque rustls allocations.
-    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+    #[cfg(all(
+        feature = "full",
+        not(target_arch = "wasm32"),
+        not(feature = "sandbox")
+    ))]
     {
         let context_descr = <pyre_module::module::_ssl::W_SSLContext
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
@@ -4521,7 +4577,11 @@ fn build_gc() -> Box<MiniMarkGC> {
     // PyPy's W_MMap directly owns rmmap.MMap.  The typed wrapper carries the
     // subclass mapdict prefix and a sweep destructor for the native mapping
     // and duplicated fd.
-    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+    #[cfg(all(
+        feature = "full",
+        not(target_arch = "wasm32"),
+        not(feature = "sandbox")
+    ))]
     {
         let mmap_descr = <pyre_module::module::mmap::W_MMap
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
@@ -4590,7 +4650,11 @@ fn build_gc() -> Box<MiniMarkGC> {
     // carrier hold ordinary traced fields; a cdata additionally owns the block
     // that `newp` malloc'd for it and a library owns its loader handle, which
     // their sweep destructors release.
-    #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+    #[cfg(all(
+        feature = "full",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    ))]
     {
         for descriptor in [
             <pyre_module::module::_cffi_backend::ctypeobj::W_CType
@@ -10866,6 +10930,112 @@ fn handle_fail(
     HandleFailOutcome::ResumeInBlackhole
 }
 
+/// Flattened `handle_fail` result after blackhole resume, shared by the
+/// three compiled-run doors.
+enum HandleFailDispatch {
+    ContinueRunningNormally,
+    Done(PyResult),
+    Fallthrough,
+}
+
+/// compile.py `handle_fail` never returns: a compiled bridge raises
+/// ContinueRunningNormally / DoneWithThisFrame, otherwise
+/// resume_in_blackhole raises. This is that single flow.
+///
+/// `continue_on_compiled`: the loop doors map a compiled bridge and a
+/// blackhole ContinueRunningNormally to [`HandleFailDispatch::ContinueRunningNormally`];
+/// the function-entry door falls through to eval_loop_jit.
+/// `log_bh_return`: the function-entry door logs a blackhole Done.
+// dont_look_inside: compile.py handle_fail; post-trace outcome dispatch.
+#[majit_macros::dont_look_inside]
+fn dispatch_handle_fail(
+    frame_root: &mut FrameRoot,
+    green_key: u64,
+    trace_id: u64,
+    fail_index: u32,
+    descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
+    should_bridge: bool,
+    owning_key: u64,
+    exit_layout: &CompiledExitLayout,
+    raw_values: &mut [i64],
+    guard_exc: i64,
+    info: &majit_metainterp::virtualizable::VirtualizableInfo,
+    savedata: Option<majit_ir::GcRef>,
+    continue_on_compiled: bool,
+    log_bh_return: bool,
+) -> HandleFailDispatch {
+    let compiled = || {
+        if continue_on_compiled {
+            HandleFailDispatch::ContinueRunningNormally
+        } else {
+            HandleFailDispatch::Fallthrough
+        }
+    };
+    match handle_fail(
+        frame_root.frame(),
+        green_key,
+        trace_id,
+        fail_index,
+        descr_arc,
+        should_bridge,
+        owning_key,
+        exit_layout,
+        raw_values,
+        guard_exc,
+        info,
+    ) {
+        HandleFailOutcome::BridgeCompiled => compiled(),
+        HandleFailOutcome::BridgeFinished(v) => HandleFailDispatch::Done(Ok(v)),
+        HandleFailOutcome::BridgeRaised(err) => HandleFailDispatch::Done(Err(err)),
+        HandleFailOutcome::ResumeInBlackhole => {
+            // compile.py:710-716 / pyjitpl.py:2906 SwitchToBlackhole
+            let bh_result = resume_in_blackhole_from_exit_layout(
+                raw_values,
+                exit_layout,
+                guard_exc,
+                false,
+                savedata,
+            );
+            publish_blackhole_frame_finished(&bh_result, frame_root.frame());
+            match &bh_result {
+                crate::call_jit::BlackholeResult::ContinueRunningNormally { green_int, .. } => {
+                    apply_blackhole_crn_handoff(frame_root.frame(), green_int);
+                    compiled()
+                }
+                crate::call_jit::BlackholeResult::BailToInterpreter => {
+                    HandleFailDispatch::Fallthrough
+                }
+                // warmspot.py:988-1005 — box the typed DoneWithThisFrame*
+                // result for the portal's `result_type=Ref`, or propagate
+                // the ExitFrameWithExceptionRef exception rather than
+                // swallowing it.  Spelled once, in `take_pyresult`.
+                _ => {
+                    let Some(r) = bh_result.take_pyresult() else {
+                        return HandleFailDispatch::Fallthrough;
+                    };
+                    if log_bh_return && majit_metainterp::majit_log_enabled() {
+                        let returned_intval = match &r {
+                            Ok(obj)
+                                if !obj.is_null()
+                                    && unsafe { pyre_object::pyobject::is_int(*obj) } =>
+                            {
+                                Some(unsafe { pyre_object::intobject::w_int_get_value(*obj) })
+                            }
+                            _ => None,
+                        };
+                        eprintln!(
+                            "[jit][handle-outcome] bh-return arg0={:?} intval={:?}",
+                            debug_first_arg_int(frame_root.frame()),
+                            returned_intval,
+                        );
+                    }
+                    HandleFailDispatch::Done(r)
+                }
+            }
+        }
+    }
+}
+
 /// Short tag for a `BlackholeResult` variant, for the `[bh-rd-numb]`
 /// blackhole-resume log line.
 fn blackhole_result_tag(r: &crate::call_jit::BlackholeResult) -> &'static str {
@@ -11348,52 +11518,28 @@ fn execute_assembler(
             guard_exc,
             savedata,
             deadframe: _deadframe,
-        } => {
-            match handle_fail(
-                frame_root.frame(),
-                green_key,
-                trace_id,
-                fail_index,
-                descr_arc,
-                should_bridge,
-                owning_key,
-                exit_layout,
-                raw_values,
-                guard_exc,
-                info,
-            ) {
-                HandleFailOutcome::BridgeCompiled => Some(LoopResult::ContinueRunningNormally),
-                // #177: single-frame bridge walk returned a concrete Finish.
-                HandleFailOutcome::BridgeFinished(v) => Some(LoopResult::Done(Ok(v))),
-                HandleFailOutcome::BridgeRaised(err) => Some(LoopResult::Done(Err(err))),
-                HandleFailOutcome::ResumeInBlackhole => {
-                    // compile.py:710-716 / pyjitpl.py:2906 SwitchToBlackhole
-                    let bh_result = resume_in_blackhole_from_exit_layout(
-                        raw_values,
-                        exit_layout,
-                        guard_exc,
-                        false,
-                        savedata,
-                    );
-                    publish_blackhole_frame_finished(&bh_result, frame_root.frame());
-                    match &bh_result {
-                        crate::call_jit::BlackholeResult::ContinueRunningNormally {
-                            green_int,
-                            ..
-                        } => {
-                            apply_blackhole_crn_handoff(frame_root.frame(), green_int);
-                            Some(LoopResult::ContinueRunningNormally)
-                        }
-                        crate::call_jit::BlackholeResult::BailToInterpreter => None,
-                        // warmspot.py:988-1005 — box the typed DoneWithThisFrame*
-                        // result for the portal's `result_type=Ref`, or propagate
-                        // the ExitFrameWithExceptionRef exception rather than
-                        // swallowing it.  Spelled once, in `take_pyresult`.
-                        _ => bh_result.take_pyresult().map(LoopResult::Done),
-                    }
-                }
+        } => match dispatch_handle_fail(
+            &mut frame_root,
+            green_key,
+            trace_id,
+            fail_index,
+            descr_arc,
+            should_bridge,
+            owning_key,
+            exit_layout,
+            raw_values,
+            guard_exc,
+            info,
+            savedata,
+            true,
+            false,
+        ) {
+            HandleFailDispatch::ContinueRunningNormally => {
+                Some(LoopResult::ContinueRunningNormally)
             }
-        }
+            HandleFailDispatch::Done(r) => Some(LoopResult::Done(r)),
+            HandleFailDispatch::Fallthrough => None,
+        },
         DetailedDriverRunOutcome::Jump { .. } | DetailedDriverRunOutcome::Abort { .. } => None,
     }
 }
@@ -11728,8 +11874,8 @@ fn bound_reached(
             deadframe: _deadframe,
         } = outcome
         {
-            match handle_fail(
-                frame_root.frame(),
+            match dispatch_handle_fail(
+                &mut frame_root,
                 green_key,
                 trace_id,
                 fail_index,
@@ -11740,42 +11886,15 @@ fn bound_reached(
                 raw_values,
                 guard_exc,
                 info,
+                savedata,
+                true,
+                false,
             ) {
-                HandleFailOutcome::BridgeCompiled => {
+                HandleFailDispatch::ContinueRunningNormally => {
                     return Some(LoopResult::ContinueRunningNormally);
                 }
-                // #177: single-frame bridge walk returned a concrete Finish.
-                HandleFailOutcome::BridgeFinished(v) => {
-                    return Some(LoopResult::Done(Ok(v)));
-                }
-                HandleFailOutcome::BridgeRaised(err) => {
-                    return Some(LoopResult::Done(Err(err)));
-                }
-                HandleFailOutcome::ResumeInBlackhole => {
-                    let bh_result = resume_in_blackhole_from_exit_layout(
-                        raw_values,
-                        exit_layout,
-                        guard_exc,
-                        false,
-                        savedata,
-                    );
-                    publish_blackhole_frame_finished(&bh_result, frame_root.frame());
-                    match &bh_result {
-                        crate::call_jit::BlackholeResult::ContinueRunningNormally {
-                            green_int,
-                            ..
-                        } => {
-                            apply_blackhole_crn_handoff(frame_root.frame(), green_int);
-                            return Some(LoopResult::ContinueRunningNormally);
-                        }
-                        crate::call_jit::BlackholeResult::BailToInterpreter => {}
-                        _ => {
-                            if let Some(r) = bh_result.take_pyresult() {
-                                return Some(LoopResult::Done(r));
-                            }
-                        }
-                    }
-                }
+                HandleFailDispatch::Done(r) => return Some(LoopResult::Done(r)),
+                HandleFailDispatch::Fallthrough => {}
             }
         } else {
             match handle_jit_outcome(outcome, &jit_state, frame_root.frame(), info, green_key) {
@@ -12040,8 +12159,8 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             deadframe: _deadframe,
         } = outcome
         {
-            match handle_fail(
-                frame_root.frame(),
+            match dispatch_handle_fail(
+                &mut frame_root,
                 green_key,
                 trace_id,
                 fail_index,
@@ -12052,65 +12171,14 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                 raw_values,
                 guard_exc,
                 info,
+                savedata,
+                false,
+                true,
             ) {
-                HandleFailOutcome::BridgeCompiled => {
-                    // Bridge compiled → ContinueRunningNormally → re-enter
-                    // compiled code which will follow the new bridge.
-                    // Fall through to eval_loop_jit below.
-                }
-                // #177: single-frame bridge walk returned a concrete Finish.
-                // This site returns `Option<PyResult>` (not `LoopResult`).
-                HandleFailOutcome::BridgeFinished(v) => {
-                    return Some(Ok(v));
-                }
-                HandleFailOutcome::BridgeRaised(err) => {
-                    return Some(Err(err));
-                }
-                HandleFailOutcome::ResumeInBlackhole => {
-                    let bh_result = resume_in_blackhole_from_exit_layout(
-                        raw_values,
-                        exit_layout,
-                        guard_exc,
-                        false,
-                        savedata,
-                    );
-                    publish_blackhole_frame_finished(&bh_result, frame_root.frame());
-                    match &bh_result {
-                        crate::call_jit::BlackholeResult::ContinueRunningNormally {
-                            green_int,
-                            ..
-                        } => {
-                            apply_blackhole_crn_handoff(frame_root.frame(), green_int);
-                            // Fall through to eval_loop_jit
-                        }
-                        crate::call_jit::BlackholeResult::BailToInterpreter => {}
-                        _ => {
-                            if let Some(r) = bh_result.take_pyresult() {
-                                if majit_metainterp::majit_log_enabled() {
-                                    let returned_intval = match &r {
-                                        Ok(obj)
-                                            if !obj.is_null()
-                                                && unsafe {
-                                                    pyre_object::pyobject::is_int(*obj)
-                                                } =>
-                                        {
-                                            Some(unsafe {
-                                                pyre_object::intobject::w_int_get_value(*obj)
-                                            })
-                                        }
-                                        _ => None,
-                                    };
-                                    eprintln!(
-                                        "[jit][handle-outcome] bh-return arg0={:?} intval={:?}",
-                                        debug_first_arg_int(frame_root.frame()),
-                                        returned_intval,
-                                    );
-                                }
-                                return Some(r);
-                            }
-                        }
-                    }
-                }
+                HandleFailDispatch::Done(r) => return Some(r),
+                // Bridge compiled / blackhole CRN: ContinueRunningNormally
+                // re-enters compiled code via eval_loop_jit below.
+                HandleFailDispatch::ContinueRunningNormally | HandleFailDispatch::Fallthrough => {}
             }
         } else {
             match handle_jit_outcome(outcome, &jit_state, frame_root.frame(), info, green_key) {

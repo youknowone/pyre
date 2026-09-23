@@ -58,10 +58,15 @@ members = [
 pyre-object = { version = "0.0.2", path = "pyre/pyre-object" }
 pyre-macros = { version = "0.0.2", path = "pyre/pyre-macros" }
 pyre-native = { version = "0.0.2", path = "pyre/pyre-native", default-features = false }
-pyre-interpreter = { version = "0.0.2", path = "pyre/pyre-interpreter" }
+# Defaults off so a dependant can leave `full` out; each names `host_env`
+# itself and forwards `full` through a feature of its own.
+pyre-interpreter = { version = "0.0.2", path = "pyre/pyre-interpreter", default-features = false }
 pyre-sandbox = { version = "0.0.2", path = "pyre/pyre-sandbox" }
-pyre-module = { version = "0.0.2", path = "pyre/pyre-module" }
-pyre-jit = { version = "0.0.2", path = "pyre/pyre-jit" }
+# Defaults off so a core build can leave `full` unset. Each dependant names
+# `host_env` and forwards `full`.
+pyre-module = { version = "0.0.2", path = "pyre/pyre-module", default-features = false }
+# Defaults off for the same reason as `pyre-interpreter`: `full` is forwarded.
+pyre-jit = { version = "0.0.2", path = "pyre/pyre-jit", default-features = false }
 # Defaults off so `pyre-jit` forwards `dynasm` / `cranelift` / `prepass` one by
 # one and its LLBC extraction pass can leave `prepass` out (see that manifest).
 pyre-jit-trace = { version = "0.0.2", path = "pyre/pyre-jit-trace", default-features = false }

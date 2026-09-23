@@ -7,7 +7,10 @@ repository.workspace = true
 description = "Trace-time JIT for pyre — MIFrame and tracing logic"
 
 [features]
-default = ["dynasm", "prepass"]
+default = ["dynasm", "prepass", "full"]
+# The interpreter's whole builtin module set; reaches the build script's host
+# copy too, so the prepass registers the module surface the binary links.
+full = ["pyre-interpreter/full", "pyre-module/full"]
 cranelift = ["dep:majit-backend-cranelift", "majit-metainterp/cranelift"]
 dynasm = ["dep:majit-backend-dynasm", "majit-metainterp/dynasm"]
 # The build script's translation prepass over the LLBC set, and with it the
@@ -27,8 +30,8 @@ parking_lot = { workspace = true }
 bitflags = { workspace = true }
 indexmap = { workspace = true }
 pyre-object = { workspace = true }
-pyre-interpreter = { workspace = true }
-pyre-module = { workspace = true }
+pyre-interpreter = { workspace = true, features = ["host_env"] }
+pyre-module = { workspace = true, features = ["host_env"] }
 rustpython-wtf8 = { workspace = true }
 linkme = { workspace = true }
 majit-ir = { workspace = true }
@@ -60,12 +63,12 @@ majit-backend-wasm = { path = "../../majit/majit-backend-wasm", version = "0.0.2
 majit-ir = { workspace = true }
 majit-translate = { workspace = true, optional = true }
 mimalloc = { version = "0.1", optional = true }
-pyre-interpreter = { workspace = true, features = ["dynasm"], optional = true }
+pyre-interpreter = { workspace = true, features = ["host_env", "dynasm"], optional = true }
 # Same process as `jit_trace_fnaddrs()`: without this crate the
 # `#[pyre_methods]` wrappers that moved out of the interpreter never
 # join `BUILTIN_WRAPPER_DESCRIPTORS`, and every hot call to those
 # builtins takes the `no jitcode for address` residual.
-pyre-module = { workspace = true, optional = true }
+pyre-module = { workspace = true, optional = true, features = ["host_env"] }
 serde = { workspace = true, features = ["rc"] }
 serde_json = { workspace = true }
 bincode = { workspace = true }
@@ -78,4 +81,4 @@ insta = { workspace = true }
 # `#[test]`s here drive interpreter frames through `init_typeobjects` without
 # compiling pyre-interpreter under `cfg(test)`; enable its `test-hooks` feature
 # so the thread-local dict hash hook is installed on the test threads.
-pyre-interpreter = { workspace = true, features = ["test-hooks"] }
+pyre-interpreter = { workspace = true, features = ["host_env", "test-hooks"] }
