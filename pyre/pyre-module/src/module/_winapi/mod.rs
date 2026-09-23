@@ -561,169 +561,582 @@ mod process {
     }
 }
 
+#[cfg(feature = "host_env")]
+macro_rules! win_const {
+    (INFINITE) => {
+        host_winapi::INFINITE_TIMEOUT as i64
+    };
+    ($name:ident) => {
+        host_winapi::$name as i64
+    };
+}
+
+#[cfg(not(feature = "host_env"))]
+macro_rules! win_const {
+    (INFINITE) => {
+        0xFFFF_FFFFu32 as i64
+    };
+    (COPY_FILE_ALLOW_DECRYPTED_DESTINATION) => {
+        0x0000_0008 as i64
+    };
+    (COPY_FILE_COPY_SYMLINK) => {
+        0x0000_0800 as i64
+    };
+    (COPY_FILE_DIRECTORY) => {
+        0x0000_0080 as i64
+    };
+    (COPY_FILE_FAIL_IF_EXISTS) => {
+        0x0000_0001 as i64
+    };
+    (COPY_FILE_NO_BUFFERING) => {
+        0x0000_1000 as i64
+    };
+    (COPY_FILE_NO_OFFLOAD) => {
+        0x0004_0000 as i64
+    };
+    (COPY_FILE_OPEN_SOURCE_FOR_WRITE) => {
+        0x0000_0004 as i64
+    };
+    (COPY_FILE_REQUEST_COMPRESSED_TRAFFIC) => {
+        0x1000_0000 as i64
+    };
+    (COPY_FILE_REQUEST_SECURITY_PRIVILEGES) => {
+        0x0000_2000 as i64
+    };
+    (COPY_FILE_RESTARTABLE) => {
+        0x0000_0002 as i64
+    };
+    (COPY_FILE_RESUME_FROM_PAUSE) => {
+        0x0000_4000 as i64
+    };
+    (COPYFILE2_CALLBACK_CHUNK_STARTED) => {
+        1 as i64
+    };
+    (COPYFILE2_CALLBACK_CHUNK_FINISHED) => {
+        2 as i64
+    };
+    (COPYFILE2_CALLBACK_STREAM_STARTED) => {
+        3 as i64
+    };
+    (COPYFILE2_CALLBACK_STREAM_FINISHED) => {
+        4 as i64
+    };
+    (COPYFILE2_CALLBACK_POLL_CONTINUE) => {
+        5 as i64
+    };
+    (COPYFILE2_CALLBACK_ERROR) => {
+        6 as i64
+    };
+    (COPYFILE2_PROGRESS_CONTINUE) => {
+        0 as i64
+    };
+    (COPYFILE2_PROGRESS_CANCEL) => {
+        1 as i64
+    };
+    (COPYFILE2_PROGRESS_STOP) => {
+        2 as i64
+    };
+    (COPYFILE2_PROGRESS_QUIET) => {
+        3 as i64
+    };
+    (COPYFILE2_PROGRESS_PAUSE) => {
+        4 as i64
+    };
+    (ERROR_ACCESS_DENIED) => {
+        5 as i64
+    };
+    (ERROR_PRIVILEGE_NOT_HELD) => {
+        1314 as i64
+    };
+    (ERROR_ALREADY_EXISTS) => {
+        183 as i64
+    };
+    (ERROR_BROKEN_PIPE) => {
+        109 as i64
+    };
+    (ERROR_IO_PENDING) => {
+        997 as i64
+    };
+    (ERROR_MORE_DATA) => {
+        234 as i64
+    };
+    (ERROR_NETNAME_DELETED) => {
+        64 as i64
+    };
+    (ERROR_NO_DATA) => {
+        232 as i64
+    };
+    (ERROR_NO_SYSTEM_RESOURCES) => {
+        1450 as i64
+    };
+    (ERROR_OPERATION_ABORTED) => {
+        995 as i64
+    };
+    (ERROR_PIPE_BUSY) => {
+        231 as i64
+    };
+    (ERROR_PIPE_CONNECTED) => {
+        535 as i64
+    };
+    (ERROR_SEM_TIMEOUT) => {
+        121 as i64
+    };
+    (STD_INPUT_HANDLE) => {
+        0xFFFF_FFF6u32 as i64
+    };
+    (STD_OUTPUT_HANDLE) => {
+        0xFFFF_FFF5u32 as i64
+    };
+    (STD_ERROR_HANDLE) => {
+        0xFFFF_FFF4u32 as i64
+    };
+    (SW_HIDE) => {
+        0 as i64
+    };
+    (STARTF_USESHOWWINDOW) => {
+        0x0000_0001 as i64
+    };
+    (STARTF_USESTDHANDLES) => {
+        0x0000_0100 as i64
+    };
+    (STARTF_FORCEONFEEDBACK) => {
+        0x0000_0040 as i64
+    };
+    (STARTF_FORCEOFFFEEDBACK) => {
+        0x0000_0080 as i64
+    };
+    (STARTF_USESIZE) => {
+        0x0000_0002 as i64
+    };
+    (STARTF_USEPOSITION) => {
+        0x0000_0004 as i64
+    };
+    (STARTF_USECOUNTCHARS) => {
+        0x0000_0008 as i64
+    };
+    (STARTF_USEFILLATTRIBUTE) => {
+        0x0000_0010 as i64
+    };
+    (STARTF_RUNFULLSCREEN) => {
+        0x0000_0020 as i64
+    };
+    (STARTF_USEHOTKEY) => {
+        0x0000_0200 as i64
+    };
+    (STARTF_TITLEISLINKNAME) => {
+        0x0000_0800 as i64
+    };
+    (STARTF_TITLEISAPPID) => {
+        0x0000_1000 as i64
+    };
+    (STARTF_PREVENTPINNING) => {
+        0x0000_2000 as i64
+    };
+    (STARTF_UNTRUSTEDSOURCE) => {
+        0x0000_8000 as i64
+    };
+    (CREATE_NEW_CONSOLE) => {
+        0x0000_0010 as i64
+    };
+    (CREATE_NEW_PROCESS_GROUP) => {
+        0x0000_0200 as i64
+    };
+    (CREATE_NO_WINDOW) => {
+        0x0800_0000 as i64
+    };
+    (DETACHED_PROCESS) => {
+        0x0000_0008 as i64
+    };
+    (CREATE_DEFAULT_ERROR_MODE) => {
+        0x0400_0000 as i64
+    };
+    (CREATE_BREAKAWAY_FROM_JOB) => {
+        0x0100_0000 as i64
+    };
+    (ABOVE_NORMAL_PRIORITY_CLASS) => {
+        0x0000_8000 as i64
+    };
+    (BELOW_NORMAL_PRIORITY_CLASS) => {
+        0x0000_4000 as i64
+    };
+    (HIGH_PRIORITY_CLASS) => {
+        0x0000_0080 as i64
+    };
+    (IDLE_PRIORITY_CLASS) => {
+        0x0000_0040 as i64
+    };
+    (NORMAL_PRIORITY_CLASS) => {
+        0x0000_0020 as i64
+    };
+    (REALTIME_PRIORITY_CLASS) => {
+        0x0000_0100 as i64
+    };
+    (WAIT_OBJECT_0) => {
+        0 as i64
+    };
+    (WAIT_ABANDONED_0) => {
+        0x0000_0080 as i64
+    };
+    (WAIT_TIMEOUT) => {
+        0x0000_0102 as i64
+    };
+    (STILL_ACTIVE) => {
+        259 as i64
+    };
+    (DUPLICATE_SAME_ACCESS) => {
+        0x0000_0002 as i64
+    };
+    (DUPLICATE_CLOSE_SOURCE) => {
+        0x0000_0001 as i64
+    };
+    (FILE_TYPE_UNKNOWN) => {
+        0x0000 as i64
+    };
+    (FILE_TYPE_DISK) => {
+        0x0001 as i64
+    };
+    (FILE_TYPE_CHAR) => {
+        0x0002 as i64
+    };
+    (FILE_TYPE_PIPE) => {
+        0x0003 as i64
+    };
+    (FILE_TYPE_REMOTE) => {
+        0x8000 as i64
+    };
+    (PROCESS_ALL_ACCESS) => {
+        0x001F_FFFF as i64
+    };
+    (PROCESS_DUP_HANDLE) => {
+        0x0000_0040 as i64
+    };
+    (SYNCHRONIZE) => {
+        0x0010_0000 as i64
+    };
+    (GENERIC_READ) => {
+        0x8000_0000u32 as i64
+    };
+    (GENERIC_WRITE) => {
+        0x4000_0000 as i64
+    };
+    (FILE_GENERIC_READ) => {
+        0x0012_0089 as i64
+    };
+    (FILE_GENERIC_WRITE) => {
+        0x0012_0116 as i64
+    };
+    (OPEN_EXISTING) => {
+        3 as i64
+    };
+    (FILE_FLAG_OVERLAPPED) => {
+        0x4000_0000 as i64
+    };
+    (FILE_FLAG_FIRST_PIPE_INSTANCE) => {
+        0x0008_0000 as i64
+    };
+    (PIPE_ACCESS_INBOUND) => {
+        0x0000_0001 as i64
+    };
+    (PIPE_ACCESS_DUPLEX) => {
+        0x0000_0003 as i64
+    };
+    (PIPE_READMODE_MESSAGE) => {
+        0x0000_0002 as i64
+    };
+    (PIPE_TYPE_MESSAGE) => {
+        0x0000_0004 as i64
+    };
+    (PIPE_WAIT) => {
+        0x0000_0000 as i64
+    };
+    (PIPE_UNLIMITED_INSTANCES) => {
+        255 as i64
+    };
+    (NMPWAIT_WAIT_FOREVER) => {
+        0xFFFF_FFFFu32 as i64
+    };
+    (PAGE_NOACCESS) => {
+        0x0000_0001 as i64
+    };
+    (PAGE_READONLY) => {
+        0x0000_0002 as i64
+    };
+    (PAGE_READWRITE) => {
+        0x0000_0004 as i64
+    };
+    (PAGE_WRITECOPY) => {
+        0x0000_0008 as i64
+    };
+    (PAGE_EXECUTE) => {
+        0x0000_0010 as i64
+    };
+    (PAGE_EXECUTE_READ) => {
+        0x0000_0020 as i64
+    };
+    (PAGE_EXECUTE_READWRITE) => {
+        0x0000_0040 as i64
+    };
+    (PAGE_EXECUTE_WRITECOPY) => {
+        0x0000_0080 as i64
+    };
+    (PAGE_GUARD) => {
+        0x0000_0100 as i64
+    };
+    (PAGE_NOCACHE) => {
+        0x0000_0200 as i64
+    };
+    (PAGE_WRITECOMBINE) => {
+        0x0000_0400 as i64
+    };
+    (FILE_MAP_COPY) => {
+        0x0000_0001 as i64
+    };
+    (FILE_MAP_WRITE) => {
+        0x0000_0002 as i64
+    };
+    (FILE_MAP_READ) => {
+        0x0000_0004 as i64
+    };
+    (FILE_MAP_EXECUTE) => {
+        0x0000_0020 as i64
+    };
+    (FILE_MAP_ALL_ACCESS) => {
+        0x000F_001F as i64
+    };
+    (SEC_IMAGE) => {
+        0x0100_0000 as i64
+    };
+    (SEC_RESERVE) => {
+        0x0400_0000 as i64
+    };
+    (SEC_COMMIT) => {
+        0x0800_0000 as i64
+    };
+    (SEC_NOCACHE) => {
+        0x1000_0000 as i64
+    };
+    (SEC_WRITECOMBINE) => {
+        0x4000_0000 as i64
+    };
+    (SEC_LARGE_PAGES) => {
+        0x8000_0000u32 as i64
+    };
+    (MEM_COMMIT) => {
+        0x0000_1000 as i64
+    };
+    (MEM_RESERVE) => {
+        0x0000_2000 as i64
+    };
+    (MEM_FREE) => {
+        0x0001_0000 as i64
+    };
+    (MEM_PRIVATE) => {
+        0x0002_0000 as i64
+    };
+    (MEM_MAPPED) => {
+        0x0004_0000 as i64
+    };
+    (MEM_IMAGE) => {
+        0x0100_0000 as i64
+    };
+    (LCMAP_LOWERCASE) => {
+        0x0000_0100 as i64
+    };
+    (LCMAP_UPPERCASE) => {
+        0x0000_0200 as i64
+    };
+    (LCMAP_TITLECASE) => {
+        0x0000_0300 as i64
+    };
+    (LCMAP_HIRAGANA) => {
+        0x0010_0000 as i64
+    };
+    (LCMAP_KATAKANA) => {
+        0x0020_0000 as i64
+    };
+    (LCMAP_HALFWIDTH) => {
+        0x0040_0000 as i64
+    };
+    (LCMAP_FULLWIDTH) => {
+        0x0080_0000 as i64
+    };
+    (LCMAP_LINGUISTIC_CASING) => {
+        0x0100_0000 as i64
+    };
+    (LCMAP_SIMPLIFIED_CHINESE) => {
+        0x0200_0000 as i64
+    };
+    (LCMAP_TRADITIONAL_CHINESE) => {
+        0x0400_0000 as i64
+    };
+    (LOCALE_NAME_MAX_LENGTH) => {
+        85 as i64
+    };
+}
+
 pyre_interpreter::py_module! {
     "_winapi",
     int_constants: {
         // CopyFileEx / CopyFile2 flags (winbase.h).
-        "COPY_FILE_ALLOW_DECRYPTED_DESTINATION" => 0x0000_0008,
-        "COPY_FILE_COPY_SYMLINK" => 0x0000_0800,
-        "COPY_FILE_DIRECTORY" => 0x0000_0080,
-        "COPY_FILE_FAIL_IF_EXISTS" => 0x0000_0001,
-        "COPY_FILE_NO_BUFFERING" => 0x0000_1000,
-        "COPY_FILE_NO_OFFLOAD" => 0x0004_0000,
-        "COPY_FILE_OPEN_SOURCE_FOR_WRITE" => 0x0000_0004,
-        "COPY_FILE_REQUEST_COMPRESSED_TRAFFIC" => 0x1000_0000,
-        "COPY_FILE_REQUEST_SECURITY_PRIVILEGES" => 0x0000_2000,
-        "COPY_FILE_RESTARTABLE" => 0x0000_0002,
-        "COPY_FILE_RESUME_FROM_PAUSE" => 0x0000_4000,
+        "COPY_FILE_ALLOW_DECRYPTED_DESTINATION" => win_const!(COPY_FILE_ALLOW_DECRYPTED_DESTINATION),
+        "COPY_FILE_COPY_SYMLINK" => win_const!(COPY_FILE_COPY_SYMLINK),
+        "COPY_FILE_DIRECTORY" => win_const!(COPY_FILE_DIRECTORY),
+        "COPY_FILE_FAIL_IF_EXISTS" => win_const!(COPY_FILE_FAIL_IF_EXISTS),
+        "COPY_FILE_NO_BUFFERING" => win_const!(COPY_FILE_NO_BUFFERING),
+        "COPY_FILE_NO_OFFLOAD" => win_const!(COPY_FILE_NO_OFFLOAD),
+        "COPY_FILE_OPEN_SOURCE_FOR_WRITE" => win_const!(COPY_FILE_OPEN_SOURCE_FOR_WRITE),
+        "COPY_FILE_REQUEST_COMPRESSED_TRAFFIC" => win_const!(COPY_FILE_REQUEST_COMPRESSED_TRAFFIC),
+        "COPY_FILE_REQUEST_SECURITY_PRIVILEGES" => win_const!(COPY_FILE_REQUEST_SECURITY_PRIVILEGES),
+        "COPY_FILE_RESTARTABLE" => win_const!(COPY_FILE_RESTARTABLE),
+        "COPY_FILE_RESUME_FROM_PAUSE" => win_const!(COPY_FILE_RESUME_FROM_PAUSE),
         // The reasons a `CopyFile2` progress routine is called and the
         // answers it may give (winbase.h).  Nothing here calls one — the
         // extended parameters leave the callback field unset — but the
         // constants are part of the module's surface.
-        "COPYFILE2_CALLBACK_CHUNK_STARTED" => 1,
-        "COPYFILE2_CALLBACK_CHUNK_FINISHED" => 2,
-        "COPYFILE2_CALLBACK_STREAM_STARTED" => 3,
-        "COPYFILE2_CALLBACK_STREAM_FINISHED" => 4,
-        "COPYFILE2_CALLBACK_POLL_CONTINUE" => 5,
-        "COPYFILE2_CALLBACK_ERROR" => 6,
-        "COPYFILE2_PROGRESS_CONTINUE" => 0,
-        "COPYFILE2_PROGRESS_CANCEL" => 1,
-        "COPYFILE2_PROGRESS_STOP" => 2,
-        "COPYFILE2_PROGRESS_QUIET" => 3,
-        "COPYFILE2_PROGRESS_PAUSE" => 4,
+        "COPYFILE2_CALLBACK_CHUNK_STARTED" => win_const!(COPYFILE2_CALLBACK_CHUNK_STARTED),
+        "COPYFILE2_CALLBACK_CHUNK_FINISHED" => win_const!(COPYFILE2_CALLBACK_CHUNK_FINISHED),
+        "COPYFILE2_CALLBACK_STREAM_STARTED" => win_const!(COPYFILE2_CALLBACK_STREAM_STARTED),
+        "COPYFILE2_CALLBACK_STREAM_FINISHED" => win_const!(COPYFILE2_CALLBACK_STREAM_FINISHED),
+        "COPYFILE2_CALLBACK_POLL_CONTINUE" => win_const!(COPYFILE2_CALLBACK_POLL_CONTINUE),
+        "COPYFILE2_CALLBACK_ERROR" => win_const!(COPYFILE2_CALLBACK_ERROR),
+        "COPYFILE2_PROGRESS_CONTINUE" => win_const!(COPYFILE2_PROGRESS_CONTINUE),
+        "COPYFILE2_PROGRESS_CANCEL" => win_const!(COPYFILE2_PROGRESS_CANCEL),
+        "COPYFILE2_PROGRESS_STOP" => win_const!(COPYFILE2_PROGRESS_STOP),
+        "COPYFILE2_PROGRESS_QUIET" => win_const!(COPYFILE2_PROGRESS_QUIET),
+        "COPYFILE2_PROGRESS_PAUSE" => win_const!(COPYFILE2_PROGRESS_PAUSE),
         // System error codes (winerror.h) a caller compares
         // `OSError.winerror` against to decide whether to retry.
-        "ERROR_ACCESS_DENIED" => 5,
-        "ERROR_PRIVILEGE_NOT_HELD" => 1314,
-        "ERROR_ALREADY_EXISTS" => 183,
-        "ERROR_BROKEN_PIPE" => 109,
-        "ERROR_IO_PENDING" => 997,
-        "ERROR_MORE_DATA" => 234,
-        "ERROR_NETNAME_DELETED" => 64,
-        "ERROR_NO_DATA" => 232,
-        "ERROR_NO_SYSTEM_RESOURCES" => 1450,
-        "ERROR_OPERATION_ABORTED" => 995,
-        "ERROR_PIPE_BUSY" => 231,
-        "ERROR_PIPE_CONNECTED" => 535,
-        "ERROR_SEM_TIMEOUT" => 121,
+        "ERROR_ACCESS_DENIED" => win_const!(ERROR_ACCESS_DENIED),
+        "ERROR_PRIVILEGE_NOT_HELD" => win_const!(ERROR_PRIVILEGE_NOT_HELD),
+        "ERROR_ALREADY_EXISTS" => win_const!(ERROR_ALREADY_EXISTS),
+        "ERROR_BROKEN_PIPE" => win_const!(ERROR_BROKEN_PIPE),
+        "ERROR_IO_PENDING" => win_const!(ERROR_IO_PENDING),
+        "ERROR_MORE_DATA" => win_const!(ERROR_MORE_DATA),
+        "ERROR_NETNAME_DELETED" => win_const!(ERROR_NETNAME_DELETED),
+        "ERROR_NO_DATA" => win_const!(ERROR_NO_DATA),
+        "ERROR_NO_SYSTEM_RESOURCES" => win_const!(ERROR_NO_SYSTEM_RESOURCES),
+        "ERROR_OPERATION_ABORTED" => win_const!(ERROR_OPERATION_ABORTED),
+        "ERROR_PIPE_BUSY" => win_const!(ERROR_PIPE_BUSY),
+        "ERROR_PIPE_CONNECTED" => win_const!(ERROR_PIPE_CONNECTED),
+        "ERROR_SEM_TIMEOUT" => win_const!(ERROR_SEM_TIMEOUT),
         // `subprocess` imports these at module load (its Windows branch, taken
         // once `msvcrt` exists) — GetStdHandle ids, ShowWindow/STARTUPINFO
         // flags, and CreateProcess creation/priority flags (winbase.h,
         // processthreadsapi.h).  Exposed as the unsigned DWORD values.
-        "STD_INPUT_HANDLE" => 0xFFFF_FFF6u32,
-        "STD_OUTPUT_HANDLE" => 0xFFFF_FFF5u32,
-        "STD_ERROR_HANDLE" => 0xFFFF_FFF4u32,
-        "SW_HIDE" => 0,
-        "STARTF_USESHOWWINDOW" => 0x0000_0001,
-        "STARTF_USESTDHANDLES" => 0x0000_0100,
-        "STARTF_FORCEONFEEDBACK" => 0x0000_0040,
-        "STARTF_FORCEOFFFEEDBACK" => 0x0000_0080,
-        "STARTF_USESIZE" => 0x0000_0002,
-        "STARTF_USEPOSITION" => 0x0000_0004,
-        "STARTF_USECOUNTCHARS" => 0x0000_0008,
-        "STARTF_USEFILLATTRIBUTE" => 0x0000_0010,
-        "STARTF_RUNFULLSCREEN" => 0x0000_0020,
-        "STARTF_USEHOTKEY" => 0x0000_0200,
-        "STARTF_TITLEISLINKNAME" => 0x0000_0800,
-        "STARTF_TITLEISAPPID" => 0x0000_1000,
-        "STARTF_PREVENTPINNING" => 0x0000_2000,
-        "STARTF_UNTRUSTEDSOURCE" => 0x0000_8000,
-        "CREATE_NEW_CONSOLE" => 0x0000_0010,
-        "CREATE_NEW_PROCESS_GROUP" => 0x0000_0200,
-        "CREATE_NO_WINDOW" => 0x0800_0000,
-        "DETACHED_PROCESS" => 0x0000_0008,
-        "CREATE_DEFAULT_ERROR_MODE" => 0x0400_0000,
-        "CREATE_BREAKAWAY_FROM_JOB" => 0x0100_0000,
-        "ABOVE_NORMAL_PRIORITY_CLASS" => 0x0000_8000,
-        "BELOW_NORMAL_PRIORITY_CLASS" => 0x0000_4000,
-        "HIGH_PRIORITY_CLASS" => 0x0000_0080,
-        "IDLE_PRIORITY_CLASS" => 0x0000_0040,
-        "NORMAL_PRIORITY_CLASS" => 0x0000_0020,
-        "REALTIME_PRIORITY_CLASS" => 0x0000_0100,
+        "STD_INPUT_HANDLE" => win_const!(STD_INPUT_HANDLE),
+        "STD_OUTPUT_HANDLE" => win_const!(STD_OUTPUT_HANDLE),
+        "STD_ERROR_HANDLE" => win_const!(STD_ERROR_HANDLE),
+        "SW_HIDE" => win_const!(SW_HIDE),
+        "STARTF_USESHOWWINDOW" => win_const!(STARTF_USESHOWWINDOW),
+        "STARTF_USESTDHANDLES" => win_const!(STARTF_USESTDHANDLES),
+        "STARTF_FORCEONFEEDBACK" => win_const!(STARTF_FORCEONFEEDBACK),
+        "STARTF_FORCEOFFFEEDBACK" => win_const!(STARTF_FORCEOFFFEEDBACK),
+        "STARTF_USESIZE" => win_const!(STARTF_USESIZE),
+        "STARTF_USEPOSITION" => win_const!(STARTF_USEPOSITION),
+        "STARTF_USECOUNTCHARS" => win_const!(STARTF_USECOUNTCHARS),
+        "STARTF_USEFILLATTRIBUTE" => win_const!(STARTF_USEFILLATTRIBUTE),
+        "STARTF_RUNFULLSCREEN" => win_const!(STARTF_RUNFULLSCREEN),
+        "STARTF_USEHOTKEY" => win_const!(STARTF_USEHOTKEY),
+        "STARTF_TITLEISLINKNAME" => win_const!(STARTF_TITLEISLINKNAME),
+        "STARTF_TITLEISAPPID" => win_const!(STARTF_TITLEISAPPID),
+        "STARTF_PREVENTPINNING" => win_const!(STARTF_PREVENTPINNING),
+        "STARTF_UNTRUSTEDSOURCE" => win_const!(STARTF_UNTRUSTEDSOURCE),
+        "CREATE_NEW_CONSOLE" => win_const!(CREATE_NEW_CONSOLE),
+        "CREATE_NEW_PROCESS_GROUP" => win_const!(CREATE_NEW_PROCESS_GROUP),
+        "CREATE_NO_WINDOW" => win_const!(CREATE_NO_WINDOW),
+        "DETACHED_PROCESS" => win_const!(DETACHED_PROCESS),
+        "CREATE_DEFAULT_ERROR_MODE" => win_const!(CREATE_DEFAULT_ERROR_MODE),
+        "CREATE_BREAKAWAY_FROM_JOB" => win_const!(CREATE_BREAKAWAY_FROM_JOB),
+        "ABOVE_NORMAL_PRIORITY_CLASS" => win_const!(ABOVE_NORMAL_PRIORITY_CLASS),
+        "BELOW_NORMAL_PRIORITY_CLASS" => win_const!(BELOW_NORMAL_PRIORITY_CLASS),
+        "HIGH_PRIORITY_CLASS" => win_const!(HIGH_PRIORITY_CLASS),
+        "IDLE_PRIORITY_CLASS" => win_const!(IDLE_PRIORITY_CLASS),
+        "NORMAL_PRIORITY_CLASS" => win_const!(NORMAL_PRIORITY_CLASS),
+        "REALTIME_PRIORITY_CLASS" => win_const!(REALTIME_PRIORITY_CLASS),
         // WaitForSingleObject results / GetExitCodeProcess sentinel that
         // `subprocess.Popen._wait`/`poll` capture (winbase.h, ntstatus.h).
-        "WAIT_OBJECT_0" => 0,
-        "WAIT_ABANDONED_0" => 0x0000_0080,
-        "WAIT_TIMEOUT" => 0x0000_0102,
-        "INFINITE" => 0xFFFF_FFFFu32,
-        "STILL_ACTIVE" => 259,
+        "WAIT_OBJECT_0" => win_const!(WAIT_OBJECT_0),
+        "WAIT_ABANDONED_0" => win_const!(WAIT_ABANDONED_0),
+        "WAIT_TIMEOUT" => win_const!(WAIT_TIMEOUT),
+        "INFINITE" => win_const!(INFINITE),
+        "STILL_ACTIVE" => win_const!(STILL_ACTIVE),
         // `DuplicateHandle` options and the handle sentinel (handleapi.h).
-        "DUPLICATE_SAME_ACCESS" => 0x0000_0002,
-        "DUPLICATE_CLOSE_SOURCE" => 0x0000_0001,
+        "DUPLICATE_SAME_ACCESS" => win_const!(DUPLICATE_SAME_ACCESS),
+        "DUPLICATE_CLOSE_SOURCE" => win_const!(DUPLICATE_CLOSE_SOURCE),
         "NULL" => 0,
         // `GetFileType` answers.  A console handle is the one a caller drops
         // from an inherited handle list (`Popen._filter_handle_list`).
-        "FILE_TYPE_UNKNOWN" => 0x0000,
-        "FILE_TYPE_DISK" => 0x0001,
-        "FILE_TYPE_CHAR" => 0x0002,
-        "FILE_TYPE_PIPE" => 0x0003,
-        "FILE_TYPE_REMOTE" => 0x8000,
+        "FILE_TYPE_UNKNOWN" => win_const!(FILE_TYPE_UNKNOWN),
+        "FILE_TYPE_DISK" => win_const!(FILE_TYPE_DISK),
+        "FILE_TYPE_CHAR" => win_const!(FILE_TYPE_CHAR),
+        "FILE_TYPE_PIPE" => win_const!(FILE_TYPE_PIPE),
+        "FILE_TYPE_REMOTE" => win_const!(FILE_TYPE_REMOTE),
         // `OpenProcess`/`DuplicateHandle` access rights (processthreadsapi.h),
         // and the one right every waitable object grants (winnt.h).
-        "PROCESS_ALL_ACCESS" => 0x001F_FFFF,
-        "PROCESS_DUP_HANDLE" => 0x0000_0040,
-        "SYNCHRONIZE" => 0x0010_0000,
+        "PROCESS_ALL_ACCESS" => win_const!(PROCESS_ALL_ACCESS),
+        "PROCESS_DUP_HANDLE" => win_const!(PROCESS_DUP_HANDLE),
+        "SYNCHRONIZE" => win_const!(SYNCHRONIZE),
         // `CreateFile` access rights, share modes and creation dispositions
         // (winnt.h, fileapi.h).
-        "GENERIC_READ" => 0x8000_0000u32,
-        "GENERIC_WRITE" => 0x4000_0000,
-        "FILE_GENERIC_READ" => 0x0012_0089,
-        "FILE_GENERIC_WRITE" => 0x0012_0116,
-        "OPEN_EXISTING" => 3,
-        "FILE_FLAG_OVERLAPPED" => 0x4000_0000,
-        "FILE_FLAG_FIRST_PIPE_INSTANCE" => 0x0008_0000,
+        "GENERIC_READ" => win_const!(GENERIC_READ),
+        "GENERIC_WRITE" => win_const!(GENERIC_WRITE),
+        "FILE_GENERIC_READ" => win_const!(FILE_GENERIC_READ),
+        "FILE_GENERIC_WRITE" => win_const!(FILE_GENERIC_WRITE),
+        "OPEN_EXISTING" => win_const!(OPEN_EXISTING),
+        "FILE_FLAG_OVERLAPPED" => win_const!(FILE_FLAG_OVERLAPPED),
+        "FILE_FLAG_FIRST_PIPE_INSTANCE" => win_const!(FILE_FLAG_FIRST_PIPE_INSTANCE),
         // Named pipe open modes, pipe modes and waits (winbase.h).
-        "PIPE_ACCESS_INBOUND" => 0x0000_0001,
-        "PIPE_ACCESS_DUPLEX" => 0x0000_0003,
-        "PIPE_READMODE_MESSAGE" => 0x0000_0002,
-        "PIPE_TYPE_MESSAGE" => 0x0000_0004,
-        "PIPE_WAIT" => 0x0000_0000,
-        "PIPE_UNLIMITED_INSTANCES" => 255,
-        "NMPWAIT_WAIT_FOREVER" => 0xFFFF_FFFFu32,
+        "PIPE_ACCESS_INBOUND" => win_const!(PIPE_ACCESS_INBOUND),
+        "PIPE_ACCESS_DUPLEX" => win_const!(PIPE_ACCESS_DUPLEX),
+        "PIPE_READMODE_MESSAGE" => win_const!(PIPE_READMODE_MESSAGE),
+        "PIPE_TYPE_MESSAGE" => win_const!(PIPE_TYPE_MESSAGE),
+        "PIPE_WAIT" => win_const!(PIPE_WAIT),
+        "PIPE_UNLIMITED_INSTANCES" => win_const!(PIPE_UNLIMITED_INSTANCES),
+        "NMPWAIT_WAIT_FOREVER" => win_const!(NMPWAIT_WAIT_FOREVER),
         // File-mapping protections, view access rights, section attributes
         // and the region states `VirtualQuery` reports (winnt.h, memoryapi.h).
-        "PAGE_NOACCESS" => 0x0000_0001,
-        "PAGE_READONLY" => 0x0000_0002,
-        "PAGE_READWRITE" => 0x0000_0004,
-        "PAGE_WRITECOPY" => 0x0000_0008,
-        "PAGE_EXECUTE" => 0x0000_0010,
-        "PAGE_EXECUTE_READ" => 0x0000_0020,
-        "PAGE_EXECUTE_READWRITE" => 0x0000_0040,
-        "PAGE_EXECUTE_WRITECOPY" => 0x0000_0080,
-        "PAGE_GUARD" => 0x0000_0100,
-        "PAGE_NOCACHE" => 0x0000_0200,
-        "PAGE_WRITECOMBINE" => 0x0000_0400,
-        "FILE_MAP_COPY" => 0x0000_0001,
-        "FILE_MAP_WRITE" => 0x0000_0002,
-        "FILE_MAP_READ" => 0x0000_0004,
-        "FILE_MAP_EXECUTE" => 0x0000_0020,
-        "FILE_MAP_ALL_ACCESS" => 0x000F_001F,
-        "SEC_IMAGE" => 0x0100_0000,
-        "SEC_RESERVE" => 0x0400_0000,
-        "SEC_COMMIT" => 0x0800_0000,
-        "SEC_NOCACHE" => 0x1000_0000,
-        "SEC_WRITECOMBINE" => 0x4000_0000,
-        "SEC_LARGE_PAGES" => 0x8000_0000u32,
-        "MEM_COMMIT" => 0x0000_1000,
-        "MEM_RESERVE" => 0x0000_2000,
-        "MEM_FREE" => 0x0001_0000,
-        "MEM_PRIVATE" => 0x0002_0000,
-        "MEM_MAPPED" => 0x0004_0000,
-        "MEM_IMAGE" => 0x0100_0000,
+        "PAGE_NOACCESS" => win_const!(PAGE_NOACCESS),
+        "PAGE_READONLY" => win_const!(PAGE_READONLY),
+        "PAGE_READWRITE" => win_const!(PAGE_READWRITE),
+        "PAGE_WRITECOPY" => win_const!(PAGE_WRITECOPY),
+        "PAGE_EXECUTE" => win_const!(PAGE_EXECUTE),
+        "PAGE_EXECUTE_READ" => win_const!(PAGE_EXECUTE_READ),
+        "PAGE_EXECUTE_READWRITE" => win_const!(PAGE_EXECUTE_READWRITE),
+        "PAGE_EXECUTE_WRITECOPY" => win_const!(PAGE_EXECUTE_WRITECOPY),
+        "PAGE_GUARD" => win_const!(PAGE_GUARD),
+        "PAGE_NOCACHE" => win_const!(PAGE_NOCACHE),
+        "PAGE_WRITECOMBINE" => win_const!(PAGE_WRITECOMBINE),
+        "FILE_MAP_COPY" => win_const!(FILE_MAP_COPY),
+        "FILE_MAP_WRITE" => win_const!(FILE_MAP_WRITE),
+        "FILE_MAP_READ" => win_const!(FILE_MAP_READ),
+        "FILE_MAP_EXECUTE" => win_const!(FILE_MAP_EXECUTE),
+        "FILE_MAP_ALL_ACCESS" => win_const!(FILE_MAP_ALL_ACCESS),
+        "SEC_IMAGE" => win_const!(SEC_IMAGE),
+        "SEC_RESERVE" => win_const!(SEC_RESERVE),
+        "SEC_COMMIT" => win_const!(SEC_COMMIT),
+        "SEC_NOCACHE" => win_const!(SEC_NOCACHE),
+        "SEC_WRITECOMBINE" => win_const!(SEC_WRITECOMBINE),
+        "SEC_LARGE_PAGES" => win_const!(SEC_LARGE_PAGES),
+        "MEM_COMMIT" => win_const!(MEM_COMMIT),
+        "MEM_RESERVE" => win_const!(MEM_RESERVE),
+        "MEM_FREE" => win_const!(MEM_FREE),
+        "MEM_PRIVATE" => win_const!(MEM_PRIVATE),
+        "MEM_MAPPED" => win_const!(MEM_MAPPED),
+        "MEM_IMAGE" => win_const!(MEM_IMAGE),
         // `LCMapStringEx` transforms and the longest locale name it takes
         // (winnls.h).  The four that answer with a sort key or a hash rather
         // than text are not among them — `LCMapStringEx` rejects those.
-        "LCMAP_LOWERCASE" => 0x0000_0100,
-        "LCMAP_UPPERCASE" => 0x0000_0200,
-        "LCMAP_TITLECASE" => 0x0000_0300,
-        "LCMAP_HIRAGANA" => 0x0010_0000,
-        "LCMAP_KATAKANA" => 0x0020_0000,
-        "LCMAP_HALFWIDTH" => 0x0040_0000,
-        "LCMAP_FULLWIDTH" => 0x0080_0000,
-        "LCMAP_LINGUISTIC_CASING" => 0x0100_0000,
-        "LCMAP_SIMPLIFIED_CHINESE" => 0x0200_0000,
-        "LCMAP_TRADITIONAL_CHINESE" => 0x0400_0000,
-        "LOCALE_NAME_MAX_LENGTH" => 85,
+        "LCMAP_LOWERCASE" => win_const!(LCMAP_LOWERCASE),
+        "LCMAP_UPPERCASE" => win_const!(LCMAP_UPPERCASE),
+        "LCMAP_TITLECASE" => win_const!(LCMAP_TITLECASE),
+        "LCMAP_HIRAGANA" => win_const!(LCMAP_HIRAGANA),
+        "LCMAP_KATAKANA" => win_const!(LCMAP_KATAKANA),
+        "LCMAP_HALFWIDTH" => win_const!(LCMAP_HALFWIDTH),
+        "LCMAP_FULLWIDTH" => win_const!(LCMAP_FULLWIDTH),
+        "LCMAP_LINGUISTIC_CASING" => win_const!(LCMAP_LINGUISTIC_CASING),
+        "LCMAP_SIMPLIFIED_CHINESE" => win_const!(LCMAP_SIMPLIFIED_CHINESE),
+        "LCMAP_TRADITIONAL_CHINESE" => win_const!(LCMAP_TRADITIONAL_CHINESE),
+        "LOCALE_NAME_MAX_LENGTH" => win_const!(LOCALE_NAME_MAX_LENGTH),
     },
     inline_functions: {
         fn NeedCurrentDirectoryForExePath(

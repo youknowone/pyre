@@ -22,11 +22,10 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 
 use super::win32_err;
 
-const ERROR_IO_PENDING: u32 = 997;
-const ERROR_MORE_DATA: u32 = 234;
-const ERROR_OPERATION_ABORTED: u32 = 995;
-const ERROR_IO_INCOMPLETE: u32 = 996;
-const ERROR_PIPE_CONNECTED: u32 = 535;
+use host_winapi::{
+    ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_OPERATION_ABORTED,
+    ERROR_PIPE_CONNECTED,
+};
 
 /// What the buffer holds, which is also what `getbuffer` may answer with.
 #[derive(Clone, Copy, Eq, PartialEq)]

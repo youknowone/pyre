@@ -730,231 +730,243 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
 
     // `_rsocket_rffi.py` keeps a separate `_MSVC` constant list because the
     // two headers name overlapping but different sets; this is that list.
-    // The `Networking::WinSock` values are `<winsock2.h>`/`<ws2tcpip.h>`
-    // themselves, so what is absent here is absent from the platform.
+    // The values are the host_env names of `<winsock2.h>` / `<ws2tcpip.h>` /
+    // `<hvsocket.h>`. What is absent here is absent from the platform.
     #[cfg(windows)]
     {
-        use windows_sys::Win32::Networking::WinSock as ws;
         macro_rules! cst {
             ($name:literal, $val:expr) => {
                 pyre_interpreter::module_ns_store(ns, $name, pyre_object::w_int_new($val as i64));
             };
         }
+        // `$host as i32` before the widening cast: `PyModule_AddIntConstant`
+        // takes a 32-bit `long`, so a top-bit word is the negative it spells.
+        macro_rules! hc {
+            ($py:literal, $host:ident, $fallback:expr) => {
+                #[cfg(feature = "host_env")]
+                cst!($py, rustpython_host_env::socket::$host);
+                #[cfg(not(feature = "host_env"))]
+                cst!($py, $fallback);
+            };
+            (signed $py:literal, $host:ident, $fallback:expr) => {
+                #[cfg(feature = "host_env")]
+                cst!($py, rustpython_host_env::socket::$host as i32);
+                #[cfg(not(feature = "host_env"))]
+                cst!($py, $fallback);
+            };
+        }
+        #[cfg(not(feature = "host_env"))]
         use windows_sys::Win32::Devices::Bluetooth as bt;
+        #[cfg(not(feature = "host_env"))]
+        use windows_sys::Win32::Networking::WinSock as ws;
         // ── Address families ──
-        cst!("AF_UNSPEC", ws::AF_UNSPEC);
-        cst!("AF_INET", ws::AF_INET);
-        cst!("AF_INET6", ws::AF_INET6);
-        cst!("AF_APPLETALK", ws::AF_APPLETALK);
-        cst!("AF_DECnet", ws::AF_DECnet);
-        cst!("AF_IPX", ws::AF_IPX);
-        cst!("AF_LINK", ws::AF_LINK);
-        // `socketmodule.c:PyInit__socket` publishes the address families the
-        // 3.14 Windows SDK exposes in addition to PyPy's older MSVC census.
-        cst!("AF_SNA", 11);
-        cst!("AF_IRDA", 26);
-        cst!("AF_BLUETOOTH", bt::AF_BTH);
-        cst!("AF_HYPERV", ws::AF_HYPERV);
+        hc!("AF_UNSPEC", AF_UNSPEC, ws::AF_UNSPEC);
+        hc!("AF_INET", AF_INET, ws::AF_INET);
+        hc!("AF_INET6", AF_INET6, ws::AF_INET6);
+        hc!("AF_APPLETALK", AF_APPLETALK, ws::AF_APPLETALK);
+        hc!("AF_DECnet", AF_DECnet, ws::AF_DECnet);
+        hc!("AF_IPX", AF_IPX, ws::AF_IPX);
+        hc!("AF_LINK", AF_LINK, ws::AF_LINK);
+        hc!("AF_SNA", AF_SNA, 11);
+        hc!("AF_IRDA", AF_IRDA, 26);
+        hc!("AF_BLUETOOTH", AF_BLUETOOTH, bt::AF_BTH);
+        hc!("AF_HYPERV", AF_HYPERV, ws::AF_HYPERV);
         // ── Socket types ──
-        cst!("SOCK_STREAM", ws::SOCK_STREAM);
-        cst!("SOCK_DGRAM", ws::SOCK_DGRAM);
-        cst!("SOCK_RAW", ws::SOCK_RAW);
-        cst!("SOCK_RDM", ws::SOCK_RDM);
-        cst!("SOCK_SEQPACKET", ws::SOCK_SEQPACKET);
+        hc!("SOCK_STREAM", SOCK_STREAM, ws::SOCK_STREAM);
+        hc!("SOCK_DGRAM", SOCK_DGRAM, ws::SOCK_DGRAM);
+        hc!("SOCK_RAW", SOCK_RAW, ws::SOCK_RAW);
+        hc!("SOCK_RDM", SOCK_RDM, ws::SOCK_RDM);
+        hc!("SOCK_SEQPACKET", SOCK_SEQPACKET, ws::SOCK_SEQPACKET);
         // ── Protocols ──
-        cst!("IPPROTO_IP", ws::IPPROTO_IP);
-        cst!("IPPROTO_HOPOPTS", ws::IPPROTO_HOPOPTS);
-        cst!("IPPROTO_ICMP", ws::IPPROTO_ICMP);
-        cst!("IPPROTO_IGMP", ws::IPPROTO_IGMP);
-        cst!("IPPROTO_GGP", ws::IPPROTO_GGP);
-        cst!("IPPROTO_ST", 5);
-        cst!("IPPROTO_CBT", 7);
-        cst!("IPPROTO_IGP", 9);
-        cst!("IPPROTO_IPV4", ws::IPPROTO_IPV4);
-        cst!("IPPROTO_TCP", ws::IPPROTO_TCP);
-        cst!("IPPROTO_EGP", ws::IPPROTO_EGP);
-        cst!("IPPROTO_PUP", ws::IPPROTO_PUP);
-        cst!("IPPROTO_UDP", ws::IPPROTO_UDP);
-        cst!("IPPROTO_IDP", ws::IPPROTO_IDP);
-        cst!("IPPROTO_ICLFXBM", 78);
-        cst!("IPPROTO_IPV6", ws::IPPROTO_IPV6);
-        cst!("IPPROTO_ROUTING", ws::IPPROTO_ROUTING);
-        cst!("IPPROTO_FRAGMENT", ws::IPPROTO_FRAGMENT);
-        cst!("IPPROTO_ESP", ws::IPPROTO_ESP);
-        cst!("IPPROTO_AH", ws::IPPROTO_AH);
-        cst!("IPPROTO_ICMPV6", ws::IPPROTO_ICMPV6);
-        cst!("IPPROTO_NONE", ws::IPPROTO_NONE);
-        cst!("IPPROTO_DSTOPTS", ws::IPPROTO_DSTOPTS);
-        cst!("IPPROTO_ND", ws::IPPROTO_ND);
-        cst!("IPPROTO_PIM", ws::IPPROTO_PIM);
-        cst!("IPPROTO_PGM", ws::IPPROTO_PGM);
-        cst!("IPPROTO_RDP", ws::IPPROTO_RDP);
-        cst!("IPPROTO_L2TP", 115);
-        cst!("IPPROTO_SCTP", ws::IPPROTO_SCTP);
-        cst!("IPPROTO_RAW", ws::IPPROTO_RAW);
-        cst!("IPPROTO_MAX", ws::IPPROTO_MAX);
-        // `_rsocket_rffi.py constants_w_defaults` — SOL_TCP/UDP kept for
-        // PyPy compatibility.  `SOL_IP` is the platform's own here:
-        // `ws2def.h` defines it, so the zero placeholder the other arm uses
-        // would name `IPPROTO_IP` instead of the level.
-        cst!("SOL_IP", ws::SOL_IP);
-        cst!("SOL_TCP", 6);
-        cst!("SOL_UDP", 17);
-        // ── INADDR_* (host byte order) ──
-        //
-        // `PyModule_AddIntConstant` takes a C `long`, which is 32 bits here, so
-        // every one of these with the top bit set is published as the negative
-        // number that word spells rather than as its unsigned reading.
-        cst!("INADDR_ANY", ws::INADDR_ANY as i32);
-        cst!("INADDR_LOOPBACK", ws::INADDR_LOOPBACK as i32);
-        cst!("INADDR_BROADCAST", ws::INADDR_BROADCAST as i32);
-        cst!("INADDR_NONE", ws::INADDR_NONE as i32);
-        cst!("INADDR_ALLHOSTS_GROUP", 0xe0000001u32 as i32);
-        cst!("INADDR_UNSPEC_GROUP", 0xe0000000u32 as i32);
-        cst!("INADDR_MAX_LOCAL_GROUP", 0xe00000ffu32 as i32);
-        cst!("IPPORT_RESERVED", ws::IPPORT_RESERVED);
-        cst!("IPPORT_USERRESERVED", 5000);
+        hc!("IPPROTO_IP", IPPROTO_IP, ws::IPPROTO_IP);
+        hc!("IPPROTO_HOPOPTS", IPPROTO_HOPOPTS, ws::IPPROTO_HOPOPTS);
+        hc!("IPPROTO_ICMP", IPPROTO_ICMP, ws::IPPROTO_ICMP);
+        hc!("IPPROTO_IGMP", IPPROTO_IGMP, ws::IPPROTO_IGMP);
+        hc!("IPPROTO_GGP", IPPROTO_GGP, ws::IPPROTO_GGP);
+        hc!("IPPROTO_ST", IPPROTO_ST, 5);
+        hc!("IPPROTO_CBT", IPPROTO_CBT, 7);
+        hc!("IPPROTO_IGP", IPPROTO_IGP, 9);
+        hc!("IPPROTO_IPV4", IPPROTO_IPV4, ws::IPPROTO_IPV4);
+        hc!("IPPROTO_TCP", IPPROTO_TCP, ws::IPPROTO_TCP);
+        hc!("IPPROTO_EGP", IPPROTO_EGP, ws::IPPROTO_EGP);
+        hc!("IPPROTO_PUP", IPPROTO_PUP, ws::IPPROTO_PUP);
+        hc!("IPPROTO_UDP", IPPROTO_UDP, ws::IPPROTO_UDP);
+        hc!("IPPROTO_IDP", IPPROTO_IDP, ws::IPPROTO_IDP);
+        hc!("IPPROTO_ICLFXBM", IPPROTO_ICLFXBM, 78);
+        hc!("IPPROTO_IPV6", IPPROTO_IPV6, ws::IPPROTO_IPV6);
+        hc!("IPPROTO_ROUTING", IPPROTO_ROUTING, ws::IPPROTO_ROUTING);
+        hc!("IPPROTO_FRAGMENT", IPPROTO_FRAGMENT, ws::IPPROTO_FRAGMENT);
+        hc!("IPPROTO_ESP", IPPROTO_ESP, ws::IPPROTO_ESP);
+        hc!("IPPROTO_AH", IPPROTO_AH, ws::IPPROTO_AH);
+        hc!("IPPROTO_ICMPV6", IPPROTO_ICMPV6, ws::IPPROTO_ICMPV6);
+        hc!("IPPROTO_NONE", IPPROTO_NONE, ws::IPPROTO_NONE);
+        hc!("IPPROTO_DSTOPTS", IPPROTO_DSTOPTS, ws::IPPROTO_DSTOPTS);
+        hc!("IPPROTO_ND", IPPROTO_ND, ws::IPPROTO_ND);
+        hc!("IPPROTO_PIM", IPPROTO_PIM, ws::IPPROTO_PIM);
+        hc!("IPPROTO_PGM", IPPROTO_PGM, ws::IPPROTO_PGM);
+        hc!("IPPROTO_RDP", IPPROTO_RDP, ws::IPPROTO_RDP);
+        hc!("IPPROTO_L2TP", IPPROTO_L2TP, 115);
+        hc!("IPPROTO_SCTP", IPPROTO_SCTP, ws::IPPROTO_SCTP);
+        hc!("IPPROTO_RAW", IPPROTO_RAW, ws::IPPROTO_RAW);
+        hc!("IPPROTO_MAX", IPPROTO_MAX, ws::IPPROTO_MAX);
+        // SOL_TCP/UDP are kept for the older constant list. SOL_IP is the
+        // platform level, not the zero placeholder the other arm uses.
+        hc!("SOL_IP", SOL_IP, ws::SOL_IP);
+        hc!("SOL_TCP", SOL_TCP, 6);
+        hc!("SOL_UDP", SOL_UDP, 17);
+        // ── INADDR_* (host byte order), signed 32-bit ──
+        hc!(signed "INADDR_ANY", INADDR_ANY, ws::INADDR_ANY as i32);
+        hc!(signed "INADDR_LOOPBACK", INADDR_LOOPBACK, ws::INADDR_LOOPBACK as i32);
+        hc!(signed "INADDR_BROADCAST", INADDR_BROADCAST, ws::INADDR_BROADCAST as i32);
+        hc!(signed "INADDR_NONE", INADDR_NONE, ws::INADDR_NONE as i32);
+        hc!(signed "INADDR_ALLHOSTS_GROUP", INADDR_ALLHOSTS_GROUP, 0xe0000001u32 as i32);
+        hc!(signed "INADDR_UNSPEC_GROUP", INADDR_UNSPEC_GROUP, 0xe0000000u32 as i32);
+        hc!(signed "INADDR_MAX_LOCAL_GROUP", INADDR_MAX_LOCAL_GROUP, 0xe00000ffu32 as i32);
+        hc!("IPPORT_RESERVED", IPPORT_RESERVED, ws::IPPORT_RESERVED);
+        hc!("IPPORT_USERRESERVED", IPPORT_USERRESERVED, 5000);
         // ── SOL_* / SO_* (socket level) ──
-        cst!("SOL_SOCKET", ws::SOL_SOCKET);
-        cst!("SO_REUSEADDR", ws::SO_REUSEADDR);
-        cst!("SO_EXCLUSIVEADDRUSE", ws::SO_EXCLUSIVEADDRUSE);
-        cst!("SO_KEEPALIVE", ws::SO_KEEPALIVE);
-        cst!("SO_BROADCAST", ws::SO_BROADCAST);
-        cst!("SO_DEBUG", ws::SO_DEBUG);
-        cst!("SO_DONTROUTE", ws::SO_DONTROUTE);
-        cst!("SO_LINGER", ws::SO_LINGER);
-        cst!("SO_OOBINLINE", ws::SO_OOBINLINE);
-        cst!("SO_RCVBUF", ws::SO_RCVBUF);
-        cst!("SO_SNDBUF", ws::SO_SNDBUF);
-        cst!("SO_RCVTIMEO", ws::SO_RCVTIMEO);
-        cst!("SO_SNDTIMEO", ws::SO_SNDTIMEO);
-        cst!("SO_SNDLOWAT", 0x1003);
-        cst!("SO_RCVLOWAT", 0x1004);
-        cst!("SO_ERROR", ws::SO_ERROR);
-        cst!("SO_TYPE", ws::SO_TYPE);
-        cst!("SO_ACCEPTCONN", ws::SO_ACCEPTCONN);
-        cst!("SO_USELOOPBACK", ws::SO_USELOOPBACK);
-        cst!("SO_ORIGINAL_DST", 12303);
-        // Bluetooth/RFCOMM constants.  The option names are unsigned SDK
-        // words but `PyModule_AddIntConstant` exposes their signed C-long
-        // readings on Windows.
-        cst!("BTPROTO_RFCOMM", bt::BTHPROTO_RFCOMM);
-        cst!("SOL_RFCOMM", 3);
-        cst!("SO_BTH_ENCRYPT", 2);
-        cst!("SO_BTH_MTU", 0x80000007u32 as i32);
-        cst!("SO_BTH_MTU_MAX", 0x80000008u32 as i32);
-        cst!("SO_BTH_MTU_MIN", 0x8000000au32 as i32);
+        hc!("SOL_SOCKET", SOL_SOCKET, ws::SOL_SOCKET);
+        hc!("SO_REUSEADDR", SO_REUSEADDR, ws::SO_REUSEADDR);
+        hc!("SO_EXCLUSIVEADDRUSE", SO_EXCLUSIVEADDRUSE, ws::SO_EXCLUSIVEADDRUSE);
+        hc!("SO_KEEPALIVE", SO_KEEPALIVE, ws::SO_KEEPALIVE);
+        hc!("SO_BROADCAST", SO_BROADCAST, ws::SO_BROADCAST);
+        hc!("SO_DEBUG", SO_DEBUG, ws::SO_DEBUG);
+        hc!("SO_DONTROUTE", SO_DONTROUTE, ws::SO_DONTROUTE);
+        hc!("SO_LINGER", SO_LINGER, ws::SO_LINGER);
+        hc!("SO_OOBINLINE", SO_OOBINLINE, ws::SO_OOBINLINE);
+        hc!("SO_RCVBUF", SO_RCVBUF, ws::SO_RCVBUF);
+        hc!("SO_SNDBUF", SO_SNDBUF, ws::SO_SNDBUF);
+        hc!("SO_RCVTIMEO", SO_RCVTIMEO, ws::SO_RCVTIMEO);
+        hc!("SO_SNDTIMEO", SO_SNDTIMEO, ws::SO_SNDTIMEO);
+        hc!("SO_SNDLOWAT", SO_SNDLOWAT, 0x1003);
+        hc!("SO_RCVLOWAT", SO_RCVLOWAT, 0x1004);
+        hc!("SO_ERROR", SO_ERROR, ws::SO_ERROR);
+        hc!("SO_TYPE", SO_TYPE, ws::SO_TYPE);
+        hc!("SO_ACCEPTCONN", SO_ACCEPTCONN, ws::SO_ACCEPTCONN);
+        hc!("SO_USELOOPBACK", SO_USELOOPBACK, ws::SO_USELOOPBACK);
+        hc!("SO_ORIGINAL_DST", SO_ORIGINAL_DST, 12303);
+        hc!("BTPROTO_RFCOMM", BTHPROTO_RFCOMM, bt::BTHPROTO_RFCOMM);
+        hc!("SOL_RFCOMM", SOL_RFCOMM, 3);
+        hc!("SO_BTH_ENCRYPT", SO_BTH_ENCRYPT, 2);
+        hc!(signed "SO_BTH_MTU", SO_BTH_MTU, 0x80000007u32 as i32);
+        hc!(signed "SO_BTH_MTU_MAX", SO_BTH_MTU_MAX, 0x80000008u32 as i32);
+        hc!(signed "SO_BTH_MTU_MIN", SO_BTH_MTU_MIN, 0x8000000au32 as i32);
         // ── TCP-level ──
-        cst!("TCP_NODELAY", ws::TCP_NODELAY);
-        cst!("TCP_MAXSEG", ws::TCP_MAXSEG);
-        cst!("TCP_KEEPIDLE", 3);
-        cst!("TCP_FASTOPEN", 15);
-        cst!("TCP_KEEPCNT", 16);
-        cst!("TCP_KEEPINTVL", 17);
-        // `SIO_TCP_SET_ACK_FREQUENCY` - the name `socketmodule.c` gives this
-        // option on Windows.  It is an ioctl code, not an option number, which
-        // is why `setsockopt` and `getsockopt` both special-case it.
-        cst!("TCP_QUICKACK", ws::SIO_TCP_SET_ACK_FREQUENCY as i32);
+        hc!("TCP_NODELAY", TCP_NODELAY, ws::TCP_NODELAY);
+        hc!("TCP_MAXSEG", TCP_MAXSEG, ws::TCP_MAXSEG);
+        hc!("TCP_KEEPIDLE", TCP_KEEPIDLE, 3);
+        hc!("TCP_FASTOPEN", TCP_FASTOPEN, 15);
+        hc!("TCP_KEEPCNT", TCP_KEEPCNT, 16);
+        hc!("TCP_KEEPINTVL", TCP_KEEPINTVL, 17);
+        // SIO_TCP_SET_ACK_FREQUENCY, the name this option carries on Windows.
+        // It is an ioctl code, published as a signed 32-bit word.
+        hc!("TCP_QUICKACK", SIO_TCP_SET_ACK_FREQUENCY, ws::SIO_TCP_SET_ACK_FREQUENCY as i32);
         // ── IP-level ──
-        cst!("IP_TTL", ws::IP_TTL);
-        cst!("IP_TOS", ws::IP_TOS);
-        cst!("IP_OPTIONS", ws::IP_OPTIONS);
-        cst!("IP_MULTICAST_TTL", ws::IP_MULTICAST_TTL);
-        cst!("IP_MULTICAST_LOOP", ws::IP_MULTICAST_LOOP);
-        cst!("IP_MULTICAST_IF", ws::IP_MULTICAST_IF);
-        cst!("IP_ADD_MEMBERSHIP", ws::IP_ADD_MEMBERSHIP);
-        cst!("IP_DROP_MEMBERSHIP", ws::IP_DROP_MEMBERSHIP);
-        cst!("IP_HDRINCL", ws::IP_HDRINCL);
-        cst!("IP_RECVDSTADDR", ws::IP_RECVDSTADDR);
-        cst!("IP_ADD_SOURCE_MEMBERSHIP", 15);
-        cst!("IP_DROP_SOURCE_MEMBERSHIP", 16);
-        cst!("IP_BLOCK_SOURCE", 17);
-        cst!("IP_UNBLOCK_SOURCE", 18);
-        cst!("IP_PKTINFO", 19);
-        cst!("IP_RECVTTL", 21);
-        cst!("IP_RECVTOS", 40);
-        cst!("IP_RECVERR", 75);
-        // `IP_DEFAULT_MULTICAST_LOOP`, `IP_DEFAULT_MULTICAST_TTL` and
-        // `IP_MAX_MEMBERSHIPS` are published under `#ifdef`, and the Winsock
-        // headers define none of them, so the module does not carry them here.
+        hc!("IP_TTL", IP_TTL, ws::IP_TTL);
+        hc!("IP_TOS", IP_TOS, ws::IP_TOS);
+        hc!("IP_OPTIONS", IP_OPTIONS, ws::IP_OPTIONS);
+        hc!("IP_MULTICAST_TTL", IP_MULTICAST_TTL, ws::IP_MULTICAST_TTL);
+        hc!("IP_MULTICAST_LOOP", IP_MULTICAST_LOOP, ws::IP_MULTICAST_LOOP);
+        hc!("IP_MULTICAST_IF", IP_MULTICAST_IF, ws::IP_MULTICAST_IF);
+        hc!("IP_ADD_MEMBERSHIP", IP_ADD_MEMBERSHIP, ws::IP_ADD_MEMBERSHIP);
+        hc!("IP_DROP_MEMBERSHIP", IP_DROP_MEMBERSHIP, ws::IP_DROP_MEMBERSHIP);
+        hc!("IP_HDRINCL", IP_HDRINCL, ws::IP_HDRINCL);
+        hc!("IP_RECVDSTADDR", IP_RECVDSTADDR, ws::IP_RECVDSTADDR);
+        hc!("IP_ADD_SOURCE_MEMBERSHIP", IP_ADD_SOURCE_MEMBERSHIP, 15);
+        hc!("IP_DROP_SOURCE_MEMBERSHIP", IP_DROP_SOURCE_MEMBERSHIP, 16);
+        hc!("IP_BLOCK_SOURCE", IP_BLOCK_SOURCE, 17);
+        hc!("IP_UNBLOCK_SOURCE", IP_UNBLOCK_SOURCE, 18);
+        hc!("IP_PKTINFO", IP_PKTINFO, 19);
+        hc!("IP_RECVTTL", IP_RECVTTL, 21);
+        hc!("IP_RECVTOS", IP_RECVTOS, 40);
+        hc!("IP_RECVERR", IP_RECVERR, 75);
         // ── IPv6 ──
-        cst!("IPV6_V6ONLY", ws::IPV6_V6ONLY);
-        cst!("IPV6_CHECKSUM", ws::IPV6_CHECKSUM);
-        cst!("IPV6_DONTFRAG", ws::IPV6_DONTFRAG);
-        cst!("IPV6_HOPLIMIT", ws::IPV6_HOPLIMIT);
-        cst!("IPV6_HOPOPTS", ws::IPV6_HOPOPTS);
-        cst!("IPV6_JOIN_GROUP", ws::IPV6_JOIN_GROUP);
-        cst!("IPV6_LEAVE_GROUP", ws::IPV6_LEAVE_GROUP);
-        cst!("IPV6_MULTICAST_HOPS", ws::IPV6_MULTICAST_HOPS);
-        cst!("IPV6_MULTICAST_IF", ws::IPV6_MULTICAST_IF);
-        cst!("IPV6_MULTICAST_LOOP", ws::IPV6_MULTICAST_LOOP);
-        cst!("IPV6_PKTINFO", ws::IPV6_PKTINFO);
-        cst!("IPV6_RECVRTHDR", ws::IPV6_RECVRTHDR);
-        cst!("IPV6_RECVTCLASS", ws::IPV6_RECVTCLASS);
-        cst!("IPV6_RECVERR", 75);
-        cst!("IPV6_RTHDR", ws::IPV6_RTHDR);
-        cst!("IPV6_TCLASS", ws::IPV6_TCLASS);
-        cst!("IPV6_UNICAST_HOPS", ws::IPV6_UNICAST_HOPS);
+        hc!("IPV6_V6ONLY", IPV6_V6ONLY, ws::IPV6_V6ONLY);
+        hc!("IPV6_CHECKSUM", IPV6_CHECKSUM, ws::IPV6_CHECKSUM);
+        hc!("IPV6_DONTFRAG", IPV6_DONTFRAG, ws::IPV6_DONTFRAG);
+        hc!("IPV6_HOPLIMIT", IPV6_HOPLIMIT, ws::IPV6_HOPLIMIT);
+        hc!("IPV6_HOPOPTS", IPV6_HOPOPTS, ws::IPV6_HOPOPTS);
+        hc!("IPV6_JOIN_GROUP", IPV6_JOIN_GROUP, ws::IPV6_JOIN_GROUP);
+        hc!("IPV6_LEAVE_GROUP", IPV6_LEAVE_GROUP, ws::IPV6_LEAVE_GROUP);
+        hc!("IPV6_MULTICAST_HOPS", IPV6_MULTICAST_HOPS, ws::IPV6_MULTICAST_HOPS);
+        hc!("IPV6_MULTICAST_IF", IPV6_MULTICAST_IF, ws::IPV6_MULTICAST_IF);
+        hc!("IPV6_MULTICAST_LOOP", IPV6_MULTICAST_LOOP, ws::IPV6_MULTICAST_LOOP);
+        hc!("IPV6_PKTINFO", IPV6_PKTINFO, ws::IPV6_PKTINFO);
+        hc!("IPV6_RECVRTHDR", IPV6_RECVRTHDR, ws::IPV6_RECVRTHDR);
+        hc!("IPV6_RECVTCLASS", IPV6_RECVTCLASS, ws::IPV6_RECVTCLASS);
+        hc!("IPV6_RECVERR", IPV6_RECVERR, 75);
+        hc!("IPV6_RTHDR", IPV6_RTHDR, ws::IPV6_RTHDR);
+        hc!("IPV6_TCLASS", IPV6_TCLASS, ws::IPV6_TCLASS);
+        hc!("IPV6_UNICAST_HOPS", IPV6_UNICAST_HOPS, ws::IPV6_UNICAST_HOPS);
         // ── shutdown how ──
-        cst!("SHUT_RD", ws::SD_RECEIVE);
-        cst!("SHUT_WR", ws::SD_SEND);
-        cst!("SHUT_RDWR", ws::SD_BOTH);
+        hc!("SHUT_RD", SD_RECEIVE, ws::SD_RECEIVE);
+        hc!("SHUT_WR", SD_SEND, ws::SD_SEND);
+        hc!("SHUT_RDWR", SD_BOTH, ws::SD_BOTH);
         // ── Message flags ──
-        cst!("MSG_OOB", ws::MSG_OOB);
-        cst!("MSG_PEEK", ws::MSG_PEEK);
-        cst!("MSG_DONTROUTE", ws::MSG_DONTROUTE);
-        cst!("MSG_WAITALL", ws::MSG_WAITALL);
-        cst!("MSG_CTRUNC", ws::MSG_CTRUNC);
-        cst!("MSG_TRUNC", ws::MSG_TRUNC);
-        cst!("MSG_BCAST", ws::MSG_BCAST);
-        cst!("MSG_MCAST", ws::MSG_MCAST);
-        cst!("MSG_ERRQUEUE", 0x1000);
+        hc!("MSG_OOB", MSG_OOB, ws::MSG_OOB);
+        hc!("MSG_PEEK", MSG_PEEK, ws::MSG_PEEK);
+        hc!("MSG_DONTROUTE", MSG_DONTROUTE, ws::MSG_DONTROUTE);
+        hc!("MSG_WAITALL", MSG_WAITALL, ws::MSG_WAITALL);
+        hc!("MSG_CTRUNC", MSG_CTRUNC, ws::MSG_CTRUNC);
+        hc!("MSG_TRUNC", MSG_TRUNC, ws::MSG_TRUNC);
+        hc!("MSG_BCAST", MSG_BCAST, ws::MSG_BCAST);
+        hc!("MSG_MCAST", MSG_MCAST, ws::MSG_MCAST);
+        hc!("MSG_ERRQUEUE", MSG_ERRQUEUE, 0x1000);
         // ── Address-info flags ──
-        cst!("AI_PASSIVE", ws::AI_PASSIVE);
-        cst!("AI_CANONNAME", ws::AI_CANONNAME);
-        cst!("AI_NUMERICHOST", ws::AI_NUMERICHOST);
-        cst!("AI_NUMERICSERV", ws::AI_NUMERICSERV);
-        cst!("AI_ADDRCONFIG", ws::AI_ADDRCONFIG);
-        cst!("AI_V4MAPPED", ws::AI_V4MAPPED);
-        cst!("AI_ALL", ws::AI_ALL);
+        hc!("AI_PASSIVE", AI_PASSIVE, ws::AI_PASSIVE);
+        hc!("AI_CANONNAME", AI_CANONNAME, ws::AI_CANONNAME);
+        hc!("AI_NUMERICHOST", AI_NUMERICHOST, ws::AI_NUMERICHOST);
+        hc!("AI_NUMERICSERV", AI_NUMERICSERV, ws::AI_NUMERICSERV);
+        hc!("AI_ADDRCONFIG", AI_ADDRCONFIG, ws::AI_ADDRCONFIG);
+        hc!("AI_V4MAPPED", AI_V4MAPPED, ws::AI_V4MAPPED);
+        hc!("AI_ALL", AI_ALL, ws::AI_ALL);
         // ── Name-info flags ──
-        cst!("NI_NUMERICHOST", ws::NI_NUMERICHOST);
-        cst!("NI_NUMERICSERV", ws::NI_NUMERICSERV);
-        cst!("NI_NOFQDN", ws::NI_NOFQDN);
-        cst!("NI_NAMEREQD", ws::NI_NAMEREQD);
-        cst!("NI_DGRAM", ws::NI_DGRAM);
-        cst!("NI_MAXHOST", ws::NI_MAXHOST);
-        cst!("NI_MAXSERV", ws::NI_MAXSERV);
+        hc!("NI_NUMERICHOST", NI_NUMERICHOST, ws::NI_NUMERICHOST);
+        hc!("NI_NUMERICSERV", NI_NUMERICSERV, ws::NI_NUMERICSERV);
+        hc!("NI_NOFQDN", NI_NOFQDN, ws::NI_NOFQDN);
+        hc!("NI_NAMEREQD", NI_NAMEREQD, ws::NI_NAMEREQD);
+        hc!("NI_DGRAM", NI_DGRAM, ws::NI_DGRAM);
+        hc!("NI_MAXHOST", NI_MAXHOST, ws::NI_MAXHOST);
+        hc!("NI_MAXSERV", NI_MAXSERV, ws::NI_MAXSERV);
         // ── EAI_* — WSA error codes under their <ws2tcpip.h> aliases ──
-        cst!("EAI_AGAIN", ws::WSATRY_AGAIN);
-        cst!("EAI_BADFLAGS", ws::WSAEINVAL);
-        cst!("EAI_FAIL", ws::WSANO_RECOVERY);
-        cst!("EAI_FAMILY", ws::WSAEAFNOSUPPORT);
-        cst!("EAI_MEMORY", ws::WSA_NOT_ENOUGH_MEMORY);
-        // `ws2tcpip.h` spells `EAI_NODATA` as `EAI_NONAME`, the RFC 3493
-        // deprecation, so both name `WSAHOST_NOT_FOUND` and not `WSANO_DATA`.
-        cst!("EAI_NODATA", ws::WSAHOST_NOT_FOUND);
-        cst!("EAI_NONAME", ws::WSAHOST_NOT_FOUND);
-        cst!("EAI_SERVICE", ws::WSATYPE_NOT_FOUND);
-        cst!("EAI_SOCKTYPE", ws::WSAESOCKTNOSUPPORT);
+        hc!("EAI_AGAIN", EAI_AGAIN, ws::WSATRY_AGAIN);
+        hc!("EAI_BADFLAGS", EAI_BADFLAGS, ws::WSAEINVAL);
+        hc!("EAI_FAIL", EAI_FAIL, ws::WSANO_RECOVERY);
+        hc!("EAI_FAMILY", EAI_FAMILY, ws::WSAEAFNOSUPPORT);
+        hc!("EAI_MEMORY", EAI_MEMORY, ws::WSA_NOT_ENOUGH_MEMORY);
+        // EAI_NODATA is spelled EAI_NONAME in the header, so both name
+        // WSAHOST_NOT_FOUND.
+        hc!("EAI_NODATA", EAI_NODATA, ws::WSAHOST_NOT_FOUND);
+        hc!("EAI_NONAME", EAI_NONAME, ws::WSAHOST_NOT_FOUND);
+        hc!("EAI_SERVICE", EAI_SERVICE, ws::WSATYPE_NOT_FOUND);
+        hc!("EAI_SOCKTYPE", EAI_SOCKTYPE, ws::WSAESOCKTNOSUPPORT);
         // ── WSAIoctl codes `socket.ioctl` names ──
-        cst!("SIO_RCVALL", ws::SIO_RCVALL);
-        cst!("SIO_KEEPALIVE_VALS", ws::SIO_KEEPALIVE_VALS);
-        cst!("SIO_LOOPBACK_FAST_PATH", ws::SIO_LOOPBACK_FAST_PATH);
-        cst!("RCVALL_OFF", ws::RCVALL_OFF);
-        cst!("RCVALL_ON", ws::RCVALL_ON);
-        cst!("RCVALL_SOCKETLEVELONLY", ws::RCVALL_SOCKETLEVELONLY);
-        // `RCVALL_IPLEVEL` is a member of the `RCVALL_VALUE` enum that the
-        // module does not publish; `RCVALL_MAX` is the last name it does.
-        cst!("RCVALL_MAX", 3);
-        // Hyper-V socket ABI constants (`hvsocket.h`).  GUIDs and Bluetooth
-        // addresses are public strings rather than integer enum members.
-        cst!("HV_PROTOCOL_RAW", 1);
-        cst!("HVSOCKET_CONNECT_TIMEOUT", 1);
-        cst!("HVSOCKET_CONNECTED_SUSPEND", 4);
-        cst!("HVSOCKET_CONNECT_TIMEOUT_MAX", 300_000);
-        cst!("HVSOCKET_ADDRESS_FLAG_PASSTHRU", 1);
-        for (name, value) in [
+        hc!("SIO_RCVALL", SIO_RCVALL, ws::SIO_RCVALL);
+        hc!("SIO_KEEPALIVE_VALS", SIO_KEEPALIVE_VALS, ws::SIO_KEEPALIVE_VALS);
+        hc!("SIO_LOOPBACK_FAST_PATH", SIO_LOOPBACK_FAST_PATH, ws::SIO_LOOPBACK_FAST_PATH);
+        hc!("RCVALL_OFF", RCVALL_OFF, ws::RCVALL_OFF);
+        hc!("RCVALL_ON", RCVALL_ON, ws::RCVALL_ON);
+        hc!("RCVALL_SOCKETLEVELONLY", RCVALL_SOCKETLEVELONLY, ws::RCVALL_SOCKETLEVELONLY);
+        hc!("RCVALL_MAX", RCVALL_MAX, 3);
+        // Hyper-V socket ABI. GUIDs and Bluetooth addresses are strings.
+        hc!("HV_PROTOCOL_RAW", HV_PROTOCOL_RAW, 1);
+        hc!("HVSOCKET_CONNECT_TIMEOUT", HVSOCKET_CONNECT_TIMEOUT, 1);
+        hc!("HVSOCKET_CONNECTED_SUSPEND", HVSOCKET_CONNECTED_SUSPEND, 4);
+        hc!("HVSOCKET_CONNECT_TIMEOUT_MAX", HVSOCKET_CONNECT_TIMEOUT_MAX, 300_000);
+        hc!("HVSOCKET_ADDRESS_FLAG_PASSTHRU", HVSOCKET_ADDRESS_FLAG_PASSTHRU, 1);
+        #[cfg(feature = "host_env")]
+        let address_names = [
+            ("BDADDR_ANY", rustpython_host_env::socket::BDADDR_ANY),
+            ("BDADDR_LOCAL", rustpython_host_env::socket::BDADDR_LOCAL),
+            ("HV_GUID_ZERO", rustpython_host_env::socket::HV_GUID_ZERO),
+            ("HV_GUID_WILDCARD", rustpython_host_env::socket::HV_GUID_WILDCARD),
+            ("HV_GUID_BROADCAST", rustpython_host_env::socket::HV_GUID_BROADCAST),
+            ("HV_GUID_CHILDREN", rustpython_host_env::socket::HV_GUID_CHILDREN),
+            ("HV_GUID_LOOPBACK", rustpython_host_env::socket::HV_GUID_LOOPBACK),
+            ("HV_GUID_PARENT", rustpython_host_env::socket::HV_GUID_PARENT),
+        ];
+        #[cfg(not(feature = "host_env"))]
+        let address_names = [
             ("BDADDR_ANY", "00:00:00:00:00:00"),
             ("BDADDR_LOCAL", "00:00:00:FF:FF:FF"),
             ("HV_GUID_ZERO", "00000000-0000-0000-0000-000000000000"),
@@ -963,13 +975,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
             ("HV_GUID_CHILDREN", "90DB8B89-0D35-4F79-8CE9-49EA0AC8B7CD"),
             ("HV_GUID_LOOPBACK", "E0E16197-DD56-4A10-9195-5EE7A155A838"),
             ("HV_GUID_PARENT", "A42E7CDA-D03F-480C-9CC2-A4DE20ABB878"),
-        ] {
+        ];
+        for (name, value) in address_names {
             pyre_interpreter::module_ns_store(ns, name, pyre_object::w_str_new(value));
         }
-        // ── socket-level cap ──
-        // `<winsock2.h>` defines SOMAXCONN as 0x7fffffff; the WinSock 1.1
-        // value of 5 the metadata carries is the one `listen` outgrew.
-        cst!("SOMAXCONN", 0x7fffffffi64);
+        // `<winsock2.h>` SOMAXCONN is 0x7fffffff. The Winsock 1.1 value 5 is
+        // not the one `listen` grew into.
+        hc!("SOMAXCONN", SOMAXCONN, 0x7fff_ffffi64);
     }
 
     // ── htons / htonl / ntohs / ntohl ──
@@ -3372,7 +3384,7 @@ fn pack_bluetooth_addr(
 ) -> Result<rffi::SockLen, pyre_interpreter::PyError> {
     use windows_sys::Win32::Devices::Bluetooth as bt;
 
-    if proto != bt::BTHPROTO_RFCOMM as libc::c_int {
+    if proto != BTHPROTO_RFCOMM {
         return Err(pyre_interpreter::PyError::os_error(format!(
             "{caller}(): unknown Bluetooth protocol"
         )));
@@ -3395,7 +3407,7 @@ fn pack_bluetooth_addr(
     }
     let bd_addr = parse_bdaddr(name).ok_or_else(|| pyre_interpreter::PyError::os_error("bad bluetooth address"))?;
     let bth = bt::SOCKADDR_BTH {
-        addressFamily: bt::AF_BTH,
+        addressFamily: AF_BTH as u16,
         btAddr: bd_addr,
         serviceClassId: Default::default(),
         // `k` keeps the low `ULONG` of whatever it is handed rather than
@@ -3424,8 +3436,33 @@ fn unpack_bluetooth_addr(storage: &rffi::sockaddr_storage) -> pyre_object::PyObj
 
 /// `HV_PROTOCOL_RAW` — the only protocol an `AF_HYPERV` socket is opened with.
 /// `hvsocket.h` defines it; `windows-sys` does not carry that header.
-#[cfg(windows)]
+#[cfg(all(windows, feature = "host_env"))]
+const HV_PROTOCOL_RAW: libc::c_int = rustpython_host_env::socket::HV_PROTOCOL_RAW as libc::c_int;
+#[cfg(all(windows, not(feature = "host_env")))]
 const HV_PROTOCOL_RAW: libc::c_int = 1;
+
+#[cfg(all(windows, feature = "host_env"))]
+const AF_HYPERV: libc::c_int = rustpython_host_env::socket::AF_HYPERV as libc::c_int;
+#[cfg(all(windows, not(feature = "host_env")))]
+const AF_HYPERV: libc::c_int = windows_sys::Win32::Networking::WinSock::AF_HYPERV as libc::c_int;
+
+#[cfg(all(windows, feature = "host_env"))]
+const AF_BTH: libc::c_int = rustpython_host_env::socket::AF_BLUETOOTH as libc::c_int;
+#[cfg(all(windows, not(feature = "host_env")))]
+const AF_BTH: libc::c_int = windows_sys::Win32::Devices::Bluetooth::AF_BTH as libc::c_int;
+
+#[cfg(all(windows, feature = "host_env"))]
+const BTHPROTO_RFCOMM: libc::c_int = rustpython_host_env::socket::BTHPROTO_RFCOMM as libc::c_int;
+#[cfg(all(windows, not(feature = "host_env")))]
+const BTHPROTO_RFCOMM: libc::c_int =
+    windows_sys::Win32::Devices::Bluetooth::BTHPROTO_RFCOMM as libc::c_int;
+
+#[cfg(all(windows, feature = "host_env"))]
+const SIO_TCP_SET_ACK_FREQUENCY: libc::c_int =
+    rustpython_host_env::socket::SIO_TCP_SET_ACK_FREQUENCY as libc::c_int;
+#[cfg(all(windows, not(feature = "host_env")))]
+const SIO_TCP_SET_ACK_FREQUENCY: libc::c_int =
+    windows_sys::Win32::Networking::WinSock::SIO_TCP_SET_ACK_FREQUENCY as libc::c_int;
 
 /// `SOCKADDR_HV` (`hvsocket.h`): the family, a reserved word, and the two
 /// GUIDs a Hyper-V endpoint is named by.  36 bytes, so it fits a
@@ -3510,7 +3547,7 @@ fn pack_hyperv_addr(
     let service_id = parse_hyperv_guid(caller, "service_id", w_service_id)?;
     let hv = unsafe { &mut *(storage as *mut _ as *mut SockaddrHv) };
     *hv = SockaddrHv {
-        family: windows_sys::Win32::Networking::WinSock::AF_HYPERV,
+        family: AF_HYPERV as u16,
         reserved: 0,
         vm_id,
         service_id,
@@ -3775,13 +3812,13 @@ fn pack_inet_addr(
     }
 
     #[cfg(windows)]
-    if family == windows_sys::Win32::Networking::WinSock::AF_HYPERV as libc::c_int {
+    if family == AF_HYPERV {
         let addrlen = pack_hyperv_addr(caller, proto, addr, &mut storage)?;
         return Ok((storage, addrlen));
     }
 
     #[cfg(windows)]
-    if family == windows_sys::Win32::Devices::Bluetooth::AF_BTH as libc::c_int {
+    if family == AF_BTH {
         let addrlen = pack_bluetooth_addr(caller, proto, addr, &mut storage)?;
         return Ok((storage, addrlen));
     }
@@ -3992,11 +4029,11 @@ fn unpack_inet_addr(
             return unpack_unix_addr(storage, addrlen);
         }
         #[cfg(windows)]
-        if family == windows_sys::Win32::Networking::WinSock::AF_HYPERV as libc::c_int {
+        if family == AF_HYPERV {
             return unpack_hyperv_addr(storage);
         }
         #[cfg(windows)]
-        if family == windows_sys::Win32::Devices::Bluetooth::AF_BTH as libc::c_int {
+        if family == AF_BTH {
             return unpack_bluetooth_addr(storage);
         }
         pyre_object::w_tuple_new(vec![])
@@ -5702,7 +5739,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             // ioctl code that `setsockopt` itself rejects.  A bytes value is
             // not covered there either and still goes the ordinary way.
             #[cfg(windows)]
-            if name == windows_sys::Win32::Networking::WinSock::SIO_TCP_SET_ACK_FREQUENCY as libc::c_int
+            if name == SIO_TCP_SET_ACK_FREQUENCY
                 && unsafe { pyre_object::is_int(val) }
             {
                 let flag = (unsafe { pyre_object::w_int_get_value(val) }) as libc::c_int;
@@ -5769,7 +5806,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 // rather than asking WinSock, which has no call that reads an
                 // ioctl's current setting.
                 #[cfg(windows)]
-                if name == windows_sys::Win32::Networking::WinSock::SIO_TCP_SET_ACK_FREQUENCY as libc::c_int {
+                if name == SIO_TCP_SET_ACK_FREQUENCY {
                     return Ok(pyre_object::w_int_new(socket_get_attr_i64(
                         args[0],
                         "_quickack",
