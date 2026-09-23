@@ -3555,6 +3555,7 @@ struct FnPtrIndices {
     call_fn_13: HelperHandle,
     call_fn_14: HelperHandle,
     get_current_exception_fn: HelperHandle,
+    current_exception_or_none_fn: HelperHandle,
     reraise_varargs_zero_fn: HelperHandle,
     set_current_exception_fn: HelperHandle,
     load_attr_fn: HelperHandle,
@@ -3634,8 +3635,9 @@ struct FnPtrIndices {
 /// CallFlavor classification per helper (RPython parity:
 /// `call.py:282-330` + `effectinfo.py:13-52`):
 ///
-/// * `get_current_exception_fn` / `set_current_exception_fn`: TLS
-///   read/write of `CURRENT_EXCEPTION`; never raises.  RPython's
+/// * `get_current_exception_fn` / `current_exception_or_none_fn` /
+///   `set_current_exception_fn`: TLS read/write of
+///   `CURRENT_EXCEPTION`; never raises.  RPython's
 ///   `EF_CANNOT_RAISE` (`call.py getcalldescr`'s `else` branch) →
 ///   `PlainCannotRaise`.
 /// * `compare_fn` / `binary_op_fn` / `store_subscr_fn` / `call_fn` /
@@ -3773,6 +3775,12 @@ fn register_helper_fn_pointers(
     let get_current_exception_fn = bind(
         assembler,
         cpu.get_current_exception_fn as *const (),
+        CallFlavor::PlainCannotRaiseNoHeap,
+    );
+    // The same TLS read, answering the prebuilt `None` for an empty slot.
+    let current_exception_or_none_fn = bind(
+        assembler,
+        cpu.current_exception_or_none_fn as *const (),
         CallFlavor::PlainCannotRaiseNoHeap,
     );
     // TLS write; void return; cannot raise; touches no GC heap.
@@ -4405,6 +4413,7 @@ fn register_helper_fn_pointers(
         call_fn_13,
         call_fn_14,
         get_current_exception_fn,
+        current_exception_or_none_fn,
         reraise_varargs_zero_fn,
         set_current_exception_fn,
         load_attr_fn,
@@ -6293,6 +6302,11 @@ impl CodeWriter {
                 HelperHandle {
                     idx: get_current_exception_fn_idx,
                     flavor: _get_current_exception_fn_flavor,
+                },
+            current_exception_or_none_fn:
+                HelperHandle {
+                    idx: current_exception_or_none_fn_idx,
+                    flavor: _current_exception_or_none_fn_flavor,
                 },
             reraise_varargs_zero_fn:
                 HelperHandle {
@@ -10261,28 +10275,27 @@ impl CodeWriter {
                         }
 
                         Instruction::PushExcInfo => {
-                            // `eval.rs`'s `push_exc_info` / pyopcode.py:786 parity:
+                            // `eval.rs`'s `push_exc_info` / `pyopcode.py
+                            // PUSH_EXC_INFO` parity:
                             //   exc  = pop()
-                            //   prev = CURRENT_EXCEPTION
+                            //   prev = CURRENT_EXCEPTION, or None when empty
                             //   CURRENT_EXCEPTION = exc
                             //   push(prev)
                             //   push(exc)
                             //
                             // Emit two residual helper calls so the traced code
                             // reads/writes the same per-thread exception slot as
-                            // the interpreter; pushing `None` for `prev` breaks
-                            // nested exception state (pyopcode.py:786 saves the
-                            // previous sys_exc_info so `POP_EXCEPT` can restore it).
-                            let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            // the interpreter; `POP_EXCEPT` restores the saved
+                            // `prev`, where `None` clears the slot.
                             let exc_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             // A bare handler entry (no recorded catch-site
                             // FrameState) fills the
                             // symbolic stack with null sentinels, so the popped
                             // slot can be a `Constant` — illegal as an op result
                             // and unpinnable.  Bind a fresh Variable instead:
-                            // the `last_exc_value` re-read below becomes its
-                            // sole producer, which IS the caught exception this
-                            // slot holds at runtime.
+                            // the stack read below becomes its sole producer,
+                            // which IS the caught exception this slot holds at
+                            // runtime.
                             let exc_value = if exc_value.as_variable().is_some() {
                                 exc_value
                             } else {
@@ -10298,28 +10311,40 @@ impl CodeWriter {
                             // Without a graph producer the register allocator
                             // treats `exc_value`
                             // as dead-until-first-use (its first use trails the
-                            // `get_current_exception` call below), so it never
+                            // `current_exception_or_none` call below), so it never
                             // interferes with that call's result and the two
                             // coalesce onto one colour — the handler's
                             // CHECK_EXC_MATCH then reads the cleared current
                             // exception (NULL) instead of the caught one.  Give
-                            // `exc_value` a resume-safe producer by re-reading the
-                            // last-exception value slot: it still holds the caught
-                            // exception (no `catch_exception` intervenes between
-                            // the landing and PUSH_EXC_INFO), the read is
-                            // graph-only so the walker stream is unchanged, and
-                            // the producer forces `exc_value` to interfere with
-                            // the `get_current_exception` result so regalloc
-                            // gives them distinct colours.  The slot pin below
-                            // must stay: dropping it perturbs the canonical-
+                            // `exc_value` a producer by reading the stack slot
+                            // the catch landing stored the caught exception in,
+                            // which is `w_exc = self.popvalue()` itself: the
+                            // producer forces `exc_value` to interfere with the
+                            // `current_exception_or_none` result so regalloc gives
+                            // them distinct colours.  It must be a stack read and
+                            // not a `last_exc_value` re-read, because a guard
+                            // inside this opcode resumes at the `-live-` that
+                            // precedes it: replaying a `last_exc_value` there
+                            // reads an exception no guard failure carries
+                            // (`bhimpl_last_exc_value` asserts non-null).  Emitted
+                            // before the pop, which clears the slot.  The slot pin
+                            // below must stay: dropping it perturbs the canonical-
                             // derived gate-off resume liveness.
+                            let exc_slot =
+                                stack_base_absolute + current_depth.saturating_sub(1) as usize;
+                            let exc_slot_idx: super::flow::FlowValue =
+                                super::flow::Constant::signed(exc_slot as i64).into();
                             record_graph_op(
                                 &current_block.block(),
-                                "last_exc_value",
-                                Vec::new(),
+                                "getarrayitem_vable_r",
+                                vable_getarrayitem_ref_graph_args(
+                                    frame_var.into(),
+                                    exc_slot_idx.into(),
+                                ),
                                 Some(exc_value.clone()),
                                 py_pc as i64,
                             );
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             // pyopcode.py:786 keeps `exc` in a local after
                             // `popvalue()`.  The trailing `push(exc)` targets a
                             // stable scratch register so the intervening
@@ -10329,21 +10354,13 @@ impl CodeWriter {
                             // threading is walker-stream-only.
                             let scratch_exc = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
                             let scratch_prev = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
-                            // get_current_exception / set_current_exception are TLS read/write —
-                            // EF_CANNOT_RAISE per `effectinfo.py:19` (matching call.py:296
-                            // getcalldescr's analyzer outcome for non-raising helpers).
-                            // PushExcInfo
-                            // get/set_current_exception factor refactor.
-                            // Both helpers are PlainCannotRaise (TLS
-                            // read/write only).  `get_current_exception`
-                            // is 0-arg `() → Ref`; `set_current_exception`
-                            // is 1-arg `(exc:Ref) → Void`.  Graph
-                            // dual-writes below remain unchanged.
-                            // graph dual-writes for
-                            // both PushExcInfo emits.  get_current_exception
-                            // takes no args (shape residual_call_r_r with empty
-                            // ListR); set_current_exception is `(exc:Ref)→Void`
-                            // (shape residual_call_r_v).
+                            // current_exception_or_none / set_current_exception are TLS
+                            // read/write — `EF_CANNOT_RAISE`, the outcome `call.py
+                            // getcalldescr`'s analyzer gives a non-raising helper.
+                            // `current_exception_or_none` is 0-arg `() → Ref`
+                            // (shape residual_call_r_r with empty ListR);
+                            // `set_current_exception` is `(exc:Ref) → Void` (shape
+                            // residual_call_r_v).
                             // Walker-orthodoxy: TLS-only helpers,
                             // no frame_var threading.  Match helper
                             // bind-site flavors in `register_helper_fn_pointers`
@@ -10354,9 +10371,9 @@ impl CodeWriter {
                             // + empty raw frozensets + can_collect=false`
                             // shape (`effectinfo.py:281-283`).
                             let prev_var = residual_call!(
-                                get_current_exception_fn_idx,
+                                current_exception_or_none_fn_idx,
                                 CallFlavor::PlainCannotRaiseNoHeap,
-                                majit_ir::RuntimeHelperKind::GetCurrentException,
+                                majit_ir::RuntimeHelperKind::CurrentExceptionOrNone,
                                 vec![],
                                 vec![],
                                 vec![],

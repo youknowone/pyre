@@ -11833,6 +11833,13 @@ fn try_walker_specialize_subscr_str<Sym: WalkSym>(
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, raw)?;
     Ok(Some(()))
 }
+/// Whether `callable` is the `dict.get` method object.
+///
+/// The typedef registers the slot as
+/// `make_builtin_function("get", __majit_wrap_dict_descr_get)`, so that leaf
+/// is what `BuiltinCode.func` holds. Naming the `dict_method_get` body it
+/// forwards to instead compares two different functions, and answered true
+/// only while a build happened to give them one address.
 fn is_builtin_dict_get_function(callable: pyre_object::PyObjectRef) -> bool {
     if callable.is_null() || !unsafe { pyre_interpreter::is_function(callable) } {
         return false;
@@ -11841,7 +11848,7 @@ fn is_builtin_dict_get_function(callable: pyre_object::PyObjectRef) -> bool {
     !code.is_null()
         && unsafe { pyre_interpreter::is_builtin_code(code) }
         && unsafe { pyre_interpreter::builtin_code_get(code) as usize }
-            == pyre_interpreter::type_methods::dict_method_get as *const () as usize
+            == pyre_interpreter::type_methods::__majit_wrap_dict_descr_get as *const () as usize
 }
 
 #[derive(Clone, Copy)]
@@ -20314,20 +20321,35 @@ pub(crate) fn orthodox_list_append_body_and_sym<Sym: WalkSym>(
     Some((sub_body, sym_ptr))
 }
 
-/// The entry frame a helper sub-walk pushes when the walk is inside an
-/// inlined callee (`fbw_mode.inline_subwalk`): the callee preserved at the
-/// helper's entry, so a guard in the helper rebuilds it and re-executes the
-/// helper.  `None` at the root level, which stays on the caller-boundary
-/// resume (see `try_walker_inline_builtin_call`).  An `Err` is a decline:
-/// nothing has been recorded.
+/// Where the guards of a helper sub-walk resume.
+pub(crate) enum HelperEntry {
+    /// Root level: the caller-boundary resume at the full-body sym's
+    /// coordinate for the call (see `try_walker_inline_builtin_call`).
+    Root,
+    /// Inside an inlined Python callee: the callee paused at the helper's
+    /// CALL, pushed as the helper's entry frame, so a guard in the helper
+    /// rebuilds it and re-executes the helper.
+    Callee(InlineParentFrame),
+    /// Inside another canonical helper body.  That helper has no Python
+    /// frame of its own, so a guard here resumes where the enclosing
+    /// helper's guards do: the coordinates and paused levels it already
+    /// published, re-executing the outermost helper call.
+    EnclosingHelper,
+}
+
+/// The [`HelperEntry`] for a helper call at `op_pc` of the current walk.
+/// An `Err` is a decline: nothing has been recorded.
 fn orthodox_helper_nested_entry<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
-) -> Result<Option<InlineParentFrame>, InlineCallerFrameDecline> {
-    if !ctx.fbw_mode.inline_subwalk {
-        return Ok(None);
+) -> Result<HelperEntry, InlineCallerFrameDecline> {
+    if ctx.fbw_mode.transparent_helper_subwalk {
+        return Ok(HelperEntry::EnclosingHelper);
     }
-    compute_inline_helper_call_entry_frame(ctx, op_pc).map(Some)
+    if !ctx.fbw_mode.inline_subwalk {
+        return Ok(HelperEntry::Root);
+    }
+    compute_inline_helper_call_entry_frame(ctx, op_pc).map(HelperEntry::Callee)
 }
 
 /// Enter a canonical helper body as a sub-jitcode walk from a walker fold.
@@ -20350,11 +20372,11 @@ fn orthodox_helper_nested_entry<Sym: WalkSym>(
 /// `call_site_label` names it in the active-box collection.
 ///
 /// `nested_entry` is [`orthodox_helper_nested_entry`]'s answer for `op_pc`:
-/// inside an inlined callee the helper's guards resume at that callee's
-/// own coordinate (the entry frame it pushes plus the sub-walk's outer
-/// coordinate/active boxes), not at the full-body sym's -- the same model
-/// `try_walker_inline_builtin_call` applies.  Resolving the full-body
-/// coordinate from a callee `op_pc` restored the wrong frame image after
+/// inside an inlined callee or another helper the helper's guards resume at
+/// the enclosing coordinate (the entry frame pushed for a callee, plus the
+/// sub-walk's outer coordinate/active boxes), not at the full-body sym's --
+/// the same model `try_walker_inline_builtin_call` applies.  Resolving the
+/// full-body coordinate from a callee `op_pc` restored the wrong frame image after
 /// an overflow guard failed in `step` of `a, b = step(a, b)`.
 #[allow(clippy::too_many_arguments)]
 fn run_orthodox_helper_subwalk<Sym: WalkSym>(
@@ -20362,7 +20384,7 @@ fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     op_pc: usize,
     sym: &Sym,
     sub_body: &SubJitCodeBody,
-    nested_entry: Option<InlineParentFrame>,
+    nested_entry: HelperEntry,
     fallback_label: &'static str,
     call_site_label: &'static str,
     int_args: &[OpRef],
@@ -20371,7 +20393,7 @@ fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     ref_arg_concretes: &[ConcreteValue],
     float_args: &[OpRef],
 ) -> Result<(DispatchOutcome, majit_metainterp::recorder::TracePosition), DispatchError> {
-    let nested_helper = nested_entry.is_some();
+    let nested_helper = !matches!(nested_entry, HelperEntry::Root);
     let (call_site_py_pc, vsd_value, outer_jitcode_index, call_site_marker) = if nested_helper {
         (
             ctx.entry_py_pc(),
@@ -20488,8 +20510,12 @@ fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     let walk_start = ctx.trace_ctx.get_trace_position();
     let saved_fbw_mode = ctx.fbw_mode;
     ctx.fbw_mode.inline_subwalk = true;
-    let helper_frame =
-        nested_entry.map(|frame| InlineFrameGuard::enter(ctx.session, 0, false, vec![frame]));
+    let helper_frame = match nested_entry {
+        HelperEntry::Callee(frame) => {
+            Some(InlineFrameGuard::enter(ctx.session, 0, false, vec![frame]))
+        }
+        HelperEntry::Root | HelperEntry::EnclosingHelper => None,
+    };
     let walk_result = run_sub_jitcode_walk(
         ctx,
         op_pc,
@@ -22691,21 +22717,27 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
 /// `sys_exc_value` slot (`ec_sys_exc_value_descr`), and consume pyre's
 /// propagation-root clear without recording a runtime call.
 /// Recognised by the codewriter-stamped `runtime_helper` tag, NOT a funcptr
-/// address (the residual calls the cross-crate `cpu.{get,set}_current_
-/// exception_fn` wrappers in `pyre-jit`, which `pyre-jit-trace` cannot name).
+/// address (the residual calls the cross-crate `cpu.*_current_exception*_fn`
+/// wrappers in `pyre-jit`, which `pyre-jit-trace` cannot name).
 ///
+///   * `CurrentExceptionOrNone` — `current_exception_or_none()` (`[]→Ref`,
+///     dst_bank `'r'`): the PUSH_EXC_INFO `prev` save.  It owns a matching
+///     store and POP_EXCEPT restore, so it pushes the field onto the
+///     saved-prev stack: emit `GETFIELD_GC_R(ec, sys_exc_value)` for the
+///     restore to reinstate.  The operand `PUSH_EXC_INFO` pushes is `None`
+///     for an empty slot and the field otherwise; the test becomes the
+///     nullity guard upstream records (see the read arm).
 ///   * `GetCurrentException` — `get_current_exception()` (`[]→Ref`,
-///     dst_bank `'r'`): the PUSH_EXC_INFO `prev` save, and also the read a
-///     catch-covered bare `raise` uses to obtain the exception it re-raises.
-///     Only the first owns a matching store and POP_EXCEPT restore, so only
-///     the first pushes onto the saved-prev stack.  Emit
-///     `GETFIELD_GC_R(ec, sys_exc_value)`, stamp the live `prev` concrete
-///     (the residual executor would have returned it) so a downstream read
-///     of the dst sees the right value.
+///     dst_bank `'r'`): the read a catch-covered bare `raise` uses to obtain
+///     the exception it re-raises.  Emit `GETFIELD_GC_R(ec, sys_exc_value)`
+///     and stamp the live value concrete (the residual executor would have
+///     returned it) so a downstream read of the dst sees the right value.
 ///   * `SetCurrentException` — `set_current_exception(exc)` (`[Ref]→void`,
 ///     dst_bank `'v'`): the PUSH_EXC_INFO store and the POP_EXCEPT restore.
 ///     Emit `SETFIELD_GC(ec, exc, sys_exc_value)` and apply the concrete
-///     write the authoritative walk's residual executor would have done.
+///     write the authoritative walk's residual executor would have done.  A
+///     restore with no matching save tests its operand against `None`
+///     (`set_sys_exc_info3`) and stores NULL for it.
 ///   * `ClearInFlightException` — `set_in_flight_exception(PY_NULL)`
 ///     (`[]→void`, dst_bank `'v'`): apply the clear to the authoritative
 ///     recording walk, but emit no IR.  PyPy keeps the propagating exception
@@ -22759,12 +22791,17 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
         return Ok(Some(()));
     }
 
-    if runtime_helper == majit_ir::RuntimeHelperKind::GetCurrentException {
-        // PUSH_EXC_INFO `prev = ec.sys_exc_value` — `[]→Ref`.
+    if matches!(
+        runtime_helper,
+        majit_ir::RuntimeHelperKind::GetCurrentException
+            | majit_ir::RuntimeHelperKind::CurrentExceptionOrNone
+    ) {
+        // PUSH_EXC_INFO `prev = ec.sys_exc_value`, or a covered bare raise's
+        // read of it — `[]→Ref`.
         if !r_args.is_empty() || dst_bank != 'r' {
             return Ok(None);
         }
-        // Two Python instructions lower to this helper, and they want
+        // The two Python instructions that lower to these helpers want
         // different things from a bridge seed.  A bare `raise` wants
         // the exception the bridge is resuming with — the compiled loop is free
         // to elide its `sys_exc_value` store (a balanced save/store/restore
@@ -22779,13 +22816,11 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
         // entry, so the slot is current.  A seed this walk stored itself is a
         // view of the field either way, and reusing its OpRef keeps the
         // save/store/restore triple balanced.
-        // The predicate is true for `RAISE_VARARGS 0`, `RERAISE` and `FOR_ITER`,
-        // but only the first can reach here: `RERAISE` reads its exception off
-        // the vable stack and `FOR_ITER` re-raises the value its own
-        // `catch_exception` caught, so neither emits this helper.  The name
-        // records the one shape that does.
+        // `GetCurrentException` is emitted only by a catch-covered bare
+        // `RAISE_VARARGS 0`; PUSH_EXC_INFO saves through
+        // `CurrentExceptionOrNone`.
         let is_covered_bare_raise_read =
-            super::recording_raise_keeps_existing_traceback(ctx, op.pc);
+            runtime_helper == majit_ir::RuntimeHelperKind::GetCurrentException;
         let seed_answers_this_read =
             ctx.fbw_mode.current_exception_seed_from_walk_store || is_covered_bare_raise_read;
         let (prev, prev_obj) = if let Some(seed) = ctx
@@ -22816,19 +22851,45 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
             majit_ir::Value::Ref(majit_ir::GcRef(prev_obj as usize)),
         );
         // Only PUSH_EXC_INFO owns a matching set + POP_EXCEPT pair.  A covered
-        // bare raise uses the same read helper to obtain the exception it
+        // bare raise reads the same field to obtain the exception it
         // re-raises, but has no following PUSH store.  Treating that read as a
         // save arms the next POP as a PUSH and leaves the bare raise's value on
         // this stack, so a second enclosing POP restores the inner exception.
-        // For PUSH_EXC_INFO, save (OpRef, concrete) for the matching restore and
-        // mark the immediately-following set as this PUSH's slot store.  The
-        // codewriter pushes `prev` then `exc` onto the operand stack and
-        // POP_EXCEPT pops them, but the walker resolves the popped `prev`
-        // operand to the caught exception, not the saved prev; the LIFO stack
-        // carries the authoritative value instead.
+        // For PUSH_EXC_INFO, save the field (OpRef, concrete) for the matching
+        // restore and mark the immediately-following set as this PUSH's slot
+        // store.  The codewriter pushes `prev` then `exc` onto the operand
+        // stack and POP_EXCEPT pops them, but the walker resolves the popped
+        // `prev` operand to the caught exception, not the saved prev; the LIFO
+        // stack carries the authoritative value instead.
         if !is_covered_bare_raise_read {
             FBW_EXC_PREV.with(|s| s.borrow_mut().push((prev, prev_obj)));
             FBW_EXC_PENDING_PUSH_SET.with(|c| c.set(true));
+            // The value `PUSH_EXC_INFO` pushes is `space.w_None` for an empty
+            // slot and the field otherwise.  Trace that test as the nullity
+            // guard `if prev_operr is not None` records.  It has to carry the
+            // walk's own `-live-` anchor: this opcode is an exception-table
+            // target, so its block head is the handler landing, which reads a
+            // `last_exception` value no guard failure carries.  With no anchor
+            // to carry, leave the test in the helper — decline the fold and
+            // let the call stand, which also keeps the pushed operand a value
+            // the resume image can name.  The field read above balances the
+            // save/store/restore triple either way.
+            let is_null = prev_obj.is_null();
+            let guard = if is_null {
+                OpCode::GuardIsnull
+            } else {
+                OpCode::GuardNonnull
+            };
+            if !walker_emit_anchored_fold_guard(ctx, op.pc, guard, &[prev])? {
+                return Ok(None);
+            }
+            let w_prev = if is_null {
+                ctx.trace_ctx.const_ref(pyre_object::w_none() as i64)
+            } else {
+                prev
+            };
+            write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', w_prev)?;
+            return Ok(Some(()));
         }
         write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', prev)?;
         return Ok(Some(()));
@@ -22866,7 +22927,11 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
                 Some(ConcreteValue::Null) | None => std::ptr::null_mut(),
                 _ => return Ok(None),
             };
-            (r_args[0], exc_concrete)
+            if is_push_set {
+                (r_args[0], exc_concrete)
+            } else {
+                walker_restore_exc_info_operand(ctx, op.pc, r_args[0], exc_concrete)?
+            }
         }
     };
     // A PUSH_EXC_INFO store publishes the exception being handled, which IS the
@@ -22918,6 +22983,39 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
     ctx.frame_state.borrow_mut().current_exception_seed_concrete = store_concrete;
     ctx.fbw_mode.current_exception_seed_from_walk_store = true;
     Ok(Some(()))
+}
+
+/// `POP_EXCEPT` → `PyFrame._restore_exc_info` →
+/// `ExecutionContext.set_sys_exc_info3(w_prev)` for a restore whose value
+/// comes off the operand stack: `space.is_none(w_prev)` clears the slot, and
+/// any other value becomes the handled exception.  Returns the value to store
+/// and its concrete.
+fn walker_restore_exc_info_operand<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    w_prev: OpRef,
+    w_prev_concrete: pyre_object::PyObjectRef,
+) -> Result<(OpRef, pyre_object::PyObjectRef), DispatchError> {
+    let is_none = !w_prev_concrete.is_null() && unsafe { pyre_object::is_none(w_prev_concrete) };
+    if !w_prev.is_constant() {
+        let none_const = ctx.trace_ctx.const_ref(pyre_object::w_none() as i64);
+        let is_w = ctx
+            .trace_ctx
+            .record_op(OpCode::PtrEq, &[w_prev, none_const]);
+        ctx.trace_ctx
+            .set_opref_concrete(is_w, majit_ir::Value::Int(is_none as i64));
+        let guard = if is_none {
+            OpCode::GuardTrue
+        } else {
+            OpCode::GuardFalse
+        };
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, guard, &[is_w])?;
+    }
+    Ok(if is_none {
+        (ctx.trace_ctx.const_ref(0), pyre_object::PY_NULL)
+    } else {
+        (w_prev, w_prev_concrete)
+    })
 }
 
 /// #62: walker-native speculative specialization for the `STORE_SUBSCR`

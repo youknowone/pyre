@@ -6254,7 +6254,26 @@ impl CallControl {
     /// native function address: non-elidable calls do not enter the executor's
     /// pure-call folding path.
     fn declares_cannot_raise(&self, target: &CallTarget) -> bool {
-        self.target_func_effects(target)
+        if self
+            .target_func_effects(target)
+            .is_some_and(|effects| effects.cannot_raise_assertion)
+        {
+            return true;
+        }
+        // A `#[dont_look_inside_cannot_raise]` helper is called through
+        // `__majit_call_target_<fn>`.  The mark is harvested on `<fn>`, not
+        // on the trampoline, so a lookup that stops at the trampoline
+        // leaves the residual at `EF_RANDOM_EFFECTS` (may-force).
+        let Some(path) = self.target_to_path(target).or_else(|| {
+            crate::model::fn_const_segments(target)
+                .map(|segments| CallPath::from_segments(segments.iter().map(String::as_str)))
+        }) else {
+            return false;
+        };
+        let Some(user) = user_path_behind_majit_call_target(&path) else {
+            return false;
+        };
+        self.func_effects_with_crate_alias(&user)
             .is_some_and(|effects| effects.cannot_raise_assertion)
     }
 
@@ -7651,7 +7670,7 @@ impl CallControl {
             CallShape::Direct(target) => self.cached_can_collect(target, cache),
             CallShape::Indirect(graphs) => self.cached_can_collect_family(graphs, cache),
         };
-        let effectinfo = effectinfo_from_writeanalyze(
+        let mut effectinfo = effectinfo_from_writeanalyze(
             effects,
             extraeffect,
             oopspecindex,
@@ -7660,6 +7679,19 @@ impl CallControl {
             extradescrs,
             &effect_callee,
         );
+        // `effectinfo_from_writeanalyze` rewrites a top read/write set to
+        // `EF_RANDOM_EFFECTS`.  A `#[dont_look_inside_cannot_raise]`
+        // trampoline's body is that top set (it calls host code the
+        // analyzer cannot see), which would put the residual back at
+        // may-force and a transparent helper walk cannot record it.
+        if let CallShape::Direct(target) = shape
+            && !elidable
+            && !loopinvariant
+            && self.declares_cannot_raise(target)
+            && !caller_supplied_extraeffect
+        {
+            effectinfo.extraeffect = ExtraEffect::CannotRaise;
+        }
 
         // RPython call.py:326-332 post-conditions on elidable / loopinvariant.
         if elidable || loopinvariant {
@@ -7767,6 +7799,21 @@ pub(crate) fn symbolic_fnaddr_for_path(path: &CallPath) -> i64 {
 /// synthetic grow/malloc body — matching upstream's `@jit.dont_look_inside`
 /// residualization. Matched by leaf segment so it is agnostic to any crate or
 /// module prefix a callsite spells the target with.
+/// `__majit_call_target_<fn>` → `<fn>` in the same path.
+///
+/// The helper macro emits the trampoline next to the user function, and
+/// `_jit_cannot_raise_` is harvested on the user function only.
+fn user_path_behind_majit_call_target(path: &CallPath) -> Option<CallPath> {
+    let leaf = path.segments.last()?;
+    let user = leaf.strip_prefix("__majit_call_target_")?;
+    if user.is_empty() {
+        return None;
+    }
+    let mut segments = path.segments.clone();
+    *segments.last_mut()? = user.to_string();
+    Some(CallPath { segments })
+}
+
 pub(crate) fn is_dont_look_inside_residual_helper(path: &CallPath) -> bool {
     matches!(
         path.last_segment(),
@@ -11314,6 +11361,53 @@ mod tests {
             let descriptor = cc.getcalldescr(
                 &direct_call_op(target),
                 vec![Type::Ref, Type::Int],
+                Type::Void,
+                OopSpecIndex::None,
+                None,
+                &mut cache,
+                None,
+            );
+            assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CannotRaise);
+        });
+    }
+
+    #[test]
+    fn call_target_trampoline_honours_user_cannot_raise_assertion() {
+        let mut cc = CallControl::new();
+        cc.mark_cannot_raise_assertion(CallPath::from_segments([
+            "typedef",
+            "tuple_from_exact_list",
+        ]));
+        let target = CallTarget::function_path([
+            "pyre_interpreter",
+            "typedef",
+            "__majit_call_target_tuple_from_exact_list",
+        ]);
+        // The trampoline has a graph whose read/write analysis is top, which
+        // `effectinfo_from_writeanalyze` would otherwise publish as
+        // `EF_RANDOM_EFFECTS`.
+        let trampoline = CallPath::from_segments([
+            "pyre_interpreter",
+            "typedef",
+            "__majit_call_target_tuple_from_exact_list",
+        ]);
+        let host = CallPath::from_segments(["typedef", "tuple_from_exact_list"]);
+        let mut graph = FunctionGraph::new("__majit_call_target_tuple_from_exact_list");
+        let start = graph.startblock;
+        graph.blocks[start.0]
+            .operations
+            .push(direct_call_op(CallTarget::function_path([
+                "typedef",
+                "tuple_from_exact_list",
+            ])));
+        graph.set_return(start, None);
+        cc.register_function_graph(trampoline, graph);
+        cc.mark_external_gc_effects(host);
+        crate::local_crates::with_local_crate_root("pyre_interpreter", || {
+            let mut cache = AnalysisCache::default();
+            let descriptor = cc.getcalldescr(
+                &direct_call_op(target),
+                Vec::new(),
                 Type::Void,
                 OopSpecIndex::None,
                 None,

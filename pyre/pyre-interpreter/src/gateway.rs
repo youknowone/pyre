@@ -1375,6 +1375,45 @@ fn arity_mismatch(
     crate::PyError::type_error(message)
 }
 
+/// A `Signature` binding error for a method descriptor whose receiver is its
+/// only positional parameter and whose other parameters are keyword-only
+/// (`list.sort($self, /, *, key=None, reverse=False)`).  Such a method is an
+/// argument-clinic `_PyArg_UnpackKeywords` parse under its bare name, so its
+/// errors take that wording; every other shape keeps the `Arguments` wording
+/// `call::bind_kwargs_to_signature` produced.  `pos_args` leads with the
+/// receiver.
+///
+/// # Safety
+/// `obj` must point to a valid `BuiltinCode`.
+#[cold]
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub unsafe fn builtin_code_binding_error(
+    obj: PyObjectRef,
+    sig: &Signature,
+    pos_args: &[PyObjectRef],
+    kw_names: &[rustpython_wtf8::Wtf8Buf],
+    err: crate::PyError,
+) -> crate::PyError {
+    let code = unsafe { &*(obj as *const BuiltinCode) };
+    let keyword_only_method = !code.owner.is_null()
+        && sig.varargname.is_none()
+        && sig.kwargname.is_none()
+        && sig.posonlyargcount == 1
+        && sig.num_argnames() == 1
+        && sig.kwonlyargcount > 0;
+    if !keyword_only_method {
+        return err;
+    }
+    crate::builtins::clinic_keyword_only_error(
+        code.name,
+        &sig.argnames[1..],
+        pos_args.len().saturating_sub(1),
+        kw_names,
+    )
+    .unwrap_or(err)
+}
+
 /// Build the keyword-rejection error for a fixed-count BuiltinCode, for a
 /// caller that rejects the keyword before it reaches [`builtin_code_call`].
 /// `receiver` is the call's first positional argument, if any.

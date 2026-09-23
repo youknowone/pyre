@@ -91,16 +91,29 @@ pub mod frame_locals_proxy {
         unsafe { FrameLocalsProxy::from_obj(obj) }.map(|proxy| proxy.w_frame)
     }
 
-    /// The `f_extra_locals` half of [`FrameLocalsProxy::pin_entries`]: pin
-    /// every entry of `extra` as a `(key, value)` pair on top of the caller's
-    /// bracket, and report how many.
+    /// Whether `obj` is a `FrameLocalsProxy`.  A class-pointer test, so
+    /// `list.__init__` can branch on it without entering `keys`.
+    pub fn is_frame_locals_proxy(obj: PyObjectRef) -> bool {
+        unsafe { FrameLocalsProxy::from_obj(obj) }.is_some()
+    }
+
+    /// `keys()` of a `FrameLocalsProxy`, or `None` when `obj` is not one.
+    ///
+    /// `list(f_locals)` reaches this from `ListStrategy.extend` instead of
+    /// `space.iter`: the proxy's `__iter__` is `iter(self.keys())`, and that
+    /// method call re-enters the interpreter once per extend.
+    pub fn keys_list(obj: PyObjectRef) -> Option<Result<PyObjectRef, crate::PyError>> {
+        let proxy = unsafe { FrameLocalsProxy::from_obj(obj) }?;
+        Some(proxy.keys())
+    }
+
+    /// Pin every entry of `extra` as a `(key, value)` pair on top of the
+    /// caller's bracket, and report how many.
     ///
     /// Pins into `roots` on purpose — a nested `push_roots` would rewind
-    /// those slots on drop before the caller could read them.  Deliberately
-    /// UNHINTED: this loop is bounded by the dict's length, which is red,
-    /// where the slot scan it follows is bounded by the green
-    /// `locals_plus_names`.  `contains_loop` therefore declines this graph
-    /// and the extras walk stays one residual call.
+    /// those slots on drop before the caller could read them.  Only the
+    /// residual helpers below call it: this loop is bounded by the dict's
+    /// length, which is red.
     fn pin_extra_locals_entries(
         roots: &pyre_object::gc_roots::RootScope,
         extra: PyObjectRef,
@@ -116,6 +129,59 @@ pub mod frame_locals_proxy {
         }
         let _ = roots.pin_roots(&live);
         live.len() / 2
+    }
+
+    /// The `f_extra_locals` half of `framelocalsproxy_keys` (`part` 0) or
+    /// `_values` (`part` 1): append one entry per `extra` pair to `w_list`
+    /// and return the list.
+    ///
+    /// `dont_look_inside` because the loop is bounded by the dict's length,
+    /// which is red: it stays one residual call, so the hinted collect in
+    /// [`FrameLocalsProxy::collect_entries`] is bounded by the green slot
+    /// scan alone.
+    #[majit_macros::dont_look_inside]
+    fn append_extra_locals(w_list: PyObjectRef, extra: PyObjectRef, part: usize) -> PyObjectRef {
+        let roots = pyre_object::gc_roots::push_roots();
+        let list_slot = roots.pin_roots(&[w_list]);
+        let pairs_base = list_slot + 1;
+        let count = pin_extra_locals_entries(&roots, extra);
+        for index in 0..count {
+            unsafe {
+                pyre_object::w_list_append(
+                    roots.get(list_slot),
+                    roots.get(pairs_base + index * 2 + part),
+                )
+            };
+        }
+        roots.get(list_slot)
+    }
+
+    /// [`append_extra_locals`] for `framelocalsproxy_items`: one
+    /// `(key, value)` tuple per `extra` pair.
+    #[majit_macros::dont_look_inside]
+    fn append_extra_locals_items(w_list: PyObjectRef, extra: PyObjectRef) -> PyObjectRef {
+        let roots = pyre_object::gc_roots::push_roots();
+        let list_slot = roots.pin_roots(&[w_list]);
+        let pairs_base = list_slot + 1;
+        let count = pin_extra_locals_entries(&roots, extra);
+        for index in 0..count {
+            let item = pyre_object::w_tuple_new(vec![
+                roots.get(pairs_base + index * 2),
+                roots.get(pairs_base + index * 2 + 1),
+            ]);
+            unsafe { pyre_object::w_list_append(roots.get(list_slot), item) };
+        }
+        roots.get(list_slot)
+    }
+
+    /// `framelocalsproxy_reversed`'s in-place `list.reverse` of the keys
+    /// list, returning the list reloaded from its root.
+    #[majit_macros::dont_look_inside]
+    fn reverse_list_in_place(w_list: PyObjectRef) -> PyObjectRef {
+        let roots = pyre_object::gc_roots::push_roots();
+        let list_slot = roots.pin_roots(&[w_list]);
+        unsafe { pyre_object::listobject::w_list_reverse(roots.get(list_slot)) };
+        roots.get(list_slot)
     }
 
     impl FrameLocalsProxy {
@@ -428,11 +494,12 @@ pub mod frame_locals_proxy {
         }
 
         /// `framelocalsproxy_keys`, `_values` and `_items` walk the same two
-        /// halves in the same order, so one scan serves all three: every bound
-        /// locals-plus slot in `co_localsplusnames` order, then every
-        /// `f_extra_locals` entry.  Pins `2 * n` shadow-stack slots from the
-        /// caller's bracket base upwards, `(key, value)` interleaved, and
-        /// returns `n`.
+        /// halves in the same order: every bound locals-plus slot in
+        /// `co_localsplusnames` order, then every `f_extra_locals` entry.
+        /// This scan is the first half and serves all three.  Pins `2 * n`
+        /// shadow-stack slots from the caller's bracket base upwards,
+        /// `(key, value)` interleaved, and returns `n`; the second half is
+        /// [`append_extra_locals`] / [`append_extra_locals_items`].
         ///
         /// The two halves are reported INDEPENDENTLY, so a name that is both a
         /// bound slot and an `f_extra_locals` key yields two entries — which is
@@ -454,8 +521,7 @@ pub mod frame_locals_proxy {
         /// [`Self::locals_plus_value`]: the slot scan is bounded by
         /// `locals_plus_names`, i.e. the code object's varnames plus cellvars
         /// plus freevars, which is green.  The extras half is bounded by the
-        /// dict's length instead, so it lives in its own unhinted function
-        /// and stays a residual call.
+        /// dict's length instead, so it is not part of this scan.
         #[majit_macros::unroll_safe]
         fn pin_entries(&self, roots: &pyre_object::gc_roots::RootScope) -> usize {
             let mut count = 0;
@@ -490,12 +556,11 @@ pub mod frame_locals_proxy {
                 next_slot += 2;
                 let _ = roots.pin_root(pyre_object::PY_NULL);
                 let _ = roots.pin_root(value);
-                roots.set(key_slot, pyre_object::w_str_new_managed(name));
+                // `co_localsplusnames` entries are the code object's own strings.
+                // A fresh managed string per `keys` call allocated one object
+                // per bound local on every `list(f_locals)`.
+                roots.set(key_slot, pyre_object::intern_str_value(name));
                 count += 1;
-            }
-            let extra = self.frame().get_extra_locals();
-            if !extra.is_null() {
-                count += pin_extra_locals_entries(roots, extra);
             }
             count
         }
@@ -758,14 +823,8 @@ pub mod frame_locals_proxy {
         fn __reversed__(&self) -> Result<PyObjectRef, crate::PyError> {
             // `framelocalsproxy_reversed` reverses the key LIST in place and
             // hands that back; it does not build a cursor.
-            let roots = pyre_object::gc_roots::push_roots();
-            let base = roots.base();
-            let count = self.pin_entries(&roots);
-            let mut keys: Vec<PyObjectRef> = Vec::with_capacity(count);
-            for index in (0..count).rev() {
-                keys.push(roots.get(base + index * 2));
-            }
-            Ok(pyre_object::w_list_new(keys))
+            let keys = self.keys()?;
+            Ok(reverse_list_in_place(keys))
         }
 
         fn __contains__(&self, key: PyObjectRef) -> Result<bool, crate::PyError> {
@@ -792,27 +851,44 @@ pub mod frame_locals_proxy {
         }
 
         fn keys(&self) -> Result<PyObjectRef, crate::PyError> {
-            let roots = pyre_object::gc_roots::push_roots();
-            let base = roots.base();
-            let count = self.pin_entries(&roots);
-            let mut keys: Vec<PyObjectRef> = Vec::with_capacity(count);
-            for index in 0..count {
-                keys.push(roots.get(base + index * 2));
-            }
-            Ok(pyre_object::w_list_new(keys))
+            self.collect_entries(0)
         }
 
         fn values(&self) -> Result<PyObjectRef, crate::PyError> {
+            self.collect_entries(1)
+        }
+
+        /// [`Self::keys`] (`part` 0) or [`Self::values`] (`part` 1).
+        ///
+        /// The collect loop is bounded by the count [`Self::pin_entries`]
+        /// just produced from the green `locals_plus_names` array, so the
+        /// hint is the same one `fast2locals` carries; the `f_extra_locals`
+        /// half, bounded by a dict length, is the residual
+        /// [`append_extra_locals`].  Without the hint `contains_loop`
+        /// declines this graph even though `pin_entries` is already hinted,
+        /// and `sorted(fr.f_locals)` / `iter(fr.f_locals)` (both
+        /// `framelocalsproxy_iter` → `keys`) stay one residual call per
+        /// except-handler iteration.
+        #[majit_macros::unroll_safe]
+        fn collect_entries(&self, part: usize) -> Result<PyObjectRef, crate::PyError> {
             let roots = pyre_object::gc_roots::push_roots();
             let base = roots.base();
             let count = self.pin_entries(&roots);
-            let mut values: Vec<PyObjectRef> = Vec::with_capacity(count);
+            let mut entries: Vec<PyObjectRef> = Vec::with_capacity(count);
             for index in 0..count {
-                values.push(roots.get(base + index * 2 + 1));
+                entries.push(roots.get(base + index * 2 + part));
             }
-            Ok(pyre_object::w_list_new(values))
+            let entries = pyre_object::w_list_new(entries);
+            let extra = self.frame().get_extra_locals();
+            if extra.is_null() {
+                return Ok(entries);
+            }
+            Ok(append_extra_locals(entries, extra, part))
         }
 
+        /// Same bound as [`Self::collect_entries`], and the extras half is
+        /// the residual [`append_extra_locals_items`].
+        #[majit_macros::unroll_safe]
         fn items(&self) -> Result<PyObjectRef, crate::PyError> {
             // Each `w_tuple_new` allocates, so the pairs still queued in the
             // scan and the tuples already built are pre-allocation copies by
@@ -831,7 +907,12 @@ pub mod frame_locals_proxy {
             for i in 0..count {
                 out.push(roots.get(out_base + i));
             }
-            Ok(pyre_object::w_list_new(out))
+            let items = pyre_object::w_list_new(out);
+            let extra = self.frame().get_extra_locals();
+            if extra.is_null() {
+                return Ok(items);
+            }
+            Ok(append_extra_locals_items(items, extra))
         }
 
         fn copy(&self) -> Result<PyObjectRef, crate::PyError> {
@@ -5724,7 +5805,7 @@ impl PyFrame {
             if mark_top_of_stack(cur_stack) == StackKind::Except as i64 {
                 // The popped value is the saved previous exception; make
                 // it current again.
-                crate::eval::set_current_exception(self.popvalue());
+                crate::eval::restore_exc_info(self.popvalue());
             } else {
                 // `PyStackRef_XCLOSE(_PyFrame_StackPop(f->f_frame))` — the
                 // `X` is load-bearing.  A slot below the jump target can be

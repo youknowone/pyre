@@ -8961,10 +8961,19 @@ pub(crate) unsafe fn resolve_inlinable_callee(
     callable: pyre_object::PyObjectRef,
 ) -> Option<(*const (), usize, bool)> {
     unsafe {
+        // `is_function` also admits METHOD_DESCRIPTOR_TYPE.  Inlinable
+        // callees are `function.py Function` and the MixedModule-wrapped
+        // `BuiltinFunction` that still carries PyCode (`_load_lazily`).
+        // Interp-level builtins have BuiltinCode and fail the CODE_TYPE
+        // check below.  Slot wrappers / method descriptors stay residual.
+        if !pyre_interpreter::is_function(callable) {
+            return None;
+        }
+        let ob_type = (*callable).ob_type as *const () as usize;
         let function_type_addr = &pyre_interpreter::FUNCTION_TYPE as *const _ as usize;
-        if !pyre_interpreter::is_function(callable)
-            || (*callable).ob_type as *const () as usize != function_type_addr
-        {
+        let builtin_function_type_addr =
+            &pyre_interpreter::BUILTIN_FUNCTION_TYPE as *const _ as usize;
+        if ob_type != function_type_addr && ob_type != builtin_function_type_addr {
             return None;
         }
         let w_code = pyre_interpreter::function_get_code(callable);
@@ -9041,11 +9050,107 @@ unsafe fn lookup_instance_dunder_call(
     Some((method, w_class, version_tag))
 }
 
+/// `typeobject.py descr_call` for a class whose `__new__` is a builtin gateway.
+///
+/// When `__init__` is `object`'s, the whole of `type.__call__` is the `__new__`
+/// call, which `try_walker_inline_builtin_call` enters with the class as its
+/// receiver.  `object.__init__` rejects surplus arguments only when `__new__`
+/// is `object`'s or `__init__` is overridden, and neither holds here, so that
+/// half of `descr_call` has no effect to reproduce.
+///
+/// That is true of the class named at the call; `descr_call` looks `__init__`
+/// up on the type of what `__new__` returned.  A builtin `__new__` handed the
+/// exact class returns another type only through a conversion dunder of an
+/// argument (`__int__`, `__str__`, ...), so every argument is required to be
+/// an instance of a builtin type, which the caller pins — but only in the
+/// `__init__`-is-`object`'s case, where skipping `__init__` is valid only if
+/// the result type cannot change.
+///
+/// When `__init__` is itself a builtin gateway (`list.__init__` calling
+/// `extend`), `descr_call` runs both halves and the result type is the class
+/// being called.  The conversion-dunder pin does not apply: `list(x)` iterates
+/// `x` rather than converting it.  The second return is that `__init__`; the
+/// caller walks it after `__new__` and keeps the instance.
+///
+/// # Safety
+/// `callable` and every entry of `args` must be valid objects.
+unsafe fn resolve_type_call_builtin_new(
+    callable: pyre_object::PyObjectRef,
+    args: &[ConcreteValue],
+) -> Option<(pyre_object::PyObjectRef, Option<pyre_object::PyObjectRef>)> {
+    if callable.is_null() || !unsafe { pyre_object::is_type(callable) } {
+        return None;
+    }
+    let w_metatype = pyre_interpreter::typedef::w_type();
+    let w_object = pyre_interpreter::typedef::w_object();
+    if w_object.is_null() || std::ptr::eq(callable, w_metatype) {
+        return None;
+    }
+    // A metaclass may supply its own `__call__`; only `type`'s is this shape.
+    if !std::ptr::eq(unsafe { (*callable).w_class }, w_metatype) {
+        return None;
+    }
+    if unsafe { pyre_object::typeobject::w_type_get_version_tag(callable) } == 0 {
+        return None;
+    }
+    if unsafe {
+        pyre_object::w_type_disallows_instantiation(callable)
+            || pyre_object::w_type_is_abstract(callable)
+            || pyre_object::typeobject::w_type_get_hasuserdel(callable)
+            || pyre_object::typeobject::w_type_has_vectorcall(callable)
+    } {
+        return None;
+    }
+    let tp_new = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(callable, "__new__") }?;
+    let obj_new = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_object, "__new__") };
+    if Some(tp_new) == obj_new || !unsafe { pyre_interpreter::is_function_carrier(tp_new) } {
+        return None;
+    }
+    let tp_init = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(callable, "__init__") };
+    let obj_init = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_object, "__init__") };
+    let builtin_init = if tp_init == obj_init {
+        None
+    } else {
+        let init = tp_init?;
+        if !unsafe { pyre_interpreter::is_function_carrier(init) } {
+            return None;
+        }
+        Some(init)
+    };
+    for arg in args {
+        let ConcreteValue::Ref(arg) = arg else {
+            return None;
+        };
+        if arg.is_null()
+            || *arg == pyre_object::PY_NULL
+            || (pyre_object::tagged_int::CAN_BE_TAGGED
+                && pyre_object::tagged_int::is_tagged_int(*arg))
+        {
+            return None;
+        }
+        let w_class = unsafe { (**arg).w_class };
+        if w_class.is_null() || !unsafe { pyre_object::is_type(w_class) } {
+            return None;
+        }
+        // Skipping `__init__` is valid only when `__new__` cannot return
+        // another type through a conversion dunder.  Running a builtin
+        // `__init__` is the `descr_call` shape for `list(x)` / similar, and
+        // the result type is the class being called regardless of whether
+        // `x` is a heaptype (`FrameLocalsProxy` is one).
+        if builtin_init.is_none() && unsafe { pyre_object::typeobject::w_type_is_heaptype(w_class) }
+        {
+            return None;
+        }
+    }
+    Some((tp_new, builtin_init))
+}
+
 /// [`lookup_instance_dunder_call`] narrowed to an app-level `__call__` the
 /// walker can inline.  A `__call__` that is not a plain inlinable function — a
 /// `classmethod`, another callable object — has no body to walk and declines
-/// here, exactly as `resolve_inlinable_callee` declines a non-`Function`
-/// callee; a builtin gateway `__call__` is `try_walker_inline_builtin_call`'s.
+/// here, exactly as `resolve_inlinable_callee` declines a callee that is
+/// neither `Function` nor a PyCode-carrying `BuiltinFunction`; a builtin
+/// gateway `__call__` is `try_walker_inline_builtin_call`'s.
 ///
 /// # Safety
 /// `callable` must be a valid object.
@@ -9909,6 +10014,93 @@ fn walker_emit_fold_guard_with_snapshot<Sym: WalkSym>(
     args: &[OpRef],
 ) -> Result<(), DispatchError> {
     walker_emit_guard_with_snapshot(ctx, op_pc, opcode, args)
+}
+
+/// [`walker_emit_fold_guard_with_snapshot`] for a fold inside a Python opcode
+/// that cannot be re-entered at its block head.
+///
+/// A guard ordinarily resumes at the block-head `-live-` of its Python
+/// opcode.  For an exception-table target that marker precedes the handler
+/// landing's `last_exception` / `last_exc_value` pair, and a guard failure
+/// carries no exception for those to read (`bhimpl_last_exc_value` asserts
+/// non-null).  Carry the walk's own `-live-` BEFORE anchor instead: it sits
+/// after the landing, on the operations the opcode has left to run, and is a
+/// decodable startpoint by construction (`pyjitpl.py` reads the normal guard
+/// resume at `self.pc - SIZE_LIVE_OP`).
+///
+/// `false` when the walk has no stepped anchor to carry, leaving the caller
+/// to decline its fold.
+fn walker_emit_anchored_fold_guard<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    opcode: OpCode,
+    args: &[OpRef],
+) -> Result<bool, DispatchError> {
+    let subject = args.first().copied();
+    // `pyjitpl.py _establish_nullity` / `heapcache.py is_nullity_known`, as
+    // in [`walker_emit_guard_with_snapshot`]: an answered question needs no
+    // guard, and the fold stands either way.
+    let nullity = match opcode {
+        OpCode::GuardNonnull => Some(true),
+        OpCode::GuardIsnull => Some(false),
+        _ => None,
+    };
+    if subject.is_some_and(|arg| arg.is_constant()) {
+        return Ok(true);
+    }
+    if let (Some(subject), Some(is_nonnull)) = (subject, nullity)
+        && ctx
+            .trace_ctx
+            .heap_cache()
+            .is_nullity_known(subject, walker_inline_const_word)
+            == Some(is_nonnull)
+    {
+        return Ok(true);
+    }
+    // The anchor answers only when the walk stepped past the block head: the
+    // `-live-` it names must be a LATER one, or it is the block head itself
+    // (or a stale word from a walk that entered mid-opcode) and carrying it
+    // resumes on the landing this exists to skip.  An inline sub-walk's
+    // `op_pc` is a callee coordinate the outer jitcode's tables do not hold,
+    // and its capture resumes at the CALL site instead, so the anchor is not
+    // this guard's to carry there.
+    let anchor = ctx.live_before_jit_pc;
+    if anchor == usize::MAX || ctx.fbw_mode.inline_subwalk {
+        return Ok(false);
+    }
+    let block_head = {
+        let sym = ctx.fbw_mode.snapshot_sym;
+        if sym.is_null() {
+            return Ok(false);
+        }
+        let jitcode = unsafe { (&*sym).jitcode() };
+        if jitcode.is_null() {
+            return Ok(false);
+        }
+        unsafe { (&*jitcode).payload.resume_marker_for_jitcode_pc(op_pc) }
+    };
+    let Some(block_head) = block_head else {
+        return Ok(false);
+    };
+    if anchor <= block_head {
+        return Ok(false);
+    }
+    stamp_guard_value_concrete(ctx.trace_ctx, opcode, args);
+    ctx.trace_ctx.record_guard(opcode, args, 0);
+    if let (Some(subject), Some(is_nonnull)) = (subject, nullity) {
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .nullity_now_known(subject, is_nonnull);
+    }
+    walker_capture_snapshot_for_last_guard_scoped(
+        ctx,
+        op_pc,
+        GuardCaptureScope {
+            carried_resume_jit_pc: Some(anchor),
+            ..GuardCaptureScope::default()
+        },
+    )?;
+    Ok(true)
 }
 
 fn walker_flush_guard_not_invalidated<Sym: WalkSym>(

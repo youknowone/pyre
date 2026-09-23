@@ -7731,10 +7731,16 @@ pub extern "C" fn bh_unpack_ex_fn(before: i64, after: i64, seq: i64) -> i64 {
 }
 
 /// Read the current (per-thread) exception saved in
-/// `pyre_interpreter::eval::CURRENT_EXCEPTION`. Matches the read at
-/// `pyopcode.py PUSH_EXC_INFO` (implicit via `executioncontext.sys_exc_info`).
+/// `pyre_interpreter::eval::CURRENT_EXCEPTION`: the value a catch-covered
+/// bare `raise` re-raises.
 pub extern "C" fn bh_get_current_exception() -> i64 {
     pyre_interpreter::eval::get_current_exception() as i64
+}
+
+/// The value `pyopcode.py PUSH_EXC_INFO` saves below the caught exception:
+/// the exception being handled, or `None` when there is none.
+pub extern "C" fn bh_current_exception_or_none() -> i64 {
+    pyre_interpreter::eval::current_exception_or_none() as i64
 }
 
 /// `eval.rs`'s `raise_varargs(0)` — the value a bare `raise` re-raises.
@@ -7762,10 +7768,10 @@ pub extern "C" fn bh_reraise_varargs_zero() -> i64 {
 
 /// Store `exc` into the per-thread `CURRENT_EXCEPTION` slot. Matches
 /// the write at `pyopcode.py POP_EXCEPT` (restore of saved
-/// sys_exc_info) and at `pyopcode.py PUSH_EXC_INFO` (new raised
-/// exception becomes current).
+/// sys_exc_info, where `None` clears it) and at `pyopcode.py
+/// PUSH_EXC_INFO` (new raised exception becomes current).
 pub extern "C" fn bh_set_current_exception(exc: i64) {
-    pyre_interpreter::eval::set_current_exception(exc as pyre_object::PyObjectRef);
+    pyre_interpreter::eval::restore_exc_info(exc as pyre_object::PyObjectRef);
 }
 
 /// Complete the `PUSH_EXC_INFO` ownership transfer after the caught exception

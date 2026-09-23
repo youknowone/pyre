@@ -576,147 +576,272 @@ pub fn list_method_append(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     Ok(w_none())
 }
 
+/// `listobject.py ListStrategy.extend` — dispatcher only.  Each arm's loop
+/// lives in its own function so `contains_loop` cannot decline this graph
+/// and turn `list(iterable)` / `sorted(x)` into one residual CALL.
 pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_list_receiver(args, "extend", true)?;
     arity_exact(args, "extend", 1)?;
-    let mut list = args[0];
-    let mut other = args[1];
-    unsafe {
-        // listobject.py:1019-1033 only takes the storage-copy path when a
-        // list/tuple uses its inherited iterator.  An overridden subclass
-        // must use the generic incremental iterator path below.
-        if is_exact_list(other) {
-            // BaseRangeListStrategy.extend switches its receiver before even
-            // an empty donor is examined. Keep both operands rooted across
-            // that materialisation and the append loop it feeds.
-            let _roots = pyre_object::gc_roots::push_roots();
-            let root_base = pyre_object::gc_roots::pin_roots(&[list, other]);
-            list = pyre_object::listobject::w_list_materialize_range(list);
-            other = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
-            let n = w_list_len(other);
-            if w_list_len(list) == 0 && pyre_object::listobject::w_list_is_range_strategy(other) {
-                // EmptyListStrategy._extend_from_list delegates to the
-                // donor's copy_into; BaseRangeListStrategy shares its
-                // immutable erased tuple rather than appending boxed ints.
-                pyre_object::listobject::w_list_setslice_mode(
-                    list,
-                    0,
-                    0,
-                    other,
-                    majit_metainterp::jit::we_are_jitted(),
-                )
-                .expect("range copy_into an empty exact list");
-                return Ok(w_none());
-            }
-            pyre_object::listobject::w_list_reserve_for_extend(list, n);
-            for i in 0..n {
-                list = pyre_object::gc_roots::shadow_stack_get(root_base);
-                other = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
-                if let Some(item) = w_list_getitem(other, i as i64) {
-                    pyre_object::listobject::w_list_append_preallocated(list, item);
-                }
-            }
-        } else if is_exact_tuple(other) {
-            let n = w_tuple_len(other);
-            pyre_object::listobject::w_list_reserve_for_extend(list, n);
-            for i in 0..n {
-                if let Some(item) = w_tuple_getitem(other, i as i64) {
-                    pyre_object::listobject::w_list_append_preallocated(list, item);
-                }
-            }
-        } else if pyre_object::is_set_or_frozenset(other)
+    list_extend_items(args[0], args[1])?;
+    Ok(w_none())
+}
+
+/// `ListStrategy.extend` without the gateway arity/receiver checks.
+/// `descr_init` calls this after its own receiver check so the descent
+/// scan of `list((i, 3, 1))` does not inherit `args.first` / `format!`
+/// from `require_list_receiver`.
+pub(crate) fn list_extend_items(
+    list: PyObjectRef,
+    other: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    // listobject.py extend only takes the storage-copy path when a
+    // list/tuple uses its inherited iterator.  An overridden subclass
+    // must use the generic incremental iterator path below.
+    if unsafe { is_exact_list(other) } {
+        extend_from_list(list, other)?;
+    } else if unsafe { is_exact_tuple(other) } {
+        extend_from_tuple(list, other)?;
+    } else if unsafe {
+        pyre_object::is_set_or_frozenset(other)
             && (*other).w_class == pyre_object::get_instantiate(&*(*other).ob_type)
-        {
-            // PyPy's listview optimization snapshots builtin set storage.
-            // In free-threaded pyre this is also the operation boundary that
-            // keeps list(set) from observing a concurrent size transition
-            // between iterator steps.
-            let _roots = pyre_object::gc_roots::push_roots();
-            let root_base = pyre_object::gc_roots::publish_roots(&[list]);
-            let items = pyre_object::w_set_items(other);
-            let _ = pyre_object::gc_roots::publish_roots(&items);
-            pyre_object::gc_roots::normalize_roots(root_base, 1 + items.len());
-            pyre_object::listobject::w_list_resize_for_extend(
-                pyre_object::gc_roots::shadow_stack_get(root_base),
-                items.len(),
-            );
-            for index in 0..items.len() {
-                pyre_object::listobject::w_list_append_preallocated(
-                    pyre_object::gc_roots::shadow_stack_get(root_base),
-                    pyre_object::gc_roots::shadow_stack_get(root_base + 1 + index),
-                );
+    } {
+        extend_from_set(list, other)?;
+    } else if unsafe { crate::pyframe::frame_locals_proxy::is_frame_locals_proxy(other) } {
+        // `framelocalsproxy_iter` is `iter(self.keys())`.  The key list is
+        // built inside this residual so `descr_init`'s graph does not gain
+        // `keys`, and `list(f_locals)` does not re-enter the interpreter.
+        extend_from_frame_locals_proxy(list, other)?;
+    } else {
+        extend_from_iterable(list, other)?;
+    }
+    Ok(())
+}
+
+/// `listobject.py ListStrategy._extend_from_list`, a per-strategy storage
+/// copy (`l += ...`) the JIT calls rather than inlines.  The
+/// `dont_look_inside` call target gives that residual call a real fnaddr,
+/// which the descent scan of `descr_init` requires of every helper it can
+/// reach.
+#[majit_macros::dont_look_inside]
+fn extend_from_list(mut list: PyObjectRef, mut other: PyObjectRef) -> Result<(), crate::PyError> {
+    unsafe {
+        // BaseRangeListStrategy.extend switches its receiver before even
+        // an empty donor is examined. Keep both operands rooted across
+        // that materialisation and the append loop it feeds.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let root_base = pyre_object::gc_roots::pin_roots(&[list, other]);
+        list = pyre_object::listobject::w_list_materialize_range(list);
+        other = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+        let n = w_list_len(other);
+        if w_list_len(list) == 0 && pyre_object::listobject::w_list_is_range_strategy(other) {
+            // EmptyListStrategy._extend_from_list delegates to the
+            // donor's copy_into; BaseRangeListStrategy shares its
+            // immutable erased tuple rather than appending boxed ints.
+            pyre_object::listobject::w_list_setslice_mode(
+                list,
+                0,
+                0,
+                other,
+                majit_metainterp::jit::we_are_jitted(),
+            )
+            .expect("range copy_into an empty exact list");
+            return Ok(());
+        }
+        pyre_object::listobject::w_list_reserve_for_extend(list, n);
+        for i in 0..n {
+            list = pyre_object::gc_roots::shadow_stack_get(root_base);
+            other = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+            if let Some(item) = w_list_getitem(other, i as i64) {
+                pyre_object::listobject::w_list_append_preallocated(list, item);
             }
-        } else {
-            // listobject.py `_extend_from_iterable` asks for a length
-            // hint before `_do_extend_from_iterable` obtains and consumes the
-            // iterator.  Hint failures other than TypeError/AttributeError are
-            // observable and propagate without appending a prefix.
-            // Append each yielded value before asking for the next one.  An
-            // exception from a later `next()` does not roll back the prefix.
-            let _roots = pyre_object::gc_roots::push_roots();
-            let root_base = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_roots(&[list, other]);
-            // CPython 3.14 `list_extend_iter_lock_held` obtains the iterator
-            // before asking the original iterable for its length hint.
-            let iterator =
-                crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(root_base + 1))?;
-            let _ = pyre_object::gc_roots::pin_root(iterator);
-            // listobject.py _extend_from_iterable — consult the length
-            // hint before iterating.  A `__length_hint__` returning a negative
-            // value raises ValueError, and one exceeding a C ssize_t raises
-            // OverflowError (via `int_w`), rather than being silently ignored.
-            let hint = crate::baseobjspace::length_hint(
-                pyre_object::gc_roots::shadow_stack_get(root_base + 1),
-                8,
-            )?;
-            // `length_hint` has already rejected negative and non-i64 values.
-            let hint = hint as usize;
-            let target = pyre_object::gc_roots::shadow_stack_get(root_base);
-            let source = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
-            let current_size = pyre_object::w_list_len(target);
-            // CPython ignores an overflowing `m + n` hint on the chance that
-            // the iterator lied, then grows from yielded items. Otherwise the
-            // pointer-array byte size must be representable before reserving.
-            if current_size <= (isize::MAX as usize).saturating_sub(hint) {
-                if current_size + hint > (isize::MAX as usize) / std::mem::size_of::<PyObjectRef>()
-                {
-                    return Err(crate::PyError::memory_error(""));
-                }
-                let exact_dict = pyre_object::is_dict(source)
-                    && (*source).w_class == pyre_object::get_instantiate(&*(*source).ob_type);
-                // CPython has sibling `list_extend_dict{,items}` branches for
-                // its three exact dict-view types; all use ordinary resize.
-                if exact_dict || pyre_object::dictmultiobject::is_dict_view(source) {
-                    pyre_object::listobject::w_list_resize_for_extend(target, hint);
-                } else if !pyre_object::listobject::w_list_try_reserve_for_extend(target, hint) {
-                    // `list_extend_iter_lock_held` reserves the hint with the
-                    // ordinary `list_resize`, so a hint no allocation can serve
-                    // is refused before the iterator is walked.
-                    return Err(crate::PyError::memory_error(""));
-                }
-            }
-            loop {
-                let item = match crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(
-                    root_base + 2,
-                )) {
-                    Ok(item) => item,
-                    Err(err) if err.matches_stop_iteration() => break,
-                    Err(err) => return Err(err),
-                };
-                let _item_roots = pyre_object::gc_roots::push_roots();
-                let item_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(item);
-                pyre_object::listobject::w_list_append_preallocated(
-                    pyre_object::gc_roots::shadow_stack_get(root_base),
-                    pyre_object::gc_roots::shadow_stack_get(item_slot),
-                );
-            }
-            pyre_object::listobject::w_list_finish_extend(pyre_object::gc_roots::shadow_stack_get(
-                root_base,
-            ));
         }
     }
-    Ok(w_none())
+    Ok(())
+}
+
+/// `listobject.py ListStrategy._extend_from_tuple`.
+///
+/// PRE-EXISTING-ADAPTATION: upstream is
+/// `@jit.look_inside_iff(loop_unrolling_heuristic(tup_w, len(tup_w),
+/// UNROLL_CUTOFF))`.  Here it is residual, because the body's
+/// `w_list_reserve_for_extend` and `w_list_append_preallocated` both take
+/// `w_list_lock`, an un-lowered helper, and the descent scan of
+/// `descr_init` reaches this body whatever the tuple's length and so refuses
+/// every `list(x)` descent.  Restoring `look_inside_iff` needs those two
+/// storage writes without the lock helper in the traced graph.
+#[majit_macros::dont_look_inside]
+fn extend_from_tuple(list: PyObjectRef, other: PyObjectRef) -> Result<(), crate::PyError> {
+    // An integer- or float-specialised tuple boxes each item as it is read,
+    // so `w_tuple_getitem` allocates and both operands can move under the
+    // loop.  Keep them on the shadow stack and re-read them per item.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[list, other]);
+    unsafe {
+        let n = w_tuple_len(pyre_object::gc_roots::shadow_stack_get(base + 1));
+        pyre_object::listobject::w_list_reserve_for_extend(
+            pyre_object::gc_roots::shadow_stack_get(base),
+            n,
+        );
+        for i in 0..n {
+            let other = pyre_object::gc_roots::shadow_stack_get(base + 1);
+            if let Some(item) = w_tuple_getitem(other, i as i64) {
+                pyre_object::listobject::w_list_append_preallocated(
+                    pyre_object::gc_roots::shadow_stack_get(base),
+                    item,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Snapshot a builtin set/frozenset into the list.  `ListStrategy.extend`
+/// has no `_extend_from_set`; sets fall through `_extend_from_iterable`,
+/// whose drain upstream never inlines either.  Residual for the same
+/// fnaddr reason as `_extend_from_list`.
+#[majit_macros::dont_look_inside]
+fn extend_from_set(list: PyObjectRef, other: PyObjectRef) -> Result<(), crate::PyError> {
+    // PyPy's listview optimization snapshots builtin set storage.
+    // In free-threaded pyre this is also the operation boundary that
+    // keeps list(set) from observing a concurrent size transition
+    // between iterator steps.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::publish_roots(&[list]);
+    let items = unsafe { pyre_object::w_set_items(other) };
+    let _ = pyre_object::gc_roots::publish_roots(&items);
+    pyre_object::gc_roots::normalize_roots(root_base, 1 + items.len());
+    unsafe {
+        pyre_object::listobject::w_list_resize_for_extend(
+            pyre_object::gc_roots::shadow_stack_get(root_base),
+            items.len(),
+        );
+        for index in 0..items.len() {
+            pyre_object::listobject::w_list_append_preallocated(
+                pyre_object::gc_roots::shadow_stack_get(root_base),
+                pyre_object::gc_roots::shadow_stack_get(root_base + 1 + index),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `list(FrameLocalsProxy)` — `keys()` then the same storage copy as
+/// `list(list)`.  `dont_look_inside` so the key materialization stays out
+/// of `descr_init`.
+#[majit_macros::dont_look_inside]
+fn extend_from_frame_locals_proxy(
+    list: PyObjectRef,
+    other: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    // `keys_list` materializes the key list, so both operands can move
+    // under it.  `extend_from_list` pins what it is handed, which is too
+    // late for an address this frame captured before the allocation.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[list, other]);
+    let Some(keys) = crate::pyframe::frame_locals_proxy::keys_list(
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+    ) else {
+        return extend_from_iterable(
+            pyre_object::gc_roots::shadow_stack_get(base),
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+        );
+    };
+    extend_from_list(pyre_object::gc_roots::shadow_stack_get(base), keys?)
+}
+
+/// `listobject.py ListStrategy._extend_from_iterable`.  Upstream drains
+/// through the `_do_extend_jitdriver` portal, so the caller's trace never
+/// inlines the drain; here the whole arm is one residual call with a real
+/// fnaddr.  `FrameLocalsProxy` does not take this arm.
+#[majit_macros::dont_look_inside]
+fn extend_from_iterable(list: PyObjectRef, other: PyObjectRef) -> Result<(), crate::PyError> {
+    // Hint failures other than TypeError/AttributeError are observable and
+    // propagate without appending a prefix.  Append each yielded value
+    // before asking for the next one.  An exception from a later `next()`
+    // does not roll back the prefix.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_roots(&[list, other]);
+    let iterator =
+        crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(root_base + 1))?;
+    let _ = pyre_object::gc_roots::pin_root(iterator);
+    // listobject.py _extend_from_iterable — consult the length hint
+    // before iterating.  A `__length_hint__` returning a negative value
+    // raises ValueError, and one exceeding a C ssize_t raises OverflowError
+    // (via `int_w`), rather than being silently ignored.
+    let hint = crate::baseobjspace::length_hint(
+        pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+        8,
+    )?;
+    // `length_hint` has already rejected negative and non-i64 values.
+    let hint = hint as usize;
+    let target = pyre_object::gc_roots::shadow_stack_get(root_base);
+    let source = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+    let current_size = unsafe { pyre_object::w_list_len(target) };
+    // An overflowing `m + n` hint is ignored on the chance that the iterator
+    // lied, then growth comes from yielded items. Otherwise the pointer-array
+    // byte size must be representable before reserving.
+    if current_size <= (isize::MAX as usize).saturating_sub(hint) {
+        if current_size + hint > (isize::MAX as usize) / std::mem::size_of::<PyObjectRef>() {
+            return Err(crate::PyError::memory_error(""));
+        }
+        let exact_dict = unsafe {
+            pyre_object::is_dict(source)
+                && (*source).w_class == pyre_object::get_instantiate(&*(*source).ob_type)
+        };
+        // Sibling `list_extend_dict{,items}` branches for the three exact
+        // dict-view types; all use ordinary resize.
+        if exact_dict || unsafe { pyre_object::dictmultiobject::is_dict_view(source) } {
+            unsafe { pyre_object::listobject::w_list_resize_for_extend(target, hint) };
+        } else if !unsafe { pyre_object::listobject::w_list_try_reserve_for_extend(target, hint) } {
+            // `list_extend_iter_lock_held` reserves the hint with the
+            // ordinary `list_resize`, so a hint no allocation can serve
+            // is refused before the iterator is walked.
+            return Err(crate::PyError::memory_error(""));
+        }
+    }
+    do_extend_from_iterable(
+        pyre_object::gc_roots::shadow_stack_get(root_base),
+        pyre_object::gc_roots::shadow_stack_get(root_base + 2),
+    )?;
+    unsafe {
+        pyre_object::listobject::w_list_finish_extend(pyre_object::gc_roots::shadow_stack_get(
+            root_base,
+        ));
+    }
+    Ok(())
+}
+
+/// `listobject.py _do_extend_from_iterable`.  Upstream drains through the
+/// `_do_extend_jitdriver` portal (`greens=['strategy_type', 'greenkey']`),
+/// which is not ported; here the drain runs inside the residual
+/// [`extend_from_iterable`].  A length hint is advisory, so it cannot bound
+/// an unrolled drain either.
+fn do_extend_from_iterable(
+    list: PyObjectRef,
+    w_iterator: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::pin_roots(&[list, w_iterator]);
+    loop {
+        let item =
+            match crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(root_base + 1))
+            {
+                Ok(item) => item,
+                Err(err) if err.matches_stop_iteration() => break,
+                Err(err) => return Err(err),
+            };
+        let _item_roots = pyre_object::gc_roots::push_roots();
+        let item_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(item);
+        unsafe {
+            pyre_object::listobject::w_list_append_preallocated(
+                pyre_object::gc_roots::shadow_stack_get(root_base),
+                pyre_object::gc_roots::shadow_stack_get(item_slot),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// PyPy: listobject.py descr_insert — list.insert(index, item)
@@ -835,48 +960,10 @@ pub fn list_method_reverse(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     Ok(w_none())
 }
 
-/// PyPy: listobject.py descr_sort — list.sort()
+/// PyPy: listobject.py descr_sort — list.sort().  The body is the
+/// `interp2app` leaf [`crate::typedef::__majit_wrap_list_descr_sort`].
 pub fn list_method_sort(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_list_receiver(args, "sort", true)?;
-    // Keep the argument decoding shared with `sorted()` before changing the
-    // receiver's visible storage.
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    // `sort($self, /, *, key=None, reverse=False)` — the receiver is the only
-    // positional slot, so everything after it has to arrive by keyword.
-    crate::builtins::clinic_arity(
-        "sort",
-        positional.len() - 1,
-        crate::builtins::real_kwarg_count(kwargs),
-        0,
-        0,
-        2,
-    )?;
-    crate::builtins::kwarg_reject_unknown(kwargs, &["key", "reverse"], "sort")?;
-    // `reverse=` runs a user `__bool__`, which reaches a safepoint and can move
-    // the receiver and the key callable.  `args` is a native copy the collector
-    // does not update (`call.rs` `call_builtin_code_positional`), so both have
-    // to be pinned before the call and reloaded after, as `tuple_method_index`
-    // does around `eq_w`.  `w_none` stands in when no key was given, keeping the
-    // two roots adjacent so one base covers both.
-    let key_obj = crate::builtins::kwarg_get(kwargs, "key").unwrap_or_else(w_none);
-    let reverse_obj = crate::builtins::kwarg_get(kwargs, "reverse");
-    let _roots = pyre_object::gc_roots::push_roots();
-    let list_slot = if let Some(reverse_obj) = reverse_obj {
-        pyre_object::gc_roots::pin_roots(&[args[0], key_obj, reverse_obj])
-    } else {
-        pyre_object::gc_roots::pin_roots(&[args[0], key_obj])
-    };
-
-    let reverse = if reverse_obj.is_some() {
-        crate::baseobjspace::is_true(pyre_object::gc_roots::shadow_stack_get(list_slot + 2))?
-    } else {
-        false
-    };
-
-    let key_arg = pyre_object::gc_roots::shadow_stack_get(list_slot + 1);
-    let key_fn = unsafe { !pyre_object::is_none(key_arg) }.then_some(key_arg);
-    crate::builtins::sort_list_in_place(list_slot, key_fn, reverse)?;
-    Ok(w_none())
+    crate::typedef::__majit_wrap_list_descr_sort(args)
 }
 
 /// listobject.py `descr_index` — list.index(value[, start[, stop]]).
@@ -6726,6 +6813,27 @@ pub(crate) fn set_contains_checked(
         )
     }
 }
+
+/// `dictmultiobject.py descr_get`.  The body is this leaf so
+/// `BuiltinCode.func`'s PBC family has a jitcode for `d.get`; a closure
+/// registered under another name has no member and the call stays
+/// `no jitcode for address`.
+pub fn __majit_wrap_dict_descr_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    dict_method_get(args)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_builtin_wrapper_target_dict_descr_get: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(
+            module_path!(),
+            "::",
+            stringify!(__majit_wrap_dict_descr_get)
+        ),
+        func: __majit_wrap_dict_descr_get,
+    };
 
 pub fn dict_method_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "get", 1)?;

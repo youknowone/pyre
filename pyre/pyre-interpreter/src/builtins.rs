@@ -3341,7 +3341,7 @@ pub fn install_default_builtins(ns: PyObjectRef) {
         crate::typedef::gettypeobject(&pyre_object::functional::REVERSED_TYPE)
     });
     crate::module_ns_get_or_insert_with(ns, "sorted", || {
-        make_module_builtin_function("sorted", builtin_sorted)
+        make_module_builtin_function("sorted", crate::app_functional::__majit_wrap_builtin_sorted)
     });
     crate::module_ns_get_or_insert_with(ns, "iter", || {
         make_module_builtin_function("iter", builtin_iter)
@@ -5541,17 +5541,43 @@ pub fn kwarg_reject_unknown(
             continue;
         }
         if !allowed.iter().any(|name| key.as_str() == Ok(*name)) {
-            let mut msg = format!("{fn_name}() got an unexpected keyword argument '{key}'");
-            if let Ok(wrong) = key.as_str() {
-                let candidates: Vec<String> = allowed.iter().map(|s| s.to_string()).collect();
-                if let Some(suggestion) = crate::error::best_suggestion(&candidates, wrong) {
-                    msg.push_str(&format!(". Did you mean '{suggestion}'?"));
-                }
-            }
-            return Err(crate::PyError::type_error(msg));
+            return Err(unexpected_keyword_error(fn_name, key, allowed));
         }
     }
     Ok(())
+}
+
+/// `NAME() got an unexpected keyword argument 'KEY'`, with the
+/// `Did you mean` suggestion drawn from `allowed`.
+fn unexpected_keyword_error(fn_name: &str, key: &Wtf8, allowed: &[&str]) -> crate::PyError {
+    let mut msg = format!("{fn_name}() got an unexpected keyword argument '{key}'");
+    if let Ok(wrong) = key.as_str() {
+        let candidates: Vec<String> = allowed.iter().map(|s| s.to_string()).collect();
+        if let Some(suggestion) = crate::error::best_suggestion(&candidates, wrong) {
+            msg.push_str(&format!(". Did you mean '{suggestion}'?"));
+        }
+    }
+    crate::PyError::type_error(msg)
+}
+
+/// `_PyArg_UnpackKeywords` for a method whose receiver is its only
+/// positional parameter and whose other parameters are all keyword-only
+/// (`list.sort($self, /, *, key=None, reverse=False)`): the total count
+/// first, then any positional, then the first keyword that names no
+/// parameter.  `npos` excludes the receiver.  `None` when the call binds.
+pub(crate) fn clinic_keyword_only_error(
+    fn_name: &str,
+    kwonly: &[&str],
+    npos: usize,
+    kw_names: &[Wtf8Buf],
+) -> Option<crate::PyError> {
+    if let Err(err) = clinic_arity(fn_name, npos, kw_names.len(), 0, 0, kwonly.len()) {
+        return Some(err);
+    }
+    kw_names
+        .iter()
+        .find(|key| !kwonly.iter().any(|name| key.as_str() == Ok(*name)))
+        .map(|key| unexpected_keyword_error(fn_name, key, kwonly))
 }
 
 /// Bind a positional-or-keyword parameter that follows a positional-only
@@ -19063,6 +19089,47 @@ pub(crate) fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     )))
 }
 
+/// Rewrite a user-function binding error for the published app-level
+/// `sorted`; any other callable gets `err` back unchanged.
+///
+/// `builtin_sorted` unpacks exactly one positional itself
+/// (`sorted expected 1 argument, got N`, before the iterable is touched)
+/// and forwards every keyword to `list.sort`, which parses them only after
+/// `list(iterable)` has consumed the iterable.  The app-level
+/// `sorted(iterable, /, *, key=None, reverse=False)` rejects exactly those
+/// calls, so the binding stays on the success path and only the error and
+/// the iteration before it are produced here.
+///
+/// `positional[0]` is read only when exactly one positional was passed; the
+/// binders raise every error such a call can hit before their first
+/// allocation, so the word is still current.
+#[cold]
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub(crate) fn applevel_binding_error(
+    func: PyObjectRef,
+    positional: &[PyObjectRef],
+    kw_names: &[Wtf8Buf],
+    err: crate::PyError,
+) -> crate::PyError {
+    if !crate::app_functional::is_published_sorted(func) {
+        return err;
+    }
+    if positional.len() != 1 {
+        return crate::PyError::type_error(format!(
+            "sorted expected 1 argument, got {}",
+            positional.len()
+        ));
+    }
+    if clinic_keyword_only_error("sort", &["key", "reverse"], 0, kw_names).is_none() {
+        return err;
+    }
+    if let Err(iter_err) = builtin_list_ctor(&[positional[0]]) {
+        return iter_err;
+    }
+    clinic_keyword_only_error("sort", &["key", "reverse"], 0, kw_names).unwrap_or(err)
+}
+
 /// `pypy/module/__builtin__/functional.py:328-340 builtin_sorted`
 /// parity:
 ///
@@ -19121,6 +19188,61 @@ pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 /// `listobject.py descr_sort` — the shared body of `list.sort` and
 /// `sorted`.  `list_slot` is a shadow-stack slot holding the list, because a
 /// key call or a comparison dunder can collect and move it.
+///
+/// Residual: `JitPolicy.look_inside_graph` refuses graphs that contain
+/// loops (`self.sort(reverse)` / `sorter.sort()` / TimSort).  The gateway
+/// unwrap in `typedef::__majit_wrap_list_descr_sort` is what a traced
+/// CALL_KW descends.
+///
+/// Strategy sorts that do not call Python: range, unboxed numbers, bytes,
+/// and ascii strings.  `false` means the list is object strategy (or
+/// otherwise unsorted) and [`sort_list_in_place_obj`] still has to run.
+///
+/// The return is `bool`, not `Result`.  A `dont_look_inside` `Result`
+/// helper's effect slot stays the most general one, and that call is
+/// may-force, which a transparent builtin walk cannot record.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn sort_list_without_key_native(list: PyObjectRef, reverse: bool) -> bool {
+    unsafe {
+        if pyre_object::listobject::w_list_sort_range(list, reverse) {
+            return true;
+        }
+        if pyre_object::listobject::w_list_sort_int_or_float(list, reverse) {
+            return true;
+        }
+        pyre_object::listobject::w_list_sort_strings(list, reverse)
+    }
+}
+
+/// `list` / `key` / `reverse` stay the runtime boxes; `is_true(reverse)`
+/// and the shadow-stack pin run here so the unwrap graph has no effect
+/// before this call.
+#[majit_macros::dont_look_inside]
+pub fn sort_list_in_place_obj(
+    list: PyObjectRef,
+    key: PyObjectRef,
+    reverse_obj: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let list_slot = pyre_object::gc_roots::pin_roots(&[list, key, reverse_obj]);
+    let reverse = {
+        let reverse_obj = pyre_object::gc_roots::shadow_stack_get(list_slot + 2);
+        if reverse_obj.is_null() {
+            false
+        } else {
+            crate::baseobjspace::is_true(reverse_obj)?
+        }
+    };
+    let key_arg = pyre_object::gc_roots::shadow_stack_get(list_slot + 1);
+    let key_fn = if key_arg.is_null() || unsafe { pyre_object::is_none(key_arg) } {
+        None
+    } else {
+        Some(key_arg)
+    };
+    sort_list_in_place(list_slot, key_fn, reverse)
+}
+
+#[majit_macros::dont_look_inside]
 pub fn sort_list_in_place(
     list_slot: usize,
     key_fn: Option<PyObjectRef>,

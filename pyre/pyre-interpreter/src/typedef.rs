@@ -4860,31 +4860,162 @@ fn subclass_to_tag(
     Ok(Some(cls))
 }
 
-/// `list.__new__(cls, *args)` allocates an empty list.  Population belongs to
-/// `list.__init__`, including for subclasses which inherit that initializer.
-fn list_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (params, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    let cls = params.first().copied().unwrap_or(pyre_object::PY_NULL);
-    builtinclass_new_args_check(
-        "list",
-        gettypeobject(&pyre_object::LIST_TYPE),
-        cls,
-        params.len().saturating_sub(2),
-        crate::builtins::has_real_kwargs(kwargs),
-    )?;
-    let value = pyre_object::w_list_new(Vec::new());
-    if let Some(sub) = subclass_to_tag(cls, &pyre_object::LIST_TYPE)? {
-        unsafe { store_subclass_tag(value, sub) };
-        // objspace.py `allocate_instance`: a builtin-layout subclass still
-        // participates in the user-finalizer queue when its Python type has
-        // `__del__`. Registration must follow `w_class` tagging so the hook
-        // sees the subclass rather than the canonical list type.
-        pyre_object::gc_hook::maybe_register_finalizer(value);
+/// `listobject.py W_ListObject.descr_new`, exposed through `interp2app`.
+/// The body lives in this `__majit_wrap_` leaf so `BuiltinCode.func`'s PBC
+/// family has a real fnaddr for the constructor — a trampoline onto a
+/// private `list_descr_new` compiled as a second graph whose fnaddr is
+/// symbolic, and the wrapper walk aborted at that call (`pc=0 symbolic=0`).
+///
+/// Shape matches `descr_new`: `builtinclass_new_args_check`, then
+/// `allocate_instance(W_ListObject, w_listtype)` (empty strategy is
+/// `clear`).  Slice `__len__` / `saturating_sub` / `Vec::new` in this
+/// graph were un-lowered helpers after the previous residual alloc.
+pub fn __majit_wrap_list_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // Type-call `list(x)` walks this with `[cls, iterable]` (length 2).
+    // `leading_non_null_count` / kwargs-marker dict walk stay off that
+    // graph (`w_dict_str_entries_wtf8` was the first un-lowered helper).
+    if args.len() > 2 || args.is_empty() {
+        return list_new_slow(args);
     }
-    Ok(value)
+    let cls = args[0];
+    let list_type = gettypeobject(&pyre_object::LIST_TYPE);
+    if std::ptr::eq(cls, list_type) {
+        return Ok(pyre_object::w_list_allocate_instance(list_type));
+    }
+    subclass_to_tag(cls, &pyre_object::LIST_TYPE)?;
+    Ok(pyre_object::w_list_allocate_instance(cls))
 }
 
-fn list_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+#[majit_macros::dont_look_inside]
+fn list_new_slow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let n = crate::builtins::leading_non_null_count(args);
+    let cls = if n >= 1 {
+        args[0]
+    } else {
+        pyre_object::PY_NULL
+    };
+    let list_type = gettypeobject(&pyre_object::LIST_TYPE);
+    let (extra, has_keywords) = list_descr_new_surplus(args, n);
+    builtinclass_new_args_check("list", list_type, cls, extra, has_keywords)?;
+    if n >= 1 && !std::ptr::eq(cls, list_type) {
+        subclass_to_tag(cls, &pyre_object::LIST_TYPE)?;
+        return Ok(pyre_object::w_list_allocate_instance(cls));
+    }
+    Ok(pyre_object::w_list_allocate_instance(list_type))
+}
+
+/// Extra positionals beyond `cls` plus optional iterable, and whether a
+/// real keyword dict trailed the call.  `leading_non_null_count` is the
+/// gateway count; `slice::len` / `saturating_sub` do not lower here.
+fn list_descr_new_surplus(args: &[PyObjectRef], n: i64) -> (usize, bool) {
+    if n < 1 {
+        return (0, false);
+    }
+    let last = args[(n - 1) as usize];
+    if (unsafe { pyre_object::is_dict(last) }) && crate::builtins::builtin_kwargs_marker_dict(last)
+    {
+        let without_marker = n - 1;
+        let extra = if without_marker > 2 {
+            (without_marker - 2) as usize
+        } else {
+            0
+        };
+        (extra, crate::builtins::has_real_kwargs(Some(last)))
+    } else {
+        let extra = if n > 2 { (n - 2) as usize } else { 0 };
+        (extra, false)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_builtin_wrapper_target_list_descr_new: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(
+            module_path!(),
+            "::",
+            stringify!(__majit_wrap_list_descr_new)
+        ),
+        func: __majit_wrap_list_descr_new,
+    };
+
+/// `listobject.py W_ListObject.descr_init`.  Same PBC-family reason as
+/// [`__majit_wrap_list_descr_new`]: the body is this leaf, not a trampoline
+/// onto a private graph with a symbolic fnaddr.
+///
+/// Shape matches `descr_init`: `clear`, then `extend`.  The gateway r0
+/// length is a known `arraylen_gc`; a `leading_non_null_count` / `map_or`
+/// closure / marker-dict walk in this graph was an un-lowered helper the
+/// descent scan treated as an effect, so `_extend_from_tuple` after it was
+/// refused.  A surplus positional takes [`list_init_slow`], and a dict
+/// argument, which may be the `__pyre_kw__` marker, takes
+/// [`list_init_dict_arg`].
+pub fn __majit_wrap_list_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // `list()` type-call walks this with `[self, iterable]` (length 2).
+    if args.len() > 2 {
+        return list_init_slow(args);
+    }
+    if args.is_empty() || args[0].is_null() {
+        return list_init_need_arg();
+    }
+    let list = args[0];
+    if !unsafe { pyre_object::is_list(list) } {
+        return list_init_bad_self(list);
+    }
+    if args.len() == 2 && unsafe { pyre_object::is_dict(args[1]) } {
+        list_init_dict_arg(list, args[1])?;
+        return Ok(pyre_object::w_none());
+    }
+    // descr_init always `self.clear(space)` before extend.  A fresh
+    // allocate_instance is already Empty, so the clear is skipped there.
+    if unsafe { pyre_object::w_list_len(list) } != 0 {
+        list_init_clear(list);
+    }
+    if args.len() > 1 {
+        crate::type_methods::list_extend_items(list, args[1])?;
+    }
+    Ok(pyre_object::w_none())
+}
+
+#[majit_macros::dont_look_inside]
+fn list_init_need_arg() -> Result<PyObjectRef, crate::PyError> {
+    Err(crate::PyError::type_error(
+        "descriptor '__init__' of 'list' object needs an argument",
+    ))
+}
+
+/// `W_ListObject.clear` inside `descr_init`.  `w_list_clear` takes
+/// `w_list_lock`, which the descent scan of `descr_init` cannot walk; as a
+/// thin-argument call target the clear is one residual call with a real
+/// fnaddr instead.
+#[majit_macros::dont_look_inside]
+fn list_init_clear(list: PyObjectRef) {
+    unsafe { pyre_object::w_list_clear(list) };
+}
+
+/// A non-list receiver, which is also where a lone `__pyre_kw__` marker lands
+/// when `list.__init__` got keywords and no receiver.
+#[majit_macros::dont_look_inside]
+fn list_init_bad_self(list: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    list_init_slow(&[list])
+}
+
+/// `descr_init` with a dict argument: a real dict to iterate, or the
+/// `__pyre_kw__` marker carrying keywords.  Thin arguments give the residual
+/// call a real fnaddr, so the descent scan of `descr_init` admits it; the
+/// marker-dict walk stays out of the length-2 type-call graph.
+#[majit_macros::dont_look_inside]
+fn list_init_dict_arg(list: PyObjectRef, w_arg: PyObjectRef) -> Result<(), crate::PyError> {
+    list_init_slow(&[list, w_arg])?;
+    Ok(())
+}
+
+/// `descr_init` for a call that may carry keywords or a surplus positional.
+/// Residual so `format!` and the marker-dict walk stay out of the length-2
+/// type-call graph.
+#[majit_macros::dont_look_inside]
+fn list_init_slow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (params, kwargs) = crate::builtins::split_builtin_kwargs(args);
     let list = crate::type_methods::require_list_receiver(params, "__init__", false)?;
     // CPython 3.14 clinic/listobject.c.h `list___init__`: keywords are
@@ -4922,11 +5053,57 @@ fn list_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     Ok(pyre_object::w_none())
 }
 
-/// `tuple.__new__(cls, *args)` — `tupleobject.py:descr__new__` allocates
-/// a `W_TupleObject` of `w_tupletype`.  `builtin_tuple` may return the
-/// argument tuple unchanged, so the subclass path rebuilds a fresh tuple
-/// before retagging to avoid aliasing the input.
-fn tuple_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_builtin_wrapper_target_list_descr_init: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(
+            module_path!(),
+            "::",
+            stringify!(__majit_wrap_list_descr_init)
+        ),
+        func: __majit_wrap_list_descr_init,
+    };
+
+/// `tupleobject.py W_AbstractTupleObject.descr_new`, exposed through
+/// `interp2app`.  The body is this `__majit_wrap_` leaf so the PBC family
+/// has a real fnaddr; a trampoline onto private `tuple_descr_new` aborted
+/// the wrapper walk at that symbolic call (`pc=3`).
+pub fn __majit_wrap_tuple_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // Type-call `tuple(x)` walks this with `[cls, iterable]` (length 2).
+    // `builtin_tuple`'s generic arm calls `__len__`, and that symbolic
+    // call sits after an effect on every red join, so the whole wrapper
+    // was declined.  Exact `tuple` and one positional stay here; keywords,
+    // a surplus positional, and a subclass `cls` are the residual.
+    if args.len() != 2 || args[0].is_null() {
+        return tuple_new_slow(args);
+    }
+    let cls = args[0];
+    let tuple_type = gettypeobject(&pyre_object::TUPLE_TYPE);
+    if !std::ptr::eq(cls, tuple_type) {
+        return tuple_new_slow(args);
+    }
+    let obj = args[1];
+    unsafe {
+        if pyre_object::is_exact_tuple(obj) {
+            return Ok(obj);
+        }
+        // Exact list copy does not call `__len__` or Python.  A
+        // `Result`-returning residual is may-force, and this wrapper is
+        // a transparent helper, so that call cannot be recorded.
+        if pyre_object::is_exact_list(obj) {
+            return Ok(tuple_from_exact_list(obj));
+        }
+    }
+    tuple_from_one(obj)
+}
+
+/// Keywords, the wrong arity, or a subclass `cls`.  Kept out of
+/// [`__majit_wrap_tuple_descr_new`]'s length-2 graph: `builtin_tuple`'s
+/// generic iterable calls `__len__`.
+#[majit_macros::dont_look_inside]
+fn tuple_new_slow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (params, kwargs) = crate::builtins::split_builtin_kwargs(args);
     let cls = params.first().copied().unwrap_or(pyre_object::PY_NULL);
     builtinclass_new_args_check(
@@ -4938,30 +5115,87 @@ fn tuple_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     )?;
     let value = crate::builtins::builtin_tuple(params.get(1..).unwrap_or(&[]))?;
     if let Some(sub) = subclass_to_tag(cls, &pyre_object::TUPLE_TYPE)? {
-        let n = unsafe { pyre_object::w_tuple_len(value) };
-        // `w_tuple_getitem` re-boxes an inline payload on a specialised
-        // tuple, so each element is pinned as it is produced and the tuple is
-        // reloaded before the next item is read.
-        let tuple_roots = pyre_object::gc_roots::push_roots();
-        let tuple_slot = tuple_roots.publish(&[value]);
-        tuple_roots.normalize(tuple_slot, 1);
-        let mut rooted = pyre_object::gc_roots::RootedItems::new();
-        for i in 0..n {
-            if let Some(item) =
-                unsafe { pyre_object::w_tuple_getitem(tuple_roots.get(tuple_slot), i as i64) }
-            {
-                rooted.push(item);
-            }
-        }
-        let items = rooted.take();
-        // The generated user-class layout selected by `typedef.py:174-227`,
-        // never an arity-2 specialised tuple.
-        let fresh = pyre_object::w_tuple_subclass_new_array_backed(items, sub);
-        pyre_object::gc_hook::maybe_register_finalizer(fresh);
-        return Ok(fresh);
+        // The copy loop lives in its own graph so `contains_loop` cannot
+        // decline this wrapper.  Exact `tuple(x)` never takes this arm.
+        return tuple_subclass_retarget(value, sub);
     }
     Ok(value)
 }
+
+/// `tuple(exact list)` storage copy.  `PyObjectRef`, not `Result`: the
+/// call has to be recordable inside the transparent `tuple.__new__` walk.
+#[majit_macros::dont_look_inside_cannot_raise]
+fn tuple_from_exact_list(obj: PyObjectRef) -> PyObjectRef {
+    // A range or unboxed list strategy boxes each element as it is read, so
+    // `w_list_getitem` allocates: the source list and every item already
+    // collected have to be on the shadow stack, not in a native `Vec`.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[obj]);
+    let n = unsafe { pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(base)) };
+    let mut slots = Vec::with_capacity(n);
+    for i in 0..n {
+        let obj = pyre_object::gc_roots::shadow_stack_get(base);
+        if let Some(item) = unsafe { pyre_object::w_list_getitem(obj, i as i64) } {
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(item);
+            slots.push(slot);
+        }
+    }
+    let items = slots
+        .into_iter()
+        .map(pyre_object::gc_roots::shadow_stack_get)
+        .collect();
+    unsafe { pyre_object::w_tuple_new(items) }
+}
+
+/// `tuple(x)` for an iterable that is not an exact tuple or list.
+/// `__len__` stays in this residual.
+#[majit_macros::dont_look_inside]
+fn tuple_from_one(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    crate::builtins::builtin_tuple(std::slice::from_ref(&obj))
+}
+
+fn tuple_subclass_retarget(
+    value: PyObjectRef,
+    sub: pyre_object::PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let n = unsafe { pyre_object::w_tuple_len(value) };
+    // `w_tuple_getitem` re-boxes an inline payload on a specialised
+    // tuple, so each element is pinned as it is produced and the tuple is
+    // reloaded before the next item is read.
+    let tuple_roots = pyre_object::gc_roots::push_roots();
+    let tuple_slot = tuple_roots.publish(&[value]);
+    tuple_roots.normalize(tuple_slot, 1);
+    let mut rooted = pyre_object::gc_roots::RootedItems::new();
+    for i in 0..n {
+        if let Some(item) =
+            unsafe { pyre_object::w_tuple_getitem(tuple_roots.get(tuple_slot), i as i64) }
+        {
+            rooted.push(item);
+        }
+    }
+    let items = rooted.take();
+    // The generated user-class layout selected by `typedef.py
+    // get_unique_interplevel_subclass` / `_getusercls`, never an arity-2
+    // specialised tuple.
+    let fresh = pyre_object::w_tuple_subclass_new_array_backed(items, sub);
+    pyre_object::gc_hook::maybe_register_finalizer(fresh);
+    Ok(fresh)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_builtin_wrapper_target_tuple_descr_new: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(
+            module_path!(),
+            "::",
+            stringify!(__majit_wrap_tuple_descr_new)
+        ),
+        func: __majit_wrap_tuple_descr_new,
+    };
+
 /// `enumerate.__new__(cls, iterable, start=0)` — `functional.py:253-275
 /// W_Enumerate.descr___new__`.  `builtin_enumerate` builds a fresh
 /// `W_Enumerate`; a subclass instance is the same object with `w_class`
@@ -6146,6 +6380,127 @@ static __majit_builtin_wrapper_target_list_descr_append: crate::gateway::Builtin
         func: __majit_wrap_list_descr_append,
     };
 
+/// `listobject.py W_ListObject.descr_len`.  A closure in `init_list_type`
+/// is not a PBC-family member, so `tuple(lst)` / `length_hint` saw
+/// `__len__` as a symbolic hash.
+pub fn __majit_wrap_list_descr_len(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::require_list_receiver(args, "__len__", false)?;
+    crate::type_methods::arity_slot(args, 0)?;
+    crate::baseobjspace::len_slot(args[0])
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_builtin_wrapper_target_list_descr_len: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(
+            module_path!(),
+            "::",
+            stringify!(__majit_wrap_list_descr_len)
+        ),
+        func: __majit_wrap_list_descr_len,
+    };
+
+/// `listobject.py W_ListObject.descr_extend` / `ListStrategy.extend`.
+/// `list.__init__` calls this after `clear`, so a traced `list(iterable)`
+/// only stays a residual when this dispatcher is missing from the PBC family.
+pub fn __majit_wrap_list_descr_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::list_method_extend(args)
+}
+
+/// `listobject.py W_ListObject.descr_sort`, exposed through `interp2app`.
+/// The body is this leaf, not a trampoline onto a private graph: a traced
+/// `lst.sort(key=..., reverse=...)` descends it through the gateway
+/// Signature `($self, /, *, key=None, reverse=False)`, which delivers
+/// `[self, key, reverse]` with `PY_NULL` holes, so the keyword values stay
+/// the traced boxes.  The loopy half (`self.sort(reverse)` / TimSort) is
+/// `sort_list_in_place_obj`, which `look_inside_graph` refuses and so stays
+/// residual; `is_true(reverse)` and the pinning run inside it, so this
+/// unwrap has no effect before that call.
+pub fn __majit_wrap_list_descr_sort(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.is_empty() || args[0].is_null() {
+        return list_sort_need_arg();
+    }
+    let list = args[0];
+    if !unsafe { pyre_object::is_list(list) } {
+        return list_sort_bad_self(list);
+    }
+    // Signature slots: index, do not walk a marker dict.  `args.len()` is
+    // `arraylen_gc` of the gateway r0 the descent scan already knows.
+    let key = if args.len() > 1 {
+        args[1]
+    } else {
+        pyre_object::PY_NULL
+    };
+    let reverse_obj = if args.len() > 2 {
+        args[2]
+    } else {
+        pyre_object::PY_NULL
+    };
+    // `sorted` passes `key=None, reverse=False`.  A bool reverse and an
+    // absent key stay on the strategy sort, which a traced `list.sort` can
+    // record.  Anything else (a key function, a non-bool reverse) is the
+    // general body.
+    let key_absent = key.is_null() || unsafe { pyre_object::is_none(key) };
+    let reverse = if reverse_obj.is_null() || unsafe { pyre_object::is_none(reverse_obj) } {
+        Some(false)
+    } else if unsafe { pyre_object::is_bool(reverse_obj) } {
+        Some(unsafe { pyre_object::w_bool_get_value(reverse_obj) })
+    } else {
+        None
+    };
+    if key_absent
+        && let Some(reverse) = reverse
+        && crate::builtins::sort_list_without_key_native(list, reverse)
+    {
+        return Ok(pyre_object::w_none());
+    }
+    crate::builtins::sort_list_in_place_obj(list, key, reverse_obj)?;
+    Ok(pyre_object::w_none())
+}
+
+#[majit_macros::dont_look_inside]
+fn list_sort_need_arg() -> Result<PyObjectRef, crate::PyError> {
+    Err(crate::PyError::type_error(
+        "descriptor 'sort' of 'list' object needs an argument",
+    ))
+}
+
+#[majit_macros::dont_look_inside]
+fn list_sort_bad_self(list: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let received = crate::baseobjspace::object_functionstr_type_name(list);
+    Err(crate::PyError::type_error(format!(
+        "descriptor 'sort' for 'list' objects doesn't apply to a '{received}' object"
+    )))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_builtin_wrapper_target_list_descr_sort: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(
+            module_path!(),
+            "::",
+            stringify!(__majit_wrap_list_descr_sort)
+        ),
+        func: __majit_wrap_list_descr_sort,
+    };
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_builtin_wrapper_target_list_descr_extend: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(
+            module_path!(),
+            "::",
+            stringify!(__majit_wrap_list_descr_extend)
+        ),
+        func: __majit_wrap_list_descr_extend,
+    };
+
 /// Name of `obj`'s type, for operand-type error messages.
 fn arg_type_name(obj: PyObjectRef) -> String {
     unsafe {
@@ -6195,7 +6550,7 @@ fn init_list_type(ns: PyObjectRef) {
             ns,
             "__new__",
             make_new_descr_with_doc(
-                list_descr_new,
+                __majit_wrap_list_descr_new,
                 "Create and return a new object.  See help(type) for accurate signature.",
             ),
         )
@@ -6206,7 +6561,7 @@ fn init_list_type(ns: PyObjectRef) {
             "__init__",
             crate::gateway::make_builtin_function_with_doc(
                 "__init__",
-                list_descr_init,
+                __majit_wrap_list_descr_init,
                 "Initialize self.  See help(type(self)) for accurate signature.",
             ),
         )
@@ -6272,7 +6627,7 @@ fn init_list_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "extend",
-            make_builtin_function_with_arity("extend", crate::type_methods::list_method_extend, 2),
+            make_builtin_function_with_arity("extend", __majit_wrap_list_descr_extend, 2),
         )
     };
     unsafe {
@@ -6318,7 +6673,18 @@ fn init_list_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "sort",
-            make_builtin_function("sort", crate::type_methods::list_method_sort),
+            crate::gateway::make_builtin_function_with_text_signature_and_sig(
+                "sort",
+                __majit_wrap_list_descr_sort,
+                "($self, /, *, key=None, reverse=False)",
+                Some(crate::gateway::Signature::new(
+                    vec!["self", "key", "reverse"],
+                    None,
+                    None,
+                    2,
+                    1,
+                )),
+            ),
         )
     };
     unsafe {
@@ -6397,15 +6763,7 @@ fn init_list_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__len__",
-            make_builtin_function_with_arity(
-                "__len__",
-                |args| {
-                    crate::type_methods::require_list_receiver(args, "__len__", false)?;
-                    crate::type_methods::arity_slot(args, 0)?;
-                    crate::baseobjspace::len_slot(args[0])
-                },
-                1,
-            ),
+            make_builtin_function_with_arity("__len__", __majit_wrap_list_descr_len, 1),
         )
     };
     unsafe {
@@ -7802,7 +8160,7 @@ fn init_dict_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "get",
-            make_builtin_function("get", crate::type_methods::dict_method_get),
+            make_builtin_function("get", crate::type_methods::__majit_wrap_dict_descr_get),
         )
     };
     unsafe {
@@ -10349,7 +10707,7 @@ fn init_tuple_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__new__",
-            make_new_descr(tuple_descr_new),
+            make_new_descr(__majit_wrap_tuple_descr_new),
         )
     };
     unsafe {

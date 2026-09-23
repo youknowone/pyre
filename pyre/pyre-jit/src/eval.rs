@@ -1627,10 +1627,11 @@ unsafe fn memoryview_object_destructor(obj_addr: usize) {
 /// so a type-directed trace of a header-tagged `PyFrame` sees the same
 /// root set the ad-hoc walker does.  A flat `gc_ptr_offsets` list cannot
 /// express two of those slots: the `locals_cells_stack_w` items when the
-/// array is a stationary `std::alloc` block (regime-a — the collector
-/// never enters `trace_and_update_object` on a non-nursery array so its
-/// varsize walker never runs), and the in-place scan of old-gen / Box
-/// `FrameDebugData` fields. Both require a custom trace.
+/// array is a stationary `std::alloc` block (the collector never enters
+/// `trace_and_update_object` on a raw array so its varsize walker never
+/// runs), and the in-place scan of a raw `malloc_raw` `FrameDebugData`
+/// payload (no GC header, never entered by `trace_and_update_object`).
+/// Both require a custom trace.
 ///
 /// Forwarded (mirrors `walk_pyframe_roots` in `pyre-interpreter::eval`):
 ///   - `f_backref` — the parent frame pointer, or the `JitVirtualRef` standing
@@ -1642,19 +1643,20 @@ unsafe fn memoryview_object_destructor(obj_addr: usize) {
 ///     are Box-immortal (`is_nursery_object_start` short-circuits).
 ///   - `vable_token` — null, the prebuilt tracing sentinel, or the active
 ///     JITFRAME GCREF (`rvirtualizable.py:29`).
-///   - `locals_cells_stack_w` — the array pointer.  A GC-managed nursery
-///     block forwards through its field slot and its type-9 walker owns the
-///     items. An old-gen GC block also visits the field slot and walks its
-///     items in place: barrier-less interpreter stores require that at minors,
-///     and it is harmless duplicate marking at majors. A stationary
-///     `std::alloc` block always forwards its items in place.
+///   - `locals_cells_stack_w` — the array pointer.  A GC-managed block
+///     forwards through its field slot and its type-9 walker owns the
+///     items in either generation; `set_ref` / `remember_frame_locals_array`
+///     arm the barrier. A stationary `std::alloc` block always forwards
+///     its items in place.
 ///   - `w_yielding_from`, `w_builtin`, `w_globals` — the ref-bearing statics.
 ///     `f_generator_nowref` is excluded: it is the raw counterpart of PyPy's
 ///     translated `f_generator_wref` (pyframe.py:75-76/276-279), hence a
 ///     non-owning back-reference rather than a GC edge.
 ///   - `debugdata` / `lastblock` — managed field slots are forwarded.
-///   - `debugdata->{w_locals, w_extra_locals, w_f_trace,
-///     hidden_operationerr}` — null-guarded.
+///   - `debugdata->{w_globals, w_locals, w_extra_locals, w_f_trace,
+///     hidden_operationerr}` — a GC-managed payload's own
+///     `FRAME_DEBUG_DATA_GC_TYPE_ID` offset walker owns these; a raw
+///     `malloc_raw` payload forwards them in place.
 ///
 /// Excluded (matches the walker): `execution_context` (persistent, not
 /// GC), the module-dict / method-cache / prebuilt-family global walks (those are not frame-owned; the
@@ -1731,21 +1733,37 @@ unsafe fn pyframe_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut ma
 
     if !frame.debugdata.is_null() {
         let debugdata = frame.debugdata;
-        let walk_fields = if pyre_object::gc_hook::try_gc_owns_object(debugdata as *mut u8) {
+        // debugdata: visit the field slot for every GC payload so both
+        // marking phases reach it. The payload is then scanned by its own
+        // FRAME_DEBUG_DATA_GC_TYPE_ID offset walker, in either generation,
+        // exactly as an ordinary object field is. RPython's precedent for
+        // scanning a block in place, jitframe.py `jitframe_trace`, covers
+        // the raw counterpart below, not a GC instance.
+        let managed = pyre_object::gc_hook::try_gc_owns_object(debugdata as *mut u8);
+        if managed {
             f(
                 &mut frame.debugdata as *mut *mut pyre_interpreter::pyframe::FrameDebugData
                     as *mut majit_ir::GcRef,
             );
-            !majit_gc::gc_is_nursery_object(debugdata as usize)
-        } else {
-            true
-        };
-        // A nursery payload is scanned by FRAME_DEBUG_DATA_GC_TYPE_ID's
-        // ordinary offset walker. Box payloads and old-gen payloads need this
-        // in-place walk because interpreter stores do not individually
-        // write-barrier w_f_trace and its sibling fields. The old-gen major
-        // walk is harmless duplicate marking, matching RPython's
-        // phase-agnostic jitframe.py `jitframe_trace` contract.
+        }
+        // A GC-managed payload forwards its own fields, whatever generation
+        // it is in: FRAME_DEBUG_DATA_GC_TYPE_ID declares every PyObjectRef
+        // offset, so `trace_and_update_object` walks them, and
+        // `remember_frame_debug_data` (both exits of `getorcreate_debug_data`,
+        // plus `clone_debugdata_ptr` / `set_w_globals`) puts an old payload
+        // holding a young value into the remembered set. That is the shape
+        // of `FrameDebugData` upstream, a plain RPython instance whose
+        // `setfield_gc` stores are write-barriered by `transform_generic_set`;
+        // `PyFrame` carries no trace hook at all. The drain re-arms
+        // TRACK_YOUNG_PTRS unconditionally, so the barrier stays armed for
+        // the next store.
+        //
+        // Walking a managed payload's fields from here as well would hand
+        // the collector slots it does not own — an extra area whose header
+        // the barrier, not this hook, is responsible for. Only a raw
+        // `malloc_raw` payload, which has no GC header and is never entered
+        // by `trace_and_update_object`, still needs the in-place walk.
+        let walk_fields = !managed;
         if walk_fields {
             let d = unsafe { &mut *frame.debugdata };
             f(&mut d.w_globals as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
@@ -2775,8 +2793,8 @@ fn build_gc() -> Box<MiniMarkGC> {
     // the frame-owned GC slots `walk_pyframe_roots` visits per frame.
     // A flat `gc_ptr_offsets` list cannot express two of them — the
     // `locals_cells_stack_w` items when the array is a stationary
-    // `std::alloc` block, and the `debugdata->{w_locals, w_f_trace}`
-    // refs one indirection away — so a custom trace is required.
+    // `std::alloc` block, and the fields of a raw `malloc_raw`
+    // `FrameDebugData` payload — so a custom trace is required.
     // `custom_trace` fully replaces offset tracing on both the minor
     // (`trace_and_update_object`) and major-mark (`mark_object`) paths
     // in `collector.rs`.
@@ -5997,6 +6015,7 @@ fn build_jit_driver_pair() -> JitDriverPair {
             crate::call_jit::bh_load_global_fn as *const () as usize as i64,
             crate::call_jit::bh_reraise_varargs_zero as *const () as usize as i64,
             crate::call_jit::bh_get_current_exception as *const () as usize as i64,
+            crate::call_jit::bh_current_exception_or_none as *const () as usize as i64,
             // These call_jit stubs already implement CallDescr.create_call_stub's
             // word ABI. Keep truth tests and exception-context reads in the
             // guest instead of reflecting through the host on every iteration.

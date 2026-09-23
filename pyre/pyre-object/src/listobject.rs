@@ -1793,6 +1793,34 @@ pub fn w_list_new_empty() -> PyObjectRef {
     w_list_new_object(Vec::new())
 }
 
+/// `objspace.py allocate_instance(W_ListObject, w_listtype)` then
+/// `W_ListObject.clear`.  The empty-strategy header is the cleared instance;
+/// a subtype stamps `w_class` and joins the user-finalizer queue the way
+/// `allocate_instance` does after `user_setup`.  Residualized so `Vec::new`
+/// and the atomic length cell stay inside the opaque call — `descr_new`
+/// records this as its last helper, matching a looked-into malloc.
+#[majit_macros::dont_look_inside]
+pub fn w_list_allocate_instance(w_listtype: PyObjectRef) -> PyObjectRef {
+    // The header allocation below can collect, and a user subtype is an
+    // ordinary movable object, so the class word has to survive it on the
+    // shadow stack and be re-read afterwards.
+    let _roots = crate::gc_roots::push_roots();
+    let type_slot = crate::gc_roots::pin_roots(&[w_listtype]);
+    let obj = w_list_new_with_strategy(Vec::new(), ListStrategy::Empty);
+    let w_listtype = crate::gc_roots::shadow_stack_get(type_slot);
+    if !w_listtype.is_null() {
+        let list_class = get_instantiate(&LIST_TYPE);
+        if w_listtype != list_class {
+            unsafe {
+                crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+                (*obj).w_class = w_listtype;
+            }
+            crate::gc_hook::maybe_register_finalizer(obj);
+        }
+    }
+    obj
+}
+
 /// `rpython.rlib.objectmodel.newlist_hint` for interpreter-level temporary
 /// lists of wrapped objects.
 ///

@@ -9118,7 +9118,17 @@ impl CraneliftBackend {
             flag_builder.set("probestack_strategy", "inline").unwrap();
         }
 
-        let isa_builder = cranelift_native::builder().expect("host ISA not supported");
+        #[allow(unused_mut)]
+        let mut isa_builder = cranelift_native::builder().expect("host ISA not supported");
+        // `cranelift_native` turns return-address signing on for every Apple
+        // aarch64 host, which brackets each compiled body with
+        // `pacibz`/`retabz`. A CALL_ASSEMBLER-bound trace pays that pair on
+        // every recursive entry; the assembler this backend is measured
+        // against emits a plain `ret`.
+        #[cfg(target_arch = "aarch64")]
+        if std::env::var_os("MAJIT_CL_SIGN_RETURN").is_none() {
+            isa_builder.set("sign_return_address", "false").unwrap();
+        }
         let isa = isa_builder
             .finish(settings::Flags::new(flag_builder))
             .unwrap();

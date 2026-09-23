@@ -138,9 +138,10 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     // The undeduplicated `keys` / `values` / `items` scan behind the same
     // proxy, and the count `__len__` answers without materializing anything.
     // Both are bounded by the very `locals_plus_names` array `fast2locals`
-    // walks; each pairs that green scan with an extras half that is bounded by
-    // a dict length instead, which is why the extras half lives in its own
-    // unhinted function (`pin_extra_locals_entries`) and stays a residual call.
+    // walks.  The `f_extra_locals` half is bounded by a dict length instead:
+    // `entry_count` reads that length, and the collectors below append that
+    // half through `dont_look_inside` helpers (`append_extra_locals`,
+    // `append_extra_locals_items`) that stay residual calls.
     //
     // `entry_count` is named for what it counts rather than `length` because
     // this table matches by leaf and `length` is already the leaf of
@@ -167,6 +168,26 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     (
         "entry_count",
         "fast2locals' scan of the same locals-plus array, counted only",
+    ),
+    // `collect_entries` (behind `keys` / `values`) and `items` collect the
+    // pairs `pin_entries` just pinned.  The loop is bounded by that count —
+    // the same green `locals_plus_names` walk `fast2locals` unrolls — so the
+    // hint is the same one.  Without it `contains_loop` declines the
+    // collect even though `pin_entries` is already hinted, and
+    // `sorted(fr.f_locals)` (via `framelocalsproxy_iter` → `keys`) is one
+    // residual per except-handler iteration.
+    //
+    // Evidence class is `frame_locals_proxy_snapshot`, not `*_nohidden`:
+    // `exception_vable_frame_virtual_local` reaches `keys` from the
+    // traced `drive` except handler.  The extras half is not in these
+    // loops: it is appended by the residual `append_extra_locals{,_items}`.
+    (
+        "collect_entries",
+        "fast2locals' scan collected as the proxy keys or values list",
+    ),
+    (
+        "items",
+        "fast2locals' scan collected as the proxy items list",
     ),
     // `pyopcode.py` `dispatch_bytecode` is `@jit.unroll_safe`; its
     // EXTENDED_ARG loop is split here into the interpreter decoder and the
