@@ -138,12 +138,10 @@ pub struct StructFieldRegistry {
 /// `struct_name → [(field_name, full_field_type_string)]`, with an O(1)
 /// key-set fingerprint. `insert` / `remove` / `entry` update the xor of
 /// the keys' hashes; a lookup compares that word and `len` and does not
-/// rescan the map. Reads deref to the inner map.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(
-    from = "HashMap<String, Vec<(String, String)>>",
-    into = "HashMap<String, Vec<(String, String)>>"
-)]
+/// rescan the map. Reads deref to the inner map. Serializes as the inner
+/// map; deserializing goes through `From` so the fingerprint is recomputed.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(from = "HashMap<String, Vec<(String, String)>>")]
 pub struct FieldRows {
     map: HashMap<String, Vec<(String, String)>>,
     /// Xor of [`field_key_fp`] over the current keys. `0` when empty.
@@ -172,6 +170,12 @@ impl From<HashMap<String, Vec<(String, String)>>> for FieldRows {
 impl From<FieldRows> for HashMap<String, Vec<(String, String)>> {
     fn from(rows: FieldRows) -> Self {
         rows.map
+    }
+}
+
+impl Serialize for FieldRows {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.map.serialize(serializer)
     }
 }
 
