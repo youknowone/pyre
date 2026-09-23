@@ -4028,12 +4028,9 @@ pub fn funccall_valuestack(
     dropvalues: usize,
     methodcall: bool,
 ) -> PyObjectRef {
-    // RPython's translated `Function.funccall_valuestack` keeps `frame` and
-    // its virtualizable array live from function entry.  The pending-stack
-    // exception drain below and all code/default metadata lookups therefore
-    // see forwarded stack operands before `_flat_pycall` copies them.
+    // `function.py` `Function.funccall_valuestack` takes the frame. The
+    // valuestack array stays inside `peekvalue` / `dropvalues`.
     let _caller_locals_root = FrameLocalsRoot::new(frame);
-    crate::pyframe::remember_frame_locals_array(frame.locals_cells_stack_w);
     // A compiled callee prologue can publish an overflow before control
     // returns to this dispatcher.  The fresh stack check belongs to the
     // Python frame entry (`PyFrame.execute_frame.insert_stack_check_here`),
@@ -4266,12 +4263,9 @@ fn _flat_pycall(
     for i in 0..nargs {
         new_frame.set_locals_w(i, frame.peekvalue(nargs - 1 - i));
     }
-    // `PyFrame.__init__` allocates `locals_cells_stack_w` as a fresh
-    // `[None] * size` nursery array.  Arguments just written into it are
-    // also young.  `remember_frame_locals_array` still runs: a full nursery
-    // can spill the array to old-gen, and until the callee sits on
-    // `f_backref` nothing else exposes these slots.
-    crate::pyframe::remember_frame_locals_array(new_frame.locals_cells_stack_w);
+    // `function.py` `_flat_pycall` copies through `peekvalue` into the
+    // callee frame. `set_locals_w` writes the slots; the array itself is
+    // not a call argument (`jtransform.py` `_check_no_vable_array`).
     frame.dropvalues(dropvalues);
     new_frame.fix_array_ptrs();
 
@@ -4289,14 +4283,9 @@ fn _flat_pycall(
         }
     } else {
         let _callee_locals_root = FrameLocalsRoot::new(&mut new_frame);
-        let eval_fn = crate::call::get_eval_fn();
-        match eval_fn(&mut new_frame, None) {
-            Ok(v) => v,
-            Err(e) => {
-                crate::call::set_call_error(e);
-                pyre_object::PY_NULL
-            }
-        }
+        // `function.py` `_flat_pycall` returns `new_frame.run(...)`.
+        // `call::eval_current_frame_raw` is that call (`dont_look_inside`).
+        crate::call::eval_current_frame_raw(&mut new_frame)
     }
 }
 
@@ -4367,9 +4356,7 @@ fn _flat_pycall_defaults(
         }
     }
 
-    // Same barrier as `_flat_pycall`: a full nursery can spill the callee's
-    // locals array to old-gen, and the arguments and defaults in it are young.
-    crate::pyframe::remember_frame_locals_array(new_frame.locals_cells_stack_w);
+    // Same copy as `_flat_pycall`: the callee array is not passed onward.
     frame.dropvalues(dropvalues);
     new_frame.fix_array_ptrs();
 
@@ -4384,14 +4371,8 @@ fn _flat_pycall_defaults(
         }
     } else {
         let _callee_locals_root = FrameLocalsRoot::new(&mut new_frame);
-        let eval_fn = crate::call::get_eval_fn();
-        match eval_fn(&mut new_frame, None) {
-            Ok(v) => v,
-            Err(e) => {
-                crate::call::set_call_error(e);
-                pyre_object::PY_NULL
-            }
-        }
+        // `function.py` `_flat_pycall_defaults` returns `new_frame.run(...)`.
+        crate::call::eval_current_frame_raw(&mut new_frame)
     }
 }
 
