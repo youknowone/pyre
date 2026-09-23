@@ -3033,7 +3033,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // aggregate stays the ordinary ADT ctor (census Skip).
         // `map(it, f).collect()` denotes a loop.  Rewrite it at the
         // construction site — where `f` is a concrete closure ADT —
-        // into `Vec::new` + `next` + `call_once` + `push` BEFORE the
+        // into `Vec::new` + `next` + `call_mut` + `push` BEFORE the
         // range divert and `next`-diamond run, so those passes see the
         // synthesized `next` the same way they see a source-level
         // for-loop.  Fail-safe: a site whose closure env is not a

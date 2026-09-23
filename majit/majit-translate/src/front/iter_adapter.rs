@@ -31,18 +31,18 @@
 //! lives on the **construction site**, not inside the polymorphic shim:
 //! the caller holds a concrete closure ADT, so this pass rewrites
 //! `map(it, f).collect()` into the loop it denotes and calls that
-//! closure's inherent `call_once`.  `FilterMap::next` / `Iter::position`
+//! closure's inherent `call_mut` on a reborrow of the env.  `FilterMap::next` / `Iter::position`
 //! still stay residual — they need an early-exit match on the predicate
 //! result, which is a different CFG.
 
 use crate::flowspace::model::{ConstValue, Variable};
 use crate::front::bool_then::{close_goto_mixed, reproduce_exit_args};
 use crate::front::iter_next::{originates_from_iter_op, walk_back_to_source};
-use crate::front::option_closure_select::emit_call_once;
+use crate::front::option_map_or::emit_narrow;
 use crate::front::result_exc::back_substitute;
 use crate::model::{
-    CallTarget, ExitCase, ExitSwitch, FieldDescriptor, FunctionGraph, Link, LinkArg, OpKind,
-    SpaceOperation, ValueType,
+    BlockId, CallTarget, ExitCase, ExitSwitch, FieldDescriptor, FunctionGraph, Link, LinkArg,
+    OpKind, SpaceOperation, ValueType,
 };
 
 /// Owner leaf of the pair that stands in for an `Enumerate` adapter.
@@ -316,6 +316,7 @@ pub(crate) fn pack_enumerate_payload(
     graph: &mut FunctionGraph,
     some_target: usize,
     item: &Variable,
+    item_ty: &ValueType,
     pair: &Variable,
     item_ty: &ValueType,
     name: &str,
@@ -673,6 +674,70 @@ fn vec_new_call(result: Variable) -> SpaceOperation {
     }
 }
 
+/// `FnMut::call_mut(&mut env, (payload,))`. The receiver is a `same_as`
+/// reborrow of the loop-carried env, so the iteration does not consume it.
+fn emit_call_mut(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    env: Variable,
+    arg: Option<(Variable, ValueType, Option<String>)>,
+    call_owner: &str,
+    result_ty: ValueType,
+    args_tuple_suffix: &str,
+) -> Variable {
+    let env_borrow = graph.alloc_value_var();
+    graph.block_mut(block).operations.push(SpaceOperation {
+        result: Some(env_borrow.clone()),
+        kind: OpKind::UnaryOp {
+            op: "same_as".to_string(),
+            operand: env,
+            result_ty: ValueType::Ref(None),
+        },
+    });
+    let tuple_owner = if arg.is_some() {
+        format!("Tuple{args_tuple_suffix}")
+    } else {
+        "Tuple".to_string()
+    };
+    let args_tuple = graph.alloc_value_var();
+    graph.block_mut(block).operations.push(SpaceOperation {
+        result: Some(args_tuple.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::synthetic_transparent_ctor(&tuple_owner),
+            args: Vec::new(),
+            result_ty: ValueType::Ref(Some(tuple_owner.clone())),
+        },
+    });
+    if let Some((value, value_ty, class_root)) = arg {
+        let value = emit_narrow(graph, block, value, &class_root);
+        graph.block_mut(block).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: args_tuple.clone(),
+                field: FieldDescriptor {
+                    name: "__pos_0".to_string(),
+                    owner_root: Some(tuple_owner.clone()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                },
+                value: LinkArg::Value(value),
+                ty: value_ty,
+            },
+        });
+    }
+    let call_result = graph.alloc_value_var();
+    graph.block_mut(block).operations.push(SpaceOperation {
+        result: Some(call_result.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::method("call_mut", Some(call_owner.to_string())),
+            args: crate::model::call_args(vec![env_borrow, args_tuple]),
+            result_ty,
+        },
+    });
+    call_result
+}
+
 fn vec_push_call(result: Variable, out: Variable, item: Variable) -> SpaceOperation {
     SpaceOperation {
         result: Some(result),
@@ -960,7 +1025,7 @@ fn rewire_one_map_collect_site(
             pure: true,
         },
     });
-    let call_result = emit_call_once(
+    let call_result = emit_call_mut(
         graph,
         body_bb,
         env_b.clone(),
@@ -1259,6 +1324,26 @@ mod tests {
         );
     }
 
+    /// The packed enumerate element is the base iterator's item kind.
+    /// A list of ints records `Int`; the tuple's `__pos_1` must not widen
+    /// that to `Ref`.
+    #[test]
+    fn enumerate_tuple_element_keeps_base_item_kind() {
+        let (mut g, opt, _enumer) = build_enumerate_diamond();
+        let rewritten = rewire_next_call_sites(&mut g, &[(opt, ValueType::Int)]);
+        assert_eq!(rewritten, 1, "the enumerate for-loop must fold");
+        let item_tys: Vec<ValueType> = g
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldWrite { field, ty, .. } if field.name == "__pos_1" => Some(ty.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(item_tys, vec![ValueType::Int]);
+    }
+
     /// An Enumerate whose inner iterator is not a list `iter` op stays
     /// residual — packing without the StopIteration diamond would drop
     /// exhaustion.
@@ -1515,10 +1600,10 @@ mod tests {
         assert_eq!(
             count_calls(
                 &g,
-                |t| matches!(t, CallTarget::Method { name, .. } if name == "call_once")
+                |t| matches!(t, CallTarget::Method { name, .. } if name == "call_mut")
             ),
             1,
-            "the Some arm calls the closure once"
+            "the Some arm calls the closure through call_mut"
         );
         assert_eq!(
             count_calls(
@@ -1884,6 +1969,66 @@ mod tests {
             count_calls(&g, is_map_collect_target),
             1,
             "Map::collect residual survives a foreign recast"
+        );
+    }
+
+    /// `(0..n).map(move |_| owned.len()).collect()` reuses one closure.
+    /// `FnOnce::call_once` moves the env; the header then reads that moved
+    /// value. `FnMut::call_mut` takes a reborrow (`same_as` of the
+    /// loop-carried env) and the back edge carries the original env.
+    #[test]
+    fn map_collect_calls_closure_through_call_mut_reborrow() {
+        let (mut g, collected) = build_map_collect_two_blocks();
+        let nexts = rewire_map_collect_sites(&mut g, &[collect_site(collected)]);
+        assert_eq!(nexts.len(), 1, "the map.collect chain must fold");
+        let (name, args) = g
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .find_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    args,
+                    ..
+                } if name == "call_once" || name == "call_mut" => {
+                    Some((name.clone(), args.clone()))
+                }
+                _ => None,
+            })
+            .expect("the loop body must call the closure");
+        assert_eq!(
+            name, "call_mut",
+            "the closure is FnMut, reused each iteration"
+        );
+        let receiver = args[0].clone().into_variable();
+        let env = g
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .find_map(|op| match (&op.kind, &op.result) {
+                (OpKind::UnaryOp { op, operand, .. }, Some(result))
+                    if op == "same_as" && result == &receiver =>
+                {
+                    Some(operand.clone())
+                }
+                _ => None,
+            })
+            .expect("call_mut receiver must be a reborrow of the loop env");
+        assert_ne!(receiver, env, "the reborrow is not the loop-carried env");
+        let threads_original = g.blocks.iter().any(|b| {
+            b.exits.iter().any(|link| {
+                link.args
+                    .iter()
+                    .any(|arg| matches!(arg, LinkArg::Value(v) if v == &env))
+                    && link
+                        .args
+                        .iter()
+                        .all(|arg| !matches!(arg, LinkArg::Value(v) if v == &receiver))
+            })
+        });
+        assert!(
+            threads_original,
+            "the loop header must carry the original env, not the reborrow"
         );
     }
 }
