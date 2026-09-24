@@ -2784,7 +2784,15 @@ pub unsafe fn ll_listslice(obj: PyObjectRef, start: usize, stop: usize) -> PyObj
     // copy have to see one state: a concurrent append or strategy transition
     // would otherwise replace the storage under a raw sub-slice.  The lock is
     // reentrant, so an arm that still boxes may take it again.
+    //
+    // A contended acquisition parks in `before_external_block`, which lets the
+    // collector move the receiver, so root it across the wait and read it back
+    // — the same bracket `w_list_clone_if_shared_strategy` uses.
+    let _roots = crate::gc_roots::push_roots();
+    let root_base = crate::gc_roots::shadow_stack_len();
+    let obj = crate::gc_roots::pin_root(obj);
     let _list_guard = w_list_lock(obj);
+    let obj = crate::gc_roots::shadow_stack_get(root_base);
     let length = w_list_len(obj);
     let start = start.min(length);
     let stop = if stop > length { length } else { stop };
@@ -2825,8 +2833,16 @@ fn ll_listslice_new_int_list(obj: PyObjectRef, start: usize, piece: &[i64]) -> P
     let mut items = items;
     items.reload_block(block_slot);
     let result = crate::gc_roots::shadow_stack_get(result_slot);
+    list_write_barrier(result);
+    let result = crate::gc_roots::shadow_stack_get(result_slot);
     let list = unsafe { &mut *(result as *mut W_ListObject) };
     list.int_items.install(items);
+    // `install` tears the outgoing block down through a safepoint, and
+    // `w_list_new_with_strategy` left `allocated` at the zero-length vector it
+    // was handed. `__sizeof__` reads this field, so name the slice's slots.
+    let result = crate::gc_roots::shadow_stack_get(result_slot);
+    let list = unsafe { &mut *(result as *mut W_ListObject) };
+    list.allocated = n as isize;
     crate::gc_roots::shadow_stack_get(result_slot)
 }
 
@@ -2853,8 +2869,15 @@ fn ll_listslice_new_float_list(obj: PyObjectRef, start: usize, piece: &[f64]) ->
     let mut items = items;
     items.reload_block(block_slot);
     let result = crate::gc_roots::shadow_stack_get(result_slot);
+    list_write_barrier(result);
+    let result = crate::gc_roots::shadow_stack_get(result_slot);
     let list = unsafe { &mut *(result as *mut W_ListObject) };
     list.float_items.install(items);
+    // Same as the Integer arm: the barrier precedes the block store and
+    // `allocated` names the slice's slots for `__sizeof__`.
+    let result = crate::gc_roots::shadow_stack_get(result_slot);
+    let list = unsafe { &mut *(result as *mut W_ListObject) };
+    list.allocated = n as isize;
     crate::gc_roots::shadow_stack_get(result_slot)
 }
 

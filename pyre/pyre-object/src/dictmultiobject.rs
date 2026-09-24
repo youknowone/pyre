@@ -2209,24 +2209,37 @@ pub unsafe fn w_dict_strategy_name(obj: PyObjectRef) -> &'static str {
     }
 }
 
-/// Whether probing `obj` compares stored keys without running Python.
+/// `getitem` for an exact `str` key, taken only where the probe cannot reach
+/// Python, and `default` when the key is absent.
 ///
-/// A lookup hashes the key and then compares it against whatever shares that
-/// hash.  Only `ObjectDictStrategy` holds keys of arbitrary type, so only
-/// there can that comparison reach an interpreter-level `__eq__` — the
-/// specialised strategies hold `str`, `bytes` or `int` keys whose comparison
-/// is a builtin, and `IdentityDictStrategy` does not compare keys at all.
+/// `UnicodeDictStrategy` stores `str` keys only, and its `getitem` sends an
+/// exact `str` straight to the probe, so every comparison it can make is
+/// builtin.  Every other strategy is refused: `ObjectDictStrategy` holds keys
+/// of any type and can reach a stored key's `__eq__`, and `MapDictStrategy`
+/// can materialise object storage before it looks anything up.
+///
+/// The strategy is read here rather than by the caller because the two have to
+/// be one operation.  A separate check is a time-of-check window — a
+/// concurrent store can devolve the dict in between, and an unchecked probe
+/// then reports a raising `__eq__` as a miss.  `None` says the dict was not on
+/// that strategy, and the caller owes the checked lookup.
 ///
 /// # Safety
-/// `obj` must point to a live `W_DictObject` or `W_ModuleDictObject`.
-pub unsafe fn w_dict_keys_compare_without_python(obj: PyObjectRef) -> bool {
+/// `obj` must point to a live dict and `key` to a live exact `str`.
+pub unsafe fn w_dict_lookup_str_keyed(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+    default: PyObjectRef,
+) -> Option<PyObjectRef> {
     if is_module_dict(obj) {
-        return !w_module_dict_is_object_strategy(obj);
+        return None;
     }
-    !matches!(
-        w_dict_get_strategy(obj).strategy_kind(),
-        StrategyKind::Object
-    )
+    lock_dict_refs!(_dict_guard, obj, key, default);
+    let strategy = w_dict_get_strategy(obj);
+    if strategy.strategy_kind() != StrategyKind::Unicode {
+        return None;
+    }
+    Some(strategy.getitem(obj, key).unwrap_or(default))
 }
 
 /// Key-set mutation state captured by dict iterators.

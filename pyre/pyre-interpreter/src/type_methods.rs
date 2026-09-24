@@ -6818,21 +6818,30 @@ pub(crate) fn set_contains_checked(
 /// registered under another name has no member and the call stays
 /// `no jitcode for address`.
 pub fn __majit_wrap_dict_descr_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // `d.get(key)` / `d.get(key, default)` of an exact dict and a plain
-    // key (str, or a tuple of strs).  `dict_method_get` hashes through
-    // user code and its graph reaches `w_dict_str_entries_wtf8`, which
-    // the descent scan refuses.  Those two residuals stay out of this
-    // graph; the slow arm is one real fnaddr.
-    if (args.len() == 2 || args.len() == 3)
-        && !args[0].is_null()
-        && dict_get_plain_applies(args[0], args[1])
-    {
-        let default = if args.len() == 3 {
+    // `d.get(key)` / `d.get(key, default)` of an exact dict and an exact
+    // `str` key.  `dict_method_get` hashes through user code and its graph
+    // reaches `w_dict_str_entries_wtf8`, which the descent scan refuses.
+    // Those two residuals stay out of this graph; the slow arm is one real
+    // fnaddr.
+    if (args.len() == 2 || args.len() == 3) && !args[0].is_null() {
+        // A three-word call can be `d.get(k, **kw)`: the third word is then
+        // the marker dict, not a default.
+        let tail = if args.len() == 3 {
             args[2]
         } else {
-            pyre_object::w_none()
+            pyre_object::PY_NULL
         };
-        return Ok(dict_get_plain(args[0], args[1], default));
+        if dict_get_plain_applies(args[0], args[1], tail) {
+            let default = if args.len() == 3 {
+                tail
+            } else {
+                pyre_object::w_none()
+            };
+            let found = dict_get_plain(args[0], args[1], default);
+            if !found.is_null() {
+                return Ok(found);
+            }
+        }
     }
     let dict = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     let key = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
@@ -6847,46 +6856,39 @@ pub fn __majit_wrap_dict_descr_get(args: &[PyObjectRef]) -> Result<PyObjectRef, 
     dict_get_slow(dict, key, default, args.len() as i64)
 }
 
-/// Exact `dict` and a key whose hash does not run Python: an exact `str`,
-/// or an exact `tuple` of exact `str`s.
+/// Exact `dict`, an exact `str` key, and a third word that is not the
+/// trailing keyword dict.
 ///
-/// The stored keys decide as much as the looked-up one.  A probe compares the
-/// key against everything sharing its hash, and `w_dict_lookup` reports a
-/// raising `__eq__` as a miss — which this path would answer with the
-/// default.  So the dict must also be on a strategy whose keys compare
-/// without running Python.
+/// Exactness is the requirement, not layout: `py_type_check` passes a `str`
+/// subclass, whose `__hash__` can raise, and the unchecked probe reports that
+/// raise as a miss.  `tail` is `PY_NULL` for a two-word call; anything else is
+/// the caller's third word, and a keyword marker there means the call is
+/// `d.get(k, **kw)`, which `dict_method_get` rejects.
+///
+/// The dict's strategy is deliberately not tested here.  Reading it in this
+/// call and probing in the next is a time-of-check window, so
+/// [`dict_get_plain`] decides it under the lock that probes.
 #[majit_macros::dont_look_inside_cannot_raise]
-fn dict_get_plain_applies(dict: PyObjectRef, key: PyObjectRef) -> bool {
+fn dict_get_plain_applies(dict: PyObjectRef, key: PyObjectRef, tail: PyObjectRef) -> bool {
     unsafe {
-        if !pyre_object::py_type_check(dict, &pyre_object::DICT_TYPE) {
-            return false;
-        }
-        if !pyre_object::dictmultiobject::w_dict_keys_compare_without_python(dict) {
-            return false;
-        }
-        if pyre_object::py_type_check(key, &pyre_object::STR_TYPE) {
-            return true;
-        }
-        if !pyre_object::py_type_check(key, &pyre_object::TUPLE_TYPE) {
-            return false;
-        }
-        let n = pyre_object::tupleobject::w_tuple_len(key);
-        for i in 0..n {
-            let Some(item) = pyre_object::tupleobject::w_tuple_getitem(key, i as i64) else {
-                return false;
-            };
-            if !pyre_object::py_type_check(item, &pyre_object::STR_TYPE) {
-                return false;
-            }
-        }
-        true
+        pyre_object::is_exact_type(dict, &pyre_object::DICT_TYPE)
+            && pyre_object::is_exact_type(key, &pyre_object::STR_TYPE)
+            && (tail.is_null() || !crate::builtins::builtin_kwargs_marker_tail(tail))
     }
 }
 
 /// Lookup for a key [`dict_get_plain_applies`] already accepted.
+///
+/// `PY_NULL` says the answer is not this path's to give and the caller owes
+/// the checked arm.  A stored value is never `PY_NULL`, so the only other
+/// reading is a miss whose `default` was itself `PY_NULL` — the padded shape
+/// of a two-argument call — and the checked arm answers that one identically.
 #[majit_macros::dont_look_inside_cannot_raise]
 fn dict_get_plain(dict: PyObjectRef, key: PyObjectRef, default: PyObjectRef) -> PyObjectRef {
-    unsafe { pyre_object::dictmultiobject::w_dict_lookup(dict, key).unwrap_or(default) }
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_lookup_str_keyed(dict, key, default)
+            .unwrap_or(pyre_object::PY_NULL)
+    }
 }
 
 /// Word ABI so the residual has a real fnaddr.  A `&[PyObjectRef]`
