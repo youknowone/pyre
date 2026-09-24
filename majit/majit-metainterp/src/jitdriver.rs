@@ -7274,6 +7274,9 @@ impl<S: JitState> JitDriver<S> {
                     env,
                     &raw_values,
                     target_pc,
+                    // Portal recovery already applied the guard's pending fields.
+                    // A `#[jit_interp]` machine has not (`compile.py handle_fail`).
+                    !S::SYNCHRONIZES_VIRTUALIZABLE_AFTER_GUARD_FAILURE,
                 )
             };
             if let Some(pc) = bridge_pc {
