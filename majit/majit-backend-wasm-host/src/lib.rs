@@ -27,6 +27,8 @@ pub struct TraceState {
     // indices; replace/free must reject a wide index before they rewrite
     // `slot` and `slot + 1`.
     wide_slots: BTreeSet<u32>,
+    /// Pair bases `free` cleared. `publish` reuses one before growing.
+    free_slots: Vec<u32>,
 }
 
 pub trait HostState {
@@ -112,6 +114,15 @@ pub fn publish<T: HostState>(
     trace: Func,
     wide: Option<Func>,
 ) -> Result<u32> {
+    if let Some(slot) = caller.data_mut().traces_mut().free_slots.pop() {
+        let table = table(caller)?;
+        table.set(&mut *caller, slot as u64, Ref::Func(Some(trace)))?;
+        if let Some(wide) = wide {
+            table.set(&mut *caller, slot as u64 + 1, Ref::Func(Some(wide)))?;
+            caller.data_mut().traces_mut().wide_slots.insert(slot);
+        }
+        return Ok(slot);
+    }
     let table = table(caller)?;
     let slot = u32::try_from(table.grow(&mut *caller, 2, Ref::Func(Some(trace)))?)?;
     if let Some(wide) = wide {
@@ -194,7 +205,9 @@ pub fn free<T: HostState>(caller: &mut Caller<'_, T>, slot: u32) -> Result<()> {
     let table = table(caller)?;
     table.set(&mut *caller, slot as u64, Ref::Func(None))?;
     table.set(&mut *caller, slot as u64 + 1, Ref::Func(None))?;
-    caller.data_mut().traces_mut().wide_slots.remove(&slot);
+    let traces = caller.data_mut().traces_mut();
+    traces.wide_slots.remove(&slot);
+    traces.free_slots.push(slot);
     Ok(())
 }
 

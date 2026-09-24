@@ -4045,6 +4045,9 @@ pub struct CaParams {
     /// A compiled bridge with more captures than its source also leaves
     /// this false: it writes those slots on the first crossing.
     pub home_gcmap_null_grown_labels: bool,
+    /// `LoopAsmResources` that owns maps published by this build. `0` leaks
+    /// the map (`allocate_gcmap`'s `Box::into_raw`) for a direct codegen test.
+    pub gcmap_sink: usize,
 }
 
 /// Per-CALL_ASSEMBLER target dispatch baked into the corresponding wasm arm.
@@ -5843,8 +5846,10 @@ fn build_function(
                 |_| true,
             );
         }
-        Box::leak(build_home_gcmap(frame, used_ordinary, used_labels)).as_ptr() as *const usize
-            as usize as i64
+        crate::release::park_gcmap_raw(
+            ca.gcmap_sink,
+            build_home_gcmap(frame, used_ordinary, used_labels),
+        ) as i64
     } else {
         ca.home_gcmap_ptr
     };

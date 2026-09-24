@@ -26,7 +26,9 @@ static JIT_COMPILE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 /// memory are process-global too, so this has the same owner as the handles it
 /// stores (and deliberately is not TLS).  `IndexMap` is used instead of an
 /// unordered side table so insertion/teardown diagnostics remain stable.
-static MODULE_CACHE: OnceLock<Mutex<indexmap::IndexMap<Box<[u8]>, u32>>> = OnceLock::new();
+/// Each entry counts the compilations holding its handle; `free` releases the
+/// table slot only when the last of them is freed.
+static MODULE_CACHE: OnceLock<Mutex<indexmap::IndexMap<Box<[u8]>, (u32, usize)>>> = OnceLock::new();
 
 #[cfg(all(feature = "web", feature = "host-import"))]
 compile_error!("features `web` and `host-import` are mutually exclusive; enable exactly one");
@@ -101,24 +103,39 @@ pub fn compile_module(wasm_bytes: &[u8]) -> u32 {
 /// this cache later without weakening that invariant.
 pub fn compile_module_cached(wasm_bytes: &[u8]) -> u32 {
     let cache = MODULE_CACHE.get_or_init(|| Mutex::new(indexmap::IndexMap::new()));
-    if let Some(&handle) = cache.lock().get(wasm_bytes) {
+    if let Some((handle, owners)) = cache.lock().get_mut(wasm_bytes) {
         JIT_COMPILE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
-        return handle;
+        *owners += 1;
+        return *handle;
     }
     let handle = compile_module(wasm_bytes);
     if handle != 0 {
         JIT_COMPILE_COUNT.fetch_add(1, Ordering::Relaxed);
-        cache.lock().insert(wasm_bytes.into(), handle);
+        cache.lock().insert(wasm_bytes.into(), (handle, 1));
     }
     handle
 }
 
-/// Replace the function stored in an existing trace slot.
+/// Replace the function stored in an existing trace slot, returning the slot
+/// the caller now owns.
 ///
-/// Replacements deliberately bypass `MODULE_CACHE`: a slot belongs to one
-/// token, while a byte-identical later trace must not inherit that token's
-/// table identity.
+/// Replacements bypass `MODULE_CACHE`: a byte-identical later trace must not
+/// inherit this token's table identity, so a replaced slot leaves the cache.
+/// A slot another compilation still holds through the cache is not rewritten
+/// under it; the caller gets a fresh slot instead and drops its share.
 pub fn replace_module(func_id: u32, wasm_bytes: &[u8]) -> u32 {
+    if let Some(cache) = MODULE_CACHE.get() {
+        let mut cache = cache.lock();
+        if let Some(index) = cache.values().position(|&(handle, _)| handle == func_id) {
+            let (_, owners) = cache.get_index_mut(index).expect("index from position").1;
+            if *owners > 1 {
+                *owners -= 1;
+                drop(cache);
+                return compile_module(wasm_bytes);
+            }
+            cache.shift_remove_index(index);
+        }
+    }
     let ptr = wasm_bytes.as_ptr() as u32;
     let len = wasm_bytes.len() as u32;
     #[cfg(feature = "web")]
@@ -179,12 +196,24 @@ pub fn jit_compile_cache_hits() -> u64 {
     JIT_COMPILE_CACHE_HITS.load(Ordering::Relaxed)
 }
 
-/// Free a compiled JIT function.
-#[expect(
-    dead_code,
-    reason = "host bindings expose free for embedder parity even though the backend does not call it yet"
-)]
+/// Free a compiled JIT function. `AbstractLLCPU.free_loop_and_bridges`
+/// frees the machine-code block; this is that call for a table slot.
 pub fn free(func_id: u32) {
+    if func_id == 0 {
+        return;
+    }
+    let cache = MODULE_CACHE.get_or_init(|| Mutex::new(indexmap::IndexMap::new()));
+    {
+        let mut cache = cache.lock();
+        if let Some(index) = cache.values().position(|&(handle, _)| handle == func_id) {
+            let (_, owners) = cache.get_index_mut(index).expect("index from position").1;
+            *owners -= 1;
+            if *owners > 0 {
+                return;
+            }
+            cache.shift_remove_index(index);
+        }
+    }
     #[cfg(feature = "web")]
     {
         imports::jit_free_wasm(func_id)

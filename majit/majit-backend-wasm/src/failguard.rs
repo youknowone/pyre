@@ -525,6 +525,7 @@ mod tests {
             requires_own_frame: false,
             is_last_label: true,
             frame: crate::codegen::FrameGeometry::fixed(),
+            owner_token: 0,
         }
     }
 
@@ -575,6 +576,8 @@ pub struct LabelTarget {
     /// a frame when its offsets agree exactly, not merely when its allocation
     /// is large enough.
     pub frame: crate::codegen::FrameGeometry,
+    /// `JitCellToken.number` that published this row.
+    pub owner_token: u64,
 }
 
 /// Frozen metadata for entering a compiled loop from a `CALL_ASSEMBLER` arm.
@@ -696,7 +699,7 @@ pub const FINISH_EXIT_INDEX_INT: u32 = 1;
 pub const FINISH_EXIT_INDEX_REF: u32 = 2;
 pub const FINISH_EXIT_INDEX_FLOAT: u32 = 3;
 pub const FINISH_EXIT_INDEX_EXC: u32 = 4;
-const FINISH_EXIT_INDEX_COUNT: u32 = 5;
+pub(crate) const FINISH_EXIT_INDEX_COUNT: u32 = 5;
 
 /// Reserved exit index for the `done_with_this_frame_descr_*` of `ty`.
 pub fn done_with_this_frame_exit_index(ty: Type) -> u32 {
@@ -1188,7 +1191,7 @@ pub fn remove_call_assembler_targets_for_compiled_ptr(compiled_ptr: u32) {
 /// `reserve_fail_descrs` and filled by `register_fail_descrs`. The two steps
 /// are separate so a compile can bake `base + local` into its guards before
 /// the descrs those guards name exist.
-enum FailDescrSlot {
+pub(crate) enum FailDescrSlot {
     Reserved,
     Registered(Arc<WasmFailDescr>),
 }
@@ -1281,7 +1284,7 @@ pub struct CpuTestGuard {
 /// retained memory. A compile that reserves its range and then fails leaves
 /// its slots `Reserved` for good, so the bound is the number of exits
 /// compilation was *attempted* for, not the number that reached a module.
-static FAIL_DESCR_REGISTRY: parking_lot::Mutex<Option<Vec<FailDescrSlot>>> =
+pub(crate) static FAIL_DESCR_REGISTRY: parking_lot::Mutex<Option<Vec<FailDescrSlot>>> =
     parking_lot::Mutex::new(None);
 
 /// Atomically reserve `count` global fail indices and return the first one.
@@ -1651,6 +1654,17 @@ impl CompiledWasmLoop {
             }
             self.register_descrs_once();
             self.func_handle.set(handle);
+            let mut blocks = self.compiled_loop_token.asmmemmgr_blocks.lock();
+            if let Some(resources) = blocks
+                .last_mut()
+                .and_then(|block| block.downcast_mut::<crate::release::LoopAsmResources>())
+            {
+                resources.table_slots.push(handle);
+            } else {
+                let mut resources = crate::release::LoopAsmResources::default();
+                resources.table_slots.push(handle);
+                blocks.push(Box::new(resources));
+            }
             drop(pending);
             self.pending_wasm_bytes.borrow_mut().take();
             Ok(handle)
@@ -1663,6 +1677,8 @@ impl Drop for CompiledWasmLoop {
         // Remove every token alias still targeting this module, including a
         // redirect source. A source redirected to a newer module survives an
         // old-loop drop because its dispatch `compiled_ptr` no longer matches.
+        // Label rows and table slots are owned by `LoopAsmResources` in
+        // `asmmemmgr_blocks`, dropped by `free_loop_and_bridges`.
         remove_call_assembler_targets_for_compiled_ptr(self as *const Self as usize as u32);
         // Retract this loop's published label targets so a later bridge
         // cannot chain into a dropped loop's stale table slot. Guarded by

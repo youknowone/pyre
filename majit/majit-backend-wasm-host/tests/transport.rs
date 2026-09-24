@@ -59,6 +59,25 @@ fn trace_pairs_publish_replace_and_free() {
 }
 
 #[test]
+fn publish_reuses_a_freed_pair_before_growing() {
+    with_caller(|caller| {
+        let module = Module::new(
+            caller.engine(),
+            r#"(module
+            (func (export "trace") (param i32) (result i32) i32.const 7))"#,
+        )
+        .unwrap();
+        let (trace, wide, _) = instantiate(caller, &module, |_, _, _| Ok(())).unwrap();
+        let first = publish(caller, trace, wide).unwrap();
+        free(caller, first).unwrap();
+        let (trace, wide, _) = instantiate(caller, &module, |_, _, _| Ok(())).unwrap();
+        let second = publish(caller, trace, wide).unwrap();
+        assert_eq!(second, first);
+        assert_eq!(table(caller).unwrap().size(&*caller), 4);
+    });
+}
+
+#[test]
 fn replace_and_free_reject_a_wide_slot_without_touching_the_next_pair() {
     with_caller(|caller| {
         let module = Module::new(

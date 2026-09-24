@@ -16,8 +16,10 @@
 pub mod codegen;
 pub mod failguard;
 mod func_sig;
+mod release;
 
 pub use func_sig::{FuncSigVal, WasmSig, decode_func_sig, encode_func_sig};
+
 
 /// The wasm host compiles and resumes on the thread that ran the
 /// compiled frame (`eval.rs` post-`run_compiled`). cargo's default
@@ -871,6 +873,7 @@ fn stamp_and_publish_label_targets(
     inputargs: &[InputArgRc],
     ops: &[Op],
     bridge_entry_arity: Option<usize>,
+    owner_token: u64,
 ) -> (Vec<usize>, Vec<usize>) {
     // Stamp each LABEL's loop-target descr with its ordinal (0, 1, 2, …) so a
     // loop-closing bridge can recover which label its terminal JUMP targets:
@@ -963,6 +966,7 @@ fn stamp_and_publish_label_targets(
                         requires_own_frame: label_resume_info[j].1,
                         is_last_label: j == header,
                         frame,
+                        owner_token,
                     },
                 );
                 published_descrs.push(id);
@@ -1007,6 +1011,7 @@ fn stamp_and_publish_label_targets(
                     // advancing segment — the livelock check applies.
                     is_last_label: true,
                     frame,
+                    owner_token,
                 },
             );
             published_descrs.push(id);
@@ -2656,12 +2661,12 @@ fn wasm_jitframe_tid() -> u32 {
 /// word stays unmarked). Returns `[data_word_count, word0, ...]` in `usize`
 /// words (GCMAP array layout: `gcmap[0]` = number of data words).
 fn leak_home_gcmap(
+    own: &mut release::LoopAsmResources,
     frame: codegen::FrameGeometry,
     used_ordinary: usize,
     used_labels: usize,
 ) -> usize {
-    Box::leak(codegen::build_home_gcmap(frame, used_ordinary, used_labels)).as_ptr() as *const usize
-        as usize
+    own.park_gcmap(codegen::build_home_gcmap(frame, used_ordinary, used_labels))
 }
 
 /// Bitwise union of two GCMAP arrays (`[n, word0, ...]`).
@@ -2714,13 +2719,17 @@ pub extern "C" fn wasm_jit_union_gcmap(old: i64, new: i64) -> i64 {
         for i in 0..n_new {
             buf[1 + i] |= *new_ptr.add(1 + i);
         }
-        Box::leak(buf.into_boxed_slice()).as_ptr() as usize as i64
+        // Runtime union. The two inputs are compile-time maps owned by the
+        // loop's asm blocks. This result is stored into `jf_gcmap` while the
+        // trace is running; `allocate_gcmap` likewise hands the caller a
+        // leaked pointer with no second owner.
+        Box::into_raw(buf.into_boxed_slice()) as *mut usize as i64
     }
 }
 
 /// Allocate the immutable guard-token gcmap which PyPy's
 /// `store_force_descr` retains as `_finish_gcmap`.
-fn leak_gcmap_for_indices(indices: &[u32]) -> usize {
+fn leak_gcmap_for_indices(own: &mut release::LoopAsmResources, indices: &[u32]) -> usize {
     let bits_per_word = usize::BITS as usize;
     let num_words = indices
         .iter()
@@ -2733,7 +2742,7 @@ fn leak_gcmap_for_indices(indices: &[u32]) -> usize {
         let index = index as usize;
         gcmap[1 + index / bits_per_word] |= 1usize << (index % bits_per_word);
     }
-    Box::leak(gcmap.into_boxed_slice()).as_ptr() as usize
+    own.park_gcmap(gcmap.into_boxed_slice())
 }
 
 /// `__indirect_function_table` slot of `call_jit::wasm_ca_resume_deopt`,
@@ -4094,6 +4103,8 @@ impl WasmBackend {
         // every table pinned on this token so owner/region force-arm
         // ConstPtrs rematerialize after collection.
         Self::rebind_failarg_const_tables(token);
+        let mut asm_resources = release::LoopAsmResources::default();
+        inputs.ca.gcmap_sink = &mut asm_resources as *mut _ as usize;
         let (wasm_bytes, guard_exits, merged_ref_homes, merged_labels) =
             codegen::build_wasm_module(&inputs)?;
         let code_size = wasm_bytes.len();
@@ -4119,7 +4130,10 @@ impl WasmBackend {
                     fail_locs: g.fail_locs.clone(),
                     is_finish: g.is_finish,
                     force_args_offset: inputs.frame.force_slot_base as u32,
-                    force_gcmap_ptr: leak_gcmap_for_indices(&g.force_ref_home_indices),
+                    force_gcmap_ptr: leak_gcmap_for_indices(
+                        &mut asm_resources,
+                        &g.force_ref_home_indices,
+                    ),
                     meta_descr: g.meta_descr.clone(),
                 })
             })
@@ -4152,12 +4166,19 @@ impl WasmBackend {
                     .set(compiled.bridge_cells_base.get());
             }
             new_handle
-        } else if glue::replace_module(old_handle, &wasm_bytes) != old_handle {
-            return Err(BackendError::Unsupported(
-                "wasm host rejected the re-emitted trace module".into(),
-            ));
         } else {
-            old_handle
+            // A slot shared through the module cache comes back as a fresh
+            // one, installed like the grown-labels arm above.
+            let handle = glue::replace_module(old_handle, &wasm_bytes);
+            if handle == 0 {
+                return Err(BackendError::Unsupported(
+                    "wasm host rejected the re-emitted trace module".into(),
+                ));
+            }
+            if handle != old_handle {
+                compiled.func_handle.set(handle);
+            }
+            handle
         };
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -4175,6 +4196,11 @@ impl WasmBackend {
         // in the same lifetime ledger as an ordinary compiled module.
         let block = self.asm_memory_stats.record_block(code_size, code_size);
         self.asm_memory_blocks.push(block);
+        if install_handle != 0 && install_handle != old_handle {
+            asm_resources.table_slots.push(install_handle);
+        }
+        asm_resources.fail_indices = descrs.iter().map(|descr| descr.fail_index).collect();
+        asm_resources.label_owner = token.number;
         // Keep still-standalone bridge descriptors after the rebuilt merged
         // prefix. Adding regions grows that prefix, so every old positional
         // range moves by exactly the difference in guard-cell counts.
@@ -4232,16 +4258,19 @@ impl WasmBackend {
             }
         }
         if let Some(owner) = new_cells_owner {
-            compiled._bridge_owned_cells.borrow_mut().push(owner);
+            asm_resources.bridge_cells.push(owner);
         }
         compiled.bridge_cells_base.set(new_cells_base);
         compiled.module_bytes.set(code_size as u32);
         compiled.num_guard_cells.set(guard_exits.len());
         compiled.num_ref_homes.set(widened);
         compiled.used_label_homes.set(widened_labels);
-        compiled
-            .home_gcmap_ptr
-            .set(leak_home_gcmap(compiled.frame, widened, widened_labels));
+        compiled.home_gcmap_ptr.set(leak_home_gcmap(
+            &mut asm_resources,
+            compiled.frame,
+            widened,
+            widened_labels,
+        ));
         {
             let mut metas = compiled.chained_trace_meta.borrow_mut();
             let mut offset = own_guard_count;
@@ -4320,13 +4349,16 @@ impl WasmBackend {
 
         // LABEL targets bake only the stable table slot, so restamp them for
         // this build. CA dispatch additionally carries the new finish index.
-        let _ = stamp_and_publish_label_targets(
+        let (_, published_labels) = stamp_and_publish_label_targets(
             install_handle,
             compiled.frame,
             &inputs.inputargs,
             &inputs.ops,
             inputs.bridge_entry_arity,
+            token.number,
         );
+        asm_resources.label_ids = published_labels;
+        release::push_resources(token, asm_resources);
         if let Some(mut target) = call_assembler_target(token.number) {
             target.func_handle = install_handle;
             target.compiled_ptr = compiled as *const CompiledWasmLoop as usize as u64;
@@ -5238,7 +5270,7 @@ impl majit_backend::Backend for WasmBackend {
         // module leaks the map from its own RefHomes / LABEL captures after
         // those stores, matching a safepoint write.
         let used_label_homes = codegen::label_ref_capture_slots(inputargs, ops);
-        let module_inputs = codegen::ModuleBuildInputs {
+        let mut module_inputs = codegen::ModuleBuildInputs {
             inputargs: inputargs.iter().cloned().collect(),
             // Keep these rewritten operations exactly as rewrite_ops_for_gc
             // produced them; their LoadFromGcTable immediates share this base.
@@ -5288,6 +5320,8 @@ impl majit_backend::Backend for WasmBackend {
                 },
             ),
         };
+        let mut asm_resources = release::LoopAsmResources::default();
+        module_inputs.ca.gcmap_sink = &mut asm_resources as *mut _ as usize;
         let (wasm_bytes, guard_exits, num_ref_homes, _used_labels) =
             match codegen::build_wasm_module(&module_inputs) {
                 Ok(built) => built,
@@ -5298,7 +5332,8 @@ impl majit_backend::Backend for WasmBackend {
                     return Err(err);
                 }
             };
-        let home_gcmap_ptr = leak_home_gcmap(frame, num_ref_homes, used_label_homes);
+        let home_gcmap_ptr =
+            leak_home_gcmap(&mut asm_resources, frame, num_ref_homes, used_label_homes);
 
         // Build fail descriptors
         let fail_descrs: Vec<Arc<WasmFailDescr>> = guard_exits
@@ -5311,7 +5346,10 @@ impl majit_backend::Backend for WasmBackend {
                     fail_locs: g.fail_locs.clone(),
                     is_finish: g.is_finish,
                     force_args_offset: frame.force_slot_base as u32,
-                    force_gcmap_ptr: leak_gcmap_for_indices(&g.force_ref_home_indices),
+                    force_gcmap_ptr: leak_gcmap_for_indices(
+                        &mut asm_resources,
+                        &g.force_ref_home_indices,
+                    ),
                     meta_descr: g.meta_descr.clone(),
                 })
             })
@@ -5403,8 +5441,20 @@ impl majit_backend::Backend for WasmBackend {
         // the last LABEL. Computed through the same predicate codegen's wrapper
         // gates on, so the recorded field and the emitted wrapper cannot drift.
         let has_preamble = codegen::is_resumable_peeled(ops);
-        let (label_descrs, _) =
-            stamp_and_publish_label_targets(func_handle, frame, inputargs, ops, None);
+        let (label_descrs, published_labels) =
+            stamp_and_publish_label_targets(func_handle, frame, inputargs, ops, None, token.number);
+        if func_handle != 0 {
+            asm_resources.table_slots.push(func_handle);
+        }
+        asm_resources.label_ids = published_labels;
+        asm_resources.label_handle = func_handle;
+        asm_resources.label_owner = token.number;
+        asm_resources.fail_indices = fail_descrs.iter().map(|descr| descr.fail_index).collect();
+        if let Some(cells) = bridge_cells_owner {
+            asm_resources.bridge_cells.push(cells);
+        }
+        module_inputs.ca.gcmap_sink = 0;
+        release::push_resources(token, asm_resources);
         // Per-guard, per-fail-arg induction-advance flags for
         // `compile_bridge`'s livelock check (see `guard_fail_args_advanced`).
         let guard_fail_arg_advanced = guard_fail_args_advanced(ops, &guard_exits);
@@ -5447,7 +5497,7 @@ impl majit_backend::Backend for WasmBackend {
             bridge_param_dispatch,
             bridge_descr_ranges: std::cell::RefCell::new(Vec::new()),
             chained_trace_meta: std::cell::RefCell::new(std::collections::HashMap::new()),
-            _bridge_owned_cells: std::cell::RefCell::new(bridge_cells_owner.into_iter().collect()),
+            _bridge_owned_cells: std::cell::RefCell::new(Vec::new()),
             bridge_slots: std::cell::RefCell::new(HashMap::new()),
             chained_bridge_slots: std::cell::RefCell::new(HashMap::new()),
             // Retaining the snapshot costs long-lived heap for the token's
@@ -6316,7 +6366,7 @@ impl majit_backend::Backend for WasmBackend {
         let bridge_flag = original_token.mint_bridge_invalidation_flag();
         let (bridge_cells_base, bridge_cells_owner) = codegen::alloc_bridge_cells(guard_exit_count);
         let bridge_param_dispatch = bridge_param_dispatch_for(guard_exit_count);
-        let module_inputs = codegen::ModuleBuildInputs {
+        let mut module_inputs = codegen::ModuleBuildInputs {
             inputargs: inputargs.iter().cloned().collect(),
             ops: ops_owned.clone(),
             inlined_bridges: Vec::new(),
@@ -6341,6 +6391,8 @@ impl majit_backend::Backend for WasmBackend {
             frame: source_frame,
             ca: ca_params,
         };
+        let mut asm_resources = release::LoopAsmResources::default();
+        module_inputs.ca.gcmap_sink = &mut asm_resources as *mut _ as usize;
         let (wasm_bytes, guard_exits, _num_ref_homes, _used_labels) =
             match codegen::build_wasm_module(&module_inputs) {
                 Ok(built) => built,
@@ -6361,7 +6413,10 @@ impl majit_backend::Backend for WasmBackend {
                     fail_locs: g.fail_locs.clone(),
                     is_finish: g.is_finish,
                     force_args_offset: source_frame.force_slot_base as u32,
-                    force_gcmap_ptr: leak_gcmap_for_indices(&g.force_ref_home_indices),
+                    force_gcmap_ptr: leak_gcmap_for_indices(
+                        &mut asm_resources,
+                        &g.force_ref_home_indices,
+                    ),
                     meta_descr: g.meta_descr.clone(),
                 })
             })
@@ -6423,7 +6478,19 @@ impl majit_backend::Backend for WasmBackend {
             inputargs,
             ops,
             bridge_entry_arity,
+            original_token.number,
         );
+        if bridge_slot != 0 {
+            asm_resources.table_slots.push(bridge_slot);
+        }
+        asm_resources.label_ids = published_label_descrs.clone();
+        asm_resources.label_handle = bridge_slot;
+        asm_resources.label_owner = original_token.number;
+        asm_resources.fail_indices = bridge_descrs.iter().map(|descr| descr.fail_index).collect();
+        if let Some(cells) = bridge_cells_owner {
+            asm_resources.bridge_cells.push(cells);
+        }
+        release::push_resources(original_token, asm_resources);
 
         {
             let source_loop = original_token
@@ -6476,9 +6543,6 @@ impl majit_backend::Backend for WasmBackend {
             );
             // The bridge module lives as long as this source loop, so hand its
             // own cell array (if any) to the loop, freed when the loop drops.
-            if let Some(owner) = bridge_cells_owner {
-                source_loop._bridge_owned_cells.borrow_mut().push(owner);
-            }
             source_loop.bridge_owned_label_targets.borrow_mut().extend(
                 published_label_descrs
                     .into_iter()
@@ -7011,6 +7075,15 @@ impl majit_backend::Backend for WasmBackend {
         crate::jit_exc_clear();
     }
 
+    fn free_loop(&mut self, token: &JitCellToken) {
+        // `llmodel.py` `AbstractLLCPU.free_loop_and_bridges`. Dropping
+        // `asmmemmgr_blocks` releases this loop's wasm resources. The
+        // metainterp reaches the same clear from `JitCellToken::drop`.
+        if let Some(clt) = token.compiled_loop_token() {
+            clt.free_loop_and_bridges();
+        }
+    }
+
     fn invalidate_loop(&self, token: &JitCellToken) {
         // A validated wasm module's code is immutable, so
         // GUARD_NOT_INVALIDATED loads a live flag instead of having its
@@ -7146,6 +7219,165 @@ mod tests {
         let bits = usize::BITS as usize;
         let word = 1 + index / bits;
         word < buf.len() && (buf[word] & (1usize << (index % bits))) != 0
+    }
+
+    /// `llmodel.py` `free_loop_and_bridges`: a loop and its bridge drop their
+    /// table slot, bridge-cell reservation, label target and call-assembler
+    /// entry. The next compile reuses the slot id instead of growing it.
+    #[test]
+    fn free_loop_releases_slot_cells_and_registries() {
+        let _compile_guard = failguard::lock_cpu();
+        let mut backend = WasmBackend::new();
+        let token = JitCellToken::new(9_910_001);
+        let label = majit_ir::make_loop_target_descr(70, false);
+        let label_id = std::sync::Arc::as_ptr(&label) as *const () as usize;
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
+        let label_op = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::Label,
+            &[rb(majit_ir::OpRef::input_arg_int(0)), rb(majit_ir::OpRef::input_arg_int(1))],
+        ));
+        label_op.setdescr(label.clone());
+        let advance = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::IntAdd,
+            &[rb(majit_ir::OpRef::input_arg_int(0)), rb(majit_ir::OpRef::const_int(1))],
+        ));
+        advance.pos().set(majit_ir::OpRef::int_op(2));
+        let guard = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::GuardTrue,
+            &[rb(majit_ir::OpRef::int_op(2))],
+        ));
+        guard.setfailargs(
+            vec![
+                rb(majit_ir::OpRef::int_op(2)),
+                rb(majit_ir::OpRef::input_arg_int(1)),
+            ]
+            .into(),
+        );
+        guard.set_fail_arg_types(vec![majit_ir::Type::Int, majit_ir::Type::Int]);
+        let jump = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::Jump,
+            &[
+                majit_ir::operand::Operand::from_bound_op(&advance),
+                rb(majit_ir::OpRef::input_arg_int(1)),
+            ],
+        ));
+        jump.setdescr(label.clone());
+        let ops = vec![label_op, advance, guard, jump];
+        backend
+            .compile_loop(&inputargs, &ops, &token)
+            .expect("loop compiles");
+        assert!(failguard::call_assembler_target(token.number).is_some());
+        assert!(failguard::label_target(label_id).is_some());
+        let fail = FreeFailDescr {
+            fail_index: 0,
+            arg_types: vec![majit_ir::Type::Int, majit_ir::Type::Int],
+        };
+        let bridge_advance = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::IntAdd,
+            &[rb(majit_ir::OpRef::input_arg_int(0)), rb(majit_ir::OpRef::const_int(1))],
+        ));
+        bridge_advance.pos().set(majit_ir::OpRef::int_op(3));
+        let bridge_jump = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::Jump,
+            &[
+                majit_ir::operand::Operand::from_bound_op(&bridge_advance),
+                rb(majit_ir::OpRef::input_arg_int(1)),
+            ],
+        ));
+        bridge_jump.setdescr(label);
+        let bridge_inputs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
+        backend
+            .compile_bridge(
+                &fail,
+                &bridge_inputs,
+                &[bridge_advance, bridge_jump],
+                &token,
+                &[],
+                None,
+            )
+            .expect("bridge compiles");
+        let clt = token.compiled_loop_token_expect();
+        let owned = clt.asmmemmgr_blocks.lock().len();
+        assert!(owned >= 1, "loop resources sit on asmmemmgr_blocks");
+        let gcmaps_owned = clt.asmmemmgr_blocks.lock().iter().any(|block| {
+            block
+                .downcast_ref::<release::LoopAsmResources>()
+                .is_some_and(|resources| !resources.gcmaps.is_empty())
+        });
+        assert!(gcmaps_owned, "gcmap is owned by the token, not leaked");
+        drop(clt);
+
+        backend.free_loop(&token);
+        assert!(failguard::call_assembler_target(token.number).is_none());
+        assert!(failguard::label_target(label_id).is_none());
+        assert!(
+            token
+                .compiled_loop_token_expect()
+                .asmmemmgr_blocks
+                .lock()
+                .is_empty(),
+            "free_loop_and_bridges dropped the asm blocks"
+        );
+        drop(token);
+
+        let token2 = JitCellToken::new(9_910_002);
+        let label2 = majit_ir::make_loop_target_descr(71, false);
+        let label_op = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::Label,
+            &[rb(majit_ir::OpRef::input_arg_int(0)), rb(majit_ir::OpRef::input_arg_int(1))],
+        ));
+        label_op.setdescr(label2.clone());
+        let advance = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::IntAdd,
+            &[rb(majit_ir::OpRef::input_arg_int(0)), rb(majit_ir::OpRef::const_int(1))],
+        ));
+        advance.pos().set(majit_ir::OpRef::int_op(2));
+        let jump = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::Jump,
+            &[
+                majit_ir::operand::Operand::from_bound_op(&advance),
+                rb(majit_ir::OpRef::input_arg_int(1)),
+            ],
+        ));
+        jump.setdescr(label2);
+        backend
+            .compile_loop(
+                &inputargs,
+                &[label_op, advance, jump],
+                &token2,
+            )
+            .expect("second loop compiles");
+        assert!(failguard::label_target(label_id).is_none());
+        assert!(
+            token2
+                .compiled_loop_token_expect()
+                .asmmemmgr_blocks
+                .lock()
+                .iter()
+                .any(|block| {
+                    block
+                        .downcast_ref::<release::LoopAsmResources>()
+                        .is_some_and(|resources| !resources.gcmaps.is_empty())
+                }),
+            "second compile owns a fresh gcmap"
+        );
+    }
+
+    #[derive(Debug)]
+    struct FreeFailDescr {
+        fail_index: u32,
+        arg_types: Vec<majit_ir::Type>,
+    }
+
+    impl majit_ir::Descr for FreeFailDescr {}
+
+    impl majit_ir::descr::FailDescr for FreeFailDescr {
+        fn fail_index(&self) -> u32 {
+            self.fail_index
+        }
+        fn fail_arg_types(&self) -> &[majit_ir::Type] {
+            &self.arg_types
+        }
     }
 
     #[test]
