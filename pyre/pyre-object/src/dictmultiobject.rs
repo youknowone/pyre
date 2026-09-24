@@ -169,9 +169,14 @@ impl std::hash::Hasher for StrKeyHasher {
         }
         let rest = chunks.remainder();
         if !rest.is_empty() {
-            let mut tail = [0u8; 8];
-            tail[..rest.len()].copy_from_slice(rest);
-            self.mix(u64::from_le_bytes(tail));
+            // The zero-padded little-endian tail word, folded byte by byte: a
+            // `copy_from_slice` of a variable length is an out-of-line
+            // `memmove` on every global-name probe.
+            let tail = rest
+                .iter()
+                .enumerate()
+                .fold(0u64, |word, (i, &byte)| word | (byte as u64) << (8 * i));
+            self.mix(tail);
         }
     }
 
