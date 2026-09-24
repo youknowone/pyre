@@ -14,16 +14,7 @@ pub use crate::model::IndirectCallTargets;
 use crate::model::{BlockId, ExitCase, ExitSwitch, FunctionGraph, Link, LinkArg, SpaceOperation};
 use crate::regalloc::RegAllocator;
 
-/// A label in the flattened instruction stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Label(pub usize);
-
-/// `flatten.py class TLabel`.
-///
-/// Rust encodes the definition-vs-target distinction in [`FlatOp`] variants
-/// (`Label` vs jump targets), so the target wrapper shares the same numeric
-/// label carrier.
-pub type TLabel = Label;
+pub use majit_jitcode::codewriter::flatten::{Label, TLabel};
 
 /// `flatten.py class Register`.
 ///

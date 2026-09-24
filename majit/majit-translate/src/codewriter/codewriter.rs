@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use crate::assembler::Assembler;
+use crate::assembler::{Assembler, AssemblerExt};
 use crate::call::CallControl;
 use crate::jitcode::JitCode;
 use crate::jtransform::GraphTransformConfig;

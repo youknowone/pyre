@@ -6,6 +6,8 @@
 //! `majit-macros` build without the translator.
 
 pub mod codewriter {
+    pub mod assembler;
+    pub mod flatten;
     pub mod insns;
     pub mod jitcode;
     pub mod liveness;
