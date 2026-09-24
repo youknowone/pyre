@@ -234,6 +234,7 @@ fn has_variadic_type_param_default(module: &ast::Mod) -> bool {
 pub fn compile_object(
     object: PyObjectRef,
     filename: &str,
+    warning_filename: &Wtf8,
     mode: crate::compile::Mode,
     opts: crate::compile::CompileOpts,
 ) -> AstResult<crate::compile::CodeObject> {
@@ -265,7 +266,7 @@ pub fn compile_object(
         module,
         source_file,
         &text,
-        filename,
+        warning_filename,
         mode,
         opts,
     )

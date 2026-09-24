@@ -1625,6 +1625,9 @@ fn annotator_unfollowed_legacy_vars(
 /// only tests whether the result is `Some`; the tags are stable identifiers
 /// for the decline census (`crate::decline`).
 pub(crate) fn unported_category(msg: &str) -> Option<&'static str> {
+    if msg.contains("wtf8-strlen-unknown-receiver") {
+        return Some("wtf8-strlen-unknown-receiver");
+    }
     if msg.contains("not registered in CallRegistry") {
         return Some("call-registry-miss");
     }
@@ -2021,6 +2024,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     function_graphs: &crate::codewriter::call::GraphStore,
     unsafe_fn_stubs: &[(Vec<String>, Signature, Option<String>)],
     foreign_opaque_method_externals: &[(Vec<String>, Signature, crate::model::ValueType)],
+    atomic_load_decls: &[crate::translator::rtyper::lltypesystem::module::ll_extaccessor::DeclinedFunDecl],
     registry: &CallRegistry,
 ) -> Result<(), TyperError> {
     // Decline-census gate name for this function's registration skips.
@@ -2265,8 +2269,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // addresses are published in `pyre-interpreter` `jit_trace_fnaddrs`
     // (`pa0`), so the residual is a real call rather than a symbolic
     // hash.
-    let atomic_load_decls = crate::translator::rtyper::lltypesystem::module::ll_extaccessor::harvested_atomic_load_decls();
-    register_atomic_load_llexternals(registry, &atomic_load_decls);
+    register_atomic_load_llexternals(registry, atomic_load_decls);
     // Foreign opaque-ADT method externals (`<BigInt as Add>::add`, …) the
     // LLBC collected.  `impl_method_owner` declines the Method hint for an
     // opaque owner, so these residualize as `FunctionPath` calls; declare
@@ -4618,11 +4621,13 @@ fn reconcile_elided_phi_inputargs(
 /// which proves it: `front::option_closure_select` replaces
 /// `Option::unwrap_or_else` with the direct discriminant diamond RPython's
 /// closure-free source would have built and synthesizes a closure
-/// `call_once` in the `None` arm.  Charon retains the concrete `FnOnce::Output`
-/// as that op's `result_ty` but does not monomorphize it into the registered
-/// closure method, so the real rtyper can default the live result to `Void`.
-/// For that synthesized closure call alone, carry a declared `Signed` or
-/// `Float` result onto the twin.  An ordinary scalar call is deliberately not
+/// `call_once` in the `None` arm, and `front::iter_adapter` synthesizes
+/// `call_mut` for `map(...).collect()`.  Charon retains the concrete
+/// `FnOnce::Output` / `FnMut::Output` as that op's `result_ty` but does not
+/// monomorphize it into the registered closure method, so the real rtyper
+/// can default the live result to `Void`.  For that synthesized closure
+/// call alone, carry a declared `Signed` or `Float` result onto the twin.
+/// An ordinary scalar call is deliberately not
 /// covered: its `Signed`/`Float` versus `Void` pairing remains a genuine kind
 /// divergence and falls back to legacy.
 ///
@@ -4652,20 +4657,20 @@ fn backfill_untyped_call_results(legacy: &LegacyGraph, value_to_var: &LegacyToTy
                 continue;
             };
             let declared_kind = valuetype_to_concrete(result_ty);
-            let closure_call_once = matches!(
+            let closure_scalar_call = matches!(
                 target,
                 crate::model::CallTarget::Method {
                     name,
                     receiver_root: Some(root),
                     ..
-                } if name == "call_once"
+                } if (name == "call_once" || name == "call_mut")
                     && root.rsplit("::").next().is_some_and(
                         majit_charon_reader::ullbc::is_closure_leaf
                     )
             );
             let declared_lltype = match declared_kind {
                 ConcreteType::GcRef => Some(GCREF.clone()),
-                ConcreteType::Signed | ConcreteType::Float if closure_call_once => {
+                ConcreteType::Signed | ConcreteType::Float if closure_scalar_call => {
                     crate::model::concrete_to_canonical_lltype(declared_kind)
                 }
                 _ => None,
@@ -4845,7 +4850,7 @@ mod tests {
             },
             graph,
         );
-        populate_call_registry_from_call_graphs(&graphs, &[], &[], &registry).unwrap();
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry).unwrap();
         let entry = registry
             .lookup(&FunctionPathKey::from_segments(["owner", "memo_source"]))
             .unwrap();
@@ -4854,7 +4859,7 @@ mod tests {
         // Re-populating keeps the canonical callable instead of making a
         // second GraphFunc and silently erasing its specialization policy.
         let id = entry.host_object.user_function().unwrap().id;
-        populate_call_registry_from_call_graphs(&graphs, &[], &[], &registry).unwrap();
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry).unwrap();
         assert_eq!(
             registry
                 .lookup(&FunctionPathKey::from_segments(["owner", "memo_source"]))
@@ -4907,7 +4912,7 @@ mod tests {
             },
             graph,
         );
-        populate_call_registry_from_call_graphs(&graphs, &[], &[], &registry).unwrap();
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry).unwrap();
         assert_eq!(entry.host_object.user_function().unwrap().id, func.id);
         let result = entry
             .function_desc
@@ -5342,19 +5347,21 @@ mod tests {
             (ValueType::Int, ConcreteType::Signed),
             (ValueType::Float, ConcreteType::Float),
         ] {
-            let (graph, result, value_to_var) = backfill_call_result_fixture(
-                crate::model::CallTarget::method(
-                    "call_once",
-                    Some("module::function::closure#2".to_string()),
-                ),
-                result_ty,
-            );
-            backfill_untyped_call_results(&graph, &value_to_var);
-            assert_eq!(
-                kind_of_in(&value_to_var, &result),
-                expected,
-                "the closure's declared FnOnce::Output must survive Charon erasure"
-            );
+            for method in ["call_once", "call_mut"] {
+                let (graph, result, value_to_var) = backfill_call_result_fixture(
+                    crate::model::CallTarget::method(
+                        method,
+                        Some("module::function::closure#2".to_string()),
+                    ),
+                    result_ty.clone(),
+                );
+                backfill_untyped_call_results(&graph, &value_to_var);
+                assert_eq!(
+                    kind_of_in(&value_to_var, &result),
+                    expected,
+                    "{method}: the closure's declared output must survive Charon erasure"
+                );
+            }
         }
     }
 
@@ -7240,7 +7247,7 @@ mod tests {
         let bare = CallRegistry::new(std::rc::Rc::new(
             crate::annotator::bookkeeper::Bookkeeper::new(),
         ));
-        populate_call_registry_from_call_graphs(&graphs, &[], &[], &bare).unwrap();
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &bare).unwrap();
         let bare_error = bare
             .lookup(&caller_key)
             .expect("caller registers regardless")
@@ -7263,7 +7270,7 @@ mod tests {
         let registry = CallRegistry::new(std::rc::Rc::new(
             crate::annotator::bookkeeper::Bookkeeper::new(),
         ));
-        populate_call_registry_from_call_graphs(&graphs, &stubs, &[], &registry).unwrap();
+        populate_call_registry_from_call_graphs(&graphs, &stubs, &[], &[], &registry).unwrap();
 
         let caller = registry.lookup(&caller_key).expect("caller entry");
         assert_eq!(
@@ -8060,6 +8067,7 @@ mod tests {
             &crate::codewriter::call::GraphStore::default(),
             &[],
             &[],
+            &[],
             &registry,
         )
         .unwrap();
@@ -8261,8 +8269,12 @@ mod tests {
         let statements = ordering
             .map(|name| {
                 let index = variants.iter().position(|v| *v == name).unwrap();
-                json!([{"span": span, "kind": {"Assign": [place(2, &adt(1)),
-                {"Aggregate": [{"Adt": [1, index, null, generics]}, []]}]}}])
+                json!([
+                    {"span": span, "kind": {"Assign": [place(1, &receiver),
+                        {"Aggregate": [{"Adt": [0, 0, null, generics]}, []]}]}},
+                    {"span": span, "kind": {"Assign": [place(2, &adt(1)),
+                        {"Aggregate": [{"Adt": [1, index, null, generics]}, []]}]}}
+                ])
             })
             .unwrap_or_else(|| json!([]));
         let arg_count = if zero_arg { 0 } else { 1 };
@@ -8321,7 +8333,9 @@ mod tests {
             collect_atomic_load_llexternals, is_external_shaped_atomic_accessor,
         };
         let acquire = atomic_load_llbc(Some("Acquire"), true);
-        let decls = crate::front::mir::collect_atomic_load_declined_fun_decls(&acquire);
+        let decls = crate::front::mir::build_semantic_program_from_llbc(&acquire)
+            .expect("acquire fixture lowers")
+            .atomic_load_decls;
         assert_eq!(decls.len(), 1);
         assert_eq!(
             decls[0].segments,
@@ -8339,23 +8353,30 @@ mod tests {
         assert_eq!(collect_atomic_load_llexternals(&decls).len(), 1);
 
         let pointer = atomic_load_llbc(Some("Acquire"), false);
-        let decls = crate::front::mir::collect_atomic_load_declined_fun_decls(&pointer);
+        let decls = crate::front::mir::build_semantic_program_from_llbc(&pointer)
+            .expect("pointer fixture lowers")
+            .atomic_load_decls;
         assert_eq!(decls.len(), 1);
         assert_eq!(decls[0].arg_lltypes.len(), 1);
         assert!(!is_external_shaped_atomic_accessor(&decls[0]));
         assert!(collect_atomic_load_llexternals(&decls).is_empty());
 
         let relaxed = atomic_load_llbc(Some("Relaxed"), true);
-        assert!(crate::front::mir::collect_atomic_load_declined_fun_decls(&relaxed).is_empty());
+        assert!(
+            crate::front::mir::build_semantic_program_from_llbc(&relaxed)
+                .expect("relaxed fixture lowers")
+                .atomic_load_decls
+                .is_empty()
+        );
     }
 
     #[test]
     fn harvested_zero_arg_atomic_load_accessor_registers_as_extfunc_entry() {
         use crate::annotator::model::SomeValue;
-        use crate::translator::rtyper::lltypesystem::module::ll_extaccessor::register_harvested_atomic_load_decls;
         let acquire = atomic_load_llbc(Some("Acquire"), true);
-        let decls = crate::front::mir::collect_atomic_load_declined_fun_decls(&acquire);
-        register_harvested_atomic_load_decls(decls);
+        let decls = crate::front::mir::build_semantic_program_from_llbc(&acquire)
+            .expect("acquire fixture lowers")
+            .atomic_load_decls;
         let registry = CallRegistry::new(std::rc::Rc::new(
             crate::annotator::bookkeeper::Bookkeeper::new(),
         ));
@@ -8363,6 +8384,7 @@ mod tests {
             &crate::codewriter::call::GraphStore::default(),
             &[],
             &[],
+            &decls,
             &registry,
         )
         .unwrap();
@@ -8405,7 +8427,6 @@ mod tests {
             }
             other => panic!("expected unsigned SomeInteger, got {other:?}"),
         }
-        register_harvested_atomic_load_decls(Vec::new());
     }
 
     #[test]
@@ -8414,10 +8435,10 @@ mod tests {
         use crate::codewriter::jtransform::{GraphTransformConfig, Transformer};
         use crate::codewriter::type_state::ConcreteType;
         use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
-        use crate::translator::rtyper::lltypesystem::module::ll_extaccessor::register_harvested_atomic_load_decls;
         let acquire = atomic_load_llbc(Some("Acquire"), true);
-        let decls = crate::front::mir::collect_atomic_load_declined_fun_decls(&acquire);
-        register_harvested_atomic_load_decls(decls);
+        let decls = crate::front::mir::build_semantic_program_from_llbc(&acquire)
+            .expect("acquire fixture lowers")
+            .atomic_load_decls;
         let registry = CallRegistry::new(std::rc::Rc::new(
             crate::annotator::bookkeeper::Bookkeeper::new(),
         ));
@@ -8425,6 +8446,7 @@ mod tests {
             &crate::codewriter::call::GraphStore::default(),
             &[],
             &[],
+            &decls,
             &registry,
         )
         .unwrap();
@@ -8491,15 +8513,12 @@ mod tests {
                 .any(|op| matches!(op.kind, OpKind::CallResidual { .. })),
             "call site must residualize; got {ops:?}"
         );
-        register_harvested_atomic_load_decls(Vec::new());
     }
 
     #[test]
     fn populate_refuses_unverified_atomic_load_harvest() {
-        use crate::translator::rtyper::lltypesystem::module::ll_extaccessor::{
-            DeclinedFunDecl, register_harvested_atomic_load_decls,
-        };
-        register_harvested_atomic_load_decls(vec![DeclinedFunDecl {
+        use crate::translator::rtyper::lltypesystem::module::ll_extaccessor::DeclinedFunDecl;
+        let decls = vec![DeclinedFunDecl {
             segments: vec!["pyre_object".into(), "gc_interp".into(), "safepoint".into()],
             arg_lltypes: vec![],
             result_lltype: LowLevelType::Void,
@@ -8507,7 +8526,7 @@ mod tests {
             decline_reason: "unsupported MIR: atomic load ordering Acquire requires \
                  address-preserving ordered lowering"
                 .into(),
-        }]);
+        }];
         let registry = CallRegistry::new(std::rc::Rc::new(
             crate::annotator::bookkeeper::Bookkeeper::new(),
         ));
@@ -8515,6 +8534,7 @@ mod tests {
             &crate::codewriter::call::GraphStore::default(),
             &[],
             &[],
+            &decls,
             &registry,
         )
         .unwrap();
@@ -8528,6 +8548,5 @@ mod tests {
                 .is_none(),
             "safepoint contains an Acquire load but is not a word-only reader"
         );
-        register_harvested_atomic_load_decls(Vec::new());
     }
 }

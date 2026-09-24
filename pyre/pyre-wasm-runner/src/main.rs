@@ -202,7 +202,7 @@ fn warn_inert_guest_env() {
         "MAJIT_MAX_BRIDGES",
         "MAJIT_SKIP_BRIDGES",
     ];
-    // Forwarded into the guest through `pyre_set_gc_env` / `GC_ENV_NAMES`,
+    // Forwarded into the guest through `pyre_set_env` / `pyre_env_names`,
     // not interpreted here. Presence of the name is the native contract.
     const GUEST_FORWARDED_GC: &[&str] = &["MAJIT_GC_STRESS"];
     // `to_string_lossy`, not `into_string().ok()`: a name the platform allows
@@ -507,39 +507,26 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
         set_force.call(&mut store, selector)?;
     }
 
-    // The environment `-P`, `-O`, PYTHONWARNINGS and the rest resolve against.
-    // The guest's own is permanently empty, so without this every one of them
-    // reads as unset there while working natively; the runner only forwards the
-    // values, the fold stays in `launch_env::finalize` where the launcher's is.
-    // The module names which variables it wants, so the two never drift apart.
+    // One environment for the guest. The launcher, the collector and the JIT
+    // knobs all read it; the runner forwards every name the module asks for in
+    // one blob. Values stay undecoded: `PYTHONSAFEPATH` is a presence flag on
+    // the raw bytes, and a non-UTF-8 value is still set.
     //
-    // A module predating `pyre_set_launch_env` still understands the `-P` half
-    // through `pyre_set_safe_path`; one predating both keeps its previous
-    // behaviour of always seeding `sys.path[0]`. Both halves are resolved before
-    // either is used, so a module carrying only one degrades to the fallback
-    // instead of failing the run.
-    let launch_env_names = instance
-        .get_typed_func::<(), u64>(&mut store, "pyre_launch_env_names")
+    // A module predating `pyre_set_env` still understands `-P` through
+    // `pyre_set_safe_path`.
+    let env_names = instance
+        .get_typed_func::<(), u64>(&mut store, "pyre_env_names")
         .ok();
-    let set_launch_env = instance
-        .get_typed_func::<(u32, u32), ()>(&mut store, "pyre_set_launch_env")
+    let set_env = instance
+        .get_typed_func::<(u32, u32), ()>(&mut store, "pyre_set_env")
         .ok();
-    if let (Some(names), Some(set_launch_env)) = (launch_env_names, set_launch_env) {
+    if let (Some(names), Some(set_env)) = (env_names, set_env) {
         let packed = names.call(&mut store, ())?;
         let (nptr, nlen) = ((packed >> 32) as u32, packed as u32);
         let mut buf = vec![0u8; nlen as usize];
         memory.read(&store, nptr as usize, &mut buf)?;
         dealloc.call(&mut store, (nptr, nlen))?;
 
-        // Values are forwarded undecoded. The fold reads all but one of these
-        // names through `env::var` and so drops a value that is not UTF-8 on
-        // its own, matching the native launcher; the exception is the
-        // `PYTHONSAFEPATH` presence flag, which `_Py_GetEnv` tests on raw
-        // bytes. Decoding here would make such a value read as unset and leave
-        // `sys.path[0]` seeded rather than suppressed, so the decision belongs
-        // to the fold, not the transport. `into_encoded_bytes` round-trips a
-        // valid-UTF-8 `OsString` to exactly its UTF-8 bytes, so the guest's
-        // `from_utf8` reproduces `env::var`'s accept/reject split unchanged.
         let mut blob: Vec<u8> = Vec::new();
         for name in String::from_utf8_lossy(&buf)
             .split('\0')
@@ -558,11 +545,11 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
 
         let blen = blob.len() as u32;
         if blen == 0 {
-            set_launch_env.call(&mut store, (0, 0))?;
+            set_env.call(&mut store, (0, 0))?;
         } else {
             let p = alloc.call(&mut store, blen)?;
             memory.write(&mut store, p as usize, &blob)?;
-            set_launch_env.call(&mut store, (p, blen))?;
+            set_env.call(&mut store, (p, blen))?;
             dealloc.call(&mut store, (p, blen))?;
         }
     } else if std::env::var_os("PYTHONSAFEPATH").is_some_and(|value| !value.is_empty())
@@ -570,94 +557,6 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             instance.get_typed_func::<u32, ()>(&mut store, "pyre_set_safe_path")
     {
         set_safe_path.call(&mut store, 1)?;
-    }
-
-    // The environment the collector sizes itself from, forwarded the same way
-    // and for the same reason. It is not a diagnostic knob: `PYPY_GC_MIN` and
-    // `PYPY_GC_NURSERY` fix where the major-collection threshold falls, the
-    // major step arms the eval-breaker word, and every compiled loop's back edge
-    // polls that word through a real guard — so a guest that cannot read them
-    // counts a different number of guard failures than the native backends run
-    // beside it, from the same settings. Absent on a module predating the
-    // export, which then keeps its built-in defaults.
-    let gc_env_names = instance
-        .get_typed_func::<(), u64>(&mut store, "pyre_gc_env_names")
-        .ok();
-    let set_gc_env = instance
-        .get_typed_func::<(u32, u32), ()>(&mut store, "pyre_set_gc_env")
-        .ok();
-    if let (Some(names), Some(set_gc_env)) = (gc_env_names, set_gc_env) {
-        let packed = names.call(&mut store, ())?;
-        let (nptr, nlen) = ((packed >> 32) as u32, packed as u32);
-        let mut buf = vec![0u8; nlen as usize];
-        memory.read(&store, nptr as usize, &mut buf)?;
-        dealloc.call(&mut store, (nptr, nlen))?;
-
-        // `env::var`, not `var_os`: the size/rate pins are numbers, so a
-        // value that does not decode could not have been one and is left unset
-        // exactly as it would be natively. `MAJIT_GC_STRESS` is presence-only
-        // and any UTF-8 value, including empty, opts in.
-        let blob = String::from_utf8_lossy(&buf)
-            .split('\0')
-            .filter(|name| !name.is_empty())
-            .filter_map(|name| {
-                std::env::var(name)
-                    .ok()
-                    .map(|value| format!("{name}={value}"))
-            })
-            .collect::<Vec<_>>()
-            .join("\0");
-
-        let blen = blob.len() as u32;
-        if blen != 0 {
-            let p = alloc.call(&mut store, blen)?;
-            memory.write(&mut store, p as usize, blob.as_bytes())?;
-            set_gc_env.call(&mut store, (p, blen))?;
-            dealloc.call(&mut store, (p, blen))?;
-        }
-    }
-
-    // The environment the JIT knobs resolve against, forwarded the same way
-    // and for the same reason. It is not a diagnostic knob: `PYRE_NO_JIT`
-    // disables every compiled path and `MAJIT_NO_BRIDGE` sends every guard
-    // failure through the blackhole — so a guest that cannot read them
-    // executes a different program than the native backends run beside it,
-    // from the same settings. Absent on a module predating the export, which
-    // then keeps both knobs unset.
-    let jit_env_names = instance
-        .get_typed_func::<(), u64>(&mut store, "pyre_jit_env_names")
-        .ok();
-    let set_jit_env = instance
-        .get_typed_func::<(u32, u32), ()>(&mut store, "pyre_set_jit_env")
-        .ok();
-    if let (Some(names), Some(set_jit_env)) = (jit_env_names, set_jit_env) {
-        let packed = names.call(&mut store, ())?;
-        let (nptr, nlen) = ((packed >> 32) as u32, packed as u32);
-        let mut buf = vec![0u8; nlen as usize];
-        memory.read(&store, nptr as usize, &mut buf)?;
-        dealloc.call(&mut store, (nptr, nlen))?;
-
-        // Presence flags, but the blob is still UTF-8 `NAME=VALUE`. Native
-        // presence reads use `var_os`, so a non-UTF-8 value is still "set";
-        // forward that as `NAME=` (empty still counts as set).
-        let blob = String::from_utf8_lossy(&buf)
-            .split('\0')
-            .filter(|name| !name.is_empty())
-            .filter_map(|name| {
-                std::env::var_os(name)?;
-                let value = std::env::var(name).unwrap_or_default();
-                Some(format!("{name}={value}"))
-            })
-            .collect::<Vec<_>>()
-            .join("\0");
-
-        let blen = blob.len() as u32;
-        if blen != 0 {
-            let p = alloc.call(&mut store, blen)?;
-            memory.write(&mut store, p as usize, blob.as_bytes())?;
-            set_jit_env.call(&mut store, (p, blen))?;
-            dealloc.call(&mut store, (p, blen))?;
-        }
     }
 
     // Name the script so the guest compiles it under its real path: that is

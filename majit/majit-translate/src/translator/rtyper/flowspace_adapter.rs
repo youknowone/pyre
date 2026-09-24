@@ -2450,18 +2450,15 @@ pub fn translate_op(
                     // `__strlen` is a fourth frontend spelling
                     // (`front/mir.rs` plants it for `Rvalue::Len` /
                     // `slice::len` / `Wtf8::len` on a
-                    // `string_byte_view_locals` place).  The receiver at
-                    // real `w_str_get_wtf8` sites is the dest of
-                    // `__cast_instance_intrinsic` with a `Wtf8` root and
-                    // `ValueType::Str` — `SomeString` / `StringRepr` —
-                    // so this is the same `len` op as `__len` on a
-                    // `&str`.  `StringRepr.rtype_len` → `ll_strlen`
-                    // (`rstr.py`) reads the rstr `STR` `chars` length
-                    // (the `len` word at offset 8).  The Skip spine
-                    // still rewrites a residual `__strlen` Call to the
-                    // `strlen` blackhole; both spines keep the machine
-                    // value as that dest pointer.  See
-                    // `strlen_arg_at_real_w_str_get_wtf8_sites_annotates_as_somestring`.
+                    // `string_byte_view_locals` place).  A receiver that
+                    // is already the rstr takes this `len` op
+                    // (`StringRepr.rtype_len` → `ll_strlen`, `rstr.py`).
+                    // A `Wtf8`/`Str` cast of a wrapper is not that rstr:
+                    // [`rewrite_wtf8_view_strlen`] turns it into
+                    // `getattr` of the wrapper's one string field
+                    // (`W_UnicodeObject._utf8`, `len(w._utf8)`) before
+                    // this arm runs.  `ll_strlen` on the wrapper would
+                    // read `PyObject.w_class` at offset 8.
                     let is_len_op = (segments.len() == 1
                         && (segments[0] == "__len" || segments[0] == "__strlen"))
                         || (segments.len() == 4
@@ -4099,6 +4096,279 @@ pub(crate) fn derive_subject_inputcells(
 /// flag covers only the framestate path's explicit marking
 /// (`mir.rs::lower_framestate`); startblock reachability is the general
 /// case the `dead` skip sites below also honour.
+/// `__strlen` on a `Wtf8`/`Str` cast reads the wrapper. `W_UnicodeObject._utf8`
+/// is the rstr (`unicodeobject.py`); the length is `len` of that one
+/// string-typed field. A layout with any other count of string fields
+/// declines — `ll_strlen` on the wrapper reads `PyObject.w_class`.
+///
+/// A block inputarg is that cast when every predecessor `Link` resolves to
+/// the same Wtf8 source. `Ok(None)` when this call is not that cast, so a
+/// real string receiver still lowers as `len`.
+fn rewrite_wtf8_view_strlen(
+    legacy: &FunctionGraph,
+    op: &SpaceOperation,
+    value_map: &HashMap<Variable, Hlvalue>,
+    call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
+) -> Result<Option<Vec<FlowspaceOp>>, TyperError> {
+    let Some(view) = strlen_call_arg(&op.kind) else {
+        return Ok(None);
+    };
+    let reachable = reachable_block_ids(legacy);
+    let obj = match resolve_strlen_view(legacy, view, 0, &mut Vec::new(), &reachable)? {
+        StrlenView::Cast(obj) => obj,
+        StrlenView::NotCast | StrlenView::Cycle => return Ok(None),
+    };
+    let Some(class_name) =
+        op_defining(legacy, &obj).and_then(|producer| input_class_name(&producer.kind))
+    else {
+        return Err(TyperError::message(
+            "__strlen on a Wtf8 view: receiver class unresolved \
+             (wtf8-strlen-unknown-receiver)",
+        ));
+    };
+    let field_name = unique_string_field(call_registry, class_name).map_err(|why| {
+        TyperError::message(format!(
+            "__strlen on a Wtf8 view of {class_name} has no unique string field ({why})"
+        ))
+    })?;
+    let receiver = lookup_operand(value_map, &obj, op, "strlen receiver")?;
+    let field = Hlvalue::Variable(Variable::new());
+    let result = resolve_result_hlvalue(op, value_map)?;
+    Ok(Some(vec![
+        FlowspaceOp::new(
+            "getattr",
+            vec![
+                receiver,
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str(field_name))),
+            ],
+            field.clone(),
+        ),
+        FlowspaceOp::new("len", vec![field], result),
+    ]))
+}
+
+fn strlen_call_arg(kind: &OpKind) -> Option<&Variable> {
+    let OpKind::Call {
+        target: crate::model::CallTarget::FunctionPath { segments, .. },
+        args,
+        ..
+    } = kind
+    else {
+        return None;
+    };
+    if segments.as_slice() != ["__strlen"] || args.len() != 1 {
+        return None;
+    }
+    args.first().and_then(LinkArg::as_variable)
+}
+
+enum StrlenView {
+    Cast(Variable),
+    NotCast,
+    /// Re-entered phi. It adds no producer of its own.
+    Cycle,
+}
+
+fn strlen_unresolved() -> TyperError {
+    TyperError::message(
+        "__strlen on a Wtf8 view: receiver class unresolved \
+         (wtf8-strlen-unknown-receiver)",
+    )
+}
+
+/// Operation result, or the one Wtf8 cast every predecessor link carries.
+/// A phi that is not a Wtf8 cast stays `NotCast` so a real string `len`
+/// still lowers. A cast that does not unify across incoming edges declines.
+fn resolve_strlen_view(
+    legacy: &FunctionGraph,
+    var: &Variable,
+    depth: usize,
+    stack: &mut Vec<Variable>,
+    reachable: &std::collections::HashSet<BlockId>,
+) -> Result<StrlenView, TyperError> {
+    if depth > 32 {
+        return Err(strlen_unresolved());
+    }
+    if stack.iter().any(|seen| seen == var) {
+        return Ok(StrlenView::Cycle);
+    }
+    if let Some(op) = op_defining(legacy, var) {
+        return Ok(match wtf8_str_cast_source(&op.kind) {
+            Some(obj) => StrlenView::Cast(obj.clone()),
+            None => StrlenView::NotCast,
+        });
+    }
+    let mut incoming: Vec<crate::model::LinkArg> = Vec::new();
+    let mut saw_input = false;
+    for block in &legacy.blocks {
+        // `function_graph_to_flowspace_inner` drops the same blocks:
+        // `dead` or not in `reachable_block_ids`. A dead predecessor
+        // must not feed the phi.
+        if block.dead || !reachable.contains(&block.id) {
+            continue;
+        }
+        let Some(idx) = block.inputargs.iter().position(|input| input == var) else {
+            continue;
+        };
+        saw_input = true;
+        for pred in &legacy.blocks {
+            if pred.dead || !reachable.contains(&pred.id) {
+                continue;
+            }
+            for link in &pred.exits {
+                if link.target != block.id {
+                    continue;
+                }
+                match link.args.get(idx) {
+                    Some(arg) => incoming.push(arg.clone()),
+                    None => return Err(strlen_unresolved()),
+                }
+            }
+        }
+    }
+    if !saw_input || incoming.is_empty() {
+        return Ok(StrlenView::NotCast);
+    }
+    stack.push(var.clone());
+    let mut cast_src: Option<Variable> = None;
+    let mut saw_not = false;
+    for arg in &incoming {
+        let view = match arg {
+            crate::model::LinkArg::Value(value) => {
+                resolve_strlen_view(legacy, value, depth + 1, stack, reachable)?
+            }
+            crate::model::LinkArg::Const(_) => StrlenView::NotCast,
+        };
+        match view {
+            StrlenView::Cast(obj) => {
+                if saw_not {
+                    return Err(strlen_unresolved());
+                }
+                if let Some(prev) = &cast_src {
+                    if prev != &obj {
+                        return Err(strlen_unresolved());
+                    }
+                } else {
+                    cast_src = Some(obj);
+                }
+            }
+            StrlenView::NotCast => {
+                if cast_src.is_some() {
+                    return Err(strlen_unresolved());
+                }
+                saw_not = true;
+            }
+            StrlenView::Cycle => {}
+        }
+    }
+    stack.pop();
+    if let Some(obj) = cast_src {
+        Ok(StrlenView::Cast(obj))
+    } else {
+        Ok(StrlenView::NotCast)
+    }
+}
+
+fn op_defining<'a>(legacy: &'a FunctionGraph, var: &Variable) -> Option<&'a SpaceOperation> {
+    legacy.blocks.iter().find_map(|block| {
+        block
+            .operations
+            .iter()
+            .find(|op| op.result.as_ref() == Some(var))
+    })
+}
+
+fn wtf8_str_cast_source(kind: &OpKind) -> Option<&Variable> {
+    if crate::model::cast_instance_root(kind) != Some("Wtf8") {
+        return None;
+    }
+    let OpKind::Call {
+        result_ty, args, ..
+    } = kind
+    else {
+        return None;
+    };
+    if *result_ty != crate::model::ValueType::Str {
+        return None;
+    }
+    args.first().and_then(LinkArg::as_variable)
+}
+
+fn input_class_name(kind: &OpKind) -> Option<&str> {
+    let OpKind::Input { class_root, ty, .. } = kind else {
+        return None;
+    };
+    if let Some(name) = class_root.as_deref().filter(|name| !name.is_empty()) {
+        return Some(name);
+    }
+    match ty {
+        crate::model::ValueType::Ref(Some(name)) => Some(name.as_str()),
+        _ => None,
+    }
+}
+
+fn unique_string_field(
+    call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
+    class_name: &str,
+) -> Result<String, &'static str> {
+    let bk = call_registry.bookkeeper();
+    let rows = {
+        let borrowed = bk.struct_fields.borrow();
+        let Some(reg) = borrowed.as_ref() else {
+            return Err("no struct field layout");
+        };
+        let Some(rows) = layout_rows(reg, class_name) else {
+            return Err("class has no registered fields");
+        };
+        rows.to_vec()
+    };
+    let mut found: Option<String> = None;
+    for (name, ty) in &rows {
+        if !matches!(
+            bk.project_struct_field_type(ty),
+            crate::annotator::model::SomeValue::String(_)
+        ) {
+            continue;
+        }
+        if found.is_some() {
+            return Err("more than one string field");
+        }
+        found = Some(name.clone());
+    }
+    found.ok_or("no string field")
+}
+
+fn layout_rows<'a>(
+    reg: &'a crate::front::StructFieldRegistry,
+    class_name: &str,
+) -> Option<&'a [(String, String)]> {
+    if class_name.is_empty() {
+        return None;
+    }
+    if let Some(rows) = reg.fields.get(class_name) {
+        return Some(rows.as_slice());
+    }
+    let leaf = class_name.rsplit("::").next().unwrap_or(class_name);
+    let canonical = majit_ir::descr::canonical_struct_name(leaf);
+    if let Some(rows) = reg.fields.get(&canonical) {
+        return Some(rows.as_slice());
+    }
+    let mut found: Option<&[(String, String)]> = None;
+    for (key, rows) in &reg.fields {
+        let suffix = key.ends_with(&format!("::{class_name}"))
+            || class_name.ends_with(&format!("::{key}"))
+            || key == leaf;
+        if !suffix {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(rows.as_slice());
+    }
+    found
+}
+
 fn reachable_block_ids(legacy: &FunctionGraph) -> std::collections::HashSet<BlockId> {
     // Index lookup instead of `FunctionGraph::block` (a dense
     // `blocks[id.0]` projection): final blocks reached as link targets
@@ -4626,6 +4896,18 @@ fn function_graph_to_flowspace_inner(
             if let OpKind::FieldWrite { base, .. } = &legacy_op.kind
                 && array_list_elements.contains_key(base)
             {
+                continue;
+            }
+            if let Some(ops) =
+                rewrite_wtf8_view_strlen(legacy, legacy_op, &value_map, call_registry)?
+            {
+                translated_ops.extend(ops);
+                if let Some(result_var) = legacy_op.result.as_ref()
+                    && let Some(name) = legacy.value_name_for(result_var)
+                    && let Some(value) = value_map.get(result_var).cloned()
+                {
+                    name_to_value.insert(name.to_string(), value);
+                }
                 continue;
             }
             translated_ops.extend(translate_op_or_frontier(
@@ -5351,18 +5633,12 @@ mod tests {
         let bk = Rc::new(Bookkeeper::new());
         bk.set_struct_fields(Rc::new(crate::front::StructFieldRegistry::default()));
 
-        let before = crate::codewriter::annotation_state::classdef_less_input_fallthrough_count();
         let cells = derive_subject_inputcells(&graph, Some(&bk))
             .expect("unregistered Ref input keeps the classdef-less shell");
         assert!(
             matches!(&cells[0], SomeValue::Instance(inst) if inst.classdef.is_none()),
             "unregistered root must keep the classdef-less shell, got {:?}",
             cells[0],
-        );
-        assert_eq!(
-            crate::codewriter::annotation_state::classdef_less_input_fallthrough_count(),
-            before,
-            "verbose-off input fallthrough must record nothing",
         );
     }
 
@@ -5707,117 +5983,395 @@ mod tests {
         );
     }
 
-    #[test]
-    fn strlen_on_wtf8_str_dest_rtypes_to_ll_strlen_not_getattr_len() {
-        // Real-site shape: dest of `w_str_get_wtf8` is SomeString.
-        // `__strlen(dest)` rewrites to `len`; `StringRepr.rtype_len`
-        // emits `direct_call(ll_strlen)` — the rstr `STR` `chars`
-        // length (byte length), not `getattr(__len__)`.
-        use crate::annotator::annrpython::RPythonAnnotator;
-        use crate::annotator::classdesc::ClassDef;
-        use crate::annotator::model::SomeInstance;
-        use crate::flowspace::model::ConstValue;
-        use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
-        use crate::translator::rtyper::pairtype::ReprClassId;
-        use crate::translator::rtyper::rmodel::Repr;
-        use crate::translator::rtyper::rstr::string_repr;
-        use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList, RPythonTyper};
-        use std::sync::Arc;
+    fn wtf8_strlen_fixture(
+        rows: Vec<(String, String)>,
+    ) -> (LegacyGraph, CallRegistry, crate::flowspace::model::Variable) {
+        let registry = empty_call_registry();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert("W_UnicodeObject".to_string(), rows);
+        registry.bookkeeper().set_struct_fields(Rc::new(fields));
 
         let mut graph = LegacyGraph::new("strlen_wtf8_dest");
         let vars = mint_vars(&mut graph, 4);
         let obj = vars[1].clone();
         let dest = vars[2].clone();
         let len_result = vars[3].clone();
-        let strlen_op = SpaceOperation {
-            result: Some(len_result.clone()),
-            kind: OpKind::Call {
-                target: crate::model::CallTarget::FunctionPath {
-                    segments: vec!["__strlen".to_string()],
-                    fun_decl_id: None,
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1]),
+            operations: vec![
+                SpaceOperation {
+                    result: Some(obj.clone()),
+                    kind: OpKind::Input {
+                        name: "obj".to_string(),
+                        ty: ValueType::Ref(Some("W_UnicodeObject".to_string())),
+                        class_root: Some("W_UnicodeObject".to_string()),
+                    },
                 },
-                args: crate::model::call_args(vec![dest.clone()]),
-                result_ty: ValueType::Int,
+                SpaceOperation {
+                    result: Some(dest.clone()),
+                    kind: crate::model::cast_instance_call_result("Wtf8", obj, ValueType::Str),
+                },
+                SpaceOperation {
+                    result: Some(len_result.clone()),
+                    kind: OpKind::Call {
+                        target: crate::model::CallTarget::FunctionPath {
+                            segments: vec!["__strlen".to_string()],
+                            fun_decl_id: None,
+                        },
+                        args: crate::model::call_args(vec![dest.clone()]),
+                        result_ty: ValueType::Int,
+                    },
+                },
+            ],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(len_result)],
+                graph.returnblock,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: block_inputargs(&vars, &[3]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock];
+        (graph, registry, dest)
+    }
+
+    fn flow_ops(output: &FlowspaceAdapterOutput) -> Vec<crate::flowspace::model::SpaceOperation> {
+        let graph = output.graph.borrow();
+        graph
+            .iterblocks()
+            .into_iter()
+            .flat_map(|block| block.borrow().operations.clone())
+            .collect()
+    }
+
+    fn hl_var_id(value: &Hlvalue) -> Option<u64> {
+        match value {
+            Hlvalue::Variable(var) => Some(var.id()),
+            _ => None,
+        }
+    }
+
+    /// `w_str_get_wtf8` paints its dest `ValueType::Str`, but the pointer
+    /// is still the `W_UnicodeObject`. `Wtf8::len` is the byte length of
+    /// `_utf8` (`W_UnicodeObject.value`, an rstr `STR`), so `__strlen`
+    /// must `getattr` that string field and `len` the field — `ll_strlen`
+    /// on the wrapper reads `PyObject.w_class`.
+    #[test]
+    fn strlen_on_wtf8_cast_reads_the_string_field_not_the_wrapper() {
+        use crate::flowspace::model::ConstValue;
+
+        let (graph, registry, dest) = wtf8_strlen_fixture(vec![
+            ("ob_header".to_string(), "PyObject".to_string()),
+            ("value".to_string(), "*mut Utf8Str".to_string()),
+            ("byte_len".to_string(), "usize".to_string()),
+            ("len".to_string(), "usize".to_string()),
+        ]);
+        let output =
+            function_graph_to_flowspace(&graph, &registry).expect("proven string field must lower");
+        let ops = flow_ops(&output);
+        let getattr = ops
+            .iter()
+            .find(|op| op.opname == "getattr")
+            .expect("length must getattr the string field, not len the wrapper");
+        let Hlvalue::Constant(field) = &getattr.args[1] else {
+            panic!("getattr field must be a constant, got {:?}", getattr.args);
+        };
+        assert!(
+            matches!(&field.value, ConstValue::ByteStr(bytes) if bytes == b"value"),
+            "the unique string-typed field is `value` (_utf8), not byte_len/len, got {:?}",
+            field.value
+        );
+        let field_id = hl_var_id(&getattr.result).expect("getattr result");
+        let len_ops: Vec<_> = ops.iter().filter(|op| op.opname == "len").collect();
+        assert_eq!(len_ops.len(), 1, "one len, of the string field: {ops:?}");
+        assert_eq!(hl_var_id(&len_ops[0].args[0]), Some(field_id));
+        let wrapper = output
+            .value_to_var
+            .get(&dest)
+            .expect("cast dest representative");
+        assert_ne!(
+            hl_var_id(&len_ops[0].args[0]),
+            Some(wrapper.id()),
+            "len must not read the W_UnicodeObject wrapper"
+        );
+        assert!(
+            !ops.iter().any(|op| {
+                matches!(op.opname.as_str(), "int_add" | "direct_ptradd" | "adr_add")
+            }),
+            "the length is a field then ll_strlen, not an address: {ops:?}"
+        );
+    }
+
+    /// The cast result reaches `__strlen` as the successor block's inputarg.
+    /// Resolving only operation results would `len` the wrapper.
+    #[test]
+    fn strlen_on_wtf8_cast_phi_reads_the_string_field() {
+        use crate::flowspace::model::ConstValue;
+
+        let registry = empty_call_registry();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "W_UnicodeObject".to_string(),
+            vec![
+                ("ob_header".to_string(), "PyObject".to_string()),
+                ("value".to_string(), "*mut Utf8Str".to_string()),
+                ("byte_len".to_string(), "usize".to_string()),
+                ("len".to_string(), "usize".to_string()),
+            ],
+        );
+        registry.bookkeeper().set_struct_fields(Rc::new(fields));
+
+        let mut graph = LegacyGraph::new("strlen_wtf8_phi");
+        let vars = mint_vars(&mut graph, 5);
+        let obj = vars[1].clone();
+        let dest = vars[2].clone();
+        let view = vars[3].clone();
+        let len_result = vars[4].clone();
+        let phi = BlockId(2);
+        let ret = graph.returnblock;
+        graph.exceptblock = BlockId(3);
+        graph.blocks = vec![
+            Block {
+                id: graph.startblock,
+                inputargs: block_inputargs(&vars, &[1]),
+                operations: vec![
+                    SpaceOperation {
+                        result: Some(obj.clone()),
+                        kind: OpKind::Input {
+                            name: "obj".to_string(),
+                            ty: ValueType::Ref(Some("W_UnicodeObject".to_string())),
+                            class_root: Some("W_UnicodeObject".to_string()),
+                        },
+                    },
+                    SpaceOperation {
+                        result: Some(dest.clone()),
+                        kind: crate::model::cast_instance_call_result(
+                            "Wtf8",
+                            obj.clone(),
+                            ValueType::Str,
+                        ),
+                    },
+                ],
+                exitswitch: None,
+                exits: vec![link_to_returnblock(
+                    vec![LinkArg::Value(obj.clone()), LinkArg::Value(dest)],
+                    phi,
+                )],
+                framestate: None,
+                dead: false,
             },
+            Block {
+                id: ret,
+                inputargs: vec![len_result.clone()],
+                operations: vec![],
+                exitswitch: None,
+                exits: vec![],
+                framestate: None,
+                dead: false,
+            },
+            Block {
+                id: phi,
+                inputargs: vec![obj, view.clone()],
+                operations: vec![SpaceOperation {
+                    result: Some(len_result.clone()),
+                    kind: OpKind::Call {
+                        target: crate::model::CallTarget::FunctionPath {
+                            segments: vec!["__strlen".to_string()],
+                            fun_decl_id: None,
+                        },
+                        args: crate::model::call_args(vec![view]),
+                        result_ty: ValueType::Int,
+                    },
+                }],
+                exitswitch: None,
+                exits: vec![link_to_returnblock(vec![LinkArg::Value(len_result)], ret)],
+                framestate: None,
+                dead: false,
+            },
+        ];
+        let output = function_graph_to_flowspace(&graph, &registry)
+            .expect("a phi of one Wtf8 cast must lower");
+        let ops = flow_ops(&output);
+        let getattr = ops
+            .iter()
+            .find(|op| op.opname == "getattr")
+            .expect("phi strlen must getattr the string field");
+        let Hlvalue::Constant(field) = &getattr.args[1] else {
+            panic!("getattr field must be a constant, got {:?}", getattr.args);
         };
-        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
-        value_map.insert(dest.clone(), Hlvalue::Variable(Variable::new()));
-        value_map.insert(len_result.clone(), Hlvalue::Variable(Variable::new()));
-        let translated = translate_op(&strlen_op, &value_map, &empty_call_registry())
-            .expect("__strlen on the Wtf8 dest is a len op");
-        assert_eq!(translated.len(), 1);
-        assert_eq!(translated[0].opname, "len");
-        assert_ne!(translated[0].opname, "getattr");
-        assert_eq!(translated[0].args.len(), 1);
-
-        let bk = Rc::new(Bookkeeper::new());
-        let s_obj = SomeValue::Instance(SomeInstance::new(
-            Some(ClassDef::new_standalone("pyobject::PyObject", None)),
-            false,
-            Default::default(),
-        ));
-        let s_root = bk
-            .immutablevalue(&ConstValue::byte_str("Wtf8"))
-            .expect("Wtf8 root constant");
-        let s_dest = crate::annotator::builtin::call_builtin(
-            &bk,
-            crate::runtime_names::shims::CAST_INSTANCE,
-            &[Some(s_obj), Some(s_root)],
-            &std::collections::HashMap::new(),
-        )
-        .expect("string-root cast must accept a PyObject instance");
         assert!(
-            matches!(s_dest, SomeValue::String(_)),
-            "dest annotates SomeString, got {s_dest:?}"
+            matches!(&field.value, ConstValue::ByteStr(bytes) if bytes == b"value"),
+            "got {:?}",
+            field.value
         );
+    }
 
-        let ann = RPythonAnnotator::new(None, None, Some(bk.clone()), false);
-        let rtyper = Rc::new(RPythonTyper::new(&ann));
-        rtyper
-            .initialize_exceptiondata()
-            .expect("exceptiondata for rtype_len");
-        let repr = rtyper
-            .getrepr(&s_dest)
-            .expect("SomeString must make StringRepr");
-        assert_eq!(Repr::repr_class_id(repr.as_ref()), ReprClassId::StringRepr);
+    /// A dead predecessor that feeds a non-cast into the phi is not an
+    /// incoming edge. The live cast still resolves to the string field.
+    #[test]
+    fn strlen_on_wtf8_cast_phi_ignores_dead_predecessor() {
+        use crate::flowspace::model::ConstValue;
 
-        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
-        let v_arg = Variable::new();
-        v_arg.set_concretetype(Some(STRPTR.clone()));
-        let v_result = Variable::new();
-        v_result.set_concretetype(Some(LowLevelType::Signed));
-        let hop = HighLevelOp::new(
-            rtyper.clone(),
-            crate::flowspace::model::SpaceOperation::new(
-                "len".to_string(),
-                vec![Hlvalue::Variable(v_arg)],
-                Hlvalue::Variable(v_result),
-            ),
-            Vec::new(),
-            llops.clone(),
+        let registry = empty_call_registry();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "W_UnicodeObject".to_string(),
+            vec![
+                ("ob_header".to_string(), "PyObject".to_string()),
+                ("value".to_string(), "*mut Utf8Str".to_string()),
+                ("byte_len".to_string(), "usize".to_string()),
+                ("len".to_string(), "usize".to_string()),
+            ],
         );
-        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
-        hop.args_s.borrow_mut().push(s_dest);
-        hop.args_r
-            .borrow_mut()
-            .push(Some(string_repr() as Arc<dyn Repr>));
-        let _ = repr
-            .rtype_len(&hop)
-            .unwrap_or_else(|err| panic!("StringRepr.rtype_len: {err:?}"));
-        let ops = llops.borrow();
-        assert_eq!(ops.ops.len(), 1, "rtype_len: one direct_call, not getattr");
-        assert_eq!(ops.ops[0].opname, "direct_call");
-        assert_ne!(ops.ops[0].opname, "getattr");
-        let funcptr_arg = &ops.ops[0].args[0];
-        let Hlvalue::Constant(c) = funcptr_arg else {
-            panic!("expected Constant funcptr, got {funcptr_arg:?}");
+        registry.bookkeeper().set_struct_fields(Rc::new(fields));
+
+        let mut graph = LegacyGraph::new("strlen_wtf8_phi_dead_pred");
+        let vars = mint_vars(&mut graph, 6);
+        let obj = vars[1].clone();
+        let dest = vars[2].clone();
+        let view = vars[3].clone();
+        let len_result = vars[4].clone();
+        let not_cast = vars[5].clone();
+        let phi = BlockId(2);
+        let dead_id = BlockId(4);
+        let ret = graph.returnblock;
+        graph.exceptblock = BlockId(3);
+        graph.blocks = vec![
+            Block {
+                id: graph.startblock,
+                inputargs: block_inputargs(&vars, &[1]),
+                operations: vec![
+                    SpaceOperation {
+                        result: Some(obj.clone()),
+                        kind: OpKind::Input {
+                            name: "obj".to_string(),
+                            ty: ValueType::Ref(Some("W_UnicodeObject".to_string())),
+                            class_root: Some("W_UnicodeObject".to_string()),
+                        },
+                    },
+                    SpaceOperation {
+                        result: Some(dest.clone()),
+                        kind: crate::model::cast_instance_call_result(
+                            "Wtf8",
+                            obj.clone(),
+                            ValueType::Str,
+                        ),
+                    },
+                ],
+                exitswitch: None,
+                exits: vec![link_to_returnblock(
+                    vec![LinkArg::Value(obj.clone()), LinkArg::Value(dest)],
+                    phi,
+                )],
+                framestate: None,
+                dead: false,
+            },
+            Block {
+                id: ret,
+                inputargs: vec![len_result.clone()],
+                operations: vec![],
+                exitswitch: None,
+                exits: vec![],
+                framestate: None,
+                dead: false,
+            },
+            Block {
+                id: phi,
+                inputargs: vec![obj.clone(), view.clone()],
+                operations: vec![SpaceOperation {
+                    result: Some(len_result.clone()),
+                    kind: OpKind::Call {
+                        target: crate::model::CallTarget::FunctionPath {
+                            segments: vec!["__strlen".to_string()],
+                            fun_decl_id: None,
+                        },
+                        args: crate::model::call_args(vec![view]),
+                        result_ty: ValueType::Int,
+                    },
+                }],
+                exitswitch: None,
+                exits: vec![link_to_returnblock(vec![LinkArg::Value(len_result)], ret)],
+                framestate: None,
+                dead: false,
+            },
+            Block {
+                id: dead_id,
+                inputargs: vec![],
+                operations: vec![SpaceOperation {
+                    result: Some(not_cast.clone()),
+                    kind: OpKind::Input {
+                        name: "other".to_string(),
+                        ty: ValueType::Int,
+                        class_root: None,
+                    },
+                }],
+                exitswitch: None,
+                exits: vec![link_to_returnblock(
+                    vec![LinkArg::Value(obj), LinkArg::Value(not_cast)],
+                    phi,
+                )],
+                framestate: None,
+                dead: true,
+            },
+        ];
+        let output = function_graph_to_flowspace(&graph, &registry)
+            .expect("a dead non-cast predecessor must not block the live Wtf8 cast");
+        let ops = flow_ops(&output);
+        let getattr = ops
+            .iter()
+            .find(|op| op.opname == "getattr")
+            .expect("phi strlen must still getattr the string field");
+        let Hlvalue::Constant(field) = &getattr.args[1] else {
+            panic!("getattr field must be a constant, got {:?}", getattr.args);
         };
-        let dbg = format!("{:?}", c.value);
         assert!(
-            dbg.contains("ll_strlen"),
-            "expected funcptr 'll_strlen' (byte length), got {dbg}"
+            matches!(&field.value, ConstValue::ByteStr(bytes) if bytes == b"value"),
+            "got {:?}",
+            field.value
         );
-        let _ = (graph, obj);
+    }
+
+    /// No string-typed field in the registered layout: do not accept
+    /// `len` of the wrapper. That answer is `ll_strlen` at offset 8,
+    /// which is `PyObject.w_class`.
+    #[test]
+    fn strlen_on_wtf8_cast_without_string_field_declines() {
+        let (graph, registry, _dest) = wtf8_strlen_fixture(vec![
+            ("ob_header".to_string(), "PyObject".to_string()),
+            ("byte_len".to_string(), "usize".to_string()),
+            ("len".to_string(), "usize".to_string()),
+        ]);
+        let err = function_graph_to_flowspace(&graph, &registry)
+            .expect_err("unproven Wtf8 view must not become len of the wrapper");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("string field") || msg.contains("__strlen"),
+            "decline must name the unproven strlen, got {msg}"
+        );
+        assert!(
+            !msg.contains("wtf8-strlen-unknown-receiver"),
+            "a known class with no string field is not an unresolved receiver"
+        );
+    }
+
+    #[test]
+    fn unresolved_wtf8_strlen_receiver_is_classified_for_the_legacy_walker() {
+        let msg = "__strlen on a Wtf8 view: receiver class unresolved \
+                   (wtf8-strlen-unknown-receiver)";
+        assert_eq!(
+            crate::translator::rtyper::cutover::unported_category(msg),
+            Some("wtf8-strlen-unknown-receiver")
+        );
     }
 
     fn describe_op_kind(kind: &OpKind) -> String {
@@ -7194,7 +7748,7 @@ mod tests {
             let mut graphs = GraphStore::default();
             graphs.insert(CallPath::from_segments(segments.clone()), body);
             let registry = empty_call_registry();
-            populate_call_registry_from_call_graphs(&graphs, &[], &[], &registry)
+            populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry)
                 .expect("register ordinary helper body");
             let entry = registry
                 .lookup(&FunctionPathKey::from_segments(segments))

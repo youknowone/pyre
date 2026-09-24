@@ -1,9 +1,4 @@
 # pyre-check: max-pypy-ratio=45
-# pyre-check: max-wasm-ratio=5.1
-# Isolated re-run reads 4.4x (wasm 1.30s / dynasm 0.30s, 3% swing both
-# sides). Topology matches dynasm: 6 loops, 5 bridges, 1046 guard
-# failures. 5.1x is 4.4x plus WASM_RATIO_FIT_HEADROOM (15%). The 4x
-# default ceiling is not raised.
 # pyre-check: spec-folds=format_simple,convert_value,format_with_spec,format_with_spec_int,build_string,str_startswith,str_endswith
 # Merged synth parity smoke suite: independent feature-level hot loops, each
 # kept from its former standalone file with module-level names prefixed by the

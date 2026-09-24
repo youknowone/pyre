@@ -75,7 +75,7 @@ pub fn resolve_types(graph: &FunctionGraph) {
         if let Some(rc_some) = ann.as_ref() {
             let vtype = somevalue_to_valuetype(rc_some);
             let concrete = valuetype_to_concrete(&vtype);
-            FunctionGraph::set_concretetype_of_inline(&var, concrete);
+            commit_concretetype(&var, concrete);
         }
     }
 
@@ -92,7 +92,7 @@ pub fn resolve_types(graph: &FunctionGraph) {
                     .unwrap_or(crate::model::ValueType::Unknown);
                 let concrete = valuetype_to_concrete(&vtype);
                 if concrete != ConcreteType::Unknown {
-                    FunctionGraph::set_concretetype_of_inline(var, concrete);
+                    commit_concretetype(var, concrete);
                 }
             }
         }
@@ -108,7 +108,7 @@ pub fn resolve_types(graph: &FunctionGraph) {
                     // Float inference for `float_add` / `float_neg` /
                     // etc. produced by jtransform's float-operand
                     // rewrite arm.
-                    crate::model::FunctionGraph::set_concretetype_of_inline(result_var, inferred);
+                    commit_concretetype(result_var, inferred);
                 }
             }
         }
@@ -539,6 +539,25 @@ fn link_arg_concrete_type(src: &LinkArg) -> ConcreteType {
             None => const_value_to_concrete(&value.value),
         },
     }
+}
+
+/// A raw `Ptr(Array)` (`CArrayPtr` / `CCHARP`) is the concretetype
+/// `direct_ptradd` scales by. A later kind-only commit (`Signed` or
+/// `GcRef`) must not replace it with the canonical scalar.
+fn commit_concretetype(var: &Variable, concrete: ConcreteType) {
+    if var.concretetype().as_ref().is_some_and(|ty| {
+        matches!(
+            ty,
+            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Ptr(ptr)
+                if matches!(
+                    ptr.TO,
+                    crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Array(_)
+                )
+        )
+    }) {
+        return;
+    }
+    FunctionGraph::set_concretetype_of_inline(var, concrete);
 }
 
 fn maybe_seed_concrete_type(dst: &Variable, src_ty: ConcreteType) -> bool {

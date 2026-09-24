@@ -2291,7 +2291,7 @@ fn build_gc() -> Box<MiniMarkGC> {
         w_tuple_tid,
     );
     // Each arity-2 specialisation gets its own `ob_type`, so bind each to its
-    // own typeid. `cls_of_gcref` reads that `ob_type`, and without a binding
+    // own typeid. `bh_classof` reads that `ob_type`, and without a binding
     // `subclass_range` cannot answer for it — which makes
     // `protect_speculative_field` reject any pure field fold on a constant
     // specialised tuple and invalidate the loop rather than decline the fold.

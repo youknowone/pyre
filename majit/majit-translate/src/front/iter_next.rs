@@ -1250,8 +1250,8 @@ fn rewire_one_next_site(
             graph,
             some_target.0,
             &item_in_some,
-            &pair_in_some,
             &item_ty,
+            &pair_in_some,
             &name,
         )?;
     } else {

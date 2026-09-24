@@ -12659,7 +12659,7 @@ impl<M: Clone> MetaInterp<M> {
             // pointer width: an i64 read on a 32-bit target would pull the
             // adjacent header word into the high half and the class value
             // would never compare equal to a pointer-width one
-            // (`Cpu::cls_of_gcref`, `jit_exc_raise`).
+            // (`Cpu::bh_classof`, `jit_exc_raise`).
             unsafe { *(result.exception_value.0 as *const usize) as i64 }
         };
         let exception = ExceptionState {

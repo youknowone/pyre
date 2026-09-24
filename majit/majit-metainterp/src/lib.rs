@@ -134,11 +134,10 @@ pub mod history;
 pub mod intrinsics;
 pub(crate) mod io_buffer;
 pub mod jit;
-/// Embedder-supplied JIT knobs (`PYRE_NO_JIT`, `MAJIT_NO_BRIDGE`) for a
-/// platform that hands the process no environment. No same-named upstream
-/// file: the collector's `GC_ENV_NAMES` / `set_supplied_env` pair is the
-/// shape this copies, and both `pyre-jit` and this crate have to share one
-/// table without a new dependency edge.
+/// Pyre-only JIT debug knobs. They read [`majit_ir::environ`], the one
+/// environment the collector reads too. Real JIT parameters
+/// (`threshold`, `enable_opts`, …) go through `set_user_param` /
+/// `WarmEnterState.set_param_*`, not through this module.
 pub mod jit_env;
 mod jit_state;
 pub mod jitcode;

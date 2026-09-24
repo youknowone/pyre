@@ -22,10 +22,11 @@
 //!
 //! The harvested [`DeclinedFunDecl`] has path, scalar lltypes, and the
 //! decline reason; it has no body.  The harvest lives in `front::mir`
-//! and does not attach one.  The gate therefore requires:
+//! and does not attach one.  The decline string is not a gate: the MIR
+//! loop already records an ordered load on `ordered_atomic_load_reasons`.
+//! The gate therefore requires:
 //!
 //! - no translatable body
-//! - the ordered-load decline (not some other omitted body)
 //! - zero arguments (a process-global cell; a pointer argument is a
 //!   visitor / method, not this reader)
 //! - an unsigned scalar result (`u32` is in `residual_scalar!`; `Void`
@@ -35,37 +36,52 @@
 //!   process-global cell
 //!
 //! A pointer argument (`walk_*` GC visitors, `w_type_get_version_tag`'s
-//! receiver) or a compound result is not an external.  A body that
-//! failed for any other reason is also refused.
+//! receiver) or a compound result is not an external.  A path outside
+//! [`WORD_LOAD_LLEXTERNALS`] is refused whatever the decline string says.
 //!
 //! The result is never a translation-time constant: the GC type id is
 //! published at runtime, so the stub annotation is a non-const scalar
 //! (`SomeInteger` with no `const_box`).
 
-use std::cell::RefCell;
-
 use super::super::lltype::LowLevelType;
 use crate::translator::rtyper::extfunc::ExternalAnnotation;
 
-thread_local! {
-    /// Per-pipeline harvest of [`DeclinedFunDecl`] rows, replaced each
-    /// `build_semantic_program_via_active_frontend` invocation the same
-    /// way `register_foldable_const_lits` replaces its literal set.
-    /// `populate_call_registry_from_call_graphs` reads this slot because
-    /// the decls are not a `CallControl` / `SemanticProgram` field.
-    static HARVESTED_ATOMIC_LOAD_DECLS: RefCell<Vec<DeclinedFunDecl>> =
-        const { RefCell::new(Vec::new()) };
+/// One word-only reader declared as `llexternal`, with the effect kwargs
+/// on the external (`rffi.py` `llexternal`).
+pub struct WordLoadLlexternal {
+    pub segments: &'static [&'static str],
+    pub random_effects_on_gcobjs: bool,
+    pub releasegil: bool,
 }
 
-/// Replace this thread's harvested Acquire-load declarations.
-pub fn register_harvested_atomic_load_decls(decls: Vec<DeclinedFunDecl>) {
-    HARVESTED_ATOMIC_LOAD_DECLS.with(|slot| *slot.borrow_mut() = decls);
-}
-
-/// Clone of the harvested Acquire-load declarations for this pipeline.
-pub fn harvested_atomic_load_decls() -> Vec<DeclinedFunDecl> {
-    HARVESTED_ATOMIC_LOAD_DECLS.with(|slot| slot.borrow().clone())
-}
+/// Pure word loads. Effect facts live here, not in a name filter over
+/// declined bodies.
+pub const WORD_LOAD_LLEXTERNALS: &[WordLoadLlexternal] = &[
+    WordLoadLlexternal {
+        segments: &["pyre_object", "lowlevel_string", "lowlevel_str_gc_type_id"],
+        random_effects_on_gcobjs: false,
+        releasegil: false,
+    },
+    WordLoadLlexternal {
+        segments: &[
+            "pyre_object",
+            "lowlevel_string",
+            "lowlevel_unicode_gc_type_id",
+        ],
+        random_effects_on_gcobjs: false,
+        releasegil: false,
+    },
+    WordLoadLlexternal {
+        segments: &["pyre_object", "rbuilder", "stringbuilder_gc_type_id"],
+        random_effects_on_gcobjs: false,
+        releasegil: false,
+    },
+    WordLoadLlexternal {
+        segments: &["pyre_object", "rbuilder", "stringpiece_gc_type_id"],
+        random_effects_on_gcobjs: false,
+        releasegil: false,
+    },
+];
 
 /// Needle of the `LowerError::Unsupported` Display string
 /// `build_semantic_program` records in its local `skipped` vec.
@@ -100,12 +116,6 @@ impl AtomicLoadLlexternal {
     }
 }
 
-/// True when `reason` is the MIR loop's ordered-load refusal, not some
-/// other omitted body.
-pub fn is_atomic_load_ordering_decline(reason: &str) -> bool {
-    reason.contains(ATOMIC_LOAD_ORDERING_DECLINE)
-}
-
 /// Scalar ABI the residual call can return in one word.
 ///
 /// Matches the primitive tokens `residual_return_shell` can model
@@ -126,49 +136,14 @@ pub fn is_external_scalar_lltype(lltype: &LowLevelType) -> bool {
     )
 }
 
-/// Hand-audited word-only Acquire readers.  Each body's Rust source is
-/// exactly `AtomicU32::load(Acquire)` of a process-global cell and a
-/// return of that word — no allocation, collection, blocking, or thread
-/// creation.  `ExtFuncEntry` has no `random_effects_on_gcobjs` /
-/// `releasegil` / `threadsafe` (`rffi.py` `llexternal`), so a
-/// signature-only residual is only sound for a function with that
-/// property.  The harvest does not attach a body, so the declaration
-/// cannot prove it; these four were verified by reading the functions:
+/// Whether `decl` is a word-only reader the residual ABI can call.
 ///
-/// - `lowlevel_string::lowlevel_str_gc_type_id`
-/// - `lowlevel_string::lowlevel_unicode_gc_type_id`
-/// - `rbuilder::stringbuilder_gc_type_id`
-/// - `rbuilder::stringpiece_gc_type_id`
-const VERIFIED_WORD_ONLY_ATOMIC_READERS: &[&[&str]] = &[
-    &["pyre_object", "lowlevel_string", "lowlevel_str_gc_type_id"],
-    &[
-        "pyre_object",
-        "lowlevel_string",
-        "lowlevel_unicode_gc_type_id",
-    ],
-    &["pyre_object", "rbuilder", "stringbuilder_gc_type_id"],
-    &["pyre_object", "rbuilder", "stringpiece_gc_type_id"],
-];
-
-fn is_verified_word_only_atomic_reader(segments: &[String]) -> bool {
-    VERIFIED_WORD_ONLY_ATOMIC_READERS.iter().any(|path| {
-        path.len() == segments.len()
-            && path
-                .iter()
-                .zip(segments.iter())
-                .all(|(want, got)| *want == got)
-    })
-}
-
-/// Whether `decl` is a word-only Acquire reader the residual ABI can
-/// call: ordered-load decline, no translatable body, zero arguments,
-/// unsigned result, and a path whose body was verified to load one
-/// word and return it.
+/// Shape is necessary but not sufficient: only the four
+/// [`WORD_LOAD_LLEXTERNALS`] rows have addresses in `jit_trace_fnaddrs`
+/// and effect facts (`random_effects_on_gcobjs=False`, `releasegil=False`).
+/// Any other bodyless zero-arg unsigned decl keeps a symbolic fnaddr.
 pub fn is_external_shaped_atomic_accessor(decl: &DeclinedFunDecl) -> bool {
     if decl.has_translatable_body {
-        return false;
-    }
-    if !is_atomic_load_ordering_decline(&decl.decline_reason) {
         return false;
     }
     if !decl.arg_lltypes.is_empty() {
@@ -177,7 +152,12 @@ pub fn is_external_shaped_atomic_accessor(decl: &DeclinedFunDecl) -> bool {
     if decl.result_lltype != LowLevelType::Unsigned {
         return false;
     }
-    is_verified_word_only_atomic_reader(&decl.segments)
+    WORD_LOAD_LLEXTERNALS.iter().any(|row| {
+        row.segments
+            .iter()
+            .copied()
+            .eq(decl.segments.iter().map(String::as_str))
+    })
 }
 
 /// Keep only the external-shaped rows of `decls`.
@@ -247,7 +227,6 @@ mod tests {
     #[test]
     fn is_external_shaped_atomic_accessor_accepts_zero_arg_unsigned_acquire_reader() {
         let decl = zero_arg_unsigned(acquire_reason(), false);
-        assert!(is_atomic_load_ordering_decline(&decl.decline_reason));
         assert!(is_external_shaped_atomic_accessor(&decl));
         let rows = collect_atomic_load_llexternals(std::slice::from_ref(&decl));
         assert_eq!(rows.len(), 1);
@@ -281,9 +260,9 @@ mod tests {
                 "{segments:?} is a verified word-only Acquire reader"
             );
         }
-        let decls: Vec<_> = VERIFIED_WORD_ONLY_ATOMIC_READERS
+        let decls: Vec<_> = WORD_LOAD_LLEXTERNALS
             .iter()
-            .map(|path| zero_arg_unsigned_at(path, acquire_reason(), false))
+            .map(|row| zero_arg_unsigned_at(row.segments, acquire_reason(), false))
             .collect();
         assert_eq!(collect_atomic_load_llexternals(&decls).len(), 4);
     }
@@ -319,6 +298,28 @@ mod tests {
         };
         assert!(!is_external_shaped_atomic_accessor(&decl));
         assert!(collect_atomic_load_llexternals(std::slice::from_ref(&decl)).is_empty());
+    }
+
+    #[test]
+    fn external_shaped_atomic_accessor_rejects_unlisted_path_and_other_decline() {
+        let decl = zero_arg_unsigned_at(
+            &["pyre_object", "gc_interp", "some_flag"],
+            "declaration-has-no-unstructured-body".to_string(),
+            false,
+        );
+        assert!(
+            !is_external_shaped_atomic_accessor(&decl),
+            "a path outside WORD_LOAD_LLEXTERNALS has no published fnaddr"
+        );
+    }
+
+    #[test]
+    fn word_load_llexternals_carry_pure_word_effect_kwargs() {
+        for row in WORD_LOAD_LLEXTERNALS {
+            assert!(!row.random_effects_on_gcobjs);
+            assert!(!row.releasegil);
+        }
+        assert_eq!(WORD_LOAD_LLEXTERNALS.len(), 4);
     }
 
     #[test]
@@ -374,11 +375,23 @@ mod tests {
     }
 
     #[test]
-    fn is_external_shaped_atomic_accessor_rejects_other_decline_reasons() {
+    fn listed_word_reader_ignores_decline_reason() {
         let setter = zero_arg_unsigned("declaration-has-no-unstructured-body".to_string(), false);
-        assert!(!is_external_shaped_atomic_accessor(&setter));
+        assert!(
+            is_external_shaped_atomic_accessor(&setter),
+            "WORD_LOAD path is admitted; the decline string is not a gate"
+        );
         let other = zero_arg_unsigned("unsupported MIR: uninitialised local 3".to_string(), false);
-        assert!(!is_external_shaped_atomic_accessor(&other));
+        assert!(is_external_shaped_atomic_accessor(&other));
+        let unlisted = zero_arg_unsigned_at(
+            &["pyre_object", "gc_interp", "some_flag"],
+            acquire_reason(),
+            false,
+        );
+        assert!(
+            !is_external_shaped_atomic_accessor(&unlisted),
+            "an Acquire decline does not admit a path outside WORD_LOAD_LLEXTERNALS"
+        );
     }
 
     #[test]
@@ -390,11 +403,11 @@ mod tests {
     #[test]
     fn collect_atomic_load_llexternals_keeps_only_external_shape() {
         let keep = zero_arg_unsigned(acquire_reason(), false);
-        let drop_reason = zero_arg_unsigned("schema decode: x".to_string(), false);
+        let other_reason = zero_arg_unsigned("schema decode: x".to_string(), false);
         let drop_body = zero_arg_unsigned(acquire_reason(), true);
-        let rows = collect_atomic_load_llexternals([&keep, &drop_reason, &drop_body]);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].segments, keep.segments);
+        let rows = collect_atomic_load_llexternals([&keep, &other_reason, &drop_body]);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.segments == keep.segments));
     }
 
     #[test]
@@ -411,17 +424,5 @@ mod tests {
             ]),
             "pyre_object.lowlevel_string.lowlevel_str_gc_type_id"
         );
-    }
-
-    #[test]
-    fn harvested_atomic_load_decls_replace_per_pipeline() {
-        let keep = zero_arg_unsigned(acquire_reason(), false);
-        register_harvested_atomic_load_decls(vec![keep.clone()]);
-        assert_eq!(harvested_atomic_load_decls(), vec![keep.clone()]);
-        register_harvested_atomic_load_decls(Vec::new());
-        assert!(harvested_atomic_load_decls().is_empty());
-        register_harvested_atomic_load_decls(vec![keep.clone()]);
-        assert_eq!(harvested_atomic_load_decls().len(), 1);
-        register_harvested_atomic_load_decls(Vec::new());
     }
 }

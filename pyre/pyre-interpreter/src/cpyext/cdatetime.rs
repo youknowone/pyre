@@ -763,18 +763,50 @@ fn declared_shape(w_type: PyObjectRef) -> Option<Shape> {
     if derived("timedelta") {
         return Some(Shape::Delta);
     }
-    // date, datetime and time share the tzinfo-word basestruct.  The date
-    // type is then sized back to the header, so a zero here is not a request
-    // for the header.
-    if derived("datetime") || derived("time") || derived("date") {
+    if derived("datetime") || derived("time") {
         return Some(Shape::WithTZInfo);
     }
     None
 }
 
+/// Exact `datetime.date`. Its typedescr basestruct is the datetime struct,
+/// because `datetime` inherits from `date`; the size a mirror publishes is
+/// the header.
+fn exact_date(w_type: PyObjectRef) -> bool {
+    let date = datetime_class("date");
+    !date.is_null() && std::ptr::eq(w_type, date)
+}
+
+/// A subclass of `date` that is not a `datetime` or a `time`.
+fn pure_date_subclass(w_type: PyObjectRef) -> bool {
+    let date = datetime_class("date");
+    if date.is_null() || std::ptr::eq(w_type, date) {
+        return false;
+    }
+    if unsafe { !crate::baseobjspace::issubtype_w(w_type, date) } {
+        return false;
+    }
+    let later = |name: &str| {
+        let class = datetime_class(name);
+        !class.is_null() && unsafe { crate::baseobjspace::issubtype_w(w_type, class) }
+    };
+    !later("datetime") && !later("time")
+}
+
 /// What `tp_basicsize` a synthesized mirror of `w_type` carries.
 pub(super) fn basicsize(w_type: PyObjectRef) -> isize {
-    declared_shape(w_type).map_or(0, Shape::size)
+    // `date` is given the datetime basestruct by its typedescr, then
+    // `_PyDateTime_Import` writes `sizeof(PyObject)` back before `datetime`
+    // is mirrored. A subclass copies the base mirror's `tp_basicsize` at the
+    // moment it is built, so the header has to already be the size on the
+    // exact `date` mirror — including when that mirror is built first.
+    if exact_date(w_type) || pure_date_subclass(w_type) {
+        return size_of::<CPyObject>() as isize;
+    }
+    if let Some(shape) = declared_shape(w_type) {
+        return shape.size();
+    }
+    0
 }
 
 /// The shape a block carries, read off its type mirror — `type_attach`

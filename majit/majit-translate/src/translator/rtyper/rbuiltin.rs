@@ -3325,16 +3325,10 @@ pub fn rtype_direct_ptradd(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) 
     use crate::translator::rtyper::rtyper::GenopResult;
 
     let r_arg = arg_repr(hop, 0)?;
-    // `assert isinstance(hop.args_r[0], rptr.PtrRepr)`.  A classdef-less
-    // raw pointer annotates as `SomeInstance` and rtypes to
-    // `InstanceRepr` (`Ptr(GcStruct(OBJECT))`); that is still a pointer
-    // operand, so the same `inputargs(ptr, Signed)` conversion applies.
-    if !matches!(
-        r_arg.repr_class_id(),
-        ReprClassId::PtrRepr | ReprClassId::InstanceRepr
-    ) {
+    // `assert isinstance(hop.args_r[0], rptr.PtrRepr)`.
+    if r_arg.repr_class_id() != ReprClassId::PtrRepr {
         return Err(TyperError::message(format!(
-            "rtype_direct_ptradd: hop.args_r[0] must be PtrRepr or InstanceRepr, got {:?}",
+            "rtype_direct_ptradd: hop.args_r[0] must be PtrRepr, got {:?}",
             r_arg.repr_class_id()
         )));
     }
@@ -5095,5 +5089,22 @@ mod tests {
         let last = llops.ops.last().expect("the llop is emitted");
         assert_eq!(result, last.result);
         assert_eq!(last.opname, "cast_ptr_to_int");
+    }
+
+    #[test]
+    fn rtype_direct_ptradd_rejects_instancerepr() {
+        use crate::translator::rtyper::rclass::{Flavor, getinstancerepr};
+
+        let hop = dummy_hop();
+        hop.rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let inst = getinstancerepr(&hop.rtyper, None, Flavor::Gc).expect("root InstanceRepr");
+        hop.args_r.borrow_mut().push(Some(inst as Arc<dyn Repr>));
+        let err = rtype_direct_ptradd(&hop, &HashMap::new()).expect_err("PtrRepr only");
+        assert!(
+            err.to_string().contains("must be PtrRepr"),
+            "rtype_direct_ptradd asserts PtrRepr, got {err}"
+        );
     }
 }

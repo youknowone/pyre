@@ -3,6 +3,7 @@ pub mod debug;
 pub mod descr;
 pub mod descr_registry;
 pub mod effectinfo;
+pub mod environ;
 pub mod eval_breaker_word;
 pub mod field_entry;
 pub mod forwarding;

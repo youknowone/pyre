@@ -791,12 +791,14 @@ pub(super) fn describe_interpreter_type(mirror: *mut CPyTypeObject, w_type: PyOb
         true => TpFlags::PY_TPFLAGS_IMMUTABLETYPE,
         false => TpFlags::empty(),
     };
-    // Compute the size while `tp_name` is still null: `declared_type_layout`
-    // treats a named block not yet in `TYPE_NAMES` as a C declaration, and
-    // this mirror has been linked but not filled.
-    let basicsize = mirror_basicsize(w_type);
+    // `type_attach` publishes `tp_name` before `tp_basicsize`. The size is
+    // the typedescr keyed by `w_type`: a named block whose size fields are
+    // still zero is not a C declaration (`declared_type_layout`).
     unsafe {
         (*mirror).tp_name = pointer;
+    }
+    let basicsize = mirror_basicsize(w_type);
+    unsafe {
         (*mirror).tp_basicsize = basicsize;
         (*mirror).tp_itemsize = mirror_itemsize(w_type);
         (*mirror).tp_flags = TpFlags::PY_TPFLAGS_DEFAULT
@@ -2516,11 +2518,18 @@ pub(crate) fn declared_type_layout(
         let tp = pyobject::as_pyobj(w_current) as *mut CPyTypeObject;
         // A mirror this layer filled describes a type pyre defines, so its
         // fields are what [`describe_interpreter_type`] synthesized rather
-        // than a declaration.  `TYPE_NAMES` holds exactly those, and a block
-        // still carrying the null `tp_name` it was declared with is one that
-        // has been linked but not yet filled -- neither is a declaration.
+        // than a declaration. `TYPE_NAMES` holds the finished ones. A block
+        // whose name is set while every size field is still zero is the
+        // mirror `type_attach` has named but not yet sized -- not a
+        // declaration either.
         let declared = !tp.is_null()
             && unsafe { !(*tp).tp_name.is_null() }
+            && unsafe {
+                (*tp).tp_basicsize != 0
+                    || (*tp).tp_itemsize != 0
+                    || (*tp).tp_dictoffset != 0
+                    || (*tp).tp_weaklistoffset != 0
+            }
             && !TYPE_NAMES.lock().contains_key(&(tp as usize));
         if declared {
             return Some(unsafe {
@@ -7071,6 +7080,31 @@ mod tests {
     #[test]
     fn spec_type_wrapper_starts_without_a_second_c_reference() {
         assert_eq!(super::allocated_type().ob_base.ob_base.ob_refcnt, 0);
+    }
+
+    /// `type_attach` publishes `tp_name` before `tp_basicsize`. A mirror named
+    /// but not yet sized is not a C declaration: the size still comes from the
+    /// typedescr keyed by `w_type`.
+    #[test]
+    fn named_unsized_mirror_keeps_typedescr_basicsize() {
+        crate::typedef::init_typeobjects();
+        let w_list = crate::typedef::gettypeobject(&pyre_object::LIST_TYPE);
+        let name = std::ffi::CString::new("isolated-layout").unwrap();
+        let mut named = super::immortal_type();
+        named.tp_name = name.as_ptr();
+        unsafe {
+            let layout = pyre_object::typeobject::w_type_get_layout_ptr(w_list);
+            let w_type = pyre_object::typeobject::w_type_new(
+                "isolated-layout",
+                pyre_object::PY_NULL,
+                std::ptr::null_mut(),
+            );
+            pyre_object::typeobject::w_type_set_layout(w_type, layout);
+            pyre_object::typeobject::w_type_set_cpy_ref(w_type, (&raw mut named).cast());
+            let sized = super::mirror_basicsize(w_type);
+            pyre_object::typeobject::w_type_set_cpy_ref(w_type, std::ptr::null_mut());
+            assert_eq!(sized, 7 * std::mem::size_of::<usize>() as isize);
+        }
     }
 
     /// Every thunk in every pool must have an address of its own.

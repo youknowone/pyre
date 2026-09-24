@@ -3814,7 +3814,9 @@ impl Repr for InstanceRepr {
         // `allinstancefields` branch above.  Reaching the fall-through for
         // `"__discriminant"` therefore means the discriminant is the
         // pointer's null-ness (`None` = null = 0, `Some` = non-null = 1), so
-        // read it as `cast_bool_to_int(ptr_nonzero(vinst))` rather than a
+        // read it as `ptr_nonzero(vinst)` cast to the result lltype:
+        // `cast_bool_to_uint` when that lltype is `Unsigned` or
+        // `UnsignedLongLong`, and `cast_bool_to_int` otherwise, rather than a
         // class field (which does not exist and rtypes to Void).  Mirrors the
         // `CanBeNull.rtype_bool` `ptr_nonzero` lowering (rmodel.py) and the
         // front-end `Discriminant` niche fold's in-place null test; the

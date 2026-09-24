@@ -203,3 +203,36 @@ fn drives_the_datetime_c_api() {
     fixtures.compile("cpyext_datetime");
     fixtures.expect_ok(SCRIPT, &[], "cpyext-datetime-ok");
 }
+
+/// A pure `date` subclass follows the shrunk date header. The tzinfo words
+/// belong to `datetime` and `time`, not to a class that only inherits `date`.
+const DATE_SUBCLASS_SCRIPT: &str = r#"
+import datetime
+import cpyext_datetime as m
+
+class D(datetime.date):
+    pass
+
+class DT(datetime.datetime):
+    pass
+
+class T(datetime.time):
+    pass
+
+date_size = m.basicsize_of(datetime.date)
+assert date_size > 0, date_size
+assert m.basicsize_of(D) == date_size, (m.basicsize_of(D), date_size)
+assert m.type_data_size(D) == 0, m.type_data_size(D)
+assert m.basicsize_of(DT) == m.basicsize_of(datetime.datetime)
+assert m.type_data_size(DT) == 0, m.type_data_size(DT)
+assert m.basicsize_of(T) == m.basicsize_of(datetime.time)
+assert m.type_data_size(T) == 0, m.type_data_size(T)
+print('date-subclass-layout-ok')
+"#;
+
+#[test]
+fn date_subclass_type_data_follows_shrunk_base() {
+    let fixtures = Fixtures::new("cpyext-datetime-date-subclass");
+    fixtures.compile("cpyext_datetime");
+    fixtures.expect_ok(DATE_SUBCLASS_SCRIPT, &[], "date-subclass-layout-ok");
+}

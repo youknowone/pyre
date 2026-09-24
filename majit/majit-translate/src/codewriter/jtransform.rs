@@ -600,6 +600,12 @@ pub struct Transformer<'a> {
     /// that producer is gone, so later `conditional_call` / indirect-call
     /// rewrites recover the callee from this map.
     fn_const_results: std::collections::HashMap<crate::flowspace::model::Variable, CallTarget>,
+    /// Pointer operand of the `direct_ptradd` currently being rewritten,
+    /// before `same_as` aliasing. `rewrite_op_same_as` drops the op and
+    /// renames uses to the original variable; the item type lives on the
+    /// pre-rename operand (`jtransform.py` `rewrite_op_direct_ptradd`
+    /// reads `op.args[0].concretetype`).
+    direct_ptradd_type_arg: Option<crate::flowspace::model::Variable>,
     notes: Vec<GraphTransformNote>,
     vable_rewrites: usize,
     calls_classified: usize,
@@ -1634,6 +1640,7 @@ impl<'a> Transformer<'a> {
             aliases: std::collections::HashMap::new(),
             cast_ptr_to_int_src: std::collections::HashMap::new(),
             fn_const_results: std::collections::HashMap::new(),
+            direct_ptradd_type_arg: None,
             notes: Vec::new(),
             vable_rewrites: 0,
             calls_classified: 0,
@@ -1783,6 +1790,10 @@ impl<'a> Transformer<'a> {
         // last operation and the elision test below does not apply.
         let mut count_before_last_operation = None;
         for original_op in &original_ops {
+            // Captured before `remap_op`: a preceding `same_as` has already
+            // been aliased onto the original pointer, whose concretetype
+            // is not the array item type the `same_as` result carried.
+            self.direct_ptradd_type_arg = direct_ptradd_type_arg(original_op);
             let op = remap_op(original_op, &self.aliases);
             self.hook_access_field(original_op, &op, graph_name, graph);
             // `jtransform.py` binds `_rewrite_symmetric` as the whole
@@ -1805,6 +1816,7 @@ impl<'a> Transformer<'a> {
                     new_ops.push(op);
                 }
             }
+            self.direct_ptradd_type_arg = None;
         }
 
         // `jtransform.py:116-118`: the block's exception exits belong to its
@@ -4054,6 +4066,28 @@ impl<'a> Transformer<'a> {
         )
     }
 
+    /// `llmemory.sizeof(concretetype.TO.OF)` as a byte count.
+    /// `CCHARP` is handled by the caller and never reaches this.
+    fn direct_ptradd_item_bytes(
+        ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+        layout: &dyn crate::translator::rtyper::lltypesystem::llmemory::OffsetLayout,
+    ) -> Option<i64> {
+        use crate::flowspace::model::ConstValue;
+        use crate::translator::rtyper::lltypesystem::llmemory;
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+
+        let LowLevelType::Ptr(ptr) = ty else {
+            return None;
+        };
+        let PtrTarget::Array(arr) = &ptr.TO else {
+            return None;
+        };
+        let ConstValue::AddressOffset(addr) = llmemory::sizeof(&arr.OF, None).ok()? else {
+            return None;
+        };
+        addr.byte_size(layout).ok()
+    }
+
     /// Recovery helper — no direct RPython precedent. Inserts
     /// `cast_ptr_to_int` for a Ref operand at an integer site.
     /// The producer is `front::mir` `BinaryOp` (`simple_call` to
@@ -4086,61 +4120,106 @@ impl<'a> Transformer<'a> {
         )
     }
 
-    /// `jtransform.py rewrite_op_direct_ptradd`.  The count is already a
-    /// byte offset (front scaled `n * sizeof(T)` when the pointee size
-    /// was known), so this is the `CCHARP` arm: `int_add` of the
-    /// address integer and the shift.  Raw pointers are Ref here, so
-    /// the add is `cast_ptr_to_int` + `int_add` + `cast_int_to_ptr`
-    /// rather than `int_add` of two ints — each alias stays inside one
-    /// bank (`value_type_bank`).
+    /// `Transformer.rewrite_op_direct_ptradd` (`jtransform.py`).
+    ///
+    /// A non-`CCHARP` pointer scales the count by `llmemory.sizeof(TO.OF)`.
+    /// The pointer and the shift then meet in one `int_add` whose result
+    /// stays a raw pointer (int kind).
     fn rewrite_op_direct_ptradd(
         &mut self,
         op: &SpaceOperation,
         args: &[crate::flowspace::model::Variable],
-        result_ty: &ValueType,
+        _result_ty: &ValueType,
         graph: &mut FunctionGraph,
     ) -> RewriteResult {
         let [ptr, shift] = args else {
             return RewriteResult::Keep;
         };
-        let (addr, mut ops) = self.coerce_operand_to_int(graph, ptr);
-        let (shift_i, shift_ops) = self.coerce_operand_to_int(graph, shift);
-        ops.extend(shift_ops);
-        if matches!(result_ty, ValueType::Ref(_)) {
-            let sum = self.fresh_synthetic_variable_typed(
+        // `Unknown` is reported as `'r'` by `get_value_kind_var`, but an
+        // unstamped count is still the `Signed` index. Only a real GC
+        // pointer cannot be the shift.
+        if matches!(
+            FunctionGraph::concretetype_of(shift),
+            crate::codewriter::type_state::ConcreteType::GcRef
+        ) {
+            return RewriteResult::Keep;
+        }
+        // The value added is the renamed pointer. The item type is the
+        // one `op.args[0]` had before that rename.
+        let ptr_ty = self
+            .direct_ptradd_type_arg
+            .as_ref()
+            .and_then(|typed| typed.concretetype())
+            .or_else(|| ptr.concretetype());
+        let is_ccharp = ptr_ty
+            .as_ref()
+            .is_some_and(|ty| ty == &*crate::translator::rtyper::lltypesystem::rffi::CCHARP);
+        let mut shift_v = shift.clone();
+        let mut ops = Vec::new();
+        if !is_ccharp {
+            struct NoLayout;
+            impl crate::translator::rtyper::lltypesystem::llmemory::OffsetLayout for NoLayout {
+                fn field_offset(&self, _struct_name: &str, _fldname: &str) -> Option<i64> {
+                    None
+                }
+                fn struct_size(&self, _struct_name: &str) -> Option<i64> {
+                    None
+                }
+            }
+            let no_layout = NoLayout;
+            let layout: &dyn crate::translator::rtyper::lltypesystem::llmemory::OffsetLayout =
+                match self.callcontrol.as_deref() {
+                    Some(cc) => cc,
+                    None => &no_layout,
+                };
+            let Some(by) = ptr_ty
+                .as_ref()
+                .and_then(|ty| Self::direct_ptradd_item_bytes(ty, layout))
+            else {
+                return RewriteResult::Keep;
+            };
+            let c_by = self.fresh_synthetic_variable_typed(
                 graph,
                 crate::codewriter::type_state::ConcreteType::Signed,
             );
             ops.push(SpaceOperation {
-                result: Some(sum.clone()),
+                result: Some(c_by.clone()),
+                kind: OpKind::ConstInt(by),
+            });
+            let prod = self.fresh_synthetic_variable_typed(
+                graph,
+                crate::codewriter::type_state::ConcreteType::Signed,
+            );
+            ops.push(SpaceOperation {
+                result: Some(prod.clone()),
                 kind: OpKind::BinOp {
-                    op: "add".to_string(),
-                    lhs: addr,
-                    rhs: shift_i,
+                    op: "int_mul".to_string(),
+                    lhs: shift.clone(),
+                    rhs: c_by,
                     result_ty: ValueType::Int,
                 },
             });
-            self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
-            ops.push(SpaceOperation {
-                result: op.result.clone(),
-                kind: OpKind::UnaryOp {
-                    op: "cast_int_to_ptr".into(),
-                    operand: sum,
-                    result_ty: result_ty.clone(),
-                },
-            });
-        } else {
-            self.stamp_value_kind_from_value_type(graph, op.result.clone(), &ValueType::Int);
-            ops.push(SpaceOperation {
-                result: op.result.clone(),
-                kind: OpKind::BinOp {
-                    op: "add".to_string(),
-                    lhs: addr,
-                    rhs: shift_i,
-                    result_ty: ValueType::Int,
-                },
-            });
+            shift_v = prod;
         }
+        if let Some(result) = op.result.clone() {
+            if let Some(ty) = ptr_ty.clone() {
+                result.set_concretetype(Some(ty));
+            }
+            self.stamp_value_kind(
+                graph,
+                Some(result),
+                crate::codewriter::type_state::ConcreteType::Signed,
+            );
+        }
+        ops.push(SpaceOperation {
+            result: op.result.clone(),
+            kind: OpKind::BinOp {
+                op: "int_add".to_string(),
+                lhs: ptr.clone(),
+                rhs: shift_v,
+                result_ty: ValueType::Int,
+            },
+        });
         RewriteResult::Replace(ops)
     }
 
@@ -5149,7 +5228,32 @@ impl<'a> Transformer<'a> {
                 return RewriteResult::Identity(src);
             }
             if is_lltype_cast_path(segments, "direct_ptradd") && args.len() == 2 {
-                return self.rewrite_op_direct_ptradd(op, args, result_ty, graph);
+                let rewritten = self.rewrite_op_direct_ptradd(op, args, result_ty, graph);
+                // An unsized pointee has no `TO.OF`. Drop the call: a
+                // residual to `lltype.direct_ptradd` has no function
+                // address, and `Keep` would assemble as `direct_call_*`.
+                if matches!(rewritten, RewriteResult::Keep) {
+                    // An unsized pointee has no `TO.OF`. A residual to
+                    // `lltype.direct_ptradd` has no function address.
+                    // No result to leave undefined. A used result stays
+                    // defined for register allocation, but the call must
+                    // not run: abort first, then keep the original op.
+                    if op.result.is_none() {
+                        return RewriteResult::Replace(Vec::new());
+                    }
+                    return RewriteResult::Replace(vec![
+                        SpaceOperation {
+                            result: None,
+                            kind: OpKind::Abort {
+                                kind: crate::model::UnknownKind::UnsupportedExpr {
+                                    variant: crate::model::UnsupportedExprKind::RawAddr,
+                                },
+                            },
+                        },
+                        op.clone(),
+                    ]);
+                }
+                return rewritten;
             }
             if is_lltype_cast_path(segments, "cast_int_to_ptr")
                 && args.len() == 1
@@ -10291,6 +10395,23 @@ fn is_lltype_cast_path(segments: &[String], name: &str) -> bool {
     path_segments_end_with(segments, &["lltype", name])
 }
 
+/// `direct_ptradd`'s pointer argument as the front emitted it, before
+/// `same_as` renaming. Its `concretetype` is `TO.OF`.
+fn direct_ptradd_type_arg(op: &SpaceOperation) -> Option<crate::flowspace::model::Variable> {
+    let OpKind::Call { target, args, .. } = &op.kind else {
+        return None;
+    };
+    let crate::model::CallTarget::FunctionPath { segments, .. } = target else {
+        return None;
+    };
+    if !is_lltype_cast_path(segments, "direct_ptradd") || args.len() != 2 {
+        return None;
+    }
+    args.first()
+        .and_then(crate::model::LinkArg::as_variable)
+        .cloned()
+}
+
 /// Project a 1-arg host call to the unary llop the rtyper would have
 /// emitted (`Float2LongLongEntry.specialize_call`,
 /// `rewrite_op_cast_ptr_to_int`).
@@ -14482,7 +14603,9 @@ mod tests {
                 true,
             )
             .unwrap();
-        FunctionGraph::set_concretetype_of_inline(&ptr, ConcreteType::GcRef);
+        ptr.set_concretetype(Some(
+            crate::translator::rtyper::lltypesystem::rffi::CCHARP.clone(),
+        ));
         let shift = graph
             .push_op_var(
                 graph.startblock,
@@ -14537,26 +14660,17 @@ mod tests {
                 assert!(
                     ops.iter().any(|op| matches!(
                         &op.kind,
-                        OpKind::UnaryOp { op, operand, result_ty: ty }
-                            if op == "cast_ptr_to_int" && operand == &ptr && *ty == ValueType::Int
+                        OpKind::BinOp { op, lhs, rhs, result_ty: ty }
+                            if op == "int_add" && lhs == &ptr && rhs == &shift && *ty == ValueType::Int
                     )),
-                    "direct_ptradd must take the address integer first; ops={ops:?}"
+                    "CCHARP direct_ptradd is one int_add; ops={ops:?}"
                 );
                 assert!(
-                    ops.iter().any(|op| matches!(
+                    !ops.iter().any(|op| matches!(
                         &op.kind,
-                        OpKind::BinOp { op, result_ty: ty, .. }
-                            if op == "add" && *ty == ValueType::Int
+                        OpKind::UnaryOp { op, .. } if op == "cast_ptr_to_int" || op == "cast_int_to_ptr"
                     )),
-                    "direct_ptradd must int_add the byte offset; ops={ops:?}"
-                );
-                assert!(
-                    ops.iter().any(|op| matches!(
-                        &op.kind,
-                        OpKind::UnaryOp { op, result_ty: ty, .. }
-                            if op == "cast_int_to_ptr" && *ty == ValueType::Ref(None)
-                    )),
-                    "direct_ptradd must restore the Ref bank; ops={ops:?}"
+                    "direct_ptradd must not cast the address into a GC ref; ops={ops:?}"
                 );
                 assert!(
                     !ops.iter()
@@ -14564,6 +14678,571 @@ mod tests {
                     "direct_ptradd must not residualize; ops={ops:?}"
                 );
             }
+            RewriteResult::Keep => panic!("direct_ptradd must rewrite, got Keep"),
+            RewriteResult::Identity(_) => panic!("direct_ptradd must rewrite, got Identity"),
+        }
+    }
+
+    /// `Transformer.rewrite_op_direct_ptradd`: a `CCHARP` shift is already
+    /// in bytes, so the rewrite is one `int_add` into an int-kind result.
+    #[test]
+    fn direct_ptradd_ccharp_is_int_add_not_a_ref_cast() {
+        use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+
+        let (ops, result) = rewrite_direct_ptradd_of((*CCHARP).clone(), ValueType::Ref(None));
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, .. } if op == "cast_ptr_to_int" || op == "cast_int_to_ptr"
+            )),
+            "raw pointer add must not cast through a GC ref; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::BinOp { op, lhs, rhs, result_ty }
+                    if op == "int_add"
+                        && lhs == &result.0
+                        && rhs == &result.1
+                        && *result_ty == ValueType::Int
+            )),
+            "CCHARP direct_ptradd is int_add of the pointer and the shift; ops={ops:?}"
+        );
+        let out = ops.last().and_then(|op| op.result.as_ref()).unwrap();
+        assert_eq!(
+            FunctionGraph::concretetype_of(out),
+            ConcreteType::Signed,
+            "a raw pointer result is int kind"
+        );
+    }
+
+    /// Non-`CCHARP` item pointers scale the count by `sizeof(TO.OF)`
+    /// before the same `int_add`.
+    #[test]
+    fn direct_ptradd_non_char_multiplies_by_item_size() {
+        use crate::translator::rtyper::lltypesystem::rffi::SIGNEDP;
+
+        let (ops, (ptr, shift)) = rewrite_direct_ptradd_of((*SIGNEDP).clone(), ValueType::Int);
+        let mul = ops.iter().find(|op| {
+            matches!(&op.kind, OpKind::BinOp { op, lhs, .. } if op == "int_mul" && lhs == &shift)
+        });
+        let Some(mul) = mul else {
+            panic!("non-char direct_ptradd must int_mul the shift; ops={ops:?}");
+        };
+        let prod = mul.result.clone().unwrap();
+        let scale = match &mul.kind {
+            OpKind::BinOp { rhs, .. } => rhs.clone(),
+            _ => unreachable!(),
+        };
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::ConstInt(n) if op.result.as_ref() == Some(&scale) && *n == 8)),
+            "sizeof(Signed) is the scale; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::BinOp { op, lhs, rhs, result_ty }
+                    if op == "int_add" && lhs == &ptr && rhs == &prod && *result_ty == ValueType::Int
+            )),
+            "the scaled shift is int_add-ed onto the pointer; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, .. } if op == "cast_ptr_to_int" || op == "cast_int_to_ptr"
+            )),
+            "ops={ops:?}"
+        );
+    }
+
+    /// `*const usize` + n scales by the word, then adds.
+    #[test]
+    fn direct_ptradd_of_usize_multiplies_by_word_then_adds() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let ty = crate::front::mir::lltype_for_direct_ptradd_pointer(
+            Some(LowLevelType::Signed),
+            &LowLevelType::Signed,
+        );
+        let (ops, (ptr, shift)) = rewrite_direct_ptradd_of(ty, ValueType::Int);
+        let mul = ops.iter().find(|op| {
+            matches!(&op.kind, OpKind::BinOp { op, lhs, .. } if op == "int_mul" && lhs == &shift)
+        });
+        let Some(mul) = mul else {
+            panic!("*const usize direct_ptradd must int_mul; ops={ops:?}");
+        };
+        let prod = mul.result.clone().unwrap();
+        let scale = match &mul.kind {
+            OpKind::BinOp { rhs, .. } => rhs.clone(),
+            _ => unreachable!(),
+        };
+        assert!(
+            ops.iter().any(|op| {
+                matches!(&op.kind, OpKind::ConstInt(n) if op.result.as_ref() == Some(&scale) && *n == 8)
+            }),
+            "sizeof(usize) is 8; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::BinOp { op, lhs, rhs, .. }
+                    if op == "int_add" && lhs == &ptr && rhs == &prod
+            )),
+            "scaled shift is int_add-ed; ops={ops:?}"
+        );
+    }
+
+    /// A 4-byte target word sizes a `Signed` item as 4. The host `usize`
+    /// is 8; the layout's word is what `sizeof` resolves.
+    #[test]
+    fn direct_ptradd_signed_item_uses_layout_word_bytes() {
+        use crate::translator::rtyper::lltypesystem::llmemory::OffsetLayout;
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+
+        struct Word4;
+        impl OffsetLayout for Word4 {
+            fn field_offset(&self, _struct_name: &str, _fldname: &str) -> Option<i64> {
+                None
+            }
+            fn struct_size(&self, _struct_name: &str) -> Option<i64> {
+                None
+            }
+            fn word_bytes(&self) -> i64 {
+                4
+            }
+        }
+        let ty = crate::front::mir::lltype_for_direct_ptradd_pointer(None, &LowLevelType::Signed);
+        assert_eq!(
+            Transformer::direct_ptradd_item_bytes(&ty, &Word4),
+            Some(4),
+            "Signed item on a 4-byte target is 4, not the host word"
+        );
+    }
+
+    /// `same_as` is removed and its uses rename to the original pointer.
+    /// The item type stamped on the `same_as` result still scales the add.
+    #[test]
+    fn direct_ptradd_scales_same_as_item_type_after_rename() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+
+        let item = LowLevelType::Signed;
+        let typed =
+            crate::front::mir::lltype_for_direct_ptradd_pointer(Some((*CCHARP).clone()), &item);
+        let mut graph = FunctionGraph::new("direct_ptradd_same_as_item");
+        let original = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "ptr".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        original.set_concretetype(Some((*CCHARP).clone()));
+        let typed_ptr = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::UnaryOp {
+                    op: "same_as".into(),
+                    operand: original.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        typed_ptr.set_concretetype(Some(typed));
+        let shift = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "n".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&shift, ConcreteType::Signed);
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path([
+                        "rpython",
+                        "rtyper",
+                        "lltypesystem",
+                        "lltype",
+                        "direct_ptradd",
+                    ]),
+                    args: crate::model::call_args(vec![typed_ptr, shift.clone()]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result));
+
+        let transformed = transform_graph(&graph, &GraphTransformConfig::default());
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        let scale = crate::layout::target_word_size() as i64;
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op.kind, OpKind::ConstInt(n) if n == scale)),
+            "same_as item type Signed must scale by {scale}; ops={ops:?}"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, lhs, .. } if op == "int_mul" && lhs == &shift)),
+            "full transform must int_mul the shift; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as")),
+            "same_as is still removed; ops={ops:?}"
+        );
+    }
+
+    /// `*const u8` + n is one `int_add` (`CCHARP` is already a byte offset).
+    #[test]
+    fn direct_ptradd_of_u8_is_one_int_add() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+        let ty = crate::front::mir::lltype_for_direct_ptradd_pointer(
+            Some(LowLevelType::Signed),
+            &LowLevelType::Char,
+        );
+        assert_eq!(ty, *CCHARP);
+        let (ops, (ptr, shift)) = rewrite_direct_ptradd_of(ty, ValueType::Int);
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "int_mul")),
+            "*const u8 must not scale; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::BinOp { op, lhs, rhs, .. }
+                    if op == "int_add" && lhs == &ptr && rhs == &shift
+            )),
+            "*const u8 is one int_add; ops={ops:?}"
+        );
+    }
+
+    /// An unsized pointee cannot be scaled. The call is dropped: no residual
+    /// to `direct_ptradd`, and no `OpKind::Call` left behind.
+    #[test]
+    fn direct_ptradd_of_unknown_pointee_declines() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            LowLevelType, OpaqueType, Ptr, PtrTarget,
+        };
+
+        let ptr_ty = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Opaque(OpaqueType::gc("not_an_array")),
+        }));
+        let mut graph = FunctionGraph::new("direct_ptradd_unknown");
+        let ptr = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "ptr".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        ptr.set_concretetype(Some(ptr_ty));
+        let shift = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "n".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&shift, ConcreteType::Signed);
+        let target = CallTarget::function_path([
+            "rpython",
+            "rtyper",
+            "lltypesystem",
+            "lltype",
+            "direct_ptradd",
+        ]);
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![ptr.clone(), shift.clone()]),
+                result_ty: ValueType::Int,
+            },
+        };
+        let mut cc = crate::call::CallControl::new();
+        let rewritten = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .rewrite_op_direct_call(
+                &op,
+                &target,
+                &[ptr, shift],
+                &ValueType::Int,
+                "direct_ptradd_unknown",
+                &mut graph,
+            );
+        let RewriteResult::Replace(ops) = rewritten else {
+            panic!("unknown pointee must drop the call");
+        };
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op.kind, OpKind::CallResidual { .. } | OpKind::Call { .. })),
+            "ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn direct_ptradd_of_unknown_pointee_with_result_aborts() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            LowLevelType, OpaqueType, Ptr, PtrTarget,
+        };
+
+        let ptr_ty = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Opaque(OpaqueType::gc("not_an_array")),
+        }));
+        let mut graph = FunctionGraph::new("direct_ptradd_unknown_result");
+        let ptr = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "ptr".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        ptr.set_concretetype(Some(ptr_ty));
+        let shift = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "n".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&shift, ConcreteType::Signed);
+        let result = graph.alloc_value_var();
+        let target = CallTarget::function_path([
+            "rpython",
+            "rtyper",
+            "lltypesystem",
+            "lltype",
+            "direct_ptradd",
+        ]);
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![ptr.clone(), shift.clone()]),
+                result_ty: ValueType::Int,
+            },
+        };
+        let mut cc = crate::call::CallControl::new();
+        let rewritten = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .rewrite_op_direct_call(
+                &op,
+                &target,
+                &[ptr, shift],
+                &ValueType::Int,
+                "direct_ptradd_unknown_result",
+                &mut graph,
+            );
+        let RewriteResult::Replace(ops) = rewritten else {
+            panic!("a used unsized direct_ptradd must abort, not Keep");
+        };
+        assert!(
+            matches!(
+                ops.first().map(|op| &op.kind),
+                Some(OpKind::Abort {
+                    kind: crate::model::UnknownKind::UnsupportedExpr {
+                        variant: crate::model::UnsupportedExprKind::RawAddr,
+                    }
+                })
+            ),
+            "ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(&op.kind, OpKind::Call { .. })),
+            "the original op stays defined for register allocation; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn direct_ptradd_struct_array_scales_by_callcontrol_size() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget, Struct,
+        };
+        use std::collections::HashMap;
+
+        let name = "direct_ptradd_fixture::Point";
+        let sid = majit_ir::descr::StructId::from_canonical(name);
+        let mut ids = HashMap::new();
+        ids.insert(name.to_string(), Some(sid));
+        let _registry = crate::test_support::register_struct_ids_serialized(ids);
+        let ptr_ty = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::new(LowLevelType::Struct(Box::new(Struct::new(
+                name,
+                vec![],
+            ))))),
+        }));
+        let mut graph = FunctionGraph::new("direct_ptradd_struct");
+        let ptr = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "ptr".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        ptr.set_concretetype(Some(ptr_ty));
+        let shift = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "n".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&shift, ConcreteType::Signed);
+        let target = CallTarget::function_path([
+            "rpython",
+            "rtyper",
+            "lltypesystem",
+            "lltype",
+            "direct_ptradd",
+        ]);
+        let op = SpaceOperation {
+            result: Some(graph.alloc_value_var()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![ptr.clone(), shift.clone()]),
+                result_ty: ValueType::Int,
+            },
+        };
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            sid,
+            crate::call::StructLayout {
+                size: 12,
+                fields: vec![],
+            },
+        );
+        let rewritten = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .rewrite_op_direct_call(
+                &op,
+                &target,
+                &[ptr, shift],
+                &ValueType::Int,
+                "direct_ptradd_struct",
+                &mut graph,
+            );
+        let RewriteResult::Replace(ops) = rewritten else {
+            panic!("struct direct_ptradd must scale by the registered size");
+        };
+        assert!(
+            ops.iter().any(|op| matches!(op.kind, OpKind::ConstInt(12))),
+            "ops={ops:?}"
+        );
+    }
+
+    fn rewrite_direct_ptradd_of(
+        ptr_ty: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+        result_ty: ValueType,
+    ) -> (
+        Vec<SpaceOperation>,
+        (
+            crate::flowspace::model::Variable,
+            crate::flowspace::model::Variable,
+        ),
+    ) {
+        let mut graph = FunctionGraph::new("direct_ptradd_item");
+        let ptr = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "ptr".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        ptr.set_concretetype(Some(ptr_ty));
+        let shift = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "n".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&shift, ConcreteType::Signed);
+        let target = CallTarget::function_path([
+            "rpython",
+            "rtyper",
+            "lltypesystem",
+            "lltype",
+            "direct_ptradd",
+        ]);
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: target.clone(),
+                    args: crate::model::call_args(vec![ptr.clone(), shift.clone()]),
+                    result_ty: result_ty.clone(),
+                },
+                true,
+            )
+            .unwrap();
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: OpKind::Call {
+                target,
+                args: crate::model::call_args(vec![ptr.clone(), shift.clone()]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        let rewritten = Transformer::new(&GraphTransformConfig::default()).rewrite_op_direct_call(
+            &op,
+            match &op.kind {
+                OpKind::Call { target, .. } => target,
+                _ => unreachable!(),
+            },
+            &[ptr.clone(), shift.clone()],
+            &result_ty,
+            "direct_ptradd_item",
+            &mut graph,
+        );
+        match rewritten {
+            RewriteResult::Replace(ops) => (ops, (ptr, shift)),
             RewriteResult::Keep => panic!("direct_ptradd must rewrite, got Keep"),
             RewriteResult::Identity(_) => panic!("direct_ptradd must rewrite, got Identity"),
         }

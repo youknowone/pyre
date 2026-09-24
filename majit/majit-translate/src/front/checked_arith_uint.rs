@@ -118,8 +118,52 @@ impl UintArith {
 /// erases the source width, so retain the literal atom at the capture
 /// gate: a narrow `u8`/`u16`/`u32` overflow is not necessarily a word
 /// overflow.
+///
+/// `Unsigned` (`unsigned_repr`, `uint_*`) is the machine word: `usize`,
+/// and `u64` only when that word is 8 bytes. `u64` on a 4-byte target is
+/// `UnsignedLongLong` (`unsignedlonglong_repr`, `ullong_*`).
+pub(crate) fn is_word_sized_uint_atom_for(atom: &str, word_bytes: usize) -> bool {
+    match atom {
+        "Usize" => true,
+        "U64" => word_bytes == 8,
+        _ => false,
+    }
+}
+
+/// `Signed` max for a `word_bytes`-wide machine word (`sys.maxint`).
+pub(crate) fn signed_word_max(word_bytes: usize) -> i64 {
+    match word_bytes {
+        8 => i64::MAX,
+        4 => i32::MAX as i64,
+        other => {
+            let bits = other.saturating_mul(8);
+            if bits == 0 || bits >= 64 {
+                i64::MAX
+            } else {
+                (1i64 << (bits - 1)) - 1
+            }
+        }
+    }
+}
+
+/// `Unsigned` max for a `word_bytes`-wide machine word.
+pub(crate) fn unsigned_word_max(word_bytes: usize) -> u64 {
+    match word_bytes {
+        8 => u64::MAX,
+        4 => u32::MAX as u64,
+        other => {
+            let bits = other.saturating_mul(8);
+            if bits == 0 || bits >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << bits) - 1
+            }
+        }
+    }
+}
+
 pub(crate) fn is_word_sized_uint_atom(atom: &str) -> bool {
-    matches!(atom, "U64") || (atom == "Usize" && crate::layout::target_word_size() == 8)
+    is_word_sized_uint_atom_for(atom, crate::layout::target_word_size())
 }
 
 /// Destination `Option<Self>` payload first (covers both-const
@@ -317,11 +361,24 @@ mod tests {
         for atom in ["U8", "U16", "U32", "U128"] {
             assert!(!is_word_sized_uint_atom(atom));
         }
-        assert!(is_word_sized_uint_atom("U64"));
+        assert!(is_word_sized_uint_atom("Usize"));
         assert_eq!(
-            is_word_sized_uint_atom("Usize"),
+            is_word_sized_uint_atom("U64"),
             crate::layout::target_word_size() == 8
         );
+    }
+
+    #[test]
+    fn word_sized_uint_follows_unsigned_lowleveltype() {
+        assert!(is_word_sized_uint_atom_for("Usize", 8));
+        assert!(is_word_sized_uint_atom_for("U64", 8));
+        assert!(!is_word_sized_uint_atom_for("U32", 8));
+        assert!(is_word_sized_uint_atom_for("Usize", 4));
+        assert!(
+            !is_word_sized_uint_atom_for("U64", 4),
+            "u64 on a 4-byte target is UnsignedLongLong, not the uint_* word op"
+        );
+        assert!(!is_word_sized_uint_atom_for("U32", 4));
     }
 
     use super::*;
@@ -526,10 +583,16 @@ mod tests {
 
     #[test]
     fn both_const_and_const_rhs_reach_word_sized_unsigned() {
-        assert_eq!(unsigned_word_atom(Some("U64"), [None, None]), Some("U64"));
-        assert_eq!(unsigned_word_atom(None, [Some("U64"), None]), Some("U64"));
         assert_eq!(
-            unsigned_word_atom(Some("Usize"), [None, None]).is_some(),
+            unsigned_word_atom(Some("Usize"), [None, None]),
+            Some("Usize")
+        );
+        assert_eq!(
+            unsigned_word_atom(None, [Some("Usize"), None]),
+            Some("Usize")
+        );
+        assert_eq!(
+            unsigned_word_atom(Some("U64"), [None, None]).is_some(),
             crate::layout::target_word_size() == 8
         );
     }

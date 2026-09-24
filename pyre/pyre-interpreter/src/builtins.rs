@@ -16598,8 +16598,8 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         // an app-visible AST.  The ordinary code path runs both scans inside
         // `compile_with_codegen_warnings`; ONLY_AST has no codegen boundary,
         // so keep the tokenizer order explicitly here.
-        crate::syntax_warnings::emit_tokenizer_syntax_warnings(source, &filename)?;
-        crate::syntax_warnings::emit_escape_warnings(source, &filename)?;
+        crate::syntax_warnings::emit_tokenizer_syntax_warnings(source, &filename_text)?;
+        crate::syntax_warnings::emit_escape_warnings(source, &filename_text)?;
     }
     if flags & PYCF_ONLY_AST != 0 {
         // CPython 3.14 bltinmodule.c:847 / pythonrun.c:1524:
@@ -16680,7 +16680,7 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         });
     }
     let code = if let Some(source) = source_str.as_deref() {
-        crate::syntax_warnings::compile_with_codegen_warnings(source, mode, &filename, opts)
+        crate::syntax_warnings::compile_with_codegen_warnings(source, mode, &filename_text, opts)
             .map_err(|error| match error {
                 crate::syntax_warnings::SourceCompileError::Compile(error) => {
                     compile_err_to_syntax_error_maybe_incomplete(
@@ -16693,7 +16693,7 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
                 crate::syntax_warnings::SourceCompileError::Warning(error) => error,
             })
     } else {
-        crate::module::_ast::convert::compile_object(source, &filename, mode, opts)
+        crate::module::_ast::convert::compile_object(source, &filename, &filename_text, mode, opts)
     }
     .map_err(|error| {
         replace_compile_syntax_error_filename(error, &filename, filename_bytes.as_deref())
@@ -16813,7 +16813,7 @@ pub fn exec_or_eval(
             let code = crate::syntax_warnings::compile_with_codegen_warnings(
                 &source,
                 mode,
-                "<string>",
+                rustpython_wtf8::Wtf8::new("<string>"),
                 crate::compile::CompileOpts {
                     optimize: crate::importing::optimize_flag(),
                     debug_ranges: crate::importing::code_debug_ranges_flag(),
