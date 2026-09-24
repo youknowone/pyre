@@ -19834,8 +19834,13 @@ impl<'a> Lowering<'a> {
         let Some(src) = fd.signature.inputs.first() else {
             return Ok(false);
         };
-        let signed_word = matches!(self.tyref_literal_int_atom(src), Some("I64" | "Isize"));
-        let unsigned_word = matches!(self.tyref_literal_uint_atom(src), Some("U64" | "Usize"));
+        let word_bytes = crate::layout::target_word_size();
+        let signed_word = self.tyref_literal_int_atom(src).is_some_and(|atom| {
+            crate::front::checked_arith_uint::is_jit_bank_int_atom(atom, word_bytes)
+        });
+        let unsigned_word = self.tyref_literal_uint_atom(src).is_some_and(|atom| {
+            crate::front::checked_arith_uint::is_jit_bank_int_atom(atom, word_bytes)
+        });
         if !signed_word && !unsigned_word {
             return Ok(false);
         }
@@ -19938,8 +19943,13 @@ impl<'a> Lowering<'a> {
         let Some(src) = fd.signature.inputs.first() else {
             return Ok(false);
         };
-        let signed_word = matches!(self.tyref_literal_int_atom(src), Some("I64" | "Isize"));
-        let unsigned_word = matches!(self.tyref_literal_uint_atom(src), Some("U64" | "Usize"));
+        let word_bytes = crate::layout::target_word_size();
+        let signed_word = self.tyref_literal_int_atom(src).is_some_and(|atom| {
+            crate::front::checked_arith_uint::is_jit_bank_int_atom(atom, word_bytes)
+        });
+        let unsigned_word = self.tyref_literal_uint_atom(src).is_some_and(|atom| {
+            crate::front::checked_arith_uint::is_jit_bank_int_atom(atom, word_bytes)
+        });
         if !signed_word && !unsigned_word {
             return Ok(false);
         }
