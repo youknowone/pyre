@@ -1087,16 +1087,11 @@ unsafe fn long_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         return Ok(w_long_new(w_long_get_value(b).int_add(w_int_get_value(a))));
     }
     debug_assert!(is_long(a) && is_long(b));
-    if w_long_get_value(a).is_zero() {
-        return Ok(pyre_object::longobject::w_long_from_raw(
-            w_long_get_raw_value(b),
-        ));
-    }
-    if w_long_get_value(b).is_zero() {
-        return Ok(pyre_object::longobject::w_long_from_raw(
-            w_long_get_raw_value(a),
-        ));
-    }
+    // `rbigint.add` is `@jit.elidable` and already returns the other operand
+    // when either sign is 0. A traced `is_zero` test here becomes a guard on
+    // the concrete remainder of the traced iteration (`q * d + r` in
+    // `side_exit_contracts`), which fails on the next non-zero remainder and
+    // compiles a bridge. Leave the test inside the elidable call.
     Ok(w_long_new(w_long_get_value(a).add(w_long_get_value(b))))
 }
 
