@@ -149,6 +149,23 @@ extern "C" fn bh_w_type_issubtype(w_type: i64, cls: i64) -> i64 {
     }
 }
 
+/// `w_type_is_cpython_immutabletype` returns `bool`. Same widening as
+/// [`bh_w_type_issubtype`]: the residual dispatcher reads a whole word.
+extern "C" fn bh_w_type_is_cpython_immutabletype(w_type: i64) -> i64 {
+    unsafe {
+        pyre_object::w_type_is_cpython_immutabletype(w_type as pyre_object::PyObjectRef) as i64
+    }
+}
+
+/// `LoadAttr::name_idx` returns `u32`. Residual calls read an `i64` result.
+extern "C" fn bh_load_attr_name_idx(oparg: i64) -> i64 {
+    i64::from(
+        rustpython_compiler_core::bytecode::oparg::LoadAttr::name_idx(
+            rustpython_compiler_core::bytecode::oparg::LoadAttr::from_u32(oparg as u32),
+        ),
+    )
+}
+
 // `descr.py CallDescr.create_call_stub` constructs FuncType(ARGS, RESULT),
 // calls that typed function and only then casts its result to Signed. These
 // source-registry entries need the same stub: the override probes return bool,
@@ -1565,6 +1582,13 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::w_type_issubtype",
         bh_w_type_issubtype,
     );
+    // Same boolean widening. The raw function's result is one byte.
+    cpa1(
+        &mut entries,
+        "pyre_object::typeobject::w_type_is_cpython_immutabletype",
+        "pyre_object::w_type_is_cpython_immutabletype",
+        bh_w_type_is_cpython_immutabletype,
+    );
     // `lookup_exc_class_for_kind` reads the process-global `EXC_CLASS_BY_KIND`
     // registry the tracer cannot model; its residual call rides a C-ABI
     // bridge that reconstructs the `ExcKind` from the integer arg slot.
@@ -2609,6 +2633,28 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::pycode::w_code_lookup_exceptiontable",
         "pyre_interpreter::w_code_lookup_exceptiontable",
         crate::pycode::w_code_lookup_exceptiontable_jit_abi,
+    );
+    // `named_key_hash` residualizes `w_code_getname_w` (`dont_look_inside`).
+    // Without this row the codewriter mints a symbolic path hash and
+    // `interpret()` aborts the first LOAD_NAME / LOAD_GLOBAL walk.
+    up2(
+        &mut entries,
+        "pyre_interpreter::pycode::w_code_getname_w",
+        crate::pycode::w_code_getname_w,
+    );
+    // `get_w_globals` is a quasi-immutable field read upstream. The body here
+    // is an atomic load the translator declines, so the residual keeps the
+    // real function. One pointer in, one pointer out.
+    up1(
+        &mut entries,
+        "pyre_interpreter::pycode::w_code_get_w_globals",
+        crate::pycode::w_code_get_w_globals,
+    );
+    // `name_idx` is `u32 -> u32`. The word bridge is what the residual reads.
+    cp1(
+        &mut entries,
+        "bytecode::oparg::LoadAttr::name_idx",
+        bh_load_attr_name_idx,
     );
     // `compare` residualizes its `compare_slot` tail: the slot body reads two
     // `&[u8]` through `core::slice::cmp`, which has no LLBC, so the source lift
@@ -6106,6 +6152,29 @@ mod tests {
             stray.is_empty(),
             "these wrapper descriptors cannot join the BuiltinCode.func PBC \
              family, so they get no jitcode: {stray:?}",
+        );
+    }
+
+    #[test]
+    fn jit_trace_fnaddrs_covers_w_code_getname_w() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let expected = crate::pycode::w_code_getname_w as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::pycode::w_code_getname_w"],
+            expected,
+        );
+        let globals = crate::pycode::w_code_get_w_globals as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::pycode::w_code_get_w_globals"],
+            globals,
+        );
+        assert_eq!(
+            bindings["pyre_object::typeobject::w_type_is_cpython_immutabletype"],
+            super::bh_w_type_is_cpython_immutabletype as *const () as usize as i64,
+        );
+        assert_eq!(
+            bindings["bytecode::oparg::LoadAttr::name_idx"],
+            super::bh_load_attr_name_idx as *const () as usize as i64,
         );
     }
 

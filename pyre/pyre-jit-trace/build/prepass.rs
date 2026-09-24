@@ -79,6 +79,7 @@ const CODEGEN_OUTPUTS: &[&str] = &[
     "field_mint_census.bin",
     "liveness.bin",
     "fnaddr_bindings.bin",
+    "symbolic_fnaddr_paths.bin",
     "static_pytype_bindings.bin",
     "static_ref_bindings.bin",
 ];
@@ -1767,6 +1768,15 @@ fn real_main() {
         std::fs::write(
             format!("{out_dir}/fnaddr_bindings.bin"),
             &fnaddr_bindings_bin,
+        )
+        .unwrap();
+        // `symbolic_fnaddr_for_path` hashes have no reverse map in the runtime
+        // process: the codewriter records them only while it runs, in the
+        // build script. Persist that snapshot so a residual-call bail can
+        // name the path. Hashes are path identity, not host addresses.
+        std::fs::write(
+            format!("{out_dir}/symbolic_fnaddr_paths.bin"),
+            bincode::serialize(&pipeline.symbolic_fnaddr_paths).unwrap(),
         )
         .unwrap();
 

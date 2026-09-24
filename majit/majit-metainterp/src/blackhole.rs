@@ -332,6 +332,9 @@ pub struct BlackholeInterpreter {
     /// marker is a clean bail to the interpreter after the codewriter has
     /// already materialized the frame's resume coordinate.
     pub abort_permanent_bail: bool,
+    /// Name of the residual whose unbound call produced this bail.
+    /// `None` until a reject site or `resume_mainloop` fills it.
+    pub bail_residual: Option<String>,
     /// RPython blackhole.py handle_exception_in_frame parity:
     /// True when a residual call raised an exception (returned NULL ref).
     /// Unlike `aborted`, this indicates a Python-level exception that
@@ -594,6 +597,7 @@ impl Default for BlackholeInterpreter {
             return_type: BhReturnType::Void,
             aborted: false,
             abort_permanent_bail: false,
+            bail_residual: None,
             got_exception: false,
             last_opcode_position: 0,
             entry_position: 0,
@@ -787,6 +791,7 @@ impl BlackholeInterpreter {
         self.return_type = BhReturnType::Void;
         self.aborted = false;
         self.abort_permanent_bail = false;
+        self.bail_residual = None;
         self.got_exception = false;
         self.state_field_layout = StateFieldLayout::default();
     }
@@ -1211,6 +1216,13 @@ impl BlackholeInterpreter {
         }
 
         if self.aborted {
+            if self.bail_residual.is_none() {
+                self.bail_residual = Some(format!(
+                    "blackhole abort in {} at {}",
+                    self.jitcode.name(),
+                    self.last_opcode_position
+                ));
+            }
             // No upstream counterpart — see `JitException::BailToInterpreter`.
             // The abort leaves this frame unfinished at every level, so it
             // propagates instead of being absorbed: `Ok(0)` would have popped
@@ -3195,6 +3207,7 @@ impl BlackholeInterpBuilder {
         interp.nextblackholeinterp = None;
         interp.aborted = false;
         interp.abort_permanent_bail = false;
+        interp.bail_residual = None;
         interp.got_exception = false;
         // The virtualizable handle is frame identity, not builder state, and
         // `acquire_interp` refreshes only the six builder-shared fields.  A
@@ -3412,6 +3425,9 @@ pub struct BlackholeTerminalImage {
     /// the exception says only *that* the chain bailed, and every consumer has
     /// to assume the boundary it cannot check.
     pub abort_permanent_bail: bool,
+    /// Residual named by the frame that bailed. `None` when the bail
+    /// was not an unbound call.
+    pub bail_residual: Option<String>,
 }
 
 /// Result that escaped a recursive portal runner.
@@ -3454,6 +3470,7 @@ impl BlackholeTerminalImage {
             position: bh.position,
             last_opcode_position: bh.last_opcode_position,
             abort_permanent_bail: bh.abort_permanent_bail,
+            bail_residual: bh.bail_residual.take(),
         }
     }
 }
@@ -5674,6 +5691,7 @@ mod tests {
                         // The resumable bail: a consumer that checks the flag
                         // before adopting this image accepts it.
                         abort_permanent_bail: true,
+                        bail_residual: None,
                     },
                 ))
             };
@@ -6315,6 +6333,8 @@ mod tests {
             // "callee-default".
             parent.virtualizable_ptr = 0xDEAD_BEEF;
             parent.virtualizable_stack_base = 7;
+            let vinfo = Box::leak(Box::new(crate::virtualizable::VirtualizableInfo::new(8)));
+            parent.virtualizable_info = vinfo;
 
             let mut callee = BlackholeInterpreter::default();
             callee.clone_context_from(&parent);
@@ -6334,6 +6354,11 @@ mod tests {
                 "clone_context_from must alias the parent table"
             );
             assert_eq!(callee.virtualizable_ptr, parent.virtualizable_ptr);
+            assert!(
+                std::ptr::eq(callee.virtualizable_info, parent.virtualizable_info),
+                "inline callee must inherit the parent's virtualizable_info \
+                 (interpret_unresolved_inline_call clones through here)"
+            );
             assert_eq!(
                 callee.virtualizable_stack_base,
                 parent.virtualizable_stack_base
@@ -9972,6 +9997,11 @@ fn reject_unresolved_call(bh: &mut BlackholeInterpreter, func: i64) -> DispatchE
             bh.jitcode.name, bh.position, bh.last_opcode_position,
         );
     }
+    bh.bail_residual = Some(
+        crate::pyjitpl::resolve_symbolic_fnaddr_path(func)
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("fnaddr {func:#x}")),
+    );
     bh.aborted = true;
     DispatchError::LeaveFrame
 }
@@ -13434,6 +13464,9 @@ fn reject_unresolved_inline_call(
              (fnaddr={fnaddr:#x}); register the callee's path in the host's fnaddr bindings"
         );
     }
+    bh.bail_residual = Some(format!(
+        "inline jitcode[{jitcode_index}] fnaddr={fnaddr:#x}"
+    ));
     bh.aborted = true;
     DispatchError::LeaveFrame
 }
@@ -13509,6 +13542,9 @@ fn interpret_unresolved_inline_call(
             bh.position = post_p;
             bh.aborted = true;
             bh.abort_permanent_bail = callee.abort_permanent_bail;
+            if let Some(name) = callee.bail_residual.take() {
+                bh.bail_residual = Some(name);
+            }
             break 'callee Err(DispatchError::LeaveFrame);
         }
         if callee.got_exception {
@@ -14380,6 +14416,9 @@ fn handler_inline_call_nested_ext(
             bh.position = p;
             bh.aborted = true;
             bh.abort_permanent_bail = callee.abort_permanent_bail;
+            if let Some(name) = callee.bail_residual.take() {
+                bh.bail_residual = Some(name);
+            }
             break 'callee Err(DispatchError::LeaveFrame);
         }
         if callee.got_exception {

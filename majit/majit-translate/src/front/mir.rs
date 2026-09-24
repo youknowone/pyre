@@ -1239,24 +1239,29 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         let gcref_result = gc_root_gcref_result_path(&fn_path);
         let returns_objectptr =
             output_type_is_objectptr(&fd.signature.output, llbc) && !gcref_result;
-        // Stamp the FUNC.RESULT token for `dont_look_inside` callees only
-        // (keyed exactly as `merge_hints_from_llbcs`), so the narrow
-        // codewriter surface stays restricted to opaque stubs; every
-        // other fn keeps the declared-void default.
-        // Every trait method can be a member of an indirect-call PBC row:
-        // default bodies and concrete overrides alike.  RPython's
-        // `FunctionReprBase.call` gets the row's result from
-        // `FuncType.RESULT`, so each member must carry that type before the
-        // graph analyzers run.  Left `None`, pyre maps it to `Void` and the
-        // first concrete witness can mismatch a real `Ref`/`Int` result.
-        // Stamp the same signature token an opaque callee gets.
+        // `dont_look_inside` / `elidable` callees and every trait-method
+        // member of an indirect-call row stamp FUNC.RESULT.  RPython's
+        // `FunctionReprBase.call` reads that row from `FuncType.RESULT`.
+        // Left `None`, pyre maps it to `Void`, so a callee whose body
+        // produces a scalar disagrees with the call's `result_ty`.
+        // A `repr(transparent)` scalar wrapper is that word: the same
+        // token an opaque callee gets, including an inherent constructor
+        // that is not itself a trait method.
+        // Aggregate `"ref"` results stay unstamped — the call-signature
+        // validator skips a missing declaration, and a struct name is not
+        // a register class.
         let stamp_return_token = dont_look_inside.contains(&fn_path)
             || elidable_residual.contains(&fn_path)
             || trait_root.is_some();
-        let return_type = if gcref_result {
+        let signature_token = if gcref_result {
             Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE.to_string())
-        } else if stamp_return_token {
+        } else {
             dont_look_inside_return_token(&fd.signature.output, llbc, static_addrs.error_carrier)
+        };
+        let return_type = if gcref_result || stamp_return_token {
+            signature_token
+        } else if signature_token.as_deref().is_some_and(scalar_result_token) {
+            signature_token
         } else {
             None
         };
@@ -7324,22 +7329,35 @@ impl<'a> Lowering<'a> {
                         }
                     }
                 }
-                // A transparent one-field aggregate is represented by its
-                // only operand. Constructing a separate instance would split
-                // one machine word into incompatible scalar and reference
-                // annotations at later merges.
+                // A `repr(transparent)` aggregate is its one sized field.
+                // Zero-sized markers are not stored, so the operand is that
+                // field rather than whichever single operand arrived. An
+                // opaque newtype, or a wrapper whose only field is zero-sized,
+                // still has one operand and stays the identity. Constructing
+                // a separate instance would split one machine word into
+                // incompatible scalar and reference annotations at later
+                // merges. The bank comes from the tombstoned classifier.
                 if tyref_transparent_inner_value_type(dest_ty, self.llbc, self.tombstoned_leaves)
                     .is_some()
-                    && operands.len() == 1
                 {
-                    let value = self.resolve_operand(
-                        mir_bb,
-                        operands
-                            .into_iter()
-                            .next()
-                            .expect("one transparent aggregate operand"),
-                    )?;
-                    return Ok((None, value));
+                    if let Some((index, _)) = tyref_transparent_nonzst_field(dest_ty, self.llbc) {
+                        let Some(operand) = operands.into_iter().nth(index) else {
+                            return Err(LowerError::Unsupported(format!(
+                                "bb{mir_bb}: transparent aggregate missing field {index}"
+                            )));
+                        };
+                        let value = self.resolve_operand(mir_bb, operand)?;
+                        return Ok((None, value));
+                    } else if operands.len() == 1 {
+                        let value = self.resolve_operand(
+                            mir_bb,
+                            operands
+                                .into_iter()
+                                .next()
+                                .expect("one transparent aggregate operand"),
+                        )?;
+                        return Ok((None, value));
+                    }
                 }
                 // Resolve operand Variables up front; they flow into the
                 // synthesised FieldWrite chain rather than the ctor's
@@ -8122,11 +8140,22 @@ impl<'a> Lowering<'a> {
                     && let Some((owner_root, field_name, field_ty, owner_id)) =
                         self.resolve_adt_field(field_payload)
                 {
-                    // Projecting the sole field of a transparent wrapper is
-                    // the identity on its low-level value. The wrapper and
-                    // field share one register bank and one machine word, so
-                    // emitting a FieldRead would try to dereference that word
-                    // as an aggregate base.
+                    // Projecting the sized field of a `repr(transparent)`
+                    // wrapper is the identity on its low-level value, including
+                    // through a borrow: the borrow carries no representation of
+                    // its own, the same way [`Self::tyref_is_borrowed_fieldless_enum`]
+                    // treats a fieldless enum. A zero-sized marker in the same
+                    // struct still has no bytes. Emitting a FieldRead would
+                    // try to dereference that word as an aggregate base.
+                    if let Some((_, name)) = tyref_transparent_nonzst_field(&inner.ty, self.llbc) {
+                        if field_name == name {
+                            return self.resolve_place(mir_bb, *inner);
+                        }
+                        return Ok(self.emit_unit(self.block_id[mir_bb]));
+                    }
+                    // An opaque dependency view has no field list, but the
+                    // linked scalar bank still types the wrapper as its inner
+                    // word. The only projection that view emits is `__pos_0`.
                     if field_name == "__pos_0"
                         && tyref_transparent_inner_value_type(
                             &inner.ty,
@@ -9987,6 +10016,45 @@ impl<'a> Lowering<'a> {
         Ok(true)
     }
 
+    /// A residual or `dont_look_inside` callee expects a real address for
+    /// `&T`. A `repr(transparent)` scalar wrapper's borrow is the word, so
+    /// passing it would hand that word to the callee as a pointer.
+    ///
+    /// Charon leaves the declaration generic (`monomorphize:false`), so
+    /// `fn f<T>(x: &T)` is a `TypeVar` and does not name the wrapper. The
+    /// operand's place type is the type the call actually passes.
+    fn refuse_borrowed_transparent_scalar_residual(
+        &self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        arg_tys: &[Option<TyRef>],
+    ) -> Result<(), LowerError> {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return Ok(());
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return Ok(());
+        };
+        let path = strip_crate_prefix(&fd.item_meta.name_path());
+        let residual = fd.unstructured().is_none() || self.dont_look_inside.contains(&path);
+        if !residual {
+            return Ok(());
+        }
+        for (index, declared) in fd.signature.inputs.iter().enumerate() {
+            let passed = arg_tys.get(index).and_then(Option::as_ref);
+            if std::iter::once(declared).chain(passed).any(|ty| {
+                tyref_is_borrowed_transparent_scalar(ty, self.llbc, self.tombstoned_leaves)
+            }) {
+                return Err(LowerError::Unsupported(format!(
+                    "bb{mir_bb}: residual `{}` argument {index} borrows a \
+                     repr(transparent) scalar; the word is not an address",
+                    fd.item_meta.name_path()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn lower_call(
         &mut self,
         mir_bb: usize,
@@ -10105,6 +10173,15 @@ impl<'a> Lowering<'a> {
                 },
                 Operand::Const(_) => None,
             })
+            .collect();
+        // Every argument's place type, captured before the operands are
+        // consumed. A residual `fn f<T>(x: &T)` keeps `T` as a `TypeVar`
+        // on the declaration (`monomorphize:false`); the place type is the
+        // type the call actually passes.
+        let call_arg_tys: Vec<Option<TyRef>> = call
+            .args
+            .iter()
+            .map(|op| operand_tyref(op).map(clone_tyref))
             .collect();
         // First argument's MIR-declared type, captured before the
         // operands are consumed — `reflexive_into_alias` compares it
@@ -13153,6 +13230,7 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 {
+                    self.refuse_borrowed_transparent_scalar_residual(mir_bb, &reg, &call_arg_tys)?;
                     // `jit::promote(x)` (and its `promote_string` /
                     // `promote_unicode` siblings) rewrites to the synthesised
                     // `hint_promote*` marker so the residual `OpKind::Call`
@@ -19459,6 +19537,16 @@ impl<'a> Lowering<'a> {
         else {
             return false;
         };
+        // `opcode_for_iter`'s match is `Option<H::Value>`. The only
+        // `IterOpcodeHandler` impl binds `Value = *mut PyObject`, which
+        // Rust represents as a null niche. The generic body still spells
+        // the payload as a trait projection, so peel that unique binding
+        // before the raw-pointer test. A multi-impl projection stays
+        // unresolved and keeps the tagged aggregate.
+        let resolved_assoc = trait_payload_node(payload, self.llbc)
+            .and_then(|node| trait_assoc_projection_target(node, self.llbc));
+        let resolved_body = resolved_assoc.as_ref().and_then(|ty| self.tyref_body(ty));
+        let payload = resolved_body.unwrap_or(payload);
         if type_node_is_mut_ref(payload, self.llbc) {
             return true;
         }
@@ -19541,12 +19629,19 @@ impl<'a> Lowering<'a> {
         if let Some(raw_pointee) = type_node_raw_ptr_pointee(payload, self.llbc)
             && let Some(stripped) = strip_ty_wrappers(raw_pointee, self.llbc)
             && let Some(def_id) = adt_node_def_id(stripped)
-            && self
-                .llbc
-                .type_by_id(def_id)
-                .and_then(|td| td.layout_for_target(&std::env::var("TARGET").unwrap_or_default()))
-                .and_then(|l| l.size)
-                .is_some()
+            && self.llbc.type_by_id(def_id).is_some_and(|td| {
+                // A recorded layout must name a concrete size (a DST is not
+                // one word). A cross-crate nominal pointee often has no
+                // layout in this ullbc at all; `RawPtr` is already the thin
+                // spelling, so a missing layout is still the nullable
+                // pointer, not a two-word shell. Reading `__discriminant`
+                // off that pointer loads the pointee header and the match
+                // falls into `unreachable`.
+                match td.layout_for_target(&std::env::var("TARGET").unwrap_or_default()) {
+                    Some(layout) => layout.size.is_some(),
+                    None => td.layout.is_none(),
+                }
+            })
         {
             return true;
         }
@@ -26453,6 +26548,19 @@ fn tyref_to_value_type_with(
     if let Some(resolved) = trait_assoc_projection_target(value, llbc) {
         return tyref_to_value_type_with(&resolved, llbc, tombstoned);
     }
+    // A borrow hides the projection: `&Self::Anchor` is a `Ref` whose
+    // pointee is the associated type.  `trait_assoc_projection_target`
+    // only sees a top-level `TraitType`, and the transparent peel below
+    // only sees an ADT, so the borrow would stay a GC reference while the
+    // by-value projection is the impl's word.  Peel first, then resolve,
+    // and answer only when the binding is a transparent wrapper: that is
+    // the one borrow the transparent peel already types as its field.
+    if let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_wrappers(node, llbc))
+        && let Some(resolved) = trait_assoc_projection_target(node, llbc)
+        && let Some(inner) = tyref_transparent_inner_value_type(&resolved, llbc, tombstoned)
+    {
+        return inner;
+    }
     // RPython `history.getkind` classifies `Ptr(FuncType)` through the raw
     // pointer arm, hence as `int`.  Charon's equivalent is a top-level
     // `FnPtr`: it is the machine address that `FunctionReprBase.call` feeds
@@ -27028,6 +27136,13 @@ fn tyref_payload_enum_class_root_with(
     tyref_class_root_with(ty, llbc, tombstoned)
 }
 
+/// Machine-scalar FUNC.RESULT spellings.  `"ref"` is not one: it collapses
+/// every aggregate onto a GC reference, which the call-signature validator
+/// must not start enforcing for ordinary struct returns.
+fn scalar_result_token(token: &str) -> bool {
+    matches!(token, "bool" | "i64" | "u64" | "f32" | "f64")
+}
+
 /// Encode the FUNC.RESULT of a `dont_look_inside` callee into the
 /// canonical `FunctionGraph.return_type` token the rtyper stub
 /// classifier (`cutover.rs` `dont_look_inside` arm) decodes, so the
@@ -27563,6 +27678,94 @@ fn tyref_atomic_inner_scalar_str(ty: &TyRef, llbc: &Llbc) -> Option<&'static str
     }
 }
 
+/// Index and name of the one sized field of a `#[repr(transparent)]` struct.
+///
+/// Zero-sized fields occupy no bytes and are ignored, so a wrapper whose
+/// only sized field is a scalar (plus a marker) is that scalar.
+/// [`strip_ty_wrappers`] peels `&T` / `&mut T` and leaves `RawPtr` alone, so
+/// a borrow of the wrapper is the same word a fieldless-enum borrow is
+/// ([`tyref_is_borrowed_fieldless_enum`]). A raw pointer remains an address.
+fn transparent_nonzst_field(decl: &TypeDecl, llbc: &Llbc) -> Option<(usize, String)> {
+    if !decl.is_repr_transparent() {
+        return None;
+    }
+    let TypeDeclKind::Struct(fields) = &decl.kind else {
+        return None;
+    };
+    let mut found = None;
+    for (index, field) in fields.iter().enumerate() {
+        if field_is_zst(&field.ty, llbc) {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        let name = field
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("__pos_{index}"));
+        found = Some((index, name));
+    }
+    found
+}
+
+fn tyref_transparent_nonzst_field(ty: &TyRef, llbc: &Llbc) -> Option<(usize, String)> {
+    let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
+    let decl = llbc.type_by_id(adt_node_def_id(node)?)?;
+    transparent_nonzst_field(decl, llbc)
+}
+
+fn field_is_zst(ty: &TyRef, llbc: &Llbc) -> bool {
+    if is_unit_type(ty, llbc) || tyref_is_zero_sized(ty, llbc) {
+        return true;
+    }
+    let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc)) else {
+        return false;
+    };
+    if json_ty_byte_size(node, llbc) == Some(0) {
+        return true;
+    }
+    let Some(adt) = node
+        .as_object()
+        .and_then(|obj| obj.get("Adt"))
+        .and_then(|adt| adt.as_object())
+    else {
+        return false;
+    };
+    let is_tuple = adt.get("id").and_then(|id| id.as_str()) == Some("Tuple");
+    let empty = adt
+        .get("generics")
+        .and_then(|generics| generics.get("types"))
+        .and_then(|types| types.as_array())
+        .is_some_and(|types| types.is_empty());
+    is_tuple && empty
+}
+
+/// `&T` / `&mut T` where `T` is a `repr(transparent)` wrapper of a scalar.
+/// A residual callee expects a real address for that borrow; the word is not
+/// one. A raw pointer is left alone.
+fn tyref_is_borrowed_transparent_scalar(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> bool {
+    if !output_type_is_ref(ty, llbc) {
+        return false;
+    }
+    matches!(
+        tyref_transparent_inner_value_type(ty, llbc, tombstoned),
+        Some(
+            ValueType::Int
+                | ValueType::Unsigned
+                | ValueType::Bool
+                | ValueType::Float
+                | ValueType::SingleFloat
+                | ValueType::Int128
+                | ValueType::UInt128
+        )
+    )
+}
+
 fn tyref_transparent_inner_value_type(
     ty: &TyRef,
     llbc: &Llbc,
@@ -27584,7 +27787,11 @@ fn tyref_transparent_inner_value_type(
     }
     match &decl.kind {
         TypeDeclKind::Struct(fields) => {
-            let [field] = fields.as_slice() else {
+            let field = if let Some((index, _)) = transparent_nonzst_field(decl, llbc) {
+                fields.get(index)?
+            } else if let [only] = fields.as_slice() {
+                only
+            } else {
                 return None;
             };
             Some(tyref_to_value_type_with(&field.ty, llbc, tombstoned))
@@ -27806,7 +28013,10 @@ pub(crate) fn discover_transparent_scalar_kinds(
         let TypeDeclKind::Struct(fields) = &decl.kind else {
             continue;
         };
-        let [field] = fields.as_slice() else {
+        let Some((index, _)) = transparent_nonzst_field(decl, llbc) else {
+            continue;
+        };
+        let Some(field) = fields.get(index) else {
             continue;
         };
         let kind = match tyref_to_value_type(&field.ty, llbc) {
@@ -29258,7 +29468,8 @@ fn tyref_to_field_layout_string(ty: &TyRef, llbc: &Llbc) -> String {
         return tyref_to_ast_string(ty, llbc);
     }
     if let TypeDeclKind::Struct(fields) = &decl.kind
-        && let [field] = fields.as_slice()
+        && let Some((index, _)) = transparent_nonzst_field(decl, llbc)
+        && let Some(field) = fields.get(index)
         && !matches!(
             tyref_to_value_type(&field.ty, llbc),
             ValueType::Ref(_)
@@ -29556,6 +29767,31 @@ fn trait_assoc_projection_target<'a>(
     // consed or a dedup id, and `TyRef`'s own deserializer is what knows
     // the three shapes apart.
     serde_json::from_value::<TyRef>(resolved?.clone()).ok()
+}
+
+/// Peel `Deduplicated` / `HashConsedValue` so a trait projection in an
+/// ADT generic argument is visible to [`trait_assoc_projection_target`].
+fn trait_payload_node<'a>(
+    mut node: &'a serde_json::Value,
+    llbc: &'a Llbc,
+) -> Option<&'a serde_json::Value> {
+    for _ in 0..8 {
+        let obj = node.as_object()?;
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            node = llbc.dedup_body(id)?;
+            continue;
+        }
+        if let Some(arr) = obj
+            .get("HashConsedValue")
+            .and_then(serde_json::Value::as_array)
+            && arr.len() == 2
+        {
+            node = &arr[1];
+            continue;
+        }
+        break;
+    }
+    Some(node)
 }
 
 /// The `[traitref, assoc]` pair of an unresolved `Self::Assoc` projection,
@@ -42726,6 +42962,243 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_one_scalar_struct_uses_the_field_bank() {
+        let type_decl = serde_json::json!({
+            "def_id": 1,
+            "item_meta": {
+                "name": [{"Ident": ["fixture", 0]}, {"Ident": ["DepthWord", 0]}],
+                "span": {"data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 4, "col": 1}
+                }},
+                "source_text": "struct Anchor { depth: usize, _not_send: () }",
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            },
+            "kind": {"Struct": [
+                {
+                    "name": "depth",
+                    "ty": {"HashConsedValue": [7, {"Literal": {"UInt": "Usize"}}]},
+                    "attr_info": null
+                },
+                {
+                    "name": "_not_send",
+                    "ty": {"HashConsedValue": [9, {"Adt": {"id": "Tuple", "generics": {"types": []}}}]},
+                    "attr_info": null
+                }
+            ]},
+            "layout": [{
+                "key": "aarch64-apple-darwin",
+                "value": {
+                    "size": 8,
+                    "align": 8,
+                    "variant_layouts": [{"field_offsets": [0, 8]}],
+                    "repr": {"repr_algo": "Rust", "transparent": true}
+                }
+            }]
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [null, type_decl],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let borrowed = serde_json::from_value::<super::TyRef>(serde_json::json!({
+            "HashConsedValue": [8, {
+                "Ref": ["r", {
+                    "Adt": {"id": {"Adt": 1}, "generics": {"types": []}}
+                }, "Shared"]
+            }]
+        }))
+        .expect("borrowed TyRef parses");
+        assert_eq!(
+            super::tyref_to_value_type(&borrowed, &llbc),
+            crate::model::ValueType::Unsigned
+        );
+    }
+
+    /// `fn f<T>(x: &T)` stays generic on the declaration. The call
+    /// instantiates `T` with a `repr(transparent)` scalar wrapper, so the
+    /// residual must be refused; the same callee with a non-transparent
+    /// `T` still lowers.
+    #[test]
+    fn generic_residual_borrow_of_transparent_scalar_is_refused() {
+        let span = || {
+            serde_json::json!({"data": {
+                "file_id": 0,
+                "beg": {"line": 1, "col": 0},
+                "end": {"line": 1, "col": 1}
+            }})
+        };
+        let item_meta = |path: &[&str], is_local: bool| {
+            serde_json::json!({
+                "name": path
+                    .iter()
+                    .map(|segment| serde_json::json!({"Ident": [segment, 0]}))
+                    .collect::<Vec<_>>(),
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": is_local
+            })
+        };
+        let struct_decl = |def_id: u64, leaf: &str, transparent: bool| {
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": item_meta(&["fixture", leaf], true),
+                "kind": {"Struct": [{
+                    "name": null,
+                    "ty": {"Literal": {"Int": "I64"}},
+                    "attr_info": null
+                }]},
+                "layout": [{
+                    "key": "fixture-target",
+                    "value": {
+                        "size": 8,
+                        "align": 8,
+                        "variant_layouts": [{"field_offsets": [0]}],
+                        "repr": {"repr_algo": "Rust", "transparent": transparent}
+                    }
+                }]
+            })
+        };
+        let adt = |def_id: u64| {
+            serde_json::json!({
+                "Adt": {"id": {"Adt": def_id}, "generics": {"types": []}}
+            })
+        };
+        let borrowed =
+            |inner: serde_json::Value| serde_json::json!({"Ref": ["_", inner, "Shared"]});
+        let type_var = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+        let unit = serde_json::json!({"Tuple": []});
+        let caller = |def_id: u64, name: &str, type_arg: serde_json::Value| {
+            let arg_ty = borrowed(type_arg.clone());
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": item_meta(&["fixture", name], true),
+                "signature": {
+                    "is_unsafe": false,
+                    "inputs": [arg_ty.clone()],
+                    "output": unit.clone()
+                },
+                "body": {
+                    "Unstructured": {
+                        "span": span(),
+                        "locals": {
+                            "arg_count": 1,
+                            "locals": [
+                                {"index": 0, "name": null, "span": span(), "ty": unit.clone()},
+                                {"index": 1, "name": "value", "span": span(), "ty": arg_ty.clone()}
+                            ]
+                        },
+                        "body": [
+                            {
+                                "statements": [],
+                                "terminator": {
+                                    "span": span(),
+                                    "kind": {
+                                        "Call": {
+                                            "call": {
+                                                "func": {
+                                                    "Regular": {
+                                                        "kind": {"Fun": {"Regular": 2}},
+                                                        "generics": {
+                                                            "regions": [],
+                                                            "types": [type_arg],
+                                                            "const_generics": [],
+                                                            "trait_refs": []
+                                                        }
+                                                    }
+                                                },
+                                                "args": [{
+                                                    "Copy": {
+                                                        "kind": {"Local": 1},
+                                                        "ty": arg_ty.clone()
+                                                    }
+                                                }],
+                                                "dest": {"kind": {"Local": 0}, "ty": unit.clone()}
+                                            },
+                                            "target": 2,
+                                            "on_unwind": 1
+                                        }
+                                    }
+                                }
+                            },
+                            {
+                                "statements": [],
+                                "terminator": {"span": span(), "kind": "UnwindResume"}
+                            },
+                            {
+                                "statements": [],
+                                "terminator": {"span": span(), "kind": "Return"}
+                            }
+                        ]
+                    }
+                }
+            })
+        };
+        let callee = serde_json::json!({
+            "def_id": 2,
+            "item_meta": item_meta(&["fixture", "f"], false),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [borrowed(type_var)],
+                "output": unit
+            },
+            "body": "Opaque"
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [
+                    struct_decl(0, "Word", true),
+                    struct_decl(1, "Plain", false)
+                ],
+                "fun_decls": [
+                    caller(0, "pass_word", adt(0)),
+                    caller(1, "pass_plain", adt(1)),
+                    callee
+                ],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+
+        let refused = super::lower_function(&llbc, "pass_word")
+            .expect_err("borrow of a transparent scalar wrapper must be refused");
+        let refused = refused.to_string();
+        assert!(
+            refused.contains("repr(transparent) scalar"),
+            "refusal must name the scalar borrow, got {refused}"
+        );
+
+        let graph = super::lower_function(&llbc, "pass_plain")
+            .expect("a non-transparent T must still lower");
+        let ops = graph_ops(&graph);
+        assert!(
+            call_leafs(&ops).iter().any(|leaf| leaf == "f"),
+            "non-transparent instantiation must stay a residual call; ops={ops:?}"
+        );
+    }
+
+    #[test]
     fn atomic_field_layout_string_is_the_inner_scalar() {
         let atomic_decl = |def_id: u64, leaf: &str, size: u64| {
             serde_json::json!({
@@ -45939,6 +46412,13 @@ mod tests {
     /// arm, so the resulting graph directly exposes whether the classifier
     /// chose aggregate construction or the nullable-pointer identities.
     fn lower_option_source_with_payload(payload: serde_json::Value) -> FunctionGraph {
+        lower_option_source_with_payload_ext(payload, false)
+    }
+
+    fn lower_option_source_with_payload_ext(
+        mut payload: serde_json::Value,
+        inject_layoutless_nominal: bool,
+    ) -> FunctionGraph {
         fn replace_dedup(
             value: &mut serde_json::Value,
             payload_id: u64,
@@ -45997,6 +46477,50 @@ mod tests {
                 })
             })
             .expect("Option type declaration in corpus");
+        if inject_layoutless_nominal {
+            let decls = translated
+                .get_mut("type_decls")
+                .and_then(serde_json::Value::as_array_mut)
+                .expect("corpus type_decls");
+            // `type_by_id` indexes this array by `def_id`. A hole is the
+            // only free index a copy can occupy.
+            let hole = decls
+                .iter()
+                .position(serde_json::Value::is_null)
+                .expect("corpus type_decls has a null hole");
+            let mut copy = decls
+                .iter()
+                .find(|decl| decl.get("def_id").and_then(serde_json::Value::as_u64) == Some(4))
+                .expect("sized nominal def-id 4")
+                .clone();
+            copy["def_id"] = serde_json::json!(hole);
+            copy.as_object_mut()
+                .expect("type decl object")
+                .remove("layout");
+            decls[hole] = copy;
+            // The fixture payload names Adt 1000 as the stand-in. Point it
+            // at the hole the copy actually occupies.
+            fn retarget(value: &mut serde_json::Value, hole: u64) {
+                let hit = value.get("Adt").and_then(serde_json::Value::as_u64) == Some(1000);
+                if hit {
+                    value["Adt"] = serde_json::json!(hole);
+                }
+                match value {
+                    serde_json::Value::Array(items) => {
+                        for item in items {
+                            retarget(item, hole);
+                        }
+                    }
+                    serde_json::Value::Object(map) => {
+                        for item in map.values_mut() {
+                            retarget(item, hole);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            retarget(&mut payload, hole as u64);
+        }
 
         let fun = translated
             .get_mut("fun_decls")
@@ -46094,6 +46618,45 @@ mod tests {
         assert_eq!(
             transparent_ctors, 0,
             "Some(raw nominal pointer) must be the payload identity, with no Option aggregate"
+        );
+    }
+
+    #[test]
+    fn niche_option_raw_nominal_ptr_without_layout_is_null_test() {
+        use crate::model::OpKind;
+        // Cross-crate pointees often have a type decl and no `layout`
+        // entry. `Option<*mut That>` is still the nullable pointer:
+        // `None` is null and the discriminant is a null test, not a
+        // `__discriminant` load of the pointee header.
+        let payload = serde_json::json!({
+            "RawPtr": [
+                {
+                    "Adt": {
+                        "id": { "Adt": 1000 },
+                        "generics": {
+                            "regions": [], "types": [],
+                            "const_generics": [], "trait_refs": []
+                        }
+                    }
+                },
+                "Mut"
+            ]
+        });
+        let graph = lower_option_source_with_payload_ext(payload, true);
+        let (null_muts, transparent_ctors) = niche_ctor_shape(&graph);
+        assert_eq!(null_muts, 1, "None must lower to one null pointer");
+        assert_eq!(transparent_ctors, 0, "Some must be the pointer identity");
+        let discriminant_reads = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "__discriminant")
+            })
+            .count();
+        assert_eq!(
+            discriminant_reads, 0,
+            "a layout-less nominal raw pointer must not read __discriminant"
         );
     }
 
@@ -46577,6 +47140,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `opcode_for_iter` matches `Option<H::Value>`. The sole impl binds
+    /// `Value = *mut PyObject`, a null niche. The generic body spells that
+    /// payload as a trait projection; the discriminant must be a null test.
+    #[test]
+    #[ignore]
+    fn opcode_for_iter_option_assoc_payload_is_null_test() {
+        use crate::model::OpKind;
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real interpreter LLBC");
+        let graph = super::lower_function(&llbc, "pyre_interpreter::pyopcode::opcode_for_iter")
+            .expect("lower opcode_for_iter");
+        let null_muts = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(&op.kind, OpKind::Call { target, .. }
+                    if target.to_string() == "core::ptr::null_mut")
+            })
+            .count();
+        assert!(
+            null_muts >= 1,
+            "opcode_for_iter Option match must null-test the pointer (null_muts={null_muts})"
+        );
     }
 
     #[test]

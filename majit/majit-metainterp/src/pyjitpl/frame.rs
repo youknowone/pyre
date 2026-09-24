@@ -1026,6 +1026,9 @@ impl MIFrame {
             self.pc - SIZE_LIVE_OP
         };
         // `get_list_of_active_boxes` asserts `code[pc] == op_live`.
+        // pyjitpl.py get_list_of_active_boxes: the assert survives
+        // translation; a debug-only check lets release decode operand
+        // bytes as an `all_liveness` offset.
         assert_eq!(self.jitcode.code[pc], op_live);
 
         let mut offset = decode_offset(&self.jitcode.code, pc + 1);
