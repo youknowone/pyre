@@ -5051,6 +5051,10 @@ impl OpcodeStepExecutor for PyFrame {
         let anchor = FrameAnchor::new(self);
         match crate::baseobjspace::getitem(mapping, key) {
             Ok(value) => {
+                // The mapping may be the raw type namespace.  `setdictvalue`
+                // parks an `ObjectMutableCell` there; the loaded name is the
+                // payload.
+                let value = unsafe { pyre_object::celldict::unwrap_cell(value) };
                 return Self::push_anchored(&anchor, value);
             }
             Err(err) if matches!(err.kind, PyErrorKind::KeyError) => {}
@@ -5074,6 +5078,10 @@ impl OpcodeStepExecutor for PyFrame {
         let anchor = FrameAnchor::new(self);
         match crate::baseobjspace::getitem(mapping, key) {
             Ok(value) => {
+                // The mapping is the raw type namespace (`__classdictcell__`).
+                // An `ObjectMutableCell` parked by `setdictvalue` must not
+                // surface as the bound.
+                let value = unsafe { pyre_object::celldict::unwrap_cell(value) };
                 return Self::push_anchored(&anchor, value);
             }
             Err(err) if matches!(err.kind, PyErrorKind::KeyError) => {}

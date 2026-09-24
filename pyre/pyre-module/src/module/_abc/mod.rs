@@ -476,6 +476,7 @@ fn abc_init(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErr
         let namespace = unsafe { w_type_get_dict_ptr(cls) as PyObjectRef };
         if !namespace.is_null() {
             for (name, value) in unsafe { w_dict_items(namespace) } {
+                let value = unsafe { pyre_object::celldict::unwrap_cell(value) };
                 if pyre_interpreter::baseobjspace::isabstractmethod_w(value)? {
                     abstract_names.push(name);
                 }

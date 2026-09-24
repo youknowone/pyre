@@ -3369,9 +3369,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
             guards_before,
             None,
         )?;
-        if !nonstandard
-            && let Some(standard) = ctx.trace_ctx.standard_virtualizable_box()
-        {
+        if !nonstandard && let Some(standard) = ctx.trace_ctx.standard_virtualizable_box() {
             obj = standard;
         }
     }
@@ -4226,7 +4224,8 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
     let Some((w_type, _version_tag, w_descr)) =
         (unsafe { pyre_interpreter::load_method_fast_path(concrete_obj, &name) })
     else {
-        return Ok(None);
+        let cell = unsafe { pyre_interpreter::load_method_cell_fast_path(concrete_obj, &name) };
+        return walker_fold_load_method_cell(ctx, op_pc, obj, concrete_obj, cell, dst, dst_bank);
     };
     if unsafe { resolve_inlinable_callee(w_descr) }.is_none() {
         return Ok(None);
@@ -4278,6 +4277,55 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
 
     let method_const = ctx.trace_ctx.const_ref(w_descr as i64);
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, method_const)?;
+    Ok(Some(()))
+}
+
+/// `load_method_cell_fast_path`: the namespace entry is an `ObjectMutableCell`.
+/// Pin the cell pointer under `_version_tag` and `getfield` `w_value`, so an
+/// in-place method store stays visible without a new trace.
+fn walker_fold_load_method_cell<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    concrete_obj: pyre_object::PyObjectRef,
+    cell_hit: Option<(pyre_object::PyObjectRef, u64, pyre_object::PyObjectRef)>,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    let Some((w_type, _version_tag, cell)) = cell_hit else {
+        return Ok(None);
+    };
+    if !std::ptr::eq(unsafe { (*concrete_obj).w_class }, w_type) {
+        return Ok(None);
+    }
+    let Some(shadow) = (unsafe { walker_classify_shadow_guard(concrete_obj) }) else {
+        return Ok(None);
+    };
+    let physical_type = unsafe { (*concrete_obj).ob_type } as i64;
+    if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
+        let type_const = ctx.trace_ctx.const_int(physical_type);
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[obj, type_const])?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(obj, physical_type);
+    }
+    let w_class_op = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
+    let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
+    walker_emit_fold_guard_with_snapshot(
+        ctx,
+        op_pc,
+        OpCode::GuardValue,
+        &[w_class_op, w_type_const],
+    )?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(w_class_op, w_type_const);
+    walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
+    walker_emit_shadow_guard(ctx, op_pc, obj, concrete_obj, shadow)?;
+    // Do not stamp the payload.  The following CALL must invoke whatever
+    // `w_value` holds, not the function that was there at record time.
+    let value = walker_read_object_mutable_cell_stamped(ctx, cell, false);
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
     Ok(Some(()))
 }
 
@@ -4468,17 +4516,29 @@ fn walker_read_object_mutable_cell<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     cell: pyre_object::PyObjectRef,
 ) -> OpRef {
+    walker_read_object_mutable_cell_stamped(ctx, cell, true)
+}
+
+/// `stamp` is false when a later op must not treat the payload as a green
+/// constant.  A method call inlines whatever concrete it sees and guards that
+/// identity; an in-place cell write would then fail the guard on every
+/// iteration instead of calling the function the `getfield` just read.
+fn walker_read_object_mutable_cell_stamped<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    cell: pyre_object::PyObjectRef,
+    stamp: bool,
+) -> OpRef {
     let cell_op = ctx.trace_ctx.const_ref(cell as i64);
     let value = crate::state::opimpl_getfield_gc_r(
         ctx.trace_ctx,
         cell_op,
         crate::descr::object_mutable_cell_value_descr(),
     );
-    let live = unsafe { (*(cell as *const pyre_object::celldict::ObjectMutableCell)).w_value };
-    ctx.trace_ctx.set_opref_concrete(
-        value,
-        majit_ir::Value::Ref(majit_ir::GcRef(live as usize)),
-    );
+    if stamp {
+        let live = unsafe { (*(cell as *const pyre_object::celldict::ObjectMutableCell)).w_value };
+        ctx.trace_ctx
+            .set_opref_concrete(value, majit_ir::Value::Ref(majit_ir::GcRef(live as usize)));
+    }
     value
 }
 
@@ -4514,9 +4574,9 @@ fn walker_fold_type_attr_cell<Sym: WalkSym>(
     name: &str,
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
-    let Some((w_type, _version_tag, cell)) = (unsafe {
-        pyre_interpreter::type_attr_cell_fast_path(concrete_obj, Wtf8::new(name))
-    }) else {
+    let Some((w_type, _version_tag, cell)) =
+        (unsafe { pyre_interpreter::type_attr_cell_fast_path(concrete_obj, Wtf8::new(name)) })
+    else {
         return Ok(None);
     };
     let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
@@ -4932,6 +4992,15 @@ pub(crate) fn try_walker_fold_load_method_self<Sym: WalkSym>(
     if let Some((_, _, w_descr)) =
         unsafe { pyre_interpreter::baseobjspace::load_method_fast_path(concrete_obj, &name) }
     {
+        if std::ptr::eq(w_descr, concrete_attr) {
+            write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, obj)?;
+            return Ok(Some(()));
+        }
+    }
+    if let Some((_, _, cell)) =
+        unsafe { pyre_interpreter::load_method_cell_fast_path(concrete_obj, &name) }
+    {
+        let w_descr = unsafe { pyre_object::celldict::unwrap_cell(cell) };
         if std::ptr::eq(w_descr, concrete_attr) {
             write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, obj)?;
             return Ok(Some(()));

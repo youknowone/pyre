@@ -9199,11 +9199,17 @@ unsafe fn resolve_instance_dunder_call(
     Some((method, w_class, version_tag, w_code, nparams, has_closure))
 }
 
+/// `(receiver, concrete_receiver, w_class, version_tag, attr_cell)` for an
+/// inlined call whose callee the receiver's class resolved.  `attr_cell` is
+/// `(cell, payload)` when the namespace entry that produced the callee is an
+/// `ObjectMutableCell`: the tag pin does not cover an in-place write to one, so
+/// the payload is re-read and promoted rather than baked on the tag alone.
 type ExceptionInlineReceiverGuard = (
     OpRef,
     pyre_object::PyObjectRef,
     pyre_object::PyObjectRef,
     u64,
+    Option<(pyre_object::PyObjectRef, pyre_object::PyObjectRef)>,
 );
 
 /// `(arg, concrete_arg, w_type)` for an inlined operator's non-receiver
@@ -10630,6 +10636,36 @@ fn walker_pin_type_version_tag<Sym: WalkSym>(
         crate::descr::type_version_tag_descr(),
     );
     walker_flush_guard_not_invalidated(ctx, op_pc)
+}
+
+/// Make a class-namespace `ObjectMutableCell`'s payload green again, so a fold
+/// that bakes the resolved method survives an in-place rebind.
+///
+/// [`walker_pin_type_version_tag`] covers a REPLACING store: `write_cell`
+/// builds a fresh cell and `mutated()` revokes the tag here and in every
+/// subclass.  It covers nothing about an in-place write, which returns `None`
+/// from `write_cell` and moves no tag at all -- so the payload has to be read.
+/// The pin is what holds the cell pointer still, which is why the load is a
+/// `getfield` off a `ConstPtr` and not a second lookup, and the `guard_value`
+/// is what hands the fold back the constant it resolved on.
+fn walker_promote_object_mutable_cell<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    cell: pyre_object::PyObjectRef,
+    expected: pyre_object::PyObjectRef,
+) -> Result<(), DispatchError> {
+    let cell_const = ctx.trace_ctx.const_ref(cell as i64);
+    let value = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        cell_const,
+        crate::descr::object_mutable_cell_value_descr(),
+    );
+    let expected_const = ctx.trace_ctx.const_ref(expected as i64);
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[value, expected_const])?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(value, expected_const);
+    Ok(())
 }
 
 /// The `descriptor.py:175 _immutable_fields_ = ["w_fget?", "w_fset?",

@@ -2743,7 +2743,9 @@ unsafe fn getitem_instance(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
 ///
 /// # Safety
 /// `w_obj` must be a live object.
-pub unsafe fn getitem_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, u64, PyObjectRef)> {
+pub unsafe fn getitem_fast_path(
+    w_obj: PyObjectRef,
+) -> Option<(PyObjectRef, u64, PyObjectRef, PyObjectRef)> {
     unsafe {
         let (w_type, method) = if is_list(w_obj)
             || is_tuple(w_obj)
@@ -2766,7 +2768,11 @@ pub unsafe fn getitem_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, u64,
         if version_tag == 0 {
             return None;
         }
-        Some((w_type, version_tag, method))
+        // An in-place `ObjectMutableCell` write does not move `version_tag`, so
+        // the tag alone does not make `method` green.  Hand the cell back and
+        // let the caller pay [`type_attr_object_cell`]'s getfield and guard.
+        let cell = type_attr_object_cell(w_type, Wtf8::new("__getitem__"));
+        Some((w_type, version_tag, method, cell))
     }
 }
 
@@ -2802,6 +2808,9 @@ pub unsafe fn iter_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, u64, Py
         if version_tag == 0 {
             return None;
         }
+        if type_attr_stored_is_cell(w_type, Wtf8::new("__iter__")) {
+            return None;
+        }
         Some((w_type, version_tag, method))
     }
 }
@@ -2828,6 +2837,9 @@ pub unsafe fn next_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, u64, Py
         let method = lookup_in_type_where(w_type, "__next__")?;
         let version_tag = w_type_version_tag(w_type);
         if version_tag == 0 {
+            return None;
+        }
+        if type_attr_stored_is_cell(w_type, Wtf8::new("__next__")) {
             return None;
         }
         Some((w_type, version_tag, method))
@@ -5551,7 +5563,9 @@ fn _len(obj: PyObjectRef) -> PyResult {
 ///
 /// # Safety
 /// `w_obj` must be a live object.
-pub unsafe fn len_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, u64, PyObjectRef)> {
+pub unsafe fn len_fast_path(
+    w_obj: PyObjectRef,
+) -> Option<(PyObjectRef, u64, PyObjectRef, PyObjectRef)> {
     unsafe {
         if w_obj.is_null() {
             return None;
@@ -5561,7 +5575,10 @@ pub unsafe fn len_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, u64, PyO
         if version_tag == 0 {
             return None;
         }
-        Some((w_type, version_tag, method))
+        // As in [`getitem_fast_path`]: an in-place cell write moves no tag, so
+        // the cell travels with the answer and the caller promotes the payload.
+        let cell = type_attr_object_cell(w_type, Wtf8::new("__len__"));
+        Some((w_type, version_tag, method, cell))
     }
 }
 
@@ -7768,7 +7785,7 @@ pub(crate) unsafe fn object_getattribute_surrogate(
         let w_descr = if w_type.is_null() {
             None
         } else {
-            lookup_in_type_wtf8_uncached(w_type, name)
+            lookup_in_type_wtf8_uncached(w_type, name).and_then(|v| unwrap_looked_up_value(v))
         };
         if let Some(descr) = w_descr
             && is_data_descr(descr)
@@ -7853,7 +7870,8 @@ pub(crate) unsafe fn object_setattr_surrogate(
             crate::typedef::r#type(obj).map_or(std::ptr::null_mut(), |p| p.as_ptr())
         };
         if !w_type.is_null()
-            && let Some(descr) = lookup_in_type_wtf8_uncached(w_type, name)
+            && let Some(descr) =
+                lookup_in_type_wtf8_uncached(w_type, name).and_then(|v| unwrap_looked_up_value(v))
         {
             if set(descr, obj, value)? {
                 return Ok(w_none());
@@ -7947,7 +7965,8 @@ pub(crate) unsafe fn object_delattr_surrogate(
             crate::typedef::r#type(obj).map_or(std::ptr::null_mut(), |p| p.as_ptr())
         };
         if !w_type.is_null()
-            && let Some(descr) = lookup_in_type_wtf8_uncached(w_type, name)
+            && let Some(descr) =
+                lookup_in_type_wtf8_uncached(w_type, name).and_then(|v| unwrap_looked_up_value(v))
             && is_data_descr(descr)
         {
             delete(descr, obj)?;
@@ -10728,6 +10747,18 @@ pub(crate) unsafe fn lookup_where(
     w_type: PyObjectRef,
     name: &str,
 ) -> Option<(PyObjectRef, PyObjectRef)> {
+    let (class, value) = lookup_where_no_unwrapping(w_type, name)?;
+    unwrap_method_cache_value(class, value)
+}
+
+/// The walk itself, with the namespace entry left exactly as stored.
+/// `_lookup_where_all_typeobjects` reads through
+/// `_getdictvalue_no_unwrapping`, and what it returns is what the
+/// `MethodCache` holds, so a `MutableCell` must survive this far.
+unsafe fn lookup_where_no_unwrapping(
+    w_type: PyObjectRef,
+    name: &str,
+) -> Option<(PyObjectRef, PyObjectRef)> {
     if w_type.is_null() || !is_type(w_type) {
         return None;
     }
@@ -10744,7 +10775,7 @@ pub(crate) unsafe fn lookup_where(
         if (*cls).is_null() || !is_type(*cls) {
             continue;
         }
-        if let Some(value) = crate::type_dict_lookup(*cls, name) {
+        if let Some(value) = crate::type_dict_lookup_no_unwrapping(*cls, name) {
             return Some((*cls, value));
         }
     }
@@ -10814,10 +10845,22 @@ pub unsafe fn lookup_where_pair(
     w_type: PyObjectRef,
     name: &str,
 ) -> Option<(PyObjectRef, PyObjectRef)> {
+    let (class, value) = lookup_where_pair_no_unwrapping(w_type, name)?;
+    unwrap_method_cache_value(class, value)
+}
+
+/// [`lookup_where_pair`] with the namespace entry left as stored, for the
+/// `MethodCache` fill.  Same two residuals, same retry, same boxed name: the
+/// only difference is that a `MutableCell` reaches the cache intact, which is
+/// what lets `lookup_where_with_method_cache` unwrap at its front door.
+pub(crate) unsafe fn lookup_where_pair_no_unwrapping(
+    w_type: PyObjectRef,
+    name: &str,
+) -> Option<(PyObjectRef, PyObjectRef)> {
     if !majit_metainterp::jit::we_are_jitted() {
         // Outside a trace there is no residual boundary to keep, so one raw
         // walk answers both halves at once.
-        return lookup_where(w_type, name);
+        return lookup_where_no_unwrapping(w_type, name);
     }
     // Traced code boxes the name so both residuals carry thin pointers only,
     // the way `lookup_in_type_uncached_split` does for the value half: the
@@ -10838,7 +10881,7 @@ pub unsafe fn lookup_where_pair(
         if class.is_null() {
             continue;
         }
-        if crate::type_dict_lookup_wtf8(class, name_wtf8) == Some(value) {
+        if crate::type_dict_lookup_wtf8_no_unwrapping(class, name_wtf8) == Some(value) {
             return Some((class, value));
         }
     }
@@ -10872,7 +10915,9 @@ pub(crate) unsafe fn lookup_where_wtf8(
         if (*cls).is_null() || !is_type(*cls) {
             continue;
         }
-        if let Some(value) = crate::type_dict_lookup_wtf8(*cls, name) {
+        // `_lookup_where_all_typeobjects` stores the raw entry.  A
+        // `MutableCell` stays in the method cache; the front door unwraps.
+        if let Some(value) = crate::type_dict_lookup_wtf8_no_unwrapping(*cls, name) {
             return Some((*cls, value));
         }
     }
@@ -10951,19 +10996,21 @@ pub(crate) unsafe fn _lookup_where_class_uncached(
 #[inline]
 unsafe fn lookup_in_type_uncached_split(w_type: PyObjectRef, name: &Wtf8) -> Option<PyObjectRef> {
     if !majit_metainterp::jit::we_are_jitted() {
-        return lookup_in_type_wtf8_uncached(w_type, name);
+        return lookup_in_type_wtf8_uncached(w_type, name).and_then(|v| unwrap_looked_up_value(v));
     }
     let w_name = pyre_object::unicodeobject::box_str_constant(name);
     let v = _lookup_in_type_uncached(w_type, w_name);
-    if v.is_null() { None } else { Some(v) }
+    unwrap_looked_up_value(v)
 }
 
 unsafe fn lookup_where_pair_wtf8(
     w_type: PyObjectRef,
     name: &Wtf8,
 ) -> Option<(PyObjectRef, PyObjectRef)> {
+    // Method-cache fill: `_lookup_where_all_typeobjects` hands the cache the
+    // raw entry, cell included.
     match name.as_str() {
-        Ok(s) => lookup_where_pair(w_type, s),
+        Ok(s) => lookup_where_pair_no_unwrapping(w_type, s),
         Err(_) => lookup_where_pair_wtf8_uncached(w_type, name),
     }
 }
@@ -11260,7 +11307,7 @@ pub unsafe fn _pure_getdictvalue_no_unwrapping(
     // body is likewise just `self._getdictvalue_no_unwrapping(space, attr)`.
     let _ = version_tag;
     let name = unsafe { pyre_object::unicodeobject::w_str_get_wtf8(w_name) };
-    crate::type_dict_lookup_wtf8(w_type, name).unwrap_or(PY_NULL)
+    crate::type_dict_lookup_wtf8_no_unwrapping(w_type, name).unwrap_or(PY_NULL)
 }
 
 /// The `MethodCache` probe/fill shared by the `@elidable` JIT surface
@@ -11580,6 +11627,27 @@ pub(crate) unsafe fn type_attr_stored_is_cell(w_type: PyObjectRef, name: &Wtf8) 
         .is_some_and(|value| pyre_object::celldict::is_mutable_cell(value))
 }
 
+/// The class-namespace entry for `name` when it is an `ObjectMutableCell`, and
+/// null when it is anything else.
+///
+/// `_version_tag` alone does not make the payload green.  `write_cell` updates
+/// an installed cell in place and returns `None`, so `setdictvalue` skips
+/// `mutated()` and no tag moves.  What the tag does cover is the cell itself: a
+/// replacing store builds a fresh one and `mutated()` revokes the tag here and
+/// in every subclass.  So a caller that wants the payload green pins the tag,
+/// reads `ObjectMutableCell.w_value` off the now-constant cell, and promotes
+/// what it read with a guard -- the three ops a rebound method records
+/// upstream, in that order.
+///
+/// # Safety
+/// `w_type` must be a live type object.
+pub unsafe fn type_attr_object_cell(w_type: PyObjectRef, name: &Wtf8) -> PyObjectRef {
+    match unsafe { type_attr_stored(w_type, name) } {
+        Some(value) if unsafe { pyre_object::celldict::is_object_mutable_cell(value) } => value,
+        _ => std::ptr::null_mut(),
+    }
+}
+
 /// The class-namespace value is a `MutableCell` an in-place write can update
 /// without moving `_version_tag`.  The caller pins the tag (so a replacing
 /// store still revokes the trace) and reads the payload with `getfield`.
@@ -11668,7 +11736,11 @@ unsafe fn unwrap_looked_up_value(w_value: PyObjectRef) -> Option<PyObjectRef> {
         return None;
     }
     let unwrapped = pyre_object::celldict::unwrap_cell(w_value);
-    if unwrapped.is_null() { None } else { Some(unwrapped) }
+    if unwrapped.is_null() {
+        None
+    } else {
+        Some(unwrapped)
+    }
 }
 
 #[inline]
@@ -11836,6 +11908,9 @@ pub unsafe fn load_special_fast_path(
     if version_tag == 0 {
         return None;
     }
+    if type_attr_stored_is_cell(w_type, Wtf8::new(name)) {
+        return None;
+    }
     let w_descr = lookup_in_type(w_type, name)?;
     if !std::ptr::eq((*w_descr).ob_type, &crate::FUNCTION_TYPE as *const _) {
         return None;
@@ -11860,6 +11935,7 @@ pub unsafe fn type_fully_qualified_name(w_type: PyObjectRef) -> String {
     let module = (!dict.is_null())
         .then(|| pyre_object::w_dict_getitem_str(dict, "__module__"))
         .flatten()
+        .map(|m| pyre_object::celldict::unwrap_cell(m))
         .filter(|m| is_str(*m))
         .map(|m| w_str_get_value(m).to_string());
     match module.as_deref() {
@@ -11915,6 +11991,11 @@ pub unsafe fn load_method_fast_path(
     // in `uses_object_getattribute`, so the first access takes the fast
     // path too (not only after the interpreter `getattr` primed the flag).
     if !has_object_getattribute(w_type) {
+        return None;
+    }
+    // A cell's payload moves without `_version_tag`.  The cell fold reads
+    // `ObjectMutableCell.w_value`; this arm only bakes a stable descriptor.
+    if type_attr_stored_is_cell(w_type, Wtf8::new(name)) {
         return None;
     }
     // callmethod.py:59 `_pure_lookup_where_with_method_cache(name, vt)`.
@@ -12525,7 +12606,12 @@ unsafe fn super_attr_suffix_lookup(
         if !past_super || !is_type(t) {
             continue;
         }
-        if let Some(attr) = crate::type_dict_lookup(t, name) {
+        // Own-dict read.  A `MutableCell` here is not a stable descriptor:
+        // an in-place write leaves `objtype`'s version tag alone.
+        if let Some(attr) = crate::type_dict_lookup_no_unwrapping(t, name) {
+            if pyre_object::celldict::is_mutable_cell(attr) {
+                return None;
+            }
             w_descr = attr;
             break;
         }
@@ -16431,6 +16517,9 @@ pub unsafe fn index_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, u64, P
         let method = lookup_in_type_where(w_type, "__index__")?;
         let version_tag = w_type_version_tag(w_type);
         if version_tag == 0 {
+            return None;
+        }
+        if type_attr_stored_is_cell(w_type, Wtf8::new("__index__")) {
             return None;
         }
         Some((w_type, version_tag, method))

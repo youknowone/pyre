@@ -1940,6 +1940,14 @@ pub unsafe fn getattr_hook_fast_path(
     name: &str,
 ) -> Option<(PyObjectRef, u64, MapRef, PyObjectRef)> {
     let (w_type, version_tag, map) = unsafe { getattr_resolves_nowhere(w_obj, name) }?;
+    if unsafe {
+        crate::baseobjspace::type_attr_stored_is_cell(
+            w_type,
+            rustpython_wtf8::Wtf8::new("__getattr__"),
+        )
+    } {
+        return None;
+    }
     let w_getattr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, "__getattr__") }?;
     Some((w_type, version_tag, map, w_getattr))
 }
@@ -1977,6 +1985,14 @@ pub unsafe fn getattribute_hook_fast_path(
     }
     let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(w_type) };
     if version_tag == 0 {
+        return None;
+    }
+    if unsafe {
+        crate::baseobjspace::type_attr_stored_is_cell(
+            w_type,
+            rustpython_wtf8::Wtf8::new("__getattribute__"),
+        )
+    } {
         return None;
     }
     let w_getattribute = unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }?;

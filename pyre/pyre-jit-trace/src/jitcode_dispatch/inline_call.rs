@@ -3906,7 +3906,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
                 ));
             };
             method_form = true;
-            instance_call_pin = Some((r_args[0], callable, w_class, version_tag));
+            instance_call_pin = Some((r_args[0], callable, w_class, version_tag, None));
             (method, w_code, nparams, has_closure)
         }
     };
@@ -7270,7 +7270,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // CALL boundary (single outer Python frame — re-execute the whole
     // call on deopt), captured via `fbw_mode.inline_subwalk` for
     // the sub-walk guards below.
-    if let Some((receiver, concrete_receiver, w_class, version_tag)) = exception_receiver_guard {
+    if let Some((receiver, concrete_receiver, w_class, version_tag, attr_cell)) =
+        exception_receiver_guard
+    {
         walker_guard_exception_attr_slot(
             ctx,
             op.pc,
@@ -7279,6 +7281,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             w_class,
             version_tag,
         )?;
+        // After the class guards and the pin, never before: the pin is what
+        // makes the cell pointer a constant, and an in-place write to the cell
+        // is the one rebind the pin does not see.
+        if let Some((cell, expected)) = attr_cell {
+            walker_promote_object_mutable_cell(ctx, op.pc, cell, expected)?;
+        }
     }
     if let Some((arg, concrete_arg, w_type)) = arg_class_guard {
         // `GuardClass` compares the object's physical `ob_type`, not its Python
@@ -9859,7 +9867,7 @@ pub(crate) fn try_walker_inline_exception_string_override<Sym: WalkSym>(
         w_code,
         nparams,
         has_closure,
-        Some((r_args[2], concrete_receiver, w_class, version_tag)),
+        Some((r_args[2], concrete_receiver, w_class, version_tag, None)),
         None,
         true,
         true,
@@ -9998,7 +10006,7 @@ pub(crate) fn try_walker_inline_hash_builtin<Sym: WalkSym>(
         w_code,
         nparams,
         has_closure,
-        Some((r_args[2], concrete_receiver, w_type, version_tag)),
+        Some((r_args[2], concrete_receiver, w_type, version_tag, None)),
         None,
         true,
         false,
@@ -10584,7 +10592,7 @@ fn try_walker_inline_property_get_named<Sym: WalkSym>(
         w_code,
         nparams,
         has_closure,
-        Some((obj, concrete_obj, w_type, version_tag)),
+        Some((obj, concrete_obj, w_type, version_tag, None)),
         None,
         // LOAD_ATTR is not a CALL either, but this entry is left admitted
         // as it was: only the subscript one below has a witness.
@@ -10702,7 +10710,7 @@ pub(crate) fn try_walker_inline_data_descriptor_get<Sym: WalkSym>(
         w_code,
         nparams,
         has_closure,
-        Some((obj, concrete_obj, w_type, version_tag)),
+        Some((obj, concrete_obj, w_type, version_tag, None)),
         None,
         true,
         false,
@@ -11192,7 +11200,7 @@ pub(crate) fn try_walker_inline_property_set<Sym: WalkSym>(
         w_code,
         nparams,
         has_closure,
-        Some((obj, concrete_obj, w_type, version_tag)),
+        Some((obj, concrete_obj, w_type, version_tag, None)),
         None,
         // STORE_ATTR, same standing as the getter above.
         true,
@@ -11384,7 +11392,7 @@ pub(crate) fn try_walker_inline_index<Sym: WalkSym>(
         w_code,
         nparams,
         has_closure,
-        Some((arg, concrete_arg, w_type, version_tag)),
+        Some((arg, concrete_arg, w_type, version_tag, None)),
         None,
         // This method call is nested inside `range(...)`, not represented by
         // a caller bytecode CALL of its own.
@@ -11451,11 +11459,15 @@ pub(crate) fn try_walker_inline_subscr_getitem<Sym: WalkSym>(
     ) else {
         return Ok(None);
     };
-    let Some((w_type, version_tag, w_getitem)) =
+    let Some((w_type, version_tag, w_getitem, attr_cell)) =
         (unsafe { pyre_interpreter::baseobjspace::getitem_fast_path(concrete_obj) })
     else {
         return Ok(None);
     };
+    // Null unless the namespace entry is an `ObjectMutableCell`, which is what
+    // a rebound `__getitem__` leaves behind.  Baking the method on the version
+    // tag alone would keep calling the function the first store installed.
+    let cell_guard = (!attr_cell.is_null()).then_some((attr_cell, w_getitem));
     let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(w_getitem) })
     else {
         return Ok(None);
@@ -11508,7 +11520,7 @@ pub(crate) fn try_walker_inline_subscr_getitem<Sym: WalkSym>(
         w_code,
         nparams,
         has_closure,
-        Some((obj, concrete_obj, w_type, version_tag)),
+        Some((obj, concrete_obj, w_type, version_tag, cell_guard)),
         None,
         // `entry_is_call_boundary`, for the reason the forward-dunder route
         // gives: what decides it is whether the abort rewind can name this
@@ -11567,11 +11579,15 @@ fn try_walker_inline_len_dunder<Sym: WalkSym>(
     if ctx.fbw_mode.inline_subwalk {
         return Ok(None);
     }
-    let Some((w_type, version_tag, w_len)) =
+    let Some((w_type, version_tag, w_len, attr_cell)) =
         (unsafe { pyre_interpreter::baseobjspace::len_fast_path(concrete_receiver) })
     else {
         return Ok(None);
     };
+    // A rebound `__len__` leaves an `ObjectMutableCell` in the namespace; the
+    // version tag does not move when the next store updates it in place, so the
+    // payload is promoted rather than baked.  See the `__getitem__` route.
+    let cell_guard = (!attr_cell.is_null()).then_some((attr_cell, w_len));
     let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(w_len) }) else {
         return Ok(None);
     };
@@ -11618,7 +11634,13 @@ fn try_walker_inline_len_dunder<Sym: WalkSym>(
         w_code,
         nparams,
         has_closure,
-        Some((receiver_op, concrete_receiver, w_type, version_tag)),
+        Some((
+            receiver_op,
+            concrete_receiver,
+            w_type,
+            version_tag,
+            cell_guard,
+        )),
         None,
         // The entry is a Python CALL of its own, which is what the abort
         // rewind names.
@@ -11746,7 +11768,7 @@ pub(crate) fn try_walker_specialize_instance_iter<Sym: WalkSym>(
         w_code,
         nparams,
         has_closure,
-        Some((obj_op, concrete_obj, w_type, version_tag)),
+        Some((obj_op, concrete_obj, w_type, version_tag, None)),
         None,
         // GET_ITER consumes one iterable and produces one iterator. Its
         // caller-operand shape is recorded by `caller_operand_slots`, so the
@@ -11921,7 +11943,7 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
         w_code,
         nparams,
         has_closure,
-        Some((iter_op, iter_obj, w_type, version_tag)),
+        Some((iter_op, iter_obj, w_type, version_tag, None)),
         None,
         true,
         false,
@@ -13590,7 +13612,7 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
         w_code,
         nparams,
         has_closure,
-        Some((receiver, concrete_receiver, w_class, version_tag)),
+        Some((receiver, concrete_receiver, w_class, version_tag, None)),
         Some((other, concrete_other, w_typ_other)),
         // `entry_is_call_boundary`.  What decides it is whether the abort
         // rewind can name this entry, not whether the entry is spelled CALL,
@@ -13854,7 +13876,7 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
         w_code,
         nparams,
         has_closure,
-        Some((lhs, concrete_lhs, w_class, version_tag)),
+        Some((lhs, concrete_lhs, w_class, version_tag, None)),
         Some((rhs, concrete_rhs, w_typ_r.as_ptr())),
         // `entry_is_call_boundary`.  What decides it is whether the abort
         // rewind can name this entry, not whether the entry is spelled CALL,
@@ -14082,7 +14104,7 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
         w_code,
         nparams,
         has_closure,
-        Some((value, concrete_value, w_class, version_tag)),
+        Some((value, concrete_value, w_class, version_tag, None)),
         None,
         // FORMAT_WITH_SPEC pops both of its operands, so the abort rewind
         // cannot re-execute it from the stack it had: only a `Clean` body is

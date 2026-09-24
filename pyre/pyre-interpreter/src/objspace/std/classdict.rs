@@ -253,11 +253,9 @@ fn type_namespace(w_type: PyObjectRef) -> PyObjectRef {
 /// When the type has a version tag, `write_cell` (`typeobject.py`) either
 /// updates an existing `MutableCell` in place and returns `None`, or returns
 /// the object the namespace must store (the raw value on the first write, a
-/// fresh cell once the previous value cannot absorb the new one).  `None`
-/// skips `mutated()`, so `_version_tag` does not move and a quasi-immutable
-/// watcher on that field stays valid.  A type with no tag stores the raw
-/// value and always mutates, matching the untagged arm.
-///
+/// fresh `ObjectMutableCell` or `IntMutableCell` once the previous value
+/// cannot absorb the new one).  `None` skips `mutated()`, so `_version_tag`
+/// does not move.  A type with no tag stores the raw value and always mutates.
 pub(crate) unsafe fn type_setdictvalue_wtf8(
     w_type: PyObjectRef,
     name: &Wtf8,
@@ -276,39 +274,11 @@ pub(crate) unsafe fn type_setdictvalue_wtf8(
         // `W_TypeObject.setdictvalue` reads through
         // `_pure_getdictvalue_no_unwrapping`, which does not unwrap.
         let w_name = pyre_object::unicodeobject::box_str_constant(name);
-        let raw = crate::baseobjspace::_pure_getdictvalue_no_unwrapping(
-            w_type, w_name, version_tag,
-        );
+        let raw =
+            crate::baseobjspace::_pure_getdictvalue_no_unwrapping(w_type, w_name, version_tag);
         let w_curr = if raw.is_null() { None } else { Some(raw) };
-        // `write_cell` returns `None` for three different stores: an
-        // `IntMutableCell` updated in place, an `ObjectMutableCell` updated
-        // in place, and the same object stored again.  Only the int cell
-        // may skip `mutated()`.  Its payload is read with `getfield`, so the
-        // version tag has to stay put.  The other two keep the tag moving:
-        // method folds bake the unwrapped function under it, and a repeated
-        // store of one object used to bump the tag on every assignment.
-        let inplace_int = w_curr.is_some_and(|cell| {
-            pyre_object::celldict::is_int_mutable_cell(cell)
-        });
         match pyre_object::celldict::write_cell(w_curr, w_value) {
-            None => {
-                if !inplace_int {
-                    crate::baseobjspace::mutated(w_type, name.as_str().ok());
-                }
-                return Ok(());
-            }
-            // NARROWER THAN UPSTREAM, and this is debt, not a design choice.
-            // `write_cell` wraps every replacing store, so upstream parks an
-            // `ObjectMutableCell` in the namespace here.  pyre still has a
-            // reader that reaches a type-dict resident without going through
-            // `unwrap_cell` -- a type-parameter bound is the one that showed
-            // it -- and that reader would observe the cell.  Storing the raw
-            // value and moving the tag is observationally identical; it only
-            // costs the version-tag stability an object-valued attribute
-            // could have had.  Converging means auditing every type-dict
-            // reader for `unwrap_cell` first, then deleting this arm.  The
-            // int cell is the one an in-place update has to absorb.
-            Some(stored) if pyre_object::celldict::is_object_mutable_cell(stored) => {}
+            None => return Ok(()),
             Some(stored) => w_value = stored,
         }
     }
