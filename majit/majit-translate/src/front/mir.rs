@@ -4957,7 +4957,7 @@ impl<'a> Lowering<'a> {
             // param is never touched, and a fieldless enum — already
             // resolved to `Int` above regardless of its own zero-sized
             // layout — never reaches this arm.
-            let ty = if matches!(ty, ValueType::Ref(None)) && tyref_is_zero_sized(&local.ty, llbc) {
+            let ty = if matches!(ty, ValueType::Ref(None)) && tyref_is_void_zst(&local.ty, llbc) {
                 ValueType::Void
             } else {
                 ty
@@ -7272,6 +7272,15 @@ impl<'a> Lowering<'a> {
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                     return Ok((Some(OpKind::ConstInt(tag)), res));
+                }
+                // A fieldless struct / unit value is `lltype.Void`
+                // (`TUPLE_TYPE([])`, `getkind(Void) == 'void'`). No
+                // constructor, no ref register.
+                if tyref_is_void_zst(dest_ty, self.llbc) {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Void);
+                    return Ok((None, res));
                 }
                 // `Option<E>` over a dense fieldless enum E is the same
                 // scalar plus one reserved `None` value.  Constructing
@@ -10340,6 +10349,12 @@ impl<'a> Lowering<'a> {
             _ => (false, None, None),
         };
         for op in call.args {
+            // A zero-sized receiver (`&self` on a fieldless struct, unit)
+            // is `lltype.Void`. The callee's parameter is stamped the same
+            // way, so the argument is absent on both sides.
+            if operand_is_void_zst(self.llbc, &op) {
+                continue;
+            }
             args.push(self.resolve_operand(mir_bb, op)?);
         }
         let first_arg_is_string_array_view = args.first().is_some_and(|arg| {
@@ -27280,6 +27295,36 @@ fn tyref_is_enum_free(ty: &TyRef, llbc: &Llbc) -> bool {
 /// bytes of its owner, so an enum whose every variant field is zero-sized
 /// has no payload at all and is the same by-value tag integer a
 /// syntactically fieldless enum is.
+/// A value with no runtime representation: unit `()`, a layout-size-0
+/// struct, or one borrow of such a struct (`&self` on a ZST).
+///
+/// A fieldless enum is a discriminant integer, including through a borrow,
+/// so it is not void. `strip_ty_wrappers` peels the borrow; the pointee's
+/// layout is what `tyref_is_zero_sized` reads.
+fn tyref_is_void_zst(ty: &TyRef, llbc: &Llbc) -> bool {
+    if tyref_is_fieldless_enum_free(ty, llbc) || tyref_is_borrowed_fieldless_enum_free(ty, llbc) {
+        return false;
+    }
+    if is_unit_type(ty, llbc) || tyref_is_zero_sized(ty, llbc) {
+        return true;
+    }
+    let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_wrappers(node, llbc)) else {
+        return false;
+    };
+    let peeled = TyRef::Other(node.clone());
+    if tyref_is_fieldless_enum_free(&peeled, llbc) {
+        return false;
+    }
+    is_unit_type(&peeled, llbc) || tyref_is_zero_sized(&peeled, llbc)
+}
+
+fn operand_is_void_zst(llbc: &Llbc, op: &Operand) -> bool {
+    match op {
+        Operand::Copy(place) | Operand::Move(place) => tyref_is_void_zst(&place.ty, llbc),
+        Operand::Const(_) => false,
+    }
+}
+
 fn tyref_is_zero_sized(ty: &TyRef, llbc: &Llbc) -> bool {
     let def_id = match ty {
         TyRef::Inline { value: (_, v) } | TyRef::Other(v) => inline_adt_def_id(v),
