@@ -498,14 +498,16 @@ pub unsafe fn walk_raw_code_roots(
         visitor(&mut *(&mut code.w_qualname as *mut PyObjectRef as *mut majit_ir::GcRef));
         // `co_name` is realized and retained the same way.
         visitor(&mut *(&mut code.w_name as *mut PyObjectRef as *mut majit_ir::GcRef));
+        let names_slot = &mut code.co_names_w as *mut *mut pyre_object::FixedObjectArray;
+        visitor(&mut *(names_slot as *mut majit_ir::GcRef));
+        let consts_slot = &mut code.co_consts_w as *mut *mut pyre_object::FixedObjectArray;
+        visitor(&mut *(consts_slot as *mut majit_ir::GcRef));
         if !code.co_consts_w.is_null() {
-            for slot in (&*code.co_consts_w).iter() {
-                let mut child = slot.load(std::sync::atomic::Ordering::Acquire);
-                if child.is_null() {
+            for slot in unsafe { (*code.co_consts_w).as_mut_slice() } {
+                if slot.is_null() {
                     continue;
                 }
-                visitor(&mut *(&mut child as *mut PyObjectRef as *mut majit_ir::GcRef));
-                slot.store(child, std::sync::atomic::Ordering::Release);
+                visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));
             }
         }
         // mapdict.py CacheEntry.w_method is the cache's sole GC
