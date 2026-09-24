@@ -671,7 +671,7 @@ fn gateway_wrapper_refusals_all_residualize() {
     // reports a runtime receiver type, so unlike its two neighbours it could
     // never have been a literal, and left transparent it put one
     // materialisation in the wrapper per call site.
-    // `__majit_wrap_random` moved with `_random` into `pyre-module`.
+    // `__majit_wrap_random` lives in `pyre-module.ullbc` after the `_random` move.
     for (llbc, name) in [
         (optional_module(), "__majit_wrap_random"),
         (interp(), "__majit_wrap_getvalue"),
