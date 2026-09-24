@@ -9492,7 +9492,6 @@ pub(crate) fn get_type_flag(
             || s.starts_with("Box<")
             || s.starts_with("Arc<")
             || s.starts_with("Rc<")
-            || s.starts_with("Vec<")
             || s.starts_with("Option<")
             || s == "String" =>
         {
@@ -9502,6 +9501,14 @@ pub(crate) fn get_type_flag(
                 crate::layout::target_word_size(),
             )
         }
+        // `{cap, ptr, len}`. The field is the three-word value, so
+        // `&mut vec_field` is the address of that value. A one-word
+        // pointer load reads `cap`.
+        s if s.starts_with("Vec<") => (
+            ArrayFlag::Struct,
+            majit_ir::value::Type::Ref,
+            3 * crate::layout::target_word_size(),
+        ),
         // RPython: TYPE is lltype.Float → FLAG_FLOAT
         "f64" => (ArrayFlag::Float, majit_ir::value::Type::Float, 8),
         // RPython: SingleFloat is not lltype.Float and `rffi.cast(_, -1)
@@ -10298,6 +10305,57 @@ mod tests {
         assert_eq!(
             return_type_string_to_value_type(Some(&"f64".to_string())),
             Type::Float
+        );
+    }
+
+    /// A `Vec<T>` field is the three-word value `{cap, ptr, len}`.
+    /// Loading one word at the field's offset reads `cap`. The address
+    /// of the field is the address of that value; the buffer pointer
+    /// sits one word in.
+    #[test]
+    fn vec_field_is_an_inline_three_word_value() {
+        use crate::model::FieldDescriptor;
+        use majit_ir::descr::ArrayFlag;
+        use majit_ir::value::Type;
+
+        let word = crate::layout::target_word_size();
+        let (flag, ty, size) = get_type_flag("Vec<Box<Dynamic>>");
+        assert_eq!(flag, ArrayFlag::Struct);
+        assert_eq!(ty, Type::Ref);
+        assert_eq!(size, 3 * word);
+        let (box_flag, _, box_size) = get_type_flag("Box<Dynamic>");
+        assert_eq!(box_flag, ArrayFlag::Pointer);
+        assert_eq!(box_size, word);
+
+        let layout = StructLayout::from_type_strings(
+            &[
+                ("stack".into(), "Vec<Box<Dynamic>>".into()),
+                ("depth".into(), "usize".into()),
+            ],
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(layout.fields[0].name, "stack");
+        assert_eq!(layout.fields[0].offset, 0);
+        assert_eq!(layout.fields[0].size, 3 * word);
+        assert_eq!(layout.fields[0].flag, ArrayFlag::Struct);
+        assert_eq!(layout.fields[1].name, "depth");
+        assert_eq!(layout.fields[1].offset, 3 * word);
+
+        let owner = "vec_field_layout::Vm";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(owner_id, layout);
+        let stack = FieldDescriptor::new("stack", Some(owner.into())).with_taken_by_address(true);
+        assert_eq!(
+            crate::assembler::inline_substruct_field_offset(&cc, &stack),
+            Some(0),
+            "the address of an inline Vec is the field, not a load of cap"
         );
     }
 

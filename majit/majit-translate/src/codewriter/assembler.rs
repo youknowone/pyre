@@ -3614,12 +3614,13 @@ fn type_flag_from_str(
             || s.starts_with("Box<")
             || s.starts_with("Arc<")
             || s.starts_with("Rc<")
-            || s.starts_with("Vec<")
             || s.starts_with("Option<")
             || s == "String" =>
         {
             (ArrayFlag::Pointer, majit_ir::value::Type::Ref, word)
         }
+        // `{cap, ptr, len}` inline. Same arm as `get_type_flag`.
+        s if s.starts_with("Vec<") => (ArrayFlag::Struct, majit_ir::value::Type::Ref, 3 * word),
         "f64" => (ArrayFlag::Float, majit_ir::value::Type::Float, 8),
         "f32" => (ArrayFlag::Float, majit_ir::value::Type::Float, 4),
         "i64" => (ArrayFlag::Signed, majit_ir::value::Type::Int, 8),
