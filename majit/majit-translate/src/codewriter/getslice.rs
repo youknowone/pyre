@@ -85,7 +85,12 @@ pub fn array_identity_of_base(
                 array_type_id,
                 ..
             } if same(b) => return Some((item_ty.clone(), array_type_id.clone())),
-            OpKind::NewArrayClear {
+            OpKind::NewArray {
+                item_ty,
+                array_type_id,
+                ..
+            }
+            | OpKind::NewArrayClear {
                 item_ty,
                 array_type_id,
                 ..

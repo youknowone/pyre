@@ -1011,7 +1011,9 @@ pub(crate) fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
         | OpKind::LoweredBlackholeOp { args, .. } => args.clone(),
         // `new_array_clear(v_length, arraydescr)` — only the length is an
         // SSA operand; the arraydescr is a descriptor, not a value.
-        OpKind::NewArrayClear { length, .. } => vec![length.clone()],
+        OpKind::NewArray { length, .. } | OpKind::NewArrayClear { length, .. } => {
+            vec![length.clone()]
+        }
         // `newlist_clear(v_length, ...)` — same operand shape: only the
         // length is an SSA operand; the struct/array descrs are not values.
         OpKind::NewListClear { length, .. } => vec![length.clone()],

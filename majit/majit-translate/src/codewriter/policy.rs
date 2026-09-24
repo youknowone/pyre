@@ -535,7 +535,8 @@ pub fn collect_declared_value_types<'a>(kind: &'a OpKind, out: &mut Vec<&'a Valu
         | OpKind::LoadStatic { ty, .. } => out.push(ty),
 
         // The element type of the array or interior field addressed.
-        OpKind::NewArrayClear { item_ty, .. }
+        OpKind::NewArray { item_ty, .. }
+        | OpKind::NewArrayClear { item_ty, .. }
         | OpKind::NewListClear { item_ty, .. }
         | OpKind::ArrayRead { item_ty, .. }
         | OpKind::ArrayWrite { item_ty, .. }
