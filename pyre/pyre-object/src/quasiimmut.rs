@@ -513,6 +513,7 @@ mod tests {
     #[test]
     fn publication_is_serialised_across_threads() {
         const ROUNDS: usize = 200_000;
+        const RECORDER_ROUNDS: usize = 4 * ROUNDS;
 
         let field = QuasiImmutField::new();
         let stop = AtomicBool::new(false);
@@ -526,7 +527,12 @@ mod tests {
                 scope.spawn(move || {
                     let flag = Arc::new(AtomicBool::new(false));
                     let token = test_loop_token(&flag);
-                    while !stop.load(Ordering::Relaxed) {
+                    // Bounded, so a starved mutator cannot turn this loop into
+                    // an unbounded producer.
+                    for _ in 0..RECORDER_ROUNDS {
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
                         field
                             .get_current_qmut_instance()
                             .register_loop_token(&token);
