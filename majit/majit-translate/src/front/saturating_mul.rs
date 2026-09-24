@@ -5,11 +5,12 @@
 //! `core::num::<Impl>::saturating_mul` is a foreign leaf whose body is Opaque
 //! in the LLBC, so the caller emits a residual `saturating_mul` call.  Portal-
 //! reachable sites (`W_ListObject` / unicode grow, `str::repeat`, buffer
-//! nbytes, `_ast` offsets) are word-sized unsigned.  Wrapping mul in the
-//! word bank plus a high-half test is the overflow check.  `uint_mul_high`
-//! is the high 64 bits of a 64×64 product, so a 4-byte word also shifts the
-//! low product by 32 and ors that half in.  The overflow arm yields the
-//! max of the op's `Unsigned` lowleveltype (`unsigned_word_max`).
+//! nbytes, `_ast` offsets) are the 8-byte JIT int bank.  Wrapping mul in
+//! that bank plus a high-half test is the overflow check.  `uint_mul_high`
+//! is the high 64 bits of a 64×64 product.  A 4-byte word is not that
+//! bank (`(lo >> 32) | hi` leaves the low product unmasked), so the
+//! rewrite declines and the residual call stays.  The overflow arm yields
+//! the max of the op's `Unsigned` lowleveltype (`unsigned_word_max`).
 //!
 //! A narrow `u16`/`u32` saturating mul is **not** that test: `u32::MAX *
 //! u32::MAX` fits in a u64, so the high word stays zero and the rewrite would
@@ -75,6 +76,15 @@ fn rewire_one_saturating_mul_site(
     word_bytes: usize,
 ) -> Result<(), String> {
     let name = graph.name.clone();
+    // `uint_mul_high` is bits [64, 128) of a 64×64 product. A narrower
+    // word is not that bank: `(lo >> 32) | hi` still leaves `lo` unmasked,
+    // the same miss as `u32` on an 8-byte target. The capture gate keeps
+    // a 4-byte `usize` residual.
+    if word_bytes != 8 {
+        return Err(format!(
+            "{name}: saturating_mul word of {word_bytes} bytes is not the JIT int bank"
+        ));
+    }
     let a = graph
         .blocks
         .iter()
@@ -162,38 +172,7 @@ fn rewire_one_saturating_mul_site(
         result: Some(zero.clone()),
         kind: OpKind::ConstUInt(0),
     });
-    // `uint_mul_high` is bits [64, 128) of a 64×64 product. A 4-byte word
-    // overflows when bits [32, 64) are set as well, so fold `(lo >> 32) | hi`.
-    let high = if word_bytes >= 8 {
-        hi
-    } else {
-        let shift_n = graph.alloc_value_var();
-        graph.block_mut(a_id).operations.push(SpaceOperation {
-            result: Some(shift_n.clone()),
-            kind: OpKind::ConstUInt((word_bytes.saturating_mul(8)) as u64),
-        });
-        let hi_word = graph.alloc_value_var();
-        graph.block_mut(a_id).operations.push(SpaceOperation {
-            result: Some(hi_word.clone()),
-            kind: OpKind::BinOp {
-                op: "uint_rshift".to_string(),
-                lhs: lo.clone(),
-                rhs: shift_n,
-                result_ty: ValueType::Unsigned,
-            },
-        });
-        let mixed = graph.alloc_value_var();
-        graph.block_mut(a_id).operations.push(SpaceOperation {
-            result: Some(mixed.clone()),
-            kind: OpKind::BinOp {
-                op: "uint_or".to_string(),
-                lhs: hi_word,
-                rhs: hi,
-                result_ty: ValueType::Unsigned,
-            },
-        });
-        mixed
-    };
+    let high = hi;
     let ovf = graph.alloc_value_var();
     graph.block_mut(a_id).operations.push(SpaceOperation {
         result: Some(ovf.clone()),
@@ -332,7 +311,7 @@ mod tests {
     }
 
     #[test]
-    fn four_byte_word_clamps_at_u32_max_and_shifts_the_low_half() {
+    fn four_byte_word_is_not_rewritten_onto_the_jit_bank() {
         let mut g = FunctionGraph::new("test_saturating_mul_u32");
         let a = g.startblock;
         let av = g.push_op_var(a, OpKind::ConstInt(7), true).unwrap();
@@ -343,20 +322,14 @@ mod tests {
         g.set_goto(a, b, vec![r.clone()]);
 
         let rewritten = rewire_saturating_mul_call_sites_for(&mut g, std::slice::from_ref(&r), 4);
-        assert_eq!(rewritten, 1);
+        assert_eq!(rewritten, 0, "a 4-byte word is not the 8-byte JIT int bank");
         assert!(
-            g.blocks
-                .iter()
-                .flat_map(|blk| &blk.operations)
-                .any(|op| { matches!(&op.kind, OpKind::ConstUInt(n) if *n == u32::MAX as u64) }),
-            "4-byte overflow arm is u32::MAX"
-        );
-        assert!(
-            g.blocks[a.0]
-                .operations
-                .iter()
-                .any(|op| { matches!(&op.kind, OpKind::BinOp { op, .. } if op == "uint_rshift") }),
-            "4-byte overflow looks at bits [32, 64) of the product"
+            g.blocks[a.0].operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                    if segments.last().map(String::as_str) == Some("saturating_mul")
+            )),
+            "residual saturating_mul call is left untouched"
         );
     }
 

@@ -81,6 +81,14 @@ fn rewire_one_saturating_add_site(
     word_bytes: usize,
 ) -> Result<(), String> {
     let name = graph.name.clone();
+    // `uint_lt(sum, x)` sees a carry in the 8-byte JIT bank. A 4-byte
+    // `usize::MAX + 1` is `4294967296` there, not a wrap, so the clamp
+    // never fires. Decline, the same as a narrow `u32`.
+    if word_bytes != 8 {
+        return Err(format!(
+            "{name}: saturating_add word of {word_bytes} bytes is not the JIT int bank"
+        ));
+    }
     let a = graph
         .blocks
         .iter()
@@ -341,27 +349,37 @@ mod tests {
 
     #[test]
     fn saturating_add_clamps_at_unsigned_lowleveltype_max() {
-        for word_bytes in [8usize, 4] {
-            let unsigned_max = match word_bytes {
-                8 => u64::MAX,
-                4 => u32::MAX as u64,
-                _ => unreachable!(),
-            };
-            let mut g = FunctionGraph::new("test_saturating_add_width");
-            let a = g.startblock;
-            let av = g.push_op_var(a, OpKind::ConstInt(7), true).unwrap();
-            let bv = g.push_op_var(a, OpKind::ConstInt(3), true).unwrap();
-            let r = emit_call(&mut g, a, vec![av, bv]);
-            let (b, _b_args) = g.create_block_with_arg_vars(1);
-            g.set_return(b, None);
-            g.set_goto(a, b, vec![r.clone()]);
-            let rewritten = rewire_saturating_add_call_sites_for(
-                &mut g,
-                &[SaturatingAddSite { result_var: r }],
-                word_bytes,
-            );
-            assert_eq!(rewritten, 1);
-            assert_eq!(overflow_const(&g), unsigned_max);
-        }
+        let mut g = FunctionGraph::new("test_saturating_add_width");
+        let a = g.startblock;
+        let av = g.push_op_var(a, OpKind::ConstInt(7), true).unwrap();
+        let bv = g.push_op_var(a, OpKind::ConstInt(3), true).unwrap();
+        let r = emit_call(&mut g, a, vec![av, bv]);
+        let (b, _b_args) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![r.clone()]);
+        let rewritten = rewire_saturating_add_call_sites_for(
+            &mut g,
+            &[SaturatingAddSite {
+                result_var: r.clone(),
+            }],
+            8,
+        );
+        assert_eq!(rewritten, 1);
+        assert_eq!(overflow_const(&g), u64::MAX);
+
+        let mut narrow = FunctionGraph::new("test_saturating_add_width_4");
+        let a = narrow.startblock;
+        let av = narrow.push_op_var(a, OpKind::ConstInt(7), true).unwrap();
+        let bv = narrow.push_op_var(a, OpKind::ConstInt(3), true).unwrap();
+        let r = emit_call(&mut narrow, a, vec![av, bv]);
+        let (b, _) = narrow.create_block_with_arg_vars(1);
+        narrow.set_return(b, None);
+        narrow.set_goto(a, b, vec![r.clone()]);
+        let rewritten = rewire_saturating_add_call_sites_for(
+            &mut narrow,
+            &[SaturatingAddSite { result_var: r }],
+            4,
+        );
+        assert_eq!(rewritten, 0, "a 4-byte word is not the 8-byte JIT int bank");
     }
 }

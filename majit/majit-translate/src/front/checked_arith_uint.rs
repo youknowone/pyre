@@ -113,19 +113,33 @@ impl UintArith {
     }
 }
 
-/// The unsigned checked-arithmetic pass uses one machine-word operation
-/// and its carry/borrow test.  Charon's flattened [`ValueType::Unsigned`]
+/// The unsigned checked-arithmetic pass uses one JIT-bank operation and
+/// its carry/borrow test.  Charon's flattened [`ValueType::Unsigned`]
 /// erases the source width, so retain the literal atom at the capture
-/// gate: a narrow `u8`/`u16`/`u32` overflow is not necessarily a word
+/// gate: a narrow `u8`/`u16`/`u32` overflow is not necessarily a bank
 /// overflow.
 ///
-/// `Unsigned` (`unsigned_repr`, `uint_*`) is the machine word: `usize`,
-/// and `u64` only when that word is 8 bytes. `u64` on a 4-byte target is
-/// `UnsignedLongLong` (`unsignedlonglong_repr`, `ullong_*`).
+/// The bank is 8 bytes. `int_add` / `uint_lt` / `uint_mul_high` lower to
+/// the wasm `I64Add` / `I64LtU` / 64×64 high half, with no `intmask`
+/// back to a 4-byte target word (`rarithmetic.intmask` / `r_uint` at
+/// `LONG_BIT`). A 4-byte `usize` is the same width as `u32` and must
+/// keep the residual call. `u64` matches the bank only when the target
+/// word is 8 bytes; on a 4-byte target it is `UnsignedLongLong`
+/// (`unsignedlonglong_repr`, `ullong_*`), not this `uint_*` op.
 pub(crate) fn is_word_sized_uint_atom_for(atom: &str, word_bytes: usize) -> bool {
     match atom {
-        "Usize" => true,
-        "U64" => word_bytes == 8,
+        "Usize" | "U64" => word_bytes == 8,
+        _ => false,
+    }
+}
+
+/// `I64` / `U64` are the 8-byte JIT int bank. `Isize` / `Usize` are that
+/// bank only when the target word is 8 bytes; a 4-byte word wraps like
+/// `i32` / `u32` and must not be lowered to an unmasked `int_*` op.
+pub(crate) fn is_jit_bank_int_atom(atom: &str, word_bytes: usize) -> bool {
+    match atom {
+        "I64" | "U64" => true,
+        "Isize" | "Usize" => word_bytes == 8,
         _ => false,
     }
 }
@@ -173,8 +187,20 @@ pub(crate) fn unsigned_word_atom<'a>(
     dest_payload_atom: Option<&'a str>,
     operand_atoms: impl IntoIterator<Item = Option<&'a str>>,
 ) -> Option<&'a str> {
+    unsigned_word_atom_for(
+        dest_payload_atom,
+        operand_atoms,
+        crate::layout::target_word_size(),
+    )
+}
+
+pub(crate) fn unsigned_word_atom_for<'a>(
+    dest_payload_atom: Option<&'a str>,
+    operand_atoms: impl IntoIterator<Item = Option<&'a str>>,
+    word_bytes: usize,
+) -> Option<&'a str> {
     let atom = dest_payload_atom.or_else(|| operand_atoms.into_iter().flatten().next())?;
-    is_word_sized_uint_atom(atom).then_some(atom)
+    is_word_sized_uint_atom_for(atom, word_bytes).then_some(atom)
 }
 
 fn rewire_one_checked_arith_uint_site(
@@ -373,12 +399,44 @@ mod tests {
         assert!(is_word_sized_uint_atom_for("Usize", 8));
         assert!(is_word_sized_uint_atom_for("U64", 8));
         assert!(!is_word_sized_uint_atom_for("U32", 8));
-        assert!(is_word_sized_uint_atom_for("Usize", 4));
+        assert!(
+            !is_word_sized_uint_atom_for("Usize", 4),
+            "4-byte usize is u32-wide; the JIT int bank does not wrap there"
+        );
         assert!(
             !is_word_sized_uint_atom_for("U64", 4),
             "u64 on a 4-byte target is UnsignedLongLong, not the uint_* word op"
         );
         assert!(!is_word_sized_uint_atom_for("U32", 4));
+    }
+
+    #[test]
+    fn four_byte_usize_wrapping_shl_is_not_a_jit_bank_op() {
+        assert!(
+            !is_jit_bank_int_atom("Usize", 4),
+            "usize::wrapping_shl on a 4-byte word must stay a residual call"
+        );
+        assert!(!is_jit_bank_int_atom("Isize", 4));
+        assert!(is_jit_bank_int_atom("Usize", 8));
+        assert!(is_jit_bank_int_atom("Isize", 8));
+        assert!(is_jit_bank_int_atom("U64", 4));
+        assert!(is_jit_bank_int_atom("I64", 4));
+        assert!(!is_jit_bank_int_atom("U32", 8));
+        assert!(!is_jit_bank_int_atom("I32", 8));
+    }
+
+    #[test]
+    fn four_byte_usize_checked_add_is_not_an_unchecked_bank_op() {
+        assert!(!is_word_sized_uint_atom_for("Usize", 4));
+        assert_eq!(
+            unsigned_word_atom_for(Some("Usize"), [None, None], 4),
+            None,
+            "usize::checked_add on a 4-byte word must stay a residual call"
+        );
+        assert_eq!(
+            unsigned_word_atom_for(Some("Usize"), [None, None], 8),
+            Some("Usize")
+        );
     }
 
     use super::*;
