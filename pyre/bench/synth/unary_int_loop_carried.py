@@ -37,9 +37,9 @@ def controls(n):
     return s, acc, -7
 
 
-print(loop_carried_neg(30000))
-print(large_neg(20000))
-print(controls(30000))
+print(loop_carried_neg(360000))
+print(large_neg(240000))
+print(controls(360000))
 
 
 def hot_invert(n):
@@ -52,4 +52,4 @@ def hot_invert(n):
     return s
 
 
-print(hot_invert(30000000))
+print(hot_invert(360000000))

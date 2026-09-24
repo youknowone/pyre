@@ -27,7 +27,7 @@ try:
 except ImportError:
     pass
 
-N = 400
+N = 600000
 
 
 def out(key, value):
