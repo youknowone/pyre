@@ -4160,10 +4160,10 @@ fn emit_alloc_array_helper(
     sink.call_indirect(0, residual_type_base + 5);
 }
 
-pub(crate) const BUILTIN_STRING_HASH_OFFSET: usize = 0;
+pub(crate) const BUILTIN_STRING_HASH_OFFSET: usize = majit_backend::BUILTIN_STRING_HASH_OFFSET;
 pub(crate) const BUILTIN_STRING_HASH_SIZE: usize = std::mem::size_of::<usize>();
-pub(crate) const BUILTIN_STRING_LEN_OFFSET: usize = std::mem::size_of::<usize>();
-pub(crate) const BUILTIN_STR_TOKEN_BASE_SIZE: usize = 2 * std::mem::size_of::<usize>() + 1;
+pub(crate) const BUILTIN_STRING_LEN_OFFSET: usize = majit_backend::BUILTIN_STRING_LEN_OFFSET;
+pub(crate) const BUILTIN_STR_TOKEN_BASE_SIZE: usize = majit_backend::BUILTIN_STR_TOKEN_BASE_SIZE;
 pub(crate) const BUILTIN_UNICODE_TOKEN_BASE_SIZE: usize = 2 * std::mem::size_of::<usize>();
 
 #[derive(Debug)]

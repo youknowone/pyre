@@ -490,13 +490,6 @@ pub type Bytecode = [u8];
 /// dispatch on it; `pc` stays 0 so the green key is the regex.
 pub const PROGRAM: [u8; 1] = [0];
 
-/// The input string, as a headerless buffer plus its length.
-#[repr(C)]
-struct Input {
-    data: *mut u8,
-    len: i64,
-}
-
 /// `jit_interp::MatchState`'s fields, under a different type name.
 ///
 /// The name is the one deliberate deviation from "identical everything else":
@@ -504,11 +497,10 @@ struct Input {
 /// portals sharing the name would make a degraded arm unattributable — and
 /// `jit_interp`'s own test filters that list on `interp == "MatchState"`.
 struct ShortCircuitState {
-    /// The input buffer.
-    inp: usize,
     pos: i64,
-    len: i64,
     result: i64,
+    /// `rstr.STR` pointer (`ll_strlen` / `ll_strgetitem`).
+    s: usize,
 }
 
 pub static COMPILES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -567,12 +559,10 @@ pub fn last_peeled_body() -> Vec<majit_ir::OpCode> {
     env = Bytecode,
     greens = [pc, program, root: ref],
     state_fields = {
-        inp: ref(Input),
         pos: int,
-        len: int,
         result: int,
+        s: str,
     },
-    array_fields = { Input::data => u8 },
     ref_fields = {
         NodeRec::left => NodeRec,
         NodeRec::right => NodeRec,
@@ -590,24 +580,22 @@ fn mainloop(
     program: &Bytecode,
     mut driver: &mut JitDriver<ShortCircuitState>,
     root: usize,
-    inp: usize,
-    len: i64,
+    s: usize,
     first: i64,
 ) -> i64 {
     let mut pc: usize = 0;
     let mut state = ShortCircuitState {
-        inp,
         pos: 1i64,
-        len,
         result: first,
+        s,
     };
     // marked.py: first char is outside; the header tick is what
     // `rewrite_can_enter_jit` inserts in front of `jit_merge_point`.
-    while state.pos < state.len {
+    // `while i < len(s)` records `Strlen`; `ord(s[i])` records `Strgetitem`.
+    while state.pos < crate::rstr::ll_strlen(state.s) {
         can_enter_jit!(driver, 0usize, &mut state, program, || {});
         jit_merge_point!(driver, program, pc; state);
-        let idx = state.pos as usize;
-        let c = state.inp.data[idx] as i64;
+        let c = crate::rstr::ll_strgetitem(state.s, state.pos);
         state.result = shift(root, c, false) as i64;
         state.pos = state.pos + 1i64;
     }
@@ -651,10 +639,9 @@ impl Matcher {
         {
             use majit_metainterp::JitState as _;
             ShortCircuitState {
-                inp: 0,
                 pos: 0,
-                len: 0,
                 result: 0,
+                s: 0,
             }
             .build_meta(0, &PROGRAM)
             .install_canonical_liveness(&mut driver);
@@ -670,16 +657,12 @@ impl Matcher {
         let result = if s.len() == 1 {
             first
         } else {
-            let mut input = Input {
-                data: s.as_ptr() as *mut u8,
-                len: s.len() as i64,
-            };
+            let input = crate::rstr::RpyStr::from_bytes(s);
             mainloop(
                 &PROGRAM,
                 &mut self.driver,
                 self.root as usize,
-                &mut input as *mut Input as usize,
-                input.len,
+                input.as_usize(),
                 first,
             )
         };

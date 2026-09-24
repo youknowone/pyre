@@ -1146,14 +1146,14 @@ extern "C" fn jit_reacquire_gil_shim() {
 // (b) emitting a 2-load indirection in the backend.
 
 /// `symbolic.get_field_token(rstr.STR/UNICODE, 'hash', ...).offset`.
-const BUILTIN_STRING_HASH_OFFSET: usize = 0;
+const BUILTIN_STRING_HASH_OFFSET: usize = majit_backend::BUILTIN_STRING_HASH_OFFSET;
 /// `symbolic.get_field_token(..., 'hash', ...).size` — assert == WORD at
 /// rewrite.py:286,292.
 const BUILTIN_STRING_HASH_SIZE: usize = std::mem::size_of::<usize>();
 /// `symbolic.get_array_token(...).ofs_length`.
-const BUILTIN_STRING_LEN_OFFSET: usize = std::mem::size_of::<usize>();
+const BUILTIN_STRING_LEN_OFFSET: usize = majit_backend::BUILTIN_STRING_LEN_OFFSET;
 /// STR token `basesize` — header + extra_item_after_alloc.
-const BUILTIN_STR_TOKEN_BASE_SIZE: usize = 2 * std::mem::size_of::<usize>() + 1;
+const BUILTIN_STR_TOKEN_BASE_SIZE: usize = majit_backend::BUILTIN_STR_TOKEN_BASE_SIZE;
 /// UNICODE token `basesize` — header only.
 const BUILTIN_UNICODE_TOKEN_BASE_SIZE: usize = 2 * std::mem::size_of::<usize>();
 /// Byte offset of the first `chars[]` slot at runtime, for backend tests

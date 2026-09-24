@@ -5373,16 +5373,16 @@ mod tests {
 // `get_field_token(..., 'hash', ...)`, not `get_array_token(...)`.
 
 /// `symbolic.get_field_token(rstr.STR/UNICODE, 'hash', ...).offset`.
-const BUILTIN_STRING_HASH_OFFSET: usize = 0;
+const BUILTIN_STRING_HASH_OFFSET: usize = majit_backend::BUILTIN_STRING_HASH_OFFSET;
 /// `symbolic.get_field_token(..., 'hash', ...).size` — assert == WORD at
 /// rewrite.py:286,292.
 const BUILTIN_STRING_HASH_SIZE: usize = std::mem::size_of::<usize>();
 /// `symbolic.get_array_token(rstr.STR/UNICODE, ...).ofs_length` =
 /// `before_array_part + carray.length.offset`.
-const BUILTIN_STRING_LEN_OFFSET: usize = std::mem::size_of::<usize>();
+const BUILTIN_STRING_LEN_OFFSET: usize = majit_backend::BUILTIN_STRING_LEN_OFFSET;
 /// STR token `basesize` — `before_array_part(8) + carray.items.offset(8) +
 /// extra_item_after_alloc(1) = 17`.
-const BUILTIN_STR_TOKEN_BASE_SIZE: usize = 2 * std::mem::size_of::<usize>() + 1;
+const BUILTIN_STR_TOKEN_BASE_SIZE: usize = majit_backend::BUILTIN_STR_TOKEN_BASE_SIZE;
 /// UNICODE token `basesize` — `before_array_part(8) + carray.items.offset(8)
 /// = 16` (no extra_item_after_alloc).
 const BUILTIN_UNICODE_TOKEN_BASE_SIZE: usize = 2 * std::mem::size_of::<usize>();
