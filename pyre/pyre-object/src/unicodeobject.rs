@@ -1803,13 +1803,14 @@ pub unsafe fn w_str_next_codepoint_pos_dont_look_inside(obj: PyObjectRef, pos: u
 /// `ll_stringslice_startstop` (`@jit.oopspec('stroruni.slice')`); the
 /// wrap is `space.newutf8`.
 ///
-/// `_getitem_result` records `stroruni.slice` (`ll_stringslice_startstop`)
-/// plus the one-code-point wrap.  `Utf8Str` is the `rpy_string` layout, so
-/// the slice oopspec's first argument classifies as STR.
+/// Residual: the walker folds exact-str getitem.  Looking inside this
+/// body currently hits `stroruni.slice` with a first argument whose
+/// concretetype is not `rpy_string`.  Unseal with the wrap helper.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_UnicodeObject`.
 #[inline(never)]
+#[majit_macros::dont_look_inside]
 pub unsafe fn w_str_getitem(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
     let len = unsafe { w_str_len(obj) } as i64;
     let idx = if index < 0 { index + len } else { index };
