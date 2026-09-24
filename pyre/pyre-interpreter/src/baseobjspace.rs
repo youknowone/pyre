@@ -20875,10 +20875,10 @@ unsafe fn generator_kind(gen_obj: PyObjectRef) -> &'static str {
 /// (PEP 479): a `StopIteration` that escapes the generator body — whether
 /// raised explicitly or leaked from a `next()` inside the body — is replaced
 /// by `RuntimeError("generator raised StopIteration")` chained from it
-/// (`__cause__` and `__context__` both point at the leaked exception, and the
-/// cause suppresses the context in display, mirroring
-/// `chain_exceptions_from_cause`).  This is distinct from a normal generator
-/// return, which surfaces through the `Ok`/`frame_finished_execution` path.
+/// through [`PyError::chain_exceptions_from_cause`], so `__cause__` and
+/// `__context__` both point at the leaked exception and the cause suppresses
+/// the context in display.  This is distinct from a normal generator return,
+/// which surfaces through the `Ok`/`frame_finished_execution` path.
 unsafe fn leak_generator_iteration(mut e: PyError, message: &str) -> PyError {
     use pyre_object::interp_exceptions::*;
     // `generator.py _leak_stopiteration` / `chain_exceptions_from_cause`:
@@ -20888,22 +20888,27 @@ unsafe fn leak_generator_iteration(mut e: PyError, message: &str) -> PyError {
     // root the minor rewrites. The `PyError` cache and this local are not.
     let w_stopiter = e.to_exc_object();
     let _roots = pyre_object::gc_roots::push_roots();
-    let stop_slot = pyre_object::gc_roots::shadow_stack_len();
+    let stopiter_slot = pyre_object::gc_roots::shadow_stack_len();
     if !w_stopiter.is_null() {
         let _ = pyre_object::gc_roots::pin_root(w_stopiter);
     }
     let rt = w_exception_new(ExcKind::RuntimeError, message);
-    let w_stopiter = if w_stopiter.is_null() {
-        w_stopiter
-    } else {
-        pyre_object::gc_roots::shadow_stack_get(stop_slot)
-    };
-    if pyre_object::is_exception(rt) && !w_stopiter.is_null() {
-        w_exception_set_context(rt, w_stopiter);
-        w_exception_set_cause(rt, w_stopiter);
-        w_exception_set_suppress_context(rt, true);
+    if !pyre_object::is_exception(rt) || w_stopiter.is_null() {
+        return PyError::from_exc_object(rt);
     }
-    PyError::from_exc_object(rt)
+    let rt_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(rt);
+    let mut leaked =
+        PyError::from_exc_object(pyre_object::gc_roots::shadow_stack_get(stopiter_slot));
+    let mut raised = PyError::from_exc_object(pyre_object::gc_roots::shadow_stack_get(rt_slot));
+    // `_leak_stopiteration` builds the RuntimeError and hands the leaked
+    // exception to `chain_exceptions_from_cause`, which raises rather than
+    // returns when the pair is not chainable; answer with that error, as the
+    // `raise e2` upstream never reaches.
+    match raised.chain_exceptions_from_cause(pyre_object::w_none(), &mut leaked) {
+        Ok(()) => raised,
+        Err(chain_error) => chain_error,
+    }
 }
 
 /// generator.py `should_not_inline`.

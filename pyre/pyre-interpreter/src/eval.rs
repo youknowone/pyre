@@ -2141,12 +2141,30 @@ pub fn handle_exception_with_context(
     // error outward because the dispatch loop moves the same value into
     // `Err(err)` on propagation.  The mark is set below whether or not an active
     // exception was found, mirroring the `finally`.
+    //
+    // # TODO: call `PyError::record_context`
+    //
+    // **Deviation.** The body is spelled here rather than going through the
+    // method that holds it, so this reads as three steps where upstream reads
+    // as one call.
+    //
+    // **Why.** `record_context`'s only callee is `chain_context`, which no
+    // annotated graph reaches, so it is absent from the CallRegistry and the
+    // method cannot be typed: Phase-A ends with `chain_context ... not
+    // registered in CallRegistry`, and the method joins the rtyper
+    // skip-subject census. Inlining it here does not cost an annotated graph
+    // — `handle_exception` is already a census entry for reasons of its own.
+    //
+    // **How to fix.** Make `chain_context` reachable from a graph the
+    // minting closure already walks, so the registry carries it; then this
+    // becomes `err.record_context(context_source)` and the method annotates
+    // wherever it is called.
     if err.attach_tb && !err.context_recorded {
-        let active = match context_source {
+        let last = match context_source {
             ContextSource::GeneratorChain => get_sys_exception(),
             ContextSource::ResumedFrameOnly => get_current_exception(),
         };
-        crate::error::chain_context(pyre_object::gc_roots::shadow_stack_get(exc_slot), active);
+        crate::error::chain_context(pyre_object::gc_roots::shadow_stack_get(exc_slot), last);
         err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
         err.context_recorded = true;
     }

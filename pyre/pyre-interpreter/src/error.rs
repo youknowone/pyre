@@ -1771,7 +1771,7 @@ impl PyError {
             // `W_SystemExit.descr_init`: a single constructor argument is `code`.
             if self.kind == PyErrorKind::SystemExit {
                 let msg = pyre_object::gc_roots::shadow_stack_get(msg_slot);
-                unsafe { pyre_object::interp_exceptions::w_exception_set_code(exc, msg) };
+                unsafe { pyre_object::interp_exceptions::w_exception_set_code(exc(), msg) };
             }
         }
         // Stamp the deferred `name` / `obj` context onto the freshly
@@ -2100,6 +2100,102 @@ impl PyError {
             ));
         }
         chain_context(w_value, w_context);
+        Ok(())
+    }
+
+    /// `error.py OperationError.record_context`: chain whatever exception is
+    /// currently being handled as this one's `__context__`, once.
+    ///
+    /// ```python
+    /// def record_context(self, space, ec):
+    ///     if self._context_recorded:
+    ///         return
+    ///     last = ec.sys_exc_info()
+    ///     try:
+    ///         if last is not None:
+    ///             self.chain_exceptions(space, last)
+    ///     finally:
+    ///         self._context_recorded = True
+    /// ```
+    ///
+    /// Upstream reads `ec.sys_exc_info()` itself.  The source is a parameter
+    /// here because an exception thrown *into* a resumed generator asks the
+    /// same question of the flat slot instead — see [`ContextSource`].  The
+    /// mark is set whether or not anything was found, which is the `finally`:
+    /// a null `__context__` cannot say whether it was recorded as absent or
+    /// never recorded at all.
+    pub fn record_context(&mut self, source: crate::eval::ContextSource) {
+        if self.context_recorded {
+            return;
+        }
+        let last = match source {
+            crate::eval::ContextSource::GeneratorChain => crate::eval::get_sys_exception(),
+            crate::eval::ContextSource::ResumedFrameOnly => crate::eval::get_current_exception(),
+        };
+        chain_context(self.exc_object, last);
+        self.context_recorded = true;
+    }
+
+    /// `error.py OperationError.set_cause`.
+    ///
+    /// ```python
+    /// def set_cause(self, space, w_cause):
+    ///     if w_cause is None:
+    ///         return
+    ///     if space.is_none(w_cause):
+    ///         pass
+    ///     else:
+    ///         self._exception_getclass(space, w_cause, "exception causes")
+    ///     w_value = self.get_w_value(space)
+    ///     space.setattr(w_value, space.newtext("__cause__"), w_cause)
+    /// ```
+    ///
+    /// The `setattr` lands on `descr_setcause`, which stamps
+    /// `suppress_context` beside the slot; both writes are spelled out
+    /// because the slot is reached directly.
+    pub fn set_cause(&mut self, space: PyObjectRef, w_cause: PyObjectRef) -> Result<(), PyError> {
+        if w_cause.is_null() {
+            return Ok(());
+        }
+        if !unsafe { pyre_object::is_none(w_cause) } {
+            let w_cause_type =
+                crate::typedef::r#type(w_cause).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
+            if w_cause_type.is_null()
+                || !unsafe { crate::baseobjspace::exception_is_valid_class_w(w_cause_type) }
+            {
+                return Err(PyError::type_error(
+                    "exception causes must derive from BaseException",
+                ));
+            }
+        }
+        let w_value = self.normalize_exception(space)?;
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_cause(w_value, w_cause);
+            pyre_object::interp_exceptions::w_exception_set_suppress_context(w_value, true);
+        }
+        Ok(())
+    }
+
+    /// `error.py OperationError.chain_exceptions_from_cause`.
+    ///
+    /// ```python
+    /// def chain_exceptions_from_cause(self, space, exception):
+    ///     self.chain_exceptions(space, exception)
+    ///     self.set_cause(space, exception.get_w_value(space))
+    ///     self.record_context(space, space.getexecutioncontext())
+    /// ```
+    ///
+    /// `getexecutioncontext` is the `sys_exc_info` source, so the recording
+    /// asks [`ContextSource::GeneratorChain`].
+    pub fn chain_exceptions_from_cause(
+        &mut self,
+        space: PyObjectRef,
+        exception: &mut OperationError,
+    ) -> Result<(), PyError> {
+        self.chain_exceptions(space, exception)?;
+        let w_cause = exception.normalize_exception(space)?;
+        self.set_cause(space, w_cause)?;
+        self.record_context(crate::eval::ContextSource::GeneratorChain);
         Ok(())
     }
 
