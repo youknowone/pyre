@@ -1419,15 +1419,22 @@ impl JitCodeBuilder {
         field_idx: u16,
         value: i64,
     ) {
-        let const_idx = self.add_const_i(value);
+        // `setfield_vable_i` is not in `USE_C_FORM` (`assembler.py`), so a
+        // constant value would take a `constants_i` slot. One slot per
+        // Python instruction (`dispatch_bytecode` `last_instr`) overflows
+        // `check_result`'s 256-wide int index space. The immediate form
+        // writes the u32 inline and shares the `VableField` descr with
+        // `setfield_vable_i/rid`. Blackhole `handler_setfield_vable_i_imm`
+        // and the walker's `setfield_vable_i_imm/rddd` arm execute it as
+        // `_opimpl_setfield_vable`.
+        let imm = u32::try_from(value)
+            .unwrap_or_else(|_| panic!("setfield_vable_i immediate {value} does not fit in u32"));
         self.touch_ref_reg(vable_reg);
         let field_descr = self.add_vable_field_descr(field_idx);
-        self.write_insn("setfield_vable_i/rid");
+        self.write_insn("setfield_vable_i_imm/rddd");
         self.push_reg_u8(vable_reg, "setfield_vable_i base");
-        let src_offset = self.code.len();
-        self.push_u8(0);
-        self.const_patches_u8
-            .push((src_offset, ConstKind::Int, const_idx));
+        self.push_u16(imm as u16);
+        self.push_u16((imm >> 16) as u16);
         self.push_u16(field_descr);
     }
 
@@ -6345,6 +6352,7 @@ impl JitCodeBuilder {
                 | i::BC_GETFIELD_VABLE_R
                 | i::BC_GETFIELD_VABLE_F
                 | i::BC_SETFIELD_VABLE_I
+                | i::BC_SETFIELD_VABLE_I_IMM
                 | i::BC_SETFIELD_VABLE_R
                 | i::BC_SETFIELD_VABLE_F
                 | i::BC_GETARRAYITEM_VABLE_I

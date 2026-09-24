@@ -1176,180 +1176,51 @@ pub fn finish_blackhole_level_frame(frame_ptr: i64) {
     }
 }
 
-/// `majit_metainterp::blackhole::LiveMarkerHook` implementation: stamp the
-/// instruction the blackhole is about to replay into the frame's `last_instr`.
+/// `walk_bh_regs` calls this before visiting a blackhole register bank.
 ///
-/// `dispatch_bytecode` (pyopcode.py) writes `self.last_instr = intmask(
-/// next_instr)` before every opcode, and the interpreter's own loop
-/// (`eval.rs::eval_loop`) mirrors it, so anything that reads the frame while it
-/// is running — `f_lineno`, `f_lasti`, a traceback node, the exception-table
-/// lookup — sees the instruction actually executing. Upstream gets the same
-/// invariant during blackhole replay for free, because that write is a
-/// source-level store its codewriter lowers into the jitcode. pyre's codewriter
-/// cannot: it unrolls the bytecode per PC, so the store would need one distinct
-/// int pool constant per instruction against `check_result`'s 256-entry cap.
-/// Publishing here costs no jitcode, no recorded operation and no pool entry,
-/// and only the replay pays for it.
+/// `bhimpl_live` only records the marker pc. Precise liveness is a
+/// collection-time `gcmap` (`jitframe` + `gcmap` in
+/// `rpython/jit/backend/llsupport`), not a per-instruction clear.
+/// `cleanup_registers` (`blackhole.py`) still runs at `release_interp`.
+/// Between those points a loop-only colour is never redefined — this
+/// codewriter colours one function per jitcode, not one
+/// `dispatch_bytecode` graph — so `walk_bh_regs` would keep that object
+/// alive until frame exit. The marker's Ref set (`liveness.py`) is the
+/// bound: a register missing from it is rewritten before any read.
 ///
-/// The frame is the one THIS level reads and writes — the portal red the
-/// codewriter threads through every `getarrayitem_vable_r`, taken from this
-/// level's own register bank. `virtualizable_ptr` is deliberately not a
-/// fallback: a nested level that carries no frame of its own would resolve it
-/// to the level ABOVE, and direct recursion would then get the callee's
-/// coordinate written into the caller's frame, past the code-object check.
-/// That check stays as the second half of the same argument — the frame must
-/// also be running the function this JitCode was built for.
+/// No marker, a marker that does not decode, or an empty Ref set roots
+/// the whole bank. The clear stops at `num_regs_r()`; the slots above it
+/// are the constants window.
 ///
-/// This runs once per replayed instruction, so it resolves everything under a
-/// single store borrow and takes no reference count: the `Arc`-cloning
-/// accessors (`pyjitcode_for_jitcode_index`, `pyjitcode_for_code`) each re-run
-/// `ensure_finish_setup`, whose opname-map clone alone costs more than the
-/// replayed instruction, and `compiled_jitcode_lookup` is a linear scan.
-pub fn publish_last_instr_at_live_marker(
-    bh: &majit_metainterp::blackhole::BlackholeInterpreter,
-    marker_pc: usize,
-) {
-    // A JitCode only exists once `finish_setup` has run, so the store is read
-    // directly here rather than through `ensure_finish_setup`. A borrow already
-    // held (a reentrant walker path) skips the publish rather than panicking.
-    METAINTERP_SD.with(|r| {
-        let Ok(sd) = r.try_borrow() else {
-            return;
-        };
-        let Some(jitcode) = sd.jitcodes.get(bh.jitcode.index()) else {
-            return;
-        };
-        let metadata = &jitcode.payload.metadata;
-        let frame = match bh
-            .registers_r
-            .get(metadata.portal_frame_reg as usize)
-            .copied()
-        {
-            Some(value) if value > 0 => value as usize,
-            _ => return,
-        };
-        // SAFETY: the portal red holds the concrete `PyFrame` the blackhole
-        // runs against, and `frame_layout` pins `pycode` to this offset with a
-        // compile-time assertion against the interpreter's own constant.
-        let w_code =
-            unsafe { *((frame + crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const *const ()) };
-        // A non-standard virtualizable frame from a bridge sub-walk carries the
-        // `GcRef(usize::MAX)` sentinel (or null) here instead of a real
-        // `PyCode`. `w_code_get_ptr` requires a valid code object, so the null
-        // and sentinel tests run first, and `is_code` before the deref for the
-        // same reason its other callers order them that way — `py_type_check`
-        // would itself dereference a raw sentinel.
-        if w_code.is_null() || w_code as usize == usize::MAX {
-            return;
-        }
-        if !unsafe { pyre_interpreter::pycode::is_code(w_code as PyObjectRef) } {
-            return;
-        }
-        let raw_code = unsafe { pyre_interpreter::w_code_get_ptr(w_code as PyObjectRef) };
-        if raw_code as *const CodeObject != jitcode.payload.code_ptr {
-            return;
-        }
-        let raw_py_pc = crate::py_coord::containing_py_pc_for_jitcode_pc(metadata, marker_pc);
-        // A marker resolves through inverse tables that pick one owner per
-        // JitCode offset by position, not by whether that Python PC is
-        // executable: `block_head_py_by_jit_pc` keeps the first PC mapped to an
-        // offset and the floor tier keeps the last, so a run of `Cache` units
-        // sharing the following opcode's offset can win either way. The field
-        // has to name a real opcode — `next_instr` is `last_instr + 1` and
-        // `offset2lineno` keys on it — so advance to the instruction the
-        // blackhole is about to replay, the normalization the resume reader
-        // already applies (`trivia_normalized_py_pc_for_jitcode_pc`). Without
-        // it a callee's `sys._getframe(1).f_lasti` reads its caller as paused
-        // one code unit past the opcode that pushed the callee.
-        // SAFETY: `raw_code` is this JitCode's own code object, checked equal to
-        // `code_ptr` above.
-        let py_pc = crate::jitcode_dispatch::skip_python_trivia_forward(
-            unsafe { &*(raw_code as *const CodeObject) },
-            raw_py_pc as usize,
-        );
-        // SAFETY: same frame, and `last_instr` carries the same compile-time
-        // offset assertion.
-        unsafe {
-            *((frame + crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET) as *mut isize) =
-                py_pc as isize;
-        }
-    });
-}
-
-/// Drop every Ref register the `-live-` marker at `marker_pc` does not name.
-///
-/// `cleanup_registers` (`blackhole.py`) clears `registers_r` "to avoid
-/// keeping references alive", but it runs from `release_interp`
-/// (`blackhole.py`) — after the run, not during it. Inside a run the only
-/// thing that ends a register's hold on its object is a later write to the
-/// same register, which `rpython/tool/algo/regalloc.py:28-75` makes near-certain
-/// by colouring on liveranges and reusing a dead value's colour. This
-/// codewriter walks one Python function per jitcode rather than one giant
-/// `dispatch_bytecode` graph, so a colour whose only definition sits inside a
-/// loop is never redefined afterwards: the loop's iterable stays in its
-/// register for the whole remainder of the frame, and `walk_bh_regs` roots the
-/// bank unconditionally. A resumed frame that then calls `gc.collect()` keeps
-/// the iterable and everything it reaches.
-///
-/// The marker's Ref set is a sound bound to clear against. It is the SSA-live
-/// set — "written before and read afterwards" — computed by the backward pass
-/// in `liveness.rs` (`liveness.py:5-12`), so a register missing from it is
-/// re-written before any read. `filter_liveness_in_place` only ever adds to it
-/// (the FOR_ITER frame-live re-add, the portal reds, a residual call's result
-/// register), and a folded marker carries the union over its group's PCs.
-///
-/// The clear stops at `num_regs_r()`: the slots above it are the constants
-/// window `copy_constants` preloads, which `cleanup_registers` also leaves
-/// alone. Anything unresolvable — a pc that anchors no marker, a liveness
-/// table that does not cover the offset, a length that cannot describe this
-/// bank — clears nothing, which is exactly the behaviour without this hook.
-fn clear_dead_ref_registers_at_live_marker(
-    bh: &mut majit_metainterp::blackhole::BlackholeInterpreter,
-    marker_pc: usize,
-) {
-    let num_regs_r = bh.jitcode.num_regs_r().min(bh.registers_r.len());
+/// # Safety
+/// `ctx` is a live `BlackholeInterpreter` registered with the bank.
+/// `regs` is that interpreter's `registers_r` for `len` slots.
+pub unsafe fn retain_live_ref_registers(ctx: *const (), regs: *mut i64, len: usize) {
+    let bh = unsafe { &*(ctx as *const majit_metainterp::blackhole::BlackholeInterpreter) };
+    let Some(marker_pc) = bh.last_live_marker_pc() else {
+        return;
+    };
+    let regs = unsafe { std::slice::from_raw_parts_mut(regs, len) };
+    let num_regs_r = bh.jitcode.num_regs_r().min(regs.len());
     if num_regs_r == 0 {
         return;
     }
-    // `get_live_vars_info` panics on a pc that anchors no `-live-`; the
-    // blackhole reaches this hook only from `handler_live`, but the marker
-    // still has to resolve against this jitcode's own code stream.
     if !bh.jitcode.can_decode_live_vars(marker_pc, bh.op_live) {
         return;
     }
     let info = bh.jitcode.get_live_vars_info(marker_pc, bh.op_live);
-    // Read the pool through the store rather than `liveness_info_snapshot`:
-    // this runs once per replayed instruction, and that accessor re-runs
-    // `ensure_finish_setup` and takes a reference count each time. A borrow
-    // already held (a reentrant walker path) declines, the same way the
-    // `last_instr` publish above does, instead of panicking.
     METAINTERP_SD.with(|r| {
         let Ok(sd) = r.try_borrow() else {
             return;
         };
         let all_liveness: &[u8] = &sd.liveness_info;
-        // `enumerate_vars` indexes the three length bytes unguarded.
         if info + 3 > all_liveness.len() {
             return;
         }
-        // A live set cannot name more Ref registers than the bank holds; a
-        // wider count means the offset is not describing this jitcode.
         let length_r = all_liveness[info + 1] as usize;
-        if length_r > num_regs_r {
+        if length_r > num_regs_r || length_r == 0 {
             return;
         }
-        // An empty Ref set is not a claim that nothing is live. A marker whose
-        // Python PCs are all unreachable is emitted with no registers at all
-        // (`filter_liveness_in_place`'s `any_reachable` arm), while a reachable
-        // portal marker always names at least the `frame` red
-        // (`interp_jit.py reds = ['frame', 'ec']`). Decline rather than
-        // clear the whole bank on the one shape that cannot be told apart.
-        if length_r == 0 {
-            return;
-        }
-        // Register indices are single bytes (`assembler.py:127-138` asserts
-        // `0 <= val < 256`), so the live set fits a fixed 256-bit mask and the
-        // hook allocates nothing.
         let mut live_r: [u64; 4] = [0; 4];
         majit_jitcode::codewriter::jitcode::enumerate_vars(
             info,
@@ -1365,20 +1236,10 @@ fn clear_dead_ref_registers_at_live_marker(
         );
         for index in 0..num_regs_r.min(256) {
             if live_r[index / 64] & (1u64 << (index % 64)) == 0 {
-                bh.registers_r[index] = 0;
+                regs[index] = 0;
             }
         }
     });
-}
-
-/// `-live-` marker hook: stamp the frame's `last_instr`, then drop the Ref
-/// registers the marker does not name.
-pub fn on_live_marker(
-    bh: &mut majit_metainterp::blackhole::BlackholeInterpreter,
-    marker_pc: usize,
-) {
-    publish_last_instr_at_live_marker(bh, marker_pc);
-    clear_dead_ref_registers_at_live_marker(bh, marker_pc);
 }
 
 /// Whether an exception exit emitted for the Python instruction at `py_pc`

@@ -7797,6 +7797,23 @@ fn portal_vable_bookkeeping_anchor(
             // The int vable fields are `last_instr` (0) and `valuestackdepth`
             // (2), both reassigned by the rebuild; a non-`VableField` descr is
             // not frame bookkeeping.
+            "setfield_vable_i_imm/rddd" => {
+                // opcode, frame reg, u32 immediate, little-endian descr index.
+                let Some((&lo, &hi)) = code.get(op.pc + 6).zip(code.get(op.pc + 7)) else {
+                    return false;
+                };
+                let descr_index = lo as usize | ((hi as usize) << 8);
+                if !matches!(
+                    perfn_descrs.get(descr_index),
+                    Some(majit_metainterp::jitcode::RuntimeBhDescr::Descr(descr))
+                        if matches!(
+                            descr.as_ref(),
+                            majit_jitcode::jitcode::BhDescr::VableField { .. }
+                        )
+                ) {
+                    return false;
+                }
+            }
             "setfield_vable_i/rid" => {
                 let Some((&lo, &hi)) = code.get(op.pc + 3).zip(code.get(op.pc + 4)) else {
                     return false;
@@ -12730,6 +12747,7 @@ fn handle<Sym: WalkSym>(
         // `setfield_vable_i/rid`, `setfield_vable_r/rrd`,
         // `setfield_vable_f/rfd` — value bank differs, no dst byte.
         "setfield_vable_i/rid" => setfield_vable_via_metainterp(code, op, ctx, 'i'),
+        "setfield_vable_i_imm/rddd" => setfield_vable_int_imm(code, op, ctx),
         "setfield_vable_r/rrd" => setfield_vable_via_metainterp(code, op, ctx, 'r'),
         "setfield_vable_f/rfd" => setfield_vable_via_metainterp(code, op, ctx, 'f'),
         // Virtualizable array reads/writes + length. RPython
