@@ -270,7 +270,14 @@ pub(crate) unsafe fn type_setdictvalue_wtf8(
     }
     // `version_tag()` is `None` when the field is 0.
     let version_tag = crate::baseobjspace::w_type_version_tag(w_type);
-    if version_tag != 0 {
+    // A type that already has a C mirror publishes this very block through
+    // `tp_dict` (`stamp_tp_dict`), and `PyType_GetDict` hands it back
+    // unchanged.  There is no `unwrap_cell` in front of an extension's
+    // `PyDict_GetItemString`, so such a type keeps the value raw and pays the
+    // `mutated()` every store instead of parking a cell an extension would
+    // read as the attribute.
+    let has_c_mirror = !pyre_object::w_type_get_cpy_ref(w_type).is_null();
+    if version_tag != 0 && !has_c_mirror {
         // `W_TypeObject.setdictvalue` reads through
         // `_pure_getdictvalue_no_unwrapping`, which does not unwrap.
         let w_name = pyre_object::unicodeobject::box_str_constant(name);

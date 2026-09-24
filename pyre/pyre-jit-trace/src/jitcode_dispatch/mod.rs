@@ -9131,6 +9131,13 @@ unsafe fn resolve_type_call_builtin_new(
     } {
         return None;
     }
+    // Both answers below are baked by identity under `callable`'s version tag,
+    // which an in-place `write_cell` store does not move.
+    if unsafe { type_attr_is_cell_backed(callable, "__new__") }
+        || unsafe { type_attr_is_cell_backed(callable, "__init__") }
+    {
+        return None;
+    }
     let tp_new = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(callable, "__new__") }?;
     let obj_new = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_object, "__new__") };
     if Some(tp_new) == obj_new || !unsafe { pyre_interpreter::is_function_carrier(tp_new) } {
@@ -9197,6 +9204,51 @@ unsafe fn resolve_instance_dunder_call(
     let (method, w_class, version_tag) = unsafe { lookup_instance_dunder_call(callable) }?;
     let (w_code, nparams, has_closure) = unsafe { resolve_inlinable_callee(method) }?;
     Some((method, w_class, version_tag, w_code, nparams, has_closure))
+}
+
+/// The `attr_cell` half of [`ExceptionInlineReceiverGuard`] for a callee the
+/// walker resolved with `space.lookup(w_class, name)`.
+///
+/// `lookup` unwraps a `MutableCell`, so the resolved callee alone does not say
+/// whether the namespace entry can still change under the pinned
+/// `_version_tag`.  Ask the raw entry instead: an `ObjectMutableCell` is one
+/// `write_cell` updates in place, which moves no tag, so an inline -- an
+/// identity decision, the body is baked -- owes the getfield and the promote
+/// [`walker_promote_object_mutable_cell`] emits.
+///
+/// # Safety
+/// `w_class` must be a live type object.
+/// A name whose raw class-namespace entry is an `ObjectMutableCell` cannot be
+/// baked on `_version_tag` alone: `write_cell` updates an installed cell in
+/// place and moves no tag.  An emit with nowhere to hang the promote declines
+/// on this, the way `super_attr_suffix_lookup`'s own-dict read does.  The
+/// convergence is the getfield-and-promote pair [`inline_attr_cell_guard`]
+/// carries, not this decline.
+///
+/// # Safety
+/// `w_type` must be a live type object.
+unsafe fn type_attr_is_cell_backed(w_type: pyre_object::PyObjectRef, name: &str) -> bool {
+    !unsafe {
+        pyre_interpreter::baseobjspace::type_attr_object_cell(
+            w_type,
+            rustpython_wtf8::Wtf8::new(name),
+        )
+    }
+    .is_null()
+}
+
+unsafe fn inline_attr_cell_guard(
+    w_class: pyre_object::PyObjectRef,
+    name: &str,
+    method: pyre_object::PyObjectRef,
+) -> Option<(pyre_object::PyObjectRef, pyre_object::PyObjectRef)> {
+    let cell = unsafe {
+        pyre_interpreter::baseobjspace::type_attr_object_cell(
+            w_class,
+            rustpython_wtf8::Wtf8::new(name),
+        )
+    };
+    (!cell.is_null()).then_some((cell, method))
 }
 
 /// `(receiver, concrete_receiver, w_class, version_tag, attr_cell)` for an

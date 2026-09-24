@@ -4295,6 +4295,9 @@ fn walker_fold_load_method_cell<Sym: WalkSym>(
     let Some((w_type, _version_tag, cell)) = cell_hit else {
         return Ok(None);
     };
+    if !object_mutable_cell_payload_is_guardable(cell) {
+        return Ok(None);
+    }
     if !std::ptr::eq(unsafe { (*concrete_obj).w_class }, w_type) {
         return Ok(None);
     }
@@ -4325,6 +4328,12 @@ fn walker_fold_load_method_cell<Sym: WalkSym>(
     // Do not stamp the payload.  The following CALL must invoke whatever
     // `w_value` holds, not the function that was there at record time.
     let value = walker_read_object_mutable_cell_stamped(ctx, cell, false);
+    // `load_method_cell_fast_path` admitted this name because the payload's
+    // type carries `flag_method_descriptor`, which is what decides the
+    // `(method, self)` pair the paired self-fold writes.  An in-place rebind
+    // can replace the method with a `property`; the guard is what makes that
+    // side-exit instead of binding a receiver to it.
+    walker_guard_object_mutable_cell_payload(ctx, op_pc, value, cell)?;
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
     Ok(Some(()))
 }
@@ -4542,6 +4551,44 @@ fn walker_read_object_mutable_cell_stamped<Sym: WalkSym>(
     value
 }
 
+/// Guard the class of a payload [`walker_read_object_mutable_cell`] just read.
+///
+/// The `getfield` keeps an in-place rebind visible, which is the whole point of
+/// reading the cell; what it does not keep is the admission the oracle computed
+/// against `type(w_value)` while recording -- `flag_method_descriptor` for a
+/// method load, "no `__get__`, not a heaptype" for a plain type attribute.  An
+/// in-place write is the one namespace change `_version_tag` does not report,
+/// so a rebind from a function to a `property` would otherwise reach code that
+/// already decided the descriptor protocol does not run.  This is the class
+/// check the dispatch the fold replaced records anyway: `space.get` resolves
+/// `__get__` on `type(w_descr)`, and the same-class rebind the live read exists
+/// for passes it.
+///
+/// Asked before the fold emits anything: a tagged int has no `ob_type`, so its
+/// payload cannot carry the class guard and the fold declines instead.
+fn object_mutable_cell_payload_is_guardable(cell: pyre_object::PyObjectRef) -> bool {
+    let live = unsafe { (*(cell as *const pyre_object::celldict::ObjectMutableCell)).w_value };
+    !live.is_null()
+        && !(pyre_object::tagged_int::CAN_BE_TAGGED
+            && unsafe { pyre_object::tagged_int::is_tagged_int(live) })
+}
+
+fn walker_guard_object_mutable_cell_payload<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    value: OpRef,
+    cell: pyre_object::PyObjectRef,
+) -> Result<(), DispatchError> {
+    let live = unsafe { (*(cell as *const pyre_object::celldict::ObjectMutableCell)).w_value };
+    let physical_type = unsafe { (*live).ob_type } as i64;
+    let type_const = ctx.trace_ctx.const_int(physical_type);
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[value, type_const])?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(value, physical_type);
+    Ok(())
+}
+
 fn walker_read_int_mutable_cell<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -4579,6 +4626,11 @@ fn walker_fold_type_attr_cell<Sym: WalkSym>(
     else {
         return Ok(None);
     };
+    if !unsafe { pyre_object::celldict::is_int_mutable_cell(cell) }
+        && !object_mutable_cell_payload_is_guardable(cell)
+    {
+        return Ok(None);
+    }
     let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
     walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[obj, w_type_const])?;
     ctx.trace_ctx
@@ -4586,9 +4638,18 @@ fn walker_fold_type_attr_cell<Sym: WalkSym>(
         .replace_box(obj, w_type_const);
     walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
     let value = if unsafe { pyre_object::celldict::is_int_mutable_cell(cell) } {
+        // An `IntMutableCell` only ever holds an int: `write_cell`'s in-place
+        // arm stores `intval`, so the payload cannot change shape and the
+        // boxing below is the whole of the binding.
         walker_read_int_mutable_cell(ctx, op_pc, cell)?
     } else {
-        walker_read_object_mutable_cell(ctx, cell)
+        let value = walker_read_object_mutable_cell(ctx, cell);
+        // `type_attr_cell_fast_path` admitted this name because the payload's
+        // type has no `__get__` -- the arm where `get` returns the value
+        // unchanged.  An in-place rebind can put a descriptor there, so the
+        // class guard is what sends that to the full `descr_getattribute`.
+        walker_guard_object_mutable_cell_payload(ctx, op_pc, value, cell)?;
+        value
     };
     write_residual_call_result_to_dst(ctx, op_pc, dst, 'r', value)?;
     Ok(Some(()))
@@ -21786,6 +21847,14 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
         let version_tag =
             unsafe { pyre_object::typeobject::w_type_get_version_tag(concrete_callable) };
         if version_tag == 0 {
+            return Ok(None);
+        }
+        // Both answers are baked under `version_tag`, and an in-place
+        // `write_cell` store moves no tag: a `__new__` rebound inside its cell
+        // would run user Python where this proof admitted only `descr_new`.
+        if unsafe { type_attr_is_cell_backed(concrete_callable, "__new__") }
+            || unsafe { type_attr_is_cell_backed(concrete_callable, "__init__") }
+        {
             return Ok(None);
         }
         let Some(class_new) = (unsafe {
