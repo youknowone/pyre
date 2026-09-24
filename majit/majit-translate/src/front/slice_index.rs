@@ -376,11 +376,12 @@ fn rewire_one_slice_index_site(
         .ok_or_else(|| format!("{name}: slice::index op vanished before rewrite"))?;
     match bounds {
         SliceIndexBounds::Range { start, end } => {
+            let segments = getslice_marker_segments(graph, &slice, "__getslice_range");
             graph.blocks[rb].operations[ri] = SpaceOperation {
                 result: Some(index_result),
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
-                        segments: vec!["__getslice_range".to_string()],
+                        segments,
                         fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![slice, start.clone(), end.clone()]),
@@ -390,11 +391,12 @@ fn rewire_one_slice_index_site(
         }
         SliceIndexBounds::MinusOne { .. } | SliceIndexBounds::RangeTo { .. } => {
             let (segments, args) = match bounds {
-                SliceIndexBounds::MinusOne { .. } => {
-                    (vec!["__getslice_minusone".to_string()], vec![slice])
-                }
+                SliceIndexBounds::MinusOne { .. } => (
+                    getslice_marker_segments(graph, &slice, "__getslice_minusone"),
+                    vec![slice],
+                ),
                 SliceIndexBounds::RangeTo { end } => (
-                    vec!["__getslice_rangeto".to_string()],
+                    getslice_marker_segments(graph, &slice, "__getslice_rangeto"),
                     vec![slice, end.clone()],
                 ),
                 SliceIndexBounds::RangeFrom { .. } => unreachable!(),
@@ -410,11 +412,12 @@ fn rewire_one_slice_index_site(
             };
         }
         SliceIndexBounds::RangeFrom { start } => {
+            let segments = getslice_marker_segments(graph, &slice, "__getslice_rangefrom");
             graph.blocks[rb].operations[ri] = SpaceOperation {
                 result: Some(index_result),
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
-                        segments: vec!["__getslice_rangefrom".to_string()],
+                        segments,
                         fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![slice, start.clone()]),
@@ -736,6 +739,94 @@ pub(crate) fn range_feeds_only_index(
         }
     }
     !require_end_write || end_writes == 1
+}
+
+/// Marker path. The leaf stays `__getslice_*`. A second segment carries the
+/// item kind when the slice operand's list spelling or array identity names
+/// one and the sibling-array scan does not. A scan hit keeps today's
+/// one-segment marker: the codewriter still recovers that identity itself.
+fn getslice_marker_segments(graph: &FunctionGraph, slice: &Variable, leaf: &str) -> Vec<String> {
+    let mut segments = vec![leaf.to_string()];
+    if let Some(suffix) = slice_marker_suffix(graph, slice) {
+        segments.push(suffix);
+    }
+    segments
+}
+
+fn slice_marker_suffix(graph: &FunctionGraph, slice: &Variable) -> Option<String> {
+    if crate::codewriter::getslice::array_identity_of_base(graph, slice).is_some() {
+        return None;
+    }
+    let classes = crate::codewriter::getslice::LinkClasses::of(graph);
+    let same = |v: &Variable| classes.same(v, slice);
+    let mut from_input = None;
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        match &op.kind {
+            OpKind::ArrayLen {
+                base,
+                array_type_id: Some(id),
+                ..
+            } if same(base) => {
+                if let Some((item_ty, array_type_id)) = identity_from_array_type_id(id) {
+                    return crate::codewriter::getslice::listslice_marker_suffix(
+                        &item_ty,
+                        array_type_id.as_deref(),
+                    );
+                }
+            }
+            OpKind::Input {
+                class_root: Some(root),
+                ..
+            } if from_input.is_none() && op.result.as_ref().is_some_and(|v| same(v)) => {
+                from_input = identity_from_list_spelling(root);
+            }
+            _ => {}
+        }
+    }
+    let (item_ty, array_type_id) = from_input?;
+    crate::codewriter::getslice::listslice_marker_suffix(&item_ty, array_type_id.as_deref())
+}
+
+/// `[i64]` / `[f64]` and the same spellings inside `Vec<T>` / `VecDeque<T>` /
+/// `[T; N]`. Anything else stays unsuffixed.
+fn identity_from_list_spelling(spelling: &str) -> Option<(ValueType, Option<String>)> {
+    let stripped = spelling
+        .trim()
+        .trim_start_matches('&')
+        .trim_start_matches("mut ")
+        .trim();
+    let elem = if let Some(rest) = stripped.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        match rest.find(';') {
+            Some(i) => rest[..i].trim(),
+            None => rest.trim(),
+        }
+    } else if let Some(rest) = stripped
+        .strip_prefix("Vec<")
+        .or_else(|| stripped.strip_prefix("VecDeque<"))
+    {
+        rest.strip_suffix('>')?.trim()
+    } else {
+        return None;
+    };
+    if elem.is_empty() {
+        return None;
+    }
+    identity_from_array_type_id(&format!("[{elem}]"))
+}
+
+fn identity_from_array_type_id(id: &str) -> Option<(ValueType, Option<String>)> {
+    let inner = id.strip_prefix('[').and_then(|s| s.strip_suffix(']'))?;
+    if inner.contains(';') || inner.contains('<') {
+        return None;
+    }
+    let item_ty = match inner {
+        "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize" => {
+            ValueType::Int
+        }
+        "f64" => ValueType::Float,
+        _ => return None,
+    };
+    Some((item_ty, Some(id.to_string())))
 }
 
 /// `true` when `var` is produced by some op or is a block inputarg — i.e. it
@@ -2498,6 +2589,84 @@ mod tests {
                 .flat_map(|blk| &blk.operations)
                 .any(|op| is_slice_range_index_call(&op.kind)),
             "residual slice::index call left in place"
+        );
+    }
+
+    /// An integer-item slice whose only array fact is the input spelling
+    /// carries that kind. A length read of `[i64]` is not enough for the
+    /// codewriter scan, which names an item only for the object array.
+    #[test]
+    fn integer_list_input_carries_item_kind_on_the_marker() {
+        let mut g = FunctionGraph::new("int_slice");
+        let entry = g.startblock;
+        let slice = g.alloc_value_var();
+        g.push_inputarg_var(entry, slice.clone());
+        g.push_op_with_result_var(
+            entry,
+            OpKind::Input {
+                name: "items".into(),
+                ty: ValueType::Ref(None),
+                class_root: Some("[i64]".into()),
+            },
+            slice.clone(),
+        );
+        g.push_op_var(
+            entry,
+            OpKind::ArrayLen {
+                base: slice.clone(),
+                array_type_id: Some("[i64]".into()),
+                nolength: false,
+            },
+            true,
+        );
+        let end = g.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let range = g
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: rangeto_ctor_target(),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("core::ops::range::RangeTo".into())),
+                },
+                true,
+            )
+            .unwrap();
+        g.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: end_field_write(&range, &end),
+        });
+        g.push_op_var(
+            entry,
+            OpKind::Call {
+                target: slice_index_call_target(),
+                args: crate::model::call_args(vec![slice, range.clone()]),
+                result_ty: ValueType::Ref(None),
+            },
+            true,
+        )
+        .unwrap();
+        g.set_return(entry, None);
+        let site = SliceIndexRangeToSite {
+            range_result: range,
+            end,
+        };
+        assert_eq!(rewire_slice_index_rangeto_sites(&mut g, &[site]), 1);
+        let segments = g
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .find_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.first().map(String::as_str) == Some("__getslice_rangeto") => {
+                    Some(segments.clone())
+                }
+                _ => None,
+            });
+        assert_eq!(
+            segments.as_deref(),
+            Some(["__getslice_rangeto".to_string(), "int___i64_".to_string()].as_slice())
         );
     }
 }

@@ -5390,7 +5390,7 @@ impl<'a> Transformer<'a> {
         // marker stays what it was, a residual call.
         if crate::codewriter::getslice::is_getslice_rangefrom(op)
             && let Some((item_ty, array_type_id)) =
-                crate::codewriter::getslice::array_identity_of_base(graph, &args[0])
+                crate::codewriter::getslice::getslice_marker_identity(graph, op)
             && let Some(cc) = self.callcontrol.as_deref_mut()
         {
             let path = crate::codewriter::getslice::listslice_startonly_path(
@@ -5418,7 +5418,7 @@ impl<'a> Transformer<'a> {
         // same way `__getslice_rangefrom` mints `ll_listslice_startonly`.
         if crate::codewriter::getslice::is_getslice_minusone(op)
             && let Some((item_ty, array_type_id)) =
-                crate::codewriter::getslice::array_identity_of_base(graph, &args[0])
+                crate::codewriter::getslice::getslice_marker_identity(graph, op)
             && let Some(cc) = self.callcontrol.as_deref_mut()
         {
             let path = crate::codewriter::getslice::listslice_minusone_path(
@@ -5444,7 +5444,7 @@ impl<'a> Transformer<'a> {
         // `ll_listslice_startstop`; mint the start=0 form here.
         if crate::codewriter::getslice::is_getslice_rangeto(op)
             && let Some((item_ty, array_type_id)) =
-                crate::codewriter::getslice::array_identity_of_base(graph, &args[0])
+                crate::codewriter::getslice::getslice_marker_identity(graph, op)
             && let Some(cc) = self.callcontrol.as_deref_mut()
         {
             let path = crate::codewriter::getslice::listslice_rangeto_path(
@@ -5470,7 +5470,7 @@ impl<'a> Transformer<'a> {
         // into `ll_listslice_startstop`; mint that helper here.
         if crate::codewriter::getslice::is_getslice_range(op)
             && let Some((item_ty, array_type_id)) =
-                crate::codewriter::getslice::array_identity_of_base(graph, &args[0])
+                crate::codewriter::getslice::getslice_marker_identity(graph, op)
             && let Some(cc) = self.callcontrol.as_deref_mut()
         {
             let path = crate::codewriter::getslice::listslice_range_path(
