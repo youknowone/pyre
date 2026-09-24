@@ -1719,10 +1719,15 @@ fn parse_getset_attr(a: &syn::Attribute) -> syn::Result<(Option<String>, Option<
 ///
 /// `#[getter]` / `#[setter]` accept an optional `(py_name)` arg.  When
 /// omitted, the py-name is derived from the rust fn name (setters strip
-/// a leading `set_` to pair with their getter).  Mirrors PyPy
-/// `name = GetSetProperty(W_X.descr_get_name, W_X.descr_set_name)`
+/// a leading `set_` to pair with their getter).  A setter `set_traceback`
+/// therefore pairs with getter `__traceback__` (and `set_CHUNK_SIZE` with
+/// `_CHUNK_SIZE`) rather than requiring a rust name like `set___traceback__`.
+/// Mirrors PyPy `name = GetSetProperty(W_X.descr_get_name, W_X.descr_set_name)`
 /// where both descr handlers share the python-visible `name`.
-fn classify_method(m: &syn::ImplItemFn) -> syn::Result<MethodKind> {
+fn classify_method(
+    m: &syn::ImplItemFn,
+    getter_names: &std::collections::HashSet<String>,
+) -> syn::Result<MethodKind> {
     let mut kind = MethodKind::Instance;
     let mut seen = false;
     for a in m.attrs.iter() {
@@ -1736,17 +1741,13 @@ fn classify_method(m: &syn::ImplItemFn) -> syn::Result<MethodKind> {
             Some(MethodKind::Getter(py_name, doc))
         } else if a.path().is_ident("setter") {
             let (name, doc) = parse_getset_attr(a)?;
-            let fn_name = m.sig.ident.to_string();
-            let py_name = name
-                .or_else(|| fn_name.strip_prefix("set_").map(str::to_owned))
-                .unwrap_or(fn_name);
+            let py_name =
+                derive_setdel_py_name("set_", &m.sig.ident.to_string(), name, getter_names);
             Some(MethodKind::Setter(py_name, doc))
         } else if a.path().is_ident("deleter") {
             let (name, doc) = parse_getset_attr(a)?;
-            let fn_name = m.sig.ident.to_string();
-            let py_name = name
-                .or_else(|| fn_name.strip_prefix("del_").map(str::to_owned))
-                .unwrap_or(fn_name);
+            let py_name =
+                derive_setdel_py_name("del_", &m.sig.ident.to_string(), name, getter_names);
             Some(MethodKind::Deleter(py_name, doc))
         } else {
             None
@@ -1768,7 +1769,7 @@ fn classify_method(m: &syn::ImplItemFn) -> syn::Result<MethodKind> {
 /// One python-visible GetSetProperty being assembled across `#[getter]` /
 /// `#[setter]` / `#[deleter]` arms that share a py-name.  Mirrors
 /// `GetSetProperty(fget, fset, fdel, doc=)`.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct PropEntry {
     name: String,
     fget: Option<syn::Ident>,
@@ -1831,6 +1832,43 @@ fn record_property(
     Ok(())
 }
 
+/// `set_traceback` → `__traceback__` when that getter exists, else
+/// `traceback`.  Same for `set_CHUNK_SIZE` / `_CHUNK_SIZE` and deleters.
+fn derive_setdel_py_name(
+    prefix: &str,
+    fn_name: &str,
+    explicit: Option<String>,
+    getter_names: &std::collections::HashSet<String>,
+) -> String {
+    if let Some(name) = explicit {
+        return name;
+    }
+    let rest = fn_name.strip_prefix(prefix).unwrap_or(fn_name);
+    if getter_names.contains(rest) {
+        return rest.to_owned();
+    }
+    let underscored = format!("_{rest}");
+    if getter_names.contains(&underscored) {
+        return underscored;
+    }
+    let dunder = format!("__{rest}__");
+    if getter_names.contains(&dunder) {
+        return dunder;
+    }
+    rest.to_owned()
+}
+
+fn getter_py_name(m: &syn::ImplItemFn) -> Option<String> {
+    for a in m.attrs.iter() {
+        if !a.path().is_ident("getter") {
+            continue;
+        }
+        let (name, _) = parse_getset_attr(a).ok()?;
+        return Some(name.unwrap_or_else(|| m.sig.ident.to_string()));
+    }
+    None
+}
+
 fn expand_pyre_methods(
     attrs: PyreMethodsAttrs,
     mut imp: ItemImpl,
@@ -1842,6 +1880,16 @@ fn expand_pyre_methods(
         ));
     }
     let self_ty = (*imp.self_ty).clone();
+    let getter_names: std::collections::HashSet<String> = imp
+        .items
+        .iter()
+        .filter_map(|item| {
+            let ImplItem::Fn(m) = item else {
+                return None;
+            };
+            getter_py_name(m)
+        })
+        .collect();
 
     // Auto-synthesize `__new__` when the user wrote `__init__` but no
     // `__new__`.  Mirrors PyPy `TypeDef` behavior where a class without
@@ -1899,7 +1947,7 @@ fn expand_pyre_methods(
         let mname = &m.sig.ident;
         let wrapper_name = format_ident!("__majit_wrap_{}", mname);
         let wrapper_target_name = format_ident!("__majit_builtin_wrapper_target_{}", mname);
-        let kind = classify_method(m)?;
+        let kind = classify_method(m, &getter_names)?;
 
         // Build per-kind wrapper preamble (self extraction) + call form,
         // and pick the registration constructor.
@@ -1956,7 +2004,7 @@ fn expand_pyre_methods(
                 // `descr_check` names the descriptor as Python sees it, and
                 // a `#[setter]` / `#[deleter]` reaches the type under the
                 // property's name rather than the `set_` / `del_` prefixed
-                // Rust one: `_CHUNK_SIZE`, not `set__CHUNK_SIZE`.
+                // Rust one: `__traceback__`, not `set_traceback`.
                 let descr_name = match &kind {
                     MethodKind::Getter(py_name, _)
                     | MethodKind::Setter(py_name, _)

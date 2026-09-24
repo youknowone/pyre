@@ -766,7 +766,7 @@ two-phase-never-a-subject	pyre_interpreter::module::_io::textio::<Impl>::resolve
 two-phase-never-a-subject	pyre_interpreter::module::_io::textio::<Impl>::seek
 two-phase-never-a-subject	pyre_interpreter::module::_io::textio::<Impl>::seekable
 two-phase-never-a-subject	pyre_interpreter::module::_io::textio::<Impl>::set
-two-phase-never-a-subject	pyre_interpreter::module::_io::textio::<Impl>::set__CHUNK_SIZE
+two-phase-never-a-subject	pyre_interpreter::module::_io::textio::<Impl>::set_CHUNK_SIZE
 two-phase-never-a-subject	pyre_interpreter::module::_io::textio::<Impl>::set_encoder_decoder
 two-phase-never-a-subject	pyre_interpreter::module::_io::textio::<Impl>::set_newline
 two-phase-never-a-subject	pyre_interpreter::module::_io::textio::<Impl>::size_limit
@@ -802,7 +802,7 @@ two-phase-never-a-subject	pyre_interpreter::module::_io::textio::__majit_wrap_re
 two-phase-never-a-subject	pyre_interpreter::module::_io::textio::__majit_wrap_reconfigure
 two-phase-never-a-subject	pyre_interpreter::module::_io::textio::__majit_wrap_seek
 two-phase-never-a-subject	pyre_interpreter::module::_io::textio::__majit_wrap_seekable
-two-phase-never-a-subject	pyre_interpreter::module::_io::textio::__majit_wrap_set__CHUNK_SIZE
+two-phase-never-a-subject	pyre_interpreter::module::_io::textio::__majit_wrap_set_CHUNK_SIZE
 two-phase-never-a-subject	pyre_interpreter::module::_io::textio::__majit_wrap_tell
 two-phase-never-a-subject	pyre_interpreter::module::_io::textio::__majit_wrap_truncate
 two-phase-never-a-subject	pyre_interpreter::module::_io::textio::__majit_wrap_writable
