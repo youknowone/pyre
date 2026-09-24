@@ -109,9 +109,16 @@ fn semlock_ismine(obj: PyObjectRef) -> bool {
         && pyre_interpreter::module::thread::current_ident() == semlock_get_i64(obj, "last_tid")
 }
 
+/// The stored integer is the semaphore. `SemHandle`'s drop closes it, and
+/// that close stays with the Python object, so the view must not drop.
+#[cfg(all(unix, feature = "host_env"))]
+fn sem_view(handle: SemRaw) -> core::mem::ManuallyDrop<host_mp::SemHandle> {
+    core::mem::ManuallyDrop::new(host_mp::SemHandle::from_raw(handle))
+}
+
 #[cfg(all(unix, feature = "host_env"))]
 fn semlock_post(handle: SemRaw) -> Result<(), pyre_interpreter::PyError> {
-    host_mp::sem_post(handle).map_err(|error| {
+    sem_view(handle).post().map_err(|error| {
         pyre_interpreter::PyError::os_error_with_errno(error.raw_os_error(), "sem_post")
     })
 }
@@ -123,11 +130,9 @@ fn semlock_post(handle: SemRaw) -> Result<(), pyre_interpreter::PyError> {
 fn semlock_getvalue(handle: SemRaw) -> Result<i64, pyre_interpreter::PyError> {
     // The host helper also clamps implementations that report the number of
     // waiters as a negative value.
-    unsafe { host_mp::get_semaphore_value(handle) }
-        .map(i64::from)
-        .map_err(|error| {
-            pyre_interpreter::PyError::os_error_with_errno(error.raw_os_error(), "sem_getvalue")
-        })
+    sem_view(handle).value().map(i64::from).map_err(|error| {
+        pyre_interpreter::PyError::os_error_with_errno(error.raw_os_error(), "sem_getvalue")
+    })
 }
 
 /// `interp_semaphore.py semlock_iszero`.
@@ -135,7 +140,7 @@ fn semlock_getvalue(handle: SemRaw) -> Result<i64, pyre_interpreter::PyError> {
 fn semlock_iszero(handle: SemRaw) -> Result<bool, pyre_interpreter::PyError> {
     #[cfg(target_vendor = "apple")]
     {
-        match host_mp::sem_trywait_status(handle) {
+        match sem_view(handle).trywait() {
             host_mp::TryAcquireStatus::Acquired => {
                 semlock_post(handle)?;
                 Ok(false)
@@ -290,7 +295,7 @@ fn semlock_create(
                 error.description(),
             )
         })?;
-    let raw = handle.as_ptr();
+    let raw = handle.as_handle_int() as usize as SemRaw;
     // SemHandle::Drop closes the semaphore. Ownership belongs to the Python
     // W_SemLock until its registered finalizer grows a typed payload.
     core::mem::forget(handle);
@@ -338,7 +343,7 @@ fn semlock_rebuild_raw(
                     error.description(),
                 )
             })?;
-            let raw = handle.as_ptr();
+            let raw = handle.as_handle_int() as usize as SemRaw;
             core::mem::forget(handle);
             Ok(raw)
         }
@@ -379,7 +384,7 @@ fn semlock_acquire(
         loop {
             let status = {
                 let _blocked = pyre_interpreter::module::thread::before_external_block();
-                host_mp::sem_wait_status(handle, None)
+                sem_view(handle).wait(None)
             };
             match status {
                 host_mp::WaitStatus::Acquired => break,
@@ -399,7 +404,7 @@ fn semlock_acquire(
         Ok(true)
     } else if !block {
         loop {
-            match host_mp::sem_trywait_status(handle) {
+            match sem_view(handle).trywait() {
                 host_mp::TryAcquireStatus::Acquired => {
                     pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
                     return Ok(true);
@@ -434,9 +439,7 @@ fn semlock_acquire(
                 // The poll step sleeps between `sem_trywait` attempts.
                 let step = {
                     let _blocked = pyre_interpreter::module::thread::before_external_block();
-                    rustpython_host_env::multiprocessing::sem_timedwait_poll_step(
-                        handle, &deadline, delay,
-                    )
+                    sem_view(handle).poll_wait_step(&deadline, delay)
                 };
                 match step.map_err(|error| {
                     pyre_interpreter::PyError::os_error_with_errno(
@@ -458,7 +461,7 @@ fn semlock_acquire(
             use rustpython_host_env::multiprocessing::WaitStatus;
             let status = {
                 let _blocked = pyre_interpreter::module::thread::before_external_block();
-                rustpython_host_env::multiprocessing::sem_wait_status(handle, Some(&deadline))
+                sem_view(handle).wait(Some(&deadline))
             };
             match status {
                 WaitStatus::Acquired => {
@@ -496,10 +499,10 @@ fn semlock_release(
         // checked properly.
         if maxvalue == 1 {
             // make sure that already locked
-            match host_mp::sem_trywait_status(handle) {
+            match sem_view(handle).trywait() {
                 host_mp::TryAcquireStatus::Acquired => {
                     // it was not locked so undo wait and raise
-                    let _ = host_mp::sem_post(handle);
+                    let _ = sem_view(handle).post();
                     return Err(pyre_interpreter::PyError::value_error(
                         "semaphore or lock released too many times",
                     ));

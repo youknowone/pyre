@@ -50,7 +50,7 @@ mod msvc {
     /// structured exception is ever raised to be filtered.
     pub(in super::super) fn access_violation_reading(address: usize) -> pyre_interpreter::PyError {
         exception(&Record {
-            code: windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION as u32,
+            code: rustpython_host_env::faulthandler::EXCEPTION_ACCESS_VIOLATION,
             info: [0, address as u64],
             ninfo: 2,
         })
@@ -100,11 +100,11 @@ mod msvc {
     /// information the code alone does not, or describe a fault the system
     /// message does not.
     fn exception(record: &Record) -> pyre_interpreter::PyError {
-        use windows_sys::Win32::Foundation as win;
+        use rustpython_host_env::faulthandler as fh;
 
         let code = record.code as i32;
         let message = match code {
-            win::EXCEPTION_ACCESS_VIOLATION => {
+            x if x == fh::EXCEPTION_ACCESS_VIOLATION as i32 => {
                 // `ExceptionInformation[0]` is the access that faulted and
                 // `[1]` the address it named.  `%p` is ill-defined, so
                 // `PyUnicode_FromFormat` puts the `0x` in front of it itself
@@ -121,26 +121,50 @@ mod msvc {
                     width = size_of::<usize>() * 2
                 )
             }
-            win::EXCEPTION_BREAKPOINT => "exception: breakpoint encountered".to_string(),
-            win::EXCEPTION_DATATYPE_MISALIGNMENT => "exception: datatype misalignment".to_string(),
-            win::EXCEPTION_SINGLE_STEP => "exception: single step".to_string(),
-            win::EXCEPTION_ARRAY_BOUNDS_EXCEEDED => "exception: array bounds exceeded".to_string(),
-            win::EXCEPTION_FLT_DENORMAL_OPERAND => {
+            x if x == fh::EXCEPTION_BREAKPOINT as i32 => {
+                "exception: breakpoint encountered".to_string()
+            }
+            x if x == fh::EXCEPTION_DATATYPE_MISALIGNMENT as i32 => {
+                "exception: datatype misalignment".to_string()
+            }
+            x if x == fh::EXCEPTION_SINGLE_STEP as i32 => "exception: single step".to_string(),
+            x if x == fh::EXCEPTION_ARRAY_BOUNDS_EXCEEDED as i32 => {
+                "exception: array bounds exceeded".to_string()
+            }
+            x if x == fh::EXCEPTION_FLT_DENORMAL_OPERAND as i32 => {
                 "exception: floating-point operand denormal".to_string()
             }
-            win::EXCEPTION_FLT_DIVIDE_BY_ZERO => "exception: float divide by zero".to_string(),
-            win::EXCEPTION_FLT_INEXACT_RESULT => "exception: float inexact".to_string(),
-            win::EXCEPTION_FLT_INVALID_OPERATION => {
+            x if x == fh::EXCEPTION_FLT_DIVIDE_BY_ZERO as i32 => {
+                "exception: float divide by zero".to_string()
+            }
+            x if x == fh::EXCEPTION_FLT_INEXACT_RESULT as i32 => {
+                "exception: float inexact".to_string()
+            }
+            x if x == fh::EXCEPTION_FLT_INVALID_OPERATION as i32 => {
                 "exception: float invalid operation".to_string()
             }
-            win::EXCEPTION_FLT_OVERFLOW => "exception: float overflow".to_string(),
-            win::EXCEPTION_FLT_STACK_CHECK => "exception: stack over/underflow".to_string(),
-            win::EXCEPTION_STACK_OVERFLOW => "exception: stack overflow".to_string(),
-            win::EXCEPTION_FLT_UNDERFLOW => "exception: float underflow".to_string(),
-            win::EXCEPTION_INT_DIVIDE_BY_ZERO => "exception: integer divide by zero".to_string(),
-            win::EXCEPTION_INT_OVERFLOW => "exception: integer overflow".to_string(),
-            win::EXCEPTION_PRIV_INSTRUCTION => "exception: privileged instruction".to_string(),
-            win::EXCEPTION_NONCONTINUABLE_EXCEPTION => "exception: nocontinuable".to_string(),
+            x if x == fh::EXCEPTION_FLT_OVERFLOW as i32 => "exception: float overflow".to_string(),
+            x if x == fh::EXCEPTION_FLT_STACK_CHECK as i32 => {
+                "exception: stack over/underflow".to_string()
+            }
+            x if x == fh::EXCEPTION_STACK_OVERFLOW as i32 => {
+                "exception: stack overflow".to_string()
+            }
+            x if x == fh::EXCEPTION_FLT_UNDERFLOW as i32 => {
+                "exception: float underflow".to_string()
+            }
+            x if x == fh::EXCEPTION_INT_DIVIDE_BY_ZERO as i32 => {
+                "exception: integer divide by zero".to_string()
+            }
+            x if x == fh::EXCEPTION_INT_OVERFLOW as i32 => {
+                "exception: integer overflow".to_string()
+            }
+            x if x == fh::EXCEPTION_PRIV_INSTRUCTION as i32 => {
+                "exception: privileged instruction".to_string()
+            }
+            x if x == fh::EXCEPTION_NONCONTINUABLE_EXCEPTION as i32 => {
+                "exception: nocontinuable".to_string()
+            }
             _ => {
                 return pyre_interpreter::PyError::os_error_win32_syscall2(
                     code,

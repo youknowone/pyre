@@ -16221,7 +16221,7 @@ fn syntax_error_subclass(
         // `pegen`'s "expected an indented block after <clause> on line N",
         // which the compiler reconstructs as a plain message.
         ParseErrorType::OtherError(msg) if msg.starts_with("expected an indented block") => {
-            Some(("IndentationError", None))
+            Some(("IndentationError", Some(msg.clone())))
         }
         // `python.gram:invalid_if_stmt` checks `NEWLINE !INDENT` before an
         // invalid expression on the following line.  RustPython's diagnostic

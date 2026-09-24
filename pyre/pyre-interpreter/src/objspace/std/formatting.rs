@@ -817,6 +817,11 @@ unsafe fn spec_format_bytes(spec: &CFormatSpec, obj: PyObjectRef) -> Result<Vec<
         CFormatType::Character(CCharacterType::Character) => {
             Ok(spec.format_char(bytes_char_arg(obj)?))
         }
+        CFormatType::Unsupported { ch, index } => Err(PyError::value_error(format!(
+            "unsupported format character '{}' ({:#x}) at index {index}",
+            ch.to_char_lossy(),
+            ch.to_u32(),
+        ))),
     }
 }
 
@@ -903,6 +908,11 @@ unsafe fn spec_format_string(spec: &CFormatSpec, obj: PyObjectRef) -> Result<Wtf
             Ok(Wtf8Buf::from_string(spec.format_float(value)))
         }
         CFormatType::Character(_) => Ok(spec.format_char(char_arg(obj)?)),
+        CFormatType::Unsupported { ch, index } => Err(PyError::value_error(format!(
+            "unsupported format character '{}' ({:#x}) at index {index}",
+            ch.to_char_lossy(),
+            ch.to_u32(),
+        ))),
     }
 }
 

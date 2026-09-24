@@ -13,9 +13,9 @@ use pyre_object::PyObjectRef;
 use rustpython_host_env::winsound as host_winsound;
 
 /// Play from a buffer rather than from a name.
-const SND_MEMORY: i32 = 0x0004;
+const SND_MEMORY: i32 = host_winsound::SND_MEMORY as i32;
 /// Return before the sound finishes.
-const SND_ASYNC: i32 = 0x0001;
+const SND_ASYNC: i32 = host_winsound::SND_ASYNC as i32;
 
 enum PreparedSound {
     Memory(Vec<u16>),
@@ -116,31 +116,31 @@ pyre_interpreter::py_module! {
     int_constants: {
         // `PlaySound` flags (mmsystem.h).  SND_SYNC is the absence of
         // SND_ASYNC rather than a bit of its own.
-        "SND_SYNC" => 0x0000,
+        "SND_SYNC" => host_winsound::SND_SYNC as i32,
         "SND_ASYNC" => SND_ASYNC,
-        "SND_NODEFAULT" => 0x0002,
+        "SND_NODEFAULT" => host_winsound::SND_NODEFAULT as i32,
         "SND_MEMORY" => SND_MEMORY,
-        "SND_LOOP" => 0x0008,
-        "SND_NOSTOP" => 0x0010,
-        "SND_PURGE" => 0x0040,
-        "SND_APPLICATION" => 0x0080,
-        "SND_NOWAIT" => 0x0000_2000,
-        "SND_ALIAS" => 0x0001_0000,
-        "SND_FILENAME" => 0x0002_0000,
-        "SND_SENTRY" => 0x0008_0000,
-        "SND_SYSTEM" => 0x0020_0000,
+        "SND_LOOP" => host_winsound::SND_LOOP as i32,
+        "SND_NOSTOP" => host_winsound::SND_NOSTOP as i32,
+        "SND_PURGE" => host_winsound::SND_PURGE as i32,
+        "SND_APPLICATION" => host_winsound::SND_APPLICATION as i32,
+        "SND_NOWAIT" => host_winsound::SND_NOWAIT as i32,
+        "SND_ALIAS" => host_winsound::SND_ALIAS as i32,
+        "SND_FILENAME" => host_winsound::SND_FILENAME as i32,
+        "SND_SENTRY" => host_winsound::SND_SENTRY as i32,
+        "SND_SYSTEM" => host_winsound::SND_SYSTEM as i32,
         // `MessageBeep` sound ids (winuser.h).  Several are aliases: HAND,
         // ERROR and STOP are one sound, as are EXCLAMATION and WARNING, and
         // ASTERISK and INFORMATION.
-        "MB_OK" => 0x0000,
-        "MB_ICONHAND" => 0x0010,
-        "MB_ICONERROR" => 0x0010,
-        "MB_ICONSTOP" => 0x0010,
-        "MB_ICONQUESTION" => 0x0020,
-        "MB_ICONEXCLAMATION" => 0x0030,
-        "MB_ICONWARNING" => 0x0030,
-        "MB_ICONASTERISK" => 0x0040,
-        "MB_ICONINFORMATION" => 0x0040,
+        "MB_OK" => host_winsound::MB_OK as i32,
+        "MB_ICONHAND" => host_winsound::MB_ICONHAND as i32,
+        "MB_ICONERROR" => host_winsound::MB_ICONERROR as i32,
+        "MB_ICONSTOP" => host_winsound::MB_ICONSTOP as i32,
+        "MB_ICONQUESTION" => host_winsound::MB_ICONQUESTION as i32,
+        "MB_ICONEXCLAMATION" => host_winsound::MB_ICONEXCLAMATION as i32,
+        "MB_ICONWARNING" => host_winsound::MB_ICONWARNING as i32,
+        "MB_ICONASTERISK" => host_winsound::MB_ICONASTERISK as i32,
+        "MB_ICONINFORMATION" => host_winsound::MB_ICONINFORMATION as i32,
     },
     inline_functions: {
         fn PlaySound(sound: PyObjectRef, flags: PyIndexCInt) -> Result<(), pyre_interpreter::PyError> {
