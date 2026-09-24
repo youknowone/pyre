@@ -1933,7 +1933,7 @@ dependencies = [
  "libc",
  "majit-gc",
  "majit-ir",
- "majit-translate",
+ "majit-jitcode",
  "parking_lot",
  "region",
 ]
@@ -1951,7 +1951,7 @@ dependencies = [
  "majit-backend",
  "majit-gc",
  "majit-ir",
- "majit-translate",
+ "majit-jitcode",
  "parking_lot",
  "region",
  "smallvec",
@@ -1969,8 +1969,8 @@ dependencies = [
  "majit-backend",
  "majit-gc",
  "majit-ir",
+ "majit-jitcode",
  "majit-trace",
- "majit-translate",
  "parking_lot",
  "rustc-hash",
  "smallvec",
@@ -1984,7 +1984,7 @@ dependencies = [
  "majit-backend",
  "majit-gc",
  "majit-ir",
- "majit-translate",
+ "majit-jitcode",
  "parking_lot",
  "smallvec",
  "wasm-bindgen",
@@ -2040,7 +2040,9 @@ name = "majit-jitcode"
 version = "0.0.2"
 dependencies = [
  "indexmap",
+ "majit-ir",
  "rustc-hash",
+ "serde",
 ]
 
 [[package]]

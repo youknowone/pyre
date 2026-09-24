@@ -3189,6 +3189,7 @@ mod portal_driver_tests {
             .body()
             ._ssarepr
             .as_ref()
+            .and_then(|ssarepr| ssarepr.as_any().downcast_ref::<SSARepr>())
             .expect("assembled portal keeps its SSA representation")
             .insns
             .iter()

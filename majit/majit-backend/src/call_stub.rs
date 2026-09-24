@@ -13,8 +13,8 @@
 //! Microsoft x64 positional-slot convention and is also correct under SysV and
 //! AAPCS.
 
-use majit_translate::codewriter::insns::MAX_HOST_CALL_ARITY;
-use majit_translate::jitcode::{BhCallDescr, BhCallStub};
+use majit_jitcode::codewriter::insns::MAX_HOST_CALL_ARITY;
+use majit_jitcode::jitcode::{BhCallDescr, BhCallStub};
 
 /// `descr.py TYPE()` collapsed to the two C-ABI register classes the
 /// dispatch table can express: `'i'`, `'r'` and `'L'` (`lltype.Signed`,
@@ -40,7 +40,7 @@ pub enum ArgClass {
 ///
 /// Coverage: every ordered sequence up to 5 arguments, plus the all-`Int`
 /// sequences on to `MAX_HOST_CALL_ARITY`. The float-carrying bound is mirrored
-/// by `majit_translate::codewriter::jitcode::MAX_FLOAT_CARRYING_CALL_ARITY`,
+/// by `majit_jitcode::codewriter::jitcode::MAX_FLOAT_CARRYING_CALL_ARITY`,
 /// which flags such a signature where the calldescr is built instead of at the
 /// deopt that first runs it; widening the arms here means raising it there in
 /// the same change (`majit-translate` cannot call into `majit-backend`, so the
@@ -710,7 +710,7 @@ pub unsafe fn bh_call_v_with_descr(
 /// `args_i` / `args_r` / `args_f`, following `calldescr.arg_classes` order.
 ///
 /// `arg_classes` is the per-argument class string from
-/// `majit_translate::jitcode::BhCallDescr`. RPython
+/// `majit_jitcode::jitcode::BhCallDescr`. RPython
 /// `rpython/jit/backend/llsupport/descr.py create_call_stub`'s
 /// `process(c)` walks the class string in declaration order and pulls the next
 /// item out of the corresponding storage bank.
@@ -1046,7 +1046,7 @@ mod tests {
     }
 
     /// The widest float-carrying sequence the table covers, and the bound
-    /// `majit_translate::codewriter::jitcode::MAX_FLOAT_CARRYING_CALL_ARITY`
+    /// `majit_jitcode::codewriter::jitcode::MAX_FLOAT_CARRYING_CALL_ARITY`
     /// states on the descr-build side.
     #[test]
     fn call_stub_i_dispatches_a_float_in_the_last_covered_slot() {

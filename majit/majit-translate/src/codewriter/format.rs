@@ -75,6 +75,16 @@ fn getlabelname(
     *labelcount
 }
 
+impl crate::jitcode::SsaReprDump for SSARepr {
+    fn format_assembler(&self) -> String {
+        format_assembler(self)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 /// `format.py format_assembler(ssarepr)`.  Per-arg kinds for
 /// `OpKind::Call` argument lists resolve via `getkind(v.concretetype)`
 /// read directly from each operand `Variable`'s `concretetype` cell

@@ -18894,7 +18894,7 @@ impl majit_backend::Backend for CraneliftBackend {
     }
 
     /// llmodel.py bh_new(sizedescr) → gc_ll_descr.gc_malloc(sizedescr).
-    fn bh_new(&self, sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
+    fn bh_new(&self, sizedescr: &majit_jitcode::jitcode::BhDescr) -> i64 {
         let size = sizedescr.as_size();
         // Same non-moving requirement as `bh_new_with_vtable` below, and the
         // same shape as Dynasm's `bh_alloc_struct`: the materialized struct is
@@ -18940,7 +18940,7 @@ impl majit_backend::Backend for CraneliftBackend {
 
     /// llmodel.py bh_new_with_vtable(sizedescr).
     /// gc_malloc(sizedescr) + write vtable at vtable_offset.
-    fn bh_new_with_vtable(&self, sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
+    fn bh_new_with_vtable(&self, sizedescr: &majit_jitcode::jitcode::BhDescr) -> i64 {
         let size = sizedescr.as_size();
         let vtable = sizedescr.get_vtable();
         let type_id = sizedescr.resolve_gc_tid();
@@ -18972,7 +18972,7 @@ impl majit_backend::Backend for CraneliftBackend {
     }
 
     /// llmodel.py bh_new_array / bh_new_array_clear.
-    fn bh_new_array(&self, length: i64, arraydescr: &majit_translate::jitcode::BhDescr) -> i64 {
+    fn bh_new_array(&self, length: i64, arraydescr: &majit_jitcode::jitcode::BhDescr) -> i64 {
         let Ok(length) = usize::try_from(length) else {
             return 0;
         };
@@ -19015,11 +19015,7 @@ impl majit_backend::Backend for CraneliftBackend {
     }
 
     /// llmodel.py bh_new_array_clear = bh_new_array.
-    fn bh_new_array_clear(
-        &self,
-        length: i64,
-        arraydescr: &majit_translate::jitcode::BhDescr,
-    ) -> i64 {
+    fn bh_new_array_clear(&self, length: i64, arraydescr: &majit_jitcode::jitcode::BhDescr) -> i64 {
         self.bh_new_array(length, arraydescr)
     }
 
@@ -19050,7 +19046,7 @@ impl majit_backend::Backend for CraneliftBackend {
         args_i: Option<&[i64]>,
         args_r: Option<&[i64]>,
         args_f: Option<&[i64]>,
-        calldescr: &majit_translate::jitcode::BhCallDescr,
+        calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> i64 {
         assert_ne!(func, 0, "bh_call_i: null function pointer");
         majit_backend::call_stub::verify_result_type(calldescr.result_type, "iS");
@@ -19075,7 +19071,7 @@ impl majit_backend::Backend for CraneliftBackend {
         args_i: Option<&[i64]>,
         args_r: Option<&[i64]>,
         args_f: Option<&[i64]>,
-        calldescr: &majit_translate::jitcode::BhCallDescr,
+        calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
         assert_ne!(func, 0, "bh_call_r: null function pointer");
         majit_backend::call_stub::verify_result_type(calldescr.result_type, "r");
@@ -19101,7 +19097,7 @@ impl majit_backend::Backend for CraneliftBackend {
         args_i: Option<&[i64]>,
         args_r: Option<&[i64]>,
         args_f: Option<&[i64]>,
-        calldescr: &majit_translate::jitcode::BhCallDescr,
+        calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> f64 {
         assert_ne!(func, 0, "bh_call_f: null function pointer");
         majit_backend::call_stub::verify_result_type(calldescr.result_type, "fL");
@@ -19125,7 +19121,7 @@ impl majit_backend::Backend for CraneliftBackend {
         args_i: Option<&[i64]>,
         args_r: Option<&[i64]>,
         args_f: Option<&[i64]>,
-        calldescr: &majit_translate::jitcode::BhCallDescr,
+        calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) {
         // llmodel.py bh_call_v / descr.py create_call_stub
         // (`RESULT == lltype.Void`) parity: route through the void-typed
@@ -19150,7 +19146,7 @@ impl majit_backend::Backend for CraneliftBackend {
         &self,
         addr: i64,
         offset: i64,
-        descr: &majit_translate::jitcode::BhDescr,
+        descr: &majit_jitcode::jitcode::BhDescr,
     ) -> i64 {
         // llmodel.py: ofs, size, sign = self.unpack_arraydescr_size(descr)
         // ofs == 0 always for raw lengthless arrays (llmodel.py:749 assert)
@@ -19166,7 +19162,7 @@ impl majit_backend::Backend for CraneliftBackend {
         addr: i64,
         offset: i64,
         newvalue: i64,
-        descr: &majit_translate::jitcode::BhDescr,
+        descr: &majit_jitcode::jitcode::BhDescr,
     ) {
         // llmodel.py: ofs, size, _ = self.unpack_arraydescr_size(descr)
         // ofs == 0 always for raw lengthless arrays (llmodel.py:741 assert)
@@ -19180,7 +19176,7 @@ impl majit_backend::Backend for CraneliftBackend {
         &self,
         addr: i64,
         offset: i64,
-        _descr: &majit_translate::jitcode::BhDescr,
+        _descr: &majit_jitcode::jitcode::BhDescr,
     ) -> f64 {
         // llmodel.py: return self.read_float_at_mem(addr, offset)
         self.read_float_at_mem(addr, offset)
@@ -19192,7 +19188,7 @@ impl majit_backend::Backend for CraneliftBackend {
         addr: i64,
         offset: i64,
         newvalue: f64,
-        _descr: &majit_translate::jitcode::BhDescr,
+        _descr: &majit_jitcode::jitcode::BhDescr,
     ) {
         // llmodel.py: self.write_float_at_mem(addr, offset, newvalue)
         self.write_float_at_mem(addr, offset, newvalue);
@@ -19220,7 +19216,7 @@ impl majit_backend::Backend for CraneliftBackend {
     fn bh_getfield_gc_i(
         &self,
         struct_ptr: i64,
-        fielddescr: &majit_translate::jitcode::BhDescr,
+        fielddescr: &majit_jitcode::jitcode::BhDescr,
     ) -> i64 {
         let (offset, size, sign) = fielddescr.unpack_fielddescr_size();
         self.read_int_at_mem(struct_ptr, offset as i64, size, sign)
@@ -19229,7 +19225,7 @@ impl majit_backend::Backend for CraneliftBackend {
     fn bh_getfield_gc_r(
         &self,
         struct_ptr: i64,
-        fielddescr: &majit_translate::jitcode::BhDescr,
+        fielddescr: &majit_jitcode::jitcode::BhDescr,
     ) -> majit_ir::GcRef {
         let offset = fielddescr.as_offset();
         // `llmodel.py bh_getfield_gc_r` loads a value, including a by-value
@@ -19242,7 +19238,7 @@ impl majit_backend::Backend for CraneliftBackend {
         &self,
         struct_ptr: i64,
         value: i64,
-        fielddescr: &majit_translate::jitcode::BhDescr,
+        fielddescr: &majit_jitcode::jitcode::BhDescr,
     ) {
         let (offset, size, _sign) = fielddescr.unpack_fielddescr_size();
         self.write_int_at_mem(struct_ptr, offset as i64, size, value);
@@ -19252,7 +19248,7 @@ impl majit_backend::Backend for CraneliftBackend {
         &self,
         struct_ptr: i64,
         value: majit_ir::GcRef,
-        fielddescr: &majit_translate::jitcode::BhDescr,
+        fielddescr: &majit_jitcode::jitcode::BhDescr,
     ) {
         let offset = fielddescr.as_offset();
         unsafe { *((struct_ptr as *mut u8).add(offset) as *mut usize) = value.0 };
@@ -19271,7 +19267,7 @@ impl majit_backend::Backend for CraneliftBackend {
         &self,
         array_ptr: i64,
         index: i64,
-        arraydescr: &majit_translate::jitcode::BhDescr,
+        arraydescr: &majit_jitcode::jitcode::BhDescr,
     ) -> i64 {
         let (base_size, itemsize, sign) = arraydescr.unpack_arraydescr_size();
         let offset = (base_size as i64) + index * (itemsize as i64);
@@ -19280,11 +19276,7 @@ impl majit_backend::Backend for CraneliftBackend {
 
     /// model.py / llmodel.py bh_arraylen_gc.
     /// Read the length word from `arraydescr.lendescr.offset`.
-    fn bh_arraylen_gc(
-        &self,
-        array_ptr: i64,
-        arraydescr: &majit_translate::jitcode::BhDescr,
-    ) -> i64 {
+    fn bh_arraylen_gc(&self, array_ptr: i64, arraydescr: &majit_jitcode::jitcode::BhDescr) -> i64 {
         let ofs = arraydescr
             .array_len_offset()
             .expect("bh_arraylen_gc requires ArrayDescr.lendescr");
@@ -19296,7 +19288,7 @@ impl majit_backend::Backend for CraneliftBackend {
         &self,
         array_ptr: i64,
         index: i64,
-        arraydescr: &majit_translate::jitcode::BhDescr,
+        arraydescr: &majit_jitcode::jitcode::BhDescr,
     ) -> majit_ir::GcRef {
         let base_size = arraydescr.array_base_size();
         let offset = (base_size as i64) + index * 8;
@@ -19309,7 +19301,7 @@ impl majit_backend::Backend for CraneliftBackend {
         &self,
         array_ptr: i64,
         index: i64,
-        arraydescr: &majit_translate::jitcode::BhDescr,
+        arraydescr: &majit_jitcode::jitcode::BhDescr,
     ) -> f64 {
         let base_size = arraydescr.array_base_size();
         let offset = (base_size as i64) + index * 8;
@@ -19322,7 +19314,7 @@ impl majit_backend::Backend for CraneliftBackend {
         array_ptr: i64,
         index: i64,
         newvalue: i64,
-        arraydescr: &majit_translate::jitcode::BhDescr,
+        arraydescr: &majit_jitcode::jitcode::BhDescr,
     ) {
         let (base_size, itemsize, _sign) = arraydescr.unpack_arraydescr_size();
         let offset = (base_size as i64) + index * (itemsize as i64);
@@ -19335,7 +19327,7 @@ impl majit_backend::Backend for CraneliftBackend {
         array_ptr: i64,
         index: i64,
         newvalue: majit_ir::GcRef,
-        arraydescr: &majit_translate::jitcode::BhDescr,
+        arraydescr: &majit_jitcode::jitcode::BhDescr,
     ) {
         let base_size = arraydescr.array_base_size();
         let offset = (base_size as i64) + index * 8;
@@ -19357,7 +19349,7 @@ impl majit_backend::Backend for CraneliftBackend {
         array_ptr: i64,
         index: i64,
         newvalue: f64,
-        arraydescr: &majit_translate::jitcode::BhDescr,
+        arraydescr: &majit_jitcode::jitcode::BhDescr,
     ) {
         let base_size = arraydescr.array_base_size();
         let offset = (base_size as i64) + index * 8;
@@ -19372,9 +19364,9 @@ impl majit_backend::Backend for CraneliftBackend {
         array_ptr: i64,
         index: i64,
         newvalue: i64,
-        descr: &majit_translate::jitcode::BhDescr,
+        descr: &majit_jitcode::jitcode::BhDescr,
     ) {
-        let majit_translate::jitcode::BhDescr::InteriorField { array, field } = descr else {
+        let majit_jitcode::jitcode::BhDescr::InteriorField { array, field } = descr else {
             panic!("bh_setinteriorfield_gc_i: descr is not an InteriorField: {descr:?}");
         };
         let (base_size, itemsize, _) = array.unpack_arraydescr_size();
@@ -19390,9 +19382,9 @@ impl majit_backend::Backend for CraneliftBackend {
         array_ptr: i64,
         index: i64,
         newvalue: majit_ir::GcRef,
-        descr: &majit_translate::jitcode::BhDescr,
+        descr: &majit_jitcode::jitcode::BhDescr,
     ) {
-        let majit_translate::jitcode::BhDescr::InteriorField { array, field } = descr else {
+        let majit_jitcode::jitcode::BhDescr::InteriorField { array, field } = descr else {
             panic!("bh_setinteriorfield_gc_r: descr is not an InteriorField: {descr:?}");
         };
         let (base_size, itemsize, _) = array.unpack_arraydescr_size();
@@ -19411,9 +19403,9 @@ impl majit_backend::Backend for CraneliftBackend {
         array_ptr: i64,
         index: i64,
         newvalue: f64,
-        descr: &majit_translate::jitcode::BhDescr,
+        descr: &majit_jitcode::jitcode::BhDescr,
     ) {
-        let majit_translate::jitcode::BhDescr::InteriorField { array, field } = descr else {
+        let majit_jitcode::jitcode::BhDescr::InteriorField { array, field } = descr else {
             panic!("bh_setinteriorfield_gc_f: descr is not an InteriorField: {descr:?}");
         };
         let (base_size, itemsize, _) = array.unpack_arraydescr_size();
@@ -19431,7 +19423,7 @@ impl majit_backend::Backend for CraneliftBackend {
     fn bh_getfield_gc_f(
         &self,
         struct_ptr: i64,
-        fielddescr: &majit_translate::jitcode::BhDescr,
+        fielddescr: &majit_jitcode::jitcode::BhDescr,
     ) -> f64 {
         let (offset, size, _) = fielddescr.unpack_fielddescr_size();
         unsafe {
@@ -19446,7 +19438,7 @@ impl majit_backend::Backend for CraneliftBackend {
         &self,
         struct_ptr: i64,
         value: f64,
-        fielddescr: &majit_translate::jitcode::BhDescr,
+        fielddescr: &majit_jitcode::jitcode::BhDescr,
     ) {
         let (offset, size, _) = fielddescr.unpack_fielddescr_size();
         unsafe {
@@ -19496,7 +19488,7 @@ mod tests {
                 "Node.value".into(),
                 "value".into(),
             );
-            let bh = majit_translate::jitcode::BhDescr::from_field_descr(&fd);
+            let bh = majit_jitcode::jitcode::BhDescr::from_field_descr(&fd);
             assert_eq!(
                 backend.bh_getfield_gc_r(field_words.as_ptr() as i64, &bh),
                 majit_ir::GcRef(field_words[1])

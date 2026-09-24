@@ -657,7 +657,7 @@ impl Assembler {
             jit_merge_point_offset: state.jit_merge_point_offset,
             alllabels: Some(state.alllabels),
             resulttypes: Some(state.resulttypes),
-            _ssarepr: Some(ssarepr.clone()),
+            _ssarepr: Some(std::sync::Arc::new(ssarepr.clone())),
         };
 
         self.count_jitcodes += 1;
@@ -4915,100 +4915,6 @@ fn heuristic_field_layout(
     None
 }
 
-fn bh_field_flag_from_descr(fd: &dyn majit_ir::descr::FieldDescr) -> majit_ir::descr::ArrayFlag {
-    if fd.is_pointer_field() {
-        majit_ir::descr::ArrayFlag::Pointer
-    } else if fd.is_float_field() {
-        majit_ir::descr::ArrayFlag::Float
-    } else if fd.field_type() == majit_ir::value::Type::Void {
-        majit_ir::descr::ArrayFlag::Void
-    } else if fd.is_field_signed() {
-        majit_ir::descr::ArrayFlag::Signed
-    } else {
-        majit_ir::descr::ArrayFlag::Unsigned
-    }
-}
-
-fn bh_field_spec_from_descr(fd: &dyn majit_ir::descr::FieldDescr) -> crate::jitcode::BhFieldSpec {
-    let field_flag = bh_field_flag_from_descr(fd);
-    crate::jitcode::BhFieldSpec {
-        index: fd.index(),
-        field_key: fd.field_key().to_string(),
-        name: fd.field_name().to_string(),
-        offset: fd.offset(),
-        field_size: fd.field_size(),
-        field_type: fd.field_type(),
-        field_flag,
-        is_field_signed: fd.is_field_signed(),
-        is_immutable: fd.is_immutable(),
-        is_quasi_immutable: fd.is_quasi_immutable(),
-        index_in_parent: fd.index_in_parent(),
-        // `declared_w_class`, not `is_w_class`: a descr that guessed from its
-        // name must round-trip as "nobody declared", so the far side re-guesses
-        // instead of receiving a declaration that outranks a real one.
-        is_class_word: fd.declared_w_class(),
-    }
-}
-
-fn bh_size_spec_from_descr(sd: &dyn majit_ir::descr::SizeDescr) -> crate::jitcode::BhSizeSpec {
-    crate::jitcode::BhSizeSpec {
-        size: sd.size(),
-        // Descr-back-to-spec inverse path: pyre's analyzer-side
-        // `bh_size_spec_from_callcontrol` stamps
-        // `type_id = path_hash(owner)` (u64) so the
-        // `simple_descr_group_from_bh_size` round-trip resolves
-        // `LLType::Struct(path_hash)` in `gc_cache._cache_size`.  The
-        // `SizeDescr.cache_key()` accessor returns that same u64 (set
-        // by `get_size_descr` cache-miss-mint).  Previously this used
-        // `sd.type_id() as u64` — the dense GC tid widened to u64,
-        // which lands on a DIFFERENT cache slot than the analyzer's
-        // path_hash key, polluting cross-path identity.
-        type_id: sd.cache_key(),
-        vtable: sd.vtable() as u64,
-        // Round-trip the GC-header flag off the descr so a raw native
-        // struct stays raw through the inverse path (it must not regain
-        // a spurious `GUARD_GC_TYPE`).
-        is_gc_managed: sd.is_gc_managed(),
-        headerless: sd.headerless(),
-        all_fielddescrs: sd
-            .all_fielddescrs()
-            .iter()
-            .map(|fd| bh_field_spec_from_descr(fd.as_ref()))
-            .collect(),
-    }
-}
-
-pub(crate) fn bh_interior_field_specs_from_array_descr(
-    array_descr: &dyn majit_ir::descr::ArrayDescr,
-) -> Vec<crate::jitcode::BhInteriorFieldSpec> {
-    array_descr
-        .get_all_interiorfielddescrs()
-        .unwrap_or(&[])
-        .iter()
-        .filter_map(|descr| {
-            let interior = descr.as_interior_field_descr()?;
-            let field = bh_field_spec_from_descr(interior.field_descr());
-            let owner = interior
-                .field_descr()
-                .get_parent_descr()
-                .and_then(|parent| parent.as_size_descr().map(bh_size_spec_from_descr))
-                .unwrap_or_else(|| crate::jitcode::BhSizeSpec {
-                    size: array_descr.item_size(),
-                    type_id: 0,
-                    vtable: 0,
-                    is_gc_managed: true,
-                    headerless: false,
-                    all_fielddescrs: vec![field.clone()],
-                });
-            Some(crate::jitcode::BhInteriorFieldSpec {
-                index: descr.index(),
-                field,
-                owner,
-            })
-        })
-        .collect()
-}
-
 /// `cpu.arraydescrof(rffi.CArray(T))` for a raw element access
 /// (`jtransform.py:1156-1171`): no length header, non-GC, item width and
 /// signedness explicit because [`crate::model::ValueType`] collapses widths.
@@ -5097,7 +5003,7 @@ fn arraydescrof(
             array_type_id: array_type_id
                 .as_ref()
                 .map(|id| crate::front::typestr::canonical_array_type_id(id).into_owned()),
-            interior_fields: bh_interior_field_specs_from_array_descr(array_descr),
+            interior_fields: super::jitcode::bh_interior_field_specs_from_array_descr(array_descr),
             is_gc_managed: array_descr.is_gc_managed(),
         };
     }

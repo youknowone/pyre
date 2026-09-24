@@ -37,7 +37,7 @@ pub use majit_jitcode::codewriter::insns;
 pub mod getslice;
 // `core::cmp::{min,max}` for the rich-`OpKind` spine — mints `ll_min` / `ll_max`.
 pub mod iter_lower;
-pub mod jitcode;
+pub use majit_jitcode::codewriter::jitcode;
 pub mod jtransform;
 pub mod longlong;
 pub mod minmax;

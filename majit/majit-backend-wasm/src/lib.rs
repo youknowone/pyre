@@ -1942,7 +1942,7 @@ fn wasm_bh_alloc_raw(size: usize) -> i64 {
 /// `resolve_gc_tid` routes the serialized `path_hash` cache key back to the
 /// dense GC tid (`gc.py:536-542`); a raw cache key read as a tid indexes past
 /// the type table on the first collection that traces the block.
-fn wasm_bh_alloc_struct(sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
+fn wasm_bh_alloc_struct(sizedescr: &majit_jitcode::jitcode::BhDescr) -> i64 {
     let size = sizedescr.as_size();
     if sizedescr.is_headerless() {
         let gc_ptr = wasm_alloc_nursery_headerless_no_collect(size).0;
@@ -5038,13 +5038,13 @@ impl majit_backend::Backend for WasmBackend {
     // collects, so allocation inputs need no rooting here.
 
     /// llmodel.py bh_new(sizedescr).
-    fn bh_new(&self, sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
+    fn bh_new(&self, sizedescr: &majit_jitcode::jitcode::BhDescr) -> i64 {
         wasm_bh_alloc_struct(sizedescr)
     }
 
     /// llmodel.py bh_new_with_vtable(sizedescr): allocate, then write
     /// the type pointer at `vtable_offset`.
-    fn bh_new_with_vtable(&self, sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
+    fn bh_new_with_vtable(&self, sizedescr: &majit_jitcode::jitcode::BhDescr) -> i64 {
         let vtable = sizedescr.get_vtable();
         let ptr = wasm_bh_alloc_struct(sizedescr);
         if ptr != 0
@@ -5059,7 +5059,7 @@ impl majit_backend::Backend for WasmBackend {
     }
 
     /// llmodel.py bh_new_array(length, arraydescr).
-    fn bh_new_array(&self, length: i64, arraydescr: &majit_translate::jitcode::BhDescr) -> i64 {
+    fn bh_new_array(&self, length: i64, arraydescr: &majit_jitcode::jitcode::BhDescr) -> i64 {
         let Ok(length) = usize::try_from(length) else {
             return 0;
         };
@@ -5092,11 +5092,7 @@ impl majit_backend::Backend for WasmBackend {
     }
 
     /// llmodel.py bh_new_array_clear = bh_new_array (allocator zeroes).
-    fn bh_new_array_clear(
-        &self,
-        length: i64,
-        arraydescr: &majit_translate::jitcode::BhDescr,
-    ) -> i64 {
+    fn bh_new_array_clear(&self, length: i64, arraydescr: &majit_jitcode::jitcode::BhDescr) -> i64 {
         self.bh_new_array(length, arraydescr)
     }
 
@@ -5149,11 +5145,7 @@ impl majit_backend::Backend for WasmBackend {
     /// its at-capacity arm on a list that has room. The compiled code reads the
     /// real length, so that guard then fails on nearly every iteration and the
     /// trace never stays in compiled code.
-    fn bh_arraylen_gc(
-        &self,
-        array_ptr: i64,
-        arraydescr: &majit_translate::jitcode::BhDescr,
-    ) -> i64 {
+    fn bh_arraylen_gc(&self, array_ptr: i64, arraydescr: &majit_jitcode::jitcode::BhDescr) -> i64 {
         let ofs = arraydescr
             .array_len_offset()
             .expect("bh_arraylen_gc requires ArrayDescr.lendescr");

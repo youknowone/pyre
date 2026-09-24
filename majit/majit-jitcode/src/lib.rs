@@ -7,7 +7,11 @@
 
 pub mod codewriter {
     pub mod insns;
+    pub mod jitcode;
+    pub mod liveness;
 }
+
+pub use codewriter::{insns, jitcode, liveness};
 
 pub mod tool {
     pub mod algo {

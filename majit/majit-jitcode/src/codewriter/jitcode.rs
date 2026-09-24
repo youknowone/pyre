@@ -17,6 +17,16 @@ use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
+/// What `JitCode._ssarepr` holds: the flattened graph the assembler read,
+/// kept so `dump()` can render it. The translator owns the concrete type
+/// (`flatten::SSARepr`) and `format.py format_assembler`.
+pub trait SsaReprDump: std::fmt::Debug {
+    /// `format_assembler(self._ssarepr)`.
+    fn format_assembler(&self) -> String;
+    /// The concrete representation, for readers that inspect its insns.
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
 /// Assembled JitCode — the output of the assembler.
 ///
 /// RPython parity (`rpython/jit/codewriter/jitcode.py:9-43`):
@@ -271,7 +281,7 @@ pub struct JitCodeBody {
     /// graph kind view is required alongside `_ssarepr` — matching
     /// upstream's `Variable.concretetype` carrier shape.
     #[serde(skip)]
-    pub _ssarepr: Option<crate::flatten::SSARepr>,
+    pub _ssarepr: Option<Arc<dyn SsaReprDump>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -650,7 +660,7 @@ impl JitCode {
     pub fn dump(&self) -> String {
         match &self._ssarepr {
             None => format!("<no dump available for {:?}>", self.name),
-            Some(ssarepr) => crate::codewriter::format::format_assembler(ssarepr),
+            Some(ssarepr) => ssarepr.format_assembler(),
         }
     }
 
@@ -773,7 +783,7 @@ impl JitCode {
         );
         let mut pc = pc;
         if self.code[pc] != op_live {
-            pc -= crate::liveness::OFFSET_SIZE + 1;
+            pc -= super::liveness::OFFSET_SIZE + 1;
             debug_assert!(
                 self.startpoints
                     .as_ref()
@@ -785,7 +795,7 @@ impl JitCode {
                 self.missing_liveness(pc);
             }
         }
-        crate::liveness::decode_offset(&self.code, pc + 1)
+        super::liveness::decode_offset(&self.code, pc + 1)
     }
 
     /// `True` when `pc` is a recorded resume startpoint (`jitcode.py:85`
@@ -822,7 +832,7 @@ impl JitCode {
         if self.code.get(pc) == Some(&op_live) {
             return true;
         }
-        match pc.checked_sub(crate::liveness::OFFSET_SIZE + 1) {
+        match pc.checked_sub(super::liveness::OFFSET_SIZE + 1) {
             Some(back) => self.is_valid_startpoint(back) && self.code.get(back) == Some(&op_live),
             None => false,
         }
@@ -1019,7 +1029,7 @@ pub fn enumerate_vars_by_bank(
     all_liveness: &[u8],
     mut callback: impl FnMut(majit_ir::Type, u32),
 ) {
-    use crate::liveness::LivenessIterator;
+    use super::liveness::LivenessIterator;
     let length_i = all_liveness[offset] as u32;
     let length_r = all_liveness[offset + 1] as u32;
     let length_f = all_liveness[offset + 2] as u32;
@@ -2015,7 +2025,7 @@ pub enum BhDescr {
 ///
 /// Each channel is summed separately so a second generation names *which*
 /// one moved rather than only that the file did.  The pool-population
-/// counters ([`crate::codewriter::assembler::DescrPoolDuplication`]) cannot
+/// counters (`codewriter::assembler::DescrPoolDuplication`) cannot
 /// see any of this — they measure how many entries there are, not how long
 /// each one is.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -2650,8 +2660,7 @@ impl BhDescr {
             interior_fields, ..
         } = &mut array
         {
-            *interior_fields =
-                super::assembler::bh_interior_field_specs_from_array_descr(ifd.array_descr());
+            *interior_fields = bh_interior_field_specs_from_array_descr(ifd.array_descr());
         }
         BhDescr::InteriorField {
             array: Box::new(array),
@@ -2752,6 +2761,100 @@ impl BhDescr {
     }
 }
 
+fn bh_field_flag_from_descr(fd: &dyn majit_ir::descr::FieldDescr) -> majit_ir::descr::ArrayFlag {
+    if fd.is_pointer_field() {
+        majit_ir::descr::ArrayFlag::Pointer
+    } else if fd.is_float_field() {
+        majit_ir::descr::ArrayFlag::Float
+    } else if fd.field_type() == majit_ir::value::Type::Void {
+        majit_ir::descr::ArrayFlag::Void
+    } else if fd.is_field_signed() {
+        majit_ir::descr::ArrayFlag::Signed
+    } else {
+        majit_ir::descr::ArrayFlag::Unsigned
+    }
+}
+
+pub fn bh_field_spec_from_descr(fd: &dyn majit_ir::descr::FieldDescr) -> BhFieldSpec {
+    let field_flag = bh_field_flag_from_descr(fd);
+    BhFieldSpec {
+        index: fd.index(),
+        field_key: fd.field_key().to_string(),
+        name: fd.field_name().to_string(),
+        offset: fd.offset(),
+        field_size: fd.field_size(),
+        field_type: fd.field_type(),
+        field_flag,
+        is_field_signed: fd.is_field_signed(),
+        is_immutable: fd.is_immutable(),
+        is_quasi_immutable: fd.is_quasi_immutable(),
+        index_in_parent: fd.index_in_parent(),
+        // `declared_w_class`, not `is_w_class`: a descr that guessed from its
+        // name must round-trip as "nobody declared", so the far side re-guesses
+        // instead of receiving a declaration that outranks a real one.
+        is_class_word: fd.declared_w_class(),
+    }
+}
+
+pub fn bh_size_spec_from_descr(sd: &dyn majit_ir::descr::SizeDescr) -> BhSizeSpec {
+    BhSizeSpec {
+        size: sd.size(),
+        // Descr-back-to-spec inverse path: pyre's analyzer-side
+        // `bh_size_spec_from_callcontrol` stamps
+        // `type_id = path_hash(owner)` (u64) so the
+        // `simple_descr_group_from_bh_size` round-trip resolves
+        // `LLType::Struct(path_hash)` in `gc_cache._cache_size`.  The
+        // `SizeDescr.cache_key()` accessor returns that same u64 (set
+        // by `get_size_descr` cache-miss-mint).  Previously this used
+        // `sd.type_id() as u64` — the dense GC tid widened to u64,
+        // which lands on a DIFFERENT cache slot than the analyzer's
+        // path_hash key, polluting cross-path identity.
+        type_id: sd.cache_key(),
+        vtable: sd.vtable() as u64,
+        // Round-trip the GC-header flag off the descr so a raw native
+        // struct stays raw through the inverse path (it must not regain
+        // a spurious `GUARD_GC_TYPE`).
+        is_gc_managed: sd.is_gc_managed(),
+        headerless: sd.headerless(),
+        all_fielddescrs: sd
+            .all_fielddescrs()
+            .iter()
+            .map(|fd| bh_field_spec_from_descr(fd.as_ref()))
+            .collect(),
+    }
+}
+
+pub fn bh_interior_field_specs_from_array_descr(
+    array_descr: &dyn majit_ir::descr::ArrayDescr,
+) -> Vec<BhInteriorFieldSpec> {
+    array_descr
+        .get_all_interiorfielddescrs()
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|descr| {
+            let interior = descr.as_interior_field_descr()?;
+            let field = bh_field_spec_from_descr(interior.field_descr());
+            let owner = interior
+                .field_descr()
+                .get_parent_descr()
+                .and_then(|parent| parent.as_size_descr().map(bh_size_spec_from_descr))
+                .unwrap_or_else(|| BhSizeSpec {
+                    size: array_descr.item_size(),
+                    type_id: 0,
+                    vtable: 0,
+                    is_gc_managed: true,
+                    headerless: false,
+                    all_fielddescrs: vec![field.clone()],
+                });
+            Some(BhInteriorFieldSpec {
+                index: descr.index(),
+                field,
+                owner,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2759,7 +2862,7 @@ mod tests {
     #[test]
     fn liveness_decode_rejects_operand_bytes_that_match_live_opcode() {
         let live = 42;
-        let width = crate::liveness::OFFSET_SIZE + 1;
+        let width = crate::codewriter::liveness::OFFSET_SIZE + 1;
         let mut code = vec![0; 3 * width];
         code[0] = live;
         // An operand byte can equal live, but it is not an instruction.
