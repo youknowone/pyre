@@ -8373,7 +8373,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // return only reads as a raise when the callee installed the exception.
     // Nothing between here and the sub-walk writes the slot.
     let exc_before_subwalk = ctx.last_exc_value();
-    let (callee_outcome, callee_class_of_last_exc_is_const) = {
+    let (mut callee_outcome, callee_class_of_last_exc_is_const) = {
         {
             let parent_state = ctx.frame_state.borrow();
             let mut state = callee_state.borrow_mut();
@@ -8923,6 +8923,28 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // permanently `mark_as_escaped` the caller and force a vref that never
         // needed forcing.
         let got_exception = matches!(callee_outcome, Ok((DispatchOutcome::SubRaise { .. }, _)));
+        // `SubRaise`'s concrete word is a Rust copy. `leave` forces the
+        // frame vref (`force_vref`). `registers_r` is not a root. Publish
+        // the copy for the leave and write the forwarded address back
+        // before `record_prepend_application_traceback` reads it.
+        let raised_ptr = if let Ok((
+            DispatchOutcome::SubRaise {
+                exc_concrete: ConcreteValue::Ref(exc_ptr),
+                ..
+            },
+            _,
+        )) = &callee_outcome
+        {
+            (!exc_ptr.is_null()).then_some(*exc_ptr)
+        } else {
+            None
+        };
+        let _raise_roots = raised_ptr.map(|_| pyre_object::gc_roots::push_roots());
+        let raise_slot = raised_ptr.map(|exc_ptr| {
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(exc_ptr);
+            slot
+        });
         walker_ec_leave(
             ctx.trace_ctx,
             ca_callee_frame,
@@ -8931,6 +8953,16 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             concrete_ec,
             got_exception,
         );
+        if let Some(slot) = raise_slot {
+            let live = pyre_object::gc_roots::shadow_stack_get(slot);
+            if let Ok((DispatchOutcome::SubRaise { exc_concrete, .. }, _)) = &mut callee_outcome {
+                let old = *exc_concrete;
+                *exc_concrete = ConcreteValue::Ref(live);
+                if ctx.last_exc_value_concrete() == old {
+                    ctx.set_last_exc_value_concrete(ConcreteValue::Ref(live));
+                }
+            }
+        }
         drop(open_activation);
     }
     // RPython has one MetaInterp shared by every MIFrame.  The sub-walk uses
@@ -9188,7 +9220,10 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 }
             }
         },
-        DispatchOutcome::SubRaise { exc, exc_concrete } => {
+        DispatchOutcome::SubRaise {
+            exc,
+            mut exc_concrete,
+        } => {
             // Ahead of the traceback nodes, matching the interpreter order:
             // `getattr_str` enriches as the error leaves the attribute
             // dispatch, before the caller frame's `handle_exception` records a
@@ -9208,7 +9243,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 record_inline_application_traceback(
                     ctx,
                     exc,
-                    exc_concrete,
+                    &mut exc_concrete,
                     op.pc,
                     true,
                     emit_runtime,
@@ -9216,7 +9251,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 record_top_level_application_traceback(
                     ctx,
                     exc,
-                    exc_concrete,
+                    &mut exc_concrete,
                     op.pc,
                     true,
                     emit_runtime,
@@ -15821,7 +15856,10 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
                 Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })
             }
         },
-        DispatchOutcome::SubRaise { exc, exc_concrete } => {
+        DispatchOutcome::SubRaise {
+            exc,
+            mut exc_concrete,
+        } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 // The handler this routes to is part of the trace, so once the
                 // trace runs compiled it catches the exception itself and this
@@ -15834,7 +15872,7 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
                 record_inline_application_traceback(
                     ctx,
                     exc,
-                    exc_concrete,
+                    &mut exc_concrete,
                     op.pc,
                     true,
                     emit_runtime,
@@ -15842,7 +15880,7 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
                 record_top_level_application_traceback(
                     ctx,
                     exc,
-                    exc_concrete,
+                    &mut exc_concrete,
                     op.pc,
                     true,
                     emit_runtime,
@@ -16397,7 +16435,10 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                 Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })
             }
         },
-        DispatchOutcome::SubRaise { exc, exc_concrete } => {
+        DispatchOutcome::SubRaise {
+            exc,
+            mut exc_concrete,
+        } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 // The handler this routes to is part of the trace, so once the
                 // trace runs compiled it catches the exception itself and this
@@ -16410,7 +16451,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                 record_inline_application_traceback(
                     ctx,
                     exc,
-                    exc_concrete,
+                    &mut exc_concrete,
                     op.pc,
                     true,
                     emit_runtime,
@@ -16418,7 +16459,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                 record_top_level_application_traceback(
                     ctx,
                     exc,
-                    exc_concrete,
+                    &mut exc_concrete,
                     op.pc,
                     true,
                     emit_runtime,
@@ -16618,7 +16659,10 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
                 Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })
             }
         },
-        DispatchOutcome::SubRaise { exc, exc_concrete } => {
+        DispatchOutcome::SubRaise {
+            exc,
+            mut exc_concrete,
+        } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 // The handler this routes to is part of the trace, so once the
                 // trace runs compiled it catches the exception itself and this
@@ -16631,7 +16675,7 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
                 record_inline_application_traceback(
                     ctx,
                     exc,
-                    exc_concrete,
+                    &mut exc_concrete,
                     op.pc,
                     true,
                     emit_runtime,
@@ -16639,7 +16683,7 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
                 record_top_level_application_traceback(
                     ctx,
                     exc,
-                    exc_concrete,
+                    &mut exc_concrete,
                     op.pc,
                     true,
                     emit_runtime,

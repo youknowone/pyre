@@ -584,20 +584,14 @@ pub(crate) fn publish_residual_call_exception(exc_obj: i64) {
     // (`GUARD_NO_EXCEPTION` in compiled code, `_exit_frame_with_exception` in
     // the blackhole) end up reading the value's `ExcKind` tag through a match
     // with no wildcard arm; see `exit_frame_exception_ref`.
-    // Both cells are roots (`walk_parked_exception_roots` /
-    // `PyFrameRootArea`). A residual that copied the exception before
-    // a nursery minor still holds the forwarding stub; publishing that
-    // word is what `seed_major_root` later reports as a stale root.
-    // `gc_current_object_address` is the reload `pin_root` uses.
-    let obj = pyre_object::interp_exceptions::live_nursery_ref(exc_obj as PyObjectRef);
+    let obj = exc_obj as PyObjectRef;
     if !obj.is_null()
         && unsafe { pyre_object::interp_exceptions::w_exception_kind_checked(obj) }.is_none()
     {
         reject_non_exception_channel_value(obj, "publish_residual_call_exception", String::new);
     }
-    let live = obj as i64;
-    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(live));
-    store_jit_exception(live);
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj));
+    store_jit_exception(exc_obj);
 }
 
 /// The caller's residual-call exception pair, taken out of its cells for the
@@ -4093,8 +4087,6 @@ pub fn trace_and_compile_from_bridge(
         // Publish the grabbed exception (`cpu.grab_exc_value` result) so the
         // walker's `seed_standing_exception_for_walk` threads it into
         // `sym.last_exc_box`, which the handler's `last_exc_value/>r` reads.
-        let guard_exc =
-            pyre_object::interp_exceptions::live_nursery_ref(guard_exc as PyObjectRef) as i64;
         majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(guard_exc));
     } else if !pending_exc {
         // No standing exception at this bridge's source guard (e.g. a

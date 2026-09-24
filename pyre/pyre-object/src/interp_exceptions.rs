@@ -676,15 +676,6 @@ fn exception_write_barrier(obj: PyObjectRef) {
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
-/// A Rust local copied before `collect_and_reserve` still names the
-/// nursery corpse. Field stores and the callers that publish them are
-/// not roots, so reload the way `gc_roots::pin_root` does
-/// (`gc_current_object_address`, `incminimark.py` forwarding check).
-#[majit_macros::dont_look_inside]
-pub fn live_nursery_ref(value: PyObjectRef) -> PyObjectRef {
-    majit_gc::gc_current_object_address(value as usize) as PyObjectRef
-}
-
 /// Fixed payload size (`framework.py` `malloc` / `init_gc_object`) of the slim base layout.
 pub const W_BASE_EXCEPTION_SIZE: usize = std::mem::size_of::<W_BaseException>();
 
@@ -1270,8 +1261,7 @@ pub unsafe fn w_exception_get_args_storage(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_exception_set_args(obj: PyObjectRef, args_list: PyObjectRef) {
     unsafe {
-        let obj = live_nursery_ref(obj);
-        (*(obj as *mut W_BaseException)).args_w = live_nursery_ref(args_list);
+        (*(obj as *mut W_BaseException)).args_w = args_list;
         exception_write_barrier(obj);
     }
 }
@@ -1299,8 +1289,7 @@ pub unsafe fn w_exception_get_cause(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_exception_set_cause(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        let obj = live_nursery_ref(obj);
-        (*(obj as *mut W_BaseException)).w_cause = live_nursery_ref(value);
+        (*(obj as *mut W_BaseException)).w_cause = value;
         exception_write_barrier(obj);
     }
 }
@@ -1328,8 +1317,7 @@ pub unsafe fn w_exception_get_context(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_exception_set_context(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        let obj = live_nursery_ref(obj);
-        (*(obj as *mut W_BaseException)).w_context = live_nursery_ref(value);
+        (*(obj as *mut W_BaseException)).w_context = value;
         exception_write_barrier(obj);
     }
 }
@@ -1358,8 +1346,7 @@ pub unsafe fn w_exception_get_traceback(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_exception_set_traceback(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        let obj = live_nursery_ref(obj);
-        (*(obj as *mut W_BaseException)).w_traceback = live_nursery_ref(value);
+        (*(obj as *mut W_BaseException)).w_traceback = value;
         exception_write_barrier(obj);
     }
 }

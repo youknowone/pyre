@@ -1559,11 +1559,7 @@ impl ExecutionContext {
         let current_exc = self.sys_exc_value;
         let saved_exc =
             unsafe { pyre_object::generator::w_generator_get_saved_exc_value(generator) };
-        // `saved_exc_value` is an old-gen field. A minor rewrites it only
-        // through the remembered set; a copy taken before that still names
-        // the nursery corpse. `sys_exc_value` is a root, so publish the
-        // forwarded address (`gc_current_object_address`).
-        self.sys_exc_value = pyre_object::interp_exceptions::live_nursery_ref(saved_exc);
+        self.sys_exc_value = saved_exc;
         unsafe {
             pyre_object::generator::w_generator_set_saved_exc_value(generator, current_exc);
             pyre_object::generator::w_generator_set_previous(
@@ -1586,7 +1582,7 @@ impl ExecutionContext {
             pyre_object::generator::w_generator_set_previous(generator, pyre_object::PY_NULL);
             pyre_object::generator::w_generator_set_saved_exc_value(generator, self.sys_exc_value);
         }
-        self.sys_exc_value = pyre_object::interp_exceptions::live_nursery_ref(caller_exc);
+        self.sys_exc_value = caller_exc;
     }
 
     #[majit_macros::dont_look_inside]

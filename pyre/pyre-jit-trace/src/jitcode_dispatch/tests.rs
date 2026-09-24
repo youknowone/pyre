@@ -16737,7 +16737,7 @@ fn traceback_journal_rollback_unwinds_every_walk_node() {
     }
 
     super::fbw_store_journal_reset();
-    let exc = w_exception_new(ExcKind::ValueError, "boom");
+    let mut exc = w_exception_new(ExcKind::ValueError, "boom");
     // The node the raise itself already attached before the walk got here.
     prepend(exc, 1);
     assert_eq!(chain(exc), vec![1]);
@@ -16745,7 +16745,10 @@ fn traceback_journal_rollback_unwinds_every_walk_node() {
     // Callee level first, catching level last — the order the walk records in,
     // and the reverse of the order the rollback has to undo.
     for lasti in [2i64, 3] {
-        super::journaled_concrete_traceback_attach(exc, || prepend(exc, lasti));
+        super::journaled_concrete_traceback_attach(&mut exc, |slot| {
+            let exc = pyre_object::gc_roots::shadow_stack_get(slot);
+            prepend(exc, lasti);
+        });
     }
     assert_eq!(chain(exc), vec![3, 2, 1]);
 
@@ -16758,7 +16761,10 @@ fn traceback_journal_rollback_unwinds_every_walk_node() {
 
     // Commit keeps them: a committed walk's nodes ARE this delivery's.
     for lasti in [4i64, 5] {
-        super::journaled_concrete_traceback_attach(exc, || prepend(exc, lasti));
+        super::journaled_concrete_traceback_attach(&mut exc, |slot| {
+            let exc = pyre_object::gc_roots::shadow_stack_get(slot);
+            prepend(exc, lasti);
+        });
     }
     super::fbw_store_journal_commit();
     super::fbw_store_journal_rollback();

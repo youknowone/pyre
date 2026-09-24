@@ -11056,9 +11056,21 @@ fn exception_group_projection(
     keep: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
+    // The group is a nursery exception. Leaf collection and the list
+    // malloc both collect, so the group is re-read from this slot
+    // before `exception_group_split_inner`.
+    let group_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_group);
+    let keep_base = pyre_object::gc_roots::shadow_stack_len();
+    for &w_exc in keep {
+        let _ = pyre_object::gc_roots::pin_root(w_exc);
+    }
     let mut leaves = Vec::new();
-    for w_exc in keep.iter().copied() {
-        exception_group_collect_leaves(w_exc, &mut leaves)?;
+    for i in 0..keep.len() {
+        exception_group_collect_leaves(
+            pyre_object::gc_roots::shadow_stack_get(keep_base + i),
+            &mut leaves,
+        )?;
     }
     let items: Vec<PyObjectRef> = leaves
         .iter()
@@ -11068,7 +11080,7 @@ fn exception_group_projection(
     let list_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(pyre_object::w_list_new(items));
     let (matching, _) = exception_group_split_inner(
-        w_group,
+        pyre_object::gc_roots::shadow_stack_get(group_slot),
         &ExceptionGroupCondition::Identity(pyre_object::gc_roots::shadow_stack_get(list_slot)),
     )?;
     Ok(matching)
@@ -11078,30 +11090,65 @@ pub(crate) fn exception_group_prep_reraise_star(
     w_orig: PyObjectRef,
     w_exc_list: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let exceptions = crate::baseobjspace::fixedview(w_exc_list, -1)?;
+    // Both arguments are nursery exceptions (`alloc_exception_nursery`).
+    // `fixedview` and the metadata / projection calls collect, and these
+    // locals are not roots, so each use re-reads the shadow-stack slot.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let orig_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_orig);
+    let list_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_exc_list);
+    let exceptions =
+        crate::baseobjspace::fixedview(pyre_object::gc_roots::shadow_stack_get(list_slot), -1)?;
     if exceptions.is_empty() {
         return Ok(pyre_object::w_none());
     }
+    let exc_base = pyre_object::gc_roots::shadow_stack_len();
+    for &w_exc in &exceptions {
+        let _ = pyre_object::gc_roots::pin_root(w_exc);
+    }
+    let n = exceptions.len();
+    let exc_at = |i: usize| pyre_object::gc_roots::shadow_stack_get(exc_base + i);
     let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
-    if !crate::baseobjspace::isinstance(w_orig, base_group)? {
-        return Ok(exceptions[0]);
+    if !crate::baseobjspace::isinstance(
+        pyre_object::gc_roots::shadow_stack_get(orig_slot),
+        base_group,
+    )? {
+        return Ok(exc_at(0));
     }
 
-    let mut raised = Vec::new();
-    let mut reraised = Vec::new();
-    for w_exc in exceptions {
+    let mut raised_slots = Vec::new();
+    let mut reraised_slots = Vec::new();
+    for i in 0..n {
+        let w_exc = exc_at(i);
         if !unsafe { pyre_object::is_none(w_exc) } {
-            if exception_group_same_metadata(w_exc, w_orig)? {
-                reraised.push(w_exc);
+            if exception_group_same_metadata(
+                w_exc,
+                pyre_object::gc_roots::shadow_stack_get(orig_slot),
+            )? {
+                reraised_slots.push(exc_base + i);
             } else {
-                raised.push(w_exc);
+                raised_slots.push(exc_base + i);
             }
         }
     }
-    let reraised_group = exception_group_projection(w_orig, &reraised)?;
-    if raised.is_empty() {
+    let reraised: Vec<PyObjectRef> = reraised_slots
+        .iter()
+        .copied()
+        .map(pyre_object::gc_roots::shadow_stack_get)
+        .collect();
+    let reraised_group = exception_group_projection(
+        pyre_object::gc_roots::shadow_stack_get(orig_slot),
+        &reraised,
+    )?;
+    if raised_slots.is_empty() {
         return Ok(reraised_group);
     }
+    let mut raised: Vec<PyObjectRef> = raised_slots
+        .iter()
+        .copied()
+        .map(pyre_object::gc_roots::shadow_stack_get)
+        .collect();
     if !unsafe { pyre_object::is_none(reraised_group) } {
         raised.push(reraised_group);
     }
@@ -11112,9 +11159,20 @@ pub(crate) fn exception_group_prep_reraise_star(
     // bare BaseException (e.g. a reraised KeyboardInterrupt alongside a freshly
     // raised Exception) stays a BaseExceptionGroup; the constructor promotes to
     // ExceptionGroup only when every leaf is an Exception.
+    let raised_base = pyre_object::gc_roots::shadow_stack_len();
+    for &item in &raised {
+        let _ = pyre_object::gc_roots::pin_root(item);
+    }
+    let raised_n = raised.len();
     let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
+    let list = pyre_object::w_list_new(
+        (0..raised_n)
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(raised_base + i))
+            .collect(),
+    );
+    // `w_list_new` collects; the message is allocated after it so no
+    // unrooted local crosses that collection.
     let message = unsafe { pyre_object::w_str_new("") };
-    let list = pyre_object::w_list_new(raised);
     exception_group_new(&[base_group, message, list])
 }
 

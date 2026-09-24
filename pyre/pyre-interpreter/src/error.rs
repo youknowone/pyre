@@ -1710,15 +1710,7 @@ impl PyError {
     /// `e.args == (msg,)` all line up with PyPy.
     pub fn to_exc_object(&mut self) -> PyObjectRef {
         if !self.exc_object.is_null() {
-            // The cache is a Rust field, not a root. A minor
-            // (`alloc_exception_nursery` → `collect_and_reserve`) forwards
-            // the instance and rewrites every root, then this copy still
-            // names the corpse. `gc_current_object_address` is the same
-            // nursery-forwarding reload `pin_root` applies to a published
-            // slot (`incminimark.py` forwarding check).
-            let live = pyre_object::interp_exceptions::live_nursery_ref(self.exc_object);
-            self.exc_object = live;
-            return live;
+            return self.exc_object;
         }
         // Root the deferred name/obj context references across the exception
         // allocation below: they live only in this Rust `PyError`, which the
