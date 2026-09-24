@@ -4663,7 +4663,7 @@ fn fielddescrof(
     // census downstream inherits that.
     let mut index_in_parent: Option<usize> = None;
     let mut parent = None;
-    let field_key = if let Some(owner) = field.owner_root.as_deref() {
+    let mut field_key = if let Some(owner) = field.owner_root.as_deref() {
         let prefix = format!("{owner}.");
         field
             .name
@@ -4761,7 +4761,6 @@ fn fielddescrof(
                 }
             }
         }
-
         if let Some(rank) = cc.field_immutability(Some(owner), &field_key) {
             is_immutable = rank.is_immutable();
             is_quasi_immutable = rank.is_quasi_immutable();
@@ -4841,6 +4840,35 @@ fn fielddescrof(
             .or_else(|| unique_slot_at_offset(&parent_spec.all_fielddescrs, offset))
     {
         majit_ir::descr::census_attached_index(pos, index_in_parent);
+    }
+    // `rlist.py` `ll_getitem_fast` is `l.ll_items()[index]` and `ll_length`
+    // is `l.length`. A Rust `Vec<T>` is those two words inside the value.
+    // The field offset above is the value; the component offset is measured
+    // in `vec_layout::probe` because Charon's `Vec` decl has no layout.
+    // Applied after the slot census so the parent slot stays the field's.
+    if let Some(part) = field.vec_part {
+        let layout = crate::vec_layout::probe();
+        let word = crate::layout::target_word_size();
+        let add = match part {
+            crate::model::VecFieldPart::Buf => layout.ptr_offset,
+            crate::model::VecFieldPart::Len => layout.len_offset,
+        };
+        offset = offset.saturating_add(add);
+        field_size = word;
+        match part {
+            crate::model::VecFieldPart::Buf => {
+                field_type = majit_ir::value::Type::Ref;
+                field_flag = majit_ir::descr::ArrayFlag::Pointer;
+                is_field_signed = false;
+                field_key = format!("{field_key}.buf");
+            }
+            crate::model::VecFieldPart::Len => {
+                field_type = majit_ir::value::Type::Int;
+                field_flag = majit_ir::descr::ArrayFlag::Unsigned;
+                is_field_signed = false;
+                field_key = format!("{field_key}.len");
+            }
+        }
     }
     crate::jitcode::BhDescr::Field {
         offset,
@@ -6220,6 +6248,133 @@ mod tests {
     use super::*;
     use crate::flowspace::model::{ConstValue, HostObject};
     use crate::regalloc;
+
+    /// Index and len of an inline `Vec<u8>` / `Vec<i64>` field are
+    /// `getfield` of the measured buffer pointer or length word, then a
+    /// headerless array op. `[u8]` stays length-prefixed; the Vec identity
+    /// does not.
+    #[test]
+    fn vec_field_index_and_len_use_buf_and_len_words() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::model::{FieldDescriptor, ValueType, VecFieldPart};
+        use majit_ir::descr::ArrayFlag;
+        use majit_ir::value::Type;
+
+        let layout = crate::vec_layout::probe();
+        let word = crate::layout::target_word_size();
+        assert_ne!(layout.ptr_offset, layout.len_offset);
+        assert_ne!(layout.ptr_offset, layout.cap_offset);
+        assert!(layout.ptr_offset < 3 * word);
+        assert!(layout.len_offset < 3 * word);
+
+        let owner = "vec_component_layout::Holder";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 6 * word,
+                fields: vec![
+                    StructFieldLayout {
+                        name: "bytes".into(),
+                        offset: 0,
+                        size: 3 * word,
+                        flag: ArrayFlag::Struct,
+                        field_type: Type::Ref,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "words".into(),
+                        offset: 3 * word,
+                        size: 3 * word,
+                        flag: ArrayFlag::Struct,
+                        field_type: Type::Ref,
+                        rank: None,
+                    },
+                ],
+            },
+        );
+
+        let check = |field: &str, field_off: usize, part: VecFieldPart, id: &str, item: usize| {
+            let descr = fielddescrof(
+                &FieldDescriptor::new(field, Some(owner.into()))
+                    .with_owner_id(Some(owner_id))
+                    .with_vec_part(part),
+                &match part {
+                    VecFieldPart::Buf => ValueType::Ref(None),
+                    VecFieldPart::Len => ValueType::Int,
+                },
+                Some(&cc),
+            );
+            let (offset, size, flag, name) = match descr {
+                crate::jitcode::BhDescr::Field {
+                    offset,
+                    field_size,
+                    field_flag,
+                    name,
+                    ..
+                } => (offset, field_size, field_flag, name),
+                other => panic!("expected field descr, got {other:?}"),
+            };
+            let add = match part {
+                VecFieldPart::Buf => layout.ptr_offset,
+                VecFieldPart::Len => layout.len_offset,
+            };
+            assert_eq!(offset, field_off + add, "{field} {part:?}");
+            assert_eq!(size, word);
+            let expect_flag = match part {
+                VecFieldPart::Buf => ArrayFlag::Pointer,
+                VecFieldPart::Len => ArrayFlag::Unsigned,
+            };
+            assert_eq!(flag, expect_flag);
+            assert!(name.ends_with(match part {
+                VecFieldPart::Buf => ".buf",
+                VecFieldPart::Len => ".len",
+            }));
+            if part == VecFieldPart::Buf {
+                assert!(crate::front::typestr::nolength_from_array_type_id(Some(id)));
+                let array = arraydescrof(&ValueType::Int, &Some(id.to_string()), None, Some(&cc));
+                match array {
+                    crate::jitcode::BhDescr::Array {
+                        base_size,
+                        itemsize,
+                        len_offset,
+                        ..
+                    } => {
+                        assert_eq!(base_size, 0, "{id} buffer has no length header");
+                        assert_eq!(itemsize, item, "{id}");
+                        assert_eq!(len_offset, None);
+                    }
+                    other => panic!("expected array descr, got {other:?}"),
+                }
+            }
+        };
+        check("bytes", 0, VecFieldPart::Buf, "Vec<u8>", 1);
+        check("bytes", 0, VecFieldPart::Len, "Vec<u8>", 1);
+        check("words", 3 * word, VecFieldPart::Buf, "Vec<i64>", word);
+        check("words", 3 * word, VecFieldPart::Len, "Vec<i64>", word);
+        // A pointer to the Vec (Box<Vec<_>> after the box load) adds nothing
+        // but the component offset.
+        let boxed = fielddescrof(
+            &FieldDescriptor::new("buf", Some("alloc::vec::Vec".into()))
+                .with_vec_part(VecFieldPart::Buf),
+            &ValueType::Ref(None),
+            Some(&cc),
+        );
+        match boxed {
+            crate::jitcode::BhDescr::Field {
+                offset, field_size, ..
+            } => {
+                assert_eq!(offset, layout.ptr_offset);
+                assert_eq!(field_size, word);
+            }
+            other => panic!("expected field descr, got {other:?}"),
+        }
+    }
 
     #[test]
     fn surviving_ref_identity_uses_rpython_ptr_eq_opname() {

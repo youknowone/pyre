@@ -48,9 +48,11 @@ pub fn first_top_level_generic_arg(args: &str) -> Option<&str> {
 
 /// Decide whether a registered `array_type_id` describes a
 /// headerless item-run pointee or a length-prefixed wrapper.  Bare
-/// pointers to identifier types address `items[0]` (no length word);
-/// `Vec<T>` / `GcArray<T>` / `Ptr(GcArray(T))` shapes carry a length
-/// header at offset 0 and therefore keep the PyPy default `False`.
+/// pointers to identifier types address `items[0]` (no length word).
+/// `GcArray<T>` / `Ptr(GcArray(T))` carry a length header at offset 0
+/// and therefore keep the PyPy default `False`.  A Rust `Vec<T>` is
+/// `{cap, ptr, len}`: the buffer pointer is the middle word and the
+/// buffer itself has no length header.
 ///
 /// The synthetic ARRAY names `[u8]` / `[str]` / `[i64]` / `[f64]` are
 /// the same length-prefixed GcArray identities the front stamps on
@@ -80,6 +82,12 @@ pub fn nolength_from_array_type_id(array_type_id: Option<&str>) -> bool {
         // remap — has no length word.
         return !matches!(inner, "[u8]" | "[str]" | "[i64]" | "[f64]");
     }
+    // `{cap, ptr, len}` — the indexed pointer is the buffer, which has
+    // no length word. Length lives in the third word of the Vec value.
+    let vec_tail = inner.rsplit("::").next().unwrap_or(inner);
+    if vec_tail.starts_with("Vec<") {
+        return true;
+    }
     // Length-prefixed wrappers carry `<` (generic) or `(` (paren-style
     // lltype spelling such as `Ptr(GcArray(...))`).  Keep the PyPy
     // default `False` for those — a pointer to a wrapper still
@@ -107,13 +115,22 @@ mod tests {
             "[i64]",
             "[f64]",
             "&[u8]",
-            "Vec<u8>",
             "GcArray<i64>",
             "majit::object_ref_gcarray",
         ] {
             assert!(
                 !nolength_from_array_type_id(Some(id)),
                 "{id} must share one length-prefixed descr"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_vec_buffer_has_no_length_header() {
+        for id in ["Vec<u8>", "alloc::vec::Vec<u8>", "&mut Vec<i64>"] {
+            assert!(
+                nolength_from_array_type_id(Some(id)),
+                "{id} indexes a headerless buffer"
             );
         }
     }
