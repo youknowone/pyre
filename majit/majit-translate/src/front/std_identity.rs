@@ -10,14 +10,14 @@
 //! field read.  An opaque layout stays a residual call.  `Default` on a
 //! machine-word integer / bool is a typed zero.
 //!
-//! `core::mem::replace` is recognised but *not* rewritten here.  The
+//! `core::mem::replace` / `swap` / `take` are not rewritten here.  The
 //! front models `&mut T` as the referent value (`Rvalue::Ref` aliases
-//! the place's Variable), so the residual call's first argument is the
-//! old `T`, not the slot address.  Emitting `__deref_write(old, new)`
-//! would store through the old value; yielding only `same_as(old)`
-//! would drop the store.  The write needs the borrowed Place, the same
-//! fact `Atomic*::store` records in `atomic_ref_place` — and that map
-//! is atomic-only.
+//! the place's Variable), so the call's first argument is the old `T`,
+//! not the slot.  The write needs the borrowed place, recorded on
+//! `Lowering::atomic_ref_place` and applied in `lower_call`
+//! (`try_lower_mem_exchange`): a read of that place, then a store of
+//! the new value.  That is `old = a[i]; a[i] = new`
+//! (`getarrayitem_gc`/`setarrayitem_gc` or `getfield_gc`/`setfield_gc`).
 
 use crate::flowspace::model::Variable;
 use crate::model::{CallTarget, FieldDescriptor, OpKind, ValueType};
