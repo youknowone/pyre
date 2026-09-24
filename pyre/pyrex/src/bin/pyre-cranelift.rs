@@ -1,8 +1,7 @@
-// Enabled by default; see `pyre-dynasm.rs`.
-#[cfg(feature = "mimalloc")]
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: pyrex::ProcessAllocator = pyrex::ProcessAllocator::new();
 
 fn main() {
+    pyrex::memory_ceiling::install();
     pyrex::main_entry("pyre-cranelift");
 }

@@ -21,7 +21,11 @@
 //! default release artifact path.
 
 mod host_path;
+mod memory_ceiling;
 mod wasmi_host;
+
+#[global_allocator]
+static GLOBAL: memory_ceiling::ProcessAllocator = memory_ceiling::ProcessAllocator::new();
 
 bitflags::bitflags! {
     /// Mirror of `pyre_jit_trace::trace::fbw_diag::RingFlags`.
@@ -139,6 +143,8 @@ struct Host {
     /// Epoch samples whose innermost frame was anywhere else — the interpreter
     /// itself, and any sample taken with no wasm frame on the stack.
     trace_samples_elsewhere: u64,
+    /// Process ceiling applied to this store's linear memories.
+    mem_limit: memory_ceiling::GuestMemoryLimit,
 }
 
 impl majit_backend_wasm_host::HostState for Host {
@@ -201,6 +207,7 @@ fn warn_inert_guest_env() {
         "MAJIT_BRIDGE_BAIL",
         "MAJIT_MAX_BRIDGES",
         "MAJIT_SKIP_BRIDGES",
+        "PYRE_MAX_MEMORY",
     ];
     // Forwarded into the guest through `pyre_set_env` / `pyre_env_names`,
     // not interpreted here. Presence of the name is the native contract.
@@ -231,6 +238,7 @@ fn warn_inert_guest_env() {
 }
 
 fn main() {
+    memory_ceiling::install();
     let t0_main = std::time::Instant::now();
     warn_inert_guest_env();
     let startup_trace = std::env::var_os("PYRE_WASM_STARTUP_TRACE").is_some();
@@ -420,6 +428,10 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
     startup_lap("load_module");
 
     let mut store = Store::new(&engine, Host::default());
+    store.data_mut().mem_limit.ceiling = memory_ceiling::bytes();
+    if store.data().mem_limit.ceiling != 0 {
+        store.limiter(|host| &mut host.mem_limit);
+    }
     if guest_profile_out.is_some() {
         const SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_micros(200);
         let profiler = wasmtime::GuestProfiler::new(

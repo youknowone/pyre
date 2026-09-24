@@ -13,6 +13,8 @@ use pyre_interpreter::pyframe::PyFrame;
 use pyre_interpreter::{CompileOpts, Mode, PyDisplay, PyErrorKind, PyExecutionContext};
 use pyre_jit::eval::eval_with_jit;
 
+pub mod memory_ceiling;
+pub use memory_ceiling::ProcessAllocator;
 mod repl;
 mod repl_readline;
 
@@ -904,8 +906,9 @@ fn real_main(binary_name: &str) {
         // equivalent here is the line above, which is what builds the
         // collector. Nothing has allocated yet either way, so the thresholds
         // `set_max_heap_size` pulls down are still their startup values.
-        // Reaching the GC from the launcher is an entry from outside pyre and
-        // takes the GIL as one.
+        // `PYRE_MAX_MEMORY` is not applied here: a non-zero `max_heap_size`
+        // lowers the major-collection threshold (`set_max_heap_size`) even
+        // when the heap is far below it. The process charge is the ceiling.
         if let Some(size) = heapsize {
             let _entry = majit_gc::gc_sync::enter_external_callback();
             majit_gc::gc_set_max_heap_size(usize::try_from(size).unwrap_or(usize::MAX));
