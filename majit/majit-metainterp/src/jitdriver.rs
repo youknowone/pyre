@@ -4688,6 +4688,21 @@ impl<S: JitState> JitDriver<S> {
                         self.meta.abort_trace(false);
                         self.meta.clear_trace_session();
                     }
+                    // `reached_loop_header` keeps tracing after a cancel no
+                    // matter how the JUMP arguments were supplied. Same latch
+                    // as the `CloseLoop` arm: `resume_walk_after_close` and
+                    // leave `self.sym` in place.
+                    if self.meta.take_keep_tracing_after_close() {
+                        self.meta.single_pass_outcome = None;
+                        self.meta.single_pass_scalar_values = None;
+                        self.meta.single_pass_ref_scalar_values = None;
+                        self.meta.single_pass_virt_array_values = None;
+                        crate::mc_diag_bump(78); // retrace_close_resumed
+                        if let Some(ctx) = self.meta.trace_ctx() {
+                            ctx.resume_walk_after_close();
+                        }
+                        continue;
+                    }
                     self.sym = None;
                 }
                 TraceAction::Finish {
@@ -11472,6 +11487,111 @@ mod tests {
         fn validate_close(_sym: &Self::Sym, _meta: &Self::Meta) -> bool {
             false
         }
+    }
+
+    /// `validate_close` accepts, so `CloseLoopWithArgs` reaches
+    /// `compile_and_record_loop`.
+    #[derive(Default)]
+    struct AcceptCloseState {
+        selected: i64,
+    }
+
+    #[derive(Default)]
+    struct AcceptCloseSym {
+        selected: i64,
+    }
+
+    impl JitState for AcceptCloseState {
+        type Meta = ();
+        type Sym = AcceptCloseSym;
+        type Env = ();
+
+        fn build_meta(&self, _header_pc: usize, _env: &Self::Env) -> Self::Meta {}
+
+        fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+            vec![self.selected]
+        }
+
+        fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
+            AcceptCloseSym::default()
+        }
+
+        fn initialize_sym(&self, sym: &mut Self::Sym, _meta: &Self::Meta) {
+            sym.selected = self.selected;
+        }
+
+        fn is_compatible(&self, _meta: &Self::Meta) -> bool {
+            true
+        }
+
+        fn restore(&mut self, _meta: &Self::Meta, _values: &[i64]) {}
+
+        fn collect_jump_args(_sym: &Self::Sym) -> Vec<OpRef> {
+            vec![OpRef::input_arg_int(0)]
+        }
+
+        fn collect_scalar_state_field_values(_sym: &Self::Sym) -> Vec<i64> {
+            Vec::new()
+        }
+
+        fn writeback_scalar_state_fields_from_values(&mut self, _values: &[i64]) {}
+
+        fn validate_close(_sym: &Self::Sym, _meta: &Self::Meta) -> bool {
+            true
+        }
+    }
+
+    /// `reached_loop_header` keeps tracing after `compile_retrace` returns
+    /// None under the unroll budget. The close arrived as
+    /// `CloseLoopWithArgs`; the driver must consume
+    /// `keep_tracing_after_close` and leave the walk running.
+    #[test]
+    fn close_loop_with_args_retrace_cancel_keeps_walk() {
+        let mut driver = JitDriver::<AcceptCloseState>::new(1);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        driver.meta.warm_state.set_param("max_unroll_loops", 1);
+        let mut state = AcceptCloseState::default();
+        let key = 42u64;
+        driver.force_start_tracing(key, 0, &mut state, &());
+        assert!(driver.is_tracing());
+        let start = driver.meta.trace_ctx().unwrap().current_merge_points[0].position;
+        let token = std::sync::Arc::new(majit_backend::JitCellToken::new(9));
+        token.set_compiled(Box::new(()));
+        token.record_target_token(crate::history::TargetToken::new_loop(1).as_jump_target_descr());
+        driver
+            .meta
+            .warm_state_mut()
+            .memory_manager
+            .keep_loop_alive(&token);
+        driver
+            .meta
+            .warm_state_mut()
+            .attach_procedure_to_interp(key, std::sync::Arc::clone(&token));
+        driver.meta.partial_trace = Some(crate::pyjitpl::PartialTrace {
+            ops: Vec::new(),
+            inputargs: Vec::new(),
+        });
+        driver.meta.retracing_from = Some(start);
+        let calls = std::cell::Cell::new(0u32);
+        driver.merge_point(|_meta, _sym| {
+            let n = calls.get();
+            calls.set(n + 1);
+            if n > 0 {
+                return TraceAction::Continue;
+            }
+            TraceAction::CloseLoopWithArgs {
+                jump_args: vec![OpRef::input_arg_int(0)],
+                loop_header_pc: None,
+            }
+        });
+        assert_eq!(calls.get(), 2, "the close must re-enter the walk");
+        assert!(driver.sym.is_some(), "the driver walk stays alive");
+        assert!(driver.is_tracing());
+        assert!(
+            !driver.meta.take_keep_tracing_after_close(),
+            "CloseLoopWithArgs must consume the latch"
+        );
+        assert!(driver.meta.trace_ctx().unwrap().take_merge_point_resumed());
     }
 
     /// Regression: the whole-circuit single-pass CloseLoop arm captures the

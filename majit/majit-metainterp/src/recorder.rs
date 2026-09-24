@@ -1682,7 +1682,11 @@ impl Trace {
     /// optimizer has to see a copy.
     pub fn clone_materialized_parts(&mut self) -> (Vec<InputArgRc>, Vec<OpRc>) {
         self.materialize_into_ops();
-        (self.inputargs.clone(), self.ops.clone())
+        // `History.set_inputargs` stores the hole-filtered list
+        // (`initialize_state_from_guard_failure` drops dead failargs).
+        // `into_parts` already does that filter; the retrace snapshot must
+        // hand the optimizer the same list, or a dead position becomes an input.
+        (self.live_inputargs_cloned(), self.ops.clone())
     }
 
     pub fn into_parts(self) -> (Vec<InputArgRc>, Vec<OpRc>) {
@@ -2826,6 +2830,30 @@ mod tests {
         assert_eq!(inputargs[0].opref(), iarg(0));
         assert_eq!(inputargs[1].opref(), iarg(2));
         assert_eq!(ops[0].arg(1).to_opref(), iarg(2));
+    }
+
+    #[test]
+    fn clone_materialized_parts_drops_dead_failarg_holes() {
+        // Guard-failure retrace: `History.set_inputargs` leaves the dead
+        // failarg reserved in the dense vector (`inputarg_live` false) but
+        // `into_parts` omits it. The snapshot clone is what `compile_retrace`
+        // optimizes, so it has to apply the same filter.
+        let mut rec =
+            Trace::with_input_layout(&[Type::Int, Type::Ref, Type::Int], &[true, false, true]);
+        let result = rec.record_op(OpCode::IntAdd, &[iarg(0), iarg(2)]);
+        rec.close_loop(&[result]);
+        let (inputargs, ops) = rec.clone_materialized_parts();
+        assert_eq!(
+            inputargs.iter().map(|arg| arg.opref()).collect::<Vec<_>>(),
+            vec![OpRef::input_arg_int(0), OpRef::input_arg_int(2)]
+        );
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].arg(1).to_opref(), iarg(2));
+        assert_eq!(
+            rec.num_inputargs(),
+            3,
+            "the live recorder keeps the reserved hole"
+        );
     }
 
     #[test]
