@@ -1947,6 +1947,23 @@ def synth_rss_gate(path):
     return _positive_float(*found, path, "synthetic memory gate")
 
 
+def synth_skip_platforms(path):
+    """Read an optional host exemption:
+        # pyre-check: skip-platforms=win32
+
+    The named `sys.platform` values never start the fixture. Use it when the
+    oracle itself cannot run there, not to hide a pyre failure. The header
+    line must be followed by a comment naming the missing host facility.
+    """
+    return _header_name_list(
+        path,
+        "# pyre-check: skip-platforms=",
+        ("darwin", "linux", "win32"),
+        "platform",
+        "synthetic platform exemption",
+    )
+
+
 def synth_skip_backends(path):
     """Read an optional per-fixture backend exemption from its header:
         # pyre-check: skip-backends=wasm
@@ -2429,6 +2446,7 @@ def synth_fixture_headers(path):
     headers = {
         "selfcheck": selfcheck,
         "skip_backends": synth_skip_backends(path),
+        "skip_platforms": synth_skip_platforms(path),
         "spec_folds": synth_spec_folds(path),
     }
     if selfcheck:
@@ -5243,6 +5261,10 @@ class Check:
         spec_folds = headers["spec_folds"]
 
         print(f"  {name}")
+        # `# pyre-check: skip-platforms=` — the oracle cannot run on this host.
+        if sys.platform in headers["skip_platforms"]:
+            print(f"    {dim('skip')} ({sys.platform})")
+            return
 
         sys.stdout.write(f"    {'cpython':<10s}")
         sys.stdout.flush()

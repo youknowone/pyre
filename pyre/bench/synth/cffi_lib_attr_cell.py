@@ -1,5 +1,8 @@
 # pyre-check: skip-cpython
 # pyre-check: skip-backends=wasm
+# pyre-check: skip-platforms=win32
+# `optind` is a libc `int` on unix. Windows has no such export, so pypy
+# exits 1 during dlopen and the oracle never starts.
 # `_cffi_backend` is built into pypy but is not a CPython builtin, and this
 # host's python3 cannot import it, so pypy alone is the oracle here. The module
 # is absent on wasm32 altogether -- the fold arm itself is
