@@ -7,7 +7,7 @@ use pyre_object::*;
 // Under sandbox, name libc through the seam facade so any direct syscall call
 // in this module is a compile error (only types/constants/pure fns resolve).
 #[cfg(feature = "sandbox")]
-use crate::host_seam::sys as libc;
+use pyre_interpreter::host_seam::sys as libc;
 
 #[cfg(feature = "host_env")]
 use rustpython_host_env::time as host_time;
@@ -29,7 +29,7 @@ pub const STRUCT_TM_ITEMS: i64 = 11;
 /// wasm32 has neither a `SystemTime` nor an `Instant`: both panic rather than
 /// answer, which is why `time` was kept out of the module registry there at
 /// all.  The embedder that supplies the filesystem through
-/// [`crate::importing::SourceProvider`] supplies the clock through this.
+/// [`pyre_interpreter::importing::SourceProvider`] supplies the clock through this.
 #[cfg(target_arch = "wasm32")]
 pub trait ClockProvider: Send + Sync {
     /// Nanoseconds since the unix epoch.
@@ -143,7 +143,9 @@ pub fn duration_since_epoch() -> std::time::Duration {
     }
     #[cfg(feature = "sandbox")]
     {
-        let secs = crate::host_seam::ops::time().unwrap_or(0.0).max(0.0);
+        let secs = pyre_interpreter::host_seam::ops::time()
+            .unwrap_or(0.0)
+            .max(0.0);
         std::time::Duration::from_secs_f64(secs)
     }
     #[cfg(all(
@@ -163,7 +165,7 @@ pub fn duration_since_epoch() -> std::time::Duration {
 }
 
 /// time.time() → float (seconds since epoch)
-pub fn time(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn time(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let _ = args;
     Ok(floatobject::w_float_new(
         duration_since_epoch().as_secs_f64(),
@@ -171,7 +173,7 @@ pub fn time(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 /// time.time_ns() → int (nanoseconds since epoch)
-pub fn time_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn time_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let _ = args;
     Ok(w_int_new(duration_since_epoch().as_nanos() as i64))
 }
@@ -183,7 +185,7 @@ pub fn time_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// platform's monotonic clock on every Rust target, so the fallback
 /// preserves `time.monotonic`'s non-decreasing guarantee even when the
 /// syscall is unavailable.
-pub fn monotonic(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn monotonic(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let _ = args;
     Ok(floatobject::w_float_new(monotonic_seconds()))
 }
@@ -193,9 +195,9 @@ pub fn monotonic(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// Routes through `host_env::time::nanosleep` on Unix when available so
 /// that signal-driven wakeups propagate; falls back to
 /// `std::thread::sleep` otherwise.
-pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     if args.len() != 1 {
-        return Err(crate::PyError::type_error(format!(
+        return Err(pyre_interpreter::PyError::type_error(format!(
             "sleep() takes exactly one argument ({} given)",
             args.len()
         )));
@@ -209,9 +211,9 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     const SECS_TO_NS: i64 = 1_000_000_000;
     let timeout_ns: i64 = unsafe {
         let overflow = || {
-            crate::PyError::overflow_error(crate::display::wtf8_format!(
+            pyre_interpreter::PyError::overflow_error(pyre_interpreter::display::wtf8_format!(
                 "timestamp ",
-                crate::display::py_repr_wtf8(args[0]).unwrap_or_else(|_| {
+                pyre_interpreter::display::py_repr_wtf8(args[0]).unwrap_or_else(|_| {
                     rustpython_wtf8::Wtf8Buf::from_string("<unprintable>".to_string())
                 }),
                 " too large to convert to C _PyTime_t"
@@ -220,7 +222,7 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         if is_float(args[0]) {
             let secs = floatobject::w_float_get_value(args[0]);
             if secs.is_nan() {
-                return Err(crate::PyError::value_error("timestamp is nan"));
+                return Err(pyre_interpreter::PyError::value_error("timestamp is nan"));
             }
             // `rarithmetic.ovfcheck_float_to_longlong` bounds.
             let result_float = (secs * SECS_TO_NS as f64).ceil();
@@ -241,17 +243,17 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 // `timeutils.py` — `space.bigint_w(w_secs)` applies
                 // `space.int`, so an object with `__int__` / `__index__` is
                 // accepted and reduced to a longlong.
-                let has_int = crate::baseobjspace::lookup(args[0], "__int__").is_some()
-                    || crate::baseobjspace::lookup(args[0], "__index__").is_some();
+                let has_int = pyre_interpreter::baseobjspace::lookup(args[0], "__int__").is_some()
+                    || pyre_interpreter::baseobjspace::lookup(args[0], "__index__").is_some();
                 if !has_int {
                     // `_PyTime_FromSecondsObject` accepts either domain, so
                     // an argument that is neither names both.
-                    return Err(crate::PyError::type_error(format!(
+                    return Err(pyre_interpreter::PyError::type_error(format!(
                         "'{}' object cannot be interpreted as an integer or float",
-                        crate::type_methods::arg_type_name(args[0])
+                        pyre_interpreter::type_methods::arg_type_name(args[0])
                     )));
                 }
-                let w_int = crate::baseobjspace::space_int(args[0])?;
+                let w_int = pyre_interpreter::baseobjspace::space_int(args[0])?;
                 if is_int(w_int) {
                     w_int_get_value(w_int)
                 } else {
@@ -264,7 +266,7 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     };
     // `interp_time.py` — `if not (timeout >= 0)`.
     if timeout_ns < 0 {
-        return Err(crate::PyError::value_error(
+        return Err(pyre_interpreter::PyError::value_error(
             "sleep length must be non-negative",
         ));
     }
@@ -284,8 +286,8 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // The controller services the sleep; signal handling is its concern.
         // Every trampolined seam op already brackets its round trip, and the
         // bracket does not nest — a second one would leave the census twice.
-        crate::host_seam::ops::sleep(dur.as_secs_f64())
-            .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
+        pyre_interpreter::host_seam::ops::sleep(dur.as_secs_f64())
+            .map_err(|e| pyre_interpreter::host_seam::seam_os_err(e, ""))?;
         Ok(w_none())
     }
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
@@ -297,13 +299,13 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let mut remaining = dur;
         loop {
             let slept = {
-                let _blocking = crate::module::thread::before_external_block();
+                let _blocking = pyre_interpreter::module::thread::before_external_block();
                 host_time::nanosleep(remaining)
             };
             match slept {
                 Ok(()) => return Ok(w_none()),
                 Err(e) if e.raw_os_error() == Some(libc::EINTR) => {
-                    crate::module::signal::interp_signal::checksignals_now()?;
+                    pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
                     let now = std::time::Instant::now();
                     if now >= deadline {
                         return Ok(w_none());
@@ -311,7 +313,7 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                     remaining = deadline - now;
                 }
                 Err(e) => {
-                    return Err(crate::PyError::os_error_with_errno(
+                    return Err(pyre_interpreter::PyError::os_error_with_errno(
                         e.raw_os_error().unwrap_or(0),
                         format!("sleep: {e}"),
                     ));
@@ -323,7 +325,7 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     {
         // The guest has no scheduler of its own, so the wait is the
         // embedder's to take.
-        let _blocking = crate::module::thread::before_external_block();
+        let _blocking = pyre_interpreter::module::thread::before_external_block();
         with_clock(
             |clock| clock.sleep_nanos(dur.as_nanos().min(u64::MAX as u128) as u64),
             (),
@@ -336,7 +338,7 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         target_arch = "wasm32"
     )))]
     {
-        let _blocking = crate::module::thread::before_external_block();
+        let _blocking = pyre_interpreter::module::thread::before_external_block();
         std::thread::sleep(dur);
         Ok(w_none())
     }
@@ -347,7 +349,7 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// Shares `monotonic_seconds()` with `time.monotonic`; the two clocks
 /// are nominally separate but pyre exposes the same monotonic source so
 /// that `perf_counter` is also non-decreasing across calls.
-pub fn perf_counter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn perf_counter(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let _ = args;
     Ok(floatobject::w_float_new(monotonic_seconds()))
 }
@@ -371,7 +373,7 @@ pub(crate) fn monotonic_nanos() -> i128 {
 }
 
 /// time.monotonic_ns() → int
-pub fn monotonic_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn monotonic_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let _ = args;
     Ok(w_int_new(monotonic_nanos() as i64))
 }
@@ -379,7 +381,7 @@ pub fn monotonic_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 /// time.perf_counter_ns() → int
 ///
 /// Shares the monotonic nanosecond source with `time.perf_counter`.
-pub fn perf_counter_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn perf_counter_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let _ = args;
     Ok(w_int_new(monotonic_nanos() as i64))
 }
@@ -387,7 +389,7 @@ pub fn perf_counter_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// `interp_time.py _get_time_info` — fill the app-level namespace
 /// used by `time.get_clock_info`.  The observable fields follow Python 3.14;
 /// all clocks exposed by pyre have nanosecond representation internally.
-pub fn get_time_info(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn get_time_info(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     // The registered arity is only a dispatch hint, so the positional count
     // is enforced here rather than by the caller.
     if args.len() != 2 {
@@ -397,14 +399,14 @@ pub fn get_time_info(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             1 => "_get_time_info() missing 1 required positional argument: 'info'".to_string(),
             n => format!("_get_time_info() takes 2 positional arguments but {n} were given"),
         };
-        return Err(crate::PyError::type_error(message));
+        return Err(pyre_interpreter::PyError::type_error(message));
     }
     let name_obj = args[0];
     let info = args[1];
     if unsafe { !pyre_object::is_str(name_obj) } {
-        return Err(crate::PyError::type_error(format!(
+        return Err(pyre_interpreter::PyError::type_error(format!(
             "time._get_time_info() argument 1 must be str, not {}",
-            crate::type_methods::arg_type_name(name_obj)
+            pyre_interpreter::type_methods::arg_type_name(name_obj)
         )));
     }
     let name = unsafe { pyre_object::w_str_get_wtf8(name_obj) };
@@ -420,7 +422,7 @@ pub fn get_time_info(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         "monotonic" | "perf_counter" => ("QueryPerformanceCounter()", true, false),
         "process_time" => ("GetProcessTimes()", true, false),
         "thread_time" => ("GetThreadTimes()", true, false),
-        _ => return Err(crate::PyError::value_error("unknown clock")),
+        _ => return Err(pyre_interpreter::PyError::value_error("unknown clock")),
     };
     // The guest makes no syscall: every clock is a question put to the
     // embedder, and `process_time` is the monotonic one because that is the
@@ -431,7 +433,7 @@ pub fn get_time_info(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         "monotonic" | "perf_counter" | "process_time" => {
             ("ClockProvider::monotonic_nanos()", true, false)
         }
-        _ => return Err(crate::PyError::value_error("unknown clock")),
+        _ => return Err(pyre_interpreter::PyError::value_error("unknown clock")),
     };
     #[cfg(all(not(windows), not(target_arch = "wasm32")))]
     let (implementation, monotonic, adjustable) = match name_str {
@@ -465,17 +467,29 @@ pub fn get_time_info(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             ))
         ))]
         "thread_time" => ("clock_gettime(CLOCK_THREAD_CPUTIME_ID)", true, false),
-        _ => return Err(crate::PyError::value_error("unknown clock")),
+        _ => return Err(pyre_interpreter::PyError::value_error("unknown clock")),
     };
     let roots = pyre_object::gc_roots::push_roots();
     let info_slot = roots.base();
     let _ = roots.pin_root(info);
     let impl_slot = info_slot + 1;
     let _ = roots.pin_root(w_str_new_managed(implementation));
-    crate::baseobjspace::setattr_str(roots.get(info_slot), "implementation", roots.get(impl_slot))?;
-    crate::baseobjspace::setattr_str(roots.get(info_slot), "monotonic", w_bool_from(monotonic))?;
-    crate::baseobjspace::setattr_str(roots.get(info_slot), "adjustable", w_bool_from(adjustable))?;
-    crate::baseobjspace::setattr_str(
+    pyre_interpreter::baseobjspace::setattr_str(
+        roots.get(info_slot),
+        "implementation",
+        roots.get(impl_slot),
+    )?;
+    pyre_interpreter::baseobjspace::setattr_str(
+        roots.get(info_slot),
+        "monotonic",
+        w_bool_from(monotonic),
+    )?;
+    pyre_interpreter::baseobjspace::setattr_str(
+        roots.get(info_slot),
+        "adjustable",
+        w_bool_from(adjustable),
+    )?;
+    pyre_interpreter::baseobjspace::setattr_str(
         roots.get(info_slot),
         "resolution",
         floatobject::w_float_new(get_clock_info_resolution(name_str)),
@@ -585,11 +599,11 @@ fn get_clock_info_resolution(_name: &str) -> f64 {
 /// usable process clock, `_clock_impl` raises RuntimeError rather than
 /// reporting a bogus zero.
 #[cfg(all(unix, feature = "host_env"))]
-fn process_time_nanos() -> Result<i128, crate::PyError> {
+fn process_time_nanos() -> Result<i128, pyre_interpreter::PyError> {
     #[cfg(feature = "sandbox")]
     {
-        let secs =
-            crate::host_seam::ops::clock().map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
+        let secs = pyre_interpreter::host_seam::ops::clock()
+            .map_err(|e| pyre_interpreter::host_seam::seam_os_err(e, ""))?;
         Ok((secs * 1_000_000_000.0) as i128)
     }
     #[cfg(not(feature = "sandbox"))]
@@ -604,7 +618,7 @@ fn process_time_nanos() -> Result<i128, crate::PyError> {
             };
             return Ok(tv_ns(&usage.ru_utime) + tv_ns(&usage.ru_stime));
         }
-        Err(crate::PyError::runtime_error(
+        Err(pyre_interpreter::PyError::runtime_error(
             "the processor time used is not available or its value cannot be represented",
         ))
     }
@@ -614,18 +628,18 @@ fn process_time_nanos() -> Result<i128, crate::PyError> {
 /// reads on this platform.  The monotonic fallback below would count a sleep,
 /// which is the one thing process time must not do.
 #[cfg(all(windows, feature = "host_env"))]
-fn process_time_nanos() -> Result<i128, crate::PyError> {
+fn process_time_nanos() -> Result<i128, pyre_interpreter::PyError> {
     host_time::get_process_time_100ns()
         .map(|hundred_ns| i128::from(hundred_ns) * 100)
         .ok_or_else(|| {
-            crate::PyError::runtime_error(
+            pyre_interpreter::PyError::runtime_error(
                 "the processor time used is not available or its value cannot be represented",
             )
         })
 }
 
 #[cfg(not(any(all(unix, feature = "host_env"), all(windows, feature = "host_env"))))]
-fn process_time_nanos() -> Result<i128, crate::PyError> {
+fn process_time_nanos() -> Result<i128, pyre_interpreter::PyError> {
     // No process clock available; report the monotonic one, which is
     // non-decreasing and is the only clock this target has.
     Ok(monotonic_nanos())
@@ -636,22 +650,22 @@ fn process_time_nanos() -> Result<i128, crate::PyError> {
 /// below.  As there, an unreadable clock raises rather than reporting a
 /// process-wide figure in its place.
 #[cfg(all(windows, feature = "host_env"))]
-fn thread_time_nanos() -> Result<i128, crate::PyError> {
+fn thread_time_nanos() -> Result<i128, pyre_interpreter::PyError> {
     host_time::get_thread_time_100ns()
         .map(|hundred_ns| i128::from(hundred_ns) * 100)
-        .ok_or_else(|| crate::PyError::os_error("the thread time used is not available"))
+        .ok_or_else(|| pyre_interpreter::PyError::os_error("the thread time used is not available"))
 }
 
 /// time.thread_time() → float
 #[cfg(all(windows, feature = "host_env"))]
-pub fn thread_time(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn thread_time(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let _ = args;
     Ok(floatobject::w_float_new(thread_time_nanos()? as f64 * 1e-9))
 }
 
 /// time.thread_time_ns() → int
 #[cfg(all(windows, feature = "host_env"))]
-pub fn thread_time_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn thread_time_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let _ = args;
     Ok(w_int_new(thread_time_nanos()? as i64))
 }
@@ -659,7 +673,7 @@ pub fn thread_time_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 /// time.process_time() → float
 ///
 /// Process time for profiling: sum of the kernel and user-space CPU time.
-pub fn process_time(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn process_time(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let _ = args;
     Ok(floatobject::w_float_new(
         process_time_nanos()? as f64 * 1e-9,
@@ -667,7 +681,7 @@ pub fn process_time(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 }
 
 /// time.process_time_ns() → int
-pub fn process_time_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn process_time_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let _ = args;
     Ok(w_int_new(process_time_nanos()? as i64))
 }
@@ -696,11 +710,11 @@ pub fn process_time_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         target_os = "redox",
     ))
 ))]
-fn thread_time_nanos() -> Result<i128, crate::PyError> {
+fn thread_time_nanos() -> Result<i128, pyre_interpreter::PyError> {
     host_time::clock_gettime(host_time::ClockId::CLOCK_THREAD_CPUTIME_ID)
         .map(|d| d.as_nanos() as i128)
         .map_err(|e| {
-            crate::PyError::os_error_with_errno(
+            pyre_interpreter::PyError::os_error_with_errno(
                 e.raw_os_error().unwrap_or(0),
                 format!("clock_gettime: {e}"),
             )
@@ -721,7 +735,7 @@ fn thread_time_nanos() -> Result<i128, crate::PyError> {
         target_os = "redox",
     ))
 ))]
-pub fn thread_time(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn thread_time(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let _ = args;
     Ok(floatobject::w_float_new(thread_time_nanos()? as f64 * 1e-9))
 }
@@ -738,25 +752,27 @@ pub fn thread_time(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         target_os = "redox",
     ))
 ))]
-pub fn thread_time_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn thread_time_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let _ = args;
     Ok(w_int_new(thread_time_nanos()? as i64))
 }
 
 /// time.clock_gettime(clk_id) → float seconds
 #[cfg(all(unix, feature = "host_env"))]
-pub fn clock_gettime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn clock_gettime(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     if args.is_empty() {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "clock_gettime() missing argument",
         ));
     }
     if !unsafe { is_int(args[0]) } {
-        return Err(crate::PyError::type_error("clock id must be an integer"));
+        return Err(pyre_interpreter::PyError::type_error(
+            "clock id must be an integer",
+        ));
     }
     let id = unsafe { w_int_get_value(args[0]) } as libc::clockid_t;
     let d = host_time::clock_gettime(host_time::ClockId::from_raw(id)).map_err(|e| {
-        crate::PyError::os_error_with_errno(
+        pyre_interpreter::PyError::os_error_with_errno(
             e.raw_os_error().unwrap_or(0),
             format!("clock_gettime: {e}"),
         )
@@ -766,18 +782,20 @@ pub fn clock_gettime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 
 /// time.clock_gettime_ns(clk_id) → int nanoseconds
 #[cfg(all(unix, feature = "host_env"))]
-pub fn clock_gettime_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn clock_gettime_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     if args.is_empty() {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "clock_gettime_ns() missing argument",
         ));
     }
     if !unsafe { is_int(args[0]) } {
-        return Err(crate::PyError::type_error("clock id must be an integer"));
+        return Err(pyre_interpreter::PyError::type_error(
+            "clock id must be an integer",
+        ));
     }
     let id = unsafe { w_int_get_value(args[0]) } as libc::clockid_t;
     let d = host_time::clock_gettime(host_time::ClockId::from_raw(id)).map_err(|e| {
-        crate::PyError::os_error_with_errno(
+        pyre_interpreter::PyError::os_error_with_errno(
             e.raw_os_error().unwrap_or(0),
             format!("clock_gettime_ns: {e}"),
         )
@@ -792,14 +810,16 @@ pub fn clock_gettime_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     not(target_os = "redox"),
     not(feature = "sandbox")
 ))]
-pub fn clock_settime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn clock_settime(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     if args.len() < 2 {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "clock_settime() requires 2 arguments",
         ));
     }
     if !unsafe { is_int(args[0]) } {
-        return Err(crate::PyError::type_error("clock id must be an integer"));
+        return Err(pyre_interpreter::PyError::type_error(
+            "clock id must be an integer",
+        ));
     }
     let id = unsafe { w_int_get_value(args[0]) } as libc::clockid_t;
     let secs = unsafe {
@@ -808,7 +828,7 @@ pub fn clock_settime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         } else if is_float(args[1]) {
             floatobject::w_float_get_value(args[1])
         } else {
-            return Err(crate::PyError::type_error(
+            return Err(pyre_interpreter::PyError::type_error(
                 "clock_settime: time must be a real number",
             ));
         }
@@ -824,7 +844,7 @@ pub fn clock_settime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     let ret = unsafe { libc::clock_settime(id, &ts) };
     if ret != 0 {
         let e = std::io::Error::last_os_error();
-        return Err(crate::PyError::os_error_with_errno(
+        return Err(pyre_interpreter::PyError::os_error_with_errno(
             e.raw_os_error().unwrap_or(0),
             format!("clock_settime: {e}"),
         ));
@@ -839,14 +859,14 @@ pub fn clock_settime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     not(target_os = "redox"),
     not(feature = "sandbox")
 ))]
-pub fn clock_settime_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn clock_settime_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     if args.len() < 2 {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "clock_settime_ns() requires 2 arguments",
         ));
     }
     if !unsafe { is_int(args[0]) } || !unsafe { is_int(args[1]) } {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "clock_settime_ns: clock id and time must be integers",
         ));
     }
@@ -861,7 +881,7 @@ pub fn clock_settime_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     let ret = unsafe { libc::clock_settime(id, &ts) };
     if ret != 0 {
         let e = std::io::Error::last_os_error();
-        return Err(crate::PyError::os_error_with_errno(
+        return Err(pyre_interpreter::PyError::os_error_with_errno(
             e.raw_os_error().unwrap_or(0),
             format!("clock_settime_ns: {e}"),
         ));
@@ -871,18 +891,20 @@ pub fn clock_settime_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 
 /// time.clock_getres(clk_id) → float seconds
 #[cfg(all(unix, feature = "host_env", not(target_os = "redox")))]
-pub fn clock_getres(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn clock_getres(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     if args.is_empty() {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "clock_getres() missing argument",
         ));
     }
     if !unsafe { is_int(args[0]) } {
-        return Err(crate::PyError::type_error("clock id must be an integer"));
+        return Err(pyre_interpreter::PyError::type_error(
+            "clock id must be an integer",
+        ));
     }
     let id = unsafe { w_int_get_value(args[0]) } as libc::clockid_t;
     let d = host_time::clock_getres(host_time::ClockId::from_raw(id)).map_err(|e| {
-        crate::PyError::os_error_with_errno(
+        pyre_interpreter::PyError::os_error_with_errno(
             e.raw_os_error().unwrap_or(0),
             format!("clock_getres: {e}"),
         )
@@ -920,10 +942,10 @@ struct c_tm {
 type time_t = i64;
 
 #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
-fn _c_gmtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
+fn _c_gmtime(seconds: time_t) -> Result<c_tm, pyre_interpreter::PyError> {
     host_time::gmtime_from_timestamp(seconds as host_time::TimeT)
         .map(|tm| libc_tm_to_c_tm(&tm))
-        .ok_or_else(|| crate::PyError::os_error("unconvertible time"))
+        .ok_or_else(|| pyre_interpreter::PyError::os_error("unconvertible time"))
 }
 
 /// The calendar a target with no libc has to compute for itself.
@@ -1231,27 +1253,27 @@ mod wasm_calendar {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn _c_gmtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
+fn _c_gmtime(seconds: time_t) -> Result<c_tm, pyre_interpreter::PyError> {
     wasm_calendar::broken_down(seconds)
-        .ok_or_else(|| crate::PyError::os_error("unconvertible time"))
+        .ok_or_else(|| pyre_interpreter::PyError::os_error("unconvertible time"))
 }
 
 // `interp_time.py c_gmtime` libc backend, used when the host_env
 // abstraction layer is disabled.  Mirrors PyPy's rffi.llexternal call
 // to libc gmtime_r (Unix) / _gmtime64_s (Windows CRT).
 #[cfg(all(unix, not(feature = "host_env")))]
-fn _c_gmtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
+fn _c_gmtime(seconds: time_t) -> Result<c_tm, pyre_interpreter::PyError> {
     let t = seconds as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     let p = unsafe { libc::gmtime_r(&t, &mut tm) };
     if p.is_null() {
-        return Err(crate::PyError::os_error("unconvertible time"));
+        return Err(pyre_interpreter::PyError::os_error("unconvertible time"));
     }
     Ok(libc_tm_to_c_tm(&tm))
 }
 
 #[cfg(all(windows, not(feature = "host_env")))]
-fn _c_gmtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
+fn _c_gmtime(seconds: time_t) -> Result<c_tm, pyre_interpreter::PyError> {
     unsafe extern "C" {
         fn _gmtime64_s(out: *mut MsvcTm, t: *const i64) -> i32;
     }
@@ -1259,36 +1281,36 @@ fn _c_gmtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
     let mut tm: MsvcTm = unsafe { std::mem::zeroed() };
     let rc = unsafe { _gmtime64_s(&mut tm, &t) };
     if rc != 0 {
-        return Err(crate::PyError::value_error("unconvertible time"));
+        return Err(pyre_interpreter::PyError::value_error("unconvertible time"));
     }
     Ok(msvc_tm_to_c_tm(&tm))
 }
 
 #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
-fn _c_localtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
+fn _c_localtime(seconds: time_t) -> Result<c_tm, pyre_interpreter::PyError> {
     host_time::localtime_from_timestamp(seconds as host_time::TimeT)
         .map(|tm| libc_tm_to_c_tm(&tm))
-        .ok_or_else(|| crate::PyError::os_error("unconvertible time"))
+        .ok_or_else(|| pyre_interpreter::PyError::os_error("unconvertible time"))
 }
 
 #[cfg(target_arch = "wasm32")]
-fn _c_localtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
+fn _c_localtime(seconds: time_t) -> Result<c_tm, pyre_interpreter::PyError> {
     _c_gmtime(seconds)
 }
 
 #[cfg(all(unix, not(feature = "host_env")))]
-fn _c_localtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
+fn _c_localtime(seconds: time_t) -> Result<c_tm, pyre_interpreter::PyError> {
     let t = seconds as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     let p = unsafe { libc::localtime_r(&t, &mut tm) };
     if p.is_null() {
-        return Err(crate::PyError::os_error("unconvertible time"));
+        return Err(pyre_interpreter::PyError::os_error("unconvertible time"));
     }
     Ok(libc_tm_to_c_tm(&tm))
 }
 
 #[cfg(all(windows, not(feature = "host_env")))]
-fn _c_localtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
+fn _c_localtime(seconds: time_t) -> Result<c_tm, pyre_interpreter::PyError> {
     unsafe extern "C" {
         fn _localtime64_s(out: *mut MsvcTm, t: *const i64) -> i32;
     }
@@ -1296,7 +1318,7 @@ fn _c_localtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
     let mut tm: MsvcTm = unsafe { std::mem::zeroed() };
     let rc = unsafe { _localtime64_s(&mut tm, &t) };
     if rc != 0 {
-        return Err(crate::PyError::value_error("unconvertible time"));
+        return Err(pyre_interpreter::PyError::value_error("unconvertible time"));
     }
     Ok(msvc_tm_to_c_tm(&tm))
 }
@@ -1397,10 +1419,10 @@ pub(crate) fn init_timezone(ns: PyObjectRef) {
         _ => (0, 0, 0, String::new(), String::new()),
     };
 
-    crate::module_ns_store(ns, "timezone", w_int_new(timezone));
-    crate::module_ns_store(ns, "altzone", w_int_new(altzone));
-    crate::module_ns_store(ns, "daylight", w_int_new(daylight));
-    crate::module_ns_store(ns, "tzname", {
+    pyre_interpreter::module_ns_store(ns, "timezone", w_int_new(timezone));
+    pyre_interpreter::module_ns_store(ns, "altzone", w_int_new(altzone));
+    pyre_interpreter::module_ns_store(ns, "daylight", w_int_new(daylight));
+    pyre_interpreter::module_ns_store(ns, "tzname", {
         let mut fields = pyre_object::gc_roots::RootedItems::new();
         fields.push(w_str_new_managed(&standard_name));
         fields.push(w_str_new_managed(&daylight_name));
@@ -1411,14 +1433,14 @@ pub(crate) fn init_timezone(ns: PyObjectRef) {
 /// `interp_time.py tzset` — ask libc to reread `TZ`, then refresh
 /// the values installed by `_init_timezone`.
 #[cfg(unix)]
-pub fn tzset(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn tzset(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let _ = args;
     unsafe extern "C" {
         #[link_name = "tzset"]
         fn c_tzset();
     }
     unsafe { c_tzset() };
-    if let Some(module) = crate::importing::get_sys_module("time") {
+    if let Some(module) = pyre_interpreter::importing::get_sys_module("time") {
         let ns = unsafe { pyre_object::w_module_get_w_dict(module) };
         if !ns.is_null() {
             init_timezone(ns);
@@ -1491,10 +1513,10 @@ pub(crate) fn init_timezone(ns: PyObjectRef) {
         .filter_map(|&when| _c_localtime(when).ok())
         .any(|tm| tm.tm_isdst > 0);
 
-    crate::module_ns_store(ns, "timezone", w_int_new(timezone));
-    crate::module_ns_store(ns, "altzone", w_int_new(timezone - 3600));
-    crate::module_ns_store(ns, "daylight", w_int_new(i64::from(observes_dst)));
-    crate::module_ns_store(ns, "tzname", {
+    pyre_interpreter::module_ns_store(ns, "timezone", w_int_new(timezone));
+    pyre_interpreter::module_ns_store(ns, "altzone", w_int_new(timezone - 3600));
+    pyre_interpreter::module_ns_store(ns, "daylight", w_int_new(i64::from(observes_dst)));
+    pyre_interpreter::module_ns_store(ns, "tzname", {
         let mut fields = pyre_object::gc_roots::RootedItems::new();
         fields.push(w_str_new_managed(&info.standard_name));
         fields.push(w_str_new_managed(&info.daylight_name));
@@ -1562,7 +1584,7 @@ pub(crate) fn struct_time_type() -> PyObjectRef {
         "tm_isdst",
     ];
     *STRUCT_TIME_TYPE.get_or_init(|| {
-        crate::_structseq::make_struct_seq_with_extra(
+        pyre_interpreter::_structseq::make_struct_seq_with_extra(
             "time.struct_time",
             SEQ,
             &["tm_zone", "tm_gmtoff"],
@@ -1591,7 +1613,7 @@ fn _tm_to_tuple(tm: &c_tm) -> PyObjectRef {
         extra_items.push(w_int_new(tm.tm_gmtoff));
         extra_items.take()
     };
-    crate::_structseq::new_instance_with_extra(
+    pyre_interpreter::_structseq::new_instance_with_extra(
         struct_time_type(),
         items,
         vec![("tm_zone", extras[0]), ("tm_gmtoff", extras[1])],
@@ -1601,27 +1623,27 @@ fn _tm_to_tuple(tm: &c_tm) -> PyObjectRef {
 /// `interp_time.py _get_inttime` — extract integral epoch seconds
 /// from an optional real argument (None/absent means now), rejecting NaN and
 /// values that lose at least one second when cast to the platform time_t.
-fn _get_seconds(args: &[PyObjectRef]) -> Result<time_t, crate::PyError> {
+fn _get_seconds(args: &[PyObjectRef]) -> Result<time_t, pyre_interpreter::PyError> {
     if let Some(&arg) = args.first() {
         unsafe {
             if !is_none(arg) {
-                let seconds = crate::baseobjspace::float_w(arg)?;
+                let seconds = pyre_interpreter::baseobjspace::float_w(arg)?;
                 if seconds.is_nan() {
-                    return Err(crate::PyError::value_error(
+                    return Err(pyre_interpreter::PyError::value_error(
                         "Invalid value Nan (not a number)",
                     ));
                 }
                 // Rust's float-to-int cast saturates.  Guard the boundary
                 // explicitly, then retain PyPy's lost-whole-second check.
                 if seconds >= i64::MAX as f64 || seconds < i64::MIN as f64 {
-                    return Err(crate::PyError::overflow_error(
+                    return Err(pyre_interpreter::PyError::overflow_error(
                         "timestamp out of range for platform time_t",
                     ));
                 }
                 let result = seconds as time_t;
                 let diff = seconds - result as f64;
                 if !(-1.0..=1.0).contains(&diff) || diff == -1.0 || diff == 1.0 {
-                    return Err(crate::PyError::overflow_error(
+                    return Err(pyre_interpreter::PyError::overflow_error(
                         "timestamp out of range for platform time_t",
                     ));
                 }
@@ -1634,13 +1656,13 @@ fn _get_seconds(args: &[PyObjectRef]) -> Result<time_t, crate::PyError> {
 
 /// Extract a `c_tm` from a Python time tuple argument.
 /// interp_time.py: _gettmarg
-fn _gettmarg(args: &[PyObjectRef], default_now: bool) -> Result<c_tm, crate::PyError> {
+fn _gettmarg(args: &[PyObjectRef], default_now: bool) -> Result<c_tm, pyre_interpreter::PyError> {
     let tup = if let Some(&arg) = args.first() {
         if unsafe { is_none(arg) } {
             if default_now {
                 return _c_localtime(_get_seconds(&[])?);
             }
-            return Err(crate::PyError::type_error(
+            return Err(pyre_interpreter::PyError::type_error(
                 "Tuple or struct_time argument required",
             ));
         }
@@ -1648,25 +1670,26 @@ fn _gettmarg(args: &[PyObjectRef], default_now: bool) -> Result<c_tm, crate::PyE
     } else if default_now {
         return _c_localtime(_get_seconds(&[])?);
     } else {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "Tuple or struct_time argument required",
         ));
     };
 
     // `interp_time.py` — `space.fixedview(w_tup)` accepts any sequence
     // (tuple, list, struct_time), not only an exact tuple.
-    let tup_w = crate::baseobjspace::fixedview(tup, -1)?;
+    let tup_w = pyre_interpreter::baseobjspace::fixedview(tup, -1)?;
     let len = tup_w.len();
     unsafe {
         if len < 9 {
-            return Err(crate::PyError::type_error(format!(
+            return Err(pyre_interpreter::PyError::type_error(format!(
                 "argument must be sequence of at least length 9, not {len}"
             )));
         }
         // `baseobjspace.py c_int_w` — int_w with a 32-bit range check;
         // floats and non-integers raise rather than being truncated.
-        let c_int_w =
-            |i: usize| -> Result<i32, crate::PyError> { crate::baseobjspace::c_int_w(tup_w[i]) };
+        let c_int_w = |i: usize| -> Result<i32, pyre_interpreter::PyError> {
+            pyre_interpreter::baseobjspace::c_int_w(tup_w[i])
+        };
         let y = c_int_w(0)?;
         // A zero month / day / yday is normalized to 1 before the C-struct
         // adjustment below.
@@ -1704,17 +1727,21 @@ fn _gettmarg(args: &[PyObjectRef], default_now: bool) -> Result<c_tm, crate::PyE
         // `tm_zone` (idx 9, via `utf8_w`) and length >=11 supplies
         // `tm_gmtoff` (idx 10).
         if len >= 10 {
-            tm.tm_zone = crate::baseobjspace::utf8_w(tup_w[9])?.to_string();
+            tm.tm_zone = pyre_interpreter::baseobjspace::utf8_w(tup_w[9])?.to_string();
         }
         if len >= 11 {
             tm.tm_gmtoff = c_int_w(10)? as i64;
         }
         // Bounds checked before the final field adjustments.
         if (y as i64) < i32::MIN as i64 + 1900 {
-            return Err(crate::PyError::overflow_error("year out of range"));
+            return Err(pyre_interpreter::PyError::overflow_error(
+                "year out of range",
+            ));
         }
         if tm_wday < -1 {
-            return Err(crate::PyError::value_error("day of week out of range"));
+            return Err(pyre_interpreter::PyError::value_error(
+                "day of week out of range",
+            ));
         }
         tm.tm_year = y - 1900;
         tm.tm_mon = tm_mon - 1;
@@ -1725,7 +1752,7 @@ fn _gettmarg(args: &[PyObjectRef], default_now: bool) -> Result<c_tm, crate::PyE
 }
 
 /// time.localtime([seconds]) — interp_time.localtime
-pub fn localtime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn localtime(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let seconds = _get_seconds(args)?;
     #[cfg_attr(not(windows), expect(unused_mut))]
     let mut tm = _c_localtime(seconds)?;
@@ -1735,7 +1762,7 @@ pub fn localtime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 /// time.gmtime([seconds]) — interp_time.gmtime
-pub fn gmtime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn gmtime(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let seconds = _get_seconds(args)?;
     #[cfg_attr(not(windows), expect(unused_mut))]
     let mut tm = _c_gmtime(seconds)?;
@@ -1753,24 +1780,32 @@ pub fn gmtime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// fields that strftime()/asctime() index, so a bad value raises a
 /// ValueError instead of letting libc index out of bounds.  Year and
 /// wday are already handled in `_gettmarg`.
-fn _checktm(tm: &c_tm) -> Result<(), crate::PyError> {
+fn _checktm(tm: &c_tm) -> Result<(), pyre_interpreter::PyError> {
     if !(0..=11).contains(&tm.tm_mon) {
-        return Err(crate::PyError::value_error("month out of range"));
+        return Err(pyre_interpreter::PyError::value_error("month out of range"));
     }
     if !(1..=31).contains(&tm.tm_mday) {
-        return Err(crate::PyError::value_error("day of month out of range"));
+        return Err(pyre_interpreter::PyError::value_error(
+            "day of month out of range",
+        ));
     }
     if !(0..=23).contains(&tm.tm_hour) {
-        return Err(crate::PyError::value_error("hour out of range"));
+        return Err(pyre_interpreter::PyError::value_error("hour out of range"));
     }
     if !(0..=59).contains(&tm.tm_min) {
-        return Err(crate::PyError::value_error("minute out of range"));
+        return Err(pyre_interpreter::PyError::value_error(
+            "minute out of range",
+        ));
     }
     if !(0..=61).contains(&tm.tm_sec) {
-        return Err(crate::PyError::value_error("seconds out of range"));
+        return Err(pyre_interpreter::PyError::value_error(
+            "seconds out of range",
+        ));
     }
     if !(0..=365).contains(&tm.tm_yday) {
-        return Err(crate::PyError::value_error("day of year out of range"));
+        return Err(pyre_interpreter::PyError::value_error(
+            "day of year out of range",
+        ));
     }
     Ok(())
 }
@@ -1779,11 +1814,11 @@ fn _checktm(tm: &c_tm) -> Result<(), crate::PyError> {
 fn decode_strftime_output(
     bytes: &[u8],
     passthrough: bool,
-) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
+) -> Result<rustpython_wtf8::Wtf8Buf, pyre_interpreter::PyError> {
     if passthrough {
         Ok(unsafe { rustpython_wtf8::Wtf8::from_bytes_unchecked(bytes).to_wtf8_buf() })
     } else {
-        crate::typedef::decode_bytes_to_wtf8(bytes, "utf-8", "surrogateescape")
+        pyre_interpreter::typedef::decode_bytes_to_wtf8(bytes, "utf-8", "surrogateescape")
     }
 }
 
@@ -1793,7 +1828,7 @@ fn strftime_one(
     format: &[u8],
     tm: &c_tm,
     passthrough: bool,
-) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
+) -> Result<rustpython_wtf8::Wtf8Buf, pyre_interpreter::PyError> {
     if format.is_empty() {
         return Ok(rustpython_wtf8::Wtf8Buf::new());
     }
@@ -1824,7 +1859,7 @@ fn strftime_one(
     format: &[u8],
     tm: &c_tm,
     passthrough: bool,
-) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
+) -> Result<rustpython_wtf8::Wtf8Buf, pyre_interpreter::PyError> {
     unsafe extern "C" {
         fn strftime(
             buf: *mut libc::c_char,
@@ -1857,7 +1892,9 @@ fn strftime_one(
             // with `EINVAL`, which is neither a too-small buffer nor the
             // empty-result case below.
             if n == 0 && *_errno() == libc::EINVAL {
-                return Err(crate::PyError::value_error("invalid format string"));
+                return Err(pyre_interpreter::PyError::value_error(
+                    "invalid format string",
+                ));
             }
             // A buffer 256 times the format length is not failing for
             // lack of room: the format simply yields an empty result,
@@ -1871,11 +1908,10 @@ fn strftime_one(
 }
 
 /// time.strftime(format[, tuple]) — interp_time.strftime
-pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let fmt = args
-        .first()
-        .copied()
-        .ok_or_else(|| crate::PyError::type_error("strftime() requires at least one argument"))?;
+pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    let fmt = args.first().copied().ok_or_else(|| {
+        pyre_interpreter::PyError::type_error("strftime() requires at least one argument")
+    })?;
 
     // `unwrap_spec(format='text0')`: the format is unwrapped before
     // `_gettmarg` runs.  `fixedview` there allocates and can run Python, so a
@@ -1883,7 +1919,7 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // name its old address.  The text is copied out while it is still live.
     let fmt_wtf8 = unsafe {
         if !is_str(fmt) {
-            return Err(crate::PyError::type_error(
+            return Err(pyre_interpreter::PyError::type_error(
                 "strftime() argument 1 must be str",
             ));
         }
@@ -1899,7 +1935,7 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // the year `_gettmarg` was given, so this cannot overflow.
     #[cfg(windows)]
     if tm.tm_year + 1900 < 1 || 9999 < tm.tm_year + 1900 {
-        return Err(crate::PyError::value_error(
+        return Err(pyre_interpreter::PyError::value_error(
             "strftime() requires year in [1; 9999]",
         ));
     }
@@ -1925,7 +1961,7 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let rendered = wasm_calendar::render(fmt_wtf8.as_bytes(), &tm);
         Ok(match pyre_object::rutf8::wtf8_from_bytes(&rendered, true) {
             Ok(wtf8) => w_str_from_wtf8_managed(wtf8.to_owned()),
-            Err(_) => crate::typedef::charp2uni(&rendered),
+            Err(_) => pyre_interpreter::typedef::charp2uni(&rendered),
         })
     }
     // strftime consults $TZ/tzname (%Z/%z) and the LC_TIME locale DB; under
@@ -1933,13 +1969,13 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     #[cfg(all(unix, feature = "sandbox"))]
     {
         let _ = format_len;
-        Err(crate::host_seam::stub("time.strftime"))
+        Err(pyre_interpreter::host_seam::stub("time.strftime"))
     }
     // strftime is available on both Unix and Windows CRT.
     #[cfg(all(unix, not(feature = "sandbox")))]
     {
         let libc_tm = c_tm_to_libc_tm(&tm);
-        let render_segment = |segment: &[u8]| -> Result<Vec<u8>, crate::PyError> {
+        let render_segment = |segment: &[u8]| -> Result<Vec<u8>, pyre_interpreter::PyError> {
             if segment.is_empty() {
                 return Ok(Vec::new());
             }
@@ -1986,7 +2022,7 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             // interp_time.py returns `space.newutf8(decoded, size)`:
             // strftime's formatted value is an ordinary runtime string.
             Ok(wtf8) => pyre_object::w_str_from_wtf8_managed(wtf8.to_owned()),
-            Err(_) => crate::typedef::charp2uni(&rendered),
+            Err(_) => pyre_interpreter::typedef::charp2uni(&rendered),
         };
         Ok(result)
     }
@@ -2007,7 +2043,7 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             ) -> usize;
         }
         let msvc_tm = c_tm_to_msvc_tm(&tm);
-        let render_segment = |segment: &[u16]| -> Result<Vec<u16>, crate::PyError> {
+        let render_segment = |segment: &[u16]| -> Result<Vec<u16>, pyre_interpreter::PyError> {
             if segment.is_empty() {
                 return Ok(Vec::new());
             }
@@ -2020,9 +2056,9 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 // silenced; silenced, the call returns zero and sets `EINVAL`
                 // instead.  The cell has to start clear for that read to
                 // describe this call rather than an earlier one.
-                crate::builtins::clear_crt_errno();
+                pyre_interpreter::builtins::clear_crt_errno();
                 let n = unsafe {
-                    crate::builtins::crt_call!(wcsftime(
+                    pyre_interpreter::builtins::crt_call!(wcsftime(
                         buf.as_mut_ptr(),
                         buf.len(),
                         c_fmt.as_ptr(),
@@ -2031,8 +2067,10 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 };
                 // A rejected directive is neither a buffer too small for the
                 // result nor the empty-result case below.
-                if n == 0 && crate::builtins::crt_errno() == libc::EINVAL {
-                    return Err(crate::PyError::value_error("Invalid format string"));
+                if n == 0 && pyre_interpreter::builtins::crt_errno() == libc::EINVAL {
+                    return Err(pyre_interpreter::PyError::value_error(
+                        "Invalid format string",
+                    ));
                 }
                 if n != 0 {
                     return Ok(buf[..n].to_vec());
@@ -2077,15 +2115,16 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 /// time.mktime(tuple) — interp_time.mktime
-pub fn mktime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn mktime(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     // One zone, and it is UTC, so the seconds a broken-down time names are the
     // ones `gmtime` would hand back for it.  `tm_isdst` names no second
     // reading here and is ignored the way it is on a platform with no DST rule.
     #[cfg(not(any(unix, windows)))]
     {
         let mut tm = _gettmarg(args, false)?;
-        let seconds = wasm_calendar::seconds_from(&mut tm)
-            .ok_or_else(|| crate::PyError::overflow_error("mktime argument out of range"))?;
+        let seconds = wasm_calendar::seconds_from(&mut tm).ok_or_else(|| {
+            pyre_interpreter::PyError::overflow_error("mktime argument out of range")
+        })?;
         Ok(floatobject::w_float_new(seconds as f64))
     }
     #[cfg(any(unix, windows))]
@@ -2119,7 +2158,7 @@ pub fn mktime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         };
 
         if tt == -1 && tm.tm_wday == -1 {
-            return Err(crate::PyError::overflow_error(
+            return Err(pyre_interpreter::PyError::overflow_error(
                 "mktime argument out of range",
             ));
         }
@@ -2128,13 +2167,13 @@ pub fn mktime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 /// time.asctime([tuple]) — interp_time.asctime
-pub fn asctime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn asctime(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let tm = _gettmarg(args, true)?;
     _checktm(&tm)?;
     _asctime_from_tm(&tm)
 }
 
-fn _asctime_from_tm(tm: &c_tm) -> Result<PyObjectRef, crate::PyError> {
+fn _asctime_from_tm(tm: &c_tm) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     const WDAY_NAME: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     const MON_NAME: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -2154,7 +2193,7 @@ fn _asctime_from_tm(tm: &c_tm) -> Result<PyObjectRef, crate::PyError> {
 }
 
 /// time.ctime([seconds]) — interp_time.ctime
-pub fn ctime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn ctime(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let seconds = _get_seconds(args)?;
 
     // interp_time.py:ctime always delegates through localtime + _asctime.
@@ -2167,20 +2206,20 @@ pub fn ctime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// the shared `_strptime` module.  A non-descriptor when stored on a class,
 /// and positional-only: the `app_time.py` definition binds its parameters by
 /// keyword, but the demoted module builtin takes none (`METH_VARARGS`).
-pub fn strptime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if crate::builtins::has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
+pub fn strptime(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
+    if pyre_interpreter::builtins::has_real_kwargs(kwargs) {
+        return Err(pyre_interpreter::PyError::type_error(
             "strptime() takes no keyword arguments",
         ));
     }
     if positional.is_empty() {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "strptime() missing 1 required positional argument: 'string'",
         ));
     }
     if positional.len() > 2 {
-        return Err(crate::PyError::type_error(format!(
+        return Err(pyre_interpreter::PyError::type_error(format!(
             "strptime() takes from 1 to 2 positional arguments but {} were given",
             positional.len()
         )));
@@ -2203,18 +2242,18 @@ pub fn strptime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             (string_slot, format_slot)
         }
     };
-    let w_mod = match crate::importing::get_sys_module("_strptime") {
+    let w_mod = match pyre_interpreter::importing::get_sys_module("_strptime") {
         Some(m) => m,
-        None => crate::importing::importhook(
+        None => pyre_interpreter::importing::importhook(
             "_strptime",
             pyre_object::PY_NULL,
             pyre_object::PY_NULL,
             0,
-            crate::call::getexecutioncontext(),
+            pyre_interpreter::call::getexecutioncontext(),
         )?,
     };
-    let w_fn = crate::baseobjspace::getattr_str(w_mod, "_strptime_time")?;
-    crate::call::call_function_impl_result(
+    let w_fn = pyre_interpreter::baseobjspace::getattr_str(w_mod, "_strptime_time")?;
+    pyre_interpreter::call::call_function_impl_result(
         w_fn,
         &[
             pyre_object::gc_roots::shadow_stack_get(string_slot),
@@ -2227,15 +2266,15 @@ pub fn strptime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `_get_time_info`.  A non-descriptor when stored on a class, and
 /// positional-only: the `app_time.py` definition binds `name` by keyword, but
 /// the demoted module builtin takes none (`METH_VARARGS`).
-pub fn get_clock_info(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if crate::builtins::has_real_kwargs(kwargs) {
-        return Err(crate::PyError::type_error(
+pub fn get_clock_info(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
+    if pyre_interpreter::builtins::has_real_kwargs(kwargs) {
+        return Err(pyre_interpreter::PyError::type_error(
             "get_clock_info() takes no keyword arguments",
         ));
     }
     if positional.len() != 1 {
-        return Err(crate::PyError::type_error(format!(
+        return Err(pyre_interpreter::PyError::type_error(format!(
             "get_clock_info() takes exactly 1 argument ({} given)",
             positional.len()
         )));
@@ -2244,7 +2283,7 @@ pub fn get_clock_info(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     let _roots = pyre_object::gc_roots::push_roots();
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(name);
-    let info = crate::module::sys::vm::new_simple_namespace_instance()?;
+    let info = pyre_interpreter::module::sys::vm::new_simple_namespace_instance()?;
     let info_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(info);
     // `_get_time_info` overwrites implementation/monotonic/adjustable/resolution

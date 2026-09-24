@@ -456,7 +456,7 @@ impl W_PickleBuffer {
 /// / `memoryview(pb)` operate on the wrapped `bytes`/`bytearray`/`array`/
 /// `memoryview`. `Some(Err(..))` once the buffer was released; `None` when
 /// `obj` is not a `PickleBuffer`.
-pub(crate) fn forwarded_exporter(obj: PyObjectRef) -> Option<Result<PyObjectRef, PyError>> {
+pub fn forwarded_exporter(obj: PyObjectRef) -> Option<Result<PyObjectRef, PyError>> {
     W_PickleBuffer::from_obj(obj).map(|pb| {
         let w = pb.wrapped();
         if unsafe { pyre_object::is_none(w) } {

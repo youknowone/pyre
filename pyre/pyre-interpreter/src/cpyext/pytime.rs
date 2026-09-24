@@ -9,8 +9,6 @@
 
 use std::ffi::{c_double, c_int};
 
-use crate::module::time::interp_time;
-
 /// A count of nanoseconds.
 #[allow(non_camel_case_types)]
 pub type PyTime_t = i64;
@@ -19,11 +17,15 @@ pub type PyTime_t = i64;
 const SEC_TO_NS: PyTime_t = 1_000_000_000;
 
 fn monotonic() -> PyTime_t {
-    interp_time::monotonic_nanos() as PyTime_t
+    crate::importing::optional_module_hooks()
+        .map(|hooks| (hooks.time_monotonic_nanos)() as PyTime_t)
+        .unwrap_or(0)
 }
 
 fn wall_clock() -> PyTime_t {
-    interp_time::duration_since_epoch().as_nanos() as PyTime_t
+    crate::importing::optional_module_hooks()
+        .map(|hooks| (hooks.time_duration_since_epoch)().as_nanos() as PyTime_t)
+        .unwrap_or(0)
 }
 
 /// `PyTime_AsSecondsDouble(t)` — nanoseconds as seconds.

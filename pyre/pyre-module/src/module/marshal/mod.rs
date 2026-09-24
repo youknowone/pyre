@@ -12,7 +12,7 @@ use rustpython_compiler_core::bytecode::{BasicBag, CodeObject, ConstantBag, Cons
 use rustpython_compiler_core::marshal::{self as wire, DumpableValue, Write};
 use rustpython_wtf8::Wtf8;
 
-use crate::{PyError, PyResult};
+use pyre_interpreter::{PyError, PyResult};
 
 const MAX_DEPTH: usize = wire::MAX_MARSHAL_STACK_DEPTH;
 
@@ -32,13 +32,13 @@ fn marshal_error(error: wire::MarshalError) -> PyError {
 }
 
 fn eof_error(message: &str) -> PyError {
-    PyError::new(crate::PyErrorKind::EOFError, message)
+    PyError::new(pyre_interpreter::PyErrorKind::EOFError, message)
 }
 
 fn call_method(obj: PyObjectRef, name: &str, args: &[PyObjectRef]) -> PyResult {
-    let result = crate::baseobjspace::call_method(obj, name, args);
+    let result = pyre_interpreter::baseobjspace::call_method(obj, name, args);
     if result.is_null() {
-        Err(crate::call::take_call_error()
+        Err(pyre_interpreter::call::take_call_error()
             .unwrap_or_else(|| PyError::runtime_error("method call failed")))
     } else {
         Ok(result)
@@ -70,8 +70,8 @@ fn bytes_like(obj: PyObjectRef, function: &str) -> Result<MarshalBytes, PyError>
         }));
     }
     if unsafe { memoryview::is_w_memoryview(obj) } {
-        unsafe { crate::builtins::memoryview_check_released(obj) }?;
-        crate::typedef::require_contiguous_buffer(obj)?;
+        unsafe { pyre_interpreter::builtins::memoryview_check_released(obj) }?;
+        pyre_interpreter::typedef::require_contiguous_buffer(obj)?;
         let view = unsafe { memoryview::w_memoryview_view(obj) };
         return Ok(match unsafe { view.as_contiguous_bytes() } {
             Some(bytes) => MarshalBytes::Borrowed(bytes),
@@ -81,7 +81,7 @@ fn bytes_like(obj: PyObjectRef, function: &str) -> Result<MarshalBytes, PyError>
     // Any readable buffer is accepted (`interp_marshal` unwraps via
     // `space.readbuf_w`): `SourcelessFileLoader.get_code` hands `loads` a
     // sliced memoryview of the pyc payload.
-    if let Some(src) = crate::typedef::buffer_as_bytes_like(obj)? {
+    if let Some(src) = pyre_interpreter::typedef::buffer_as_bytes_like(obj)? {
         return Ok(MarshalBytes::Owned(
             unsafe { bytesobject::bytes_like_data(src) }.to_vec(),
         ));
@@ -98,7 +98,8 @@ fn bytes_like(obj: PyObjectRef, function: &str) -> Result<MarshalBytes, PyError>
 /// acquired bytes in a Rust `Vec`: unlike materialising a Python `bytes`, this
 /// cannot move objects while `write_object` holds raw traversal locals.
 fn marshal_buffer_bytes(obj: PyObjectRef) -> Result<Option<Vec<u8>>, PyError> {
-    if let Some(target) = crate::module::__pypy__::interp_buffer::forwarded_exporter(obj) {
+    if let Some(target) = pyre_interpreter::module::__pypy__::interp_buffer::forwarded_exporter(obj)
+    {
         return marshal_buffer_bytes(target?);
     }
     unsafe {
@@ -109,9 +110,11 @@ fn marshal_buffer_bytes(obj: PyObjectRef) -> Result<Option<Vec<u8>>, PyError> {
             return Ok(Some(interp_array::w_array_bytes(obj).to_vec()));
         }
         if memoryview::is_w_memoryview(obj) {
-            crate::builtins::memoryview_check_released(obj)?;
-            crate::typedef::require_contiguous_buffer(obj)?;
-            return Ok(Some(crate::builtins::memoryview_gather_bytes(obj)));
+            pyre_interpreter::builtins::memoryview_check_released(obj)?;
+            pyre_interpreter::typedef::require_contiguous_buffer(obj)?;
+            return Ok(Some(pyre_interpreter::builtins::memoryview_gather_bytes(
+                obj,
+            )));
         }
     }
     Ok(None)
@@ -184,7 +187,7 @@ impl WriterRefs {
 
 fn is_singleton(obj: PyObjectRef) -> bool {
     (unsafe { is_none(obj) || is_bool(obj) || is_ellipsis(obj) })
-        || crate::builtins::lookup_exc_class("StopIteration") == Some(obj)
+        || pyre_interpreter::builtins::lookup_exc_class("StopIteration") == Some(obj)
 }
 
 fn write_len(out: &mut Vec<u8>, len: usize) -> Result<(), PyError> {
@@ -240,15 +243,19 @@ unsafe fn write_code(
     depth: usize,
 ) -> Result<(), PyError> {
     let code_root = Rooted::new(w_code);
-    let code =
-        unsafe { &*(crate::pycode::w_code_get_ptr(code_root.get()) as *const crate::CodeObject) };
+    let code = unsafe {
+        &*(pyre_interpreter::pycode::w_code_get_ptr(code_root.get())
+            as *const pyre_interpreter::CodeObject)
+    };
     out.write_u32(code.arg_count);
     out.write_u32(code.posonlyarg_count);
     out.write_u32(code.kwonlyarg_count);
     out.write_u32(code.max_stackdepth);
     out.write_u32(code.flags.bits());
 
-    write_bytes(out, &unsafe { crate::pycode::code_bytes(code_root.get()) })?;
+    write_bytes(out, &unsafe {
+        pyre_interpreter::pycode::code_bytes(code_root.get())
+    })?;
 
     out.write_u8(b'(');
     write_len(out, code.constants.len())?;
@@ -256,7 +263,7 @@ unsafe fn write_code(
     // slot and reload it just like PyPy keeps `x` live throughout w_code.
     let constant_count = code.constants.len();
     for index in 0..constant_count {
-        let constant = crate::pycode::w_code_const(code_root.get(), index);
+        let constant = pyre_interpreter::pycode::w_code_const(code_root.get(), index);
         if constant.is_null() {
             return Err(PyError::value_error("unmarshallable object"));
         }
@@ -265,8 +272,10 @@ unsafe fn write_code(
 
     // A wrapped constant may have allocated and moved `w_code`; recover the
     // backing payload from the forwarded wrapper before touching later fields.
-    let code =
-        unsafe { &*(crate::pycode::w_code_get_ptr(code_root.get()) as *const crate::CodeObject) };
+    let code = unsafe {
+        &*(pyre_interpreter::pycode::w_code_get_ptr(code_root.get())
+            as *const pyre_interpreter::CodeObject)
+    };
     write_name_tuple(out, &code.names, version)?;
 
     let cell_only_names: Vec<&str> = code
@@ -294,9 +303,9 @@ unsafe fn write_code(
     write_marshal_str(out, code.source_path.as_ref(), version)?;
     write_marshal_str(out, code.obj_name.as_ref(), version)?;
     write_marshal_str(out, code.qualname.as_ref(), version)?;
-    out.write_u32(
-        unsafe { (*(code_root.get() as *const crate::pycode::PyCode)).co_firstlineno_raw } as u32,
-    );
+    out.write_u32(unsafe {
+        (*(code_root.get() as *const pyre_interpreter::pycode::PyCode)).co_firstlineno_raw
+    } as u32);
     write_bytes(out, &code.linetable)?;
     write_bytes(out, &code.exceptiontable)?;
     Ok(())
@@ -366,7 +375,7 @@ fn write_object(
     let use_ref = refs.is_some() && !is_singleton(obj);
     // CPython 3.14 `w_ref` marks only code and slice objects incomplete and
     // clears that marker in `w_complete` after their contents are written.
-    let requires_completion = unsafe { crate::pycode::is_code(obj) || is_slice(obj) };
+    let requires_completion = unsafe { pyre_interpreter::pycode::is_code(obj) || is_slice(obj) };
     let ref_index = if use_ref {
         Some(refs.as_mut().unwrap().reserve(obj, requires_completion)?)
     } else {
@@ -376,22 +385,24 @@ fn write_object(
     // PyPy `marshal`: instances of user heap types skip the builtin
     // marshaller table completely.  They may still reach the buffer fallback
     // below (notably bytes/bytearray subclasses).
-    let is_heap_type = crate::typedef::r#type(obj)
+    let is_heap_type = pyre_interpreter::typedef::r#type(obj)
         .is_some_and(|w_type| unsafe { typeobject::w_type_is_heaptype(w_type.as_ptr()) });
 
     unsafe {
         let obj = obj_root.get();
         if !is_heap_type && is_none(obj) {
             out.write_u8(b'N');
-        } else if !is_heap_type && crate::builtins::lookup_exc_class("StopIteration") == Some(obj) {
+        } else if !is_heap_type
+            && pyre_interpreter::builtins::lookup_exc_class("StopIteration") == Some(obj)
+        {
             out.write_u8(b'S');
         } else if !is_heap_type && is_bool(obj) {
             out.write_u8(if w_bool_get_value(obj) { b'T' } else { b'F' });
         } else if !is_heap_type && is_ellipsis(obj) {
             out.write_u8(b'.');
         } else if !is_heap_type && is_int_or_long(obj) {
-            let value = crate::builtins::obj_to_bigint(obj);
-            let value = crate::rbigint_to_compiler_bigint(&value);
+            let value = pyre_interpreter::builtins::obj_to_bigint(obj);
+            let value = pyre_interpreter::rbigint_to_compiler_bigint(&value);
             wire::serialize_value::<_, ConstantData>(out, DumpableValue::Integer(&value))
                 .unwrap_or_else(|never| match never {});
         } else if !is_heap_type && is_float(obj) {
@@ -526,8 +537,9 @@ fn write_object(
                 let item_root = Rooted::new(item);
                 write_object(out, item_root.get(), refs, version, depth - 1)?;
             }
-        } else if !is_heap_type && crate::pycode::is_code(obj) {
-            let ptr = crate::pycode::w_code_get_ptr(obj_root.get()) as *const crate::CodeObject;
+        } else if !is_heap_type && pyre_interpreter::pycode::is_code(obj) {
+            let ptr = pyre_interpreter::pycode::w_code_get_ptr(obj_root.get())
+                as *const pyre_interpreter::CodeObject;
             if ptr.is_null() {
                 return Err(PyError::value_error("unmarshallable object"));
             }
@@ -588,7 +600,8 @@ impl FileReader {
         let file = Rooted::new(file);
         // Probe exactly once. A missing attribute selects `read`; an exception
         // raised by the lookup itself remains observable.
-        let has_readinto = crate::baseobjspace::findattr_result(file.get(), "readinto")?.is_some();
+        let has_readinto =
+            pyre_interpreter::baseobjspace::findattr_result(file.get(), "readinto")?.is_some();
         Ok(Self {
             file,
             scratch: Vec::new(),
@@ -645,7 +658,7 @@ impl FileReader {
         // The file protocol reads a byte count through the index protocol, so
         // an object carrying only `__int__` is a TypeError rather than a
         // silently accepted length.
-        let count = match crate::baseobjspace::getindex_w(count) {
+        let count = match pyre_interpreter::baseobjspace::getindex_w(count) {
             Ok(count) => count,
             Err(error) => return self.python_error(error),
         };
@@ -673,7 +686,7 @@ impl FileReader {
 /// wire reader's own error type.
 fn strict_wtf8(bytes: &[u8], errors: ErrorSink) -> Result<&Wtf8, wire::MarshalError> {
     pyre_object::rutf8::wtf8_from_bytes(bytes, true).map_err(|error| {
-        errors.remember(crate::typedef::utf8_decode_error_from(
+        errors.remember(pyre_interpreter::typedef::utf8_decode_error_from(
             bytes,
             error.pos as usize,
         ));
@@ -782,14 +795,14 @@ impl PyreMarshalBag {
         // form duplicated the whole recursive constants graph and then threw
         // the original away — once per code object in every unmarshalled
         // module.
-        let code = Rooted::new(crate::pycode::box_code_object(code));
+        let code = Rooted::new(pyre_interpreter::pycode::box_code_object(code));
         // `box_code_object` allocates, so read each constant out of its
         // shadow-stack slot only now. PyPy gives the complete decoded wrapped
         // list to `PyCode.__init__`; replace the compiler-boundary eager values
         // with those exact marshal objects.
         let constants: Vec<_> = constants.into_iter().map(Rooted::get).collect();
-        unsafe { crate::pycode::w_code_fill_wrapped_consts(code.get(), &constants) };
-        unsafe { crate::pycode::set_co_code_bytes(code.get(), raw_code_bytes) };
+        unsafe { pyre_interpreter::pycode::w_code_fill_wrapped_consts(code.get(), &constants) };
+        unsafe { pyre_interpreter::pycode::set_co_code_bytes(code.get(), raw_code_bytes) };
         Ok(code)
     }
 }
@@ -837,7 +850,7 @@ impl wire::MarshalBag for PyreMarshalBag {
     }
 
     fn make_int(&self, value: malachite_bigint::BigInt) -> Rooted {
-        let value = crate::compiler_bigint_to_rbigint(&value);
+        let value = pyre_interpreter::compiler_bigint_to_rbigint(&value);
         let obj = if longobject::jit_bigint_to_i64_fits(&value) != 0 {
             w_int_new(longobject::jit_bigint_to_i64_value(&value))
         } else {
@@ -871,11 +884,11 @@ impl wire::MarshalBag for PyreMarshalBag {
     fn make_code(&self, code: CodeObject<ConstantData>) -> Result<Rooted, wire::MarshalError> {
         // Owned here and used nowhere else — hand it over rather than copying
         // the recursive constants graph, as in `make_runtime_code`.
-        Ok(Rooted::new(crate::pycode::box_code_object(code)))
+        Ok(Rooted::new(pyre_interpreter::pycode::box_code_object(code)))
     }
 
     fn make_stop_iter(&self) -> Result<Rooted, wire::MarshalError> {
-        crate::builtins::lookup_exc_class("StopIteration")
+        pyre_interpreter::builtins::lookup_exc_class("StopIteration")
             .map(Rooted::new)
             .ok_or(wire::MarshalError::BadType)
     }
@@ -909,11 +922,13 @@ impl wire::MarshalBag for PyreMarshalBag {
     ) -> Result<Rooted, wire::MarshalError> {
         let set = Rooted::new(setobject::w_set_new());
         for item in elements {
-            let hash = crate::baseobjspace::hash_w_strict(item.get())
+            let hash = pyre_interpreter::baseobjspace::hash_w_strict(item.get())
                 .map_err(|error| self.remember_python_error(error))?;
             unsafe { setobject::w_set_add_hashed_checked(set.get(), item.get(), hash) }.map_err(
                 |error| {
-                    self.remember_python_error(crate::baseobjspace::map_set_update_error(error))
+                    self.remember_python_error(
+                        pyre_interpreter::baseobjspace::map_set_update_error(error),
+                    )
                 },
             )?;
         }
@@ -925,10 +940,14 @@ impl wire::MarshalBag for PyreMarshalBag {
     }
 
     fn insert_set_item(&self, set: &Rooted, item: Rooted) -> Result<(), wire::MarshalError> {
-        let hash = crate::baseobjspace::hash_w_strict(item.get())
+        let hash = pyre_interpreter::baseobjspace::hash_w_strict(item.get())
             .map_err(|error| self.remember_python_error(error))?;
         unsafe { setobject::w_set_add_hashed_checked(set.get(), item.get(), hash) }.map_err(
-            |error| self.remember_python_error(crate::baseobjspace::map_set_update_error(error)),
+            |error| {
+                self.remember_python_error(pyre_interpreter::baseobjspace::map_set_update_error(
+                    error,
+                ))
+            },
         )
     }
 
@@ -938,11 +957,13 @@ impl wire::MarshalBag for PyreMarshalBag {
     ) -> Result<Rooted, wire::MarshalError> {
         let set = Rooted::new(setobject::w_frozenset_new());
         for item in elements {
-            let hash = crate::baseobjspace::hash_w_strict(item.get())
+            let hash = pyre_interpreter::baseobjspace::hash_w_strict(item.get())
                 .map_err(|error| self.remember_python_error(error))?;
             unsafe { setobject::w_set_add_hashed_checked(set.get(), item.get(), hash) }.map_err(
                 |error| {
-                    self.remember_python_error(crate::baseobjspace::map_set_update_error(error))
+                    self.remember_python_error(
+                        pyre_interpreter::baseobjspace::map_set_update_error(error),
+                    )
                 },
             )?;
         }
@@ -956,9 +977,9 @@ impl wire::MarshalBag for PyreMarshalBag {
         let dict = Rooted::new(w_dict_new());
         for (key, value) in elements {
             unsafe { w_dict_store_checked(dict.get(), key.get(), value.get()) }.map_err(|_| {
-                self.remember_python_error(crate::baseobjspace::take_pending_dict_key_error(
-                    key.get(),
-                ))
+                self.remember_python_error(
+                    pyre_interpreter::baseobjspace::take_pending_dict_key_error(key.get()),
+                )
             })?;
         }
         Ok(dict)
@@ -975,7 +996,9 @@ impl wire::MarshalBag for PyreMarshalBag {
         value: Rooted,
     ) -> Result<(), wire::MarshalError> {
         unsafe { w_dict_store_checked(dict.get(), key.get(), value.get()) }.map_err(|_| {
-            self.remember_python_error(crate::baseobjspace::take_pending_dict_key_error(key.get()))
+            self.remember_python_error(pyre_interpreter::baseobjspace::take_pending_dict_key_error(
+                key.get(),
+            ))
         })
     }
 
@@ -997,7 +1020,7 @@ impl wire::MarshalBag for PyreMarshalBag {
     }
 
     fn constant_ref_from_value(&self, value: &Rooted) -> Option<ConstantData> {
-        unsafe { crate::pycode::obj_to_constant_data(value.get()).ok() }
+        unsafe { pyre_interpreter::pycode::obj_to_constant_data(value.get()).ok() }
     }
 
     /// A `co_consts` entry the compiler enum cannot describe — a list, a dict,
@@ -1012,11 +1035,13 @@ impl wire::MarshalBag for PyreMarshalBag {
         // compiler-level table copies its whole body into a second permanent
         // owner; `None` is the arm `is_wrapped_constant` always stores, so the
         // already-decoded wrapper stays this slot's authority instead.
-        if unsafe { crate::pycode::is_code(value.get()) } {
+        if unsafe { pyre_interpreter::pycode::is_code(value.get()) } {
             return Ok(ConstantData::None);
         }
-        Ok(unsafe { crate::pycode::obj_to_constant_data(value.get()) }
-            .unwrap_or(ConstantData::None))
+        Ok(
+            unsafe { pyre_interpreter::pycode::obj_to_constant_data(value.get()) }
+                .unwrap_or(ConstantData::None),
+        )
     }
 
     fn make_code_with_constants(
@@ -1030,8 +1055,8 @@ impl wire::MarshalBag for PyreMarshalBag {
     fn code_units_from_bytes(
         &self,
         code_bytes: &[u8],
-    ) -> Result<crate::bytecode::CodeUnits, wire::MarshalError> {
-        crate::pycode::decode_code_units(code_bytes)
+    ) -> Result<pyre_interpreter::bytecode::CodeUnits, wire::MarshalError> {
+        pyre_interpreter::pycode::decode_code_units(code_bytes)
             .map(|(instructions, _)| instructions)
             .map_err(|()| wire::MarshalError::InvalidBytecode)
     }
@@ -1049,7 +1074,7 @@ impl wire::MarshalBag for PyreMarshalBag {
         let raw_code_bytes = code
             .instructions
             .iter()
-            .any(|unit| matches!(unit.op, crate::bytecode::Instruction::Reserved))
+            .any(|unit| matches!(unit.op, pyre_interpreter::bytecode::Instruction::Reserved))
             .then_some(code_bytes);
         self.make_runtime_code(code, constants, raw_code_bytes)
     }
@@ -1102,7 +1127,7 @@ impl wire::MarshalBag for PyreMarshalBag {
 /// raises `TypeError` like any other non-integer.
 fn resolve_version(version: Option<PyObjectRef>) -> Result<i32, PyError> {
     match version {
-        Some(value) => Ok(crate::baseobjspace::int_w(value)? as i32),
+        Some(value) => Ok(pyre_interpreter::baseobjspace::int_w(value)? as i32),
         None => Ok(wire::FORMAT_VERSION as i32),
     }
 }
@@ -1111,7 +1136,7 @@ fn resolve_version(version: Option<PyObjectRef>) -> Result<i32, PyError> {
 /// slot defaults to true.
 fn resolve_allow_code(allow_code: Option<PyObjectRef>) -> Result<bool, PyError> {
     match allow_code {
-        Some(value) => crate::baseobjspace::is_true(value),
+        Some(value) => pyre_interpreter::baseobjspace::is_true(value),
         None => Ok(true),
     }
 }
@@ -1161,7 +1186,7 @@ fn unmarshal_bytes(data: &[u8], allow_code: bool) -> PyResult {
 /// traversal does not persist it); it also prevents container cycles from
 /// recursing forever without introducing a side table.
 fn contains_code(obj: PyObjectRef, seen: &mut Vec<PyObjectRef>) -> bool {
-    if unsafe { crate::pycode::is_code(obj) } {
+    if unsafe { pyre_interpreter::pycode::is_code(obj) } {
         return true;
     }
     if seen.iter().any(|&seen_obj| std::ptr::eq(seen_obj, obj)) {
@@ -1220,7 +1245,7 @@ pub(crate) fn dumps_bytes(value: PyObjectRef) -> Result<Vec<u8>, PyError> {
     marshal_to_bytes(value, wire::FORMAT_VERSION as i32, true)
 }
 
-crate::py_module! {
+pyre_interpreter::py_module! {
     "marshal",
     int_constants: {
         "version" => wire::FORMAT_VERSION as i64,
@@ -1237,7 +1262,7 @@ crate::py_module! {
             #[posonly]
             #[kwonly]
             allow_code: Option<PyObjectRef>,
-        ) -> Result<PyObjectRef, crate::PyError> {
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             let version = resolve_version(version)?;
             let allow_code = resolve_allow_code(allow_code)?;
             let out = marshal_to_bytes(value, version, allow_code)?;
@@ -1250,7 +1275,7 @@ crate::py_module! {
             #[posonly]
             #[kwonly]
             allow_code: Option<PyObjectRef>,
-        ) -> Result<PyObjectRef, crate::PyError> {
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             let allow_code = resolve_allow_code(allow_code)?;
             let data = bytes_like(data, "loads")?;
             unmarshal_bytes(data.as_slice(), allow_code)
@@ -1265,7 +1290,7 @@ crate::py_module! {
             #[posonly]
             #[kwonly]
             allow_code: Option<PyObjectRef>,
-        ) -> Result<PyObjectRef, crate::PyError> {
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             let version = resolve_version(version)?;
             let allow_code = resolve_allow_code(allow_code)?;
             let out = marshal_to_bytes(value, version, allow_code)?;
@@ -1281,7 +1306,7 @@ crate::py_module! {
             #[posonly]
             #[kwonly]
             allow_code: Option<PyObjectRef>,
-        ) -> Result<PyObjectRef, crate::PyError> {
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             let allow_code = resolve_allow_code(allow_code)?;
             let _roots = pyre_object::gc_roots::push_roots();
             let mut pending_error = None;
@@ -1319,7 +1344,7 @@ mod tests {
 
     #[test]
     fn decoded_code_constant_uses_the_wrapped_pycode_as_authority() {
-        let w_code = crate::pycode::w_code_new(std::ptr::null());
+        let w_code = pyre_interpreter::pycode::w_code_new(std::ptr::null());
         let rooted = Rooted::new(w_code);
         let mut pending_error = None;
         let bag = PyreMarshalBag::new(&mut pending_error);

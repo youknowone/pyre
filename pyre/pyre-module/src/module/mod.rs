@@ -99,6 +99,8 @@ pub mod _template;
 #[allow(non_snake_case)]
 pub mod _tokenize;
 #[allow(non_snake_case)]
+#[allow(non_snake_case)]
+pub mod _types;
 pub mod _typing;
 #[allow(non_snake_case)]
 #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
@@ -119,6 +121,9 @@ pub mod fcntl;
 pub mod gc;
 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 pub mod grp;
+#[allow(non_snake_case)]
+pub mod imp;
+pub mod marshal;
 pub mod math;
 #[cfg(all(
     feature = "full",
@@ -141,6 +146,7 @@ pub mod select;
 pub mod syslog;
 #[cfg(all(unix, not(feature = "sandbox")))]
 pub mod termios;
+pub mod time;
 pub mod unicodedata;
 #[cfg(windows)]
 pub mod winreg;

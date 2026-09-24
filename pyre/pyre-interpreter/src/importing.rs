@@ -495,7 +495,7 @@ static SYS_PATH_0: LazyLock<Mutex<Option<Wtf8Buf>>> = LazyLock::new(|| Mutex::ne
 /// thread runs the insert must observe that staging.
 static SYS_PATH_0_PENDING: LazyLock<Mutex<Option<std::ffi::OsString>>> =
     LazyLock::new(|| Mutex::new(None));
-pub(crate) static BUILTIN_MODULES: LazyLock<Mutex<HashMap<&'static str, BuiltinModuleDef>>> =
+pub static BUILTIN_MODULES: LazyLock<Mutex<HashMap<&'static str, BuiltinModuleDef>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Where a module-owned GC type joins `build_gc`'s registration order.
@@ -619,6 +619,15 @@ pub struct OptionalModuleHooks {
     pub pickle_call_fn: fn(PyObjectRef, &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
     pub pickle_call_meth:
         fn(PyObjectRef, &str, &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+    pub time_monotonic_nanos: fn() -> i128,
+    pub time_duration_since_epoch: fn() -> std::time::Duration,
+    pub imp_lock_held_by_current_thread: fn() -> bool,
+    pub imp_before_fork: fn(),
+    pub imp_after_fork_parent: fn() -> Result<(), crate::PyError>,
+    pub imp_after_fork_child: fn(),
+    pub imp_load_pyc_script: fn(&[u8]) -> Result<PyObjectRef, crate::PyError>,
+    pub imp_frozen_cache_load: fn(&str, &str) -> Option<PyObjectRef>,
+    pub imp_frozen_cache_store: fn(&str, &str, PyObjectRef),
 }
 
 static OPTIONAL_MODULE_HOOKS: std::sync::OnceLock<OptionalModuleHooks> = std::sync::OnceLock::new();
@@ -640,7 +649,7 @@ thread_local! {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct BuiltinModuleDef {
+pub struct BuiltinModuleDef {
     init: fn(PyObjectRef) -> Result<(), crate::PyError>,
     startup: Option<fn(PyObjectRef, *const PyExecutionContext) -> Result<(), crate::PyError>>,
     /// The module follows ordinary `sys.modules` ownership and may be
@@ -788,7 +797,6 @@ pub fn install_builtin_modules() {
     }
 
     // Core pyre modules backed by `interpleveldefs` tables.
-    pyre_install_module!(time);
     pyre_install_module!(sys);
     // `moduledef.py applevel_name = '_operator'` — the interp-level table
     // is reachable only as `_operator`; `import operator` resolves to
@@ -823,7 +831,6 @@ pub fn install_builtin_modules() {
     pyre_install_module!("nt"(posix));
     pyre_install_module!(_collections);
     pyre_install_module!(_ast);
-    pyre_install_module!("_imp"(imp));
 
     // importlib package and its submodules load their real source from disk:
     // the package `__init__.py` binds `__import__`/`import_module`/… from the
@@ -842,7 +849,8 @@ pub fn install_builtin_modules() {
     // `select`, `mmap`, `_socket`/`_ssl`, `pwd`/`grp`, `errno`, `_stat`,
     // `_abc`, `_typing`, `_symtable`, `_pypy_generic_alias`, `atexit`,
     // `pypyjit`, `_contextvars`, `_functools`, `gc`, `_pickle`, `_random`,
-    // and the Windows host modules live in `pyre-module`.  None of the host
+    // `time`, `_imp`, `marshal`, `_types`, and the Windows host modules
+    // live in `pyre-module`.  None of the host
     // ones belong to the mediated ll_os/ll_time surface, so the sandbox
     // interpreter omits them entirely: `import _ctypes` then raises
     // ModuleNotFoundError, as in a build whose syscall code is absent.
@@ -857,7 +865,6 @@ pub fn install_builtin_modules() {
     }
     pyre_install_module!(_locale);
     register_collectible_builtin_module("_struct", crate::module::r#struct::init);
-    pyre_install_module!(marshal);
 
     // Modules whose stdlib wrapper does `import X` + attribute access or
     // `from X import *` are deliberately NOT stubbed here: an empty stub
@@ -871,7 +878,7 @@ pub fn install_builtin_modules() {
         crate::module::array::init_array_module,
         crate::module::array::startup_array_module,
     );
-    register_builtin_module("_types", crate::module::_types::init);
+
     register_builtin_module("_string", init_string_module);
     register_builtin_module("_tracemalloc", init_tracemalloc);
     register_builtin_module("_sysconfig", init_sysconfig_stub);
@@ -1763,7 +1770,7 @@ pub(crate) fn load_builtin_module(name: &str) -> Result<Option<PyObjectRef>, cra
 /// Build a builtin module for `_imp.create_builtin`, then run its `startup`
 /// hook. App-level `module_from_spec` stamps import metadata afterwards
 /// (`_bootstrap.py:822`), so this entry point must not pre-fill it.
-pub(crate) fn create_builtin_module(
+pub fn create_builtin_module(
     name: &str,
     execution_context: *const PyExecutionContext,
 ) -> Result<Option<PyObjectRef>, crate::PyError> {
@@ -3018,7 +3025,7 @@ pub(crate) fn startup_path_config() -> &'static StartupPathConfig {
 ///
 /// PyPy equivalent: initpath.py scans for lib-python/X.Y at startup.
 #[cfg(feature = "host_env")]
-pub(crate) fn detect_stdlib_path() -> Option<PathBuf> {
+pub fn detect_stdlib_path() -> Option<PathBuf> {
     startup_path_config().stdlib.clone()
 }
 
@@ -3809,7 +3816,10 @@ pub fn code_debug_ranges_flag() -> bool {
 /// ends in `.pyc`.  The actual header and marshal ownership remains in `_imp`,
 /// alongside importlib's copy of the same protocol.
 pub fn load_pyc_script(bytes: &[u8]) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-    crate::module::imp::interp_imp::load_pyc_script(bytes)
+    let Some(hooks) = optional_module_hooks() else {
+        return Err(crate::PyError::runtime_error("_imp is not available"));
+    };
+    (hooks.imp_load_pyc_script)(bytes)
 }
 
 pub fn unbuffered_flag() -> bool {
@@ -4622,9 +4632,9 @@ fn load_source_module(
         "importlib._bootstrap" | "importlib._bootstrap_external" => Some(modulename),
         _ => None,
     };
-    let (w_code, store) = match cache_key
-        .and_then(|key| crate::module::imp::interp_imp::frozen_cache_load(key, &source))
-    {
+    let (w_code, store) = match cache_key.and_then(|key| {
+        optional_module_hooks().and_then(|hooks| (hooks.imp_frozen_cache_load)(key, &source))
+    }) {
         Some(w_code) => (w_code, false),
         None => {
             let code = parse_source_module(&path_text, &source).map_err(|error| match error {
@@ -4644,7 +4654,9 @@ fn load_source_module(
     let code_slot = roots.base();
     let _ = roots.pin_root(w_code);
     if let (true, Some(key)) = (store, cache_key) {
-        crate::module::imp::interp_imp::frozen_cache_store(key, &source, roots.get(code_slot));
+        if let Some(hooks) = optional_module_hooks() {
+            (hooks.imp_frozen_cache_store)(key, &source, roots.get(code_slot));
+        }
     }
 
     // Create a fresh namespace for the module, seeded with builtins.

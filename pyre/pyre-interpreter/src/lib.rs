@@ -989,7 +989,7 @@ pub fn with_causes(error: &dyn std::error::Error) -> String {
     rendered
 }
 
-pub(crate) fn compiler_bigint_to_rbigint(value: &malachite_bigint::BigInt) -> PyBigInt {
+pub fn compiler_bigint_to_rbigint(value: &malachite_bigint::BigInt) -> PyBigInt {
     let (sign, bytes) = value.to_bytes_le();
     let sign = match sign {
         malachite_bigint::Sign::Minus => majit_rlib::rbigint::RBigIntSign::Minus,
@@ -1013,7 +1013,7 @@ pub extern "C" fn jit_compiler_bigint_to_rbigint(value: i64) -> *mut PyBigInt {
     pyre_object::longobject::alloc_bigint_nursery_collecting(converted)
 }
 
-pub(crate) fn rbigint_to_compiler_bigint(value: &PyBigInt) -> malachite_bigint::BigInt {
+pub fn rbigint_to_compiler_bigint(value: &PyBigInt) -> malachite_bigint::BigInt {
     let sign = match value.sign() {
         majit_rlib::rbigint::RBigIntSign::Minus => malachite_bigint::Sign::Minus,
         majit_rlib::rbigint::RBigIntSign::NoSign => malachite_bigint::Sign::NoSign,

@@ -16,7 +16,42 @@ use std::time::Instant;
 // wasm32 has no `Instant` of its own; the deadlines below read the clock the
 // embedder installs, the same one `time.monotonic()` reports.
 #[cfg(target_arch = "wasm32")]
-use crate::module::time::interp_time::Instant;
+use wasm_instant::Instant;
+
+/// wasm32 deadlines. Native builds use `std::time::Instant` directly.
+#[cfg(target_arch = "wasm32")]
+mod wasm_instant {
+    use std::time::Duration;
+
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    pub(super) struct Instant(i128);
+
+    impl Instant {
+        pub(super) fn now() -> Self {
+            let nanos = crate::importing::optional_module_hooks()
+                .map(|hooks| (hooks.time_monotonic_nanos)())
+                .unwrap_or(0);
+            Self(nanos)
+        }
+    }
+
+    impl std::ops::Add<Duration> for Instant {
+        type Output = Self;
+
+        fn add(self, rhs: Duration) -> Self {
+            Self(self.0 + rhs.as_nanos() as i128)
+        }
+    }
+
+    impl std::ops::Sub for Instant {
+        type Output = Duration;
+
+        fn sub(self, rhs: Self) -> Duration {
+            let nanos = (self.0 - rhs.0).max(0) as u128;
+            Duration::from_nanos(nanos.min(u64::MAX as u128) as u64)
+        }
+    }
+}
 
 /// `PY_TIMEOUT_MAX` — the acquire-timeout bound in microseconds.  A POSIX host
 /// waits on a nanosecond deadline and bounds it at `LLONG_MAX / 1000`; Windows
@@ -317,7 +352,9 @@ pub fn park_if_finalizing() {
     // A parked thread never runs again, so a lock it owns is never released.
     // The import lock is one the finalizing thread itself takes; its owner
     // keeps running and parks at the first dispatch after `release_lock`.
-    if crate::module::imp::interp_imp::lock_held_by_current_thread() {
+    if crate::importing::optional_module_hooks()
+        .is_some_and(|hooks| (hooks.imp_lock_held_by_current_thread)())
+    {
         return;
     }
     let blocked = before_external_block();

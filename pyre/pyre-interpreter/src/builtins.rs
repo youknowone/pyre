@@ -523,7 +523,7 @@ unsafe fn w_memoryview_new_mmap(
 /// value-model view.  Residualize the whole geometry/copy subtree behind
 /// this single `.gather()` call surface (`@jit.dont_look_inside`).
 #[majit_macros::dont_look_inside]
-pub(crate) unsafe fn memoryview_gather_bytes(mv: PyObjectRef) -> Vec<u8> {
+pub unsafe fn memoryview_gather_bytes(mv: PyObjectRef) -> Vec<u8> {
     unsafe { pyre_object::memoryview::w_memoryview_view(mv).gather() }
 }
 
@@ -17022,7 +17022,7 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 /// the supplied namespaces.  When the namespaces are dicts, pyre converts
 /// them into `DictStorage`s before invocation and copies the post-run
 /// namespace contents back so that callers see the new bindings.
-pub(crate) fn builtin_exec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn builtin_exec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `exec(source, /, globals=None, locals=None, *, closure=None)`: source is
     // positional-only; globals/locals are positional-or-keyword; `closure` is
     // keyword-only.  `closure` supplies the cell objects that bind a code

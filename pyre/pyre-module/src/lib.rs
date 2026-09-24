@@ -120,6 +120,8 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("_template", module::_template::init);
     pyre_interpreter::importing::register_builtin_module("_tokenize", module::_tokenize::init);
     pyre_interpreter::importing::register_builtin_module("_typing", module::_typing::init);
+    pyre_interpreter::importing::register_builtin_module("_types", module::_types::init);
+    pyre_interpreter::importing::register_builtin_module("_imp", module::imp::init);
     #[cfg(windows)]
     pyre_interpreter::importing::register_builtin_module("_winapi", module::_winapi::init);
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
@@ -138,6 +140,7 @@ pub fn install_optional_modules() {
         "faulthandler",
         module::faulthandler::init,
     );
+    pyre_interpreter::importing::register_builtin_module("marshal", module::marshal::init);
     pyre_interpreter::importing::register_builtin_module("math", module::math::init);
     #[cfg(all(windows, feature = "host_env"))]
     pyre_interpreter::importing::register_builtin_module("msvcrt", module::msvcrt::init);
@@ -164,6 +167,7 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("syslog", module::syslog::init);
     #[cfg(all(unix, not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("termios", module::termios::init);
+    pyre_interpreter::importing::register_builtin_module("time", module::time::init);
     #[cfg(windows)]
     pyre_interpreter::importing::register_builtin_module("winreg", module::winreg::init);
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
@@ -459,6 +463,15 @@ pub fn register() {
             gc_initialize: hook_gc_initialize,
             pickle_call_fn: module::_pickle::call_fn,
             pickle_call_meth: module::_pickle::call_meth,
+            time_monotonic_nanos: module::time::interp_time::monotonic_nanos,
+            time_duration_since_epoch: module::time::interp_time::duration_since_epoch,
+            imp_lock_held_by_current_thread: module::imp::interp_imp::lock_held_by_current_thread,
+            imp_before_fork: module::imp::interp_imp::before_fork,
+            imp_after_fork_parent: module::imp::interp_imp::after_fork_parent,
+            imp_after_fork_child: module::imp::interp_imp::after_fork_child,
+            imp_load_pyc_script: module::imp::interp_imp::load_pyc_script,
+            imp_frozen_cache_load: module::imp::interp_imp::frozen_cache_load,
+            imp_frozen_cache_store: module::imp::interp_imp::frozen_cache_store,
         },
     );
 }

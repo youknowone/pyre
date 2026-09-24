@@ -362,7 +362,7 @@ impl W_Random {
 /// the reading to the sandbox controller and to the wasm embedder rather than
 /// to a `SystemTime` neither of them has.
 fn seed_from_time() -> u64 {
-    let secs = pyre_interpreter::module::time::interp_time::duration_since_epoch().as_secs_f64();
+    let secs = crate::module::time::interp_time::duration_since_epoch().as_secs_f64();
     (secs * 256.0) as u64
 }
 

@@ -2,7 +2,7 @@
 //!
 //! Verbatim move of the inline block previously in importing.rs.
 
-use crate::importing::BUILTIN_MODULES;
+use pyre_interpreter::importing::BUILTIN_MODULES;
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
 use std::ffi::CString;
 use std::sync::OnceLock;
@@ -192,7 +192,7 @@ struct ImportRLock {
     /// `importing.py:162 self.lock` — what `space.allocate_lock()` returned,
     /// allocated on the first acquire.  Null is upstream's `None`, and the
     /// distinction is observable: `release_lock` is silent while it is null.
-    lock: AtomicPtr<crate::baseobjspace::Lock>,
+    lock: AtomicPtr<pyre_interpreter::baseobjspace::Lock>,
     /// `importing.py:163 self.lockowner` — the owning thread, held as the
     /// ident rather than as the context object because only its identity is
     /// ever read.  Zero is `None`.
@@ -214,7 +214,7 @@ struct ImportRLock {
 /// re-seeds with a fresh context per phase, so a lock taken while running a
 /// script would be owned by a stranger once the REPL starts.
 fn thread_ident() -> i64 {
-    match crate::module::thread::current_ident() {
+    match pyre_interpreter::module::thread::current_ident() {
         // Zero is the `None` encoding, so it cannot also name a thread; fall
         // back to the same single-threaded sentinel `_thread.get_ident` uses.
         0 => 1,
@@ -252,7 +252,7 @@ impl ImportRLock {
         // importing.py:177-181 — allocate on first use.  A losing racer drops
         // its own box and uses the winner's.
         if self.lock.load(Ordering::Acquire).is_null() {
-            let fresh = crate::baseobjspace::allocate_lock();
+            let fresh = pyre_interpreter::baseobjspace::allocate_lock();
             if self
                 .lock
                 .compare_exchange(
@@ -280,7 +280,7 @@ impl ImportRLock {
     }
 
     /// `importing.py release_lock(silent_after_fork)`.
-    fn release_lock(&self, silent_after_fork: bool) -> Result<(), crate::PyError> {
+    fn release_lock(&self, silent_after_fork: bool) -> Result<(), pyre_interpreter::PyError> {
         let me = thread_ident();
         let owner = self.lockowner.load(Ordering::Acquire);
         if owner != me {
@@ -302,7 +302,7 @@ impl ImportRLock {
             // lock is allocated before user code runs and the branch stops
             // being observable either way.
             // importing.py:201-203
-            return Err(crate::PyError::runtime_error("not holding the import lock"));
+            return Err(pyre_interpreter::PyError::runtime_error("not holding the import lock"));
         }
         debug_assert!(self.lockcounter.load(Ordering::Relaxed) > 0);
         // importing.py:204-207 — clear the owner BEFORE releasing, so the
@@ -327,7 +327,7 @@ impl ImportRLock {
         if self.lockcounter.load(Ordering::Relaxed) > 1 {
             // importing.py:216-224 — the old lock object is abandoned rather
             // than freed: a foreign thread could be mid-acquire on it.
-            let fresh = crate::baseobjspace::allocate_lock();
+            let fresh = pyre_interpreter::baseobjspace::allocate_lock();
             self.lock.store(fresh, Ordering::Release);
             let me = thread_ident();
             unsafe { &*fresh }.acquire(true);
@@ -381,7 +381,7 @@ fn acquire_lock() {
 
 /// `interp_imp.py release_lock` — `silent_after_fork=False`, which is why
 /// an unbalanced `_imp.release_lock()` from Python raises.
-fn release_lock() -> Result<(), crate::PyError> {
+fn release_lock() -> Result<(), pyre_interpreter::PyError> {
     getimportlock().release_lock(false)
 }
 
@@ -403,7 +403,7 @@ pub(crate) fn before_fork() {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn after_fork_parent() -> Result<(), crate::PyError> {
+pub(crate) fn after_fork_parent() -> Result<(), pyre_interpreter::PyError> {
     // moduledef.py registers `interp_imp.release_lock`, whose gateway passes
     // `silent_after_fork=False`; only native importhook cleanup uses `True`.
     getimportlock().release_lock(false)
@@ -448,14 +448,14 @@ fn served_frozen_module(name: &Wtf8) -> Option<&'static FrozenModule> {
 fn frozen_name(
     args: &[pyre_object::PyObjectRef],
     function: &str,
-) -> Result<Wtf8Buf, crate::PyError> {
+) -> Result<Wtf8Buf, pyre_interpreter::PyError> {
     let Some(&name) = args.first() else {
-        return Err(crate::PyError::type_error(format!(
+        return Err(pyre_interpreter::PyError::type_error(format!(
             "{function} expected at least 1 argument, got 0"
         )));
     };
     if !unsafe { pyre_object::is_str(name) } {
-        return Err(crate::PyError::type_error(format!(
+        return Err(pyre_interpreter::PyError::type_error(format!(
             "{function}() argument 1 must be str, not {}",
             bad_argument_type_name(name)
         )));
@@ -465,8 +465,8 @@ fn frozen_name(
 
 /// `set_frozen_error` — both frozen diagnostics carry the module name as
 /// `.name` with no `.path`, and render it the way `%R` does.
-fn frozen_error(message: String, name: &Wtf8) -> crate::PyError {
-    crate::PyError::import_error_name_path(
+fn frozen_error(message: String, name: &Wtf8) -> pyre_interpreter::PyError {
+    pyre_interpreter::PyError::import_error_name_path(
         message,
         pyre_object::w_str_from_wtf8_managed(name.to_owned()),
         pyre_object::w_none(),
@@ -477,10 +477,10 @@ fn frozen_error(message: String, name: &Wtf8) -> crate::PyError {
 /// `repr(str)`, which Rust's `{:?}` does not reproduce (it always
 /// double-quotes).
 fn frozen_name_repr(name: &Wtf8) -> String {
-    crate::display::format_wtf8_repr(name)
+    pyre_interpreter::display::format_wtf8_repr(name)
 }
 
-fn missing_frozen_error(name: &Wtf8) -> crate::PyError {
+fn missing_frozen_error(name: &Wtf8) -> pyre_interpreter::PyError {
     frozen_error(
         format!("No such frozen object named {}", frozen_name_repr(name)),
         name,
@@ -489,7 +489,7 @@ fn missing_frozen_error(name: &Wtf8) -> crate::PyError {
 
 /// `set_frozen_error(FROZEN_INVALID)` — the frozen data was supplied by the
 /// caller but does not unmarshal.
-fn invalid_frozen_error(name: &Wtf8) -> crate::PyError {
+fn invalid_frozen_error(name: &Wtf8) -> pyre_interpreter::PyError {
     frozen_error(
         format!("Frozen object named {} is invalid", frozen_name_repr(name)),
         name,
@@ -507,28 +507,28 @@ fn bad_argument_type_name(obj: pyre_object::PyObjectRef) -> String {
 
 /// The receiver's type name, for argument-type error messages.
 fn type_name(obj: pyre_object::PyObjectRef) -> String {
-    match crate::typedef::r#type(obj) {
+    match pyre_interpreter::typedef::r#type(obj) {
         Some(tp) => unsafe { pyre_object::w_type_get_name(tp.as_ptr()) }.to_string(),
         None => "object".to_string(),
     }
 }
 
-fn frozen_source(entry: &FrozenModule) -> Result<(String, String), crate::PyError> {
+fn frozen_source(entry: &FrozenModule) -> Result<(String, String), pyre_interpreter::PyError> {
     match entry.source {
         FrozenSource::Literal(source) => Ok((source.to_owned(), "frozen_only".to_owned())),
         FrozenSource::Stdlib(relative) => {
             #[cfg(feature = "host_env")]
             {
-                let stdlib = crate::importing::detect_stdlib_path().ok_or_else(|| {
-                    crate::PyError::new(
-                        crate::PyErrorKind::ImportError,
+                let stdlib = pyre_interpreter::importing::detect_stdlib_path().ok_or_else(|| {
+                    pyre_interpreter::PyError::new(
+                        pyre_interpreter::PyErrorKind::ImportError,
                         format!("cannot resolve source for frozen module {:?}", entry.name),
                     )
                 })?;
                 let path = stdlib.join(relative);
-                let source = crate::importing::read_source_to_string(&path).map_err(|error| {
-                    crate::PyError::new(
-                        crate::PyErrorKind::ImportError,
+                let source = pyre_interpreter::importing::read_source_to_string(&path).map_err(|error| {
+                    pyre_interpreter::PyError::new(
+                        pyre_interpreter::PyErrorKind::ImportError,
                         format!("cannot read '{}': {error}", path.display()),
                     )
                 })?;
@@ -542,8 +542,8 @@ fn frozen_source(entry: &FrozenModule) -> Result<(String, String), crate::PyErro
             #[cfg(not(feature = "host_env"))]
             {
                 let _ = relative;
-                Err(crate::PyError::new(
-                    crate::PyErrorKind::ImportError,
+                Err(pyre_interpreter::PyError::new(
+                    pyre_interpreter::PyErrorKind::ImportError,
                     format!("cannot resolve source for frozen module {:?}", entry.name),
                 ))
             }
@@ -556,12 +556,12 @@ fn frozen_source(entry: &FrozenModule) -> Result<(String, String), crate::PyErro
 /// `_Py_ext_module_loader_info_init` encodes the name to ASCII because it has
 /// to build the `PyInit_<name>` symbol from it, so a name outside ASCII is
 /// rejected by the codec before the builtin registry is ever consulted.
-fn ascii_module_name(w_name: pyre_object::PyObjectRef) -> Result<String, crate::PyError> {
+fn ascii_module_name(w_name: pyre_object::PyObjectRef) -> Result<String, pyre_interpreter::PyError> {
     // Read straight off the buffer: reaching the name through `encode` would
     // run a `str` subclass's override, which decides which builtin is loaded.
     let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
     if let Some(pos) = name.code_points().position(|cp| cp.to_u32() > 127) {
-        return Err(crate::typedef::unicode_encode_error(
+        return Err(pyre_interpreter::typedef::unicode_encode_error(
             "ascii",
             w_name,
             pos as i64,
@@ -576,7 +576,7 @@ fn ascii_module_name(w_name: pyre_object::PyObjectRef) -> Result<String, crate::
 /// pre-marshalled bytes; pyre keeps the source and compiles it on demand, so
 /// both `get_frozen_object` and the `withdata` arm of `find_frozen` come
 /// through here and observe the same object.
-fn frozen_code(entry: &FrozenModule) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+fn frozen_code(entry: &FrozenModule) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
     let (source, code_name) = frozen_source(entry)?;
     // `_frozen_importlib._cached_compile`: recompiling the frozen sources (the
     // ~116 KB importlib bootstrap) on every startup is a large recurring cost,
@@ -590,15 +590,15 @@ fn frozen_code(entry: &FrozenModule) -> Result<pyre_object::PyObjectRef, crate::
         return Ok(code);
     }
     let filename = format!("<frozen {code_name}>");
-    let code = crate::compile::compile_source_with_filename(
+    let code = pyre_interpreter::compile::compile_source_with_filename(
         &source,
-        crate::compile::Mode::Exec,
+        pyre_interpreter::compile::Mode::Exec,
         &filename,
     )
     .map_err(|error| {
-        crate::builtins::compile_err_to_syntax_error(error, &source, crate::compile::Mode::Exec)
+        pyre_interpreter::builtins::compile_err_to_syntax_error(error, &source, pyre_interpreter::compile::Mode::Exec)
     })?;
-    let w_code = crate::box_code_object(code);
+    let w_code = pyre_interpreter::box_code_object(code);
     if let Some(key) = cache_key {
         // `frozen_cache_store` marshals `w_code`, which can allocate and collect;
         // keep the freshly boxed code reachable across that call.
@@ -619,18 +619,18 @@ pub(crate) const PYC_MAGIC_NUMBER_TOKEN: u32 = 0x0A0D_0E2B;
 /// code object.  Script execution deliberately shares the same magic token and
 /// marshal reader as `_imp`/importlib instead of growing a launcher-private
 /// bytecode format.
-pub(crate) fn load_pyc_script(bytes: &[u8]) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+pub(crate) fn load_pyc_script(bytes: &[u8]) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
     if bytes.get(..4) != Some(PYC_MAGIC_NUMBER_TOKEN.to_le_bytes().as_slice()) {
-        return Err(crate::PyError::runtime_error(
+        return Err(pyre_interpreter::PyError::runtime_error(
             "Bad magic number in .pyc file",
         ));
     }
     let Some(payload) = bytes.get(16..) else {
-        return Err(crate::PyError::runtime_error("Truncated .pyc file"));
+        return Err(pyre_interpreter::PyError::runtime_error("Truncated .pyc file"));
     };
     let w_code = crate::module::marshal::loads_bytes(payload)?;
-    if !unsafe { crate::is_code(w_code) } {
-        return Err(crate::PyError::runtime_error(
+    if !unsafe { pyre_interpreter::is_code(w_code) } {
+        return Err(pyre_interpreter::PyError::runtime_error(
             "Bad code object in .pyc file",
         ));
     }
@@ -666,7 +666,7 @@ fn frozen_cache_base() -> Option<&'static FrozenCacheBase> {
             .duration_since(std::time::UNIX_EPOCH)
             .ok()?
             .as_nanos() as u64;
-        let dir = crate::importing::detect_stdlib_path()?.join("__pycache__");
+        let dir = pyre_interpreter::importing::detect_stdlib_path()?.join("__pycache__");
         Some(FrozenCacheBase {
             dir,
             exe_name,
@@ -684,7 +684,7 @@ fn frozen_cache_base() -> Option<&'static FrozenCacheBase> {
 #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
 pub(crate) fn frozen_cache_path(cache_key: &str) -> Option<std::path::PathBuf> {
     let base = frozen_cache_base()?;
-    let optimize = crate::importing::optimize_flag();
+    let optimize = pyre_interpreter::importing::optimize_flag();
     let stem = cache_key.replace(['.', '/', '\\'], "_");
     Some(base.dir.join(format!(
         "frozen.{stem}.{}.opt-{optimize}.marshalcache",
@@ -715,7 +715,7 @@ pub(crate) fn frozen_cache_load(cache_key: &str, source: &str) -> Option<pyre_ob
         return None;
     }
     let code = crate::module::marshal::loads_bytes(bytes.get(src_end..)?).ok()?;
-    unsafe { crate::is_code(code) }.then_some(code)
+    unsafe { pyre_interpreter::is_code(code) }.then_some(code)
 }
 
 /// `_cached_compile` store half (best effort): write the marshalled code with
@@ -767,16 +767,16 @@ pub(crate) fn frozen_cache_store(_cache_key: &str, _source: &str, _code: pyre_ob
 /// The `data` element of a `withdata=True` `find_frozen` result: a read-only
 /// `memoryview` over the frozen bytes, so `marshal.loads(bytes(data))`
 /// reconstructs the same code object `get_frozen_object` returns.
-fn frozen_data(entry: &FrozenModule) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+fn frozen_data(entry: &FrozenModule) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
     let code = frozen_code(entry)?;
     let bytes = crate::module::marshal::dumps_bytes(code)?;
     let w_bytes = pyre_object::bytesobject::w_bytes_from_bytes(&bytes);
     let _roots = pyre_object::gc_roots::push_roots();
     let bytes_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_bytes);
-    let mv_type = crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE);
-    let Some(hooks) = crate::importing::optional_module_hooks() else {
-        return Err(crate::PyError::runtime_error("_pickle is not available"));
+    let mv_type = pyre_interpreter::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE);
+    let Some(hooks) = pyre_interpreter::importing::optional_module_hooks() else {
+        return Err(pyre_interpreter::PyError::runtime_error("_pickle is not available"));
     };
     (hooks.pickle_call_fn)(
         mv_type,
@@ -784,11 +784,11 @@ fn frozen_data(entry: &FrozenModule) -> Result<pyre_object::PyObjectRef, crate::
     )
 }
 
-pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
-    crate::module_ns_store(
+pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
+    pyre_interpreter::module_ns_store(
         ns,
         "is_builtin",
-        crate::make_builtin_function_with_arity(
+        pyre_interpreter::make_builtin_function_with_arity(
             "is_builtin",
             |args| {
                 if args.is_empty() {
@@ -828,10 +828,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             1,
         ),
     );
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "is_frozen",
-        crate::make_builtin_function_with_arity(
+        pyre_interpreter::make_builtin_function_with_arity(
             "is_frozen",
             |args| {
                 let name = frozen_name(args, "is_frozen")?;
@@ -842,10 +842,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             1,
         ),
     );
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "is_frozen_package",
-        crate::make_builtin_function_with_arity(
+        pyre_interpreter::make_builtin_function_with_arity(
             "is_frozen_package",
             |args| {
                 let name = frozen_name(args, "is_frozen_package")?;
@@ -856,10 +856,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             1,
         ),
     );
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "init_frozen",
-        crate::make_builtin_function_with_arity(
+        pyre_interpreter::make_builtin_function_with_arity(
             "init_frozen",
             // `import.c _imp_init_frozen_impl` — run the frozen module's code
             // in a fresh namespace registered under its name and hand the
@@ -875,14 +875,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // A frozen name is ASCII by construction (the table's keys),
                 // so the lossy view is the name itself.
                 let name = name.to_string_lossy().into_owned();
-                if let Some(module) = crate::importing::get_sys_module(&name) {
+                if let Some(module) = pyre_interpreter::importing::get_sys_module(&name) {
                     return Ok(module);
                 }
                 let code = frozen_code(entry)?;
                 let _roots = pyre_object::gc_roots::push_roots();
                 let code_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ = pyre_object::gc_roots::pin_root(code);
-                let ec = crate::call::getexecutioncontext();
+                let ec = pyre_interpreter::call::getexecutioncontext();
                 let w_globals = unsafe { &*ec }.fresh_module_globals();
                 let globals_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ = pyre_object::gc_roots::pin_root(w_globals);
@@ -934,15 +934,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // `set_sys_module` inserts into `sys.modules` and so allocates:
                 // publish the module from its rooted slot rather than from a
                 // pointer captured before the insert.
-                crate::importing::set_sys_module(
+                pyre_interpreter::importing::set_sys_module(
                     &name,
                     pyre_object::gc_roots::shadow_stack_get(module_slot),
                 );
-                if let Err(error) = crate::builtins::builtin_exec(&[
+                if let Err(error) = pyre_interpreter::builtins::builtin_exec(&[
                     pyre_object::gc_roots::shadow_stack_get(code_slot),
                     pyre_object::gc_roots::shadow_stack_get(globals_slot),
                 ]) {
-                    crate::importing::remove_sys_module(&name);
+                    pyre_interpreter::importing::remove_sys_module(&name);
                     return Err(error);
                 }
                 Ok(pyre_object::gc_roots::shadow_stack_get(module_slot))
@@ -950,10 +950,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             1,
         ),
     );
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "_frozen_module_names",
-        crate::make_builtin_function("_frozen_module_names", |_| {
+        pyre_interpreter::make_builtin_function("_frozen_module_names", |_| {
             let mut names = pyre_object::gc_roots::RootedItems::new();
             for entry in FROZEN_MODULES
                 .iter()
@@ -964,24 +964,24 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             Ok(pyre_object::w_list_new(names.take()))
         }),
     );
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "find_frozen",
         // `withdata` is keyword-only, so no call shape fills every parameter
         // positionally and there is no fixed natural arity to fast-path on.
-        crate::make_builtin_function("find_frozen", |args| {
-            let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            crate::builtins::kwarg_reject_unknown(kwargs, &["withdata"], "find_frozen")?;
+        pyre_interpreter::make_builtin_function("find_frozen", |args| {
+            let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
+            pyre_interpreter::builtins::kwarg_reject_unknown(kwargs, &["withdata"], "find_frozen")?;
             if positional.len() != 1 {
-                return Err(crate::PyError::type_error(format!(
+                return Err(pyre_interpreter::PyError::type_error(format!(
                     "find_frozen() takes exactly 1 positional argument ({} given)",
                     positional.len()
                 )));
             }
             let name = frozen_name(positional, "find_frozen")?;
             // `withdata: bool(accept={int})` — any object, read for truth.
-            let withdata = match crate::builtins::kwarg_get(kwargs, "withdata") {
-                Some(value) => crate::baseobjspace::is_true(value)?,
+            let withdata = match pyre_interpreter::builtins::kwarg_get(kwargs, "withdata") {
+                Some(value) => pyre_interpreter::baseobjspace::is_true(value)?,
                 None => false,
             };
             let Some(entry) = served_frozen_module(&name) else {
@@ -1008,21 +1008,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             ]))
         }),
     );
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "_override_frozen_modules_for_tests",
-        crate::make_builtin_function("_override_frozen_modules_for_tests", |args| {
+        pyre_interpreter::make_builtin_function("_override_frozen_modules_for_tests", |args| {
             let Some(&value) = args.first() else {
-                return Err(crate::PyError::type_error(
+                return Err(pyre_interpreter::PyError::type_error(
                     "_override_frozen_modules_for_tests expected at least 1 argument, got 0",
                 ));
             };
-            let value = crate::baseobjspace::gateway_int_w(value)?;
+            let value = pyre_interpreter::baseobjspace::gateway_int_w(value)?;
             FROZEN_OVERRIDE.store(value, Ordering::Relaxed);
             Ok(pyre_object::w_none())
         }),
     );
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "_override_multi_interp_extensions_check",
         // Overrides `PyInterpreterConfig.check_multi_interp_extensions` for a
@@ -1030,11 +1030,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // one interpreter, so every call takes the refusing arm — the override
         // has no state to keep.  The int conversion runs first, so a non-int
         // argument still reports the argument error rather than this one.
-        crate::make_builtin_function_with_arity(
+        pyre_interpreter::make_builtin_function_with_arity(
             "_override_multi_interp_extensions_check",
             |args| {
-                crate::baseobjspace::gateway_int_w(args[0])?;
-                Err(crate::PyError::runtime_error(
+                pyre_interpreter::baseobjspace::gateway_int_w(args[0])?;
+                Err(pyre_interpreter::PyError::runtime_error(
                     "_imp._override_multi_interp_extensions_check() cannot be used \
                      in the main interpreter",
                 ))
@@ -1042,21 +1042,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             1,
         ),
     );
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "get_frozen_object",
         // `data` is optional, so there is no fixed natural arity to fast-path
         // on; registering one would declare a call shape the closure does not
         // actually require.
-        crate::make_builtin_function("get_frozen_object", |args| {
-            let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            if crate::builtins::has_real_kwargs(kwargs) {
-                return Err(crate::PyError::type_error(
+        pyre_interpreter::make_builtin_function("get_frozen_object", |args| {
+            let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
+            if pyre_interpreter::builtins::has_real_kwargs(kwargs) {
+                return Err(pyre_interpreter::PyError::type_error(
                     "_imp.get_frozen_object() takes no keyword arguments",
                 ));
             }
             if positional.len() > 2 {
-                return Err(crate::PyError::type_error(format!(
+                return Err(pyre_interpreter::PyError::type_error(format!(
                     "get_frozen_object expected at most 2 arguments, got {}",
                     positional.len()
                 )));
@@ -1071,8 +1071,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 .copied()
                 .filter(|&data| !unsafe { pyre_object::is_none(data) });
             if let Some(data) = data {
-                let Some(buffer) = crate::typedef::buffer_as_bytes_like(data)? else {
-                    return Err(crate::PyError::type_error(format!(
+                let Some(buffer) = pyre_interpreter::typedef::buffer_as_bytes_like(data)? else {
+                    return Err(pyre_interpreter::PyError::type_error(format!(
                         "get_frozen_object() argument 2 must be bytes, not {}",
                         bad_argument_type_name(data)
                     )));
@@ -1082,8 +1082,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 let bytes = unsafe { pyre_object::bytesobject::bytes_like_data(buffer) }.to_vec();
                 let code = crate::module::marshal::loads_bytes(&bytes)
                     .map_err(|_| invalid_frozen_error(&name))?;
-                if !unsafe { crate::is_code(code) } {
-                    return Err(crate::PyError::type_error(format!(
+                if !unsafe { pyre_interpreter::is_code(code) } {
+                    return Err(pyre_interpreter::PyError::type_error(format!(
                         "frozen object {} is not a code object",
                         frozen_name_repr(&name)
                     )));
@@ -1094,69 +1094,69 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             frozen_code(entry)
         }),
     );
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "create_builtin",
-        crate::make_builtin_function_with_arity(
+        pyre_interpreter::make_builtin_function_with_arity(
             "create_builtin",
             |args| {
                 // `BuiltinImporter.create_module` passes the spec and expects the
                 // module back; `_load` then binds it in sys.modules. A name
                 // already imported keeps its module, so the machinery and a plain
                 // `import X` agree on one object.
-                let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-                if crate::builtins::has_real_kwargs(kwargs) {
-                    return Err(crate::PyError::type_error(
+                let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
+                if pyre_interpreter::builtins::has_real_kwargs(kwargs) {
+                    return Err(pyre_interpreter::PyError::type_error(
                         "_imp.create_builtin() takes no keyword arguments",
                     ));
                 }
                 if positional.len() != 1 {
-                    return Err(crate::PyError::type_error(format!(
+                    return Err(pyre_interpreter::PyError::type_error(format!(
                         "_imp.create_builtin() takes exactly one argument ({} given)",
                         positional.len()
                     )));
                 }
                 let spec = positional[0];
-                let w_name = crate::baseobjspace::getattr_str(spec, "name")?;
+                let w_name = pyre_interpreter::baseobjspace::getattr_str(spec, "name")?;
                 if !unsafe { pyre_object::is_str(w_name) } {
-                    return Err(crate::PyError::type_error(format!(
+                    return Err(pyre_interpreter::PyError::type_error(format!(
                         "name must be string, not {}",
                         type_name(w_name)
                     )));
                 }
                 let name = ascii_module_name(w_name)?;
                 if name.as_bytes().contains(&0) {
-                    return Err(crate::PyError::value_error("embedded null character"));
+                    return Err(pyre_interpreter::PyError::value_error("embedded null character"));
                 }
-                if let Some(module) = crate::importing::get_sys_module(&name) {
+                if let Some(module) = pyre_interpreter::importing::get_sys_module(&name) {
                     return Ok(module);
                 }
                 // A name that is spelled correctly but names no builtin is
                 // reported by returning None, leaving the diagnostic to
                 // `BuiltinImporter.create_module`, which has already screened
                 // the name against `sys.builtin_module_names`.
-                Ok(crate::importing::create_builtin_module(
+                Ok(pyre_interpreter::importing::create_builtin_module(
                     &name,
-                    crate::call::getexecutioncontext(),
+                    pyre_interpreter::call::getexecutioncontext(),
                 )?
                 .unwrap_or_else(pyre_object::w_none))
             },
             1,
         ),
     );
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "exec_builtin",
-        crate::make_builtin_function_with_arity(
+        pyre_interpreter::make_builtin_function_with_arity(
             "exec_builtin",
             |_| Ok(pyre_object::w_int_new(0)),
             1,
         ),
     );
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "exec_dynamic",
-        crate::make_builtin_function_with_arity(
+        pyre_interpreter::make_builtin_function_with_arity(
             "exec_dynamic",
             |_args| {
                 #[cfg(all(
@@ -1165,7 +1165,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     any(target_os = "macos", target_os = "linux")
                 ))]
                 {
-                    crate::cpyext::exec_dynamic(_args[0])
+                    pyre_interpreter::cpyext::exec_dynamic(_args[0])
                 }
                 #[cfg(not(all(
                     feature = "cpyext",
@@ -1177,7 +1177,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             1,
         ),
     );
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "create_dynamic",
         // interp_imp.py create_dynamic. Without the `cpyext` feature this is
@@ -1187,7 +1187,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // `_imp_create_dynamic_impl`. Raising ImportError (rather than being
         // absent) matches the meta-path `hasattr` probe while still letting
         // `except ImportError` fall back to a pure-Python module.
-        crate::make_builtin_function_with_signature(
+        pyre_interpreter::make_builtin_function_with_signature(
             "create_dynamic",
             |args| {
                 // `file` is bound and dropped: the loader opens the library by
@@ -1195,7 +1195,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // it is what keeps a two-argument call from being rejected.
                 let spec = args.first().copied().unwrap_or(pyre_object::PY_NULL);
                 if spec.is_null() {
-                    return Err(crate::PyError::type_error(
+                    return Err(pyre_interpreter::PyError::type_error(
                         "create_dynamic() missing required argument 'spec'",
                     ));
                 }
@@ -1205,7 +1205,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     any(target_os = "macos", target_os = "linux")
                 ))]
                 {
-                    crate::cpyext::create_dynamic(spec)
+                    pyre_interpreter::cpyext::create_dynamic(spec)
                 }
                 #[cfg(not(all(
                     feature = "cpyext",
@@ -1213,25 +1213,25 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     any(target_os = "macos", target_os = "linux")
                 )))]
                 {
-                    crate::baseobjspace::text0_wtf8_w(crate::baseobjspace::getattr_str(
+                    pyre_interpreter::baseobjspace::text0_wtf8_w(pyre_interpreter::baseobjspace::getattr_str(
                         spec, "name",
                     )?)?;
-                    crate::baseobjspace::text0_wtf8_w(crate::baseobjspace::getattr_str(
+                    pyre_interpreter::baseobjspace::text0_wtf8_w(pyre_interpreter::baseobjspace::getattr_str(
                         spec, "origin",
                     )?)?;
-                    Err(crate::PyError::new(
-                        crate::PyErrorKind::ImportError,
+                    Err(pyre_interpreter::PyError::new(
+                        pyre_interpreter::PyErrorKind::ImportError,
                         "Not implemented".to_string(),
                     ))
                 }
             },
-            crate::Signature::new(vec!["spec", "file"], None, None, 0, 0),
+            pyre_interpreter::Signature::new(vec!["spec", "file"], None, None, 0, 0),
         ),
     );
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "acquire_lock",
-        crate::make_builtin_function_with_arity(
+        pyre_interpreter::make_builtin_function_with_arity(
             "acquire_lock",
             |_| {
                 acquire_lock();
@@ -1240,10 +1240,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             0,
         ),
     );
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "release_lock",
-        crate::make_builtin_function_with_arity(
+        pyre_interpreter::make_builtin_function_with_arity(
             "release_lock",
             |_| {
                 release_lock()?;
@@ -1252,47 +1252,47 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             0,
         ),
     );
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "lock_held",
-        crate::make_builtin_function_with_arity(
+        pyre_interpreter::make_builtin_function_with_arity(
             "lock_held",
             |_| Ok(pyre_object::w_bool_from(lock_held())),
             0,
         ),
     );
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "_fix_co_filename",
         // interp_imp.py fix_co_filename(code, pathname).
-        crate::make_builtin_function_with_arity(
+        pyre_interpreter::make_builtin_function_with_arity(
             "_fix_co_filename",
             |args| {
-                if !unsafe { crate::is_code(args[0]) } {
-                    return Err(crate::PyError::type_error(format!(
+                if !unsafe { pyre_interpreter::is_code(args[0]) } {
+                    return Err(pyre_interpreter::PyError::type_error(format!(
                         "_fix_co_filename() argument 1 must be code, not {}",
                         type_name(args[0])
                     )));
                 }
                 if !unsafe { pyre_object::is_str(args[1]) } {
-                    return Err(crate::PyError::type_error(format!(
+                    return Err(pyre_interpreter::PyError::type_error(format!(
                         "_fix_co_filename() argument 2 must be str, not {}",
                         type_name(args[1])
                     )));
                 }
                 // `interp_imp.py pathname='fsencode'`: preserve the raw
                 // filesystem spelling before storing it on the code object.
-                let newname = crate::gateway::fsencode_bytes_w(args[1])?;
-                unsafe { crate::pycode::fix_co_filename(args[0], &newname) };
+                let newname = pyre_interpreter::gateway::fsencode_bytes_w(args[1])?;
+                unsafe { pyre_interpreter::pycode::fix_co_filename(args[0], &newname) };
                 Ok(pyre_object::w_none())
             },
             2,
         ),
     );
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "extension_suffixes",
-        crate::make_builtin_function_with_arity(
+        pyre_interpreter::make_builtin_function_with_arity(
             "extension_suffixes",
             |_| {
                 #[cfg(all(
@@ -1303,7 +1303,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 {
                     let _roots = pyre_object::gc_roots::push_roots();
                     let native = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(
-                        crate::cpyext::extension_suffix(),
+                        pyre_interpreter::cpyext::extension_suffix(),
                     ));
                     // interp_imp.py `extension_suffixes`: after the native
                     // suffix, advertise `.abi3.so` so a 3.12+ limited-API
@@ -1325,21 +1325,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             0,
         ),
     );
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "get_tag",
         // PyPy `interp_imp.py:get_tag`: the cache tag for .pyc files.  Keep
         // this identical to sys.implementation.cache_tag.
-        crate::make_builtin_function_with_arity(
+        pyre_interpreter::make_builtin_function_with_arity(
             "get_tag",
             |_| Ok(pyre_object::w_str_new("pyre314")),
             0,
         ),
     );
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "source_hash",
-        crate::make_builtin_function_with_arity(
+        pyre_interpreter::make_builtin_function_with_arity(
             "source_hash",
             |args| {
                 // `_imp_source_hash_impl` hashes the source bytes with
@@ -1350,13 +1350,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // carries the 3.14 magic number, so the digest has to agree
                 // with the one that format specifies.
                 use std::hash::Hasher;
-                let magic = crate::baseobjspace::int_w(args[0])? as u64;
+                let magic = pyre_interpreter::baseobjspace::int_w(args[0])? as u64;
                 let content = if unsafe { pyre_object::bytesobject::is_bytes_like(args[1]) } {
                     unsafe { pyre_object::bytesobject::bytes_like_data(args[1]) }.to_vec()
-                } else if let Some(src) = crate::typedef::buffer_as_bytes_like(args[1])? {
+                } else if let Some(src) = pyre_interpreter::typedef::buffer_as_bytes_like(args[1])? {
                     unsafe { pyre_object::bytesobject::bytes_like_data(src) }.to_vec()
                 } else {
-                    return Err(crate::PyError::type_error(
+                    return Err(pyre_interpreter::PyError::type_error(
                         "source_hash() argument 2 must be a bytes-like object",
                     ));
                 };
@@ -1369,7 +1369,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             2,
         ),
     );
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "check_hash_based_pycs",
         pyre_object::w_str_new("default"),
@@ -1377,7 +1377,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // `MAGIC_NUMBER = _imp.pyc_magic_number_token.to_bytes(4, 'little')`
     // (_bootstrap_external.py).  Cache files are already segregated by
     // `sys.implementation.cache_tag`.
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "pyc_magic_number_token",
         pyre_object::w_int_new(i64::from(PYC_MAGIC_NUMBER_TOKEN)),

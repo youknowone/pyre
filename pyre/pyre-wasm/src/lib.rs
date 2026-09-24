@@ -273,7 +273,7 @@ mod residual_host {
 // the same way it asks for module source.
 #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
 mod host_clock {
-    use pyre_interpreter::module::time::interp_time::ClockProvider;
+    use pyre_module::module::time::interp_time::ClockProvider;
 
     #[link(wasm_import_module = "pyre_host")]
     unsafe extern "C" {
@@ -304,7 +304,7 @@ mod host_clock {
     }
 
     pub fn install() {
-        pyre_interpreter::module::time::interp_time::install_clock_provider(std::sync::Arc::new(
+        pyre_module::module::time::interp_time::install_clock_provider(std::sync::Arc::new(
             HostClock,
         ));
     }
@@ -315,7 +315,7 @@ mod host_clock {
 // `datetime.date.today()` is always 1970-01-01.
 #[cfg(all(target_arch = "wasm32", feature = "web"))]
 mod web_clock {
-    use pyre_interpreter::module::time::interp_time::ClockProvider;
+    use pyre_module::module::time::interp_time::ClockProvider;
     use wasm_bindgen::prelude::*;
 
     #[wasm_bindgen]
@@ -342,7 +342,7 @@ mod web_clock {
     }
 
     pub fn install() {
-        pyre_interpreter::module::time::interp_time::install_clock_provider(std::sync::Arc::new(
+        pyre_module::module::time::interp_time::install_clock_provider(std::sync::Arc::new(
             WebClock,
         ));
     }

@@ -26083,7 +26083,7 @@ pub(crate) fn charp2uni_wtf8(data: &[u8]) -> Wtf8Buf {
         .expect("surrogateescape rescues every byte, so the decode never fails")
 }
 
-pub(crate) fn charp2uni(data: &[u8]) -> PyObjectRef {
+pub fn charp2uni(data: &[u8]) -> PyObjectRef {
     pyre_object::w_str_from_wtf8_managed(charp2uni_wtf8(data))
 }
 

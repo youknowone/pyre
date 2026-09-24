@@ -1540,7 +1540,7 @@ unsafe fn set_filename_bytes(obj: PyObjectRef, bytes: Option<Vec<u8>>) {
 ///
 /// A null slot means every opcode is representable by compiler-core and its
 /// canonical `original_bytes()` is authoritative.
-pub(crate) unsafe fn set_co_code_bytes(obj: PyObjectRef, bytes: Option<Vec<u8>>) {
+pub unsafe fn set_co_code_bytes(obj: PyObjectRef, bytes: Option<Vec<u8>>) {
     let slot = unsafe { &mut (*(obj as *mut PyCode)).co_code_bytes };
     if let Some(bytes) = bytes {
         if slot.is_null() {
@@ -1558,7 +1558,7 @@ pub(crate) unsafe fn set_co_code_bytes(obj: PyObjectRef, bytes: Option<Vec<u8>>)
 ///
 /// # Safety
 /// `w_code` must point to a live [`PyCode`].
-pub(crate) unsafe fn code_bytes(w_code: PyObjectRef) -> Vec<u8> {
+pub unsafe fn code_bytes(w_code: PyObjectRef) -> Vec<u8> {
     let pycode = unsafe { &*(w_code as *const PyCode) };
     if pycode.co_code_bytes.is_null() {
         let code = unsafe { &*(pycode.code_ptr as *const crate::CodeObject) };
@@ -1704,7 +1704,7 @@ fn publish_code_slot_store_rooting(obj: PyObjectRef, children: &[PyObjectRef]) -
 /// arrive as decoded objects rather than as a tuple. PyPy's marshal reader
 /// passes the complete wrapped list to `PyCode.__init__`; replace every eager
 /// compiler-boundary placeholder with that authoritative decoded object.
-pub(crate) unsafe fn w_code_fill_wrapped_consts(obj: PyObjectRef, constants: &[PyObjectRef]) {
+pub unsafe fn w_code_fill_wrapped_consts(obj: PyObjectRef, constants: &[PyObjectRef]) {
     let code = unsafe { &*(obj as *const PyCode) };
     if code.co_consts_w.is_null() {
         return;
@@ -3015,7 +3015,7 @@ unsafe fn read_code_units(
 /// The marshal runtime bag calls this same boundary, so `CodeType`,
 /// `code.replace` and marshal loading cannot disagree about which bytes are
 /// deferred to dispatch as `Instruction::Reserved`.
-pub(crate) fn decode_code_units(
+pub fn decode_code_units(
     bytes: &[u8],
 ) -> Result<(crate::bytecode::CodeUnits, Option<Vec<u8>>), ()> {
     if bytes.len() % 2 != 0 {
@@ -3075,7 +3075,7 @@ unsafe fn read_code_consts(
 /// represent it.  Callers that need a literal compiler constant propagate the
 /// `ValueError`; `read_code_consts` instead supplies a shape placeholder and
 /// retains the arbitrary object in PyPy's authoritative `co_consts_w` slot.
-pub(crate) unsafe fn obj_to_constant_data(
+pub unsafe fn obj_to_constant_data(
     obj: PyObjectRef,
 ) -> Result<crate::bytecode::ConstantData, crate::PyError> {
     use crate::bytecode::ConstantData;
