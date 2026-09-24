@@ -2063,35 +2063,22 @@ const CALL_ASSEMBLER_OUTCOME_DEADFRAME: i64 = 1;
 /// to completion, returning the result as an i64.
 static CALL_ASSEMBLER_FORCE_FN: OnceLock<extern "C" fn(i64) -> i64> = OnceLock::new();
 
-/// `compile.py:710-716 resume_in_blackhole(descr, deadframe)` parity:
+/// `compile.py resume_in_blackhole(descr, deadframe)` parity:
 /// callback to resume execution from the guard failure point using the
-/// blackhole interpreter.  Args: `(descr_addr, rebuilt_values_ptr,
-/// num_rebuilt, raw_deadframe_ptr, num_raw, guard_exc, savedata)` →
+/// blackhole interpreter.  Args: `(descr_addr, deadframe)` →
 /// `Option<result>`.  The receiver recovers the failed descr from
 /// `descr_addr` via `Backend::fail_descr_arc_from_addr`
-/// (`history.py:125` `cpu.get_latest_descr` parity) and derives
+/// (`history.py` `cpu.get_latest_descr`) and derives
 /// green_key / trace_id / fail_index from the descr identity
 /// (`descr_owning_jct`).  No surrogate triple crosses the C-ABI.
-///
-/// `guard_exc` is `cpu.grab_exc_value(deadframe)` (`llmodel.py`):
-/// the pending exception the `must_save_exception` failure-recovery
-/// stub staged into `jf_guard_exc`, handed to the blackhole resume per
-/// `blackhole.py _prepare_resume_from_failure`.  `0` = no pending
-/// exception.
-///
-/// `savedata` is `cpu.get_savedata_ref(deadframe)` (`llmodel.py`): the
-/// `jf_savedata` AllVirtuals cache a `GUARD_NOT_FORCED` force already
-/// materialized.  `0` = no cache.
-type CallAssemblerBlackholeFn =
-    fn(usize, *mut majit_backend::jitframe::JitFrame, i64) -> Option<i64>;
+/// The pending exception stays in `jf_guard_exc`; the receiver reads it
+/// with `cpu.grab_exc_value` (`llmodel.py`).
+type CallAssemblerBlackholeFn = fn(usize, *mut majit_backend::jitframe::JitFrame) -> Option<i64>;
 static CALL_ASSEMBLER_BLACKHOLE_FN: OnceLock<CallAssemblerBlackholeFn> = OnceLock::new();
 
 /// Register a blackhole callback for call_assembler guard failure resume.
-/// The last two arguments are `cpu.grab_exc_value(deadframe)` (`i64`) and
-/// `cpu.get_savedata_ref(deadframe)` (`usize`): the callee's `jf_guard_exc`
-/// and `jf_savedata` slots, forwarded so the blackhole resume can seed
-/// `_prepare_resume_from_failure` (blackhole.py) and reuse a
-/// `GUARD_NOT_FORCED` AllVirtuals cache.
+/// The receiver reads `jf_guard_exc` (`cpu.grab_exc_value`, llmodel.py)
+/// to seed `_prepare_resume_from_failure` (blackhole.py).
 pub fn register_call_assembler_blackhole(f: CallAssemblerBlackholeFn) {
     let _ = CALL_ASSEMBLER_BLACKHOLE_FN.set(f);
 }
@@ -2925,13 +2912,10 @@ fn call_assembler_finish_or_blackhole_deadframe(frame: DeadFrame) -> Option<i64>
         return finish_result_from_deadframe(&frame).ok();
     }
 
-    let guard_exc = grab_exc_value_from_deadframe(&frame)
-        .map(|g| g.0 as i64)
-        .unwrap_or(0);
     let blackhole = CALL_ASSEMBLER_BLACKHOLE_FN.get()?;
     let cell = majit_ir::FailDescrCell::wrap(fail_descr_arc);
     let descr_addr = majit_ir::FailDescrCell::thin_ptr(&cell);
-    let result = blackhole(descr_addr, frame_ptr, guard_exc);
+    let result = blackhole(descr_addr, frame_ptr);
     drop(cell);
     result
 }
@@ -3105,22 +3089,9 @@ pub fn grab_exc_value_from_deadframe(frame: &DeadFrame) -> Result<GcRef, Backend
     Ok(jf.grab_exc_value())
 }
 
-/// `cpu.grab_exc_value(deadframe)` (llmodel.py) for a raw JitFrame
-/// address: read `jf_guard_exc` without clearing, matching
-/// `JitFrameDeadFrame::grab_exc_value`.  Returns 0 when the guard exit
-/// stored no exception (the common non-`GUARD_EXCEPTION` case).
-#[inline]
-fn grab_exc_value_from_jf_ptr(jf_ptr: usize) -> i64 {
-    if jf_ptr == 0 {
-        return 0;
-    }
-    unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *const usize) as i64 }
-}
-
 /// `cpu.get_savedata_ref(deadframe)` for the raw JITFRAME handed to the
-/// CALL_ASSEMBLER guard helper.  Unlike [`grab_exc_value_from_jf_ptr`], this
-/// field is not consumed: `ResumeGuardForcedDescr.handle_fail` reveals it
-/// during the immediately following blackhole resume.
+/// CALL_ASSEMBLER guard helper.  `ResumeGuardForcedDescr.handle_fail`
+/// reveals it during the immediately following blackhole resume.
 #[inline]
 #[allow(dead_code)] // cpu.get_savedata_ref
 fn get_savedata_from_jf_ptr(jf_ptr: usize) -> usize {
@@ -3844,11 +3815,9 @@ fn call_assembler_guard_failure_inner(
     // (call_jit.rs), which previously drove the force_fn fallback
     // into garbage-frame territory.
     if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
-        let guard_exc = grab_exc_value_from_jf_ptr(frame_ptr as usize);
         if let Some(result) = bh_fn(
             fail_descr_ptr as usize,
             frame_ptr as *mut majit_backend::jitframe::JitFrame,
-            guard_exc,
         ) {
             // warmspot.py:988-996: DoneWithThisFrame{Int,Ref,Float} returns
             // e.result as-is. warmspot.py:982: ContinueRunningNormally
@@ -3995,14 +3964,11 @@ fn call_assembler_shim_inner(
                 target.fail_descrs.len()
             );
         };
-        let guard_exc = grab_exc_value_from_deadframe(&frame)
-            .map(|g| g.0 as i64)
-            .unwrap_or(0);
         let frame_ptr = frame
             .as_jitframe()
             .map(|jf| jf.jf_gcref().0 as *mut majit_backend::jitframe::JitFrame)
             .unwrap_or(std::ptr::null_mut());
-        if let Some(result) = bh_fn(descr_addr, frame_ptr, guard_exc) {
+        if let Some(result) = bh_fn(descr_addr, frame_ptr) {
             unsafe {
                 *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
                 *outcome.add(1) = 0;

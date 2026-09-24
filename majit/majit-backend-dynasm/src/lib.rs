@@ -193,30 +193,25 @@ pub(crate) fn jit_threadlocalref_base() -> *const i64 {
 
 use std::sync::OnceLock;
 
-/// Blackhole resume: (descr_addr, raw_values, len, typed_outputs,
-/// typed_len, guard_exc) → Option<result>.
+/// Blackhole resume: (descr_addr, deadframe) → Option<result>.
 ///
 /// The receiving handler recovers the failed descr from `descr_addr`
 /// via `Backend::fail_descr_arc_from_addr` (`history.py:125`
 /// `cpu.get_latest_descr` parity) and derives the resume identity
 /// (`jct.green_key` / `descr.trace_id()` /
 /// `descr.fail_index_per_trace()`) from that Arc, mirroring
-/// `compile.py:710-716 resume_in_blackhole(descr, deadframe)` where
-/// the descr is the sole identity carrier.  No surrogate triple
-/// crosses the C-ABI.
+/// `compile.py resume_in_blackhole(descr, deadframe)` where the descr
+/// is the sole identity carrier.  No surrogate triple crosses the C-ABI.
 ///
-/// `guard_exc` is `cpu.grab_exc_value(deadframe)` (`llmodel.py`):
-/// the pending exception the `must_save_exception` failure-recovery
-/// stub staged into `jf_guard_exc`, read off the jitframe before it is
-/// freed.  The grab itself does not write the slot upstream — clearing
-/// `jf_guard_exc` is emitted code's job (`_restore_exception`,
-/// x86/assembler.py).  `blackhole.py
-/// _prepare_resume_from_failure` hands it to the resumed frame so an
-/// exception guard unwinds into its handler instead of resuming the
-/// no-exception continuation.  `0` = no pending exception.
-/// `compile.py resume_in_blackhole(descr, deadframe)`:
-/// descr address plus the jitframe. Values stay in `jf_frame[]`.
-pub type BlackholeFn = fn(usize, *mut jitframe::JitFrame, i64) -> Option<i64>;
+/// The pending exception stays in `jf_guard_exc`. The receiver reads it
+/// with `cpu.grab_exc_value(deadframe)` (`llmodel.py`); the grab does
+/// not write the slot. Clearing `jf_guard_exc` is emitted code's job
+/// (`_restore_exception`, x86/assembler.py) and a fresh frame's job
+/// (`execute_token` / `malloc_jitframe`). `blackhole.py
+/// _prepare_resume_from_failure` hands that read to the resumed frame.
+/// `compile.py resume_in_blackhole(descr, deadframe)`: descr address
+/// plus the jitframe. Values stay in `jf_frame[]`.
+pub type BlackholeFn = fn(usize, *mut jitframe::JitFrame) -> Option<i64>;
 
 /// Bridge compilation: raw values, descr identity, and optional GUARD_VALUE
 /// operand → compiled?
@@ -391,20 +386,6 @@ pub fn stack_check_addresses() -> Option<StackCheckAddresses> {
 /// Output: the int interpretation of the handled result (the caller
 ///         re-casts to the portal's return type).
 ///
-/// Removes a `gc_add_root` registration on every exit path.
-///
-/// The rooted cell is a local of the trampoline below, and the hooks it calls
-/// trace, compile and run Python — any of which can unwind. An unwind past a
-/// bare `gc_remove_root` frees the cell while the registration still names it,
-/// leaving the collector writing through freed stack.
-struct GcRootScope(*mut majit_ir::GcRef);
-
-impl Drop for GcRootScope {
-    fn drop(&mut self) {
-        majit_gc::gc_remove_root(self.0);
-    }
-}
-
 /// The callee jitframe is GC-managed by the rewriter's
 /// `handle_call_assembler` path, so the helper must not free it here.
 #[expect(
@@ -678,65 +659,33 @@ fn handle_fail_resume_guard(
     // `debug_assert_eq!(source_jct.green_key, green_key)` (pyjitpl.rs).
     let owning_jct = majit_backend::descr_owning_jct(descr);
 
-    // llmodel.py `grab_exc_value(deadframe)`: read `jf_guard_exc`
-    // while the jitframe is still alive.  The `must_save_exception`
-    // failure-recovery stub (GUARD_EXCEPTION / GUARD_NO_EXCEPTION /
-    // GUARD_NOT_FORCED) staged `pos_exc_value` here; non-exception guards
-    // leave it null.
-    //
-    // The grab is read-only (`llmodel.py` `grab_exc_value` returns the
-    // field and does not store). The bridge hook re-reads the slot
-    // (`jit_ca_handle_guard_failure`; `BridgeFn` does not carry the
-    // exception), so the slot stays set across that call and is cleared
-    // after it returns. Clearing it before that read traces an
-    // exception-guard bridge as the no-exception continuation
-    // (`pyjitpl.py` `prepare_resume_from_failure` null arm). The rooted
-    // local is the carrier for the blackhole arm.
-    //
-    // The slot stays the jitframe root across the bridge hook. The local
-    // is an additional root for the blackhole that runs after the slot is
-    // cleared — the hook can allocate, and a bare `usize` is not a GC root.
-    let mut guard_exc_root = majit_ir::GcRef(unsafe { (*frame_ptr).jf_guard_exc });
-    // The blackhole receiver parks this same value in the metainterp's raw
-    // guard-exception carrier as soon as it is entered, so across the
-    // `blackhole` call below the value is rooted twice over. Collapsing the
-    // pair onto the park alone is not reachable from here: this crate does not
-    // depend on `majit-metainterp`, and `BridgeFn` does not carry the
-    // exception, so the bridge hook cannot park a value it never receives.
-    let _guard_exc_scope = (guard_exc_root.0 != 0).then(|| {
-        let slot = &mut guard_exc_root as *mut majit_ir::GcRef;
-        unsafe { majit_gc::gc_add_root(slot) };
-        GcRootScope(slot)
-    });
+    // `jf_guard_exc` stays where the failure stub wrote it. `grab_exc_value`
+    // (`llmodel.py`) only reads the field. The slot is a GCREF visited by
+    // `jitframe_trace` for the whole helper: the callee frame is still the
+    // rewriter's live frame, so the exception stays rooted across the bridge
+    // hook without a second root. `_restore_exception` (x86/assembler.py)
+    // clears the slot when emitted code moves the value back to
+    // `pos_exc_value`; a later execution starts from `malloc_jitframe` /
+    // `alloc_off_gc_jitframe`, which zeroes the fixed header.
 
     // compile.py `if must_compile and not stack_almost_full`.
     // Fail args stay in `jf_frame[]` (`llmodel.py get_int_value`).
     if let (Some(_jct), Some(bridge_fn)) = (owning_jct.as_ref(), CA_BRIDGE_FN.get()) {
-        if guard_exc_root.0 != 0 {
-            unsafe { (*frame_ptr).jf_guard_exc = guard_exc_root.0 };
-        }
         let bridged = bridge_fn(
             frame_ptr,
             descr_raw,
             guard_value_operand.unwrap_or(0),
             guard_value_operand.is_some(),
         );
-        // Consumed by the bridge hook's re-read. Drop it so a later
-        // non-exception guard on this frame does not observe it
-        // (`pyjitpl.py` `_prepare_exception_resumption` asserts no
-        // exception on that flavor). The blackhole arm below consumes
-        // `guard_exc_root`, not the slot.
-        unsafe { (*frame_ptr).jf_guard_exc = 0 };
         if let Some(result) = bridged {
             return result;
         }
     }
-    unsafe { (*frame_ptr).jf_guard_exc = 0 };
 
     // compile.py `else: resume_in_blackhole(descr, deadframe)`.
+    // The receiver reads `jf_guard_exc` (`grab_exc_value`).
     let blackhole = CA_BLACKHOLE_FN.get();
-    let bh_result =
-        blackhole.and_then(|blackhole| blackhole(descr_raw, frame_ptr, guard_exc_root.0 as i64));
+    let bh_result = blackhole.and_then(|blackhole| blackhole(descr_raw, frame_ptr));
     if let Some(bh_result) = bh_result {
         if majit_log_enabled() {
             eprintln!(
@@ -748,7 +697,7 @@ fn handle_fail_resume_guard(
     if majit_log_enabled() {
         eprintln!(
             "[dynasm][ca-helper] resume-guard trace_id={trace_id} fail_index={fail_index} fell through to 0 descr=0x{descr_raw:x} frame={frame_ptr:p} guard_exc=0x{:x}",
-            guard_exc_root.0
+            unsafe { (*frame_ptr).jf_guard_exc }
         );
     }
     // `assert 0, "unreachable"` upstream — pyre returns 0 when neither
@@ -761,8 +710,9 @@ fn handle_fail_resume_guard(
     // (stack overflow) in place. A registered blackhole that answered
     // `None` bailed to the interpreter after delivering the exception to
     // a handler, so there is nothing left to raise.
-    if blackhole.is_none() && guard_exc_root.0 != 0 && !jit_exc_is_pending() {
-        jit_exc_raise(guard_exc_root.0 as i64);
+    let guard_exc = unsafe { (*frame_ptr).jf_guard_exc };
+    if blackhole.is_none() && guard_exc != 0 && !jit_exc_is_pending() {
+        jit_exc_raise(guard_exc as i64);
     }
     0
 }
