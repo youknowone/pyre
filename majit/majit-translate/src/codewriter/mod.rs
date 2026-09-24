@@ -32,7 +32,7 @@ pub mod heaptracker;
 // Local Rust boundary for the stable byte table derived from
 // `assembler.py:Assembler.insns`; pyre serializes bytecode across build
 // and runtime, so the dynamic upstream table is materialized here.
-pub mod insns;
+pub use majit_jitcode::codewriter::insns;
 // `l[start:]` for the rich-`OpKind` spine — mints `ll_listslice_startonly`.
 pub mod getslice;
 // `core::cmp::{min,max}` for the rich-`OpKind` spine — mints `ll_min` / `ll_max`.

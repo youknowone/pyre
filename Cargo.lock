@@ -2036,14 +2036,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "majit-jitcode"
+version = "0.0.2"
+dependencies = [
+ "indexmap",
+ "rustc-hash",
+]
+
+[[package]]
 name = "majit-macros"
 version = "0.0.2"
 dependencies = [
  "ctor",
  "linkme",
  "majit-ir",
+ "majit-jitcode",
  "majit-metainterp",
- "majit-translate",
  "proc-macro2",
  "quote",
  "syn",
@@ -2115,6 +2123,7 @@ dependencies = [
  "libc",
  "majit-charon-reader",
  "majit-ir",
+ "majit-jitcode",
  "md-5 0.10.6",
  "parking_lot",
  "proc-macro2",

@@ -28,6 +28,7 @@ serde_json = { workspace = true }
 indexmap = { workspace = true }
 rustc-hash = { workspace = true }
 majit-ir = { workspace = true }
+majit-jitcode = { workspace = true }
 libc = { workspace = true }
 # PRE-EXISTING-ADAPTATION, parity rule #1.
 #
