@@ -2289,34 +2289,22 @@ unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         // `__index__` may have appended to or truncated this very list, and
         // the bounds are clamped against what it holds now.
         let len = w_list_len(obj) as i64;
-        let (start, _stop, step, slicelength) =
+        let (start, stop, step, slicelength) =
             crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
-        // BaseRangeListStrategy.getslice materialises the receiver before
-        // delegating to IntegerListStrategy, even though slicing is otherwise
-        // a read-only operation.
-        obj = pyre_object::listobject::w_list_materialize_range(obj);
-        // Boxing a Range/Integer/Float element allocates, and so does
-        // `w_list_new`, so pin the receiver and each fetched item on one
-        // bracket before the constructor.
-        let _item_roots = pyre_object::gc_roots::push_roots();
-        let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
-        let items_base = pyre_object::gc_roots::shadow_stack_len();
-        let mut fetched = 0usize;
-        let mut i = start;
-        for n in 0..slicelength {
-            if let Some(v) = w_list_getitem(pyre_object::gc_roots::shadow_stack_get(obj_slot), i) {
-                let _ = pyre_object::gc_roots::pin_root(v);
-                fetched += 1;
-            }
-            if n + 1 < slicelength {
-                i += step;
-            }
+        // `W_ListObject.descr_getitem`: an empty slice is `make_empty_list`
+        // before `getslice`. The length is already the post-`__index__` value.
+        if slicelength == 0 {
+            return Ok(w_list_new(Vec::new()));
         }
-        let mut items = Vec::with_capacity(fetched);
-        for j in 0..fetched {
-            items.push(pyre_object::gc_roots::shadow_stack_get(items_base + j));
-        }
-        return Ok(w_list_new(items));
+        // `W_ListObject.getslice` → `strategy.getslice`. Range strategies
+        // materialise inside that call (`BaseRangeListStrategy.getslice`).
+        return Ok(pyre_object::listobject::w_list_getslice(
+            obj,
+            start,
+            stop,
+            step,
+            slicelength,
+        ));
     }
     // `descr_getitem`: getindex_w(index, IndexError, "list") coerces a
     // non-slice key through `__index__`.  The coercion is inlined rather
