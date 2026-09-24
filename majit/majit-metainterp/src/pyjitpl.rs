@@ -6847,6 +6847,9 @@ impl<M: Clone> MetaInterp<M> {
         let vinfo = self.virtualizable_info().cloned();
         let last_exc_value = self.last_exc_value;
         self.stage_abort_reason(reason);
+        // This is the runner: `convert_and_run_from_pyjitpl` below consumes
+        // `self.framestack`, so `abort_trace` must not stage it for another.
+        self.interpret_framestack_for_abort = false;
         self.abort_trace(false);
         builder.set_cpu(self.blackhole_cpu());
         let result = crate::jitdriver::drive_multi_frame_blackhole(
