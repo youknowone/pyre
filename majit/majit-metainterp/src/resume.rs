@@ -5128,6 +5128,27 @@ mod tests {
     use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
 
     #[test]
+    fn resume_register_box_pairs_failargs_and_consts_and_skips_holes() {
+        let fail_values = [11i64, 22];
+        let (op, bits) =
+            super::resume_register_box(&RebuiltValue::Box(1, majit_ir::Type::Int), &fail_values)
+                .expect("failarg");
+        assert_eq!(op, majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Int));
+        assert_eq!(bits, 22);
+        assert!(
+            super::resume_register_box(&RebuiltValue::Box(4, majit_ir::Type::Int), &fail_values)
+                .is_none()
+        );
+        let (op, bits) =
+            super::resume_register_box(&RebuiltValue::Const(majit_ir::Const::Int(7)), &fail_values)
+                .expect("const");
+        assert_eq!(op, majit_ir::OpRef::const_int(7));
+        assert_eq!(bits, 7);
+        assert!(super::resume_register_box(&RebuiltValue::Unassigned, &fail_values).is_none());
+        assert!(super::resume_register_box(&RebuiltValue::Virtual(0), &fail_values).is_none());
+    }
+
+    #[test]
     fn numbering_keeps_the_resolved_box_for_identity_lookup() {
         struct Env {
             inner: SimpleBoxEnv,
@@ -8484,6 +8505,32 @@ pub fn read_frame_liveness_reg_indices(
         |index| float.push(index),
     );
     FrameLivenessRegIndices { int, ref_, float }
+}
+
+/// One `resume.py` `ResumeDataBoxReader` callback result: the box to store
+/// in the live register, and the concrete bits `_copy_data_from_miframe`
+/// reads back. `Virtual` and `Unassigned` have no box here —
+/// `materialize_bridge_virtual` allocates a virtual on the guard-resume
+/// walk, and an unassigned slot stays empty (`box is None`).
+pub fn resume_register_box(
+    value: &majit_ir::resumedata::RebuiltValue,
+    fail_values: &[i64],
+) -> Option<(majit_ir::OpRef, i64)> {
+    use majit_ir::resumedata::RebuiltValue;
+    match value {
+        RebuiltValue::Box(n, kind) => {
+            let bits = *fail_values.get(*n)?;
+            Some((majit_ir::OpRef::input_arg_typed(*n as u32, *kind), bits))
+        }
+        RebuiltValue::Const(majit_ir::Const::Int(v)) => Some((majit_ir::OpRef::const_int(*v), *v)),
+        RebuiltValue::Const(majit_ir::Const::Ref(g)) => {
+            Some((majit_ir::OpRef::const_ptr(*g), g.0 as i64))
+        }
+        RebuiltValue::Const(majit_ir::Const::Float(f)) => {
+            Some((majit_ir::OpRef::const_float(*f), f.to_bits() as i64))
+        }
+        RebuiltValue::Virtual(_) | RebuiltValue::Unassigned => None,
+    }
 }
 
 /// RAII guard that pops every resume-construction ref-slice root pushed

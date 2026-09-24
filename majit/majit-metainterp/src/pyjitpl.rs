@@ -18446,7 +18446,7 @@ impl<M: Clone> MetaInterp<M> {
     /// Pyre's inlined Python frames share the portal jitcode, so each section
     /// is a portal frame and `portal_call_depth` counts them. The pc is still
     /// per section: leaving every frame at 0 resumes the callee at the
-    /// caller's entry.
+    /// caller's entry. Register fill is [`Self::consume_portal_resume_boxes`].
     pub fn rebuild_portal_framestack_from_resume(
         &mut self,
         mainjitcode: std::sync::Arc<crate::jitcode::JitCode>,
@@ -18467,8 +18467,92 @@ impl<M: Clone> MetaInterp<M> {
                 continue;
             };
             if let Some(frame) = self.framestack.frames.get_mut(frame_index) {
-                // resume.py: `f.setup_resume_at_op(pc)` — body is `self.pc = pc`.
+                // resume.py `MIFrame.setup_resume_at_op`: `self.pc = pc`.
                 frame.setup_resume_at_op(pc);
+            }
+        }
+    }
+
+    /// `resume.py` `rebuild_from_resumedata` for a bridge that already
+    /// decoded its sections. Same portal frame per section as
+    /// [`Self::rebuild_portal_framestack_from_resume`], then
+    /// `consume_boxes` into that frame's registers.
+    pub fn rebuild_portal_framestack_from_resumedata(
+        &mut self,
+        mainjitcode: std::sync::Arc<crate::jitcode::JitCode>,
+        frames: &[majit_ir::resumedata::RebuiltFrame],
+        fail_values: &[i64],
+    ) {
+        let resume_pcs: Vec<i32> = frames.iter().map(|frame| frame.pc).collect();
+        self.rebuild_portal_framestack_from_resume(mainjitcode, &resume_pcs);
+        self.consume_portal_resume_boxes(frames, fail_values);
+    }
+
+    /// `resume.py` `ResumeDataBoxReader.consume_boxes`: pair each section's
+    /// rebuilt values with that jitcode's live registers and store the box.
+    ///
+    /// A count mismatch leaves the frame's registers unset. Pairing them
+    /// anyway would write a value into a different register than
+    /// `enumerate_vars` named. A virtual stays unset; the guard-resume walk
+    /// allocates it through `materialize_bridge_virtual`.
+    fn consume_portal_resume_boxes(
+        &mut self,
+        frames: &[majit_ir::resumedata::RebuiltFrame],
+        fail_values: &[i64],
+    ) {
+        let op_live = self.staticdata.op_live as u8;
+        let liveness = self.staticdata.liveness_info.clone();
+        let registered = self.jitcodes().to_vec();
+        let n = self.framestack.frames.len().min(frames.len());
+        for i in 0..n {
+            let section = &frames[i];
+            // A negative pc is not a jitcode position (`setup_resume_at_op`
+            // leaves the frame at 0). Pairing values against pc 0 would
+            // write them into the wrong registers.
+            let Ok(pc) = usize::try_from(section.pc) else {
+                continue;
+            };
+            let jitcode = registered
+                .get(section.jitcode_index as usize)
+                .cloned()
+                .unwrap_or_else(|| self.framestack.frames[i].jitcode.clone());
+            let indices =
+                crate::resume::read_frame_liveness_reg_indices(&jitcode, pc, op_live, &liveness);
+            if indices.total_len() != section.values.len() {
+                continue;
+            }
+            let mut order = Vec::with_capacity(indices.total_len());
+            for index in indices.int {
+                order.push((majit_ir::Type::Int, index as usize));
+            }
+            for index in indices.ref_ {
+                order.push((majit_ir::Type::Ref, index as usize));
+            }
+            for index in indices.float {
+                order.push((majit_ir::Type::Float, index as usize));
+            }
+            let frame = &mut self.framestack.frames[i];
+            for (slot, value) in order.into_iter().zip(section.values.iter()) {
+                let Some((opref, bits)) = crate::resume::resume_register_box(value, fail_values)
+                else {
+                    continue;
+                };
+                let (bank, index) = slot;
+                match bank {
+                    majit_ir::Type::Int if index < frame.int_regs.len() => {
+                        frame.int_regs[index] = Some(opref);
+                        frame.int_values[index] = Some(bits);
+                    }
+                    majit_ir::Type::Ref if index < frame.ref_regs.len() => {
+                        frame.ref_regs[index] = Some(opref);
+                        frame.ref_values[index] = Some(bits);
+                    }
+                    majit_ir::Type::Float if index < frame.float_regs.len() => {
+                        frame.float_regs[index] = Some(opref);
+                        frame.float_values[index] = Some(bits);
+                    }
+                    _ => {}
+                }
             }
         }
     }
