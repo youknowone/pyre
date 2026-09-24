@@ -9264,13 +9264,17 @@ unsafe fn resolve_type_call_builtin_new(
     {
         return None;
     }
-    let tp_new = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(callable, "__new__") }?;
-    let obj_new = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_object, "__new__") };
+    let new_name =
+        pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new("__new__"));
+    let tp_new = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(callable, new_name) }?;
+    let obj_new = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_object, new_name) };
     if Some(tp_new) == obj_new || !unsafe { pyre_interpreter::is_function_carrier(tp_new) } {
         return None;
     }
-    let tp_init = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(callable, "__init__") };
-    let obj_init = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_object, "__init__") };
+    let init_name =
+        pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new("__init__"));
+    let tp_init = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(callable, init_name) };
+    let obj_init = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_object, init_name) };
     let builtin_init = if tp_init == obj_init {
         None
     } else {
