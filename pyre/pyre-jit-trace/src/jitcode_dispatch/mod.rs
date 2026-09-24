@@ -1451,7 +1451,6 @@ struct TracebackNodeSite {
     frame: OpRef,
     w_code: usize,
     last_instruction: i32,
-    lineno: i64,
 }
 
 /// Resolve the `PyTraceback` fields of the frame the walk is currently in.
@@ -1495,12 +1494,6 @@ fn traceback_node_site<Sym: WalkSym>(
         jitcode_index,
         opcode_position as i32,
     )?;
-    let lineno = unsafe {
-        pyre_interpreter::pyframe::offset2lineno(
-            w_code as pyre_object::PyObjectRef,
-            last_instruction as isize,
-        )
-    } as i64;
     let frame = ctx
         .registers_r
         .get(jitcode.metadata.portal_frame_reg as usize)
@@ -1526,7 +1519,6 @@ fn traceback_node_site<Sym: WalkSym>(
         frame,
         w_code,
         last_instruction,
-        lineno,
     })
 }
 
@@ -1552,7 +1544,13 @@ fn emit_traceback_node<Sym: WalkSym>(
             1,
         ),
         (w_next, 2),
-        (ctx.trace_ctx.const_int(site.lineno), 3),
+        // `record_application_traceback` leaves `lineno` at
+        // `LINENO_NOT_COMPUTED`; the `tb_lineno` getter resolves it.
+        (
+            ctx.trace_ctx
+                .const_int(pyre_interpreter::pytraceback::LINENO_NOT_COMPUTED),
+            3,
+        ),
         (ctx.trace_ctx.const_ref(site.w_code as i64), 4),
         (
             ctx.trace_ctx

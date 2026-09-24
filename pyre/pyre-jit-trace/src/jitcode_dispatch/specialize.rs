@@ -2025,6 +2025,37 @@ fn walker_guard_code_ptr_present<Sym: WalkSym>(
     walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[absent])
 }
 
+/// The line `w_pytraceback_get_lineno` resolves for a node whose `lineno`,
+/// `lasti` and `w_code` slots are all trace constants in the heap cache —
+/// the node `emit_traceback_node` built in this trace, whose stores are the
+/// cached values.  `None` when any slot is not a known constant, when the
+/// stored `lineno` is not the sentinel, or when `tb_lasti` names no line (the
+/// getter answers `None` there, which only the residual reproduces).
+fn walker_traceback_lineno_from_trace_constants<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    obj: OpRef,
+) -> Option<i64> {
+    let mut cached_const = |index: usize| {
+        let descr = crate::descr::pytraceback_field_descr(index);
+        let value = ctx
+            .trace_ctx
+            .heapcache_getfield_cached(obj, descr.index())?;
+        ctx.trace_ctx.const_value(value)
+    };
+    // `emit_traceback_node`'s field order: 1 = `lasti`, 3 = `lineno`,
+    // 4 = `w_code`.
+    if cached_const(3)? != pyre_interpreter::pytraceback::LINENO_NOT_COMPUTED {
+        return None;
+    }
+    let lasti = cached_const(1)?;
+    let w_code = cached_const(4)? as pyre_object::PyObjectRef;
+    if w_code.is_null() || !unsafe { pyre_interpreter::pycode::is_code(w_code) } {
+        return None;
+    }
+    let lineno = unsafe { pyre_interpreter::pycode::w_code_addr2line(w_code, lasti) };
+    (lineno >= 0).then_some(lineno as i64)
+}
+
 /// Emit one traceback-walk hop as a guarded inline field read instead of the
 /// opaque `getattr_fn` residual.
 ///
@@ -2110,14 +2141,26 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
         let live =
             unsafe { pyre_interpreter::pytraceback::w_pytraceback_get_lineno_raw(concrete_obj) };
         // A slot holding the sentinel is not the getter's value — the getter
-        // resolves it out of `w_code` and `lasti`, which are two more slots
-        // this fold would have to pin — so the slot value is the getter's value
-        // only once it is pinned against the sentinel.  A node that already
-        // carries the sentinel — built from a frame with no `pycode`, or handed
-        // it through `TracebackType(..., -1)` — has nothing to pin, so decline
-        // before recording anything.
+        // resolves it out of `w_code` and `lasti`.  A node this trace built
+        // (`emit_traceback_node`) carries all three as trace constants, and
+        // resolving an immutable code object's line table at a constant
+        // offset is the value the getter's resolution produces, so that node
+        // folds to the resolved line.  Any other sentinel node — recorded by
+        // the interpreter, or handed `-1` through `TracebackType(...)` — has
+        // slots this fold would have to pin, so it declines before recording
+        // anything and the getter runs as a residual.
         if live == pyre_interpreter::pytraceback::LINENO_NOT_COMPUTED {
-            return Ok(None);
+            let Some(resolved) = walker_traceback_lineno_from_trace_constants(ctx, obj) else {
+                return Ok(None);
+            };
+            walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
+            let raw_value = ctx.trace_ctx.const_int(resolved);
+            let boxed = walker_box_int(ctx, op_pc, raw_value, resolved)?;
+            let live_ptr = pyre_object::w_int_new(resolved) as i64;
+            ctx.trace_ctx
+                .set_opref_concrete(boxed, box_int_concrete(resolved, live_ptr));
+            write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
+            return Ok(Some(()));
         }
         walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
         let raw_value = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, obj, descr);
