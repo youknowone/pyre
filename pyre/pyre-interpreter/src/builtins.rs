@@ -7438,17 +7438,25 @@ fn value_error_one_arg(cls: PyObjectRef, arg: PyObjectRef) -> PyObjectRef {
             pyre_object::gc_roots::shadow_stack_get(cls_slot),
         )
     };
-    let exc = crate::typedef::tag_subclass_instance(
-        exc,
+    // `tag_subclass_instance` registers a finalizer and `w_exception_args_new`
+    // allocates the args list, so the fresh exception has to be rooted and
+    // re-read rather than carried in a raw local across either one.
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(exc);
+    crate::typedef::tag_subclass_instance(
+        pyre_object::gc_roots::shadow_stack_get(exc_slot),
         pyre_object::gc_roots::shadow_stack_get(cls_slot),
     );
     let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![
         pyre_object::gc_roots::shadow_stack_get(arg_slot),
     ]);
     unsafe {
-        pyre_object::interp_exceptions::w_exception_set_args(exc, args_list);
+        pyre_object::interp_exceptions::w_exception_set_args(
+            pyre_object::gc_roots::shadow_stack_get(exc_slot),
+            args_list,
+        );
     }
-    exc
+    pyre_object::gc_roots::shadow_stack_get(exc_slot)
 }
 
 #[cfg(not(target_arch = "wasm32"))]

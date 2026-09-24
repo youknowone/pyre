@@ -7735,14 +7735,20 @@ impl CallControl {
         // attribute is `dont_look_inside_cannot_raise` and whose body does
         // not call Python; a may-force residual there aborts the
         // transparent walk.
+        // One descriptor serves the whole indirect family, so a single listed
+        // member does not license dropping the exception path the other
+        // targets still need: every resolved member has to carry the
+        // assertion, and an unresolved family carries nothing.
         let leaf_cannot_raise = match shape {
             CallShape::Direct(target) => self
                 .resolved_direct_path(target)
                 .is_some_and(|path| cannot_raise_helper_leaf(&path.segments.join("::"))),
-            CallShape::Indirect(graphs) => graphs
-                .unwrap_or(&[])
-                .iter()
-                .any(|path| cannot_raise_helper_leaf(&path.segments.join("::"))),
+            CallShape::Indirect(graphs) => graphs.is_some_and(|paths| {
+                !paths.is_empty()
+                    && paths
+                        .iter()
+                        .all(|path| cannot_raise_helper_leaf(&path.segments.join("::")))
+            }),
         };
         if !elidable
             && !loopinvariant

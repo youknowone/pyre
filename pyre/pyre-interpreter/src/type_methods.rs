@@ -6849,10 +6849,19 @@ pub fn __majit_wrap_dict_descr_get(args: &[PyObjectRef]) -> Result<PyObjectRef, 
 
 /// Exact `dict` and a key whose hash does not run Python: an exact `str`,
 /// or an exact `tuple` of exact `str`s.
+///
+/// The stored keys decide as much as the looked-up one.  A probe compares the
+/// key against everything sharing its hash, and `w_dict_lookup` reports a
+/// raising `__eq__` as a miss — which this path would answer with the
+/// default.  So the dict must also be on a strategy whose keys compare
+/// without running Python.
 #[majit_macros::dont_look_inside_cannot_raise]
 fn dict_get_plain_applies(dict: PyObjectRef, key: PyObjectRef) -> bool {
     unsafe {
         if !pyre_object::py_type_check(dict, &pyre_object::DICT_TYPE) {
+            return false;
+        }
+        if !pyre_object::dictmultiobject::w_dict_keys_compare_without_python(dict) {
             return false;
         }
         if pyre_object::py_type_check(key, &pyre_object::STR_TYPE) {

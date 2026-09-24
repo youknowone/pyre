@@ -2779,6 +2779,12 @@ pub unsafe fn w_list_getitem_inner(obj: PyObjectRef, index: i64) -> Option<PyObj
 /// `obj` must point to a valid `W_ListObject`. `start` and `stop` are
 /// already normalised machine bounds (a `stop` past the length is clamped).
 pub unsafe fn ll_listslice(obj: PyObjectRef, start: usize, stop: usize) -> PyObjectRef {
+    // The arms address the backing array directly instead of boxing one item
+    // at a time through `w_list_getitem`, so the length, the strategy and the
+    // copy have to see one state: a concurrent append or strategy transition
+    // would otherwise replace the storage under a raw sub-slice.  The lock is
+    // reentrant, so an arm that still boxes may take it again.
+    let _list_guard = w_list_lock(obj);
     let length = w_list_len(obj);
     let start = start.min(length);
     let stop = if stop > length { length } else { stop };

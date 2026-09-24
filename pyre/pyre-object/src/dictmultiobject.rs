@@ -2209,6 +2209,26 @@ pub unsafe fn w_dict_strategy_name(obj: PyObjectRef) -> &'static str {
     }
 }
 
+/// Whether probing `obj` compares stored keys without running Python.
+///
+/// A lookup hashes the key and then compares it against whatever shares that
+/// hash.  Only `ObjectDictStrategy` holds keys of arbitrary type, so only
+/// there can that comparison reach an interpreter-level `__eq__` — the
+/// specialised strategies hold `str`, `bytes` or `int` keys whose comparison
+/// is a builtin, and `IdentityDictStrategy` does not compare keys at all.
+///
+/// # Safety
+/// `obj` must point to a live `W_DictObject` or `W_ModuleDictObject`.
+pub unsafe fn w_dict_keys_compare_without_python(obj: PyObjectRef) -> bool {
+    if is_module_dict(obj) {
+        return !w_module_dict_is_object_strategy(obj);
+    }
+    !matches!(
+        w_dict_get_strategy(obj).strategy_kind(),
+        StrategyKind::Object
+    )
+}
+
 /// Key-set mutation state captured by dict iterators.
 ///
 /// PyPy's `BaseIteratorImplementation` owns a live iterator over the
