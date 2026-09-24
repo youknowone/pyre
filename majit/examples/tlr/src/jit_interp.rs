@@ -472,15 +472,12 @@ mod tests {
     }
 
     #[test]
-    fn jit_square_5() {
+    fn jit_square() {
         let bc = square_bytecode();
-        assert_eq!(run_jit(&bc, 5), 25);
-    }
-
-    #[test]
-    fn jit_square_100() {
-        let bc = square_bytecode();
-        assert_eq!(run_jit(&bc, 100), 10_000);
+        let cases = [("5", 5, 25), ("100", 100, 10_000)];
+        for (name, n, want) in cases {
+            assert_eq!(run_jit(&bc, n), want, "case {name}");
+        }
     }
 
     #[test]

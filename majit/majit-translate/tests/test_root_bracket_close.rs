@@ -118,28 +118,34 @@ fn assert_bracket_closes(llbc: &Llbc, leaf: &str) {
 }
 
 #[test]
-fn bracket_closes_in_the_crate_that_owns_the_guard() {
-    let Some(llbc) = object_llbc() else { return };
-    assert_bracket_closes(llbc, "w_tuple_items_copy_as_vec");
-}
-
-#[test]
-fn bracket_closes_in_a_crate_that_only_imports_the_guard() {
-    let Some(llbc) = interpreter_llbc() else {
-        return;
-    };
-    assert_bracket_closes(llbc, "call_function_impl_result");
-}
-
-/// The bracket a descended `lib.abs(x)` inlines into its trace.
-/// `_cffi_backend` lives in `pyre-module`, so the fixture is that crate's
-/// `do_call` rather than anything still in the interpreter artefact.
-#[test]
-fn bracket_closes_in_the_cffi_call_path() {
-    let Some(llbc) = module_llbc() else {
-        return;
-    };
-    assert_bracket_closes(llbc, "do_call");
+fn bracket_closes_for_each_caller_shape() {
+    let cases: &[(&str, fn() -> Option<&'static Llbc>, &str)] = &[
+        ("owns_guard", object_llbc, "w_tuple_items_copy_as_vec"),
+        (
+            "imports_guard",
+            interpreter_llbc,
+            "call_function_impl_result",
+        ),
+        ("cffi", module_llbc, "do_call"),
+    ];
+    for (name, load, leaf) in cases {
+        let Some(llbc) = load() else {
+            continue;
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_bracket_closes(llbc, leaf);
+        }));
+        if let Err(payload) = result {
+            let msg = if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else if let Some(s) = payload.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else {
+                "assertion failed".to_string()
+            };
+            panic!("case {name}: {msg}");
+        }
+    }
 }
 
 /// A body whose guard is dropped several blocks away from where it is bound.

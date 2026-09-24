@@ -443,16 +443,30 @@ mod tests {
         }));
     }
 
-    /// `Result::Ok = 0`, so its payload arm is the `bool(disc)`-false exit;
-    /// the true (`Err`) exit raises. This is the mirror of `Option::Some = 1`.
+    /// `Result::Ok = 0`, so its payload arm is the `bool(disc)`-false exit
+    /// for both `unwrap` and `expect`. The true (`Err`) exit raises.
     #[test]
-    fn rewrite_lifts_result_unwrap_payload_on_disc_false() {
-        check_result_payload_on_disc_false(false);
+    fn rewrite_lifts_result_payload_on_disc_false() {
+        let cases = [("unwrap", false), ("expect", true)];
+        for (name, expect) in cases {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                check_result_payload_on_disc_false(expect);
+            }));
+            if let Err(payload) = result {
+                let msg = panic_payload(&payload);
+                panic!("case {name}: {msg}");
+            }
+        }
     }
 
-    #[test]
-    fn rewrite_lifts_result_expect_payload_on_disc_false() {
-        check_result_payload_on_disc_false(true);
+    fn panic_payload(payload: &Box<dyn std::any::Any + Send>) -> String {
+        if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else if let Some(s) = payload.downcast_ref::<&str>() {
+            (*s).to_string()
+        } else {
+            "assertion failed".to_string()
+        }
     }
 
     fn check_result_payload_on_disc_false(expect: bool) {

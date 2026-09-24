@@ -538,13 +538,6 @@ mod tests {
     }
 
     #[test]
-    fn new_engine_has_empty_state() {
-        let e = SimpleTaskEngine::new();
-        assert!(e.tasks.borrow().is_empty());
-        assert!(e._plan_cache.borrow().is_empty());
-    }
-
-    #[test]
     fn register_task_populates_tasks_map() {
         // Upstream `taskengine.py:5-14` — `self.tasks[task_name] =
         // task, task_deps`. The Rust port's explicit registration

@@ -1630,21 +1630,31 @@ mod tests {
     }
 
     #[test]
-    fn rangeto_matches_equivalent_arraylen_values() {
-        let (mut g, site) = build_rangeto_arraylen_value_graph(false, false);
-        assert_rangeto_rewrite(&mut g, site);
+    fn rangeto_arraylen_value_graphs_rewrite() {
+        let cases = [
+            ("equivalent_values", false, false),
+            ("different_bases", true, false),
+            ("mutable_base", false, true),
+        ];
+        for (name, different_bases, mutable_base) in cases {
+            let (mut g, site) = build_rangeto_arraylen_value_graph(different_bases, mutable_base);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                assert_rangeto_rewrite(&mut g, site);
+            }));
+            if let Err(payload) = result {
+                panic!("case {name}: {}", panic_payload_slice(&payload));
+            }
+        }
     }
 
-    #[test]
-    fn rangeto_preserves_end_across_arraylen_different_bases() {
-        let (mut g, site) = build_rangeto_arraylen_value_graph(true, false);
-        assert_rangeto_rewrite(&mut g, site);
-    }
-
-    #[test]
-    fn rangeto_preserves_end_across_mutable_arraylen_base() {
-        let (mut g, site) = build_rangeto_arraylen_value_graph(false, true);
-        assert_rangeto_rewrite(&mut g, site);
+    fn panic_payload_slice(payload: &Box<dyn std::any::Any + Send>) -> String {
+        if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else if let Some(s) = payload.downcast_ref::<&str>() {
+            (*s).to_string()
+        } else {
+            "assertion failed".to_string()
+        }
     }
 
     #[test]
@@ -1901,27 +1911,22 @@ mod tests {
     }
 
     #[test]
-    fn rangeto_without_bound_rewrites() {
-        let (mut g, site) = build_rangeto_static_length_graph(None, true, true);
-        assert_rangeto_rewrite(&mut g, site);
-    }
-
-    #[test]
-    fn rangeto_weak_bound_rewrites() {
-        let (mut g, site) = build_rangeto_static_length_graph(Some(9), true, true);
-        assert_rangeto_rewrite(&mut g, site);
-    }
-
-    #[test]
-    fn rangeto_wrong_edge_rewrites() {
-        let (mut g, site) = build_rangeto_static_length_graph(Some(8), false, true);
-        assert_rangeto_rewrite(&mut g, site);
-    }
-
-    #[test]
-    fn rangeto_unknown_repeat_count_rewrites() {
-        let (mut g, site) = build_rangeto_static_length_graph(Some(8), true, false);
-        assert_rangeto_rewrite(&mut g, site);
+    fn rangeto_static_length_graphs_rewrite() {
+        let cases = [
+            ("without_bound", None, true, true),
+            ("weak_bound", Some(9), true, true),
+            ("wrong_edge", Some(8), false, true),
+            ("unknown_repeat_count", Some(8), true, false),
+        ];
+        for (name, bound, edge, repeat_known) in cases {
+            let (mut g, site) = build_rangeto_static_length_graph(bound, edge, repeat_known);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                assert_rangeto_rewrite(&mut g, site);
+            }));
+            if let Err(payload) = result {
+                panic!("case {name}: {}", panic_payload_slice(&payload));
+            }
+        }
     }
 
     /// Build the minimal `&s[k..]` shape — a `ConstInt(k)` start, a

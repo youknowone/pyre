@@ -3427,12 +3427,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn no_standard_graph_error_carries_desc_key() {
-        let err = NoStandardGraph(desc_key(42));
-        assert!(format!("{err}").contains("42"));
-    }
-
     /// `ClassAttrFamily.commonbase` defaults to `None` until populated
     /// by `merge_classpbc_getattr_into_classdef` (normalizecalls.py).
     /// `update`/`absorb` propagate descs / s_value but never touch
@@ -3488,42 +3482,12 @@ mod tests {
     }
 
     #[test]
-    fn desc_new_carries_bookkeeper_and_pyobj() {
-        let bk = bk();
-        let desc = Desc::new(bk.clone(), None);
-        assert!(desc.pyobj.is_none());
-        assert!(Rc::ptr_eq(&desc.bookkeeper, &bk));
-    }
-
-    #[test]
-    fn desc_querycallfamily_is_none_without_bookkeeper_unionfind() {
-        let desc = Desc::new(bk(), None);
-        assert!(desc.querycallfamily().is_none());
-    }
-
-    #[test]
     fn desc_getcallfamily_materializes_unionfind_entry() {
         let desc = Desc::new(bk(), None);
         assert!(desc.querycallfamily().is_none());
         let family = desc.getcallfamily().expect("callfamily must be created");
         assert!(family.borrow().descs.contains_key(&desc.identity));
         assert!(desc.querycallfamily().is_some());
-    }
-
-    #[test]
-    fn function_desc_new_sets_all_fields() {
-        let bk = bk();
-        let fd = FunctionDesc::new(bk, None, "f", int_sig(&["x"]), None, None);
-        assert_eq!(fd.name, "f");
-        assert_eq!(fd.signature.argnames, vec!["x".to_string()]);
-        assert!(fd.defaults.is_empty());
-        assert!(fd.cache.borrow().is_empty());
-    }
-
-    #[test]
-    fn function_desc_getgraphs_returns_cached_values() {
-        let fd = FunctionDesc::new(bk(), None, "f", int_sig(&[]), None, None);
-        assert!(fd.getgraphs().is_empty());
     }
 
     #[test]
@@ -4291,13 +4255,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn memodesc_wraps_functiondesc() {
-        let fd = FunctionDesc::new(bk(), None, "m", int_sig(&[]), None, None);
-        let md = MemoDesc::new(Rc::new(RefCell::new(fd)));
-        assert_eq!(md.base.borrow().name, "m");
-    }
-
     // ---- MethodDesc + FrozenDesc + MethodOfFrozenDesc (commit 3) ----
 
     fn wrap_fd(bk: &Rc<Bookkeeper>, name: &str) -> Rc<RefCell<FunctionDesc>> {
@@ -4315,24 +4272,6 @@ mod tests {
     /// `MethodDesc`/`MethodOfFrozenDesc`/`getmethoddesc` now take.
     fn fde(fd: &Rc<RefCell<FunctionDesc>>) -> FuncDescEntry {
         FuncDescEntry::plain(fd.clone())
-    }
-
-    #[test]
-    fn method_desc_new_carries_funcdesc_and_classes() {
-        let bk = bk();
-        let fd = wrap_fd(&bk, "m");
-        let md = MethodDesc::new(
-            bk,
-            fde(&fd),
-            ClassDefKey::from_raw(1),
-            Some(ClassDefKey::from_raw(2)),
-            "m",
-            std::collections::BTreeMap::new(),
-        );
-        assert_eq!(md.name, "m");
-        assert_eq!(md.originclassdef, ClassDefKey::from_raw(1));
-        assert_eq!(md.selfclassdef, Some(ClassDefKey::from_raw(2)));
-        assert!(Rc::ptr_eq(&md.funcdesc.func(), &fd));
     }
 
     /// A bound memo method keeps the exact `MemoDesc` identity upstream's

@@ -737,115 +737,68 @@ mod tests {
     }
 
     #[test]
-    fn backward_constraint_types_unknown_int_binop_operands_as_signed() {
-        let mut graph = FunctionGraph::new("int_backprop");
-        let entry = graph.startblock;
-        let lhs_var = graph
-            .push_op_var(
-                entry,
-                OpKind::Input {
-                    name: "lhs".to_string(),
-                    ty: ValueType::Unknown,
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
-        let rhs_var = graph
-            .push_op_var(
-                entry,
-                OpKind::Input {
-                    name: "rhs".to_string(),
-                    ty: ValueType::Unknown,
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
-        let result_var = graph
-            .push_op_var(
-                entry,
-                OpKind::BinOp {
-                    op: "add".to_string(),
-                    lhs: lhs_var.clone(),
-                    rhs: rhs_var.clone(),
-                    result_ty: ValueType::Int,
-                },
-                true,
-            )
-            .unwrap();
-        graph.set_return(entry, Some(result_var.clone()));
+    fn backward_constraint_types_int_ops_as_signed() {
+        let cases = [
+            ("add", "int_backprop", "add"),
+            ("bitxor", "bitxor_backprop", "bitxor"),
+        ];
+        for (name, graph_name, op) in cases {
+            let mut graph = FunctionGraph::new(graph_name);
+            let entry = graph.startblock;
+            let lhs_var = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Input {
+                        name: "lhs".to_string(),
+                        ty: ValueType::Unknown,
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            let rhs_var = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Input {
+                        name: "rhs".to_string(),
+                        ty: ValueType::Unknown,
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            let result_var = graph
+                .push_op_var(
+                    entry,
+                    OpKind::BinOp {
+                        op: op.to_string(),
+                        lhs: lhs_var.clone(),
+                        rhs: rhs_var.clone(),
+                        result_ty: ValueType::Int,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.set_return(entry, Some(result_var.clone()));
 
-        annotate::annotate(&graph);
-        resolve_types(&graph);
-        assert_eq!(
-            FunctionGraph::concretetype_of(&lhs_var),
-            ConcreteType::Signed
-        );
-        assert_eq!(
-            FunctionGraph::concretetype_of(&rhs_var),
-            ConcreteType::Signed
-        );
-        assert_eq!(
-            FunctionGraph::concretetype_of(&result_var),
-            ConcreteType::Signed
-        );
-    }
-
-    #[test]
-    fn backward_constraint_types_frontend_bitop_operands_as_signed() {
-        let mut graph = FunctionGraph::new("bitxor_backprop");
-        let entry = graph.startblock;
-        let lhs_var = graph
-            .push_op_var(
-                entry,
-                OpKind::Input {
-                    name: "lhs".to_string(),
-                    ty: ValueType::Unknown,
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
-        let rhs_var = graph
-            .push_op_var(
-                entry,
-                OpKind::Input {
-                    name: "rhs".to_string(),
-                    ty: ValueType::Unknown,
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
-        let result_var = graph
-            .push_op_var(
-                entry,
-                OpKind::BinOp {
-                    op: "bitxor".to_string(),
-                    lhs: lhs_var.clone(),
-                    rhs: rhs_var.clone(),
-                    result_ty: ValueType::Int,
-                },
-                true,
-            )
-            .unwrap();
-        graph.set_return(entry, Some(result_var.clone()));
-
-        annotate::annotate(&graph);
-        resolve_types(&graph);
-        assert_eq!(
-            FunctionGraph::concretetype_of(&lhs_var),
-            ConcreteType::Signed
-        );
-        assert_eq!(
-            FunctionGraph::concretetype_of(&rhs_var),
-            ConcreteType::Signed
-        );
-        assert_eq!(
-            FunctionGraph::concretetype_of(&result_var),
-            ConcreteType::Signed
-        );
+            annotate::annotate(&graph);
+            resolve_types(&graph);
+            assert_eq!(
+                FunctionGraph::concretetype_of(&lhs_var),
+                ConcreteType::Signed,
+                "case {name} lhs"
+            );
+            assert_eq!(
+                FunctionGraph::concretetype_of(&rhs_var),
+                ConcreteType::Signed,
+                "case {name} rhs"
+            );
+            assert_eq!(
+                FunctionGraph::concretetype_of(&result_var),
+                ConcreteType::Signed,
+                "case {name} result"
+            );
+        }
     }
 
     #[test]

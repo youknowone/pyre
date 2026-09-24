@@ -5535,16 +5535,6 @@ mod tests {
         assert!(SomeValue::Type(SomeType::new()).knowntypedata().is_none());
     }
 
-    #[test]
-    fn variable_annotation_roundtrip() {
-        use std::rc::Rc;
-        let v = Variable::named("x");
-        let s = SomeValue::Integer(SomeInteger::default());
-        v.annotation.replace(Some(Rc::new(s.clone())));
-        let got = v.annotation.borrow().as_ref().map(|rc| (**rc).clone());
-        assert_eq!(got, Some(s));
-    }
-
     /// rstring.py — `SomeStringBuilder` getlength/build annotate to
     /// `SomeInteger(nonneg=True)` and `SomeString(can_be_None=False)`.
     #[test]

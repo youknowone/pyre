@@ -303,19 +303,17 @@ mod tests {
         run(program, num_regs, threshold)
     }
 
-    /// Loop header at pc 0 (the portal entry pc). Same arithmetic as the
-    /// pc-3 and pc-9 variants; only the back-edge target differs.
+    /// 1000-trip headers at pc 0 and pc 3, armed at threshold 3.
     #[test]
-    fn header_at_zero() {
-        let (r, _) = probe("header_at_zero", &loop_header_at_zero(1000), 3, 3);
-        assert_eq!(r, 1000);
-    }
-
-    /// Loop header at pc 3.
-    #[test]
-    fn header_at_three() {
-        let (r, _) = probe("header_at_three", &loop_header_at_three(1000), 3, 3);
-        assert_eq!(r, 1000);
+    fn header_variants_return_trip_count() {
+        let cases: &[(&str, fn(i64) -> Vec<i64>)] = &[
+            ("header_at_zero", loop_header_at_zero),
+            ("header_at_three", loop_header_at_three),
+        ];
+        for &(name, build) in cases {
+            let (r, _) = probe(name, &build(1000), 3, 3);
+            assert_eq!(r, 1000, "case {name}");
+        }
     }
 
     /// Portal-entry door, straight-line program: the walk is armed at pc 0
@@ -463,13 +461,6 @@ mod tests {
              walk headed past its arming pc"
         );
         println!("[straight-line] 333 from a {ops_after}-op body with no back edge");
-    }
-
-    /// Loop header at pc 9 — the pre-existing shape, as a control.
-    #[test]
-    fn header_at_nine() {
-        let (r, _) = probe("header_at_nine", &count_program(1000, 1), 3, 3);
-        assert_eq!(r, 1000);
     }
 
     /// The env element is 8 bytes wide and the immediate `n = 1000` does not

@@ -6365,30 +6365,21 @@ fn host_loop_inputargs() -> Vec<InputArgRc> {
     ]
 }
 
-/// The complement of the invalidation decline below. With the same valid owner,
-/// guard and bridge, a header-resuming region reaches the inline candidate but
-/// waits for the same entry-count trip as every other region. This pins the
-/// cost gate before any wasm host is involved: the host-only install trial must
-/// not run until the bridge has proved hot enough to pay for rebuilding its
-/// whole owner module.
+/// Header, preamble, and large-header owners all defer the inline trial
+/// until the entry-count trip, including an invalidation-guard region.
 #[test]
-fn a_valid_header_owner_defers_the_inline_trial() {
-    assert_valid_owner_defers_inline_trial(false, false);
+fn a_valid_owner_defers_the_inline_trial() {
+    let cases = [
+        ("header", false, false),
+        ("preamble_invalidation", true, false),
+        ("large_header_invalidation", false, true),
+    ];
+    for (name, preamble, large_header) in cases {
+        assert_valid_owner_defers_inline_trial(name, preamble, large_header);
+    }
 }
 
-/// compile.py::record_loop_or_bridge registers dependencies on the token,
-/// not a bridge flag. A valid preamble region can defer its merge too.
-#[test]
-fn a_valid_preamble_owner_defers_an_invalidation_guard_region() {
-    assert_valid_owner_defers_inline_trial(true, false);
-}
-
-#[test]
-fn a_large_header_owner_defers_an_invalidation_guard_region() {
-    assert_valid_owner_defers_inline_trial(false, true);
-}
-
-fn assert_valid_owner_defers_inline_trial(preamble: bool, large_header: bool) {
+fn assert_valid_owner_defers_inline_trial(case: &str, preamble: bool, large_header: bool) {
     use majit_backend::Backend;
 
     let _serialized = HOST_COMPILE_LOCK.lock();
@@ -6434,8 +6425,8 @@ fn assert_valid_owner_defers_inline_trial(preamble: bool, large_header: bool) {
 
     backend
         .compile_loop(&host_loop_inputargs(), &loop_ops, &token)
-        .expect("the owner loop compiles");
-    assert!(!token.is_invalidated());
+        .unwrap_or_else(|_| panic!("case {case}: the owner loop compiles"));
+    assert!(!token.is_invalidated(), "case {case}");
 
     let fail_descr = HostFailDescr {
         fail_index: 0,
@@ -6465,32 +6456,39 @@ fn assert_valid_owner_defers_inline_trial(preamble: bool, large_header: bool) {
         majit_backend_wasm::set_inline_eager_max_bytes(4096);
     }
     majit_backend_wasm::set_inline_trip_helper_slot(0);
-    compiled.expect("the loop-closing bridge compiles");
+    compiled.unwrap_or_else(|_| panic!("case {case}: the loop-closing bridge compiles"));
 
     assert_eq!(
         majit_backend_wasm::bridge_diag(50),
         declines_before,
-        "a valid owner is not declined by the invalidation arm"
+        "case {case}: a valid owner is not declined by the invalidation arm"
     );
     assert!(
         majit_backend_wasm::bridge_diag(54) > deferred_before,
-        "a valid region waits on the entry-count trip: {}",
+        "case {case}: a valid region waits on the entry-count trip: {}",
         majit_backend_wasm::inline_declines()
     );
     assert_eq!(
         majit_backend_wasm::bridge_diag(37),
         trials_before,
-        "the deferred region has not tried to rebuild the owner yet"
+        "case {case}: the deferred region has not tried to rebuild the owner yet"
     );
     assert_eq!(
         majit_backend_wasm::bridge_diag(56),
-        invalidation_declines_before
+        invalidation_declines_before,
+        "case {case}"
     );
     let generation = token.latest_bridge_invalidation_flag().unwrap();
-    assert!(!generation.load(std::sync::atomic::Ordering::Acquire));
+    assert!(
+        !generation.load(std::sync::atomic::Ordering::Acquire),
+        "case {case}"
+    );
     token.invalidate();
-    assert!(token.is_invalidated());
-    assert!(generation.load(std::sync::atomic::Ordering::Acquire));
+    assert!(token.is_invalidated(), "case {case}");
+    assert!(
+        generation.load(std::sync::atomic::Ordering::Acquire),
+        "case {case}"
+    );
 }
 
 /// After a peel has already grown the owner past

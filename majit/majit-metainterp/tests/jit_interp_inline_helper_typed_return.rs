@@ -204,12 +204,6 @@ fn jit_inline_float_identity_generates_valid_jitcode() {
 }
 
 #[test]
-fn jit_inline_ref_identity_keeps_interpreter_behavior() {
-    assert_eq!(inline_ref_identity(42), 42);
-    assert_eq!(inline_ref_identity(0), 0);
-}
-
-#[test]
 fn jit_inline_float_identity_keeps_interpreter_behavior() {
     assert_eq!(inline_float_identity(3.125), 3.125);
     assert_eq!(

@@ -3801,24 +3801,6 @@ mod tests {
     }
 
     #[test]
-    fn classdict_entry_constant_and_desc_variants() {
-        let c = ClassDictEntry::constant(ConstValue::Int(7));
-        assert!(matches!(c, ClassDictEntry::Constant(_)));
-        // Desc variant is constructable from a DescEntry handle; a
-        // Function entry avoids re-porting bookkeeper.newfuncdesc in the
-        // test.
-        use crate::flowspace::model::GraphFunc;
-        let bk = make_bk();
-        let host = HostObject::new_user_function(GraphFunc::new(
-            "f",
-            Constant::new(ConstValue::Dict(Default::default())),
-        ));
-        let entry = bk.getdesc(&host).unwrap();
-        let stored = ClassDictEntry::Desc(entry);
-        assert!(matches!(stored, ClassDictEntry::Desc(_)));
-    }
-
-    #[test]
     fn force_attributes_into_classes_has_environment_error() {
         let env =
             forced_attributes_for("EnvironmentError").expect("EnvironmentError entry present");

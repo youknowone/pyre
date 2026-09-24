@@ -3520,25 +3520,24 @@ mod tests {
     // ── Float optimization tests ──
 
     #[test]
-    fn test_float_mul_one_right() {
-        let (result, ctx) = run_one(
-            vec![same_f(), same_f(), bin_f(OpCode::FloatMul, 0, 1)],
-            2,
-            &[(OpRef::float_op(1), Value::Float(1.0))],
-        );
-        assert_remove(&result);
-        assert_forward(&ctx, OpRef::float_op(2), OpRef::float_op(0));
-    }
-
-    #[test]
-    fn test_float_mul_one_left() {
-        let (result, ctx) = run_one(
-            vec![same_f(), same_f(), bin_f(OpCode::FloatMul, 0, 1)],
-            2,
-            &[(OpRef::float_op(0), Value::Float(1.0))],
-        );
-        assert_remove(&result);
-        assert_forward(&ctx, OpRef::float_op(2), OpRef::float_op(1));
+    fn test_float_mul_one() {
+        let cases = [
+            ("right", OpRef::float_op(1), OpRef::float_op(0)),
+            ("left", OpRef::float_op(0), OpRef::float_op(1)),
+        ];
+        for (name, const_op, forward_to) in cases {
+            let (result, ctx) = run_one(
+                vec![same_f(), same_f(), bin_f(OpCode::FloatMul, 0, 1)],
+                2,
+                &[(const_op, Value::Float(1.0))],
+            );
+            assert!(matches!(result, OptimizationResult::Remove), "case {name}");
+            assert_eq!(
+                ctx.get_replacement_opref(OpRef::float_op(2)),
+                forward_to,
+                "case {name}"
+            );
+        }
     }
 
     #[test]

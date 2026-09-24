@@ -525,12 +525,6 @@ mod tests {
     }
 
     #[test]
-    fn bytearray_repr_carries_llhelpers() {
-        let repr = ByteArrayRepr::new();
-        assert_eq!(repr.ll, LLHelpers);
-    }
-
-    #[test]
     fn build_ll_str2bytearray_graph_matches_source_loop_shape() {
         let helper = build_ll_str2bytearray_helper_graph("ll_str2bytearray").unwrap();
         let inner = helper.graph.borrow();

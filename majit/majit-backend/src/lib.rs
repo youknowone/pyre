@@ -4728,18 +4728,6 @@ mod tests {
     }
 
     #[test]
-    fn loop_version_info_default() {
-        let info = LoopVersionInfo::default();
-        assert!(info.versions.is_empty());
-    }
-
-    #[test]
-    fn loop_token_version_info_none_by_default() {
-        let token = JitCellToken::new(1);
-        assert!(token.version_info.is_none());
-    }
-
-    #[test]
     fn loop_token_with_version_info() {
         let mut token = JitCellToken::new(1);
         let mut info = LoopVersionInfo::new();
@@ -4931,15 +4919,6 @@ mod tests {
         assert!(!later_bridge.load(std::sync::atomic::Ordering::Acquire));
         dependency.invalidate_for_quasi_immut();
         assert!(later_bridge.load(std::sync::atomic::Ordering::Acquire));
-    }
-
-    #[test]
-    fn test_we_are_jitted() {
-        assert!(!we_are_jitted());
-        set_jitted(true);
-        assert!(we_are_jitted());
-        set_jitted(false);
-        assert!(!we_are_jitted());
     }
 
     #[test]

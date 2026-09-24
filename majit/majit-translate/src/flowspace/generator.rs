@@ -630,14 +630,14 @@ mod tests {
     }
 
     #[test]
-    fn get_variable_names_prefixes_and_deduplicates() {
-        let out = get_variable_names(&["x", "y", "_x_"]);
-        assert_eq!(out, vec!["g_x", "g_y", "g_x_"]);
-    }
-
-    #[test]
-    fn get_variable_names_empty_input() {
-        assert!(get_variable_names(&[]).is_empty());
+    fn get_variable_names_prefixes_inputs() {
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            ("prefixed", &["x", "y", "_x_"], &["g_x", "g_y", "g_x_"]),
+            ("empty", &[], &[]),
+        ];
+        for &(name, input, want) in cases {
+            assert_eq!(get_variable_names(input), want, "case {name}");
+        }
     }
 
     #[test]

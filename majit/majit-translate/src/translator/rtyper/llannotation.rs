@@ -1012,33 +1012,48 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "must be wrapped in Ptr(T)")]
-    fn lltype_to_annotation_rejects_bare_struct() {
-        // upstream llannotation.py:184-185 falls back to SomePtr(T),
-        // whose __init__ asserts T is a Ptr. A bare Struct therefore
-        // trips the SomePtr assertion; the Rust port surfaces this as
-        // an explicit panic at the dispatch site.
-        let _ = lltype_to_annotation(lltype::LowLevelType::Struct(Box::new(lltype::Struct::new(
-            "S",
-            vec![("x".into(), lltype::LowLevelType::Signed)],
-        ))));
-    }
-
-    #[test]
-    #[should_panic(expected = "must be wrapped in Ptr(T)")]
-    fn lltype_to_annotation_rejects_bare_func() {
-        let _ = lltype_to_annotation(lltype::LowLevelType::Func(Box::new(lltype::FuncType {
-            args: vec![],
-            result: lltype::LowLevelType::Void,
-        })));
-    }
-
-    #[test]
-    #[should_panic(expected = "must be wrapped in Ptr(T)")]
-    fn lltype_to_annotation_rejects_bare_array() {
-        let _ = lltype_to_annotation(lltype::LowLevelType::Array(Box::new(lltype::Array::new(
-            lltype::LowLevelType::Signed,
-        ))));
+    fn lltype_to_annotation_rejects_bare_compounds() {
+        let cases = [
+            (
+                "struct",
+                lltype::LowLevelType::Struct(Box::new(lltype::Struct::new(
+                    "S",
+                    vec![("x".into(), lltype::LowLevelType::Signed)],
+                ))),
+            ),
+            (
+                "func",
+                lltype::LowLevelType::Func(Box::new(lltype::FuncType {
+                    args: vec![],
+                    result: lltype::LowLevelType::Void,
+                })),
+            ),
+            (
+                "array",
+                lltype::LowLevelType::Array(Box::new(lltype::Array::new(
+                    lltype::LowLevelType::Signed,
+                ))),
+            ),
+        ];
+        for (name, ty) in cases {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = lltype_to_annotation(ty);
+            }));
+            let Err(payload) = result else {
+                panic!("case {name}: expected panic");
+            };
+            let msg = if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else if let Some(s) = payload.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else {
+                "assertion failed".to_string()
+            };
+            assert!(
+                msg.contains("must be wrapped in Ptr(T)"),
+                "case {name}: {msg}"
+            );
+        }
     }
 
     #[test]

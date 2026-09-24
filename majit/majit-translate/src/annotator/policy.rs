@@ -447,27 +447,20 @@ mod tests {
     }
 
     #[test]
-    fn specialize_arg_parses_parms() {
+    fn specialize_arg_parses_parm_lists() {
+        let cases = [
+            ("single", "specialize:arg(0)", vec!["0".to_string()]),
+            (
+                "multi",
+                "specialize:arg(0, 1)",
+                vec!["0".to_string(), "1".to_string()],
+            ),
+        ];
         let pol = AnnotatorPolicy::new();
-        let sp = pol.get_specializer(Some("specialize:arg(0)")).unwrap();
-        assert_eq!(
-            sp,
-            Specializer::Arg {
-                parms: vec!["0".to_string()]
-            }
-        );
-    }
-
-    #[test]
-    fn specialize_arg_multi_parm() {
-        let pol = AnnotatorPolicy::new();
-        let sp = pol.get_specializer(Some("specialize:arg(0, 1)")).unwrap();
-        assert_eq!(
-            sp,
-            Specializer::Arg {
-                parms: vec!["0".to_string(), "1".to_string()]
-            }
-        );
+        for (name, spec, parms) in cases {
+            let sp = pol.get_specializer(Some(spec)).unwrap();
+            assert_eq!(sp, Specializer::Arg { parms }, "case {name}");
+        }
     }
 
     #[test]

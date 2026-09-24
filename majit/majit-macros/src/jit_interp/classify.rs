@@ -346,80 +346,48 @@ mod tests {
     }
 
     #[test]
-    fn classify_simple_call_as_lowerable() {
-        let arm = parse_arm("0 => { foo(); },");
-        let result = classify_arm_body(&arm.body);
-        assert!(matches!(result, ArmPattern::Lowerable));
+    fn classify_control_flow_as_lowerable() {
+        let cases = [
+            ("simple_call", "0 => { foo(); },"),
+            ("if_else", "0 => { if cond { a(); } else { b(); } },"),
+            (
+                "nested_if_else",
+                "0 => { if a { if b { x(); } else { y(); } } else { z(); } },",
+            ),
+            (
+                "standalone_match",
+                "0 => { match op { 1 => a(), _ => b() } },",
+            ),
+            (
+                "nested_match_with_loop",
+                "0 => { match op { 1 => { loop { break; } }, _ => b() } },",
+            ),
+            ("loop", "0 => { loop { break; } },"),
+            ("while", "0 => { while cond { x(); } },"),
+            ("for", "0 => { for i in 0..10 { x(); } },"),
+            (
+                "nested_loop_in_if",
+                "0 => { if cond { loop { break; } } else { x(); } },",
+            ),
+        ];
+        for (name, src) in cases {
+            let arm = parse_arm(src);
+            let result = classify_arm_body(&arm.body);
+            assert!(matches!(result, ArmPattern::Lowerable), "case {name}");
+        }
     }
 
     #[test]
-    fn classify_if_else_as_lowerable() {
-        let arm = parse_arm("0 => { if cond { a(); } else { b(); } },");
-        let result = classify_arm_body(&arm.body);
-        assert!(matches!(result, ArmPattern::Lowerable));
-    }
-
-    #[test]
-    fn classify_nested_if_else_as_lowerable() {
-        let arm = parse_arm("0 => { if a { if b { x(); } else { y(); } } else { z(); } },");
-        let result = classify_arm_body(&arm.body);
-        assert!(matches!(result, ArmPattern::Lowerable));
-    }
-
-    #[test]
-    fn classify_standalone_match_as_lowerable() {
-        let arm = parse_arm("0 => { match op { 1 => a(), _ => b() } },");
-        let result = classify_arm_body(&arm.body);
-        assert!(matches!(result, ArmPattern::Lowerable));
-    }
-
-    #[test]
-    fn classify_nested_match_with_loop_as_lowerable() {
-        let arm = parse_arm("0 => { match op { 1 => { loop { break; } }, _ => b() } },");
-        let result = classify_arm_body(&arm.body);
-        assert!(matches!(result, ArmPattern::Lowerable));
-    }
-
-    #[test]
-    fn classify_loop_as_lowerable() {
-        let arm = parse_arm("0 => { loop { break; } },");
-        let result = classify_arm_body(&arm.body);
-        assert!(matches!(result, ArmPattern::Lowerable));
-    }
-
-    #[test]
-    fn classify_while_as_lowerable() {
-        let arm = parse_arm("0 => { while cond { x(); } },");
-        let result = classify_arm_body(&arm.body);
-        assert!(matches!(result, ArmPattern::Lowerable));
-    }
-
-    #[test]
-    fn classify_for_as_lowerable() {
-        let arm = parse_arm("0 => { for i in 0..10 { x(); } },");
-        let result = classify_arm_body(&arm.body);
-        assert!(matches!(result, ArmPattern::Lowerable));
-    }
-
-    #[test]
-    fn classify_nested_loop_in_if_as_lowerable() {
-        let arm = parse_arm("0 => { if cond { loop { break; } } else { x(); } },");
-        let result = classify_arm_body(&arm.body);
-        assert!(matches!(result, ArmPattern::Lowerable));
-    }
-
-    #[test]
-    fn classify_read_number_as_abort() {
-        let arm = parse_arm("0 => { read_number(); },");
-        let result = classify_arm_body(&arm.body);
-        assert!(matches!(result, ArmPattern::AbortPermanent));
-    }
-
-    #[test]
-    fn classify_method_read_utf8_as_abort() {
-        let arm = parse_arm("0 => { io.read_utf8(); },");
-        let result = classify_arm_body(&arm.body);
-        assert!(matches!(result, ArmPattern::AbortPermanent));
+    fn classify_read_calls_as_abort() {
+        let cases = [
+            ("read_number", "0 => { read_number(); },"),
+            ("read_utf8", "0 => { io.read_utf8(); },"),
+        ];
+        for (name, src) in cases {
+            let arm = parse_arm(src);
+            let result = classify_arm_body(&arm.body);
+            assert!(matches!(result, ArmPattern::AbortPermanent), "case {name}");
+        }
     }
 
     /// NOT behavioural coverage of `detect_unsupported_pattern` — read the
