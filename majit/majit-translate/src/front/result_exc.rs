@@ -2232,7 +2232,7 @@ fn catch_and_rewrap(
     if let (Some(ok_shell), Some(err_shell), Some(ok_payload), Some(err_payload)) =
         (n_shell, e_shell, ok_payload, err_payload)
     {
-        let _ = collapse_rebuilt_shell_match(
+        if let Err(msg) = collapse_rebuilt_shell_match(
             graph,
             n_id.0,
             e_id.0,
@@ -2240,7 +2240,17 @@ fn catch_and_rewrap(
             &err_shell,
             &ok_payload,
             &err_payload,
-        );
+        ) {
+            // The rewrap above is the fail-safe. A collapse refusal must
+            // stay visible to the census the same way a drain-fusion
+            // refusal does; dropping the `Err` here used to hide it.
+            crate::decline::record_reason(
+                RESULT_EXC_CALLER_GATE,
+                "rebuilt-shell-collapse-declined",
+                &msg,
+                &graph.name,
+            );
+        }
     }
     Ok(())
 }
@@ -2266,6 +2276,14 @@ fn collapse_rebuilt_shell_match(
 ) -> Result<(), String> {
     let n_exit = single_exit(graph, normal)?;
     let e_exit = single_exit(graph, handler)?;
+    // `catch_and_rewrap` writes the shell into every slot `r` occupied.
+    // A second slot becomes a second arm inputarg still bound to the
+    // shell, and deleting the build would leave that use undefined.
+    if value_occurrences(&n_exit.args, ok_shell) != 1
+        || value_occurrences(&e_exit.args, err_shell) != 1
+    {
+        return Err("rebuilt shell is threaded into more than one exit slot".to_string());
+    }
     if n_exit.target != e_exit.target {
         return Err("rebuilt shells do not meet at one match".to_string());
     }
@@ -2283,6 +2301,16 @@ fn collapse_rebuilt_shell_match(
         ));
     }
     let (_, disc, shell_in) = match_discriminant(graph, m)?;
+    let shell_binds = graph.blocks[m]
+        .inputargs
+        .iter()
+        .filter(|arg| *arg == &shell_in)
+        .count();
+    if shell_binds != 1 {
+        return Err(format!(
+            "match block {m} binds the shell in {shell_binds} inputargs"
+        ));
+    }
     if graph.blocks[m].operations.len() != 1 {
         return Err(format!("match block {m} is not a pure discriminant switch"));
     }
@@ -2293,8 +2321,30 @@ fn collapse_rebuilt_shell_match(
     assert_single_pred(graph, err_arm, "rebuilt shell match")?;
     let ok_shell_arm = arm_shell_var(graph, &ok_link, &shell_in)?;
     let err_shell_arm = arm_shell_var(graph, &err_link, &shell_in)?;
-    let ok_reads = shell_pos0_reads(graph, ok_arm, &ok_shell_arm)?;
-    let err_reads = shell_pos0_reads(graph, err_arm, &err_shell_arm)?;
+    let ok_walk = shell_pos0_reads(graph, ok_arm, &ok_shell_arm)?;
+    let err_walk = shell_pos0_reads(graph, err_arm, &err_shell_arm)?;
+    if ok_walk
+        .visited
+        .iter()
+        .any(|block| err_walk.visited.contains(block))
+    {
+        return Err("rebuilt shell Ok and Err arms share a block".to_string());
+    }
+    let mut collapses = Vec::new();
+    for (block, pos) in ok_walk.reads.iter().chain(err_walk.reads.iter()) {
+        let Some(read_result) = classify_pos0_carrier(graph, *block, *pos, "rebuilt shell match")?
+        else {
+            return Err(format!(
+                "rebuilt shell match: block {block} __pos_0 read vanished before collapse"
+            ));
+        };
+        let carrier = graph.blocks[*block].inputargs[*pos].clone();
+        collapses.push(Pos0Collapse {
+            block: *block,
+            carrier,
+            read_result,
+        });
+    }
     let ok_args = project_arm_args(
         &n_exit.args,
         &graph.blocks[m].inputargs,
@@ -2313,16 +2363,112 @@ fn collapse_rebuilt_shell_match(
         &disc,
         1,
     )?;
-    remove_shell_build(graph, normal, ok_shell)?;
-    remove_shell_build(graph, handler, err_shell)?;
+    let ok_build = shell_build_ops(graph, normal, ok_shell)?;
+    let err_build = shell_build_ops(graph, handler, err_shell)?;
+    // Every check has run. The edits below do not fail.
+    delete_ops(graph, normal, ok_build);
+    delete_ops(graph, handler, err_build);
     graph.blocks[normal].exits = vec![Link::new_mixed(ok_args, ok_link.target, None)];
     graph.blocks[normal].exitswitch = None;
     graph.blocks[handler].exits = vec![Link::new_mixed(err_args, err_link.target, None)];
     graph.blocks[handler].exitswitch = None;
-    for (block, pos) in ok_reads.into_iter().chain(err_reads) {
-        collapse_pos0_read(graph, BlockId(block), pos, "rebuilt shell match")?;
+    for plan in collapses {
+        apply_pos0_collapse(graph, &plan);
     }
     Ok(())
+}
+
+fn value_occurrences(args: &[LinkArg], var: &Variable) -> usize {
+    args.iter()
+        .filter(|arg| matches!(arg, LinkArg::Value(v) if v == var))
+        .count()
+}
+
+struct Pos0Collapse {
+    block: usize,
+    carrier: Variable,
+    read_result: Variable,
+}
+
+/// The checks of [`collapse_pos0_read`] with no graph edit.
+/// `Some` is the `__pos_0` read's result; `None` is a discarded payload.
+fn classify_pos0_carrier(
+    graph: &FunctionGraph,
+    block: usize,
+    pos: usize,
+    name: &str,
+) -> Result<Option<Variable>, String> {
+    let carrier = graph.blocks[block]
+        .inputargs
+        .get(pos)
+        .cloned()
+        .ok_or_else(|| format!("{name}: continue target lacks inputarg {pos}"))?;
+    let mut read_result = None;
+    for op in &graph.blocks[block].operations {
+        if !op_operand_vars(&op.kind)
+            .iter()
+            .any(|operand| operand == &carrier)
+        {
+            continue;
+        }
+        match &op.kind {
+            OpKind::FieldRead { base, field, .. }
+                if base == &carrier && field.name == "__pos_0" =>
+            {
+                if read_result.is_some() {
+                    return Err(format!("block {block} reads __pos_0 twice"));
+                }
+                let Some(result) = op.result.clone() else {
+                    return Err(format!("{name}: __pos_0 read without result"));
+                };
+                read_result = Some(result);
+            }
+            _ => {
+                return Err(format!(
+                    "{name}: continue target block {block} uses the ControlFlow \
+                     carrier outside a __pos_0 read — unsupported shape"
+                ));
+            }
+        }
+    }
+    Ok(read_result)
+}
+
+/// Delete the `__pos_0` read [`classify_pos0_carrier`] already accepted
+/// and rename its result to the carrier. The carrier and the read are
+/// unchanged by the shell-build removal, so this does not fail.
+fn apply_pos0_collapse(graph: &mut FunctionGraph, plan: &Pos0Collapse) {
+    let Some(read_idx) = graph.blocks[plan.block].operations.iter().position(|op| {
+        matches!(
+            &op.kind,
+            OpKind::FieldRead { base, field, .. }
+                if base == &plan.carrier && field.name == "__pos_0"
+        )
+    }) else {
+        return;
+    };
+    graph.blocks[plan.block].operations.remove(read_idx);
+    let carrier = plan.carrier.clone();
+    let read_result = plan.read_result.clone();
+    let rename = |v: &Variable| -> Variable {
+        if *v == read_result {
+            carrier.clone()
+        } else {
+            v.clone()
+        }
+    };
+    let block = &mut graph.blocks[plan.block];
+    for op in &mut block.operations {
+        op.kind = crate::inline::remap_op_kind(&op.kind, &rename);
+    }
+    let (sw, exits) = crate::model::remap_control_flow_metadata_var(
+        &block.exitswitch,
+        &block.exits,
+        rename,
+        |b| b,
+    );
+    block.exitswitch = sw;
+    block.exits = exits;
 }
 
 fn single_exit(graph: &FunctionGraph, block: usize) -> Result<Link, String> {
@@ -2390,15 +2536,23 @@ fn arm_shell_var(
         .ok_or_else(|| format!("arm block {} lacks inputarg {pos}", link.target.0))
 }
 
+struct ShellPos0Walk {
+    /// `(block, inputarg position)` of a `__pos_0` read the collapse can delete.
+    reads: Vec<(usize, usize)>,
+    /// Every block the walk entered, including `start`.
+    visited: Vec<usize>,
+}
+
 /// Blocks reachable from `start` whose shell alias is only a `__pos_0`
-/// read or a forwarded link arg. Each entry is `(block, inputarg position)`
-/// of a read [`collapse_pos0_read`] can delete.
+/// read or a forwarded link arg. Each read entry is `(block, inputarg
+/// position)` of a read the collapse can delete.
 fn shell_pos0_reads(
     graph: &FunctionGraph,
     start: usize,
     shell: &Variable,
-) -> Result<Vec<(usize, usize)>, String> {
+) -> Result<ShellPos0Walk, String> {
     let mut reads = Vec::new();
+    let mut visited = Vec::new();
     let mut seen: Vec<(usize, u64)> = Vec::new();
     let mut work = vec![(start, shell.clone())];
     while let Some((block, var)) = work.pop() {
@@ -2406,6 +2560,24 @@ fn shell_pos0_reads(
             continue;
         }
         seen.push((block, var.id()));
+        if !visited.contains(&block) {
+            visited.push(block);
+        }
+        // `start` is the arm block, already `assert_single_pred`. Every
+        // later block this walk enters has to be single-predecessor too:
+        // a merge that only forwards the shell still joins a value this
+        // walk did not rewrite into the reader downstream.
+        if block != start {
+            let preds = graph
+                .blocks
+                .iter()
+                .flat_map(|b| b.exits.iter())
+                .filter(|link| link.target.0 == block)
+                .count();
+            if preds != 1 {
+                return Err(format!("block {block} has {preds} predecessors"));
+            }
+        }
         let mut read_result: Option<Variable> = None;
         for op in &graph.blocks[block].operations {
             if !op_operand_vars(&op.kind)
@@ -2453,16 +2625,23 @@ fn shell_pos0_reads(
         }
         for link in &graph.blocks[block].exits {
             for (i, arg) in link.args.iter().enumerate() {
-                let carries = match arg {
-                    LinkArg::Value(v) if v == &var => true,
-                    LinkArg::Value(v) if read_result.as_ref() == Some(v) => true,
-                    _ => false,
-                };
-                if !carries {
+                let shell_alias = matches!(arg, LinkArg::Value(v) if v == &var);
+                let payload_alias = read_result
+                    .as_ref()
+                    .is_some_and(|result| matches!(arg, LinkArg::Value(v) if v == result));
+                if !shell_alias && !payload_alias {
                     continue;
                 }
                 let target = link.target.0;
                 if target == graph.returnblock.0 || target == graph.exceptblock.0 {
+                    // The unwrapped payload may leave the function. The
+                    // shell alias must not: that returns the Result / the
+                    // PyError as a normal value.
+                    if shell_alias {
+                        return Err(format!(
+                            "block {block} forwards the Result shell to the function exit"
+                        ));
+                    }
                     continue;
                 }
                 let Some(next) = graph.blocks[target].inputargs.get(i).cloned() else {
@@ -2472,7 +2651,7 @@ fn shell_pos0_reads(
             }
         }
     }
-    Ok(reads)
+    Ok(ShellPos0Walk { reads, visited })
 }
 
 /// Rebuild `arm_args` from the predecessor's exit. A match input becomes
@@ -2523,11 +2702,12 @@ fn project_arm_args(
         .collect()
 }
 
-fn remove_shell_build(
-    graph: &mut FunctionGraph,
+/// Op indices of the `Ok`/`Err` ctor and its `__pos_0` write. No edit.
+fn shell_build_ops(
+    graph: &FunctionGraph,
     block: usize,
     shell: &Variable,
-) -> Result<(), String> {
+) -> Result<Vec<usize>, String> {
     let mut remove = Vec::new();
     let mut saw_ctor = false;
     let mut saw_write = false;
@@ -2549,10 +2729,13 @@ fn remove_shell_build(
     }
     remove.sort_unstable();
     remove.dedup();
-    for index in remove.into_iter().rev() {
+    Ok(remove)
+}
+
+fn delete_ops(graph: &mut FunctionGraph, block: usize, indices: Vec<usize>) {
+    for index in indices.into_iter().rev() {
         graph.blocks[block].operations.remove(index);
     }
-    Ok(())
 }
 
 /// True iff `owner` names a `Result<T, PyError>` — the discriminant read's
@@ -4608,6 +4791,372 @@ mod carrier_tests {
         assert!(
             !tyref_is_result_of_carrier(&result, &llbc, d),
             "an undeclared carrier lowers nothing",
+        );
+    }
+}
+
+#[cfg(test)]
+mod rebuilt_shell_collapse_tests {
+    use super::*;
+    use crate::flowspace::model::ConstValue;
+    use crate::model::{ExitCase, FieldDescriptor, SpaceOperation};
+
+    fn disc_owner() -> FieldDescriptor {
+        FieldDescriptor::new(
+            "__discriminant",
+            Some("core::result::Result<i64,PyError>".into()),
+        )
+    }
+
+    fn payload_owner(variant: &str) -> FieldDescriptor {
+        FieldDescriptor::new(
+            "__pos_0",
+            Some(format!("core::result::Result<i64,PyError>::{variant}")),
+        )
+    }
+
+    fn push_shell(
+        graph: &mut FunctionGraph,
+        block: BlockId,
+        variant: &str,
+        payload: &Variable,
+    ) -> Variable {
+        let shell = graph
+            .push_op_var(
+                block,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor_with_owner(
+                        vec!["core".into(), "result".into(), "Result<i64,PyError>".into()],
+                        variant,
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("shell");
+        graph.blocks[block.0].operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: shell.clone(),
+                field: payload_owner(variant),
+                value: LinkArg::Value(payload.clone()),
+                ty: ValueType::Int,
+            },
+        });
+        shell
+    }
+
+    struct Fixture {
+        graph: FunctionGraph,
+        normal: usize,
+        handler: usize,
+        ok_shell: Variable,
+        err_shell: Variable,
+        ok_payload: Variable,
+        err_payload: Variable,
+        ok_arm: usize,
+    }
+
+    fn fixture() -> Fixture {
+        let mut graph = FunctionGraph::new("rebuilt_shell");
+        let ok_payload = graph.alloc_value_var();
+        let err_payload = graph.alloc_value_var();
+        let (normal_id, _) = graph.create_block_with_arg_vars(0);
+        let (handler_id, _) = graph.create_block_with_arg_vars(0);
+        let ok_shell = push_shell(&mut graph, normal_id, "Ok", &ok_payload);
+        let err_shell = push_shell(&mut graph, handler_id, "Err", &err_payload);
+
+        let (match_id, match_args) = graph.create_block_with_arg_vars(1);
+        let shell_in = match_args[0].clone();
+        let disc = graph
+            .push_op_var(
+                match_id,
+                OpKind::FieldRead {
+                    base: shell_in.clone(),
+                    field: disc_owner(),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("disc");
+
+        let (ok_id, ok_args) = graph.create_block_with_arg_vars(1);
+        let ok_read = graph
+            .push_op_var(
+                ok_id,
+                OpKind::FieldRead {
+                    base: ok_args[0].clone(),
+                    field: payload_owner("Ok"),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("ok read");
+        graph.set_return(ok_id, Some(ok_read));
+
+        let (err_id, err_args) = graph.create_block_with_arg_vars(1);
+        let err_read = graph
+            .push_op_var(
+                err_id,
+                OpKind::FieldRead {
+                    base: err_args[0].clone(),
+                    field: payload_owner("Err"),
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
+                true,
+            )
+            .expect("err read");
+        graph.set_goto(err_id, graph.returnblock, vec![err_read]);
+
+        graph.block_mut(match_id).exitswitch = Some(ExitSwitch::Value(disc));
+        graph.block_mut(match_id).exits = vec![
+            Link::new_mixed(
+                vec![LinkArg::Value(shell_in.clone())],
+                ok_id,
+                Some(ExitCase::Const(ConstValue::Int(0))),
+            ),
+            Link::new_mixed(
+                vec![LinkArg::Value(shell_in)],
+                err_id,
+                Some(ExitCase::Const(ConstValue::Int(1))),
+            ),
+        ];
+        graph.set_goto(normal_id, match_id, vec![ok_shell.clone()]);
+        graph.set_goto(handler_id, match_id, vec![err_shell.clone()]);
+        Fixture {
+            graph,
+            normal: normal_id.0,
+            handler: handler_id.0,
+            ok_shell,
+            err_shell,
+            ok_payload,
+            err_payload,
+            ok_arm: ok_id.0,
+        }
+    }
+
+    fn shell_ctors(graph: &FunctionGraph) -> usize {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| {
+                matches!(&op.kind, OpKind::Call { target, .. } if result_ctor_kind(target).is_some())
+            })
+            .count()
+    }
+
+    fn collapse(fix: &mut Fixture) -> Result<(), String> {
+        collapse_rebuilt_shell_match(
+            &mut fix.graph,
+            fix.normal,
+            fix.handler,
+            &fix.ok_shell,
+            &fix.err_shell,
+            &fix.ok_payload,
+            &fix.err_payload,
+        )
+    }
+
+    #[test]
+    fn pure_pos0_match_drops_the_rebuilt_shells() {
+        let mut fix = fixture();
+        collapse(&mut fix).expect("pure __pos_0 match collapses");
+        assert_eq!(shell_ctors(&fix.graph), 0, "Ok and Err shells are removed");
+        let exit = &fix.graph.blocks[fix.normal].exits[0];
+        assert_eq!(exit.target.0, fix.ok_arm);
+        assert!(
+            matches!(&exit.args[0], LinkArg::Value(v) if *v == fix.ok_payload),
+            "the normal edge carries the unwrapped payload"
+        );
+    }
+
+    #[test]
+    fn a_second_shell_slot_declines_before_the_build_is_removed() {
+        let mut fix = fixture();
+        fix.graph.blocks[fix.normal].exits[0]
+            .args
+            .push(LinkArg::Value(fix.ok_shell.clone()));
+        let err = collapse(&mut fix).expect_err("two shell slots decline");
+        assert!(err.contains("more than one exit slot"), "{err}");
+        assert_eq!(shell_ctors(&fix.graph), 2, "the shell builds stay");
+    }
+
+    #[test]
+    fn a_match_that_binds_the_shell_twice_declines() {
+        let mut fix = fixture();
+        let shell_in =
+            fix.graph.blocks[fix.graph.blocks[fix.normal].exits[0].target.0].inputargs[0].clone();
+        let match_block = fix.graph.blocks[fix.normal].exits[0].target.0;
+        fix.graph.blocks[match_block].inputargs.push(shell_in);
+        let err = collapse(&mut fix).expect_err("duplicate shell inputarg declines");
+        assert!(err.contains("inputargs"), "{err}");
+        assert_eq!(shell_ctors(&fix.graph), 2);
+    }
+
+    #[test]
+    fn forwarding_the_shell_to_the_return_declines() {
+        let mut fix = fixture();
+        let shell = fix.graph.blocks[fix.ok_arm].inputargs[0].clone();
+        fix.graph.blocks[fix.ok_arm].exits[0].args = vec![LinkArg::Value(shell)];
+        let err = collapse(&mut fix).expect_err("shell forwarded to return declines");
+        assert!(err.contains("function exit"), "{err}");
+        assert_eq!(shell_ctors(&fix.graph), 2, "decline leaves the shells");
+    }
+
+    #[test]
+    fn a_downstream_read_with_two_predecessors_declines() {
+        let mut fix = fixture();
+        let shell = fix.graph.blocks[fix.ok_arm].inputargs[0].clone();
+        let (read_id, read_args) = fix.graph.create_block_with_arg_vars(1);
+        let read = fix
+            .graph
+            .push_op_var(
+                read_id,
+                OpKind::FieldRead {
+                    base: read_args[0].clone(),
+                    field: payload_owner("Ok"),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("downstream read");
+        fix.graph
+            .set_goto(read_id, fix.graph.returnblock, vec![read]);
+        // The arm no longer reads; it forwards the shell into the shared read.
+        fix.graph.blocks[fix.ok_arm].operations.clear();
+        fix.graph
+            .set_goto(BlockId(fix.ok_arm), read_id, vec![shell]);
+        let (extra_id, _) = fix.graph.create_block_with_arg_vars(0);
+        let filler = fix.graph.alloc_value_var();
+        fix.graph.set_goto(extra_id, read_id, vec![filler]);
+        let err = collapse(&mut fix).expect_err("multi-pred read declines");
+        assert!(err.contains("predecessors"), "{err}");
+        assert_eq!(shell_ctors(&fix.graph), 2);
+    }
+
+    /// The reader itself has one predecessor. The merge in front of it
+    /// has two, and only forwards the shell. That merge is the miscompile.
+    #[test]
+    fn a_forwarding_merge_in_front_of_a_single_pred_read_declines() {
+        let mut fix = fixture();
+        let shell = fix.graph.blocks[fix.ok_arm].inputargs[0].clone();
+        let (merge_id, merge_args) = fix.graph.create_block_with_arg_vars(1);
+        let (read_id, read_args) = fix.graph.create_block_with_arg_vars(1);
+        let read = fix
+            .graph
+            .push_op_var(
+                read_id,
+                OpKind::FieldRead {
+                    base: read_args[0].clone(),
+                    field: payload_owner("Ok"),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("downstream read");
+        fix.graph
+            .set_goto(read_id, fix.graph.returnblock, vec![read]);
+        fix.graph.blocks[fix.ok_arm].operations.clear();
+        fix.graph
+            .set_goto(BlockId(fix.ok_arm), merge_id, vec![shell]);
+        fix.graph
+            .set_goto(merge_id, read_id, vec![merge_args[0].clone()]);
+        let (extra_id, _) = fix.graph.create_block_with_arg_vars(0);
+        let filler = fix.graph.alloc_value_var();
+        fix.graph.set_goto(extra_id, merge_id, vec![filler]);
+        let err = collapse(&mut fix).expect_err("forwarding merge declines");
+        assert!(err.contains("predecessors"), "{err}");
+        assert_eq!(shell_ctors(&fix.graph), 2, "decline leaves the shells");
+    }
+
+    #[test]
+    fn ok_and_err_walks_that_share_a_block_decline_before_any_edit() {
+        let mut fix = fixture();
+        let (shared_id, _) = fix.graph.create_block_with_arg_vars(1);
+        fix.graph.set_return(shared_id, None);
+        let ok_read = fix.graph.blocks[fix.ok_arm].operations[0]
+            .result
+            .clone()
+            .expect("ok read result");
+        let err_arm = fix.graph.blocks[fix.handler].exits[0].target.0;
+        // handler exits to the err arm, not to the read. The err arm is the
+        // block whose exit we retarget.
+        let err_block = fix
+            .graph
+            .blocks
+            .iter()
+            .position(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldRead { field, .. }
+                            if field.owner_root.as_deref().is_some_and(|o| o.ends_with("::Err"))
+                    )
+                })
+            })
+            .expect("err arm");
+        let err_read = fix.graph.blocks[err_block].operations[0]
+            .result
+            .clone()
+            .expect("err read result");
+        let _ = err_arm;
+        fix.graph
+            .set_goto(BlockId(fix.ok_arm), shared_id, vec![ok_read]);
+        fix.graph
+            .set_goto(BlockId(err_block), shared_id, vec![err_read]);
+        let err = collapse(&mut fix).expect_err("shared block declines");
+        assert!(err.contains("predecessors"), "{err}");
+        assert_eq!(
+            shell_ctors(&fix.graph),
+            2,
+            "the decline happens before the shell builds are deleted"
+        );
+    }
+
+    #[test]
+    fn catch_and_rewrap_keeps_the_shells_when_collapse_declines() {
+        let mut graph = FunctionGraph::new("rewrap_keeps_shell");
+        let a = graph.startblock;
+        let r = graph
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::function_path(["callee"]),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("call");
+        let (tail, _) = graph.create_block_with_arg_vars(1);
+        graph.set_return(tail, None);
+        graph.set_goto(a, tail, vec![r.clone()]);
+        catch_and_rewrap(
+            &mut graph,
+            a.0,
+            &r,
+            "<i64,PyError>",
+            &ValueType::Int,
+            crate::ErrorCarrierSpec::default(),
+        )
+        .expect("rewrap");
+        assert!(
+            matches!(
+                graph.blocks[a.0].exitswitch,
+                Some(ExitSwitch::LastException)
+            ),
+            "the rewrap stays in place"
+        );
+        assert!(
+            shell_ctors(&graph) >= 1,
+            "a non-match consumer keeps the rebuilt shells"
         );
     }
 }
