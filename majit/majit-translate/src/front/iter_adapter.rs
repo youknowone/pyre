@@ -37,7 +37,9 @@
 
 use crate::flowspace::model::{ConstValue, Variable};
 use crate::front::bool_then::{close_goto_mixed, reproduce_exit_args};
-use crate::front::iter_next::{originates_from_iter_op, walk_back_to_source};
+use crate::front::iter_next::{
+    BackEdges, iter_op_container_with, originates_from_iter_op, walk_back_to_source, walk_back_with,
+};
 use crate::front::option_map_or::emit_narrow;
 use crate::front::result_exc::back_substitute;
 use crate::model::{
@@ -92,9 +94,10 @@ fn adapter_path_ends_with(segments: &[String], adapter: &str, leaf: &str) -> boo
 /// reaches `enumerate(it)` or an `Enumerate { iter, count }` aggregate.
 pub(crate) fn inner_iter_of_enumerate(
     graph: &FunctionGraph,
+    edges: &BackEdges,
     enum_var: &Variable,
 ) -> Option<Variable> {
-    if let Some(inner) = walk_back_to_source(graph, enum_var, |op| match &op.kind {
+    if let Some(inner) = walk_back_with(graph, edges, enum_var, |op| match &op.kind {
         OpKind::Call { target, args, .. }
             if is_enumerate_ctor_target(target) && args.len() == 1 =>
         {
@@ -104,7 +107,7 @@ pub(crate) fn inner_iter_of_enumerate(
     }) {
         return Some(inner);
     }
-    let origin = walk_back_to_source(graph, enum_var, |op| match &op.kind {
+    let origin = walk_back_with(graph, edges, enum_var, |op| match &op.kind {
         OpKind::Call {
             target: CallTarget::SyntheticTransparentCtor { .. },
             ..
@@ -166,13 +169,16 @@ fn emit_pair_field_write(
 /// loop-carried SSA slot.
 pub(crate) fn rewrite_enumerate_ctor_to_pair(
     graph: &mut FunctionGraph,
+    edges: &BackEdges,
     enum_var: &Variable,
     inner: &Variable,
 ) -> Result<(), String> {
     let name = graph.name.clone();
     // `enum_var` is often the loop-header phi; the constructor lives on
-    // the entry edge.  Rewrite that origin op, not the phi.
-    let origin = walk_back_to_source(graph, enum_var, |op| match &op.kind {
+    // the entry edge.  Rewrite that origin op, not the phi.  `edges`
+    // indexes the graph as it stands on entry; the walk runs before this
+    // function's first mutation.
+    let origin = walk_back_with(graph, edges, enum_var, |op| match &op.kind {
         OpKind::Call { target, .. } if is_enumerate_ctor_target(target) => op.result.clone(),
         _ => None,
     })
@@ -452,19 +458,20 @@ fn collapse_pos0_onto(
 /// Does not mutate; the caller validates the diamond first.
 pub(crate) fn enumerate_list_inner(
     graph: &FunctionGraph,
+    edges: &BackEdges,
     next_target: &CallTarget,
     enum_var: &Variable,
 ) -> Result<Option<Variable>, String> {
     if !is_enumerate_next_target(next_target) {
         return Ok(None);
     }
-    let inner = inner_iter_of_enumerate(graph, enum_var).ok_or_else(|| {
+    let inner = inner_iter_of_enumerate(graph, edges, enum_var).ok_or_else(|| {
         format!(
             "{}: Enumerate::next iterator does not originate from enumerate(it)",
             graph.name
         )
     })?;
-    if !originates_from_iter_op(graph, &inner) {
+    if iter_op_container_with(graph, edges, &inner).is_none() {
         return Err(format!(
             "{}: Enumerate inner iterator does not originate from an iter op",
             graph.name
