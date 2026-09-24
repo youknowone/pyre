@@ -670,7 +670,10 @@ mod tests {
         let h_add = b_add_args[0].clone();
         let len_add = b_add_args[1].clone();
         g.set_goto(b_len, b_add, vec![h_len, len.clone()]);
-        let offset = g.push_op_var(b_add, OpKind::ConstUInt(16), true).unwrap();
+        let chars_off = (2 * crate::layout::target_word_size()) as u64;
+        let offset = g
+            .push_op_var(b_add, OpKind::ConstUInt(chars_off), true)
+            .unwrap();
         let chars = g
             .push_op_var(
                 b_add,

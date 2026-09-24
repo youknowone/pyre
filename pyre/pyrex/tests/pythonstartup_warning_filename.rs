@@ -50,7 +50,17 @@ fn pythonstartup_syntaxwarning_filename_matches_file() {
         .lines()
         .find(|line| line.starts_with("CODE "))
         .expect("CODE line");
-    assert_eq!(file_line["FILE ".len()..], code_line["CODE ".len()..]);
+    let file_name = &file_line["FILE ".len()..];
+    let code_name = &code_line["CODE ".len()..];
+    assert_eq!(file_name, code_name);
+    assert!(
+        file_name.contains(r"\udcff"),
+        "FILE lost the fsdecoded surrogate: {file_name}"
+    );
+    assert!(
+        code_name.contains(r"\udcff"),
+        "CODE lost the fsdecoded surrogate: {code_name}"
+    );
     assert!(
         !output
             .stderr

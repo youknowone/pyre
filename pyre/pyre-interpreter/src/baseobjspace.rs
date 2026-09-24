@@ -17212,8 +17212,12 @@ fn fixedview_impl<const UNROLL: bool>(
                 let _ = majit_metainterp::jit::promote(length);
             }
             // `getitems_unroll` and `getitems_fixedsize` both snapshot storage.
-            // Iteration is only the generic arm below.
-            return Ok(pyre_object::listobject::w_list_items_copy_as_vec(current()));
+            // `AbstractUnwrappedStrategy.getitems_copy` skips wrapper reuse
+            // while `jit.we_are_jitted()`.
+            return Ok(pyre_object::listobject::w_list_items_copy_as_vec_mode(
+                current(),
+                majit_metainterp::jit::we_are_jitted(),
+            ));
         }
     }
     let w_obj = current();

@@ -4621,11 +4621,13 @@ fn reconcile_elided_phi_inputargs(
 /// which proves it: `front::option_closure_select` replaces
 /// `Option::unwrap_or_else` with the direct discriminant diamond RPython's
 /// closure-free source would have built and synthesizes a closure
-/// `call_once` in the `None` arm.  Charon retains the concrete `FnOnce::Output`
-/// as that op's `result_ty` but does not monomorphize it into the registered
-/// closure method, so the real rtyper can default the live result to `Void`.
-/// For that synthesized closure call alone, carry a declared `Signed` or
-/// `Float` result onto the twin.  An ordinary scalar call is deliberately not
+/// `call_once` in the `None` arm, and `front::iter_adapter` synthesizes
+/// `call_mut` for `map(...).collect()`.  Charon retains the concrete
+/// `FnOnce::Output` / `FnMut::Output` as that op's `result_ty` but does not
+/// monomorphize it into the registered closure method, so the real rtyper
+/// can default the live result to `Void`.  For that synthesized closure
+/// call alone, carry a declared `Signed` or `Float` result onto the twin.
+/// An ordinary scalar call is deliberately not
 /// covered: its `Signed`/`Float` versus `Void` pairing remains a genuine kind
 /// divergence and falls back to legacy.
 ///
@@ -4655,20 +4657,20 @@ fn backfill_untyped_call_results(legacy: &LegacyGraph, value_to_var: &LegacyToTy
                 continue;
             };
             let declared_kind = valuetype_to_concrete(result_ty);
-            let closure_call_once = matches!(
+            let closure_scalar_call = matches!(
                 target,
                 crate::model::CallTarget::Method {
                     name,
                     receiver_root: Some(root),
                     ..
-                } if name == "call_once"
+                } if (name == "call_once" || name == "call_mut")
                     && root.rsplit("::").next().is_some_and(
                         majit_charon_reader::ullbc::is_closure_leaf
                     )
             );
             let declared_lltype = match declared_kind {
                 ConcreteType::GcRef => Some(GCREF.clone()),
-                ConcreteType::Signed | ConcreteType::Float if closure_call_once => {
+                ConcreteType::Signed | ConcreteType::Float if closure_scalar_call => {
                     crate::model::concrete_to_canonical_lltype(declared_kind)
                 }
                 _ => None,
@@ -5345,19 +5347,21 @@ mod tests {
             (ValueType::Int, ConcreteType::Signed),
             (ValueType::Float, ConcreteType::Float),
         ] {
-            let (graph, result, value_to_var) = backfill_call_result_fixture(
-                crate::model::CallTarget::method(
-                    "call_once",
-                    Some("module::function::closure#2".to_string()),
-                ),
-                result_ty,
-            );
-            backfill_untyped_call_results(&graph, &value_to_var);
-            assert_eq!(
-                kind_of_in(&value_to_var, &result),
-                expected,
-                "the closure's declared FnOnce::Output must survive Charon erasure"
-            );
+            for method in ["call_once", "call_mut"] {
+                let (graph, result, value_to_var) = backfill_call_result_fixture(
+                    crate::model::CallTarget::method(
+                        method,
+                        Some("module::function::closure#2".to_string()),
+                    ),
+                    result_ty.clone(),
+                );
+                backfill_untyped_call_results(&graph, &value_to_var);
+                assert_eq!(
+                    kind_of_in(&value_to_var, &result),
+                    expected,
+                    "{method}: the closure's declared output must survive Charon erasure"
+                );
+            }
         }
     }
 

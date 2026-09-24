@@ -15619,6 +15619,8 @@ impl<'a> Lowering<'a> {
                     ordering.insert(local as usize, name);
                 }
             }
+        }
+        for bb in &self.body.body {
             let Ok(term) = bb.term() else {
                 continue;
             };
@@ -26164,9 +26166,22 @@ fn push_direct_ptradd(
         },
         item,
     );
-    let ptr = if already_int {
-        ptr.set_concretetype(Some(ptr_ty.clone()));
+    let ptr = if already_int && ptr.concretetype().as_ref() == Some(&ptr_ty) {
         ptr
+    } else if already_int {
+        // `clone` shares the concretetype cell. A fresh `same_as` result
+        // carries `TO.OF` without rewriting the caller's variable.
+        let fresh = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        fresh.set_concretetype(Some(ptr_ty.clone()));
+        graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(fresh.clone()),
+            kind: OpKind::UnaryOp {
+                op: "same_as".to_string(),
+                operand: ptr,
+                result_ty: ValueType::Int,
+            },
+        });
+        fresh
     } else {
         let fresh = push_cast_ptr_to_int(graph, bb_id, ptr);
         fresh.set_concretetype(Some(ptr_ty.clone()));
@@ -44156,6 +44171,7 @@ mod tests {
             .push_op_var(entry, OpKind::ConstRefAddr(0x1000), true)
             .expect("pointer value");
         FunctionGraph::set_concretetype_of_inline(&ptr, crate::model::ConcreteType::Signed);
+        let before = ptr.concretetype();
         let count = graph
             .push_op_var(entry, OpKind::ConstInt(8), true)
             .expect("count");
@@ -44177,7 +44193,12 @@ mod tests {
                 args,
                 result_ty: ValueType::Int,
             } if segments.last().map(String::as_str) == Some("direct_ptradd") => {
-                assert_eq!(args, &crate::model::call_args(vec![ptr, count]));
+                assert_eq!(ptr.concretetype(), before, "caller concretetype stays put");
+                let crate::model::LinkArg::Value(got) = &args[0] else {
+                    panic!("pointer operand must be a variable, got {:?}", args[0]);
+                };
+                assert_ne!(got, &ptr, "a different item type needs a fresh variable");
+                assert_eq!(args[1], crate::model::LinkArg::Value(count));
             }
             other => panic!("expected direct_ptradd call, got {other:?}"),
         }

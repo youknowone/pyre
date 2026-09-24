@@ -186,6 +186,10 @@ pub(crate) fn lower_std_primitive_op(
         } else {
             receiver_path
         };
+        // `Box::as_ref` is a pointer cast whatever the layout is.
+        if banks_agree && is_box_as_ref(target, receiver_path) {
+            return same_as(operand, result_ty.clone());
+        }
         if let Some(fields) = layout {
             if fields.len() == 1 {
                 let (name, field_ty) = &fields[0];
@@ -205,10 +209,6 @@ pub(crate) fn lower_std_primitive_op(
                 return payload_field_read(operand, name, owner, result_ty.clone());
             }
             return op_kind;
-        }
-        // No registered struct: `Box::as_ref` is still a pointer cast.
-        if banks_agree && is_box_as_ref(target, receiver_path) {
-            return same_as(operand, result_ty.clone());
         }
         return op_kind;
     }
@@ -487,6 +487,28 @@ mod tests {
             as_ref,
             OpKind::UnaryOp { ref op, .. } if op == "same_as"
         ));
+
+        let multi = lower_std_primitive_op(
+            call(
+                CallTarget::method("as_ref", Some("Box".into())),
+                vec![v.clone()],
+                ValueType::Ref(None),
+            ),
+            Some("alloc::boxed::Box"),
+            None,
+            None,
+            None,
+            false,
+            true,
+            Some(&[
+                ("0".into(), ValueType::Ref(None)),
+                ("1".into(), ValueType::Ref(None)),
+            ]),
+        );
+        assert!(
+            matches!(multi, OpKind::UnaryOp { ref op, .. } if op == "same_as"),
+            "Box::as_ref stays a pointer cast when the layout is not one field"
+        );
 
         let deref = lower_std_primitive_op(
             call(
