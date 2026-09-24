@@ -1109,7 +1109,8 @@ pub struct OptContext {
     /// A Phase-2 lookup that followed a label arg to its Phase-1 producer
     /// would re-express a per-iteration value in terms of the PREAMBLE's
     /// entry value, which the loop header does not carry per-iteration.
-    pub emitted_operations: indexmap::IndexSet<majit_ir::operand::Operand>,
+    pub emitted_operations:
+        indexmap::IndexSet<majit_ir::operand::Operand, rustc_hash::FxBuildHasher>,
     /// Number of input arguments, used to offset emitted op positions
     /// so that variable indices don't collide with input arg indices.
     num_inputs: u32,
@@ -2263,7 +2264,10 @@ impl OptContext {
                 estimated_ops,
                 Default::default(),
             ),
-            emitted_operations: indexmap::IndexSet::with_capacity(estimated_ops),
+            emitted_operations: indexmap::IndexSet::with_capacity_and_hasher(
+                estimated_ops,
+                rustc_hash::FxBuildHasher,
+            ),
             num_inputs: 0,
             inputarg_base: 0,
             next_pos: 0,
@@ -2947,7 +2951,10 @@ impl OptContext {
                 estimated_ops,
                 Default::default(),
             ),
-            emitted_operations: indexmap::IndexSet::with_capacity(estimated_ops),
+            emitted_operations: indexmap::IndexSet::with_capacity_and_hasher(
+                estimated_ops,
+                rustc_hash::FxBuildHasher,
+            ),
             num_inputs: num_inputs as u32,
             inputarg_base,
             next_pos: start_next_pos,
@@ -7892,7 +7899,7 @@ impl OptContext {
     /// of the preamble's entry box (e.g. int_add reassociation turning
     /// `loop_arg - 1` into `preamble_entry - 2`), a box the loop header
     /// does not carry per-iteration.
-    pub fn get_producing_op(&self, op: &Operand) -> Option<Op> {
+    pub fn get_producing_op(&self, op: &Operand) -> Option<majit_ir::OpRc> {
         // resoperation.py AbstractResOpOrInputArg `_forwarded` host: a box's producing op is its
         // bound op (set at emit, mod.rs bind_op before new_operations.push).
         // Walk the forwarding chain first (resoperation.py get_box_replacement) so the
@@ -7907,7 +7914,7 @@ impl OptContext {
         {
             return None;
         }
-        Some((*producer).clone())
+        Some(producer)
     }
 
     /// Number of emitted operations so far.

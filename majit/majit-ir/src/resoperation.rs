@@ -1936,6 +1936,7 @@ impl OpPosRef<'_> {
     }
 }
 
+#[inline]
 fn pack_op_pos(r: OpRef) -> u64 {
     let (tag, payload): (u8, u32) = match r {
         OpRef::None => (0, 0),
@@ -1958,6 +1959,7 @@ fn pack_op_pos(r: OpRef) -> u64 {
     ((tag as u64) << 32) | u64::from(payload)
 }
 
+#[inline]
 fn unpack_op_pos(packed: u64) -> OpRef {
     let tag = (packed >> 32) as u8;
     let payload = packed as u32;
@@ -1977,6 +1979,7 @@ fn unpack_op_pos(packed: u64) -> OpRef {
     }
 }
 
+#[cold]
 fn intern_overflow_pos(r: OpRef) -> u32 {
     let mut slab = OVERFLOW_POS.lock().unwrap_or_else(|e| e.into_inner());
     let idx = u32::try_from(slab.len()).expect("Op.pos overflow slab exhausted");
@@ -1984,6 +1987,7 @@ fn intern_overflow_pos(r: OpRef) -> u32 {
     idx
 }
 
+#[cold]
 fn overflow_pos(idx: u32) -> OpRef {
     let slab = OVERFLOW_POS.lock().unwrap_or_else(|e| e.into_inner());
     slab[idx as usize]

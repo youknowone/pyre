@@ -176,7 +176,7 @@ fn replace_with(original: &Op, opcode: OpCode, args: &[Operand]) -> Optimization
     OptimizationResult::Restart(new_op)
 }
 
-fn as_operation_b(b: &Operand, opcode: OpCode, ctx: &mut OptContext) -> Option<Op> {
+fn as_operation_b(b: &Operand, opcode: OpCode, ctx: &mut OptContext) -> Option<majit_ir::OpRc> {
     let op = ctx.get_producing_op(b)?;
     if op.opcode == opcode { Some(op) } else { None }
 }

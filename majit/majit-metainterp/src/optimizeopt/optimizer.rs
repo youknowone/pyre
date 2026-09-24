@@ -583,7 +583,8 @@ pub struct Optimizer {
     /// matches the optional `required_opnum`. The lookup resolves the
     /// queried opref through `ctx.get_box_replacement` so it compares the
     /// same canonical box the insert recorded.
-    pub emitted_operations: indexmap::IndexSet<majit_ir::operand::Operand>,
+    pub emitted_operations:
+        indexmap::IndexSet<majit_ir::operand::Operand, rustc_hash::FxBuildHasher>,
     /// One-shot explicit `input_ops` seed for the next
     /// `optimize_with_constants_and_inputs_at` run. When `Some`, the
     /// canonical producer `Rc<Op>` slice is used directly as
@@ -1586,7 +1587,7 @@ impl Optimizer {
             opt_guards_emitted: 0,
             opt_guards_shared_emitted: 0,
             cpu: crate::cpu::default_cpu(),
-            emitted_operations: indexmap::IndexSet::new(),
+            emitted_operations: indexmap::IndexSet::with_hasher(rustc_hash::FxBuildHasher),
             explicit_input_ops_seed: None,
         }
     }

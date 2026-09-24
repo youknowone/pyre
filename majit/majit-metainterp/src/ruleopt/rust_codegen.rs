@@ -233,7 +233,7 @@ impl RustCodegen {
         );
         self.emit("");
         self.with_block(
-            "fn as_operation_b(b: &Operand, opcode: OpCode, ctx: &mut OptContext) -> Option<Op> {",
+            "fn as_operation_b(b: &Operand, opcode: OpCode, ctx: &mut OptContext) -> Option<majit_ir::OpRc> {",
             |this| {
                 this.emit("let op = ctx.get_producing_op(b)?;");
                 this.with_block("if op.opcode == opcode {", |this| this.emit("Some(op)"));
