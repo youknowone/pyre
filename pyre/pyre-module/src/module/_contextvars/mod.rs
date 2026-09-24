@@ -13,14 +13,19 @@ use std::sync::OnceLock;
 pub(crate) fn context_var_type() -> PyObjectRef {
     static TYPE: OnceLock<usize> = OnceLock::new();
     *TYPE.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type("_contextvars.ContextVar", |ns| {
-            let signature =
-                crate::gateway::Signature::new(vec!["cls", "name", "default"], None, None, 1, 2);
+        let tp = pyre_interpreter::typedef::make_builtin_type("_contextvars.ContextVar", |ns| {
+            let signature = pyre_interpreter::gateway::Signature::new(
+                vec!["cls", "name", "default"],
+                None,
+                None,
+                1,
+                2,
+            );
             unsafe {
                 pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                     ns,
                     "__new__",
-                    crate::typedef::make_new_descr_with_signature(
+                    pyre_interpreter::typedef::make_new_descr_with_signature(
                         context_var_new,
                         signature.clone(),
                     ),
@@ -28,10 +33,10 @@ pub(crate) fn context_var_type() -> PyObjectRef {
                 pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                     ns,
                     "__init__",
-                    crate::make_builtin_function_with_signature(
+                    pyre_interpreter::make_builtin_function_with_signature(
                         "__init__",
                         |_| Ok(w_none()),
-                        crate::gateway::Signature::new(
+                        pyre_interpreter::gateway::Signature::new(
                             vec!["self", "name", "default"],
                             None,
                             None,
@@ -43,28 +48,40 @@ pub(crate) fn context_var_type() -> PyObjectRef {
                 pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                     ns,
                     "get",
-                    crate::make_builtin_function("get", context_var_get),
+                    pyre_interpreter::make_builtin_function("get", context_var_get),
                 );
                 pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                     ns,
                     "set",
-                    crate::make_builtin_function_with_arity("set", context_var_set, 2),
+                    pyre_interpreter::make_builtin_function_with_arity("set", context_var_set, 2),
                 );
                 pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                     ns,
                     "reset",
-                    crate::make_builtin_function_with_arity("reset", context_var_reset, 2),
+                    pyre_interpreter::make_builtin_function_with_arity(
+                        "reset",
+                        context_var_reset,
+                        2,
+                    ),
                 );
                 pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                     ns,
                     "__repr__",
-                    crate::make_builtin_function_with_arity("__repr__", context_var_repr, 1),
+                    pyre_interpreter::make_builtin_function_with_arity(
+                        "__repr__",
+                        context_var_repr,
+                        1,
+                    ),
                 );
                 pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                     ns,
                     "name",
-                    crate::typedef::make_getset_descriptor_named(
-                        crate::make_builtin_function_with_arity("name", context_var_name_get, 2),
+                    pyre_interpreter::typedef::make_getset_descriptor_named(
+                        pyre_interpreter::make_builtin_function_with_arity(
+                            "name",
+                            context_var_name_get,
+                            2,
+                        ),
                         "name",
                     ),
                 );
@@ -73,10 +90,12 @@ pub(crate) fn context_var_type() -> PyObjectRef {
                 pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                     ns,
                     "__class_getitem__",
-                    pyre_object::function::w_classmethod_new(crate::make_builtin_function(
-                        "__class_getitem__",
-                        crate::_pypy_generic_alias::generic_alias_class_getitem,
-                    )),
+                    pyre_object::function::w_classmethod_new(
+                        pyre_interpreter::make_builtin_function(
+                            "__class_getitem__",
+                            pyre_interpreter::_pypy_generic_alias::generic_alias_class_getitem,
+                        ),
+                    ),
                 );
             }
         });
@@ -86,40 +105,40 @@ pub(crate) fn context_var_type() -> PyObjectRef {
     }) as PyObjectRef
 }
 
-fn context_var_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn context_var_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     // PyPy lib_pypy/_contextvars.py ContextVar.__init__(name, *,
     // default=_NO_DEFAULT): the signature-aware gateway supplies
     // [cls, name, default], with PY_NULL for an omitted default.
     if args.len() < 2 || args[1].is_null() {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "ContextVar() takes exactly 1 positional argument (0 given)",
         ));
     }
     if !unsafe { is_str(args[1]) } {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "context variable name must be a str",
         ));
     }
     // CPython 3.14 contextvar_new stores the name's hash eagerly; this also
     // rejects an unhashable str subclass at construction time.
-    crate::baseobjspace::hash_w_strict(args[1])?;
+    pyre_interpreter::baseobjspace::hash_w_strict(args[1])?;
     let obj = w_instance_new(context_var_type());
-    crate::baseobjspace::setattr_str(obj, "_name", args[1])?;
+    pyre_interpreter::baseobjspace::setattr_str(obj, "_name", args[1])?;
     if let Some(&default) = args.get(2)
         && !default.is_null()
     {
-        crate::baseobjspace::setattr_str(obj, "_default", default)?;
+        pyre_interpreter::baseobjspace::setattr_str(obj, "_default", default)?;
     }
     Ok(obj)
 }
 
-fn context_var_name_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::baseobjspace::getattr_str(args[1], "_name")
+fn context_var_name_get(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    pyre_interpreter::baseobjspace::getattr_str(args[1], "_name")
 }
 
-fn context_var_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn context_var_get(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     if args.len() > 2 {
-        return Err(crate::PyError::type_error(format!(
+        return Err(pyre_interpreter::PyError::type_error(format!(
             "get() takes from 1 to 2 positional arguments but {} were given",
             args.len()
         )));
@@ -133,19 +152,19 @@ fn context_var_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     let args_base = pyre_object::gc_roots::pin_roots(args);
     let var = || pyre_object::gc_roots::shadow_stack_get(args_base);
     if let Some(context) = current_context(false)? {
-        match crate::baseobjspace::getitem(context, var()) {
+        match pyre_interpreter::baseobjspace::getitem(context, var()) {
             Ok(value) => return Ok(value),
-            Err(err) if err.kind == crate::PyErrorKind::KeyError => {}
+            Err(err) if err.kind == pyre_interpreter::PyErrorKind::KeyError => {}
             Err(err) => return Err(err),
         }
     }
     if args.len() > 1 {
         return Ok(pyre_object::gc_roots::shadow_stack_get(args_base + 1));
     }
-    if let Some(default) = crate::baseobjspace::findattr_result(var(), "_default")? {
+    if let Some(default) = pyre_interpreter::baseobjspace::findattr_result(var(), "_default")? {
         return Ok(default);
     }
-    Err(crate::PyError::lookup_error(
+    Err(pyre_interpreter::PyError::lookup_error(
         context_var_repr_string(var())?,
     ))
 }
@@ -154,15 +173,16 @@ fn call_method_result(
     obj: PyObjectRef,
     name: &str,
     args: &[PyObjectRef],
-) -> Result<PyObjectRef, crate::PyError> {
-    let method = crate::baseobjspace::getattr_str(obj, name)?;
-    crate::call::call_function_impl_result(method, args)
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    let method = pyre_interpreter::baseobjspace::getattr_str(obj, name)?;
+    pyre_interpreter::call::call_function_impl_result(method, args)
 }
 
-fn current_context(create: bool) -> Result<Option<PyObjectRef>, crate::PyError> {
-    let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
+fn current_context(create: bool) -> Result<Option<PyObjectRef>, pyre_interpreter::PyError> {
+    let ec =
+        pyre_interpreter::call::getexecutioncontext() as *mut pyre_interpreter::PyExecutionContext;
     if ec.is_null() {
-        return Err(crate::PyError::runtime_error(
+        return Err(pyre_interpreter::PyError::runtime_error(
             "no current execution context",
         ));
     }
@@ -174,14 +194,15 @@ fn current_context(create: bool) -> Result<Option<PyObjectRef>, crate::PyError> 
         // `_context_type` is stored on the immortal ContextVar type's dict by
         // module init, which roots the app-level Context type without a raw
         // side table or thread-local copy.
-        let context_type = crate::baseobjspace::getattr_str(context_var_type(), "_context_type")?;
-        context = crate::call::call_function_impl_result(context_type, &[])?;
+        let context_type =
+            pyre_interpreter::baseobjspace::getattr_str(context_var_type(), "_context_type")?;
+        context = pyre_interpreter::call::call_function_impl_result(context_type, &[])?;
         unsafe { (*ec).contextvar_context = context };
     }
     Ok(Some(context))
 }
 
-fn context_var_set(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn context_var_set(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     // PyPy lib_pypy/_contextvars.py ContextVar.set, line by line: read the
     // old binding, persistently replace Context._data, and return a token
     // tied to this exact Context.
@@ -207,18 +228,23 @@ fn context_var_set(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     let context = || pyre_object::gc_roots::shadow_stack_get(context_slot);
 
     let data_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(crate::baseobjspace::getattr_str(context(), "_data")?);
+    let _ = pyre_object::gc_roots::pin_root(pyre_interpreter::baseobjspace::getattr_str(
+        context(),
+        "_data",
+    )?);
     let data = || pyre_object::gc_roots::shadow_stack_get(data_slot);
 
     let old_value_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(match crate::baseobjspace::getitem(data(), var()) {
-        Ok(value) => value,
-        Err(err) if err.kind == crate::PyErrorKind::KeyError => token_missing(),
-        Err(err) => return Err(err),
-    });
+    let _ = pyre_object::gc_roots::pin_root(
+        match pyre_interpreter::baseobjspace::getitem(data(), var()) {
+            Ok(value) => value,
+            Err(err) if err.kind == pyre_interpreter::PyErrorKind::KeyError => token_missing(),
+            Err(err) => return Err(err),
+        },
+    );
 
     let updated_data = call_method_result(data(), "set", &[var(), value()])?;
-    crate::baseobjspace::setattr_str(context(), "_data", updated_data)?;
+    pyre_interpreter::baseobjspace::setattr_str(context(), "_data", updated_data)?;
     new_token(
         context(),
         var(),
@@ -226,12 +252,12 @@ fn context_var_set(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     )
 }
 
-fn context_var_reset(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn context_var_reset(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let token = args[1];
-    if !unsafe { crate::baseobjspace::isinstance_w(token, token_type()) } {
-        return Err(crate::PyError::type_error(format!(
+    if !unsafe { pyre_interpreter::baseobjspace::isinstance_w(token, token_type()) } {
+        return Err(pyre_interpreter::PyError::type_error(format!(
             "expected an instance of Token, got {}",
-            crate::type_methods::arg_type_name(token),
+            pyre_interpreter::type_methods::arg_type_name(token),
         )));
     }
     // Each attribute read and each mapping call is application-level Python.
@@ -246,17 +272,25 @@ fn context_var_reset(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     let var = || pyre_object::gc_roots::shadow_stack_get(args_base);
     let token = || pyre_object::gc_roots::shadow_stack_get(args_base + 1);
 
-    if crate::baseobjspace::is_true(crate::baseobjspace::getattr_str(token(), "_used")?)? {
-        return Err(crate::PyError::runtime_error(crate::display::wtf8_format!(
-            token_repr_string(token())?,
-            " has already been used once",
-        )));
+    if pyre_interpreter::baseobjspace::is_true(pyre_interpreter::baseobjspace::getattr_str(
+        token(),
+        "_used",
+    )?)? {
+        return Err(pyre_interpreter::PyError::runtime_error(
+            pyre_interpreter::display::wtf8_format!(
+                token_repr_string(token())?,
+                " has already been used once",
+            ),
+        ));
     }
     let token_var_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(crate::baseobjspace::getattr_str(token(), "_var")?);
+    let _ = pyre_object::gc_roots::pin_root(pyre_interpreter::baseobjspace::getattr_str(
+        token(),
+        "_var",
+    )?);
     let token_var = || pyre_object::gc_roots::shadow_stack_get(token_var_slot);
     if !std::ptr::eq(token_var(), var()) {
-        return Err(crate::PyError::value_error(
+        return Err(pyre_interpreter::PyError::value_error(
             "Token was created by a different ContextVar",
         ));
     }
@@ -266,51 +300,61 @@ fn context_var_reset(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     );
     let context = || pyre_object::gc_roots::shadow_stack_get(context_slot);
     if !std::ptr::eq(
-        crate::baseobjspace::getattr_str(token(), "_context")?,
+        pyre_interpreter::baseobjspace::getattr_str(token(), "_context")?,
         context(),
     ) {
-        return Err(crate::PyError::value_error(
+        return Err(pyre_interpreter::PyError::value_error(
             "Token was created in a different Context",
         ));
     }
     let data_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(crate::baseobjspace::getattr_str(context(), "_data")?);
+    let _ = pyre_object::gc_roots::pin_root(pyre_interpreter::baseobjspace::getattr_str(
+        context(),
+        "_data",
+    )?);
     let data = || pyre_object::gc_roots::shadow_stack_get(data_slot);
     let old_value_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ =
-        pyre_object::gc_roots::pin_root(crate::baseobjspace::getattr_str(token(), "_old_value")?);
+    let _ = pyre_object::gc_roots::pin_root(pyre_interpreter::baseobjspace::getattr_str(
+        token(),
+        "_old_value",
+    )?);
     let old_value = || pyre_object::gc_roots::shadow_stack_get(old_value_slot);
     let updated_data = if std::ptr::eq(old_value(), token_missing()) {
         call_method_result(data(), "delete", &[token_var()])?
     } else {
         call_method_result(data(), "set", &[token_var(), old_value()])?
     };
-    crate::baseobjspace::setattr_str(context(), "_data", updated_data)?;
-    crate::baseobjspace::setattr_str(token(), "_used", w_bool_from(true))?;
+    pyre_interpreter::baseobjspace::setattr_str(context(), "_data", updated_data)?;
+    pyre_interpreter::baseobjspace::setattr_str(token(), "_used", w_bool_from(true))?;
     Ok(w_none())
 }
 
-fn context_var_repr_string(obj: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
-    let Some(_guard) = crate::display::ReprGuard::enter(obj) else {
+fn context_var_repr_string(
+    obj: PyObjectRef,
+) -> Result<rustpython_wtf8::Wtf8Buf, pyre_interpreter::PyError> {
+    let Some(_guard) = pyre_interpreter::display::ReprGuard::enter(obj) else {
         return Ok(rustpython_wtf8::Wtf8Buf::from_string("...".to_string()));
     };
-    let name = crate::baseobjspace::getattr_str(obj, "_name")?;
-    let name_repr = unsafe { crate::display::py_repr_wtf8(name)? };
-    let default = match crate::baseobjspace::findattr_result(obj, "_default")? {
-        Some(value) => crate::display::wtf8_format!(" default=", unsafe {
-            crate::display::py_repr_wtf8(value)?
+    let name = pyre_interpreter::baseobjspace::getattr_str(obj, "_name")?;
+    let name_repr = unsafe { pyre_interpreter::display::py_repr_wtf8(name)? };
+    let default = match pyre_interpreter::baseobjspace::findattr_result(obj, "_default")? {
+        Some(value) => pyre_interpreter::display::wtf8_format!(" default=", unsafe {
+            pyre_interpreter::display::py_repr_wtf8(value)?
         }),
         None => rustpython_wtf8::Wtf8Buf::new(),
     };
-    Ok(crate::display::wtf8_format!(
+    Ok(pyre_interpreter::display::wtf8_format!(
         "<ContextVar name=",
         name_repr,
         default,
-        format!(" at {}>", crate::display::repr_addr(obj as usize)),
+        format!(
+            " at {}>",
+            pyre_interpreter::display::repr_addr(obj as usize)
+        ),
     ))
 }
 
-fn context_var_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn context_var_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     Ok(pyre_object::w_str_from_wtf8_managed(
         context_var_repr_string(args[0])?,
     ))
@@ -319,7 +363,7 @@ fn context_var_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 fn token_type() -> PyObjectRef {
     static TYPE: OnceLock<usize> = OnceLock::new();
     *TYPE.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type("_contextvars.Token", |ns| unsafe {
+        let tp = pyre_interpreter::typedef::make_builtin_type("_contextvars.Token", |ns| unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 "MISSING",
@@ -328,39 +372,43 @@ fn token_type() -> PyObjectRef {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 "var",
-                crate::typedef::make_getset_descriptor_named(
-                    crate::make_builtin_function_with_arity("var", token_var_get, 2),
+                pyre_interpreter::typedef::make_getset_descriptor_named(
+                    pyre_interpreter::make_builtin_function_with_arity("var", token_var_get, 2),
                     "var",
                 ),
             );
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 "old_value",
-                crate::typedef::make_getset_descriptor_named(
-                    crate::make_builtin_function_with_arity("old_value", token_old_value_get, 2),
+                pyre_interpreter::typedef::make_getset_descriptor_named(
+                    pyre_interpreter::make_builtin_function_with_arity(
+                        "old_value",
+                        token_old_value_get,
+                        2,
+                    ),
                     "old_value",
                 ),
             );
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 "__repr__",
-                crate::make_builtin_function_with_arity("__repr__", token_repr, 1),
+                pyre_interpreter::make_builtin_function_with_arity("__repr__", token_repr, 1),
             );
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 "__enter__",
-                crate::make_builtin_function_with_arity("__enter__", token_enter, 1),
+                pyre_interpreter::make_builtin_function_with_arity("__enter__", token_enter, 1),
             );
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 "__exit__",
-                crate::make_builtin_function_with_arity("__exit__", token_exit, 4),
+                pyre_interpreter::make_builtin_function_with_arity("__exit__", token_exit, 4),
             );
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 "__new__",
-                crate::typedef::make_new_descr(|_| {
-                    Err(crate::PyError::type_error(
+                pyre_interpreter::typedef::make_new_descr(|_| {
+                    Err(pyre_interpreter::PyError::type_error(
                         "Tokens can only be created by ContextVars",
                     ))
                 }),
@@ -370,9 +418,9 @@ fn token_type() -> PyObjectRef {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 "__class_getitem__",
-                pyre_object::function::w_classmethod_new(crate::make_builtin_function(
+                pyre_object::function::w_classmethod_new(pyre_interpreter::make_builtin_function(
                     "__class_getitem__",
-                    crate::_pypy_generic_alias::generic_alias_class_getitem,
+                    pyre_interpreter::_pypy_generic_alias::generic_alias_class_getitem,
                 )),
             );
         });
@@ -385,17 +433,20 @@ fn token_type() -> PyObjectRef {
 fn token_missing_type() -> PyObjectRef {
     static TYPE: OnceLock<usize> = OnceLock::new();
     *TYPE.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type("_contextvars.Token.MISSING", |ns| unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
-                "__repr__",
-                crate::make_builtin_function_with_arity(
+        let tp = pyre_interpreter::typedef::make_builtin_type(
+            "_contextvars.Token.MISSING",
+            |ns| unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
                     "__repr__",
-                    |_| Ok(w_str_new_managed("<Token.MISSING>")),
-                    1,
-                ),
-            );
-        });
+                    pyre_interpreter::make_builtin_function_with_arity(
+                        "__repr__",
+                        |_| Ok(w_str_new_managed("<Token.MISSING>")),
+                        1,
+                    ),
+                );
+            },
+        );
         unsafe { typeobject::w_type_set_acceptable_as_base_class(tp, false) };
         tp as usize
     }) as PyObjectRef
@@ -405,7 +456,7 @@ fn token_missing() -> PyObjectRef {
     // The Token type dict is the shared owner/root, matching PyPy's
     // `Token.MISSING` class attribute.  Do not cache this movable singleton
     // in a raw-pointer OnceLock.
-    crate::baseobjspace::getattr_str(token_type(), "MISSING")
+    pyre_interpreter::baseobjspace::getattr_str(token_type(), "MISSING")
         .expect("Token.MISSING is installed with the Token type")
 }
 
@@ -413,7 +464,7 @@ fn new_token(
     context: PyObjectRef,
     var: PyObjectRef,
     old_value: PyObjectRef,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     // The three values arrive as native words and outlive the allocation
     // below and four attribute stores, each of which can collect; `old_value`
     // is whatever the caller last set, a list or a dict included.  The token
@@ -425,53 +476,60 @@ fn new_token(
     let _ = pyre_object::gc_roots::pin_root(w_instance_new(token_type()));
     let token = || pyre_object::gc_roots::shadow_stack_get(token_slot);
     let value_at = |offset: usize| pyre_object::gc_roots::shadow_stack_get(base + offset);
-    crate::baseobjspace::setattr_str(token(), "_context", value_at(0))?;
-    crate::baseobjspace::setattr_str(token(), "_var", value_at(1))?;
-    crate::baseobjspace::setattr_str(token(), "_old_value", value_at(2))?;
-    crate::baseobjspace::setattr_str(token(), "_used", w_bool_from(false))?;
+    pyre_interpreter::baseobjspace::setattr_str(token(), "_context", value_at(0))?;
+    pyre_interpreter::baseobjspace::setattr_str(token(), "_var", value_at(1))?;
+    pyre_interpreter::baseobjspace::setattr_str(token(), "_old_value", value_at(2))?;
+    pyre_interpreter::baseobjspace::setattr_str(token(), "_used", w_bool_from(false))?;
     Ok(token())
 }
 
-fn token_var_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::baseobjspace::getattr_str(args[1], "_var")
+fn token_var_get(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    pyre_interpreter::baseobjspace::getattr_str(args[1], "_var")
 }
 
-fn token_old_value_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::baseobjspace::getattr_str(args[1], "_old_value")
+fn token_old_value_get(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    pyre_interpreter::baseobjspace::getattr_str(args[1], "_old_value")
 }
 
-fn token_repr_string(token: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
-    let var = crate::baseobjspace::getattr_str(token, "_var")?;
-    let var_repr = unsafe { crate::display::py_repr_wtf8(var)? };
-    let used = crate::baseobjspace::is_true(crate::baseobjspace::getattr_str(token, "_used")?)?;
-    Ok(crate::display::wtf8_format!(
+fn token_repr_string(
+    token: PyObjectRef,
+) -> Result<rustpython_wtf8::Wtf8Buf, pyre_interpreter::PyError> {
+    let var = pyre_interpreter::baseobjspace::getattr_str(token, "_var")?;
+    let var_repr = unsafe { pyre_interpreter::display::py_repr_wtf8(var)? };
+    let used = pyre_interpreter::baseobjspace::is_true(
+        pyre_interpreter::baseobjspace::getattr_str(token, "_used")?,
+    )?;
+    Ok(pyre_interpreter::display::wtf8_format!(
         if used {
             "<Token used var="
         } else {
             "<Token var="
         },
         var_repr,
-        format!(" at {}>", crate::display::repr_addr(token as usize)),
+        format!(
+            " at {}>",
+            pyre_interpreter::display::repr_addr(token as usize)
+        ),
     ))
 }
 
-fn token_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn token_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     Ok(pyre_object::w_str_from_wtf8_managed(token_repr_string(
         args[0],
     )?))
 }
 
-fn token_enter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn token_enter(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     Ok(args[0])
 }
 
-fn token_exit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let var = crate::baseobjspace::getattr_str(args[0], "_var")?;
+fn token_exit(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    let var = pyre_interpreter::baseobjspace::getattr_str(args[0], "_var")?;
     context_var_reset(&[var, args[0]])?;
     Ok(w_bool_from(false))
 }
 
-crate::py_module! {
+pyre_interpreter::py_module! {
     "_contextvars",
     interpleveldefs: {
         "ContextVar" => context_var_type(),
@@ -487,9 +545,9 @@ crate::py_module! {
         },
     },
     extra_init: |ns| {
-        let context_var = crate::module_ns_get(ns, "ContextVar")
+        let context_var = pyre_interpreter::module_ns_get(ns, "ContextVar")
             .expect("_contextvars.ContextVar must be installed first");
-        crate::importing::appleveldef_install_seeded(
+        pyre_interpreter::importing::appleveldef_install_seeded(
             ns,
             include_str!("_contextvars_app.py"),
             "_contextvars_app.py",
@@ -497,7 +555,7 @@ crate::py_module! {
             &["Context"],
             &[("ContextVar", context_var)],
         )?;
-        let context = crate::module_ns_get(ns, "Context")
+        let context = pyre_interpreter::module_ns_get(ns, "Context")
             .expect("_contextvars.Context must be installed by appleveldefs");
         // [3.14-spec] PyPy keeps Context as the ordinary app-level class in
         // lib_pypy/_contextvars.py (with Unsubclassable as its metaclass), and

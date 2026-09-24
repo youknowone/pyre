@@ -8063,7 +8063,7 @@ pub fn crt_errno() -> i32 {
 /// payload instead, which `posix_errno` reads.  Unrecognised kinds keep the raw
 /// code, and an error carrying no code of either kind falls back to `default`
 /// (the errno each call site used before the translation existed).
-pub(crate) fn io_error_posix_errno(e: &std::io::Error, default: i32) -> i32 {
+pub fn io_error_posix_errno(e: &std::io::Error, default: i32) -> i32 {
     #[cfg(windows)]
     {
         use std::io::ErrorKind;

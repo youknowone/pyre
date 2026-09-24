@@ -27,39 +27,39 @@ enum PreparedSound {
 /// `bytes` is turned away even though it names a file elsewhere: the argument
 /// is a buffer under `SND_MEMORY`, and accepting it here as a name too would
 /// make the same value mean two things.
-fn sound_name(sound: PyObjectRef) -> Result<Vec<u16>, crate::PyError> {
+fn sound_name(sound: PyObjectRef) -> Result<Vec<u16>, pyre_interpreter::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let sound_slot = roots.base();
     let sound = roots.pin_root(sound);
     let w_name = if unsafe { pyre_object::is_str(sound) } {
         roots.get(sound_slot)
     } else if unsafe { pyre_object::bytesobject::is_bytes(sound) } {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "'sound' must be str, os.PathLike, or None, not bytes",
         ));
     } else {
         // `type(sound).__fspath__(sound)` — the descriptor read off the type is
         // unbound, so the object is supplied as the sole argument.
-        let Some(fspath_fn) = crate::typedef::r#type(sound).and_then(|pt| unsafe {
-            crate::baseobjspace::lookup_in_type(pt.as_ptr(), "__fspath__")
+        let Some(fspath_fn) = pyre_interpreter::typedef::r#type(sound).and_then(|pt| unsafe {
+            pyre_interpreter::baseobjspace::lookup_in_type(pt.as_ptr(), "__fspath__")
         }) else {
-            return Err(crate::PyError::type_error(format!(
+            return Err(pyre_interpreter::PyError::type_error(format!(
                 "expected str, bytes or os.PathLike object, not {}",
-                crate::gateway::short_type_name(sound)
+                pyre_interpreter::gateway::short_type_name(sound)
             )));
         };
         let fspath_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(fspath_fn);
-        let resolved = crate::call::call_function_impl_result(
+        let resolved = pyre_interpreter::call::call_function_impl_result(
             roots.get(fspath_slot),
             &[roots.get(sound_slot)],
         )?;
         let resolved_slot = pyre_object::gc_roots::shadow_stack_len();
         let resolved = roots.pin_root(resolved);
         if !unsafe { pyre_object::is_str(resolved) } {
-            return Err(crate::PyError::type_error(format!(
+            return Err(pyre_interpreter::PyError::type_error(format!(
                 "'sound' must resolve to str, not {}",
-                crate::gateway::short_type_name(resolved)
+                pyre_interpreter::gateway::short_type_name(resolved)
             )));
         }
         resolved
@@ -71,7 +71,9 @@ fn sound_name(sound: PyObjectRef) -> Result<Vec<u16>, crate::PyError> {
         .encode_wide()
         .collect();
     if units.contains(&0) {
-        return Err(crate::PyError::value_error("embedded null character"));
+        return Err(pyre_interpreter::PyError::value_error(
+            "embedded null character",
+        ));
     }
     units.push(0);
     Ok(units)
@@ -81,10 +83,10 @@ fn sound_name(sound: PyObjectRef) -> Result<Vec<u16>, crate::PyError> {
 /// carrying the arguments the OSError constructor takes: errno 0, the system's
 /// own text for the code, no filename, the code as a signed int, no second
 /// filename.  `RuntimeError` reads none of them and keeps the five as `args`.
-fn win32_runtime_error(code: u32) -> crate::PyError {
-    let message = crate::PyError::win32_strerror(code as i32);
-    let Some(cls) = crate::builtins::lookup_exc_class("RuntimeError") else {
-        return crate::PyError::runtime_error(message);
+fn win32_runtime_error(code: u32) -> pyre_interpreter::PyError {
+    let message = pyre_interpreter::PyError::win32_strerror(code as i32);
+    let Some(cls) = pyre_interpreter::builtins::lookup_exc_class("RuntimeError") else {
+        return pyre_interpreter::PyError::runtime_error(message);
     };
     // Building an argument can collect, so each one is pinned as it is made:
     // a Rust array of raw references is not something the collector updates.
@@ -103,13 +105,13 @@ fn win32_runtime_error(code: u32) -> crate::PyError {
         roots.get(cls_slot + 4),
         roots.get(cls_slot + 5),
     ];
-    match crate::call::call_function_impl_result(roots.get(cls_slot), &args) {
-        Ok(exc) => unsafe { crate::PyError::from_exc_object(exc) },
+    match pyre_interpreter::call::call_function_impl_result(roots.get(cls_slot), &args) {
+        Ok(exc) => unsafe { pyre_interpreter::PyError::from_exc_object(exc) },
         Err(error) => error,
     }
 }
 
-crate::py_module! {
+pyre_interpreter::py_module! {
     "winsound",
     int_constants: {
         // `PlaySound` flags (mmsystem.h).  SND_SYNC is the absence of
@@ -141,7 +143,7 @@ crate::py_module! {
         "MB_ICONINFORMATION" => 0x0040,
     },
     inline_functions: {
-        fn PlaySound(sound: PyObjectRef, flags: PyIndexCInt) -> Result<(), crate::PyError> {
+        fn PlaySound(sound: PyObjectRef, flags: PyIndexCInt) -> Result<(), pyre_interpreter::PyError> {
             // `None` answers first, so it silences the device whatever else
             // the flags asked for.
             let source = if unsafe { pyre_object::is_none(sound) } {
@@ -150,14 +152,14 @@ crate::py_module! {
                 if flags & SND_ASYNC != 0 {
                     // The buffer would have to outlive the call, and nothing
                     // here can keep it alive that long.
-                    return Err(crate::PyError::runtime_error(
+                    return Err(pyre_interpreter::PyError::runtime_error(
                         "Cannot play asynchronously from memory",
                     ));
                 }
-                let data = crate::baseobjspace::simple_buffer_bytes(sound)?.ok_or_else(|| {
-                    crate::PyError::type_error(format!(
+                let data = pyre_interpreter::baseobjspace::simple_buffer_bytes(sound)?.ok_or_else(|| {
+                    pyre_interpreter::PyError::type_error(format!(
                         "a bytes-like object is required, not '{}'",
-                        crate::gateway::short_type_name(sound)
+                        pyre_interpreter::gateway::short_type_name(sound)
                     ))
                 })?;
                 let bytes = data.as_bytes().to_vec();
@@ -177,7 +179,7 @@ crate::py_module! {
             let result = {
                 // A synchronous play runs to the end of the sound, so the
                 // thread that will stop it has to be able to run.
-                let _blocked = crate::module::thread::before_external_block();
+                let _blocked = pyre_interpreter::module::thread::before_external_block();
                 match source.as_ref() {
                     None => host_winsound::play_sound(
                         host_winsound::PlaySoundSource::Stop,
@@ -206,34 +208,34 @@ crate::py_module! {
                 }
             };
             if result.is_err() {
-                return Err(crate::PyError::runtime_error("Failed to play sound"));
+                return Err(pyre_interpreter::PyError::runtime_error("Failed to play sound"));
             }
             Ok(())
         }
-        fn Beep(frequency: PyIndexCInt, duration: PyIndexCInt) -> Result<(), crate::PyError> {
+        fn Beep(frequency: PyIndexCInt, duration: PyIndexCInt) -> Result<(), pyre_interpreter::PyError> {
             // The range `Beep` itself accepts; naming one outside it is a
             // ValueError rather than a failed call.
             if !(37..=32767).contains(&frequency) {
-                return Err(crate::PyError::value_error(
+                return Err(pyre_interpreter::PyError::value_error(
                     "frequency must be in 37 thru 32767",
                 ));
             }
             let beeped = {
-                let _blocked = crate::module::thread::before_external_block();
+                let _blocked = pyre_interpreter::module::thread::before_external_block();
                 host_winsound::beep(frequency as u32, duration as u32)
             };
             if !beeped {
-                return Err(crate::PyError::runtime_error("Failed to beep"));
+                return Err(pyre_interpreter::PyError::runtime_error("Failed to beep"));
             }
             Ok(())
         }
-        fn MessageBeep(#[default(0i32)] type_: PyIndexCInt) -> Result<(), crate::PyError> {
+        fn MessageBeep(#[default(0i32)] type_: PyIndexCInt) -> Result<(), pyre_interpreter::PyError> {
             // Read inside the released region, as
             // `save_err=rffi.RFFI_SAVE_LASTERROR` does: reacquiring goes
             // through `mutex2_lock_timeout`, whose timed wait leaves
             // `ERROR_TIMEOUT` behind on a poll that expired.
             let result = {
-                let _blocked = crate::module::thread::before_external_block();
+                let _blocked = pyre_interpreter::module::thread::before_external_block();
                 host_winsound::message_beep(type_ as u32)
             };
             if let Err(error) = result {

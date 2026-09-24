@@ -3983,9 +3983,6 @@ fn call_with_kwargs_in_ctx_impl(
         ) || std::ptr::eq(
             current_type(),
             crate::module::_collections::deque_rev_iter::public_type(),
-        ) || std::ptr::eq(
-            current_type(),
-            crate::module::_contextvars::context_var_type(),
         ) || type_new_accepts_keywords(current_type())
             || crate::_structseq::is_structseq_type(current_type());
         if !kwargs.is_empty()

@@ -71,29 +71,35 @@ impl Drop for NativeOverlapped {
 
 // CPython 3.14 Modules/_winapi.c creates winapi_overlapped_type_spec through
 // PyType_FromModuleAndSpec; its spec is immutable.
-#[crate::pyre_class("_winapi.Overlapped", cpython_heaptype)]
+#[pyre_interpreter::pyre_class("_winapi.Overlapped", cpython_heaptype)]
 #[derive(Default)]
 pub struct W_Overlapped {
     backend: *mut Mutex<NativeOverlapped>,
 }
 
-fn this(obj: PyObjectRef) -> Result<&'static mut W_Overlapped, crate::PyError> {
+fn this(obj: PyObjectRef) -> Result<&'static mut W_Overlapped, pyre_interpreter::PyError> {
     W_Overlapped::from_obj(obj)
-        .ok_or_else(|| crate::PyError::type_error("expected _winapi.Overlapped object"))
+        .ok_or_else(|| pyre_interpreter::PyError::type_error("expected _winapi.Overlapped object"))
 }
 
-fn native(obj: PyObjectRef) -> Result<&'static Mutex<NativeOverlapped>, crate::PyError> {
+fn native(obj: PyObjectRef) -> Result<&'static Mutex<NativeOverlapped>, pyre_interpreter::PyError> {
     let this = this(obj)?;
     if this.backend.is_null() {
-        return Err(crate::PyError::value_error("invalid overlapped object"));
+        return Err(pyre_interpreter::PyError::value_error(
+            "invalid overlapped object",
+        ));
     }
     Ok(unsafe { &*this.backend })
 }
 
-fn arg(args: &[PyObjectRef], index: usize, name: &str) -> Result<PyObjectRef, crate::PyError> {
-    args.get(index)
-        .copied()
-        .ok_or_else(|| crate::PyError::type_error(format!("{name}() missing required argument")))
+fn arg(
+    args: &[PyObjectRef],
+    index: usize,
+    name: &str,
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    args.get(index).copied().ok_or_else(|| {
+        pyre_interpreter::PyError::type_error(format!("{name}() missing required argument"))
+    })
 }
 
 /// A fresh record over `handle`, with the manual-reset event the operation
@@ -102,7 +108,7 @@ fn arg(args: &[PyObjectRef], index: usize, name: &str) -> Result<PyObjectRef, cr
 /// Returned as the native state alone: the object around it is only built once
 /// the call it belongs to has been started, so a failed start has nothing to
 /// finalize.
-fn new_native(handle: HANDLE) -> Result<Box<Mutex<NativeOverlapped>>, crate::PyError> {
+fn new_native(handle: HANDLE) -> Result<Box<Mutex<NativeOverlapped>>, pyre_interpreter::PyError> {
     let event = host_winapi::create_event_w(true, false, None).map_err(win32_err)?;
     let mut overlapped: OVERLAPPED = unsafe { core::mem::zeroed() };
     overlapped.hEvent = event;
@@ -131,9 +137,9 @@ fn w_overlapped(backend: Box<Mutex<NativeOverlapped>>) -> PyObjectRef {
 /// The result is asked for unconditionally rather than only while the
 /// operation is pending: a call that completed inside `ReadFile` still has its
 /// transfer count here, and that is what the caller reads it for.
-fn overlapped_get_result(args: &[PyObjectRef]) -> crate::PyResult {
+fn overlapped_get_result(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     let obj = arg(args, 0, "GetOverlappedResult")?;
-    let wait = crate::baseobjspace::is_true(arg(args, 1, "GetOverlappedResult")?)?;
+    let wait = pyre_interpreter::baseobjspace::is_true(arg(args, 1, "GetOverlappedResult")?)?;
     let record = native(obj)?;
     // A waiting call runs with the lock dropped.  It blocks until the
     // operation ends, and `cancel` — the one call that can end it early —
@@ -153,7 +159,7 @@ fn overlapped_get_result(args: &[PyObjectRef]) -> crate::PyResult {
     // `ERROR_TIMEOUT` behind on every poll that expires, so a value read after
     // the guard names that wait rather than this call.
     let result = {
-        let _blocked = crate::module::thread::before_external_block();
+        let _blocked = pyre_interpreter::module::thread::before_external_block();
         host_overlapped::get_overlapped_result(handle, overlapped, wait)
     };
     let transferred = result.transferred;
@@ -183,11 +189,11 @@ fn overlapped_get_result(args: &[PyObjectRef]) -> crate::PyResult {
 
 /// `Overlapped.getbuffer()` -> what a completed read produced, or `None` when
 /// the operation moved no bytes into one.
-fn overlapped_getbuffer(args: &[PyObjectRef]) -> crate::PyResult {
+fn overlapped_getbuffer(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     let obj = arg(args, 0, "getbuffer")?;
     let state = native(obj)?.lock();
     if !state.completed {
-        return Err(crate::PyError::value_error(
+        return Err(pyre_interpreter::PyError::value_error(
             "can't get read buffer before GetOverlappedResult() signals the operation completed",
         ));
     }
@@ -202,7 +208,7 @@ fn overlapped_getbuffer(args: &[PyObjectRef]) -> crate::PyResult {
 /// An operation that finished between the caller's decision to cancel and the
 /// call itself answers `ERROR_NOT_FOUND`, which is not a failure — there is
 /// simply nothing left to cancel.
-fn overlapped_cancel(args: &[PyObjectRef]) -> crate::PyResult {
+fn overlapped_cancel(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     let obj = arg(args, 0, "cancel")?;
     let state = native(obj)?.lock();
     if !state.pending {
@@ -215,7 +221,7 @@ fn overlapped_cancel(args: &[PyObjectRef]) -> crate::PyResult {
     // and `multiprocessing.connection.wait`'s `finally` turns that into an
     // `OSError` that kills the pool's `_handle_workers` thread.
     let result = {
-        let _blocked = crate::module::thread::before_external_block();
+        let _blocked = pyre_interpreter::module::thread::before_external_block();
         host_overlapped::cancel_overlapped(state.handle, &state.overlapped)
     };
     if let Err(error) = result {
@@ -224,8 +230,8 @@ fn overlapped_cancel(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(pyre_object::w_none())
 }
 
-fn overlapped_new(_args: &[PyObjectRef]) -> crate::PyResult {
-    Err(crate::PyError::type_error(
+fn overlapped_new(_args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
+    Err(pyre_interpreter::PyError::type_error(
         "cannot create '_winapi.Overlapped' instances",
     ))
 }
@@ -235,14 +241,14 @@ fn init_overlapped_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__new__",
-            crate::typedef::make_new_descr(overlapped_new),
+            pyre_interpreter::typedef::make_new_descr(overlapped_new),
         )
     };
     for (name, arity, function) in [
         (
             "GetOverlappedResult",
             2,
-            overlapped_get_result as crate::BuiltinCodeFn,
+            overlapped_get_result as pyre_interpreter::BuiltinCodeFn,
         ),
         ("getbuffer", 1, overlapped_getbuffer),
         ("cancel", 1, overlapped_cancel),
@@ -251,7 +257,7 @@ fn init_overlapped_type(ns: PyObjectRef) {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                crate::make_builtin_function_with_arity(name, function, arity),
+                pyre_interpreter::make_builtin_function_with_arity(name, function, arity),
             )
         };
     }
@@ -261,10 +267,10 @@ fn init_overlapped_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "event",
-            crate::typedef::make_getset_descriptor_named(
-                crate::make_builtin_function_with_arity(
+            pyre_interpreter::typedef::make_getset_descriptor_named(
+                pyre_interpreter::make_builtin_function_with_arity(
                     "event",
-                    |args: &[PyObjectRef]| -> crate::PyResult {
+                    |args: &[PyObjectRef]| -> pyre_interpreter::PyResult {
                         let state = native(arg(args, 1, "event")?)?.lock();
                         Ok(super::w_handle(state.overlapped.hEvent))
                     },
@@ -280,13 +286,13 @@ static OVERLAPPED_RUNTIME_TYPE: OnceLock<usize> = OnceLock::new();
 
 pub fn overlapped_type() -> PyObjectRef {
     *OVERLAPPED_RUNTIME_TYPE.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type_with_layout(
+        let tp = pyre_interpreter::typedef::make_builtin_type_with_layout(
             "_winapi.Overlapped",
             init_overlapped_type,
-            crate::typedef::w_object(),
+            pyre_interpreter::typedef::w_object(),
             <W_Overlapped as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
         );
-        crate::typedef::mark_cpython_heap_type(tp, true);
+        pyre_interpreter::typedef::mark_cpython_heap_type(tp, true);
         pyre_object::pyobject::set_instantiate(
             unsafe { &*<W_Overlapped as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE },
             tp,
@@ -328,13 +334,13 @@ pub unsafe fn w_overlapped_dealloc(obj: PyObjectRef) {
 pub fn connect_named_pipe(
     handle: HANDLE,
     use_overlapped: bool,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     if !use_overlapped {
         // Scoped to the call alone, as `releasegil=True` is: raising and
         // building the answer both allocate, and an allocation made outside
         // the RUNNING census can be collected under the thread that made it.
         let result = {
-            let _blocked = crate::module::thread::before_external_block();
+            let _blocked = pyre_interpreter::module::thread::before_external_block();
             host_winapi::connect_named_pipe(handle)
         };
         result.map_err(win32_err)?;
@@ -345,7 +351,7 @@ pub fn connect_named_pipe(
         let mut state = backend.lock();
         // An overlapped `ConnectNamedPipe` never reports success directly; it
         // reports either the pending connection or one already made.
-        let _blocked = crate::module::thread::before_external_block();
+        let _blocked = pyre_interpreter::module::thread::before_external_block();
         host_overlapped::start_connect_named_pipe(handle, &mut state.overlapped)
     };
     match error {
@@ -371,10 +377,10 @@ pub fn read_file(
     handle: HANDLE,
     size: u32,
     use_overlapped: bool,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     if !use_overlapped {
         let result = {
-            let _blocked = crate::module::thread::before_external_block();
+            let _blocked = pyre_interpreter::module::thread::before_external_block();
             host_winapi::read_file(handle, size)
         }
         .map_err(win32_err)?;
@@ -388,7 +394,7 @@ pub fn read_file(
         let mut state = backend.lock();
         state.transfer = Transfer::Read;
         state.buffer = vec![0u8; size as usize];
-        let _blocked = crate::module::thread::before_external_block();
+        let _blocked = pyre_interpreter::module::thread::before_external_block();
         host_overlapped::start_read_file(
             handle,
             state.buffer.as_mut_ptr(),
@@ -417,10 +423,10 @@ pub fn write_file(
     handle: HANDLE,
     data: &[u8],
     use_overlapped: bool,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     if !use_overlapped {
         let result = {
-            let _blocked = crate::module::thread::before_external_block();
+            let _blocked = pyre_interpreter::module::thread::before_external_block();
             host_winapi::write_file(handle, data)
         }
         .map_err(win32_err)?;
@@ -435,7 +441,7 @@ pub fn write_file(
         state.transfer = Transfer::Write;
         state.buffer = data.to_vec();
         let length = state.buffer.len().min(u32::MAX as usize) as u32;
-        let _blocked = crate::module::thread::before_external_block();
+        let _blocked = pyre_interpreter::module::thread::before_external_block();
         host_overlapped::start_write_file(
             handle,
             state.buffer.as_ptr(),

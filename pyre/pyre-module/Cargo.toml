@@ -49,7 +49,11 @@ libffi = { version = "5", features = ["system"] }
 # `faulthandler`'s vectored exception handler returns
 # `EXCEPTION_CONTINUE_SEARCH`. Same 0.61 line as pyre-interpreter so
 # HANDLE types stay one package instance.
-windows-sys = { version = "0.61", features = ["Win32_System_Diagnostics_Debug"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_IO",
+] }
 # `_overlapped.CreateEvent` builds the `WideCString` name
 # `rustpython_host_env::winapi::create_event_w` takes.
 widestring = "1.2"
