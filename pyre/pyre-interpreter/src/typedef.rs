@@ -12751,7 +12751,7 @@ fn make_getset_property_full(
 ///
 /// `gc.is_tracked` consumes it here, and `type.__flags__` publishes the same
 /// canonical field as `Py_TPFLAGS_HAVE_GC`.
-pub(crate) fn cpython_object_is_gc(w_obj: PyObjectRef) -> bool {
+pub fn cpython_object_is_gc(w_obj: PyObjectRef) -> bool {
     let Some(tp) = r#type(w_obj) else {
         return false;
     };
@@ -25806,7 +25806,7 @@ fn unicode_decode_error_msg(
 ///
 /// `bytes` must not be valid UTF-8: the error details are read off the
 /// `Utf8Error` a strict decode of it raises, so a valid buffer has none.
-pub(crate) fn utf8_decode_error(bytes: &[u8]) -> crate::PyError {
+pub fn utf8_decode_error(bytes: &[u8]) -> crate::PyError {
     utf8_decode_error_from(bytes, 0)
 }
 
@@ -25822,7 +25822,7 @@ pub(crate) fn utf8_decode_error(bytes: &[u8]) -> crate::PyError {
 /// # Panics
 ///
 /// `bytes[pos..]` must not be valid UTF-8, for the reason above.
-pub(crate) fn utf8_decode_error_from(bytes: &[u8], pos: usize) -> crate::PyError {
+pub fn utf8_decode_error_from(bytes: &[u8], pos: usize) -> crate::PyError {
     let error = std::str::from_utf8(&bytes[pos..]).unwrap_err();
     let start = pos + error.valid_up_to();
     let reason = match error.error_len() {
@@ -34774,11 +34774,6 @@ mod tests {
                 "itertools.count",
                 crate::typedef::gettypeobject(&pyre_object::interp_itertools::COUNT_TYPE),
                 HEAPTYPE | IMMUTABLETYPE,
-            ),
-            (
-                "_random.Random",
-                crate::module::_random::type_object(),
-                HEAPTYPE,
             ),
         ];
         for (name, w_type, expected) in cases {

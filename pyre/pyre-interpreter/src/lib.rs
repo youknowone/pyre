@@ -1142,12 +1142,9 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         subclass_range_alias(37, &crate::pyframe::FRAME_TYPE),
         subclass_range_alias(43, &crate::pycode::CODE_TYPE),
         subclass_range_alias(44, &crate::pytraceback::PYTRACEBACK_TYPE),
-        subclass_range_alias(56, typed::<crate::module::_random::W_Random>()),
-        subclass_range_alias(89, typed::<crate::module::_pickle::W_Pickler>()),
-        subclass_range_alias(90, typed::<crate::module::_pickle::W_Unpickler>()),
+        // `_random.Random` alias 56 and the `_pickle` aliases 89, 90, 92, 93
+        // live on the optional-module hook.
         subclass_range_alias(91, typed::<crate::module::__pypy__::W_PickleBuffer>()),
-        subclass_range_alias(92, typed::<crate::module::_pickle::PicklerMemoProxy>()),
-        subclass_range_alias(93, typed::<crate::module::_pickle::UnpicklerMemoProxy>()),
         // `collections.deque` W_Deque — auto-id registered at the tail of the
         // GC type chain (`build_gc`), after the coroutine / dict-view-iterator
         // slots, so its vtable alias lands at the current max tid.
@@ -1189,16 +1186,8 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         // 159 as a bare `with_gc_ptrs` id and carries no vtable of its own.
         subclass_range_alias(160, typed::<crate::module::_io::W_BytesIO>()),
         subclass_range_alias(161, typed::<crate::module::_io::W_StringIO>()),
-        // `_hashlib` aliases 164-165 live on the optional-module hook.
-        // `gc.GcRef` keeps its raw referent as a traced wrapper field.
-        // referent field is traced on the wrapper itself, as in
-        // `pypy/module/gc/referents.py`.
-        subclass_range_alias(166, typed::<crate::module::gc::gcref::W_GcRef>()),
-        // `gc.hooks` owns its three callback references directly, matching
-        // W_AppLevelHooks in pypy/module/gc/hook.py.
-        subclass_range_alias(167, typed::<crate::module::gc::hook::W_AppLevelHooks>()),
-        // `gc._get_stats()` returns referents.py's native W_GcStats owner.
-        subclass_range_alias(168, typed::<crate::module::gc::stats::W_GcStats>()),
+        // `_hashlib` aliases 164-165 and `gc` aliases 166-168 live on the
+        // optional-module hook.
         // zlib / `_lsprof` / `_queue` aliases live on the optional-module
         // hook (ids 169-171, 176-179). `_lzma` aliases 174-175 live on
         // the same hook.

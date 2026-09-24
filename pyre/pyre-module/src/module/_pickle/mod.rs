@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 use majit_rlib::rbigint::{RBigInt as BigInt, RBigIntSign as Sign};
 use pyre_object::PyObjectRef;
 
-use crate::PyError;
+use pyre_interpreter::PyError;
 
 mod pickler;
 mod unpickler;
@@ -128,11 +128,10 @@ pub(crate) const BATCHSIZE: usize = 1000;
 // error through `call::set_call_error`; surface it as a Rust `Result`.
 
 pub(crate) fn call_fn(callable: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let r = crate::baseobjspace::call_function(callable, args);
+    let r = pyre_interpreter::baseobjspace::call_function(callable, args);
     if r.is_null() {
-        return Err(
-            crate::call::take_call_error().unwrap_or_else(|| PyError::runtime_error("call failed"))
-        );
+        return Err(pyre_interpreter::call::take_call_error()
+            .unwrap_or_else(|| PyError::runtime_error("call failed")));
     }
     Ok(r)
 }
@@ -142,7 +141,7 @@ fn call_fn_with_kwargs(
     args: &[PyObjectRef],
     kwargs: &[(&str, PyObjectRef)],
 ) -> Result<PyObjectRef, PyError> {
-    let ec = crate::call::getexecutioncontext();
+    let ec = pyre_interpreter::call::getexecutioncontext();
     if ec.is_null() {
         return Err(PyError::runtime_error(
             "no execution context for _pickle keyword call",
@@ -156,7 +155,7 @@ fn call_fn_with_kwargs(
         .iter()
         .map(|(name, value)| (rustpython_wtf8::Wtf8Buf::from(*name), *value))
         .collect::<Vec<_>>();
-    crate::call::call_with_kwargs(unsafe { &mut *frame }, callable, args, &kwargs)
+    pyre_interpreter::call::call_with_kwargs(unsafe { &mut *frame }, callable, args, &kwargs)
 }
 
 pub(crate) fn call_meth(
@@ -164,9 +163,9 @@ pub(crate) fn call_meth(
     name: &str,
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, PyError> {
-    let r = crate::baseobjspace::call_method(obj, name, args);
+    let r = pyre_interpreter::baseobjspace::call_method(obj, name, args);
     if r.is_null() {
-        return Err(crate::call::take_call_error()
+        return Err(pyre_interpreter::call::take_call_error()
             .unwrap_or_else(|| PyError::runtime_error("method call failed")));
     }
     Ok(r)
@@ -177,7 +176,7 @@ pub(crate) fn call_meth(
 /// carrying the same text if the class is somehow unavailable.
 fn pickle_exc(class_name: &str, msg: rustpython_wtf8::Wtf8Buf) -> PyError {
     let mut err = PyError::value_error(msg.clone());
-    if let Some(cls) = crate::builtins::lookup_exc_class(class_name) {
+    if let Some(cls) = pyre_interpreter::builtins::lookup_exc_class(class_name) {
         let _roots = pyre_object::gc_roots::push_roots();
         let cls_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(cls);
@@ -187,7 +186,7 @@ fn pickle_exc(class_name: &str, msg: rustpython_wtf8::Wtf8Buf) -> PyError {
             pyre_object::gc_roots::shadow_stack_get(cls_slot),
             pyre_object::gc_roots::shadow_stack_get(msg_slot),
         ];
-        if let Ok(exc) = crate::builtins::exc_exception_new(&args) {
+        if let Ok(exc) = pyre_interpreter::builtins::exc_exception_new(&args) {
             err.exc_object = exc;
         }
     }
@@ -217,21 +216,21 @@ pub(crate) fn eof_error(msg: &str) -> PyError {
 /// concurrent unpickler cannot observe a half-executed module.  Its initialized
 /// fast path does not reload or rebind modules such as `builtins`.
 pub(crate) fn import_module(name: &str) -> Result<PyObjectRef, PyError> {
-    crate::importing::dunder_import(
+    pyre_interpreter::importing::dunder_import(
         name,
         pyre_object::w_none(),
         pyre_object::w_none(),
         pyre_object::w_none(),
         0,
-        crate::call::getexecutioncontext(),
+        pyre_interpreter::call::getexecutioncontext(),
     )?;
-    crate::importing::get_sys_module(name)
+    pyre_interpreter::importing::get_sys_module(name)
         .ok_or_else(|| PyError::value_error(format!("Can't find module {name:?} in sys.modules")))
 }
 
 /// The live execution context reached through the thread-owned space state.
-fn current_ec() -> Option<*const crate::PyExecutionContext> {
-    let ec = crate::call::getexecutioncontext();
+fn current_ec() -> Option<*const pyre_interpreter::PyExecutionContext> {
+    let ec = pyre_interpreter::call::getexecutioncontext();
     if ec.is_null() { None } else { Some(ec) }
 }
 
@@ -293,7 +292,7 @@ fn pickle_state() -> Option<*const PickleState> {
         "REVERSE_IMPORT_MAPPING",
     ] {
         let compat = pyre_object::gc_roots::shadow_stack_get(base);
-        let table = crate::baseobjspace::getattr_str(compat, attr).ok()?;
+        let table = pyre_interpreter::baseobjspace::getattr_str(compat, attr).ok()?;
         let _ = pyre_object::gc_roots::pin_root(table);
     }
     // Slots base+1..=base+4 hold the four tables (updated by any relocation
@@ -350,7 +349,7 @@ pub(crate) fn compat_map(
     module: &str,
     name: &str,
     reverse: bool,
-) -> Result<(String, String), crate::PyError> {
+) -> Result<(String, String), pyre_interpreter::PyError> {
     // `pickle_state()` yields a raw `*const PickleState`, not a shared reference:
     // the generic `finditem` below can run Python on a user-replaced mapping and
     // drive a collection, and `walk_pickle_state_gc` then rewrites the cached
@@ -394,11 +393,11 @@ pub(crate) fn compat_map(
     // `text_w` conversions raise TypeError on a non-str element — the guards a
     // malformed value would otherwise hit in the downstream `__import__` /
     // `getattr`.
-    if let Some(v) = crate::baseobjspace::finditem(w_name_map, key)? {
-        let pair = crate::baseobjspace::fixedview(v, 2)?;
+    if let Some(v) = pyre_interpreter::baseobjspace::finditem(w_name_map, key)? {
+        let pair = pyre_interpreter::baseobjspace::fixedview(v, 2)?;
         return Ok((
-            crate::baseobjspace::text_w(pair[0])?.to_string(),
-            crate::baseobjspace::text_w(pair[1])?.to_string(),
+            pyre_interpreter::baseobjspace::text_w(pair[0])?.to_string(),
+            pyre_interpreter::baseobjspace::text_w(pair[1])?.to_string(),
         ));
     }
     let w_import_map = unsafe {
@@ -410,9 +409,9 @@ pub(crate) fn compat_map(
     };
     // `elif w_2:` — presence of a bare-module remap, then `w_module_name = w_2`
     // with `name` unchanged; `text_w` raises TypeError on a non-str remap value.
-    if let Some(v) = crate::baseobjspace::finditem_str(w_import_map, module)? {
+    if let Some(v) = pyre_interpreter::baseobjspace::finditem_str(w_import_map, module)? {
         return Ok((
-            crate::baseobjspace::text_w(v)?.to_string(),
+            pyre_interpreter::baseobjspace::text_w(v)?.to_string(),
             name.to_string(),
         ));
     }
@@ -434,7 +433,7 @@ pub(crate) fn getattribute_dotted(
             )));
         }
         parent = cur;
-        cur = crate::baseobjspace::getattr_str(cur, sub)?;
+        cur = pyre_interpreter::baseobjspace::getattr_str(cur, sub)?;
     }
     Ok((cur, parent))
 }
@@ -473,16 +472,20 @@ pub(crate) fn getattribute_dotted_obj(
         };
         if unsafe { pyre_object::w_str_get_wtf8(w_part) }.as_bytes() == b"<locals>" {
             let qualname_repr = unsafe {
-                crate::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(qualname_slot))
+                pyre_interpreter::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(
+                    qualname_slot,
+                ))
             }
             .unwrap_or_else(|_| rustpython_wtf8::Wtf8Buf::from_string("<qualname>".to_string()));
-            return Err(PyError::attribute_error(crate::display::wtf8_format!(
-                "Can't get local attribute ",
-                qualname_repr
-            )));
+            return Err(PyError::attribute_error(
+                pyre_interpreter::display::wtf8_format!(
+                    "Can't get local attribute ",
+                    qualname_repr
+                ),
+            ));
         }
         parent_slot = cur_slot;
-        let next = crate::baseobjspace::getattr(
+        let next = pyre_interpreter::baseobjspace::getattr(
             pyre_object::gc_roots::shadow_stack_get(cur_slot),
             w_part,
         )?;
@@ -529,14 +532,14 @@ pub(crate) fn try_resolve_global(
         // non-dotted name is a single `getattr`), mirroring `_getattribute`.
         return match getattribute_dotted(module, name) {
             Ok((obj, _)) => Ok(Some(obj)),
-            Err(e) if e.kind == crate::PyErrorKind::AttributeError => Ok(None),
+            Err(e) if e.kind == pyre_interpreter::PyErrorKind::AttributeError => Ok(None),
             Err(e) => Err(e),
         };
     }
     // protocol < 4: a single `getattr`, never a qualname walk.
-    match crate::baseobjspace::getattr_str(module, name) {
+    match pyre_interpreter::baseobjspace::getattr_str(module, name) {
         Ok(obj) => Ok(Some(obj)),
-        Err(e) if e.kind == crate::PyErrorKind::AttributeError => Ok(None),
+        Err(e) if e.kind == pyre_interpreter::PyErrorKind::AttributeError => Ok(None),
         Err(e) => Err(e),
     }
 }
@@ -609,7 +612,7 @@ pub(crate) fn parse_int_text(s: &str) -> Result<PyObjectRef, PyError> {
     // interp_pickle.py:2201 calls the ordinary `int` constructor.  Reuse its
     // NumberStringParser consumer so the digit limit, MemoryError edge, and
     // literal diagnostics do not diverge for protocol-0 INT/LONG opcodes.
-    crate::builtins::parse_int_from_str(pyre_object::w_str_new_managed(s), s, 10)
+    pyre_interpreter::builtins::parse_int_from_str(pyre_object::w_str_new_managed(s), s, 10)
 }
 
 pub(crate) fn read_int_le(data: &[u8]) -> i64 {
@@ -627,14 +630,15 @@ pub(crate) fn str_from_utf8(data: &[u8]) -> Result<PyObjectRef, PyError> {
     // rejection is `rutf8::wtf8_from_bytes`'s and not `Wtf8Buf::from_bytes`'s,
     // which admits sequences that hold no code point at all, and it is
     // reported at the position that validator stopped at.
-    let s = pyre_object::rutf8::wtf8_from_bytes(data, true)
-        .map_err(|error| crate::typedef::utf8_decode_error_from(data, error.pos as usize))?;
+    let s = pyre_object::rutf8::wtf8_from_bytes(data, true).map_err(|error| {
+        pyre_interpreter::typedef::utf8_decode_error_from(data, error.pos as usize)
+    })?;
     Ok(pyre_object::unicodeobject::w_str_from_wtf8_managed(
         s.to_owned(),
     ))
 }
 
-crate::py_module! {
+pyre_interpreter::py_module! {
     "_pickle",
     interpleveldefs: {
         "Pickler" => pickler::type_object(),
@@ -642,14 +646,14 @@ crate::py_module! {
         // Shared singleton with `__pypy__.PickleBuffer`; `pickle.py` does
         // `from _pickle import PickleBuffer` to set `_HAVE_PICKLE_BUFFER`.
         "PickleBuffer" =>
-            crate::module::__pypy__::interp_buffer::picklebuffer_type_object(),
+            pyre_interpreter::module::__pypy__::interp_buffer::picklebuffer_type_object(),
     },
     exceptions: {
-        "PickleError" => crate::builtins::lookup_exc_class("Exception")
+        "PickleError" => pyre_interpreter::builtins::lookup_exc_class("Exception")
             .expect("Exception must be installed before _pickle init"),
-        "PicklingError" => crate::builtins::lookup_exc_class("_pickle.PickleError")
+        "PicklingError" => pyre_interpreter::builtins::lookup_exc_class("_pickle.PickleError")
             .expect("_pickle.PickleError registered just above"),
-        "UnpicklingError" => crate::builtins::lookup_exc_class("_pickle.PickleError")
+        "UnpicklingError" => pyre_interpreter::builtins::lookup_exc_class("_pickle.PickleError")
             .expect("_pickle.PickleError registered just above"),
     },
     inline_functions: {
@@ -684,7 +688,7 @@ crate::py_module! {
             ))?;
             pickler::check_buffer_callback(pyre_object::gc_roots::shadow_stack_get(bc_slot), proto)?;
             let fix =
-                crate::baseobjspace::is_true(pyre_object::gc_roots::shadow_stack_get(fix_slot))?;
+                pyre_interpreter::baseobjspace::is_true(pyre_object::gc_roots::shadow_stack_get(fix_slot))?;
             // The dump-time `dispatch_table` (no per-pickler one here) — its
             // `copyreg` import can collect; pin it before the memo allocation.
             let dispatch_table = pickler::copyreg_dispatch_table();
@@ -736,7 +740,7 @@ crate::py_module! {
             ))?;
             pickler::check_buffer_callback(pyre_object::gc_roots::shadow_stack_get(bc_slot), proto)?;
             let fix =
-                crate::baseobjspace::is_true(pyre_object::gc_roots::shadow_stack_get(fix_slot))?;
+                pyre_interpreter::baseobjspace::is_true(pyre_object::gc_roots::shadow_stack_get(fix_slot))?;
             let dispatch_table = pickler::copyreg_dispatch_table();
             let _ = pyre_object::gc_roots::pin_root(dispatch_table);
             let dt_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -801,7 +805,7 @@ crate::py_module! {
             let errors = pyre_object::gc_roots::pin_root(errors);
             let buffers = pyre_object::gc_roots::pin_root(buffers);
             let io = import_module("io")?;
-            let bytesio_cls = crate::baseobjspace::getattr_str(io, "BytesIO")?;
+            let bytesio_cls = pyre_interpreter::baseobjspace::getattr_str(io, "BytesIO")?;
             let file = call_fn(
                 bytesio_cls,
                 &[pyre_object::gc_roots::shadow_stack_get(base)],

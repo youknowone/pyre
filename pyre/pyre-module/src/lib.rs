@@ -56,6 +56,8 @@ pub fn install_optional_modules() {
         module::_contextvars::init,
     );
     pyre_interpreter::importing::register_builtin_module("_functools", module::_functools::init);
+    pyre_interpreter::importing::register_builtin_module("_pickle", module::_pickle::init);
+    pyre_interpreter::importing::register_builtin_module("_random", module::_random::init);
     pyre_interpreter::importing::register_builtin_module("_codecs_cn", module::_codecs_cn::init);
     pyre_interpreter::importing::register_builtin_module("_codecs_hk", module::_codecs_hk::init);
     pyre_interpreter::importing::register_builtin_module(
@@ -130,6 +132,7 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("binascii", module::binascii::init);
     pyre_interpreter::importing::register_builtin_module("cmath", module::cmath::init);
     pyre_interpreter::importing::register_builtin_module("errno", module::errno::init);
+    pyre_interpreter::importing::register_builtin_module("gc", module::gc::init);
     #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module(
         "faulthandler",
@@ -427,6 +430,8 @@ pub fn register() {
             walk_global_roots: walk_optional_global_roots,
             walk_prebuilt_slots: |fwd| {
                 module::_csv::walk_csv_state_gc(fwd);
+                module::_pickle::walk_pickle_state_gc(fwd);
+                module::gc::walk_gc_stats_type_gc(fwd);
             },
             subclass_range_aliases: optional_subclass_range_aliases,
             publish_fnaddrs: publish_optional_fnaddrs,
@@ -451,6 +456,9 @@ pub fn register() {
             math_word_residual_call_addrs: || {
                 vec![module::math::interp_math::jit_math_isqrt_i64 as *const () as usize as i64]
             },
+            gc_initialize: hook_gc_initialize,
+            pickle_call_fn: module::_pickle::call_fn,
+            pickle_call_meth: module::_pickle::call_meth,
         },
     );
 }
@@ -591,6 +599,19 @@ fn module_gc_types() -> Vec<pyre_interpreter::importing::ModuleGcType> {
 /// inherent methods `ll_math::f64_method_llexternal` names onto these
 /// paths; the raising `ll_math_*` wrappers stay around them.
 fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
+    // `rpython/rlib/rrandom.py Random.genrand32` is not `@jit.unroll_safe`,
+    // so `Random.random` keeps residual calls to the native helper. Publish
+    // the old interpreter path and the moved path.
+    let genrand32: fn(&mut module::_random::Random) -> u32 = module::_random::Random::genrand32;
+    let genrand32_addr = genrand32 as *const () as usize as i64;
+    for path in [
+        "pyre_interpreter::module::_random::Random::genrand32",
+        "module::_random::Random::genrand32",
+        "pyre_module::module::_random::Random::genrand32",
+    ] {
+        entries.push((path, genrand32_addr));
+    }
+
     use module::math::interp_math as math;
 
     fn pair(
@@ -1331,8 +1352,15 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
     }
 }
 
+fn hook_gc_initialize(
+    space: pyre_object::PyObjectRef,
+    actionflag: &mut (dyn pyre_interpreter::executioncontext::ActionFlagOps + 'static),
+) {
+    let _ = module::gc::hook::initialize(space, actionflag);
+}
+
 fn walk_optional_global_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    let _ = visitor;
+    module::gc::hook::walk_hook_roots(visitor);
     #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
     module::faulthandler::handler::walk_faulthandler_roots(visitor);
     #[cfg(all(
@@ -1353,6 +1381,11 @@ fn optional_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRange
     }
 
     let mut aliases = vec![
+        subclass_range_alias(56, typed::<module::_random::W_Random>()),
+        subclass_range_alias(89, typed::<module::_pickle::W_Pickler>()),
+        subclass_range_alias(90, typed::<module::_pickle::W_Unpickler>()),
+        subclass_range_alias(92, typed::<module::_pickle::PicklerMemoProxy>()),
+        subclass_range_alias(93, typed::<module::_pickle::UnpicklerMemoProxy>()),
         subclass_range_alias(129, typed::<module::_tokenize::W_TokenizerIter>()),
         // `unicodedata.UCD` sits at AUTO-ID 157, before `__pypy__.Bufferable`.
         subclass_range_alias(157, typed::<module::unicodedata::W_UCD>()),
@@ -1362,6 +1395,9 @@ fn optional_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRange
         // owners and have sweep-time native-state destructors in build_gc.
         subclass_range_alias(164, typed::<module::_hashlib::W_HashState>()),
         subclass_range_alias(165, typed::<module::_hashlib::W_Hmac>()),
+        subclass_range_alias(166, typed::<module::gc::gcref::W_GcRef>()),
+        subclass_range_alias(167, typed::<module::gc::hook::W_AppLevelHooks>()),
+        subclass_range_alias(168, typed::<module::gc::stats::W_GcStats>()),
         subclass_range_alias(172, typed::<module::_bz2::W_BZ2Compressor>()),
         subclass_range_alias(173, typed::<module::_bz2::W_BZ2Decompressor>()),
         // `_lzma`'s two stream objects own their liblzma coder, unconditional

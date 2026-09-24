@@ -911,7 +911,7 @@ unsafe fn int_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_
 /// the wrapper keeps answering `random()` through it after a collection.
 unsafe fn random_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     unsafe { object_object_custom_trace(obj_addr, f) };
-    let inst = unsafe { &mut *(obj_addr as *mut pyre_interpreter::module::_random::W_Random) };
+    let inst = unsafe { &mut *(obj_addr as *mut pyre_module::module::_random::W_Random) };
     f(std::ptr::addr_of_mut!(inst.rnd) as *mut majit_ir::GcRef);
 }
 
@@ -3082,7 +3082,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     // edge, which `random_object_custom_trace` adds on top. Register it in the
     // original slot so every later type id remains stable.
     {
-        let descr = <pyre_interpreter::module::_random::W_Random
+        let descr = <pyre_module::module::_random::W_Random
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
         let tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
             descr.object_size,
@@ -3254,13 +3254,13 @@ fn build_gc() -> Box<MiniMarkGC> {
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_interpreter::module::_pickle::W_Pickler
+        <pyre_module::module::_pickle::W_Pickler
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_interpreter::module::_pickle::W_Unpickler
+        <pyre_module::module::_pickle::W_Unpickler
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     // W_PickleBuffer (`__pypy__.PickleBuffer`) — typed payload via
@@ -3278,13 +3278,13 @@ fn build_gc() -> Box<MiniMarkGC> {
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_interpreter::module::_pickle::PicklerMemoProxy
+        <pyre_module::module::_pickle::PicklerMemoProxy
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_interpreter::module::_pickle::UnpicklerMemoProxy
+        <pyre_module::module::_pickle::UnpicklerMemoProxy
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     // W_ReversedIterator (`reversed`) — typed payload via `#[pyre_class]`
@@ -3901,7 +3901,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_interpreter::module::gc::gcref::W_GcRef
+        <pyre_module::module::gc::gcref::W_GcRef
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     // `pypy/module/gc/hook.py W_AppLevelHooks`: the process-owned hooks
@@ -3911,7 +3911,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_interpreter::module::gc::hook::W_AppLevelHooks
+        <pyre_module::module::gc::hook::W_AppLevelHooks
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     // `pypy/module/gc/referents.py W_GcStats`: scalar statistics live on
@@ -3919,7 +3919,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_interpreter::module::gc::stats::W_GcStats
+        <pyre_module::module::gc::stats::W_GcStats
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     // The unconditional native owners of `zlib`, `_bz2`, `_lzma`, `_lsprof`
@@ -4053,7 +4053,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     // rclass.OBJECT subclass and has no Python-visible vtable, so it takes a
     // bare `with_gc_ptrs` id rather than a `register_pyre_class` one. Appended
     // at the tail so no established id moves.
-    let twister_descr = <pyre_interpreter::module::_random::Random
+    let twister_descr = <pyre_module::module::_random::Random
         as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
     let twister_tid = gc.register_type(TypeInfo::with_gc_ptrs(
         twister_descr.object_size,

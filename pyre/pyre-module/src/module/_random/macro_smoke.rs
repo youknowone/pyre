@@ -15,29 +15,29 @@ use pyre_object::*;
 
 /// `#[pyre_class]` typed payload exercising getter/setter/deleter,
 /// `__reduce__`, and the declarative `base = <expr>` arm.
-#[crate::pyre_class("_pyre_smoke.Demo")]
+#[pyre_interpreter::pyre_class("_pyre_smoke.Demo")]
 #[derive(Default)]
 pub struct Demo {
     pub state: u64,
 }
 
-#[crate::pyre_methods(
+#[pyre_interpreter::pyre_methods(
     doc = "Demo() -> smoke-test typed payload.",
     weakrefable,
     // `base = <expr>` arm — `object` is the implicit default, so this is
     // behaviorally identical while exercising the declarative-base plumbing.
-    base = crate::typedef::w_object()
+    base = pyre_interpreter::typedef::w_object()
 )]
 impl Demo {
     fn __init__(&mut self, #[default(0i64)] seed: i64) {
         self.state = seed as u64;
     }
     fn getstate(&self) -> PyObjectRef {
-        crate::pytuple![self.state as i64]
+        pyre_interpreter::pytuple![self.state as i64]
     }
     // `__reduce__` pickling-hook arm.
     fn __reduce__(&self) -> PyObjectRef {
-        crate::pytuple![type_object(), crate::pytuple![], self.getstate()]
+        pyre_interpreter::pytuple![type_object(), pyre_interpreter::pytuple![], self.getstate()]
     }
     // A positional-or-keyword parameter plus a keyword-only default: the
     // instance-method arm must build a `Signature` (`self` posonly, then
@@ -76,20 +76,20 @@ impl Demo {
 }
 
 /// `PyPath` typed-receiver alias.
-#[crate::pyre_function]
+#[pyre_interpreter::pyre_function]
 fn _seed_from_path(path: PyPath) -> i64 {
     path.into_iter().map(|b| b as i64).sum()
 }
 
 /// `Vec<i64>` auto return-wrap.
-#[crate::pyre_function]
+#[pyre_interpreter::pyre_function]
 fn _path_bytes(path: PyPath) -> Vec<i64> {
     path.into_iter().map(|b| b as i64).collect()
 }
 
 /// One parameter per text / int unwrap alias, so the generated unwrap +
 /// binding-type expansion is exercised for each.
-#[crate::pyre_function]
+#[pyre_interpreter::pyre_function]
 fn _unwrap_alias_probe(
     u: PyUnicode,
     u8s: PyUtf8,
@@ -106,7 +106,7 @@ fn _unwrap_alias_probe(
 
 /// A Signature-bound scope includes keyword-only slots in its flat argument
 /// array.  The typed wrapper must not recount those slots as positionals.
-#[crate::pyre_function]
+#[pyre_interpreter::pyre_function]
 fn _kwonly_bound_probe(
     value: i64,
     #[kwonly]
@@ -120,7 +120,7 @@ fn _kwonly_bound_probe(
 /// positional-only run before it: `base` is positional-only, so the derived
 /// `Signature` carries `posonlyargcount == 1` and a keyword named `base` is
 /// rejected by `raise_if_posonly_kwds`.
-#[crate::pyre_function]
+#[pyre_interpreter::pyre_function]
 fn _posonly_bound_probe(
     base: i64,
     #[posonly]
@@ -130,14 +130,14 @@ fn _posonly_bound_probe(
     base + offset
 }
 
-crate::py_module! {
+pyre_interpreter::py_module! {
     "_pyre_smoke",
     interpleveldefs: {
         "Demo" => type_object(),
-        "_seed_from_path" => crate::make_builtin_function("_seed_from_path", _seed_from_path),
-        "_path_bytes" => crate::make_builtin_function("_path_bytes", _path_bytes),
+        "_seed_from_path" => pyre_interpreter::make_builtin_function("_seed_from_path", _seed_from_path),
+        "_path_bytes" => pyre_interpreter::make_builtin_function("_path_bytes", _path_bytes),
         "_unwrap_alias_probe" =>
-            crate::make_builtin_function("_unwrap_alias_probe", _unwrap_alias_probe),
+            pyre_interpreter::make_builtin_function("_unwrap_alias_probe", _unwrap_alias_probe),
     },
     int_constants: {
         // `int_constants:` arm — a plain integer module constant.
@@ -145,7 +145,7 @@ crate::py_module! {
     },
     exceptions: {
         // `exceptions:` arm — a module-local exception class.
-        "_ProbeError" => crate::builtins::lookup_exc_class("Exception")
+        "_ProbeError" => pyre_interpreter::builtins::lookup_exc_class("Exception")
             .expect("Exception must be installed before smoke init"),
     },
     appleveldefs: {
@@ -168,7 +168,7 @@ mod tests {
     /// `PyCNonNegInt` through the space-level converters.
     #[test]
     fn unwrap_alias_probe_runs() {
-        crate::typedef::init_typeobjects();
+        pyre_interpreter::typedef::init_typeobjects();
         let args = [
             w_str_new("ab"),
             w_str_new("cde"),
@@ -185,16 +185,16 @@ mod tests {
     /// A missing required argument raises `TypeError` instead of panicking.
     #[test]
     fn missing_required_arg_is_type_error() {
-        crate::typedef::init_typeobjects();
+        pyre_interpreter::typedef::init_typeobjects();
         let err = _seed_from_path(&[]).expect_err("missing path should error");
-        assert_eq!(err.kind, crate::PyErrorKind::TypeError);
+        assert_eq!(err.kind, pyre_interpreter::PyErrorKind::TypeError);
     }
 
     #[test]
     fn keyword_only_bound_slot_is_not_counted_as_positional() {
-        crate::typedef::init_typeobjects();
+        pyre_interpreter::typedef::init_typeobjects();
         let signature = _kwonly_bound_probe_pyre_sig().expect("derived signature");
-        let bound = crate::call::bind_kwargs_to_signature(
+        let bound = pyre_interpreter::call::bind_kwargs_to_signature(
             &signature,
             "_kwonly_bound_probe",
             &[w_int_new(40)],
@@ -207,15 +207,15 @@ mod tests {
 
     #[test]
     fn unmatched_keywords_pack_from_parallel_rooted_lists() {
-        crate::typedef::init_typeobjects();
-        let signature = crate::gateway::Signature::new(
+        pyre_interpreter::typedef::init_typeobjects();
+        let signature = pyre_interpreter::gateway::Signature::new(
             vec!["head"],
             None,
             Some("kwargs"),
             /*kwonlyargcount*/ 0,
             /*posonlyargcount*/ 0,
         );
-        let bound = crate::call::bind_kwargs_to_signature(
+        let bound = pyre_interpreter::call::bind_kwargs_to_signature(
             &signature,
             "probe",
             &[w_int_new(1)],
@@ -241,14 +241,14 @@ mod tests {
 
     #[test]
     fn posonly_marker_makes_leading_param_positional_only() {
-        crate::typedef::init_typeobjects();
+        pyre_interpreter::typedef::init_typeobjects();
         let signature = _posonly_bound_probe_pyre_sig().expect("derived signature");
         assert_eq!(signature.posonlyargcount, 1);
         assert_eq!(signature.argnames, vec!["base", "offset"]);
 
         // The positional-only `base` binds fine by position, and `offset`
         // still binds by keyword.
-        let bound = crate::call::bind_kwargs_to_signature(
+        let bound = pyre_interpreter::call::bind_kwargs_to_signature(
             &signature,
             "_posonly_bound_probe",
             &[w_int_new(40)],
@@ -259,20 +259,20 @@ mod tests {
         assert_eq!(unsafe { w_int_get_value(result) }, 42);
 
         // Passing the positional-only `base` as a keyword is a TypeError.
-        let err = crate::call::bind_kwargs_to_signature(
+        let err = pyre_interpreter::call::bind_kwargs_to_signature(
             &signature,
             "_posonly_bound_probe",
             &[],
             &[(rustpython_wtf8::Wtf8Buf::from("base"), w_int_new(40))],
         )
         .expect_err("positional-only name as keyword must error");
-        assert_eq!(err.kind, crate::PyErrorKind::TypeError);
+        assert_eq!(err.kind, pyre_interpreter::PyErrorKind::TypeError);
     }
 
     /// `Vec<i64>` return auto-wraps to a list.
     #[test]
     fn path_bytes_returns_list() {
-        crate::typedef::init_typeobjects();
+        pyre_interpreter::typedef::init_typeobjects();
         let result = _path_bytes(&[w_str_new("AB")]).expect("path bytes");
         assert!(unsafe { is_list(result) });
         assert_eq!(unsafe { w_list_len(result) }, 2);
@@ -282,7 +282,7 @@ mod tests {
     /// leaves them for `__init__`; the synthesized allocator must do the same.
     #[test]
     fn synthesized_new_accepts_init_arguments() {
-        crate::typedef::init_typeobjects();
+        pyre_interpreter::typedef::init_typeobjects();
         let cls = type_object();
         let seed = w_int_new(37);
         let obj = __majit_wrap___new__(&[cls, seed]).expect("synthesized __new__");
@@ -299,7 +299,7 @@ mod tests {
     /// PY_NULL-padded scope.
     #[test]
     fn instance_method_binds_keyword_only_through_signature() {
-        crate::typedef::init_typeobjects();
+        pyre_interpreter::typedef::init_typeobjects();
         let cls = type_object();
         let obj = __majit_wrap___new__(&[cls]).expect("synthesized __new__");
         __majit_wrap___init__(&[obj, w_int_new(7)]).expect("Demo.__init__");
@@ -307,14 +307,14 @@ mod tests {
         // The `Signature` the instance-method arm derives for
         // `combine(&self, factor, #[kwonly] bias)`: `self` positional-only,
         // then `factor`, then a keyword-only `bias`.
-        let signature = crate::gateway::Signature::new(
+        let signature = pyre_interpreter::gateway::Signature::new(
             vec!["self", "factor", "bias"],
             None,
             None,
             /*kwonlyargcount*/ 1,
             /*posonlyargcount*/ 1,
         );
-        let bound = crate::call::bind_kwargs_to_signature(
+        let bound = pyre_interpreter::call::bind_kwargs_to_signature(
             &signature,
             "combine",
             &[obj, w_int_new(3)],
@@ -335,7 +335,7 @@ mod tests {
     /// the exact same Python type object, not a fresh TLS allocation.
     #[test]
     fn generated_type_object_is_process_global() {
-        crate::typedef::init_typeobjects();
+        pyre_interpreter::typedef::init_typeobjects();
         let expected = type_object() as usize;
         let observed = std::thread::spawn(|| type_object() as usize)
             .join()

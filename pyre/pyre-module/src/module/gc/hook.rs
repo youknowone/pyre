@@ -1,10 +1,10 @@
 //! App-level GC hooks — PyPy: `pypy/module/gc/hook.py`.
 
 use super::{new_collect_stats, new_collect_step_stats_full, new_minor_stats};
-use crate::executioncontext::{
+use pyre_interpreter::executioncontext::{
     ActionFlagOps, AsyncAction, AsyncActionControl, AsyncActionOps, ExecutionContext,
 };
-use crate::pyframe::PyFrame;
+use pyre_interpreter::pyframe::PyFrame;
 use pyre_object::*;
 use std::sync::OnceLock;
 
@@ -40,7 +40,7 @@ impl GcMinorHookAction {
         self.duration_max = 0.0;
     }
 
-    fn do_perform(&mut self) -> Result<(), crate::PyError> {
+    fn do_perform(&mut self) -> Result<(), pyre_interpreter::PyError> {
         // `self` is a field of this very allocation, so read the callback
         // through the pointer rather than borrowing the whole singleton.
         let Some(hooks) = app_hooks_ptr() else {
@@ -67,7 +67,7 @@ impl GcMinorHookAction {
         )?;
         let _ = pyre_object::gc_roots::pin_root(stats);
         let stats_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        crate::call::call_function_impl_result(
+        pyre_interpreter::call::call_function_impl_result(
             pyre_object::gc_roots::shadow_stack_get(callable_slot),
             &[pyre_object::gc_roots::shadow_stack_get(stats_slot)],
         )?;
@@ -80,7 +80,7 @@ impl AsyncActionOps for GcMinorHookAction {
         &mut self,
         _executioncontext: &mut ExecutionContext,
         _frame: *mut PyFrame,
-    ) -> Result<AsyncActionControl, crate::PyError> {
+    ) -> Result<AsyncActionControl, pyre_interpreter::PyError> {
         if self.depth != 0 {
             return Ok(AsyncActionControl::Continue);
         }
@@ -131,7 +131,7 @@ impl GcCollectStepHookAction {
         self.duration_max = 0.0;
     }
 
-    fn do_perform(&mut self) -> Result<(), crate::PyError> {
+    fn do_perform(&mut self) -> Result<(), pyre_interpreter::PyError> {
         // `self` is a field of this very allocation, so read the callback
         // through the pointer rather than borrowing the whole singleton.
         let Some(hooks) = app_hooks_ptr() else {
@@ -159,7 +159,7 @@ impl GcCollectStepHookAction {
         )?;
         let _ = pyre_object::gc_roots::pin_root(stats);
         let stats_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        crate::call::call_function_impl_result(
+        pyre_interpreter::call::call_function_impl_result(
             pyre_object::gc_roots::shadow_stack_get(callable_slot),
             &[pyre_object::gc_roots::shadow_stack_get(stats_slot)],
         )?;
@@ -172,7 +172,7 @@ impl AsyncActionOps for GcCollectStepHookAction {
         &mut self,
         _executioncontext: &mut ExecutionContext,
         _frame: *mut PyFrame,
-    ) -> Result<AsyncActionControl, crate::PyError> {
+    ) -> Result<AsyncActionControl, pyre_interpreter::PyError> {
         if self.depth != 0 {
             return Ok(AsyncActionControl::Continue);
         }
@@ -220,7 +220,7 @@ impl GcCollectHookAction {
         }
     }
 
-    fn do_perform(&mut self) -> Result<(), crate::PyError> {
+    fn do_perform(&mut self) -> Result<(), pyre_interpreter::PyError> {
         // `self` is a field of this very allocation, so read the callback
         // through the pointer rather than borrowing the whole singleton.
         let Some(hooks) = app_hooks_ptr() else {
@@ -251,7 +251,7 @@ impl GcCollectHookAction {
         )?;
         let _ = pyre_object::gc_roots::pin_root(stats);
         let stats_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        crate::call::call_function_impl_result(
+        pyre_interpreter::call::call_function_impl_result(
             pyre_object::gc_roots::shadow_stack_get(callable_slot),
             &[pyre_object::gc_roots::shadow_stack_get(stats_slot)],
         )?;
@@ -264,7 +264,7 @@ impl AsyncActionOps for GcCollectHookAction {
         &mut self,
         _executioncontext: &mut ExecutionContext,
         _frame: *mut PyFrame,
-    ) -> Result<AsyncActionControl, crate::PyError> {
+    ) -> Result<AsyncActionControl, pyre_interpreter::PyError> {
         if self.depth != 0 {
             return Ok(AsyncActionControl::Continue);
         }
@@ -287,7 +287,7 @@ impl AsyncActionOps for GcCollectHookAction {
 /// on the singleton owner, so the generated type tracer forwards them; the
 /// three action objects are embedded exactly as its `gc_minor`,
 /// `gc_collect_step`, and `gc_collect` attributes are upstream.
-#[crate::pyre_class("GcHooks")]
+#[pyre_interpreter::pyre_class("GcHooks")]
 pub struct W_AppLevelHooks {
     pub w_on_gc_minor: PyObjectRef,
     pub w_on_gc_collect_step: PyObjectRef,
@@ -306,7 +306,7 @@ impl W_AppLevelHooks {
     }
 }
 
-#[crate::pyre_methods]
+#[pyre_interpreter::pyre_methods]
 impl W_AppLevelHooks {
     #[getter]
     fn on_gc_minor(&self) -> PyObjectRef {
@@ -344,25 +344,25 @@ impl W_AppLevelHooks {
         self.write_barrier();
     }
 
-    fn set(&mut self, w_obj: PyObjectRef) -> Result<(), crate::PyError> {
+    fn set(&mut self, w_obj: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
         // hook.py:100-107 — fetch all three first, so a missing later
         // attribute leaves the existing hook set untouched.
         let _roots = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(w_obj);
         let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let w_a = crate::baseobjspace::getattr_str(
+        let w_a = pyre_interpreter::baseobjspace::getattr_str(
             pyre_object::gc_roots::shadow_stack_get(obj_slot),
             "on_gc_minor",
         )?;
         let _ = pyre_object::gc_roots::pin_root(w_a);
         let a_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let w_b = crate::baseobjspace::getattr_str(
+        let w_b = pyre_interpreter::baseobjspace::getattr_str(
             pyre_object::gc_roots::shadow_stack_get(obj_slot),
             "on_gc_collect_step",
         )?;
         let _ = pyre_object::gc_roots::pin_root(w_b);
         let b_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let w_c = crate::baseobjspace::getattr_str(
+        let w_c = pyre_interpreter::baseobjspace::getattr_str(
             pyre_object::gc_roots::shadow_stack_get(obj_slot),
             "on_gc_collect",
         )?;
@@ -417,7 +417,7 @@ fn app_hooks_ptr() -> Option<*mut W_AppLevelHooks> {
 
 /// Create the space-owned singleton and bind its three actions to the shared
 /// `space.actionflag`. The main ExecutionContext calls this during bootstrap;
-/// worker ECs carry [`crate::executioncontext::SpaceActionFlag`] references to
+/// worker ECs carry [`pyre_interpreter::executioncontext::SpaceActionFlag`] references to
 /// that same flag, so a collection performed by a worker fires and dispatches
 /// the same action indexes there, matching PyPy's process-owned object space.
 pub fn initialize(
@@ -466,7 +466,8 @@ pub fn hooks_object() -> PyObjectRef {
     if let Some(&addr) = HOOKS_OBJECT.get() {
         return addr as PyObjectRef;
     }
-    let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
+    let ec =
+        pyre_interpreter::call::getexecutioncontext() as *mut pyre_interpreter::PyExecutionContext;
     assert!(
         !ec.is_null(),
         "gc.hooks initialized without an ExecutionContext"

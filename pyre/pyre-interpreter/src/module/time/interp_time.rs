@@ -132,7 +132,7 @@ fn monotonic_seconds() -> f64 {
 
 /// Wall-clock seconds since the unix epoch, falling back to 0 on
 /// `SystemTimeError`.  Routes through `host_env::time` when enabled.
-pub(crate) fn duration_since_epoch() -> std::time::Duration {
+pub fn duration_since_epoch() -> std::time::Duration {
     #[cfg(all(target_arch = "wasm32", not(feature = "sandbox")))]
     {
         let nanos = with_clock(|clock| clock.wall_nanos(), 0).max(0) as u128;

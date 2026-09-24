@@ -613,6 +613,12 @@ pub struct OptionalModuleHooks {
     pub math_faithful_residual_call_addrs: fn() -> Vec<i64>,
     /// The `math` residual targets vouched to return a word on wasm.
     pub math_word_residual_call_addrs: fn() -> Vec<i64>,
+    /// `gc` app-level hooks, installed once when the execution context
+    /// binds the shared action flag.
+    pub gc_initialize: fn(PyObjectRef, &mut (dyn crate::executioncontext::ActionFlagOps + 'static)),
+    pub pickle_call_fn: fn(PyObjectRef, &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+    pub pickle_call_meth:
+        fn(PyObjectRef, &str, &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
 }
 
 static OPTIONAL_MODULE_HOOKS: std::sync::OnceLock<OptionalModuleHooks> = std::sync::OnceLock::new();
@@ -835,8 +841,8 @@ pub fn install_builtin_modules() {
     // Host-access modules — arbitrary FFI (`_ctypes`), real signals.
     // `select`, `mmap`, `_socket`/`_ssl`, `pwd`/`grp`, `errno`, `_stat`,
     // `_abc`, `_typing`, `_symtable`, `_pypy_generic_alias`, `atexit`,
-    // `pypyjit`, `_contextvars`, `_functools`, and the Windows host modules
-    // live in `pyre-module`.  None of the host
+    // `pypyjit`, `_contextvars`, `_functools`, `gc`, `_pickle`, `_random`,
+    // and the Windows host modules live in `pyre-module`.  None of the host
     // ones belong to the mediated ll_os/ll_time surface, so the sandbox
     // interpreter omits them entirely: `import _ctypes` then raises
     // ModuleNotFoundError, as in a build whose syscall code is absent.
@@ -850,11 +856,8 @@ pub fn install_builtin_modules() {
         pyre_install_module!("_signal"(signal));
     }
     pyre_install_module!(_locale);
-    pyre_install_module!(_random);
-    pyre_install_module!(_pickle);
     register_collectible_builtin_module("_struct", crate::module::r#struct::init);
     pyre_install_module!(marshal);
-    pyre_install_module!(gc);
 
     // Modules whose stdlib wrapper does `import X` + attribute access or
     // `from X import *` are deliberately NOT stubbed here: an empty stub

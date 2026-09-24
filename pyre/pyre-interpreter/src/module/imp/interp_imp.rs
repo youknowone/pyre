@@ -775,7 +775,10 @@ fn frozen_data(entry: &FrozenModule) -> Result<pyre_object::PyObjectRef, crate::
     let bytes_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_bytes);
     let mv_type = crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE);
-    crate::module::_pickle::call_fn(
+    let Some(hooks) = crate::importing::optional_module_hooks() else {
+        return Err(crate::PyError::runtime_error("_pickle is not available"));
+    };
+    (hooks.pickle_call_fn)(
         mv_type,
         &[pyre_object::gc_roots::shadow_stack_get(bytes_slot)],
     )

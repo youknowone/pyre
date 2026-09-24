@@ -1252,22 +1252,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::jit_sequence_getitem",
         crate::runtime_ops::jit_sequence_getitem,
     );
-    // `rpython/rlib/rrandom.py Random.genrand32` contains the Mersenne
-    // Twister refill loops.  `JitPolicy.look_inside_graph` deliberately
-    // rejects the loopy graph (it is not `@jit.unroll_safe`), so
-    // `Random.random` keeps two ordinary residual calls to the translated
-    // native helper.  Publish that helper's address just as RPython's source
-    // translation/link step does; otherwise the codewriter can only emit a
-    // `symbolic_fnaddr_for_path` hash and an inline sub-walk must abort before
-    // reaching the native residual.
-    let random_genrand32: fn(&mut crate::module::_random::Random) -> u32 =
-        crate::module::_random::Random::genrand32;
-    pa1(
-        &mut entries,
-        "pyre_interpreter::module::_random::Random::genrand32",
-        "module::_random::Random::genrand32",
-        random_genrand32,
-    );
     cpa1(
         &mut entries,
         "pyre_interpreter::runtime_ops::jit_next",
@@ -6091,20 +6075,6 @@ mod tests {
             bindings["stack_check::PYRE_STACKTOOBIG"],
             &crate::stack_check::PYRE_STACKTOOBIG as *const _ as i64
         );
-    }
-
-    #[test]
-    fn jit_trace_fnaddrs_covers_random_genrand32_residual() {
-        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
-        let genrand32: fn(&mut crate::module::_random::Random) -> u32 =
-            crate::module::_random::Random::genrand32;
-        let expected = genrand32 as *const () as usize as i64;
-
-        assert_eq!(
-            bindings["pyre_interpreter::module::_random::Random::genrand32"],
-            expected
-        );
-        assert_eq!(bindings["module::_random::Random::genrand32"], expected);
     }
 
     /// Every `#[pyre_methods]` `type_object()` accessor publishes its residual
