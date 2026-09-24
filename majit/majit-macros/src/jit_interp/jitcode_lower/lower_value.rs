@@ -195,6 +195,21 @@ impl<'c> Lowerer<'c> {
         if let Some(binding) = self.lower_recursive_portal_call(expr) {
             return Some(binding);
         }
+        // `jtransform.py` `_rewrite_equality` recognises `Constant(nullptr)`.
+        // The same constant is a value here, not only a compare operand.
+        if expr_is_null_ptr(expr) {
+            let reg = self.alloc_reg();
+            self.emit_op(
+                OpMeta::linear(OpKind::LoadConstR, vec![], vec![Register::ref_(reg)]),
+                quote! { __builder.load_const_r_value(#reg, 0i64); },
+            );
+            return Some(Binding {
+                reg,
+                kind: BindingKind::Ref,
+                depends_on_stack: false,
+                struct_type: None,
+            });
+        }
 
         match expr {
             Expr::Lit(ExprLit {
@@ -317,6 +332,22 @@ impl<'c> Lowerer<'c> {
             Expr::Cast(ExprCast { expr, ty, .. })
                 if !is_supported_int_cast(ty) && !is_supported_float_type(ty) =>
             {
+                // `jtransform.py` `rewrite_op_cast_pointer`: a literal call
+                // cast to a raw pointer is a prebuilt address, read when the
+                // jitcode is built.
+                if type_is_raw_pointer(ty) && expr_is_literal_call(expr) {
+                    let reg = self.alloc_reg();
+                    self.emit_op(
+                        OpMeta::linear(OpKind::LoadConstR, vec![], vec![Register::ref_(reg)]),
+                        quote! { __builder.load_const_r_value(#reg, (#expr as #ty) as i64); },
+                    );
+                    return Some(Binding {
+                        reg,
+                        kind: BindingKind::Ref,
+                        depends_on_stack: false,
+                        struct_type: struct_pointee_of_pointer(ty),
+                    });
+                }
                 let binding = self.lower_value_expr(expr)?;
                 match binding.kind {
                     BindingKind::Ref => {
@@ -2353,9 +2384,13 @@ impl<'c> Lowerer<'c> {
                 block: expr_if.then_branch.clone(),
             }))?;
         let (else_seq, else_binding) = self.lower_branch_value_expr(else_expr)?;
-        if !matches!(then_binding.kind, BindingKind::Int)
-            || !matches!(else_binding.kind, BindingKind::Int)
-        {
+        let int_branch = matches!(then_binding.kind, BindingKind::Int)
+            && matches!(else_binding.kind, BindingKind::Int);
+        // `jtransform.py` `rewrite_op_same_as`: both arms are refs, joined by
+        // a ref copy. A static ref on the taken arm stays a constant.
+        let ref_branch = matches!(then_binding.kind, BindingKind::Ref)
+            && matches!(else_binding.kind, BindingKind::Ref);
+        if !int_branch && !ref_branch {
             return None;
         }
         let then_reg = then_binding.reg;
@@ -2372,34 +2407,68 @@ impl<'c> Lowerer<'c> {
         );
         self.emit_lowered_condition_guard(&cond, &else_label);
         self.append_lowered_sequence(then_seq);
-        self.emit_op(
-            OpMeta::linear(
-                OpKind::MoveI,
-                vec![Register::int(then_reg)],
-                vec![Register::int(result_reg)],
-            ),
-            quote! { __builder.move_i(#result_reg, #then_reg); },
-        );
+        if int_branch {
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::MoveI,
+                    vec![Register::int(then_reg)],
+                    vec![Register::int(result_reg)],
+                ),
+                quote! { __builder.move_i(#result_reg, #then_reg); },
+            );
+        } else {
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::MoveR,
+                    vec![Register::ref_(then_reg)],
+                    vec![Register::ref_(result_reg)],
+                ),
+                quote! { __builder.move_r(#result_reg, #then_reg); },
+            );
+        }
         self.emit_jump(&end_label);
         self.emit_label_def(&else_label);
         self.append_lowered_sequence(else_seq);
-        self.emit_op(
-            OpMeta::linear(
-                OpKind::MoveI,
-                vec![Register::int(else_reg)],
-                vec![Register::int(result_reg)],
-            ),
-            quote! { __builder.move_i(#result_reg, #else_reg); },
-        );
+        if int_branch {
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::MoveI,
+                    vec![Register::int(else_reg)],
+                    vec![Register::int(result_reg)],
+                ),
+                quote! { __builder.move_i(#result_reg, #else_reg); },
+            );
+        } else {
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::MoveR,
+                    vec![Register::ref_(else_reg)],
+                    vec![Register::ref_(result_reg)],
+                ),
+                quote! { __builder.move_r(#result_reg, #else_reg); },
+            );
+        }
         self.emit_label_def(&end_label);
 
+        let struct_type = if ref_branch {
+            match (&then_binding.struct_type, &else_binding.struct_type) {
+                (Some(a), Some(b)) if a == b => Some(a.clone()),
+                _ => None,
+            }
+        } else {
+            None
+        };
         Some(Binding {
             reg: result_reg,
-            kind: BindingKind::Int,
+            kind: if int_branch {
+                BindingKind::Int
+            } else {
+                BindingKind::Ref
+            },
             depends_on_stack: cond_depends_on_stack
                 || then_binding.depends_on_stack
                 || else_binding.depends_on_stack,
-            struct_type: None,
+            struct_type,
         })
     }
 

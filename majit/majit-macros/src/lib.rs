@@ -285,6 +285,39 @@ fn rewrite_jit_inline_ref_param_fields(
                     .insert(pat_ident.ident.to_string(), pointee);
             }
         }
+
+        // `let col = p as *mut Struct` keeps the pointee the array rewrite
+        // indexes. `jtransform.py` `rewrite_op_cast_pointer` is `same_as`;
+        // the concrete body still has to name the struct to dereference it.
+        fn record_pointer_cast_local(&mut self, local: &syn::Local) {
+            let Some(init) = &local.init else {
+                return;
+            };
+            let syn::Expr::Cast(cast) = &*init.expr else {
+                return;
+            };
+            let syn::Type::Ptr(ptr) = &*cast.ty else {
+                return;
+            };
+            let syn::Type::Path(path) = ptr.elem.as_ref() else {
+                return;
+            };
+            let Some(last) = path.path.segments.last() else {
+                return;
+            };
+            if !last
+                .ident
+                .to_string()
+                .starts_with(|c: char| c.is_ascii_uppercase())
+            {
+                return;
+            }
+            let syn::Pat::Ident(pat_ident) = &local.pat else {
+                return;
+            };
+            self.local_ref_types
+                .insert(pat_ident.ident.to_string(), path.path.clone());
+        }
     }
 
     impl VisitMut for InlineRefFieldRewriter {
@@ -315,6 +348,7 @@ fn rewrite_jit_inline_ref_param_fields(
             }
             if let syn::Stmt::Local(local) = stmt {
                 self.record_ref_field_local(local);
+                self.record_pointer_cast_local(local);
             }
             syn::visit_mut::visit_stmt_mut(self, stmt);
         }

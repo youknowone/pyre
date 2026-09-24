@@ -66,10 +66,21 @@ pub(super) fn field_scalar_tokens(
         Some((ty, signed)) => (
             quote! { ::core::mem::size_of::<#ty>() },
             quote! { #signed },
-            // Fails to compile unless the field really has the declared type,
-            // so the declaration cannot drift from the struct it describes.
+            // `jtransform.py` `rewrite_op_getfield` reads the field's integer
+            // storage. A `#[repr(u8)]` tag is that integer, not the enum's
+            // name, so the witness is the width: the declared type and the
+            // field must be the same size. A wider or narrower declaration
+            // still fails here.
             quote! {
-                const _: fn(&#struct_path) -> #ty = |__s| __s.#member;
+                const _: () = {
+                    const fn __majit_int_field_width<T, U>(_: fn(&#struct_path) -> &T) {
+                        assert!(
+                            ::core::mem::size_of::<T>() == ::core::mem::size_of::<U>(),
+                            "int_fields width does not match the field",
+                        );
+                    }
+                    __majit_int_field_width::<_, #ty>(|__s: &#struct_path| &__s.#member);
+                };
             },
         ),
         // `scalar_size`'s own default for a non-`Ref` field: the `i64` storage,

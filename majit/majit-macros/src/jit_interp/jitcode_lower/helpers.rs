@@ -517,8 +517,17 @@ pub(super) fn expr_is_unsigned_int(expr: &Expr) -> bool {
     }
 }
 
-fn type_is_raw_pointer(ty: &Type) -> bool {
+pub(super) fn type_is_raw_pointer(ty: &Type) -> bool {
     matches!(ty, Type::Ptr(_))
+}
+
+/// A call whose every argument is a literal. Its address is fixed when the
+/// jitcode is built (`jtransform.py` constant pointer, `rewrite_op_cast_pointer`).
+pub(super) fn expr_is_literal_call(expr: &Expr) -> bool {
+    let Expr::Call(call) = expr else {
+        return false;
+    };
+    call.args.iter().all(|arg| matches!(arg, Expr::Lit(_)))
 }
 
 /// `jtransform.py` `_rewrite_equality`'s `not arg.value` test for a

@@ -148,17 +148,17 @@ fn build_bh_jitdrivers_sd(
 
 /// Pick the `bh.virtualizable_info` pointer to seed at a guard-failure deopt, or
 /// null to leave it unset. A non-null vinfo lets the blackhole run a mid-body
-/// vable-array op (e.g. the `int_*_jump_if_ovf` overflow guard on a `[int; virt]`
-/// state field). Seed when the machine is a state-field one (no `vable_token`
-/// field) whose `bh_clear_vable_token` is inert so a non-null vinfo cannot
-/// corrupt its non-GC `state` struct. A real heap virtualizable (e.g. PyFrame)
-/// is left with null vinfo to preserve its existing resume contract.
+/// vable op (`getfield_vable_*`, or the `int_*_jump_if_ovf` overflow guard on
+/// a `[int; virt]` state field). `blackhole.py` `clear_vable_token` is a no-op
+/// while the token word is zero, and forces the frame when a compiled loop
+/// left one, which is what a deopt of that loop has to do before it reads
+/// the fields.
 fn seed_deopt_vinfo_ptr(
     vinfo: Option<&std::sync::Arc<crate::virtualizable::VirtualizableInfo>>,
 ) -> *const crate::virtualizable::VirtualizableInfo {
     match vinfo {
-        Some(info) if !info.has_vable_token() => std::sync::Arc::as_ptr(info),
-        _ => std::ptr::null(),
+        Some(info) => std::sync::Arc::as_ptr(info),
+        None => std::ptr::null(),
     }
 }
 
@@ -7406,9 +7406,10 @@ impl<S: JitState> JitDriver<S> {
                 //     The overflow-guard deopt (`int_*_jump_if_ovf` on the
                 //     `[int; virt]` regs) is the first path to run a blackhole
                 //     vable-array op on such a machine.
-                // A real heap virtualizable (`token_offset > 0`, e.g.
-                // PyFrame) keeps its existing null-vinfo resume contract.
-                // The identity pointer must be co-seeded because the GC-root
+                // A heap virtualizable is seeded as well: a guard that fails
+                // before a later `getfield_vable_*` has to resolve that
+                // descr. `clear_vable_token` is a no-op while the token is
+                // zero. The identity pointer must be co-seeded because the GC-root
                 // walk (`resume_mainloop`) dereferences `virtualizable_ptr`
                 // whenever `virtualizable_info` is non-null.
                 let seed_vinfo_ptr = seed_deopt_vinfo_ptr(self.meta.virtualizable_info());
@@ -10659,7 +10660,7 @@ mod tests {
     // must be seeded so a mid-body vable-array op — the `int_*_jump_if_ovf` overflow
     // guard on a `[int; virt]` field — resolves its vinfo during resume instead of
     // panicking. A real heap virtualizable (e.g. PyFrame) keeps the prior
-    // null-vinfo resume contract unless the portal-inline experiment is on.
+    // seeded too, so a later `getfield_vable_*` in that resume can run.
     #[test]
     fn seed_deopt_vinfo_ptr_seeds_state_field_and_skips_heap_virtualizable() {
         use crate::virtualizable::VirtualizableInfo;
@@ -10676,12 +10677,13 @@ mod tests {
         // No vinfo available → null.
         assert!(seed_deopt_vinfo_ptr(None).is_null());
 
-        // token_offset > 0 → null, so a real heap virtualizable keeps its
-        // existing null-vinfo resume contract.
+        // A heap virtualizable is seeded too: a guard that fails before a
+        // later `getfield_vable_*` otherwise resumes with a null vinfo.
         let heap_vable = std::sync::Arc::new(VirtualizableInfo::new(8));
-        assert!(
-            seed_deopt_vinfo_ptr(Some(&heap_vable)).is_null(),
-            "a token_offset>0 heap virtualizable must keep the null-vinfo contract",
+        assert_eq!(
+            seed_deopt_vinfo_ptr(Some(&heap_vable)),
+            std::sync::Arc::as_ptr(&heap_vable),
+            "a heap virtualizable deopt must seed vinfo so getfield_vable can run",
         );
     }
 

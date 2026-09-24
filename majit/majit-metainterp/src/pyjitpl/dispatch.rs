@@ -27,6 +27,23 @@ type CallArgs = SmallVec<[JitCallArg; CALL_INLINE]>;
 type CallValues = SmallVec<[Value; CALL_INLINE]>;
 type CallTriples = SmallVec<[(OpRef, i64, Type); CALL_INLINE]>;
 
+/// `GcLLDescr_boehm.malloc_fixedsize` (`llmodel_alloc`).
+///
+/// `Some` when the host published the hook, including a null OOM result.
+/// `None` leaves the caller on its raw allocator.
+fn host_malloc_fixedsize(size: usize) -> Option<*mut u8> {
+    let addr = majit_gc::malloc_fixedsize_addr();
+    if addr == 0 {
+        return None;
+    }
+    let malloc: extern "C" fn(usize) -> *mut u8 = unsafe { std::mem::transmute(addr) };
+    let ptr = malloc(size);
+    if !ptr.is_null() {
+        unsafe { std::ptr::write_bytes(ptr, 0, size) };
+    }
+    Some(ptr)
+}
+
 /// Which recorded op [`JitCodeMachine::publish_last_guard_resume_snapshot`]
 /// points at the snapshot it just captured.
 #[derive(Clone, Copy)]
@@ -4441,6 +4458,11 @@ where
                 };
                 let ptr = if gc_ptr != 0 {
                     gc_ptr as i64
+                } else if let Some(ptr) = host_malloc_fixedsize(size) {
+                    // `GcLLDescr_boehm.malloc_fixedsize`, same arm as
+                    // `llmodel_alloc` / `bh_new_with_vtable`. A raw
+                    // `alloc_zeroed` block is not in the heap that hook owns.
+                    ptr as i64
                 } else {
                     let layout = std::alloc::Layout::from_size_align(size, 8)
                         .expect("BC_NEW: invalid struct layout");
@@ -11108,6 +11130,8 @@ where
                 };
                 let struct_ptr = if struct_gc_ptr != 0 {
                     struct_gc_ptr as i64
+                } else if let Some(ptr) = host_malloc_fixedsize(struct_size) {
+                    ptr as i64
                 } else {
                     let layout = std::alloc::Layout::from_size_align(struct_size, 8)
                         .expect("BC_NEWLIST_CLEAR: invalid list-header layout");
@@ -11168,6 +11192,8 @@ where
                 };
                 let array_ptr = if array_gc_ptr != 0 {
                     array_gc_ptr as i64
+                } else if let Some(ptr) = host_malloc_fixedsize(array_payload) {
+                    ptr as i64
                 } else {
                     let layout = std::alloc::Layout::from_size_align(array_payload, 8)
                         .expect("BC_NEWLIST_CLEAR: invalid items-block layout");
