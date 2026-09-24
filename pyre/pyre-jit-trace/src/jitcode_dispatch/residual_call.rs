@@ -9947,66 +9947,14 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         // Exact int pairs have already been taken
                         // whole by `binary_op_descent`, including overflow and
                         // zero-division exception arms.
-                        // longobject.py `_make_generic_descr_binop` and
-                        // `descr_sub` use the rbigint.int_* family for
-                        // mixed Long/Int operands.
-                        let mut specialized = spec_gate(SpecFold::BinaryOpLongInt, || {
-                            try_walker_specialize_binary_op_long_int(
+                        // `descr_pow` keeps a `W_IntObject` exponent unwrapped
+                        // and calls `rbigint.int_pow`. Descent still stops in
+                        // `long_pow`, so this fold remains.
+                        spec_gate(SpecFold::BinaryOpLongIntPow, || {
+                            try_walker_specialize_binary_op_long_int_pow(
                                 ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
                             )
-                        })?;
-                        if specialized.is_none() {
-                            // `_make_descr_binop` gives shifts with an Int
-                            // count their own `_int_lshift` / `_int_rshift`
-                            // path before Long/Long.
-                            if let Some(outcome) =
-                                spec_gate(SpecFold::BinaryOpLongIntShift, || {
-                                    try_walker_specialize_binary_op_long_int_shift(
-                                        ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
-                                        dst_bank,
-                                    )
-                                })?
-                            {
-                                return Ok((outcome, op.next_pc));
-                            }
-                        }
-                        if specialized.is_none() {
-                            // `_int_floordiv` / `_int_mod` are the same family:
-                            // an Int divisor keeps its machine word instead of
-                            // being widened to a bigint, and `_int_mod`'s
-                            // result is a machine int rather than a long.
-                            if let Some(outcome) = spec_gate(SpecFold::BinaryOpLongIntDiv, || {
-                                try_walker_specialize_binary_op_long_int_div(
-                                    ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
-                                    dst_bank,
-                                )
-                            })? {
-                                return Ok((outcome, op.next_pc));
-                            }
-                        }
-                        if specialized.is_none() {
-                            // `descr_pow` keeps a `W_IntObject` exponent
-                            // unwrapped and calls `rbigint.int_pow`; only a
-                            // long exponent reaches `rbigint.pow`.
-                            specialized = spec_gate(SpecFold::BinaryOpLongIntPow, || {
-                                try_walker_specialize_binary_op_long_int_pow(
-                                    ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
-                                    dst_bank,
-                                )
-                            })?;
-                        }
-                        if specialized.is_none() {
-                            // W_LongObject operands take the long fast path
-                            // before float so bigint arithmetic retains its
-                            // payload representation.
-                            specialized = spec_gate(SpecFold::BinaryOpLong, || {
-                                try_walker_specialize_binary_op_long(
-                                    ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
-                                    dst_bank,
-                                )
-                            })?;
-                        }
-                        specialized
+                        })?
                     }
                 } else if op_tag == 10 && ctx.is_authoritative_executor {
                     // `op_tag == 10` is CHECK_EXC_MATCH

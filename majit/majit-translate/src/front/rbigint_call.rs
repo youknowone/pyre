@@ -13,6 +13,8 @@ const RESIDUAL_MODULE: [&str; 2] = [crate::runtime_names::crates::OBJECT, "longo
 pub(crate) enum ScalarResult {
     Int,
     Bool,
+    /// One GC reference, the translated `RBigInt` / `BigInt` result.
+    Ref,
 }
 
 /// Return the pointer-ABI constructor residual for an RBigInt constructor call.
@@ -252,6 +254,50 @@ pub(crate) fn pow_nomod_residual_path(segments: &[String]) -> Option<Vec<String>
         .map(str::to_string)
         .collect(),
     )
+}
+
+/// By-value or unregistered leaves of the zero-checked long/int seams.
+///
+/// `bigint_int_modulo_int_result_nonzero` is ABI-safe (`&BigInt`, `i64` in,
+/// `i64` out) but unpublished. `bigint_int_floordiv_nonzero` and
+/// `bigint_rshift` return `BigInt` by value. Each already has a
+/// `jit_bigint_*` wrapper: the remainder stays a machine word, and the two
+/// bigint results come back as the GC reference those wrappers return.
+pub(crate) fn nonzero_leaf_residual_path(
+    segments: &[String],
+) -> Option<(Vec<String>, ScalarResult)> {
+    let (residual, result) = match segments.last().map(String::as_str) {
+        Some("bigint_int_modulo_int_result_nonzero") => {
+            ("jit_bigint_int_mod_int_result", ScalarResult::Int)
+        }
+        Some("bigint_int_floordiv_nonzero") => ("jit_bigint_int_div_floor", ScalarResult::Ref),
+        // `jit_bigint_rshift` takes two payload pointers. This leaf's second
+        // argument is the machine shift count, which `jit_bigint_shr` already
+        // accepts, returning the GC reference.
+        Some("bigint_rshift") => ("jit_bigint_shr", ScalarResult::Ref),
+        _ => return None,
+    };
+    if !segments
+        .iter()
+        .rev()
+        .skip(1)
+        .take(2)
+        .eq(["descroperation", "objspace"])
+    {
+        return None;
+    }
+    Some((
+        [
+            crate::runtime_names::crates::INTERPRETER,
+            "objspace",
+            "descroperation",
+            residual,
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+        result,
+    ))
 }
 
 /// `descroperation::bigint_lshift_count(&RBigInt, i64) ->
@@ -647,6 +693,65 @@ mod tests {
                 "descroperation",
                 "jit_bigint_int_pow_nomod",
             ]))
+        );
+    }
+
+    #[test]
+    fn maps_nonzero_leaves_to_existing_wrappers() {
+        assert_eq!(
+            nonzero_leaf_residual_path(&segs(&[
+                crate::runtime_names::crates::INTERPRETER,
+                "objspace",
+                "descroperation",
+                "bigint_int_modulo_int_result_nonzero",
+            ])),
+            Some((
+                segs(&[
+                    crate::runtime_names::crates::INTERPRETER,
+                    "objspace",
+                    "descroperation",
+                    "jit_bigint_int_mod_int_result",
+                ]),
+                ScalarResult::Int,
+            ))
+        );
+        assert_eq!(
+            nonzero_leaf_residual_path(&segs(&[
+                crate::runtime_names::crates::INTERPRETER,
+                "objspace",
+                "descroperation",
+                "bigint_int_floordiv_nonzero",
+            ])),
+            Some((
+                segs(&[
+                    crate::runtime_names::crates::INTERPRETER,
+                    "objspace",
+                    "descroperation",
+                    "jit_bigint_int_div_floor",
+                ]),
+                ScalarResult::Ref,
+            ))
+        );
+        assert_eq!(
+            nonzero_leaf_residual_path(&segs(&[
+                crate::runtime_names::crates::INTERPRETER,
+                "objspace",
+                "descroperation",
+                "bigint_rshift",
+            ])),
+            Some((
+                segs(&[
+                    crate::runtime_names::crates::INTERPRETER,
+                    "objspace",
+                    "descroperation",
+                    "jit_bigint_shr",
+                ]),
+                ScalarResult::Ref,
+            ))
+        );
+        assert!(
+            nonzero_leaf_residual_path(&segs(&["majit_rlib", "rbigint", "RBigInt", "rshift",]))
+                .is_none()
         );
     }
 

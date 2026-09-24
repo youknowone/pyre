@@ -2829,10 +2829,56 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
 /// caller still needs its own concrete blackhole image: without it the
 /// multi-frame conversion declines and the helper-local abort pc can escape
 /// into an outer frame's coordinate space.
+/// Parents to attach when entering a helper level.
+///
+/// A helper (`w_code == 0`) already stores the caller jitcode on its
+/// `InlineParentFrame`. `resume.py` `rebuild_from_resumedata` reads that
+/// index back out of `staticdata.jitcodes` and `MetaInterp.newframe` re-enters
+/// it; a nested helper call must not push a second copy of the same section.
+pub(crate) fn parents_for_helper_entry<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    frame: InlineParentFrame,
+) -> Vec<InlineParentFrame> {
+    let helper_level = ctx
+        .session
+        .borrow()
+        .last_inline()
+        .is_some_and(|inline| inline.w_code == 0);
+    if helper_level {
+        Vec::new()
+    } else {
+        vec![frame]
+    }
+}
+
 pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     call_jit_pc: usize,
 ) -> Result<InlineParentFrame, InlineCallerFrameDecline> {
+    // `w_code == 0` is a helper already on the framestack. It has no PyCode,
+    // so `ensure_jitcode_index` cannot name its jitcode. `rebuild_from_resumedata`
+    // does not look one up either: it indexes the jitcode `newframe` is already
+    // executing, which this frame's `InlineParentFrame.jitcode_index` holds
+    // (the resume word captured at the helper CALL). A deeper helper with an
+    // empty parent list walks out to that same frame and stops at a real
+    // PyCode, which still takes the lookup below.
+    let held_helper_parent = {
+        let session = ctx.session.borrow();
+        let mut held = None;
+        for frame in session.framestack.iter().rev() {
+            if frame.is_portal || frame.w_code != 0 {
+                break;
+            }
+            if let Some(parent) = frame.parents.last() {
+                held = Some(parent.clone());
+                break;
+            }
+        }
+        held
+    };
+    if let Some(held) = held_helper_parent {
+        return Ok(held);
+    }
     let caller_code = ctx.session.borrow().last_inline().map(|frame| frame.w_code);
     let (jitcode_index, pjc) = if let Some(caller_code) = caller_code {
         let jitcode_index = crate::state::ensure_jitcode_index(caller_code as *const ())

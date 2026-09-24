@@ -16205,56 +16205,11 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         })? {
             return Ok((outcome, op.next_pc));
         }
-        // Residual BINARY_OP's long/int family. Flatten lands bigint
-        // `//` `%` `**` here, so the same folds must fire.
+        // `descr_pow` still declines inside `long_pow`, so the mixed
+        // long/int power fold stays. The other long binary folds no longer fire.
         if let Ok(setup) = inline_fnaddr_call_setup_binary_helper(ctx, op.pc, &int_args, &ref_args)
             && let Some(call_descr) = setup.descr.as_call_descr()
-        {
-            if spec_gate(SpecFold::BinaryOpLongInt, || {
-                super::specialize::try_walker_specialize_binary_op_long_int(
-                    ctx,
-                    op.pc,
-                    op_tag,
-                    &ref_args,
-                    &setup.allboxes,
-                    call_descr,
-                    dst,
-                    dst_bank,
-                )
-            })?
-            .is_some()
-            {
-                return Ok((DispatchOutcome::Continue, op.next_pc));
-            }
-            if let Some(outcome) = spec_gate(SpecFold::BinaryOpLongIntShift, || {
-                super::specialize::try_walker_specialize_binary_op_long_int_shift(
-                    ctx,
-                    op.pc,
-                    op_tag,
-                    &ref_args,
-                    &setup.allboxes,
-                    call_descr,
-                    dst,
-                    dst_bank,
-                )
-            })? {
-                return Ok((outcome, op.next_pc));
-            }
-            if let Some(outcome) = spec_gate(SpecFold::BinaryOpLongIntDiv, || {
-                super::specialize::try_walker_specialize_binary_op_long_int_div(
-                    ctx,
-                    op.pc,
-                    op_tag,
-                    &ref_args,
-                    &setup.allboxes,
-                    call_descr,
-                    dst,
-                    dst_bank,
-                )
-            })? {
-                return Ok((outcome, op.next_pc));
-            }
-            if spec_gate(SpecFold::BinaryOpLongIntPow, || {
+            && spec_gate(SpecFold::BinaryOpLongIntPow, || {
                 super::specialize::try_walker_specialize_binary_op_long_int_pow(
                     ctx,
                     op.pc,
@@ -16267,25 +16222,8 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                 )
             })?
             .is_some()
-            {
-                return Ok((DispatchOutcome::Continue, op.next_pc));
-            }
-            if spec_gate(SpecFold::BinaryOpLong, || {
-                super::specialize::try_walker_specialize_binary_op_long(
-                    ctx,
-                    op.pc,
-                    op_tag,
-                    &ref_args,
-                    &setup.allboxes,
-                    call_descr,
-                    dst,
-                    dst_bank,
-                )
-            })?
-            .is_some()
-            {
-                return Ok((DispatchOutcome::Continue, op.next_pc));
-            }
+        {
+            return Ok((DispatchOutcome::Continue, op.next_pc));
         }
         // Residual BINARY_OP used to admit a Python forward dunder here.
         // Flatten now lowers BINARY to `inline_call` of

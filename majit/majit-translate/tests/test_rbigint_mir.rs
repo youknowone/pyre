@@ -1608,6 +1608,18 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
             .is_some_and(|leaf| leaf == "bigint_pow_nomod")),
         "the host Result wrapper must not survive in the translated graph: {pow_calls:?}"
     );
+    assert!(
+        pow_calls.iter().any(|segments| segments
+            .last()
+            .is_some_and(|leaf| leaf == "jit_bigint_int_eq")),
+        "long_pow int_eq(1) must retarget to jit_bigint_int_eq: {pow_calls:?}"
+    );
+    assert!(
+        !pow_calls
+            .iter()
+            .any(|segments| segments.last().is_some_and(|leaf| leaf == "int_eq")),
+        "long_pow retained RBigInt::int_eq: {pow_calls:?}"
+    );
 
     let module_loaded = llbcs.len() > 1;
     for &(module_suffix, caller_name) in BORROWED_PAYLOAD_CALLERS {
@@ -1743,6 +1755,55 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
                 .iter()
                 .any(|segments| { segments.last().is_some_and(|leaf| leaf == residual_name) }),
             "{caller_name} must target {residual_name}: {calls:?}"
+        );
+    }
+
+    for (caller_name, residual_name, forbidden) in [
+        (
+            "long_floordiv",
+            "jit_bigint_int_div_floor",
+            "bigint_int_floordiv_nonzero",
+        ),
+        (
+            "long_mod",
+            "jit_bigint_int_mod_int_result",
+            "bigint_int_modulo_int_result_nonzero",
+        ),
+        ("long_rshift", "jit_bigint_shr", "bigint_rshift"),
+        ("long_bitxor", "jit_bigint_xor", "xor"),
+    ] {
+        let caller = program
+            .functions
+            .iter()
+            .find(|function| {
+                function.name == caller_name
+                    && function.module_path.ends_with("objspace::descroperation")
+            })
+            .unwrap_or_else(|| panic!("descroperation::{caller_name} graph"));
+        let calls: Vec<Vec<String>> = caller
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|operation| match &operation.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => Some(segments.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            calls
+                .iter()
+                .any(|segments| segments.last().is_some_and(|leaf| leaf == residual_name)),
+            "{caller_name} must target {residual_name}: {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|segments| segments.last().is_some_and(|leaf| leaf == forbidden)),
+            "{caller_name} retained {forbidden}: {calls:?}"
         );
     }
 

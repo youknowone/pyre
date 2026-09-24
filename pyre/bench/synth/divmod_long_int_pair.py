@@ -1,4 +1,4 @@
-# pyre-check: spec-folds=builtin_divmod,builtin_divmod_long_int,binary_op_long_int_div
+# pyre-check: spec-folds=builtin_divmod,builtin_divmod_long_int
 # `divmod(long, int)` at a traced call site. `_int_divmod` keeps the divisor
 # unwrapped and calls `rbigint.int_divmod`, whose rtyped return is a two-item
 # `GcStruct`: the walker emits one elidable call plus two `getfield_gc_r`, then

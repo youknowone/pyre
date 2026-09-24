@@ -1791,6 +1791,35 @@ fn float_divmod_w(x: f64, y: f64) -> Result<(f64, f64), PyError> {
 
 // ── Power ────────────────────────────────────────────────────────────
 
+/// intobject.py `_pow_nomod`: `@jit.look_inside_iff(lambda iv, iw: jit.isconstant(iw))`.
+fn int_pow_nomod_iff(_iv: i64, iw: i64) -> bool {
+    majit_rlib::jit::isconstant(&iw)
+}
+
+/// Exponentiation by squaring for a non-negative machine exponent.
+/// A variable exponent stays a residual call of the trampoline.
+#[majit_macros::look_inside_iff(int_pow_nomod_iff)]
+fn int_pow_nomod(iv: i64, mut iw: i64) -> Option<i64> {
+    let mut temp = iv;
+    let mut ix = 1_i64;
+    loop {
+        if iw & 1 != 0 {
+            let Some(value) = ix.checked_mul(temp) else {
+                return None;
+            };
+            ix = value;
+        }
+        iw >>= 1;
+        if iw == 0 {
+            return Some(ix);
+        }
+        let Some(value) = temp.checked_mul(temp) else {
+            return None;
+        };
+        temp = value;
+    }
+}
+
 unsafe fn int_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let va = int_value(a);
     let vb = int_value(b);
@@ -1812,28 +1841,9 @@ unsafe fn int_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         _ => {}
     }
     // intobject.py `_pow_nomod`: exponentiation by squaring with an
-    // overflow check at each machine multiplication. Keep this literal loop;
-    // `checked_mul` is the Rust source spelling the MIR front lowers back to
-    // RPython's `int_mul_ovf` exception edge.
-    let mut temp = va;
-    let mut ix = 1_i64;
-    let mut iw = vb;
-    let machine_result = loop {
-        if iw & 1 != 0 {
-            let Some(value) = ix.checked_mul(temp) else {
-                break None;
-            };
-            ix = value;
-        }
-        iw >>= 1;
-        if iw == 0 {
-            break Some(ix);
-        }
-        let Some(value) = temp.checked_mul(temp) else {
-            break None;
-        };
-        temp = value;
-    };
+    // overflow check at each machine multiplication. `checked_mul` is the
+    // Rust source spelling the MIR front lowers back to `int_mul_ovf`.
+    let machine_result = int_pow_nomod(va, vb);
     match machine_result {
         Some(r) => Ok(w_int_new(r)),
         None => {
@@ -4819,20 +4829,32 @@ fn pow_binary(a: &mut PyObjectRef, b: &mut PyObjectRef) -> Result<Option<PyObjec
             return Ok(None);
         }
         if is_int_like(*a) && is_int_like(*b) {
-            return int_pow(*a, *b).map(Some);
+            return match int_pow(*a, *b) {
+                Ok(result) => Ok(Some(result)),
+                Err(err) => Err(err),
+            };
         }
         if is_int_or_long(*a) && is_int_or_long(*b) {
-            return long_pow(*a, *b).map(Some);
+            return match long_pow(*a, *b) {
+                Ok(result) => Ok(Some(result)),
+                Err(err) => Err(err),
+            };
         }
         if is_float_pair(*a, *b) {
             reject_pow_operand_overflow(*a)?;
             reject_pow_operand_overflow(*b)?;
-            return float_pow_impl(as_float(*a), as_float(*b)).map(Some);
+            return match float_pow_impl(as_float(*a), as_float(*b)) {
+                Ok(result) => Ok(Some(result)),
+                Err(err) => Err(err),
+            };
         }
         if is_complex_pair(*a, *b) {
             reject_pow_operand_overflow(*a)?;
             reject_pow_operand_overflow(*b)?;
-            return complex_pow(*a, *b).map(Some);
+            return match complex_pow(*a, *b) {
+                Ok(result) => Ok(Some(result)),
+                Err(err) => Err(err),
+            };
         }
         try_dispatch_binary_special(a, b, "__pow__", "__rpow__")
     }

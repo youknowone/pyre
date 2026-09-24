@@ -10339,6 +10339,10 @@ impl<'a> Lowering<'a> {
             Operand::Copy(p) | Operand::Move(p) => Some(clone_tyref(&p.ty)),
             Operand::Const(_) => None,
         });
+        // A constant word (`vb.int_eq(1)`) has no place type. Its declared
+        // `ty` is what the int-comparison residual classifies, the same way
+        // `RBigInt::from(1)` uses `const_arg_ty`.
+        let second_const_arg_ty = call.args.get(1).and_then(const_operand_tyref);
         // Function-item identity of arg #1, captured before `call.args` is
         // consumed.  `Option::map(opt, named_fn)` passes a `FnDef` constant
         // (or a Copy/Move of a `FnDef`-typed local); that shape has no
@@ -13844,14 +13848,18 @@ impl<'a> Lowering<'a> {
         // both operand orders (the int-left descriptor reverses the relation).
         // The receiver remains one RBigInt GCREF, the other operand is exactly
         // Signed, and the result occupies the bool/int bank.
+        let cmp_int_ty = second_arg_ty.as_ref().or(second_const_arg_ty.as_ref());
         let op_kind = if let OpKind::Call { target, args, .. } = &op_kind
             && args.len() == 2
             && first_arg_ty
                 .as_ref()
                 .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
-            && second_arg_ty
-                .as_ref()
-                .is_some_and(|ty| self.tyref_literal_int_atom(ty) == Some("I64"))
+            && cmp_int_ty.is_some_and(|ty| {
+                matches!(
+                    self.tyref_literal_int_atom(ty),
+                    Some("I8" | "I16" | "I32" | "I64" | "Isize")
+                )
+            })
             && let Some(residual) = match target {
                 CallTarget::FunctionPath { segments, .. } => segments.last().and_then(|leaf| {
                     crate::front::rbigint_call::int_comparison_residual_for_method(leaf)
@@ -13868,6 +13876,48 @@ impl<'a> Lowering<'a> {
                 },
                 args: args.clone(),
                 result_ty: ValueType::Bool,
+            }
+        } else {
+            op_kind
+        };
+
+        // Zero-checked long/int leaves (`bigint_int_floordiv_nonzero`,
+        // `bigint_int_modulo_int_result_nonzero`, `bigint_rshift`) are elidable
+        // and either return `BigInt` by value or have no published address.
+        // Retarget each to the `jit_bigint_*` wrapper that already exists.
+        // The remainder wrapper returns the machine word; the other two return
+        // the GC reference.
+        let nonzero_int_ty = second_arg_ty.as_ref().or(second_const_arg_ty.as_ref());
+        let op_kind = if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
+            && first_arg_ty
+                .as_ref()
+                .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
+            && nonzero_int_ty.is_some_and(|ty| {
+                matches!(
+                    self.tyref_literal_int_atom(ty),
+                    Some("I8" | "I16" | "I32" | "I64" | "Isize")
+                )
+            })
+            && let Some((residual, scalar_result)) =
+                crate::front::rbigint_call::nonzero_leaf_residual_path(segments)
+        {
+            let result_ty = match scalar_result {
+                crate::front::rbigint_call::ScalarResult::Int => ValueType::Int,
+                crate::front::rbigint_call::ScalarResult::Bool => ValueType::Bool,
+                crate::front::rbigint_call::ScalarResult::Ref => ValueType::Ref(None),
+            };
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: residual,
+                    fun_decl_id: None,
+                },
+                args: args.clone(),
+                result_ty,
             }
         } else {
             op_kind
@@ -14106,6 +14156,7 @@ impl<'a> Lowering<'a> {
             let result_ty = match scalar_result {
                 crate::front::rbigint_call::ScalarResult::Int => ValueType::Int,
                 crate::front::rbigint_call::ScalarResult::Bool => ValueType::Bool,
+                crate::front::rbigint_call::ScalarResult::Ref => ValueType::Ref(None),
             };
             OpKind::Call {
                 target: CallTarget::function_path(segments),
