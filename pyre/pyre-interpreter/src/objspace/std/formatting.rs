@@ -823,15 +823,14 @@ unsafe fn spec_format_bytes(spec: &CFormatSpec, obj: PyObjectRef) -> Result<Vec<
     }
 }
 
-/// `PyUnicode_Format` prints a conversion it does not know. A byte at or
-/// above 0x80 reaches that printer as a negative character and raises
-/// `OverflowError`; a string conversion outside printable ASCII is shown
-/// as `?` while the hex keeps the code point.
+/// A bytes conversion at or above 0x80 raises `OverflowError`. A string
+/// conversion in `0x1f..0x7f` is printed as itself; every other string
+/// conversion is printed as `?`. The hex keeps the code point.
 fn unsupported_format_error(cp: u32, index: usize, bytes: bool) -> PyError {
     if bytes && cp > 0x7f {
         return PyError::overflow_error("character argument not in range(0x110000)");
     }
-    let shown = if bytes || (0x21..0x7f).contains(&cp) {
+    let shown = if bytes || (0x1f..0x7f).contains(&cp) {
         char::from_u32(cp).unwrap_or('?')
     } else {
         '?'
@@ -1248,6 +1247,14 @@ mod tests {
             "unsupported format character '?' (0xe9) at index 1",
         );
         let error = unsafe {
+            str_format_percent(w_str_new("%\u{1f}"), w_tuple_new(vec![w_int_new(1)])).unwrap_err()
+        };
+        assert_error(
+            error,
+            PyErrorKind::ValueError,
+            "unsupported format character '\u{1f}' (0x1f) at index 1",
+        );
+        let error = unsafe {
             str_format_percent(w_str_new("%\u{7f}"), w_tuple_new(vec![w_int_new(1)])).unwrap_err()
         };
         assert_error(
@@ -1257,8 +1264,11 @@ mod tests {
         );
 
         let error = unsafe {
-            bytes_format_percent(w_bytes_from_bytes(b"%\x80"), w_tuple_new(vec![w_int_new(1)]))
-                .unwrap_err()
+            bytes_format_percent(
+                w_bytes_from_bytes(b"%\x80"),
+                w_tuple_new(vec![w_int_new(1)]),
+            )
+            .unwrap_err()
         };
         assert_error(
             error,
