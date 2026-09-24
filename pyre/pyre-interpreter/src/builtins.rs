@@ -7959,7 +7959,6 @@ fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) -> Result<(), cra
                     w_filename.expect("is_written_arg implies a third argument"),
                 )?;
                 interp_exceptions::w_exception_set_written(exc(), value);
-                interp_exceptions::w_exception_set_blocking_written_arg(exc());
             } else if let Some(fname) = w_filename {
                 interp_exceptions::w_exception_set_filename(exc(), fname);
                 if let Some(f2) = arg_opt(4).filter(|&f| !pyre_object::is_none(f)) {

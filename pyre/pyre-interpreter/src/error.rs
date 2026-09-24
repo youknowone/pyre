@@ -1768,6 +1768,11 @@ impl PyError {
                 let msg = pyre_object::gc_roots::shadow_stack_get(msg_slot);
                 unsafe { pyre_object::interp_exceptions::w_exception_set_syntax_msg(exc(), msg) };
             }
+            // `W_SystemExit.descr_init`: a single constructor argument is `code`.
+            if self.kind == PyErrorKind::SystemExit {
+                let msg = pyre_object::gc_roots::shadow_stack_get(msg_slot);
+                unsafe { pyre_object::interp_exceptions::w_exception_set_code(exc, msg) };
+            }
         }
         // Stamp the deferred `name` / `obj` context onto the freshly
         // materialised NameError / AttributeError instance, the lazy

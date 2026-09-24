@@ -957,22 +957,6 @@ pub fn exception_getclass(w_obj: PyObjectRef) -> PyObjectRef {
     }
 }
 
-/// True when `obj` is a `BlockingIOError` whose constructor took the numeric
-/// third argument as `characters_written`.  The constructor records the
-/// successful `__index__` conversion independently from `args_w` because the
-/// original, possibly non-int indexable object remains in `args`, and from the
-/// writable/deletable `written` slot.  This suppresses `filename` even after
-/// the slot is deleted (`interp_exceptions.py` `_init_error`).
-fn exc_blocking_written(obj: PyObjectRef) -> bool {
-    if !unsafe { pyre_object::interp_exceptions::w_exception_get_blocking_written_arg(obj) } {
-        return false;
-    }
-    let Some(blocking) = crate::builtins::lookup_exc_class("BlockingIOError") else {
-        return false;
-    };
-    unsafe { isinstance_w(obj, blocking) }
-}
-
 /// `interp_exceptions.py W_SyntaxError` direct slot reader.
 ///
 /// PyPy's `descr_init` writes the eight `w_*` fields before forwarding the
@@ -8593,7 +8577,7 @@ pub(crate) fn type_del_doc(obj: PyObjectRef) -> PyResult {
 pub(crate) fn exception_attr_get(obj: PyObjectRef, name: &str) -> PyResult {
     match name {
         "__dict__" => {
-            // interp_exceptions.py:293 BaseException.typedef installs
+            // `interp_exceptions.py` `W_BaseException.typedef` installs
             // `GetSetProperty(descr_get_dict, descr_set_dict)`.  Every
             // exception owns a writable instance dict, allocated eagerly by
             // pyre's flattened W_BaseException layout.
@@ -8630,8 +8614,7 @@ pub(crate) fn exception_attr_get(obj: PyObjectRef, name: &str) -> PyResult {
             return Ok(pyre_object::w_bool_from(b));
         }
         "args" => {
-            // `pypy/module/exceptions/interp_exceptions.py:153
-            // W_BaseException.descr_getargs` returns
+            // `interp_exceptions.py` `W_BaseException.descr_getargs` returns
             // `space.newtuple(self.args_w)` — a freshly-built
             // tuple per call.  `w_exception_get_args` does the
             // same: it walks the internal list slot and rebuilds
@@ -8672,45 +8655,16 @@ pub(crate) fn exception_attr_get(obj: PyObjectRef, name: &str) -> PyResult {
             }
         }
         "code" => {
-            // `interp_exceptions.py W_SystemExit`: `code` is a
-            // writable `readwrite_attrproperty_w('w_code')` slot
-            // (`:1006`) set by `descr_init` to `args_w[0]` for a single
-            // argument, `newtuple(args_w)` for several, and the
-            // `__init__` default `None` when the instance carries no
-            // arguments.  Read the slot first so an explicit
-            // `e.code = x` write persists, then derive from `args_w`
-            // (the internal-constructor path that bypasses the public
-            // setter), mirroring the OSError `errno` arm.
+            // `readwrite_attrproperty_w('w_code', W_SystemExit)`.
+            // The slot is the value; `PY_NULL` is the class default `None`.
             let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
             if kind == pyre_object::interp_exceptions::ExcKind::SystemExit {
                 let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_code(obj) };
-                if !stored.is_null() {
-                    return Ok(stored);
-                }
-                let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
-                let len = unsafe { pyre_object::w_tuple_len(args) };
-                if len == 1 {
-                    if let Some(v) = unsafe { pyre_object::w_tuple_getitem(args, 0) } {
-                        return Ok(v);
-                    }
-                } else if len > 1 {
-                    return Ok(args);
-                }
-                return Ok(w_none());
+                return Ok(if stored.is_null() { w_none() } else { stored });
             }
         }
-        // `interp_exceptions.py W_OSError` exposes
-        // `errno` / `strerror` / `filename` / `filename2` as
-        // `readwrite_attrproperty_w('w_errno', ...)` slots, populated
-        // by the 2..=5-argument constructor (`errno = args[0]`,
-        // `strerror = args[1]`, `filename = args[2]`,
-        // `filename2 = args[4]`).  Read the writable slot first so a
-        // `e.errno = ...` assignment (`object_setattr`) persists; when
-        // the slot is `PY_NULL` (the internal-constructor path that
-        // never goes through the public setter) fall back to deriving
-        // the value from `args_w` with the same argument-count gate.
-        // Fewer than two arguments leaves all four `None` (the class
-        // defaults).
+        // `readwrite_attrproperty_w('w_errno' / 'w_strerror', W_OSError)`.
+        // The slot is the value; `PY_NULL` is the class default `None`.
         "errno" | "strerror" => {
             let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
             if matches!(
@@ -8723,21 +8677,10 @@ pub(crate) fn exception_attr_get(obj: PyObjectRef, name: &str) -> PyResult {
                 } else {
                     unsafe { pyre_object::interp_exceptions::w_exception_get_strerror(obj) }
                 };
-                if !stored.is_null() {
-                    return Ok(stored);
-                }
-                let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
-                let n = unsafe { pyre_object::w_tuple_len(args) };
-                if (2..=5).contains(&n) {
-                    let idx = if name == "errno" { 0 } else { 1 };
-                    if let Some(v) = unsafe { pyre_object::w_tuple_getitem(args, idx) } {
-                        return Ok(v);
-                    }
-                }
-                return Ok(w_none());
+                return Ok(if stored.is_null() { w_none() } else { stored });
             }
         }
-        // `interp_exceptions.py:723-728`: the attribute exists only where the
+        // `W_OSError.typedef`: the attribute exists only where the
         // platform has a Windows error code, and it has no `args_w` fallback —
         // nothing but the fourth constructor argument ever fills it.
         #[cfg(windows)]
@@ -8753,6 +8696,8 @@ pub(crate) fn exception_attr_get(obj: PyObjectRef, name: &str) -> PyResult {
                 return Ok(if stored.is_null() { w_none() } else { stored });
             }
         }
+        // `readwrite_attrproperty_w('w_filename' / 'w_filename2', W_OSError)`.
+        // The slot is the value; `PY_NULL` is the class default `None`.
         "filename" | "filename2" => {
             let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
             if matches!(
@@ -8765,24 +8710,7 @@ pub(crate) fn exception_attr_get(obj: PyObjectRef, name: &str) -> PyResult {
                 } else {
                     unsafe { pyre_object::interp_exceptions::w_exception_get_filename2(obj) }
                 };
-                if !stored.is_null() {
-                    return Ok(stored);
-                }
-                // A `BlockingIOError` keeps `characters_written` (a number)
-                // in `args_w[2]`; it is not a filename (`_init_error`).
-                if name == "filename" && exc_blocking_written(obj) {
-                    return Ok(w_none());
-                }
-                let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
-                let n = unsafe { pyre_object::w_tuple_len(args) };
-                let idx: usize = if name == "filename" { 2 } else { 4 };
-                if (3..=5).contains(&n)
-                    && idx < n
-                    && let Some(v) = unsafe { pyre_object::w_tuple_getitem(args, idx as i64) }
-                {
-                    return Ok(v);
-                }
-                return Ok(w_none());
+                return Ok(if stored.is_null() { w_none() } else { stored });
             }
             // `W_SyntaxError` also exposes its dedicated `w_filename` slot
             // (`filename2` is OSError-only).
@@ -8875,7 +8803,7 @@ pub(crate) fn exception_attr_get(obj: PyObjectRef, name: &str) -> PyResult {
                 return Ok(w_none());
             }
         }
-        // `interp_exceptions.py:468-471`
+        // `interp_exceptions.py` `W_UnicodeTranslateError.typedef`
         // `readwrite_attrproperty_w('w_object', W_UnicodeTranslateError)`
         // (and `:1081-1083` / `:1201-1203` for Decode / Encode).
         // PyPy surfaces these as direct slot reads — `None` when the
@@ -14014,8 +13942,7 @@ pub(crate) fn exception_attr_set(obj: PyObjectRef, name: &str, value: PyObjectRe
     {
         return Err(PyError::attribute_error("readonly attribute"));
     }
-    // `pypy/module/exceptions/interp_exceptions.py:156-157
-    // W_BaseException.descr_setargs` →
+    // `interp_exceptions.py` `W_BaseException.descr_setargs` →
     //   self.args_w = space.fixedview(w_newargs)
     // `space.fixedview` materialises any iterable into a list of
     // wrapped objects; pyre stores `args_w` as a tuple `PyObjectRef`,
@@ -14026,7 +13953,7 @@ pub(crate) fn exception_attr_set(obj: PyObjectRef, name: &str, value: PyObjectRe
         unsafe { pyre_object::interp_exceptions::w_exception_set_args(obj, coerced) };
         return Ok(w_none());
     }
-    // `interp_exceptions.py:165-219` — the four special exception
+    // `W_BaseException.typedef` — the four special exception
     // attributes (`__cause__`, `__context__`, `__traceback__`,
     // `__suppress_context__`) are registered as `GetSetProperty`
     // setters on `W_BaseException.typedef` and each validates its
@@ -14036,7 +13963,7 @@ pub(crate) fn exception_attr_set(obj: PyObjectRef, name: &str, value: PyObjectRe
     // directly — no side store for these four names.
     match name {
         "__dict__" => {
-            // `interp_exceptions.py:293` registers
+            // `interp_exceptions.py` `W_BaseException.typedef` registers
             // `__dict__ = GetSetProperty(descr_get_dict, descr_set_dict)`
             // whose setter routes to `setdict` (typedef.py
             // descr_set_dict) — replaces the whole instance dict.
@@ -14105,7 +14032,7 @@ pub(crate) fn exception_attr_set(obj: PyObjectRef, name: &str, value: PyObjectRe
             unsafe { pyre_object::interp_exceptions::w_exception_set_suppress_context(obj, b) };
             return Ok(w_none());
         }
-        // `interp_exceptions.py:468-471`
+        // `interp_exceptions.py` `W_UnicodeTranslateError.typedef`
         // `readwrite_attrproperty_w('w_object', W_UnicodeTranslateError)`
         // and `:1081-1083` / `:1201-1203` for Decode / Encode.
         // PyPy's `attrproperty_w` writer stores the raw `w_value`
@@ -14176,12 +14103,9 @@ pub(crate) fn exception_attr_set(obj: PyObjectRef, name: &str, value: PyObjectRe
                 return Ok(w_none());
             }
         }
-        // `interp_exceptions.py:739-742` —
         // `readwrite_attrproperty_w('w_errno' / 'w_strerror' /
-        // 'w_filename' / 'w_filename2', W_OSError)`.  The
-        // `attrproperty_w` writer stores the raw `w_value` into the
-        // slot; the matching getattr arm reads it back ahead of the
-        // `args_w`-derived fallback.  Gated on the OSError family
+        // 'w_filename' / 'w_filename2', W_OSError)`.  The writer stores
+        // the raw value into the slot.  Gated on the OSError family
         // (OSError / FileNotFoundError) because PyPy installs these
         // descriptors only on `W_OSError.typedef`.
         "errno" | "strerror" | "filename" | "filename2" => {
@@ -14222,7 +14146,7 @@ pub(crate) fn exception_attr_set(obj: PyObjectRef, name: &str, value: PyObjectRe
                 return Ok(w_none());
             }
         }
-        // `interp_exceptions.py:723-728`: the `winerror` descriptor is
+        // `W_OSError.typedef`: the `winerror` descriptor is
         // installed only where the platform has Windows error codes, so
         // elsewhere the name falls through to the ordinary instance dict.
         #[cfg(windows)]
@@ -14237,12 +14161,10 @@ pub(crate) fn exception_attr_set(obj: PyObjectRef, name: &str, value: PyObjectRe
                 return Ok(w_none());
             }
         }
-        // `interp_exceptions.py:1006
-        // readwrite_attrproperty_w('w_code', W_SystemExit)` — the
-        // writer stores the raw `w_value` into the slot; the matching
-        // getattr arm reads it back ahead of the `args_w`-derived
-        // fallback.  Gated on SystemExit because PyPy installs the
-        // descriptor only on `W_SystemExit.typedef`.
+        // `readwrite_attrproperty_w('w_code', W_SystemExit)` — the
+        // writer stores the raw value into the slot.  Gated on
+        // SystemExit because PyPy installs the descriptor only on
+        // `W_SystemExit.typedef`.
         "code" => {
             let kind = unsafe { pyre_object::w_exception_get_kind(obj) };
             if kind == pyre_object::interp_exceptions::ExcKind::SystemExit {
@@ -14909,8 +14831,7 @@ pub unsafe fn exception_attr_slot_fold(
     Some((slot, kind, w_type.as_ptr(), version_tag, stored))
 }
 
-/// `pypy/module/exceptions/interp_exceptions.py:156-157
-/// W_BaseException.descr_setargs` parity helper:
+/// `interp_exceptions.py` `W_BaseException.descr_setargs` parity helper:
 ///
 /// ```python
 /// def descr_setargs(self, space, w_newargs):
