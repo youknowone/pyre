@@ -2753,6 +2753,118 @@ pub unsafe fn w_list_getitem_inner(obj: PyObjectRef, index: i64) -> Option<PyObj
     }
 }
 
+/// `ll_listslice_startstop`: `newlength = stop - start`, one `ll_newlist`,
+/// then `ll_arraycopy`. `descr_getslice` normalises the bounds in the caller
+/// — a user `__index__` must not run inside this leaf.
+///
+/// The result is allocated first and the selected elements are stored into
+/// it, so Integer, Float and Object storage copy machine values (or the
+/// existing object pointers) without pinning each element into the shadow
+/// stack. Every other strategy boxes on `getitem`, so it still materialises
+/// through a host `Vec` — kept inside one opaque helper rather than here.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ListObject`. `start` and `stop` are
+/// already normalised machine bounds (a `stop` past the length is clamped).
+pub unsafe fn ll_listslice(obj: PyObjectRef, start: usize, stop: usize) -> PyObjectRef {
+    let length = w_list_len(obj);
+    let start = start.min(length);
+    let stop = if stop > length { length } else { stop };
+    let newlength = stop.saturating_sub(start);
+    if newlength == 0 {
+        return w_list_new(Vec::new());
+    }
+    let strategy = (*(obj as *const W_ListObject)).strategy;
+    match strategy {
+        ListStrategy::Integer => ll_listslice_ints(obj, start, newlength),
+        ListStrategy::Float => ll_listslice_floats(obj, start, newlength),
+        ListStrategy::Object => ll_listslice_objects(obj, start, newlength),
+        _ => ll_listslice_boxed(obj, start, newlength),
+    }
+}
+
+/// Cleared Integer-strategy list of length `n`. `w_list_new` re-infers
+/// Integer storage from the zero placeholders; the slice loop then
+/// overwrites them.
+#[majit_macros::dont_look_inside]
+unsafe fn ll_list_new_int_cleared(n: usize) -> PyObjectRef {
+    let zero = w_int_new(0);
+    w_list_new(vec![zero; n])
+}
+
+/// Cleared Float-strategy list of length `n`.
+#[majit_macros::dont_look_inside]
+unsafe fn ll_list_new_float_cleared(n: usize) -> PyObjectRef {
+    let zero = w_float_new(0.0);
+    w_list_new(vec![zero; n])
+}
+
+/// Cleared Object-strategy list of length `n`.
+#[majit_macros::dont_look_inside]
+unsafe fn ll_list_new_object_cleared(n: usize) -> PyObjectRef {
+    let none = crate::noneobject::w_none();
+    w_list_new(vec![none; n])
+}
+
+unsafe fn ll_listslice_ints(obj: PyObjectRef, start: usize, n: usize) -> PyObjectRef {
+    let result = ll_list_new_int_cleared(n);
+    let obj = current_gc_ref(obj);
+    for i in 0..n {
+        let item = ll_list_int_getitem_fast(&*(obj as *const W_ListObject), start + i);
+        ll_list_int_setitem_fast(&mut *(result as *mut W_ListObject), i, item);
+    }
+    result
+}
+
+unsafe fn ll_listslice_floats(obj: PyObjectRef, start: usize, n: usize) -> PyObjectRef {
+    let result = ll_list_new_float_cleared(n);
+    let obj = current_gc_ref(obj);
+    for i in 0..n {
+        let item = ll_list_float_getitem_fast(&*(obj as *const W_ListObject), start + i);
+        ll_list_float_setitem_fast(&mut *(result as *mut W_ListObject), i, item);
+    }
+    result
+}
+
+unsafe fn ll_listslice_objects(obj: PyObjectRef, start: usize, n: usize) -> PyObjectRef {
+    let mut result = ll_list_new_object_cleared(n);
+    let mut obj = current_gc_ref(obj);
+    for i in 0..n {
+        let item = ll_list_obj_getitem_fast(&*(obj as *const W_ListObject), start + i);
+        // The element is a GC pointer. Barrier, then store the post-barrier
+        // address — a young pointer written into an old result has to be
+        // remembered, and the barrier is a safepoint.
+        let item = prepare_list_ref_store(result, item);
+        result = current_gc_ref(result);
+        obj = current_gc_ref(obj);
+        ll_list_obj_setitem_fast(&mut *(result as *mut W_ListObject), i, item);
+    }
+    result
+}
+
+/// Strategies whose `getitem` boxes (range, bytes, ascii, int-or-float).
+/// One opaque helper: the pin loop stays out of `ll_listslice`'s body.
+#[majit_macros::dont_look_inside]
+unsafe fn ll_listslice_boxed(obj: PyObjectRef, start: usize, n: usize) -> PyObjectRef {
+    let roots = crate::gc_roots::push_roots();
+    let obj_slot = roots.base();
+    roots.publish(&[obj]);
+    roots.normalize(obj_slot, 1);
+    let items_base = crate::gc_roots::shadow_stack_len();
+    let mut fetched = 0usize;
+    for i in 0..n {
+        if let Some(v) = w_list_getitem(roots.get(obj_slot), (start + i) as i64) {
+            let _ = roots.pin_root(v);
+            fetched += 1;
+        }
+    }
+    let mut items = Vec::with_capacity(fetched);
+    for i in 0..fetched {
+        items.push(roots.get(items_base + i));
+    }
+    w_list_new(items)
+}
+
 /// Set the item at the given index in a list.
 ///
 /// Supports negative indexing. Returns false if out of bounds.
