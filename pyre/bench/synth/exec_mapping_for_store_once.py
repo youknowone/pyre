@@ -1,4 +1,5 @@
 # pyre-check: selfcheck
+# pyre-check: selfcheck-compiles=<module>
 # A module-level `for` executed by `exec(src, globals, mapping)` whose locals
 # are a non-dict mapping.  `journal_walker_namespace_write` records nothing
 # for that namespace: `__setitem__` cannot be rolled back.  The assignment
