@@ -5195,10 +5195,17 @@ pub fn fuse_boxing_alloc_with_pytypes(
             // `descr.rs`'s instance group states what follows: a minor
             // collection inside a residual moves the fresh object, and the
             // caller finishes writing into the dead pre-move copy.
-            // `malloc_typed_stable` (`allocate` / `allocate_stable`) is
-            // non-movable. `NewWithVtable` is a nursery bump, so a vtable
-            // does not make that flavor expressible.
-            if !allocates_movable(flavor) {
+            // `allocate_stable` is `malloc_typed_stable`: the pointer must
+            // not move. `NewWithVtable` is a nursery bump, so a vtable does
+            // not make that call expressible. Other non-movable clusters
+            // still lower when they already carry a type word; only the
+            // plain `New` arm cannot say non-movable.
+            let allocate_stable = matches!(
+                target,
+                CallTarget::FunctionPath { segments, .. }
+                    if segments.last().map(String::as_str) == Some("allocate_stable")
+            );
+            if allocate_stable || (header.vtable.is_none() && !allocates_movable(flavor)) {
                 crate::decline::record(
                     FUSE_GATE,
                     "unsupported-malloc-flags-nonmovable",
