@@ -7675,7 +7675,11 @@ impl CallControl {
             CallShape::Direct(target) => self.cached_can_collect(target, cache),
             CallShape::Indirect(graphs) => self.cached_can_collect_family(graphs, cache),
         };
-        let mut effectinfo = effectinfo_from_writeanalyze(
+        // A top read/write set forces `EF_RANDOM_EFFECTS` and a `None`
+        // descriptor image (`effectinfo.py` `effectinfo_from_writeanalyze`).
+        // Stamping `EF_CANNOT_RAISE` onto that image afterwards is the pair
+        // `prepare` rejects: the wildcard and a concrete extraeffect.
+        let effectinfo = effectinfo_from_writeanalyze(
             effects,
             extraeffect,
             oopspecindex,
@@ -7684,19 +7688,6 @@ impl CallControl {
             extradescrs,
             &effect_callee,
         );
-        // `effectinfo_from_writeanalyze` rewrites a top read/write set to
-        // `EF_RANDOM_EFFECTS`.  A `#[dont_look_inside_cannot_raise]`
-        // trampoline's body is that top set (it calls host code the
-        // analyzer cannot see), which would put the residual back at
-        // may-force and a transparent helper walk cannot record it.
-        if let CallShape::Direct(target) = shape
-            && !elidable
-            && !loopinvariant
-            && self.declares_cannot_raise(target)
-            && !caller_supplied_extraeffect
-        {
-            effectinfo.extraeffect = ExtraEffect::CannotRaise;
-        }
 
         // RPython call.py:326-332 post-conditions on elidable / loopinvariant.
         if elidable || loopinvariant {
@@ -10994,6 +10985,51 @@ mod tests {
         );
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CannotRaise);
         assert!(!descriptor.extra_info.can_invalidate);
+    }
+
+    /// A top read/write set is `EF_RANDOM_EFFECTS` with a `None` descriptor
+    /// image (`effectinfo_from_writeanalyze`). `prepare` rejects that image
+    /// paired with `EF_CANNOT_RAISE`. A `cannot_raise` assertion on the same
+    /// direct call does not put the concrete extraeffect back.
+    #[test]
+    fn top_readwrite_set_stays_random_effects_when_cannot_raise() {
+        let mut cc = CallControl::new();
+        let mut graph = FunctionGraph::new("opaque_cannot_raise");
+        let entry = graph.startblock;
+        graph.push_op_var(
+            entry,
+            OpKind::IndirectCall {
+                funcptr: crate::flowspace::model::Variable::named("fnptr"),
+                args: Vec::new(),
+                graphs: None,
+                family_key: None,
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        let path = CallPath::from_segments(["opaque_cannot_raise"]);
+        register_int_result_graph(&mut cc, path.clone(), graph);
+        cc.mark_cannot_raise_assertion(path);
+        cc.find_all_graphs_for_tests();
+
+        let target = CallTarget::function_path(["opaque_cannot_raise"]);
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &direct_call_op(target),
+            Vec::new(),
+            Type::Int,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        assert_eq!(
+            descriptor.extra_info.extraeffect,
+            ExtraEffect::RandomEffects
+        );
+        assert!(descriptor.extra_info.readonly_descrs_fields.is_none());
+        assert!(descriptor.extra_info.write_descrs_fields.is_none());
+        assert!(descriptor.extra_info.descr_set_keys.is_none());
     }
 
     #[test]
