@@ -3492,3 +3492,70 @@ pyre_interpreter::py_module! {
         }
     },
 }
+
+/// `_ssl._SSLContext` has the native-layout mapdict prefix plus the three
+/// Python callback/path references owned by the context wrapper.
+unsafe fn ssl_context_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    unsafe { pyre_interpreter::objspace::std::mapdict::mapdict_storage_custom_trace(obj_addr, f) };
+    let context = unsafe { &mut *(obj_addr as *mut W_SSLContext) };
+    f(std::ptr::addr_of_mut!(context.sni_callback) as *mut majit_ir::GcRef);
+    f(std::ptr::addr_of_mut!(context.msg_callback) as *mut majit_ir::GcRef);
+    f(std::ptr::addr_of_mut!(context.keylog_filename) as *mut majit_ir::GcRef);
+}
+
+/// `_ssl._SSLSocket` owns its context, transport endpoints, public owner,
+/// and hostname directly on the typed object.
+unsafe fn ssl_socket_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let socket = unsafe { &mut *(obj_addr as *mut W_SSLSocket) };
+    f(std::ptr::addr_of_mut!(socket.ob.w_class) as *mut majit_ir::GcRef);
+    f(std::ptr::addr_of_mut!(socket.context) as *mut majit_ir::GcRef);
+    f(std::ptr::addr_of_mut!(socket.socket) as *mut majit_ir::GcRef);
+    f(std::ptr::addr_of_mut!(socket.incoming) as *mut majit_ir::GcRef);
+    f(std::ptr::addr_of_mut!(socket.outgoing) as *mut majit_ir::GcRef);
+    f(std::ptr::addr_of_mut!(socket.owner) as *mut majit_ir::GcRef);
+    f(std::ptr::addr_of_mut!(socket.server_hostname) as *mut majit_ir::GcRef);
+}
+
+/// The GC types this module owns, in `build_gc` registration order.
+pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType>) {
+    use pyre_interpreter::importing::{ModuleGcAnchor, ModuleGcLayout, ModuleGcType};
+    use pyre_object::lltype::PyreClassPyTypeOf;
+    // rustls objects sit behind opaque native pointers.  Context and
+    // MemoryBIO are subclassable native layouts, so their marker walks the
+    // mapdict prefix; Context additionally owns Python callbacks/path values.
+    // The sweep destructors release the opaque rustls allocations.
+    types.push(ModuleGcType {
+        anchor: ModuleGcAnchor::AfterScandirIterator,
+        descriptor: <W_SSLContext as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::CustomTrace(ssl_context_custom_trace),
+        destructor: Some(gc_destructor!(w_ssl_context_dealloc)),
+    });
+    types.push(ModuleGcType {
+        anchor: ModuleGcAnchor::AfterScandirIterator,
+        descriptor: <W_MemoryBIO as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::CustomTrace(
+            pyre_interpreter::objspace::std::mapdict::mapdict_storage_custom_trace,
+        ),
+        destructor: Some(gc_destructor!(w_memory_bio_dealloc)),
+    });
+    types.push(ModuleGcType {
+        anchor: ModuleGcAnchor::AfterScandirIterator,
+        descriptor: <W_SSLSession as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::Object,
+        destructor: Some(gc_destructor!(w_ssl_session_dealloc)),
+    });
+    types.push(ModuleGcType {
+        anchor: ModuleGcAnchor::AfterScandirIterator,
+        descriptor: <W_SSLSocket as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::CustomTrace(ssl_socket_custom_trace),
+        destructor: Some(gc_destructor!(w_ssl_socket_dealloc)),
+    });
+    types.push(ModuleGcType {
+        anchor: ModuleGcAnchor::AfterScandirIterator,
+        descriptor: <W_Certificate as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::PyreClass {
+            memory_pressure_offset: None,
+        },
+        destructor: None,
+    });
+}

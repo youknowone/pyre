@@ -14,6 +14,17 @@
 //! Everything else belongs here.  Modules will be migrated from
 //! `pyre-interpreter/src/module/` as they grow.
 
+/// Adapt a `W_Root` sweep hook (`fn(PyObjectRef)`) to the collector's
+/// address-taking `DestructorFn`.
+macro_rules! gc_destructor {
+    ($hook:path) => {{
+        unsafe fn destructor(obj_addr: usize) {
+            unsafe { $hook(obj_addr as pyre_object::PyObjectRef) }
+        }
+        destructor as majit_gc::trace::DestructorFn
+    }};
+}
+
 /// Keep the `module::` path prefix so harvested hint paths and
 /// `should_lower_module` stay `module::<name>` after the crate split.
 pub mod module;
@@ -428,8 +439,152 @@ pub fn register() {
             ctypes_bytes_object: hook_ctypes_bytes_object,
             ctypes_array_instance: hook_ctypes_array_instance,
             ctypes_pointer_instance: hook_ctypes_pointer_instance,
+            gc_types: module_gc_types,
+            immortal_w_class_only_descriptors: all_immortal_w_class_only_descriptors,
+            libffi_cif_shape: hook_libffi_cif_shape,
+            cffi_lib_dict: hook_cffi_lib_dict,
+            cffi_is_glob_support: hook_cffi_is_glob_support,
+            math_builtin_name: module::math::interp_math::math_builtin_name,
+            math1_gamma_result_finite: module::math::interp_math::math1_gamma_result_finite,
+            math_faithful_residual_call_addrs:
+                module::math::interp_math::math_faithful_residual_call_addrs,
+            math_word_residual_call_addrs: || {
+                vec![module::math::interp_math::jit_math_isqrt_i64 as *const () as usize as i64]
+            },
         },
     );
+}
+
+fn hook_cffi_lib_dict(obj: pyre_object::PyObjectRef) -> Option<pyre_object::PyObjectRef> {
+    #[cfg(all(
+        feature = "full",
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    ))]
+    {
+        return module::_cffi_backend::lib_obj::W_LibObject::from_obj(obj).map(|lib| lib.dict_w);
+    }
+    #[cfg(not(all(
+        feature = "full",
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    )))]
+    {
+        let _ = obj;
+        None
+    }
+}
+
+fn hook_cffi_is_glob_support(obj: pyre_object::PyObjectRef) -> bool {
+    #[cfg(all(
+        feature = "full",
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    ))]
+    {
+        return module::_cffi_backend::cglob::W_GlobSupport::from_obj(obj).is_some();
+    }
+    #[cfg(not(all(
+        feature = "full",
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    )))]
+    {
+        let _ = obj;
+        false
+    }
+}
+
+/// `jit_libffi.py`'s reading of a `CIF_DESCRIPTION` block for the tracer.
+unsafe fn hook_libffi_cif_shape(
+    cif_description: usize,
+) -> Option<pyre_interpreter::importing::LibffiCifShape> {
+    #[cfg(all(
+        feature = "full",
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    ))]
+    {
+        use module::_cffi_backend::jit_libffi::{self, types};
+        use pyre_interpreter::importing::{LibffiCifShape, LibffiType};
+        // `getkind(0)` is `OTHER`; there is no record to size.
+        let read = |ffi_type: usize| LibffiType {
+            kind: unsafe { types::getkind(ffi_type) } as u8,
+            size: if ffi_type == 0 {
+                0
+            } else {
+                unsafe { types::getsize(ffi_type) }
+            },
+        };
+        let nargs = unsafe { jit_libffi::nargs(cif_description) };
+        return Some(LibffiCifShape {
+            rtype: read(unsafe { jit_libffi::rtype(cif_description) }),
+            args: (0..nargs)
+                .map(|i| {
+                    (
+                        read(unsafe { jit_libffi::atype(cif_description, i) }),
+                        unsafe { jit_libffi::exchange_arg(cif_description, i) },
+                    )
+                })
+                .collect(),
+        });
+    }
+    #[cfg(not(all(
+        feature = "full",
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    )))]
+    {
+        let _ = cif_description;
+        None
+    }
+}
+
+/// The GC types this crate's modules own, in `build_gc` registration order
+/// within each `ModuleGcAnchor`.
+fn module_gc_types() -> Vec<pyre_interpreter::importing::ModuleGcType> {
+    let mut types = Vec::new();
+    module::_tokenize::gc_types(&mut types);
+    module::_functools::gc_types(&mut types);
+    module::unicodedata::gc_types(&mut types);
+    module::_json::gc_types(&mut types);
+    module::_hashlib::gc_types(&mut types);
+    module::zlib::gc_types(&mut types);
+    module::_bz2::gc_types(&mut types);
+    module::_lzma::gc_types(&mut types);
+    module::_lsprof::gc_types(&mut types);
+    module::_queue::gc_types(&mut types);
+    #[cfg(all(
+        feature = "full",
+        not(target_arch = "wasm32"),
+        not(feature = "sandbox")
+    ))]
+    module::_ssl::gc_types(&mut types);
+    #[cfg(all(
+        feature = "full",
+        not(target_arch = "wasm32"),
+        feature = "host_env",
+        not(feature = "sandbox")
+    ))]
+    module::mmap::gc_types(&mut types);
+    #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+    module::_overlapped::gc_types(&mut types);
+    #[cfg(windows)]
+    module::_winapi::gc_types(&mut types);
+    #[cfg(all(
+        feature = "full",
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    ))]
+    module::_cffi_backend::gc_types(&mut types);
+    types
 }
 
 /// `ll_math.py` C llexternals. The front retargets the Opaque `f64`

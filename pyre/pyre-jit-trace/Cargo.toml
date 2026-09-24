@@ -10,7 +10,7 @@ description = "Trace-time JIT for pyre — MIFrame and tracing logic"
 default = ["dynasm", "prepass", "full"]
 # The interpreter's whole builtin module set; reaches the build script's host
 # copy too, so the prepass registers the module surface the binary links.
-full = ["pyre-interpreter/full", "pyre-module/full"]
+full = ["pyre-interpreter/full", "pyre-module?/full"]
 cranelift = ["dep:majit-backend-cranelift", "majit-metainterp/cranelift"]
 dynasm = ["dep:majit-backend-dynasm", "majit-metainterp/dynasm"]
 # The build script's translation prepass over the LLBC set, and with it the
@@ -22,7 +22,7 @@ dynasm = ["dep:majit-backend-dynasm", "majit-metainterp/dynasm"]
 prepass = ["dep:pyre-interpreter", "dep:pyre-module", "dep:majit-translate", "dep:mimalloc", "dep:syn", "dep:walkdir"]
 # Keep JIT-side module references in lockstep with the interpreter's sandbox
 # build, which drops the modules that reach the OS directly.
-sandbox = ["pyre-interpreter/sandbox", "pyre-module/sandbox"]
+sandbox = ["pyre-interpreter/sandbox", "pyre-module?/sandbox"]
 test-support = []
 
 [dependencies]
@@ -31,7 +31,6 @@ bitflags = { workspace = true }
 indexmap = { workspace = true }
 pyre-object = { workspace = true }
 pyre-interpreter = { workspace = true, features = ["host_env"] }
-pyre-module = { workspace = true, features = ["host_env"] }
 rustpython-wtf8 = { workspace = true }
 linkme = { workspace = true }
 majit-ir = { workspace = true }

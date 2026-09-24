@@ -8800,47 +8800,38 @@ struct LibffiCallPlan {
 /// disagrees with the residual's own destination bank means the jitcode and
 /// the cif describe different calls.
 ///
-/// `module/mod.rs` gates `_cffi_backend` on the same two conditions the
-/// attribute names.
-#[cfg(all(
-    feature = "full",
-    not(feature = "sandbox"),
-    not(target_arch = "wasm32")
-))]
+/// `pyjitpl.py`'s `assert self.staticdata.has_libffi_call` "constant-folds
+/// away the rest of this function if the codewriter didn't produce any
+/// OS_LIBFFI_CALL at all".  `_cffi_backend` is the only producer of that
+/// oopspec and the only builder of the block, so a build without it reads no
+/// `CIF_DESCRIPTION` and declines to the same `resbox is None` fallthrough an
+/// unsupported kind takes.
 fn libffi_call_plan(cif_description: usize, dst_bank: char) -> Option<LibffiCallPlan> {
-    use pyre_module::module::_cffi_backend::jit_libffi::{self, kind, types};
-
+    let hooks = pyre_interpreter::importing::optional_module_hooks()?;
     // `ffi_result = cif_description.rtype; reskind = get_ffi_type_kind(...)`.
-    let rtype = unsafe { jit_libffi::rtype(cif_description) };
-    let reskind = unsafe { types::getkind(rtype) };
+    let cif = unsafe { (hooks.libffi_cif_shape)(cif_description) }?;
+    let reskind = cif.rtype.kind;
     // `if reskind == 'v': result_size = 0 else: intmask(ffi_result.c_size)`;
     // `is_ffi_type_signed` answers `kind != 'u'`.
     let (result_type, result_signed) = match reskind {
-        kind::VOID if dst_bank == 'v' => (Type::Void, false),
-        kind::SIGNED if dst_bank == 'i' => (Type::Int, true),
-        kind::UNSIGNED if dst_bank == 'i' => (Type::Int, false),
-        kind::FLOAT if dst_bank == 'f' => (Type::Float, true),
+        b'v' if dst_bank == 'v' => (Type::Void, false),
+        b'i' if dst_bank == 'i' => (Type::Int, true),
+        b'u' if dst_bank == 'i' => (Type::Int, false),
+        b'f' if dst_bank == 'f' => (Type::Float, true),
         _ => return None,
     };
-    let result_size = if reskind == kind::VOID {
-        0
-    } else {
-        unsafe { types::getsize(rtype) }
-    };
-    let nargs = unsafe { jit_libffi::nargs(cif_description) };
-    let mut args = Vec::with_capacity(nargs);
-    let mut arg_types = Vec::with_capacity(nargs);
-    for i in 0..nargs {
-        let atype = unsafe { jit_libffi::atype(cif_description, i) };
-        let argkind = unsafe { types::getkind(atype) };
+    let result_size = if reskind == b'v' { 0 } else { cif.rtype.size };
+    let mut args = Vec::with_capacity(cif.args.len());
+    let mut arg_types = Vec::with_capacity(cif.args.len());
+    for (atype, ofs) in cif.args {
         // `_get_ffi2descr_dict`: an integer argument keys on its own size, a
         // float on `('f', 0)`.  `('v', 0)` is the one entry that carries no
         // descr — the argument occupies no slot and is skipped.
-        let (item_type, item_size, signed) = match argkind {
-            kind::VOID => continue,
-            kind::SIGNED => (Type::Int, unsafe { types::getsize(atype) }, true),
-            kind::UNSIGNED => (Type::Int, unsafe { types::getsize(atype) }, false),
-            kind::FLOAT => (Type::Float, 8, false),
+        let (item_type, item_size, signed) = match atype.kind {
+            b'v' => continue,
+            b'i' => (Type::Int, atype.size, true),
+            b'u' => (Type::Int, atype.size, false),
+            b'f' => (Type::Float, 8, false),
             _ => return None,
         };
         if item_size == 0 {
@@ -8849,7 +8840,6 @@ fn libffi_call_plan(cif_description: usize, dst_bank: char) -> Option<LibffiCall
         // `ofs = cif_description.exchange_args[i]; assert ofs % itemsize == 0`
         // — the index a `GETARRAYITEM_RAW` carries is that offset in items,
         // so an offset the item size does not divide has no such spelling.
-        let ofs = unsafe { jit_libffi::exchange_arg(cif_description, i) };
         if ofs % item_size != 0 {
             return None;
         }
@@ -8868,21 +8858,6 @@ fn libffi_call_plan(cif_description: usize, dst_bank: char) -> Option<LibffiCall
         result_signed,
         result_size,
     })
-}
-
-/// `pyjitpl.py`'s `assert self.staticdata.has_libffi_call`, which its own
-/// comment describes as "an 'assert' that constant-folds away the rest of
-/// this function if the codewriter didn't produce any OS_LIBFFI_CALL at
-/// all".  `_cffi_backend` is the only producer of that oopspec, so a build
-/// without it reads no `CIF_DESCRIPTION` and declines to the same
-/// `resbox is None` fallthrough an unsupported kind takes.
-#[cfg(not(all(
-    feature = "full",
-    not(feature = "sandbox"),
-    not(target_arch = "wasm32")
-)))]
-fn libffi_call_plan(_cif_description: usize, _dst_bank: char) -> Option<LibffiCallPlan> {
-    None
 }
 
 fn direct_call_release_gil<Sym: WalkSym>(

@@ -672,3 +672,23 @@ pyre_interpreter::py_module! {
         }
     },
 }
+
+/// The GC types this module owns, in `build_gc` registration order.
+pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType>) {
+    use pyre_interpreter::importing::{ModuleGcAnchor, ModuleGcLayout, ModuleGcType};
+    use pyre_object::lltype::PyreClassPyTypeOf;
+    // Both stream objects own their liblzma coder on the W_Root owner and are
+    // not subclassable; the sweep destructor releases the coder.
+    types.push(ModuleGcType {
+        anchor: ModuleGcAnchor::AfterGcStats,
+        descriptor: <W_LZMACompressor as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::Object,
+        destructor: Some(gc_destructor!(w_lzmacompressor_dealloc)),
+    });
+    types.push(ModuleGcType {
+        anchor: ModuleGcAnchor::AfterGcStats,
+        descriptor: <W_LZMADecompressor as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::Object,
+        destructor: Some(gc_destructor!(w_lzmadecompressor_dealloc)),
+    });
+}

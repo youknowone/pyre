@@ -494,3 +494,20 @@ mod tests {
         );
     }
 }
+
+/// The GC types this module owns, in `build_gc` registration order.
+pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType>) {
+    use pyre_interpreter::importing::{ModuleGcAnchor, ModuleGcLayout, ModuleGcType};
+    use pyre_object::lltype::PyreClassPyTypeOf;
+    // `unicodedata.UCD`: an `allocate_stable` type with no inline object
+    // payload, so the header `w_class` — which a Python subclass instance points
+    // at a managed heap type — is the only edge its marker forwards.
+    types.push(ModuleGcType {
+        anchor: ModuleGcAnchor::AfterWClassOnlyTypes,
+        descriptor: <W_UCD as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::PyreClass {
+            memory_pressure_offset: None,
+        },
+        destructor: None,
+    });
+}

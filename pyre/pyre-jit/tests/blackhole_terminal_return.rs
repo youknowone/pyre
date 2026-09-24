@@ -17,6 +17,9 @@ fn terminal_ref_return_finishes_the_frame_and_leaves_its_execution_scope() {
     std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
         .spawn(|| {
+            // As a launcher does: the module GC types join the collector
+            // `init_jit_hooks` builds.
+            pyre_module::register();
             pyre_jit::eval::init_jit_hooks();
             let vinfo = pyre_jit::eval::driver_pair().1.clone();
             let ec = Rc::new(PyExecutionContext::default());

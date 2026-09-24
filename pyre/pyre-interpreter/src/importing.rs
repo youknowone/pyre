@@ -498,6 +498,68 @@ static SYS_PATH_0_PENDING: LazyLock<Mutex<Option<std::ffi::OsString>>> =
 pub(crate) static BUILTIN_MODULES: LazyLock<Mutex<HashMap<&'static str, BuiltinModuleDef>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Where a module-owned GC type joins `build_gc`'s registration order.
+///
+/// GC type ids are handed out in registration order and
+/// `SUBCLASS_RANGE_HIERARCHY` names them by number, so each module type keeps
+/// the slot it had when the JIT registered it by name: `build_gc` drains the
+/// types of one anchor at the point the anchor names.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ModuleGcAnchor {
+    /// Behind `_collections.deque_reverse_iterator`.
+    AfterDequeRevIter,
+    /// Behind the interpreter's header-only `#[pyre_class]` types.
+    AfterWClassOnlyTypes,
+    /// Behind `_io.StringIO`.
+    AfterStringIO,
+    /// Behind `gc` `W_GcStats`.
+    AfterGcStats,
+    /// Behind `posix.ScandirIterator`, where the target-gated tail begins.
+    AfterScandirIterator,
+    /// Behind `_io._WindowsConsoleIO`, the last interpreter rclass.
+    AfterWindowsConsoleIO,
+}
+
+/// The GC layout a module type declares for itself.
+#[derive(Clone, Copy)]
+pub enum ModuleGcLayout {
+    /// The `#[pyre_class]` inline pointer offsets, optionally with the field
+    /// that reports its native memory pressure.
+    PyreClass {
+        memory_pressure_offset: Option<usize>,
+    },
+    /// An `rclass.OBJECT` subclass whose payload holds no traced edge.
+    Object,
+    /// An `rclass.OBJECT` subclass walked by its own trace hook
+    /// (`rgc.register_custom_trace_hook`).
+    CustomTrace(majit_gc::trace::CustomTraceFn),
+}
+
+/// One GC type a module owns: its layout and, when it holds native state,
+/// the sweep destructor that releases it (`_finalize_` / `__del__`).
+#[derive(Clone, Copy)]
+pub struct ModuleGcType {
+    pub anchor: ModuleGcAnchor,
+    pub descriptor: &'static pyre_object::lltype::PyreClassDescriptor,
+    pub layout: ModuleGcLayout,
+    pub destructor: Option<majit_gc::trace::DestructorFn>,
+}
+
+/// One `ffi_type` of a `CIF_DESCRIPTION` as `jit_libffi.py` reads it:
+/// `types.getkind`'s kind letter and the type's `size`.
+#[derive(Clone, Copy)]
+pub struct LibffiType {
+    pub kind: u8,
+    pub size: usize,
+}
+
+/// The call shape a `CIF_DESCRIPTION` block records: `rtype`, then each
+/// `atypes[i]` with its `exchange_args[i]` offset.
+pub struct LibffiCifShape {
+    pub rtype: LibffiType,
+    pub args: Vec<(LibffiType, usize)>,
+}
+
 /// Optional modules live in `pyre-module` so this crate does not depend on
 /// them. The final binary links both and installs the hooks once before
 /// [`install_builtin_modules`]. PyPy freezes the same surface at
@@ -524,6 +586,33 @@ pub struct OptionalModuleHooks {
     pub ctypes_bytes_object: fn(PyObjectRef) -> Option<PyObjectRef>,
     pub ctypes_array_instance: fn(PyObjectRef) -> bool,
     pub ctypes_pointer_instance: fn(PyObjectRef) -> bool,
+    /// The GC types the modules own, in registration order within each
+    /// [`ModuleGcAnchor`].
+    pub gc_types: fn() -> Vec<ModuleGcType>,
+    /// Header-only `#[pyre_class]` types the modules allocate immortal; only
+    /// the immortal-root walker learns their `w_class` edge.
+    pub immortal_w_class_only_descriptors:
+        fn() -> Vec<&'static pyre_object::lltype::PyreClassDescriptor>,
+    /// Read the `CIF_DESCRIPTION` block at the given address; `None` when
+    /// `_cffi_backend`, the only builder of such blocks, is absent.
+    ///
+    /// # Safety
+    /// The address must be a block `_cffi_backend` built.
+    pub libffi_cif_shape: unsafe fn(usize) -> Option<LibffiCifShape>,
+    /// `Some(dict_w)` when the object is a `_cffi_backend` `Lib`.
+    pub cffi_lib_dict: fn(PyObjectRef) -> Option<PyObjectRef>,
+    /// Whether the object is a `_cffi_backend` global-variable support
+    /// object, which `Lib.__getattribute__` turns into a C-memory read.
+    pub cffi_is_glob_support: fn(PyObjectRef) -> bool,
+    /// The name of the canonical `math` builtin a callable is, if any.
+    pub math_builtin_name: fn(PyObjectRef) -> Option<&'static str>,
+    /// Whether `math.gamma` (or `lgamma` when the flag is set) is finite at
+    /// the argument.
+    pub math1_gamma_result_finite: fn(f64, bool) -> bool,
+    /// The `math` residual targets vouched faithful to their wasm ABI.
+    pub math_faithful_residual_call_addrs: fn() -> Vec<i64>,
+    /// The `math` residual targets vouched to return a word on wasm.
+    pub math_word_residual_call_addrs: fn() -> Vec<i64>,
 }
 
 static OPTIONAL_MODULE_HOOKS: std::sync::OnceLock<OptionalModuleHooks> = std::sync::OnceLock::new();

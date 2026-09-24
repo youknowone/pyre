@@ -857,3 +857,45 @@ pyre_interpreter::py_module! {
         let _ = stats_subentry_methods::type_object();
     },
 }
+
+/// `_lsprof.Profiler`'s trace: the mapdict prefix, then the entry trees.
+unsafe fn profiler_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::mapdict_storage_custom_trace(obj_addr, f);
+        w_profiler_custom_trace(obj_addr, f);
+    }
+}
+
+/// The GC types this module owns, in `build_gc` registration order.
+pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType>) {
+    use pyre_interpreter::importing::{ModuleGcAnchor, ModuleGcLayout, ModuleGcType};
+    use pyre_object::lltype::PyreClassPyTypeOf;
+    // `interp_lsprof.py` keeps the profiler's entry trees on the W_Root owner,
+    // behind Rust vectors no inline offset can name, so it needs a marker; it is
+    // also `cProfile.Profile`'s base class, hence the mapdict prefix walk.
+    types.push(ModuleGcType {
+        anchor: ModuleGcAnchor::AfterGcStats,
+        descriptor: <W_Profiler as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::CustomTrace(profiler_custom_trace),
+        destructor: Some(gc_destructor!(w_profiler_dealloc)),
+    });
+    // The two stats result objects hold their code and call-list references in
+    // inline fields and are not instantiable, so they register like any other
+    // rclass owner.
+    types.push(ModuleGcType {
+        anchor: ModuleGcAnchor::AfterGcStats,
+        descriptor: <W_StatsEntry as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::PyreClass {
+            memory_pressure_offset: None,
+        },
+        destructor: None,
+    });
+    types.push(ModuleGcType {
+        anchor: ModuleGcAnchor::AfterGcStats,
+        descriptor: <W_StatsSubEntry as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::PyreClass {
+            memory_pressure_offset: None,
+        },
+        destructor: None,
+    });
+}

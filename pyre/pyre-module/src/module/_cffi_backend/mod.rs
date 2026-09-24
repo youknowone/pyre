@@ -37,3 +37,126 @@ pub use pyre_native::cffi as parse_c_type;
 pub mod realize_c_type;
 pub mod wchar_helper;
 pub mod wrapper;
+
+/// The GC types this module owns, in `build_gc` registration order.
+pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType>) {
+    use pyre_interpreter::importing::{ModuleGcAnchor, ModuleGcLayout, ModuleGcType};
+    use pyre_object::lltype::PyreClassPyTypeOf;
+    // A ctype, the array iterator, struct field, allocator, MiniBuffer and
+    // offset carrier hold ordinary traced fields; a cdata additionally owns the
+    // block that `newp` malloc'd for it and a library owns its loader handle,
+    // which their sweep destructors release.
+    types.push(ModuleGcType {
+        anchor: ModuleGcAnchor::AfterWindowsConsoleIO,
+        descriptor: <ctypeobj::W_CType as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::PyreClass {
+            memory_pressure_offset: None,
+        },
+        destructor: None,
+    });
+    types.push(ModuleGcType {
+        anchor: ModuleGcAnchor::AfterWindowsConsoleIO,
+        descriptor: <ctypearray::W_CDataIter as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::PyreClass {
+            memory_pressure_offset: None,
+        },
+        destructor: None,
+    });
+    // Frees the block a `newp`-owned cdata malloc'd; a cdata that only borrows
+    // someone else's memory frees nothing.
+    types.push(ModuleGcType {
+        anchor: ModuleGcAnchor::AfterWindowsConsoleIO,
+        descriptor: <cdataobj::W_CData as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::PyreClass {
+            memory_pressure_offset: Some(std::mem::offset_of!(
+                cdataobj::W_CData,
+                special_memory_pressure
+            )),
+        },
+        destructor: Some(gc_destructor!(cdataobj::w_cdata_dealloc)),
+    });
+    types.push(ModuleGcType {
+        anchor: ModuleGcAnchor::AfterWindowsConsoleIO,
+        descriptor: <ctypestruct::W_CField as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::PyreClass {
+            memory_pressure_offset: None,
+        },
+        destructor: None,
+    });
+    // `W_Library._finalize_` closes a library nothing names any more, unless
+    // the handle was opened by someone else.
+    types.push(ModuleGcType {
+        anchor: ModuleGcAnchor::AfterWindowsConsoleIO,
+        descriptor: <libraryobj::W_Library as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::PyreClass {
+            memory_pressure_offset: None,
+        },
+        destructor: Some(gc_destructor!(libraryobj::w_library_dealloc)),
+    });
+    types.push(ModuleGcType {
+        anchor: ModuleGcAnchor::AfterWindowsConsoleIO,
+        descriptor: <allocator::W_Allocator as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::PyreClass {
+            memory_pressure_offset: None,
+        },
+        destructor: None,
+    });
+    types.push(ModuleGcType {
+        anchor: ModuleGcAnchor::AfterWindowsConsoleIO,
+        descriptor: <cbuffer::MiniBuffer as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::PyreClass {
+            memory_pressure_offset: None,
+        },
+        destructor: None,
+    });
+    types.push(ModuleGcType {
+        anchor: ModuleGcAnchor::AfterWindowsConsoleIO,
+        descriptor: <func::OffsetInBytes as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::PyreClass {
+            memory_pressure_offset: None,
+        },
+        destructor: None,
+    });
+    // `FreeCtxObj.__del__` releases an FFI object's copied parser context.
+    types.push(ModuleGcType {
+        anchor: ModuleGcAnchor::AfterWindowsConsoleIO,
+        descriptor: <ffi_obj::W_FFIObject as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::PyreClass {
+            memory_pressure_offset: None,
+        },
+        destructor: Some(gc_destructor!(ffi_obj::w_ffi_dealloc)),
+    });
+    types.push(ModuleGcType {
+        anchor: ModuleGcAnchor::AfterWindowsConsoleIO,
+        descriptor: <realize_c_type::W_RawFuncType as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::PyreClass {
+            memory_pressure_offset: None,
+        },
+        destructor: None,
+    });
+    // `W_DlOpenLibObject._finalize_` closes an ABI library nothing names.
+    types.push(ModuleGcType {
+        anchor: ModuleGcAnchor::AfterWindowsConsoleIO,
+        descriptor: <lib_obj::W_LibObject as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::PyreClass {
+            memory_pressure_offset: None,
+        },
+        destructor: Some(gc_destructor!(lib_obj::w_lib_dealloc)),
+    });
+    types.push(ModuleGcType {
+        anchor: ModuleGcAnchor::AfterWindowsConsoleIO,
+        descriptor: <cglob::W_GlobSupport as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::PyreClass {
+            memory_pressure_offset: None,
+        },
+        destructor: None,
+    });
+    types.push(ModuleGcType {
+        anchor: ModuleGcAnchor::AfterWindowsConsoleIO,
+        descriptor: <wrapper::W_FunctionWrapper as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::PyreClass {
+            memory_pressure_offset: None,
+        },
+        destructor: None,
+    });
+}

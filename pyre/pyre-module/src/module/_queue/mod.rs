@@ -317,3 +317,25 @@ pyre_interpreter::py_module! {
             .expect("Exception must be installed before _queue init"),
     },
 }
+
+/// `_queue.SimpleQueue` is subclassable and owns a FIFO of Python objects.
+unsafe fn simplequeue_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::mapdict_storage_custom_trace(obj_addr, f);
+        w_simplequeue_custom_trace(obj_addr, f);
+    }
+}
+
+/// The GC types this module owns, in `build_gc` registration order.
+pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType>) {
+    use pyre_interpreter::importing::{ModuleGcAnchor, ModuleGcLayout, ModuleGcType};
+    use pyre_object::lltype::PyreClassPyTypeOf;
+    // `_queue.SimpleQueue` is unconditional, so it registers ahead of the
+    // target-gated tail and keeps one id on every target.
+    types.push(ModuleGcType {
+        anchor: ModuleGcAnchor::AfterGcStats,
+        descriptor: <W_SimpleQueue as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::CustomTrace(simplequeue_custom_trace),
+        destructor: Some(gc_destructor!(w_simplequeue_dealloc)),
+    });
+}
