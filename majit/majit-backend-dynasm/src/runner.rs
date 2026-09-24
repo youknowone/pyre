@@ -617,6 +617,28 @@ pub(crate) fn new_via_gc_enabled() -> bool {
     NEW_VIA_GC.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// `GcLLDescr_boehm.malloc_fixedsize`: zeroed storage from the published
+/// function, or `None` when [`majit_gc::set_malloc_fixedsize`] is unset.
+pub(crate) fn call_malloc_fixedsize(size: usize) -> Option<*mut u8> {
+    let addr = majit_gc::malloc_fixedsize_addr();
+    if addr == 0 {
+        return None;
+    }
+    let malloc: extern "C" fn(usize) -> *mut u8 = unsafe { std::mem::transmute(addr) };
+    let ptr = malloc(size);
+    if !ptr.is_null() {
+        unsafe { libc::memset(ptr.cast(), 0, size) };
+    }
+    Some(ptr)
+}
+
+/// Address `genop_new_with_vtable` calls: the Boehm hook when published,
+/// otherwise `fallback` (`dynasm_new_alloc` or `libc::malloc`).
+pub(crate) fn malloc_fixedsize_or(fallback: i64) -> i64 {
+    let addr = majit_gc::malloc_fixedsize_addr();
+    if addr == 0 { fallback } else { addr as i64 }
+}
+
 /// Compiled-code `New` allocation trampoline. Called from the machine code
 /// emitted by `genop_new` / `genop_new_with_vtable` when `new_via_gc_enabled`.
 /// Routes through the active GC's nursery allocator (mirroring cranelift's
@@ -1592,6 +1614,13 @@ pub extern "C" fn dynasm_malloc_big_fixedsize(size: u64, type_id: u64) -> u64 {
     // mirroring `dynasm_nursery_slowpath` above
     // (`alloc_nursery(total_size - gc_hdr)`).
     let payload = (size as usize).saturating_sub(majit_gc::header::GcHeader::SIZE);
+    // `GcLLDescr_boehm.malloc_fixedsize` (`rewrite.py gen_malloc_fixedsize`,
+    // Boehm arm): no HDR, the block is the object, vtable at offset 0.
+    // `handle_new` still passes the headered total; the payload is
+    // `descr.size()`. Unset keeps `dynasm_alloc_fixedsize_typed_or_raw`.
+    if let Some(ptr) = call_malloc_fixedsize(payload) {
+        return oom_signal_if_zero(ptr as u64);
+    }
     oom_signal_if_zero(dynasm_alloc_fixedsize_typed_or_raw(type_id as u32, payload))
 }
 
@@ -1600,6 +1629,11 @@ pub extern "C" fn dynasm_malloc_big_fixedsize(size: u64, type_id: u64) -> u64 {
 /// arguments and stamps the type id the same way; only the allocator differs.
 pub extern "C" fn dynasm_malloc_big_fixedsize_oldgen(size: u64, type_id: u64) -> u64 {
     let payload = (size as usize).saturating_sub(majit_gc::header::GcHeader::SIZE);
+    // Same `GcLLDescr_boehm.malloc_fixedsize` arm as
+    // `dynasm_malloc_big_fixedsize`: one heap, no second header.
+    if let Some(ptr) = call_malloc_fixedsize(payload) {
+        return oom_signal_if_zero(ptr as u64);
+    }
     oom_signal_if_zero(dynasm_alloc_oldgen_typed_or_raw(type_id as u32, payload))
 }
 
@@ -3632,7 +3666,14 @@ impl Backend for DynasmBackend {
 
     fn bh_new_with_vtable(&self, sizedescr: &majit_jitcode::jitcode::BhDescr) -> i64 {
         let vtable = sizedescr.get_vtable();
-        let ptr = bh_alloc_struct(sizedescr);
+        // `GcLLDescr_boehm._bh_malloc` → `malloc_fixedsize`. A published
+        // function replaces the collector allocation; the caller still
+        // stores the vtable at `vtable_offset`.
+        let ptr = if let Some(ptr) = call_malloc_fixedsize(sizedescr.as_size()) {
+            ptr.cast()
+        } else {
+            bh_alloc_struct(sizedescr)
+        };
         if !ptr.is_null() {
             unsafe {
                 // llmodel.py:780-782: if self.vtable_offset is not None:

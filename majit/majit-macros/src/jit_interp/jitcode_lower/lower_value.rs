@@ -706,6 +706,35 @@ impl<'c> Lowerer<'c> {
         })
     }
 
+    /// `inlined_prefix` names this field as the leading substructure, and the
+    /// literal's type is that base (leaf names match; the body may spell an
+    /// imported path while the attribute spells a crate path).
+    fn field_is_inlined_prefix(
+        &self,
+        outer: &syn::Path,
+        member: &syn::Member,
+        inner: &syn::Path,
+    ) -> bool {
+        let Some(config) = self.config else {
+            return false;
+        };
+        let Some(name) = named_member(member) else {
+            return false;
+        };
+        let Some((field, base)) = crate::jit_interp::inlined_prefix_entry(
+            &config.inlined_prefix,
+            &super::canonical_path_segments(outer),
+        ) else {
+            return false;
+        };
+        if field != &name {
+            return false;
+        }
+        let base_segs = super::canonical_path_segments(base);
+        let inner_segs = super::canonical_path_segments(inner);
+        inner_segs == base_segs || inner_segs.last() == base_segs.last()
+    }
+
     /// Lower a struct literal `Path { f0: v0, f1: v1, .. }` to a JIT
     /// allocation plus per-field stores: `new` (size from `size_of`) then
     /// `setfield_gc_<kind>` at each field's `offset_of`.  Mirrors
@@ -719,22 +748,58 @@ impl<'c> Lowerer<'c> {
             return None;
         }
         let struct_path = &s.path;
-        // Lower every field value (rejecting unsupported kinds) before
-        // emitting the allocation, so a failed field never leaves a
-        // dangling New in the op stream.
-        let mut fields = Vec::new();
-        let mut depends_on_stack = false;
+        // An inlined leading substructure is not its own allocation.
+        // `lltype.py` admits it only at `_names[0]` (offset 0); its fields
+        // are stores into the outer object. A constant `ob_type` / `typeptr`
+        // there is the vtable `rewrite_op_malloc` reads, not a setfield
+        // (`heaptracker.all_fielddescrs` drops `typeptr`).
+        let mut flat: Vec<(syn::Path, syn::Member, syn::Expr)> = Vec::new();
         for field in &s.fields {
-            let value = self.lower_value_expr(&field.expr)?;
+            if let syn::Expr::Struct(inner) = &field.expr
+                && self.field_is_inlined_prefix(struct_path, &field.member, &inner.path)
+            {
+                for inner_field in &inner.fields {
+                    flat.push((
+                        inner.path.clone(),
+                        inner_field.member.clone(),
+                        inner_field.expr.clone(),
+                    ));
+                }
+            } else {
+                flat.push((
+                    struct_path.clone(),
+                    field.member.clone(),
+                    field.expr.clone(),
+                ));
+            }
+        }
+        let mut vtable: Option<TokenStream> = None;
+        let mut value_fields: Vec<(syn::Path, syn::Member, Binding)> = Vec::new();
+        let mut depends_on_stack = false;
+        for (owner, member, expr) in &flat {
+            if Self::is_typeptr_member(member)
+                && let Some(tokens) = Self::const_vtable_tokens(expr)
+            {
+                if vtable.is_some() {
+                    return None;
+                }
+                vtable = Some(tokens);
+                continue;
+            }
+            let value = self.lower_value_expr(expr)?;
             if matches!(value.kind, BindingKind::Float) {
                 return None;
             }
             depends_on_stack |= value.depends_on_stack;
-            fields.push((field.member.clone(), value));
+            value_fields.push((owner.clone(), member.clone(), value));
         }
-        // GC-allocated struct (`new_struct`): TypeId plus the GC-layout
-        // discriminator, shared by every spelling of this concrete type.
-        let type_id = struct_type_id_tokens(struct_path, true);
+        let fields = value_fields;
+        // Same id a later `getfield` mints (`struct_gc_kind_is_managed`), so
+        // the virtual's slot and the read name one descriptor.
+        let gc_managed = self
+            .config
+            .is_some_and(|cfg| cfg.struct_gc_kind_is_managed(struct_path));
+        let type_id = struct_type_id_tokens(struct_path, gc_managed);
         let result_reg = self.alloc_reg();
         // descr.py init_size_descr: the SizeDescr carries the
         // struct's full `(offset, is_ref, name)` layout so the optimizer can
@@ -744,14 +809,14 @@ impl<'c> Lowerer<'c> {
         // need to hand it each field's `(offset, is_ref, name)`.
         let field_layout: Vec<TokenStream> = fields
             .iter()
-            .map(|(member, value)| {
+            .map(|(owner, member, value)| {
                 let is_ref = matches!(value.kind, BindingKind::Ref);
                 // `rewrite_op_malloc` + `rewrite_op_setfield` register
                 // each field through `fielddescrof`, which reads width
                 // and signedness from FIELDTYPE. Use the same
                 // `int_fields` / `ref_fields` witness the getfield path
                 // already consults.
-                let struct_name = struct_path
+                let struct_name = owner
                     .segments
                     .last()
                     .map(|s| s.ident.to_string())
@@ -760,7 +825,7 @@ impl<'c> Lowerer<'c> {
                 let key = format!("{struct_name}::{member_name}");
                 let (size, signed, witness) = match self.config {
                     Some(config) => {
-                        super::lower_vable::field_scalar_tokens(config, &key, struct_path, member)
+                        super::lower_vable::field_scalar_tokens(config, &key, owner, member)
                     }
                     None => (
                         quote! { ::core::mem::size_of::<i64>() },
@@ -768,10 +833,12 @@ impl<'c> Lowerer<'c> {
                         quote! {},
                     ),
                 };
+                // A prefix field sits at offset 0 of the outer struct, so
+                // its own `offset_of` is the outer offset.
                 quote! {{
                     #witness
                     (
-                        ::core::mem::offset_of!(#struct_path, #member),
+                        ::core::mem::offset_of!(#owner, #member),
                         #is_ref,
                         stringify!(#member),
                         #size,
@@ -783,8 +850,24 @@ impl<'c> Lowerer<'c> {
         let headerless = self
             .config
             .is_some_and(|cfg| cfg.is_headerless_struct(struct_path));
-        self.emit_op(
-            OpMeta::linear(OpKind::New, vec![], vec![Register::ref_(result_reg)]),
+        let alloc = if let Some(vtable) = &vtable {
+            quote! {
+                __builder.new_with_vtable_struct(
+                    #result_reg,
+                    ::core::mem::size_of::<#struct_path>(),
+                    #type_id,
+                    #vtable,
+                    #headerless,
+                    #gc_managed,
+                    &[ #(#field_layout),* ],
+                    {
+                        #[allow(unused_imports)]
+                        use majit_metainterp::MajitImmutableFields as _;
+                        <#struct_path>::__MAJIT_IMMUTABLE_FIELDS
+                    },
+                );
+            }
+        } else {
             quote! {
                 __builder.new_struct(
                     #result_reg,
@@ -804,9 +887,13 @@ impl<'c> Lowerer<'c> {
                         <#struct_path>::__MAJIT_IMMUTABLE_FIELDS
                     },
                 );
-            },
+            }
+        };
+        self.emit_op(
+            OpMeta::linear(OpKind::New, vec![], vec![Register::ref_(result_reg)]),
+            alloc,
         );
-        for (member, value) in fields.iter() {
+        for (owner, member, value) in fields.iter() {
             let value_reg = value.reg;
             let (reads, tokens) = match value.kind {
                 BindingKind::Int => (
@@ -815,7 +902,7 @@ impl<'c> Lowerer<'c> {
                         __builder.setfield_gc_i(
                             #result_reg,
                             #value_reg,
-                            ::core::mem::offset_of!(#struct_path, #member),
+                            ::core::mem::offset_of!(#owner, #member),
                             #type_id,
                             stringify!(#member),
                         );
@@ -827,7 +914,7 @@ impl<'c> Lowerer<'c> {
                         __builder.setfield_gc_r(
                             #result_reg,
                             #value_reg,
-                            ::core::mem::offset_of!(#struct_path, #member),
+                            ::core::mem::offset_of!(#owner, #member),
                             #type_id,
                             stringify!(#member),
                         );
@@ -843,6 +930,28 @@ impl<'c> Lowerer<'c> {
             depends_on_stack,
             struct_type: Some(struct_path.clone()),
         })
+    }
+
+    fn is_typeptr_member(member: &syn::Member) -> bool {
+        matches!(
+            named_member(member).as_deref(),
+            Some("ob_type") | Some("typeptr")
+        )
+    }
+
+    /// `&PATH` — a compile-time class address. `rewrite_op_malloc` only emits
+    /// `new_with_vtable` when the vtable is static.
+    fn const_vtable_tokens(expr: &syn::Expr) -> Option<TokenStream> {
+        let syn::Expr::Reference(reference) = expr else {
+            return None;
+        };
+        if reference.mutability.is_some() {
+            return None;
+        }
+        if !matches!(reference.expr.as_ref(), syn::Expr::Path(_)) {
+            return None;
+        }
+        Some(quote! { (#expr as *const _ as usize) })
     }
 
     /// Statement-context lowering for `hint(x, promote=True)`:

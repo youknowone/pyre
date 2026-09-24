@@ -2169,7 +2169,10 @@ impl<S: JitState> JitDriver<S> {
             bridge_attempt_declined: false,
             entry_points: Vec::new(),
             is_recursive: false,
-            blackhole_allocator: None,
+            // resume.py `allocate_with_vtable` must return an object.
+            // `NullAllocator` leaves a virtual ref as 0, so a vable slot
+            // that held one is not a live box after the guard.
+            blackhole_allocator: Some(Box::new(crate::resume::LlmodelBlackholeAllocator)),
             portal_jd_index: None,
             state_field_fvc: None,
             function_entry_suppressed: false,

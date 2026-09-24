@@ -703,6 +703,55 @@ impl JitCodeBuilder {
         self.push_reg_u8(dest, "new result");
     }
 
+    /// `new_with_vtable/d>r` with the same field layout as [`Self::new_struct`].
+    ///
+    /// `jtransform.py rewrite_op_malloc` emits this when the struct has a
+    /// vtable (`heaptracker.get_vtable_for_gcstruct`). The type word is not a
+    /// field (`heaptracker.all_fielddescrs` drops `typeptr`); `vtable` is the
+    /// class address stored at offset 0 by the backend.
+    pub fn new_with_vtable_struct(
+        &mut self,
+        dest: u16,
+        size: usize,
+        type_id: u64,
+        vtable: usize,
+        headerless: bool,
+        is_gc_managed: bool,
+        fields: &[(usize, bool, &str, usize, bool)],
+        immutable_fields: &str,
+    ) {
+        self.touch_ref_reg(dest);
+        self.register_struct_layout(
+            size,
+            type_id,
+            is_gc_managed,
+            headerless,
+            fields,
+            immutable_fields,
+        );
+        let all_fielddescrs = self
+            .struct_size_specs
+            .get(&type_id)
+            .expect("register_struct_layout just inserted this type_id")
+            .all_fielddescrs
+            .clone();
+        let descr = self.add_bh_descr(CanonicalBhDescr::Size {
+            size,
+            type_id,
+            vtable: vtable as u64,
+            owner: if headerless {
+                HEADERLESS_SIZE_OWNER_MARKER.to_string()
+            } else {
+                String::new()
+            },
+            all_fielddescrs,
+            is_gc_managed,
+        });
+        self.write_insn("new_with_vtable/d>r");
+        self.push_u16(descr);
+        self.push_reg_u8(dest, "new_with_vtable result");
+    }
+
     /// Register a struct's `(offset, is_ref, name)` layout under `type_id`
     /// WITHOUT emitting a `new/d>r` allocation op.  Used for a struct that
     /// is allocated natively (outside the JIT) but whose fields are still

@@ -8624,7 +8624,8 @@ rx86::movss_ax(&mut self.mc, base.value, ofs_reg.value, $scale, offset, xmm);
                 (sd.vtable() as i64, w_class_init)
             })
             .unwrap_or((0, None));
-        let malloc_ptr = Self::new_alloc_fn_addr();
+        // `rewrite.py gen_malloc_fixedsize` (Boehm arm): CALL malloc_fixedsize(size).
+        let malloc_ptr = crate::runner::malloc_fixedsize_or(Self::new_alloc_fn_addr());
         self.emit_abi_int_arg_from_imm(0, obj_size);
         dynasm!(self.mc ; .arch x64 ; mov rax, QWORD malloc_ptr);
         self.emit_abi_call_rax();
@@ -8637,7 +8638,7 @@ rx86::movss_ax(&mut self.mc, base.value, ofs_reg.value, $scale, offset, xmm);
         );
         self.emit_abi_call_rax_after_one_push();
         dynasm!(self.mc ; .arch x64 ; pop rax);
-        // Write vtable at offset 0
+        // Write vtable at offset 0 (`GcLLDescr_boehm`, fielddescr_vtable at 0).
         if vtable != 0 {
             dynasm!(self.mc ; .arch x64
                 ; mov rcx, QWORD vtable

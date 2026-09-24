@@ -507,7 +507,10 @@ fn rewrite_jit_inline_ref_param_fields(
         struct_allocs: struct_allocs_map,
     };
     let mut block = block.clone();
-    if !rewriter.local_ref_types.is_empty() {
+    // `struct_allocs` rewrites `let x = Struct { .. }` even when the helper
+    // declares no ref parameter. Gating the visit on ref params left that
+    // concrete allocator unapplied.
+    if !rewriter.local_ref_types.is_empty() || !rewriter.struct_allocs.is_empty() {
         rewriter.visit_block_mut(&mut block);
     }
     block

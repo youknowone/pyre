@@ -2492,6 +2492,29 @@ pub fn collector_installed() -> bool {
     gc_box_installed() || gc_sync::is_initialized()
 }
 
+/// `GcLLDescr_boehm.malloc_fn_ptr`, the address `gen_malloc_fixedsize` calls.
+///
+/// Boehm has no inline nursery (`fielddescr_tid is None`), so `NEW` /
+/// `NEW_WITH_VTABLE` are `CALL_R(malloc_fixedsize, size)` and the vtable is
+/// stored at offset 0 afterwards. Unset (0) leaves the backend on its
+/// existing allocator. Installing this does not install a collector:
+/// [`collector_installed`] stays false.
+static MALLOC_FIXEDSIZE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Publish `malloc_fixedsize`. `None` clears the hook.
+pub fn set_malloc_fixedsize(func: Option<extern "C" fn(usize) -> *mut u8>) {
+    MALLOC_FIXEDSIZE.store(
+        func.map(|f| f as usize).unwrap_or(0),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// The published `malloc_fixedsize` address, or 0 when unset.
+#[inline]
+pub fn malloc_fixedsize_addr() -> usize {
+    MALLOC_FIXEDSIZE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 // ── Host-side nursery allocation hook ───────────────────────────────
 //
 // Separate from `ActiveGcGuardHooks` because allocation is not a
