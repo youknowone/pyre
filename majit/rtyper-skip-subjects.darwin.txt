@@ -1251,7 +1251,9 @@ two-phase-never-a-subject	pyre_interpreter::runtime_ops::module_ns_get
 two-phase-never-a-subject	pyre_interpreter::runtime_ops::sequence_len
 two-phase-never-a-subject	pyre_interpreter::runtime_ops::type_dict_delete
 two-phase-never-a-subject	pyre_interpreter::runtime_ops::type_dict_lookup
+two-phase-never-a-subject	pyre_interpreter::runtime_ops::type_dict_lookup_no_unwrapping
 two-phase-never-a-subject	pyre_interpreter::runtime_ops::type_dict_lookup_wtf8
+two-phase-never-a-subject	pyre_interpreter::runtime_ops::type_dict_lookup_wtf8_no_unwrapping
 two-phase-never-a-subject	pyre_interpreter::shared_opcode::SharedOpcodeHandler::set_function_typeparams
 two-phase-never-a-subject	pyre_interpreter::shared_opcode::opcode_build_map
 two-phase-never-a-subject	pyre_interpreter::shared_opcode::opcode_call

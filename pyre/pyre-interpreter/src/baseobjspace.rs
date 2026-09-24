@@ -10743,12 +10743,39 @@ pub unsafe fn mutated(w_type: PyObjectRef, key: Option<&str>) {
 /// `_pure_lookup_where_with_method_cache(name, version_tag)` that lets the JIT
 /// constant-fold lookups on a promoted `version_tag` is the remaining slice —
 /// this raw walk stays non-elidable until then.
+///
+/// `_lookup_where` reads each MRO class through `getdictvalue`
+/// ([`crate::type_dict_lookup`]), so the entry is unwrapped per class and a
+/// cell that holds nothing leaves the walk running instead of ending it.  The
+/// raw twin that feeds the `MethodCache` is
+/// [`lookup_where_no_unwrapping`], which mirrors
+/// `_lookup_where_all_typeobjects` and keeps its own walk for the same reason
+/// upstream writes the loop out twice.
 pub(crate) unsafe fn lookup_where(
     w_type: PyObjectRef,
     name: &str,
 ) -> Option<(PyObjectRef, PyObjectRef)> {
-    let (class, value) = lookup_where_no_unwrapping(w_type, name)?;
-    unwrap_method_cache_value(class, value)
+    if w_type.is_null() || !is_type(w_type) {
+        return None;
+    }
+    // Use cached MRO if available (W_TypeObject.mro_w)
+    let cached = w_type_get_mro(w_type);
+    let mro_owned;
+    let mro: &[PyObjectRef] = if !cached.is_null() {
+        (*cached).as_slice()
+    } else {
+        mro_owned = compute_mro(w_type);
+        &mro_owned
+    };
+    for cls in mro {
+        if (*cls).is_null() || !is_type(*cls) {
+            continue;
+        }
+        if let Some(value) = crate::type_dict_lookup(*cls, name) {
+            return Some((*cls, value));
+        }
+    }
+    None
 }
 
 /// The walk itself, with the namespace entry left exactly as stored.
@@ -10846,7 +10873,14 @@ pub unsafe fn lookup_where_pair(
     name: &str,
 ) -> Option<(PyObjectRef, PyObjectRef)> {
     let (class, value) = lookup_where_pair_no_unwrapping(w_type, name)?;
-    unwrap_method_cache_value(class, value)
+    // `getdictvalue`'s unwrap, applied to the one entry the two residuals
+    // agreed on.  A type store parks a cell only around a live value, so the
+    // null payload `_lookup_where` would walk past is not reachable here.
+    let value = pyre_object::celldict::unwrap_cell(value);
+    if value.is_null() {
+        return None;
+    }
+    Some((class, value))
 }
 
 /// [`lookup_where_pair`] with the namespace entry left as stored, for the
