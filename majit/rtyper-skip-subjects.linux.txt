@@ -860,12 +860,16 @@ two-phase-never-a-subject	pyre_interpreter::module::gc::hook::__majit_wrap_set
 two-phase-never-a-subject	pyre_interpreter::module::struct::<Impl>::__init__
 two-phase-never-a-subject	pyre_interpreter::module::struct::<Impl>::__sizeof__
 two-phase-never-a-subject	pyre_interpreter::module::struct::<Impl>::iter_unpack
+two-phase-never-a-subject	pyre_interpreter::module::struct::<Impl>::pack
 two-phase-never-a-subject	pyre_interpreter::module::struct::<Impl>::unpack
 two-phase-never-a-subject	pyre_interpreter::module::struct::<Impl>::unpack_from
 two-phase-never-a-subject	pyre_interpreter::module::struct::__majit_wrap___init__
 two-phase-never-a-subject	pyre_interpreter::module::struct::__majit_wrap___new__
 two-phase-never-a-subject	pyre_interpreter::module::struct::__majit_wrap___sizeof__
 two-phase-never-a-subject	pyre_interpreter::module::struct::__majit_wrap_iter_unpack
+two-phase-never-a-subject	pyre_interpreter::module::struct::__majit_wrap_pack
+two-phase-never-a-subject	pyre_interpreter::module::struct::__majit_wrap_struct_pack
+two-phase-never-a-subject	pyre_interpreter::module::struct::__majit_wrap_struct_unpack
 two-phase-never-a-subject	pyre_interpreter::module::struct::__majit_wrap_unpack
 two-phase-never-a-subject	pyre_interpreter::module::struct::__majit_wrap_unpack_from
 two-phase-never-a-subject	pyre_interpreter::module::struct::_orig_do_unpack

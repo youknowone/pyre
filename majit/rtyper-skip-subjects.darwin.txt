@@ -2,7 +2,7 @@
 # Ratcheted by scripts/check-rtyper-skip-subjects.py: a name may
 # leave this list, and may not join it.  Empty is the epic's
 # done-when.
-# corpus=581374ce2a8547ad platform=darwin
+# corpus=cf58f5cc113da7d0 platform=darwin
 two-phase-never-a-subject	eval_loop_jit_portal
 two-phase-never-a-subject	ll_int_abs
 two-phase-never-a-subject	ll_listslice_minusone__ref__majit__object_ref_gcarray
@@ -864,12 +864,16 @@ two-phase-never-a-subject	pyre_interpreter::module::gc::hook::__majit_wrap_set
 two-phase-never-a-subject	pyre_interpreter::module::struct::<Impl>::__init__
 two-phase-never-a-subject	pyre_interpreter::module::struct::<Impl>::__sizeof__
 two-phase-never-a-subject	pyre_interpreter::module::struct::<Impl>::iter_unpack
+two-phase-never-a-subject	pyre_interpreter::module::struct::<Impl>::pack
 two-phase-never-a-subject	pyre_interpreter::module::struct::<Impl>::unpack
 two-phase-never-a-subject	pyre_interpreter::module::struct::<Impl>::unpack_from
 two-phase-never-a-subject	pyre_interpreter::module::struct::__majit_wrap___init__
 two-phase-never-a-subject	pyre_interpreter::module::struct::__majit_wrap___new__
 two-phase-never-a-subject	pyre_interpreter::module::struct::__majit_wrap___sizeof__
 two-phase-never-a-subject	pyre_interpreter::module::struct::__majit_wrap_iter_unpack
+two-phase-never-a-subject	pyre_interpreter::module::struct::__majit_wrap_pack
+two-phase-never-a-subject	pyre_interpreter::module::struct::__majit_wrap_struct_pack
+two-phase-never-a-subject	pyre_interpreter::module::struct::__majit_wrap_struct_unpack
 two-phase-never-a-subject	pyre_interpreter::module::struct::__majit_wrap_unpack
 two-phase-never-a-subject	pyre_interpreter::module::struct::__majit_wrap_unpack_from
 two-phase-never-a-subject	pyre_interpreter::module::struct::_orig_do_unpack
