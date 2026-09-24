@@ -3349,8 +3349,8 @@ mod tests {
 
         // i0/i1 are unproduced header inputs (modelled as InputArgs so the
         // production driver resolves them positionally); i2/i4 are produced by
-        // the trace; i200 is the const-seeded slot (`constants.insert(200, …)`)
-        // whose canonical host the const-seeding registers.
+        // the trace; the addend is ConstInt(1), the object the recorder
+        // would have placed in the arg.
         let ops = vec![
             make_op(
                 OpCode::IntLt,
@@ -3360,7 +3360,7 @@ mod tests {
             make_op(OpCode::GuardTrue, &[OpRef::int_op(2)], 3),
             make_op(
                 OpCode::IntAddOvf,
-                &[OpRef::input_arg_int(0), OpRef::int_op(200)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(1)],
                 4,
             ),
             make_op(OpCode::GuardNoOverflow, &[], 5),
@@ -3371,11 +3371,10 @@ mod tests {
         // IntLt/IntAddOvf operate on Int-typed inputs — override the
         // test default (Ref) used by `optimize_with_constants_and_inputs_at`.
         opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&vec![majit_ir::Type::Int; 1024]);
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
-        constants.insert(200u32, majit_ir::Value::Int(1));
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 1024);
 
         let opcodes: Vec<_> = result.iter().map(|op| op.opcode).collect();
         assert!(

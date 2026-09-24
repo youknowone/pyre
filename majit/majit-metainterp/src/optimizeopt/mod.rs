@@ -2925,6 +2925,33 @@ impl OptContext {
         }
     }
 
+    /// `replace_op_with`: carry the terminal's `Info` onto `new_op`, then
+    /// `old.set_forwarded(new_op)`. `ptr_eq` skips a one-node cycle, including
+    /// when the terminal walk already landed on `new_op`.
+    pub(crate) fn link_replaced_producer(old: &majit_ir::OpRc, new_op: &majit_ir::OpRc) {
+        use majit_ir::forwarding::ForwardingHost;
+        if OpRc::ptr_eq(old, new_op) {
+            return;
+        }
+        let terminal = Operand::from_bound_op(old).get_box_replacement(false);
+        let Some(term_op) = terminal.bound_op() else {
+            return;
+        };
+        if OpRc::ptr_eq(&term_op, new_op) {
+            return;
+        }
+        let opinfo = term_op.get_forwarded();
+        if matches!(opinfo, majit_ir::forwarding::Forwarded::Info(_))
+            && matches!(
+                new_op.get_forwarded(),
+                majit_ir::forwarding::Forwarded::None
+            )
+        {
+            new_op.store_forwarded(opinfo);
+        }
+        term_op.set_forwarded_op(new_op);
+    }
+
     /// Construct an `OptContext` whose inputarg / fresh-OpRef numbering is
     /// shifted to start above a parent trace's high water mark.
     ///
@@ -3593,10 +3620,39 @@ impl OptContext {
             }
         }
         Self::debug_assert_box_type_invariant(&op);
+        // Same live-synthetic hand-off as `emit`'s clone path. A pass-through
+        // `OpRc` is often the stand-in itself; the helper's `ptr_eq` guard
+        // leaves that producer unlinked to itself.
+        self.adopt_live_synthetic(&op);
         self.emitted_operations
             .insert(majit_ir::operand::Operand::from_bound_op(&op));
         self.push_new_operation(op);
         pos_ref
+    }
+
+    /// Move the `live_synthetics` stand-in at `op_rc`'s position onto the
+    /// producer about to be appended. Copies the stand-in's `_forwarded`
+    /// onto `op_rc`, then `synth.set_forwarded(op_rc)` when the two are
+    /// distinct objects (`replace_op_with`). A carried `Forwarded::Op` that
+    /// already names `op_rc` is left in place so the copy cannot close a
+    /// one-node cycle.
+    fn adopt_live_synthetic(&mut self, op_rc: &majit_ir::OpRc) {
+        let op_pos = op_rc.pos().get();
+        let Some(synth) = self.live_synthetics_swap_remove_pos(op_pos) else {
+            return;
+        };
+        let carried = synth.forwarded().borrow().clone();
+        // An Op redirect is not info to carry. Copying it onto the producer
+        // closes a cycle when the redirect already names that producer, or
+        // names a box that forwards back to it.
+        let carried_is_op = matches!(carried, majit_ir::forwarding::Forwarded::Op(_));
+        if !carried_is_op {
+            *op_rc.forwarded().borrow_mut() = carried;
+        }
+        if !OpRc::ptr_eq(&synth, op_rc) {
+            use majit_ir::forwarding::ForwardingHost;
+            synth.set_forwarded_op(op_rc);
+        }
     }
 
     pub(crate) fn stamp_emitted_op(src: &Op, dst: &Op) {
@@ -3820,27 +3876,16 @@ impl OptContext {
         //
         // The synthetic stand-in registered for `op_pos` by `materialize_operand_at` /
         // `bind_input_resops` is the `live_synthetics` entry at this position.
-        // Migrate its `_forwarded` onto the real producer (resoperation.py
-        // `_forwarded` lives on the op) and drop it from `live_synthetics` so
-        // the superseded stand-in is not drained into `phase1_emit_ops`. Each
-        // `op_pos` has at most one live stand-in, so the position match is
-        // unambiguous. This is the sole carry-over path: the synthetic is the
-        // `_forwarded` host every `find_producer_op` reaches before this emit
-        // supersedes it.
-        if let Some(synth) = self.live_synthetics_swap_remove_pos(op_pos) {
-            *op_rc.forwarded().borrow_mut() = synth.forwarded().borrow().clone();
-            // replace_op_with parity (optimizer.py): forward the superseded
-            // stand-in to the emitted producer. A consumer dispatched BEFORE
-            // this producer emitted (forward reference) bound its operand to
-            // `synth`; without this link its box-native walk freezes on the
-            // orphaned stand-in while the OpRef path resolves `op_rc`, so a
-            // later fold (e.g. GUARD_TRUE constant-folding the operand) lands
-            // on a different host and `resolve_operand_operand`'s witness diverges.
-            if !OpRc::ptr_eq(&synth, &op_rc) {
-                use majit_ir::forwarding::ForwardingHost;
-                synth.set_forwarded_op(&op_rc);
-            }
-        }
+        // `adopt_live_synthetic` migrates its `_forwarded` onto the real producer
+        // and drops it from `live_synthetics` so the superseded stand-in is not
+        // drained into `phase1_emit_ops`. Each `op_pos` has at most one live
+        // stand-in, so the position match is unambiguous. This is the sole
+        // carry-over path: the synthetic is the `_forwarded` host every
+        // `find_producer_op` reaches before this emit supersedes it.
+        // A consumer dispatched BEFORE this producer emitted (forward reference)
+        // bound its operand to `synth`; without this link its box-native walk
+        // freezes on the orphaned stand-in while the OpRef path resolves `op_rc`.
+        self.adopt_live_synthetic(&op_rc);
         // optimizer.py `self._emittedoperations[op] = None`.
         self.emitted_operations
             .insert(majit_ir::operand::Operand::from_bound_op(&op_rc));

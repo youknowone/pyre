@@ -5458,17 +5458,14 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::NewArrayClear,
-                &[crate::history::test_support::rooted_resop_operand(
-                    Type::Int,
-                    50,
-                )],
+                &[majit_ir::operand::Operand::const_from_value(Value::Int(1))],
                 arr.clone(),
             ),
             Op::with_descr(
                 OpCode::SetinteriorfieldGc,
                 &[
                     crate::history::test_support::rooted_resop_operand(Type::Ref, 0),
-                    crate::history::test_support::rooted_resop_operand(Type::Int, 51),
+                    majit_ir::operand::Operand::const_from_value(Value::Int(0)),
                     crate::history::test_support::rooted_inputarg_operand(Type::Float, 60),
                 ],
                 real.clone(),
@@ -5477,7 +5474,7 @@ mod tests {
                 OpCode::SetinteriorfieldGc,
                 &[
                     crate::history::test_support::rooted_resop_operand(Type::Ref, 0),
-                    crate::history::test_support::rooted_resop_operand(Type::Int, 51),
+                    majit_ir::operand::Operand::const_from_value(Value::Int(0)),
                     crate::history::test_support::rooted_inputarg_operand(Type::Float, 61),
                 ],
                 imag.clone(),
@@ -5505,10 +5502,8 @@ mod tests {
         types[61] = Type::Float;
         opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&types);
         opt.snapshot_boxes = snapshots;
-        let mut constants = majit_ir::ConstMap::default();
-        constants.insert(50u32, Value::Int(1));
-        constants.insert(51u32, Value::Int(0));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 1024);
 
         // Forced reconstruction: NEW_ARRAY_CLEAR, 2× SETINTERIORFIELD_GC, CALL_N.
         assert_eq!(
@@ -5592,7 +5587,7 @@ mod tests {
                 OpCode::GuardClass,
                 &[
                     crate::history::test_support::rooted_resop_operand(Type::Ref, 0),
-                    crate::history::test_support::rooted_resop_operand(Type::Int, 200),
+                    majit_ir::operand::Operand::const_from_value(Value::Int(42)),
                 ],
             ),
         ];
@@ -5601,9 +5596,8 @@ mod tests {
         let mut opt = Optimizer::default_pipeline();
         let (ops, snapshots) = seed_virtualize_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
-        constants.insert(200u32, majit_ir::Value::Int(42)); // expected class ptr matches vtable
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 1024);
         // Both NEW_WITH_VTABLE (virtual) and GuardClass (redundant) removed
         assert!(
             result.is_empty(),
@@ -6180,14 +6174,14 @@ mod tests {
                 OpCode::GuardClass,
                 &[
                     crate::history::test_support::rooted_inputarg_operand(Type::Ref, 0),
-                    crate::history::test_support::rooted_resop_operand(Type::Int, 200),
+                    majit_ir::operand::Operand::const_from_value(Value::Int(42)),
                 ],
             ),
             Op::new(
                 OpCode::GuardClass,
                 &[
                     crate::history::test_support::rooted_inputarg_operand(Type::Ref, 0),
-                    crate::history::test_support::rooted_resop_operand(Type::Int, 200),
+                    majit_ir::operand::Operand::const_from_value(Value::Int(42)),
                 ],
             ),
         ];
@@ -6196,9 +6190,8 @@ mod tests {
         let mut opt = Optimizer::default_pipeline();
         let (ops, snapshots) = seed_virtualize_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
-        constants.insert(200u32, majit_ir::Value::Int(42)); // class ptr constant
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 1024);
         assert_eq!(
             result.len(),
             1,
@@ -6989,7 +6982,7 @@ mod tests {
                 OpCode::SetfieldGc,
                 &[
                     crate::history::test_support::rooted_resop_operand(Type::Ref, 2),
-                    crate::history::test_support::rooted_resop_operand(Type::Int, 100),
+                    majit_ir::operand::Operand::const_from_value(Value::Int(7)),
                 ],
                 value_fd.clone(),
             ),
@@ -7006,7 +6999,7 @@ mod tests {
                 OpCode::SetfieldGc,
                 &[
                     crate::history::test_support::rooted_resop_operand(Type::Ref, 5),
-                    crate::history::test_support::rooted_resop_operand(Type::Int, 101),
+                    majit_ir::operand::Operand::const_from_value(Value::Int(11)),
                 ],
                 value_fd.clone(),
             ),
@@ -7035,8 +7028,6 @@ mod tests {
 
         let mut opt = Optimizer::default_pipeline();
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
-        constants.insert(100u32, majit_ir::Value::Int(7));
-        constants.insert(101u32, majit_ir::Value::Int(11));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
         let new_positions: Vec<_> = result

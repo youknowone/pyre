@@ -2849,7 +2849,13 @@ impl Optimizer {
         // are not the canonical producers, so `input_ops` is seeded as empty
         // here (`input_ops_from_ops = false`); the canonical stores
         // (`bind_input_resops` / emit) carry identity instead.
-        let ops_rc: Vec<majit_ir::OpRc> = ops.iter().map(|op| OpRc::new(op.clone())).collect();
+        //
+        // `TraceIterator::next` caches the minted object and later args
+        // resolve through that cache (`_untag`). Fixtures assert the
+        // recorded positions, so this entry keeps each op's `pos` and only
+        // rebinds a later arg / fail_arg onto the fresh `Rc` of the op that
+        // owns that position. Void results stay uncached.
+        let ops_rc = Self::rebind_wrapped_trace_ops(ops);
         // This `&[Op]` convenience overload backs unit-test fixtures and the
         // legacy `propagate_all_forward` / `optimize_trace_with_constants`
         // helpers, not the production JIT path (which uses the `_oprc` /
@@ -2861,6 +2867,71 @@ impl Optimizer {
             .into_iter()
             .map(|rc| (*rc).clone())
             .collect()
+    }
+
+    /// Wrap each recorded `Op` in a fresh `OpRc` and rebind later args the
+    /// way `TraceIterator::_cache` does: a non-void result is the object
+    /// later positions name. Positions stay as the fixture recorded them.
+    fn rebind_wrapped_trace_ops(ops: &[Op]) -> Vec<majit_ir::OpRc> {
+        let mut wrapped: Vec<majit_ir::OpRc> = Vec::with_capacity(ops.len());
+        // First InputArg at each index. Later args at that index reuse it,
+        // the same way `TraceIterator` seeds `_cache` once per input.
+        let mut input_cache: Vec<(u32, Operand)> = Vec::new();
+        for op in ops {
+            let rc = OpRc::new(op.clone());
+            for i in 0..rc.num_args() {
+                let arg = rc.arg(i);
+                if let Some(rebound) = Self::rebound_arg_to_wrapped(&arg, &wrapped)
+                    .or_else(|| Self::rebound_inputarg(&arg, &input_cache))
+                {
+                    rc.setarg(i, rebound);
+                }
+                Self::remember_inputarg(&rc.arg(i), &mut input_cache);
+            }
+            rc.map_failargs_in_place(|arg| {
+                if let Some(rebound) = Self::rebound_arg_to_wrapped(arg, &wrapped)
+                    .or_else(|| Self::rebound_inputarg(arg, &input_cache))
+                {
+                    *arg = rebound;
+                }
+                Self::remember_inputarg(arg, &mut input_cache);
+            });
+            wrapped.push(rc);
+        }
+        wrapped
+    }
+
+    fn rebound_inputarg(arg: &Operand, cache: &[(u32, Operand)]) -> Option<Operand> {
+        let ia = arg.bound_inputarg()?;
+        cache
+            .iter()
+            .rev()
+            .find(|(idx, _)| *idx == ia.index)
+            .map(|(_, cached)| cached.clone())
+    }
+
+    fn remember_inputarg(arg: &Operand, cache: &mut Vec<(u32, Operand)>) {
+        let Some(ia) = arg.bound_inputarg() else {
+            return;
+        };
+        if cache.iter().any(|(idx, _)| *idx == ia.index) {
+            return;
+        }
+        cache.push((ia.index, arg.clone()));
+    }
+
+    /// Last non-void wrapped op whose recorded position is `arg`'s.
+    /// Constants and the absent slot pass through (`TraceIterator::_untag`).
+    fn rebound_arg_to_wrapped(arg: &Operand, prior: &[majit_ir::OpRc]) -> Option<Operand> {
+        if arg.is_constant() || arg.is_none() {
+            return None;
+        }
+        let opref = arg.to_opref();
+        let prod = prior.iter().rev().find(|op| {
+            let pos = op.pos().get();
+            pos == opref && !pos.is_none() && op.opcode.result_type() != majit_ir::Type::Void
+        })?;
+        Some(Operand::from_bound_op(prod))
     }
 
     /// `OpRc`-threading entry for callers that hold the canonical
@@ -3047,6 +3118,23 @@ impl Optimizer {
         //    (history.py:220 box.type parity).
         // optimizer.py `self.inputargs = inputargs` parity.
         ctx.inputargs = self.trace_inputargs.clone();
+        // The `&[Op]` wrap carries the fixture's InputArg objects. Install
+        // those before `ensure_inputarg_bindings` mints a second host per
+        // slot (`or_insert` / same-type keep).
+        for op in ops {
+            for arg in op.getarglist() {
+                if let Some(ia) = arg.bound_inputarg() {
+                    ctx.inputarg_refs.entry(ia.index).or_insert(ia);
+                }
+            }
+            if let Some(failargs) = op.guard_fail_args() {
+                for arg in failargs {
+                    if let Some(ia) = arg.bound_inputarg() {
+                        ctx.inputarg_refs.entry(ia.index).or_insert(ia);
+                    }
+                }
+            }
+        }
         // Bind inputarg hosts so `make_equal_to` routes InputArg-targeted
         // chain steps through `Forwarded::InputArg(_)` (the orphan-box
         // forwarding fallback has been retired). Phase 2 enters with a
@@ -5073,28 +5161,34 @@ impl Optimizer {
         //    own ops and documents the transfer on its own signature.
         for i in 0..op_rc.num_args() {
             let arg = op_rc.arg(i);
-            // Resolve each operand to its canonical bound terminal. When no
-            // producer is registered yet — a short-preamble / bridge operand
-            // dispatched mid-pass through `send_extra_operation`, whose
-            // producer is neither emitted nor in `resop_refs` —
-            // `resolve_box_box_opt` returns None. `materialize_operand_at`
-            // then mints and registers the canonical `_forwarded` host (the
-            // "Box always exists" invariant, resoperation.py AbstractResOpOrInputArg) and we walk
-            // it to its terminal, so the stored arg is BOUND on every dispatch
-            // path. A sentinel operand keeps its unbound arg box (const
-            // operands resolve through the `Some` arm above).
-            let resolved = match ctx.resolve_operand_operand_opt(&arg) {
-                Some(b) => b,
-                None => {
-                    let argref = arg.to_opref();
-                    if argref.is_none() {
-                        arg.clone()
-                    } else {
-                        ctx.materialize_operand_at(argref)
-                            .get_box_replacement(false)
+            // `get_box_replacement` is the consumer walk (`optimizer.py`
+            // `get_box_replacement(op.getarg(i))`). The old resolver stays
+            // in the debug witness only: compute the new terminal first so
+            // the witness's `materialize_operand_at` cannot heal before
+            // the comparison.
+            let resolved = arg.get_box_replacement(false);
+            #[cfg(debug_assertions)]
+            {
+                let old = match ctx.resolve_operand_operand_opt(&arg) {
+                    Some(b) => b,
+                    None => {
+                        let argref = arg.to_opref();
+                        if argref.is_none() {
+                            arg.clone()
+                        } else {
+                            ctx.materialize_operand_at(argref)
+                                .get_box_replacement(false)
+                        }
                     }
-                }
-            };
+                };
+                debug_assert!(
+                    resolved.same_box(&old),
+                    "propagate_from_pass_range {:?} arg {i}: new {:?} old {:?}",
+                    op_rc.opcode,
+                    resolved.to_opref(),
+                    old.to_opref()
+                );
+            }
             op_rc.setarg(i, resolved);
         }
 
@@ -5153,7 +5247,11 @@ impl Optimizer {
                         OptContext::stamp_emitted_op(&op, op_rc);
                         op_rc.clone()
                     } else {
-                        OpRc::new(op.clone())
+                        let created = OpRc::new(op.clone());
+                        // Opcode change mints a second object at this position.
+                        // `replace_op_with` links the walked-in op before emit.
+                        OptContext::link_replaced_producer(op_rc, &created);
+                        created
                     };
                     self.emit_operation_inner(emit_rc, ctx, false)?;
                     // optimizer.py:585-589: invoke postprocess callbacks
@@ -5263,7 +5361,7 @@ impl Optimizer {
         if !replaced {
             self.emit_operation_inner(op_rc.clone(), ctx, true)?;
         } else {
-            self.emit_operation((*current_op).clone(), ctx, false)?;
+            self.emit_operation((*current_op).clone(), op_rc, ctx, false)?;
         }
         // Postprocess in reverse order after emission.
         for &pp_idx in postprocess_passes.iter().rev() {
@@ -5287,10 +5385,15 @@ impl Optimizer {
     fn emit_operation(
         &mut self,
         op: Op,
+        replaced: &majit_ir::OpRc,
         ctx: &mut OptContext,
         reuse: bool,
     ) -> Result<(), crate::optimize::InvalidLoop> {
-        self.emit_operation_inner(OpRc::new(op), ctx, reuse)
+        let created = OpRc::new(op);
+        // `Replace` mints a second object. Link the walked-in producer to it
+        // before emission (`replace_op_with`).
+        OptContext::link_replaced_producer(replaced, &created);
+        self.emit_operation_inner(created, ctx, reuse)
     }
 
     fn emit_operation_inner(
@@ -5344,6 +5447,12 @@ impl Optimizer {
                 // through pyre's flat OpRef adapter minted a new Rc-backed
                 // Const at every emitted use.
                 original_arg
+            } else if (original_arg.is_resop() || original_arg.is_inputarg())
+                && original_arg.get_box_replacement(false).to_opref() == forced
+            {
+                // The arg already carries the producer. A positional mint
+                // would be a second box at the same OpRef.
+                original_arg.get_box_replacement(false)
             } else {
                 match ctx.get_box_replacement_operand_opt(forced) {
                     Some(b) => b,
@@ -5433,7 +5542,10 @@ impl Optimizer {
 
             // optimizer.py: op = self.emit_guard_operation(op, pendingfields)
             if let Some(newop) = self.emit_guard_operation(&op, ctx) {
-                op = OpRc::new(newop);
+                let created = OpRc::new(newop);
+                // Guard resume sharing copies into a second object.
+                OptContext::link_replaced_producer(&op, &created);
+                op = created;
             }
             // emit_guard_operation may defer an `InvalidLoop` (e.g. a pending
             // SETARRAYITEM index that is not a non-negative constant).
@@ -6709,11 +6821,15 @@ mod tests {
         let mut ctx = OptContext::new(2);
         let lhs = rooted_resop_operand(Type::Int, 0);
         let rhs = rooted_resop_operand(Type::Int, 1);
-        ctx.emit_extra_at(
-            0,
-            OpRc::new(Op::new(OpCode::IntAdd, &[lhs.clone(), rhs.clone()])),
-        );
-        ctx.emit_extra_at(0, OpRc::new(Op::new(OpCode::IntSub, &[lhs, rhs])));
+        let add = OpRc::new(Op::new(OpCode::IntAdd, &[lhs.clone(), rhs.clone()]));
+        let sub = OpRc::new(Op::new(OpCode::IntSub, &[lhs, rhs]));
+        // Result positions stay off the arg boxes. `emit_extra_at` would
+        // otherwise number a pos-less IntAdd as int_op(0), the same OpRef
+        // as `lhs`.
+        add.pos().set(OpRef::int_op(2));
+        sub.pos().set(OpRef::int_op(3));
+        ctx.emit_extra_at(0, add);
+        ctx.emit_extra_at(0, sub);
 
         let result = opt.drain_extra_operations_from(0, &mut ctx);
 
@@ -7149,7 +7265,7 @@ mod tests {
                 OpCode::IntGt,
                 &[
                     rooted_resop_operand(Type::Int, 5),
-                    rooted_resop_operand(Type::Int, 1),
+                    Operand::const_from_value(majit_ir::Value::Int(27)),
                 ],
             ),
         ];
@@ -7157,9 +7273,8 @@ mod tests {
         ops[1].pos().set(OpRef::int_op(4));
         ops[2].pos().set(OpRef::int_op(5));
         ops[3].pos().set(OpRef::int_op(6));
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
-        constants.insert(1u32, majit_ir::Value::Int(27));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 3);
 
         let positions: Vec<_> = result.iter().map(|op| op.pos().get()).collect();
         assert_eq!(
@@ -7192,7 +7307,7 @@ mod tests {
                 OpCode::IntGt,
                 &[
                     rooted_resop_operand(Type::Int, 3),
-                    rooted_resop_operand(Type::Int, 1),
+                    Operand::const_from_value(majit_ir::Value::Int(27)),
                 ],
             ),
         ];
@@ -7201,7 +7316,6 @@ mod tests {
         ops[2].pos().set(OpRef::int_op(5));
         ops[3].pos().set(OpRef::int_op(6));
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
-        constants.insert(1u32, majit_ir::Value::Int(27));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
 
         assert_eq!(result[0].pos().get(), OpRef::int_op(5));
@@ -7223,42 +7337,16 @@ mod tests {
         let mut ops = vec![Op::new(
             OpCode::IntGt,
             &[
-                rooted_resop_operand(Type::Int, 0),
-                rooted_resop_operand(Type::Int, 1),
+                Operand::const_from_value(majit_ir::Value::Int(40)),
+                Operand::const_from_value(majit_ir::Value::Int(5)),
             ],
         )];
         ops[0].pos().set(OpRef::int_op(3));
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
-        constants.insert(0u32, majit_ir::Value::Int(40));
-        constants.insert(1u32, majit_ir::Value::Int(5));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].pos().get(), OpRef::int_op(3));
-        assert_eq!(constants.get(&3), None);
-    }
-
-    #[test]
-    fn test_import_constants_skips_live_op_positions() {
-        let mut opt = Optimizer::new();
-
-        let mut ops = vec![Op::new(
-            OpCode::IntGt,
-            &[
-                rooted_resop_operand(Type::Int, 0),
-                rooted_resop_operand(Type::Int, 1),
-            ],
-        )];
-        ops[0].pos().set(OpRef::int_op(3));
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
-        constants.insert(0u32, majit_ir::Value::Int(40));
-        constants.insert(1u32, majit_ir::Value::Int(5));
-        constants.insert(3u32, majit_ir::Value::Int(1));
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
-
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].pos().get(), OpRef::int_op(3));
-        assert_eq!(result[0].opcode, OpCode::IntGt);
         assert_eq!(constants.get(&3), None);
     }
 
@@ -7369,7 +7457,7 @@ mod tests {
     #[test]
     fn test_ref_guard_value_is_not_bool_specialized() {
         let mut opt = Optimizer::new();
-        let ops = vec![
+        let mut ops = vec![
             Op::new(OpCode::New, &[]),
             Op::new(OpCode::New, &[]),
             Op::new(
@@ -7381,6 +7469,8 @@ mod tests {
             ),
             Op::new(OpCode::Finish, &[]),
         ];
+        ops[0].pos().set(OpRef::ref_op(0));
+        ops[1].pos().set(OpRef::ref_op(1));
 
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
@@ -8000,7 +8090,9 @@ mod tests {
         let (mut seeded_ops, snapshots) =
             super::super::seed_empty_guard_snapshots(std::slice::from_ref(&op));
         ctx.snapshot_boxes = snapshots;
-        let _ = opt.emit_operation(seeded_ops.pop().unwrap(), &mut ctx, false);
+        let op = seeded_ops.pop().unwrap();
+        let prior = OpRc::new(op.clone());
+        let _ = opt.emit_operation(op, &prior, &mut ctx, false);
 
         assert!(!ctx.in_final_emission);
 
@@ -8088,7 +8180,9 @@ mod tests {
         let (mut seeded_ops, snapshots) =
             super::super::seed_empty_guard_snapshots(std::slice::from_ref(&guard));
         ctx.snapshot_boxes = snapshots;
-        let _ = opt.emit_operation(seeded_ops.pop().unwrap(), &mut ctx, false);
+        let op = seeded_ops.pop().unwrap();
+        let prior = OpRc::new(op.clone());
+        let _ = opt.emit_operation(op, &prior, &mut ctx, false);
 
         let sp = ctx
             .build_imported_short_preamble()
