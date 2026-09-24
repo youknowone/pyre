@@ -348,6 +348,17 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
         "_orig_compare_tuples",
         "rlib/jit.py look_inside_iff unroll_safe(_compare_tuples)",
     ),
+    // `intobject.py _pow_mod` / `_pow_nomod` are
+    // `@jit.look_inside_iff(... jit.isconstant(iw) ...)`. With the descent,
+    // no synth fixture's recorded `fbw_rolled_back_with_effects` moved.
+    (
+        "_orig__pow_mod",
+        "rlib/jit.py look_inside_iff unroll_safe(_pow_mod)",
+    ),
+    (
+        "_orig__pow_nomod",
+        "rlib/jit.py look_inside_iff unroll_safe(_pow_nomod)",
+    ),
     ("_flat_pycall", "function.py _flat_pycall"),
     ("_flat_pycall_defaults", "function.py _flat_pycall_defaults"),
     ("action_dispatcher", "executioncontext.py action_dispatcher"),
