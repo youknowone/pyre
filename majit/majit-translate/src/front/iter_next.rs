@@ -64,8 +64,8 @@ use crate::front::result_exc::{
     follow_single_exit, op_operand_vars, split_diamond_exits,
 };
 use crate::model::{
-    BlockId, CallTarget, ExitCase, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind,
-    SpaceOperation, ValueType,
+    CallTarget, ExitCase, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind, SpaceOperation,
+    ValueType,
 };
 
 /// The `[__iter_next]` FunctionPath marker the rewrite emits in place of
