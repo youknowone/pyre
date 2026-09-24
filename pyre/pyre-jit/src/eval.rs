@@ -5654,6 +5654,9 @@ fn build_jit_driver_pair() -> JitDriverPair {
     majit_metainterp::set_resolve_exception_context_hook(Some(
         crate::call_jit::resolve_exception_context,
     ));
+    majit_metainterp::set_symbolic_fnaddr_path_resolver(Some(
+        pyre_jit_trace::runtime_fnaddr_patch::symbolic_fnaddr_path,
+    ));
     // `quasiimmut.py do_force_quasi_immutable`'s host half — the blackhole
     // computes the hidden mutate field's address, pyre unlinks the instance
     // and flips every loop flag it recorded.

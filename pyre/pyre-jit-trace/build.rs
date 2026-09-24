@@ -150,4 +150,9 @@ fn emit_llbc_extraction_placeholders() {
         )
         .unwrap();
     }
+    std::fs::write(
+        format!("{out_dir}/symbolic_fnaddr_paths.bin"),
+        bincode::serialize(&Vec::<(i64, String)>::new()).unwrap(),
+    )
+    .unwrap();
 }
