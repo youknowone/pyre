@@ -59,9 +59,14 @@ fn pythonstartup_syntaxwarning_filename_matches_file() {
         "SyntaxWarning filename was lossy: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let surrogate = [0xed, 0xb3, 0xbf];
+    // The fsdecoded name carries U+DCFF; `sys.stderr` writes it through
+    // `errors='backslashreplace'` as the ASCII text `\udcff`.
+    let escaped = br"start\udcff.py";
     assert!(
-        output.stderr.windows(3).any(|bytes| bytes == surrogate) || output.stderr.contains(&0xff),
+        output
+            .stderr
+            .windows(escaped.len())
+            .any(|bytes| bytes == escaped),
         "SyntaxWarning filename is not the fsdecoded path: {}",
         String::from_utf8_lossy(&output.stderr)
     );
