@@ -334,9 +334,17 @@ def main() -> int:
 
     gone_names = {s for _, s in pair_gone}
     added_names = {s for _, s in pair_added}
-    gone_keys = {module_move_key(s) for s in gone_names}
-    added_names = {s for s in added_names if module_move_key(s) not in gone_keys}
-    gone_names = {s for s in gone_names if module_move_key(s) not in {module_move_key(a) for a in (s for _, s in pair_added)}}
+
+    def prefix_moved(name: str, other: set[str]) -> bool:
+        key = module_move_key(name)
+        # Same spelling is a class change, not a crate move. Keep it so
+        # `relocated` still reports old class -> new class.
+        if key == name:
+            return False
+        return any(module_move_key(o) == key and o != name for o in other)
+
+    added_names = {s for s in added_names if not prefix_moved(s, gone_names)}
+    gone_names = {s for s in gone_names if not prefix_moved(s, {s for _, s in pair_added})}
     added = sorted((c, s) for c, s in pair_added if s in added_names)
     gone = sorted((c, s) for c, s in pair_gone if s in gone_names)
     relocated = sorted(
