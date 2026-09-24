@@ -601,38 +601,6 @@ pub extern "C" fn jit_mapdict_unboxed_write_f(
 /// opcode-default empty write set would let optheap CSE a getfield
 /// across the call: `acc = acc + a; acc = acc + b` at module level then
 /// reuses the pre-store cell value and drops the first term.
-/// i64-in / i64-out walker helpers for `vouch_residual_call_addr_returning_word`.
-/// These are already spelled in machine words; Vouched mode will not
-/// `call_indirect` them unless they are named.
-pub fn walker_word_helper_addrs() -> Vec<i64> {
-    [
-        jit_dict_exact_int_lookup_or_null as *const () as usize as i64,
-        jit_dict_exact_int_lookup_index as *const () as usize as i64,
-        jit_dict_int_value_at as *const () as usize as i64,
-        jit_dict_value_at as *const () as usize as i64,
-        jit_force_vref as *const () as usize as i64,
-        jit_init_kwdefaults_dict as *const () as usize as i64,
-        jit_getexecutioncontext as *const () as usize as i64,
-        jit_dict_exact_unicode_lookup_or_null as *const () as usize as i64,
-        jit_lookup_where_with_method_cache as *const () as usize as i64,
-        jit_instance_getdictvalue as *const () as usize as i64,
-        jit_mapdict_read as *const () as usize as i64,
-        jit_format_w as *const () as usize as i64,
-        jit_hash_normalize_digest as *const () as usize as i64,
-        jit_bare_super_from_frame as *const () as usize as i64,
-    ]
-    .into()
-}
-
-/// Void word-ABI walker helpers (`-> ()` with i64 parameters).
-pub fn walker_void_word_helper_addrs() -> Vec<i64> {
-    [
-        jit_mapdict_boxed_write as *const () as usize as i64,
-        jit_mapdict_unboxed_write_raw as *const () as usize as i64,
-    ]
-    .into()
-}
-
 pub fn emit_trace_call_void_word_abi(
     ctx: &mut TraceCtx,
     helper: *const (),

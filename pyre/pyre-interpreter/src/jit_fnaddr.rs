@@ -3799,15 +3799,14 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // word, drains a pending memory-error bit, and services stop-the-world /
     // finalization requests through these cross-crate helpers.
     //
-    // The value-returning ones ride a word-ABI bridge.  A residual whose
-    // result is Int/Ref lowers to a direct `call_indirect` typed
-    // `(i64 x n) -> i64` (`ResidualCallAbi::Word`, the default), and a Rust
-    // `-> usize` / `-> bool` / `&T` argument is narrower than a word on
-    // wasm32, where the call type-checks its callee.  The two `-> ()` polls
-    // keep their plain rows because they take no arguments: `() -> ()` is the
-    // type the void residual family declares on every target.  A void residual
-    // that DOES take arguments needs a bridge like any other, which is why
-    // `frame_anchor_release` has one.
+    // The value-returning ones ride a word-ABI bridge. A residual whose
+    // result is Int/Ref is emitted from the call descr as `(i64 x n) -> i64`,
+    // and a Rust `-> usize` / `-> bool` / `&T` argument is narrower than a
+    // word on wasm32, where `call_indirect` type-checks its callee. The two
+    // `-> ()` polls keep their plain rows because they take no arguments:
+    // `() -> ()` is the type the void residual family declares. A void
+    // residual that takes arguments needs a bridge like any other, which is
+    // why `frame_anchor_release` has one.
     cp0(
         &mut entries,
         "majit_ir::eval_breaker_word::load",

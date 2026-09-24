@@ -2438,9 +2438,15 @@ pub fn rewrite_ops_for_gc_with(
     let out_constants = constants.clone();
     let ops: Vec<Op> = rewritten.iter().map(|rc| (**rc).clone()).collect();
     let table = (!gcrefs.is_empty()).then(|| majit_gc::GcTable::from_gcrefs(&gcrefs));
-    let gc_table_base = table.as_ref().map_or(0, |t| t.base_addr() as u32);
-    codegen::bind_failarg_const_table(&gcrefs, gc_table_base);
     (ops, out_constants, table)
+}
+
+/// `GcTable::compile_key` list, slot order. Empty when this compile has no table.
+fn gc_const_keys_of(table: Option<&majit_gc::GcTable>) -> Vec<usize> {
+    let Some(table) = table else {
+        return Vec::new();
+    };
+    (0..table.len()).map(|i| table.compile_key(i)).collect()
 }
 
 /// rewrite.py `gen_malloc_fixedsize` / gc.py `malloc_big_fixedsize(size, tid)`.
@@ -3135,110 +3141,32 @@ pub fn ca_deopt_helper_slot() -> u32 {
     CA_DEOPT_HELPER_SLOT.load(Ordering::Relaxed) as u32
 }
 
-/// Publish the residual-call targets whose call descr describes their real
-/// wasm ABI, so codegen may lower them to a typed in-module `call_indirect`
-/// instead of the `jit_call` host trampoline.
-///
-/// This is an exact-function allow-list, not a signature inference, for the
-/// same reason [`ca_deopt_helper_slot`]'s twin in `pyre-wasm`
-/// (`direct_uniform_i64_call`) is one: a descr `Float` does not prove the wasm
-/// parameter is `f64`, and an `Int` or `Ref` beside it may be a real `i32`
-/// pointer -- `jit_bigint_to_f64_or_inf(&BigInt) -> f64` is published raw and
-/// is genuinely `(i32) -> f64`. Emitting a guessed signature traps at the
-/// `call_indirect`. A caller vouches for each address by naming the function.
-///
-/// Addresses are `fn as usize`, which on wasm32 is the table index.
-pub fn set_faithful_residual_call_addrs(addrs: &[i64]) {
-    FAITHFUL_RESIDUAL_CALL_ADDRS.with(|set| {
-        let mut set = set.borrow_mut();
-        set.clear();
-        set.extend(addrs.iter().copied());
-    });
-}
-
-thread_local! {
-    /// Per thread, and that is the whole process wherever the set is consulted for
-    /// real: every registration a shipped build makes is compiled only for wasm32,
-    /// and a module instance there is one thread.
-    ///
-    /// Two properties keep a wider store from being owed anyway. A lookup that
-    /// misses is answered by the reflecting host trampoline, so a registration on
-    /// one thread and a question on another costs a round trip and never a wrong
-    /// signature -- the direction that traps is a spurious *hit*, which per-thread
-    /// storage cannot manufacture. And a caller replacing the whole list leaves
-    /// every other thread's alone, so two of them may run at once.
-    static FAITHFUL_RESIDUAL_CALL_ADDRS: RefCell<std::collections::HashSet<i64>> =
-        RefCell::new(std::collections::HashSet::new());
-}
-
-/// Vouch for one more callee, leaving the rest of the set alone.
-///
-/// [`set_faithful_residual_call_addrs`] is the embedder's whole list, declared
-/// once. This is for a producer that mints word-spelled call targets as it
-/// goes: the address does not exist until the target is built, so it cannot be
-/// in a list written ahead of time, and the producer that built it is the one
-/// that knows how it is spelled.
-pub fn vouch_residual_call_addr(addr: i64) {
-    FAITHFUL_RESIDUAL_CALL_ADDRS.with(|set| {
-        set.borrow_mut().insert(addr);
-    });
-}
-
-/// Whether `addr` was vouched for by [`set_faithful_residual_call_addrs`] or
-/// [`vouch_residual_call_addr`].
-pub(crate) fn residual_call_descr_is_faithful(addr: i64) -> bool {
-    FAITHFUL_RESIDUAL_CALL_ADDRS.with(|set| set.borrow().contains(&addr))
-}
-
-thread_local! {
-    /// Per thread for the same reason [`FAITHFUL_RESIDUAL_CALL_ADDRS`] is.
-    /// Residual targets are guest-static table entries present from
-    /// instantiation (`fn as usize` on wasm32 is that table index), so both
-    /// a known encoding and a `0` unknown answer are stable for the life of
-    /// the instance and are cached.
-    static RESIDUAL_TARGET_SIG_CACHE: RefCell<HashMap<i64, i64>> =
-        RefCell::new(HashMap::new());
-}
-
 #[cfg(any(test, not(target_arch = "wasm32")))]
 thread_local! {
-    static TEST_RESIDUAL_TARGET_SIGS: RefCell<HashMap<i64, i64>> =
-        RefCell::new(HashMap::new());
+    static TEST_RESIDUAL_TARGET_SIGS: std::cell::RefCell<HashMap<i64, i64>> =
+        std::cell::RefCell::new(HashMap::new());
 }
 
-/// Install a `jit_func_sig` encoding for host-side tests and native compiles.
+/// Install a `jit_func_sig` encoding for host-side tests. Production reads
+/// the function table directly and does not keep a map.
 #[cfg(any(test, not(target_arch = "wasm32")))]
 pub fn set_test_residual_target_sig(addr: i64, encoded: i64) {
     TEST_RESIDUAL_TARGET_SIGS.with(|map| {
         map.borrow_mut().insert(addr, encoded);
     });
-    RESIDUAL_TARGET_SIG_CACHE.with(|cache| {
-        cache.borrow_mut().remove(&addr);
-    });
 }
 
-/// Drop every injected encoding and the guest-side cache.
+/// Drop every injected encoding.
 #[cfg(any(test, not(target_arch = "wasm32")))]
 pub fn clear_test_residual_target_sigs() {
     TEST_RESIDUAL_TARGET_SIGS.with(|map| map.borrow_mut().clear());
-    RESIDUAL_TARGET_SIG_CACHE.with(|cache| cache.borrow_mut().clear());
 }
 
-/// The callee's real wasm signature, if the host oracle knows it.
-///
-/// Residual targets are guest-static function-table slots, so a miss is
-/// cached as well as a hit: the slot cannot be filled later with a different
-/// type.
+/// Declared wasm type of table slot `addr`, or `None` when the slot is not a
+/// function in this module's table. No address-keyed cache: each lookup reads
+/// the table (or the test injection).
 pub fn residual_target_sig(addr: i64) -> Option<WasmSig> {
-    let cached = RESIDUAL_TARGET_SIG_CACHE.with(|cache| cache.borrow().get(&addr).copied());
-    let encoded = cached.unwrap_or_else(|| {
-        let encoded = query_residual_target_sig(addr);
-        RESIDUAL_TARGET_SIG_CACHE.with(|cache| {
-            cache.borrow_mut().insert(addr, encoded);
-        });
-        encoded
-    });
-    decode_func_sig(encoded)
+    decode_func_sig(query_residual_target_sig(addr))
 }
 
 fn query_residual_target_sig(addr: i64) -> i64 {
@@ -3260,6 +3188,7 @@ fn query_residual_target_sig(addr: i64) -> i64 {
     }
     #[cfg(not(all(target_arch = "wasm32", any(feature = "host-import", feature = "web"))))]
     {
+        let _ = addr;
         0
     }
 }
@@ -3278,81 +3207,6 @@ mod jit_func_sig_web {
     unsafe extern "C" {
         pub fn jit_func_sig(slot: i32) -> i64;
     }
-}
-
-/// [`vouch_residual_call_addr`] for a target whose *result* is a word too, so
-/// its whole wasm signature is the uniform `(i64…) -> i64`.
-///
-/// The parameter half is what a compiled call needs to know; this is the half
-/// [`direct_word_abi_call`] needs, because a caller reaching a target through
-/// a raw address has no descr telling it whether the callee returns anything.
-/// A void target vouched here would be called as if it returned a word, which
-/// is the same type error the vouching exists to avoid.
-pub fn vouch_residual_call_addr_returning_word(addr: i64) {
-    vouch_residual_call_addr(addr);
-    WORD_RESULT_RESIDUAL_CALL_ADDRS.with(|set| {
-        set.borrow_mut().insert(addr);
-    });
-}
-
-thread_local! {
-    /// Per thread for the reasons [`FAITHFUL_RESIDUAL_CALL_ADDRS`] is, and it is
-    /// read on the thread that wrote it for one more: the producer minting a
-    /// word-spelled target and the guest call reaching that target are the same
-    /// thread by construction, since the target's address is a table index in the
-    /// instance that minted it.
-    static WORD_RESULT_RESIDUAL_CALL_ADDRS: RefCell<std::collections::HashSet<i64>> =
-        RefCell::new(std::collections::HashSet::new());
-}
-
-/// Call a residual target from inside the guest, when its whole signature is
-/// the uniform `(i64…) -> i64` and this backend was told so.
-///
-/// The recording and blackhole paths reach a target through a raw address and
-/// no descr, and wasm32 `call_indirect` type-checks the callee: transmuting
-/// that address to the signature the residual call carries traps unless the
-/// callee really is spelled that way. So those paths hand the call to a host
-/// that reflects the callee's declared type first — a guest→host→guest round
-/// trip per call. For a target vouched by
-/// [`vouch_residual_call_addr_returning_word`] the transmute is exactly right
-/// and the round trip buys nothing.
-///
-/// `None` means the caller still owes the reflecting path: the address was not
-/// vouched for, or its arity is past what a residual call can carry.
-#[cfg(target_arch = "wasm32")]
-pub fn direct_word_abi_call(func_ptr: usize, args: &[i64]) -> Option<i64> {
-    if !WORD_RESULT_RESIDUAL_CALL_ADDRS.with(|set| set.borrow().contains(&(func_ptr as i64))) {
-        return None;
-    }
-    // One arm per arity: the transmuted type has to name the parameters, and
-    // wasm has no variadic call. `MAX_CALL_ARGS` bounds what a residual call
-    // can carry, so an arity past the arms below cannot arrive here.
-    macro_rules! arms {
-        ($( [$($arg:ident),*] ),* $(,)?) => {
-            match args {
-                $(
-                    [$($arg),*] => {
-                        let f: extern "C" fn($(arms!(@i64 $arg)),*) -> i64 =
-                            unsafe { std::mem::transmute(func_ptr) };
-                        Some(f($(*$arg),*))
-                    }
-                )*
-                _ => None,
-            }
-        };
-        (@i64 $arg:ident) => { i64 };
-    }
-    arms![
-        [],
-        [a0],
-        [a0, a1],
-        [a0, a1, a2],
-        [a0, a1, a2, a3],
-        [a0, a1, a2, a3, a4],
-        [a0, a1, a2, a3, a4, a5],
-        [a0, a1, a2, a3, a4, a5, a6],
-        [a0, a1, a2, a3, a4, a5, a6, a7],
-    ]
 }
 
 /// Install the wasm guest-side residual-call trampoline.
@@ -3379,9 +3233,6 @@ pub fn residual_host_call(func_ptr: usize, args: &[i64]) -> i64 {
         "residual_host_call: arity {} exceeds {MAX_CALL_ARGS}",
         args.len()
     );
-    if let Some(result) = direct_word_abi_call(func_ptr, args) {
-        return result;
-    }
     let base = RESIDUAL_CALL_SCRATCH.0.get() as *mut u8;
     unsafe {
         (base.add(CALL_FUNC_OFS as usize) as *mut i64).write_unaligned(func_ptr as i64);
@@ -3606,8 +3457,6 @@ impl WasmBackend {
         let (ops, gcrefs) =
             majit_gc::rewrite::remove_ref_constants_for_inputs(&ops, next_pos, &input_indices);
         let table = (!gcrefs.is_empty()).then(|| majit_gc::GcTable::from_gcrefs(&gcrefs));
-        let gc_table_base = table.as_ref().map_or(0, |t| t.base_addr() as u32);
-        codegen::bind_failarg_const_table(&gcrefs, gc_table_base);
         (ops, table)
     }
 
@@ -3635,18 +3484,6 @@ impl WasmBackend {
                 descrs.iter().filter_map(|d| d.meta_descr.clone()).collect();
             let tracer: Arc<dyn std::any::Any + Send + Sync> = Arc::new(meta);
             clt.asmmemmgr_gcreftracers.lock().push(tracer);
-        }
-    }
-
-    fn rebind_failarg_const_tables(token: &JitCellToken) {
-        codegen::bind_failarg_const_table(&[], 0);
-        let Some(clt) = token.compiled_loop_token() else {
-            return;
-        };
-        for tracer in clt.asmmemmgr_gcreftracers.lock().iter() {
-            if let Some(table) = tracer.downcast_ref::<majit_gc::GcTable>() {
-                codegen::extend_failarg_const_table_from_gc_table(table);
-            }
         }
     }
 
@@ -4160,10 +3997,6 @@ impl WasmBackend {
         // Key-0 still clears the full used-label range.
         inputs.ca.home_gcmap_min_ordinary = compiled.num_ref_homes.get();
         inputs.ca.home_gcmap_min_labels = compiled.used_label_homes.get();
-        // The just-compiled bridge rebuilt the TLS ConstPtr map. Restore
-        // every table pinned on this token so owner/region force-arm
-        // ConstPtrs rematerialize after collection.
-        Self::rebind_failarg_const_tables(token);
         let mut asm_resources = release::LoopAsmResources::default();
         inputs.ca.gcmap_sink = &mut asm_resources as *mut _ as usize;
         let (wasm_bytes, guard_exits, merged_ref_homes, merged_labels) =
@@ -5360,6 +5193,7 @@ impl majit_backend::Backend for WasmBackend {
             nursery: nursery_alloc_params(ops),
             invalidated_flag_addr: Arc::as_ptr(&token.invalidated) as usize as u32,
             gc_table_base,
+            gc_const_keys: gc_const_keys_of(gc_table.as_deref()),
             fail_index_base,
             bridge_cells_base,
             bridge_entry_arity: None,
@@ -6324,6 +6158,7 @@ impl majit_backend::Backend for WasmBackend {
                             inputargs: inputargs.iter().cloned().collect(),
                             ops: ops_owned.clone(),
                             gc_table_base,
+                            gc_const_keys: gc_const_keys_of(gc_table.as_deref()),
                             constants: self.constants.clone(),
                         };
                         if self.install_inline_region(&owner, region) {
@@ -6430,6 +6265,7 @@ impl majit_backend::Backend for WasmBackend {
                 inputargs: inputargs.iter().cloned().collect(),
                 ops: ops_owned.clone(),
                 gc_table_base,
+                gc_const_keys: gc_const_keys_of(gc_table.as_deref()),
                 constants: self.constants.clone(),
             };
             // The owner's size prices this merge. The source guard's cell
@@ -6464,6 +6300,7 @@ impl majit_backend::Backend for WasmBackend {
             nursery: nursery_alloc_params(ops),
             invalidated_flag_addr: Arc::as_ptr(&bridge_flag) as usize as u32,
             gc_table_base,
+            gc_const_keys: gc_const_keys_of(gc_table.as_deref()),
             fail_index_base: base,
             bridge_cells_base,
             bridge_entry_arity,
@@ -8222,6 +8059,7 @@ mod tests {
             nursery: None,
             invalidated_flag_addr: 0,
             gc_table_base: 0,
+            gc_const_keys: Vec::new(),
             fail_index_base: 0,
             bridge_cells_base: 0,
             bridge_entry_arity: None,

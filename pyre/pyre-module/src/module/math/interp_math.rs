@@ -836,37 +836,6 @@ pub fn math_builtin_name(callable: PyObjectRef) -> Option<&'static str> {
     .find(|&(_, addr)| addr == wrapper)
     .map(|(name, _)| name)
 }
-
-/// The residual targets `math` vouches for as faithful to their wasm ABI.
-pub fn math_faithful_residual_call_addrs() -> Vec<i64> {
-    let mut addrs = vec![
-        // (f64) -> i64
-        jit_math_frexp_exponent as *const () as usize as i64,
-        // (f64, i64) -> f64
-        jit_math_ldexp_raw as *const () as usize as i64,
-        // (f64, f64) -> i64
-        jit_math_isclose_default as *const () as usize as i64,
-    ];
-    addrs.extend(math_float_fold_helper_addrs());
-    addrs
-}
-
-/// Addresses of the `math` float-fold helpers for
-/// `set_faithful_residual_call_addrs`. Each is `(f64) -> f64` or
-/// `(f64, f64) -> f64`, which the wasm backend will not lower from a
-/// descr's word types alone.
-pub fn math_float_fold_helper_addrs() -> Vec<i64> {
-    MATH_FLOAT1_FOLDS
-        .iter()
-        .map(|fold| fold.raw as *const () as usize as i64)
-        .chain(
-            MATH_FLOAT2_FOLDS
-                .iter()
-                .map(|fold| fold.raw as *const () as usize as i64),
-        )
-        .collect()
-}
-
 pub fn cbrt(args: &[PyObjectRef]) -> PyResult {
     math1_pymath("cbrt", args, pymath::math::cbrt, |_| {
         "math domain error".to_string()

@@ -11,7 +11,6 @@
 ///
 /// The residual-call trampoline scratch is stored separately at the static
 /// base returned by `jit_call_area_addr`.
-use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -145,65 +144,30 @@ pub(crate) const FORCE_TAKEN_BIT: i64 = 1 << 32;
 /// (al, ah, bl, bh, mid1).
 const UMULHI_SCRATCH: u32 = 5;
 
-thread_local! {
-    /// Per-table ConstPtr maps: `gc_table_base -> (compile_key -> slot index)`.
-    /// Nursery addresses can be reused after a collection, so two retained
-    /// tables may share a compile-time key. Lookup is scoped to the region
-    /// being emitted.
-    static FAILARG_CONST_TABLE: RefCell<HashMap<u32, HashMap<usize, u32>>> =
-        RefCell::new(HashMap::new());
+/// Compile-time ConstPtr identities of the `GcTable`s this emit owns, in
+/// slot order under each table's `base_addr`.
+///
+/// `GcTable::compile_key` is the address `store_info_on_descr` leaves in the
+/// assembler's constant-pointer table. A later collection forwards the slot;
+/// the key does not change. Lookup is the emitting region's base, so two
+/// tables that reuse one nursery address do not share a slot.
+struct ConstPtrTables {
+    entries: Vec<(u32, Vec<usize>)>,
 }
 
-/// Bind the rewrite's gcref list so a ConstPtr failarg can rematerialize
-/// from the same table `LoadFromGcTable` uses. Empty `gcrefs` clears it.
-pub fn bind_failarg_const_table(gcrefs: &[majit_ir::GcRef], gc_table_base: u32) {
-    FAILARG_CONST_TABLE.with(|cell| {
-        let mut map = cell.borrow_mut();
-        map.clear();
-        if gcrefs.is_empty() {
+impl ConstPtrTables {
+    fn push(&mut self, base: u32, keys: &[usize]) {
+        if keys.is_empty() || self.entries.iter().any(|(b, _)| *b == base) {
             return;
         }
-        let mut inner = HashMap::with_capacity(gcrefs.len());
-        for (i, g) in gcrefs.iter().enumerate() {
-            inner.insert(g.0, i as u32);
-        }
-        map.insert(gc_table_base, inner);
-    });
-}
+        self.entries.push((base, keys.to_vec()));
+    }
 
-/// Merge one interned GC table into the force-arm ConstPtr map.
-///
-/// A later compile (an inline bridge) rebuilds the TLS map. Re-emission
-/// must restore every retained region's table, each under its own
-/// `base_addr`, or a non-null owner ConstPtr falls through to a raw address.
-pub fn extend_failarg_const_table_from_gc_table(table: &majit_gc::GcTable) {
-    FAILARG_CONST_TABLE.with(|cell| {
-        let mut map = cell.borrow_mut();
-        let base = table.base_addr() as u32;
-        let mut inner = HashMap::with_capacity(table.len());
-        for i in 0..table.len() {
-            inner.insert(table.compile_key(i), i as u32);
-        }
-        map.insert(base, inner);
-    });
-}
-
-thread_local! {
-    static FAILARG_LOOKUP_BASE: Cell<u32> = const { Cell::new(0) };
-}
-
-fn set_failarg_lookup_base(base: u32) {
-    FAILARG_LOOKUP_BASE.with(|cell| cell.set(base));
-}
-
-fn lookup_failarg_const(compile_key: usize) -> Option<(u32, u32)> {
-    let table_base = FAILARG_LOOKUP_BASE.with(|cell| cell.get());
-    FAILARG_CONST_TABLE.with(|cell| {
-        cell.borrow()
-            .get(&table_base)
-            .and_then(|inner| inner.get(&compile_key).copied())
-            .map(|index| (table_base, index))
-    })
+    fn slot(&self, base: u32, compile_key: usize) -> Option<(u32, u32)> {
+        let keys = self.entries.iter().find(|(b, _)| *b == base)?.1.as_slice();
+        let index = keys.iter().position(|&key| key == compile_key)? as u32;
+        Some((base, index))
+    }
 }
 
 /// Dense wasm-local assignment for the sparse value-id namespace.
@@ -3052,87 +3016,6 @@ pub struct GuardGcTypeInfo {
     pub subclass_ranges: HashMap<i64, (i64, i64)>,
 }
 
-// Whether an eligible residual CALL may be lowered to a direct in-module
-// `call_indirect` into the callee's `__indirect_function_table` slot, instead
-// of routing through the `jit_call` host trampoline (guest→host→guest
-// reflection + arg marshalling).
-//
-// The lowering takes the callee's wasm type from the IR alone: word-typed
-// arguments and result become `(i64×n) -> i64`, so the static type is fixed by
-// the arity. That is a claim about the embedding language's residual helpers,
-// and one the IR cannot check — a helper declared to take a pointer has an
-// `i32` parameter on wasm32, and `call_indirect` type-checks its callee on
-// every call, so a call lowered this way traps instead of reaching a helper
-// whose real signature is narrower.
-//
-// `ResidualCallAbi` is how an embedder says which of the two it is.
-//
-// Read once per emitted call, so it must be set before the first compile
-// on this thread. Per thread for the same reason
-// `FAITHFUL_RESIDUAL_CALL_ADDRS` is: a wasm32 module is one thread, and a
-// process-global value lets a test that selects `Vouched` change a sibling
-// test that is compiling under the default `Word` ABI.
-thread_local! {
-    static RESIDUAL_CALL_ABI: Cell<u8> = const { Cell::new(0) };
-}
-
-/// How faithfully a residual callee's call descr describes its real wasm
-/// signature.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ResidualCallAbi {
-    /// Every callee reachable as a residual is spelled with word-sized `i64`
-    /// parameters and result and casts at its own boundary, so a descr's word
-    /// type *is* the callee's wasm type. Any word-typed residual then lowers
-    /// to a direct in-module `call_indirect`. The default.
-    Word,
-    /// Only the callees named by [`crate::set_faithful_residual_call_addrs`]
-    /// are known to be spelled that way. Every other residual keeps the host
-    /// trampoline, which reads the callee's declared type before calling it:
-    /// slower, but correct for a callee spelled with a pointer parameter,
-    /// which is narrower than a word on wasm32. Vouching for too few callees
-    /// costs speed; vouching for one whose parameters are not all words costs
-    /// a trap, so the safe direction is to add them one at a time.
-    Vouched,
-}
-
-/// Declare which [`ResidualCallAbi`] this embedder's residual helpers satisfy.
-pub fn set_residual_call_abi(abi: ResidualCallAbi) {
-    let encoded = match abi {
-        ResidualCallAbi::Word => 0,
-        ResidualCallAbi::Vouched => 1,
-    };
-    RESIDUAL_CALL_ABI.with(|cell| cell.set(encoded));
-}
-
-fn residual_call_abi() -> ResidualCallAbi {
-    match RESIDUAL_CALL_ABI.with(|cell| cell.get()) {
-        0 => ResidualCallAbi::Word,
-        _ => ResidualCallAbi::Vouched,
-    }
-}
-
-/// Whether `op`'s callee may be called with the wasm type its descr's word
-/// types imply, rather than through the reflecting trampoline.
-fn func_sig_val_to_valtype(val: crate::FuncSigVal) -> ValType {
-    match val {
-        crate::FuncSigVal::I32 => ValType::I32,
-        crate::FuncSigVal::I64 => ValType::I64,
-        crate::FuncSigVal::F32 => ValType::F32,
-        crate::FuncSigVal::F64 => ValType::F64,
-    }
-}
-
-fn wasm_sig_to_typed(sig: &crate::WasmSig) -> TypedResidualSig {
-    (
-        sig.params
-            .iter()
-            .copied()
-            .map(func_sig_val_to_valtype)
-            .collect(),
-        sig.result.map(func_sig_val_to_valtype),
-    )
-}
-
 /// Descr-derived wasm type the direct arm would use for this op.
 ///
 /// CallN's void-word vs true-void result follows the oracle's real result
@@ -3193,6 +3076,9 @@ fn expected_direct_wasm_sig_at(
             Type::Void => return None,
         }
     };
+    // A void op's `result_size` is the historical dummy-word bit. When the
+    // table names the callee, its declared result wins (`get_result_size`
+    // cannot see an i32/void split the table already published).
     if is_void_op
         && let Some(addr) = const_funcptr_addr(op, constants, func_arg)
         && let Some(real) = crate::residual_target_sig(addr)
@@ -3219,13 +3105,30 @@ fn const_funcptr_addr(
         .then(|| resolve_const_bits(constants, func_ptr))
 }
 
-/// True when `real` differs from `expected` only by i32 where the descr-derived
-/// type has i64 (Int/Ref on the JIT side). f32 anywhere is not this case.
-fn i32_abi_variance(expected: &TypedResidualSig, real: &TypedResidualSig) -> bool {
-    if expected.0.len() != real.0.len() {
-        return false;
+fn func_sig_val_to_valtype(val: crate::FuncSigVal) -> ValType {
+    match val {
+        crate::FuncSigVal::I32 => ValType::I32,
+        crate::FuncSigVal::I64 => ValType::I64,
+        crate::FuncSigVal::F32 => ValType::F32,
+        crate::FuncSigVal::F64 => ValType::F64,
     }
-    if expected.1.is_some() != real.1.is_some() {
+}
+
+fn wasm_sig_to_typed(sig: &crate::WasmSig) -> TypedResidualSig {
+    (
+        sig.params
+            .iter()
+            .copied()
+            .map(func_sig_val_to_valtype)
+            .collect(),
+        sig.result.map(func_sig_val_to_valtype),
+    )
+}
+
+/// True when `real` differs from `expected` only by i32 where the descr has
+/// i64. f32 is not this case.
+fn i32_abi_variance(expected: &TypedResidualSig, real: &TypedResidualSig) -> bool {
+    if expected.0.len() != real.0.len() || expected.1.is_some() != real.1.is_some() {
         return false;
     }
     if real.0.contains(&ValType::F32) || real.1 == Some(ValType::F32) {
@@ -3245,7 +3148,10 @@ fn i32_abi_variance(expected: &TypedResidualSig, real: &TypedResidualSig) -> boo
     }
 }
 
-/// Emit signature for a direct call, or `None` to keep the trampoline.
+/// `_genop_call` emits `CallDescr.get_arg_types` / `get_result_type` /
+/// `get_result_size`. On wasm the same descr is the type only when the
+/// callee's table entry agrees, or differs solely by i32 for an Int/Ref.
+/// A slot the table does not hold (a host import) keeps `jit_call`.
 fn residual_callee_direct_emit_sig_at(
     op: &Op,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -3256,10 +3162,10 @@ fn residual_callee_direct_emit_sig_at(
         return None;
     };
     if !func_ptr.is_constant() {
-        return match residual_call_abi() {
-            ResidualCallAbi::Word if word_descr_shape(expected) => Some(expected.clone()),
-            _ => None,
-        };
+        // The index is computed. The descr is still the type; a host that
+        // cannot see the table (native tests) emits it. The guest bounces,
+        // because a dynamic index is not known to be a function of this type.
+        return (!cfg!(target_arch = "wasm32")).then(|| expected.clone());
     }
     let addr = resolve_const_bits(constants, func_ptr);
     match crate::residual_target_sig(addr) {
@@ -3276,23 +3182,9 @@ fn residual_callee_direct_emit_sig_at(
                 None
             }
         }
-        None => {
-            let all_float =
-                expected.1 == Some(ValType::F64) && expected.0.iter().all(|t| *t == ValType::F64);
-            if all_float
-                || (residual_call_abi() == ResidualCallAbi::Word && word_descr_shape(expected))
-                || crate::residual_call_descr_is_faithful(addr)
-            {
-                Some(expected.clone())
-            } else {
-                None
-            }
-        }
+        None if cfg!(target_arch = "wasm32") => None,
+        None => Some(expected.clone()),
     }
-}
-
-fn word_descr_shape(expected: &TypedResidualSig) -> bool {
-    expected.0.iter().all(|t| *t == ValType::I64) && matches!(expected.1, Some(ValType::I64) | None)
 }
 
 fn residual_direct_emit_sig(
@@ -3614,9 +3506,9 @@ fn direct_helper_i64_arity(
 ///
 /// Keep this in lockstep with the individual emission arms below: the uniform
 /// i64, typed float, and true-void residual families, `CallMallocNursery*`,
-/// and write barriers are direct as far as [`RESIDUAL_CALL_ABI`] lets each
-/// one be; non-uniform CALLs, an unvouched callee, and string allocation
-/// retain the trampoline.
+/// and write barriers are direct when the call descr and the callee's table
+/// type agree; a mismatch, a host import, and string allocation retain the
+/// trampoline.
 fn has_trampoline_calls(
     inputargs: &[InputArgRc],
     ops: &[Op],
@@ -4256,6 +4148,8 @@ pub struct ModuleBuildInputs {
     pub nursery: Option<NurseryAllocParams>,
     pub invalidated_flag_addr: u32,
     pub gc_table_base: u32,
+    /// `GcTable::compile_key` for each slot at `gc_table_base`, in order.
+    pub gc_const_keys: Vec<usize>,
     pub fail_index_base: u32,
     pub bridge_cells_base: u32,
     /// A bridge reached from an armed guard takes its fail values as `i64`
@@ -4324,6 +4218,8 @@ pub struct InlinedBridge {
     /// Base of this already-interned region's GC table. Each region retains
     /// its own roots; codegen selects it by the LoadFromGcTable producer.
     pub gc_table_base: u32,
+    /// `GcTable::compile_key` for each slot at `gc_table_base`, in order.
+    pub gc_const_keys: Vec<usize>,
     /// The constant pool registered for this region's own trace. A pool is
     /// per-trace (`Backend::set_constants_pool` names the next compile), and
     /// its value-id keys — the folded values that have no producing op — are
@@ -4409,6 +4305,7 @@ impl Clone for InlinedBridge {
             inputargs: self.inputargs.iter().cloned().collect(),
             ops: self.ops.clone(),
             gc_table_base: self.gc_table_base,
+            gc_const_keys: self.gc_const_keys.clone(),
             constants: self.constants.clone(),
         }
     }
@@ -4429,6 +4326,7 @@ impl Clone for ModuleBuildInputs {
             nursery: self.nursery.clone(),
             invalidated_flag_addr: self.invalidated_flag_addr,
             gc_table_base: self.gc_table_base,
+            gc_const_keys: self.gc_const_keys.clone(),
             fail_index_base: self.fail_index_base,
             bridge_cells_base: self.bridge_cells_base,
             bridge_entry_arity: self.bridge_entry_arity,
@@ -4560,6 +4458,7 @@ fn rebase_region_value_ids(
             inputargs,
             ops,
             gc_table_base: bridge.gc_table_base,
+            gc_const_keys: bridge.gc_const_keys.clone(),
             constants: bridge.constants.clone(),
         },
         width,
@@ -4583,6 +4482,7 @@ pub fn build_wasm_module(
         nursery,
         invalidated_flag_addr,
         gc_table_base,
+        gc_const_keys,
         fail_index_base,
         bridge_cells_base,
         bridge_entry_arity,
@@ -4928,7 +4828,7 @@ pub fn build_wasm_module(
     // keeps the tail call area for future bridges.
     let needs_call =
         has_trampoline_calls(&analysis_inputargs, &analysis_ops, constants, ca.emit_ca);
-    // In-module residual calls ([`RESIDUAL_CALL_ABI`]): the largest
+    // In-module residual calls: the largest
     // eligible `(i64×n)->i64` arity in this trace — residual CALLs (word
     // result or word-ABI void) plus the `CallMallocNursery*` / write-barrier
     // helper targets, which share the same uniform-i64 ABI — or `None` if there
@@ -4977,7 +4877,7 @@ pub fn build_wasm_module(
     } else {
         residual_max_arity
     };
-    // Typed float residual calls use their descr's faithful wasm ABI instead
+    // Typed float residual calls use the descr-derived wasm type instead
     // of the uniform i64 helper family. Preserve first-use order so a given
     // trace gets stable type indices while declaring each signature once.
     let mut typed_residual_sigs = Vec::new();
@@ -5271,6 +5171,7 @@ pub fn build_wasm_module(
         &bridge_param_type_indices,
         *invalidated_flag_addr,
         *gc_table_base,
+        gc_const_keys,
         &gc_table_bases,
         *fail_index_base,
         *external_jump_slot,
@@ -5419,6 +5320,7 @@ fn build_function(
     bridge_param_type_indices: &indexmap::IndexMap<usize, u32>,
     invalidated_flag_addr: u32,
     gc_table_base: u32,
+    gc_const_keys: &[usize],
     gc_table_bases: &HashMap<u32, u32>,
     fail_index_base: u32,
     external_jump_slot: u32,
@@ -5629,6 +5531,13 @@ fn build_function(
     // arg, so the guard must rematerialize the load — cranelift
     // `resolve_failarg_opref` / `GC_TABLE_VAR_INDEX`.
     let gc_table_slots = gc_table_failarg_slots(ops, constants, gc_table_base, gc_table_bases);
+    let mut const_tables = ConstPtrTables {
+        entries: Vec::new(),
+    };
+    const_tables.push(gc_table_base, gc_const_keys);
+    for bridge in inlined_bridges {
+        const_tables.push(bridge.gc_table_base, &bridge.gc_const_keys);
+    }
     let inline_guards: Vec<InlineGuard<'_>> = inlined_bridges
         .iter()
         .enumerate()
@@ -5661,6 +5570,8 @@ fn build_function(
         counter_slot: counter_slot(entry_inputargs, ops).map(|slot| slot as u64),
         spill_helpers: spill_helper_indices,
         gc_table_slots: &gc_table_slots,
+        const_tables: &const_tables,
+        const_table_base: gc_table_base,
     };
     let mut locals = Vec::new();
     let mut start = 0;
@@ -5996,7 +5907,6 @@ fn build_function(
             skip_nursery_tid_store_at = None;
             continue;
         }
-        set_failarg_lookup_base(table_base_by_op[op_idx]);
         if frame_can_escape && ref_homes.len() != 0 && op.opcode.can_malloc() {
             emit_jitframe_write_barrier(&mut sink, jit_call_idx, residual_type_base, wb);
         }
@@ -6168,6 +6078,7 @@ fn build_function(
             outside_region_base,
             closed_body_regions: started_body_regions as u32,
             closed_outside_regions: started_outside_regions as u32,
+            const_table_base: table_base_by_op[op_idx],
             ..guard_dispatch
         };
         // The guard whose condition the previous op already pushed and tested.
@@ -6737,6 +6648,8 @@ fn build_function(
                     op,
                     exit_index(op, guard_idx),
                     None,
+                    guard_dispatch.const_tables,
+                    guard_dispatch.const_table_base,
                 );
                 guard_idx += 1;
             }
@@ -8812,6 +8725,8 @@ fn build_function(
                     ops,
                     op_idx,
                     guard_idx,
+                    guard_dispatch.const_tables,
+                    guard_dispatch.const_table_base,
                 );
                 let vi = op.pos().get().raw();
                 let descr = op
@@ -9140,6 +9055,8 @@ fn build_function(
                     ops,
                     op_idx,
                     guard_idx,
+                    guard_dispatch.const_tables,
+                    guard_dispatch.const_table_base,
                 );
                 let vi = op.pos().get().raw();
                 let can_collect = call_can_collect(op);
@@ -10001,13 +9918,15 @@ fn emit_resolve_failarg(
     gc_table_slots: &HashMap<u32, (u32, i64)>,
     ref_homes: &RefHomes,
     frame: FrameGeometry,
+    const_tables: &ConstPtrTables,
+    const_table_base: u32,
 ) {
     // rewrite.py leaves a ConstPtr failarg as a constant. Load it from
     // the table on this path only — the collector forwards the slot —
     // rather than baking the compile-time address as `i64.const`.
     if let Some(g) = opref.as_const_ptr()
         && !g.is_null()
-        && let Some((base, index)) = lookup_failarg_const(g.0)
+        && let Some((base, index)) = const_tables.slot(const_table_base, g.0)
     {
         emit_gc_table_load(sink, base, i64::from(index));
         return;
@@ -10530,6 +10449,10 @@ struct BridgeDispatch<'a> {
     /// later guard may spill. Keyed by value id; the pair is the baked
     /// table base and slot index.
     gc_table_slots: &'a HashMap<u32, (u32, i64)>,
+    /// ConstPtr compile keys of every GC table this function emits, and the
+    /// base of the table that owns the operation currently being emitted.
+    const_tables: &'a ConstPtrTables,
+    const_table_base: u32,
 }
 
 fn emit_guard_true(
@@ -10766,6 +10689,8 @@ fn emit_guard_exit(
             op,
             inline.inputargs,
             dispatch.gc_table_slots,
+            dispatch.const_tables,
+            dispatch.const_table_base,
         );
         sink.br(inline_region_br_depth(inline, &dispatch, enclosing_frames));
         return;
@@ -10785,6 +10710,8 @@ fn emit_guard_exit(
             dispatch.gc_table_slots,
             dispatch.ref_homes,
             dispatch.frame,
+            dispatch.const_tables,
+            dispatch.const_table_base,
         );
         if dispatch.enabled {
             emit_guard_bridge_dispatch(sink, guard_idx, dispatch);
@@ -10804,6 +10731,8 @@ fn emit_guard_exit(
             dispatch.gc_table_slots,
             dispatch.ref_homes,
             dispatch.frame,
+            dispatch.const_tables,
+            dispatch.const_table_base,
         );
     }
     sink.br(block_exit_depth);
@@ -10864,6 +10793,8 @@ fn emit_guard_param_tail_call(
                 dispatch.gc_table_slots,
                 dispatch.ref_homes,
                 dispatch.frame,
+                dispatch.const_tables,
+                dispatch.const_table_base,
             );
         }
     }
@@ -10884,6 +10815,8 @@ fn emit_guard_inline_bridge_move(
     op: &Op,
     inputargs: &[InputArgRc],
     gc_table_slots: &HashMap<u32, (u32, i64)>,
+    const_tables: &ConstPtrTables,
+    const_table_base: u32,
 ) {
     let fail_args: Vec<OpRef> = live_fail_args_of(op);
     assert_eq!(
@@ -10903,6 +10836,8 @@ fn emit_guard_inline_bridge_move(
                 gc_table_slots,
                 ref_homes,
                 frame,
+                const_tables,
+                const_table_base,
             );
         }
     }
@@ -10967,6 +10902,8 @@ fn emit_force_bracket_before_call(
     ops: &[Op],
     op_idx: usize,
     guard_idx: u32,
+    const_tables: &ConstPtrTables,
+    const_table_base: u32,
 ) {
     if !call_publishes_force_descr(ops[op_idx].opcode) {
         return;
@@ -10992,6 +10929,8 @@ fn emit_force_bracket_before_call(
         next_op,
         exit_index(next_op, guard_idx),
         Some(ops[op_idx].pos().get().raw()),
+        const_tables,
+        const_table_base,
     );
 }
 
@@ -11015,8 +10954,8 @@ fn emit_force_bracket_before_call(
 /// free to tell an offset from a value.
 ///
 /// A non-null `ConstPtr` has no home. Publishing its compile-time address
-/// (or even the current `FAILARG_CONST_TABLE` load) into the untraced force
-/// slot goes stale if the bracketed call collects. Homes use
+/// into the untraced force slot goes stale if the bracketed call collects.
+/// Homes use
 /// `offset * 2 + 1` (bit 0 set; bit 1 is clear because `offset` is
 /// 8-aligned). A table slot is published as `abs_addr | 3` so consume
 /// reloads the forwarded table entry after the collection. `undefined`
@@ -11031,6 +10970,8 @@ fn emit_force_arm(
     guard_op: &Op,
     exit_idx: u32,
     undefined: Option<u32>,
+    const_tables: &ConstPtrTables,
+    const_table_base: u32,
 ) {
     // `counter_value_spill` answers `None` for anything but a GUARD_VALUE, so
     // the counter slot has nothing to contribute to a force bracket.
@@ -11049,7 +10990,7 @@ fn emit_force_arm(
         } else if let Some(g) = arg_ref.as_const_ptr() {
             if g.is_null() {
                 sink.i64_const(0);
-            } else if let Some((base, index)) = lookup_failarg_const(g.0) {
+            } else if let Some((base, index)) = const_tables.slot(const_table_base, g.0) {
                 // Tag the GC-table slot so `dead_frame_from_forced_frame`
                 // reloads after a collection inside the bracketed call.
                 let addr = i64::from(base)
@@ -11094,6 +11035,8 @@ fn emit_guard_spill(
     gc_table_slots: &HashMap<u32, (u32, i64)>,
     ref_homes: &RefHomes,
     frame: FrameGeometry,
+    const_tables: &ConstPtrTables,
+    const_table_base: u32,
 ) {
     emit_guard_fail_args_spill(
         sink,
@@ -11105,6 +11048,8 @@ fn emit_guard_spill(
         gc_table_slots,
         ref_homes,
         frame,
+        const_tables,
+        const_table_base,
     );
     emit_guard_fail_index_store(sink, exit_index(op, guard_idx));
 }
@@ -11134,6 +11079,8 @@ fn emit_guard_fail_args_spill(
     gc_table_slots: &HashMap<u32, (u32, i64)>,
     ref_homes: &RefHomes,
     frame: FrameGeometry,
+    const_tables: &ConstPtrTables,
+    const_table_base: u32,
 ) {
     // Store the live values at their descriptor's physical locations. A hole
     // in ResumeDataLoopMemo's numbering is not a frame location.
@@ -11153,6 +11100,8 @@ fn emit_guard_fail_args_spill(
                 gc_table_slots,
                 ref_homes,
                 frame,
+                const_tables,
+                const_table_base,
             );
         }
         sink.call(helper);
@@ -11168,6 +11117,8 @@ fn emit_guard_fail_args_spill(
                 gc_table_slots,
                 ref_homes,
                 frame,
+                const_tables,
+                const_table_base,
             );
             sink.i64_store(mem64(offset));
         }
@@ -11183,6 +11134,8 @@ fn emit_guard_fail_args_spill(
             gc_table_slots,
             ref_homes,
             frame,
+            const_tables,
+            const_table_base,
         );
         sink.i64_store(mem64(offset));
     }
@@ -12274,6 +12227,9 @@ mod tests {
         };
         let param_type_indices = indexmap::IndexMap::new();
         let spill_helpers = indexmap::IndexMap::new();
+        let const_tables = ConstPtrTables {
+            entries: Vec::new(),
+        };
         let inline = InlineGuard {
             guard_idx: 0,
             inputargs: &[],
@@ -12295,6 +12251,8 @@ mod tests {
             counter_slot: None,
             spill_helpers: &spill_helpers,
             gc_table_slots: &HashMap::new(),
+            const_tables: &const_tables,
+            const_table_base: 0,
         };
 
         assert_eq!(inline_region_br_depth(&inline, &dispatch, 0), 0);
