@@ -2820,9 +2820,10 @@ const DEFAULT_INLINE_EAGER_MAX_BYTES: u32 = 4096;
 /// [`INLINE_TRIP_THRESHOLD`] entries into the bridge compiled in its place.
 ///
 /// Installation replaces the retained wasm module after compiled execution
-/// returns. Dispatch is withdrawn during this transition, so intervening exits
-/// use blackhole resume without heating an already-attached guard. Invalidation
-/// remains owned by the loop token across module replacement.
+/// returns. Until that publish the source guard keeps dispatching to this
+/// bridge (`assembler.py` `patch_jump_for_descr` never clears the jump
+/// before the new target is written). Invalidation remains owned by the
+/// loop token across module replacement.
 struct PendingInline {
     /// The loop this region merges into. Weak so a leftover retry
     /// cannot keep an otherwise unreachable owner (and its module)
@@ -2985,17 +2986,11 @@ fn merged_region_fail_index(
 }
 
 /// Note that a bridge has counted its way to the threshold. Called from
-/// compiled code: mark the withdrawn source dispatch and queue its rebuild,
-/// but leave module installation to the caller after compiled code returns.
+/// compiled code: queue the rebuild, but leave the source guard's cell
+/// pointing at this bridge. Module installation runs after compiled code
+/// returns (`assembler.py` `patch_jump_for_descr` redirects only once the
+/// new target exists).
 pub fn record_inline_trip(pending_id: i64) {
-    #[cfg(target_arch = "wasm32")]
-    with_pending_inlines(|pending| {
-        if let Some(pending) = pending.get(&pending_id)
-            && pending.remap.is_none()
-        {
-            pending.set_dispatch_withdrawn(true);
-        }
-    });
     push_tripped_inline(pending_id);
 }
 
@@ -3038,16 +3033,11 @@ pub fn take_tripped_inlines() -> Vec<i64> {
 fn register_pending_inline(
     owner: Arc<JitCellToken>,
     region: codegen::InlinedBridge,
-    cells_base_ptr: u32,
     owner_module_bytes: u32,
     remap: Option<(u64, u32)>,
 ) -> codegen::InlineTripProbe {
     let counter_addr = Box::leak(Box::new(0u64)) as *const u64 as usize as u32;
-    let dispatch_cell_index = region.source_fail_index;
     let pending_id = NEXT_PENDING_INLINE_ID.fetch_add(1, Ordering::Relaxed);
-    // A remapped child must not zero an owner cell: the source guard
-    // still lives on the parent module until that parent is merged.
-    let cells_base_ptr = if remap.is_some() { 0 } else { cells_base_ptr };
     with_pending_inlines_mut(|pending| {
         pending.insert(
             pending_id,
@@ -3064,8 +3054,6 @@ fn register_pending_inline(
         threshold: inline_trip_threshold_for(owner_module_bytes),
         trip_fn_ptr: inline_trip_helper_slot() as i64,
         pending_id,
-        cells_base_ptr,
-        dispatch_cell_index,
     }
 }
 
@@ -6327,18 +6315,12 @@ impl majit_backend::Backend for WasmBackend {
                 gc_table_base,
                 constants: self.constants.clone(),
             };
-            // The cell the owner's guard consults travels by address of the
-            // field rather than by value: a later re-emission reallocates the
-            // array and the probe has to reach the live one. The owner's size
-            // travels by value, because it prices this merge alone.
-            let (cells_base_ptr, owner_module_bytes) =
-                compiled_wasm_loop(&owner).map_or((0, 0), |loop_| {
-                    (
-                        &loop_.bridge_cells_base as *const std::cell::Cell<u32> as usize as u32,
-                        loop_.module_bytes.get(),
-                    )
-                });
-            register_pending_inline(owner, region, cells_base_ptr, owner_module_bytes, remap)
+            // The owner's size prices this merge. The source guard's cell
+            // stays on the current bridge until the host publishes the
+            // merged module (`assembler.py` `patch_jump_for_descr`).
+            let owner_module_bytes =
+                compiled_wasm_loop(&owner).map_or(0, |loop_| loop_.module_bytes.get());
+            register_pending_inline(owner, region, owner_module_bytes, remap)
         });
         let pending_guard = PendingInlineGuard(inline_trip.map(|probe| probe.pending_id));
 
