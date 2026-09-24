@@ -7857,14 +7857,8 @@ pub(crate) fn try_walker_specialize_subscr_tuple<Sym: WalkSym>(
             return Ok(None);
         }
         let index = pyre_object::w_int_get_value(key_obj);
-        // Negative index is `w_tuple_getitem`'s adjust (`index + len`).
-        // The positive arm below is the constant-index fold; the negative
-        // arm records the reader so `wrappeditems[*]` loads as
-        // `getarrayitem_gc_pure_r` and a loop-invariant `c[-1]` hoists.
         if index < 0 {
-            return try_walker_orthodox_canonical_tuple_getitem(
-                ctx, op_pc, list_op, key_op, tuple_obj, key_obj, dst, dst_bank,
-            );
+            return Ok(None);
         }
         let concrete_len = pyre_object::w_tuple_len(tuple_obj);
         if index as usize >= concrete_len {
@@ -7929,104 +7923,6 @@ pub(crate) fn try_walker_specialize_subscr_tuple<Sym: WalkSym>(
         majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
     );
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
-    Ok(Some(()))
-}
-
-/// Descend `w_tuple_getitem` for a canonical tuple and a negative int key.
-/// The positive constant-index arm stays in [`try_walker_specialize_subscr_tuple`].
-/// An out-of-range key stays on the generic residual so the raising path
-/// is not what this loop records.
-fn try_walker_orthodox_canonical_tuple_getitem<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    seq_op: OpRef,
-    key_op: OpRef,
-    seq_obj: pyre_object::PyObjectRef,
-    key_obj: pyre_object::PyObjectRef,
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<()>, DispatchError> {
-    if dst_bank != 'r' {
-        return Ok(None);
-    }
-    let raw_key = unsafe { pyre_object::w_int_get_value(key_obj) };
-    let len = unsafe { pyre_object::tupleobject::w_tuple_len(seq_obj) } as i64;
-    let index = raw_key + len;
-    if index < 0 || index >= len {
-        return Ok(None);
-    }
-    let Some(jc_arc) = crate::jitcode_runtime::tuple_getitem_jitcode() else {
-        return Ok(None);
-    };
-    let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
-        return Ok(None);
-    };
-    let sym_ptr = ctx.fbw_mode.snapshot_sym;
-    if sym_ptr.is_null() || unsafe { (&*sym_ptr).jitcode().is_null() } {
-        return Ok(None);
-    }
-    let sym = unsafe { &*sym_ptr };
-    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
-        return Ok(None);
-    };
-
-    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    let tuple_type_addr = &pyre_object::pyobject::TUPLE_TYPE as *const _ as i64;
-    walker_guard_exact_w_class(
-        ctx,
-        op_pc,
-        seq_op,
-        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE),
-    )?;
-    if !seq_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(seq_op) {
-        let type_const = ctx.trace_ctx.const_int(tuple_type_addr);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[seq_op, type_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-    }
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(seq_op, tuple_type_addr);
-    let (idx_type, idx_descr) = crate::state::int_or_bool_unbox_type_descr(key_obj);
-    let key_index = walker_unbox_int_typed(ctx, op_pc, key_op, idx_type, idx_descr)?;
-    ctx.trace_ctx
-        .set_opref_concrete(key_index, majit_ir::Value::Int(raw_key));
-    ctx.trace_ctx.set_opref_concrete(
-        seq_op,
-        majit_ir::Value::Ref(majit_ir::GcRef(seq_obj as usize)),
-    );
-    let walk = run_orthodox_helper_subwalk(
-        ctx,
-        op_pc,
-        sym,
-        &sub_body,
-        nested_entry,
-        "canonical_tuple_neg_getitem_commit",
-        "w_tuple_getitem_call_site",
-        &[key_index],
-        &[ConcreteValue::Int(raw_key)],
-        &[seq_op],
-        &[ConcreteValue::Ref(seq_obj)],
-        &[],
-    );
-    let (walk_outcome, _) = match walk {
-        Ok(pair) => pair,
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
-            if fbw_debug_abort_enabled() {
-                eprintln!("[decline-why] CANONICAL-TUPLE-NEG-SUBWALK pc={pc}");
-            }
-            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
-            ctx.trace_ctx.heap_cache_mut().reset();
-            return Ok(None);
-        }
-        Err(error) => return Err(error),
-    };
-    let result = match walk_outcome {
-        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
-            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
-        _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
-    };
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
     Ok(Some(()))
 }
 
