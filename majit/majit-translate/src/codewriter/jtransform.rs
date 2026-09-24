@@ -4534,6 +4534,15 @@ impl<'a> Transformer<'a> {
         // class constant; pyre's receivers here are SSA variables (a prebuilt
         // constant reaches a field read through `ConstRef`, not as an
         // operand), so that arm has no input and is not spelled.
+        // A `Vec` buffer word loaded from a declared virtualizable array is
+        // the array pointer. `deref` aliases that pointer onto this base, so
+        // the getfield would be a use of the array. Keep the array op.
+        if field.vec_part == Some(crate::model::VecFieldPart::Buf)
+            && let OpKind::FieldRead { base, .. } = &op.kind
+            && self.vable_array_vars.contains_key(base)
+        {
+            return RewriteResult::Identity(base.clone());
+        }
         if let OpKind::FieldRead { base, .. } = &op.kind
             && is_typeptr_field(field)
         {
