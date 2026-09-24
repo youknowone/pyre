@@ -573,7 +573,11 @@ impl Assembler {
                 .unwrap_or_else(|| panic!("undefined TLabel {label:?} at fixup {fixup_pos}"));
             let target_u16 = target as u16;
             // RPython `assembler.py assert 0 <= target <= 0xFFFF`.
-            assert!(target <= 0xFFFF, "label target {target} exceeds u16 range");
+            assert!(
+                target <= 0xFFFF,
+                "label target {target} exceeds u16 range in {}",
+                self.current_graph_name.as_deref().unwrap_or("?")
+            );
             // RPython `assembler.py:252-253 assert self.code[pos] == "temp 1"`
             // — the fixup must point to two reserved placeholder
             // bytes still in range.

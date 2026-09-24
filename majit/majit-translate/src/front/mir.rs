@@ -8028,18 +8028,6 @@ impl<'a> Lowering<'a> {
         release_declared_vable_array_address(&mut self.graph, base)
     }
 
-    fn var_is_inline_vec(&self, var: &Variable) -> bool {
-        self.graph.blocks.iter().any(|block| {
-            block.operations.iter().any(|op| {
-                op.result.as_ref() == Some(var)
-                    && matches!(
-                        &op.kind,
-                        OpKind::FieldRead { field, .. } if field.inline_vec
-                    )
-            })
-        })
-    }
-
     fn var_is_declared_vable_array(&self, var: &Variable) -> bool {
         self.graph.blocks.iter().any(|block| {
             block.operations.iter().any(|op| {
@@ -8056,74 +8044,132 @@ impl<'a> Lowering<'a> {
         })
     }
 
-    /// `v[i]` / `v.len()` on a `Vec<T>`.
-    ///
-    /// An inline field is retargeted in place: the read's base stays the
-    /// owner and the descr offset is the field plus the measured buffer or
-    /// length word (`rlist.ll_items` / `ll_length`). A `Box<Vec<_>>` field
-    /// has already loaded the heap pointer; the component is a second
-    /// getfield from that pointer.
+    /// `v[i]` / `v.len()` on a `Vec<T>`, wherever the `Vec` was reached:
+    /// an inline field, a `&mut Vec` local, or a pointer already loaded
+    /// from `Box<Vec<_>>`. An inline field is retargeted in place. Every
+    /// other receiver is a getfield of the buffer or length word from that
+    /// pointer (`rlist.ll_items` / `ll_length`).
     fn retarget_vec_part(
         &mut self,
         bb_id: BlockId,
         vec_var: &Variable,
         part: crate::model::VecFieldPart,
     ) -> Variable {
-        let inline = self.graph.blocks.iter().any(|block| {
-            block.operations.iter().any(|op| {
-                op.result.as_ref() == Some(vec_var)
-                    && matches!(
-                        &op.kind,
-                        OpKind::FieldRead { field, .. }
-                            if field.inline_vec && field.vec_part.is_none()
-                    )
-            })
-        });
-        if inline {
-            for block in &mut self.graph.blocks {
-                for op in &mut block.operations {
-                    if op.result.as_ref() != Some(vec_var) {
-                        continue;
+        retarget_vec_operand(&mut self.graph, bb_id, vec_var, part)
+    }
+}
+
+/// True when `var` is a declared virtualizable array, or was loaded out of
+/// one. A buffer getfield from that pointer is the escape
+/// `jtransform` rejects (`vable array field` passed around).
+fn reaches_declared_vable_array(graph: &FunctionGraph, var: &Variable) -> bool {
+    let mut current = var.clone();
+    for _ in 0..6 {
+        let mut base = None;
+        let mut declared = false;
+        for block in &graph.blocks {
+            for op in &block.operations {
+                if op.result.as_ref() != Some(&current) {
+                    continue;
+                }
+                match &op.kind {
+                    OpKind::FieldRead {
+                        base: field_base,
+                        field,
+                        ..
+                    } => {
+                        if crate::virtualizable_decl::is_declared_array_field(
+                            field.owner_root.as_deref(),
+                            &field.name,
+                        ) {
+                            declared = true;
+                        }
+                        base = Some(field_base.clone());
                     }
-                    if let OpKind::FieldRead { field, ty, .. } = &mut op.kind
-                        && field.inline_vec
-                        && field.vec_part.is_none()
-                    {
-                        field.vec_part = Some(part);
-                        field.taken_by_address = false;
-                        *ty = match part {
-                            crate::model::VecFieldPart::Buf => ValueType::Ref(None),
-                            crate::model::VecFieldPart::Len => ValueType::Int,
-                        };
+                    // `deref` / `same_as` alias the operand. The codewriter
+                    // drops them, so a buffer getfield on the result is a
+                    // getfield on the array.
+                    OpKind::UnaryOp { operand, .. } => {
+                        base = Some(operand.clone());
                     }
+                    _ => {}
                 }
             }
-            return vec_var.clone();
         }
-        let name = match part {
-            crate::model::VecFieldPart::Buf => "buf",
-            crate::model::VecFieldPart::Len => "len",
-        };
-        let ty = match part {
-            crate::model::VecFieldPart::Buf => ValueType::Ref(None),
-            crate::model::VecFieldPart::Len => ValueType::Int,
-        };
-        let res = self
-            .graph
-            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-            result: Some(res.clone()),
-            kind: OpKind::FieldRead {
-                base: vec_var.clone(),
-                field: FieldDescriptor::new(name, Some("alloc::vec::Vec".to_string()))
-                    .with_vec_part(part),
-                ty,
-                pure: false,
-            },
-        });
-        res
+        if declared {
+            return true;
+        }
+        match base {
+            Some(next) => current = next,
+            None => return false,
+        }
     }
+    false
+}
 
+fn retarget_vec_operand(
+    graph: &mut FunctionGraph,
+    bb_id: BlockId,
+    vec_var: &Variable,
+    part: crate::model::VecFieldPart,
+) -> Variable {
+    if reaches_declared_vable_array(graph, vec_var) {
+        return vec_var.clone();
+    }
+    let inline = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            op.result.as_ref() == Some(vec_var)
+                && matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. }
+                        if field.inline_vec && field.vec_part.is_none()
+                )
+        })
+    });
+    if inline {
+        for block in &mut graph.blocks {
+            for op in &mut block.operations {
+                if op.result.as_ref() != Some(vec_var) {
+                    continue;
+                }
+                if let OpKind::FieldRead { field, ty, .. } = &mut op.kind
+                    && field.inline_vec
+                    && field.vec_part.is_none()
+                {
+                    field.vec_part = Some(part);
+                    field.taken_by_address = false;
+                    *ty = match part {
+                        crate::model::VecFieldPart::Buf => ValueType::Ref(None),
+                        crate::model::VecFieldPart::Len => ValueType::Int,
+                    };
+                }
+            }
+        }
+        return vec_var.clone();
+    }
+    let name = match part {
+        crate::model::VecFieldPart::Buf => "buf",
+        crate::model::VecFieldPart::Len => "len",
+    };
+    let ty = match part {
+        crate::model::VecFieldPart::Buf => ValueType::Ref(None),
+        crate::model::VecFieldPart::Len => ValueType::Int,
+    };
+    let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    graph.block_mut(bb_id).operations.push(SpaceOperation {
+        result: Some(res.clone()),
+        kind: OpKind::FieldRead {
+            base: vec_var.clone(),
+            field: FieldDescriptor::new(name, Some("alloc::vec::Vec".to_string()))
+                .with_vec_part(part),
+            ty,
+            pure: false,
+        },
+    });
+    res
+}
+
+impl<'a> Lowering<'a> {
     /// Whether `&<place>` / `&raw [mut] <place>` takes the address of a
     /// place, as opposed to reading the value one holds.
     ///
@@ -11118,7 +11164,7 @@ impl<'a> Lowering<'a> {
                         matches!(item_ty, ValueType::Ref(_))
                             .then(|| OBJECT_REF_GCARRAY_TYPE_ID.to_string())
                     } else if self.is_vec_index_call(&reg, second_arg_ty.as_ref())
-                        && self.var_is_inline_vec(&args[0])
+                        && !reaches_declared_vable_array(&self.graph, &args[0])
                     {
                         // The buffer is headerless. `[u8]` is the length-prefixed
                         // byte block, so a Vec keeps its own identity: element
@@ -11194,7 +11240,7 @@ impl<'a> Lowering<'a> {
                     let vable_array = self.release_declared_vable_array_address(&args[0]);
                     let array_base = if !vable_array
                         && self.is_vec_index_call(&reg, second_arg_ty.as_ref())
-                        && self.var_is_inline_vec(&args[0])
+                        && !reaches_declared_vable_array(&self.graph, &args[0])
                     {
                         let buf = self.retarget_vec_part(
                             bb_id,
@@ -12632,7 +12678,10 @@ impl<'a> Lowering<'a> {
                     // residual `__len` that would carry the array out of the
                     // block. The index check uses the same length.
                     let vable_array = self.release_declared_vable_array_address(&args[0]);
-                    if !vable_array && self.is_vec_len(&reg) && self.var_is_inline_vec(&args[0]) {
+                    if !vable_array
+                        && self.is_vec_len(&reg)
+                        && !reaches_declared_vable_array(&self.graph, &args[0])
+                    {
                         let len = self.retarget_vec_part(
                             bb_id,
                             &args[0],
@@ -44337,6 +44386,105 @@ mod tests {
         let gb = super::lower_function(&llbcs[1], "read_b").expect("b lowers");
         assert_eq!(folded_uints(&ga), vec![1]);
         assert_eq!(folded_uints(&gb), vec![7]);
+    }
+
+    /// Each receiver that reaches a `Vec` — an inline field, a `&mut Vec`
+    /// local, and a pointer loaded out of `Box<Vec<_>>` — becomes a getfield
+    /// of the buffer word. A declared virtualizable array is not a receiver
+    /// this helper is given: the caller keeps the vable array op.
+    #[test]
+    fn vec_index_retargets_each_receiver_shape() {
+        use crate::model::{FieldDescriptor, FunctionGraph, OpKind, ValueType, VecFieldPart};
+
+        fn input(graph: &mut FunctionGraph, name: &str) -> crate::flowspace::model::Variable {
+            graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: name.into(),
+                        ty: ValueType::Ref(None),
+                        class_root: None,
+                    },
+                    true,
+                )
+                .expect("input")
+        }
+
+        fn field_part(
+            graph: &FunctionGraph,
+            var: &crate::flowspace::model::Variable,
+        ) -> VecFieldPart {
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| block.operations.iter())
+                .find_map(|op| match &op.kind {
+                    OpKind::FieldRead { field, .. } if op.result.as_ref() == Some(var) => {
+                        field.vec_part
+                    }
+                    _ => None,
+                })
+                .expect("vec part")
+        }
+
+        let mut inline = FunctionGraph::new("inline_vec_field");
+        let frame = input(&mut inline, "frame");
+        let stack = inline
+            .push_op_var(
+                inline.startblock,
+                OpKind::FieldRead {
+                    base: frame,
+                    field: FieldDescriptor::new("stack", Some("Vm".into())).with_inline_vec(true),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .expect("stack field");
+        let bb = inline.startblock;
+        let buf = super::retarget_vec_operand(&mut inline, bb, &stack, VecFieldPart::Buf);
+        assert_eq!(buf, stack, "inline field retargets the field read in place");
+        assert_eq!(field_part(&inline, &stack), VecFieldPart::Buf);
+
+        let mut local = FunctionGraph::new("vec_local");
+        let arg = input(&mut local, "v");
+        let bb = local.startblock;
+        let buf = super::retarget_vec_operand(&mut local, bb, &arg, VecFieldPart::Buf);
+        assert_ne!(buf, arg);
+        match &local.blocks[0].operations.last().unwrap().kind {
+            OpKind::FieldRead { base, field, .. } => {
+                assert_eq!(base, &arg, "&mut Vec local");
+                assert_eq!(field.owner_root.as_deref(), Some("alloc::vec::Vec"));
+                assert_eq!(field.vec_part, Some(VecFieldPart::Buf));
+            }
+            other => panic!("local receiver must getfield the buffer, got {other:?}"),
+        }
+
+        let mut boxed = FunctionGraph::new("box_vec");
+        let frame = input(&mut boxed, "frame");
+        let words = boxed
+            .push_op_var(
+                boxed.startblock,
+                OpKind::FieldRead {
+                    base: frame,
+                    field: FieldDescriptor::new("operand_words", Some("GrainFrame".into())),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .expect("box pointer");
+        let bb = boxed.startblock;
+        let buf = super::retarget_vec_operand(&mut boxed, bb, &words, VecFieldPart::Len);
+        assert_ne!(buf, words);
+        match &boxed.blocks[0].operations.last().unwrap().kind {
+            OpKind::FieldRead { base, field, .. } => {
+                assert_eq!(base, &words, "Box<Vec> pointer");
+                assert_eq!(field.vec_part, Some(VecFieldPart::Len));
+                assert_eq!(field.name, "len");
+            }
+            other => panic!("box receiver must getfield the length word, got {other:?}"),
+        }
     }
 
     /// The `Vec` index fold must accept a `usize` index.
