@@ -3772,9 +3772,22 @@ impl WarmEnterState {
         if self.lookup_chain_with_key(key).is_some() {
             return;
         }
+        // `JitCell.get_jitcell(*greenargs)` is the only installer upstream,
+        // so `get_assembler_token(greenkey)` and `maybe_compile_and_run`
+        // meet on one cell. A hash-only writer files a comparekey-less cell
+        // under this hash; stamping the greens on it is that one cell.
+        // A cell that already has a different comparekey is a real collision
+        // and stays chained.
+        let hash = key.get_uhash();
+        if let Some(cell) = self.cell_by_key_mut(hash)
+            && cell.comparekey.is_none()
+        {
+            cell.set_comparekey(key);
+            return;
+        }
         let mut newcell = BaseJitCell::new();
         newcell.set_comparekey(key);
-        self.install_new_cell(key.get_uhash(), Some(newcell));
+        self.install_new_cell(hash, Some(newcell));
     }
 }
 
@@ -6168,7 +6181,11 @@ mod tests {
         ws.mark_force_finish_tracing_for_key(&key);
 
         let typed = ws.lookup_chain_with_key(&key).expect("typed callee cell");
-        assert_ne!(typed.cell_key, Some(bucket), "typed cell is chained/minted");
+        assert_eq!(
+            typed.cell_key,
+            Some(bucket),
+            "the hash-only cell was adopted"
+        );
         assert!(typed.flags.contains(JcFlags::JC_TEMPORARY));
         assert!(typed.flags.contains(JcFlags::JC_DONT_TRACE_HERE));
         assert!(typed.flags.contains(JcFlags::JC_FORCE_FINISH));
@@ -6189,8 +6206,10 @@ mod tests {
             "the standalone retry retains its segmenting request"
         );
         assert!(
-            !ws.cell_by_key(bucket).expect("hash-only head").is_tracing(),
-            "the comparator-less bucket head is not mistaken for the callee"
+            ws.cell_by_key(bucket)
+                .expect("the adopted cell")
+                .is_tracing(),
+            "hash lookup and the typed lookup name the cell that started tracing"
         );
     }
 
@@ -6249,80 +6268,39 @@ mod tests {
         assert_eq!(count, 0, "cached lookups must not invoke make_token");
     }
 
-    /// A hash-form write and a typed-form read of the SAME green key land on
-    /// DIFFERENT cells, and the state the hash form wrote is invisible to the
-    /// typed reader.
-    ///
-    /// This is the behavioural consequence of
-    /// `one_key_through_a_hash_and_a_typed_entry_point_builds_a_chain`: that
-    /// fixture shows the chain forms, this one shows what the chain costs.
-    ///
-    /// `disable_noninlinable_function` is reached in production from
-    /// `pyre-jit-trace/src/state.rs` and `pyjitpl.rs`;
-    /// `maybe_compile_with_key` is the typed back-edge path (`pyjitpl.rs`).
-    ///
-    /// The state does not merely move — it SPLITS, and the two reader
-    /// families see opposite halves. `DONT_TRACE_HERE` ends up on the head,
-    /// `TRACING` on the chained typed cell. So a bare-head reader
-    /// (`self.lookup_chain(hash)`, ~26 of them here) sees the mark but not the
-    /// tracing state, while a typed reader (`lookup_chain_with_key`) sees the
-    /// tracing state but not the mark. Neither sees the whole cell.
-    ///
-    /// SCOPE. What is proven here is the split and the route change. The
-    /// hash-marked key reaches `StartTracing` on the THRESHOLD tick by the
-    /// ordinary counter route, because the typed decision never saw the mark;
-    /// the typed-marked key reaches it on the FIRST tick by
-    /// `should_start_dont_trace_here_trace` (warmstate.py), which is
-    /// the rule upstream intends to apply. Both trace in the end, so this is
-    /// NOT demonstrated to be a user-visible wrong answer — it is a lost
-    /// decision input. Whether a production key reaches both entry points, and
-    /// in which order, is a runtime question this fixture does not answer.
+    /// A hash-form write and the later typed trace start of the SAME green
+    /// key share one cell. Until `ensure_cell_for_key` runs, the hash-only
+    /// cell has no comparekey, so the counter ticks; the trace start stamps
+    /// the greens onto that cell and both flags live there.
     #[test]
-    fn a_hash_write_and_a_typed_read_of_one_key_use_different_cells() {
+    fn a_hash_write_and_a_typed_read_of_one_key_share_one_cell() {
         let mut ws = WarmEnterState::new(3);
         let key = GreenKey::new(vec![7, 9]);
         ws.disable_noninlinable_function(key.get_uhash());
 
-        // Ticks 1-2 under threshold, tick 3 fires — the ORDINARY counter
-        // route, i.e. the mark above was never consulted.
         assert!(matches!(ws.maybe_compile_with_key(&key), HotResult::NotHot));
         assert!(matches!(ws.maybe_compile_with_key(&key), HotResult::NotHot));
-        assert!(
-            matches!(ws.maybe_compile_with_key(&key), HotResult::StartTracing),
-            "the hash-written DONT_TRACE_HERE never reached the typed decision",
-        );
+        assert!(matches!(
+            ws.maybe_compile_with_key(&key),
+            HotResult::StartTracing
+        ));
 
-        // One bucket, two cells: the split itself.
         assert_eq!(ws.occupied_buckets(), 1, "one green key, so one bucket");
-        assert_eq!(ws.get_stats().num_cells, 2, "but two cells");
-
-        // `install_new_cell` folds the SURVIVOR in front of the newcomer
-        // (counter.py `cell.next = keep; keep = cell`), so the
-        // HASH-written cell stays the head and the TYPED cell is chained
-        // behind it. This is the direction that matters: every bare-head
-        // reader — `self.lookup_chain(hash)`, ~26 of them in this file — reads
-        // the head, which is the cell WITHOUT the comparekey.
-        let head = ws.lookup_chain(key.get_uhash()).expect("head present");
-        assert!(
-            head.comparekey.is_none(),
-            "the head is the hash-written cell — a hash is not invertible, so \
-             it can store no comparekey",
-        );
-        assert!(
-            head.flags.contains(JcFlags::JC_DONT_TRACE_HERE),
-            "the head still holds the mark the hash form wrote",
-        );
-        let typed_cell = head.next.as_deref().expect("typed cell chained behind");
         assert_eq!(
-            typed_cell.comparekey.as_ref(),
-            Some(&key),
-            "the typed install carries the comparekey and is NOT the head",
+            ws.get_stats().num_cells,
+            1,
+            "one cell after the typed adopt"
         );
+
+        let cell = ws
+            .lookup_chain_with_key(&key)
+            .expect("typed lookup finds the adopted cell");
+        assert!(cell.comparekey_matches(&key));
         assert!(
-            typed_cell.is_tracing(),
-            "the typed cell is the one the tracing transition wrote to, so the \
-             two halves of this key's state now live on two different cells",
+            cell.flags.contains(JcFlags::JC_DONT_TRACE_HERE),
+            "the hash-written mark stays on the adopted cell",
         );
+        assert!(cell.is_tracing(), "tracing was written to that same cell");
 
         // Control: the typed form of the same mark keeps ONE cell and takes
         // the dont-trace-here route on the very first tick.
@@ -6750,52 +6728,40 @@ mod tests {
         );
     }
 
-    /// A chain does NOT need a hash collision. ONE green key reached
-    /// through both a hash-only entry point and a typed one builds a two-cell
-    /// chain in a single bucket.
-    ///
-    /// The mechanism has no probabilistic step in it:
-    /// 1. a hash-only writer installs a cell with `comparekey: None`;
-    /// 2. `DONT_TRACE_HERE` with no token makes `should_remove_jitcell()`
-    ///    false (`BaseJitCell::should_remove_jitcell`), so the cell survives the next install;
-    /// 3. `lookup_chain_with_key` cannot match a `None` comparekey — that is
-    ///    asserted by `comparekey_matches_only_with_stored_key` — so
-    ///    `ensure_cell_for_key` misses and calls `install_new_cell`;
-    /// 4. `install_new_cell` (counter.py) links the survivor behind
-    ///    the newcomer.
-    ///
-    /// Every other chain fixture in this module forces its collision by
-    /// installing two comparekeys under one `get_uhash()` by hand, and says
-    /// so. This one uses only public entry points on a single key, which is
-    /// why it is the one that settles whether chains occur in practice.
+    /// One green key reached through a hash-only writer and then a typed one
+    /// is one cell. `get_jitcell(*greenargs)` is the only installer upstream,
+    /// so the typed ensure stamps `comparekey` onto the hash-only cell instead
+    /// of chaining a sibling. A chain still needs two different keys.
     #[test]
-    fn one_key_through_a_hash_and_a_typed_entry_point_builds_a_chain() {
+    fn one_key_through_a_hash_and_a_typed_entry_point_is_one_cell() {
         let mut ws = WarmEnterState::new(100);
         let key = GreenKey::new(vec![100, 200]);
 
-        // Hash-only writer (what `dont_trace_here` did before it was routed
-        // through the typed form).
         ws.disable_noninlinable_function(key.get_uhash());
         assert_eq!(ws.get_stats().num_cells, 1, "one cell after the hash write");
         assert!(
             ws.lookup_chain_with_key(&key).is_none(),
-            "the hash-only cell stores no comparekey, so a typed probe for the \
-             SAME key cannot see it — this is the step that makes the chain",
+            "the hash-only cell stores no comparekey until a typed ensure",
         );
 
-        // Typed writer, same key.
         ws.ensure_cell_for_key(&key);
 
-        assert_eq!(
-            ws.occupied_buckets(),
-            1,
-            "still ONE bucket — no collision here",
-        );
+        assert_eq!(ws.occupied_buckets(), 1, "still ONE bucket");
         assert_eq!(
             ws.get_stats().num_cells,
-            2,
-            "one green key, two cells: the typed install could not find the \
-             hash-only cell and chained past it",
+            1,
+            "one green key, one cell: the typed ensure stamps comparekey on \
+             the hash-only cell",
+        );
+        assert!(
+            ws.lookup_chain_with_key(&key)
+                .is_some_and(|cell| cell.comparekey_matches(&key)),
+            "the same cell answers the typed lookup",
+        );
+        assert!(
+            ws.cell_by_key(key.get_uhash())
+                .is_some_and(|cell| cell.flags.contains(JcFlags::JC_DONT_TRACE_HERE)),
+            "the hash-only flag stays on that cell",
         );
     }
 
@@ -6846,21 +6812,18 @@ mod tests {
         ws.disable_noninlinable_function(key.get_uhash());
         ws.ensure_cell_for_key(&key);
         assert_eq!(ws.occupied_buckets(), 1, "one bucket");
-        assert_eq!(ws.get_stats().num_cells, 2, "two cells in it");
-
-        assert!(
-            !ws.get_cell(key.get_uhash())
-                .expect("bucket is occupied")
-                .comparekey_matches(&key),
-            "fixture: `install_new_cell` links the surviving hash-only cell \
-             AHEAD of the new typed one, so the HEAD is the comparator-less \
-             cell and a head-reading lookup returns the wrong cell here",
-        );
+        assert_eq!(ws.get_stats().num_cells, 1, "one key, one cell");
 
         let cell = ws.get_cell_for_key(&key).expect("the key owns a cell");
         assert!(
             cell.comparekey_matches(&key),
             "get_cell_for_key must return the cell that matches the key",
+        );
+        assert!(
+            ws.get_cell(key.get_uhash())
+                .expect("bucket is occupied")
+                .comparekey_matches(&key),
+            "the hash form names that same cell",
         );
     }
 
@@ -6917,15 +6880,13 @@ mod tests {
         ws.attach_procedure_to_interp_for_key(&key, Arc::clone(&token));
 
         assert!(
-            ws.bucket_is_chained(key.get_uhash()),
-            "fixture: the hash-only writer and the typed one built a chain, \
-             which is the only case in which the two forms can disagree",
+            !ws.bucket_is_chained(key.get_uhash()),
+            "one key is one cell, so the hash and typed forms cannot disagree",
         );
-        assert!(
-            ws.get_procedure_token(key.get_uhash()).is_none(),
-            "fixture: the head is the comparator-less cell and holds no token, \
-             so the hash form cannot see the one just installed",
-        );
+        let by_hash = ws
+            .get_procedure_token(key.get_uhash())
+            .expect("the hash form sees the token on the adopted cell");
+        assert!(Arc::ptr_eq(&by_hash, &token));
 
         let found = ws
             .get_procedure_token_for_key(&key)
