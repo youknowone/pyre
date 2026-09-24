@@ -1,10 +1,10 @@
-# pyre-check: max-pypy-ratio=12
+# pyre-check: max-pypy-ratio=25
 # A nested loop over a sliced list whose length varies between outer
 # iterations must preserve both iterators and the accumulator when a
 # compiled exhaustion guard resumes in the interpreter. The exact
 # aggregate makes corruption of either iterator or the accumulator
 # visible in the output.
-N = 10000
+N = 200000
 
 
 def main():

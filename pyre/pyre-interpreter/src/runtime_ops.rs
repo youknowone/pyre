@@ -879,24 +879,11 @@ pub fn binary_slice_values(
             let e = raw_e.unwrap_or(len);
             let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
             let e = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
-            // A fetch off an unboxed strategy boxes the element it returns, so
-            // the elements accumulate in root slots: a plain `Vec` is scanned by
-            // nothing while the next box is allocated.  The block is read back
-            // as one indexed run once no further allocation separates it from
-            // the constructor, which pins the whole item set itself.
-            let items_base = pyre_object::gc_roots::shadow_stack_len();
-            let mut fetched = 0usize;
-            for i in s..e {
-                if let Some(v) = pyre_object::w_list_getitem(roots.get(obj_slot), i as i64) {
-                    let _ = roots.pin_root(v);
-                    fetched += 1;
-                }
-            }
-            let mut items = Vec::with_capacity(fetched);
-            for i in 0..fetched {
-                items.push(roots.get(items_base + i));
-            }
-            return Ok(pyre_object::w_list_new(items));
+            // Bounds are normalised here, outside `ll_listslice`: a user
+            // `__index__` may have resized this list, and the operand roots
+            // above are what keep it alive across that call. The leaf
+            // allocates once and copies; it does not convert bounds.
+            return Ok(pyre_object::ll_listslice(roots.get(obj_slot), s, e));
         }
         if pyre_object::is_str(obj) {
             // Slice on code-point boundaries over the WTF-8 view, so a

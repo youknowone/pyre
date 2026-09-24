@@ -94,6 +94,13 @@ pub type LegacyToTypedCandidates = HashMap<Variable, Vec<Variable>>;
 
 pub use crate::codewriter::annotation_state::valuetype_to_someshell;
 
+/// `__getslice_*` markers may carry an item-kind suffix as a second segment.
+/// The rtyper expands the marker to `getslice` and learns the element from
+/// the annotated list, so the suffix is ignored here.
+fn is_getslice_marker(segments: &[String], name: &str) -> bool {
+    segments.first().map(String::as_str) == Some(name) && segments.len() <= 2
+}
+
 /// Allocate a fresh `flowspace::Variable` and attach the projected
 /// `SomeValue` shell to its `annotation` slot.
 ///
@@ -2033,7 +2040,7 @@ pub fn translate_op(
                     // selects `SliceKind::MinusOne` for annotated constants
                     // `0` and `-1`, then `rlist.py:906-911` calls
                     // `ll_listslice_minusone` (asserting, not clamping).
-                    if segments.as_slice() == ["__getslice_minusone"] && arg_hls.len() == 1 {
+                    if is_getslice_marker(segments, "__getslice_minusone") && arg_hls.len() == 1 {
                         let slice = arg_hls.into_iter().next().expect("slice arg");
                         return Ok(vec![FlowspaceOp::new(
                             "getslice",
@@ -2045,7 +2052,7 @@ pub fn translate_op(
                             result,
                         )]);
                     }
-                    if segments.as_slice() == ["__getslice_rangeto"] && arg_hls.len() == 2 {
+                    if is_getslice_marker(segments, "__getslice_rangeto") && arg_hls.len() == 2 {
                         // slice, end -> getslice(slice, 0, end)
                         let mut args = arg_hls.into_iter();
                         let slice = args.next().expect("slice arg");
@@ -2060,7 +2067,7 @@ pub fn translate_op(
                             result,
                         )]);
                     }
-                    if segments.as_slice() == ["__getslice_rangefrom"] && arg_hls.len() == 2 {
+                    if is_getslice_marker(segments, "__getslice_rangefrom") && arg_hls.len() == 2 {
                         // slice, start -> getslice(slice, start, None).
                         // RPython `decompose_slice_args` selects StartOnly;
                         // the frontend records only SliceIndex<usize>
@@ -2078,7 +2085,7 @@ pub fn translate_op(
                             result,
                         )]);
                     }
-                    if segments.as_slice() == ["__getslice_range"] && arg_hls.len() == 3 {
+                    if is_getslice_marker(segments, "__getslice_range") && arg_hls.len() == 3 {
                         // slice, start, end -> getslice(slice, start, end)
                         // This is the direct RPython flow-space shape for the
                         // interpreter sites ported from `buffer[start:end]`.

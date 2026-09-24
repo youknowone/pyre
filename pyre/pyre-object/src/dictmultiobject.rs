@@ -2209,6 +2209,39 @@ pub unsafe fn w_dict_strategy_name(obj: PyObjectRef) -> &'static str {
     }
 }
 
+/// `getitem` for an exact `str` key, taken only where the probe cannot reach
+/// Python, and `default` when the key is absent.
+///
+/// `UnicodeDictStrategy` stores `str` keys only, and its `getitem` sends an
+/// exact `str` straight to the probe, so every comparison it can make is
+/// builtin.  Every other strategy is refused: `ObjectDictStrategy` holds keys
+/// of any type and can reach a stored key's `__eq__`, and `MapDictStrategy`
+/// can materialise object storage before it looks anything up.
+///
+/// The strategy is read here rather than by the caller because the two have to
+/// be one operation.  A separate check is a time-of-check window — a
+/// concurrent store can devolve the dict in between, and an unchecked probe
+/// then reports a raising `__eq__` as a miss.  `None` says the dict was not on
+/// that strategy, and the caller owes the checked lookup.
+///
+/// # Safety
+/// `obj` must point to a live dict and `key` to a live exact `str`.
+pub unsafe fn w_dict_lookup_str_keyed(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+    default: PyObjectRef,
+) -> Option<PyObjectRef> {
+    if is_module_dict(obj) {
+        return None;
+    }
+    lock_dict_refs!(_dict_guard, obj, key, default);
+    let strategy = w_dict_get_strategy(obj);
+    if strategy.strategy_kind() != StrategyKind::Unicode {
+        return None;
+    }
+    Some(strategy.getitem(obj, key).unwrap_or(default))
+}
+
 /// Key-set mutation state captured by dict iterators.
 ///
 /// PyPy's `BaseIteratorImplementation` owns a live iterator over the
