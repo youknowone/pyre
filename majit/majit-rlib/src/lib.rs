@@ -20,6 +20,7 @@ pub mod debug;
 pub mod jit;
 pub mod lltypesystem;
 pub mod nonconst;
+pub mod rarithmetic;
 pub mod rbigint;
 pub mod rffi;
 pub mod rposix;
