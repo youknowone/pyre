@@ -58,11 +58,6 @@ fn kwargs_at(items: &[PyObjectRef], i: usize) -> PyObjectRef {
     items[i]
 }
 
-/// `ll_setitem_fast` on `values_w[i]`.
-fn kwargs_at_mut(items: &mut [PyObjectRef], i: usize) -> &mut PyObjectRef {
-    &mut items[i]
-}
-
 /// `pypy/objspace/std/kwargsdict.py KwargsDictStrategy`
 /// singleton — matches PyPy's `space.fromcache(KwargsDictStrategy)`.
 pub static KWARGS_DICT_STRATEGY: KwargsDictStrategy = KwargsDictStrategy;
@@ -249,7 +244,10 @@ impl DictStrategy for KwargsDictStrategy {
             let storage = &mut *(dict.dstorage as *mut (Vec<PyObjectRef>, Vec<PyObjectRef>));
             for i in 0..storage.0.len() {
                 if crate::dictmultiobject::dict_keys_equal(kwargs_at(&storage.0, i), w_key) {
-                    *kwargs_at_mut(&mut storage.1, i) = w_value;
+                    // Direct element store in this body. A helper that
+                    // returns `&mut items[i]` leaves an opaque `index_mut`
+                    // whose destination is not a single deref here.
+                    storage.1[i] = w_value;
                     crate::dictmultiobject::dict_write_barrier(w_dict);
                     return;
                 }
@@ -480,6 +478,27 @@ mod tests {
                 .map(|&(key, _)| crate::w_str_get_value(key).to_owned())
                 .collect();
             assert_eq!(keys, ["c", "b", "a"]);
+        }
+    }
+
+    #[test]
+    fn kwargs_setitem_overwrites_an_existing_parallel_value() {
+        unsafe {
+            let w_dict = kwargs_with(&[("a", 1), ("b", 2)]);
+            crate::dictmultiobject::w_dict_setitem_str(w_dict, "a", crate::w_int_new(9));
+            let strategy = crate::dictmultiobject::w_dict_get_strategy(w_dict);
+            assert_eq!(
+                strategy.strategy_kind(),
+                crate::dictmultiobject::StrategyKind::Kwargs
+            );
+            assert_eq!(strategy.length(w_dict), 2);
+            let (w_key, w_value) = strategy.nth_item(w_dict, 0).unwrap();
+            assert_eq!(crate::w_str_get_value(w_key), "a");
+            assert_eq!(crate::w_int_get_value(w_value), 9);
+            assert_eq!(
+                crate::w_int_get_value(strategy.nth_value(w_dict, 1).unwrap()),
+                2
+            );
         }
     }
 
