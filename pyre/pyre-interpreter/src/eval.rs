@@ -498,10 +498,9 @@ pub unsafe fn walk_raw_code_roots(
         visitor(&mut *(&mut code.w_qualname as *mut PyObjectRef as *mut majit_ir::GcRef));
         // `co_name` is realized and retained the same way.
         visitor(&mut *(&mut code.w_name as *mut PyObjectRef as *mut majit_ir::GcRef));
-        let names_slot = &mut code.co_names_w as *mut *mut pyre_object::FixedObjectArray;
-        visitor(&mut *(names_slot as *mut majit_ir::GcRef));
-        let consts_slot = &mut code.co_consts_w as *mut *mut pyre_object::FixedObjectArray;
-        visitor(&mut *(consts_slot as *mut majit_ir::GcRef));
+        // `co_names_w` items are immortal interned strings. `co_consts_w` is
+        // the code object's own length-prefixed block, not a collector object,
+        // so the items are the direct edges.
         if !code.co_consts_w.is_null() {
             for slot in unsafe { (*code.co_consts_w).as_mut_slice() } {
                 if slot.is_null() {
