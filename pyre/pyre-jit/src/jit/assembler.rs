@@ -1169,6 +1169,24 @@ fn dispatch_op(
                 .builder
                 .vable_getfield_float_with_base(dst, vable_reg, field_idx);
         }
+        "getfield_gc_i" => {
+            let dst = expect_result_reg(result, Kind::Int, "getfield_gc_i needs result");
+            assert_eq!(args.len(), 2, "getfield_gc_i expects [struct, fielddescr]");
+            let struct_reg = expect_reg(&args[0], Kind::Ref);
+            let field = expect_field_bh_descr(&args[1], "getfield_gc_i");
+            state.builder.getfield_gc_i_bh(dst, struct_reg, field);
+        }
+        "setfield_gc_i" => {
+            assert_eq!(
+                args.len(),
+                3,
+                "setfield_gc_i expects [struct, value, fielddescr]"
+            );
+            let struct_reg = expect_reg(&args[0], Kind::Ref);
+            let value_reg = expect_reg(&args[1], Kind::Int);
+            let field = expect_field_bh_descr(&args[2], "setfield_gc_i");
+            state.builder.setfield_gc_i_bh(struct_reg, value_reg, field);
+        }
         "setfield_vable_i" => {
             // pyjitpl.py `_opimpl_setfield_vable` is generic
             // across i/r/f — `valuebox` may be a ConstInt after optimizer
@@ -2285,6 +2303,18 @@ fn expect_vable_arraylen_args(args: &[Operand]) -> (u16, u16) {
 /// `assembler.py _encode_descr` — the descr operand of a heap
 /// array op is appended to `Assembler.descrs` and encoded as a 2-byte
 /// index.
+fn expect_field_bh_descr(op: &Operand, ctx: &'static str) -> majit_translate::jitcode::BhDescr {
+    match op {
+        Operand::Descr(d) => match &**d {
+            DescrOperand::Bh(field @ majit_translate::jitcode::BhDescr::Field { .. }) => {
+                field.clone()
+            }
+            other => panic!("{ctx} expects DescrOperand::Bh(BhDescr::Field), got {other:?}"),
+        },
+        other => panic!("{ctx} expects a descr operand, got {other:?}"),
+    }
+}
+
 fn expect_array_bh_descr(state: &mut AssemblyState, op: &Operand, ctx: &'static str) -> u16 {
     match op {
         Operand::Descr(d) => match &**d {

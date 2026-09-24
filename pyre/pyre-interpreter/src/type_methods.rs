@@ -610,7 +610,11 @@ pub(crate) fn list_extend_items(
         // `framelocalsproxy_iter` is `iter(self.keys())`.  The key list is
         // built inside this residual so `descr_init`'s graph does not gain
         // `keys`, and `list(f_locals)` does not re-enter the interpreter.
-        extend_from_frame_locals_proxy(list, other)?;
+        // `false` means the proxy had no key list; drain it as a generic
+        // iterable.
+        if !extend_from_frame_locals_proxy(list, other) {
+            extend_from_iterable(list, other)?;
+        }
     } else {
         extend_from_iterable(list, other)?;
     }
@@ -726,27 +730,22 @@ fn extend_from_set(list: PyObjectRef, other: PyObjectRef) -> Result<(), crate::P
 }
 
 /// `list(FrameLocalsProxy)` — `keys()` then the same storage copy as
-/// `list(list)`.  `dont_look_inside` so the key materialization stays out
-/// of `descr_init`.
-#[majit_macros::dont_look_inside]
-fn extend_from_frame_locals_proxy(
-    list: PyObjectRef,
-    other: PyObjectRef,
-) -> Result<(), crate::PyError> {
+/// `list(list)`.  `bool`, not `Result`: a `Result` residual is may-force
+/// and `descr_init` is a transparent helper that cannot record one.
+/// `false` asks the caller to use the generic iterable drain.
+#[majit_macros::dont_look_inside_cannot_raise]
+fn extend_from_frame_locals_proxy(list: PyObjectRef, other: PyObjectRef) -> bool {
     // `keys_list` materializes the key list, so both operands can move
     // under it.  `extend_from_list` pins what it is handed, which is too
     // late for an address this frame captured before the allocation.
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(&[list, other]);
-    let Some(keys) = crate::pyframe::frame_locals_proxy::keys_list(
+    let Some(Ok(keys)) = crate::pyframe::frame_locals_proxy::keys_list(
         pyre_object::gc_roots::shadow_stack_get(base + 1),
     ) else {
-        return extend_from_iterable(
-            pyre_object::gc_roots::shadow_stack_get(base),
-            pyre_object::gc_roots::shadow_stack_get(base + 1),
-        );
+        return false;
     };
-    extend_from_list(pyre_object::gc_roots::shadow_stack_get(base), keys?)
+    extend_from_list(pyre_object::gc_roots::shadow_stack_get(base), keys).is_ok()
 }
 
 /// `listobject.py ListStrategy._extend_from_iterable`.  Upstream drains
@@ -6819,7 +6818,108 @@ pub(crate) fn set_contains_checked(
 /// registered under another name has no member and the call stays
 /// `no jitcode for address`.
 pub fn __majit_wrap_dict_descr_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    dict_method_get(args)
+    // `d.get(key)` / `d.get(key, default)` of an exact dict and an exact
+    // `str` key.  `dict_method_get` hashes through user code and its graph
+    // reaches `w_dict_str_entries_wtf8`, which the descent scan refuses.
+    // Those two residuals stay out of this graph; the slow arm is one real
+    // fnaddr.
+    if (args.len() == 2 || args.len() == 3) && !args[0].is_null() {
+        // A three-word call can be `d.get(k, **kw)`: the third word is then
+        // the marker dict, not a default.
+        let tail = if args.len() == 3 {
+            args[2]
+        } else {
+            pyre_object::PY_NULL
+        };
+        if dict_get_plain_applies(args[0], args[1], tail) {
+            let default = if args.len() == 3 {
+                tail
+            } else {
+                pyre_object::w_none()
+            };
+            let found = dict_get_plain(args[0], args[1], default);
+            if !found.is_null() {
+                return Ok(found);
+            }
+        }
+    }
+    let dict = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let key = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+    // Three words cover a call of length 0..=3. A longer slice's last
+    // element rides in the third word so a trailing keyword dict is still
+    // visible when the real arity is rejected.
+    let default = if args.len() > 3 {
+        args[args.len() - 1]
+    } else {
+        args.get(2).copied().unwrap_or(pyre_object::PY_NULL)
+    };
+    dict_get_slow(dict, key, default, args.len() as i64)
+}
+
+/// Exact `dict`, an exact `str` key, and a third word that is not the
+/// trailing keyword dict.
+///
+/// Exactness is the requirement, not layout: `py_type_check` passes a `str`
+/// subclass, whose `__hash__` can raise, and the unchecked probe reports that
+/// raise as a miss.  `tail` is `PY_NULL` for a two-word call; anything else is
+/// the caller's third word, and a keyword marker there means the call is
+/// `d.get(k, **kw)`, which `dict_method_get` rejects.
+///
+/// The dict's strategy is deliberately not tested here.  Reading it in this
+/// call and probing in the next is a time-of-check window, so
+/// [`dict_get_plain`] decides it under the lock that probes.
+#[majit_macros::dont_look_inside_cannot_raise]
+fn dict_get_plain_applies(dict: PyObjectRef, key: PyObjectRef, tail: PyObjectRef) -> bool {
+    unsafe {
+        pyre_object::is_exact_type(dict, &pyre_object::DICT_TYPE)
+            && pyre_object::is_exact_type(key, &pyre_object::STR_TYPE)
+            && (tail.is_null() || !crate::builtins::builtin_kwargs_marker_tail(tail))
+    }
+}
+
+/// Lookup for a key [`dict_get_plain_applies`] already accepted.
+///
+/// `PY_NULL` says the answer is not this path's to give and the caller owes
+/// the checked arm.  A stored value is never `PY_NULL`, so the only other
+/// reading is a miss whose `default` was itself `PY_NULL` — the padded shape
+/// of a two-argument call — and the checked arm answers that one identically.
+#[majit_macros::dont_look_inside_cannot_raise]
+fn dict_get_plain(dict: PyObjectRef, key: PyObjectRef, default: PyObjectRef) -> PyObjectRef {
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_lookup_str_keyed(dict, key, default)
+            .unwrap_or(pyre_object::PY_NULL)
+    }
+}
+
+/// Word ABI so the residual has a real fnaddr.  A `&[PyObjectRef]`
+/// parameter is a fat pointer and gets no trampoline, which the descent
+/// scan reports as an un-lowered helper.
+#[majit_macros::dont_look_inside]
+fn dict_get_slow(
+    dict: PyObjectRef,
+    key: PyObjectRef,
+    default: PyObjectRef,
+    nargs: i64,
+) -> Result<PyObjectRef, crate::PyError> {
+    // `nargs` is the flat length, receiver included. Collapsing anything
+    // above three into a three-argument call drops the too-many-arguments
+    // TypeError `dict_method_get` raises from the real slice.
+    if nargs == 3 {
+        dict_method_get(&[dict, key, default])
+    } else if nargs == 2 {
+        dict_method_get(&[dict, key])
+    } else if nargs == 1 {
+        dict_method_get(&[dict])
+    } else if nargs <= 0 {
+        dict_method_get(&[])
+    } else {
+        let n = nargs as usize;
+        let mut buf = vec![pyre_object::PY_NULL; n];
+        buf[0] = dict;
+        buf[1] = key;
+        buf[n - 1] = default;
+        dict_method_get(&buf)
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]

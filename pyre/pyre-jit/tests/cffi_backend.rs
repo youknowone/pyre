@@ -46,7 +46,7 @@ fn run_harness(program: &str, name: &str) -> Result<(), String> {
     set_last_exec_ctx(Rc::as_ptr(&execution_context));
 
     let mut frame = PyFrame::new_with_context(code, execution_context)
-        .map_err(|e| format!("frame setup error: {}", e.message))?;
+        .map_err(|e| format!("frame setup error: {}", e.message_text()))?;
 
     let canonical = frame.get_w_globals();
     let main_module = pyre_object::w_module_new_aliasing_dict("__main__", canonical);

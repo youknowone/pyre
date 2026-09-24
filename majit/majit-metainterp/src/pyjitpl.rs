@@ -908,6 +908,77 @@ pub(crate) fn snapshot_tagged_to_box(
     }
 }
 
+/// `opencoder.py` `TraceIterator.__init__`: seed
+/// `_cache[self.trace.inputargs[i].get_position()]`, then `next` rewrites
+/// every arg through that cache. A guard-failure retrace keeps dead failarg
+/// holes in the coordinate space (`History.set_inputargs`), so the live list
+/// is `[InputArg(0), InputArg(2)]` while ops still name slot 2. The fresh
+/// boxes are allocated densely from 0, which is the namespace
+/// `UnrollOptimizer`'s later `TraceIterator::new` walks.
+fn prepare_retrace_snapshot(mut trace: crate::history::TreeLoop) -> crate::history::TreeLoop {
+    let (ops, reminted_inputargs, cache) = {
+        let mut iter = crate::opencoder::TraceIterator::new_with_inputargs(
+            &trace.ops,
+            0,
+            trace.ops.len(),
+            None,
+            &trace.inputargs,
+            0,
+        );
+        let mut ops = Vec::with_capacity(trace.ops.len());
+        while let Some(op) = iter.next() {
+            ops.push(op);
+        }
+        for (src, dst) in trace.ops.iter().zip(ops.iter()) {
+            if let Some(value) = src.get_value() {
+                dst.set_value(value);
+            }
+        }
+        for (arg, ia) in trace.inputargs.iter().zip(iter.inputargs.iter()) {
+            if let Some(value) = arg.get_value() {
+                ia.set_value(value);
+            }
+        }
+        (ops, iter.inputargs, iter._cache)
+    };
+    let translate = |opref: majit_ir::OpRef| -> majit_ir::OpRef {
+        if opref.is_none() || opref.is_constant() {
+            return opref;
+        }
+        cache
+            .get(opref.raw() as usize)
+            .and_then(|slot| slot.as_ref())
+            .map(|b| b.to_opref())
+            .unwrap_or_else(|| {
+                panic!(
+                    "prepare_retrace_snapshot cache miss for {opref:?} (cache_len={})",
+                    cache.len()
+                )
+            })
+    };
+    let rewrite_tagged = |tagged: &mut crate::recorder::SnapshotTagged| {
+        if let crate::recorder::SnapshotTagged::Box(opref, _) = tagged {
+            *opref = translate(*opref);
+        }
+    };
+    for snap in &mut trace.snapshots {
+        for frame in &mut snap.frames {
+            for tagged in &mut frame.boxes {
+                rewrite_tagged(tagged);
+            }
+        }
+        for tagged in &mut snap.vable_boxes {
+            rewrite_tagged(tagged);
+        }
+        for tagged in &mut snap.vref_boxes {
+            rewrite_tagged(tagged);
+        }
+    }
+    trace.ops = ops;
+    trace.inputargs = reminted_inputargs;
+    trace
+}
+
 fn snapshot_map_from_trace_snapshots(
     trace_snapshots: &[crate::recorder::Snapshot],
     constants: &mut majit_ir::ConstMap<majit_ir::Value>,
@@ -5347,7 +5418,7 @@ impl<M: Clone> MetaInterp<M> {
         let inner_key = ctx.cut_inner_green_key?;
         // compile.py:269: cross-loop cut uses the inner loop's merge point.
         // Lookup by inner_key (not ctx.green_key which is the outer loop).
-        ctx.get_merge_point_at(inner_key, ctx.header_pc)
+        ctx.find_merge_point_same_greenkey(inner_key, None)
             .filter(|mp| mp.position.has_prefix_ops(ctx.num_inputargs()))
             .map(|mp| (mp.header_pc, mp.green_boxes.clone()))
     }
@@ -7789,11 +7860,18 @@ impl<M: Clone> MetaInterp<M> {
             // `compile_retrace` matches on the NEXT visit is the one
             // appended here — a full iteration later, which is what makes
             // the retrace body non-empty.
-            let merge_position = self
-                .tracing
-                .as_ref()
-                .and_then(|ctx| ctx.get_merge_point_at(ctx.green_key, ctx.close_header_pc()))
-                .map(|mp| mp.position);
+            // `reached_loop_header` `same_greenkey(original_boxes, live_arg_boxes)`
+            // — the greens of the merge point just reached, not the trace-start
+            // key, and not a side header_pc.
+            let merge_position = self.tracing.as_ref().and_then(|ctx| {
+                let typed = ctx.close_green_key();
+                let key = typed
+                    .as_ref()
+                    .map(|k| k.get_uhash())
+                    .unwrap_or(ctx.green_key);
+                ctx.find_merge_point_same_greenkey(key, typed.as_ref())
+                    .map(|mp| mp.position)
+            });
             if merge_position.is_none() {
                 self.register_retrace_merge_point(jump_args);
                 // pyjitpl.py:3059-3060: no loop compiled, so the caller
@@ -7849,13 +7927,15 @@ impl<M: Clone> MetaInterp<M> {
                     self.clear_trace_session();
                     return CompileOutcome::Aborted;
                 }
-                // Not too many — clear retrace state and fall through
-                // to normal compile_loop path.
+                // `reached_loop_header`: compile_retrace returned None, so
+                // cut the tentative JUMP (already done inside compile_retrace),
+                // drop exported_state, append this header and keep tracing.
+                // `partial_trace` stays. Falling into `compile_loop` hits
+                // `has_compiled_targets` and gives the trace up.
                 self.exported_state = None;
-                crate::debug::log_one(
-                    "jit-tracing",
-                    "retrace cancelled, trying normal compilation",
-                );
+                crate::debug::log_one("jit-tracing", "cancelled, tracing more...");
+                self.register_retrace_merge_point(jump_args);
+                return CompileOutcome::Cancelled;
             } else {
                 // pyjitpl.py:2994-2995: position mismatch — abort.
                 self.clear_retrace_state();
@@ -7897,6 +7977,10 @@ impl<M: Clone> MetaInterp<M> {
             let closed = ctx.close_green_key();
             (closed, cut_inner, outer)
         };
+        // Kept for the same_greenkey scan below. `resolve_cell_key` consumes
+        // `closed`, and the merge point was filed under the greens themselves,
+        // not under the resolved cell key.
+        let closed_for_scan = closed.clone();
         // File the loop under the CELL key, not the bucket hash: this is the
         // key a later warm entry resolves and looks `compiled_loops` up by, and
         // on a chained bucket a bucket hash names a different cell's slot. The
@@ -7977,8 +8061,31 @@ impl<M: Clone> MetaInterp<M> {
             self.speculative_cut_owned_key = Some(cut_key);
         }
         self.force_finish_trace = false;
+        // Park the recorder where `walk_active_trace_refs` still sees it.
+        // `reached_loop_header` calls `history.trace.tracing_done()` before
+        // `compile_loop`. A tag overflow is `SwitchToBlackhole(ABORT_TOO_LONG)`
+        // (`opencoder.py` `tracing_done`), not a loop we publish.
         self.compile_tracing = self.tracing.take();
         let _compile_tracing_guard = CompileTracingGuard::new(&mut self.compile_tracing);
+        let tracing_failed = {
+            let ctx = self.compile_tracing.as_mut().unwrap();
+            match ctx.recorder.tracing_done() {
+                Ok(()) => None,
+                Err(reason) => Some((reason.as_int(), ctx.green_key)),
+            }
+        };
+        if let Some((reason, key)) = tracing_failed {
+            // `opencoder.py tracing_done` raises `SwitchToBlackhole(ABORT_TOO_LONG)`.
+            // `aborted_tracing` then counts that reason. The ctx is already
+            // parked in `compile_tracing`, so `abort_trace_live` cannot read
+            // the key; stage it the way `finish_and_compile` does.
+            self.pending_abort_reason = Some(reason);
+            self.warm_state.abort_tracing(key, false);
+            self.pending_abort_green_key = Some(key);
+            self.pending_abort_permanent = false;
+            self.clear_trace_session();
+            return CompileOutcome::Aborted;
+        }
         // Cache driver descriptor before ctx is partially consumed below;
         // mirrors the FINISH-path capture pattern (see `finish_and_compile`).
         let driver_descriptor = self
@@ -8007,8 +8114,10 @@ impl<M: Clone> MetaInterp<M> {
         let (orig_vable_ptr_loop, cross_loop_cut, call_pure_results) = {
             let ctx = self.compile_tracing.as_ref().unwrap();
             let n_inputargs = ctx.num_inputargs();
+            // `reached_loop_header` `same_greenkey`: typed greens, not a
+            // side `header_pc`. The cell hash is only the untyped fallback.
             let cut_merge_point = ctx
-                .get_merge_point_at(green_key, ctx.header_pc)
+                .find_merge_point_same_greenkey(green_key, closed_for_scan.as_ref())
                 .filter(|mp| mp.position.has_prefix_ops(n_inputargs));
             let orig_vable_ptr_loop =
                 self.orig_vable_ptr_for_cut(cut_merge_point, ctx, driver_descriptor.as_ref());
@@ -9365,17 +9474,31 @@ impl<M: Clone> MetaInterp<M> {
             .iter()
             .map(|&op| crate::trace_ctx::GreenBox::new(op, op.ty().unwrap_or(majit_ir::Type::Void)))
             .collect();
-        let key = ctx.green_key;
         // pyjitpl.py:3059-3060 `self.current_merge_points.append(
         // (live_arg_boxes, start))` appends the greens the trace is closing
         // WITH, which is the same list the `same_greenkey` scan above
-        // compares against. Register under those greens' header so the next
-        // visit's scan can find this entry.
+        // compares against. That key is the close, not the trace-start key.
+        let key_typed = ctx
+            .close_green_key()
+            .or_else(|| ctx.green_key_values().cloned());
+        let hash_fallback = key_typed
+            .as_ref()
+            .map(|k| k.get_uhash())
+            .unwrap_or(ctx.green_key);
         let header_pc = ctx.close_header_pc();
-        // `key` is `ctx.green_key`, so the trace's own structured key is the
-        // one it was hashed from; carrying it lets the segmenting consumers
-        // reach this header's cell by comparekey instead of by bucket.
-        let key_typed = ctx.green_key_values().cloned();
+        // `compile_loop` files under `resolve_cell_key`, and `compile_retrace`
+        // reads this entry back as `mp.green_key` for `compiled_loops`. A
+        // bucket hash names a different cell once the bucket is chained.
+        let key = match key_typed.clone() {
+            Some(typed) => self
+                .warm_state
+                .resolve_cell_key(typed.get_uhash(), || typed),
+            None => hash_fallback,
+        };
+        let ctx = self
+            .tracing
+            .as_mut()
+            .expect("register_retrace_merge_point: tracing");
         ctx.add_merge_point_with_key(key, key_typed, green_boxes, header_pc);
         if crate::majit_log_enabled() {
             eprintln!(
@@ -9951,7 +10074,12 @@ impl<M: Clone> MetaInterp<M> {
         };
         let mut start_state = match self.exported_state.take() {
             Some(s) => s,
-            None => return false,
+            None => {
+                // `compile_retrace` returning None leaves `partial_trace` on
+                // the metainterp (`reached_loop_header` keeps tracing).
+                self.partial_trace = Some(partial);
+                return false;
+            }
         };
         // gcreftracer.py parity: GC may have moved objects between Phase 1
         // and Phase 2. Refresh GcRef values from shadow stack before use.
@@ -9966,9 +10094,22 @@ impl<M: Clone> MetaInterp<M> {
         let vable_config = self.current_virtualizable_optimizer_config();
         self.force_finish_trace = false;
         let retracing_from = self.retracing_from.take();
+        let retracing_from_kept = retracing_from;
+        // Same park as `compile_loop_body`. `reached_loop_header` calls
+        // `tracing_done` on this arm too, before `compile_retrace`.
         self.compile_tracing = self.tracing.take();
         let _compile_tracing_guard = CompileTracingGuard::new(&mut self.compile_tracing);
-        if self.compile_tracing.is_none() {
+        let tracing_failed = {
+            let Some(ctx) = self.compile_tracing.as_mut() else {
+                return false;
+            };
+            match ctx.recorder.tracing_done() {
+                Ok(()) => None,
+                Err(reason) => Some(reason.as_int()),
+            }
+        };
+        if let Some(reason) = tracing_failed {
+            self.pending_abort_reason = Some(reason);
             return false;
         }
         let (
@@ -9980,6 +10121,8 @@ impl<M: Clone> MetaInterp<M> {
             trace,
             call_pure_results,
             phase2_input_ops_seed,
+            mut ctx,
+            jump_cut,
         ) = {
             let driver_descriptor = self
                 .compile_tracing
@@ -10059,12 +10202,17 @@ impl<M: Clone> MetaInterp<M> {
             };
             let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
-            // compile.py:358-362 records the closing JUMP on the same history
-            // that `cut_trace_from` views. Rust materializes TreeLoop eagerly,
-            // so close once, then cut the completed trace.
-            self.compile_tracing.as_mut().unwrap().close_loop(jump_args);
-            let ctx = self.compile_tracing.take().unwrap();
-            let trace = ctx.into_tree_loop();
+            // `compile_retrace` records the closing JUMP on the same history
+            // that `cut_trace_from` views. The optimizer sees a snapshot so
+            // `InvalidLoop` can `history.cut` this JUMP and keep tracing.
+            let jump_cut = {
+                let ctx = self.compile_tracing.as_mut().unwrap();
+                let jump_cut = ctx.get_trace_position();
+                ctx.close_loop(jump_args);
+                jump_cut
+            };
+            let mut ctx = self.compile_tracing.take().unwrap();
+            let trace = ctx.snapshot_tree_loop();
             let trace = if let Some((ref original_boxes, start)) = retrace_cut {
                 if crate::majit_log_enabled() {
                     eprintln!(
@@ -10088,6 +10236,11 @@ impl<M: Clone> MetaInterp<M> {
             } else {
                 trace
             };
+            // `TraceIterator.__init__` binds each live input at
+            // `inputargs[i].get_position()`, then `next` rewrites ops and
+            // snapshots onto the fresh boxes. The unroll phases walk that
+            // rewritten trace with a dense `TraceIterator::new`.
+            let trace = prepare_retrace_snapshot(trace);
             // Seed the retrace optimizer's `input_ops` directly. Retrace runs
             // no Phase 1, so the recorder ops carry no `_forwarded`, and
             // `trace.ops` (non-cut) are the recorder `Rc<Op>` themselves. Cut
@@ -10107,6 +10260,8 @@ impl<M: Clone> MetaInterp<M> {
                 trace,
                 call_pure_results,
                 phase2_input_ops_seed,
+                ctx,
+                jump_cut,
             )
         };
 
@@ -10226,12 +10381,11 @@ impl<M: Clone> MetaInterp<M> {
         // fills from `preamble_data.base.inputargs()`. Left empty here, the
         // retrace's Phase 2 iterator seeds nothing and `_get` misses on the
         // first body operand that refers to a cut inputarg.
-        unroll_opt.trace_inputargs = trace
-            .inputargs
-            .iter()
-            .enumerate()
-            .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp.get()))
-            .collect();
+        // Fresh boxes from `prepare_retrace_snapshot`
+        // (`TraceIterator.__init__` / `inputarg_from_tp`). Their `.index` is
+        // the position the rewritten ops name, including a hole-filtered
+        // retrace whose original last live arg was `InputArg(2)`.
+        unroll_opt.trace_inputargs = trace.inputargs.iter().map(|ia| ia.opref()).collect();
         unroll_opt.trace_inputarg_boxes = trace.inputargs.clone();
         let (
             mut retrace_snapshot_boxes,
@@ -10282,7 +10436,10 @@ impl<M: Clone> MetaInterp<M> {
             // A guard proven to always fail (deferred `InvalidLoop` signal):
             // abandon the retrace.
             Err(_invalid_loop) => {
-                // compile.py compile_retrace: jitlog.trace_aborted on InvalidLoop.
+                // `compile_retrace`: jitlog.trace_aborted, history.cut(cut),
+                // return None. The tentative JUMP comes off and tracing
+                // continues; the caller counts a cancel instead of giving
+                // the trace up.
                 self.jitlog_trace_aborted();
                 if crate::debug::have_debug_prints() {
                     crate::debug::log_one(
@@ -10290,6 +10447,12 @@ impl<M: Clone> MetaInterp<M> {
                         &format!("compile_retrace: InvalidLoop at key={green_key}"),
                     );
                 }
+                ctx.cut_trace(jump_cut);
+                self.tracing = Some(ctx);
+                // `reached_loop_header` keeps `partial_trace` and
+                // `retracing_from` when `compile_retrace` returns None.
+                self.partial_trace = Some(partial);
+                self.retracing_from = retracing_from_kept;
                 return false;
             }
         };
@@ -12659,7 +12822,7 @@ impl<M: Clone> MetaInterp<M> {
             // pointer width: an i64 read on a 32-bit target would pull the
             // adjacent header word into the high half and the class value
             // would never compare equal to a pointer-width one
-            // (`Cpu::cls_of_gcref`, `jit_exc_raise`).
+            // (`Cpu::bh_classof`, `jit_exc_raise`).
             unsafe { *(result.exception_value.0 as *const usize) as i64 }
         };
         let exception = ExceptionState {
@@ -18051,23 +18214,43 @@ impl<M: Clone> MetaInterp<M> {
     /// starts at 0 and `call_ids` holds the root id, matching
     /// `newframe(mainjitcode)` with no greenkey.
     pub fn seed_root_portal_frame(&mut self, mainjitcode: std::sync::Arc<crate::jitcode::JitCode>) {
-        self.rebuild_portal_framestack_from_resume(mainjitcode, 1);
+        // `initialize_state_from_start` has no resume pc. `newframe` leaves
+        // the frame at 0, which is `setup_resume_at_op` of a start.
+        self.rebuild_portal_framestack_from_resume(mainjitcode, &[]);
     }
 
-    /// resume.py `rebuild_from_resumedata`: `newframe(jitcode)` per
-    /// encoded section, no greenkey. The root lands at
-    /// `portal_call_depth == 0`; each extra portal section increments it.
+    /// resume.py `rebuild_from_resumedata`: `newframe(jitcode)` per encoded
+    /// section, then `f.setup_resume_at_op(pc)`, no greenkey.
+    ///
+    /// `resume_pcs` is outermost-first, the order the resume stream is read.
+    /// Empty means one portal frame at pc 0 (`initialize_state_from_start`).
+    /// Pyre's inlined Python frames share the portal jitcode, so each section
+    /// is a portal frame and `portal_call_depth` counts them. The pc is still
+    /// per section: leaving every frame at 0 resumes the callee at the
+    /// caller's entry.
     pub fn rebuild_portal_framestack_from_resume(
         &mut self,
         mainjitcode: std::sync::Arc<crate::jitcode::JitCode>,
-        nframes: usize,
+        resume_pcs: &[i32],
     ) {
         self.portal_call_depth = -1;
         self.framestack = crate::pyjitpl::MIFrameStack::empty();
         self.call_ids.clear();
         self.current_call_id = 0;
-        for _ in 0..nframes.max(1) {
-            let _ = self.newframe(mainjitcode.clone(), None);
+        let count = resume_pcs.len().max(1);
+        for i in 0..count {
+            let frame_index = self.newframe(mainjitcode.clone(), None);
+            let Some(pc) = resume_pcs
+                .get(i)
+                .copied()
+                .and_then(|pc| usize::try_from(pc).ok())
+            else {
+                continue;
+            };
+            if let Some(frame) = self.framestack.frames.get_mut(frame_index) {
+                // resume.py: `f.setup_resume_at_op(pc)` — body is `self.pc = pc`.
+                frame.setup_resume_at_op(pc);
+            }
         }
     }
 
@@ -29361,6 +29544,161 @@ mod tests {
             assert_eq!(events.len(), 2);
             assert_eq!(events[1], (green_key, true));
         }
+    }
+
+    #[test]
+    fn retrace_cancel_keeps_tracing_when_unroll_budget_remains() {
+        // `reached_loop_header`: `compile_retrace` returned None and
+        // `cancel_count` is still within `max_unroll_loops`, so the header
+        // is appended and tracing continues. `partial_trace` stays.
+        // Falling through into `compile_loop` would hit `has_compiled_targets`.
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
+        meta.warm_state.set_param("max_unroll_loops", 1);
+        let green_key = 42u64;
+        for _ in 0..2 {
+            meta.on_back_edge(green_key, &[0]);
+        }
+        let start = meta.trace_ctx().unwrap().current_merge_points[0].position;
+        // `has_compiled_targets` is `get_procedure_token` plus
+        // `token.target_tokens`. The cell stores a weak ref, so the token
+        // has to stay alive (`keep_loop_alive`) and carry compiled code.
+        let token = std::sync::Arc::new(JitCellToken::new(9));
+        token.set_compiled(Box::new(()));
+        token.record_target_token(crate::history::TargetToken::new_loop(1).as_jump_target_descr());
+        meta.warm_state_mut().memory_manager.keep_loop_alive(&token);
+        meta.warm_state_mut()
+            .attach_procedure_to_interp(green_key, std::sync::Arc::clone(&token));
+        assert!(
+            meta.has_compiled_targets(green_key),
+            "the fall-through compile_loop would give this key up"
+        );
+        meta.partial_trace = Some(PartialTrace {
+            ops: Vec::new(),
+            inputargs: Vec::new(),
+        });
+        meta.retracing_from = Some(start);
+        let before = meta.trace_ctx().unwrap().current_merge_points.len();
+        let outcome = meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+        assert!(
+            matches!(outcome, CompileOutcome::Cancelled),
+            "retrace cancel must keep tracing, got {outcome:?}"
+        );
+        assert!(meta.tracing.is_some());
+        assert!(meta.partial_trace().is_some());
+        assert!(meta.take_keep_tracing_after_close());
+        assert_eq!(
+            meta.trace_ctx().unwrap().current_merge_points.len(),
+            before + 1
+        );
+    }
+
+    #[test]
+    fn retrace_merge_point_stores_the_resolved_cell_key() {
+        // `compile_retrace` reads `mp.green_key` as the `compiled_loops` key.
+        // That map is keyed by `resolve_cell_key`, not by `GreenKey::get_uhash`.
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let pc = 11i64;
+        let extra = 7200i64;
+        let parked = majit_ir::GreenKey::new(vec![pc, extra]);
+        let hash = parked.get_uhash();
+        // A comparekey-less cell already owns `hash`, so the typed install
+        // is minted a different cell key (`attach_procedure_to_interp`).
+        let squatter = std::sync::Arc::new(JitCellToken::new(meta.warm_state.alloc_token_number()));
+        squatter.set_compiled(Box::new(()));
+        meta.warm_state
+            .attach_procedure_to_interp(hash, std::sync::Arc::clone(&squatter));
+        meta.warm_state
+            .attach_procedure_to_interp_for_key(&parked, squatter);
+        let minted = meta.warm_state.cell_key_for(&parked).expect("typed cell");
+        assert_ne!(minted, hash, "fixture: chained install mints a cell key");
+
+        for _ in 0..2 {
+            meta.on_back_edge(1, &[0]);
+        }
+        {
+            let ctx = meta.trace_ctx().unwrap();
+            ctx.set_driver_descriptor(crate::jitdriver::JitDriverStaticData::new(
+                vec![("g", Type::Int)],
+                vec![("r", Type::Int)],
+            ));
+            ctx.close_green_pc = Some(pc);
+            ctx.close_greens = Some((vec![extra], Vec::new(), Vec::new()));
+        }
+        let closed = meta
+            .trace_ctx()
+            .unwrap()
+            .close_green_key()
+            .expect("close greens");
+        assert_eq!(closed, parked);
+        assert_eq!(
+            meta.warm_state.resolve_cell_key(hash, || closed.clone()),
+            minted
+        );
+        meta.partial_trace = Some(PartialTrace {
+            ops: Vec::new(),
+            inputargs: Vec::new(),
+        });
+        meta.retracing_from = Some(meta.trace_ctx().unwrap().current_merge_points[0].position);
+        let outcome = meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+        assert!(matches!(outcome, CompileOutcome::Cancelled));
+        let stored = meta
+            .trace_ctx()
+            .unwrap()
+            .current_merge_points
+            .last()
+            .unwrap()
+            .green_key;
+        assert_eq!(stored, minted);
+        assert_ne!(stored, hash);
+    }
+
+    #[test]
+    fn retrace_sparse_failargs_optimize_binds_last_live_arg() {
+        // Guard-failure layout [live, dead, live]. Ops name slot 2.
+        // `TraceIterator.__init__` caches that slot; the last live arg
+        // must optimize as the value recorded on InputArg(2).
+        let mut rec = crate::recorder::Trace::with_input_layout(
+            &[Type::Int, Type::Ref, Type::Int],
+            &[true, false, true],
+        );
+        let live = rec.live_inputargs_cloned();
+        live[0].set_value(Value::Int(11));
+        live[1].set_value(Value::Int(22));
+        let _add = rec.record_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::input_arg_int(2)],
+        );
+        rec.close_loop(&[OpRef::input_arg_int(0), OpRef::input_arg_int(2)]);
+        let (inputargs, ops) = rec.clone_materialized_parts();
+        let trace = crate::history::TreeLoop::from_oprc(inputargs, ops, Vec::new());
+        let prepared = prepare_retrace_snapshot(trace);
+        assert_eq!(
+            prepared.ops[0].arg(1).to_opref(),
+            prepared.inputargs[1].opref(),
+            "slot 2 remints onto the last live inputarg"
+        );
+        assert_eq!(prepared.inputargs[1].get_value(), Some(Value::Int(22)));
+        let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
+        unroll_opt.trace_inputargs = prepared.inputargs.iter().map(|ia| ia.opref()).collect();
+        unroll_opt.trace_inputarg_boxes = prepared.inputargs.clone();
+        let mut phase1_out = None;
+        unroll_opt
+            .optimize_trace_with_constants_and_inputs_vable_out(
+                &prepared.ops,
+                &mut majit_ir::ConstMap::default(),
+                prepared.inputargs.len(),
+                None,
+                Some(&mut phase1_out),
+            )
+            .expect("sparse retrace must optimize");
+        let state = phase1_out.expect("phase 1 export").1;
+        assert_eq!(
+            state.runtime_boxes[1],
+            OpRef::const_int(22),
+            "the closing JUMP's last live arg is InputArg(2)'s value"
+        );
     }
 
     #[test]

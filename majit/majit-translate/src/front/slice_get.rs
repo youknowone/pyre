@@ -145,10 +145,10 @@ fn slice_get_leaf_from_parts(parts: &[&str]) -> Option<SliceGetLeaf> {
     }
 }
 
-/// `get` may lower a scalar or a thin-pointer element. `get_mut` may lower
-/// only a thin pointer: `ArrayRead` copies the element, which for a pointer
-/// is the referent address (the consumer mutates that object) and for a
-/// scalar / `AtomicU64` / `Option<Entry>` is a stale copy.
+/// `get` may lower a scalar or a thin-pointer element. `get_mut` returns
+/// `&mut T` of the element slot. `ArrayRead` copies the element, so a later
+/// store through that reference misses the slot whether `T` is a scalar or
+/// a pointer. `get_mut` stays residual.
 ///
 /// `array_type_id` is `Some("[u8]")` for a scalar spelling and `None` only
 /// for a proven thin-pointer element (`SliceGetSite::array_type_id`).
@@ -159,7 +159,8 @@ pub(crate) fn slice_get_element_may_record(
     array_type_id: Option<&String>,
 ) -> bool {
     if is_get_mut {
-        array_type_id.is_none()
+        let _ = array_type_id;
+        false
     } else {
         true
     }
@@ -304,6 +305,23 @@ fn rewire_one_slice_get_site(graph: &mut FunctionGraph, site: &SliceGetSite) -> 
             ));
         }
     };
+    // `get_mut` yields `&mut` of the element slot. `ArrayRead` copies the
+    // element, so a store through the reference does not update the slice.
+    let is_get_mut = match &graph.blocks[a].operations[ci].kind {
+        OpKind::Call { target, .. } => match target {
+            CallTarget::FunctionPath { segments, .. } => {
+                segments.last().is_some_and(|leaf| leaf == "get_mut")
+            }
+            CallTarget::Method { name, .. } => name == "get_mut",
+            _ => false,
+        },
+        _ => false,
+    };
+    if is_get_mut {
+        return Err(format!(
+            "{name}: get_mut addresses the element slot; ArrayRead would copy it"
+        ));
+    }
 
     // A's single exit → B (the continuation consuming the Option).  Must be a
     // plain goto — `lower_call` closes with exactly this shape.
@@ -833,11 +851,10 @@ mod tests {
         ])));
     }
 
-    /// `get_mut` of a thin pointer is the same two-argument diamond as `get`:
-    /// `ArrayRead` yields the pointer value, which is what the consumer
-    /// mutates through. The rewriter never inspects the leaf name.
+    /// `get_mut` of a pointer element still returns `&mut` of the slot.
+    /// Copying the pointer with `ArrayRead` drops a store of a new pointer.
     #[test]
-    fn rewrite_lifts_get_mut_on_thin_pointer() {
+    fn get_mut_of_thin_pointer_does_not_copy_the_slot() {
         let mut g = FunctionGraph::new("test_slice_get_mut");
         let a = g.startblock;
         let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
@@ -849,17 +866,47 @@ mod tests {
 
         let mut site = slice_get_site(opt);
         site.niche = true;
-        assert_eq!(rewire_slice_get_call_sites(&mut g, &[site]), 1);
+        assert_eq!(rewire_slice_get_call_sites(&mut g, &[site]), 0);
         assert!(
-            !residual_get_survives(&g, a),
-            "residual get_mut call removed from A"
+            residual_get_survives(&g, a),
+            "residual get_mut call stays: the result is a slot reference"
         );
         assert!(
-            g.blocks
+            !g.blocks
                 .iter()
                 .flat_map(|block| &block.operations)
                 .any(|op| matches!(op.kind, OpKind::ArrayRead { .. })),
-            "the Some arm reads the thin-pointer element"
+            "get_mut must not copy the pointer element"
+        );
+    }
+
+    /// `get_mut` of a non-pointer copies the element. The address of the slot
+    /// is an interior pointer; a copy then a store misses the write, so the
+    /// rewrite declines instead of emitting `ArrayRead`.
+    #[test]
+    fn get_mut_of_non_pointer_does_not_copy_the_element() {
+        let mut g = FunctionGraph::new("test_slice_get_mut_scalar");
+        let a = g.startblock;
+        let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let index = g.push_op_var(a, OpKind::ConstInt(1), true).unwrap();
+        let opt = emit_named_call(&mut g, a, vec![slice, index], "get_mut");
+        let (b, _) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![opt.clone()]);
+
+        let mut site = scalar_slice_get_site(opt);
+        site.array_type_id = Some("[u8]".into());
+        assert_eq!(
+            rewire_slice_get_call_sites(&mut g, &[site]),
+            0,
+            "get_mut of a non-pointer must not lower to a copied ArrayRead"
+        );
+        assert!(
+            !g.blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(op.kind, OpKind::ArrayRead { .. })),
+            "no copied element read"
         );
     }
 
@@ -885,8 +932,8 @@ mod tests {
             "get_mut of a scalar would copy the slot"
         );
         assert!(
-            slice_get_element_may_record(true, None),
-            "get_mut of a thin pointer copies the pointer, which is the referent"
+            !slice_get_element_may_record(true, None),
+            "get_mut of a pointer is still a slot reference"
         );
         // No element proof ⇒ not recorded.  That is how `[AtomicU64]::get`
         // (`portal_diag_bump`) and `Option<Entry>` stay residual: they are

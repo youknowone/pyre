@@ -6795,9 +6795,10 @@ where
                 // pyjitpl.py:3029-3030 `current_merge_points.append(...)`: the
                 // FIRST merge-point visit of a primary trace is the loop header;
                 // snapshot its concrete green constants (grouped by IR slot) as
-                // the `same_greenkey` reference for every later visit.  Bridges
-                // close through the compiled-loop registry, not this reference,
-                // so they never capture it.
+                // the `same_greenkey` reference for every later visit.  A bridge's
+                // trace-start header is the guard, so it does not capture
+                // this; its `same_greenkey` reads `compiled_key_for_greens`
+                // against the source loop instead.
                 if !ctx.is_bridge_trace && ctx.header_greens.is_none() {
                     ctx.header_greens = Some((
                         mp_green_ints.to_vec(),
@@ -7044,16 +7045,29 @@ where
                     // no Const → an always-empty filter that would decline every
                     // close and hang).
                     let same_greenkey = if ctx.is_bridge_trace {
-                        // A bridge closes by JUMPing into its parent loop via the
-                        // compiled-loop registry (`has_compiled_targets` =
-                        // get_procedure_token analog), keyed by the (pc, code)
-                        // green-key hash.  The parent loop's full green tuple is
-                        // not threaded to the bridge ctx, and pyre's u64 green key
-                        // does not encode scalar greens beyond (pc, code), so a
-                        // full-green bridge match would need the registry re-keyed
-                        // by the full green hash — a separate change.  Keep the
-                        // registry/pc close for bridges.
-                        true
+                        // pyjitpl.py `same_greenkey` over the greens of the merge
+                        // point just reached. A bridge's trace-start header is
+                        // the guard, not the parent loop, so the reference is
+                        // the compiled loop those greens name
+                        // (`compiled_key_for_greens` / `loop_header_greens`).
+                        // It has to be this bridge's source loop: the same pc
+                        // in another code object is a different green key.
+                        // `None` means that loop was compiled without stored
+                        // greens; the pc check above stays the only
+                        // discriminator, which is what this arm used to be.
+                        let greens = (
+                            mp_green_ints.to_vec(),
+                            mp_green_refs.to_vec(),
+                            mp_green_floats.to_vec(),
+                        );
+                        match ctx
+                            .compiled_key_for_greens_fn
+                            .as_ref()
+                            .and_then(|lookup| lookup(&greens))
+                        {
+                            Some(key) => key == ctx.green_key,
+                            None => true,
+                        }
                     } else if let Some((h_ints, h_refs, h_floats)) = ctx.header_greens.as_ref() {
                         mp_green_ints.as_slice() == h_ints.as_slice()
                             && mp_green_refs.as_slice() == h_refs.as_slice()
@@ -7108,7 +7122,12 @@ where
                                 None => (ctx.green_key, ctx.green_key_values().cloned()),
                             };
                             if !already_compiled_here
-                                && !ctx.has_merge_point_at(close_key, ctx.header_pc)
+                                && ctx
+                                    .find_merge_point_same_greenkey(
+                                        close_key,
+                                        close_key_typed.as_ref(),
+                                    )
+                                    .is_none()
                             {
                                 let vable_boxes =
                                     ctx.collect_virtualizable_typed_boxes().unwrap_or_default();
@@ -7129,11 +7148,16 @@ where
                                         ctx.num_ops(),
                                     );
                                 }
+                                // `MergePoint::header_pc` is this visit's guest pc
+                                // (`same_greenkey`'s pc green), not the
+                                // trace-start `ctx.header_pc`.
+                                let recorded_pc =
+                                    mp_green_pc.map(|p| p as usize).unwrap_or(ctx.header_pc);
                                 ctx.add_merge_point_with_key(
                                     close_key,
                                     close_key_typed,
                                     original_boxes,
-                                    ctx.header_pc,
+                                    recorded_pc,
                                 );
                                 return TraceAction::Continue;
                             }
@@ -7161,14 +7185,9 @@ where
                     // green key. RPython scans current_merge_points for a prior
                     // same_greenkey visit; if found it closes the loop THERE
                     // (cutting the outer prefix as preamble); otherwise it appends
-                    // and keeps tracing. The MAJIT dispatch model never wired this
-                    // append/scan, so a trace that enters at an outer header and
-                    // spins in a NESTED inner loop never closes. Record the inner
-                    // merge point keyed on (green_key_from_code_ptr(code, pc),
-                    // ctx.header_pc) — header_pc stays the trace's so the
-                    // cross_loop_cut consumer (cross_loop_cut_info /
-                    // compile_loop_body) finds it via get_merge_point_at(inner_key,
-                    // ctx.header_pc).
+                    // and keeps tracing. Record the inner merge point under its
+                    // own green key and its own guest pc. The scan is
+                    // `find_merge_point_same_greenkey`, not `(key, trace header_pc)`.
                     //
                     // The S0 census that established this — append-and-observe
                     // with NO close, confirming the inner key is stable and
@@ -7177,7 +7196,6 @@ where
                     // reads that name today; re-running the census means adding
                     // the gate back, not setting a variable.
                     if inner_close && let Some(pc) = mp_green_pc {
-                        let header_pc = ctx.header_pc;
                         // pyjitpl.py:3001-3007, which runs BEFORE the
                         // `current_merge_points` scan:
                         //
@@ -7228,15 +7246,12 @@ where
                         // `compile_bridge` hands `optimize_bridge` the ORIGIN
                         // loop's `front_target_tokens`) recovered only 7%.
                         //
-                        // One consequence of a DECLINED attempt is still
-                        // narrower than upstream: upstream reaches the
-                        // `current_merge_points` scan whenever `compile_trace`
-                        // does not raise, while a declined attempt here
-                        // returns to neither the scan nor the `append`
-                        // (:3058-3060), so the merge point goes unregistered
-                        // while a compiled loop sits at those greens.  Kept
-                        // deliberately — it is exactly the pre-JUMP behaviour,
-                        // so the lever has a clean A/B.
+                        // A declined `compile_trace` does not append here.
+                        // The walker has no `MetaInterp` to scan
+                        // `current_merge_points`. `JitDriver::keep_tracing_after_declined_jump`
+                        // is that scan (`reached_loop_header`): no prior
+                        // same-greenkey entry appends and the walk continues;
+                        // a prior entry falls through to `compile_loop`.
                         //
                         // The token lookup below is unconditional, where
                         // upstream guards it with `if not self.partial_trace:`
@@ -7321,10 +7336,13 @@ where
                             // GUARD_FUTURE_CONDITION was already emitted unconditionally at the
                             // reached_loop_header entry above (pyjitpl.py).
                             return TraceAction::CloseLoop;
-                        } else if ctx.has_merge_point_at(inner_key, header_pc) {
+                        } else if ctx
+                            .find_merge_point_same_greenkey(inner_key, Some(&inner_key_typed))
+                            .is_some()
+                        {
                             if crate::jitdriver::spdiag_enabled() {
                                 eprintln!(
-                                    "@@@SPDIAG INNER-CUT-CLOSE pc={pc} header_pc={header_pc} inner_key={inner_key} walk_reds={walk_reds:?}"
+                                    "@@@SPDIAG INNER-CUT-CLOSE pc={pc} inner_key={inner_key} walk_reds={walk_reds:?}"
                                 );
                             }
                             if crate::closedbg_enabled() {
@@ -7411,15 +7429,15 @@ where
                             };
                             if crate::mptrace_enabled() {
                                 eprintln!(
-                                    "@@@MPTRACE add-mp pc={pc} header_pc={header_pc} inner_key={inner_key} num_ops={}",
-                                    ctx.num_ops(),
+                                    "@@@MPTRACE add-mp pc={pc} inner_key={inner_key} num_ops={}",
+                                    ctx.num_ops()
                                 );
                             }
                             ctx.add_merge_point_with_key(
                                 inner_key,
                                 Some(inner_key_typed),
                                 original_boxes,
-                                header_pc,
+                                pc as usize,
                             );
                         }
                     }

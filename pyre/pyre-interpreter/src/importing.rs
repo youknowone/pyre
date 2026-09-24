@@ -4207,7 +4207,7 @@ fn parent_package_path(parent: PyObjectRef) -> Result<Option<Vec<PathBuf>>, crat
 // PyPy equivalent: importing.py `parse_source_module(space, pathname, source)`
 
 fn parse_source_module(
-    pathname: &str,
+    pathname: &rustpython_wtf8::Wtf8,
     source: &str,
 ) -> Result<CodeObject, crate::syntax_warnings::SourceCompileError> {
     // PyPy `PythonAstCompiler.compile` runs the same string-literal warning
@@ -4215,6 +4215,7 @@ fn parse_source_module(
     // separately, so keep pyre's shared warning pass in front of this file
     // compiler too; otherwise an invalid escape warns under `-c` but silently
     // disappears when the identical source is loaded from a `.py` file.
+    // `pathname` is the decoded filename, not the compiler's lossy UTF-8 path.
     crate::syntax_warnings::compile_with_codegen_warnings(
         source,
         Mode::Exec,
@@ -4501,13 +4502,12 @@ fn load_source_module(
     {
         Some(w_code) => (w_code, false),
         None => {
-            let code =
-                parse_source_module(&pathname_str, &source).map_err(|error| match error {
-                    crate::syntax_warnings::SourceCompileError::Compile(error) => {
-                        crate::compile_err_to_syntax_error(error, &source, Mode::Exec)
-                    }
-                    crate::syntax_warnings::SourceCompileError::Warning(error) => error,
-                })?;
+            let code = parse_source_module(&path_text, &source).map_err(|error| match error {
+                crate::syntax_warnings::SourceCompileError::Compile(error) => {
+                    crate::compile_err_to_syntax_error(error, &source, Mode::Exec)
+                }
+                crate::syntax_warnings::SourceCompileError::Warning(error) => error,
+            })?;
             (crate::box_code_object(code), cache_key.is_some())
         }
     };

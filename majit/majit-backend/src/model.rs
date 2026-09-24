@@ -31,18 +31,21 @@ pub trait Cpu: Send + Sync {
     /// Reads the runtime typeptr (object class) at offset 0 of the
     /// box's Ref payload — the lltype `OBJECTPTR` layout that the
     /// default backend uses.  Returns 0 when the box does not carry a
-    /// concrete `Value::Ref` or when the Ref is null.  Backends that
-    /// enable `gcremovetypeptr` route through `model.py:266+` and
-    /// override this method to consult the GC header instead.
+    /// concrete `Value::Ref` or when the Ref is null.  The raw read is
+    /// `bh_classof`; a backend with a different object model overrides that.
     fn cls_of_box(&self, box_: &Operand) -> i64;
 
-    /// `model.py cpu.cls_of_box` lowered to the raw `getref_base`
-    /// payload — the `lltype.cast_opaque_ptr(OBJECTPTR, base).typeptr`
-    /// step.  Callers that already hold a `GcRef` (e.g. `ConstPtrInfo`
-    /// which stores the const ref directly) reach the typeptr read
-    /// through this primitive instead of synthesizing a temporary
-    /// const operand.  The default `cls_of_box` delegates here.
-    fn cls_of_gcref(&self, gcref: GcRef) -> i64;
+    /// `llmodel.py AbstractLLCPU.bh_classof`:
+    ///
+    /// ```python
+    /// def bh_classof(self, struct):
+    ///     struct = lltype.cast_opaque_ptr(rclass.OBJECTPTR, struct)
+    ///     return ptr2int(struct.typeptr)
+    /// ```
+    ///
+    /// Raw typeptr read of a `GcRef`. `cls_of_box` unwraps the box and
+    /// delegates here. Backends with a different object model override this.
+    fn bh_classof(&self, gcref: GcRef) -> i64;
 
     /// `model.py+ cpu.bh_getfield_gc_i / _r / _f`:
     /// `llmodel.py read_int_at_mem / read_ref_at_mem / read_float_at_mem`.
@@ -135,7 +138,7 @@ pub trait Cpu: Send + Sync {
             // range.
             let (expected_min, expected_max) = majit_gc::subclass_range(sizedescr.vtable())
                 .ok_or("protect_speculative_field: descr vtable has no range")?;
-            let actual_vtable = self.cls_of_gcref(gcptr);
+            let actual_vtable = self.bh_classof(gcptr);
             if actual_vtable == 0 {
                 return Err("protect_speculative_field: gcptr has no class");
             }
@@ -370,12 +373,12 @@ impl Cpu for DefaultCpu {
         // stamped `Value::Ref` must resolve too — `get_value()`, not the
         // const-only `const_value()`.
         match box_.get_box_replacement(false).get_value() {
-            Some(Value::Ref(gcref)) if !gcref.is_null() => self.cls_of_gcref(gcref),
+            Some(Value::Ref(gcref)) if !gcref.is_null() => self.bh_classof(gcref),
             _ => 0,
         }
     }
 
-    fn cls_of_gcref(&self, gcref: GcRef) -> i64 {
+    fn bh_classof(&self, gcref: GcRef) -> i64 {
         if gcref.is_null() {
             return 0;
         }
@@ -447,7 +450,7 @@ pub fn cpu_from_cls_of_box_fn(f: fn(i64) -> i64) -> Arc<dyn Cpu> {
             };
             (self.0)(raw)
         }
-        fn cls_of_gcref(&self, gcref: GcRef) -> i64 {
+        fn bh_classof(&self, gcref: GcRef) -> i64 {
             if majit_gc::is_tagged_immediate(gcref.as_usize()) {
                 // A tagged immediate has no object header to read at offset 0; report
                 // "no class" (0) so the optimizer keeps the runtime type guard instead
@@ -502,5 +505,18 @@ mod tests {
                 GcRef(field_words[1])
             );
         }
+    }
+
+    /// `AbstractCPU.cls_of_box` unwraps the box; `AbstractLLCPU.bh_classof`
+    /// reads `struct.typeptr`. Both entries on one object return that class.
+    #[test]
+    fn cls_of_box_and_bh_classof_agree_on_one_object() {
+        let class_word = 0xC1A5_u64;
+        let object = [class_word as usize];
+        let gcref = GcRef(object.as_ptr() as usize);
+        let box_ = Operand::const_from_value(Value::Ref(gcref));
+        let cpu = DefaultCpu;
+        assert_eq!(cpu.cls_of_box(&box_), class_word as i64);
+        assert_eq!(cpu.bh_classof(gcref), class_word as i64);
     }
 }

@@ -947,7 +947,14 @@ fn build_object_descr_group_with_extra_gc_edges(
                     .copied()
                     .unwrap_or_else(|| stable_field_index(offset, field_size, field_type, signed)),
                 field_key: field_key.to_string(),
-                name: if simple_name.is_empty() {
+                // `descr.py get_field_descr` stores one FieldDescr per
+                // `(STRUCT, fieldname)`. `fieldname` is the cache key; the
+                // display name is `STRUCT._name + '.' + fieldname`. A key that
+                // already begins with that prefix is the fieldname, so
+                // prefixing it again mints a second descr (`PyFrame.flags`
+                // versus `PyFrame.PyFrame.flags`) for the same offset.
+                name: if simple_name.is_empty() || field_key.starts_with(&format!("{simple_name}."))
+                {
                     field_key.to_string()
                 } else {
                     format!("{simple_name}.{field_key}")

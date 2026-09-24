@@ -600,6 +600,11 @@ pub struct SemanticProgram {
         crate::flowspace::argument::Signature,
         crate::model::ValueType,
     )>,
+    /// Functions whose body the MIR loop declined for an ordered atomic
+    /// load. The lowering records the declaration; callers do not walk
+    /// the body again. `populate_call_registry_from_call_graphs` reads it.
+    pub atomic_load_decls:
+        Vec<crate::translator::rtyper::lltypesystem::module::ll_extaccessor::DeclinedFunDecl>,
 }
 
 /// Graph lookup table built from a `SemanticProgram` so registration and

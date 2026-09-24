@@ -6,8 +6,10 @@
 //! in the LLBC, so the caller emits a residual `saturating_add` call.  Every
 //! portal-reachable site named by the census (`W_ListObject::object_grow`,
 //! `IntArray::grow`, `UnicodeArray::{empty,with_capacity}`) is word-sized
-//! unsigned.  Wrapping add in the u64 bank plus `uint_lt(sum, a)` is the
-//! carry test; the overflow arm yields `u64::MAX`.
+//! unsigned.  Wrapping add in the word bank plus `uint_lt(sum, a)` is the
+//! carry test; the overflow arm yields the max of the op's `Unsigned`
+//! lowleveltype (`unsigned_repr`: `u64::MAX` when the word is 8 bytes,
+//! `u32::MAX` when it is 4).
 //!
 //! A narrow `u16`/`u32` saturating add is **not** that test: `u32::MAX + 1`
 //! does not wrap in the word bank, so `sum < a` stays false and the rewrite
@@ -23,25 +25,41 @@
 //! Block A holds the residual `saturating_add` call producing `r`.  The
 //! rewrite:
 //! 1. drops the call and emits `sum = a + b`, `ovf = uint_lt(sum, a)`;
-//! 2. the true arm (`ovf`) builds `r = u64::MAX`;
+//! 2. the true arm (`ovf`) builds `r = Unsigned max`;
 //! 3. the false arm builds `r = sum`;
 //! 4. both arms forward to B.
 //!
 //! Fail-safe: a site whose producer is not a 2-arg `saturating_add` Call
-//! (including a `saturating_sub` Variable sharing the recording vec) is
-//! left untouched.
+//! is left untouched. `int_add` and `int_sub` are separate ops, so add
+//! sites are [`SaturatingAddSite`]s, not `SaturatingSubSite`s.
 
 use crate::flowspace::model::Variable;
 use crate::front::bool_then::{close_goto_mixed, map_source, reproduce_exit_args};
 use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
 
+/// A recognized word-sized `{usize,u64}::saturating_add(a, b)` call.
+/// `int_add` carries its own op, so this is not a [`crate::front::saturating_sub::SaturatingSubSite`].
+#[derive(Clone)]
+pub(crate) struct SaturatingAddSite {
+    /// The `saturating_add` call result. Operands are read from that call.
+    pub result_var: Variable,
+}
+
 pub(crate) fn rewire_saturating_add_call_sites(
     graph: &mut FunctionGraph,
-    result_vars: &[Variable],
+    sites: &[SaturatingAddSite],
+) -> usize {
+    rewire_saturating_add_call_sites_for(graph, sites, crate::layout::target_word_size())
+}
+
+pub(crate) fn rewire_saturating_add_call_sites_for(
+    graph: &mut FunctionGraph,
+    sites: &[SaturatingAddSite],
+    word_bytes: usize,
 ) -> usize {
     let mut rewritten = 0;
-    for result_var in result_vars {
-        match rewire_one_saturating_add_site(graph, result_var) {
+    for site in sites {
+        match rewire_one_saturating_add_site(graph, &site.result_var, word_bytes) {
             Ok(()) => rewritten += 1,
             Err(_decline) => {}
         }
@@ -60,8 +78,17 @@ fn is_saturating_add_target(target: &CallTarget) -> bool {
 fn rewire_one_saturating_add_site(
     graph: &mut FunctionGraph,
     result_var: &Variable,
+    word_bytes: usize,
 ) -> Result<(), String> {
     let name = graph.name.clone();
+    // `uint_lt(sum, x)` sees a carry in the 8-byte JIT bank. A 4-byte
+    // `usize::MAX + 1` is `4294967296` there, not a wrap, so the clamp
+    // never fires. Decline, the same as a narrow `u32`.
+    if word_bytes != 8 {
+        return Err(format!(
+            "{name}: saturating_add word of {word_bytes} bytes is not the JIT int bank"
+        ));
+    }
     let a = graph
         .blocks
         .iter()
@@ -155,7 +182,9 @@ fn rewire_one_saturating_add_site(
     let then_result = graph.alloc_value_var();
     graph.block_mut(then_bb).operations.push(SpaceOperation {
         result: Some(then_result.clone()),
-        kind: OpKind::ConstUInt(u64::MAX),
+        kind: OpKind::ConstUInt(crate::front::checked_arith_uint::unsigned_word_max(
+            word_bytes,
+        )),
     });
     let then_link_args = reproduce_exit_args(
         &saved_exit,
@@ -221,7 +250,12 @@ mod tests {
         g.set_return(b, None);
         g.set_goto(a, b, vec![r.clone()]);
 
-        let rewritten = rewire_saturating_add_call_sites(&mut g, std::slice::from_ref(&r));
+        let rewritten = rewire_saturating_add_call_sites(
+            &mut g,
+            &[SaturatingAddSite {
+                result_var: r.clone(),
+            }],
+        );
         assert_eq!(rewritten, 1, "the saturating_add site must be rewritten");
 
         assert!(
@@ -285,7 +319,12 @@ mod tests {
         g.set_return(b, None);
         g.set_goto(a, b, vec![r.clone()]);
 
-        let rewritten = rewire_saturating_add_call_sites(&mut g, std::slice::from_ref(&r));
+        let rewritten = rewire_saturating_add_call_sites(
+            &mut g,
+            &[SaturatingAddSite {
+                result_var: r.clone(),
+            }],
+        );
         assert_eq!(rewritten, 0, "a saturating_sub producer declines");
         assert!(
             g.blocks[a.0].operations.iter().any(|op| matches!(
@@ -295,5 +334,52 @@ mod tests {
             )),
             "residual saturating_sub call is left untouched"
         );
+    }
+
+    fn overflow_const(g: &FunctionGraph) -> u64 {
+        g.blocks
+            .iter()
+            .flat_map(|blk| &blk.operations)
+            .find_map(|op| match op.kind {
+                OpKind::ConstUInt(n) => Some(n),
+                _ => None,
+            })
+            .expect("overflow clamp const")
+    }
+
+    #[test]
+    fn saturating_add_clamps_at_unsigned_lowleveltype_max() {
+        let mut g = FunctionGraph::new("test_saturating_add_width");
+        let a = g.startblock;
+        let av = g.push_op_var(a, OpKind::ConstInt(7), true).unwrap();
+        let bv = g.push_op_var(a, OpKind::ConstInt(3), true).unwrap();
+        let r = emit_call(&mut g, a, vec![av, bv]);
+        let (b, _b_args) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![r.clone()]);
+        let rewritten = rewire_saturating_add_call_sites_for(
+            &mut g,
+            &[SaturatingAddSite {
+                result_var: r.clone(),
+            }],
+            8,
+        );
+        assert_eq!(rewritten, 1);
+        assert_eq!(overflow_const(&g), u64::MAX);
+
+        let mut narrow = FunctionGraph::new("test_saturating_add_width_4");
+        let a = narrow.startblock;
+        let av = narrow.push_op_var(a, OpKind::ConstInt(7), true).unwrap();
+        let bv = narrow.push_op_var(a, OpKind::ConstInt(3), true).unwrap();
+        let r = emit_call(&mut narrow, a, vec![av, bv]);
+        let (b, _) = narrow.create_block_with_arg_vars(1);
+        narrow.set_return(b, None);
+        narrow.set_goto(a, b, vec![r.clone()]);
+        let rewritten = rewire_saturating_add_call_sites_for(
+            &mut narrow,
+            &[SaturatingAddSite { result_var: r }],
+            4,
+        );
+        assert_eq!(rewritten, 0, "a 4-byte word is not the 8-byte JIT int bank");
     }
 }

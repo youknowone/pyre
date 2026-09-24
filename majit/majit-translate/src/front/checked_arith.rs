@@ -101,12 +101,21 @@ pub(crate) fn is_checked_arith_target(target: &CallTarget) -> bool {
 /// `i64::checked_add` by path, and `tyref_to_value_type` colors every signed
 /// width `Int`.  Fusing a narrower width answers a different question than
 /// the source asked: `127i8.checked_add(1)` overflows `i8` but not the
-/// machine word, so the rewrite would take the success continuation carrying
-/// `128` where the residual call returns `None`.  `Isize` is the machine word
-/// by definition and shares the equivalence `get_type_flag` already makes for
-/// it; `I128` is wider than the int bank.
+/// JIT int bank, so the rewrite would take the success continuation carrying
+/// `128` where the residual call returns `None`.  `Isize` shares that bank
+/// only when the target word is 8 bytes; `I128` is wider than the int bank.
 pub(crate) fn is_ovf_width_int_atom(atom: &str) -> bool {
-    matches!(atom, "I64" | "Isize")
+    is_ovf_width_int_atom_for(atom, crate::layout::target_word_size())
+}
+
+/// `add_ovf` is the 8-byte JIT bank (`I64Add` on wasm). `Isize` shares
+/// that bank only when the target word is 8 bytes.
+pub(crate) fn is_ovf_width_int_atom_for(atom: &str, word_bytes: usize) -> bool {
+    match atom {
+        "I64" => true,
+        "Isize" => word_bytes == 8,
+        _ => false,
+    }
 }
 
 /// Whether a signed `checked_*` site may reach the `*_ovf` rewrite.
@@ -747,6 +756,12 @@ mod tests {
         for atom in ["I64", "Isize"] {
             assert!(is_ovf_width_int_atom(atom), "{atom} should fuse");
         }
+        assert!(
+            !is_ovf_width_int_atom_for("Isize", 4),
+            "4-byte isize is i32-wide; add_ovf does not wrap there"
+        );
+        assert!(is_ovf_width_int_atom_for("Isize", 8));
+        assert!(is_ovf_width_int_atom_for("I64", 4));
         for atom in ["I8", "I16", "I32", "I128", "U64", "Usize"] {
             assert!(!is_ovf_width_int_atom(atom), "{atom} should decline");
         }

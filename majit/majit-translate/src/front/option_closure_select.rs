@@ -554,7 +554,7 @@ fn emit_site_callable(
             graph,
             block,
             segments,
-            payload.map(|(value, _, _)| value),
+            payload.map(|(value, _, class_root)| (value, class_root)),
             site.call_result_ty.clone(),
         ))
     } else {
@@ -579,12 +579,18 @@ fn emit_fn_item_call(
     graph: &mut FunctionGraph,
     block: BlockId,
     segments: &[String],
-    arg: Option<Variable>,
+    arg: Option<(Variable, Option<String>)>,
     result_ty: ValueType,
 ) -> Variable {
     let call_result = graph.alloc_value_var();
     let args = match arg {
-        Some(payload) => crate::model::call_args(vec![payload]),
+        Some((payload, class_root)) => {
+            // Same class narrow the closure arm applies before writing
+            // `Tuple<*mut T>.__pos_0`: the callee parameter must not widen
+            // to OBJECTPTR.
+            let payload = emit_narrow(graph, block, payload, &class_root);
+            crate::model::call_args(vec![payload])
+        }
         None => crate::model::call_args(vec![]),
     };
     graph.block_mut(block).operations.push(SpaceOperation {
@@ -1264,6 +1270,79 @@ mod tests {
         );
         assert_eq!(g.blocks[a.0].exits.len(), 2, "A branches to Some/None arms");
         assert_eq!(count_ctors(&g), 2, "map still builds Some(U) and None");
+    }
+
+    #[test]
+    fn map_fn_item_narrows_payload_class() {
+        let mut g = FunctionGraph::new("test_map_fn_item_narrow");
+        let a = g.startblock;
+        let opt = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let fn_item = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::model::FN_CONST_HEAD.into(),
+                            "host".into(),
+                            "named_fn".into(),
+                        ],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let result = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::method("map", Some(RECV_OPTION.into())),
+                    args: crate::model::call_args(vec![opt, fn_item]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _b_args) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![result.clone()]);
+        let mut fn_site = site(ClosureCombinator::Map, result);
+        fn_site.fn_item_segments = Some(vec!["host".into(), "named_fn".into()]);
+        fn_site.payload_ty = ValueType::Ref(None);
+        fn_site.payload_class_root = Some("W_Root".into());
+
+        let outcome = rewire_closure_select_call_sites(&mut g, &[fn_site]);
+        assert_eq!(outcome.rewritten, 1, "map(opt, fn_item) must be rewritten");
+        let named_fn_calls: Vec<&crate::model::SpaceOperation> = g
+            .blocks
+            .iter()
+            .flat_map(|blk| &blk.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments == &["host".to_string(), "named_fn".to_string()]
+                )
+            })
+            .collect();
+        assert_eq!(named_fn_calls.len(), 1);
+        let OpKind::Call { args, .. } = &named_fn_calls[0].kind else {
+            panic!("named function call");
+        };
+        let payload = args[0].as_variable().expect("payload variable");
+        let narrowed = g.blocks.iter().flat_map(|blk| &blk.operations).any(|op| {
+            op.result.as_ref() == Some(payload)
+                && crate::model::cast_instance_root(&op.kind) == Some("W_Root")
+        });
+        assert!(
+            narrowed,
+            "function-item map must narrow the payload to its class before the call"
+        );
     }
 
     #[test]

@@ -106,7 +106,6 @@ use majit_charon_reader::{
         SwitchTargets, TermKind, TyRef, TypeDecl, TypeDeclKind, Unstructured,
     },
 };
-use std::cell::RefCell;
 
 use crate::flowspace::model::{ConstValue, Variable};
 use crate::model::{
@@ -346,6 +345,7 @@ pub(crate) fn absorb_semantic_program(
                     })
                     .or_insert(id);
             }
+            acc.atomic_load_decls.extend(prog.atomic_load_decls);
         }
     }
 }
@@ -454,6 +454,7 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
             struct_ids: std::collections::HashMap::new(),
             unsafe_fn_stubs: Vec::new(),
             foreign_opaque_method_externals: Vec::new(),
+            atomic_load_decls: Vec::new(),
         }),
     )
 }
@@ -1086,6 +1087,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         .collect();
     let mut functions = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
+    let mut atomic_load_decls = Vec::new();
     for fd in llbc.iter_local_fns() {
         // Charon emits static / const initialiser bodies (e.g. the
         // body that builds `static NONE_SINGLETON`) as ordinary
@@ -1153,6 +1155,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // erroring out at program-build time.
         let accum = AccumulatorFacts::build(llbc, &body);
         let builder_mode = accum.has_builder;
+        let mut atomic_reasons = Vec::new();
         let graph = match lower_unstructured_with_static_addrs_and_attrs(
             llbc,
             fd,
@@ -1164,10 +1167,15 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             &tombstoned_leaves,
             builder_mode,
             &accum,
+            &mut atomic_reasons,
         ) {
             Ok(g) => g,
             Err(e) => {
-                skipped.push((name.clone(), e.to_string()));
+                let msg = e.to_string();
+                if let Some(reason) = atomic_reasons.first() {
+                    atomic_load_decls.push(declined_atomic_load_fun_decl(llbc, fd, reason.clone()));
+                }
+                skipped.push((name.clone(), msg));
                 continue;
             }
         };
@@ -1347,6 +1355,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // (it iterates the full LLBC set), mirroring `merge_hints_from_llbcs`.
         unsafe_fn_stubs: Vec::new(),
         foreign_opaque_method_externals: Vec::new(),
+        atomic_load_decls,
     })
 }
 
@@ -2764,6 +2773,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
     })?;
     let accum = AccumulatorFacts::build(llbc, &u);
     let builder_mode = accum.has_builder;
+    let mut atomic_load_reasons = Vec::new();
     lower_unstructured_with_static_addrs_and_attrs(
         llbc,
         fd,
@@ -2775,6 +2785,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         &tombstoned_leaves,
         builder_mode,
         &accum,
+        &mut atomic_load_reasons,
     )
 }
 
@@ -2837,6 +2848,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     // qualifying functions have one canonical marker-emitting graph.
     builder_mode: bool,
     accum: &AccumulatorFacts,
+    atomic_load_reasons: &mut Vec<String>,
 ) -> Result<FunctionGraph, LowerError> {
     let name = fd.item_meta.name_path();
     // The Result-of-PyError exception-link lowering's callee rule
@@ -3033,7 +3045,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // aggregate stays the ordinary ADT ctor (census Skip).
         // `map(it, f).collect()` denotes a loop.  Rewrite it at the
         // construction site — where `f` is a concrete closure ADT —
-        // into `Vec::new` + `next` + `call_once` + `push` BEFORE the
+        // into `Vec::new` + `next` + `call_mut` + `push` BEFORE the
         // range divert and `next`-diamond run, so those passes see the
         // synthesized `next` the same way they see a source-level
         // for-loop.  Fail-safe: a site whose closure env is not a
@@ -3223,22 +3235,28 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         let _from_raw_parts_rewritten =
             crate::front::from_raw_parts::rewire_from_raw_parts_sites(&mut lo.graph);
         // Word-sized `saturating_add` clamp (`front::saturating_add`) splits
-        // the residual call into `sum = a + b; if uint_lt(sum, a) { MAX } else
-        // { sum }`.  Sites share `saturating_sub_sites`; the add pass matches
-        // the `saturating_add` leaf and declines sub producers.  No new
+        // the residual call into `sum = a + b; if uint_lt(sum, a) { Unsigned
+        // max } else { sum }`.  `int_add` is its own op, so the sites live on
+        // `saturating_add_sites`, not `saturating_sub_sites`.  No new
         // unreachable blocks (both arms forward to the original
         // continuation), so the sweep gate below does not need the count.
-        let saturating_add_vars: Vec<Variable> = lo
-            .saturating_sub_sites
-            .iter()
-            .map(|site| site.result_var.clone())
-            .collect();
-        let _saturating_add_rewritten = if saturating_add_vars.is_empty() {
+        let _saturating_add_rewritten = if lo.saturating_add_sites.is_empty() {
             0
         } else {
             crate::front::saturating_add::rewire_saturating_add_call_sites(
                 &mut lo.graph,
-                &saturating_add_vars,
+                &lo.saturating_add_sites,
+            )
+        };
+        // Word-sized `saturating_mul` clamp (`front::saturating_mul`) splits
+        // the residual call into `lo = a * b; hi = uint_mul_high(a, b); if
+        // uint_ne(hi, 0) { MAX } else { lo }`.  Same fail-safe as add.
+        let _saturating_mul_rewritten = if lo.saturating_mul_sites.is_empty() {
+            0
+        } else {
+            crate::front::saturating_mul::rewire_saturating_mul_call_sites(
+                &mut lo.graph,
+                &lo.saturating_mul_sites,
             )
         };
         // The `saturating_sub` clamp rewrite (`front::saturating_sub`) splits
@@ -3512,6 +3530,9 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                     eprintln!("[FRAMESTATE fallback] {:?}: {e:?}", name);
                 }
                 if std::env::var_os("MAJIT_MIR_FRAMESTATE_STRICT").is_some() {
+                    if atomic_load_reasons.is_empty() {
+                        atomic_load_reasons.extend(lo.ordered_atomic_load_reasons.iter().cloned());
+                    }
                     return Err(e);
                 }
             }
@@ -3566,7 +3587,12 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             finish(&mut lo)?;
             Ok(lo.graph)
         }
-        Err(e) => Err(e),
+        Err(e) => {
+            if atomic_load_reasons.is_empty() {
+                atomic_load_reasons.extend(lo.ordered_atomic_load_reasons.iter().cloned());
+            }
+            Err(e)
+        }
     }
 }
 
@@ -4649,6 +4675,9 @@ struct Lowering<'a> {
     /// variant a dropped barrier, so this map carries the single-assignment
     /// restriction for the same reason [`Lowering::atomic_ref_place`] does.
     atomic_ordering_locals: std::collections::HashMap<usize, String>,
+    /// Non-`Relaxed` `Atomic*::load` sites seen in the body, independent of
+    /// which lowering error is reported first.
+    ordered_atomic_load_reasons: Vec<String>,
     /// MIR locals whose enum discriminant is a translation-time
     /// constant: single-assignment locals bound by an always-`Ok`
     /// decomposed conversion ([`Lowering::try_lower_usize_try_from`]).
@@ -4770,6 +4799,14 @@ struct Lowering<'a> {
     /// `front::saturating_sub` post-pass synthesizes after body lowering (see
     /// [`crate::front::saturating_sub::SaturatingSubSite`]).
     saturating_sub_sites: Vec<crate::front::saturating_sub::SaturatingSubSite>,
+    /// Word-sized `{usize,u64}::saturating_add(a, b)` call sites. `int_add`
+    /// is a separate op from `int_sub`, so these are not stored on
+    /// `saturating_sub_sites`.
+    saturating_add_sites: Vec<crate::front::saturating_add::SaturatingAddSite>,
+    /// Word-sized `{u64,usize}::saturating_mul(a, b)` call results recorded
+    /// for the unsigned high-word clamp diamond `front::saturating_mul`
+    /// synthesizes after body lowering.
+    saturating_mul_sites: Vec<Variable>,
     /// `RangeInclusive::new(lo, hi)` call sites recorded for the
     /// `(a..=b).contains(&x)` → `int_between(lo, x, hi + 1)` fold the
     /// `front::range_contains` post-pass synthesizes (see
@@ -5127,6 +5164,7 @@ impl<'a> Lowering<'a> {
             index_elem_alias: std::collections::HashMap::new(),
             atomic_ref_place: std::collections::HashMap::new(),
             atomic_ordering_locals: std::collections::HashMap::new(),
+            ordered_atomic_load_reasons: Vec::new(),
             const_discriminant_locals: std::collections::HashMap::new(),
             multi_assigned_locals: compute_multi_assigned_locals(body),
             string_byte_view_locals: Vec::new(),
@@ -5149,6 +5187,8 @@ impl<'a> Lowering<'a> {
             slice_first_sites: Vec::new(),
             slice_get_sites: Vec::new(),
             saturating_sub_sites: Vec::new(),
+            saturating_add_sites: Vec::new(),
+            saturating_mul_sites: Vec::new(),
             range_inclusive_new_sites: Vec::new(),
             range_iter_new_sites: Vec::new(),
             slice_index_rangefrom_sites: Vec::new(),
@@ -5210,6 +5250,7 @@ impl<'a> Lowering<'a> {
     }
 
     fn lower(&mut self, order: BlockOrder) -> Result<(), LowerError> {
+        self.note_nonrelaxed_atomic_loads();
         // Each MIR basic block is a FlowGraph block.  Locals live across
         // a successor edge are explicit `Link.args` into the target
         // block's `inputargs`, mirroring FlowContext.mergeblock rather
@@ -5554,6 +5595,7 @@ impl<'a> Lowering<'a> {
     /// shape — so a back-edge into bb0 (which would demand reseeding the
     /// parameter slots as phis) declines to the monotonic fallback.
     fn lower_framestate(&mut self, loop_headers: &[bool]) -> Result<(), LowerError> {
+        self.note_nonrelaxed_atomic_loads();
         let n = self.body.body.len();
         if n == 0 {
             return Ok(());
@@ -9572,7 +9614,7 @@ impl<'a> Lowering<'a> {
                         .and_then(const_lit_to_op)
                 }
             });
-        local.or_else(|| foldable_const_lit(&g.item_meta.name_path()))
+        local.or_else(|| attached_foldable_lit(self.llbc, def_id))
     }
 
     /// Fold a `NamedConst` global whose initializer is exactly
@@ -10636,13 +10678,12 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `<*mut T>::add` / `<*const T>::add` is `lltype.direct_ptradd`.
-                // The add stays pointer-typed so a `null_mut()` arm at the
-                // same return can union with it.  Pointee size is not a
-                // recoverable `TO.OF` on the erased pointer at jtransform
-                // time, so the count is scaled to a byte offset here
-                // (`n * sizeof(T)`, skipped for size 0/1) and the rewrite
-                // treats the shift as already-scaled, like `CCHARP`.
+                // `<*mut T>::add` / `<*const T>::add` / `::sub` is
+                // `lltype.direct_ptradd(ptr, unscaled_count)`.  `sub`
+                // negates the count.  The pointer's concretetype carries
+                // `TO.OF` so `rewrite_op_direct_ptradd` can scale; a char
+                // pointer is `CCHARP` and stays unscaled.  The result is
+                // a raw pointer (int kind).
                 //
                 // Brick-1 accessors and brick-3 getarrayitem `.add`s have
                 // their own intercepts later in this match; do not steal
@@ -10662,31 +10703,23 @@ impl<'a> Lowering<'a> {
                     let offset = if pointee_size == 0 {
                         args[0].clone()
                     } else {
-                        let count = if pointee_size == 1 {
-                            args[1].clone()
-                        } else {
-                            let scale = self
+                        let mut count = args[1].clone();
+                        if self.ptr_offset_is_sub(&reg) {
+                            let neg = self
                                 .graph
                                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                                result: Some(scale.clone()),
-                                kind: OpKind::ConstInt(pointee_size),
-                            });
-                            let scaled = self
-                                .graph
-                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                                result: Some(scaled.clone()),
-                                kind: OpKind::BinOp {
-                                    op: "mul".to_string(),
-                                    lhs: args[1].clone(),
-                                    rhs: scale,
+                                result: Some(neg.clone()),
+                                kind: OpKind::UnaryOp {
+                                    op: "neg".to_string(),
+                                    operand: count,
                                     result_ty: ValueType::Int,
                                 },
                             });
-                            scaled
-                        };
-                        push_direct_ptradd(&mut self.graph, bb_id, args[0].clone(), count)
+                            count = neg;
+                        }
+                        let item = item_lltype_for_size(pointee_size);
+                        push_direct_ptradd(&mut self.graph, bb_id, args[0].clone(), count, &item)
                     };
                     self.local_var[dest_local] = Some(offset);
                     let target_bb = self.block_id[target];
@@ -12667,6 +12700,11 @@ impl<'a> Lowering<'a> {
                 )? {
                     return Ok(());
                 }
+                if self.try_lower_wrapping_unop(
+                    mir_bb, &reg.kind, &segments, &args, dest_local, target,
+                )? {
+                    return Ok(());
+                }
                 if self.try_lower_cmp_minmax(
                     mir_bb,
                     &segments,
@@ -14170,8 +14208,11 @@ impl<'a> Lowering<'a> {
                     } else {
                         body
                     };
-                    let item =
-                        iterator_payload_element(body, self.llbc, iterator_added_a_reference)?;
+                    let item = iterator_payload_element(
+                        body,
+                        self.llbc,
+                        enumerate_item_peel(enumerate_next, iterator_added_a_reference),
+                    )?;
                     serde_json::from_value::<TyRef>(item.clone()).ok()
                 })
                 .map(|ty| tyref_to_value_type_with(&ty, self.llbc, self.tombstoned_leaves))
@@ -14258,6 +14299,19 @@ impl<'a> Lowering<'a> {
             };
             value_type_bank(&recv_ty) == value_type_bank(&identity_dest_ty)
         });
+        let identity_layout = if matches!(
+            &op_kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().is_some_and(|leaf| leaf == "new")
+        ) {
+            self.adt_struct_fields(&call.dest.ty)
+        } else {
+            first_arg_ty
+                .as_ref()
+                .and_then(|ty| self.adt_struct_fields(ty))
+        };
         let op_kind = crate::front::std_identity::lower_std_primitive_op(
             op_kind,
             identity_recv.as_deref(),
@@ -14266,6 +14320,7 @@ impl<'a> Lowering<'a> {
             self.tyref_literal_uint_atom(&call.dest.ty),
             dest_is_bool,
             identity_banks_agree,
+            identity_layout.as_deref(),
         );
         // Capture `i64::checked_{add,sub,mul}()` results (`Option<i64>`-
         // typed) for the checked-arith rewiring pass
@@ -14408,11 +14463,9 @@ impl<'a> Lowering<'a> {
         }
         // Word-sized `{u64,usize}::saturating_add`.  Narrow unsigned
         // saturating add is not a word carry (`u32::MAX + 1` does not wrap
-        // in the u64 bank), so the dest atom is required here — the same
-        // width gate as unsigned `checked_add`.  Recorded on
-        // `saturating_sub_sites` (identical `{ result_var }` shape); the
-        // add pass matches the `saturating_add` leaf and declines sub
-        // producers.
+        // in the word bank), so the dest atom is required here — the same
+        // width gate as unsigned `checked_add`.  `int_add` is recorded on
+        // its own site list; the sub pass never sees these producers.
         if let OpKind::Call {
             target: CallTarget::FunctionPath { segments, .. },
             args,
@@ -14424,10 +14477,27 @@ impl<'a> Lowering<'a> {
                 .tyref_literal_uint_atom(&call.dest.ty)
                 .is_some_and(crate::front::checked_arith_uint::is_word_sized_uint_atom)
         {
-            self.saturating_sub_sites
-                .push(crate::front::saturating_sub::SaturatingSubSite {
+            self.saturating_add_sites
+                .push(crate::front::saturating_add::SaturatingAddSite {
                     result_var: result_var.clone(),
                 });
+        }
+        // Word-sized `{u64,usize}::saturating_mul`.  Narrow unsigned
+        // saturating mul is not a word high-word test (`u32::MAX *
+        // u32::MAX` fits in u64), so the dest atom is required here —
+        // the same width gate as unsigned `checked_mul`.
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
+            && fmt_path_ends_with(segments, &["num", "<Impl>", "saturating_mul"])
+            && self
+                .tyref_literal_uint_atom(&call.dest.ty)
+                .is_some_and(crate::front::checked_arith_uint::is_word_sized_uint_atom)
+        {
+            self.saturating_mul_sites.push(result_var.clone());
         }
         // Capture `Result::ok()` results whose payload is `Layout`
         // (`Option<Layout>`) for the `from_size_align` bound-check rewiring pass
@@ -15532,6 +15602,59 @@ impl<'a> Lowering<'a> {
         self.is_atomic_method(reg, "load")
     }
 
+    /// Record every non-`Relaxed` atomic load in the body before lowering
+    /// stops at the first unsupported statement.
+    fn note_nonrelaxed_atomic_loads(&mut self) {
+        self.ordered_atomic_load_reasons.clear();
+        let mut ordering = std::collections::HashMap::<usize, String>::new();
+        for bb in &self.body.body {
+            for stmt in &bb.statements {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
+                    continue;
+                };
+                let PlaceKind::Local(local) = place.kind else {
+                    continue;
+                };
+                if let Some(name) = self.atomic_ordering_variant(&rvalue) {
+                    ordering.insert(local as usize, name);
+                }
+            }
+        }
+        for bb in &self.body.body {
+            let Ok(term) = bb.term() else {
+                continue;
+            };
+            let TermKind::Call { call, .. } = term else {
+                continue;
+            };
+            let CallFunc::Regular(reg) = &call.func else {
+                continue;
+            };
+            if call.args.len() != 2 || !self.is_atomic_load(reg) {
+                continue;
+            }
+            let ordering_name = call
+                .args
+                .get(1)
+                .and_then(|operand| match operand {
+                    Operand::Copy(place) | Operand::Move(place) => match place.kind {
+                        PlaceKind::Local(local) => Some(local as usize),
+                        _ => None,
+                    },
+                    Operand::Const(_) => None,
+                })
+                .and_then(|local| ordering.get(&local))
+                .map(String::as_str);
+            if ordering_name == Some("Relaxed") {
+                continue;
+            }
+            self.ordered_atomic_load_reasons.push(format!(
+                "unsupported MIR: atomic load ordering {} requires address-preserving ordered lowering",
+                ordering_name.unwrap_or("unknown")
+            ));
+        }
+    }
+
     /// `<core::sync::atomic::Atomic*>::store(&self, value, ordering)` — the
     /// write twin of [`Lowering::is_atomic_load`].  A relaxed store to a
     /// layout-transparent atomic is the same machine store a plain field
@@ -16103,15 +16226,16 @@ impl<'a> Lowering<'a> {
             && tyref_is_copy_scalar_or_thin_ptr(dest_ty, self.llbc)
     }
 
-    /// `<*mut T>::add` / `<*const T>::add` when the pointee has a known
-    /// byte size, so the count can be scaled to a byte offset before
+    /// `<*mut T>::add` / `<*const T>::add` / `::sub` when the pointee has a
+    /// known byte size, so the count can be scaled to a byte offset before
     /// `lltype.direct_ptradd`.
     fn ptr_add_pointee_size(&self, reg: &RegularCall, first_arg_ty: Option<&TyRef>) -> Option<i64> {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return None;
         };
         let fd = self.llbc.fn_by_id(*id)?;
-        if !is_core_ptr_add_path(fd.item_meta.name_path().as_str()) {
+        let path = fd.item_meta.name_path();
+        if !is_core_ptr_add_path(path.as_str()) && !is_core_ptr_sub_path(path.as_str()) {
             return None;
         }
         let pointee = first_arg_ty.and_then(|ty| {
@@ -16119,6 +16243,15 @@ impl<'a> Lowering<'a> {
                 .or_else(|| tyref_peel_one_ref_node(ty, self.llbc))
         })?;
         json_ty_byte_size(pointee, self.llbc)
+    }
+
+    fn ptr_offset_is_sub(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| is_core_ptr_sub_path(fd.item_meta.name_path().as_str()))
     }
 
     /// Later intercepts in this same `RegularCall` match already lower
@@ -17578,6 +17711,28 @@ impl<'a> Lowering<'a> {
             return Some(arg.clone());
         }
         None
+    }
+
+    /// Named fields of a struct lltype, after peeling a borrow. `None`
+    /// when the declaration is missing or opaque, so a wrapper call
+    /// declines instead of aliasing the guard.
+    fn adt_struct_fields(&self, ty: &TyRef) -> Option<Vec<(String, ValueType)>> {
+        let peeled = self.tyref_peel_ref_to_pointee(ty);
+        let ty = peeled.as_ref().unwrap_or(ty);
+        let id = self.tyref_adt_def_id(ty)?;
+        let td = self.llbc.type_by_id(id)?;
+        let TypeDeclKind::Struct(fields) = &td.kind else {
+            return None;
+        };
+        Some(
+            fields
+                .iter()
+                .filter_map(|field| {
+                    let name = field.name.clone()?;
+                    Some((name, tyref_to_value_type(&field.ty, self.llbc)))
+                })
+                .collect(),
+        )
     }
 
     /// The ADT `def_id` behind a signature [`TyRef`], whether inline
@@ -19661,6 +19816,8 @@ impl<'a> Lowering<'a> {
             "wrapping_mul" => ("mul", false),
             "wrapping_div" => ("floordiv", true),
             "wrapping_rem" => ("mod", true),
+            "wrapping_shl" => ("lshift", false),
+            "wrapping_shr" => ("rshift", false),
             _ => return Ok(false),
         };
         let [lhs, rhs] = args else {
@@ -19677,8 +19834,13 @@ impl<'a> Lowering<'a> {
         let Some(src) = fd.signature.inputs.first() else {
             return Ok(false);
         };
-        let signed_word = matches!(self.tyref_literal_int_atom(src), Some("I64" | "Isize"));
-        let unsigned_word = matches!(self.tyref_literal_uint_atom(src), Some("U64" | "Usize"));
+        let word_bytes = crate::layout::target_word_size();
+        let signed_word = self.tyref_literal_int_atom(src).is_some_and(|atom| {
+            crate::front::checked_arith_uint::is_jit_bank_int_atom(atom, word_bytes)
+        });
+        let unsigned_word = self.tyref_literal_uint_atom(src).is_some_and(|atom| {
+            crate::front::checked_arith_uint::is_jit_bank_int_atom(atom, word_bytes)
+        });
         if !signed_word && !unsigned_word {
             return Ok(false);
         }
@@ -19686,6 +19848,49 @@ impl<'a> Lowering<'a> {
             return Ok(false);
         }
         let bb_id = self.block_id[mir_bb];
+        let result_ty = if unsigned_word {
+            ValueType::Unsigned
+        } else {
+            ValueType::Int
+        };
+        let shift_rhs = if matches!(leaf.as_str(), "wrapping_shl" | "wrapping_shr") {
+            let bits: i64 = if matches!(self.tyref_literal_int_atom(src), Some("I64"))
+                || matches!(self.tyref_literal_uint_atom(src), Some("U64"))
+            {
+                64
+            } else {
+                (crate::layout::target_word_size() * 8) as i64
+            };
+            if bits <= 1 {
+                return Ok(false);
+            }
+            let mask = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(mask.clone()),
+                kind: if unsigned_word {
+                    OpKind::ConstUInt((bits - 1) as u64)
+                } else {
+                    OpKind::ConstInt(bits - 1)
+                },
+            });
+            let masked = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(masked.clone()),
+                kind: OpKind::BinOp {
+                    op: "and".to_string(),
+                    lhs: rhs.clone(),
+                    rhs: mask,
+                    result_ty: result_ty.clone(),
+                },
+            });
+            masked
+        } else {
+            rhs.clone()
+        };
         let res = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -19694,7 +19899,69 @@ impl<'a> Lowering<'a> {
             kind: OpKind::BinOp {
                 op: op.to_string(),
                 lhs: lhs.clone(),
-                rhs: rhs.clone(),
+                rhs: shift_rhs,
+                result_ty,
+            },
+        });
+        self.local_var[dest_local] = Some(res);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    /// `i64`/`u64`/`isize`/`usize::wrapping_neg` is `llop.int_neg`.  The
+    /// binary wrapping table cannot take it: the method is unary.
+    fn try_lower_wrapping_unop(
+        &mut self,
+        mir_bb: usize,
+        kind: &CallKind,
+        segments: &[String],
+        args: &[Variable],
+        dest_local: usize,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let [first, .., module, impl_seg, leaf] = segments else {
+            return Ok(false);
+        };
+        if first.as_str() != "core"
+            || module.as_str() != "num"
+            || impl_seg.as_str() != "<Impl>"
+            || leaf.as_str() != "wrapping_neg"
+        {
+            return Ok(false);
+        }
+        let [operand] = args else {
+            return Ok(false);
+        };
+        let CallKind::Fun(FunId::Regular { id }) = kind else {
+            return Ok(false);
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return Ok(false);
+        };
+        let Some(src) = fd.signature.inputs.first() else {
+            return Ok(false);
+        };
+        let word_bytes = crate::layout::target_word_size();
+        let signed_word = self.tyref_literal_int_atom(src).is_some_and(|atom| {
+            crate::front::checked_arith_uint::is_jit_bank_int_atom(atom, word_bytes)
+        });
+        let unsigned_word = self.tyref_literal_uint_atom(src).is_some_and(|atom| {
+            crate::front::checked_arith_uint::is_jit_bank_int_atom(atom, word_bytes)
+        });
+        if !signed_word && !unsigned_word {
+            return Ok(false);
+        }
+        let bb_id = self.block_id[mir_bb];
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::UnaryOp {
+                op: "neg".to_string(),
+                operand: operand.clone(),
                 result_ty: if unsigned_word {
                     ValueType::Unsigned
                 } else {
@@ -24881,142 +25148,33 @@ pub(crate) fn collect_policy_opaque_fn_stubs_from_llbc(
     })
 }
 
-/// Collect signature-only [`DeclinedFunDecl`] rows for every local function
-/// whose unstructured body contains a non-`Relaxed` `Atomic*::load`.
+/// Signature row for a function the MIR loop already declined.
 ///
-/// Re-derives the same condition `build_semantic_program_from_llbcs`
-/// records in its local `skipped` vec (`LowerError::Unsupported` whose
-/// Display contains `atomic load ordering`).  The skip list is a
-/// `(leaf, message)` pair and never leaves that function, so a sibling
-/// of [`collect_policy_opaque_fn_stubs_from_llbc`] walks the LLBC and
-/// rebuilds the full declaration (path segments, scalar lltypes, the
-/// Display string) instead of threading `skipped` out.
-pub(crate) fn collect_atomic_load_declined_fun_decls(
+/// The decline string is the `LowerError` the lowering produced. This
+/// does not walk the body again.
+fn declined_atomic_load_fun_decl(
     llbc: &Llbc,
-) -> Vec<crate::translator::rtyper::lltypesystem::module::ll_extaccessor::DeclinedFunDecl> {
+    fd: &FunDecl,
+    decline_reason: String,
+) -> crate::translator::rtyper::lltypesystem::module::ll_extaccessor::DeclinedFunDecl {
     use crate::translator::rtyper::lltypesystem::module::ll_extaccessor::DeclinedFunDecl;
-    let mut out = Vec::new();
-    for fd in llbc.iter_local_fns() {
-        if fd.is_global_initializer.is_some() {
-            continue;
-        }
-        let Some(body) = fd.unstructured() else {
-            continue;
-        };
-        let Some(ordering) = first_non_relaxed_atomic_load_ordering(llbc, &body) else {
-            continue;
-        };
-        let segments: Vec<String> = fd
-            .item_meta
-            .name_path()
-            .split("::")
-            .map(String::from)
-            .collect();
-        out.push(DeclinedFunDecl {
-            segments,
-            arg_lltypes: fd
-                .signature
-                .inputs
-                .iter()
-                .map(|ty| tyref_to_external_lltype(ty, llbc))
-                .collect(),
-            result_lltype: tyref_to_external_lltype(&fd.signature.output, llbc),
-            has_translatable_body: false,
-            decline_reason: format!(
-                "unsupported MIR: atomic load ordering {ordering} requires \
-                 address-preserving ordered lowering"
-            ),
-        });
-    }
-    out
-}
-
-fn first_non_relaxed_atomic_load_ordering(llbc: &Llbc, body: &Unstructured) -> Option<String> {
-    let mut ordering_locals: std::collections::HashMap<usize, String> =
-        std::collections::HashMap::new();
-    for bb in &body.body {
-        for stmt in &bb.statements {
-            let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
-                continue;
-            };
-            if let PlaceKind::Local(index) = dest.kind
-                && let Some(name) = atomic_ordering_variant_of(llbc, &rvalue)
-            {
-                ordering_locals.insert(index as usize, name);
-            }
-        }
-        let Ok(TermKind::Call { call, .. }) = bb.term() else {
-            continue;
-        };
-        if call.args.len() != 2 {
-            continue;
-        }
-        let CallFunc::Regular(reg) = &call.func else {
-            continue;
-        };
-        if !call_is_atomic_load(reg, llbc) {
-            continue;
-        }
-        let ordering = operand_local_index(&call.args[1])
-            .and_then(|local| ordering_locals.get(&local).cloned())
-            .unwrap_or_else(|| "unknown".to_string());
-        if ordering != "Relaxed" {
-            return Some(ordering);
-        }
-    }
-    None
-}
-
-fn call_is_atomic_load(reg: &RegularCall, llbc: &Llbc) -> bool {
-    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-        return false;
-    };
-    let Some(fd) = llbc.fn_by_id(*id) else {
-        return false;
-    };
-    if fd.item_meta.name_path().rsplit("::").next() != Some("load") {
-        return false;
-    }
-    fd.signature.inputs.first().is_some_and(|ty| {
-        adt_path_of_tyref(ty, llbc).is_some_and(|path| {
-            path.contains("::sync::atomic::")
-                && path
-                    .rsplit("::")
-                    .next()
-                    .is_some_and(|leaf| leaf.starts_with("Atomic"))
-        })
-    })
-}
-
-fn atomic_ordering_variant_of(llbc: &Llbc, rvalue: &Rvalue) -> Option<String> {
-    let Rvalue::Aggregate(kind, _) = rvalue else {
-        return None;
-    };
-    let adt = kind.as_object()?.get("Adt")?.as_array()?;
-    let head = adt.first()?;
-    let type_id = match head.as_u64() {
-        Some(id) => id,
-        None => head.get("id")?.get("Adt")?.as_u64()?,
-    };
-    let td = llbc.type_by_id(type_id)?;
-    if td.item_meta.name_path() != "core::sync::atomic::Ordering" {
-        return None;
-    }
-    let TypeDeclKind::Enum(variants) = &td.kind else {
-        return None;
-    };
-    let variant_idx = adt.get(1).and_then(serde_json::Value::as_u64)? as usize;
-    Some(variants.get(variant_idx)?.name.clone())
-}
-
-fn operand_local_index(op: &Operand) -> Option<usize> {
-    let place = match op {
-        Operand::Copy(place) | Operand::Move(place) => place,
-        Operand::Const(_) => return None,
-    };
-    match &place.kind {
-        PlaceKind::Local(index) => Some(*index as usize),
-        _ => None,
+    let segments: Vec<String> = fd
+        .item_meta
+        .name_path()
+        .split("::")
+        .map(String::from)
+        .collect();
+    DeclinedFunDecl {
+        segments,
+        arg_lltypes: fd
+            .signature
+            .inputs
+            .iter()
+            .map(|ty| tyref_to_external_lltype(ty, llbc))
+            .collect(),
+        result_lltype: tyref_to_external_lltype(&fd.signature.output, llbc),
+        has_translatable_body: false,
+        decline_reason,
     }
 }
 
@@ -25985,18 +26143,68 @@ fn int_binop_needs_ptr_to_int(op: &str, lhs: Option<&ValueType>, rhs: Option<&Va
         && (matches!(lhs, Some(ValueType::Ref(_))) || matches!(rhs, Some(ValueType::Ref(_))))
 }
 
-/// Emit `simple_call(lltype.direct_ptradd, p, n)` and return the pointer
-/// result.  The annotation is the pointer operand's (`ann_direct_ptradd`
-/// returns `s_p`), so a `null_mut()` arm of the same pointer unions with
-/// it.  `n` is a Signed/Unsigned byte offset — pointee scaling happens
-/// at the callsite when `TO.OF` is not recoverable later.
+/// Emit `simple_call(lltype.direct_ptradd, p, n)` and return the raw
+/// pointer.  `ann_direct_ptradd` returns `s_p`.  `n` is an unscaled item
+/// count.  `item` is `TO.OF`: a `Char` builds `CCHARP` (byte shift);
+/// anything else is what `rewrite_op_direct_ptradd` multiplies by.
+/// The result kind is int.
 fn push_direct_ptradd(
     graph: &mut FunctionGraph,
     bb_id: BlockId,
     ptr: Variable,
     count: Variable,
+    item: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
 ) -> Variable {
-    let result = graph.alloc_value_var();
+    // A Rust `*const T` / `*mut T` is `rffi.CArrayPtr(T)` (`Ptr(Array)` with
+    // `nolength`), and a byte pointer is `CCHARP`. An earlier cast may have
+    // stamped `Signed` or a GC pointer; `rewrite_op_direct_ptradd` scales
+    // from `TO.OF`, so the operand has to carry the array pointer.
+    // Stamp the array pointer on an int-kind value. A GC-pointer (or
+    // still-unstamped) operand keeps its own concretetype: overwriting
+    // it changes the register bank, and a later result-kind commit puts
+    // the ref back under an `int_add`. `cast_ptr_to_int` yields a fresh
+    // `Signed` that can carry `CArrayPtr` / `CCHARP`.
+    let already_int = ptr
+        .concretetype()
+        .as_ref()
+        .is_some_and(|ty| crate::model::getkind(ty) == crate::model::ConcreteType::Signed);
+    let ptr_ty = lltype_for_direct_ptradd_pointer(
+        if already_int {
+            ptr.concretetype()
+        } else {
+            None
+        },
+        item,
+    );
+    let ptr = if already_int && ptr.concretetype().as_ref() == Some(&ptr_ty) {
+        ptr
+    } else if already_int {
+        // `clone` shares the concretetype cell. A fresh `same_as` result
+        // carries `TO.OF` without rewriting the caller's variable.
+        let fresh = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        fresh.set_concretetype(Some(ptr_ty.clone()));
+        graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(fresh.clone()),
+            kind: OpKind::UnaryOp {
+                op: "same_as".to_string(),
+                operand: ptr,
+                result_ty: ValueType::Int,
+            },
+        });
+        fresh
+    } else {
+        let fresh = push_cast_ptr_to_int(graph, bb_id, ptr);
+        fresh.set_concretetype(Some(ptr_ty.clone()));
+        fresh
+    };
+    // An unstamped count reads as ref (`Unknown` → `'r'`), and
+    // `rewrite_op_direct_ptradd` then refuses the scale. The count is
+    // an item index: `lltype.Signed`.
+    if FunctionGraph::concretetype_of(&count) == crate::model::ConcreteType::Unknown {
+        FunctionGraph::set_concretetype_of_inline(&count, crate::model::ConcreteType::Signed);
+    }
+    let result = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+    result.set_concretetype(Some(ptr_ty));
     graph.block_mut(bb_id).operations.push(SpaceOperation {
         result: Some(result.clone()),
         kind: OpKind::Call {
@@ -26014,10 +26222,69 @@ fn push_direct_ptradd(
                 fun_decl_id: None,
             },
             args: crate::model::call_args(vec![ptr, count]),
-            result_ty: ValueType::Ref(None),
+            result_ty: ValueType::Int,
         },
     });
     result
+}
+
+fn is_raw_array_ptr(ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType) -> bool {
+    raw_array_ptr_item(ty).is_some()
+}
+
+fn raw_array_ptr_item(
+    ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+) -> Option<&crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    let LowLevelType::Ptr(ptr) = ty else {
+        return None;
+    };
+    let PtrTarget::Array(arr) = &ptr.TO else {
+        return None;
+    };
+    Some(&arr.OF)
+}
+
+/// `CArrayPtr(item)`, or `CCHARP` when the item is a byte (`lltype.Char`).
+/// An existing `Ptr(Array)` is already that shape and is kept.
+pub(crate) fn lltype_for_direct_ptradd_pointer(
+    existing: Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType>,
+    item: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::lltypesystem::rffi::{CArrayPtr, CCHARP};
+    if let Some(existing) = existing.as_ref()
+        && is_raw_array_ptr(existing)
+        && raw_array_ptr_item(existing).is_some_and(|of| of == item)
+    {
+        return existing.clone();
+    }
+    if *item == LowLevelType::Char {
+        return (*CCHARP).clone();
+    }
+    CArrayPtr(item.clone())
+}
+
+/// Item type whose `llmemory.sizeof` is `n` bytes, so
+/// `rewrite_op_direct_ptradd` can read `TO.OF`.  One byte is `Char`
+/// (`CCHARP` skips the multiply).
+fn item_lltype_for_size(n: i64) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
+    use crate::translator::rtyper::lltypesystem::lltype::{FixedSizeArray, LowLevelType};
+    let word = crate::layout::target_word_size() as i64;
+    if n == 1 {
+        LowLevelType::Char
+    } else if n == word {
+        LowLevelType::Signed
+    } else if n == 4 {
+        LowLevelType::UniChar
+    } else if n == 16 {
+        LowLevelType::SignedLongLongLong
+    } else {
+        LowLevelType::FixedSizeArray(Box::new(FixedSizeArray::new(
+            LowLevelType::Char,
+            n as usize,
+        )))
+    }
 }
 
 /// Emit `simple_call(lltype.cast_ptr_to_int, p)` and return the Signed
@@ -27334,19 +27601,32 @@ fn tyref_transparent_inner_value_type(
     }
 }
 
-thread_local! {
-    /// Foldable const literals harvested from the whole linked LLBC set.
-    ///
-    /// The streaming driver parses one artefact at a time and drops it,
-    /// so a defining crate's initializer body is gone by the time a
-    /// dependent crate's read is lowered. The harvest stores the folded
-    /// value, keyed by the full `item_meta.name_path()`, for
-    /// [`Lowering::const_eval_global`] to consult after the local
-    /// initializer lanes fail. Thread-local, not a process-global lock:
-    /// one translate pipeline runs on one thread, matching
-    /// [`crate::local_crates::register_local_crate_roots`].
-    static FOLDABLE_CONST_LITS: RefCell<Vec<(String, OpKind)>> =
-        const { RefCell::new(Vec::new()) };
+fn encode_foldable_op(op: &OpKind) -> Option<String> {
+    match op {
+        OpKind::ConstInt(n) => Some(format!("i{n}")),
+        OpKind::ConstUInt(n) => Some(format!("u{n}")),
+        OpKind::ConstBool(b) => Some(format!("b{}", u8::from(*b))),
+        OpKind::ConstFloat(bits) => Some(format!("f{bits}")),
+        OpKind::ConstSingleFloat(bits) => Some(format!("s{bits}")),
+        _ => None,
+    }
+}
+
+fn decode_foldable_op(encoded: &str) -> Option<OpKind> {
+    let (tag, rest) = encoded.split_at(encoded.chars().next()?.len_utf8());
+    match tag {
+        "i" => Some(OpKind::ConstInt(rest.parse().ok()?)),
+        "u" => Some(OpKind::ConstUInt(rest.parse().ok()?)),
+        "b" => Some(OpKind::ConstBool(rest == "1")),
+        "f" => Some(OpKind::ConstFloat(rest.parse().ok()?)),
+        "s" => Some(OpKind::ConstSingleFloat(rest.parse().ok()?)),
+        _ => None,
+    }
+}
+
+/// Literal previously written onto this artefact's global `def_id`.
+pub(crate) fn attached_foldable_lit(llbc: &Llbc, def_id: u64) -> Option<OpKind> {
+    decode_foldable_op(&llbc.foldable_const_lit(def_id)?)
 }
 
 fn global_is_thread_local(g: &GlobalDecl) -> bool {
@@ -27423,11 +27703,56 @@ pub(crate) fn discover_foldable_const_lits(llbc: &Llbc) -> Vec<(String, OpKind)>
     discovered
 }
 
-/// Replace this thread's harvested foldable-const set with one
-/// pipeline invocation's merged literals. A later invocation on the
-/// same thread overwrites. Two artefacts that fold the same full path
-/// to different values is a bug, not a silent winner.
-pub(crate) fn register_foldable_const_lits(entries: impl IntoIterator<Item = (String, OpKind)>) {
+/// Impl associated consts share one `name_path` (`<Impl>`). Register each
+/// by its defining global's `def_id` instead of that path.
+pub(crate) fn register_ambiguous_impl_foldable_const_lits(llbc: &Llbc) {
+    let mut paths: Vec<String> = llbc
+        .iter_global_decls()
+        .map(|g| g.item_meta.name_path())
+        .collect();
+    paths.sort();
+    let mut ambiguous: Vec<String> = Vec::new();
+    for pair in paths.windows(2) {
+        if pair[0] == pair[1] && ambiguous.last() != Some(&pair[0]) {
+            ambiguous.push(pair[0].clone());
+        }
+    }
+    for g in llbc.iter_global_decls() {
+        let path = g.item_meta.name_path();
+        if !path.contains('<') || ambiguous.binary_search(&path).is_err() {
+            continue;
+        }
+        if global_is_thread_local(g) || global_source_text_is_static_mut(g) {
+            continue;
+        }
+        let Some(init_id) = g.rest.get("init").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        let Some(fd) = llbc.fn_by_id(init_id) else {
+            continue;
+        };
+        let Some(u) = fd.unstructured() else {
+            continue;
+        };
+        let Some(op) = const_eval_init_body(llbc, &u) else {
+            continue;
+        };
+        let Some(encoded) = encode_foldable_op(&op) else {
+            continue;
+        };
+        llbc.register_foldable_const_lit(g.def_id, encoded);
+    }
+}
+
+/// Merge foldable literals that share an injective path.
+///
+/// A path containing `<` is not an identity (`name_path` renders every
+/// trait impl as `<Impl>`). Callers keep those on the defining global's
+/// decl id and do not pass them here. Two artefacts that fold one
+/// injective path to different values is a bug, not a silent winner.
+pub(crate) fn register_foldable_const_lits(
+    entries: impl IntoIterator<Item = (String, OpKind)>,
+) -> Vec<(String, OpKind)> {
     let mut lits: Vec<(String, OpKind)> = Vec::new();
     for (path, lit) in entries {
         match lits.binary_search_by(|(known, _)| known.cmp(&path)) {
@@ -27438,17 +27763,29 @@ pub(crate) fn register_foldable_const_lits(entries: impl IntoIterator<Item = (St
             Err(index) => lits.insert(index, (path, lit)),
         }
     }
-    FOLDABLE_CONST_LITS.with(|slot| *slot.borrow_mut() = lits);
+    lits
 }
 
-fn foldable_const_lit(path: &str) -> Option<OpKind> {
-    FOLDABLE_CONST_LITS.with(|slot| {
-        let lits = slot.borrow();
-        let index = lits
-            .binary_search_by(|(known, _)| known.as_str().cmp(path))
-            .ok()?;
-        Some(lits[index].1.clone())
-    })
+/// Write each harvested literal onto the global in `llbc` whose
+/// `name_path` matches, stored under that global's decl id.
+pub(crate) fn attach_foldable_const_lits(llbc: &Llbc, entries: &[(String, OpKind)]) {
+    if entries.is_empty() {
+        return;
+    }
+    let mut entries = entries.to_vec();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+    for g in llbc.iter_global_decls() {
+        let path = g.item_meta.name_path();
+        let Ok(index) = entries.binary_search_by(|(known, _)| known.as_str().cmp(path.as_str()))
+        else {
+            continue;
+        };
+        let Some(encoded) = encode_foldable_op(&entries[index].1) else {
+            continue;
+        };
+        llbc.register_foldable_const_lit(g.def_id, encoded);
+    }
 }
 
 /// Link complete transparent-scalar declarations to opaque dependency views.
@@ -27486,19 +27823,28 @@ pub(crate) fn discover_transparent_scalar_kinds(
 
 fn link_transparent_scalar_types(llbcs: &[Llbc]) {
     let mut discovered = Vec::new();
-    let mut foldable_consts = Vec::new();
+    let mut foldable_cross = Vec::new();
+    let mut foldable_impl: Vec<Vec<(String, OpKind)>> = Vec::new();
     for llbc in llbcs {
         discovered.extend(discover_transparent_scalar_kinds(llbc));
-        foldable_consts.extend(discover_foldable_const_lits(llbc));
+        let mut impl_folds = Vec::new();
+        for (path, op) in discover_foldable_const_lits(llbc) {
+            if path.contains('<') {
+                impl_folds.push((path, op));
+            } else {
+                foldable_cross.push((path, op));
+            }
+        }
+        foldable_impl.push(impl_folds);
     }
     discovered.sort_by(|a, b| a.0.cmp(&b.0));
     discovered.dedup();
-    foldable_consts.sort_by(|a, b| a.0.cmp(&b.0));
-    foldable_consts.dedup();
-    for llbc in llbcs {
+    let foldable_cross = register_foldable_const_lits(foldable_cross);
+    for (llbc, impl_folds) in llbcs.iter().zip(foldable_impl) {
         llbc.register_transparent_scalar_kinds(discovered.iter().cloned());
+        attach_foldable_const_lits(llbc, &foldable_cross);
+        attach_foldable_const_lits(llbc, &impl_folds);
     }
-    register_foldable_const_lits(foldable_consts);
 }
 
 /// `Arg<T>` from `rustpython_compiler_core::bytecode::instruction` —
@@ -28355,6 +28701,39 @@ fn json_ty_raw_store_descr(
 /// Recognition is positive-only: an unlisted or unreadable receiver does not
 /// peel, which leaves a `&T` payload typed `Ref` — the answer the fold
 /// assumed unconditionally before any element type was carried.
+/// `Map<I, F>::collect` records the closure argument. `slice::Iter<T>`'s
+/// type argument is `T`, but `Iterator::Item` is `&T` and the closure is
+/// lowered against that borrow. `tyref_to_value_type` keeps `&i64` in the
+/// Ref bank and `i64` in the int bank, so recording `T` writes `__pos_0`
+/// as `Int` while the body reads `Ref`.
+fn map_collect_payload_value_type(item_ty: &TyRef, llbc: &Llbc, adds_reference: bool) -> ValueType {
+    if !adds_reference {
+        return tyref_to_value_type(item_ty, llbc);
+    }
+    let node = match item_ty {
+        TyRef::Inline { value: (_, v) } | TyRef::Other(v) => v.clone(),
+        TyRef::Dedup { id } => llbc
+            .dedup_body(*id)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    };
+    let borrowed = serde_json::json!({"Ref": ["Erased", node, "Shared"]});
+    tyref_to_value_type(&TyRef::Other(borrowed), llbc)
+}
+
+/// Plain `next` peels the reference [`iterator_adds_a_reference`] added
+/// ([`iterator_payload_element`]). `Enumerate<I>::next` yields
+/// `(usize, I::Item)` and the loop reads `I::Item` — the borrow, for a
+/// slice iterator — the same bank `pack_enumerate_payload` writes into
+/// `__pos_1`.
+fn enumerate_item_peel(enumerate_next: bool, iterator_added_a_reference: bool) -> bool {
+    if enumerate_next {
+        false
+    } else {
+        iterator_added_a_reference
+    }
+}
+
 fn iterator_adds_a_reference(path: &str) -> bool {
     matches!(
         path,
@@ -30573,20 +30952,13 @@ fn known_array_layout_const(segments: &[String]) -> Option<OpKind> {
 /// `Bits::ALL` is type-width-specific (`u8::MAX` vs `u64::MAX`) under
 /// the same non-injective path, so it stays residual.
 fn bitflags_trait_empty_const(segments: &[String]) -> Option<OpKind> {
-    if segments.first().map(String::as_str) != Some("bitflags") {
-        return None;
-    }
-    let tail: Vec<&str> = segments
-        .iter()
-        .rev()
-        .take(3)
-        .rev()
-        .map(String::as_str)
-        .collect();
-    match tail.as_slice() {
-        ["traits", "<Impl>", "EMPTY"] => Some(OpKind::ConstInt(0)),
-        _ => None,
-    }
+    // `Bits::EMPTY` is the impl's own initializer (`impl_bits!`), keyed by
+    // the concrete Self type the way `fold_size_const_global` keys a layout.
+    // Charon renders every impl as `<Impl>` and leaves the external impl
+    // body opaque, so a leaf match cannot see that Self. Leave the read
+    // residual; a defining initializer still folds through `const_eval_global`.
+    let _ = segments;
+    None
 }
 
 /// Supply the value of a `CodeFlags` associated constant. `bitflags!`
@@ -32191,6 +32563,13 @@ fn is_core_ptr_add_path(path: &str) -> bool {
     matches!(
         path.split("::").collect::<Vec<_>>().as_slice(),
         ["core", "ptr", "mut_ptr" | "const_ptr", "<Impl>", "add"]
+    )
+}
+
+fn is_core_ptr_sub_path(path: &str) -> bool {
+    matches!(
+        path.split("::").collect::<Vec<_>>().as_slice(),
+        ["core", "ptr", "mut_ptr" | "const_ptr", "<Impl>", "sub"]
     )
 }
 
@@ -35729,6 +36108,80 @@ mod tests {
         ullbc::{NameSeg, TyRef},
     };
 
+    fn empty_llbc() -> Llbc {
+        Llbc::from_slice(
+            br#"{"charon_version":"t","has_errors":false,"translated":{"crate_name":"c","fun_decls":[],"files":[]}}"#,
+        )
+        .expect("empty llbc")
+    }
+
+    fn literal_i64() -> TyRef {
+        serde_json::from_value(serde_json::json!({"Literal": {"Int": "I64"}})).unwrap()
+    }
+
+    fn shared_i64() -> TyRef {
+        serde_json::from_value(
+            serde_json::json!({"Ref": ["Erased", {"Literal": {"Int": "I64"}}, "Shared"]}),
+        )
+        .unwrap()
+    }
+
+    /// `&i64` and `i64` are different banks. `slice::Iter<i64>`'s type
+    /// argument is the scalar; the closure reads the borrow.
+    #[test]
+    fn map_collect_slice_iter_records_the_borrow_the_closure_reads() {
+        let llbc = empty_llbc();
+        let scalar = literal_i64();
+        let borrow = shared_i64();
+        assert_eq!(tyref_to_value_type(&scalar, &llbc), ValueType::Int);
+        assert_eq!(
+            tyref_to_value_type(&borrow, &llbc),
+            ValueType::Ref(None),
+            "&i64 and i64 must not share a bank"
+        );
+        assert!(super::iterator_adds_a_reference("core::slice::iter::Iter"));
+        assert_eq!(
+            super::map_collect_payload_value_type(&scalar, &llbc, true),
+            ValueType::Ref(None),
+            "Map::collect must record Iterator::Item &i64, not the type argument i64"
+        );
+    }
+
+    /// `Enumerate<slice::Iter<i64>>::next` yields `(usize, &i64)`. The
+    /// loop's `tuple.1` read is that borrow. Peeling to `i64` stores an
+    /// int in the ref field `__pos_1`.
+    #[test]
+    fn enumerate_slice_iter_next_records_the_borrow_the_loop_reads() {
+        let llbc = empty_llbc();
+        let borrow = shared_i64();
+        let node = match &borrow {
+            TyRef::Other(v) => v.clone(),
+            other => panic!("fixture ref must be inline, got {other:?}"),
+        };
+        assert_eq!(tyref_to_value_type(&borrow, &llbc), ValueType::Ref(None));
+        let peeled = super::iterator_payload_element(&node, &llbc, true)
+            .and_then(|item| serde_json::from_value::<TyRef>(item.clone()).ok())
+            .map(|ty| tyref_to_value_type(&ty, &llbc));
+        assert_eq!(
+            peeled,
+            Some(ValueType::Int),
+            "the peel itself still yields i64"
+        );
+        assert!(
+            !super::enumerate_item_peel(true, true),
+            "Enumerate::next must not peel I::Item; plain next still peels"
+        );
+        let kept =
+            super::iterator_payload_element(&node, &llbc, super::enumerate_item_peel(true, true))
+                .and_then(|item| serde_json::from_value::<TyRef>(item.clone()).ok())
+                .map(|ty| tyref_to_value_type(&ty, &llbc));
+        assert_eq!(kept, Some(ValueType::Ref(None)));
+        assert!(
+            super::enumerate_item_peel(false, true),
+            "plain slice::Iter::next still peels the reference it added"
+        );
+    }
+
     #[test]
     fn map_err_capture_requires_the_core_result_callee() {
         for path in [
@@ -35787,6 +36240,15 @@ mod tests {
         ));
         assert!(!super::is_core_ptr_add_path(
             "core::ptr::mut_ptr::<Impl>::offset"
+        ));
+        assert!(super::is_core_ptr_sub_path(
+            "core::ptr::mut_ptr::<Impl>::sub"
+        ));
+        assert!(super::is_core_ptr_sub_path(
+            "core::ptr::const_ptr::<Impl>::sub"
+        ));
+        assert!(!super::is_core_ptr_sub_path(
+            "core::ptr::mut_ptr::<Impl>::add"
         ));
 
         assert!(super::is_core_ptr_write_path("core::ptr::write"));
@@ -39695,10 +40157,11 @@ mod tests {
 
     /// Anchor the `(a..=b).contains(&v)` fold to the real lowered IR of
     /// its int census callers — `setitem_bytearray` / `byte_w`
-    /// (`(0..=255)`, constant bounds) and `c_int_w` (`(i32::MIN as
-    /// i64..=i32::MAX as i64)`, NON-constant bounds).  For each, both
-    /// residual range calls (`RangeInclusive::new` / `contains`) must be
-    /// gone and an `int_between` op present.  Ignored
+    /// (`(0..=255)`) and `c_int_w` (`(i32::MIN as i64..=i32::MAX as
+    /// i64)`, whose casts lower to `ConstInt` bounds).  All three have
+    /// constant bounds with `lo <= hi`, so for each both residual range
+    /// calls (`RangeInclusive::new` / `contains`) must be gone and an
+    /// `int_between` op present.  Ignored
     /// by default (loads the real LLBC); run with `cargo test -p
     /// majit-translate --lib range_contains_fold_real -- --ignored
     /// --nocapture`.
@@ -41504,13 +41967,13 @@ mod tests {
         let graph = super::lower_function(&llbc, "add_i64").expect("lower *const i64::add");
         let ops = graph_ops(&graph);
         assert!(
-            ops.iter().any(|op| matches!(op.kind, OpKind::ConstInt(8))),
-            "*const i64::add must multiply by 8; ops={ops:?}"
+            !ops.iter().any(|op| matches!(op.kind, OpKind::ConstInt(8))),
+            "*const i64::add must leave scaling to rewrite_op_direct_ptradd; ops={ops:?}"
         );
         assert!(
-            ops.iter()
+            !ops.iter()
                 .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "mul")),
-            "*const i64::add must emit int_mul on the count; ops={ops:?}"
+            "*const i64::add must not scale the count; ops={ops:?}"
         );
         assert!(
             ops.iter().any(|op| is_lltype_direct_ptradd(op)),
@@ -41523,12 +41986,152 @@ mod tests {
         );
     }
 
+    #[test]
+    fn direct_ptradd_pointer_reuses_array_only_when_element_matches() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget,
+        };
+        let byte = LowLevelType::Char;
+        let wide = LowLevelType::Signed;
+        let existing = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::new(byte.clone())),
+        }));
+        let same = super::lltype_for_direct_ptradd_pointer(Some(existing.clone()), &byte);
+        assert_eq!(same, existing);
+        let rebuilt = super::lltype_for_direct_ptradd_pointer(Some(existing), &wide);
+        match &rebuilt {
+            LowLevelType::Ptr(ptr) => match &ptr.TO {
+                PtrTarget::Array(arr) => assert_eq!(arr.OF, wide),
+                other => panic!("expected an array pointer, got {other:?}"),
+            },
+            other => panic!("expected a pointer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ptr_add_of_i64_emits_unscaled_count() {
+        let ptr_ty = serde_json::json!({
+            "RawPtr": [{"Literal": {"Int": "I64"}}, "Mut"]
+        });
+        let usize_ty = serde_json::json!({"Literal": {"UInt": "Usize"}});
+        let llbc = std_extern_call_fixture(
+            "add_i64_unscaled",
+            &["core", "ptr", "const_ptr", "<Impl>", "add"],
+            &[ptr_ty.clone(), usize_ty],
+            ptr_ty,
+        );
+        let graph =
+            super::lower_function(&llbc, "add_i64_unscaled").expect("lower *const i64::add");
+        let ops = graph_ops(&graph);
+        assert!(
+            !ops.iter().any(|op| matches!(op.kind, OpKind::ConstInt(8))),
+            "item scaling belongs to rewrite_op_direct_ptradd; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "mul")),
+            "the count must stay unscaled; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    result_ty: ValueType::Int,
+                    ..
+                } if segments.last().map(String::as_str) == Some("direct_ptradd")
+            )),
+            "direct_ptradd result is a raw pointer (int kind); ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn ptr_sub_of_bytes_is_unscaled_direct_ptradd_with_negated_count() {
+        let ptr_ty = serde_json::json!({
+            "RawPtr": [{"Literal": {"UInt": "U8"}}, "Mut"]
+        });
+        let usize_ty = serde_json::json!({"Literal": {"UInt": "Usize"}});
+        let llbc = std_extern_call_fixture(
+            "sub_u8",
+            &["core", "ptr", "mut_ptr", "<Impl>", "sub"],
+            &[ptr_ty.clone(), usize_ty],
+            ptr_ty,
+        );
+        let graph = super::lower_function(&llbc, "sub_u8").expect("lower *mut u8::sub");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| is_lltype_direct_ptradd(op)),
+            "*mut u8::sub must become direct_ptradd; ops={ops:?}"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "neg")),
+            "*mut u8::sub must negate the byte count; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "mul")),
+            "*mut u8::sub must not scale; ops={ops:?}"
+        );
+        assert!(
+            !call_leafs(&ops).iter().any(|leaf| *leaf == "sub"),
+            "*mut u8::sub must not residualize; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn wrapping_neg_of_i64_is_int_neg() {
+        let i64_ty = serde_json::json!({"Literal": {"Int": "I64"}});
+        let llbc = std_extern_call_fixture(
+            "wrapping_neg_i64",
+            &["core", "num", "<Impl>", "wrapping_neg"],
+            &[i64_ty.clone()],
+            i64_ty,
+        );
+        let graph =
+            super::lower_function(&llbc, "wrapping_neg_i64").expect("lower i64::wrapping_neg");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "neg")),
+            "i64::wrapping_neg must become int_neg; ops={ops:?}"
+        );
+        assert!(
+            !call_leafs(&ops).iter().any(|leaf| *leaf == "wrapping_neg"),
+            "i64::wrapping_neg must not residualize; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn wrapping_shl_of_usize_is_lshift() {
+        let usize_ty = serde_json::json!({"Literal": {"UInt": "Usize"}});
+        let u32_ty = serde_json::json!({"Literal": {"UInt": "U32"}});
+        let llbc = std_extern_call_fixture(
+            "wrapping_shl_usize",
+            &["core", "num", "<Impl>", "wrapping_shl"],
+            &[usize_ty.clone(), u32_ty],
+            usize_ty,
+        );
+        let graph =
+            super::lower_function(&llbc, "wrapping_shl_usize").expect("lower usize::wrapping_shl");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "lshift")),
+            "usize::wrapping_shl must become lshift; ops={ops:?}"
+        );
+        assert!(
+            !call_leafs(&ops).iter().any(|leaf| *leaf == "wrapping_shl"),
+            "usize::wrapping_shl must not residualize; ops={ops:?}"
+        );
+    }
+
     fn is_lltype_direct_ptradd(op: &SpaceOperation) -> bool {
         matches!(
             &op.kind,
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments, .. },
-                result_ty: ValueType::Ref(_),
+                result_ty: ValueType::Int,
                 ..
             } if segments.last().map(String::as_str) == Some("direct_ptradd")
                 && segments.iter().any(|s| s == "lltype")
@@ -42891,6 +43494,13 @@ mod tests {
             ]),
         );
         assert!(super::discover_foldable_const_lits(&shared).is_empty());
+        super::register_ambiguous_impl_foldable_const_lits(&shared);
+        let first = shared.foldable_const_lit(1);
+        let second = shared.foldable_const_lit(2);
+        assert!(
+            first.is_some() && second.is_some() && first != second,
+            "each impl const keeps its own literal, got {first:?} {second:?}"
+        );
     }
 
     #[test]
@@ -43142,16 +43752,17 @@ mod tests {
                 )
             ]),
         );
-        super::link_transparent_scalar_types(&[a, b]);
+        let llbcs = [a, b];
+        super::link_transparent_scalar_types(&llbcs);
         assert_eq!(
-            super::foldable_const_lit("crate_a::SIZE"),
+            super::attached_foldable_lit(&llbcs[0], 1),
             Some(OpKind::ConstUInt(4))
         );
         assert_eq!(
-            super::foldable_const_lit("crate_b::SIZE"),
+            super::attached_foldable_lit(&llbcs[1], 1),
             Some(OpKind::ConstUInt(8))
         );
-        assert!(super::foldable_const_lit("SIZE").is_none());
+        assert!(super::attached_foldable_lit(&llbcs[0], 0).is_none());
     }
 
     #[test]
@@ -43175,10 +43786,10 @@ mod tests {
                 )
             ]),
         );
-        super::register_foldable_const_lits(vec![(
-            "fixture::VALUE".into(),
-            OpKind::ConstUInt(185),
-        )]);
+        super::attach_foldable_const_lits(
+            &local,
+            &[("fixture::VALUE".into(), OpKind::ConstUInt(185))],
+        );
         let graph = super::lower_function(&local, "read_value").expect("local body lowers");
         assert_eq!(folded_uints(&graph), vec![99]);
         assert_eq!(nullary_calls_ending(&graph, "VALUE"), 0);
@@ -43191,6 +43802,39 @@ mod tests {
             ("crate::SIZE".into(), OpKind::ConstUInt(4)),
             ("crate::SIZE".into(), OpKind::ConstUInt(8)),
         ]);
+    }
+
+    #[test]
+    fn impl_associated_const_literal_is_not_shared_across_decl_ids() {
+        let path = ["fixture", "<Impl>", "EMPTY"];
+        let a = const_artifact(
+            "crate_a",
+            serde_json::json!([
+                reader_fun(&["crate_a", "read_a"], 1),
+                init_fun(1, &path, literal_init_body("1"))
+            ]),
+            serde_json::json!([
+                null,
+                named_const_global(1, &path, "const EMPTY: u32 = 1;", true, "NamedConst", 1)
+            ]),
+        );
+        let b = const_artifact(
+            "crate_b",
+            serde_json::json!([
+                reader_fun(&["crate_b", "read_b"], 1),
+                init_fun(1, &path, literal_init_body("7"))
+            ]),
+            serde_json::json!([
+                null,
+                named_const_global(1, &path, "const EMPTY: u32 = 7;", true, "NamedConst", 1)
+            ]),
+        );
+        let llbcs = [a, b];
+        super::link_transparent_scalar_types(&llbcs);
+        let ga = super::lower_function(&llbcs[0], "read_a").expect("a lowers");
+        let gb = super::lower_function(&llbcs[1], "read_b").expect("b lowers");
+        assert_eq!(folded_uints(&ga), vec![1]);
+        assert_eq!(folded_uints(&gb), vec![7]);
     }
 
     /// The `Vec` index fold must accept a `usize` index.
@@ -43555,22 +44199,35 @@ mod tests {
         let ptr = graph
             .push_op_var(entry, OpKind::ConstRefAddr(0x1000), true)
             .expect("pointer value");
+        FunctionGraph::set_concretetype_of_inline(&ptr, crate::model::ConcreteType::Signed);
+        let before = ptr.concretetype();
         let count = graph
             .push_op_var(entry, OpKind::ConstInt(8), true)
             .expect("count");
-        let result = push_direct_ptradd(&mut graph, entry, ptr.clone(), count.clone());
+        let result = push_direct_ptradd(
+            &mut graph,
+            entry,
+            ptr.clone(),
+            count.clone(),
+            &crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Char,
+        );
         assert_eq!(
             FunctionGraph::concretetype_of(&result),
-            crate::model::ConcreteType::Unknown,
-            "direct_ptradd result matches null_mut's unstamped pointer"
+            crate::model::ConcreteType::Signed,
+            "direct_ptradd result is a raw pointer (int kind)"
         );
         match &graph.block(entry).operations.last().unwrap().kind {
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments, .. },
                 args,
-                result_ty: ValueType::Ref(None),
+                result_ty: ValueType::Int,
             } if segments.last().map(String::as_str) == Some("direct_ptradd") => {
-                assert_eq!(args, &crate::model::call_args(vec![ptr, count]));
+                assert_eq!(ptr.concretetype(), before, "caller concretetype stays put");
+                let crate::model::LinkArg::Value(got) = &args[0] else {
+                    panic!("pointer operand must be a variable, got {:?}", args[0]);
+                };
+                assert_ne!(got, &ptr, "a different item type needs a fresh variable");
+                assert_eq!(args[1], crate::model::LinkArg::Value(count));
             }
             other => panic!("expected direct_ptradd call, got {other:?}"),
         }
@@ -46322,9 +46979,9 @@ mod tests {
         use crate::model::OpKind;
         let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
-        // Any &mut-self __majit_wrap setter; set__CHUNK_SIZE takes `&mut self`.
+        // Any &mut-self __majit_wrap setter; set_CHUNK_SIZE takes `&mut self`.
         let graph =
-            super::lower_function(&llbc, "__majit_wrap_set__CHUNK_SIZE").expect("lower setter");
+            super::lower_function(&llbc, "__majit_wrap_set_CHUNK_SIZE").expect("lower setter");
         let pos0_reads = graph
             .blocks
             .iter()
@@ -49606,15 +50263,16 @@ mod tests {
 
     #[test]
     fn bitflags_trait_empty_const_folds_zero_and_rejects_all() {
-        match bitflags_trait_empty_const(&[
-            "bitflags".into(),
-            "traits".into(),
-            "<Impl>".into(),
-            "EMPTY".into(),
-        ]) {
-            Some(OpKind::ConstInt(0)) => {}
-            other => panic!("expected ConstInt(0), got {other:?}"),
-        }
+        assert!(
+            bitflags_trait_empty_const(&[
+                "bitflags".into(),
+                "traits".into(),
+                "<Impl>".into(),
+                "EMPTY".into(),
+            ])
+            .is_none(),
+            "EMPTY is not a leaf fold; it comes from the impl initializer"
+        );
         assert!(
             bitflags_trait_empty_const(&[
                 "bitflags".into(),
@@ -49670,8 +50328,7 @@ mod tests {
     }
 
     #[test]
-    fn opaque_bitflags_empty_global_read_folds_to_zero() {
-        super::register_foldable_const_lits(Vec::new());
+    fn opaque_bitflags_empty_global_read_stays_residual() {
         let path = ["bitflags", "traits", "<Impl>", "EMPTY"];
         let mut opaque_init = init_fun(1, &path, serde_json::json!("Opaque"));
         opaque_init["item_meta"]["is_local"] = serde_json::json!(false);
@@ -49693,11 +50350,14 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(ints, vec![0]);
+        assert!(
+            ints.is_empty(),
+            "opaque Bits::EMPTY must not leaf-fold to 0, got {ints:?}"
+        );
         assert_eq!(
             nullary_calls_ending(&graph, "EMPTY"),
-            0,
-            "the Opaque Bits::EMPTY read must not remain a nullary call: {graph:?}"
+            1,
+            "the Opaque Bits::EMPTY read stays a nullary call: {graph:?}"
         );
     }
 

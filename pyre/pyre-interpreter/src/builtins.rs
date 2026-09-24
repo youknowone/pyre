@@ -3444,7 +3444,7 @@ pub fn install_default_builtins(ns: PyObjectRef) {
         "BaseException",
         Some("Common base class for all exceptions"),
         exc_base_exception_new,
-        Some(exc_base_exception_init),
+        Some(__majit_wrap_base_exception_descr_init),
         crate::typedef::w_object(),
     );
     crate::module_ns_store(ns, "BaseException", base_exc);
@@ -3547,7 +3547,7 @@ pub fn install_default_builtins(ns: PyObjectRef) {
     let value_error = make_exc_type_with_doc(
         "ValueError",
         "Inappropriate argument value (of correct type).",
-        exc_value_error_new,
+        __majit_wrap_exc_value_error_descr_new,
         exception,
     );
     crate::module_ns_store(ns, "ValueError", value_error);
@@ -5416,17 +5416,28 @@ static __majit_wrap_builtin_abs_target: crate::gateway::BuiltinWrapperDescriptor
 pub fn split_builtin_kwargs(args: &[PyObjectRef]) -> (&[PyObjectRef], Option<PyObjectRef>) {
     if !args.is_empty() {
         let last = args[args.len() - 1];
-        // The marker dict stores an unforgeable sentinel under `__pyre_kw__`
-        // (`call_with_kwargs`), so detection is by value identity.  A dict
-        // passed positionally that merely contains a `__pyre_kw__` string key
-        // (`float({'__pyre_kw__': True})`) carries a different value and is a
-        // value, not the marker, so it must not be stripped.
-        let is_marker = (unsafe { is_dict(last) }) && builtin_kwargs_marker_dict(last);
-        if is_marker {
+        if builtin_kwargs_marker_tail(last) {
             return (&args[..args.len() - 1], Some(last));
         }
     }
     (args, None)
+}
+
+/// Whether `last` is the trailing keyword dict [`split_builtin_kwargs`]
+/// strips.
+///
+/// The marker dict stores an unforgeable sentinel under `__pyre_kw__`
+/// (`call_with_kwargs`), so detection is by value identity.  A dict passed
+/// positionally that merely contains a `__pyre_kw__` string key
+/// (`float({'__pyre_kw__': True})`) carries a different value and is a
+/// value, not the marker, so it must not be stripped.
+///
+/// Scalar so a wrapper that only needs the answer for a known slot can ask
+/// it without the sub-slice [`split_builtin_kwargs`] returns: a traced
+/// wrapper that builds that sub-slice stops annotating and falls to the
+/// legacy walker.
+pub fn builtin_kwargs_marker_tail(last: PyObjectRef) -> bool {
+    (unsafe { is_dict(last) }) && builtin_kwargs_marker_dict(last)
 }
 
 /// Length of the leading non-null run of `args`.
@@ -7269,6 +7280,198 @@ exc_constructor!(
 /// arguments".  pyre's flat builtin ABI has no signature to enforce that,
 /// so the keyword dict is policed here directly; the type name comes from
 /// `self`, matching `_PyArg_NoKeywords(Py_TYPE(self)->tp_name, kwds)`.
+/// `BaseException.__init__`.  One positional and no keyword dict is
+/// `[self, arg]`.  That arm stores `args` without the kwargs walk, so the
+/// traced call is one cannot-raise residual.  A keyword dict, any other
+/// arity that fits in six words, stays in [`exc_base_exception_init_slow`];
+/// a longer slice is passed through whole.
+pub fn __majit_wrap_base_exception_descr_init(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() == 2 && !args[0].is_null() && !builtin_kwargs_marker_tail(args[1]) {
+        exc_init_one_positional(args[0], args[1]);
+        return Ok(pyre_object::w_none());
+    }
+    // The six-word residual cannot see a longer tail. Hand the real slice
+    // to the initializer instead of shortening it.
+    if args.len() > 6 {
+        return exc_base_exception_init_long(args);
+    }
+    let slot = |i: usize| args.get(i).copied().unwrap_or(pyre_object::PY_NULL);
+    exc_base_exception_init_slow(
+        slot(0),
+        slot(1),
+        slot(2),
+        slot(3),
+        slot(4),
+        slot(5),
+        args.len() as i64,
+    )
+}
+
+/// Word ABI for the same reason as `dict_get_slow`: the traced wrapper
+/// cannot pass the args slice through.
+#[majit_macros::dont_look_inside]
+fn exc_base_exception_init_slow(
+    a0: PyObjectRef,
+    a1: PyObjectRef,
+    a2: PyObjectRef,
+    a3: PyObjectRef,
+    a4: PyObjectRef,
+    a5: PyObjectRef,
+    n: i64,
+) -> Result<PyObjectRef, crate::PyError> {
+    let buf = [a0, a1, a2, a3, a4, a5];
+    // The wrapper forwards a longer flat slice to `exc_base_exception_init`
+    // before this residual. A count that does not match the words cannot
+    // be reconstructed, so do not pretend the call was shorter.
+    if !(0..=buf.len() as i64).contains(&n) {
+        return Err(crate::PyError::type_error(
+            "exception initializer argument count exceeds the values received",
+        ));
+    }
+    exc_base_exception_init(&buf[..n as usize])
+}
+
+/// `BaseException(*args)` takes any number of positional arguments, so an
+/// arity the word ABI cannot carry still has to reach the initializer whole.
+/// Residual for the same reason as [`exc_base_exception_init_slow`]: a
+/// traced wrapper that passes the slice on itself stops annotating.
+#[majit_macros::dont_look_inside]
+fn exc_base_exception_init_long(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    exc_base_exception_init(args)
+}
+
+#[majit_macros::dont_look_inside_cannot_raise]
+fn exc_init_one_positional(w_self: PyObjectRef, arg: PyObjectRef) {
+    if exception_args_already(w_self, &[arg]) {
+        return;
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_self);
+    let arg_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(arg);
+    let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![
+        pyre_object::gc_roots::shadow_stack_get(arg_slot),
+    ]);
+    unsafe {
+        pyre_object::interp_exceptions::w_exception_set_args(
+            pyre_object::gc_roots::shadow_stack_get(self_slot),
+            args_list,
+        );
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_wrap_base_exception_descr_init_target: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(
+            module_path!(),
+            "::",
+            "__majit_wrap_base_exception_descr_init"
+        ),
+        func: __majit_wrap_base_exception_descr_init,
+    };
+
+/// `ValueError(x)` — one positional.  The general `exc_value_error_new`
+/// graph has no jitcode of its own, so `ValueError(...)` declined with
+/// `no jitcode for address`.
+pub fn __majit_wrap_exc_value_error_descr_new(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() == 2 && !args[0].is_null() && !builtin_kwargs_marker_tail(args[1]) {
+        return Ok(value_error_one_arg(args[0], args[1]));
+    }
+    // The four-word residual cannot see a longer tail, and a bare exception
+    // takes any number of positional arguments. Hand the real slice over
+    // rather than shortening it.
+    if args.len() > 4 {
+        return exc_value_error_new_long(args);
+    }
+    let slot = |i: usize| args.get(i).copied().unwrap_or(pyre_object::PY_NULL);
+    exc_value_error_new_slow(slot(0), slot(1), slot(2), slot(3), args.len() as i64)
+}
+
+#[majit_macros::dont_look_inside]
+fn exc_value_error_new_slow(
+    a0: PyObjectRef,
+    a1: PyObjectRef,
+    a2: PyObjectRef,
+    a3: PyObjectRef,
+    n: i64,
+) -> Result<PyObjectRef, crate::PyError> {
+    let buf = [a0, a1, a2, a3];
+    // The wrapper forwards a longer flat slice to `exc_value_error_new`
+    // before this residual. A count that does not match the words cannot be
+    // reconstructed, so do not pretend the call was shorter.
+    if !(0..=buf.len() as i64).contains(&n) {
+        return Err(crate::PyError::type_error(
+            "exception constructor argument count exceeds the values received",
+        ));
+    }
+    exc_value_error_new(&buf[..n as usize])
+}
+
+/// The constructor takes any number of positional arguments, so an arity the
+/// word ABI cannot carry still has to reach it whole.  Residual for the same
+/// reason as [`exc_value_error_new_slow`]: a traced wrapper that passes the
+/// slice on itself stops annotating, and it drags `exc_value_error_new` into
+/// the prepass with it.
+#[majit_macros::dont_look_inside]
+fn exc_value_error_new_long(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    exc_value_error_new(args)
+}
+
+#[majit_macros::dont_look_inside_cannot_raise]
+fn value_error_one_arg(cls: PyObjectRef, arg: PyObjectRef) -> PyObjectRef {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let arg_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(arg);
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(cls);
+    let exc = unsafe {
+        pyre_object::interp_exceptions::w_exception_new_empty_for_class(
+            pyre_object::interp_exceptions::ExcKind::ValueError,
+            pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        )
+    };
+    // `tag_subclass_instance` registers a finalizer and `w_exception_args_new`
+    // allocates the args list, so the fresh exception has to be rooted and
+    // re-read rather than carried in a raw local across either one.
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(exc);
+    crate::typedef::tag_subclass_instance(
+        pyre_object::gc_roots::shadow_stack_get(exc_slot),
+        pyre_object::gc_roots::shadow_stack_get(cls_slot),
+    );
+    let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![
+        pyre_object::gc_roots::shadow_stack_get(arg_slot),
+    ]);
+    unsafe {
+        pyre_object::interp_exceptions::w_exception_set_args(
+            pyre_object::gc_roots::shadow_stack_get(exc_slot),
+            args_list,
+        );
+    }
+    pyre_object::gc_roots::shadow_stack_get(exc_slot)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_wrap_exc_value_error_descr_new_target: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(
+            module_path!(),
+            "::",
+            "__majit_wrap_exc_value_error_descr_new"
+        ),
+        func: __majit_wrap_exc_value_error_descr_new,
+    };
+
 fn exc_base_exception_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let w_self = *args.first().ok_or_else(|| {
         crate::PyError::type_error("__init__() missing 1 required positional argument: 'self'")
@@ -16598,8 +16801,8 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         // an app-visible AST.  The ordinary code path runs both scans inside
         // `compile_with_codegen_warnings`; ONLY_AST has no codegen boundary,
         // so keep the tokenizer order explicitly here.
-        crate::syntax_warnings::emit_tokenizer_syntax_warnings(source, &filename)?;
-        crate::syntax_warnings::emit_escape_warnings(source, &filename)?;
+        crate::syntax_warnings::emit_tokenizer_syntax_warnings(source, &filename_text)?;
+        crate::syntax_warnings::emit_escape_warnings(source, &filename_text)?;
     }
     if flags & PYCF_ONLY_AST != 0 {
         // CPython 3.14 bltinmodule.c:847 / pythonrun.c:1524:
@@ -16680,7 +16883,7 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         });
     }
     let code = if let Some(source) = source_str.as_deref() {
-        crate::syntax_warnings::compile_with_codegen_warnings(source, mode, &filename, opts)
+        crate::syntax_warnings::compile_with_codegen_warnings(source, mode, &filename_text, opts)
             .map_err(|error| match error {
                 crate::syntax_warnings::SourceCompileError::Compile(error) => {
                     compile_err_to_syntax_error_maybe_incomplete(
@@ -16693,7 +16896,7 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
                 crate::syntax_warnings::SourceCompileError::Warning(error) => error,
             })
     } else {
-        crate::module::_ast::convert::compile_object(source, &filename, mode, opts)
+        crate::module::_ast::convert::compile_object(source, &filename, &filename_text, mode, opts)
     }
     .map_err(|error| {
         replace_compile_syntax_error_filename(error, &filename, filename_bytes.as_deref())
@@ -16813,7 +17016,7 @@ pub fn exec_or_eval(
             let code = crate::syntax_warnings::compile_with_codegen_warnings(
                 &source,
                 mode,
-                "<string>",
+                rustpython_wtf8::Wtf8::new("<string>"),
                 crate::compile::CompileOpts {
                     optimize: crate::importing::optimize_flag(),
                     debug_ranges: crate::importing::code_debug_ranges_flag(),
@@ -24782,7 +24985,7 @@ mod tests {
         let err = parse_int_from_str(source, &text, 10).unwrap_err();
         assert_eq!(err.kind, crate::PyErrorKind::ValueError);
         assert!(
-            err.message
+            err.message_text()
                 .starts_with("invalid literal for int() with base 10:")
         );
     }

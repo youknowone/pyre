@@ -2038,10 +2038,8 @@ fn lltype_cast_ptr_to_int(
 ///     return s_p
 /// ```
 ///
-/// The result annotation is the pointer operand's.  A classdef-less
-/// `SomeInstance` is the erased raw-pointer shell used here; `SomePtr`
-/// is the `lltype.Ptr` spelling.  Either is a pointer, so a
-/// `null_mut()` arm of the same pointer unions with the add.
+/// The result annotation is the pointer operand (`ann_direct_ptradd`
+/// returns `s_p`).  The operand must be `SomePtr`.
 fn lltype_direct_ptradd(
     _bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
@@ -2054,7 +2052,7 @@ fn lltype_direct_ptradd(
     }
     let s_p = arg_at(args_s, 0, "lltype.direct_ptradd");
     match s_p {
-        SomeValue::Instance(_) | SomeValue::Ptr(_) => Ok(s_p.clone()),
+        SomeValue::Ptr(_) => Ok(s_p.clone()),
         other => Err(AnnotatorError::new(format!(
             "direct_ptradd of non-pointer: {other:?}"
         ))),
@@ -3494,6 +3492,27 @@ mod tests {
         };
         assert_eq!(it.variant, vec!["enumerate".to_string()]);
         assert_eq!(it.enumerate_start, Some(ConstValue::Int(5)));
+    }
+
+    #[test]
+    fn ann_direct_ptradd_rejects_someinstance() {
+        use crate::annotator::model::SomePtr;
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+
+        let LowLevelType::Ptr(ptr_ty) = (*CCHARP).clone() else {
+            panic!("CCHARP is a pointer");
+        };
+        let s_p = SomeValue::Ptr(SomePtr::new(*ptr_ty));
+        let s_n = SomeValue::Integer(super::super::model::SomeInteger::default());
+        let out = lltype_direct_ptradd(&bk(), &[Some(s_p.clone()), Some(s_n.clone())], &no_kwds())
+            .expect("ann_direct_ptradd returns s_p");
+        assert_eq!(out, s_p);
+
+        let s_inst = SomeValue::Instance(SomeInstance::new(None, true, Default::default()));
+        let err = lltype_direct_ptradd(&bk(), &[Some(s_inst), Some(s_n)], &no_kwds())
+            .expect_err("ann_direct_ptradd asserts SomePtr");
+        assert!(err.to_string().contains("non-pointer"), "got {err}");
     }
 
     #[test]

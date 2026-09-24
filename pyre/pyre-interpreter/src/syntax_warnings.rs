@@ -340,7 +340,7 @@ fn error_message(escape: &InvalidEscape) -> String {
 fn escalate(
     err: PyError,
     source: &str,
-    filename: &str,
+    filename: &Wtf8,
     offset: usize,
     escape: &InvalidEscape,
 ) -> PyError {
@@ -363,7 +363,7 @@ fn escalate(
         .map(|line| format!("{}\n", line.trim_end_matches('\r')));
     PyError::syntax_error_located(
         error_message(escape),
-        Wtf8::new(filename),
+        filename,
         lineno as i64,
         column as i64,
         lineno as i64,
@@ -376,7 +376,7 @@ fn escalate(
 /// `PyErr_WarnExplicitObject(PyExc_SyntaxWarning, ...)` for one invalid escape.
 fn warn_invalid_escape_sequence(
     source: &str,
-    filename: &str,
+    filename: &Wtf8,
     escape: &InvalidEscape,
     offset: usize,
 ) -> Result<(), PyError> {
@@ -402,7 +402,9 @@ fn warn_invalid_escape_sequence(
     let _ =
         pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(&warning_message(escape)));
     let filename_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(filename));
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(
+        filename.to_wtf8_buf(),
+    ));
 
     crate::module::_warnings::do_warn_explicit(
         pyre_object::gc_roots::shadow_stack_get(category_slot),
@@ -433,7 +435,7 @@ pub enum SourceCompileError {
 /// `PythonCodeGenerator._check_compare`.
 fn warn_codegen_syntax(
     source: &str,
-    filename: &str,
+    filename: &Wtf8,
     lineno: usize,
     offset: usize,
     message: &str,
@@ -451,7 +453,9 @@ fn warn_codegen_syntax(
     let message_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(message));
     let filename_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(filename));
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(
+        filename.to_wtf8_buf(),
+    ));
 
     crate::module::_warnings::do_warn_explicit(
         pyre_object::gc_roots::shadow_stack_get(category_slot),
@@ -480,7 +484,7 @@ fn warn_codegen_syntax(
             .map(|line| format!("{}\n", line.trim_end_matches('\r')));
         PyError::syntax_error_located(
             message,
-            Wtf8::new(filename),
+            filename,
             lineno as i64,
             offset as i64,
             lineno as i64,
@@ -578,7 +582,7 @@ fn replacement_expression_end(bytes: &[u8], start: usize, limit: usize) -> usize
 /// token stream, so nothing between those fields is scanned.
 fn scan_replacement_field(
     source: &str,
-    filename: &str,
+    filename: &Wtf8,
     start: usize,
     end: usize,
 ) -> Result<(), PyError> {
@@ -602,7 +606,7 @@ fn scan_replacement_field(
 /// Returns the index just past the closing quote.
 fn scan_interpolated_string(
     source: &str,
-    filename: &str,
+    filename: &Wtf8,
     quote_index: usize,
     _raw: bool,
 ) -> Result<usize, PyError> {
@@ -644,7 +648,7 @@ fn scan_interpolated_string(
 /// `VirtualMachine::emit_tokenizer_syntax_warnings` performs the same byte
 /// scan before entering Ruff's parser, whose recovered tree otherwise loses
 /// the token boundary that owns the warning.
-pub fn emit_tokenizer_syntax_warnings(source: &str, filename: &str) -> Result<(), PyError> {
+pub fn emit_tokenizer_syntax_warnings(source: &str, filename: &Wtf8) -> Result<(), PyError> {
     scan_tokenizer_warnings(source, filename, 0, source.len())
 }
 
@@ -653,7 +657,7 @@ pub fn emit_tokenizer_syntax_warnings(source: &str, filename: &str) -> Result<()
 /// like any other source, while its literal text never is.
 fn scan_tokenizer_warnings(
     source: &str,
-    filename: &str,
+    filename: &Wtf8,
     start: usize,
     end: usize,
 ) -> Result<(), PyError> {
@@ -717,7 +721,7 @@ fn scan_tokenizer_warnings(
 pub fn compile_with_codegen_warnings(
     source: &str,
     mode: Mode,
-    filename: &str,
+    filename: &Wtf8,
     opts: CompileOpts,
 ) -> Result<CodeObject, SourceCompileError> {
     crate::module::thread::ensure_runtime_thread();
@@ -725,6 +729,9 @@ pub fn compile_with_codegen_warnings(
     emit_tokenizer_syntax_warnings(&source, filename).map_err(SourceCompileError::Warning)?;
     emit_escape_warnings(&source, filename).map_err(SourceCompileError::Warning)?;
     let escalated = core::cell::Cell::new(None);
+    // The compiler's `source_path` is a `String`. A lone surrogate stays on
+    // the warning; the code object is renamed afterwards.
+    let source_path = filename.to_string_lossy();
     let mut handler = |location: crate::compile::SourceLocation, message: String| {
         warn_codegen_syntax(
             &source,
@@ -741,14 +748,14 @@ pub fn compile_with_codegen_warnings(
                 location: Some(location),
                 end_location: None,
                 error: crate::compile::codegen::error::CodegenErrorType::SyntaxError(String::new()),
-                source_path: filename.to_owned(),
+                source_path: source_path.as_ref().to_owned(),
             }
         })
     };
     let result = crate::compile::rp_compile_with_syntax_warning_handler(
         &source,
         mode,
-        filename,
+        source_path.as_ref(),
         opts.clone(),
         &mut handler,
     );
@@ -757,7 +764,7 @@ pub fn compile_with_codegen_warnings(
             crate::compile::rp_compile_with_syntax_warning_handler(
                 rewritten,
                 mode,
-                filename,
+                source_path.as_ref(),
                 opts,
                 &mut handler,
             )
@@ -779,7 +786,7 @@ pub fn compile_ast_with_codegen_warnings(
     module: ast::Mod,
     source_file: rustpython_compiler::core::SourceFile,
     source: &str,
-    filename: &str,
+    filename: &Wtf8,
     mode: Mode,
     opts: CompileOpts,
 ) -> Result<CodeObject, SourceCompileError> {
@@ -799,7 +806,7 @@ pub fn compile_ast_with_codegen_warnings(
                 location: Some(location),
                 end_location: None,
                 error: crate::compile::codegen::error::CodegenErrorType::SyntaxError(String::new()),
-                source_path: filename.to_owned(),
+                source_path: filename.to_string_lossy().into_owned(),
             }
         })
     };
@@ -820,7 +827,7 @@ pub fn compile_ast_with_codegen_warnings(
 
 struct EscapeWarningVisitor<'a> {
     source: &'a str,
-    filename: &'a str,
+    filename: &'a Wtf8,
     error: Option<PyError>,
 }
 
@@ -958,7 +965,7 @@ impl<'a> Visitor<'a> for EscapeWarningVisitor<'a> {
 /// A source that does not parse is still walked, over whatever the parser
 /// recovered: the tokenizer reports an escape it has already passed even when
 /// the parse fails later, so `'\\e' $` warns once and then raises.
-pub fn emit_escape_warnings(source: &str, filename: &str) -> Result<(), PyError> {
+pub fn emit_escape_warnings(source: &str, filename: &Wtf8) -> Result<(), PyError> {
     // No escape without a backslash, so the reparse is skipped for the vast
     // majority of modules rather than paid on every compile.
     if !source.contains('\\') {

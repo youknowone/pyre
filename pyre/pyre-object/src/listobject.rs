@@ -356,6 +356,20 @@ impl W_ListObject {
         self.length.store(n, Ordering::Relaxed);
     }
 
+    /// Object-strategy item array as a slice. Null storage is empty.
+    ///
+    /// # Safety
+    /// The caller must have established the Object strategy. The returned
+    /// slice aliases `items` and is valid only until that block moves.
+    #[inline]
+    pub unsafe fn object_items_as_slice(&self) -> &[PyObjectRef] {
+        let len = self.length_relaxed();
+        if len == 0 || self.items.is_null() {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(items_block_items_base(self.items), len) }
+    }
+
     #[inline]
     fn live_len(&self) -> usize {
         match self.strategy {
@@ -2751,6 +2765,208 @@ pub unsafe fn w_list_getitem_inner(obj: PyObjectRef, index: i64) -> Option<PyObj
             Some(w_str_from_storage(list.ascii_items[idx as usize] as *mut _))
         }
     }
+}
+
+/// `ll_listslice_startstop`: `newlength = stop - start`, one `ll_newlist`,
+/// then `ll_arraycopy`. `descr_getslice` normalises the bounds in the caller
+/// — a user `__index__` must not run inside this leaf.
+///
+/// Integer, Float and Object storage each copy one sub-slice of the source
+/// array into a fresh list. Every other strategy boxes on `getitem`, so it
+/// still materialises through a host `Vec` inside one opaque helper.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ListObject`. `start` and `stop` are
+/// already normalised machine bounds (a `stop` past the length is clamped).
+pub unsafe fn ll_listslice(obj: PyObjectRef, start: usize, stop: usize) -> PyObjectRef {
+    // The arms address the backing array directly instead of boxing one item
+    // at a time through `w_list_getitem`, so the length, the strategy and the
+    // copy have to see one state: a concurrent append or strategy transition
+    // would otherwise replace the storage under a raw sub-slice.  The lock is
+    // reentrant, so an arm that still boxes may take it again.
+    //
+    // A contended acquisition parks in `before_external_block`, which lets the
+    // collector move the receiver, so root it across the wait and read it back
+    // — the same bracket `w_list_clone_if_shared_strategy` uses.
+    let _roots = crate::gc_roots::push_roots();
+    let root_base = crate::gc_roots::shadow_stack_len();
+    let obj = crate::gc_roots::pin_root(obj);
+    let _list_guard = w_list_lock(obj);
+    let obj = crate::gc_roots::shadow_stack_get(root_base);
+    let length = w_list_len(obj);
+    let start = start.min(length);
+    let stop = if stop > length { length } else { stop };
+    let newlength = stop.saturating_sub(start);
+    if newlength == 0 {
+        return w_list_new(Vec::new());
+    }
+    let strategy = (*(obj as *const W_ListObject)).strategy;
+    match strategy {
+        ListStrategy::Integer => ll_listslice_ints(obj, start, newlength),
+        ListStrategy::Float => ll_listslice_floats(obj, start, newlength),
+        ListStrategy::Object => ll_listslice_objects(obj, start, newlength),
+        _ => ll_listslice_boxed(obj, start, newlength),
+    }
+}
+
+/// Copy a sub-slice of `obj` into a fresh Integer-strategy list.
+///
+/// The header allocation can collect. `obj` is pinned across it and re-read
+/// before the source array is addressed; the element copy lands in a host
+/// `Vec` before `IntArray::from_vec` allocates the destination block.
+#[majit_macros::dont_look_inside]
+fn ll_listslice_new_int_list(obj: PyObjectRef, start: usize, piece: &[i64]) -> PyObjectRef {
+    let n = piece.len();
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    let _obj = crate::gc_roots::pin_root(obj);
+    let result_slot = crate::gc_roots::shadow_stack_len();
+    let result = w_list_new_with_strategy(Vec::new(), ListStrategy::Integer);
+    let _ = crate::gc_roots::pin_root(result);
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let list = unsafe { &*(obj as *const W_ListObject) };
+    let storage = list.int_items.as_slice();
+    let fresh = &storage[start..start + n];
+    let copied = fresh.to_vec();
+    let items = IntArray::from_vec(copied);
+    let block_slot = items.pin_block();
+    let mut items = items;
+    items.reload_block(block_slot);
+    let result = crate::gc_roots::shadow_stack_get(result_slot);
+    list_write_barrier(result);
+    let result = crate::gc_roots::shadow_stack_get(result_slot);
+    let list = unsafe { &mut *(result as *mut W_ListObject) };
+    list.int_items.install(items);
+    // `install` tears the outgoing block down through a safepoint, and
+    // `w_list_new_with_strategy` left `allocated` at the zero-length vector it
+    // was handed. `__sizeof__` reads this field, so name the slice's slots.
+    let result = crate::gc_roots::shadow_stack_get(result_slot);
+    let list = unsafe { &mut *(result as *mut W_ListObject) };
+    list.allocated = n as isize;
+    crate::gc_roots::shadow_stack_get(result_slot)
+}
+
+/// Copy a sub-slice of `obj` into a fresh Float-strategy list.
+///
+/// Same order as [`ll_listslice_new_int_list`]: pin the source, allocate the
+/// header, re-read, then host-copy before the block allocation.
+#[majit_macros::dont_look_inside]
+fn ll_listslice_new_float_list(obj: PyObjectRef, start: usize, piece: &[f64]) -> PyObjectRef {
+    let n = piece.len();
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    let _obj = crate::gc_roots::pin_root(obj);
+    let result_slot = crate::gc_roots::shadow_stack_len();
+    let result = w_list_new_with_strategy(Vec::new(), ListStrategy::Float);
+    let _ = crate::gc_roots::pin_root(result);
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let list = unsafe { &*(obj as *const W_ListObject) };
+    let storage = list.float_items.as_slice();
+    let fresh = &storage[start..start + n];
+    let copied = fresh.to_vec();
+    let items = FloatArray::from_vec(copied);
+    let block_slot = items.pin_block();
+    let mut items = items;
+    items.reload_block(block_slot);
+    let result = crate::gc_roots::shadow_stack_get(result_slot);
+    list_write_barrier(result);
+    let result = crate::gc_roots::shadow_stack_get(result_slot);
+    let list = unsafe { &mut *(result as *mut W_ListObject) };
+    list.float_items.install(items);
+    // Same as the Integer arm: the barrier precedes the block store and
+    // `allocated` names the slice's slots for `__sizeof__`.
+    let result = crate::gc_roots::shadow_stack_get(result_slot);
+    let list = unsafe { &mut *(result as *mut W_ListObject) };
+    list.allocated = n as isize;
+    crate::gc_roots::shadow_stack_get(result_slot)
+}
+
+/// Copy a sub-slice of `obj` into a fresh Object-strategy list.
+///
+/// The header is allocated while `obj` is pinned. The source array is re-read
+/// after that, and `alloc_list_items_block_gc` pins each element before its
+/// own block allocation. The list barrier runs before the owner edge is stored.
+#[majit_macros::dont_look_inside]
+unsafe fn ll_listslice_new_object_list(
+    obj: PyObjectRef,
+    start: usize,
+    piece: &[PyObjectRef],
+) -> PyObjectRef {
+    let n = piece.len();
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    let _obj = crate::gc_roots::pin_root(obj);
+    let result_slot = crate::gc_roots::shadow_stack_len();
+    let result = w_list_new_object(Vec::new());
+    let _ = crate::gc_roots::pin_root(result);
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let list = &*(obj as *const W_ListObject);
+    let storage = list.object_items_as_slice();
+    let fresh = &storage[start..start + n];
+    let block_slot = crate::gc_roots::shadow_stack_len();
+    let block = alloc_list_items_block_gc(fresh);
+    let _ = crate::gc_roots::pin_root(block as PyObjectRef);
+    let result = crate::gc_roots::shadow_stack_get(result_slot);
+    list_write_barrier(result);
+    let result = crate::gc_roots::shadow_stack_get(result_slot);
+    let block = crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock;
+    let list = &mut *(result as *mut W_ListObject);
+    let old = list.items;
+    list.items = block;
+    list.length.store(n, Ordering::Relaxed);
+    list.allocated = n as isize;
+    dealloc_list_items_block(old);
+    crate::gc_roots::shadow_stack_get(result_slot)
+}
+
+unsafe fn ll_listslice_ints(obj: PyObjectRef, start: usize, n: usize) -> PyObjectRef {
+    let list = &*(obj as *const W_ListObject);
+    let storage = list.int_items.as_slice();
+    // Names the item kind for array_identity_of_base.
+    let _len = storage.len();
+    let piece = &storage[start..start + n];
+    ll_listslice_new_int_list(obj, start, piece)
+}
+
+unsafe fn ll_listslice_floats(obj: PyObjectRef, start: usize, n: usize) -> PyObjectRef {
+    let list = &*(obj as *const W_ListObject);
+    let storage = list.float_items.as_slice();
+    // Names the item kind for array_identity_of_base.
+    let _len = storage.len();
+    let piece = &storage[start..start + n];
+    ll_listslice_new_float_list(obj, start, piece)
+}
+
+unsafe fn ll_listslice_objects(obj: PyObjectRef, start: usize, n: usize) -> PyObjectRef {
+    let list = &*(obj as *const W_ListObject);
+    let storage = list.object_items_as_slice();
+    // Names the item kind for array_identity_of_base.
+    let _len = storage.len();
+    let piece = &storage[start..start + n];
+    ll_listslice_new_object_list(obj, start, piece)
+}
+
+/// Strategies whose `getitem` boxes (range, bytes, ascii, int-or-float).
+/// One opaque helper: the pin loop stays out of `ll_listslice`'s body.
+#[majit_macros::dont_look_inside]
+unsafe fn ll_listslice_boxed(obj: PyObjectRef, start: usize, n: usize) -> PyObjectRef {
+    let roots = crate::gc_roots::push_roots();
+    let obj_slot = roots.base();
+    roots.publish(&[obj]);
+    roots.normalize(obj_slot, 1);
+    let items_base = crate::gc_roots::shadow_stack_len();
+    let mut fetched = 0usize;
+    for i in 0..n {
+        if let Some(v) = w_list_getitem(roots.get(obj_slot), (start + i) as i64) {
+            let _ = roots.pin_root(v);
+            fetched += 1;
+        }
+    }
+    let mut items = Vec::with_capacity(fetched);
+    for i in 0..fetched {
+        items.push(roots.get(items_base + i));
+    }
+    w_list_new(items)
 }
 
 /// Set the item at the given index in a list.

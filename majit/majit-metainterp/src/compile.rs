@@ -6311,16 +6311,30 @@ impl TraceCtx {
         self.current_merge_points.first().map(|mp| mp.green_key)
     }
 
-    /// pyjitpl.py same_greenkey + header identity: check if a specific
-    /// loop header (key, header_pc) was already visited.
+    /// pyjitpl.py `same_greenkey`, most recent hit.
     ///
-    /// TODO: pyre disambiguates loop headers by
-    /// `(green_key, header_pc)`. RPython's `same_greenkey` (`pyjitpl.py`)
-    /// matches by Python box identity over a structural greenkey tuple;
-    /// pyre's `make_green_key` collapses `(PyCode*, pc)` into a
-    /// `u64`, losing the per-header identity, so the explicit `header_pc`
-    /// disambiguator restores it for re-entrant loop headers within one
-    /// code object.
+    /// The green key is `JitCell.get_uhash` over the whole green tuple, pc
+    /// included (`pypyjit_greenkey_uhash`). A side `header_pc` is not part of
+    /// the compare: `same_greenkey` matches the boxes, and requiring the
+    /// trace-start `header_pc` missed a point recorded under the merge
+    /// point's own pc (and the other way round). `header_pc` on
+    /// [`MergePoint`] stays the guest pc of that visit, for the cut.
+    ///
+    /// Typed greens use `GreenKey::eq` (`comparekey`). Hash equality is the
+    /// fallback when either side never carried a typed key.
+    pub fn find_merge_point_same_greenkey(
+        &self,
+        key: u64,
+        live_typed: Option<&majit_ir::GreenKey>,
+    ) -> Option<&MergePoint> {
+        self.current_merge_points.iter().rev().find(|mp| {
+            match (mp.green_key_typed.as_ref(), live_typed) {
+                (Some(stored), Some(live)) => stored == live,
+                _ => mp.green_key == key,
+            }
+        })
+    }
+
     /// See [`TraceCtx::merge_point_resumed`] — pyjitpl.py:1570/1577
     /// `saved_pc`. Read-and-clear: the skip applies to exactly one visit.
     pub fn take_merge_point_resumed(&mut self) -> bool {
@@ -6345,10 +6359,11 @@ impl TraceCtx {
         self.merge_point_resumed = true;
     }
 
-    pub fn has_merge_point_at(&self, key: u64, header_pc: usize) -> bool {
-        self.current_merge_points
-            .iter()
-            .any(|mp| mp.green_key == key && mp.header_pc == header_pc)
+    /// Hash-only [`Self::find_merge_point_same_greenkey`]. `header_pc` is not
+    /// part of `same_greenkey`; callers that still pass the trace-start pc
+    /// must not have that pc reject a point recorded under the loop's own pc.
+    pub fn has_merge_point_at(&self, key: u64, _header_pc: usize) -> bool {
+        self.find_merge_point_same_greenkey(key, None).is_some()
     }
 
     /// pyjitpl.py:2988 + header identity: find merge point by (key, header_pc),
@@ -6361,9 +6376,11 @@ impl TraceCtx {
     /// (the cross-loop cut, compile.py:269) re-labels the loop from that
     /// merge point instead.
     ///
-    /// `header_pc` identifies the header on its own here: a merge point's
-    /// `green_key` is derived from `(code, header_pc)`, so the reverse scan's
-    /// first hit is the same entry [`Self::get_merge_point_at`] would return.
+    /// `header_pc` is the guest pc stored on the merge point
+    /// ([`MergePoint::header_pc`]), not a second identity beside the green
+    /// key. The reverse scan's first hit with that pc is the entry a
+    /// same-greenkey close would have selected when the pc is the loop's
+    /// own green.
     /// Only entries recorded during the walk (`has_prefix_ops`) answer here.
     /// The entry at position 0 is the synthetic trace-start seed, whose boxes
     /// were built from the trace's own `inputarg_types()`; leaving it out lets
@@ -6411,11 +6428,10 @@ impl TraceCtx {
         }
     }
 
-    pub fn get_merge_point_at(&self, key: u64, header_pc: usize) -> Option<&MergePoint> {
-        self.current_merge_points
-            .iter()
-            .rev()
-            .find(|mp| mp.green_key == key && mp.header_pc == header_pc)
+    /// Hash-only [`Self::find_merge_point_same_greenkey`]. `header_pc` does
+    /// not filter: see [`Self::has_merge_point_at`].
+    pub fn get_merge_point_at(&self, key: u64, _header_pc: usize) -> Option<&MergePoint> {
+        self.find_merge_point_same_greenkey(key, None)
     }
 
     /// `compile.py compile_retrace(..., start)` — the merge point the

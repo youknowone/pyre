@@ -4373,17 +4373,15 @@ pub trait Backend: Send {
         self.bh_setfield_gc_f(struct_ptr, newvalue, fielddescr)
     }
 
-    /// model.py: bh_classof(obj_ptr)
-    ///
-    /// `llmodel.py bh_classof` reads the object's class word:
+    /// `llmodel.py AbstractLLCPU.bh_classof` reads the object's class word:
     ///   struct = lltype.cast_opaque_ptr(rclass.OBJECTPTR, struct)
     ///   return ptr2int(struct.typeptr)
     ///
-    /// That is the same `struct.typeptr` read `cls_of_gcref` performs, so both
-    /// go through one place and a backend with a different object model
-    /// overrides `cls_of_gcref` alone.
+    /// This is the raw typeptr read. A backend with a different object model
+    /// (e.g. gcremovetypeptr) overrides this.
     fn bh_classof(&self, obj_ptr: i64) -> i64 {
-        self.cls_of_gcref(obj_ptr)
+        debug_assert!(obj_ptr != 0, "bh_classof: null ref");
+        unsafe { *(obj_ptr as *const usize) as i64 }
     }
     /// RPython rclass.ll_issubclass(typeptr, bounding_class).
     /// Returns true if `typeptr` is a subclass of `bounding_class`.
@@ -4483,15 +4481,6 @@ pub trait Backend: Send {
     /// model.py: cast_gcref_to_int(ref)
     fn cast_gcref_to_int(&self, gcref: GcRef) -> i64 {
         gcref.as_usize() as i64
-    }
-
-    /// Read the class word (typeptr/vtable) at offset 0 of a raw gcref.
-    /// Default reads offset 0 (standard RPython object layout).
-    /// Backends with different object models (e.g. gcremovetypeptr)
-    /// should override.
-    fn cls_of_gcref(&self, raw_ref: i64) -> i64 {
-        debug_assert!(raw_ref != 0, "cls_of_gcref: null ref");
-        unsafe { *(raw_ref as *const usize) as i64 }
     }
 }
 

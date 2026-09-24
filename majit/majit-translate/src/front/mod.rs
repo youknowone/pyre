@@ -93,6 +93,7 @@ pub(crate) mod result_exc;
 pub(crate) mod result_map_err;
 pub(crate) mod rfloat_call;
 pub(crate) mod saturating_add;
+pub(crate) mod saturating_mul;
 pub(crate) mod saturating_sub;
 pub mod semantic;
 pub(crate) mod slice_first;

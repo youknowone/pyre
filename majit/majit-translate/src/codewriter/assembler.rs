@@ -5446,6 +5446,10 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
             // `front::checked_arith_uint`); pass through so the `int_` prefix
             // does not double up (`int_uint_lt` has no `insns` entry).
             s if s.starts_with("uint_") => op.clone(),
+            // Canonical llop names (`int_add`, `int_mul`, `int_lt`,
+            // `int_floordiv`) are already final. Prefixing again emits
+            // `int_int_*`, which blackhole.py does not dispatch.
+            s if s.starts_with("int_") => op.clone(),
             _ => format!("int_{op}"),
         },
         // RPython `blackhole.py`: bitwise NOT on i64 is `int_invert`.
@@ -6249,6 +6253,21 @@ mod tests {
                 result_ty,
             };
             assert_eq!(op_kind_to_opname(&kind), op);
+        }
+    }
+
+    #[test]
+    fn canonical_int_binop_is_not_double_prefixed() {
+        let lhs = crate::flowspace::model::Variable::new();
+        let rhs = crate::flowspace::model::Variable::new();
+        for name in ["int_add", "int_mul", "int_lt", "int_floordiv"] {
+            let kind = crate::model::OpKind::BinOp {
+                op: name.into(),
+                lhs: lhs.clone(),
+                rhs: rhs.clone(),
+                result_ty: crate::model::ValueType::Int,
+            };
+            assert_eq!(op_kind_to_opname(&kind), name);
         }
     }
 

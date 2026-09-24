@@ -359,7 +359,7 @@ impl W_WindowsConsoleIO {
     }
 
     #[setter]
-    fn set__finalizing(&mut self, value: PyObjectRef) -> Result<(), crate::PyError> {
+    fn set_finalizing(&mut self, value: PyObjectRef) -> Result<(), crate::PyError> {
         if unsafe { !pyre_object::is_bool(value) } {
             return Err(crate::PyError::type_error(
                 "attribute value type must be bool",

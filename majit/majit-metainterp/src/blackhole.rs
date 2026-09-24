@@ -3497,13 +3497,12 @@ fn handle_jitexception(
         // `pyopcode.py handle_operation_error` stores
         // `frame_finished_execution = True` on the route that propagates out
         // of a frame without a handler, and `executioncontext.py leave`
-        // takes `got_exception` — both run on the unwind, not only on the
-        // return.  These levels are the ones the walk abandons on its way to
-        // the portal: their chain link is dropped here and never resumes, so
-        // this is where each one leaves.  The `Ok` arm's twin store sits in
-        // `run_forever_with_portal`, which never sees these levels.  Without
-        // the callback a traceback that retains such a frame refuses
-        // `frame.clear()`.
+        // takes `got_exception`. `RETURN_VALUE`'s own store is the jitcode
+        // `setfield_gc` the blackhole replays; this unwind has no such op.
+        // These levels are the ones the walk abandons on its way to the
+        // portal: their chain link is dropped here and never resumes, so
+        // this is where each one leaves. Without the callback a traceback
+        // that retains such a frame refuses `frame.clear()`.
         if let Some(on_leave_level) = on_leave_level {
             on_leave_level(bh.virtualizable_ptr);
         }
@@ -3674,15 +3673,16 @@ pub fn run_forever_with_portal(
 
         // blackhole.py:1759
         let next = bh.nextblackholeinterp.take();
-        // `pyopcode.py RETURN_VALUE` (`frame_finished_execution = True`)
-        // and `pyopcode.py handle_operation_error` (the same store on the
-        // no-handler propagation): the level reached here has returned to its
-        // caller by one of those two routes, so its frame's execution is over.
+        // The level reached here has returned to its caller. `RETURN_VALUE`'s
+        // `frame_finished_execution` store is the jitcode `setfield_gc` this
+        // interpreter just replayed; the callback still runs because the
+        // embedder hangs per-leave bookkeeping on it and because
+        // `handle_operation_error` has no jitcode store of its own.
         // Threaded from the interpreter side for the same reason as
-        // `on_enter_level` — the transition is a property of the embedder's
-        // frame object, which majit-metainterp cannot name.  A level that
-        // unwinds instead of returning never arrives here; `handle_jitexception`
-        // calls the same callback for each level it abandons on its walk.
+        // `on_enter_level` — the frame object is the embedder's, which
+        // majit-metainterp cannot name. A level that unwinds instead of
+        // returning never arrives here; `handle_jitexception` calls the same
+        // callback for each level it abandons on its walk.
         if let Some(on_leave_level) = on_leave_level {
             on_leave_level(bh.virtualizable_ptr);
         }
@@ -3716,11 +3716,13 @@ pub struct PyjitplBlackholeFrameConfig<'a> {
     /// the resumed frame chain.  Threaded from the interpreter side because
     /// majit-metainterp cannot reference `ExecutionContext`.
     pub on_enter_level: Option<&'a dyn Fn(i64)>,
-    /// The `frame_finished_execution` store `pyopcode.py RETURN_VALUE`
-    /// and `pyopcode.py handle_operation_error` perform before leaving a
-    /// frame.  Threaded from the interpreter side for the same reason as
-    /// [`Self::on_enter_level`]; called once per level that returns to its
-    /// caller, with that level's `virtualizable_ptr`.
+    /// Leave hook for one blackhole level. `pyopcode.py RETURN_VALUE`
+    /// stores `frame_finished_execution` in the jitcode this interpreter
+    /// replays; `handle_operation_error` has no such op, so the embedder's
+    /// callback finishes that propagation. Called once per level that
+    /// returns to its caller, with that level's `virtualizable_ptr`.
+    /// Threaded from the interpreter side for the same reason as
+    /// [`Self::on_enter_level`].
     ///
     /// Set it only alongside [`Self::per_frame`], which is what makes that
     /// pointer name the level's OWN frame.  Without it every level shares the

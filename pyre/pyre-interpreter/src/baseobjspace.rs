@@ -17151,7 +17151,9 @@ pub fn fixedview(
     w_iterable: PyObjectRef,
     expected_length: isize,
 ) -> Result<Vec<PyObjectRef>, crate::PyError> {
-    unpackiterable(w_iterable, expected_length)
+    // `StdObjSpace.fixedview_unroll` is this call with `unroll=True`.
+    // `@specialize.arg(3)` keeps the two arms apart.
+    fixedview_impl::<false>(w_iterable, expected_length)
 }
 
 /// pypy/objspace/std/objspace.py `fixedview_unroll`.
@@ -17160,7 +17162,69 @@ pub fn fixedview_unroll(
     w_iterable: PyObjectRef,
     expected_length: usize,
 ) -> Result<Vec<PyObjectRef>, crate::PyError> {
-    unpackiterable_unroll(w_iterable, expected_length)
+    fixedview_impl::<true>(w_iterable, expected_length as isize)
+}
+
+fn fixedview_length_error(expected: isize, got: isize) -> crate::PyError {
+    if got > expected {
+        crate::PyError::value_error(format!("too many values to unpack (expected {expected})"))
+    } else {
+        crate::PyError::value_error(format!(
+            "not enough values to unpack (expected {expected}, got {got})"
+        ))
+    }
+}
+
+/// `StdObjSpace.fixedview`: tuple `tolist`, exact-list `getitems_unroll` /
+/// `getitems_fixedsize`, then `unpackiterable_unroll` / `unpackiterable`.
+///
+/// `@specialize.arg(3)` is the const `UNROLL`. A constant expected length
+/// promotes the list length (`jit.isconstant` / `jit.promote`). `tolist` and
+/// `getitems_*` are the existing storage snapshots; `make_sure_not_resized`
+/// is the returned `Vec`.
+fn fixedview_impl<const UNROLL: bool>(
+    w_obj: PyObjectRef,
+    expected_length: isize,
+) -> Result<Vec<PyObjectRef>, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
+    let current = || pyre_object::gc_roots::shadow_stack_get(slot);
+    unsafe {
+        if is_tuple(current())
+            && builtin_iter_replacement(current(), &pyre_object::TUPLE_TYPE).is_none()
+        {
+            let items = pyre_object::tupleobject::w_tuple_items_copy_as_vec(current());
+            if expected_length != -1 && items.len() as isize != expected_length {
+                return Err(fixedview_length_error(
+                    expected_length,
+                    items.len() as isize,
+                ));
+            }
+            return Ok(items);
+        }
+        if is_exact_type(current(), &pyre_object::LIST_TYPE) {
+            let length = pyre_object::listobject::w_list_len(current()) as isize;
+            if expected_length >= 0 && length != expected_length {
+                return Err(fixedview_length_error(expected_length, length));
+            }
+            if majit_rlib::jit::isconstant(&expected_length) {
+                let _ = majit_metainterp::jit::promote(length);
+            }
+            // `getitems_unroll` and `getitems_fixedsize` both snapshot storage.
+            // `AbstractUnwrappedStrategy.getitems_copy` skips wrapper reuse
+            // while `jit.we_are_jitted()`.
+            return Ok(pyre_object::listobject::w_list_items_copy_as_vec_mode(
+                current(),
+                majit_metainterp::jit::we_are_jitted(),
+            ));
+        }
+    }
+    let w_obj = current();
+    if UNROLL {
+        return unpackiterable_unroll(w_obj, expected_length.max(0) as usize);
+    }
+    unpackiterable(w_obj, expected_length)
 }
 
 /// descroperation.py — `iter()` requires the object returned by a
@@ -23040,8 +23104,8 @@ mod tests {
         assert_eq!(items.len(), 2);
     }
 
-    /// pypy/interpreter/baseobjspace.py `fixedview` is a
-    /// thin wrapper over `unpackiterable`; verify it dispatches.
+    /// pypy/interpreter/baseobjspace.py `fixedview` reads exact list and tuple
+    /// storage; anything else goes through `unpackiterable`.
     #[test]
     fn fixedview_delegates_to_unpackiterable() {
         let lst = w_list_new(vec![w_int_new(7), w_int_new(8)]);
@@ -23051,6 +23115,20 @@ mod tests {
             assert_eq!(w_int_get_value(items[0]), 7);
             assert_eq!(w_int_get_value(items[1]), 8);
         }
+    }
+
+    /// `IntegerListStrategy.getitems_*` reuses one wrapper for a repeated
+    /// unboxed value. The generic unpack arm boxes each index on its own.
+    #[test]
+    fn fixedview_unroll_reuses_exact_list_storage() {
+        crate::typedef::init_typeobjects();
+        let list = w_list_new(vec![w_int_new(10_000), w_int_new(10_000)]);
+        let items = fixedview_unroll(list, 2).expect("int list");
+        assert_eq!(items.len(), 2);
+        assert!(
+            std::ptr::eq(items[0], items[1]),
+            "exact-list arm must reuse the storage wrapper"
+        );
     }
 
     /// pypy/objspace/descroperation.py `is_iterable`:

@@ -34,10 +34,12 @@
 //! The helper is therefore loop-free, so `look_inside_graph` admits it and
 //! it is a candidate — the residual is the copy, not the slice helper.
 //!
-//! The array's item kind is not on the marker call — the front knows it, the
-//! marker does not carry it.  It is recovered from another array operation on
-//! the same base in the same graph ([`array_identity_of_base`]); a graph that
-//! slices an array it never otherwise reads keeps today's residual.
+//! The marker may carry the array's item kind as a second path segment.
+//! [`listslice_marker_suffix`] spells that segment the same way
+//! [`helper_name`] spells a minted helper (`int___i64_`,
+//! `ref__majit__object_ref_gcarray`). [`getslice_marker_identity`] reads it
+//! first. A marker with no suffix, or a suffix that does not round-trip to
+//! an item kind and array identity, falls back to [`array_identity_of_base`].
 
 use crate::codewriter::call::CallControl;
 use crate::flowspace::model::Variable;
@@ -258,12 +260,116 @@ fn helper_name(leaf: &str, item_ty: &ValueType, array_type_id: Option<&str>) -> 
     let mut name = format!("{leaf}__{item}");
     if let Some(id) = array_type_id {
         name.push_str("__");
-        name.extend(
-            id.chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }),
-        );
+        name.push_str(&sanitize_array_id(id));
     }
     name
+}
+
+fn sanitize_array_id(id: &str) -> String {
+    id.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+/// The second path segment of a `__getslice_*` marker: the same
+/// `{item}[__{array identity}]` tail [`helper_name`] appends.
+///
+/// `None` when `item_ty` is not one of the three helper banks, or when
+/// sanitizing `array_type_id` cannot be reversed to the same string. A
+/// missing suffix means the codewriter falls back to
+/// [`array_identity_of_base`] rather than minting a helper for a guessed
+/// element width.
+pub fn listslice_marker_suffix(item_ty: &ValueType, array_type_id: Option<&str>) -> Option<String> {
+    let item = match item_ty {
+        ValueType::Ref(None) => "ref",
+        ValueType::Float => "float",
+        ValueType::Int | ValueType::Unsigned => "int",
+        _ => return None,
+    };
+    let mut suffix = item.to_string();
+    if let Some(id) = array_type_id {
+        let sanitized = sanitize_array_id(id);
+        if restore_array_id(&sanitized).as_deref() != Some(id) {
+            return None;
+        }
+        suffix.push_str("__");
+        suffix.push_str(&sanitized);
+    }
+    Some(suffix)
+}
+
+fn restore_array_id(sanitized: &str) -> Option<String> {
+    if let Some(inner) = sanitized
+        .strip_prefix('_')
+        .and_then(|s| s.strip_suffix('_'))
+        && matches!(
+            inner,
+            "u8" | "u16"
+                | "u32"
+                | "u64"
+                | "usize"
+                | "i8"
+                | "i16"
+                | "i32"
+                | "i64"
+                | "isize"
+                | "f32"
+                | "f64"
+                | "bool"
+                | "str"
+        )
+    {
+        let id = format!("[{inner}]");
+        if sanitize_array_id(&id) == sanitized {
+            return Some(id);
+        }
+    }
+    let restored = sanitized.replace("__", "::");
+    (sanitize_array_id(&restored) == sanitized).then_some(restored)
+}
+
+/// Inverse of [`listslice_marker_suffix`]. `None` when `suffix` is not a
+/// suffix this module would emit.
+pub fn decode_listslice_marker_suffix(suffix: &str) -> Option<(ValueType, Option<String>)> {
+    let (item, raw_id) = match suffix.split_once("__") {
+        Some((item, rest)) => (item, Some(rest)),
+        None => (suffix, None),
+    };
+    let item_ty = match item {
+        "ref" => ValueType::Ref(None),
+        "float" => ValueType::Float,
+        "int" => ValueType::Int,
+        _ => return None,
+    };
+    let array_type_id = match raw_id {
+        None => None,
+        Some(sanitized) => Some(restore_array_id(sanitized)?),
+    };
+    let again = listslice_marker_suffix(&item_ty, array_type_id.as_deref())?;
+    (again == suffix).then_some((item_ty, array_type_id))
+}
+
+/// Item kind for a `__getslice_*` marker. The carried suffix wins. Without
+/// one, or when it does not decode, the sibling-array scan applies.
+pub fn getslice_marker_identity(
+    graph: &FunctionGraph,
+    op: &SpaceOperation,
+) -> Option<(ValueType, Option<String>)> {
+    let OpKind::Call {
+        target: CallTarget::FunctionPath { segments, .. },
+        args,
+        ..
+    } = &op.kind
+    else {
+        return None;
+    };
+    if let Some(suffix) = segments.get(1)
+        && let Some(decoded) = decode_listslice_marker_suffix(suffix)
+    {
+        return Some(decoded);
+    }
+    let base = args.first()?;
+    array_identity_of_base(graph, base)
 }
 
 /// `rlist.py ll_listslice_startonly` in the rich model, with `ll_arraycopy`
@@ -670,7 +776,7 @@ pub fn is_getslice_rangefrom(op: &SpaceOperation) -> bool {
             target: crate::model::CallTarget::FunctionPath { segments, .. },
             args,
             ..
-        } if segments.len() == 1 && segments[0] == "__getslice_rangefrom" && args.len() == 2
+        } if is_getslice_marker(segments, "__getslice_rangefrom") && args.len() == 2
     )
 }
 
@@ -682,7 +788,7 @@ pub fn is_getslice_minusone(op: &SpaceOperation) -> bool {
             target: crate::model::CallTarget::FunctionPath { segments, .. },
             args,
             ..
-        } if segments.len() == 1 && segments[0] == "__getslice_minusone" && args.len() == 1
+        } if is_getslice_marker(segments, "__getslice_minusone") && args.len() == 1
     )
 }
 
@@ -694,7 +800,7 @@ pub fn is_getslice_rangeto(op: &SpaceOperation) -> bool {
             target: crate::model::CallTarget::FunctionPath { segments, .. },
             args,
             ..
-        } if segments.len() == 1 && segments[0] == "__getslice_rangeto" && args.len() == 2
+        } if is_getslice_marker(segments, "__getslice_rangeto") && args.len() == 2
     )
 }
 
@@ -706,8 +812,12 @@ pub fn is_getslice_range(op: &SpaceOperation) -> bool {
             target: crate::model::CallTarget::FunctionPath { segments, .. },
             args,
             ..
-        } if segments.len() == 1 && segments[0] == "__getslice_range" && args.len() == 3
+        } if is_getslice_marker(segments, "__getslice_range") && args.len() == 3
     )
+}
+
+fn is_getslice_marker(segments: &[String], name: &str) -> bool {
+    segments.first().map(String::as_str) == Some(name) && segments.len() <= 2
 }
 
 #[cfg(test)]
@@ -1078,5 +1188,74 @@ mod tests {
                 result_ty: ValueType::Ref(None),
             },
         }));
+    }
+
+    #[test]
+    fn carried_integer_suffix_resolves_without_a_sibling_read() {
+        let mut graph = FunctionGraph::new("f");
+        let items = graph.alloc_value_var();
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::ArrayLen {
+                base: items.clone(),
+                array_type_id: Some("[i64]".into()),
+                nolength: false,
+            },
+            true,
+        );
+        assert_eq!(array_identity_of_base(&graph, &items), None);
+        let suffix = listslice_marker_suffix(&ValueType::Int, Some("[i64]")).unwrap();
+        assert_eq!(suffix, "int___i64_");
+        let op = SpaceOperation {
+            result: Some(Variable::new()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["__getslice_range".into(), suffix],
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![items, Variable::new(), Variable::new()]),
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        assert!(is_getslice_range(&op));
+        assert_eq!(
+            getslice_marker_identity(&graph, &op),
+            Some((ValueType::Int, Some("[i64]".into())))
+        );
+    }
+
+    #[test]
+    fn unsuffixed_marker_resolves_through_the_array_scan() {
+        let mut graph = FunctionGraph::new("f");
+        let items = graph.alloc_value_var();
+        let index = graph.alloc_value_var();
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::ArrayRead {
+                base: items.clone(),
+                index,
+                item_ty: ValueType::Float,
+                array_type_id: Some("[f64]".into()),
+                nolength: false,
+                pure: false,
+            },
+            true,
+        );
+        let op = SpaceOperation {
+            result: Some(Variable::new()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["__getslice_rangefrom".into()],
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![items, Variable::new()]),
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        assert!(is_getslice_rangefrom(&op));
+        assert_eq!(
+            getslice_marker_identity(&graph, &op),
+            Some((ValueType::Float, Some("[f64]".into())))
+        );
     }
 }

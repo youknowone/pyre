@@ -145,7 +145,7 @@ impl ArrayDescr for PyreUnicodeDescr {
 }
 
 /// `Cpu` impl for pyre's runtime.  Delegates to `DefaultCpu` for the
-/// methods `DefaultCpu` overrides (`cls_of_box` / `cls_of_gcref` /
+/// methods `DefaultCpu` overrides (`cls_of_box` / `bh_classof` /
 /// `bh_getfield_gc_{i,r,f}`) and exposes pyre-specific descrs for the
 /// str / unicode family.  `bh_strgetitem` / `bh_unicodegetitem` follow
 /// the `W_UnicodeObject.value: *mut String` indirection that PyPy's STR
@@ -176,8 +176,8 @@ impl Cpu for PyreCpu {
     fn cls_of_box(&self, box_: &Operand) -> i64 {
         self.0.cls_of_box(box_)
     }
-    fn cls_of_gcref(&self, gcref: GcRef) -> i64 {
-        self.0.cls_of_gcref(gcref)
+    fn bh_classof(&self, gcref: GcRef) -> i64 {
+        self.0.bh_classof(gcref)
     }
     fn bh_getfield_gc_i(&self, struct_ptr: usize, fd: &dyn FieldDescr) -> i64 {
         self.0.bh_getfield_gc_i(struct_ptr, fd)

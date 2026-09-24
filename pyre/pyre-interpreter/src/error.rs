@@ -397,11 +397,23 @@ pub struct OpErrFmtNoArgs;
 /// Result type for Python operations.
 pub type PyResult = Result<PyObjectRef, PyError>;
 
+/// Rust-side display text for [`PyError`].
+///
+/// A dedicated enum, not `Option<Wtf8Buf>`: a bare `Option` shares
+/// `Some.__pos_0` with every other `Option` instantiation and unions
+/// the string payload with unrelated types. `FromExcObject` is a unit
+/// variant so `from_exc_object` does not construct a `Wtf8Buf`.
+#[derive(Debug, Clone)]
+pub enum DisplayMessage {
+    FromExcObject,
+    Text(Wtf8Buf),
+}
+
 /// Python exception.
 #[derive(Debug, Clone)]
 pub struct PyError {
     pub kind: PyErrorKind,
-    pub message: Wtf8Buf,
+    pub message: DisplayMessage,
     /// Cached W_BaseException pointer — reused by to_exc_object()
     /// to avoid re-allocating an exception object that already exists.
     pub exc_object: PyObjectRef,
@@ -706,13 +718,24 @@ impl PyError {
     pub fn new(kind: PyErrorKind, message: impl Into<Wtf8Buf>) -> Self {
         PyError {
             kind,
-            message: message.into(),
+            message: DisplayMessage::Text(message.into()),
             exc_object: std::ptr::null_mut(),
             attach_tb: true,
             context_recorded: false,
             reraise_lasti: -1,
             w_name_context: std::ptr::null_mut(),
             w_obj_context: std::ptr::null_mut(),
+        }
+    }
+
+    fn has_display_message(&self) -> bool {
+        matches!(&self.message, DisplayMessage::Text(m) if !m.is_empty())
+    }
+
+    fn display_message_buf(&self) -> Wtf8Buf {
+        match &self.message {
+            DisplayMessage::Text(m) => m.clone(),
+            DisplayMessage::FromExcObject => Wtf8Buf::new(),
         }
     }
 
@@ -993,7 +1016,7 @@ impl PyError {
             // Leave the display message empty so `message_text` derives it from
             // `exc_object` via the SyntaxError `descr_str`, which appends the
             // `(filename, line N)` suffix.
-            message: Wtf8Buf::new(),
+            message: DisplayMessage::FromExcObject,
             exc_object: exc,
             attach_tb: true,
             context_recorded: false,
@@ -1094,8 +1117,17 @@ impl PyError {
     /// undefined `name` so `e.name` reads back once the instance is
     /// materialised (Python 3.10+).
     pub fn name_error_with_name(msg: impl Into<Wtf8Buf>, name: &str) -> Self {
+        Self::name_error_with_name_obj(msg, pyre_object::w_str_new_managed(name))
+    }
+
+    /// [`name_error_with_name`] for a name that is already a `str` object
+    /// (`pyopcode.py _load_global_failed` takes `w_varname`).
+    pub fn name_error_with_name_obj(
+        msg: impl Into<Wtf8Buf>,
+        w_name: pyre_object::PyObjectRef,
+    ) -> Self {
         let mut err = Self::new(PyErrorKind::NameError, msg);
-        err.w_name_context = pyre_object::w_str_new_managed(name);
+        err.w_name_context = w_name;
         err
     }
 
@@ -1177,7 +1209,7 @@ impl PyError {
         }
         PyError {
             kind: PyErrorKind::KeyError,
-            message,
+            message: DisplayMessage::Text(message),
             exc_object: exc(),
             attach_tb: true,
             context_recorded: false,
@@ -1415,7 +1447,7 @@ impl PyError {
             // `exc_object` via `W_OSError.descr_str`, which appends the
             // `: 'filename'` suffix; the bare "[Errno N] strerror" would bypass
             // it and the uncaught-traceback header would drop the filename.
-            message: Wtf8Buf::new(),
+            message: DisplayMessage::FromExcObject,
             exc_object: exc(),
             attach_tb: true,
             context_recorded: false,
@@ -1465,7 +1497,7 @@ impl PyError {
             // Leave the display message empty so `message_text` derives it
             // from `exc_object`, whose `descr_str` renders the two-element
             // `args` as a tuple repr rather than as a bare string.
-            message: Wtf8Buf::new(),
+            message: DisplayMessage::FromExcObject,
             exc_object: exc(),
             attach_tb: true,
             context_recorded: false,
@@ -1533,7 +1565,7 @@ impl PyError {
         }
         PyError {
             kind,
-            message,
+            message: DisplayMessage::Text(message),
             exc_object: exc(),
             attach_tb: true,
             context_recorded: false,
@@ -1626,7 +1658,7 @@ impl PyError {
         }
         PyError {
             kind: PyErrorKind::ImportError,
-            message,
+            message: DisplayMessage::Text(message),
             exc_object: exc(),
             attach_tb: true,
             context_recorded: false,
@@ -1705,9 +1737,9 @@ impl PyError {
         // setters) run, so a collection there could sweep the unrooted
         // (non-moving oldgen) exception before it is written through.
         let exc = pyre_object::gc_roots::pin_root(exc);
-        if !self.message.is_empty() {
+        if self.has_display_message() {
             let msg_slot = pyre_object::gc_roots::shadow_stack_len();
-            let msg = pyre_object::w_str_from_wtf8_managed(self.message.clone());
+            let msg = pyre_object::w_str_from_wtf8_managed(self.display_message_buf());
             let msg = pyre_object::gc_roots::pin_root(msg);
             let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![msg]);
             unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
@@ -2347,7 +2379,7 @@ impl PyError {
             // display time.
             PyError {
                 kind: Self::kind_from_exc(kind),
-                message: Wtf8Buf::new(),
+                message: DisplayMessage::FromExcObject,
                 exc_object: obj,
                 attach_tb: true,
                 context_recorded: false,
@@ -2413,12 +2445,15 @@ impl PyError {
     /// `W_BaseException.descr_str` formats `args_w`, so the args'
     /// `__str__` runs at display time, not at raise time.
     pub fn message_text(&self) -> String {
-        if !self.message.is_empty() || self.exc_object.is_null() {
+        if self.has_display_message() || self.exc_object.is_null() {
             // Display-side only: `message` is WTF-8 and may hold a lone
             // surrogate, so spend the escape the stream would spend rather
             // than folding it to U+FFFD.  A caller that needs the value
             // itself wants [`message_wtf8`].
-            return crate::display::wtf8_display_string(self.message.clone(), "<unprintable>");
+            return crate::display::wtf8_display_string(
+                self.display_message_buf(),
+                "<unprintable>",
+            );
         }
         // Infallible Display-side context: a raising `__str__` degrades to
         // the placeholder rather than propagating, and a lone surrogate is
@@ -2432,8 +2467,8 @@ impl PyError {
     /// surrogate in a message that names a user string has to survive here;
     /// `message_text` is for the diagnostic streams only.
     pub fn message_wtf8(&self) -> Wtf8Buf {
-        if !self.message.is_empty() || self.exc_object.is_null() {
-            return self.message.clone();
+        if self.has_display_message() || self.exc_object.is_null() {
+            return self.display_message_buf();
         }
         unsafe { crate::display::py_str_wtf8(self.exc_object) }
             .unwrap_or_else(|_| Wtf8Buf::from_string("<unprintable>".to_string()))

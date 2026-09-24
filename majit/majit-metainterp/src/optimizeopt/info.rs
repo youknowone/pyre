@@ -557,7 +557,7 @@ impl PtrInfoExt for PtrInfo {
                 // routes through the Cpu trait so backends that override
                 // the typeptr-at-offset-0 read (e.g. `gcremovetypeptr`)
                 // are honored here too.
-                let vtable = cpu.cls_of_gcref(*gcref);
+                let vtable = cpu.bh_classof(*gcref);
                 if vtable == 0 { None } else { Some(vtable) }
             }
             _ => None,
