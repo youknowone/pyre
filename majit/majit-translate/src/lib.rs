@@ -74,6 +74,7 @@ mod codegen;
     )
 )]
 pub mod front;
+pub mod vec_layout;
 // TODO(pyre): pyre-interpreter handler JitCode registry
 // (Rust source → FunctionGraph bridge with no RPython counterpart;
 // upstream assumes rtyper-produced `translator.graphs` is already in

@@ -8587,7 +8587,9 @@ fn apply_readwrite_replay(
                     cc,
                 )
                 .or_else(|| array_type_id.clone());
-                let len_offset = if *nolength { None } else { Some(0) };
+                let headerless = *nolength
+                    || crate::front::typestr::nolength_from_array_type_id(resolved_id.as_deref());
+                let len_offset = if headerless { None } else { Some(0) };
                 push_array_effect(
                     &mut acc.read_arrays,
                     &mut acc.array_read_descrs,
@@ -8613,7 +8615,9 @@ fn apply_readwrite_replay(
                     cc,
                 )
                 .or_else(|| array_type_id.clone());
-                let len_offset = if *nolength { None } else { Some(0) };
+                let headerless = *nolength
+                    || crate::front::typestr::nolength_from_array_type_id(resolved_id.as_deref());
+                let len_offset = if headerless { None } else { Some(0) };
                 push_array_effect(
                     &mut acc.write_arrays,
                     &mut acc.array_write_descrs,

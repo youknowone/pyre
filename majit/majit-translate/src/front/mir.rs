@@ -7684,6 +7684,8 @@ impl<'a> Lowering<'a> {
                                 owner_id: aggregate_owner_id,
                                 base_is_deref: None,
                                 taken_by_address: false,
+                                inline_vec: false,
+                                vec_part: None,
                             },
                             value: crate::model::LinkArg::Value(value),
                             ty: ValueType::Ref(None),
@@ -7895,6 +7897,8 @@ impl<'a> Lowering<'a> {
                             owner_id,
                             base_is_deref: None,
                             taken_by_address: false,
+                            inline_vec: false,
+                            vec_part: None,
                         },
                         ty: ValueType::Int,
                         pure: true,
@@ -8167,6 +8171,90 @@ impl<'a> Lowering<'a> {
     /// Returns whether `base` is that declared array field.
     fn release_declared_vable_array_address(&mut self, base: &Variable) -> bool {
         release_declared_vable_array_address(&mut self.graph, base)
+    }
+
+    fn var_is_declared_vable_array(&self, var: &Variable) -> bool {
+        self.graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| {
+                op.result.as_ref() == Some(var)
+                    && matches!(
+                        &op.kind,
+                        OpKind::FieldRead { field, .. }
+                            if crate::virtualizable_decl::is_declared_array_field(
+                                field.owner_root.as_deref(),
+                                &field.name,
+                            )
+                    )
+            })
+        })
+    }
+
+    /// `v[i]` / `v.len()` on a `Vec<T>`.
+    ///
+    /// An inline field is retargeted in place: the read's base stays the
+    /// owner and the descr offset is the field plus the measured buffer or
+    /// length word (`rlist.ll_items` / `ll_length`). A `Box<Vec<_>>` field
+    /// has already loaded the heap pointer; the component is a second
+    /// getfield from that pointer.
+    fn retarget_vec_part(
+        &mut self,
+        bb_id: BlockId,
+        vec_var: &Variable,
+        part: crate::model::VecFieldPart,
+    ) -> Variable {
+        let inline = self.graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| {
+                op.result.as_ref() == Some(vec_var)
+                    && matches!(
+                        &op.kind,
+                        OpKind::FieldRead { field, .. }
+                            if field.inline_vec && field.vec_part.is_none()
+                    )
+            })
+        });
+        if inline {
+            for block in &mut self.graph.blocks {
+                for op in &mut block.operations {
+                    if op.result.as_ref() != Some(vec_var) {
+                        continue;
+                    }
+                    if let OpKind::FieldRead { field, ty, .. } = &mut op.kind
+                        && field.inline_vec
+                        && field.vec_part.is_none()
+                    {
+                        field.vec_part = Some(part);
+                        field.taken_by_address = false;
+                        *ty = match part {
+                            crate::model::VecFieldPart::Buf => ValueType::Ref(None),
+                            crate::model::VecFieldPart::Len => ValueType::Int,
+                        };
+                    }
+                }
+            }
+            return vec_var.clone();
+        }
+        let name = match part {
+            crate::model::VecFieldPart::Buf => "buf",
+            crate::model::VecFieldPart::Len => "len",
+        };
+        let ty = match part {
+            crate::model::VecFieldPart::Buf => ValueType::Ref(None),
+            crate::model::VecFieldPart::Len => ValueType::Int,
+        };
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::FieldRead {
+                base: vec_var.clone(),
+                field: FieldDescriptor::new(name, Some("alloc::vec::Vec".to_string()))
+                    .with_vec_part(part),
+                ty,
+                pure: false,
+            },
+        });
+        res
     }
 
     /// Whether `&<place>` / `&raw [mut] <place>` takes the address of a
@@ -8449,7 +8537,10 @@ impl<'a> Lowering<'a> {
                             base,
                             field: FieldDescriptor::new(field_name, Some(owner_root))
                                 .with_owner_id(owner_id)
-                                .with_base_is_deref(base_is_deref),
+                                .with_base_is_deref(base_is_deref)
+                                .with_inline_vec(crate::vec_layout::field_layout_is_inline_vec(
+                                    &tyref_to_field_layout_string(&field_ty, self.llbc),
+                                )),
                             ty,
                             pure: false,
                         },
@@ -11239,6 +11330,18 @@ impl<'a> Lowering<'a> {
                     let array_type_id = if workspace_index {
                         matches!(item_ty, ValueType::Ref(_))
                             .then(|| OBJECT_REF_GCARRAY_TYPE_ID.to_string())
+                    } else if self.is_vec_index_call(&reg, second_arg_ty.as_ref())
+                        && !self.var_is_declared_vable_array(&args[0])
+                    {
+                        // The buffer is headerless. `[u8]` is the length-prefixed
+                        // byte block, so a Vec keeps its own identity: element
+                        // `u8`, `nolength`, cache key distinct from `[u8]`.
+                        // A declared virtualizable array keeps the length-prefixed
+                        // descr the vable protocol already uses.
+                        first_arg_ty
+                            .as_ref()
+                            .map(|ty| tyref_to_ast_string(ty, self.llbc))
+                            .filter(|identity| !identity.starts_with("??"))
                     } else {
                         // `get_array_descr` keys the descr cache on the ARRAY
                         // lltype, so two sites naming the same element name the
@@ -11304,7 +11407,21 @@ impl<'a> Lowering<'a> {
                     // array, the address mark would keep the field read out of
                     // `vable_array_vars` and the index would stay a plain
                     // `getarrayitem_gc`.
-                    self.release_declared_vable_array_address(&args[0]);
+                    let vable_array = self.release_declared_vable_array_address(&args[0]);
+                    let array_base =
+                        if !vable_array && self.is_vec_index_call(&reg, second_arg_ty.as_ref()) {
+                            let buf = self.retarget_vec_part(
+                                bb_id,
+                                &args[0],
+                                crate::model::VecFieldPart::Buf,
+                            );
+                            if let Some(local) = arg_locals.first().copied().flatten() {
+                                self.local_var[local] = Some(buf.clone());
+                            }
+                            buf
+                        } else {
+                            args[0].clone()
+                        };
                     // A trait-associated `Index::Output` can stay a TypeVar
                     // in this call's destination even though the workspace
                     // gate has resolved the concrete receiver. In that case
@@ -11322,7 +11439,7 @@ impl<'a> Lowering<'a> {
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
                         kind: OpKind::ArrayRead {
-                            base: args[0].clone(),
+                            base: array_base.clone(),
                             index: args[1].clone(),
                             item_ty: item_ty.clone(),
                             array_type_id: array_type_id.clone(),
@@ -11336,7 +11453,7 @@ impl<'a> Lowering<'a> {
                         dest_local,
                         IndexElemAlias {
                             base_local: arg_locals.first().copied().flatten(),
-                            base_var: args[0].clone(),
+                            base_var: array_base,
                             index_local: arg_locals.get(1).copied().flatten(),
                             index_var: args[1].clone(),
                             item_ty,
@@ -12728,7 +12845,20 @@ impl<'a> Lowering<'a> {
                     // `arraylen_vable` (`rewrite_op_getarraysize`), not a
                     // residual `__len` that would carry the array out of the
                     // block. The index check uses the same length.
-                    let kind = if self.release_declared_vable_array_address(&args[0]) {
+                    let vable_array = self.release_declared_vable_array_address(&args[0]);
+                    if !vable_array && self.is_vec_len(&reg) {
+                        let len = self.retarget_vec_part(
+                            bb_id,
+                            &args[0],
+                            crate::model::VecFieldPart::Len,
+                        );
+                        self.local_var[dest_local] = Some(len);
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
+                    let kind = if vable_array {
                         OpKind::ArrayLen {
                             base: args[0].clone(),
                             array_type_id: None,
@@ -13380,6 +13510,8 @@ impl<'a> Lowering<'a> {
                                 owner_id,
                                 base_is_deref: None,
                                 taken_by_address: false,
+                                inline_vec: false,
+                                vec_part: None,
                             },
                             ty: ValueType::Int,
                             pure: true,
@@ -17276,6 +17408,15 @@ impl<'a> Lowering<'a> {
     /// via [`Self::is_object_array_len`], because its receiver is the
     /// virtualizable array and a `__len` call would pass that array as a
     /// call argument.
+    fn is_vec_len(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "alloc::vec::<Impl>::len")
+    }
+
     fn is_container_len(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
@@ -22293,6 +22434,8 @@ impl<'a> Lowering<'a> {
                         owner_id: None,
                         base_is_deref: None,
                         taken_by_address: false,
+                        inline_vec: false,
+                        vec_part: None,
                     },
                     value: LinkArg::Value(value),
                     ty,
@@ -34520,6 +34663,8 @@ fn emit_enum_disc_read(
                 owner_id: None,
                 base_is_deref: None,
                 taken_by_address: false,
+                inline_vec: false,
+                vec_part: None,
             },
             ty: ValueType::Int,
             pure: true,
@@ -34546,6 +34691,8 @@ fn emit_payload_read(
                 owner_id: None,
                 base_is_deref: None,
                 taken_by_address: false,
+                inline_vec: false,
+                vec_part: None,
             },
             ty,
             pure: true,
