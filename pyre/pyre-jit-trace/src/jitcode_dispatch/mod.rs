@@ -7230,9 +7230,8 @@ thread_local! {
     /// `write_cell` via `try_execute_residual_call_via_executor`); a
     /// non-commit walk restores each cell's prior `intvalue` in reverse push
     /// order so the legacy replay re-applies the store against the pre-walk
-    /// heap.  Cells are immovable (`malloc_typed`; the fold's `can_move`
-    /// gate) and stay reachable from their module dict slot, so entries need
-    /// no GC-root forwarding.
+    /// heap.  The cell is a nursery object (`ObjectMutableCell.__init__`),
+    /// so each entry is a GC root via [`fbw_store_journal_root_walker`].
     static FBW_CELL_STORE_JOURNAL: std::cell::RefCell<Vec<FbwCellStore>> =
         const { std::cell::RefCell::new(Vec::new()) };
 
@@ -7941,10 +7940,9 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     for (_slot, value) in abort_overrides.iter_mut() {
         visitor(unsafe { &mut *(value as *mut pyre_object::PyObjectRef).cast() });
     }
-    // Cell-store journal: the cell is immovable (`malloc_typed`) so no
-    // forwarding happens, but a mid-walk rebind can drop the module dict's
-    // only reference — rooting it keeps the rollback's `intvalue` restore
-    // from writing into a freed block.
+    // Cell-store journal: the cell is nursery-allocated and a mid-walk
+    // rebind can drop the module dict's only reference.  Forwarding the
+    // slot keeps the rollback's restore on the live object.
     let cell_stores = unsafe { &mut *(*area.cell_stores).as_ptr() };
     for entry in cell_stores.iter_mut() {
         match entry {

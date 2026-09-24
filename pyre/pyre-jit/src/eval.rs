@@ -990,10 +990,10 @@ unsafe fn module_dict_object_custom_trace(
         }
     }
     // Delegate to the shared module-dict walk so this (GC-managed dict)
-    // path and `walk_pyframe_roots`' Box-immortal path forward exactly
-    // the same movable slots — including unwrapping the Box-immortal
-    // MutableCells to reach the inner `w_value`, which a bare cell-pointer
-    // visit (the slot itself never moves) would miss.
+    // path and `walk_pyframe_roots` forward the same slots. A collector-owned
+    // `MutableCell` is visited as the slot; the collector traces `w_value`
+    // through the cell type's pointer offsets and forwards the cell when
+    // it moves.
     let mut forward = |slot: &mut pyre_object::PyObjectRef| {
         f(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     };

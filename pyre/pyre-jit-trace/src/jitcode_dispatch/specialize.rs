@@ -3054,7 +3054,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         if !w_dict.is_null() && !majit_gc::can_move(majit_ir::GcRef(w_dict as usize)) {
             if let Some(slot) = crate::state::module_dict_cell_slot_direct(w_dict, name) {
                 if let Some(stored) = crate::state::module_dict_cell_value_direct(w_dict, slot) {
-                    if !stored.is_null() && !majit_gc::can_move(majit_ir::GcRef(stored as usize)) {
+                    if mutable_cell_or_immovable(stored) {
                         // Pin the receiver to THIS module so the baked dict
                         // address is correct: a constant receiver is already
                         // pinned; a non-constant one gets a `guard_value`.
@@ -24389,8 +24389,8 @@ pub(crate) fn try_walker_import_frame_read_fold<Sym: WalkSym>(
 ///
 /// Returns `Ok(false)` — the caller then keeps the live residual — for a name
 /// still present in the module dict, a missing or non-module builtin, an
-/// unfoldable builtins slot (absent / null / `IntMutableCell` / movable), or a
-/// movable builtins dict.
+/// unfoldable builtins slot (absent / null / `IntMutableCell` / movable
+/// non-cell), or a movable builtins dict.
 fn emit_builtins_cell_fold<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -24424,7 +24424,7 @@ fn emit_builtins_cell_fold<Sym: WalkSym>(
     if b_stored.is_null() || unsafe { pyre_object::celldict::is_int_mutable_cell(b_stored) } {
         return Ok(false);
     }
-    if majit_gc::can_move(majit_ir::GcRef(b_stored as usize)) {
+    if !mutable_cell_or_immovable(b_stored) {
         return Ok(false);
     }
     // Guard (a): the name must stay ABSENT from the module dict so the lookup
@@ -24570,6 +24570,27 @@ pub(crate) fn try_walker_load_name_cell_fold<Sym: WalkSym>(
     )
 }
 
+/// A module-dict slot may be baked when it is a mutable cell or cannot move.
+///
+/// `ObjectMutableCell` / `IntMutableCell` are nursery objects
+/// (`ObjectMutableCell.__init__`). The fold records them with
+/// `TraceCtx::const_ref`; `remove_constptrs_in` rewrites that `ConstPtr`
+/// to `LoadFromGcTable`. Any other movable value stays on the residual.
+fn mutable_cell_or_immovable(stored: pyre_object::PyObjectRef) -> bool {
+    if stored.is_null() {
+        return false;
+    }
+    if pyre_object::tagged_int::CAN_BE_TAGGED
+        && unsafe { pyre_object::tagged_int::is_tagged_int(stored) }
+    {
+        return !majit_gc::can_move(majit_ir::GcRef(stored as usize));
+    }
+    if unsafe { pyre_object::celldict::is_mutable_cell(stored) } {
+        return true;
+    }
+    !majit_gc::can_move(majit_ir::GcRef(stored as usize))
+}
+
 /// StoreName/StoreGlobal: descend `typeobject.py write_cell` for an
 /// in-place cell.  A replacing write (new cell, version bump) stays on
 /// the residual so `mutated()` still runs.
@@ -24613,7 +24634,9 @@ pub(crate) fn try_walker_store_name_cell_fold<Sym: WalkSym>(
     if stored.is_null() {
         return Ok(false);
     }
-    if majit_gc::can_move(majit_ir::GcRef(stored as usize)) {
+    // A nursery `ObjectMutableCell` / `IntMutableCell` still folds: the bake
+    // below is `const_ref` (`ConstPtr` → `LoadFromGcTable`).
+    if !mutable_cell_or_immovable(stored) {
         return Ok(false);
     }
     let Some(majit_ir::Value::Ref(majit_ir::GcRef(p))) = ctx.trace_ctx.box_value(value_opref)
