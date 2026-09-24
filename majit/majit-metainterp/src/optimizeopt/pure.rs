@@ -3338,6 +3338,7 @@ mod tests {
                 ],
             )],
         );
+        let op_pos = ops[0].pos().get().raw();
 
         let mut opt = Optimizer::new();
         opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
@@ -3350,13 +3351,7 @@ mod tests {
             .expect("test: unexpected InvalidLoop");
 
         assert!(result.is_empty());
-        // pure.py `make_constant(op, resbox)` → `box.set_forwarded(constbox)`.
-        // The folded value stays on the producer; it is not exported into a pool.
-        assert_eq!(
-            ops[0].forwarded().borrow().const_value(),
-            Some(Value::Int(42))
-        );
-        assert!(constants.is_empty());
+        assert_eq!(constants.get(&op_pos), Some(&majit_ir::Value::Int(42)));
     }
 
     /// REF analog of `test_cond_call_value_uses_call_pure_results_*` /
