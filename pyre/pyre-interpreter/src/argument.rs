@@ -2533,7 +2533,7 @@ mod tests {
             )
             .expect_err("too many args should TypeError");
         assert_eq!(err.kind, crate::PyErrorKind::TypeError);
-        assert!(err.message.starts_with("myfn() "));
+        assert!(err.message_text().starts_with("myfn() "));
     }
 
     /// pypy/interpreter/argument.py `parse_obj` special-cases

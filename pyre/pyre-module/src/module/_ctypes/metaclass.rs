@@ -1602,7 +1602,7 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
                     } else if unsafe { pyre_object::is_tuple(value) } {
                         let values = seq_items(value).unwrap_or_default();
                         pyre_interpreter::call::type_call_instantiate(proto, &values).map_err(
-                            |error| pyre_interpreter::PyError::runtime_error(error.message),
+                            |error| pyre_interpreter::PyError::runtime_error(error.message_wtf8()),
                         )?
                     } else {
                         return Err(pyre_interpreter::PyError::type_error("incompatible types"));
