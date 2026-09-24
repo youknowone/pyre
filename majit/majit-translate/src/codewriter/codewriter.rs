@@ -848,7 +848,8 @@ impl CodeWriter {
                     ConcreteType::Signed => 'i',
                     ConcreteType::GcRef => 'r',
                     ConcreteType::Float => 'f',
-                    ConcreteType::Void => 'v',
+                    // `get_jitcode_calldescr` keeps only non-void `FUNC.ARGS`.
+                    ConcreteType::Void => continue,
                     // `getkind` raises for a type it cannot classify rather
                     // than answering.  Answering `'v'` describes the argument
                     // as absent, so the residual call would pass one word

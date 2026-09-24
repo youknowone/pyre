@@ -7273,6 +7273,16 @@ impl<'a> Lowering<'a> {
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                     return Ok((Some(OpKind::ConstInt(tag)), res));
                 }
+                // A fieldless struct, unit `()`, or a borrow of one is
+                // `lltype.Void` (`getkind == 'void'`). No constructor and
+                // no register. Fieldless enums stay discriminant integers
+                // and are handled above.
+                if tyref_is_void_zst(dest_ty, self.llbc) {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Void);
+                    return Ok((None, res));
+                }
                 // `Option<E>` over a dense fieldless enum E is the same
                 // scalar plus one reserved `None` value.  Constructing
                 // `Some(e)` therefore aliases e; constructing `None` emits
@@ -27293,35 +27303,27 @@ fn tyref_is_enum_free(ty: &TyRef, llbc: &Llbc) -> bool {
 /// bytes of its owner, so an enum whose every variant field is zero-sized
 /// has no payload at all and is the same by-value tag integer a
 /// syntactically fieldless enum is.
-/// A layout-size-0 struct, or a borrow of one (`&self` on a fieldless struct).
+/// A value with no runtime representation: unit `()`, a layout-size-0
+/// struct, or one borrow of such a struct (`&self` on a ZST).
 ///
-/// Unit `()` stays a real operand: `Option<()>` still writes the payload.
-/// A fieldless enum is a discriminant integer, including through a borrow.
-/// `strip_ty_wrappers` peels the borrow; the pointee's layout is what
-/// `tyref_is_zero_sized` reads.
+/// A fieldless enum is a discriminant integer, including through a borrow,
+/// so it is not void. `strip_ty_wrappers` peels the borrow; the pointee's
+/// layout is what `tyref_is_zero_sized` reads.
 fn tyref_is_void_zst(ty: &TyRef, llbc: &Llbc) -> bool {
-    // Only the marker driver. Other zero-sized `&self` receivers stay
-    // references: an indirect-call family still passes that receiver.
-    if !tyref_to_ast_string(ty, llbc).contains("GrainJitDriver") {
-        return false;
-    }
     if tyref_is_fieldless_enum_free(ty, llbc) || tyref_is_borrowed_fieldless_enum_free(ty, llbc) {
         return false;
     }
-    if is_unit_type(ty, llbc) {
-        return false;
-    }
-    if tyref_is_zero_sized(ty, llbc) {
+    if is_unit_type(ty, llbc) || tyref_is_zero_sized(ty, llbc) {
         return true;
     }
     let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_wrappers(node, llbc)) else {
         return false;
     };
     let peeled = TyRef::Other(node.clone());
-    if tyref_is_fieldless_enum_free(&peeled, llbc) || is_unit_type(&peeled, llbc) {
+    if tyref_is_fieldless_enum_free(&peeled, llbc) {
         return false;
     }
-    tyref_is_zero_sized(&peeled, llbc)
+    is_unit_type(&peeled, llbc) || tyref_is_zero_sized(&peeled, llbc)
 }
 
 fn call_path_is_jit_marker(path: &str) -> bool {

@@ -2064,6 +2064,16 @@ impl Assembler {
                 field,
                 ty,
             } => {
+                // `rewrite_op_setfield` drops a void value. A unit payload
+                // that still reaches here has no coloring; emit nothing.
+                if let crate::model::LinkArg::Value(var) = value
+                    && crate::model::FunctionGraph::concretetype_of(var)
+                        == crate::model::ConcreteType::Void
+                {
+                    state.code.pop();
+                    state.startpoints.shift_remove(&startposition);
+                    return;
+                }
                 let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
                 assert!(
                     kc == 'r' || kc == 'i',
@@ -2852,6 +2862,11 @@ impl Assembler {
             other => {
                 let mut operand_kinds = String::new();
                 for v in crate::inline::op_variable_refs(other) {
+                    if crate::model::FunctionGraph::concretetype_of(&v)
+                        == crate::model::ConcreteType::Void
+                    {
+                        continue;
+                    }
                     let (reg, kind_char) = self.lookup_reg_with_kind_var(&v, regallocs);
                     state.code.push(reg);
                     argcodes.push(kind_char);
@@ -7124,6 +7139,28 @@ mod tests {
         assert!(!use_c_form("ref_copy"));
         assert!(!use_c_form("float_copy"));
         assert!(!use_c_form("getfield_gc_i"));
+    }
+
+    #[test]
+    fn setfield_of_void_value_encodes_no_opcode() {
+        use crate::model::{FunctionGraph, OpKind, SpaceOperation};
+
+        let mut graph = FunctionGraph::new("unit_payload");
+        let base = graph.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+        let unit = graph.alloc_value_var_with_type(crate::model::ConcreteType::Void);
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base,
+                field: crate::model::FieldDescriptor::new("payload", None),
+                value: crate::model::LinkArg::Value(unit),
+                ty: crate::model::ValueType::Void,
+            },
+        };
+        let mut asm = Assembler::new();
+        let mut state = empty_state();
+        asm.encode_op(&op, &HashMap::new(), &mut state, None);
+        assert!(state.code.is_empty());
     }
 
     #[test]

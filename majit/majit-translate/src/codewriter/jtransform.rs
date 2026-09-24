@@ -4800,6 +4800,20 @@ impl<'a> Transformer<'a> {
             });
             return RewriteResult::Replace(Vec::new());
         }
+        // `jtransform.py rewrite_op_setfield`: `if RESULT is lltype.Void: return`.
+        // A unit payload has no register; emitting the store sends it to
+        // the assembler with no coloring.
+        let value_is_void = match value {
+            crate::model::LinkArg::Value(var) => self.get_value_kind_var(var) == 'v',
+            crate::model::LinkArg::Const(c) => crate::flatten::constant_kind(c) == 'v',
+        };
+        if value_is_void {
+            self.notes.push(GraphTransformNote {
+                function: graph_name.to_string(),
+                detail: format!("rewrite: setfield({}) → dropped (void)", field.name),
+            });
+            return RewriteResult::Replace(Vec::new());
+        }
         // `jtransform.py self._check_no_vable_array(op.args)` —
         // upstream's `op.args` is `[v_inst, c_fieldname, v_value]`; the
         // field name rides in a descriptor here, leaving the base and the
@@ -8722,6 +8736,16 @@ impl<'a> Transformer<'a> {
             .map(|(var, _)| var)
             .unwrap_or(funcptr)
             .clone();
+        // `rewrite_call` / `make_three_lists` drop `getkind == 'void'` for
+        // direct and indirect calls. The family's declared `FUNC.ARGS`
+        // is that same list, so a void slot the callee's jitcode does
+        // not take is absent from the calldescr and from `args_*`.
+        let filtered_args = self
+            .callcontrol
+            .as_deref()
+            .map(|cc| cc.non_void_actual_args_for_graphs(graphs, args))
+            .unwrap_or_else(|| args.to_vec());
+        let args = filtered_args.as_slice();
         let (args_i, args_r, args_f) = self.rewrite_call_three_lists(args, graph_name);
         let resolved_result = self.resolve_call_result(op.result.as_ref(), result_ty);
         let result_kind = resolved_result.kind;
@@ -19766,6 +19790,116 @@ mod tests {
             .unwrap();
         graph.set_return(graph.startblock, None);
         graph
+    }
+
+    /// An indirect family whose first parameter is void
+    /// (`map_by_fn_name_token::call`'s ZST receiver) and whose caller
+    /// still passes that slot as a ref. The calldescr and `args_r`
+    /// both drop it, matching the callee's non-void inputs.
+    #[test]
+    fn indirect_family_drops_void_receiver_with_the_callee() {
+        use crate::call::CallControl;
+
+        let mut callee = FunctionGraph::new("Token::call");
+        callee
+            .push_op_var(
+                callee.startblock,
+                OpKind::Input {
+                    name: "self".into(),
+                    ty: ValueType::Void,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        callee
+            .push_op_var(
+                callee.startblock,
+                OpKind::Input {
+                    name: "a".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        callee
+            .push_op_var(
+                callee.startblock,
+                OpKind::Input {
+                    name: "b".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        callee.set_return(callee.startblock, None);
+
+        let mut cc = CallControl::new();
+        cc.register_trait_method("call", Some("MapByName"), "Token", callee);
+        let family = cc.all_impls_for_indirect("MapByName", "call");
+        assert_eq!(family.len(), 1);
+
+        let mut graph = FunctionGraph::new("caller");
+        let bb = graph.startblock;
+        let funcptr = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let args: Vec<_> = (0..3)
+            .map(|_| graph.alloc_value_var_with_type(ConcreteType::GcRef))
+            .collect();
+        graph.block_mut(bb).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::IndirectCall {
+                funcptr,
+                args,
+                graphs: Some(family),
+                family_key: Some(("MapByName".into(), "call".into())),
+                result_ty: ValueType::Void,
+            },
+        });
+        graph.set_return(bb, None);
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let result = transformer.transform(&graph);
+        let args_r_len = result
+            .graph
+            .block(bb)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::CallResidual { args_r, .. } => Some(args_r.len()),
+                _ => None,
+            })
+            .expect("indirect call lowered to a residual");
+        assert_eq!(args_r_len, 2);
+    }
+
+    /// `rewrite_op_setfield` drops a void value (`RESULT is lltype.Void`),
+    /// so a unit payload never reaches the assembler uncolored.
+    #[test]
+    fn setfield_of_void_unit_payload_is_dropped() {
+        let mut graph = FunctionGraph::new("apply_assign_fast");
+        let bb = graph.startblock;
+        let base = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let unit = graph.alloc_value_var_with_type(ConcreteType::Void);
+        graph.block_mut(bb).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base,
+                field: crate::model::FieldDescriptor::new("payload", None),
+                value: LinkArg::Value(unit),
+                ty: ValueType::Ref(None),
+            },
+        });
+        graph.set_return(bb, None);
+        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        assert!(transformed.graph.blocks.iter().all(|block| {
+            block
+                .operations
+                .iter()
+                .all(|op| !matches!(op.kind, OpKind::FieldWrite { .. }))
+        }));
     }
 
     /// Build a graph that calls `receiver.run()` on a `dyn Handler`
