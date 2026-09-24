@@ -5233,6 +5233,44 @@ impl CallControl {
             .collect()
     }
 
+    /// Same drop as [`Self::non_void_actual_args_for_target`], for an
+    /// indirect-call family. The witness graph's `FUNC.ARGS` is the
+    /// family's signature; a `Void` slot is absent from every member's
+    /// jitcode inputs and from the calldescr, so the call drops that
+    /// position even when the actual's own `concretetype` is still `Ref`.
+    pub(crate) fn non_void_actual_args_for_graphs(
+        &self,
+        graphs: Option<&[crate::parse::CallPath]>,
+        args: &[crate::flowspace::model::Variable],
+    ) -> Vec<crate::flowspace::model::Variable> {
+        let drop_void_concretetype = || {
+            args.iter()
+                .filter(|arg| {
+                    crate::model::FunctionGraph::concretetype_of(arg)
+                        != crate::model::ConcreteType::Void
+                })
+                .cloned()
+                .collect()
+        };
+        let Some(graphs) = graphs else {
+            return drop_void_concretetype();
+        };
+        let Some(graph) = graphs
+            .iter()
+            .find_map(|path| self.function_graphs.get(path))
+        else {
+            return drop_void_concretetype();
+        };
+        let declared = graph_arg_types(graph);
+        if declared.len() != args.len() {
+            return drop_void_concretetype();
+        }
+        args.iter()
+            .zip(declared)
+            .filter_map(|(arg, ty)| (ty != crate::model::ValueType::Void).then(|| arg.clone()))
+            .collect()
+    }
+
     /// The shared low-level result type of an indirect-call family.
     ///
     /// RPython's `FunctionReprBase.call` gets this from the selected

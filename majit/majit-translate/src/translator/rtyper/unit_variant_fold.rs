@@ -282,9 +282,7 @@ fn erase_zero_sized_ctors(graph: &mut FunctionGraph) {
                 continue;
             };
             let unit_tuple = owner_path.is_empty() && name == "Tuple";
-            let fieldless_struct = *is_struct
-                && name == "GrainJitDriver"
-                && !field_bases.iter().any(|base| base == &result);
+            let fieldless_struct = *is_struct && !field_bases.iter().any(|base| base == &result);
             if !unit_tuple && !fieldless_struct {
                 continue;
             }
@@ -511,10 +509,10 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::synthetic_transparent_struct_ctor(
                         vec!["grain".into(), "vm".into(), "jit".into()],
-                        "GrainJitDriver",
+                        "Marker",
                     ),
                     args: Vec::new(),
-                    result_ty: ValueType::Ref(Some("GrainJitDriver".into())),
+                    result_ty: ValueType::Ref(Some("Marker".into())),
                 },
                 true,
             )
