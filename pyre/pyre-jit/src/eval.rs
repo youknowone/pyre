@@ -5223,23 +5223,6 @@ fn build_jit_driver_pair() -> JitDriverPair {
                 current_ec_ptr: || pyre_interpreter::call::getexecutioncontext() as i64,
             },
         );
-        majit_metainterp::register_int_py_mod_residual(majit_metainterp::IntPyModResidual {
-            fnaddrs: {
-                let mut addrs: Vec<i64> = pyre_interpreter::jit_trace_fnaddrs()
-                    .into_iter()
-                    .filter_map(|(name, addr)| {
-                        (name.contains("ll_int_py_mod") && !name.contains("uint")
-                            || name.contains("_ll_2_int_mod"))
-                        .then_some(addr)
-                    })
-                    .collect();
-                addrs.push(
-                    pyre_interpreter::objspace::descroperation::ll_int_py_mod as *const () as i64,
-                );
-                addrs.push(majit_metainterp::blackhole::_ll_2_int_mod as *const () as i64);
-                addrs
-            },
-        });
     }
     let info = build_pyframe_virtualizable_info();
     let mut d = JitDriver::new(JIT_THRESHOLD);
@@ -10646,8 +10629,7 @@ fn apply_blackhole_crn_handoff(frame: &mut PyFrame, green_int: &[i64]) {
         return;
     }
     frame.set_last_instr_from_next_instr(ni);
-    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
-    if pyre_interpreter::code_pc_is_loop_header(code, ni) {
+    if pyre_interpreter::code_pc_is_loop_header(frame.pycode as pyre_object::PyObjectRef, ni) {
         correct_resume_vsd(frame, ni);
     }
 }
