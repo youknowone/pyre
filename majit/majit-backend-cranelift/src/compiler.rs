@@ -12514,6 +12514,19 @@ impl CraneliftBackend {
                         .as_call_descr()
                         .expect("call op descriptor must be a CallDescr");
 
+                    // x86 `genop_math_sqrt` / aarch64 `math_sqrt`: OS_MATH_SQRT
+                    // is an inline sqrt, not a residual call.
+                    if call_descr.get_extra_info().oopspecindex == majit_ir::OopSpecIndex::MathSqrt
+                    {
+                        let a = resolve_opref(&mut builder, &constants, op.arg(1).to_opref());
+                        let fa = coerce_ty(&mut builder, a, cl_types::F64);
+                        let fr = builder.ins().sqrt(fa);
+                        let want = var_types.get(&vi).copied().unwrap_or(cl_types::F64);
+                        let r = coerce_ty(&mut builder, fr, want);
+                        builder.def_var(var(vi), r);
+                        continue;
+                    }
+
                     let call_result = emit_indirect_call_from_parts(
                         &mut builder,
                         &constants,

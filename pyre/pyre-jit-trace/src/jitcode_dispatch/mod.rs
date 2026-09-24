@@ -13017,6 +13017,14 @@ fn handle<Sym: WalkSym>(
             let result =
                 ctx.trace_ctx
                     .record_op_with_descr(OpCode::RawLoadI, &[base, offset], descr);
+            // `pyjitpl.py MIFrame.execute_and_record` / `_record_helper`
+            // pass the executed `resvalue` into `history.record2`, so the
+            // result box carries `box.value`. Stamp the same channel:
+            // `uint_ge` / `goto_if_not` read `concrete_of_opref`, not only
+            // the Int-bank slot shadow.
+            if let ConcreteValue::Int(value) = concrete {
+                ctx.trace_ctx.set_opref_concrete(result, Value::Int(value));
+            }
             let dst = code[op.pc + 5] as usize;
             write_int_reg(ctx, op.pc, dst, result, concrete)?;
             Ok((DispatchOutcome::Continue, op.next_pc))

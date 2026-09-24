@@ -10,32 +10,13 @@ use crate::state::*;
 use pyre_interpreter::locals_w;
 
 use std::borrow::Cow;
-use std::sync::OnceLock;
 
-use majit_ir::{DescrRef, GcRef, OpCode, OpRef, Type, Value};
+use majit_ir::{GcRef, OpCode, OpRef, Type, Value};
 use majit_metainterp::{
     CANNOT_RAISE_NO_HEAP_EFFECT_INFO, TraceAction, TraceCtx, default_effect_info,
 };
 
 use pyre_interpreter::bytecode::{BinaryOperator, CodeObject, ComparisonOperator, Instruction};
-
-/// Descriptor for the back-edge poll's load of the eval-breaker word.
-///
-/// Mirrors `rffi.CArray(Signed)`: the load is exactly as wide as the word it
-/// reads, taking the width from the word itself rather than restating it.
-fn eval_breaker_word_descr() -> DescrRef {
-    static DESCR: OnceLock<DescrRef> = OnceLock::new();
-    DESCR
-        .get_or_init(|| {
-            majit_ir::descr::make_array_descr_signed(
-                0,
-                majit_ir::eval_breaker_word::EVAL_BREAKER_WORD_SIZE,
-                Type::Int,
-                true,
-            )
-        })
-        .clone()
-}
 
 #[allow(dead_code)]
 extern "C" fn trace_function_get_defaults(func: i64) -> i64 {
@@ -929,16 +910,7 @@ impl MIFrame {
         target_pc: Option<usize>,
         header_marker_jit_pc: Option<usize>,
     ) -> Vec<OpRef> {
-        let poll_resume_pc = self.orgpc;
-        self.with_ctx(|this, ctx| {
-            this.close_loop_args_at(
-                ctx,
-                target_pc,
-                header_marker_jit_pc,
-                poll_resume_pc,
-                header_marker_jit_pc,
-            )
-        })
+        self.with_ctx(|this, ctx| this.close_loop_args_at(ctx, target_pc, header_marker_jit_pc))
     }
 
     #[doc(hidden)]
@@ -2010,52 +1982,19 @@ impl MIFrame {
         ctx: &mut TraceCtx,
         target_pc: Option<usize>,
         header_marker_jit_pc: Option<usize>,
-        poll_resume_pc: usize,
-        poll_resume_marker_jit_pc: Option<usize>,
     ) -> Vec<OpRef> {
-        // Mirror pypy/module/pypyjit/test_pypy_c/model.py's `--TICK--` shape:
-        // load a process-global raw word through a baked constant address,
-        // compare it, then guard the result — three operations, upstream's
-        // `int_lt(ticker, 0)` being the compare there. The folded eval-breaker
-        // word is a bitmask rather than a counter, so the compare is against
-        // `JIT_BREAKER_FLOOR`: the word's one non-breaker bit
-        // (`EB_GC_INTERP`, a process-stable dispatch gate that shares the word
-        // to spare the interpreter a second load) sits below every breaker
-        // bit, so an unsigned compare separates them without a mask.
+        // The `--TICK--` poll now lives in JUMP_BACKWARD's jitcode
+        // (`emit_jump_absolute_tick`: `raw_load_i` / `uint_ge` / `goto_if_not`
+        // then residual `bytecode_trace` on the armed arm).  Synthesizing it
+        // here at loop close duplicated that guard and resumed it at the
+        // JUMP_BACKWARD *pre-opcode* state, so the blackhole and any bridge
+        // walked `loop_header` + `goto` with no dispatcher.
         //
-        // Load-bearing invariant: RawLoadI must remain outside the always-pure
-        // range and this descriptor must remain non-pure. Otherwise CSE can
-        // forward the preamble's guarded-zero value into the loop body and
-        // `optimize_guard_false` deletes the body's poll, leaving compiled
-        // loops unable to respond to signals or stop-the-world requests.
-        //
-        // Captured before the flush/materialize below so the guard snapshot
-        // reflects the pre-close loop-body state. A zero address means the
-        // poll is simply not recorded; startup publishes it before tracing.
-        let eb_addr = majit_ir::eval_breaker_word::eval_breaker_word_addr();
-        if eb_addr != 0 {
-            let base = ctx.const_int(eb_addr as i64);
-            let offset = ctx.const_int(0);
-            let word = ctx.record_op_with_descr(
-                OpCode::RawLoadI,
-                &[base, offset],
-                eval_breaker_word_descr(),
-            );
-            let floor = ctx.const_int(majit_ir::eval_breaker_word::JIT_BREAKER_FLOOR as i64);
-            let armed = ctx.record_op(OpCode::UintGe, &[word, floor]);
-            // The poll is synthesized while this MIFrame is anchored at the
-            // target merge point, but semantically it belongs to the
-            // JUMP_BACKWARD that reached that target.  Temporarily install the
-            // back-edge coordinates so guard flushing, liveness, last_instr,
-            // and the snapshot's JitCode/Python-PC pair all describe the same
-            // pre-opcode state.  Restore the header coordinates immediately:
-            // GuardFutureCondition below must retain its merge-point resume.
-            let header_orgpc = self.orgpc;
-            self.orgpc = poll_resume_pc;
-            self.loop_close_marker_jit_pc = poll_resume_marker_jit_pc;
-            self.generate_guard(ctx, OpCode::GuardFalse, &[armed]);
-            self.orgpc = header_orgpc;
-        }
+        // Load-bearing invariant (still applies to the walked `raw_load_i`):
+        // RawLoadI must remain outside the always-pure range and its
+        // descriptor must remain non-pure. Otherwise CSE can forward the
+        // preamble's guarded-zero value into the loop body and
+        // `optimize_guard_false` deletes the body's poll.
         self.loop_close_marker_jit_pc = header_marker_jit_pc;
         // pyjitpl.py reached_loop_header: virtualizable_boxes
         // (read from locals_cells_stack_w[*] by virtualizable.py:86-98

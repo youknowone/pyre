@@ -159,9 +159,8 @@ impl W_BufferedReader {
         if !super::acquire_buffered_lock(lock) {
             return Err(crate::PyError::runtime_error("reentrant call"));
         }
-        let result = body(self);
-        super::release_buffered_lock(lock);
-        result
+        let _guard = super::BufferedLockGuard(lock);
+        body(self)
     }
 
     fn readahead(&self) -> usize {
@@ -460,13 +459,20 @@ impl W_BufferedReader {
             return self.with_lock(Self::read_all_unlocked);
         }
         let size = size as usize;
-        if let Some(result) = self.read_fast(size) {
-            return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&result));
-        }
-        let result = self.with_lock(|this| this.read_generic_unlocked(size))?;
-        Ok(match result {
-            Some(data) => pyre_object::bytesobject::w_bytes_from_bytes(&data),
-            None => w_none(),
+        // `_read_fast` is unlocked in `read_w` because it cannot thread-switch.
+        // A `raw_read` drops the GIL (`call_external_function`), so another
+        // thread can run this fast path while a `with_lock` body is still
+        // using `pos` / `read_end`; the slice in `buffer_bytes` then panics
+        // and would leave `TryLock` held. `_io._Buffered.read` takes
+        // `@critical_section` for that exclusion on the whole method.
+        self.with_lock(|this| {
+            if let Some(result) = this.read_fast(size) {
+                return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&result));
+            }
+            Ok(match this.read_generic_unlocked(size)? {
+                Some(data) => pyre_object::bytesobject::w_bytes_from_bytes(&data),
+                None => w_none(),
+            })
         })
     }
 

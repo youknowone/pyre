@@ -2317,21 +2317,11 @@ fn analyze_pipeline_from_module_paths(
 
     // `ll_math.sqrt_nonneg` assigns
     // `sqrt_nonneg.oopspec = "math.sqrt_nonneg(x)"` after the function
-    // definition, so the spec is owner-side there too.
-    //
-    // Unlike the four names above, this one currently matches no call site.
-    // Those are helper graphs the rtyper mints under exactly that name, so
-    // `target_to_path` reproduces the single segment. `sqrt_nonneg` is not
-    // minted: it is an ordinary translator-side function, and the math surface
-    // the rtyper does register is the external `ll_math.ll_math_sqrt`
-    // (`extfuncregistry.rs`), which the codewriter lowers through
-    // `_ll_1_ll_math_ll_math_sqrt` (`INLINE_CALLS_TO`). So this call creates a
-    // graph-less funcobj record nothing resolves to, and the `math.sqrt*` arm
-    // in `handle_builtin_call` fires only for an oopspec registered elsewhere.
-    // Retargeting it at `ll_math.ll_math_sqrt` would be wrong: that one raises,
-    // and the arm asks for `EF_ELIDABLE_CANNOT_RAISE`. Kept at the owner
-    // upstream names so the record is right whenever `sqrt_nonneg` does become
-    // a lowered callee.
+    // definition. The interpreter owner is `sqrt_nonneg` in
+    // `descroperation.rs`, which also carries `#[oopspec]` / `#[elidable]`
+    // so the harvester registers every alias path. This bare-name mark is
+    // the owner-side spelling `target_to_path` resolves for that callee;
+    // `_handle_math_sqrt_call` then asks for `EF_ELIDABLE_CANNOT_RAISE`.
     call_control.mark_oopspec(
         parse::CallPath::from_segments(["sqrt_nonneg"]),
         "math.sqrt_nonneg(x)".to_string(),

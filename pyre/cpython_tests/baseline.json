@@ -658,7 +658,8 @@
       "reason": "package skips itself on a free-threaded build (Py_GIL_DISABLED)"
     },
     "test.test_io": {
-      "dynasm": "TIMEOUT"
+      "dynasm": "TIMEOUT",
+      "reason": "CBufferedReaderTest.test_threads no longer hangs — the buffered TryLock is now released from a destructor and taken across the whole read — but the module overruns the 600 s per-module timeout of the ubuntu gate lane; on darwin-arm64 it passes in 94-113 s at low load"
     },
     "test.test_ioctl": {
       "dynasm": "FAIL"
@@ -1054,7 +1055,7 @@
       "dynasm": "FAIL"
     },
     "test.test_signal": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_site": {
       "dynasm": "FAIL",

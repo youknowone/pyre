@@ -7473,6 +7473,39 @@ pub extern "C" fn bh_get_iter_fn(obj: i64) -> i64 {
     }
 }
 
+/// Residual callee for the jitted `jump_absolute` armed path:
+/// `ec.bytecode_trace(frame, decr_by)`.
+///
+/// Void result (`residual_call_r_v`), matching `bh_delete_subscr_fn`:
+/// always returns 0; an exception is published through `BH_LAST_EXC_VALUE`
+/// for the trailing `GuardNoException`.
+///
+/// pyre-adaptation: the walked guard fails on `word >= JIT_BREAKER_FLOOR`,
+/// so it also fires for the pyre-only breaker bits (`EB_STW`,
+/// `EB_FINALIZING`, `EB_GC`, `EB_MEMORY_ERROR`).  This helper consumes only
+/// what `bytecode_trace` consumes and leaves those bits armed for the
+/// bytecode-boundary service in `eval_loop_jit`: that service collects
+/// through `gc_interp::safepoint`, which is safe only at the interpreter's
+/// dispatch safepoint, not from a residual call inside machine code.
+pub extern "C" fn bh_bytecode_trace_jitted_slow(ec_ptr: i64, frame_ptr: i64) -> i64 {
+    if ec_ptr == 0 {
+        return 0;
+    }
+    let decr_by = if pyre_interpreter::module::thread::gil::threads_initialized() {
+        crate::eval::_get_adapted_tick_counter()
+    } else {
+        0
+    };
+    let ec = ec_ptr as *mut pyre_interpreter::PyExecutionContext;
+    match unsafe { (*ec).bytecode_trace(frame_ptr as *mut PyFrame, decr_by) } {
+        Ok(()) => 0,
+        Err(mut err) => {
+            publish_residual_call_exception(err.to_exc_object() as i64);
+            0
+        }
+    }
+}
+
 /// UNARY_INVERT residual (`unary_invert` HLOp → `residual_call_r_r`).
 /// Computes `~value` through `opcode_ops::unary_invert_value` (`invert`); a
 /// user `__invert__` may run Python (`MayForce`).  On error the exception

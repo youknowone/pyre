@@ -6834,13 +6834,13 @@ impl __extend__ {
             jumpto = frame.next_instr();
         }
         // interp_jit.py — `pypyjitdriver.can_enter_jit(...)`.
-        // Not invoked here: this function is a documentation-only
-        // line-by-line port of PyPy `interp_jit.py:102-121` kept for
-        // parity audit (no Rust caller exists yet).  Pyre's live
-        // can_enter_jit dispatch happens out-of-band at
-        // `eval_loop_jit`'s `StepResult::CloseLoop` →
-        // `maybe_compile_and_run`, which fires for every backward
-        // jump independently of this shim.
+        // Not invoked here: the live jitted path is JUMP_BACKWARD's
+        // jitcode (`emit_jump_absolute_tick`), which walks the same
+        // `bytecode_trace` + `can_enter_jit` sequence.  This shim stays
+        // a line-by-line port of PyPy `interp_jit.py` `jump_absolute` for
+        // parity audit.  Pyre's live can_enter_jit dispatch happens out-of-band
+        // at `eval_loop_jit`'s `StepResult::CloseLoop` →
+        // `maybe_compile_and_run`.
         Ok(jumpto)
     }
 }
@@ -6852,7 +6852,7 @@ impl __extend__ {
 /// by a possibly smaller constant.  We get the maximum 100 when the
 /// (unoptimized) trace length is at least 3200 (a bit randomly).
 #[inline]
-fn _get_adapted_tick_counter() -> usize {
+pub(crate) fn _get_adapted_tick_counter() -> usize {
     let (driver, _) = driver_pair();
     let trace_length = driver.current_trace_length();
     // current_trace_length() returns -1 when not tracing

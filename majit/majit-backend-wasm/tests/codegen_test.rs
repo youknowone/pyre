@@ -4,8 +4,10 @@
 /// regression additionally executes the full wasm host and compares its Python
 /// output with dynasm, because the old failure was a runtime pointer miscast.
 ///
-/// `ResidualCallAbi` is process-global; oracle tests flip it to Vouched.
-/// One test thread keeps that from racing Word-mode CALL tests.
+/// One test thread on every OS. `ResidualCallAbi` and the vouched-callee
+/// set are thread-local, so selecting `Vouched` cannot reach another test.
+/// The single thread guards process-global settings tests flip, such as
+/// the inline-trip helper slot and the eager-merge byte cap.
 #[cfg(not(target_arch = "wasm32"))]
 mod serial_cpu_tests {
     extern "C" fn set_one_test_thread() {
@@ -22,6 +24,7 @@ mod serial_cpu_tests {
         any(target_os = "linux", target_os = "android", target_os = "freebsd"),
         unsafe(link_section = ".init_array")
     )]
+    #[cfg_attr(windows, unsafe(link_section = ".CRT$XCU"))]
     static SET_ONE_TEST_THREAD: extern "C" fn() = set_one_test_thread;
 }
 

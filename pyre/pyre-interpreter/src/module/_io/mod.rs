@@ -85,6 +85,17 @@ pub(crate) fn release_buffered_lock(handle: usize) {
     unsafe { &*lock.lock }.release();
 }
 
+/// `TryLock.__exit__` as a destructor. `with self.lock:` always runs
+/// `__exit__` when the body leaves, including an unwind; a sequential
+/// `release_buffered_lock` after `body()` does not.
+pub(crate) struct BufferedLockGuard(pub(crate) usize);
+
+impl Drop for BufferedLockGuard {
+    fn drop(&mut self) {
+        release_buffered_lock(self.0);
+    }
+}
+
 // The module-local exception class is process-global, like PyPy's module
 // definition object.  Keep the immortal type pointer shared across threads;
 // runtime semantic state must not be duplicated in TLS.

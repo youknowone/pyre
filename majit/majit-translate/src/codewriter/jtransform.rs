@@ -2573,6 +2573,13 @@ impl<'a> Transformer<'a> {
             }
             // ── rewrite_op_setfield ──
             OpKind::FieldWrite {
+                base, field, value, ..
+            } if escaping_object_array_len(graph, base).is_some()
+                && tuple_pos_field_index(&field.name).is_some() =>
+            {
+                self.rewrite_escaping_object_array_store(op, base, field, value, graph)
+            }
+            OpKind::FieldWrite {
                 field, value, ty, ..
             } if self.config.lower_virtualizable => {
                 self.rewrite_op_setfield(op, field, value, ty, graph_name)
@@ -4795,6 +4802,40 @@ impl<'a> Transformer<'a> {
         RewriteResult::Keep
     }
 
+    /// Element store of an `Array<*mut PyObject;N>` that was lowered to
+    /// `new_array_clear` because its address is a call argument.
+    /// `do_fixed_newlist_clear` fills that array with `setarrayitem_gc`,
+    /// not `setfield` of `__pos_N`.
+    fn rewrite_escaping_object_array_store(
+        &mut self,
+        op: &SpaceOperation,
+        base: &crate::flowspace::model::Variable,
+        field: &FieldDescriptor,
+        value: &LinkArg,
+        graph: &mut crate::model::FunctionGraph,
+    ) -> RewriteResult {
+        let index_n = tuple_pos_field_index(&field.name).expect("guard checked __pos_N");
+        let index =
+            graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::Signed);
+        RewriteResult::Replace(vec![
+            SpaceOperation {
+                result: Some(index.clone()),
+                kind: OpKind::ConstInt(index_n as i64),
+            },
+            SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::ArrayWrite {
+                    base: base.clone(),
+                    index,
+                    value: value.clone(),
+                    item_ty: ValueType::Ref(None),
+                    array_type_id: Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+                    nolength: false,
+                },
+            },
+        ])
+    }
+
     /// RPython: rewrite_op_getarrayitem
     fn rewrite_op_getarrayitem(
         &mut self,
@@ -5531,6 +5572,36 @@ impl<'a> Transformer<'a> {
                 .as_ref()
                 .is_none_or(|array| !array_has_nonconstant_index_read(graph, array))
         {
+            // A fixed `Array<T;N>` whose address is a call argument is the
+            // callee's list, not a struct of `__pos_N` fields. `split_builtin_kwargs`
+            // reads it with `arraylen_gc` / `getarrayitem_gc` (`rlist.py`
+            // `ll_length` / `ll_getitem_fast`). `do_fixed_newlist_clear`
+            // (`jtransform.py`) is the allocation that carries that length word.
+            // A struct `new` stores the first element where the length word
+            // sits, so the length comes back as a pointer.
+            if let Some(array) = op.result.as_ref()
+                && let Some(len) = shaped_object_ptr_array_len(name)
+                && shaped_array_is_call_argument(graph, array)
+            {
+                let length = graph
+                    .alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::Signed);
+                return RewriteResult::Replace(vec![
+                    SpaceOperation {
+                        result: Some(length.clone()),
+                        kind: OpKind::ConstInt(len as i64),
+                    },
+                    SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::NewArrayClear {
+                            length,
+                            item_ty: ValueType::Ref(None),
+                            array_type_id: Some(
+                                crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
+                            ),
+                        },
+                    },
+                ]);
+            }
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result.clone(),
                 kind: OpKind::New {
@@ -9449,6 +9520,80 @@ fn fn_const_target_from_field_write(
         }
     }
     found
+}
+
+/// `Array<*mut PyObject;N>` / `Array<PyObjectRef;N>` length. Other item
+/// types keep the struct aggregate.
+fn shaped_object_ptr_array_len(name: &str) -> Option<usize> {
+    let inner = name.strip_prefix("Array<")?.strip_suffix('>')?;
+    let (item, len) = inner.rsplit_once(';')?;
+    let len = len.trim().parse().ok()?;
+    match item.trim() {
+        "*mut PyObject" | "PyObjectRef" => Some(len),
+        _ => None,
+    }
+}
+
+/// The ctor result (or a direct alias of it) is passed to a call.
+fn shaped_array_is_call_argument(
+    graph: &crate::model::FunctionGraph,
+    array: &crate::flowspace::model::Variable,
+) -> bool {
+    let id = array.id();
+    graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            let crate::model::OpKind::Call { args, .. } = &op.kind else {
+                return false;
+            };
+            crate::model::call_arg_vars(args).iter().any(|arg| {
+                if arg.id() == id {
+                    return true;
+                }
+                crate::front::mir::resolve_to_producer_op(graph, arg)
+                    .and_then(|(block_id, op_index)| {
+                        graph
+                            .blocks
+                            .iter()
+                            .find(|candidate| candidate.id == block_id)?
+                            .operations
+                            .get(op_index)?
+                            .result
+                            .as_ref()
+                    })
+                    .is_some_and(|result| result.id() == id)
+            })
+        })
+    })
+}
+
+/// `base` is an object-pointer fixed array passed to a call.
+fn escaping_object_array_len(
+    graph: &crate::model::FunctionGraph,
+    base: &crate::flowspace::model::Variable,
+) -> Option<usize> {
+    let (block_id, op_index) = crate::front::mir::resolve_to_producer_op(graph, base)?;
+    let op = graph
+        .blocks
+        .iter()
+        .find(|block| block.id == block_id)?
+        .operations
+        .get(op_index)?;
+    let crate::model::OpKind::Call {
+        target:
+            crate::model::CallTarget::SyntheticTransparentCtor {
+                name, owner_path, ..
+            },
+        ..
+    } = &op.kind
+    else {
+        return None;
+    };
+    if !owner_path.is_empty() {
+        return None;
+    }
+    let len = shaped_object_ptr_array_len(name)?;
+    let result = op.result.as_ref()?;
+    shaped_array_is_call_argument(graph, result).then_some(len)
 }
 
 /// Whether `array` feeds a fixed-array `ArrayRead` whose index is not a graph
@@ -17627,6 +17772,72 @@ mod tests {
                 kind: OpKind::New { owner: allocated },
             }] if result == &result_var && allocated == &owner
         ));
+    }
+
+    /// An `Array<*mut PyObject;N>` passed to a call is the callee's list.
+    /// `do_fixed_newlist_clear` allocates it; `__pos_N` stores are
+    /// `setarrayitem_gc`. A struct `new` puts the first element where
+    /// `arraylen_gc` reads the length.
+    #[test]
+    fn escaping_object_array_lowers_to_new_array_clear() {
+        let mut graph = FunctionGraph::new("escape_object_array");
+        let entry = graph.startblock;
+        let elem = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let owner = "Array<*mut PyObject;2>".to_string();
+        let array = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor(owner.clone()),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some(owner.clone())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: array.clone(),
+                field: FieldDescriptor::new("__pos_0", Some(owner.clone())),
+                value: crate::model::LinkArg::Value(elem),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            OpKind::Call {
+                target: CallTarget::function_path(["split_builtin_kwargs"]),
+                args: crate::model::call_args(vec![array.clone()]),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.set_return(entry, None);
+        let result = transform_graph(&graph, &GraphTransformConfig::default());
+        let ops: Vec<_> = result
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .map(|op| &op.kind)
+            .collect();
+        assert!(
+            ops.iter()
+                .any(|kind| matches!(kind, OpKind::NewArrayClear { .. })),
+            "escaping array must allocate with new_array_clear: {ops:?}"
+        );
+        assert!(
+            ops.iter()
+                .any(|kind| matches!(kind, OpKind::ArrayWrite { .. })),
+            "positional store must be setarrayitem: {ops:?}"
+        );
+        assert!(
+            !ops.iter()
+                .any(|kind| matches!(kind, OpKind::New { owner } if owner.contains("Array<"))),
+            "escaping array must not be a struct new: {ops:?}"
+        );
     }
 
     #[test]

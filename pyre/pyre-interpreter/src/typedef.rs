@@ -2260,7 +2260,8 @@ fn patch_typeobject_descriptor_names() {
             let cur = unsafe { pyre_object::typedef::w_getset_get_name(value) };
             let is_sentinel = cur.is_null()
                 || (unsafe { pyre_object::is_str(cur) }
-                    && unsafe { pyre_object::w_str_get_value(cur) } == "<generic property>");
+                    && unsafe { pyre_object::w_str_get_value_opt(cur) }
+                        == Some("<generic property>"));
             if !is_sentinel {
                 continue;
             }
@@ -20341,9 +20342,9 @@ fn init_int_type(ns: PyObjectRef) {
                 {
                     None => "big",
                     Some(o) if unsafe { pyre_object::is_str(o) } => {
-                        match unsafe { pyre_object::w_str_get_value(o) } {
-                            "little" => "little",
-                            "big" => "big",
+                        match unsafe { pyre_object::w_str_get_value_opt(o) } {
+                            Some("little") => "little",
+                            Some("big") => "big",
                             _ => {
                                 return Err(crate::PyError::value_error(
                                     "byteorder must be either 'little' or 'big'",
@@ -25504,9 +25505,9 @@ fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let byteorder = match pos.get(2).copied().or(byteorder_kw) {
         None => "big",
         Some(b) if unsafe { pyre_object::is_str(b) } => {
-            match unsafe { pyre_object::w_str_get_value(b) } {
-                "little" => "little",
-                "big" => "big",
+            match unsafe { pyre_object::w_str_get_value_opt(b) } {
+                Some("little") => "little",
+                Some("big") => "big",
                 _ => {
                     return Err(crate::PyError::value_error(
                         "byteorder must be either 'little' or 'big'",

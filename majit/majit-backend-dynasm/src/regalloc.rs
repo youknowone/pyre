@@ -1799,6 +1799,11 @@ pub struct RegAlloc<'a> {
     arglocs_arena: Vec<Loc>,
 }
 
+fn is_math_sqrt_call(op: &Op) -> bool {
+    op.with_call_descr(|cd| cd.get_extra_info().oopspecindex)
+        == Some(majit_ir::OopSpecIndex::MathSqrt)
+}
+
 impl<'a> RegAlloc<'a> {
     /// x86/regalloc.py:170
     pub fn new(
@@ -3052,7 +3057,15 @@ impl<'a> RegAlloc<'a> {
             | OpCode::CallMayForceR
             | OpCode::CallMayForceF
             | OpCode::CallMayForceN => {
-                self.consider_call_j2(dst, args, op, i, output, opcode.is_call_may_force(), 1);
+                // x86/regalloc.py `_consider_real_call`: OS_MATH_SQRT is
+                // `_consider_math_sqrt`, not a real call.
+                if is_math_sqrt_call(op) {
+                    let dst = dst.unwrap_or(op.pos().get());
+                    let src = args.get(1).copied().unwrap_or(dst);
+                    self.consider_math_sqrt_j2(dst, src, i, output);
+                } else {
+                    self.consider_call_j2(dst, args, op, i, output, opcode.is_call_may_force(), 1);
+                }
             }
             OpCode::CallReleaseGilI | OpCode::CallReleaseGilF | OpCode::CallReleaseGilN => {
                 self.consider_call_j2(dst, args, op, i, output, true, 2);
@@ -3562,7 +3575,13 @@ impl<'a> RegAlloc<'a> {
             | OpCode::CallMayForceR
             | OpCode::CallMayForceF
             | OpCode::CallMayForceN => {
-                self.consider_call(op, i, output, op.opcode.is_call_may_force(), 1);
+                // x86/regalloc.py `_consider_real_call`: OS_MATH_SQRT is
+                // `_consider_math_sqrt`, not a real call.
+                if is_math_sqrt_call(op) {
+                    self.consider_math_sqrt(op, i, output);
+                } else {
+                    self.consider_call(op, i, output, op.opcode.is_call_may_force(), 1);
+                }
             }
             OpCode::CallReleaseGilI | OpCode::CallReleaseGilF | OpCode::CallReleaseGilN => {
                 self.consider_call(op, i, output, true, 2);
@@ -4478,6 +4497,46 @@ impl<'a> RegAlloc<'a> {
             &mut self.pending_moves,
         );
         self.perform(i, [loc0, loc1], Some(loc0), output);
+    }
+
+    /// x86/regalloc.py `_consider_math_sqrt`:
+    /// `loc0 = xrm.force_result_in_reg(op, op.getarg(1)); perform_math(op, [loc0], loc0)`.
+    /// No `before_call`: `SQRTSD` does not spill caller-saved registers.
+    fn consider_math_sqrt(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
+        let src = op.arg(1).to_opref();
+        let args: Vec<OpRef> = op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect());
+        let loc = self.xrm.force_result_in_reg(
+            op.pos().get(),
+            src,
+            Type::Float,
+            &args,
+            &mut self.longevity,
+            &mut self.fm,
+            &self.constants,
+            &mut self.pending_moves,
+        );
+        self.perform(i, [loc], Some(loc), output);
+    }
+
+    fn consider_math_sqrt_j2(
+        &mut self,
+        dst: OpRef,
+        src: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let args = [src];
+        let loc = self.xrm.force_result_in_reg(
+            dst,
+            src,
+            Type::Float,
+            &args,
+            &mut self.longevity,
+            &mut self.fm,
+            &self.constants,
+            &mut self.pending_moves,
+        );
+        self.perform(i, [loc], Some(loc), output);
     }
 
     /// x86/regalloc.py float_neg / float_abs

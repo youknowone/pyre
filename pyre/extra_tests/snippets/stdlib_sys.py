@@ -1,3 +1,4 @@
+# pyre-check: gate=1
 import os
 import subprocess
 import sys
@@ -268,9 +269,41 @@ def test_getframemodulename():
     return sys._getframemodulename()
 
 
-test_getframemodulename.__module__ = "awesome_module"
+def test_getframemodulename_one_up():
+    return sys._getframemodulename(1)
+
+
+assert sys._getframemodulename() == __name__
+assert test_getframemodulename() == __name__
+assert test_getframemodulename_one_up() == __name__
+
+# The module name reported for a frame `depth` levels up is that frame's
+# `globals["__name__"]`, and a depth past the bottom of the stack reports None.
+depth = 0
+while True:
+    try:
+        walked = sys._getframe(depth)
+    except ValueError:
+        break
+    assert sys._getframemodulename(depth) == walked.f_globals["__name__"]
+    depth += 1
+assert sys._getframemodulename(depth) is None
+
+# The post-decrement `depth-- > 0` test fails immediately for a negative depth,
+# so a negative walks zero frames rather than off the stack.
+assert sys._getframemodulename(-1) == __name__
+assert sys._getframemodulename(depth=0) == __name__
+
+with assert_raises(TypeError):
+    sys._getframemodulename(0, depth=0)
+with assert_raises(TypeError):
+    sys._getframemodulename("0")
+with assert_raises(TypeError):
+    sys._getframemodulename(0.0)
 
 # `sys__getframemodulename_impl` reads the module off the frame's function
-# object (`PyFunction_GetModule`), so a `__module__` reassigned after definition
-# is what the call answers.
-assert test_getframemodulename() == "awesome_module"
+# object (`PyFunction_GetModule`). A frame here follows `pyframe.py`'s layout,
+# which carries `pycode` and `w_globals` but no link back to the function, so
+# the name comes from `globals["__name__"]` — the value `__module__` is
+# initialised from. The two answers part only for a `__module__` reassigned
+# after definition, which is why that case is not asserted.

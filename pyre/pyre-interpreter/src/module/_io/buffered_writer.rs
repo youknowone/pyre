@@ -136,9 +136,8 @@ impl W_BufferedWriter {
         if !super::acquire_buffered_lock(lock) {
             return Err(crate::PyError::runtime_error("reentrant call"));
         }
-        let result = body(self);
-        super::release_buffered_lock(lock);
-        result
+        let _guard = super::BufferedLockGuard(lock);
+        body(self)
     }
 
     fn writer_reset_buf(&mut self) {

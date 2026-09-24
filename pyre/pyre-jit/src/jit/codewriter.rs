@@ -847,6 +847,7 @@ fn derive_pc_live_indices_from_sparse(
     ssarepr: &super::flatten::SSARepr,
     n_pcs: usize,
     code: &CodeObject,
+    is_true_portal: bool,
 ) -> Vec<Option<usize>> {
     // py_pc -> the stream position whose nearest-`-live-`-at-or-before is
     // the PC's resume marker.  Default = the PC's own first insn position
@@ -875,13 +876,16 @@ fn derive_pc_live_indices_from_sparse(
             .checked_sub(1)
             .map(|k| pc_pos[k].1)
     };
-    // Unconditional control-transfer target of `pc` (`JUMP_FORWARD` /
-    // `JUMP_BACKWARD` / `JUMP_BACKWARD_NO_INTERRUPT`), or `None` for any
-    // other opcode.  An unconditional jump emits no resume-relevant jitcode
-    // of its own: the blackhole steps it and lands at the target, so its
-    // resume liveness IS the target block's.  Used by the break-arm
-    // re-key below (matches the retired trace-side branch recorder's target
-    // computation and `liveness.rs`).
+    // Unconditional control-transfer target of `pc` (`JUMP_FORWARD`,
+    // `JUMP_BACKWARD_NO_INTERRUPT`, and non-portal `JUMP_BACKWARD`), or
+    // `None` for any other opcode.  Those jumps still emit no
+    // resume-relevant jitcode of their own: the blackhole steps them and
+    // lands at the target, so their resume liveness IS the target block's.
+    // True-portal `JUMP_BACKWARD` carries the jitted `bytecode_trace` poll
+    // (`emit_jump_absolute_tick`) before `loop_header` + `goto`, so it is
+    // no longer an empty uncond jump — a branch whose not-taken arm is
+    // that back-edge must resume at the poll, not skip to the jump target.
+    // Used by the break-arm re-key below.
     let uncond_jump_target = |pc: usize| -> Option<usize> {
         let (instr, op_arg) = pyre_interpreter::decode_instruction_at(code, pc)?;
         match instr {
@@ -890,10 +894,17 @@ fn derive_pc_live_indices_from_sparse(
                 pc + 1,
                 delta.get(op_arg).as_usize(),
             )),
-            // `backward_jump_target` keeps the JumpBackward (skip_caches)
-            // vs JumpBackwardNoInterrupt (direct `pc + 1`) base distinction
-            // in one place, matching the interpreter's dispatch.
-            _ => pyre_interpreter::backward_jump_target(code, pc, instr, op_arg),
+            // `JUMP_BACKWARD_NO_INTERRUPT` still emits no resume-relevant
+            // jitcode (no tick).  Non-portal `JUMP_BACKWARD` is the same:
+            // the tick is true-portal only.  `backward_jump_target` keeps
+            // the skip_caches vs direct `pc + 1` base distinction.
+            Instruction::JumpBackwardNoInterrupt { .. } => {
+                pyre_interpreter::backward_jump_target(code, pc, instr, op_arg)
+            }
+            Instruction::JumpBackward { .. } if !is_true_portal => {
+                pyre_interpreter::backward_jump_target(code, pc, instr, op_arg)
+            }
+            _ => None,
         }
     };
     // Branch guards (`goto_if_not` / `goto_if_not_*` / `switch`) resume at
@@ -1000,10 +1011,12 @@ fn derive_pc_live_indices_from_sparse(
         }
     }
     // Unconditional-jump forward-carry: a `JUMP_FORWARD` /
-    // `JUMP_BACKWARD` PC that is a branch's not-taken arm head (a `break` /
-    // loop-exit / loop back-edge) emits no resume-relevant jitcode — the
-    // blackhole steps it straight to the jump target.  So its resume liveness
-    // is the TARGET block's.  The branch-condition re-key above deliberately
+    // `JUMP_BACKWARD_NO_INTERRUPT` PC (and `JUMP_BACKWARD` in non-portal
+    // jitcode) that is a branch's not-taken arm head emits no
+    // resume-relevant jitcode — the blackhole steps it straight to the
+    // jump target.  So its resume liveness is the TARGET block's.
+    // True-portal `JUMP_BACKWARD` is excluded: it carries the walked tick
+    // poll.  The branch-condition re-key above deliberately
     // leaves such fallthrough PCs `None`; key them here to the target's
     // position so the resolver lands at the target block's `-live-` (the same
     // place the per-PC walker resumes), not the preceding branch marker the
@@ -2249,6 +2262,241 @@ fn emit_loop_header(
         },
     ];
     GraphFlattener::new(graph, &mut empty_regallocs, ssarepr).serialize_op(&graph_op);
+}
+
+// Literal field indices crystallised at the codewriter call site.
+// RPython looks up the index dynamically through
+// `VABLEINFO.static_field_descrs` since each backend may reorder
+// fields.  Pyre's `_virtualizable_` order matches PyPy
+// `interp_jit.py` `PyFrame._virtualizable_` line by line:
+// [last_instr, pycode, valuestackdepth, debugdata],
+// so the literals match `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS`.
+// Hoisted so `emit_jump_absolute_tick` and the portal compile body share
+// `VABLE_LAST_INSTR_FIELD_IDX`.
+const VABLE_LAST_INSTR_FIELD_IDX: u16 = 0;
+const VABLE_CODE_FIELD_IDX: u16 = 1;
+const VABLE_VALUESTACKDEPTH_FIELD_IDX: u16 = 2;
+
+/// interp_jit.py `PyFrame.jump_absolute` jitted arm: `ec.bytecode_trace(self,
+/// decr_by)` then `can_enter_jit`.  The walked fast path is the breaker-word
+/// poll (`raw_load_i` / `uint_ge` / `goto_if_not` → `GuardFalse`), matching
+/// `--TICK--` (`getfield_raw_i` / `int_lt` / `guard_false`).  The armed arm is
+/// a residual call to `bytecode_trace`, so a blackhole or bridge from that
+/// guard executes the action dispatcher instead of jumping straight back into
+/// the loop.  The pyre-only breaker bits stay armed for `eval_loop_jit`
+/// (`bh_bytecode_trace_jitted_slow`).
+///
+/// `emit_tick` is the true-portal `JUMP_BACKWARD` gate: a non-portal jitcode
+/// aliases `frame_var` to the outermost frame (same gap as ReturnValue's
+/// `last_instr` store).  `eb_addr == 0` also takes the no-tick shape.
+fn emit_jump_absolute_tick(
+    code: &CodeObject,
+    graph: &mut super::flow::FunctionGraph,
+    current_block: &SpamBlockRef,
+    current_state: &FrameState,
+    ssarepr: &mut SSARepr,
+    py_pc: usize,
+    target_py_pc: usize,
+    frame_var: super::flow::Variable,
+    ec_var: super::flow::Variable,
+    bytecode_trace_slow_fn_idx: u16,
+    bytecode_trace_slow_flavor: CallFlavor,
+    emit_tick: bool,
+    emit_header: bool,
+    jdindex: usize,
+    catch_for_pc: &[Option<u16>],
+    catch_sites: &[ExceptionCatchSite],
+    joinpoints: &mut VecMap<usize, Vec<SpamBlockRef>>,
+    pendingblocks: &mut VecDeque<SpamBlockRef>,
+    all_walker_blocks: &mut Vec<SpamBlockRef>,
+) {
+    let eb_addr = majit_ir::eval_breaker_word::eval_breaker_word_addr();
+    let header_block = if !emit_tick || eb_addr == 0 {
+        current_block.clone()
+    } else {
+        // interp_jit.py jump_absolute: `self.last_instr = intmask(jumpto)`
+        // before `bytecode_trace`.  eval_loop_jit stamps `last_instr` to
+        // the pc of the opcode about to run (`handle_bytecode`) before
+        // calling `bytecode_trace`; after JUMP_BACKWARD that pc is the
+        // jump target, so the stored value is `target_py_pc`.  The dead
+        // `jump_absolute` shim uses `set_last_instr_from_next_instr(jumpto)`
+        // (`last_instr = jumpto - 1`), which is the f_lasti store and not
+        // the live convention.
+        //
+        // Portal jitcode only (`emit_tick`): in a non-portal callee
+        // `frame_var` aliases the outermost frame (ReturnValue arm).
+        //
+        // Split a new graph block for the poll.  JUMP_BACKWARD falls
+        // through from STORE_FAST in the same CFG block; appending the
+        // poll there made `derive_pc_live_indices_from_sparse` key the
+        // PC's first insn at the setfield, whose nearest `-live-` is
+        // STORE_FAST's trailing marker (dead boxed temps still SSA-live).
+        // The snapshot then treated those colors as kept operand-stack
+        // slots (`BranchGuardKeptSlotUnsourced`).  `get_list_of_active_boxes`
+        // (`pyjitpl.py`) reads the terminator's own `-live-`.  A fresh
+        // block's head `-live-` is the jump's frame-state variables — the
+        // same set the slow/hot arms already use — so the resume marker
+        // and the guard agree.
+        let mut tick_state = current_state.clone();
+        tick_state.next_offset = py_pc;
+        tick_state.blocklist = frame_blocks_for_offset(code, py_pc);
+        let tick_block = SpamBlockRef::new(graph.new_block(Vec::new()), Some(tick_state.clone()));
+        all_walker_blocks.push(tick_block.clone());
+        tick_block.block().borrow_mut().inputargs = tick_state.getvariables();
+        append_exit(
+            &current_block.block(),
+            output_link(current_state, &tick_state, tick_block.block()),
+        );
+
+        let last_instr: super::flow::FlowValue =
+            super::flow::Constant::signed(target_py_pc as i64).into();
+        record_graph_op(
+            &tick_block.block(),
+            "setfield_vable_i",
+            vable_setfield_int_graph_args(
+                frame_var.into(),
+                last_instr.into(),
+                VABLE_LAST_INSTR_FIELD_IDX,
+            ),
+            None,
+            py_pc as i64,
+        );
+
+        let addr = emit_graph_op_with_result(
+            graph,
+            &tick_block.block(),
+            "int_copy",
+            vec![super::flow::Constant::signed(eb_addr as i64).into()],
+            Kind::Int,
+            py_pc as i64,
+        );
+        let offset = emit_graph_op_with_result(
+            graph,
+            &tick_block.block(),
+            "int_copy",
+            vec![super::flow::Constant::signed(0).into()],
+            Kind::Int,
+            py_pc as i64,
+        );
+        let descr = majit_ir::make_array_descr_signed(
+            0,
+            majit_ir::eval_breaker_word::EVAL_BREAKER_WORD_SIZE,
+            majit_ir::Type::Int,
+            true,
+        );
+        let word = emit_graph_op_with_result(
+            graph,
+            &tick_block.block(),
+            "raw_load_i",
+            vec![addr.into(), offset.into(), descr.into()],
+            Kind::Int,
+            py_pc as i64,
+        );
+        let floor = emit_graph_op_with_result(
+            graph,
+            &tick_block.block(),
+            "int_copy",
+            vec![
+                super::flow::Constant::signed(
+                    majit_ir::eval_breaker_word::JIT_BREAKER_FLOOR as i64,
+                )
+                .into(),
+            ],
+            Kind::Int,
+            py_pc as i64,
+        );
+        let armed = emit_graph_op_with_result(
+            graph,
+            &tick_block.block(),
+            "uint_ge",
+            vec![word.into(), floor.into()],
+            Kind::Int,
+            py_pc as i64,
+        );
+
+        tick_block.block().borrow_mut().exitswitch =
+            Some(super::flow::ExitSwitch::Value(armed.into()));
+
+        let mut arm_state = tick_state.clone();
+        arm_state.next_offset = py_pc;
+        arm_state.blocklist = frame_blocks_for_offset(code, py_pc);
+        let slow = SpamBlockRef::new(graph.new_block(Vec::new()), Some(arm_state.clone()));
+        all_walker_blocks.push(slow.clone());
+        let slow_inputs = arm_state.getvariables();
+        slow.block().borrow_mut().inputargs = slow_inputs.clone();
+
+        let hot = SpamBlockRef::new(graph.new_block(Vec::new()), Some(arm_state.clone()));
+        all_walker_blocks.push(hot.clone());
+        let hot_inputs = arm_state.getvariables();
+        hot.block().borrow_mut().inputargs = hot_inputs.clone();
+
+        // flatten.py Bool 2-exit: `make_link(linktrue)` then `linkfalse`.
+        // goto_if_not jumps when the condition is 0, so linkfalse is the
+        // unarmed (hot) arm and linktrue is the armed residual.
+        append_exit(
+            &tick_block.block(),
+            super::flow::Link::new(slow_inputs, Some(slow.block()), None).into_ref(),
+        );
+        set_last_bool_exitcase(&tick_block.block(), true);
+        append_exit(
+            &tick_block.block(),
+            super::flow::Link::new(hot_inputs.clone(), Some(hot.block()), None).into_ref(),
+        );
+        set_last_bool_exitcase(&tick_block.block(), false);
+
+        let _ = record_residual_call_graph_op(
+            graph,
+            &slow.block(),
+            bytecode_trace_slow_fn_idx,
+            bytecode_trace_slow_flavor,
+            majit_ir::RuntimeHelperKind::None,
+            vec![],
+            vec![ec_var.into(), frame_var.into()],
+            vec![],
+            vec![Kind::Ref, Kind::Ref],
+            ResKind::Void,
+            py_pc as i64,
+        );
+        if let Some(catch_label) = catch_for_pc.get(py_pc).copied().flatten()
+            && let Some(site) = catch_sites
+                .iter()
+                .find(|site| site.landing_label == catch_label)
+        {
+            attach_catch_exception_edge(
+                code,
+                graph,
+                &slow.block(),
+                &site.landing,
+                &arm_state,
+                site,
+            );
+        }
+        append_exit(
+            &slow.block(),
+            super::flow::Link::new(hot_inputs, Some(hot.block()), None).into_ref(),
+        );
+        restore_canraise_exit_order(&slow.block());
+        hot
+    };
+
+    if emit_header {
+        emit_loop_header(graph, &header_block, ssarepr, jdindex, py_pc);
+    }
+    let _ = mergeblock(
+        code,
+        graph,
+        joinpoints,
+        &header_block,
+        &{
+            let mut branch_state = current_state.clone();
+            branch_state.next_offset = target_py_pc;
+            branch_state.blocklist = frame_blocks_for_offset(code, target_py_pc);
+            branch_state
+        },
+        target_py_pc,
+        pendingblocks,
+        all_walker_blocks,
+    );
 }
 
 fn emit_frontend_neg(
@@ -3626,6 +3874,7 @@ struct FnPtrIndices {
     call_kw_fn_13: HelperHandle,
     unbound_local_error_fn: HelperHandle,
     clear_in_flight_exception_fn: HelperHandle,
+    bytecode_trace_jitted_slow_fn: HelperHandle,
 }
 
 /// Register every blackhole helper fn pointer with the assembler in
@@ -4377,6 +4626,14 @@ fn register_helper_fn_pointers(
         cpu.load_import_globals_fn as *const (),
         CallFlavor::PlainCannotRaise,
     );
+    // interp_jit.py jump_absolute residual: `action_dispatcher` is
+    // `@dont_inline` and can run a signal handler, so this helper is
+    // `MayForce`.  Appended last to preserve fn_ptr indices.
+    let bytecode_trace_jitted_slow_fn = bind(
+        assembler,
+        cpu.bytecode_trace_jitted_slow_fn as *const (),
+        CallFlavor::MayForce,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -4485,6 +4742,7 @@ fn register_helper_fn_pointers(
         set_function_attribute_fn,
         unbound_local_error_fn,
         clear_in_flight_exception_fn,
+        bytecode_trace_jitted_slow_fn,
     }
 }
 
@@ -6085,17 +6343,6 @@ impl CodeWriter {
         // killing the cross-arm conflated Variable that previously caused
         // scratch slots to appear "alive" at unrelated `-live-` markers.
         let scratch_ref_base: u16 = portal_ec_reg + 1;
-        // Note: literal field indices crystallised at
-        // the codewriter call site. RPython looks up the index dynamically
-        // through `VABLEINFO.static_field_descrs` since each backend may
-        // reorder fields. Pyre's `_virtualizable_` order matches PyPy
-        // `interp_jit.py:25-30` line by line:
-        // [last_instr, pycode, valuestackdepth, debugdata],
-        // so the literals match
-        // `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS`.
-        const VABLE_LAST_INSTR_FIELD_IDX: u16 = 0;
-        const VABLE_CODE_FIELD_IDX: u16 = 1;
-        const VABLE_VALUESTACKDEPTH_FIELD_IDX: u16 = 2;
 
         // regalloc.py: compile-time stack depth counter — tracks which
         // stack register (stack_base + depth) is the current TOS.
@@ -6662,6 +6909,11 @@ impl CodeWriter {
                 HelperHandle {
                     idx: clear_in_flight_exception_fn_idx,
                     flavor: _clear_in_flight_exception_fn_flavor,
+                },
+            bytecode_trace_jitted_slow_fn:
+                HelperHandle {
+                    idx: bytecode_trace_jitted_slow_fn_idx,
+                    flavor: bytecode_trace_jitted_slow_fn_flavor,
                 },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
@@ -9488,30 +9740,42 @@ impl CodeWriter {
                                 pyre_interpreter::backward_jump_target(code, py_pc, instr, op_arg)
                             {
                                 if target_py_pc < num_instrs {
-                                    // interp_jit.py `can_enter_jit` at each
-                                    // backward jump → jtransform.py:1714-1723
-                                    // lowers it to a `loop_header` op in the
-                                    // jumping block, before the goto. The op
-                                    // stamps `seen_loop_header_for_jdindex` so
-                                    // the target's `jit_merge_point` treats
-                                    // this arrival as a loop crossing
-                                    // (pyjitpl.py:1527-1562).
-                                    if !backward_jump_is_handler_only_target(
+                                    // interp_jit.py `jump_absolute`: jitted
+                                    // `bytecode_trace` then `can_enter_jit`.
+                                    // pyre-adaptation (inlined callee's own
+                                    // frame is unpublished — same gap as
+                                    // ReturnValue's last_instr store): the
+                                    // whole tick is true-portal only;
+                                    // `loop_header` stays under the existing
+                                    // true-portal && !handler-only condition.
+                                    let emit_tick = is_true_portal;
+                                    let emit_header = !backward_jump_is_handler_only_target(
                                         code,
                                         py_pc,
                                         target_py_pc,
-                                    ) && is_true_portal
-                                    {
-                                        let jdindex = PYTHON_PORTAL_JD_INDEX;
-                                        emit_loop_header(
-                                            &graph,
-                                            &current_block,
-                                            &mut ssarepr,
-                                            jdindex,
-                                            py_pc,
-                                        );
-                                    }
-                                    emit_goto!(target_py_pc);
+                                    ) && is_true_portal;
+                                    emit_jump_absolute_tick(
+                                        code,
+                                        &mut graph,
+                                        &current_block,
+                                        &current_state,
+                                        &mut ssarepr,
+                                        py_pc,
+                                        target_py_pc,
+                                        frame_var,
+                                        ec_var,
+                                        bytecode_trace_jitted_slow_fn_idx,
+                                        bytecode_trace_jitted_slow_fn_flavor,
+                                        emit_tick,
+                                        emit_header,
+                                        PYTHON_PORTAL_JD_INDEX,
+                                        &catch_for_pc,
+                                        &catch_sites,
+                                        &mut joinpoints,
+                                        &mut pendingblocks,
+                                        &mut all_walker_blocks,
+                                    );
+                                    needs_fallthrough = false;
                                 }
                             }
                         }
@@ -9997,6 +10261,7 @@ impl CodeWriter {
                                     // Same `can_enter_jit` → `loop_header`
                                     // lowering as the JumpBackward arm above
                                     // (jtransform.py:1714-1723).
+                                    // No tick: the opcode does not check the eval breaker.
                                     if !backward_jump_is_handler_only_target(
                                         code,
                                         py_pc,
@@ -14881,7 +15146,8 @@ impl CodeWriter {
             .iter()
             .position(|i| i.is_live())
             .expect("canonical splice stream carries no -live- marker");
-        let derived = derive_pc_live_indices_from_sparse(&spliced, num_instrs, code);
+        let derived =
+            derive_pc_live_indices_from_sparse(&spliced, num_instrs, code, is_true_portal);
         let mut dense: Vec<usize> = Vec::with_capacity(num_instrs);
         let mut last = first_live;
         for entry in &derived {

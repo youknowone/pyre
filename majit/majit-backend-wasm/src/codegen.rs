@@ -1001,6 +1001,7 @@ impl<'sink, 'buf> PeepSink<'sink, 'buf> {
         f64_mul,
         f64_ne,
         f64_neg,
+        f64_sqrt,
         f64_reinterpret_i64,
         f64_sub,
         f32_demote_f64,
@@ -9177,6 +9178,19 @@ fn build_function(
             | OpCode::CallMayForceF
             | OpCode::CallAssemblerF
             | OpCode::CallReleaseGilF => {
+                // llgraph `runner.py` `_do_math_sqrt` / x86 `genop_math_sqrt`:
+                // OS_MATH_SQRT is `f64.sqrt`, not a residual call.
+                if op.with_call_descr(|cd| cd.get_extra_info().oopspecindex)
+                    == Some(majit_ir::OopSpecIndex::MathSqrt)
+                {
+                    let vi = op.pos().get().raw();
+                    if !OpRef::raw_is_constant(vi) {
+                        emit_resolve_f64(&mut sink, constants, value_types, op.arg(1).to_opref());
+                        sink.f64_sqrt();
+                        sink.local_set(value_types.local(vi));
+                    }
+                    continue;
+                }
                 if residual_func_ofs(op.opcode) == 1
                     && const_operand_value(constants, op.arg(0).to_opref()) != Some(0)
                 {

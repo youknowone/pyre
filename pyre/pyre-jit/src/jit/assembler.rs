@@ -1436,6 +1436,34 @@ fn dispatch_op(
                 .builder
                 .vable_arraylen_with_base(dst, vable_reg, array_idx);
         }
+        // `blackhole.py bhimpl_raw_load_i` / `jtransform.py rewrite_op_raw_load`.
+        // Interned as a raw (non-GC) array descr so CSE cannot treat the
+        // load as a pure GC-array read — the back-edge poll of the eval
+        // breaker word depends on that.
+        "raw_load_i" => {
+            assert_eq!(
+                args.len(),
+                3,
+                "raw_load_i expects [base, offset, arraydescr]"
+            );
+            let dst = expect_result_reg(result, Kind::Int, "raw_load_i needs result");
+            let base = expect_int_reg_or_pool(state, &args[0]);
+            let offset = expect_int_reg_or_pool(state, &args[1]);
+            let descr_idx = match &args[2] {
+                Operand::Descr(d) => match &**d {
+                    DescrOperand::Bh(majit_translate::jitcode::BhDescr::Array {
+                        itemsize,
+                        is_item_signed,
+                        ..
+                    }) => state
+                        .builder
+                        .add_raw_int_array_descr_signed(*itemsize, *is_item_signed),
+                    _ => expect_array_bh_descr(state, &args[2], "raw_load_i"),
+                },
+                _ => expect_array_bh_descr(state, &args[2], "raw_load_i"),
+            };
+            state.builder.raw_load_i(dst, base, offset, descr_idx);
+        }
         // Heap GC-array primitives, canonical shapes
         // `new_array_clear/id>r` (blackhole.py `bhimpl_new_array_clear`)
         // and `setarrayitem_gc_r/rird` (`bhimpl_setarrayitem_gc_r`),

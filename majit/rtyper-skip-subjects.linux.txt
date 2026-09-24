@@ -526,6 +526,7 @@ two-phase-never-a-subject	pyre_interpreter::module::_io::buffered::<Impl>::seek
 two-phase-never-a-subject	pyre_interpreter::module::_io::buffered::<Impl>::seekable
 two-phase-never-a-subject	pyre_interpreter::module::_io::buffered::<Impl>::tell
 two-phase-never-a-subject	pyre_interpreter::module::_io::buffered::<Impl>::truncate
+two-phase-never-a-subject	pyre_interpreter::module::_io::buffered::<Impl>::with_lock
 two-phase-never-a-subject	pyre_interpreter::module::_io::buffered::__majit_wrap___init__
 two-phase-never-a-subject	pyre_interpreter::module::_io::buffered::__majit_wrap___new__
 two-phase-never-a-subject	pyre_interpreter::module::_io::buffered::__majit_wrap___repr__
@@ -579,6 +580,7 @@ two-phase-never-a-subject	pyre_interpreter::module::_io::buffered_random::<Impl>
 two-phase-never-a-subject	pyre_interpreter::module::_io::buffered_random::<Impl>::seekable
 two-phase-never-a-subject	pyre_interpreter::module::_io::buffered_random::<Impl>::tell
 two-phase-never-a-subject	pyre_interpreter::module::_io::buffered_random::<Impl>::truncate
+two-phase-never-a-subject	pyre_interpreter::module::_io::buffered_random::<Impl>::with_lock
 two-phase-never-a-subject	pyre_interpreter::module::_io::buffered_random::<Impl>::writable
 two-phase-never-a-subject	pyre_interpreter::module::_io::buffered_random::<Impl>::write
 two-phase-never-a-subject	pyre_interpreter::module::_io::buffered_random::<Impl>::write_bytes
@@ -654,6 +656,7 @@ two-phase-never-a-subject	pyre_interpreter::module::_io::buffered_writer::<Impl>
 two-phase-never-a-subject	pyre_interpreter::module::_io::buffered_writer::<Impl>::seekable
 two-phase-never-a-subject	pyre_interpreter::module::_io::buffered_writer::<Impl>::tell
 two-phase-never-a-subject	pyre_interpreter::module::_io::buffered_writer::<Impl>::truncate
+two-phase-never-a-subject	pyre_interpreter::module::_io::buffered_writer::<Impl>::with_lock
 two-phase-never-a-subject	pyre_interpreter::module::_io::buffered_writer::<Impl>::writable
 two-phase-never-a-subject	pyre_interpreter::module::_io::buffered_writer::<Impl>::write
 two-phase-never-a-subject	pyre_interpreter::module::_io::buffered_writer::<Impl>::write_bytes

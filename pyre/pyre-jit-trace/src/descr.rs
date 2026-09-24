@@ -4027,16 +4027,6 @@ pub fn w_method_size_descr() -> DescrRef {
     W_METHOD_DESCR_GROUP.size_descr.clone()
 }
 
-/// `typeobject.py ObjectMutableCell.w_value` — the boxed payload of
-/// a module-global cell, read LIVE on the cell fast path. The value is
-/// rewritten in place when a hot global is reassigned without bumping the
-/// strategy version, so this descriptor is mutable (not immutable /
-/// quasi-immutable); the `version?` guard protects cell identity, not the
-/// payload.
-pub fn object_mutable_cell_value_descr() -> DescrRef {
-    field_descr_from_group(&W_OBJECT_MUTABLE_CELL_DESCR_GROUP, 0)
-}
-
 /// `nestedscope.py Cell.contents` — what `w_cell_get` reads.  The modelled
 /// `fast2locals` expansion reads it once per cell slot, in place of the
 /// residual `bh_call_fn(locals)` whose frame force loses the enclosing loop.
