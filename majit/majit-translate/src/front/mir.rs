@@ -13436,6 +13436,26 @@ impl<'a> Lowering<'a> {
                                 target
                             }
                             _ => {
+                                // Opaque cross-crate `self` (`RootScope` in the
+                                // caller's LLBC). `impl_method_owner` declines
+                                // `CallTarget::Method`, so `MethodDesc.func_args`
+                                // never prepends `SomeInstance(selfclassdef)`
+                                // and the traced body binds a classdef-less
+                                // receiver. Paint the classdef onto this
+                                // argument only.
+                                if let Some(root) = self.opaque_traced_method_self_root(&reg)
+                                    && let Some(recv) = args.first().cloned()
+                                {
+                                    let narrowed = self.graph.alloc_value_var_with_type(
+                                        crate::model::ConcreteType::Unknown,
+                                    );
+                                    let bb_id = self.block_id[mir_bb];
+                                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                                        result: Some(narrowed.clone()),
+                                        kind: crate::model::cast_instance_call(root, recv),
+                                    });
+                                    args[0] = narrowed;
+                                }
                                 let mut target = CallTarget::FunctionPath {
                                     segments,
                                     fun_decl_id: None,
@@ -15379,6 +15399,54 @@ impl<'a> Lowering<'a> {
                 "bb{mir_bb}: CallKind::Unknown"
             ))),
         }
+    }
+
+    /// Class root of an inherent `&self` method whose owner ADT is opaque
+    /// in this crate. `dont_look_inside` callees stay residual and are
+    /// not painted. `core`/`std`/`alloc` owners are not struct classes.
+    fn opaque_traced_method_self_root(&self, reg: &RegularCall) -> Option<String> {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return None;
+        };
+        let fd = self.llbc.fn_by_id(*id)?;
+        if self
+            .dont_look_inside
+            .contains(&strip_crate_prefix(&fd.item_meta.name_path()))
+        {
+            return None;
+        }
+        if fd.first_arg_local_name().is_some_and(|n| n != "self") {
+            return None;
+        }
+        let segs = &fd.item_meta.name;
+        let last_idx = segs
+            .iter()
+            .rposition(|s| matches!(s, NameSeg::Ident { .. }))?;
+        if last_idx == 0 {
+            return None;
+        }
+        let impl_payload = match &segs[last_idx - 1] {
+            NameSeg::Other(v) => v.as_object()?.get("Impl")?,
+            _ => return None,
+        };
+        let adt_def_id = self.resolve_impl_owner_adt_def_id(impl_payload)?;
+        if !self.first_input_is_adt(fd, adt_def_id) {
+            return None;
+        }
+        let td = self.llbc.type_by_id(adt_def_id)?;
+        if !matches!(td.kind, TypeDeclKind::Opaque) {
+            return None;
+        }
+        let name = td.item_meta.name_path();
+        let crate_root = name.split("::").next().unwrap_or(&name);
+        if matches!(crate_root, "core" | "std" | "alloc") {
+            return None;
+        }
+        tyref_input_class_root(
+            fd.signature.inputs.first()?,
+            self.llbc,
+            self.tombstoned_leaves,
+        )
     }
 
     /// Return `(owner_root_leaf, method_leaf)` when the FunDecl's name
