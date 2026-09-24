@@ -817,12 +817,28 @@ unsafe fn spec_format_bytes(spec: &CFormatSpec, obj: PyObjectRef) -> Result<Vec<
         CFormatType::Character(CCharacterType::Character) => {
             Ok(spec.format_char(bytes_char_arg(obj)?))
         }
-        CFormatType::Unsupported { ch, index } => Err(PyError::value_error(format!(
-            "unsupported format character '{}' ({:#x}) at index {index}",
-            ch.to_char_lossy(),
-            ch.to_u32(),
-        ))),
+        CFormatType::Unsupported { ch, index } => {
+            Err(unsupported_format_error(ch.to_u32(), *index, true))
+        }
     }
+}
+
+/// `PyUnicode_Format` prints a conversion it does not know. A byte at or
+/// above 0x80 reaches that printer as a negative character and raises
+/// `OverflowError`; a string conversion outside printable ASCII is shown
+/// as `?` while the hex keeps the code point.
+fn unsupported_format_error(cp: u32, index: usize, bytes: bool) -> PyError {
+    if bytes && cp > 0x7f {
+        return PyError::overflow_error("character argument not in range(0x110000)");
+    }
+    let shown = if bytes || (0x21..0x7f).contains(&cp) {
+        char::from_u32(cp).unwrap_or('?')
+    } else {
+        '?'
+    };
+    PyError::value_error(format!(
+        "unsupported format character '{shown}' ({cp:#x}) at index {index}",
+    ))
 }
 
 unsafe fn bytes_char_arg(obj: PyObjectRef) -> Result<u8, PyError> {
@@ -908,11 +924,9 @@ unsafe fn spec_format_string(spec: &CFormatSpec, obj: PyObjectRef) -> Result<Wtf
             Ok(Wtf8Buf::from_string(spec.format_float(value)))
         }
         CFormatType::Character(_) => Ok(spec.format_char(char_arg(obj)?)),
-        CFormatType::Unsupported { ch, index } => Err(PyError::value_error(format!(
-            "unsupported format character '{}' ({:#x}) at index {index}",
-            ch.to_char_lossy(),
-            ch.to_u32(),
-        ))),
+        CFormatType::Unsupported { ch, index } => {
+            Err(unsupported_format_error(ch.to_u32(), *index, false))
+        }
     }
 }
 
@@ -1223,6 +1237,42 @@ mod tests {
             error,
             PyErrorKind::ValueError,
             "unsupported format character 'z' (0x7a) at index 1",
+        );
+
+        let error = unsafe {
+            str_format_percent(w_str_new("%\u{e9}"), w_tuple_new(vec![w_int_new(1)])).unwrap_err()
+        };
+        assert_error(
+            error,
+            PyErrorKind::ValueError,
+            "unsupported format character '?' (0xe9) at index 1",
+        );
+        let error = unsafe {
+            str_format_percent(w_str_new("%\u{7f}"), w_tuple_new(vec![w_int_new(1)])).unwrap_err()
+        };
+        assert_error(
+            error,
+            PyErrorKind::ValueError,
+            "unsupported format character '?' (0x7f) at index 1",
+        );
+
+        let error = unsafe {
+            bytes_format_percent(w_bytes_from_bytes(b"%\x80"), w_tuple_new(vec![w_int_new(1)]))
+                .unwrap_err()
+        };
+        assert_error(
+            error,
+            PyErrorKind::OverflowError,
+            "character argument not in range(0x110000)",
+        );
+        let error = unsafe {
+            bytes_format_percent(w_bytes_from_bytes(b"%q"), w_tuple_new(vec![w_int_new(1)]))
+                .unwrap_err()
+        };
+        assert_error(
+            error,
+            PyErrorKind::ValueError,
+            "unsupported format character 'q' (0x71) at index 1",
         );
 
         let error = unsafe {
