@@ -19788,7 +19788,9 @@ pub(crate) fn try_walker_specialize_build_string<Sym: WalkSym>(
         return Ok(None);
     }
 
-    let boxed_result = pyre_interpreter::runtime_ops::build_string_from_refs(&concretes);
+    let Ok(boxed_result) = pyre_interpreter::runtime_ops::build_string_from_refs(&concretes) else {
+        return Ok(None);
+    };
     if boxed_result.is_null()
         || !unsafe { pyre_object::is_exact_type(boxed_result, &pyre_object::STR_TYPE) }
     {
@@ -19804,7 +19806,12 @@ pub(crate) fn try_walker_specialize_build_string<Sym: WalkSym>(
         let prefix = if i + 1 == fragments.len() {
             boxed_result
         } else {
-            pyre_interpreter::runtime_ops::build_string_from_refs(&concretes[..=i])
+            let Ok(prefix) =
+                pyre_interpreter::runtime_ops::build_string_from_refs(&concretes[..=i])
+            else {
+                return Ok(None);
+            };
+            prefix
         };
         acc = emit_walker_descr_add(ctx, op_pc, acc, fragments[i], prefix)?;
     }

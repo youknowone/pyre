@@ -706,51 +706,34 @@ pub fn build_set_from_refs(items: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 }
 
 /// BUILD_STRING residual (`bh_build_string_from_array`): concatenates `parts`
-/// (already-stringified f-string fragments, in bottom-to-top order) into a
-/// single `str` via `Utf8StringBuilder`.  The interpreter opcode uses the
-/// builder directly (`pyopcode.py BUILD_STRING`).  Each fragment is a `str`
-/// by construction (FORMAT_SIMPLE / FORMAT_WITH_SPEC / CONVERT_VALUE ran
-/// first); the `bool` / `int` / `None` / `<object>` arms are defensive
-/// rendering, so this never runs user code and is infallible.
-pub fn build_string_from_refs(parts: &[PyObjectRef]) -> PyObjectRef {
+/// (f-string fragments, in bottom-to-top / source order) into a single `str`
+/// via `Utf8StringBuilder`.  `pyopcode.py BUILD_STRING` reads each fragment
+/// through `space.utf8_len_w`.  A non-`str` (exact `str` or a `str` subclass,
+/// the `isinstance_str_w` check `expect_str` uses) raises
+/// `TypeError("sequence item {i}: expected str instance, {typename} found")`
+/// at the first such fragment; `i` is its 0-based position in `parts`.  The
+/// `str` arm is the `Utf8StringBuilder.append_utf8` + `newutf8` path and runs
+/// no user code.
+pub fn build_string_from_refs(parts: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mut builder = pyre_object::rutf8::Utf8StringBuilder::new(0);
-    for part in parts {
+    for (i, part) in parts.iter().enumerate() {
         unsafe {
-            if pyre_object::is_str(*part) {
-                builder.append_utf8(
-                    pyre_object::unicodeobject::w_str_storage(*part),
-                    pyre_object::unicodeobject::w_str_len(*part) as i64,
-                );
-            } else {
-                // Defensive rendering for a residual that saw a non-str
-                // fragment; `BUILD_STRING` itself only appends `utf8_len_w`.
-                let rendered = if pyre_object::is_bool(*part) {
-                    if pyre_object::w_bool_get_value(*part) {
-                        "True".to_string()
-                    } else {
-                        "False".to_string()
-                    }
-                } else if pyre_object::is_int(*part) {
-                    pyre_object::w_int_get_value(*part).to_string()
-                } else if pyre_object::is_none(*part) {
-                    "None".to_string()
-                } else {
-                    "<object>".to_string()
-                };
-                let tmp = pyre_object::w_str_from_wtf8_managed(
-                    rustpython_wtf8::Wtf8Buf::from_string(rendered),
-                );
-                builder.append_utf8(
-                    pyre_object::unicodeobject::w_str_storage(tmp),
-                    pyre_object::unicodeobject::w_str_len(tmp) as i64,
-                );
+            if !crate::baseobjspace::isinstance_str_w(*part) {
+                return Err(crate::PyError::type_error(format!(
+                    "sequence item {i}: expected str instance, {} found",
+                    crate::baseobjspace::object_functionstr_type_name(*part)
+                )));
             }
+            builder.append_utf8(
+                pyre_object::unicodeobject::w_str_storage(*part),
+                pyre_object::unicodeobject::w_str_len(*part) as i64,
+            );
         }
     }
-    pyre_object::unicodeobject::w_str_from_storage_and_length(
+    Ok(pyre_object::unicodeobject::w_str_from_storage_and_length(
         builder.build(),
         builder.getlength() as usize,
-    )
+    ))
 }
 
 /// CONVERT_VALUE conversion code, shared by the interpreter and the JIT
