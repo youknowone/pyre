@@ -7337,123 +7337,6 @@ pub(crate) fn try_walker_specialize_set_function_attribute<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// W_LongObject (bigint) COMPARE_OP specialization.  Both operands are `int`-typed but
-/// bigint-stored: guard each against `LONG_TYPE`, read each `value` payload,
-/// then `CallPure_I` the pure
-/// `jit_bigint_cmp` (sign of `a <=> b` in {-1,0,1}; a comparison neither
-/// allocates nor raises, so `EF_ELIDABLE_CANNOT_RAISE` and NO trailing guard)
-/// and turn the sign into the requested truth with `int_<cmp>(sign, 0)` before
-/// boxing to a `W_Bool` (same dead-box elision as the int path).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn try_walker_specialize_compare_op_long<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    op_tag: i64,
-    r_args: &[OpRef],
-    allboxes: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<()>, DispatchError> {
-    if !ctx.is_authoritative_executor || r_args.len() != 2 || dst_bank != 'r' {
-        return Ok(None);
-    }
-    let Some(cmp_op) = pyre_interpreter::runtime_ops::compare_op_from_tag(op_tag) else {
-        return Ok(None);
-    };
-    use pyre_interpreter::bytecode::ComparisonOperator;
-    // `a <cmp> b` ⟺ `sign(a <=> b) <cmp> 0`.
-    let cmp = match cmp_op {
-        ComparisonOperator::Less => OpCode::IntLt,
-        ComparisonOperator::LessOrEqual => OpCode::IntLe,
-        ComparisonOperator::Greater => OpCode::IntGt,
-        ComparisonOperator::GreaterOrEqual => OpCode::IntGe,
-        ComparisonOperator::Equal => OpCode::IntEq,
-        ComparisonOperator::NotEqual => OpCode::IntNe,
-    };
-    let lhs = r_args[0];
-    let rhs = r_args[1];
-    let (Some(lhs_obj), Some(rhs_obj)) = (
-        walker_concrete_ref_object(ctx, lhs),
-        walker_concrete_ref_object(ctx, rhs),
-    ) else {
-        return Ok(None);
-    };
-    if !unsafe { pyre_object::is_long(lhs_obj) && pyre_object::is_long(rhs_obj) } {
-        return Ok(None);
-    }
-    let (Some(lhs_class), Some(rhs_class)) = (unsafe {
-        (
-            walker_exact_builtin_class(lhs_obj),
-            walker_exact_builtin_class(rhs_obj),
-        )
-    }) else {
-        return Ok(None);
-    };
-    // Authentic boxed W_Bool via the same execute path the int leg uses; also
-    // advances the concrete VM state the downstream ops read.
-    let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
-        return Ok(None);
-    };
-    let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
-    walker_guard_class(ctx, op_pc, lhs, long_type_addr)?;
-    walker_guard_class(ctx, op_pc, rhs, long_type_addr)?;
-    walker_guard_exact_w_class(ctx, op_pc, lhs, lhs_class)?;
-    walker_guard_exact_w_class(ctx, op_pc, rhs, rhs_class)?;
-    // `_make_descr_cmp` (longobject.py) compares `self.num` against
-    // `w_other.num`, so the two payload reads are trace ops rather than work
-    // hidden inside the callee. Spelling them out is also what keeps a
-    // `W_LongObject` this same trace built from having to escape into the
-    // comparison: the read hits the heap cache entry `emit_box_long_inline`
-    // filed and the box stays virtual.
-    let lhs_payload = unsafe { long_payload_of(lhs_obj) };
-    let rhs_payload = unsafe { long_payload_of(rhs_obj) };
-    let lhs_pl = walker_read_long_payload(ctx, lhs, lhs_payload);
-    let rhs_pl = walker_read_long_payload(ctx, rhs, rhs_payload);
-    // Pure `rbigint` comparison → sign in {-1,0,1}. Dead after the `int_<cmp>`
-    // below and never spans a guard, so it needs no blackhole reconstruction.
-    let cmp_fn = pyre_object::longobject::jit_bigint_cmp as *const ();
-    let sign_concrete = pyre_object::longobject::jit_bigint_cmp(lhs_payload, rhs_payload);
-    let concrete_args = [
-        majit_ir::Value::Int(cmp_fn as usize as i64),
-        majit_ir::Value::Ref(majit_ir::GcRef(lhs_payload as usize)),
-        majit_ir::Value::Ref(majit_ir::GcRef(rhs_payload as usize)),
-    ];
-    let sign = ctx.trace_ctx.call_typed_with_effect_pure(
-        OpCode::CallI,
-        cmp_fn,
-        &[lhs_pl, rhs_pl],
-        &[majit_ir::Type::Ref, majit_ir::Type::Ref],
-        majit_ir::Type::Int,
-        majit_metainterp::ELIDABLE_CANNOT_RAISE_EFFECT_INFO,
-        &concrete_args,
-        majit_ir::Value::Int(sign_concrete),
-    );
-    ctx.trace_ctx
-        .set_opref_concrete(sign, majit_ir::Value::Int(sign_concrete));
-    let zero = ctx.trace_ctx.const_int(0);
-    let truth = ctx.trace_ctx.record_op(cmp, &[sign, zero]);
-    let folded = majit_metainterp::eval_binop_i(cmp, sign_concrete, 0);
-    ctx.trace_ctx
-        .set_opref_concrete(truth, majit_ir::Value::Int(folded));
-    // `space.newbool` on the truth: its guard plus the prebuilt singleton.  The
-    // residual box is the no-snapshot fallback only.
-    let boxed = match walker_newbool_guarded(ctx, op_pc, truth, folded != 0, dst_bank)? {
-        Some(boxed) => boxed,
-        None => {
-            let boxed =
-                crate::helpers::emit_trace_bool_value_from_truth(ctx.trace_ctx, truth, false);
-            ctx.trace_ctx.set_opref_concrete(
-                boxed,
-                majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
-            );
-            boxed
-        }
-    };
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
-    Ok(Some(()))
-}
-
 /// Two-sided bounds guard `0 <= raw_index < len` for a direct element access.
 ///
 /// The trace is recorded from a non-negative observed index, but a later
@@ -10350,7 +10233,7 @@ fn try_walker_fold_small_tuple_eq<Sym: WalkSym>(
 
 /// `COMPARE_OP` on two exact builtin machine ints (`int`, `bool`): descend
 /// `compare_value_from_tag` → `compare` → `compare_slot` → `int_lt` and its
-/// siblings.  The hand-emitted int compare fold is retired.  See
+/// siblings.  The hand-emitted int and long compare folds are retired.  See
 /// [`try_walker_orthodox_binary_op`] for the operand policy; the body's
 /// override probe is promoted away for such a pair
 /// (`descroperation.rs compare`), and the `bool`-vs-`int` subtype ordering

@@ -2851,39 +2851,82 @@ pub(crate) fn parents_for_helper_entry<Sym: WalkSym>(
     }
 }
 
+/// A resume section `rebuild_from_resumedata` can turn back into a Python
+/// frame. The codeless slot 0 (and constructor tails) have no `CodeObject`.
+fn jitcode_index_names_python_code(jitcode_index: u32) -> bool {
+    crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)
+        .is_some_and(|pjc| pjc.is_populated() && !pjc.code_ptr.is_null())
+}
+
 pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     call_jit_pc: usize,
 ) -> Result<InlineParentFrame, InlineCallerFrameDecline> {
-    // `w_code == 0` is a helper already on the framestack. It has no PyCode,
-    // so `ensure_jitcode_index` cannot name its jitcode. `rebuild_from_resumedata`
-    // does not look one up either: it indexes the jitcode `newframe` is already
-    // executing, which this frame's `InlineParentFrame.jitcode_index` holds
-    // (the resume word captured at the helper CALL). A deeper helper with an
-    // empty parent list walks out to that same frame and stops at a real
-    // PyCode, which still takes the lookup below.
-    let held_helper_parent = {
+    // `w_code == 0` is a helper already on the framestack. It has no PyCode.
+    // `rebuild_from_resumedata` does not look one up either: it indexes the
+    // jitcode `MetaInterp.newframe` is already executing, which this frame's
+    // `InlineParentFrame.jitcode_index` holds (the resume word captured at the
+    // helper CALL). `ensure_jitcode_index` on that null code binds the
+    // codeless slot 0, and a bridge walk then enters the helper body at pc 0.
+    // A deeper helper with an empty parent list walks out to that same frame.
+    // A real PyCode still takes the lookup below, unless that lookup is the
+    // codeless slot — a bridge callee's `w_code` is the live wrapper, and the
+    // jitcode `newframe` was given is `InlineCalleeConsts.jitcode_index`.
+    let (held_helper_parent, helper_level, stored_jitcode_index) = {
         let session = ctx.session.borrow();
+        let helper_level = session.last_inline().is_some_and(|frame| frame.w_code == 0);
         let mut held = None;
-        for frame in session.framestack.iter().rev() {
-            if frame.is_portal || frame.w_code != 0 {
-                break;
-            }
-            if let Some(parent) = frame.parents.last() {
-                held = Some(parent.clone());
-                break;
+        let mut stored = None;
+        if helper_level {
+            for frame in session.framestack.iter().rev() {
+                if frame.is_portal {
+                    break;
+                }
+                if let Some(parent) = frame
+                    .parents
+                    .iter()
+                    .rev()
+                    .find(|parent| jitcode_index_names_python_code(parent.jitcode_index))
+                {
+                    held = Some(parent.clone());
+                    stored = Some(parent.jitcode_index);
+                    break;
+                }
+                if frame.w_code != 0 {
+                    break;
+                }
             }
         }
-        held
+        if stored.is_none() {
+            stored = ctx
+                .inline_callee_consts
+                .map(|consts| consts.jitcode_index)
+                .filter(|index| *index >= 0 && jitcode_index_names_python_code(*index as u32))
+                .map(|index| index as u32);
+        }
+        (held, helper_level, stored)
     };
     if let Some(held) = held_helper_parent {
         return Ok(held);
     }
     let caller_code = ctx.session.borrow().last_inline().map(|frame| frame.w_code);
-    let (jitcode_index, pjc) = if let Some(caller_code) = caller_code {
-        let jitcode_index = crate::state::ensure_jitcode_index(caller_code as *const ())
-            .ok_or_else(|| unavail("Unavail::Helper/NoJitcodeIndex"))?
-            as u32;
+    let (jitcode_index, pjc) = if helper_level || caller_code.is_some() {
+        let looked_up = caller_code.and_then(|caller_code| {
+            if caller_code == 0 {
+                return None;
+            }
+            let index = crate::state::ensure_jitcode_index(caller_code as *const ())? as u32;
+            jitcode_index_names_python_code(index).then_some(index)
+        });
+        // Helper level and a bridge callee both already know the jitcode
+        // `newframe` is executing. The `w_code` lookup answers the codeless
+        // slot there; keep the stored index.
+        let jitcode_index = if helper_level {
+            stored_jitcode_index.or(looked_up)
+        } else {
+            looked_up.or(stored_jitcode_index)
+        }
+        .ok_or_else(|| unavail("Unavail::Helper/NoJitcodeIndex"))?;
         let pjc = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)
             .ok_or_else(|| unavail("Unavail::Helper/NoPjc"))?;
         (jitcode_index, pjc)

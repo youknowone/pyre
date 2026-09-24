@@ -5999,9 +5999,10 @@ pub(crate) fn residual_call_specialized_plain_numeric_binop(
     else {
         return None;
     };
-    // All six `ComparisonOperator`s are admitted.  The hand int, float and
-    // mixed long/int compare folds are retired; `compare_op_descent` records the
-    // exact-builtin sites.  `CHECK_EXC_MATCH` reuses the `CompareOp`
+    // All six `ComparisonOperator`s are admitted.  The hand int, long,
+    // mixed long/int and float compare folds are retired;
+    // `compare_op_descent` records the exact-builtin sites.
+    // `CHECK_EXC_MATCH` reuses the `CompareOp`
     // shape with `ISINSTANCE_OP` (tag 10), which is not one of the six and so
     // stays excluded.
     if helper == Some(majit_ir::RuntimeHelperKind::CompareOp) {
@@ -10033,22 +10034,18 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                     })? {
                         return Ok((outcome, op.next_pc));
                     }
-                    // Two-bigint operands keep bigint comparison. Exact strings
-                    // follow: `_compare` (unicodeobject.py) answers from one
-                    // WTF-8 ordering. Short exact tuples of ints or None are
-                    // folded by `try_walker_fold_small_tuple_eq`.
-                    match spec_gate(SpecFold::CompareOpLong, || {
-                        try_walker_specialize_compare_op_long(
+                    // Exact int and long compares are recorded by the descent
+                    // above (`compare_value_from_tag` → `compare_slot`).
+                    // Two exact strings: `_compare` (unicodeobject.py) answers
+                    // from one WTF-8 ordering.
+                    // Short exact tuples of ints or None are folded by
+                    // `try_walker_fold_small_tuple_eq`. Longer tuples and
+                    // subclasses still reach this residual.
+                    spec_gate(SpecFold::CompareOpStr, || {
+                        try_walker_specialize_compare_op_str(
                             ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
                         )
-                    })? {
-                        Some(()) => Some(()),
-                        None => spec_gate(SpecFold::CompareOpStr, || {
-                            try_walker_specialize_compare_op_str(
-                                ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
-                            )
-                        })?,
-                    }
+                    })?
                 };
                 if specialized.is_some() {
                     return Ok((DispatchOutcome::Continue, op.next_pc));
