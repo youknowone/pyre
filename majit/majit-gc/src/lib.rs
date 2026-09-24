@@ -4335,20 +4335,35 @@ thread_local! {
     static BH_PROBE_PHASE: std::cell::Cell<&'static str> = const { std::cell::Cell::new("interp") };
 }
 
-pub struct BhProbePhase(&'static str);
+/// Diagnostic phase for `MAJIT_GC_BH_PROBE`.
+///
+/// `blackhole.py` `BlackholeInterpreter.run` has no phase label. The label is
+/// read by `note_bh_object` and `bh_probe_scan`, and both return before that
+/// read unless `bh_probe_enabled` is set. `None` means this guard did not
+/// touch `BH_PROBE_PHASE`, so `Drop` must not either.
+pub struct BhProbePhase(Option<&'static str>);
 
 impl BhProbePhase {
     pub fn enter(name: &'static str) -> Self {
+        // `bh_probe_enabled` is a `OnceLock`, same shape as
+        // `bridge_diag_enabled`. The disabled path stops here: no
+        // thread-local resolve on `BlackholeInterpreter::run`.
+        if !bh_probe_enabled() {
+            return BhProbePhase(None);
+        }
         let prev = BH_PROBE_PHASE
             .try_with(|c| c.replace(name))
             .unwrap_or("interp");
-        BhProbePhase(prev)
+        BhProbePhase(Some(prev))
     }
 }
 
 impl Drop for BhProbePhase {
     fn drop(&mut self) {
-        let _ = BH_PROBE_PHASE.try_with(|c| c.set(self.0));
+        let Some(prev) = self.0 else {
+            return;
+        };
+        let _ = BH_PROBE_PHASE.try_with(|c| c.set(prev));
     }
 }
 
