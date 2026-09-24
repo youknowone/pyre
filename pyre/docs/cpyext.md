@@ -131,16 +131,13 @@ reports what it picked.
 
 ## What is implemented
 
-The macOS/Linux slice is end-to-end: `pyrex/tests/cpyext_smoke.rs` imports a
-single-phase extension, `pyrex/tests/cpyext_methods.rs` a multi-phase one and
-`pyrex/tests/cpyext_types.rs` one defining types, all compiled from C against
-the header below. `pyrex/tests/cpyext_dict_subclass.rs`,
-`pyrex/tests/cpyext_pystate.rs`, `pyrex/tests/cpyext_object_families.rs`,
-`pyrex/tests/cpyext_str.rs`, `pyrex/tests/cpyext_exceptions.rs`,
-`pyrex/tests/cpyext_warnings.rs`, `pyrex/tests/cpyext_conversions.rs`,
-`pyrex/tests/cpyext_type_statics.rs`, `pyrex/tests/cpyext_runtime.rs`,
-`pyrex/tests/cpyext_small.rs`, `pyrex/tests/cpyext_locks.rs` and
-`pyrex/tests/cpyext_writer.rs` take their expectations from CPython 3.14.6
+The macOS/Linux slice is end-to-end: `extra_tests/cpyext/test_smoke_*.py`
+imports a single-phase extension, `extra_tests/cpyext/test_methods.py` a
+multi-phase one and `extra_tests/cpyext/test_types_*.py` one defining types,
+all compiled from C (`pyrex/tests/fixtures/*.c`) against the header below by
+`extra_tests/cpyext/run.py`. The dict-subclass, pystate, object-family, str,
+exceptions, warnings, conversions, type-statics, runtime, small, locks and
+writer scripts in that directory take their expectations from CPython 3.14.6
 running the same script against the same fixture. Every fixture is compiled
 with `-Werror`: it is written against these headers and nothing else, so a
 warning in one is either the fixture calling an entry point wrongly or the
