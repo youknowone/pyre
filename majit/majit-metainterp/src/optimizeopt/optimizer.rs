@@ -595,111 +595,6 @@ pub(crate) fn lower_typed_constants_to_const_pool(
     pool
 }
 
-/// The runtime OpRefs `ops` defines, as a set.
-///
-/// A set rather than a `BitSet` keyed by the raw. Pyre's OpRefs come from a
-/// monotonic counter and a bridge mints its own at `[parent_high_water..)`, so
-/// a bitmap indexed by the bare raw is sized by everything the trace family has
-/// compiled so far — one more of the positional side tables `optimizer.py` does
-/// not have, since it forwards on the box object (`op.set_forwarded(newop)`)
-/// and keeps no table at all. The membership tests below run once per constant
-/// and once per considered op, both bounded by the trace, so hashing is the
-/// cheaper half of the trade.
-fn live_runtime_positions<'a>(ops: impl IntoIterator<Item = &'a Op>) -> rustc_hash::FxHashSet<u32> {
-    let mut live_positions = rustc_hash::FxHashSet::default();
-    for op in ops {
-        let pos = op.pos().get();
-        if pos.is_none() || pos.is_constant() {
-            continue;
-        }
-        live_positions.insert(pos.raw());
-    }
-    live_positions
-}
-
-pub(crate) fn sanitize_backend_constants_for_ops<'a>(
-    ops: impl IntoIterator<Item = &'a Op>,
-    constants: &mut majit_ir::ConstMap<majit_ir::Value>,
-) {
-    let live_positions = live_runtime_positions(ops);
-    constants.retain(|idx, _| !live_positions.contains(idx));
-}
-
-/// Export newly-discovered constants from `OptContext` into the
-/// optimizer's `constants: HashMap<u32, Value>` value pool. The
-/// backend boundary lowers the typed `Value` map back to its raw
-/// `i64` shape via `Value::to_const().as_raw_i64()` when the
-/// `set_constants` call is made.
-///
-/// history.py/261/307 box.type parity: `ConstInt/ConstFloat/ConstPtr`
-/// each pin `.type` on the value object itself. Pyre mirrors that by
-/// keying the optimizer-level pool with `Value` directly, so type
-/// information rides alongside the bits without any external
-/// `constant_types` side table.
-pub(crate) fn merge_backend_constants_from_ctx(
-    ctx: &OptContext,
-    constants: &mut majit_ir::ConstMap<majit_ir::Value>,
-) {
-    let live_positions = live_runtime_positions(ctx.new_operations.iter().map(|rc| rc.as_ref()));
-
-    // Iterate every bound ResOp across the canonical `_forwarded` hosts
-    // (`new_operations` ∪ `phase1_emit_ops` ∪ `resop_refs`). The
-    // forwarded-write's bound-precondition forbids a forwarded write to an
-    // unbound box, so every position carrying `Forwarded::Const` has a bound
-    // producer `Op` reachable through one of these stores. Body-namespace
-    // producers are never `InputArg`, so the `b.is_inputarg()` skip
-    // (make_constant excludes InputArg positions) is automatic.
-    // `entry_or_insert_with` dedups positions appearing in more than one
-    // store.
-    let mut consider = |op: &majit_ir::OpRc| {
-        let pos = op.pos().get();
-        if pos.is_none() || pos.is_constant() {
-            return;
-        }
-        let idx = pos.raw();
-        let Some(value) = op.forwarded().borrow().const_value() else {
-            return;
-        };
-        // A ref constant is never resolved from this backend pool: a referenced
-        // (live) ref operand is an inline ConstPtr that `remove_constptr`
-        // (`majit-gc/src/rewrite.rs`) rewrites to `LoadFromGcTable`, loading
-        // from the
-        // GC-traced gc_table. Only dead (non-result) const-folded positions
-        // reach here, and the recorder invariant (`recorder.rs`'s
-        // `box_for_operand`) forbids a
-        // `RefOp(pos)` operand from referencing a dead position, so a ref entry
-        // is vestigial. Dropping it keeps the pool — and the `CompiledTrace`
-        // constants cloned from it — free of raw `GcRef`, which has no GC root
-        // walker (the gc_table is the sole GC-traced ref store).
-        if matches!(value, majit_ir::Value::Ref(_)) {
-            return;
-        }
-        if live_positions.contains(&idx) {
-            return;
-        }
-        let key = OptContext::op_ref_for_value(idx, &value).raw();
-        constants.entry(key).or_insert_with(|| value);
-    };
-    for op in &ctx.new_operations {
-        consider(op);
-    }
-    for op in &ctx.phase1_emit_ops {
-        consider(op);
-    }
-    for op in ctx.resop_refs.values() {
-        consider(op);
-    }
-    // No raw `GcRef` survives in the backend constant pool: the only other
-    // entries are pre-existing ones the caller threaded in, which must already
-    // hold no ref for the same reason.
-    debug_assert!(
-        constants
-            .values()
-            .all(|v| !matches!(v, majit_ir::Value::Ref(_))),
-        "backend constant pool must not retain a raw GcRef (use the gc_table)"
-    );
-}
-
 /// RPython unroll.py: import_state virtual info for Phase 2.
 /// Tells OptVirtualize that an inputarg is a virtual object.
 #[derive(Clone, Debug)]
@@ -3123,7 +3018,6 @@ impl Optimizer {
         ctx.snapshot_frame_pcs = std::mem::take(&mut self.snapshot_frame_pcs);
         ctx.byte_bridge_resume = self.byte_bridge_resume.take();
 
-        sanitize_backend_constants_for_ops(ops.iter().map(|op| &**op), constants);
         // Pre-populate known constants so passes can see them.
         //
         // history.py/261/307: `ConstInt/ConstFloat/ConstPtr` pin
@@ -4195,12 +4089,10 @@ impl Optimizer {
             }
         }
 
-        // Export newly-discovered constants back to the caller's map.
-        merge_backend_constants_from_ctx(&ctx, constants);
-        sanitize_backend_constants_for_ops(
-            ctx.new_operations.iter().map(|rc| rc.as_ref()),
-            constants,
-        );
+        // `optimizer.py` `make_constant` forwards the box
+        // (`box.set_forwarded(constbox)`). Later uses read that through
+        // `get_box_replacement`; the backend reads `ConstInt.getint()` off
+        // the op. There is no position→value pool to export.
 
         // Preserve final context for jump_to_existing_trace.
         let mut ops = ctx.take_new_operations();
@@ -7127,8 +7019,11 @@ mod tests {
         assert_eq!(result[1].pos().get(), OpRef::int_op(6));
         assert_eq!(result[2].pos().get(), OpRef::int_op(7));
         assert_eq!(result[2].arg(0).to_opref(), OpRef::int_op(5));
+        // Folded values stay on the box (`make_constant` /
+        // `set_forwarded`). The position map is not filled.
+        assert_eq!(constants.get(&1), Some(&majit_ir::Value::Int(27)));
         assert_eq!(constants.get(&5), None);
-        assert_eq!(constants.get(&8), Some(&majit_ir::Value::Int(123)));
+        assert_eq!(constants.get(&8), None);
     }
 
     #[test]
@@ -7178,7 +7073,11 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].pos().get(), OpRef::int_op(3));
         assert_eq!(result[0].opcode, OpCode::IntGt);
-        assert_eq!(constants.get(&3), None);
+        // Caller-supplied entries stay. `make_constant` does not rewrite
+        // the map, and a live result position is not stripped out of it.
+        assert_eq!(constants.get(&0), Some(&majit_ir::Value::Int(40)));
+        assert_eq!(constants.get(&1), Some(&majit_ir::Value::Int(5)));
+        assert_eq!(constants.get(&3), Some(&majit_ir::Value::Int(1)));
     }
 
     #[test]

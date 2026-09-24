@@ -1051,23 +1051,6 @@ impl UnrollOptimizer {
                 &mut self.quasi_immutable_deps,
                 &opt_p1.quasi_immutable_deps,
             );
-            // RPython parity: Phase 1 optimizer may discover new constants
-            // via make_constant (e.g., constant-folded heap reads, guard
-            // class pointers). These live on the operand's forwarded chain
-            // (and in `ctx.const_pool` for const-namespace OpRefs) but
-            // not in `consts_p1` (which was only seeded from the input
-            // constants). Merge them back so
-            // build_short_preamble_from_exported_boxes can capture all
-            // constants referenced by short preamble ops.
-            if let Some(ref final_ctx) = opt_p1.final_ctx {
-                // history.py:220 box.type parity: every `Value` carries its
-                // Const class identity intrinsically; no companion type map
-                // needs threading alongside.
-                crate::optimizeopt::optimizer::merge_backend_constants_from_ctx(
-                    final_ctx,
-                    &mut consts_p1,
-                );
-            }
             let p1_ni = opt_p1.final_num_inputs();
 
             match opt_p1.exported_loop_state.take() {
@@ -1520,17 +1503,6 @@ impl UnrollOptimizer {
         // disjoint Phase 2 inputarg OpRefs via the inputarg_base parameter.
         // Phase 2 inputarg OpRefs at [phase2_inputarg_base..+body_num_inputs)
         // flow directly into the assembly without translation.
-        // Phase 2 may discover new constants via make_constant (e.g., guard
-        // class pointers from collect_use_box_guards).
-        // Merge back into consts_p2 so the backend can resolve them.
-        if let Some(ref final_ctx) = opt_p2.final_ctx {
-            // history.py:220 box.type parity: every `Value` carries its
-            // Const class identity intrinsically.
-            crate::optimizeopt::optimizer::merge_backend_constants_from_ctx(
-                final_ctx,
-                &mut consts_p2,
-            );
-        }
         let body_terminal_op = opt_p2.terminal_op.clone();
         let p2_ni = opt_p2.final_num_inputs();
         self.all_descrs = std::mem::take(&mut opt_p2.all_descrs);
@@ -2304,10 +2276,6 @@ impl UnrollOptimizer {
                 seen.insert(op.pos().get().raw())
             });
         }
-        crate::optimizeopt::optimizer::sanitize_backend_constants_for_ops(
-            combined.iter().map(|op| &**op),
-            &mut consts_p2,
-        );
         if crate::debug::have_debug_prints() {
             let _s = crate::debug::scope("jit-log-opt-loop");
             crate::debug::debug_print("--- peeled trace (assembled) ---");
@@ -4098,13 +4066,11 @@ impl OptUnroll {
                     }
                     drop(publication);
                     // history.py/268/314 — `Const{Int,Float,Ptr}.value`
-                    // rides inline on the OpRef. Production no longer seeds
-                    // `ctx.const_pool` (`merge_backend_constants_from_ctx`
-                    // asserts the pool is empty at export), so the
-                    // cross-compile `loop_constants` snapshot is no longer
-                    // built: short-preamble ops embed the Const value
-                    // directly in `op.args`, mirroring RPython's
-                    // `shortpreamble.py` which has no parallel side table.
+                    // rides inline on the OpRef. `make_constant` forwards
+                    // the box (`set_forwarded`); short-preamble ops embed
+                    // that Const in `op.args`. `shortpreamble.py` has no
+                    // position→value pool, so no `loop_constants` snapshot
+                    // is built.
                     //
                     // Replay can abort mid-way and leave the builder partial,
                     // so publishing it would persist a short preamble later
@@ -4204,22 +4170,17 @@ impl OptUnroll {
         ctx: &mut OptContext,
     ) -> Vec<OpRef> {
         // history.py/268/314 — `Const{Int,Float,Ptr}.value` is inline on
-        // the OpRef. All production short-preamble capture sites early-return
-        // on Const OpRefs (`shortpreamble.rs`), so
-        // `short_preamble.constants` is empty along every production export
-        // and the bridge has no const-pool entries to replay through
-        // `ctx.const_pool`. The export-side invariant at
-        // `optimizer::merge_backend_constants_from_ctx` asserts the same
-        // pool-empty contract; mirror it at the producer entry so any
-        // re-introduction of const-pool seeding fails loudly here
-        // rather than silently leaking into a backend that no longer
-        // consumes `ctx.const_pool`.
+        // the OpRef. Production short-preamble capture returns early on
+        // Const OpRefs (`shortpreamble.rs`), so `short_preamble.constants`
+        // stays empty. `make_constant` / `set_forwarded` is the export;
+        // a non-empty list here is a producer that would not reach the
+        // backend.
         debug_assert!(
             short_preamble.constants.is_empty(),
             "inline_short_preamble: short_preamble.constants must be empty in production — \
              history.py:227/268/314 inline-Const is the single source of truth; \
-             a non-empty entry indicates a stale legacy producer that would never reach \
-             the backend (merge_backend_constants_from_ctx no longer exports ctx.const_pool)"
+             a non-empty entry indicates a stale legacy producer. \
+             make_constant forwards via set_forwarded and does not fill a pool"
         );
 
         let mut mapping: indexmap::IndexMap<OpRef, OpRef> = indexmap::IndexMap::new();
