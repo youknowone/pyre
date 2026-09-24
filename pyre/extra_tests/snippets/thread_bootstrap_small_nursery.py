@@ -26,7 +26,16 @@ SCRIPT = textwrap.dedent(
         for i in range(256):
             TestFlag(i)
 
+    def spawn():
+        # Several starters contend for the bootstrap lock at once.
+        inner = [threading.Thread(target=cycle) for _ in range(4)]
+        for t in inner:
+            t.start()
+        for t in inner:
+            t.join()
+
     threads = [threading.Thread(target=cycle) for _ in range(8)]
+    threads += [threading.Thread(target=spawn) for _ in range(4)]
     for t in threads:
         t.start()
     for t in threads:

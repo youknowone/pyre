@@ -1999,7 +1999,6 @@ fn spawn_thread(
 
     // `Bootstrapper.acquire` then stores `w_callable` and `args` on the
     // global bootstrapper. The tuple is the traced stand-in for those fields.
-    let boot_gen = acquire_bootstrap_lock();
     let roots = pyre_object::gc_roots::push_roots();
     let callable_i = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(callable);
@@ -2009,6 +2008,8 @@ fn spawn_thread(
     let _ = roots.pin_root(kwargs.unwrap_or_else(w_none));
     let handle_i = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(handle.unwrap_or_else(w_none));
+    // A contended wait releases the GIL, so every input is rooted before it.
+    let boot_gen = acquire_bootstrap_lock();
     let mut arg_items = Vec::with_capacity(nargs);
     for i in 0..nargs {
         arg_items.push(roots.get(args_base + i));
