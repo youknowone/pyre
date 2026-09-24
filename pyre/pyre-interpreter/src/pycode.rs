@@ -671,8 +671,7 @@ pub struct PyCode {
     /// interns every name into the array before the code object is returned.
     /// An unusable `code_ptr` holds an empty array, so a name index is covered
     /// exactly when it is below `arraylen_gc`. Items are `intern_str_value`
-    /// results (`malloc_typed`-immortal). The array object itself is a GC
-    /// block, so `eval::walk_raw_code_roots` traces the pointer.
+    /// results (`malloc_typed`-immortal).
     pub co_names_w: *mut pyre_object::FixedObjectArray,
     /// `pycode.py self.co_qualname = qualname` realized as one shared
     /// wrapped object.
@@ -1135,15 +1134,37 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
     w_code_new_owned(code_ptr, hidden_applevel, 0)
 }
 
-/// `Ptr(GcArray(W_Root))` for `co_names_w` / `co_consts_w`.
+/// `Ptr(GcArray(W_Root))` layout for `co_names_w` / `co_consts_w`.
+///
+/// The block is a code-object side table, not its own collector object:
+/// `eval::walk_raw_code_roots` forwards the items. A GC header here would
+/// make that walk trace the length word as a class pointer.
 fn alloc_co_table(items: &[PyObjectRef]) -> *mut pyre_object::FixedObjectArray {
-    unsafe { pyre_object::object_array::alloc_mro_block_gc(items) }
+    let len = items.len();
+    let payload = pyre_object::object_array::FIXED_ARRAY_ITEMS_OFFSET
+        + len * std::mem::size_of::<PyObjectRef>();
+    let layout = std::alloc::Layout::from_size_align(
+        payload,
+        std::mem::align_of::<pyre_object::FixedObjectArray>(),
+    )
+    .expect("co table layout");
+    let mem = unsafe { std::alloc::alloc(layout) };
+    if mem.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    unsafe {
+        let block = mem as *mut pyre_object::FixedObjectArray;
+        (*block).len = len;
+        if len > 0 {
+            std::ptr::copy_nonoverlapping(items.as_ptr(), (*block).items_mut_ptr(), len);
+        }
+        block
+    }
 }
 
-/// Release a bootstrap `std::alloc` table. A collector-owned block is reclaimed
-/// through the `co_*_w` edge in `eval::walk_raw_code_roots`.
+/// Release the `std::alloc` block from [`alloc_co_table`].
 unsafe fn release_co_table(arr: *mut pyre_object::FixedObjectArray) {
-    if arr.is_null() || pyre_object::gc_hook::try_gc_owns_object(arr as *mut u8) {
+    if arr.is_null() {
         return;
     }
     let len = unsafe { (*arr).len };
