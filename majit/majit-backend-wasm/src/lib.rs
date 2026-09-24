@@ -2303,7 +2303,7 @@ fn lookup_call_assembler_callee_locs(
         let info = clt.frame_info.lock();
         &*info as *const majit_backend::JitFrameInfo as usize
     };
-    let frame_depth = clt.frame_info.lock().jfi_frame_depth as usize;
+    let frame_depth = clt.frame_info.lock().depth() as usize;
     let ll_initial_locs = clt._ll_initial_locs.lock().clone();
     Some(majit_gc::rewrite::CallAssemblerCalleeLocs {
         _ll_initial_locs: ll_initial_locs,
