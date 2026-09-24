@@ -10842,6 +10842,19 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `Wtf8::from_bytes_unchecked(&[u8]) -> &Wtf8`.  `rstr.STR`
+                // stores the UTF-8/WTF-8 bytes in the string itself
+                // (`rutf8` reads that same buffer), so a Wtf8 view of those
+                // bytes is the string.  Alias the result to the byte operand
+                // instead of leaving an unregistered call.  The destination
+                // must be a string value; a non-string use keeps the call.
+                if args.len() == 1 && self.is_wtf8_from_bytes_identity(&reg, &call.dest.ty) {
+                    self.alias_dest_to_arg0(dest_local, args[0].clone(), true);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `<str|String as ToString>::to_string`, `Wtf8::to_wtf8_buf`,
                 // `<str>::to_owned`, and a string-family `Clone::clone` on a
                 // string-family receiver — each an owned copy of a value that
@@ -16351,6 +16364,21 @@ impl<'a> Lowering<'a> {
             return false;
         }
         first_arg_ty.is_some_and(|ty| tyref_is_string_value(ty, self.llbc))
+    }
+
+    /// `Wtf8::from_bytes_unchecked` — the inverse of `Wtf8::as_bytes`.
+    /// The destination is the string; the operand is its byte storage.
+    fn is_wtf8_from_bytes_identity(&self, reg: &RegularCall, dest_ty: &TyRef) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        if fd.item_meta.name_path().rsplit("::").next() != Some("from_bytes_unchecked") {
+            return false;
+        }
+        tyref_is_string_value(dest_ty, self.llbc)
     }
 
     /// `<str as ToString>::to_string` / `<String as ToString>::to_string`
