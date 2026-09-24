@@ -860,7 +860,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         hc!("TCP_KEEPINTVL", TCP_KEEPINTVL, 17);
         // SIO_TCP_SET_ACK_FREQUENCY, the name this option carries on Windows.
         // It is an ioctl code, published as a signed 32-bit word.
-        hc!("TCP_QUICKACK", SIO_TCP_SET_ACK_FREQUENCY, ws::SIO_TCP_SET_ACK_FREQUENCY as i32);
+        hc!(signed "TCP_QUICKACK", SIO_TCP_SET_ACK_FREQUENCY, ws::SIO_TCP_SET_ACK_FREQUENCY as i32);
         // ── IP-level ──
         hc!("IP_TTL", IP_TTL, ws::IP_TTL);
         hc!("IP_TOS", IP_TOS, ws::IP_TOS);
