@@ -8173,6 +8173,18 @@ impl<'a> Lowering<'a> {
         release_declared_vable_array_address(&mut self.graph, base)
     }
 
+    fn var_is_inline_vec(&self, var: &Variable) -> bool {
+        self.graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| {
+                op.result.as_ref() == Some(var)
+                    && matches!(
+                        &op.kind,
+                        OpKind::FieldRead { field, .. } if field.inline_vec
+                    )
+            })
+        })
+    }
+
     fn var_is_declared_vable_array(&self, var: &Variable) -> bool {
         self.graph.blocks.iter().any(|block| {
             block.operations.iter().any(|op| {
@@ -11331,7 +11343,7 @@ impl<'a> Lowering<'a> {
                         matches!(item_ty, ValueType::Ref(_))
                             .then(|| OBJECT_REF_GCARRAY_TYPE_ID.to_string())
                     } else if self.is_vec_index_call(&reg, second_arg_ty.as_ref())
-                        && !self.var_is_declared_vable_array(&args[0])
+                        && self.var_is_inline_vec(&args[0])
                     {
                         // The buffer is headerless. `[u8]` is the length-prefixed
                         // byte block, so a Vec keeps its own identity: element
@@ -11408,20 +11420,22 @@ impl<'a> Lowering<'a> {
                     // `vable_array_vars` and the index would stay a plain
                     // `getarrayitem_gc`.
                     let vable_array = self.release_declared_vable_array_address(&args[0]);
-                    let array_base =
-                        if !vable_array && self.is_vec_index_call(&reg, second_arg_ty.as_ref()) {
-                            let buf = self.retarget_vec_part(
-                                bb_id,
-                                &args[0],
-                                crate::model::VecFieldPart::Buf,
-                            );
-                            if let Some(local) = arg_locals.first().copied().flatten() {
-                                self.local_var[local] = Some(buf.clone());
-                            }
-                            buf
-                        } else {
-                            args[0].clone()
-                        };
+                    let array_base = if !vable_array
+                        && self.is_vec_index_call(&reg, second_arg_ty.as_ref())
+                        && self.var_is_inline_vec(&args[0])
+                    {
+                        let buf = self.retarget_vec_part(
+                            bb_id,
+                            &args[0],
+                            crate::model::VecFieldPart::Buf,
+                        );
+                        if let Some(local) = arg_locals.first().copied().flatten() {
+                            self.local_var[local] = Some(buf.clone());
+                        }
+                        buf
+                    } else {
+                        args[0].clone()
+                    };
                     // A trait-associated `Index::Output` can stay a TypeVar
                     // in this call's destination even though the workspace
                     // gate has resolved the concrete receiver. In that case
@@ -12846,7 +12860,7 @@ impl<'a> Lowering<'a> {
                     // residual `__len` that would carry the array out of the
                     // block. The index check uses the same length.
                     let vable_array = self.release_declared_vable_array_address(&args[0]);
-                    if !vable_array && self.is_vec_len(&reg) {
+                    if !vable_array && self.is_vec_len(&reg) && self.var_is_inline_vec(&args[0]) {
                         let len = self.retarget_vec_part(
                             bb_id,
                             &args[0],
