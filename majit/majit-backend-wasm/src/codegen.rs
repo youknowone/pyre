@@ -2402,15 +2402,6 @@ fn collecting_call_positions(ops: &[Op], include_ca_collects: bool) -> Vec<usize
         .collect()
 }
 
-/// Reload the live Ref locals from their home slots after a collecting call
-/// at op index `at_op`, optionally skipping one value id (`skip_raw` — the
-/// freshly-allocated result, whose home is not yet written). The collection
-/// forwarded the home slots (registered as GC roots), so reloading the
-/// locals makes object movement transparent to the trace. Only values live
-/// across `at_op` ([`HomeLiveness::live_across`]) are reloaded: a value not
-/// yet defined has a null home and its local is written at its def, and a
-/// value never read after `at_op` has no consumer for the reload — the
-/// native regalloc likewise reloads a spilled box only on its next use.
 /// Null-initialise the home slots of `range` that `wanted` selects.
 ///
 /// The slots are adjacent 8-byte words, so a run of them is a memset: one
@@ -2819,212 +2810,117 @@ fn emit_ca_reload_caller(sink: &mut PeepSink<'_, '_>, top_addr: u32) {
     sink.i32_add();
 }
 
-/// x86 `malloc_cond_varsize_frame` for a CA callee JitFrame, then the
-/// `jitframe_allocate` stores + `_call_header_shadowstack` push.
+/// `_call_header_shadowstack` (`assembler.py`). `ca_cfp_local` holds the
+/// object base returned by `CallMallocNurseryVarsizeFrame`.
 ///
-/// rewrite.py `gen_malloc_nursery_varsize_frame` emits
-/// `CALL_MALLOC_NURSERY_VARSIZE_FRAME`; the backend inlines the nursery
-/// bump (`assembler.py malloc_cond_varsize_frame`) and only calls the
-/// collecting helper on overflow. The wasm CA arm used to call
-/// `wasm_jit_ca_alloc_frame` on every recursion; that is the helper
-/// body, not the fast path, and it is what bound `fib_recursive`.
+/// The two stores run in the guest when `jf_top` / `jf_limit` are published.
+/// A full shadow stack, or a build that did not publish those cells, calls
+/// `wasm_jit_ca_push_frame`: the stack then lives in host TLS.
+/// Zero the callee's reserved Ref-home region before the frame is a root.
 ///
-/// Size is loaded from the dispatch entry so a later
-/// `redirect_call_assembler` depth increase is honoured. A total that
-/// meets `large_threshold`, or a full shadow stack, takes the helper.
-fn emit_ca_malloc_cond_varsize_frame(
+/// `build_home_gcmap` marks only the used prefix and the LABEL tail, but a
+/// redirect widens that set up to `home_slots` without reallocating the
+/// frame. Slots past the homes are not in the map. A zero-length region
+/// emits nothing.
+fn emit_clear_reserved_homes(
     sink: &mut PeepSink<'_, '_>,
-    inline: CaInlineParams,
-    residual_type_base: u32,
-    ca_alloc_fn_ptr: i64,
-    ca_target_local: u32,
-    alloc_scratch_local: u32,
-    alloc_size_local: u32,
+    object_local: u32,
+    target_local: u32,
+    scratch: u32,
 ) {
-    use majit_backend::jitframe::{
-        JF_DESCR_OFS, JF_FORCE_DESCR_OFS, JF_FORWARD_OFS, JF_FRAME_INFO_OFS, JF_FRAME_OFS,
-        JF_GCMAP_OFS, JF_GUARD_EXC_OFS, JF_SAVEDATA_OFS, JITFRAME_FIXED_SIZE, SIZEOFSIGNED,
-    };
-    let word = SIZEOFSIGNED as i32;
-    let ss_word = std::mem::size_of::<usize>() as i32;
-    let hdr = GcHeader::SIZE as i32;
-    let min_obj = GcHeader::MIN_NURSERY_OBJ_SIZE as i32;
-
-    // frame_bytes → aligned nursery total into `alloc_size_local`.
-    // `JitFrame::alloc_size(depth)` = FIXED + WORD*(1+depth), and
-    // `depth = frame_bytes / WORD`, so payload = FIXED + WORD + frame_bytes.
-    sink.local_get(ca_target_local);
-    sink.i64_load32_u(memarg(crate::failguard::WASM_CA_TARGET_FRAME_BYTES_OFS, 2));
-    sink.i32_wrap_i64();
-    sink.i32_const((JITFRAME_FIXED_SIZE + SIZEOFSIGNED) as i32);
-    sink.i32_add();
-    sink.i32_const(hdr);
-    sink.i32_add();
-    sink.local_set(alloc_size_local);
-    sink.i32_const(min_obj);
-    sink.local_get(alloc_size_local);
-    sink.i32_gt_u();
-    sink.if_(BlockType::Empty);
-    sink.i32_const(min_obj);
-    sink.local_set(alloc_size_local);
-    sink.end();
-    sink.local_get(alloc_size_local);
-    sink.i32_const(7);
-    sink.i32_add();
-    sink.i32_const(!7i32);
-    sink.i32_and();
-    sink.local_set(alloc_size_local);
-
-    // Overflow if total >= large_threshold, new_free > nursery_top, or
-    // the shadow stack cannot take one more `[is_minor, jf]` pair.
-    sink.i32_const(inline.large_threshold as i32);
-    sink.local_get(alloc_size_local);
-    sink.i32_gt_u();
+    use crate::failguard::{WASM_CA_TARGET_HOME_SLOT_BASE_OFS, WASM_CA_TARGET_HOME_SLOTS_OFS};
+    sink.local_get(target_local);
+    sink.i32_load(mem32(WASM_CA_TARGET_HOME_SLOTS_OFS));
+    sink.i32_const(3);
+    sink.i32_shl();
+    sink.local_tee(scratch);
     sink.i32_eqz();
-    sink.i32_const(inline.nursery_free_addr as i32);
-    sink.i32_load(mem32(0));
-    sink.local_tee(alloc_scratch_local);
-    sink.local_get(alloc_size_local);
-    sink.i32_add();
-    sink.i32_const(inline.nursery_top_addr as i32);
-    sink.i32_load(mem32(0));
-    sink.i32_gt_u();
-    sink.i32_or();
-    sink.i32_const(inline.jf_top_addr as i32);
-    sink.i32_load(mem32(0));
-    sink.i32_const(2 * ss_word);
-    sink.i32_add();
-    sink.i32_const(inline.jf_limit_addr as i32);
-    sink.i32_load(mem32(0));
-    sink.i32_gt_u();
-    sink.i32_or();
-    sink.if_(BlockType::Result(ValType::I64));
-    sink.local_get(ca_target_local);
-    sink.i64_load32_u(memarg(crate::failguard::WASM_CA_TARGET_FRAME_BYTES_OFS, 2));
-    sink.local_get(ca_target_local);
-    sink.i64_load(mem64(crate::failguard::WASM_CA_TARGET_GCMAP_PTR_OFS));
-    sink.i32_const(ca_alloc_fn_ptr as i32);
-    sink.call_indirect(0, residual_type_base + 2);
-    // The helper may have collected. Reload the caller ITEMS into local 0
-    // only when a callee frame was actually pushed so the bump path can
-    // leave local 0 untouched. A zero return is OOM and does not push;
-    // reloading `top[-3 * WORD]` then would read before the outermost
-    // CA entry, before the later memory-error check can run.
-    sink.i32_wrap_i64();
-    sink.local_tee(alloc_scratch_local);
     sink.if_(BlockType::Empty);
-    emit_ca_reload_caller(sink, inline.jf_top_addr);
-    sink.local_set(0);
-    sink.end();
-    sink.local_get(alloc_scratch_local);
-    sink.i64_extend_i32_u();
     sink.else_();
-    // Commit the bump. Result is the payload pointer (`free + HDR`).
-    sink.i32_const(inline.nursery_free_addr as i32);
-    sink.local_get(alloc_scratch_local);
-    sink.local_get(alloc_size_local);
+    sink.local_get(object_local);
+    sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
     sink.i32_add();
-    sink.i32_store(mem32(0));
-    sink.local_get(alloc_scratch_local);
-    sink.i64_const(i64::from(inline.jitframe_tid));
-    sink.i64_store(mem64(0));
-    sink.local_get(alloc_scratch_local);
-    sink.i32_const(hdr);
+    sink.local_get(target_local);
+    sink.i32_load(mem32(WASM_CA_TARGET_HOME_SLOT_BASE_OFS));
     sink.i32_add();
-    sink.local_set(alloc_scratch_local);
-    // Recycled nursery bytes do not start null. `JitFrame::init` and
-    // `wasm_jit_ca_alloc_frame` write a null `jf_frame_info`; PyPy's
-    // `handle_call_assembler` then stores `llfi`. This path has no
-    // frame-info pointer on the dispatch entry, so write null.
-    sink.local_get(alloc_scratch_local);
-    sink.i64_const(0);
-    emit_word_store(sink, JF_FRAME_INFO_OFS as u64);
-    // rewrite.py `gen_malloc_frame`: zero the GCREF fields because of
-    // the unusual malloc pattern.
-    for ofs in [
-        JF_SAVEDATA_OFS,
-        JF_FORCE_DESCR_OFS,
-        JF_DESCR_OFS,
-        JF_GUARD_EXC_OFS,
-        JF_FORWARD_OFS,
-    ] {
-        sink.local_get(alloc_scratch_local);
-        sink.i64_const(0);
-        emit_word_store(sink, ofs as u64);
-    }
-    // rewrite.rs after `gen_malloc_nursery_varsize_frame`: write
-    // `jf_frame` length. Leave `jf_gcmap` null — assembler.py publishes
-    // the map at safepoints once homes are live. The callee entry stores
-    // `home_gcmap_ptr` after its home/input stores.
-    sink.local_get(alloc_scratch_local);
-    sink.local_get(ca_target_local);
-    sink.i64_load32_u(memarg(crate::failguard::WASM_CA_TARGET_FRAME_BYTES_OFS, 2));
-    sink.i32_wrap_i64();
-    sink.i32_const(word.trailing_zeros() as i32);
-    sink.i32_shr_u();
-    sink.i64_extend_i32_u();
-    emit_word_store(sink, JF_FRAME_OFS as u64);
-    // Leave `jf_gcmap` null. The callee key-0 prologue nulls the homes
-    // `build_home_gcmap` marks and then publishes — the same moment
-    // PyPy's assembler writes `_finish_gcmap` / the live gcmap, once
-    // those slots are valid or null. Filling `ca_frame_bytes` here on
-    // every recursive bump is what made
-    // `recursion_past_unroll_bound_from_loop` 4.9x dynasm.
-    sink.local_get(alloc_scratch_local);
-    sink.i64_const(0);
-    emit_word_store(sink, JF_GCMAP_OFS as u64);
-    // assembler.py `_call_header_shadowstack`: [is_minor=1, jf_ptr], then
-    // advance top by 2*WORD.
-    sink.i32_const(inline.jf_top_addr as i32);
-    sink.i32_load(mem32(0));
-    sink.local_tee(alloc_size_local);
-    if ss_word == 4 {
-        sink.i32_const(1);
-        sink.i32_store(mem32(0));
-        sink.local_get(alloc_size_local);
-        sink.local_get(alloc_scratch_local);
-        sink.i32_store(memarg(ss_word as u64, 2));
-    } else {
-        sink.i64_const(1);
-        sink.i64_store(mem64(0));
-        sink.local_get(alloc_size_local);
-        sink.local_get(alloc_scratch_local);
-        sink.i64_extend_i32_u();
-        sink.i64_store(memarg(ss_word as u64, 3));
-    }
-    sink.i32_const(inline.jf_top_addr as i32);
-    sink.local_get(alloc_size_local);
-    sink.i32_const(2 * ss_word);
-    sink.i32_add();
-    sink.i32_store(mem32(0));
-    sink.local_get(alloc_scratch_local);
-    sink.i64_extend_i32_u();
+    sink.i32_const(0);
+    sink.local_get(scratch);
+    sink.memory_fill(0);
     sink.end();
 }
 
-/// Reload the Ref operands which the CA arm resolves only after its collecting
-/// callee-frame allocation. Unlike ordinary post-call reloads, these are live
-/// *at* the CALL_ASSEMBLER op, not after it.
-fn emit_reload_ca_input_refs_from_homes(
+fn emit_ca_push_frame(
     sink: &mut PeepSink<'_, '_>,
-    value_types: &ValueLocals,
-    ref_homes: &RefHomes,
-    ref_values: &RefValues,
-    op: &Op,
-    frame: FrameGeometry,
-) {
-    for arg in op.getarglist() {
-        let arg = arg.to_opref();
-        if !ref_values.contains(arg) {
-            continue;
-        }
-        let Some(home) = ref_homes.home(arg) else {
-            continue;
+    inline: Option<&CaInlineParams>,
+    residual_type_base: Option<u32>,
+    ca_push_fn_ptr: i64,
+    jit_call_idx: Option<u32>,
+    ca_cfp_local: u32,
+    alloc_scratch_local: u32,
+) -> Result<(), BackendError> {
+    if let Some(inline) = inline {
+        let ss_word = std::mem::size_of::<usize>() as i32;
+        sink.i32_const(inline.jf_top_addr as i32);
+        sink.i32_load(mem32(0));
+        sink.local_tee(alloc_scratch_local);
+        sink.i32_const(2 * ss_word);
+        sink.i32_add();
+        sink.i32_const(inline.jf_limit_addr as i32);
+        sink.i32_load(mem32(0));
+        sink.i32_gt_u();
+        sink.if_(BlockType::Empty);
+        let Some(base) = residual_type_base else {
+            return Err(BackendError::Unsupported(
+                "wasm codegen: CALL_ASSEMBLER shadow-stack overflow needs a push helper type"
+                    .into(),
+            ));
         };
-        sink.local_get(0);
-        sink.i64_load(mem64(frame.home_slot_base + home as u64 * SLOT_SIZE));
-        sink.local_set(value_types.local(arg.raw()));
+        sink.local_get(ca_cfp_local);
+        sink.i64_extend_i32_u();
+        sink.i32_const(ca_push_fn_ptr as i32);
+        sink.call_indirect(0, base + 1);
+        sink.drop();
+        sink.else_();
+        sink.local_get(alloc_scratch_local);
+        sink.i64_const(1);
+        emit_word_store(sink, 0);
+        sink.local_get(alloc_scratch_local);
+        sink.local_get(ca_cfp_local);
+        sink.i64_extend_i32_u();
+        emit_word_store(sink, ss_word as u64);
+        sink.i32_const(inline.jf_top_addr as i32);
+        sink.local_get(alloc_scratch_local);
+        sink.i32_const(2 * ss_word);
+        sink.i32_add();
+        sink.i32_store(mem32(0));
+        sink.end();
+        return Ok(());
     }
+    if let Some(base) = residual_type_base {
+        sink.local_get(ca_cfp_local);
+        sink.i64_extend_i32_u();
+        sink.i32_const(ca_push_fn_ptr as i32);
+        sink.call_indirect(0, base + 1);
+        sink.drop();
+        return Ok(());
+    }
+    let jit_call = jit_call_idx.ok_or_else(|| {
+        BackendError::Unsupported(
+            "wasm codegen: CALL_ASSEMBLER needs jit_call to push the frame".into(),
+        )
+    })?;
+    emit_call_area_addr(sink);
+    sink.i64_const(ca_push_fn_ptr);
+    sink.i64_store(mem64(STATIC_CALL_FUNC_OFS));
+    emit_call_area_addr(sink);
+    sink.i64_const(1);
+    sink.i64_store(mem64(STATIC_CALL_NARGS_OFS));
+    emit_call_area_addr(sink);
+    sink.local_get(ca_cfp_local);
+    sink.i64_extend_i32_u();
+    sink.i64_store(mem64(STATIC_CALL_ARGS_OFS));
+    emit_jit_call(sink, jit_call);
+    Ok(())
 }
 
 /// Information about a guard exit collected during pre-scan.
@@ -3991,12 +3887,10 @@ pub struct CaParams {
     /// instead of trapping. `0` (unset) ⇒ no helper, so `compile_bridge` declines
     /// the CA lift before reaching codegen.
     pub deopt_helper_slot: u32,
-    /// `__indirect_function_table` slot (`fn as usize`) of
-    /// `lib.rs::wasm_jit_ca_alloc_frame`, which allocates each callee frame as
-    /// a young nursery GC-managed `JitFrame` (push_jf-rooted, traced by its own
-    /// per-frame gcmap). `call_indirect`ed in-module through the residual
-    /// `(i64,i64)->i64` type when declared, else via the `jit_call` trampoline.
-    pub ca_alloc_fn_ptr: i64,
+    /// `__indirect_function_table` slot of `wasm_jit_ca_push_frame`.
+    /// Used when `jf_top` is not published: the shadow stack is host TLS.
+    /// `(i64)->i64`.
+    pub ca_push_fn_ptr: i64,
     /// `__indirect_function_table` slot of `lib.rs::wasm_jit_ca_pop_frame`,
     /// called on CA-arm exit to pop the callee frame off the jitframe shadow
     /// stack (strict LIFO).
@@ -5060,7 +4954,7 @@ pub fn build_wasm_module(
         if ca.emit_ca {
             // The CA arm's frame helpers (`wasm_jit_ca_reload_frame()`,
             // `wasm_jit_ca_pop_frame(frame_base)`, and
-            // `wasm_jit_ca_alloc_frame(frame_bytes, gcmap_ptr)`) lower through
+            // `wasm_jit_ca_push_frame(frame_ptr)`) lower through
             // this same `(i64×n)->i64` family; make sure arity 2 is declared,
             // which declares the full 0..=2 range including reload's arity 0.
             Some(scanned.map_or(2, |m| m.max(2)))
@@ -5516,7 +5410,7 @@ fn build_function(
     alloc: AllocHelpers,
     wb: &WriteBarrierHelpers,
     nursery: Option<&NurseryAllocParams>,
-    ref_values: &RefValues,
+    _ref_values: &RefValues,
     ref_homes: &RefHomes,
     label_resume: &LabelResumeData,
     cells_base: u32,
@@ -8558,7 +8452,7 @@ fn build_function(
                             .into(),
                     ));
                 };
-                let inlined = matches!((nursery, bump_size, payload), (Some(_), Some(_), Some(_)));
+                let inlined = nursery.is_some();
                 if let (Some(na), Some(bump_size), Some(payload)) = (nursery, bump_size, payload) {
                     sink.i32_const(na.free_addr as i32);
                     sink.i32_load(MemArg {
@@ -8618,6 +8512,114 @@ fn build_function(
                     sink.i32_const(GcHeader::SIZE as i32);
                     sink.i32_add();
                     sink.i64_extend_i32_u();
+                    sink.end();
+                } else if let Some(na) = nursery {
+                    // `jfi_frame_size` is not a rewrite-time constant.
+                    // `malloc_cond_varsize_frame` bumps that runtime total;
+                    // a total at or above `large_threshold` takes the helper
+                    // (`can_use_nursery_malloc`'s exclusive bound).
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                    sink.i64_const(7);
+                    sink.i64_add();
+                    sink.i64_const(!7i64);
+                    sink.i64_and();
+                    sink.i64_const(na.large_threshold as i64);
+                    sink.i64_ge_u();
+                    sink.if_(BlockType::Result(ValType::I64));
+                    sink.i64_const(0);
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                    sink.i64_const(7);
+                    sink.i64_add();
+                    sink.i64_const(!7i64);
+                    sink.i64_and();
+                    sink.i64_const(GcHeader::SIZE as i64);
+                    sink.i64_sub();
+                    sink.i32_const(alloc.new_fn_ptr as i32);
+                    sink.call_indirect(0, base + 2);
+                    emit_reload_frame_if_necessary(
+                        &mut sink,
+                        residual_type_base,
+                        ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
+                    );
+                    emit_reload_refs_from_homes(
+                        &mut sink,
+                        value_types,
+                        ref_homes,
+                        &liveness,
+                        op_idx,
+                        (!OpRef::raw_is_constant(vi)).then_some(vi),
+                        frame,
+                    );
+                    sink.else_();
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                    sink.i64_const(7);
+                    sink.i64_add();
+                    sink.i64_const(!7i64);
+                    sink.i64_and();
+                    sink.i32_wrap_i64();
+                    sink.local_set(alloc_size_local);
+                    sink.i32_const(na.free_addr as i32);
+                    sink.i32_load(MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    sink.local_tee(alloc_scratch_local);
+                    sink.local_get(alloc_size_local);
+                    sink.i32_add();
+                    sink.i32_const(na.top_addr as i32);
+                    sink.i32_load(MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    sink.i32_gt_u();
+                    sink.if_(BlockType::Result(ValType::I64));
+                    sink.i64_const(0);
+                    sink.local_get(alloc_size_local);
+                    sink.i64_extend_i32_u();
+                    sink.i64_const(GcHeader::SIZE as i64);
+                    sink.i64_sub();
+                    sink.i32_const(alloc.new_fn_ptr as i32);
+                    sink.call_indirect(0, base + 2);
+                    emit_reload_frame_if_necessary(
+                        &mut sink,
+                        residual_type_base,
+                        ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
+                    );
+                    emit_reload_refs_from_homes(
+                        &mut sink,
+                        value_types,
+                        ref_homes,
+                        &liveness,
+                        op_idx,
+                        (!OpRef::raw_is_constant(vi)).then_some(vi),
+                        frame,
+                    );
+                    sink.else_();
+                    sink.i32_const(na.free_addr as i32);
+                    sink.local_get(alloc_scratch_local);
+                    sink.local_get(alloc_size_local);
+                    sink.i32_add();
+                    sink.i32_store(MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    sink.local_get(alloc_scratch_local);
+                    sink.i64_const(0);
+                    sink.i64_store(MemArg {
+                        offset: 0,
+                        align: 3,
+                        memory_index: 0,
+                    });
+                    sink.local_get(alloc_scratch_local);
+                    sink.i32_const(GcHeader::SIZE as i32);
+                    sink.i32_add();
+                    sink.i64_extend_i32_u();
+                    sink.end();
                     sink.end();
                 } else {
                     sink.i64_const(0);
@@ -8843,58 +8845,16 @@ fn build_function(
                 // trace at the Python CALL needs resume metadata that a
                 // CALL_ASSEMBLER op does not currently carry.
 
-                // Allocate the callee frame as a GC JitFrame.
-                // `ca_cfp_local = frame_base + FIRST_ITEM_OFFSET` is the
-                // bespoke-layout frame pointer — every `mem64(OFS)` below is
-                // relative to it, exactly as the source loop reads its local 0.
-                // The tmp callback and the real loop may have different frame
-                // depths.  PyPy updates the old token's frame info during
-                // redirect; wasm mirrors that by loading both allocation
-                // fields from the old token's stable dispatch entry.
-                //
-                // `malloc_cond_varsize_frame` inlines the nursery bump
-                // (`assembler.py`) when `ca.inline` is armed. Size still
-                // comes from the dispatch entry, so a later redirect can
-                // deepen the frame. Overflow (or gc_stress) keeps the
-                // collecting helper.
-                if let (Some(base), Some(inline)) = (residual_type_base, ca.inline) {
-                    emit_ca_malloc_cond_varsize_frame(
-                        &mut sink,
-                        inline,
-                        base,
-                        ca.ca_alloc_fn_ptr,
-                        ca_target_local,
-                        alloc_scratch_local,
-                        alloc_size_local,
-                    );
-                } else if let Some(base) = residual_type_base {
-                    sink.local_get(ca_target_local);
-                    sink.i64_load32_u(memarg(crate::failguard::WASM_CA_TARGET_FRAME_BYTES_OFS, 2));
-                    sink.local_get(ca_target_local);
-                    sink.i64_load(mem64(crate::failguard::WASM_CA_TARGET_GCMAP_PTR_OFS));
-                    sink.i32_const(ca.ca_alloc_fn_ptr as i32);
-                    sink.call_indirect(0, base + 2);
-                } else {
-                    let jit_call =
-                        jit_call_idx.expect("CA arm needs jit_call for the frame trampolines");
-                    emit_call_area_addr(&mut sink);
-                    sink.i64_const(ca.ca_alloc_fn_ptr);
-                    sink.i64_store(mem64(STATIC_CALL_FUNC_OFS));
-                    emit_call_area_addr(&mut sink);
-                    sink.i64_const(2);
-                    sink.i64_store(mem64(STATIC_CALL_NARGS_OFS));
-                    emit_call_area_addr(&mut sink);
-                    sink.local_get(ca_target_local);
-                    sink.i64_load32_u(memarg(crate::failguard::WASM_CA_TARGET_FRAME_BYTES_OFS, 2));
-                    sink.i64_store(mem64(STATIC_CALL_ARGS_OFS));
-                    emit_call_area_addr(&mut sink);
-                    sink.local_get(ca_target_local);
-                    sink.i64_load(mem64(crate::failguard::WASM_CA_TARGET_GCMAP_PTR_OFS));
-                    sink.i64_store(mem64(STATIC_CALL_ARGS_OFS + SLOT_SIZE));
-                    emit_jit_call(&mut sink, jit_call);
-                    emit_call_area_addr(&mut sink);
-                    sink.i64_load(mem64(STATIC_CALL_RESULT_OFS));
+                // The rewriter's `CallMallocNurseryVarsizeFrame` allocated the
+                // frame and `GcStore`d each input at `_ll_initial_locs`.
+                // Arg 0 is that object base. A virtualizable, when present,
+                // is arg 1 and was also stored into its frame slot.
+                if op.num_args() == 0 {
+                    return Err(BackendError::Unsupported(
+                        "wasm backend: CALL_ASSEMBLER is missing its frame argument".into(),
+                    ));
                 }
+                emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                 sink.i32_wrap_i64();
                 sink.local_tee(ca_cfp_local);
                 emit_memory_error_if_i32_zero(
@@ -8903,72 +8863,44 @@ fn build_function(
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
                 );
+                // Recycled nursery bytes. The entry publish unions with the
+                // live map, so a fresh frame must start with a null map or
+                // that union walks a garbage length.
+                sink.local_get(ca_cfp_local);
+                sink.i64_const(0);
+                emit_word_store(&mut sink, majit_backend::jitframe::JF_GCMAP_OFS as u64);
+                // Used homes are a prefix of `home_slots`. A later redirect
+                // marks further reserved homes in the same frame, so the
+                // whole reserved region has to be null before the push.
+                // Bytes outside it are not in the static home gcmap.
+                emit_clear_reserved_homes(
+                    &mut sink,
+                    ca_cfp_local,
+                    ca_target_local,
+                    alloc_scratch_local,
+                );
+                emit_ca_push_frame(
+                    &mut sink,
+                    ca.inline.as_ref(),
+                    residual_type_base,
+                    ca.ca_push_fn_ptr,
+                    jit_call_idx,
+                    ca_cfp_local,
+                    alloc_scratch_local,
+                )?;
                 sink.local_get(ca_cfp_local);
                 sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
                 sink.i32_add();
                 sink.local_set(ca_cfp_local);
-                // The collecting helper may have moved this invocation's
-                // frame. The inline bump path reloads only on that arm
-                // (`emit_ca_malloc_cond_varsize_frame`); a non-inline
-                // allocation always goes through the helper.
-                if ca.inline.is_none() {
-                    if let Some(base) = residual_type_base {
-                        sink.i32_const(ca.ca_reload_caller_fn_ptr as i32);
-                        sink.call_indirect(0, base);
-                        sink.i32_wrap_i64();
-                        sink.local_set(0);
-                    }
-                }
-                emit_reload_ca_input_refs_from_homes(
-                    &mut sink,
-                    value_types,
-                    ref_homes,
-                    ref_values,
-                    op,
-                    frame,
-                );
                 // dispatch key = 0: run the loop from its entry (preamble), not a
-                // LABEL resume — this is a fresh call.
+                // LABEL resume — this is a fresh call. The offset is loaded
+                // from the dispatch entry because redirect can move it.
                 sink.local_get(ca_cfp_local);
                 sink.local_get(ca_target_local);
                 sink.i32_load(mem32(crate::failguard::WASM_CA_TARGET_DISPATCH_KEY_OFS_OFS));
                 sink.i32_add();
                 sink.i64_const(0);
                 sink.i64_store(mem64(0));
-                // Marshal the descriptor's uniform i64 Int/Ref ABI inputs into
-                // the callee's positional frame slots.
-                for (arg_index, arg) in op.getarglist().iter().enumerate() {
-                    sink.local_get(ca_cfp_local);
-                    emit_resolve(&mut sink, constants, value_types, arg.to_opref());
-                    sink.i64_store(mem64(FRAME_SLOT_BASE + arg_index as u64 * SLOT_SIZE));
-                }
-                // Homes are still recycled nursery bytes. Null the callee
-                // home range from the dispatch snapshot and publish that
-                // snapshot's gcmap before `call_indirect`. A minor
-                // collection can fire in the callee
-                // (`recursive_call_frame_relocation`) while this frame is
-                // already on the shadow stack. Key-0 still skips unmarked
-                // frozen padding.
-                sink.local_get(ca_target_local);
-                sink.i32_load(mem32(crate::failguard::WASM_CA_TARGET_HOME_SLOTS_OFS));
-                sink.if_(BlockType::Empty);
-                sink.local_get(ca_cfp_local);
-                sink.local_get(ca_target_local);
-                sink.i32_load(mem32(crate::failguard::WASM_CA_TARGET_HOME_SLOT_BASE_OFS));
-                sink.i32_add();
-                sink.i32_const(0);
-                sink.local_get(ca_target_local);
-                sink.i32_load(mem32(crate::failguard::WASM_CA_TARGET_HOME_SLOTS_OFS));
-                sink.i32_const(SLOT_SIZE as i32);
-                sink.i32_mul();
-                sink.memory_fill(0);
-                sink.end();
-                sink.local_get(ca_cfp_local);
-                sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
-                sink.i32_sub();
-                sink.local_get(ca_target_local);
-                sink.i64_load(mem64(crate::failguard::WASM_CA_TARGET_GCMAP_PTR_OFS));
-                emit_word_store(&mut sink, majit_backend::jitframe::JF_GCMAP_OFS as u64);
                 // Run the callee loop on F'; discard the returned frame_ptr.
                 sink.local_get(ca_cfp_local);
                 // The immutable target snapshot was loaded before allocating

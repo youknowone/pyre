@@ -199,22 +199,35 @@ fn assert_no_call_assembler_frame_fill(stderr: &str) {
             && lines[index - 3].starts_with("local.get ")
             && lines[index - 2] == "i32.const 0"
             && lines[index - 1].starts_with("i32.const ");
-        // dest = cfp + target.home_slot_base, size = home_slots * SLOT_SIZE.
-        // The two `local.get` of the dispatch-entry pointer must name the
-        // same local, and the loads must be the snapshot home fields.
-        let ca_target = lines[index.saturating_sub(8)]
+        // `emit_clear_reserved_homes`: size = home_slots << 3, skipped when
+        // zero; dest = frame + FIRST_ITEM_OFFSET + home_slot_base (the
+        // guest's wasm32 offset, not this host's). The three `local.get` of
+        // the dispatch-entry pointer must name the same local, the loads must
+        // be the snapshot home fields, and the fill length must be the local
+        // the size was teed into.
+        let ca_target = lines[index.saturating_sub(16)]
             .strip_prefix("local.get ")
             .filter(|s| !s.is_empty());
-        let is_ca_callee_home_null = index >= 9
-            && lines[index - 9].starts_with("local.get ")
+        let home_size = lines[index.saturating_sub(12)]
+            .strip_prefix("local.tee ")
+            .filter(|s| !s.is_empty());
+        let is_ca_callee_home_null = index >= 16
             && ca_target.is_some()
-            && lines[index - 7] == home_base
+            && lines[index - 15] == home_slots
+            && lines[index - 14] == "i32.const 3"
+            && lines[index - 13] == "i32.shl"
+            && home_size.is_some()
+            && lines[index - 11] == "i32.eqz"
+            && lines[index - 10].starts_with("if")
+            && lines[index - 9] == "else"
+            && lines[index - 8].starts_with("local.get ")
+            && lines[index - 7].starts_with("i32.const ")
             && lines[index - 6] == "i32.add"
-            && lines[index - 5] == "i32.const 0"
-            && lines[index - 4].strip_prefix("local.get ") == ca_target
-            && lines[index - 3] == home_slots
-            && lines[index - 2] == "i32.const 8"
-            && lines[index - 1] == "i32.mul";
+            && lines[index - 5].strip_prefix("local.get ") == ca_target
+            && lines[index - 4] == home_base
+            && lines[index - 3] == "i32.add"
+            && lines[index - 2] == "i32.const 0"
+            && lines[index - 1].strip_prefix("local.get ") == home_size;
         // `OpCode::ZeroArray` after `emit_pending_zeros` (scales rewritten
         // to 1, start/size in bytes): dest = wrap(base) + start +
         // `ArrayDescr.base_size()`. PeepSink folds `wrap(const)` to
@@ -284,15 +297,22 @@ memory.fill
 fn call_assembler_home_range_fill_is_not_a_frame_refill() {
     assert_no_call_assembler_frame_fill(
         "\
+local.get 267
+i32.load offset=28
+i32.const 3
+i32.shl
+local.tee 130
+i32.eqz
+if ;; label = @2
+else
 local.get 265
+i32.const 32
+i32.add
 local.get 267
 i32.load offset=24
 i32.add
 i32.const 0
-local.get 267
-i32.load offset=28
-i32.const 8
-i32.mul
+local.get 130
 memory.fill
 ",
     );
@@ -317,15 +337,22 @@ memory.fill
 fn call_assembler_mismatched_target_local_fill_is_rejected() {
     assert_no_call_assembler_frame_fill(
         "\
-local.get 265
 local.get 267
+i32.load offset=28
+i32.const 3
+i32.shl
+local.tee 130
+i32.eqz
+if ;; label = @2
+else
+local.get 265
+i32.const 32
+i32.add
+local.get 268
 i32.load offset=24
 i32.add
 i32.const 0
-local.get 268
-i32.load offset=28
-i32.const 8
-i32.mul
+local.get 130
 memory.fill
 ",
     );
@@ -336,15 +363,22 @@ memory.fill
 fn call_assembler_wrong_home_offset_fill_is_rejected() {
     assert_no_call_assembler_frame_fill(
         "\
+local.get 267
+i32.load offset=28
+i32.const 3
+i32.shl
+local.tee 130
+i32.eqz
+if ;; label = @2
+else
 local.get 265
+i32.const 32
+i32.add
 local.get 267
 i32.load offset=8
 i32.add
 i32.const 0
-local.get 267
-i32.load offset=28
-i32.const 8
-i32.mul
+local.get 130
 memory.fill
 ",
     );
@@ -2608,7 +2642,7 @@ fn call_assembler_accepts_float_and_void_result_locals() {
                     },
                 )]),
                 deopt_helper_slot: 1,
-                ca_alloc_fn_ptr: 2,
+                ca_push_fn_ptr: 2,
                 ca_pop_fn_ptr: 3,
                 ca_reload_fn_ptr: 4,
                 ca_reload_caller_fn_ptr: 5,
@@ -2639,17 +2673,23 @@ fn call_assembler_inlines_malloc_cond_varsize_frame() {
     let token = 0x5a5a_u64;
     let nursery_free = 0x1000_u32;
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
-    let call = make_op(
-        OpCode::CallAssemblerI,
+    let frame_ref = OpRef::int_op(2);
+    let malloc = make_op(
+        OpCode::CallMallocNurseryVarsizeFrame,
         &[OpRef::input_arg_int(0)],
-        OpRef::int_op(1),
+        frame_ref,
     );
+    let call = make_op(OpCode::CallAssemblerI, &[frame_ref], OpRef::int_op(1));
     call.setdescr(std::sync::Arc::new(TargetTokenCallDescr {
         arg_types: vec![Type::Int],
         result_type: Type::Int,
         target_token: token,
     }));
-    let ops = vec![call, Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))])];
+    let ops = vec![
+        malloc,
+        call,
+        Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]),
+    ];
     let inputs = codegen::ModuleBuildInputs {
         inputargs,
         ops,
@@ -2658,9 +2698,17 @@ fn call_assembler_inlines_malloc_cond_varsize_frame() {
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
-        alloc: codegen::AllocHelpers::default(),
+        alloc: codegen::AllocHelpers {
+            new_fn_ptr: 0x11,
+            ..codegen::AllocHelpers::default()
+        },
         wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
-        nursery: None,
+        nursery: Some(codegen::NurseryAllocParams {
+            free_addr: nursery_free,
+            top_addr: 0x1008,
+            large_threshold: 4096,
+            plain_tids: std::collections::HashSet::new(),
+        }),
         invalidated_flag_addr: 0,
         gc_table_base: 0,
         fail_index_base: 0,
@@ -2672,7 +2720,7 @@ fn call_assembler_inlines_malloc_cond_varsize_frame() {
         external_jump_slot: 0,
         external_jump_wide_slot: 0,
         external_jump_key: 0,
-        frame: codegen::FrameGeometry::fixed(),
+        frame: codegen::FrameGeometry::compact(4, 1, 0),
         ca: codegen::CaParams {
             emit_ca: true,
             targets: HashMap::from([(
@@ -2682,7 +2730,7 @@ fn call_assembler_inlines_malloc_cond_varsize_frame() {
                 },
             )]),
             deopt_helper_slot: 1,
-            ca_alloc_fn_ptr: 2,
+            ca_push_fn_ptr: 2,
             ca_pop_fn_ptr: 3,
             ca_reload_fn_ptr: 4,
             ca_reload_caller_fn_ptr: 5,
@@ -2723,7 +2771,7 @@ fn call_assembler_inlines_malloc_cond_varsize_frame() {
     // The CA arm no longer memory.fills the frozen home range; the
     // callee key-0 prologue nulls only marked slots. The bump itself
     // must not refill `ca_frame_bytes`.
-    let frame = codegen::FrameGeometry::fixed();
+    let frame = codegen::FrameGeometry::compact(4, 1, 0);
     assert!(
         !fill_lengths.contains(&(frame.ca_frame_bytes as i32)),
         "inline CA bump must not memory.fill ca_frame_bytes; fills were {fill_lengths:?}"
@@ -2854,7 +2902,7 @@ fn call_assembler_pop_reads_callee_gnf2_from_snapshot() {
                     },
                 )]),
                 deopt_helper_slot: 1,
-                ca_alloc_fn_ptr: 2,
+                ca_push_fn_ptr: 2,
                 ca_pop_fn_ptr,
                 ca_reload_fn_ptr: 4,
                 ca_reload_caller_fn_ptr: 5,
@@ -10747,7 +10795,7 @@ fn call_malloc_nursery_variants_lower() {
     assert_eq!(
         memory_fill_count(&bytes),
         0,
-        "CallMallocNurseryVarsizeFrame fast path must not memory.fill the payload"
+        "CallMallocNurseryVarsizeFrame leaves home clears to the CA arm"
     );
 
     let varsize = make_op(

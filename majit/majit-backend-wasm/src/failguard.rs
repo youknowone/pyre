@@ -606,6 +606,11 @@ pub struct CallAssemblerTarget {
     /// pop footer must use the write-barrier helper when this is set,
     /// even if the caller module itself has no GNF2.
     pub has_guard_not_forced_2: u32,
+    /// Homes `build_home_gcmap` marks: the used ordinary prefix, then the
+    /// LABEL-capture tail. Reserved padding between them is unmarked.
+    pub marked_ordinary: u32,
+    pub marked_labels: u32,
+    pub label_ref_slots: u32,
 }
 
 /// Compiled loop targets keyed by their `JitCellToken` number. Unlike label
@@ -641,6 +646,13 @@ pub struct WasmCaRuntimeTarget {
     pub home_slot_base: u32,
     pub home_slots: u32,
     pub has_guard_not_forced_2: u32,
+    /// Used ordinary Ref homes the callee's static gcmap marks.
+    pub marked_ordinary: u32,
+    /// Used LABEL-capture homes the same map marks.
+    pub marked_labels: u32,
+    /// Reserved LABEL tail. The marked tail starts at
+    /// `home_slots - label_ref_slots`.
+    pub label_ref_slots: u32,
 }
 
 /// Stable cell baked by callers.  A redirect publishes one pointer to an
@@ -681,6 +693,12 @@ pub const WASM_CA_TARGET_HOME_SLOTS_OFS: u64 =
     std::mem::offset_of!(WasmCaRuntimeTarget, home_slots) as u64;
 pub const WASM_CA_TARGET_HAS_GNF2_OFS: u64 =
     std::mem::offset_of!(WasmCaRuntimeTarget, has_guard_not_forced_2) as u64;
+pub const WASM_CA_TARGET_MARKED_ORDINARY_OFS: u64 =
+    std::mem::offset_of!(WasmCaRuntimeTarget, marked_ordinary) as u64;
+pub const WASM_CA_TARGET_MARKED_LABELS_OFS: u64 =
+    std::mem::offset_of!(WasmCaRuntimeTarget, marked_labels) as u64;
+pub const WASM_CA_TARGET_LABEL_REF_SLOTS_OFS: u64 =
+    std::mem::offset_of!(WasmCaRuntimeTarget, label_ref_slots) as u64;
 
 /// `make_and_attach_done_descrs` gives every cpu one `DoneWithThisFrame*` per
 /// result kind plus one `ExitFrameWithExceptionDescrRef`, and
@@ -1026,6 +1044,9 @@ pub fn ca_dispatch_publish(
     home_slot_base: u32,
     home_slots: u32,
     has_guard_not_forced_2: u32,
+    marked_ordinary: u32,
+    marked_labels: u32,
+    label_ref_slots: u32,
 ) {
     let _ = ca_dispatch_slot(number);
     let table = WASM_CA_DISPATCH.lock();
@@ -1057,6 +1078,9 @@ pub fn ca_dispatch_publish(
             && current.home_slot_base == home_slot_base
             && current.home_slots == home_slots
             && current.has_guard_not_forced_2 == has_guard_not_forced_2
+            && current.marked_ordinary == marked_ordinary
+            && current.marked_labels == marked_labels
+            && current.label_ref_slots == label_ref_slots
     }) {
         return;
     }
@@ -1069,6 +1093,9 @@ pub fn ca_dispatch_publish(
         home_slot_base,
         home_slots,
         has_guard_not_forced_2,
+        marked_ordinary,
+        marked_labels,
+        label_ref_slots,
     });
     let target_ptr = (&*target as *const WasmCaRuntimeTarget as usize) as u32;
     targets.push(target);
@@ -1086,6 +1113,9 @@ pub fn ca_dispatch_redirect(
     home_slot_base: u32,
     home_slots: u32,
     has_guard_not_forced_2: u32,
+    marked_ordinary: u32,
+    marked_labels: u32,
+    label_ref_slots: u32,
 ) {
     ca_dispatch_publish(
         old_number,
@@ -1097,6 +1127,9 @@ pub fn ca_dispatch_redirect(
         home_slot_base,
         home_slots,
         has_guard_not_forced_2,
+        marked_ordinary,
+        marked_labels,
+        label_ref_slots,
     );
 }
 

@@ -20,7 +20,6 @@ mod release;
 
 pub use func_sig::{FuncSigVal, WasmSig, decode_func_sig, encode_func_sig};
 
-
 /// The wasm host compiles and resumes on the thread that ran the
 /// compiled frame (`eval.rs` post-`run_compiled`). cargo's default
 /// harness is N threads against one process-global cpu
@@ -2228,14 +2227,120 @@ pub extern "C" fn wasm_malloc_unicode(type_id: i64, length: i64) -> i64 {
     )
 }
 
+struct CaCalleeReg {
+    clt: Weak<majit_backend::CompiledLoopToken>,
+    index_of_virtualizable: i32,
+}
+
+thread_local! {
+    /// dynasm `CALL_ASSEMBLER_TARGETS`: per-thread, because token numbers
+    /// are reused across threads in backend tests. `free_loop_and_bridges`
+    /// retracts an entry through `unregister_wasm_ca_target`.
+    static CA_CALLEE_REGS: RefCell<IndexMap<u64, CaCalleeReg>> = RefCell::new(IndexMap::new());
+}
+
+fn unregister_wasm_ca_target(number: u64) {
+    let _ = CA_CALLEE_REGS.try_with(|cell| {
+        cell.borrow_mut().swap_remove(&number);
+    });
+    crate::failguard::remove_call_assembler_target(number);
+}
+
+/// `call_jit.rs` `jitframe_layout_descrs`. Offsets are from the object base
+/// past the GC header, which is what `CallMallocNurseryVarsizeFrame` returns.
+fn wasm_jitframe_descrs() -> majit_gc::rewrite::JitFrameDescrs {
+    use majit_backend::jitframe::*;
+    majit_gc::rewrite::JitFrameDescrs {
+        jitframe_tid: wasm_jitframe_tid(),
+        jitframe_fixed_size: JITFRAME_FIXED_SIZE,
+        jf_frame_info_ofs: JF_FRAME_INFO_OFS,
+        jf_descr_ofs: JF_DESCR_OFS,
+        jf_force_descr_ofs: JF_FORCE_DESCR_OFS,
+        jf_savedata_ofs: JF_SAVEDATA_OFS,
+        jf_guard_exc_ofs: JF_GUARD_EXC_OFS,
+        jf_forward_ofs: JF_FORWARD_OFS,
+        jf_frame_ofs: JF_FRAME_OFS,
+        jf_frame_baseitemofs: FIRST_ITEM_OFFSET,
+        jf_frame_lengthofs: JF_FRAME_OFS + LENGTHOFS,
+        sign_size: SIGN_SIZE,
+    }
+}
+
+/// dynasm `register_call_assembler_target` / `BaseRegalloc._set_initial_bindings`.
+///
+/// The wasm entry reads input `k` from `FRAME_SLOT_BASE + k*8` off the items
+/// base (`FIRST_ITEM_OFFSET`). `handle_call_assembler` adds
+/// `jf_frame_baseitemofs`, so each loc is that same byte offset.
+fn publish_ca_initial_locs(token: &majit_backend::JitCellToken, n_inputs: usize) {
+    let Some(clt) = token.compiled_loop_token() else {
+        return;
+    };
+    let locs: Vec<i32> = (0..n_inputs)
+        .map(|i| codegen::FRAME_SLOT_BASE as i32 + (i as i32) * 8)
+        .collect();
+    *clt._ll_initial_locs.lock() = locs;
+    let index_of_virtualizable = token.virtualizable_arg_index().map_or(-1, |i| i as i32);
+    CA_CALLEE_REGS.with(|cell| {
+        cell.borrow_mut().insert(
+            token.number,
+            CaCalleeReg {
+                clt: Arc::downgrade(&clt),
+                index_of_virtualizable,
+            },
+        );
+    });
+}
+
+fn lookup_call_assembler_callee_locs(
+    token_number: u64,
+) -> Option<majit_gc::rewrite::CallAssemblerCalleeLocs> {
+    let (clt, index_of_virtualizable) = CA_CALLEE_REGS.with(|cell| {
+        let map = cell.borrow();
+        let reg = map.get(&token_number)?;
+        Some((reg.clt.upgrade()?, reg.index_of_virtualizable))
+    })?;
+    let frame_info_ptr = {
+        let info = clt.frame_info.lock();
+        &*info as *const majit_backend::JitFrameInfo as usize
+    };
+    let frame_depth = clt.frame_info.lock().jfi_frame_depth as usize;
+    let ll_initial_locs = clt._ll_initial_locs.lock().clone();
+    Some(majit_gc::rewrite::CallAssemblerCalleeLocs {
+        _ll_initial_locs: ll_initial_locs,
+        frame_depth,
+        frame_info_ptr,
+        index_of_virtualizable,
+    })
+}
+
+/// A `CALL_ASSEMBLER` whose callee has not published locs cannot be rewritten.
+/// The message matches `wasm_unsupported_trace_reason` so the decline tally
+/// stays on the same string.
+fn missing_call_assembler_locs(ops: &[Op]) -> Option<String> {
+    for op in ops.iter().filter(|op| op.opcode.is_call_assembler()) {
+        let ready = op.getdescr().is_some_and(|d| {
+            d.as_loop_token_descr()
+                .and_then(|lt| lookup_call_assembler_callee_locs(lt.loop_token_number()))
+                .is_some()
+        });
+        if !ready {
+            return Some(format!(
+                "wasm backend: {:?} (loop-callee inline)",
+                op.opcode
+            ));
+        }
+    }
+    None
+}
+
 /// Production GC rewriter used by `compile_loop` / `compile_bridge`.
 ///
 /// `llsupport/gc.py` `get_ll_description` + `rewrite.py`
 /// `GcRewriterAssembler`. Native backends run this before assemble.
-/// Wasm leaves `jitframe_info` unset, so `CALL_ASSEMBLER` stays in
-/// place for the wasm-specific arm (`handle_call_assembler` needs
-/// `_ll_initial_locs` + 1-arg CA codegen). malloc / zero / barrier /
-/// `GC_LOAD` still come from the shared rewrite.
+/// `CALL_ASSEMBLER` goes through `handle_call_assembler`. The callee's
+/// `_ll_initial_locs` are published by `publish_ca_initial_locs` before
+/// this rewriter runs. malloc / zero / barrier / `GC_LOAD` are the same
+/// shared rewrite.
 #[doc(hidden)]
 pub fn gc_rewriter() -> majit_gc::rewrite::GcRewriterImpl {
     let collector = with_wasm_active_gc(|gc| {
@@ -2254,15 +2359,8 @@ pub fn gc_rewriter() -> majit_gc::rewrite::GcRewriterImpl {
         nursery_top_addr,
         max_nursery_size,
         wb_descr,
-        // `rewrite.py` `handle_call_assembler` needs both. Wasm
-        // `CallAssemblerTarget` has no `_ll_initial_locs` / `frame_info`,
-        // and codegen still emits the multi-arg CA arm. Convergence:
-        // publish `_ll_initial_locs` on the wasm CLT (dynasm
-        // `register_call_assembler_target`), pass `JitFrameDescrs`
-        // (`call_jit.rs` `jitframe_layout_descrs`), then emit the
-        // rewritten 1-arg CA.
-        jitframe_info: None,
-        call_assembler_callee_locs: None,
+        jitframe_info: Some(wasm_jitframe_descrs()),
+        call_assembler_callee_locs: Some(Box::new(lookup_call_assembler_callee_locs)),
         load_supported_factors: &[1],
         supports_load_effective_address: true,
         malloc_zero_filled: is_boehm,
@@ -2418,60 +2516,23 @@ fn wasm_write_barrier_helpers() -> codegen::WriteBarrierHelpers {
     }
 }
 
-/// Self-recursive CALL_ASSEMBLER (`PYRE_WASM_CA`) callee-frame allocation
-/// helper. Allocates the callee's execution frame as a young nursery
-/// GC-managed `JitFrame`, mirroring rewrite.py's nursery frame allocation:
-/// steady recursive frames die young, while only frames alive across a
-/// collection are promoted. The frame is traced through the jitframe type id's
-/// custom trace using its per-frame `jf_gcmap`, rooted by pushing it on the
-/// jitframe shadow stack, and reloaded after the recursive call because a
-/// nursery frame may move. Returns the frame base (codegen adds
-/// `FIRST_ITEM_OFFSET` for the bespoke-layout frame pointer), or 0 on
-/// allocation failure.
+/// `_call_header_shadowstack` when `jf_top` is not in linear memory.
 ///
-/// Each callee frame self-describes through its own per-frame gcmap, so
-/// mixed-geometry frames from distinct CA bridges are each forwarded by their
-/// own geometry — no shared coarse single-stride scan that mis-reads a larger
-/// frame's interior as a smaller frame's slots.
-pub extern "C" fn wasm_jit_ca_alloc_frame(frame_bytes: i64, _gcmap_ptr: i64) -> i64 {
-    use majit_backend::jitframe::{JITFRAME_FIXED_SIZE, JitFrame};
-    assert!(frame_bytes >= 0);
-    assert_eq!(frame_bytes as usize % std::mem::size_of::<isize>(), 0);
-    let depth = frame_bytes as usize / std::mem::size_of::<isize>();
-    // Collecting nursery allocation, matching rewrite.py's
-    // `gen_malloc_nursery_varsize_frame`. The caller frame remains rooted at
-    // the shadow-stack top during a collection; wasm reloads it from there
-    // after this call, then this freshly allocated callee is pushed below its
-    // own execution. Steady recursive frames die young; only frames that live
-    // through a collection are promoted instead of inflating the old-gen major
-    // collection threshold on every call.
-    let alloc_size = JitFrame::alloc_size(depth);
-    let jf_ref =
-        with_wasm_active_gc_mut(|gc| gc.alloc_nursery_typed(wasm_jitframe_tid(), alloc_size))
-            .unwrap_or(GcRef(0));
-    if jf_ref.0 == 0 {
-        return oom_signal_if_zero(0);
+/// `handle_call_assembler` already emitted `CallMallocNurseryVarsizeFrame`
+/// for `frame_ptr`. The guest emits the two stores itself when
+/// `CaInlineParams` publishes `jf_top` / `jf_limit`. This helper is the path
+/// where the shadow stack stays in host TLS (`shadow_stack.rs` `JF_ROOT_STACK`),
+/// which a wasm module cannot address.
+pub extern "C" fn wasm_jit_ca_push_frame(frame_ptr: i64) -> i64 {
+    if frame_ptr == 0 {
+        return 0;
     }
-    let jf = jf_ref.0 as *mut JitFrame;
-    unsafe {
-        // rewrite.py `gen_malloc_frame`: NULL the GC-pointer header
-        // fields (`jf_savedata` / `jf_force_descr` / `jf_descr` /
-        // `jf_guard_exc` / `jf_forward`). IncrementalMiniMark does not
-        // zero the `jf_frame` slots; `JitFrame::init` only needs the
-        // fixed header clean.
-        std::ptr::write_bytes(jf as *mut u8, 0, JITFRAME_FIXED_SIZE);
-        JitFrame::init(jf, std::ptr::null(), depth);
-        // assembler.py publishes `jf_gcmap` at safepoints once homes are
-        // live. The callee entry stores `home_gcmap_ptr` after its
-        // home/input stores. Installing the map here would trace leftover
-        // item words (`invalid type_id` in `copy_nursery_object`).
-        (*jf).jf_gcmap = std::ptr::null();
-    }
+    let jf_ref = GcRef(frame_ptr as usize);
     majit_gc::shadow_stack::push_jf(jf_ref);
-    jf_ref.0 as i64
+    frame_ptr
 }
 
-/// Companion to [`wasm_jit_ca_alloc_frame`]: pop the top jitframe shadow-stack
+/// Pop the top jitframe shadow-stack
 /// entry on CA-arm exit. The CA recursion is strict LIFO — each level pushes
 /// one frame before its `call_indirect` and pops after, and a deopt resume runs
 /// on the host's own shadow stack — so removing the top entry releases exactly
@@ -4362,6 +4423,9 @@ impl WasmBackend {
         if let Some(mut target) = call_assembler_target(token.number) {
             target.func_handle = install_handle;
             target.compiled_ptr = compiled as *const CompiledWasmLoop as usize as u64;
+            target.marked_ordinary = compiled.num_ref_homes.get() as u32;
+            target.marked_labels = compiled.used_label_homes.get() as u32;
+            target.label_ref_slots = compiled.frame.label_ref_slots as u32;
             // Never clear a flag an out-of-line bridge already published:
             // re-emission can omit that bridge's ops while the attached
             // module still finishes through it.
@@ -4377,6 +4441,9 @@ impl WasmBackend {
                 target.home_slot_base,
                 target.home_slots,
                 target.has_guard_not_forced_2,
+                target.marked_ordinary,
+                target.marked_labels,
+                target.label_ref_slots,
             );
             publish_call_assembler_target(token.number, target);
         }
@@ -4596,6 +4663,9 @@ fn general_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssemblerTa
                 registered.home_slot_base,
                 registered.home_slots,
                 registered.has_guard_not_forced_2,
+                registered.marked_ordinary,
+                registered.marked_labels,
+                registered.label_ref_slots,
             );
             publish_call_assembler_target(target_token, registered.clone());
         }
@@ -5156,10 +5226,15 @@ impl majit_backend::Backend for WasmBackend {
         // creates the `CompiledLoopToken`.
         if let Some(clt) = token.compiled_loop_token() {
             majit_backend::record_compiled_loop_token(&self.cpu_tracker, &clt);
-            clt.set_ca_unregister(crate::failguard::remove_call_assembler_target);
+            clt.set_ca_unregister(unregister_wasm_ca_target);
         }
         let mut ops_owned: Vec<Op> = normalize_ops_for_codegen(inputargs, ops);
         codegen::materialize_unbound_label_args(inputargs, &mut ops_owned);
+        publish_ca_initial_locs(token, inputargs.len());
+        if let Some(reason) = missing_call_assembler_locs(&ops_owned) {
+            diag_bump(25);
+            return decline_compile_loop(BackendError::Unsupported(reason));
+        }
         let (ops_owned, gc_table) = self.rewrite_ops_for_gc(ops_owned);
         let gc_table_base = gc_table.as_ref().map_or(0, |t| t.base_addr() as u32);
         let ops: &[Op] = &ops_owned;
@@ -5308,7 +5383,7 @@ impl majit_backend::Backend for WasmBackend {
                     emit_ca: true,
                     targets: ca_codegen_targets(targets),
                     deopt_helper_slot: ca_deopt_helper_slot(),
-                    ca_alloc_fn_ptr: wasm_jit_ca_alloc_frame as *const () as usize as i64,
+                    ca_push_fn_ptr: wasm_jit_ca_push_frame as *const () as usize as i64,
                     ca_pop_fn_ptr: wasm_jit_ca_pop_frame as *const () as usize as i64,
                     ca_reload_fn_ptr: wasm_jit_ca_reload_frame as *const () as usize as i64,
                     ca_reload_caller_fn_ptr: wasm_jit_ca_reload_caller_frame as *const () as usize
@@ -5556,6 +5631,9 @@ impl majit_backend::Backend for WasmBackend {
             compiled.frame.home_slot_base as u32,
             compiled.frame.home_slots as u32,
             has_guard_not_forced_2,
+            num_ref_homes as u32,
+            used_label_homes as u32,
+            compiled.frame.label_ref_slots as u32,
         );
         publish_call_assembler_target(
             token.number,
@@ -5570,6 +5648,9 @@ impl majit_backend::Backend for WasmBackend {
                 home_slot_base: compiled.frame.home_slot_base as u32,
                 home_slots: compiled.frame.home_slots as u32,
                 has_guard_not_forced_2,
+                marked_ordinary: num_ref_homes as u32,
+                marked_labels: used_label_homes as u32,
+                label_ref_slots: compiled.frame.label_ref_slots as u32,
             },
         );
         if let Some(targets) = ca_targets.as_ref() {
@@ -5649,6 +5730,10 @@ impl majit_backend::Backend for WasmBackend {
         // argument-recovery layout is needed — hence `caller_recovery_layout`
         // and `previous_tokens` are unused.
         let ops_owned: Vec<Op> = normalize_ops_for_codegen(inputargs, ops);
+        if let Some(reason) = missing_call_assembler_locs(&ops_owned) {
+            diag_bump(1);
+            return Err(BackendError::Unsupported(reason));
+        }
         // A bridge gets its own table, like `compile_loop`'s.
         let (ops_owned, gc_table) = self.rewrite_ops_for_gc(ops_owned);
         let gc_table_base = gc_table.as_ref().map_or(0, |t| t.base_addr() as u32);
@@ -6299,7 +6384,7 @@ impl majit_backend::Backend for WasmBackend {
                 // frame, so its tail call area is never touched.
                 targets: ca_codegen_targets(targets),
                 deopt_helper_slot: ca_deopt_helper_slot(),
-                ca_alloc_fn_ptr: wasm_jit_ca_alloc_frame as *const () as usize as i64,
+                ca_push_fn_ptr: wasm_jit_ca_push_frame as *const () as usize as i64,
                 ca_pop_fn_ptr: wasm_jit_ca_pop_frame as *const () as usize as i64,
                 ca_reload_fn_ptr: wasm_jit_ca_reload_frame as *const () as usize as i64,
                 ca_reload_caller_fn_ptr: wasm_jit_ca_reload_caller_frame as *const () as usize
@@ -6607,6 +6692,9 @@ impl majit_backend::Backend for WasmBackend {
                         target.home_slot_base,
                         target.home_slots,
                         1,
+                        target.marked_ordinary,
+                        target.marked_labels,
+                        target.label_ref_slots,
                     );
                     publish_call_assembler_target(original_token.number, target);
                 }
@@ -7146,6 +7234,9 @@ impl majit_backend::Backend for WasmBackend {
                 new_target.home_slot_base,
                 new_target.home_slots,
                 new_target.has_guard_not_forced_2,
+                new_target.marked_ordinary,
+                new_target.marked_labels,
+                new_target.label_ref_slots,
             );
             publish_call_assembler_target(new.number, new_target.clone());
         }
@@ -7189,6 +7280,9 @@ impl majit_backend::Backend for WasmBackend {
             new_target.home_slot_base,
             new_target.home_slots,
             new_target.has_guard_not_forced_2,
+            new_target.marked_ordinary,
+            new_target.marked_labels,
+            new_target.label_ref_slots,
         );
         transfer_call_assembler_target_activity(&old_target, &new_target);
         new_target.token_number = old.number;
@@ -7234,12 +7328,18 @@ mod tests {
         let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let label_op = OpRc::new(majit_ir::Op::new(
             majit_ir::OpCode::Label,
-            &[rb(majit_ir::OpRef::input_arg_int(0)), rb(majit_ir::OpRef::input_arg_int(1))],
+            &[
+                rb(majit_ir::OpRef::input_arg_int(0)),
+                rb(majit_ir::OpRef::input_arg_int(1)),
+            ],
         ));
         label_op.setdescr(label.clone());
         let advance = OpRc::new(majit_ir::Op::new(
             majit_ir::OpCode::IntAdd,
-            &[rb(majit_ir::OpRef::input_arg_int(0)), rb(majit_ir::OpRef::const_int(1))],
+            &[
+                rb(majit_ir::OpRef::input_arg_int(0)),
+                rb(majit_ir::OpRef::const_int(1)),
+            ],
         ));
         advance.pos().set(majit_ir::OpRef::int_op(2));
         let guard = OpRc::new(majit_ir::Op::new(
@@ -7274,7 +7374,10 @@ mod tests {
         };
         let bridge_advance = OpRc::new(majit_ir::Op::new(
             majit_ir::OpCode::IntAdd,
-            &[rb(majit_ir::OpRef::input_arg_int(0)), rb(majit_ir::OpRef::const_int(1))],
+            &[
+                rb(majit_ir::OpRef::input_arg_int(0)),
+                rb(majit_ir::OpRef::const_int(1)),
+            ],
         ));
         bridge_advance.pos().set(majit_ir::OpRef::int_op(3));
         let bridge_jump = OpRc::new(majit_ir::Op::new(
@@ -7324,12 +7427,18 @@ mod tests {
         let label2 = majit_ir::make_loop_target_descr(71, false);
         let label_op = OpRc::new(majit_ir::Op::new(
             majit_ir::OpCode::Label,
-            &[rb(majit_ir::OpRef::input_arg_int(0)), rb(majit_ir::OpRef::input_arg_int(1))],
+            &[
+                rb(majit_ir::OpRef::input_arg_int(0)),
+                rb(majit_ir::OpRef::input_arg_int(1)),
+            ],
         ));
         label_op.setdescr(label2.clone());
         let advance = OpRc::new(majit_ir::Op::new(
             majit_ir::OpCode::IntAdd,
-            &[rb(majit_ir::OpRef::input_arg_int(0)), rb(majit_ir::OpRef::const_int(1))],
+            &[
+                rb(majit_ir::OpRef::input_arg_int(0)),
+                rb(majit_ir::OpRef::const_int(1)),
+            ],
         ));
         advance.pos().set(majit_ir::OpRef::int_op(2));
         let jump = OpRc::new(majit_ir::Op::new(
@@ -7341,11 +7450,7 @@ mod tests {
         ));
         jump.setdescr(label2);
         backend
-            .compile_loop(
-                &inputargs,
-                &[label_op, advance, jump],
-                &token2,
-            )
+            .compile_loop(&inputargs, &[label_op, advance, jump], &token2)
             .expect("second loop compiles");
         assert!(failguard::label_target(label_id).is_none());
         assert!(
@@ -7580,37 +7685,6 @@ mod tests {
     }
 
     #[test]
-    fn ca_alloc_frame_zeros_recycled_nursery_bytes() {
-        let _compile_guard = failguard::lock_cpu();
-        use majit_backend::jitframe::{JitFrame, jitframe_type_info};
-        use majit_gc::GcAllocator;
-
-        let mut gc = MiniMarkGC::new();
-        let tid = gc.register_type(jitframe_type_info());
-        let poison = gc.alloc_nursery_typed(tid, JitFrame::alloc_size(1));
-        assert_ne!(poison.0, 0);
-        unsafe {
-            std::ptr::write_bytes(poison.0 as *mut u8, 0xAA, JitFrame::alloc_size(1));
-        }
-        gc.collect_nursery();
-
-        set_wasm_jitframe_tid(tid);
-        let _gc_box = install_gc_box(Box::new(gc));
-        let frame = wasm_jit_ca_alloc_frame(std::mem::size_of::<isize>() as i64, 0);
-        assert_ne!(frame, 0);
-        unsafe {
-            let jf = frame as *const JitFrame;
-            assert_eq!((*jf).jf_descr, 0);
-            assert_eq!((*jf).jf_force_descr, 0);
-            assert_eq!((*jf).jf_savedata, 0);
-            assert_eq!((*jf).jf_guard_exc, 0);
-            assert!((*jf).jf_forward.is_null());
-        }
-        wasm_jit_ca_pop_frame(0);
-        set_wasm_jitframe_tid(0);
-    }
-
-    #[test]
     fn typed_blackhole_allocation_never_falls_back_to_raw_memory() {
         let _compile_guard = failguard::lock_cpu();
         // No active wasm GC is installed on this test thread.  A typed descr
@@ -7699,8 +7773,8 @@ mod tests {
             numbers: vec![token_number],
             ptrs: vec![compiled_ptr],
         };
-        ca_dispatch_publish(token_number, 11, compiled_ptr, 33, 44, 55, 0, 0, 0);
-        ca_dispatch_publish(token_number, 11, compiled_ptr, 33, 44, 55, 0, 0, 0);
+        ca_dispatch_publish(token_number, 11, compiled_ptr, 33, 44, 55, 0, 0, 0, 0, 0, 0);
+        ca_dispatch_publish(token_number, 11, compiled_ptr, 33, 44, 55, 0, 0, 0, 0, 0, 0);
 
         let table = failguard::WASM_CA_DISPATCH.lock();
         let entry = table
@@ -7713,7 +7787,7 @@ mod tests {
             assert_eq!(targets[0].has_guard_not_forced_2, 0);
         }
         drop(table);
-        ca_dispatch_publish(token_number, 11, compiled_ptr, 33, 44, 55, 0, 0, 1);
+        ca_dispatch_publish(token_number, 11, compiled_ptr, 33, 44, 55, 0, 0, 1, 0, 0, 0);
         let table = failguard::WASM_CA_DISPATCH.lock();
         let entry = table
             .as_ref()
@@ -7731,7 +7805,7 @@ mod tests {
             1
         );
         drop(table);
-        ca_dispatch_publish(token_number, 11, compiled_ptr, 33, 44, 55, 0, 0, 0);
+        ca_dispatch_publish(token_number, 11, compiled_ptr, 33, 44, 55, 0, 0, 0, 0, 0, 0);
         let table = failguard::WASM_CA_DISPATCH.lock();
         let entry = table
             .as_ref()
@@ -7755,7 +7829,7 @@ mod tests {
             numbers: vec![token_number],
             ptrs: vec![compiled_ptr],
         };
-        ca_dispatch_publish(token_number, 11, compiled_ptr, 33, 44, 55, 0, 0, 0);
+        ca_dispatch_publish(token_number, 11, compiled_ptr, 33, 44, 55, 0, 0, 0, 0, 0, 0);
         failguard::ca_dispatch_mark_gnf2(token_number);
         let table = failguard::WASM_CA_DISPATCH.lock();
         let entry = table
@@ -7786,9 +7860,9 @@ mod tests {
             numbers: vec![old_number, new_number],
             ptrs: vec![old_ptr, new_ptr],
         };
-        ca_dispatch_publish(old_number, 1, old_ptr, 33, 44, 55, 0, 0, 0);
-        ca_dispatch_publish(new_number, 2, new_ptr, 33, 44, 55, 0, 0, 0);
-        ca_dispatch_redirect(old_number, 2, new_ptr, 33, 44, 55, 0, 0, 0);
+        ca_dispatch_publish(old_number, 1, old_ptr, 33, 44, 55, 0, 0, 0, 0, 0, 0);
+        ca_dispatch_publish(new_number, 2, new_ptr, 33, 44, 55, 0, 0, 0, 0, 0, 0);
+        ca_dispatch_redirect(old_number, 2, new_ptr, 33, 44, 55, 0, 0, 0, 0, 0, 0);
         failguard::ca_dispatch_mark_gnf2(new_number);
 
         let table = failguard::WASM_CA_DISPATCH.lock();
@@ -7818,11 +7892,11 @@ mod tests {
             numbers: vec![alias, source],
             ptrs: vec![source_ptr, later_ptr],
         };
-        ca_dispatch_publish(alias, 1, source_ptr, 33, 44, 55, 0, 0, 0);
-        ca_dispatch_publish(source, 2, source_ptr, 33, 44, 55, 0, 0, 0);
+        ca_dispatch_publish(alias, 1, source_ptr, 33, 44, 55, 0, 0, 0, 0, 0, 0);
+        ca_dispatch_publish(source, 2, source_ptr, 33, 44, 55, 0, 0, 0, 0, 0, 0);
         // Second redirect replaces `.last()`; the S snapshot stays in
         // `targets` for in-flight callers that already loaded it.
-        ca_dispatch_redirect(alias, 3, later_ptr, 33, 44, 55, 0, 0, 0);
+        ca_dispatch_redirect(alias, 3, later_ptr, 33, 44, 55, 0, 0, 0, 0, 0, 0);
         failguard::ca_dispatch_mark_gnf2(source);
 
         let table = failguard::WASM_CA_DISPATCH.lock();
@@ -7855,11 +7929,11 @@ mod tests {
             numbers: vec![source, alias],
             ptrs: vec![compiled_ptr],
         };
-        ca_dispatch_publish(source, 2, compiled_ptr, 33, 44, 55, 0, 0, 0);
+        ca_dispatch_publish(source, 2, compiled_ptr, 33, 44, 55, 0, 0, 0, 0, 0, 0);
         failguard::ca_dispatch_mark_gnf2(source);
         // Redirect-shaped publish with a stale zero flag, as if the
         // CallAssemblerTarget clone was taken before the mark.
-        ca_dispatch_publish(alias, 2, compiled_ptr, 33, 44, 55, 0, 0, 0);
+        ca_dispatch_publish(alias, 2, compiled_ptr, 33, 44, 55, 0, 0, 0, 0, 0, 0);
 
         let table = failguard::WASM_CA_DISPATCH.lock();
         let entry = table

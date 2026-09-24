@@ -3603,21 +3603,9 @@ impl GcRewriter for GcRewriterImpl {
                 | OpCode::CallAssemblerR
                 | OpCode::CallAssemblerF
                 | OpCode::CallAssemblerN => {
-                    // `rewrite.py` always `handle_call_assembler` →
-                    // `gen_malloc_frame` → `gen_malloc_nursery_varsize_frame`,
-                    // which runs `emitting_an_operation_that_can_collect`
-                    // before the call. A backend that has not published
-                    // `jitframe_info` / `_ll_initial_locs` (wasm) leaves
-                    // the op in place but still runs that bookkeeping:
-                    // pending NULL stores flush and the nursery batch
-                    // closes. Convergence: set both fields and delete
-                    // this `is_none` arm.
-                    if self.jitframe_info.is_some() {
-                        self.handle_call_assembler(op, &mut st);
-                    } else {
-                        st.emitting_an_operation_that_can_collect();
-                        st.emit_maybe_forwarded(&op_rc);
-                    }
+                    // rewrite.py always `handle_call_assembler` →
+                    // `gen_malloc_frame` → `gen_malloc_nursery_varsize_frame`.
+                    self.handle_call_assembler(op, &mut st);
                     continue;
                 }
 
@@ -5097,31 +5085,75 @@ mod tests {
         assert_eq!(malloc_count, 2);
     }
 
-    /// wasm (`jitframe_info: None`) leaves CALL_ASSEMBLER in place, but
-    /// `gen_malloc_nursery_varsize_frame` still runs
-    /// `emitting_an_operation_that_can_collect` (rewrite.py)
-    /// before the call: pending NULL stores of the first NEW flush
-    /// before the op, and the second NEW is a fresh CallMallocNursery.
+    /// `handle_call_assembler` runs `gen_malloc_nursery_varsize_frame`, which
+    /// calls `emitting_an_operation_that_can_collect` before the call: the
+    /// first NEW's pending NULL store flushes, and the second NEW is a fresh
+    /// `CallMallocNursery`. The call itself becomes one frame argument.
     #[test]
-    fn test_call_assembler_without_jitframe_flushes_pending_and_breaks_batch() {
+    fn test_call_assembler_flushes_pending_and_breaks_batch() {
+        #[derive(Debug)]
+        struct TestLoopToken(u64);
+        impl majit_ir::Descr for TestLoopToken {
+            fn as_loop_token_descr(&self) -> Option<&dyn majit_ir::LoopTokenDescr> {
+                Some(self)
+            }
+        }
+        impl majit_ir::LoopTokenDescr for TestLoopToken {
+            fn loop_token_number(&self) -> u64 {
+                self.0
+            }
+        }
+
         let mut rw = make_rewriter();
-        assert!(rw.jitframe_info.is_none());
         rw.malloc_zero_filled = false;
+        rw.jitframe_info = Some(JitFrameDescrs {
+            jitframe_tid: 7,
+            jitframe_fixed_size: 56,
+            jf_frame_info_ofs: 0,
+            jf_descr_ofs: 8,
+            jf_force_descr_ofs: 16,
+            jf_savedata_ofs: 24,
+            jf_guard_exc_ofs: 32,
+            jf_forward_ofs: 40,
+            jf_frame_ofs: 56,
+            jf_frame_baseitemofs: 64,
+            jf_frame_lengthofs: 56,
+            sign_size: 8,
+        });
+        rw.call_assembler_callee_locs = Some(Box::new(|token| {
+            (token == 9).then_some(CallAssemblerCalleeLocs {
+                _ll_initial_locs: Vec::new(),
+                frame_depth: 4,
+                frame_info_ptr: 0x1000,
+                index_of_virtualizable: -1,
+            })
+        }));
         let gc_fields = vec![ref_field_descr_at(24)];
         let descr = size_descr_with_gc_fields(48, 42, gc_fields);
+        let call = Op::with_descr(
+            OpCode::CallAssemblerN,
+            &[],
+            std::sync::Arc::new(TestLoopToken(9)),
+        );
         let ops = vec![
             Op::with_descr(OpCode::New, &[], descr),
-            Op::new(OpCode::CallAssemblerN, &[]),
+            call,
             Op::with_descr(OpCode::New, &[], size_descr(24, 2)),
         ];
 
         let result = rw.rewrite_ops(&ops);
 
+        let frame_idx = result
+            .iter()
+            .position(|o| o.opcode == OpCode::CallMallocNurseryVarsizeFrame)
+            .expect("handle_call_assembler allocates the callee frame");
         let call_idx = result
             .iter()
             .position(|o| o.opcode == OpCode::CallAssemblerN)
-            .expect("CallAssemblerN survives when jitframe_info is None");
-        let null_before: Vec<i64> = result[..call_idx]
+            .expect("rewritten CALL_ASSEMBLER");
+        assert!(frame_idx < call_idx);
+        assert_eq!(result[call_idx].num_args(), 1);
+        let null_before: Vec<i64> = result[..frame_idx]
             .iter()
             .filter(|o| o.opcode == OpCode::GcStore)
             .filter(|o| o.arg(2).to_opref().inline_const_bits() == Some(0))
@@ -5132,28 +5164,17 @@ mod tests {
                     .expect("inline ConstInt")
             })
             .collect();
-        assert_eq!(
-            null_before,
-            vec![24],
-            "pending NULL GcStore for the first New must flush before CallAssemblerN, got {:?}",
-            result
+        assert!(
+            null_before.contains(&24),
+            "pending NULL GcStore for the first New must flush before the frame malloc, got {null_before:?} in {result:?}"
         );
-
         let malloc_count = result
             .iter()
             .filter(|o| o.opcode == OpCode::CallMallocNursery)
             .count();
         assert_eq!(
             malloc_count, 2,
-            "second New must be a fresh CallMallocNursery, got {:?}",
-            result
-        );
-        assert!(
-            result
-                .iter()
-                .all(|o| o.opcode != OpCode::NurseryPtrIncrement),
-            "CallAssemblerN must close the nursery batch, got {:?}",
-            result
+            "second New must be a fresh CallMallocNursery, got {result:?}"
         );
     }
 
