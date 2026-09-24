@@ -149,11 +149,13 @@ two-phase-never-a-subject	pyre_interpreter::baseobjspace::view_as_kwargs
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::w_type_getdictvalue
 two-phase-never-a-subject	pyre_interpreter::builtins::<Impl>::acquire
 two-phase-never-a-subject	pyre_interpreter::builtins::<Impl>::as_mut_slice
+two-phase-never-a-subject	pyre_interpreter::builtins::__majit_wrap_base_exception_descr_init::<Impl>::call
 two-phase-never-a-subject	pyre_interpreter::builtins::__majit_wrap_builtin_abs
 two-phase-never-a-subject	pyre_interpreter::builtins::__majit_wrap_builtin_dunder_import
 two-phase-never-a-subject	pyre_interpreter::builtins::__majit_wrap_builtin_isinstance
 two-phase-never-a-subject	pyre_interpreter::builtins::__majit_wrap_builtin_len
 two-phase-never-a-subject	pyre_interpreter::builtins::__majit_wrap_builtin_locals
+two-phase-never-a-subject	pyre_interpreter::builtins::__majit_wrap_exc_value_error_descr_new::<Impl>::call
 two-phase-never-a-subject	pyre_interpreter::builtins::abs_structural
 two-phase-never-a-subject	pyre_interpreter::builtins::acquire_readbuf
 two-phase-never-a-subject	pyre_interpreter::builtins::backing_exports_incref
