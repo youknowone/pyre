@@ -1676,6 +1676,15 @@ impl Trace {
     /// history.py parity: the recording phase ends and the trace is handed
     /// to the optimizer as a `TreeLoop`. See `TraceCtx::into_tree_loop` for
     /// the snapshot-bearing path.
+    /// Clone the materialized inputargs and ops without draining the recorder.
+    /// `compile_retrace`'s `InvalidLoop` arm cuts the tentative JUMP off the
+    /// live history (`compile_retrace` `history.cut`) and keeps tracing, so the
+    /// optimizer has to see a copy.
+    pub fn clone_materialized_parts(&mut self) -> (Vec<InputArgRc>, Vec<OpRc>) {
+        self.materialize_into_ops();
+        (self.inputargs.clone(), self.ops.clone())
+    }
+
     pub fn into_parts(self) -> (Vec<InputArgRc>, Vec<OpRc>) {
         let ops = if self.trb.is_some() && self.ops.is_empty() {
             self.materialize_ops()

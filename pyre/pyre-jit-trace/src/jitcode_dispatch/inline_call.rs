@@ -12053,6 +12053,256 @@ pub(super) fn generator_resume_yield<Sym: WalkSym>(
     Ok(Some(store.value))
 }
 
+/// A walk that is not resuming a generator ends at `YIELD_VALUE` the way
+/// `RETURN_VALUE` ends a frame.
+///
+/// `pyopcode.py` `YIELD_VALUE` raises `Yield`; `interp_jit.py` `dispatch`
+/// catches it with `popvalue()`, `jit.hint(..., force_virtualizable=True)`,
+/// and returns that value. The portal then `compile_done_with_this_frame`s.
+/// The marker stays `abort_permanent` so a resume sub-walk can still stop on
+/// it (`generator_resume_yield`); this path is every other walk.
+///
+/// `last_instr` is the yield's own Python pc. `dispatch_bytecode` stores
+/// `set_last_instr_from_next_instr(fallthrough)` before the opcode, and
+/// `execute_yield_value` does not move it, so the next `send` starts at the
+/// instruction after the yield. The yielded value is popped: depth is one
+/// below the marker's pre-opcode stack, whose top slot is that value.
+pub(super) fn portal_yield_frame_exit<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+) -> Option<(OpRef, i64)> {
+    if ctx.fbw_mode.generator_resume.is_some() {
+        return None;
+    }
+    let Some((py_pc, code_ptr)) = yield_marker_py_pc(ctx, op_pc) else {
+        return None;
+    };
+    let is_yield = unsafe {
+        pyre_interpreter::decode_instruction_at(code_ptr.as_ref()?, py_pc).is_some_and(
+            |(instr, _)| matches!(instr, pyre_interpreter::Instruction::YieldValue { .. }),
+        )
+    };
+    if !is_yield {
+        return None;
+    }
+    // `vstack_last_ref` is the producer of the current opcode and is cleared
+    // at the opcode boundary. The yield marker is the first op of its own
+    // opcode, so that clear has already moved the yielded ref onto
+    // `vstack_boxes`. An int-bank temporary stays `NONE` there; then there
+    // is no ref for this exit to return.
+    let state = ctx.frame_state.borrow();
+    let mirrored = if ctx.vstack_valid && ctx.vstack_depth > 0 {
+        state
+            .vstack_boxes
+            .get(ctx.vstack_depth - 1)
+            .copied()
+            .unwrap_or(OpRef::NONE)
+    } else {
+        OpRef::NONE
+    };
+    let value = if !mirrored.is_none() {
+        mirrored
+    } else if !state.vstack_last_ref.is_none() {
+        state.vstack_last_ref
+    } else {
+        OpRef::NONE
+    };
+    drop(state);
+    // An int-bank temporary never lands in the Ref mirror. The marker's
+    // `setarrayitem_vable_r` has already written that boxed value into the
+    // standard virtualizable, at the slot just below `valuestackdepth`.
+    // A loop-header walk can also leave the mirror invalid (`ReturnGenerator`
+    // is unmodeled, so the boundary latch drops it) while the value register
+    // the marker just stored is still live. That register is the yielded
+    // ref even when the virtualizable slot index does not match.
+    let value = if value.is_none() {
+        portal_yield_tos_from_vable(ctx).unwrap_or(OpRef::NONE)
+    } else {
+        value
+    };
+    if value.is_none() {
+        return None;
+    }
+    Some((value, py_pc as i64))
+}
+
+/// The yielded ref the `abort_permanent` marker just flushed into the portal
+/// virtualizable. `valuestackdepth` is absolute, so the popped slot is one
+/// below it.
+fn portal_yield_tos_from_vable<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> Option<OpRef> {
+    let info = ctx.trace_ctx.virtualizable_info()?;
+    let depth_index = info.static_field_index_by_name("valuestackdepth")?;
+    let (_, majit_ir::Value::Int(depth)) = ctx.trace_ctx.virtualizable_entry_at(depth_index)?
+    else {
+        return None;
+    };
+    let slot = usize::try_from(depth).ok()?.checked_sub(1)?;
+    let flat = crate::virtualizable_gen::NUM_VABLE_SCALARS + slot;
+    let (op, _) = ctx.trace_ctx.virtualizable_entry_at(flat)?;
+    if op.is_none() { None } else { Some(op) }
+}
+
+/// Flush the yield suspension after the trace finish has published its own
+/// `last_instr`. `emit_abort_permanent` left `py_pc - 1` and the yielded
+/// value on the stack; `fbw_terminate_with_finish` may have published the
+/// marker's resolved coordinate. The hint runs last so the flushed
+/// virtualizable is the post-yield frame.
+pub(super) fn flush_yield_exit<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>, py_pc: i64) {
+    publish_yield_exit_state(ctx, py_pc);
+    // `gen_store_back_in_vable` (`hint_force_virtualizable`) records every
+    // virtualizable field, array items included. The walker is not the
+    // interpreter, and `synchronize_virtualizable` skips the write when an
+    // outer executor owns the struct — a no-replay `Finish` then returns the
+    // yielded value without replaying those stores. The live frame the
+    // interpreter resumes is `recording_frame_ptr`, so the same array image
+    // the hint publishes has to land there before the trace ends.
+    publish_yield_vable_array(ctx);
+    if let Some(vbox) = ctx.trace_ctx.standard_virtualizable_box() {
+        ctx.trace_ctx.gen_store_back_in_vable(vbox);
+    }
+}
+
+/// Copy every `locals_cells_stack_w` slot of the standard virtualizable onto
+/// the live portal frame. Scalar fields are published by
+/// [`publish_yield_exit_state`]; this is the array half of
+/// `gen_store_back_in_vable`.
+fn publish_yield_vable_array<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>) {
+    let frame = ctx.session.borrow().recording_frame_ptr;
+    if frame == 0 {
+        return;
+    }
+    let len = {
+        let Some(lengths) = ctx.trace_ctx.virtualizable_array_lengths() else {
+            return;
+        };
+        lengths.first().copied().unwrap_or(0)
+    };
+    if len == 0 {
+        return;
+    }
+    // First note wins, so an earlier `f_locals` mirror keeps the pre-walk
+    // image. A yield that is the first writer captures the whole array,
+    // stack slots included, because this flush writes those too.
+    fbw_note_locals_mirror_undo(frame, len);
+    let base = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+    for slot in 0..len {
+        let Some((op, mut value)) = ctx.trace_ctx.virtualizable_entry_at(base + slot) else {
+            continue;
+        };
+        // The array half of `gen_store_back_in_vable` stores the box. A slot
+        // whose concrete half is still null keeps that box's stamped value,
+        // which is what the recorded `setarrayitem_gc` writes.
+        if matches!(value, majit_ir::Value::Void)
+            || matches!(value, majit_ir::Value::Ref(r) if r.is_null())
+        {
+            if let Some(stamped) = ctx.trace_ctx.concrete_of_opref(op) {
+                value = stamped;
+            }
+        }
+        let boxed = crate::state::boxed_slot_value_for_type(majit_ir::Type::Ref, &value);
+        crate::state::store_live_frame_array_slot(
+            frame,
+            slot,
+            majit_ir::Value::Ref(majit_ir::GcRef(boxed as usize)),
+        );
+    }
+}
+
+/// Python pc and code object of an `abort_permanent` at `op_pc`, when that
+/// marker belongs to the jitcode this walk is executing.
+fn yield_marker_py_pc<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+) -> Option<(usize, *const pyre_interpreter::CodeObject)> {
+    if ctx.is_top_level {
+        let sym = ctx.fbw_mode.snapshot_sym;
+        if sym.is_null() {
+            return None;
+        }
+        // SAFETY: the sym and its jitcode live for this walk; read-only.
+        let code_ptr = unsafe {
+            let jitcode = (*sym).jitcode();
+            if jitcode.is_null() {
+                return None;
+            }
+            let jitcode = &*jitcode;
+            jitcode.payload.code_ptr
+        };
+        let py_pc = fbw_abort_resume_py_pc(unsafe { &*sym }, op_pc)?;
+        return Some((py_pc, code_ptr));
+    }
+    let consts = ctx.inline_callee_consts?;
+    let pjc = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index)?;
+    let py_pc = pjc
+        .metadata
+        .abort_permanent_py_pc_by_jit_pc
+        .iter()
+        .find(|&&(off, _)| off as usize == op_pc)
+        .map(|&(_, py)| py as usize)?;
+    if consts.w_code == 0 {
+        return None;
+    }
+    let code_ptr =
+        unsafe { pyre_interpreter::w_code_get_ptr(consts.w_code as pyre_object::PyObjectRef) }
+            as *const pyre_interpreter::CodeObject;
+    Some((py_pc, code_ptr))
+}
+
+/// Store the suspension `StepResult::Yield` leaves: `last_instr` at the yield,
+/// operand stack one slot shorter.
+fn publish_yield_exit_state<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>, py_pc: i64) {
+    let Some(info) = ctx.trace_ctx.virtualizable_info().cloned() else {
+        return;
+    };
+    let Some(vbox) = ctx.trace_ctx.standard_virtualizable_box() else {
+        return;
+    };
+    if let Some(field_index) = info.static_field_index_by_name("last_instr") {
+        let value = ctx.trace_ctx.const_int(py_pc);
+        let descr = info.static_field_struct_descr(field_index);
+        ctx.trace_ctx.vable_setfield_descr(vbox, value, descr);
+        crate::trace_opcode::mirror_vable_static_to_boxes(
+            ctx.trace_ctx,
+            "last_instr",
+            value,
+            majit_ir::Value::Int(py_pc),
+        );
+    }
+    let frame = ctx.session.borrow().recording_frame_ptr;
+    if frame != 0 {
+        fbw_note_last_instr_undo(frame);
+        // SAFETY: `frame_layout` pins `last_instr` at this offset.
+        unsafe {
+            *((frame + crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET) as *mut isize) =
+                py_pc as isize;
+        }
+    }
+    let Some(depth_index) = info.static_field_index_by_name("valuestackdepth") else {
+        return;
+    };
+    let Some((_, majit_ir::Value::Int(depth))) = ctx.trace_ctx.virtualizable_entry_at(depth_index)
+    else {
+        return;
+    };
+    if depth <= 0 {
+        return;
+    }
+    let popped = depth - 1;
+    let value = ctx.trace_ctx.const_int(popped);
+    let descr = info.static_field_struct_descr(depth_index);
+    ctx.trace_ctx.vable_setfield_descr(vbox, value, descr);
+    crate::trace_opcode::mirror_vable_static_to_boxes(
+        ctx.trace_ctx,
+        "valuestackdepth",
+        value,
+        majit_ir::Value::Int(popped),
+    );
+    if frame != 0 {
+        fbw_note_frame_vsd_undo(frame);
+        crate::state::set_concrete_stack_depth(frame, popped as usize);
+    }
+}
+
 /// Write one static field of the suspended generator frame.
 ///
 /// The generator is not the trace's standard virtualizable — that stays the
@@ -12416,15 +12666,16 @@ fn gen_resume_decline(reason: &str) {
 /// `can_inline_callable` (`warmstate.py`) is true only when `perform_call`
 /// (`pyjitpl.py`) can `newframe` and `capture_resumedata` the resulting
 /// MIFrame, and the walk's yield is `dispatch`'s `except Yield` `popvalue()`.
-/// A `newframe` without that `popvalue` compiled `FOR_ITER` to hand the
-/// iterator back as the item (`int + generator` on
-/// `generator_iteration__main`).  Enabling the walk without that
-/// `popvalue` also lets the generator `while` start traces that die on
-/// the yield `abort_permanent` (`calls_closures` `loops_aborted` 1→11).
-/// Stay residual until the walk's TOS is that `popvalue`.
+/// That `popvalue` is the top slot `YIELD_VALUE` leaves on the entry stack:
+/// `emit_abort_permanent!` stores `pre_opcode_stack` before the fall-through
+/// placeholder, and `generator_resume_yield` returns that slot. A `newframe`
+/// without it compiled `FOR_ITER` to hand the iterator back as the item
+/// (`int + generator` on `generator_iteration__main`) and let the generator
+/// `while` start traces that die on the yield `abort_permanent`
+/// (`calls_closures` `loops_aborted` 1→11).
 #[inline(never)]
 fn generator_resume_can_perform_call<Sym: WalkSym>(_ctx: &WalkContext<'_, '_, Sym>) -> bool {
-    false
+    true
 }
 
 /// Resume a suspended generator into the trace at a `FOR_ITER`, in place of
@@ -12440,9 +12691,10 @@ fn generator_resume_can_perform_call<Sym: WalkSym>(_ctx: &WalkContext<'_, '_, Sy
 ///
 /// That look-inside is `_opimpl_recursive_call` → `perform_call` →
 /// `newframe` (`pyjitpl.py`) and ends at `except Yield` `popvalue()`.
-/// Until `generator_resume_can_perform_call` is true, the residual
-/// `jit_next` stays in place — `do_residual_call`, not a start-then-abort
-/// of the parent `FOR_ITER` loop and not a miscompiled item.
+/// `generator_resume_can_perform_call` is that `popvalue`: the yield
+/// marker's entry-stack top. When it declines, the residual `jit_next`
+/// stays in place — `do_residual_call`, not a start-then-abort of the
+/// parent `FOR_ITER` loop and not a miscompiled item.
 pub(crate) fn try_walker_specialize_generator_next<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,

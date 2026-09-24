@@ -3970,6 +3970,10 @@ impl<S: JitState> JitDriver<S> {
                     // The walker published the token key it reached (`close_jump_into_key`); this is
                     // the `compile_trace` call, and its success ends the trace exactly the way
                     // `raise_if_successful` (pyjitpl.py) does.
+                    // Set when this visit already ran `compile_trace`, so the
+                    // bridge-origin block below does not run it a second time.
+                    // `reached_loop_header` calls `compile_trace` once per header visit.
+                    let mut compile_trace_attempted = false;
                     if let Some(target_key) = self
                         .meta
                         .trace_ctx()
@@ -3989,6 +3993,7 @@ impl<S: JitState> JitDriver<S> {
                         if self.meta.partial_trace().is_none()
                             && self.meta.has_compiled_targets(target_key)
                         {
+                            compile_trace_attempted = true;
                             attempted = true;
                             continue_running_normally_values = {
                                 let trace_meta = self.meta.trace_meta().cloned();
@@ -4095,30 +4100,34 @@ impl<S: JitState> JitDriver<S> {
                                 self.bridge_attempt_declined = true;
                             }
                             crate::pyjitpl::BridgeCompileResult::Declined => {
-                                // pyjitpl.py raise_if_successful does not raise
-                                // on None. The reached greens are the target
-                                // we failed to JUMP into, so the merge-point
-                                // scan below (same-greenkey of this trace)
-                                // must not compile_loop them. Re-enter the
-                                // walk as `reached_loop_header` does after
-                                // appending a merge point. Do not latch: the
-                                // next header visit retries compile_trace
-                                // (`if not self.partial_trace`).
+                                // pyjitpl.py `raise_if_successful` does not raise
+                                // on None, so control reaches the
+                                // `current_merge_points` scan (`reached_loop_header`).
+                                // No prior same-greenkey entry appends and
+                                // tracing continues; the next visit retries
+                                // `compile_trace`. A prior entry calls
+                                // `compile_loop`, which gives the trace up when
+                                // that key still `has_compiled_targets`.
+                                //
+                                // An unattempted close (`partial_trace` already
+                                // set, or the token is gone) reaches the same
+                                // scan: `reached_loop_header` skips
+                                // `compile_trace` and falls into the
+                                // `current_merge_points` loop unchanged. With no
+                                // prior same-greenkey entry it appends and keeps
+                                // tracing; with one it falls through to
+                                // `compile_loop` / `compile_retrace` below.
                                 if attempted {
                                     crate::mc_diag_bump(50); // bridge_declined_close
                                 } else {
                                     crate::mc_diag_bump(67); // bridge_unattempted_close
                                 }
-                                if let Some(ctx) = self.meta.trace_ctx() {
-                                    ctx.resume_walk_after_close();
-                                    ctx.close_greens = None;
-                                    ctx.close_green_pc = None;
+                                if self
+                                    .keep_tracing_after_declined_jump(target_key, &live_arg_boxes)
+                                {
+                                    continue;
                                 }
-                                self.meta.single_pass_outcome = None;
-                                self.meta.single_pass_scalar_values = None;
-                                self.meta.single_pass_ref_scalar_values = None;
-                                self.meta.single_pass_virt_array_values = None;
-                                continue;
+                                self.bridge_attempt_declined = true;
                             }
                             crate::pyjitpl::BridgeCompileResult::Failed => {
                                 self.meta.abort_trace(false);
@@ -4143,8 +4152,11 @@ impl<S: JitState> JitDriver<S> {
                     // pyjitpl.py `if not self.partial_trace:` is the only
                     // compile_trace gate. Upstream retries on every header
                     // visit; do not skip a later visit after a decline.
+                    // `compile_trace_attempted` is that one call for this visit.
                     let has_partial_trace = self.meta.partial_trace().is_some();
-                    if let Some(bridge) = self.meta.bridge_info().filter(|_| !has_partial_trace) {
+                    if !compile_trace_attempted
+                        && let Some(bridge) = self.meta.bridge_info().filter(|_| !has_partial_trace)
+                    {
                         let bridge_key = bridge.green_key;
                         let bridge_trace_id = bridge.trace_id;
                         let bridge_fail_index = bridge.fail_index;
@@ -4337,12 +4349,21 @@ impl<S: JitState> JitDriver<S> {
                                     // merge-point scan.
                                     crate::pyjitpl::BridgeCompileResult::Declined => {
                                         crate::mc_diag_bump(50); // bridge_declined_close
+                                        // `reached_loop_header` — no prior same-greenkey
+                                        // entry appends and the walk continues.
+                                        // A prior entry falls through to
+                                        // compile_loop.
+                                        if self.keep_tracing_after_declined_jump(
+                                            target_key,
+                                            &live_arg_boxes,
+                                        ) {
+                                            continue;
+                                        }
                                         // The resumekey survives because upstream
                                         // never clears it in this region
                                         // (pyjitpl.py:2979-3060); only the attempt
                                         // latch is set.
                                         self.bridge_attempt_declined = true;
-                                        // Fall through — do NOT return.
                                     }
                                     crate::pyjitpl::BridgeCompileResult::Failed => {
                                         self.meta.abort_trace(false);
@@ -4570,12 +4591,18 @@ impl<S: JitState> JitDriver<S> {
                                 // scan.
                                 crate::pyjitpl::BridgeCompileResult::Declined => {
                                     crate::mc_diag_bump(50); // bridge_declined_close
+                                    // `reached_loop_header` — no prior same-greenkey
+                                    // entry appends and the walk continues.
+                                    // A prior entry falls through to compile_loop.
+                                    if self.keep_tracing_after_declined_jump(target_key, &jump_args)
+                                    {
+                                        continue;
+                                    }
                                     // The resumekey survives because upstream never
                                     // clears it in this region
                                     // (pyjitpl.py:2979-3060); only the attempt
                                     // latch is set.
                                     self.bridge_attempt_declined = true;
-                                    // Fall through — do NOT return.
                                 }
                                 crate::pyjitpl::BridgeCompileResult::Failed => {
                                     self.meta.abort_trace(false);
@@ -5141,6 +5168,65 @@ impl<S: JitState> JitDriver<S> {
             }
             break;
         }
+    }
+
+    /// `pyjitpl.py` `reached_loop_header` after `compile_trace` returns
+    /// without raising.
+    ///
+    /// The reverse scan (`reached_loop_header`) either finds a prior
+    /// same-greenkey merge point — the caller then runs `compile_loop`,
+    /// which gives up when that key still `has_compiled_targets` — or
+    /// appends `(live_arg_boxes, start)` and keeps tracing. The next header
+    /// visit retries `compile_trace` (`if not self.partial_trace`).
+    ///
+    /// Returns `true` when this visit appended and the walk should continue.
+    fn keep_tracing_after_declined_jump(
+        &mut self,
+        target_key: u64,
+        live_arg_boxes: &[OpRef],
+    ) -> bool {
+        let (header_pc, already, key_typed) = {
+            let Some(ctx) = self.meta.trace_ctx() else {
+                return false;
+            };
+            // pyjitpl.py same_greenkey: the green key is the identity.
+            // `header_pc` recorded below is this close's guest pc.
+            let key_typed = ctx
+                .close_green_key()
+                .filter(|key| key.get_uhash() == target_key);
+            (
+                ctx.close_header_pc(),
+                ctx.find_merge_point_same_greenkey(target_key, key_typed.as_ref())
+                    .is_some(),
+                key_typed,
+            )
+        };
+        if already {
+            return false;
+        }
+        let green_boxes: Vec<crate::trace_ctx::GreenBox> = live_arg_boxes
+            .iter()
+            .map(|&op| crate::trace_ctx::GreenBox::new(op, op.ty().unwrap_or(majit_ir::Type::Void)))
+            .collect();
+        {
+            let Some(ctx) = self.meta.trace_ctx() else {
+                return false;
+            };
+            ctx.add_merge_point_with_key(target_key, key_typed, green_boxes, header_pc);
+            // `saved_pc`: the resumed walk executes the
+            // merge-point instruction once instead of closing again with
+            // nothing recorded in between.
+            ctx.resume_walk_after_close();
+            ctx.close_greens = None;
+            ctx.close_green_pc = None;
+        }
+        // The handoff staged for a trace that ENDED must not publish: the
+        // walk is still recording.
+        self.meta.single_pass_outcome = None;
+        self.meta.single_pass_scalar_values = None;
+        self.meta.single_pass_ref_scalar_values = None;
+        self.meta.single_pass_virt_array_values = None;
+        true
     }
 
     /// pyjitpl.py `blackhole_if_trace_too_long` + pyjitpl.py

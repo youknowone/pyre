@@ -1268,14 +1268,18 @@ pub(crate) fn flush_callee_locals_region(
     })
 }
 
-/// Publish `PyFrame.frame_finished_execution = True` on the current
-/// MIFrame's own red frame.
+/// Apply `PyFrame.frame_finished_execution = True` on the concrete frame a
+/// `*_return` just finished.
 ///
-/// `PyFrame.finish_value` performs this store before returning
-/// `StepResult::Return`.  The walker consumes the lowered `*_return` JitCode
-/// operation directly, so it must preserve that preceding interpreter state
-/// transition on both the emitted frame operand and its recording-time
-/// concrete shadow.
+/// `pyopcode.py` `RETURN_VALUE` stores the bit before returning, and the
+/// codewriter emits that read-or-write of `PyFrame.flags` immediately before
+/// `*_return`. The walker records it by executing that jitcode. The recorded
+/// `setfield_gc` stays record-only for a frame the walk did not allocate, and
+/// a no-replay portal exit never re-executes the trace, so the concrete bit
+/// still has to land on that pre-existing frame here. `YIELD_VALUE` does not
+/// reach this function: its frame exit is the `abort_permanent` arm, which
+/// finishes the trace without the store. `generator.py` `send_ex` reads the
+/// bit to tell the two apart.
 fn finish_current_frame_execution<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     opcode_position: usize,
@@ -1289,25 +1293,19 @@ fn finish_current_frame_execution<Sym: WalkSym>(
     if !ctx.is_top_level {
         residual_call::record_and_publish_inline_callee_last_instr(ctx, opcode_position);
     }
-    let (frame, concrete_frame) = if ctx.is_top_level {
-        let sym = ctx.fbw_mode.snapshot_sym;
-        if sym.is_null() {
-            return;
-        }
-        // The emitted operand is the live red frame.  Do not mutate that live
-        // frame during a speculative top-level walk: the no-replay commit in
-        // `compile_and_run_once` performs the concrete transition only after
-        // the walk has produced a consumable Return payload.
-        (unsafe { (&*sym).frame() }, std::ptr::null_mut())
+    let concrete_frame = if ctx.is_top_level {
+        // `fbw_store_token_in_vable` captures a guard snapshot and that
+        // capture returns `Err`. Setting the bit before the `?` would leave
+        // it on a frame whose walk was declined. `commit_top_level_frame_finished`
+        // runs only after `fbw_terminate_with_finish` returns `Ok`.
+        return;
     } else {
         let jitcode_index = ctx
             .inline_callee_consts
             .map_or(-1, |consts| consts.jitcode_index);
-        let mut frame = OpRef::NONE;
         let mut concrete = std::ptr::null_mut();
         if let Some(jitcode) = crate::state::pyjitcode_for_jitcode_index(jitcode_index) {
             let frame_reg = jitcode.metadata.portal_frame_reg as usize;
-            frame = ctx.registers_r.get(frame_reg).unwrap_or(OpRef::NONE);
             concrete = match ctx
                 .frame_state
                 .borrow()
@@ -1321,10 +1319,12 @@ fn finish_current_frame_execution<Sym: WalkSym>(
         }
         // `sys._getframe` marks the inlined callee's own red frame escaped
         // (`CalleeLocalsShadow`).  After the walk rewrites that frame as
-        // `NewWithVtable`, `portal_frame_reg` can name a different box or
-        // an unescaped concrete, and finishing that other box leaves the
-        // returned object with only `FLAG_ESCAPED`.  `frame.clear()` then
-        // refuses a frame that has already returned.
+        // `NewWithVtable`, `portal_frame_reg` can name a different box, and
+        // finishing that other box leaves the returned object with only
+        // `FLAG_ESCAPED`.  `frame.clear()` then refuses a frame that has
+        // already returned. A frame the walk allocated already received the
+        // jitcode store; this covers the pre-existing escaped object the
+        // record-only `setfield_gc` did not write.
         if let Some(shadow) = ctx.frame_state.borrow().callee_shadow.as_ref() {
             let shadow_concrete = if shadow.concrete_frame == 0 {
                 std::ptr::null_mut()
@@ -1332,53 +1332,31 @@ fn finish_current_frame_execution<Sym: WalkSym>(
                 shadow.concrete_frame as *mut pyre_interpreter::PyFrame
             };
             if !shadow_concrete.is_null() && unsafe { (*shadow_concrete).escaped() } {
-                if shadow.frame_box != OpRef::NONE {
-                    frame = shadow.frame_box;
-                }
                 concrete = shadow_concrete;
             }
         }
-        (frame, concrete)
+        if concrete.is_null() || unsafe { !(*concrete).escaped() } {
+            // An unescaped inline frame has no observer after return.
+            // optimizeopt.virtualize removes that virtual MIFrame.
+            return;
+        }
+        concrete
     };
-    if frame.is_none() {
-        return;
-    }
-    if !ctx.is_top_level && (concrete_frame.is_null() || unsafe { !(*concrete_frame).escaped() }) {
-        // RPython records this store on a virtual MIFrame and
-        // optimizeopt.virtualize removes the whole frame when it never
-        // escapes.  The walker has already selected the concrete path and can
-        // make the same distinction before recording: an unescaped inline
-        // frame has no observer after return.  Escaped inline frames and the
-        // portal red frame keep the real store below.
-        return;
-    }
-
-    // The emitted store is what carries the transition into compiled code and
-    // its bridges.  `pyre-jit`'s publishers each reach the portal frame alone,
-    // so an escaped inline callee's frame is finished by this trace operation
-    // or by nothing at all, and `frame.clear()` then refuses a frame that has
-    // returned.
-    let flags_descr = crate::descr::pyframe_flags_descr();
-    let live_flags = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, frame, flags_descr.clone());
-    let finished_bit = ctx
-        .trace_ctx
-        .const_int(i64::from(pyre_interpreter::PyFrame::FLAG_FRAME_FINISHED));
-    let new_flags = ctx
-        .trace_ctx
-        .record_op(OpCode::IntOr, &[live_flags, finished_bit]);
-    ctx.trace_ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[frame, new_flags],
-        flags_descr.clone(),
-    );
-    ctx.trace_ctx
-        .heapcache_setfield_cached(frame, flags_descr.index(), new_flags);
-
-    // The top-level arm hands this a null carrier on purpose — the live red
-    // frame is transitioned by the no-replay commit, not by the walk — so the
-    // concrete store belongs to an escaped inline callee alone.
     if !concrete_frame.is_null() {
         unsafe { (*concrete_frame).set_frame_finished_execution(true) };
+    }
+}
+
+/// `PyFrame.frame_finished_execution = True` on the live portal frame, after
+/// `fbw_terminate_with_finish` has accepted the exit. See
+/// [`finish_current_frame_execution`].
+fn commit_top_level_frame_finished<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) {
+    let frame = ctx.session.borrow().recording_frame_ptr;
+    if frame == 0 {
+        return;
+    }
+    unsafe {
+        (*(frame as *mut pyre_interpreter::PyFrame)).set_frame_finished_execution(true);
     }
 }
 
@@ -12869,6 +12847,46 @@ fn handle<Sym: WalkSym>(
                     op.next_pc,
                 ));
             }
+            // `YIELD_VALUE` on any walk except the generator-resume sub-walk
+            // is a frame exit (`dispatch`'s `except Yield`), the same FINISH
+            // `ref_return/r` records. The frame stays suspended: do not set
+            // `FLAG_FRAME_FINISHED`.
+            if let Some((yielded, yield_py_pc)) = portal_yield_frame_exit(ctx, op.pc) {
+                if !yielded.is_constant() {
+                    if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) =
+                        ctx.trace_ctx.concrete_of_opref(yielded)
+                    {
+                        if ptr != 0 {
+                            ctx.trace_ctx.set_opref_concrete(
+                                yielded,
+                                majit_ir::Value::Ref(majit_ir::GcRef(ptr)),
+                            );
+                        }
+                    }
+                }
+                if ctx.is_top_level {
+                    if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) =
+                        ctx.trace_ctx.concrete_of_opref(yielded)
+                    {
+                        if ptr != 0 {
+                            fbw_finish_concrete_set(ConcreteValue::Ref(
+                                ptr as pyre_object::PyObjectRef,
+                            ));
+                        }
+                    }
+                    fbw_terminate_with_finish(ctx, yielded, op.pc)?;
+                    // After the finish's own `last_instr` store, so the hint
+                    // flushes the yield coordinate and the popped depth.
+                    flush_yield_exit(ctx, yield_py_pc);
+                    return Ok((DispatchOutcome::Terminate, op.next_pc));
+                }
+                return Ok((
+                    DispatchOutcome::SubReturn {
+                        result: Some(yielded),
+                    },
+                    op.next_pc,
+                ));
+            }
             // pyre-only `BC_ABORT_PERMANENT` fail-path
             // (`bhimpl_abort_permanent`, `blackhole.rs`): emitted for
             // paths that must always terminate the frame (BigInt-overflow
@@ -13707,6 +13725,7 @@ fn handle<Sym: WalkSym>(
                     }
                 }
                 fbw_terminate_with_finish(ctx, result, op.pc)?;
+                commit_top_level_frame_finished(ctx);
                 Ok((DispatchOutcome::Terminate, op.next_pc))
             } else {
                 Ok((
@@ -13747,6 +13766,7 @@ fn handle<Sym: WalkSym>(
                     fbw_finish_concrete_set(ConcreteValue::Int(v));
                 }
                 fbw_terminate_with_finish(ctx, result, op.pc)?;
+                commit_top_level_frame_finished(ctx);
                 Ok((DispatchOutcome::Terminate, op.next_pc))
             } else {
                 Ok((
@@ -13770,6 +13790,7 @@ fn handle<Sym: WalkSym>(
             if ctx.is_top_level {
                 fbw_finish_concrete_set(ConcreteValue::Int(value));
                 fbw_terminate_with_finish(ctx, result, op.pc)?;
+                commit_top_level_frame_finished(ctx);
                 Ok((DispatchOutcome::Terminate, op.next_pc))
             } else {
                 Ok((
@@ -13799,6 +13820,7 @@ fn handle<Sym: WalkSym>(
                     fbw_finish_concrete_set(ConcreteValue::Float(v));
                 }
                 fbw_terminate_with_finish(ctx, result, op.pc)?;
+                commit_top_level_frame_finished(ctx);
                 Ok((DispatchOutcome::Terminate, op.next_pc))
             } else {
                 Ok((
@@ -13841,6 +13863,7 @@ fn handle<Sym: WalkSym>(
                 // applied effects.
                 fbw_finish_concrete_set(ConcreteValue::Null);
                 fbw_terminate_void_with_finish(ctx, op.pc)?;
+                commit_top_level_frame_finished(ctx);
                 Ok((DispatchOutcome::Terminate, op.next_pc))
             } else {
                 Ok((DispatchOutcome::SubReturn { result: None }, op.next_pc))

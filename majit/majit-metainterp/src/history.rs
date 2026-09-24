@@ -3336,6 +3336,15 @@ impl TraceCtx {
         crate::history::TreeLoop::from_oprc(inputargs, ops, self.snapshots)
     }
 
+    /// Non-consuming [`Self::into_tree_loop`]. The live recorder stays so
+    /// `compile_retrace` can `history.cut` the tentative JUMP after
+    /// `InvalidLoop` (`compile_retrace`) and keep tracing.
+    pub fn snapshot_tree_loop(&mut self) -> crate::history::TreeLoop {
+        self.ensure_snapshots_materialized();
+        let (inputargs, ops) = self.recorder.clone_materialized_parts();
+        crate::history::TreeLoop::from_oprc(inputargs, ops, self.snapshots.clone())
+    }
+
     /// Snapshot slice accessor — Pyre-level parity with
     /// `MetaInterp.history.trace.snapshots()`.
     pub fn snapshots(&mut self) -> &[crate::recorder::Snapshot] {

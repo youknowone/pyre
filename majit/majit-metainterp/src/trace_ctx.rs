@@ -415,13 +415,14 @@ pub struct TraceCtx {
     /// `start_bridge_tracing` and leaves the default `false` for
     /// primary entries.
     ///
-    /// This is NOT `self.partial_trace`. That flag is set only by
+    /// This is NOT `MetaInterp::partial_trace`. That flag is set only by
     /// `retrace_needed` (pyjitpl.py) and means "this is a
     /// RETRACE"; a bridge from a guard failure has `partial_trace = None`
-    /// and takes every `if not self.partial_trace:` branch. Pyre has no
-    /// retrace counterpart, so those branches are unconditional here —
-    /// gating one of them on this flag would be a new behaviour, not
-    /// parity.
+    /// and takes every `if not self.partial_trace:` branch. The walker
+    /// cannot read `MetaInterp::partial_trace` while it holds this ctx, so
+    /// the gate stays on the driver (`JitDriver::merge_point`). Gating it
+    /// on `is_bridge_trace` would skip `compile_trace` for every guard
+    /// bridge, which upstream does not.
     ///
     /// Consumers that need bridge-only behavior
     /// (e.g. `pyre-jit-trace::pyjitpl::run_to_end`'s close-loop

@@ -40134,10 +40134,11 @@ mod tests {
 
     /// Anchor the `(a..=b).contains(&v)` fold to the real lowered IR of
     /// its int census callers — `setitem_bytearray` / `byte_w`
-    /// (`(0..=255)`, constant bounds) and `c_int_w` (`(i32::MIN as
-    /// i64..=i32::MAX as i64)`, NON-constant bounds).  For each, both
-    /// residual range calls (`RangeInclusive::new` / `contains`) must be
-    /// gone and an `int_between` op present.  Ignored
+    /// (`(0..=255)`) and `c_int_w` (`(i32::MIN as i64..=i32::MAX as
+    /// i64)`, whose casts lower to `ConstInt` bounds).  All three have
+    /// constant bounds with `lo <= hi`, so for each both residual range
+    /// calls (`RangeInclusive::new` / `contains`) must be gone and an
+    /// `int_between` op present.  Ignored
     /// by default (loads the real LLBC); run with `cargo test -p
     /// majit-translate --lib range_contains_fold_real -- --ignored
     /// --nocapture`.
