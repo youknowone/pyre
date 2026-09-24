@@ -9,7 +9,7 @@
 #
 # STAGED IN `_pending/`: check.py globs `synth/*.py` and does not descend here,
 # so this file gates nothing yet. Graduating it means moving it up one level and
-# recording `.dynasm.jitstats` / `.cranelift.jitstats` beside it with
+# recording `<name>.jitstats` (or `<name>.<backend>.jitstats` where a backend disagrees) beside it with
 # `check.py --snapshot`. That was not done in the change that added it because
 # check.py has no per-fixture filter, so a snapshot rewrites every fixture's
 # baseline including the macro benches, and the host was carrying a load average
