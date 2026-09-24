@@ -317,6 +317,7 @@ pub(crate) fn pack_enumerate_payload(
     some_target: usize,
     item: &Variable,
     pair: &Variable,
+    item_ty: &ValueType,
     name: &str,
 ) -> Result<Variable, String> {
     let count = graph.alloc_value_var();
@@ -375,13 +376,25 @@ pub(crate) fn pack_enumerate_payload(
                 base: tup.clone(),
                 field: FieldDescriptor::new("__pos_1", Some("Tuple".into())),
                 value: LinkArg::Value(item.clone()),
-                ty: ValueType::Ref(None),
+                ty: item_ty.clone(),
             },
         },
     ];
+    // Decide before the prefix is spliced in. The `__pos_1` write below
+    // names `item`, so a use-count taken afterwards would see that write
+    // and refuse the unread `for _ in` arm.
+    let has_pos0 = graph.blocks[some_target].operations.iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::FieldRead { base, field, .. }
+                if base == item && field.name == "__pos_0"
+        )
+    });
     prefix.append(&mut graph.blocks[some_target].operations);
     graph.blocks[some_target].operations = prefix;
-    collapse_pos0_onto(graph, some_target, item, &tup, name)?;
+    if has_pos0 {
+        collapse_pos0_onto(graph, some_target, item, &tup, name)?;
+    }
     Ok(tup)
 }
 
@@ -394,19 +407,18 @@ fn collapse_pos0_onto(
     onto: &Variable,
     name: &str,
 ) -> Result<(), String> {
-    let read_idx = graph.blocks[some_target]
-        .operations
-        .iter()
-        .position(|op| {
-            matches!(
-                &op.kind,
-                OpKind::FieldRead { base, field, .. }
-                    if base == carrier && field.name == "__pos_0"
-            )
-        })
-        .ok_or_else(|| {
-            format!("{name}: enumerate Some arm has no Option __pos_0 read to collapse onto the packed tuple")
-        })?;
+    let read_idx = graph.blocks[some_target].operations.iter().position(|op| {
+        matches!(
+            &op.kind,
+            OpKind::FieldRead { base, field, .. }
+                if base == carrier && field.name == "__pos_0"
+        )
+    });
+    let Some(read_idx) = read_idx else {
+        return Err(format!(
+            "{name}: enumerate Some arm has no __pos_0 read; the caller checked one"
+        ));
+    };
     let read_result = graph.blocks[some_target].operations[read_idx]
         .result
         .clone()
@@ -520,10 +532,6 @@ pub(crate) fn is_map_ctor_target(target: &CallTarget) -> bool {
     }
 }
 
-fn is_recast_kind(kind: &OpKind) -> bool {
-    crate::model::cast_instance_root(kind).is_some()
-}
-
 fn originates_from_range_ctor(graph: &FunctionGraph, var: &Variable) -> bool {
     walk_back_to_source(graph, var, |op| match &op.kind {
         OpKind::Call {
@@ -570,22 +578,6 @@ fn producer_in_block<'a>(
         .iter()
         .enumerate()
         .find(|(_, op)| op.result.as_ref() == Some(var))
-}
-
-/// Peel a trailing recast chain inside `block` back to the value the
-/// recasts alias.  Stops at the first non-recast producer or when `var`
-/// is a block inputarg.
-fn peel_recasts_in_block(graph: &FunctionGraph, block: usize, var: &Variable) -> Variable {
-    let mut cur = var.clone();
-    while let Some((_, op)) = producer_in_block(graph, block, &cur) {
-        match &op.kind {
-            OpKind::Call { args, .. } if is_recast_kind(&op.kind) && args.len() == 1 => {
-                cur = args[0].clone().into_variable();
-            }
-            _ => break,
-        }
-    }
-    cur
 }
 
 struct MapCtor {
@@ -635,8 +627,7 @@ fn locate_map_ctor(
     mapped: &Variable,
 ) -> Result<MapCtor, String> {
     let name = graph.name.clone();
-    let peeled = peel_recasts_in_block(graph, collect_block, mapped);
-    if let Some((idx, op)) = producer_in_block(graph, collect_block, &peeled)
+    if let Some((idx, op)) = producer_in_block(graph, collect_block, mapped)
         && let Some(mut ctor) = map_ctor_from_op(op, idx, collect_block)
     {
         if ctor.aggregate {
@@ -648,9 +639,8 @@ fn locate_map_ctor(
         return Ok(ctor);
     }
     let m = unique_predecessor(graph, collect_block)?;
-    let mapped_m = back_substitute(graph, &[(m, collect_block)], &peeled, &name)?;
-    let peeled_m = peel_recasts_in_block(graph, m, &mapped_m);
-    let (idx, op) = producer_in_block(graph, m, &peeled_m).ok_or_else(|| {
+    let mapped_m = back_substitute(graph, &[(m, collect_block)], mapped, &name)?;
+    let (idx, op) = producer_in_block(graph, m, &mapped_m).ok_or_else(|| {
         format!("{name}: Map adapter has no constructor in the collect predecessor")
     })?;
     let mut ctor = map_ctor_from_op(op, idx, m)
@@ -738,16 +728,18 @@ fn rewire_one_map_collect_site(
     let ops_len = graph.blocks[a].operations.len();
     let (flow_result, _remove_upto) = if ci + 1 == ops_len {
         (site.result_var.clone(), ci)
-    } else if ci + 2 == ops_len {
-        let cast = &graph.blocks[a].operations[ci + 1];
-        match cast.result.as_ref() {
-            Some(narrowed) if is_recast_kind(&cast.kind) => (narrowed.clone(), ci + 1),
-            _ => {
-                return Err(format!(
-                    "{name}: Map::collect call is not the last op of block {a}"
-                ));
-            }
-        }
+    } else if ci + 2 == ops_len
+        && crate::model::cast_instance_of(
+            &graph.blocks[a].operations[ci + 1].kind,
+            &site.result_var,
+        )
+        .is_some()
+    {
+        let narrowed = graph.blocks[a].operations[ci + 1]
+            .result
+            .clone()
+            .ok_or_else(|| format!("{name}: Map::collect recast has no result"))?;
+        (narrowed, ci + 1)
     } else {
         return Err(format!(
             "{name}: Map::collect call is not the last op of block {a}"
@@ -815,6 +807,16 @@ fn rewire_one_map_collect_site(
             ));
         }
     }
+    // The constructor block's exit is redirected at the loop header and
+    // block A is left with no predecessor, so any op in A before `collect`
+    // would never run. A may hold only the collect call and the trailing
+    // recast of its result already accepted above.
+    if emit_block != a && ci != 0 {
+        return Err(format!(
+            "{name}: Map::collect block {a} is orphaned when the constructor \
+             lives in block {emit_block}; an earlier op would not run"
+        ));
+    }
 
     // --- All structural validation passed; mutate the graph. ---
 
@@ -839,18 +841,23 @@ fn rewire_one_map_collect_site(
         .unwrap_or(ctor_idx);
     graph.blocks[emit_block].operations.remove(ctor_idx);
 
-    // The constructor may live in an earlier block. Validation only
-    // requires `collect` to be the last call here, so a preceding
-    // assignment in this block (`state.field = value; mapped.collect()`)
-    // stays. Drop the call and a following recast, the same as when the
-    // constructor shares the block.
+    // Drop the collect call and a trailing recast of its result. When
+    // the constructor is in an earlier block, A is orphaned; validation
+    // already refused every other op in A. An assignment in the
+    // constructor's own block is not in A and still runs.
     let ci = graph.blocks[a]
         .operations
         .iter()
         .position(|op| op.result.as_ref() == Some(&site.result_var))
         .ok_or_else(|| format!("{name}: Map::collect call vanished before removal"))?;
     let ops_len = graph.blocks[a].operations.len();
-    let last = if ci + 1 < ops_len && is_recast_kind(&graph.blocks[a].operations[ci + 1].kind) {
+    let last = if ci + 1 < ops_len
+        && crate::model::cast_instance_of(
+            &graph.blocks[a].operations[ci + 1].kind,
+            &site.result_var,
+        )
+        .is_some()
+    {
         ci + 1
     } else {
         ci
@@ -1420,9 +1427,10 @@ mod tests {
         ));
     }
 
-    /// An assignment in the collect block stays. Validation only requires
-    /// `collect` to be the last call, so `state.field = value; mapped.collect()`
-    /// must keep the field write.
+    /// The `map` constructor is in the predecessor of the collect block.
+    /// An assignment in the collect block would be orphaned when that
+    /// predecessor's exit is redirected at the loop header, so the
+    /// rewrite declines and the assignment stays reachable from the start.
     #[test]
     fn rewrite_keeps_an_assignment_before_map_collect() {
         let (mut g, collected) = build_map_collect_two_blocks();
@@ -1447,15 +1455,23 @@ mod tests {
             },
         );
         let nexts = rewire_map_collect_sites(&mut g, &[collect_site(collected)]);
-        assert_eq!(nexts.len(), 1, "the map.collect chain must fold");
         assert!(
-            g.blocks.iter().any(|block| {
-                block
+            nexts.is_empty(),
+            "an assignment in the orphaned collect block must decline"
+        );
+        assert!(
+            reachable_from_start(&g).iter().any(|block| {
+                g.blocks[*block]
                     .operations
                     .iter()
                     .any(|op| matches!(op.kind, OpKind::ConstInt(11)))
             }),
-            "the assignment before Map::collect must survive"
+            "the assignment before Map::collect stays reachable"
+        );
+        assert_eq!(
+            count_calls(&g, is_map_collect_target),
+            1,
+            "Map::collect residual survives the decline"
         );
     }
 
@@ -1698,6 +1714,176 @@ mod tests {
             count_calls(&g, is_map_collect_target),
             0,
             "Map::collect residual must be gone"
+        );
+    }
+
+    fn reachable_from_start(g: &FunctionGraph) -> Vec<usize> {
+        let mut seen = vec![false; g.blocks.len()];
+        let mut stack = vec![g.startblock.0];
+        while let Some(block) = stack.pop() {
+            if seen.get(block).copied().unwrap_or(true) {
+                continue;
+            }
+            seen[block] = true;
+            for link in &g.blocks[block].exits {
+                stack.push(link.target.0);
+            }
+        }
+        seen.iter()
+            .enumerate()
+            .filter_map(|(i, on)| on.then_some(i))
+            .collect()
+    }
+
+    /// `for _ in xs.iter().enumerate()` never reads the Some payload.
+    /// The rewrite still folds, and `__pos_1` carries the inner item type.
+    #[test]
+    fn rewrite_enumerate_unread_payload_packs_item_type() {
+        let (mut g, opt, _) = build_enumerate_diamond();
+        let some = g
+            .blocks
+            .iter()
+            .position(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "__pos_0")
+                })
+            })
+            .expect("some arm");
+        let some_id = g.blocks[some].id;
+        g.blocks[some].operations.clear();
+        g.set_return(some_id, None);
+        let rewritten = rewire_next_call_sites(&mut g, &[(opt, ValueType::Int)]);
+        assert_eq!(rewritten, 1, "an unread Some payload still folds");
+        assert!(
+            g.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldWrite { field, ty, .. }
+                        if field.name == "__pos_1"
+                            && field.owner_root.as_deref() == Some("Tuple")
+                            && *ty == ValueType::Int
+                )
+            }),
+            "__pos_1 is the inner item type on a Tuple"
+        );
+        assert_eq!(
+            count_calls(&g, is_enumerate_next_target),
+            0,
+            "Enumerate::next residual must be gone"
+        );
+    }
+
+    /// A Some arm that uses the payload slot for something other than
+    /// `__pos_0` declines before the enumerate constructor is rewritten.
+    #[test]
+    fn rewrite_declines_enumerate_payload_used_outside_pos0() {
+        let (mut g, opt, _) = build_enumerate_diamond();
+        for block in &mut g.blocks {
+            for op in &mut block.operations {
+                if let OpKind::FieldRead { base, field, .. } = &op.kind
+                    && field.name == "__pos_0"
+                {
+                    let base = base.clone();
+                    op.kind = OpKind::Call {
+                        target: CallTarget::function_path(["uses", "payload"]),
+                        args: crate::model::call_args(vec![base]),
+                        result_ty: ValueType::Ref(None),
+                    };
+                }
+            }
+        }
+        let rewritten = rewire_next_call_sites(&mut g, &[(opt, ValueType::Ref(None))]);
+        assert_eq!(rewritten, 0, "a non-__pos_0 payload use must decline");
+        assert_eq!(
+            count_calls(&g, is_enumerate_ctor_target),
+            1,
+            "enumerate ctor is not rewritten on a decline"
+        );
+        assert_eq!(
+            count_calls(&g, |t| matches!(
+                t,
+                CallTarget::SyntheticTransparentCtor { name, .. } if name == ENUMERATE_PAIR_OWNER
+            )),
+            0,
+            "the pair ctor is not installed on a decline"
+        );
+    }
+
+    /// A `__pos_0` read plus a forward of the same carrier is still a
+    /// second reference. The rewrite must decline before the constructor
+    /// is replaced.
+    #[test]
+    fn rewrite_declines_enumerate_payload_forwarded_beside_pos0() {
+        let (mut g, opt, _) = build_enumerate_diamond();
+        let some = g
+            .blocks
+            .iter()
+            .position(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "__pos_0")
+                })
+            })
+            .expect("some arm");
+        let carrier = g.blocks[some].inputargs[0].clone();
+        g.blocks[some].exits[0].args.push(LinkArg::Value(carrier));
+        let rewritten = rewire_next_call_sites(&mut g, &[(opt, ValueType::Ref(None))]);
+        assert_eq!(
+            rewritten, 0,
+            "forwarding the carrier beside __pos_0 must decline"
+        );
+        assert_eq!(
+            count_calls(&g, is_enumerate_ctor_target),
+            1,
+            "enumerate ctor is not rewritten on a decline"
+        );
+        assert_eq!(
+            count_calls(&g, |t| matches!(
+                t,
+                CallTarget::SyntheticTransparentCtor { name, .. } if name == ENUMERATE_PAIR_OWNER
+            )),
+            0,
+            "the pair ctor is not installed on a decline"
+        );
+    }
+
+    /// A trailing recast is accepted only when it recasts the collect result.
+    #[test]
+    fn rewrite_declines_recast_of_a_different_value_after_collect() {
+        let (mut g, collected) = build_map_collect_two_blocks();
+        let collect_block = g
+            .blocks
+            .iter()
+            .position(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call { target, .. } if is_map_collect_target(target)
+                    )
+                })
+            })
+            .expect("collect block");
+        let other = g.alloc_value_var();
+        let narrowed = g.alloc_value_var();
+        g.blocks[collect_block].operations.push(SpaceOperation {
+            result: Some(narrowed),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["__cast_instance_intrinsic"]),
+                args: vec![
+                    LinkArg::from(other),
+                    LinkArg::from(ConstValue::byte_str("Vec")),
+                ],
+                result_ty: ValueType::Ref(Some("Vec".into())),
+            },
+        });
+        let nexts = rewire_map_collect_sites(&mut g, &[collect_site(collected)]);
+        assert!(
+            nexts.is_empty(),
+            "a recast of some other value must decline"
+        );
+        assert_eq!(
+            count_calls(&g, is_map_collect_target),
+            1,
+            "Map::collect residual survives a foreign recast"
         );
     }
 }
