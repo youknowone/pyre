@@ -10899,6 +10899,7 @@ fn elidable_or_memoryerror_call_executes_and_stamps_its_result() {
         recorded,
         0,
         None,
+        false,
     );
     drop(wc);
 
@@ -10979,6 +10980,7 @@ fn authoritative_walker_executes_may_force_call_and_stamps_result() {
         recorded,
         0,
         None,
+        false,
     );
     drop(wc);
     assert_eq!(
@@ -11045,6 +11047,7 @@ fn non_authoritative_walker_does_not_execute_may_force_call() {
         recorded,
         0,
         None,
+        false,
     );
     drop(wc);
     assert_eq!(
@@ -11125,6 +11128,7 @@ fn authoritative_walker_transcribes_may_force_raise_to_last_exc() {
         recorded,
         0,
         None,
+        false,
     );
     let captured_exc = wc.last_exc_value();
     let captured_concrete = wc.last_exc_value_concrete();
@@ -11236,6 +11240,7 @@ fn may_force_with_active_vable_executes_and_clears_token() {
         recorded,
         0,
         None,
+        false,
     );
     drop(wc);
     assert!(
@@ -11345,6 +11350,7 @@ fn may_force_vable_escape_surfaces_typed_abort() {
         recorded,
         7,
         None,
+        false,
     );
     drop(wc);
     assert!(

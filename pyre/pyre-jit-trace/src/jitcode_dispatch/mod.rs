@@ -8716,6 +8716,7 @@ fn direct_libffi_call<Sym: WalkSym>(
         recorded,
         pc,
         None,
+        false,
     )?;
     let resid_raised = match resid_exec {
         ResidualExecOutcome::Executed(result) => result.is_err(),
@@ -8972,6 +8973,7 @@ fn direct_call_release_gil<Sym: WalkSym>(
         recorded,
         pc,
         None,
+        false,
     )?;
     // A decline leaves the call recorded symbolically WITHOUT running it, so
     // the walk-end no-replay commit must stay off for this trace.

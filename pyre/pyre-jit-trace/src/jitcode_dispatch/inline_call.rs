@@ -2621,6 +2621,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
             OpRef::NONE,
             op.pc,
             None,
+            false,
         )?
     };
     // `pyjitpl.py:2049-2079` checks vrefs after concrete execution, records
@@ -3056,6 +3057,7 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
         OpRef::NONE,
         op.pc,
         None,
+        false,
     )?;
     // `pyjitpl.py:2049-2079` records a forced VIRTUAL_REF_FINISH before the
     // selected CALL_ASSEMBLER, followed immediately by GUARD_NOT_FORCED.
@@ -14722,6 +14724,7 @@ fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
         recorded,
         pc,
         None,
+        false,
     )?;
     let resid_raised = match resid {
         super::ResidualExecOutcome::Executed(result) => result.is_err(),

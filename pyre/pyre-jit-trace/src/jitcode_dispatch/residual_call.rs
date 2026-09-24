@@ -3435,6 +3435,9 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     recorded: OpRef,
     op_pc: usize,
     blackhole_result: Option<(usize, char, usize)>,
+    // `Some` from `journal_walker_namespace_write` for this residual.
+    // A namespace helper whose journal declined stays a body effect.
+    namespace_write_journaled: bool,
 ) -> Result<ResidualExecOutcome, DispatchError> {
     // `execute_varargs` clears the metainterp exception slot at residual-call
     // entry, before the helper can either run or leave the call recorded
@@ -4276,25 +4279,21 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // to be safer than.
     let writes_gc_liveness_root_only =
         helper == majit_ir::RuntimeHelperKind::ClearInFlightException;
-    // Store / list-append journals (and the namespace journal for
-    // `StoreName` / `StoreGlobal` / `DeleteName` / `DeleteGlobal`) have
-    // rollback entry points; executing those residuals is recoverable.
-    // A transparent helper sub-walk (`write_cell`, `binary_value_from_tag`,
-    // …) is not a Python frame: its Void write-barrier residuals belong to
-    // the journaled outer store, not to the FOR_ITER body of the live
-    // frame.  Marking either class as `body_effect_since_consume` makes
-    // [`fbw_foriter_inflight_take`] refuse delivery and skip the cursor
-    // restore, which is how a module-level `for` over journaled STORE_NAME
-    // cells lost iterations.
+    // Store / list-append journals have rollback entry points; executing
+    // those residuals is recoverable.  A namespace helper is recoverable
+    // only when [`journal_walker_namespace_write`] actually recorded the
+    // displaced binding.  A non-dict `exec` locals mapping returns `None`
+    // — its `__setitem__` / `__delitem__` cannot be undone — so that write
+    // stays a body effect.  A transparent helper sub-walk (`write_cell`,
+    // `binary_value_from_tag`, …) is not a Python frame: its Void
+    // write-barrier residuals belong to the journaled outer store, not to
+    // the FOR_ITER body of the live frame.  Marking either class as
+    // `body_effect_since_consume` makes [`fbw_foriter_inflight_take`]
+    // refuse delivery and skip the cursor restore, which is how a
+    // module-level `for` over journaled STORE_NAME cells lost iterations.
     let residual_will_be_journaled = inplace_list_journal.is_some()
         || list_append_journal.is_some()
-        || matches!(
-            helper,
-            majit_ir::RuntimeHelperKind::StoreName
-                | majit_ir::RuntimeHelperKind::StoreGlobal
-                | majit_ir::RuntimeHelperKind::DeleteName
-                | majit_ir::RuntimeHelperKind::DeleteGlobal
-        );
+        || namespace_write_journaled;
     let body_effect_candidate = !provably_side_effect_free
         && !is_idempotent_gc_barrier
         && !is_loop_var_binding_store
@@ -8644,7 +8643,8 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // A namespace write reaches the executor as an ordinary residual and
         // mutates the frame's dict in place; record what it displaces while the
         // write is still entirely ahead of the walk.
-        let _ = journal_walker_namespace_write(ctx, ei.runtime_helper, &r_args);
+        let namespace_write_journaled =
+            journal_walker_namespace_write(ctx, ei.runtime_helper, &r_args).is_some();
         let resid_exec = try_execute_residual_call_via_executor(
             ctx,
             call_opcode,
@@ -8653,6 +8653,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             recorded,
             op.pc,
             Some((op.next_pc, dst_bank, dst)),
+            namespace_write_journaled,
         )?;
         // A decline leaves the call recorded symbolically WITHOUT running
         // it — a side effect only the legacy replay applies, so the
@@ -10255,7 +10256,8 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         // A namespace write reaches the executor as an ordinary residual and
         // mutates the frame's dict in place; record what it displaces while the
         // write is still entirely ahead of the walk.
-        let _ = journal_walker_namespace_write(ctx, ei.runtime_helper, &r_args);
+        let namespace_write_journaled =
+            journal_walker_namespace_write(ctx, ei.runtime_helper, &r_args).is_some();
         let resid_exec = try_execute_residual_call_via_executor(
             ctx,
             call_opcode,
@@ -10264,6 +10266,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
             recorded,
             op.pc,
             Some((op.next_pc, dst_bank, dst)),
+            namespace_write_journaled,
         )?;
         // A decline leaves the call recorded symbolically WITHOUT running
         // it — a side effect only the legacy replay applies, so the
@@ -10561,7 +10564,8 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
         // A namespace write reaches the executor as an ordinary residual and
         // mutates the frame's dict in place; record what it displaces while the
         // write is still entirely ahead of the walk.
-        let _ = journal_walker_namespace_write(ctx, ei.runtime_helper, &r_args);
+        let namespace_write_journaled =
+            journal_walker_namespace_write(ctx, ei.runtime_helper, &r_args).is_some();
         let resid_exec = try_execute_residual_call_via_executor(
             ctx,
             call_opcode,
@@ -10570,6 +10574,7 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
             recorded,
             op.pc,
             Some((op.next_pc, dst_bank, dst)),
+            namespace_write_journaled,
         )?;
         // A decline leaves the call recorded symbolically WITHOUT running
         // it — a side effect only the legacy replay applies, so the
