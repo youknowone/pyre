@@ -7087,7 +7087,7 @@ impl OptContext {
             op.set_rd_resume_position(self.new_operations[idx].rd_resume_position());
             // bridgeopt.py parity: fail_arg_types carry the types the
             // serializer used when writing the class-knowledge bitfield in
-            // rd_numb (memo.finish() uses numb_state.livebox_types). A
+            // rd_numb (`box.type` on each live box). A
             // shared guard's rd_numb encodes the donor's livebox type
             // layout, so the sharer must inherit fail_arg_types too —
             // otherwise `deserialize_optimizer_knowledge` (`bridgeopt.rs`)
@@ -7601,7 +7601,7 @@ impl OptContext {
 
         // resume.py, 520-558: pending_setfields are passed to finish()
         // which handles register_box, visitor_walk_recursive, and tagging.
-        let Ok((rd_numb, rd_consts, rd_virtuals, liveboxes, livebox_types)) =
+        let Ok((rd_numb, rd_consts, rd_virtuals, liveboxes)) =
             memo.finish(numb_state, &env, &mut pending_setfields, knowledge.as_ref())
         else {
             self.signal_invalid_loop("resume numbering: TagOverflow");
@@ -7629,7 +7629,7 @@ impl OptContext {
                 op.rd_resume_position(),
                 vable_items,
                 liveboxes,
-                livebox_types,
+                liveboxes.iter().map(|b| b.type_()).collect::<Vec<_>>(),
                 rd_consts,
             );
         }
@@ -7640,11 +7640,11 @@ impl OptContext {
                 op.pos().get(),
                 liveboxes,
                 rd_virtuals.len(),
-                livebox_types
+                liveboxes.iter().map(|b| b.type_()).collect::<Vec<_>>(),
             );
         }
 
-        // RPython Box.type: use the exact numbered object's intrinsic type.
+        // resume.py reads `box.type` off each live box (`Operand::type_`).
         let new_types: Vec<majit_ir::Type> = liveboxes
             .iter()
             .map(|b| {
@@ -7654,7 +7654,6 @@ impl OptContext {
                 b.type_()
             })
             .collect();
-        memo.recycle_livebox_types(livebox_types);
 
         // optimizer.py Optimizer.store_final_boxes_in_guard passes finish()'s
         // exact box objects to ResumeGuardDescr.store_final_boxes. Rebinding
