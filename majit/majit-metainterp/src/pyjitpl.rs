@@ -7856,13 +7856,15 @@ impl<M: Clone> MetaInterp<M> {
                     self.clear_trace_session();
                     return CompileOutcome::Aborted;
                 }
-                // Not too many — clear retrace state and fall through
-                // to normal compile_loop path.
+                // `reached_loop_header`: compile_retrace returned None, so
+                // cut the tentative JUMP (already done inside compile_retrace),
+                // drop exported_state, append this header and keep tracing.
+                // `partial_trace` stays. Falling into `compile_loop` hits
+                // `has_compiled_targets` and gives the trace up.
                 self.exported_state = None;
-                crate::debug::log_one(
-                    "jit-tracing",
-                    "retrace cancelled, trying normal compilation",
-                );
+                crate::debug::log_one("jit-tracing", "cancelled, tracing more...");
+                self.register_retrace_merge_point(jump_args);
+                return CompileOutcome::Cancelled;
             } else {
                 // pyjitpl.py:2994-2995: position mismatch — abort.
                 self.clear_retrace_state();
@@ -8002,8 +8004,14 @@ impl<M: Clone> MetaInterp<M> {
             }
         };
         if let Some((reason, key)) = tracing_failed {
+            // `opencoder.py tracing_done` raises `SwitchToBlackhole(ABORT_TOO_LONG)`.
+            // `aborted_tracing` then counts that reason. The ctx is already
+            // parked in `compile_tracing`, so `abort_trace_live` cannot read
+            // the key; stage it the way `finish_and_compile` does.
             self.pending_abort_reason = Some(reason);
             self.warm_state.abort_tracing(key, false);
+            self.pending_abort_green_key = Some(key);
+            self.pending_abort_permanent = false;
             self.clear_trace_session();
             return CompileOutcome::Aborted;
         }
@@ -9402,11 +9410,24 @@ impl<M: Clone> MetaInterp<M> {
         let key_typed = ctx
             .close_green_key()
             .or_else(|| ctx.green_key_values().cloned());
-        let key = key_typed
+        let hash_fallback = key_typed
             .as_ref()
             .map(|k| k.get_uhash())
             .unwrap_or(ctx.green_key);
         let header_pc = ctx.close_header_pc();
+        // `compile_loop` files under `resolve_cell_key`, and `compile_retrace`
+        // reads this entry back as `mp.green_key` for `compiled_loops`. A
+        // bucket hash names a different cell once the bucket is chained.
+        let key = match key_typed.clone() {
+            Some(typed) => self
+                .warm_state
+                .resolve_cell_key(typed.get_uhash(), || typed),
+            None => hash_fallback,
+        };
+        let ctx = self
+            .tracing
+            .as_mut()
+            .expect("register_retrace_merge_point: tracing");
         ctx.add_merge_point_with_key(key, key_typed, green_boxes, header_pc);
         if crate::majit_log_enabled() {
             eprintln!(
@@ -9982,7 +10003,12 @@ impl<M: Clone> MetaInterp<M> {
         };
         let mut start_state = match self.exported_state.take() {
             Some(s) => s,
-            None => return false,
+            None => {
+                // `compile_retrace` returning None leaves `partial_trace` on
+                // the metainterp (`reached_loop_header` keeps tracing).
+                self.partial_trace = Some(partial);
+                return false;
+            }
         };
         // gcreftracer.py parity: GC may have moved objects between Phase 1
         // and Phase 2. Refresh GcRef values from shadow stack before use.
@@ -9997,6 +10023,7 @@ impl<M: Clone> MetaInterp<M> {
         let vable_config = self.current_virtualizable_optimizer_config();
         self.force_finish_trace = false;
         let retracing_from = self.retracing_from.take();
+        let retracing_from_kept = retracing_from;
         // Same park as `compile_loop_body`. `reached_loop_header` calls
         // `tracing_done` on this arm too, before `compile_retrace`.
         self.compile_tracing = self.tracing.take();
@@ -10347,6 +10374,10 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 ctx.cut_trace(jump_cut);
                 self.tracing = Some(ctx);
+                // `reached_loop_header` keeps `partial_trace` and
+                // `retracing_from` when `compile_retrace` returns None.
+                self.partial_trace = Some(partial);
+                self.retracing_from = retracing_from_kept;
                 return false;
             }
         };
@@ -29438,6 +29469,114 @@ mod tests {
             assert_eq!(events.len(), 2);
             assert_eq!(events[1], (green_key, true));
         }
+    }
+
+    #[test]
+    fn retrace_cancel_keeps_tracing_when_unroll_budget_remains() {
+        // `reached_loop_header`: `compile_retrace` returned None and
+        // `cancel_count` is still within `max_unroll_loops`, so the header
+        // is appended and tracing continues. `partial_trace` stays.
+        // Falling through into `compile_loop` would hit `has_compiled_targets`.
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
+        meta.warm_state.set_param("max_unroll_loops", 1);
+        let green_key = 42u64;
+        for _ in 0..2 {
+            meta.on_back_edge(green_key, &[0]);
+        }
+        let start = meta.trace_ctx().unwrap().current_merge_points[0].position;
+        // `has_compiled_targets` is `get_procedure_token` plus
+        // `token.target_tokens`. The cell stores a weak ref, so the token
+        // has to stay alive (`keep_loop_alive`) and carry compiled code.
+        let token = std::sync::Arc::new(JitCellToken::new(9));
+        token.set_compiled(Box::new(()));
+        token.record_target_token(crate::history::TargetToken::new_loop(1).as_jump_target_descr());
+        meta.warm_state_mut().memory_manager.keep_loop_alive(&token);
+        meta.warm_state_mut()
+            .attach_procedure_to_interp(green_key, std::sync::Arc::clone(&token));
+        assert!(
+            meta.has_compiled_targets(green_key),
+            "the fall-through compile_loop would give this key up"
+        );
+        meta.partial_trace = Some(PartialTrace {
+            ops: Vec::new(),
+            inputargs: Vec::new(),
+        });
+        meta.retracing_from = Some(start);
+        let before = meta.trace_ctx().unwrap().current_merge_points.len();
+        let outcome = meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+        assert!(
+            matches!(outcome, CompileOutcome::Cancelled),
+            "retrace cancel must keep tracing, got {outcome:?}"
+        );
+        assert!(meta.tracing.is_some());
+        assert!(meta.partial_trace().is_some());
+        assert!(meta.take_keep_tracing_after_close());
+        assert_eq!(
+            meta.trace_ctx().unwrap().current_merge_points.len(),
+            before + 1
+        );
+    }
+
+    #[test]
+    fn retrace_merge_point_stores_the_resolved_cell_key() {
+        // `compile_retrace` reads `mp.green_key` as the `compiled_loops` key.
+        // That map is keyed by `resolve_cell_key`, not by `GreenKey::get_uhash`.
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let pc = 11i64;
+        let extra = 7200i64;
+        let parked = majit_ir::GreenKey::new(vec![pc, extra]);
+        let hash = parked.get_uhash();
+        // A comparekey-less cell already owns `hash`, so the typed install
+        // is minted a different cell key (`attach_procedure_to_interp`).
+        let squatter = std::sync::Arc::new(JitCellToken::new(meta.warm_state.alloc_token_number()));
+        squatter.set_compiled(Box::new(()));
+        meta.warm_state
+            .attach_procedure_to_interp(hash, std::sync::Arc::clone(&squatter));
+        meta.warm_state
+            .attach_procedure_to_interp_for_key(&parked, squatter);
+        let minted = meta.warm_state.cell_key_for(&parked).expect("typed cell");
+        assert_ne!(minted, hash, "fixture: chained install mints a cell key");
+
+        for _ in 0..2 {
+            meta.on_back_edge(1, &[0]);
+        }
+        {
+            let ctx = meta.trace_ctx().unwrap();
+            ctx.set_driver_descriptor(crate::jitdriver::JitDriverStaticData::new(
+                vec![("g", Type::Int)],
+                vec![("r", Type::Int)],
+            ));
+            ctx.close_green_pc = Some(pc);
+            ctx.close_greens = Some((vec![extra], Vec::new(), Vec::new()));
+        }
+        let closed = meta
+            .trace_ctx()
+            .unwrap()
+            .close_green_key()
+            .expect("close greens");
+        assert_eq!(closed, parked);
+        assert_eq!(
+            meta.warm_state.resolve_cell_key(hash, || closed.clone()),
+            minted
+        );
+        meta.partial_trace = Some(PartialTrace {
+            ops: Vec::new(),
+            inputargs: Vec::new(),
+        });
+        meta.retracing_from = Some(meta.trace_ctx().unwrap().current_merge_points[0].position);
+        let outcome = meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+        assert!(matches!(outcome, CompileOutcome::Cancelled));
+        let stored = meta
+            .trace_ctx()
+            .unwrap()
+            .current_merge_points
+            .last()
+            .unwrap()
+            .green_key;
+        assert_eq!(stored, minted);
+        assert_ne!(stored, hash);
     }
 
     #[test]
