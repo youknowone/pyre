@@ -12,17 +12,16 @@
 # reading no CI run measures.
 #
 # A float subclass that overrides the arithmetic and comparison dunders, driven
-# hot enough to compile. The walker's float specialization lowers BINARY_OP to
+# hot enough to compile. A retired float specialization lowered BINARY_OP to
 # `FloatAdd` / `FloatSub` / `FloatMul` / `FloatTrueDiv` and COMPARE_OP to
 # `FloatLt` / `FloatEq` / ... , all of which bypass special-method dispatch.
+# Those hand folds are gone; the generated descent now records the same shapes.
 #
 # A numeric subclass keeps the builtin `ob_type` layout while its Python-visible
-# class lives in `w_class`, so the `guard_class` those paths emit reads `ob_type`
-# and cannot tell the subclass apart at runtime either. Only an exactness test on
-# the concrete operands keeps a subclass out of the raw path, which is what
-# `walker_float_specialization_operands` checks before returning its operands.
-# Without it every line below silently loses the override and prints the raw
-# IEEE result.
+# class lives in `w_class`, so a `guard_class` on `ob_type` cannot tell the
+# subclass apart at runtime. Only an exactness test on the concrete operands
+# keeps a subclass out of the raw path. Without it every line below silently
+# loses the override and prints the raw IEEE result.
 #
 # The int subclass at the bottom is the control for the record-time gate: when
 # the subclass is present from the first iteration, the gate sees it on the
@@ -31,9 +30,10 @@
 #
 # That shape is not sufficient. The `warm_then_swap_*` cases below compile the
 # trace from EXACT builtins first and introduce the subclass afterwards, so the
-# gate never sees it and only the emitted guard can reject it. `compare_op_int`,
-# `compare_op_float`, `store_subscr`, `newlist` and the `store_attr` in-place
-# arm each emitted the `ob_type` unbox guard without the matching `w_class` pin
+# gate never sees it and only the emitted guard can reject it. The retired
+# `compare_op_int` and `compare_op_float` folds, and the still-live
+# `store_subscr`, `newlist` and `store_attr` in-place arm, each emitted the
+# `ob_type` unbox guard without the matching `w_class` pin
 # and answered these with the raw payload -- `a < 1` returning True where the
 # override returns a string, and a stored subclass reading back as a plain int.
 try:

@@ -5,7 +5,7 @@
 # `compare_op_int` used to fire 61 times here, on the int compares whose
 # descent declined at a helper call inside the compare helper's body; that
 # call now resumes at the enclosing helper, the descent takes those sites, and
-# the fold is consulted only where the descent declines.
+# the hand fold has been removed.
 # Memoized vs plain recursion with post-warm-up branch divergence. The
 # memo-dict store (memo[n] = r) once died with a TypeError after warm-up
 # (an empty-string type name from a clobbered class read on the dict-store

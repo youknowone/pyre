@@ -614,9 +614,9 @@ gateway shortcut in `inline_call.rs` instead; the eight
 the fold count is 97. The three unary descent rows
 retired when `flatten` began emitting canonical codewriter `inline_call_r_r`
 operations to `descroperation::pos`, `neg` and `invert`. `pos` and `invert`
-now enter those bodies with no residual-call gate at all; `neg` and `not` keep
-one as the fallback for a build whose bodies are unbound, under the `unary_neg`
-and `unary_not` rows.
+enter those bodies with no residual-call gate. The `unary_neg` and `unary_not`
+rows were the residual fallback for a build whose bodies are unbound; those
+folds are retired too, and the sites fall through to the canonical inline-call.
 Nothing in this charter named that layer before 2026-08-26, which is itself
 the finding: it is the largest single adaptation in the tree.
 
