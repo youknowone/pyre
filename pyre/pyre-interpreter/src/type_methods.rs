@@ -6836,7 +6836,14 @@ pub fn __majit_wrap_dict_descr_get(args: &[PyObjectRef]) -> Result<PyObjectRef, 
     }
     let dict = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     let key = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-    let default = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+    // Three words cover a call of length 0..=3. A longer slice's last
+    // element rides in the third word so a trailing keyword dict is still
+    // visible when the real arity is rejected.
+    let default = if args.len() > 3 {
+        args[args.len() - 1]
+    } else {
+        args.get(2).copied().unwrap_or(pyre_object::PY_NULL)
+    };
     dict_get_slow(dict, key, default, args.len() as i64)
 }
 
@@ -6883,12 +6890,24 @@ fn dict_get_slow(
     default: PyObjectRef,
     nargs: i64,
 ) -> Result<PyObjectRef, crate::PyError> {
-    if nargs >= 3 {
+    // `nargs` is the flat length, receiver included. Collapsing anything
+    // above three into a three-argument call drops the too-many-arguments
+    // TypeError `dict_method_get` raises from the real slice.
+    if nargs == 3 {
         dict_method_get(&[dict, key, default])
     } else if nargs == 2 {
         dict_method_get(&[dict, key])
-    } else {
+    } else if nargs == 1 {
         dict_method_get(&[dict])
+    } else if nargs <= 0 {
+        dict_method_get(&[])
+    } else {
+        let n = nargs as usize;
+        let mut buf = vec![pyre_object::PY_NULL; n];
+        buf[0] = dict;
+        buf[1] = key;
+        buf[n - 1] = default;
+        dict_method_get(&buf)
     }
 }
 

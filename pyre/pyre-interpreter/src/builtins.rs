@@ -7269,16 +7269,25 @@ exc_constructor!(
 /// arguments".  pyre's flat builtin ABI has no signature to enforce that,
 /// so the keyword dict is policed here directly; the type name comes from
 /// `self`, matching `_PyArg_NoKeywords(Py_TYPE(self)->tp_name, kwds)`.
-/// `BaseException.__init__`.  `ValueError(x)` is `[self, x]`.  That arm
-/// stores `args` without the kwargs dict walk, so the traced call is one
-/// cannot-raise residual.  Keywords and any other arity stay in
-/// [`exc_base_exception_init`].
+/// `BaseException.__init__`.  One positional and no keyword dict is
+/// `[self, arg]`.  That arm stores `args` without the kwargs walk, so the
+/// traced call is one cannot-raise residual.  A keyword dict, any other
+/// arity that fits in six words, stays in [`exc_base_exception_init_slow`];
+/// a longer slice is passed through whole.
 pub fn __majit_wrap_base_exception_descr_init(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
     if args.len() == 2 && !args[0].is_null() {
-        exc_init_one_positional(args[0], args[1]);
-        return Ok(pyre_object::w_none());
+        let (positional, kwargs) = split_builtin_kwargs(&args[1..]);
+        if kwargs.is_none() && positional.len() == 1 {
+            exc_init_one_positional(args[0], positional[0]);
+            return Ok(pyre_object::w_none());
+        }
+    }
+    // The six-word residual cannot see a longer tail. Hand the real slice
+    // to the initializer instead of shortening it.
+    if args.len() > 6 {
+        return exc_base_exception_init(args);
     }
     let slot = |i: usize| args.get(i).copied().unwrap_or(pyre_object::PY_NULL);
     exc_base_exception_init_slow(
@@ -7305,8 +7314,15 @@ fn exc_base_exception_init_slow(
     n: i64,
 ) -> Result<PyObjectRef, crate::PyError> {
     let buf = [a0, a1, a2, a3, a4, a5];
-    let n = n.clamp(0, buf.len() as i64) as usize;
-    exc_base_exception_init(&buf[..n])
+    // The wrapper forwards a longer flat slice to `exc_base_exception_init`
+    // before this residual. A count that does not match the words cannot
+    // be reconstructed, so do not pretend the call was shorter.
+    if !(0..=buf.len() as i64).contains(&n) {
+        return Err(crate::PyError::type_error(
+            "exception initializer argument count exceeds the values received",
+        ));
+    }
+    exc_base_exception_init(&buf[..n as usize])
 }
 
 #[majit_macros::dont_look_inside_cannot_raise]
@@ -7350,7 +7366,16 @@ pub fn __majit_wrap_exc_value_error_descr_new(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
     if args.len() == 2 && !args[0].is_null() {
-        return Ok(value_error_one_arg(args[0], args[1]));
+        let (positional, kwargs) = split_builtin_kwargs(&args[1..]);
+        if kwargs.is_none() && positional.len() == 1 {
+            return Ok(value_error_one_arg(args[0], positional[0]));
+        }
+    }
+    // The four-word residual cannot see a longer tail, and a bare exception
+    // takes any number of positional arguments. Hand the real slice over
+    // rather than shortening it.
+    if args.len() > 4 {
+        return exc_value_error_new(args);
     }
     let slot = |i: usize| args.get(i).copied().unwrap_or(pyre_object::PY_NULL);
     exc_value_error_new_slow(slot(0), slot(1), slot(2), slot(3), args.len() as i64)
@@ -7365,8 +7390,15 @@ fn exc_value_error_new_slow(
     n: i64,
 ) -> Result<PyObjectRef, crate::PyError> {
     let buf = [a0, a1, a2, a3];
-    let n = n.clamp(0, buf.len() as i64) as usize;
-    exc_value_error_new(&buf[..n])
+    // The wrapper forwards a longer flat slice to `exc_value_error_new`
+    // before this residual. A count that does not match the words cannot be
+    // reconstructed, so do not pretend the call was shorter.
+    if !(0..=buf.len() as i64).contains(&n) {
+        return Err(crate::PyError::type_error(
+            "exception constructor argument count exceeds the values received",
+        ));
+    }
+    exc_value_error_new(&buf[..n as usize])
 }
 
 #[majit_macros::dont_look_inside_cannot_raise]
