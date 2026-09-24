@@ -795,23 +795,15 @@ pub fn __majit_wrap_struct_unpack(args: &[PyObjectRef]) -> Result<PyObjectRef, c
     unpack_slow(this, w_str)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_builtin_wrapper_target_struct_pack: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(module_path!(), "::", stringify!(__majit_wrap_struct_pack)),
-        func: __majit_wrap_struct_pack,
-    };
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_struct_pack,
+    __majit_wrap_struct_pack
+);
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_builtin_wrapper_target_struct_unpack: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(module_path!(), "::", stringify!(__majit_wrap_struct_unpack)),
-        func: __majit_wrap_struct_unpack,
-    };
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_struct_unpack,
+    __majit_wrap_struct_unpack
+);
 
 fn do_pack_iff(format: &str, _values: &[PyObjectRef]) -> bool {
     majit_rlib::jit::isconstant(format)

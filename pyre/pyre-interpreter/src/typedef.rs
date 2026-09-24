@@ -4928,18 +4928,10 @@ fn list_descr_new_surplus(args: &[PyObjectRef], n: i64) -> (usize, bool) {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_builtin_wrapper_target_list_descr_new: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(
-            module_path!(),
-            "::",
-            stringify!(__majit_wrap_list_descr_new)
-        ),
-        func: __majit_wrap_list_descr_new,
-    };
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_list_descr_new,
+    __majit_wrap_list_descr_new
+);
 
 /// `listobject.py W_ListObject.descr_init`.  Same PBC-family reason as
 /// [`__majit_wrap_list_descr_new`]: the body is this leaf, not a trampoline
@@ -5054,18 +5046,10 @@ fn list_init_slow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(pyre_object::w_none())
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_builtin_wrapper_target_list_descr_init: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(
-            module_path!(),
-            "::",
-            stringify!(__majit_wrap_list_descr_init)
-        ),
-        func: __majit_wrap_list_descr_init,
-    };
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_list_descr_init,
+    __majit_wrap_list_descr_init
+);
 
 /// `tupleobject.py W_AbstractTupleObject.descr_new`, exposed through
 /// `interp2app`.  The body is this `__majit_wrap_` leaf so the PBC family
@@ -5184,18 +5168,10 @@ fn tuple_subclass_retarget(
     Ok(fresh)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_builtin_wrapper_target_tuple_descr_new: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(
-            module_path!(),
-            "::",
-            stringify!(__majit_wrap_tuple_descr_new)
-        ),
-        func: __majit_wrap_tuple_descr_new,
-    };
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_tuple_descr_new,
+    __majit_wrap_tuple_descr_new
+);
 
 /// `enumerate.__new__(cls, iterable, start=0)` — `functional.py:253-275
 /// W_Enumerate.descr___new__`.  `builtin_enumerate` builds a fresh
@@ -6350,18 +6326,10 @@ pub fn __majit_wrap_list_descr_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, 
     crate::type_methods::list_method_pop(args)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_builtin_wrapper_target_list_descr_pop: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(
-            module_path!(),
-            "::",
-            stringify!(__majit_wrap_list_descr_pop)
-        ),
-        func: __majit_wrap_list_descr_pop,
-    };
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_list_descr_pop,
+    __majit_wrap_list_descr_pop
+);
 
 /// listobject.py:W_ListObject.typedef exposes W_ListObject.append through
 /// interp2app, so its gateway must be a member of BuiltinCode.func's PBC
@@ -6371,18 +6339,10 @@ pub fn __majit_wrap_list_descr_append(args: &[PyObjectRef]) -> Result<PyObjectRe
     crate::type_methods::list_method_append(args)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_builtin_wrapper_target_list_descr_append: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(
-            module_path!(),
-            "::",
-            stringify!(__majit_wrap_list_descr_append)
-        ),
-        func: __majit_wrap_list_descr_append,
-    };
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_list_descr_append,
+    __majit_wrap_list_descr_append
+);
 
 /// `listobject.py W_ListObject.descr_len`.  A closure in `init_list_type`
 /// is not a PBC-family member, so `tuple(lst)` / `length_hint` saw
@@ -6393,18 +6353,10 @@ pub fn __majit_wrap_list_descr_len(args: &[PyObjectRef]) -> Result<PyObjectRef, 
     crate::baseobjspace::len_slot(args[0])
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_builtin_wrapper_target_list_descr_len: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(
-            module_path!(),
-            "::",
-            stringify!(__majit_wrap_list_descr_len)
-        ),
-        func: __majit_wrap_list_descr_len,
-    };
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_list_descr_len,
+    __majit_wrap_list_descr_len
+);
 
 /// `listobject.py W_ListObject.descr_extend` / `ListStrategy.extend`.
 /// `list.__init__` calls this after `clear`, so a traced `list(iterable)`
@@ -6479,31 +6431,15 @@ fn list_sort_bad_self(list: PyObjectRef) -> Result<PyObjectRef, crate::PyError> 
     )))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_builtin_wrapper_target_list_descr_sort: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(
-            module_path!(),
-            "::",
-            stringify!(__majit_wrap_list_descr_sort)
-        ),
-        func: __majit_wrap_list_descr_sort,
-    };
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_list_descr_sort,
+    __majit_wrap_list_descr_sort
+);
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_builtin_wrapper_target_list_descr_extend: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(
-            module_path!(),
-            "::",
-            stringify!(__majit_wrap_list_descr_extend)
-        ),
-        func: __majit_wrap_list_descr_extend,
-    };
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_list_descr_extend,
+    __majit_wrap_list_descr_extend
+);
 
 /// Name of `obj`'s type, for operand-type error messages.
 fn arg_type_name(obj: PyObjectRef) -> String {
@@ -20119,18 +20055,10 @@ pub fn __majit_wrap_int_descr_bit_length(
     Ok(pyre_object::w_int_new(bits as i64))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_builtin_wrapper_target_int_descr_bit_length:
-    crate::gateway::BuiltinWrapperDescriptor = crate::gateway::BuiltinWrapperDescriptor {
-    path: concat!(
-        module_path!(),
-        "::",
-        stringify!(__majit_wrap_int_descr_bit_length)
-    ),
-    func: __majit_wrap_int_descr_bit_length,
-};
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_int_descr_bit_length,
+    __majit_wrap_int_descr_bit_length
+);
 
 fn init_int_type(ns: PyObjectRef) {
     unsafe {
@@ -21704,18 +21632,10 @@ pub fn __majit_wrap_float_descr_as_integer_ratio(
     float_descr_as_integer_ratio(args)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_wrap_float_descr_as_integer_ratio_target: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(
-            module_path!(),
-            "::",
-            "__majit_wrap_float_descr_as_integer_ratio"
-        ),
-        func: __majit_wrap_float_descr_as_integer_ratio,
-    };
+crate::builtin_wrapper_descriptor!(
+    __majit_wrap_float_descr_as_integer_ratio_target,
+    __majit_wrap_float_descr_as_integer_ratio
+);
 
 #[derive(Copy, Clone)]
 pub enum FloatToIntMode {
@@ -22172,14 +22092,10 @@ pub fn __majit_wrap_object_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef
     object_descr_new(args)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_wrap_object_descr_new_target: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(module_path!(), "::", "__majit_wrap_object_descr_new"),
-        func: __majit_wrap_object_descr_new,
-    };
+crate::builtin_wrapper_descriptor!(
+    __majit_wrap_object_descr_new_target,
+    __majit_wrap_object_descr_new
+);
 
 /// `object.__init__(self)` — no-op base __init__.  Surplus arguments are
 /// accepted only when __init__ or __new__ is overridden (objectobject.py
@@ -29528,14 +29444,10 @@ pub fn __majit_wrap_set_descr_add(args: &[PyObjectRef]) -> Result<PyObjectRef, c
     Ok(pyre_object::w_none())
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_builtin_wrapper_target_set_descr_add: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(module_path!(), "::", stringify!(__majit_wrap_set_descr_add)),
-        func: __majit_wrap_set_descr_add,
-    };
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_set_descr_add,
+    __majit_wrap_set_descr_add
+);
 
 fn init_set_type(ns: PyObjectRef) {
     unsafe {
@@ -34103,14 +34015,15 @@ mod tests {
             callable,
             super::__majit_wrap_list_descr_append as crate::gateway::BuiltinCodeFn,
         ));
-        assert!(
-            crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS
-                .iter()
-                .any(|entry| {
-                    entry.path.ends_with("::__majit_wrap_list_descr_append")
-                        && std::ptr::fn_addr_eq(entry.func, callable)
-                })
-        );
+        let mut registered = false;
+        crate::gateway::for_each_builtin_wrapper_descriptor(|entry| {
+            if entry.path.ends_with("::__majit_wrap_list_descr_append")
+                && std::ptr::fn_addr_eq(entry.func, callable)
+            {
+                registered = true;
+            }
+        });
+        assert!(registered);
         let _roots = gc_roots::push_roots();
         let slot = gc_roots::shadow_stack_len();
         let _ = gc_roots::pin_root(w_list_new(vec![]));

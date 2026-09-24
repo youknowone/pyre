@@ -3311,14 +3311,7 @@ pub fn __majit_wrap_descr_typecheck_fget_getdictscope(
 /// so `f_locals` cannot be the only orthodox member by accident.
 macro_rules! register_frame_builtin_wrapper {
     ($static_name:ident, $func:ident) => {
-        #[cfg(not(target_arch = "wasm32"))]
-        #[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-        #[allow(non_upper_case_globals)]
-        static $static_name: crate::gateway::BuiltinWrapperDescriptor =
-            crate::gateway::BuiltinWrapperDescriptor {
-                path: concat!(module_path!(), "::", stringify!($func)),
-                func: $func,
-            };
+        crate::builtin_wrapper_descriptor!($static_name, $func);
     };
 }
 

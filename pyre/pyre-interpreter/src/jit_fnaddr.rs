@@ -1163,68 +1163,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // interp2app wrapper is a possible value of the indirect function-pointer
     // field.  `#[pyre_methods]` contributes these process-global descriptors
     // through the same link-time census used for pyre class descriptors.
-    #[cfg(not(target_arch = "wasm32"))]
-    for wrapper in crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS {
-        // ABI-UNSOUND: `Result<*mut PyObject, error::PyError>` does not fit one residual slot.
+    // The address is used for the jitcode lookup only — the gateway body is
+    // descended, never residual-called. `Result<*mut PyObject, PyError>`
+    // does not fit one residual slot.
+    crate::gateway::for_each_builtin_wrapper_descriptor(|wrapper| {
         push_abi_unsound_fnaddr(&mut entries, wrapper.path, wrapper.func as *const ());
-    }
-    // `BUILTIN_WRAPPER_DESCRIPTORS` does not exist on wasm32
-    // (`linkme::distributed_slice` has no arm for `target_os = "unknown"`),
-    // so the loop above registers nothing there and
-    // `bytecode_for_address(__majit_wrap_builtin_len)` finds no jitcode: the
-    // builtin `len` gateway descent then declines before its spec gate.  The
-    // address is used for the jitcode lookup only — the gateway body is
-    // descended, never residual-called — so register the one wrapper the
-    // descent recognises explicitly, the way this file registers every other
-    // wasm-reachable helper.
-    #[cfg(target_arch = "wasm32")]
-    push_abi_unsound_fnaddr(
-        &mut entries,
-        "pyre_interpreter::builtins::__majit_wrap_builtin_len",
-        crate::builtins::__majit_wrap_builtin_len as *const (),
-    );
-    #[cfg(target_arch = "wasm32")]
-    push_abi_unsound_fnaddr(
-        &mut entries,
-        "pyre_interpreter::type_methods::__majit_wrap_str_descr_startswith",
-        crate::type_methods::__majit_wrap_str_descr_startswith as *const (),
-    );
-    #[cfg(target_arch = "wasm32")]
-    push_abi_unsound_fnaddr(
-        &mut entries,
-        "pyre_interpreter::type_methods::__majit_wrap_str_descr_endswith",
-        crate::type_methods::__majit_wrap_str_descr_endswith as *const (),
-    );
-    #[cfg(target_arch = "wasm32")]
-    push_abi_unsound_fnaddr(
-        &mut entries,
-        "pyre_interpreter::type_methods::__majit_wrap_str_descr_find",
-        crate::type_methods::__majit_wrap_str_descr_find as *const (),
-    );
-    #[cfg(target_arch = "wasm32")]
-    push_abi_unsound_fnaddr(
-        &mut entries,
-        "pyre_interpreter::type_methods::__majit_wrap_str_descr_rfind",
-        crate::type_methods::__majit_wrap_str_descr_rfind as *const (),
-    );
-    #[cfg(target_arch = "wasm32")]
-    push_abi_unsound_fnaddr(
-        &mut entries,
-        "pyre_interpreter::type_methods::__majit_wrap_str_descr_count",
-        crate::type_methods::__majit_wrap_str_descr_count as *const (),
-    );
-    #[cfg(target_arch = "wasm32")]
-    push_abi_unsound_fnaddr(
-        &mut entries,
-        "pyre_interpreter::module::r#struct::__majit_wrap_struct_pack",
-        crate::module::r#struct::__majit_wrap_struct_pack as *const (),
-    );
-    #[cfg(target_arch = "wasm32")]
-    push_abi_unsound_fnaddr(
-        &mut entries,
-        "pyre_interpreter::module::r#struct::__majit_wrap_struct_unpack",
-        crate::module::r#struct::__majit_wrap_struct_unpack as *const (),
-    );
+    });
 
     // `type_object()` accessors are `dont_look_inside` (`majit-translate`
     // `front::llbc_hints` stamps them: the JIT residualizes the `OnceLock` body
@@ -6188,11 +6132,13 @@ mod tests {
     /// `jit_force_virtualizable` the gateway carries was never deleted from a
     /// looked-inside copy.
     #[test]
-    #[cfg(not(target_arch = "wasm32"))]
     fn every_builtin_wrapper_descriptor_carries_the_family_prefix() {
-        let stray: Vec<&str> = crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS
-            .iter()
-            .map(|wrapper| wrapper.path)
+        let mut stray: Vec<&str> = Vec::new();
+        crate::gateway::for_each_builtin_wrapper_descriptor(|wrapper| {
+            stray.push(wrapper.path);
+        });
+        let stray: Vec<&str> = stray
+            .into_iter()
             .filter(|path| {
                 !path
                     .rsplit("::")
@@ -6230,10 +6176,7 @@ mod tests {
         );
     }
 
-    /// `BUILTIN_WRAPPER_DESCRIPTORS` is only pushed into the binding table off
-    /// wasm32, so the lookup below has nothing to find there.
     #[test]
-    #[cfg(not(target_arch = "wasm32"))]
     fn jit_trace_fnaddrs_covers_int_bit_length_gateway_wrapper() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
         let expected =

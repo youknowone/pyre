@@ -1676,14 +1676,7 @@ pub fn is_builtin_exc_info_function(callable: PyObjectRef) -> bool {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_wrap_exc_info_target: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(module_path!(), "::", "__majit_wrap_exc_info"),
-        func: __majit_wrap_exc_info,
-    };
+crate::builtin_wrapper_descriptor!(__majit_wrap_exc_info_target, __majit_wrap_exc_info);
 
 /// pypy/module/sys/vm.py `exception` — the exception instance currently being
 /// handled, or None outside an `except` block: the value half of
@@ -1716,14 +1709,10 @@ pub fn __majit_wrap_sys_exception(args: &[PyObjectRef]) -> Result<PyObjectRef, c
     Ok(sys_exception_direct())
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_wrap_sys_exception_target: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(module_path!(), "::", "__majit_wrap_sys_exception"),
-        func: __majit_wrap_sys_exception,
-    };
+crate::builtin_wrapper_descriptor!(
+    __majit_wrap_sys_exception_target,
+    __majit_wrap_sys_exception
+);
 
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     module_ns_store(ns, "maxsize", w_int_new(i64::MAX));

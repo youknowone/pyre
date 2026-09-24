@@ -7039,18 +7039,10 @@ fn dict_get_slow(
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_builtin_wrapper_target_dict_descr_get: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(
-            module_path!(),
-            "::",
-            stringify!(__majit_wrap_dict_descr_get)
-        ),
-        func: __majit_wrap_dict_descr_get,
-    };
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_dict_descr_get,
+    __majit_wrap_dict_descr_get
+);
 
 pub fn dict_method_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "get", 1)?;
@@ -7153,109 +7145,45 @@ pub fn __majit_wrap_dict_descr_items(args: &[PyObjectRef]) -> Result<PyObjectRef
     ))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_builtin_wrapper_target_str_descr_startswith:
-    crate::gateway::BuiltinWrapperDescriptor = crate::gateway::BuiltinWrapperDescriptor {
-    path: concat!(
-        module_path!(),
-        "::",
-        stringify!(__majit_wrap_str_descr_startswith)
-    ),
-    func: __majit_wrap_str_descr_startswith,
-};
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_str_descr_startswith,
+    __majit_wrap_str_descr_startswith
+);
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_builtin_wrapper_target_str_descr_endswith: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(
-            module_path!(),
-            "::",
-            stringify!(__majit_wrap_str_descr_endswith)
-        ),
-        func: __majit_wrap_str_descr_endswith,
-    };
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_str_descr_endswith,
+    __majit_wrap_str_descr_endswith
+);
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_builtin_wrapper_target_str_descr_find: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(
-            module_path!(),
-            "::",
-            stringify!(__majit_wrap_str_descr_find)
-        ),
-        func: __majit_wrap_str_descr_find,
-    };
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_str_descr_find,
+    __majit_wrap_str_descr_find
+);
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_builtin_wrapper_target_str_descr_rfind: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(
-            module_path!(),
-            "::",
-            stringify!(__majit_wrap_str_descr_rfind)
-        ),
-        func: __majit_wrap_str_descr_rfind,
-    };
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_str_descr_rfind,
+    __majit_wrap_str_descr_rfind
+);
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_builtin_wrapper_target_str_descr_count: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(
-            module_path!(),
-            "::",
-            stringify!(__majit_wrap_str_descr_count)
-        ),
-        func: __majit_wrap_str_descr_count,
-    };
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_str_descr_count,
+    __majit_wrap_str_descr_count
+);
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_builtin_wrapper_target_dict_descr_keys: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(
-            module_path!(),
-            "::",
-            stringify!(__majit_wrap_dict_descr_keys)
-        ),
-        func: __majit_wrap_dict_descr_keys,
-    };
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_dict_descr_keys,
+    __majit_wrap_dict_descr_keys
+);
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_builtin_wrapper_target_dict_descr_values: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(
-            module_path!(),
-            "::",
-            stringify!(__majit_wrap_dict_descr_values)
-        ),
-        func: __majit_wrap_dict_descr_values,
-    };
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_dict_descr_values,
+    __majit_wrap_dict_descr_values
+);
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_builtin_wrapper_target_dict_descr_items: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(
-            module_path!(),
-            "::",
-            stringify!(__majit_wrap_dict_descr_items)
-        ),
-        func: __majit_wrap_dict_descr_items,
-    };
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_dict_descr_items,
+    __majit_wrap_dict_descr_items
+);
 
 /// Materialise a dict_keys / values / items view's current snapshot
 /// as a list of items.  Mirrors the view iteration bodies on

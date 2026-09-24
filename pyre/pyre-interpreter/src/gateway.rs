@@ -754,9 +754,85 @@ pub struct BuiltinWrapperDescriptor {
     pub func: BuiltinCodeFn,
 }
 
+/// `distributed_slice` rejects wasm32, which carries the same set in
+/// [`WASM_BUILTIN_WRAPPER_DESCRIPTORS`]; read both through
+/// [`for_each_builtin_wrapper_descriptor`].
 #[cfg(not(target_arch = "wasm32"))]
 #[linkme::distributed_slice]
 pub static BUILTIN_WRAPPER_DESCRIPTORS: [BuiltinWrapperDescriptor];
+
+/// The same registry on wasm32, populated at constructor time.
+///
+/// `linkme` has no wasm32 arm: a static with a custom `link_section` must be
+/// a plain list of bytes there, with no relocation for a pointer field, and a
+/// descriptor holds a path and a function pointer. A constructor runs before
+/// any exported function of the module, so the set is complete by the time
+/// `jit_trace_fnaddrs` binds addresses, and it is emitted beside the wrapper
+/// so it inherits that module's `cfg` gates.
+#[cfg(target_arch = "wasm32")]
+pub static WASM_BUILTIN_WRAPPER_DESCRIPTORS: std::sync::Mutex<Vec<BuiltinWrapperDescriptor>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Append one interp2app wrapper to [`WASM_BUILTIN_WRAPPER_DESCRIPTORS`].
+///
+/// Called only from the constructor `#[pyre_methods]` and the hand-written
+/// wrapper sites emit. An entry appended after `jit_trace_fnaddrs` has been
+/// read is not published.
+#[cfg(target_arch = "wasm32")]
+pub fn register_builtin_wrapper_descriptor(path: &'static str, func: BuiltinCodeFn) {
+    WASM_BUILTIN_WRAPPER_DESCRIPTORS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(BuiltinWrapperDescriptor { path, func });
+}
+
+/// Publish one hand-written interp2app wrapper on both targets.
+///
+/// Native builds append a `linkme` slice element. wasm32 has no
+/// `distributed_slice`, so the same name is a constructor that calls
+/// [`register_builtin_wrapper_descriptor`]. The two `cfg`s are exclusive, so
+/// the static and the constructor share `$target`. The path is
+/// `concat!(module_path!(), "::", stringify!($func))`, the string every
+/// hand-written site already published.
+#[macro_export]
+macro_rules! builtin_wrapper_descriptor {
+    ($target:ident, $func:ident) => {
+        #[cfg(not(target_arch = "wasm32"))]
+        #[linkme::distributed_slice($crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+        #[allow(non_upper_case_globals)]
+        static $target: $crate::gateway::BuiltinWrapperDescriptor =
+            $crate::gateway::BuiltinWrapperDescriptor {
+                path: concat!(module_path!(), "::", stringify!($func)),
+                func: $func,
+            };
+
+        #[cfg(target_arch = "wasm32")]
+        #[ctor::ctor(unsafe)]
+        fn $target() {
+            $crate::gateway::register_builtin_wrapper_descriptor(
+                concat!(module_path!(), "::", stringify!($func)),
+                $func,
+            );
+        }
+    };
+}
+
+/// Visit every registered interp2app wrapper, whichever population the
+/// target carries.
+pub fn for_each_builtin_wrapper_descriptor(mut visit: impl FnMut(&BuiltinWrapperDescriptor)) {
+    #[cfg(not(target_arch = "wasm32"))]
+    for descr in BUILTIN_WRAPPER_DESCRIPTORS {
+        visit(&descr);
+    }
+    #[cfg(target_arch = "wasm32")]
+    for descr in WASM_BUILTIN_WRAPPER_DESCRIPTORS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+    {
+        visit(descr);
+    }
+}
 
 /// The type a method descriptor belongs to, and the layout test its receiver
 /// must satisfy — `PyDescrObject.d_type`, and the `self` entry of PyPy's
