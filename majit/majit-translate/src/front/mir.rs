@@ -976,9 +976,18 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         mut enum_variant_by_discriminant,
         mut struct_origins,
         mut struct_field_attrs,
-        exact_layouts,
+        mut exact_layouts,
         mut struct_ids,
     ) = derive_program_metadata(llbc);
+    promote_cross_crate_stripped_keys(
+        llbc,
+        cross_tombstoned_leaves,
+        &mut known_struct_names,
+        &mut struct_fields,
+        &mut struct_field_attrs,
+        &mut exact_layouts,
+        &mut struct_ids,
+    );
     // Only leaves this pass withdrew. A crate-root decl
     // (`charon_corpus::ClassObject`) also stores an empty origin module,
     // and that empty string is not a withdrawal.
@@ -2293,6 +2302,10 @@ pub(crate) struct DuplicateLeafFacts {
     defined_at: std::collections::HashMap<String, String>,
     /// Leaves withdrawn because one stripped path was defined in two crates.
     cross_crate_leaves: std::collections::HashSet<String>,
+    /// Those stripped paths themselves (`same::Code` from `a::same::Code`
+    /// and `b::same::Code`). A leaf tombstone still paints the
+    /// crate-stripped spelling; a path in this set keeps the crate.
+    cross_crate_stripped: std::collections::HashSet<String>,
 }
 
 impl DuplicateLeafFacts {
@@ -2314,6 +2327,7 @@ impl DuplicateLeafFacts {
             struct_ids,
             defined_at,
             cross_crate_leaves: std::collections::HashSet::new(),
+            cross_crate_stripped: std::collections::HashSet::new(),
         }
     }
 
@@ -2345,12 +2359,14 @@ impl DuplicateLeafFacts {
         // match that artefact's crate prefix, so it is not a second
         // definition.
         self.cross_crate_leaves.extend(other.cross_crate_leaves);
+        self.cross_crate_stripped.extend(other.cross_crate_stripped);
         for (stripped, crate_name) in other.defined_at {
             if let Some(prev) = self.defined_at.get(&stripped)
                 && prev != &crate_name
             {
                 let leaf = stripped.rsplit("::").next().unwrap_or(stripped.as_str());
                 self.cross_crate_leaves.insert(leaf.to_string());
+                self.cross_crate_stripped.insert(stripped.clone());
             }
             self.defined_at.entry(stripped).or_insert(crate_name);
         }
@@ -2367,7 +2383,116 @@ impl DuplicateLeafFacts {
             Some(&self.struct_ids),
         );
         leaves.extend(self.cross_crate_leaves);
+        // Colliding stripped paths travel with the leaf set so every paint
+        // site can tell `same::Code` (keep the crate) from a single-crate
+        // tombstone (keep the stripped spelling). A one-segment path is
+        // already the leaf.
+        leaves.extend(
+            self.cross_crate_stripped
+                .into_iter()
+                .filter(|path| path.contains("::")),
+        );
         leaves
+    }
+}
+
+/// Crate-stripped path, or the full declaration path when that stripped
+/// spelling is a cross-crate collision carried in `tombstoned`.
+fn decl_path_for_tombstone(
+    name_path: &str,
+    tombstoned: &std::collections::HashSet<String>,
+) -> String {
+    let stripped = strip_crate_prefix(name_path);
+    if stripped.contains("::") && tombstoned.contains(&stripped) {
+        name_path.to_string()
+    } else {
+        stripped
+    }
+}
+
+/// Move rows whose crate-stripped key collides across crates onto the
+/// full declaration path. The stripped key is dropped so a later
+/// `or_insert` merge cannot keep one crate's layout for both.
+fn promote_cross_crate_stripped_keys(
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    known_struct_names: &mut std::collections::HashSet<String>,
+    struct_fields: &mut crate::front::semantic::StructFieldRegistry,
+    struct_field_attrs: &mut std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    exact_layouts: &mut std::collections::HashMap<
+        majit_ir::descr::StructId,
+        crate::front::semantic::ExactLayout,
+    >,
+    struct_ids: &mut std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
+) {
+    if tombstoned.is_empty() {
+        return;
+    }
+    for td in llbc.iter_type_decls() {
+        let name = td.item_meta.name_path();
+        let stripped = strip_crate_prefix(&name);
+        if !stripped.contains("::") || !tombstoned.contains(&stripped) || stripped == name {
+            continue;
+        }
+        let old_sid = majit_ir::descr::StructId::from_canonical(&stripped);
+        let new_sid = majit_ir::descr::StructId::from_canonical(&name);
+        if let Some(layout) = exact_layouts.remove(&old_sid) {
+            exact_layouts.insert(new_sid, layout);
+        }
+        if let Some(rows) = struct_field_attrs.remove(&stripped) {
+            struct_field_attrs.entry(name.clone()).or_insert(rows);
+        }
+        struct_fields.remove_field(&stripped);
+        known_struct_names.remove(&stripped);
+        struct_ids.insert(name.clone(), Some(new_sid));
+        struct_ids.remove(&stripped);
+        let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
+        if struct_ids.get(&leaf) == Some(&Some(old_sid)) {
+            struct_ids.insert(leaf.clone(), Some(new_sid));
+        }
+        let TypeDeclKind::Enum(variants) = &td.kind else {
+            continue;
+        };
+        for v in variants {
+            let old_key = format!("{stripped}::{}", v.name);
+            let new_key = format!("{name}::{}", v.name);
+            let old_vsid = majit_ir::descr::StructId::from_canonical(&old_key);
+            let new_vsid = majit_ir::descr::StructId::from_canonical(&new_key);
+            if let Some(layout) = exact_layouts.remove(&old_vsid) {
+                exact_layouts.insert(new_vsid, layout);
+            }
+            if let Some(rows) = struct_field_attrs.remove(&old_key) {
+                struct_field_attrs.insert(new_key.clone(), rows);
+            }
+            if let Some(rows) = struct_fields.remove_field(&old_key) {
+                struct_fields.fields.insert(new_key.clone(), rows);
+            }
+            struct_ids.insert(new_key, Some(new_vsid));
+            struct_ids.remove(&old_key);
+            let variant_leaf = format!("{leaf}::{}", v.name);
+            if struct_ids.get(&variant_leaf) == Some(&Some(old_vsid)) {
+                struct_ids.insert(variant_leaf, Some(new_vsid));
+            }
+        }
+    }
+}
+
+/// Owner spelling for a leaf [`harden_duplicate_leaf_metadata`] withdrew.
+/// The crate-stripped path is kept, except when stripping yields the leaf
+/// or that stripped path itself collides across crates — both paint the
+/// full declaration path.
+fn tombstoned_owner_spelling(
+    name_path: &str,
+    leaf: &str,
+    tombstoned: &std::collections::HashSet<String>,
+) -> String {
+    let qualified = strip_crate_prefix(name_path);
+    if qualified != leaf && tombstoned.contains(&qualified) {
+        name_path.to_string()
+    } else if qualified != leaf {
+        qualified
+    } else {
+        name_path.to_string()
     }
 }
 
@@ -7590,7 +7715,7 @@ impl<'a> Lowering<'a> {
                 // concrete generic argument.
                 let (owner_root, owner_id) = match self.tyref_adt_class_root(&place.ty) {
                     Some(class_root) => {
-                        let canon = strip_crate_prefix(&class_root);
+                        let canon = decl_path_for_tombstone(&class_root, self.tombstoned_leaves);
                         let sid = self.tyref_adt_layout_id(&place.ty).unwrap_or_else(|| {
                             let bare = majit_ir::descr::strip_instantiation_suffix(&canon);
                             majit_ir::descr::StructId::from_canonical(bare)
@@ -8914,8 +9039,10 @@ impl<'a> Lowering<'a> {
                         )
                     })
                     .collect();
-                let template =
-                    majit_ir::descr::StructId::from_canonical(&strip_crate_prefix(&name_path));
+                let template = majit_ir::descr::StructId::from_canonical(&decl_path_for_tombstone(
+                    &name_path,
+                    self.tombstoned_leaves,
+                ));
                 Some((
                     owner_path,
                     type_leaf,
@@ -8957,7 +9084,7 @@ impl<'a> Lowering<'a> {
                     .collect();
                 let template = majit_ir::descr::StructId::from_canonical(&format!(
                     "{}::{}",
-                    strip_crate_prefix(&name_path),
+                    decl_path_for_tombstone(&name_path, self.tombstoned_leaves),
                     v.name
                 ));
                 Some((
@@ -9146,12 +9273,7 @@ impl<'a> Lowering<'a> {
             strip_crate_prefix(&name_path)
         } else {
             let owner_base = if self.tombstoned_leaves.contains(&owner_leaf) {
-                let qualified = strip_crate_prefix(&name_path);
-                if qualified != owner_leaf {
-                    qualified
-                } else {
-                    name_path.clone()
-                }
+                tombstoned_owner_spelling(&name_path, &owner_leaf, self.tombstoned_leaves)
             } else {
                 owner_leaf
             };
@@ -9171,8 +9293,10 @@ impl<'a> Lowering<'a> {
                     .clone()
                     .unwrap_or_else(|| format!("__pos_{field_idx}"));
                 let ty = clone_tyref(&f.ty);
-                let template =
-                    majit_ir::descr::StructId::from_canonical(&strip_crate_prefix(&name_path));
+                let template = majit_ir::descr::StructId::from_canonical(&decl_path_for_tombstone(
+                    &name_path,
+                    self.tombstoned_leaves,
+                ));
                 let owner_id = Some(concrete_adt_struct_id(template, head_adt, self.llbc));
                 Some((owner_root, name, ty, owner_id))
             }
@@ -9192,7 +9316,7 @@ impl<'a> Lowering<'a> {
                 let variant_owner = format!("{owner_root}::{}", variant.name);
                 let template = majit_ir::descr::StructId::from_canonical(&format!(
                     "{}::{}",
-                    strip_crate_prefix(&name_path),
+                    decl_path_for_tombstone(&name_path, self.tombstoned_leaves),
                     variant.name
                 ));
                 let owner_id = Some(concrete_adt_struct_id(template, head_adt, self.llbc));
@@ -13147,7 +13271,7 @@ impl<'a> Lowering<'a> {
                         .map(|td| td.item_meta.name_path())
                     {
                         Some(name_path) => {
-                            let canon = strip_crate_prefix(&name_path);
+                            let canon = decl_path_for_tombstone(&name_path, self.tombstoned_leaves);
                             let sid = majit_ir::descr::StructId::from_canonical(&canon);
                             (Some(canon), Some(sid))
                         }
@@ -21406,7 +21530,10 @@ impl<'a> Lowering<'a> {
         let value = self.tyref_adt_body(ty)?;
         let def_id = inline_adt_def_id(value)?;
         let name_path = self.llbc.type_by_id(def_id)?.item_meta.name_path();
-        let template = majit_ir::descr::StructId::from_canonical(&strip_crate_prefix(&name_path));
+        let template = majit_ir::descr::StructId::from_canonical(&decl_path_for_tombstone(
+            &name_path,
+            self.tombstoned_leaves,
+        ));
         let adt = value.as_object()?.get("Adt")?.as_object();
         Some(concrete_adt_struct_id(template, adt, self.llbc))
     }
@@ -28180,12 +28307,7 @@ fn adt_node_class_root_with(
     // The stripped spelling is the withdrawn token, so paint the full
     // declaration path — the same spelling the constructor joins.
     if tombstoned.contains(&leaf) {
-        let qualified = strip_crate_prefix(&name);
-        leaf = if qualified != leaf {
-            qualified
-        } else {
-            name.clone()
-        };
+        leaf = tombstoned_owner_spelling(&name, &leaf, tombstoned);
     }
     // A reference-payload workspace enum instantiation projects to a
     // per-instantiation base class (`Result<Tuple>`) so its variant
@@ -45472,6 +45594,144 @@ mod tests {
         assert_eq!(
             super::adt_node_class_root_with(&adt_node(0), &b, &cross).as_deref(),
             Some("b::Foo")
+        );
+    }
+
+    /// `a::same::Code` and `b::same::Code` strip to one key. The leaf is
+    /// tombstoned, and each declaration keeps its crate on the owner and
+    /// on the merged field row.
+    #[test]
+    fn cross_crate_same_module_leaf_keeps_distinct_rows() {
+        fn code_with_field(def_id: u64, path: &[&str], field: &str, ty: &str) -> serde_json::Value {
+            let mut decl = code_struct(def_id, path);
+            decl["kind"]["Struct"][0]["name"] = serde_json::json!(field);
+            decl["kind"]["Struct"][0]["ty"] = serde_json::json!({"Literal": {"UInt": ty}});
+            decl
+        }
+        let a = llbc_with_types(
+            "a",
+            vec![code_with_field(0, &["a", "same", "Code"], "n", "U64")],
+            vec![],
+        );
+        let b = llbc_with_types(
+            "b",
+            vec![code_with_field(0, &["b", "same", "Code"], "m", "U32")],
+            vec![],
+        );
+        let mut facts = super::DuplicateLeafFacts::default();
+        facts.absorb(super::DuplicateLeafFacts::discover(&a));
+        facts.absorb(super::DuplicateLeafFacts::discover(&b));
+        let cross = facts.tombstoned_leaves();
+        assert!(cross.contains("Code"));
+        assert!(
+            cross.contains("same::Code"),
+            "the colliding stripped path is recorded, not only the leaf"
+        );
+        assert_eq!(
+            super::adt_node_class_root_with(&adt_node(0), &a, &cross).as_deref(),
+            Some("a::same::Code")
+        );
+        assert_eq!(
+            super::adt_node_class_root_with(&adt_node(0), &b, &cross).as_deref(),
+            Some("b::same::Code")
+        );
+
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+        }});
+        let body: super::Unstructured = serde_json::from_value(serde_json::json!({
+            "locals": {"arg_count": 0, "locals": []}, "body": [], "span": span
+        }))
+        .unwrap();
+        let dont_look_inside = std::collections::HashSet::new();
+        let accum_a = super::AccumulatorFacts::build(&a, &body);
+        let lowering_a = super::Lowering::new(
+            &a,
+            "a".into(),
+            &body,
+            crate::HostStaticAddrs::default(),
+            &[],
+            None,
+            &dont_look_inside,
+            &cross,
+            &accum_a,
+        )
+        .unwrap();
+        let payload = serde_json::json!([{"Adt": [0, null]}, 0]);
+        let (owner_a, field_a, _, id_a) = lowering_a
+            .resolve_adt_field(&payload)
+            .expect("field projection");
+        assert_eq!(owner_a, "a::same::Code");
+        assert_eq!(field_a, "n");
+        let kind = serde_json::json!({"Adt": [0, null]});
+        let (ctor_path, ctor_leaf, _, ctor_id, _, _) = lowering_a
+            .resolve_aggregate_adt(&kind)
+            .expect("constructor");
+        let ctor_owner = if ctor_path.is_empty() {
+            ctor_leaf
+        } else {
+            format!("{}::{}", ctor_path.join("::"), ctor_leaf)
+        };
+        assert_eq!(ctor_owner, "a::same::Code");
+        assert_eq!(
+            id_a,
+            Some(majit_ir::descr::StructId::from_canonical("a::same::Code"))
+        );
+        assert_eq!(
+            ctor_id,
+            majit_ir::descr::StructId::from_canonical("a::same::Code")
+        );
+
+        let accum_b = super::AccumulatorFacts::build(&b, &body);
+        let lowering_b = super::Lowering::new(
+            &b,
+            "b".into(),
+            &body,
+            crate::HostStaticAddrs::default(),
+            &[],
+            None,
+            &dont_look_inside,
+            &cross,
+            &accum_b,
+        )
+        .unwrap();
+        let (owner_b, field_b, _, id_b) = lowering_b
+            .resolve_adt_field(&payload)
+            .expect("field projection");
+        assert_eq!(owner_b, "b::same::Code");
+        assert_eq!(field_b, "m");
+        assert_eq!(
+            id_b,
+            Some(majit_ir::descr::StructId::from_canonical("b::same::Code"))
+        );
+        assert_ne!(id_a, id_b);
+
+        let prog = super::build_semantic_program_from_llbcs(&[a, b]).expect("merged program");
+        assert_eq!(
+            prog.struct_fields
+                .fields
+                .get("a::same::Code")
+                .map(|rows| rows[0].0.as_str()),
+            Some("n")
+        );
+        assert_eq!(
+            prog.struct_fields
+                .fields
+                .get("b::same::Code")
+                .map(|rows| rows[0].0.as_str()),
+            Some("m")
+        );
+        assert!(
+            !prog.struct_fields.fields.contains_key("same::Code"),
+            "the merged program must not keep one row for the shared stripped key"
+        );
+        assert_ne!(
+            prog.struct_ids
+                .get("a::same::Code")
+                .and_then(|id| id.as_ref()),
+            prog.struct_ids
+                .get("b::same::Code")
+                .and_then(|id| id.as_ref())
         );
     }
 
