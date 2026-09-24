@@ -5752,29 +5752,6 @@ pub fn getdict(obj: PyObjectRef) -> PyResult {
     }
 }
 
-/// Whether [`getdict`] answers `W_Root.getdict`'s None for `obj`, decided
-/// without allocating: none of the layouts that override `getdict` with a
-/// dictionary of their own, and a type without `hasdict` (the bytes /
-/// bytearray / float / complex / array overrides and mapdict all key on it).
-fn getdict_is_none(obj: PyObjectRef) -> bool {
-    unsafe {
-        if is_type(obj)
-            || is_module(obj)
-            || crate::module::thread::is_local(obj)
-            || std::ptr::eq((*obj).ob_type, &crate::function::FUNCTION_TYPE)
-            || pyre_object::function::is_staticmethod(obj)
-            || pyre_object::function::is_classmethod(obj)
-            || pyre_object::is_exception(obj)
-        {
-            return false;
-        }
-        match crate::typedef::r#type(obj) {
-            Some(w_type) => !pyre_object::w_type_get_hasdict(w_type.as_ptr()),
-            None => true,
-        }
-    }
-}
-
 /// `__slots__` storage fallback for a native-layout subclass instance.
 ///
 /// A `W_Member` slot normally reads/writes the receiver's mapdict slot
@@ -11951,15 +11928,10 @@ unsafe fn instance_dict_does_not_shadow_wtf8(w_obj: PyObjectRef, name: &Wtf8) ->
             .is_null()
             .then_some(());
     }
-    // `W_Root.getdictvalue`: a receiver whose `getdict` answers None has no
-    // instance attribute to shadow the type lookup.
-    if getdict_is_none(w_obj) {
-        return Some(());
-    }
-    // Every other layout (str / tuple subclasses with a dictionary, …) keeps
-    // its instance attributes somewhere this probe does not read yet.  Adding
-    // a layout means adding its non-allocating dictionary peek here and the
-    // matching shadowing guard on the tracer side.
+    // Every other layout (list / str / tuple / native-payload subclasses)
+    // keeps its instance attributes somewhere this probe does not read yet.
+    // Adding a layout means adding its non-allocating dictionary peek here and
+    // the matching shadowing guard on the tracer side.
     None
 }
 
