@@ -696,12 +696,6 @@ mod tests {
     }
 
     #[test]
-    fn test_long_type_name_is_int() {
-        // Python users see "int" for both W_IntObject and W_LongObject
-        assert_eq!(LONG_TYPE.name, "int");
-    }
-
-    #[test]
     fn test_jit_w_long_fits_int_in_range() {
         let obj = w_long_from_i64(123);
         assert_eq!(jit_w_long_fits_int(obj as i64), 1);

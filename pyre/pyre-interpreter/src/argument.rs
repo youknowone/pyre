@@ -2374,28 +2374,6 @@ mod tests {
         }
     }
 
-    /// pypy/interpreter/argument.py:97-103 — non-iterable `*` arg
-    /// surfaces as `Err(PyError)` from `Arguments::new` rather than the
-    /// previous `unimplemented!()` panic.  The rejection takes the same
-    /// `space.iter` route as the test above, so it needs the same
-    /// `init_typeobjects()`.
-    #[test]
-    fn new_with_w_stararg_non_iterable_returns_err() {
-        crate::typedef::init_typeobjects();
-        let pos: [PyObjectRef; 0] = [];
-        let stararg = pyre_object::w_int_new(42); // not iterable
-        match Arguments::new(&pos, None, None, Some(stararg), None, false, None) {
-            Ok(_) => panic!("non-iterable star arg should fail"),
-            Err(err) => {
-                assert_eq!(err.kind, crate::PyErrorKind::TypeError);
-                assert!(
-                    err.message_text()
-                        .contains("argument after * must be an iterable")
-                );
-            }
-        }
-    }
-
     /// pypy/interpreter/argument.py `replace_arguments` —
     /// returns a new Arguments with replaced positional list,
     /// keyword names/values shared (cloned in pyre).

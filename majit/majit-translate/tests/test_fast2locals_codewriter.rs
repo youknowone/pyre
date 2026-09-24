@@ -17,18 +17,25 @@ use majit_translate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
 use majit_translate::{
     CallPath, ErrorCarrierSpec, GraphTransformConfig, HostStaticAddrs, VirtualizableFieldDescriptor,
 };
+use std::sync::OnceLock;
 
 const INTERPRETER_LLBC: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../build/llbc/pyre-interpreter.ullbc"
 );
 
-fn interpreter_llbc() -> Option<Llbc> {
-    if !std::path::Path::new(INTERPRETER_LLBC).is_file() {
-        eprintln!("skipping: {INTERPRETER_LLBC} is missing");
-        return None;
-    }
-    Some(Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter.ullbc"))
+/// Shared parse — the corpus is several GB resident, and each test parsing
+/// its own copy in parallel took the binary past 12 GB.
+fn interpreter_llbc() -> Option<&'static Llbc> {
+    static LLBC: OnceLock<Option<Llbc>> = OnceLock::new();
+    LLBC.get_or_init(|| {
+        if !std::path::Path::new(INTERPRETER_LLBC).is_file() {
+            eprintln!("skipping: {INTERPRETER_LLBC} is missing");
+            return None;
+        }
+        Some(Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter.ullbc"))
+    })
+    .as_ref()
 }
 
 fn lower_named(llbc: &Llbc, context: &LowerContext<'_>, leaf: &str) -> FunctionGraph {
@@ -59,8 +66,8 @@ fn lower_named(llbc: &Llbc, context: &LowerContext<'_>, leaf: &str) -> FunctionG
 /// when the artefact is absent so the tests degrade to a skip.
 fn lower_fast2locals() -> Option<FunctionGraph> {
     let llbc = interpreter_llbc()?;
-    let context = LowerContext::new(&llbc);
-    Some(lower_named(&llbc, &context, "fast2locals"))
+    let context = LowerContext::new(llbc);
+    Some(lower_named(llbc, &context, "fast2locals"))
 }
 
 fn call_leafs(graph: &FunctionGraph) -> Vec<String> {
@@ -89,8 +96,8 @@ fn the_access_directly_marker_folds_out_of_the_type_lookup() {
     let Some(llbc) = interpreter_llbc() else {
         return;
     };
-    let context = LowerContext::new(&llbc);
-    let graph = lower_named(&llbc, &context, "typedef::type");
+    let context = LowerContext::new(llbc);
+    let graph = lower_named(llbc, &context, "typedef::type");
     assert!(
         call_leafs(&graph)
             .iter()
@@ -108,13 +115,13 @@ fn f_locals_gateway_force_is_deleted_and_the_method_has_none() {
     let Some(llbc) = interpreter_llbc() else {
         return;
     };
-    let context = LowerContext::new(&llbc);
+    let context = LowerContext::new(llbc);
     let gateway = lower_named(
-        &llbc,
+        llbc,
         &context,
         "__majit_wrap_descr_typecheck_fget_getdictscope",
     );
-    let method = lower_named(&llbc, &context, "fget_getdictscope");
+    let method = lower_named(llbc, &context, "fget_getdictscope");
     assert!(
         call_leafs(&gateway)
             .iter()
@@ -158,7 +165,7 @@ fn every_redirected_frame_getter_carries_a_deletable_force() {
     let Some(llbc) = interpreter_llbc() else {
         return;
     };
-    let context = LowerContext::new(&llbc);
+    let context = LowerContext::new(llbc);
     for leaf in [
         "__majit_wrap_descr_typecheck_get_w_globals",
         "__majit_wrap_descr_typecheck_fget_f_lasti",
@@ -172,7 +179,7 @@ fn every_redirected_frame_getter_carries_a_deletable_force() {
         "__majit_wrap_descr_typecheck_fget_f_trace_opcodes",
         "__majit_wrap_descr_typecheck_fset_f_trace_opcodes",
     ] {
-        let gateway = lower_named(&llbc, &context, leaf);
+        let gateway = lower_named(llbc, &context, leaf);
         let before = call_leafs(&gateway);
         assert!(
             before
@@ -210,14 +217,14 @@ fn the_gateways_outside_the_redirected_set_carry_no_force() {
     let Some(llbc) = interpreter_llbc() else {
         return;
     };
-    let context = LowerContext::new(&llbc);
+    let context = LowerContext::new(llbc);
     for leaf in [
         "__majit_wrap_descr_typecheck_fget_f_code",
         "__majit_wrap_descr_typecheck_fget_f_back",
         "__majit_wrap_descr_typecheck_fget_f_builtins",
         "__majit_wrap_descr_typecheck_get_generator",
     ] {
-        let gateway = lower_named(&llbc, &context, leaf);
+        let gateway = lower_named(llbc, &context, leaf);
         let before = call_leafs(&gateway);
         assert!(
             before

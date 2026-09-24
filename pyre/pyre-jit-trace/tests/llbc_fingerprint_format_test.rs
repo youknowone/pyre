@@ -146,32 +146,38 @@ fn a_bare_hash_is_rejected() {
 }
 
 #[test]
-fn a_short_digest_is_rejected() {
-    let stdout = format!("source={}\nclosure={HASH}\nexternal=\n", &HASH[..63]);
-    assert_eq!(parse_fingerprint_stdout(&stdout), None);
+fn malformed_fingerprint_stdout_is_rejected() {
+    let cases = [
+        (
+            "short",
+            format!("source={}\nclosure={HASH}\nexternal=\n", &HASH[..63]),
+        ),
+        (
+            "non_hex",
+            format!("source={}zz\nclosure={HASH}\nexternal=\n", &HASH[..62]),
+        ),
+        ("empty", String::new()),
+    ];
+    for (name, stdout) in cases {
+        assert_eq!(parse_fingerprint_stdout(&stdout), None, "case {name}");
+    }
 }
 
 #[test]
-fn a_non_hex_digest_is_rejected() {
-    let stdout = format!("source={}zz\nclosure={HASH}\nexternal=\n", &HASH[..62]);
-    assert_eq!(parse_fingerprint_stdout(&stdout), None);
-}
-
-#[test]
-fn empty_output_is_rejected() {
-    assert_eq!(parse_fingerprint_stdout(""), None);
-}
-
-#[test]
-fn output_without_closure_is_rejected() {
-    let stdout = format!("source={HASH}\nexternal=\n{ARTEFACTS}\n");
-    assert_eq!(parse_fingerprint_fields(&stdout), None);
-}
-
-#[test]
-fn a_non_hash_closure_is_rejected() {
-    let stdout = format!("source={HASH}\nclosure=unknown\nexternal=\n{ARTEFACTS}\n");
-    assert_eq!(parse_fingerprint_fields(&stdout), None);
+fn fingerprint_fields_without_valid_closure_are_rejected() {
+    let cases = [
+        (
+            "without_closure",
+            format!("source={HASH}\nexternal=\n{ARTEFACTS}\n"),
+        ),
+        (
+            "non_hash_closure",
+            format!("source={HASH}\nclosure=unknown\nexternal=\n{ARTEFACTS}\n"),
+        ),
+    ];
+    for (name, stdout) in cases {
+        assert_eq!(parse_fingerprint_fields(&stdout), None, "case {name}");
+    }
 }
 
 #[test]

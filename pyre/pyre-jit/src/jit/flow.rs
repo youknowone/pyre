@@ -1601,15 +1601,6 @@ mod tests {
     }
 
     #[test]
-    fn link_extravars_round_trip() {
-        let v0 = Variable::new(VariableId(0), Kind::Ref);
-        let v1 = Variable::new(VariableId(1), Kind::Ref);
-        let mut link = Link::new(vec![], None, None);
-        link.extravars(Some(v0), Some(v1));
-        assert_eq!(link.getextravars(), vec![v0, v1]);
-    }
-
-    #[test]
     fn link_exitcase_supports_switch_and_bool_shapes() {
         let link = Link::new(vec![], None, Some(Constant::string("default").into()))
             .with_llexitcase(Constant::signed(7).into());

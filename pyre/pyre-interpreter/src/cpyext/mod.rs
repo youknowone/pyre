@@ -1029,61 +1029,45 @@ mod tests {
         assert!(checked > 0, "no fork locks found to check");
     }
 
-    /// Resetting a module's own locks is only reached if [`after_fork_child`]
-    /// calls that module.
     #[test]
-    fn every_module_after_fork_child_is_called() {
+    fn every_module_hook_is_called() {
         let sources = sources();
         let (_, root) = sources
             .iter()
             .find(|(name, _)| name == "mod.rs")
             .expect("cpyext/mod.rs");
-        let body = root
-            .split_once("pub fn after_fork_child() {")
-            .expect("the entry point")
-            .1
-            .split_once("\n}\n")
-            .expect("its end")
-            .0;
-        for (file, text) in &sources {
-            // The entry point's own file names both spellings, in this test.
-            if file == "mod.rs" || !text.contains("pub(super) unsafe fn after_fork_child()") {
-                continue;
+        let cases = [
+            (
+                "after_fork_child",
+                "pub fn after_fork_child() {",
+                "pub(super) unsafe fn after_fork_child()",
+                "after_fork_child()",
+            ),
+            (
+                "ensure_linked",
+                "pub fn ensure_linked() {",
+                "pub(super) fn ensure_linked()",
+                "ensure_linked()",
+            ),
+        ];
+        for (hook, entry, decl, call) in cases {
+            let body = root
+                .split_once(entry)
+                .unwrap_or_else(|| panic!("case {hook}: the entry point"))
+                .1
+                .split_once("\n}\n")
+                .unwrap_or_else(|| panic!("case {hook}: its end"))
+                .0;
+            for (file, text) in &sources {
+                if file == "mod.rs" || !text.contains(decl) {
+                    continue;
+                }
+                let module = file.strip_suffix(".rs").expect("a Rust source");
+                assert!(
+                    body.contains(&format!("{module}::{call}")),
+                    "case {hook}: {file} has a {hook} that cpyext::{hook} never calls",
+                );
             }
-            let module = file.strip_suffix(".rs").expect("a Rust source");
-            assert!(
-                body.contains(&format!("{module}::after_fork_child()")),
-                "{file} has an after_fork_child that cpyext::after_fork_child never calls",
-            );
-        }
-    }
-
-    /// An entry point is only in the binary because something names it, and
-    /// `ensure_linked` is what does the naming.  A module's own list is
-    /// reached only if [`ensure_linked`] calls it.
-    #[test]
-    fn every_module_ensure_linked_is_called() {
-        let sources = sources();
-        let (_, root) = sources
-            .iter()
-            .find(|(name, _)| name == "mod.rs")
-            .expect("cpyext/mod.rs");
-        let body = root
-            .split_once("pub fn ensure_linked() {")
-            .expect("the entry point")
-            .1
-            .split_once("\n}\n")
-            .expect("its end")
-            .0;
-        for (file, text) in &sources {
-            if file == "mod.rs" || !text.contains("pub(super) fn ensure_linked()") {
-                continue;
-            }
-            let module = file.strip_suffix(".rs").expect("a Rust source");
-            assert!(
-                body.contains(&format!("{module}::ensure_linked()")),
-                "{file} has an ensure_linked that cpyext::ensure_linked never calls",
-            );
         }
     }
 }

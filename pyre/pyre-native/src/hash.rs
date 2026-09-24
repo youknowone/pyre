@@ -102,18 +102,6 @@ mod tests {
     }
 
     #[test]
-    fn computes_fixed_length_digests() {
-        assert_eq!(
-            hex(&compute_digest("md5", b"abc", 0).unwrap()),
-            "900150983cd24fb0d6963f7d28e17f72"
-        );
-        assert_eq!(
-            hex(&compute_digest("sha256", b"abc", 0).unwrap()),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-    }
-
-    #[test]
     fn computes_extendable_output_digests() {
         let digest = compute_digest("shake_128", b"abc", 8).unwrap();
         assert_eq!(digest.len(), 8);

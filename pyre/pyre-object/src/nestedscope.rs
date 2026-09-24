@@ -249,21 +249,14 @@ mod tests {
     }
 
     #[test]
-    fn test_cell_create_empty() {
-        let cell = w_cell_new(PY_NULL, leak_family());
-        unsafe {
-            assert!(is_cell(cell));
-            assert!(w_cell_get(cell).is_null());
-        }
-    }
-
-    #[test]
-    fn test_cell_create_with_value() {
-        let value = 0xDEAD as PyObjectRef;
-        let cell = w_cell_new(value, leak_family());
-        unsafe {
-            assert!(is_cell(cell));
-            assert_eq!(w_cell_get(cell), value);
+    fn test_cell_create() {
+        let cases = [("empty", PY_NULL), ("with_value", 0xDEAD as PyObjectRef)];
+        for (name, value) in cases {
+            let cell = w_cell_new(value, leak_family());
+            unsafe {
+                assert!(is_cell(cell), "case {name}");
+                assert_eq!(w_cell_get(cell), value, "case {name}");
+            }
         }
     }
 

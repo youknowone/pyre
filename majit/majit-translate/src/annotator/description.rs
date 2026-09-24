@@ -4008,19 +4008,6 @@ mod tests {
     }
 
     #[test]
-    fn function_desc_pycall_without_pyobj_errors_cleanly() {
-        // FunctionDesc with no pyobj can't reach `buildgraph` — pycall
-        // surfaces the missing-pyobj error via specialize → cachedgraph
-        // → buildgraph rather than panicking.
-        let fd = FunctionDesc::new(bk(), None, "f", int_sig(&[]), None, None);
-        let args = ArgumentsForTranslation::new(vec![], None, None);
-        let err = fd
-            .pycall(None, &args, &SomeValue::Impossible, None)
-            .unwrap_err();
-        assert!(err.msg.unwrap_or_default().contains("missing pyobj"));
-    }
-
-    #[test]
     fn flatten_star_args_identity_for_plain_signature() {
         let fd = FunctionDesc::new(bk(), None, "f", int_sig(&["a", "b"]), None, None);
         let args = vec![

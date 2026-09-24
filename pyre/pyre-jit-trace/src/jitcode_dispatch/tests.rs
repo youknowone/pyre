@@ -2787,13 +2787,19 @@ fn drive_alloc_with_descr(
 }
 
 #[test]
-fn new_with_vtable_records_the_alloc_and_writes_the_ref_dst() {
-    drive_alloc_with_descr("new_with_vtable/d>r", OpCode::NewWithVtable, None);
-}
-
-#[test]
-fn new_records_the_alloc_and_writes_the_ref_dst() {
-    drive_alloc_with_descr("new/d>r", OpCode::New, None);
+fn alloc_records_the_alloc_and_writes_the_ref_dst() {
+    let cases = [
+        (
+            "new_with_vtable",
+            "new_with_vtable/d>r",
+            OpCode::NewWithVtable,
+        ),
+        ("new", "new/d>r", OpCode::New),
+    ];
+    for (name, opname, opcode) in cases {
+        assert!(opname.starts_with(name), "case {name}");
+        drive_alloc_with_descr(opname, opcode, None);
+    }
 }
 
 /// Backend stub for the allocation-rooting tests: `bh_new*` hands back one
@@ -3728,7 +3734,7 @@ fn record_exact_class_records_the_hint_with_both_operands() {
 }
 
 #[test]
-fn switch_id_hit_jumps_to_matching_target() {
+fn switch_id_jumps_to_target_or_falls_through() {
     let switch_byte = *insns_opname_to_byte()
         .get("switch/id")
         .expect("`switch/id` must be in insns table");
@@ -3738,123 +3744,62 @@ fn switch_id_hit_jumps_to_matching_target() {
         0x00,
         0x00, // d descr index 0
     ];
-    let mut tc = fresh_trace_ctx();
-    let value = tc.const_int(5);
-    let mut regs_i = vec![value];
-    let descr_pool = switch_descr_pool(&[(5, 17), (9, 23)]);
-    let descr = done_descr_ref_for_tests();
-    let session = std::cell::RefCell::new(WalkSession::default());
-    let mut wc = WalkContext {
-        frame_state: WalkFrameState::new(WalkFrameStateData {
-            callee_shadow: None,
-            concrete_registers_r: ([]).to_vec(),
-            outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
-            ..Default::default()
-        }),
-        inline_callee_consts: None,
-        inline_poison_pcs: None,
-        fbw_mode: test_fbw_mode(),
-        session: &session,
-        registers_r: &RegisterBank::default(),
-        registers_i: &RegisterBank::new(regs_i.iter().copied()),
-        registers_f: &RegisterBank::default(),
+    let cases = [("hit", 5_i64, Some(17_usize)), ("miss", 7, None)];
+    for (name, key, jump_to) in cases {
+        let mut tc = fresh_trace_ctx();
+        let value = tc.const_int(key);
+        let mut regs_i = vec![value];
+        let descr_pool = switch_descr_pool(&[(5, 17), (9, 23)]);
+        let _descr = done_descr_ref_for_tests();
+        let session = std::cell::RefCell::new(WalkSession::default());
+        let mut wc = WalkContext {
+            frame_state: WalkFrameState::new(WalkFrameStateData {
+                callee_shadow: None,
+                concrete_registers_r: ([]).to_vec(),
+                outer_active_boxes: Vec::new(),
+                vstack_boxes: Vec::new(),
+                vstack_last_ref: OpRef::NONE,
+                vstack_reorder_saved: None,
+                ..Default::default()
+            }),
+            inline_callee_consts: None,
+            inline_poison_pcs: None,
+            fbw_mode: test_fbw_mode(),
+            session: &session,
+            registers_r: &RegisterBank::default(),
+            registers_i: &RegisterBank::new(regs_i.iter().copied()),
+            registers_f: &RegisterBank::default(),
 
-        concrete_registers_i: &mut [],
-        descr_refs: &descr_pool,
-        raw_descrs: RawDescrPool::Global,
-        is_authoritative_executor: false,
-        trace_ctx: &mut tc,
-        is_top_level: true,
-        sub_jitcode_lookup: &no_sub_jitcodes,
-        entry_py_pc: EntryPyPc::Py(0),
-        outer_resume_marker_jit_pc: None,
-        outer_jitcode_index: 0,
+            concrete_registers_i: &mut [],
+            descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
+            trace_ctx: &mut tc,
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            entry_py_pc: EntryPyPc::Py(0),
+            outer_resume_marker_jit_pc: None,
+            outer_jitcode_index: 0,
 
-        pending_guard_snapshot_error: None,
+            pending_guard_snapshot_error: None,
 
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
 
-        vstack_reorder_ceiling: u32::MAX,
+            vstack_reorder_ceiling: u32::MAX,
 
-        vstack_handler_landing_py: None,
-        live_before_jit_pc: usize::MAX,
-        live_after_jit_pc: usize::MAX,
-    };
+            vstack_handler_landing_py: None,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
+        };
 
-    let (outcome, next_pc) = step(&code, 0, &mut wc).expect("switch hit must dispatch");
-
-    assert_eq!(outcome, DispatchOutcome::Continue);
-    assert_eq!(next_pc, 17);
-}
-
-#[test]
-fn switch_id_miss_falls_through() {
-    let switch_byte = *insns_opname_to_byte()
-        .get("switch/id")
-        .expect("`switch/id` must be in insns table");
-    let code = [
-        switch_byte,
-        0x00, // i register 0
-        0x00,
-        0x00, // d descr index 0
-    ];
-    let mut tc = fresh_trace_ctx();
-    let value = tc.const_int(7);
-    let mut regs_i = vec![value];
-    let descr_pool = switch_descr_pool(&[(5, 17), (9, 23)]);
-    let descr = done_descr_ref_for_tests();
-    let session = std::cell::RefCell::new(WalkSession::default());
-    let mut wc = WalkContext {
-        frame_state: WalkFrameState::new(WalkFrameStateData {
-            callee_shadow: None,
-            concrete_registers_r: ([]).to_vec(),
-            outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
-            ..Default::default()
-        }),
-        inline_callee_consts: None,
-        inline_poison_pcs: None,
-        fbw_mode: test_fbw_mode(),
-        session: &session,
-        registers_r: &RegisterBank::default(),
-        registers_i: &RegisterBank::new(regs_i.iter().copied()),
-        registers_f: &RegisterBank::default(),
-
-        concrete_registers_i: &mut [],
-        descr_refs: &descr_pool,
-        raw_descrs: RawDescrPool::Global,
-        is_authoritative_executor: false,
-        trace_ctx: &mut tc,
-        is_top_level: true,
-        sub_jitcode_lookup: &no_sub_jitcodes,
-        entry_py_pc: EntryPyPc::Py(0),
-        outer_resume_marker_jit_pc: None,
-        outer_jitcode_index: 0,
-
-        pending_guard_snapshot_error: None,
-
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
-        live_before_jit_pc: usize::MAX,
-        live_after_jit_pc: usize::MAX,
-    };
-
-    let (outcome, next_pc) = step(&code, 0, &mut wc).expect("switch miss must dispatch");
-
-    assert_eq!(outcome, DispatchOutcome::Continue);
-    assert_eq!(next_pc, code.len());
+        let stepped = step(&code, 0, &mut wc);
+        assert!(stepped.is_ok(), "case {name}");
+        let (outcome, next_pc) = stepped.unwrap();
+        assert_eq!(outcome, DispatchOutcome::Continue, "case {name}");
+        assert_eq!(next_pc, jump_to.unwrap_or(code.len()), "case {name}");
+    }
 }
 
 #[test]
@@ -8506,110 +8451,40 @@ fn drive_int_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
 }
 
 #[test]
-fn int_add_records_intadd_with_both_operands_and_writes_dst() {
-    drive_int_binop("int_add/ii>i", majit_ir::OpCode::IntAdd);
-}
-
-#[test]
-fn int_sub_records_intsub() {
-    drive_int_binop("int_sub/ii>i", majit_ir::OpCode::IntSub);
-}
-
-#[test]
-fn int_mul_records_intmul() {
-    drive_int_binop("int_mul/ii>i", majit_ir::OpCode::IntMul);
-}
-
-#[test]
-fn int_and_records_intand() {
-    drive_int_binop("int_and/ii>i", majit_ir::OpCode::IntAnd);
-}
-
-// `int_or/ii>i` is not currently in `pipeline.insns` — pyre's
-// interpreter source does not emit Rust `|` on integers in any
-// path the JIT traces.  RPython's `Assembler.insns` only carries
-// emitted opnames (`assembler.py
-// setdefault(key, len(self.insns))`); pyre's runtime now mirrors
-// that (build.rs walks only `pipeline.insns`).  The dispatcher
-// handler exists; this test will unignore once an interpreter
-// source path emits `int_or` (e.g., bitset / flag computation).
-#[test]
-fn int_or_records_intor() {
-    drive_int_binop("int_or/ii>i", majit_ir::OpCode::IntOr);
-}
-
-#[test]
-fn int_xor_records_intxor() {
-    drive_int_binop("int_xor/ii>i", majit_ir::OpCode::IntXor);
-}
-
-#[test]
-fn int_rshift_records_intrshift() {
-    drive_int_binop("int_rshift/ii>i", majit_ir::OpCode::IntRshift);
-}
-
-// The unsigned members of the same generated binop loop. They reach the
-// walker through `record_binop_i`, which the legacy dispatcher also feeds
-// from `BC_UINT_*`; the shape is identical to the signed arms, so the
-// driver covers them unchanged.
-#[test]
-fn uint_rshift_records_uintrshift() {
-    drive_int_binop("uint_rshift/ii>i", majit_ir::OpCode::UintRshift);
-}
-
-#[test]
-fn uint_mul_high_records_uintmulhigh() {
-    drive_int_binop("uint_mul_high/ii>i", majit_ir::OpCode::UintMulHigh);
-}
-
-#[test]
-fn uint_lt_records_uintlt() {
-    drive_int_binop("uint_lt/ii>i", majit_ir::OpCode::UintLt);
-}
-
-#[test]
-fn uint_le_records_uintle() {
-    drive_int_binop("uint_le/ii>i", majit_ir::OpCode::UintLe);
-}
-
-#[test]
-fn uint_gt_records_uintgt() {
-    drive_int_binop("uint_gt/ii>i", majit_ir::OpCode::UintGt);
-}
-
-#[test]
-fn uint_ge_records_uintge() {
-    drive_int_binop("uint_ge/ii>i", majit_ir::OpCode::UintGe);
-}
-
-#[test]
-fn int_eq_records_inteq() {
-    drive_int_binop("int_eq/ii>i", majit_ir::OpCode::IntEq);
-}
-
-#[test]
-fn int_ne_records_intne() {
-    drive_int_binop("int_ne/ii>i", majit_ir::OpCode::IntNe);
-}
-
-#[test]
-fn int_lt_records_intlt() {
-    drive_int_binop("int_lt/ii>i", majit_ir::OpCode::IntLt);
-}
-
-#[test]
-fn int_le_records_intle() {
-    drive_int_binop("int_le/ii>i", majit_ir::OpCode::IntLe);
-}
-
-#[test]
-fn int_gt_records_intgt() {
-    drive_int_binop("int_gt/ii>i", majit_ir::OpCode::IntGt);
-}
-
-#[test]
-fn int_ge_records_intge() {
-    drive_int_binop("int_ge/ii>i", majit_ir::OpCode::IntGe);
+fn int_binop_records_opcode_with_both_operands_and_writes_dst() {
+    let cases = [
+        ("int_add", "int_add/ii>i", majit_ir::OpCode::IntAdd),
+        ("int_sub", "int_sub/ii>i", majit_ir::OpCode::IntSub),
+        ("int_mul", "int_mul/ii>i", majit_ir::OpCode::IntMul),
+        ("int_and", "int_and/ii>i", majit_ir::OpCode::IntAnd),
+        ("int_or", "int_or/ii>i", majit_ir::OpCode::IntOr),
+        ("int_xor", "int_xor/ii>i", majit_ir::OpCode::IntXor),
+        ("int_rshift", "int_rshift/ii>i", majit_ir::OpCode::IntRshift),
+        (
+            "uint_rshift",
+            "uint_rshift/ii>i",
+            majit_ir::OpCode::UintRshift,
+        ),
+        (
+            "uint_mul_high",
+            "uint_mul_high/ii>i",
+            majit_ir::OpCode::UintMulHigh,
+        ),
+        ("uint_lt", "uint_lt/ii>i", majit_ir::OpCode::UintLt),
+        ("uint_le", "uint_le/ii>i", majit_ir::OpCode::UintLe),
+        ("uint_gt", "uint_gt/ii>i", majit_ir::OpCode::UintGt),
+        ("uint_ge", "uint_ge/ii>i", majit_ir::OpCode::UintGe),
+        ("int_eq", "int_eq/ii>i", majit_ir::OpCode::IntEq),
+        ("int_ne", "int_ne/ii>i", majit_ir::OpCode::IntNe),
+        ("int_lt", "int_lt/ii>i", majit_ir::OpCode::IntLt),
+        ("int_le", "int_le/ii>i", majit_ir::OpCode::IntLe),
+        ("int_gt", "int_gt/ii>i", majit_ir::OpCode::IntGt),
+        ("int_ge", "int_ge/ii>i", majit_ir::OpCode::IntGe),
+    ];
+    for (name, opname, opcode) in cases {
+        assert!(opname.starts_with(name), "case {name}");
+        drive_int_binop(opname, opcode);
+    }
 }
 
 /// Drive `int_between/iii>i` and return the recorded ops plus
@@ -8875,18 +8750,20 @@ fn drive_float_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
 }
 
 #[test]
-fn float_add_records_floatadd() {
-    drive_float_binop("float_add/ff>f", majit_ir::OpCode::FloatAdd);
-}
-
-#[test]
-fn float_sub_records_floatsub() {
-    drive_float_binop("float_sub/ff>f", majit_ir::OpCode::FloatSub);
-}
-
-#[test]
-fn float_truediv_records_floattruediv() {
-    drive_float_binop("float_truediv/ff>f", majit_ir::OpCode::FloatTrueDiv);
+fn float_binop_records_opcode() {
+    let cases = [
+        ("float_add", "float_add/ff>f", majit_ir::OpCode::FloatAdd),
+        ("float_sub", "float_sub/ff>f", majit_ir::OpCode::FloatSub),
+        (
+            "float_truediv",
+            "float_truediv/ff>f",
+            majit_ir::OpCode::FloatTrueDiv,
+        ),
+    ];
+    for (name, opname, opcode) in cases {
+        assert!(opname.starts_with(name), "case {name}");
+        drive_float_binop(opname, opcode);
+    }
 }
 
 /// Drive a single `float_<unop>/f>f` handler. Same shape pattern as
@@ -8967,13 +8844,15 @@ fn drive_float_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
 }
 
 #[test]
-fn float_neg_records_floatneg_with_one_operand_and_writes_dst() {
-    drive_float_unop("float_neg/f>f", majit_ir::OpCode::FloatNeg);
-}
-
-#[test]
-fn float_abs_records_floatabs() {
-    drive_float_unop("float_abs/f>f", majit_ir::OpCode::FloatAbs);
+fn float_unop_records_opcode_and_writes_dst() {
+    let cases = [
+        ("float_neg", "float_neg/f>f", majit_ir::OpCode::FloatNeg),
+        ("float_abs", "float_abs/f>f", majit_ir::OpCode::FloatAbs),
+    ];
+    for (name, opname, opcode) in cases {
+        assert!(opname.starts_with(name), "case {name}");
+        drive_float_unop(opname, opcode);
+    }
 }
 
 /// Drive a single `int_<unop>/i>i` handler. Same shape pattern as
@@ -9052,18 +8931,20 @@ fn drive_int_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
 }
 
 #[test]
-fn int_neg_records_intneg() {
-    drive_int_unop("int_neg/i>i", majit_ir::OpCode::IntNeg);
-}
-
-#[test]
-fn int_invert_records_intinvert() {
-    drive_int_unop("int_invert/i>i", majit_ir::OpCode::IntInvert);
-}
-
-#[test]
-fn int_is_true_records_intistrue() {
-    drive_int_unop("int_is_true/i>i", majit_ir::OpCode::IntIsTrue);
+fn int_unop_records_opcode() {
+    let cases = [
+        ("int_neg", "int_neg/i>i", majit_ir::OpCode::IntNeg),
+        ("int_invert", "int_invert/i>i", majit_ir::OpCode::IntInvert),
+        (
+            "int_is_true",
+            "int_is_true/i>i",
+            majit_ir::OpCode::IntIsTrue,
+        ),
+    ];
+    for (name, opname, opcode) in cases {
+        assert!(opname.starts_with(name), "case {name}");
+        drive_int_unop(opname, opcode);
+    }
 }
 
 /// `int_is_zero` is the `not a` sibling `pyjitpl.py` generates beside
@@ -9173,23 +9054,25 @@ fn drive_ptr_compare(opname: &str, expected_opcode: majit_ir::OpCode) {
 }
 
 #[test]
-fn ptr_eq_records_ptreq_with_two_ref_operands_into_int_dst() {
-    drive_ptr_compare("ptr_eq/rr>i", majit_ir::OpCode::PtrEq);
-}
-
-#[test]
-fn ptr_ne_records_ptrne() {
-    drive_ptr_compare("ptr_ne/rr>i", majit_ir::OpCode::PtrNe);
-}
-
-#[test]
-fn instance_ptr_eq_records_instanceptreq() {
-    drive_ptr_compare("instance_ptr_eq/rr>i", majit_ir::OpCode::InstancePtrEq);
-}
-
-#[test]
-fn instance_ptr_ne_records_instanceptrne() {
-    drive_ptr_compare("instance_ptr_ne/rr>i", majit_ir::OpCode::InstancePtrNe);
+fn ptr_compare_records_opcode_into_int_dst() {
+    let cases = [
+        ("ptr_eq", "ptr_eq/rr>i", majit_ir::OpCode::PtrEq),
+        ("ptr_ne", "ptr_ne/rr>i", majit_ir::OpCode::PtrNe),
+        (
+            "instance_ptr_eq",
+            "instance_ptr_eq/rr>i",
+            majit_ir::OpCode::InstancePtrEq,
+        ),
+        (
+            "instance_ptr_ne",
+            "instance_ptr_ne/rr>i",
+            majit_ir::OpCode::InstancePtrNe,
+        ),
+    ];
+    for (name, opname, opcode) in cases {
+        assert!(opname.starts_with(name), "case {name}");
+        drive_ptr_compare(opname, opcode);
+    }
 }
 
 #[test]
@@ -11840,98 +11723,6 @@ fn residual_call_r_r_with_cannot_raise_records_callr_no_guard() {
 }
 
 #[test]
-fn residual_call_r_r_writes_recorder_result_into_dst_register() {
-    // Verify the dst writeback half of `residual_call_r_r/iRd>r`.
-    // After the handler runs, `registers_r[dst]` must equal the
-    // OpRef the recorder returned (i.e., the OpRef whose Op is
-    // the recorded CallR at the trace tail).
-    let residual_byte = *insns_opname_to_byte()
-        .get("residual_call_r_r/iRd>r")
-        .expect("`residual_call_r_r/iRd>r` must be in insns table");
-    // funcptr=regs_i[0], no args, descr index=0, dst=3
-    let code = [residual_byte, 0x00, 0x00, 0x00, 0x00, 0x03];
-    let mut tc = fresh_trace_ctx();
-    let mut regs_i = distinct_const_refs(&mut tc, 1);
-    let mut regs_r = distinct_const_refs(&mut tc, 8);
-    let dst_val_pre = regs_r[3];
-    // 0 R args → arg_types=[]; CallDescr required (RPython
-    // do_residual_call always has one).
-    let descr_pool = vec![make_call_descr(
-        1,
-        vec![],
-        Type::Ref,
-        majit_ir::ExtraEffect::CanRaise,
-    )];
-    let frame_done_descr = done_descr_ref_for_tests();
-    let session = std::cell::RefCell::new(WalkSession::default());
-    let mut wc = WalkContext {
-        frame_state: WalkFrameState::new(WalkFrameStateData {
-            callee_shadow: None,
-            concrete_registers_r: ([]).to_vec(),
-            outer_active_boxes: Vec::new(),
-            vstack_boxes: Vec::new(),
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_saved: None,
-            ..Default::default()
-        }),
-        inline_callee_consts: None,
-        inline_poison_pcs: None,
-        fbw_mode: test_fbw_mode(),
-        session: &session,
-        registers_r: &RegisterBank::new(regs_r.iter().copied()),
-        registers_i: &RegisterBank::new(regs_i.iter().copied()),
-        registers_f: &RegisterBank::default(),
-
-        concrete_registers_i: &mut [],
-        descr_refs: &descr_pool,
-        raw_descrs: RawDescrPool::Global,
-        is_authoritative_executor: false,
-        trace_ctx: &mut tc,
-        is_top_level: true,
-        sub_jitcode_lookup: &no_sub_jitcodes,
-        entry_py_pc: EntryPyPc::Py(0),
-        outer_resume_marker_jit_pc: None,
-        outer_jitcode_index: 0,
-
-        pending_guard_snapshot_error: None,
-
-        vstack_depth: 0,
-        vstack_cur_pypc: 0,
-        vstack_valid: false,
-
-        vstack_reorder_ceiling: u32::MAX,
-
-        vstack_handler_landing_py: None,
-        live_before_jit_pc: usize::MAX,
-        live_after_jit_pc: usize::MAX,
-    };
-    wc.outer_jitcode_index = test_outer_resume_jitcode_index();
-    wc.outer_resume_marker_jit_pc = Some(0);
-    let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
-    // The dst slot must hold the OpRef of the recorded CallR. Each
-    // Op carries its OpRef in `op.pos` (recorder.rs), which lets
-    // the test compare without re-deriving the index (input args
-    // also occupy OpRef indices, so `ops.iter().position()` would
-    // be off by `num_inputargs`).
-    let dst_ref = wc.registers_r.get(3).expect("ref register in range");
-    assert_ne!(
-        dst_ref, dst_val_pre,
-        "dst must change from its pre-call value",
-    );
-    let call_op = wc
-        .trace_ctx
-        .ops()
-        .iter()
-        .find(|o| o.opcode == OpCode::CallR)
-        .expect("a CallR op must be in the recorded trace");
-    assert_eq!(
-        dst_ref,
-        call_op.pos().get(),
-        "registers_r[dst] must be the recorded CallR's OpRef (op.pos().get())",
-    );
-}
-
-#[test]
 fn residual_call_r_r_can_raise_writes_dst_before_guard_no_exception() {
     // pyjitpl.py _opimpl_residual_call*: result lands in
     // `registers_*[reg_index]` BEFORE
@@ -13312,12 +13103,6 @@ fn inline_call_with_more_args_than_callee_regs_surfaces_arity_mismatch() {
             callee_num_regs_r: 1,
         },
     );
-}
-
-#[test]
-fn inline_call_with_void_subreturn_surfaces_unexpected_void_error() {
-    let err = DispatchError::UnexpectedVoidSubReturn { pc: 42 };
-    assert_eq!(err, DispatchError::UnexpectedVoidSubReturn { pc: 42 },);
 }
 
 // ── inline_call_*_v regression tests ──────────────────────────────

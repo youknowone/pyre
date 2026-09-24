@@ -7446,128 +7446,79 @@ mod tests {
     }
 
     #[test]
-    fn stringbuilder_bare_gcstruct_descr_reconciles_at_path_hash() {
-        // rbuilder epic task #43. Publish a distinctive tid the way `build_gc`
-        // would (a small dynamic id, NOT the truncated `cache_key as u32`
-        // placeholder), then force the group. A resolved tid keeps the
-        // unresolved-struct walker from re-stamping a destructor-less tid.
-        let published_tid = 0x00AB_CDEF_u32;
-        pyre_object::rbuilder::set_stringbuilder_gc_type_id(published_tid);
-
-        let size = stringbuilder_size_descr();
-        let sd = size.as_size_descr().expect("stringbuilder is a SizeDescr");
-        // The group binds the published tid once, at first force; read it back so
-        // the tid assertions reflect what the group actually captured, not a
-        // locally chosen constant a competing first-forcer could diverge from.
-        let published_tid = pyre_object::rbuilder::stringbuilder_gc_type_id();
-
-        // Body layout mirrors `size_of::<StringBuilderBox>()` and the analyzer's
-        // layer-2a structural layout (current_buf@0 .. extra_pieces@32).
-        assert_eq!(sd.size(), 40, "stringbuilder body must be 40 bytes");
-        // Headered (forwardable across a minor GC), GC-managed — NOT a raw
-        // headerless struct, which could not survive a collection while live.
-        assert!(
-            !sd.headerless(),
-            "stringbuilder must be a headered GcStruct"
-        );
-        assert!(sd.is_gc_managed(), "stringbuilder is GC-managed");
-        // `current_buf: Ptr(STR)` and `extra_pieces: Ptr(STRINGPIECE)` are both
-        // normal GC edges, exactly as in rbuilder.py.
-        let traced: Vec<usize> = sd.gc_fielddescrs().iter().map(|f| f.offset()).collect();
-        assert_eq!(
-            traced,
-            vec![0, 32],
-            "stringbuilder must trace current_buf@0 and extra_pieces@32; got offsets {traced:?}",
-        );
-        assert_eq!(
-            sd.type_id(),
-            published_tid,
-            "descr must carry the published box tid",
-        );
-        assert_eq!(
-            sd.cache_key(),
-            majit_ir::descr::path_hash("stringbuilder"),
-            "keyed at path_hash(\"stringbuilder\") for New{{\"stringbuilder\"}}",
-        );
-
-        // Reconciliation: `New{"stringbuilder"}` resolves via
-        // `_cache_size[LLType::Struct(path_hash("stringbuilder"))]`.
-        let key = majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash("stringbuilder"));
-        let resolved = majit_ir::descr::gc_cache()
-            .lock()
-            ._cache_size
-            .get(&key)
-            .cloned()
-            .expect("stringbuilder descr registered under its path_hash key");
-        let resolved = resolved
-            .as_size_descr()
-            .expect("resolved stringbuilder entry is a SizeDescr");
-        assert_eq!(resolved.size(), 40);
-        assert_eq!(resolved.type_id(), published_tid);
-        let resolved_traced: Vec<usize> = resolved
-            .gc_fielddescrs()
-            .iter()
-            .map(|f| f.offset())
-            .collect();
-        assert_eq!(resolved_traced, vec![0, 32]);
-    }
-
-    #[test]
-    fn stringpiece_bare_gcstruct_descr_reconciles_at_path_hash() {
-        // rbuilder epic task #48. The `extra_pieces` chain node, registered the
-        // same way as the builder: a headered bare GcStruct resolved via
-        // `New{"stringpiece"}` (the grow path's `malloc(STRINGPIECE)`).
-        let published_tid = 0x00BE_EF01_u32;
-        pyre_object::rbuilder::set_stringpiece_gc_type_id(published_tid);
-
-        let size = stringpiece_size_descr();
-        let sd = size.as_size_descr().expect("stringpiece is a SizeDescr");
-        // Read the group-captured tid back (see the builder test) so the tid
-        // assertions do not hardcode a constant a competing first-forcer could
-        // diverge from.
-        let published_tid = pyre_object::rbuilder::stringpiece_gc_type_id();
-
-        // Body layout mirrors `size_of::<StringPieceBox>()`: buf@0, prev_piece@8.
-        assert_eq!(sd.size(), 16, "stringpiece body must be 16 bytes");
-        assert!(!sd.headerless(), "stringpiece must be a headered GcStruct");
-        assert!(sd.is_gc_managed(), "stringpiece is GC-managed");
-        // Both `buf` (offset 0) and `prev_piece` (offset 8) are GC `Ref`
-        // edges, matching RPython's STRINGPIECE {buf: Ptr(STR), prev_piece}.
-        let traced: Vec<usize> = sd.gc_fielddescrs().iter().map(|f| f.offset()).collect();
-        assert_eq!(
-            traced,
-            vec![0, 8],
-            "stringpiece must trace buf@0 and prev_piece@8; got offsets {traced:?}",
-        );
-        assert_eq!(
-            sd.type_id(),
-            published_tid,
-            "descr must carry the published node tid"
-        );
-        assert_eq!(
-            sd.cache_key(),
-            majit_ir::descr::path_hash("stringpiece"),
-            "keyed at path_hash(\"stringpiece\") for New{{\"stringpiece\"}}",
-        );
-
-        let key = majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash("stringpiece"));
-        let resolved = majit_ir::descr::gc_cache()
-            .lock()
-            ._cache_size
-            .get(&key)
-            .cloned()
-            .expect("stringpiece descr registered under its path_hash key");
-        let resolved = resolved
-            .as_size_descr()
-            .expect("resolved stringpiece entry is a SizeDescr");
-        assert_eq!(resolved.size(), 16);
-        assert_eq!(resolved.type_id(), published_tid);
-        let resolved_traced: Vec<usize> = resolved
-            .gc_fielddescrs()
-            .iter()
-            .map(|f| f.offset())
-            .collect();
-        assert_eq!(resolved_traced, vec![0, 8]);
+    fn bare_gcstruct_descr_reconciles_at_path_hash() {
+        let cases: &[(
+            &str,
+            u32,
+            fn(u32),
+            fn() -> DescrRef,
+            fn() -> u32,
+            usize,
+            &[usize],
+        )] = &[
+            (
+                "stringbuilder",
+                0x00AB_CDEF,
+                pyre_object::rbuilder::set_stringbuilder_gc_type_id,
+                stringbuilder_size_descr,
+                pyre_object::rbuilder::stringbuilder_gc_type_id,
+                40,
+                &[0, 32],
+            ),
+            (
+                "stringpiece",
+                0x00BE_EF01,
+                pyre_object::rbuilder::set_stringpiece_gc_type_id,
+                stringpiece_size_descr,
+                pyre_object::rbuilder::stringpiece_gc_type_id,
+                16,
+                &[0, 8],
+            ),
+        ];
+        for (name, seed, set_tid, size_descr, get_tid, expect_size, expect_offsets) in cases {
+            set_tid(*seed);
+            let size = size_descr();
+            let sd = size
+                .as_size_descr()
+                .unwrap_or_else(|| panic!("case {name} is a SizeDescr"));
+            let published_tid = get_tid();
+            assert_eq!(sd.size(), *expect_size, "case {name} body size");
+            assert!(!sd.headerless(), "case {name} must be a headered GcStruct");
+            assert!(sd.is_gc_managed(), "case {name} is GC-managed");
+            let traced: Vec<usize> = sd.gc_fielddescrs().iter().map(|f| f.offset()).collect();
+            assert_eq!(&traced, expect_offsets, "case {name} traced offsets");
+            assert_eq!(sd.type_id(), published_tid, "case {name} published tid");
+            assert_eq!(
+                sd.cache_key(),
+                majit_ir::descr::path_hash(name),
+                "case {name} path hash",
+            );
+            let key = majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash(name));
+            let resolved = majit_ir::descr::gc_cache()
+                .lock()
+                ._cache_size
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| panic!("case {name} descr registered under its path_hash key"));
+            let resolved = resolved
+                .as_size_descr()
+                .unwrap_or_else(|| panic!("case {name} resolved entry is a SizeDescr"));
+            assert_eq!(resolved.size(), *expect_size, "case {name} resolved size");
+            assert_eq!(
+                resolved.type_id(),
+                published_tid,
+                "case {name} resolved tid"
+            );
+            let resolved_traced: Vec<usize> = resolved
+                .gc_fielddescrs()
+                .iter()
+                .map(|f| f.offset())
+                .collect();
+            assert_eq!(
+                &resolved_traced, expect_offsets,
+                "case {name} resolved offsets"
+            );
+        }
     }
 
     #[test]
