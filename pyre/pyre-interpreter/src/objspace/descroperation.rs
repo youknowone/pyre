@@ -5435,6 +5435,99 @@ pub(crate) fn try_inplace_special(
     Ok(None)
 }
 
+/// `intobject.py _pow_nomod` — look inside when the exponent is constant.
+fn _pow_nomod_iff(_iv: i64, iw: i64) -> bool {
+    majit_rlib::jit::isconstant(&iw)
+}
+
+#[majit_macros::look_inside_iff(_pow_nomod_iff)]
+pub(crate) fn _pow_nomod(iv: i64, mut iw: i64) -> Result<i64, PowMachineFail> {
+    if iw <= 0 {
+        if iw == 0 {
+            return Ok(1);
+        }
+        return Err(PowMachineFail::Value);
+    }
+    let mut temp = iv;
+    let mut ix = 1_i64;
+    loop {
+        if iw & 1 != 0 {
+            ix = ix.checked_mul(temp).ok_or(PowMachineFail::Overflow)?;
+        }
+        iw >>= 1;
+        if iw == 0 {
+            break;
+        }
+        temp = temp.checked_mul(temp).ok_or(PowMachineFail::Overflow)?;
+    }
+    Ok(ix)
+}
+
+/// `intobject.py _pow_mod` — look inside when the exponent and the modulus
+/// are both constants, so the squaring loop unrolls into `mulmod` calls.
+fn _pow_mod_iff(_iv: i64, iw: i64, iz: i64) -> bool {
+    majit_rlib::jit::isconstant(&iw) && majit_rlib::jit::isconstant(&iz)
+}
+
+/// Why `_pow` / `_pow_mod` left the machine-int body.
+pub(crate) enum PowMachineFail {
+    /// `ovfcheck` failed; `descr_pow` continues in `_pow_ovf2long`.
+    Overflow,
+    /// Negative exponent with no modulus: the result is a float.
+    Value,
+    /// Negative exponent with a modulus: `invmod`, then the long path.
+    Negative,
+}
+
+/// Floor remainder. `iz` may be negative (`1 % iz` when the exponent is 0).
+fn floor_mod_i64(iv: i64, iz: i64) -> i64 {
+    let mut remainder = iv % iz;
+    if remainder != 0 && (remainder < 0) != (iz < 0) {
+        remainder += iz;
+    }
+    remainder
+}
+
+#[majit_macros::look_inside_iff(_pow_mod_iff)]
+pub(crate) fn _pow_mod(mut iv: i64, mut iw: i64, mut iz: i64) -> Result<i64, PowMachineFail> {
+    if iw == 0 {
+        return Ok(floor_mod_i64(1, iz));
+    }
+    let mut iz_negative = false;
+    if iz < 0 {
+        iz = iz.checked_neg().ok_or(PowMachineFail::Overflow)?;
+        iz_negative = true;
+    }
+    if iw <= 0 {
+        return Err(PowMachineFail::Negative);
+    }
+    let mut temp = iv;
+    let mut ix = 1_i64;
+    loop {
+        if iw & 1 != 0 {
+            ix = majit_rlib::rarithmetic::mulmod(ix, temp, iz);
+        }
+        iw >>= 1;
+        if iw == 0 {
+            break;
+        }
+        temp = majit_rlib::rarithmetic::mulmod(temp, temp, iz);
+    }
+    if iz_negative && ix > 0 {
+        ix -= iz;
+    }
+    Ok(ix)
+}
+
+/// `intobject.py _pow`. `iz == 0` is the two-argument form.
+pub(crate) fn _pow(iv: i64, iw: i64, iz: i64) -> Result<i64, PowMachineFail> {
+    if iz == 0 {
+        _pow_nomod(iv, iw)
+    } else {
+        _pow_mod(iv, iw, iz)
+    }
+}
+
 /// `(int|long) ** (int|long) % (int|long)` fast path used by `space.pow`
 /// when a modulus is supplied — longobject.py `int_pow`.
 pub(crate) fn try_int_long_pow_with_modulo(
@@ -5453,6 +5546,25 @@ pub(crate) fn try_int_long_pow_with_modulo(
         // is a long. So the result stays a long unless all three operands are
         // machine ints, in which case `space.newint` demotes it.
         let all_int_like = is_int_like(base) && is_int_like(exp) && is_int_like(modulus);
+
+        // `W_IntObject.descr_pow` / `_pow_mod` for three machine ints.
+        // `is_int_like` is a subclass check and is also true of a long, so
+        // a long stays on the bigint path below. A negative exponent does too.
+        if all_int_like && !is_long(base) && !is_long(exp) && !is_long(modulus) {
+            let iv = int_value(base);
+            let iw = int_value(exp);
+            let iz = int_value(modulus);
+            if iz == 0 {
+                return Err(PyError::value_error("pow() 3rd argument cannot be 0"));
+            }
+            if iw >= 0 {
+                match _pow_mod(iv, iw, iz) {
+                    Ok(result) => return Ok(Some(w_int_new(result))),
+                    Err(PowMachineFail::Overflow) => {}
+                    Err(PowMachineFail::Negative) | Err(PowMachineFail::Value) => {}
+                }
+            }
+        }
 
         let base_owned;
         let base = if is_long(base) {

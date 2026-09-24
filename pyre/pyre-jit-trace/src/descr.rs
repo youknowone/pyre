@@ -1792,6 +1792,36 @@ static RANGE_ITER_STEP_ONE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLoc
 });
 
 /// `functional.py W_IntRangeOneArgIterator` — the `range(stop)` shape.
+static CALLABLE_ITERATOR_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_object_descr_group_with_def_path(
+        std::mem::size_of::<pyre_object::operation::_CallableIterator>(),
+        <pyre_object::operation::_CallableIterator as pyre_object::lltype::GcType>::type_id(),
+        &pyre_object::operation::CALLABLE_ITERATOR_TYPE as *const _ as usize,
+        &[
+            (
+                "callable",
+                std::mem::offset_of!(pyre_object::operation::_CallableIterator, callable),
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "sentinel",
+                std::mem::offset_of!(pyre_object::operation::_CallableIterator, sentinel),
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+        ],
+        "_CallableIterator",
+        "operation::_CallableIterator",
+    )
+});
+
 static RANGE_ITER_ONE_ARG_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group_with_def_path(
         std::mem::size_of::<pyre_object::functional::W_IntRangeOneArgIterator>(),
@@ -7971,6 +8001,9 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     ("functional::W_IntRangeOneArgIterator", || {
         LazyLock::force(&RANGE_ITER_ONE_ARG_DESCR_GROUP);
     }),
+    ("operation::_CallableIterator", || {
+        LazyLock::force(&CALLABLE_ITERATOR_DESCR_GROUP);
+    }),
     ("functional::W_Range", || {
         LazyLock::force(&RANGE_DESCR_GROUP);
     }),
@@ -8958,6 +8991,10 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
             is_gc_managed,
             ..
         } => {
+            // Publish this module's group before the lookup. A `BhDescr`
+            // that arrives first would keep a vtable captured in the
+            // producing process and a field list with no `w_class` edge.
+            force_declared_group(*type_id);
             // `descr.py get_size_descr` cache-hit semantics:
             // when the producer's `type_id` matches a runtime publish
             // (`build_object_descr_group_with_def_path` →

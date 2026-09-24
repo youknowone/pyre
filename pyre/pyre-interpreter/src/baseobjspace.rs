@@ -20075,6 +20075,13 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         // this call's result.
         if pyre_object::operation::is_callable_iterator(obj) {
             use pyre_object::operation as ci;
+            // The callable allocates. Keep `self` on the shadow stack and
+            // reload it after the call; a nursery object would otherwise
+            // move out from under the raw pointer.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let _ = pyre_object::gc_roots::pin_root(obj);
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             let callable = ci::w_callable_iterator_get_callable(obj);
             if callable.is_null() {
                 return Err(PyError::stop_iteration());
@@ -20088,6 +20095,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     // StopIteration is cleared and replaced with a bare one —
                     // its value/message does not leak to the consumer.
                     let _ = e;
+                    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                     ci::w_callable_iterator_set_callable(obj, pyre_object::PY_NULL);
                     return Err(PyError::stop_iteration());
                 }
@@ -20097,11 +20105,13 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             // re-entered `next()` on this same iterator and latched it to
             // `PY_NULL`, exhausting it; discard the result and stay stopped
             // rather than comparing a stale value to the sentinel.
+            let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             if ci::w_callable_iterator_get_callable(obj).is_null() {
                 return Err(PyError::stop_iteration());
             }
             let sentinel = ci::w_callable_iterator_get_sentinel(obj);
             if is_true(compare(result, sentinel, CompareOp::Eq)?)? {
+                let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                 ci::w_callable_iterator_set_callable(obj, pyre_object::PY_NULL);
                 return Err(PyError::stop_iteration());
             }

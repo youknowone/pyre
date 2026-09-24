@@ -42,18 +42,21 @@ pub struct _CallableIterator {
 }
 
 /// Allocate a `_CallableIterator` for `iter(callable, sentinel)`.
+///
+/// `malloc_typed` with a constant type word lowers to `new_with_vtable`
+/// plus field stores, the same shape as `w_int_new`. The iterator used to
+/// go through `allocate_stable` because `__next__` kept `self` as a raw
+/// pointer across the callable; that call now reloads `self` from the
+/// shadow stack, so the object does not need a non-moving address.
 pub fn w_callable_iterator_new(callable: PyObjectRef, sentinel: PyObjectRef) -> PyObjectRef {
-    let _roots = crate::gc_roots::push_roots();
-    let callable = crate::gc_roots::pin_root(callable);
-    let sentinel = crate::gc_roots::pin_root(sentinel);
-    _CallableIterator::allocate_stable(_CallableIterator {
+    crate::lltype::malloc_typed(_CallableIterator {
         ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
+            ob_type: &CALLABLE_ITERATOR_TYPE,
+            w_class: get_instantiate(&CALLABLE_ITERATOR_TYPE),
         },
         callable,
         sentinel,
-    })
+    }) as PyObjectRef
 }
 
 /// # Safety

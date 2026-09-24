@@ -4669,10 +4669,19 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // A type-dict `__call__` installed from a `BuiltinCode` is a slot wrapper:
     // the same `Function` carrier under `SLOT_WRAPPER_TYPE`, so the carrier
     // test admits it and the `Function.code` read below is the same load.
-    let (callable, receiver) = if method_form
-        || bound_method
-        || unsafe { pyre_interpreter::is_function(callable) }
-    {
+    // One-argument `type(x)` enters `type_descr_call_impl`'s graph
+    // (`__majit_wrap_type_query`) instead of the instantiation emit.
+    let type_query = !method_form
+        && !bound_method
+        && !is_call_kw
+        && r_args.len() == 3
+        && unsafe {
+            pyre_object::is_type(callable_operand)
+                && std::ptr::eq(callable_operand, pyre_interpreter::typedef::w_type())
+        };
+    let (callable, receiver) = if type_query {
+        (callable, None)
+    } else if method_form || bound_method || unsafe { pyre_interpreter::is_function(callable) } {
         (callable, receiver)
     } else {
         match unsafe { lookup_instance_dunder_call(callable) } {
@@ -4747,17 +4756,26 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
             }
         };
     }
-    if !unsafe { pyre_interpreter::is_function_carrier(callable) } {
-        builtin_inline_decline!("not is_function", 0usize);
-        return Ok(None);
-    }
-    let builtin_code =
-        unsafe { pyre_interpreter::function_get_code(callable) } as pyre_object::PyObjectRef;
-    if builtin_code.is_null() || !unsafe { pyre_interpreter::is_builtin_code(builtin_code) } {
-        builtin_inline_decline!("not builtin_code", 0usize);
-        return Ok(None);
-    }
-    let fnaddr = unsafe { pyre_interpreter::builtin_code_get(builtin_code) as usize };
+    let fnaddr = if type_query {
+        pyre_interpreter::call::__majit_wrap_type_query as usize
+    } else {
+        if !unsafe { pyre_interpreter::is_function_carrier(callable) } {
+            builtin_inline_decline!("not is_function", 0usize);
+            return Ok(None);
+        }
+        let builtin_code =
+            unsafe { pyre_interpreter::function_get_code(callable) as pyre_object::PyObjectRef };
+        if builtin_code.is_null() || !unsafe { pyre_interpreter::is_builtin_code(builtin_code) } {
+            builtin_inline_decline!("not builtin_code", 0usize);
+            return Ok(None);
+        }
+        unsafe { pyre_interpreter::builtin_code_get(builtin_code) as usize }
+    };
+    let builtin_code = if type_query {
+        pyre_object::PY_NULL
+    } else {
+        unsafe { pyre_interpreter::function_get_code(callable) as pyre_object::PyObjectRef }
+    };
     let Some(jitcode) = crate::state::bytecode_for_address(fnaddr) else {
         builtin_inline_decline!("no jitcode for address", fnaddr);
         return Ok(None);
@@ -4819,8 +4837,11 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
             )
         })?
         .is_some();
-    let builtin_sig =
-        unsafe { pyre_interpreter::gateway::builtin_code_get_signature(builtin_code) };
+    let builtin_sig = if type_query || builtin_code.is_null() {
+        None
+    } else {
+        unsafe { pyre_interpreter::gateway::builtin_code_get_signature(builtin_code) }
+    };
     if is_call_kw && builtin_sig.is_none() {
         builtin_inline_decline!("call_kw builtin has no Signature", fnaddr);
         return Ok(None);
@@ -5424,7 +5445,7 @@ fn builtin_gateway_undescendable_reason(
         return Some("not is_function_carrier");
     }
     let builtin_code =
-        unsafe { pyre_interpreter::function_get_code(callable) } as pyre_object::PyObjectRef;
+        unsafe { pyre_interpreter::function_get_code(callable) as pyre_object::PyObjectRef };
     if builtin_code.is_null() || !unsafe { pyre_interpreter::is_builtin_code(builtin_code) } {
         return Some("not builtin_code");
     }

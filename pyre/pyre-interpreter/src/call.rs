@@ -4674,6 +4674,53 @@ pub fn type_call_instantiate_with_kwargs(
 /// Type call without a PyFrame.
 /// PyPy: typeobject.py descr_call
 fn type_descr_call_impl(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
+    // One-argument `type(x)` is `type_call_special_case` before any
+    // allocation. The instantiation tail is a separate graph.
+    if let Some(result) = type_call_special_case(w_type, args, false) {
+        return match result {
+            Ok(value) => value,
+            Err(error) => {
+                set_call_error(error);
+                PY_NULL
+            }
+        };
+    }
+    type_descr_call_instantiate(w_type, args)
+}
+
+/// Gateway the tracer enters for one-argument `type(x)`.
+///
+/// The success arm is `type_call_special_case` → `type_of_object` → `r#type`
+/// (the promoted `w_class` read). The string fallback stays out of that graph.
+pub fn __majit_wrap_type_query(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    if args.len() != 1 {
+        return Err(PyError::type_error("type() takes 1 or 3 arguments"));
+    }
+    let obj = args[0];
+    // `type_call_special_case` → `type_of_object` → `r#type`'s promoted
+    // class read. The fallback arms stay `dont_look_inside`.
+    if let Some(w_class) = crate::typedef::promoted_w_class(obj) {
+        return Ok(w_class);
+    }
+    type_query_cold(obj)
+}
+
+#[majit_macros::dont_look_inside]
+fn type_query_cold(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
+    Ok(crate::builtins::type_of_object(obj))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_wrap_type_query_target: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(module_path!(), "::", "__majit_wrap_type_query"),
+        func: __majit_wrap_type_query,
+    };
+
+#[majit_macros::dont_look_inside]
+fn type_descr_call_instantiate(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
     // typeobject.py descr_call keeps `w_type`, every argument, and the new
     // instance live across both Python calls.  In translated RPython the GC
     // transform reloads these from shadow-stack slots after `__new__`; Rust
