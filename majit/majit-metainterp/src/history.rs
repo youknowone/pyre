@@ -800,7 +800,7 @@ impl TreeLoop {
         start: TreeLoopCutPosition,
         original_boxes: &[crate::trace_ctx::GreenBox],
     ) -> Option<TreeLoop> {
-        self.cut_trace_from_with_consts(start, original_boxes, &[])
+        self.cut_trace_from_with_consts(start, original_boxes, &[], false)
     }
 
     /// Like `cut_trace_from`, but with pre-allocated constant OpRefs for each
@@ -821,11 +821,20 @@ impl TreeLoop {
     /// handing them the uncut trace fails `test_re` outright (measured 3/3 vs
     /// 0/3 on a same-binary toggle).  Cancelling runs the loop in the
     /// interpreter, which is correct.
+    /// `promote_snapshot_inputargs`: a bridge cut (`compile.py compile_retrace`).
+    /// `opencoder.py CutTrace` is a view whose pre-cut boxes are already the
+    /// cut's `inputargs`; it never replays them and never cancels.  A loop cut
+    /// still declines, because `patch_new_loop_to_load_virtualizable_fields`
+    /// requires the entry list to be exactly the red args plus the
+    /// virtualizable fields (`assert i == len(inputargs)`).  A bridge is
+    /// entered from the guard resume, so the same box is carried as an
+    /// inputarg instead of being re-executed.
     pub fn cut_trace_from_with_consts(
         &self,
         start: TreeLoopCutPosition,
         original_boxes: &[crate::trace_ctx::GreenBox],
         inputarg_consts: &[OpRef],
+        promote_snapshot_inputargs: bool,
     ) -> Option<TreeLoop> {
         use indexmap::IndexSet;
         use std::collections::VecDeque;
@@ -960,13 +969,27 @@ impl TreeLoop {
         //
         // Returns the extra pre-cut ops the caller must seed alongside the
         // root; `None` is the decline.
-        let snapshot_cone_is_reemittable = |root: &OpRef| -> Option<Vec<OpRef>> {
+        // `Promote` — the root itself becomes a cut inputarg.  Used when
+        // `promote_snapshot_inputargs` is set and the root cannot be replayed
+        // (`opencoder.py CutTrace` carries that box as an inputarg of the view).
+        // A leaf inside a replayable cone still declines: appending it widens
+        // the loop entry `patch_new_loop_to_load_virtualizable_fields` asserts.
+        enum SnapshotSeed {
+            Replay(Vec<OpRef>),
+            Promote,
+        }
+        let snapshot_cone_is_reemittable = |root: &OpRef| -> Option<SnapshotSeed> {
             let mut seen: IndexSet<OpRef> = IndexSet::new();
             let mut extra: Vec<OpRef> = Vec::new();
             let mut stack: Vec<(OpRef, bool)> = vec![(*root, true)];
             while let Some((r, is_root)) = stack.pop() {
                 if r.raw() < num_original_inputargs {
-                    inputarg_consts.get(r.raw() as usize)?;
+                    if inputarg_consts.get(r.raw() as usize).is_none() {
+                        if promote_snapshot_inputargs && is_root {
+                            return Some(SnapshotSeed::Promote);
+                        }
+                        return None;
+                    }
                     continue;
                 }
                 if !seen.insert(r) {
@@ -974,6 +997,9 @@ impl TreeLoop {
                 }
                 let op = self.ops.get((r.raw() - num_original_inputargs) as usize)?;
                 if !op.opcode.is_always_pure() {
+                    if promote_snapshot_inputargs && is_root {
+                        return Some(SnapshotSeed::Promote);
+                    }
                     if !is_root || !op.opcode.is_malloc() {
                         return None;
                     }
@@ -1010,8 +1036,9 @@ impl TreeLoop {
                     }
                 }
             }
-            Some(extra)
+            Some(SnapshotSeed::Replay(extra))
         };
+        let mut promoted_ops: IndexSet<OpRef> = IndexSet::new();
         for op in cut_ops {
             let snapshot_id = op.rd_resume_position();
             if snapshot_id < 0 {
@@ -1030,7 +1057,7 @@ impl TreeLoop {
                     if !is_pre_cut_ref(r) {
                         continue;
                     }
-                    let Some(extra) = snapshot_cone_is_reemittable(r) else {
+                    let Some(seed) = snapshot_cone_is_reemittable(r) else {
                         if crate::majit_log_enabled() {
                             let root = r
                                 .raw()
@@ -1044,6 +1071,19 @@ impl TreeLoop {
                             );
                         }
                         return None;
+                    };
+                    if matches!(seed, SnapshotSeed::Promote) {
+                        // The box is an inputarg of the cut.  Do not walk its
+                        // definition: re-executing a load or a call is the
+                        // replay this path exists to avoid.
+                        escaped_set.insert(*r);
+                        if r.raw() >= num_original_inputargs {
+                            promoted_ops.insert(*r);
+                        }
+                        continue;
+                    }
+                    let SnapshotSeed::Replay(extra) = seed else {
+                        continue;
                     };
                     if escaped_set.insert(*r) {
                         queue.push_back(*r);
@@ -1082,15 +1122,19 @@ impl TreeLoop {
         //  - "op_escaped": refs to pre-cut ops → re-emit as prefix operations.
         let mut orig_inputarg_escaped: Vec<OpRef> = Vec::new();
         let mut op_escaped: Vec<OpRef> = Vec::new();
+        let mut promoted_op_refs: Vec<OpRef> = Vec::new();
         for &r in &escaped_set {
             if r.raw() < num_original_inputargs {
                 orig_inputarg_escaped.push(r);
+            } else if promoted_ops.contains(&r) {
+                promoted_op_refs.push(r);
             } else {
                 op_escaped.push(r);
             }
         }
         orig_inputarg_escaped.sort_by_key(|r| r.raw());
         op_escaped.sort_by_key(|r| r.raw()); // preserve original order
+        promoted_op_refs.sort_by_key(|r| r.raw());
 
         // Phase 4: Build new inputargs.
         // If concrete initial values are available, escaped original inputargs
@@ -1119,6 +1163,16 @@ impl TreeLoop {
                 new_ia_boxes.push(r);
                 new_ia_types.push(tp);
             }
+        }
+        // Promoted pre-cut results (`Getfield*`, `Call*`) are inputargs of the
+        // cut, same as an original inputarg the snapshot still names.  They
+        // are not replayed.
+        for &r in &promoted_op_refs {
+            let op_idx = (r.raw() - num_original_inputargs) as usize;
+            let tp = self.ops[op_idx].opcode.result_type();
+            remap.insert(r, OpRef::input_arg_typed(new_ia_boxes.len() as u32, tp));
+            new_ia_boxes.push(r);
+            new_ia_types.push(tp);
         }
         let new_inputargs_count = new_ia_boxes.len() as u32;
 
@@ -2241,6 +2295,48 @@ mod tests {
         };
         assert!(!r.is_none(), "snapshot slot mapped to NONE: {slot:?}");
         assert_eq!(r, cut.ops[0].pos().get());
+    }
+
+    #[test]
+    fn test_cut_trace_from_promotes_snapshot_inputarg_on_a_bridge_cut() {
+        // `opencoder.py CutTrace` carries a pre-cut box as an inputarg of the
+        // view. A bridge cut (`promote_snapshot_inputargs`) does the same for a
+        // snapshot-only original inputarg and for a load, instead of cancelling.
+        // A loop cut still declines: appending there breaks
+        // `patch_new_loop_to_load_virtualizable_fields`.
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let mut load = Op::new(OpCode::GetfieldGcI, &[iarg_box(0)]);
+        load.pos().set(iop(2));
+        let mut guard = Op::new(OpCode::GuardTrue, &[iarg_box(0)]);
+        guard.pos().set(vop(3));
+        guard.set_rd_resume_position(0);
+        let mut jump = Op::new(OpCode::Jump, &[iarg_box(0)]);
+        jump.pos().set(vop(4));
+        let snapshots = vec![snapshot_with_frame_boxes(vec![
+            crate::recorder::SnapshotTagged::Box(iarg(1), Type::Int),
+            crate::recorder::SnapshotTagged::Box(iop(2), Type::Int),
+        ])];
+        let trace = TreeLoop::with_snapshots(inputargs, vec![load, guard, jump], snapshots);
+        let start = TreeLoopCutPosition::new(1);
+        let original_boxes = vec![crate::trace_ctx::GreenBox::new(iarg(0), Type::Int)];
+        assert!(trace.cut_trace_from(start, &original_boxes).is_none());
+        let cut = trace
+            .cut_trace_from_with_consts(start, &original_boxes, &[], true)
+            .expect("bridge cut promotes the snapshot boxes");
+        assert!(
+            cut.ops.iter().all(|op| op.opcode != OpCode::GetfieldGcI),
+            "the load was replayed"
+        );
+        assert_eq!(cut.inputargs.len(), 3);
+        for slot in &cut.snapshots[0].frames[0].boxes {
+            let crate::recorder::SnapshotTagged::Box(r, _) = slot else {
+                panic!("snapshot slot lost its box: {slot:?}");
+            };
+            assert!(
+                r.is_input_arg(),
+                "snapshot box was not carried as an inputarg: {r:?}"
+            );
+        }
     }
 
     #[test]

@@ -1272,6 +1272,147 @@ pub(crate) fn walker_write_back_standard_frame_locals<Sym: WalkSym>(
         .vable_array_region_write_back(frame_op, 0, &slots)
 }
 
+/// Same stores as [`walker_write_back_standard_frame_locals`], skipping slots
+/// the shadow cannot answer instead of declining the read.
+pub(crate) fn walker_write_back_known_frame_locals<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    frame_op: OpRef,
+    concrete_frame: usize,
+) -> bool {
+    let Some(info) = ctx.trace_ctx.virtualizable_info().cloned() else {
+        return false;
+    };
+    let base = info.num_static_extra_boxes;
+    let Some(nlocals) = crate::state::concrete_nlocals(concrete_frame) else {
+        return false;
+    };
+    crate::jitcode_dispatch::fbw_note_locals_mirror_undo(concrete_frame, nlocals);
+    let written = crate::state::flush_known_locals_region_to_frame(ctx.trace_ctx, concrete_frame);
+    if written.is_empty() {
+        return false;
+    }
+    let mut slots = Vec::with_capacity(written.len());
+    for slot in written {
+        let Some((opref, _)) = ctx.trace_ctx.virtualizable_entry_at(base + slot as usize) else {
+            continue;
+        };
+        slots.push((slot, opref));
+    }
+    if slots.is_empty() {
+        return false;
+    }
+    ctx.trace_ctx
+        .vable_array_region_write_back(frame_op, 0, &slots)
+}
+
+/// Publish every local the proxy can observe.
+///
+/// `fast2locals` reads `locals_cells_stack_w[i]` for every varname. A shadow
+/// slot whose concrete half is `Void` still has a box; omitting it drops the
+/// name. Slots the shadow does not carry are read off this frame object.
+fn walker_publish_complete_frame_locals<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    frame_op: OpRef,
+    concrete_frame: usize,
+    source: &ReceiverTraceLocals,
+) {
+    let Some(nlocals) = crate::state::concrete_nlocals(concrete_frame) else {
+        return;
+    };
+    let info = ctx.trace_ctx.virtualizable_info().cloned();
+    let mut unread: Vec<usize> = Vec::new();
+    let inline_slots = match source {
+        ReceiverTraceLocals::Inline(slots) => Some(slots.as_slice()),
+        ReceiverTraceLocals::Portal => None,
+    };
+    if let Some(slots) = inline_slots {
+        let mut trace_slots = Vec::with_capacity(nlocals);
+        for slot in 0..nlocals {
+            match slots.iter().find(|(index, _, _)| *index == slot as i64) {
+                Some((_, opref, value)) if !opref.is_none() => {
+                    let concrete = match *value {
+                        majit_ir::Value::Void => ctx
+                            .trace_ctx
+                            .concrete_of_opref(*opref)
+                            .unwrap_or(majit_ir::Value::Void),
+                        majit_ir::Value::Ref(gc) if gc == majit_ir::GcRef::NO_CONCRETE => {
+                            ctx.trace_ctx.concrete_of_opref(*opref).unwrap_or(*value)
+                        }
+                        other => other,
+                    };
+                    let _ = crate::state::store_frame_local_value(concrete_frame, slot, &concrete);
+                    trace_slots.push((slot as i64, *opref));
+                }
+                _ => unread.push(slot),
+            }
+        }
+        if !trace_slots.is_empty() {
+            ctx.trace_ctx
+                .vable_array_region_write_back(frame_op, 0, &trace_slots);
+        }
+    } else if let Some(info) = info.as_ref() {
+        let base = info.num_static_extra_boxes;
+        let mut trace_slots = Vec::with_capacity(nlocals);
+        for slot in 0..nlocals {
+            match ctx.trace_ctx.virtualizable_entry_at(base + slot) {
+                Some((opref, value)) if !opref.is_none() => {
+                    let concrete = match value {
+                        majit_ir::Value::Void => ctx
+                            .trace_ctx
+                            .concrete_of_opref(opref)
+                            .unwrap_or(majit_ir::Value::Void),
+                        majit_ir::Value::Ref(gc) if gc == majit_ir::GcRef::NO_CONCRETE => {
+                            ctx.trace_ctx.concrete_of_opref(opref).unwrap_or(value)
+                        }
+                        other => other,
+                    };
+                    // A `Void` or null half is not a value to write over the
+                    // live frame. The slot stays a read of that frame.
+                    let real = match concrete {
+                        majit_ir::Value::Ref(gc) => {
+                            gc != majit_ir::GcRef::NO_CONCRETE && gc.as_usize() != 0
+                        }
+                        majit_ir::Value::Int(_) | majit_ir::Value::Float(_) => true,
+                        majit_ir::Value::Void => false,
+                    };
+                    if real {
+                        let _ =
+                            crate::state::store_frame_local_value(concrete_frame, slot, &concrete);
+                        trace_slots.push((slot as i64, opref));
+                    } else {
+                        unread.push(slot);
+                    }
+                }
+                _ => unread.push(slot),
+            }
+        }
+        crate::jitcode_dispatch::fbw_note_locals_mirror_undo(concrete_frame, nlocals);
+        if !trace_slots.is_empty() {
+            ctx.trace_ctx
+                .vable_array_region_write_back(frame_op, 0, &trace_slots);
+        }
+    } else {
+        unread.extend(0..nlocals);
+    }
+    if unread.is_empty() {
+        return;
+    }
+    let Some(info) = info else {
+        return;
+    };
+    if info.array_fields.is_empty() {
+        return;
+    }
+    let field = info.array_pointer_field_descr(0);
+    let adescr = info.array_item_descr(0);
+    let array = ctx.trace_ctx.vable_getfield_ref_descr(frame_op, field);
+    for slot in unread {
+        let _ = ctx
+            .trace_ctx
+            .read_gc_array_item_ref(array, slot as i64, adescr.clone());
+    }
+}
+
 /// The frame box and EXECUTING Python pc of a frame receiver the walk owns,
 /// or `None` for one it does not.
 ///
@@ -2306,11 +2447,13 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     //
     // There are two identities the walker can prove here: the current inline
     // callee's shadow frame, whose locals region the walk flushes itself at the
-    // escape, or the standard portal frame, gated by BOTH its red box and its
-    // concrete pointer.  For the portal the dropped force was also what wrote
-    // the locals region out of the virtualizable image, so the fold has to
-    // write that region itself.
-    let inline_frame = current_inline_concrete_frame();
+    // escape, or the portal frame.  `descr_get_tb_frame` hands the portal
+    // back as a getfield result, a red box other than
+    // `standard_virtualizable_box`; the check below proves that alias is the
+    // standard virtualizable.  `fast2locals` is `@jit.unroll_safe` and reads
+    // `locals_cells_stack_w` from the virtualizable boxes, so the proxy read
+    // does not force.  The dropped force was also what wrote the portal's
+    // locals region out, so the fold writes that region itself.
     // `pyjitpl.py MIFrame._nonstandard_virtualizable`: a box that is not
     // `virtualizable_boxes[-1]` but points at it is still the standard
     // virtualizable.  The check records `PTR_EQ` + `implement_guard_value`
@@ -2345,19 +2488,13 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
             obj = standard;
         }
     }
-    let is_inline_frame = inline_frame != 0
-        && concrete_obj as usize == inline_frame
-        && ctx
-            .frame_state
-            .borrow()
-            .callee_shadow
-            .as_ref()
-            .is_some_and(|shadow| shadow.concrete_frame == inline_frame && shadow.frame_box == obj);
-    let is_standard_frame = ctx.trace_ctx.standard_virtualizable_box() == Some(obj)
-        && ctx.trace_ctx.standard_virtualizable_ptr() == Some(concrete_obj as usize);
+    let concrete_addr = concrete_obj as usize;
 
+    // `f_locals` on a frame this trace still owns reads that frame's shadow
+    // (portal virtualizable or the inline level's own slots), including a
+    // `Void` concrete half. A finished frame's heap array is authoritative.
+    // Anything else stays on the forcing getter.
     if name == "f_locals"
-        && (is_inline_frame || is_standard_frame)
         && unsafe { (*concrete_obj).ob_type } == &pyre_interpreter::pyframe::FRAME_TYPE
         && unsafe {
             (*(concrete_obj as *const pyre_interpreter::PyFrame))
@@ -2372,21 +2509,21 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         if version_tag == 0 || unsafe { (*concrete_obj).w_class } != w_type {
             return Ok(None);
         }
-        if is_standard_frame
-            && !walker_write_back_standard_frame_locals(ctx, obj, concrete_obj as usize)
-        {
+        let Some(source) = ctx.receiver_trace_locals(obj, concrete_addr) else {
             return Ok(None);
-        }
+        };
+        walker_publish_complete_frame_locals(ctx, obj, concrete_addr, &source);
         let concrete_proxy = pyre_interpreter::pyframe::frame_locals_proxy::new(concrete_obj);
         walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
         let proxy = ctx.trace_ctx.call_ref_typed_with_effect(
             jit_inline_frame_locals_proxy_new as *const (),
             &[obj],
             &[majit_ir::Type::Ref],
-            majit_ir::EffectInfo::new(
-                majit_ir::ExtraEffect::CannotRaise,
-                majit_ir::OopSpecIndex::None,
-            ),
+            // The proxy's later reads observe `locals_cells_stack_w`. An
+            // effect with an empty read set lets the optimizer drop the
+            // slot stores published just above, and the name those stores
+            // carried disappears.
+            majit_ir::EffectInfo::MOST_GENERAL,
         );
         ctx.trace_ctx.set_opref_concrete(
             proxy,

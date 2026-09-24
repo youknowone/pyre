@@ -5879,6 +5879,28 @@ impl TraceCtx {
         true
     }
 
+    /// `GETARRAYITEM_GC_R` of one locals slot. Does not consult the
+    /// virtualizable shadow: the caller has already decided this slot is not
+    /// a live vable box and must be read off the frame object.
+    pub fn read_gc_array_item_ref(
+        &mut self,
+        array_opref: OpRef,
+        item_index: i64,
+        adescr: DescrRef,
+    ) -> OpRef {
+        let index = self.const_int(item_index);
+        let op = self.execute_and_record(
+            None,
+            OpCode::GetarrayitemGcR,
+            Some(adescr.clone()),
+            &[array_opref, index],
+            None,
+            0,
+        );
+        let _ = self.stamp_vable_array_item(op, array_opref, item_index, &adescr, Type::Ref);
+        op
+    }
+
     /// `_opimpl_setarrayitem_vable` body with the `_nonstandard_virtualizable`
     /// decision already taken by the caller (see
     /// [`Self::nonstandard_virtualizable`]).

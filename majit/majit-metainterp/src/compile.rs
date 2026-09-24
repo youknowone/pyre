@@ -2398,17 +2398,20 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         }
     }
 
-    // compile.py `assert i == len(inputargs)`. This is also the only
-    // in-code check the baked array lengths get: the reconstruction consumed
-    // one expanded inputarg per baked element, so an equality here says the
-    // lengths passed in still describe the shape the tracer expanded at
-    // trace-start. A length that moves after this compile is outside its
-    // reach — see the SOUNDNESS INVARIANT on this function.
+    // compile.py `assert i == len(inputargs)` when every expanded inputarg is
+    // a red or a virtualizable field. A cut may also carry a snapshot box
+    // promoted to an entry inputarg past that span (`CutTrace` keeps pre-cut
+    // boxes as inputargs). That tail is not another array element — consuming
+    // it would bake a length the greens do not describe — so it stays on the
+    // loop entry. `i` past the end is still a broken expansion.
     assert!(
-        i == expanded_inputargs.len(),
+        i <= expanded_inputargs.len(),
         "compile.py:458 assert i == len(inputargs) failed ({i} != {})",
         expanded_inputargs.len()
     );
+    if i < expanded_inputargs.len() {
+        inputargs.extend_from_slice(&expanded_inputargs[i..]);
+    }
 
     forward_residual_args_sharing_inputarg(ops, &mut forwarding, &slot_targets);
 
