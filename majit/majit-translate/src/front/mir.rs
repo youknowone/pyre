@@ -10560,11 +10560,18 @@ impl<'a> Lowering<'a> {
             }
             _ => (false, None, None),
         };
+        // Jit-marker methods still need the receiver in `Call.args`:
+        // `try_handle_jit_marker` strips `args[0]` as the driver before
+        // reading greens. Every other call drops a void ZST here so the
+        // callee, whose parameter is also void, does not expect it.
+        let keep_void_receiver = match &call.func {
+            CallFunc::Regular(reg) => regular_call_name_path(reg, self.llbc)
+                .as_deref()
+                .is_some_and(call_path_is_jit_marker),
+            _ => false,
+        };
         for op in call.args {
-            // A zero-sized receiver (`&self` on a fieldless struct, unit)
-            // is `lltype.Void`. The callee's parameter is stamped the same
-            // way, so the argument is absent on both sides.
-            if operand_is_void_zst(self.llbc, &op) {
+            if !keep_void_receiver && operand_is_void_zst(self.llbc, &op) {
                 continue;
             }
             args.push(self.resolve_operand(mir_bb, op)?);
@@ -27761,6 +27768,12 @@ fn tyref_is_void_zst(ty: &TyRef, llbc: &Llbc) -> bool {
         return false;
     }
     is_unit_type(&peeled, llbc) || tyref_is_zero_sized(&peeled, llbc)
+}
+
+fn call_path_is_jit_marker(path: &str) -> bool {
+    path.ends_with("jit_merge_point")
+        || path.ends_with("can_enter_jit")
+        || path.ends_with("loop_header")
 }
 
 fn operand_is_void_zst(llbc: &Llbc, op: &Operand) -> bool {
