@@ -10872,15 +10872,45 @@ pub unsafe fn lookup_where_pair(
     w_type: PyObjectRef,
     name: &str,
 ) -> Option<(PyObjectRef, PyObjectRef)> {
-    let (class, value) = lookup_where_pair_no_unwrapping(w_type, name)?;
-    // `getdictvalue`'s unwrap, applied to the one entry the two residuals
-    // agreed on.  A type store parks a cell only around a live value, so the
-    // null payload `_lookup_where` would walk past is not reachable here.
-    let value = pyre_object::celldict::unwrap_cell(value);
-    if value.is_null() {
-        return None;
+    if !majit_metainterp::jit::we_are_jitted() {
+        // Outside a trace there is no residual boundary to keep, so one
+        // unwrapping walk answers both halves at once.
+        return lookup_where(w_type, name);
     }
-    Some((class, value))
+    // The retry below is [`lookup_where_pair_no_unwrapping`]'s, written out
+    // again rather than wrapped: unwrapping the pair a callee returned means
+    // binding `(class, value)` from an `Option` of two pointers, and that
+    // binding is what costs the graph its prepass subject status.  Upstream
+    // writes `_lookup_where` and `_lookup_where_all_typeobjects` out twice for
+    // the same reason the two live side by side here — the walk is shared, the
+    // cell handling is not.
+    let w_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new(name));
+    let name_wtf8 = pyre_object::unicodeobject::w_str_get_wtf8(w_name);
+    for _ in 0..8 {
+        let tag = pyre_object::typeobject::w_type_get_version_tag(w_type);
+        let value = _lookup_in_type_uncached(w_type, w_name);
+        if value.is_null() {
+            if pyre_object::typeobject::w_type_get_version_tag(w_type) == tag {
+                return None;
+            }
+            continue;
+        }
+        let class = _lookup_where_class_uncached(w_type, w_name);
+        if class.is_null() {
+            continue;
+        }
+        if crate::type_dict_lookup_wtf8_no_unwrapping(class, name_wtf8) == Some(value) {
+            // `getdictvalue`'s unwrap, on the one entry both residuals agreed
+            // on.  A type store parks a cell only around a live value, so the
+            // null payload `_lookup_where` walks past is not reachable here.
+            let unwrapped = pyre_object::celldict::unwrap_cell(value);
+            if unwrapped.is_null() {
+                return None;
+            }
+            return Some((class, unwrapped));
+        }
+    }
+    None
 }
 
 /// [`lookup_where_pair`] with the namespace entry left as stored, for the
