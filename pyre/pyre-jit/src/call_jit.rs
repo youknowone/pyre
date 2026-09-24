@@ -1837,7 +1837,7 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
 /// exception, which the propagate path resolves through its
 /// `memory_error_singleton_ref()` fallback — a `MemoryError` where the program
 /// is owed a `RecursionError`.
-#[cfg(feature = "dynasm")]
+#[cfg(any(feature = "dynasm", feature = "cranelift"))]
 extern "C" fn jit_prologue_stack_check_slowpath(current: usize) -> u8 {
     let result = pyre_interpreter::stack_check::pyre_stack_check_slowpath_for_backend(current);
     if result != 0
