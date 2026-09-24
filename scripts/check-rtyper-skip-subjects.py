@@ -320,10 +320,25 @@ def main() -> int:
     # categorised by that instead.
     pair_added = flat_got - flat_want
     pair_gone = flat_want - flat_got
+    def module_move_key(name: str) -> str:
+        # `#1854` moved optional modules from `pyre-interpreter` to
+        # `pyre-module`. The graph is the same subject; only the crate
+        # prefix changed.
+        for prefix in (
+            "pyre_interpreter::module::",
+            "pyre_module::module::",
+        ):
+            if name.startswith(prefix):
+                return "module::" + name[len(prefix) :]
+        return name
+
     gone_names = {s for _, s in pair_gone}
     added_names = {s for _, s in pair_added}
-    added = sorted((c, s) for c, s in pair_added if s not in gone_names)
-    gone = sorted((c, s) for c, s in pair_gone if s not in added_names)
+    gone_keys = {module_move_key(s) for s in gone_names}
+    added_names = {s for s in added_names if module_move_key(s) not in gone_keys}
+    gone_names = {s for s in gone_names if module_move_key(s) not in {module_move_key(a) for a in (s for _, s in pair_added)}}
+    added = sorted((c, s) for c, s in pair_added if s in added_names)
+    gone = sorted((c, s) for c, s in pair_gone if s in gone_names)
     relocated = sorted(
         (s, before, now)
         for s in gone_names & added_names
