@@ -5085,7 +5085,9 @@ pub fn fuse_boxing_alloc_with_pytypes(
                         value,
                         ty: payload_ty.clone(),
                     }),
-                    None if is_class_allocate(target) && !field_is_stored(graph, agg, field_name) => {
+                    None if is_class_allocate(target)
+                        && !field_is_stored(graph, agg, field_name) =>
+                    {
                         // `..Default::default()` leaves the unlisted
                         // fields at the type's zero. Spell that zero
                         // rather than declining the cluster.
