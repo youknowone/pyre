@@ -466,9 +466,18 @@ pub fn register() {
             time_monotonic_nanos: module::time::interp_time::monotonic_nanos,
             time_duration_since_epoch: module::time::interp_time::duration_since_epoch,
             imp_lock_held_by_current_thread: module::imp::interp_imp::lock_held_by_current_thread,
+            #[cfg(not(target_arch = "wasm32"))]
             imp_before_fork: module::imp::interp_imp::before_fork,
+            #[cfg(target_arch = "wasm32")]
+            imp_before_fork: || {},
+            #[cfg(not(target_arch = "wasm32"))]
             imp_after_fork_parent: module::imp::interp_imp::after_fork_parent,
+            #[cfg(target_arch = "wasm32")]
+            imp_after_fork_parent: || Ok(()),
+            #[cfg(not(target_arch = "wasm32"))]
             imp_after_fork_child: module::imp::interp_imp::after_fork_child,
+            #[cfg(target_arch = "wasm32")]
+            imp_after_fork_child: || {},
             imp_load_pyc_script: module::imp::interp_imp::load_pyc_script,
             imp_frozen_cache_load: module::imp::interp_imp::frozen_cache_load,
             imp_frozen_cache_store: module::imp::interp_imp::frozen_cache_store,

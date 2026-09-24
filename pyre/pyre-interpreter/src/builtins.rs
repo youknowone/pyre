@@ -8184,6 +8184,7 @@ pub(crate) fn os_error_errno_subclass(errno: i64) -> Option<&'static str> {
 /// arguments the caller has already checked, and silencing the handler is a
 /// thread-local store the runtime itself offers for the purpose.
 #[cfg(not(target_arch = "wasm32"))]
+#[macro_export]
 macro_rules! crt_call {
     ($call:expr) => {{
         #[cfg(all(windows, feature = "host_env"))]
@@ -8196,7 +8197,7 @@ macro_rules! crt_call {
     }};
 }
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) use crt_call;
+pub use crt_call;
 
 /// `lseek`, taking and reporting the whole 64-bit file position.
 ///
@@ -8230,7 +8231,7 @@ pub(crate) fn crt_lseek(fd: libc::c_int, offset: i64, whence: libc::c_int) -> i6
 /// directive and an empty result).  Windows-only, which is where the runtime
 /// keeps a cell of its own that `std::io::Error::last_os_error` does not read.
 #[cfg(windows)]
-pub(crate) fn clear_crt_errno() {
+pub fn clear_crt_errno() {
     #[cfg(feature = "host_env")]
     {
         rustpython_host_env::os::clear_errno();
