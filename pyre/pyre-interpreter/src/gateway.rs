@@ -1608,7 +1608,41 @@ pub unsafe fn builtin_code_name(obj: PyObjectRef) -> &'static str {
 #[inline]
 pub unsafe fn builtin_code_call_name(obj: PyObjectRef, receiver: Option<PyObjectRef>) -> String {
     let code = unsafe { &*(obj as *const BuiltinCode) };
+    // `descr_init(self, space, args_w)` / `descr_new(space, w_subtype, args_w)`
+    // reject keywords before the body. `_PyArg_NoKeywords` names the
+    // receiver's own type (`ValueError()`, not `BaseException.__init__()`).
+    if let Some(name) = starargs_constructor_type_name(code, receiver) {
+        return name;
+    }
     builtin_names(code, receiver).1
+}
+
+/// Type name a `(self|cls, *args)` constructor reports in a keyword error.
+///
+/// The binder's ordinary qualname is `Type.__init__`. These two signatures
+/// have no `**kwargs`, so the rejection is the type's own, and a subclass
+/// that inherits the method reports its own name.
+fn starargs_constructor_type_name(
+    code: &BuiltinCode,
+    receiver: Option<PyObjectRef>,
+) -> Option<String> {
+    let sig = unsafe { code.sig.as_ref() }?;
+    if sig.varargname != Some("args")
+        || sig.kwargname.is_some()
+        || sig.num_kwonlyargnames() != 0
+        || sig.argnames.len() != 1
+    {
+        return None;
+    }
+    if sig.argnames[0] != "self" && sig.argnames[0] != "cls" {
+        return None;
+    }
+    let receiver = receiver.filter(|receiver| !receiver.is_null())?;
+    if unsafe { pyre_object::typeobject::is_type(receiver) } {
+        return Some(unsafe { pyre_object::w_type_get_qualname(receiver) }.to_string());
+    }
+    crate::typedef::r#type(receiver)
+        .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) }.to_string())
 }
 
 /// `objspace.py` `ObjSpace.newtext_or_none`.

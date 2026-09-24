@@ -7275,20 +7275,26 @@ exc_constructor!(
 /// `super().__init__(*args)`, instead of leaving the full original
 /// argument list captured by `__new__`.  `args[0]` is `self`.
 ///
-/// `descr_init`'s `(self, args_w)` interp2app signature is positional-only,
-/// so the argument matcher rejects any keyword with "takes no keyword
-/// arguments".  pyre's flat builtin ABI has no signature to enforce that,
-/// so the keyword dict is policed here directly; the type name comes from
-/// `self`, matching `_PyArg_NoKeywords(Py_TYPE(self)->tp_name, kwds)`.
-/// `BaseException.__init__`.  One positional and no keyword dict is
-/// `[self, arg]`.  That arm stores `args` without the kwargs walk, so the
-/// traced call is one cannot-raise residual.  A keyword dict, any other
-/// arity that fits in six words, stays in [`exc_base_exception_init_slow`];
-/// a longer slice is passed through whole.
+/// `descr_init(self, space, args_w)` is registered with that signature, so
+/// the binder rejects keywords before this runs and packs `*args` into one
+/// tuple.  One positional — the tuple holding a single argument — stores
+/// `args` without the general walk.  Any other arity that fits in six words
+/// stays in [`exc_base_exception_init_slow`]; a longer slice is passed
+/// through whole.
 pub fn __majit_wrap_base_exception_descr_init(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() == 2 && !args[0].is_null() && !builtin_kwargs_marker_tail(args[1]) {
+    if args.len() == 2 && !args[0].is_null() && unsafe { pyre_object::is_tuple(args[1]) } {
+        let n = unsafe { pyre_object::w_tuple_len(args[1]) };
+        if n == 1 {
+            let item =
+                unsafe { pyre_object::w_tuple_getitem(args[1], 0) }.unwrap_or(pyre_object::PY_NULL);
+            exc_init_one_positional(args[0], item);
+            return Ok(pyre_object::w_none());
+        }
+        return exc_base_exception_init_packed(args[0], args[1]);
+    }
+    if args.len() == 2 && !args[0].is_null() {
         exc_init_one_positional(args[0], args[1]);
         return Ok(pyre_object::w_none());
     }
@@ -7378,11 +7384,21 @@ static __majit_wrap_base_exception_descr_init_target: crate::gateway::BuiltinWra
 
 /// `ValueError(x)` — one positional.  The general `exc_value_error_new`
 /// graph has no jitcode of its own, so `ValueError(...)` declined with
-/// `no jitcode for address`.
+/// `no jitcode for address`.  The `(cls, *args)` signature packs those
+/// positionals into one tuple before this runs.
 pub fn __majit_wrap_exc_value_error_descr_new(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() == 2 && !args[0].is_null() && !builtin_kwargs_marker_tail(args[1]) {
+    if args.len() == 2 && !args[0].is_null() && unsafe { pyre_object::is_tuple(args[1]) } {
+        let n = unsafe { pyre_object::w_tuple_len(args[1]) };
+        if n == 1 {
+            let item =
+                unsafe { pyre_object::w_tuple_getitem(args[1], 0) }.unwrap_or(pyre_object::PY_NULL);
+            return Ok(value_error_one_arg(args[0], item));
+        }
+        return exc_value_error_new_packed(args[0], args[1]);
+    }
+    if args.len() == 2 && !args[0].is_null() {
         return Ok(value_error_one_arg(args[0], args[1]));
     }
     // The four-word residual cannot see a longer tail, and a bare exception
@@ -7472,27 +7488,46 @@ static __majit_wrap_exc_value_error_descr_new_target: crate::gateway::BuiltinWra
         func: __majit_wrap_exc_value_error_descr_new,
     };
 
+/// Expand the `*args` tuple the signature binder appended after `self`.
+#[majit_macros::dont_look_inside]
+fn exc_base_exception_init_packed(
+    w_self: PyObjectRef,
+    packed: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let n = unsafe { pyre_object::w_tuple_len(packed) };
+    let mut flat = Vec::with_capacity(1 + n);
+    flat.push(w_self);
+    for index in 0..n as i64 {
+        if let Some(item) = unsafe { pyre_object::w_tuple_getitem(packed, index) } {
+            flat.push(item);
+        }
+    }
+    exc_base_exception_init(&flat)
+}
+
+/// Expand the `*args` tuple the signature binder appended after `cls`.
+#[majit_macros::dont_look_inside]
+fn exc_value_error_new_packed(
+    cls: PyObjectRef,
+    packed: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let n = unsafe { pyre_object::w_tuple_len(packed) };
+    let mut flat = Vec::with_capacity(1 + n);
+    flat.push(cls);
+    for index in 0..n as i64 {
+        if let Some(item) = unsafe { pyre_object::w_tuple_getitem(packed, index) } {
+            flat.push(item);
+        }
+    }
+    exc_value_error_new(&flat)
+}
+
 fn exc_base_exception_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let w_self = *args.first().ok_or_else(|| {
         crate::PyError::type_error("__init__() missing 1 required positional argument: 'self'")
     })?;
-    let (positional, kwargs) = split_builtin_kwargs(&args[1..]);
-    if let Some(dict) = kwargs {
-        let has_keyword = unsafe { pyre_object::w_dict_str_entries(dict) }
-            .iter()
-            .any(|(key, _)| key != "__pyre_kw__");
-        if has_keyword {
-            let type_name = unsafe {
-                match crate::typedef::r#type(w_self) {
-                    Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
-                    None => "BaseException".to_string(),
-                }
-            };
-            return Err(crate::PyError::type_error(format!(
-                "{type_name}() takes no keyword arguments"
-            )));
-        }
-    }
+    // `descr_init` stores the positional `args_w` its signature already bound.
+    let positional = &args[1..];
     // `interp_exceptions.py descr_init` and `:277-282
     // descr_new_base_exception` both store the `args_w` list their own
     // signature was bound to, so `type.__call__` reaches here holding a list
@@ -7530,7 +7565,10 @@ fn exc_stop_iteration_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     let w_self = *args.first().ok_or_else(|| {
         crate::PyError::type_error("__init__() missing 1 required positional argument: 'self'")
     })?;
-    let (positional, _) = split_builtin_kwargs(&args[1..]);
+    let (positional, kwargs) = split_builtin_kwargs(&args[1..]);
+    if has_real_kwargs(kwargs) {
+        return Err(exc_no_keywords_error(w_self, "StopIteration"));
+    }
     let w_value = positional
         .first()
         .copied()
@@ -7540,7 +7578,10 @@ fn exc_stop_iteration_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     // so a moving collection between the two would leave this raw local — and
     // `w_self` — pointing at vacated memory.
     unsafe { pyre_object::interp_exceptions::w_exception_set_value(w_self, w_value) };
-    exc_base_exception_init(args)
+    let mut flat = Vec::with_capacity(positional.len() + 1);
+    flat.push(w_self);
+    flat.extend_from_slice(positional);
+    exc_base_exception_init(&flat)
 }
 
 /// `_PyArg_NoKeywords(type_name, kwds)` message for an exception initializer
@@ -9386,10 +9427,23 @@ fn exc_unicode_encode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
 /// in a trailing marker dict, so remove it before constructing `args_w`.
 macro_rules! exc_new_wrapper {
     ($wrapper:ident, $ctor:ident) => {
+        exc_new_wrapper!(@body $wrapper, $ctor, true);
+    };
+    ($wrapper:ident, $ctor:ident, nosplit) => {
+        exc_new_wrapper!(@body $wrapper, $ctor, false);
+    };
+    (@body $wrapper:ident, $ctor:ident, $split:expr) => {
         pub fn $wrapper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             let cls = args.first().copied();
             let rest: &[PyObjectRef] = if args.is_empty() { args } else { &args[1..] };
-            let (positional, _) = split_builtin_kwargs(rest);
+            // ValueError's `(cls, *args)` signature already rejected keywords,
+            // so its slice has no marker dict. Every other constructor still
+            // receives one.
+            let (positional, _) = if $split {
+                split_builtin_kwargs(rest)
+            } else {
+                (rest, None)
+            };
             let _roots = pyre_object::gc_roots::push_roots();
             let cls_slot = cls.map(|cls| {
                 let slot = pyre_object::gc_roots::shadow_stack_len();
@@ -9419,7 +9473,7 @@ exc_new_wrapper!(exc_eof_error_new, exc_eof_error);
 exc_new_wrapper!(exc_arithmetic_error_new, exc_arithmetic_error);
 exc_new_wrapper!(exc_zero_division_new, exc_zero_division);
 exc_new_wrapper!(exc_type_error_new, exc_type_error);
-exc_new_wrapper!(exc_value_error_new, exc_value_error);
+exc_new_wrapper!(exc_value_error_new, exc_value_error, nosplit);
 exc_new_wrapper!(exc_key_error_new, exc_key_error);
 exc_new_wrapper!(exc_index_error_new, exc_index_error);
 exc_new_wrapper!(exc_attribute_error_new, exc_attribute_error);
@@ -9480,8 +9534,14 @@ fn exc_system_exit_init(args: &[PyObjectRef]) -> crate::PyResult {
     let w_self = *args.first().ok_or_else(|| {
         crate::PyError::type_error("__init__() missing 1 required positional argument: 'self'")
     })?;
-    exc_base_exception_init(args)?;
-    let (positional, _) = split_builtin_kwargs(&args[1..]);
+    let (positional, kwargs) = split_builtin_kwargs(&args[1..]);
+    if has_real_kwargs(kwargs) {
+        return Err(exc_no_keywords_error(w_self, "SystemExit"));
+    }
+    let mut flat = Vec::with_capacity(positional.len() + 1);
+    flat.push(w_self);
+    flat.extend_from_slice(positional);
+    exc_base_exception_init(&flat)?;
     let code = match positional.len() {
         0 => return Ok(pyre_object::w_none()),
         1 => positional[0],
@@ -9857,12 +9917,39 @@ pub fn make_exc_type_with_init(
             if let Some(doc) = doc {
                 type_ns_store(ns_slot, "__doc__", pyre_object::w_str_new(doc));
             }
-            type_ns_store(ns_slot, "__new__", crate::typedef::make_new_descr(new_fn));
+            // `descr_init(self, space, args_w)` and ValueError's `__new__`
+            // (`cls, *args`, no `**kwargs`). The binder rejects keywords;
+            // the bodies only store `args_w`.
+            let new_sig = match name {
+                "ValueError" => Some(crate::gateway::Signature::new(
+                    vec!["cls"],
+                    Some("args"),
+                    None,
+                    0,
+                    0,
+                )),
+                _ => None,
+            };
+            type_ns_store(
+                ns_slot,
+                "__new__",
+                crate::typedef::make_new_descr_maybe_sig(new_fn, new_sig),
+            );
             if let Some(init_fn) = init_fn {
+                let init_sig = match name {
+                    "BaseException" => Some(crate::gateway::Signature::new(
+                        vec!["self"],
+                        Some("args"),
+                        None,
+                        0,
+                        0,
+                    )),
+                    _ => None,
+                };
                 type_ns_store(
                     ns_slot,
                     "__init__",
-                    make_builtin_function("__init__", init_fn),
+                    crate::gateway::make_builtin_function_maybe_sig("__init__", init_fn, init_sig),
                 );
             }
             // `interp_exceptions.py` declares each class's typed attributes
@@ -10482,17 +10569,26 @@ pub(crate) fn exception_group_fields(
 }
 
 fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() != 3 {
+    // `descr_new(space, w_subtype, w_message, w_exceptions)` counts only the
+    // positional arguments it was bound to. Keywords ride the same flat slice
+    // here, so strip them before the arity check and leave the rejection to
+    // `descr_init`, which names the type the instance ended up with.
+    let positional = if args.is_empty() {
+        args
+    } else {
+        split_builtin_kwargs(&args[1..]).0
+    };
+    if positional.len() != 2 {
         return Err(crate::PyError::type_error(format!(
             "BaseExceptionGroup.__new__() takes exactly 2 arguments ({} given)",
-            args.len().saturating_sub(1)
+            positional.len()
         )));
     }
     // `py_repr`, `fixedview` and the `isinstance`/`issubclass` checks below all
     // run Python, so the three operands cannot stay in untraced Rust locals
     // across them.
     let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[args[0], args[1], args[2]]);
+    let base = pyre_object::gc_roots::pin_roots(&[args[0], positional[0], positional[1]]);
     let mut cls = pyre_object::gc_roots::shadow_stack_get(base);
     let message = pyre_object::gc_roots::shadow_stack_get(base + 1);
     let w_exceptions = pyre_object::gc_roots::shadow_stack_get(base + 2);
@@ -10632,11 +10728,17 @@ fn exception_group_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     let w_self = *args.first().ok_or_else(|| {
         crate::PyError::type_error("__init__() missing 1 required positional argument: 'self'")
     })?;
-    let (positional, _) = split_builtin_kwargs(&args[1..]);
+    let (positional, kwargs) = split_builtin_kwargs(&args[1..]);
+    if has_real_kwargs(kwargs) {
+        return Err(exc_no_keywords_error(w_self, "BaseExceptionGroup"));
+    }
     if let Some(value) = positional.first().copied() {
         unsafe { pyre_object::interp_exceptions::w_exception_set_value(w_self, value) };
     }
-    exc_base_exception_init(args)
+    let mut flat = Vec::with_capacity(positional.len() + 1);
+    flat.push(w_self);
+    flat.extend_from_slice(positional);
+    exc_base_exception_init(&flat)
 }
 
 enum ExceptionGroupCondition {
