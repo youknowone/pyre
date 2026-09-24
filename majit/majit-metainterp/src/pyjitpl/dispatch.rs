@@ -8935,50 +8935,6 @@ where
                         }
                         return TraceAction::Continue;
                     }
-                    // `rint.py ll_int_py_mod` residual: record `OS_INT_PY_MOD`
-                    // (FBW `walker_emit_int_py_div_or_mod`). Look-inside of
-                    // `int_mod` still emits `_ll_2_int_mod` plus the
-                    // sign-correction; rewriting that C rem to Python rem
-                    // makes the correction a no-op (`(r ^ y) < 0` is false
-                    // for a same-sign remainder) so `optimize_call_int_py_mod`
-                    // can fold the call. Emitting `IntMod` instead would keep
-                    // C rem and leave `GuardTrue(rem != 0)` as a live bake.
-                    if let Some(spec) = crate::box_trace::int_py_mod_residual()
-                        && (spec.matches(concrete_ptr as i64) || spec.matches(trace_ptr as i64))
-                        && args.len() == 2
-                        && raw_i.len() >= 2
-                    {
-                        let func_ptr = crate::blackhole::ll_int_py_mod as *const ();
-                        let traced = ctx.call_typed_with_effect_pure(
-                            majit_ir::OpCode::CallI,
-                            func_ptr,
-                            &args,
-                            &arg_types,
-                            majit_ir::Type::Int,
-                            crate::INT_PY_MOD_EFFECT_INFO,
-                            &[
-                                majit_ir::Value::Int(func_ptr as usize as i64),
-                                majit_ir::Value::Int(raw_i[0]),
-                                majit_ir::Value::Int(raw_i[1]),
-                            ],
-                            majit_ir::Value::Int(concrete),
-                        );
-                        ctx.set_opref_concrete(traced, majit_ir::Value::Int(concrete));
-                        self.set_int_reg(dst, Some(traced), Some(concrete));
-                        if is_forces
-                            && matches!(
-                                self.finalize_standard_virtualizable_may_force(
-                                    ctx,
-                                    sym,
-                                    active_vable
-                                ),
-                                TraceAction::Abort
-                            )
-                        {
-                            return TraceAction::Abort;
-                        }
-                        return TraceAction::Continue;
-                    }
                     // pyjitpl.py do_residual_call plain branch:
                     //     pure = effectinfo.check_is_elidable()
                     //     return self.execute_varargs(rop.CALL_I,
