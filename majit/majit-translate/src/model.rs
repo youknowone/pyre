@@ -4305,6 +4305,19 @@ pub fn fuse_boxing_alloc_with_pytypes(
         }
         found
     }
+
+    fn field_is_stored(graph: &FunctionGraph, base: &Variable, field_name: &str) -> bool {
+        graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldWrite { base: b, field, .. }
+                        if b == base && field.name.as_str() == field_name
+                )
+            })
+        })
+    }
+
     /// Whether this write must execute between `base`'s construction and the
     /// allocation site.  A graph-wide unique write is not enough: when the
     /// same aggregate crosses both arms of a branch, a write on only one arm
@@ -5072,7 +5085,7 @@ pub fn fuse_boxing_alloc_with_pytypes(
                         value,
                         ty: payload_ty.clone(),
                     }),
-                    None if is_class_allocate(target) => {
+                    None if is_class_allocate(target) && !field_is_stored(graph, agg, field_name) => {
                         // `..Default::default()` leaves the unlisted
                         // fields at the type's zero. Spell that zero
                         // rather than declining the cluster.
@@ -5180,7 +5193,10 @@ pub fn fuse_boxing_alloc_with_pytypes(
             // `descr.rs`'s instance group states what follows: a minor
             // collection inside a residual moves the fresh object, and the
             // caller finishes writing into the dead pre-move copy.
-            if header.vtable.is_none() && !allocates_movable(flavor) {
+            // `malloc_typed_stable` (`allocate` / `allocate_stable`) is
+            // non-movable. `NewWithVtable` is a nursery bump, so a vtable
+            // does not make that flavor expressible.
+            if !allocates_movable(flavor) {
                 crate::decline::record(
                     FUSE_GATE,
                     "unsupported-malloc-flags-nonmovable",
@@ -12217,23 +12233,18 @@ mod tests {
             &attrs,
             &[("module::_cffi_backend::cdataobj::W_CData", CDATA_VTABLE)],
         );
-        assert_eq!(fused, 1, "allocate_stable must fuse from the owner PyType");
+        assert_eq!(
+            fused, 0,
+            "allocate_stable is malloc_typed_stable and must stay residual"
+        );
         let ops = &graph.block(entry).operations;
         assert!(
             ops.iter().any(|op| matches!(
                 &op.kind,
-                OpKind::NewWithVtable { owner, vtable }
-                    if owner == "W_CData" && *vtable == CDATA_VTABLE
-            )),
-            "NewWithVtable must carry the owner PyType address"
-        );
-        assert!(
-            !ops.iter().any(|op| matches!(
-                &op.kind,
                 OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments.last().map(String::as_str) == Some("allocate_stable")
             )),
-            "allocate_stable must not survive the fusion"
+            "allocate_stable must not become a moving NewWithVtable"
         );
     }
 
