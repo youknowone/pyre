@@ -240,6 +240,7 @@ fn build_semantic_program_via_active_frontend(
             // parse is the cost of not keeping every tree live.
             let mut discovered = Vec::new();
             let mut foldable_consts = Vec::new();
+            let mut duplicate_leaf_facts = front::mir::DuplicateLeafFacts::default();
             let mut crate_names = Vec::new();
             let mut hints: std::collections::HashMap<String, Vec<String>> =
                 std::collections::HashMap::new();
@@ -254,6 +255,7 @@ fn build_semantic_program_via_active_frontend(
                 crate_names.push(llbc.crate_name().to_string());
                 discovered.extend(front::mir::discover_transparent_scalar_kinds(&llbc));
                 foldable_consts.extend(front::mir::discover_foldable_const_lits(&llbc));
+                duplicate_leaf_facts.absorb(front::mir::DuplicateLeafFacts::discover(&llbc));
                 for (k, v) in
                     front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(&llbc))
                 {
@@ -269,6 +271,7 @@ fn build_semantic_program_via_active_frontend(
             discovered.dedup();
             foldable_consts.sort_by(|a, b| a.0.cmp(&b.0));
             foldable_consts.dedup();
+            let cross_tombstoned_leaves = duplicate_leaf_facts.tombstoned_leaves();
             crate::local_crates::register_local_crate_roots(crate_names);
             front::mir::register_foldable_const_lits(foldable_consts);
 
@@ -298,6 +301,7 @@ fn build_semantic_program_via_active_frontend(
                     static_addrs,
                     module_paths,
                     jitdriver_receiver_roots,
+                    &cross_tombstoned_leaves,
                 )
                 .unwrap_or_else(|e| panic!("Step 4.4 cutover: lower {p}: {e}"));
                 prof.mark(&format!("    lower {p}"));

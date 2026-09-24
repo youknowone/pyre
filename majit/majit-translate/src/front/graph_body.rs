@@ -13,7 +13,7 @@
 //! That requires the LLBC set to stay alive past the whole-program build,
 //! which is what a [`GraphBodyProvider`] owns.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use majit_charon_reader::Llbc;
@@ -44,6 +44,13 @@ pub(crate) struct GraphBodyProvider {
     /// map exactly; it is computed on the first body demanded from each
     /// LLBC rather than for every LLBC up front.
     struct_field_attrs: Vec<OnceLock<HashMap<String, Vec<(String, ValueType)>>>>,
+    /// Per-LLBC duplicate-leaf tombstones. Computed on the first body
+    /// demanded from that LLBC, the same cache as `struct_field_attrs`.
+    tombstoned_leaves: Vec<OnceLock<HashSet<String>>>,
+    /// Duplicate-leaf verdict across every LLBC this provider owns.
+    /// A leaf that collides only across artefacts is in this set and in
+    /// none of the per-LLBC sets.
+    cross_tombstoned_leaves: OnceLock<HashSet<String>>,
     pytypes: Vec<(String, i64)>,
     pytypes_by_struct: Vec<(String, i64)>,
     refs: Vec<(String, i64)>,
@@ -117,9 +124,12 @@ impl GraphBodyProvider {
             rows.iter().map(|(k, v)| ((*k).to_string(), *v)).collect()
         };
         let struct_field_attrs = llbcs.iter().map(|_| OnceLock::new()).collect();
+        let tombstoned_leaves = llbcs.iter().map(|_| OnceLock::new()).collect();
         Self {
             llbcs,
             struct_field_attrs,
+            tombstoned_leaves,
+            cross_tombstoned_leaves: OnceLock::new(),
             pytypes: own(static_addrs.pytypes),
             pytypes_by_struct: own(static_addrs.pytypes_by_struct),
             refs: own(static_addrs.refs),
@@ -178,6 +188,18 @@ impl GraphBodyProvider {
             LowerError::Unsupported(format!("no FunDecl for def_id {}", src.def_id))
         })?;
         let attrs = self.struct_field_attrs[idx].get_or_init(|| mir::struct_field_attrs_of(llbc));
+        let local_tombstones = self.tombstoned_leaves[idx]
+            .get_or_init(|| mir::tombstoned_leaves_of(llbc))
+            .clone();
+        let cross = self.cross_tombstoned_leaves.get_or_init(|| {
+            let mut facts = mir::DuplicateLeafFacts::default();
+            for llbc in &self.llbcs {
+                facts.absorb(mir::DuplicateLeafFacts::discover(llbc));
+            }
+            facts.tombstoned_leaves()
+        });
+        let mut tombstoned = local_tombstones;
+        tombstoned.extend(cross.iter().cloned());
         let pytypes = borrowed(&self.pytypes);
         let pytypes_by_struct = borrowed(&self.pytypes_by_struct);
         let refs = borrowed(&self.refs);
@@ -210,6 +232,7 @@ impl GraphBodyProvider {
                 scalar_field_stores: &scalar_field_stores,
             },
             attrs,
+            &tombstoned,
         )
     }
 }
@@ -299,6 +322,7 @@ mod tests {
     fn provider_reproduces_the_eagerly_lowered_body() {
         let llbc = Llbc::load(CORPUS).expect("load corpus.ullbc");
         let attrs = mir::struct_field_attrs_of(&llbc);
+        let tombstoned = mir::tombstoned_leaves_of(&llbc);
         let mut eager: Vec<(String, _)> = Vec::new();
         for fd in llbc.iter_local_fns() {
             if fd.unstructured().is_none() || fd.is_global_initializer.is_some() {
@@ -309,6 +333,7 @@ mod tests {
                 fd,
                 crate::HostStaticAddrs::default(),
                 &attrs,
+                &tombstoned,
             ) {
                 eager.push((fd.item_meta.name_path(), shape(&g)));
             }
