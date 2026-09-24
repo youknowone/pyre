@@ -1795,6 +1795,7 @@ fn tracing_sentinel_is_reminted_for_a_rebuilt_heap() {
     let handle = std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
         .spawn(|| {
+            pyre_module::register();
             init_jit_hooks();
             reset_gc_fresh_for_test();
             let first = majit_metainterp::virtualref::token_tracing_rescall();

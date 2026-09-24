@@ -1965,13 +1965,13 @@ fn build_gc() -> Box<MiniMarkGC> {
          -> u32 { register_pyre_class_with_pressure(gc, pytype_to_tid, descr, None) };
     // The GC types `pyre-module` owns, each declaring its own layout and sweep
     // destructor; `build_gc` only fixes where in the id order they register.
-    let module_gc_types = pyre_interpreter::importing::optional_module_hooks()
-        .map(|hooks| (hooks.gc_types)())
-        .unwrap_or_default();
+    // Missing hooks would shift every later type id away from the ids
+    // `SUBCLASS_RANGE_HIERARCHY` hardcodes, so fail here instead.
+    let module_hooks = pyre_interpreter::importing::optional_module_hooks()
+        .expect("pyre_module::register must run before the collector is built");
+    let module_gc_types = (module_hooks.gc_types)();
     let module_immortal_w_class_only_descriptors =
-        pyre_interpreter::importing::optional_module_hooks()
-            .map(|hooks| (hooks.immortal_w_class_only_descriptors)())
-            .unwrap_or_default();
+        (module_hooks.immortal_w_class_only_descriptors)();
     let register_module_gc_types = |gc: &mut MiniMarkGC,
                                     pytype_to_tid: &mut HashMap<usize, u32>,
                                     anchor: ModuleGcAnchor| {
