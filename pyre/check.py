@@ -3287,6 +3287,193 @@ def wasm_outputs_match(output, expected):
 ALL_BACKENDS = ("dynasm", "cranelift", "wasm")
 
 
+def _jitstats_shared_path(source):
+    return source.with_name(f"{source.stem}.jitstats")
+
+
+def _jitstats_specific_path(source, backend):
+    return source.with_name(f"{source.stem}.{backend}.jitstats")
+
+
+def _jitstats_texts_match(a, b):
+    """True when two baselines are the same snapshot under the gate.
+
+    `_jit_stats_change` reads a field missing from either side as 0, so a
+    backend that prints `wasm_inline_merge_exits=0` and one that omits the
+    key record one baseline. Merging keeps a single file for that case.
+    """
+    left, right = _parse_jit_stats(a), _parse_jit_stats(b)
+    keys = set(left) | set(right)
+    return all(left.get(key, "0") == right.get(key, "0") for key in keys)
+
+
+def _jitstats_overlay_path(source, backend):
+    """Platform overlay, if one is committed for this host. Else None.
+
+    A `<name>.<backend>.<platform>.github-actions.jitstats` wins on that
+    GitHub runner; otherwise `<name>.<backend>.<platform>.jitstats` wins on
+    the platform. These stay per backend: they exist only where one host
+    disagrees, and folding them into the shared file would hide that.
+    """
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        github_runner = source.with_name(
+            f"{source.stem}.{backend}.{sys.platform}.github-actions.jitstats"
+        )
+        if github_runner.exists():
+            return github_runner
+    per_platform = source.with_name(
+        f"{source.stem}.{backend}.{sys.platform}.jitstats"
+    )
+    if per_platform.exists():
+        return per_platform
+    return None
+
+
+def jitstats_baseline_path(script, backend):
+    """Committed baseline consulted for `backend` on `script`.
+
+    Resolution order: a platform overlay, then `<name>.<backend>.jitstats`
+    when this backend's counters differ, then `<name>.jitstats` shared by
+    every backend whose snapshot gates as equal. When nothing is committed,
+    the path is the per-backend name the missing-baseline error reports.
+    """
+    source = Path(script)
+    overlay = _jitstats_overlay_path(source, backend)
+    if overlay is not None:
+        return overlay
+    specific = _jitstats_specific_path(source, backend)
+    if specific.exists():
+        return specific
+    shared = _jitstats_shared_path(source)
+    if shared.exists():
+        return shared
+    return specific
+
+
+def _choose_shared_jitstats_text(members):
+    """Exact bytes to store for a cluster that already gates as equal.
+
+    Prefer the text most members already have. A tie prefers the shorter
+    one, which drops a key another backend only prints as 0.
+    """
+    counts = {}
+    for _backend, text in members:
+        counts[text] = counts.get(text, 0) + 1
+    return max(counts, key=lambda text: (counts[text], -len(text)))
+
+
+def rewrite_jitstats_baselines(script, contents):
+    """Write the smallest baseline set that still gates as `contents`.
+
+    `contents` maps a backend to its snapshot text, or None when that
+    backend has no baseline. Callers omit backends they are not placing.
+    At least two backends whose texts gate as equal share
+    `<stem>.jitstats`. A backend that disagrees keeps
+    `<stem>.<backend>.jitstats`. Platform overlays are left alone.
+    """
+    source = Path(script)
+    shared_path = _jitstats_shared_path(source)
+    clusters = []
+    for backend, text in contents.items():
+        if text is None:
+            continue
+        for cluster in clusters:
+            if _jitstats_texts_match(cluster[0][1], text):
+                cluster.append((backend, text))
+                break
+        else:
+            clusters.append([(backend, text)])
+
+    order = {backend: index for index, backend in enumerate(ALL_BACKENDS)}
+
+    def cluster_rank(cluster):
+        earliest = min(order.get(backend, len(order)) for backend, _text in cluster)
+        return (len(cluster), -earliest)
+
+    shared_backends = set()
+    if clusters:
+        shared_cluster = max(clusters, key=cluster_rank)
+        if len(shared_cluster) >= 2:
+            shared_text = _choose_shared_jitstats_text(shared_cluster)
+            shared_backends = {backend for backend, _text in shared_cluster}
+            current = (
+                shared_path.read_text(encoding="utf-8")
+                if shared_path.exists()
+                else None
+            )
+            if current != shared_text:
+                shared_path.write_text(shared_text, encoding="utf-8", newline="")
+    if not shared_backends and shared_path.exists():
+        shared_path.unlink()
+
+    for backend, text in contents.items():
+        specific = _jitstats_specific_path(source, backend)
+        if backend in shared_backends or text is None:
+            specific.unlink(missing_ok=True)
+            continue
+        current = specific.read_text(encoding="utf-8") if specific.exists() else None
+        if current != text:
+            specific.write_text(text, encoding="utf-8", newline="")
+
+
+def store_jitstats_baseline(script, backend, text):
+    """Record `text` for `backend` and re-fold sibling baselines.
+
+    `text` None removes this backend's baseline. An existing platform
+    overlay is updated in place and does not participate in the fold:
+    recording one host must not rewrite the baseline the other hosts read.
+    """
+    source = Path(script)
+    overlay = _jitstats_overlay_path(source, backend)
+    if overlay is not None:
+        if text is None:
+            overlay.unlink(missing_ok=True)
+        else:
+            overlay.write_text(text, encoding="utf-8", newline="")
+        return
+
+    skipped = set(synth_skip_backends(script))
+    backends = [name for name in ALL_BACKENDS if name not in skipped]
+    if backend not in backends:
+        backends.append(backend)
+    for name in ALL_BACKENDS:
+        if name not in backends and _jitstats_specific_path(source, name).exists():
+            backends.append(name)
+
+    shared_path = _jitstats_shared_path(source)
+    shared_text = (
+        shared_path.read_text(encoding="utf-8") if shared_path.exists() else None
+    )
+    contents = {}
+    for name in backends:
+        if name == backend:
+            contents[name] = text
+            continue
+        specific = _jitstats_specific_path(source, name)
+        if specific.exists():
+            contents[name] = specific.read_text(encoding="utf-8")
+        else:
+            contents[name] = shared_text
+
+    if text is None:
+        # No snapshot must not inherit the shared file on the next run.
+        # Materialize the siblings, then drop the shared baseline.
+        for name, sibling in contents.items():
+            if name == backend or sibling is None:
+                continue
+            specific = _jitstats_specific_path(source, name)
+            current = (
+                specific.read_text(encoding="utf-8") if specific.exists() else None
+            )
+            if current != sibling:
+                specific.write_text(sibling, encoding="utf-8", newline="")
+        shared_path.unlink(missing_ok=True)
+        _jitstats_specific_path(source, backend).unlink(missing_ok=True)
+        return
+
+    rewrite_jitstats_baselines(script, contents)
+
+
 def _wasm_target_installed():
     """Whether the wasm backend can be built here.
 
@@ -3615,8 +3802,10 @@ class Check:
 
     def _jitstats_baseline_path(self, backend, script):
         # The committed structural-stats baseline sits beside its benchmark
-        # source (pyre/bench/<name>.<backend>.jitstats), not in the gitignored
-        # check.snap scratch tree that holds the local .out/.time snapshots.
+        # source, not in the gitignored check.snap scratch tree that holds the
+        # local .out/.time snapshots. Backends whose snapshots gate as equal
+        # share `<name>.jitstats`. A backend that disagrees keeps
+        # `<name>.<backend>.jitstats`, and that file wins over the shared one.
         #
         # A `<name>.<backend>.<platform>.github-actions.jitstats` beside it wins
         # on that GitHub runner; otherwise a
@@ -3664,17 +3853,7 @@ class Check:
         # windows later converged on its shared value. Read all three runners
         # back before adding one, and prefer removing the fixture's dependence on
         # the host input to recording the host.
-        source = Path(script)
-        if os.environ.get("GITHUB_ACTIONS") == "true":
-            github_runner = source.with_name(
-                f"{source.stem}.{backend}.{sys.platform}.github-actions.jitstats"
-            )
-            if github_runner.exists():
-                return github_runner
-        per_platform = source.with_name(f"{source.stem}.{backend}.{sys.platform}.jitstats")
-        if per_platform.exists():
-            return per_platform
-        return source.with_name(f"{source.stem}.{backend}.jitstats")
+        return jitstats_baseline_path(script, backend)
 
     def _apply_snapshot_gate(
         self, backend, name, script, output, stderr, elapsed, timeout,
@@ -3792,10 +3971,10 @@ class Check:
             # did not change.
             out_path.write_text(output, encoding="utf-8", newline="")
             time_path.write_text(f"{elapsed:.2f}", encoding="utf-8", newline="")
-            if jitstats is None:
-                jitstats_path.unlink(missing_ok=True)
-            else:
-                jitstats_path.write_text(jitstats, encoding="utf-8", newline="")
+            # Fold after writing: a backend that now matches its siblings
+            # drops `<name>.<backend>.jitstats` in favor of `<name>.jitstats`,
+            # and one that diverges is split back out of the shared file.
+            store_jitstats_baseline(script, backend, jitstats)
 
         if self.args.snapshot_mode == "diff":
             if not out_path.exists():
