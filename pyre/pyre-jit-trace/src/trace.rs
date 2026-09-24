@@ -6968,6 +6968,11 @@ fn full_body_walk_trace<Sym: WalkSym>(
                     ctx.set_green_key(target_key, (w_code as usize, loop_header_pc));
                     ctx.header_pc = loop_header_pc;
                     ctx.cut_inner_green_key = Some(target_key);
+                    ctx.set_close_typed_key(crate::driver::make_green_key_typed(
+                        w_code,
+                        loop_header_pc,
+                        is_being_profiled,
+                    ));
                 } else {
                     let key = crate::driver::make_green_key(w_code, start_pc, is_being_profiled);
                     ctx.set_green_key(key, (w_code as usize, start_pc));

@@ -8091,15 +8091,15 @@ impl<M: Clone> MetaInterp<M> {
         // `closed`, and the merge point was filed under the greens themselves,
         // not under the resolved cell key.
         let closed_for_scan = closed.clone();
-        // File the loop under the CELL key, not the bucket hash: this is the
-        // key a later warm entry resolves and looks `compiled_loops` up by, and
-        // on a chained bucket a bucket hash names a different cell's slot. The
-        // resolve is the same one the entry does (`warmstate.py:458-464`), so
-        // compile and entry agree by construction.
+        // File the loop on the cell `get_jitcell(*greenargs)` /
+        // `ensure_jit_cell_at_key` would own. `resolve_cell_key` answers the
+        // raw hash when the bucket is empty or holds only a comparekey-less
+        // cell, and `attach_procedure_to_interp` then installs the token
+        // there. The later `get_assembler_token` walk compares greens and
+        // misses that cell. Ensure the typed cell first so the token and the
+        // entry share it.
         let green_key = match closed {
-            Some(key) => self
-                .warm_state
-                .resolve_cell_key(key.get_uhash(), || key.clone()),
+            Some(key) => self.warm_state.ensure_cell_key(&key),
             // `outer` is `ctx.green_key`, already resolved at trace start. The
             // cross-loop-cut inner key is produced inside the trace walker,
             // which holds no `WarmEnterState`, so it arrives as a bucket hash
