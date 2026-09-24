@@ -1749,16 +1749,22 @@ pub fn range_iter_continues(iter: PyObjectRef) -> Result<bool, PyError> {
             // tail ends the loop) rather than the length captured at iterator
             // creation.
             let len = seq_iter_current_len(si.seq).unwrap_or(si.length);
-            return Ok(si.index < len);
+            // `length` is the creation-time snapshot (still `i64`). The live
+            // cursor is a machine word; widen it, which drops no bits.
+            return Ok(pyre_object::seq_index_to_i64(si.index) < len);
         }
         if is_list_iter(iter) {
             let si = &*(iter as *const W_ListIterObject);
             // A negative cursor is the `__setstate__` exhausted sentinel.
-            return Ok(!si.seq.is_null() && si.index >= 0 && si.index < w_list_len(si.seq) as i64);
+            // Compare the `Signed` cursor with the live length in word width.
+            // Casting the cursor to `usize` would record a narrowing mask.
+            return Ok(!si.seq.is_null()
+                && si.index >= 0
+                && si.index < w_list_len(si.seq) as isize);
         }
         if is_tuple_iter(iter) {
             let si = &*(iter as *const W_TupleIterObject);
-            return Ok(!si.seq.is_null() && si.index < w_tuple_len(si.seq) as i64);
+            return Ok(!si.seq.is_null() && si.index < w_tuple_len(si.seq) as isize);
         }
     }
     Err(PyError::type_error("not an iterator"))
@@ -1786,10 +1792,11 @@ pub fn range_iter_next_or_null(iter: PyObjectRef) -> Result<PyObjectRef, PyError
             // range_iter_continues): getitem returns None past the live
             // length, so an element appended during iteration is yielded and a
             // removed tail ends the loop. Mirrors baseobjspace::next.
+            let idx_i64 = pyre_object::seq_index_to_i64(idx);
             let item = if is_list(si.seq) {
-                w_list_getitem(si.seq, idx)
+                w_list_getitem(si.seq, idx_i64)
             } else if is_tuple(si.seq) {
-                w_tuple_getitem(si.seq, idx)
+                w_tuple_getitem(si.seq, idx_i64)
             } else if is_str(si.seq) {
                 // Box the idx-th code point as a one-character str, reading
                 // the WTF-8 view so a lone surrogate is yielded instead of
@@ -1806,7 +1813,7 @@ pub fn range_iter_next_or_null(iter: PyObjectRef) -> Result<PyObjectRef, PyError
             } else if pyre_object::bytesobject::is_bytes_like(si.seq) {
                 // Each item is the byte's ordinal, read from the live buffer so
                 // a bytearray resized mid-iteration is observed.
-                if (idx as usize) < pyre_object::bytesobject::bytes_like_len(si.seq) {
+                if idx < pyre_object::bytesobject::bytes_like_len(si.seq) as isize {
                     Some(w_int_new(pyre_object::bytesobject::bytes_like_getitem(
                         si.seq,
                         idx as usize,
@@ -1815,7 +1822,7 @@ pub fn range_iter_next_or_null(iter: PyObjectRef) -> Result<PyObjectRef, PyError
                     None
                 }
             } else if pyre_object::interp_array::is_array(si.seq) {
-                if (idx as usize) < pyre_object::interp_array::w_array_len(si.seq) {
+                if idx < pyre_object::interp_array::w_array_len(si.seq) as isize {
                     // [3.14-spec] PyPy's generic `W_SeqIterObject.descr_next`
                     // advances only after `getitem` succeeds (and clears the
                     // source on any error). v3.14.6 `arrayiter_next` passes
@@ -1848,7 +1855,7 @@ pub fn range_iter_next_or_null(iter: PyObjectRef) -> Result<PyObjectRef, PyError
             if si.seq.is_null() || si.index < 0 {
                 return Ok(PY_NULL);
             }
-            if let Some(item) = w_list_getitem(si.seq, si.index) {
+            if let Some(item) = w_list_getitem(si.seq, pyre_object::seq_index_to_i64(si.index)) {
                 si.index += 1;
                 return Ok(item);
             }
@@ -1860,7 +1867,7 @@ pub fn range_iter_next_or_null(iter: PyObjectRef) -> Result<PyObjectRef, PyError
             if si.seq.is_null() {
                 return Ok(PY_NULL);
             }
-            if let Some(item) = w_tuple_getitem(si.seq, si.index) {
+            if let Some(item) = w_tuple_getitem(si.seq, pyre_object::seq_index_to_i64(si.index)) {
                 si.index += 1;
                 return Ok(item);
             }

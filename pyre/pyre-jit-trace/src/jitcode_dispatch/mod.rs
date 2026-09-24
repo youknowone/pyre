@@ -7176,7 +7176,7 @@ enum BridgeIterJournalEntry {
         kind: BridgeIterKind,
         iter: pyre_object::PyObjectRef,
         pre_seq: pyre_object::PyObjectRef,
-        pre_index: i64,
+        pre_index: isize,
     },
 }
 

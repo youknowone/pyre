@@ -22202,8 +22202,8 @@ fn try_walker_specialize_zip_two_tuple_iters<Sym: WalkSym>(
             {
                 return Ok(None);
             }
-            let len = pyre_object::w_tuple_len(seq) as i64;
-            let item = pyre_object::w_tuple_getitem(seq, index);
+            let len = pyre_object::w_tuple_len(seq) as isize;
+            let item = pyre_object::w_tuple_getitem(seq, pyre_object::seq_index_to_i64(index));
             steps.push((seq, index, len, item));
         }
         (
@@ -22304,7 +22304,7 @@ fn try_walker_specialize_zip_two_tuple_iters<Sym: WalkSym>(
             crate::descr::tuple_iter_index_descr(),
         );
         ctx.trace_ctx
-            .set_opref_concrete(raw_index, Value::Int(index));
+            .set_opref_concrete(raw_index, Value::Int(pyre_object::seq_index_to_i64(index)));
         let items = crate::state::opimpl_getfield_gc_r(
             ctx.trace_ctx,
             seq_op,
@@ -22315,7 +22315,8 @@ fn try_walker_specialize_zip_two_tuple_iters<Sym: WalkSym>(
             items,
             crate::state::pyobject_gcarray_descr(),
         );
-        ctx.trace_ctx.set_opref_concrete(raw_len, Value::Int(len));
+        ctx.trace_ctx
+            .set_opref_concrete(raw_len, Value::Int(pyre_object::seq_index_to_i64(len)));
         let matches_arm = if concrete_continues {
             let zero = ctx.trace_ctx.const_int(0);
             let nonnegative = ctx.trace_ctx.record_op(OpCode::IntGe, &[raw_index, zero]);
@@ -22404,8 +22405,10 @@ fn try_walker_specialize_zip_two_tuple_iters<Sym: WalkSym>(
             crate::state::trace_items_block_getitem_value_pure(ctx.trace_ctx, items, raw_index);
         let next_index = ctx.trace_ctx.record_op(OpCode::IntAdd, &[raw_index, one]);
         let concrete_index = steps[item_ops.len()].1;
-        ctx.trace_ctx
-            .set_opref_concrete(next_index, Value::Int(concrete_index + 1));
+        ctx.trace_ctx.set_opref_concrete(
+            next_index,
+            Value::Int(pyre_object::seq_index_to_i64(concrete_index) + 1),
+        );
         let index_descr = crate::descr::tuple_iter_index_descr();
         ctx.trace_ctx.record_op_with_descr(
             OpCode::SetfieldGc,
@@ -22576,7 +22579,7 @@ fn try_walker_specialize_for_iter_list<Sym: WalkSym>(
         crate::descr::list_iter_index_descr(),
     );
     ctx.trace_ctx
-        .set_opref_concrete(index_op, Value::Int(index));
+        .set_opref_concrete(index_op, Value::Int(pyre_object::seq_index_to_i64(index)));
 
     // Object storage keeps the inline `length` field; the typed storages read
     // their own items-array length field.
@@ -22696,8 +22699,10 @@ fn try_walker_specialize_for_iter_list<Sym: WalkSym>(
 
     let one = ctx.trace_ctx.const_int(1);
     let next_index = ctx.trace_ctx.record_op(OpCode::IntAdd, &[index_op, one]);
-    ctx.trace_ctx
-        .set_opref_concrete(next_index, Value::Int(index + 1));
+    ctx.trace_ctx.set_opref_concrete(
+        next_index,
+        Value::Int(pyre_object::seq_index_to_i64(index) + 1),
+    );
     let index_descr = crate::descr::list_iter_index_descr();
     ctx.trace_ctx.record_op_with_descr(
         OpCode::SetfieldGc,
@@ -22710,7 +22715,9 @@ fn try_walker_specialize_for_iter_list<Sym: WalkSym>(
     // The authentic boxed item comes from the same `w_list_getitem` the
     // residual calls.  It allocates for the typed strategies, so every raw
     // pointer used afterwards is re-derived from its (GC-forwarded) opref.
-    let Some(concrete_item) = (unsafe { pyre_object::w_list_getitem(seq_obj, index) }) else {
+    let Some(concrete_item) =
+        (unsafe { pyre_object::w_list_getitem(seq_obj, pyre_object::seq_index_to_i64(index)) })
+    else {
         return Err(DispatchError::ConcreteShadowAllocationFailed { pc: op_pc });
     };
     ctx.trace_ctx.set_opref_concrete(

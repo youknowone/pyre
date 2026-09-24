@@ -19400,7 +19400,9 @@ pub(crate) fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
         // `list.__reversed__`, which is the same lazy iterator).
         if pyre_object::is_exact_builtin_instance(obj) {
             if pyre_object::is_list(obj) {
-                let n = pyre_object::w_list_len(obj) as i64;
+                let n = isize::try_from(pyre_object::w_list_len(obj)).map_err(|_| {
+                    crate::PyError::overflow_error("Python int too large to convert to C ssize_t")
+                })?;
                 return Ok(pyre_object::w_list_reverse_iter_new(
                     pyre_object::gc_roots::shadow_stack_get(obj_slot),
                     n - 1,

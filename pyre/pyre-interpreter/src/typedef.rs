@@ -6817,7 +6817,12 @@ fn init_list_type(ns: PyObjectRef) {
                     let obj =
                         crate::type_methods::require_list_receiver(args, "__reversed__", true)?;
                     crate::type_methods::arity_no_args(args, "__reversed__")?;
-                    let n = unsafe { pyre_object::w_list_len(obj) } as i64;
+                    let n =
+                        isize::try_from(unsafe { pyre_object::w_list_len(obj) }).map_err(|_| {
+                            crate::PyError::overflow_error(
+                                "Python int too large to convert to C ssize_t",
+                            )
+                        })?;
                     Ok(pyre_object::w_list_reverse_iter_new(obj, n - 1))
                 },
                 1,

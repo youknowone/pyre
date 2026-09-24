@@ -1749,7 +1749,9 @@ impl Optimization for OptIntBounds {
                 let __descr_arc_d = op.getdescr();
                 if let Some(d) = __descr_arc_d.as_ref() {
                     let (field_size, signed) = d.field_size_and_sign();
-                    if field_size > 0 && field_size < 8 {
+                    // descr.py `FieldDescr.is_integer_bounded`: only a field
+                    // narrower than `symbolic.WORD` carries a size bound.
+                    if field_size > 0 && field_size < std::mem::size_of::<usize>() {
                         let (lo, hi) = if signed {
                             let half = 1i64 << (field_size * 8 - 1);
                             (-half, half - 1)
@@ -1768,7 +1770,9 @@ impl Optimization for OptIntBounds {
                     && let Some(ad) = d.as_array_descr()
                 {
                     let item_size = ad.item_size();
-                    if item_size > 0 && item_size < 8 {
+                    // descr.py `ArrayDescr.is_integer_bounded`: `itemsize <
+                    // symbolic.WORD`.
+                    if item_size > 0 && item_size < std::mem::size_of::<usize>() {
                         let signed = ad.is_item_signed();
                         let (lo, hi) = if signed {
                             let half = 1i64 << (item_size * 8 - 1);
