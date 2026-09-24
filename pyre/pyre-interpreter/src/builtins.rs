@@ -7284,33 +7284,29 @@ exc_constructor!(
 pub fn __majit_wrap_base_exception_descr_init(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() == 2 && !args[0].is_null() && unsafe { pyre_object::is_tuple(args[1]) } {
-        let n = unsafe { pyre_object::w_tuple_len(args[1]) };
-        if n == 1 {
-            let item =
-                unsafe { pyre_object::w_tuple_getitem(args[1], 0) }.unwrap_or(pyre_object::PY_NULL);
+    if args.len() == 2 && !args[0].is_null() {
+        let item = packed_single_arg(args[1]);
+        if !item.is_null() {
             exc_init_one_positional(args[0], item);
             return Ok(pyre_object::w_none());
         }
         return exc_base_exception_init_packed(args[0], args[1]);
-    }
-    if args.len() == 2 && !args[0].is_null() {
-        exc_init_one_positional(args[0], args[1]);
-        return Ok(pyre_object::w_none());
     }
     // The six-word residual cannot see a longer tail. Hand the real slice
     // to the initializer instead of shortening it.
     if args.len() > 6 {
         return exc_base_exception_init_long(args);
     }
-    let slot = |i: usize| args.get(i).copied().unwrap_or(pyre_object::PY_NULL);
+    // Spelled out rather than read through a closure: a closure here is a
+    // graph of its own, annotated without the environment it reads, and it
+    // falls to the legacy walker on the captured slice.
     exc_base_exception_init_slow(
-        slot(0),
-        slot(1),
-        slot(2),
-        slot(3),
-        slot(4),
-        slot(5),
+        args.first().copied().unwrap_or(pyre_object::PY_NULL),
+        args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+        args.get(2).copied().unwrap_or(pyre_object::PY_NULL),
+        args.get(3).copied().unwrap_or(pyre_object::PY_NULL),
+        args.get(4).copied().unwrap_or(pyre_object::PY_NULL),
+        args.get(5).copied().unwrap_or(pyre_object::PY_NULL),
         args.len() as i64,
     )
 }
@@ -7389,17 +7385,12 @@ static __majit_wrap_base_exception_descr_init_target: crate::gateway::BuiltinWra
 pub fn __majit_wrap_exc_value_error_descr_new(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() == 2 && !args[0].is_null() && unsafe { pyre_object::is_tuple(args[1]) } {
-        let n = unsafe { pyre_object::w_tuple_len(args[1]) };
-        if n == 1 {
-            let item =
-                unsafe { pyre_object::w_tuple_getitem(args[1], 0) }.unwrap_or(pyre_object::PY_NULL);
+    if args.len() == 2 && !args[0].is_null() {
+        let item = packed_single_arg(args[1]);
+        if !item.is_null() {
             return Ok(value_error_one_arg(args[0], item));
         }
         return exc_value_error_new_packed(args[0], args[1]);
-    }
-    if args.len() == 2 && !args[0].is_null() {
-        return Ok(value_error_one_arg(args[0], args[1]));
     }
     // The four-word residual cannot see a longer tail, and a bare exception
     // takes any number of positional arguments. Hand the real slice over
@@ -7407,8 +7398,15 @@ pub fn __majit_wrap_exc_value_error_descr_new(
     if args.len() > 4 {
         return exc_value_error_new_long(args);
     }
-    let slot = |i: usize| args.get(i).copied().unwrap_or(pyre_object::PY_NULL);
-    exc_value_error_new_slow(slot(0), slot(1), slot(2), slot(3), args.len() as i64)
+    // Spelled out for the reason [`__majit_wrap_base_exception_descr_init`]
+    // gives: a closure reading the slice is a graph of its own.
+    exc_value_error_new_slow(
+        args.first().copied().unwrap_or(pyre_object::PY_NULL),
+        args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+        args.get(2).copied().unwrap_or(pyre_object::PY_NULL),
+        args.get(3).copied().unwrap_or(pyre_object::PY_NULL),
+        args.len() as i64,
+    )
 }
 
 #[majit_macros::dont_look_inside]
@@ -7488,12 +7486,37 @@ static __majit_wrap_exc_value_error_descr_new_target: crate::gateway::BuiltinWra
         func: __majit_wrap_exc_value_error_descr_new,
     };
 
+/// The one object a `*args` tuple of length one holds, or `PY_NULL` for any
+/// other shape — including a `packed` that is not a tuple at all, which is
+/// what an unbound caller passes.
+///
+/// `visit_args_w` reads the tuple `_match_signature` packed, and this is
+/// that read.  Residual because the traced wrapper cannot perform it: the
+/// item comes out of the tuple's `ItemsBlock`, and merging that with the
+/// wrapper's own `args` list leaves the annotator no union arm, so the
+/// wrapper's graph falls to the legacy walker.
+#[majit_macros::dont_look_inside_cannot_raise]
+fn packed_single_arg(packed: PyObjectRef) -> PyObjectRef {
+    if packed.is_null() || !unsafe { pyre_object::is_tuple(packed) } {
+        return pyre_object::PY_NULL;
+    }
+    if unsafe { pyre_object::w_tuple_len(packed) } != 1 {
+        return pyre_object::PY_NULL;
+    }
+    unsafe { pyre_object::w_tuple_getitem(packed, 0) }.unwrap_or(pyre_object::PY_NULL)
+}
+
 /// Expand the `*args` tuple the signature binder appended after `self`.
+/// An unbound caller reaches here with the positional itself rather than a
+/// tuple holding it; take it as the one argument it is.
 #[majit_macros::dont_look_inside]
 fn exc_base_exception_init_packed(
     w_self: PyObjectRef,
     packed: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
+    if packed.is_null() || !unsafe { pyre_object::is_tuple(packed) } {
+        return exc_base_exception_init(&[w_self, packed]);
+    }
     let n = unsafe { pyre_object::w_tuple_len(packed) };
     let mut flat = Vec::with_capacity(1 + n);
     flat.push(w_self);
@@ -7506,11 +7529,16 @@ fn exc_base_exception_init_packed(
 }
 
 /// Expand the `*args` tuple the signature binder appended after `cls`.
+/// An unbound caller reaches here with the positional itself rather than a
+/// tuple holding it; take it as the one argument it is.
 #[majit_macros::dont_look_inside]
 fn exc_value_error_new_packed(
     cls: PyObjectRef,
     packed: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
+    if packed.is_null() || !unsafe { pyre_object::is_tuple(packed) } {
+        return exc_value_error_new(&[cls, packed]);
+    }
     let n = unsafe { pyre_object::w_tuple_len(packed) };
     let mut flat = Vec::with_capacity(1 + n);
     flat.push(cls);
@@ -7688,6 +7716,15 @@ fn exc_syntax_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
             args_list,
         );
     }
+    // `W_SyntaxError.descr_init` ends by calling `_report_missing_parentheses`,
+    // which reads `w_text` back and rewrites `w_msg` into a "Did you mean
+    // print(...)?" suggestion.  That belongs to a parser which cannot produce
+    // the diagnostic itself; this tree's grammar does, so the rewrite is
+    // deliberately absent.  Measured against the pinned 3.14.6:
+    // `SyntaxError("Missing parentheses in call to 'print' ", (f, 1, 1,
+    // "print 1")).msg` comes back unchanged, and the suggestion the compiler
+    // itself emits reads `print(...)`, not the reconstructed `print(1)`.
+    // Rewriting here would miss on both counts.
     Ok(pyre_object::w_none())
 }
 
