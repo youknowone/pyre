@@ -14346,7 +14346,7 @@ fn handle<Sym: WalkSym>(
                 })
                 .flatten();
             if let Some(callee_code) = callee_code {
-                let callee_key = crate::driver::make_green_key(
+                let callee_key = crate::driver::make_green_key_typed(
                     callee_code as *const (),
                     next_instr,
                     is_being_profiled,
@@ -14359,7 +14359,7 @@ fn handle<Sym: WalkSym>(
                 ];
                 let red_types = [Type::Ref, Type::Ref];
                 if let Some(token) = driver.get_or_make_portal_assembler_token_arc(
-                    callee_key,
+                    &callee_key,
                     &greenboxes,
                     &red_types,
                 ) {
@@ -14396,7 +14396,7 @@ fn handle<Sym: WalkSym>(
                         })
                         .flatten();
                     if let Some(callee_code) = callee_code {
-                        let callee_key = crate::driver::make_green_key(
+                        let callee_key = crate::driver::make_green_key_typed(
                             callee_code as *const (),
                             next_instr,
                             is_being_profiled,
@@ -14409,7 +14409,7 @@ fn handle<Sym: WalkSym>(
                         ];
                         let red_types = [Type::Ref, Type::Ref];
                         if let Some(token) = driver.get_or_make_portal_assembler_token_arc(
-                            callee_key,
+                            &callee_key,
                             &greenboxes,
                             &red_types,
                         ) {

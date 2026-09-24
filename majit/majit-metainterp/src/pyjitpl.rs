@@ -6655,11 +6655,12 @@ impl<M: Clone> MetaInterp<M> {
             // index: the token comes off the celltable and the key travels
             // on to the `CALL_ASSEMBLER` descr, so both must name the cell
             // the callee's greens own rather than whatever heads its bucket.
+            let typed = majit_ir::GreenKey::with_types(green_values.to_vec(), spec.clone());
             let green_key = runtime_state
                 .borrow()
                 .0
                 .resolve_cell_key(crate::green_key_hash_typed(green_values, &spec), || {
-                    majit_ir::GreenKey::with_types(green_values.to_vec(), spec.clone())
+                    typed.clone()
                 });
             if let Some(token) = runtime_state.borrow().0.get_compiled(green_key) {
                 return Some((token, green_key));
@@ -6677,19 +6678,23 @@ impl<M: Clone> MetaInterp<M> {
             let red_arg_types = jd.red_arg_types_as_ir_types();
             let mut state = runtime_state.borrow_mut();
             let (warm_state, backend) = &mut *state;
+            warm_state.ensure_cell_for_key(&typed);
+            let cell_key = warm_state
+                .cell_key_for(&typed)
+                .unwrap_or_else(|| typed.get_uhash());
             let token_number = warm_state.alloc_token_number();
-            match warm_state.get_assembler_token(green_key, |memmgr| {
+            match warm_state.get_assembler_token_with_key(&typed, |memmgr| {
                 compile::compile_tmp_callback(
                     *backend,
                     &jd,
                     token_number,
-                    green_key,
+                    cell_key,
                     &greenboxes,
                     &red_arg_types,
                     Some(memmgr),
                 )
             }) {
-                Ok(token) => Some((token, green_key)),
+                Ok(token) => Some((token, cell_key)),
                 Err(err) => {
                     if crate::majit_log_enabled() {
                         eprintln!(
@@ -19582,9 +19587,10 @@ impl<M: Clone> MetaInterp<M> {
         // Resolve to the target's CELL key: the token this key selects is
         // carried into the `CALL_ASSEMBLER` descr, so it has to be the token of
         // the cell these greens own.
+        let typed = majit_ir::GreenKey::with_types(green_values.clone(), green_types.clone());
         let green_key = self.warm_state.resolve_cell_key(
             crate::green_key_hash_typed(&green_values, &green_types),
-            || majit_ir::GreenKey::with_types(green_values.clone(), green_types.clone()),
+            || typed.clone(),
         );
         // `compile.py:187` parity: `op.getdescr()` IS a `JitCellToken`.  Carry
         // the *same* Arc that `compiled_loops` / warm cell own through to the
@@ -19610,19 +19616,26 @@ impl<M: Clone> MetaInterp<M> {
                     }
                 })
                 .collect();
+            self.warm_state.ensure_cell_for_key(&typed);
+            let cell_key = self
+                .warm_state
+                .cell_key_for(&typed)
+                .unwrap_or_else(|| typed.get_uhash());
             let token_number = self.warm_state.alloc_token_number();
             let backend = &mut self.backend;
-            match self.warm_state.get_assembler_token(green_key, |memmgr| {
-                compile::compile_tmp_callback(
-                    backend,
-                    &target_sd,
-                    token_number,
-                    green_key,
-                    &greenboxes,
-                    &arg_types,
-                    Some(memmgr),
-                )
-            }) {
+            match self
+                .warm_state
+                .get_assembler_token_with_key(&typed, |memmgr| {
+                    compile::compile_tmp_callback(
+                        backend,
+                        &target_sd,
+                        token_number,
+                        cell_key,
+                        &greenboxes,
+                        &arg_types,
+                        Some(memmgr),
+                    )
+                }) {
                 Ok(token) => token,
                 Err(err) => {
                     if crate::majit_log_enabled() {
@@ -19680,16 +19693,23 @@ impl<M: Clone> MetaInterp<M> {
     /// `[next_instr, is_being_profiled, pycode]` / `[frame, ec]` → `[Ref, Ref]`
     /// (`build_portal_calldescr`), for a registered driver whatever its
     /// `jit_merge_point` spec names.
+    ///
+    /// `typed_key` is the caller's green tuple when it has one: the token is
+    /// then installed on the typed cell (`JitCell.get_jitcell(*greenargs)`),
+    /// which also returns an installed token, temporary or compiled, as-is.
     fn assembler_token_arc_for_driver(
         &mut self,
         target_sd: &crate::jitdriver::JitDriverStaticData,
         green_key: u64,
+        typed_key: Option<&majit_ir::GreenKey>,
         greenboxes: &[Value],
         red_arg_types: &[Type],
         log_tag: &str,
     ) -> Option<Arc<JitCellToken>> {
         // `compile.py:187` parity: an already-compiled loop token wins.
-        if let Some(arc) = self.get_loop_token_arc(green_key) {
+        if typed_key.is_none()
+            && let Some(arc) = self.get_loop_token_arc(green_key)
+        {
             return Some(arc);
         }
         if target_sd.portal_runner_adr == 0 {
@@ -19701,7 +19721,7 @@ impl<M: Clone> MetaInterp<M> {
         // 1150`).
         let token_number = self.warm_state.alloc_token_number();
         let backend = &mut self.backend;
-        match self.warm_state.get_assembler_token(green_key, |memmgr| {
+        let make_token = |memmgr: &mut crate::memmgr::MemoryManager| {
             compile::compile_tmp_callback(
                 backend,
                 target_sd,
@@ -19711,7 +19731,14 @@ impl<M: Clone> MetaInterp<M> {
                 red_arg_types,
                 Some(memmgr),
             )
-        }) {
+        };
+        let token = match typed_key {
+            Some(key) => self
+                .warm_state
+                .get_assembler_token_with_key(key, make_token),
+            None => self.warm_state.get_assembler_token(green_key, make_token),
+        };
+        match token {
             Ok(token) => Some(token),
             Err(err) => {
                 if crate::majit_log_enabled() {
@@ -19726,15 +19753,14 @@ impl<M: Clone> MetaInterp<M> {
 
     pub fn get_or_make_portal_assembler_token_arc(
         &mut self,
-        green_key: u64,
+        key: &majit_ir::GreenKey,
         greenboxes: &[Value],
         red_arg_types: &[Type],
     ) -> Option<Arc<JitCellToken>> {
-        // Resolved before the portal-driver lookup — an installed token does
-        // not need the portal staticdata.
-        if let Some(arc) = self.get_loop_token_arc(green_key) {
-            return Some(arc);
-        }
+        // `warmstate.py get_assembler_token(greenkey)` reaches the cell through
+        // `JitCell.get_jitcell(*greenargs)`. The caller supplies that green
+        // tuple; this crate does not invent one. A hash-only install would
+        // file a comparekey-less cell the later typed attach never redirects.
         // The real portal driver has greens; the empty
         // `ensure_default_driver_sd` placeholder (jitdrivers_sd[0]) has none.
         let idx = self
@@ -19743,9 +19769,15 @@ impl<M: Clone> MetaInterp<M> {
             .iter()
             .position(|jd| jd.num_greens() > 0)?;
         let target_sd = self.staticdata.jitdrivers_sd.get(idx).cloned()?;
+        self.warm_state.ensure_cell_for_key(key);
+        let cell_key = self
+            .warm_state
+            .cell_key_for(key)
+            .unwrap_or_else(|| key.get_uhash());
         self.assembler_token_arc_for_driver(
             &target_sd,
-            green_key,
+            cell_key,
+            Some(key),
             greenboxes,
             red_arg_types,
             "walker-ca",
@@ -19772,6 +19804,7 @@ impl<M: Clone> MetaInterp<M> {
         self.assembler_token_arc_for_driver(
             &target_sd,
             green_key,
+            None,
             greenboxes,
             red_arg_types,
             "jd-ca",

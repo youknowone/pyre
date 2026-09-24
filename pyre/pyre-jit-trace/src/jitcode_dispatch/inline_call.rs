@@ -2466,10 +2466,9 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // being traced; emission below resolves compiled-or-tmp so the descr never
     // carries a bodyless token.
     let (driver, _) = crate::driver::driver_pair();
-    let callee_key = crate::driver::make_green_key(w_code, 0, is_being_profiled);
-    // warmstate.py / compile.py: resolve an installed
-    // procedure token, or synthesize a tmp callback token while the real loop
-    // is still tracing.
+    let callee_key = crate::driver::make_green_key_typed(w_code, 0, is_being_profiled);
+    // `get_jitcell(*greenargs)` — the token and the later loop attach share
+    // this cell. The hash alone would file a comparekey-less sibling.
     let greenboxes = [
         majit_ir::Value::Int(0),
         majit_ir::Value::Int(is_being_profiled as i64),
@@ -2477,7 +2476,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     ];
     let red_types = [Type::Ref, Type::Ref];
     let token =
-        match driver.get_or_make_portal_assembler_token_arc(callee_key, &greenboxes, &red_types) {
+        match driver.get_or_make_portal_assembler_token_arc(&callee_key, &greenboxes, &red_types) {
             Some(token) => token,
             None => {
                 if p2_diag_enabled() {
