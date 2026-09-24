@@ -33,6 +33,10 @@ mod wasm_instant {
                 .unwrap_or(0);
             Self(nanos)
         }
+
+        pub(super) fn elapsed(&self) -> Duration {
+            Self::now() - *self
+        }
     }
 
     impl std::ops::Add<Duration> for Instant {
