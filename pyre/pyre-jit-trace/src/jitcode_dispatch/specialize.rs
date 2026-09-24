@@ -9922,23 +9922,6 @@ pub(crate) fn try_walker_orthodox_binary_op<Sym: WalkSym>(
     if !ctx.is_authoritative_executor || r_args.len() != 2 || dst_bank != 'r' {
         return Ok(None);
     }
-    // Descent walks `binary_value_from_tag` → `add`.  Re-entering here
-    // from that `add` inline would recurse until the stack blows.
-    thread_local! {
-        static BINARY_OP_DESCENT_ACTIVE: std::cell::Cell<bool> =
-            const { std::cell::Cell::new(false) };
-    }
-    if BINARY_OP_DESCENT_ACTIVE.with(std::cell::Cell::get) {
-        return Ok(None);
-    }
-    struct DescentGuard;
-    impl Drop for DescentGuard {
-        fn drop(&mut self) {
-            BINARY_OP_DESCENT_ACTIVE.with(|flag| flag.set(false));
-        }
-    }
-    BINARY_OP_DESCENT_ACTIVE.with(|flag| flag.set(true));
-    let _descent_guard = DescentGuard;
     // `//` and `%` descend since `int_floordiv` / `int_mod` compute the
     // floor result through the `#[oopspec("int.py_div")]` /
     // `int.py_mod` twins of rint.py's `ll_int_py_div` / `ll_int_py_mod`:

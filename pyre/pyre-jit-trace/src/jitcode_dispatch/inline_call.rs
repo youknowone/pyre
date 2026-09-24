@@ -15783,13 +15783,20 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         // `binary_value_from_tag`.  Descend the generated body the same
         // way the tagged helper does; do not emit `try_emit_exact_*`
         // under this descent row.
-        let tag_op = ctx.trace_ctx.const_int(op_tag);
-        if let Some(outcome) = spec_gate(SpecFold::BinaryOpDescent, || {
-            super::specialize::try_walker_orthodox_binary_op(
-                ctx, op.pc, op_tag, tag_op, &args, dst, dst_bank,
-            )
-        })? {
-            return Ok((outcome, op.next_pc));
+        //
+        // This frame is already that helper walk (`perform_call` of
+        // `binary_value_from_tag` → `and_` / `add` / …).  Opening the
+        // wrapper again suspends at this inline_call and the driver
+        // pushes it forever.  Walk the callee body instead.
+        if !ctx.fbw_mode.transparent_helper_subwalk {
+            let tag_op = ctx.trace_ctx.const_int(op_tag);
+            if let Some(outcome) = spec_gate(SpecFold::BinaryOpDescent, || {
+                super::specialize::try_walker_orthodox_binary_op(
+                    ctx, op.pc, op_tag, tag_op, &args, dst, dst_bank,
+                )
+            })? {
+                return Ok((outcome, op.next_pc));
+            }
         }
         // Named `add`/`mul` helpers are the same BINARY family as
         // `binary_value_from_tag`.  A Python forward dunder must be

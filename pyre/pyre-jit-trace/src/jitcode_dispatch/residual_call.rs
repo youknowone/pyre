@@ -3383,6 +3383,27 @@ fn transparent_helper_recordable_leaf(path: &str) -> bool {
     })
 }
 
+/// Funcptr word of a residual that is NULL or a `symbolic_fnaddr` hash.
+/// Other `ResidualDecline::Symbolic` causes (non-const funcbox, LoadConst)
+/// stay recorded: those calls are real at runtime.
+fn recorded_symbolic_funcptr<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    allboxes: &[OpRef],
+) -> Option<i64> {
+    let funcbox = allboxes.first()?;
+    if !funcbox.is_constant() {
+        return None;
+    }
+    match ctx.trace_ctx.box_value(*funcbox) {
+        Some(majit_ir::Value::Int(addr))
+            if addr == 0 || majit_jitcode::codewriter::call::is_symbolic_fnaddr(addr) =>
+        {
+            Some(addr)
+        }
+        _ => None,
+    }
+}
+
 /// The symbolic decline, minted in one place so it carries provenance.
 ///
 /// Ten preconditions inside [`try_execute_residual_call_via_executor`] end in
@@ -8666,6 +8687,19 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         let resid_raised = match resid_exec {
             ResidualExecOutcome::Executed(result) => result.is_err(),
             ResidualExecOutcome::Declined(cause) => {
+                // The call op is already recorded. A symbolic fnaddr decline
+                // must not leave it: the backend emits a call to the hash.
+                // Cut back to the position taken before the record, then
+                // abort this walk so the result box is not used.
+                if cause == ResidualDecline::Symbolic
+                    && let Some(addr) = recorded_symbolic_funcptr(ctx, &allboxes)
+                {
+                    ctx.trace_ctx.cut_trace_with_snapshots(patch_pos);
+                    return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
+                        pc: op.pc,
+                        symbolic: addr,
+                    });
+                }
                 fbw_abort_nested_unjournaled_residual(ctx, op.pc, Some(cause))?;
                 fbw_mark_unjournaled_effect(cause);
                 false
@@ -10209,6 +10243,19 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         let resid_raised = match resid_exec {
             ResidualExecOutcome::Executed(result) => result.is_err(),
             ResidualExecOutcome::Declined(cause) => {
+                // The call op is already recorded. A symbolic fnaddr decline
+                // must not leave it: the backend emits a call to the hash.
+                // Cut back to the position taken before the record, then
+                // abort this walk so the result box is not used.
+                if cause == ResidualDecline::Symbolic
+                    && let Some(addr) = recorded_symbolic_funcptr(ctx, &allboxes)
+                {
+                    ctx.trace_ctx.cut_trace_with_snapshots(patch_pos);
+                    return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
+                        pc: op.pc,
+                        symbolic: addr,
+                    });
+                }
                 fbw_abort_nested_unjournaled_residual(ctx, op.pc, Some(cause))?;
                 fbw_mark_unjournaled_effect(cause);
                 false
@@ -10517,6 +10564,19 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
         let resid_raised = match resid_exec {
             ResidualExecOutcome::Executed(result) => result.is_err(),
             ResidualExecOutcome::Declined(cause) => {
+                // The call op is already recorded. A symbolic fnaddr decline
+                // must not leave it: the backend emits a call to the hash.
+                // Cut back to the position taken before the record, then
+                // abort this walk so the result box is not used.
+                if cause == ResidualDecline::Symbolic
+                    && let Some(addr) = recorded_symbolic_funcptr(ctx, &allboxes)
+                {
+                    ctx.trace_ctx.cut_trace_with_snapshots(patch_pos);
+                    return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
+                        pc: op.pc,
+                        symbolic: addr,
+                    });
+                }
                 fbw_abort_nested_unjournaled_residual(ctx, op.pc, Some(cause))?;
                 fbw_mark_unjournaled_effect(cause);
                 false
