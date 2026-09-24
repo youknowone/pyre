@@ -351,10 +351,34 @@ fn op_is_call(kind: &OpKind) -> bool {
     matches!(kind, OpKind::Call { .. } | OpKind::IndirectCall { .. })
 }
 
+fn call_keeps_void_receiver(kind: &OpKind) -> bool {
+    // `try_handle_jit_marker` treats `args[0]` as the driver and reads
+    // greens from the rest. Dropping the void receiver here makes `pc`
+    // look like the driver.
+    let leaf = match kind {
+        OpKind::Call {
+            target: CallTarget::Method { name, .. },
+            ..
+        } => name.as_str(),
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } => match segments.last() {
+            Some(leaf) => leaf.as_str(),
+            None => return false,
+        },
+        _ => return false,
+    };
+    matches!(leaf, "jit_merge_point" | "can_enter_jit" | "loop_header")
+}
+
 fn strip_void_call_operands(
     kind: &mut OpKind,
     is_void: &impl Fn(&crate::flowspace::model::Variable) -> bool,
 ) {
+    if call_keeps_void_receiver(kind) {
+        return;
+    }
     match kind {
         OpKind::Call { args, .. } => {
             args.retain(|arg| arg.as_variable().map(|var| !is_void(var)).unwrap_or(true));
@@ -370,6 +394,9 @@ fn strip_void_typed_call_args(graph: &mut FunctionGraph) {
     use crate::model::{ConcreteType, FunctionGraph};
     for block in &mut graph.blocks {
         for op in &mut block.operations {
+            if call_keeps_void_receiver(&op.kind) {
+                continue;
+            }
             match &mut op.kind {
                 OpKind::Call { args, .. } => {
                     args.retain(|arg| {
