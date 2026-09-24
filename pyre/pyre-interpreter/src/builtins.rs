@@ -24993,7 +24993,7 @@ mod tests {
         let err = parse_int_from_str(source, &text, 10).unwrap_err();
         assert_eq!(err.kind, crate::PyErrorKind::ValueError);
         assert!(
-            err.message
+            err.message_text()
                 .starts_with("invalid literal for int() with base 10:")
         );
     }
