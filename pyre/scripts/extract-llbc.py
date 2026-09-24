@@ -149,8 +149,12 @@ SPECS: dict[str, CrateSpec] = {
         # set this pass compiled that no artefact ever read. `full` is named
         # beside `{features}` because it is a default too, and dropping it
         # would extract a JIT artefact whose module surface is the core
-        # build's. The core driver replaces this spec and leaves `full` off.
-        cargo_args=["--no-default-features", "--features", "{features},full"],
+        # build's. It is named on the interpreter rather than on this crate:
+        # this crate's `full` also turns on `pyre-jit-trace/full`, which links
+        # `pyre-module` into that build script and so brings the host copy
+        # of the interpreter back. The core driver replaces this spec and
+        # leaves `full` off.
+        cargo_args=["--no-default-features", "--features", "{features},pyre-interpreter/full"],
         # No layout sidecar. A cross-target pass has to pass cargo
         # `--target`, and cargo then stops applying `RUSTFLAGS` to host
         # units — including `pyre-jit-trace`'s build script, which

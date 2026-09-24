@@ -17,9 +17,8 @@ export PYRE_JIT_CORE=1
 export LLBC_LAYOUT_TARGETS=
 export LLBC_DEST="$ROOT/build/llbc-jit-core"
 python3 pyre/scripts/extract-llbc.py majit-rlib pyre-object pyre-interpreter pyre-jit
-LLBC="$LLBC_DEST"
-export MAJIT_MIR_FRONTEND_LLBC="$LLBC/majit-rlib.ullbc:$LLBC/pyre-object.ullbc:$LLBC/pyre-interpreter.ullbc:$LLBC/pyre-jit.ullbc"
-export PYRE_LLBC_SKIP_FINGERPRINT_CHECK=1
+# Without `full`, `pyre-jit-trace`'s prepass reads this directory and checks
+# its stamps itself, and neither links nor hashes `pyre-module`.
 if [ "$MODE" = check ]; then
     exec cargo check -p pyrex --bin pyre-dynasm --no-default-features --features dynasm,mimalloc
 fi
