@@ -502,7 +502,7 @@ pub struct AssemblerARM64<'a> {
     /// of thousands of ops. The box→
     /// location map is a dict in the reference assembler; insertion order is
     /// preserved (no semantic change, only the lookup cost).
-    opref_to_slot: indexmap::IndexMap<OpRef, usize>,
+    opref_to_slot: indexmap::IndexMap<OpRef, usize, rustc_hash::FxBuildHasher>,
     /// Trace inputargs — borrowed for `opref_type` lookups.
     inputargs: &'a [InputArgRc],
     /// Trace operations — borrowed for `opref_type` lookups (reads
@@ -799,7 +799,7 @@ impl<'a> AssemblerARM64<'a> {
             header_pc,
             input_types: Vec::new(),
             bridge_input_locs: None,
-            opref_to_slot: indexmap::IndexMap::new(),
+            opref_to_slot: indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher),
             inputargs,
             operations,
             inputarg_pos,

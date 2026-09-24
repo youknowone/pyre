@@ -2518,23 +2518,42 @@ static THIN_STAMPED: std::sync::LazyLock<std::sync::Mutex<ThinStampedTable>> =
 static THIN_STAMPED_SLOTS: [std::sync::OnceLock<ThinStamped>; THIN_STAMPED_SLOT_COUNT] =
     [const { std::sync::OnceLock::new() }; THIN_STAMPED_SLOT_COUNT];
 
-static DESCR_VTABLES: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+/// Published vtable pointers. Slot `i` is stored with `Release` before
+/// `DESCR_VTABLE_LEN` advances to `i + 1`, and before `intern_descr_vtable`
+/// returns the id that a thin word can carry. `descr_vtable_at` loads the
+/// slot with `Acquire`, pairing with that `Release`, so the read does not
+/// rely on synchronization of the id word itself.
+static DESCR_VTABLE_SLOTS: [std::sync::atomic::AtomicUsize; 256] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 256];
+static DESCR_VTABLE_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static DESCR_VTABLE_INSERT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn intern_descr_vtable(vtable: usize) -> Option<u8> {
-    let mut v = DESCR_VTABLES.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(i) = v.iter().position(|&x| x == vtable) {
-        return u8::try_from(i).ok();
+    let n = DESCR_VTABLE_LEN.load(std::sync::atomic::Ordering::Acquire);
+    for i in 0..n {
+        if DESCR_VTABLE_SLOTS[i].load(std::sync::atomic::Ordering::Acquire) == vtable {
+            return Some(i as u8);
+        }
     }
-    if v.len() >= 256 {
+    let _guard = DESCR_VTABLE_INSERT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let n = DESCR_VTABLE_LEN.load(std::sync::atomic::Ordering::Acquire);
+    for i in 0..n {
+        if DESCR_VTABLE_SLOTS[i].load(std::sync::atomic::Ordering::Acquire) == vtable {
+            return Some(i as u8);
+        }
+    }
+    if n >= 256 {
         return None;
     }
-    v.push(vtable);
-    u8::try_from(v.len() - 1).ok()
+    DESCR_VTABLE_SLOTS[n].store(vtable, std::sync::atomic::Ordering::Release);
+    DESCR_VTABLE_LEN.store(n + 1, std::sync::atomic::Ordering::Release);
+    Some(n as u8)
 }
 
 fn descr_vtable_at(id: u8) -> usize {
-    let v = DESCR_VTABLES.lock().unwrap_or_else(|e| e.into_inner());
-    v[id as usize]
+    DESCR_VTABLE_SLOTS[id as usize].load(std::sync::atomic::Ordering::Acquire)
 }
 
 fn is_thin_descr(w: u64) -> bool {

@@ -34,6 +34,10 @@
 use indexmap::{IndexMap, IndexSet};
 use majit_ir::operand::Operand;
 use majit_ir::{GcRef, Op, OpCode, OpRc, OpRef};
+use rustc_hash::FxBuildHasher;
+
+type FxIndexMap<K, V> = IndexMap<K, V, FxBuildHasher>;
+type FxIndexSet<K> = IndexSet<K, FxBuildHasher>;
 
 use crate::optimizeopt::virtualstate::VirtualState;
 
@@ -467,26 +471,26 @@ pub struct ShortBoxes {
     /// position through `ctx.materialize_operand_at`, which memoizes one box
     /// per producer, so the same position yields the same object. Const
     /// results never key this map (they route to `const_short_boxes`).
-    potential_ops: IndexMap<majit_ir::operand::Operand, PotentialShortOp>,
+    potential_ops: FxIndexMap<majit_ir::operand::Operand, PotentialShortOp>,
     /// Mirrors `to_opref()` for every key ever inserted into `potential_ops`
     /// (which is insert-only; same-key overwrites keep the same opref), so
     /// membership equals the old linear scan `any(k.to_opref() == opref)`.
     /// Parity anchor: shortpreamble.py:290 `op in self.potential_ops` is
     /// dict membership.
-    potential_op_oprefs: IndexSet<OpRef>,
+    potential_op_oprefs: FxIndexSet<OpRef>,
     /// shortpreamble.py:250 self.produced_short_boxes = {}
     /// (insertion order preserved by IndexMap for deterministic export.)
     /// Keyed by the result Box (`shortop.res`), compared by object
     /// identity (shortpreamble.py:317/338) — lookups resolve their
     /// position through `ctx.materialize_operand_at`, which memoizes one
     /// box per producer, so the same position yields the same object.
-    produced_short_boxes: IndexMap<majit_ir::operand::Operand, ProducedShortOp>,
+    produced_short_boxes: FxIndexMap<majit_ir::operand::Operand, ProducedShortOp>,
     /// shortpreamble.py: const_short_boxes
     const_short_boxes: Vec<PreambleOp>,
     /// RPython shortpreamble.py: Const boxes are directly admissible in
     /// produce_arg(). majit models constants as OpRef entries in OptContext,
     /// so we track which OpRefs correspond to constants here.
-    known_constants: IndexSet<OpRef>,
+    known_constants: FxIndexSet<OpRef>,
     /// shortpreamble.py: short_inputargs
     ///
     /// shortpreamble.py `renamed = OpHelpers.inputarg_from_tp(box.type)`
@@ -517,7 +521,7 @@ pub struct ShortBoxes {
     /// for `materialize_one` recursion, keyed by the result Box
     /// (shortpreamble.py:314 `self.boxes_in_production[shortop.res]`).
     /// Active set is bounded by recursion depth (linear scan suffices).
-    boxes_in_production: IndexSet<majit_ir::operand::Operand>,
+    boxes_in_production: FxIndexSet<majit_ir::operand::Operand>,
     /// The number of label args.
     pub num_label_args: usize,
 }
@@ -603,15 +607,21 @@ impl ShortBoxes {
         // per label arg, then heap/pure candidates. Size the maps to
         // that first loop so the IndexMap table is not grown per box.
         ShortBoxes {
-            potential_ops: IndexMap::with_capacity(num_label_args),
-            potential_op_oprefs: IndexSet::with_capacity(num_label_args),
-            produced_short_boxes: IndexMap::with_capacity(num_label_args),
+            potential_ops: FxIndexMap::with_capacity_and_hasher(num_label_args, FxBuildHasher),
+            potential_op_oprefs: FxIndexSet::with_capacity_and_hasher(
+                num_label_args,
+                FxBuildHasher,
+            ),
+            produced_short_boxes: FxIndexMap::with_capacity_and_hasher(
+                num_label_args,
+                FxBuildHasher,
+            ),
             const_short_boxes: Vec::new(),
-            known_constants: IndexSet::new(),
+            known_constants: FxIndexSet::with_hasher(FxBuildHasher),
             short_inputargs: Vec::with_capacity(num_label_args),
             short_inputarg_refs: Vec::with_capacity(num_label_args),
             label_args: Vec::with_capacity(num_label_args),
-            boxes_in_production: IndexSet::new(),
+            boxes_in_production: FxIndexSet::with_hasher(FxBuildHasher),
             num_label_args,
         }
     }
@@ -871,13 +881,14 @@ impl ShortBoxes {
             // short_inputargs box for the slot (shortpreamble.py
             // `ShortInputArg(box, renamed)`), same as the
             // `produced_short_boxes` hit.
-            let produced = self.materialize_one(ctx, opref)?;
-            if produced.kind == PreambleOpKind::InputArg {
-                return Some(self.renamed_short_inputarg(produced.label_arg_idx));
+            let idx = self.materialize_one(ctx, opref)?;
+            let kind = self.produced_short_boxes[idx].kind.clone();
+            if kind == PreambleOpKind::InputArg {
+                let label_arg_idx = self.produced_short_boxes[idx].label_arg_idx;
+                return Some(self.renamed_short_inputarg(label_arg_idx));
             }
-            return Some(majit_ir::operand::Operand::from_bound_op(
-                &produced.preamble_op,
-            ));
+            let preamble_op = self.produced_short_boxes[idx].preamble_op.clone();
+            return Some(majit_ir::operand::Operand::from_bound_op(&preamble_op));
         }
         // shortpreamble.py:295-296 `else: return None`. Every label arg is
         // registered as a ShortInputArg in `potential_ops`
@@ -911,16 +922,19 @@ impl ShortBoxes {
         index.unwrap_or(0)
     }
 
+    /// Index into `produced_short_boxes`. A hit returns that index; the
+    /// stored `ProducedShortOp` is not cloned. `shortpreamble.py`
+    /// `produce_arg` / `add_op_to_short` hand back the stored object.
     fn materialize_one(
         &mut self,
         ctx: &mut crate::optimizeopt::OptContext,
         result: OpRef,
-    ) -> Option<ProducedShortOp> {
+    ) -> Option<usize> {
         // shortpreamble.py add_op_to_short — guard, cycle set,
         // and final insert all key on `shortop.res` Box identity.
         let okey = ctx.materialize_operand_at(result);
-        if let Some(existing) = self.produced_short_boxes.get(&okey) {
-            return Some(existing.clone());
+        if let Some(idx) = self.produced_short_boxes.get_index_of(&okey) {
+            return Some(idx);
         }
         if self.boxes_in_production.contains(&okey) {
             return None;
@@ -934,8 +948,8 @@ impl ShortBoxes {
         let produced = candidate.add_op_to_short(self, ctx);
         self.boxes_in_production.swap_remove(&okey);
         let produced = produced?;
-        self.produced_short_boxes.insert(okey, produced.clone());
-        Some(produced)
+        let (idx, _) = self.produced_short_boxes.insert_full(okey, produced);
+        Some(idx)
     }
 
     /// shortpreamble.py: produced_short_boxes after add_op_to_short().
@@ -1380,7 +1394,7 @@ pub struct ProducedShortOp {
 /// in the imported short op. Mirrors the inline `imported_const_opref`
 /// closure inside the legacy `import_short_preamble_ops` (`unroll.rs`).
 fn imported_const_opref(
-    imported_constants: &mut indexmap::IndexMap<OpRef, OpRef>,
+    imported_constants: &mut FxIndexMap<OpRef, OpRef>,
     source: OpRef,
     value: &majit_ir::Value,
 ) -> OpRef {
@@ -1418,8 +1432,8 @@ pub(crate) fn classify_short_arg(
     arg: OpRef,
     short_inputargs: &[OpRef],
     short_args: &[OpRef],
-    produced_results: &indexmap::IndexMap<OpRef, OpRef>,
-    imported_constants: &mut indexmap::IndexMap<OpRef, OpRef>,
+    produced_results: &FxIndexMap<OpRef, OpRef>,
+    imported_constants: &mut FxIndexMap<OpRef, OpRef>,
 ) -> Option<crate::optimizeopt::ImportedShortPureArg> {
     if let Some(slot) = short_inputargs.iter().position(|i| *i == arg) {
         return short_args
@@ -1485,9 +1499,9 @@ impl ProducedShortOp {
         >,
         short_inputargs: &[OpRef],
         short_args: &[OpRef],
-        result_map: &indexmap::IndexMap<OpRef, OpRef>,
-        produced_results: &mut indexmap::IndexMap<OpRef, OpRef>,
-        imported_constants: &mut indexmap::IndexMap<OpRef, OpRef>,
+        result_map: &FxIndexMap<OpRef, OpRef>,
+        produced_results: &mut FxIndexMap<OpRef, OpRef>,
+        imported_constants: &mut FxIndexMap<OpRef, OpRef>,
     ) -> Option<OpRef> {
         let result = match self.kind {
             PreambleOpKind::Pure => self.produce_pure(
@@ -1553,9 +1567,9 @@ impl ProducedShortOp {
         ctx: &mut crate::optimizeopt::OptContext,
         short_inputargs: &[OpRef],
         short_args: &[OpRef],
-        result_map: &indexmap::IndexMap<OpRef, OpRef>,
-        produced_results: &mut indexmap::IndexMap<OpRef, OpRef>,
-        imported_constants: &mut indexmap::IndexMap<OpRef, OpRef>,
+        result_map: &FxIndexMap<OpRef, OpRef>,
+        produced_results: &mut FxIndexMap<OpRef, OpRef>,
+        imported_constants: &mut FxIndexMap<OpRef, OpRef>,
     ) -> Option<OpRef> {
         let source = self.preamble_op.pos().get();
         // Result OpRef was fixed before ShortPreambleBuilder construction,
@@ -1717,9 +1731,9 @@ impl ProducedShortOp {
         >,
         short_inputargs: &[OpRef],
         short_args: &[OpRef],
-        result_map: &indexmap::IndexMap<OpRef, OpRef>,
-        produced_results: &indexmap::IndexMap<OpRef, OpRef>,
-        imported_constants: &mut indexmap::IndexMap<OpRef, OpRef>,
+        result_map: &FxIndexMap<OpRef, OpRef>,
+        produced_results: &FxIndexMap<OpRef, OpRef>,
+        imported_constants: &mut FxIndexMap<OpRef, OpRef>,
     ) -> Option<OpRef> {
         let source = self.preamble_op.pos().get();
         let result_type = self.preamble_op.result_type();
@@ -1855,9 +1869,9 @@ impl ProducedShortOp {
         >,
         short_inputargs: &[OpRef],
         short_args: &[OpRef],
-        result_map: &indexmap::IndexMap<OpRef, OpRef>,
-        produced_results: &indexmap::IndexMap<OpRef, OpRef>,
-        imported_constants: &mut indexmap::IndexMap<OpRef, OpRef>,
+        result_map: &FxIndexMap<OpRef, OpRef>,
+        produced_results: &FxIndexMap<OpRef, OpRef>,
+        imported_constants: &mut FxIndexMap<OpRef, OpRef>,
     ) -> Option<OpRef> {
         let source = self.preamble_op.pos().get();
         let result_type = self.preamble_op.result_type();
@@ -1996,9 +2010,9 @@ impl ProducedShortOp {
         ctx: &mut crate::optimizeopt::OptContext,
         short_inputargs: &[OpRef],
         short_args: &[OpRef],
-        result_map: &indexmap::IndexMap<OpRef, OpRef>,
-        produced_results: &indexmap::IndexMap<OpRef, OpRef>,
-        imported_constants: &mut indexmap::IndexMap<OpRef, OpRef>,
+        result_map: &FxIndexMap<OpRef, OpRef>,
+        produced_results: &FxIndexMap<OpRef, OpRef>,
+        imported_constants: &mut FxIndexMap<OpRef, OpRef>,
     ) -> Option<OpRef> {
         let source = self.preamble_op.pos().get();
         let result_type = self.preamble_op.result_type();
@@ -2044,7 +2058,7 @@ impl ProducedShortOp {
 #[derive(Clone, Debug, Default)]
 struct AbstractShortPreambleBuilderState {
     short: Vec<majit_ir::OpRc>,
-    short_results: IndexSet<OpRef>,
+    short_results: FxIndexSet<OpRef>,
     used_boxes: Vec<OpRef>,
     short_preamble_jump: Vec<majit_ir::OpRc>,
     extra_same_as: Vec<Op>,
@@ -2054,7 +2068,7 @@ struct AbstractShortPreambleBuilderState {
     short_inputargs: Vec<OpRef>,
     /// Known constant OpRefs. In RPython, isinstance(box, Const) is a type
     /// check. In majit, constant OpRefs must be explicitly tracked.
-    known_constants: IndexSet<OpRef>,
+    known_constants: FxIndexSet<OpRef>,
     /// Canonical dedup for `record_imported_preamble_use`, keyed by
     /// `replay_op.pos` (a stable proxy for `self.res`).  Two independent
     /// paths reach the same replay op — `record_preamble_use` and
@@ -2062,7 +2076,7 @@ struct AbstractShortPreambleBuilderState {
     /// one slot regardless of how it is reached, so the dedup prevents
     /// either path from pushing the same RPython Box twice into
     /// `used_boxes` / `short_preamble_jump` / `extra_same_as`.
-    recorded_canonical_results: IndexSet<OpRef>,
+    recorded_canonical_results: FxIndexSet<OpRef>,
 }
 
 impl AbstractShortPreambleBuilderState {
@@ -2159,7 +2173,7 @@ impl AbstractShortPreambleBuilderState {
     fn use_box(
         &mut self,
         preamble_op: &majit_ir::OpRc,
-        already_in_short: &IndexSet<OpRef>,
+        already_in_short: &FxIndexSet<OpRef>,
         arg_guards: &[Op],
         result_guards: &[Op],
     ) -> Op {
@@ -2300,7 +2314,7 @@ pub struct ShortPreambleBuilder {
     /// the dual key compensated for, so the two entries collapse to one. The
     /// PYRE_S8B_HARNESS census measured this lookup agreeing with the former
     /// position key on every live firing across the bench corpus.
-    produced_short_boxes: IndexMap<majit_ir::operand::Operand, ProducedShortOp>,
+    produced_short_boxes: FxIndexMap<majit_ir::operand::Operand, ProducedShortOp>,
 }
 
 impl ShortPreambleBuilder {
@@ -2309,7 +2323,8 @@ impl ShortPreambleBuilder {
         short_boxes: &[(majit_ir::operand::Operand, ProducedShortOp)],
         short_inputargs: &[OpRef],
     ) -> Self {
-        let mut produced_short_boxes = IndexMap::with_capacity(short_boxes.len());
+        let mut produced_short_boxes =
+            FxIndexMap::with_capacity_and_hasher(short_boxes.len(), FxBuildHasher);
         for (k, v) in short_boxes {
             // shortpreamble.py: __init__ plants
             // `preamble_op.set_forwarded(info)` on every replay op. The
@@ -2361,7 +2376,7 @@ impl ShortPreambleBuilder {
     fn use_box_recursive(
         &mut self,
         result: &majit_ir::operand::Operand,
-        visiting: &mut IndexSet<majit_ir::operand::Operand>,
+        visiting: &mut FxIndexSet<majit_ir::operand::Operand>,
     ) -> Option<majit_ir::OpRc> {
         let produced = self.produced_short_boxes.get(result)?.clone();
         let canonical_result = produced.preamble_op.pos().get();
@@ -2398,7 +2413,7 @@ impl ShortPreambleBuilder {
     /// Recursive `ShortPreambleBuilder.add_op_to_short`, used during
     /// export-time create_short_boxes to resolve transitive dependencies.
     pub fn add_op_to_short(&mut self, result: &majit_ir::operand::Operand) -> Option<Op> {
-        self.use_box_recursive(result, &mut IndexSet::new())
+        self.use_box_recursive(result, &mut FxIndexSet::with_hasher(FxBuildHasher))
             .map(|op| (*op).clone())
     }
 
@@ -2421,8 +2436,12 @@ impl ShortPreambleBuilder {
         // `produce_arg` results, and `make_guards` was called on this same
         // op, so guard args name the replay result. No second lookup.
         let _ = source;
-        self.state
-            .use_box(preamble_op, &IndexSet::new(), arg_guards, result_guards);
+        self.state.use_box(
+            preamble_op,
+            &FxIndexSet::with_hasher(FxBuildHasher),
+            arg_guards,
+            result_guards,
+        );
     }
 
     /// shortpreamble.py:284-285 `op in self.produced_short_boxes`.
@@ -2580,14 +2599,14 @@ pub struct ExtendedShortPreambleBuilder {
     /// over the full bench corpus — measured. A #146 operand re-key here is
     /// therefore unverifiable (the gate cannot exercise the silent-miss
     /// surface), like the deferred vectorizer maps.
-    produced_short_boxes: IndexMap<OpRef, ProducedShortOp>,
+    produced_short_boxes: FxIndexMap<OpRef, ProducedShortOp>,
     short_inputargs: Vec<OpRef>,
     /// shortpreamble.py setup: self.short = short — single ops list (base + JUMP sentinel)
     short: Vec<Op>,
     /// Tracks which OpRefs are already in `short` (for dedup).
-    short_results: IndexSet<OpRef>,
+    short_results: FxIndexSet<OpRef>,
     /// Constants tracked for RPython isinstance(arg, Const) checks.
-    known_constants: IndexSet<OpRef>,
+    known_constants: FxIndexSet<OpRef>,
     extra_same_as: Vec<Op>,
     short_preamble_jump: Vec<majit_ir::OpRc>,
     base_extra_same_as: Vec<Op>,
@@ -2600,14 +2619,14 @@ pub struct ExtendedShortPreambleBuilder {
     /// `setup()` insertion (the mapping values in unroll.py:396 are the
     /// jump-arg Box objects themselves), so the remap `setarg` writes
     /// produce live-tracking bound operands instead of frozen positions.
-    phase1_to_inputarg: indexmap::IndexMap<OpRef, majit_ir::operand::Operand>,
+    phase1_to_inputarg: FxIndexMap<OpRef, majit_ir::operand::Operand>,
     /// Canonical dedup keyed by `produced.preamble_op.pos`. Mirrors
     /// `AbstractShortPreambleBuilderState.recorded_canonical_results` —
     /// `produced_short_boxes` carries dual entries (source-key plus
     /// result_opref-key) for the same RPython Box, so per-key dedup
     /// (`label_args` etc.) cannot catch a second add via the alternate
     /// key. RPython's Box identity collapses both paths to one entry.
-    recorded_canonical_results: IndexSet<OpRef>,
+    recorded_canonical_results: FxIndexSet<OpRef>,
 }
 
 impl ExtendedShortPreambleBuilder {
@@ -2620,7 +2639,7 @@ impl ExtendedShortPreambleBuilder {
             }
         }
 
-        fn visit_opref_set(set: &mut IndexSet<OpRef>, visitor: &mut dyn FnMut(&mut GcRef)) {
+        fn visit_opref_set(set: &mut FxIndexSet<OpRef>, visitor: &mut dyn FnMut(&mut GcRef)) {
             let refs: Vec<OpRef> = set.iter().copied().collect();
             set.clear();
             for mut r in refs {
@@ -2673,7 +2692,10 @@ impl ExtendedShortPreambleBuilder {
             // res Box (#146); this builder keys by `preamble_op.pos` (the
             // assert in `ensure_dep_from_produced`), so re-key on copy.
             produced_short_boxes: {
-                let mut m = indexmap::IndexMap::with_capacity(sb.produced_short_boxes.len());
+                let mut m = FxIndexMap::with_capacity_and_hasher(
+                    sb.produced_short_boxes.len(),
+                    FxBuildHasher,
+                );
                 for (_, p) in sb.produced_short_boxes.iter() {
                     m.insert(p.preamble_op.pos().get(), p.clone());
                 }
@@ -2681,8 +2703,8 @@ impl ExtendedShortPreambleBuilder {
             },
             short_inputargs: sb.short_inputargs().to_vec(),
             short: Vec::new(),
-            short_results: IndexSet::new(),
-            known_constants: IndexSet::new(),
+            short_results: FxIndexSet::with_hasher(FxBuildHasher),
+            known_constants: FxIndexSet::with_hasher(FxBuildHasher),
             extra_same_as: sb.extra_same_as().to_vec(),
             short_preamble_jump: Vec::new(),
             base_extra_same_as: sb.extra_same_as().to_vec(),
@@ -2690,8 +2712,8 @@ impl ExtendedShortPreambleBuilder {
             used_boxes: Vec::new(),
             short_jump_args: Vec::new(),
             target_token,
-            phase1_to_inputarg: indexmap::IndexMap::new(),
-            recorded_canonical_results: IndexSet::new(),
+            phase1_to_inputarg: FxIndexMap::with_hasher(FxBuildHasher),
+            recorded_canonical_results: FxIndexSet::with_hasher(FxBuildHasher),
         }
     }
 
@@ -2763,8 +2785,8 @@ impl ExtendedShortPreambleBuilder {
         // Instead, remap on-the-fly when reading from produced_short_boxes.
 
         // Build single short list with inline dep resolution.
-        let inputargs_set: IndexSet<OpRef> = label_args.iter().copied().collect();
-        let constants_set: IndexSet<u32> = short_preamble.constants.keys().copied().collect();
+        let inputargs_set: FxIndexSet<OpRef> = label_args.iter().copied().collect();
+        let constants_set: FxIndexSet<u32> = short_preamble.constants.keys().copied().collect();
         self.short.clear();
         self.short_results.clear();
         for entry in &short_preamble.ops {
@@ -2965,8 +2987,8 @@ impl ExtendedShortPreambleBuilder {
     fn insert_dep_recursive(
         &mut self,
         arg: OpRef,
-        inputargs_set: &IndexSet<OpRef>,
-        constants_set: &IndexSet<u32>,
+        inputargs_set: &FxIndexSet<OpRef>,
+        constants_set: &FxIndexSet<u32>,
     ) -> bool {
         // history.py/268/314 inline-Const variants short-circuit
         // before `arg.raw()` (which panics on inline) — covered by
@@ -3049,7 +3071,7 @@ impl ExtendedShortPreambleBuilder {
         true
     }
 
-    fn use_box_recursive(&mut self, result: OpRef, visiting: &mut IndexSet<OpRef>) -> Option<Op> {
+    fn use_box_recursive(&mut self, result: OpRef, visiting: &mut FxIndexSet<OpRef>) -> Option<Op> {
         let produced = self.produced_short_boxes.get(&result)?.clone();
         let canonical_result = produced.preamble_op.pos().get();
         if self.short_results.contains(&canonical_result) {
@@ -3203,7 +3225,7 @@ impl ExtendedShortPreambleBuilder {
 
     /// shortpreamble.py: add_op_to_short — recursive, export-time.
     pub fn add_op_to_short(&mut self, result: OpRef) -> Option<Op> {
-        self.use_box_recursive(result, &mut IndexSet::new())
+        self.use_box_recursive(result, &mut FxIndexSet::with_hasher(FxBuildHasher))
     }
 
     /// Remap a preamble op's args using phase1_to_inputarg (on-the-fly, no mutation).
@@ -3368,7 +3390,7 @@ fn build_from_preamble_and_label(
     exported_state: Option<VirtualState>,
 ) -> ShortPreamble {
     let mut builder = CollectedShortPreambleBuilder::new();
-    let mut included_ovf_positions = IndexSet::new();
+    let mut included_ovf_positions = FxIndexSet::with_hasher(FxBuildHasher);
     // Record all preamble ops
     for (idx, op) in preamble_ops.iter().enumerate() {
         if op.opcode.is_guard() {
@@ -3415,7 +3437,7 @@ pub(crate) fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
     // Pure ops whose results are used as label args must also be replayed
     // (e.g., GETFIELD from preamble that feeds into loop body).
     let mut entries = Vec::new();
-    let mut included_positions = IndexSet::new();
+    let mut included_positions = FxIndexSet::with_hasher(FxBuildHasher);
     for (idx, op) in peeled_ops[..label_pos].iter().enumerate() {
         let mut included_overflow_producer = false;
         if op.opcode.is_guard_overflow() && idx > 0 {

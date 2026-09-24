@@ -275,7 +275,7 @@ pub struct LifetimeManager {
     // while keeping the insertion-ordered iteration `IndexMap` provided.
     lifetimes: indexmap::IndexMap<OpRef, Lifetime, FxBuildHasher>,
     /// regalloc.py maps register → FixedRegisterPositions
-    pub fixed_register_use: IndexMap<RegLoc, FixedRegisterPositions>,
+    pub fixed_register_use: IndexMap<RegLoc, FixedRegisterPositions, FxBuildHasher>,
 }
 
 impl Default for LifetimeManager {
@@ -288,14 +288,14 @@ impl LifetimeManager {
     pub fn new() -> Self {
         LifetimeManager {
             lifetimes: indexmap::IndexMap::default(),
-            fixed_register_use: IndexMap::new(),
+            fixed_register_use: IndexMap::with_hasher(FxBuildHasher),
         }
     }
 
     pub fn with_capacity(n: usize) -> Self {
         LifetimeManager {
             lifetimes: indexmap::IndexMap::with_capacity_and_hasher(n, Default::default()),
-            fixed_register_use: IndexMap::new(),
+            fixed_register_use: IndexMap::with_hasher(FxBuildHasher),
         }
     }
 
@@ -2068,7 +2068,7 @@ impl<'a> RegAlloc<'a> {
 
     /// x86/regalloc.py _update_bindings — bind bridge inputargs to their locations.
     fn _update_bindings(&mut self, locs: &[Loc], inputargs: &[InputArgRc]) {
-        let mut used: IndexMap<RegLoc, ()> = IndexMap::new();
+        let mut used: IndexMap<RegLoc, (), FxBuildHasher> = IndexMap::with_hasher(FxBuildHasher);
 
         // x86/regalloc.py:295-312
         for (iarg, loc) in inputargs.iter().zip(locs.iter()) {

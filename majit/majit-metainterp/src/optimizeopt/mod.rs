@@ -4026,8 +4026,8 @@ impl OptContext {
         short_args: &[OpRef],
         short_inputargs: &[OpRef],
         short_boxes: &[(OpRef, crate::optimizeopt::shortpreamble::ProducedShortOp)],
-        result_map: &indexmap::IndexMap<OpRef, OpRef>,
-        mut imported_constants: &mut indexmap::IndexMap<OpRef, OpRef>,
+        result_map: &indexmap::IndexMap<OpRef, OpRef, rustc_hash::FxBuildHasher>,
+        mut imported_constants: &mut indexmap::IndexMap<OpRef, OpRef, rustc_hash::FxBuildHasher>,
         exported_infos: &indexmap::IndexMap<
             majit_ir::operand::Operand,
             crate::optimizeopt::info::OpInfo,
@@ -4103,7 +4103,8 @@ impl OptContext {
         let mut produced: Vec<(OpRef, ProducedShortOp)> = Vec::with_capacity(short_boxes.len());
         let mut builder_entries: Vec<(majit_ir::operand::Operand, ProducedShortOp)> =
             Vec::with_capacity(short_boxes.len());
-        let mut produced_results: indexmap::IndexMap<OpRef, OpRef> = indexmap::IndexMap::new();
+        let mut produced_results: indexmap::IndexMap<OpRef, OpRef, rustc_hash::FxBuildHasher> =
+            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
         // shortpreamble.py:PreambleOp.add_op_to_short — Pure ops whose
         // opcode is a Call get rewritten to the CallPure* equivalent so
         // the short preamble can replay the cached call without
@@ -4135,24 +4136,29 @@ impl OptContext {
         // also dispatches via `classify_short_arg`) keeps the two consume
         // sites locked to a single rule, mirroring RPython's single
         // `produce_arg` path.
-        let resolve_arg = |arg: OpRef,
-                           ctx: &mut Self,
-                           produced_results: &indexmap::IndexMap<OpRef, OpRef>,
-                           imported_constants: &mut indexmap::IndexMap<OpRef, OpRef>|
-         -> Option<OpRef> {
-            crate::optimizeopt::shortpreamble::classify_short_arg(
-                ctx,
-                arg,
-                short_inputargs,
-                short_args,
-                produced_results,
-                imported_constants,
-            )
-            .map(|cls| match cls {
-                crate::optimizeopt::ImportedShortPureArg::OpRef(r) => r,
-                crate::optimizeopt::ImportedShortPureArg::Const(_, r) => r,
-            })
-        };
+        let resolve_arg =
+            |arg: OpRef,
+             ctx: &mut Self,
+             produced_results: &indexmap::IndexMap<OpRef, OpRef, rustc_hash::FxBuildHasher>,
+             imported_constants: &mut indexmap::IndexMap<
+                OpRef,
+                OpRef,
+                rustc_hash::FxBuildHasher,
+            >|
+             -> Option<OpRef> {
+                crate::optimizeopt::shortpreamble::classify_short_arg(
+                    ctx,
+                    arg,
+                    short_inputargs,
+                    short_args,
+                    produced_results,
+                    imported_constants,
+                )
+                .map(|cls| match cls {
+                    crate::optimizeopt::ImportedShortPureArg::OpRef(r) => r,
+                    crate::optimizeopt::ImportedShortPureArg::Const(_, r) => r,
+                })
+            };
         // shortpreamble.py produce_arg object-carry: a dependency
         // arg is the dep's replay op OBJECT (upstream returns
         // `produced_short_boxes[op].preamble_op`). Bind dep args to the

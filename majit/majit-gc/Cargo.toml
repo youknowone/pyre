@@ -41,6 +41,7 @@ gc_box = []
 [dependencies]
 bitflags = { workspace = true }
 indexmap = { workspace = true }
+rustc-hash = { workspace = true }
 libc = { workspace = true }
 majit-ir = { workspace = true }
 parking_lot = { workspace = true }

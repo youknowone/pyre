@@ -18,9 +18,14 @@ use majit_ir::operand::Operand;
 use majit_ir::resoperation::{Op, OpCode, OpRc, OpRef};
 use majit_ir::{Const, ConstMap, GcRef, Value};
 use std::borrow::Cow;
-use std::collections::HashSet;
 
 use crate::{GcRewriter, WriteBarrierDescr};
+use rustc_hash::FxBuildHasher;
+
+type FxIndexMap<K, V> = IndexMap<K, V, FxBuildHasher>;
+type FxIndexSet<K> = IndexSet<K, FxBuildHasher>;
+type FxHashMap<K, V> = std::collections::HashMap<K, V, FxBuildHasher>;
+type FxHashSet<T> = std::collections::HashSet<T, FxBuildHasher>;
 
 fn boehm_malloc_fn() -> Option<usize> {
     let addr = crate::malloc_fixedsize_addr();
@@ -93,10 +98,10 @@ fn mk_op_descr(opcode: OpCode, args: &[Operand], descr: DescrRef) -> Op {
 /// itself is then `None`, so follow the replacement first.
 fn rewrite_operand(
     operand: Operand,
-    defined: &HashSet<u32>,
+    defined: &FxHashSet<u32>,
     gcrefs: &mut Vec<GcRef>,
-    gcrefs_map: &mut IndexMap<usize, u32>,
-    recently_loaded: &mut IndexMap<u32, Operand>,
+    gcrefs_map: &mut FxIndexMap<usize, u32>,
+    recently_loaded: &mut FxIndexMap<u32, Operand>,
     next_pos: &mut u32,
     out: &mut Vec<Op>,
 ) -> Operand {
@@ -133,7 +138,7 @@ fn rewrite_operand(
 fn register_constptr(
     operand: &Operand,
     gcrefs: &mut Vec<GcRef>,
-    gcrefs_map: &mut IndexMap<usize, u32>,
+    gcrefs_map: &mut FxIndexMap<usize, u32>,
 ) {
     let Some(Value::Ref(gcref)) = operand.const_value() else {
         return;
@@ -151,8 +156,8 @@ fn register_constptr(
 fn intern_constptr_operand(
     operand: Operand,
     gcrefs: &mut Vec<GcRef>,
-    gcrefs_map: &mut IndexMap<usize, u32>,
-    recently_loaded: &mut IndexMap<u32, Operand>,
+    gcrefs_map: &mut FxIndexMap<usize, u32>,
+    recently_loaded: &mut FxIndexMap<u32, Operand>,
     next_pos: &mut u32,
     out: &mut Vec<Op>,
 ) -> Option<Operand> {
@@ -204,10 +209,10 @@ pub fn remove_ref_constants_for_inputs(
     // rewrite.py:352-354 `gcrefs_output_list` / `gcrefs_map` /
     // `gcrefs_recently_loaded`.
     let mut gcrefs: Vec<GcRef> = Vec::new();
-    let mut gcrefs_map: IndexMap<usize, u32> = IndexMap::default();
-    let mut recently_loaded: IndexMap<u32, Operand> = IndexMap::default();
+    let mut gcrefs_map: FxIndexMap<usize, u32> = IndexMap::default();
+    let mut recently_loaded: FxIndexMap<u32, Operand> = IndexMap::default();
     let mut out: Vec<Op> = Vec::with_capacity(ops.len());
-    let mut defined: HashSet<u32> = ops
+    let mut defined: FxHashSet<u32> = ops
         .iter()
         .filter_map(|op| {
             let pos = op.pos().get();
@@ -628,7 +633,7 @@ struct RewriteState<'a> {
     /// guard (rewrite.py:376-377), so scanning `out` for the producer made
     /// the GC rewrite quadratic in trace length.  Void results share
     /// `OpRef::NONE` and are not indexed.
-    out_by_pos: IndexMap<OpRef, majit_ir::OpRc>,
+    out_by_pos: FxIndexMap<OpRef, majit_ir::OpRc>,
     /// Next position index for emitted result ops that do not have an
     /// explicit source position to preserve.
     next_pos: u32,
@@ -654,17 +659,17 @@ struct RewriteState<'a> {
     /// whose write barrier has already been emitted (freshly allocated
     /// objects, or objects we already issued a WB for). Cleared whenever
     /// we emit an operation that can trigger a collection or on LABEL.
-    wb_applied: IndexSet<OpRef>,
+    wb_applied: FxIndexSet<OpRef>,
     /// Forwarding map from original result OpRefs to rewritten result boxes.
     /// Keyed lookup only (`resolve`/`record_result_mapping`), never iterated
     /// in order, so a hash map keeps the per-op resolve O(1) on long traces.
-    forwarding: std::collections::HashMap<OpRef, Operand>,
+    forwarding: FxHashMap<OpRef, Operand>,
 
     // ── Array length tracking (rewrite.py:59 _known_lengths) ──
     /// Maps array OpRef → known length. Populated when NEW_ARRAY has a
     /// constant length operand (rewrite.py:551). Cleared on LABEL
     /// (rewrite.py) and emitting_an_operation_that_can_collect.
-    known_lengths: IndexMap<OpRef, usize>,
+    known_lengths: FxIndexMap<OpRef, usize>,
 
     // ── Pending zero tracking ──
     /// Deferred ZERO_ARRAY ops that may be optimized away if subsequent
@@ -672,7 +677,7 @@ struct RewriteState<'a> {
     pending_zeros: Vec<PendingZero>,
     /// Tracks which array indices have been explicitly SET since the
     /// pending zero was recorded. Keyed by array OpRef index.
-    initialized_indices: IndexMap<OpRef, IndexSet<usize>>,
+    initialized_indices: FxIndexMap<OpRef, FxIndexSet<usize>>,
     /// rewrite.py `_delayed_zero_setfields = {}`.
     ///
     /// Map from base OpRef → set of byte-offsets of zero-init SETFIELD_GC
@@ -682,7 +687,7 @@ struct RewriteState<'a> {
     /// pending at the next can-collect / flush point is emitted as
     /// `GC_STORE(ptr, ofs, 0, WORD)` by `emit_pending_zeros`
     /// (rewrite.py:761-766).
-    _delayed_zero_setfields: IndexMap<OpRef, IndexSet<i64>>,
+    _delayed_zero_setfields: FxIndexMap<OpRef, FxIndexSet<i64>>,
 
     // ── INT_ADD/INT_SUB constant-fold tracking (rewrite.py:64) ──
     /// `_constant_additions[box]` = `(older_box, constant_add)` for an
@@ -697,7 +702,7 @@ struct RewriteState<'a> {
     /// ported.  The parity skeleton is kept here so the structural
     /// presence matches upstream and the consumer can be wired without
     /// re-introducing the field.
-    _constant_additions: IndexMap<OpRef, (Operand, i64)>,
+    _constant_additions: FxIndexMap<OpRef, (Operand, i64)>,
     /// Reserved next constant index in the passed-in constant namespace.
     /// Current GC-rewrite parity emits fresh `ConstInt` values inline
     /// (`history.py:227`) instead of allocating pool entries, so this is
@@ -715,7 +720,7 @@ struct RewriteState<'a> {
     /// input op list. The main dispatch loop checks for a substitution
     /// at iteration `i` and swaps the rewritten op in place of the
     /// original (rewrite.py:366-367).
-    changed_ops: IndexMap<usize, Op>,
+    changed_ops: FxIndexMap<usize, Op>,
 
     /// rewrite.py `get_box_replacement` — source→replacement mapping
     /// for ops that `transform_to_gc_load` has forwarded to a lowered
@@ -726,7 +731,7 @@ struct RewriteState<'a> {
     /// keyed by the main-loop iteration index (stashed in
     /// `current_i`) and consumed by `emit_maybe_forwarded` when the
     /// outer dispatch reaches the op's emission site.
-    forwarded_ops: IndexMap<usize, Op>,
+    forwarded_ops: FxIndexMap<usize, Op>,
     /// Current main-loop iteration index, set by the outer dispatch
     /// before invoking `transform_to_gc_load` / `handle_*` helpers.
     /// Read by `set_forwarded` / `emit_maybe_forwarded` to key the
@@ -740,14 +745,14 @@ struct RewriteState<'a> {
     gcrefs_output_list: Vec<GcRef>,
     /// rewrite.py:353 `gcrefs_map` — dedup map from a reference constant
     /// (keyed by `GcRef.0`) to its index in `gcrefs_output_list`.
-    gcrefs_map: IndexMap<usize, u32>,
+    gcrefs_map: FxIndexMap<usize, u32>,
     /// rewrite.py:354 `gcrefs_recently_loaded` — CSE cache from a gc_table
     /// index to the `LoadFromGcTable` result box already emitted in the
     /// current basic block. Reset at every Label (rewrite.py:1005). Reuse
     /// across a can-collect point is sound: the load result is a Ref box,
     /// so the register allocator keeps it in the GC map and the collector
     /// forwards the held copy.
-    gcrefs_recently_loaded: IndexMap<u32, Operand>,
+    gcrefs_recently_loaded: FxIndexMap<u32, Operand>,
 }
 
 impl<'a> RewriteState<'a> {
@@ -775,20 +780,20 @@ impl<'a> RewriteState<'a> {
             pending_malloc_total: 0,
             previous_size: 0,
             last_malloced_ref: Operand::none(),
-            wb_applied: IndexSet::new(),
-            forwarding: std::collections::HashMap::new(),
-            known_lengths: IndexMap::new(),
+            wb_applied: IndexSet::default(),
+            forwarding: FxHashMap::default(),
+            known_lengths: IndexMap::default(),
             pending_zeros: Vec::new(),
-            initialized_indices: IndexMap::new(),
-            _delayed_zero_setfields: IndexMap::new(),
-            _constant_additions: IndexMap::new(),
+            initialized_indices: IndexMap::default(),
+            _delayed_zero_setfields: IndexMap::default(),
+            _constant_additions: IndexMap::default(),
             next_const_idx,
-            changed_ops: IndexMap::new(),
-            forwarded_ops: IndexMap::new(),
+            changed_ops: IndexMap::default(),
+            forwarded_ops: IndexMap::default(),
             current_i: 0,
             gcrefs_output_list: Vec::new(),
-            gcrefs_map: IndexMap::new(),
-            gcrefs_recently_loaded: IndexMap::new(),
+            gcrefs_map: IndexMap::default(),
+            gcrefs_recently_loaded: IndexMap::default(),
         }
     }
 
@@ -1169,7 +1174,7 @@ impl<'a> RewriteState<'a> {
     /// rewrite.py `delayed_zero_setfields(op)` — get-or-create the
     /// per-base byte-offset set, resolving `r` through the forwarding
     /// map first (RPython calls `get_box_replacement(op)` here).
-    fn delayed_zero_setfields(&mut self, r: &Operand) -> &mut IndexSet<i64> {
+    fn delayed_zero_setfields(&mut self, r: &Operand) -> &mut FxIndexSet<i64> {
         let key = self.resolve(r.clone()).to_opref();
         self._delayed_zero_setfields.entry(key).or_default()
     }

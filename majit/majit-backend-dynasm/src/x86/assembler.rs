@@ -898,7 +898,7 @@ pub struct Assembler386<'a> {
 
     // ── State tracking for code generation ──
     /// Maps OpRef → jitframe slot index.
-    opref_to_slot: IndexMap<OpRef, usize>,
+    opref_to_slot: IndexMap<OpRef, usize, rustc_hash::FxBuildHasher>,
     /// Trace inputargs — borrowed for `opref_type` lookups.
     inputargs: &'a [InputArgRc],
     /// Trace operations — borrowed for `opref_type` lookups (reads
@@ -1194,7 +1194,7 @@ impl<'a> Assembler386<'a> {
             header_pc,
             input_types: Vec::new(),
             bridge_input_locs: None,
-            opref_to_slot: IndexMap::new(),
+            opref_to_slot: IndexMap::with_hasher(rustc_hash::FxBuildHasher),
             inputargs,
             operations,
             inputarg_pos,
