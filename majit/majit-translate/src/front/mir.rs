@@ -10019,10 +10019,15 @@ impl<'a> Lowering<'a> {
     /// A residual or `dont_look_inside` callee expects a real address for
     /// `&T`. A `repr(transparent)` scalar wrapper's borrow is the word, so
     /// passing it would hand that word to the callee as a pointer.
+    ///
+    /// Charon leaves the declaration generic (`monomorphize:false`), so
+    /// `fn f<T>(x: &T)` is a `TypeVar` and does not name the wrapper. The
+    /// operand's place type is the type the call actually passes.
     fn refuse_borrowed_transparent_scalar_residual(
         &self,
         mir_bb: usize,
         reg: &RegularCall,
+        arg_tys: &[Option<TyRef>],
     ) -> Result<(), LowerError> {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return Ok(());
@@ -10035,8 +10040,11 @@ impl<'a> Lowering<'a> {
         if !residual {
             return Ok(());
         }
-        for (index, ty) in fd.signature.inputs.iter().enumerate() {
-            if tyref_is_borrowed_transparent_scalar(ty, self.llbc, self.tombstoned_leaves) {
+        for (index, declared) in fd.signature.inputs.iter().enumerate() {
+            let passed = arg_tys.get(index).and_then(Option::as_ref);
+            if std::iter::once(declared).chain(passed).any(|ty| {
+                tyref_is_borrowed_transparent_scalar(ty, self.llbc, self.tombstoned_leaves)
+            }) {
                 return Err(LowerError::Unsupported(format!(
                     "bb{mir_bb}: residual `{}` argument {index} borrows a \
                      repr(transparent) scalar; the word is not an address",
@@ -10165,6 +10173,15 @@ impl<'a> Lowering<'a> {
                 },
                 Operand::Const(_) => None,
             })
+            .collect();
+        // Every argument's place type, captured before the operands are
+        // consumed. A residual `fn f<T>(x: &T)` keeps `T` as a `TypeVar`
+        // on the declaration (`monomorphize:false`); the place type is the
+        // type the call actually passes.
+        let call_arg_tys: Vec<Option<TyRef>> = call
+            .args
+            .iter()
+            .map(|op| operand_tyref(op).map(clone_tyref))
             .collect();
         // First argument's MIR-declared type, captured before the
         // operands are consumed — `reflexive_into_alias` compares it
@@ -13213,7 +13230,7 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 {
-                    self.refuse_borrowed_transparent_scalar_residual(mir_bb, &reg)?;
+                    self.refuse_borrowed_transparent_scalar_residual(mir_bb, &reg, &call_arg_tys)?;
                     // `jit::promote(x)` (and its `promote_string` /
                     // `promote_unicode` siblings) rewrites to the synthesised
                     // `hint_promote*` marker so the residual `OpKind::Call`
@@ -42995,6 +43012,179 @@ mod tests {
         assert_eq!(
             super::tyref_to_value_type(&borrowed, &llbc),
             crate::model::ValueType::Unsigned
+        );
+    }
+
+    /// `fn f<T>(x: &T)` stays generic on the declaration. The call
+    /// instantiates `T` with a `repr(transparent)` scalar wrapper, so the
+    /// residual must be refused; the same callee with a non-transparent
+    /// `T` still lowers.
+    #[test]
+    fn generic_residual_borrow_of_transparent_scalar_is_refused() {
+        let span = || {
+            serde_json::json!({"data": {
+                "file_id": 0,
+                "beg": {"line": 1, "col": 0},
+                "end": {"line": 1, "col": 1}
+            }})
+        };
+        let item_meta = |path: &[&str], is_local: bool| {
+            serde_json::json!({
+                "name": path
+                    .iter()
+                    .map(|segment| serde_json::json!({"Ident": [segment, 0]}))
+                    .collect::<Vec<_>>(),
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": is_local
+            })
+        };
+        let struct_decl = |def_id: u64, leaf: &str, transparent: bool| {
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": item_meta(&["fixture", leaf], true),
+                "kind": {"Struct": [{
+                    "name": null,
+                    "ty": {"Literal": {"Int": "I64"}},
+                    "attr_info": null
+                }]},
+                "layout": [{
+                    "key": "fixture-target",
+                    "value": {
+                        "size": 8,
+                        "align": 8,
+                        "variant_layouts": [{"field_offsets": [0]}],
+                        "repr": {"repr_algo": "Rust", "transparent": transparent}
+                    }
+                }]
+            })
+        };
+        let adt = |def_id: u64| {
+            serde_json::json!({
+                "Adt": {"id": {"Adt": def_id}, "generics": {"types": []}}
+            })
+        };
+        let borrowed =
+            |inner: serde_json::Value| serde_json::json!({"Ref": ["_", inner, "Shared"]});
+        let type_var = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+        let unit = serde_json::json!({"Tuple": []});
+        let caller = |def_id: u64, name: &str, type_arg: serde_json::Value| {
+            let arg_ty = borrowed(type_arg.clone());
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": item_meta(&["fixture", name], true),
+                "signature": {
+                    "is_unsafe": false,
+                    "inputs": [arg_ty.clone()],
+                    "output": unit.clone()
+                },
+                "body": {
+                    "Unstructured": {
+                        "span": span(),
+                        "locals": {
+                            "arg_count": 1,
+                            "locals": [
+                                {"index": 0, "name": null, "span": span(), "ty": unit.clone()},
+                                {"index": 1, "name": "value", "span": span(), "ty": arg_ty.clone()}
+                            ]
+                        },
+                        "body": [
+                            {
+                                "statements": [],
+                                "terminator": {
+                                    "span": span(),
+                                    "kind": {
+                                        "Call": {
+                                            "call": {
+                                                "func": {
+                                                    "Regular": {
+                                                        "kind": {"Fun": {"Regular": 2}},
+                                                        "generics": {
+                                                            "regions": [],
+                                                            "types": [type_arg],
+                                                            "const_generics": [],
+                                                            "trait_refs": []
+                                                        }
+                                                    }
+                                                },
+                                                "args": [{
+                                                    "Copy": {
+                                                        "kind": {"Local": 1},
+                                                        "ty": arg_ty.clone()
+                                                    }
+                                                }],
+                                                "dest": {"kind": {"Local": 0}, "ty": unit.clone()}
+                                            },
+                                            "target": 2,
+                                            "on_unwind": 1
+                                        }
+                                    }
+                                }
+                            },
+                            {
+                                "statements": [],
+                                "terminator": {"span": span(), "kind": "UnwindResume"}
+                            },
+                            {
+                                "statements": [],
+                                "terminator": {"span": span(), "kind": "Return"}
+                            }
+                        ]
+                    }
+                }
+            })
+        };
+        let callee = serde_json::json!({
+            "def_id": 2,
+            "item_meta": item_meta(&["fixture", "f"], false),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [borrowed(type_var)],
+                "output": unit
+            },
+            "body": "Opaque"
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [
+                    struct_decl(0, "Word", true),
+                    struct_decl(1, "Plain", false)
+                ],
+                "fun_decls": [
+                    caller(0, "pass_word", adt(0)),
+                    caller(1, "pass_plain", adt(1)),
+                    callee
+                ],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+
+        let refused = super::lower_function(&llbc, "pass_word")
+            .expect_err("borrow of a transparent scalar wrapper must be refused");
+        let refused = refused.to_string();
+        assert!(
+            refused.contains("repr(transparent) scalar"),
+            "refusal must name the scalar borrow, got {refused}"
+        );
+
+        let graph = super::lower_function(&llbc, "pass_plain")
+            .expect("a non-transparent T must still lower");
+        let ops = graph_ops(&graph);
+        assert!(
+            call_leafs(&ops).iter().any(|leaf| leaf == "f"),
+            "non-transparent instantiation must stay a residual call; ops={ops:?}"
         );
     }
 
