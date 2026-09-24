@@ -4122,10 +4122,9 @@ impl<S: JitState> JitDriver<S> {
                                 } else {
                                     crate::mc_diag_bump(67); // bridge_unattempted_close
                                 }
-                                if self.keep_tracing_after_declined_jump(
-                                    target_key,
-                                    &live_arg_boxes,
-                                ) {
+                                if self
+                                    .keep_tracing_after_declined_jump(target_key, &live_arg_boxes)
+                                {
                                     continue;
                                 }
                                 self.bridge_attempt_declined = true;
