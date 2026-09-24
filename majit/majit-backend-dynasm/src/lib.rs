@@ -703,9 +703,8 @@ fn handle_fail_resume_guard(
     // leave it null.
     //
     // The grab is read-only upstream; the additional clear below is pyre's,
-    // so the rooted local is the sole carrier for the rest of this function
-    // (the value is read back from `guard_exc_root`, never re-read from the
-    // slot).
+    // so the rooted local is the carrier for the blackhole arm. The bridge
+    // hook re-reads the slot, so the value is written back across that call.
     //
     // Clearing the slot drops the only GC root for the exception object
     // (`jf_guard_exc` is a GCREF visited by `jitframe_trace`).  The bridge
@@ -724,11 +723,13 @@ fn handle_fail_resume_guard(
     });
     // The blackhole receiver parks this same value in the metainterp's raw
     // guard-exception carrier as soon as it is entered, so across the
-    // `blackhole` call below the value is rooted twice over. Collapsing the
-    // pair onto the park alone is not reachable from here: this crate does not
-    // depend on `majit-metainterp`, and `BridgeFn` does not carry the
-    // exception, so the bridge hook cannot park a value it never receives.
-    // Either fix costs more machinery than the root pair it would delete.
+    // `blackhole` call below the value is rooted twice over. The bridge hook
+    // does not take the exception as an argument: `jit_ca_handle_guard_failure`
+    // re-reads `jf_guard_exc` (`llmodel.py grab_exc_value`). Clearing the slot
+    // before that read makes a `GUARD_EXCEPTION` failure look exception-free,
+    // so the bridge walk resumes the no-exception continuation and runs the
+    // already-executed call again. Put the grabbed value back for the read.
+    // The rooted local stays the carrier for the blackhole arm.
     let _guard_exc_scope = (guard_exc_root.0 != 0).then(|| {
         let slot = &mut guard_exc_root as *mut majit_ir::GcRef;
         unsafe { majit_gc::gc_add_root(slot) };
@@ -738,12 +739,18 @@ fn handle_fail_resume_guard(
     // compile.py `if must_compile and not stack_almost_full`.
     // Fail args stay in `jf_frame[]` (`llmodel.py get_int_value`).
     if let (Some(_jct), Some(bridge_fn)) = (owning_jct.as_ref(), CA_BRIDGE_FN.get()) {
-        if let Some(result) = bridge_fn(
+        if guard_exc_root.0 != 0 {
+            unsafe { (*frame_ptr).jf_guard_exc = guard_exc_root.0 };
+        }
+        let bridged = bridge_fn(
             frame_ptr,
             descr_raw,
             guard_value_operand.unwrap_or(0),
             guard_value_operand.is_some(),
-        ) {
+        );
+        // The blackhole arm below consumes `guard_exc_root`, not the slot.
+        unsafe { (*frame_ptr).jf_guard_exc = 0 };
+        if let Some(result) = bridged {
             return result;
         }
     }
