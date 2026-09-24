@@ -2963,7 +2963,7 @@ pub(crate) fn resolve_kwargs(
 /// `#[default]` values).  Excess positionals pack into the `*args` tuple
 /// when `varargname` is set; unmatched keywords pack into the `**kwargs`
 /// dict when `kwargname` is set, otherwise raise TypeError.
-pub(crate) fn bind_kwargs_to_signature(
+pub fn bind_kwargs_to_signature(
     sig: &crate::Signature,
     fname: &str,
     pos_args: &[PyObjectRef],

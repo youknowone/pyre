@@ -389,6 +389,7 @@ mod moved_type_tests {
 
     #[test]
     fn random_type_keeps_heaptype_flag_without_a_heap_owner() {
+        pyre_interpreter::typedef::init_typeobjects();
         let w_type = type_object();
         let flags = unsafe { pyre_object::w_type_get_flags(w_type) };
         let heaptype = pyre_object::typeobject::TpFlags::PY_TPFLAGS_HEAPTYPE.as_int();
