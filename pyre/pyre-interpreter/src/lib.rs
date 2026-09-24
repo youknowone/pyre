@@ -168,6 +168,7 @@ pub mod reduce_protocol;
 pub mod rsocket_rffi;
 pub mod runtime_ops;
 pub mod shared_opcode;
+pub mod shutdown;
 pub mod sliceobject;
 pub mod stack_check;
 pub mod syntax_warnings;
