@@ -16664,15 +16664,16 @@ impl CraneliftBackend {
                         &constants,
                         op.arg(0).to_opref(),
                     );
-                    let num_bits = resolve_opref(
+                    // The second operand is a byte width (`genop_int_signext`),
+                    // not a bit count. 4 sign-extends the low 32 bits.
+                    let num_bytes = resolve_opref(
                         &mut builder,
                         &opref_var_map,
                         &constants,
                         op.arg(1).to_opref(),
                     );
-
-                    // Sign extend from `num_bits` to 64 bits
-                    // shift left by (64 - num_bits), then arithmetic shift right by same
+                    let eight = builder.ins().iconst(cl_types::I64, 8);
+                    let num_bits = builder.ins().imul(num_bytes, eight);
                     let sixty_four = builder.ins().iconst(cl_types::I64, 64);
                     let shift = builder.ins().isub(sixty_four, num_bits);
                     let shifted_left = builder.ins().ishl(val, shift);

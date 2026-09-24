@@ -7256,6 +7256,21 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
         });
     }
 
+    // Exact `bytes`: `stringmethods.descr_getitem` / `_getitem_result`
+    // (`strgetitem` + `newint`).  No fold row — the reader is the body.
+    if unsafe {
+        pyre_object::bytesobject::is_bytes(list_obj)
+            && walker_exact_builtin_class(list_obj).is_some()
+    } {
+        if try_walker_orthodox_bytes_getitem(
+            ctx, op_pc, list_op, key_op, list_obj, key_obj, dst, dst_bank,
+        )?
+        .is_some()
+        {
+            return Ok(Some(()));
+        }
+    }
+
     // The `dict.lookup` gate.  Both `w_class` checks are load-bearing: a dict
     // SUBCLASS shares `ob_type == &DICT_TYPE` but retags `w_class` and reaches
     // `__missing__` on a miss, and a str SUBCLASS key may override `__hash__` /
@@ -7842,8 +7857,14 @@ pub(crate) fn try_walker_specialize_subscr_tuple<Sym: WalkSym>(
             return Ok(None);
         }
         let index = pyre_object::w_int_get_value(key_obj);
+        // Negative index is `w_tuple_getitem`'s adjust (`index + len`).
+        // The positive arm below is the constant-index fold; the negative
+        // arm records the reader so `wrappeditems[*]` loads as
+        // `getarrayitem_gc_pure_r` and a loop-invariant `c[-1]` hoists.
         if index < 0 {
-            return Ok(None);
+            return try_walker_orthodox_canonical_tuple_getitem(
+                ctx, op_pc, list_op, key_op, tuple_obj, key_obj, dst, dst_bank,
+            );
         }
         let concrete_len = pyre_object::w_tuple_len(tuple_obj);
         if index as usize >= concrete_len {
@@ -7908,6 +7929,104 @@ pub(crate) fn try_walker_specialize_subscr_tuple<Sym: WalkSym>(
         majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
     );
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
+    Ok(Some(()))
+}
+
+/// Descend `w_tuple_getitem` for a canonical tuple and a negative int key.
+/// The positive constant-index arm stays in [`try_walker_specialize_subscr_tuple`].
+/// An out-of-range key stays on the generic residual so the raising path
+/// is not what this loop records.
+fn try_walker_orthodox_canonical_tuple_getitem<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    seq_op: OpRef,
+    key_op: OpRef,
+    seq_obj: pyre_object::PyObjectRef,
+    key_obj: pyre_object::PyObjectRef,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if dst_bank != 'r' {
+        return Ok(None);
+    }
+    let raw_key = unsafe { pyre_object::w_int_get_value(key_obj) };
+    let len = unsafe { pyre_object::tupleobject::w_tuple_len(seq_obj) } as i64;
+    let index = raw_key + len;
+    if index < 0 || index >= len {
+        return Ok(None);
+    }
+    let Some(jc_arc) = crate::jitcode_runtime::tuple_getitem_jitcode() else {
+        return Ok(None);
+    };
+    let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
+        return Ok(None);
+    };
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() || unsafe { (&*sym_ptr).jitcode().is_null() } {
+        return Ok(None);
+    }
+    let sym = unsafe { &*sym_ptr };
+    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
+        return Ok(None);
+    };
+
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let tuple_type_addr = &pyre_object::pyobject::TUPLE_TYPE as *const _ as i64;
+    walker_guard_exact_w_class(
+        ctx,
+        op_pc,
+        seq_op,
+        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE),
+    )?;
+    if !seq_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(seq_op) {
+        let type_const = ctx.trace_ctx.const_int(tuple_type_addr);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[seq_op, type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+    }
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(seq_op, tuple_type_addr);
+    let (idx_type, idx_descr) = crate::state::int_or_bool_unbox_type_descr(key_obj);
+    let key_index = walker_unbox_int_typed(ctx, op_pc, key_op, idx_type, idx_descr)?;
+    ctx.trace_ctx
+        .set_opref_concrete(key_index, majit_ir::Value::Int(raw_key));
+    ctx.trace_ctx.set_opref_concrete(
+        seq_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(seq_obj as usize)),
+    );
+    let walk = run_orthodox_helper_subwalk(
+        ctx,
+        op_pc,
+        sym,
+        &sub_body,
+        nested_entry,
+        "canonical_tuple_neg_getitem_commit",
+        "w_tuple_getitem_call_site",
+        &[key_index],
+        &[ConcreteValue::Int(raw_key)],
+        &[seq_op],
+        &[ConcreteValue::Ref(seq_obj)],
+        &[],
+    );
+    let (walk_outcome, _) = match walk {
+        Ok(pair) => pair,
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+            if fbw_debug_abort_enabled() {
+                eprintln!("[decline-why] CANONICAL-TUPLE-NEG-SUBWALK pc={pc}");
+            }
+            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let result = match walk_outcome {
+        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
+            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+        _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
+    };
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
     Ok(Some(()))
 }
 
@@ -10333,17 +10452,13 @@ fn try_walker_orthodox_str_getitem<Sym: WalkSym>(
     if !unsafe { pyre_object::is_int(key_obj) } {
         return Ok(None);
     }
-    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(key_obj) {
-        // The fold emit is not tag-aware; the helper takes a machine
-        // index, but a tagged key has no header for the class guard
-        // the generated body does not emit.  Keep that shape on the
-        // residual until the tag-aware unbox is the body itself.
-        return Ok(None);
-    }
+    let tagged_key =
+        pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(key_obj);
     let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
     let raw_key = unsafe {
-        if !std::ptr::eq((*key_obj).ob_type, &pyre_object::pyobject::INT_TYPE)
-            || !std::ptr::eq((*key_obj).w_class, int_typeobj)
+        if !tagged_key
+            && (!std::ptr::eq((*key_obj).ob_type, &pyre_object::pyobject::INT_TYPE)
+                || !std::ptr::eq((*key_obj).w_class, int_typeobj))
         {
             return Ok(None);
         }
@@ -10381,9 +10496,11 @@ fn try_walker_orthodox_str_getitem<Sym: WalkSym>(
     let str_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE);
     walker_guard_class(ctx, op_pc, seq_op, str_type_addr)?;
     walker_guard_exact_w_class(ctx, op_pc, seq_op, str_typeobj)?;
-    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-    walker_guard_class(ctx, op_pc, key_op, int_type_addr)?;
-    walker_guard_exact_w_class(ctx, op_pc, key_op, int_typeobj)?;
+    if !tagged_key {
+        let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+        walker_guard_class(ctx, op_pc, key_op, int_type_addr)?;
+        walker_guard_exact_w_class(ctx, op_pc, key_op, int_typeobj)?;
+    }
     ctx.trace_ctx.set_opref_concrete(
         seq_op,
         majit_ir::Value::Ref(majit_ir::GcRef(seq_obj as usize)),
@@ -10411,6 +10528,117 @@ fn try_walker_orthodox_str_getitem<Sym: WalkSym>(
         Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
             if fbw_debug_abort_enabled() {
                 eprintln!("[decline-why] STR-GETITEM-SUBWALK pc={pc}");
+            }
+            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let result = match walk_outcome {
+        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
+            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+        _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
+    };
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+    Ok(Some(()))
+}
+
+/// Descend `baseobjspace::getitem_bytes_like` (`stringmethods.py descr_getitem`).
+/// The scalar arm is `strgetitem` plus `newint(ord)`.  A missing jitcode
+/// declines to the generic residual.
+fn try_walker_orthodox_bytes_getitem<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    seq_op: OpRef,
+    key_op: OpRef,
+    seq_obj: pyre_object::PyObjectRef,
+    key_obj: pyre_object::PyObjectRef,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if dst_bank != 'r' {
+        return Ok(None);
+    }
+    if !unsafe { pyre_object::is_int(key_obj) } {
+        return Ok(None);
+    }
+    let tagged_key =
+        pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(key_obj);
+    let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
+    let raw_key = unsafe {
+        if !tagged_key
+            && (!std::ptr::eq((*key_obj).ob_type, &pyre_object::pyobject::INT_TYPE)
+                || !std::ptr::eq((*key_obj).w_class, int_typeobj))
+        {
+            return Ok(None);
+        }
+        pyre_object::w_int_get_value(key_obj)
+    };
+    let len = unsafe { pyre_object::bytesobject::w_bytes_len(seq_obj) } as i64;
+    let index = if raw_key < 0 { raw_key + len } else { raw_key };
+    if index < 0 || index >= len {
+        return Ok(None);
+    }
+
+    let Some(jc_arc) = crate::jitcode_runtime::pathed_jitcode(
+        "pyre_interpreter::baseobjspace::getitem_bytes_like",
+    ) else {
+        return Ok(None);
+    };
+    let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
+        return Ok(None);
+    };
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() {
+        return Ok(None);
+    }
+    if unsafe { (&*sym_ptr).jitcode().is_null() } {
+        return Ok(None);
+    }
+    let sym = unsafe { &*sym_ptr };
+    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
+        return Ok(None);
+    };
+
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let bytes_type_addr = &pyre_object::bytesobject::BYTES_TYPE as *const _ as i64;
+    let bytes_typeobj =
+        pyre_object::pyobject::get_instantiate(&pyre_object::bytesobject::BYTES_TYPE);
+    walker_guard_class(ctx, op_pc, seq_op, bytes_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, seq_op, bytes_typeobj)?;
+    if !tagged_key {
+        let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+        walker_guard_class(ctx, op_pc, key_op, int_type_addr)?;
+        walker_guard_exact_w_class(ctx, op_pc, key_op, int_typeobj)?;
+    }
+    ctx.trace_ctx.set_opref_concrete(
+        seq_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(seq_obj as usize)),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        key_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(key_obj as usize)),
+    );
+    let walk = run_orthodox_helper_subwalk(
+        ctx,
+        op_pc,
+        sym,
+        &sub_body,
+        nested_entry,
+        "bytes_getitem_commit",
+        "getitem_bytes_call_site",
+        &[],
+        &[],
+        &[seq_op, key_op],
+        &[ConcreteValue::Ref(seq_obj), ConcreteValue::Ref(key_obj)],
+        &[],
+    );
+    let (walk_outcome, _) = match walk {
+        Ok(pair) => pair,
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+            if fbw_debug_abort_enabled() {
+                eprintln!("[decline-why] BYTES-GETITEM-SUBWALK pc={pc}");
             }
             ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
             ctx.trace_ctx.heap_cache_mut().reset();
@@ -21950,6 +22178,8 @@ fn try_walker_specialize_for_iter_list<Sym: WalkSym>(
         debug_assert!(pyre_object::is_exact_list(seq_obj));
         let sid = if pyre_object::w_list_uses_int_storage(seq_obj) {
             pyre_object::listobject::ListStrategy::Integer as i64
+        } else if pyre_object::w_list_uses_int_or_float_storage(seq_obj) {
+            pyre_object::listobject::ListStrategy::IntOrFloat as i64
         } else if pyre_object::w_list_uses_float_storage(seq_obj) {
             pyre_object::listobject::ListStrategy::Float as i64
         } else if pyre_object::w_list_uses_object_storage(seq_obj) {
@@ -21971,12 +22201,18 @@ fn try_walker_specialize_for_iter_list<Sym: WalkSym>(
         match (concrete_continues, sid) {
             (true, 1) => pyre_object::listobject::w_list_int_items_raw(seq_obj)
                 .map(|(items, _)| Value::Int(*items.add(index as usize))),
+            (true, 4) => {
+                let list = &*(seq_obj as *const pyre_object::listobject::W_ListObject);
+                Some(Value::Int(
+                    pyre_object::listobject::ll_list_int_getitem_fast(list, index as usize),
+                ))
+            }
             (true, 2) => pyre_object::listobject::w_list_float_items_raw(seq_obj)
                 .map(|(items, _)| Value::Float(*items.add(index as usize))),
             _ => None,
         }
     };
-    if concrete_continues && matches!(sid, 1 | 2) && raw_elem.is_none() {
+    if concrete_continues && matches!(sid, 1 | 2 | 4) && raw_elem.is_none() {
         return Ok(None);
     }
 
@@ -22024,10 +22260,10 @@ fn try_walker_specialize_for_iter_list<Sym: WalkSym>(
         .set_opref_concrete(index_op, Value::Int(pyre_object::seq_index_to_i64(index)));
 
     // Object storage keeps the inline `length` field; the typed storages read
-    // their own items-array length field.
+    // their own items-array length field. IntOrFloat shares the int block.
     let len_descr = match sid {
         0 => crate::descr::list_length_descr(),
-        1 => crate::descr::list_int_items_len_descr(),
+        1 | 4 => crate::descr::list_int_items_len_descr(),
         2 => crate::descr::list_float_items_len_descr(),
         _ => crate::descr::list_ascii_items_len_descr(),
     };
@@ -22102,6 +22338,52 @@ fn try_walker_specialize_for_iter_list<Sym: WalkSym>(
                 unreachable!("int storage stamps an Int")
             };
             walker_box_int(ctx, op_pc, raw, elem)?
+        }
+        4 => {
+            // IntOrFloatListStrategy.getitem: the array word is the
+            // nan-boxed longlong. Stamp that word on the load. The tag
+            // is `is_int32_from_longlong_nan` (arithmetic >> 32 == -2);
+            // an int decodes with signext of the low 32 bits, a float
+            // is `convert_longlong_bytes_to_float`.
+            let block = crate::state::opimpl_getfield_gc_r(
+                ctx.trace_ctx,
+                seq_op,
+                crate::descr::list_int_items_block_descr(),
+            );
+            let raw = crate::state::trace_int_block_getitem_value(ctx.trace_ctx, block, index_op);
+            let Value::Int(encoded) = raw_elem.expect("int-or-float storage read its raw element")
+            else {
+                unreachable!("int-or-float storage stamps an Int")
+            };
+            ctx.trace_ctx.set_opref_concrete(raw, Value::Int(encoded));
+            let thirty_two = ctx.trace_ctx.const_int(32);
+            let high = ctx
+                .trace_ctx
+                .record_op(OpCode::IntRshift, &[raw, thirty_two]);
+            let high_c = encoded >> 32;
+            ctx.trace_ctx.set_opref_concrete(high, Value::Int(high_c));
+            let tag = ctx.trace_ctx.const_int(-2);
+            let is_int = ctx.trace_ctx.record_op(OpCode::IntEq, &[high, tag]);
+            let is_int_c = i64::from(high_c == -2);
+            ctx.trace_ctx
+                .set_opref_concrete(is_int, Value::Int(is_int_c));
+            if is_int_c == 1 {
+                walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[is_int])?;
+                let width = ctx.trace_ctx.const_int(4);
+                let decoded = ctx.trace_ctx.record_op(OpCode::IntSignext, &[raw, width]);
+                let decoded_c = encoded as u32 as i32 as i64;
+                ctx.trace_ctx
+                    .set_opref_concrete(decoded, Value::Int(decoded_c));
+                walker_box_int(ctx, op_pc, decoded, decoded_c)?
+            } else {
+                walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[is_int])?;
+                let bits = ctx
+                    .trace_ctx
+                    .record_op(OpCode::ConvertLonglongBytesToFloat, &[raw]);
+                ctx.trace_ctx
+                    .set_opref_concrete(bits, Value::Float(f64::from_bits(encoded as u64)));
+                crate::state::wrapfloat(ctx.trace_ctx, bits)
+            }
         }
         2 => {
             let block = crate::state::opimpl_getfield_gc_r(

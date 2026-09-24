@@ -3533,7 +3533,8 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         // without a report here the helper that stopped the descent is
         // unnameable.
         if fbw_debug_abort_enabled() {
-            eprintln!("[subwalk-unsupported] pc={op_pc} {reason}={addr:#x}");
+            let path = majit_metainterp::resolve_symbolic_fnaddr_path(addr);
+            eprintln!("[subwalk-unsupported] pc={op_pc} {reason}={addr:#x} path={path:?}");
         }
         return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
             pc: op_pc,

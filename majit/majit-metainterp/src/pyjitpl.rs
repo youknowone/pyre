@@ -3054,7 +3054,7 @@ pub fn set_symbolic_fnaddr_path_resolver(hook: Option<SymbolicFnaddrPathResolver
     );
 }
 
-pub(crate) fn resolve_symbolic_fnaddr_path(fnaddr: i64) -> Option<&'static str> {
+pub fn resolve_symbolic_fnaddr_path(fnaddr: i64) -> Option<&'static str> {
     let hook = SYMBOLIC_FNADDR_PATH_RESOLVER.load(std::sync::atomic::Ordering::Acquire);
     if hook == 0 {
         return None;

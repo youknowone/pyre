@@ -595,6 +595,13 @@ pub struct Transformer<'a> {
         crate::flowspace::model::Variable,
         crate::flowspace::model::Variable,
     >,
+    /// Results of `getfield` on an `IR_IMMUTABLE_ARRAY` field, plus the
+    /// identity copies the items-base accessor and block phis make of them.
+    /// `rewrite_op_getarrayitem` marks a load of one of these pure.
+    /// The shared `object_ref_gcarray` type stays out of
+    /// `immutable_array_types`: list items use that same ARRAY identity
+    /// and must keep a non-pure descr.
+    immutable_array_bases: std::collections::HashSet<crate::flowspace::model::Variable>,
     /// Result of a `__fn_const` 0-arg Call rewritten to `ConstInt(fnaddr)`.
     /// `fn_const_target_for_var` reads the producer Call; after the rewrite
     /// that producer is gone, so later `conditional_call` / indirect-call
@@ -1633,6 +1640,7 @@ impl<'a> Transformer<'a> {
             vable_flags: std::collections::HashMap::new(),
             aliases: std::collections::HashMap::new(),
             cast_ptr_to_int_src: std::collections::HashMap::new(),
+            immutable_array_bases: std::collections::HashSet::new(),
             fn_const_results: std::collections::HashMap::new(),
             direct_ptradd_type_arg: None,
             notes: Vec::new(),
@@ -1719,6 +1727,7 @@ impl<'a> Transformer<'a> {
         // post-annotation, pre-rewrite — keeping the un-annotatable
         // `SpecTag` out of the annotator.
         fold_we_are_jitted_calls(&mut rewritten);
+        self.collect_immutable_array_bases(&rewritten);
 
         // Scalarise the front's iterator markers (`core::slice::iter`,
         // `__iter_next`, `__majit_range`) that only the lifted spine's
@@ -1748,6 +1757,83 @@ impl<'a> Transformer<'a> {
             vable_rewrites: self.vable_rewrites,
             calls_classified: self.calls_classified,
         }
+    }
+
+    /// Seed `immutable_array_bases` from `field[*]` reads.
+    ///
+    /// `rewrite_op_getarrayitem` uses `ARRAY._immutable_field(None)`.
+    /// The items ARRAY identity is shared with mutable list storage, so
+    /// purity is recovered from the producing `getfield` instead of the
+    /// type. `items_block_items_base` returns that same header pointer.
+    fn collect_immutable_array_bases(&mut self, graph: &crate::model::FunctionGraph) {
+        let Some(cc) = self.callcontrol.as_deref() else {
+            return;
+        };
+        let mut bases = std::collections::HashSet::new();
+        for block in &graph.blocks {
+            for op in &block.operations {
+                let (Some(result), crate::model::OpKind::FieldRead { field, .. }) =
+                    (&op.result, &op.kind)
+                else {
+                    continue;
+                };
+                let immutable_array = cc
+                    .field_immutability(field.owner_root.as_deref(), &field.name)
+                    .is_some_and(|rank| rank.is_array() && rank.is_immutable());
+                if immutable_array {
+                    bases.insert(result.clone());
+                }
+            }
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for block in &graph.blocks {
+                for op in &block.operations {
+                    let (Some(result), crate::model::OpKind::Call { target, args, .. }) =
+                        (&op.result, &op.kind)
+                    else {
+                        continue;
+                    };
+                    if !Self::call_target_is_items_block_accessor(target) {
+                        continue;
+                    }
+                    let Some(arg) = args.first().and_then(|arg| arg.as_variable()) else {
+                        continue;
+                    };
+                    if bases.contains(arg) && bases.insert(result.clone()) {
+                        changed = true;
+                    }
+                }
+                for (slot, input) in block.inputargs.iter().enumerate() {
+                    if bases.contains(input) {
+                        continue;
+                    }
+                    let mut preds = 0usize;
+                    let mut all_immutable = true;
+                    for src in &graph.blocks {
+                        for link in &src.exits {
+                            if link.target != block.id {
+                                continue;
+                            }
+                            preds += 1;
+                            let carried = link
+                                .args
+                                .get(slot)
+                                .and_then(|arg| arg.as_variable())
+                                .is_some_and(|var| bases.contains(var));
+                            if !carried {
+                                all_immutable = false;
+                            }
+                        }
+                    }
+                    if preds > 0 && all_immutable && bases.insert(input.clone()) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+        self.immutable_array_bases = bases;
     }
 
     /// RPython: Transformer.optimize_block()
@@ -4683,6 +4769,34 @@ impl<'a> Transformer<'a> {
         //                           [v_inst, descr, descr1], None),
         //            op1]       # op1 = getfield_*_pure
         // Mutable fields stay as plain `getfield_gc_*`.
+        // `ItemsBlock.capacity` is the GcArray length header (`len(items)`,
+        // rlist.py `_ll_list_resize_hint`). `list.obj_capacity` already
+        // lowers that word to `arraylen_gc`. A struct `getfield` of the same
+        // offset is not an always-pure opcode, so a tuple length read stays
+        // in the peeled loop. `TypedItemsBlock.capacity` is a different
+        // array and is left alone.
+        if field.name == "capacity"
+            && field
+                .owner_root
+                .as_deref()
+                .is_some_and(|owner| owner.rsplit("::").next() == Some("ItemsBlock"))
+        {
+            let OpKind::FieldRead { base, .. } = &op.kind else {
+                return RewriteResult::Keep;
+            };
+            self.notes.push(GraphTransformNote {
+                function: graph_name.to_string(),
+                detail: "rewrite: getfield(ItemsBlock.capacity) → arraylen_gc".to_string(),
+            });
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::ArrayLen {
+                    base: base.clone(),
+                    array_type_id: Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+                    nolength: false,
+                },
+            }]);
+        }
         let rank = self
             .callcontrol
             .as_deref()
@@ -4903,6 +5017,16 @@ impl<'a> Transformer<'a> {
         RewriteResult::Keep
     }
 
+    fn call_target_is_items_block_accessor(target: &crate::model::CallTarget) -> bool {
+        let crate::model::CallTarget::FunctionPath { segments, .. } = target else {
+            return false;
+        };
+        matches!(
+            segments.last().map(String::as_str),
+            Some("items_block_items_base" | "items_block_items_ptr")
+        )
+    }
+
     /// RPython: rewrite_op_getarrayitem
     fn rewrite_op_getarrayitem(
         &mut self,
@@ -4966,7 +5090,17 @@ impl<'a> Transformer<'a> {
                 .as_deref()
                 .is_some_and(|cc| cc.immutable_array_types.contains(aid))
         });
-        let pure = source_pure || immutable;
+        // `ARRAY._immutable_field(None)` is a property of the ARRAY the
+        // field's pointer denotes.  List and tuple items share
+        // `object_ref_gcarray`, so the type cannot be marked pure.
+        // A load whose base is the `wrappeditems[*]` field (or the
+        // header-identity accessor of that field) still is.
+        let from_immutable_field = self.immutable_array_bases.contains(base)
+            || self
+                .aliases
+                .get(base)
+                .is_some_and(|aliased| self.immutable_array_bases.contains(aliased));
+        let pure = source_pure || immutable || from_immutable_field;
         if &typed_item_ty != item_ty || pure != source_pure {
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result.clone(),
