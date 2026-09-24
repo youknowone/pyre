@@ -6,7 +6,7 @@
 ///
 /// Reference: rpython/jit/metainterp/warmstate.py WarmEnterState, BaseBaseJitCell
 use indexmap::IndexMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use majit_backend::JitCellToken;
@@ -111,6 +111,13 @@ pub struct BaseJitCell {
     /// (`compile.py:1148-1149`) for the one place that had to be repaired
     /// before the downgrade was safe.
     pub loop_token: Option<std::sync::Weak<JitCellToken>>,
+    /// `JitCellToken.invalidated`, cloned at `set_procedure_token`.
+    ///
+    /// `is_compiled` reads this flag and `Weak::strong_count` instead of
+    /// `upgrade`: the upgrade bumps and drops the token's strong count on
+    /// every entry, and `get_procedure_token` (`warmstate.py`) already does
+    /// that once for the token the entry actually runs.
+    pub invalidated_flag: Option<Arc<AtomicBool>>,
     /// Number of times tracing was aborted for this key.
     ///
     /// Kept for diagnostics only. In RPython, `retrace_limit` is handled by
@@ -212,6 +219,7 @@ impl BaseJitCell {
             token: None,
             tracing_generation: 0,
             loop_token: None,
+            invalidated_flag: None,
             abort_count: 0,
             next: None,
             cell_key: None,
@@ -269,7 +277,18 @@ impl BaseJitCell {
     /// warmstate.py — get_procedure_token returns None for
     /// invalidated tokens. is_compiled additionally excludes TEMPORARY.
     pub fn is_compiled(&self) -> bool {
-        self.get_procedure_token().is_some() && (!self.flags.contains(JcFlags::JC_TEMPORARY))
+        if self.flags.contains(JcFlags::JC_TEMPORARY) {
+            return false;
+        }
+        let Some(flag) = &self.invalidated_flag else {
+            return self.get_procedure_token().is_some();
+        };
+        let Some(wref) = &self.loop_token else {
+            return false;
+        };
+        // `strong_count` is the weakref resolving; the flag is
+        // `token.invalidated`. A dead weak answers false without `upgrade`.
+        wref.strong_count() > 0 && !flag.load(Ordering::Acquire)
     }
 
     /// warmstate.py `get_procedure_token`.
@@ -343,6 +362,7 @@ impl BaseJitCell {
         // `redirect_call_assembler` (warmstate.py) needs the object,
         // and a predecessor `alive_loops` has already dropped has no code left
         // to redirect.
+        self.invalidated_flag = Some(Arc::clone(&loop_token.invalidated));
         let old = self
             .loop_token
             .replace(Self::_makeref(&loop_token))
@@ -937,6 +957,7 @@ impl WarmEnterState {
     pub fn clear_loop_token(&mut self, cell_key: u64) {
         if let Some(cell) = self.cell_by_key_mut(cell_key) {
             cell.loop_token = None;
+            cell.invalidated_flag = None;
         }
     }
 
@@ -953,6 +974,7 @@ impl WarmEnterState {
             let mut cur = slot.as_deref_mut();
             while let Some(cell) = cur {
                 cell.loop_token = None;
+                cell.invalidated_flag = None;
                 cur = cell.next.as_deref_mut();
             }
         }
@@ -1361,6 +1383,34 @@ impl WarmEnterState {
         None
     }
 
+    /// Give a lone comparekey-less `JC_TEMPORARY` cell this key's comparekey.
+    ///
+    /// `get_assembler_token` files that cell through `ensure_cell_by_key`, so
+    /// `comparekey_matches` refuses it. `maybe_compile_and_run` still hands
+    /// the found cell to `bound_reached`; without this stamp
+    /// `ensure_cell_for_key` installs another cell in the same bucket.
+    /// A chain, a different bucket in the same table slot, or a cell that
+    /// already stores a comparekey is left alone — those are not the cell
+    /// the empty-chain door found.
+    fn reuse_lone_temporary_cell(&mut self, key: &GreenKey) {
+        if self.lookup_chain_with_key(key).is_some() {
+            return;
+        }
+        let hash = key.get_uhash();
+        let index = self.counter._get_index(hash);
+        let Some(cell) = self.celltable[index].as_deref_mut() else {
+            return;
+        };
+        if cell.next.is_some()
+            || cell.cell_bucket != hash
+            || cell.comparekey.is_some()
+            || !cell.flags.contains(JcFlags::JC_TEMPORARY)
+        {
+            return;
+        }
+        cell.set_comparekey(key);
+    }
+
     /// warmstate.py `WarmEnterState.bound_reached` —
     /// typed-key variant of [`Self::start_tracing_cell`].
     ///
@@ -1379,6 +1429,7 @@ impl WarmEnterState {
         self.counter.reset(hash);
         self.tracing_generation += 1;
         let current_generation = self.tracing_generation;
+        self.reuse_lone_temporary_cell(key);
         self.ensure_cell_for_key(key);
         let cell = self
             .lookup_chain_with_key_mut(key)
@@ -1430,6 +1481,7 @@ impl WarmEnterState {
     pub fn clear_loop_token_for_key(&mut self, key: &GreenKey) {
         if let Some(cell) = self.lookup_chain_with_key_mut(key) {
             cell.loop_token = None;
+            cell.invalidated_flag = None;
         }
     }
 

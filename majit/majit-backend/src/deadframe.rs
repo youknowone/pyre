@@ -6,7 +6,7 @@
 //! JITFRAMEPTR and reads `jf_frame[index]` in place, and `get_latest_descr`
 //! (`llmodel.py:411-419`) does the same for `jf_descr`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use majit_gc::shadow_stack::OwnerRootGuard;
@@ -93,6 +93,13 @@ struct PoolReaper;
 
 impl Drop for PoolReaper {
     fn drop(&mut self) {
+        let _ = FRAME_SLOT.try_with(|slot| {
+            let parked = slot.get();
+            if !parked.base.is_null() {
+                unsafe { crate::jitframe::dealloc_off_gc_block(parked.base, parked.total) };
+                slot.set(SlotState::EMPTY);
+            }
+        });
         let _ = FRAME_POOL.try_with(|pool| {
             let mut pool = pool.borrow_mut();
             for parked in &pool.free[..pool.free_len] {
@@ -124,6 +131,40 @@ struct FramePool {
     /// …of which the free list had nothing usable for, so the allocator was
     /// asked after all. `taken - misses` is what pooling actually saved.
     misses: u64,
+}
+
+/// One block kept in a `Cell`, ahead of [`FRAME_POOL`].
+///
+/// The steady portal holds a single frame size. Parking it here is one TLS
+/// load and a pointer store. The `RefCell` list remains for a second live
+/// frame (a nested entry) and for a size the slot cannot hold.
+#[derive(Clone, Copy)]
+struct SlotState {
+    base: *mut u8,
+    total: usize,
+    reaper_armed: bool,
+}
+
+impl SlotState {
+    const EMPTY: SlotState = SlotState {
+        base: std::ptr::null_mut(),
+        total: 0,
+        reaper_armed: false,
+    };
+}
+
+thread_local! {
+    static FRAME_SLOT: Cell<SlotState> = const { Cell::new(SlotState::EMPTY) };
+}
+
+fn arm_frame_slot_reaper(slot: &Cell<SlotState>) {
+    let mut state = slot.get();
+    if state.reaper_armed {
+        return;
+    }
+    state.reaper_armed = true;
+    slot.set(state);
+    let _ = POOL_REAPER.try_with(|_| ());
 }
 
 thread_local! {
@@ -161,6 +202,24 @@ pub(crate) fn take_pooled_block(total: usize) -> Option<*mut u8> {
         count_owned_frame_block();
         return None;
     }
+    if let Some(base) = FRAME_SLOT
+        .try_with(|slot| {
+            let state = slot.get();
+            if state.base.is_null() || state.total < total {
+                return None;
+            }
+            slot.set(SlotState {
+                base: std::ptr::null_mut(),
+                total: 0,
+                reaper_armed: state.reaper_armed,
+            });
+            Some(state.base)
+        })
+        .ok()
+        .flatten()
+    {
+        return Some(base);
+    }
     FRAME_POOL
         .try_with(|pool| {
             let mut pool = pool.borrow_mut();
@@ -188,6 +247,46 @@ pub(crate) fn give_back_pooled_block(base: *mut u8, total: usize) -> bool {
     if !jitframe_pool_enabled() {
         return false;
     }
+    let slot_result = FRAME_SLOT.try_with(|slot| {
+        let state = slot.get();
+        if state.base.is_null() {
+            slot.set(SlotState {
+                base,
+                total,
+                reaper_armed: state.reaper_armed,
+            });
+            arm_frame_slot_reaper(slot);
+            return Some(ParkedBlock::EMPTY);
+        }
+        if state.total < total {
+            slot.set(SlotState {
+                base,
+                total,
+                reaper_armed: state.reaper_armed,
+            });
+            return Some(ParkedBlock {
+                base: state.base,
+                total: state.total,
+            });
+        }
+        None
+    });
+    match slot_result {
+        Ok(Some(displaced)) if displaced.base.is_null() => return true,
+        Ok(Some(displaced)) => {
+            // The slot kept the larger block. Park the smaller one on the list.
+            if give_to_pool_list(displaced.base, displaced.total) {
+                return true;
+            }
+            unsafe { crate::jitframe::dealloc_off_gc_block(displaced.base, displaced.total) };
+            return true;
+        }
+        _ => {}
+    }
+    give_to_pool_list(base, total)
+}
+
+fn give_to_pool_list(base: *mut u8, total: usize) -> bool {
     FRAME_POOL
         .try_with(|pool| {
             let mut pool = pool.borrow_mut();
@@ -431,6 +530,23 @@ impl ExitDescr {
     pub fn borrowed(descr: &'static DescrRef) -> Self {
         ExitDescr {
             ptr: std::sync::Arc::as_ptr(descr),
+            owned: false,
+        }
+    }
+
+    /// `AbstractDescr.show`: `addr` is a [`majit_ir::FailDescrCell`] thin
+    /// pointer. The cell keeps the `Arc` alive; this handle does not
+    /// bump it.
+    ///
+    /// # Safety
+    /// `addr` must be [`majit_ir::FailDescrCell::thin_ptr`] of a cell that
+    /// outlives this handle — a cpu singleton from
+    /// [`majit_ir::descr_instance_ptr`], or a guard cell rooted by the
+    /// loop's `asmmemmgr_gcreftracers` for as long as the deadframe is read.
+    pub unsafe fn from_cell(addr: usize) -> Self {
+        let cell = unsafe { &*(addr as *const majit_ir::FailDescrCell) };
+        ExitDescr {
+            ptr: std::sync::Arc::as_ptr(&cell.descr),
             owned: false,
         }
     }

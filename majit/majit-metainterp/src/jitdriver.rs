@@ -2118,6 +2118,17 @@ impl<S: JitState> crate::jit::JitParameterTarget for JitDriver<S> {
     }
 }
 
+/// Answer of [`JitDriver::enter_compiled_function_entry`].
+enum SteadyCompiledEntry {
+    /// No compiled token for this hash. The cold door still runs.
+    Miss,
+    /// A procedure token exists, and the frontend meta does not. The
+    /// occupied door (`function_entry_internal`) owns that case.
+    NeedsInternal,
+    /// This call is finished. `None` is a decline, `Some` a resume pc.
+    Done(Option<usize>),
+}
+
 impl<S: JitState> JitDriver<S> {
     /// Create a new JitDriver with the given hot-counting threshold.
     pub fn new(threshold: u32) -> Self {
@@ -3153,6 +3164,11 @@ impl<S: JitState> JitDriver<S> {
     /// `Some(resume_pc)` the same call produced: that pc is the back edge, and
     /// resuming there re-runs the loop the compiled run already completed.
     pub fn take_back_edge_finish(&mut self) -> Option<Vec<Value>> {
+        // The int fast path publishes one word. `get_result` for
+        // `DoneWithThisFrameDescrInt` is that word, not an exit-value buffer.
+        if let Some(value) = self.meta.back_edge_finish_word.take() {
+            return Some(vec![Value::Int(value)]);
+        }
         // The latch holds the exit values in their decoded storage, which is
         // inline for the widths a finish actually returns. Taken rather than
         // copied: the buffer is owned here and has no reader left, so a width
@@ -3168,6 +3184,9 @@ impl<S: JitState> JitDriver<S> {
     /// argument is projected by its bits, matching how such a portal spells a
     /// float return (`f64::to_bits() as i64`).
     pub fn take_back_edge_finish_int(&mut self) -> Option<i64> {
+        if let Some(value) = self.meta.back_edge_finish_word.take() {
+            return Some(value);
+        }
         let values = self.meta.back_edge_finish.take()?;
         match values.first() {
             Some(Value::Int(v)) => Some(*v),
@@ -3179,6 +3198,9 @@ impl<S: JitState> JitDriver<S> {
     /// [`Self::take_back_edge_finish`] projected onto one float word — the
     /// return shape of an `-> f64` `#[jit_interp]` portal.
     pub fn take_back_edge_finish_float(&mut self) -> Option<f64> {
+        if let Some(value) = self.meta.back_edge_finish_word.take() {
+            return Some(f64::from_bits(value as u64));
+        }
         let values = self.meta.back_edge_finish.take()?;
         match values.first() {
             Some(Value::Float(v)) => Some(*v),
@@ -6351,12 +6373,12 @@ impl<S: JitState> JitDriver<S> {
             {
                 return None;
             }
-            let descriptor = self.driver_descriptor_for(state, &compiled_meta);
-            // Resolved here with the descriptor and carried to both ends of
-            // the run; see `sync_before` for why it is not asked for twice.
-            let vable = descriptor
-                .as_deref()
-                .and_then(JitDriverStaticData::virtualizable);
+            // The cached descriptor's `Arc` stays on the driver. Cloning it
+            // on every entry bumped the count; `warmstate.py execute_assembler`
+            // closes over the driver data instead of re-resolving it.
+            let descriptor_ptr = self.driver_descriptor_ptr(state, &compiled_meta);
+            let descriptor = unsafe { descriptor_ptr.map(|ptr| &*ptr) };
+            let vable = descriptor.and_then(JitDriverStaticData::virtualizable);
             if !state.is_compatible(&compiled_meta) {
                 self.meta.invalidate_loop(green_key);
                 return None;
@@ -6600,732 +6622,65 @@ impl<S: JitState> JitDriver<S> {
                 hook(green_key, target_pc);
             }
 
-            let result = self.meta.execute_assembler_at_dispatch_key(
-                &procedure_token,
-                green_key,
-                // The run is handed the meta the gate above already read out of
-                // `compiled_loops`, rather than probing that map a third time
-                // for the same slot. Nothing between the two can replace the
-                // entry: `pre_run` cannot capture the driver and the
-                // `on_compiled_entry` hook is called through `&self.meta`.
-                // Not carried: this entry reads its snapshot from
-                // `compiled_meta` on every arm below, so a copy on the result
-                // would ride out and drop unread.
-                None,
-                live_values,
-                selected_dispatch_key,
-            );
+            // `warmstate.py execute_assembler` tests the returned descr
+            // (`isinstance(fail_descr, DoneWithThisFrameDescrInt)`), then
+            // `get_int_value(deadframe, 0)`. Dispatch key 0 is the ordinary
+            // token entry. A direct LABEL entry keeps the general result.
+            // The driver's `result_type` field is not that test: it stays at
+            // its default unless a caller assigns it, while the trace stamps
+            // `jf_descr` from the result box.
+            let polled_raw_int = selected_dispatch_key == 0;
+            if polled_raw_int {
+                if let Some(value) =
+                    self.meta
+                        .poll_raw_int_finish(&procedure_token, green_key, live_values)
+                {
+                    self.entry_scratch_out(scratch);
+                    self.meta.back_edge_finish = None;
+                    self.meta.back_edge_finish_word = Some(value);
+                    if vable.is_some() {
+                        self.sync_after(state, &compiled_meta, vable, None);
+                    }
+                    return Some(target_pc);
+                }
+            }
+            let result = if polled_raw_int {
+                self.meta
+                    .raw_int_fallback
+                    .take()
+                    .expect("poll_raw_int_finish stored the general-case result")
+            } else {
+                self.meta.execute_assembler_at_dispatch_key(
+                    &procedure_token,
+                    green_key,
+                    // The run is handed the meta the gate above already read out of
+                    // `compiled_loops`, rather than probing that map a third time
+                    // for the same slot. Nothing between the two can replace the
+                    // entry: `pre_run` cannot capture the driver and the
+                    // `on_compiled_entry` hook is called through `&self.meta`.
+                    // Not carried: this entry reads its snapshot from
+                    // `compiled_meta` on every arm below, so a copy on the result
+                    // would ride out and drop unread.
+                    None,
+                    live_values,
+                    selected_dispatch_key,
+                )
+            };
             // The compiled body no longer reads its entry arguments. Return
             // these buffers before any guard-resume path can re-enter the
             // driver to trace a bridge.
             self.entry_scratch_out(scratch);
-            let mut result = result;
-            if portal_rca {
-                eprintln!(
-                    "[portal-rca][compiled-exit] green_key={green_key} \
-                     dispatch_key={selected_dispatch_key} is_finish={} fail_index={} \
-                     typed_values={:?}",
-                    result.is_finish, result.fail_index, result.typed_values
-                );
-            }
-
-            // Stage E4, before the arm split, so it prices one pair of calls
-            // rather than a different pair per outcome — and before the FINISH
-            // arm takes the exit values out from under it.
-            #[cfg(feature = "__back-edge-stage-probe")]
-            if result.is_finish || result.fail_index == u32::MAX {
-                count_back_edge_stage_passes(BackEdgeStage::MarshalOut, stage_repeats.marshal_out);
-                for _ in 0..stage_repeats.marshal_out {
-                    if !result.is_finish && !result.typed_values.is_empty() {
-                        state.restore_values(&compiled_meta, &result.typed_values);
-                    }
-                    self.sync_after(state, &compiled_meta, vable, None);
-                    std::hint::black_box(&mut *state);
-                }
-            }
-
-            if result.is_finish {
-                // compile.py `_DoneWithThisFrameDescr.final_descr = True`:
-                // the compiled run ended in FINISH, so the traced function has
-                // RETURNED. Upstream `handle_fail` raises `jitexc.DoneWithThisFrame*`
-                // and unwinds the portal; there is no resume point past a final
-                // descr. `target_pc` is the back edge, so resuming there restarts
-                // the loop the run just finished — with only the FINISH's own
-                // argument restored, not the loop-carried state — and the caller
-                // re-enters compiled code at the next back edge, making one call
-                // cost one full compiled run per remaining iteration.
-                //
-                // Publish the FINISH arguments out of band. Front end A reads the
-                // same outcome as `DetailedDriverRunOutcome::Finished` and returns
-                // from the portal; front end B's `Option<resume_pc>` signature has
-                // no variant for "the function returned", so the `#[jit_interp]`
-                // expansion drains this latch right after the call and returns it
-                // as the portal's own return value.
-                // Taken, not copied: this arm returns below, so the exit values
-                // in `result` have no reader past this point.
-                self.meta.back_edge_finish = Some(std::mem::take(&mut result.typed_values));
-                // The meta the run was handed, not a second handle to it:
-                // cloning `result.meta` here bought a refcount pair for a value
-                // already in scope.
-                let run_meta = &compiled_meta;
-                // The FINISH arguments are NOT the loop-carried state, so they
-                // are not written back into it. `warmstate.py:405-419
-                // execute_assembler` takes the `DoneWithThisFrameDescr*` fast
-                // path straight to `fail_descr.get_result(cpu, deadframe)` and
-                // returns; the only thing it reads off the deadframe is the
-                // portal's own result, and it touches no interpreter state on
-                // the way out. A `restore_values` here decodes the FINISH
-                // descr's `fail_arg_types` — one word for an int-returning
-                // portal — into slots indexed by the state's live-value
-                // layout, so a state with more than one live field indexes
-                // past the end of the list it was handed.
-                // The descriptor the entry decided on is the one the exit
-                // syncs through — resolved once above and carried here rather
-                // than asked for again. `warmstate.py:483/509-511` reads the
-                // cell once per `maybe_compile_and_run` and carries the read
-                // out to the executor for the same reason; the driver's static
-                // data is a configuration-time constant (see
-                // `descriptor_cache`), so a second consultation could only
-                // return the same object at the cost of one more refcount pair
-                // per compiled entry.
-                self.sync_after(state, run_meta, vable, None);
-                // Kept for callers that cannot consume the latch (a portal whose
-                // return type the expansion cannot build from a `Value`). Those
-                // callers see today's behaviour unchanged; a caller that drains
-                // the latch never reaches this pc.
-                return Some(target_pc);
-            }
-
-            // Normal loop back-edge JUMP, not a guard failure.
-            if result.fail_index == u32::MAX {
-                // Same handle as the FINISH arm above, for the same reason.
-                let run_meta = &compiled_meta;
-                if !result.typed_values.is_empty() {
-                    state.restore_values(run_meta, &result.typed_values);
-                }
-                // Carried from the entry decision above, not re-resolved; see
-                // the FINISH arm for why one resolution serves both ends of a
-                // compiled entry.
-                self.sync_after(state, run_meta, vable, None);
-                return Some(target_pc);
-            }
-
-            // compile.py handle_fail
-            let fail_index = result.fail_index;
-            let trace_id = result.trace_id;
-            // `compile.py ResumeGuardDescr.handle_fail` / `resume.py
-            // blackhole_from_resumedata` read fail values from the deadframe
-            // in place (`resume.py ResumeDataDirectReader.decode_int` via
-            // `self.cpu.get_int_value(self.deadframe, num)`). No dense list
-            // is built unless `must_compile` starts a bridge.
-            let descr_arc = result
-                .descr_arc
-                .take()
-                .expect("a guard exit carries its descr");
-            // `compile.py handle_fail(self, deadframe, ...)`: the failing
-            // guard's own `ResumeGuardDescr` is what every read below is off
-            // — its fail-arg types, its `rd_*` resume payload — not a layout
-            // assembled per failure from the frontend's records.
-            let fd: &dyn majit_ir::FailDescr = descr_arc
-                .as_fail_descr()
-                .expect("a guard exit carries a FailDescr");
-            let guard_value_operand = result.guard_value_operand;
-            // `compile.py handle_fail` `resumedescr.rd_loop_token`, resolved
-            // once where the run handed the descr back.
-            let descr_owning_key = result.rd_loop_token;
-            // blackhole.py `_prepare_resume_from_failure(deadframe)`:
-            // the pending exception grabbed at guard failure
-            // (cpu.grab_exc_value) must seed the blackhole resume so an
-            // exception guard unwinds into its handler instead of resuming
-            // the no-exception continuation.
-            let guard_exc = result.exception.exc_value;
-            let savedata = result.savedata;
-            // Keep `result` (and its deadframe) until this arm returns so
-            // `jf_savedata` stays rooted through `AllVirtuals.show`, matching
-            // `compile.py handle_fail(self, deadframe, ...)`.
-            // Also park the copied GCREF: `AllVirtuals.show` reads this
-            // word after the reconstruction has already allocated.
-            let mut savedata_slot = [savedata.map_or(0, majit_ir::GcRef::as_usize) as i64];
-            let _savedata_root = unsafe {
-                crate::resume::DeadFrameRefRoots::enter(&mut savedata_slot, |_| savedata.is_some())
-            };
-            let savedata = savedata.map(|_| majit_ir::GcRef(savedata_slot[0] as usize));
-            // The reconstruction below allocates through the blackhole allocator,
-            // so hold the exception where the frontend's root walker can reach
-            // it until `prepare_resume_from_failure` hands it to the blackhole.
-            let _guard_exc_root = crate::blackhole::GuardExcRoot::park(guard_exc);
-
-            // must_compile tick for bridge threshold counting.
-            if crate::majit_log_enabled() {
-                let descr_addr = std::sync::Arc::as_ptr(&descr_arc) as *const () as usize;
-                eprintln!(
-                    "[jit] handle_fail: fail_index={} trace_id={} descr_addr={:#x} values={}",
-                    fail_index,
-                    trace_id,
-                    descr_addr,
-                    fd.fail_arg_types().len()
-                );
-            }
-            if failvals_enabled() {
-                let raw_values = result.deadframe.as_ref().map_or_else(Vec::new, |frame| {
-                    self.meta.raw_exit_slots_from_deadframe(frame, fd)
-                });
-                eprintln!(
-                    "@@@FAILVALS fail_index={} resume_pc={} raw_values={:?}",
-                    fail_index,
-                    self.get_merge_point_pc(green_key, trace_id, fail_index)
-                        .map(|p| p as i64)
-                        .unwrap_or(-1),
-                    raw_values
-                );
-            }
-            if crate::callee_rca_enabled() {
-                let raw_values = result.deadframe.as_ref().map_or_else(Vec::new, |frame| {
-                    self.meta.raw_exit_slots_from_deadframe(frame, fd)
-                });
-                eprintln!(
-                    "[callee-rca][guard-fail] fail_index={} trace_id={} raw_values={:?} exit_types={:?}",
-                    fail_index,
-                    trace_id,
-                    raw_values,
-                    fd.fail_arg_types(),
-                );
-                if let Some(dump) = state.debug_state_fields(&compiled_meta) {
-                    eprintln!("[callee-rca][post-execute-token-state]\n{dump}");
-                }
-            }
-            // Resolved once for the whole event, where the run handed the descr
-            // back, and carried here: `compile.py handle_fail` reads
-            // `resumedescr.rd_loop_token` once and hands the loop it names to
-            // the `must_compile` call. A descr with no owner stamped is the
-            // loop that was entered.
-            let owning_key = descr_owning_key.unwrap_or(green_key);
-            // `guard_value_operand` was read off the deadframe while it was
-            // live (`compile.py must_compile` `cpu.get_value_direct`). The
-            // fail-values slice is only the fallback for backends that
-            // resolve the GUARD_VALUE index from the dense vector.
-            let (must_compile, owning_key) = self.meta.must_compile_with_owning_key(
-                &descr_arc,
-                &[],
-                guard_value_operand,
-                owning_key,
+            return self.consume_compiled_entry_result(
+                green_key,
+                target_pc,
+                state,
+                env,
+                result,
+                &compiled_meta,
+                vable,
+                selected_dispatch_key,
+                portal_rca,
             );
-            // compile.py: must_compile() and not stack_almost_full().
-            // MAJIT_NO_BRIDGE (diagnostic): suppress bridge recording so every
-            // guard failure resumes via blackhole — isolates bridge-record
-            // resume defects from the blackhole path.
-            //
-            // Pending-field guards bridge through setup_bridge_sym's
-            // pending-field prologue (resume.py:993-1007).
-            let should_bridge = must_compile
-                && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full()
-                && !no_bridge_enabled()
-                && bridge_fuel_take();
-
-            // compile.py handle_fail. `must_compile() and not
-            // stack_almost_full()` → `_trace_and_compile_from_bridge`, else
-            // `resume_in_blackhole`; the two are mutually exclusive and
-            // neither returns. majit adapts by returning the interpreter
-            // resume pc.
-            //
-            // The bridging arm enters the walk at the guard's own jitcode
-            // position, so the rest of the opcode the guard sits inside is
-            // recorded rather than run where the bridge cannot see it. It
-            // declines — and only before running anything — for a state with
-            // no dispatch jitcode, a resume frame it cannot seed a register
-            // file from, or a bridge setup that gave up; the blackhole arm
-            // below is then the answer, exactly as when the guard does not
-            // `must_compile` at all.
-            // Decode a dense list only when this failure will start a
-            // bridge (`compile.py ResumeGuardDescr.handle_fail` when
-            // `must_compile` fires — about once per 200 failures).
-            let mut raw_values_for_bridge: Option<Vec<i64>> = None;
-            if should_bridge {
-                let mut raw_values = self.take_exit_raw_scratch();
-                if let Some(frame) = result.deadframe.as_ref() {
-                    raw_values.extend(self.meta.raw_exit_slots_from_deadframe(frame, fd));
-                }
-                if let Some(pc) = self.bridge_from_guard_resume_position(
-                    &descr_arc,
-                    state,
-                    env,
-                    &raw_values,
-                    target_pc,
-                ) {
-                    if crate::majit_log_enabled() {
-                        eprintln!(
-                            "[bridge] guard-resume bridge key={} trace={} fail={} resume_pc={}",
-                            green_key, trace_id, fail_index, pc,
-                        );
-                    }
-                    self.exit_raw_scratch_out(raw_values);
-                    return Some(pc);
-                }
-                raw_values_for_bridge = Some(raw_values);
-            }
-
-            // compile.py:711 resume_in_blackhole
-            // compile.py `ResumeGuardDescr` storage — `rd_numb` /
-            // `rd_consts` / `rd_virtuals` / `rd_pendingfields` borrowed off
-            // the failing descr itself (`get_resumestorage(): return self`),
-            // so blackhole resume observes the guard-owned pool the GC
-            // walker updates, and nothing is built per failure to hold them.
-            if let Some(rd_numb) = fd.rd_numb() {
-                let rd_consts_slice: &[Const] = fd.rd_consts().unwrap_or(&[]);
-
-                // `resume.py _prepare_virtuals` is a no-op when
-                // `storage.rd_virtuals` is empty (the regex `and`/`or`
-                // leaf: nvirtuals=0). Skip the per-failure convert and
-                // the two empty `VirtualCache` vecs `prepare_virtuals`
-                // would mint for `Some(&[])`.
-                let virtual_infos;
-                let rd_virtuals_slice = match fd.rd_virtuals() {
-                    Some(rds) if !rds.is_empty() => {
-                        virtual_infos = rds
-                            .iter()
-                            .map(|rd| crate::resume::virtual_info_from_rd(rd))
-                            .collect::<Vec<_>>();
-                        Some(virtual_infos.as_slice())
-                    }
-                    _ => None,
-                };
-
-                // resume.py:1338-1340: `jitcode = jitcodes[jitcode_pos];
-                // curbh.setposition(jitcode, pc)`.  Per-driver
-                // pyre layout: root frame resolves to the dispatch
-                // JitCode singleton (RPython's `metainterp_sd.jitcodes`
-                // for the portal jitdriver slot); sub-frames index into
-                // the parent's `descrs` array per `BC_INLINE_CALL`'s
-                // `j` argcode (`blackhole.py:150-157`).
-                //
-                // The snapshot's root `jitcode_index` is unused once
-                // the dispatch singleton is registered — the closure
-                // ignores it and clones `self.dispatch_jitcode`.
-                let _ = env;
-                // resume.py `jitcode = jitcodes[jitcode_pos]` —
-                // resolve every frame statelessly from the flat global
-                // registry by its self-describing absolute index (no root/sub
-                // branch, no parent-relative descrs walk, no last-frame state).
-                // `resume.py`'s `jitcode = jitcodes[jitcode_pos]` indexes the
-                // prebuilt list in place.  Borrowing it costs nothing; the
-                // `to_vec` that stood here cloned every `Arc` in the registry
-                // — two atomic RMWs per jitcode — on a path this fixture takes
-                // once per input character.
-                let jitcode_registry: &[std::sync::Arc<crate::jitcode::JitCode>] =
-                    self.meta.jitcodes();
-                let resolve_jitcode = |jitcode_index: i32,
-                                       pc: i32|
-                 -> Option<crate::resume::ResolvedJitCode> {
-                    let resolved_jitcode = jitcode_registry.get(jitcode_index as usize)?.clone();
-                    Some(crate::resume::ResolvedJitCode::new(
-                        resolved_jitcode,
-                        pc as usize,
-                    ))
-                };
-
-                let fallback_alloc = crate::resume::NullAllocator;
-                let allocator: &dyn crate::resume::BlackholeAllocator = self
-                    .blackhole_allocator
-                    .as_deref()
-                    .unwrap_or(&fallback_alloc);
-
-                // Inline-call-only builder so byte 17 (BC_INLINE_CALL) is
-                // wired to handler_inline_call_nested_ext when the
-                // multi-frame state-field-JIT chain reconstructs sub-frames
-                // via parent.descrs[idx].as_jitcode() above.  3
-                // retired the dispatch_one BC_INLINE_CALL legacy arm so an
-                // empty builder would now panic on byte 17.  Re-apply
-                // staticdata control opcodes after the constructor's
-                // BC_LIVE/BC_CATCH_EXCEPTION/BC_RVMPROF_CODE defaults so
-                // the values match the metainterp's actual byte
-                // assignments.
-                let mut bh_builder = BackEdgeBhBuilder::lease();
-                bh_builder.set_cpu(self.meta_interp().blackhole_cpu());
-                bh_builder.setup_cached_control_opcodes(
-                    self.meta_interp().staticdata.op_live,
-                    self.meta_interp().staticdata.op_catch_exception,
-                    self.meta_interp().staticdata.op_rvmprof_code,
-                );
-                // `blackhole_from_resumedata` below acquires one interpreter
-                // per resumed frame, and every frame that still has a caller
-                // takes `bhimpl_jit_merge_point`'s recursive-portal branch
-                // (blackhole.py:1079-1093), which indexes `jitdrivers_sd`
-                // directly.  The lease is thread-local and carries whatever
-                // the previous resume left on it, so seed the table here
-                // instead of depending on that.
-                let jitdrivers_sd = bh_jitdrivers_sd(&self.meta_interp().staticdata);
-                if !std::sync::Arc::ptr_eq(&bh_builder.jitdrivers_sd, jitdrivers_sd) {
-                    bh_builder.setup_jitdrivers_sd(std::sync::Arc::clone(jitdrivers_sd));
-                }
-                let all_liveness = self.meta_interp().staticdata.liveness_info.as_slice();
-                // The state-field macro's `&state` is host-stack storage, so
-                // its identity may be folded out of the failing frame. Ask
-                // only an explicit host opt-in for the current call's address;
-                // heap virtualizables retain the live resume TAGBOX path.
-                let vable_identity_override = self.meta.virtualizable_info().and_then(|info| {
-                    state
-                        .blackhole_virtualizable_identity(&compiled_meta, &info.name, info)
-                        .map(|ptr| ptr as i64)
-                });
-                // `resume.py ResumeDataDirectReader.decode_int` —
-                // `self.cpu.get_int_value(self.deadframe, num)`. Keep
-                // `result` (and its deadframe) alive across this call so
-                // `jf_savedata` stays rooted; `FailArgSource::JitFrame`
-                // also holds an `OwnerRootGuard`.
-                let n_fail_args = fd.fail_arg_types().len();
-                let fallback_raw;
-                let fail_args = match result
-                    .deadframe
-                    .as_ref()
-                    .and_then(|frame| frame.jitframe_ptr())
-                {
-                    Some(ptr) => majit_backend::FailArgSource::from_jitframe(ptr, fd, n_fail_args),
-                    None => {
-                        fallback_raw = result.deadframe.as_ref().map_or_else(Vec::new, |frame| {
-                            self.meta.raw_exit_slots_from_deadframe(frame, fd)
-                        });
-                        majit_backend::FailArgSource::Slice(&fallback_raw)
-                    }
-                };
-                let bh = crate::resume::blackhole_from_resumedata(
-                    &mut bh_builder,
-                    &resolve_jitcode,
-                    rd_numb,
-                    rd_consts_slice,
-                    all_liveness,
-                    fail_args,
-                    Some(fd.fail_arg_types()),
-                    rd_virtuals_slice,
-                    Some(fd.rd_pendingfields().unwrap_or(&[])), // rd_guard_pendingfields
-                    Some(
-                        &self.meta_interp().staticdata.virtualref_info
-                            as &dyn crate::resume::VRefInfo,
-                    ),
-                    // Pass the registered vinfo so the vable section of the
-                    // resume stream is consumed (avoids a stream desync when
-                    // the trace carries virtualizable array boxes).
-                    self.meta
-                        .virtualizable_info()
-                        .map(|a| a.as_ref() as &dyn crate::resume::VirtualizableInfo),
-                    None, // ginfo
-                    vable_identity_override,
-                    savedata.and_then(crate::compile::AllVirtuals::show),
-                    allocator,
-                );
-                let (mut bh, vable_ptr) = bh;
-                {
-                    // Thread the state-field register layout onto every frame
-                    // so the `state_field` handlers map a logical scalar/array
-                    // index to the flat register slot the resume reader seeded.
-                    // Inlined sub-frames carry no state-field ops, but the root
-                    // dispatch frame (the chain tail, which owns the merge point
-                    // and the loop's state load/store) does, so it must hold the
-                    // layout before it runs.
-                    let sf_layout = state.state_field_layout();
-                    // Seed the reconstructed blackhole chain with the registered
-                    // virtualizable info + identity pointer so a mid-body
-                    // vable-array opcode (`getarrayitem_vable_*` /
-                    // `setarrayitem_vable`) can resolve its vinfo during resume.
-                    // Two sources:
-                    //   * the portal-inline experiment (gated), OR
-                    //   * a state-field machine (no `vable_token` field), whose
-                    //     `bh_clear_vable_token` is inert (the `state` struct has
-                    //     no heap token), so a non-null vinfo cannot corrupt it.
-                    //     The overflow-guard deopt (`int_*_jump_if_ovf` on the
-                    //     `[int; virt]` regs) is the first path to run a blackhole
-                    //     vable-array op on such a machine.
-                    // A real heap virtualizable (`token_offset > 0`, e.g.
-                    // PyFrame) keeps its existing null-vinfo resume contract.
-                    // The identity pointer must be co-seeded because the GC-root
-                    // walk (`resume_mainloop`) dereferences `virtualizable_ptr`
-                    // whenever `virtualizable_info` is non-null.
-                    let seed_vinfo_ptr = seed_deopt_vinfo_ptr(self.meta.virtualizable_info());
-                    {
-                        let mut current = Some(&mut *bh);
-                        while let Some(frame) = current {
-                            frame.state_field_layout = sf_layout.clone();
-                            if !seed_vinfo_ptr.is_null() {
-                                frame.virtualizable_info = seed_vinfo_ptr;
-                                frame.virtualizable_ptr = vable_ptr;
-                            }
-                            current = frame.nextblackholeinterp.as_deref_mut();
-                        }
-                    }
-                    let exc = crate::blackhole::BlackholeInterpreter::prepare_resume_from_failure(
-                        guard_exc,
-                    );
-                    // Drive the reconstructed frame chain (blackhole.py:1752
-                    // `_run_forever`): each completed sub-frame passes its
-                    // return value to its caller (resume_mainloop did the
-                    // `setup_return_value_*` copy), then we descend to the
-                    // caller until a frame raises a control exception — CRN at
-                    // a merge point, DoneWithThisFrame at the root, or an
-                    // uncaught exception. Unlike `run_forever_with_portal`,
-                    // which consumes every frame and so leaves no register file
-                    // to read, keep the terminal frame alive: PyPy re-enters
-                    // the portal with the CRN reds (warmspot.py:970-983), but
-                    // those are only the declared subset, so the structural
-                    // equivalent for majit's live `state` struct is to restore
-                    // the terminal frame's full register bank
-                    // (resume.py:1028-1038 seeded it in slot order) and resume
-                    // at the CRN green pc.
-                    let mut cur_exc = exc;
-                    let outcome = loop {
-                        match bh.resume_mainloop(cur_exc) {
-                            Ok(next_exc) => match bh.nextblackholeinterp.take() {
-                                Some(caller) => {
-                                    // Layout + vinfo were seeded across the
-                                    // whole chain before the loop started.
-                                    bh_builder.release_interp(bh);
-                                    bh = caller;
-                                    cur_exc = next_exc;
-                                }
-                                // The bottommost frame always raises
-                                // (done_with_this_frame / exit_frame_with_
-                                // exception), so an `Ok` with no caller is
-                                // unreachable.  Nothing returned a result on
-                                // this route, so name it a bail rather than a
-                                // void completion the caller would install.
-                                None => break crate::jitexc::JitException::BailToInterpreter,
-                            },
-                            Err(jit_exc) => break jit_exc,
-                        }
-                    };
-                    if crate::majit_log_enabled() {
-                        eprintln!("[bh] back_edge_internal: chain resume → {:?}", outcome);
-                    }
-                    // `compile.py` `resume_in_blackhole`. The walk runs the
-                    // reconstructed chain to the next merge point (or out of
-                    // the frame) and hands that pc back to the interpreter.
-                    // It does not record a bridge: `handle_fail` already
-                    // tried `_trace_and_compile_from_bridge` from the guard's
-                    // own resumedescr, and a decline is the blackhole branch,
-                    // not a second trace started at the merge point the walk
-                    // stopped on.
-                    let resume_pc = match outcome {
-                        // Next merge point reached (loop back-edge): flush the
-                        // register file into the live state and resume the
-                        // interpreter at the merge point's green pc.
-                        crate::jitexc::JitException::ContinueRunningNormally(args) => {
-                            let green_int = &args.green_int;
-                            // PyPy re-enters the portal with the CRN greens
-                            // (warmspot.py:970-983), so the interpreter
-                            // resumes at the pc the re-executed
-                            // jit_merge_point reported — every `greens`
-                            // declaration puts `pc` first (jit_merge_point
-                            // bucket order), so it is `green_int[0]`. The
-                            // blackhole may have crossed a non-back-edge
-                            // path (e.g. a branch fall-through that leaves
-                            // the loop), in which case the green pc differs
-                            // from the loop-header `target_pc`.
-                            let green_pc = green_int.first().map(|&pc| pc as usize);
-                            if portal_rca_enabled() {
-                                eprintln!(
-                                    "[portal-rca][crn] target_pc={} green_int={:?} \
-                                     selected_green_pc={:?}",
-                                    target_pc, green_int, green_pc,
-                                );
-                            }
-                            if let Some(pc) = green_pc {
-                                let _ = crate::handle_portal_crn_hook(target_pc, pc);
-                            }
-                            // `restore_banked` consumes both banks densely
-                            // (int slot j at index j, ref scalar j at index
-                            // j); the register file holds them at
-                            // `scalar_slot(j) = int_scalar_base + j` /
-                            // `ref_scalar_slot(j) = ref_scalar_base + j`, so
-                            // slice off the dispatch JitCode's argument
-                            // prefix in each bank.
-                            let layout = state.state_field_layout();
-                            let int_base = layout.int_scalar_base.min(bh.registers_i.len());
-                            let ref_base = layout.ref_scalar_base.min(bh.registers_r.len());
-                            if crate::callee_rca_enabled() {
-                                eprintln!(
-                                    "[callee-rca][crn-pre] green_pc={:?} target_pc={} \
-                                     layout={:?} int_base={} ref_base={}",
-                                    green_pc, target_pc, layout, int_base, ref_base,
-                                );
-                                eprintln!(
-                                    "[callee-rca][crn-pre] bh.registers_i(len={})={:?}",
-                                    bh.registers_i.len(),
-                                    bh.registers_i,
-                                );
-                                eprintln!(
-                                    "[callee-rca][crn-pre] bh.registers_r(len={})={:?}",
-                                    bh.registers_r.len(),
-                                    bh.registers_r,
-                                );
-                                eprintln!(
-                                    "[callee-rca][crn-pre] int_slice={:?}",
-                                    &bh.registers_i[int_base..],
-                                );
-                                eprintln!(
-                                    "[callee-rca][crn-pre] ref_slice={:?}",
-                                    &bh.registers_r[ref_base..],
-                                );
-                                if let Some(dump) = state.debug_state_fields(&compiled_meta) {
-                                    eprintln!("[callee-rca][crn-state-before]\n{dump}");
-                                }
-                            }
-                            if layout.num_vable_identity_slots == 0 {
-                                let float_base = layout.float_scalar_base.min(bh.registers_f.len());
-                                state.restore_banked3(
-                                    &compiled_meta,
-                                    &bh.registers_i[int_base..],
-                                    &bh.registers_r[ref_base..],
-                                    &bh.registers_f[float_base..],
-                                );
-                            } else {
-                                writeback_live_state_scalars_from_blackhole(
-                                    state,
-                                    &layout,
-                                    &bh,
-                                    all_liveness,
-                                );
-                            }
-                            // The carried/delta-tracked reds in the deadframe
-                            // can lag the authoritative live storage (e.g. a
-                            // `stacksize` whose backing stack was popped by the
-                            // compiled body but whose red was captured stale).
-                            // Re-derive them from storage so the green recomputed
-                            // at the resumed `jit_merge_point` (here: `stackok =
-                            // req_size <= stacksize`) reflects reality instead of
-                            // the stale red, otherwise the interpreter re-enters
-                            // the same compiled loop and re-fails the same green
-                            // guard with zero forward progress.
-                            state.recover_after_compiled_run();
-                            if crate::callee_rca_enabled()
-                                && let Some(dump) = state.debug_state_fields(&compiled_meta)
-                            {
-                                eprintln!("[callee-rca][crn-state-after]\n{dump}");
-                            }
-                            // The register file just flushed above is the state
-                            // AT the green pc — the blackhole ran the failing
-                            // opcode forward to the next merge point. Resuming
-                            // anywhere else (the loop-header `target_pc` was
-                            // used here for label-entered runs) re-executes the
-                            // header..green_pc opcodes on post-green state,
-                            // corrupting every value they recompute. The entry
-                            // dispatch key does not change the guard's resume
-                            // snapshot, so label-entered runs resume at the
-                            // green pc like every other run.
-                            let resume_pc = Some(green_pc.unwrap_or(target_pc));
-                            bh.recycle_merge_point_args(args);
-                            resume_pc
-                        }
-                        // The interpreted frame ran to completion inside the
-                        // blackhole: flush, then force the generated mainloop's
-                        // `while pc < len` guard to fail so it exits and
-                        // returns the value computed from the flushed state.
-                        crate::jitexc::JitException::DoneWithThisFrameVoid
-                        | crate::jitexc::JitException::DoneWithThisFrameInt(_)
-                        | crate::jitexc::JitException::DoneWithThisFrameRef(_)
-                        | crate::jitexc::JitException::DoneWithThisFrameFloat(_) => {
-                            let layout = state.state_field_layout();
-                            let int_base = layout.int_scalar_base.min(bh.registers_i.len());
-                            let ref_base = layout.ref_scalar_base.min(bh.registers_r.len());
-                            let float_base = layout.float_scalar_base.min(bh.registers_f.len());
-                            state.restore_banked3(
-                                &compiled_meta,
-                                &bh.registers_i[int_base..],
-                                &bh.registers_r[ref_base..],
-                                &bh.registers_f[float_base..],
-                            );
-                            Some(usize::MAX)
-                        }
-                        // blackhole.py `_exit_frame_with_exception` →
-                        // warmspot.py:998-1005: the resumed chain raised an
-                        // exception that escaped every reconstructed frame
-                        // (the hand-rolled loop above drove the multi-frame
-                        // descent, propagating the exc to the bottommost frame
-                        // just like `_run_forever`). resume_in_blackhole has
-                        // finished; hand the exception to the interpreter's own
-                        // machinery (parity: `eval.rs` re-raises the stored Ref
-                        // via `PyError::from_exc_object`) instead of dropping
-                        // back to re-execute from the guard pc. Returns the
-                        // interpreter's handler pc, or `None` when it has no
-                        // exception machinery — then the crude fallback runs,
-                        // but an exception-less interpreter never reaches here.
-                        // See the twin arm in the tracing-abort adoption
-                        // above: a bail names a jitcode coordinate this
-                        // driver cannot resume at, and the chain has already
-                        // run, so ending the dispatch loop is the closest
-                        // non-replaying answer.  The banked state is restored
-                        // first because the blackhole registers hold what the
-                        // chain computed before it stopped.
-                        crate::jitexc::JitException::BailToInterpreter => {
-                            let layout = state.state_field_layout();
-                            let int_base = layout.int_scalar_base.min(bh.registers_i.len());
-                            let ref_base = layout.ref_scalar_base.min(bh.registers_r.len());
-                            let float_base = layout.float_scalar_base.min(bh.registers_f.len());
-                            state.restore_banked3(
-                                &compiled_meta,
-                                &bh.registers_i[int_base..],
-                                &bh.registers_r[ref_base..],
-                                &bh.registers_f[float_base..],
-                            );
-                            Some(usize::MAX)
-                        }
-                        crate::jitexc::JitException::ExitFrameWithExceptionRef(exc_ref) => {
-                            state.deliver_blackhole_exception(exc_ref)
-                        }
-                    };
-                    bh_builder.release_interp(bh);
-                    // `BlackholeInterpBuilder.release_interp` makes the frame
-                    // reusable as soon as `_run_forever` is done. The
-                    // interpreter may re-enter the portal on the pc we return,
-                    // so the builder goes back to the pool before that.
-                    drop(bh_builder);
-                    if let Some(pc) = resume_pc {
-                        if let Some(raw_values) = raw_values_for_bridge {
-                            self.exit_raw_scratch_out(raw_values);
-                        }
-                        return Some(pc);
-                    }
-                }
-            }
-
-            // The chain raised an exception and
-            // `deliver_blackhole_exception` returned `None` (the
-            // interpreter has no exception machinery — unreachable for an
-            // exception-less interpreter): fall back to crude state recovery and
-            // resume the interpreter at the guard pc.
-            //
-            // `AbstractResumeGuardDescr.handle_fail` parity: a guard failure
-            // that does not compile is answered by `resume_in_blackhole`, which
-            // rebuilds the frame chain and `setposition`s it at the pc the
-            // guard's own resume data encodes. The header pc of the guard's
-            // recovery frame is that position here. Resolved at the head of
-            // this block for two reasons. It sits inside the block because the
-            // block is the only reader — every other exit from the guard arm
-            // returns a pc the bridge or the blackhole reported — and it sits
-            // ahead of the retirement below because the index lookup is keyed on
-            // a compiled loop that `remove_compiled_loop` is about to drop:
-            // asking afterwards finds nothing and silently answers `target_pc`,
-            // which resumes at the loop entry against state the recovery has
-            // already rewound. The failing guard's own layout carries the same
-            // header pc, so reading it first also answers without a lookup.
-            // A bridge guard carries no frontend recovery layout
-            // (`compile.py send_bridge_to_backend`); the backend stamped
-            // its trace's header pc on the descr (`CompiledTraceInfo`), so
-            // that is read next.
-            let guard_resume_pc = fd
-                .trace_info_any()
-                .and_then(|info| {
-                    info.downcast_ref::<majit_backend::CompiledTraceInfo>()
-                        .map(|info| info.header_pc)
-                })
-                .or_else(|| self.get_merge_point_pc(owning_key, trace_id, fail_index))
-                .map(|pc| pc as usize)
-                .unwrap_or(target_pc);
-            state.recover_after_compiled_run();
-            self.meta.invalidate_loop(green_key);
-            self.meta.remove_compiled_loop(green_key);
-            self.meta.warm_state_mut().abort_tracing(green_key, true);
-            if let Some(raw_values) = raw_values_for_bridge {
-                self.exit_raw_scratch_out(raw_values);
-            }
-            return Some(guard_resume_pc);
         }
 
         // Re-enter the dispatch loop at `target_pc` so the trace HEADS where its
@@ -7357,6 +6712,729 @@ impl<S: JitState> JitDriver<S> {
             return Some(target_pc);
         }
         None
+    }
+
+    /// Finish, loop-back, or guard failure after the assembler returned.
+    ///
+    /// `warmstate.py execute_assembler` reads `get_latest_descr` and either
+    /// returns `DoneWithThisFrameDescr*.get_result` or calls `handle_fail`.
+    /// The int finish that already returned a word never reaches this.
+    fn consume_compiled_entry_result(
+        &mut self,
+        green_key: u64,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+        result: crate::pyjitpl::CompileResult<S::Meta>,
+        compiled_meta: &std::sync::Arc<S::Meta>,
+        vable: Option<&JitDriverVar>,
+        selected_dispatch_key: u32,
+        portal_rca: bool,
+    ) -> Option<usize> {
+        let mut result = result;
+        if portal_rca {
+            eprintln!(
+                "[portal-rca][compiled-exit] green_key={green_key} \
+                 dispatch_key={selected_dispatch_key} is_finish={} fail_index={} \
+                 typed_values={:?}",
+                result.is_finish, result.fail_index, result.typed_values
+            );
+        }
+
+        // Stage E4, before the arm split, so it prices one pair of calls
+        // rather than a different pair per outcome — and before the FINISH
+        // arm takes the exit values out from under it.
+        #[cfg(feature = "__back-edge-stage-probe")]
+        if result.is_finish || result.fail_index == u32::MAX {
+            count_back_edge_stage_passes(BackEdgeStage::MarshalOut, stage_repeats.marshal_out);
+            for _ in 0..stage_repeats.marshal_out {
+                if !result.is_finish && !result.typed_values.is_empty() {
+                    state.restore_values(&compiled_meta, &result.typed_values);
+                }
+                self.sync_after(state, &compiled_meta, vable, None);
+                std::hint::black_box(&mut *state);
+            }
+        }
+
+        if result.is_finish {
+            // compile.py `_DoneWithThisFrameDescr.final_descr = True`:
+            // the compiled run ended in FINISH, so the traced function has
+            // RETURNED. Upstream `handle_fail` raises `jitexc.DoneWithThisFrame*`
+            // and unwinds the portal; there is no resume point past a final
+            // descr. `target_pc` is the back edge, so resuming there restarts
+            // the loop the run just finished — with only the FINISH's own
+            // argument restored, not the loop-carried state — and the caller
+            // re-enters compiled code at the next back edge, making one call
+            // cost one full compiled run per remaining iteration.
+            //
+            // Publish the FINISH arguments out of band. Front end A reads the
+            // same outcome as `DetailedDriverRunOutcome::Finished` and returns
+            // from the portal; front end B's `Option<resume_pc>` signature has
+            // no variant for "the function returned", so the `#[jit_interp]`
+            // expansion drains this latch right after the call and returns it
+            // as the portal's own return value.
+            // Taken, not copied: this arm returns below, so the exit values
+            // in `result` have no reader past this point.
+            self.meta.back_edge_finish_word = None;
+            self.meta.back_edge_finish = Some(std::mem::take(&mut result.typed_values));
+            // The meta the run was handed, not a second handle to it:
+            // cloning `result.meta` here bought a refcount pair for a value
+            // already in scope.
+            let run_meta = &compiled_meta;
+            // The FINISH arguments are NOT the loop-carried state, so they
+            // are not written back into it. `warmstate.py:405-419
+            // execute_assembler` takes the `DoneWithThisFrameDescr*` fast
+            // path straight to `fail_descr.get_result(cpu, deadframe)` and
+            // returns; the only thing it reads off the deadframe is the
+            // portal's own result, and it touches no interpreter state on
+            // the way out. A `restore_values` here decodes the FINISH
+            // descr's `fail_arg_types` — one word for an int-returning
+            // portal — into slots indexed by the state's live-value
+            // layout, so a state with more than one live field indexes
+            // past the end of the list it was handed.
+            // The descriptor the entry decided on is the one the exit
+            // syncs through — resolved once above and carried here rather
+            // than asked for again. `warmstate.py:483/509-511` reads the
+            // cell once per `maybe_compile_and_run` and carries the read
+            // out to the executor for the same reason; the driver's static
+            // data is a configuration-time constant (see
+            // `descriptor_cache`), so a second consultation could only
+            // return the same object at the cost of one more refcount pair
+            // per compiled entry.
+            self.sync_after(state, run_meta, vable, None);
+            // Kept for callers that cannot consume the latch (a portal whose
+            // return type the expansion cannot build from a `Value`). Those
+            // callers see today's behaviour unchanged; a caller that drains
+            // the latch never reaches this pc.
+            return Some(target_pc);
+        }
+
+        // Normal loop back-edge JUMP, not a guard failure.
+        if result.fail_index == u32::MAX {
+            // Same handle as the FINISH arm above, for the same reason.
+            let run_meta = &compiled_meta;
+            if !result.typed_values.is_empty() {
+                state.restore_values(run_meta, &result.typed_values);
+            }
+            // Carried from the entry decision above, not re-resolved; see
+            // the FINISH arm for why one resolution serves both ends of a
+            // compiled entry.
+            self.sync_after(state, run_meta, vable, None);
+            return Some(target_pc);
+        }
+
+        // compile.py handle_fail
+        let fail_index = result.fail_index;
+        let trace_id = result.trace_id;
+        // `compile.py ResumeGuardDescr.handle_fail` / `resume.py
+        // blackhole_from_resumedata` read fail values from the deadframe
+        // in place (`resume.py ResumeDataDirectReader.decode_int` via
+        // `self.cpu.get_int_value(self.deadframe, num)`). No dense list
+        // is built unless `must_compile` starts a bridge.
+        let descr_arc = result
+            .descr_arc
+            .take()
+            .expect("a guard exit carries its descr");
+        // `compile.py handle_fail(self, deadframe, ...)`: the failing
+        // guard's own `ResumeGuardDescr` is what every read below is off
+        // — its fail-arg types, its `rd_*` resume payload — not a layout
+        // assembled per failure from the frontend's records.
+        let fd: &dyn majit_ir::FailDescr = descr_arc
+            .as_fail_descr()
+            .expect("a guard exit carries a FailDescr");
+        let guard_value_operand = result.guard_value_operand;
+        // `compile.py handle_fail` `resumedescr.rd_loop_token`, resolved
+        // once where the run handed the descr back.
+        let descr_owning_key = result.rd_loop_token;
+        // blackhole.py `_prepare_resume_from_failure(deadframe)`:
+        // the pending exception grabbed at guard failure
+        // (cpu.grab_exc_value) must seed the blackhole resume so an
+        // exception guard unwinds into its handler instead of resuming
+        // the no-exception continuation.
+        let guard_exc = result.exception.exc_value;
+        let savedata = result.savedata;
+        // Keep `result` (and its deadframe) until this arm returns so
+        // `jf_savedata` stays rooted through `AllVirtuals.show`, matching
+        // `compile.py handle_fail(self, deadframe, ...)`.
+        // Also park the copied GCREF: `AllVirtuals.show` reads this
+        // word after the reconstruction has already allocated.
+        let mut savedata_slot = [savedata.map_or(0, majit_ir::GcRef::as_usize) as i64];
+        let _savedata_root = unsafe {
+            crate::resume::DeadFrameRefRoots::enter(&mut savedata_slot, |_| savedata.is_some())
+        };
+        let savedata = savedata.map(|_| majit_ir::GcRef(savedata_slot[0] as usize));
+        // The reconstruction below allocates through the blackhole allocator,
+        // so hold the exception where the frontend's root walker can reach
+        // it until `prepare_resume_from_failure` hands it to the blackhole.
+        let _guard_exc_root = crate::blackhole::GuardExcRoot::park(guard_exc);
+
+        // must_compile tick for bridge threshold counting.
+        if crate::majit_log_enabled() {
+            let descr_addr = std::sync::Arc::as_ptr(&descr_arc) as *const () as usize;
+            eprintln!(
+                "[jit] handle_fail: fail_index={} trace_id={} descr_addr={:#x} values={}",
+                fail_index,
+                trace_id,
+                descr_addr,
+                fd.fail_arg_types().len()
+            );
+        }
+        if failvals_enabled() {
+            let raw_values = result.deadframe.as_ref().map_or_else(Vec::new, |frame| {
+                self.meta.raw_exit_slots_from_deadframe(frame, fd)
+            });
+            eprintln!(
+                "@@@FAILVALS fail_index={} resume_pc={} raw_values={:?}",
+                fail_index,
+                self.get_merge_point_pc(green_key, trace_id, fail_index)
+                    .map(|p| p as i64)
+                    .unwrap_or(-1),
+                raw_values
+            );
+        }
+        if crate::callee_rca_enabled() {
+            let raw_values = result.deadframe.as_ref().map_or_else(Vec::new, |frame| {
+                self.meta.raw_exit_slots_from_deadframe(frame, fd)
+            });
+            eprintln!(
+                "[callee-rca][guard-fail] fail_index={} trace_id={} raw_values={:?} exit_types={:?}",
+                fail_index,
+                trace_id,
+                raw_values,
+                fd.fail_arg_types(),
+            );
+            if let Some(dump) = state.debug_state_fields(&compiled_meta) {
+                eprintln!("[callee-rca][post-execute-token-state]\n{dump}");
+            }
+        }
+        // Resolved once for the whole event, where the run handed the descr
+        // back, and carried here: `compile.py handle_fail` reads
+        // `resumedescr.rd_loop_token` once and hands the loop it names to
+        // the `must_compile` call. A descr with no owner stamped is the
+        // loop that was entered.
+        let owning_key = descr_owning_key.unwrap_or(green_key);
+        // `guard_value_operand` was read off the deadframe while it was
+        // live (`compile.py must_compile` `cpu.get_value_direct`). The
+        // fail-values slice is only the fallback for backends that
+        // resolve the GUARD_VALUE index from the dense vector.
+        let (must_compile, owning_key) = self.meta.must_compile_with_owning_key(
+            &descr_arc,
+            &[],
+            guard_value_operand,
+            owning_key,
+        );
+        // compile.py: must_compile() and not stack_almost_full().
+        // MAJIT_NO_BRIDGE (diagnostic): suppress bridge recording so every
+        // guard failure resumes via blackhole — isolates bridge-record
+        // resume defects from the blackhole path.
+        //
+        // Pending-field guards bridge through setup_bridge_sym's
+        // pending-field prologue (resume.py:993-1007).
+        let should_bridge = must_compile
+            && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full()
+            && !no_bridge_enabled()
+            && bridge_fuel_take();
+
+        // compile.py handle_fail. `must_compile() and not
+        // stack_almost_full()` → `_trace_and_compile_from_bridge`, else
+        // `resume_in_blackhole`; the two are mutually exclusive and
+        // neither returns. majit adapts by returning the interpreter
+        // resume pc.
+        //
+        // The bridging arm enters the walk at the guard's own jitcode
+        // position, so the rest of the opcode the guard sits inside is
+        // recorded rather than run where the bridge cannot see it. It
+        // declines — and only before running anything — for a state with
+        // no dispatch jitcode, a resume frame it cannot seed a register
+        // file from, or a bridge setup that gave up; the blackhole arm
+        // below is then the answer, exactly as when the guard does not
+        // `must_compile` at all.
+        // Decode a dense list only when this failure will start a
+        // bridge (`compile.py ResumeGuardDescr.handle_fail` when
+        // `must_compile` fires — about once per 200 failures).
+        let mut raw_values_for_bridge: Option<Vec<i64>> = None;
+        if should_bridge {
+            let mut raw_values = self.take_exit_raw_scratch();
+            if let Some(frame) = result.deadframe.as_ref() {
+                raw_values.extend(self.meta.raw_exit_slots_from_deadframe(frame, fd));
+            }
+            if let Some(pc) = self.bridge_from_guard_resume_position(
+                &descr_arc,
+                state,
+                env,
+                &raw_values,
+                target_pc,
+            ) {
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[bridge] guard-resume bridge key={} trace={} fail={} resume_pc={}",
+                        green_key, trace_id, fail_index, pc,
+                    );
+                }
+                self.exit_raw_scratch_out(raw_values);
+                return Some(pc);
+            }
+            raw_values_for_bridge = Some(raw_values);
+        }
+
+        // compile.py:711 resume_in_blackhole
+        // compile.py `ResumeGuardDescr` storage — `rd_numb` /
+        // `rd_consts` / `rd_virtuals` / `rd_pendingfields` borrowed off
+        // the failing descr itself (`get_resumestorage(): return self`),
+        // so blackhole resume observes the guard-owned pool the GC
+        // walker updates, and nothing is built per failure to hold them.
+        if let Some(rd_numb) = fd.rd_numb() {
+            let rd_consts_slice: &[Const] = fd.rd_consts().unwrap_or(&[]);
+
+            // `resume.py _prepare_virtuals` is a no-op when
+            // `storage.rd_virtuals` is empty (the regex `and`/`or`
+            // leaf: nvirtuals=0). Skip the per-failure convert and
+            // the two empty `VirtualCache` vecs `prepare_virtuals`
+            // would mint for `Some(&[])`.
+            let virtual_infos;
+            let rd_virtuals_slice = match fd.rd_virtuals() {
+                Some(rds) if !rds.is_empty() => {
+                    virtual_infos = rds
+                        .iter()
+                        .map(|rd| crate::resume::virtual_info_from_rd(rd))
+                        .collect::<Vec<_>>();
+                    Some(virtual_infos.as_slice())
+                }
+                _ => None,
+            };
+
+            // resume.py:1338-1340: `jitcode = jitcodes[jitcode_pos];
+            // curbh.setposition(jitcode, pc)`.  Per-driver
+            // pyre layout: root frame resolves to the dispatch
+            // JitCode singleton (RPython's `metainterp_sd.jitcodes`
+            // for the portal jitdriver slot); sub-frames index into
+            // the parent's `descrs` array per `BC_INLINE_CALL`'s
+            // `j` argcode (`blackhole.py:150-157`).
+            //
+            // The snapshot's root `jitcode_index` is unused once
+            // the dispatch singleton is registered — the closure
+            // ignores it and clones `self.dispatch_jitcode`.
+            let _ = env;
+            // resume.py `jitcode = jitcodes[jitcode_pos]` —
+            // resolve every frame statelessly from the flat global
+            // registry by its self-describing absolute index (no root/sub
+            // branch, no parent-relative descrs walk, no last-frame state).
+            // `resume.py`'s `jitcode = jitcodes[jitcode_pos]` indexes the
+            // prebuilt list in place.  Borrowing it costs nothing; the
+            // `to_vec` that stood here cloned every `Arc` in the registry
+            // — two atomic RMWs per jitcode — on a path this fixture takes
+            // once per input character.
+            let jitcode_registry: &[std::sync::Arc<crate::jitcode::JitCode>] = self.meta.jitcodes();
+            let resolve_jitcode =
+                |jitcode_index: i32, pc: i32| -> Option<crate::resume::ResolvedJitCode> {
+                    let resolved_jitcode = jitcode_registry.get(jitcode_index as usize)?.clone();
+                    Some(crate::resume::ResolvedJitCode::new(
+                        resolved_jitcode,
+                        pc as usize,
+                    ))
+                };
+
+            let fallback_alloc = crate::resume::NullAllocator;
+            let allocator: &dyn crate::resume::BlackholeAllocator = self
+                .blackhole_allocator
+                .as_deref()
+                .unwrap_or(&fallback_alloc);
+
+            // Inline-call-only builder so byte 17 (BC_INLINE_CALL) is
+            // wired to handler_inline_call_nested_ext when the
+            // multi-frame state-field-JIT chain reconstructs sub-frames
+            // via parent.descrs[idx].as_jitcode() above.  3
+            // retired the dispatch_one BC_INLINE_CALL legacy arm so an
+            // empty builder would now panic on byte 17.  Re-apply
+            // staticdata control opcodes after the constructor's
+            // BC_LIVE/BC_CATCH_EXCEPTION/BC_RVMPROF_CODE defaults so
+            // the values match the metainterp's actual byte
+            // assignments.
+            let mut bh_builder = BackEdgeBhBuilder::lease();
+            bh_builder.set_cpu(self.meta_interp().blackhole_cpu());
+            bh_builder.setup_cached_control_opcodes(
+                self.meta_interp().staticdata.op_live,
+                self.meta_interp().staticdata.op_catch_exception,
+                self.meta_interp().staticdata.op_rvmprof_code,
+            );
+            // `blackhole_from_resumedata` below acquires one interpreter
+            // per resumed frame, and every frame that still has a caller
+            // takes `bhimpl_jit_merge_point`'s recursive-portal branch
+            // (blackhole.py:1079-1093), which indexes `jitdrivers_sd`
+            // directly.  The lease is thread-local and carries whatever
+            // the previous resume left on it, so seed the table here
+            // instead of depending on that.
+            let jitdrivers_sd = bh_jitdrivers_sd(&self.meta_interp().staticdata);
+            if !std::sync::Arc::ptr_eq(&bh_builder.jitdrivers_sd, jitdrivers_sd) {
+                bh_builder.setup_jitdrivers_sd(std::sync::Arc::clone(jitdrivers_sd));
+            }
+            let all_liveness = self.meta_interp().staticdata.liveness_info.as_slice();
+            // The state-field macro's `&state` is host-stack storage, so
+            // its identity may be folded out of the failing frame. Ask
+            // only an explicit host opt-in for the current call's address;
+            // heap virtualizables retain the live resume TAGBOX path.
+            let vable_identity_override = self.meta.virtualizable_info().and_then(|info| {
+                state
+                    .blackhole_virtualizable_identity(&compiled_meta, &info.name, info)
+                    .map(|ptr| ptr as i64)
+            });
+            // `resume.py ResumeDataDirectReader.decode_int` —
+            // `self.cpu.get_int_value(self.deadframe, num)`. Keep
+            // `result` (and its deadframe) alive across this call so
+            // `jf_savedata` stays rooted; `FailArgSource::JitFrame`
+            // also holds an `OwnerRootGuard`.
+            let n_fail_args = fd.fail_arg_types().len();
+            let fallback_raw;
+            let fail_args = match result
+                .deadframe
+                .as_ref()
+                .and_then(|frame| frame.jitframe_ptr())
+            {
+                Some(ptr) => majit_backend::FailArgSource::from_jitframe(ptr, fd, n_fail_args),
+                None => {
+                    fallback_raw = result.deadframe.as_ref().map_or_else(Vec::new, |frame| {
+                        self.meta.raw_exit_slots_from_deadframe(frame, fd)
+                    });
+                    majit_backend::FailArgSource::Slice(&fallback_raw)
+                }
+            };
+            let bh = crate::resume::blackhole_from_resumedata(
+                &mut bh_builder,
+                &resolve_jitcode,
+                rd_numb,
+                rd_consts_slice,
+                all_liveness,
+                fail_args,
+                Some(fd.fail_arg_types()),
+                rd_virtuals_slice,
+                Some(fd.rd_pendingfields().unwrap_or(&[])), // rd_guard_pendingfields
+                Some(
+                    &self.meta_interp().staticdata.virtualref_info as &dyn crate::resume::VRefInfo,
+                ),
+                // Pass the registered vinfo so the vable section of the
+                // resume stream is consumed (avoids a stream desync when
+                // the trace carries virtualizable array boxes).
+                self.meta
+                    .virtualizable_info()
+                    .map(|a| a.as_ref() as &dyn crate::resume::VirtualizableInfo),
+                None, // ginfo
+                vable_identity_override,
+                savedata.and_then(crate::compile::AllVirtuals::show),
+                allocator,
+            );
+            let (mut bh, vable_ptr) = bh;
+            {
+                // Thread the state-field register layout onto every frame
+                // so the `state_field` handlers map a logical scalar/array
+                // index to the flat register slot the resume reader seeded.
+                // Inlined sub-frames carry no state-field ops, but the root
+                // dispatch frame (the chain tail, which owns the merge point
+                // and the loop's state load/store) does, so it must hold the
+                // layout before it runs.
+                let sf_layout = state.state_field_layout();
+                // Seed the reconstructed blackhole chain with the registered
+                // virtualizable info + identity pointer so a mid-body
+                // vable-array opcode (`getarrayitem_vable_*` /
+                // `setarrayitem_vable`) can resolve its vinfo during resume.
+                // Two sources:
+                //   * the portal-inline experiment (gated), OR
+                //   * a state-field machine (no `vable_token` field), whose
+                //     `bh_clear_vable_token` is inert (the `state` struct has
+                //     no heap token), so a non-null vinfo cannot corrupt it.
+                //     The overflow-guard deopt (`int_*_jump_if_ovf` on the
+                //     `[int; virt]` regs) is the first path to run a blackhole
+                //     vable-array op on such a machine.
+                // A real heap virtualizable (`token_offset > 0`, e.g.
+                // PyFrame) keeps its existing null-vinfo resume contract.
+                // The identity pointer must be co-seeded because the GC-root
+                // walk (`resume_mainloop`) dereferences `virtualizable_ptr`
+                // whenever `virtualizable_info` is non-null.
+                let seed_vinfo_ptr = seed_deopt_vinfo_ptr(self.meta.virtualizable_info());
+                {
+                    let mut current = Some(&mut *bh);
+                    while let Some(frame) = current {
+                        frame.state_field_layout = sf_layout.clone();
+                        if !seed_vinfo_ptr.is_null() {
+                            frame.virtualizable_info = seed_vinfo_ptr;
+                            frame.virtualizable_ptr = vable_ptr;
+                        }
+                        current = frame.nextblackholeinterp.as_deref_mut();
+                    }
+                }
+                let exc =
+                    crate::blackhole::BlackholeInterpreter::prepare_resume_from_failure(guard_exc);
+                // Drive the reconstructed frame chain (blackhole.py:1752
+                // `_run_forever`): each completed sub-frame passes its
+                // return value to its caller (resume_mainloop did the
+                // `setup_return_value_*` copy), then we descend to the
+                // caller until a frame raises a control exception — CRN at
+                // a merge point, DoneWithThisFrame at the root, or an
+                // uncaught exception. Unlike `run_forever_with_portal`,
+                // which consumes every frame and so leaves no register file
+                // to read, keep the terminal frame alive: PyPy re-enters
+                // the portal with the CRN reds (warmspot.py:970-983), but
+                // those are only the declared subset, so the structural
+                // equivalent for majit's live `state` struct is to restore
+                // the terminal frame's full register bank
+                // (resume.py:1028-1038 seeded it in slot order) and resume
+                // at the CRN green pc.
+                let mut cur_exc = exc;
+                let outcome = loop {
+                    match bh.resume_mainloop(cur_exc) {
+                        Ok(next_exc) => match bh.nextblackholeinterp.take() {
+                            Some(caller) => {
+                                // Layout + vinfo were seeded across the
+                                // whole chain before the loop started.
+                                bh_builder.release_interp(bh);
+                                bh = caller;
+                                cur_exc = next_exc;
+                            }
+                            // The bottommost frame always raises
+                            // (done_with_this_frame / exit_frame_with_
+                            // exception), so an `Ok` with no caller is
+                            // unreachable.  Nothing returned a result on
+                            // this route, so name it a bail rather than a
+                            // void completion the caller would install.
+                            None => break crate::jitexc::JitException::BailToInterpreter,
+                        },
+                        Err(jit_exc) => break jit_exc,
+                    }
+                };
+                if crate::majit_log_enabled() {
+                    eprintln!("[bh] back_edge_internal: chain resume → {:?}", outcome);
+                }
+                // `compile.py` `resume_in_blackhole`. The walk runs the
+                // reconstructed chain to the next merge point (or out of
+                // the frame) and hands that pc back to the interpreter.
+                // It does not record a bridge: `handle_fail` already
+                // tried `_trace_and_compile_from_bridge` from the guard's
+                // own resumedescr, and a decline is the blackhole branch,
+                // not a second trace started at the merge point the walk
+                // stopped on.
+                let resume_pc = match outcome {
+                    // Next merge point reached (loop back-edge): flush the
+                    // register file into the live state and resume the
+                    // interpreter at the merge point's green pc.
+                    crate::jitexc::JitException::ContinueRunningNormally(args) => {
+                        let green_int = &args.green_int;
+                        // PyPy re-enters the portal with the CRN greens
+                        // (warmspot.py:970-983), so the interpreter
+                        // resumes at the pc the re-executed
+                        // jit_merge_point reported — every `greens`
+                        // declaration puts `pc` first (jit_merge_point
+                        // bucket order), so it is `green_int[0]`. The
+                        // blackhole may have crossed a non-back-edge
+                        // path (e.g. a branch fall-through that leaves
+                        // the loop), in which case the green pc differs
+                        // from the loop-header `target_pc`.
+                        let green_pc = green_int.first().map(|&pc| pc as usize);
+                        if portal_rca_enabled() {
+                            eprintln!(
+                                "[portal-rca][crn] target_pc={} green_int={:?} \
+                                 selected_green_pc={:?}",
+                                target_pc, green_int, green_pc,
+                            );
+                        }
+                        if let Some(pc) = green_pc {
+                            let _ = crate::handle_portal_crn_hook(target_pc, pc);
+                        }
+                        // `restore_banked` consumes both banks densely
+                        // (int slot j at index j, ref scalar j at index
+                        // j); the register file holds them at
+                        // `scalar_slot(j) = int_scalar_base + j` /
+                        // `ref_scalar_slot(j) = ref_scalar_base + j`, so
+                        // slice off the dispatch JitCode's argument
+                        // prefix in each bank.
+                        let layout = state.state_field_layout();
+                        let int_base = layout.int_scalar_base.min(bh.registers_i.len());
+                        let ref_base = layout.ref_scalar_base.min(bh.registers_r.len());
+                        if crate::callee_rca_enabled() {
+                            eprintln!(
+                                "[callee-rca][crn-pre] green_pc={:?} target_pc={} \
+                                 layout={:?} int_base={} ref_base={}",
+                                green_pc, target_pc, layout, int_base, ref_base,
+                            );
+                            eprintln!(
+                                "[callee-rca][crn-pre] bh.registers_i(len={})={:?}",
+                                bh.registers_i.len(),
+                                bh.registers_i,
+                            );
+                            eprintln!(
+                                "[callee-rca][crn-pre] bh.registers_r(len={})={:?}",
+                                bh.registers_r.len(),
+                                bh.registers_r,
+                            );
+                            eprintln!(
+                                "[callee-rca][crn-pre] int_slice={:?}",
+                                &bh.registers_i[int_base..],
+                            );
+                            eprintln!(
+                                "[callee-rca][crn-pre] ref_slice={:?}",
+                                &bh.registers_r[ref_base..],
+                            );
+                            if let Some(dump) = state.debug_state_fields(&compiled_meta) {
+                                eprintln!("[callee-rca][crn-state-before]\n{dump}");
+                            }
+                        }
+                        if layout.num_vable_identity_slots == 0 {
+                            let float_base = layout.float_scalar_base.min(bh.registers_f.len());
+                            state.restore_banked3(
+                                &compiled_meta,
+                                &bh.registers_i[int_base..],
+                                &bh.registers_r[ref_base..],
+                                &bh.registers_f[float_base..],
+                            );
+                        } else {
+                            writeback_live_state_scalars_from_blackhole(
+                                state,
+                                &layout,
+                                &bh,
+                                all_liveness,
+                            );
+                        }
+                        // The carried/delta-tracked reds in the deadframe
+                        // can lag the authoritative live storage (e.g. a
+                        // `stacksize` whose backing stack was popped by the
+                        // compiled body but whose red was captured stale).
+                        // Re-derive them from storage so the green recomputed
+                        // at the resumed `jit_merge_point` (here: `stackok =
+                        // req_size <= stacksize`) reflects reality instead of
+                        // the stale red, otherwise the interpreter re-enters
+                        // the same compiled loop and re-fails the same green
+                        // guard with zero forward progress.
+                        state.recover_after_compiled_run();
+                        if crate::callee_rca_enabled()
+                            && let Some(dump) = state.debug_state_fields(&compiled_meta)
+                        {
+                            eprintln!("[callee-rca][crn-state-after]\n{dump}");
+                        }
+                        // The register file just flushed above is the state
+                        // AT the green pc — the blackhole ran the failing
+                        // opcode forward to the next merge point. Resuming
+                        // anywhere else (the loop-header `target_pc` was
+                        // used here for label-entered runs) re-executes the
+                        // header..green_pc opcodes on post-green state,
+                        // corrupting every value they recompute. The entry
+                        // dispatch key does not change the guard's resume
+                        // snapshot, so label-entered runs resume at the
+                        // green pc like every other run.
+                        let resume_pc = Some(green_pc.unwrap_or(target_pc));
+                        bh.recycle_merge_point_args(args);
+                        resume_pc
+                    }
+                    // The interpreted frame ran to completion inside the
+                    // blackhole: flush, then force the generated mainloop's
+                    // `while pc < len` guard to fail so it exits and
+                    // returns the value computed from the flushed state.
+                    crate::jitexc::JitException::DoneWithThisFrameVoid
+                    | crate::jitexc::JitException::DoneWithThisFrameInt(_)
+                    | crate::jitexc::JitException::DoneWithThisFrameRef(_)
+                    | crate::jitexc::JitException::DoneWithThisFrameFloat(_) => {
+                        let layout = state.state_field_layout();
+                        let int_base = layout.int_scalar_base.min(bh.registers_i.len());
+                        let ref_base = layout.ref_scalar_base.min(bh.registers_r.len());
+                        let float_base = layout.float_scalar_base.min(bh.registers_f.len());
+                        state.restore_banked3(
+                            &compiled_meta,
+                            &bh.registers_i[int_base..],
+                            &bh.registers_r[ref_base..],
+                            &bh.registers_f[float_base..],
+                        );
+                        Some(usize::MAX)
+                    }
+                    // blackhole.py `_exit_frame_with_exception` →
+                    // warmspot.py:998-1005: the resumed chain raised an
+                    // exception that escaped every reconstructed frame
+                    // (the hand-rolled loop above drove the multi-frame
+                    // descent, propagating the exc to the bottommost frame
+                    // just like `_run_forever`). resume_in_blackhole has
+                    // finished; hand the exception to the interpreter's own
+                    // machinery (parity: `eval.rs` re-raises the stored Ref
+                    // via `PyError::from_exc_object`) instead of dropping
+                    // back to re-execute from the guard pc. Returns the
+                    // interpreter's handler pc, or `None` when it has no
+                    // exception machinery — then the crude fallback runs,
+                    // but an exception-less interpreter never reaches here.
+                    // See the twin arm in the tracing-abort adoption
+                    // above: a bail names a jitcode coordinate this
+                    // driver cannot resume at, and the chain has already
+                    // run, so ending the dispatch loop is the closest
+                    // non-replaying answer.  The banked state is restored
+                    // first because the blackhole registers hold what the
+                    // chain computed before it stopped.
+                    crate::jitexc::JitException::BailToInterpreter => {
+                        let layout = state.state_field_layout();
+                        let int_base = layout.int_scalar_base.min(bh.registers_i.len());
+                        let ref_base = layout.ref_scalar_base.min(bh.registers_r.len());
+                        let float_base = layout.float_scalar_base.min(bh.registers_f.len());
+                        state.restore_banked3(
+                            &compiled_meta,
+                            &bh.registers_i[int_base..],
+                            &bh.registers_r[ref_base..],
+                            &bh.registers_f[float_base..],
+                        );
+                        Some(usize::MAX)
+                    }
+                    crate::jitexc::JitException::ExitFrameWithExceptionRef(exc_ref) => {
+                        state.deliver_blackhole_exception(exc_ref)
+                    }
+                };
+                bh_builder.release_interp(bh);
+                // `BlackholeInterpBuilder.release_interp` makes the frame
+                // reusable as soon as `_run_forever` is done. The
+                // interpreter may re-enter the portal on the pc we return,
+                // so the builder goes back to the pool before that.
+                drop(bh_builder);
+                if let Some(pc) = resume_pc {
+                    if let Some(raw_values) = raw_values_for_bridge {
+                        self.exit_raw_scratch_out(raw_values);
+                    }
+                    return Some(pc);
+                }
+            }
+        }
+
+        // The chain raised an exception and
+        // `deliver_blackhole_exception` returned `None` (the
+        // interpreter has no exception machinery — unreachable for an
+        // exception-less interpreter): fall back to crude state recovery and
+        // resume the interpreter at the guard pc.
+        //
+        // `AbstractResumeGuardDescr.handle_fail` parity: a guard failure
+        // that does not compile is answered by `resume_in_blackhole`, which
+        // rebuilds the frame chain and `setposition`s it at the pc the
+        // guard's own resume data encodes. The header pc of the guard's
+        // recovery frame is that position here. Resolved at the head of
+        // this block for two reasons. It sits inside the block because the
+        // block is the only reader — every other exit from the guard arm
+        // returns a pc the bridge or the blackhole reported — and it sits
+        // ahead of the retirement below because the index lookup is keyed on
+        // a compiled loop that `remove_compiled_loop` is about to drop:
+        // asking afterwards finds nothing and silently answers `target_pc`,
+        // which resumes at the loop entry against state the recovery has
+        // already rewound. The failing guard's own layout carries the same
+        // header pc, so reading it first also answers without a lookup.
+        // A bridge guard carries no frontend recovery layout
+        // (`compile.py send_bridge_to_backend`); the backend stamped
+        // its trace's header pc on the descr (`CompiledTraceInfo`), so
+        // that is read next.
+        let guard_resume_pc = fd
+            .trace_info_any()
+            .and_then(|info| {
+                info.downcast_ref::<majit_backend::CompiledTraceInfo>()
+                    .map(|info| info.header_pc)
+            })
+            .or_else(|| self.get_merge_point_pc(owning_key, trace_id, fail_index))
+            .map(|pc| pc as usize)
+            .unwrap_or(target_pc);
+        state.recover_after_compiled_run();
+        self.meta.invalidate_loop(green_key);
+        self.meta.remove_compiled_loop(green_key);
+        self.meta.warm_state_mut().abort_tracing(green_key, true);
+        if let Some(raw_values) = raw_values_for_bridge {
+            self.exit_raw_scratch_out(raw_values);
+        }
+        return Some(guard_resume_pc);
     }
 
     fn back_edge_or_run_compiled_internal(
@@ -7704,6 +7782,26 @@ impl<S: JitState> JitDriver<S> {
     /// than rebuilt per consultation. Callers that need to hand ownership on
     /// (the trace-start and bridge-setup paths) clone out of the shared value;
     /// the per-entry paths only read through it.
+    /// Address of the cached driver descriptor. The `Arc` in
+    /// [`Self::descriptor_cache`] keeps it alive for the driver's life.
+    fn driver_descriptor_ptr(
+        &mut self,
+        state: &S,
+        meta: &S::Meta,
+    ) -> Option<*const JitDriverStaticData> {
+        if self.descriptor_cache.is_none() {
+            let resolved = self
+                .descriptor
+                .clone()
+                .or_else(|| state.driver_descriptor(meta))
+                .map(std::sync::Arc::new);
+            self.descriptor_cache = Some(resolved);
+        }
+        self.descriptor_cache
+            .as_ref()
+            .and_then(|cached| cached.as_ref().map(|descr| std::sync::Arc::as_ptr(descr)))
+    }
+
     fn driver_descriptor_for(
         &mut self,
         state: &S,
@@ -7911,6 +8009,11 @@ impl<S: JitState> JitDriver<S> {
             if !ok {
                 return false;
             }
+        }
+        // `execute_assembler` clears the vable token only `if vinfo is not None`.
+        // A driver with no virtualizable info has nothing to reset.
+        if virtualizable.is_none() && self.meta.virtualizable_info().is_none() {
+            return true;
         }
 
         // Refresh the trace-entry vable heap pointer so `initialize_virtualizable`
@@ -8837,6 +8940,20 @@ impl<S: JitState> JitDriver<S> {
         if self.meta.is_tracing() {
             return None;
         }
+        match self.enter_compiled_function_entry(green_key_hash, target_pc, state, env) {
+            SteadyCompiledEntry::Done(resume) => return resume,
+            SteadyCompiledEntry::NeedsInternal => {
+                return self.function_entry_internal(
+                    green_key_hash,
+                    make_green_key,
+                    target_pc,
+                    state,
+                    env,
+                    false,
+                );
+            }
+            SteadyCompiledEntry::Miss => {}
+        }
         if let Some(handled) = self.try_function_entry_cold_tick(
             green_key_hash,
             &make_green_key,
@@ -8847,6 +8964,146 @@ impl<S: JitState> JitDriver<S> {
             return handled;
         }
         self.function_entry_internal(green_key_hash, make_green_key, target_pc, state, env, false)
+    }
+
+    /// Sole compiled cell for `hash`, when no confirm hook is installed.
+    ///
+    /// `warmstate.py maybe_compile_and_run` walks `lookup_chain` once.
+    /// `:473` declines `JC_TRACING | JC_TEMPORARY`. `:483` reads
+    /// `get_procedure_token` once. A confirm hook stays on the occupied
+    /// door (`:501`).
+    #[inline]
+    fn compiled_function_token(
+        &self,
+        hash: u64,
+    ) -> Option<(u64, std::sync::Arc<majit_backend::JitCellToken>)> {
+        if self.meta.warm_state_ref().has_confirm_enter_jit() {
+            return None;
+        }
+        let warm = self.meta.warm_state_ref();
+        let cell = warm.lookup_chain(hash)?;
+        if cell.next.is_some() || cell.cell_bucket != hash {
+            return None;
+        }
+        if cell.flags.contains(JcFlags::JC_TRACING) || cell.flags.contains(JcFlags::JC_TEMPORARY) {
+            return None;
+        }
+        let cell_key = cell.cell_key?;
+        let token = cell.get_procedure_token()?;
+        if !token.has_compiled_code() {
+            return None;
+        }
+        Some((cell_key, token))
+    }
+
+    /// `warmstate.py maybe_compile_and_run` then `execute_assembler` for a
+    /// compiled function-entry token.
+    ///
+    /// Reds are unspecialized into the driver's scratch (`:503-511`) and the
+    /// assembler runs. `execute_assembler` touches the virtualizable only
+    /// `if vinfo is not None`, so a driver with no virtualizable info does
+    /// not resolve the descriptor, reset a vable token, or walk red types.
+    /// A longer input list, a pending label, or a cross-loop cut falls
+    /// back to [`Self::back_edge_resolved`].
+    #[inline(never)]
+    fn enter_compiled_function_entry(
+        &mut self,
+        green_key_hash: u64,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+    ) -> SteadyCompiledEntry {
+        let Some((cell_key, token)) = self.compiled_function_token(green_key_hash) else {
+            return SteadyCompiledEntry::Miss;
+        };
+        if !state.can_trace() {
+            return SteadyCompiledEntry::Done(None);
+        }
+        if self.meta.virtualizable_info().is_some()
+            || self.meta.single_pass_label_entry_key.is_some()
+            || !self.meta.cut_compiled_keys.is_empty()
+        {
+            return SteadyCompiledEntry::Done(self.back_edge_resolved(
+                cell_key,
+                token,
+                target_pc,
+                state,
+                env,
+                || {},
+            ));
+        }
+        let mut scratch = self.take_entry_scratch();
+        let compatible = {
+            let Some(meta) = self.meta.get_compiled_meta(cell_key) else {
+                self.entry_scratch_out(scratch);
+                return SteadyCompiledEntry::NeedsInternal;
+            };
+            let compatible = state.is_compatible(meta);
+            if compatible {
+                state.extract_live_values_into(
+                    meta,
+                    &mut scratch.live_values,
+                    &mut scratch.raw,
+                    &mut scratch.types,
+                );
+            }
+            compatible
+        };
+        if !compatible {
+            self.entry_scratch_out(scratch);
+            self.meta.invalidate_loop(cell_key);
+            return SteadyCompiledEntry::Done(None);
+        }
+        // `execute_assembler` receives the unspecialized reds. More inputs
+        // than reds is the virtualizable extension, which this driver does
+        // not have (`vinfo is None` above); that case stays on
+        // `back_edge_resolved`.
+        let need = token.inputarg_types().len();
+        if need > scratch.live_values.len() {
+            self.entry_scratch_out(scratch);
+            return SteadyCompiledEntry::Done(self.back_edge_resolved(
+                cell_key,
+                token,
+                target_pc,
+                state,
+                env,
+                || {},
+            ));
+        }
+        if let Some(ref hook) = self.meta.hooks.on_compiled_entry {
+            hook(cell_key, target_pc);
+        }
+        if let Some(value) = self
+            .meta
+            .poll_raw_int_finish(&token, cell_key, &scratch.live_values)
+        {
+            self.entry_scratch_out(scratch);
+            self.meta.back_edge_finish = None;
+            self.meta.back_edge_finish_word = Some(value);
+            return SteadyCompiledEntry::Done(Some(target_pc));
+        }
+        let result = self
+            .meta
+            .raw_int_fallback
+            .take()
+            .expect("poll_raw_int_finish stored the general-case result");
+        self.entry_scratch_out(scratch);
+        let compiled_meta = self
+            .meta
+            .get_compiled_meta(cell_key)
+            .cloned()
+            .expect("compiled meta survived the run");
+        SteadyCompiledEntry::Done(self.consume_compiled_entry_result(
+            cell_key,
+            target_pc,
+            state,
+            env,
+            result,
+            &compiled_meta,
+            None,
+            0,
+            portal_rca_enabled(),
+        ))
     }
 
     /// `warmstate.py maybe_compile_and_run` `:465-480` with
@@ -8869,6 +9126,9 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         env: &S::Env,
     ) -> Option<Option<usize>> {
+        if let Some((cell_key, token)) = self.compiled_function_token(green_key_hash) {
+            return Some(self.back_edge_resolved(cell_key, token, target_pc, state, env, || {}));
+        }
         if let Some(cell) = self.meta.warm_state_ref().lookup_chain(green_key_hash) {
             if cell.next.is_some() {
                 return None;
@@ -10117,6 +10377,30 @@ mod tests {
         fn validate_close(_sym: &Self::Sym, _meta: &Self::Meta) -> bool {
             true
         }
+    }
+
+    /// `compile.py make_and_attach_done_descrs([self, cpu])` runs from
+    /// `MetaInterp::new`, which `JitDriver::new` calls, and again from
+    /// `finish_setup_descrs_for_jitdrivers` when the descriptor is registered.
+    /// The int cell is that singleton's address.
+    #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
+    #[test]
+    fn driver_setup_publishes_done_int_cell() {
+        let mut driver = JitDriver::<CountingDoorState>::new(1);
+        let cell = driver.meta.backend().done_with_this_frame_descr_int_cell();
+        assert_ne!(cell, 0);
+        assert_eq!(
+            cell,
+            driver
+                .meta
+                .backend()
+                .attached_done_with_this_frame_descr_int()
+        );
+        driver.ensure_descriptor_registered();
+        assert_eq!(
+            driver.meta.backend().done_with_this_frame_descr_int_cell(),
+            cell
+        );
     }
 
     impl JitState for TypedInputState {
@@ -12300,6 +12584,84 @@ mod tests {
         assert!(
             driver.meta.is_tracing(),
             "the threshold is reached by counting, exactly as for a cell with no token",
+        );
+    }
+
+    /// `maybe_compile_and_run` calls `bound_reached(hash, cell, *args)` with
+    /// the `JC_TEMPORARY` cell it found. A non-zero `code_ptr` takes
+    /// `bound_reached`'s typed arm (`force_start_tracing_for_key`); that arm
+    /// must set `JC_TRACING` on this cell and not install a second one.
+    /// `code_ptr == 0` stays on `ensure_cell_by_key` and cannot show the split.
+    #[test]
+    fn a_temporary_cell_starts_tracing_on_the_found_cell() {
+        // `WarmEnterState::new` installs the Ref hash resolver. Hash the
+        // portal greens after that, or the key will not match the one
+        // `with_typed_decision_key` rebuilds.
+        let mut driver = JitDriver::<CountingDoorState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let target_pc = 7usize;
+        let code_ptr = 0x1234usize;
+        let key = GreenKey::with_types(
+            vec![target_pc as i64, 0, code_ptr as i64],
+            vec![Type::Int, Type::Int, Type::Ref],
+        );
+        let green_key = majit_ir::pypyjit_greenkey_uhash(target_pc, false, code_ptr as u64);
+        assert_eq!(green_key, key.get_uhash());
+        attach_tmp_callback_cell(&mut driver, green_key);
+
+        let token_number = {
+            let cell = driver
+                .meta
+                .warm_state
+                .lookup_chain(green_key)
+                .expect("the temporary callback installed one cell");
+            assert!(cell.next.is_none(), "the fast path only owns a lone cell");
+            assert_eq!(cell.cell_bucket, green_key);
+            assert!(cell.comparekey.is_none());
+            assert!(cell.flags.contains(crate::warmstate::JcFlags::JC_TEMPORARY));
+            assert!(!cell.is_tracing());
+            cell.get_procedure_token()
+                .expect("the callback token is live")
+                .number
+        };
+        assert_eq!(driver.meta.warm_state.get_stats().num_cells, 1);
+
+        let mut state = CountingDoorState {
+            code_ptr,
+            ..Default::default()
+        };
+        assert_eq!(
+            driver.back_edge_keyed(green_key, target_pc, &mut state, &(), || {}),
+            None,
+            "the first tick must not start tracing",
+        );
+        assert!(!driver.meta.is_tracing());
+        assert_eq!(
+            driver.back_edge_keyed(green_key, target_pc, &mut state, &(), || {}),
+            Some(target_pc),
+        );
+        assert!(driver.meta.is_tracing());
+        assert_eq!(
+            driver.meta.warm_state.get_stats().num_cells,
+            1,
+            "bound_reached must mark the found cell, not install another",
+        );
+
+        let cell = driver
+            .meta
+            .warm_state
+            .lookup_chain(green_key)
+            .expect("the original cell is still the bucket");
+        assert!(cell.next.is_none());
+        assert!(cell.is_tracing());
+        assert!(cell.flags.contains(crate::warmstate::JcFlags::JC_TEMPORARY));
+        assert!(cell.comparekey_matches(&key));
+        assert_eq!(cell.cell_key, Some(green_key));
+        assert_eq!(
+            cell.get_procedure_token()
+                .expect("the callback token stays on the found cell")
+                .number,
+            token_number,
         );
     }
 

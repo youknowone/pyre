@@ -2314,6 +2314,15 @@ pub struct MetaInterp<M: Clone> {
     /// this carries the result value out of band instead. Set by
     /// `back_edge_internal`, `take`n by `JitDriver::take_back_edge_finish*`.
     pub(crate) back_edge_finish: Option<ExitValues>,
+    /// One-word form of [`Self::back_edge_finish`] for
+    /// `DoneWithThisFrameDescrInt.get_result`: the portal reads slot 0 and
+    /// does not move an `ExitValues` buffer. `take_back_edge_finish_int`
+    /// drains this first.
+    pub(crate) back_edge_finish_word: Option<i64>,
+    /// Stashed when [`Self::poll_raw_int_finish`] ran the trace and the exit
+    /// was not the int finish singleton. The caller takes it and continues
+    /// with the same `CompileResult` `execute_assembler` would have returned.
+    pub(crate) raw_int_fallback: Option<CompileResult<M>>,
     /// Single-pass tracing: the walk-final scalar state-field values captured
     /// off the still-live sym at the CloseLoop point (scalar state-field index
     /// order, idx `0..num_scalars`), BEFORE the CloseLoop arm clears the sym.
@@ -4134,6 +4143,8 @@ impl<M: Clone> MetaInterp<M> {
             single_pass_finish: false,
             single_pass_finish_values: None,
             back_edge_finish: None,
+            back_edge_finish_word: None,
+            raw_int_fallback: None,
             single_pass_scalar_values: None,
             single_pass_ref_scalar_values: None,
             single_pass_virt_array_values: None,
@@ -13067,6 +13078,21 @@ impl<M: Clone> MetaInterp<M> {
         // RPython: bridge compilation happens synchronously inside
         // assembler_call_helper (called from compiled code). No deferred queue.
 
+        self.consume_executed_frame(green_key, meta, frame)
+    }
+
+    /// `warmstate.py execute_assembler` after `func_execute_token` returns.
+    ///
+    /// Split from the call so a `DoneWithThisFrameDescrInt` portal can return
+    /// the one word without building this result. `Err` from
+    /// [`Backend::execute_token_done_int`] lands here with the deadframe the
+    /// general arm already expected.
+    fn consume_executed_frame(
+        &mut self,
+        green_key: u64,
+        meta: Option<std::sync::Arc<M>>,
+        frame: majit_backend::DeadFrame,
+    ) -> CompileResult<M> {
         // Borrowed off the frame, not shared: a final descr is read here and
         // returned, so the entry that runs one compiled body to completion
         // pays no reference count for it. The guard arm below takes the
@@ -13234,6 +13260,34 @@ impl<M: Clone> MetaInterp<M> {
             exception,
             status,
             guard_value_operand,
+        }
+    }
+
+    /// `warmstate.py execute_assembler` int fast path.
+    ///
+    /// `Some` is `DoneWithThisFrameDescrInt.get_result`: slot 0, frame
+    /// released, no `CompileResult`. `None` means the trace already ran and
+    /// [`Self::raw_int_fallback`] holds the general-case result.
+    pub fn poll_raw_int_finish(
+        &mut self,
+        procedure_token: &std::sync::Arc<JitCellToken>,
+        green_key: u64,
+        live_values: &[Value],
+    ) -> Option<i64> {
+        Self::prepare_compiled_run_io();
+        match self
+            .backend
+            .execute_token_done_int(procedure_token, live_values)
+        {
+            Ok(value) => {
+                Self::finish_compiled_run_io();
+                Some(value)
+            }
+            Err(frame) => {
+                let result = self.consume_executed_frame(green_key, None, frame);
+                self.raw_int_fallback = Some(result);
+                None
+            }
         }
     }
 
@@ -21647,6 +21701,12 @@ impl MetaInterpStaticData {
     /// = exc_descr` — upstream binds the descr to the cpu instance
     /// inside the same method body.
     pub fn finish_setup_descrs_for_jitdrivers(&mut self, cpu: &mut dyn majit_backend::Backend) {
+        // `compile.py make_and_attach_done_descrs([self, cpu])` publishes
+        // `done_with_this_frame_descr_int` on the cpu before any compiled
+        // code runs. `MetaInterp::new` does it once; registration repeats
+        // it so a driver that reaches compile through this hook still has
+        // the cell attached.
+        self.attach_descrs_to_cpu(cpu);
         // `pyjitpl.py` `exc_descr = compile.PropagateExceptionDescr()` —
         // a *single* shared instance across every jitdriver + the cpu.
         // pyre's `register_jitdriver_sd` calls this method on every

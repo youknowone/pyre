@@ -52,6 +52,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 /// every call. The flag never changes after process startup, so checking it
 /// from hot dispatch paths shows up in profiles. The `LazyLock` caches the
 /// boolean. Mirrors the equivalent helper in `majit-backend-cranelift`.
+#[inline]
 pub fn majit_log_enabled() -> bool {
     static ENABLED: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("MAJIT_LOG").is_some());
@@ -73,6 +74,7 @@ pub fn majit_ops_log_enabled() -> bool {
 }
 
 /// Whether `MAJIT_DUMP` is set, cached at first access.
+#[inline]
 pub fn majit_dump_enabled() -> bool {
     static ENABLED: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("MAJIT_DUMP").is_some());
@@ -90,6 +92,7 @@ pub fn majit_j2plan_log_enabled() -> bool {
 ///
 /// Read once per residual call and twice per compiled-trace entry, so the
 /// uncached form put `getenv` on the hottest paths the backend has.
+#[inline]
 pub fn gc_freelist_diag_enabled() -> bool {
     // One cache for the whole process: `majit_gc` reads the same variable in
     // `free_arena`.
@@ -97,6 +100,7 @@ pub fn gc_freelist_diag_enabled() -> bool {
 }
 
 /// Whether `MAJIT_DYNASM_EXEC_DIAG` is set, cached at first access.
+#[inline]
 pub fn dynasm_exec_diag_enabled() -> bool {
     static ENABLED: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("MAJIT_DYNASM_EXEC_DIAG").is_some());
@@ -112,6 +116,11 @@ static JIT_EXC_TYPE: AtomicI64 = AtomicI64::new(0);
 /// `llmodel.py:319-322` does the same in untranslated runs, handing the entry a
 /// dummy container instead of the real `pypy_threadlocal_s`.
 static DUMMY_THREADLOCAL_SLOT: i64 = 0;
+/// Set by [`jit_threadlocalref_set`]. Until then every entry receives the
+/// dummy word: `llop.threadlocalref_addr` is one load, and an empty
+/// `RefCell<Vec>` borrow on the unset path was that load plus a TLS flag.
+static THREADLOCAL_SLOTS_USED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 thread_local! {
     /// llmodel.py / :317-323 `threadlocalref_addr` parity: compiled
@@ -180,6 +189,7 @@ pub fn jit_exc_type_addr() -> usize {
 
 /// Write a thread-local slot that compiled entrypoints may read back.
 pub fn jit_threadlocalref_set(offset: i64, value: i64) {
+    THREADLOCAL_SLOTS_USED.store(true, std::sync::atomic::Ordering::Release);
     JIT_THREADLOCAL_SLOTS.with(|slots| {
         let mut slots = slots.borrow_mut();
         let idx = (offset / 8) as usize;
@@ -191,7 +201,11 @@ pub fn jit_threadlocalref_set(offset: i64, value: i64) {
 }
 
 /// Return the base pointer passed to compiled entrypoints as x1.
+#[inline]
 pub(crate) fn jit_threadlocalref_base() -> *const i64 {
+    if !THREADLOCAL_SLOTS_USED.load(std::sync::atomic::Ordering::Acquire) {
+        return &raw const DUMMY_THREADLOCAL_SLOT;
+    }
     JIT_THREADLOCAL_SLOTS.with(|slots| {
         let slots = slots.borrow();
         if slots.is_empty() {
@@ -689,9 +703,8 @@ fn handle_fail_resume_guard(
     // leave it null.
     //
     // The grab is read-only upstream; the additional clear below is pyre's,
-    // so the rooted local is the sole carrier for the rest of this function
-    // (the value is read back from `guard_exc_root`, never re-read from the
-    // slot).
+    // so the rooted local is the carrier for the blackhole arm. The bridge
+    // hook re-reads the slot, so the value is written back across that call.
     //
     // Clearing the slot drops the only GC root for the exception object
     // (`jf_guard_exc` is a GCREF visited by `jitframe_trace`).  The bridge
@@ -710,11 +723,13 @@ fn handle_fail_resume_guard(
     });
     // The blackhole receiver parks this same value in the metainterp's raw
     // guard-exception carrier as soon as it is entered, so across the
-    // `blackhole` call below the value is rooted twice over. Collapsing the
-    // pair onto the park alone is not reachable from here: this crate does not
-    // depend on `majit-metainterp`, and `BridgeFn` does not carry the
-    // exception, so the bridge hook cannot park a value it never receives.
-    // Either fix costs more machinery than the root pair it would delete.
+    // `blackhole` call below the value is rooted twice over. The bridge hook
+    // does not take the exception as an argument: `jit_ca_handle_guard_failure`
+    // re-reads `jf_guard_exc` (`llmodel.py grab_exc_value`). Clearing the slot
+    // before that read makes a `GUARD_EXCEPTION` failure look exception-free,
+    // so the bridge walk resumes the no-exception continuation and runs the
+    // already-executed call again. Put the grabbed value back for the read.
+    // The rooted local stays the carrier for the blackhole arm.
     let _guard_exc_scope = (guard_exc_root.0 != 0).then(|| {
         let slot = &mut guard_exc_root as *mut majit_ir::GcRef;
         unsafe { majit_gc::gc_add_root(slot) };
@@ -724,12 +739,18 @@ fn handle_fail_resume_guard(
     // compile.py `if must_compile and not stack_almost_full`.
     // Fail args stay in `jf_frame[]` (`llmodel.py get_int_value`).
     if let (Some(_jct), Some(bridge_fn)) = (owning_jct.as_ref(), CA_BRIDGE_FN.get()) {
-        if let Some(result) = bridge_fn(
+        if guard_exc_root.0 != 0 {
+            unsafe { (*frame_ptr).jf_guard_exc = guard_exc_root.0 };
+        }
+        let bridged = bridge_fn(
             frame_ptr,
             descr_raw,
             guard_value_operand.unwrap_or(0),
             guard_value_operand.is_some(),
-        ) {
+        );
+        // The blackhole arm below consumes `guard_exc_root`, not the slot.
+        unsafe { (*frame_ptr).jf_guard_exc = 0 };
+        if let Some(result) = bridged {
             return result;
         }
     }

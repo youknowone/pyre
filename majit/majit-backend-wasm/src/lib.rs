@@ -6935,7 +6935,9 @@ impl majit_backend::Backend for WasmBackend {
                     jf,
                     jf,
                     depth,
-                    fail_descr.clone() as majit_ir::DescrRef,
+                    majit_backend::deadframe::ExitDescr::owned(
+                        fail_descr.clone() as majit_ir::DescrRef
+                    ),
                     None,
                 )
             };
@@ -7726,8 +7728,8 @@ mod tests {
 
         let tmp_clt = tmp.compiled_loop_token().expect("tmp callback CLT");
         let real_clt = real.compiled_loop_token().expect("real loop CLT");
-        let tmp_depth = tmp_clt.frame_info.lock().jfi_frame_depth;
-        let real_depth = real_clt.frame_info.lock().jfi_frame_depth;
+        let tmp_depth = tmp_clt.frame_info.lock().depth();
+        let real_depth = real_clt.frame_info.lock().depth();
         assert!(tmp_depth < real_depth);
         let tmp_target = call_assembler_target(tmp.number).expect("tmp callback metadata");
         let real_target = call_assembler_target(real.number).expect("real loop metadata");
@@ -7736,7 +7738,7 @@ mod tests {
         backend
             .redirect_call_assembler(&tmp, &real)
             .expect("redirect tmp callback to deeper real loop");
-        assert_eq!(tmp_clt.frame_info.lock().jfi_frame_depth, real_depth);
+        assert_eq!(tmp_clt.frame_info.lock().depth(), real_depth);
 
         let redirected = call_assembler_target(tmp.number).expect("redirected target metadata");
         let installed = call_assembler_target(real.number).expect("real target metadata");

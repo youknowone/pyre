@@ -1,5 +1,5 @@
 use super::*;
-use crate::jit_interp::codegen_trace::{call_is_insn_op_at_pc, unwrap_cast};
+use crate::jit_interp::codegen_trace::call_is_insn_op_at_pc;
 
 #[cfg(test)]
 mod find_dispatch_loop_body_tests {
@@ -1308,18 +1308,6 @@ fn pick_local_and_const_idents(lowerer: &Lowerer, cond: &Expr) -> Option<(u16, s
     }
 }
 
-/// `insn_op(program as _, pc as _)` is the same fetch as the bare call.
-/// `lower_value_expr` does not treat `as _` as transparent, so the call
-/// policy is applied to the idents the predicate already accepted.
-fn insn_op_call_with_bare_args(call: &syn::ExprCall) -> syn::ExprCall {
-    let mut bare = call.clone();
-    for arg in bare.args.iter_mut() {
-        let peeled = unwrap_cast(arg).clone();
-        *arg = peeled;
-    }
-    bare
-}
-
 /// Try to lower one of the two opcode-fetch IR patterns:
 ///
 /// 1. `let <name> = program[<index>];` where `<index>` is `pc` or `pc + N`
@@ -1401,8 +1389,7 @@ fn try_lower_opcode_fetch_stmt(lowerer: &mut Lowerer, stmt: &Stmt) -> bool {
             && let Expr::Call(call) = init_expr
             && call_is_insn_op_at_pc(call)
         {
-            let bare = insn_op_call_with_bare_args(call);
-            if let Some(binding) = lowerer.lower_value_expr(&syn::Expr::Call(bare)) {
+            if let Some(binding) = lowerer.lower_value_expr(init_expr) {
                 if let Some(name) = pat_bound_ident_name(&local.pat) {
                     lowerer.bindings.insert(
                         name.clone(),
@@ -4318,15 +4305,11 @@ mod insn_op_fetch_tests {
     }
 
     #[test]
-    fn cast_wrapped_insn_op_emits_dispatch_arms() {
-        let text = lower_portal("let opcode = insn_op(program as _, pc as _);", true);
+    fn cast_wrapped_insn_op_is_not_the_opcode_fetch() {
+        let func = portal("let opcode = insn_op(program as _, pc as _);");
         assert!(
-            text.contains("goto_if_not_int_eq"),
-            "cast-wrapped insn_op must emit the opcode dispatch arms:\n{text}"
-        );
-        assert!(
-            !text.contains("compile_error"),
-            "a registered insn_op policy must not fail the portal:\n{text}"
+            crate::jit_interp::codegen_trace::find_dispatch_match(&func.block).is_none(),
+            "a cast on either insn_op argument is not the opcode fetch"
         );
     }
 

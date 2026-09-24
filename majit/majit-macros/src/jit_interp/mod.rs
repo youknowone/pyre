@@ -540,14 +540,19 @@ pub struct InlinedPrefixEntry {
 /// array of `ElementType`, so `base.field[i]` lowers to a `getfield_gc_r`
 /// for the buffer pointer followed by `get/setarrayitem_gc_i` on it.
 ///
+/// `ElementType in Header` is the same declaration for pointer elements
+/// that begin at `Header`'s `items` field. The load is `getarrayitem_gc_r`
+/// with that field's offset as `base_size`. Integer elements stay on
+/// `get/setarrayitem_gc_i` and have no header.
+///
 /// This is the non-virtualizable array vocabulary: the elements do NOT ride
 /// a guard's `vable_array` resume section, so the snapshot stays O(1) in the
 /// array's length. A `[..; virt]` state field is the other choice and is only
 /// correct for per-frame state whose length is bounded by the green key.
 ///
-/// The buffer carries no object header, so its length is NOT readable with
-/// `arraylen_gc`; bound an index against a sibling `int_fields` length/offset
-/// field instead.
+/// The buffer carries no object header the length op can read, so its length
+/// is NOT readable with `arraylen_gc`; bound an index against a sibling
+/// `int_fields` length/offset field instead.
 #[derive(Clone)]
 pub struct ArrayFieldEntry {
     /// The struct that owns the field (e.g. `Stack`).
@@ -556,6 +561,9 @@ pub struct ArrayFieldEntry {
     pub field: Ident,
     /// The element type (e.g. `i64`).
     pub element_type: Path,
+    /// Header struct whose `items` field is element 0, when the base
+    /// pointer addresses the header rather than element 0.
+    pub header: Option<Path>,
 }
 
 /// One entry in `int_fields = { Struct::field => u32, ... }`.
@@ -1301,6 +1309,7 @@ pub(crate) fn parse_ref_fields_map(input: ParseStream) -> syn::Result<Vec<RefFie
 /// Parse `array_fields = { Struct::field => ElementType, ... }`.
 /// Each entry declares that `Struct.field` is the base pointer of a
 /// contiguous `ElementType` array; see [`ArrayFieldEntry`].
+/// `ElementType in Header` names the struct whose `items` field is element 0.
 pub(crate) fn parse_array_fields_map(input: ParseStream) -> syn::Result<Vec<ArrayFieldEntry>> {
     let content;
     braced!(content in input);
@@ -1309,10 +1318,17 @@ pub(crate) fn parse_array_fields_map(input: ParseStream) -> syn::Result<Vec<Arra
         let (struct_type, field) = split_struct_field_path(content.parse::<Path>()?)?;
         content.parse::<Token![=>]>()?;
         let element_type: Path = content.parse()?;
+        let header = if content.peek(Token![in]) {
+            content.parse::<Token![in]>()?;
+            Some(content.parse()?)
+        } else {
+            None
+        };
         entries.push(ArrayFieldEntry {
             struct_type,
             field,
             element_type,
+            header,
         });
         let _ = content.parse::<Token![,]>();
     }
@@ -2250,6 +2266,8 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn, trace: bool) -> T
         // field holds the buffer BASE POINTER, so an indexed access derefs
         // through it instead of reading the field itself.
         array_field_elems: std::collections::HashMap<String, syn::Path>,
+        // `Element in Header` entries, same key. Element 0 is `Header.items`.
+        array_headers: std::collections::HashMap<String, syn::Path>,
     }
     impl RefFieldRewriter {
         // For `e == state.<ref_scalar>`, return the `ref(T)` struct path.
@@ -2301,10 +2319,19 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn, trace: bool) -> T
 
         // Whether `struct_path::field_name` is an array base, and if so the
         // element type.
-        fn array_field_elem(&self, struct_path: &syn::Path, field_name: &str) -> Option<syn::Path> {
+        fn array_field_key(struct_path: &syn::Path, field_name: &str) -> Option<String> {
             let struct_last = struct_path.segments.last()?.ident.to_string();
-            let key = format!("{}::{}", struct_last, field_name);
+            Some(format!("{}::{}", struct_last, field_name))
+        }
+
+        fn array_field_elem(&self, struct_path: &syn::Path, field_name: &str) -> Option<syn::Path> {
+            let key = Self::array_field_key(struct_path, field_name)?;
             self.array_field_elems.get(&key).cloned()
+        }
+
+        fn array_header(&self, struct_path: &syn::Path, field_name: &str) -> Option<syn::Path> {
+            let key = Self::array_field_key(struct_path, field_name)?;
+            self.array_headers.get(&key).cloned()
         }
 
         // Record a local binding as pointing to a struct type.
@@ -2353,6 +2380,11 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn, trace: bool) -> T
             {
                 let base = (*field.base).clone();
                 let member = field.member.clone();
+                let member_name = member_id.to_string();
+                let header = self.array_header(&struct_path, &member_name);
+                let element = self
+                    .array_field_elem(&struct_path, &member_name)
+                    .expect("array field element");
                 let mut idx = (*index_expr.index).clone();
                 let mut rhs = (*assign.right).clone();
                 self.visit_expr_mut(&mut idx);
@@ -2363,15 +2395,37 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn, trace: bool) -> T
                 // `compute_value()` first. The JIT side lowers the right-hand
                 // side first for the same reason, and the two paths have to
                 // agree or a warm run observes a different order from a cold one.
-                *expr = syn::parse_quote! {
-                    {
-                        let __majit_arr_val = #rhs;
-                        let __majit_arr_obj = #base;
-                        let __majit_arr_idx = #idx;
-                        unsafe {
-                            *((*(__majit_arr_obj as *mut #struct_path))
-                                .#member
-                                .add(__majit_arr_idx as usize)) = __majit_arr_val;
+                *expr = if let Some(header) = header {
+                    syn::parse_quote! {
+                        {
+                            let __majit_arr_val = #rhs;
+                            let __majit_arr_obj = #base;
+                            let __majit_arr_idx = #idx;
+                            unsafe {
+                                let __majit_arr_block = core::mem::transmute::<
+                                    _,
+                                    *mut #header,
+                                >(
+                                    (*(__majit_arr_obj as *const #struct_path)).#member,
+                                );
+                                let __majit_arr_items = (__majit_arr_block as *mut u8).add(
+                                    core::mem::offset_of!(#header, items),
+                                ) as *mut #element;
+                                *__majit_arr_items.add(__majit_arr_idx as usize) = __majit_arr_val;
+                            }
+                        }
+                    }
+                } else {
+                    syn::parse_quote! {
+                        {
+                            let __majit_arr_val = #rhs;
+                            let __majit_arr_obj = #base;
+                            let __majit_arr_idx = #idx;
+                            unsafe {
+                                *((*(__majit_arr_obj as *mut #struct_path))
+                                    .#member
+                                    .add(__majit_arr_idx as usize)) = __majit_arr_val;
+                            }
                         }
                     }
                 };
@@ -2392,16 +2446,42 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn, trace: bool) -> T
             {
                 let base = (*field.base).clone();
                 let member = field.member.clone();
+                let member_name = member_id.to_string();
+                let header = self.array_header(&struct_path, &member_name);
+                let element = self
+                    .array_field_elem(&struct_path, &member_name)
+                    .expect("array field element");
                 let mut idx = (*index_expr.index).clone();
                 self.visit_expr_mut(&mut idx);
-                *expr = syn::parse_quote! {
-                    {
-                        let __majit_arr_obj = #base;
-                        let __majit_arr_idx = #idx;
-                        unsafe {
-                            *((*(__majit_arr_obj as *const #struct_path))
-                                .#member
-                                .add(__majit_arr_idx as usize))
+                *expr = if let Some(header) = header {
+                    syn::parse_quote! {
+                        {
+                            let __majit_arr_obj = #base;
+                            let __majit_arr_idx = #idx;
+                            unsafe {
+                                let __majit_arr_block = core::mem::transmute::<
+                                    _,
+                                    *mut #header,
+                                >(
+                                    (*(__majit_arr_obj as *const #struct_path)).#member,
+                                );
+                                let __majit_arr_items = (__majit_arr_block as *mut u8).add(
+                                    core::mem::offset_of!(#header, items),
+                                ) as *mut #element;
+                                *__majit_arr_items.add(__majit_arr_idx as usize)
+                            }
+                        }
+                    }
+                } else {
+                    syn::parse_quote! {
+                        {
+                            let __majit_arr_obj = #base;
+                            let __majit_arr_idx = #idx;
+                            unsafe {
+                                *((*(__majit_arr_obj as *const #struct_path))
+                                    .#member
+                                    .add(__majit_arr_idx as usize))
+                            }
                         }
                     }
                 };
@@ -2689,6 +2769,15 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn, trace: bool) -> T
                     .filter_map(|e| {
                         let last = e.struct_type.segments.last()?.ident.to_string();
                         Some((format!("{}::{}", last, e.field), e.element_type.clone()))
+                    })
+                    .collect(),
+                array_headers: config
+                    .array_fields
+                    .iter()
+                    .filter_map(|e| {
+                        let header = e.header.clone()?;
+                        let last = e.struct_type.segments.last()?.ident.to_string();
+                        Some((format!("{}::{}", last, e.field), header))
                     })
                     .collect(),
                 field_pointees,
@@ -3434,6 +3523,14 @@ fn rewrite_body(
                                         #single_pass_finish_drain
                                         break;
                                     }
+                                    // `usize::MAX` is the no-position sentinel a
+                                    // finished frame reports. Assigning it and
+                                    // dispatching reads off the end of the
+                                    // program. The loop's own epilogue returns
+                                    // the status the walk already stored.
+                                    if __sp_pc == usize::MAX {
+                                        break;
+                                    }
                                     #pc = __sp_pc;
                                     continue;
                                 }
@@ -3712,6 +3809,15 @@ fn rewrite_body(
                                     #finish_drain
                                     #single_pass_finish_exit
                                     if let Some(__resume_pc) = __back_edge_resume {
+                                        // Same sentinel as the merge-point close.
+                                        // A compiled guard that ran the frame to
+                                        // completion reports no bytecode pc;
+                                        // storing it makes the next dispatch
+                                        // fail. Leaving the loop returns the
+                                        // status already written on `state`.
+                                        if __resume_pc == usize::MAX {
+                                            break;
+                                        }
                                         #pc_expr = __resume_pc;
                                         continue;
                                     }
@@ -3774,19 +3880,31 @@ fn rewrite_body(
             .map(|finish_return| finish_return.drain(&driver))
             .unwrap_or_default();
         match green_key_expr(&pc, &pc, default_greens, default_green_type_tags) {
+            // The block is the condition of `if #door { loop }`. A finished
+            // frame reports `usize::MAX` and has no bytecode pc; assigning
+            // that and entering the loop dispatches off the end of the
+            // program. Skipping the loop leaves the status the run already
+            // stored for the function's own epilogue. A real resume pc still
+            // enters the loop there.
             Some(key) => quote! {
                 {
                     let (__green_hash, __make_key) = #key;
-                    if let Some(__resume) = #driver.function_entry_structured(
+                    let __run_dispatch = match #driver.function_entry_structured(
                         __green_hash,
                         __make_key,
                         #pc,
                         &mut #state,
                         #env,
                     ) {
-                        #pc = __resume;
-                    }
+                        Some(__resume) if __resume == usize::MAX => false,
+                        Some(__resume) => {
+                            #pc = __resume;
+                            true
+                        }
+                        None => true,
+                    };
                     #finish_drain
+                    __run_dispatch
                 }
             },
             None => quote! {},
@@ -3810,11 +3928,39 @@ fn insert_before_traced_loop(
     if door.is_empty() {
         return stmts;
     }
-    let door_stmt: syn::Stmt =
-        syn::parse2(door).expect("function-entry door must parse as a statement");
-    let at = traced_loop_at.unwrap_or(0).min(stmts.len());
+    let Some(at) = traced_loop_at else {
+        let door_stmt: syn::Stmt =
+            syn::parse2(door).expect("function-entry door must parse as a statement");
+        let mut out = stmts;
+        out.insert(0, door_stmt);
+        return out;
+    };
+    let at = at.min(stmts.len());
+    if at == stmts.len() {
+        let door_stmt: syn::Stmt =
+            syn::parse2(door).expect("function-entry door must parse as a statement");
+        let mut out = stmts;
+        out.push(door_stmt);
+        return out;
+    }
+    // `door` is a bool: true enters the dispatch loop, false skips it and
+    // falls into the function's own epilogue. One check per call, not per
+    // opcode.
+    let syn::Stmt::Expr(loop_expr, _) = &stmts[at] else {
+        let door_stmt: syn::Stmt =
+            syn::parse2(door).expect("function-entry door must parse as a statement");
+        let mut out = stmts;
+        out.insert(at, door_stmt);
+        return out;
+    };
+    let wrapped: syn::Stmt = syn::parse2(quote! {
+        if #door {
+            #loop_expr;
+        }
+    })
+    .expect("function-entry door must wrap the dispatch loop");
     let mut out = stmts;
-    out.insert(at, door_stmt);
+    out[at] = wrapped;
     out
 }
 

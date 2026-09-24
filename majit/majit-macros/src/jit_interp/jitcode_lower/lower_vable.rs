@@ -1,6 +1,36 @@
 use super::lower_value::struct_type_id_tokens;
 use super::*;
 
+impl<'c> Lowerer<'c> {
+    /// The virtualizable object in an access.
+    ///
+    /// `jtransform.py` `rewrite_op_getfield` matches the virtualizable
+    /// variable itself (`frame.field`). A portal stores that object in a
+    /// `ref` state field, spelled `state.frame.field`; both are the same
+    /// object, so both take `getfield_vable_*` / `getarrayitem_vable_*`.
+    fn expr_is_vable_object(&self, expr: &Expr) -> bool {
+        let Some(config) = self.config else {
+            return false;
+        };
+        let Some(vable_var) = config.vable_var.as_deref() else {
+            return false;
+        };
+        if expr_matches_local_name(expr, vable_var) {
+            return true;
+        }
+        let Expr::Field(field) = expr else {
+            return false;
+        };
+        if !expr_matches_local_name(&field.base, "state") {
+            return false;
+        }
+        let Some(member) = named_member(&field.member) else {
+            return false;
+        };
+        member == vable_var && config.state_ref_scalars.contains_key(vable_var)
+    }
+}
+
 /// The `(field_size, is_signed)` a struct-layout registration reports for one
 /// field, plus a compile-time check that the declaration matches the Rust
 /// struct.  `descr.py get_field_descr` derives both from `FIELDTYPE`,
@@ -230,6 +260,9 @@ struct ArrayFieldBase {
     struct_path: syn::Path,
     member: syn::Member,
     element_type: syn::Path,
+    /// Header whose `items` field is element 0. Pointer elements; the
+    /// integer path leaves this empty.
+    header: Option<syn::Path>,
 }
 
 impl<'c> Lowerer<'c> {
@@ -305,7 +338,6 @@ impl<'c> Lowerer<'c> {
 
     pub(super) fn lower_vable_field_write(&mut self, expr: &Expr) -> Option<()> {
         let config = self.config?;
-        let vable_var = config.vable_var.as_ref()?;
 
         let assign = match expr {
             Expr::Assign(a) => a,
@@ -315,7 +347,7 @@ impl<'c> Lowerer<'c> {
             Expr::Field(f) => f,
             _ => return None,
         };
-        if !expr_matches_local_name(&field.base, vable_var) {
+        if !self.expr_is_vable_object(&field.base) {
             return None;
         }
         let member_name = named_member(&field.member)?;
@@ -354,7 +386,6 @@ impl<'c> Lowerer<'c> {
     /// Recognizes `frame.locals_w[i] = val` and emits vable_setarrayitem.
     pub(super) fn lower_vable_array_write(&mut self, expr: &Expr) -> Option<()> {
         let config = self.config?;
-        let vable_var = config.vable_var.as_ref()?;
 
         let assign = match expr {
             Expr::Assign(a) => a,
@@ -369,7 +400,7 @@ impl<'c> Lowerer<'c> {
             Expr::Field(f) => f,
             _ => return None,
         };
-        if !expr_matches_local_name(&field.base, vable_var) {
+        if !self.expr_is_vable_object(&field.base) {
             return None;
         }
         let member_name = named_member(&field.member)?;
@@ -425,7 +456,6 @@ impl<'c> Lowerer<'c> {
     /// shares one index register between the vable read and write.
     pub(super) fn lower_vable_array_update(&mut self, expr: &Expr) -> Option<()> {
         let config = self.config?;
-        let vable_var = config.vable_var.as_ref()?;
         let binary = match expr {
             Expr::Binary(binary) => binary,
             _ => return None,
@@ -438,7 +468,7 @@ impl<'c> Lowerer<'c> {
             Expr::Field(field) => field,
             _ => return None,
         };
-        if !expr_matches_local_name(&field.base, vable_var) {
+        if !self.expr_is_vable_object(&field.base) {
             return None;
         }
         let member_name = named_member(&field.member)?;
@@ -877,10 +907,9 @@ impl<'c> Lowerer<'c> {
     /// and `field` is a declared virtualizable scalar field.
     pub(super) fn lower_vable_field_read(&mut self, expr: &Expr) -> Option<Binding> {
         let config = self.config?;
-        let vable_var = config.vable_var.as_ref()?;
 
         if let Expr::Field(field) = expr {
-            if !expr_matches_local_name(&field.base, vable_var) {
+            if !self.expr_is_vable_object(&field.base) {
                 return None;
             }
             let member_name = named_member(&field.member)?;
@@ -951,9 +980,8 @@ impl<'c> Lowerer<'c> {
     /// variable and `locals_w` is a declared virtualizable array field.
     pub(super) fn lower_vable_array_read(&mut self, expr: &Expr) -> Option<Binding> {
         let config = self.config?;
-        let vable_var = config.vable_var.as_ref()?;
 
-        // Pattern: Expr::Index where base is Expr::Field on vable_var
+        // Pattern: Expr::Index where base is Expr::Field on the virtualizable
         let index_expr = match expr {
             Expr::Index(idx) => idx,
             _ => return None,
@@ -962,7 +990,7 @@ impl<'c> Lowerer<'c> {
             Expr::Field(f) => f,
             _ => return None,
         };
-        if !expr_matches_local_name(&field.base, vable_var) {
+        if !self.expr_is_vable_object(&field.base) {
             return None;
         }
         let member_name = named_member(&field.member)?;
@@ -1031,7 +1059,6 @@ impl<'c> Lowerer<'c> {
     /// Recognizes `frame.locals_w.len()` for declared virtualizable arrays.
     pub(super) fn lower_vable_array_len(&mut self, expr: &Expr) -> Option<Binding> {
         let config = self.config?;
-        let vable_var = config.vable_var.as_ref()?;
         let call = match expr {
             Expr::MethodCall(call) => call,
             _ => return None,
@@ -1043,7 +1070,7 @@ impl<'c> Lowerer<'c> {
             Expr::Field(field) => field,
             _ => return None,
         };
-        if !expr_matches_local_name(&field.base, vable_var) {
+        if !self.expr_is_vable_object(&field.base) {
             return None;
         }
         let member_name = named_member(&field.member)?;
@@ -1343,6 +1370,32 @@ impl<'c> Lowerer<'c> {
         }
     }
 
+    /// The local a field read is on: `ident` or `(*ident)`, parentheses aside.
+    ///
+    /// One deref. `(*(*ident)).field` is a different load and stays unlowered.
+    fn field_base_ident(base: &Expr) -> Option<&syn::Ident> {
+        let mut expr = base;
+        loop {
+            expr = match expr {
+                Expr::Paren(paren) => &paren.expr,
+                Expr::Group(group) => &group.expr,
+                Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Deref(_)) => {
+                    let mut inner = unary.expr.as_ref();
+                    loop {
+                        inner = match inner {
+                            Expr::Paren(paren) => &paren.expr,
+                            Expr::Group(group) => &group.expr,
+                            Expr::Path(path) => return path.path.get_ident(),
+                            _ => return None,
+                        };
+                    }
+                }
+                Expr::Path(path) => return path.path.get_ident(),
+                _ => return None,
+            };
+        }
+    }
+
     /// Field read on an arbitrary local ref binding with known struct type:
     /// `<ident>.<field>` where `<ident>` was bound as `BindingKind::Ref` with
     /// a non-None `struct_type`.  Uses the same `ref_fields` config as
@@ -1354,10 +1407,11 @@ impl<'c> Lowerer<'c> {
             return None;
         };
         // Base must be a simple ident (a local variable), not `state.x.y`.
-        let Expr::Path(path) = &*field.base else {
+        // `(*ident).field` is that same ident: the parentheses are part of
+        // the Rust spelling, because `*ident.field` binds the other way.
+        let Some(ident) = Self::field_base_ident(&field.base) else {
             return None;
         };
-        let ident = path.path.get_ident()?;
         let binding = self.bindings.get(&ident.to_string())?.clone();
         if !matches!(binding.kind, BindingKind::Ref) {
             return None;
@@ -1552,11 +1606,13 @@ impl<'c> Lowerer<'c> {
             .unwrap_or_default();
         let key = format!("{}::{}", struct_last, member_name);
         let element_type = config.array_fields.get(&key)?.2.clone();
+        let header = config.array_headers.get(&key).cloned();
         Some(ArrayFieldBase {
             holder,
             struct_path,
             member,
             element_type,
+            header,
         })
     }
 
@@ -1573,7 +1629,32 @@ impl<'c> Lowerer<'c> {
             struct_path,
             member,
             element_type,
+            header,
         } = shape;
+        // A header array's field is the block pointer, not `*mut Element`.
+        // Dereferencing it is not an element. Check the pointer width and
+        // that `header.items` exists; the element stride comes from the descr.
+        let element_witness = if let Some(header) = header {
+            quote! {
+                const _: () = {
+                    const fn __majit_field_width<T>(_: fn(&#struct_path) -> &T) -> usize {
+                        ::core::mem::size_of::<T>()
+                    }
+                    assert!(
+                        __majit_field_width(|__s: &#struct_path| &__s.#member)
+                            == ::core::mem::size_of::<usize>()
+                    );
+                };
+                const _: usize = ::core::mem::offset_of!(#header, items);
+            }
+        } else {
+            quote! {
+                const _: fn(&#struct_path) = |__s| {
+                    let _: #element_type =
+                        unsafe { ::core::mem::transmute(*__s.#member) };
+                };
+            }
+        };
         let (struct_path, member, element_type) =
             (struct_path.clone(), member.clone(), element_type.clone());
         // A state scalar is read here rather than in the matcher, so nothing is
@@ -1636,11 +1717,10 @@ impl<'c> Lowerer<'c> {
                 //
                 // Reading through the field rather than naming a pointer type
                 // accepts `*const T` as well as `*mut T`; the closure body is
-                // type-checked but never evaluated.
-                const _: fn(&#struct_path) = |__s| {
-                    let _: #element_type =
-                        unsafe { ::core::mem::transmute(*__s.#member) };
-                };
+                // type-checked but never evaluated. A header array checks the
+                // block pointer's width instead, because the field is not
+                // itself `*mut Element`.
+                #element_witness
                 #prefix_witness
                 __builder.register_struct_layout(
                     ::core::mem::size_of::<#struct_path>(),
@@ -1702,6 +1782,7 @@ impl<'c> Lowerer<'c> {
         // before its index, which is the order emitted here.
         let shape = self.match_array_field_base(field)?;
         let element_type = shape.element_type.clone();
+        let header = shape.header.clone();
         let buffer_reg = self.emit_array_field_base(&shape)?;
         let index = self.lower_value_expr(&index_expr.index)?;
         if !matches!(index.kind, BindingKind::Int) {
@@ -1709,6 +1790,36 @@ impl<'c> Lowerer<'c> {
         }
         let index_reg = index.reg;
         let result_reg = self.alloc_reg();
+        if let Some(header) = header {
+            // Pointer elements living after `header.items`. The base
+            // register is the header, so the descr's base_size is that
+            // field's offset rather than zero.
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::Vable,
+                    vec![Register::ref_(buffer_reg), Register::int(index_reg)],
+                    vec![Register::ref_(result_reg)],
+                ),
+                quote! {
+                    let __descr_idx = __builder.add_ptr_array_descr(
+                        ::core::mem::offset_of!(#header, items),
+                        ::core::option::Option::None,
+                    );
+                    __builder.getarrayitem_gc_r(
+                        #result_reg as u16,
+                        #buffer_reg as u16,
+                        #index_reg as u16,
+                        __descr_idx,
+                    );
+                },
+            );
+            return Some(Binding {
+                reg: result_reg,
+                kind: BindingKind::Ref,
+                depends_on_stack: index.depends_on_stack,
+                struct_type: None,
+            });
+        }
         self.emit_op(
             OpMeta::linear(
                 OpKind::Vable,
@@ -1765,8 +1876,14 @@ impl<'c> Lowerer<'c> {
         // side effects ahead of the right-hand side's.
         let shape = self.match_array_field_base(field)?;
         let element_type = shape.element_type.clone();
+        let header = shape.header.clone();
         let value = self.lower_value_expr(&assign.right)?;
-        if !matches!(value.kind, BindingKind::Int) {
+        let value_is_ref = header.is_some();
+        if value_is_ref {
+            if !matches!(value.kind, BindingKind::Ref) {
+                return None;
+            }
+        } else if !matches!(value.kind, BindingKind::Int) {
             return None;
         }
         let buffer_reg = self.emit_array_field_base(&shape)?;
@@ -1776,6 +1893,32 @@ impl<'c> Lowerer<'c> {
         }
         let index_reg = index.reg;
         let value_reg = value.reg;
+        if let Some(header) = header {
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::Vable,
+                    vec![
+                        Register::ref_(buffer_reg),
+                        Register::int(index_reg),
+                        Register::ref_(value_reg),
+                    ],
+                    vec![],
+                ),
+                quote! {
+                    let __descr_idx = __builder.add_ptr_array_descr(
+                        ::core::mem::offset_of!(#header, items),
+                        ::core::option::Option::None,
+                    );
+                    __builder.setarrayitem_gc_r(
+                        #buffer_reg as u16,
+                        #index_reg as u16,
+                        #value_reg as u16,
+                        __descr_idx,
+                    );
+                },
+            );
+            return Some(());
+        }
         self.emit_op(
             OpMeta::linear(
                 OpKind::Vable,

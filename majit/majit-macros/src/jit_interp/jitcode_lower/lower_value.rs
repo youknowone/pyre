@@ -97,10 +97,47 @@ pub(super) fn struct_type_id_tokens(path: &syn::Path, is_gc_managed: bool) -> To
     }
 }
 
+/// Pointee of `*mut Struct` / `*const Struct` when `Struct` is a type name.
+///
+/// Primitive pointees (`*mut u8`) are not structs, so a cast to one does not
+/// retarget a field read.
+fn struct_pointee_of_pointer(ty: &syn::Type) -> Option<syn::Path> {
+    let syn::Type::Ptr(ptr) = ty else {
+        return None;
+    };
+    let syn::Type::Path(path) = ptr.elem.as_ref() else {
+        return None;
+    };
+    if path.qself.is_some() {
+        return None;
+    }
+    let last = path.path.segments.last()?;
+    if !last.arguments.is_none() {
+        return None;
+    }
+    let name = last.ident.to_string();
+    if !name.starts_with(|c: char| c.is_ascii_uppercase()) {
+        return None;
+    }
+    Some(path.path.clone())
+}
+
 impl<'c> Lowerer<'c> {
     pub(super) fn lower_value_expr(&mut self, expr: &Expr) -> Option<Binding> {
         // State field read (register/tape machines).
         if let Some(binding) = self.lower_state_field_read(expr) {
+            return Some(binding);
+        }
+        // `state.<vable>.<field>` / `state.<vable>.<array>[i]` before the
+        // heap getfield / getarrayitem rewrites, which match the same syntax.
+        // `jtransform.py` `getfield_vable_*` / `getarrayitem_vable_*`.
+        if let Some(binding) = self.lower_vable_field_read(expr) {
+            return Some(binding);
+        }
+        if let Some(binding) = self.lower_vable_array_read(expr) {
+            return Some(binding);
+        }
+        if let Some(binding) = self.lower_vable_array_len(expr) {
             return Some(binding);
         }
         // Field read through a `ref(T)` state scalar: `state.<ref>.<member>`
@@ -135,17 +172,6 @@ impl<'c> Lowerer<'c> {
         // the same `getarrayitem_gc_i` on the green array (folded by the
         // optimizer since array + index are green).
         if let Some(binding) = self.lower_env_array_read(expr) {
-            return Some(binding);
-        }
-        // RPython jtransform.py:832 — virtualizable field read rewrite.
-        if let Some(binding) = self.lower_vable_field_read(expr) {
-            return Some(binding);
-        }
-        // RPython jtransform.py:760 — virtualizable array read rewrite.
-        if let Some(binding) = self.lower_vable_array_read(expr) {
-            return Some(binding);
-        }
-        if let Some(binding) = self.lower_vable_array_len(expr) {
             return Some(binding);
         }
         // RPython call.py passes the virtualizable object itself to residual
@@ -281,6 +307,29 @@ impl<'c> Lowerer<'c> {
                     struct_type: None,
                 })
             }
+            // A pointer cast keeps the bits and the ref bank. Integer and
+            // float targets are the arms below; a ref source cast to one of
+            // those stays unlowered because the bytecode cast that moves
+            // between the banks checks a tagged immediate.
+            // `*mut Struct` / `*const Struct` names the pointee the next
+            // `(*ident).field` resolves against. A cast to `*mut u8` and the
+            // other non-struct pointees leaves the binding's struct as it was.
+            Expr::Cast(ExprCast { expr, ty, .. })
+                if !is_supported_int_cast(ty) && !is_supported_float_type(ty) =>
+            {
+                let binding = self.lower_value_expr(expr)?;
+                match binding.kind {
+                    BindingKind::Ref => {
+                        let mut binding = binding;
+                        if let Some(path) = struct_pointee_of_pointer(ty) {
+                            binding.struct_type = Some(path);
+                        }
+                        Some(binding)
+                    }
+                    _ => None,
+                }
+            }
+            Expr::Unsafe(inner) => self.lower_block_value(&inner.block),
             Expr::Cast(ExprCast { expr, ty, .. }) if is_supported_float_type(ty) => {
                 let unsigned = expr_is_unsigned_int(expr);
                 let binding = self.lower_value_expr(expr)?;
@@ -2930,6 +2979,77 @@ mod tests {
             depends_on_stack: false,
             struct_type: None,
         }
+    }
+
+    #[test]
+    fn unsafe_block_lowers_its_body() {
+        let mut lowerer = Lowerer::new(None);
+        lowerer
+            .bindings
+            .insert("x".to_string(), binding(4, BindingKind::Int));
+        let expr: Expr = syn::parse_str("unsafe { x + 1 }").expect("parse unsafe");
+        let result = lowerer
+            .lower_value_expr(&expr)
+            .expect("unsafe block should lower");
+        assert_eq!(result.kind, BindingKind::Int);
+    }
+
+    #[test]
+    fn ref_pointer_cast_keeps_the_ref_register() {
+        let mut lowerer = Lowerer::new(None);
+        lowerer
+            .bindings
+            .insert("p".to_string(), binding(3, BindingKind::Ref));
+        let expr: Expr = syn::parse_str("p as *mut u8").expect("parse cast");
+        let result = lowerer
+            .lower_value_expr(&expr)
+            .expect("ref to pointer cast should lower");
+        assert_eq!(result.kind, BindingKind::Ref);
+        assert_eq!(result.reg, 3);
+        assert!(result.struct_type.is_none());
+    }
+
+    #[test]
+    fn pointer_cast_to_a_struct_names_the_pointee() {
+        let mut lowerer = Lowerer::new(None);
+        lowerer
+            .bindings
+            .insert("p".to_string(), binding(3, BindingKind::Ref));
+        let expr: Expr = syn::parse_str("p as *mut Node").expect("parse cast");
+        let result = lowerer
+            .lower_value_expr(&expr)
+            .expect("struct pointer cast should lower");
+        assert_eq!(result.reg, 3);
+        assert_eq!(result.struct_type.unwrap(), syn::parse_quote!(Node));
+    }
+
+    #[test]
+    fn deref_field_read_lowers_to_getfield() {
+        let config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
+        let mut lowerer = Lowerer::new(Some(&config));
+        lowerer.bindings.insert(
+            "p".to_string(),
+            Binding {
+                reg: 1,
+                kind: BindingKind::Ref,
+                depends_on_stack: false,
+                struct_type: Some(syn::parse_quote!(W_IntObject)),
+            },
+        );
+        let expr: Expr = syn::parse_quote!(unsafe { (*p).intval });
+        let result = lowerer
+            .lower_value_expr(&expr)
+            .expect("(*p).field should lower");
+        assert_eq!(result.kind, BindingKind::Int);
+        let emitted = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(
+            emitted.contains("getfield_gc_i"),
+            "deref field read must be a getfield, got {emitted}"
+        );
     }
 
     #[test]
