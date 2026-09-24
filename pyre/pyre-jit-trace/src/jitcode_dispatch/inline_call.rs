@@ -3906,13 +3906,9 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
                 ));
             };
             method_form = true;
-            instance_call_pin = Some((
-                r_args[0],
-                callable,
-                w_class,
-                version_tag,
-                unsafe { inline_attr_cell_guard(w_class, "__call__", method) },
-            ));
+            instance_call_pin = Some((r_args[0], callable, w_class, version_tag, unsafe {
+                inline_attr_cell_guard(w_class, "__call__", method)
+            }));
             (method, w_code, nparams, has_closure)
         }
     };
@@ -9887,13 +9883,11 @@ pub(crate) fn try_walker_inline_exception_string_override<Sym: WalkSym>(
         w_code,
         nparams,
         has_closure,
-        Some((
-            r_args[2],
-            concrete_receiver,
-            w_class,
-            version_tag,
-            unsafe { inline_attr_cell_guard(w_class, dunder, method) },
-        )),
+        Some(
+            (r_args[2], concrete_receiver, w_class, version_tag, unsafe {
+                inline_attr_cell_guard(w_class, dunder, method)
+            }),
+        ),
         None,
         true,
         true,
@@ -10032,13 +10026,9 @@ pub(crate) fn try_walker_inline_hash_builtin<Sym: WalkSym>(
         w_code,
         nparams,
         has_closure,
-        Some((
-            r_args[2],
-            concrete_receiver,
-            w_type,
-            version_tag,
-            unsafe { inline_attr_cell_guard(w_type, "__hash__", method) },
-        )),
+        Some((r_args[2], concrete_receiver, w_type, version_tag, unsafe {
+            inline_attr_cell_guard(w_type, "__hash__", method)
+        })),
         None,
         true,
         false,
@@ -13644,13 +13634,9 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
         w_code,
         nparams,
         has_closure,
-        Some((
-            receiver,
-            concrete_receiver,
-            w_class,
-            version_tag,
-            unsafe { inline_attr_cell_guard(w_class, dunder, method) },
-        )),
+        Some((receiver, concrete_receiver, w_class, version_tag, unsafe {
+            inline_attr_cell_guard(w_class, dunder, method)
+        })),
         Some((other, concrete_other, w_typ_other)),
         // `entry_is_call_boundary`.  What decides it is whether the abort
         // rewind can name this entry, not whether the entry is spelled CALL,
@@ -13914,13 +13900,9 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
         w_code,
         nparams,
         has_closure,
-        Some((
-            lhs,
-            concrete_lhs,
-            w_class,
-            version_tag,
-            unsafe { inline_attr_cell_guard(w_class, dunder, method) },
-        )),
+        Some((lhs, concrete_lhs, w_class, version_tag, unsafe {
+            inline_attr_cell_guard(w_class, dunder, method)
+        })),
         Some((rhs, concrete_rhs, w_typ_r.as_ptr())),
         // `entry_is_call_boundary`.  What decides it is whether the abort
         // rewind can name this entry, not whether the entry is spelled CALL,
@@ -14148,13 +14130,9 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
         w_code,
         nparams,
         has_closure,
-        Some((
-            value,
-            concrete_value,
-            w_class,
-            version_tag,
-            unsafe { inline_attr_cell_guard(w_class, "__format__", method) },
-        )),
+        Some((value, concrete_value, w_class, version_tag, unsafe {
+            inline_attr_cell_guard(w_class, "__format__", method)
+        })),
         None,
         // FORMAT_WITH_SPEC pops both of its operands, so the abort rewind
         // cannot re-execute it from the stack it had: only a `Clean` body is

@@ -2346,9 +2346,7 @@ pub unsafe fn data_descriptor_get_fast_path(
     }
     // Baked by identity under `descr_version_tag`, which an in-place cell
     // write does not move.
-    if unsafe {
-        crate::baseobjspace::type_attr_stored_is_cell(descr_type, Wtf8::new("__get__"))
-    } {
+    if unsafe { crate::baseobjspace::type_attr_stored_is_cell(descr_type, Wtf8::new("__get__")) } {
         return None;
     }
     let w_get = unsafe { crate::baseobjspace::lookup_in_type_where(descr_type, "__get__") }?;
