@@ -514,22 +514,35 @@ thread_local! {
 ///
 /// Restores the previous value on drop rather than clearing, so a nested
 /// handoff (a bridge trace that itself deopts) unwinds to the exception its
-/// caller is still carrying.
+/// caller is still carrying. The displaced value stays a root while it is
+/// set aside: a nursery exception can move during the nested handoff, and
+/// restoring the copy taken at `park` would put the pre-move address back
+/// into a walked cell.
 pub struct GuardExcRoot {
-    prev: i64,
+    prev: Option<majit_gc::shadow_stack::OwnerRootGuard>,
 }
 
 impl GuardExcRoot {
     pub fn park(exc: i64) -> Self {
+        let prev = GUARD_EXC_VALUE.with(|cell| cell.replace(exc));
         Self {
-            prev: GUARD_EXC_VALUE.with(|cell| cell.replace(exc)),
+            prev: (prev != 0)
+                .then(|| majit_gc::shadow_stack::OwnerRootGuard::new(GcRef(prev as usize))),
         }
+    }
+
+    /// The parked exception's current address while this park is the
+    /// innermost one. The collector rewrites the cell in place, so this is
+    /// the forwarded value after a collection.
+    pub fn get(&self) -> i64 {
+        GUARD_EXC_VALUE.with(|cell| cell.get())
     }
 }
 
 impl Drop for GuardExcRoot {
     fn drop(&mut self) {
-        GUARD_EXC_VALUE.with(|cell| cell.set(self.prev));
+        let prev = self.prev.as_ref().map_or(0, |root| root.get().0 as i64);
+        GUARD_EXC_VALUE.with(|cell| cell.set(prev));
     }
 }
 

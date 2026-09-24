@@ -16716,13 +16716,14 @@ fn traceback_journal_rollback_unwinds_every_walk_node() {
 
     // `frame` is only ever compared by identity here, and `w_code` only has to
     // be a chain-terminating slot, so both stay NULL — the splice walks
-    // `w_next` and nothing dereferences either.
-    fn prepend(exc: pyre_object::PyObjectRef, lasti: i64) {
+    // `w_next` and nothing dereferences either. `w_pytraceback_new` can
+    // collect, so the exception is read from its root slot on each side of it.
+    fn prepend(slot: usize, lasti: i64) {
         unsafe {
-            let head = w_exception_get_traceback(exc);
+            let head = w_exception_get_traceback(pyre_object::gc_roots::shadow_stack_get(slot));
             let node =
                 w_pytraceback_new(std::ptr::null_mut(), lasti, head, 1, pyre_object::PY_NULL);
-            w_exception_set_traceback(exc, node);
+            w_exception_set_traceback(pyre_object::gc_roots::shadow_stack_get(slot), node);
         }
     }
 
@@ -16739,16 +16740,19 @@ fn traceback_journal_rollback_unwinds_every_walk_node() {
     super::fbw_store_journal_reset();
     let mut exc = w_exception_new(ExcKind::ValueError, "boom");
     // The node the raise itself already attached before the walk got here.
-    prepend(exc, 1);
+    {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(exc);
+        prepend(slot, 1);
+        exc = pyre_object::gc_roots::shadow_stack_get(slot);
+    }
     assert_eq!(chain(exc), vec![1]);
 
     // Callee level first, catching level last — the order the walk records in,
     // and the reverse of the order the rollback has to undo.
     for lasti in [2i64, 3] {
-        super::journaled_concrete_traceback_attach(&mut exc, |slot| {
-            let exc = pyre_object::gc_roots::shadow_stack_get(slot);
-            prepend(exc, lasti);
-        });
+        super::journaled_concrete_traceback_attach(&mut exc, |slot| prepend(slot, lasti));
     }
     assert_eq!(chain(exc), vec![3, 2, 1]);
 
@@ -16761,10 +16765,7 @@ fn traceback_journal_rollback_unwinds_every_walk_node() {
 
     // Commit keeps them: a committed walk's nodes ARE this delivery's.
     for lasti in [4i64, 5] {
-        super::journaled_concrete_traceback_attach(&mut exc, |slot| {
-            let exc = pyre_object::gc_roots::shadow_stack_get(slot);
-            prepend(exc, lasti);
-        });
+        super::journaled_concrete_traceback_attach(&mut exc, |slot| prepend(slot, lasti));
     }
     super::fbw_store_journal_commit();
     super::fbw_store_journal_rollback();

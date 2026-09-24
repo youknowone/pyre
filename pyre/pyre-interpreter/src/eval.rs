@@ -2183,9 +2183,12 @@ pub fn handle_exception_with_context(
             if !saved_trace.is_null() {
                 frame.getorcreatedebug(-1).w_f_trace = saved_trace;
             }
-            if let Err(trace_err) = after_exc_result {
+            match after_exc_result {
                 // pyopcode.py:144-145 — `except OperationError as e: operr = e`.
-                *err = trace_err;
+                Err(trace_err) => *err = trace_err,
+                // The hook ran application code, so the field names the
+                // pre-collection address; the pin holds the forwarded one.
+                Ok(_) => err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot),
             }
         }
         // pyopcode.py:144-149 — after `except OperationError as e: operr = e`,
@@ -2231,7 +2234,9 @@ pub fn handle_exception_with_context(
             *err = trace_err;
             return false;
         }
-        pyre_object::gc_roots::shadow_stack_set(exc_slot, err.exc_object);
+        // `exception_trace` normalizes the carrier in place, which keeps the
+        // same exception, then runs the tracer; the pin, not the field, holds
+        // its forwarded address.
         err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
     }
     // `attach_tb=False` (RaiseWithExplicitTraceback) suppresses the traceback

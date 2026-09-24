@@ -257,7 +257,12 @@ fn read_timestamp() -> u128 {
 /// ready word (`debug_print.c` `OP_HAVE_DEBUG_PRINTS`).
 #[inline]
 pub fn have_debug_prints() -> bool {
-    with_debug_state(|state, cfg| cfg.enabled && (state.ready & 1) != 0)
+    // A disabled log keeps `pypy_have_debug_prints` at 0, so the gate
+    // answers without touching this thread's section state.
+    if !with_config(|cfg| cfg.enabled) {
+        return false;
+    }
+    with_debug_state(|state, _| (state.ready & 1) != 0)
 }
 
 /// `rlib/debug.py have_debug_prints_for(prefix)` — true when the

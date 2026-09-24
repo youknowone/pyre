@@ -1070,6 +1070,13 @@ pub fn jit_exc_value_peek() -> i64 {
     JIT_EXC_VALUE.load(Ordering::Relaxed)
 }
 
+/// Root-walker write-back for `JIT_EXC_VALUE`: a minor collection moved the
+/// pending exception from `old` to `new`. A compare-exchange, so a cell that
+/// no longer holds `old` is left alone.
+pub fn jit_exc_value_forward(old: i64, new: i64) {
+    let _ = JIT_EXC_VALUE.compare_exchange(old, new, Ordering::Relaxed, Ordering::Relaxed);
+}
+
 /// Clear both exception slots without reading the value.
 pub fn jit_exc_clear() {
     JIT_EXC_VALUE.store(0, Ordering::Relaxed);

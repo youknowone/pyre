@@ -2743,7 +2743,7 @@ pub fn blackhole_resume_via_rd_numb<'df>(
     // CALL_ASSEMBLER caller: the decode below rebuilds virtuals through the
     // blackhole allocator while the grabbed exception is still only a bare
     // pointer with no deadframe root behind it.
-    let _guard_exc_root = majit_metainterp::blackhole::GuardExcRoot::park(guard_exc);
+    let guard_exc_root = majit_metainterp::blackhole::GuardExcRoot::park(guard_exc);
 
     use majit_metainterp::resume;
 
@@ -3077,6 +3077,10 @@ pub fn blackhole_resume_via_rd_numb<'df>(
     // loop advances to nextblackholeinterp), so walk the chain here.
     if guard_exc != 0 {
         loop {
+            // The traceback records below allocate their nodes through the
+            // collecting nursery hook and can move the exception; the park
+            // holds its forwarded address, `guard_exc` the pre-move copy.
+            let guard_exc = guard_exc_root.get();
             if bh.handle_exception_in_frame(guard_exc) {
                 // Handler found in this frame; `position` now points at it.
                 // Fall through to the run loop to execute the handler.
@@ -3101,6 +3105,8 @@ pub fn blackhole_resume_via_rd_numb<'df>(
                     // resolves the raise coordinate and honours a bare reraise,
                     // as it does for the sibling propagation loop.
                     if !frame_ptr.is_null() {
+                        // Re-read past `leave_resumed_blackhole_frame`.
+                        let guard_exc = guard_exc_root.get();
                         match jitcode_index {
                             Some(jitcode_index) => record_caught_blackhole_traceback(
                                 guard_exc,
@@ -3122,11 +3128,16 @@ pub fn blackhole_resume_via_rd_numb<'df>(
                 None => {
                     // blackhole.py:1629 bottommost frame, unhandled →
                     // raise ExitFrameWithExceptionRef(exc).
-                    let err = exit_frame_exception_ref(guard_exc, "guard_exc propagation", || {
-                        format!(
-                            "jitcode={jitcode_index:?} last_opcode_position={last_opcode_position}"
-                        )
-                    });
+                    let mut err = exit_frame_exception_ref(
+                        guard_exc_root.get(),
+                        "guard_exc propagation",
+                        || {
+                            format!(
+                                "jitcode={jitcode_index:?} \
+                                 last_opcode_position={last_opcode_position}"
+                            )
+                        },
+                    );
                     if !frame_ptr.is_null() {
                         match jitcode_index {
                             // Every indexed frame recorded during blackhole
@@ -3147,6 +3158,9 @@ pub fn blackhole_resume_via_rd_numb<'df>(
                                 );
                             },
                         }
+                        // `err` was built from the parked exception, which
+                        // the record above can move.
+                        err.exc_object = guard_exc_root.get() as PyObjectRef;
                     }
                     // `guard_exc` is now owned by the typed
                     // `ExitFrameWithExceptionRef` result. A can-raise

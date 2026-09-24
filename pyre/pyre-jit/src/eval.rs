@@ -5120,6 +5120,20 @@ pub(crate) fn jit_exc_value_peek_backend() -> i64 {
     0
 }
 
+/// Write the forwarded address of a moved pending exception back into the
+/// active backend's `JIT_EXC_VALUE` cell. Same backend selection as
+/// [`jit_exc_value_peek_backend`].
+#[cfg(target_arch = "wasm32")]
+fn jit_exc_value_forward_backend(old: i64, new: i64) {
+    majit_backend_wasm::jit_exc_value_forward(old, new)
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn jit_exc_value_forward_backend(old: i64, new: i64) {
+    majit_metainterp::active_backend_jit_exc_value_forward(old, new)
+}
+#[cfg(not(any(target_arch = "wasm32", feature = "cranelift", feature = "dynasm")))]
+fn jit_exc_value_forward_backend(_old: i64, _new: i64) {}
+
 /// Root the pending compiled-trace raise held in the backend `JIT_EXC_VALUE`
 /// cell. A can-raise helper publishes the exception's raw pointer there
 /// (`store_jit_exception` / `publish_residual_call_exception`); between that
@@ -5132,11 +5146,16 @@ fn walk_jit_exc_value(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         return;
     }
     // A GC-managed exception marked here has its registered child offsets
-    // traced by the collector; the exception is oldgen-stable so a bare mark
-    // suffices.
+    // traced by the collector. A nursery exception (`alloc_exception_nursery`)
+    // moves in a minor, and the backend cell is not the slot the visitor
+    // rewrote, so the forwarded address is written back into it; the drain
+    // (`GUARD_NO_EXCEPTION`, `jit_exc_value_raw`) then reads the live object.
     let mut gcref = majit_ir::GcRef(exc as usize);
     visitor(&mut gcref);
-    // The carrier is non-moving (oldgen-stable / malloc_typed), so a minor
+    if gcref.0 as i64 != exc {
+        jit_exc_value_forward_backend(exc, gcref.0 as i64);
+    }
+    // An oldgen-stable or `malloc_typed` carrier does not move, so a minor
     // collection's root visitor no-ops on it and never reaches its fields
     // (`drag_out_root` returns for non-nursery starts): young children —
     // tracebacks appended by the raise in flight, args — would be left

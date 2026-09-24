@@ -244,10 +244,11 @@ pub fn gc_nursery_poison_enabled() -> bool {
     *ENABLED
 }
 
-/// The same `have_debug_prints` gate `majit_metainterp::majit_log_enabled`
-/// resolves, for the collector's own per-collection sites.
+/// `have_debug_prints_for("gc")` for the collector's own per-collection
+/// sites: a collection opens no debug section of its own, so the section
+/// ready bit would silence them under a `gc` prefix filter.
 pub fn majit_log_enabled() -> bool {
-    majit_ir::debug::have_debug_prints()
+    majit_ir::debug::have_debug_prints_for("gc")
 }
 
 /// `MAJIT_GC_DRAIN_CENSUS` — aggregate how much each minor collection drains.

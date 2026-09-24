@@ -71,8 +71,6 @@ mod slice_x2_probe {
     }
 }
 
-/// Whether `MAJIT_LOG` is set, cached at first access.
-///
 /// `have_debug_prints` — true only inside a debug section the `MAJIT_LOG`
 /// prefix filter accepts, so a category filter silences these sites.
 fn majit_log_enabled() -> bool {
@@ -87,16 +85,16 @@ struct EntryFlags {
     verify_enabled: bool,
 }
 
-/// One `LazyLock` check per entry instead of three; each is an env var fixed
-/// at process start.
+/// The two log gates follow this thread's open debug section, so they are
+/// read on every entry; a disabled log answers them without touching the
+/// section state.
 #[inline]
 fn entry_flags() -> EntryFlags {
-    static FLAGS: std::sync::LazyLock<EntryFlags> = std::sync::LazyLock::new(|| EntryFlags {
+    EntryFlags {
         log_enabled: majit_log_enabled(),
         debug_prints: majit_ir::debug::have_debug_prints(),
         verify_enabled: majit_verify_enabled(),
-    });
-    *FLAGS
+    }
 }
 
 /// Whether `MAJIT_VERIFY` is set, cached at first access.
@@ -988,6 +986,18 @@ pub fn jit_exc_value_addr() -> usize {
 /// the swap-to-0 read `jit_exc_value_raw`).
 pub fn jit_exc_value_peek() -> i64 {
     JIT_EXC_VALUE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Root-walker write-back for `JIT_EXC_VALUE`: a minor collection moved the
+/// pending exception from `old` to `new`. A compare-exchange, so a cell that
+/// no longer holds `old` is left alone.
+pub fn jit_exc_value_forward(old: i64, new: i64) {
+    let _ = JIT_EXC_VALUE.compare_exchange(
+        old,
+        new,
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// Return the address of JIT_EXC_TYPE for direct memory store in JIT code.
@@ -3344,9 +3354,30 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
                 fail_arg_types,
                 bridge.num_inputs,
             );
+            // `mat_outputs` is indexed by logical resume position, while
+            // `execute_bridge` decodes `rd_locs` against physical frame slots
+            // (`llmodel.py _decode_pos`). Write each rebuilt value back to its
+            // home slot.
+            let rd_locs = fail_descr_fd.rd_locs();
+            let bridge_outputs = if rd_locs.is_empty() {
+                mat_outputs
+            } else {
+                let mut slots = frame_slots;
+                for (index, &loc) in rd_locs.iter().enumerate() {
+                    if loc == 0xFFFF {
+                        continue;
+                    }
+                    if let (Some(&value), Some(slot)) =
+                        (mat_outputs.get(index), slots.get_mut(loc as usize))
+                    {
+                        *slot = value;
+                    }
+                }
+                slots
+            };
             return CraneliftBackend::execute_bridge(
                 &bridge,
-                &mat_outputs,
+                &bridge_outputs,
                 fail_descr_fd,
                 attachments,
             );
@@ -8613,6 +8644,10 @@ fn resolve_exit_descr(
     }
 }
 
+/// `assembler.py` `gcmap_for_finish`: one bitmap word with bit 0 set, the
+/// map a FINISH returning a Ref leaves on the frame so slot 0 is traced.
+static GCMAP_FOR_FINISH: [isize; 2] = [1, 1];
+
 /// compile.py `PropagateExceptionDescr.handle_fail`: move `jf_guard_exc`
 /// (or `memory_error` when it is empty) into frame slot 0 and retarget
 /// `jf_descr` at the attached `exit_frame_with_exception_descr_ref`, so
@@ -8634,8 +8669,13 @@ fn stage_propagate_exception_as_exit(
         // compile.py `cast_instance_to_gcref(memory_error)`
         majit_backend::memory_error_singleton_ref()
     };
+    // Slot 0 now holds the only reference to the exception. The propagate
+    // guard has no failargs, so its gcmap marks no slot; install
+    // `gcmap_for_finish` so the frame keeps the value rooted and forwarded
+    // until the exit reader consumes it.
     unsafe {
         *result_jf.add(header_words) = exc_val;
+        *result_jf.add(JF_GCMAP_OFS as usize / 8) = GCMAP_FOR_FINISH.as_ptr() as i64;
     }
     // When unattached (unit-test setup) this writes 0, and
     // `resolve_exit_descr` surfaces the cranelift singleton.
@@ -8661,9 +8701,9 @@ fn run_compiled_code_inner(
     let depth = max_output_slots.max(inputs.len()).max(1);
     let header_words = (JF_FRAME_ITEM0_OFS as usize) / 8; // 8 words = 64 bytes
     let frame_depth = depth + num_ref_roots;
-    // Read once, ahead of the run. Each of these is a `Once`-guarded load of a
-    // flag fixed at process start, and the compiled call between the sites
-    // below is opaque to the optimizer, so asking again after it re-reads.
+    // Read once per entry, ahead of the run: the compiled call between the
+    // sites below is opaque to the optimizer, so asking again after it
+    // re-reads.
     let EntryFlags {
         log_enabled,
         debug_prints,

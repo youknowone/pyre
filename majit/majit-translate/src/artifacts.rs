@@ -125,6 +125,11 @@ impl JitCodeIndex {
     }
 }
 
+/// Wire-format version of [`EmbeddedArtifacts`]. Version 2 added the
+/// reachable-symbolic-residual table to [`JitCodeIndex`]; a version-1 index
+/// has no such table and is rejected rather than decoded as garbage.
+const ARTIFACT_VERSION: u32 = 2;
+
 /// Encoded bodies remain bytes until requested, so this envelope is Send+Sync
 /// without publishing translation-time graphs across threads.
 #[derive(Serialize, Deserialize)]
@@ -148,7 +153,7 @@ impl EmbeddedArtifacts {
         let reachable = reachable_symbolic_residual_table(&pipeline.jitcodes, &pipeline.descrs);
         let (index, bodies) = JitCodeIndex::encode(&pipeline.jitcodes, paths, reachable)?;
         Ok(Self {
-            version: 1,
+            version: ARTIFACT_VERSION,
             index,
             bodies,
             descrs: bincode::serialize(&pipeline.descrs)?,
@@ -162,12 +167,16 @@ impl EmbeddedArtifacts {
     }
 
     pub fn decode(bytes: &[u8]) -> bincode::Result<Self> {
-        let artifacts: Self = bincode::deserialize(bytes)?;
-        if artifacts.version != 1 {
+        // `version` leads the envelope. Read it alone first, so an envelope of
+        // another layout is rejected by its version rather than failing
+        // partway through an index shaped differently.
+        let version: u32 = bincode::deserialize(bytes)?;
+        if version != ARTIFACT_VERSION {
             return Err(Box::new(bincode::ErrorKind::Custom(
                 "unsupported JitCode artifact version".into(),
             )));
         }
+        let artifacts: Self = bincode::deserialize(bytes)?;
         artifacts.index.validate(&artifacts.bodies)?;
         Ok(artifacts)
     }
@@ -425,7 +434,7 @@ mod tests {
         let (index, bodies) =
             JitCodeIndex::encode(&[code], vec!["module::helper".into()], reachable).unwrap();
         let mut original = EmbeddedArtifacts {
-            version: 1,
+            version: ARTIFACT_VERSION,
             index,
             bodies,
             descrs: bincode::serialize(&Vec::<BhDescr>::new()).unwrap(),
@@ -445,7 +454,7 @@ mod tests {
         assert!(loaded.descrs().unwrap().is_empty());
         assert!(loaded.index.load(&loaded.bodies, 1).is_err());
         assert!(loaded.index.load(&loaded.bodies, usize::MAX).is_err());
-        original.version = 2;
+        original.version = ARTIFACT_VERSION + 1;
         assert!(EmbeddedArtifacts::decode(&original.encode().unwrap()).is_err());
     }
 

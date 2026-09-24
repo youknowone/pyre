@@ -166,6 +166,13 @@ pub fn jit_exc_value_peek() -> i64 {
     JIT_EXC_VALUE.load(Ordering::Relaxed)
 }
 
+/// Root-walker write-back for `JIT_EXC_VALUE`: a minor collection moved the
+/// pending exception from `old` to `new`. A compare-exchange, so a cell that
+/// no longer holds `old` is left alone.
+pub fn jit_exc_value_forward(old: i64, new: i64) {
+    let _ = JIT_EXC_VALUE.compare_exchange(old, new, Ordering::Relaxed, Ordering::Relaxed);
+}
+
 /// Clear exception state.
 pub fn jit_exc_clear() {
     JIT_EXC_VALUE.store(0, Ordering::Relaxed);
@@ -765,9 +772,9 @@ fn handle_fail_resume_guard(
     unsafe { (*frame_ptr).jf_guard_exc = 0 };
 
     // compile.py `else: resume_in_blackhole(descr, deadframe)`.
-    let bh_result = CA_BLACKHOLE_FN
-        .get()
-        .and_then(|blackhole| blackhole(descr_raw, frame_ptr, guard_exc_root.0 as i64));
+    let blackhole = CA_BLACKHOLE_FN.get();
+    let bh_result =
+        blackhole.and_then(|blackhole| blackhole(descr_raw, frame_ptr, guard_exc_root.0 as i64));
     if let Some(bh_result) = bh_result {
         if majit_log_enabled() {
             eprintln!(
@@ -789,8 +796,10 @@ fn handle_fail_resume_guard(
     // failure stub already moved it out of `pos_exc_value` into
     // `jf_guard_exc`, and returning 0 with the cell empty is a normal
     // NULL result. Leave an exception the blackhole already published
-    // (stack overflow) in place.
-    if guard_exc_root.0 != 0 && !jit_exc_is_pending() {
+    // (stack overflow) in place. A registered blackhole that answered
+    // `None` bailed to the interpreter after delivering the exception to
+    // a handler, so there is nothing left to raise.
+    if blackhole.is_none() && guard_exc_root.0 != 0 && !jit_exc_is_pending() {
         jit_exc_raise(guard_exc_root.0 as i64);
     }
     0

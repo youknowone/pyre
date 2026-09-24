@@ -1613,9 +1613,16 @@ mod tests {
             let s = crate::w_str_new("s");
             let obj_cell = w_object_mutable_cell_new(s);
             let int_cell = w_int_mutable_cell_new(7);
+            // Distinct objects, so these reach `is_w` past its pointer check.
+            let f1 = crate::floatobject::w_float_new(1.5);
+            let f2 = crate::floatobject::w_float_new(1.5);
+            assert!(!std::ptr::eq(f1, f2));
+            let ab1 = crate::w_str_new("ab");
+            let ab2 = crate::w_str_new("ab");
+            assert!(!std::ptr::eq(ab1, ab2));
 
             // (raw slot contents, value written, bumps?, what the write does)
-            let cases: [(Option<PyObjectRef>, PyObjectRef, bool, &str); 6] = [
+            let cases: [(Option<PyObjectRef>, PyObjectRef, bool, &str); 8] = [
                 (None, int7, true, "no cell: the value is stored bare"),
                 (Some(obj_cell), s, false, "object cell: written in place"),
                 (
@@ -1627,6 +1634,18 @@ mod tests {
                 (Some(int_cell), s, true, "int cell + non-int: fresh cell"),
                 (Some(s), s, false, "bare value, identical: unchanged"),
                 (Some(int7), int8, true, "bare value, different: fresh cell"),
+                (
+                    Some(f1),
+                    f2,
+                    false,
+                    "equal exact floats: `is_w` identical, unchanged",
+                ),
+                (
+                    Some(ab1),
+                    ab2,
+                    true,
+                    "equal strs with separate storage: fresh cell",
+                ),
             ];
             for (w_cell, w_value, bumps, what) in cases {
                 assert_eq!(store_would_bump_version(w_cell, w_value), bumps, "{what}");

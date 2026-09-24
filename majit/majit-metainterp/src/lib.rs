@@ -153,8 +153,8 @@ pub(crate) mod parity;
 mod pyjitpl;
 #[cfg(not(target_arch = "wasm32"))]
 pub use pyjitpl::{
-    active_backend_jit_exc_value_peek, install_active_backend_gc_standalone,
-    register_active_backend_jitframe_gc_type,
+    active_backend_jit_exc_value_forward, active_backend_jit_exc_value_peek,
+    install_active_backend_gc_standalone, register_active_backend_jitframe_gc_type,
 };
 pub mod quasiimmut;
 pub use quasiimmut::set_force_quasi_immutable_hook;

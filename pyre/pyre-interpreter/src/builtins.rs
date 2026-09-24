@@ -7921,9 +7921,16 @@ fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) -> Result<(), cra
     // `_parse_init_args`: only a 2..=5 argument call carries errno/strerror
     // (and optionally filename/filename2); outside that range every argument
     // stays in `args_w` and no slot is filled.
-    let parsed = os_error_parsed_errno(args);
+    // Pinned as well: on Windows the parse can mint a fresh int, and
+    // `getindex_w_written` below can move either one.
+    let errno_slot = os_error_parsed_errno(args).map(|w_errno| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_errno);
+        slot
+    });
+    let errno = || errno_slot.map(pyre_object::gc_roots::shadow_stack_get);
     let mut trimmed = false;
-    if let Some(w_errno) = parsed {
+    if let Some(w_errno) = errno() {
         // The parse also decides the errno the args tuple carries, so
         // `e.args[0]` and `e.errno` agree even where a Windows error code in
         // the fourth argument replaced the one that was passed.
@@ -7965,7 +7972,7 @@ fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) -> Result<(), cra
     }
     // Assembled from the root stack, after the last `__index__`: the caller's
     // slice is a pre-move view of the operands by then.
-    let args_w: Vec<PyObjectRef> = match (parsed, trimmed) {
+    let args_w: Vec<PyObjectRef> = match (errno(), trimmed) {
         (Some(w_errno), true) => vec![w_errno, arg(1)],
         (Some(w_errno), false) => std::iter::once(w_errno)
             .chain((1..args.len()).map(&arg))
