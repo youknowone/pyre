@@ -17209,7 +17209,7 @@ fn fixedview_impl<const UNROLL: bool>(
                 return Err(fixedview_length_error(expected_length, length));
             }
             if majit_rlib::jit::isconstant(&expected_length) {
-                std::hint::black_box(majit_metainterp::jit::promote(length));
+                let _ = majit_metainterp::jit::promote(length);
             }
             // `getitems_unroll` and `getitems_fixedsize` both snapshot storage.
             // Iteration is only the generic arm below.

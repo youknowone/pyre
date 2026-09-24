@@ -28,10 +28,11 @@ pub const JIT_ENV_NAMES: &[&str] = &[
     "MAJIT_SKIP_BRIDGES",
 ];
 
-/// Replace the one environment. Call before the first read: each site caches
-/// the answer in a `OnceLock`.
+/// Upsert into the one environment. Call before the first read: each site
+/// caches the answer in a `OnceLock`. A later call keeps names another setter
+/// already wrote. [`install`] is what replaces the map.
 pub fn set_supplied_env(entries: Vec<(String, String)>) {
-    majit_ir::environ::install(string_entries(entries));
+    majit_ir::environ::extend(string_entries(entries));
 }
 
 /// Replace the one environment with raw values. The launcher needs bytes:
@@ -80,33 +81,35 @@ pub fn env_var(varname: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// One install has to be visible to a collector knob and a JIT knob.
-    /// Separate `SUPPLIED_ENV` tables fail this: the setter that wrote the
-    /// value is not the reader that consumes it.
+    /// One map has to be visible to a collector reader and a JIT reader.
+    /// Separate tables fail this: the setter that wrote the value is not the
+    /// reader that consumes it. The names are unique to this test, so a
+    /// process variable cannot hide the installed value and nothing here
+    /// writes the process environment.
     #[test]
     fn one_environment_is_visible_to_a_gc_knob_and_a_jit_knob() {
-        unsafe {
-            std::env::remove_var("PYPY_GC_DEBUG");
-            std::env::remove_var("MAJIT_NO_BRIDGE");
-        }
-        majit_gc::collector::set_supplied_env(vec![(
-            "MAJIT_NO_BRIDGE".to_string(),
-            "1".to_string(),
-        )]);
+        const JIT_NAME: &str = "MAJIT_TEST_ONE_ENV_JIT_READER";
+        const GC_NAME: &str = "MAJIT_TEST_ONE_ENV_GC_READER";
+        majit_ir::environ::install(Vec::new());
+        majit_gc::collector::set_supplied_env(vec![(JIT_NAME.to_string(), "1".to_string())]);
         assert!(
-            env_var_os("MAJIT_NO_BRIDGE").is_some(),
+            env_var_os(JIT_NAME).is_some(),
             "a name installed for the collector must be the name the jit knob reads"
         );
-        set_supplied_env(vec![("PYPY_GC_DEBUG".to_string(), "2".to_string())]);
+        set_supplied_env(vec![(GC_NAME.to_string(), "2".to_string())]);
         assert_eq!(
-            majit_gc::collector::GcConfig::default().debug,
-            2,
+            majit_ir::environ::env_var(GC_NAME).as_deref(),
+            Some("2"),
             "a name installed for the jit must be the name the collector reads"
         );
         let installed = entries();
-        assert_eq!(installed.len(), 1, "one install replaced the one map");
-        assert_eq!(installed[0].0, "PYPY_GC_DEBUG");
-        set_supplied_env(Vec::new());
-        majit_gc::collector::set_supplied_env(Vec::new());
+        assert_eq!(installed.len(), 2, "each setter extends the one map");
+        assert!(installed.iter().any(|(name, _)| name == JIT_NAME));
+        assert!(
+            installed
+                .iter()
+                .any(|(name, value)| name == GC_NAME && value == b"2")
+        );
+        majit_ir::environ::install(Vec::new());
     }
 }

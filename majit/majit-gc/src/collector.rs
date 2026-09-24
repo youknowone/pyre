@@ -292,15 +292,15 @@ pub const GC_ENV_NAMES: &[&str] = &[
     "MAJIT_GC_STRESS",
 ];
 
-/// Install [`GC_ENV_NAMES`] into the one environment ([`majit_ir::environ`]).
-/// Call before the first allocation: the values are read once, when the
-/// collector is built. Replaces the whole map — the host installs once.
+/// Upsert [`GC_ENV_NAMES`] into the one environment ([`majit_ir::environ`]).
+/// A later call keeps names another setter already wrote. Call before the
+/// first allocation: the values are read once, when the collector is built.
+/// [`majit_ir::environ::install`] is what replaces the map.
 pub fn set_supplied_env(entries: Vec<(String, String)>) {
-    majit_ir::environ::install(
+    majit_ir::environ::extend(
         entries
             .into_iter()
-            .map(|(name, value)| (name, value.into_bytes()))
-            .collect(),
+            .map(|(name, value)| (name, value.into_bytes())),
     );
 }
 
@@ -10003,15 +10003,16 @@ mod tests {
     static SUPPLIED_ENV_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     /// A supplied environment answers a name the process does not define, and
-    /// yields to one it does. The name is not in [`GC_ENV_NAMES`], so a
-    /// concurrently built collector cannot see this table.
+    /// yields to one it does. The absent name is not in [`GC_ENV_NAMES`], so a
+    /// concurrently built collector cannot see this table. `PATH` is read, not
+    /// written: a parallel test must not mutate the process environment.
     #[test]
     fn supplied_env_fills_in_only_what_the_process_lacks() {
         let _guard = SUPPLIED_ENV_TEST_LOCK.lock();
         let absent = "MAJIT_TEST_SUPPLIED_ENV_ABSENT";
-        let present = "MAJIT_TEST_SUPPLIED_ENV_PRESENT";
-        // SAFETY: single-threaded within this test; the names are unique to it.
-        unsafe { std::env::set_var(present, "2m") };
+        let present = "PATH";
+        let process_value = std::env::var(present).expect("PATH");
+        majit_ir::environ::install(Vec::new());
 
         assert_eq!(read_uint_from_env(absent), None);
         set_supplied_env(vec![
@@ -10019,11 +10020,10 @@ mod tests {
             (present.to_string(), "4m".to_string()),
         ]);
         assert_eq!(read_uint_from_env(absent), Some(1024 * 1024));
-        assert_eq!(read_uint_from_env(present), Some(2 * 1024 * 1024));
+        assert_eq!(env_var(present).as_deref(), Some(process_value.as_str()));
 
-        set_supplied_env(Vec::new());
+        majit_ir::environ::install(Vec::new());
         assert_eq!(read_uint_from_env(absent), None);
-        unsafe { std::env::remove_var(present) };
     }
 
     /// Presence matches `var_os.is_some()`: an empty supplied value still
@@ -10033,19 +10033,17 @@ mod tests {
     fn supplied_env_presence_matches_var_os() {
         let _guard = SUPPLIED_ENV_TEST_LOCK.lock();
         let name = "MAJIT_TEST_SUPPLIED_PRESENCE";
-        // SAFETY: lock held; unique name.
-        unsafe { std::env::remove_var(name) };
-        set_supplied_env(Vec::new());
+        majit_ir::environ::install(Vec::new());
         assert!(
             !env_is_set(name),
-            "cleared process env and embedder table must read as unset"
+            "a unique name absent from the process and the embedder table is unset"
         );
         set_supplied_env(vec![(name.to_string(), String::new())]);
         assert!(
             env_is_set(name),
             "empty supplied value is still present, matching var_os.is_some"
         );
-        set_supplied_env(Vec::new());
+        majit_ir::environ::install(Vec::new());
         assert!(!env_is_set(name));
     }
 

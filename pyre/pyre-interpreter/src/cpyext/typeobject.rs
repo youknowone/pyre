@@ -7089,25 +7089,20 @@ mod tests {
     fn named_unsized_mirror_keeps_typedescr_basicsize() {
         crate::typedef::init_typeobjects();
         let w_list = crate::typedef::gettypeobject(&pyre_object::LIST_TYPE);
-        let name = std::ffi::CString::new("list").unwrap();
+        let name = std::ffi::CString::new("isolated-layout").unwrap();
         let mut named = super::immortal_type();
-        let mut blank = super::immortal_type();
         named.tp_name = name.as_ptr();
-        let mut saved = Vec::new();
         unsafe {
-            let mut base = pyre_object::typeobject::w_type_get_best_base(w_list);
-            while !base.is_null() {
-                saved.push((base, pyre_object::typeobject::w_type_get_cpy_ref(base)));
-                pyre_object::typeobject::w_type_set_cpy_ref(base, (&raw mut blank).cast());
-                base = pyre_object::typeobject::w_type_get_best_base(base);
-            }
-            let old_list = pyre_object::typeobject::w_type_get_cpy_ref(w_list);
-            pyre_object::typeobject::w_type_set_cpy_ref(w_list, (&raw mut named).cast());
-            let sized = super::mirror_basicsize(w_list);
-            pyre_object::typeobject::w_type_set_cpy_ref(w_list, old_list);
-            for (base, previous) in saved {
-                pyre_object::typeobject::w_type_set_cpy_ref(base, previous);
-            }
+            let layout = pyre_object::typeobject::w_type_get_layout_ptr(w_list);
+            let w_type = pyre_object::typeobject::w_type_new(
+                "isolated-layout",
+                pyre_object::PY_NULL,
+                std::ptr::null_mut(),
+            );
+            pyre_object::typeobject::w_type_set_layout(w_type, layout);
+            pyre_object::typeobject::w_type_set_cpy_ref(w_type, (&raw mut named).cast());
+            let sized = super::mirror_basicsize(w_type);
+            pyre_object::typeobject::w_type_set_cpy_ref(w_type, std::ptr::null_mut());
             assert_eq!(sized, 7 * std::mem::size_of::<usize>() as isize);
         }
     }

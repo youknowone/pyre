@@ -766,14 +766,15 @@ fn declared_shape(w_type: PyObjectRef) -> Option<Shape> {
     if derived("datetime") || derived("time") {
         return Some(Shape::WithTZInfo);
     }
-    // Exact `date` is sized as the datetime basestruct, then shrunk by
-    // `_PyDateTime_Import`. A later subclass inherits that shrunk `tp_basicsize`
-    // from the base (`type_attach`), so it is not this shape.
-    let date = datetime_class("date");
-    if !date.is_null() && std::ptr::eq(w_type, date) {
-        return Some(Shape::WithTZInfo);
-    }
     None
+}
+
+/// Exact `datetime.date`. Its typedescr basestruct is the datetime struct,
+/// because `datetime` inherits from `date`; the size a mirror publishes is
+/// the header.
+fn exact_date(w_type: PyObjectRef) -> bool {
+    let date = datetime_class("date");
+    !date.is_null() && std::ptr::eq(w_type, date)
 }
 
 /// A subclass of `date` that is not a `datetime` or a `time`.
@@ -794,14 +795,16 @@ fn pure_date_subclass(w_type: PyObjectRef) -> bool {
 
 /// What `tp_basicsize` a synthesized mirror of `w_type` carries.
 pub(super) fn basicsize(w_type: PyObjectRef) -> isize {
+    // `date` is given the datetime basestruct by its typedescr, then
+    // `_PyDateTime_Import` writes `sizeof(PyObject)` back before `datetime`
+    // is mirrored. A subclass copies the base mirror's `tp_basicsize` at the
+    // moment it is built, so the header has to already be the size on the
+    // exact `date` mirror — including when that mirror is built first.
+    if exact_date(w_type) || pure_date_subclass(w_type) {
+        return size_of::<CPyObject>() as isize;
+    }
     if let Some(shape) = declared_shape(w_type) {
         return shape.size();
-    }
-    // `_PyDateTime_Import` shrinks the exact date type to `sizeof(PyObject)`.
-    // A heap subclass created afterwards inherits that size. The slot table
-    // would otherwise append the date layout's words on top of the header.
-    if pure_date_subclass(w_type) {
-        return size_of::<CPyObject>() as isize;
     }
     0
 }

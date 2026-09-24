@@ -316,11 +316,93 @@ static PyMethodDef methods[] = {
     {"checks_of", checks_of, METH_O, NULL},
     {NULL, NULL, 0, NULL}};
 
+/* Mirror a pure `date` subclass before `_PyDateTime_Import`. The subclass
+   copies `tp_basicsize` from the date mirror at that moment, so the date
+   mirror already has to be the header. `PyType_GetTypeDataSize` is then 0. */
+static int mirror_pure_date_subclass_before_import(PyObject **held)
+{
+    PyObject *datetime_mod;
+    PyObject *date;
+    PyObject *bases;
+    PyObject *dict;
+    PyObject *name;
+    PyObject *cls;
+    Py_ssize_t extra;
+
+    *held = NULL;
+    datetime_mod = PyImport_ImportModule("datetime");
+    if (datetime_mod == NULL) {
+        return -1;
+    }
+    date = PyObject_GetAttrString(datetime_mod, "date");
+    Py_DECREF(datetime_mod);
+    if (date == NULL) {
+        return -1;
+    }
+    bases = PyTuple_Pack(1, date);
+    Py_DECREF(date);
+    if (bases == NULL) {
+        return -1;
+    }
+    dict = PyDict_New();
+    if (dict == NULL) {
+        Py_DECREF(bases);
+        return -1;
+    }
+    name = PyUnicode_FromString("DayBeforeImport");
+    if (name == NULL) {
+        Py_DECREF(dict);
+        Py_DECREF(bases);
+        return -1;
+    }
+    cls = PyObject_CallFunctionObjArgs(
+        (PyObject *)&PyType_Type, name, bases, dict, NULL);
+    Py_DECREF(name);
+    Py_DECREF(bases);
+    Py_DECREF(dict);
+    if (cls == NULL) {
+        return -1;
+    }
+    extra = PyType_GetTypeDataSize((PyTypeObject *)cls);
+    if (extra != 0) {
+        Py_DECREF(cls);
+        PyErr_Format(
+            PyExc_AssertionError,
+            "date subclass mirrored before import reports %zd extra bytes",
+            extra);
+        return -1;
+    }
+    *held = cls;
+    return 0;
+}
+
 static int datetime_exec(PyObject *module)
 {
+    PyObject *early = NULL;
+    Py_ssize_t extra;
+    Py_ssize_t date_size;
+    Py_ssize_t sub_size;
+
     (void)module;
+    if (mirror_pure_date_subclass_before_import(&early) < 0) {
+        return -1;
+    }
     PyDateTime_IMPORT;
     if (PyDateTimeAPI == NULL) {
+        Py_DECREF(early);
+        return -1;
+    }
+    extra = PyType_GetTypeDataSize((PyTypeObject *)early);
+    date_size = PyDateTimeAPI->DateType->tp_basicsize;
+    sub_size = ((PyTypeObject *)early)->tp_basicsize;
+    Py_DECREF(early);
+    if (extra != 0 || sub_size != date_size) {
+        PyErr_Format(
+            PyExc_AssertionError,
+            "date subclass after import: extra %zd subclass %zd date %zd",
+            extra,
+            sub_size,
+            date_size);
         return -1;
     }
     return 0;
