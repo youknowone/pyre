@@ -7538,7 +7538,7 @@ mod tests {
         // that `add_call_descr` puts a `BhDescr::Call { calldescr }` at the
         // returned pool index so canonical `residual_call_*_v` handlers
         // (`blackhole.rs`) can reach it via `read_descr` →
-        // `as_calldescr()` (`majit-translate/src/codewriter/jitcode.rs`).
+        // `as_calldescr()` (`majit-jitcode/src/codewriter/jitcode.rs`).
         let mut builder = JitCodeBuilder::new();
         let calldescr = majit_jitcode::codewriter::jitcode::BhCallDescr::from_signature(
             "i".to_string(),

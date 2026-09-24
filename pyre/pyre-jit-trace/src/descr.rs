@@ -8404,7 +8404,7 @@ pub fn make_struct_array_descr_full_keyed(
 /// `calldescr` + the callee's bytecode body and is emitted directly as
 /// the descr operand of `inline_call_*`. The codewriter side surfaces
 /// this as `BhDescr::JitCode { jitcode_index, fnaddr, calldescr }`
-/// (`majit-translate/src/codewriter/jitcode.rs`); the trace-side
+/// (`majit-jitcode/src/codewriter/jitcode.rs`); the trace-side
 /// walker (`jitcode_dispatch.rs::WalkContext`) consumes
 /// `&[Arc<dyn Descr>]` and queries `as_jitcode_descr()` /
 /// `jitcode_index()`.
@@ -8550,7 +8550,7 @@ impl Descr for PyreVtableMethodDescr {
 }
 
 /// `assembler.py Assembler.descrs` parity adapter — translate one
-/// codewriter-side `BhDescr` slot (`majit-translate/src/codewriter/jitcode.rs`)
+/// codewriter-side `BhDescr` slot (`majit-jitcode/src/codewriter/jitcode.rs`)
 /// into the matching trace-side `Arc<dyn Descr>` so trace ops emitted
 /// by the walker (`crate::jitcode_dispatch::dispatch_via_miframe`) can carry
 /// real-content descrs instead of `make_fail_descr` placeholders.

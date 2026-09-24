@@ -72,7 +72,7 @@ fn quoted(line: &str) -> Vec<String> {
 /// what THIS build's assembler emitted, so it varies with the analyzed source
 /// set, while a coverage snapshot has to compare two static arm lists.
 fn insns_table(root: &Path) -> Vec<(String, String)> {
-    let src = read(root, "majit/majit-translate/src/codewriter/insns.rs");
+    let src = read(root, "majit/majit-jitcode/src/codewriter/insns.rs");
     // Drop `//` comments so a name that only appears in prose does not
     // read as an implementation, then scan the joined remainder so a
     // rustfmt-wrapped `m.insert(\n    "key",\n    BC_X,\n)` still

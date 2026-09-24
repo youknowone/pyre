@@ -31,6 +31,9 @@ class ModulePair:
     label: str
     python_dir: Path
     rust_dir: Path
+    # Further directories holding modules of the same upstream package, when
+    # the port splits it across crates. `rust_dir` is searched first.
+    extra_rust_dirs: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -51,7 +54,7 @@ DEFAULT_PAIRS = [
     ModulePair(
         "rpython/config",
         Path("rpython/config"),
-        Path("majit/majit-translate/src/config"),
+        Path("majit/majit-config/src"),
     ),
     ModulePair(
         "rpython/flowspace",
@@ -62,6 +65,7 @@ DEFAULT_PAIRS = [
         "rpython/jit/codewriter",
         Path("rpython/jit/codewriter"),
         Path("majit/majit-translate/src/codewriter"),
+        (Path("majit/majit-jitcode/src/codewriter"),),
     ),
     ModulePair(
         "rpython/jit/metainterp",
@@ -102,6 +106,7 @@ DEFAULT_PAIRS = [
         "rpython/tool/algo",
         Path("rpython/tool/algo"),
         Path("majit/majit-translate/src/tool/algo"),
+        (Path("majit/majit-jitcode/src/tool/algo"),),
     ),
     ModulePair(
         "rpython/translator",
@@ -1781,19 +1786,36 @@ def compare_symbols_for_pair(
     root: Path, pair: ModulePair, matched: list[str]
 ) -> list[dict[str, object]]:
     python_dir = root / pair.python_dir
-    rust_dir = root / pair.rust_dir
+    rust_dirs = [root / pair.rust_dir, *(root / extra for extra in pair.extra_rust_dirs)]
     results = []
 
     for module in matched:
         if module == PACKAGE_ENTRY:
             continue
         py_path = python_module_path(python_dir, module)
-        rs_path = rust_module_path(rust_dir, module)
-        if not py_path.is_file() or not rs_path.is_file():
+        # A module split across crates keeps a file of the same name in each;
+        # its symbols are the union, reported under the first one found.
+        rs_paths = [
+            path
+            for path in (rust_module_path(rust_dir, module) for rust_dir in rust_dirs)
+            if path.is_file()
+        ]
+        if not py_path.is_file() or not rs_paths:
             continue
+        rs_path = rs_paths[0]
 
         py_symbols = python_top_level_symbols(py_path)
-        rs_symbols, rs_nonpub_symbols, rs_reexports, is_reexport = rust_top_level_symbols(rs_path)
+        rs_symbols = {"types": set(), "functions": set()}
+        rs_nonpub_symbols = {"types": set(), "functions": set()}
+        rs_reexports: set[str] = set()
+        is_reexport = True
+        for path in rs_paths:
+            symbols, nonpub_symbols, reexports, path_is_reexport = rust_top_level_symbols(path)
+            for kind in rs_symbols:
+                rs_symbols[kind] |= symbols[kind]
+                rs_nonpub_symbols[kind] |= nonpub_symbols[kind]
+            rs_reexports |= reexports
+            is_reexport = is_reexport and path_is_reexport
         rs_type_names = rs_symbols["types"] | rs_reexports
         rs_function_names = rs_symbols["functions"] | rs_reexports
         rs_implemented_function_names = rs_function_names | rs_nonpub_symbols["functions"]
@@ -1861,6 +1883,10 @@ def compare_pair(root: Path, pair: ModulePair, excludes: set[str]) -> dict[str, 
 
     py_modules = python_modules(python_dir, excludes)
     rs_modules = rust_modules(rust_dir, excludes)
+    for extra in pair.extra_rust_dirs:
+        if not (root / extra).is_dir():
+            raise SystemExit(f"missing Rust directory: {extra}")
+        rs_modules |= rust_modules(root / extra, excludes)
     raw_missing = py_modules - rs_modules
     raw_extra = rs_modules - py_modules
     ignored_missing = {
