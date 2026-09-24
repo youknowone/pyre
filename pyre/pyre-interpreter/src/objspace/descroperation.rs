@@ -6222,14 +6222,16 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
     // the codewriter looks inside a loop-free graph only
     // (`policy.py look_inside_graph`), and a traced `int < int` must reach
     // `int_lt` through here.  Exact float/float is the same shape
-    // (`_float_lt` after `_to_float`) and must live here too, or the
-    // leaf is only reachable from [`compare_slot_rest`] and never
-    // becomes a jitcode.  Every other layout's comparison, several of
-    // which iterate, lives in [`compare_slot_rest`], a residual on the
-    // trace.  Tuple comparison stays there: the container cycle's stack
-    // check is the first thing `compare_slot_rest` does, and a tuple arm
-    // ahead of that check would recurse through `compare_tuples` with no
-    // guard.  Short tuple equality is folded in the tracer instead.
+    // (`_float_lt` after `_to_float`).  Long/long (`rbigint.lt`), mixed
+    // long/int (`rbigint.int_lt` via [`long_int_compare`]), and str/str
+    // (`jit_str_compare`, the `ll_unicode_cmp` ordering `W_UnicodeObject.descr_lt`
+    // takes over `_utf8`) are loop-free too and must live here, or the leaf
+    // is only reachable from [`compare_slot_rest`] and never becomes a
+    // jitcode.  Every layout that iterates stays in [`compare_slot_rest`].
+    // Tuple comparison stays there: the container cycle's stack check is the
+    // first thing `compare_slot_rest` does, and a tuple arm ahead of that
+    // check would recurse through `compare_tuples` with no guard.  Short
+    // tuple equality is folded in the tracer instead.
     unsafe {
         if is_int_like(a) && is_int_like(b) {
             return match op {
@@ -6253,22 +6255,6 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                 CompareOp::Ne => _float_ne(x, y),
             };
         }
-    }
-    compare_slot_rest(a, b, op)
-}
-
-/// [`compare_slot`] for every pair that is not two machine ints.
-#[inline(never)]
-fn compare_slot_rest(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
-    // RPython inserts a stack check on this recursive object-space call.
-    // Container comparisons recurse through [`compare`] without pushing a
-    // Python frame (for example two distinct self-referential lists), so keep
-    // the same guard explicitly in the Rust port and raise RecursionError
-    // before exhausting the native stack.  It sits on the recursive arm: a
-    // machine-int pair never recurses, and the check would otherwise be one
-    // residual call on every traced `int < int`.
-    crate::stack_check::stack_check()?;
-    unsafe {
         // longobject.py `_make_descr_cmp` and intobject.py
         // `_make_descr_cmp`: both mixed orders call an rbigint.int_* method
         // on the long payload. The int-left order uses the reversed relation.
@@ -6315,6 +6301,37 @@ fn compare_slot_rest(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult 
                 CompareOp::Ne => va.ne(vb),
             }));
         }
+        if is_str(a) && is_str(b) {
+            // `W_UnicodeObject.descr_lt` answers from one `_utf8` ordering
+            // (`ll_unicode_cmp`). `jit_str_compare` is that ordering on WTF-8
+            // bytes, which matches code-point order including lone surrogates.
+            let diff = pyre_object::unicodeobject::jit_str_compare(a as i64, b as i64);
+            return Ok(w_bool_from(match op {
+                CompareOp::Lt => diff < 0,
+                CompareOp::Le => diff <= 0,
+                CompareOp::Gt => diff > 0,
+                CompareOp::Ge => diff >= 0,
+                CompareOp::Eq => diff == 0,
+                CompareOp::Ne => diff != 0,
+            }));
+        }
+    }
+    compare_slot_rest(a, b, op)
+}
+
+/// [`compare_slot`] for layouts whose comparison iterates (containers) or
+/// is not the loop-free long/int/str arm.
+#[inline(never)]
+fn compare_slot_rest(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
+    // RPython inserts a stack check on this recursive object-space call.
+    // Container comparisons recurse through [`compare`] without pushing a
+    // Python frame (for example two distinct self-referential lists), so keep
+    // the same guard explicitly in the Rust port and raise RecursionError
+    // before exhausting the native stack.  It sits on the recursive arm: a
+    // machine-int pair never recurses, and the check would otherwise be one
+    // residual call on every traced `int < int`.
+    crate::stack_check::stack_check()?;
+    unsafe {
         if is_float_pair(a, b) {
             // Exact float/float already returned from [`compare_slot`].
             // Mixed int/long keeps `float_compare` for the mantissa / bigint
@@ -6333,23 +6350,6 @@ fn compare_slot_rest(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult 
         // reflected comparison and the generic TypeError fallback below.
         if is_complex_pair(a, b) && matches!(op, CompareOp::Eq | CompareOp::Ne) {
             return complex_richcompare(a, b, op);
-        }
-        if is_str(a) && is_str(b) {
-            // Compare the WTF-8 bytes: for surrogate-free strings this is the
-            // UTF-8 byte order (= code point order), and WTF-8 keeps lone
-            // surrogates in code-point order too, so a surrogate-bearing
-            // string compares correctly without going through
-            // `w_str_get_value`.
-            let sa = w_str_get_wtf8(a).as_bytes();
-            let sb = w_str_get_wtf8(b).as_bytes();
-            return Ok(w_bool_from(match op {
-                CompareOp::Lt => sa < sb,
-                CompareOp::Le => sa <= sb,
-                CompareOp::Gt => sa > sb,
-                CompareOp::Ge => sa >= sb,
-                CompareOp::Eq => sa == sb,
-                CompareOp::Ne => sa != sb,
-            }));
         }
         // bytesobject.py W_BytesObject.descr_eq / _lt / ... and the
         // bytearray counterparts — lexicographic comparison on the raw

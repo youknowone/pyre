@@ -1,4 +1,4 @@
-# pyre-check: spec-folds=builtin_zip,zip_two_tuple_iters,compare_op_long_int,binary_op_long_int_pow,math_frexp,math_ldexp
+# pyre-check: spec-folds=builtin_zip,zip_two_tuple_iters,binary_op_long_int_pow,math_frexp,math_ldexp
 # The throughput gate for eight hand-written trace-time folds that no other
 # fixture makes fire: `zip` over two tuples (positional and `strict=True`), a
 # long/int comparison, a two-bigint true-divide, `bigint ** int`,

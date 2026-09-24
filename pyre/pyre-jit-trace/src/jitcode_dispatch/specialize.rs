@@ -7382,135 +7382,6 @@ pub(crate) fn try_walker_specialize_set_function_attribute<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// Mixed W_LongObject/W_IntObject COMPARE_OP specialization.
-///
-/// `pypy/objspace/std/longobject.py:_make_descr_cmp` selects the corresponding
-/// `rbigint.int_<cmp>` method for a machine-int other operand.  For the
-/// reflected order, select the inverse comparison with the bigint kept as the
-/// first residual argument (`int < long` becomes `long > int`).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn try_walker_specialize_compare_op_long_int<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    op_tag: i64,
-    r_args: &[OpRef],
-    allboxes: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<()>, DispatchError> {
-    if !ctx.is_authoritative_executor || r_args.len() != 2 || dst_bank != 'r' {
-        return Ok(None);
-    }
-    use pyre_interpreter::bytecode::ComparisonOperator;
-    use pyre_interpreter::objspace::descroperation as desc;
-    type CompareFn = extern "C" fn(i64, i64) -> i64;
-    let Some(cmp_op) = pyre_interpreter::runtime_ops::compare_op_from_tag(op_tag) else {
-        return Ok(None);
-    };
-    let (lhs_obj, rhs_obj) = match (
-        walker_concrete_ref_object(ctx, r_args[0]),
-        walker_concrete_ref_object(ctx, r_args[1]),
-    ) {
-        (Some(lhs), Some(rhs)) => (lhs, rhs),
-        _ => return Ok(None),
-    };
-    let lhs_is_long = unsafe { pyre_object::is_long(lhs_obj) };
-    let rhs_is_long = unsafe { pyre_object::is_long(rhs_obj) };
-    let lhs_is_int = unsafe { pyre_object::is_int(lhs_obj) };
-    let rhs_is_int = unsafe { pyre_object::is_int(rhs_obj) };
-    let (long, int, long_obj, int_obj, reflected) = if lhs_is_long && rhs_is_int {
-        (r_args[0], r_args[1], lhs_obj, rhs_obj, false)
-    } else if lhs_is_int && rhs_is_long {
-        (r_args[1], r_args[0], rhs_obj, lhs_obj, true)
-    } else {
-        return Ok(None);
-    };
-    let (Some(long_class), Some(int_class)) = (unsafe {
-        (
-            walker_exact_builtin_class(long_obj),
-            walker_exact_builtin_class(int_obj),
-        )
-    }) else {
-        return Ok(None);
-    };
-    let effective_cmp = if reflected {
-        match cmp_op {
-            ComparisonOperator::Less => ComparisonOperator::Greater,
-            ComparisonOperator::LessOrEqual => ComparisonOperator::GreaterOrEqual,
-            ComparisonOperator::Greater => ComparisonOperator::Less,
-            ComparisonOperator::GreaterOrEqual => ComparisonOperator::LessOrEqual,
-            ComparisonOperator::Equal => ComparisonOperator::Equal,
-            ComparisonOperator::NotEqual => ComparisonOperator::NotEqual,
-        }
-    } else {
-        cmp_op
-    };
-    let helper: CompareFn = match effective_cmp {
-        ComparisonOperator::Less => desc::jit_bigint_int_lt,
-        ComparisonOperator::LessOrEqual => desc::jit_bigint_int_le,
-        ComparisonOperator::Greater => desc::jit_bigint_int_gt,
-        ComparisonOperator::GreaterOrEqual => desc::jit_bigint_int_ge,
-        ComparisonOperator::Equal => desc::jit_bigint_int_eq,
-        ComparisonOperator::NotEqual => desc::jit_bigint_int_ne,
-    };
-    let int_value = unsafe { pyre_object::w_int_get_value(int_obj) };
-
-    let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
-        return Ok(None);
-    };
-    let boxed_result_obj = boxed_result_i64 as usize as pyre_object::PyObjectRef;
-    if boxed_result_obj == pyre_object::PY_NULL
-        || !unsafe { pyre_object::is_bool(boxed_result_obj) }
-    {
-        return Ok(None);
-    }
-    let concrete_truth = unsafe { pyre_object::w_bool_get_value(boxed_result_obj) as i64 };
-
-    let Some(long_pl) = walker_guard_long_and_read_payload(ctx, op_pc, long, long_class)? else {
-        return Ok(None);
-    };
-    let long_payload = match ctx.trace_ctx.concrete_of_opref(long_pl) {
-        Some(majit_ir::Value::Ref(r)) => r.0 as i64,
-        _ => return Ok(None),
-    };
-    let (int_type, int_descr) = crate::state::int_or_bool_unbox_type_descr(int_obj);
-    let int_raw = walker_unbox_int_exact(ctx, op_pc, int, int_type, int_descr, int_class)?;
-    let helper_ptr = helper as *const ();
-    let truth = ctx.trace_ctx.call_typed_with_effect_pure(
-        OpCode::CallI,
-        helper_ptr,
-        &[long_pl, int_raw],
-        &[majit_ir::Type::Ref, majit_ir::Type::Int],
-        majit_ir::Type::Int,
-        majit_metainterp::ELIDABLE_CANNOT_RAISE_EFFECT_INFO,
-        &[
-            majit_ir::Value::Int(helper_ptr as usize as i64),
-            majit_ir::Value::Ref(majit_ir::GcRef(long_payload as usize)),
-            majit_ir::Value::Int(int_value),
-        ],
-        majit_ir::Value::Int(concrete_truth),
-    );
-    ctx.trace_ctx
-        .set_opref_concrete(truth, majit_ir::Value::Int(concrete_truth));
-    // `space.newbool` on the truth: its guard plus the prebuilt singleton.  The
-    // residual box is the no-snapshot fallback only.
-    let boxed = match walker_newbool_guarded(ctx, op_pc, truth, concrete_truth != 0, dst_bank)? {
-        Some(boxed) => boxed,
-        None => {
-            let boxed =
-                crate::helpers::emit_trace_bool_value_from_truth(ctx.trace_ctx, truth, false);
-            ctx.trace_ctx.set_opref_concrete(
-                boxed,
-                majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
-            );
-            boxed
-        }
-    };
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
-    Ok(Some(()))
-}
-
 /// W_LongObject (bigint) COMPARE_OP specialization.  Both operands are `int`-typed but
 /// bigint-stored: guard each against `LONG_TYPE`, read each `value` payload,
 /// then `CallPure_I` the pure
@@ -10610,11 +10481,17 @@ pub(crate) fn try_walker_orthodox_compare_op<Sym: WalkSym>(
         // shadow.  Exact builtin float walks `_float_lt` and siblings
         // (`descr_*` after `_to_float`); mixed int/float does too once
         // the int is exact as a double (`int_between(-1, i2 >> 48, 1)`).
+        // Exact builtin long walks `compare_slot`'s loop-free arms
+        // (`rbigint.lt` / `rbigint.int_lt`). Exact str stays on the
+        // residual: the recorded `jit_str_compare` call passes a box
+        // whose `_utf8` (`value`) is not a pointer (`0xe6` on
+        // `type_name_setter`). The wrapper is not `stroruni.cmp`.
         let admitted = unsafe {
             pyre_object::is_exact_builtin_instance(obj)
                 && (pyre_object::is_int(obj)
                     || pyre_object::is_bool(obj)
-                    || pyre_object::is_float(obj))
+                    || pyre_object::is_float(obj)
+                    || pyre_object::is_long(obj))
         };
         if !admitted {
             return Ok(None);
@@ -10623,7 +10500,16 @@ pub(crate) fn try_walker_orthodox_compare_op<Sym: WalkSym>(
     }
     let lhs_is_float = unsafe { pyre_object::is_float(operands[0].1) };
     let rhs_is_float = unsafe { pyre_object::is_float(operands[1].1) };
-    if lhs_is_float || rhs_is_float {
+    let any_long =
+        unsafe { pyre_object::is_long(operands[0].1) || pyre_object::is_long(operands[1].1) };
+    // A long paired with a float leaves `compare_slot` for
+    // [`compare_slot_rest`]. That graph contains loops
+    // (`policy.py look_inside_graph`), so the descent would not record the
+    // arm. That pair stays on the residual.
+    if any_long && (lhs_is_float || rhs_is_float) {
+        return Ok(None);
+    }
+    if !any_long && (lhs_is_float || rhs_is_float) {
         let Some(descent) = (match op_tag {
             0 => Some(&FLOAT_LT_DESCENT),
             1 => Some(&FLOAT_LE_DESCENT),
