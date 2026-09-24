@@ -4779,11 +4779,11 @@ struct Lowering<'a> {
     /// MIR locals bound by `_i = &place` where `place` is a
     /// `core::sync::atomic` slot, mapped to the place they borrowed.
     ///
-    /// `<Atomic*>::store(&self, v, ord)` is a call, so the write target
-    /// survives only as the receiver operand; the load fold gets away with
-    /// aliasing the receiver Variable because a read needs no place, but a
-    /// write does.  Keyed on the referent being an atomic, so a body's
-    /// ordinary borrows never enter the map.
+    /// `<Atomic*>::store(&self, v, ord)` and `core::mem::{replace,swap,take}`
+    /// are calls, so the write target survives only as an operand.  The load
+    /// fold gets away with aliasing the receiver Variable because a read
+    /// needs no place, but a write does.  Every single-assignment borrow is
+    /// recorded; the atomic store still fires only for an atomic method.
     ///
     /// Only locals outside [`Lowering::multi_assigned_locals`] enter, the
     /// same restriction [`Lowering::const_discriminant_locals`] carries and
@@ -6223,7 +6223,11 @@ impl<'a> Lowering<'a> {
                 // place rather than to the value it resolved to.  Read
                 // before `build_rvalue` consumes the rvalue.
                 if !self.multi_assigned_locals.contains(&(i as usize)) {
-                    if let Some(place) = atomic_ref_referent(&rvalue, self.llbc) {
+                    // Any `&place` / `&raw place`, not only an atomic slot.
+                    // `mem::replace` writes the same place back
+                    // (`getfield_gc` / `setfield_gc`, `getarrayitem_gc` /
+                    // `setarrayitem_gc`).
+                    if let Some(place) = borrowed_place_referent(&rvalue) {
                         self.atomic_ref_place.insert(i as usize, place);
                     }
                     // `_i = Ordering::<V>` — the ordering the store arm has
@@ -10457,6 +10461,20 @@ impl<'a> Lowering<'a> {
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `core::mem::replace(&mut place, new)` is `old = place; place = new`
+                // (`getarrayitem_gc`/`setarrayitem_gc` or `getfield_gc`/`setfield_gc`).
+                // The borrowed place is on `atomic_ref_place` (or `index_elem_alias`
+                // when the reference is an `index_mut`).  No place: leave the call.
+                if self.try_lower_mem_exchange(
+                    mir_bb,
+                    &reg,
+                    &args,
+                    &arg_locals,
+                    dest_local,
+                    target,
+                )? {
                     return Ok(());
                 }
                 // Fold an inline `core::mem::size_of::<T>()` /
@@ -15957,6 +15975,288 @@ impl<'a> Lowering<'a> {
     /// destination to the receiver.  Gating on an atomic receiver
     /// excludes unrelated inherent `load` methods, and the method name
     /// never reaches the rtyper as a `ptr.getattr`.
+    /// `core::mem::replace(&mut place, new)`, `swap`, and `take`.
+    ///
+    /// RPython has no `mem::replace`. The move is `old = place; place = new`:
+    /// `getarrayitem_gc` then `setarrayitem_gc`, or `getfield_gc` then
+    /// `setfield_gc`. No recorded place leaves the residual call.
+    fn try_lower_mem_exchange(
+        &mut self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        args: &[Variable],
+        arg_locals: &[Option<usize>],
+        dest_local: usize,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let Some(name) = regular_call_name_path(reg, self.llbc) else {
+            return Ok(false);
+        };
+        if !(name.starts_with("core::mem::") || name.starts_with("std::mem::")) {
+            return Ok(false);
+        }
+        let leaf = name.rsplit("::").next();
+        match leaf {
+            Some("replace") if args.len() == 2 => {
+                let Some(slot) = self.mem_slot(arg_locals.first().copied().flatten()) else {
+                    return Ok(false);
+                };
+                // `*p = new` where `p` is not an `index_mut` alias is one word
+                // at that address: `raw_load` then `raw_store`
+                // (`rewrite_op_raw_load` / `rewrite_op_raw_store`). A
+                // `__deref_write` call has no bound address.
+                if let Some(place) = self.bare_deref_place(&slot) {
+                    let Some(old) = self.exchange_deref_word(mir_bb, &place, args[1].clone())?
+                    else {
+                        return Ok(false);
+                    };
+                    self.local_var[dest_local] = Some(old);
+                } else {
+                    let old = self.read_mem_slot(mir_bb, &slot)?;
+                    self.write_mem_slot(mir_bb, slot, args[1].clone())?;
+                    self.local_var[dest_local] = Some(old);
+                }
+            }
+            Some("swap") if args.len() == 2 => {
+                let Some(slot0) = self.mem_slot(arg_locals.first().copied().flatten()) else {
+                    return Ok(false);
+                };
+                let Some(slot1) = self.mem_slot(arg_locals.get(1).copied().flatten()) else {
+                    return Ok(false);
+                };
+                let old0 = self.read_mem_slot(mir_bb, &slot0)?;
+                let old1 = self.read_mem_slot(mir_bb, &slot1)?;
+                self.write_mem_slot(mir_bb, slot0, old1)?;
+                self.write_mem_slot(mir_bb, slot1, old0)?;
+                let bb_id = self.block_id[mir_bb];
+                self.local_var[dest_local] = Some(self.emit_unit(bb_id));
+            }
+            Some("take") if args.len() == 1 => {
+                let Some(slot) = self.mem_slot(arg_locals.first().copied().flatten()) else {
+                    return Ok(false);
+                };
+                let Some(zero) = self.zero_for_mem_slot(mir_bb, &slot) else {
+                    return Ok(false);
+                };
+                let old = self.read_mem_slot(mir_bb, &slot)?;
+                self.write_mem_slot(mir_bb, slot, zero)?;
+                self.local_var[dest_local] = Some(old);
+            }
+            _ => return Ok(false),
+        }
+        let bb_id = self.block_id[mir_bb];
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    fn mem_slot(&self, local: Option<usize>) -> Option<MemSlot> {
+        let local = local?;
+        if let Some(place) = self.atomic_ref_place.get(&local) {
+            return Some(MemSlot::Place(place.clone()));
+        }
+        if self.index_elem_alias.contains_key(&local)
+            && self.local_var.get(local).and_then(Option::as_ref).is_some()
+        {
+            return Some(MemSlot::Index(local));
+        }
+        None
+    }
+
+    /// `&mut *borrow` where `borrow` is itself `&mut place` is that place.
+    /// A bare `Deref` otherwise stays, and lowers as `__deref_write`.
+    fn concrete_borrow_place(&self, mut place: Place) -> Place {
+        for _ in 0..8 {
+            let PlaceKind::Projection(inner, elem) = &place.kind else {
+                break;
+            };
+            let ProjectionElem::Atom(name) = elem else {
+                break;
+            };
+            if name != "Deref" {
+                break;
+            }
+            let PlaceKind::Local(local) = inner.kind else {
+                break;
+            };
+            let Some(next) = self.atomic_ref_place.get(&(local as usize)).cloned() else {
+                break;
+            };
+            place = next;
+        }
+        place
+    }
+
+    /// `*p` that is not an `index_mut` element and not a reborrow of a field.
+    fn bare_deref_place(&self, slot: &MemSlot) -> Option<Place> {
+        let MemSlot::Place(place) = slot else {
+            return None;
+        };
+        let place = self.concrete_borrow_place(place.clone());
+        let PlaceKind::Projection(inner, elem) = &place.kind else {
+            return None;
+        };
+        let ProjectionElem::Atom(name) = elem else {
+            return None;
+        };
+        if name != "Deref" {
+            return None;
+        }
+        let PlaceKind::Local(local) = inner.kind else {
+            return None;
+        };
+        if self.index_elem_alias.contains_key(&(local as usize)) {
+            return None;
+        }
+        Some(place)
+    }
+
+    /// One-word pointee: `raw_load` of the old value, then `raw_store` of
+    /// `new`. `None` means the pointee is not one word and the call stays.
+    fn exchange_deref_word(
+        &mut self,
+        mir_bb: usize,
+        place: &Place,
+        new_value: Variable,
+    ) -> Result<Option<Variable>, LowerError> {
+        let PlaceKind::Projection(inner, _) = &place.kind else {
+            return Ok(None);
+        };
+        let Some((item_ty, itemsize, is_item_signed)) = self.raw_word_descr(&place.ty) else {
+            return Ok(None);
+        };
+        let base = self.resolve_place(mir_bb, (**inner).clone())?;
+        let bb_id = self.block_id[mir_bb];
+        let offset = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(offset.clone()),
+            kind: OpKind::ConstInt(0),
+        });
+        let old = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(old.clone()),
+            kind: OpKind::RawLoad {
+                base: base.clone(),
+                offset: offset.clone(),
+                item_ty: item_ty.clone(),
+                itemsize,
+                is_item_signed,
+            },
+        });
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::RawStore {
+                base,
+                offset,
+                value: new_value,
+                item_ty,
+                itemsize,
+                is_item_signed,
+            },
+        });
+        Ok(Some(old))
+    }
+
+    fn raw_word_descr(&self, ty: &TyRef) -> Option<(ValueType, usize, bool)> {
+        if !tyref_is_copy_scalar_or_thin_ptr(ty, self.llbc) {
+            return None;
+        }
+        json_ty_raw_store_descr(tyref_node(ty, self.llbc)?, self.llbc)
+    }
+
+    fn read_mem_slot(&mut self, mir_bb: usize, slot: &MemSlot) -> Result<Variable, LowerError> {
+        match slot {
+            MemSlot::Place(place) => {
+                self.resolve_place(mir_bb, self.concrete_borrow_place(place.clone()))
+            }
+            MemSlot::Index(local) => self
+                .local_var
+                .get(*local)
+                .and_then(Option::as_ref)
+                .cloned()
+                .ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "bb{mir_bb}: indexed mem slot lost its element"
+                    ))
+                }),
+        }
+    }
+
+    fn write_mem_slot(
+        &mut self,
+        mir_bb: usize,
+        slot: MemSlot,
+        value: Variable,
+    ) -> Result<(), LowerError> {
+        match slot {
+            MemSlot::Place(place) => {
+                let place = self.concrete_borrow_place(place);
+                match place.kind {
+                    PlaceKind::Local(i) => {
+                        self.local_var[i as usize] = Some(value);
+                        Ok(())
+                    }
+                    PlaceKind::Projection(inner, elem) => self.emit_projection_write(
+                        mir_bb,
+                        *inner,
+                        elem,
+                        LinkArg::Value(value),
+                        &place.ty,
+                    ),
+                    _ => Err(LowerError::Unsupported(format!(
+                        "bb{mir_bb}: mem place is not a local or a projection"
+                    ))),
+                }
+            }
+            MemSlot::Index(local) => {
+                let place = Place {
+                    kind: PlaceKind::Local(local as u64),
+                    ty: unit_tyref(),
+                };
+                self.emit_projection_write(
+                    mir_bb,
+                    place,
+                    ProjectionElem::Atom("Deref".to_string()),
+                    LinkArg::Value(value),
+                    &unit_tyref(),
+                )
+            }
+        }
+    }
+
+    /// `Default` for `mem::take` when the slot is a scalar zero.
+    /// A non-scalar stays a residual call: its `Default` is not a literal.
+    fn zero_for_mem_slot(&mut self, mir_bb: usize, slot: &MemSlot) -> Option<Variable> {
+        let vt = match slot {
+            MemSlot::Place(place) => {
+                tyref_to_value_type_with(&place.ty, self.llbc, self.tombstoned_leaves)
+            }
+            MemSlot::Index(local) => self.index_elem_alias.get(local)?.item_ty.clone(),
+        };
+        let bb_id = self.block_id[mir_bb];
+        let kind = match vt {
+            ValueType::Int => OpKind::ConstInt(0),
+            ValueType::Unsigned => OpKind::ConstUInt(0),
+            ValueType::Bool => OpKind::ConstBool(false),
+            ValueType::Float => OpKind::ConstFloat(0.0f64.to_bits()),
+            ValueType::Void => return Some(self.emit_unit(bb_id)),
+            _ => return None,
+        };
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind,
+        });
+        Some(res)
+    }
+
     fn is_atomic_load(&self, reg: &RegularCall) -> bool {
         self.is_atomic_method(reg, "load")
     }
@@ -26340,17 +26640,25 @@ fn inline_adt_def_id(body: &serde_json::Value) -> Option<u64> {
 /// Clone a [`TyRef`] (no `Clone` impl on the schema enum).  Used by
 /// [`Lowering::resolve_adt_field`] when handing the resolved field's
 /// type to [`tyref_to_value_type`].
-/// The borrowed place behind `_i = &place` / `&raw place`, cloned out of the
-/// rvalue, when `place` names a `core::sync::atomic` slot.  Nothing else is
-/// recorded: the only consumer is [`Lowering::is_atomic_store`]'s write
-/// target.
-fn atomic_ref_referent(rvalue: &Rvalue, llbc: &Llbc) -> Option<Place> {
+/// The borrowed place behind `_i = &place` / `&raw place`.
+///
+/// Consumers are [`Lowering::is_atomic_store`] and
+/// [`Lowering::try_lower_mem_exchange`].  The referent is not filtered:
+/// `mem::replace` writes whatever place the borrow names.
+/// A place `mem::replace` can read and write. `Index` is an `index_mut`
+/// result: the element value is already the local, and the write is the
+/// `Deref` arm of [`Lowering::emit_projection_write`].
+enum MemSlot {
+    Place(Place),
+    Index(usize),
+}
+
+fn borrowed_place_referent(rvalue: &Rvalue) -> Option<Place> {
     let place = match rvalue {
         Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => place,
         _ => return None,
     };
-    tyref_atomic_inner_value_type(&place.ty, llbc)?;
-    Some(clone_place(place))
+    Some(place.clone())
 }
 
 /// Charon's `Place` carries a `TyRef`, which is not `Clone` (see

@@ -1522,3 +1522,68 @@ fn a_borrowed_primitive_banks_by_its_container() {
         "a struct's `&u8` field is a pointer the program stores and compares",
     );
 }
+
+/// `mem::replace(&mut place, new)` is a read of `place` then a store of `new`.
+/// The read's variable is what the function returns; the store's value is the
+/// new argument.
+#[test]
+fn mem_replace_field_and_slice_element_read_then_store() {
+    use majit_translate::model::OpKind;
+    let llbc = load_corpus();
+
+    let assert_exchange = |name: &str, read_is_field: bool| {
+        let graph = lower_function(llbc, name).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let mut read_result = None;
+        let mut write_value = None;
+        let mut replace_calls = 0usize;
+        for block in &graph.blocks {
+            for op in &block.operations {
+                match &op.kind {
+                    OpKind::FieldRead { .. } if read_is_field => {
+                        read_result = op.result.clone();
+                    }
+                    OpKind::ArrayRead { .. } if !read_is_field => {
+                        read_result = op.result.clone();
+                    }
+                    OpKind::FieldWrite { value, .. } if read_is_field => {
+                        write_value = Some(value.clone());
+                    }
+                    OpKind::ArrayWrite { value, .. } if !read_is_field => {
+                        write_value = Some(value.clone());
+                    }
+                    OpKind::Call { target, .. } => {
+                        if format!("{target:?}").contains("replace") {
+                            replace_calls += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(replace_calls, 0, "{name} still calls mem::replace");
+        let kinds: Vec<String> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .map(|op| format!("{:?}", op.kind).chars().take(80).collect())
+            .collect();
+        let read_result = read_result.unwrap_or_else(|| panic!("{name} no read: {kinds:?}"));
+        let write_value = write_value.unwrap_or_else(|| panic!("{name} no store: {kinds:?}"));
+        assert_ne!(
+            write_value.as_variable(),
+            Some(&read_result),
+            "{name} stores the old value back"
+        );
+        let returned = graph.blocks.iter().flat_map(|b| &b.exits).any(|link| {
+            link.target == graph.returnblock
+                && link
+                    .args
+                    .iter()
+                    .any(|arg| arg.as_variable() == Some(&read_result))
+        });
+        assert!(returned, "{name} does not return the old value");
+    };
+
+    assert_exchange("replace_field", true);
+    assert_exchange("replace_elem", false);
+}

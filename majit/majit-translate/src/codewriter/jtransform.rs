@@ -10926,6 +10926,133 @@ mod tests {
         );
     }
 
+    /// Moving a multi-variant enum out of a slice slot is a load and a store
+    /// of the GC reference the codewriter already carries for that value.
+    /// The address of the word-sized cell is not an interior substructure, so
+    /// the lowered graph has no abort.
+    #[test]
+    fn moving_enum_out_of_slice_slot_has_no_abort() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::model::{FieldDescriptor, LinkArg};
+
+        let owner = "jtransform_enum_slot::Slice";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+        let mut cc = CallControl::new();
+        let word = crate::layout::target_word_size();
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 24,
+                fields: vec![
+                    StructFieldLayout {
+                        name: "cell".to_string(),
+                        offset: 8,
+                        size: word,
+                        flag: majit_ir::descr::ArrayFlag::Pointer,
+                        field_type: majit_ir::value::Type::Ref,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "inline_word".to_string(),
+                        offset: 16,
+                        size: word,
+                        flag: majit_ir::descr::ArrayFlag::Struct,
+                        field_type: majit_ir::value::Type::Ref,
+                        rank: None,
+                    },
+                ],
+            },
+        );
+
+        let cell_field =
+            FieldDescriptor::new("cell", Some(owner.into())).with_taken_by_address(true);
+        assert_eq!(
+            crate::assembler::inline_substruct_field_offset(&cc, &cell_field),
+            None,
+            "a pointer-sized Ref cell is a load, not an interior address"
+        );
+        let inline_word =
+            FieldDescriptor::new("inline_word", Some(owner.into())).with_taken_by_address(true);
+        assert_eq!(
+            crate::assembler::inline_substruct_field_offset(&cc, &inline_word),
+            Some(16),
+            "a word-sized inline struct stays an interior address"
+        );
+
+        let mut graph = FunctionGraph::new("move_enum_from_slice");
+        let slice = graph.alloc_value_var();
+        let index = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, slice.clone());
+        graph.push_inputarg_var(graph.startblock, index.clone());
+        let loaded = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::ArrayRead {
+                    base: slice.clone(),
+                    index: index.clone(),
+                    item_ty: ValueType::Ref(None),
+                    array_type_id: Some("enum_slice".into()),
+                    nolength: true,
+                    pure: false,
+                },
+                true,
+            )
+            .expect("array read");
+        let empty = graph
+            .push_op_var(graph.startblock, OpKind::ConstRefNull, true)
+            .expect("null");
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::ArrayWrite {
+                base: slice,
+                index,
+                value: LinkArg::Value(empty),
+                item_ty: ValueType::Ref(None),
+                array_type_id: Some("enum_slice".into()),
+                nolength: true,
+            },
+            false,
+        );
+        let cell = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: loaded,
+                    field: cell_field,
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .expect("cell");
+        graph.set_return(graph.startblock, Some(cell));
+
+        let result = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let aborting = result.graph.blocks.iter().any(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::Abort { .. }))
+        });
+        assert!(
+            !aborting,
+            "moving the enum ref must not emit an abort: {:?}",
+            result
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|block| block.operations.iter())
+                .map(|op| op.kind.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// A `FunctionPath` override matches its own segmentation and nothing
     /// else, and a non-match is silent.
     ///
