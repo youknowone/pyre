@@ -26,6 +26,19 @@ fn path_has(segments: &[String], needle: &str) -> bool {
     segments.iter().any(|s| s.as_str() == needle)
 }
 
+fn is_std_crate(name: &str) -> bool {
+    // `sync::...` is the std lock path with the `std::` prefix already peeled.
+    matches!(name, "core" | "std" | "alloc" | "sync")
+}
+
+fn is_std_fn_path(segments: &[String]) -> bool {
+    segments.first().is_some_and(|seg| is_std_crate(seg))
+}
+
+fn is_std_type_path(path: Option<&str>) -> bool {
+    path.is_some_and(|p| p.split("::").next().is_some_and(is_std_crate))
+}
+
 fn path_leaf(path: Option<&str>) -> Option<&str> {
     path.map(|p| p.rsplit("::").next().unwrap_or(p))
 }
@@ -44,13 +57,21 @@ fn is_identity_wrapper_target(
             name,
             receiver_root,
             ..
-        } => match (name.as_str(), path_leaf(receiver_root.as_deref())) {
-            ("get", Some("Cell")) => true,
-            ("as_ref", Some("Box")) => true,
-            ("deref" | "deref_mut", Some("Ref") | Some("MutexGuard")) => true,
-            _ => false,
-        },
+        } => {
+            if !is_std_type_path(receiver_root.as_deref()) && !is_std_type_path(receiver_path) {
+                return false;
+            }
+            match (name.as_str(), path_leaf(receiver_root.as_deref())) {
+                ("get", Some("Cell")) => true,
+                ("as_ref", Some("Box")) => true,
+                ("deref" | "deref_mut", Some("Ref") | Some("MutexGuard")) => true,
+                _ => false,
+            }
+        }
         CallTarget::FunctionPath { segments, .. } => {
+            if !is_std_fn_path(segments) {
+                return false;
+            }
             let leaf = function_leaf(segments);
             let recv = path_leaf(receiver_path);
             let dest = path_leaf(dest_path);
@@ -378,6 +399,28 @@ mod tests {
         assert!(
             matches!(new, OpKind::UnaryOp { ref op, .. } if op == "same_as"),
             "AtomicUsize::new is identity on the inner usize"
+        );
+    }
+
+    #[test]
+    fn user_cell_get_stays_a_call() {
+        let v = dummy_var();
+        let get = lower_std_primitive_op(
+            call(path(&["my_crate", "Cell", "get"]), vec![v], ValueType::Int),
+            Some("my_crate::Cell"),
+            None,
+            Some("I64"),
+            None,
+            false,
+            true,
+            Some(&[
+                ("value".into(), ValueType::Int),
+                ("flag".into(), ValueType::Bool),
+            ]),
+        );
+        assert!(
+            matches!(&get, OpKind::Call { .. }),
+            "a user Cell::get must not become a field read, got {get:?}"
         );
     }
 

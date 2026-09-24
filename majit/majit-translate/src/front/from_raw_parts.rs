@@ -114,7 +114,7 @@ fn is_ptr_add_target(target: &CallTarget) -> bool {
     };
     matches!(
         segments.last().map(String::as_str),
-        Some("add" | "wrapping_add" | "sub" | "wrapping_sub")
+        Some("add" | "wrapping_add")
     ) && segments
         .iter()
         .any(|s| s == "const_ptr" || s == "mut_ptr" || s == "ptr")
@@ -197,7 +197,7 @@ fn chars_field_header(graph: &FunctionGraph, ptr: &Variable) -> Option<Variable>
 fn is_chars_offset(n: i64) -> bool {
     // `llmemory.offsetof(STR, 'chars')` — hash, then len, then chars.
     // pyre lays that out as `LOWLEVEL_STRING_CHARS_OFFSET` (two words).
-    n == (2 * std::mem::size_of::<usize>()) as i64
+    n == (2 * crate::layout::target_word_size()) as i64
 }
 
 fn const_int_of(graph: &FunctionGraph, var: &Variable) -> Option<i64> {
@@ -484,7 +484,8 @@ mod tests {
         let mut g = FunctionGraph::new("test_from_raw_parts_utf8");
         let a = g.startblock;
         let header = str_header(&mut g, a);
-        let offset = g.push_op_var(a, OpKind::ConstInt(16), true).unwrap();
+        let chars_off = (2 * crate::layout::target_word_size()) as i64;
+        let offset = g.push_op_var(a, OpKind::ConstInt(chars_off), true).unwrap();
         let chars = g
             .push_op_var(
                 a,
@@ -528,6 +529,105 @@ mod tests {
                 OpKind::UnaryOp { op, operand, .. } if op == "same_as" && operand == &header
             )
         }));
+    }
+
+    #[test]
+    fn pointer_sub_of_chars_offset_stays_residual() {
+        let mut g = FunctionGraph::new("test_from_raw_parts_sub");
+        let a = g.startblock;
+        let header = str_header(&mut g, a);
+        let chars_off = (2 * crate::layout::target_word_size()) as i64;
+        let offset = g.push_op_var(a, OpKind::ConstInt(chars_off), true).unwrap();
+        let chars = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: ["core", "ptr", "const_ptr", "<Impl>", "sub"]
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect(),
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![header.clone(), offset]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let len = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: string_len_target(),
+                    args: crate::model::call_args(vec![header]),
+                    result_ty: ValueType::Unsigned,
+                },
+                true,
+            )
+            .unwrap();
+        let slice = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: from_raw_parts_target(),
+                    args: crate::model::call_args(vec![chars, len]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        g.set_return(a, Some(slice));
+        assert_eq!(rewire_from_raw_parts_sites(&mut g), 0);
+        assert!(residual_from_raw_parts(&g));
+    }
+
+    #[test]
+    fn host_width_offset_is_not_the_other_targets_chars_offset() {
+        let mut g = FunctionGraph::new("test_from_raw_parts_other_width");
+        let a = g.startblock;
+        let header = str_header(&mut g, a);
+        let other = if crate::layout::target_word_size() == 8 {
+            8
+        } else {
+            16
+        };
+        let offset = g.push_op_var(a, OpKind::ConstInt(other), true).unwrap();
+        let chars = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: ptr_add_target(),
+                    args: crate::model::call_args(vec![header.clone(), offset]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let len = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: string_len_target(),
+                    args: crate::model::call_args(vec![header]),
+                    result_ty: ValueType::Unsigned,
+                },
+                true,
+            )
+            .unwrap();
+        let slice = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: from_raw_parts_target(),
+                    args: crate::model::call_args(vec![chars, len]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        g.set_return(a, Some(slice));
+        assert_eq!(rewire_from_raw_parts_sites(&mut g), 0);
     }
 
     #[test]
@@ -683,7 +783,7 @@ mod tests {
         let offset = g
             .push_op_var(
                 a,
-                OpKind::ConstInt(std::mem::size_of::<usize>() as i64),
+                OpKind::ConstInt(crate::layout::target_word_size() as i64),
                 true,
             )
             .unwrap();
@@ -748,7 +848,7 @@ mod tests {
         let offset = g
             .push_op_var(
                 b,
-                OpKind::ConstInt((2 * std::mem::size_of::<usize>()) as i64),
+                OpKind::ConstInt((2 * crate::layout::target_word_size()) as i64),
                 true,
             )
             .unwrap();

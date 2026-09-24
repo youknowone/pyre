@@ -5,9 +5,11 @@
 //! `core::num::<Impl>::saturating_mul` is a foreign leaf whose body is Opaque
 //! in the LLBC, so the caller emits a residual `saturating_mul` call.  Portal-
 //! reachable sites (`W_ListObject` / unicode grow, `str::repeat`, buffer
-//! nbytes, `_ast` offsets) are word-sized unsigned.  Wrapping mul in the u64
-//! bank plus `uint_mul_high(a, b) != 0` is the overflow test; the overflow
-//! arm yields `u64::MAX`.
+//! nbytes, `_ast` offsets) are word-sized unsigned.  Wrapping mul in the
+//! word bank plus a high-half test is the overflow check.  `uint_mul_high`
+//! is the high 64 bits of a 64×64 product, so a 4-byte word also shifts the
+//! low product by 32 and ors that half in.  The overflow arm yields the
+//! max of the op's `Unsigned` lowleveltype (`unsigned_word_max`).
 //!
 //! A narrow `u16`/`u32` saturating mul is **not** that test: `u32::MAX *
 //! u32::MAX` fits in a u64, so the high word stays zero and the rewrite would
@@ -25,8 +27,8 @@
 //! Block A holds the residual `saturating_mul` call producing `r`.  The
 //! rewrite:
 //! 1. drops the call and emits `lo = a * b`, `hi = uint_mul_high(a, b)`,
-//!    `ovf = uint_ne(hi, 0)`;
-//! 2. the true arm (`ovf`) builds `r = u64::MAX`;
+//!    and `ovf` from the word-width high half;
+//! 2. the true arm (`ovf`) builds `r = Unsigned max`;
 //! 3. the false arm builds `r = lo`;
 //! 4. both arms forward to B.
 //!
@@ -41,9 +43,17 @@ pub(crate) fn rewire_saturating_mul_call_sites(
     graph: &mut FunctionGraph,
     result_vars: &[Variable],
 ) -> usize {
+    rewire_saturating_mul_call_sites_for(graph, result_vars, crate::layout::target_word_size())
+}
+
+pub(crate) fn rewire_saturating_mul_call_sites_for(
+    graph: &mut FunctionGraph,
+    result_vars: &[Variable],
+    word_bytes: usize,
+) -> usize {
     let mut rewritten = 0;
     for result_var in result_vars {
-        match rewire_one_saturating_mul_site(graph, result_var) {
+        match rewire_one_saturating_mul_site(graph, result_var, word_bytes) {
             Ok(()) => rewritten += 1,
             Err(_decline) => {}
         }
@@ -62,6 +72,7 @@ fn is_saturating_mul_target(target: &CallTarget) -> bool {
 fn rewire_one_saturating_mul_site(
     graph: &mut FunctionGraph,
     result_var: &Variable,
+    word_bytes: usize,
 ) -> Result<(), String> {
     let name = graph.name.clone();
     let a = graph
@@ -151,12 +162,44 @@ fn rewire_one_saturating_mul_site(
         result: Some(zero.clone()),
         kind: OpKind::ConstUInt(0),
     });
+    // `uint_mul_high` is bits [64, 128) of a 64×64 product. A 4-byte word
+    // overflows when bits [32, 64) are set as well, so fold `(lo >> 32) | hi`.
+    let high = if word_bytes >= 8 {
+        hi
+    } else {
+        let shift_n = graph.alloc_value_var();
+        graph.block_mut(a_id).operations.push(SpaceOperation {
+            result: Some(shift_n.clone()),
+            kind: OpKind::ConstUInt((word_bytes.saturating_mul(8)) as u64),
+        });
+        let hi_word = graph.alloc_value_var();
+        graph.block_mut(a_id).operations.push(SpaceOperation {
+            result: Some(hi_word.clone()),
+            kind: OpKind::BinOp {
+                op: "uint_rshift".to_string(),
+                lhs: lo.clone(),
+                rhs: shift_n,
+                result_ty: ValueType::Unsigned,
+            },
+        });
+        let mixed = graph.alloc_value_var();
+        graph.block_mut(a_id).operations.push(SpaceOperation {
+            result: Some(mixed.clone()),
+            kind: OpKind::BinOp {
+                op: "uint_or".to_string(),
+                lhs: hi_word,
+                rhs: hi,
+                result_ty: ValueType::Unsigned,
+            },
+        });
+        mixed
+    };
     let ovf = graph.alloc_value_var();
     graph.block_mut(a_id).operations.push(SpaceOperation {
         result: Some(ovf.clone()),
         kind: OpKind::BinOp {
             op: "uint_ne".to_string(),
-            lhs: hi,
+            lhs: high,
             rhs: zero,
             result_ty: ValueType::Int,
         },
@@ -172,7 +215,9 @@ fn rewire_one_saturating_mul_site(
     let then_result = graph.alloc_value_var();
     graph.block_mut(then_bb).operations.push(SpaceOperation {
         result: Some(then_result.clone()),
-        kind: OpKind::ConstUInt(u64::MAX),
+        kind: OpKind::ConstUInt(crate::front::checked_arith_uint::unsigned_word_max(
+            word_bytes,
+        )),
     });
     let then_link_args = reproduce_exit_args(
         &saved_exit,
@@ -275,13 +320,44 @@ mod tests {
             2,
             "A branches to MAX / product arms"
         );
+        let word_max =
+            crate::front::checked_arith_uint::unsigned_word_max(crate::layout::target_word_size());
         let maxes = g
             .blocks
             .iter()
             .flat_map(|blk| &blk.operations)
-            .filter(|op| matches!(&op.kind, OpKind::ConstUInt(u64::MAX)))
+            .filter(|op| matches!(&op.kind, OpKind::ConstUInt(n) if *n == word_max))
             .count();
-        assert!(maxes >= 1, "the overflow arm builds u64::MAX");
+        assert!(maxes >= 1, "the overflow arm builds the unsigned word max");
+    }
+
+    #[test]
+    fn four_byte_word_clamps_at_u32_max_and_shifts_the_low_half() {
+        let mut g = FunctionGraph::new("test_saturating_mul_u32");
+        let a = g.startblock;
+        let av = g.push_op_var(a, OpKind::ConstInt(7), true).unwrap();
+        let bv = g.push_op_var(a, OpKind::ConstInt(3), true).unwrap();
+        let r = emit_call(&mut g, a, vec![av, bv]);
+        let (b, _) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![r.clone()]);
+
+        let rewritten = rewire_saturating_mul_call_sites_for(&mut g, std::slice::from_ref(&r), 4);
+        assert_eq!(rewritten, 1);
+        assert!(
+            g.blocks
+                .iter()
+                .flat_map(|blk| &blk.operations)
+                .any(|op| { matches!(&op.kind, OpKind::ConstUInt(n) if *n == u32::MAX as u64) }),
+            "4-byte overflow arm is u32::MAX"
+        );
+        assert!(
+            g.blocks[a.0]
+                .operations
+                .iter()
+                .any(|op| { matches!(&op.kind, OpKind::BinOp { op, .. } if op == "uint_rshift") }),
+            "4-byte overflow looks at bits [32, 64) of the product"
+        );
     }
 
     #[test]

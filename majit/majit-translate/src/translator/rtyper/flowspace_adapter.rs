@@ -4118,9 +4118,14 @@ fn rewrite_wtf8_view_strlen(
     let Some(obj) = wtf8_str_cast_source(&cast.kind) else {
         return Ok(None);
     };
-    let class_name = op_defining(legacy, obj)
-        .and_then(|producer| input_class_name(&producer.kind))
-        .unwrap_or("");
+    let Some(class_name) =
+        op_defining(legacy, obj).and_then(|producer| input_class_name(&producer.kind))
+    else {
+        return Err(TyperError::message(
+            "__strlen on a Wtf8 view: receiver class unresolved \
+             (wtf8-strlen-unknown-receiver)",
+        ));
+    };
     let field_name = unique_string_field(call_registry, class_name).map_err(|why| {
         TyperError::message(format!(
             "__strlen on a Wtf8 view of {class_name} has no unique string field ({why})"
@@ -5521,18 +5526,12 @@ mod tests {
         let bk = Rc::new(Bookkeeper::new());
         bk.set_struct_fields(Rc::new(crate::front::StructFieldRegistry::default()));
 
-        let before = crate::codewriter::annotation_state::classdef_less_input_fallthrough_count();
         let cells = derive_subject_inputcells(&graph, Some(&bk))
             .expect("unregistered Ref input keeps the classdef-less shell");
         assert!(
             matches!(&cells[0], SomeValue::Instance(inst) if inst.classdef.is_none()),
             "unregistered root must keep the classdef-less shell, got {:?}",
             cells[0],
-        );
-        assert_eq!(
-            crate::codewriter::annotation_state::classdef_less_input_fallthrough_count(),
-            before,
-            "verbose-off input fallthrough must record nothing",
         );
     }
 
@@ -6022,6 +6021,20 @@ mod tests {
         assert!(
             msg.contains("string field") || msg.contains("__strlen"),
             "decline must name the unproven strlen, got {msg}"
+        );
+        assert!(
+            !msg.contains("wtf8-strlen-unknown-receiver"),
+            "a known class with no string field is not an unresolved receiver"
+        );
+    }
+
+    #[test]
+    fn unresolved_wtf8_strlen_receiver_is_classified_for_the_legacy_walker() {
+        let msg = "__strlen on a Wtf8 view: receiver class unresolved \
+                   (wtf8-strlen-unknown-receiver)";
+        assert_eq!(
+            crate::translator::rtyper::cutover::unported_category(msg),
+            Some("wtf8-strlen-unknown-receiver")
         );
     }
 

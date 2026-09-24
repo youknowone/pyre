@@ -1155,6 +1155,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // erroring out at program-build time.
         let accum = AccumulatorFacts::build(llbc, &body);
         let builder_mode = accum.has_builder;
+        let mut atomic_reasons = Vec::new();
         let graph = match lower_unstructured_with_static_addrs_and_attrs(
             llbc,
             fd,
@@ -1166,12 +1167,13 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             &tombstoned_leaves,
             builder_mode,
             &accum,
+            &mut atomic_reasons,
         ) {
             Ok(g) => g,
             Err(e) => {
                 let msg = e.to_string();
-                if msg.contains("atomic load ordering") {
-                    atomic_load_decls.push(declined_atomic_load_fun_decl(llbc, fd, msg.clone()));
+                if let Some(reason) = atomic_reasons.first() {
+                    atomic_load_decls.push(declined_atomic_load_fun_decl(llbc, fd, reason.clone()));
                 }
                 skipped.push((name.clone(), msg));
                 continue;
@@ -2771,6 +2773,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
     })?;
     let accum = AccumulatorFacts::build(llbc, &u);
     let builder_mode = accum.has_builder;
+    let mut atomic_load_reasons = Vec::new();
     lower_unstructured_with_static_addrs_and_attrs(
         llbc,
         fd,
@@ -2782,6 +2785,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         &tombstoned_leaves,
         builder_mode,
         &accum,
+        &mut atomic_load_reasons,
     )
 }
 
@@ -2844,6 +2848,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     // qualifying functions have one canonical marker-emitting graph.
     builder_mode: bool,
     accum: &AccumulatorFacts,
+    atomic_load_reasons: &mut Vec<String>,
 ) -> Result<FunctionGraph, LowerError> {
     let name = fd.item_meta.name_path();
     // The Result-of-PyError exception-link lowering's callee rule
@@ -3525,6 +3530,9 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                     eprintln!("[FRAMESTATE fallback] {:?}: {e:?}", name);
                 }
                 if std::env::var_os("MAJIT_MIR_FRAMESTATE_STRICT").is_some() {
+                    if atomic_load_reasons.is_empty() {
+                        atomic_load_reasons.extend(lo.ordered_atomic_load_reasons.iter().cloned());
+                    }
                     return Err(e);
                 }
             }
@@ -3579,7 +3587,12 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             finish(&mut lo)?;
             Ok(lo.graph)
         }
-        Err(e) => Err(e),
+        Err(e) => {
+            if atomic_load_reasons.is_empty() {
+                atomic_load_reasons.extend(lo.ordered_atomic_load_reasons.iter().cloned());
+            }
+            Err(e)
+        }
     }
 }
 
@@ -4662,6 +4675,9 @@ struct Lowering<'a> {
     /// variant a dropped barrier, so this map carries the single-assignment
     /// restriction for the same reason [`Lowering::atomic_ref_place`] does.
     atomic_ordering_locals: std::collections::HashMap<usize, String>,
+    /// Non-`Relaxed` `Atomic*::load` sites seen in the body, independent of
+    /// which lowering error is reported first.
+    ordered_atomic_load_reasons: Vec<String>,
     /// MIR locals whose enum discriminant is a translation-time
     /// constant: single-assignment locals bound by an always-`Ok`
     /// decomposed conversion ([`Lowering::try_lower_usize_try_from`]).
@@ -5148,6 +5164,7 @@ impl<'a> Lowering<'a> {
             index_elem_alias: std::collections::HashMap::new(),
             atomic_ref_place: std::collections::HashMap::new(),
             atomic_ordering_locals: std::collections::HashMap::new(),
+            ordered_atomic_load_reasons: Vec::new(),
             const_discriminant_locals: std::collections::HashMap::new(),
             multi_assigned_locals: compute_multi_assigned_locals(body),
             string_byte_view_locals: Vec::new(),
@@ -5233,6 +5250,7 @@ impl<'a> Lowering<'a> {
     }
 
     fn lower(&mut self, order: BlockOrder) -> Result<(), LowerError> {
+        self.note_nonrelaxed_atomic_loads();
         // Each MIR basic block is a FlowGraph block.  Locals live across
         // a successor edge are explicit `Link.args` into the target
         // block's `inputargs`, mirroring FlowContext.mergeblock rather
@@ -5577,6 +5595,7 @@ impl<'a> Lowering<'a> {
     /// shape — so a back-edge into bb0 (which would demand reseeding the
     /// parameter slots as phis) declines to the monotonic fallback.
     fn lower_framestate(&mut self, loop_headers: &[bool]) -> Result<(), LowerError> {
+        self.note_nonrelaxed_atomic_loads();
         let n = self.body.body.len();
         if n == 0 {
             return Ok(());
@@ -15583,6 +15602,57 @@ impl<'a> Lowering<'a> {
         self.is_atomic_method(reg, "load")
     }
 
+    /// Record every non-`Relaxed` atomic load in the body before lowering
+    /// stops at the first unsupported statement.
+    fn note_nonrelaxed_atomic_loads(&mut self) {
+        self.ordered_atomic_load_reasons.clear();
+        let mut ordering = std::collections::HashMap::<usize, String>::new();
+        for bb in &self.body.body {
+            for stmt in &bb.statements {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
+                    continue;
+                };
+                let PlaceKind::Local(local) = place.kind else {
+                    continue;
+                };
+                if let Some(name) = self.atomic_ordering_variant(&rvalue) {
+                    ordering.insert(local as usize, name);
+                }
+            }
+            let Ok(term) = bb.term() else {
+                continue;
+            };
+            let TermKind::Call { call, .. } = term else {
+                continue;
+            };
+            let CallFunc::Regular(reg) = &call.func else {
+                continue;
+            };
+            if call.args.len() != 2 || !self.is_atomic_load(reg) {
+                continue;
+            }
+            let ordering_name = call
+                .args
+                .get(1)
+                .and_then(|operand| match operand {
+                    Operand::Copy(place) | Operand::Move(place) => match place.kind {
+                        PlaceKind::Local(local) => Some(local as usize),
+                        _ => None,
+                    },
+                    Operand::Const(_) => None,
+                })
+                .and_then(|local| ordering.get(&local))
+                .map(String::as_str);
+            if ordering_name == Some("Relaxed") {
+                continue;
+            }
+            self.ordered_atomic_load_reasons.push(format!(
+                "unsupported MIR: atomic load ordering {} requires address-preserving ordered lowering",
+                ordering_name.unwrap_or("unknown")
+            ));
+        }
+    }
+
     /// `<core::sync::atomic::Atomic*>::store(&self, value, ordering)` — the
     /// write twin of [`Lowering::is_atomic_load`].  A relaxed store to a
     /// layout-transparent atomic is the same machine store a plain field
@@ -19771,6 +19841,49 @@ impl<'a> Lowering<'a> {
             return Ok(false);
         }
         let bb_id = self.block_id[mir_bb];
+        let result_ty = if unsigned_word {
+            ValueType::Unsigned
+        } else {
+            ValueType::Int
+        };
+        let shift_rhs = if matches!(leaf.as_str(), "wrapping_shl" | "wrapping_shr") {
+            let bits: i64 = if matches!(self.tyref_literal_int_atom(src), Some("I64"))
+                || matches!(self.tyref_literal_uint_atom(src), Some("U64"))
+            {
+                64
+            } else {
+                (crate::layout::target_word_size() * 8) as i64
+            };
+            if bits <= 1 {
+                return Ok(false);
+            }
+            let mask = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(mask.clone()),
+                kind: if unsigned_word {
+                    OpKind::ConstUInt((bits - 1) as u64)
+                } else {
+                    OpKind::ConstInt(bits - 1)
+                },
+            });
+            let masked = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(masked.clone()),
+                kind: OpKind::BinOp {
+                    op: "and".to_string(),
+                    lhs: rhs.clone(),
+                    rhs: mask,
+                    result_ty: result_ty.clone(),
+                },
+            });
+            masked
+        } else {
+            rhs.clone()
+        };
         let res = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -19779,12 +19892,8 @@ impl<'a> Lowering<'a> {
             kind: OpKind::BinOp {
                 op: op.to_string(),
                 lhs: lhs.clone(),
-                rhs: rhs.clone(),
-                result_ty: if unsigned_word {
-                    ValueType::Unsigned
-                } else {
-                    ValueType::Int
-                },
+                rhs: shift_rhs,
+                result_ty,
             },
         });
         self.local_var[dest_local] = Some(res);
@@ -26095,8 +26204,20 @@ fn push_direct_ptradd(
 }
 
 fn is_raw_array_ptr(ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType) -> bool {
+    raw_array_ptr_item(ty).is_some()
+}
+
+fn raw_array_ptr_item(
+    ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+) -> Option<&crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
     use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
-    matches!(ty, LowLevelType::Ptr(ptr) if matches!(ptr.TO, PtrTarget::Array(_)))
+    let LowLevelType::Ptr(ptr) = ty else {
+        return None;
+    };
+    let PtrTarget::Array(arr) = &ptr.TO else {
+        return None;
+    };
+    Some(&arr.OF)
 }
 
 /// `CArrayPtr(item)`, or `CCHARP` when the item is a byte (`lltype.Char`).
@@ -26109,6 +26230,7 @@ pub(crate) fn lltype_for_direct_ptradd_pointer(
     use crate::translator::rtyper::lltypesystem::rffi::{CArrayPtr, CCHARP};
     if let Some(existing) = existing.as_ref()
         && is_raw_array_ptr(existing)
+        && raw_array_ptr_item(existing).is_some_and(|of| of == item)
     {
         return existing.clone();
     }
@@ -27554,6 +27676,47 @@ pub(crate) fn discover_foldable_const_lits(llbc: &Llbc) -> Vec<(String, OpKind)>
         discovered.push((path, op));
     }
     discovered
+}
+
+/// Impl associated consts share one `name_path` (`<Impl>`). Register each
+/// by its defining global's `def_id` instead of that path.
+pub(crate) fn register_ambiguous_impl_foldable_const_lits(llbc: &Llbc) {
+    let mut paths: Vec<String> = llbc
+        .iter_global_decls()
+        .map(|g| g.item_meta.name_path())
+        .collect();
+    paths.sort();
+    let mut ambiguous: Vec<String> = Vec::new();
+    for pair in paths.windows(2) {
+        if pair[0] == pair[1] && ambiguous.last() != Some(&pair[0]) {
+            ambiguous.push(pair[0].clone());
+        }
+    }
+    for g in llbc.iter_global_decls() {
+        let path = g.item_meta.name_path();
+        if !path.contains('<') || ambiguous.binary_search(&path).is_err() {
+            continue;
+        }
+        if global_is_thread_local(g) || global_source_text_is_static_mut(g) {
+            continue;
+        }
+        let Some(init_id) = g.rest.get("init").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        let Some(fd) = llbc.fn_by_id(init_id) else {
+            continue;
+        };
+        let Some(u) = fd.unstructured() else {
+            continue;
+        };
+        let Some(op) = const_eval_init_body(llbc, &u) else {
+            continue;
+        };
+        let Some(encoded) = encode_foldable_op(&op) else {
+            continue;
+        };
+        llbc.register_foldable_const_lit(g.def_id, encoded);
+    }
 }
 
 /// Merge foldable literals that share an injective path.
@@ -41785,6 +41948,28 @@ mod tests {
     }
 
     #[test]
+    fn direct_ptradd_pointer_reuses_array_only_when_element_matches() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget,
+        };
+        let byte = LowLevelType::Char;
+        let wide = LowLevelType::Signed;
+        let existing = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::new(byte.clone())),
+        }));
+        let same = super::lltype_for_direct_ptradd_pointer(Some(existing.clone()), &byte);
+        assert_eq!(same, existing);
+        let rebuilt = super::lltype_for_direct_ptradd_pointer(Some(existing), &wide);
+        match &rebuilt {
+            LowLevelType::Ptr(ptr) => match &ptr.TO {
+                PtrTarget::Array(arr) => assert_eq!(arr.OF, wide),
+                other => panic!("expected an array pointer, got {other:?}"),
+            },
+            other => panic!("expected a pointer, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn ptr_add_of_i64_emits_unscaled_count() {
         let ptr_ty = serde_json::json!({
             "RawPtr": [{"Literal": {"Int": "I64"}}, "Mut"]
@@ -43265,6 +43450,13 @@ mod tests {
             ]),
         );
         assert!(super::discover_foldable_const_lits(&shared).is_empty());
+        super::register_ambiguous_impl_foldable_const_lits(&shared);
+        let first = shared.foldable_const_lit(1);
+        let second = shared.foldable_const_lit(2);
+        assert!(
+            first.is_some() && second.is_some() && first != second,
+            "each impl const keeps its own literal, got {first:?} {second:?}"
+        );
     }
 
     #[test]

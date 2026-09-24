@@ -25,7 +25,8 @@ fn record_ref_payload(payload: Option<&str>) {
     let _ = payload;
 }
 
-/// Count a classdef-less `SomeInstance` minted outside the `Ref` arm.
+/// Classdef-less `SomeInstance` minted outside the `Ref` arm. The census
+/// counter is gone; callers still name the site so a later count can return.
 pub(crate) fn record_classdef_less_mint(site: &str, key: &str) {
     let _ = (site, key);
 }
@@ -55,11 +56,6 @@ pub(crate) fn record_classdef_less_input(
 
 /// Former classdef-less `Ref` census. The thread-local counter is gone.
 pub(crate) fn dump_classdef_less_ref_census() {}
-
-#[cfg(test)]
-pub(crate) fn classdef_less_input_fallthrough_count() -> usize {
-    0
-}
 
 /// RPython `SomeValue` lattice projection of the legacy `ValueType`.
 ///

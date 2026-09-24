@@ -361,9 +361,9 @@ mod tests {
         for atom in ["U8", "U16", "U32", "U128"] {
             assert!(!is_word_sized_uint_atom(atom));
         }
-        assert!(is_word_sized_uint_atom("U64"));
+        assert!(is_word_sized_uint_atom("Usize"));
         assert_eq!(
-            is_word_sized_uint_atom("Usize"),
+            is_word_sized_uint_atom("U64"),
             crate::layout::target_word_size() == 8
         );
     }
@@ -583,10 +583,16 @@ mod tests {
 
     #[test]
     fn both_const_and_const_rhs_reach_word_sized_unsigned() {
-        assert_eq!(unsigned_word_atom(Some("U64"), [None, None]), Some("U64"));
-        assert_eq!(unsigned_word_atom(None, [Some("U64"), None]), Some("U64"));
         assert_eq!(
-            unsigned_word_atom(Some("Usize"), [None, None]).is_some(),
+            unsigned_word_atom(Some("Usize"), [None, None]),
+            Some("Usize")
+        );
+        assert_eq!(
+            unsigned_word_atom(None, [Some("Usize"), None]),
+            Some("Usize")
+        );
+        assert_eq!(
+            unsigned_word_atom(Some("U64"), [None, None]).is_some(),
             crate::layout::target_word_size() == 8
         );
     }

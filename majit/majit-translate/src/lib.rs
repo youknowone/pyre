@@ -291,6 +291,7 @@ fn build_semantic_program_via_active_frontend(
                 llbc.register_transparent_scalar_kinds(discovered.iter().cloned());
                 front::mir::attach_foldable_const_lits(&llbc, &foldable_cross);
                 front::mir::attach_foldable_const_lits(&llbc, &foldable_impl_by_ord[ord]);
+                front::mir::register_ambiguous_impl_foldable_const_lits(&llbc);
                 unsafe_fn_stubs.extend(front::mir::collect_unsafe_fn_stubs_from_llbc(
                     &llbc,
                     static_addrs.error_carrier,

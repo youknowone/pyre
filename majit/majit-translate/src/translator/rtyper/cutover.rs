@@ -1625,6 +1625,9 @@ fn annotator_unfollowed_legacy_vars(
 /// only tests whether the result is `Some`; the tags are stable identifiers
 /// for the decline census (`crate::decline`).
 pub(crate) fn unported_category(msg: &str) -> Option<&'static str> {
+    if msg.contains("wtf8-strlen-unknown-receiver") {
+        return Some("wtf8-strlen-unknown-receiver");
+    }
     if msg.contains("not registered in CallRegistry") {
         return Some("call-registry-miss");
     }

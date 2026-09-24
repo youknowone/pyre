@@ -273,6 +273,10 @@ pub fn register_external(
 }
 
 /// `rffi.py` `llexternal` effect kwargs on the same registration path.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors rffi.py llexternal keyword arguments on one registration"
+)]
 pub fn register_llexternal(
     function: HostObject,
     args: Vec<ExternalAnnotation>,

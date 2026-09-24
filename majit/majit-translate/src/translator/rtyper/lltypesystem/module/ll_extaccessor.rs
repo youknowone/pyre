@@ -22,10 +22,11 @@
 //!
 //! The harvested [`DeclinedFunDecl`] has path, scalar lltypes, and the
 //! decline reason; it has no body.  The harvest lives in `front::mir`
-//! and does not attach one.  The gate therefore requires:
+//! and does not attach one.  The decline string is not a gate: the MIR
+//! loop already records an ordered load on `ordered_atomic_load_reasons`.
+//! The gate therefore requires:
 //!
 //! - no translatable body
-//! - the ordered-load decline (not some other omitted body)
 //! - zero arguments (a process-global cell; a pointer argument is a
 //!   visitor / method, not this reader)
 //! - an unsigned scalar result (`u32` is in `residual_scalar!`; `Void`
@@ -35,8 +36,8 @@
 //!   process-global cell
 //!
 //! A pointer argument (`walk_*` GC visitors, `w_type_get_version_tag`'s
-//! receiver) or a compound result is not an external.  A body that
-//! failed for any other reason is also refused.
+//! receiver) or a compound result is not an external.  A path outside
+//! [`WORD_LOAD_LLEXTERNALS`] is refused whatever the decline string says.
 //!
 //! The result is never a translation-time constant: the GC type id is
 //! published at runtime, so the stub annotation is a non-const scalar
@@ -115,12 +116,6 @@ impl AtomicLoadLlexternal {
     }
 }
 
-/// True when `reason` is the MIR loop's ordered-load refusal, not some
-/// other omitted body.
-pub fn is_atomic_load_ordering_decline(reason: &str) -> bool {
-    reason.contains(ATOMIC_LOAD_ORDERING_DECLINE)
-}
-
 /// Scalar ABI the residual call can return in one word.
 ///
 /// Matches the primitive tokens `residual_return_shell` can model
@@ -141,12 +136,12 @@ pub fn is_external_scalar_lltype(lltype: &LowLevelType) -> bool {
     )
 }
 
-/// Whether `decl` is a word-only reader the residual ABI can call:
-/// no translatable body, zero arguments, unsigned result.
+/// Whether `decl` is a word-only reader the residual ABI can call.
 ///
-/// The decline string and the path are not gates. Effect facts for the
-/// four pure word loads are `WORD_LOAD_LLEXTERNALS`
-/// (`random_effects_on_gcobjs=False`, `releasegil=False`).
+/// Shape is necessary but not sufficient: only the four
+/// [`WORD_LOAD_LLEXTERNALS`] rows have addresses in `jit_trace_fnaddrs`
+/// and effect facts (`random_effects_on_gcobjs=False`, `releasegil=False`).
+/// Any other bodyless zero-arg unsigned decl keeps a symbolic fnaddr.
 pub fn is_external_shaped_atomic_accessor(decl: &DeclinedFunDecl) -> bool {
     if decl.has_translatable_body {
         return false;
@@ -154,7 +149,15 @@ pub fn is_external_shaped_atomic_accessor(decl: &DeclinedFunDecl) -> bool {
     if !decl.arg_lltypes.is_empty() {
         return false;
     }
-    decl.result_lltype == LowLevelType::Unsigned
+    if decl.result_lltype != LowLevelType::Unsigned {
+        return false;
+    }
+    WORD_LOAD_LLEXTERNALS.iter().any(|row| {
+        row.segments
+            .iter()
+            .copied()
+            .eq(decl.segments.iter().map(String::as_str))
+    })
 }
 
 /// Keep only the external-shaped rows of `decls`.
@@ -224,7 +227,6 @@ mod tests {
     #[test]
     fn is_external_shaped_atomic_accessor_accepts_zero_arg_unsigned_acquire_reader() {
         let decl = zero_arg_unsigned(acquire_reason(), false);
-        assert!(is_atomic_load_ordering_decline(&decl.decline_reason));
         assert!(is_external_shaped_atomic_accessor(&decl));
         let rows = collect_atomic_load_llexternals(std::slice::from_ref(&decl));
         assert_eq!(rows.len(), 1);
@@ -299,15 +301,15 @@ mod tests {
     }
 
     #[test]
-    fn external_shaped_atomic_accessor_ignores_name_allowlist_and_decline_reason() {
+    fn external_shaped_atomic_accessor_rejects_unlisted_path_and_other_decline() {
         let decl = zero_arg_unsigned_at(
             &["pyre_object", "gc_interp", "some_flag"],
             "declaration-has-no-unstructured-body".to_string(),
             false,
         );
         assert!(
-            is_external_shaped_atomic_accessor(&decl),
-            "shape is zero-arg unsigned with no body; the decline string and path are not the gate"
+            !is_external_shaped_atomic_accessor(&decl),
+            "a path outside WORD_LOAD_LLEXTERNALS has no published fnaddr"
         );
     }
 
@@ -327,11 +329,8 @@ mod tests {
             acquire_reason(),
             false,
         );
-        assert!(is_external_shaped_atomic_accessor(&decl));
-        assert_eq!(
-            collect_atomic_load_llexternals(std::slice::from_ref(&decl)).len(),
-            1
-        );
+        assert!(!is_external_shaped_atomic_accessor(&decl));
+        assert!(collect_atomic_load_llexternals(std::slice::from_ref(&decl)).is_empty());
     }
 
     #[test]
@@ -376,11 +375,23 @@ mod tests {
     }
 
     #[test]
-    fn is_external_shaped_atomic_accessor_rejects_other_decline_reasons() {
+    fn listed_word_reader_ignores_decline_reason() {
         let setter = zero_arg_unsigned("declaration-has-no-unstructured-body".to_string(), false);
-        assert!(is_external_shaped_atomic_accessor(&setter));
+        assert!(
+            is_external_shaped_atomic_accessor(&setter),
+            "WORD_LOAD path is admitted; the decline string is not a gate"
+        );
         let other = zero_arg_unsigned("unsupported MIR: uninitialised local 3".to_string(), false);
         assert!(is_external_shaped_atomic_accessor(&other));
+        let unlisted = zero_arg_unsigned_at(
+            &["pyre_object", "gc_interp", "some_flag"],
+            acquire_reason(),
+            false,
+        );
+        assert!(
+            !is_external_shaped_atomic_accessor(&unlisted),
+            "an Acquire decline does not admit a path outside WORD_LOAD_LLEXTERNALS"
+        );
     }
 
     #[test]
@@ -392,11 +403,11 @@ mod tests {
     #[test]
     fn collect_atomic_load_llexternals_keeps_only_external_shape() {
         let keep = zero_arg_unsigned(acquire_reason(), false);
-        let drop_reason = zero_arg_unsigned("schema decode: x".to_string(), false);
+        let other_reason = zero_arg_unsigned("schema decode: x".to_string(), false);
         let drop_body = zero_arg_unsigned(acquire_reason(), true);
-        let rows = collect_atomic_load_llexternals([&keep, &drop_reason, &drop_body]);
+        let rows = collect_atomic_load_llexternals([&keep, &other_reason, &drop_body]);
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].segments, keep.segments);
+        assert!(rows.iter().all(|row| row.segments == keep.segments));
     }
 
     #[test]
