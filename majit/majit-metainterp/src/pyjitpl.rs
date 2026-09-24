@@ -6321,6 +6321,9 @@ impl<M: Clone> MetaInterp<M> {
         self.pending_abort_reason = None;
         self.pending_abort_permanent = false;
         self.pending_abort_blackhole = None;
+        self.interpret_framestack_for_abort = false;
+        self.last_interpret_abort_reason = None;
+        self.interpret_bail_residual = None;
         self.keep_tracing_after_close = false;
         self.retrace_after_bridge = false;
         self.potential_retrace_position = None;

@@ -3362,7 +3362,15 @@ where
                 }
             };
             if !matches!(action, TraceAction::Continue) {
-                if crate::majit_log_enabled() || crate::tldbg_enabled() {
+                if (crate::majit_log_enabled() || crate::tldbg_enabled()) && self.frames.is_empty()
+                {
+                    // Every `Finish` return drains the framestack first.
+                    eprintln!(
+                        "[interpret] run_to_end action={:?} steps={step_count} ops={} framestack drained",
+                        action,
+                        ctx.num_recorded_ops(),
+                    );
+                } else if crate::majit_log_enabled() || crate::tldbg_enabled() {
                     let fr = self.frames.current_mut();
                     let last_op = fr
                         .jitcode
