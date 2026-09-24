@@ -2468,6 +2468,30 @@ fn walker_frame_executing_py_pc<Sym: WalkSym>(
     Some((frame_box, ctx.vstack_cur_pypc))
 }
 
+/// Pin a frame-attribute receiver to the frame type's getset.
+///
+/// Its class, its `w_class` and the frame type's `version_tag` are guarded, so
+/// rebinding the getset on the type revokes the loop instead of the fold
+/// outliving the descriptor that produced it.  This is the half of
+/// [`walker_prove_owned_frame_pc`] that does not ask whether the receiver is
+/// the frame the walk is executing: `f_back` records a field on the object,
+/// and `pyframe.py get_f_back` derefs `f_backref` without forcing, so a
+/// receiver that merely *is* a frame still owes these guards.
+fn walker_guard_frame_attr_receiver<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    concrete_obj: pyre_object::PyObjectRef,
+) -> Result<bool, DispatchError> {
+    let w_type = pyre_interpreter::typedef::gettypeobject(&pyre_interpreter::pyframe::FRAME_TYPE);
+    let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) };
+    if version_tag == 0 || unsafe { (*concrete_obj).w_class } != w_type {
+        return Ok(false);
+    }
+    walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
+    Ok(true)
+}
+
 /// Prove the receiver IS the frame the walk is executing, and answer that
 /// frame's executing pc.
 ///
@@ -2475,13 +2499,13 @@ fn walker_frame_executing_py_pc<Sym: WalkSym>(
 /// walk holds rather than the one the frame's own field records and therefore
 /// owe the same proof about the object in hand.
 ///
-/// The receiver is pinned two ways.  Its class, its `w_class` and the frame
-/// type's `version_tag` are guarded, so rebinding the getset on the type
-/// revokes the loop instead of the fold outliving the descriptor that produced
-/// it.  And when the receiver arrives in a box other than the frame's own —
-/// a local the loop hoisted the frame into — a `ptr_eq` against that box is
-/// guarded, so a later entry holding a different frame side-exits to the
-/// residual rather than reading this trace's coordinate.
+/// The receiver is pinned two ways.  [`walker_guard_frame_attr_receiver`]
+/// guards the type.  And when the receiver arrives in a box other than the
+/// frame's own — a local the loop hoisted the frame into — a `ptr_eq` against
+/// that box is guarded, so a later entry holding a different frame side-exits
+/// to the residual rather than reading this trace's coordinate.  That second
+/// pin is only meaningful once [`walker_frame_executing_py_pc`] has named the
+/// frame this walk is executing.
 fn walker_prove_owned_frame_pc<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -2491,12 +2515,9 @@ fn walker_prove_owned_frame_pc<Sym: WalkSym>(
     let Some((frame_box, py_pc)) = walker_frame_executing_py_pc(ctx, concrete_obj, op_pc) else {
         return Ok(None);
     };
-    let w_type = pyre_interpreter::typedef::gettypeobject(&pyre_interpreter::pyframe::FRAME_TYPE);
-    let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) };
-    if version_tag == 0 || unsafe { (*concrete_obj).w_class } != w_type {
+    if !walker_guard_frame_attr_receiver(ctx, op_pc, obj, concrete_obj)? {
         return Ok(None);
     }
-    walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
     if obj != frame_box {
         let is_own_frame = ctx.trace_ctx.record_op(OpCode::PtrEq, &[obj, frame_box]);
         ctx.trace_ctx
@@ -2668,10 +2689,14 @@ fn try_walker_specialize_frame_lineno<Sym: WalkSym>(
 
 /// `pyframe.py fget_f_back` → `get_f_back` → `getnextframe_nohidden`.
 ///
-/// The first hop is `f_backref` (unforced). When that names the standard
-/// virtualizable, `_do_jit_force_virtual` short-circuits on identity and
-/// `opimpl_getfield_vable` never runs. Emit that hop plus the identity
-/// guard; a farther or hidden hop still falls through.
+/// The first hop is `f_backref` (unforced). `PyFrame._virtualizable_` does
+/// not name that field, so `rvirtualizable.py hook_access_field` injects no
+/// force and the read does not have to be the frame the walk is executing.
+/// When the hop names the standard virtualizable, `_do_jit_force_virtual`
+/// short-circuits on identity and `opimpl_getfield_vable` never runs. Emit
+/// that hop plus the identity guard; a farther or hidden hop still falls
+/// through.  The type guards stay: rebinding the getset must still revoke
+/// the loop.
 fn try_walker_specialize_frame_f_back<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -2680,7 +2705,7 @@ fn try_walker_specialize_frame_f_back<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
-    if walker_prove_owned_frame_pc(ctx, op_pc, obj, concrete_obj)?.is_none() {
+    if !walker_guard_frame_attr_receiver(ctx, op_pc, obj, concrete_obj)? {
         return Ok(None);
     }
     let frame = concrete_obj as *mut pyre_interpreter::PyFrame;
@@ -3314,6 +3339,40 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     // the locals region out of the virtualizable image, so the fold has to
     // write that region itself.
     let inline_frame = current_inline_concrete_frame();
+    // `pyjitpl.py MIFrame._nonstandard_virtualizable`: a box that is not
+    // `virtualizable_boxes[-1]` but points at it is still the standard
+    // virtualizable.  The check records `PTR_EQ` + `implement_guard_value`
+    // and, when the pointers match, `replace_box`s the alias onto the
+    // standard box.  `f_locals` then takes the existing standard-frame arm.
+    // A failed identity falls through to `emit_force_virtualizable` and this
+    // fold declines, the same as a receiver that was never the portal frame.
+    let mut obj = obj;
+    if name == "f_locals"
+        && ctx.trace_ctx.standard_virtualizable_ptr() == Some(concrete_obj as usize)
+        && ctx
+            .trace_ctx
+            .standard_virtualizable_box()
+            .is_some_and(|standard| standard != obj)
+        && let Some(info) = ctx.trace_ctx.virtualizable_info().cloned()
+    {
+        // `locals_cells_stack_w` is the virtualizable array `f_locals` reads,
+        // so its descr carries the active vinfo (`vinfo is fielddescr.get_vinfo()`).
+        let fielddescr = info.array_pointer_field_descr(0);
+        let guards_before = ctx.trace_ctx.num_guards();
+        let nonstandard = vable_ops::with_replace_frames(ctx, |ctx| {
+            ctx.trace_ctx
+                .nonstandard_virtualizable(op_pc, obj, &fielddescr)
+        });
+        resume_snapshot::walker_capture_inline_nonstandard_vable_guard(
+            ctx,
+            op_pc,
+            guards_before,
+            None,
+        )?;
+        if !nonstandard && let Some(standard) = ctx.trace_ctx.standard_virtualizable_box() {
+            obj = standard;
+        }
+    }
     let is_inline_frame = inline_frame != 0
         && concrete_obj as usize == inline_frame
         && ctx
@@ -4165,7 +4224,8 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
     let Some((w_type, _version_tag, w_descr)) =
         (unsafe { pyre_interpreter::load_method_fast_path(concrete_obj, &name) })
     else {
-        return Ok(None);
+        let cell = unsafe { pyre_interpreter::load_method_cell_fast_path(concrete_obj, &name) };
+        return walker_fold_load_method_cell(ctx, op_pc, obj, concrete_obj, cell, dst, dst_bank);
     };
     if unsafe { resolve_inlinable_callee(w_descr) }.is_none() {
         return Ok(None);
@@ -4217,6 +4277,64 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
 
     let method_const = ctx.trace_ctx.const_ref(w_descr as i64);
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, method_const)?;
+    Ok(Some(()))
+}
+
+/// `load_method_cell_fast_path`: the namespace entry is an `ObjectMutableCell`.
+/// Pin the cell pointer under `_version_tag` and `getfield` `w_value`, so an
+/// in-place method store stays visible without a new trace.
+fn walker_fold_load_method_cell<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    concrete_obj: pyre_object::PyObjectRef,
+    cell_hit: Option<(pyre_object::PyObjectRef, u64, pyre_object::PyObjectRef)>,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    let Some((w_type, _version_tag, cell)) = cell_hit else {
+        return Ok(None);
+    };
+    if !object_mutable_cell_payload_is_guardable(cell) {
+        return Ok(None);
+    }
+    if !std::ptr::eq(unsafe { (*concrete_obj).w_class }, w_type) {
+        return Ok(None);
+    }
+    let Some(shadow) = (unsafe { walker_classify_shadow_guard(concrete_obj) }) else {
+        return Ok(None);
+    };
+    let physical_type = unsafe { (*concrete_obj).ob_type } as i64;
+    if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
+        let type_const = ctx.trace_ctx.const_int(physical_type);
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[obj, type_const])?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(obj, physical_type);
+    }
+    let w_class_op = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
+    let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
+    walker_emit_fold_guard_with_snapshot(
+        ctx,
+        op_pc,
+        OpCode::GuardValue,
+        &[w_class_op, w_type_const],
+    )?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(w_class_op, w_type_const);
+    walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
+    walker_emit_shadow_guard(ctx, op_pc, obj, concrete_obj, shadow)?;
+    // Do not stamp the payload.  The following CALL must invoke whatever
+    // `w_value` holds, not the function that was there at record time.
+    let value = walker_read_object_mutable_cell_stamped(ctx, cell, false);
+    // `load_method_cell_fast_path` admitted this name because the payload's
+    // type carries `flag_method_descriptor`, which is what decides the
+    // `(method, self)` pair the paired self-fold writes.  An in-place rebind
+    // can replace the method with a `property`; the guard is what makes that
+    // side-exit instead of binding a receiver to it.
+    walker_guard_object_mutable_cell_payload(ctx, op_pc, value, cell)?;
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
     Ok(Some(()))
 }
 
@@ -4403,6 +4521,140 @@ pub(crate) fn try_walker_specialize_load_type_name_attr<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+fn walker_read_object_mutable_cell<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    cell: pyre_object::PyObjectRef,
+) -> OpRef {
+    walker_read_object_mutable_cell_stamped(ctx, cell, true)
+}
+
+/// `stamp` is false when a later op must not treat the payload as a green
+/// constant.  A method call inlines whatever concrete it sees and guards that
+/// identity; an in-place cell write would then fail the guard on every
+/// iteration instead of calling the function the `getfield` just read.
+fn walker_read_object_mutable_cell_stamped<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    cell: pyre_object::PyObjectRef,
+    stamp: bool,
+) -> OpRef {
+    let cell_op = ctx.trace_ctx.const_ref(cell as i64);
+    let value = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        cell_op,
+        crate::descr::object_mutable_cell_value_descr(),
+    );
+    if stamp {
+        let live = unsafe { (*(cell as *const pyre_object::celldict::ObjectMutableCell)).w_value };
+        ctx.trace_ctx
+            .set_opref_concrete(value, majit_ir::Value::Ref(majit_ir::GcRef(live as usize)));
+    }
+    value
+}
+
+/// Guard the class of a payload [`walker_read_object_mutable_cell`] just read.
+///
+/// The `getfield` keeps an in-place rebind visible, which is the whole point of
+/// reading the cell; what it does not keep is the admission the oracle computed
+/// against `type(w_value)` while recording -- `flag_method_descriptor` for a
+/// method load, "no `__get__`, not a heaptype" for a plain type attribute.  An
+/// in-place write is the one namespace change `_version_tag` does not report,
+/// so a rebind from a function to a `property` would otherwise reach code that
+/// already decided the descriptor protocol does not run.  This is the class
+/// check the dispatch the fold replaced records anyway: `space.get` resolves
+/// `__get__` on `type(w_descr)`, and the same-class rebind the live read exists
+/// for passes it.
+///
+/// Asked before the fold emits anything: a tagged int has no `ob_type`, so its
+/// payload cannot carry the class guard and the fold declines instead.
+fn object_mutable_cell_payload_is_guardable(cell: pyre_object::PyObjectRef) -> bool {
+    let live = unsafe { (*(cell as *const pyre_object::celldict::ObjectMutableCell)).w_value };
+    !live.is_null()
+        && !(pyre_object::tagged_int::CAN_BE_TAGGED
+            && unsafe { pyre_object::tagged_int::is_tagged_int(live) })
+}
+
+fn walker_guard_object_mutable_cell_payload<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    value: OpRef,
+    cell: pyre_object::PyObjectRef,
+) -> Result<(), DispatchError> {
+    let live = unsafe { (*(cell as *const pyre_object::celldict::ObjectMutableCell)).w_value };
+    let physical_type = unsafe { (*live).ob_type } as i64;
+    let type_const = ctx.trace_ctx.const_int(physical_type);
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[value, type_const])?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(value, physical_type);
+    Ok(())
+}
+
+fn walker_read_int_mutable_cell<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    cell: pyre_object::PyObjectRef,
+) -> Result<OpRef, DispatchError> {
+    let cell_op = ctx.trace_ctx.const_ref(cell as i64);
+    let raw = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        cell_op,
+        crate::descr::int_mutable_cell_value_descr(),
+    );
+    let live = unsafe { (*(cell as *const pyre_object::celldict::IntMutableCell)).intvalue };
+    ctx.trace_ctx
+        .set_opref_concrete(raw, majit_ir::Value::Int(live));
+    let boxed = walker_box_int(ctx, op_pc, raw, live)?;
+    let live_ptr = pyre_object::w_int_new(live) as i64;
+    ctx.trace_ctx
+        .set_opref_concrete(boxed, box_int_concrete(live, live_ptr));
+    Ok(boxed)
+}
+
+/// `LOAD_ATTR` of a type attribute stored in a `MutableCell`.  The cell
+/// pointer is constant under the type's `_version_tag`; the payload is a
+/// `getfield`, so an in-place write stays visible.
+fn walker_fold_type_attr_cell<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    concrete_obj: pyre_object::PyObjectRef,
+    name: &str,
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    let Some((w_type, _version_tag, cell)) =
+        (unsafe { pyre_interpreter::type_attr_cell_fast_path(concrete_obj, Wtf8::new(name)) })
+    else {
+        return Ok(None);
+    };
+    if !unsafe { pyre_object::celldict::is_int_mutable_cell(cell) }
+        && !object_mutable_cell_payload_is_guardable(cell)
+    {
+        return Ok(None);
+    }
+    let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[obj, w_type_const])?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(obj, w_type_const);
+    walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
+    let value = if unsafe { pyre_object::celldict::is_int_mutable_cell(cell) } {
+        // An `IntMutableCell` only ever holds an int: `write_cell`'s in-place
+        // arm stores `intval`, so the payload cannot change shape and the
+        // boxing below is the whole of the binding.
+        walker_read_int_mutable_cell(ctx, op_pc, cell)?
+    } else {
+        let value = walker_read_object_mutable_cell(ctx, cell);
+        // `type_attr_cell_fast_path` admitted this name because the payload's
+        // type has no `__get__` -- the arm where `get` returns the value
+        // unchanged.  An in-place rebind can put a descriptor there, so the
+        // class guard is what sends that to the full `descr_getattribute`.
+        walker_guard_object_mutable_cell_payload(ctx, op_pc, value, cell)?;
+        value
+    };
+    write_residual_call_result_to_dst(ctx, op_pc, dst, 'r', value)?;
+    Ok(Some(()))
+}
+
 /// Fold `LOAD_ATTR` on a type receiver when
 /// [`pyre_interpreter::type_attr_value_fast_path`] resolves
 /// `typeobject.py` `getattribute`'s `space.get(w_value, w_None, self)` to a
@@ -4442,7 +4694,7 @@ pub(crate) fn try_walker_specialize_load_type_attr<Sym: WalkSym>(
     let Some((w_type, _version_tag, w_value, binding)) = (unsafe {
         pyre_interpreter::type_attr_value_fast_path(concrete_obj, Wtf8::new(name.as_str()))
     }) else {
-        return Ok(None);
+        return walker_fold_type_attr_cell(ctx, op_pc, obj, concrete_obj, name.as_str(), dst);
     };
 
     let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
@@ -4801,6 +5053,15 @@ pub(crate) fn try_walker_fold_load_method_self<Sym: WalkSym>(
     if let Some((_, _, w_descr)) =
         unsafe { pyre_interpreter::baseobjspace::load_method_fast_path(concrete_obj, &name) }
     {
+        if std::ptr::eq(w_descr, concrete_attr) {
+            write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, obj)?;
+            return Ok(Some(()));
+        }
+    }
+    if let Some((_, _, cell)) =
+        unsafe { pyre_interpreter::load_method_cell_fast_path(concrete_obj, &name) }
+    {
+        let w_descr = unsafe { pyre_object::celldict::unwrap_cell(cell) };
         if std::ptr::eq(w_descr, concrete_attr) {
             write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, obj)?;
             return Ok(Some(()));
@@ -21586,6 +21847,14 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
         let version_tag =
             unsafe { pyre_object::typeobject::w_type_get_version_tag(concrete_callable) };
         if version_tag == 0 {
+            return Ok(None);
+        }
+        // Both answers are baked under `version_tag`, and an in-place
+        // `write_cell` store moves no tag: a `__new__` rebound inside its cell
+        // would run user Python where this proof admitted only `descr_new`.
+        if unsafe { type_attr_is_cell_backed(concrete_callable, "__new__") }
+            || unsafe { type_attr_is_cell_backed(concrete_callable, "__init__") }
+        {
             return Ok(None);
         }
         let Some(class_new) = (unsafe {

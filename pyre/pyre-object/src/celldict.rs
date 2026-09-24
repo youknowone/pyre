@@ -12,13 +12,14 @@
 //!
 //! The `ModuleDictStrategy` struct itself
 //! plus the supporting `VersionTag` / `ModuleDictStorage` types.
-//! Bodies are stubbed against an in-memory `Vec<(String,
-//! PyObjectRef)>` because the cell-indirection layer
-//! (`pypy/objspace/std/typeobject.py MutableCell / write_cell
-//! / unwrap_cell`) is a separate port.  Until that lands the
-//! strategy stores raw values directly, which is observationally
-//! correct (cells are a JIT speed optimisation, not a semantic
-//! requirement).
+//! `MutableCell`, `ObjectMutableCell`, `IntMutableCell`,
+//! `write_cell` and `unwrap_cell` (defined on `W_TypeObject`'s
+//! module, `typeobject.py`) live in this file.  Module-dict stores
+//! and `W_TypeObject.setdictvalue` both go through `write_cell`.
+//! An in-place update returns no new object, so the caller does not
+//! run `mutated()` and the type's `_version_tag` stays put.  That
+//! stable tag is what keeps a traced class-attribute store's
+//! quasi-immutable watcher valid across the loop.
 //!
 //! `W_ModuleDictObject` (`dictmultiobject.rs`) carries this strategy
 //! as its `mstrategy` slot per `dictmultiobject.py:328-341`.  The

@@ -36,6 +36,13 @@
 # That is recorded rather than asserted: the jitstats baselines gate
 # `loops_aborted`, so a move in either direction becomes a review question
 # instead of silent drift.
+#
+# The zero is the oracle's answer too, not a gap left open.  `PYPYLOG=jit-summary:-`
+# on this shape reports `Total # of loops: 0` and a nonzero `abort: vable escape`,
+# so the roster read aborts the recording walk upstream for the same reason: it
+# escapes the virtualizable and `jit_force_virtualizable` has no fold to offer.
+# A future change that compiles this loop is therefore a divergence to justify,
+# not a win -- unless it also names what upstream hint makes the escape foldable.
 import sys
 
 try:
