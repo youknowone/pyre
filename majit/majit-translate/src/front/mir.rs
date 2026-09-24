@@ -32008,14 +32008,14 @@ fn is_core_result_map_err_path(path: &str) -> bool {
     )
 }
 
-fn is_core_clone_impls_clone_path(path: &str) -> bool {
+pub(crate) fn is_core_clone_impls_clone_path(path: &str) -> bool {
     matches!(
         path.split("::").collect::<Vec<_>>().as_slice(),
         ["core", "clone", "impls", "<Impl>", "clone"]
     )
 }
 
-fn is_core_default_path(path: &str) -> bool {
+pub(crate) fn is_core_default_path(path: &str) -> bool {
     matches!(
         path.split("::").collect::<Vec<_>>().as_slice(),
         ["core", "default", "<Impl>", "default"] | ["core", "ptr", "mut_ptr", "<Impl>", "default"]
