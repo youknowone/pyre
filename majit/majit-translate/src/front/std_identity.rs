@@ -100,13 +100,10 @@ fn is_identity_wrapper_target(
     }
 }
 
-fn segments_are(segments: &[String], want: &[&str]) -> bool {
-    segments.len() == want.len() && segments.iter().zip(want).all(|(seg, w)| seg == w)
-}
-
 /// The concrete `Copy` impls, spelled in full — the same items
-/// `mir.rs`'s `is_core_clone_path` / `is_core_default_path` recognise on
-/// the `RegularCall` route.
+/// [`crate::front::mir::is_core_clone_impls_clone_path`] /
+/// [`crate::front::mir::is_core_default_path`] recognise on the
+/// `RegularCall` route. Both routes call those predicates.
 ///
 /// A leaf-name match would also take `core::clone::<Impl>::clone` and
 /// `core::default::Default::default`, which are the blanket impl and the
@@ -118,7 +115,7 @@ fn segments_are(segments: &[String], want: &[&str]) -> bool {
 pub(crate) fn is_clone_target(target: &CallTarget) -> bool {
     match target {
         CallTarget::FunctionPath { segments, .. } => {
-            segments_are(segments, &["core", "clone", "impls", "<Impl>", "clone"])
+            crate::front::mir::is_core_clone_impls_clone_path(&segments.join("::"))
         }
         _ => false,
     }
@@ -127,8 +124,7 @@ pub(crate) fn is_clone_target(target: &CallTarget) -> bool {
 pub(crate) fn is_default_target(target: &CallTarget) -> bool {
     match target {
         CallTarget::FunctionPath { segments, .. } => {
-            segments_are(segments, &["core", "default", "<Impl>", "default"])
-                || segments_are(segments, &["core", "ptr", "mut_ptr", "<Impl>", "default"])
+            crate::front::mir::is_core_default_path(&segments.join("::"))
         }
         _ => false,
     }
@@ -559,6 +555,28 @@ mod tests {
         assert!(
             matches!(trait_item, OpKind::Call { .. }),
             "Default::default names no impl to read a zero from"
+        );
+    }
+
+    #[test]
+    fn clone_and_default_targets_use_the_regular_call_predicates() {
+        let clone_impl = path(&["core", "clone", "impls", "<Impl>", "clone"]);
+        let blanket = path(&["core", "clone", "<Impl>", "clone"]);
+        let default_impl = path(&["core", "default", "<Impl>", "default"]);
+        let ptr_default = path(&["core", "ptr", "mut_ptr", "<Impl>", "default"]);
+        let trait_item = path(&["core", "default", "Default", "default"]);
+        assert!(is_clone_target(&clone_impl));
+        assert!(!is_clone_target(&blanket));
+        assert!(is_default_target(&default_impl));
+        assert!(is_default_target(&ptr_default));
+        assert!(!is_default_target(&trait_item));
+        assert_eq!(
+            is_clone_target(&clone_impl),
+            crate::front::mir::is_core_clone_impls_clone_path("core::clone::impls::<Impl>::clone")
+        );
+        assert_eq!(
+            is_default_target(&ptr_default),
+            crate::front::mir::is_core_default_path("core::ptr::mut_ptr::<Impl>::default")
         );
     }
 }

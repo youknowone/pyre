@@ -333,10 +333,42 @@ fn count_result_ctors(graph: &majit_translate::model::FunctionGraph) -> usize {
                 OpKind::Call {
                     target: CallTarget::SyntheticTransparentCtor { owner_path, .. },
                     ..
-                } if owner_path.last().map(String::as_str) == Some("Result")
+                } if owner_path.last().is_some_and(|leaf| {
+                    leaf.split_once('<').map_or(leaf.as_str(), |(base, _)| base) == "Result"
+                })
             )
         })
         .count()
+}
+
+#[test]
+fn count_result_ctors_counts_suffixed_shells() {
+    use majit_translate::model::{FunctionGraph, ValueType};
+    let mut graph = FunctionGraph::new("suffixed_result_shell");
+    let entry = graph.startblock;
+    graph
+        .push_op_var(
+            entry,
+            OpKind::Call {
+                target: CallTarget::synthetic_transparent_ctor_with_owner(
+                    vec![
+                        "core".into(),
+                        "result".into(),
+                        "Result<Tuple,PyError>".into(),
+                    ],
+                    "Ok",
+                ),
+                args: Vec::new(),
+                result_ty: ValueType::Ref(None),
+            },
+            true,
+        )
+        .expect("ctor");
+    assert_eq!(
+        count_result_ctors(&graph),
+        1,
+        "Result<Tuple,PyError> is still a Result shell"
+    );
 }
 
 #[test]

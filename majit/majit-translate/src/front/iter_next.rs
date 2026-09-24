@@ -64,8 +64,8 @@ use crate::front::result_exc::{
     follow_single_exit, op_operand_vars, split_diamond_exits,
 };
 use crate::model::{
-    BlockId, CallTarget, ExitCase, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind,
-    SpaceOperation, ValueType,
+    CallTarget, ExitCase, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind, SpaceOperation,
+    ValueType,
 };
 
 /// The `[__iter_next]` FunctionPath marker the rewrite emits in place of
@@ -1055,6 +1055,82 @@ fn rewire_one_next_site(
              the adapter packs (i, item) onto __pos_0"
         ));
     }
+    // `pack_enumerate_payload` collapses this read after the graph has
+    // already been rewritten. Accept only a `__pos_0` read of the payload
+    // slot, or a slot nothing reads (`for _ in ...enumerate()`). Any other
+    // use declines here, before the first edit.
+    if enum_pair.is_some() {
+        let pos = payload_positions[0];
+        let carrier = graph.blocks[some_target.0]
+            .inputargs
+            .get(pos)
+            .cloned()
+            .ok_or_else(|| format!("{name}: enumerate Some arm lacks payload slot {pos}"))?;
+        let block = &graph.blocks[some_target.0];
+        let pos0_at: Vec<usize> = block
+            .operations
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldRead { base, field, .. }
+                        if base == &carrier && field.name == "__pos_0"
+                )
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if pos0_at.is_empty() {
+            let uses = block
+                .operations
+                .iter()
+                .filter(|op| op_operand_vars(&op.kind).contains(&carrier))
+                .count();
+            let forwarded = block.exits.iter().any(|link| {
+                link.args
+                    .iter()
+                    .any(|arg| matches!(arg, LinkArg::Value(v) if v == &carrier))
+            });
+            if uses != 0 || forwarded {
+                return Err(format!(
+                    "{name}: enumerate Some arm uses the payload outside a __pos_0 read"
+                ));
+            }
+        } else if pos0_at.len() != 1 || block.operations[pos0_at[0]].result.is_none() {
+            let why = if block.operations[pos0_at[0]].result.is_none() {
+                "__pos_0 read without result"
+            } else {
+                "enumerate Some arm reads __pos_0 more than once"
+            };
+            return Err(format!("{name}: {why}"));
+        } else {
+            // The one `__pos_0` read is the only reference to the carrier.
+            // A second operand, an exit arg, or an exitswitch use would
+            // keep the original payload after the read collapses onto the
+            // packed tuple.
+            let read_at = pos0_at[0];
+            let other_operand = block
+                .operations
+                .iter()
+                .enumerate()
+                .any(|(i, op)| i != read_at && op_operand_vars(&op.kind).contains(&carrier));
+            let forwarded = block.exits.iter().any(|link| {
+                link.args
+                    .iter()
+                    .any(|arg| matches!(arg, LinkArg::Value(v) if v == &carrier))
+            });
+            let switched = match &block.exitswitch {
+                Some(ExitSwitch::Value(v)) if v == &carrier => true,
+                Some(ExitSwitch::Fused { args, .. }) if args.contains(&carrier) => true,
+                _ => false,
+            };
+            if other_operand || forwarded || switched {
+                return Err(format!(
+                    "{name}: enumerate Some arm uses the payload outside a __pos_0 read"
+                ));
+            }
+        }
+    }
 
     // None arm (StopIteration exit): the loop-break continuation.  RPython's
     // `ll_listnext` raises `StopIteration` with NO value on the exhaustion
@@ -1175,6 +1251,7 @@ fn rewire_one_next_site(
             some_target.0,
             &item_in_some,
             &pair_in_some,
+            &item_ty,
             &name,
         )?;
     } else {

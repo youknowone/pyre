@@ -175,6 +175,7 @@ pub fn build_semantic_program_from_llbcs_with_static_addrs(
         None,
         None,
         true,
+        no_tombstoned_leaves(),
     )
 }
 
@@ -207,6 +208,7 @@ pub(crate) fn build_semantic_program_from_llbcs_with_static_addrs_module_paths_a
         module_filter.as_ref(),
         None,
         true,
+        no_tombstoned_leaves(),
     )
 }
 
@@ -219,6 +221,7 @@ pub(crate) fn build_semantic_program_from_prelinked_llbc(
     static_addrs: crate::HostStaticAddrs<'_>,
     module_paths: &[&str],
     jitdriver_receiver_roots: &[String],
+    cross_tombstoned_leaves: &std::collections::HashSet<String>,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
     let module_filter = normalize_module_filter(module_paths);
     build_semantic_program_from_llbcs_with_static_addrs_filtered(
@@ -228,6 +231,7 @@ pub(crate) fn build_semantic_program_from_prelinked_llbc(
         module_filter.as_ref(),
         None,
         false,
+        cross_tombstoned_leaves,
     )
 }
 
@@ -262,6 +266,7 @@ pub fn build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         module_filter.as_ref(),
         function_filter.as_ref(),
         true,
+        no_tombstoned_leaves(),
     )
 }
 
@@ -352,10 +357,21 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
     module_filter: Option<&std::collections::HashSet<String>>,
     function_filter: Option<&std::collections::HashSet<String>>,
     link_scalars: bool,
+    cross_tombstoned_leaves: &std::collections::HashSet<String>,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
     if link_scalars {
         link_transparent_scalar_types(llbcs);
     }
+    // One duplicate-leaf verdict for the whole input, computed before any
+    // body is painted. A leaf unique inside each artefact (the two
+    // `FrameBlock`s) is still withdrawn once the artefacts are merged, and
+    // the per-file lowering has to paint that qualified root up front.
+    let mut duplicate_leaf_facts = DuplicateLeafFacts::default();
+    for llbc in llbcs {
+        duplicate_leaf_facts.absorb(DuplicateLeafFacts::discover(llbc));
+    }
+    let mut paint_tombstones = duplicate_leaf_facts.tombstoned_leaves();
+    paint_tombstones.extend(cross_tombstoned_leaves.iter().cloned());
     // Defining-crate NamedConst values have to be harvested while that
     // crate's artefact is loaded: a foreign `const` is `Opaque` in the
     // caller's LLBC.  The production frontend reloads one crate at a
@@ -397,6 +413,7 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
             jitdriver_receiver_roots,
             module_filter,
             function_filter,
+            &paint_tombstones,
         )?;
         absorb_semantic_program(
             &mut merged,
@@ -841,6 +858,7 @@ pub fn build_semantic_program_from_llbc_with_static_addrs(
         &jitdriver_receiver_roots,
         None,
         None,
+        no_tombstoned_leaves(),
     )
 }
 
@@ -947,6 +965,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     jitdriver_receiver_roots: &[String],
     module_filter: Option<&std::collections::HashSet<String>>,
     function_filter: Option<&std::collections::HashSet<String>>,
+    cross_tombstoned_leaves: &std::collections::HashSet<String>,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
     // ── Pass 1: walk type_decls + trait_decls ─────────────────────
     let (
@@ -959,7 +978,10 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         exact_layouts,
         mut struct_ids,
     ) = derive_program_metadata(llbc);
-    harden_duplicate_leaf_metadata(
+    // Only leaves this pass withdrew. A crate-root decl
+    // (`charon_corpus::ClassObject`) also stores an empty origin module,
+    // and that empty string is not a withdrawal.
+    let mut tombstoned_leaves = harden_duplicate_leaf_metadata(
         &mut struct_fields,
         &mut struct_origins,
         &mut enum_variant_by_discriminant,
@@ -1014,18 +1036,16 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         &mut struct_fields,
     );
 
-    // Pass 2 paints each ADT as its bare leaf. A leaf `harden` emptied
+    // Pass 2 paints each ADT as its bare leaf. A leaf `harden` withdrew
     // (`eval::Code` beside `module::struct::Code`) is not a class: the
     // paint has to name the declaration actually being lowered, or the
     // value seeds `SomeInstance(classdef=None)` and a later
     // `__discriminant` read raises `MissingRTypeAttribute`. The set is
-    // lowering input, the same kind of program metadata as
-    // `struct_origins`, not a per-thread cache.
-    let tombstoned_leaves: std::collections::HashSet<String> = struct_origins
-        .iter()
-        .filter(|(_, module)| module.is_empty())
-        .map(|(leaf, _)| leaf.clone())
-        .collect();
+    // the leaves the pass withdrew, not every empty origin: a crate-root
+    // decl stores an empty module without being a duplicate. Leaves that
+    // collide only across input LLBCs are absent from this file; the
+    // caller computed that verdict before lowering.
+    tombstoned_leaves.extend(cross_tombstoned_leaves.iter().cloned());
 
     // ── Pass 2: lower every function body and build SemanticFunctions ─
     // `@jit.dont_look_inside` (`rlib/jit.py`) callees declare a
@@ -2221,6 +2241,106 @@ fn derive_program_metadata(
     )
 }
 
+/// Per-LLBC fragment of the duplicate-leaf verdict. The streaming frontend
+/// discovers one of these per artefact (the same pre-link shape as
+/// [`discover_foldable_const_lits`]), merges them, and only then lowers.
+#[derive(Default)]
+pub(crate) struct DuplicateLeafFacts {
+    struct_fields: crate::front::semantic::StructFieldRegistry,
+    enum_variant_by_discriminant:
+        std::collections::HashMap<String, std::collections::HashMap<i64, String>>,
+    struct_origins: std::collections::HashMap<String, String>,
+    struct_ids: std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
+    /// Crate-stripped path → defining crate, for a declaration whose full
+    /// path starts with this artefact's crate name. `a::Foo` and `b::Foo`
+    /// both land on `Foo`, and `StructId::from_canonical` mints one id
+    /// from that spelling, so the identity table sees one declaration.
+    defined_at: std::collections::HashMap<String, String>,
+    /// Leaves withdrawn because one stripped path was defined in two crates.
+    cross_crate_leaves: std::collections::HashSet<String>,
+}
+
+impl DuplicateLeafFacts {
+    pub(crate) fn discover(llbc: &Llbc) -> Self {
+        let (_, _, struct_fields, enum_variant_by_discriminant, struct_origins, _, _, struct_ids) =
+            derive_program_metadata(llbc);
+        let crate_name = llbc.crate_name().to_string();
+        let prefix = format!("{crate_name}::");
+        let mut defined_at = std::collections::HashMap::new();
+        for key in struct_ids.keys() {
+            if let Some(rest) = key.strip_prefix(&prefix) {
+                defined_at.insert(rest.to_string(), crate_name.clone());
+            }
+        }
+        Self {
+            struct_fields,
+            enum_variant_by_discriminant,
+            struct_origins,
+            struct_ids,
+            defined_at,
+            cross_crate_leaves: std::collections::HashSet::new(),
+        }
+    }
+
+    pub(crate) fn absorb(&mut self, other: Self) {
+        for (key, fields) in other.struct_fields.fields {
+            self.struct_fields.fields.entry(key).or_insert(fields);
+        }
+        for (enum_key, by_discr) in other.enum_variant_by_discriminant {
+            self.enum_variant_by_discriminant
+                .entry(enum_key)
+                .or_insert(by_discr);
+        }
+        for (leaf, module) in other.struct_origins {
+            self.struct_origins.entry(leaf).or_insert(module);
+        }
+        for (key, id) in other.struct_ids {
+            self.struct_ids
+                .entry(key)
+                .and_modify(|slot| {
+                    if *slot != id {
+                        *slot = None;
+                    }
+                })
+                .or_insert(id);
+        }
+        // Same stripped path, two defining crates: the identity table
+        // minted both from that path, so harden sees one declaration.
+        // A copy of the same full path inside another artefact does not
+        // match that artefact's crate prefix, so it is not a second
+        // definition.
+        self.cross_crate_leaves.extend(other.cross_crate_leaves);
+        for (stripped, crate_name) in other.defined_at {
+            if let Some(prev) = self.defined_at.get(&stripped)
+                && prev != &crate_name
+            {
+                let leaf = stripped.rsplit("::").next().unwrap_or(stripped.as_str());
+                self.cross_crate_leaves.insert(leaf.to_string());
+            }
+            self.defined_at.entry(stripped).or_insert(crate_name);
+        }
+    }
+
+    /// Leaves whose origin [`harden_duplicate_leaf_metadata`] withdraws on
+    /// this merged fragment. An empty origin module is not enough: a
+    /// crate-root declaration stores one without being a duplicate.
+    pub(crate) fn tombstoned_leaves(mut self) -> std::collections::HashSet<String> {
+        let mut leaves = harden_duplicate_leaf_metadata(
+            &mut self.struct_fields,
+            &mut self.struct_origins,
+            &mut self.enum_variant_by_discriminant,
+            Some(&self.struct_ids),
+        );
+        leaves.extend(self.cross_crate_leaves);
+        leaves
+    }
+}
+
+/// Tombstones for one LLBC, the set [`LowerContext::new`] paints with.
+pub(crate) fn tombstoned_leaves_of(llbc: &Llbc) -> std::collections::HashSet<String> {
+    DuplicateLeafFacts::discover(llbc).tombstoned_leaves()
+}
+
 /// Withdraw the bare-leaf convenience aliases for struct leaves shared
 /// by two or more distinct type declarations.
 ///
@@ -2272,7 +2392,7 @@ pub(crate) fn harden_duplicate_leaf_metadata(
         std::collections::HashMap<i64, String>,
     >,
     struct_ids: Option<&std::collections::HashMap<String, Option<majit_ir::descr::StructId>>>,
-) {
+) -> std::collections::HashSet<String> {
     // RPython groups aliases by the live class object, never by spelling.
     // `StructId` is pyre's existing object-identity carrier: discard a
     // crate-included/canonical duplicate before comparing declaration rows,
@@ -2374,9 +2494,14 @@ pub(crate) fn harden_duplicate_leaf_metadata(
     for leaf in drop_field_aliases {
         struct_fields.remove_field(&leaf);
     }
+    let mut tombstoned_leaves = std::collections::HashSet::new();
     for leaf in tombstone_origins {
         if let Some(module) = struct_origins.get_mut(&leaf) {
             module.clear();
+            // Record the withdrawal itself. Clearing the string cannot be
+            // told apart afterwards from a crate-root decl, whose module
+            // was already empty.
+            tombstoned_leaves.insert(leaf);
         }
     }
     // Variant-leaf aliases.  The enum-variant rows (`derive_program_metadata`)
@@ -2467,6 +2592,7 @@ pub(crate) fn harden_duplicate_leaf_metadata(
             struct_fields.remove_field(&leaf);
         }
     }
+    tombstoned_leaves
 }
 
 /// Lower a single Charon [`FunDecl`] to a [`FunctionGraph`].
@@ -2493,6 +2619,10 @@ pub struct LowerContext<'a> {
     llbc: &'a Llbc,
     struct_field_attrs: std::collections::HashMap<String, Vec<(String, ValueType)>>,
     dont_look_inside: std::collections::HashSet<String>,
+    /// Leaves [`harden_duplicate_leaf_metadata`] emptied for this LLBC.
+    /// Single-function entry points paint with this set, the same one the
+    /// whole-program loop computes from `struct_origins`.
+    tombstoned_leaves: std::collections::HashSet<String>,
 }
 
 impl<'a> LowerContext<'a> {
@@ -2503,6 +2633,7 @@ impl<'a> LowerContext<'a> {
             llbc,
             struct_field_attrs,
             dont_look_inside: dont_look_inside_set_of(llbc),
+            tombstoned_leaves: tombstoned_leaves_of(llbc),
         }
     }
 }
@@ -2523,6 +2654,7 @@ pub fn lower_fun_decl_with_static_addrs(
             &jitdriver_receiver_roots,
             &context.struct_field_attrs,
             &context.dont_look_inside,
+            &context.tombstoned_leaves,
         )
     })
 }
@@ -2599,6 +2731,7 @@ pub(crate) fn lower_fun_decl_with_static_addrs_and_attrs(
     fd: &FunDecl,
     static_addrs: crate::HostStaticAddrs<'_>,
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    tombstoned_leaves: &std::collections::HashSet<String>,
 ) -> Result<FunctionGraph, LowerError> {
     let jitdriver_receiver_roots =
         crate::codewriter::jtransform::default_jitdriver_receiver_roots();
@@ -2610,6 +2743,7 @@ pub(crate) fn lower_fun_decl_with_static_addrs_and_attrs(
         &jitdriver_receiver_roots,
         struct_field_attrs,
         &dont_look_inside,
+        tombstoned_leaves,
     )
 }
 
@@ -2620,6 +2754,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
     jitdriver_receiver_roots: &[String],
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
     dont_look_inside: &std::collections::HashSet<String>,
+    tombstoned_leaves: &std::collections::HashSet<String>,
 ) -> Result<FunctionGraph, LowerError> {
     let u = fd.unstructured().ok_or_else(|| {
         LowerError::Unsupported(format!(
@@ -2629,7 +2764,6 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
     })?;
     let accum = AccumulatorFacts::build(llbc, &u);
     let builder_mode = accum.has_builder;
-    let tombstoned_leaves = std::collections::HashSet::new();
     lower_unstructured_with_static_addrs_and_attrs(
         llbc,
         fd,
@@ -8929,15 +9063,28 @@ impl<'a> Lowering<'a> {
         // capture must key the full crate-stripped path the registry
         // kept — the same spelling [`tyref_input_class_root`] uses for
         // the env parameter.
+        // A tombstoned leaf uses the same spelling as
+        // [`adt_node_class_root_with`]: the crate-stripped path, or the
+        // full declaration path when stripping yields the leaf itself.
         let owner_root = if majit_charon_reader::ullbc::is_closure_leaf(&owner_leaf) {
             strip_crate_prefix(&name_path)
         } else {
+            let owner_base = if self.tombstoned_leaves.contains(&owner_leaf) {
+                let qualified = strip_crate_prefix(&name_path);
+                if qualified != owner_leaf {
+                    qualified
+                } else {
+                    name_path.clone()
+                }
+            } else {
+                owner_leaf
+            };
             match head
                 .as_object()
                 .and_then(|h| adt_head_instantiation_suffix(h, self.llbc))
             {
-                Some(suffix) => format!("{owner_leaf}{suffix}"),
-                None => owner_leaf,
+                Some(suffix) => format!("{owner_base}{suffix}"),
+                None => owner_base,
             }
         };
         match (&td.kind, variant_idx) {
@@ -27455,11 +27602,16 @@ fn adt_node_class_root_with(
     // nowhere to resolve (`rclass.py` `InstanceRepr.getfieldrepr`). Paint
     // this declaration's crate-stripped path; that key still carries the
     // rows, and `canonical_struct_name` leaves a `::` path unchanged.
+    // A crate-root declaration (`crate::Code`) strips to the leaf itself.
+    // The stripped spelling is the withdrawn token, so paint the full
+    // declaration path — the same spelling the constructor joins.
     if tombstoned.contains(&leaf) {
         let qualified = strip_crate_prefix(&name);
-        if qualified != leaf {
-            leaf = qualified;
-        }
+        leaf = if qualified != leaf {
+            qualified
+        } else {
+            name.clone()
+        };
     }
     // A reference-payload workspace enum instantiation projects to a
     // per-instantiation base class (`Result<Tuple>`) so its variant
@@ -32008,14 +32160,14 @@ fn is_core_result_map_err_path(path: &str) -> bool {
     )
 }
 
-fn is_core_clone_impls_clone_path(path: &str) -> bool {
+pub(crate) fn is_core_clone_impls_clone_path(path: &str) -> bool {
     matches!(
         path.split("::").collect::<Vec<_>>().as_slice(),
         ["core", "clone", "impls", "<Impl>", "clone"]
     )
 }
 
-fn is_core_default_path(path: &str) -> bool {
+pub(crate) fn is_core_default_path(path: &str) -> bool {
     matches!(
         path.split("::").collect::<Vec<_>>().as_slice(),
         ["core", "default", "<Impl>", "default"] | ["core", "ptr", "mut_ptr", "<Impl>", "default"]
@@ -42188,6 +42340,7 @@ mod tests {
             &jitdriver_receiver_roots,
             None,
             None,
+            super::no_tombstoned_leaves(),
         )
         .unwrap();
         let linked_ty = serde_json::from_value::<super::TyRef>(serde_json::json!({
@@ -43789,6 +43942,252 @@ mod tests {
         assert_eq!(
             origins.get("W_IntObject").map(String::as_str),
             Some("intobject")
+        );
+    }
+
+    fn code_struct(def_id: u64, path: &[&str]) -> serde_json::Value {
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+        }});
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": {
+                "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+                "span": span,
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            },
+            "kind": {"Struct": [{
+                "name": "n",
+                "ty": {"Literal": {"UInt": "U64"}},
+                "attr_info": null
+            }]}
+        })
+    }
+
+    fn llbc_with_types(
+        crate_name: &str,
+        types: Vec<serde_json::Value>,
+        funs: Vec<serde_json::Value>,
+    ) -> Llbc {
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": crate_name,
+                "type_decls": types,
+                "fun_decls": funs,
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses")
+    }
+
+    fn adt_node(def_id: u64) -> serde_json::Value {
+        serde_json::json!({
+            "Adt": {
+                "id": {"Adt": def_id},
+                "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+            }
+        })
+    }
+
+    /// Two `Code` declarations in one LLBC. `fixture::Code` strips to the
+    /// leaf; `fixture::other::Code` strips to `other::Code`.
+    fn duplicate_code_llbc() -> Llbc {
+        llbc_with_types(
+            "fixture",
+            vec![
+                code_struct(0, &["fixture", "Code"]),
+                code_struct(1, &["fixture", "other", "Code"]),
+            ],
+            vec![],
+        )
+    }
+
+    #[test]
+    fn a_unique_crate_root_struct_keeps_its_bare_leaf() {
+        let llbc = llbc_with_types(
+            "charon_corpus",
+            vec![code_struct(0, &["charon_corpus", "ClassObject"])],
+            vec![],
+        );
+        let tombstoned = super::tombstoned_leaves_of(&llbc);
+        assert!(
+            !tombstoned.contains("ClassObject"),
+            "a crate-root decl stores an empty origin module without being a duplicate"
+        );
+        assert_eq!(
+            super::adt_node_class_root_with(&adt_node(0), &llbc, &tombstoned).as_deref(),
+            Some("ClassObject"),
+            "the class-static narrow and the field registry both key the bare leaf"
+        );
+    }
+
+    #[test]
+    fn single_llbc_lowering_tombstones_a_duplicate_leaf() {
+        let llbc = duplicate_code_llbc();
+        let tombstoned = super::tombstoned_leaves_of(&llbc);
+        assert!(
+            tombstoned.contains("Code"),
+            "two Code declarations in one LLBC withdraw the bare leaf"
+        );
+        let context = super::LowerContext::new(&llbc);
+        assert!(
+            context.tombstoned_leaves.contains("Code"),
+            "LowerContext paints with the LLBC tombstone set, not an empty one"
+        );
+        assert_eq!(
+            super::adt_node_class_root_with(&adt_node(1), &llbc, &tombstoned).as_deref(),
+            Some("other::Code")
+        );
+    }
+
+    #[test]
+    fn crate_root_tombstoned_leaf_paints_the_full_declaration_path() {
+        let llbc = duplicate_code_llbc();
+        let tombstoned = super::tombstoned_leaves_of(&llbc);
+        assert_eq!(
+            super::adt_node_class_root_with(&adt_node(0), &llbc, &tombstoned).as_deref(),
+            Some("fixture::Code"),
+            "crate::Code strips to the withdrawn leaf, so the paint keeps the full path"
+        );
+        assert_eq!(
+            super::adt_node_class_root_with(&adt_node(0), &llbc, super::no_tombstoned_leaves())
+                .as_deref(),
+            Some("Code"),
+            "without a tombstone the crate-root decl still paints the bare leaf"
+        );
+
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+        }});
+        let body: super::Unstructured = serde_json::from_value(serde_json::json!({
+            "locals": {"arg_count": 0, "locals": []}, "body": [], "span": span
+        }))
+        .unwrap();
+        let dont_look_inside = std::collections::HashSet::new();
+        let accum = super::AccumulatorFacts::build(&llbc, &body);
+        let lowering = super::Lowering::new(
+            &llbc,
+            "fixture".into(),
+            &body,
+            crate::HostStaticAddrs::default(),
+            &[],
+            None,
+            &dont_look_inside,
+            &tombstoned,
+            &accum,
+        )
+        .unwrap();
+        let payload = serde_json::json!([{"Adt": [0, null]}, 0]);
+        let (owner_root, field_name, _, _) = lowering
+            .resolve_adt_field(&payload)
+            .expect("field projection");
+        assert_eq!(field_name, "n");
+        assert_eq!(
+            owner_root, "fixture::Code",
+            "the field owner uses the same full path as the class root"
+        );
+    }
+
+    #[test]
+    fn tombstoned_module_leaf_field_owner_matches_the_class_root() {
+        let llbc = duplicate_code_llbc();
+        let tombstoned = super::tombstoned_leaves_of(&llbc);
+        assert_eq!(
+            super::adt_node_class_root_with(&adt_node(1), &llbc, &tombstoned).as_deref(),
+            Some("other::Code")
+        );
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+        }});
+        let body: super::Unstructured = serde_json::from_value(serde_json::json!({
+            "locals": {"arg_count": 0, "locals": []}, "body": [], "span": span
+        }))
+        .unwrap();
+        let dont_look_inside = std::collections::HashSet::new();
+        let accum = super::AccumulatorFacts::build(&llbc, &body);
+        let lowering = super::Lowering::new(
+            &llbc,
+            "fixture".into(),
+            &body,
+            crate::HostStaticAddrs::default(),
+            &[],
+            None,
+            &dont_look_inside,
+            &tombstoned,
+            &accum,
+        )
+        .unwrap();
+        let payload = serde_json::json!([{"Adt": [1, null]}, 0]);
+        let (owner_root, _, _, _) = lowering
+            .resolve_adt_field(&payload)
+            .expect("field projection");
+        assert_eq!(
+            owner_root, "other::Code",
+            "fixture::other::Code is tombstoned, so the field owner is the crate-stripped path"
+        );
+    }
+
+    #[test]
+    fn cross_llbc_duplicate_leaf_is_tombstoned_before_lowering() {
+        let interpreter = llbc_with_types(
+            "pyre_interpreter",
+            vec![code_struct(0, &["pyre_interpreter", "eval", "FrameBlock"])],
+            vec![],
+        );
+        let jit = llbc_with_types(
+            "pyre_jit",
+            vec![code_struct(0, &["pyre_jit", "trace", "FrameBlock"])],
+            vec![],
+        );
+        assert!(
+            !super::tombstoned_leaves_of(&interpreter).contains("FrameBlock"),
+            "each artefact alone has one FrameBlock"
+        );
+        assert!(!super::tombstoned_leaves_of(&jit).contains("FrameBlock"));
+        let mut facts = super::DuplicateLeafFacts::default();
+        facts.absorb(super::DuplicateLeafFacts::discover(&interpreter));
+        facts.absorb(super::DuplicateLeafFacts::discover(&jit));
+        let cross = facts.tombstoned_leaves();
+        assert!(
+            cross.contains("FrameBlock"),
+            "the merged verdict withdraws a leaf that collides only across LLBCs"
+        );
+        assert_eq!(
+            super::adt_node_class_root_with(&adt_node(0), &interpreter, &cross).as_deref(),
+            Some("eval::FrameBlock")
+        );
+    }
+
+    /// `a::Foo` and `b::Foo` mint one `StructId` from the stripped leaf, so
+    /// the identity table sees a single declaration. The merge still
+    /// withdraws `Foo` because the defining crates differ.
+    #[test]
+    fn cross_llbc_crate_root_leaf_is_tombstoned_when_crates_differ() {
+        let a = llbc_with_types("a", vec![code_struct(0, &["a", "Foo"])], vec![]);
+        let b = llbc_with_types("b", vec![code_struct(0, &["b", "Foo"])], vec![]);
+        assert!(!super::tombstoned_leaves_of(&a).contains("Foo"));
+        assert!(!super::tombstoned_leaves_of(&b).contains("Foo"));
+        let mut facts = super::DuplicateLeafFacts::default();
+        facts.absorb(super::DuplicateLeafFacts::discover(&a));
+        facts.absorb(super::DuplicateLeafFacts::discover(&b));
+        let cross = facts.tombstoned_leaves();
+        assert!(
+            cross.contains("Foo"),
+            "the same stripped key from two crates tombstones the leaf"
+        );
+        assert_eq!(
+            super::adt_node_class_root_with(&adt_node(0), &a, &cross).as_deref(),
+            Some("a::Foo")
+        );
+        assert_eq!(
+            super::adt_node_class_root_with(&adt_node(0), &b, &cross).as_deref(),
+            Some("b::Foo")
         );
     }
 
