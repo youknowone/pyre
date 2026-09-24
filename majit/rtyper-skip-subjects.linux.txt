@@ -3,6 +3,19 @@
 # leave this list, and may not join it.  Empty is the epic's
 # done-when.
 # corpus=eff93b0bce4cea6c platform=linux
+# New subjects from looking inside from_exc_object and the split
+# primitive convert helpers. The two-phase prepass never saw them.
+two-phase-never-a-subject	pyre_interpreter::error::<Impl>::empty_object_message
+two-phase-never-a-subject	pyre_interpreter::error::<Impl>::from_exc_object
+two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::convert_from_object_complex
+two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::convert_from_object_float
+two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::convert_from_object_longdouble
+two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::convert_from_object_longlong
+two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::convert_from_object_ulonglong
+two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::convert_to_object_longlong
+two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::convert_to_object_ulonglong
+two-phase-never-a-subject	pyre_module::module::_cffi_backend::misc::as_long_long
+two-phase-never-a-subject	pyre_module::module::_cffi_backend::misc::read_raw_long_data
 two-phase-never-a-subject	eval_loop_jit_portal
 two-phase-never-a-subject	ll_int_abs
 two-phase-never-a-subject	ll_listslice_minusone__ref__majit__object_ref_gcarray
