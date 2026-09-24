@@ -4110,19 +4110,23 @@ impl<S: JitState> JitDriver<S> {
                                 // that key still `has_compiled_targets`.
                                 //
                                 // An unattempted close (`partial_trace` already
-                                // set, or the token is gone) must not resume
-                                // past that scan: `compile_retrace` lives in
-                                // `compile_loop`.
+                                // set, or the token is gone) reaches the same
+                                // scan: `reached_loop_header` skips
+                                // `compile_trace` and falls into the
+                                // `current_merge_points` loop unchanged. With no
+                                // prior same-greenkey entry it appends and keeps
+                                // tracing; with one it falls through to
+                                // `compile_loop` / `compile_retrace` below.
                                 if attempted {
                                     crate::mc_diag_bump(50); // bridge_declined_close
-                                    if self.keep_tracing_after_declined_jump(
-                                        target_key,
-                                        &live_arg_boxes,
-                                    ) {
-                                        continue;
-                                    }
                                 } else {
                                     crate::mc_diag_bump(67); // bridge_unattempted_close
+                                }
+                                if self.keep_tracing_after_declined_jump(
+                                    target_key,
+                                    &live_arg_boxes,
+                                ) {
+                                    continue;
                                 }
                                 self.bridge_attempt_declined = true;
                             }
