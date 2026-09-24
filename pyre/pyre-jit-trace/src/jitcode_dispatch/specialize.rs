@@ -10133,8 +10133,10 @@ pub(crate) fn try_walker_orthodox_binary_op<Sym: WalkSym>(
     // A variable machine-int exponent still declines inside `int_pow_nomod`
     // (its `Option<i64>` result is not a word-ABI residual). Keep `**` off
     // this descent until that call has a real address. A constant exponent
-    // does record when the call is admitted.
-    if matches!(plain, B::Power) && !any_long {
+    // does record when the call is admitted. A float operand stays on the
+    // float-pow fold: `float_pow` reaches `f64::is_infinite` and the float
+    // constructor, which this walk does not record.
+    if matches!(plain, B::Power) && (lhs_is_float || rhs_is_float || !any_long) {
         return Ok(None);
     }
     let all_int = !any_long
