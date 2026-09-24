@@ -4113,7 +4113,8 @@ fn rewrite_wtf8_view_strlen(
     let Some(view) = strlen_call_arg(&op.kind) else {
         return Ok(None);
     };
-    let obj = match resolve_strlen_view(legacy, view, 0, &mut Vec::new())? {
+    let reachable = reachable_block_ids(legacy);
+    let obj = match resolve_strlen_view(legacy, view, 0, &mut Vec::new(), &reachable)? {
         StrlenView::Cast(obj) => obj,
         StrlenView::NotCast | StrlenView::Cycle => return Ok(None),
     };
@@ -4183,6 +4184,7 @@ fn resolve_strlen_view(
     var: &Variable,
     depth: usize,
     stack: &mut Vec<Variable>,
+    reachable: &std::collections::HashSet<BlockId>,
 ) -> Result<StrlenView, TyperError> {
     if depth > 32 {
         return Err(strlen_unresolved());
@@ -4199,11 +4201,20 @@ fn resolve_strlen_view(
     let mut incoming: Vec<crate::model::LinkArg> = Vec::new();
     let mut saw_input = false;
     for block in &legacy.blocks {
+        // `function_graph_to_flowspace_inner` drops the same blocks:
+        // `dead` or not in `reachable_block_ids`. A dead predecessor
+        // must not feed the phi.
+        if block.dead || !reachable.contains(&block.id) {
+            continue;
+        }
         let Some(idx) = block.inputargs.iter().position(|input| input == var) else {
             continue;
         };
         saw_input = true;
         for pred in &legacy.blocks {
+            if pred.dead || !reachable.contains(&pred.id) {
+                continue;
+            }
             for link in &pred.exits {
                 if link.target != block.id {
                     continue;
@@ -4224,7 +4235,7 @@ fn resolve_strlen_view(
     for arg in &incoming {
         let view = match arg {
             crate::model::LinkArg::Value(value) => {
-                resolve_strlen_view(legacy, value, depth + 1, stack)?
+                resolve_strlen_view(legacy, value, depth + 1, stack, reachable)?
             }
             crate::model::LinkArg::Const(_) => StrlenView::NotCast,
         };
@@ -6195,6 +6206,131 @@ mod tests {
             .iter()
             .find(|op| op.opname == "getattr")
             .expect("phi strlen must getattr the string field");
+        let Hlvalue::Constant(field) = &getattr.args[1] else {
+            panic!("getattr field must be a constant, got {:?}", getattr.args);
+        };
+        assert!(
+            matches!(&field.value, ConstValue::ByteStr(bytes) if bytes == b"value"),
+            "got {:?}",
+            field.value
+        );
+    }
+
+    /// A dead predecessor that feeds a non-cast into the phi is not an
+    /// incoming edge. The live cast still resolves to the string field.
+    #[test]
+    fn strlen_on_wtf8_cast_phi_ignores_dead_predecessor() {
+        use crate::flowspace::model::ConstValue;
+
+        let registry = empty_call_registry();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "W_UnicodeObject".to_string(),
+            vec![
+                ("ob_header".to_string(), "PyObject".to_string()),
+                ("value".to_string(), "*mut Utf8Str".to_string()),
+                ("byte_len".to_string(), "usize".to_string()),
+                ("len".to_string(), "usize".to_string()),
+            ],
+        );
+        registry.bookkeeper().set_struct_fields(Rc::new(fields));
+
+        let mut graph = LegacyGraph::new("strlen_wtf8_phi_dead_pred");
+        let vars = mint_vars(&mut graph, 6);
+        let obj = vars[1].clone();
+        let dest = vars[2].clone();
+        let view = vars[3].clone();
+        let len_result = vars[4].clone();
+        let not_cast = vars[5].clone();
+        let phi = BlockId(2);
+        let dead_id = BlockId(4);
+        let ret = graph.returnblock;
+        graph.exceptblock = BlockId(3);
+        graph.blocks = vec![
+            Block {
+                id: graph.startblock,
+                inputargs: block_inputargs(&vars, &[1]),
+                operations: vec![
+                    SpaceOperation {
+                        result: Some(obj.clone()),
+                        kind: OpKind::Input {
+                            name: "obj".to_string(),
+                            ty: ValueType::Ref(Some("W_UnicodeObject".to_string())),
+                            class_root: Some("W_UnicodeObject".to_string()),
+                        },
+                    },
+                    SpaceOperation {
+                        result: Some(dest.clone()),
+                        kind: crate::model::cast_instance_call_result(
+                            "Wtf8",
+                            obj.clone(),
+                            ValueType::Str,
+                        ),
+                    },
+                ],
+                exitswitch: None,
+                exits: vec![link_to_returnblock(
+                    vec![LinkArg::Value(obj.clone()), LinkArg::Value(dest)],
+                    phi,
+                )],
+                framestate: None,
+                dead: false,
+            },
+            Block {
+                id: ret,
+                inputargs: vec![len_result.clone()],
+                operations: vec![],
+                exitswitch: None,
+                exits: vec![],
+                framestate: None,
+                dead: false,
+            },
+            Block {
+                id: phi,
+                inputargs: vec![obj.clone(), view.clone()],
+                operations: vec![SpaceOperation {
+                    result: Some(len_result.clone()),
+                    kind: OpKind::Call {
+                        target: crate::model::CallTarget::FunctionPath {
+                            segments: vec!["__strlen".to_string()],
+                            fun_decl_id: None,
+                        },
+                        args: crate::model::call_args(vec![view]),
+                        result_ty: ValueType::Int,
+                    },
+                }],
+                exitswitch: None,
+                exits: vec![link_to_returnblock(vec![LinkArg::Value(len_result)], ret)],
+                framestate: None,
+                dead: false,
+            },
+            Block {
+                id: dead_id,
+                inputargs: vec![],
+                operations: vec![SpaceOperation {
+                    result: Some(not_cast.clone()),
+                    kind: OpKind::Input {
+                        name: "other".to_string(),
+                        ty: ValueType::Int,
+                        class_root: None,
+                    },
+                }],
+                exitswitch: None,
+                exits: vec![link_to_returnblock(
+                    vec![LinkArg::Value(obj), LinkArg::Value(not_cast)],
+                    phi,
+                )],
+                framestate: None,
+                dead: true,
+            },
+        ];
+        let output = function_graph_to_flowspace(&graph, &registry)
+            .expect("a dead non-cast predecessor must not block the live Wtf8 cast");
+        let ops = flow_ops(&output);
+        let getattr = ops
+            .iter()
+            .find(|op| op.opname == "getattr")
+            .expect("phi strlen must still getattr the string field");
         let Hlvalue::Constant(field) = &getattr.args[1] else {
             panic!("getattr field must be a constant, got {:?}", getattr.args);
         };

@@ -318,7 +318,6 @@ pub(crate) fn pack_enumerate_payload(
     item: &Variable,
     item_ty: &ValueType,
     pair: &Variable,
-    item_ty: &ValueType,
     name: &str,
 ) -> Result<Variable, String> {
     let count = graph.alloc_value_var();

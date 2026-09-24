@@ -1252,7 +1252,6 @@ fn rewire_one_next_site(
             &item_in_some,
             &item_ty,
             &pair_in_some,
-            &item_ty,
             &name,
         )?;
     } else {

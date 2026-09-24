@@ -822,22 +822,30 @@ pub trait OffsetLayout {
     fn field_offset(&self, struct_name: &str, fldname: &str) -> Option<i64>;
     /// `symbolic.get_size(STRUCT)` — total struct byte size.
     fn struct_size(&self, struct_name: &str) -> Option<i64>;
+    /// `symbolic.get_size(lltype.Signed)` — the target word
+    /// (`layout::target_word_size`), not the host `usize`.
+    /// `Signed` / `Unsigned` / `Address` item sizes read this. A layout
+    /// aimed at another word (a 4-byte target while this process is
+    /// 8-byte) overrides it; every other layout uses the target word.
+    fn word_bytes(&self) -> i64 {
+        crate::layout::target_word_size() as i64
+    }
 }
 
 /// Byte size of a primitive `LowLevelType`. Mirrors
 /// `symbolic.get_size(TYPE)` (symbolic.py:24), which resolves to
-/// `ctypes.sizeof(ll2ctypes.get_ctypes_type(TYPE))`; the widths below are
-/// the C-model sizes for the LP64 targets pyre emits for (x86-64 /
-/// AArch64). `UniChar` is the 4-byte UCS-4 codepoint; `LongFloat` is the
+/// `ctypes.sizeof(ll2ctypes.get_ctypes_type(TYPE))`. `Signed` /
+/// `Unsigned` / `Address` are the target word (`word`, from
+/// [`OffsetLayout::word_bytes`]). `long long` and `double` stay 8 on
+/// every target this codewriter emits; the host `usize` is not their
+/// width. `UniChar` is the 4-byte UCS-4 codepoint; `LongFloat` is the
 /// target-derived `long double` width ([`SIZEOF_LONGFLOAT`]).
-fn primitive_byte_size(ty: &LowLevelType) -> Result<i64, String> {
+fn primitive_byte_size(ty: &LowLevelType, word: i64) -> Result<i64, String> {
     match ty {
-        LowLevelType::Signed
-        | LowLevelType::Unsigned
-        | LowLevelType::Address
-        | LowLevelType::SignedLongLong
-        | LowLevelType::UnsignedLongLong
-        | LowLevelType::Float => Ok(WORD),
+        LowLevelType::Signed | LowLevelType::Unsigned | LowLevelType::Address => Ok(word),
+        LowLevelType::SignedLongLong | LowLevelType::UnsignedLongLong | LowLevelType::Float => {
+            Ok(8)
+        }
         // `r_longlonglong` / `r_ulonglonglong` are 128-bit on every target
         // that defines them, so 16 is stable; `long double` is not.
         LowLevelType::SignedLongLongLong | LowLevelType::UnsignedLongLongLong => Ok(16),
@@ -852,10 +860,13 @@ fn primitive_byte_size(ty: &LowLevelType) -> Result<i64, String> {
 /// primitive width, a struct size from `layout`, or a `FixedSizeArray`
 /// laid out as `length` inlined items of `OF`.
 fn item_byte_size(ty: &LowLevelType, layout: &dyn OffsetLayout) -> Result<i64, String> {
-    if let Ok(sz) = primitive_byte_size(ty) {
+    let word = layout.word_bytes();
+    if let Ok(sz) = primitive_byte_size(ty, word) {
         return Ok(sz);
     }
     match ty {
+        // A pointer item is one target word (`ctypes.c_void_p`).
+        LowLevelType::Ptr(_) => Ok(word),
         LowLevelType::Struct(st) => layout
             .struct_size(&st._name)
             .ok_or_else(|| format!("no struct layout for {} (get_size)", st._name)),

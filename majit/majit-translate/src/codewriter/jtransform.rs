@@ -600,6 +600,12 @@ pub struct Transformer<'a> {
     /// that producer is gone, so later `conditional_call` / indirect-call
     /// rewrites recover the callee from this map.
     fn_const_results: std::collections::HashMap<crate::flowspace::model::Variable, CallTarget>,
+    /// Pointer operand of the `direct_ptradd` currently being rewritten,
+    /// before `same_as` aliasing. `rewrite_op_same_as` drops the op and
+    /// renames uses to the original variable; the item type lives on the
+    /// pre-rename operand (`jtransform.py` `rewrite_op_direct_ptradd`
+    /// reads `op.args[0].concretetype`).
+    direct_ptradd_type_arg: Option<crate::flowspace::model::Variable>,
     notes: Vec<GraphTransformNote>,
     vable_rewrites: usize,
     calls_classified: usize,
@@ -1634,6 +1640,7 @@ impl<'a> Transformer<'a> {
             aliases: std::collections::HashMap::new(),
             cast_ptr_to_int_src: std::collections::HashMap::new(),
             fn_const_results: std::collections::HashMap::new(),
+            direct_ptradd_type_arg: None,
             notes: Vec::new(),
             vable_rewrites: 0,
             calls_classified: 0,
@@ -1783,6 +1790,10 @@ impl<'a> Transformer<'a> {
         // last operation and the elision test below does not apply.
         let mut count_before_last_operation = None;
         for original_op in &original_ops {
+            // Captured before `remap_op`: a preceding `same_as` has already
+            // been aliased onto the original pointer, whose concretetype
+            // is not the array item type the `same_as` result carried.
+            self.direct_ptradd_type_arg = direct_ptradd_type_arg(original_op);
             let op = remap_op(original_op, &self.aliases);
             self.hook_access_field(original_op, &op, graph_name, graph);
             // `jtransform.py` binds `_rewrite_symmetric` as the whole
@@ -1805,6 +1816,7 @@ impl<'a> Transformer<'a> {
                     new_ops.push(op);
                 }
             }
+            self.direct_ptradd_type_arg = None;
         }
 
         // `jtransform.py:116-118`: the block's exception exits belong to its
@@ -4132,7 +4144,13 @@ impl<'a> Transformer<'a> {
         ) {
             return RewriteResult::Keep;
         }
-        let ptr_ty = ptr.concretetype();
+        // The value added is the renamed pointer. The item type is the
+        // one `op.args[0]` had before that rename.
+        let ptr_ty = self
+            .direct_ptradd_type_arg
+            .as_ref()
+            .and_then(|typed| typed.concretetype())
+            .or_else(|| ptr.concretetype());
         let is_ccharp = ptr_ty
             .as_ref()
             .is_some_and(|ty| ty == &*crate::translator::rtyper::lltypesystem::rffi::CCHARP);
@@ -10377,6 +10395,23 @@ fn is_lltype_cast_path(segments: &[String], name: &str) -> bool {
     path_segments_end_with(segments, &["lltype", name])
 }
 
+/// `direct_ptradd`'s pointer argument as the front emitted it, before
+/// `same_as` renaming. Its `concretetype` is `TO.OF`.
+fn direct_ptradd_type_arg(op: &SpaceOperation) -> Option<crate::flowspace::model::Variable> {
+    let OpKind::Call { target, args, .. } = &op.kind else {
+        return None;
+    };
+    let crate::model::CallTarget::FunctionPath { segments, .. } = target else {
+        return None;
+    };
+    if !is_lltype_cast_path(segments, "direct_ptradd") || args.len() != 2 {
+        return None;
+    }
+    args.first()
+        .and_then(crate::model::LinkArg::as_variable)
+        .cloned()
+}
+
 /// Project a 1-arg host call to the unary llop the rtyper would have
 /// emitted (`Float2LongLongEntry.specialize_call`,
 /// `rewrite_op_cast_ptr_to_int`).
@@ -14754,6 +14789,119 @@ mod tests {
                     if op == "int_add" && lhs == &ptr && rhs == &prod
             )),
             "scaled shift is int_add-ed; ops={ops:?}"
+        );
+    }
+
+    /// A 4-byte target word sizes a `Signed` item as 4. The host `usize`
+    /// is 8; the layout's word is what `sizeof` resolves.
+    #[test]
+    fn direct_ptradd_signed_item_uses_layout_word_bytes() {
+        use crate::translator::rtyper::lltypesystem::llmemory::OffsetLayout;
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+
+        struct Word4;
+        impl OffsetLayout for Word4 {
+            fn field_offset(&self, _struct_name: &str, _fldname: &str) -> Option<i64> {
+                None
+            }
+            fn struct_size(&self, _struct_name: &str) -> Option<i64> {
+                None
+            }
+            fn word_bytes(&self) -> i64 {
+                4
+            }
+        }
+        let ty = crate::front::mir::lltype_for_direct_ptradd_pointer(None, &LowLevelType::Signed);
+        assert_eq!(
+            Transformer::direct_ptradd_item_bytes(&ty, &Word4),
+            Some(4),
+            "Signed item on a 4-byte target is 4, not the host word"
+        );
+    }
+
+    /// `same_as` is removed and its uses rename to the original pointer.
+    /// The item type stamped on the `same_as` result still scales the add.
+    #[test]
+    fn direct_ptradd_scales_same_as_item_type_after_rename() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+
+        let item = LowLevelType::Signed;
+        let typed =
+            crate::front::mir::lltype_for_direct_ptradd_pointer(Some((*CCHARP).clone()), &item);
+        let mut graph = FunctionGraph::new("direct_ptradd_same_as_item");
+        let original = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "ptr".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        original.set_concretetype(Some((*CCHARP).clone()));
+        let typed_ptr = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::UnaryOp {
+                    op: "same_as".into(),
+                    operand: original.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        typed_ptr.set_concretetype(Some(typed));
+        let shift = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "n".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&shift, ConcreteType::Signed);
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path([
+                        "rpython",
+                        "rtyper",
+                        "lltypesystem",
+                        "lltype",
+                        "direct_ptradd",
+                    ]),
+                    args: crate::model::call_args(vec![typed_ptr, shift.clone()]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result));
+
+        let transformed = transform_graph(&graph, &GraphTransformConfig::default());
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        let scale = crate::layout::target_word_size() as i64;
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op.kind, OpKind::ConstInt(n) if n == scale)),
+            "same_as item type Signed must scale by {scale}; ops={ops:?}"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, lhs, .. } if op == "int_mul" && lhs == &shift)),
+            "full transform must int_mul the shift; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as")),
+            "same_as is still removed; ops={ops:?}"
         );
     }
 
