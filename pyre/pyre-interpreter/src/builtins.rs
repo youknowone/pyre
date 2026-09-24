@@ -5416,17 +5416,28 @@ static __majit_wrap_builtin_abs_target: crate::gateway::BuiltinWrapperDescriptor
 pub fn split_builtin_kwargs(args: &[PyObjectRef]) -> (&[PyObjectRef], Option<PyObjectRef>) {
     if !args.is_empty() {
         let last = args[args.len() - 1];
-        // The marker dict stores an unforgeable sentinel under `__pyre_kw__`
-        // (`call_with_kwargs`), so detection is by value identity.  A dict
-        // passed positionally that merely contains a `__pyre_kw__` string key
-        // (`float({'__pyre_kw__': True})`) carries a different value and is a
-        // value, not the marker, so it must not be stripped.
-        let is_marker = (unsafe { is_dict(last) }) && builtin_kwargs_marker_dict(last);
-        if is_marker {
+        if builtin_kwargs_marker_tail(last) {
             return (&args[..args.len() - 1], Some(last));
         }
     }
     (args, None)
+}
+
+/// Whether `last` is the trailing keyword dict [`split_builtin_kwargs`]
+/// strips.
+///
+/// The marker dict stores an unforgeable sentinel under `__pyre_kw__`
+/// (`call_with_kwargs`), so detection is by value identity.  A dict passed
+/// positionally that merely contains a `__pyre_kw__` string key
+/// (`float({'__pyre_kw__': True})`) carries a different value and is a
+/// value, not the marker, so it must not be stripped.
+///
+/// Scalar so a wrapper that only needs the answer for a known slot can ask
+/// it without the sub-slice [`split_builtin_kwargs`] returns: a traced
+/// wrapper that builds that sub-slice stops annotating and falls to the
+/// legacy walker.
+pub fn builtin_kwargs_marker_tail(last: PyObjectRef) -> bool {
+    (unsafe { is_dict(last) }) && builtin_kwargs_marker_dict(last)
 }
 
 /// Length of the leading non-null run of `args`.
@@ -7277,17 +7288,14 @@ exc_constructor!(
 pub fn __majit_wrap_base_exception_descr_init(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() == 2 && !args[0].is_null() {
-        let (positional, kwargs) = split_builtin_kwargs(&args[1..]);
-        if kwargs.is_none() && positional.len() == 1 {
-            exc_init_one_positional(args[0], positional[0]);
-            return Ok(pyre_object::w_none());
-        }
+    if args.len() == 2 && !args[0].is_null() && !builtin_kwargs_marker_tail(args[1]) {
+        exc_init_one_positional(args[0], args[1]);
+        return Ok(pyre_object::w_none());
     }
     // The six-word residual cannot see a longer tail. Hand the real slice
     // to the initializer instead of shortening it.
     if args.len() > 6 {
-        return exc_base_exception_init(args);
+        return exc_base_exception_init_long(args);
     }
     let slot = |i: usize| args.get(i).copied().unwrap_or(pyre_object::PY_NULL);
     exc_base_exception_init_slow(
@@ -7323,6 +7331,15 @@ fn exc_base_exception_init_slow(
         ));
     }
     exc_base_exception_init(&buf[..n as usize])
+}
+
+/// `BaseException(*args)` takes any number of positional arguments, so an
+/// arity the word ABI cannot carry still has to reach the initializer whole.
+/// Residual for the same reason as [`exc_base_exception_init_slow`]: a
+/// traced wrapper that passes the slice on itself stops annotating.
+#[majit_macros::dont_look_inside]
+fn exc_base_exception_init_long(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    exc_base_exception_init(args)
 }
 
 #[majit_macros::dont_look_inside_cannot_raise]
@@ -7365,17 +7382,14 @@ static __majit_wrap_base_exception_descr_init_target: crate::gateway::BuiltinWra
 pub fn __majit_wrap_exc_value_error_descr_new(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() == 2 && !args[0].is_null() {
-        let (positional, kwargs) = split_builtin_kwargs(&args[1..]);
-        if kwargs.is_none() && positional.len() == 1 {
-            return Ok(value_error_one_arg(args[0], positional[0]));
-        }
+    if args.len() == 2 && !args[0].is_null() && !builtin_kwargs_marker_tail(args[1]) {
+        return Ok(value_error_one_arg(args[0], args[1]));
     }
     // The four-word residual cannot see a longer tail, and a bare exception
     // takes any number of positional arguments. Hand the real slice over
     // rather than shortening it.
     if args.len() > 4 {
-        return exc_value_error_new(args);
+        return exc_value_error_new_long(args);
     }
     let slot = |i: usize| args.get(i).copied().unwrap_or(pyre_object::PY_NULL);
     exc_value_error_new_slow(slot(0), slot(1), slot(2), slot(3), args.len() as i64)
@@ -7399,6 +7413,16 @@ fn exc_value_error_new_slow(
         ));
     }
     exc_value_error_new(&buf[..n as usize])
+}
+
+/// The constructor takes any number of positional arguments, so an arity the
+/// word ABI cannot carry still has to reach it whole.  Residual for the same
+/// reason as [`exc_value_error_new_slow`]: a traced wrapper that passes the
+/// slice on itself stops annotating, and it drags `exc_value_error_new` into
+/// the prepass with it.
+#[majit_macros::dont_look_inside]
+fn exc_value_error_new_long(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    exc_value_error_new(args)
 }
 
 #[majit_macros::dont_look_inside_cannot_raise]
