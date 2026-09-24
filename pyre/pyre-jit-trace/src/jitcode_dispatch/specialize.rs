@@ -24099,8 +24099,13 @@ fn try_walker_specialize_zip_two_tuple_iters<Sym: WalkSym>(
             }
             let seq = pyre_object::w_tuple_iter_seq(inner);
             let index = pyre_object::w_tuple_iter_index(inner);
+            // `W_FastTupleIterObject.descr_next` indexes `tupleitems` captured
+            // by `W_AbstractTupleObject.descr_iter` from `tolist()`. Only
+            // `W_TupleObject.wrappeditems` is that array. An arity-2
+            // `W_SpecialisedTupleObject_*` stores `value0`/`value1` inline, so
+            // a `wrappeditems` load reads the payload as a pointer.
             if seq.is_null()
-                || !pyre_object::is_tuple(seq)
+                || !std::ptr::eq((*seq).ob_type, &pyre_object::TUPLE_TYPE)
                 || !pyre_object::is_exact_builtin_instance(seq)
                 || index < 0
             {
