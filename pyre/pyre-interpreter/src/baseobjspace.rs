@@ -20835,12 +20835,21 @@ fn stop_iteration_with_value(value: PyObjectRef) -> PyError {
         pyre_object::gc_roots::shadow_stack_get(value_slot)
     };
     if !value.is_null() && unsafe { !is_none(value) } {
-        // `interp_exceptions.py W_BaseException.descr_init`
-        // stores `args_w` as a list; pyre matches the shape so that
-        // `e.args` materialises a fresh tuple each read.
+        // `generator.py stopiteration_value` reaches the class through
+        // `call_function` so that `W_StopIteration.descr_init` runs, rather
+        // than passing the value as the operation error's own argument — a
+        // tuple subclass would otherwise be unpacked into several arguments.
+        // Building the list here keeps that single-argument shape, so this has
+        // to do both halves `descr_init` does: store `args_w` as a list, so
+        // `e.args` materialises a fresh tuple each read, and stamp the
+        // `w_value` slot the `value` attrproperty reads.
         let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![value]);
         unsafe {
             w_exception_set_args(pyre_object::gc_roots::shadow_stack_get(exc_slot), args_list);
+            w_exception_set_value(
+                pyre_object::gc_roots::shadow_stack_get(exc_slot),
+                pyre_object::gc_roots::shadow_stack_get(value_slot),
+            );
         }
     }
     unsafe { PyError::from_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot)) }
