@@ -62,6 +62,7 @@ pub const TUPLE_HASH_UNSET: i64 = -1;
 /// items are loaded as `getfield_gc_pure_r` and the array length
 /// comes from `arraylen_gc` against the GcArray header.
 #[repr(C)]
+#[majit_macros::jit_immutable_fields("wrappeditems[*]")]
 pub struct W_TupleObject {
     pub ob_header: PyObject,
     /// CPython 3.14 `PyTupleObject.ob_hash`; `TUPLE_HASH_UNSET` until computed.

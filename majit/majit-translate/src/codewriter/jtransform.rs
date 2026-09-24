@@ -986,7 +986,8 @@ fn drop_guarded_gc_write_barriers(graph: &mut FunctionGraph) {
 
 /// Variables that hold an immutable array: each is the result of a
 /// `FieldRead` whose field has `IR_IMMUTABLE_ARRAY` rank
-/// (`rclass.py _parse_field_list` `name[*]`).  Computed once per graph.
+/// (`rclass.py _parse_field_list` `name[*]`), or an items-base accessor
+/// result / block phi carrying one.  Computed once per graph.
 fn collect_immutable_array_vars(
     graph: &FunctionGraph,
     cc: Option<&crate::call::CallControl>,
@@ -1006,6 +1007,56 @@ fn collect_immutable_array_vars(
             if rank.is_array() && rank.is_immutable() {
                 if let Some(result) = op.result.clone() {
                     set.insert(result);
+                }
+            }
+        }
+    }
+    // The items-base accessor returns the same header pointer, and a block
+    // phi fed only by such pointers still names that array.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in &graph.blocks {
+            for op in &block.operations {
+                let (Some(result), crate::model::OpKind::Call { target, args, .. }) =
+                    (&op.result, &op.kind)
+                else {
+                    continue;
+                };
+                if !Transformer::call_target_is_items_block_accessor(target) {
+                    continue;
+                }
+                let Some(arg) = args.first().and_then(|arg| arg.as_variable()) else {
+                    continue;
+                };
+                if set.contains(arg) && set.insert(result.clone()) {
+                    changed = true;
+                }
+            }
+            for (slot, input) in block.inputargs.iter().enumerate() {
+                if set.contains(input) {
+                    continue;
+                }
+                let mut preds = 0usize;
+                let mut all_immutable = true;
+                for src in &graph.blocks {
+                    for link in &src.exits {
+                        if link.target != block.id {
+                            continue;
+                        }
+                        preds += 1;
+                        let carried = link
+                            .args
+                            .get(slot)
+                            .and_then(|arg| arg.as_variable())
+                            .is_some_and(|var| set.contains(var));
+                        if !carried {
+                            all_immutable = false;
+                        }
+                    }
+                }
+                if preds > 0 && all_immutable && set.insert(input.clone()) {
+                    changed = true;
                 }
             }
         }
@@ -5361,6 +5412,34 @@ impl<'a> Transformer<'a> {
         //                           [v_inst, descr, descr1], None),
         //            op1]       # op1 = getfield_*_pure
         // Mutable fields stay as plain `getfield_gc_*`.
+        // `ItemsBlock.capacity` is the GcArray length header (`len(items)`,
+        // rlist.py `_ll_list_resize_hint`). `list.obj_capacity` already
+        // lowers that word to `arraylen_gc`. A struct `getfield` of the same
+        // offset is not an always-pure opcode, so a tuple length read stays
+        // in the peeled loop. `TypedItemsBlock.capacity` is a different
+        // array and is left alone.
+        if field.name == "capacity"
+            && field
+                .owner_root
+                .as_deref()
+                .is_some_and(|owner| owner.rsplit("::").next() == Some("ItemsBlock"))
+        {
+            let OpKind::FieldRead { base, .. } = &op.kind else {
+                return RewriteResult::Keep;
+            };
+            self.notes.push(GraphTransformNote {
+                function: graph_name.to_string(),
+                detail: "rewrite: getfield(ItemsBlock.capacity) → arraylen_gc".to_string(),
+            });
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::ArrayLen {
+                    base: base.clone(),
+                    array_type_id: Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+                    nolength: false,
+                },
+            }]);
+        }
         let rank = self
             .callcontrol
             .as_deref()
@@ -5579,6 +5658,16 @@ impl<'a> Transformer<'a> {
             }]);
         }
         RewriteResult::Keep
+    }
+
+    fn call_target_is_items_block_accessor(target: &crate::model::CallTarget) -> bool {
+        let crate::model::CallTarget::FunctionPath { segments, .. } = target else {
+            return false;
+        };
+        matches!(
+            segments.last().map(String::as_str),
+            Some("items_block_items_base" | "items_block_items_ptr")
+        )
     }
 
     /// RPython: rewrite_op_getarrayitem
