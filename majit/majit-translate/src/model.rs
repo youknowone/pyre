@@ -6801,7 +6801,7 @@ fn ptr_gckind(
 /// RPython's `getattr(func, <attr>)` reads — and is also the home for
 /// the attributes that were previously kept in per-`CallControl`
 /// GraphId-keyed side tables.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FuncEffects {
     /// `func.oopspec` (rlib/jit.py `@oopspec(spec)`). Its presence is
     /// the builtin signal (call.py:135 `if hasattr(targetgraph.func,
@@ -6819,6 +6819,10 @@ pub struct FuncEffects {
     /// meaningful for an external (graph-less) funcobj; a graph-bearing
     /// function derives can-collect by walking the graph instead.
     pub random_effects_on_gcobjs: bool,
+    /// `funcobj.canraise` (`canraise.py analyze_external_call`:
+    /// `getattr(fnobj, 'canraise', True)`). Defaults to true. `rffi.py
+    /// llexternal` stamps false on the C function it creates.
+    pub canraise: bool,
     /// `LL_OPERATIONS[op.opname].canmallocgc` (collectanalyze.py) for a
     /// callee that has no graph.
     ///
@@ -6860,6 +6864,26 @@ pub struct FuncEffects {
     pub dont_inline: bool,
 }
 
+impl Default for FuncEffects {
+    fn default() -> Self {
+        Self {
+            oopspec: None,
+            oopspec_argnames: Vec::new(),
+            cannot_collect: false,
+            random_effects_on_gcobjs: false,
+            // `canraise.py analyze_external_call` defaults missing to True.
+            canraise: true,
+            canmallocgc: false,
+            cannot_raise_assertion: false,
+            memerror_only_assertion: false,
+            elidable: false,
+            loop_invariant: false,
+            close_stack: false,
+            dont_inline: false,
+        }
+    }
+}
+
 impl FuncEffects {
     /// Fold `other`'s set attributes into `self`. Used when a graph is
     /// registered *after* a `mark_*` already recorded effects on the
@@ -6875,6 +6899,9 @@ impl FuncEffects {
         }
         self.cannot_collect |= other.cannot_collect;
         self.random_effects_on_gcobjs |= other.random_effects_on_gcobjs;
+        // Default is true. `&=` keeps an `llexternal` false stamp when the
+        // other record is the default.
+        self.canraise &= other.canraise;
         self.canmallocgc |= other.canmallocgc;
         self.cannot_raise_assertion |= other.cannot_raise_assertion;
         self.memerror_only_assertion |= other.memerror_only_assertion;
@@ -8290,6 +8317,7 @@ mod tests {
         let set = FuncEffects {
             cannot_collect: true,
             random_effects_on_gcobjs: true,
+            canraise: false,
             canmallocgc: true,
             cannot_raise_assertion: true,
             memerror_only_assertion: true,
