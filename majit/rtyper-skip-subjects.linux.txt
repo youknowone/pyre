@@ -16,6 +16,8 @@ two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::convert
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::convert_to_object_ulonglong
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::misc::as_long_long
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::misc::read_raw_long_data
+two-phase-never-a-subject	pyre_module::module::_cffi_backend::misc::read_raw_ulong_data
+two-phase-rtype-skipped	pyre_interpreter::gateway::builtin_fixed_arity_fn
 two-phase-never-a-subject	eval_loop_jit_portal
 two-phase-never-a-subject	ll_int_abs
 two-phase-never-a-subject	ll_listslice_minusone__ref__majit__object_ref_gcarray
