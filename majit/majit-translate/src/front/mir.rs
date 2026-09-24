@@ -1239,24 +1239,29 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         let gcref_result = gc_root_gcref_result_path(&fn_path);
         let returns_objectptr =
             output_type_is_objectptr(&fd.signature.output, llbc) && !gcref_result;
-        // Stamp the FUNC.RESULT token for `dont_look_inside` callees only
-        // (keyed exactly as `merge_hints_from_llbcs`), so the narrow
-        // codewriter surface stays restricted to opaque stubs; every
-        // other fn keeps the declared-void default.
-        // Every trait method can be a member of an indirect-call PBC row:
-        // default bodies and concrete overrides alike.  RPython's
-        // `FunctionReprBase.call` gets the row's result from
-        // `FuncType.RESULT`, so each member must carry that type before the
-        // graph analyzers run.  Left `None`, pyre maps it to `Void` and the
-        // first concrete witness can mismatch a real `Ref`/`Int` result.
-        // Stamp the same signature token an opaque callee gets.
+        // `dont_look_inside` / `elidable` callees and every trait-method
+        // member of an indirect-call row stamp FUNC.RESULT.  RPython's
+        // `FunctionReprBase.call` reads that row from `FuncType.RESULT`.
+        // Left `None`, pyre maps it to `Void`, so a callee whose body
+        // produces a scalar disagrees with the call's `result_ty`.
+        // A `repr(transparent)` scalar wrapper is that word: the same
+        // token an opaque callee gets, including an inherent constructor
+        // that is not itself a trait method.
+        // Aggregate `"ref"` results stay unstamped — the call-signature
+        // validator skips a missing declaration, and a struct name is not
+        // a register class.
         let stamp_return_token = dont_look_inside.contains(&fn_path)
             || elidable_residual.contains(&fn_path)
             || trait_root.is_some();
-        let return_type = if gcref_result {
+        let signature_token = if gcref_result {
             Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE.to_string())
-        } else if stamp_return_token {
+        } else {
             dont_look_inside_return_token(&fd.signature.output, llbc, static_addrs.error_carrier)
+        };
+        let return_type = if gcref_result || stamp_return_token {
+            signature_token
+        } else if signature_token.as_deref().is_some_and(scalar_result_token) {
+            signature_token
         } else {
             None
         };
@@ -26516,6 +26521,19 @@ fn tyref_to_value_type_with(
     if let Some(resolved) = trait_assoc_projection_target(value, llbc) {
         return tyref_to_value_type_with(&resolved, llbc, tombstoned);
     }
+    // A borrow hides the projection: `&Self::Anchor` is a `Ref` whose
+    // pointee is the associated type.  `trait_assoc_projection_target`
+    // only sees a top-level `TraitType`, and the transparent peel below
+    // only sees an ADT, so the borrow would stay a GC reference while the
+    // by-value projection is the impl's word.  Peel first, then resolve,
+    // and answer only when the binding is a transparent wrapper: that is
+    // the one borrow the transparent peel already types as its field.
+    if let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_wrappers(node, llbc))
+        && let Some(resolved) = trait_assoc_projection_target(node, llbc)
+        && let Some(inner) = tyref_transparent_inner_value_type(&resolved, llbc, tombstoned)
+    {
+        return inner;
+    }
     // RPython `history.getkind` classifies `Ptr(FuncType)` through the raw
     // pointer arm, hence as `int`.  Charon's equivalent is a top-level
     // `FnPtr`: it is the machine address that `FunctionReprBase.call` feeds
@@ -27089,6 +27107,13 @@ fn tyref_payload_enum_class_root_with(
         return None;
     }
     tyref_class_root_with(ty, llbc, tombstoned)
+}
+
+/// Machine-scalar FUNC.RESULT spellings.  `"ref"` is not one: it collapses
+/// every aggregate onto a GC reference, which the call-signature validator
+/// must not start enforcing for ordinary struct returns.
+fn scalar_result_token(token: &str) -> bool {
+    matches!(token, "bool" | "i64" | "u64" | "f32" | "f64")
 }
 
 /// Encode the FUNC.RESULT of a `dont_look_inside` callee into the
