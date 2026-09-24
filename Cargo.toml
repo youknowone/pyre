@@ -24,6 +24,7 @@ members = [
     "majit/majit-rlib",
     "majit/majit-translate",
     "majit/majit-jitcode",
+    "majit/majit-config",
     "majit/majit-charon-reader",
     "majit/examples/tlr",
     "majit/examples/tl",
@@ -141,6 +142,7 @@ majit-macros = { version = "0.0.2", path = "majit/majit-macros" }
 majit-rlib = { version = "0.0.2", path = "majit/majit-rlib" }
 majit-translate = { version = "0.0.2", path = "majit/majit-translate" }
 majit-jitcode = { version = "0.0.2", path = "majit/majit-jitcode" }
+majit-config = { version = "0.0.2", path = "majit/majit-config" }
 majit-charon-reader = { version = "0.0.2", path = "majit/majit-charon-reader" }
 
 # shared dependencies

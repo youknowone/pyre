@@ -32,7 +32,7 @@ pub mod artifacts;
     )
 )]
 pub mod codewriter;
-pub mod config;
+pub use majit_config as config;
 // Decline census — no upstream counterpart.  Upstream gates that cannot
 // lower a shape raise a named error (`jtransform.py _handle_list_call`);
 // every gate here declines silently, so the refusals are counted instead.

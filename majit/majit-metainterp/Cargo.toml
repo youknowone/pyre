@@ -43,7 +43,9 @@ majit-ir = { workspace = true }
 majit-trace = { workspace = true }
 majit-backend = { workspace = true }
 majit-gc = { workspace = true }
-majit-translate = { workspace = true }
+majit-rlib = { workspace = true }
+majit-jitcode = { workspace = true }
+majit-config = { workspace = true }
 bit-set = { workspace = true }
 smallvec = { workspace = true }
 vecset = { workspace = true }
@@ -68,6 +70,7 @@ ctor = { workspace = true }
 majit-backend-wasm = { path = "../majit-backend-wasm", version = "0.0.2", default-features = false }
 
 [dev-dependencies]
+majit-translate = { workspace = true }
 bincode = { workspace = true }
 majit-macros = { workspace = true }
 majit-gc = { workspace = true }

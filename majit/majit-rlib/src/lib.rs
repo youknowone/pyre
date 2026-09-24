@@ -16,6 +16,7 @@ pub mod jit;
 pub mod lltypesystem;
 pub mod nonconst;
 pub mod rbigint;
+pub mod rvmprof;
 
 /// `lltype.malloc(T, flavor='raw')` (`rpython/rtyper/lltypesystem/lltype.py`) —
 /// an allocation the collector neither traces nor reclaims.

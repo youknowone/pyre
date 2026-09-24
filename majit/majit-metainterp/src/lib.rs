@@ -242,7 +242,7 @@ pub use pyjitpl::{eval_binop_f, eval_binop_i, eval_float_cmp, eval_unary_f, eval
 // can build a fresh Assembler without forcing each user crate to
 // declare a `majit-translate` dependency.  The same pattern is used
 // for `JitCode` / `BhDescr` re-exports above (`jitcode/mod.rs`).
-pub use majit_translate::codewriter::assembler::Assembler;
+pub use majit_jitcode::codewriter::assembler::Assembler;
 pub use parity::{TraceParityCase, assert_trace_parity, normalize_ops, normalize_trace};
 /// The walker's own `getfield_gc` / `setfield_gc` descr resolution
 /// (`blackhole.py:1432-1483` reads the descr straight out of the constant

@@ -10,5 +10,6 @@ description = "The part of majit's codewriter that the JIT runtime reads: jitcod
 majit-ir = { workspace = true }
 serde = { workspace = true, features = ["rc"] }
 indexmap = { workspace = true }
+parking_lot = { workspace = true }
 vecset = { workspace = true }
 rustc-hash = { workspace = true }

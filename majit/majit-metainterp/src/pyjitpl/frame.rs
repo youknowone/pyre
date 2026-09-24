@@ -765,8 +765,8 @@ impl MIFrame {
         after_residual_call: bool,
         unique_to_box: Option<&[u32]>,
     ) -> i64 {
-        const SIZE_LIVE_OP: usize = majit_translate::liveness::OFFSET_SIZE + 1;
-        use majit_translate::liveness::{LivenessIterator, decode_offset};
+        const SIZE_LIVE_OP: usize = majit_jitcode::liveness::OFFSET_SIZE + 1;
+        use majit_jitcode::liveness::{LivenessIterator, decode_offset};
 
         // pyjitpl.py:180-193 — in_a_call branch.  The frame that holds
         // the in-flight CALL instruction has a "result" register slot
@@ -972,8 +972,8 @@ impl MIFrame {
         after_residual_call: bool,
         skip_int_identity: Option<(usize, usize)>,
     ) -> Vec<SnapshotTagged> {
-        const SIZE_LIVE_OP: usize = majit_translate::liveness::OFFSET_SIZE + 1;
-        use majit_translate::liveness::{LivenessIterator, decode_offset};
+        const SIZE_LIVE_OP: usize = majit_jitcode::liveness::OFFSET_SIZE + 1;
+        use majit_jitcode::liveness::{LivenessIterator, decode_offset};
 
         let (clear_int_idx, clear_ref_idx, clear_float_idx) = if in_a_call {
             let argcode = self._result_argcode;
@@ -1814,7 +1814,7 @@ mod tests {
 
         // `self.pc = live_pc + SIZE_LIVE_OP` (in_a_call=false path:
         // `pc = self.pc - SIZE_LIVE_OP`).
-        let current_pc = live_pc + majit_translate::codewriter::liveness::OFFSET_SIZE + 1;
+        let current_pc = live_pc + majit_jitcode::codewriter::liveness::OFFSET_SIZE + 1;
 
         // Liveness lists register index `1` — falls into the
         // constants area.  bitset byte 0b0000_0010 lights up bit 1.

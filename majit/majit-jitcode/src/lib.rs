@@ -7,6 +7,8 @@
 
 pub mod codewriter {
     pub mod assembler;
+    pub mod call;
+    pub mod codewriter;
     pub mod flatten;
     pub mod insns;
     pub mod jitcode;
@@ -14,6 +16,9 @@ pub mod codewriter {
 }
 
 pub use codewriter::{insns, jitcode, liveness};
+
+pub mod parse;
+pub mod rclass;
 
 pub mod tool {
     pub mod algo {

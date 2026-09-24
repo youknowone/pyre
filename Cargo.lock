@@ -2011,6 +2011,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "majit-config"
+version = "0.0.2"
+dependencies = [
+ "parking_lot",
+]
+
+[[package]]
 name = "majit-gc"
 version = "0.0.2"
 dependencies = [
@@ -2041,6 +2048,7 @@ version = "0.0.2"
 dependencies = [
  "indexmap",
  "majit-ir",
+ "parking_lot",
  "rustc-hash",
  "serde",
  "vecset",
@@ -2074,9 +2082,12 @@ dependencies = [
  "majit-backend-cranelift",
  "majit-backend-dynasm",
  "majit-backend-wasm",
+ "majit-config",
  "majit-gc",
  "majit-ir",
+ "majit-jitcode",
  "majit-macros",
+ "majit-rlib",
  "majit-trace",
  "majit-translate",
  "parking_lot",
@@ -2125,6 +2136,7 @@ dependencies = [
  "indexmap",
  "libc",
  "majit-charon-reader",
+ "majit-config",
  "majit-ir",
  "majit-jitcode",
  "md-5 0.10.6",

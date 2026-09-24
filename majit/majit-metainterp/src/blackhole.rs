@@ -145,7 +145,7 @@ pub enum BhReturnType {
 /// Re-export BhDescr from codewriter::jitcode — shared descriptor type
 /// between codewriter assembler and blackhole interpreter.
 /// RPython `history.py:AbstractDescr` parity.
-pub use majit_translate::jitcode::{BhCallDescr, BhDescr, DescrTable, EMPTY_DESCR_TABLE};
+pub use majit_jitcode::jitcode::{BhCallDescr, BhDescr, DescrTable, EMPTY_DESCR_TABLE};
 
 /// Per-jitdriver static data visible to the blackhole interpreter.
 ///
@@ -553,7 +553,7 @@ impl Drop for GuardExcRoot {
 // Blackhole calls through `rvmprof::cintf::jit_rvmprof_code` directly,
 // matching `blackhole.py:416, 438, 1600` where the C intf function is
 // invoked without any hook-registry indirection visible to dispatch code.
-use majit_translate::rlib::rvmprof::cintf::jit_rvmprof_code;
+use majit_rlib::rvmprof::cintf::jit_rvmprof_code;
 
 thread_local! {
     /// The placeholder `jitcode` every `BlackholeInterpreter::default()`
@@ -593,9 +593,9 @@ impl Default for BlackholeInterpreter {
             // RPython blackhole.py — copied from builder in `acquire_interp`.
             // `BC_ABSENT` stands in for `insns.get('…', -1)`: a reserved byte
             // no opname is ever assigned, so it cannot match `code[position]`.
-            op_catch_exception: majit_translate::insns::BC_ABSENT,
-            op_rvmprof_code: majit_translate::insns::BC_ABSENT,
-            op_live: majit_translate::insns::BC_ABSENT,
+            op_catch_exception: majit_jitcode::insns::BC_ABSENT,
+            op_rvmprof_code: majit_jitcode::insns::BC_ABSENT,
+            op_live: majit_jitcode::insns::BC_ABSENT,
             registers_i: Vec::new(),
             registers_r: Vec::new(),
             registers_f: Vec::new(),
@@ -718,7 +718,7 @@ impl BlackholeInterpreter {
     fn init_register_file_from_const_slots_r(
         regs: &mut Vec<i64>,
         num_regs: usize,
-        constants: &[majit_translate::jitcode::ConstSlotR],
+        constants: &[majit_jitcode::jitcode::ConstSlotR],
     ) {
         Self::init_register_file(regs, num_regs, constants.len(), |dst| {
             for (dst, slot) in dst.iter_mut().zip(constants) {
@@ -760,7 +760,7 @@ impl BlackholeInterpreter {
     #[cfg(test)]
     pub(crate) fn prepare_registers_for_canonical_jitcode(
         &mut self,
-        jitcode: &majit_translate::jitcode::JitCode,
+        jitcode: &majit_jitcode::jitcode::JitCode,
         position: usize,
     ) {
         let body = jitcode.body();
@@ -1619,7 +1619,7 @@ impl BlackholeInterpreter {
             return false;
         }
         if code[position] == self.op_live {
-            position += majit_translate::liveness::OFFSET_SIZE + 1;
+            position += majit_jitcode::liveness::OFFSET_SIZE + 1;
             if position >= code.len() {
                 return false;
             }
@@ -1738,7 +1738,7 @@ impl BlackholeInterpreter {
         let mut position = self.position;
         let mut opcode = code[position];
         if opcode == self.op_live {
-            position += majit_translate::liveness::OFFSET_SIZE + 1;
+            position += majit_jitcode::liveness::OFFSET_SIZE + 1;
             opcode = code[position];
         }
         if opcode == self.op_rvmprof_code {
@@ -1906,7 +1906,7 @@ impl BlackholeInterpreter {
                 body.calldescr.result_type,
                 body.calldescr.arg_classes.as_ptr(),
                 body.calldescr.arg_classes.len(),
-                &body.calldescr as *const majit_translate::jitcode::BhCallDescr,
+                &body.calldescr as *const majit_jitcode::jitcode::BhCallDescr,
             )
         };
         let mut args_i = smallvec::SmallVec::<[i64; 4]>::new();
@@ -2063,7 +2063,7 @@ impl BlackholeInterpreter {
             if !trace {
                 match opcode {
                     jitcode::insns::BC_LIVE if live_hook_absent => {
-                        position += majit_translate::liveness::OFFSET_SIZE;
+                        position += majit_jitcode::liveness::OFFSET_SIZE;
                         continue;
                     }
                     jitcode::insns::BC_JUMP => {
@@ -2431,7 +2431,7 @@ impl BlackholeInterpreter {
         &self,
         func: i64,
         args_r: &[i64],
-        calldescr: &majit_translate::jitcode::BhCallDescr,
+        calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> i64 {
         self.cpu()
             .bh_call_i(func, None, Some(args_r), None, calldescr)
@@ -2442,7 +2442,7 @@ impl BlackholeInterpreter {
         &self,
         func: i64,
         args_r: &[i64],
-        calldescr: &majit_translate::jitcode::BhCallDescr,
+        calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
         self.cpu()
             .bh_call_r(func, None, Some(args_r), None, calldescr)
@@ -2453,7 +2453,7 @@ impl BlackholeInterpreter {
         &self,
         func: i64,
         args_r: &[i64],
-        calldescr: &majit_translate::jitcode::BhCallDescr,
+        calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) {
         self.cpu()
             .bh_call_v(func, None, Some(args_r), None, calldescr);
@@ -2465,7 +2465,7 @@ impl BlackholeInterpreter {
         func: i64,
         args_i: &[i64],
         args_r: &[i64],
-        calldescr: &majit_translate::jitcode::BhCallDescr,
+        calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> i64 {
         self.cpu()
             .bh_call_i(func, Some(args_i), Some(args_r), None, calldescr)
@@ -2477,7 +2477,7 @@ impl BlackholeInterpreter {
         func: i64,
         args_i: &[i64],
         args_r: &[i64],
-        calldescr: &majit_translate::jitcode::BhCallDescr,
+        calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
         self.cpu()
             .bh_call_r(func, Some(args_i), Some(args_r), None, calldescr)
@@ -2489,7 +2489,7 @@ impl BlackholeInterpreter {
         func: i64,
         args_i: &[i64],
         args_r: &[i64],
-        calldescr: &majit_translate::jitcode::BhCallDescr,
+        calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) {
         self.cpu()
             .bh_call_v(func, Some(args_i), Some(args_r), None, calldescr);
@@ -2502,7 +2502,7 @@ impl BlackholeInterpreter {
         args_i: &[i64],
         args_r: &[i64],
         args_f: &[i64],
-        calldescr: &majit_translate::jitcode::BhCallDescr,
+        calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> i64 {
         self.cpu()
             .bh_call_i(func, Some(args_i), Some(args_r), Some(args_f), calldescr)
@@ -2515,7 +2515,7 @@ impl BlackholeInterpreter {
         args_i: &[i64],
         args_r: &[i64],
         args_f: &[i64],
-        calldescr: &majit_translate::jitcode::BhCallDescr,
+        calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
         self.cpu()
             .bh_call_r(func, Some(args_i), Some(args_r), Some(args_f), calldescr)
@@ -2528,7 +2528,7 @@ impl BlackholeInterpreter {
         args_i: &[i64],
         args_r: &[i64],
         args_f: &[i64],
-        calldescr: &majit_translate::jitcode::BhCallDescr,
+        calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> f64 {
         self.cpu()
             .bh_call_f(func, Some(args_i), Some(args_r), Some(args_f), calldescr)
@@ -2541,7 +2541,7 @@ impl BlackholeInterpreter {
         args_i: &[i64],
         args_r: &[i64],
         args_f: &[i64],
-        calldescr: &majit_translate::jitcode::BhCallDescr,
+        calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) {
         self.cpu()
             .bh_call_v(func, Some(args_i), Some(args_r), Some(args_f), calldescr);
@@ -2563,7 +2563,7 @@ impl BlackholeInterpreter {
         &self,
         fnaddr: i64,
         args_r: &[i64],
-        calldescr: &majit_translate::jitcode::BhCallDescr,
+        calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> i64 {
         self.cpu()
             .bh_call_i(fnaddr, None, Some(args_r), None, calldescr)
@@ -2573,7 +2573,7 @@ impl BlackholeInterpreter {
         &self,
         fnaddr: i64,
         args_r: &[i64],
-        calldescr: &majit_translate::jitcode::BhCallDescr,
+        calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
         self.cpu()
             .bh_call_r(fnaddr, None, Some(args_r), None, calldescr)
@@ -2583,7 +2583,7 @@ impl BlackholeInterpreter {
         &self,
         fnaddr: i64,
         args_r: &[i64],
-        calldescr: &majit_translate::jitcode::BhCallDescr,
+        calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) {
         self.cpu()
             .bh_call_v(fnaddr, None, Some(args_r), None, calldescr);
@@ -2594,7 +2594,7 @@ impl BlackholeInterpreter {
         fnaddr: i64,
         args_i: &[i64],
         args_r: &[i64],
-        calldescr: &majit_translate::jitcode::BhCallDescr,
+        calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> i64 {
         self.cpu()
             .bh_call_i(fnaddr, Some(args_i), Some(args_r), None, calldescr)
@@ -2605,7 +2605,7 @@ impl BlackholeInterpreter {
         fnaddr: i64,
         args_i: &[i64],
         args_r: &[i64],
-        calldescr: &majit_translate::jitcode::BhCallDescr,
+        calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
         self.cpu()
             .bh_call_r(fnaddr, Some(args_i), Some(args_r), None, calldescr)
@@ -2616,7 +2616,7 @@ impl BlackholeInterpreter {
         fnaddr: i64,
         args_i: &[i64],
         args_r: &[i64],
-        calldescr: &majit_translate::jitcode::BhCallDescr,
+        calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) {
         self.cpu()
             .bh_call_v(fnaddr, Some(args_i), Some(args_r), None, calldescr);
@@ -2628,7 +2628,7 @@ impl BlackholeInterpreter {
         args_i: &[i64],
         args_r: &[i64],
         args_f: &[i64],
-        calldescr: &majit_translate::jitcode::BhCallDescr,
+        calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> i64 {
         self.cpu()
             .bh_call_i(fnaddr, Some(args_i), Some(args_r), Some(args_f), calldescr)
@@ -2640,7 +2640,7 @@ impl BlackholeInterpreter {
         args_i: &[i64],
         args_r: &[i64],
         args_f: &[i64],
-        calldescr: &majit_translate::jitcode::BhCallDescr,
+        calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
         self.cpu()
             .bh_call_r(fnaddr, Some(args_i), Some(args_r), Some(args_f), calldescr)
@@ -2652,7 +2652,7 @@ impl BlackholeInterpreter {
         args_i: &[i64],
         args_r: &[i64],
         args_f: &[i64],
-        calldescr: &majit_translate::jitcode::BhCallDescr,
+        calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> f64 {
         self.cpu()
             .bh_call_f(fnaddr, Some(args_i), Some(args_r), Some(args_f), calldescr)
@@ -2664,7 +2664,7 @@ impl BlackholeInterpreter {
         args_i: &[i64],
         args_r: &[i64],
         args_f: &[i64],
-        calldescr: &majit_translate::jitcode::BhCallDescr,
+        calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) {
         self.cpu()
             .bh_call_v(fnaddr, Some(args_i), Some(args_r), Some(args_f), calldescr);
@@ -2770,7 +2770,7 @@ pub struct BlackholeInterpBuilder {
     pub _insns: Vec<String>,
     /// RPython `blackhole.py` `self.op_live = insns.get('live/', -1)`.
     ///
-    /// A missing key stores [`majit_translate::insns::BC_ABSENT`] rather than
+    /// A missing key stores [`majit_jitcode::insns::BC_ABSENT`] rather than
     /// upstream's `-1`.  The two carry the same guarantee for the
     /// `opcode == self.op_live` tests: `-1` cannot equal `ord(code[position])`
     /// because it is outside `0..=255`, and `BC_ABSENT` cannot because it is a
@@ -2839,9 +2839,9 @@ impl BlackholeInterpBuilder {
             blackholeinterps: None,
             cpu: None,
             _insns: Vec::new(),
-            op_live: majit_translate::insns::BC_ABSENT,
-            op_catch_exception: majit_translate::insns::BC_ABSENT,
-            op_rvmprof_code: majit_translate::insns::BC_ABSENT,
+            op_live: majit_jitcode::insns::BC_ABSENT,
+            op_catch_exception: majit_jitcode::insns::BC_ABSENT,
+            op_rvmprof_code: majit_jitcode::insns::BC_ABSENT,
             // blackhole.py `EMPTY_LIST_I = [] # shared`.
             descrs: EMPTY_DESCR_TABLE,
             dispatch_table: std::sync::Arc::new(vec![
@@ -2891,7 +2891,7 @@ impl BlackholeInterpBuilder {
     ) {
         let to_u8 = |opcode: i32| -> u8 {
             if opcode < 0 {
-                majit_translate::insns::BC_ABSENT
+                majit_jitcode::insns::BC_ABSENT
             } else {
                 u8::try_from(opcode).expect("cached blackhole opcode does not fit in u8")
             }
@@ -4603,7 +4603,7 @@ mod tests {
         /// every key here is the upstream-canonical opname/argcodes
         /// pair (no `_u16_ext` suffix).
         fn build_test_bh_builder() -> BlackholeInterpBuilder {
-            use majit_translate::insns;
+            use majit_jitcode::insns;
             let mut builder = BlackholeInterpBuilder::new();
             let mut entries: indexmap::IndexMap<String, u8> = indexmap::IndexMap::new();
             entries.insert("int_copy/i>i".to_string(), insns::BC_MOVE_I);
@@ -4646,7 +4646,7 @@ mod tests {
         #[test]
         fn test_convert_and_run_from_pyjitpl_starts_at_frame_pc() {
             use crate::pyjitpl::{MIFrame, MIFrameStack};
-            use majit_translate::insns;
+            use majit_jitcode::insns;
 
             let mut b = JitCodeBuilder::default();
             // pc 0 — never executed.
@@ -5298,7 +5298,7 @@ mod tests {
         /// catch that — an absent key has no table slot to be a placeholder in.
         #[test]
         fn production_bh_builder_wires_every_canonical_inline_call_byte() {
-            use majit_translate::insns;
+            use majit_jitcode::insns;
             let builder = super::build_inline_call_only_bh_builder();
             let placeholder = super::unwired_handler_placeholder as super::BhOpcodeHandler;
             for (opname, byte) in [
@@ -5328,7 +5328,7 @@ mod tests {
         fn production_bh_builder_wires_cast_int_to_float() {
             let builder = super::build_inline_call_only_bh_builder();
             let placeholder = super::unwired_handler_placeholder as super::BhOpcodeHandler;
-            let byte = majit_translate::insns::BC_CAST_INT_TO_FLOAT;
+            let byte = majit_jitcode::insns::BC_CAST_INT_TO_FLOAT;
             let slot = builder.dispatch_table[byte as usize];
             assert_ne!(
                 slot as usize, placeholder as usize,
@@ -5344,7 +5344,7 @@ mod tests {
         fn production_bh_builder_wires_cast_float_to_int() {
             let builder = super::build_inline_call_only_bh_builder();
             let placeholder = super::unwired_handler_placeholder as super::BhOpcodeHandler;
-            let byte = majit_translate::insns::BC_CAST_FLOAT_TO_INT;
+            let byte = majit_jitcode::insns::BC_CAST_FLOAT_TO_INT;
             let slot = builder.dispatch_table[byte as usize];
             assert_ne!(
                 slot as usize, placeholder as usize,
@@ -5358,7 +5358,7 @@ mod tests {
         /// register their emitted bytes so `setup_insns` can bind them.
         #[test]
         fn production_bh_builder_wires_every_interior_field_load() {
-            use majit_translate::insns;
+            use majit_jitcode::insns;
             let builder = super::build_inline_call_only_bh_builder();
             let placeholder = super::unwired_handler_placeholder as super::BhOpcodeHandler;
             for (opname, byte) in [
@@ -5394,8 +5394,8 @@ mod tests {
             assert!(!super::is_symbolic_fnaddr(real));
             assert!(super::is_callable_fnaddr(real));
 
-            let symbolic = majit_translate::codewriter::call::SYMBOLIC_FNADDR_BASE as i64
-                | 0x1234_5678_9abc_i64;
+            let symbolic =
+                majit_jitcode::codewriter::call::SYMBOLIC_FNADDR_BASE as i64 | 0x1234_5678_9abc_i64;
             assert!(super::is_symbolic_fnaddr(symbolic));
             assert!(!super::is_callable_fnaddr(symbolic));
 
@@ -5434,8 +5434,8 @@ mod tests {
                 super::handler_residual_call_r_r,
                 super::handler_residual_call_r_v,
             ];
-            let symbolic = majit_translate::codewriter::call::SYMBOLIC_FNADDR_BASE as i64
-                | 0x1234_5678_9abc_i64;
+            let symbolic =
+                majit_jitcode::codewriter::call::SYMBOLIC_FNADDR_BASE as i64 | 0x1234_5678_9abc_i64;
             for target in [0, symbolic] {
                 for handler in handlers {
                     let mut builder = BlackholeInterpBuilder::new();
@@ -6023,7 +6023,7 @@ mod tests {
 
         #[test]
         fn test_guard_exception_resume_uses_operation_owned_trailing_live() {
-            let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+            let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
             let mut b = JitCodeBuilder::default();
             b.load_const_r_value(0, 1);
             b.load_const_i_value(0, 2);
@@ -6053,7 +6053,7 @@ mod tests {
 
         #[test]
         fn test_guard_exception_resume_does_not_steal_later_operation_catch() {
-            let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+            let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
             let mut b = JitCodeBuilder::default();
             let resume_pc = b.current_pos();
             b.live(&mut asm, &[], &[], &[]);
@@ -6706,9 +6706,9 @@ mod tests {
         #[test]
         fn default_bh_builder_unwired_set_matches_task_85_snapshot() {
             let mut insns: indexmap::IndexMap<String, u8> = indexmap::IndexMap::new();
-            for (opname, byte) in majit_translate::insns::wellknown_bh_insns()
+            for (opname, byte) in majit_jitcode::insns::wellknown_bh_insns()
                 .into_iter()
-                .chain(majit_translate::insns::extension_insns())
+                .chain(majit_jitcode::insns::extension_insns())
             {
                 insns.insert(opname.to_string(), byte);
             }
@@ -6742,13 +6742,13 @@ mod tests {
             let builder = super::build_inline_call_only_bh_builder();
             let placeholder = super::unwired_handler_placeholder as *const () as usize;
             for byte in [
-                majit_translate::insns::BC_FLOAT_LT,
-                majit_translate::insns::BC_FLOAT_LE,
-                majit_translate::insns::BC_FLOAT_EQ,
-                majit_translate::insns::BC_FLOAT_NE,
-                majit_translate::insns::BC_FLOAT_GT,
-                majit_translate::insns::BC_FLOAT_GE,
-                majit_translate::insns::BC_RAW_LOAD_F,
+                majit_jitcode::insns::BC_FLOAT_LT,
+                majit_jitcode::insns::BC_FLOAT_LE,
+                majit_jitcode::insns::BC_FLOAT_EQ,
+                majit_jitcode::insns::BC_FLOAT_NE,
+                majit_jitcode::insns::BC_FLOAT_GT,
+                majit_jitcode::insns::BC_FLOAT_GE,
+                majit_jitcode::insns::BC_RAW_LOAD_F,
             ] {
                 assert_ne!(
                     builder.dispatch_table[byte as usize] as *const () as usize, placeholder,
@@ -10313,7 +10313,7 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     let mut insns: indexmap::IndexMap<String, u8> = indexmap::IndexMap::new();
     insns.insert(
         "inline_call_nested_ext/P".to_string(),
-        majit_translate::insns::BC_INLINE_CALL,
+        majit_jitcode::insns::BC_INLINE_CALL,
     );
     // Leftover `_ext/P` adapters. Jitcode no longer emits CALL_ASSEMBLER;
     // the keys stay so a leftover byte still reaches `wire_handler`.
@@ -10322,39 +10322,39 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     for (key, byte) in [
         (
             "call_assembler_int_ext/P",
-            majit_translate::insns::BC_CALL_ASSEMBLER_INT,
+            majit_jitcode::insns::BC_CALL_ASSEMBLER_INT,
         ),
         (
             "call_assembler_ref_ext/P",
-            majit_translate::insns::BC_CALL_ASSEMBLER_REF,
+            majit_jitcode::insns::BC_CALL_ASSEMBLER_REF,
         ),
         (
             "call_assembler_float_ext/P",
-            majit_translate::insns::BC_CALL_ASSEMBLER_FLOAT,
+            majit_jitcode::insns::BC_CALL_ASSEMBLER_FLOAT,
         ),
         (
             "call_assembler_void_ext/P",
-            majit_translate::insns::BC_CALL_ASSEMBLER_VOID,
+            majit_jitcode::insns::BC_CALL_ASSEMBLER_VOID,
         ),
         (
             "cond_call_void_ext/P",
-            majit_translate::insns::BC_COND_CALL_VOID,
+            majit_jitcode::insns::BC_COND_CALL_VOID,
         ),
         (
             "cond_call_value_int_ext/P",
-            majit_translate::insns::BC_COND_CALL_VALUE_INT,
+            majit_jitcode::insns::BC_COND_CALL_VALUE_INT,
         ),
         (
             "cond_call_value_ref_ext/P",
-            majit_translate::insns::BC_COND_CALL_VALUE_REF,
+            majit_jitcode::insns::BC_COND_CALL_VALUE_REF,
         ),
         (
             "record_known_result_int_ext/P",
-            majit_translate::insns::BC_RECORD_KNOWN_RESULT_INT,
+            majit_jitcode::insns::BC_RECORD_KNOWN_RESULT_INT,
         ),
         (
             "record_known_result_ref_ext/P",
-            majit_translate::insns::BC_RECORD_KNOWN_RESULT_REF,
+            majit_jitcode::insns::BC_RECORD_KNOWN_RESULT_REF,
         ),
     ] {
         insns.insert(key.to_string(), byte);
@@ -10372,51 +10372,45 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     //     payload via `self.position`-mutating helpers; the IRFIRF
     //     register-list bytes are u8 in BOTH the emit-side and the
     //     decoder.
-    insns.insert("live/".to_string(), majit_translate::insns::BC_LIVE);
+    insns.insert("live/".to_string(), majit_jitcode::insns::BC_LIVE);
     insns.insert(
         "loop_header/i".to_string(),
-        majit_translate::insns::BC_LOOP_HEADER,
+        majit_jitcode::insns::BC_LOOP_HEADER,
     );
-    insns.insert("goto/L".to_string(), majit_translate::insns::BC_JUMP);
+    insns.insert("goto/L".to_string(), majit_jitcode::insns::BC_JUMP);
     insns.insert(
         "catch_exception/L".to_string(),
-        majit_translate::insns::BC_CATCH_EXCEPTION,
+        majit_jitcode::insns::BC_CATCH_EXCEPTION,
     );
     insns.insert(
         "jit_merge_point/cIRFIRF".to_string(),
-        majit_translate::insns::BC_JIT_MERGE_POINT_C,
+        majit_jitcode::insns::BC_JIT_MERGE_POINT_C,
     );
     // A1/A2 canonical-encoded family — `int_copy/i>i`, `ref_copy/r>r`,
     // `ref_return/r`, `raise/r`, `last_exc_value/>r` all emit 1-byte
     // register operands matching the canonical bhhandler decoders.
-    insns.insert(
-        "int_copy/i>i".to_string(),
-        majit_translate::insns::BC_MOVE_I,
-    );
+    insns.insert("int_copy/i>i".to_string(), majit_jitcode::insns::BC_MOVE_I);
     // `int_copy/c>i` — USE_C_FORM short source (`assembler.py`): a small
     // ConstInt materialised inline as one signed byte instead of a pool slot.
     // pyre emits this for every small int/bool constant, so the production
     // blackhole must dispatch it; `handler_int_copy_c` decodes via `signedord`.
     insns.insert(
         "int_copy/c>i".to_string(),
-        majit_translate::insns::BC_MOVE_I_C,
+        majit_jitcode::insns::BC_MOVE_I_C,
     );
-    insns.insert(
-        "ref_copy/r>r".to_string(),
-        majit_translate::insns::BC_MOVE_R,
-    );
+    insns.insert("ref_copy/r>r".to_string(), majit_jitcode::insns::BC_MOVE_R);
     insns.insert(
         "ref_return/r".to_string(),
-        majit_translate::insns::BC_REF_RETURN,
+        majit_jitcode::insns::BC_REF_RETURN,
     );
-    insns.insert("raise/r".to_string(), majit_translate::insns::BC_RAISE);
+    insns.insert("raise/r".to_string(), majit_jitcode::insns::BC_RAISE);
     insns.insert(
         "last_exc_value/>r".to_string(),
-        majit_translate::insns::BC_LAST_EXC_VALUE,
+        majit_jitcode::insns::BC_LAST_EXC_VALUE,
     );
     insns.insert(
         "goto_if_not_int_is_true/iL".to_string(),
-        majit_translate::insns::BC_GOTO_IF_NOT_INT_IS_TRUE,
+        majit_jitcode::insns::BC_GOTO_IF_NOT_INT_IS_TRUE,
     );
     // `blackhole.py bhimpl_goto_if_not_int_is_true = bhimpl_goto_if_not`
     // — both `(opname, argcodes)` keys route to the same handler body.
@@ -10425,7 +10419,7 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // distinct from the alias byte (`BC_GOTO_IF_NOT_INT_IS_TRUE`).
     insns.insert(
         "goto_if_not/iL".to_string(),
-        majit_translate::insns::BC_GOTO_IF_NOT,
+        majit_jitcode::insns::BC_GOTO_IF_NOT,
     );
     // Cover the BC_* set the inline_call-only test
     // fixtures emit (`int_return`, `float_return`, `int_add`,
@@ -10436,53 +10430,50 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // canonical `handler_*` decoders wired in `wire_bhimpl_handlers`.
     insns.insert(
         "int_return/i".to_string(),
-        majit_translate::insns::BC_INT_RETURN,
+        majit_jitcode::insns::BC_INT_RETURN,
     );
     // `int_return/c` — USE_C_FORM short source (`assembler.py`): a small
     // const-int return value emitted inline as one signed byte.
     insns.insert(
         "int_return/c".to_string(),
-        majit_translate::insns::BC_INT_RETURN_C,
+        majit_jitcode::insns::BC_INT_RETURN_C,
     );
     insns.insert(
         "float_return/f".to_string(),
-        majit_translate::insns::BC_FLOAT_RETURN,
+        majit_jitcode::insns::BC_FLOAT_RETURN,
     );
     insns.insert(
         "void_return/".to_string(),
-        majit_translate::insns::BC_VOID_RETURN,
+        majit_jitcode::insns::BC_VOID_RETURN,
     );
     insns.insert(
         "float_copy/f>f".to_string(),
-        majit_translate::insns::BC_MOVE_F,
+        majit_jitcode::insns::BC_MOVE_F,
     );
     // A5 epic: full int binop+cmp+uint family (`record_binop_i` emit
     // shape), canonical 1-byte register encoding with `[lhs][rhs][dst]`
     // operand order matching `bhhandler_ii_i!`.
     for (key, byte) in [
-        ("int_add/ii>i", majit_translate::insns::BC_INT_ADD),
-        ("int_sub/ii>i", majit_translate::insns::BC_INT_SUB),
-        ("int_mul/ii>i", majit_translate::insns::BC_INT_MUL),
-        ("int_and/ii>i", majit_translate::insns::BC_INT_AND),
-        ("int_or/ii>i", majit_translate::insns::BC_INT_OR),
-        ("int_xor/ii>i", majit_translate::insns::BC_INT_XOR),
-        ("int_lshift/ii>i", majit_translate::insns::BC_INT_LSHIFT),
-        ("int_rshift/ii>i", majit_translate::insns::BC_INT_RSHIFT),
-        ("int_eq/ii>i", majit_translate::insns::BC_INT_EQ),
-        ("int_ne/ii>i", majit_translate::insns::BC_INT_NE),
-        ("int_lt/ii>i", majit_translate::insns::BC_INT_LT),
-        ("int_le/ii>i", majit_translate::insns::BC_INT_LE),
-        ("int_gt/ii>i", majit_translate::insns::BC_INT_GT),
-        ("int_ge/ii>i", majit_translate::insns::BC_INT_GE),
-        ("uint_lt/ii>i", majit_translate::insns::BC_UINT_LT),
-        ("uint_le/ii>i", majit_translate::insns::BC_UINT_LE),
-        ("uint_gt/ii>i", majit_translate::insns::BC_UINT_GT),
-        ("uint_ge/ii>i", majit_translate::insns::BC_UINT_GE),
-        ("uint_rshift/ii>i", majit_translate::insns::BC_UINT_RSHIFT),
-        (
-            "uint_mul_high/ii>i",
-            majit_translate::insns::BC_UINT_MUL_HIGH,
-        ),
+        ("int_add/ii>i", majit_jitcode::insns::BC_INT_ADD),
+        ("int_sub/ii>i", majit_jitcode::insns::BC_INT_SUB),
+        ("int_mul/ii>i", majit_jitcode::insns::BC_INT_MUL),
+        ("int_and/ii>i", majit_jitcode::insns::BC_INT_AND),
+        ("int_or/ii>i", majit_jitcode::insns::BC_INT_OR),
+        ("int_xor/ii>i", majit_jitcode::insns::BC_INT_XOR),
+        ("int_lshift/ii>i", majit_jitcode::insns::BC_INT_LSHIFT),
+        ("int_rshift/ii>i", majit_jitcode::insns::BC_INT_RSHIFT),
+        ("int_eq/ii>i", majit_jitcode::insns::BC_INT_EQ),
+        ("int_ne/ii>i", majit_jitcode::insns::BC_INT_NE),
+        ("int_lt/ii>i", majit_jitcode::insns::BC_INT_LT),
+        ("int_le/ii>i", majit_jitcode::insns::BC_INT_LE),
+        ("int_gt/ii>i", majit_jitcode::insns::BC_INT_GT),
+        ("int_ge/ii>i", majit_jitcode::insns::BC_INT_GE),
+        ("uint_lt/ii>i", majit_jitcode::insns::BC_UINT_LT),
+        ("uint_le/ii>i", majit_jitcode::insns::BC_UINT_LE),
+        ("uint_gt/ii>i", majit_jitcode::insns::BC_UINT_GT),
+        ("uint_ge/ii>i", majit_jitcode::insns::BC_UINT_GE),
+        ("uint_rshift/ii>i", majit_jitcode::insns::BC_UINT_RSHIFT),
+        ("uint_mul_high/ii>i", majit_jitcode::insns::BC_UINT_MUL_HIGH),
     ] {
         insns.insert(key.to_string(), byte);
     }
@@ -10490,8 +10481,8 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // 14 keys covering record_unary_i/f, record_binop_f, record_binop_r,
     // and ptr_iszero/nonzero (`jitcode/assembler.rs`).
     for (key, byte) in [
-        ("int_neg/i>i", majit_translate::insns::BC_INT_NEG),
-        ("int_invert/i>i", majit_translate::insns::BC_INT_INVERT),
+        ("int_neg/i>i", majit_jitcode::insns::BC_INT_NEG),
+        ("int_invert/i>i", majit_jitcode::insns::BC_INT_INVERT),
         // `int_is_true/i>i` — `@arguments("i", returns="i")` unary
         // (`blackhole.py bhimpl_int_is_true`). Emitted as the
         // loop-condition test of any int-typed `while`, including the
@@ -10499,53 +10490,50 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         // handler is wired in `wire_bhimpl_handlers` but the byte was
         // absent from this curated set, so a blackhole-executed drain hit
         // the unwired-opcode panic at the first back-edge test.
-        ("int_is_true/i>i", majit_translate::insns::BC_INT_IS_TRUE),
+        ("int_is_true/i>i", majit_jitcode::insns::BC_INT_IS_TRUE),
         // `int_is_zero/i>i` — the `not a` sibling of `int_is_true`
         // (`blackhole.py bhimpl_int_is_zero`).  Same wiring gap as the
         // entry above: `wire_bhimpl_handlers` binds `handler_int_is_zero`,
         // so without the byte here `wire_handler` no-ops and a
         // blackhole-executed `x == 0` test hits the unwired-opcode panic.
-        ("int_is_zero/i>i", majit_translate::insns::BC_INT_IS_ZERO),
-        ("float_add/ff>f", majit_translate::insns::BC_FLOAT_ADD),
-        ("float_sub/ff>f", majit_translate::insns::BC_FLOAT_SUB),
-        ("float_mul/ff>f", majit_translate::insns::BC_FLOAT_MUL),
-        (
-            "float_truediv/ff>f",
-            majit_translate::insns::BC_FLOAT_TRUEDIV,
-        ),
+        ("int_is_zero/i>i", majit_jitcode::insns::BC_INT_IS_ZERO),
+        ("float_add/ff>f", majit_jitcode::insns::BC_FLOAT_ADD),
+        ("float_sub/ff>f", majit_jitcode::insns::BC_FLOAT_SUB),
+        ("float_mul/ff>f", majit_jitcode::insns::BC_FLOAT_MUL),
+        ("float_truediv/ff>f", majit_jitcode::insns::BC_FLOAT_TRUEDIV),
         // `cast_int_to_float/i>f` — `IntegerRepr.rtype_float` /
         // `_truediv`'s `float(x)`.  Handler is already wired
         // (`bhimpl_cast_int_to_float`); the byte was only in the
         // overlay-only gap until the codewriter started emitting it.
         (
             "cast_int_to_float/i>f",
-            majit_translate::insns::BC_CAST_INT_TO_FLOAT,
+            majit_jitcode::insns::BC_CAST_INT_TO_FLOAT,
         ),
-        ("float_neg/f>f", majit_translate::insns::BC_FLOAT_NEG),
-        ("float_abs/f>f", majit_translate::insns::BC_FLOAT_ABS),
+        ("float_neg/f>f", majit_jitcode::insns::BC_FLOAT_NEG),
+        ("float_abs/f>f", majit_jitcode::insns::BC_FLOAT_ABS),
         // Float value-comparisons materialized as an int result (e.g. a
         // dispatch arm writing `(a >= b) as i64`).  Their `bhimpl_*`
         // handlers are wired in `wire_bhimpl_handlers`; without the map
         // entry `wire_handler` no-ops and a forward resume through the
         // opcode hits the unwired-byte panic.
-        ("float_lt/ff>i", majit_translate::insns::BC_FLOAT_LT),
-        ("float_le/ff>i", majit_translate::insns::BC_FLOAT_LE),
-        ("float_eq/ff>i", majit_translate::insns::BC_FLOAT_EQ),
-        ("float_ne/ff>i", majit_translate::insns::BC_FLOAT_NE),
-        ("float_gt/ff>i", majit_translate::insns::BC_FLOAT_GT),
-        ("float_ge/ff>i", majit_translate::insns::BC_FLOAT_GE),
-        ("ptr_eq/rr>i", majit_translate::insns::BC_PTR_EQ),
-        ("ptr_ne/rr>i", majit_translate::insns::BC_PTR_NE),
+        ("float_lt/ff>i", majit_jitcode::insns::BC_FLOAT_LT),
+        ("float_le/ff>i", majit_jitcode::insns::BC_FLOAT_LE),
+        ("float_eq/ff>i", majit_jitcode::insns::BC_FLOAT_EQ),
+        ("float_ne/ff>i", majit_jitcode::insns::BC_FLOAT_NE),
+        ("float_gt/ff>i", majit_jitcode::insns::BC_FLOAT_GT),
+        ("float_ge/ff>i", majit_jitcode::insns::BC_FLOAT_GE),
+        ("ptr_eq/rr>i", majit_jitcode::insns::BC_PTR_EQ),
+        ("ptr_ne/rr>i", majit_jitcode::insns::BC_PTR_NE),
         (
             "instance_ptr_eq/rr>i",
-            majit_translate::insns::BC_INSTANCE_PTR_EQ,
+            majit_jitcode::insns::BC_INSTANCE_PTR_EQ,
         ),
         (
             "instance_ptr_ne/rr>i",
-            majit_translate::insns::BC_INSTANCE_PTR_NE,
+            majit_jitcode::insns::BC_INSTANCE_PTR_NE,
         ),
-        ("ptr_iszero/r>i", majit_translate::insns::BC_PTR_ISZERO),
-        ("ptr_nonzero/r>i", majit_translate::insns::BC_PTR_NONZERO),
+        ("ptr_iszero/r>i", majit_jitcode::insns::BC_PTR_ISZERO),
+        ("ptr_nonzero/r>i", majit_jitcode::insns::BC_PTR_NONZERO),
     ] {
         insns.insert(key.to_string(), byte);
     }
@@ -10555,75 +10543,75 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     for (key, byte) in [
         (
             "goto_if_not_int_lt/iiL",
-            majit_translate::insns::BC_GOTO_IF_NOT_INT_LT,
+            majit_jitcode::insns::BC_GOTO_IF_NOT_INT_LT,
         ),
         (
             "goto_if_not_int_le/iiL",
-            majit_translate::insns::BC_GOTO_IF_NOT_INT_LE,
+            majit_jitcode::insns::BC_GOTO_IF_NOT_INT_LE,
         ),
         (
             "goto_if_not_int_eq/iiL",
-            majit_translate::insns::BC_GOTO_IF_NOT_INT_EQ,
+            majit_jitcode::insns::BC_GOTO_IF_NOT_INT_EQ,
         ),
         (
             "goto_if_not_int_ne/iiL",
-            majit_translate::insns::BC_GOTO_IF_NOT_INT_NE,
+            majit_jitcode::insns::BC_GOTO_IF_NOT_INT_NE,
         ),
         (
             "goto_if_not_int_gt/iiL",
-            majit_translate::insns::BC_GOTO_IF_NOT_INT_GT,
+            majit_jitcode::insns::BC_GOTO_IF_NOT_INT_GT,
         ),
         (
             "goto_if_not_int_ge/iiL",
-            majit_translate::insns::BC_GOTO_IF_NOT_INT_GE,
+            majit_jitcode::insns::BC_GOTO_IF_NOT_INT_GE,
         ),
         (
             "goto_if_not_float_lt/ffL",
-            majit_translate::insns::BC_GOTO_IF_NOT_FLOAT_LT,
+            majit_jitcode::insns::BC_GOTO_IF_NOT_FLOAT_LT,
         ),
         (
             "goto_if_not_float_le/ffL",
-            majit_translate::insns::BC_GOTO_IF_NOT_FLOAT_LE,
+            majit_jitcode::insns::BC_GOTO_IF_NOT_FLOAT_LE,
         ),
         (
             "goto_if_not_float_eq/ffL",
-            majit_translate::insns::BC_GOTO_IF_NOT_FLOAT_EQ,
+            majit_jitcode::insns::BC_GOTO_IF_NOT_FLOAT_EQ,
         ),
         (
             "goto_if_not_float_ne/ffL",
-            majit_translate::insns::BC_GOTO_IF_NOT_FLOAT_NE,
+            majit_jitcode::insns::BC_GOTO_IF_NOT_FLOAT_NE,
         ),
         (
             "goto_if_not_float_gt/ffL",
-            majit_translate::insns::BC_GOTO_IF_NOT_FLOAT_GT,
+            majit_jitcode::insns::BC_GOTO_IF_NOT_FLOAT_GT,
         ),
         (
             "goto_if_not_float_ge/ffL",
-            majit_translate::insns::BC_GOTO_IF_NOT_FLOAT_GE,
+            majit_jitcode::insns::BC_GOTO_IF_NOT_FLOAT_GE,
         ),
         (
             "goto_if_not_ptr_eq/rrL",
-            majit_translate::insns::BC_GOTO_IF_NOT_PTR_EQ,
+            majit_jitcode::insns::BC_GOTO_IF_NOT_PTR_EQ,
         ),
         (
             "goto_if_not_ptr_ne/rrL",
-            majit_translate::insns::BC_GOTO_IF_NOT_PTR_NE,
+            majit_jitcode::insns::BC_GOTO_IF_NOT_PTR_NE,
         ),
         (
             "goto_if_not_int_is_zero/iL",
-            majit_translate::insns::BC_GOTO_IF_NOT_INT_IS_ZERO,
+            majit_jitcode::insns::BC_GOTO_IF_NOT_INT_IS_ZERO,
         ),
         (
             "goto_if_not_ptr_iszero/rL",
-            majit_translate::insns::BC_GOTO_IF_NOT_PTR_ISZERO,
+            majit_jitcode::insns::BC_GOTO_IF_NOT_PTR_ISZERO,
         ),
         (
             "goto_if_exception_mismatch/iL",
-            majit_translate::insns::BC_GOTO_IF_EXCEPTION_MISMATCH,
+            majit_jitcode::insns::BC_GOTO_IF_EXCEPTION_MISMATCH,
         ),
         (
             "goto_if_not_ptr_nonzero/rL",
-            majit_translate::insns::BC_GOTO_IF_NOT_PTR_NONZERO,
+            majit_jitcode::insns::BC_GOTO_IF_NOT_PTR_NONZERO,
         ),
     ] {
         insns.insert(key.to_string(), byte);
@@ -10636,78 +10624,75 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         // state_field/array/varray — canonical handlers wire directly.
         (
             "load_state_field_ref/dr",
-            majit_translate::insns::BC_LOAD_STATE_FIELD_REF,
+            majit_jitcode::insns::BC_LOAD_STATE_FIELD_REF,
         ),
         (
             "store_state_field_ref/dr",
-            majit_translate::insns::BC_STORE_STATE_FIELD_REF,
+            majit_jitcode::insns::BC_STORE_STATE_FIELD_REF,
         ),
         (
             "load_state_field/di",
-            majit_translate::insns::BC_LOAD_STATE_FIELD,
+            majit_jitcode::insns::BC_LOAD_STATE_FIELD,
         ),
         (
             "store_state_field/di",
-            majit_translate::insns::BC_STORE_STATE_FIELD,
+            majit_jitcode::insns::BC_STORE_STATE_FIELD,
         ),
         (
             "load_state_field_float/df",
-            majit_translate::insns::BC_LOAD_STATE_FIELD_FLOAT,
+            majit_jitcode::insns::BC_LOAD_STATE_FIELD_FLOAT,
         ),
         (
             "store_state_field_float/df",
-            majit_translate::insns::BC_STORE_STATE_FIELD_FLOAT,
+            majit_jitcode::insns::BC_STORE_STATE_FIELD_FLOAT,
         ),
         (
             "load_state_array/dii",
-            majit_translate::insns::BC_LOAD_STATE_ARRAY,
+            majit_jitcode::insns::BC_LOAD_STATE_ARRAY,
         ),
         (
             "store_state_array/dii",
-            majit_translate::insns::BC_STORE_STATE_ARRAY,
+            majit_jitcode::insns::BC_STORE_STATE_ARRAY,
         ),
         // A3 epic: push/pop family migrated to canonical 1-byte register
         // encoding; handlers wired in `wire_bhimpl_handlers` decode via
         // `code[position]` (`bhhandler_push_*` / `bhhandler_pop_*`).
-        ("int_push/i", majit_translate::insns::BC_INT_PUSH),
-        ("int_pop/>i", majit_translate::insns::BC_INT_POP),
-        ("ref_push/r", majit_translate::insns::BC_REF_PUSH),
-        ("ref_pop/>r", majit_translate::insns::BC_REF_POP),
-        ("float_push/f", majit_translate::insns::BC_FLOAT_PUSH),
-        ("float_pop/>f", majit_translate::insns::BC_FLOAT_POP),
+        ("int_push/i", majit_jitcode::insns::BC_INT_PUSH),
+        ("int_pop/>i", majit_jitcode::insns::BC_INT_POP),
+        ("ref_push/r", majit_jitcode::insns::BC_REF_PUSH),
+        ("ref_pop/>r", majit_jitcode::insns::BC_REF_POP),
+        ("float_push/f", majit_jitcode::insns::BC_FLOAT_PUSH),
+        ("float_pop/>f", majit_jitcode::insns::BC_FLOAT_POP),
         // guard_value canonical — 1-byte register, blackhole no-op.
         (
             "int_guard_value/i",
-            majit_translate::insns::BC_INT_GUARD_VALUE,
+            majit_jitcode::insns::BC_INT_GUARD_VALUE,
         ),
         (
             "ref_guard_value/r",
-            majit_translate::insns::BC_REF_GUARD_VALUE,
+            majit_jitcode::insns::BC_REF_GUARD_VALUE,
         ),
         (
             "float_guard_value/f",
-            majit_translate::insns::BC_FLOAT_GUARD_VALUE,
+            majit_jitcode::insns::BC_FLOAT_GUARD_VALUE,
         ),
         // last_exception canonical — 1-byte dst register.
-        (
-            "last_exception/>i",
-            majit_translate::insns::BC_LAST_EXCEPTION,
-        ),
+        ("last_exception/>i", majit_jitcode::insns::BC_LAST_EXCEPTION),
         // operand-less canonical (byte-identical between pyre and RPython).
-        ("reraise/", majit_translate::insns::BC_RERAISE),
-        ("unreachable/", majit_translate::insns::BC_UNREACHABLE),
+        ("reraise/", majit_jitcode::insns::BC_RERAISE),
+        ("unreachable/", majit_jitcode::insns::BC_UNREACHABLE),
         // jit_merge_point variant 2 (jdindex via const-pool).
         (
             "jit_merge_point/iIRFIRF",
-            majit_translate::insns::BC_JIT_MERGE_POINT,
+            majit_jitcode::insns::BC_JIT_MERGE_POINT,
         ),
     ] {
         insns.insert(key.to_string(), byte);
     }
-    insns.insert("abort/".to_string(), majit_translate::insns::BC_ABORT);
+    insns.insert("abort/".to_string(), majit_jitcode::insns::BC_ABORT);
     insns.insert(
         "abort_permanent/".to_string(),
-        majit_translate::insns::BC_ABORT_PERMANENT,
+        majit_jitcode::insns::BC_ABORT_PERMANENT,
     );
     // The canonical MIR dyn-call path is now a concrete vtable FieldRead plus
     // IndirectCall (`ClassRepr.getclsfield` / `FunctionReprBase.call`).  Keep
@@ -10715,13 +10700,13 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // jitcodes; its handler safely bails to the source interpreter.
     insns.insert(
         "vtable_method_ptr/rd>i".to_string(),
-        majit_translate::insns::BC_VTABLE_METHOD_PTR,
+        majit_jitcode::insns::BC_VTABLE_METHOD_PTR,
     );
     // blackhole.py bhimpl_switch. `handler_switch` is wired in
     // `wire_bhimpl_handlers` but the byte was absent from this builder's
     // insns map, so a deopt through a `switch/id` op landed on the
     // unwired-opcode placeholder. RPython's setup_insns binds every opname.
-    insns.insert("switch/id".to_string(), majit_translate::insns::BC_SWITCH);
+    insns.insert("switch/id".to_string(), majit_jitcode::insns::BC_SWITCH);
     // GC heap field load/store — `blackhole.py:1432-1481 bhimpl_
     // {get,set}field_gc_{i,r,f}`.  `handler_{get,set}field_gc_*` are wired
     // in `wire_bhimpl_handlers` and the canonical bytes exist in
@@ -10735,45 +10720,27 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // assembler emits `/rd>X` / `/rid`.  An Int-bank leftover is the
     // raw family.  Additive: every byte is currently unwired.
     for (key, byte) in [
-        (
-            "getfield_gc_i/rd>i",
-            majit_translate::insns::BC_GETFIELD_GC_I,
-        ),
-        (
-            "getfield_gc_r/rd>r",
-            majit_translate::insns::BC_GETFIELD_GC_R,
-        ),
-        (
-            "getfield_gc_f/rd>f",
-            majit_translate::insns::BC_GETFIELD_GC_F,
-        ),
-        (
-            "setfield_gc_i/rid",
-            majit_translate::insns::BC_SETFIELD_GC_I,
-        ),
+        ("getfield_gc_i/rd>i", majit_jitcode::insns::BC_GETFIELD_GC_I),
+        ("getfield_gc_r/rd>r", majit_jitcode::insns::BC_GETFIELD_GC_R),
+        ("getfield_gc_f/rd>f", majit_jitcode::insns::BC_GETFIELD_GC_F),
+        ("setfield_gc_i/rid", majit_jitcode::insns::BC_SETFIELD_GC_I),
         (
             "setfield_gc_i/rcd",
-            majit_translate::insns::BC_SETFIELD_GC_I_C,
+            majit_jitcode::insns::BC_SETFIELD_GC_I_C,
         ),
-        (
-            "setfield_gc_r/rrd",
-            majit_translate::insns::BC_SETFIELD_GC_R,
-        ),
-        (
-            "setfield_gc_f/rfd",
-            majit_translate::insns::BC_SETFIELD_GC_F,
-        ),
+        ("setfield_gc_r/rrd", majit_jitcode::insns::BC_SETFIELD_GC_R),
+        ("setfield_gc_f/rfd", majit_jitcode::insns::BC_SETFIELD_GC_F),
         (
             "getfield_gc_i_pure/rd>i",
-            majit_translate::insns::BC_GETFIELD_GC_I_PURE,
+            majit_jitcode::insns::BC_GETFIELD_GC_I_PURE,
         ),
         (
             "getfield_gc_r_pure/rd>r",
-            majit_translate::insns::BC_GETFIELD_GC_R_PURE,
+            majit_jitcode::insns::BC_GETFIELD_GC_R_PURE,
         ),
         (
             "getfield_gc_f_pure/rd>f",
-            majit_translate::insns::BC_GETFIELD_GC_F_PURE,
+            majit_jitcode::insns::BC_GETFIELD_GC_F_PURE,
         ),
     ] {
         insns.insert(key.to_string(), byte);
@@ -10789,66 +10756,66 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // width adapters.
     insns.insert(
         "residual_call_r_v/iRd".to_string(),
-        majit_translate::insns::BC_RESIDUAL_CALL_R_V,
+        majit_jitcode::insns::BC_RESIDUAL_CALL_R_V,
     );
     insns.insert(
         "residual_call_r_i/iRd>i".to_string(),
-        majit_translate::insns::BC_RESIDUAL_CALL_R_I,
+        majit_jitcode::insns::BC_RESIDUAL_CALL_R_I,
     );
     insns.insert(
         "residual_call_r_r/iRd>r".to_string(),
-        majit_translate::insns::BC_RESIDUAL_CALL_R_R,
+        majit_jitcode::insns::BC_RESIDUAL_CALL_R_R,
     );
     insns.insert(
         "residual_call_ir_v/iIRd".to_string(),
-        majit_translate::insns::BC_RESIDUAL_CALL_IR_V,
+        majit_jitcode::insns::BC_RESIDUAL_CALL_IR_V,
     );
     // jtransform `_rewrite_op_cond_call` now emits this key for
     // interpreter-facing `jit.conditional_call`. `wire_bhimpl_handlers`
     // already binds `handler_conditional_call_ir_v`.
     insns.insert(
         "conditional_call_ir_v/iiIRd".to_string(),
-        majit_translate::insns::BC_CONDITIONAL_CALL_IR_V,
+        majit_jitcode::insns::BC_CONDITIONAL_CALL_IR_V,
     );
     insns.insert(
         "conditional_call_value_ir_i/iiIRd>i".to_string(),
-        majit_translate::insns::BC_CONDITIONAL_CALL_VALUE_IR_I,
+        majit_jitcode::insns::BC_CONDITIONAL_CALL_VALUE_IR_I,
     );
     insns.insert(
         "conditional_call_value_ir_r/riIRd>r".to_string(),
-        majit_translate::insns::BC_CONDITIONAL_CALL_VALUE_IR_R,
+        majit_jitcode::insns::BC_CONDITIONAL_CALL_VALUE_IR_R,
     );
     insns.insert(
         "record_known_result_i_ir_v/iiIRd".to_string(),
-        majit_translate::insns::BC_RECORD_KNOWN_RESULT_I_IR_V,
+        majit_jitcode::insns::BC_RECORD_KNOWN_RESULT_I_IR_V,
     );
     insns.insert(
         "record_known_result_r_ir_v/riIRd".to_string(),
-        majit_translate::insns::BC_RECORD_KNOWN_RESULT_R_IR_V,
+        majit_jitcode::insns::BC_RECORD_KNOWN_RESULT_R_IR_V,
     );
     insns.insert(
         "residual_call_ir_i/iIRd>i".to_string(),
-        majit_translate::insns::BC_RESIDUAL_CALL_IR_I,
+        majit_jitcode::insns::BC_RESIDUAL_CALL_IR_I,
     );
     insns.insert(
         "residual_call_ir_r/iIRd>r".to_string(),
-        majit_translate::insns::BC_RESIDUAL_CALL_IR_R,
+        majit_jitcode::insns::BC_RESIDUAL_CALL_IR_R,
     );
     insns.insert(
         "residual_call_irf_v/iIRFd".to_string(),
-        majit_translate::insns::BC_RESIDUAL_CALL_IRF_V,
+        majit_jitcode::insns::BC_RESIDUAL_CALL_IRF_V,
     );
     insns.insert(
         "residual_call_irf_i/iIRFd>i".to_string(),
-        majit_translate::insns::BC_RESIDUAL_CALL_IRF_I,
+        majit_jitcode::insns::BC_RESIDUAL_CALL_IRF_I,
     );
     insns.insert(
         "residual_call_irf_r/iIRFd>r".to_string(),
-        majit_translate::insns::BC_RESIDUAL_CALL_IRF_R,
+        majit_jitcode::insns::BC_RESIDUAL_CALL_IRF_R,
     );
     insns.insert(
         "residual_call_irf_f/iIRFd>f".to_string(),
-        majit_translate::insns::BC_RESIDUAL_CALL_IRF_F,
+        majit_jitcode::insns::BC_RESIDUAL_CALL_IRF_F,
     );
     // Canonical `inline_call_*` family (blackhole.py:1278-1319). The ten
     // handlers and their `wire_bhimpl_handlers` calls already exist, but
@@ -10862,43 +10829,43 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     for (key, byte) in [
         (
             "inline_call_r_i/dR>i",
-            majit_translate::insns::BC_INLINE_CALL_R_I,
+            majit_jitcode::insns::BC_INLINE_CALL_R_I,
         ),
         (
             "inline_call_r_r/dR>r",
-            majit_translate::insns::BC_INLINE_CALL_R_R,
+            majit_jitcode::insns::BC_INLINE_CALL_R_R,
         ),
         (
             "inline_call_r_v/dR",
-            majit_translate::insns::BC_INLINE_CALL_R_V,
+            majit_jitcode::insns::BC_INLINE_CALL_R_V,
         ),
         (
             "inline_call_ir_i/dIR>i",
-            majit_translate::insns::BC_INLINE_CALL_IR_I,
+            majit_jitcode::insns::BC_INLINE_CALL_IR_I,
         ),
         (
             "inline_call_ir_r/dIR>r",
-            majit_translate::insns::BC_INLINE_CALL_IR_R,
+            majit_jitcode::insns::BC_INLINE_CALL_IR_R,
         ),
         (
             "inline_call_ir_v/dIR",
-            majit_translate::insns::BC_INLINE_CALL_IR_V,
+            majit_jitcode::insns::BC_INLINE_CALL_IR_V,
         ),
         (
             "inline_call_irf_i/dIRF>i",
-            majit_translate::insns::BC_INLINE_CALL_IRF_I,
+            majit_jitcode::insns::BC_INLINE_CALL_IRF_I,
         ),
         (
             "inline_call_irf_r/dIRF>r",
-            majit_translate::insns::BC_INLINE_CALL_IRF_R,
+            majit_jitcode::insns::BC_INLINE_CALL_IRF_R,
         ),
         (
             "inline_call_irf_f/dIRF>f",
-            majit_translate::insns::BC_INLINE_CALL_IRF_F,
+            majit_jitcode::insns::BC_INLINE_CALL_IRF_F,
         ),
         (
             "inline_call_irf_v/dIRF",
-            majit_translate::insns::BC_INLINE_CALL_IRF_V,
+            majit_jitcode::insns::BC_INLINE_CALL_IRF_V,
         ),
     ] {
         insns.insert(key.to_string(), byte);
@@ -10913,55 +10880,55 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // Together this makes the vable family strict-dispatch ready.
     insns.insert(
         "getfield_vable_i/rd>i".to_string(),
-        majit_translate::insns::BC_GETFIELD_VABLE_I,
+        majit_jitcode::insns::BC_GETFIELD_VABLE_I,
     );
     insns.insert(
         "getfield_vable_r/rd>r".to_string(),
-        majit_translate::insns::BC_GETFIELD_VABLE_R,
+        majit_jitcode::insns::BC_GETFIELD_VABLE_R,
     );
     insns.insert(
         "getfield_vable_f/rd>f".to_string(),
-        majit_translate::insns::BC_GETFIELD_VABLE_F,
+        majit_jitcode::insns::BC_GETFIELD_VABLE_F,
     );
     insns.insert(
         "setfield_vable_i/rid".to_string(),
-        majit_translate::insns::BC_SETFIELD_VABLE_I,
+        majit_jitcode::insns::BC_SETFIELD_VABLE_I,
     );
     insns.insert(
         "setfield_vable_r/rrd".to_string(),
-        majit_translate::insns::BC_SETFIELD_VABLE_R,
+        majit_jitcode::insns::BC_SETFIELD_VABLE_R,
     );
     insns.insert(
         "setfield_vable_f/rfd".to_string(),
-        majit_translate::insns::BC_SETFIELD_VABLE_F,
+        majit_jitcode::insns::BC_SETFIELD_VABLE_F,
     );
     insns.insert(
         "getarrayitem_vable_i/ridd>i".to_string(),
-        majit_translate::insns::BC_GETARRAYITEM_VABLE_I,
+        majit_jitcode::insns::BC_GETARRAYITEM_VABLE_I,
     );
     insns.insert(
         "getarrayitem_vable_r/ridd>r".to_string(),
-        majit_translate::insns::BC_GETARRAYITEM_VABLE_R,
+        majit_jitcode::insns::BC_GETARRAYITEM_VABLE_R,
     );
     insns.insert(
         "getarrayitem_vable_f/ridd>f".to_string(),
-        majit_translate::insns::BC_GETARRAYITEM_VABLE_F,
+        majit_jitcode::insns::BC_GETARRAYITEM_VABLE_F,
     );
     insns.insert(
         "setarrayitem_vable_i/riidd".to_string(),
-        majit_translate::insns::BC_SETARRAYITEM_VABLE_I,
+        majit_jitcode::insns::BC_SETARRAYITEM_VABLE_I,
     );
     insns.insert(
         "setarrayitem_vable_r/rirdd".to_string(),
-        majit_translate::insns::BC_SETARRAYITEM_VABLE_R,
+        majit_jitcode::insns::BC_SETARRAYITEM_VABLE_R,
     );
     insns.insert(
         "setarrayitem_vable_f/rifdd".to_string(),
-        majit_translate::insns::BC_SETARRAYITEM_VABLE_F,
+        majit_jitcode::insns::BC_SETARRAYITEM_VABLE_F,
     );
     insns.insert(
         "arraylen_vable/rdd>i".to_string(),
-        majit_translate::insns::BC_ARRAYLEN_VABLE,
+        majit_jitcode::insns::BC_ARRAYLEN_VABLE,
     );
     // Registered for the same reason the array-build family below is: the
     // abort this op provokes resumes through the blackhole over the jitcode
@@ -10969,7 +10936,7 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // `dispatch_step` on the op's own failure path.
     insns.insert(
         "arraybase_vable/rdd>i".to_string(),
-        majit_translate::insns::BC_ARRAYBASE_VABLE,
+        majit_jitcode::insns::BC_ARRAYBASE_VABLE,
     );
     // GC array-build family — `BuildTuple` / `BuildList` / `BuildMap` /
     // `BuildSet` / `BuildString` lower to `new_array_clear` (alloc) +
@@ -10986,11 +10953,11 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // registers.  Handlers wired in `wire_bhimpl_handlers`.
     insns.insert(
         "new_array_clear/cd>r".to_string(),
-        majit_translate::insns::BC_NEW_ARRAY_CLEAR_C,
+        majit_jitcode::insns::BC_NEW_ARRAY_CLEAR_C,
     );
     insns.insert(
         "new_array_clear/id>r".to_string(),
-        majit_translate::insns::BC_NEW_ARRAY_CLEAR,
+        majit_jitcode::insns::BC_NEW_ARRAY_CLEAR,
     );
     // Plain struct allocation (`blackhole.py bhimpl_new` /
     // `bhimpl_new_with_vtable`) — a `#[jit_interp]` frontend's declared
@@ -10998,26 +10965,26 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // forward over one needs the byte dispatchable.  The handlers were already
     // wired in `wire_bhimpl_handlers`; only the opname→byte entries were
     // missing, which turns into a `dispatch_step: unwired opcode` panic.
-    insns.insert("new/d>r".to_string(), majit_translate::insns::BC_NEW);
+    insns.insert("new/d>r".to_string(), majit_jitcode::insns::BC_NEW);
     insns.insert(
         "new_with_vtable/d>r".to_string(),
-        majit_translate::insns::BC_NEW_WITH_VTABLE,
+        majit_jitcode::insns::BC_NEW_WITH_VTABLE,
     );
     insns.insert(
         "new_array/id>r".to_string(),
-        majit_translate::insns::BC_NEW_ARRAY,
+        majit_jitcode::insns::BC_NEW_ARRAY,
     );
     insns.insert(
         "setarrayitem_gc_r/rcrd".to_string(),
-        majit_translate::insns::BC_SETARRAYITEM_GC_R_C,
+        majit_jitcode::insns::BC_SETARRAYITEM_GC_R_C,
     );
     insns.insert(
         "setarrayitem_gc_r/rird".to_string(),
-        majit_translate::insns::BC_SETARRAYITEM_GC_R,
+        majit_jitcode::insns::BC_SETARRAYITEM_GC_R,
     );
     insns.insert(
         "hint_force_virtualizable/r".to_string(),
-        majit_translate::insns::BC_HINT_FORCE_VIRTUALIZABLE,
+        majit_jitcode::insns::BC_HINT_FORCE_VIRTUALIZABLE,
     );
     // GC heap array allocation + element access — emitted by BUILD_TUPLE /
     // BUILD_LIST (`new_array_clear` + `setarrayitem_gc_*`) and subscript
@@ -11031,31 +10998,31 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // handler.
     insns.insert(
         "new_array_clear/id>r".to_string(),
-        majit_translate::insns::BC_NEW_ARRAY_CLEAR,
+        majit_jitcode::insns::BC_NEW_ARRAY_CLEAR,
     );
     insns.insert(
         "getarrayitem_gc_i/rid>i".to_string(),
-        majit_translate::insns::BC_GETARRAYITEM_GC_I,
+        majit_jitcode::insns::BC_GETARRAYITEM_GC_I,
     );
     insns.insert(
         "getarrayitem_gc_r/rid>r".to_string(),
-        majit_translate::insns::BC_GETARRAYITEM_GC_R_RID,
+        majit_jitcode::insns::BC_GETARRAYITEM_GC_R_RID,
     );
     insns.insert(
         "getarrayitem_gc_f/rid>f".to_string(),
-        majit_translate::insns::BC_GETARRAYITEM_GC_F,
+        majit_jitcode::insns::BC_GETARRAYITEM_GC_F,
     );
     insns.insert(
         "getarrayitem_gc_i_pure/rid>i".to_string(),
-        majit_translate::insns::BC_GETARRAYITEM_GC_I_PURE,
+        majit_jitcode::insns::BC_GETARRAYITEM_GC_I_PURE,
     );
     insns.insert(
         "getarrayitem_gc_r_pure/rid>r".to_string(),
-        majit_translate::insns::BC_GETARRAYITEM_GC_R_PURE,
+        majit_jitcode::insns::BC_GETARRAYITEM_GC_R_PURE,
     );
     insns.insert(
         "getarrayitem_gc_f_pure/rid>f".to_string(),
-        majit_translate::insns::BC_GETARRAYITEM_GC_F_PURE,
+        majit_jitcode::insns::BC_GETARRAYITEM_GC_F_PURE,
     );
     // `raw_store_i/iiid` — emitted by the wasmi majit kernel's i64 memory
     // store arms (`majit_raw_store_i64` → `raw_store_i`, the analogue of
@@ -11068,21 +11035,21 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // stays unwired, desyncing the blackhole decoder.
     insns.insert(
         "raw_store_i/iiid".to_string(),
-        majit_translate::insns::BC_RAW_STORE_I,
+        majit_jitcode::insns::BC_RAW_STORE_I,
     );
     // `raw_store_f/iifd` — the float-valued store (`rewrite_op_raw_store`
     // picks the value's kind).  `handler_raw_store_f` is wired below; the
     // byte needs the same resume-forward registration as `raw_store_i`.
     insns.insert(
         "raw_store_f/iifd".to_string(),
-        majit_translate::insns::BC_RAW_STORE_F,
+        majit_jitcode::insns::BC_RAW_STORE_F,
     );
     // `raw_load_i/iid>i` — the read-side companion the wasmi kernel emits for
     // the store's out-of-bounds memory-preserving no-op readback.  Same
     // resume-forward requirement as `raw_store_i` above.
     insns.insert(
         "raw_load_i/iid>i".to_string(),
-        majit_translate::insns::BC_RAW_LOAD_I,
+        majit_jitcode::insns::BC_RAW_LOAD_I,
     );
     // `raw_load_f/iid>f` — the float read-side companion (`majit_raw_load_f`,
     // used by the celfloat example).  `handler_raw_load_f` is wired below;
@@ -11090,7 +11057,7 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // instead of hitting the unwired-byte panic.
     insns.insert(
         "raw_load_f/iid>f".to_string(),
-        majit_translate::insns::BC_RAW_LOAD_F,
+        majit_jitcode::insns::BC_RAW_LOAD_F,
     );
     // The two float<->int bitcasts, `majit_f64_to_bits` / `majit_bits_to_f64`.
     // A `#[jit_interp]` arm carries a float across a branch as its bits (the
@@ -11098,23 +11065,23 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // through such an arm dispatches these; their handlers are wired below.
     insns.insert(
         "convert_float_bytes_to_longlong/f>i".to_string(),
-        majit_translate::insns::BC_CONVERT_FLOAT_BYTES_TO_LONGLONG,
+        majit_jitcode::insns::BC_CONVERT_FLOAT_BYTES_TO_LONGLONG,
     );
     insns.insert(
         "convert_longlong_bytes_to_float/i>f".to_string(),
-        majit_translate::insns::BC_CONVERT_LONGLONG_BYTES_TO_FLOAT,
+        majit_jitcode::insns::BC_CONVERT_LONGLONG_BYTES_TO_FLOAT,
     );
     insns.insert(
         "setarrayitem_gc_i/riid".to_string(),
-        majit_translate::insns::BC_SETARRAYITEM_GC_I,
+        majit_jitcode::insns::BC_SETARRAYITEM_GC_I,
     );
     insns.insert(
         "setarrayitem_gc_r/rird".to_string(),
-        majit_translate::insns::BC_SETARRAYITEM_GC_R,
+        majit_jitcode::insns::BC_SETARRAYITEM_GC_R,
     );
     insns.insert(
         "setarrayitem_gc_f/rifd".to_string(),
-        majit_translate::insns::BC_SETARRAYITEM_GC_F,
+        majit_jitcode::insns::BC_SETARRAYITEM_GC_F,
     );
     // Constant-operand "_C" forms, emitted when the array length, store
     // index, or store value is a compile-time constant — a fixed-size
@@ -11129,15 +11096,15 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // unwired (`dispatch_step` panics on `0xd8`).
     insns.insert(
         "setarrayitem_gc_r/rcrd".to_string(),
-        majit_translate::insns::BC_SETARRAYITEM_GC_R_C,
+        majit_jitcode::insns::BC_SETARRAYITEM_GC_R_C,
     );
     insns.insert(
         "setarrayitem_gc_i/ricd".to_string(),
-        majit_translate::insns::BC_SETARRAYITEM_GC_I_C,
+        majit_jitcode::insns::BC_SETARRAYITEM_GC_I_C,
     );
     insns.insert(
         "new_array_clear/cd>r".to_string(),
-        majit_translate::insns::BC_NEW_ARRAY_CLEAR_C,
+        majit_jitcode::insns::BC_NEW_ARRAY_CLEAR_C,
     );
     // Overflow-checked arithmetic (`int_{add,sub,mul}_jump_if_ovf`): a guard
     // failure on `GuardNoOverflow`/`GuardOverflow` resumes forward through the
@@ -11146,15 +11113,15 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // silently no-ops and the byte stays unwired.
     insns.insert(
         "int_add_jump_if_ovf/Lii>i".to_string(),
-        majit_translate::insns::BC_INT_ADD_JUMP_IF_OVF,
+        majit_jitcode::insns::BC_INT_ADD_JUMP_IF_OVF,
     );
     insns.insert(
         "int_sub_jump_if_ovf/Lii>i".to_string(),
-        majit_translate::insns::BC_INT_SUB_JUMP_IF_OVF,
+        majit_jitcode::insns::BC_INT_SUB_JUMP_IF_OVF,
     );
     insns.insert(
         "int_mul_jump_if_ovf/Lii>i".to_string(),
-        majit_translate::insns::BC_INT_MUL_JUMP_IF_OVF,
+        majit_jitcode::insns::BC_INT_MUL_JUMP_IF_OVF,
     );
     // The remaining opnames the build-time `pipeline.insns` records as
     // actually emitted (`build_emitted_insns()`) that this curated set did not
@@ -11171,59 +11138,56 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // `handler_new_with_vtable`, `bhhandler_r_i!`) — and `arraylen_gc` / `new`
     // / `new_with_vtable` read `bh.cpu`, which this builder sets above.
     for (key, byte) in [
-        ("arraylen_gc/rd>i", majit_translate::insns::BC_ARRAYLEN_GC),
+        ("arraylen_gc/rd>i", majit_jitcode::insns::BC_ARRAYLEN_GC),
         (
             "getinteriorfield_gc_i/rid>i",
-            majit_translate::insns::BC_GETINTERIORFIELD_GC_I,
+            majit_jitcode::insns::BC_GETINTERIORFIELD_GC_I,
         ),
         (
             "getinteriorfield_gc_r/rid>r",
-            majit_translate::insns::BC_GETINTERIORFIELD_GC_R,
+            majit_jitcode::insns::BC_GETINTERIORFIELD_GC_R,
         ),
         (
             "getinteriorfield_gc_f/rid>f",
-            majit_translate::insns::BC_GETINTERIORFIELD_GC_F,
+            majit_jitcode::insns::BC_GETINTERIORFIELD_GC_F,
         ),
         (
             "cast_float_to_int/f>i",
-            majit_translate::insns::BC_CAST_FLOAT_TO_INT,
+            majit_jitcode::insns::BC_CAST_FLOAT_TO_INT,
         ),
         (
             "cast_ptr_to_int/r>i",
-            majit_translate::insns::BC_CAST_PTR_TO_INT,
+            majit_jitcode::insns::BC_CAST_PTR_TO_INT,
         ),
         (
             "cast_int_to_ptr/i>r",
-            majit_translate::insns::BC_CAST_INT_TO_PTR,
+            majit_jitcode::insns::BC_CAST_INT_TO_PTR,
         ),
         (
             "int_isconstant/i>i",
-            majit_translate::insns::BC_INT_ISCONSTANT,
+            majit_jitcode::insns::BC_INT_ISCONSTANT,
         ),
         (
             "ref_isconstant/r>i",
-            majit_translate::insns::BC_REF_ISCONSTANT,
+            majit_jitcode::insns::BC_REF_ISCONSTANT,
         ),
-        (
-            "ref_isvirtual/r>i",
-            majit_translate::insns::BC_REF_ISVIRTUAL,
-        ),
-        ("new/d>r", majit_translate::insns::BC_NEW),
+        ("ref_isvirtual/r>i", majit_jitcode::insns::BC_REF_ISVIRTUAL),
+        ("new/d>r", majit_jitcode::insns::BC_NEW),
         (
             "new_with_vtable/d>r",
-            majit_translate::insns::BC_NEW_WITH_VTABLE,
+            majit_jitcode::insns::BC_NEW_WITH_VTABLE,
         ),
         // The header read `jtransform.rs rewrite_op_getfield` replaces,
         // in the ref bank (`OpKind::GuardClass`: one ref register in, the
         // class out) — emitted once a descended helper reads `ob_type`
         // through a graph the codewriter looks inside.
-        ("guard_class/r>r", majit_translate::insns::BC_GUARD_CLASS_R),
-        ("strlen/r>i", majit_translate::insns::BC_STRLEN),
-        ("strgetitem/ri>i", majit_translate::insns::BC_STRGETITEM),
-        ("strgetitem/rc>i", majit_translate::insns::BC_STRGETITEM_C),
+        ("guard_class/r>r", majit_jitcode::insns::BC_GUARD_CLASS_R),
+        ("strlen/r>i", majit_jitcode::insns::BC_STRLEN),
+        ("strgetitem/ri>i", majit_jitcode::insns::BC_STRGETITEM),
+        ("strgetitem/rc>i", majit_jitcode::insns::BC_STRGETITEM_C),
         // `(lo..=hi).contains` emits `int_between/iii>i`. The decoder is
         // `bhhandler_iii_i!` (`[a][b][c][dst]`), already wired below.
-        ("int_between/iii>i", majit_translate::insns::BC_INT_BETWEEN),
+        ("int_between/iii>i", majit_jitcode::insns::BC_INT_BETWEEN),
     ] {
         insns.insert(key.to_string(), byte);
     }
@@ -11236,9 +11200,9 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // `BC_*` constants explicitly so this builder stays synchronized as
     // the registered subset changes.
     builder.setup_cached_control_opcodes(
-        majit_translate::insns::BC_LIVE as i32,
-        majit_translate::insns::BC_CATCH_EXCEPTION as i32,
-        majit_translate::insns::BC_RVMPROF_CODE as i32,
+        majit_jitcode::insns::BC_LIVE as i32,
+        majit_jitcode::insns::BC_CATCH_EXCEPTION as i32,
+        majit_jitcode::insns::BC_RVMPROF_CODE as i32,
     );
     wire_bhimpl_handlers(&mut builder);
     // Strict-coverage gate: enforce setup-time parity with RPython
@@ -13335,7 +13299,7 @@ fn read_inline_call_jitcode(
 /// `ResidualDecline::Symbolic`.
 #[inline]
 pub(crate) fn is_symbolic_fnaddr(fnaddr: i64) -> bool {
-    majit_translate::codewriter::call::is_symbolic_fnaddr(fnaddr)
+    majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr)
 }
 
 /// Whether a jitcode's `fnaddr` can be called as a function pointer.
@@ -14110,8 +14074,8 @@ fn leftover_cond_call_descr(
     target: &crate::jitcode::JitCallTarget,
     arg_classes: String,
     result_type: majit_ir::Type,
-) -> majit_translate::jitcode::BhCallDescr {
-    majit_translate::jitcode::BhCallDescr::from_signature(
+) -> majit_jitcode::jitcode::BhCallDescr {
+    majit_jitcode::jitcode::BhCallDescr::from_signature(
         arg_classes,
         result_type,
         crate::call_descr::effect_info_for_slot(target.effect_info_slot),
@@ -14335,7 +14299,7 @@ fn handler_inline_call_nested_ext(
         {
             Some((
                 sub.fnaddr,
-                &body.calldescr as *const majit_translate::jitcode::BhCallDescr,
+                &body.calldescr as *const majit_jitcode::jitcode::BhCallDescr,
             ))
         } else {
             None
@@ -14485,7 +14449,7 @@ fn inline_call_native(
     p: usize,
     num_args: usize,
     fnaddr: i64,
-    calldescr: &majit_translate::jitcode::BhCallDescr,
+    calldescr: &majit_jitcode::jitcode::BhCallDescr,
 ) -> Result<usize, DispatchError> {
     let mut p = p;
     // Translated `bhimpl_inline_call_*` becomes a direct C call of the

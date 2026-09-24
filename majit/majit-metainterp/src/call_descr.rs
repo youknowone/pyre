@@ -828,7 +828,7 @@ fn make_call_descr_sized(
 
 /// Resolve the serialized half of an Assembler.descrs call entry once.
 /// pyjitpl.py do_residual_call records that same descriptor on every use.
-pub(crate) fn call_descr_from_bh(bh: &majit_translate::jitcode::BhCallDescr) -> DescrRef {
+pub(crate) fn call_descr_from_bh(bh: &majit_jitcode::jitcode::BhCallDescr) -> DescrRef {
     let type_of = |class| match class {
         'i' | 'S' => Type::Int,
         'r' => Type::Ref,

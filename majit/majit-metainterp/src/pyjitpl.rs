@@ -4367,14 +4367,13 @@ impl<M: Clone> MetaInterp<M> {
     /// staticdata method.
     pub fn finish_setup(
         &mut self,
-        codewriter: &majit_translate::codewriter::codewriter::CodeWriter,
-        callcontrol: &majit_translate::codewriter::call::CallControl,
+        codewriter: &dyn majit_jitcode::codewriter::codewriter::CodeWriterSetup,
     ) {
         let staticdata = std::sync::Arc::get_mut(&mut self.staticdata).expect(
             "MetaInterp::finish_setup called after `staticdata` was cloned; \
              RPython warmspot.py:289 invariant requires a single owner at finish_setup time",
         );
-        staticdata.finish_setup(codewriter, callcontrol);
+        staticdata.finish_setup(codewriter);
         // pyjitpl.py `finish_setup_descrs`: PyPy invokes
         // this as the immediately-following lifecycle step from
         // `warmspot.py:289` after `finish_setup(codewriter)`. Pyre
@@ -4440,7 +4439,7 @@ impl<M: Clone> MetaInterp<M> {
     /// — call before any tracing path clones `staticdata`.
     pub fn install_canonical_liveness(
         &mut self,
-        asm: &majit_translate::codewriter::assembler::Assembler,
+        asm: &majit_jitcode::codewriter::assembler::Assembler,
     ) {
         let staticdata = std::sync::Arc::get_mut(&mut self.staticdata).expect(
             "MetaInterp::install_canonical_liveness called after `staticdata` was cloned; \
@@ -18136,7 +18135,7 @@ impl<M: Clone> MetaInterp<M> {
     /// Frames without a handler are popped. `rvmprof_code` is decoded
     /// in-place before the pop, matching the RPython side effect.
     pub fn finishframe_exception(&mut self) -> Result<(), FinishframeExceptionSignal> {
-        const SIZE_LIVE_OP: usize = majit_translate::liveness::OFFSET_SIZE + 1;
+        const SIZE_LIVE_OP: usize = majit_jitcode::liveness::OFFSET_SIZE + 1;
 
         // pyjitpl.py:2507: excvalue = self.last_exc_value
         let excvalue = self.last_exc_value;
@@ -18183,7 +18182,7 @@ impl<M: Clone> MetaInterp<M> {
                             .get(unique_id_idx)
                             .and_then(|v| *v)
                             .unwrap_or(0);
-                        majit_translate::rlib::rvmprof::cintf::jit_rvmprof_code(leaving, unique_id);
+                        majit_rlib::rvmprof::cintf::jit_rvmprof_code(leaving, unique_id);
                     }
                 }
             }
@@ -21539,8 +21538,7 @@ impl MetaInterpStaticData {
     /// payload types still diverge.
     pub fn finish_setup(
         &mut self,
-        codewriter: &majit_translate::codewriter::codewriter::CodeWriter,
-        callcontrol: &majit_translate::codewriter::call::CallControl,
+        codewriter: &dyn majit_jitcode::codewriter::codewriter::CodeWriterSetup,
     ) {
         // pyjitpl.py:2257-2258
         //     self.blackholeinterpbuilder = BlackholeInterpBuilder(codewriter, self)
@@ -21551,7 +21549,7 @@ impl MetaInterpStaticData {
         // refactor of `BlackholeInterpBuilder`'s allocator and
         // exceeds the current scope.
 
-        let asm = &codewriter.assembler;
+        let asm = codewriter.assembler();
         // pyjitpl.py `self.setup_insns(asm.insns)`
         self.setup_insns(asm.insns());
         // pyjitpl.py `self.setup_descrs(asm.descrs)`
@@ -21592,7 +21590,7 @@ impl MetaInterpStaticData {
         // pyjitpl.py `self.virtualref_info = codewriter.callcontrol.virtualref_info`
         //
         // `callcontrol.virtualref_info` carries the codewriter-time
-        // [`majit_translate::codewriter::call::VirtualRefInfoHandle`]
+        // [`majit_jitcode::codewriter::call::VirtualRefInfoHandle`]
         // (u32 descr indices for the dispatch encoder); the metainterp-side
         // `VirtualRefInfo` carries the process-singleton `DescrRef` Arcs
         // produced by `vref_size_descr()` +
@@ -21603,15 +21601,15 @@ impl MetaInterpStaticData {
         // becomes a fresh copy keyed off the `callcontrol.virtualref_info
         // is not None` precondition that `setup_vrefinfo`
         // (`codewriter.py:91-94`) establishes.
-        if callcontrol.virtualref_info.is_some() {
+        if codewriter.virtualref_info().is_some() {
             self.virtualref_info = crate::virtualref::VirtualRefInfo::new();
         }
 
         // pyjitpl.py `self.callinfocollection = codewriter.callcontrol.callinfocollection`
-        self.callinfocollection = callcontrol.callinfocollection.clone();
+        self.callinfocollection = codewriter.callinfocollection().clone();
 
         // pyjitpl.py `self.has_libffi_call = codewriter.callcontrol.has_libffi_call`
-        self.has_libffi_call = callcontrol.has_libffi_call;
+        self.has_libffi_call = codewriter.has_libffi_call();
 
         // pyjitpl.py:2273-2284
         //     exc_descr = compile.PropagateExceptionDescr()
@@ -21679,7 +21677,7 @@ impl MetaInterpStaticData {
     /// → finish_setup(codewriter)` warmspot lifecycle.
     pub fn install_canonical_liveness(
         &mut self,
-        asm: &majit_translate::codewriter::assembler::Assembler,
+        asm: &majit_jitcode::codewriter::assembler::Assembler,
     ) {
         // Mirrors the asm-derived parts of `finish_setup(codewriter,
         // callcontrol)` (this file, `pyjitpl.py:2255-2285`):
@@ -22279,7 +22277,7 @@ impl MetaInterpStaticData {
 mod metainterp_static_data_tests {
     use super::*;
     use crate::jitcode::{JitCode, JitCodeBuilder};
-    use majit_translate::jitcode::JitCode as BuildJitCode;
+    use majit_jitcode::jitcode::JitCode as BuildJitCode;
 
     #[test]
     fn setup_snapshots_a_shared_effect_info_once() {
@@ -25780,7 +25778,7 @@ mod metainterp_static_data_tests {
 
         let callcontrol = CallControl::new();
         let mut sd = MetaInterpStaticData::new();
-        sd.finish_setup(&codewriter, &callcontrol);
+        sd.finish_setup(&codewriter.with_callcontrol(&callcontrol));
 
         // pyjitpl.py `self.liveness_info = "".join(asm.all_liveness)`
         assert_eq!(sd.liveness_info, expected_liveness);
@@ -25799,7 +25797,7 @@ mod metainterp_static_data_tests {
         let mut callcontrol = CallControl::new();
         callcontrol.has_libffi_call = true;
         let mut sd = MetaInterpStaticData::new();
-        sd.finish_setup(&CodeWriter::new(), &callcontrol);
+        sd.finish_setup(&CodeWriter::new().with_callcontrol(&callcontrol));
 
         assert!(sd.has_libffi_call);
     }
@@ -25824,7 +25822,7 @@ mod metainterp_static_data_tests {
         let callcontrol = CallControl::new();
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
-        meta.finish_setup(&codewriter, &callcontrol);
+        meta.finish_setup(&codewriter.with_callcontrol(&callcontrol));
 
         assert_eq!(meta.staticdata.liveness_info, expected);
     }
@@ -25843,7 +25841,7 @@ mod metainterp_static_data_tests {
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let _share: std::sync::Arc<MetaInterpStaticData> = meta.staticdata.clone();
-        meta.finish_setup(&CodeWriter::new(), &CallControl::new());
+        meta.finish_setup(&CodeWriter::new().with_callcontrol(&CallControl::new()));
     }
 
     #[test]
@@ -25856,7 +25854,7 @@ mod metainterp_static_data_tests {
         // without going through `CodeWriter` / `CallControl`.
         // pyjitpl.py:2236-2243 — also seed the cached opcode-id fields
         // (`op_live` etc.) from pyre's static `BC_*` constants.
-        use majit_translate::codewriter::assembler::Assembler;
+        use majit_jitcode::codewriter::assembler::Assembler;
 
         let mut asm = Assembler::new();
         let mut scratch = Vec::<u8>::new();
@@ -25924,7 +25922,7 @@ mod metainterp_static_data_tests {
         // Same single-owner invariant as `finish_setup`: once
         // `staticdata` is shared, the hook must fail loudly rather
         // than silently no-op or clobber a shared snapshot.
-        use majit_translate::codewriter::assembler::Assembler;
+        use majit_jitcode::codewriter::assembler::Assembler;
 
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();

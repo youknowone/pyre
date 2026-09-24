@@ -1,0 +1,12 @@
+[package]
+name = "majit-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust port of rpython/config: translation and JIT option trees"
+
+[dependencies]
+
+[dev-dependencies]
+parking_lot = { workspace = true }

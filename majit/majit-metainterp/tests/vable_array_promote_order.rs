@@ -129,9 +129,9 @@ fn build_jitcode(
 ) -> (
     Arc<JitCode>,
     usize,
-    majit_translate::codewriter::assembler::Assembler,
+    majit_jitcode::codewriter::assembler::Assembler,
 ) {
-    let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+    let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
     let mut builder = JitCodeBuilder::new();
     let live_ints: &[u8] = if arm == Arm::Set { &[0, 1] } else { &[0] };
     builder.live(&mut asm, live_ints, &[0], &[]);

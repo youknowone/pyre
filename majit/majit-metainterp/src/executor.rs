@@ -57,7 +57,7 @@ pub fn do_getfield_gc_i(
     cpu: &dyn majit_backend::Backend,
     _metainterp: (),
     structbox: i64,
-    fielddescr: &majit_translate::jitcode::BhDescr,
+    fielddescr: &majit_jitcode::jitcode::BhDescr,
 ) -> i64 {
     let struct_ = structbox;
     cpu.bh_getfield_gc_i(struct_, fielddescr)
@@ -68,7 +68,7 @@ pub fn do_getfield_gc_r(
     cpu: &dyn majit_backend::Backend,
     _metainterp: (),
     structbox: i64,
-    fielddescr: &majit_translate::jitcode::BhDescr,
+    fielddescr: &majit_jitcode::jitcode::BhDescr,
 ) -> majit_ir::GcRef {
     let struct_ = structbox;
     cpu.bh_getfield_gc_r(struct_, fielddescr)
@@ -79,7 +79,7 @@ pub fn do_getfield_gc_f(
     cpu: &dyn majit_backend::Backend,
     _metainterp: (),
     structbox: i64,
-    fielddescr: &majit_translate::jitcode::BhDescr,
+    fielddescr: &majit_jitcode::jitcode::BhDescr,
 ) -> f64 {
     let struct_ = structbox;
     cpu.bh_getfield_gc_f(struct_, fielddescr)
@@ -108,7 +108,7 @@ pub fn do_setfield_gc(
     _metainterp: (),
     structbox: i64,
     itembox: majit_ir::Value,
-    fielddescr: &majit_translate::jitcode::BhDescr,
+    fielddescr: &majit_jitcode::jitcode::BhDescr,
     field_type: majit_ir::Type,
 ) -> bool {
     let struct_ = structbox;
@@ -138,7 +138,7 @@ pub fn do_getarrayitem_gc_i(
     _metainterp: (),
     arraybox: i64,
     indexbox: i64,
-    arraydescr: &majit_translate::jitcode::BhDescr,
+    arraydescr: &majit_jitcode::jitcode::BhDescr,
 ) -> i64 {
     cpu.bh_getarrayitem_gc_i(arraybox, indexbox, arraydescr)
 }
@@ -148,7 +148,7 @@ pub fn do_getarrayitem_gc_r(
     _metainterp: (),
     arraybox: i64,
     indexbox: i64,
-    arraydescr: &majit_translate::jitcode::BhDescr,
+    arraydescr: &majit_jitcode::jitcode::BhDescr,
 ) -> majit_ir::GcRef {
     cpu.bh_getarrayitem_gc_r(arraybox, indexbox, arraydescr)
 }
@@ -158,7 +158,7 @@ pub fn do_getarrayitem_gc_f(
     _metainterp: (),
     arraybox: i64,
     indexbox: i64,
-    arraydescr: &majit_translate::jitcode::BhDescr,
+    arraydescr: &majit_jitcode::jitcode::BhDescr,
 ) -> f64 {
     cpu.bh_getarrayitem_gc_f(arraybox, indexbox, arraydescr)
 }
@@ -174,7 +174,7 @@ pub fn do_arraylen_gc(
     cpu: &dyn majit_backend::Backend,
     _metainterp: (),
     arraybox: i64,
-    arraydescr: &majit_translate::jitcode::BhDescr,
+    arraydescr: &majit_jitcode::jitcode::BhDescr,
 ) -> i64 {
     cpu.bh_arraylen_gc(arraybox, arraydescr)
 }
@@ -189,7 +189,7 @@ pub fn do_getarrayitem_raw_i(
     _metainterp: (),
     arraybox: i64,
     indexbox: i64,
-    arraydescr: &majit_translate::jitcode::BhDescr,
+    arraydescr: &majit_jitcode::jitcode::BhDescr,
 ) -> i64 {
     cpu.bh_getarrayitem_raw_i(arraybox, indexbox, arraydescr)
 }
@@ -199,7 +199,7 @@ pub fn do_getarrayitem_raw_f(
     _metainterp: (),
     arraybox: i64,
     indexbox: i64,
-    arraydescr: &majit_translate::jitcode::BhDescr,
+    arraydescr: &majit_jitcode::jitcode::BhDescr,
 ) -> f64 {
     cpu.bh_getarrayitem_raw_f(arraybox, indexbox, arraydescr)
 }
@@ -214,7 +214,7 @@ pub fn do_getfield_raw_i(
     cpu: &dyn majit_backend::Backend,
     _metainterp: (),
     structbox: i64,
-    fielddescr: &majit_translate::jitcode::BhDescr,
+    fielddescr: &majit_jitcode::jitcode::BhDescr,
 ) -> i64 {
     cpu.bh_getfield_raw_i(structbox, fielddescr)
 }
@@ -223,7 +223,7 @@ pub fn do_getfield_raw_r(
     cpu: &dyn majit_backend::Backend,
     _metainterp: (),
     structbox: i64,
-    fielddescr: &majit_translate::jitcode::BhDescr,
+    fielddescr: &majit_jitcode::jitcode::BhDescr,
 ) -> majit_ir::GcRef {
     cpu.bh_getfield_raw_r(structbox, fielddescr)
 }
@@ -232,7 +232,7 @@ pub fn do_getfield_raw_f(
     cpu: &dyn majit_backend::Backend,
     _metainterp: (),
     structbox: i64,
-    fielddescr: &majit_translate::jitcode::BhDescr,
+    fielddescr: &majit_jitcode::jitcode::BhDescr,
 ) -> f64 {
     cpu.bh_getfield_raw_f(structbox, fielddescr)
 }
@@ -329,13 +329,13 @@ fn do_call<M: Clone>(
     // leftover CA BH uses an Int descr + `cpu.bh_call_i` so
     // `verify_result_type` accepts the i64 ABI.
     let calldescr = if result_type == majit_ir::Type::Float {
-        majit_translate::jitcode::BhCallDescr::from_signature(
+        majit_jitcode::jitcode::BhCallDescr::from_signature(
             descr.arg_classes(),
             majit_ir::Type::Int,
             descr.get_extra_info().clone(),
         )
     } else {
-        majit_translate::jitcode::BhCallDescr::from_call_descr(descr)
+        majit_jitcode::jitcode::BhCallDescr::from_call_descr(descr)
     };
     match result_type {
         majit_ir::Type::Int => cpu.bh_call_i(

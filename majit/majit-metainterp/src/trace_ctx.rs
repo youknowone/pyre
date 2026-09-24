@@ -49,9 +49,9 @@ use crate::virtualizable::VirtualizableInfo;
 ///
 /// Returns `None` for non-field descrs (the sanity check is then
 /// skipped at the caller — same behavior as `cpu == None`).
-fn descr_to_bh_field_descr(descr: &DescrRef) -> Option<majit_translate::jitcode::BhDescr> {
+fn descr_to_bh_field_descr(descr: &DescrRef) -> Option<majit_jitcode::jitcode::BhDescr> {
     let f = descr.as_field_descr()?;
-    Some(majit_translate::jitcode::BhDescr::Field {
+    Some(majit_jitcode::jitcode::BhDescr::Field {
         offset: f.offset(),
         field_size: f.field_size(),
         field_type: f.field_type(),
@@ -82,9 +82,9 @@ fn descr_to_bh_field_descr(descr: &DescrRef) -> Option<majit_translate::jitcode:
 /// + the `array_base_size()` accessor for Ref/Float reads; the
 ///   remaining `BhDescr::Array` fields are placeholder defaults the load
 ///   path never reads.  Returns `None` for non-array descrs.
-fn descr_to_bh_array_descr(descr: &DescrRef) -> Option<majit_translate::jitcode::BhDescr> {
+fn descr_to_bh_array_descr(descr: &DescrRef) -> Option<majit_jitcode::jitcode::BhDescr> {
     let a = descr.as_array_descr()?;
-    Some(majit_translate::jitcode::BhDescr::Array {
+    Some(majit_jitcode::jitcode::BhDescr::Array {
         base_size: a.base_size(),
         itemsize: a.item_size(),
         len_offset: a.len_descr().map(|fd| fd.offset()),
@@ -101,14 +101,14 @@ fn descr_to_bh_array_descr(descr: &DescrRef) -> Option<majit_translate::jitcode:
     })
 }
 
-fn descr_to_bh_size_descr(descr: &DescrRef) -> Option<majit_translate::jitcode::BhDescr> {
+fn descr_to_bh_size_descr(descr: &DescrRef) -> Option<majit_jitcode::jitcode::BhDescr> {
     let size = descr.as_size_descr()?;
-    Some(majit_translate::jitcode::BhDescr::Size {
+    Some(majit_jitcode::jitcode::BhDescr::Size {
         size: size.size(),
         type_id: size.type_id() as u64,
         vtable: size.vtable() as u64,
         owner: String::new(),
-        all_fielddescrs: majit_translate::jitcode::bh_field_specs_from_size_descr(size),
+        all_fielddescrs: majit_jitcode::jitcode::bh_field_specs_from_size_descr(size),
         is_gc_managed: size.is_gc_managed(),
     })
 }
@@ -6327,21 +6327,21 @@ mod tests {
         fn bh_getfield_gc_i(
             &self,
             _struct_ptr: i64,
-            _fielddescr: &majit_translate::jitcode::BhDescr,
+            _fielddescr: &majit_jitcode::jitcode::BhDescr,
         ) -> i64 {
             self.int_value
         }
         fn bh_getfield_gc_r(
             &self,
             _struct_ptr: i64,
-            _fielddescr: &majit_translate::jitcode::BhDescr,
+            _fielddescr: &majit_jitcode::jitcode::BhDescr,
         ) -> majit_ir::GcRef {
             self.ref_value
         }
         fn bh_getfield_gc_f(
             &self,
             _struct_ptr: i64,
-            _fielddescr: &majit_translate::jitcode::BhDescr,
+            _fielddescr: &majit_jitcode::jitcode::BhDescr,
         ) -> f64 {
             self.float_value
         }

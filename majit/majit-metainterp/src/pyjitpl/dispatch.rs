@@ -72,7 +72,7 @@ fn value_as_float_bits(value: Value) -> i64 {
 /// `SizeDescr.all_fielddescrs` / per-field `FieldDescr` group with the
 /// parent back-references the optimizer's virtualize pass relies on.
 fn field_spec_from_bh(
-    f: &majit_translate::jitcode::BhFieldSpec,
+    f: &majit_jitcode::jitcode::BhFieldSpec,
 ) -> majit_ir::descr::SimpleFieldDescrSpec {
     majit_ir::descr::SimpleFieldDescrSpec {
         index: f.index,
@@ -2932,7 +2932,7 @@ where
     }
 
     fn unwind_to_exception_handler(&mut self, ctx: &mut TraceCtx) -> TraceAction {
-        const SIZE_LIVE_OP: usize = majit_translate::liveness::OFFSET_SIZE + 1;
+        const SIZE_LIVE_OP: usize = majit_jitcode::liveness::OFFSET_SIZE + 1;
 
         while !self.frames.is_empty() {
             let mut handled = false;
@@ -2973,7 +2973,7 @@ where
                             .get(unique_id_idx)
                             .and_then(|v| *v)
                             .unwrap_or(0);
-                        majit_translate::rlib::rvmprof::cintf::jit_rvmprof_code(leaving, unique_id);
+                        majit_rlib::rvmprof::cintf::jit_rvmprof_code(leaving, unique_id);
                     }
                 }
             }
@@ -6349,7 +6349,7 @@ where
                 };
                 let leaving = self.frames.current_mut().int_values[leaving_idx].unwrap_or(0);
                 let unique_id = self.frames.current_mut().int_values[unique_id_idx].unwrap_or(0);
-                majit_translate::rlib::rvmprof::cintf::jit_rvmprof_code(leaving, unique_id);
+                majit_rlib::rvmprof::cintf::jit_rvmprof_code(leaving, unique_id);
             }
             jitcode::insns::BC_JIT_MERGE_POINT | jitcode::insns::BC_JIT_MERGE_POINT_C => {
                 // blackhole.py bhimpl_jit_merge_point parity.
@@ -7962,7 +7962,7 @@ where
                 // other dispatch sites in `blackhole.rs`.
                 if effectinfo.oopspecindex == majit_ir::descr::OopSpecIndex::NotInTrace {
                     self.clear_exception();
-                    if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+                    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
                         return report_symbolic_residual_call_target(
                             ctx,
                             concrete_ptr as usize,
@@ -8071,7 +8071,7 @@ where
                     //    `bh_call_i_dispatch` (which transmutes to
                     //    `extern "C" fn(...) -> i64` and reads garbage from
                     //    rax/x0).
-                    if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+                    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
                         return report_symbolic_residual_call_target(
                             ctx,
                             concrete_ptr as usize,
@@ -8324,7 +8324,7 @@ where
                     // through `bh_call_v_dispatch`, do not write back the
                     // int destination register, and abort on exception.
                     self.clear_exception();
-                    if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+                    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
                         return report_symbolic_residual_call_target(
                             ctx,
                             concrete_ptr as usize,
@@ -8416,7 +8416,7 @@ where
                     // Concrete execute via `bh_call_i_dispatch` (i64
                     // return) — RPython `executor.execute_varargs` →
                     // `cpu.bh_call_i`.
-                    if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+                    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
                         return report_symbolic_residual_call_target(
                             ctx,
                             concrete_ptr as usize,
@@ -8683,7 +8683,7 @@ where
                     // the int sibling at the corresponding NotInTrace
                     // branch for the full citation.
                     self.clear_exception();
-                    if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+                    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
                         return report_symbolic_residual_call_target(
                             ctx,
                             concrete_ptr as usize,
@@ -8771,7 +8771,7 @@ where
                     } else {
                         None
                     };
-                    if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+                    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
                         return report_symbolic_residual_call_target(
                             ctx,
                             concrete_ptr as usize,
@@ -8990,7 +8990,7 @@ where
                     // the int sibling at the corresponding NotInTrace
                     // branch for the full citation.
                     self.clear_exception();
-                    if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+                    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
                         return report_symbolic_residual_call_target(
                             ctx,
                             concrete_ptr as usize,
@@ -9067,7 +9067,7 @@ where
                     } else {
                         None
                     };
-                    if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+                    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
                         return report_symbolic_residual_call_target(
                             ctx,
                             concrete_ptr as usize,
@@ -9272,7 +9272,7 @@ where
                 ) {
                     return action;
                 }
-                if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+                if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
                     return report_symbolic_residual_call_target(
                         ctx,
                         concrete_ptr as usize,
@@ -9441,7 +9441,7 @@ where
                                 ) {
                                     return action;
                                 }
-                                if majit_translate::codewriter::call::is_symbolic_fnaddr(
+                                if majit_jitcode::codewriter::call::is_symbolic_fnaddr(
                                     concrete_ptr as i64,
                                 ) {
                                     return report_symbolic_residual_call_target(
@@ -9514,7 +9514,7 @@ where
                                 ) {
                                     return action;
                                 }
-                                if majit_translate::codewriter::call::is_symbolic_fnaddr(
+                                if majit_jitcode::codewriter::call::is_symbolic_fnaddr(
                                     concrete_ptr as i64,
                                 ) {
                                     return report_symbolic_residual_call_target(
@@ -9629,7 +9629,7 @@ where
                                 ) {
                                     return action;
                                 }
-                                if majit_translate::codewriter::call::is_symbolic_fnaddr(
+                                if majit_jitcode::codewriter::call::is_symbolic_fnaddr(
                                     concrete_ptr as i64,
                                 ) {
                                     return report_symbolic_residual_call_target(
@@ -9861,7 +9861,7 @@ where
                                 ) {
                                     return action;
                                 }
-                                if majit_translate::codewriter::call::is_symbolic_fnaddr(
+                                if majit_jitcode::codewriter::call::is_symbolic_fnaddr(
                                     concrete_ptr as i64,
                                 ) {
                                     return report_symbolic_residual_call_target(
@@ -9929,7 +9929,7 @@ where
                                 ) {
                                     return action;
                                 }
-                                if majit_translate::codewriter::call::is_symbolic_fnaddr(
+                                if majit_jitcode::codewriter::call::is_symbolic_fnaddr(
                                     concrete_ptr as i64,
                                 ) {
                                     return report_symbolic_residual_call_target(
@@ -10043,7 +10043,7 @@ where
                                 ) {
                                     return action;
                                 }
-                                if majit_translate::codewriter::call::is_symbolic_fnaddr(
+                                if majit_jitcode::codewriter::call::is_symbolic_fnaddr(
                                     concrete_ptr as i64,
                                 ) {
                                     return report_symbolic_residual_call_target(
@@ -10275,7 +10275,7 @@ where
                 ) {
                     return action;
                 }
-                if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+                if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
                     return report_symbolic_residual_call_target(
                         ctx,
                         concrete_ptr as usize,
@@ -10402,7 +10402,7 @@ where
                 ) {
                     return action;
                 }
-                if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+                if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
                     return report_symbolic_residual_call_target(
                         ctx,
                         concrete_ptr as usize,
@@ -10531,7 +10531,7 @@ where
                 ) {
                     return action;
                 }
-                if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+                if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
                     return report_symbolic_residual_call_target(
                         ctx,
                         concrete_ptr as usize,
@@ -13384,7 +13384,7 @@ mod tests {
         size: usize,
         vtable: u64,
     ) -> crate::blackhole::BhDescr {
-        let spec = majit_translate::jitcode::BhFieldSpec {
+        let spec = majit_jitcode::jitcode::BhFieldSpec {
             index: 0,
             field_key: field.to_string(),
             name: field.to_string(),
@@ -13407,7 +13407,7 @@ mod tests {
             is_immutable: false,
             is_quasi_immutable: false,
             index_in_parent: Some(0),
-            parent: Some(std::sync::Arc::new(majit_translate::jitcode::BhSizeSpec {
+            parent: Some(std::sync::Arc::new(majit_jitcode::jitcode::BhSizeSpec {
                 size,
                 type_id,
                 vtable,
@@ -13899,7 +13899,7 @@ mod tests {
     #[test]
     fn recursive_call_assembler_records_fresh_frame_and_returns_result() {
         RECURSIVE_CALLEE_ARG.with(|c| c.set(-1));
-        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
 
         // Caller jitcode: recurse (decision = CallAssembler), result into reg
         // 0, then return reg 0.  The callee runs with a fresh frame, so no
@@ -14045,7 +14045,7 @@ mod tests {
     #[test]
     fn a_residual_decision_still_reaches_call_assembler_through_the_token_seam() {
         RECURSIVE_CALLEE_ARG.with(|c| c.set(-1));
-        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
 
         let mut caller_builder = JitCodeBuilder::new();
         caller_builder.recursive_call_int(0, 0, &[], &[]);
@@ -14118,7 +14118,7 @@ mod tests {
     #[test]
     fn recursive_call_assembler_ref_records_and_returns_result() {
         RECURSIVE_CALLEE_ARG.with(|c| c.set(-1));
-        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
 
         let mut caller_builder = JitCodeBuilder::new();
         caller_builder.recursive_call_ref(0, 0, &[], &[]);
@@ -14185,7 +14185,7 @@ mod tests {
     #[test]
     fn recursive_call_assembler_float_records_and_returns_result() {
         RECURSIVE_CALLEE_ARG.with(|c| c.set(-1));
-        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
 
         let mut caller_builder = JitCodeBuilder::new();
         caller_builder.recursive_call_float(0, 0, &[], &[]);
@@ -14252,7 +14252,7 @@ mod tests {
     #[test]
     fn recursive_call_assembler_void_records_and_runs_side_effect() {
         RECURSIVE_CALLEE_ARG.with(|c| c.set(-1));
-        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
 
         let mut caller_builder = JitCodeBuilder::new();
         caller_builder.recursive_call_void(0, &[], &[]);
@@ -14383,7 +14383,7 @@ mod tests {
 
     #[test]
     fn recursive_portal_merge_point_cuts_to_call_assembler() {
-        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
         // Portal body: a merge point THEN a return.  The merge point is
         // reached at portal_call_depth > 0 (inlined), triggering the
         // else-branch cut; the trailing `int_return` must NOT be traced (the
@@ -14714,7 +14714,7 @@ mod tests {
         // the setter at the real index — one spurious write per failure.
         // The snapshot's liveness decode reads the `-live-` marker in front of
         // the vable op (`lower_vable.rs`, jtransform.py:764/798/814/845/926).
-        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         builder.live(&mut asm, &[0, 1], &[0], &[]);
         builder.vable_setarrayitem_int_with_base(0, 0, 0, 1);
@@ -14816,7 +14816,7 @@ mod tests {
         // `_get_arrayitem_vable_index` then promotes the index (:1201-1216).
         // One opcode, two guards, and upstream captures resume data at each
         // `implement_guard_value` — so neither may be left unstamped.
-        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         builder.live(&mut asm, &[0, 1], &[0], &[]);
         builder.vable_setarrayitem_int_with_base(0, 0, 0, 1);
@@ -15309,7 +15309,7 @@ mod tests {
 
     #[test]
     fn jitcode_call_may_force_marks_standard_virtualizable_token_and_guards() {
-        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
         let mut obj = ResidualVable { token: 0 };
         let obj_ptr = (&mut obj as *mut ResidualVable) as usize as i64;
 
@@ -15546,7 +15546,7 @@ mod tests {
 
     #[test]
     fn residual_call_can_raise_records_guard_no_exception_on_success() {
-        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         let fn_idx = builder.add_fn_ptr(residual_void_no_args as *const ());
         builder.residual_call_void_canonical_via_target_with_effect_info(
@@ -15574,7 +15574,7 @@ mod tests {
 
     #[test]
     fn residual_call_exception_records_guard_exception_and_routes_to_handler() {
-        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         let handler = builder.new_label();
         let fn_idx = builder.add_fn_ptr(residual_void_raises as *const ());
@@ -15632,7 +15632,7 @@ mod tests {
             &[],
             residual_effect(majit_ir::descr::ExtraEffect::CannotRaise),
         );
-        let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments([
+        let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments([
             "symbolic_residual_after_concrete_residual",
         ]);
         let symbolic_idx = builder.add_fn_ptr(symbolic as usize as *const ());
@@ -15704,10 +15704,10 @@ mod tests {
         let _counter_guard = SYMBOLIC_RESIDUAL_COUNTER_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let first = majit_translate::codewriter::call::symbolic_fnaddr_for_segments([
+        let first = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments([
             "reachable_symbolic_preflight_first_target",
         ]);
-        let second = majit_translate::codewriter::call::symbolic_fnaddr_for_segments([
+        let second = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments([
             "reachable_symbolic_preflight_second_target",
         ]);
         assert_ne!(first, second);
@@ -15818,7 +15818,7 @@ mod tests {
             }
         }
 
-        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         builder.load_const_i_value(0, 0);
         let live_pc = builder.current_pos();
@@ -15890,7 +15890,7 @@ mod tests {
 
     #[test]
     fn jitcode_residual_call_int_may_force_marks_standard_virtualizable_token_and_guards() {
-        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
         let mut obj = ResidualVable { token: 0 };
         let obj_ptr = (&mut obj as *mut ResidualVable) as usize as i64;
 
@@ -15951,7 +15951,7 @@ mod tests {
 
     #[test]
     fn jitcode_residual_call_ref_may_force_marks_standard_virtualizable_token_and_guards() {
-        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
         let mut obj = ResidualVable { token: 0 };
         let obj_ptr = (&mut obj as *mut ResidualVable) as usize as i64;
 
@@ -16012,7 +16012,7 @@ mod tests {
 
     #[test]
     fn jitcode_residual_call_float_may_force_marks_standard_virtualizable_token_and_guards() {
-        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
         let mut obj = ResidualVable { token: 0 };
         let obj_ptr = (&mut obj as *mut ResidualVable) as usize as i64;
 
@@ -16109,7 +16109,7 @@ mod tests {
 
         // Non-constant operands (input args 5 < 3 = false): the compare and
         // the GuardFalse are materialised.
-        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         let target = builder.new_label();
         builder.live(&mut asm, &[0, 1], &[], &[]);
@@ -16162,7 +16162,7 @@ mod tests {
 
     fn context_with_liveness(
         types: &[majit_ir::Type],
-        asm: &majit_translate::codewriter::assembler::Assembler,
+        asm: &majit_jitcode::codewriter::assembler::Assembler,
     ) -> TraceCtx {
         let mut staticdata = crate::MetaInterpStaticData::new();
         staticdata.op_live = crate::jitcode::insns::BC_LIVE as i32;
@@ -16178,7 +16178,7 @@ mod tests {
         types: &[majit_ir::Type],
         jitcode: &JitCode,
         argboxes: &[(JitArgKind, OpRef, i64)],
-        asm: &majit_translate::codewriter::assembler::Assembler,
+        asm: &majit_jitcode::codewriter::assembler::Assembler,
     ) -> Vec<OpCode> {
         let mut ctx = context_with_liveness(types, asm);
         let mut sym = DummySym;
@@ -16221,7 +16221,7 @@ mod tests {
             ),
         ];
         for (emit, ptr, want) in cases {
-            let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+            let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
             let mut builder = JitCodeBuilder::new();
             let target = builder.new_label();
             builder.live(&mut asm, &[], &[0], &[]);
@@ -16242,7 +16242,7 @@ mod tests {
     /// short-circuit and guards nothing.
     #[test]
     fn a_second_nullity_branch_on_one_box_is_answered_by_the_heapcache() {
-        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         let first = builder.new_label();
         builder.live(&mut asm, &[], &[0], &[]);
@@ -16270,7 +16270,7 @@ mod tests {
     /// through `FASTPATHS_SAME_BOXES` and would answer the same either way.
     #[test]
     fn a_null_ptr_nullity_branch_rebinds_its_source_register() {
-        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         let target = builder.new_label();
         builder.live(&mut asm, &[], &[0], &[]);
@@ -16313,7 +16313,7 @@ mod tests {
     /// through the alias folds.
     #[test]
     fn a_null_ptr_nullity_branch_replaces_the_box_in_an_aliasing_register() {
-        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         let target = builder.new_label();
         builder.live(&mut asm, &[], &[0, 1], &[]);
@@ -16337,7 +16337,7 @@ mod tests {
     /// recording arithmetic against a box already pinned to a value.
     #[test]
     fn a_guard_value_promote_replaces_the_box_in_an_aliasing_register() {
-        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         builder.live(&mut asm, &[0, 1], &[], &[]);
         builder.int_guard_value(0);
@@ -16360,7 +16360,7 @@ mod tests {
     fn goto_if_not_rebinds_its_condition_register_to_the_proved_constant() {
         // `cond` is an input arg, so the guard cannot be elided; reading it
         // again after the branch is what shows the rebind.
-        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         let target = builder.new_label();
         builder.live(&mut asm, &[0], &[], &[]);
@@ -16387,7 +16387,7 @@ mod tests {
     /// then branches with `replace=False`.
     #[test]
     fn goto_if_not_int_is_true_records_the_folded_int_is_true() {
-        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         let target = builder.new_label();
         builder.live(&mut asm, &[0], &[], &[]);
@@ -16693,7 +16693,7 @@ mod tests {
         assert!(!folded.contains(&OpCode::IntIsZero));
         assert!(!folded.contains(&OpCode::GuardFalse));
 
-        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         let target = builder.new_label();
         builder.live(&mut asm, &[0], &[], &[]);
@@ -16724,7 +16724,7 @@ mod tests {
         assert!(!folded.contains(&OpCode::IntEq));
         assert!(!folded.contains(&OpCode::GuardFalse));
 
-        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         let case_a = builder.new_label();
         let case_b = builder.new_label();
@@ -16800,8 +16800,8 @@ mod tests {
         assert!(ops.contains(&OpCode::GetfieldGcI));
     }
 
-    fn switch_return_jitcode() -> (JitCode, majit_translate::codewriter::assembler::Assembler) {
-        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+    fn switch_return_jitcode() -> (JitCode, majit_jitcode::codewriter::assembler::Assembler) {
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         let case_a = builder.new_label();
         let case_b = builder.new_label();
@@ -17254,7 +17254,7 @@ mod tests {
         // fused compare is NOT folded (opimpl_goto_if_not_int_lt only folds
         // when both operands are Const). 5 < 3 is false, so the guard records
         // `IntLt` + `GuardFalse`. Reg 2 is a live slot for the snapshot.
-        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         let target = builder.new_label();
         builder.load_const_i_value(2, 0);
@@ -17336,7 +17336,7 @@ mod tests {
         // it must not leave the guard with an unusable -1 resume position.
         // Non-constant input-arg operands (regs 0, 1) so the fused compare is
         // recorded rather than folded; 5 < 3 is false → GuardFalse.
-        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         let target = builder.new_label();
         builder.live(&mut asm, &[0, 1], &[], &[]);
@@ -17384,7 +17384,7 @@ mod tests {
 
     #[test]
     fn build_state_field_snapshot_emits_box_tags_for_populated_slots() {
-        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         for i in 0..5 {
             builder.load_const_i_value(i, 0);
@@ -17452,7 +17452,7 @@ mod tests {
 
     #[test]
     fn build_state_field_snapshot_uses_live_indices_only() {
-        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         for i in 0..3 {
             builder.load_const_i_value(i, 0);
@@ -17487,12 +17487,11 @@ mod tests {
 
     #[test]
     fn build_state_field_snapshot_subframe_uses_liveness_and_clears_result_slot() {
-        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
         let mut root_builder = JitCodeBuilder::new();
         root_builder.load_const_i_value(0, 0);
         root_builder.live(&mut asm, &[0], &[], &[]);
-        let root_live_pc =
-            root_builder.current_pos() - (majit_translate::liveness::OFFSET_SIZE + 1);
+        let root_live_pc = root_builder.current_pos() - (majit_jitcode::liveness::OFFSET_SIZE + 1);
         let root_jitcode = {
             let jc = root_builder.finish();
             jc.set_index(0);
@@ -17575,7 +17574,7 @@ mod tests {
 
     #[test]
     fn build_state_field_snapshot_reads_constants_from_liveness() {
-        let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         // Wider than a signed byte so it takes a `constants_i` slot rather
         // than `int_copy`'s inline `USE_C_FORM` encoding — the pool read is

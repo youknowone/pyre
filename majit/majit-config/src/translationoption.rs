@@ -44,11 +44,11 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::config::config::{
+use crate::config::{
     ArbitraryOption, BoolOption, Child, ChoiceOption, Config, ConfigError, DependencyEdge,
     FloatOption, IntOption, Option, OptionDescription, OptionValue, Owner, StrOption,
 };
-use crate::config::support::detect_number_of_processors;
+use crate::support::detect_number_of_processors;
 
 // ---------------------------------------------------------------------
 // Upstream module-level constants. Only those consumed by the schema
@@ -888,7 +888,7 @@ pub fn set_opt_level(config: &Rc<Config>, level: &str) -> Result<(), ConfigError
     //     if config.translation._cfgimpl_value_owners['gc'] != 'suggested':
     //         config.translation.suggest(gc=gc)
     let translation = match config.get("translation")? {
-        crate::config::config::ConfigValue::SubConfig(c) => c,
+        crate::config::ConfigValue::SubConfig(c) => c,
         _ => {
             return Err(ConfigError::Generic(
                 "set_opt_level: `translation` subgroup not found".to_string(),
@@ -910,7 +910,7 @@ pub fn set_opt_level(config: &Rc<Config>, level: &str) -> Result<(), ConfigError
         match *word {
             "nobackendopt" => {
                 let backendopt = match translation.get("backendopt")? {
-                    crate::config::config::ConfigValue::SubConfig(c) => c,
+                    crate::config::ConfigValue::SubConfig(c) => c,
                     _ => {
                         return Err(ConfigError::Generic(
                             "set_opt_level: `translation.backendopt` subgroup not found"
@@ -924,7 +924,7 @@ pub fn set_opt_level(config: &Rc<Config>, level: &str) -> Result<(), ConfigError
             }
             "lowinline" => {
                 let backendopt = match translation.get("backendopt")? {
-                    crate::config::config::ConfigValue::SubConfig(c) => c,
+                    crate::config::ConfigValue::SubConfig(c) => c,
                     _ => {
                         return Err(ConfigError::Generic(
                             "set_opt_level: `translation.backendopt` subgroup not found"
@@ -941,7 +941,7 @@ pub fn set_opt_level(config: &Rc<Config>, level: &str) -> Result<(), ConfigError
             }
             "remove_asserts" => {
                 let backendopt = match translation.get("backendopt")? {
-                    crate::config::config::ConfigValue::SubConfig(c) => c,
+                    crate::config::ConfigValue::SubConfig(c) => c,
                     _ => {
                         return Err(ConfigError::Generic(
                             "set_opt_level: `translation.backendopt` subgroup not found"
@@ -991,7 +991,7 @@ pub fn set_opt_level(config: &Rc<Config>, level: &str) -> Result<(), ConfigError
     // gc is stored but its dependent options (gctransformer,
     // rweakref) may not have been updated yet.
     let current_gc = match translation.get("gc")? {
-        crate::config::config::ConfigValue::Value(v) => v,
+        crate::config::ConfigValue::Value(v) => v,
         _ => {
             return Err(ConfigError::Generic(
                 "set_opt_level: `translation.gc` is not a leaf option".to_string(),
@@ -1063,7 +1063,7 @@ mod tests {
     fn combined_config_seeds_translating_false_by_default() {
         let config = fresh_combined();
         match config.get("translating").expect("translating leaf") {
-            crate::config::config::ConfigValue::Value(OptionValue::Bool(v)) => {
+            crate::config::ConfigValue::Value(OptionValue::Bool(v)) => {
                 assert!(!v, "upstream `:290-292` default=False");
             }
             other => panic!("translating should be a Bool leaf, got {:?}", other),
@@ -1074,7 +1074,7 @@ mod tests {
     fn combined_config_with_translating_true_sets_leaf() {
         let config = get_combined_translation_config(None, None, None, true).expect("combined");
         match config.get("translating").expect("translating leaf") {
-            crate::config::config::ConfigValue::Value(OptionValue::Bool(v)) => {
+            crate::config::ConfigValue::Value(OptionValue::Bool(v)) => {
                 assert!(v, "upstream `:306-307` sets translating=True");
             }
             other => panic!("translating should be a Bool leaf, got {:?}", other),
@@ -1085,7 +1085,7 @@ mod tests {
     fn translation_verbose_defaults_to_false() {
         let config = fresh_combined();
         match config.get("translation.verbose").expect("verbose") {
-            crate::config::config::ConfigValue::Value(OptionValue::Bool(v)) => {
+            crate::config::ConfigValue::Value(OptionValue::Bool(v)) => {
                 assert!(!v, "upstream `:134-135` default=False");
             }
             other => panic!("verbose should be Bool leaf, got {:?}", other),
@@ -1096,7 +1096,7 @@ mod tests {
     fn translation_gc_defaults_to_ref_choice() {
         let config = fresh_combined();
         match config.get("translation.gc").expect("gc") {
-            crate::config::config::ConfigValue::Value(OptionValue::Choice(s)) => {
+            crate::config::ConfigValue::Value(OptionValue::Choice(s)) => {
                 assert_eq!(s, "ref", "upstream `:65-82` default=ref");
             }
             other => panic!("gc should be Choice leaf, got {:?}", other),
@@ -1107,7 +1107,7 @@ mod tests {
     fn translation_backend_defaults_to_c() {
         let config = fresh_combined();
         match config.get("translation.backend").expect("backend") {
-            crate::config::config::ConfigValue::Value(OptionValue::Choice(s)) => {
+            crate::config::ConfigValue::Value(OptionValue::Choice(s)) => {
                 assert_eq!(s, "c", "upstream `:51-56` default=c");
             }
             other => panic!("backend should be Choice leaf, got {:?}", other),
@@ -1121,7 +1121,7 @@ mod tests {
             .get("translation.backendopt.inline_threshold")
             .expect("inline_threshold")
         {
-            crate::config::config::ConfigValue::Value(OptionValue::Float(v)) => {
+            crate::config::ConfigValue::Value(OptionValue::Float(v)) => {
                 assert_eq!(v, DEFL_INLINE_THRESHOLD);
             }
             other => panic!("inline_threshold should be Float leaf, got {:?}", other),
@@ -1135,10 +1135,10 @@ mod tests {
             .get("translation.backendopt")
             .expect("backendopt subgroup")
         {
-            crate::config::config::ConfigValue::SubConfig(sub) => {
+            crate::config::ConfigValue::SubConfig(sub) => {
                 // `none` option inside the nested description.
                 match sub.get("none").expect("backendopt.none") {
-                    crate::config::config::ConfigValue::Value(OptionValue::None) => {
+                    crate::config::ConfigValue::Value(OptionValue::None) => {
                         // upstream `:255-261` has no default → None sentinel.
                     }
                     other => panic!("backendopt.none default should be None, got {:?}", other),
@@ -1154,14 +1154,14 @@ mod tests {
         set_opt_level(&config, "0").expect("opt level 0");
         // gc should now be "boehm" (suggested).
         match config.get("translation.gc").expect("gc") {
-            crate::config::config::ConfigValue::Value(OptionValue::Choice(s)) => {
+            crate::config::ConfigValue::Value(OptionValue::Choice(s)) => {
                 assert_eq!(s, "boehm", "OPT_TABLE['0'] suggests boehm");
             }
             _ => panic!("unexpected gc shape"),
         }
         // backendopt.none should now be true.
         match config.get("translation.backendopt.none").expect("none") {
-            crate::config::config::ConfigValue::Value(OptionValue::Bool(v)) => {
+            crate::config::ConfigValue::Value(OptionValue::Bool(v)) => {
                 assert!(v, "nobackendopt word must set backendopt.none=True");
             }
             _ => panic!("unexpected backendopt.none shape"),
