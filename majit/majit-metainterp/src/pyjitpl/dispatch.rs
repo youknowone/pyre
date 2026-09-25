@@ -2533,7 +2533,7 @@ where
         {
             return None;
         }
-        if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr) {
+        if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr) {
             return None;
         }
         let concrete = unsafe {
