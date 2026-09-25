@@ -551,18 +551,17 @@ impl ArenaCollection {
     /// Recompute the covering bound from `arena_ranges`. Arenas are few, and
     /// this runs only when one is allocated or freed.
     fn refresh_arena_bound(&mut self) {
-        let mut lowest = usize::MAX;
-        let mut highest = 0usize;
-        for &(start, end, _) in &self.arena_ranges {
-            if start < lowest {
-                lowest = start;
-            }
-            if end > highest {
-                highest = end;
-            }
+        // Ranges are sorted by start and every arena has `arena_size` bytes,
+        // so the first start and the last end are the covering bounds.
+        if let (Some(&(start, _, _)), Some(&(_, end, _))) =
+            (self.arena_ranges.first(), self.arena_ranges.last())
+        {
+            self.arena_bound_start = start;
+            self.arena_bound_end = end;
+        } else {
+            self.arena_bound_start = usize::MAX;
+            self.arena_bound_end = 0;
         }
-        self.arena_bound_start = lowest;
-        self.arena_bound_end = highest;
     }
 
     /// Exact allocated-block membership for the arena allocator.

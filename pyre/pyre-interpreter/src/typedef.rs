@@ -3757,7 +3757,7 @@ fn module_require(
 
 pub(crate) fn module_repr_string(module: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
     use crate::display::wtf8_format;
-    let importlib = crate::importing::get_sys_module("_frozen_importlib");
+    let importlib = crate::importing::importlib_bootstrap_module();
     if let Some(importlib) = importlib {
         let repr_fn = crate::baseobjspace::getattr_str(importlib, "_module_repr")?;
         let result = crate::call::call_function_impl_result(repr_fn, &[module])?;

@@ -1802,7 +1802,7 @@ fn seed_create_builtin_attrs(module: PyObjectRef) {
 fn set_builtin_module_spec(name: &str, module: PyObjectRef) -> Result<(), crate::PyError> {
     use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
 
-    let Some(bootstrap) = get_sys_module("_frozen_importlib") else {
+    let Some(bootstrap) = importlib_bootstrap_module() else {
         return Ok(());
     };
 
@@ -1897,7 +1897,7 @@ fn set_builtin_module_spec(_name: &str, _module: PyObjectRef) -> Result<(), crat
 fn extension_module_spec(name: &str, pathname: &Path) -> PyObjectRef {
     use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
 
-    let Some(ext) = get_sys_module("_frozen_importlib_external") else {
+    let Some(ext) = importlib_bootstrap_external_module() else {
         return pyre_object::PY_NULL;
     };
     let _roots = push_roots();
@@ -1938,8 +1938,8 @@ fn set_extension_module_spec(
     use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
 
     let (Some(bootstrap), Some(ext)) = (
-        get_sys_module("_frozen_importlib"),
-        get_sys_module("_frozen_importlib_external"),
+        importlib_bootstrap_module(),
+        importlib_bootstrap_external_module(),
     ) else {
         return Ok(());
     };
@@ -2007,7 +2007,7 @@ fn fix_up_source_module_spec(
 ) -> Result<bool, crate::PyError> {
     use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
 
-    let Some(ext) = get_sys_module("_frozen_importlib_external") else {
+    let Some(ext) = importlib_bootstrap_external_module() else {
         return Ok(false);
     };
     let Some(w_name) = (unsafe { pyre_object::w_dict_getitem_str(ns, "__name__") }) else {
@@ -3350,6 +3350,18 @@ pub fn get_sys_module(name: &str) -> Option<PyObjectRef> {
     check_sys_modules(name)
 }
 
+/// Startup registers `_frozen_importlib`. A test that blocks that name and
+/// loads the source copy leaves the same module at `importlib._bootstrap`.
+pub fn importlib_bootstrap_module() -> Option<PyObjectRef> {
+    get_sys_module("_frozen_importlib").or_else(|| get_sys_module("importlib._bootstrap"))
+}
+
+/// Same pair as [`importlib_bootstrap_module`] for the external bootstrap.
+pub fn importlib_bootstrap_external_module() -> Option<PyObjectRef> {
+    get_sys_module("_frozen_importlib_external")
+        .or_else(|| get_sys_module("importlib._bootstrap_external"))
+}
+
 /// `space.getbuiltinmodule(name)` — the module object for a registered builtin,
 /// minted on the first ask.
 ///
@@ -4669,7 +4681,14 @@ fn load_source_module(
     // the prepare-module path is ported.
     // A package's `__init__.py` is its own `__package__`; a plain module's
     // `__package__` is its containing package.
-    let pkg = if package_dir.is_some() {
+    // Frozen top-level modules have an empty `__package__`. The two bootstrap
+    // names are loaded as top-level modules, not as `importlib` submodules.
+    let pkg = if matches!(
+        modulename,
+        "_frozen_importlib" | "_frozen_importlib_external"
+    ) {
+        ""
+    } else if package_dir.is_some() {
         modulename
     } else if let Some(dot) = modulename.rfind('.') {
         &modulename[..dot]
@@ -4837,15 +4856,23 @@ fn install_importlib_bootstrap(
     // accepts, calls `FrozenImporter._fix_up_module`. That helper reads the
     // public `__origname__` and rejects a `__file__` the source exec stored.
     // `set_frozen_alias_metadata` writes the same origname again afterwards.
+    let origname = pyre_object::w_str_new_managed("importlib._bootstrap");
+    let origname_slot = shadow_stack_len();
+    let _ = pin_root(origname);
     let w_dict = unsafe { pyre_object::w_module_get_w_dict(shadow_stack_get(module_slot)) };
     if !w_dict.is_null() {
         unsafe {
             pyre_object::w_dict_delitem_str(w_dict, "__file__");
             pyre_object::w_dict_delitem_str(w_dict, "__cached__");
+        }
+    }
+    let w_dict = unsafe { pyre_object::w_module_get_w_dict(shadow_stack_get(module_slot)) };
+    if !w_dict.is_null() {
+        unsafe {
             pyre_object::w_dict_setitem_str(
                 w_dict,
                 "__origname__",
-                pyre_object::w_str_new_managed("importlib._bootstrap"),
+                shadow_stack_get(origname_slot),
             );
         }
     }
@@ -5754,7 +5781,7 @@ pub(crate) fn wait_initializing_module(
     let _roots = push_roots();
     let mod_slot = shadow_stack_len();
     let _ = pin_root(w_module);
-    let Some(w_bootstrap) = get_sys_module("_frozen_importlib") else {
+    let Some(w_bootstrap) = importlib_bootstrap_module() else {
         return Ok(None);
     };
     let bootstrap_slot = shadow_stack_len();
@@ -5877,7 +5904,7 @@ pub(crate) fn handle_fromlist_fast(
     let _ = pin_root(w_mod);
     let fromlist_slot = shadow_stack_len();
     let _ = pin_root(w_fromlist);
-    let Some(w_bootstrap) = get_sys_module("_frozen_importlib") else {
+    let Some(w_bootstrap) = importlib_bootstrap_module() else {
         return Ok(None);
     };
     let bootstrap_slot = shadow_stack_len();
@@ -6297,7 +6324,7 @@ pub(crate) fn dunder_import_package_fromlist(
         handle_fromlist_fast(shadow_stack_get(mod_slot), shadow_stack_get(fromlist_slot))?
     {
         return Ok(w_handled);
-    } else if get_sys_module("_frozen_importlib").is_none() {
+    } else if importlib_bootstrap_module().is_none() {
         // `interp_import.py interp___import__` returns from both
         // arms of the package test; the `_handle_fromlist` it
         // calls is always installed upstream.  While the
@@ -6392,7 +6419,7 @@ pub(crate) fn dunder_import_slow(
     }
 
     // Slow path: the app-level `_bootstrap.__import__`.
-    if let Some(w_bootstrap) = get_sys_module("_frozen_importlib") {
+    if let Some(w_bootstrap) = importlib_bootstrap_module() {
         let bootstrap_slot = shadow_stack_len();
         let _ = pin_root(w_bootstrap);
         if let Some(w_import) =
@@ -6651,7 +6678,7 @@ pub fn dunder_import_name_obj(
     };
     let _ = pin_root(w_fromlist);
 
-    let bootstrap = if let Some(w_bootstrap) = get_sys_module("_frozen_importlib") {
+    let bootstrap = if let Some(w_bootstrap) = importlib_bootstrap_module() {
         let bootstrap_slot = shadow_stack_len();
         let _ = pin_root(w_bootstrap);
         crate::baseobjspace::findattr_result(shadow_stack_get(bootstrap_slot), "__import__")?
@@ -7374,7 +7401,7 @@ pub(crate) fn is_spec_uninitialized_submodule(
 /// `has_location` is the `_set_fileattr` field (`_bootstrap.py has_location`);
 /// a subclass or a custom spec object must go through the public name.
 fn is_exact_stdlib_module_spec(w_spec: PyObjectRef) -> bool {
-    let Some(bootstrap) = get_sys_module("_frozen_importlib") else {
+    let Some(bootstrap) = importlib_bootstrap_module() else {
         return false;
     };
     let dict = unsafe { pyre_object::w_module_get_w_dict(bootstrap) };
