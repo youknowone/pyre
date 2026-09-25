@@ -7084,21 +7084,25 @@ pub fn _float_atanh_raw(x: f64) -> f64 {
 float_math1_leaf!(pub _float_asinh, |x| _float_asinh_raw(x));
 float_math1_leaf!(pub _float_acosh, |x| _float_acosh_raw(x));
 float_math1_leaf!(pub _float_atanh, |x| _float_atanh_raw(x));
-// crates.io pymath is not in the Charon artefact, so these residualize.
-// Interpreter `math1_pymath` already boxed the pymath `Ok` via `_float_pos`.
-float_math1_leaf!(pub _float_erf, |x| pymath::math::erf(x).unwrap_or(f64::NAN));
-float_math1_leaf!(pub _float_erfc, |x| pymath::math::erfc(x).unwrap_or(f64::NAN));
 
-/// Unboxed `f64 -> f64` sibling of a leaf whose overflow is a non-finite
-/// result. The gateway tests that result and boxes it with `_float_pos`.
+/// `ll_math.py` C calls (`llexternal(.., elidable_function=True)`) the
+/// crates.io pymath port answers; that crate is not in the Charon artefact,
+/// so each is one elidable residual.
 macro_rules! float_math1_raw {
     ($fn:ident, |$x:ident| $compute:expr) => {
-        #[inline(never)]
+        #[majit_macros::elidable]
         pub fn $fn($x: f64) -> f64 {
             $compute
         }
     };
 }
+
+float_math1_raw!(_float_erf_raw, |x| pymath::math::erf(x).unwrap_or(f64::NAN));
+float_math1_raw!(_float_erfc_raw, |x| pymath::math::erfc(x)
+    .unwrap_or(f64::NAN));
+float_math1_raw!(_float_ulp_raw, |x| pymath::math::ulp(x));
+float_math1_leaf!(pub _float_erf, |x| _float_erf_raw(x));
+float_math1_leaf!(pub _float_erfc, |x| _float_erfc_raw(x));
 
 float_math1_raw!(_float_gamma_raw, |x| pymath::math::gamma(x)
     .unwrap_or(f64::NAN));
@@ -7108,9 +7112,9 @@ float_math1_leaf!(pub _float_sinh, |x| x.sinh());
 float_math1_leaf!(pub _float_cosh, |x| x.cosh());
 float_math1_leaf!(pub _float_exp2, |x| x.exp2());
 float_math1_leaf!(pub _float_expm1, |x| x.exp_m1());
-float_math1_leaf!(pub _float_gamma, |x| pymath::math::gamma(x).unwrap_or(f64::NAN));
-float_math1_leaf!(pub _float_lgamma, |x| pymath::math::lgamma(x).unwrap_or(f64::NAN));
-float_math1_leaf!(pub _float_ulp, |x| pymath::math::ulp(x));
+float_math1_leaf!(pub _float_gamma, |x| _float_gamma_raw(x));
+float_math1_leaf!(pub _float_lgamma, |x| _float_lgamma_raw(x));
+float_math1_leaf!(pub _float_ulp, |x| _float_ulp_raw(x));
 // pymath::math::{degrees,radians} is `x * (180/π)` / `x * (π/180)`.
 float_math1_leaf!(pub _float_degrees, |x| x * (180.0 / std::f64::consts::PI));
 float_math1_leaf!(pub _float_radians, |x| x * (std::f64::consts::PI / 180.0));
@@ -7136,11 +7140,23 @@ macro_rules! float_math2_leaf {
 }
 
 float_math2_leaf!(_float_pow, |x, y| x.powf(y));
-float_math2_leaf!(_float_fmod, |x, y| x % y);
 float_math2_leaf!(_float_copysign, |x, y| x.copysign(y));
-float_math2_leaf!(_float_remainder, |x, y| {
+
+/// `ll_math.py` `math_fmod` (`llexternal(.., elidable_function=True)`); `%`
+/// over two floats is not an RPython operation.
+#[majit_macros::elidable]
+pub fn _float_fmod_raw(x: f64, y: f64) -> f64 {
+    x % y
+}
+
+#[majit_macros::elidable]
+pub fn _float_remainder_raw(x: f64, y: f64) -> f64 {
     pymath::math::remainder(x, y).unwrap_or(f64::NAN)
-});
+}
+
+float_math2_leaf!(_float_fmod, |x, y| _float_fmod_raw(x, y));
+
+float_math2_leaf!(_float_remainder, |x, y| _float_remainder_raw(x, y));
 float_math2_leaf!(_float_atan2, |x, y| x.atan2(y));
 
 /// `math.floor`/`ceil`/`trunc` after the signed-range pin: `W_IntObject`.
@@ -7177,7 +7193,7 @@ int_from_float_leaf!(_int_from_trunc, |x| unsafe { x.to_int_unchecked::<i64>() }
 /// their jitcode records it directly.
 macro_rules! frexp_exponent_bits {
     ($x:expr) => {{
-        let bits = unsafe { std::mem::transmute::<f64, i64>($x) };
+        let bits = $x.to_bits() as i64;
         ((bits >> 52) & 0x7ff) - 1022
     }};
 }
@@ -7189,10 +7205,10 @@ pub fn _int_frexp_exponent_raw(x: f64) -> i64 {
 
 /// ll_math.py `ll_math_frexp` mantissa half for the same operand.
 float_math1_leaf!(pub _float_frexp_mantissa, |x| {
-    let bits = unsafe { std::mem::transmute::<f64, i64>(x) };
+    let bits = x.to_bits() as i64;
     let sign = bits & i64::MIN;
     let fraction = bits & ((1i64 << 52) - 1);
-    unsafe { std::mem::transmute::<i64, f64>(sign | (1022i64 << 52) | fraction) }
+    f64::from_bits((sign | (1022i64 << 52) | fraction) as u64)
 });
 int_from_float_leaf!(_int_frexp_exponent, |x| frexp_exponent_bits!(x));
 
@@ -7202,7 +7218,7 @@ int_from_float_leaf!(_int_frexp_exponent, |x| frexp_exponent_bits!(x));
 /// The boxing leaf below spells the same product in its own body.
 macro_rules! ldexp_exact_bits {
     ($x:expr, $exp:expr) => {
-        $x * unsafe { std::mem::transmute::<i64, f64>(($exp + 1023) << 52) }
+        $x * f64::from_bits((($exp + 1023) << 52) as u64)
     };
 }
 
