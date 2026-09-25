@@ -6192,14 +6192,21 @@ impl<M: Clone> MetaInterp<M> {
             return BackEdgeAction::AlreadyTracing;
         }
 
-        // Force-start via the typed greenkey when the raw (code, pc) is
-        // present so the cell carries a `comparekey` like the back-edge
-        // path; synthetic (0, 0) call sites keep the legacy u64 path.
-        let hot = match Self::with_typed_decision_key(green_key, green_key_raw, |key| {
+        // `JitCell.__init__(*greenargs)` stores the greens on the cell.
+        // The portal spelling is `with_typed_decision_key`. A driver whose
+        // greens are not that spelling still handed `green_key_values` in;
+        // installing through the hash alone leaves a comparekey-less cell,
+        // and the later `ensure_jit_cell_at_key` chains a second cell for
+        // the same greens. Only a caller with neither key stays on the hash.
+        let hot = if let Some(hot) =
+            Self::with_typed_decision_key(green_key, green_key_raw, |key| {
+                self.warm_state.force_start_tracing_for_key(key)
+            }) {
+            hot
+        } else if let Some(key) = green_key_values.as_ref() {
             self.warm_state.force_start_tracing_for_key(key)
-        }) {
-            Some(h) => h,
-            None => self.warm_state.force_start_tracing(green_key),
+        } else {
+            self.warm_state.force_start_tracing(green_key)
         };
         match hot {
             HotResult::NotHot => BackEdgeAction::Interpret,
@@ -6216,6 +6223,11 @@ impl<M: Clone> MetaInterp<M> {
                     self.warm_state.cell_key_for(key)
                 })
                 .flatten()
+                .or_else(|| {
+                    green_key_values
+                        .as_ref()
+                        .and_then(|key| self.warm_state.cell_key_for(key))
+                })
                 .unwrap_or(green_key);
                 self.prepare_trace_start_runtime();
                 self.setup_tracing(
