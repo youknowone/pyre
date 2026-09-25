@@ -9824,15 +9824,26 @@ pub fn space_int(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
 /// `intobject.py` / `longobject.py` `_int_w`. For non-int/long
 /// objects, delegate to `space_int` (the `space.int(self)` protocol)
 /// and then re-apply `_int_w`. `allow_conversion=True` is implicit —
-/// the `unwrap_spec` call sites that pyre supports all opt in.
+/// the `unwrap_spec` call sites that pyre supports all opt in; the
+/// explicit spelling is [`int_w_allow_conversion`].
 ///
 /// Floats are explicitly rejected by `floatobject.py:177`.
 pub fn int_w(obj: PyObjectRef) -> Result<i64, PyError> {
+    int_w_allow_conversion(obj, true)
+}
+
+/// baseobjspace.py `ObjSpace.int_w(w_obj, allow_conversion)`; see
+/// [`int_w`].  With `allow_conversion=False` an object that is neither an
+/// `int` nor a `long` takes `W_Root._int_w`, `_typed_unwrap_error(space,
+/// "integer")`.
+pub fn int_w_allow_conversion(obj: PyObjectRef, allow_conversion: bool) -> Result<i64, PyError> {
     if obj.is_null() {
         return Err(PyError::type_error("int_w: null object"));
     }
-    // floatobject.py `int_w` — floats are explicitly rejected.
-    if unsafe { pyre_object::pyobject::is_float(obj) } {
+    // floatobject.py `int_w` — floats are explicitly rejected.  Without
+    // conversion a float reaches `_typed_unwrap_error` below, which is the
+    // message `W_FloatObject.int_w` raises.
+    if allow_conversion && unsafe { pyre_object::pyobject::is_float(obj) } {
         return Err(PyError::type_error(
             "an integer is required (got type float)",
         ));
@@ -9854,6 +9865,14 @@ pub fn int_w(obj: PyObjectRef) -> Result<i64, PyError> {
             return Ok(pyre_object::longobject::jit_bigint_to_i64_value(big));
         }
         return Err(PyError::overflow_error("int too large to convert to int"));
+    }
+    if !allow_conversion {
+        // baseobjspace.py `W_Root._int_w` → `_typed_unwrap_error(space,
+        // "integer")`, `"expected %s, got %T object"`.
+        return Err(PyError::type_error(format!(
+            "expected integer, got {} object",
+            object_functionstr_type_name(obj)
+        )));
     }
     // baseobjspace.py `w_obj = space.int(self)` — __int__ or __index__.
     let w_obj = space_int(obj)?;
