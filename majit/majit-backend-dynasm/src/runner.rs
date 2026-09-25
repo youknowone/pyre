@@ -3160,11 +3160,7 @@ impl Backend for DynasmBackend {
         // The assembler stores the typed `Const` pool directly; each box
         // variant carries its own type (`Const::get_type`).
         let const_pool = std::mem::take(&mut self.constants);
-        if std::env::var("MAJIT_TRACE_OPS_DIAG")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            == Some(trace_id)
-        {
+        if crate::trace_ops_diag_id() == Some(trace_id) {
             let constants: indexmap::IndexMap<u32, i64> = const_pool
                 .iter()
                 .map(|(&key, value)| (key, value.as_raw_i64()))
@@ -3428,10 +3424,7 @@ impl Backend for DynasmBackend {
         // format_trace reads raw `i64` values; the assembler stores the
         // typed `Const` pool directly (type rides on `Const::get_type`).
         let const_pool = std::mem::take(&mut self.constants);
-        let trace_ops_diag = std::env::var("MAJIT_TRACE_OPS_DIAG")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            == Some(trace_id);
+        let trace_ops_diag = crate::trace_ops_diag_id() == Some(trace_id);
         if trace_ops_diag {
             let constants: IndexMap<u32, i64> = const_pool
                 .iter()

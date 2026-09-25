@@ -2132,7 +2132,7 @@ impl<'a> AssemblerARM64<'a> {
 
         // ── Run register allocator ──
         // assembler.py:537 prepare_loop / assembler.py:638 prepare_bridge
-        if std::env::var_os("MAJIT_J2PLAN_LOG").is_some() {
+        if crate::majit_j2plan_log_enabled() {
             let plan = crate::j2plan::TracePlan::build(inputargs, ops);
             // Independent debug toggle — not gated by MAJIT_LOG.
             eprintln!("[dynasm:j2plan] {}", plan.summary());
@@ -4924,11 +4924,7 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64 ; =>fail_label);
 
         dynasm!(self.mc ; .arch aarch64 ; bl =>save_regs_label);
-        if std::env::var("MAJIT_TRACE_CALL_DIAG")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            == Some(self.trace_id)
-        {
+        if crate::trace_call_diag_id() == Some(self.trace_id) {
             let fail_index = guard_token
                 .fail_descr
                 .as_fail_descr()
@@ -6228,11 +6224,7 @@ impl<'a> AssemblerARM64<'a> {
                 self.store_rax_to_result(op.pos().get());
             }
         }
-        if std::env::var("MAJIT_TRACE_CALL_DIAG")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            == Some(self.trace_id)
-        {
+        if crate::trace_call_diag_id() == Some(self.trace_id) {
             self.emit_push_all_volatile_regs();
             self.emit_mov_imm64(0, op.pos().get().raw() as i64);
             dynasm!(self.mc ; .arch aarch64 ; mov x1, x29);
