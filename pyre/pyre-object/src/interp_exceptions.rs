@@ -333,58 +333,55 @@ pub struct W_ExceptionExtended {
     /// `descr_init` path (matches PyPy's class-default `w_object = None`
     /// — `descr_str` checks `if self.object is None: return ""`).
     pub w_object: PyObjectRef,
-    /// `interp_exceptions.py W_UnicodeTranslateError.w_start`
-    /// (and `:1037` / `:1155` for Decode / Encode).
+    /// `interp_exceptions.py W_UnicodeTranslateError.w_start`, and
+    /// `W_UnicodeDecodeError.w_start` / `W_UnicodeEncodeError.w_start`.
     pub w_start: PyObjectRef,
-    /// `interp_exceptions.py W_UnicodeTranslateError.w_end`
-    /// (and `:1038` / `:1156` for Decode / Encode).
+    /// `interp_exceptions.py W_UnicodeTranslateError.w_end`, and
+    /// `W_UnicodeDecodeError.w_end` / `W_UnicodeEncodeError.w_end`.
     pub w_end: PyObjectRef,
-    /// `interp_exceptions.py W_UnicodeTranslateError.w_reason`
-    /// (and `:1039` / `:1157` for Decode / Encode).
+    /// `interp_exceptions.py W_UnicodeTranslateError.w_reason`, and
+    /// `W_UnicodeDecodeError.w_reason` / `W_UnicodeEncodeError.w_reason`.
     pub w_reason: PyObjectRef,
     /// `interp_exceptions.py W_UnicodeDecodeError.w_encoding` /
-    /// `:1153 W_UnicodeEncodeError.w_encoding`.  `W_UnicodeTranslateError`
+    /// `W_UnicodeEncodeError.w_encoding`.  `W_UnicodeTranslateError`
     /// has no `w_encoding` field per PyPy — left `PY_NULL` for Translate.
     pub w_encoding: PyObjectRef,
     /// `interp_exceptions.py W_OSError.w_errno` — writable
-    /// `readwrite_attrproperty_w('w_errno', W_OSError)` slot (`:739`).
-    /// `PY_NULL` is the class default `None`; the `errno` getattr arm
-    /// falls back to deriving the value from `args_w` when the slot is
-    /// unset (the internal-constructor path that bypasses the public
-    /// setter), so a later `e.errno = x` write persists here.
+    /// `readwrite_attrproperty_w('w_errno', W_OSError)` slot.
+    /// The slot is the value. `PY_NULL` is the class default `None`.
+    /// `W_OSError.descr_new` / `_init_error` fills it.
     pub w_errno: PyObjectRef,
     /// `interp_exceptions.py W_OSError.w_winerror` — the Windows error
     /// code, exposed as the writable `winerror` attribute only on the platform
-    /// that has one (`:723-728` gates the attrproperty on `rwin32.WIN32`).
+    /// that has one — `W_OSError.descr_new` gates it on `rwin32.WIN32`.
     /// PyPy declares the slot everywhere and reads it only under that gate;
     /// keeping it unconditional here leaves one exception layout for every
     /// target instead of a Windows-only field ordering.
     pub w_winerror: PyObjectRef,
     /// `interp_exceptions.py W_OSError.w_strerror` /
-    /// `:740 readwrite_attrproperty_w('w_strerror', W_OSError)`.
+    /// `readwrite_attrproperty_w('w_strerror', W_OSError)`.
+    /// The slot is the value. `PY_NULL` is the class default `None`.
+    /// `W_OSError.descr_new` / `_init_error` fills it.
     pub w_strerror: PyObjectRef,
     /// `interp_exceptions.py W_OSError.w_filename` /
-    /// `:741 readwrite_attrproperty_w('w_filename', W_OSError)`.
+    /// `readwrite_attrproperty_w('w_filename', W_OSError)`.
+    /// The slot is the value. `PY_NULL` is the class default `None`.
+    /// `W_OSError.descr_new` / `_init_error` fills it.
     pub w_filename: PyObjectRef,
     /// `interp_exceptions.py W_OSError.w_filename2` /
-    /// `:742 readwrite_attrproperty_w('w_filename2', W_OSError)`.
+    /// `readwrite_attrproperty_w('w_filename2', W_OSError)`.
+    /// The slot is the value. `PY_NULL` is the class default `None`.
+    /// `W_OSError.descr_new` / `_init_error` fills it.
     pub w_filename2: PyObjectRef,
     /// `interp_exceptions.py W_OSError.written = -1` — the independent
     /// integer slot exposed by the `characters_written` GetSetProperty.
     /// A numeric third argument on an exact BlockingIOError stamps it; later
     /// descriptor writes and deletes mutate this slot without changing args.
     pub written: i64,
-    /// Whether the exact BlockingIOError constructor successfully interpreted
-    /// its third argument through `__index__` as `characters_written`.  This
-    /// is constructor shape, independent of later writes/deletion of
-    /// `written`; CPython continues to suppress `filename` after deletion.
-    pub blocking_written_arg: bool,
     /// `interp_exceptions.py W_SystemExit.w_code` /
-    /// `:1006 readwrite_attrproperty_w('w_code', W_SystemExit)`.
-    /// `PY_NULL` is the class default `None`; the `code` getattr arm
-    /// derives the value from `args_w` (descr_init: `args_w[0]` for one
-    /// argument, the args tuple for several) when the slot is unset, and
-    /// a later `e.code = x` write persists here ahead of that fallback.
+    /// `readwrite_attrproperty_w('w_code', W_SystemExit)`.
+    /// The slot is the value. `PY_NULL` is the class default `None`.
+    /// `W_SystemExit.descr_init` fills it.
     pub w_code: PyObjectRef,
     /// `interp_exceptions.py W_StopIteration.w_value` — initialized to
     /// None, replaced with the first argument by `descr_init`, and exposed as
@@ -392,8 +389,8 @@ pub struct W_ExceptionExtended {
     pub w_value: PyObjectRef,
     /// Shared `w_name` slot for the exception kinds that expose a
     /// `name` attribute: `W_ImportError.w_name`
-    /// (`interp_exceptions.py:643`, `:680
-    /// readwrite_attrproperty_w('w_name', W_ImportError)`),
+    /// (`interp_exceptions.py`
+    /// `readwrite_attrproperty_w('w_name', W_ImportError)`),
     /// `W_NameError.w_name` and `W_AttributeError.w_name` (Python
     /// 3.10+).  An exception is exactly one kind, so a single slot
     /// serves all three.  `PY_NULL` is the class default `None`; set
@@ -405,7 +402,7 @@ pub struct W_ExceptionExtended {
     /// `None`.
     pub w_attr_obj: PyObjectRef,
     /// `interp_exceptions.py W_ImportError.w_path` /
-    /// `:681 readwrite_attrproperty_w('w_path', W_ImportError)`, set
+    /// `readwrite_attrproperty_w('w_path', W_ImportError)`, set
     /// from the `path=` keyword.
     pub w_import_path: PyObjectRef,
     /// `W_ImportError.w_name_from` — set from the `name_from=` keyword,
@@ -428,14 +425,21 @@ pub struct W_ExceptionExtended {
     pub w_syntax_end_lineno: PyObjectRef,
     pub w_syntax_end_offset: PyObjectRef,
     pub w_syntax_print_file_and_line: PyObjectRef,
-    /// CPython 3.14's private `SyntaxError._metadata` member.  This is the
-    /// 3.14-specific extension to PyPy's `W_SyntaxError` field set.
+    /// CPython 3.14's private `SyntaxError._metadata` member, a
+    /// `(line, offset, source)` triple.  This is the 3.14-specific extension
+    /// to PyPy's `W_SyntaxError` field set: the pinned stdlib reads it in
+    /// `traceback.py` `StackSummary._extract_from_extended_frame_gen`
+    /// (`self._exc_metadata = getattr(exc_value, "_metadata", None)`) and
+    /// unpacks it in `TracebackException.format_exception_only`.
     pub w_syntax_metadata: PyObjectRef,
     /// `interp_group.py W_BaseExceptionGroup.descr_new` `exc.w_message`,
-    /// exposed as the read-only `message` attrproperty (`:71`).
+    /// exposed as the read-only `message` attrproperty
+    /// (`interp_attrproperty_w('w_message', W_BaseExceptionGroup)`).
     pub w_group_message: PyObjectRef,
     /// `interp_group.py` `exc.w_exceptions`, exposed as the read-only
-    /// `exceptions` attrproperty (`:72`).  This is the immutable tuple built at
+    /// `exceptions` attrproperty
+    /// (`interp_attrproperty_w('w_exceptions', W_BaseExceptionGroup)`).
+    /// This is the immutable tuple built at
     /// construction time, independent of the `args` the caller passed.
     pub w_group_exceptions: PyObjectRef,
     /// The `repr` of the sequence `descr_new` received, rendered before it was
@@ -464,8 +468,6 @@ pub const EXC_W_STRERROR_OFFSET: usize = std::mem::offset_of!(W_ExceptionExtende
 pub const EXC_W_FILENAME_OFFSET: usize = std::mem::offset_of!(W_ExceptionExtended, w_filename);
 pub const EXC_W_FILENAME2_OFFSET: usize = std::mem::offset_of!(W_ExceptionExtended, w_filename2);
 pub const EXC_WRITTEN_OFFSET: usize = std::mem::offset_of!(W_ExceptionExtended, written);
-pub const EXC_BLOCKING_WRITTEN_ARG_OFFSET: usize =
-    std::mem::offset_of!(W_ExceptionExtended, blocking_written_arg);
 pub const EXC_W_CODE_OFFSET: usize = std::mem::offset_of!(W_ExceptionExtended, w_code);
 pub const EXC_W_VALUE_OFFSET: usize = std::mem::offset_of!(W_ExceptionExtended, w_value);
 pub const EXC_W_NAME_OFFSET: usize = std::mem::offset_of!(W_ExceptionExtended, w_exc_name);
@@ -741,47 +743,64 @@ pub fn w_exception_new(kind: ExcKind, message: &str) -> PyObjectRef {
     // string lazily.  Empty message → no args (the `args_w` stays
     // `PY_NULL` so `args` reads as `()`), matching the prebuilt
     // singletons (`MemoryError`, `StopIteration`).
-    if !message.is_empty() {
-        // Root the fresh nursery exception across the arg-list build.
-        // `w_exception_args_new` collects (`collect_and_reserve`), so the
-        // pin is re-read before the store: the local is not rewritten.
-        let _roots = crate::gc_roots::push_roots();
-        let exc_slot = crate::gc_roots::shadow_stack_len();
-        let _ = crate::gc_roots::pin_root(exc);
-        let arg_slot = crate::gc_roots::shadow_stack_len();
-        let _ = crate::gc_roots::pin_root(crate::unicodeobject::w_str_new_managed(message));
-        let arg = crate::gc_roots::shadow_stack_get(arg_slot);
-        let args = w_exception_args_new(vec![arg]);
-        let exc = crate::gc_roots::shadow_stack_get(exc_slot);
-        unsafe {
-            w_exception_set_args(exc, args);
-        }
+    if message.is_empty() {
         return exc;
     }
-    exc
+    // Root the fresh managed exception across the arg-list build: `exc` lives
+    // only in this Rust local while `w_list_new` allocates, so a collection
+    // there could sweep the unrooted (non-moving oldgen) exception before
+    // `w_exception_set_args` writes through it.  `w_exception_args_new` itself
+    // collects (`collect_and_reserve`), so read `exc` back out of the slot
+    // after every allocation rather than carrying the raw local forward.
+    let _roots = crate::gc_roots::push_roots();
+    let exc_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(exc);
+    let arg_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(crate::unicodeobject::w_str_new_managed(message));
+    unsafe {
+        let arg = crate::gc_roots::shadow_stack_get(arg_slot);
+        let args_list = w_exception_args_new(vec![arg]);
+        w_exception_set_args(crate::gc_roots::shadow_stack_get(exc_slot), args_list);
+        // `W_SystemExit.descr_init`: one argument is `w_code`.
+        if kind == ExcKind::SystemExit {
+            w_exception_set_code(
+                crate::gc_roots::shadow_stack_get(exc_slot),
+                crate::gc_roots::shadow_stack_get(arg_slot),
+            );
+        }
+    }
+    crate::gc_roots::shadow_stack_get(exc_slot)
 }
 
 /// Like `w_exception_new` but stores an arbitrary WTF-8 message,
 /// preserving lone surrogates that a `&str` message cannot carry.
 pub fn w_exception_new_wtf8(kind: ExcKind, message: &Wtf8) -> PyObjectRef {
     let exc = w_exception_new_empty(kind);
-    if !message.is_empty() {
-        // See `w_exception_new`: pin `exc` across the allocating arg build
-        // and return the forwarded address. `w_exception_args_new` collects.
-        let _roots = crate::gc_roots::push_roots();
-        let exc_slot = crate::gc_roots::shadow_stack_len();
-        let _ = crate::gc_roots::pin_root(exc);
-        let arg_slot = crate::gc_roots::shadow_stack_len();
-        let _ = crate::gc_roots::pin_root(crate::unicodeobject::w_str_from_wtf8_managed(
-            message.to_wtf8_buf(),
-        ));
-        let arg = crate::gc_roots::shadow_stack_get(arg_slot);
-        let args = w_exception_args_new(vec![arg]);
-        let exc = crate::gc_roots::shadow_stack_get(exc_slot);
-        unsafe { w_exception_set_args(exc, args) };
+    if message.is_empty() {
         return exc;
     }
-    exc
+    // See `w_exception_new`: pin `exc` across the allocating arg build and read
+    // it back out of the slot rather than carrying the raw local forward.
+    let _roots = crate::gc_roots::push_roots();
+    let exc_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(exc);
+    let arg_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(crate::unicodeobject::w_str_from_wtf8_managed(
+        message.to_wtf8_buf(),
+    ));
+    unsafe {
+        let arg = crate::gc_roots::shadow_stack_get(arg_slot);
+        let args_list = w_exception_args_new(vec![arg]);
+        w_exception_set_args(crate::gc_roots::shadow_stack_get(exc_slot), args_list);
+        // `W_SystemExit.descr_init`: one argument is `w_code`.
+        if kind == ExcKind::SystemExit {
+            w_exception_set_code(
+                crate::gc_roots::shadow_stack_get(exc_slot),
+                crate::gc_roots::shadow_stack_get(arg_slot),
+            );
+        }
+    }
+    crate::gc_roots::shadow_stack_get(exc_slot)
 }
 
 /// Allocate a `W_BaseException` of `kind` with no constructor args
@@ -942,7 +961,6 @@ fn w_exception_new_empty_extended_impl(kind: ExcKind, immortal: bool) -> PyObjec
         w_filename: PY_NULL,
         w_filename2: PY_NULL,
         written: -1,
-        blocking_written_arg: false,
         w_code: PY_NULL,
         w_value: PY_NULL,
         w_exc_name: PY_NULL,
@@ -1567,8 +1585,9 @@ pub unsafe fn w_exception_set_reason(obj: PyObjectRef, value: PyObjectRef) {
     }
 }
 
-/// `interp_exceptions.py readwrite_attrproperty_w('w_encoding',
-/// ...)` / `:1200 ...` — `e.encoding` reader (Decode / Encode only;
+/// `interp_exceptions.py` `readwrite_attrproperty_w('w_encoding',
+/// W_UnicodeDecodeError)` / `readwrite_attrproperty_w('w_encoding',
+/// W_UnicodeEncodeError)` — `e.encoding` reader (Decode / Encode only;
 /// Translate has no encoding field but the slot is still backed by
 /// `PY_NULL`).
 ///
@@ -1579,8 +1598,9 @@ pub unsafe fn w_exception_get_encoding(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_ExceptionExtended)).w_encoding }
 }
 
-/// `interp_exceptions.py readwrite_attrproperty_w('w_encoding',
-/// ...)` / `:1200 ...` — `e.encoding = ...` writer.
+/// `interp_exceptions.py` `readwrite_attrproperty_w('w_encoding',
+/// W_UnicodeDecodeError)` / `readwrite_attrproperty_w('w_encoding',
+/// W_UnicodeEncodeError)` — `e.encoding = ...` writer.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_BaseException`.
@@ -1729,25 +1749,8 @@ pub unsafe fn w_exception_set_written(obj: PyObjectRef, value: i64) {
     unsafe { (*(obj as *mut W_ExceptionExtended)).written = value };
 }
 
-#[inline]
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_exception_get_blocking_written_arg(obj: PyObjectRef) -> bool {
-    unsafe { (*(obj as *const W_ExceptionExtended)).blocking_written_arg }
-}
-
-#[inline]
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_exception_set_blocking_written_arg(obj: PyObjectRef) {
-    unsafe { (*(obj as *mut W_ExceptionExtended)).blocking_written_arg = true };
-}
-
 /// `interp_exceptions.py readwrite_attrproperty_w('w_code', ...)`
-/// — `e.code` reader.  `PY_NULL` means the slot was never written (the
-/// `code` getattr arm then derives the value from `args_w`).
+/// — `e.code` reader.  `PY_NULL` is the class default `None`.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_BaseException`.
@@ -2428,7 +2431,7 @@ pub fn exc_kind_matches(kind: ExcKind, type_name: &str) -> bool {
         );
     }
     // LookupError is the intermediate parent of IndexError and KeyError
-    // (`pypy/module/exceptions/interp_exceptions.py:474`).
+    // (`interp_exceptions.py` `W_LookupError`).
     if type_name == "LookupError" {
         return matches!(
             kind,

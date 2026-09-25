@@ -14939,15 +14939,15 @@ pub(crate) unsafe fn direct_member_get(member: PyObjectRef, obj: PyObjectRef) ->
             crate::baseobjspace::syntax_error_attr(obj, "print_file_and_line"),
         ),
         pyre_object::MEMBER_STOP_ITERATION_VALUE => {
-            let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_value(obj) };
-            if !stored.is_null() {
-                return Ok(stored);
-            }
-            let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
-            Ok(
-                unsafe { pyre_object::w_tuple_getitem(args, 0) }
-                    .unwrap_or_else(pyre_object::w_none),
-            )
+            // `readwrite_attrproperty_w('w_value', W_StopIteration)` reads the
+            // slot and nothing else; `descr_init` is what derives it from
+            // `args_w`.
+            let value = unsafe { pyre_object::interp_exceptions::w_exception_get_value(obj) };
+            Ok(if value.is_null() {
+                pyre_object::w_none()
+            } else {
+                value
+            })
         }
         pyre_object::MEMBER_EXCEPTION_SUPPRESS_CONTEXT => Ok(pyre_object::w_bool_from(unsafe {
             pyre_object::interp_exceptions::w_exception_get_suppress_context(obj)
@@ -14969,15 +14969,14 @@ pub(crate) unsafe fn direct_member_get(member: PyObjectRef, obj: PyObjectRef) ->
             })
         }
         pyre_object::MEMBER_IMPORT_ERROR_MSG => {
-            let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_import_msg(obj) };
-            if !stored.is_null() {
-                return Ok(stored);
-            }
-            let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
-            Ok(
-                unsafe { pyre_object::w_tuple_getitem(args, 0) }
-                    .unwrap_or_else(pyre_object::w_none),
-            )
+            // `readwrite_attrproperty_w('w_msg', W_ImportError)` reads the slot
+            // and nothing else; `descr_init` is what derives it from `args_w`.
+            let value = unsafe { pyre_object::interp_exceptions::w_exception_get_import_msg(obj) };
+            Ok(if value.is_null() {
+                pyre_object::w_none()
+            } else {
+                value
+            })
         }
         pyre_object::MEMBER_IMPORT_ERROR_NAME => {
             let value = unsafe { pyre_object::interp_exceptions::w_exception_get_name(obj) };
@@ -15045,20 +15044,14 @@ pub(crate) unsafe fn direct_member_get(member: PyObjectRef, obj: PyObjectRef) ->
             })
         }
         pyre_object::MEMBER_SYSTEM_EXIT_CODE => {
-            let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_code(obj) };
-            if !stored.is_null() {
-                return Ok(stored);
-            }
-            let args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
-            let len = unsafe { pyre_object::w_tuple_len(args) };
-            if len == 1 {
-                if let Some(value) = unsafe { pyre_object::w_tuple_getitem(args, 0) } {
-                    return Ok(value);
-                }
-            } else if len > 1 {
-                return Ok(args);
-            }
-            Ok(pyre_object::w_none())
+            // `readwrite_attrproperty_w('w_code', W_SystemExit)` reads the slot
+            // and nothing else; `descr_init` is what derives it from `args_w`.
+            let value = unsafe { pyre_object::interp_exceptions::w_exception_get_code(obj) };
+            Ok(if value.is_null() {
+                pyre_object::w_none()
+            } else {
+                value
+            })
         }
         pyre_object::MEMBER_UNICODE_ERROR_ENCODING => {
             let value = unsafe { pyre_object::interp_exceptions::w_exception_get_encoding(obj) };
