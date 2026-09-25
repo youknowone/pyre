@@ -28,8 +28,6 @@ pub mod _codecs_kr;
 #[allow(non_snake_case)]
 pub mod _codecs_tw;
 #[allow(non_snake_case)]
-pub mod _contextvars;
-#[allow(non_snake_case)]
 pub mod _csv;
 #[allow(non_snake_case)]
 #[cfg(all(not(feature = "sandbox")))]
@@ -99,7 +97,6 @@ pub mod _uuid;
 pub mod _winapi;
 #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
 pub mod _wmi;
-pub mod atexit;
 pub mod binascii;
 pub mod cmath;
 pub mod errno;

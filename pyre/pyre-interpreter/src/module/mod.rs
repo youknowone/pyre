@@ -12,6 +12,8 @@ pub mod _ast;
 pub mod _codecs;
 #[allow(non_snake_case)]
 pub mod _collections;
+#[allow(non_snake_case)]
+pub mod _contextvars;
 pub mod _io;
 #[allow(non_snake_case)]
 pub mod _locale;
@@ -25,6 +27,7 @@ pub mod _types;
 pub mod _warnings;
 pub mod _weakref;
 pub mod array;
+pub mod atexit;
 pub mod gc;
 #[allow(non_snake_case)]
 pub mod imp;
