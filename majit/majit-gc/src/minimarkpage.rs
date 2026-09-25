@@ -14,6 +14,17 @@ const ARENA_ALIGN: usize = if crate::header::GcHeader::ALIGN > WORD {
 } else {
     WORD
 };
+/// Hashed page filter in front of the arena range index. 16 bits, one 8 KB
+/// table: a cleared bit is an exact "not in any arena" answer, so a trace
+/// slot that names an immortal or a raw block never binary-searches the
+/// range list. A set bit still goes through the exact range and live-word
+/// test. Over-admission is harmless.
+const ARENA_PAGE_FILTER_BITS_LOG2: u32 = 16;
+const ARENA_PAGE_FILTER_BITS: usize = 1 << ARENA_PAGE_FILTER_BITS_LOG2;
+const ARENA_PAGE_FILTER_WORDS: usize = ARENA_PAGE_FILTER_BITS / 64;
+const ARENA_PAGE_BYTES: usize = 4096;
+/// Two pages hashed to one slot. The exact range walk decides.
+const ARENA_PAGE_OWNER_COLLISION: usize = usize::MAX;
 
 #[repr(C)]
 struct ArenaReference {
@@ -59,6 +70,14 @@ pub struct ArenaCollection {
     /// pointer-chasing every bucket for arbitrary-word validity checks.
     /// It changes only when an arena is allocated or freed.
     arena_ranges: Vec<(usize, usize, *mut ArenaReference)>,
+    /// See [`ARENA_PAGE_FILTER_BITS_LOG2`]. Rebuilt when an arena is freed,
+    /// because a shared hash bit cannot be cleared. Allocating an arena only
+    /// ORs its pages in.
+    arena_pages: Box<[u64; ARENA_PAGE_FILTER_WORDS]>,
+    /// Arena pointer for the page hash, or 0 if none, or
+    /// [`ARENA_PAGE_OWNER_COLLISION`] when two arenas share the slot.
+    /// A unique owner answers `contains` without walking `arena_ranges`.
+    arena_page_owner: Box<[usize]>,
     /// The range [`contains`] matched last.  Every field store that reaches the
     /// write barrier asks the membership question once, and consecutive stores
     /// name the same arena nearly always, so re-testing the previous answer
@@ -129,6 +148,8 @@ impl ArenaCollection {
             old_arenas_lists: vec![ptr::null_mut(); max_pages_per_arena],
             current_arena: ptr::null_mut(),
             arena_ranges: Vec::new(),
+            arena_pages: Box::new([0; ARENA_PAGE_FILTER_WORDS]),
+            arena_page_owner: vec![0usize; ARENA_PAGE_FILTER_BITS].into_boxed_slice(),
             last_range_hit: std::cell::Cell::new((usize::MAX, 0, ptr::null_mut())),
             arena_bound_start: usize::MAX,
             arena_bound_end: 0,
@@ -290,6 +311,45 @@ impl ArenaCollection {
             .unwrap_err();
         self.arena_ranges.insert(index, range);
         self.refresh_arena_bound();
+        self.admit_arena_pages(arena_base as usize, arena_end, arena);
+    }
+
+    /// Hash of the 4 KB page containing `addr`, spread the way
+    /// `AddressHasher::spread` spreads consecutive pages so they do not
+    /// land on one short run of the table.
+    #[inline]
+    fn arena_page_slot(addr: usize) -> (usize, usize, u64) {
+        let spread = ((addr >> 12) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let bit = (spread >> (64 - ARENA_PAGE_FILTER_BITS_LOG2)) as usize;
+        (bit, bit >> 6, 1u64 << (bit & 63))
+    }
+
+    fn admit_arena_pages(&mut self, base: usize, end: usize, arena: *mut ArenaReference) {
+        let arena_addr = arena as usize;
+        let mut page = base & !(ARENA_PAGE_BYTES - 1);
+        while page < end {
+            let (bit, word, mask) = Self::arena_page_slot(page);
+            self.arena_pages[word] |= mask;
+            let cur = self.arena_page_owner[bit];
+            if cur == 0 || cur == arena_addr {
+                self.arena_page_owner[bit] = arena_addr;
+            } else {
+                self.arena_page_owner[bit] = ARENA_PAGE_OWNER_COLLISION;
+            }
+            page = page.saturating_add(ARENA_PAGE_BYTES);
+            if page == 0 {
+                break;
+            }
+        }
+    }
+
+    fn rebuild_arena_page_filter(&mut self) {
+        self.arena_pages.fill(0);
+        self.arena_page_owner.fill(0);
+        for i in 0..self.arena_ranges.len() {
+            let (start, end, arena) = self.arena_ranges[i];
+            self.admit_arena_pages(start, end, arena);
+        }
     }
 
     /// `ArenaCollection.mass_free_prepare`.
@@ -577,7 +637,37 @@ impl ArenaCollection {
         if addr >= start && addr < end {
             return unsafe { Self::block_is_live(arena, addr) };
         }
+        // Immortal objects and raw blocks sit outside the arena bound, and
+        // they are most of the pointers a trace slot names. Reject them
+        // before the range index. A hit in the hashed page filter is only
+        // a candidate: the range index and the live-word bit still decide.
         if addr < self.arena_bound_start || addr >= self.arena_bound_end {
+            return false;
+        }
+        let (bit, word, mask) = Self::arena_page_slot(addr);
+        if self.arena_pages[word] & mask == 0 {
+            return false;
+        }
+        let owner = self.arena_page_owner[bit];
+        if owner != 0 && owner != ARENA_PAGE_OWNER_COLLISION {
+            let arena = owner as *mut ArenaReference;
+            let base = unsafe { (*arena).base as usize };
+            let end = base + self.arena_size;
+            if addr >= base && addr < end {
+                self.last_range_hit.set((base, end, arena));
+                return unsafe { Self::block_is_live(arena, addr) };
+            }
+        }
+        // A handful of arenas is the steady state (each arena is 512 KB).
+        // Walking them beats `partition_point`: that call does not inline
+        // into the marker, so every traced child paid a binary search.
+        if self.arena_ranges.len() <= 32 {
+            for &(start, end, arena) in &self.arena_ranges {
+                if addr >= start && addr < end {
+                    self.last_range_hit.set((start, end, arena));
+                    return unsafe { Self::block_is_live(arena, addr) };
+                }
+            }
             return false;
         }
         let index = self
@@ -655,6 +745,7 @@ impl ArenaCollection {
             self.arena_ranges.remove(index);
             self.refresh_arena_bound();
             self.last_range_hit.set((usize::MAX, 0, ptr::null_mut()));
+            self.rebuild_arena_page_filter();
             alloc::dealloc((*arena).base, (*arena).layout);
             self.total_memory_alloced -= self.arena_size;
             self.arenas_count -= 1;
