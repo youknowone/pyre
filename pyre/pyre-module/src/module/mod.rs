@@ -39,8 +39,6 @@ pub mod _hashlib;
 #[allow(non_snake_case)]
 pub mod _heapq;
 #[allow(non_snake_case)]
-pub mod _immutables_map;
-#[allow(non_snake_case)]
 pub mod _json;
 #[allow(non_snake_case)]
 pub mod _lsprof;
@@ -51,8 +49,6 @@ pub mod _multibytecodec;
 #[allow(non_snake_case)]
 #[cfg(not(feature = "sandbox"))]
 pub mod _multiprocessing;
-#[allow(non_snake_case)]
-pub mod _opcode;
 #[allow(non_snake_case)]
 #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
 pub mod _overlapped;
@@ -99,7 +95,6 @@ pub mod _winapi;
 pub mod _wmi;
 pub mod binascii;
 pub mod cmath;
-pub mod errno;
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 pub mod faulthandler;
 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
@@ -118,7 +113,6 @@ pub mod msvcrt;
 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 pub mod pwd;
 pub mod pyexpat;
-pub mod pypyjit;
 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 pub mod resource;
 #[cfg(all(not(feature = "sandbox")))]

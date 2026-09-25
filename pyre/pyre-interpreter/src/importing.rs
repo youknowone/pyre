@@ -760,10 +760,16 @@ pub fn install_builtin_modules() {
     pyre_install_module!("builtins"(__builtin__));
     pyre_install_module!(_io);
     pyre_install_module!(_sre);
-    // `baseobjspace.py:finish` runs `atexit._run_exitfuncs` at shutdown, and
-    // `warnings` imports `_contextvars`.
+    // `baseobjspace.py:finish` runs `atexit._run_exitfuncs` at shutdown;
+    // `warnings` imports `_contextvars`, which imports `_immutables_map`;
+    // `os` imports `errno`. `_opcode` is one of `essential_modules`, and a
+    // JIT build always has `pypyjit`.
     pyre_install_module!(atexit);
     pyre_install_module!(_contextvars);
+    pyre_install_module!(_immutables_map);
+    pyre_install_module!(errno);
+    pyre_install_module!(_opcode);
+    pyre_install_module!(pypyjit);
 
     // C-extension stubs required for stdlib import chains
     // (PyPy: pypy/module/* mixed modules).
@@ -807,7 +813,7 @@ pub fn install_builtin_modules() {
     // Host-access modules — arbitrary FFI (`_ctypes`), real signals.
     // `select`, `mmap`, `_socket`/`_ssl`, `pwd`/`grp`, `errno`, `_stat`,
     // `_abc`, `_typing`, `_symtable`, `_pypy_generic_alias`,
-    // `pypyjit`, `_functools`, and the Windows host modules
+    // `_functools`, and the Windows host modules
     // live in `pyre-module`.  None of the host
     // ones belong to the mediated ll_os/ll_time surface, so the sandbox
     // interpreter omits them entirely: `import _ctypes` then raises

@@ -66,10 +66,6 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("_lsprof", module::_lsprof::init);
     pyre_interpreter::importing::register_builtin_module("_lzma", module::_lzma::init);
     pyre_interpreter::importing::register_builtin_module(
-        "_immutables_map",
-        module::_immutables_map::init,
-    );
-    pyre_interpreter::importing::register_builtin_module(
         "_multibytecodec",
         module::_multibytecodec::init,
     );
@@ -78,7 +74,6 @@ pub fn install_optional_modules() {
         "_multiprocessing",
         module::_multiprocessing::init,
     );
-    pyre_interpreter::importing::register_builtin_module("_opcode", module::_opcode::init);
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("_overlapped", module::_overlapped::init);
     #[cfg(all(unix, not(feature = "sandbox")))]
@@ -119,7 +114,6 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("_scproxy", module::_scproxy::init);
     pyre_interpreter::importing::register_builtin_module("binascii", module::binascii::init);
     pyre_interpreter::importing::register_builtin_module("cmath", module::cmath::init);
-    pyre_interpreter::importing::register_builtin_module("errno", module::errno::init);
     #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module(
         "faulthandler",
@@ -128,7 +122,6 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("math", module::math::init);
     #[cfg(all(windows, feature = "host_env"))]
     pyre_interpreter::importing::register_builtin_module("msvcrt", module::msvcrt::init);
-    pyre_interpreter::importing::register_builtin_module("pypyjit", module::pypyjit::init);
     #[cfg(all(
         not(target_arch = "wasm32"),
         feature = "host_env",
