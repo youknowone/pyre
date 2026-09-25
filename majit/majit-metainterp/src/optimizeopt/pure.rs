@@ -178,13 +178,9 @@ impl RecentPureOps {
                         };
                         k.args.len() == 1
                             && k.descr_identity == descr_identity
-                            && same_box(
-                                query,
-                                (
-                                    k.args[0].to_opref(),
-                                    Some(&k.args[0].get_box_replacement(false)),
-                                ),
-                            )
+                            && k.args[0].with_box_replacement(|stored| {
+                                same_box(query, (k.args[0].to_opref(), Some(stored)))
+                            })
                     })
                 }
                 2 => {
@@ -197,13 +193,15 @@ impl RecentPureOps {
                         if k.args.len() != 2 || k.descr_identity != descr_identity {
                             return false;
                         }
-                        let s0 = k.args[0].get_box_replacement(false);
-                        let s1 = k.args[1].get_box_replacement(false);
                         let match_fwd = |query: (OpRef, Option<&Operand>), stored: &Operand| {
                             same_box(query, (stored.to_opref(), Some(stored)))
                         };
-                        (match_fwd(q0, &s0) && match_fwd(q1, &s1))
-                            || (commutative && match_fwd(q1, &s0) && match_fwd(q0, &s1))
+                        k.args[0].with_box_replacement(|s0| {
+                            k.args[1].with_box_replacement(|s1| {
+                                (match_fwd(q0, s0) && match_fwd(q1, s1))
+                                    || (commutative && match_fwd(q1, s0) && match_fwd(q0, s1))
+                            })
+                        })
                     })
                 }
                 _ => panic!(

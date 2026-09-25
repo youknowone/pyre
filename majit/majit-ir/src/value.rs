@@ -637,6 +637,7 @@ impl InputArgRc {
         }
     }
 
+    #[inline]
     pub unsafe fn increment_strong_count(value: *const InputArg) {
         let rc = unsafe { Self::from_raw(value) };
         let extra = rc.clone();
@@ -646,6 +647,7 @@ impl InputArgRc {
 }
 
 impl Clone for InputArgRc {
+    #[inline]
     fn clone(&self) -> Self {
         let inner = unsafe { self.ptr.as_ref() };
         inner.strong.set(inner.strong.get() + 1);
@@ -654,18 +656,27 @@ impl Clone for InputArgRc {
 }
 
 impl Drop for InputArgRc {
+    #[inline]
     fn drop(&mut self) {
         let inner = unsafe { self.ptr.as_ref() };
         let n = inner.strong.get() - 1;
         if n == 0 {
-            unsafe {
-                std::ptr::drop_in_place(&mut (*self.ptr.as_ptr()).value);
-            }
-            free_inputarg_inner(self.ptr);
+            release_inputarg_inner(self.ptr);
         } else {
             inner.strong.set(n);
         }
     }
+}
+
+/// Last-reference teardown, kept out of line so the count decrement in
+/// `InputArgRc::drop` inlines at every handle drop.
+#[cold]
+#[inline(never)]
+fn release_inputarg_inner(ptr: std::ptr::NonNull<InputArgInner>) {
+    unsafe {
+        std::ptr::drop_in_place(&mut (*ptr.as_ptr()).value);
+    }
+    free_inputarg_inner(ptr);
 }
 
 impl std::ops::Deref for InputArgRc {

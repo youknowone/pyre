@@ -6271,9 +6271,7 @@ impl OptContext {
     /// operand-direct read — chain walks via
     /// `Operand::get_box_replacement` then queries `ptr_info().is_virtual()`.
     pub fn is_virtual(&self, op: &Operand) -> bool {
-        op.get_box_replacement(false)
-            .ptr_info()
-            .is_some_and(|p| p.is_virtual())
+        op.with_box_replacement(|b| b.ptr_info().is_some_and(|p| p.is_virtual()))
     }
 
     /// `info.py PtrInfo.is_nonnull` (base False) + subclass
@@ -6281,9 +6279,7 @@ impl OptContext {
     /// `PtrInfo` in its `_forwarded` Info slot. Chain walks via
     /// `Operand::get_box_replacement` then reads `ptr_info()`.
     pub fn is_nonnull(&self, op: &Operand) -> bool {
-        op.get_box_replacement(false)
-            .ptr_info()
-            .is_some_and(|p| p.is_nonnull())
+        op.with_box_replacement(|b| b.ptr_info().is_some_and(|p| p.is_nonnull()))
     }
 
     /// `optimizer.py getintbound(op)` read variant — returns an
@@ -6307,11 +6303,12 @@ impl OptContext {
         &self,
         op: &Operand,
     ) -> Option<crate::optimizeopt::intutils::IntBound> {
-        let resolved = op.get_box_replacement(false);
-        if let Some(Value::Int(v)) = resolved.const_value() {
-            return Some(crate::optimizeopt::intutils::IntBound::from_constant(v));
-        }
-        resolved.int_bound().map(|ib| ib.clone())
+        op.with_box_replacement(|resolved| {
+            if let Some(Value::Int(v)) = resolved.const_value() {
+                return Some(crate::optimizeopt::intutils::IntBound::from_constant(v));
+            }
+            resolved.int_bound().map(|ib| ib.clone())
+        })
     }
 
     /// `info.py op.get_forwarded()` + `isinstance(fw, PtrInfo)` —
@@ -8014,19 +8011,20 @@ impl OptContext {
     /// ```
     pub fn get_constant_box(&self, op: &Operand) -> Option<Value> {
         // optimizer.py: box = get_box_replacement(box)
-        let resolved = op.get_box_replacement(false);
-        // optimizer.py:381-382: isinstance(box, Const) → return box
-        if let Some(v) = resolved.const_value() {
-            return Some(v);
-        }
-        // optimizer.py:383-386: box.type == 'i' + IntBound + is_constant
-        if resolved.type_() == majit_ir::Type::Int
-            && let Some(b) = resolved.int_bound()
-            && b.is_constant()
-        {
-            return Some(Value::Int(b.get_constant_int()));
-        }
-        None
+        op.with_box_replacement(|resolved| {
+            // optimizer.py:381-382: isinstance(box, Const) → return box
+            if let Some(v) = resolved.const_value() {
+                return Some(v);
+            }
+            // optimizer.py:383-386: box.type == 'i' + IntBound + is_constant
+            if resolved.type_() == majit_ir::Type::Int
+                && let Some(b) = resolved.int_bound()
+                && b.is_constant()
+            {
+                return Some(Value::Int(b.get_constant_int()));
+            }
+            None
+        })
     }
 
     pub fn get_constant_int_box(&self, op: &Operand) -> Option<i64> {

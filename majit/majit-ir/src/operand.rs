@@ -265,6 +265,7 @@ impl Operand {
     }
 
     /// Clone an operand from a packed word the caller still owns.
+    #[inline]
     pub(crate) fn clone_from_packed(packed: u64) -> Operand {
         let view = Operand { packed };
         let out = view.clone();
@@ -279,6 +280,7 @@ impl Operand {
 }
 
 impl Clone for Operand {
+    #[inline]
     fn clone(&self) -> Self {
         if self.packed == 0 || self.packed == OP_NULLREF {
             return Operand {
@@ -308,6 +310,7 @@ impl Clone for Operand {
 }
 
 impl Drop for Operand {
+    #[inline]
     fn drop(&mut self) {
         if self.packed == 0 || self.packed == OP_NULLREF {
             return;
@@ -614,13 +617,31 @@ impl Operand {
     /// (`resoperation.py while isinstance(op, AbstractResOpOrInputArg)`).
     /// This is the canonical walker; the former box-wrapper `get_box_replacement`
     /// delegates here.
+    #[inline]
     pub fn get_box_replacement(&self, not_const: bool) -> Operand {
+        Operand::clone_from_packed(self.replacement_packed(not_const))
+    }
+
+    /// Borrowing form of `get_box_replacement(false)` for read-only queries:
+    /// `f` sees the chain terminal without the terminal handle's count being
+    /// taken and released. `self`'s chain keeps the terminal alive for the
+    /// call, so `f` must not rewrite `_forwarded` on that chain.
+    #[inline]
+    pub fn with_box_replacement<R>(&self, f: impl FnOnce(&Operand) -> R) -> R {
+        let view = std::mem::ManuallyDrop::new(Operand {
+            packed: self.replacement_packed(false),
+        });
+        f(&view)
+    }
+
+    /// Packed word of the `_forwarded` chain terminal, not counted: `self`
+    /// or a hop's `_forwarded` slot keeps it alive.
+    fn replacement_packed(&self, not_const: bool) -> u64 {
         if !self.is_resop() && !self.is_inputarg() {
-            return self.clone();
+            return self.packed;
         }
         // Packed-tag walk: `self` keeps the first producer alive, and each
         // hop is kept alive by the `_forwarded` slot that points at it.
-        // One owned Operand is built only at the end.
         let mut cur = self.packed;
         loop {
             let packed_fwd = if cur & OP_TAG == OP_OP {
@@ -639,31 +660,31 @@ impl Operand {
                 }
             };
             match classify_packed_forwarded(packed_fwd) {
-                PackedForwarded::None | PackedForwarded::Info => {
-                    return Operand::clone_from_packed(cur);
-                }
+                PackedForwarded::None | PackedForwarded::Info => return cur,
                 PackedForwarded::Op(p) => cur = p as u64,
                 PackedForwarded::InputArg(p) => cur = (p as u64) | OP_INPUTARG,
+                // `_forwarded` contains the Const object itself in RPython;
+                // its identity is reused.
                 PackedForwarded::Const(p) => {
-                    if not_const {
-                        return Operand::clone_from_packed(cur);
-                    }
-                    // `_forwarded` contains the Const object itself in
-                    // RPython. Reuse its identity; constructing a new cell
-                    // here made every replacement lookup allocate.
-                    return Operand::clone_from_packed((p as u64) | OP_CONST);
+                    return if not_const {
+                        cur
+                    } else {
+                        (p as u64) | OP_CONST
+                    };
                 }
                 PackedForwarded::SmallConst(enc) => {
-                    if not_const {
-                        return Operand::clone_from_packed(cur);
-                    }
-                    return Operand::SmallInt(enc);
+                    return if not_const {
+                        cur
+                    } else {
+                        std::mem::ManuallyDrop::new(Operand::SmallInt(enc)).packed
+                    };
                 }
                 PackedForwarded::SmallWide(id) => {
-                    if not_const {
-                        return Operand::clone_from_packed(cur);
-                    }
-                    return Operand::SmallWide(id);
+                    return if not_const {
+                        cur
+                    } else {
+                        std::mem::ManuallyDrop::new(Operand::SmallWide(id)).packed
+                    };
                 }
             }
         }
