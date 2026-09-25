@@ -763,13 +763,15 @@ pub fn install_builtin_modules() {
     // `baseobjspace.py:finish` runs `atexit._run_exitfuncs` at shutdown;
     // `warnings` imports `_contextvars`, which imports `_immutables_map`;
     // `os` imports `errno`. `_opcode` is one of `essential_modules`, and a
-    // JIT build always has `pypyjit`.
+    // JIT build always has `pypyjit`. The `BUILD_TEMPLATE` and
+    // `BUILD_INTERPOLATION` opcodes import `_template`.
     pyre_install_module!(atexit);
     pyre_install_module!(_contextvars);
     pyre_install_module!(_immutables_map);
     pyre_install_module!(errno);
     pyre_install_module!(_opcode);
     pyre_install_module!(pypyjit);
+    pyre_install_module!(_template);
     // `Modules/Setup.bootstrap`: the modules built into the interpreter.
     // Frozen importlib imports `_stat` while bootstrapping a sandbox that
     // mounts no stdlib files, so it is unconditional.
