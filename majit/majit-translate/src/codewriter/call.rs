@@ -2013,9 +2013,17 @@ impl StructLayout {
             .iter()
             .map(|(_, ty)| {
                 if is_known_by_value_struct(known_structs, ty) {
-                    *known_struct_aligns
-                        .get(ty.as_str())
-                        .unwrap_or_else(|| panic!("type `{ty}` has no layout and no fields"))
+                    if let Some(&align) = known_struct_aligns.get(ty.as_str()) {
+                        align
+                    } else {
+                        match known_struct_sizes.get(ty.as_str()).copied() {
+                            Some(size) if size == 0 || size.is_power_of_two() => size,
+                            Some(size) => {
+                                panic!("type `{ty}` has size {size} but no field alignment")
+                            }
+                            None => type_align(ty),
+                        }
+                    }
                 } else {
                     type_align(ty)
                 }
@@ -9451,7 +9459,7 @@ fn compute_struct_size_uncached(
             if cc.is_known_struct(ty) {
                 cc.struct_layout_for(ty)
                     .map(|l| l.align)
-                    .unwrap_or_else(|| panic!("type `{ty}` has no layout and no fields"))
+                    .unwrap_or_else(|| type_align(ty))
             } else {
                 type_align(ty)
             }
