@@ -2,7 +2,7 @@
 # Ratcheted by scripts/check-rtyper-skip-subjects.py: a name may
 # leave this list, and may not join it.  Empty is the epic's
 # done-when.
-# corpus=b1965b5f15e29bea platform=linux
+# corpus=de3923330d03a83c platform=linux
 two-phase-never-a-subject	eval_loop_jit_portal
 two-phase-never-a-subject	ll_int_abs
 two-phase-never-a-subject	ll_listslice_minusone__ref__majit__object_ref_gcarray
@@ -289,7 +289,6 @@ two-phase-never-a-subject	pyre_interpreter::eval::<Impl>::make_function
 two-phase-never-a-subject	pyre_interpreter::eval::<Impl>::store_attr
 two-phase-never-a-subject	pyre_interpreter::eval::<Impl>::store_name_value
 two-phase-never-a-subject	pyre_interpreter::eval::<Impl>::store_subscr
-two-phase-never-a-subject	pyre_interpreter::eval::<Impl>::swap_values
 two-phase-never-a-subject	pyre_interpreter::eval::<Impl>::truth_value
 two-phase-never-a-subject	pyre_interpreter::eval::<Impl>::unary_invert_value
 two-phase-never-a-subject	pyre_interpreter::eval::<Impl>::unary_negative_value
@@ -1049,7 +1048,6 @@ two-phase-never-a-subject	pyre_interpreter::opcode_ops::unary_negative_value
 two-phase-never-a-subject	pyre_interpreter::opcode_ops::unary_not_value
 two-phase-never-a-subject	pyre_interpreter::opcode_ops::unary_positive_value
 two-phase-never-a-subject	pyre_interpreter::pycode::code_addr2line
-two-phase-never-a-subject	pyre_interpreter::pycode::publish_code_slot_store_rooting
 two-phase-never-a-subject	pyre_interpreter::pycode::w_code_addr2line
 two-phase-never-a-subject	pyre_interpreter::pycode::w_code_filename_obj
 two-phase-never-a-subject	pyre_interpreter::pycode::w_code_name_obj
@@ -1062,18 +1060,14 @@ two-phase-never-a-subject	pyre_interpreter::pyframe::<Impl>::fast2locals
 two-phase-never-a-subject	pyre_interpreter::pyframe::<Impl>::fget_f_builtins
 two-phase-never-a-subject	pyre_interpreter::pyframe::<Impl>::fget_f_lasti
 two-phase-never-a-subject	pyre_interpreter::pyframe::<Impl>::fget_f_lineno
-two-phase-never-a-subject	pyre_interpreter::pyframe::<Impl>::fget_f_trace_lines
 two-phase-never-a-subject	pyre_interpreter::pyframe::<Impl>::fget_getdictscope
 two-phase-never-a-subject	pyre_interpreter::pyframe::<Impl>::frame_locals_proxy_snapshot
 two-phase-never-a-subject	pyre_interpreter::pyframe::<Impl>::frame_locals_snapshot
 two-phase-never-a-subject	pyre_interpreter::pyframe::<Impl>::frame_ptr
 two-phase-never-a-subject	pyre_interpreter::pyframe::<Impl>::fset_f_trace
 two-phase-never-a-subject	pyre_interpreter::pyframe::<Impl>::get_builtin
-two-phase-never-a-subject	pyre_interpreter::pyframe::<Impl>::get_f_trace_lines
 two-phase-never-a-subject	pyre_interpreter::pyframe::<Impl>::get_last_lineno
 two-phase-never-a-subject	pyre_interpreter::pyframe::<Impl>::get_lineno_at
-two-phase-never-a-subject	pyre_interpreter::pyframe::<Impl>::get_or_create_extra_locals
-two-phase-never-a-subject	pyre_interpreter::pyframe::<Impl>::get_or_create_w_locals
 two-phase-never-a-subject	pyre_interpreter::pyframe::<Impl>::getdictscope
 two-phase-never-a-subject	pyre_interpreter::pyframe::<Impl>::has_active_hidden_locals
 two-phase-never-a-subject	pyre_interpreter::pyframe::<Impl>::initialize_as_generator
@@ -1086,7 +1080,6 @@ two-phase-never-a-subject	pyre_interpreter::pyframe::<Impl>::snapshot_for_genera
 two-phase-never-a-subject	pyre_interpreter::pyframe::__majit_wrap_descr_typecheck_fget_f_builtins
 two-phase-never-a-subject	pyre_interpreter::pyframe::__majit_wrap_descr_typecheck_fget_f_lasti
 two-phase-never-a-subject	pyre_interpreter::pyframe::__majit_wrap_descr_typecheck_fget_f_lineno
-two-phase-never-a-subject	pyre_interpreter::pyframe::__majit_wrap_descr_typecheck_fget_f_trace_lines
 two-phase-never-a-subject	pyre_interpreter::pyframe::__majit_wrap_descr_typecheck_fget_getdictscope
 two-phase-never-a-subject	pyre_interpreter::pyframe::__majit_wrap_descr_typecheck_fset_f_lineno
 two-phase-never-a-subject	pyre_interpreter::pyframe::__majit_wrap_descr_typecheck_fset_f_trace
@@ -1186,7 +1179,6 @@ two-phase-never-a-subject	pyre_interpreter::pyopcode::OpcodeStepExecutor::store_
 two-phase-never-a-subject	pyre_interpreter::pyopcode::OpcodeStepExecutor::store_global
 two-phase-never-a-subject	pyre_interpreter::pyopcode::OpcodeStepExecutor::store_name
 two-phase-never-a-subject	pyre_interpreter::pyopcode::OpcodeStepExecutor::store_subscr
-two-phase-never-a-subject	pyre_interpreter::pyopcode::OpcodeStepExecutor::swap
 two-phase-never-a-subject	pyre_interpreter::pyopcode::OpcodeStepExecutor::unary_invert
 two-phase-never-a-subject	pyre_interpreter::pyopcode::OpcodeStepExecutor::unary_negative
 two-phase-never-a-subject	pyre_interpreter::pyopcode::OpcodeStepExecutor::unary_not
@@ -1220,7 +1212,6 @@ two-phase-never-a-subject	pyre_interpreter::pyopcode::execute_store_attr
 two-phase-never-a-subject	pyre_interpreter::pyopcode::execute_store_global
 two-phase-never-a-subject	pyre_interpreter::pyopcode::execute_store_name
 two-phase-never-a-subject	pyre_interpreter::pyopcode::execute_store_subscr
-two-phase-never-a-subject	pyre_interpreter::pyopcode::execute_swap
 two-phase-never-a-subject	pyre_interpreter::pyopcode::execute_unary_invert
 two-phase-never-a-subject	pyre_interpreter::pyopcode::execute_unary_negative
 two-phase-never-a-subject	pyre_interpreter::pyopcode::execute_unary_not
@@ -1236,7 +1227,6 @@ two-phase-never-a-subject	pyre_interpreter::pyopcode::opcode_pop_jump_if_false
 two-phase-never-a-subject	pyre_interpreter::pyopcode::opcode_pop_jump_if_true
 two-phase-never-a-subject	pyre_interpreter::pyopcode::opcode_store_global
 two-phase-never-a-subject	pyre_interpreter::pyopcode::opcode_store_name
-two-phase-never-a-subject	pyre_interpreter::pyopcode::opcode_swap
 two-phase-never-a-subject	pyre_interpreter::pyopcode::opcode_unary_invert
 two-phase-never-a-subject	pyre_interpreter::pyopcode::opcode_unary_negative
 two-phase-never-a-subject	pyre_interpreter::pyopcode::opcode_unary_not
@@ -1263,7 +1253,6 @@ two-phase-never-a-subject	pyre_interpreter::shared_opcode::opcode_load_attr
 two-phase-never-a-subject	pyre_interpreter::shared_opcode::opcode_make_function
 two-phase-never-a-subject	pyre_interpreter::shared_opcode::opcode_store_attr
 two-phase-never-a-subject	pyre_interpreter::shared_opcode::opcode_store_subscr
-two-phase-never-a-subject	pyre_interpreter::type_methods::__majit_wrap_dict_descr_get
 two-phase-never-a-subject	pyre_interpreter::type_methods::__majit_wrap_dict_descr_items
 two-phase-never-a-subject	pyre_interpreter::type_methods::__majit_wrap_dict_descr_keys
 two-phase-never-a-subject	pyre_interpreter::type_methods::__majit_wrap_dict_descr_values
@@ -1278,9 +1267,7 @@ two-phase-never-a-subject	pyre_interpreter::type_methods::decode_raw_unicode_esc
 two-phase-never-a-subject	pyre_interpreter::type_methods::decode_raw_unicode_escape_stateful
 two-phase-never-a-subject	pyre_interpreter::type_methods::decode_utf16_32
 two-phase-never-a-subject	pyre_interpreter::type_methods::decode_utf16_32_helper
-two-phase-never-a-subject	pyre_interpreter::type_methods::dict_lookup_checked
 two-phase-never-a-subject	pyre_interpreter::type_methods::dict_method_copy
-two-phase-never-a-subject	pyre_interpreter::type_methods::dict_method_get
 two-phase-never-a-subject	pyre_interpreter::type_methods::encode_object
 two-phase-never-a-subject	pyre_interpreter::type_methods::encode_raw_unicode_escape
 two-phase-never-a-subject	pyre_interpreter::type_methods::encode_utf16_32
@@ -1341,9 +1328,7 @@ two-phase-never-a-subject	pyre_module::module::_bz2::decompressor_methods::__maj
 two-phase-never-a-subject	pyre_module::module::_bz2::decompressor_methods::__majit_wrap_decompress
 two-phase-never-a-subject	pyre_module::module::_bz2::decompressor_methods::__majit_wrap_unused_data
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::cdataobj::__majit_wrap_cdata_call
-two-phase-never-a-subject	pyre_module::module::_cffi_backend::cdataobj::new_cdata
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::cdataobj::new_cdata_copy
-two-phase-never-a-subject	pyre_module::module::_cffi_backend::cdataobj::new_cdata_full
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::cdataobj::new_cdata_mem
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::cdataobj::raw_alloc
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypefunc::call
