@@ -1,4 +1,6 @@
 # pyre-check: max-pypy-ratio=1.8
+# pyre-check: skip-backends=cranelift
+# cranelift runs the core build, which has no `pyre-module` and so no `math`.
 # pyre-check: spec-folds=math_ceil,math_fabs,math_float1,math_float2,math_floor,math_isclose,math_log_trig,math_trunc,math_sqrt,float_call
 # pyre-check: skip-cpython
 # This fixture carried a wasm allowance of 13, fitted to a darwin-arm64
