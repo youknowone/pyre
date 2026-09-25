@@ -21,12 +21,12 @@
 /// duplicating it.
 fn set_param(
     args: &[pyre_object::PyObjectRef],
-) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
-    let (pos, kwds) = pyre_interpreter::builtins::split_builtin_kwargs(args);
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    let (pos, kwds) = crate::builtins::split_builtin_kwargs(args);
 
     // interp_jit.py:147-148 — at most one non-keyword argument.
     if pos.len() > 1 {
-        return Err(pyre_interpreter::PyError::type_error(format!(
+        return Err(crate::PyError::type_error(format!(
             "set_param() takes at most 1 non-keyword argument, {} given",
             pos.len()
         )));
@@ -34,10 +34,10 @@ fn set_param(
 
     // interp_jit.py:151-156 — positional string → set_user_param(None, text).
     if let Some(&text_obj) = pos.first() {
-        let text = pyre_interpreter::baseobjspace::text_w(text_obj)?;
-        if pyre_interpreter::call::set_jit_param_string(text).is_err() {
-            return Err(pyre_interpreter::PyError::new(
-                pyre_interpreter::PyErrorKind::ValueError,
+        let text = crate::baseobjspace::text_w(text_obj)?;
+        if crate::call::set_jit_param_string(text).is_err() {
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::ValueError,
                 "error in JIT parameters string".to_string(),
             ));
         }
@@ -60,26 +60,24 @@ fn set_param(
                 continue;
             }
             if key == "enable_opts" {
-                let value = pyre_interpreter::baseobjspace::text_w(v)?;
+                let value = crate::baseobjspace::text_w(v)?;
                 parts.push(format!("{key}={value}"));
             } else {
-                let value = pyre_interpreter::baseobjspace::int_w(v)?;
+                let value = crate::baseobjspace::int_w(v)?;
                 let known = majit_metainterp::jit::UNROLL_PARAMETERS
                     .iter()
                     .any(|&(name, _)| key == name && name != "enable_opts");
                 if !known {
-                    return Err(pyre_interpreter::PyError::type_error(format!(
+                    return Err(crate::PyError::type_error(format!(
                         "no JIT parameter '{key}'"
                     )));
                 }
                 parts.push(format!("{key}={value}"));
             }
         }
-        if !parts.is_empty()
-            && pyre_interpreter::call::set_jit_param_string(&parts.join(",")).is_err()
-        {
-            return Err(pyre_interpreter::PyError::new(
-                pyre_interpreter::PyErrorKind::ValueError,
+        if !parts.is_empty() && crate::call::set_jit_param_string(&parts.join(",")).is_err() {
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::ValueError,
                 "error in JIT parameters string".to_string(),
             ));
         }
@@ -88,7 +86,7 @@ fn set_param(
     Ok(pyre_object::w_none())
 }
 
-pyre_interpreter::py_module! {
+crate::py_module! {
     "pypyjit",
     functions: {
         "set_param" / * = set_param,
