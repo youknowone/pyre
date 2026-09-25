@@ -10587,20 +10587,13 @@ impl<'a> Lowering<'a> {
             }
             _ => (false, None, None),
         };
-        // Jit-marker methods still need the receiver in `Call.args`:
-        // `try_handle_jit_marker` strips `args[0]` as the driver before
-        // reading greens. Every other call drops a void ZST here so the
-        // callee, whose parameter is also void, does not expect it.
-        let keep_void_receiver = match &call.func {
-            CallFunc::Regular(reg) => regular_call_name_path(reg, self.llbc)
-                .as_deref()
-                .is_some_and(call_path_is_jit_marker),
-            _ => false,
-        };
+        // A void ZST stays in `Call.args`. The callee's `Input` still
+        // lists that parameter, and the annotator counts it. The
+        // codewriter drops it later, on both sides, where `FUNC.ARGS`
+        // has already filtered `Void`. Dropping it here makes
+        // `Arg<T>::get` lose `args[0]` and a `dont_look_inside` host
+        // see one argument fewer than its signature.
         for op in call.args {
-            if !keep_void_receiver && operand_is_void_zst(self.llbc, &op) {
-                continue;
-            }
             args.push(self.resolve_operand(mir_bb, op)?);
         }
         let first_arg_is_string_array_view = args.first().is_some_and(|arg| {
@@ -27878,19 +27871,6 @@ fn tyref_is_void_zst(ty: &TyRef, llbc: &Llbc) -> bool {
         return false;
     }
     is_unit_type(&peeled, llbc) || tyref_is_zero_sized(&peeled, llbc)
-}
-
-fn call_path_is_jit_marker(path: &str) -> bool {
-    path.ends_with("jit_merge_point")
-        || path.ends_with("can_enter_jit")
-        || path.ends_with("loop_header")
-}
-
-fn operand_is_void_zst(llbc: &Llbc, op: &Operand) -> bool {
-    match op {
-        Operand::Copy(place) | Operand::Move(place) => tyref_is_void_zst(&place.ty, llbc),
-        Operand::Const(_) => false,
-    }
 }
 
 fn tyref_is_zero_sized(ty: &TyRef, llbc: &Llbc) -> bool {
