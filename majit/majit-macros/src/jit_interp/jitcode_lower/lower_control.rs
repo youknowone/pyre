@@ -66,9 +66,9 @@ impl<'c> Lowerer<'c> {
                 };
                 // `_rewrite_equality` on `ptr_eq` / `ptr_ne`: a comparison
                 // against null is `ptr_iszero` / `ptr_nonzero`. Detect the
-                // null spelling on the source tree — `null_mut()` does not
-                // lower as a value, so waiting until both sides are bound
-                // would refuse the condition.
+                // null spelling on the source tree. The value lowerer emits
+                // `Constant(nullptr)` too; fusing here is `optimize_goto_if_not`
+                // dropping the compare once it is only the exitswitch.
                 if matches!(binary.op, BinOp::Eq(_) | BinOp::Ne(_)) {
                     let left_null = expr_is_null_ptr(&binary.left);
                     let right_null = expr_is_null_ptr(&binary.right);

@@ -539,19 +539,28 @@ pub(super) fn expr_is_null_ptr(expr: &Expr) -> bool {
     match expr {
         Expr::Paren(paren) => expr_is_null_ptr(&paren.expr),
         Expr::Group(group) => expr_is_null_ptr(&group.expr),
-        Expr::Call(call) if call.args.is_empty() => {
-            match &*call.func {
-                Expr::Path(path) => path.path.segments.last().is_some_and(|seg| {
-                    matches!(seg.ident.to_string().as_str(), "null" | "null_mut")
-                }),
-                _ => false,
-            }
-        }
+        Expr::Call(call) => call_is_null_ptr(call),
         Expr::Cast(cast) => {
             int_literal_value(&cast.expr) == Some(0) && type_is_raw_pointer(&cast.ty)
         }
         _ => false,
     }
+}
+
+/// `core::ptr::null_mut()` / `std::ptr::null()` — `jtransform.py`'s
+/// `Constant(nullptr)`, not a helper. Any path prefix, optional turbofish,
+/// no arguments. A same-named function that takes arguments stays a call.
+pub(crate) fn call_is_null_ptr(call: &syn::ExprCall) -> bool {
+    if !call.args.is_empty() {
+        return false;
+    }
+    let Expr::Path(path) = &*call.func else {
+        return false;
+    };
+    path.path
+        .segments
+        .last()
+        .is_some_and(|seg| matches!(seg.ident.to_string().as_str(), "null" | "null_mut"))
 }
 
 /// `x.is_null()` — the Rust spelling of RPython `ptr_iszero`.

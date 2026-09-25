@@ -27,6 +27,23 @@ mod find_dispatch_loop_body_tests {
     }
 
     #[test]
+    fn null_mut_is_not_an_inferred_call() {
+        let mut lowerer = Lowerer::new(None);
+        lowerer.auto_calls = true;
+        let body: syn::Expr = syn::parse_quote! {
+            { p = core::ptr::null_mut(); }
+        };
+        assert!(
+            !lowerer.arm_body_has_infer_call(&body),
+            "Constant(nullptr) must not keep the arm off the dispatch JitCode"
+        );
+        let helper: syn::Expr = syn::parse_quote! {
+            { helper(p) }
+        };
+        assert!(lowerer.arm_body_has_infer_call(&helper));
+    }
+
+    #[test]
     fn finds_while_body() {
         let blk = fn_block_from("while x < 10 { match op { 0 => {}, _ => {} } }");
         let m = first_match(&blk);
@@ -2401,7 +2418,10 @@ impl<'c> Lowerer<'c> {
         }
         impl<'ast, 'a, 'c> Visit<'ast> for LateRejectCallProbe<'a, 'c> {
             fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
-                if !self.hit {
+                // `Constant(nullptr)` is not a helper. `auto_calls` would
+                // otherwise resolve `ptr::null_mut` to Infer and keep the
+                // arm off the dispatch JitCode (`has_infer_call`).
+                if !self.hit && !call_is_null_ptr(call) {
                     match self.lowerer.resolve_call_policy(&call.func) {
                         Some(CallPolicySpec::Infer) => self.hit = true,
                         Some(CallPolicySpec::Explicit(

@@ -2382,7 +2382,7 @@ impl<'c> Lowerer<'c> {
     /// `jtransform.py` `_rewrite_equality` via `rewrite_op_ptr_eq` /
     /// `rewrite_op_ptr_ne`: a comparison against the null pointer is the
     /// unary `ptr_iszero` / `ptr_nonzero`. The null operand is recognised
-    /// on the source tree because `null_mut()` is not a lowerable value.
+    /// on the source tree; the value lowerer also emits `Constant(nullptr)`.
     fn lower_ptr_equality_against_null(&mut self, expr: &ExprBinary) -> Option<Binding> {
         let left_null = expr_is_null_ptr(&expr.left);
         let right_null = expr_is_null_ptr(&expr.right);
@@ -3951,6 +3951,60 @@ mod tests {
             });
             assert!(out.is_some());
             assert!(emitted(&lowerer).contains("PtrNe"));
+        }
+
+        #[test]
+        fn null_mut_as_a_value_is_a_null_ref_constant() {
+            let mut lowerer = Lowerer::new(None);
+            let expr: Expr = syn::parse_str("core::ptr::null_mut()").expect("parse");
+            let out = lowerer.lower_value_expr(&expr);
+            assert!(out.is_some(), "null_mut() is Constant(nullptr)");
+            let text = emitted(&lowerer);
+            assert!(
+                text.contains("load_const_r_value") && text.contains("0i64"),
+                "assignment/return RHS must be a null ref, got:\n{text}"
+            );
+        }
+
+        #[test]
+        fn std_ptr_null_as_a_value_is_a_null_ref_constant() {
+            let mut lowerer = Lowerer::new(None);
+            let expr: Expr = syn::parse_str("std::ptr::null()").expect("parse");
+            let out = lowerer.lower_value_expr(&expr);
+            assert!(out.is_some());
+            assert!(emitted(&lowerer).contains("load_const_r_value"));
+        }
+
+        #[test]
+        fn assigning_null_mut_stores_the_null_ref() {
+            let mut lowerer = Lowerer::new(None);
+            lowerer.next_reg = 1;
+            lowerer.bindings.insert("p".into(), ref_binding(0, None));
+            let stmt: syn::Stmt = syn::parse_str("p = core::ptr::null_mut();").expect("parse");
+            assert!(lowerer.lower_stmt(&stmt).is_some());
+            let text = emitted(&lowerer);
+            assert!(
+                text.contains("load_const_r_value") && text.contains("0i64"),
+                "assignment RHS must lower, got:\n{text}"
+            );
+            assert_eq!(
+                lowerer.bindings.get("p").map(|b| b.reg),
+                Some(1),
+                "the local must take the null ref register"
+            );
+        }
+
+        #[test]
+        fn returning_null_mut_is_a_null_ref_return() {
+            let mut lowerer = Lowerer::new(None);
+            lowerer.inline_arm_tail_stmt = true;
+            let stmt: syn::Stmt = syn::parse_str("return core::ptr::null_mut();").expect("parse");
+            assert!(lowerer.lower_stmt(&stmt).is_some());
+            let text = emitted(&lowerer);
+            assert!(
+                text.contains("load_const_r_value") && text.contains("ref_return"),
+                "return value must lower, got:\n{text}"
+            );
         }
 
         #[test]
