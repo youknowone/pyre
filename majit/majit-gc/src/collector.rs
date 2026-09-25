@@ -6438,18 +6438,15 @@ impl MiniMarkGC {
 
     /// `collect_nonstack_roots` at the end of MARKING (`major_collection_step`).
     ///
-    /// Owns `prebuilt_root_objects`, the registered roots (`self.roots.roots`,
-    /// pyre's static roots), the extra-root walker, `walk_rescan_roots`, and
-    /// the finalizer death queues. Registered roots and extra-root values take
-    /// the same regray-if-VISITED-else-seed treatment as
-    /// [`Self::rescan_major_stack_roots_black_and_drain`]. Prebuilt objects go
-    /// through `seed_prebuilt_root`; `walk_rescan_roots` and the death queues
-    /// go through `seed_major_root`.
+    /// Owns `prebuilt_root_objects`, the extra-root walker,
+    /// `walk_rescan_roots`, and the finalizer death queues. Already-black
+    /// values are left black: `seed_major_root` does not re-trace a
+    /// `GCFLAG_VISITED` object. The barrier-less stack-shaped sets are the
+    /// ones that need regray, and they belong to
+    /// [`Self::rescan_major_stack_roots_black_and_drain`].
     ///
     /// Upstream `collect_nonstack_roots` walks `prebuilt_root_objects`, the
     /// static roots (`root_walker.walk_roots`), and `enum_pending_finalizers`.
-    /// The stack-shaped sets are owned by
-    /// [`Self::rescan_major_stack_roots_black_and_drain`].
     fn rescan_major_nonstack_roots_and_drain(&mut self) {
         // In place, for the reason `seed_major_roots` gives.
         let mut i = 0;
@@ -6458,21 +6455,9 @@ impl MiniMarkGC {
             self.seed_prebuilt_root(addr);
             i += 1;
         }
-        // Copy the slots first: regray takes `&mut self` while the list lives
-        // on `self`, the same split `minor_collection_body` uses.
-        let roots: Vec<*mut GcRef> = self.roots.roots.to_vec();
-        for root_ptr in roots {
-            let gcref = unsafe { *root_ptr };
-            self.regray_or_seed_major_root(gcref, "registered_root");
-        }
-        // Snapshot before regray. The walker reads interpreter globals while
-        // `regray_or_seed_major_root` mutates the mark state; doing both in
-        // one callback re-enters that state mid-walk.
-        let mut extra_roots = Vec::new();
-        crate::shadow_stack::walk_extra_roots(|gcref| extra_roots.push(*gcref));
-        for gcref in extra_roots {
-            self.regray_or_seed_major_root(gcref, "rescan_extra_root");
-        }
+        crate::shadow_stack::walk_extra_roots(|gcref| {
+            self.seed_major_root(*gcref, "rescan_extra_root");
+        });
         // TLS exception cells live on the per-mutator frame area for the
         // first pass. Upstream's second `collect_nonstack_roots` still
         // repeats the non-stack carriers that can be written after the
