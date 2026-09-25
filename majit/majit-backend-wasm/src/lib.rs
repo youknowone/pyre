@@ -1345,6 +1345,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
         wasm_alloc_nursery_collecting_typed_roots,
     ));
     majit_gc::set_active_alloc_oldgen_typed(Some(wasm_alloc_oldgen_typed));
+    majit_gc::set_active_alloc_young_nonmoving_typed(Some(wasm_alloc_young_nonmoving_typed));
     majit_gc::set_active_root_hooks(Some(wasm_gc_add_root), Some(wasm_gc_remove_root));
     majit_gc::set_active_gc_owns_object(Some(wasm_gc_owns_object));
     majit_gc::set_active_gc_shrink_array(Some(wasm_gc_shrink_array));
@@ -1884,6 +1885,12 @@ unsafe fn wasm_alloc_nursery_collecting_typed_roots(
 /// across minor/major collections — see dynasm counterpart.
 fn wasm_alloc_oldgen_typed(type_id: u32, size: usize) -> GcRef {
     with_wasm_active_gc_mut(|gc| gc.alloc_oldgen_typed(type_id, size)).unwrap_or(GcRef(0))
+}
+
+/// `external_malloc(..., alloc_young=True)` on the wasm-owned GC: a stable
+/// address that the next minor frees unless something reaches it.
+fn wasm_alloc_young_nonmoving_typed(type_id: u32, size: usize) -> GcRef {
+    with_wasm_active_gc_mut(|gc| gc.alloc_young_nonmoving_typed(type_id, size)).unwrap_or(GcRef(0))
 }
 
 /// Allocate the block a blackhole `bh_new*` descr describes, in the non-moving

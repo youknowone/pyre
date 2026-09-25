@@ -101,6 +101,12 @@ fn pyre_object_gc_alloc_stable_trampoline(type_id: u32, size: usize) -> *mut u8 
     majit_gc::alloc_oldgen_typed(type_id, size).0 as *mut u8
 }
 
+/// Trampoline for young non-moving host-side allocations —
+/// `external_malloc(..., alloc_young=True)` on the active backend's GC.
+fn pyre_object_gc_alloc_young_nonmoving_trampoline(type_id: u32, size: usize) -> *mut u8 {
+    majit_gc::alloc_young_nonmoving_typed(type_id, size).0 as *mut u8
+}
+
 /// Trampoline for *collecting* nursery host-side allocations — routes
 /// pyre-object's collecting-allocation hook to the backend's collecting nursery
 /// allocator (minor-on-full). Only the elidable bigint payload helpers use it,
@@ -4835,6 +4841,9 @@ fn install_pyre_object_hooks() {
         pyre_object_gc_alloc_with_placement_trampoline,
     );
     pyre_object::register_gc_alloc_stable_hook(pyre_object_gc_alloc_stable_trampoline);
+    pyre_object::gc_hook::register_gc_alloc_young_nonmoving_hook(
+        pyre_object_gc_alloc_young_nonmoving_trampoline,
+    );
     pyre_object::gc_hook::register_gc_alloc_collecting_hook(
         pyre_object_gc_alloc_collecting_trampoline,
     );

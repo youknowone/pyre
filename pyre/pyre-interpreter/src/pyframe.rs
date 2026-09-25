@@ -1542,13 +1542,23 @@ impl FrameBox {
     ///
     /// `pyframe.py class PyFrame(W_Root)` — an executing frame is a normal
     /// GC object whose lifetime is its reachability.  When the GC hook is
-    /// installed this allocates a non-moving old-gen `PYFRAME_GC_TYPE_ID`
-    /// block (the same `try_gc_alloc_stable` path every `W_*` uses, e.g.
-    /// `function.rs`'s `function_new_impl`); the collector reclaims the frame and its
-    /// GC-managed locals, debug data, and block stack once no root
-    /// (`walk_pyframe_roots` over the `CURRENT_FRAME` / `f_backref` chain)
-    /// reaches it, so `Drop` performs no manual free
-    /// (`executioncontext.py leave` frees nothing either).
+    /// installed this allocates a non-moving YOUNG `PYFRAME_GC_TYPE_ID`
+    /// block (`external_malloc(..., alloc_young=True)`, through
+    /// `try_gc_alloc_young_nonmoving_raw`); the collector reclaims the frame
+    /// and its GC-managed locals, debug data, and block stack once no root
+    /// (the handle's own owner root while it lives, then `walk_pyframe_roots`
+    /// over the `CURRENT_FRAME` / `f_backref` chain or a traced edge such as
+    /// a traceback's `tb_frame`) reaches it, so `Drop` performs no manual
+    /// free (`executioncontext.py leave` frees nothing either).
+    ///
+    /// Born young rather than old because upstream's frame is a nursery
+    /// object: a returned frame nothing retains dies at the next minor
+    /// collection, and until then its slots are not traced.  A frame born
+    /// old instead joins the remembered set the moment it holds a young
+    /// argument box, and the next minor traces it whether or not it is still
+    /// reachable, promoting everything its dead slots name — measured
+    /// 92-99.7% of the nursery surviving each minor on a module-level loop
+    /// calling a compiled function that raises, against 15% with the JIT off.
     ///
     /// The non-moving part is pyre's, not upstream's: `pyframe.py:52 class
     /// PyFrame(W_Root)` declares no placement hint and a minor collection
@@ -1647,7 +1657,7 @@ impl FrameBox {
         };
         let inputs = frame_root.publish(published);
         frame_root.normalize(inputs, published.len());
-        let raw = pyre_object::gc_hook::try_gc_alloc_stable_raw(
+        let raw = pyre_object::gc_hook::try_gc_alloc_young_nonmoving_raw(
             PYFRAME_GC_TYPE_ID,
             std::mem::size_of::<PyFrame>(),
         );
@@ -1686,10 +1696,12 @@ impl FrameBox {
             unsafe {
                 std::ptr::write(ptr, frame);
             }
-            // The old-gen frame may hold pointers to freshly nursery-born
-            // argument / locals objects; remember it for the next minor
-            // tracer, exactly as `generator.rs`'s `w_generator_or_coroutine_new`
-            // does for a stable generator wrapping young frame contents.
+            // A young frame needs no barrier for the young argument / locals
+            // objects it names, and the barrier's TRACK_YOUNG_PTRS test
+            // answers so.  A refused young birth is old-gen, and that frame
+            // must be remembered for the next minor tracer, exactly as
+            // `generator.rs`'s `w_generator_or_coroutine_new` does for a
+            // stable generator wrapping young frame contents.
             pyre_object::gc_hook::try_gc_write_barrier_managed(raw);
             let owner_root =
                 majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(ptr as usize));

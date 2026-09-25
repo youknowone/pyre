@@ -806,6 +806,18 @@ pub trait GcAllocator: Send {
         self.alloc_nursery_no_collect_typed(type_id, size)
     }
 
+    /// `external_malloc(typeid, 0, alloc_young=True)` (incminimark.py) for a
+    /// caller that needs a stable address: the block never moves, and it is
+    /// YOUNG, so the next minor collection frees it unless a root or a traced
+    /// edge reaches it, and a young pointer stored into it needs no barrier.
+    ///
+    /// Non-collecting for the reason [`Self::alloc_oldgen_typed`] gives. A
+    /// collector without a young non-moving arm answers with
+    /// [`Self::alloc_oldgen_typed`].
+    fn alloc_young_nonmoving_typed(&mut self, type_id: u32, size: usize) -> GcRef {
+        self.alloc_oldgen_typed(type_id, size)
+    }
+
     /// incminimark.py:1569: jit_remember_young_pointer(obj)
     /// Perform a write barrier check on `obj`.
     /// Must be called before storing a GC reference into `obj`.
@@ -1630,6 +1642,9 @@ impl GcAllocator for GcHandle {
     }
     fn alloc_oldgen_typed(&mut self, type_id: u32, size: usize) -> GcRef {
         gc_sync::gc_op(|gc| gc.alloc_oldgen_typed(type_id, size))
+    }
+    fn alloc_young_nonmoving_typed(&mut self, type_id: u32, size: usize) -> GcRef {
+        gc_sync::gc_op(|gc| gc.alloc_young_nonmoving_typed(type_id, size))
     }
     fn write_barrier(&mut self, obj: GcRef) {
         // No root bracket: the barrier neither allocates nor collects, so
@@ -2785,6 +2800,29 @@ pub fn alloc_oldgen_typed(type_id: u32, payload_size: usize) -> GcRef {
     match ACTIVE_ALLOC_OLDGEN_TYPED.get() {
         Some(f) => f(type_id, payload_size),
         None => GcRef(0),
+    }
+}
+
+/// Process-global callback for [`GcAllocator::alloc_young_nonmoving_typed`]:
+/// a stable address that the next minor collection frees unless something
+/// reaches it. Returns `GcRef(0)` on allocation failure.
+pub type AllocYoungNonmovingTypedFn = fn(type_id: u32, payload_size: usize) -> GcRef;
+
+global_hook!(static ACTIVE_ALLOC_YOUNG_NONMOVING_TYPED: AllocYoungNonmovingTypedFn);
+
+/// Install the active backend's young non-moving allocator callback. Pass
+/// `None` to clear.
+pub fn set_active_alloc_young_nonmoving_typed(hook: Option<AllocYoungNonmovingTypedFn>) {
+    ACTIVE_ALLOC_YOUNG_NONMOVING_TYPED.set(hook);
+}
+
+/// Allocate a young, non-moving object through the active backend's GC.
+/// A backend that installed no young hook answers with
+/// [`alloc_oldgen_typed`]; `GcRef(0)` when no backend is installed.
+pub fn alloc_young_nonmoving_typed(type_id: u32, payload_size: usize) -> GcRef {
+    match ACTIVE_ALLOC_YOUNG_NONMOVING_TYPED.get() {
+        Some(f) => f(type_id, payload_size),
+        None => alloc_oldgen_typed(type_id, payload_size),
     }
 }
 
