@@ -6103,82 +6103,31 @@ impl OptContext {
         }
     }
 
-    /// `Option`-returning native sibling of
-    /// [`resolve_operand_operand`](Self::resolve_operand_operand):
-    /// `None` when the operand is a NONE / unresolved position so callers can
-    /// supply their own unbound fallback (a sentinel arg box, a
-    /// `materialize_*` mint) instead of tripping the position-only panic in the
-    /// total `get_box_replacement_operand`.
+    /// `Option`-returning sibling of
+    /// [`resolve_operand_operand`](Self::resolve_operand_operand): `None`
+    /// only for the NONE sentinel or a position-only operand whose position
+    /// resolves to nothing, so callers can supply their own fallback.
     pub fn resolve_operand_operand_opt(&self, arg: &Operand) -> Option<Operand> {
-        if let Some(resolved) = self.heal_arg_to_canonical(arg) {
-            return Some(resolved);
+        if arg.is_constant() || arg.is_resop() || arg.is_inputarg() {
+            return Some(self.resolve_operand_operand(arg));
         }
-
-        if arg.is_constant() {
-            return Some(arg.clone());
-        }
-
-        // info.py `getptrinfo` starts with `get_box_replacement(op)`.
-        // Both result ops and input args carry that native `_forwarded`
-        // chain; consult it before the positional store fallback.
-        if arg.is_resop() || arg.is_inputarg() {
-            let resolved = arg.get_box_replacement(false);
-            if resolved.same_box(arg) {
-                if let Some(imported) = self.imported_inputarg_operand(arg) {
-                    return Some(imported);
-                }
-                // An unregistered InputArg keeps the old `None` contract so
-                // the dispatch-entry caller can materialize one canonical
-                // host for every occurrence of that position. Result ops
-                // already carry their canonical producer and are total here.
-                let fallback = (!arg.is_inputarg()).then_some(resolved);
-                self.get_box_replacement_operand_opt(arg.to_opref())
-                    .or(fallback)
-            } else {
-                Some(resolved)
-            }
-        } else {
-            self.get_box_replacement_operand_opt(arg.to_opref())
-        }
+        self.get_box_replacement_operand_opt(arg.to_opref())
     }
 
-    /// Box-canonicalization heal (#189). When a position's
-    /// canonical producer (the `find_producer_op` / OpRef-store resolution)
-    /// has received a forwarding — const-fold (`make_constant_box` /
-    /// `seed_constant`) or CSE (`make_equal_to`) — that did NOT route through
-    /// `emit`'s `live_synthetics` catch-up, the recorder input
-    /// op the operands carry at that position stays a DISTINCT, still-
-    /// unforwarded `Op`. A box-native walk from such an operand then freezes
-    /// on the unforwarded input op while the OpRef path resolves the canonical
-    /// (the witnessed `resolve_operand_operand` divergence). Link `input_op ->
-    /// canonical` here, the non-emitted analogue of `emit`'s synth->op_rc link,
-    /// so both paths agree.
+    /// Link an unforwarded ResOp `arg` to the producer registered at its
+    /// position (`arg.set_forwarded(canonical)`) and return that producer's
+    /// terminal; `None` when `arg` is unbound, already forwarded, or its
+    /// position has no producer.
     ///
-    /// Cycle-safe: only an UNFORWARDED bound ResOp whose store canonical is a
-    /// genuinely distinct `Op` is linked. Const and InputArg operands resolve
-    /// canonically already and are skipped.
+    /// The one caller is `export_state`'s short-preamble conversion: a
+    /// replay op's args are the dependencies' replay handles, which share a
+    /// position with the body producer and carry no forwarding of their own.
     ///
-    /// The cycle guard keys on the bound `Op` identity, NOT the position: a
-    /// position routinely carries TWO distinct `Op` objects — the recorder
-    /// input op the operands bind to, and the emitted/canonical op
-    /// `find_producer_op` returns (the host on which `heap`/`virtualize` set the
-    /// position's PtrInfo via `set_forwarded_info`). Both share the same
-    /// `to_opref()` (position), so a position-equality guard would skip exactly
-    /// this same-position duplication, leaving the operand's box-native walk
-    /// stranded on the info-less input op while the OpRef store path reaches the
-    /// info-bearing canonical. Linking those two distinct ops is the whole point
-    /// of the heal. But `get_box_replacement_operand_opt` can also re-resolve a
-    /// DIFFERENT `Operand` wrapping the SAME bound `Op` as `arg` (a store wrapper
-    /// vs the memoized operand); `same_box` (an `Rc::ptr_eq` on the producers)
-    /// catches that for an identical `Rc<Op>`, but the explicit `Rc::ptr_eq` on
-    /// the bound ops is kept as the cycle guard — without it `set_forwarded_op`
-    /// self-cycles (`arg.op -> arg.op`). The canonical is a
-    /// `get_box_replacement_operand` terminal (`Forwarded::None`/`Info`, never a
-    /// bound op chained on), so once a genuinely distinct op is linked no chain
-    /// cycle forms.
-    /// Return the terminal already found by the heal so the caller need not
-    /// perform the same positional lookup a second time.
-    fn heal_arg_to_canonical(&self, arg: &Operand) -> Option<Operand> {
+    /// The cycle guard compares the bound `Op`s: a store wrapper around the
+    /// same `Rc<Op>` as `arg` is returned without linking, since linking would
+    /// be a one-node self-cycle. The canonical is a terminal, so no chain
+    /// cycle forms once a distinct op is linked.
+    pub(crate) fn heal_arg_to_canonical(&self, arg: &Operand) -> Option<Operand> {
         if arg.bound_op().is_none() {
             return None;
         }

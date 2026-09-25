@@ -2595,6 +2595,16 @@ mod tests {
         ops
     }
 
+    /// The operand the spec graph already carries at `opref`. Seeding a
+    /// freshly materialized box would forward a different object than the
+    /// one consumer args walk.
+    fn producer_operand(ops: &[majit_ir::OpRc], opref: OpRef) -> Operand {
+        ops.iter()
+            .find(|op| op.pos().get() == opref)
+            .map(|op| Operand::from_bound_op(op))
+            .unwrap_or_else(|| panic!("no producer at {opref:?}"))
+    }
+
     fn same_i() -> OpSpec {
         op_spec(OpCode::SameAsI, &[])
     }
@@ -2638,11 +2648,13 @@ mod tests {
     ) -> (OptimizationResult, OptContext) {
         let ops = build_specs(&specs);
         let mut ctx = OptContext::new(ops.len());
+        // Emit the producer the args already wrap. A cloned `Op` would be a
+        // second object at the same position.
         for op in &ops[..target] {
-            ctx.emit((**op).clone());
+            ctx.emit_rc(op.clone());
         }
         for &(opref, value) in constants {
-            let b = ctx.materialize_operand_at(opref);
+            let b = producer_operand(&ops, opref);
             ctx.make_constant_box(&b, value);
         }
         let mut passes = test_pass_chain();
@@ -2694,14 +2706,14 @@ mod tests {
         let mut ctx = OptContext::new(ops.len());
         ctx.supports_efficient_uint_mul_high = supports_efficient_uint_mul_high;
         for op in &ops[..target] {
-            ctx.emit((**op).clone());
+            ctx.emit_rc(op.clone());
         }
         for &(opref, value) in constants {
-            let b = ctx.materialize_operand_at(opref);
+            let b = producer_operand(&ops, opref);
             ctx.make_constant_box(&b, value);
         }
         for &opref in nonneg {
-            let b = ctx.materialize_operand_at(opref);
+            let b = producer_operand(&ops, opref);
             let _ = ctx
                 .getintbound_handle(&b)
                 .borrow_mut()
@@ -2962,9 +2974,9 @@ mod tests {
         let mut ctx = OptContext::new(4);
         ctx.supports_efficient_uint_mul_high = supports_efficient_uint_mul_high;
         for op in &ops {
-            ctx.emit((**op).clone());
+            ctx.emit_rc(op.clone());
         }
-        let b = ctx.materialize_operand_at(OpRef::int_op(2));
+        let b = Operand::from_bound_op(&ops[2]);
         ctx.make_constant_box(&b, Value::Int(divisor));
 
         let mut call = Op::new(
@@ -3599,22 +3611,23 @@ mod tests {
             op_spec(OpCode::FloatNeg, &[1]), // op2: -(-x) -> x
         ]);
         let mut ctx = OptContext::new(3);
-        ctx.emit((*ops[0]).clone());
+        ctx.emit_rc(ops[0].clone());
 
         let mut pass = OptRewrite::new();
-        // Process op1 first (pass it through)
-        let __pf_rc = OpRc::new((*ops[1]).clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result1 = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
+        // Process op1 first (pass it through) on the producer the next
+        // op's arg already wraps.
+        ctx.bind_input_resops(std::slice::from_ref(&ops[1]));
+        let result1 = pass.propagate_forward(&ops[1], &ops[1], &mut ctx);
         assert!(matches!(result1, OptimizationResult::PassOn));
-        ctx.emit((*ops[1]).clone());
+        ctx.emit_rc(ops[1].clone());
 
         // Process op2: should detect double negation
-        let mut resolved2 = (*ops[2]).clone();
-        resolve_op_args_in_ctx(&mut resolved2, &mut ctx);
-        let __pf_rc = OpRc::new(resolved2.clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result2 = pass.propagate_forward(&resolved2, &__pf_rc, &mut ctx);
+        for i in 0..ops[2].num_args() {
+            let resolved = ctx.resolve_operand_operand(&ops[2].arg(i));
+            ops[2].setarg(i, resolved);
+        }
+        ctx.bind_input_resops(std::slice::from_ref(&ops[2]));
+        let result2 = pass.propagate_forward(&ops[2], &ops[2], &mut ctx);
         assert!(matches!(result2, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_replacement_opref(OpRef::float_op(2)),
@@ -3903,18 +3916,18 @@ mod tests {
             op_spec(OpCode::GuardNoException, &[]), // op3: should be removed
         ]);
         let mut ctx = OptContext::new(4);
-        ctx.emit((*ops[0]).clone());
-        ctx.emit((*ops[1]).clone());
-        let b = ctx.materialize_operand_at(OpRef::int_op(0));
-        ctx.make_constant_box(&b, Value::Int(0));
+        ctx.emit_rc(ops[0].clone());
+        ctx.emit_rc(ops[1].clone());
+        ctx.make_constant_box(&Operand::from_bound_op(&ops[0]), Value::Int(0));
 
         let mut pass = OptRewrite::new();
         // Process CondCallN -> removed
-        let mut resolved2 = (*ops[2]).clone();
-        resolve_op_args_in_ctx(&mut resolved2, &mut ctx);
-        let __pf_rc = OpRc::new(resolved2.clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result2 = pass.propagate_forward(&resolved2, &__pf_rc, &mut ctx);
+        for i in 0..ops[2].num_args() {
+            let resolved = ctx.resolve_operand_operand(&ops[2].arg(i));
+            ops[2].setarg(i, resolved);
+        }
+        ctx.bind_input_resops(std::slice::from_ref(&ops[2]));
+        let result2 = pass.propagate_forward(&ops[2], &ops[2], &mut ctx);
         assert!(matches!(result2, OptimizationResult::Remove));
 
         // Process GuardNoException -> should also be removed
@@ -3933,15 +3946,14 @@ mod tests {
             op_spec(OpCode::GuardNoException, &[]), // op2: should NOT be removed
         ]);
         let mut ctx = OptContext::new(3);
-        ctx.emit((*ops[0]).clone());
+        ctx.emit_rc(ops[0].clone());
 
         let mut pass = OptRewrite::new();
         // Process CallN -> PassOn (not handled by OptRewrite)
-        let __pf_rc = OpRc::new((*ops[1]).clone());
-        ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result1 = pass.propagate_forward(&ops[1], &__pf_rc, &mut ctx);
+        ctx.bind_input_resops(std::slice::from_ref(&ops[1]));
+        let result1 = pass.propagate_forward(&ops[1], &ops[1], &mut ctx);
         assert!(matches!(result1, OptimizationResult::PassOn));
-        ctx.emit((*ops[1]).clone());
+        ctx.emit_rc(ops[1].clone());
 
         // Process GuardNoException -> should NOT be removed
         let __pf_rc = OpRc::new((*ops[2]).clone());

@@ -2140,7 +2140,8 @@ impl Optimizer {
                         continue;
                     }
                     let resolved = ctx
-                        .resolve_operand_operand_opt(&arg)
+                        .heal_arg_to_canonical(&arg)
+                        .or_else(|| ctx.resolve_operand_operand_opt(&arg))
                         .unwrap_or_else(|| arg.clone());
                     preamble_op.setarg(i, resolved);
                 }

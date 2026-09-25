@@ -3957,28 +3957,67 @@ mod tests {
 
     fn run_pass_with_constants(ops: &[Op], constants: &[(OpRef, Value)]) -> Vec<Op> {
         let (ops, snapshots) = seed_virtualize_guard_snapshots(ops);
-        let mut ctx = OptContext::new(ops.len());
-        ctx.snapshot_boxes = snapshots;
-        for &(opref, ref val) in constants {
-            let b = ctx.materialize_operand_at(opref);
-            ctx.make_constant_box(&b, *val);
+        // Constants are Const operands in the args. A position-keyed
+        // `make_constant_box` would forward a different object than the one
+        // the ops carry.
+        let mut owned: Vec<Op> = ops;
+        for op in &mut owned {
+            for i in 0..op.num_args() {
+                let r = op.arg(i).to_opref();
+                if let Some(&(_, val)) = constants.iter().find(|(pref, _)| *pref == r) {
+                    op.setarg(i, Operand::const_from_value(val));
+                }
+            }
         }
+
+        // One object per position: a producer's result box is what later
+        // args at that position carry, and a leaf keeps the first operand.
+        let mut wrapped: Vec<OpRc> = Vec::with_capacity(owned.len());
+        let mut leaves: Vec<Operand> = Vec::new();
+        for op in &owned {
+            let rc = OpRc::new(op.clone());
+            for i in 0..rc.num_args() {
+                let arg = rc.arg(i);
+                if arg.is_constant() || arg.is_none() {
+                    continue;
+                }
+                let opref = arg.to_opref();
+                if let Some(prod) = wrapped.iter().rev().find(|p| {
+                    let pos = p.pos().get();
+                    pos == opref && p.opcode.result_type() != Type::Void
+                }) {
+                    rc.setarg(i, Operand::from_bound_op(prod));
+                    continue;
+                }
+                if let Some(leaf) = leaves.iter().find(|leaf| leaf.to_opref() == opref) {
+                    rc.setarg(i, leaf.clone());
+                    continue;
+                }
+                leaves.push(arg);
+            }
+            wrapped.push(rc);
+        }
+
+        let mut ctx = OptContext::new(wrapped.len());
+        ctx.snapshot_boxes = snapshots;
+        let produced: std::collections::HashSet<OpRef> =
+            wrapped.iter().map(|op| op.pos().get()).collect();
+        let leaf_args: Vec<Operand> = leaves
+            .into_iter()
+            .filter(|arg| !produced.contains(&arg.to_opref()))
+            .collect();
+        ctx.seed_boxes_canonical(&leaf_args);
 
         let mut pass = OptVirtualize::new();
         pass.setup();
 
-        for op in &ops {
-            // Resolve forwarded arguments
-            let mut resolved_op = op.clone();
-            // optimizer.py:651-652 setarg loop parity. `resolve_op_args`
-            // binds each arg to its canonical box (oparser object-identity),
-            // materialising and registering a bound box for any unbound
-            // position so no position-only `Operand::Box` is minted.
-            resolve_op_args(&mut resolved_op, &mut ctx);
-
-            let resolved_rc = OpRc::new(resolved_op.clone());
-            ctx.bind_input_resops(std::slice::from_ref(&resolved_rc));
-            match pass.propagate_forward(&resolved_op, &resolved_rc, &mut ctx) {
+        for rc in &wrapped {
+            for i in 0..rc.num_args() {
+                let resolved = ctx.resolve_operand_operand(&rc.arg(i));
+                rc.setarg(i, resolved);
+            }
+            ctx.bind_input_resops(std::slice::from_ref(rc));
+            match pass.propagate_forward(rc, rc, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -3987,7 +4026,7 @@ mod tests {
                 }
                 OptimizationResult::Remove => {}
                 OptimizationResult::PassOn => {
-                    ctx.emit(resolved_op);
+                    ctx.emit_rc(rc.clone());
                 }
                 OptimizationResult::InvalidLoop(_) => {
                     panic!("unexpected InvalidLoop in test");
@@ -4173,13 +4212,8 @@ mod tests {
         });
         pass.setup();
 
-        let mut get = Op::new(
-            OpCode::GetfieldRawI,
-            &[crate::history::test_support::rooted_inputarg_operand(
-                Type::Ref,
-                0,
-            )],
-        );
+        let vable = ctx.materialize_operand_at(OpRef::input_arg_ref(0));
+        let mut get = Op::new(OpCode::GetfieldRawI, &[vable]);
         get.setdescr(test_vable_field_descr(8, Type::Int, 1));
         get.pos().set(OpRef::int_op(10));
 
@@ -5007,12 +5041,11 @@ mod tests {
             OptimizationResult::Remove
         ));
 
+        let value = crate::history::test_support::rooted_resop_operand(Type::Int, 100);
+        ctx.seed_boxes_canonical(std::slice::from_ref(&value));
         let mut set_op = Op::with_descr(
             OpCode::SetfieldGc,
-            &[
-                crate::history::test_support::rooted_resop_operand(Type::Ref, 0),
-                crate::history::test_support::rooted_resop_operand(Type::Int, 100),
-            ],
+            &[Operand::from_bound_op(&new_op_rc), value],
             fd,
         );
         set_op.pos().set(OpRef::int_op(1));
@@ -6394,35 +6427,60 @@ mod tests {
         constants: &[(OpRef, Value)],
         raw_bufs: &[(OpRef, usize)],
     ) -> Vec<Op> {
-        let mut ctx = OptContext::new(ops.len());
-        for &(opref, ref val) in constants {
-            let b = ctx.materialize_operand_at(opref);
-            ctx.make_constant_box(&b, *val);
+        // Constants are Const operands. PtrInfo is seeded on the buffer
+        // operand the ops carry, not on a second box materialized by position.
+        let mut owned: Vec<Op> = ops.to_vec();
+        for op in &mut owned {
+            for i in 0..op.num_args() {
+                let r = op.arg(i).to_opref();
+                if let Some(&(_, val)) = constants.iter().find(|(pref, _)| *pref == r) {
+                    op.setarg(i, Operand::const_from_value(val));
+                }
+            }
+        }
+        let mut wrapped: Vec<OpRc> = Vec::with_capacity(owned.len());
+        let mut leaves: Vec<Operand> = Vec::new();
+        for op in &owned {
+            let rc = OpRc::new(op.clone());
+            for i in 0..rc.num_args() {
+                let arg = rc.arg(i);
+                if arg.is_constant() || arg.is_none() {
+                    continue;
+                }
+                let opref = arg.to_opref();
+                if let Some(leaf) = leaves.iter().find(|leaf| leaf.to_opref() == opref) {
+                    rc.setarg(i, leaf.clone());
+                    continue;
+                }
+                leaves.push(arg);
+            }
+            wrapped.push(rc);
         }
 
+        let mut ctx = OptContext::new(wrapped.len());
+        ctx.seed_boxes_canonical(&leaves);
         let mut pass = OptVirtualize::new();
         pass.setup();
 
-        // Pre-populate VirtualRawBuffer info for specified OpRefs
         for &(opref, size) in raw_bufs {
-            let b = ctx.materialize_operand_at(opref);
+            let b = leaves
+                .iter()
+                .find(|leaf| leaf.to_opref() == opref)
+                .cloned()
+                .unwrap_or_else(|| ctx.materialize_operand_at(opref));
             ctx.set_ptr_info(
                 &b,
                 PtrInfo::VirtualRawBuffer(RawBufferPtrInfo::new(0, size, None)),
             );
         }
 
-        for op in ops {
-            let mut resolved_op = op.clone();
-            // optimizer.py:651-652 setarg loop parity. `resolve_op_args`
-            // binds each arg to its canonical box (oparser object-identity),
-            // materialising and registering a bound box for any unbound
-            // position so no position-only `Operand::Box` is minted.
-            resolve_op_args(&mut resolved_op, &mut ctx);
-
-            let resolved_rc = OpRc::new(resolved_op.clone());
-            ctx.bind_input_resops(std::slice::from_ref(&resolved_rc));
-            match pass.propagate_forward(&resolved_op, &resolved_rc, &mut ctx) {
+        for rc in &wrapped {
+            for i in 0..rc.num_args() {
+                let resolved = ctx.resolve_operand_operand(&rc.arg(i));
+                rc.setarg(i, resolved);
+            }
+            ctx.bind_input_resops(std::slice::from_ref(rc));
+            match pass.propagate_forward(rc, rc, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -6431,7 +6489,7 @@ mod tests {
                 }
                 OptimizationResult::Remove => {}
                 OptimizationResult::PassOn => {
-                    ctx.emit(resolved_op);
+                    ctx.emit_rc(rc.clone());
                 }
                 OptimizationResult::InvalidLoop(_) => {
                     panic!("unexpected InvalidLoop in test");

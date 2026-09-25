@@ -2686,11 +2686,9 @@ mod tests {
         let left = OpRef::ref_op(100);
 
         // Simulate: NEWSTR(2) for left
-        let mut left_op = Op::new(OpCode::Newstr, &[iop(200)]);
+        let mut left_op = Op::new(OpCode::Newstr, &[Operand::const_from_value(Value::Int(2))]);
         left_op.pos().set(left);
         let mut ctx = OptContext::new(10);
-        let b = ctx.materialize_operand_at(OpRef::int_op(200));
-        ctx.make_constant_box(&b, Value::Int(2));
 
         // Process NEWSTR → creates virtual Plain
         let left_op_rc = OpRc::new(left_op.clone());
