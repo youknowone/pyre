@@ -457,6 +457,14 @@ mod imp {
         let resultdata = (exchange_buffer + unsafe { exchange_result(cif_description) })
             as *mut std::ffi::c_void;
         let descr = unsafe { header(cif_description) };
+        // `clibffi.py c_ffi_call` is an external declared
+        // `save_err=RFFI_ERR_ALL | RFFI_ALT_ERRNO`; its wrapper runs
+        // `_errno_before` / `_errno_after` around the raw call. A trace
+        // records `CALL_RELEASE_GIL` with the same flags instead
+        // (`pyjitpl.py direct_libffi_call`) and the backend does the swap.
+        const SAVE_ERR: i64 =
+            majit_jitcode::rffi::RFFI_ERR_ALL | majit_jitcode::rffi::RFFI_ALT_ERRNO;
+        majit_rlib::rposix::_errno_before(SAVE_ERR);
         unsafe {
             libffi::low::call_return_into(
                 &raw mut descr.cif,
@@ -465,6 +473,7 @@ mod imp {
                 resultdata,
             );
         }
+        majit_rlib::rposix::_errno_after(SAVE_ERR);
     }
 }
 

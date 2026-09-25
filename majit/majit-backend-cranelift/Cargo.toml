@@ -19,6 +19,7 @@ indexmap = { workspace = true }
 majit-ir = { workspace = true }
 majit-backend = { workspace = true }
 majit-jitcode = { workspace = true }
+majit-rlib = { workspace = true }
 majit-gc = { workspace = true }
 cranelift-codegen = { workspace = true }
 cranelift-frontend = { workspace = true }

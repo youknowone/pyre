@@ -68,8 +68,7 @@ const CALL_FRAME_SIZE: u32 = 64;
 /// offset differs, the mechanism does not.
 ///
 /// Reads must add any `sub sp, sp, #n` in effect at the read point, the way
-/// `aarch64/callbuilder.py:173` adds `self.current_sp`. The only reader today
-/// (`genop_call_assembler`) runs outside the stack-argument window.
+/// `aarch64/callbuilder.py` `write_real_errno` adds `self.current_sp`.
 const SAVED_THREADLOCAL_OFS: u32 = 48;
 
 const _: () = assert!(
@@ -5846,7 +5845,69 @@ impl<'a> AssemblerARM64<'a> {
     /// non-float arg plan through remap_frame_layout(asm, src, dst, ip0)
     /// and preserves the fnloc across the remap via ip1 when it is a
     /// register.
-    fn emit_call_from_arglocs(&mut self, arglocs: &[Loc], func_index: usize) {
+    /// callbuilder.py `write_real_errno`, just before the raw call: copy the
+    /// saved `errno` into the real one. `current_sp` is how far sp sits
+    /// below the body sp here. x0-x7 hold the arguments and x8/x17 the
+    /// callee, so this uses x11 and ip0.
+    fn write_real_errno(&mut self, save_err: i64, current_sp: u32) {
+        use majit_jitcode::rffi::{RFFI_ALT_ERRNO, RFFI_READSAVED_ERRNO, RFFI_ZERO_ERRNO_BEFORE};
+        use majit_rlib::rthread::{
+            TLFIELD_ALT_ERRNO_OFS, TLFIELD_P_ERRNO_OFS, TLFIELD_RPY_ERRNO_OFS,
+        };
+        let tlofs = SAVED_THREADLOCAL_OFS + current_sp;
+        let p_errno = TLFIELD_P_ERRNO_OFS as u32;
+        if save_err & RFFI_READSAVED_ERRNO != 0 {
+            // Just before a call, read '*_errno' and write it into the
+            // real 'errno'.
+            let rpy_errno = if save_err & RFFI_ALT_ERRNO != 0 {
+                TLFIELD_ALT_ERRNO_OFS
+            } else {
+                TLFIELD_RPY_ERRNO_OFS
+            } as u32;
+            dynasm!(self.mc ; .arch aarch64
+                ; ldr x11, [sp, tlofs]
+                ; ldr x16, [x11, p_errno]
+                ; ldr w11, [x11, rpy_errno]
+                ; str w11, [x16]
+            );
+        } else if save_err & RFFI_ZERO_ERRNO_BEFORE != 0 {
+            // Same, but write zero.
+            dynasm!(self.mc ; .arch aarch64
+                ; ldr x11, [sp, tlofs]
+                ; ldr x16, [x11, p_errno]
+                ; str wzr, [x16]
+            );
+        }
+    }
+
+    /// callbuilder.py `read_real_errno`, just after the raw call: save the
+    /// real `errno` into the thread-local copy. x0/d0 hold the result, so
+    /// this uses x3 and ip0.
+    fn read_real_errno(&mut self, save_err: i64, current_sp: u32) {
+        use majit_jitcode::rffi::{RFFI_ALT_ERRNO, RFFI_SAVE_ERRNO};
+        use majit_rlib::rthread::{
+            TLFIELD_ALT_ERRNO_OFS, TLFIELD_P_ERRNO_OFS, TLFIELD_RPY_ERRNO_OFS,
+        };
+        if save_err & RFFI_SAVE_ERRNO != 0 {
+            // Just after a call, read the real 'errno' and save a copy of
+            // it inside our thread-local '*_errno'.
+            let rpy_errno = if save_err & RFFI_ALT_ERRNO != 0 {
+                TLFIELD_ALT_ERRNO_OFS
+            } else {
+                TLFIELD_RPY_ERRNO_OFS
+            } as u32;
+            let p_errno = TLFIELD_P_ERRNO_OFS as u32;
+            let tlofs = SAVED_THREADLOCAL_OFS + current_sp;
+            dynasm!(self.mc ; .arch aarch64
+                ; ldr x3, [sp, tlofs]
+                ; ldr x16, [x3, p_errno]
+                ; ldr w16, [x16]
+                ; str w16, [x3, rpy_errno]
+            );
+        }
+    }
+
+    fn emit_call_from_arglocs(&mut self, arglocs: &[Loc], func_index: usize, save_err: i64) {
         let arg_count = arglocs.len();
 
         dynasm!(self.mc ; .arch aarch64 ; stp x29, x30, [sp, #-16]!);
@@ -5981,8 +6042,12 @@ impl<'a> AssemblerARM64<'a> {
             }
         }
 
+        // llsupport/callbuilder.py `emit_call_release_gil`:
+        // write_real_errno(); emit_raw_call(); read_real_errno().
+        let current_sp = 16 + stack_bytes as u32;
         // aarch64/callbuilder.py:67 — restore fnloc from ip1 / emit call.
         if fnloc_in_ip1 {
+            self.write_real_errno(save_err, current_sp);
             dynasm!(self.mc ; .arch aarch64 ; blr x17);
         } else {
             // Unlike x86, which always ends in `call rax`, this arm is the
@@ -5993,8 +6058,10 @@ impl<'a> AssemblerARM64<'a> {
             };
             let val = i.value;
             self.emit_mov_imm64(8, val);
+            self.write_real_errno(save_err, current_sp);
             dynasm!(self.mc ; .arch aarch64 ; blr x8);
         }
+        self.read_real_errno(save_err, current_sp);
 
         if stack_bytes != 0 {
             dynasm!(self.mc ; .arch aarch64 ; add sp, sp, stack_bytes as u32);
@@ -6036,8 +6103,15 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     fn _genop_call_with_arglocs(&mut self, op: &Op, arglocs: &[Loc]) {
-        let func_index = 3 + usize::from(op.opcode.is_call_release_gil());
-        self.emit_call_from_arglocs(arglocs, func_index);
+        // [resloc, size, sign, saveerr, func, args...] for CALL_RELEASE_GIL.
+        let is_call_release_gil = op.opcode.is_call_release_gil();
+        let save_err = if is_call_release_gil {
+            Self::argloc_imm(arglocs, 3)
+        } else {
+            0
+        };
+        let func_index = 3 + usize::from(is_call_release_gil);
+        self.emit_call_from_arglocs(arglocs, func_index, save_err);
         if op.opcode.result_type() == Type::Int {
             self.ensure_call_result_bit_extension(arglocs);
         }
@@ -7239,7 +7313,7 @@ impl<'a> AssemblerARM64<'a> {
         }
 
         self.emit_push_all_volatile_regs();
-        self.emit_call_from_arglocs(arglocs, 1);
+        self.emit_call_from_arglocs(arglocs, 1, 0);
         self.emit_pop_all_volatile_regs();
 
         dynasm!(self.mc ; .arch aarch64 ; =>skip_label);
@@ -7281,7 +7355,7 @@ impl<'a> AssemblerARM64<'a> {
         let skip_label = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch aarch64 ; cbnz x0, =>skip_label);
 
-        self.emit_call_from_arglocs(arglocs, 1);
+        self.emit_call_from_arglocs(arglocs, 1, 0);
 
         dynasm!(self.mc ; .arch aarch64 ; =>skip_label);
 

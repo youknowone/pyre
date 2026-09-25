@@ -947,17 +947,6 @@ fn jit_exc_type_addr() -> usize {
     &JIT_EXC_TYPE as *const _ as usize
 }
 
-thread_local! {
-    /// Thread-local reference storage for JIT-compiled code.
-    ///
-    /// Mirrors RPython's `rpy_threadlocalref` — an array of integer-sized slots
-    /// indexed by offset. The interpreter stores per-thread state here (e.g.,
-    /// the current action flag, signal handler data, etc.).
-    ///
-    /// Slots are accessed via THREADLOCALREF_GET opcode.
-    static JIT_THREADLOCAL_SLOTS: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
-}
-
 // ── Exception state shims called from JIT-compiled code ──
 
 /// Clear the current exception state.
@@ -998,16 +987,12 @@ pub fn jit_exc_value_raw() -> i64 {
 
 // ── Thread-local reference access shims ──
 
-/// Read a thread-local slot at the given offset.
+/// `llop.threadlocalref_get`: the word at byte offset `offset` of this
+/// thread's `pypy_threadlocal_s`.
 ///
 /// Called from JIT-compiled code for THREADLOCALREF_GET operations.
-/// The offset is in bytes (divided by 8 to get the slot index).
 extern "C" fn jit_threadlocalref_get(offset: i64) -> i64 {
-    JIT_THREADLOCAL_SLOTS.with(|slots| {
-        let slots = slots.borrow();
-        let idx = (offset / 8) as usize;
-        slots.get(idx).copied().unwrap_or(0)
-    })
+    majit_rlib::rthread::threadlocalref_get(offset as usize)
 }
 
 /// Write a value to a thread-local slot at the given offset.
@@ -1015,27 +1000,12 @@ extern "C" fn jit_threadlocalref_get(offset: i64) -> i64 {
 /// Called by the interpreter to set up thread-local state before entering
 /// JIT-compiled code.
 pub fn jit_threadlocalref_set(offset: i64, value: i64) {
-    JIT_THREADLOCAL_SLOTS.with(|slots| {
-        let mut slots = slots.borrow_mut();
-        let idx = (offset / 8) as usize;
-        if idx >= slots.len() {
-            slots.resize(idx + 1, 0);
-        }
-        slots[idx] = value;
-    });
+    majit_rlib::rthread::threadlocalref_set(offset as usize, value);
 }
 
-/// Get the base pointer for thread-local slots.
-/// Returns 0 since we use callback-based access.
+/// `llmodel.py` `threadlocalref_addr`: this thread's `pypy_threadlocal_s`.
 pub fn jit_threadlocalref_base() -> *const i64 {
-    JIT_THREADLOCAL_SLOTS.with(|slots| {
-        let slots = slots.borrow();
-        if slots.is_empty() {
-            std::ptr::null()
-        } else {
-            slots.as_ptr()
-        }
-    })
+    majit_rlib::rthread::threadlocalref_addr()
 }
 
 // ── GIL release/reacquire shims ──
@@ -1064,6 +1034,17 @@ extern "C" fn jit_reacquire_gil_shim() {
     if let Some(hook) = GIL_REACQUIRE_HOOK.get() {
         hook();
     }
+}
+
+/// callbuilder.py `write_real_errno`, run just before the raw call. The
+/// shim itself does not touch `errno` after setting it.
+extern "C" fn jit_write_real_errno(save_err: i64) {
+    majit_rlib::rposix::_errno_before(save_err);
+}
+
+/// callbuilder.py `read_real_errno`, run just after the raw call.
+extern "C" fn jit_read_real_errno(save_err: i64) {
+    majit_rlib::rposix::_errno_after(save_err);
 }
 
 // ── rewrite.py:489 parity: inject str_descr/unicode_descr ──
@@ -13748,11 +13729,10 @@ impl CraneliftBackend {
                     // dynasm backend mirrors that with
                     // `func_index = 3 + is_call_release_gil` at
                     // `backend-dynasm/x86/assembler.rs`.
-                    // TODO: pyre does not yet
-                    // forward `saveerr` to the GIL pre/post-hooks, so
-                    // `op.arg(0)` is still consumed as a const_int
-                    // operand at trace replay rather than threaded
-                    // into the backend hook signature.
+                    // `op.arg(0)` is the `save_err` constant
+                    // `write_real_errno` / `read_real_errno` act on.
+                    let save_err = lookup_const_i64(&constants, op.arg(0).to_opref())
+                        .expect("call_release_gil save_err must be a constant");
                     let func_ptr_raw = resolve_opref(
                         &mut builder,
                         &opref_var_map,
@@ -13780,12 +13760,36 @@ impl CraneliftBackend {
                         }
                     }
 
+                    // llsupport/callbuilder.py `emit_call_release_gil`:
+                    // write_real_errno(); emit_raw_call(); read_real_errno().
+                    if save_err != 0 {
+                        let save_err_val = builder.ins().iconst(cl_types::I64, save_err);
+                        let _ = emit_host_call(
+                            &mut builder,
+                            ptr_type,
+                            call_conv,
+                            jit_write_real_errno as *const () as usize,
+                            &[save_err_val],
+                            None,
+                        );
+                    }
                     let call = builder.ins().call_indirect(sig_ref, func_ptr_val, &args);
                     let result = if result_type != Type::Void {
                         Some(builder.inst_results(call)[0])
                     } else {
                         None
                     };
+                    if save_err != 0 {
+                        let save_err_val = builder.ins().iconst(cl_types::I64, save_err);
+                        let _ = emit_host_call(
+                            &mut builder,
+                            ptr_type,
+                            call_conv,
+                            jit_read_real_errno as *const () as usize,
+                            &[save_err_val],
+                            None,
+                        );
+                    }
 
                     // Reacquire GIL (call the post-hook)
                     let _ = emit_host_call(

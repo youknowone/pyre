@@ -1043,6 +1043,15 @@ fn emit_call_area_addr(sink: &mut PeepSink<'_, '_>) {
 /// `base + offset`. The scratch no longer lives in the frame, so the pair is
 /// always the static call area at offset zero, and the base-only import — whose
 /// host side adds a baked `CALL_RESULT_OFS` — can no longer be used.
+/// Call a `(i64 save_err)->i64` errno helper (`write_real_errno` /
+/// `read_real_errno`) through the residual type family at `base`.
+fn emit_errno_helper_call(sink: &mut PeepSink<'_, '_>, base: u32, save_err: i64, fn_ptr: i64) {
+    sink.i64_const(save_err);
+    sink.i32_const(fn_ptr as i32);
+    sink.call_indirect(0, base + 1);
+    sink.drop();
+}
+
 fn emit_jit_call(sink: &mut PeepSink<'_, '_>, jit_call_idx: u32) {
     emit_call_area_addr(sink);
     sink.i32_const(0);
@@ -4081,6 +4090,9 @@ pub struct AllocHelpers {
     pub headerless_fn_ptr: i64,
     pub threadlocal_fn_ptr: i64,
     pub fmod_fn_ptr: i64,
+    /// callbuilder.py `write_real_errno` / `read_real_errno`, `(i64)->i64`.
+    pub write_real_errno_fn_ptr: i64,
+    pub read_real_errno_fn_ptr: i64,
 }
 
 type BuildWasmModuleOutput = (Vec<u8>, Vec<GuardExit>, usize, usize);
@@ -4881,6 +4893,18 @@ pub fn build_wasm_module(
         let scanned = analysis_ops
             .iter()
             .filter_map(|op| direct_helper_i64_arity(op, &ref_values, constants))
+            // The `write_real_errno` / `read_real_errno` helpers around a
+            // CALL_RELEASE_GIL with a `save_err` are `(i64)->i64`.
+            .chain(
+                analysis_ops
+                    .iter()
+                    .filter(|op| {
+                        op.opcode.is_call_release_gil()
+                            && const_operand_value(constants, op.arg(0).to_opref())
+                                .is_some_and(|save_err| save_err != 0)
+                    })
+                    .map(|_| 1),
+            )
             .max();
         // `emit_jitframe_write_barrier` is a generated one-argument helper,
         // not a trace operation visible to the ordinary residual census.
@@ -9096,15 +9120,33 @@ fn build_function(
                     }
                     continue;
                 }
-                if residual_func_ofs(op.opcode) == 1
-                    && const_operand_value(constants, op.arg(0).to_opref()) != Some(0)
-                {
-                    // AbstractLLCPU's CALL_RELEASE_GIL also owns save_err;
-                    // no GIL on wasm does not remove errno save/restore.
-                    return Err(BackendError::Unsupported(
-                        "wasm backend: CALL_RELEASE_GIL save_err is not implemented".into(),
-                    ));
-                }
+                // `[savebox, funcbox] + argboxes` for CALL_RELEASE_GIL: its
+                // `save_err` owns an errno save/restore around the raw call
+                // even though there is no GIL to release on wasm.
+                let save_err = if residual_func_ofs(op.opcode) == 1 {
+                    let Some(save_err) = const_operand_value(constants, op.arg(0).to_opref())
+                    else {
+                        return Err(BackendError::Unsupported(
+                            "wasm backend: CALL_RELEASE_GIL save_err is not a constant".into(),
+                        ));
+                    };
+                    save_err
+                } else {
+                    0
+                };
+                let errno_helpers = if save_err == 0 {
+                    None
+                } else {
+                    let Some(base) = residual_type_base.filter(|_| {
+                        alloc.write_real_errno_fn_ptr != 0 && alloc.read_real_errno_fn_ptr != 0
+                    }) else {
+                        return Err(BackendError::Unsupported(
+                            "wasm backend: CALL_RELEASE_GIL save_err needs the errno helpers"
+                                .into(),
+                        ));
+                    };
+                    Some(base)
+                };
                 emit_force_bracket_before_call(
                     &mut sink,
                     constants,
@@ -9128,6 +9170,23 @@ fn build_function(
                     OpCode::CallReleaseGilI | OpCode::CallReleaseGilF | OpCode::CallReleaseGilN
                 ));
                 let func_ptr_ref = op.arg(func_ofs).to_opref();
+
+                // llsupport/callbuilder.py `emit_call_release_gil`:
+                // write_real_errno(); emit_raw_call(); read_real_errno(),
+                // with the read ahead of any frame reload in each arm below.
+                if let Some(base) = errno_helpers {
+                    emit_errno_helper_call(
+                        &mut sink,
+                        base,
+                        save_err,
+                        alloc.write_real_errno_fn_ptr,
+                    );
+                }
+                let read_real_errno = |sink: &mut PeepSink<'_, '_>| {
+                    if let Some(base) = errno_helpers {
+                        emit_errno_helper_call(sink, base, save_err, alloc.read_real_errno_fn_ptr);
+                    }
+                };
 
                 // Direct in-module residual call: skip the `jit_call` host hop and
                 // `call_indirect` the callee's table slot with a static
@@ -9153,6 +9212,7 @@ fn build_function(
                     } else {
                         sink.drop(); // value-producing call whose result is unused
                     }
+                    read_real_errno(&mut sink);
                     if can_collect {
                         emit_reload_frame_if_necessary(
                             &mut sink,
@@ -9187,6 +9247,7 @@ fn build_function(
                     sink.i32_wrap_i64();
                     sink.call_indirect(0, base + nargs as u32);
                     sink.drop();
+                    read_real_errno(&mut sink);
                     if can_collect {
                         emit_reload_frame_if_necessary(
                             &mut sink,
@@ -9263,6 +9324,7 @@ fn build_function(
                         sink.drop();
                         None
                     };
+                    read_real_errno(&mut sink);
                     if can_collect {
                         emit_reload_frame_if_necessary(
                             &mut sink,
@@ -9294,6 +9356,7 @@ fn build_function(
                     emit_resolve(&mut sink, constants, value_types, func_ptr_ref);
                     sink.i32_wrap_i64();
                     sink.call_indirect(0, base + nargs as u32);
+                    read_real_errno(&mut sink);
                     if can_collect {
                         emit_reload_frame_if_necessary(
                             &mut sink,
@@ -9355,6 +9418,7 @@ fn build_function(
                         sink.local_set(value_types.local(vi));
                     }
                     // Mirror the direct path: a trampoline residual call may force and collect.
+                    read_real_errno(&mut sink);
                     if can_collect {
                         emit_reload_frame_if_necessary(
                             &mut sink,

@@ -1,5 +1,6 @@
 //! Callbacks — PyPy: `pypy/module/_cffi_backend/ccallback.py`.
 
+use majit_jitcode::rffi::{RFFI_ALT_ERRNO, RFFI_ERR_ALL};
 use pyre_interpreter::{PyError, PyErrorKind};
 use pyre_object::PyObjectRef;
 
@@ -515,13 +516,13 @@ unsafe extern "C" fn invoke_callback(
 ) {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
+    super::cerrno::_errno_after(RFFI_ERR_ALL | RFFI_ALT_ERRNO);
     if !ll_res.is_null() {
         unsafe { std::ptr::write_bytes(ll_res.cast::<u8>(), 0, SIZE_OF_FFI_ARG) };
     }
     let invoked = catch_unwind(AssertUnwindSafe(|| {
         let _callback =
             pyre_interpreter::module::thread::enter_external_callback_from_foreign_thread();
-        super::cerrno::errno_after();
         if let Some(w_callback) = super::hide_reveal::reveal_callback(ll_userdata.cast::<u8>()) {
             let roots = pyre_object::gc_roots::push_roots();
             let base = roots.base();
@@ -532,7 +533,6 @@ unsafe extern "C" fn invoke_callback(
                 b"SystemError: invoking a callback that was already freed\n",
             );
         }
-        super::cerrno::errno_before();
     }));
     if invoked.is_err() {
         let _ = catch_unwind(AssertUnwindSafe(|| {
@@ -543,7 +543,7 @@ unsafe extern "C" fn invoke_callback(
             {
                 write_error_return_value(callback, ll_res.cast::<u8>());
             }
-            super::cerrno::errno_before();
         }));
     }
+    super::cerrno::_errno_before(RFFI_ERR_ALL | RFFI_ALT_ERRNO);
 }

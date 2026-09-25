@@ -746,7 +746,7 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
         not(target_arch = "wasm32")
     ))]
     {
-        use module::_cffi_backend::{cdataobj, cerrno, ctypefunc, ctypeprim, jit_libffi, misc};
+        use module::_cffi_backend::{cdataobj, ctypefunc, ctypeprim, jit_libffi, misc};
         single(
             entries,
             "pyre_interpreter::module::_cffi_backend::cdataobj::raw_malloc_varsize_char",
@@ -776,26 +776,6 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
             entries,
             "pyre_module::module::_cffi_backend::cdataobj::raw_free",
             cdataobj::raw_free as *const (),
-        );
-        single(
-            entries,
-            "pyre_interpreter::module::_cffi_backend::cerrno::errno_before",
-            cerrno::errno_before as *const (),
-        );
-        single(
-            entries,
-            "pyre_module::module::_cffi_backend::cerrno::errno_before",
-            cerrno::errno_before as *const (),
-        );
-        single(
-            entries,
-            "pyre_interpreter::module::_cffi_backend::cerrno::errno_after",
-            cerrno::errno_after as *const (),
-        );
-        single(
-            entries,
-            "pyre_module::module::_cffi_backend::cerrno::errno_after",
-            cerrno::errno_after as *const (),
         );
         single(
             entries,
