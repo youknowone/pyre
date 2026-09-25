@@ -7380,12 +7380,17 @@ static __majit_wrap_base_exception_descr_init_target: crate::gateway::BuiltinWra
 
 /// `ValueError(x)` — one positional.  The general `exc_value_error_new`
 /// graph has no jitcode of its own, so `ValueError(...)` declined with
-/// `no jitcode for address`.  The `(cls, *args)` signature packs those
-/// positionals into one tuple before this runs.
+/// `no jitcode for address`.
+///
+/// `descr_new_base_exception` reads `args_w` and ignores keywords
+/// (`# ignore kwds`).  The binder therefore always lays this wrapper out as
+/// `[cls, args_tuple, kwargs_dict]`; the dict is not read.  Three words whose
+/// second is not that tuple are an unbound `[cls, a, b]`.  Packing `a` would
+/// drop `b`, so that slice falls through with every word intact.
 pub fn __majit_wrap_exc_value_error_descr_new(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() == 2 && !args[0].is_null() {
+    if args.len() == 3 && !args[0].is_null() && packed_arg_is_tuple(args[1]) {
         let item = packed_single_arg(args[1]);
         if !item.is_null() {
             return Ok(value_error_one_arg(args[0], item));
@@ -7485,6 +7490,16 @@ static __majit_wrap_exc_value_error_descr_new_target: crate::gateway::BuiltinWra
         ),
         func: __majit_wrap_exc_value_error_descr_new,
     };
+
+/// Whether `packed` is the `*args` tuple the binder appended after `cls`.
+///
+/// An unbound `[cls, a, b]` carries the positional itself here.  A non-tuple
+/// answers false so the wrapper keeps `b`; the traced wrapper cannot ask
+/// this itself, for the same reason as [`packed_single_arg`].
+#[majit_macros::dont_look_inside_cannot_raise]
+fn packed_arg_is_tuple(packed: PyObjectRef) -> bool {
+    !packed.is_null() && unsafe { pyre_object::is_tuple(packed) }
+}
 
 /// The one object a `*args` tuple of length one holds, or `PY_NULL` for any
 /// other shape — including a `packed` that is not a tuple at all, which is
@@ -9954,14 +9969,14 @@ pub fn make_exc_type_with_init(
             if let Some(doc) = doc {
                 type_ns_store(ns_slot, "__doc__", pyre_object::w_str_new(doc));
             }
-            // `descr_init(self, space, args_w)` and ValueError's `__new__`
-            // (`cls, *args`, no `**kwargs`). The binder rejects keywords;
-            // the bodies only store `args_w`.
+            // `descr_init(self, space, args_w)` rejects keywords.
+            // ValueError's `__new__` is `descr_new_base_exception`:
+            // `cls, *args, **kwargs`, and the body ignores `kwds`.
             let new_sig = match name {
                 "ValueError" => Some(crate::gateway::Signature::new(
                     vec!["cls"],
                     Some("args"),
-                    None,
+                    Some("kwargs"),
                     0,
                     0,
                 )),
