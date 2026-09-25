@@ -465,6 +465,9 @@ pub struct UnrollOptimizer {
     /// originals and would otherwise read a stale pre-move gcref. Prepended to
     /// each phase's slot list rather than overwritten.
     pub persistent_snapshot_root_slots: Vec<usize>,
+    /// `compile.py` `enable_opts` handed to `build_opt_chain` for each phase
+    /// optimizer. Defaults to `ENABLE_ALL_OPTS`.
+    pub enable_opts: Vec<String>,
 }
 
 /// Withdraws the address `publish_short_preamble_producer` installed in
@@ -627,7 +630,19 @@ impl UnrollOptimizer {
             compile_resume_memos_slot: None,
             compile_short_preamble_producer_slot: None,
             persistent_snapshot_root_slots: Vec::new(),
+            enable_opts: crate::optimizeopt::optimizer::ENABLE_ALL_OPTS
+                .split(':')
+                .filter(|name| !name.is_empty())
+                .map(String::from)
+                .collect(),
         }
+    }
+
+    fn phase_optimizer(
+        &self,
+        vable: Option<crate::optimizeopt::virtualize::VirtualizableConfig>,
+    ) -> crate::optimizeopt::optimizer::Optimizer {
+        crate::optimizeopt::optimizer::Optimizer::build_opt_chain(&self.enable_opts, vable)
     }
 
     fn collect_snapshot_const_ptr_slots(maps: &mut [&mut SnapshotBoxes]) -> Vec<usize> {
@@ -916,14 +931,7 @@ impl UnrollOptimizer {
             // ── Phase 1: PreambleCompileData.optimize() ──
             // ── Phase 1: optimize_preamble (compile.py:275-276) ──
             let mut consts_p1 = constants.clone();
-            let mut opt_p1 = match vable_config.as_ref() {
-                Some(c) => {
-                    crate::optimizeopt::optimizer::Optimizer::default_pipeline_with_virtualizable(
-                        c.clone(),
-                    )
-                }
-                None => crate::optimizeopt::optimizer::Optimizer::default_pipeline(),
-            };
+            let mut opt_p1 = self.phase_optimizer(vable_config.clone());
             self.register_resume_memo(&opt_p1);
             opt_p1.all_descrs = std::mem::take(&mut self.all_descrs);
             opt_p1.callinfocollection = self.callinfocollection.clone();
@@ -1231,14 +1239,7 @@ impl UnrollOptimizer {
         // the same isolation.
         let mut consts_p2 = consts_p1.clone();
 
-        let mut opt_p2 = match vable_config.as_ref() {
-            Some(c) => {
-                crate::optimizeopt::optimizer::Optimizer::default_pipeline_with_virtualizable(
-                    c.clone(),
-                )
-            }
-            None => crate::optimizeopt::optimizer::Optimizer::default_pipeline(),
-        };
+        let mut opt_p2 = self.phase_optimizer(vable_config.clone());
         // Bound after `opt_p2` so it drops first and withdraws the published
         // address while the optimizer it names is still alive.
         let _published_short_preamble_producer = self.publish_short_preamble_producer(&mut opt_p2);
