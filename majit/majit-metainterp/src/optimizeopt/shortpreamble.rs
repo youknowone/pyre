@@ -471,13 +471,9 @@ pub struct ShortBoxes {
     /// position through `ctx.materialize_operand_at`, which memoizes one box
     /// per producer, so the same position yields the same object. Const
     /// results never key this map (they route to `const_short_boxes`).
-    potential_ops: FxIndexMap<majit_ir::operand::Operand, PotentialShortOp>,
-    /// Mirrors `to_opref()` for every key ever inserted into `potential_ops`
-    /// (which is insert-only; same-key overwrites keep the same opref), so
-    /// membership equals the old linear scan `any(k.to_opref() == opref)`.
-    /// Parity anchor: shortpreamble.py:290 `op in self.potential_ops` is
-    /// dict membership.
-    potential_op_oprefs: FxIndexSet<OpRef>,
+    /// Values are shared so `materialize_one` can hold a candidate while
+    /// it mutates `self`, the way the Python dict hands out the stored object.
+    potential_ops: FxIndexMap<majit_ir::operand::Operand, std::rc::Rc<PotentialShortOp>>,
     /// shortpreamble.py:250 self.produced_short_boxes = {}
     /// (insertion order preserved by IndexMap for deterministic export.)
     /// Keyed by the result Box (`shortop.res`), compared by object
@@ -608,10 +604,6 @@ impl ShortBoxes {
         // that first loop so the IndexMap table is not grown per box.
         ShortBoxes {
             potential_ops: FxIndexMap::with_capacity_and_hasher(num_label_args, FxBuildHasher),
-            potential_op_oprefs: FxIndexSet::with_capacity_and_hasher(
-                num_label_args,
-                FxBuildHasher,
-            ),
             produced_short_boxes: FxIndexMap::with_capacity_and_hasher(
                 num_label_args,
                 FxBuildHasher,
@@ -653,7 +645,7 @@ impl ShortBoxes {
     pub fn is_reachable(&self, opref: OpRef) -> bool {
         self.label_args.contains(&opref)
             || opref.is_constant()
-            || self.potential_op_oprefs.contains(&opref)
+            || self.potential_ops.keys().any(|k| k.to_opref() == opref)
     }
 
     pub fn note_known_constant(&mut self, opref: OpRef) {
@@ -665,8 +657,7 @@ impl ShortBoxes {
     }
 
     fn add_op(&mut self, key: majit_ir::operand::Operand, pop: PotentialShortOp) {
-        self.potential_op_oprefs.insert(key.to_opref());
-        self.potential_ops.insert(key, pop);
+        self.potential_ops.insert(key, std::rc::Rc::new(pop));
     }
 
     /// Add a pure operation as a short-box candidate.
@@ -801,10 +792,9 @@ impl ShortBoxes {
         // shortpreamble.py `self.potential_ops[box] = ShortInputArg(...)`
         // — keyed by the label-arg Box itself; `arg_res` is its canonical
         // (producer-bound) operand, shared with `res`.
-        self.potential_op_oprefs.insert(arg_res.to_opref());
         self.potential_ops.insert(
             arg_res.clone(),
-            PotentialShortOp::Preamble(PreambleOp {
+            std::rc::Rc::new(PotentialShortOp::Preamble(PreambleOp {
                 source_op: None,
                 res: arg_res,
                 op: OpRc::new(same_as),
@@ -812,7 +802,7 @@ impl ShortBoxes {
                 label_arg_idx: Some(live_slot),
                 invented_name: false,
                 same_as_source: None,
-            }),
+            })),
         );
     }
 
@@ -836,52 +826,49 @@ impl ShortBoxes {
         ctx: &mut crate::optimizeopt::OptContext,
         opref: OpRef,
     ) -> Option<majit_ir::operand::Operand> {
-        // shortpreamble.py `if op in self.produced_short_boxes` — the
-        // dict membership is Box identity; resolve the position to its
-        // canonical box once for both identity-keyed checks. Const args
-        // never key either set (they route to the Const arm below).
-        if !opref.is_constant() {
-            let okey = ctx.materialize_operand_at(opref);
-            if let Some(existing) = self.produced_short_boxes.get(&okey) {
-                // shortpreamble.py:285 `return ...preamble_op` — the
-                // dependency's replay op object itself, so preamble-op
-                // args carry the dep replay handle.
-                //
-                // ShortInputArg: upstream `preamble_op` IS the renamed
-                // inputarg box (shortpreamble.py `ShortInputArg(box,
-                // renamed)`), so produce_arg returns the renamed
-                // short_inputargs box for this slot — the export-time
-                // rename. (`existing.res` is the ORIGINAL box, kept only
-                // as the info-lookup key, shortpreamble.py.)
-                if existing.kind == PreambleOpKind::InputArg {
-                    let label_arg_idx = existing.label_arg_idx;
-                    return Some(self.renamed_short_inputarg(label_arg_idx));
-                }
-                return Some(majit_ir::operand::Operand::from_bound_op(
-                    &existing.preamble_op,
-                ));
-            }
-            if self.boxes_in_production.contains(&okey) {
-                return None;
-            }
-        }
         // shortpreamble.py:288 isinstance(op, Const) → return op.
         if opref.is_constant() {
             return Some(majit_ir::operand::Operand::from_opref(opref));
+        }
+        // shortpreamble.py `if op in self.produced_short_boxes` — the
+        // dict membership is Box identity; resolve the position to its
+        // canonical box once for every identity-keyed check below.
+        let okey = ctx.materialize_operand_at(opref);
+        if let Some(existing) = self.produced_short_boxes.get(&okey) {
+            // shortpreamble.py:285 `return ...preamble_op` — the
+            // dependency's replay op object itself, so preamble-op
+            // args carry the dep replay handle.
+            //
+            // ShortInputArg: upstream `preamble_op` IS the renamed
+            // inputarg box (shortpreamble.py `ShortInputArg(box,
+            // renamed)`), so produce_arg returns the renamed
+            // short_inputargs box for this slot — the export-time
+            // rename. (`existing.res` is the ORIGINAL box, kept only
+            // as the info-lookup key, shortpreamble.py:417.)
+            if existing.kind == PreambleOpKind::InputArg {
+                let label_arg_idx = existing.label_arg_idx;
+                return Some(self.renamed_short_inputarg(label_arg_idx));
+            }
+            return Some(majit_ir::operand::Operand::from_bound_op(
+                &existing.preamble_op,
+            ));
+        }
+        if self.boxes_in_production.contains(&okey) {
+            return None;
         }
         // pyre tracks iteration-known constants (body-typed OpRefs proven
         // constant for this pass) in `known_constants`; those are this
         // stage's `Const` boxes, mirroring `use_box`/`insert_dep_recursive`.
         if self.known_constants.contains(&opref) {
-            return Some(ctx.materialize_operand_at(opref));
+            return Some(okey);
         }
-        if self.potential_op_oprefs.contains(&opref) {
+        if self.potential_ops.contains_key(&okey) {
             // shortpreamble.py `r = self.add_op_to_short(...);
             // return r.preamble_op`. ShortInputArg returns the RENAMED
             // short_inputargs box for the slot (shortpreamble.py
             // `ShortInputArg(box, renamed)`), same as the
             // `produced_short_boxes` hit.
-            let idx = self.materialize_one(ctx, opref)?;
+            let idx = self.materialize_one(ctx, okey)?;
             let kind = self.produced_short_boxes[idx].kind.clone();
             if kind == PreambleOpKind::InputArg {
                 let label_arg_idx = self.produced_short_boxes[idx].label_arg_idx;
@@ -928,11 +915,10 @@ impl ShortBoxes {
     fn materialize_one(
         &mut self,
         ctx: &mut crate::optimizeopt::OptContext,
-        result: OpRef,
+        okey: majit_ir::operand::Operand,
     ) -> Option<usize> {
         // shortpreamble.py add_op_to_short — guard, cycle set,
         // and final insert all key on `shortop.res` Box identity.
-        let okey = ctx.materialize_operand_at(result);
         if let Some(idx) = self.produced_short_boxes.get_index_of(&okey) {
             return Some(idx);
         }
@@ -941,9 +927,8 @@ impl ShortBoxes {
         }
         // shortpreamble.py add_op_to_short / produce_arg:
         // `self.potential_ops[op]` looks the entry up and leaves the
-        // OrderedDict in place. Cloning the value is the port of that
-        // lookup; shift_remove + shift_insert was O(N) per candidate.
-        let candidate = self.potential_ops.get(&okey)?.clone();
+        // OrderedDict in place; the shared handle is that stored object.
+        let candidate = std::rc::Rc::clone(self.potential_ops.get(&okey)?);
         self.boxes_in_production.insert(okey.clone());
         let produced = candidate.add_op_to_short(self, ctx);
         self.boxes_in_production.swap_remove(&okey);
@@ -957,11 +942,9 @@ impl ShortBoxes {
         &mut self,
         ctx: &mut crate::optimizeopt::OptContext,
     ) -> Vec<(OpRef, ProducedShortOp)> {
-        let keys: Vec<OpRef> = self
-            .potential_ops
-            .iter()
-            .map(|(k, _)| k.to_opref())
-            .collect();
+        // shortpreamble.py `for shortop in self.potential_ops.values()` —
+        // the stored boxes themselves, not a re-resolution of their positions.
+        let keys: Vec<majit_ir::operand::Operand> = self.potential_ops.keys().cloned().collect();
         for key in keys {
             let _ = self.materialize_one(ctx, key);
         }
@@ -1131,12 +1114,15 @@ impl ShortBoxes {
         // The previous value moves into the CompoundOp; cloning it would
         // copy the whole `two` chain on every add to the same key.
         if let Some(slot) = self.potential_ops.get_mut(&key) {
-            let prev = std::mem::replace(slot, PotentialShortOp::Preamble(pop.clone()));
-            *slot = PotentialShortOp::Compound(CompoundOp {
+            let prev = std::mem::replace(
+                slot,
+                std::rc::Rc::new(PotentialShortOp::Preamble(pop.clone())),
+            );
+            *slot = std::rc::Rc::new(PotentialShortOp::Compound(CompoundOp {
                 res: result,
                 one: pop,
-                two: Box::new(prev),
-            });
+                two: Box::new(std::rc::Rc::unwrap_or_clone(prev)),
+            }));
         } else {
             self.add_op(key, PotentialShortOp::Preamble(pop));
         }
@@ -4255,7 +4241,7 @@ mod tests {
         let count_before = sb
             .potential_ops
             .values()
-            .find_map(heap_oprc_strong_count)
+            .find_map(|pop| heap_oprc_strong_count(pop))
             .expect("heap producer is in potential_ops");
 
         let mut pure = Op::new(OpCode::IntAdd, &[rop(Type::Int, 30), rop(Type::Int, 30)]);
@@ -4264,7 +4250,7 @@ mod tests {
         let count_after = sb
             .potential_ops
             .values()
-            .find_map(heap_oprc_strong_count)
+            .find_map(|pop| heap_oprc_strong_count(pop))
             .expect("heap producer is inside the CompoundOp");
         assert_eq!(
             count_before, count_after,
