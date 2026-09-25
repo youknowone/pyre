@@ -1273,7 +1273,17 @@ impl FixedObjectArray {
             unsafe { self.items_mut_ptr().add(index).write(value) };
             return;
         }
-        // `FORWARDED_MARKER` sets every flag bit, so the test above cannot
+        self.set_ref_remembering(index, value);
+    }
+
+    /// The flagged half of [`Self::set_ref`], kept out of line the way the GC
+    /// transform inlines only the `TRACK_YOUNG_PTRS` test of `setarrayitem_gc`
+    /// and calls `remember_young_pointer_from_array` for the rest.
+    #[cold]
+    #[inline(never)]
+    fn set_ref_remembering(&mut self, index: usize, value: PyObjectRef) {
+        let header = unsafe { majit_gc::header::header_of(self as *mut Self as usize) };
+        // `FORWARDED_MARKER` sets every flag bit, so `set_ref`'s flag test cannot
         // tell an array a minor collection already moved from a live old one.
         // Report it here, where the array and the store that reached it are
         // both still named, instead of one frame deeper where the barrier sees
