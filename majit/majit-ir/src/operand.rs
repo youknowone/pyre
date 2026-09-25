@@ -29,6 +29,7 @@ use crate::ptr_info::PtrInfo;
 use crate::resoperation::{OpRc, OpRef};
 use crate::value::{Const, GcRef, InputArgRc, Type, Value};
 use std::cell::{Cell, RefCell};
+use std::mem::ManuallyDrop;
 use std::ptr;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
@@ -146,15 +147,16 @@ const OP_SMALLINT: u64 = 3;
 const OP_SMALLWIDE: u64 = 4;
 const OP_NULLREF: u64 = 5;
 
-/// Decoded view. Pointer variants own an `Rc` clone.
+/// Decoded view. Pointer variants borrow the operand's own reference without
+/// taking a count; the view must not outlive the operand it was read from.
 enum Opnd {
     None,
-    Op(OpRc),
-    InputArg(InputArgRc),
+    Op(ManuallyDrop<OpRc>),
+    InputArg(ManuallyDrop<InputArgRc>),
     SmallInt(u64),
     SmallWide(u64),
     NullRef,
-    Const(Rc<Cell<Value>>),
+    Const(ManuallyDrop<Rc<Cell<Value>>>),
 }
 
 impl Operand {
@@ -214,26 +216,15 @@ impl Operand {
             return Opnd::None;
         }
         match self.packed & OP_TAG {
-            OP_OP => {
-                let rc = unsafe { OpRc::from_raw(self.packed as *const crate::resoperation::Op) };
-                let out = Opnd::Op(rc.clone());
-                std::mem::forget(rc);
-                out
-            }
-            OP_INPUTARG => {
-                let rc = unsafe {
-                    InputArgRc::from_raw((self.packed & !OP_TAG) as *const crate::value::InputArg)
-                };
-                let out = Opnd::InputArg(rc.clone());
-                std::mem::forget(rc);
-                out
-            }
-            OP_CONST => {
-                let rc = unsafe { Rc::from_raw((self.packed & !OP_TAG) as *const Cell<Value>) };
-                let out = Opnd::Const(Rc::clone(&rc));
-                std::mem::forget(rc);
-                out
-            }
+            OP_OP => Opnd::Op(ManuallyDrop::new(unsafe {
+                OpRc::from_raw(self.packed as *const crate::resoperation::Op)
+            })),
+            OP_INPUTARG => Opnd::InputArg(ManuallyDrop::new(unsafe {
+                InputArgRc::from_raw((self.packed & !OP_TAG) as *const crate::value::InputArg)
+            })),
+            OP_CONST => Opnd::Const(ManuallyDrop::new(unsafe {
+                Rc::from_raw((self.packed & !OP_TAG) as *const Cell<Value>)
+            })),
             OP_SMALLINT => {
                 let val = (self.packed >> 3) as u32 as u64;
                 let id = self.packed >> 35;
@@ -722,12 +713,10 @@ impl Operand {
     /// have no `_forwarded` slot and take the default (mirror of
     /// the carried producer's forwarding host).
     fn read_forwarding_host<R>(&self, default: R, f: impl FnOnce(&dyn ForwardingHost) -> R) -> R {
-        if let Some(op) = self.bound_op() {
-            f(&*op)
-        } else if let Some(ia) = self.bound_inputarg() {
-            f(&*ia)
-        } else {
-            default
+        match self.view() {
+            Opnd::Op(op) => f(&**op),
+            Opnd::InputArg(ia) => f(&**ia),
+            _ => default,
         }
     }
 
@@ -735,15 +724,13 @@ impl Operand {
     /// rejected by the caller's assert first; `None` has no slot and panics
     /// (routes to the carried producer's forwarding host).
     fn with_forwarding_host(&self, what: &str, f: impl FnOnce(&dyn ForwardingHost)) {
-        if let Some(op) = self.bound_op() {
-            f(&*op)
-        } else if let Some(ia) = self.bound_inputarg() {
-            f(&*ia)
-        } else {
-            panic!(
+        match self.view() {
+            Opnd::Op(op) => f(&**op),
+            Opnd::InputArg(ia) => f(&**ia),
+            _ => panic!(
                 "Operand::{what} on a non-producer operand — only a bound \
                  Op/InputArg carries a _forwarded slot (box identity precondition)"
-            )
+            ),
         }
     }
 

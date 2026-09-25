@@ -2374,9 +2374,13 @@ impl Optimizer {
         // results — otherwise the Const reaches `used_boxes` and the carried
         // label slot trips `OpRef::raw()` in unroll.rs.
         if !resolved.is_constant() {
-            let tracked = ctx
-                .take_potential_extra_op(resolved)
-                .or_else(|| ctx.take_potential_extra_op(opref));
+            let tracked = ctx.take_potential_extra_op(resolved).or_else(|| {
+                if opref == resolved {
+                    None
+                } else {
+                    ctx.take_potential_extra_op(opref)
+                }
+            });
             if let Some(preamble_op) = tracked {
                 // shortpreamble.py:434 `op = preamble_op.op.get_box_replacement()`
                 // — the resolved Box itself is handed to the builder.

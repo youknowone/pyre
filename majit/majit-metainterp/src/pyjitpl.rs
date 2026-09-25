@@ -405,11 +405,9 @@ impl OptimizationInfoItem for OpRc {
         // guard's checked box is made constant after the guard is emitted.
         // Forget on the operands too, so no forwarding written during
         // optimization outlives it.
-        let producers = self
-            .getarglist()
-            .into_iter()
-            .chain(self.getfailargs().into_iter().flatten());
-        for arg in producers {
+        let args = self.args_slice();
+        let failargs = self.guard_fail_args().unwrap_or(&[]);
+        for arg in args.iter().chain(failargs) {
             if arg.is_bound() {
                 arg.clear_forwarded();
             }
