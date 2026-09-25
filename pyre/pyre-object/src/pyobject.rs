@@ -526,14 +526,6 @@ pub const fn subclass_range_alias(type_id: u32, pytype: &'static PyType) -> Subc
     SubclassRangeAlias { type_id, pytype }
 }
 
-/// Where `_cffi_backend`'s tail slots start.  The three Windows
-/// payloads ahead of them exist only there, so the group begins three ids
-/// later on Windows than anywhere else.
-#[cfg(all(not(target_arch = "wasm32"), windows))]
-const CFFI_HIERARCHY_FIRST_TYPE_ID: u32 = 199;
-#[cfg(all(not(target_arch = "wasm32"), not(windows)))]
-const CFFI_HIERARCHY_FIRST_TYPE_ID: u32 = 196;
-
 /// Canonical `rclass.OBJECT` inheritance census in GC registration order.
 ///
 /// Each entry is `(typeid, parent_typeid)`. This is the shared input for the
@@ -683,151 +675,48 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (147, Some(0)),
     (148, Some(0)),
     (149, Some(0)),
-    (150, Some(0)),
+    (151, Some(0)),
+    // `_thread` lock / RLock / handle, registered for the header `w_class`
+    // edge (`all_w_class_only_descriptors`).
     (152, Some(0)),
-    // `_thread` lock / RLock / handle, registered at the absolute tail of
-    // `build_gc` for the header `w_class` edge (`all_w_class_only_descriptors`).
     (153, Some(0)),
     (154, Some(0)),
+    // `__pypy__.Bufferable` is `allocate_stable` with no inline object
+    // payload, so the header `w_class` is the only edge its marker forwards.
     (155, Some(0)),
-    // `functools.KeyWrapper`, registered after them.
-    (156, Some(0)),
-    // `unicodedata.UCD` / `__pypy__.Bufferable` close the tail; both are
-    // `allocate_stable` with no inline object payload, so the header
-    // `w_class` is the only edge their marker forwards.
-    (157, Some(0)),
-    (158, Some(0)),
-    // `_io.BytesIO` follows the `rbigint` result pair, which holds 159 as a
+    // `_io.BytesIO` follows the `rbigint` result pair, which holds 156 as a
     // bare `with_gc_ptrs` id and is not an rclass.OBJECT type.
+    (157, Some(0)),
+    // `_io.StringIO` follows `_io.BytesIO`.
+    (158, Some(0)),
+    // `gc.GcRef` stores its raw referent as a traced wrapper edge.
+    (159, Some(0)),
+    // `gc.hooks` keeps its three callback fields on W_AppLevelHooks.
     (160, Some(0)),
-    // `_io.StringIO` follows `_io.BytesIO` at the append-only tail.
+    // `gc._get_stats()` returns a native W_GcStats with scalar-only payload.
     (161, Some(0)),
-    // `_json.Scanner` and `_json.Encoder` follow with typed managed payloads.
+    // The three walks over a code object.
     (162, Some(0)),
     (163, Some(0)),
-    // `_hashlib`'s per-object digest and HMAC native-state owners.
     (164, Some(0)),
+    // The two `step == 1` range-iterator shapes, whose ids are explicit.
     (165, Some(0)),
-    // `gc.GcRef` stores its raw referent as a traced wrapper edge.
-    // gcref payload is a traced edge on the wrapper itself.
     (166, Some(0)),
-    // `gc.hooks` keeps its three callback fields on W_AppLevelHooks.
-    (167, Some(0)),
-    // `gc._get_stats()` returns a native W_GcStats with scalar-only payload.
-    (168, Some(0)),
-    // PyPy zlib's three stream objects own their stream and per-object lock.
-    // They are unconditional so these ids agree on native and wasm.
-    (169, Some(0)),
-    (170, Some(0)),
-    (171, Some(0)),
-    // `_bz2`'s compressor and decompressor own their libbz2 stream state.
-    // They are unconditional, so they precede the target-gated tail and these
-    // ids agree on native and wasm.
-    (172, Some(0)),
-    (173, Some(0)),
-    // `_lzma`'s compressor and decompressor own their liblzma coder state,
-    // unconditional for the same reason.
-    (174, Some(0)),
-    (175, Some(0)),
-    // `_lsprof`'s profiler and stats result owners are unconditional.
-    (176, Some(0)),
-    (177, Some(0)),
-    (178, Some(0)),
-    // `_queue.SimpleQueue` owns a native FIFO and is unconditional, so it
-    // closes the ungated block rather than joining the target-gated tail.
-    (179, Some(0)),
-    // The three walks over a code object are unconditional, so they close the
-    // ungated block behind `_queue.SimpleQueue` rather than joining the
-    // target-gated tail.
-    (180, Some(0)),
-    (181, Some(0)),
-    (182, Some(0)),
-    // The two `step == 1` range-iterator shapes are unconditional, so they
-    // close the ungated block behind the code-object walks rather than joining
-    // the target-gated tail.
-    (183, Some(0)),
-    (184, Some(0)),
-    // 185-187 are `typedef.py` `_getusercls` layouts (int/str/tuple user).
+    // 167-169 are `typedef.py` `_getusercls` layouts (int/str/tuple user).
     // They have no rclass vtable of their own (`object_layout_without_subclass_range`).
-    // Native-only type IDs 188 and 189 represent `posix.DirEntry` and
+    // Native-only type IDs 170 and 171 represent `posix.DirEntry` and
     // `posix.ScandirIterator`, matching `build_gc`'s registration order.
     #[cfg(not(target_arch = "wasm32"))]
-    (188, Some(0)),
+    (170, Some(0)),
     #[cfg(not(target_arch = "wasm32"))]
-    (189, Some(0)),
-    // rustls `_ssl` context, MemoryBIO, and session native payloads.  These
-    // extend the append-only native rclass tail; wasm omits the host TLS
-    // module and therefore the hierarchy entries as well. Sandbox filtering
-    // belongs to pyre-interpreter, which owns that module configuration.
-    #[cfg(not(target_arch = "wasm32"))]
-    (190, Some(0)),
-    #[cfg(not(target_arch = "wasm32"))]
-    (191, Some(0)),
-    #[cfg(not(target_arch = "wasm32"))]
-    (192, Some(0)),
-    #[cfg(not(target_arch = "wasm32"))]
-    (193, Some(0)),
-    #[cfg(not(target_arch = "wasm32"))]
-    (194, Some(0)),
-    // `mmap.mmap` owns its native mapping payload — the duplicated fd on POSIX
-    // and the file handle on Windows — and follows the optional SSL tail
-    // wherever the module is compiled.  The gate must match the alias gate in
-    // `all_subclass_range_aliases`: an alias whose typeid is absent here fails
-    // `compute_subclass_ranges_from_hierarchy`'s in-the-hierarchy expectation.
-    // A sandbox build has no `mmap` module either, so
-    // `active_subclass_range_hierarchy` drops this entry along with SSL's.
-    #[cfg(any(unix, windows))]
-    (195, Some(0)),
-    // `_overlapped.Overlapped` owns the Windows OVERLAPPED record and its
-    // retained Python buffers.  pyre-interpreter supplies the vtable alias;
-    // the object layer owns only the append-only hierarchy slot.
+    (171, Some(0)),
+    // PEP 528 `_io._WindowsConsoleIO` is a subclassable `_RawIOBase` payload
+    // and closes the interpreter's classes. `pyre-interpreter` drops it where
+    // it compiles the class out.
     #[cfg(windows)]
-    (196, Some(0)),
-    // `_winapi.Overlapped` owns a second Windows OVERLAPPED record, the one
-    // waited on through an event of its own rather than a completion port.
-    #[cfg(windows)]
-    (197, Some(0)),
-    // PEP 528 `_io._WindowsConsoleIO` is a subclassable `_RawIOBase` payload.
-    // Its append-only vtable id follows both Windows overlapped owners.
-    #[cfg(windows)]
-    (198, Some(0)),
-    // `_cffi_backend` is absent on wasm32 and in sandbox builds.  Its thirteen
-    // hierarchy slots sit at the tail because the interpreter's sandbox
-    // filter can only remove a contiguous trailing slice.
-    // `_cffi_backend`'s ctype, cdata, and array-iterator payloads precede the
-    // remaining payloads in the group.
-    #[cfg(not(target_arch = "wasm32"))]
-    (CFFI_HIERARCHY_FIRST_TYPE_ID, Some(0)),
-    #[cfg(not(target_arch = "wasm32"))]
-    (CFFI_HIERARCHY_FIRST_TYPE_ID + 1, Some(0)),
-    #[cfg(not(target_arch = "wasm32"))]
-    (CFFI_HIERARCHY_FIRST_TYPE_ID + 2, Some(0)),
-    // `_cffi_backend`'s struct field and library handle follow them.
-    #[cfg(not(target_arch = "wasm32"))]
-    (CFFI_HIERARCHY_FIRST_TYPE_ID + 3, Some(0)),
-    #[cfg(not(target_arch = "wasm32"))]
-    (CFFI_HIERARCHY_FIRST_TYPE_ID + 4, Some(0)),
-    // `_cffi_backend`'s allocator and MiniBuffer follow the existing owners.
-    #[cfg(not(target_arch = "wasm32"))]
-    (CFFI_HIERARCHY_FIRST_TYPE_ID + 5, Some(0)),
-    #[cfg(not(target_arch = "wasm32"))]
-    (CFFI_HIERARCHY_FIRST_TYPE_ID + 6, Some(0)),
-    // `_cffi_backend._OffsetInBytes` is the internal pointer-call carrier.
-    #[cfg(not(target_arch = "wasm32"))]
-    (CFFI_HIERARCHY_FIRST_TYPE_ID + 7, Some(0)),
-    // The FFI context owner and the internal raw-function carrier follow.
-    #[cfg(not(target_arch = "wasm32"))]
-    (CFFI_HIERARCHY_FIRST_TYPE_ID + 8, Some(0)),
-    #[cfg(not(target_arch = "wasm32"))]
-    (CFFI_HIERARCHY_FIRST_TYPE_ID + 9, Some(0)),
-    // Generated libraries, global-variable carriers, and API-function wrappers
-    // close the target-gated tail.
-    #[cfg(not(target_arch = "wasm32"))]
-    (CFFI_HIERARCHY_FIRST_TYPE_ID + 10, Some(0)),
-    #[cfg(not(target_arch = "wasm32"))]
-    (CFFI_HIERARCHY_FIRST_TYPE_ID + 11, Some(0)),
-    #[cfg(not(target_arch = "wasm32"))]
-    (CFFI_HIERARCHY_FIRST_TYPE_ID + 12, Some(0)),
+    (172, Some(0)),
+    // The classes `pyre-module` registers follow, numbered by `build_gc` in
+    // the order the module hooks list them; `pyre-interpreter` appends them.
 ];
 
 /// Compute subclass IDs from the active hierarchy and write every
@@ -1358,8 +1247,8 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         // register behind the unconditional code-object walks, the last block
         // before `build_gc`'s target-gated tail, so their ids are the same on
         // every target.
-        subclass_range_alias(183, typed::<crate::functional::W_IntRangeStepOneIterator>()),
-        subclass_range_alias(184, typed::<crate::functional::W_IntRangeOneArgIterator>()),
+        subclass_range_alias(165, typed::<crate::functional::W_IntRangeStepOneIterator>()),
+        subclass_range_alias(166, typed::<crate::functional::W_IntRangeOneArgIterator>()),
         subclass_range_alias(26, &crate::typedef::MEMBER_TYPE),
         subclass_range_alias(27, &crate::bytesobject::BYTES_TYPE),
         subclass_range_alias(28, &crate::bytearrayobject::BYTEARRAY_TYPE),
@@ -1459,33 +1348,33 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         // Async-generator support is appended after the interpreter-owned
         // FrameLocalsProxy (130) in build_gc: the shared generator payload
         // gets 131, followed by the three pyre_class helper awaitables.
-        subclass_range_alias(131, &crate::generator::ASYNC_GENERATOR_TYPE),
-        subclass_range_alias(132, typed::<crate::generator::AsyncGenValueWrapper>()),
-        subclass_range_alias(133, typed::<crate::generator::AsyncGenASend>()),
-        subclass_range_alias(134, typed::<crate::generator::AsyncGenAThrow>()),
+        subclass_range_alias(130, &crate::generator::ASYNC_GENERATOR_TYPE),
+        subclass_range_alias(131, typed::<crate::generator::AsyncGenValueWrapper>()),
+        subclass_range_alias(132, typed::<crate::generator::AsyncGenASend>()),
+        subclass_range_alias(133, typed::<crate::generator::AsyncGenAThrow>()),
         // W_ISlice is appended after the interpreter-owned W_Local (140) in
         // build_gc so every pre-existing Python-visible AUTO-ID stays stable.
-        subclass_range_alias(141, typed::<crate::interp_itertools::W_ISlice>()),
+        subclass_range_alias(140, typed::<crate::interp_itertools::W_ISlice>()),
         // W_Batched follows W_ISlice in the same append-only registration
         // chain.
-        subclass_range_alias(142, typed::<crate::interp_itertools::W_Batched>()),
-        subclass_range_alias(143, typed::<crate::interp_itertools::W_Product>()),
-        subclass_range_alias(144, typed::<crate::interp_itertools::W_Combinations>()),
+        subclass_range_alias(141, typed::<crate::interp_itertools::W_Batched>()),
+        subclass_range_alias(142, typed::<crate::interp_itertools::W_Product>()),
+        subclass_range_alias(143, typed::<crate::interp_itertools::W_Combinations>()),
         subclass_range_alias(
-            145,
+            144,
             typed::<crate::interp_itertools::W_CombinationsWithReplacement>(),
         ),
-        subclass_range_alias(146, typed::<crate::interp_itertools::W_Permutations>()),
-        subclass_range_alias(147, typed::<crate::interp_itertools::W_GroupBy>()),
-        subclass_range_alias(148, typed::<crate::interp_itertools::W_GroupByIterator>()),
+        subclass_range_alias(145, typed::<crate::interp_itertools::W_Permutations>()),
+        subclass_range_alias(146, typed::<crate::interp_itertools::W_GroupBy>()),
+        subclass_range_alias(147, typed::<crate::interp_itertools::W_GroupByIterator>()),
         subclass_range_alias(
-            149,
+            148,
             typed::<crate::interp_itertools::W_TeeChainedListNode>(),
         ),
-        subclass_range_alias(150, typed::<crate::interp_itertools::W_TeeIterable>()),
+        subclass_range_alias(149, typed::<crate::interp_itertools::W_TeeIterable>()),
         // `_buffer_wrapper` follows the deque's internal non-object Block
         // (151) at the append-only GC registration tail.
-        subclass_range_alias(152, typed::<crate::memoryview::W_BufferWrapper>()),
+        subclass_range_alias(151, typed::<crate::memoryview::W_BufferWrapper>()),
     ]
 }
 

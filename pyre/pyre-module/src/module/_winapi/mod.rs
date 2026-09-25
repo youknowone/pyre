@@ -1312,7 +1312,7 @@ pyre_interpreter::py_module! {
 
 /// The GC types this module owns, in `build_gc` registration order.
 pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType>) {
-    use pyre_interpreter::importing::{ModuleGcAnchor, ModuleGcLayout, ModuleGcType};
+    use pyre_interpreter::importing::{ModuleGcLayout, ModuleGcType};
     use pyre_object::lltype::PyreClassPyTypeOf;
     // `_winapi.Overlapped` owns the same kind of native record, waited on
     // through its own event rather than a completion port. Sweep cancels and
@@ -1320,7 +1320,6 @@ pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType
     // is freed, then closes that event.
     #[cfg(not(feature = "sandbox"))]
     types.push(ModuleGcType {
-        anchor: ModuleGcAnchor::AfterScandirIterator,
         descriptor: <overlapped::W_Overlapped as PyreClassPyTypeOf>::DESCRIPTOR,
         layout: ModuleGcLayout::PyreClass {
             memory_pressure_offset: None,

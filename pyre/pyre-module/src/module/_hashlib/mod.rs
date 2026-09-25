@@ -1273,12 +1273,11 @@ pyre_interpreter::py_module! {
 
 /// The GC types this module owns, in `build_gc` registration order.
 pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType>) {
-    use pyre_interpreter::importing::{ModuleGcAnchor, ModuleGcLayout, ModuleGcType};
+    use pyre_interpreter::importing::{ModuleGcLayout, ModuleGcType};
     use pyre_object::lltype::PyreClassPyTypeOf;
     // The digest and HMAC objects own their native contexts inline on the
     // managed owner; the sweep destructor releases the RustCrypto state.
     types.push(ModuleGcType {
-        anchor: ModuleGcAnchor::AfterStringIO,
         descriptor: <W_HashState as PyreClassPyTypeOf>::DESCRIPTOR,
         layout: ModuleGcLayout::PyreClass {
             memory_pressure_offset: None,
@@ -1286,7 +1285,6 @@ pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType
         destructor: Some(gc_destructor!(w_hash_state_dealloc)),
     });
     types.push(ModuleGcType {
-        anchor: ModuleGcAnchor::AfterStringIO,
         descriptor: <W_Hmac as PyreClassPyTypeOf>::DESCRIPTOR,
         layout: ModuleGcLayout::PyreClass {
             memory_pressure_offset: None,
