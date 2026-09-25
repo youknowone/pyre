@@ -6899,12 +6899,24 @@ impl<M: Clone> MetaInterp<M> {
         // Stamp `MIFrame.pc` so `copy_data_from_miframe` resumes where the
         // walk stopped (`blackhole.py`). Leave the stack on the MetaInterp;
         // `aborted_framestack` is only the standalone walker's handoff.
+        //
+        // A refused residual (`symbolic_residual_abort`) never ran, so the
+        // blackhole resumes at that instruction's `orgpc` rather than after
+        // it; see `stage_interpret_abort_blackhole`, which consumes the flag.
+        let refused = self
+            .tracing
+            .as_ref()
+            .is_some_and(|ctx| ctx.symbolic_residual_abort);
         if matches!(
             action,
             crate::TraceAction::Abort | crate::TraceAction::SwitchToBlackhole(_)
         ) && let Some(top) = self.framestack.frames.last_mut()
         {
-            top.pc = top.code_cursor;
+            top.pc = if refused {
+                top.last_opcode_position
+            } else {
+                top.code_cursor
+            };
         }
         action
     }
@@ -11276,8 +11288,25 @@ impl<M: Clone> MetaInterp<M> {
         // `MIFrame.pc` is the cursor after operand decode
         // (`run_blackhole_interp_to_cancel_tracing`). CloseLoop aborts
         // return before `interpret` stamps it.
+        //
+        // That position presumes the top instruction ran, which upstream
+        // always holds: `do_residual_call` executes the call before anything
+        // can raise `SwitchToBlackhole`.  A walk that refused a residual
+        // (`symbolic_residual_abort`) stopped *before* running it, so the
+        // post-decode cursor would hand the blackhole a result register the
+        // call never wrote.  Resume at the instruction's own start instead —
+        // the `orgpc` the opimpl handlers decode from — so the blackhole
+        // executes the call itself or declines it and the portal replays.
+        let refused = self
+            .tracing
+            .as_mut()
+            .is_some_and(|ctx| std::mem::replace(&mut ctx.symbolic_residual_abort, false));
         if let Some(top) = self.framestack.frames.last_mut() {
-            top.pc = top.code_cursor;
+            top.pc = if refused {
+                top.last_opcode_position
+            } else {
+                top.code_cursor
+            };
         }
         let framestack = std::mem::replace(&mut self.framestack, MIFrameStack::empty());
         self.pending_abort_blackhole = Some(crate::PendingAbortBlackhole {
