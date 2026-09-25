@@ -9210,13 +9210,13 @@ impl<'a> Lowering<'a> {
         };
         let variant_idx = adt.get(1).and_then(serde_json::Value::as_u64)? as usize;
         let td = self.llbc.type_by_id(type_id)?;
-        let TypeDeclKind::Enum(variants) = &td.kind else {
-            return None;
-        };
-        if !type_decl_is_fieldless_enum(td, self.llbc) {
-            return None;
+        match &td.kind {
+            TypeDeclKind::Enum(variants) if type_decl_is_fieldless_enum(td, self.llbc) => {
+                variants.get(variant_idx)?.discriminant_i64()
+            }
+            TypeDeclKind::Opaque => opaque_fieldless_enum_tags(td)?.get(variant_idx).copied(),
+            _ => None,
         }
-        variants.get(variant_idx)?.discriminant_i64()
     }
 
     /// The trailing `bool` is `true` when the decl is a `TypeDeclKind::Struct`.
@@ -13858,27 +13858,27 @@ impl<'a> Lowering<'a> {
                             }
                         }
                     };
-                    // `Default::default` is one symbolic path for every
-                    // Self. Stamp a raw-pointer dest so jtransform's
-                    // `rtype_ptr_null` arm can fold it without also
-                    // folding `Vec::default` (`Ref(None)`).
-                    let call_result_ty = if args.is_empty()
-                        && crate::codewriter::jtransform::is_generic_default_path(match &target {
-                            CallTarget::FunctionPath { segments, .. } => segments.as_slice(),
-                            _ => &[],
-                        })
-                        && tyref_is_raw_ptr(&call.dest.ty, self.llbc)
+                    // `Default::default` reached through the trait path with
+                    // a raw-pointer Self names the impl rustc selects
+                    // (`impl Default for *mut T` in `core::ptr::mut_ptr`),
+                    // which jtransform folds as `rtype_ptr_null`.
+                    let target = if args.is_empty()
+                        && let CallTarget::FunctionPath { segments, .. } = &target
+                        && crate::codewriter::jtransform::is_generic_default_path(segments)
+                        && let Some(segments) =
+                            raw_ptr_default_impl_segments(&call.dest.ty, self.llbc)
                     {
-                        ValueType::Ref(Some(
-                            crate::codewriter::jtransform::RAW_PTR_DEFAULT_OWNER.into(),
-                        ))
+                        CallTarget::FunctionPath {
+                            segments,
+                            fun_decl_id: None,
+                        }
                     } else {
-                        result_ty.clone()
+                        target
                     };
                     OpKind::Call {
                         target,
                         args: crate::model::call_args(args),
-                        result_ty: call_result_ty,
+                        result_ty,
                     }
                 }
             }
@@ -28914,8 +28914,18 @@ fn type_decl_is_fieldless_enum(td: &TypeDecl, llbc: &Llbc) -> bool {
                     .iter()
                     .all(|v| v.fields.iter().all(|f| tyref_is_zero_sized(&f.ty, llbc)))
         }
+        TypeDeclKind::Opaque => opaque_fieldless_enum_tags(td).is_some(),
         _ => false,
     }
+}
+
+/// The variant tags of an `Opaque` declaration whose layout is a tagged
+/// enum without fields: another crate's fieldless enum, which this
+/// artefact knows only by its layout.  Variant `i` is the value `tags[i]`,
+/// as the defining crate's `discriminant_i64` spells it.
+fn opaque_fieldless_enum_tags(td: &TypeDecl) -> Option<Vec<i64>> {
+    td.layout_for_target(&std::env::var("TARGET").unwrap_or_default())?
+        .fieldless_enum_tags()
 }
 
 /// The crate-stripped `module::Enum` spelling of a fieldless enum `ty`,
@@ -30031,14 +30041,26 @@ fn raw_ptr_pointee_container_root(node: &serde_json::Value, llbc: &Llbc) -> Opti
         .then_some(rendered)
 }
 
-/// Whether `ty` is a Charon `RawPtr` (`*mut T` / `*const T`), including
-/// `PyObjectRef`. Used to stamp [`crate::codewriter::jtransform::RAW_PTR_DEFAULT_OWNER`]
-/// on a generic `Default::default` so only nullptr Self folds.
-fn tyref_is_raw_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
-    tyref_node(ty, llbc)
-        .and_then(|n| strip_ty_wrappers(n, llbc))
-        .and_then(|n| n.as_object())
-        .is_some_and(|o| o.contains_key("RawPtr"))
+/// The path of the `Default` impl for the raw pointer `ty`
+/// (`core::ptr::mut_ptr` / `core::ptr::const_ptr`), or `None` when `ty` is
+/// not a raw pointer.
+fn raw_ptr_default_impl_segments(ty: &TyRef, llbc: &Llbc) -> Option<Vec<String>> {
+    let raw = tyref_node(ty, llbc)
+        .and_then(|n| strip_ty_wrappers(n, llbc))?
+        .as_object()?
+        .get("RawPtr")?
+        .as_array()?;
+    let module = match raw.get(1)?.as_str()? {
+        "Mut" => "mut_ptr",
+        "Shared" => "const_ptr",
+        _ => return None,
+    };
+    Some(
+        ["core", "ptr", module, "<Impl>", "default"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+    )
 }
 
 /// Whether `ty` is a raw pointer onto a byte-sized integer literal —
@@ -38851,9 +38873,11 @@ mod tests {
             variant_layouts: vec![
                 majit_charon_reader::ullbc::VariantLayout {
                     field_offsets: vec![payload_off],
+                    tagger: None,
                 },
                 majit_charon_reader::ullbc::VariantLayout {
                     field_offsets: vec![payload_off],
+                    tagger: None,
                 },
             ],
             discriminator: Some(serde_json::json!({

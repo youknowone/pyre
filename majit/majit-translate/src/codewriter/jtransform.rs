@@ -831,12 +831,6 @@ fn is_raw_ptr_default_null(segments: &[String]) -> bool {
         && (joined.contains("mut_ptr") || joined.contains("const_ptr"))
 }
 
-/// Owner stamp `front::mir` puts on `ValueType::Ref` when the dest of
-/// a generic `Default::default` is a Charon `RawPtr`. The trait method
-/// is one symbolic path for every Self, so the owner is what lets
-/// [`default_zero_rewrite`] fold only nullptr and leave `Vec` residual.
-pub(crate) const RAW_PTR_DEFAULT_OWNER: &str = "raw_ptr";
-
 /// The generic trait method `core::default::<Impl>::default` /
 /// `Default::default`. Concrete inherent impls (`Vec::default`,
 /// `W_CData::default`) keep their own paths and are not this.
@@ -901,20 +895,10 @@ fn is_ptr_from_ref_path(segments: &[String]) -> bool {
     joined.starts_with("core::ptr::") || joined.starts_with("std::ptr::")
 }
 
-/// Stored value of a GC-pointer `setfield_gc` / `setarrayitem_gc`.
-/// Raw-pointer `Ref` owners are not this (`rewrite.py
-/// handle_write_barrier_setfield` keys on `v.type == 'r'`).
+/// Stored value of a GC-pointer `setfield_gc` / `setarrayitem_gc`
+/// (`rewrite.py handle_write_barrier_setfield` keys on `v.type == 'r'`).
 fn value_type_is_gc_ref(ty: &ValueType) -> bool {
-    match ty {
-        ValueType::Ref(None) => true,
-        ValueType::Ref(Some(owner)) => {
-            owner != RAW_PTR_DEFAULT_OWNER
-                && !owner.contains("mut_ptr")
-                && !owner.contains("const_ptr")
-                && !owner.starts_with('*')
-        }
-        _ => false,
-    }
+    matches!(ty, ValueType::Ref(_))
 }
 
 /// Operand of an identity-cast Call that produced `var`, if any.
@@ -1112,22 +1096,15 @@ fn immutable_array_origin(
     cur
 }
 
-/// `rtype_const_result` / `rtype_ptr_null` for a Default whose Self
-/// is a known zero: integer, bool, float, or a raw-pointer Ref.
-/// `Ref(None)` is `Vec` / a GC struct and stays residual.
+/// `rtype_const_result` for a Default whose Self is a known zero:
+/// integer, bool or float. A `Ref` is `Vec` / a GC struct and stays
+/// residual; a raw-pointer Self reaches jtransform as its own impl path
+/// ([`is_raw_ptr_default_null`]).
 fn default_zero_rewrite(result_ty: &ValueType) -> Option<OpKind> {
     match result_ty {
         ValueType::Int | ValueType::Unsigned => Some(OpKind::ConstInt(0)),
         ValueType::Bool => Some(OpKind::ConstBool(false)),
         ValueType::Float => Some(OpKind::ConstFloat(0.0f64.to_bits())),
-        ValueType::Ref(Some(owner))
-            if owner == RAW_PTR_DEFAULT_OWNER
-                || owner.contains("mut_ptr")
-                || owner.contains("const_ptr")
-                || owner.starts_with('*') =>
-        {
-            Some(OpKind::ConstRefNull)
-        }
         _ => None,
     }
 }
@@ -6278,13 +6255,11 @@ impl<'a> Transformer<'a> {
                 kind: OpKind::ConstRefNull,
             }]);
         }
-        // `rbuiltin.py rtype_const_result` / `rtype_ptr_null` for
-        // `Default::default`. The trait method is one symbolic path
+        // `rbuiltin.py rtype_const_result` for `Default::default`. The
+        // trait method is one symbolic path
         // (`core::default::<Impl>::default`) for every monomorphization,
-        // so fold only a known-zero Self (integer / bool / float /
-        // raw-pointer Ref). `Vec::default` and a GC-struct Default stay
-        // residual — their result is `Ref(None)` or a named owner that
-        // is not a pointer.
+        // so fold only a known-zero Self (integer / bool / float).
+        // `Vec::default` and a GC-struct Default stay residual.
         if let CallTarget::FunctionPath { segments, .. } = target
             && args.is_empty()
             && is_generic_default_path(segments)
@@ -19016,16 +18991,16 @@ mod tests {
         }
     }
 
-    /// A raw-pointer Self is `rtype_ptr_null`. The frontend stamps
-    /// [`RAW_PTR_DEFAULT_OWNER`] because the trait path is shared.
+    /// A raw-pointer Self is `rtype_ptr_null`. The front names the impl
+    /// (`core::ptr::mut_ptr::<Impl>::default`) rather than the trait path.
     #[test]
     fn generic_default_of_raw_ptr_rewrites_to_null_ref() {
         let config = GraphTransformConfig::default();
         let mut transformer = Transformer::new(&config);
         let mut graph = FunctionGraph::new("default_raw_ptr");
         let result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-        let target = CallTarget::function_path(["core", "default::<Impl>", "default"]);
-        let result_ty = ValueType::Ref(Some(super::RAW_PTR_DEFAULT_OWNER.into()));
+        let target = CallTarget::function_path(["core", "ptr", "mut_ptr", "<Impl>", "default"]);
+        let result_ty = ValueType::Ref(None);
         let op = SpaceOperation {
             result: Some(result),
             kind: OpKind::Call {
