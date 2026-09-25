@@ -1433,6 +1433,50 @@ impl GcCache {
         registered
     }
 
+    /// Re-announce synthetic struct layouts to a replacement collector.
+    ///
+    /// `register_unresolved_struct_tids` skips a descriptor whose collector
+    /// tid is already stored. A fresh `MiniMarkGC` starts with an empty
+    /// registry, so those stored tids have to be appended again, in the
+    /// same insertion order, before any still-unresolved descriptor.
+    pub fn replay_synthetic_struct_tids(
+        &mut self,
+        base: u32,
+        mut register: impl FnMut(usize, Vec<usize>, Option<u32>) -> u32,
+    ) {
+        let mut stamped: Vec<(u32, usize, Vec<usize>)> = Vec::new();
+        let mut fresh: Vec<(usize, Vec<usize>, *const SimpleSizeDescr)> = Vec::new();
+        for descr in self._cache_size.values() {
+            let Some(sd) = descr
+                .as_any()
+                .and_then(|descr| descr.downcast_ref::<SimpleSizeDescr>())
+            else {
+                continue;
+            };
+            if !sd.is_gc_managed() || sd.headerless() || sd.cache_key() == 0 {
+                continue;
+            }
+            let ref_offsets = sd
+                .gc_fielddescrs()
+                .iter()
+                .map(|field| field.offset())
+                .collect();
+            if struct_tid_is_unresolved(sd.cache_key(), sd.type_id()) {
+                fresh.push((sd.size(), ref_offsets, sd as *const SimpleSizeDescr));
+            } else if sd.type_id() >= base {
+                stamped.push((sd.type_id(), sd.size(), ref_offsets));
+            }
+        }
+        stamped.sort_by_key(|(tid, _, _)| *tid);
+        for (stored, size, offsets) in stamped {
+            let _ = register(size, offsets, Some(stored));
+        }
+        for (size, offsets, sd) in fresh {
+            let tid = register(size, offsets, None);
+            unsafe { (*sd).set_type_id(tid) };
+        }
+    }
+
     /// `gc.py GcLLDescr_framework.init_size_descr` analog.
     /// Allocates a dense GC tid via `next_type_id` (the
     /// `TypeLayoutBuilder.get_type_id` analog) and stamps

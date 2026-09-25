@@ -1397,21 +1397,41 @@ fn register_synthetic_struct_tids() {
     if !majit_gc::gc_sync::is_initialized() {
         return;
     }
-    static REGISTERED: Once = Once::new();
-    REGISTERED.call_once(|| {
-        majit_gc::gc_sync::gc_op(|gc| {
-            use majit_gc::GcAllocator;
-            assert!(
-                !gc.types_frozen(),
-                "materialize_gccache_owned_descrs: synthetic struct tids must be \
-                 registered while the type registry is still open; \
-                 set_type_registry_close_hook runs this before freeze_types"
-            );
-            majit_ir::descr::gc_cache()
-                .lock()
-                .register_unresolved_struct_tids(|size, offsets| {
-                    gc.register_type(majit_gc::trace::TypeInfo::with_gc_ptrs(size, offsets))
-                });
+    // One registration per collector. `reset_gc_fresh_for_test` installs a
+    // new `MiniMarkGC`; a process-wide `Once` would leave that registry
+    // without the tids already stamped on the shared size descriptors.
+    static LAST_GC: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    majit_gc::gc_sync::gc_op(|gc| {
+        use majit_gc::GcAllocator;
+        use std::sync::atomic::Ordering;
+        let addr = gc as *mut majit_gc::collector::MiniMarkGC as usize;
+        let previous = LAST_GC.swap(addr, Ordering::AcqRel);
+        if previous == addr && gc.types_frozen() {
+            return;
+        }
+        assert!(
+            !gc.types_frozen(),
+            "materialize_gccache_owned_descrs: synthetic struct tids must be \
+             registered while the type registry is still open; \
+             set_type_registry_close_hook runs this before freeze_types"
+        );
+        let mut cache = majit_ir::descr::gc_cache().lock();
+        if previous == addr || previous == 0 {
+            cache.register_unresolved_struct_tids(|size, offsets| {
+                gc.register_type(majit_gc::trace::TypeInfo::with_gc_ptrs(size, offsets))
+            });
+            return;
+        }
+        let base = gc.type_count() as u32;
+        cache.replay_synthetic_struct_tids(base, |size, offsets, stored| {
+            let tid = gc.register_type(majit_gc::trace::TypeInfo::with_gc_ptrs(size, offsets));
+            if let Some(stored) = stored {
+                assert_eq!(
+                    tid, stored,
+                    "synthetic struct tid changed after the collector was replaced"
+                );
+            }
+            tid
         });
     });
 }
@@ -1523,6 +1543,9 @@ pub fn rehydrate_build_descr_raw_sets() {
         // `rehydrated_call_descr_ref` after this pass publishes its frozen
         // EffectInfo identity, preserving the canonical call-cache key.
         report_descr_spelling_gate();
+        // EffectInfo mints can create size descriptors after the first
+        // registration. Stamp those onto the still-open collector.
+        register_synthetic_struct_tids();
     });
 }
 

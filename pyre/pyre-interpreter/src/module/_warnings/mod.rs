@@ -588,7 +588,7 @@ fn get_source_line(module_globals: PyObjectRef, lineno: i64) -> Result<PyObjectR
     // reads `__loader__` straight out of the globals; that module predates the
     // reconciliation and carries no counterpart for it, so this answers to the
     // 3.14 stdlib shipped here.
-    let Some(external) = crate::importing::get_sys_module("_frozen_importlib_external") else {
+    let Some(external) = crate::importing::importlib_bootstrap_external_module() else {
         // A warning raised before the external bootstrap is wired has no loader
         // to ask for a source line.
         return Ok(PY_NULL);
