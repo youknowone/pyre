@@ -5092,27 +5092,201 @@ fn pack_varargs(code: &crate::CodeObject, args: Vec<PyObjectRef>) -> Vec<PyObjec
         return args;
     }
 
-    let mut packed = Vec::with_capacity(nparams + 2);
-    // Regular positional args
-    for i in 0..nparams.min(args.len()) {
-        packed.push(args[i]);
+    // `argument.py` `_match_signature` stores the `*vararg` tuple into the
+    // rooted scope before `space.newdict` for `**kwargs`. This `Vec` is not
+    // a root area: a collection during `w_tuple_new` relocates positionals
+    // already copied into it, and `w_dict_new` relocates that tuple. Pin the
+    // inputs and re-read after each allocation — the keyword-call arm does
+    // the same around `packed_tail_slots`.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let args_base = _roots.pin_roots(&args);
+    let star_slot = if has_varargs {
+        let extra: Vec<PyObjectRef> = if args.len() > nparams {
+            (nparams..args.len())
+                .map(|i| _roots.get(args_base + i))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let w_star = pyre_object::w_tuple_new(extra);
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = _roots.pin_root(w_star);
+        Some(slot)
+    } else {
+        None
+    };
+    let kw_slot = if has_varkw {
+        let w_kw = pyre_object::w_dict_new();
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = _roots.pin_root(w_kw);
+        Some(slot)
+    } else {
+        None
+    };
+
+    let mut packed =
+        Vec::with_capacity(nparams + usize::from(has_varargs) + usize::from(has_varkw));
+    let n_keep = nparams.min(args.len());
+    for i in 0..n_keep {
+        packed.push(_roots.get(args_base + i));
     }
-    // Fill missing params with PY_NULL
     while packed.len() < nparams {
         packed.push(pyre_object::PY_NULL);
     }
-    if has_varargs {
-        let extra: Vec<_> = if args.len() > nparams {
-            args[nparams..].to_vec()
-        } else {
-            vec![]
-        };
-        packed.push(pyre_object::w_tuple_new(extra));
+    if let Some(slot) = star_slot {
+        packed.push(_roots.get(slot));
     }
-    if has_varkw {
-        packed.push(pyre_object::w_dict_new());
+    if let Some(slot) = kw_slot {
+        packed.push(_roots.get(slot));
     }
     packed
+}
+
+#[cfg(test)]
+mod pack_varargs_tests {
+    use std::cell::Cell;
+    use std::sync::Once;
+
+    use super::pack_varargs;
+    use majit_gc::GcAllocator;
+    use majit_gc::collector::MiniMarkGC;
+    use majit_gc::trace::TypeInfo;
+    use majit_ir::GcRef;
+    use rustpython_compiler_core::bytecode::ConstantData;
+
+    const PROBE_PAYLOAD: usize = 16;
+
+    thread_local! {
+        static COLLECT_ON_ALLOC: Cell<bool> = const { Cell::new(false) };
+    }
+
+    fn walk_pinned_pyre_roots(visitor: &mut dyn FnMut(&mut GcRef)) {
+        pyre_object::gc_roots::walk_shadow_stack(|slot| {
+            // PyObjectRef and GcRef are both pointer-sized.
+            let gcref = unsafe { &mut *(slot as *mut pyre_object::PyObjectRef as *mut GcRef) };
+            visitor(gcref);
+        });
+    }
+
+    /// `w_tuple_new` allocates through the no-collect hook, which spills
+    /// instead of moving. This test hook takes the collecting entry so a
+    /// full nursery relocates a pinned positional during that allocation.
+    fn collecting_alloc_hook(type_id: u32, payload_size: usize) -> *mut u8 {
+        if !COLLECT_ON_ALLOC.with(Cell::get) {
+            let layout = std::alloc::Layout::from_size_align(payload_size.max(1), 8)
+                .expect("probe fallback layout");
+            return unsafe { std::alloc::alloc_zeroed(layout) };
+        }
+        majit_gc::gc_sync::gc_op(|gc| gc.alloc_with_type(type_id, payload_size)).0 as *mut u8
+    }
+
+    fn install_collecting_heap() {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            let mut gc = MiniMarkGC::new();
+            for _ in 0..16 {
+                let _ = gc.register_type(TypeInfo::simple(PROBE_PAYLOAD));
+            }
+            if !majit_gc::gc_sync::is_initialized() {
+                majit_gc::gc_sync::store_singleton(Box::new(gc));
+            }
+            majit_gc::shadow_stack::register_extra_root_walker(walk_pinned_pyre_roots);
+        });
+        // `compile_exec` already entered this thread. A second
+        // `register_thread` panics; this acquire is idempotent.
+        crate::module::thread::ensure_runtime_thread();
+    }
+
+    fn nursery_gap() -> usize {
+        majit_gc::gc_sync::gc_op(|gc| {
+            (gc.nursery_top() as usize).saturating_sub(gc.nursery_free() as usize)
+        })
+    }
+
+    fn star_code() -> crate::CodeObject {
+        let module = crate::compile_exec("def f(head, *args):\n    pass\n")
+            .expect("star function should compile");
+        module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                ConstantData::Code { code } => Some((**code).clone()),
+                _ => None,
+            })
+            .expect("nested function code")
+    }
+
+    /// A still-young probe with less free nursery than a tuple header, so the
+    /// next collecting allocation runs a minor collection.
+    fn young_probe_in_a_tight_nursery() -> (pyre_object::gc_roots::RootScope, usize) {
+        let step = majit_gc::header::GcHeader::SIZE + PROBE_PAYLOAD;
+        let young = majit_gc::gc_sync::gc_op(|gc| {
+            while (gc.nursery_top() as usize).saturating_sub(gc.nursery_free() as usize) >= step * 2
+            {
+                let _ = gc.alloc_with_type_no_collect(0, PROBE_PAYLOAD);
+            }
+            gc.alloc_with_type(0, PROBE_PAYLOAD)
+        });
+        assert_ne!(young.0, 0, "probe allocation failed");
+        let roots = pyre_object::gc_roots::push_roots();
+        let slot = roots.base();
+        let _ = roots.pin_root(young.0 as pyre_object::PyObjectRef);
+        majit_gc::gc_sync::gc_op(|gc| {
+            while (gc.nursery_top() as usize).saturating_sub(gc.nursery_free() as usize) >= step {
+                let _ = gc.alloc_with_type_no_collect(0, PROBE_PAYLOAD);
+            }
+        });
+        assert!(
+            majit_gc::gc_is_nursery_object(roots.get(slot) as usize),
+            "probe left the nursery before pack_varargs"
+        );
+        assert!(
+            nursery_gap() < pyre_object::W_TUPLE_OBJECT_SIZE,
+            "nursery still has room for the tuple header"
+        );
+        (roots, slot)
+    }
+
+    #[test]
+    fn pack_varargs_rereads_a_young_positional_after_the_tuple_alloc() {
+        // Hides the nursery hook and the collector singleton's alloc path
+        // from every other test thread for the whole body.
+        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
+        let code = star_code();
+        assert!(code.flags.contains(crate::CodeFlags::VARARGS));
+        assert!(!code.flags.contains(crate::CodeFlags::VARKEYWORDS));
+        assert_eq!(code.arg_count, 1);
+        install_collecting_heap();
+        let (roots, slot) = young_probe_in_a_tight_nursery();
+        let before = roots.get(slot);
+        // One overflow word, not a second real positional: `w_tuple_new` pins
+        // the overflow itself. The kept positional is only in this vector.
+        let args = vec![before, pyre_object::PY_NULL];
+        // Install only across the call. A hook that stays up makes every
+        // other test's `try_gc_alloc` take this process's collector.
+        struct ClearHook;
+        impl Drop for ClearHook {
+            fn drop(&mut self) {
+                COLLECT_ON_ALLOC.with(|flag| flag.set(false));
+                pyre_object::gc_hook::clear_gc_alloc_hook();
+            }
+        }
+        COLLECT_ON_ALLOC.with(|flag| flag.set(true));
+        pyre_object::gc_hook::register_gc_alloc_hook(collecting_alloc_hook);
+        let _clear = ClearHook;
+        let packed = pack_varargs(&code, args);
+        drop(_clear);
+        let after = roots.get(slot);
+        assert_ne!(
+            before, after,
+            "the tuple allocation did not collect, so the test did not run"
+        );
+        assert_eq!(
+            packed[0], after,
+            "positional kept the pre-collection address {:p}, live address is {:p}",
+            before, after
+        );
+    }
 }
 
 /// Resolve `__mro_entries__` for every base that is not a type.
