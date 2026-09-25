@@ -16,20 +16,12 @@ use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
 
 #[derive(Clone, Copy)]
 enum DeferredPercentError {
-    Unsupported(CFormatError),
     Incomplete(CFormatError),
     IncompleteMappingKey(CFormatError),
     Quantity(CFormatError),
 }
 
 impl DeferredPercentError {
-    fn unsupported(self) -> Option<CFormatError> {
-        match self {
-            Self::Unsupported(error) => Some(error),
-            _ => None,
-        }
-    }
-
     fn before_conversion(self) -> Option<CFormatError> {
         match self {
             Self::Incomplete(error) | Self::Quantity(error) => Some(error),
@@ -39,9 +31,6 @@ impl DeferredPercentError {
 
     fn after_parts(self, is_mapping: bool) -> Result<(), PyError> {
         let error = match self {
-            Self::Unsupported(_) => {
-                unreachable!("the recovered unsupported spec raises after operand acquisition")
-            }
             Self::Incomplete(_) | Self::Quantity(_) => {
                 unreachable!("the recovered spec raises before conversion acquisition")
             }
@@ -205,16 +194,13 @@ fn bytes_acquisition_prefix(
 
 /// Parse a unicode percent format, retaining the first deferred parser error.
 ///
-/// PyPy's `StringFormatter.format` parses one spec at a time: `parse_fmt`
-/// performs mapping lookup and consumes `*` operands, then the loop validates
-/// the conversion character. CPython 3.14 additionally consumes the conversion
-/// operand before reporting an unsupported character. The shared RustPython
-/// parser instead validates the entire format eagerly, which used to report
-/// the `ValueError` before either upstream's operand-side effects occurred.
+/// PyPy's `StringFormatter.format` parses one spec at a time, and `parse_fmt`
+/// raises where it stands: `getmappingkey` before the mapping lookup,
+/// `peel_flags` and `peel_num` after it and after whichever `*` operands they
+/// have already consumed. The shared RustPython parser instead validates the
+/// entire format eagerly, which used to report the `ValueError` before those
+/// operand-side effects occurred.
 ///
-/// Replace only that unsupported character with `s` and stop there. The caller
-/// can execute every preceding spec and the recovered spec's operand-acquisition
-/// path, then surface the saved 3.14 error without formatting the operand.
 /// An incomplete mapping key retains only the complete prefix. Other incomplete
 /// specs and oversized quantities retain a synthetic current spec through the
 /// mapping lookup and the `*` operands which precede their error stage. This is
@@ -249,27 +235,19 @@ fn parse_wtf8_incremental(
                 .expect("the acquisition prefix of an incomplete format must parse");
                 return Ok((recovered, Some(DeferredPercentError::Incomplete(error))));
             }
-            let (prefix_len, replacement, deferred) = match error.typ {
-                CFormatErrorType::UnsupportedFormatChar(_) => {
-                    (error.index, true, DeferredPercentError::Unsupported(error))
-                }
-                CFormatErrorType::UnmatchedKeyParentheses => (
-                    error
-                        .index
-                        .checked_sub(1)
-                        .expect("an incomplete mapping key follows its percent sign"),
-                    false,
-                    DeferredPercentError::IncompleteMappingKey(error),
-                ),
-                _ => return Err(PyError::value_error(error.to_string())),
-            };
-            let mut prefix = wtf8_prefix(fmt, prefix_len);
-            if replacement {
-                prefix.push_char('s');
+            if !matches!(error.typ, CFormatErrorType::UnmatchedKeyParentheses) {
+                return Err(PyError::value_error(error.to_string()));
             }
-            let recovered = CFormatWtf8::parse_from_wtf8(&prefix)
+            let prefix_len = error
+                .index
+                .checked_sub(1)
+                .expect("an incomplete mapping key follows its percent sign");
+            let recovered = CFormatWtf8::parse_from_wtf8(&wtf8_prefix(fmt, prefix_len))
                 .expect("the complete prefix of a deferred percent-format error must parse");
-            Ok((recovered, Some(deferred)))
+            Ok((
+                recovered,
+                Some(DeferredPercentError::IncompleteMappingKey(error)),
+            ))
         }
     }
 }
@@ -304,27 +282,19 @@ fn parse_bytes_incremental(
                 .expect("the acquisition prefix of an incomplete format must parse");
                 return Ok((recovered, Some(DeferredPercentError::Incomplete(error))));
             }
-            let (prefix_len, replacement, deferred) = match error.typ {
-                CFormatErrorType::UnsupportedFormatChar(_) => {
-                    (error.index, true, DeferredPercentError::Unsupported(error))
-                }
-                CFormatErrorType::UnmatchedKeyParentheses => (
-                    error
-                        .index
-                        .checked_sub(1)
-                        .expect("an incomplete mapping key follows its percent sign"),
-                    false,
-                    DeferredPercentError::IncompleteMappingKey(error),
-                ),
-                _ => return Err(PyError::value_error(error.to_string())),
-            };
-            let mut prefix = fmt[..prefix_len].to_vec();
-            if replacement {
-                prefix.push(b's');
+            if !matches!(error.typ, CFormatErrorType::UnmatchedKeyParentheses) {
+                return Err(PyError::value_error(error.to_string()));
             }
-            let recovered = CFormatBytes::parse_from_bytes(&prefix)
+            let prefix_len = error
+                .index
+                .checked_sub(1)
+                .expect("an incomplete mapping key follows its percent sign");
+            let recovered = CFormatBytes::parse_from_bytes(&fmt[..prefix_len])
                 .expect("the complete prefix of a deferred percent-format error must parse");
-            Ok((recovered, Some(deferred)))
+            Ok((
+                recovered,
+                Some(DeferredPercentError::IncompleteMappingKey(error)),
+            ))
         }
     }
 }
@@ -436,9 +406,6 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
                     };
                     v
                 };
-                if let Some(error) = current_deferred.and_then(DeferredPercentError::unsupported) {
-                    return Err(PyError::value_error(error.to_string()));
-                }
                 result.push_wtf8(&spec_format_string(&spec, value)?);
             }
         }
@@ -548,11 +515,6 @@ unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyR
                     {
                         return Err(PyError::value_error(error.to_string()));
                     }
-                    if let Some(error) =
-                        current_deferred.and_then(DeferredPercentError::unsupported)
-                    {
-                        return Err(PyError::value_error(error.to_string()));
-                    }
                     result.extend(spec_format_bytes(&spec, value)?);
                 }
             }
@@ -594,9 +556,6 @@ unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyR
                         "not enough arguments for format string",
                     ));
                 };
-                if let Some(error) = current_deferred.and_then(DeferredPercentError::unsupported) {
-                    return Err(PyError::value_error(error.to_string()));
-                }
                 result.extend(spec_format_bytes(&spec, value)?);
             }
         }
