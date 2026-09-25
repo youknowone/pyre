@@ -43,13 +43,14 @@ pub struct _CallableIterator {
 
 /// Allocate a `_CallableIterator` for `iter(callable, sentinel)`.
 ///
-/// `malloc_typed` with a constant type word lowers to `new_with_vtable`
-/// plus field stores, the same shape as `w_int_new`. The iterator used to
-/// go through `allocate_stable` because `__next__` kept `self` as a raw
-/// pointer across the callable; that call now reloads `self` from the
-/// shadow stack, so the object does not need a non-moving address.
+/// `malloc_typed_managed` with a constant type word lowers to
+/// `new_with_vtable` plus field stores, and the block is collector-owned
+/// so the registered `callable` / `sentinel` offsets are traced.
+/// `try_gc_alloc` does not collect, so the two children stay at the
+/// addresses copied into the payload; the write barrier after the store
+/// is what later collections follow.
 pub fn w_callable_iterator_new(callable: PyObjectRef, sentinel: PyObjectRef) -> PyObjectRef {
-    crate::lltype::malloc_typed(_CallableIterator {
+    crate::lltype::malloc_typed_managed(_CallableIterator {
         ob: PyObject {
             ob_type: &CALLABLE_ITERATOR_TYPE,
             w_class: get_instantiate(&CALLABLE_ITERATOR_TYPE),
