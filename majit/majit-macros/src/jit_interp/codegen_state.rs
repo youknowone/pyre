@@ -2051,6 +2051,27 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         } else {
             quote! {}
         };
+    // No flattened-array length check and the extract override ignores
+    // meta, so the steady entry does not probe `compiled_loops`.
+    let fill_entry_reds_without_meta_override: TokenStream = if compat_checks.is_empty()
+        && (num_ref_scalars > 0 || num_virt_arrays > 0 || num_float_scalars > 0)
+    {
+        quote! {
+            fn fill_entry_reds_without_meta(
+                &self,
+                out: &mut ::std::vec::Vec<majit_ir::Value>,
+            ) -> bool {
+                #(#extract_live_value_scalar_parts)*
+                #(#extract_live_value_array_parts)*
+                #extract_live_value_vable_identity_part
+                #(#extract_live_value_ref_scalar_parts)*
+                #(#extract_live_value_float_scalar_parts)*
+                true
+            }
+        }
+    } else {
+        quote! {}
+    };
     let live_value_types_override: TokenStream =
         if num_ref_scalars > 0 || num_virt_arrays > 0 || num_float_scalars > 0 {
             quote! {
@@ -3120,6 +3141,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             #live_value_types_override
 
             #extract_live_values_into_override
+            #fill_entry_reds_without_meta_override
 
             fn create_sym(meta: &#meta_ty, header_pc: usize) -> #sym_ty {
                 let mut __offset: usize = 0;

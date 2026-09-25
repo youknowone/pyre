@@ -9339,7 +9339,12 @@ impl<S: JitState> JitDriver<S> {
             ));
         }
         let mut scratch = self.take_entry_scratch();
-        let compatible = {
+        // `execute_assembler` does not look up `CompiledEntry`. The cell
+        // already holds the procedure token. Meta is only for a state whose
+        // reds or `is_compatible` actually read it.
+        let compatible = if state.fill_entry_reds_without_meta(&mut scratch.live_values) {
+            true
+        } else {
             let Some(meta) = self.meta.get_compiled_meta(cell_key) else {
                 self.entry_scratch_out(scratch);
                 return SteadyCompiledEntry::NeedsInternal;
