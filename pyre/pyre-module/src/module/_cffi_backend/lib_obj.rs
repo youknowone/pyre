@@ -1,6 +1,6 @@
 //! CFFI generated-library objects — PyPy: `pypy/module/_cffi_backend/lib_obj.py`.
 
-use pyre_interpreter::PyError;
+use pyre_interpreter::{PyError, PyErrorKind};
 use pyre_object::PyObjectRef;
 use std::ffi::CStr;
 use std::sync::OnceLock;
@@ -172,19 +172,33 @@ fn build_cpython_func(
     )
 }
 
-/// `W_LibObject._get_attr_elidable`.
+/// `W_LibObject._get_attr_elidable` — `self.dict_w[attr]`, `KeyError` if
+/// not found.
+///
+/// The miss raises rather than answering `None`: `_build_attr` fills
+/// `dict_w` right after it, and an elidable call that raised is never folded
+/// to its result. `w_attr` is the attribute's string object, the one word
+/// `elidable_promote` guards on.
 #[majit_macros::elidable_promote]
-fn get_attr_elidable(lib: &W_LibObject, attr: &str) -> Option<PyObjectRef> {
-    unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(lib.dict_w, attr) }
+fn get_attr_elidable(lib: &W_LibObject, w_attr: PyObjectRef) -> Result<PyObjectRef, PyError> {
+    let attr = pyre_interpreter::baseobjspace::text_w(w_attr)?;
+    match unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(lib.dict_w, attr) } {
+        Some(w_value) => Ok(w_value),
+        None => Err(PyError::key_error_with_key(w_attr)),
+    }
 }
 
 /// `W_LibObject._build_attr`.
 #[majit_macros::dont_look_inside]
-fn build_attr(w_lib: PyObjectRef, attr: &str) -> Result<Option<PyObjectRef>, PyError> {
+fn build_attr(w_lib: PyObjectRef, w_attr: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let lib_slot = roots.base();
     let _ = roots.pin_root(w_lib);
-    let ffi_slot = lib_slot + 1;
+    let _ = roots.pin_root(w_attr);
+    let w_attr = || roots.get(lib_slot + 1);
+    let attr = pyre_interpreter::baseobjspace::text_w(w_attr())?.to_string();
+    let attr = attr.as_str();
+    let ffi_slot = lib_slot + 2;
     let _ = roots.pin_root(lib_arg(roots.get(lib_slot))?.w_ffi);
     let ffi = W_FFIObject::from_obj(roots.get(ffi_slot))
         .ok_or_else(|| PyError::system_error("Lib object lost its FFI"))?;
@@ -206,10 +220,13 @@ fn build_attr(w_lib: PyObjectRef, attr: &str) -> Result<Option<PyObjectRef>, PyE
                 let _ = roots.pin_root(item);
             }
             if !unsafe { pyre_object::pyobject::is_none(roots.get(base + 1)) } {
-                result = get_attr_elidable(lib_arg(roots.get(base + 1))?, attr);
-                if result.is_none() {
-                    result = build_attr(roots.get(base + 1), attr)?;
-                }
+                result = match get_attr_elidable(lib_arg(roots.get(base + 1))?, w_attr()) {
+                    Ok(w_value) => Some(w_value),
+                    Err(e) if e.kind == PyErrorKind::KeyError => {
+                        build_attr(roots.get(base + 1), w_attr())?
+                    }
+                    Err(e) => return Err(e),
+                };
             } else {
                 result = ffi_obj::fetch_int_constant(roots.get(base), attr)?;
             }
@@ -332,9 +349,12 @@ fn get_attr(
     let _ = roots.pin_root(w_attr);
     let attr = pyre_interpreter::baseobjspace::text_w(roots.get(attr_slot))?.to_string();
     // `_get_attr`: `_get_attr_elidable` first, `_build_attr` on KeyError.
-    let value = match get_attr_elidable(lib_arg(roots.get(lib_slot))?, &attr) {
-        Some(value) => Some(value),
-        None => build_attr(roots.get(lib_slot), &attr)?,
+    let value = match get_attr_elidable(lib_arg(roots.get(lib_slot))?, roots.get(attr_slot)) {
+        Ok(value) => Some(value),
+        Err(e) if e.kind == PyErrorKind::KeyError => {
+            build_attr(roots.get(lib_slot), roots.get(attr_slot))?
+        }
+        Err(e) => return Err(e),
     };
     if let Some(value) = value {
         return Ok(value);

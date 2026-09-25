@@ -16713,7 +16713,7 @@ pub fn float_w(obj: PyObjectRef) -> Result<f64, PyError> {
         }
     }
     let Some(method) = (unsafe { lookup(obj, "__float__") }) else {
-        return Err(float_w_must_be_real(obj));
+        return Err(unsafe { PyError::from_exc_object(float_w_must_be_real(obj)) });
     };
     let w_type = match crate::typedef::r#type(obj) {
         Some(w_type) => w_type.as_ptr(),
@@ -16723,25 +16723,35 @@ pub fn float_w(obj: PyObjectRef) -> Result<f64, PyError> {
     if unsafe { pyre_object::is_float(w_result) } {
         return Ok(unsafe { pyre_object::w_float_get_value(w_result) });
     }
-    Err(float_w_returned_non_float(w_result))
+    Err(unsafe { PyError::from_exc_object(float_w_returned_non_float(w_result)) })
 }
 
-/// `W_Root._typed_unwrap_error` / `oefmt("must be real number, not %T")`.
+/// `DescrOperation.float` — `oefmt(space.w_TypeError, "must be real
+/// number, not %T", w_obj)`.
+///
+/// `error::oefmt` renders the message eagerly, so the rendering stays
+/// behind `dont_look_inside` and the helper answers the exception instance:
+/// one residual word, which the caller wraps into the `PyError` the way
+/// `OperationError` stores `w_value`.
 #[majit_macros::dont_look_inside]
-pub(crate) fn float_w_must_be_real(obj: PyObjectRef) -> PyError {
+pub(crate) fn float_w_must_be_real(obj: PyObjectRef) -> PyObjectRef {
     PyError::type_error(format!(
         "must be real number, not {}",
         object_functionstr_type_name(obj)
     ))
+    .to_exc_object()
 }
 
-/// `oefmt("__float__ returned non-float (type '%T')")`.
+/// `DescrOperation.float` — `oefmt(space.w_TypeError, "__float__ returned
+/// non-float (type '%T')", w_result)`, shaped as
+/// [`float_w_must_be_real`].
 #[majit_macros::dont_look_inside]
-pub(crate) fn float_w_returned_non_float(w_result: PyObjectRef) -> PyError {
+pub(crate) fn float_w_returned_non_float(w_result: PyObjectRef) -> PyObjectRef {
     PyError::type_error(format!(
         "__float__ returned non-float (type '{}')",
         object_functionstr_type_name(w_result)
     ))
+    .to_exc_object()
 }
 
 /// baseobjspace.py `getindex_w` with `w_exception=None` — apply

@@ -54,7 +54,9 @@ pub unsafe fn pointer_convert_from_object(
     w_ob: PyObjectRef,
 ) -> Result<(), PyError> {
     let Some(source) = W_CData::from_obj(w_ob) else {
-        return Err(ct.convert_error("cdata pointer", w_ob));
+        return Err(unsafe {
+            PyError::from_exc_object(ctypeobj::convert_error(ct, &"cdata pointer", w_ob))
+        });
     };
     // Spelled as a `match` rather than `Option::ok_or_else`: the closure
     // the combinator takes is a callee of its own, and a traced cdata
@@ -71,7 +73,9 @@ pub unsafe fn pointer_convert_from_object(
     }
     // `W_CTypeFunc` and `W_CTypePointer` are both `W_CTypePtrBase` upstream.
     if !matches!(other.kind, ctypeobj::KIND_POINTER | ctypeobj::KIND_FUNC) {
-        return Err(ct.convert_error("compatible pointer", w_ob));
+        return Err(unsafe {
+            PyError::from_exc_object(ctypeobj::convert_error(ct, &"compatible pointer", w_ob))
+        });
     }
     if !std::ptr::eq(ct as *const W_CType, other as *const W_CType) {
         if ct.has(ctypeobj::CTypeFlags::VOID_PTR) || other.has(ctypeobj::CTypeFlags::VOID_PTR) {
@@ -88,7 +92,9 @@ pub unsafe fn pointer_convert_from_object(
                 implicit_cast_warning(other, ct)?;
             }
         } else {
-            return Err(ct.convert_error("compatible pointer", w_ob));
+            return Err(unsafe {
+                PyError::from_exc_object(ctypeobj::convert_error(ct, &"compatible pointer", w_ob))
+            });
         }
     }
     cdataobj::raw_write_ptr(cdata as usize, source.ptr);
@@ -112,36 +118,39 @@ pub(crate) fn implicit_cast_warning(other: &W_CType, ct: &W_CType) -> Result<(),
 
 /// `W_CTypePtrOrArray._convert_array_from_listview` — `oefmt`.
 #[majit_macros::dont_look_inside]
-pub(crate) fn too_many_array_initializers(ct: &W_CType, got: usize) -> PyError {
+pub(crate) fn too_many_array_initializers(ct: &W_CType, got: usize) -> PyObjectRef {
     PyError::index_error(format!(
         "too many initializers for '{}' (got {})",
         ct.name(),
         got
     ))
+    .to_exc_object()
 }
 
 /// `W_CTypePtrOrArray.convert_array_from_object` — `oefmt` for a bytes initializer.
 #[majit_macros::dont_look_inside]
-pub(crate) fn initializer_string_too_long(ct: &W_CType, n: i64) -> PyError {
+pub(crate) fn initializer_string_too_long(ct: &W_CType, n: i64) -> PyObjectRef {
     PyError::index_error(format!(
         "initializer string is too long for '{}' (got {n} characters)",
         ct.name()
     ))
+    .to_exc_object()
 }
 
 /// `W_CTypePtrOrArray.convert_array_from_object` — `oefmt` for a unicode initializer.
 #[majit_macros::dont_look_inside]
-pub(crate) fn initializer_unicode_too_long(ct: &W_CType, n: i64) -> PyError {
+pub(crate) fn initializer_unicode_too_long(ct: &W_CType, n: i64) -> PyObjectRef {
     PyError::index_error(format!(
         "initializer unicode string is too long for '{}' (got {n} characters)",
         ct.name()
     ))
+    .to_exc_object()
 }
 
 /// `W_CTypePtrOrArray._must_be_string_of_zero_or_one`.
 #[majit_macros::dont_look_inside]
-pub(crate) fn bool_array_not_zero_or_one() -> PyError {
-    PyError::value_error("an array of _Bool can only contain \\x00 or \\x01")
+pub(crate) fn bool_array_not_zero_or_one() -> PyObjectRef {
+    PyError::value_error("an array of _Bool can only contain \\x00 or \\x01").to_exc_object()
 }
 
 /// `W_CTypeArray.convert_from_object`.
@@ -159,9 +168,9 @@ pub unsafe fn array_convert_from_object(
     {
         let item = item_of(ct)?;
         let length = source.array_length()?;
-        // `ctypearray.py convert_from_object` uses `rffi.c_memcpy`; a
-        // non-constant length takes `_raw_memcopy`'s opaque residual.
-        misc::raw_memcopy(source.ptr, cdata as usize, (item.size * length) as usize);
+        // `ctypearray.py convert_from_object` — `rffi.c_memcpy`, an
+        // external call.
+        misc::raw_memcopy_opaque(source.ptr, cdata as usize, (item.size * length) as usize);
         return Ok(());
     }
     unsafe { convert_array_from_object(ct, cdata, w_ob) }
@@ -180,7 +189,9 @@ pub unsafe fn convert_array_from_object(
     if unsafe { pyre_object::pyobject::is_list(w_ob) || pyre_object::pyobject::is_tuple(w_ob) } {
         let items = pyre_interpreter::baseobjspace::unpackiterable(w_ob, -1)?;
         if !ct.within_bounds(items.len() as i64) {
-            return Err(too_many_array_initializers(ct, items.len()));
+            return Err(unsafe {
+                PyError::from_exc_object(too_many_array_initializers(ct, items.len()))
+            });
         }
         let roots = pyre_object::gc_roots::push_roots();
         let base = pyre_object::gc_roots::pin_roots(&items);
@@ -196,19 +207,25 @@ pub unsafe fn convert_array_from_object(
     }
     if ct.has(ctypeobj::CTypeFlags::ACCEPT_STR) {
         if !unsafe { pyre_object::bytesobject::is_bytes(w_ob) } {
-            return Err(ct.convert_error("bytes or list or tuple", w_ob));
+            return Err(unsafe {
+                PyError::from_exc_object(ctypeobj::convert_error(
+                    ct,
+                    &"bytes or list or tuple",
+                    w_ob,
+                ))
+            });
         }
         let s = unsafe { pyre_object::bytesobject::w_bytes_data(w_ob) };
         let n = s.len() as i64;
         if ct.length >= 0 && n > ct.length {
-            return Err(initializer_string_too_long(ct, n));
+            return Err(unsafe { PyError::from_exc_object(initializer_string_too_long(ct, n)) });
         }
         if item.kind == ctypeobj::KIND_PRIM_BOOL && s.iter().any(|&c| c > 1) {
-            return Err(bool_array_not_zero_or_one());
+            return Err(unsafe { PyError::from_exc_object(bool_array_not_zero_or_one()) });
         }
         unsafe {
             // `copy_string_to_raw` — residual memcpy of the initializer.
-            misc::raw_memcopy(s.as_ptr() as usize, cdata as usize, s.len());
+            misc::raw_memcopy_opaque(s.as_ptr() as usize, cdata as usize, s.len());
             if n != ct.length {
                 cdata.offset(n as isize).write(0);
             }
@@ -217,7 +234,13 @@ pub unsafe fn convert_array_from_object(
     }
     if item.kind == ctypeobj::KIND_PRIM_UNICHAR {
         if !unsafe { pyre_object::unicodeobject::is_str(w_ob) } {
-            return Err(ct.convert_error("unicode or list or tuple", w_ob));
+            return Err(unsafe {
+                PyError::from_exc_object(ctypeobj::convert_error(
+                    ct,
+                    &"unicode or list or tuple",
+                    w_ob,
+                ))
+            });
         }
         let value = unsafe { pyre_object::w_str_get_wtf8(w_ob) };
         let n = if item.size == 2 {
@@ -226,7 +249,7 @@ pub unsafe fn convert_array_from_object(
             value.code_points().count() as i64
         };
         if ct.length >= 0 && n > ct.length {
-            return Err(initializer_unicode_too_long(ct, n));
+            return Err(unsafe { PyError::from_exc_object(initializer_unicode_too_long(ct, n)) });
         }
         let add_final_zero = n != ct.length;
         unsafe {
@@ -238,7 +261,7 @@ pub unsafe fn convert_array_from_object(
         }
         return Ok(());
     }
-    Err(ct.convert_error("list or tuple", w_ob))
+    Err(unsafe { PyError::from_exc_object(ctypeobj::convert_error(ct, &"list or tuple", w_ob)) })
 }
 
 /// `W_CTypePtrOrArray.cast`.
@@ -639,10 +662,10 @@ unsafe fn accept_movable_str(
     }
     let buf = cdataobj::raw_alloc(value.len() as i64 + 1, false)?;
     unsafe {
-        // `misc.py write_string_as_charp` is `@jit.dont_look_inside`;
-        // the copy itself is `_raw_memcopy` because the collector may
-        // move the bytes and there is no non-moving pin.
-        misc::raw_memcopy(value.as_ptr() as usize, buf, value.len());
+        // `misc.py write_string_as_charp` is `@jit.dont_look_inside`; the
+        // copy is its opaque half, taken because the collector may move the
+        // bytes and there is no non-moving pin.
+        misc::raw_memcopy_opaque(value.as_ptr() as usize, buf, value.len());
         (buf as *mut u8).add(value.len()).write(0);
         cdataobj::raw_write_ptr(cdata as usize, buf);
         set_mustfree_flag(cdata, MUSTFREE_FREE);

@@ -2488,15 +2488,7 @@ impl PyError {
         }
     }
 
-    /// Empty display text when `exc_object` already holds the message.
-    ///
-    /// Not `Wtf8Buf::new()`: the translator rewrites that ctor as
     /// Create a PyError from a W_BaseException.
-    ///
-    /// Looked inside, like `OperationError` storing `w_type`/`w_value`:
-    /// the display string stays on `exc_object` and is read by
-    /// `message_text`. The empty `message` is not `Wtf8Buf::new()` — that
-    /// ctor is rewritten as `__majit_stringbuilder_new`.
     ///
     /// # Safety
     /// `obj` must point to a valid `W_BaseException`.

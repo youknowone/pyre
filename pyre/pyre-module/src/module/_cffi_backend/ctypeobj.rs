@@ -293,39 +293,6 @@ impl W_CType {
         PyError::value_error(format!("ctype '{}' is of unknown alignment", self.name()))
     }
 
-    /// `W_CType._convert_error` — the initializer-mismatch TypeError, with
-    /// the two special cases a same-named cdata gets.
-    ///
-    /// `oefmt` does not build the message until the value is needed.
-    /// `dont_look_inside` keeps `format!` off the convert descent.
-    #[majit_macros::dont_look_inside]
-    pub fn convert_error(&self, expected: &str, w_got: PyObjectRef) -> PyError {
-        let name = self.name();
-        if let Some(got) = W_CData::from_obj(w_got)
-            && let Some(got_ctype) = ctype_at(got.ctype)
-        {
-            if name == got_ctype.name() {
-                if std::ptr::eq(self, got_ctype) {
-                    return PyError::system_error(format!(
-                        "initializer for ctype '{name}' is correct, but we get an internal mismatch--please report a bug"
-                    ));
-                }
-                return PyError::type_error(format!(
-                    "initializer for ctype '{name}' appears indeed to be '{}', but the types are different (check that you are not e.g. mixing up different ffi instances)",
-                    got_ctype.name()
-                ));
-            }
-            return PyError::type_error(format!(
-                "initializer for ctype '{name}' must be a {expected}, not cdata '{}'",
-                got_ctype.name()
-            ));
-        }
-        PyError::type_error(format!(
-            "initializer for ctype '{name}' must be a {expected}, not {}",
-            pyre_interpreter::type_methods::arg_type_name(w_got)
-        ))
-    }
-
     /// `W_CType.extra_repr` — what `<cdata '...' HERE>` shows.
     ///
     /// # Safety
@@ -488,14 +455,20 @@ pub unsafe fn convert_to_object(ct: &W_CType, cdata: usize) -> Result<PyObjectRe
         )),
         KIND_STRUCT | KIND_UNION => super::ctypestruct::convert_to_object(ct, cdata as *const u8),
         _ if ct.is_primitive() => unsafe { super::ctypeprim::convert_to_object(ct, cdata) },
-        _ => Err(cannot_return_cdata(ct)),
+        _ => Err(unsafe { PyError::from_exc_object(cannot_return_cdata(ct)) }),
     }
 }
 
 /// `W_CType.convert_to_object` — `oefmt("cannot return a cdata '%s'")`.
+///
+/// `error::oefmt` renders the message eagerly, so the rendering stays behind
+/// `dont_look_inside` and the helper answers the exception instance: one
+/// residual word, which the raise site wraps into the `PyError` the way
+/// `OperationError` stores `w_value`. The other `_cffi_backend` `oefmt`
+/// leaves take the same shape.
 #[majit_macros::dont_look_inside]
-pub(crate) fn cannot_return_cdata(ct: &W_CType) -> PyError {
-    PyError::type_error(format!("cannot return a cdata '{}'", ct.name()))
+pub(crate) fn cannot_return_cdata(ct: &W_CType) -> PyObjectRef {
+    PyError::type_error(format!("cannot return a cdata '{}'", ct.name())).to_exc_object()
 }
 
 /// `W_CType.copy_and_convert_to_object` — `void` answers `None` rather than
@@ -541,14 +514,56 @@ pub unsafe fn convert_from_object(
             super::ctypestruct::convert_from_object(ct, cdata as *mut u8, w_ob)
         },
         _ if ct.is_primitive() => unsafe { super::ctypeprim::convert_from_object(ct, cdata, w_ob) },
-        _ => Err(cannot_initialize_cdata(ct)),
+        _ => Err(unsafe { PyError::from_exc_object(cannot_initialize_cdata(ct)) }),
     }
 }
 
 /// `W_CType.convert_from_object` — `oefmt("cannot initialize cdata '%s'")`.
 #[majit_macros::dont_look_inside]
-pub(crate) fn cannot_initialize_cdata(ct: &W_CType) -> PyError {
-    PyError::type_error(format!("cannot initialize cdata '{}'", ct.name()))
+pub(crate) fn cannot_initialize_cdata(ct: &W_CType) -> PyObjectRef {
+    PyError::type_error(format!("cannot initialize cdata '{}'", ct.name())).to_exc_object()
+}
+
+/// `W_CType._convert_error` — the initializer-mismatch TypeError, with the
+/// two special cases a same-named cdata gets.
+///
+/// Shaped as [`cannot_return_cdata`]. `expected` is one of the callers'
+/// literals, passed through a `'static` reference because a `&str` is two
+/// words and the residual ABI passes one per argument.
+#[majit_macros::dont_look_inside]
+pub(crate) fn convert_error(
+    ct: &W_CType,
+    expected: &'static &'static str,
+    w_got: PyObjectRef,
+) -> PyObjectRef {
+    let name = ct.name();
+    let mut error = if let Some(got) = W_CData::from_obj(w_got)
+        && let Some(got_ctype) = ctype_at(got.ctype)
+    {
+        if name == got_ctype.name() {
+            if std::ptr::eq(ct, got_ctype) {
+                PyError::system_error(format!(
+                    "initializer for ctype '{name}' is correct, but we get an internal mismatch--please report a bug"
+                ))
+            } else {
+                PyError::type_error(format!(
+                    "initializer for ctype '{name}' appears indeed to be '{}', but the types are different (check that you are not e.g. mixing up different ffi instances)",
+                    got_ctype.name()
+                ))
+            }
+        } else {
+            PyError::type_error(format!(
+                "initializer for ctype '{name}' must be a {expected}, not cdata '{}'",
+                got_ctype.name()
+            ))
+        }
+    } else {
+        PyError::type_error(format!(
+            "initializer for ctype '{name}' must be a {expected}, not {}",
+            pyre_interpreter::type_methods::arg_type_name(w_got)
+        ))
+    };
+    error.to_exc_object()
 }
 
 /// `W_CType.cast`.

@@ -457,12 +457,6 @@ mod imp {
         let resultdata = (exchange_buffer + unsafe { exchange_result(cif_description) })
             as *mut std::ffi::c_void;
         let descr = unsafe { header(cif_description) };
-        // `clibffi.py c_ffi_call` is an `external(..., save_err=RFFI_ERR_ALL
-        // | RFFI_ALT_ERRNO)`.  The JIT path records the same flags on
-        // `CALL_RELEASE_GIL` (`pyjitpl.py direct_libffi_call`); the
-        // interpreter path has to do the swap here, or `_call` would need
-        // the two residuals PyPy's `_call` does not have.
-        super::super::cerrno::errno_before();
         unsafe {
             libffi::low::call_return_into(
                 &raw mut descr.cif,
@@ -471,7 +465,6 @@ mod imp {
                 resultdata,
             );
         }
-        super::super::cerrno::errno_after();
     }
 }
 

@@ -369,7 +369,9 @@ pub unsafe fn convert_struct_from_object(
                         break;
                     }
                     None => {
-                        return Err(too_many_struct_initializers(ct, items.len()));
+                        return Err(unsafe {
+                            PyError::from_exc_object(too_many_struct_initializers(ct, items.len()))
+                        });
                     }
                 }
             }
@@ -401,22 +403,25 @@ pub unsafe fn convert_struct_from_object(
         }
         return Ok(optvarsize);
     }
-    let expected = if optvarsize == -1 {
-        "list or tuple or dict or struct-cdata"
+    let expected: &'static &'static str = if optvarsize == -1 {
+        &"list or tuple or dict or struct-cdata"
     } else {
-        "list or tuple or dict"
+        &"list or tuple or dict"
     };
-    Err(ct.convert_error(expected, roots.get(ob_slot)))
+    Err(unsafe {
+        PyError::from_exc_object(ctypeobj::convert_error(ct, expected, roots.get(ob_slot)))
+    })
 }
 
 /// `W_CTypeStructOrUnion.convert_struct_from_object` — `oefmt`.
 #[majit_macros::dont_look_inside]
-pub(crate) fn too_many_struct_initializers(ct: &W_CType, got: usize) -> PyError {
+pub(crate) fn too_many_struct_initializers(ct: &W_CType, got: usize) -> PyObjectRef {
     PyError::value_error(format!(
         "too many initializers for '{}' (got {})",
         ct.name(),
         got
     ))
+    .to_exc_object()
 }
 
 /// The `W_CField`s of a completed struct, in declaration order.

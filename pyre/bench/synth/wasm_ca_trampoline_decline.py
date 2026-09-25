@@ -1,8 +1,3 @@
-# pyre-check: ungated-jitstats=fbw_blackhole_adopted_multi_frame,fbw_blackhole_adopted_single_frame
-# Local dynasm reads single_frame=1 multi_frame=0. Ubuntu, macOS and
-# Windows CI read the opposite, with loops_compiled=2 and
-# bridges_compiled=1 on every host. The adoption shape is not a
-# function of this tree.
 # Regression for wasm CA frames: this self-recursive body reaches the raw
 # float-power residual call (CallF, hence the host jit_call trampoline) and
 # allocates a string at every recursive level. Once the recursion bridge is

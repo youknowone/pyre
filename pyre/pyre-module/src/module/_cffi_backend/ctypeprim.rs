@@ -93,7 +93,7 @@ pub unsafe fn convert_to_object(ct: &W_CType, cdata: usize) -> Result<PyObjectRe
                 let imag = misc::read_raw_float_data(cdata + half as usize, half)?;
                 Ok(pyre_object::complexobject::w_complex_new(real, imag))
             }
-            _ => Err(cannot_return_cdata(ct)),
+            _ => Err(unsafe { PyError::from_exc_object(ctypeobj::cannot_return_cdata(ct)) }),
         }
     }
 }
@@ -178,7 +178,9 @@ pub unsafe fn convert_from_object(
                     if ct.has(ctypeobj::CTypeFlags::VALUE_SMALLER_THAN_LONG)
                         && value != misc::signext(value, ct.size)
                     {
-                        return Err(overflow(ct, roots.get(ob_slot)));
+                        return Err(unsafe {
+                            PyError::from_exc_object(overflow(ct, roots.get(ob_slot)))
+                        });
                     }
                     misc::write_raw_signed_data(cdata, value, ct.size)
                 } else {
@@ -194,7 +196,9 @@ pub unsafe fn convert_from_object(
                     let _ = roots.pin_root(w_ob);
                     let value = misc::as_unsigned_long(roots.get(ob_slot), true)?;
                     if ct.has(ctypeobj::CTypeFlags::VALUE_FITS_LONG) && value > vrange_max(ct) {
-                        return Err(overflow(ct, roots.get(ob_slot)));
+                        return Err(unsafe {
+                            PyError::from_exc_object(overflow(ct, roots.get(ob_slot)))
+                        });
                     }
                     misc::write_raw_unsigned_data(cdata, value, ct.size)
                 } else {
@@ -207,7 +211,7 @@ pub unsafe fn convert_from_object(
             ctypeobj::KIND_PRIM_LONGDOUBLE => convert_from_object_longdouble(ct, cdata, w_ob),
             // `W_CTypePrimitiveComplex.convert_from_object`.
             ctypeobj::KIND_PRIM_COMPLEX => convert_from_object_complex(ct, cdata, w_ob),
-            _ => Err(cannot_initialize_cdata(ct)),
+            _ => Err(unsafe { PyError::from_exc_object(ctypeobj::cannot_initialize_cdata(ct)) }),
         }
     }
 }
@@ -486,7 +490,7 @@ pub unsafe fn pack_list_of_items(
                 if ct.has(ctypeobj::CTypeFlags::VALUE_SMALLER_THAN_LONG)
                     && value != misc::signext(value, ct.size)
                 {
-                    return Err(overflow_value(ct, value));
+                    return Err(unsafe { PyError::from_exc_object(overflow_value(ct, value)) });
                 }
                 unsafe {
                     misc::write_raw_signed_data(
@@ -622,16 +626,20 @@ unsafe fn read_bool_0_or_1(cdata: *const u8) -> Result<u8, PyError> {
 /// `W_CTypePrimitiveUniChar.convert_to_object`'s code-point check.
 fn unichr(ct: &W_CType, value: u32) -> Result<PyObjectRef, PyError> {
     if value > 0x10FFFF {
-        return Err(unichr_out_of_range(ct, value));
+        return Err(unsafe { PyError::from_exc_object(unichr_out_of_range(ct, value)) });
     }
     Ok(pyre_object::w_str_from_codepoint(value))
 }
 
-/// `W_CTypePrimitiveUniChar.convert_to_object` — `oefmt("%s out of range...")`.
+/// `W_CTypePrimitiveUniChar.convert_to_object` — `oefmt("%s out of range
+/// for conversion to unicode: %s", self.name, s)`.
 #[majit_macros::dont_look_inside]
-pub(crate) fn unichr_out_of_range(ct: &W_CType, value: u32) -> PyError {
+pub(crate) fn unichr_out_of_range(ct: &W_CType, value: u32) -> PyObjectRef {
+    // `value` is the `r_uint` word `misc.read_raw_ulong_data` returned, so
+    // `hex(intmask(value))` and `hex(value)` both see a non-negative word.
+    let value = value as u64;
     let rendered = if ct.has(ctypeobj::CTypeFlags::SIGNED_WCHAR) {
-        format!("{:#x}", value as i32)
+        format!("{:#x}", value as i64)
     } else {
         format!("{value:#x}")
     };
@@ -639,6 +647,7 @@ pub(crate) fn unichr_out_of_range(ct: &W_CType, value: u32) -> PyError {
         "{} out of range for conversion to unicode: {rendered}",
         ct.name()
     ))
+    .to_exc_object()
 }
 
 /// `W_CTypePrimitiveChar._convert_to_char`.
@@ -655,20 +664,30 @@ fn convert_to_char(ct: &W_CType, w_ob: PyObjectRef) -> Result<u8, PyError> {
     {
         return Ok(misc::raw_read_u8(source.ptr) as u8);
     }
-    Err(ct.convert_error("string of length 1", w_ob))
+    Err(unsafe {
+        PyError::from_exc_object(ctypeobj::convert_error(ct, &"string of length 1", w_ob))
+    })
 }
 
 /// `W_CTypePrimitiveUniChar._convert_to_charN_t`.
-pub(crate) fn convert_to_char_n_t(ct: &W_CType, w_ob: PyObjectRef) -> Result<u32, PyError> {
+fn convert_to_char_n_t(ct: &W_CType, w_ob: PyObjectRef) -> Result<u32, PyError> {
     if unsafe { pyre_object::unicodeobject::is_str(w_ob) } {
         let value = unsafe { pyre_object::w_str_get_wtf8(w_ob) };
         let mut points = value.code_points();
         let (Some(point), None) = (points.next(), points.next()) else {
-            return Err(ct.convert_error("single character", w_ob));
+            return Err(unsafe {
+                PyError::from_exc_object(ctypeobj::convert_error(ct, &"single character", w_ob))
+            });
         };
         let ordinal = point.to_u32();
         if ct.size == 2 && ordinal > 0xFFFF {
-            return Err(ct.convert_error("single character <= 0xFFFF", w_ob));
+            return Err(unsafe {
+                PyError::from_exc_object(ctypeobj::convert_error(
+                    ct,
+                    &"single character <= 0xFFFF",
+                    w_ob,
+                ))
+            });
         }
         return Ok(ordinal);
     }
@@ -679,7 +698,13 @@ pub(crate) fn convert_to_char_n_t(ct: &W_CType, w_ob: PyObjectRef) -> Result<u32
     {
         return Ok(unsafe { misc::read_raw_unsigned_data(source.ptr, ct.size)? } as u32);
     }
-    Err(ct.convert_error("unicode string of length 1", w_ob))
+    Err(unsafe {
+        PyError::from_exc_object(ctypeobj::convert_error(
+            ct,
+            &"unicode string of length 1",
+            w_ob,
+        ))
+    })
 }
 
 /// `space.unpackcomplex`, which is [`pyre_interpreter::builtins::complex_coerce`] here:
@@ -690,7 +715,7 @@ fn unpack_complex(w_ob: PyObjectRef) -> Result<(f64, f64), PyError> {
 }
 
 /// `W_CTypePrimitiveFloat.convert_from_object`.
-pub(crate) unsafe fn convert_from_object_float(
+unsafe fn convert_from_object_float(
     ct: &W_CType,
     cdata: usize,
     w_ob: PyObjectRef,
@@ -700,7 +725,7 @@ pub(crate) unsafe fn convert_from_object_float(
 }
 
 /// `W_CTypePrimitiveLongDouble.convert_from_object`.
-pub(crate) unsafe fn convert_from_object_longdouble(
+unsafe fn convert_from_object_longdouble(
     ct: &W_CType,
     cdata: usize,
     w_ob: PyObjectRef,
@@ -723,7 +748,7 @@ pub(crate) unsafe fn convert_from_object_longdouble(
 }
 
 /// `W_CTypePrimitiveComplex.convert_from_object`.
-pub(crate) unsafe fn convert_from_object_complex(
+unsafe fn convert_from_object_complex(
     ct: &W_CType,
     cdata: usize,
     w_ob: PyObjectRef,
@@ -736,21 +761,9 @@ pub(crate) unsafe fn convert_from_object_complex(
     }
 }
 
-/// `W_CType.convert_to_object` — `oefmt("cannot return a cdata '%s'")`.
-#[majit_macros::dont_look_inside]
-pub(crate) fn cannot_return_cdata(ct: &W_CType) -> PyError {
-    PyError::type_error(format!("cannot return a cdata '{}'", ct.name()))
-}
-
-/// `W_CType.convert_from_object` — `oefmt("cannot initialize cdata '%s'")`.
-#[majit_macros::dont_look_inside]
-pub(crate) fn cannot_initialize_cdata(ct: &W_CType) -> PyError {
-    PyError::type_error(format!("cannot initialize cdata '{}'", ct.name()))
-}
-
 /// `W_CTypePrimitive._overflow` — `oefmt("integer %s does not fit '%s'")`.
 #[majit_macros::dont_look_inside]
-pub(crate) fn overflow(ct: &W_CType, w_ob: PyObjectRef) -> PyError {
+pub(crate) fn overflow(ct: &W_CType, w_ob: PyObjectRef) -> PyObjectRef {
     let rendered = pyre_interpreter::builtins::builtin_str(&[w_ob])
         .map(|w| {
             pyre_interpreter::baseobjspace::str_utf8_w(w)
@@ -760,12 +773,13 @@ pub(crate) fn overflow(ct: &W_CType, w_ob: PyObjectRef) -> PyError {
         })
         .unwrap_or_default();
     PyError::overflow_error(format!("integer {rendered} does not fit '{}'", ct.name()))
+        .to_exc_object()
 }
 
 /// `W_CTypePrimitive._overflow` for a machine-int that missed the range.
 #[majit_macros::dont_look_inside]
-pub(crate) fn overflow_value(ct: &W_CType, value: i64) -> PyError {
-    PyError::overflow_error(format!("integer {value} does not fit '{}'", ct.name()))
+pub(crate) fn overflow_value(ct: &W_CType, value: i64) -> PyObjectRef {
+    PyError::overflow_error(format!("integer {value} does not fit '{}'", ct.name())).to_exc_object()
 }
 
 /// `space.listview_int`'s per-item test: an `int` already in a word.
