@@ -4,7 +4,7 @@ pub mod interp_time;
 
 use interp_time as t;
 
-crate::py_module! {
+pyre_interpreter::py_module! {
     "time",
     interpleveldefs: {
         // `app_time.py class struct_time` — exposed as `time.struct_time`.
@@ -50,27 +50,27 @@ crate::py_module! {
         // CPython exposes a different surface there.)
         #[cfg(all(unix, feature = "host_env"))]
         {
-            crate::module_ns_store(ns, "clock_gettime",
-                crate::make_builtin_function_with_arity("clock_gettime", t::clock_gettime, 1));
-            crate::module_ns_store(ns, "clock_gettime_ns",
-                crate::make_builtin_function_with_arity("clock_gettime_ns", t::clock_gettime_ns, 1));
+            pyre_interpreter::module_ns_store(ns, "clock_gettime",
+                pyre_interpreter::make_builtin_function_with_arity("clock_gettime", t::clock_gettime, 1));
+            pyre_interpreter::module_ns_store(ns, "clock_gettime_ns",
+                pyre_interpreter::make_builtin_function_with_arity("clock_gettime_ns", t::clock_gettime_ns, 1));
             #[cfg(not(target_os = "redox"))]
             {
-                crate::module_ns_store(ns, "clock_getres",
-                    crate::make_builtin_function_with_arity("clock_getres", t::clock_getres, 1));
+                pyre_interpreter::module_ns_store(ns, "clock_getres",
+                    pyre_interpreter::make_builtin_function_with_arity("clock_getres", t::clock_getres, 1));
                 // clock_settime{,_ns} set the system clock (a privileged
                 // syscall that escapes mediation); omit them under sandbox.
                 #[cfg(not(feature = "sandbox"))]
                 {
-                    crate::module_ns_store(ns, "clock_settime",
-                        crate::make_builtin_function_with_arity("clock_settime", t::clock_settime, 2));
-                    crate::module_ns_store(ns, "clock_settime_ns",
-                        crate::make_builtin_function_with_arity("clock_settime_ns", t::clock_settime_ns, 2));
+                    pyre_interpreter::module_ns_store(ns, "clock_settime",
+                        pyre_interpreter::make_builtin_function_with_arity("clock_settime", t::clock_settime, 2));
+                    pyre_interpreter::module_ns_store(ns, "clock_settime_ns",
+                        pyre_interpreter::make_builtin_function_with_arity("clock_settime_ns", t::clock_settime_ns, 2));
                 }
             }
-            crate::module_ns_store(ns, "CLOCK_REALTIME",
+            pyre_interpreter::module_ns_store(ns, "CLOCK_REALTIME",
                 pyre_object::w_int_new(libc::CLOCK_REALTIME as i64));
-            crate::module_ns_store(ns, "CLOCK_MONOTONIC",
+            pyre_interpreter::module_ns_store(ns, "CLOCK_MONOTONIC",
                 pyre_object::w_int_new(libc::CLOCK_MONOTONIC as i64));
             // The two darwin clocks that keep counting across sleep, and the
             // `_APPROX` pair that read a cached value instead of taking the
@@ -82,7 +82,7 @@ crate::py_module! {
                 ("CLOCK_UPTIME_RAW", libc::CLOCK_UPTIME_RAW as i64),
                 ("CLOCK_UPTIME_RAW_APPROX", libc::CLOCK_UPTIME_RAW_APPROX as i64),
             ] {
-                crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+                pyre_interpreter::module_ns_store(ns, name, pyre_object::w_int_new(val));
             }
             #[cfg(not(any(
                 target_os = "illumos",
@@ -91,7 +91,7 @@ crate::py_module! {
                 target_os = "openbsd",
                 target_os = "wasi",
             )))]
-            crate::module_ns_store(ns, "CLOCK_PROCESS_CPUTIME_ID",
+            pyre_interpreter::module_ns_store(ns, "CLOCK_PROCESS_CPUTIME_ID",
                 pyre_object::w_int_new(libc::CLOCK_PROCESS_CPUTIME_ID as i64));
             #[cfg(not(any(
                 target_os = "illumos",
@@ -101,15 +101,15 @@ crate::py_module! {
                 target_os = "redox",
             )))]
             {
-                crate::module_ns_store(ns, "CLOCK_THREAD_CPUTIME_ID",
+                pyre_interpreter::module_ns_store(ns, "CLOCK_THREAD_CPUTIME_ID",
                     pyre_object::w_int_new(libc::CLOCK_THREAD_CPUTIME_ID as i64));
                 // thread_time reads CLOCK_THREAD_CPUTIME_ID, so it is exposed on
                 // exactly the platforms that carry the constant — the same gate
                 // `_get_time_info` uses for its "thread_time" arm.
-                crate::module_ns_store(ns, "thread_time",
-                    crate::make_builtin_function_with_arity("thread_time", t::thread_time, 0));
-                crate::module_ns_store(ns, "thread_time_ns",
-                    crate::make_builtin_function_with_arity("thread_time_ns", t::thread_time_ns, 0));
+                pyre_interpreter::module_ns_store(ns, "thread_time",
+                    pyre_interpreter::make_builtin_function_with_arity("thread_time", t::thread_time, 0));
+                pyre_interpreter::module_ns_store(ns, "thread_time_ns",
+                    pyre_interpreter::make_builtin_function_with_arity("thread_time_ns", t::thread_time_ns, 0));
             }
         }
         // `Module.startup` calls `_init_timezone`, and exposes `tzset` on
@@ -120,10 +120,10 @@ crate::py_module! {
         #[cfg(all(unix, not(feature = "sandbox")))]
         {
             t::init_timezone(ns);
-            crate::module_ns_store(
+            pyre_interpreter::module_ns_store(
                 ns,
                 "tzset",
-                crate::make_builtin_function_with_arity("tzset", t::tzset, 0),
+                pyre_interpreter::make_builtin_function_with_arity("tzset", t::tzset, 0),
             );
         }
         // Windows reads the same four attributes off the host zone record.
@@ -135,10 +135,10 @@ crate::py_module! {
             // `GetThreadTimes` is unconditional on Windows, so `thread_time`
             // is published there for the same reason the Unix arm publishes
             // it wherever `CLOCK_THREAD_CPUTIME_ID` exists.
-            crate::module_ns_store(ns, "thread_time",
-                crate::make_builtin_function_with_arity("thread_time", t::thread_time, 0));
-            crate::module_ns_store(ns, "thread_time_ns",
-                crate::make_builtin_function_with_arity("thread_time_ns", t::thread_time_ns, 0));
+            pyre_interpreter::module_ns_store(ns, "thread_time",
+                pyre_interpreter::make_builtin_function_with_arity("thread_time", t::thread_time, 0));
+            pyre_interpreter::module_ns_store(ns, "thread_time_ns",
+                pyre_interpreter::make_builtin_function_with_arity("thread_time_ns", t::thread_time_ns, 0));
         }
         // localtime/mktime/ctime/strftime consult $TZ + /etc/localtime (and
         // the LC_TIME locale DB), reading host state outside the controller;
@@ -147,14 +147,14 @@ crate::py_module! {
         {
             fn tz_unavailable(
                 _: &[pyre_object::PyObjectRef],
-            ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-                Err(crate::host_seam::stub("this time function"))
+            ) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+                Err(pyre_interpreter::host_seam::stub("this time function"))
             }
             for name in ["localtime", "mktime", "ctime", "strftime"] {
-                crate::module_ns_store(
+                pyre_interpreter::module_ns_store(
                     ns,
                     name,
-                    crate::make_builtin_function(name, tz_unavailable),
+                    pyre_interpreter::make_builtin_function(name, tz_unavailable),
                 );
             }
         }

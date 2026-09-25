@@ -384,7 +384,7 @@ pub(super) fn cdata_in_dll(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_int
         return pyre_interpreter::call::type_call_instantiate(cls, &[optimize]);
     }
     if let Some(pointer_variable) =
-        pyre_interpreter::module::imp::interp_imp::frozen_abi_pointer_variable(name)
+        crate::module::imp::interp_imp::frozen_abi_pointer_variable(name)
     {
         return Ok(make_at_address(cls, pointer_variable, size, args[1]));
     }

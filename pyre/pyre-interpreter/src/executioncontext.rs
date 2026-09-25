@@ -924,7 +924,9 @@ impl ExecutionContext {
             SPACE_CPYEXT_DEALLOC_ACTION
                 .get_or_init(|| Box::into_raw(PyObjDeallocAction::new(space, actionflag)) as usize);
         }
-        crate::module::gc::hook::initialize(self.space, actionflag);
+        if let Some(hooks) = crate::importing::optional_module_hooks() {
+            (hooks.gc_initialize)(self.space, actionflag);
+        }
         pyre_object::gc_hook::register_maybe_finalizer_hook(maybe_register_user_finalizer);
     }
 

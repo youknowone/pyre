@@ -7953,7 +7953,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // callback dispatcher.  Holding it across the host fork
                     // prevents a child from inheriting a partially initialized
                     // sys.modules entry from another thread.
-                    crate::module::imp::interp_imp::before_fork();
+                    if let Some(hooks) = crate::importing::optional_module_hooks() {
+                        (hooks.imp_before_fork)();
+                    }
                     // A free-threaded fork must snapshot native/Python lock
                     // state while every other mutator is parked.  Enter
                     // through the collector's full request path so no GC
@@ -7964,7 +7966,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         Ok(0) => {
                             crate::module::thread::after_fork_child();
                             run_fork_callbacks("child");
-                            crate::module::imp::interp_imp::after_fork_child();
+                            if let Some(hooks) = crate::importing::optional_module_hooks() {
+                                (hooks.imp_after_fork_child)();
+                            }
                             // CPython's refcounting drops the replaced
                             // `_MainThread` before os.fork() returns, so its
                             // weakref has disappeared from `_dangling` when
@@ -7981,7 +7985,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         }
                         Ok(pid) => {
                             run_fork_callbacks("parent");
-                            crate::module::imp::interp_imp::after_fork_parent()?;
+                            if let Some(hooks) = crate::importing::optional_module_hooks() {
+                                (hooks.imp_after_fork_parent)()?;
+                            }
                             drop(fork_serial);
                             Ok(pyre_object::w_int_new(pid as i64))
                         }
@@ -7989,7 +7995,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             run_fork_callbacks("parent");
                             // interp_posix.py:1570-1575 keeps the original
                             // fork OSError if a parent hook also fails.
-                            let _ = crate::module::imp::interp_imp::after_fork_parent();
+                            if let Some(hooks) = crate::importing::optional_module_hooks() {
+                                let _ = (hooks.imp_after_fork_parent)();
+                            }
                             drop(fork_serial);
                             Err(io_err(error, ""))
                         }

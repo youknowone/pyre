@@ -502,7 +502,7 @@ pub(crate) unsafe fn is_simple_namespace(obj: PyObjectRef) -> bool {
 /// full rich-comparison surface, pickle reducer and `__replace__`.  Storage
 /// remains PyPy-shaped: the values live in the instance dict, not a side
 /// table or a second native mapping.
-pub(crate) fn simple_namespace_type() -> PyObjectRef {
+pub fn simple_namespace_type() -> PyObjectRef {
     static TYPE: OnceLock<usize> = OnceLock::new();
     let raw = *TYPE.get_or_init(|| {
         // PyPy owns this as the app-level class

@@ -2895,6 +2895,7 @@ dependencies = [
  "majit-macros",
  "majit-metainterp",
  "majit-rlib",
+ "malachite-bigint",
  "num-complex",
  "num-traits",
  "parking_lot",
@@ -2909,6 +2910,7 @@ dependencies = [
  "rustpython-host_env",
  "rustpython-unicode",
  "rustpython-wtf8",
+ "siphasher",
  "widestring",
  "windows-sys 0.61.2",
 ]

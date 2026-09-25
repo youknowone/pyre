@@ -1294,6 +1294,7 @@ fn inline_call_callee_name(
 
 #[test]
 fn random_core_residuals_use_registered_genrand32_address() {
+    pyre_module::register();
     let bindings = pyre_interpreter::jit_trace_fnaddrs();
     let expected = bindings
         .iter()

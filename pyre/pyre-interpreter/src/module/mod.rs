@@ -15,22 +15,12 @@ pub mod _collections;
 pub mod _io;
 #[allow(non_snake_case)]
 pub mod _locale;
-#[allow(non_snake_case)]
-pub mod _pickle;
-#[allow(non_snake_case)]
-pub mod _random;
 pub mod _sre;
-#[allow(non_snake_case)]
-pub mod _types;
 pub mod _warnings;
 pub mod _weakref;
 pub mod array;
-pub mod gc;
-#[allow(non_snake_case)]
-pub mod imp;
 pub mod importlib;
 pub mod itertools;
-pub mod marshal;
 pub mod operator;
 pub mod posix;
 #[allow(non_snake_case)]
@@ -40,4 +30,3 @@ pub mod r#struct;
 pub mod sys;
 #[allow(non_snake_case)]
 pub mod thread;
-pub mod time;

@@ -7227,7 +7227,6 @@ mod tests {
     fn storage_class_mapdict_mixin_bit_admits_layout() {
         use pyre_object::lltype::PyreClassPyTypeOf;
         assert!(pyre_object::INSTANCE_TYPE.has_mapdict_mixin);
-        assert!(crate::module::_random::W_Random::HAS_MAPDICT_MIXIN);
         assert!(!pyre_object::INT_TYPE.has_mapdict_mixin);
         unsafe {
             let obj = pyre_object::w_instance_new(pyre_object::PY_NULL);

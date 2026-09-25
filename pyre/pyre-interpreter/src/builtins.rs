@@ -523,7 +523,7 @@ unsafe fn w_memoryview_new_mmap(
 /// value-model view.  Residualize the whole geometry/copy subtree behind
 /// this single `.gather()` call surface (`@jit.dont_look_inside`).
 #[majit_macros::dont_look_inside]
-pub(crate) unsafe fn memoryview_gather_bytes(mv: PyObjectRef) -> Vec<u8> {
+pub unsafe fn memoryview_gather_bytes(mv: PyObjectRef) -> Vec<u8> {
     unsafe { pyre_object::memoryview::w_memoryview_view(mv).gather() }
 }
 
@@ -5993,7 +5993,7 @@ pub fn space_index_w(obj: PyObjectRef) -> Result<i64, crate::PyError> {
 }
 
 /// Convert an int or long object to BigInt for comparison.
-pub(crate) unsafe fn obj_to_bigint(obj: PyObjectRef) -> BigInt {
+pub unsafe fn obj_to_bigint(obj: PyObjectRef) -> BigInt {
     unsafe {
         // PyPy's W_BoolObject subclasses W_IntObject and shares `intval`;
         // pyre uses a distinct layout, so preserve that upstream semantic arm
@@ -8184,6 +8184,7 @@ pub(crate) fn os_error_errno_subclass(errno: i64) -> Option<&'static str> {
 /// arguments the caller has already checked, and silencing the handler is a
 /// thread-local store the runtime itself offers for the purpose.
 #[cfg(not(target_arch = "wasm32"))]
+#[macro_export]
 macro_rules! crt_call {
     ($call:expr) => {{
         #[cfg(all(windows, feature = "host_env"))]
@@ -8196,7 +8197,7 @@ macro_rules! crt_call {
     }};
 }
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) use crt_call;
+pub use crt_call;
 
 /// `lseek`, taking and reporting the whole 64-bit file position.
 ///
@@ -8230,7 +8231,7 @@ pub(crate) fn crt_lseek(fd: libc::c_int, offset: i64, whence: libc::c_int) -> i6
 /// directive and an empty result).  Windows-only, which is where the runtime
 /// keeps a cell of its own that `std::io::Error::last_os_error` does not read.
 #[cfg(windows)]
-pub(crate) fn clear_crt_errno() {
+pub fn clear_crt_errno() {
     #[cfg(feature = "host_env")]
     {
         rustpython_host_env::os::clear_errno();
@@ -12112,7 +12113,7 @@ fn invalid_int_literal(w_source: PyObjectRef, base: u32) -> crate::PyError {
 }
 
 /// Parse an integer from a string with the given base.
-pub(crate) fn parse_int_from_str(
+pub fn parse_int_from_str(
     w_source: PyObjectRef,
     s: &str,
     base: u32,
@@ -17022,7 +17023,7 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 /// the supplied namespaces.  When the namespaces are dicts, pyre converts
 /// them into `DictStorage`s before invocation and copies the post-run
 /// namespace contents back so that callers see the new bindings.
-pub(crate) fn builtin_exec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn builtin_exec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `exec(source, /, globals=None, locals=None, *, closure=None)`: source is
     // positional-only; globals/locals are positional-or-keyword; `closure` is
     // keyword-only.  `closure` supplies the cell objects that bind a code

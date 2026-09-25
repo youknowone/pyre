@@ -2,7 +2,7 @@
 
 use pyre_object::PyObjectRef;
 
-use crate::PyError;
+use pyre_interpreter::PyError;
 
 use super::{
     HIGHEST_PROTOCOL, call_fn, call_meth, decode_long, import_module, op, parse_int_text,
@@ -15,7 +15,7 @@ enum PackedListKind {
     Bytes,
 }
 
-fn packed_list_sentinel_called(_args: &[PyObjectRef]) -> crate::PyResult {
+fn packed_list_sentinel_called(_args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     Err(unpickling_error(
         "internal packed-list unpickler sentinel is not callable",
     ))
@@ -34,7 +34,7 @@ fn packed_list_sentinel(kind: PackedListKind) -> PyObjectRef {
         PackedListKind::Bytes => &BYTES,
     };
     *cell.get_or_init(|| {
-        crate::make_builtin_function(
+        pyre_interpreter::make_builtin_function(
             match kind {
                 PackedListKind::Ascii => "_ascii_list_unpickle",
                 PackedListKind::Bytes => "_bytes_list_unpickle",
@@ -58,7 +58,7 @@ impl Drop for RunningGuard {
 
 // CPython 3.14 Modules/_pickle.c:pickle_exec CREATE_TYPEs
 // unpickler_type_spec; the spec is an immutable heap type.
-#[crate::pyre_class("_pickle.Unpickler", cpython_heaptype)]
+#[pyre_interpreter::pyre_class("_pickle.Unpickler", cpython_heaptype)]
 pub struct W_Unpickler {
     w_file_read: PyObjectRef,
     w_file_readline: PyObjectRef,
@@ -96,7 +96,7 @@ pub struct W_Unpickler {
     running: bool,
 }
 
-#[crate::pyre_methods(
+#[pyre_interpreter::pyre_methods(
     doc = "Unpickler(file) -> unpickler reading from file.",
     _text_signature_ = "(file, *, fix_imports=True, encoding='ASCII', errors='strict', buffers=())"
 )]
@@ -179,7 +179,7 @@ impl W_Unpickler {
         } else {
             return Err(PyError::type_error(format!(
                 "Unpickler() argument 'encoding' must be str, not {}",
-                crate::baseobjspace::object_functionstr_type_name(encoding)
+                pyre_interpreter::baseobjspace::object_functionstr_type_name(encoding)
             )));
         };
         let errors = pyre_object::gc_roots::shadow_stack_get(errors_slot);
@@ -190,24 +190,24 @@ impl W_Unpickler {
         } else {
             return Err(PyError::type_error(format!(
                 "Unpickler() argument 'errors' must be str, not {}",
-                crate::baseobjspace::object_functionstr_type_name(errors)
+                pyre_interpreter::baseobjspace::object_functionstr_type_name(errors)
             )));
         };
-        let fix_imports = crate::baseobjspace::is_true(pyre_object::gc_roots::shadow_stack_get(
-            fix_imports_slot,
-        ))?;
+        let fix_imports = pyre_interpreter::baseobjspace::is_true(
+            pyre_object::gc_roots::shadow_stack_get(fix_imports_slot),
+        )?;
         // `file` must expose both `read` and `readline`; a missing either is a
         // TypeError, not the bare AttributeError a direct `getattr` surfaces
         // (`_Unpickler_SetInputStream`). Store `read` before resolving
         // `readline` so the first bound method is rooted across that allocation.
-        let w_file_read = crate::baseobjspace::findattr_result(
+        let w_file_read = pyre_interpreter::baseobjspace::findattr_result(
             pyre_object::gc_roots::shadow_stack_get(file_slot),
             "read",
         )?
         .unwrap_or(pyre_object::PY_NULL);
         let _ = pyre_object::gc_roots::pin_root(w_file_read);
         let read_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let w_file_readline = crate::baseobjspace::findattr_result(
+        let w_file_readline = pyre_interpreter::baseobjspace::findattr_result(
             pyre_object::gc_roots::shadow_stack_get(file_slot),
             "readline",
         )?
@@ -231,7 +231,7 @@ impl W_Unpickler {
         let w_buffers = if unsafe { pyre_object::is_none(buffers) } {
             pyre_object::w_none()
         } else {
-            crate::baseobjspace::iter(buffers)?
+            pyre_interpreter::baseobjspace::iter(buffers)?
         };
         let current = cur(self_slot);
         current.encoding = encoding;
@@ -270,7 +270,7 @@ impl W_Unpickler {
         if unsafe { pyre_object::is_none(cur(slot).w_file_read) } {
             // interp_pickle.py:2030-2039 — a subclass constructed without a
             // file may provide `read` and `readline` methods itself.
-            let Some(w_read) = crate::baseobjspace::findattr_result(
+            let Some(w_read) = pyre_interpreter::baseobjspace::findattr_result(
                 pyre_object::gc_roots::shadow_stack_get(slot),
                 "read",
             )?
@@ -279,7 +279,7 @@ impl W_Unpickler {
             };
             let _ = pyre_object::gc_roots::pin_root(w_read);
             let read_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-            let Some(w_readline) = crate::baseobjspace::findattr_result(
+            let Some(w_readline) = pyre_interpreter::baseobjspace::findattr_result(
                 pyre_object::gc_roots::shadow_stack_get(slot),
                 "readline",
             )?
@@ -347,7 +347,7 @@ impl W_Unpickler {
         if !unsafe { pyre_object::is_str(w_name) } {
             return Err(PyError::type_error(format!(
                 "attribute name must be string, not '{}'",
-                crate::baseobjspace::object_functionstr_type_name(w_name)
+                pyre_interpreter::baseobjspace::object_functionstr_type_name(w_name)
             )));
         }
         let module = unsafe { pyre_object::unicodeobject::w_str_get_value_opt(w_module) };
@@ -357,10 +357,10 @@ impl W_Unpickler {
             let module_obj = if let Some(module) = module {
                 import_module(module)?
             } else {
-                let modules = crate::importing::sys_modules_dict();
+                let modules = pyre_interpreter::importing::sys_modules_dict();
                 unsafe { pyre_object::w_dict_lookup(modules, w_module) }.ok_or_else(|| {
                     PyError::new(
-                        crate::PyErrorKind::ModuleNotFoundError,
+                        pyre_interpreter::PyErrorKind::ModuleNotFoundError,
                         "No module named by surrogate identifier",
                     )
                 })?
@@ -395,7 +395,8 @@ impl W_Unpickler {
             match resolve_dotted_find_class(w_module, &name) {
                 Ok(value) => Ok(value),
                 Err(error)
-                    if error.kind == crate::PyErrorKind::AttributeError && name.contains('.') =>
+                    if error.kind == pyre_interpreter::PyErrorKind::AttributeError
+                        && name.contains('.') =>
                 {
                     Err(attribute_error_with_context(
                         format!(
@@ -409,7 +410,7 @@ impl W_Unpickler {
                 Err(error) => Err(error),
             }
         } else {
-            crate::baseobjspace::getattr_str(w_module, &name)
+            pyre_interpreter::baseobjspace::getattr_str(w_module, &name)
         }
     }
 
@@ -437,7 +438,7 @@ impl W_Unpickler {
         let cls = type_object();
         let _ = pyre_object::gc_roots::pin_root(cls);
         let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let descr = crate::runtime_ops::type_dict_lookup(
+        let descr = pyre_interpreter::runtime_ops::type_dict_lookup(
             pyre_object::gc_roots::shadow_stack_get(cls_slot),
             "__persistent_load_default",
         )
@@ -522,7 +523,7 @@ impl W_Unpickler {
                 if !unsafe { pyre_object::is_int(*k) } {
                     return Err(PyError::type_error("memo key must be integers"));
                 }
-                if crate::baseobjspace::int_w(*k)? < 0 {
+                if pyre_interpreter::baseobjspace::int_w(*k)? < 0 {
                     return Err(PyError::value_error("memo key must be positive integers."));
                 }
             }
@@ -536,7 +537,7 @@ impl W_Unpickler {
         } else {
             return Err(PyError::type_error(format!(
                 "'memo' attribute must be an UnpicklerMemoProxy object or dict, not {}",
-                crate::baseobjspace::object_functionstr_type_name(w_value),
+                pyre_interpreter::baseobjspace::object_functionstr_type_name(w_value),
             )));
         }
         Ok(())
@@ -559,7 +560,7 @@ fn resolve_dotted_find_class(
     qualname: &str,
 ) -> Result<PyObjectRef, PyError> {
     for component in qualname.split('.') {
-        object = crate::baseobjspace::getattr_str(object, component)?;
+        object = pyre_interpreter::baseobjspace::getattr_str(object, component)?;
     }
     Ok(object)
 }
@@ -594,12 +595,12 @@ mod memo_proxy {
     use super::*;
 
     // Modules/_pickle.c:pickle_exec CREATE_TYPEs unpickler_memoproxy_spec too.
-    #[crate::pyre_class("_pickle.UnpicklerMemoProxy", cpython_heaptype)]
+    #[pyre_interpreter::pyre_class("_pickle.UnpicklerMemoProxy", cpython_heaptype)]
     pub struct UnpicklerMemoProxy {
         pub(super) w_unpickler: PyObjectRef,
     }
 
-    #[crate::pyre_methods(doc = "Proxy for an Unpickler's memo.")]
+    #[pyre_interpreter::pyre_methods(doc = "Proxy for an Unpickler's memo.")]
     impl UnpicklerMemoProxy {
         /// `UnpicklerMemoProxy.copy` — a shallow `{index: obj}` copy of the memo,
         /// projecting the position-indexed memo list (NULL slots omitted).
@@ -741,7 +742,7 @@ fn load_next_buffer(slot: usize) -> Result<(), PyError> {
             "pickle stream refers to out-of-band data but no *buffers* argument was given",
         ));
     }
-    let w_buf = match crate::baseobjspace::next(w_buffers) {
+    let w_buf = match pyre_interpreter::baseobjspace::next(w_buffers) {
         Ok(b) => b,
         Err(e) if e.matches_stop_iteration() => {
             return Err(unpickling_error("not enough out-of-band buffers"));
@@ -766,7 +767,7 @@ fn load_readonly_buffer(slot: usize) -> Result<(), PyError> {
 
 /// The `memoryview` builtin type via the live execution context.
 fn memoryview_type() -> Result<PyObjectRef, PyError> {
-    let ec = crate::call::getexecutioncontext();
+    let ec = pyre_interpreter::call::getexecutioncontext();
     if ec.is_null() {
         return Err(unpickling_error("memoryview type unavailable"));
     }
@@ -840,14 +841,14 @@ fn memo_list_from_dict(w_dict: PyObjectRef) -> Result<(PyObjectRef, i64), PyErro
     let items = unsafe { pyre_object::dictmultiobject::w_dict_items(w_dict) };
     let mut max_idx: i64 = -1;
     for (k, _) in &items {
-        let idx = crate::baseobjspace::int_w(*k)?;
+        let idx = pyre_interpreter::baseobjspace::int_w(*k)?;
         if idx > max_idx {
             max_idx = idx;
         }
     }
     let mut slots: Vec<PyObjectRef> = vec![pyre_object::PY_NULL; (max_idx + 1) as usize];
     for (k, v) in &items {
-        let idx = crate::baseobjspace::int_w(*k)? as usize;
+        let idx = pyre_interpreter::baseobjspace::int_w(*k)? as usize;
         slots[idx] = *v;
     }
     Ok((
@@ -868,7 +869,7 @@ enum ShortRead {
 }
 
 fn eof_error(message: &str) -> PyError {
-    PyError::new(crate::PyErrorKind::EOFError, message)
+    PyError::new(pyre_interpreter::PyErrorKind::EOFError, message)
 }
 
 /// Read the dispatch loop's next opcode byte.  A stream ending between
@@ -1139,7 +1140,7 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
             let _ = pyre_object::gc_roots::pin_root(items);
             let items_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let w_list = top(slot, "APPENDS")?;
-            match crate::baseobjspace::findattr_result(w_list, "extend")? {
+            match pyre_interpreter::baseobjspace::findattr_result(w_list, "extend")? {
                 Some(extend) if !unsafe { pyre_object::is_none(extend) } => {
                     call_fn(
                         extend,
@@ -1180,7 +1181,7 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
             let value = pop(slot)?;
             let key = pop(slot)?;
             let w_dict = top(slot, "SETITEM")?;
-            crate::baseobjspace::setitem(w_dict, key, value)?;
+            pyre_interpreter::baseobjspace::setitem(w_dict, key, value)?;
         }
         x if x == op::SETITEMS => {
             let items = pop_mark(slot)?;
@@ -1199,8 +1200,9 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
             let _ = pyre_object::gc_roots::pin_root(items);
             let items_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let w_set = top(slot, "ADDITEMS")?;
-            let w_set_type = crate::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE);
-            if unsafe { crate::baseobjspace::isinstance_w(w_set, w_set_type) } {
+            let w_set_type =
+                pyre_interpreter::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE);
+            if unsafe { pyre_interpreter::baseobjspace::isinstance_w(w_set, w_set_type) } {
                 // `PySet_Check`: `set` and its subclasses (not `frozenset`)
                 // take the `update` path; `set.update(items)` dispatches
                 // through the (possibly overridden) method.
@@ -1307,12 +1309,12 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
             {
                 return Err(PyError::type_error("argument list must be a tuple"));
             }
-            let packed_kind = if crate::baseobjspace::is_w(
+            let packed_kind = if pyre_interpreter::baseobjspace::is_w(
                 pyre_object::gc_roots::shadow_stack_get(func_slot),
                 packed_list_sentinel(PackedListKind::Ascii),
             ) {
                 Some(PackedListKind::Ascii)
-            } else if crate::baseobjspace::is_w(
+            } else if pyre_interpreter::baseobjspace::is_w(
                 pyre_object::gc_roots::shadow_stack_get(func_slot),
                 packed_list_sentinel(PackedListKind::Bytes),
             ) {
@@ -1343,7 +1345,7 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
             // iterable and delegates non-iterable failure to argument
             // expansion; REDUCE does not impose a tuple-only shortcut.
             let mut args = Vec::new();
-            crate::argument::combine_starargs_wrapped(
+            pyre_interpreter::argument::combine_starargs_wrapped(
                 &mut args,
                 pyre_object::gc_roots::shadow_stack_get(args_slot),
                 pyre_object::gc_roots::shadow_stack_get(func_slot),
@@ -1547,13 +1549,15 @@ fn packed_list_from_args(
     let _ = pyre_object::gc_roots::pin_root(w_args);
     let w_zero = pyre_object::w_int_new(0);
     let _ = pyre_object::gc_roots::pin_root(w_zero);
-    let w_packed = crate::baseobjspace::getitem(
+    let w_packed = pyre_interpreter::baseobjspace::getitem(
         pyre_object::gc_roots::shadow_stack_get(base),
         pyre_object::gc_roots::shadow_stack_get(base + 1),
     )?;
     let _ = pyre_object::gc_roots::pin_root(w_packed);
     if unsafe {
-        !crate::baseobjspace::isinstance_bytes_w(pyre_object::gc_roots::shadow_stack_get(base + 2))
+        !pyre_interpreter::baseobjspace::isinstance_bytes_w(
+            pyre_object::gc_roots::shadow_stack_get(base + 2),
+        )
     } {
         return Err(PyError::type_error("expected bytes"));
     }
@@ -1625,7 +1629,11 @@ fn dict_update_from_pairs(w_dict: PyObjectRef, items: PyObjectRef) -> Result<PyO
         let v = unsafe {
             pyre_object::listobject::w_list_getitem(current_items, (i + 1) as i64).unwrap()
         };
-        crate::baseobjspace::setitem(pyre_object::gc_roots::shadow_stack_get(base), k, v)?;
+        pyre_interpreter::baseobjspace::setitem(
+            pyre_object::gc_roots::shadow_stack_get(base),
+            k,
+            v,
+        )?;
         i += 2;
     }
     Ok(pyre_object::gc_roots::shadow_stack_get(base))
@@ -1646,7 +1654,8 @@ fn read_line_bytes(slot: usize) -> Result<Vec<u8>, PyError> {
 
 fn read_line(slot: usize) -> Result<String, PyError> {
     let bytes = read_line_bytes(slot)?;
-    String::from_utf8(bytes).map_err(|err| crate::typedef::utf8_decode_error(err.as_bytes()))
+    String::from_utf8(bytes)
+        .map_err(|err| pyre_interpreter::typedef::utf8_decode_error(err.as_bytes()))
 }
 
 /// Read a newline-terminated decimal integer argument (GET / PUT in the
@@ -1688,7 +1697,7 @@ fn call_find_class(
     let module_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let _ = pyre_object::gc_roots::pin_root(w_name);
     let name_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let method = crate::baseobjspace::getattr_str(
+    let method = pyre_interpreter::baseobjspace::getattr_str(
         pyre_object::gc_roots::shadow_stack_get(slot),
         "find_class",
     )?;
@@ -1705,7 +1714,7 @@ fn call_find_class(
 /// `space.audit(...)` and lets a blocking audit hook's error propagate.
 fn audit_find_class(module: &str, name: &str) -> Result<(), PyError> {
     if let Ok(sys) = import_module("sys")
-        && let Ok(audit) = crate::baseobjspace::getattr_str(sys, "audit")
+        && let Ok(audit) = pyre_interpreter::baseobjspace::getattr_str(sys, "audit")
     {
         let _roots = pyre_object::gc_roots::push_roots();
         let audit = _roots.pin_root(audit);
@@ -1723,7 +1732,7 @@ fn audit_find_class_objects(w_module: PyObjectRef, w_name: PyObjectRef) -> Resul
     let module_slot = base;
     let name_slot = base + 1;
     if let Ok(sys) = import_module("sys")
-        && let Ok(audit) = crate::baseobjspace::getattr_str(sys, "audit")
+        && let Ok(audit) = pyre_interpreter::baseobjspace::getattr_str(sys, "audit")
     {
         call_fn(
             audit,
@@ -1741,12 +1750,12 @@ fn audit_find_class_objects(w_module: PyObjectRef, w_name: PyObjectRef) -> Resul
 /// to its registered global via `_extension_cache` / `_inverted_registry`.
 fn get_extension(slot: usize, code: i64) -> Result<(), PyError> {
     let copyreg = import_module("copyreg")?;
-    let cache = crate::baseobjspace::getattr_str(copyreg, "_extension_cache")?;
+    let cache = pyre_interpreter::baseobjspace::getattr_str(copyreg, "_extension_cache")?;
     if let Some(obj) = unsafe { pyre_object::w_dict_lookup(cache, pyre_object::w_int_new(code)) } {
         push(slot, obj);
         return Ok(());
     }
-    let inverted = crate::baseobjspace::getattr_str(copyreg, "_inverted_registry")?;
+    let inverted = pyre_interpreter::baseobjspace::getattr_str(copyreg, "_inverted_registry")?;
     let key = match unsafe { pyre_object::w_dict_lookup(inverted, pyre_object::w_int_new(code)) } {
         Some(k) if !unsafe { pyre_object::is_none(k) } => k,
         _ => {
@@ -1768,8 +1777,8 @@ fn get_extension(slot: usize, code: i64) -> Result<(), PyError> {
     let _ = pyre_object::gc_roots::pin_root(obj);
     let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let copyreg = import_module("copyreg")?;
-    let cache = crate::baseobjspace::getattr_str(copyreg, "_extension_cache")?;
-    crate::baseobjspace::setitem(
+    let cache = pyre_interpreter::baseobjspace::getattr_str(copyreg, "_extension_cache")?;
+    pyre_interpreter::baseobjspace::setitem(
         cache,
         pyre_object::w_int_new(code),
         pyre_object::gc_roots::shadow_stack_get(obj_slot),
@@ -1900,7 +1909,7 @@ fn persistent_load(slot: usize, w_pid: PyObjectRef) -> Result<PyObjectRef, PyErr
     // an explicit `persistent_load = None` is kept as the hook so `call_fn(None,
     // pid)` raises `TypeError: 'NoneType' object is not callable` (only an absent
     // attribute disables the hook).
-    match crate::baseobjspace::findattr_result(self_obj, "persistent_load")? {
+    match pyre_interpreter::baseobjspace::findattr_result(self_obj, "persistent_load")? {
         Some(f) => call_fn(f, &[pyre_object::gc_roots::shadow_stack_get(pid_slot)]),
         None => Err(unpickling_error(
             "A load persistent id instruction was encountered, but no persistent_load function was specified.",
@@ -1913,7 +1922,8 @@ fn persistent_load(slot: usize, w_pid: PyObjectRef) -> Result<PyObjectRef, PyErr
 /// via `__new__` without invoking `__init__`.
 fn instantiate(w_cls: PyObjectRef, w_args: PyObjectRef) -> Result<PyObjectRef, PyError> {
     let n = unsafe { pyre_object::listobject::w_list_len(w_args) };
-    let has_getinitargs = crate::baseobjspace::findattr_result(w_cls, "__getinitargs__")?.is_some();
+    let has_getinitargs =
+        pyre_interpreter::baseobjspace::findattr_result(w_cls, "__getinitargs__")?.is_some();
     let is_type = unsafe { pyre_object::typeobject::is_type(w_cls) };
     if n > 0 || !is_type || has_getinitargs {
         let args: Vec<PyObjectRef> = (0..n)
@@ -1930,11 +1940,11 @@ fn new_instance(w_cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef,
     if !unsafe { pyre_object::typeobject::is_type(w_cls) } {
         let message = format!(
             "NEWOBJ class argument must be a type, not {}",
-            crate::type_methods::arg_type_name(w_cls),
+            pyre_interpreter::type_methods::arg_type_name(w_cls),
         );
         return Err(unpickling_error(&message));
     }
-    let w_new = crate::baseobjspace::getattr_str(w_cls, "__new__")?;
+    let w_new = pyre_interpreter::baseobjspace::getattr_str(w_cls, "__new__")?;
     let mut call_args = vec![w_cls];
     call_args.extend_from_slice(args);
     call_fn(w_new, &call_args)
@@ -1958,13 +1968,13 @@ fn new_instance_star(
     if !unsafe { pyre_object::typeobject::is_type(w_cls) } {
         return Err(unpickling_error(&format!(
             "{opname} class argument must be a type, not {}",
-            crate::type_methods::arg_type_name(w_cls),
+            pyre_interpreter::type_methods::arg_type_name(w_cls),
         )));
     }
     if !unsafe { pyre_object::is_tuple(w_args) } {
         return Err(unpickling_error(&format!(
             "{opname} args argument must be a tuple, not {}",
-            crate::type_methods::arg_type_name(w_args),
+            pyre_interpreter::type_methods::arg_type_name(w_args),
         )));
     }
     if let Some(w_kwargs) = w_kwargs
@@ -1972,7 +1982,7 @@ fn new_instance_star(
     {
         return Err(unpickling_error(&format!(
             "{opname} kwargs argument must be a dict, not {}",
-            crate::type_methods::arg_type_name(w_kwargs),
+            pyre_interpreter::type_methods::arg_type_name(w_kwargs),
         )));
     }
     let _roots = pyre_object::gc_roots::push_roots();
@@ -1984,7 +1994,7 @@ fn new_instance_star(
         let _ = pyre_object::gc_roots::pin_root(kwargs);
         pyre_object::gc_roots::shadow_stack_len() - 1
     });
-    let w_new = crate::baseobjspace::getattr_str(
+    let w_new = pyre_interpreter::baseobjspace::getattr_str(
         pyre_object::gc_roots::shadow_stack_get(cls_slot),
         "__new__",
     )?;
@@ -1995,7 +2005,9 @@ fn new_instance_star(
     // container is not iterated.  This is observable for a custom object whose
     // `__len__` returns zero while `__iter__` has effects or yields values.
     if kwargs_slot.is_none()
-        && crate::baseobjspace::len_w(pyre_object::gc_roots::shadow_stack_get(star_slot))? == 0
+        && pyre_interpreter::baseobjspace::len_w(pyre_object::gc_roots::shadow_stack_get(
+            star_slot,
+        ))? == 0
     {
         return call_fn(
             pyre_object::gc_roots::shadow_stack_get(new_slot),
@@ -2004,7 +2016,7 @@ fn new_instance_star(
     }
 
     let mut unpacked = Vec::new();
-    crate::argument::combine_starargs_wrapped(
+    pyre_interpreter::argument::combine_starargs_wrapped(
         &mut unpacked,
         pyre_object::gc_roots::shadow_stack_get(star_slot),
         pyre_object::gc_roots::shadow_stack_get(new_slot),
@@ -2017,7 +2029,7 @@ fn new_instance_star(
     let mut keyword_names = Vec::new();
     let mut keyword_values = Vec::new();
     if let Some(kwargs_slot) = kwargs_slot {
-        crate::argument::combine_starstarargs_wrapped(
+        pyre_interpreter::argument::combine_starstarargs_wrapped(
             &mut keyword_names,
             &mut keyword_values,
             pyre_object::gc_roots::shadow_stack_get(kwargs_slot),
@@ -2054,7 +2066,7 @@ fn new_instance_star(
             )
         })
         .collect();
-    let ec = crate::call::getexecutioncontext();
+    let ec = pyre_interpreter::call::getexecutioncontext();
     if ec.is_null() {
         return Err(unpickling_error("no execution context for NEWOBJ_EX"));
     }
@@ -2062,7 +2074,7 @@ fn new_instance_star(
     if frame.is_null() {
         return Err(unpickling_error("no frame for NEWOBJ_EX with kwargs"));
     }
-    crate::call::call_with_kwargs(
+    pyre_interpreter::call::call_with_kwargs(
         unsafe { &mut *frame },
         pyre_object::gc_roots::shadow_stack_get(new_slot),
         &call_args,
@@ -2079,7 +2091,7 @@ fn build_instance(w_inst: PyObjectRef, w_state: PyObjectRef) -> Result<(), PyErr
     let state_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
     // __setstate__ takes precedence.
-    if let Some(setstate) = crate::baseobjspace::findattr_result(
+    if let Some(setstate) = pyre_interpreter::baseobjspace::findattr_result(
         pyre_object::gc_roots::shadow_stack_get(inst_slot),
         "__setstate__",
     )? {
@@ -2122,7 +2134,7 @@ fn build_instance(w_inst: PyObjectRef, w_state: PyObjectRef) -> Result<(), PyErr
         } {
             return Err(unpickling_error("state is not a dictionary"));
         }
-        let w_inst_dict = crate::baseobjspace::getattr_str(
+        let w_inst_dict = pyre_interpreter::baseobjspace::getattr_str(
             pyre_object::gc_roots::shadow_stack_get(inst_slot),
             "__dict__",
         )?;
@@ -2148,7 +2160,7 @@ fn build_instance(w_inst: PyObjectRef, w_state: PyObjectRef) -> Result<(), PyErr
             } else {
                 key
             };
-            crate::baseobjspace::setitem(
+            pyre_interpreter::baseobjspace::setitem(
                 pyre_object::gc_roots::shadow_stack_get(inst_dict_slot),
                 key,
                 pyre_object::gc_roots::shadow_stack_get(value_slot),
@@ -2175,12 +2187,12 @@ fn build_instance(w_inst: PyObjectRef, w_state: PyObjectRef) -> Result<(), PyErr
             if !unsafe { pyre_object::is_str(pyre_object::gc_roots::shadow_stack_get(key_slot)) } {
                 return Err(PyError::type_error(format!(
                     "attribute name must be string, not '{}'",
-                    crate::type_methods::arg_type_name(pyre_object::gc_roots::shadow_stack_get(
-                        key_slot
-                    )),
+                    pyre_interpreter::type_methods::arg_type_name(
+                        pyre_object::gc_roots::shadow_stack_get(key_slot)
+                    ),
                 )));
             }
-            crate::baseobjspace::setattr(
+            pyre_interpreter::baseobjspace::setattr(
                 pyre_object::gc_roots::shadow_stack_get(inst_slot),
                 pyre_object::gc_roots::shadow_stack_get(key_slot),
                 pyre_object::gc_roots::shadow_stack_get(value_slot),
