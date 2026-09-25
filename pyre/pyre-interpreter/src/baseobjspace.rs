@@ -2773,7 +2773,9 @@ pub unsafe fn getitem_fast_path(
 ///
 /// # Safety
 /// `w_obj` must be a live object.
-pub unsafe fn iter_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, u64, PyObjectRef)> {
+pub unsafe fn iter_fast_path(
+    w_obj: PyObjectRef,
+) -> Option<(PyObjectRef, u64, PyObjectRef, PyObjectRef)> {
     unsafe {
         if crate::module::r#struct::is_unpack_iter(w_obj) || !is_instance(w_obj) {
             return None;
@@ -2792,10 +2794,11 @@ pub unsafe fn iter_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, u64, Py
         if version_tag == 0 {
             return None;
         }
-        if type_attr_stored_is_cell(w_type, Wtf8::new("__iter__")) {
-            return None;
-        }
-        Some((w_type, version_tag, method))
+        // An in-place `ObjectMutableCell` write does not move `version_tag`, so
+        // the tag alone does not make `method` green.  Hand the cell back and
+        // let the caller pay [`type_attr_object_cell`]'s getfield and guard.
+        let cell = type_attr_object_cell(w_type, Wtf8::new("__iter__"));
+        Some((w_type, version_tag, method, cell))
     }
 }
 
@@ -2809,7 +2812,9 @@ pub unsafe fn iter_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, u64, Py
 ///
 /// # Safety
 /// `w_obj` must be a live object.
-pub unsafe fn next_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, u64, PyObjectRef)> {
+pub unsafe fn next_fast_path(
+    w_obj: PyObjectRef,
+) -> Option<(PyObjectRef, u64, PyObjectRef, PyObjectRef)> {
     unsafe {
         if crate::module::r#struct::is_unpack_iter(w_obj) || !is_instance(w_obj) {
             return None;
@@ -2823,10 +2828,11 @@ pub unsafe fn next_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, u64, Py
         if version_tag == 0 {
             return None;
         }
-        if type_attr_stored_is_cell(w_type, Wtf8::new("__next__")) {
-            return None;
-        }
-        Some((w_type, version_tag, method))
+        // An in-place `ObjectMutableCell` write does not move `version_tag`, so
+        // the tag alone does not make `method` green.  Hand the cell back and
+        // let the caller pay [`type_attr_object_cell`]'s getfield and guard.
+        let cell = type_attr_object_cell(w_type, Wtf8::new("__next__"));
+        Some((w_type, version_tag, method, cell))
     }
 }
 
@@ -11770,15 +11776,16 @@ pub fn load_special_resolve(obj: PyObjectRef, name: &str) -> Result<PyObjectRef,
 /// general `__get__` lookup that reaches `descr_function_get`); every other
 /// kind may run Python while binding.
 ///
-/// Returns `(w_type, version_tag, w_descr)` when the reduction holds, `None`
-/// otherwise.
+/// Returns `(w_type, version_tag, w_descr, cell)` when the reduction holds,
+/// `None` otherwise.  `cell` is the `ObjectMutableCell` holding `w_descr`, or
+/// null when the namespace entry is the descriptor itself.
 ///
 /// # Safety
 /// `w_obj` must be a valid object pointer (null tolerated).
 pub unsafe fn load_special_fast_path(
     w_obj: PyObjectRef,
     name: &str,
-) -> Option<(PyObjectRef, u64, PyObjectRef)> {
+) -> Option<(PyObjectRef, u64, PyObjectRef, PyObjectRef)> {
     if w_obj.is_null() {
         return None;
     }
@@ -11795,14 +11802,14 @@ pub unsafe fn load_special_fast_path(
     if version_tag == 0 {
         return None;
     }
-    if type_attr_stored_is_cell(w_type, Wtf8::new(name)) {
-        return None;
-    }
+    // An in-place `ObjectMutableCell` write does not move `version_tag`.  The
+    // cell is stable under the tag; the caller getfields `w_value` and guards it.
+    let cell = type_attr_object_cell(w_type, Wtf8::new(name));
     let w_descr = lookup_in_type(w_type, name)?;
     if !std::ptr::eq((*w_descr).ob_type, &crate::FUNCTION_TYPE as *const _) {
         return None;
     }
-    Some((w_type, version_tag, w_descr))
+    Some((w_type, version_tag, w_descr, cell))
 }
 
 /// CPython 3.14 `PyType_GetFullyQualifiedName` — the `%T` formatting name.
@@ -16388,7 +16395,9 @@ pub(crate) unsafe fn int_as_base(obj: PyObjectRef) -> PyObjectRef {
 ///
 /// # Safety
 /// `w_obj` must be a live object.
-pub unsafe fn index_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, u64, PyObjectRef)> {
+pub unsafe fn index_fast_path(
+    w_obj: PyObjectRef,
+) -> Option<(PyObjectRef, u64, PyObjectRef, PyObjectRef)> {
     unsafe {
         if w_obj.is_null() || pyre_object::pyobject::is_int_or_long(w_obj) {
             return None;
@@ -16399,10 +16408,11 @@ pub unsafe fn index_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, u64, P
         if version_tag == 0 {
             return None;
         }
-        if type_attr_stored_is_cell(w_type, Wtf8::new("__index__")) {
-            return None;
-        }
-        Some((w_type, version_tag, method))
+        // An in-place `ObjectMutableCell` write does not move `version_tag`, so
+        // the tag alone does not make `method` green.  Hand the cell back and
+        // let the caller pay [`type_attr_object_cell`]'s getfield and guard.
+        let cell = type_attr_object_cell(w_type, Wtf8::new("__index__"));
+        Some((w_type, version_tag, method, cell))
     }
 }
 

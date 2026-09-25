@@ -1952,18 +1952,18 @@ pub unsafe fn class_descr_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, 
 pub unsafe fn getattr_hook_fast_path(
     w_obj: PyObjectRef,
     name: &str,
-) -> Option<(PyObjectRef, u64, MapRef, PyObjectRef)> {
+) -> Option<(PyObjectRef, u64, MapRef, PyObjectRef, PyObjectRef)> {
     let (w_type, version_tag, map) = unsafe { getattr_resolves_nowhere(w_obj, name) }?;
-    if unsafe {
-        crate::baseobjspace::type_attr_stored_is_cell(
+    let w_getattr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, "__getattr__") }?;
+    // An in-place `ObjectMutableCell` write does not move `version_tag`.  The
+    // cell is what `write_cell` updates; the caller getfields its payload.
+    let cell = unsafe {
+        crate::baseobjspace::type_attr_object_cell(
             w_type,
             rustpython_wtf8::Wtf8::new("__getattr__"),
         )
-    } {
-        return None;
-    }
-    let w_getattr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, "__getattr__") }?;
-    Some((w_type, version_tag, map, w_getattr))
+    };
+    Some((w_type, version_tag, map, w_getattr, cell))
 }
 
 /// Return the guarded lookup ingredients for the receiver type's custom
@@ -1988,7 +1988,7 @@ pub unsafe fn getattr_hook_fast_path(
 /// `w_obj` must be a live object.
 pub unsafe fn getattribute_hook_fast_path(
     w_obj: PyObjectRef,
-) -> Option<(PyObjectRef, u64, MapRef, PyObjectRef)> {
+) -> Option<(PyObjectRef, u64, MapRef, PyObjectRef, PyObjectRef)> {
     let map = unsafe { mapdict_map_or_null(w_obj) };
     if map.is_null() || unsafe { map_is_devolved(map) } {
         return None;
@@ -2001,19 +2001,19 @@ pub unsafe fn getattribute_hook_fast_path(
     if version_tag == 0 {
         return None;
     }
-    if unsafe {
-        crate::baseobjspace::type_attr_stored_is_cell(
-            w_type,
-            rustpython_wtf8::Wtf8::new("__getattribute__"),
-        )
-    } {
-        return None;
-    }
     let w_getattribute = unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }?;
     if unsafe { crate::baseobjspace::lookup_in_type_where(w_type, "__getattr__") }.is_some() {
         return None;
     }
-    Some((w_type, version_tag, map, w_getattribute))
+    // An in-place `ObjectMutableCell` write does not move `version_tag`.  The
+    // cell is what `write_cell` updates; the caller getfields its payload.
+    let cell = unsafe {
+        crate::baseobjspace::type_attr_object_cell(
+            w_type,
+            rustpython_wtf8::Wtf8::new("__getattribute__"),
+        )
+    };
+    Some((w_type, version_tag, map, w_getattribute, cell))
 }
 
 /// The `__getattr__`-less twin of [`getattr_hook_fast_path`]: `name` resolves
