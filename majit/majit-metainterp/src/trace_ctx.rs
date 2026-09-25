@@ -2619,25 +2619,24 @@ impl TraceCtx {
         let (spec, prepend_pc): (
             smallvec::SmallVec<[GreenType; majit_ir::GREEN_INLINE]>,
             bool,
-        ) =
-            if let Some(key) = self.green_key_values.as_ref() {
-                debug_assert_eq!(
-                    key.types.first().copied(),
-                    Some(GreenType::Int),
-                    "structured green key must start with the prepended target pc",
-                );
-                (smallvec::SmallVec::from_slice(key.types.get(1..)?), true)
-            } else {
-                (
-                    smallvec::SmallVec::from_iter(
-                        self.driver_descriptor
-                            .as_ref()
-                            .map(|d| d.green_args_spec())?
-                            .into_iter(),
-                    ),
-                    false,
-                )
-            };
+        ) = if let Some(key) = self.green_key_values.as_ref() {
+            debug_assert_eq!(
+                key.types.first().copied(),
+                Some(GreenType::Int),
+                "structured green key must start with the prepended target pc",
+            );
+            (smallvec::SmallVec::from_slice(key.types.get(1..)?), true)
+        } else {
+            (
+                smallvec::SmallVec::from_iter(
+                    self.driver_descriptor
+                        .as_ref()
+                        .map(|d| d.green_args_spec())?
+                        .into_iter(),
+                ),
+                false,
+            )
+        };
 
         let mut values = smallvec::SmallVec::<[i64; majit_ir::GREEN_INLINE]>::new();
         let mut types = smallvec::SmallVec::<[GreenType; majit_ir::GREEN_INLINE]>::new();
