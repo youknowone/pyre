@@ -6927,7 +6927,7 @@ pub(crate) fn sqrt_nonneg(x: f64) -> f64 {
 
 /// ll_math.py `ll_math_sqrt` after the domain pin: `W_FloatObject(sqrt_nonneg(x))`.
 #[inline(never)]
-pub(crate) fn _float_sqrt(x: f64) -> PyResult {
+pub fn _float_sqrt(x: f64) -> PyResult {
     let floatval = sqrt_nonneg(x);
     Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
         ob_header: PyObject {

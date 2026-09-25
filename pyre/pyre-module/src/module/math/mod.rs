@@ -33,7 +33,7 @@ pyre_interpreter::py_module! {
         "atanh" / 1 = m::atanh,
 
         // Exponential / logarithmic
-        "sqrt"  / 1 = m::sqrt,
+        // `sqrt` is installed in `extra_init` as `__majit_wrap_math_sqrt`.
         "cbrt"  / 1 = m::cbrt,
         "exp"   / 1 = m::exp,
         "exp2"  / 1 = m::exp2,
@@ -95,6 +95,17 @@ pyre_interpreter::py_module! {
         "isqrt" / 1 = m::isqrt,
     },
     extra_init: |ns| {
+        // Module builtin, not a method descriptor: `BuiltinCode.func` is the
+        // gateway itself so builtin-call descent walks it.
+        pyre_interpreter::module_ns_store(
+            ns,
+            "sqrt",
+            pyre_interpreter::make_module_builtin_function_with_arity(
+                "sqrt",
+                m::__majit_wrap_math_sqrt,
+                1,
+            ),
+        );
         m::register_jit_builtin_wrappers(ns);
     },
 }

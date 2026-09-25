@@ -8,14 +8,13 @@
 # gated on — only pypy is.
 # Two hot math-builtin loops whose walker specializations this ratio gates.
 #
-# `math.sqrt(x)`: the walker specializes the call
-# (`try_walker_specialize_math_sqrt`) to a domain-guarded pure
-# `CALL_F(sqrt_nonneg_jit)` (ll_math.rs `ll_math_sqrt` -> `sqrt_nonneg`,
-# EF_ELIDABLE_CANNOT_RAISE) plus inline `wrapfloat`, instead of the opaque
-# `bh_call_fn(sqrt_builtin, NULL, x)` residual.  Two guards pin the
-# `ll_math_sqrt` branches — `x >= 0` (the ValueError direction) and
-# `isfinite(x)` — so the result `W_FloatObject` virtualizes.  A negative /
-# non-finite argument or a rebound `math.sqrt` falls through to the residual.
+# `math.sqrt(x)`: the builtin-call descent walks the `__majit_wrap_math_sqrt`
+# gateway (interp_math.py `math1` + ll_math.py `ll_math_sqrt`) and records a
+# pure `CALL_F(sqrt_nonneg_jit)` (`sqrt_nonneg`, EF_ELIDABLE_CANNOT_RAISE)
+# plus the boxed float, instead of the opaque `bh_call_fn(sqrt_builtin, NULL,
+# x)` residual.  The gateway's `x >= 0` and `isfinite(x)` branches become the
+# two guards, so the result `W_FloatObject` virtualizes.  A negative /
+# non-finite argument takes the `dont_look_inside` slow path.
 #
 # `math.isqrt(i)`: `try_walker_specialize_math_isqrt` turns the call into the
 # elidable integer body.  Suppressing that one fold alone measures 20.2x here

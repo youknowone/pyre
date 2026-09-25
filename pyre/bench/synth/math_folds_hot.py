@@ -1,5 +1,5 @@
 # pyre-check: max-pypy-ratio=1.8
-# pyre-check: spec-folds=math_ceil,math_fabs,math_float1,math_float2,math_floor,math_isclose,math_log_trig,math_trunc,math_sqrt,float_call
+# pyre-check: spec-folds=math_ceil,math_fabs,math_float1,math_float2,math_floor,math_isclose,math_log_trig,math_trunc,float_call
 # pyre-check: skip-cpython
 # This fixture carried a wasm allowance of 13, fitted to a darwin-arm64
 # reading of 8.1-9.0x.  Most of that was the host crossing: `isclose`, `frexp`
@@ -25,9 +25,9 @@
 # specialization instead unboxes the operands, emits the raw operation, and
 # leaves the result box virtualizable.
 #
-#   sqrt         `try_walker_specialize_math_sqrt` — `x >= 0` and `isfinite(x)`
-#                pin the two `ll_math_sqrt` branches, then a pure
-#                `CALL_F(sqrt_nonneg_jit)` with no result guard.
+#   sqrt         `__majit_wrap_math_sqrt` descent — `x >= 0` and `isfinite(x)`
+#                pin the two `ll_math_sqrt` branches, then `_float_sqrt`
+#                (`sqrt_nonneg`) with no result guard.
 #   log/cos/sin  `try_walker_specialize_math_log_trig` — same shape, one
 #                domain guard each.
 #   fabs         `try_walker_specialize_math_fabs` — a single `FloatAbs`;

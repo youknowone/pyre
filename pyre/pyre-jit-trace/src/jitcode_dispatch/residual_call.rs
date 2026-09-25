@@ -7990,22 +7990,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((outcome, op.next_pc));
     }
 
-    // `math.sqrt(x)` / `float(x)` on an exact numeric argument: inline the
-    // domain-guarded pure `CALL_F(sqrt_nonneg_jit)` (ll_math.rs) resp. the
-    // `CastIntToFloat` / identity conversion instead of the opaque
-    // `bh_call_fn` residual, so the result `W_FloatObject` virtualizes.  Any
-    // non-matching shape (rebound name, subclass, non-numeric arg, negative /
-    // non-finite sqrt) falls through to the generic residual (SAFE).
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate(SpecFold::MathSqrt, || {
-            try_walker_specialize_math_sqrt(ctx, code, op, &r_args, dst)
-        })?
-        .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn

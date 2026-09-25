@@ -263,13 +263,61 @@ pub fn sqrt(args: &[PyObjectRef]) -> PyResult {
     })
 }
 
+/// Arity / keyword / domain residual of `sqrt`. The positional-count check is
+/// the one `py_checked_arity_fn` used to run before this body.
+#[majit_macros::dont_look_inside]
+fn sqrt_slow(args: &[PyObjectRef]) -> PyResult {
+    pyre_interpreter::gateway::check_declared_positional_arity("sqrt", 1, args)?;
+    sqrt(args)
+}
+
+/// interp_math.py `sqrt` = `math1(space, math.sqrt, w_x)`; ll_math.py `ll_math_sqrt`.
+pub fn __majit_wrap_math_sqrt(args: &[PyObjectRef]) -> PyResult {
+    if args.len() == 1 {
+        let w_x = args[0];
+        let x =
+            if unsafe { pyre_object::is_exact_builtin_instance(w_x) && pyre_object::is_float(w_x) }
+            {
+                Some(unsafe { pyre_object::w_float_get_value(w_x) })
+            } else if unsafe {
+                pyre_object::is_exact_builtin_instance(w_x)
+                    && (pyre_object::is_int(w_x) || pyre_object::is_bool(w_x))
+            } {
+                // `_get_double` coerces via `space.float`; a machine int's `i64 as f64`
+                // is that value. NaN cannot appear. A non-finite result is ±inf.
+                Some(unsafe { pyre_object::w_int_get_value(w_x) } as f64)
+            } else {
+                None
+            };
+        if let Some(x) = x {
+            // ll_math.py `ll_math_sqrt`: `x < 0.0` raises; NaN fails `x >= 0.0`.
+            if x >= 0.0 {
+                if x.is_finite() {
+                    return pyre_interpreter::objspace::descroperation::_float_sqrt(x);
+                }
+                return Ok(pyre_object::floatobject::w_float_new(x));
+            }
+        }
+    }
+    sqrt_slow(args)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(pyre_interpreter::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_builtin_wrapper_target_math_sqrt:
+    pyre_interpreter::gateway::BuiltinWrapperDescriptor =
+    pyre_interpreter::gateway::BuiltinWrapperDescriptor {
+        path: concat!(module_path!(), "::", stringify!(__majit_wrap_math_sqrt)),
+        func: __majit_wrap_math_sqrt,
+    };
+
 /// Checked-arity wrapper pointers installed by `py_module!` for the
 /// builtins the walker probes by identity.  One record, filled once at
 /// module init: `py_checked_arity_fn!` wraps each body in a non-capturing
 /// closure, so a BuiltinCode stores that wrapper rather than (for example)
 /// [`frexp`] itself.
 struct MathBuiltinWrappers {
-    sqrt: usize,
     log: usize,
     cos: usize,
     sin: usize,
@@ -329,7 +377,6 @@ fn math_wrapper_addr(ns: PyObjectRef, name: &str) -> usize {
 /// metadata and needs no GC rooting.
 pub fn register_jit_builtin_wrappers(ns: PyObjectRef) {
     let _ = MATH_WRAPPERS.set(MathBuiltinWrappers {
-        sqrt: math_wrapper_addr(ns, "sqrt"),
         log: math_wrapper_addr(ns, "log"),
         cos: math_wrapper_addr(ns, "cos"),
         sin: math_wrapper_addr(ns, "sin"),
@@ -398,14 +445,6 @@ fn math_wrapper_is(callable: PyObjectRef, pick: fn(&MathBuiltinWrappers) -> usiz
     MATH_WRAPPERS
         .get()
         .is_some_and(|wrappers| unsafe { math_builtin_wrapper_matches(callable, pick(wrappers)) })
-}
-
-/// True iff `callable` is the canonical builtin `math.sqrt` function object.
-/// The JIT walker uses the builtin-code native fn-pointer identity to
-/// distinguish it from a value rebound under the same `math.sqrt` name, so a
-/// monkeypatched `math.sqrt` correctly declines the pure-inline specialization.
-pub fn is_math_sqrt_function(callable: PyObjectRef) -> bool {
-    math_wrapper_is(callable, |w| w.sqrt)
 }
 
 pub fn is_math_log_function(callable: PyObjectRef) -> bool {
@@ -492,10 +531,10 @@ pub fn is_math_radians_function(callable: PyObjectRef) -> bool {
     math_wrapper_is(callable, |w| w.radians)
 }
 
-/// Callable-identity probes used by the meta-trace walker.  As with
-/// [`is_math_sqrt_function`], compare the immutable BuiltinCode function
-/// pointer rather than a module/name string so rebinding `math.frexp` or
-/// `math.ldexp` cannot enter a specialization for the old callable.
+/// Callable-identity probes used by the meta-trace walker.  Compare the
+/// immutable BuiltinCode function pointer rather than a module/name string
+/// so rebinding `math.frexp` or `math.ldexp` cannot enter a specialization
+/// for the old callable.
 pub fn is_math_frexp_function(callable: PyObjectRef) -> bool {
     math_wrapper_is(callable, |w| w.frexp)
 }

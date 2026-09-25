@@ -396,7 +396,6 @@ spec_folds! {
     BuiltinLocals        => ("builtin_locals",           "residual_call", "-"),
     SysGetframe          => ("sys_getframe",             "residual_call", "-"),
     SysExcInfo           => ("sys_exc_info",             "residual_call", "-"),
-    MathSqrt             => ("math_sqrt",                "residual_call", "-"),
     MathLogTrig          => ("math_log_trig",            "residual_call", "-"),
     MathFrexp            => ("math_frexp",               "residual_call", "-"),
     MathLdexp            => ("math_ldexp",               "residual_call", "-"),
