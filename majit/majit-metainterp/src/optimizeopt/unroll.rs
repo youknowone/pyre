@@ -1690,9 +1690,19 @@ impl UnrollOptimizer {
                         true,
                     ) {
                         for arg in args {
-                            if !arg.is_none() {
-                                let _ = opt_p2.force_box(arg, &mut final_ctx);
+                            if arg.is_none() {
+                                continue;
                             }
+                            let arg_box = if arg.is_constant() {
+                                Operand::from_opref(arg)
+                            } else {
+                                let Some(arg_box) = final_ctx.get_box_replacement_operand_opt(arg)
+                                else {
+                                    continue;
+                                };
+                                arg_box
+                            };
+                            let _ = opt_p2.force_box(&arg_box, &mut final_ctx);
                         }
                     }
                 }
@@ -1733,18 +1743,20 @@ impl UnrollOptimizer {
                         if op.opcode == OpCode::Jump {
                             continue;
                         }
-                        let mut consider_arg = |arg: OpRef| {
-                            if !is_trace_runtime_ref(arg, &consts_p2)
-                                || visited_force.contains(&arg)
+                        let mut consider_arg = |arg: &Operand| {
+                            let arg_ref = arg.to_opref();
+                            if !is_trace_runtime_ref(arg_ref, &consts_p2)
+                                || visited_force.contains(&arg_ref)
                             {
                                 return;
                             }
-                            visited_force.insert(arg);
-                            let resolved = final_ctx.get_replacement_opref(arg);
-                            let needs_force = final_ctx.potential_extra_ops.contains_key(&arg)
+                            visited_force.insert(arg_ref);
+                            let resolved_box = arg.get_box_replacement(false);
+                            let resolved = resolved_box.to_opref();
+                            let needs_force = final_ctx.potential_extra_ops.contains_key(&arg_ref)
                                 || final_ctx.potential_extra_ops.contains_key(&resolved);
                             if !needs_force
-                                && let Some(produced) = produced_by_resolved.get(&arg).copied()
+                                && let Some(produced) = produced_by_resolved.get(&arg_ref).copied()
                             {
                                 let preamble_op = crate::optimizeopt::info::PreambleOp {
                                     op: produced.res.clone(),
@@ -1752,18 +1764,23 @@ impl UnrollOptimizer {
                                     preamble_op: produced.preamble_op.clone(),
                                     same_as_source: produced.same_as_source.clone(),
                                 };
-                                let source = final_ctx.force_op_from_preamble_op(&preamble_op);
-                                let _ = opt_p2.force_box(source, &mut final_ctx);
+                                let _ = final_ctx.force_op_from_preamble_op(&preamble_op);
+                                let source_box = preamble_op.op.get_box_replacement(false);
+                                let _ = opt_p2.force_box(&source_box, &mut final_ctx);
                                 return;
                             }
                             if needs_force {
-                                let _ = opt_p2.force_box(arg, &mut final_ctx);
+                                let _ = opt_p2.force_box(&resolved_box, &mut final_ctx);
                             }
                         };
                         for a in op.getarglist().iter() {
-                            consider_arg(a.to_opref());
+                            consider_arg(a);
                         }
-                        op.visit_failarg_oprefs(&mut consider_arg);
+                        if let Some(fail_args) = op.guard_fail_args() {
+                            for a in fail_args {
+                                consider_arg(a);
+                            }
+                        }
                     }
                 }
                 let rebuilt = final_ctx.build_imported_short_preamble();
@@ -4618,7 +4635,16 @@ impl OptUnroll {
                 }
                 // unroll.py:419-421
                 for &arg in args_no_virtuals.iter().chain(mapped_jump_args.iter()) {
-                    let _ = optimizer.force_box(arg, ctx);
+                    if arg.is_none() {
+                        continue;
+                    }
+                    let arg_box = if arg.is_constant() {
+                        Operand::from_opref(arg)
+                    } else {
+                        ctx.get_box_replacement_operand_opt(arg)
+                            .unwrap_or_else(|| Operand::bound_from_opref(arg))
+                    };
+                    let _ = optimizer.force_box(&arg_box, ctx);
                 }
                 // unroll.py:425-434: if short_jump_args did not grow we are
                 // done. If force_box grew it via add_preamble_op, only re-force
@@ -8539,7 +8565,7 @@ mod tests {
         assert!(sp.jump_args.is_empty());
 
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
-        let _ = optimizer.force_box(OpRef::int_op(20), &mut ctx);
+        let _ = optimizer.force_box(&src20, &mut ctx);
 
         let sp = ctx.build_imported_short_preamble().unwrap();
         // After force_box: orthodox `add_preamble_op` (shortpreamble.py)
@@ -8634,7 +8660,7 @@ mod tests {
         );
 
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
-        let _ = optimizer.force_box(forced, &mut ctx);
+        let _ = optimizer.force_box(&b_src, &mut ctx);
 
         let sp = ctx.build_imported_short_preamble().unwrap();
         // shortpreamble.py:436 `op = preamble_op.op.get_box_replacement()`.
@@ -8732,8 +8758,11 @@ mod tests {
         // (called from optimizer.force_box's potential_extra_ops.pop path).
         // shortpreamble.py record the SameAs Box at use-box time, not
         // at produce_op time — verify the lazy population fires.
+        let forced_box = ctx2
+            .get_box_replacement_operand_opt(forced)
+            .unwrap_or_else(|| Operand::bound_from_opref(forced));
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
-        let _ = optimizer.force_box(forced, &mut ctx2);
+        let _ = optimizer.force_box(&forced_box, &mut ctx2);
         let aliases = ctx2.used_imported_short_aliases();
         assert_eq!(aliases.len(), 1);
         assert_eq!(aliases[0].same_as_source.to_opref(), OpRef::int_op(14));

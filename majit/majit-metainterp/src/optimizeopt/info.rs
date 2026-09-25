@@ -1411,7 +1411,12 @@ fn force_box_impl(
             let mut alloc_op = Op::new(alloc_opcode, std::slice::from_ref(&arg_len));
             alloc_op.pos().set(opref);
             alloc_op.setdescr(vinfo.descr.clone());
-            let alloc_ref = emit_op(ctx, alloc_op);
+            let alloc_rc = majit_ir::OpRc::new(alloc_op);
+            let alloc_ref = if ctx.in_final_emission {
+                ctx.emit_rc(alloc_rc.clone())
+            } else {
+                ctx.emit_extra_rc(ctx.current_pass_idx, alloc_rc.clone())
+            };
             // Install before the item stores. A child that points back at
             // this box must see the non-virtual array, and `make_equal_to`
             // copies whatever info `op` still holds onto the allocation.
@@ -1459,8 +1464,11 @@ fn force_box_impl(
                 set_op.setdescr(descr.clone());
                 emit_op(ctx, set_op);
             }
-            // info.py:557: optforce.pure_from_args(ARRAYLEN_GC, [op], ConstInt(len))
-            ctx.pure_from_args_arraylen(alloc_ref, len as i64);
+            // pure_from_args(ARRAYLEN_GC, [op], ConstInt(len))
+            ctx.pure_from_args_arraylen(
+                majit_ir::operand::Operand::from_bound_op(&alloc_rc),
+                len as i64,
+            );
             alloc_ref
         }
         PtrInfo::VirtualArrayStruct(vinfo) => {

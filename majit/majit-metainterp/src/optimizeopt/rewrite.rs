@@ -2076,9 +2076,14 @@ impl Optimization for OptRewrite {
                     //     arg0 = get_box_replacement(op.getarg(0))
                     //     arg1 = get_box_replacement(op.getarg(1))
                     //     self.pure_from_args2(rop.INSTANCE_PTR_EQ, arg1, arg0, op)
-                    let arg0 = ctx.resolve_operand_operand(&op.arg(0)).to_opref();
-                    let arg1 = ctx.resolve_operand_operand(&op.arg(1)).to_opref();
-                    ctx.register_pure_from_args2(OpCode::InstancePtrEq, op.pos().get(), arg1, arg0);
+                    let arg0 = ctx.resolve_operand_operand(&op.arg(0));
+                    let arg1 = ctx.resolve_operand_operand(&op.arg(1));
+                    ctx.register_pure_from_args2(
+                        OpCode::InstancePtrEq,
+                        Operand::from_bound_op(op_rc),
+                        arg1,
+                        arg0,
+                    );
                 }
                 self.optimize_oois_ooisnot(op, false, instance, ctx)
             }
@@ -2086,9 +2091,14 @@ impl Optimization for OptRewrite {
                 let instance = matches!(op.opcode, OpCode::InstancePtrNe);
                 if instance {
                     // rewrite.py optimize_INSTANCE_PTR_NE: same swap.
-                    let arg0 = ctx.resolve_operand_operand(&op.arg(0)).to_opref();
-                    let arg1 = ctx.resolve_operand_operand(&op.arg(1)).to_opref();
-                    ctx.register_pure_from_args2(OpCode::InstancePtrNe, op.pos().get(), arg1, arg0);
+                    let arg0 = ctx.resolve_operand_operand(&op.arg(0));
+                    let arg1 = ctx.resolve_operand_operand(&op.arg(1));
+                    ctx.register_pure_from_args2(
+                        OpCode::InstancePtrNe,
+                        Operand::from_bound_op(op_rc),
+                        arg1,
+                        arg0,
+                    );
                 }
                 self.optimize_oois_ooisnot(op, true, instance, ctx)
             }
@@ -2098,16 +2108,16 @@ impl Optimization for OptRewrite {
             OpCode::CastPtrToInt => {
                 ctx.register_pure_from_args1(
                     OpCode::CastIntToPtr,
-                    op.pos().get(),
-                    op.arg(0).to_opref(),
+                    Operand::from_bound_op(op_rc),
+                    op.arg(0),
                 );
                 OptimizationResult::PassOn
             }
             OpCode::CastIntToPtr => {
                 ctx.register_pure_from_args1(
                     OpCode::CastPtrToInt,
-                    op.pos().get(),
-                    op.arg(0).to_opref(),
+                    Operand::from_bound_op(op_rc),
+                    op.arg(0),
                 );
                 OptimizationResult::PassOn
             }
@@ -2128,16 +2138,16 @@ impl Optimization for OptRewrite {
             OpCode::ConvertFloatBytesToLonglong => {
                 ctx.register_pure_from_args1(
                     OpCode::ConvertLonglongBytesToFloat,
-                    op.pos().get(),
-                    op.arg(0).to_opref(),
+                    Operand::from_bound_op(op_rc),
+                    op.arg(0),
                 );
                 OptimizationResult::PassOn
             }
             OpCode::ConvertLonglongBytesToFloat => {
                 ctx.register_pure_from_args1(
                     OpCode::ConvertFloatBytesToLonglong,
-                    op.pos().get(),
-                    op.arg(0).to_opref(),
+                    Operand::from_bound_op(op_rc),
+                    op.arg(0),
                 );
                 OptimizationResult::PassOn
             }
@@ -2443,7 +2453,7 @@ impl Optimization for OptRewrite {
     /// the same value and the constant is correct for all of them. PyPy's
     /// stable-Box vs majit's stable-OpRef yield the same observable
     /// behavior.
-    fn propagate_postprocess(&mut self, op: &Op, ctx: &mut OptContext) {
+    fn propagate_postprocess(&mut self, op: &Op, _op_rc: &OpRc, ctx: &mut OptContext) {
         match op.opcode {
             OpCode::GuardTrue => {
                 ctx.make_constant_arg(&op.arg(0), majit_ir::Value::Int(1));

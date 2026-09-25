@@ -645,7 +645,6 @@ impl OptString {
         mode: u8,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        let len_ref = op.arg(0).to_opref();
         if let Some(len) = ctx
             .resolve_operand_operand_opt(&op.arg(0))
             .and_then(|b_| ctx.get_constant_int_box(&b_))
@@ -684,7 +683,7 @@ impl OptString {
         } else {
             OpCode::Strlen
         };
-        ctx.register_pure_from_args1(strlen_opcode, op.pos().get(), len_ref);
+        ctx.register_pure_from_args1(strlen_opcode, Operand::from_bound_op(op_rc), op.arg(0));
         OptimizationResult::PassOn
     }
 

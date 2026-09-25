@@ -433,7 +433,6 @@ impl OptVirtualize {
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        let size_ref = op.arg(0).to_opref();
         if let Some(size) = ctx
             .resolve_operand_operand_opt(&op.arg(0))
             .and_then(|b_| ctx.get_constant_int_box(&b_))
@@ -508,15 +507,12 @@ impl OptVirtualize {
         // arg, descr=op.getdescr())` — array descr discriminates the
         // pure-cache key so the reverse ARRAYLEN→size fold doesn't
         // collide across distinct array types.
+        let array_box = Operand::from_bound_op(op_rc);
+        let size_box = op.arg(0);
         if let Some(descr) = op.getdescr() {
-            ctx.register_pure_from_args1_with_descr(
-                OpCode::ArraylenGc,
-                op.pos().get(),
-                size_ref,
-                descr,
-            );
+            ctx.register_pure_from_args1_with_descr(OpCode::ArraylenGc, array_box, size_box, descr);
         } else {
-            ctx.register_pure_from_args1(OpCode::ArraylenGc, op.pos().get(), size_ref);
+            ctx.register_pure_from_args1(OpCode::ArraylenGc, array_box, size_box);
         }
         OptimizationResult::PassOn
     }
@@ -2260,7 +2256,7 @@ impl Optimization for OptVirtualize {
         matches!(opcode, OpCode::Finish)
     }
 
-    fn propagate_postprocess(&mut self, op: &Op, ctx: &mut OptContext) {
+    fn propagate_postprocess(&mut self, op: &Op, _op_rc: &majit_ir::OpRc, ctx: &mut OptContext) {
         if op.opcode != OpCode::Finish {
             return;
         }
@@ -4072,7 +4068,7 @@ mod tests {
                 identity_input_index: Some(0),
             },
         )));
-        let forced = opt.force_box(OpRef::input_arg_ref(0), &mut ctx);
+        let forced = opt.force_box(&vable_box, &mut ctx);
         assert_eq!(forced, OpRef::input_arg_ref(0));
         assert!(
             ctx.new_operations.is_empty(),

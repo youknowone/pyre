@@ -1291,17 +1291,17 @@ pub struct OptContext {
     pub pending_for_guard: Vec<Op>,
     /// optimizer.py: pure_from_args1 parity — reverse-pure relationships
     /// registered by rewrite pass (CAST_*, CONVERT_*) and consumed by pure pass.
-    /// Each entry: (opcode, arg0, result, descr) meaning
-    /// pure((opcode, arg0), descr) = result. `descr` is `None` for
-    /// the common case (no descr); `Some(DescrRef)` matches upstream
-    /// `pure_from_args(rop.OPNUM, [arg], result, descr=op.getdescr())`
-    /// (e.g. virtualize.py:220 ARRAYLEN_GC keying on the array descr).
-    pub pending_pure_from_args: Vec<(OpCode, OpRef, OpRef, Option<majit_ir::DescrRef>)>,
+    /// Each entry: (opcode, key_arg, forwarded, descr). The register helpers
+    /// push `(opcode, key, forwarded, descr)` so OptPure's drain can call
+    /// `pure_from_args1(opcode, key, forwarded)`. `descr` is `None` for the
+    /// common case; `Some(DescrRef)` matches
+    /// `pure_from_args(opnum, [arg], result, descr=op.getdescr())`.
+    pub pending_pure_from_args: Vec<(OpCode, Operand, Operand, Option<majit_ir::DescrRef>)>,
     /// optimizer.py: pure_from_args2 parity — binary reverse-pure relationships
     /// registered by rewrite pass (INSTANCE_PTR_EQ/NE swapped-args). Consumed
-    /// by OptPure. Each entry: (opcode, arg0, arg1, result) meaning
-    /// pure(opcode, arg0, arg1) = result.
-    pub pending_pure_from_args2: Vec<(OpCode, OpRef, OpRef, OpRef)>,
+    /// by OptPure. Each entry: (opcode, arg0, arg1, forwarded) meaning
+    /// pure(opcode, arg0, arg1) forwards to `forwarded`.
+    pub pending_pure_from_args2: Vec<(OpCode, Operand, Operand, Operand)>,
     /// Live recent-ops ring. `OptPure` owns the allocation and publishes
     /// the handle; `OptRewrite.find_rewritable_bool` reads it the way
     /// `Optimization.get_pure_result` reads `optimizer.optpure`. Cleared
@@ -5342,34 +5342,33 @@ impl OptContext {
             .unwrap_or_default()
     }
 
-    /// optimizer.py: pure_from_args1 parity.
-    /// Register reverse-pure: pure(opcode, result) = arg0.
-    /// Consumed by OptPure at flush time.
-    pub fn register_pure_from_args1(&mut self, opcode: OpCode, result: OpRef, arg0: OpRef) {
+    /// `pure_from_args1(opnum, arg0, op)`: `key` is the pure op's arg,
+    /// `forwarded` is the box the synthetic op forwards to.
+    /// Consumed by OptPure before the next propagate.
+    pub fn register_pure_from_args1(&mut self, opcode: OpCode, key: Operand, forwarded: Operand) {
         self.pending_pure_from_args
-            .push((opcode, result, arg0, None));
+            .push((opcode, key, forwarded, None));
     }
 
-    /// optimizer.py: pure_from_args1 parity with explicit descr keying.
-    /// Mirrors upstream `pure_from_args(opnum, [arg], result, descr=...)`
-    /// — descr discriminates the pure cache slot so cross-descr
-    /// collisions (e.g. ARRAYLEN_GC across distinct array descrs at
-    /// virtualize.py:220) don't collapse onto the same key.
+    /// `pure_from_args(opnum, [arg], result, descr=...)`.
+    /// `descr` discriminates the pure cache slot so cross-descr
+    /// collisions (ARRAYLEN_GC across distinct array descrs) don't
+    /// collapse onto the same key.
     pub fn register_pure_from_args1_with_descr(
         &mut self,
         opcode: OpCode,
-        result: OpRef,
-        arg0: OpRef,
+        key: Operand,
+        forwarded: Operand,
         descr: majit_ir::DescrRef,
     ) {
         self.pending_pure_from_args
-            .push((opcode, result, arg0, Some(descr)));
+            .push((opcode, key, forwarded, Some(descr)));
     }
 
-    /// info.py:557 `pure_from_args(ARRAYLEN_GC, [op], ConstInt(len))`
-    pub fn pure_from_args_arraylen(&mut self, array_ref: OpRef, length: i64) {
-        let len_ref = self.emit_constant_int(length);
-        self.register_pure_from_args1(OpCode::ArraylenGc, array_ref, len_ref);
+    /// `pure_from_args(ARRAYLEN_GC, [op], ConstInt(len))`.
+    pub fn pure_from_args_arraylen(&mut self, array: Operand, length: i64) {
+        let len = Operand::const_from_value(Value::Int(length));
+        self.register_pure_from_args1(OpCode::ArraylenGc, array, len);
     }
 
     /// Probe the pure-op ring for `op`. Empty until `OptPure` publishes.
@@ -5378,18 +5377,18 @@ impl OptContext {
         pure::shared_get_pure_result(&table, op, self)
     }
 
-    /// optimizer.py: pure_from_args2 parity.
-    /// Register binary reverse-pure: pure(opcode, arg0, arg1) = result.
-    /// Consumed by OptPure at flush time.
+    /// `pure_from_args2(opnum, arg0, arg1, op)`: `forwarded` is the box
+    /// the synthetic op forwards to. Consumed by OptPure before the next
+    /// propagate.
     pub fn register_pure_from_args2(
         &mut self,
         opcode: OpCode,
-        result: OpRef,
-        arg0: OpRef,
-        arg1: OpRef,
+        forwarded: Operand,
+        arg0: Operand,
+        arg1: Operand,
     ) {
         self.pending_pure_from_args2
-            .push((opcode, arg0, arg1, result));
+            .push((opcode, arg0, arg1, forwarded));
     }
 
     /// Grain's reds (`Vm`, frame, `Scope`) live on the thread stack and
@@ -6028,6 +6027,29 @@ impl OptContext {
         // in the sense this rejoin needs, and a preamble-proved constant is
         // the case it exists for.
         imported.is_constant().then_some(imported)
+    }
+
+    /// Debug witness: `got` is the box `get_box_replacement` reached from a
+    /// caller-held operand, `probed` is that operand's position. When the
+    /// position has a producer, the two terminals are the same box.
+    #[cfg(debug_assertions)]
+    pub(crate) fn debug_assert_operand_matches_positional(
+        &self,
+        got: &Operand,
+        probed: OpRef,
+        site: &str,
+    ) {
+        if probed.is_none() {
+            return;
+        }
+        if let Some(old) = self.get_box_replacement_operand_opt(probed) {
+            debug_assert!(
+                got.same_box(&old),
+                "{site} {probed:?}: new {:?} old {:?}",
+                got.to_opref(),
+                old.to_opref()
+            );
+        }
     }
 
     /// `get_box_replacement(op)`: walk the operand's own `_forwarded`

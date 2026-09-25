@@ -1137,12 +1137,9 @@ impl VirtualState {
                 //             else:
                 //                 raise VirtualStatesCantMatch
                 //     boxes[self.position_in_notvirtuals] = box
-                let resolved = ctx.get_replacement_opref(opref);
-                let forced = match ctx
-                    .get_box_replacement_operand_opt(opref)
-                    .as_ref()
-                    .and_then(|b| ctx.peek_ptr_info(b))
-                {
+                let resolved_box = ctx.get_box_replacement_operand_opt(opref);
+                let resolved = resolved_box.as_ref().map(|b| b.to_opref()).unwrap_or(opref);
+                let forced = match resolved_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
                     // RPython: Virtualizable refs stay virtual across iterations.
                     Some(PtrInfo::Virtualizable(_)) => resolved,
                     Some(ptr_info) if ptr_info.is_virtual() => {
@@ -1163,7 +1160,12 @@ impl VirtualState {
                         // upstream owner switch.
                         let saved_pass_idx = ctx.current_pass_idx;
                         ctx.current_pass_idx = ctx.optearlyforce_idx;
-                        let forced = optimizer.force_box(resolved, ctx);
+                        let forced = optimizer.force_box(
+                            resolved_box
+                                .as_ref()
+                                .expect("virtual info lives on the box"),
+                            ctx,
+                        );
                         ctx.current_pass_idx = saved_pass_idx;
                         forced
                     }

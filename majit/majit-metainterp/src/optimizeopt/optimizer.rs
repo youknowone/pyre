@@ -79,7 +79,7 @@ pub trait Optimization {
     /// REVERSE pass order. RPython uses this for bounds propagation
     /// (intbounds.py postprocess_GUARD_TRUE) and heap cache updates
     /// (heap.py postprocess_GETFIELD_GC_I).
-    fn propagate_postprocess(&mut self, _op: &Op, _ctx: &mut OptContext) {}
+    fn propagate_postprocess(&mut self, _op: &Op, _op_rc: &majit_ir::OpRc, _ctx: &mut OptContext) {}
 
     /// optimizer.py have_postprocess
     fn have_postprocess(&self) -> bool {
@@ -2355,12 +2355,15 @@ impl Optimizer {
     /// Body refs route through the preamble source directly, so the prior
     /// reverse-lookup (`imported_short_source`) 3rd key is no longer needed.
     /// Mirrors force_box_inline (mod.rs) contract.
-    pub fn force_box(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
+    /// `op = get_box_replacement(op)` walks the caller-held box.
+    pub fn force_box(&mut self, op: &majit_ir::operand::Operand, ctx: &mut OptContext) -> OpRef {
+        let opref = op.to_opref();
         // optimizer.py: op = get_box_replacement(op)
-        if opref.is_constant() {
+        if op.is_constant() {
             return opref;
         }
-        let resolved_op = ctx.get_box_replacement_operand_opt(opref);
+        let resolved_box = op.get_box_replacement(false);
+        let resolved_op = Some(resolved_box);
         let resolved = resolved_op.as_ref().map_or(opref, |op| op.to_opref());
         // optimizer.py:351-359: potential_extra_ops.pop(op) → sb.add_preamble_op.
         // The pool is keyed by the pure op's result Box. When that result
@@ -2581,7 +2584,12 @@ impl Optimizer {
         ) {
             let saved = ctx.current_pass_idx;
             ctx.current_pass_idx = ctx.optearlyforce_idx;
-            let result = self.force_box(resolved, ctx);
+            let result = self.force_box(
+                resolved_operand
+                    .as_ref()
+                    .expect("raw/str virtual info lives on the resolved box"),
+                ctx,
+            );
             ctx.current_pass_idx = saved;
             return result;
         }
@@ -3604,7 +3612,7 @@ impl Optimizer {
             }
             for i in force_needed {
                 let original = terminal_op.arg(i);
-                let forced = self.force_box(original.to_opref(), &mut ctx);
+                let forced = self.force_box(&original, &mut ctx);
                 // Operand writes carry the canonical box: resolve the chain
                 // terminal, materializing the host when the forced position
                 // has no producer yet (mirrors the materialize_operand_at arm
@@ -5254,11 +5262,11 @@ impl Optimizer {
                         OptContext::link_replaced_producer(op_rc, &created);
                         created
                     };
-                    self.emit_operation_inner(emit_rc, ctx, false)?;
+                    self.emit_operation_inner(emit_rc.clone(), ctx, false)?;
                     // optimizer.py:585-589: invoke postprocess callbacks
                     // in reverse order after emission.
                     for &pp_idx in postprocess_passes.iter().rev() {
-                        self.passes[pp_idx].propagate_postprocess(&op, ctx);
+                        self.passes[pp_idx].propagate_postprocess(&op, &emit_rc, ctx);
                     }
                     self.drain_pending_finish_guard_postprocess(ctx);
                     return Ok(());
@@ -5317,7 +5325,7 @@ impl Optimizer {
                     // RPython's send_extra_operation does not unwind these —
                     // they belong to the original chain.
                     for &pp_idx in postprocess_passes.iter().rev() {
-                        self.passes[pp_idx].propagate_postprocess(&current_op, ctx);
+                        self.passes[pp_idx].propagate_postprocess(&current_op, op_rc, ctx);
                     }
                     self.drain_pending_finish_guard_postprocess(ctx);
                     return Ok(());
@@ -5335,7 +5343,7 @@ impl Optimizer {
                     // `opt_results` collected before it still run, in reverse.
                     // Same loop as the Restart arm above.
                     for &pp_idx in postprocess_passes.iter().rev() {
-                        self.passes[pp_idx].propagate_postprocess(&current_op, ctx);
+                        self.passes[pp_idx].propagate_postprocess(&current_op, op_rc, ctx);
                     }
                     self.drain_pending_finish_guard_postprocess(ctx);
                     return Ok(());
@@ -5359,14 +5367,18 @@ impl Optimizer {
         // If no pass handled it, emit as-is. An unreplaced pass-through is the
         // recorder input op verbatim (args re-resolved), so emit may append
         // that same Rc — no second ResOperation().
-        if !replaced {
+        let emitted_rc = if !replaced {
             self.emit_operation_inner(op_rc.clone(), ctx, true)?;
+            op_rc.clone()
         } else {
-            self.emit_operation((*current_op).clone(), op_rc, ctx, false)?;
-        }
+            let created = OpRc::new((*current_op).clone());
+            OptContext::link_replaced_producer(op_rc, &created);
+            self.emit_operation_inner(created.clone(), ctx, false)?;
+            created
+        };
         // Postprocess in reverse order after emission.
         for &pp_idx in postprocess_passes.iter().rev() {
-            self.passes[pp_idx].propagate_postprocess(&current_op, ctx);
+            self.passes[pp_idx].propagate_postprocess(&current_op, &emitted_rc, ctx);
         }
         // The FINISH reaches its emit down this path — `optimize_FINISH`
         // returns PassOn — so this is the drain that postprocess_FINISH
@@ -5439,7 +5451,7 @@ impl Optimizer {
         // the same canonicalization the pass-entry resolver applies.
         for i in 0..op.num_args() {
             let original_arg = op.arg(i);
-            let forced = self.force_box(original_arg.to_opref(), ctx);
+            let forced = self.force_box(&original_arg, ctx);
             self.flush_queued_producer(forced, ctx)?;
             let resolved = if original_arg.is_constant() && original_arg.to_opref() == forced {
                 // RPython `_emit_operation` calls `force_box` for Const too,
@@ -5588,14 +5600,18 @@ impl Optimizer {
         let op_opcode = op.opcode;
         let op_result_type = op.result_type();
         let _ = reuse;
+        let emitted_box = majit_ir::operand::Operand::from_bound_op(&op);
         let emitted = ctx.emit_rc(op);
-        // optimizer.py `self._emittedoperations[op] = None` — record
-        // the freshly emitted op so `as_operation` can later confirm it
-        // is in the emit set before downstream callers reason about
-        // descriptor-sharing or other emit-bound state. Keyed by the
-        // emitted op's canonical box (the box-identity analog of `op`).
-        self.emitted_operations
-            .insert(ctx.get_box_replacement_operand(emitted));
+        // optimizer.py `self._emittedoperations[op] = None` — record the
+        // appended op object itself so `as_operation` can later confirm it
+        // is in the emit set.
+        let emitted_box = emitted_box.get_box_replacement(false);
+        debug_assert!(
+            ctx.get_box_replacement_operand(emitted)
+                .same_box(&emitted_box),
+            "emitted op at {emitted:?} is not its position's producer"
+        );
+        self.emitted_operations.insert(emitted_box.clone());
         // optimizer.py `_emit_operation` clears the REMOVED
         // sentinel on each successful emit. Cross-pass readers
         // (rewrite.py `optimize_GUARD_NO_EXCEPTION`) see the
@@ -5606,10 +5622,7 @@ impl Optimizer {
         // Run here (post-emit) so the now-bound op box carries the IntBound
         // write; returns_bool ops are Int-typed (asserted above).
         if op_opcode.returns_bool() {
-            let bound_box = ctx
-                .get_box_replacement_operand_opt(emitted)
-                .expect("just-emitted op resolves to a bound operand");
-            ctx.with_intbound_mut(&bound_box, |bound| bound.make_bool());
+            ctx.with_intbound_mut(&emitted_box, |bound| bound.make_bool());
         }
         // optimizer.py: after emit, promote IntBound→Const.
         //   op = self.get_box_replacement(op)
@@ -5617,20 +5630,12 @@ impl Optimizer {
         //       opinfo = op.get_forwarded()  # IntBound
         //       if opinfo is not None and opinfo.is_constant():
         //           op.set_forwarded(ConstInt(opinfo.get_constant_int()))
-        if op_result_type == majit_ir::Type::Int {
-            let replaced = ctx.get_replacement_opref(emitted);
-            // operand shim — peek_intbound_box takes an operand per optimizer.py getintbound.
-            let bound = ctx
-                .get_box_replacement_operand_opt(emitted)
-                .as_ref()
-                .and_then(|b| ctx.peek_intbound_box(b));
-            if let Some(bound) = bound
-                && bound.is_constant()
-            {
-                let const_val = bound.get_constant_int();
-                let b = ctx.materialize_operand_at(replaced);
-                ctx.make_constant_box(&b, majit_ir::Value::Int(const_val));
-            }
+        if op_result_type == majit_ir::Type::Int
+            && let Some(bound) = ctx.peek_intbound_box(&emitted_box)
+            && bound.is_constant()
+        {
+            let const_val = bound.get_constant_int();
+            ctx.make_constant_box(&emitted_box, majit_ir::Value::Int(const_val));
         }
         if crate::majit_log_enabled()
             && matches!(
@@ -5875,9 +5880,9 @@ impl Optimizer {
             Self::store_final_boxes_in_guard(op, ctx, knowledge, pending_for_finish);
             // optimizer.py: force_box on each fail_arg for unrolling.
             if let Some(fa) = op.guard_fail_args() {
-                let fargs: smallvec::SmallVec<[OpRef; 8]> =
-                    fa.iter().map(|a| a.to_opref()).collect();
-                for farg in fargs {
+                let fargs: smallvec::SmallVec<[majit_ir::operand::Operand; 8]> =
+                    fa.iter().cloned().collect();
+                for farg in &fargs {
                     if !farg.is_none() {
                         self.force_box(farg, ctx);
                     }
