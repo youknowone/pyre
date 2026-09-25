@@ -1,8 +1,6 @@
 //! Builtin modules that are not part of interpreter bootstrap.
 
 #[allow(non_snake_case)]
-pub mod _abc;
-#[allow(non_snake_case)]
 pub mod _bisect;
 #[allow(non_snake_case)]
 pub mod _blake2;
@@ -32,8 +30,6 @@ pub mod _csv;
 #[allow(non_snake_case)]
 #[cfg(all(not(feature = "sandbox")))]
 pub mod _ctypes;
-#[allow(non_snake_case)]
-pub mod _functools;
 #[allow(non_snake_case)]
 pub mod _hashlib;
 #[allow(non_snake_case)]
@@ -72,19 +68,9 @@ pub mod _socket;
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 pub mod _ssl;
 #[allow(non_snake_case)]
-pub mod _stat;
-#[allow(non_snake_case)]
 pub mod _statistics;
 #[allow(non_snake_case)]
-pub mod _suggestions;
-#[allow(non_snake_case)]
-pub mod _symtable;
-#[allow(non_snake_case)]
 pub mod _template;
-#[allow(non_snake_case)]
-pub mod _tokenize;
-#[allow(non_snake_case)]
-pub mod _typing;
 #[allow(non_snake_case)]
 #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
 pub mod _uuid;
@@ -95,8 +81,6 @@ pub mod _winapi;
 pub mod _wmi;
 pub mod binascii;
 pub mod cmath;
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-pub mod faulthandler;
 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 pub mod fcntl;
 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
@@ -110,8 +94,6 @@ pub mod math;
 pub mod mmap;
 #[cfg(all(windows, feature = "host_env"))]
 pub mod msvcrt;
-#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
-pub mod pwd;
 pub mod pyexpat;
 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 pub mod resource;

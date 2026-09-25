@@ -1224,11 +1224,11 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
 /// interpreter class in `SUBCLASS_RANGE_HIERARCHY` on Windows.
 const WINDOWS_CONSOLE_IO: bool = cfg!(all(windows, feature = "host_env", not(feature = "sandbox")));
 
-/// The first GC type id `build_gc` gives a class `pyre-module` registers.
+/// The first GC type id `build_gc` gives a builtin module's class.
 ///
 /// Every object and interpreter class registers before them, so their ids do
 /// not depend on which modules are linked; the module classes follow in the
-/// order [`crate::importing::OptionalModuleHooks::gc_types`] lists them.
+/// order [`module_gc_types`] lists them.
 pub const MODULE_FIRST_TYPE_ID: u32 = if cfg!(target_arch = "wasm32") {
     170
 } else if WINDOWS_CONSOLE_IO {
@@ -1237,11 +1237,16 @@ pub const MODULE_FIRST_TYPE_ID: u32 = if cfg!(target_arch = "wasm32") {
     172
 };
 
-/// The GC classes the installed module hooks register, in `build_gc` order.
-fn module_gc_types() -> Vec<crate::importing::ModuleGcType> {
-    crate::importing::optional_module_hooks()
-        .map(|hooks| (hooks.gc_types)())
-        .unwrap_or_default()
+/// The GC classes of builtin modules, in `build_gc` order: those of this
+/// crate's modules, then those the installed module hooks register.
+pub fn module_gc_types() -> Vec<crate::importing::ModuleGcType> {
+    let mut types = Vec::new();
+    crate::module::_tokenize::gc_types(&mut types);
+    crate::module::_functools::gc_types(&mut types);
+    if let Some(hooks) = crate::importing::optional_module_hooks() {
+        types.extend((hooks.gc_types)());
+    }
+    types
 }
 
 /// The subclass-range aliases of the classes `pyre-module` registers: one per
