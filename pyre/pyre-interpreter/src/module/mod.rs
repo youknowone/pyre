@@ -14,9 +14,13 @@ pub mod _codecs;
 pub mod _collections;
 #[allow(non_snake_case)]
 pub mod _contextvars;
+#[allow(non_snake_case)]
+pub mod _immutables_map;
 pub mod _io;
 #[allow(non_snake_case)]
 pub mod _locale;
+#[allow(non_snake_case)]
+pub mod _opcode;
 #[allow(non_snake_case)]
 pub mod _pickle;
 #[allow(non_snake_case)]
@@ -28,6 +32,7 @@ pub mod _warnings;
 pub mod _weakref;
 pub mod array;
 pub mod atexit;
+pub mod errno;
 pub mod gc;
 #[allow(non_snake_case)]
 pub mod imp;
@@ -36,6 +41,7 @@ pub mod itertools;
 pub mod marshal;
 pub mod operator;
 pub mod posix;
+pub mod pypyjit;
 #[allow(non_snake_case)]
 pub mod signal;
 #[allow(non_snake_case)]
