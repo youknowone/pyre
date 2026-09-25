@@ -3132,6 +3132,11 @@ impl TraceCtx {
                 &[vable],
                 info.array_pointer_field_descr(array_index),
             );
+            // `EmbeddedArray` keeps length and items in different words of the
+            // container (`virtualizable.py` `bhimpl_setarrayitem_vable_*`
+            // loads the array, then indexes it). The field load is the
+            // container; the items live at its data pointer.
+            let array_ref = self.vable_embedded_items_base(array_ref, array_index);
             let array_descr = info.array_item_descr(array_index);
             for item_index in 0..length {
                 let Some(&value) = boxes.get(flat_index) else {
@@ -3196,6 +3201,7 @@ impl TraceCtx {
                 Some(Value::Ref(majit_ir::GcRef(vable_ptr))),
                 &field_descr,
             );
+            let array_ref = self.vable_embedded_items_base(array_ref, array_index);
             let item_type = info.array_fields[array_index].item_type;
             let item_opcode = match item_type {
                 Type::Int => OpCode::GetarrayitemGcI,
@@ -5370,6 +5376,7 @@ impl TraceCtx {
             // arraybox = self.opimpl_getfield_gc_r(box, fdescr)
             // return self.opimpl_getarrayitem_gc_i(arraybox, indexbox, adescr)
             let array_opref = self.nonstandard_vable_array_base(vable_opref, &fdescr);
+            let array_opref = self.vable_embedded_items_base_descr(array_opref, &fdescr);
             return (
                 self.vable_getarrayitem_int_descr(array_opref, index, adescr),
                 None,
@@ -5398,6 +5405,7 @@ impl TraceCtx {
             0,
         );
         self.stamp_vable_array_base(array_opref, concrete, &fdescr);
+        let array_opref = self.vable_embedded_items_base_descr(array_opref, &fdescr);
         if let Ok(item_index) = usize::try_from(index_runtime_value) {
             self.vable_getarrayitem_int_vable(array_opref, &fdescr, item_index, adescr)
         } else {
@@ -5413,6 +5421,63 @@ impl TraceCtx {
     /// which executes the load before recording it, so the box it hands on
     /// carries the loaded pointer. A base left symbolic propagates "no
     /// concrete" into every element read taken through it.
+    /// Items pointer of an `EmbeddedArray` container.
+    ///
+    /// `bhimpl_getarrayitem_vable_*` loads the array field, then the data
+    /// pointer inside that container. A direct `getarrayitem` on the field
+    /// value indexes the container header (`Vec`'s length word).
+    fn vable_embedded_items_base(&mut self, container: OpRef, array_index: usize) -> OpRef {
+        let Some(info) = self.virtualizable_info.clone() else {
+            return container;
+        };
+        let Some(array) = info.array_fields.get(array_index) else {
+            return container;
+        };
+        let crate::virtualizable::VableArrayStorage::EmbeddedArray { ptr_offset } = array.storage
+        else {
+            return container;
+        };
+        let word = std::mem::size_of::<usize>();
+        let field = std::sync::Arc::new(majit_ir::descr::SimpleFieldDescr::new_with_name(
+            0,
+            ptr_offset,
+            word,
+            Type::Ref,
+            false,
+            majit_ir::descr::ArrayFlag::Pointer,
+            "buf".to_string(),
+            "buf".to_string(),
+        ));
+        let mut parent = majit_ir::descr::SimpleSizeDescr::new(0, word * 3, 0);
+        parent.set_gc_managed(false);
+        parent.set_headerless(true);
+        let parent = parent.with_all_fielddescrs(vec![field.clone()]);
+        let parent: majit_ir::DescrRef = std::sync::Arc::new(parent);
+        field.set_parent_descr(&parent);
+        // `get_parent_descr` upgrades a `Weak`. The field descr stored on the
+        // op is the only other owner, so the parent has to stay alive itself.
+        Self::keep_embedded_parent(parent);
+        self.record_op_with_descr(OpCode::GetfieldGcR, &[container], field)
+    }
+
+    fn vable_embedded_items_base_descr(&mut self, container: OpRef, fdescr: &DescrRef) -> OpRef {
+        let Some(info) = self.virtualizable_info.clone() else {
+            return container;
+        };
+        let Some(array_index) = info.array_field_by_descr(fdescr) else {
+            return container;
+        };
+        self.vable_embedded_items_base(container, array_index)
+    }
+
+    fn keep_embedded_parent(parent: majit_ir::DescrRef) {
+        use std::sync::Mutex;
+        static KEPT: Mutex<Vec<majit_ir::DescrRef>> = Mutex::new(Vec::new());
+        KEPT.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(parent);
+    }
+
     fn stamp_vable_array_base(&mut self, op: OpRef, vable: Option<Value>, fdescr: &DescrRef) {
         let Some(Value::Ref(vable_ref)) = vable else {
             return;
@@ -5543,6 +5608,7 @@ impl TraceCtx {
                 adescr.index(),
             );
             let array_opref = self.nonstandard_vable_array_base(vable_opref, &fdescr);
+            let array_opref = self.vable_embedded_items_base_descr(array_opref, &fdescr);
             let item = self.vable_getarrayitem_ref_descr(array_opref, index, adescr);
             if crate::vable_read_probe_enabled() {
                 eprintln!(
@@ -5579,6 +5645,7 @@ impl TraceCtx {
             0,
         );
         self.stamp_vable_array_base(array_opref, concrete, &fdescr);
+        let array_opref = self.vable_embedded_items_base_descr(array_opref, &fdescr);
         let result = if let Ok(item_index) = usize::try_from(index_runtime_value) {
             self.vable_getarrayitem_ref_vable(array_opref, &fdescr, item_index, adescr)
         } else {
@@ -5669,6 +5736,7 @@ impl TraceCtx {
         let concrete = self.concrete_of_opref(vable_opref);
         if nonstandard {
             let array_opref = self.nonstandard_vable_array_base(vable_opref, &fdescr);
+            let array_opref = self.vable_embedded_items_base_descr(array_opref, &fdescr);
             return (
                 self.vable_getarrayitem_float_descr(array_opref, index, adescr),
                 None,
@@ -5691,6 +5759,7 @@ impl TraceCtx {
             0,
         );
         self.stamp_vable_array_base(array_opref, concrete, &fdescr);
+        let array_opref = self.vable_embedded_items_base_descr(array_opref, &fdescr);
         if let Ok(item_index) = usize::try_from(index_runtime_value) {
             self.vable_getarrayitem_float_vable(array_opref, &fdescr, item_index, adescr)
         } else {
@@ -5807,6 +5876,7 @@ impl TraceCtx {
         let vable_concrete = self.concrete_of_opref(vable_opref);
         self.stamp_vable_array_base(array_opref, vable_concrete, &field_descr);
         self.heapcache_getfield_now_known(vable_opref, field_descr.index(), array_opref);
+        let array_opref = self.vable_embedded_items_base(array_opref, array_index);
         for &(item_index, value) in items {
             let index = self.const_int(item_index);
             self.execute_and_record(
@@ -5843,6 +5913,7 @@ impl TraceCtx {
     ) -> VableArrayStore {
         if nonstandard {
             let array_opref = self.nonstandard_vable_array_base(vable_opref, &fdescr);
+            let array_opref = self.vable_embedded_items_base_descr(array_opref, &fdescr);
             self.execute_setarrayitem_gc(array_opref, index, value, adescr);
             return VableArrayStore::Stored(None);
         }
