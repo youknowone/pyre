@@ -93,6 +93,12 @@ extern "C" fn shadow_stack_try_pop_to_word(depth: i64) {
     majit_gc::shadow_stack::try_pop_to(depth as usize);
 }
 
+/// Word ABI for `majit_gc::bh_probe_note_store(usize, usize, u32)`; the
+/// interpreter's traced frame-enter paths call it beside the write barrier.
+extern "C" fn bh_probe_note_store_word(obj: i64, offset: i64, site: i64) {
+    majit_gc::bh_probe_note_store(obj as usize, offset as usize, site as u32);
+}
+
 /// One-word residual ABI for `w_list_pop_end`. Empty is NULL; the generated
 /// `descr_pop` graph still owns the IndexError. `Option<PyObjectRef>` is two
 /// words with no pointer niche, so publishing the Rust function would return
@@ -1142,6 +1148,11 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "majit_gc::shadow_stack::try_pop_to",
         shadow_stack_try_pop_to_word,
+    );
+    cp3(
+        &mut entries,
+        "majit_gc::bh_probe_note_store",
+        bh_probe_note_store_word,
     );
 
     pa1(

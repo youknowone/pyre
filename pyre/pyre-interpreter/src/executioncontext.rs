@@ -682,6 +682,17 @@ pub struct ExecutionContext {
     /// this one is an identity token that may name a frame already freed, so
     /// forwarding it would be wrong rather than merely unnecessary.
     pub accounted_activation: usize,
+    /// Left by `generator_invoke_execute_frame`'s finally once
+    /// the frame body returned and `running` is cleared; read by the jd2 abort
+    /// fallback to tell 'the resume never returned' from 'the body already ran'.
+    /// Per thread: each mutator resumes its own generators. Recorded only
+    /// while a jd2 walk has armed it, so the plain interpreter never holds
+    /// the last resumed generator or its result here.
+    pub genentry_note_armed: bool,
+    pub genentry_note_finished: bool,
+    pub genentry_note_is_err: bool,
+    pub genentry_note_gen: PyObjectRef,
+    pub genentry_note_word: PyObjectRef,
 }
 
 pub type PyExecutionContext = ExecutionContext;
@@ -795,6 +806,11 @@ impl ExecutionContext {
             w_profilefuncarg: pyre_object::PY_NULL,
             thread_disappeared: false,
             w_async_exception_type: pyre_object::PY_NULL,
+            genentry_note_armed: false,
+            genentry_note_finished: false,
+            genentry_note_is_err: false,
+            genentry_note_gen: pyre_object::PY_NULL,
+            genentry_note_word: pyre_object::PY_NULL,
             signals_enabled: 0,
             trace_all_generation: 0,
             profile_all_generation: 0,
@@ -839,6 +855,11 @@ impl ExecutionContext {
         ec.store_profilefunc(None, pyre_object::PY_NULL);
         ec.thread_disappeared = false;
         ec.w_async_exception_type = pyre_object::PY_NULL;
+        ec.genentry_note_armed = false;
+        ec.genentry_note_finished = false;
+        ec.genentry_note_is_err = false;
+        ec.genentry_note_gen = pyre_object::PY_NULL;
+        ec.genentry_note_word = pyre_object::PY_NULL;
         // threadlocals.py — a fresh worker EC starts disabled.  `_set_ec`
         // enables only the process main thread, and reinit_threads promotes
         // the surviving EC after a fork.
@@ -880,6 +901,12 @@ impl ExecutionContext {
         }
         visitor(unsafe {
             &mut *(&mut self.contextvar_context as *mut PyObjectRef as *mut majit_ir::GcRef)
+        });
+        visitor(unsafe {
+            &mut *(&mut self.genentry_note_gen as *mut PyObjectRef as *mut majit_ir::GcRef)
+        });
+        visitor(unsafe {
+            &mut *(&mut self.genentry_note_word as *mut PyObjectRef as *mut majit_ir::GcRef)
         });
         visitor(unsafe { &mut *(&mut self.py_repr as *mut PyObjectRef as *mut majit_ir::GcRef) });
         for entry in self.repr_active.get_mut().iter_mut() {

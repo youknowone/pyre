@@ -1174,15 +1174,15 @@ pub fn symbolic_residual_trace_aborts() -> u64 {
 }
 
 /// Print the missing-binding diagnostic once per distinct symbolic target.
-fn report_symbolic_residual_call_target_once(func: usize, arg_classes: Option<&str>) {
-    static REPORTED: std::sync::LazyLock<std::sync::Mutex<std::collections::BTreeSet<usize>>> =
+fn report_symbolic_residual_call_target_once(func: i64, arg_classes: Option<&str>) {
+    static REPORTED: std::sync::LazyLock<std::sync::Mutex<std::collections::BTreeSet<i64>>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::BTreeSet::new()));
     let first_report = REPORTED
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .insert(func);
     if first_report {
-        if let Some(path) = super::resolve_symbolic_fnaddr_path(func as i64) {
+        if let Some(path) = super::resolve_symbolic_fnaddr_path(func) {
             eprintln!(
                 "residual call target {func:#x} is symbolic path {path:?}, not a code address \
                  (arg classes {arg_classes:?}; None means the static reachable-set scan). The \
@@ -1215,7 +1215,7 @@ fn report_symbolic_residual_call_target_once(func: usize, arg_classes: Option<&s
 /// before making the call, so discarding the recording needs no rollback.
 fn report_symbolic_residual_call_target(
     ctx: &mut TraceCtx,
-    func: usize,
+    func: i64,
     arg_classes: Option<&str>,
 ) -> TraceAction {
     ctx.symbolic_residual_abort = true;
@@ -1313,7 +1313,7 @@ fn refuse_reachable_symbolic_residuals(jitcode: &JitCode) -> bool {
     // earlier residual's heap effects.
     SYMBOLIC_RESIDUAL_TRACE_ABORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     for &target in targets {
-        report_symbolic_residual_call_target_once(target as usize, None);
+        report_symbolic_residual_call_target_once(target, None);
     }
     true
 }
@@ -7948,8 +7948,7 @@ where
                                      {funcptr_reg} is uninitialized"
                                     )
                                 });
-                            let func = func as *const ();
-                            JitCallTarget::new(func, func)
+                            JitCallTarget::from_fnaddr(func)
                         });
                     (target, args_i, args_r, args_f, calldescr, trace_descr)
                 };
@@ -7967,6 +7966,7 @@ where
                 } else {
                     target.concrete_ptr
                 };
+                let fnaddr_word = target.fnaddr_for_symbolic_check(concrete_ptr);
                 if let Some(action) = refuse_walk_local_ref_args(
                     ctx,
                     concrete_ptr as usize,
@@ -8004,10 +8004,10 @@ where
                 // other dispatch sites in `blackhole.rs`.
                 if effectinfo.oopspecindex == majit_ir::descr::OopSpecIndex::NotInTrace {
                     self.clear_exception();
-                    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+                    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr_word) {
                         return report_symbolic_residual_call_target(
                             ctx,
-                            concrete_ptr as usize,
+                            fnaddr_word,
                             Some(&calldescr.arg_classes),
                         );
                     }
@@ -8113,10 +8113,10 @@ where
                     //    `bh_call_i_dispatch` (which transmutes to
                     //    `extern "C" fn(...) -> i64` and reads garbage from
                     //    rax/x0).
-                    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+                    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr_word) {
                         return report_symbolic_residual_call_target(
                             ctx,
-                            concrete_ptr as usize,
+                            fnaddr_word,
                             Some(&calldescr.arg_classes),
                         );
                     }
@@ -8314,8 +8314,7 @@ where
                                          {funcptr_reg} is uninitialized"
                                     )
                                 });
-                            let func = func as *const ();
-                            JitCallTarget::new(func, func)
+                            JitCallTarget::from_fnaddr(func)
                         });
                     (target, args_i, args_r, args_f, calldescr, trace_descr, dst)
                 };
@@ -8333,6 +8332,7 @@ where
                 } else {
                     target.concrete_ptr
                 };
+                let fnaddr_word = target.fnaddr_for_symbolic_check(concrete_ptr);
                 if let Some(action) = refuse_walk_local_ref_args(
                     ctx,
                     concrete_ptr as usize,
@@ -8366,10 +8366,10 @@ where
                     // through `bh_call_v_dispatch`, do not write back the
                     // int destination register, and abort on exception.
                     self.clear_exception();
-                    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+                    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr_word) {
                         return report_symbolic_residual_call_target(
                             ctx,
-                            concrete_ptr as usize,
+                            fnaddr_word,
                             Some(&calldescr.arg_classes),
                         );
                     }
@@ -8458,10 +8458,10 @@ where
                     // Concrete execute via `bh_call_i_dispatch` (i64
                     // return) — RPython `executor.execute_varargs` →
                     // `cpu.bh_call_i`.
-                    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+                    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr_word) {
                         return report_symbolic_residual_call_target(
                             ctx,
-                            concrete_ptr as usize,
+                            fnaddr_word,
                             Some(&calldescr.arg_classes),
                         );
                     }
@@ -8682,8 +8682,7 @@ where
                                          {funcptr_reg} is uninitialized"
                                     )
                                 });
-                            let func = func as *const ();
-                            JitCallTarget::new(func, func)
+                            JitCallTarget::from_fnaddr(func)
                         });
                     (target, args_i, args_r, args_f, calldescr, trace_descr, dst)
                 };
@@ -8701,6 +8700,7 @@ where
                 } else {
                     target.concrete_ptr
                 };
+                let fnaddr_word = target.fnaddr_for_symbolic_check(concrete_ptr);
                 if let Some(action) = refuse_walk_local_ref_args(
                     ctx,
                     concrete_ptr as usize,
@@ -8725,10 +8725,10 @@ where
                     // the int sibling at the corresponding NotInTrace
                     // branch for the full citation.
                     self.clear_exception();
-                    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+                    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr_word) {
                         return report_symbolic_residual_call_target(
                             ctx,
-                            concrete_ptr as usize,
+                            fnaddr_word,
                             Some(&calldescr.arg_classes),
                         );
                     }
@@ -8813,10 +8813,10 @@ where
                     } else {
                         None
                     };
-                    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+                    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr_word) {
                         return report_symbolic_residual_call_target(
                             ctx,
-                            concrete_ptr as usize,
+                            fnaddr_word,
                             Some(&calldescr.arg_classes),
                         );
                     }
@@ -8989,8 +8989,7 @@ where
                                          {funcptr_reg} is uninitialized"
                                     )
                                 });
-                            let func = func as *const ();
-                            JitCallTarget::new(func, func)
+                            JitCallTarget::from_fnaddr(func)
                         });
                     (target, args_i, args_r, args_f, calldescr, trace_descr, dst)
                 };
@@ -9008,6 +9007,7 @@ where
                 } else {
                     target.concrete_ptr
                 };
+                let fnaddr_word = target.fnaddr_for_symbolic_check(concrete_ptr);
                 if let Some(action) = refuse_walk_local_ref_args(
                     ctx,
                     concrete_ptr as usize,
@@ -9032,10 +9032,10 @@ where
                     // the int sibling at the corresponding NotInTrace
                     // branch for the full citation.
                     self.clear_exception();
-                    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+                    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr_word) {
                         return report_symbolic_residual_call_target(
                             ctx,
-                            concrete_ptr as usize,
+                            fnaddr_word,
                             Some(&calldescr.arg_classes),
                         );
                     }
@@ -9109,10 +9109,10 @@ where
                     } else {
                         None
                     };
-                    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+                    if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr_word) {
                         return report_symbolic_residual_call_target(
                             ctx,
-                            concrete_ptr as usize,
+                            fnaddr_word,
                             Some(&calldescr.arg_classes),
                         );
                     }
@@ -9317,7 +9317,7 @@ where
                 if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
                     return report_symbolic_residual_call_target(
                         ctx,
-                        concrete_ptr as usize,
+                        concrete_ptr as i64,
                         Some(&arg_classes),
                     );
                 }
@@ -9419,8 +9419,7 @@ where
                                      is uninitialized"
                                     )
                                 });
-                            let func = func as *const ();
-                            JitCallTarget::new(func, func)
+                            JitCallTarget::from_fnaddr(func)
                         });
                     let dst = if matches!(
                         bytecode,
@@ -9445,6 +9444,7 @@ where
                 } else {
                     target.concrete_ptr
                 };
+                let fnaddr_word = target.fnaddr_for_symbolic_check(concrete_ptr);
                 let slot = target.effect_info_slot;
                 match bytecode {
                     jitcode::insns::BC_CONDITIONAL_CALL_IR_V => {
@@ -9483,12 +9483,11 @@ where
                                 ) {
                                     return action;
                                 }
-                                if majit_jitcode::codewriter::call::is_symbolic_fnaddr(
-                                    concrete_ptr as i64,
-                                ) {
+                                if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr_word)
+                                {
                                     return report_symbolic_residual_call_target(
                                         ctx,
-                                        concrete_ptr as usize,
+                                        fnaddr_word,
                                         Some(&calldescr.arg_classes),
                                     );
                                 }
@@ -9556,12 +9555,11 @@ where
                                 ) {
                                     return action;
                                 }
-                                if majit_jitcode::codewriter::call::is_symbolic_fnaddr(
-                                    concrete_ptr as i64,
-                                ) {
+                                if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr_word)
+                                {
                                     return report_symbolic_residual_call_target(
                                         ctx,
-                                        concrete_ptr as usize,
+                                        fnaddr_word,
                                         Some(&calldescr.arg_classes),
                                     );
                                 }
@@ -9671,12 +9669,11 @@ where
                                 ) {
                                     return action;
                                 }
-                                if majit_jitcode::codewriter::call::is_symbolic_fnaddr(
-                                    concrete_ptr as i64,
-                                ) {
+                                if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr_word)
+                                {
                                     return report_symbolic_residual_call_target(
                                         ctx,
-                                        concrete_ptr as usize,
+                                        fnaddr_word,
                                         Some(&calldescr.arg_classes),
                                     );
                                 }
@@ -9851,6 +9848,7 @@ where
                 } else {
                     target.concrete_ptr
                 };
+                let fnaddr_word = target.fnaddr_for_symbolic_check(concrete_ptr);
                 let slot = target.effect_info_slot;
                 let extra_info = crate::call_descr::effect_info_for_slot(slot);
                 let mut raw_i = Vec::new();
@@ -9903,12 +9901,11 @@ where
                                 ) {
                                     return action;
                                 }
-                                if majit_jitcode::codewriter::call::is_symbolic_fnaddr(
-                                    concrete_ptr as i64,
-                                ) {
+                                if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr_word)
+                                {
                                     return report_symbolic_residual_call_target(
                                         ctx,
-                                        concrete_ptr as usize,
+                                        fnaddr_word,
                                         Some(&arg_classes),
                                     );
                                 }
@@ -9971,12 +9968,11 @@ where
                                 ) {
                                     return action;
                                 }
-                                if majit_jitcode::codewriter::call::is_symbolic_fnaddr(
-                                    concrete_ptr as i64,
-                                ) {
+                                if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr_word)
+                                {
                                     return report_symbolic_residual_call_target(
                                         ctx,
-                                        concrete_ptr as usize,
+                                        fnaddr_word,
                                         Some(&arg_classes),
                                     );
                                 }
@@ -10085,12 +10081,11 @@ where
                                 ) {
                                     return action;
                                 }
-                                if majit_jitcode::codewriter::call::is_symbolic_fnaddr(
-                                    concrete_ptr as i64,
-                                ) {
+                                if majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr_word)
+                                {
                                     return report_symbolic_residual_call_target(
                                         ctx,
-                                        concrete_ptr as usize,
+                                        fnaddr_word,
                                         Some(&arg_classes),
                                     );
                                 }
@@ -10320,7 +10315,7 @@ where
                 if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
                     return report_symbolic_residual_call_target(
                         ctx,
-                        concrete_ptr as usize,
+                        concrete_ptr as i64,
                         Some(&arg_classes),
                     );
                 }
@@ -10447,7 +10442,7 @@ where
                 if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
                     return report_symbolic_residual_call_target(
                         ctx,
-                        concrete_ptr as usize,
+                        concrete_ptr as i64,
                         Some(&arg_classes),
                     );
                 }
@@ -10576,7 +10571,7 @@ where
                 if majit_jitcode::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
                     return report_symbolic_residual_call_target(
                         ctx,
-                        concrete_ptr as usize,
+                        concrete_ptr as i64,
                         Some(&arg_classes),
                     );
                 }
@@ -10637,6 +10632,8 @@ where
             jitcode::insns::BC_FLOAT_GE => self.trace_compare_f(ctx, OpCode::FloatGe),
             jitcode::insns::BC_CAST_INT_TO_FLOAT => self.trace_cast_int_to_float(ctx),
             jitcode::insns::BC_CAST_FLOAT_TO_INT => self.trace_cast_float_to_int(ctx),
+            jitcode::insns::BC_CAST_PTR_TO_INT => self.trace_cast_ptr_to_int(ctx),
+            jitcode::insns::BC_CAST_INT_TO_PTR => self.trace_cast_int_to_ptr(ctx),
             jitcode::insns::BC_CONVERT_FLOAT_BYTES_TO_LONGLONG => {
                 self.trace_convert_float_bytes_to_longlong(ctx)
             }
@@ -11911,6 +11908,48 @@ where
             self.last_exception_value,
         );
         self.set_float_reg(dst, Some(opref), Some(fvalue.to_bits() as i64));
+    }
+
+    /// `cast_ptr_to_int/r>i`: the pointer word moves to the int bank.
+    /// `[src][dst]`. Identity on the bits (`bhimpl_cast_ptr_to_int`).
+    fn trace_cast_ptr_to_int(&mut self, ctx: &mut TraceCtx) {
+        let (src_idx, dst) = {
+            let frame = self.frames.current_mut();
+            let src_idx = frame.next_u8() as usize;
+            let dst = frame.next_u8() as usize;
+            (src_idx, dst)
+        };
+        let (src, bits) = self.read_ref_reg(src_idx);
+        let opref = ctx.execute_and_record(
+            Some(self.cpu.as_ref()),
+            OpCode::CastPtrToInt,
+            None,
+            &[src],
+            Some(majit_ir::Value::Int(bits)),
+            self.last_exception_value,
+        );
+        self.set_int_reg(dst, Some(opref), Some(bits));
+    }
+
+    /// `cast_int_to_ptr/i>r`: the int word moves to the ref bank.
+    /// `[src][dst]`. Identity on the bits (`bhimpl_cast_int_to_ptr`).
+    fn trace_cast_int_to_ptr(&mut self, ctx: &mut TraceCtx) {
+        let (src_idx, dst) = {
+            let frame = self.frames.current_mut();
+            let src_idx = frame.next_u8() as usize;
+            let dst = frame.next_u8() as usize;
+            (src_idx, dst)
+        };
+        let (src, bits) = self.read_int_reg(src_idx);
+        let opref = ctx.execute_and_record(
+            Some(self.cpu.as_ref()),
+            OpCode::CastIntToPtr,
+            None,
+            &[src],
+            Some(majit_ir::Value::Ref(majit_ir::GcRef(bits as usize))),
+            self.last_exception_value,
+        );
+        self.set_ref_reg(dst, Some(opref), Some(bits));
     }
 
     /// `cast_float_to_int/f>i`: truncate a float-bank value toward zero into the

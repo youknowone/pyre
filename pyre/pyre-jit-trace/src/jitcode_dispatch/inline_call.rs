@@ -12788,7 +12788,9 @@ fn generator_resume_can_perform_call<Sym: WalkSym>(_ctx: &WalkContext<'_, '_, Sy
 pub(crate) fn try_walker_specialize_generator_next<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
+    funcptr: OpRef,
     r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
@@ -12832,7 +12834,7 @@ pub(crate) fn try_walker_specialize_generator_next<Sym: WalkSym>(
             census.replay.is_some_and(|r| r.unscannable),
         );
     }
-    walk_generator_resume(ctx, op, r_args[0], iter_obj, dst)
+    walk_generator_resume(ctx, op, funcptr, r_args[0], iter_obj, call_descr, dst)
 }
 
 /// `'static` `DescrRefTable` for an already-leaked per-fn descr slice.
@@ -12858,13 +12860,160 @@ fn static_descr_table(refs: &'static [DescrRef]) -> &'static dyn DescrRefTable {
     })
 }
 
+/// `should_not_inline`: do not inline the generator body.
+///
+/// `opimpl_jit_merge_point` with `portal_call_depth > 0` records
+/// `CALL_ASSEMBLER` (`do_recursive_call(assembler_call=True)` →
+/// `direct_assembler_call`). The token is `warmstate.py`
+/// `get_assembler_token`: a cell with no procedure yet gets the
+/// `compile.py` `compile_tmp_callback` loop, whose body is
+/// `ll_generatorentry_portal_runner_shim`. A token whose only address is
+/// `generatorentry_portal_c` has no assembled entry for
+/// `redirect_call_assembler` to patch, so the call would stay on that
+/// function after the real trace compiled.
+///
+/// Op order matches `emit_walker_loop_callee_call_assembler`: vable/vref
+/// bookkeeping, concrete `jit_next`, `CALL_ASSEMBLER` + `KEEPALIVE`,
+/// result stamp, dst writeback, `GUARD_NOT_FORCED`, then
+/// `handle_possible_exception`. The green key is
+/// `genentry_resolved_cell_key`, the same key `genentry_merge_point_jit`
+/// passes to `force_start_tracing`.
+fn descend_generatorentry<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    funcptr: OpRef,
+    iter_op: OpRef,
+    iter_obj: pyre_object::PyObjectRef,
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    let Some(canonical) =
+        crate::jitcode_runtime::portal_jitcode_for_key("baseobjspace::generatorentry_portal")
+    else {
+        gen_resume_decline("several_yields");
+        return Ok(None);
+    };
+    let has_merge = crate::jitcode_runtime::decoded_ops(&canonical.code)
+        .any(|decoded| decoded.opname == "jit_merge_point");
+    if !has_merge {
+        gen_resume_decline("several_yields_no_merge");
+        return Ok(None);
+    }
+    let pycode = unsafe { pyre_object::generator::w_generator_get_pycode(iter_obj) };
+    if pycode.is_null() {
+        gen_resume_decline("several_yields_no_pycode");
+        return Ok(None);
+    }
+    // `next()` sends `w_None`. Same object the portal red `w_arg` carries.
+    let w_arg = pyre_object::w_none();
+    // Same cell key `genentry_merge_point_jit` resolves (`warmstate.py
+    // JitCell`): `(pycode, jd index)`, not jd0's `make_green_key(pycode, 0, false)`.
+    let green_key = {
+        let (driver, _) = crate::driver::driver_pair();
+        crate::genentry_state::genentry_resolved_cell_key(
+            driver.meta_interp_mut().warm_state_mut(),
+            pycode,
+        )
+    };
+    let (driver, _) = crate::driver::driver_pair();
+    let greenboxes = [majit_ir::Value::Ref(majit_ir::GcRef(pycode as usize))];
+    let red_types = [majit_ir::Type::Ref, majit_ir::Type::Ref];
+    // `jitdrivers_sd[2]` is `generatorentry` (registered immediately after jd1).
+    let Some(token) = driver
+        .meta_interp_mut()
+        .get_or_make_jitdriver_assembler_token_arc(2, green_key, &greenboxes, &red_types)
+    else {
+        gen_resume_decline("several_yields_no_token");
+        return Ok(None);
+    };
+    if token.call_assembler_refused() {
+        gen_resume_decline("several_yields_ca_refused");
+        return Ok(None);
+    }
+    let none_op = ctx.trace_ctx.const_ref(w_arg as i64);
+    ctx.trace_ctx.set_opref_concrete(
+        none_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(w_arg as usize)),
+    );
+
+    // `pyjitpl.py` `vable_and_vrefs_before_residual_call`, before the call.
+    maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
+    // `direct_assembler_call` executes the call, then rewrites the recorded
+    // op to `CALL_ASSEMBLER`. `jit_next` is that execution for `next(gen)`,
+    // run through the residual executor so the walk's virtualizable heap
+    // pointer is saved and restored around the callee's own portal
+    // activation and `tracing_after_residual_call` runs after it (the same
+    // route `emit_walker_loop_callee_call_assembler` takes). A raw call
+    // left the callee's frame seeded as this walk's vable, and the next
+    // snapshot wrote that frame's slot count into the caller's array.
+    let exec = try_execute_residual_call_via_executor(
+        ctx,
+        OpCode::CallMayForceR,
+        &[funcptr, iter_op],
+        call_descr,
+        OpRef::NONE,
+        op.pc,
+        None,
+        false,
+    )?;
+    // `execute_residual_call` consumes `BH_LAST_EXC_VALUE` and returns the
+    // exception word. Carry that word; do not read the TLS slot afterwards.
+    // `pyjitpl.py handle_possible_exception` / `emit_walker_loop_callee_call_assembler`.
+    let (concrete, raised) = match exec {
+        ResidualExecOutcome::Executed(Ok(result)) => (result, 0),
+        ResidualExecOutcome::Executed(Err(exc)) => (0, exc),
+        ResidualExecOutcome::Declined(cause) => {
+            fbw_mark_unjournaled_effect(cause);
+            gen_resume_decline("several_yields_exec_declined");
+            return Ok(None);
+        }
+    };
+    let ca_result = ctx.trace_ctx.call_assembler_red_only_ref_arc(
+        token,
+        &[iter_op, none_op],
+        &[majit_ir::Type::Ref, majit_ir::Type::Ref],
+    );
+    if concrete != 0 {
+        ctx.trace_ctx.set_opref_concrete(
+            ca_result,
+            majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
+        );
+    }
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .invalidate_caches_for_escaped();
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', ca_result)?;
+    ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    // `direct_assembler_call` keeps the assembler target alive between
+    // `GUARD_NOT_FORCED` and `handle_possible_exception`.
+    ctx.trace_ctx.record_op(OpCode::Keepalive, &[iter_op]);
+    if raised != 0 {
+        // A returning generator raises `StopIteration` out of `send_ex`.
+        // The executor already returned that exception word.
+        let exc = ctx.trace_ctx.const_ref(raised);
+        let exc_concrete = ConcreteValue::Ref(raised as pyre_object::PyObjectRef);
+        ctx.set_last_exc_value(exc, exc_concrete);
+        walker_record_guard_exception(ctx, op.pc);
+        return Ok(Some((
+            DispatchOutcome::SubRaise { exc, exc_concrete },
+            op.next_pc,
+        )));
+    }
+    ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    Ok(Some((DispatchOutcome::Continue, op.next_pc)))
+}
+
 /// Walk the already-installed portal-shaped body of a suspended generator
 /// from `resume_execute_frame` to its next `yield`.
 fn walk_generator_resume<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
+    funcptr: OpRef,
     iter_op: OpRef,
     iter_obj: pyre_object::PyObjectRef,
+    call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     let Some(shape) =
@@ -12884,8 +13033,7 @@ fn walk_generator_resume<Sym: WalkSym>(
     // `CO_GENERATOR` body; `should_not_inline` is the 2+ yield case that
     // upstream sends to `generatorentry_driver` instead.
     if pyre_interpreter::baseobjspace::should_not_inline(code) {
-        gen_resume_decline("several_yields");
-        return Ok(None);
+        return descend_generatorentry(ctx, op, funcptr, iter_op, iter_obj, call_descr, dst);
     }
     if !code.cellvars.is_empty() || !code.freevars.is_empty() {
         gen_resume_decline("cells_or_freevars");
