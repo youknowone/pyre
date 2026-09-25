@@ -418,13 +418,15 @@ CARGO_CONFIG = {
         # `_testmultiphase` against the binary built here: without the feature
         # `test_buffer` skips `TestBufferProtocol` wholesale, which is 95 of
         # that module's cases, and `test_importlib.extension` skips too.
-        # `full` is a pyrex default that `--no-default-features` drops; without
-        # it the binary lacks the native-library modules the product ships.
-        "extra": ["--no-default-features", "--features", "dynasm,cpyext,full"],
+        # `pyre-module` is a pyrex default that `--no-default-features` drops;
+        # without it the binary lacks the builtin modules the product ships.
+        "extra": ["--no-default-features", "--features", "dynasm,cpyext,pyre-module"],
         "bin": "pyre-dynasm",
     },
     "cranelift": {
-        "extra": ["--no-default-features", "--features", "cranelift,full"],
+        # The core: no `pyre-module`, so its build neither compiles nor
+        # translates the builtin modules that crate owns.
+        "extra": ["--no-default-features", "--features", "cranelift"],
         "bin": "pyre-cranelift",
     },
     # The wasm backend is not a `pyrex` binary: it is the wasm32 build of

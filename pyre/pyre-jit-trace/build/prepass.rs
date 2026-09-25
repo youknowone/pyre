@@ -5,7 +5,7 @@
 //! Analyzes all source files from:
 //! - pyre-object (Python object types: W_IntObject, W_FloatObject, etc.)
 //! - pyre-interpreter (object space, bytecode dispatch, eval loop)
-//! - pyre-module (optional builtin modules: math, _csv, …), `full` only
+//! - pyre-module (optional builtin modules: math, _csv, …), when linked
 
 #[path = "../src/call_spec.rs"]
 mod call_spec;
@@ -332,8 +332,8 @@ fn analysis_llbc_paths(repo_root: &str) -> Vec<String> {
 /// `majit-translate` (`build_semantic_program_via_active_frontend`):
 /// honour the `MAJIT_MIR_FRONTEND_LLBC` override, else require the
 /// `LLBC_CRATES` artefacts under `build/<LLBC_SUBDIR>/`. `pyre-jit` contains
-/// the exact `eval::eval_loop_jit` portal; `pyre-module`, in a `full` build
-/// only, holds optional builtin-module graphs so look_inside/elidable survive
+/// the exact `eval::eval_loop_jit` portal; `pyre-module`, in a build that
+/// links it, holds optional builtin-module graphs so look_inside/elidable survive
 /// the crate split.
 ///
 /// When neither resolves, emit a clean, copy-pasteable bootstrap message
@@ -411,19 +411,12 @@ fn preflight_llbc_or_fail() {
     // since `MAJIT_MIR_FRONTEND_LLBC` is treated as the complete input set and
     // returns before the sidecar check above.
     let sidecars = llbc_layout_sidecars();
-    let extract_env: String = CORE_EXTRACTION_ENV
-        .iter()
-        .map(|(key, value)| format!("{key}={value} "))
-        .collect();
     let (extract_cmd, override_extra) = if sidecars.is_empty() {
-        (
-            format!("{extract_env}scripts/extract-llbc.py"),
-            String::new(),
-        )
+        ("scripts/extract-llbc.py".to_string(), String::new())
     } else {
         let target = std::env::var("TARGET").unwrap_or_default();
         (
-            format!("{extract_env}LLBC_LAYOUT_TARGETS={target} scripts/extract-llbc.py"),
+            format!("LLBC_LAYOUT_TARGETS={target} scripts/extract-llbc.py"),
             sidecars
                 .iter()
                 .map(|name| format!(":/abs/{name}"))
@@ -482,13 +475,6 @@ use llbc_fingerprint::{
     FingerprintFields, FreshnessMode, freshness_policy, parse_fingerprint_fields, platform_key,
     stamp_field,
 };
-
-/// The switch that makes `extract-llbc.py` describe the core set; empty for
-/// the product set.
-#[cfg(feature = "full")]
-const CORE_EXTRACTION_ENV: &[(&str, &str)] = &[];
-#[cfg(not(feature = "full"))]
-const CORE_EXTRACTION_ENV: &[(&str, &str)] = &[("PYRE_JIT_CORE", "1")];
 
 /// Wait for the fingerprint oracle with a deadline.
 ///
@@ -559,7 +545,6 @@ fn llbc_current_fingerprint(
             .env("CARGO_FEATURES", features)
             .env("LLBC_LAYOUT_TARGETS", layout_targets)
             .env("LLBC_DEST", repo_root.join("build").join(LLBC_SUBDIR))
-            .envs(CORE_EXTRACTION_ENV.iter().copied())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -956,7 +941,7 @@ fn real_main() {
         // this census. Interpreter `module/mod.rs` currently contributes
         // the `module` root as well, but the moved graphs belong here.
         // The core translation leaves the crate out with its LLBC.
-        #[cfg(feature = "full")]
+        #[cfg(feature = "pyre-module")]
         format!("{pyre_base}/pyre-module/src"),
     ];
 
@@ -1186,7 +1171,7 @@ fn real_main() {
     // `compute_builtin_wrapper_indirect_graphs` records
     // `no jitcode for address`. `register` is idempotent with the
     // crate's ctor.
-    #[cfg(feature = "full")]
+    #[cfg(feature = "pyre-module")]
     pyre_module::register();
     let mut fnaddr_bindings = pyre_interpreter::jit_trace_fnaddrs();
     // This build script is the host, so it reads the linkme slice. The
@@ -1197,7 +1182,7 @@ fn real_main() {
     // Unbound, each one is a symbolic path hash and
     // `refuse_reachable_symbolic_residuals` aborts the trace.
     fnaddr_bindings.extend(pyre_interpreter::baseobjspace::generatorentry_fnaddrs());
-    #[cfg(feature = "full")]
+    #[cfg(feature = "pyre-module")]
     if !fnaddr_bindings
         .iter()
         .any(|(path, _)| path.contains("pyre_module::module::") && path.contains("__majit_wrap_"))

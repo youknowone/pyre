@@ -8,12 +8,6 @@ description = "Python bytecode interpreter for pyre"
 
 [features]
 default = ["host_env"]
-# The rclass tail for `_cffi_backend`, `_ctypes`, `_socket`, `_ssl`, `mmap`,
-# and `select`. Those modules live in `pyre-module`, so this feature only
-# keeps the hierarchy filter in step with them. A dependant turns it on by
-# enabling `pyre-module/full` (which forwards here) or by naming it itself.
-# It is not a default: an interpreter-only build does not register that tail.
-full = []
 host_env = ["dep:rustpython-host_env", "pyre-native/host_env"]
 # Expose the crate-internal `test_hooks` module (thread-local dict hash-hook
 # installer) to downstream test builds. Enabled by `pyre-jit`'s

@@ -7,12 +7,7 @@ repository.workspace = true
 description = "Optional builtin modules for pyre interpreter"
 
 [features]
-default = ["host_env", "full"]
-# Native-library modules. Off, `_cffi_backend`, `_ctypes`, `_socket`, `_ssl`,
-# `mmap`, and `select` are not rustc inputs. Enabling it also enables the
-# interpreter's `full` hierarchy filter so the registered aliases and the
-# rclass tail stay the same set.
-full = ["pyre-interpreter/full"]
+default = ["host_env"]
 host_env = [
     "pyre-interpreter/host_env",
     "dep:rustpython-host_env",
