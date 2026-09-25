@@ -140,11 +140,7 @@ pub fn bool_then_some(c: bool, x: i64) -> Option<i64> {
 
 #[inline(never)]
 fn option_source(keep: bool, value: i64) -> Option<i64> {
-    if keep {
-        Some(value)
-    } else {
-        None
-    }
+    if keep { Some(value) } else { None }
 }
 
 #[inline(never)]
@@ -499,4 +495,42 @@ pub fn replace_reborrow_then_read(mut slot: i64, new: i64) -> i64 {
     let r = &mut slot;
     std::mem::replace(&mut *r, new);
     *r
+}
+
+
+/// Two machine words, inline. `mem::replace` / `swap` / `take` of the whole
+/// value is one read and one store of each field, not a residual copy.
+#[derive(Default)]
+pub struct TwoWords {
+    pub lo: i64,
+    pub hi: i64,
+}
+
+#[inline(never)]
+pub fn replace_two_words(slot: &mut TwoWords, new: TwoWords) -> TwoWords {
+    std::mem::replace(slot, new)
+}
+
+#[inline(never)]
+pub fn swap_two_words(a: &mut TwoWords, b: &mut TwoWords) {
+    std::mem::swap(a, b);
+}
+
+#[inline(never)]
+pub fn take_two_words(slot: &mut TwoWords) -> TwoWords {
+    std::mem::take(slot)
+}
+
+/// 16-byte-shaped payload enum: an `i64` plus an `i32`, the same inline
+/// triple shape a `Union` scalar uses. A whole-value exchange copies each
+/// field the layout records.
+#[derive(Clone, Copy)]
+pub enum WordUnion {
+    Unit(i32),
+    Int(i64, i32),
+}
+
+#[inline(never)]
+pub fn replace_word_union(slot: &mut WordUnion, new: WordUnion) -> WordUnion {
+    std::mem::replace(slot, new)
 }

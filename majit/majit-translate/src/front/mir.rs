@@ -16350,10 +16350,20 @@ impl<'a> Lowering<'a> {
                 // `*p = new` where `p` is not an `index_mut` alias is one word
                 // at that address: `raw_load` then `raw_store`
                 // (`rewrite_op_raw_load` / `rewrite_op_raw_store`). A
-                // `__deref_write` call has no bound address.
+                // multi-word pointee is the same move field by field
+                // (`rffi.py` `_get_structcopy_fn`): each Charon field offset,
+                // not one residual copy. A `__deref_write` call has no bound
+                // address.
                 if let Some(place) = self.bare_deref_place(&slot) {
-                    let Some(old) = self.exchange_deref_word(mir_bb, &place, args[1].clone())?
-                    else {
+                    let old = if let Some(old) =
+                        self.exchange_deref_word(mir_bb, &place, args[1].clone())?
+                    {
+                        old
+                    } else if let Some(old) =
+                        self.exchange_deref_aggregate(mir_bb, &place, Some(args[1].clone()))?
+                    {
+                        old
+                    } else {
                         return Ok(false);
                     };
                     self.local_var[dest_local] = Some(old);
@@ -16370,10 +16380,27 @@ impl<'a> Lowering<'a> {
                 let Some(slot1) = self.mem_slot(arg_locals.get(1).copied().flatten()) else {
                     return Ok(false);
                 };
-                let old0 = self.read_mem_slot(mir_bb, &slot0)?;
-                let old1 = self.read_mem_slot(mir_bb, &slot1)?;
-                self.write_mem_slot(mir_bb, slot0, old1)?;
-                self.write_mem_slot(mir_bb, slot1, old0)?;
+                if let (Some(place0), Some(place1)) =
+                    (self.bare_deref_place(&slot0), self.bare_deref_place(&slot1))
+                    && self.move_plan(&place0.ty).is_some()
+                {
+                    let Some(old0) = self.read_moved_aggregate(mir_bb, &place0)? else {
+                        return Ok(false);
+                    };
+                    let Some(old1) = self.read_moved_aggregate(mir_bb, &place1)? else {
+                        return Ok(false);
+                    };
+                    if !self.store_moved_aggregate(mir_bb, &place0, &old1)?
+                        || !self.store_moved_aggregate(mir_bb, &place1, &old0)?
+                    {
+                        return Ok(false);
+                    }
+                } else {
+                    let old0 = self.read_mem_slot(mir_bb, &slot0)?;
+                    let old1 = self.read_mem_slot(mir_bb, &slot1)?;
+                    self.write_mem_slot(mir_bb, slot0, old1)?;
+                    self.write_mem_slot(mir_bb, slot1, old0)?;
+                }
                 let bb_id = self.block_id[mir_bb];
                 self.local_var[dest_local] = Some(self.emit_unit(bb_id));
             }
@@ -16381,12 +16408,24 @@ impl<'a> Lowering<'a> {
                 let Some(slot) = self.mem_slot(arg_locals.first().copied().flatten()) else {
                     return Ok(false);
                 };
-                let Some(zero) = self.zero_for_mem_slot(mir_bb, &slot) else {
-                    return Ok(false);
-                };
-                let old = self.read_mem_slot(mir_bb, &slot)?;
-                self.write_mem_slot(mir_bb, slot, zero)?;
-                self.local_var[dest_local] = Some(old);
+                if let Some(place) = self.bare_deref_place(&slot)
+                    && self.move_plan(&place.ty).is_some()
+                {
+                    // `mem::take` is `replace(dest, T::default())`. A scalar
+                    // field's `Default` is the zero this span stores; a
+                    // non-scalar field has no literal and stays a call.
+                    let Some(old) = self.exchange_deref_aggregate(mir_bb, &place, None)? else {
+                        return Ok(false);
+                    };
+                    self.local_var[dest_local] = Some(old);
+                } else {
+                    let Some(zero) = self.zero_for_mem_slot(mir_bb, &slot) else {
+                        return Ok(false);
+                    };
+                    let old = self.read_mem_slot(mir_bb, &slot)?;
+                    self.write_mem_slot(mir_bb, slot, zero)?;
+                    self.local_var[dest_local] = Some(old);
+                }
             }
             _ => return Ok(false),
         }
@@ -16506,6 +16545,362 @@ impl<'a> Lowering<'a> {
             },
         });
         Ok(Some(old))
+    }
+
+    /// Read `place`'s fields into a fresh aggregate, then store `new_value`'s
+    /// fields over it. `None` as `new_value` stores the zero of each scalar
+    /// field (`mem::take`). `Ok(None)` leaves the residual call.
+    ///
+    /// `rffi.py` `_get_structcopy_fn` copies an inline struct one field at a
+    /// time. The offsets are Charon's `variant_layouts`, so a 16-byte enum
+    /// (`Dynamic`'s `Union`) moves as those fields rather than one word.
+    fn exchange_deref_aggregate(
+        &mut self,
+        mir_bb: usize,
+        place: &Place,
+        new_value: Option<Variable>,
+    ) -> Result<Option<Variable>, LowerError> {
+        let Some(old) = self.read_moved_aggregate(mir_bb, place)? else {
+            return Ok(None);
+        };
+        let stored = match new_value {
+            Some(value) => self.store_moved_aggregate(mir_bb, place, &value)?,
+            None => self.store_zero_aggregate(mir_bb, place)?,
+        };
+        if !stored {
+            return Ok(None);
+        }
+        Ok(Some(old))
+    }
+
+    fn read_moved_aggregate(
+        &mut self,
+        mir_bb: usize,
+        place: &Place,
+    ) -> Result<Option<Variable>, LowerError> {
+        let Some(plan) = self.move_plan(&place.ty) else {
+            return Ok(None);
+        };
+        let base = self.deref_base(mir_bb, place)?;
+        let mut parts = Vec::with_capacity(plan.spans.len());
+        for span in &plan.spans {
+            parts.push(self.emit_span_read(mir_bb, &base, span));
+        }
+        Ok(Some(self.emit_span_aggregate(mir_bb, &plan, &parts)))
+    }
+
+    fn store_moved_aggregate(
+        &mut self,
+        mir_bb: usize,
+        place: &Place,
+        value: &Variable,
+    ) -> Result<bool, LowerError> {
+        let Some(plan) = self.move_plan(&place.ty) else {
+            return Ok(false);
+        };
+        let base = self.deref_base(mir_bb, place)?;
+        for span in &plan.spans {
+            let part = self.emit_span_read(mir_bb, value, span);
+            self.emit_span_write(mir_bb, &base, span, part);
+        }
+        Ok(true)
+    }
+
+    fn store_zero_aggregate(&mut self, mir_bb: usize, place: &Place) -> Result<bool, LowerError> {
+        let Some(plan) = self.move_plan(&place.ty) else {
+            return Ok(false);
+        };
+        if plan.spans.iter().any(|span| span.zero_kind().is_none()) {
+            return Ok(false);
+        }
+        let base = self.deref_base(mir_bb, place)?;
+        for span in &plan.spans {
+            let zero = self.emit_span_zero(mir_bb, span);
+            self.emit_span_write(mir_bb, &base, span, zero);
+        }
+        Ok(true)
+    }
+
+    fn deref_base(&mut self, mir_bb: usize, place: &Place) -> Result<Variable, LowerError> {
+        let PlaceKind::Projection(inner, _) = &place.kind else {
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: aggregate exchange place is not a deref"
+            )));
+        };
+        self.resolve_place(mir_bb, (**inner).clone())
+    }
+
+    /// Charon fields of a multi-word inline value. A transparent newtype
+    /// (`Dynamic` over `Union`) contributes the inner type's fields. A
+    /// struct field is a `getfield`/`setfield`. An enum contributes one
+    /// raw span per non-overlapping layout field, at that field's byte
+    /// size — a wide JIT tag must not swallow the payload that sits in
+    /// the next bytes.
+    fn move_plan(&self, ty: &TyRef) -> Option<MovePlan> {
+        let id = self.tyref_adt_def_id(ty)?;
+        let td = self.llbc.type_by_id(id)?;
+        let target = std::env::var("TARGET").unwrap_or_default();
+        let layout = td.layout_for_target(&target)?;
+        let size = layout.size?;
+        if size <= 8 {
+            return None;
+        }
+        match &td.kind {
+            TypeDeclKind::Struct(fields) => {
+                if td.is_repr_transparent() && fields.len() == 1 {
+                    return self.move_plan(&fields[0].ty);
+                }
+                let name_path = td.item_meta.name_path();
+                let owner = name_path.rsplit("::").next().unwrap_or("").to_string();
+                let owner_id =
+                    majit_ir::descr::StructId::from_canonical(&strip_crate_prefix(&name_path));
+                let mut spans = Vec::with_capacity(fields.len());
+                for (i, field) in fields.iter().enumerate() {
+                    let offset = layout.struct_field_offset(i)?;
+                    let node = tyref_node(&field.ty, self.llbc)?;
+                    let (_item_ty, itemsize, _is_signed) =
+                        json_ty_raw_store_descr(node, self.llbc)?;
+                    if itemsize == 0 || itemsize > 8 {
+                        return None;
+                    }
+                    let name = field.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
+                    let value_ty =
+                        tyref_to_value_type_with(&field.ty, self.llbc, self.tombstoned_leaves);
+                    spans.push(MoveSpan {
+                        offset,
+                        kind: SpanKind::Field {
+                            name,
+                            owner: owner.clone(),
+                            owner_id,
+                            ty: value_ty,
+                        },
+                    });
+                }
+                if spans.is_empty() {
+                    return None;
+                }
+                Some(MovePlan { ctor_id: id, spans })
+            }
+            TypeDeclKind::Enum(variants) => {
+                let mut candidates: Vec<MoveSpan> = Vec::new();
+                if let (Some(offset), Some(int_ty)) =
+                    (layout.discriminant_offset(), layout.discriminant_int_type())
+                {
+                    let itemsize = int_type_byte_width(int_ty) as usize;
+                    if itemsize == 0 || itemsize > 8 {
+                        return None;
+                    }
+                    let signed = int_ty.starts_with('i');
+                    let item_ty = if signed {
+                        ValueType::Int
+                    } else {
+                        ValueType::Unsigned
+                    };
+                    candidates.push(MoveSpan {
+                        offset,
+                        kind: SpanKind::Raw {
+                            item_ty,
+                            itemsize,
+                            is_signed: signed,
+                        },
+                    });
+                }
+                for (vidx, variant) in variants.iter().enumerate() {
+                    for (i, field) in variant.fields.iter().enumerate() {
+                        let Some(offset) = layout.field_offset(vidx, i) else {
+                            continue;
+                        };
+                        let Some(node) = tyref_node(&field.ty, self.llbc) else {
+                            continue;
+                        };
+                        let Some((item_ty, itemsize, is_signed)) =
+                            json_ty_raw_store_descr(node, self.llbc)
+                        else {
+                            return None;
+                        };
+                        if itemsize == 0 || itemsize > 8 {
+                            return None;
+                        }
+                        candidates.push(MoveSpan {
+                            offset,
+                            kind: SpanKind::Raw {
+                                item_ty,
+                                itemsize,
+                                is_signed,
+                            },
+                        });
+                    }
+                }
+                candidates.sort_by(|left, right| {
+                    left.offset
+                        .cmp(&right.offset)
+                        .then(right.kind.size().cmp(&left.kind.size()))
+                });
+                let mut spans: Vec<MoveSpan> = Vec::new();
+                for candidate in candidates {
+                    let start = candidate.offset;
+                    let end = start + candidate.kind.size() as u64;
+                    let overlaps = spans.iter().any(|kept| {
+                        let kept_end = kept.offset + kept.kind.size() as u64;
+                        start < kept_end && kept.offset < end
+                    });
+                    if !overlaps {
+                        spans.push(candidate);
+                    }
+                }
+                if spans.is_empty() {
+                    return None;
+                }
+                Some(MovePlan { ctor_id: id, spans })
+            }
+            _ => None,
+        }
+    }
+
+    fn emit_span_read(&mut self, mir_bb: usize, base: &Variable, span: &MoveSpan) -> Variable {
+        let bb_id = self.block_id[mir_bb];
+        let result = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        let kind = match &span.kind {
+            SpanKind::Field {
+                name,
+                owner,
+                owner_id,
+                ty,
+            } => OpKind::FieldRead {
+                base: base.clone(),
+                field: crate::model::FieldDescriptor::new(name.clone(), Some(owner.clone()))
+                    .with_owner_id(Some(*owner_id)),
+                ty: ty.clone(),
+                pure: false,
+            },
+            SpanKind::Raw {
+                item_ty,
+                itemsize,
+                is_signed,
+            } => {
+                let offset = self.emit_span_offset(bb_id, span.offset);
+                OpKind::RawLoad {
+                    base: base.clone(),
+                    offset,
+                    item_ty: item_ty.clone(),
+                    itemsize: *itemsize,
+                    is_item_signed: *is_signed,
+                }
+            }
+        };
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(result.clone()),
+            kind,
+        });
+        result
+    }
+
+    fn emit_span_write(
+        &mut self,
+        mir_bb: usize,
+        base: &Variable,
+        span: &MoveSpan,
+        value: Variable,
+    ) {
+        let bb_id = self.block_id[mir_bb];
+        let kind = match &span.kind {
+            SpanKind::Field {
+                name,
+                owner,
+                owner_id,
+                ty,
+            } => OpKind::FieldWrite {
+                base: base.clone(),
+                field: crate::model::FieldDescriptor::new(name.clone(), Some(owner.clone()))
+                    .with_owner_id(Some(*owner_id)),
+                value: crate::model::LinkArg::Value(value),
+                ty: ty.clone(),
+            },
+            SpanKind::Raw {
+                item_ty,
+                itemsize,
+                is_signed,
+            } => {
+                let offset = self.emit_span_offset(bb_id, span.offset);
+                OpKind::RawStore {
+                    base: base.clone(),
+                    offset,
+                    value,
+                    item_ty: item_ty.clone(),
+                    itemsize: *itemsize,
+                    is_item_signed: *is_signed,
+                }
+            }
+        };
+        self.graph
+            .block_mut(bb_id)
+            .operations
+            .push(SpaceOperation { result: None, kind });
+    }
+
+    fn emit_span_offset(&mut self, bb_id: crate::model::BlockId, offset: u64) -> Variable {
+        let var = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(var.clone()),
+            kind: OpKind::ConstInt(offset as i64),
+        });
+        var
+    }
+
+    fn emit_span_zero(&mut self, mir_bb: usize, span: &MoveSpan) -> Variable {
+        let bb_id = self.block_id[mir_bb];
+        let kind = span.zero_kind().expect("caller checked zero_kind");
+        let var = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(var.clone()),
+            kind,
+        });
+        var
+    }
+
+    /// Fresh aggregate holding `parts`, in `plan.spans` order. The
+    /// constructor is the same empty `malloc` marker an `Rvalue::Aggregate`
+    /// emits; the parts are the field stores.
+    fn emit_span_aggregate(
+        &mut self,
+        mir_bb: usize,
+        plan: &MovePlan,
+        parts: &[Variable],
+    ) -> Variable {
+        let bb_id = self.block_id[mir_bb];
+        let td = self
+            .llbc
+            .type_by_id(plan.ctor_id)
+            .expect("move plan type is in the LLBC");
+        let name_path = td.item_meta.name_path();
+        let mut segments: Vec<String> = name_path.split("::").map(str::to_string).collect();
+        let leaf = segments.pop().unwrap_or_default();
+        let result = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        let owner = if segments.is_empty() {
+            leaf.clone()
+        } else {
+            format!("{}::{leaf}", segments.join("::"))
+        };
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::synthetic_transparent_struct_ctor(segments, leaf),
+                args: Vec::new(),
+                result_ty: ValueType::Ref(Some(owner)),
+            },
+        });
+        for (span, part) in plan.spans.iter().zip(parts.iter()) {
+            self.emit_span_write(mir_bb, &result, span, part.clone());
+        }
+        result
     }
 
     fn raw_word_descr(&self, ty: &TyRef) -> Option<(ValueType, usize, bool)> {
@@ -27265,6 +27660,61 @@ fn inline_adt_def_id(body: &serde_json::Value) -> Option<u64> {
 enum MemSlot {
     Place(Place),
     Index(usize),
+}
+
+/// One field of a multi-word `mem::replace` / `swap` / `take`.
+struct MovePlan {
+    ctor_id: u64,
+    spans: Vec<MoveSpan>,
+}
+
+struct MoveSpan {
+    offset: u64,
+    kind: SpanKind,
+}
+
+enum SpanKind {
+    /// Named struct field. `getfield_gc` / `setfield_gc`.
+    Field {
+        name: String,
+        owner: String,
+        owner_id: majit_ir::descr::StructId,
+        ty: ValueType,
+    },
+    /// Enum layout byte. Width is the Charon field, not the JIT tag model.
+    Raw {
+        item_ty: ValueType,
+        itemsize: usize,
+        is_signed: bool,
+    },
+}
+
+impl SpanKind {
+    fn size(&self) -> usize {
+        match self {
+            SpanKind::Field { ty, .. } => match ty {
+                ValueType::Float | ValueType::Int | ValueType::Unsigned | ValueType::Ref(_) => 8,
+                ValueType::Bool => 1,
+                _ => 8,
+            },
+            SpanKind::Raw { itemsize, .. } => *itemsize,
+        }
+    }
+}
+
+impl MoveSpan {
+    fn zero_kind(&self) -> Option<OpKind> {
+        let ty = match &self.kind {
+            SpanKind::Field { ty, .. } => ty.clone(),
+            SpanKind::Raw { item_ty, .. } => item_ty.clone(),
+        };
+        match ty {
+            ValueType::Int | ValueType::Ref(_) => Some(OpKind::ConstInt(0)),
+            ValueType::Unsigned | ValueType::Bool => Some(OpKind::ConstUInt(0)),
+            ValueType::Float => Some(OpKind::ConstFloat(0.0f64.to_bits())),
+            _ => None,
+        }
+    }
 }
 
 fn borrowed_place_referent(rvalue: &Rvalue) -> Option<Place> {

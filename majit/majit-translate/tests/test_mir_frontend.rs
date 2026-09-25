@@ -1668,3 +1668,112 @@ fn mem_replace_reborrow_then_read_returns_new() {
     let replace_calls = kinds.iter().filter(|k| k.contains("replace")).count();
     assert_eq!(replace_calls, 0, "still calls mem::replace: {kinds:?}");
 }
+
+
+/// A multi-word value moves one field at a time. `TwoWords` is two `i64`
+/// fields (`getfield` / `setfield`). `WordUnion` is a 16-byte enum: each
+/// non-overlapping Charon field is a `raw_load` / `raw_store` at that
+/// field's offset and width.
+#[test]
+fn mem_replace_of_a_multi_word_value_is_field_wise() {
+    use majit_translate::model::OpKind;
+    let llbc = load_corpus();
+
+    let field_names = |name: &str, want_read: bool| -> Vec<String> {
+        let graph = lower_function(llbc, name).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let mut names = Vec::new();
+        let mut replace_calls = 0usize;
+        for block in &graph.blocks {
+            for op in &block.operations {
+                match &op.kind {
+                    OpKind::FieldRead { field, .. } if want_read => names.push(field.name.clone()),
+                    OpKind::FieldWrite { field, .. } if !want_read => {
+                        names.push(field.name.clone())
+                    }
+                    OpKind::Call { target, .. } => {
+                        if format!("{target:?}").contains("replace")
+                            || format!("{target:?}").contains("swap")
+                            || format!("{target:?}").contains("take")
+                        {
+                            replace_calls += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(
+            replace_calls, 0,
+            "{name} still calls mem::replace/swap/take"
+        );
+        names.sort();
+        names
+    };
+
+    assert_eq!(
+        field_names("replace_two_words", true),
+        vec![
+            "hi".to_string(),
+            "hi".to_string(),
+            "lo".to_string(),
+            "lo".to_string()
+        ],
+        "replace reads each field of the slot and of the new value"
+    );
+    assert_eq!(
+        field_names("replace_two_words", false),
+        vec![
+            "hi".to_string(),
+            "hi".to_string(),
+            "lo".to_string(),
+            "lo".to_string()
+        ],
+        "replace writes each field of the slot and of the saved value"
+    );
+    assert_eq!(
+        field_names("swap_two_words", true),
+        vec![
+            "hi".to_string(),
+            "hi".to_string(),
+            "lo".to_string(),
+            "lo".to_string()
+        ],
+    );
+    assert_eq!(
+        field_names("take_two_words", true),
+        vec!["hi".to_string(), "lo".to_string()],
+        "take reads the slot once, then stores zeros"
+    );
+
+    let graph = lower_function(llbc, "replace_word_union").expect("replace_word_union");
+    let mut loads: Vec<i64> = Vec::new();
+    let mut replace_calls = 0usize;
+    for block in &graph.blocks {
+        let mut pending_offset = None;
+        for op in &block.operations {
+            match &op.kind {
+                OpKind::ConstInt(n) => pending_offset = Some(*n),
+                OpKind::RawLoad { .. } => {
+                    loads.push(pending_offset.take().unwrap_or(-1));
+                }
+                OpKind::Call { target, .. } if format!("{target:?}").contains("replace") => {
+                    replace_calls += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    loads.sort();
+    assert_eq!(
+        replace_calls, 0,
+        "replace_word_union still calls mem::replace"
+    );
+    assert!(
+        loads.windows(2).any(|pair| pair == [0, 4]) || loads.contains(&0) && loads.contains(&4),
+        "enum exchange must load the tag and the field beside it, got {loads:?}"
+    );
+    assert!(
+        loads.contains(&8),
+        "enum exchange must load the payload word at offset 8, got {loads:?}"
+    );
+}
