@@ -14485,7 +14485,16 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
     // `argparse.ArgumentTypeError`'s `e.message = ...` pattern).
     // Non-special names land in the lazily allocated instance dict on
     // `W_BaseException.w_dict` (interp_exceptions.py, 222-225).
-    if unsafe { pyre_object::is_exception(obj) } {
+    //
+    // These arms stand in for a `GetSetProperty.__set__`, so they only fire
+    // where the walk above found no attribute at all.  A subclass that shadows
+    // one of the names with a plain class attribute
+    // (`class E(OSError): errno = 99`) contributes no `__set__`, so
+    // `descr__setattr__` falls through to `setdictvalue` and the instance dict
+    // wins; the real getset is never reached.  Running the arm regardless wrote
+    // the interpreter slot instead, and the shadowing class attribute then read
+    // back in place of the value just assigned.
+    if w_descr.is_none() && unsafe { pyre_object::is_exception(obj) } {
         let handled = exception_attr_set(obj, name, value)?;
         if !handled.is_null() {
             return Ok(handled);
@@ -15268,7 +15277,15 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
     // `None` store.  All of this runs before the generic instance-dict
     // removal below, which would otherwise silently succeed on a name that
     // happens to have an entry there.
-    if unsafe { pyre_object::is_exception(obj) } {
+    //
+    // Like the setattr arms, this stands in for a `GetSetProperty.__delete__`
+    // and so only fires where the walk above found no attribute: a subclass
+    // shadowing the name with a plain class attribute is no data descriptor,
+    // so `descr__delattr__` falls through to `deldictvalue` and the instance
+    // dict entry is what goes.  Running it regardless reset the interpreter
+    // slot and, for a name whose deleter refuses an unset slot, raised where
+    // the dict entry should simply have been removed.
+    if w_descr.is_none() && unsafe { pyre_object::is_exception(obj) } {
         let handled = exception_attr_delete(obj, name)?;
         if !handled.is_null() {
             return Ok(handled);
