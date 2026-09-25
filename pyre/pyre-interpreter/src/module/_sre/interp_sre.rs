@@ -36,6 +36,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         "compile",
         make_module_builtin_function("compile", sre_compile),
     );
+    // `_sre.template` (`sre.c` `_sre_template_impl`). `re._compile_template`
+    // caches its result; expand/sub consume that object instead of reparsing.
+    module_ns_store(
+        ns,
+        "template",
+        make_module_builtin_function("template", sre_template),
+    );
     module_ns_store(
         ns,
         "ascii_iscased",
@@ -1518,7 +1525,13 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
                 )
             }
         };
-        Some(parse_replacement_template(w_repl(), repl_bytes, pat, is_bytes)?)
+        Some(if repl_bytes.contains(&b'\\') {
+            parse_replacement_template(w_repl(), repl_bytes, pat, is_bytes)?
+        } else {
+            // `subx` literal arm: no backslash, so the replacement is copied
+            // verbatim and the template compiler is not invoked.
+            vec![TemplateItem::Literal(repl_bytes.to_vec())]
+        })
     };
 
     let endpos = subj.len();
@@ -1719,42 +1732,109 @@ fn template_items_from_list(w_result: PyObjectRef) -> Result<Vec<TemplateItem>, 
     Ok(items)
 }
 
-/// Parse a replacement template into [`TemplateItem`]s by delegating to the
-/// app-level `re._parser.parse_template(source, pattern)` (`re/_parser.py`)
-/// — owning the parser there keeps `\g<name>`/octal/group-reference handling
-/// and the `re.error` diagnostics identical to the stdlib.  Mirrors
-/// `import_re` (interp_sre.py, `subx` :469): `__import__("re")` runs
-/// `from . import _parser`, so the parser is always reachable as
-/// `re._parser` once `re` is imported.
+/// `sre.c` `_sre_template_impl` — turn `parse_template`'s flat list into the
+/// object `re._compile_template` caches.  The list is interleaved
+/// literal / group-index / literal, odd length, indexes non-negative.
+fn sre_template(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let w_list = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+    if !unsafe { pyre_object::is_list(w_list) } {
+        return Err(crate::PyError::type_error(format!(
+            "template() argument 2 must be list, not {}",
+            crate::baseobjspace::object_functionstr_type_name(w_list)
+        )));
+    }
+    let n = unsafe { pyre_object::w_list_len(w_list) };
+    if n < 1 || n % 2 == 0 {
+        return Err(crate::PyError::type_error("invalid template"));
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    for i in 0..n {
+        let Some(elem) = (unsafe { pyre_object::w_list_getitem(w_list, i as i64) }) else {
+            return Err(crate::PyError::type_error("invalid template"));
+        };
+        if i % 2 == 1 {
+            if !unsafe { is_int(elem) } {
+                let tname = crate::baseobjspace::object_functionstr_type_name(elem);
+                return Err(crate::PyError::type_error(format!(
+                    "an integer is required (got type {tname})"
+                )));
+            }
+            if unsafe { pyre_object::w_int_get_value(elem) } < 0 {
+                return Err(crate::PyError::type_error("invalid template"));
+            }
+        }
+        fields.push(elem);
+    }
+    Ok(w_tuple_new(fields.take()))
+}
+
+/// Parse a replacement template into [`TemplateItem`]s by calling
+/// `re._compile_template` (`sre.c` `compile_template`).  The stdlib function
+/// is `lru_cache`d, so a repeated `(pattern, repl)` pays for `parse_template`
+/// once and then reuses the `_sre.template` object.
 fn parse_replacement_template(
     w_template: PyObjectRef,
     template_bytes: &[u8],
     pat: PyObjectRef,
     is_bytes: bool,
 ) -> Result<Vec<TemplateItem>, crate::PyError> {
-    let w_parser = match crate::importing::get_sys_module("re._parser") {
-        Some(w_parser) => w_parser,
-        None => {
-            let w_re = crate::importing::importhook(
-                "re",
-                pyre_object::w_none(),
-                pyre_object::w_none(),
-                0,
-                crate::call::getexecutioncontext(),
-            )?;
-            crate::baseobjspace::getattr_str(w_re, "_parser")?
-        }
+    let w_re = match crate::importing::get_sys_module("re") {
+        Some(w_re) => w_re,
+        None => crate::importing::importhook(
+            "re",
+            pyre_object::w_none(),
+            pyre_object::w_none(),
+            0,
+            crate::call::getexecutioncontext(),
+        )?,
     };
-    let w_parse = crate::baseobjspace::getattr_str(w_parser, "parse_template")?;
-    // `_parser.parse_template` indexes the source as a string; a buffer
-    // template (e.g. `bytearray`) must be a real `bytes` first.
+    let w_compile = crate::baseobjspace::getattr_str(w_re, "_compile_template")?;
+    // A buffer template (e.g. `bytearray`) is not a cache key; compile the
+    // exact `bytes` copy.  `_compile_template` still parses through
+    // `_parser.parse_template` on a miss.
     let w_source = if is_bytes && !unsafe { pyre_object::is_bytes(w_template) } {
         pyre_object::bytesobject::w_bytes_from_bytes(template_bytes)
     } else {
         w_template
     };
-    let w_result = crate::call::call_function_impl_result(w_parse, &[w_source, pat])?;
+    let w_result = crate::call::call_function_impl_result(w_compile, &[pat, w_source])?;
+    template_items_from_compiled(w_result)
+}
+
+/// Decode the object `_sre.template` returned (a tuple copy of the parsed
+/// list) or a list left behind by a replaced compiler.
+fn template_items_from_compiled(
+    w_result: PyObjectRef,
+) -> Result<Vec<TemplateItem>, crate::PyError> {
+    if unsafe { pyre_object::is_tuple(w_result) } {
+        let n = unsafe { pyre_object::w_tuple_len(w_result) };
+        let mut items: Vec<TemplateItem> = Vec::with_capacity(n);
+        for i in 0..n {
+            let Some(elem) = (unsafe { pyre_object::w_tuple_getitem(w_result, i as i64) }) else {
+                continue;
+            };
+            push_template_elem(&mut items, elem);
+        }
+        return Ok(items);
+    }
     template_items_from_list(w_result)
+}
+
+fn push_template_elem(items: &mut Vec<TemplateItem>, elem: PyObjectRef) {
+    if unsafe { is_int(elem) } {
+        items.push(TemplateItem::Group(
+            unsafe { pyre_object::w_int_get_value(elem) } as usize,
+        ));
+    } else if unsafe { is_str(elem) } {
+        items.push(TemplateItem::Literal(
+            unsafe { w_str_get_wtf8(elem) }.as_bytes().to_vec(),
+        ));
+    } else if unsafe { pyre_object::bytesobject::is_bytes_like(elem) } {
+        items.push(TemplateItem::Literal(
+            unsafe { pyre_object::bytesobject::bytes_like_data(elem) }.to_vec(),
+        ));
+    }
 }
 
 /// Expand the parsed template against a match, appending into `out` — the
