@@ -75,115 +75,125 @@ impl FailDescr for WasmFailDescr {
     }
 }
 
+/// Where this deadframe reads the jitframe.
+///
+/// A GC frame is re-read through [`OwnerRootGuard`] so a moving collection
+/// cannot leave a raw pointer at the old copy. A host buffer is not a GC
+/// object and does not move; its address stays in [`LiveFrame::Fixed`] and
+/// [`WasmFrameData::host_frame`] owns the bytes.
+enum LiveFrame {
+    Rooted(majit_gc::shadow_stack::OwnerRootGuard),
+    Fixed(*mut majit_backend::jitframe::JitFrame),
+}
+
 /// Wasm-backend dead frame data.
 ///
-/// Stored inside `DeadFrame::Boxed` after `execute_token` returns.
+/// Stored inside `DeadFrame::Boxed` after `execute_token` returns. The
+/// deadframe is the jitframe (`llmodel.py` `return ll_frame`): accessors
+/// read `jf_frame` in place. `DeadFrame::JitFrame` is not used —
+/// `FailArgSource::from_jitframe` decodes `rd_locs` as identity slots, while
+/// this backend spills compactly.
+///
+/// One root: the frame. `jitframe_trace` walks `jf_savedata`, `jf_guard_exc`,
+/// `jf_forward`, and the fail-arg Ref slots named by the guard's `jf_gcmap`.
+/// [`Self::boxed`] is the unit-test snapshot that has no jitframe.
 pub struct WasmFrameData {
+    /// [`Self::boxed`] only: values with no jitframe. Empty when `frame` is set.
     pub raw_values: Vec<i64>,
     pub fail_descr: Arc<WasmFailDescr>,
-    /// Pending exception value captured by `execute_token` after the trace
-    /// exited through a GuardNoException / GuardException (0 = none), surfaced
-    /// via `grab_exc_value`.
+    /// [`Self::boxed`] only. A live frame reads `jf_guard_exc`
+    /// (`llmodel.py` `grab_exc_value`).
     pub exc_value: i64,
-    /// `cpu.set_savedata_ref` / `get_savedata_ref` word — compile.py
-    /// `jf_savedata`. Rooted while non-zero, same as `exc_value`.
+    /// [`Self::boxed`] only. A live frame reads `jf_savedata`.
     pub savedata: i64,
-    /// Live JITFRAME `force()` borrowed, if this snapshot was taken
-    /// mid-call. `set_savedata` writes `jf_savedata` there so the
-    /// later GUARD_NOT_FORCED exit can copy the word back.
-    origin_jf: Option<*mut majit_backend::jitframe::JitFrame>,
-    /// Off-GC host-buffer owner. `take_host_frame` keeps the entry
-    /// JitFrame alive after `execute_token` returns.
-    /// Read on the wasm32 `execute_token` host-buffer path.
+    frame: Option<LiveFrame>,
+    /// `force()` snapshot: fail args live at `force_args_offset`, tagged.
+    read_force: bool,
+    /// Off-GC host-buffer owner. Keeps the entry JitFrame alive after
+    /// `execute_token` returns. The wasm32 host-buffer path.
     #[allow(dead_code)]
     host_frame: Option<majit_backend::libc_deadframe::LibcJitFrameDeadFrame>,
-    /// Slots handed to [`crate::wasm_gc_add_roots`] by [`WasmFrameData::boxed`],
-    /// released again in `Drop`.
-    roots: Vec<usize>,
 }
 
 impl WasmFrameData {
-    /// `llmodel.py` reads `get_ref_value` straight out of the JITFRAME,
-    /// which stays a GC root (its `jf_gcmap` covers the exit slots) for as long
-    /// as the deadframe lives. wasm has no host-visible JITFRAME to hand back:
-    /// `execute_token` copies the exit values into `raw_values` and drops the
-    /// guest frame, so the copies must carry that rooting themselves. Between
-    /// the copy and the last `get_ref_value`, resume/blackhole reconstruction
-    /// allocates freely, and a minor collection there moves exactly the objects
-    /// these slots name.
-    ///
-    /// Only `Type::Ref` exit slots are rooted, matching the gcmap the guest
-    /// frame carried. A wasm32 `GcRef` occupies the low half of its `i64` slot,
-    /// so the root address is the slot address (same aliasing the Ref home
-    /// slots already rely on).
+    /// Unit-test snapshot with no jitframe. Production exits use
+    /// [`Self::from_live_frame`].
     pub fn boxed(
         raw_values: Vec<i64>,
         fail_descr: Arc<WasmFailDescr>,
         exc_value: i64,
     ) -> Box<Self> {
-        let mut data = Box::new(WasmFrameData {
+        Box::new(WasmFrameData {
             raw_values,
             fail_descr,
             exc_value,
             savedata: 0,
-            origin_jf: None,
+            frame: None,
+            read_force: false,
             host_frame: None,
-            roots: Vec::new(),
-        });
-        let ref_count = data
-            .fail_descr
-            .fail_arg_types
-            .iter()
-            .take(data.raw_values.len())
-            .filter(|ty| **ty == Type::Ref)
-            .count();
-        if ref_count != 0 || data.exc_value != 0 {
-            let mut roots = Vec::with_capacity(ref_count + usize::from(data.exc_value != 0));
-            for i in 0..data.raw_values.len() {
-                if data.fail_descr.fail_arg_types.get(i) == Some(&Type::Ref) {
-                    roots.push(&mut data.raw_values[i] as *mut i64 as usize);
-                }
+        })
+    }
+
+    /// The jitframe `execute_token` / `force` returned. Fail args stay in
+    /// its `jf_frame` slots. The frame is the only root: `jf_gcmap` names
+    /// the exit's Ref slots and `jitframe_trace` names the header fields.
+    ///
+    /// `gc_root` takes an [`OwnerRootGuard`]. A force snapshot of a frame
+    /// the running call already rooted takes one too — dropping it releases
+    /// only this handle, and the call's shadow-stack root stays. A host
+    /// buffer (`gc_root == false`) does not move; `host_frame` owns it when
+    /// this deadframe does.
+    pub fn from_live_frame(
+        jf: *mut majit_backend::jitframe::JitFrame,
+        fail_descr: Arc<WasmFailDescr>,
+        read_force: bool,
+        gc_root: bool,
+        host_frame: Option<majit_backend::libc_deadframe::LibcJitFrameDeadFrame>,
+    ) -> Box<Self> {
+        let frame = if gc_root {
+            LiveFrame::Rooted(majit_gc::shadow_stack::OwnerRootGuard::new(
+                majit_ir::GcRef(jf as usize),
+            ))
+        } else {
+            LiveFrame::Fixed(jf)
+        };
+        Box::new(WasmFrameData {
+            raw_values: Vec::new(),
+            fail_descr,
+            exc_value: 0,
+            savedata: 0,
+            frame: Some(frame),
+            read_force,
+            host_frame,
+        })
+    }
+
+    fn frame_ptr(&self) -> Option<*mut majit_backend::jitframe::JitFrame> {
+        match self.frame.as_ref() {
+            Some(LiveFrame::Rooted(root)) => {
+                Some(root.get().0 as *mut majit_backend::jitframe::JitFrame)
             }
-            // `grab_exc_value` hands this out as a `GcRef` too, and the resume path
-            // reads it after it has already allocated. A null `GcRef` needs no root.
-            if data.exc_value != 0 {
-                roots.push(&mut data.exc_value as *mut i64 as usize);
-            }
-            unsafe { crate::wasm_gc_add_roots(&roots) };
-            data.roots = roots;
-        }
-        data
-    }
-
-    /// Bind this snapshot to the live JITFRAME `force()` borrowed so
-    /// `set_savedata` writes `jf_savedata` on that frame, matching
-    /// `llmodel.py set_savedata_ref`.
-    pub fn attach_origin_jf(&mut self, jf: *mut majit_backend::jitframe::JitFrame) {
-        self.origin_jf = Some(jf);
-        let savedata = unsafe { (*jf).jf_savedata };
-        if savedata != 0 {
-            self.set_savedata(majit_ir::GcRef(savedata));
+            Some(LiveFrame::Fixed(jf)) => Some(*jf),
+            None => None,
         }
     }
 
-    /// Seed the snapshot's `savedata` word from a JITFRAME that is
-    /// about to be dropped. No origin is kept.
-    pub fn seed_savedata_from_jf(&mut self, jf: *const majit_backend::jitframe::JitFrame) {
-        let savedata = unsafe { (*jf).jf_savedata };
-        if savedata != 0 {
-            self.set_savedata(majit_ir::GcRef(savedata));
-        }
+    /// Current items base. A GC root is re-read so a moving collection
+    /// cannot leave this pointing at the old frame.
+    pub fn items_base(&self) -> Option<usize> {
+        self.frame_ptr()
+            .map(|jf| jf as usize + majit_backend::jitframe::FIRST_ITEM_OFFSET)
     }
 
-    /// `cpu.set_savedata_ref(deadframe, data)` — write the `jf_savedata`
-    /// word and keep it rooted while non-zero. When this snapshot was
-    /// taken by `force()`, also persist the word on the live JITFRAME
-    /// so the later GUARD_NOT_FORCED exit can read it back.
+    pub fn read_force(&self) -> bool {
+        self.read_force
+    }
+
+    /// `cpu.set_savedata_ref(deadframe, data)` — write `jf_savedata`.
+    /// `jitframe_trace` traces that header field; the frame root is enough.
     pub fn set_savedata(&mut self, data: majit_ir::GcRef) {
-        let was_nonzero = self.savedata != 0;
-        let now_nonzero = !data.is_null();
         let mut data_slot = data.0 as i64;
-        if let Some(jf) = self.origin_jf {
+        if let Some(jf) = self.frame_ptr() {
             let depth = majit_gc::shadow_stack::resume_ref_roots_depth();
             unsafe {
                 majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(&mut data_slot));
@@ -195,17 +205,6 @@ impl WasmFrameData {
             unsafe { (*jf).jf_savedata = data_slot as usize };
         }
         self.savedata = data_slot;
-        if was_nonzero == now_nonzero {
-            return;
-        }
-        let slot = &mut self.savedata as *mut i64 as usize;
-        if now_nonzero {
-            unsafe { crate::wasm_gc_add_roots(&[slot]) };
-            self.roots.push(slot);
-        } else {
-            crate::wasm_gc_remove_roots(std::iter::once(slot));
-            self.roots.retain(|&s| s != slot);
-        }
     }
 
     #[allow(dead_code)] // wasm32 `execute_token` host-buffer path
@@ -214,17 +213,6 @@ impl WasmFrameData {
         frame: majit_backend::libc_deadframe::LibcJitFrameDeadFrame,
     ) {
         self.host_frame = Some(frame);
-    }
-}
-
-impl Drop for WasmFrameData {
-    fn drop(&mut self) {
-        if self.roots.is_empty() {
-            return;
-        }
-        // Remove in reverse push order so RootSet::remove stays on its
-        // O(1) stack-pop path.
-        crate::wasm_gc_remove_roots(self.roots.drain(..).rev());
     }
 }
 
@@ -237,7 +225,6 @@ mod tests {
     use majit_ir::GcRef;
 
     use super::{Type, WasmFailDescr, WasmFrameData};
-    use super::{global_fail_descr, register_fail_descrs, reserve_fail_descrs};
 
     struct RootCountingGc(Arc<AtomicUsize>);
 
@@ -352,99 +339,21 @@ mod tests {
     }
 
     #[test]
-    fn the_reserved_finish_exits_precede_every_trace_base() {
-        // The emitted CALL_ASSEMBLER check compares against a baked reserved
-        // index, so a trace whose own exits started below the reserved block
-        // would collide with it.
+    fn finish_cells_keep_a_stable_address() {
+        // CALL_ASSEMBLER compares `jf_descr` with the address baked at
+        // compile time. Rebinding the singleton must not move that address.
         let _serialized = super::lock_cpu();
-        let base = reserve_fail_descrs(3);
-        assert!(base >= super::FINISH_EXIT_INDEX_COUNT);
-        for (index, types) in [
-            (super::FINISH_EXIT_INDEX_VOID, &[][..]),
-            (super::FINISH_EXIT_INDEX_INT, &[Type::Int][..]),
-            (super::FINISH_EXIT_INDEX_REF, &[Type::Ref][..]),
-            (super::FINISH_EXIT_INDEX_FLOAT, &[Type::Float][..]),
-            (super::FINISH_EXIT_INDEX_EXC, &[Type::Ref][..]),
-        ] {
-            let descr = global_fail_descr(index).expect("reserved finish exit is unregistered");
-            assert_eq!(descr.fail_index, index);
-            assert!(descr.is_finish, "reserved exit {index} is not a finish");
-            assert_eq!(descr.fail_arg_types, types, "reserved exit {index} layout");
-        }
-
-        let descrs: Vec<Arc<WasmFailDescr>> = (0..3)
-            .map(|i| {
-                Arc::new(WasmFailDescr {
-                    fail_index: base + i,
-                    trace_id: 0,
-                    fail_arg_types: vec![Type::Ref],
-                    fail_locs: Vec::new(),
-                    is_finish: false,
-                    force_args_offset: 8,
-                    force_gcmap_ptr: 0,
-                    meta_descr: None,
-                })
-            })
-            .collect();
-        register_fail_descrs(&descrs);
-        for i in 0..3 {
-            assert_eq!(
-                global_fail_descr(base + i)
-                    .expect("trace exit is unregistered")
-                    .fail_index,
-                base + i,
-            );
-        }
+        let ptr = super::finish_descr_ptr(super::FINISH_EXIT_INDEX_REF);
+        let again = super::finish_descr_ptr(super::FINISH_EXIT_INDEX_REF);
+        assert_eq!(ptr, again);
+        assert_ne!(ptr, super::finish_descr_ptr(super::FINISH_EXIT_INDEX_INT));
+        let descr = super::descr_at(ptr).expect("finish cell");
+        assert!(descr.is_finish);
+        assert_eq!(descr.fail_arg_types, vec![Type::Ref]);
     }
 
     #[test]
-    fn parallel_compiles_reserve_disjoint_fail_descr_ranges() {
-        // The registry lock already serializes reserve/register. Spawning
-        // workers to overlap those calls raced cargo's other failguard
-        // tests (shared GC box / finish-exit slots) and SIGSEGV'd the
-        // process. Disjointness is what this checks; the wasm host is
-        // single-threaded.
-        let _serialized = super::lock_cpu();
-        const COMPILES: usize = 8;
-        const EXITS: usize = 2;
-        let mut ranges = Vec::new();
-        for trace_id in 0..COMPILES {
-            let base = reserve_fail_descrs(EXITS);
-            let descrs: Vec<_> = (0..EXITS)
-                .map(|index| {
-                    Arc::new(WasmFailDescr {
-                        fail_index: base + index as u32,
-                        trace_id: trace_id as u64,
-                        fail_arg_types: vec![Type::Int],
-                        fail_locs: Vec::new(),
-                        is_finish: false,
-                        force_args_offset: 8,
-                        force_gcmap_ptr: 0,
-                        meta_descr: None,
-                    })
-                })
-                .collect();
-            register_fail_descrs(&descrs);
-            ranges.push((base, trace_id));
-        }
-        ranges.sort_by_key(|(base, _)| *base);
-        for window in ranges.windows(2) {
-            assert!(
-                window[0].0 + EXITS as u32 <= window[1].0,
-                "reserved ranges overlap"
-            );
-        }
-        for (base, trace_id) in ranges {
-            for index in 0..EXITS {
-                let descr = global_fail_descr(base + index as u32)
-                    .expect("reserved fail descr was not registered");
-                assert_eq!(descr.trace_id, trace_id as u64);
-            }
-        }
-    }
-
-    #[test]
-    fn boxed_roots_ref_slots_and_nonzero_exception_until_drop() {
+    fn boxed_does_not_root_interior_slots() {
         let _serialized = super::lock_cpu();
         let (roots, _gc_box) = install_root_counting_gc();
         let before = roots.load(Ordering::SeqCst);
@@ -453,7 +362,7 @@ mod tests {
             fail_descr(vec![Type::Ref, Type::Int, Type::Float, Type::Ref]),
             0x30,
         );
-        assert_eq!(roots.load(Ordering::SeqCst), before + 3);
+        assert_eq!(roots.load(Ordering::SeqCst), before);
         drop(frame);
         assert_eq!(roots.load(Ordering::SeqCst), before);
     }
@@ -470,20 +379,16 @@ mod tests {
     }
 
     #[test]
-    fn set_savedata_roots_until_cleared_or_drop() {
+    fn set_savedata_writes_the_word_without_an_interior_root() {
         let _serialized = super::lock_cpu();
         let (roots, _gc_box) = install_root_counting_gc();
         let before = roots.load(Ordering::SeqCst);
         let mut frame = WasmFrameData::boxed(vec![1], fail_descr(vec![Type::Int]), 0);
-        assert_eq!(roots.load(Ordering::SeqCst), before);
         frame.set_savedata(GcRef(0x40));
-        assert_eq!(roots.load(Ordering::SeqCst), before + 1);
-        frame.set_savedata(GcRef(0x41));
-        assert_eq!(roots.load(Ordering::SeqCst), before + 1);
+        assert_eq!(frame.savedata, 0x40);
         frame.set_savedata(GcRef(0));
+        assert_eq!(frame.savedata, 0);
         assert_eq!(roots.load(Ordering::SeqCst), before);
-        frame.set_savedata(GcRef(0x42));
-        assert_eq!(roots.load(Ordering::SeqCst), before + 1);
         drop(frame);
         assert_eq!(roots.load(Ordering::SeqCst), before);
     }
@@ -498,8 +403,8 @@ mod tests {
         // dropped.
         crate::clear_gc_allocator();
         let jf = alloc_off_gc_jitframe(JitFrame::alloc_size(4));
-        let mut frame = WasmFrameData::boxed(vec![1], fail_descr(vec![Type::Int]), 0);
-        frame.attach_origin_jf(jf);
+        let mut frame =
+            WasmFrameData::from_live_frame(jf, fail_descr(vec![Type::Int]), true, false, None);
         // `NO_CONCRETE` is not a heap object (even, non-8-aligned, non-null).
         // A low dummy (0x51) was chased as a nursery pointer when another
         // test's MiniMark was still the process hook target.
@@ -707,17 +612,14 @@ pub const WASM_CA_TARGET_LABEL_REF_SLOTS_OFS: u64 =
 /// writes the same `jf_descr`, and `_call_assembler_check_descr` recognises a
 /// clean callee finish by comparing against one value.
 ///
-/// A wasm frame slot holds an index into the global exit space rather than a
-/// descr pointer, so the shared identity is a reserved index. The five sit at
-/// the front of [`FAIL_DESCR_REGISTRY`], claimed before any trace takes a
-/// `fail_descr_base`, and carry the attached `Arc` as their `meta_descr` so
-/// `get_latest_descr_arc` still answers with the metainterp's own descr.
+/// The shared identity is the cell address stored in `jf_descr`. The five
+/// cells never move; `attach_finish_descr` replaces the `Arc` inside the
+/// cell. `get_latest_descr` reads that `Arc`'s `meta_descr`.
 pub const FINISH_EXIT_INDEX_VOID: u32 = 0;
 pub const FINISH_EXIT_INDEX_INT: u32 = 1;
 pub const FINISH_EXIT_INDEX_REF: u32 = 2;
 pub const FINISH_EXIT_INDEX_FLOAT: u32 = 3;
 pub const FINISH_EXIT_INDEX_EXC: u32 = 4;
-pub(crate) const FINISH_EXIT_INDEX_COUNT: u32 = 5;
 
 /// Reserved exit index for the `done_with_this_frame_descr_*` of `ty`.
 pub fn done_with_this_frame_exit_index(ty: Type) -> u32 {
@@ -753,48 +655,97 @@ fn reserved_finish_descr(exit_index: u32, meta_descr: Option<DescrRef>) -> Arc<W
     })
 }
 
-/// CPU singletons for the five `done_with_this_frame` / exception exits.
+/// Address baked into `jf_descr` / `jf_force_descr`.
 ///
-/// `make_and_attach_done_descrs` stores those descrs on the cpu, not in
-/// the per-trace fail-index vec. The growable registry still reserves
-/// indices 0..5 so a trace `fail_descr_base` cannot collide with them,
-/// but lookups and attachment go through this array so a smashed or
-/// overwritten registry slot cannot change the singleton layout.
-static FINISH_EXITS: parking_lot::Mutex<[Option<Arc<WasmFailDescr>>; 5]> =
-    parking_lot::Mutex::new([None, None, None, None, None]);
+/// The cell is the unit `LoopAsmResources` (or the finish singleton array)
+/// keeps alive. `get_latest_descr` casts `jf_descr` back to this cell.
+pub struct FailDescrCell {
+    descr: parking_lot::Mutex<Arc<WasmFailDescr>>,
+}
 
-fn finish_exits_init(exits: &mut [Option<Arc<WasmFailDescr>>; 5]) {
-    for (index, slot) in exits.iter_mut().enumerate() {
-        if slot.is_none() {
-            *slot = Some(reserved_finish_descr(index as u32, None));
+impl FailDescrCell {
+    pub fn new(descr: Arc<WasmFailDescr>) -> Self {
+        Self {
+            descr: parking_lot::Mutex::new(descr),
         }
     }
+
+    pub fn get(&self) -> Arc<WasmFailDescr> {
+        Arc::clone(&self.descr.lock())
+    }
+
+    pub fn set(&self, descr: Arc<WasmFailDescr>) {
+        *self.descr.lock() = descr;
+    }
+}
+
+/// Read the descr an exit stored in `jf_descr` or `jf_force_descr`.
+pub fn descr_at(cell: usize) -> Option<Arc<WasmFailDescr>> {
+    if cell == 0 {
+        return None;
+    }
+    Some(unsafe { &*(cell as *const FailDescrCell) }.get())
+}
+
+/// Publish the real descr into a cell `build_wasm_module` allocated.
+pub fn fill_exit_cell(cell: usize, descr: Arc<WasmFailDescr>) {
+    if cell == 0 {
+        return;
+    }
+    unsafe { &*(cell as *const FailDescrCell) }.set(descr);
+}
+
+/// Allocate the cell whose address the exit stores in `jf_descr`.
+///
+/// `sink` is the `LoopAsmResources` the compile will push into
+/// `asmmemmgr_blocks`. A null sink (a direct `build_wasm_module` test)
+/// leaks the cell the same way `park_gcmap_raw` leaks a map.
+pub fn alloc_exit_cell(sink: usize, fail_index: u32) -> usize {
+    let descr = Arc::new(WasmFailDescr {
+        fail_index,
+        trace_id: 0,
+        fail_arg_types: Vec::new(),
+        fail_locs: Vec::new(),
+        is_finish: false,
+        force_args_offset: 0,
+        force_gcmap_ptr: 0,
+        meta_descr: None,
+    });
+    if sink == 0 {
+        let cell = Box::new(FailDescrCell::new(descr));
+        let ptr = &*cell as *const FailDescrCell as usize;
+        Box::leak(cell);
+        return ptr;
+    }
+    let resources = unsafe { &mut *(sink as *mut crate::release::LoopAsmResources) };
+    resources.alloc_fail_cell(descr)
+}
+
+/// CPU singletons for the five `done_with_this_frame` / exception exits.
+///
+/// The `Box` is allocated once and never replaced, so the address baked
+/// into a module stays valid when `attach_finish_descr` rebinds the `Arc`.
+static FINISH_EXITS: parking_lot::Mutex<[Option<Box<FailDescrCell>>; 5]> =
+    parking_lot::Mutex::new([None, None, None, None, None]);
+
+fn finish_descr_ptr_locked(exits: &mut [Option<Box<FailDescrCell>>; 5], index: u32) -> usize {
+    let slot = &mut exits[index as usize];
+    if slot.is_none() {
+        *slot = Some(Box::new(FailDescrCell::new(reserved_finish_descr(
+            index, None,
+        ))));
+    }
+    &**slot.as_ref().expect("finish cell") as *const FailDescrCell as usize
+}
+
+/// Stable `jf_descr` immediate for one reserved finish exit.
+pub fn finish_descr_ptr(index: u32) -> usize {
+    let mut exits = FINISH_EXITS.lock();
+    finish_descr_ptr_locked(&mut exits, index)
 }
 
 fn finish_exit(index: u32) -> Arc<WasmFailDescr> {
-    let mut exits = FINISH_EXITS.lock();
-    finish_exits_init(&mut exits);
-    exits[index as usize]
-        .clone()
-        .expect("reserved finish exit is uninitialized")
-}
-
-/// Claim the reserved block if the registry has not been opened yet. Called
-/// under the registry lock from every entry point that can grow or read it, so
-/// a trace can never take a `fail_descr_base` below `FINISH_EXIT_INDEX_COUNT`.
-fn reserve_finish_exit_block(vec: &mut Vec<FailDescrSlot>) {
-    let mut exits = FINISH_EXITS.lock();
-    finish_exits_init(&mut exits);
-    if !vec.is_empty() {
-        return;
-    }
-    for index in 0..FINISH_EXIT_INDEX_COUNT {
-        vec.push(FailDescrSlot::Registered(
-            exits[index as usize]
-                .clone()
-                .expect("reserved finish exit is uninitialized"),
-        ));
-    }
+    descr_at(finish_descr_ptr(index)).expect("reserved finish exit is uninitialized")
 }
 
 fn thin_descr_ptr(descr: &DescrRef) -> usize {
@@ -813,37 +764,23 @@ fn thin_descr_ptr(descr: &DescrRef) -> usize {
 /// compile happened in.
 pub fn attached_finish_exit_index(descr: &Option<DescrRef>) -> Option<u32> {
     let ptr = thin_descr_ptr(descr.as_ref()?);
-    let mut exits = FINISH_EXITS.lock();
-    finish_exits_init(&mut exits);
+    let exits = FINISH_EXITS.lock();
     exits.iter().enumerate().find_map(|(index, reserved)| {
-        reserved.as_ref().and_then(|reserved| {
-            reserved
-                .meta_descr
-                .as_ref()
-                .is_some_and(|attached| thin_descr_ptr(attached) == ptr)
-                .then_some(index as u32)
-        })
+        let cell = reserved.as_ref()?;
+        cell.get()
+            .meta_descr
+            .as_ref()
+            .is_some_and(|attached| thin_descr_ptr(attached) == ptr)
+            .then_some(index as u32)
     })
 }
 
 /// `make_and_attach_done_descrs`' per-target attachment for one of the five.
-/// Binds the singleton to its reserved exit, which is what the emitted FINISH
-/// writes and the emitted CALL_ASSEMBLER check compares against. Rebinding an
-/// already-claimed entry keeps the fast path available to a process that
-/// compiled something before the attachment landed.
+/// Rebinds the `Arc` inside the existing cell, so a module that already
+/// baked [`finish_descr_ptr`] still names this descr.
 pub fn attach_finish_descr(exit_index: u32, descr: DescrRef) {
-    let attached = reserved_finish_descr(exit_index, Some(descr));
-    // Registry first, then `FINISH_EXITS` — same order as
-    // `reserve_finish_exit_block` (called under the registry lock).
-    let mut reg = FAIL_DESCR_REGISTRY.lock();
-    let vec = reg.get_or_insert_with(Default::default);
-    reserve_finish_exit_block(vec);
-    {
-        let mut exits = FINISH_EXITS.lock();
-        finish_exits_init(&mut exits);
-        exits[exit_index as usize] = Some(Arc::clone(&attached));
-    }
-    vec[exit_index as usize] = FailDescrSlot::Registered(attached);
+    let cell = finish_descr_ptr(exit_index);
+    fill_exit_cell(cell, reserved_finish_descr(exit_index, Some(descr)));
 }
 
 /// Whether the cpu has been handed `exit_frame_with_exception_descr_ref`.
@@ -1220,16 +1157,7 @@ pub fn remove_call_assembler_targets_for_compiled_ptr(compiled_ptr: u32) {
     ca_dispatch_remove_compiled_ptr(compiled_ptr);
 }
 
-/// One position in the global fail-index space: claimed by
-/// `reserve_fail_descrs` and filled by `register_fail_descrs`. The two steps
-/// are separate so a compile can bake `base + local` into its guards before
-/// the descrs those guards name exist.
-pub(crate) enum FailDescrSlot {
-    Reserved,
-    Registered(Arc<WasmFailDescr>),
-}
-
-/// Serializes tests that mutate cpu-global tables (fail-descr registry,
+/// Serializes tests that mutate cpu-global tables (finish singletons,
 /// finish singletons, GC box, label targets). The wasm host never
 /// interleaves those; cargo's parallel unit-test runner does. Held by
 /// every lib test in this crate.
@@ -1261,10 +1189,6 @@ pub fn lock_cpu() -> CpuTestGuard {
 #[cfg(test)]
 fn reset_cpu_for_tests() {
     {
-        // Registry first, then `FINISH_EXITS` — same order as
-        // `reserve_finish_exit_block` / `attach_finish_descr`.
-        let mut reg = FAIL_DESCR_REGISTRY.lock();
-        *reg = None;
         let mut exits = FINISH_EXITS.lock();
         *exits = [None, None, None, None, None];
     }
@@ -1294,82 +1218,6 @@ impl Drop for CpuTestCleanup {
 pub struct CpuTestGuard {
     _cleanup: CpuTestCleanup,
     _lock: parking_lot::MutexGuard<'static, ()>,
-}
-
-/// Global `frame[0]` fail-index space.
-///
-/// Cross-trace chaining (`LABEL_TARGETS`) means the module that last wrote
-/// `frame[0]` is not necessarily the loop `execute_token` entered: a bridge's
-/// terminal JUMP may tail-call a SIBLING loop, whose guards then write THEIR
-/// exit indices. Per-loop index spaces would make those writes ambiguous at
-/// the host — resolving `frame[0]` against the entry loop's own `fail_descrs`
-/// picks a wrong descr (wrong arg types/resume ⇒ type confusion). So every
-/// compile (`compile_loop` and `compile_bridge`) allocates its exits from this
-/// one global space: it reserves as many positions as it has exits and passes
-/// the first as codegen's `fail_index_base`, guards write `base + local` into
-/// `frame[0]`, and the registered descrs fill exactly those reserved positions — any `frame[0]`
-/// then resolves here regardless of which chained module wrote it. The
-/// per-guard bridge-cell epilogue keeps its local indexing by subtracting the
-/// owning module's base (`codegen`'s cell lookup).
-///
-/// Entries are never removed: a dropped loop's modules are unreachable (its
-/// label targets are retracted and its token is gone), so its entries are just
-/// retained memory. A compile that reserves its range and then fails leaves
-/// its slots `Reserved` for good, so the bound is the number of exits
-/// compilation was *attempted* for, not the number that reached a module.
-pub(crate) static FAIL_DESCR_REGISTRY: parking_lot::Mutex<Option<Vec<FailDescrSlot>>> =
-    parking_lot::Mutex::new(None);
-
-/// Atomically reserve `count` global fail indices and return the first one.
-/// Pass that base to `codegen::build_wasm_module`, then fill the reserved
-/// slots with `register_fail_descrs`. Reserving the range under this lock keeps
-/// native parallel compiles and tests from receiving the same base; the wasm
-/// host remains single-threaded, but the backend is also exercised natively.
-pub fn reserve_fail_descrs(count: usize) -> u32 {
-    let mut reg = FAIL_DESCR_REGISTRY.lock();
-    let vec = reg.get_or_insert_with(Default::default);
-    reserve_finish_exit_block(vec);
-    let base = vec.len() as u32;
-    vec.resize_with(vec.len() + count, || FailDescrSlot::Reserved);
-    base
-}
-
-/// Fill a compile's previously reserved slots. Each descr's `fail_index`
-/// (already base-offset by `build_wasm_module`) names its registry position.
-pub fn register_fail_descrs(descrs: &[Arc<WasmFailDescr>]) {
-    let mut reg = FAIL_DESCR_REGISTRY.lock();
-    let vec = reg.get_or_insert_with(Default::default);
-    reserve_finish_exit_block(vec);
-    for d in descrs {
-        assert!(
-            d.fail_index >= FINISH_EXIT_INDEX_COUNT,
-            "trace fail_index {} collides with the reserved finish block",
-            d.fail_index
-        );
-        let slot = vec
-            .get_mut(d.fail_index as usize)
-            .expect("fail descr registered without reserving its global fail_index");
-        assert!(
-            matches!(slot, FailDescrSlot::Reserved),
-            "global fail_index registered more than once"
-        );
-        *slot = FailDescrSlot::Registered(Arc::clone(d));
-    }
-}
-
-/// Resolve a `frame[0]` value through the global fail-index space.
-pub fn global_fail_descr(fail_index: u32) -> Option<Arc<WasmFailDescr>> {
-    if fail_index < FINISH_EXIT_INDEX_COUNT {
-        return Some(finish_exit(fail_index));
-    }
-    FAIL_DESCR_REGISTRY
-        .lock()
-        .as_ref()
-        .and_then(|v| v.get(fail_index as usize))
-        .and_then(|slot| match slot {
-            FailDescrSlot::Reserved => None,
-            FailDescrSlot::Registered(descr) => Some(Arc::clone(descr)),
-        })
 }
 
 /// Global `label descr identity → LabelTarget` registry (see `LabelTarget`).
@@ -1467,6 +1315,27 @@ pub struct ChainedTraceMeta {
     pub used_label_homes: usize,
 }
 
+/// Two guest words a running loop loads on its back-edge.
+/// `generation` at offset 0, `slot` at offset 4.
+#[repr(C)]
+pub struct ResumeEntry {
+    pub generation: std::sync::atomic::AtomicU32,
+    pub slot: std::sync::atomic::AtomicU32,
+}
+
+impl ResumeEntry {
+    pub fn new() -> Self {
+        Self {
+            generation: std::sync::atomic::AtomicU32::new(1),
+            slot: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    pub fn addr(&self) -> u32 {
+        self as *const Self as usize as u32
+    }
+}
+
 /// Compiled wasm loop metadata, stored in `JitCellToken.compiled`.
 pub struct CompiledWasmLoop {
     /// Owning `JitCellToken` number, used to retract this loop's
@@ -1479,6 +1348,10 @@ pub struct CompiledWasmLoop {
     /// execution: an invalidated trace that never reaches `execute_token`
     /// must not pay the host Wasmtime compilation cost.
     pub(crate) func_handle: Cell<u32>,
+    /// `{generation, slot}` the running loop loads on each back-edge.
+    /// The allocation stays put across in-place re-emission; the module
+    /// bakes its address. `slot` is the table index `replace_module` keeps.
+    pub(crate) resume_entry: Box<ResumeEntry>,
     /// Encoded module retained until lazy host materialization.  This is
     /// backend assembler state, not metainterpreter state: the optimized trace
     /// and all per-token descriptors have already been installed exactly as
@@ -1495,10 +1368,9 @@ pub struct CompiledWasmLoop {
     /// This loop's own guard/finish exit descriptors (positions `[0,
     /// num_guard_cells)`, per-trace order), followed by the descr slices of
     /// every chained bridge `compile_bridge` appended (positional bookkeeping
-    /// for `bridge_descr_ranges` — layouts and jitcounter hashes). `frame[0]`
-    /// exit resolution does NOT index this vec: exit indices live in the
-    /// GLOBAL fail-index space (`register_fail_descrs`), because a cross-trace
-    /// chain can exit through a sibling loop's guard. `RefCell` because the
+    /// for `bridge_descr_ranges` — layouts and jitcounter hashes). An exit
+    /// resolves through `jf_descr` (the cell), not by indexing this vec.
+    /// `RefCell` because the
     /// append happens through the shared `&JitCellToken` the bridge attaches
     /// to; the wasm host is single-threaded so no cross-thread access occurs.
     pub fail_descrs: RefCell<Vec<Arc<WasmFailDescr>>>,
@@ -1647,7 +1519,6 @@ impl CompiledWasmLoop {
             return;
         }
         let descrs = self.fail_descrs.borrow();
-        register_fail_descrs(&descrs);
         let meta: Vec<DescrRef> = descrs
             .iter()
             .filter_map(|descr| descr.meta_descr.clone())
@@ -1687,6 +1558,16 @@ impl CompiledWasmLoop {
             }
             self.register_descrs_once();
             self.func_handle.set(handle);
+            if self
+                .resume_entry
+                .slot
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == 0
+            {
+                self.resume_entry
+                    .slot
+                    .store(handle, std::sync::atomic::Ordering::Relaxed);
+            }
             let mut blocks = self.compiled_loop_token.asmmemmgr_blocks.lock();
             if let Some(resources) = blocks
                 .last_mut()

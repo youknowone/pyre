@@ -2880,8 +2880,6 @@ pub(crate) struct JitStatsCounters {
     bridges_compiled: usize,
     guard_failures: usize,
     back_edge_polls: usize,
-    #[cfg(target_arch = "wasm32")]
-    wasm_inline_merge_exits: usize,
 }
 
 /// Snapshot of cumulative JIT compilation statistics.
@@ -2905,10 +2903,6 @@ pub struct JitStats {
     /// still. Folded into `guard_failures` it made that total unusable as an
     /// exact-match baseline.
     pub back_edge_polls: usize,
-    /// Wasm's explicit module-replacement exits, not speculative guard misses.
-    /// Separately gated so module maintenance is visible rather than hidden.
-    #[cfg(target_arch = "wasm32")]
-    pub wasm_inline_merge_exits: usize,
     /// issue compilation-panic: non-`InvalidLoop` panics swallowed during compilation
     /// (graceful degradation in release). Non-zero means the JIT was
     /// silently disabled for some traces by an internal bug.
@@ -3646,17 +3640,7 @@ impl<M: Clone> MetaInterp<M> {
         trace_id: u64,
         fail_index: u32,
         back_edge_poll: bool,
-        #[cfg(target_arch = "wasm32")] wasm_dispatch_withdrawn: bool,
     ) {
-        #[cfg(target_arch = "wasm32")]
-        if wasm_dispatch_withdrawn {
-            // An attached bridge was deliberately withdrawn for replacement.
-            // Native patch_jump_for_descr never makes this trip. Preserve the
-            // blackhole resume, but neither notify a speculative-guard hook
-            // nor update its warm-state census for backend maintenance.
-            self.stats.wasm_inline_merge_exits += 1;
-            return;
-        }
         if guardlog_enabled() {
             eprintln!("@@@GUARD key={green_key} tid={trace_id} fail={fail_index}");
         }
@@ -5955,8 +5939,6 @@ impl<M: Clone> MetaInterp<M> {
             bridges_compiled: self.stats.bridges_compiled,
             guard_failures: self.stats.guard_failures,
             back_edge_polls: self.stats.back_edge_polls,
-            #[cfg(target_arch = "wasm32")]
-            wasm_inline_merge_exits: self.stats.wasm_inline_merge_exits,
             internal_compile_panics: self.internal_compile_panics,
         }
     }
@@ -12945,17 +12927,7 @@ impl<M: Clone> MetaInterp<M> {
                 .descr_arc
                 .as_fail_descr()
                 .is_some_and(|fd| fd.is_back_edge_poll());
-            self.record_guard_failure_event(
-                green_key,
-                trace_id,
-                fail_index,
-                back_edge_poll,
-                #[cfg(target_arch = "wasm32")]
-                result
-                    .descr_arc
-                    .as_fail_descr()
-                    .is_some_and(|fd| fd.wasm_dispatch_withdrawn()),
-            );
+            self.record_guard_failure_event(green_key, trace_id, fail_index, back_edge_poll);
         }
         // pyjitpl.py:3119-3123: exc_class = ptr2int(exception_obj.typeptr)
         let exc_class = if result.exception_value.is_null() {
@@ -13039,16 +13011,7 @@ impl<M: Clone> MetaInterp<M> {
             let back_edge_poll = descr_arc
                 .as_fail_descr()
                 .is_some_and(|fd| fd.is_back_edge_poll());
-            self.record_guard_failure_event(
-                green_key,
-                trace_id,
-                fail_index,
-                back_edge_poll,
-                #[cfg(target_arch = "wasm32")]
-                descr_arc
-                    .as_fail_descr()
-                    .is_some_and(|fd| fd.wasm_dispatch_withdrawn()),
-            );
+            self.record_guard_failure_event(green_key, trace_id, fail_index, back_edge_poll);
         }
 
         // FINISH descrs are singletons (`DONE_WITH_THIS_FRAME_DESCR_*` /
@@ -13523,14 +13486,7 @@ impl<M: Clone> MetaInterp<M> {
         // must_compile handles tick.
         if Self::should_record_guard_failure(is_finish, fail_index) {
             let back_edge_poll = descr.is_back_edge_poll();
-            self.record_guard_failure_event(
-                green_key,
-                trace_id,
-                fail_index,
-                back_edge_poll,
-                #[cfg(target_arch = "wasm32")]
-                descr.wasm_dispatch_withdrawn(),
-            );
+            self.record_guard_failure_event(green_key, trace_id, fail_index, back_edge_poll);
         }
 
         // No layout on the steady entry: the guard arm in `jitdriver` reads
@@ -14682,13 +14638,6 @@ impl<M: Clone> MetaInterp<M> {
             .expect("must_compile_with_values: descr_arc must be a FailDescr");
         let trace_id = descr_fd.trace_id();
         let fail_index = descr_fd.fail_index_per_trace();
-        // Wasm alone withdraws an already attached bridge to leave an immutable
-        // module before replacement. Like ResumeGuardForcedDescr.handle_fail,
-        // this goes straight to blackhole resume, without a jitcounter tick.
-        #[cfg(target_arch = "wasm32")]
-        if descr_fd.wasm_dispatch_withdrawn() {
-            return (false, owning_key);
-        }
         // A guard whose bridge was refused by a terminal-declining backend
         // (`bridge_decline_is_terminal()`, currently wasm) or by a structural
         // full-body-walk decline must not re-fire: re-tracing rebuilds the same

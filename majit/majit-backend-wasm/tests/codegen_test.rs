@@ -2214,10 +2214,9 @@ fn run_inline_region_trace(inputs: &codegen::ModuleBuildInputs) -> (i64, i64, i6
 /// re-emission from one that is crossed a few thousand times and never pays it
 /// back, so both halves of "exactly once, at the threshold" are the point.
 ///
-/// That entry leaves the source guard's dispatch cell alone. The bridge
-/// stays the target until the host publishes the merged owner, the same
-/// way `patch_jump_for_descr` keeps the old jump until the new target is
-/// written.
+/// The trip does not clear the source guard's dispatch cell. The bridge
+/// stays the target until the host, already outside compiled code, installs
+/// the merged module.
 #[test]
 fn a_deferred_merge_trips_once_at_its_threshold() {
     const COUNTER_ADDR: u32 = 0x10000;
@@ -2309,7 +2308,7 @@ fn a_deferred_merge_trips_once_at_its_threshold() {
         assert_eq!(
             cell(&store),
             7,
-            "the dispatch cell still names the bridge after the trip"
+            "the dispatch cell keeps naming the attached bridge after the trip"
         );
     }
     assert_eq!(store.data(), &[77], "the callback names its own merge");

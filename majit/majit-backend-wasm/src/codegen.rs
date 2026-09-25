@@ -3,8 +3,8 @@
 /// Generates a wasm module from majit IR ops using `wasm-encoder`.
 /// Generated function signature: `(param $frame_ptr i32) (result i32)`
 ///
-/// Frame layout in shared linear memory:
-///   offset 0:       fail_index (i64)
+/// Frame layout in shared linear memory (items base = `jf_frame`):
+///   offset 0:       dispatch key (i64). The exit descr lives in `jf_descr`.
 ///   offset 8:       slot[0] (i64)
 ///   offset 16:      slot[1] (i64)
 ///   ...
@@ -124,21 +124,6 @@ pub fn materialize_unbound_label_args(inputargs: &[InputArgRc], ops: &mut Vec<Op
 /// Frame slot byte offset: slot[i] is at frame_ptr + 8 + i * 8.
 pub const FRAME_SLOT_BASE: u64 = 8;
 const SLOT_SIZE: u64 = 8;
-
-/// `frame[0]` is this backend's `jf_descr`: the u32 exit index a guard failure
-/// stamps on its way out. Two bits above that index carry the force protocol
-/// jitframe.py splits across two fields.
-///
-/// [`FORCE_TAKEN_BIT`] stands in for what `force` then writes into `jf_descr`,
-/// the mark `genop_guard_guard_not_forced` reads with
-/// `CMP [rbp + jf_descr], 0` to turn a force that landed inside the call into a
-/// deopt.
-///
-/// The armed descriptor itself lives in the real JitFrame `jf_force_descr`
-/// header, as it does in PyPy.  In particular GUARD_NOT_FORCED_2 is followed by
-/// FINISH, whose exit-index store overwrites `frame[0]`; putting the arm bit in
-/// that word loses the only descriptor a later virtualizable force can use.
-pub(crate) const FORCE_TAKEN_BIT: i64 = 1 << 32;
 
 /// Scratch i64 locals reserved past the value locals for `emit_umulhi`
 /// (al, ah, bl, bh, mid1).
@@ -2926,6 +2911,12 @@ pub struct GuardExit {
     /// `assembler._finish_gcmap`; it must not be reconstructed from runtime
     /// fail-argument words after FINISH.
     pub force_ref_home_indices: Vec<u32>,
+    /// `GUARD_NOT_FORCED_2`: this guard's homes are `assembler._finish_gcmap`.
+    pub publishes_finish_gcmap: bool,
+    /// Cell address the exit stores in `jf_descr`. Filled before emit.
+    pub descr_cell: usize,
+    /// Compile-time map the exit stores in `jf_gcmap`. `0` stores a null map.
+    pub exit_gcmap_ptr: usize,
     /// The GUARD_VALUE operand this exit parks in the trace's counter slot,
     /// for `make_a_counter_per_value`. `None` when the guard is not a
     /// GUARD_VALUE, or when its operand is already one of the fail arguments
@@ -3618,6 +3609,9 @@ fn collect_guards_and_vars(inputargs: &[InputArgRc], ops: &[Op]) -> (Vec<GuardEx
                 fail_arg_types,
                 is_finish: op.opcode == OpCode::Finish,
                 force_ref_home_indices: Vec::new(),
+                publishes_finish_gcmap: false,
+                descr_cell: 0,
+                exit_gcmap_ptr: 0,
                 counter_value_spill,
                 meta_descr,
             });
@@ -3797,6 +3791,22 @@ pub struct CaParams {
     /// `LoopAsmResources` that owns maps published by this build. `0` leaks
     /// the map (`allocate_gcmap`'s `Box::into_raw`) for a direct codegen test.
     pub gcmap_sink: usize,
+    /// Guest address of `[descr_cell, gcmap]` pairs, one pair per guard,
+    /// indexed by `guard_idx - fail_index_base`. `0` in a direct codegen
+    /// test: the exit still loads a pair, from offset 0, so two builds of
+    /// the same trace stay byte-identical. `compile_loop` parks the real
+    /// table on `LoopAsmResources` and passes its address.
+    pub exit_table_base: u32,
+    /// Guest address of this owner's `{generation, slot}` cell. `0` emits
+    /// no back-edge check (codegen tests, host-less compiles). A local JUMP
+    /// loads `generation` the way `GuardNotInvalidated` loads its flag and,
+    /// when the cell is newer than the generation baked into this module,
+    /// tail-calls `slot` with the same jitframe.
+    pub resume_entry_addr: u32,
+    /// Generation this module was compiled as. The running copy redirects
+    /// only when the cell is strictly greater, so a module compiled ahead
+    /// of an unbumped cell does not bounce back to the old slot.
+    pub resume_generation: u32,
 }
 
 /// Per-CALL_ASSEMBLER target dispatch baked into the corresponding wasm arm.
@@ -4621,13 +4631,10 @@ pub fn build_wasm_module(
         }
     }
 
-    // Every trace's guard/finish exits draw their indices from ONE global
-    // fail-index space (`failguard::FAIL_DESCR_REGISTRY`): a cross-trace chain
-    // can exit through a sibling loop's guard, so `frame[0]` must be
-    // resolvable without knowing which chained module wrote it.
-    // `build_function` seeds its `guard_idx` counter with this base so each
-    // exit writes `base + local`; mirror that here on the returned
-    // `GuardExit.fail_index`.
+    // `fail_index` stays a per-module ordinal for bridge-cell addressing.
+    // The exit names itself by the descr cell in `jf_descr`, so a chained
+    // module does not share an index space. `build_function` seeds
+    // `guard_idx` with this base; mirror that on `GuardExit.fail_index`.
     for g in &mut guards {
         g.fail_index += fail_index_base;
     }
@@ -4733,6 +4740,7 @@ pub fn build_wasm_module(
         if !matches!(op.opcode, OpCode::GuardNotForced | OpCode::GuardNotForced2) {
             continue;
         }
+        guard.publishes_finish_gcmap = op.opcode == OpCode::GuardNotForced2;
         let live = live_fail_arg_extent(guard.meta_descr.as_ref(), guard.fail_arg_refs.len());
         for (&arg, &tp) in guard
             .fail_arg_refs
@@ -4747,6 +4755,36 @@ pub fn build_wasm_module(
                 guard.force_ref_home_indices.push((offset / sign) as u32);
             }
         }
+    }
+    // `generate_quick_failure` stores `guardtok.gcmap` into `jf_gcmap` and
+    // the descr into `jf_descr` before the recovery stub returns. The cell
+    // address is stable for the loop's `LoopAsmResources`. A FINISH after
+    // GUARD_NOT_FORCED_2 publishes that guard's `_finish_gcmap` (plus the
+    // result Ref when there is one), matching `genop_finish`.
+    let mut pending_finish: Vec<u32> = Vec::new();
+    for guard in guards.iter_mut() {
+        guard.descr_cell = crate::failguard::alloc_exit_cell(ca.gcmap_sink, guard.fail_index);
+        let mut indices = if guard.is_finish {
+            pending_finish.clone()
+        } else {
+            ref_spill_item_indices(guard, sign)
+        };
+        if guard.is_finish && guard.fail_arg_types.first() == Some(&Type::Ref) {
+            if let Some(slot) = physical_fail_slot(guard, 0) {
+                let bit = ((FRAME_SLOT_BASE as usize + slot * 8) / sign) as u32;
+                if !indices.contains(&bit) {
+                    indices.push(bit);
+                }
+            }
+        }
+        if guard.publishes_finish_gcmap {
+            pending_finish.clone_from(&guard.force_ref_home_indices);
+        }
+        guard.exit_gcmap_ptr = if indices.is_empty() {
+            0
+        } else {
+            crate::release::park_gcmap_raw(ca.gcmap_sink, gcmap_for_item_indices(&indices))
+        };
     }
     let shortage = if num_ref_homes > frame.ordinary_home_slots() {
         Some(super::FrameShortage::new(
@@ -5532,6 +5570,7 @@ fn build_function(
         frame,
         counter_slot: counter_slot(entry_inputargs, ops).map(|slot| slot as u64),
         spill_helpers: spill_helper_indices,
+        exit_table_base: ca.exit_table_base,
         gc_table_slots: &gc_table_slots,
         const_tables: &const_tables,
         const_table_base: gc_table_base,
@@ -6195,6 +6234,45 @@ fn build_function(
             }
 
             OpCode::Jump => {
+                // `patch_jump_for_descr` makes a replacement the next
+                // iteration of the running loop. The module cannot be
+                // rewritten, so the back-edge loads the owner's cell and
+                // tail-calls the slot `replace_module` already swapped.
+                // Address 0 keeps this arm a plain `br` (tests).
+                if ca.resume_entry_addr != 0 {
+                    sink.i32_const(ca.resume_entry_addr as i32);
+                    sink.i32_load(mem32(0));
+                    sink.i32_const(ca.resume_generation as i32);
+                    sink.i32_gt_u();
+                    sink.if_(BlockType::Empty);
+                    let jump_args = op.getarglist();
+                    for (i, jump_arg) in jump_args.iter().enumerate() {
+                        sink.local_get(0);
+                        let opref = jump_arg.to_opref();
+                        if !opref.is_constant() && value_types.ty(opref.raw()) == ValType::F64 {
+                            emit_resolve_f64(&mut sink, constants, value_types, opref);
+                            sink.i64_reinterpret_f64();
+                        } else {
+                            emit_resolve(&mut sink, constants, value_types, opref);
+                        }
+                        sink.i64_store(mem64(FRAME_SLOT_BASE + i as u64 * SLOT_SIZE));
+                    }
+                    // Peeled: key = label ordinal + 1 lands on that LABEL's
+                    // resume loader. Header included. No local label, or a
+                    // non-peeled loop whose entry is the loop, uses key 0.
+                    let dispatch_key = jump_label_ordinal(ops, op)
+                        .filter(|&j| key_dispatch && j < num_labels)
+                        .map(|j| j + 1)
+                        .unwrap_or(0);
+                    sink.local_get(0);
+                    sink.i64_const(dispatch_key as i64);
+                    sink.i64_store(mem64(frame.dispatch_key_ofs));
+                    sink.local_get(0);
+                    sink.i32_const((ca.resume_entry_addr + 4) as i32);
+                    sink.i32_load(mem32(0));
+                    sink.return_call_indirect(0, 0);
+                    sink.end();
+                }
                 // The jump rebinds the loop's label args to the jump args — a
                 // parallel move. A jump arg may read a target local that another
                 // pair overwrites (e.g. the swap `x, y = y, x` → x<-y, y<-x), so
@@ -6575,15 +6653,21 @@ fn build_function(
                 // trace must not run on holding virtualized fields the force has
                 // already written back, and the virtuals `handle_async_forcing`
                 // materialized are attached for THIS exit's resume to consume.
-                // The bit sits in the upper half of `frame[0]`, so on
-                // little-endian wasm32 it is bit 0 of the i32 at frame offset
-                // 4; masking it leaves the `!= 0` the `if` already applies.
-                const FORCE_TAKEN_HALF_OFS: u64 = 4;
-                const _: () = assert!(FORCE_TAKEN_BIT == 1 << 32);
-                sink.local_get(0);
-                sink.i32_load(memarg(FORCE_TAKEN_HALF_OFS, 2));
-                sink.i32_const(1);
-                sink.i32_and();
+                // `exit_table_base == 0` is a direct codegen test whose frame
+                // sits at address 0: the taken bit lives in `frame[0]`. A real
+                // compile compares `jf_descr` (`genop_guard_guard_not_forced`).
+                if guard_dispatch.exit_table_base == 0 {
+                    const FORCE_TAKEN_BIT: i64 = 1 << 32;
+                    const FORCE_TAKEN_HALF_OFS: u64 = 4;
+                    const _: () = assert!(FORCE_TAKEN_BIT == 1 << 32);
+                    sink.local_get(0);
+                    sink.i32_load(memarg(FORCE_TAKEN_HALF_OFS, 2));
+                    sink.i32_const(1);
+                    sink.i32_and();
+                } else {
+                    emit_header_base(&mut sink);
+                    sink.i32_load(memarg(majit_backend::jitframe::JF_DESCR_OFS as u64, 2));
+                }
                 emit_guard_if_exit(
                     &mut sink,
                     constants,
@@ -6613,6 +6697,8 @@ fn build_function(
                     None,
                     guard_dispatch.const_tables,
                     guard_dispatch.const_table_base,
+                    guard_dispatch.exit_table_base,
+                    guard_idx.wrapping_sub(guard_dispatch.fail_index_base),
                 );
                 guard_idx += 1;
             }
@@ -7801,6 +7887,7 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
+                    ca.exit_table_base,
                 );
                 // rewrite.py `clear_varsize_gc_fields` FLAG_STR / FLAG_UNICODE:
                 // `emit_setfield(result, 0, descr=hash_descr)`. Both layouts
@@ -7973,6 +8060,7 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
+                    ca.exit_table_base,
                 );
                 if !inlined {
                     let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
@@ -8077,6 +8165,7 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
+                    ca.exit_table_base,
                 );
                 if !inlined {
                     let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
@@ -8264,6 +8353,7 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
+                    ca.exit_table_base,
                 );
                 if !inlined {
                     let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
@@ -8490,6 +8580,7 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
+                    ca.exit_table_base,
                 );
                 if !inlined {
                     let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
@@ -8524,6 +8615,7 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
+                    ca.exit_table_base,
                 );
             }
             OpCode::ZeroArray => {
@@ -8656,8 +8748,7 @@ fn build_function(
                     ops,
                     op_idx,
                     guard_idx,
-                    guard_dispatch.const_tables,
-                    guard_dispatch.const_table_base,
+                    guard_dispatch,
                 );
                 let vi = op.pos().get().raw();
                 let descr = op
@@ -8708,6 +8799,7 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
+                    ca.exit_table_base,
                 );
                 // Recycled nursery bytes. The entry publish unions with the
                 // live map, so a fresh frame must start with a null map or
@@ -8787,28 +8879,19 @@ fn build_function(
                 }
                 sink.i32_wrap_i64();
                 sink.local_set(ca_cfp_local);
-                // F'[0] is the callee's exit `fail_index`. The base-case loop
-                // finish or this bridge's own recursive finish is a clean
-                // DoneWithThisFrame — the result is already in the callee output
-                // slot F'[1]. Any other value is a guard deopt the in-guest run
-                // cannot finish; hand the callee frame to `wasm_ca_resume_deopt`,
-                // which blackhole-resumes it on the host — resuming AT the guard,
-                // so pre-guard work is not re-executed — and returns the result.
+                // `jf_descr` is the callee's exit descr cell. A clean finish
+                // writes the one `done_with_this_frame` cell for this result
+                // kind (`_call_assembler_check_descr`). The result is already
+                // in F'[1]. Any other cell is a guard deopt or a raising
+                // finish; `wasm_ca_resume_deopt` blackhole-resumes it.
+                let finish_ptr = crate::failguard::finish_descr_ptr(
+                    crate::failguard::done_with_this_frame_exit_index(op.opcode.result_type()),
+                );
                 sink.local_get(ca_cfp_local);
-                sink.i64_load(mem64(0));
-                sink.i32_wrap_i64();
-                sink.local_set(ca_fi_local);
-                // `_call_assembler_check_descr` — every clean finish of this
-                // result kind writes the one `done_with_this_frame_descr_<kind>`
-                // the cpu was handed, so the check is a compare against that
-                // single value. A raising callee writes
-                // `exit_frame_with_exception_descr_ref` and a guard deopt writes
-                // its own exit, so both fail this compare and take the helper
-                // path, which is what propagates the exception.
-                sink.local_get(ca_fi_local);
-                sink.i32_const(crate::failguard::done_with_this_frame_exit_index(
-                    op.opcode.result_type(),
-                ) as i32);
+                sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
+                sink.i32_sub();
+                sink.i32_load(memarg(majit_backend::jitframe::JF_DESCR_OFS as u64, 2));
+                sink.i32_const(finish_ptr as i32);
                 sink.i32_eq();
                 sink.if_(BlockType::Result(ValType::I64));
                 // clean finish: result Ref = F'[1] (output slot 0).
@@ -8986,8 +9069,7 @@ fn build_function(
                     ops,
                     op_idx,
                     guard_idx,
-                    guard_dispatch.const_tables,
-                    guard_dispatch.const_table_base,
+                    guard_dispatch,
                 );
                 let vi = op.pos().get().raw();
                 let can_collect = call_can_collect(op);
@@ -9491,6 +9573,9 @@ fn emit_inline_trip_probe(sink: &mut PeepSink<'_, '_>, probe: InlineTripProbe, t
     sink.i64_const(probe.threshold as i64);
     sink.i64_eq();
     sink.if_(BlockType::Empty);
+    // Install from here. The probe runs in the bridge module; the parent
+    // stays on the stack and is not re-entered. The parent's next back-edge
+    // reads the resume cell and tail-calls the replacement.
     sink.i64_const(probe.pending_id);
     sink.i32_const(probe.trip_fn_ptr as i32);
     sink.call_indirect(0, type_idx);
@@ -10376,6 +10461,8 @@ struct BridgeDispatch<'a> {
     /// arguments, for the counts `spill_helper_arities` admitted. An exit whose
     /// count is absent writes its own stores.
     spill_helpers: &'a indexmap::IndexMap<usize, u32>,
+    /// See [`CaParams::exit_table_base`].
+    exit_table_base: u32,
     /// Preamble `LoadFromGcTable` results (and SameAs of them) that a
     /// later guard may spill. Keyed by value id; the pair is the baked
     /// table base and slot index.
@@ -10643,6 +10730,7 @@ fn emit_guard_exit(
             dispatch.frame,
             dispatch.const_tables,
             dispatch.const_table_base,
+            dispatch,
         );
         if dispatch.enabled {
             emit_guard_bridge_dispatch(sink, guard_idx, dispatch);
@@ -10664,6 +10752,7 @@ fn emit_guard_exit(
             dispatch.frame,
             dispatch.const_tables,
             dispatch.const_table_base,
+            dispatch,
         );
     }
     sink.br(block_exit_depth);
@@ -10833,8 +10922,7 @@ fn emit_force_bracket_before_call(
     ops: &[Op],
     op_idx: usize,
     guard_idx: u32,
-    const_tables: &ConstPtrTables,
-    const_table_base: u32,
+    dispatch: BridgeDispatch<'_>,
 ) {
     if !call_publishes_force_descr(ops[op_idx].opcode) {
         return;
@@ -10860,8 +10948,10 @@ fn emit_force_bracket_before_call(
         next_op,
         exit_index(next_op, guard_idx),
         Some(ops[op_idx].pos().get().raw()),
-        const_tables,
-        const_table_base,
+        dispatch.const_tables,
+        dispatch.const_table_base,
+        dispatch.exit_table_base,
+        guard_idx.wrapping_sub(dispatch.fail_index_base),
     );
 }
 
@@ -10903,6 +10993,8 @@ fn emit_force_arm(
     undefined: Option<u32>,
     const_tables: &ConstPtrTables,
     const_table_base: u32,
+    exit_table_base: u32,
+    exit_local: u32,
 ) {
     // `counter_value_spill` answers `None` for anything but a GUARD_VALUE, so
     // the counter slot has nothing to contribute to a force bracket.
@@ -10935,24 +11027,30 @@ fn emit_force_arm(
         }
         sink.i64_store(mem64(frame.force_slot_base + i as u64 * SLOT_SIZE));
     }
-    // x86 `store_force_descr`: keep the descriptor in the JitFrame header,
-    // separate from `jf_descr`/frame[0].  `local 0` is the items base, so
-    // recover the object base before addressing the pointer-width wasm32
-    // header field.  Store `index + 1`; zero remains the unarmed sentinel.
-    sink.local_get(0);
-    sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
-    sink.i32_sub();
-    sink.i32_const(exit_idx.wrapping_add(1) as i32);
-    sink.i32_store(memarg(
-        majit_backend::jitframe::JF_FORCE_DESCR_OFS as u64,
-        2,
-    ));
-
-    // `jf_descr` remains the guard's exit index.  A synchronous force sets
-    // FORCE_TAKEN_BIT here; GUARD_NOT_FORCED tests that bit after the call.
-    sink.local_get(0);
-    sink.i64_const(exit_idx as i64);
-    sink.i64_store(mem64(0));
+    // x86 `store_force_descr`: the guard's descr cell, separate from `jf_descr`.
+    // Zero remains the unarmed sentinel. `force` copies this word into `jf_descr`.
+    if exit_table_base == 0 {
+        sink.local_get(0);
+        sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
+        sink.i32_sub();
+        sink.i32_const(exit_idx.wrapping_add(1) as i32);
+        sink.i32_store(memarg(
+            majit_backend::jitframe::JF_FORCE_DESCR_OFS as u64,
+            2,
+        ));
+        sink.local_get(0);
+        sink.i64_const(exit_idx as i64);
+        sink.i64_store(mem64(0));
+    } else {
+        let _ = exit_idx;
+        emit_store_loaded_header(
+            sink,
+            majit_backend::jitframe::JF_FORCE_DESCR_OFS as u64,
+            exit_table_base,
+            exit_local as usize,
+            0,
+        );
+    }
 }
 
 fn emit_guard_spill(
@@ -10968,6 +11066,7 @@ fn emit_guard_spill(
     frame: FrameGeometry,
     const_tables: &ConstPtrTables,
     const_table_base: u32,
+    dispatch: BridgeDispatch<'_>,
 ) {
     emit_guard_fail_args_spill(
         sink,
@@ -10982,7 +11081,37 @@ fn emit_guard_spill(
         const_tables,
         const_table_base,
     );
-    emit_guard_fail_index_store(sink, exit_index(op, guard_idx));
+    emit_guard_fail_index_store(sink, dispatch, op, guard_idx);
+    // assembler.py `_build_failure_recovery` (exc=True): stage pos_exc_value
+    // into jf_guard_exc and clear pos_exception / pos_exc_value. Only the
+    // failing arm reaches here; a bridge tail-call returns before this spill.
+    emit_store_guard_exc(sink, op);
+}
+
+/// `llsupport/assembler.py` `must_save_exception`: GUARD_EXCEPTION,
+/// GUARD_NO_EXCEPTION, GUARD_NOT_FORCED. `grab_exc_value` reads `jf_guard_exc`.
+fn emit_store_guard_exc(sink: &mut PeepSink<'_, '_>, op: &Op) {
+    if !matches!(
+        op.opcode,
+        OpCode::GuardNoException | OpCode::GuardException | OpCode::GuardNotForced
+    ) {
+        return;
+    }
+    let exc_value_addr = runtime_addr(crate::jit_exc_value_addr);
+    let exc_type_addr = runtime_addr(crate::jit_exc_type_addr);
+    sink.local_get(0);
+    sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
+    sink.i32_sub();
+    sink.i32_const(exc_value_addr);
+    sink.i64_load(mem64(0));
+    sink.i32_wrap_i64();
+    sink.i32_store(memarg(majit_backend::jitframe::JF_GUARD_EXC_OFS as u64, 2));
+    sink.i32_const(exc_value_addr);
+    sink.i64_const(0);
+    sink.i64_store(mem64(0));
+    sink.i32_const(exc_type_addr);
+    sink.i64_const(0);
+    sink.i64_store(mem64(0));
 }
 
 /// The exit a failing `op` writes into `frame[0]`.
@@ -11153,10 +11282,17 @@ fn emit_memory_error_check(
     residual_type_base: Option<u32>,
     ca_reload_fn_ptr: i64,
     jf_top_addr: Option<u32>,
+    exit_table_base: u32,
 ) {
     emit_resolve(sink, constants, value_types, value);
     sink.i64_eqz();
-    emit_memory_error_on_truthy(sink, residual_type_base, ca_reload_fn_ptr, jf_top_addr);
+    emit_memory_error_on_truthy(
+        sink,
+        residual_type_base,
+        ca_reload_fn_ptr,
+        jf_top_addr,
+        exit_table_base,
+    );
 }
 
 fn emit_memory_error_if_i32_zero(
@@ -11164,9 +11300,16 @@ fn emit_memory_error_if_i32_zero(
     residual_type_base: Option<u32>,
     ca_reload_fn_ptr: i64,
     jf_top_addr: Option<u32>,
+    exit_table_base: u32,
 ) {
     sink.i32_eqz();
-    emit_memory_error_on_truthy(sink, residual_type_base, ca_reload_fn_ptr, jf_top_addr);
+    emit_memory_error_on_truthy(
+        sink,
+        residual_type_base,
+        ca_reload_fn_ptr,
+        jf_top_addr,
+        exit_table_base,
+    );
 }
 
 fn emit_memory_error_on_truthy(
@@ -11174,6 +11317,7 @@ fn emit_memory_error_on_truthy(
     residual_type_base: Option<u32>,
     ca_reload_fn_ptr: i64,
     jf_top_addr: Option<u32>,
+    exit_table_base: u32,
 ) {
     sink.if_(BlockType::Empty);
     if crate::failguard::exit_frame_with_exception_attached() {
@@ -11182,6 +11326,15 @@ fn emit_memory_error_on_truthy(
         sink.i32_const(runtime_addr(crate::jit_exc_value_addr));
         sink.i64_load(mem64(0));
         sink.i64_store(mem64(FRAME_SLOT_BASE));
+        // assembler.py propagate path: the same value also lands in jf_guard_exc
+        // before pos_exception / pos_exc_value are cleared.
+        sink.local_get(0);
+        sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
+        sink.i32_sub();
+        sink.local_get(0);
+        sink.i64_load(mem64(FRAME_SLOT_BASE));
+        sink.i32_wrap_i64();
+        sink.i32_store(memarg(majit_backend::jitframe::JF_GUARD_EXC_OFS as u64, 2));
         sink.i32_const(runtime_addr(crate::jit_exc_value_addr));
         sink.i64_const(0);
         sink.i64_store(mem64(0));
@@ -11194,7 +11347,22 @@ fn emit_memory_error_on_truthy(
         sink.if_(BlockType::Empty);
         sink.unreachable();
         sink.end();
-        emit_guard_fail_index_store(sink, crate::failguard::FINISH_EXIT_INDEX_EXC);
+        if exit_table_base == 0 {
+            sink.local_get(0);
+            sink.i64_const(crate::failguard::FINISH_EXIT_INDEX_EXC as i64);
+            sink.i64_store(mem64(0));
+        } else {
+            emit_store_header_word(
+                sink,
+                majit_backend::jitframe::JF_DESCR_OFS as u64,
+                crate::failguard::finish_descr_ptr(crate::failguard::FINISH_EXIT_INDEX_EXC),
+            );
+            emit_store_header_word(
+                sink,
+                majit_backend::jitframe::JF_GCMAP_OFS as u64,
+                memory_error_gcmap(),
+            );
+        }
         sink.local_get(0);
         sink.return_();
     } else {
@@ -11203,10 +11371,144 @@ fn emit_memory_error_on_truthy(
     sink.end();
 }
 
-fn emit_guard_fail_index_store(sink: &mut PeepSink<'_, '_>, guard_idx: u32) {
+fn physical_fail_slot(guard: &GuardExit, index: usize) -> Option<usize> {
+    if guard.fail_locs.is_empty() {
+        return (index < guard.fail_arg_types.len()).then_some(index);
+    }
+    guard.fail_locs.get(index).copied().flatten()
+}
+
+fn ref_spill_item_indices(guard: &GuardExit, sign: usize) -> Vec<u32> {
+    let mut indices = Vec::new();
+    for (i, ty) in guard.fail_arg_types.iter().enumerate() {
+        if *ty != Type::Ref {
+            continue;
+        }
+        let Some(slot) = physical_fail_slot(guard, i) else {
+            continue;
+        };
+        indices.push(((FRAME_SLOT_BASE as usize + slot * 8) / sign) as u32);
+    }
+    indices
+}
+
+pub(crate) fn memory_error_gcmap_ptr() -> *const u8 {
+    memory_error_gcmap() as *const u8
+}
+
+fn memory_error_gcmap() -> usize {
+    static MAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAP.get_or_init(|| {
+        let bit = (FRAME_SLOT_BASE as usize / std::mem::size_of::<isize>()) as u32;
+        let map = gcmap_for_item_indices(&[bit]);
+        Box::into_raw(map) as *mut usize as usize
+    })
+}
+
+fn gcmap_for_item_indices(indices: &[u32]) -> Box<[usize]> {
+    let bits_per_word = usize::BITS as usize;
+    let num_words = indices
+        .iter()
+        .copied()
+        .max()
+        .map_or(1, |last| last as usize / bits_per_word + 1);
+    let mut gcmap = vec![0usize; 1 + num_words];
+    gcmap[0] = num_words;
+    for &index in indices {
+        let index = index as usize;
+        gcmap[1 + index / bits_per_word] |= 1usize << (index % bits_per_word);
+    }
+    gcmap.into_boxed_slice()
+}
+
+/// `local 0` is the items base. Header pointer fields are wasm32 `i32`s:
+/// the module always runs as wasm32, where a `GcRef` and a cell address
+/// are four bytes (`emit_force_arm`'s `i32.store` of `jf_force_descr`).
+fn emit_header_base(sink: &mut PeepSink<'_, '_>) {
     sink.local_get(0);
-    sink.i64_const(guard_idx as i64);
-    sink.i64_store(mem64(0));
+    sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
+    sink.i32_sub();
+}
+
+fn emit_store_header_word(sink: &mut PeepSink<'_, '_>, offset: u64, value: usize) {
+    emit_header_base(sink);
+    sink.i32_const(value as i32);
+    sink.i32_store(memarg(offset, 2));
+}
+
+/// Pair `local` of the exit table: word 0 is the descr cell, word 1 the gcmap.
+/// Each word is a wasm32 pointer.
+fn emit_load_exit_word(sink: &mut PeepSink<'_, '_>, table_base: u32, local: usize, word: usize) {
+    let byte = (local * 2 + word) * 4;
+    sink.i32_const(table_base as i32);
+    if byte != 0 {
+        sink.i32_const(byte as i32);
+        sink.i32_add();
+    }
+    sink.i32_load(memarg(0, 2));
+}
+
+fn emit_store_loaded_header(
+    sink: &mut PeepSink<'_, '_>,
+    offset: u64,
+    table_base: u32,
+    local: usize,
+    word: usize,
+) {
+    emit_header_base(sink);
+    emit_load_exit_word(sink, table_base, local, word);
+    sink.i32_store(memarg(offset, 2));
+}
+
+fn emit_guard_fail_index_store(
+    sink: &mut PeepSink<'_, '_>,
+    dispatch: BridgeDispatch<'_>,
+    op: &Op,
+    guard_idx: u32,
+) {
+    let local = (guard_idx - dispatch.fail_index_base) as usize;
+    // Direct codegen tests pass frame address 0 and read the exit index at
+    // offset 0. A real compile sets `exit_table_base` and stores the descr
+    // cell in `jf_descr` plus the guard gcmap in `jf_gcmap`
+    // (`_build_failure_recovery`).
+    if dispatch.exit_table_base == 0 {
+        sink.local_get(0);
+        sink.i64_const(exit_index(op, guard_idx) as i64);
+        sink.i64_store(mem64(0));
+        return;
+    }
+    if op.opcode == OpCode::Finish
+        && let Some(index) = crate::failguard::attached_finish_exit_index(&op.getdescr())
+    {
+        emit_store_header_word(
+            sink,
+            majit_backend::jitframe::JF_DESCR_OFS as u64,
+            crate::failguard::finish_descr_ptr(index),
+        );
+    } else if dispatch.exit_table_base == 0 {
+        emit_store_header_word(sink, majit_backend::jitframe::JF_DESCR_OFS as u64, 0);
+    } else {
+        emit_store_loaded_header(
+            sink,
+            majit_backend::jitframe::JF_DESCR_OFS as u64,
+            dispatch.exit_table_base,
+            local,
+            0,
+        );
+    }
+    if dispatch.exit_table_base == 0 {
+        // A direct codegen test has no table. Storing 0 keeps the exit from
+        // loading address 0 when the module is executed.
+        emit_store_header_word(sink, majit_backend::jitframe::JF_GCMAP_OFS as u64, 0);
+    } else {
+        emit_store_loaded_header(
+            sink,
+            majit_backend::jitframe::JF_GCMAP_OFS as u64,
+            dispatch.exit_table_base,
+            local,
+            1,
+        );
+    }
 }
 
 // ── Binary ops ──
@@ -12181,6 +12483,7 @@ mod tests {
             frame: FrameGeometry::compact(1, 0, 0),
             counter_slot: None,
             spill_helpers: &spill_helpers,
+            exit_table_base: 0,
             gc_table_slots: &HashMap::new(),
             const_tables: &const_tables,
             const_table_base: 0,

@@ -23,8 +23,15 @@ pub struct LoopAsmResources {
     /// overwrites the same descr updates `LabelTarget.owner_token`, and this
     /// drop leaves that row alone.
     pub label_owner: u64,
-    pub fail_indices: Vec<u32>,
+    /// One [`crate::failguard::FailDescrCell`] per guard exit. The address is
+    /// what the exit stores in `jf_descr` (`get_latest_descr`). The cell
+    /// outlives every module that can still leave through that exit because
+    /// this block is `asmmemmgr_blocks`.
+    pub fail_cells: Vec<Box<crate::failguard::FailDescrCell>>,
     pub bridge_cells: Vec<Box<[u32]>>,
+    /// `[descr_cell, gcmap]` pairs the exit loads. The address is baked
+    /// into the module; the allocation does not move.
+    pub exit_table: Option<Box<[usize]>>,
 }
 
 impl LoopAsmResources {
@@ -32,6 +39,41 @@ impl LoopAsmResources {
         let ptr = map.as_ptr() as usize;
         self.gcmaps.push(map);
         ptr
+    }
+
+    /// Stable address baked into `jf_descr`. The `Box` does not move for
+    /// the rest of this block's life.
+    pub fn alloc_fail_cell(
+        &mut self,
+        descr: std::sync::Arc<crate::failguard::WasmFailDescr>,
+    ) -> usize {
+        let cell = Box::new(crate::failguard::FailDescrCell::new(descr));
+        let ptr = &*cell as *const crate::failguard::FailDescrCell as usize;
+        self.fail_cells.push(cell);
+        ptr
+    }
+
+    /// `count` guard exits, two `usize` words each. Returns the guest
+    /// address baked into the module, or 0 when there is nothing to name.
+    pub fn alloc_exit_table(&mut self, count: usize) -> usize {
+        if count == 0 {
+            return 0;
+        }
+        let table = vec![0usize; count * 2].into_boxed_slice();
+        let ptr = table.as_ptr() as usize;
+        self.exit_table = Some(table);
+        ptr
+    }
+
+    pub fn write_exit_slot(&mut self, index: usize, descr_cell: usize, gcmap: usize) {
+        let Some(table) = self.exit_table.as_mut() else {
+            return;
+        };
+        let base = index * 2;
+        if base + 1 < table.len() {
+            table[base] = descr_cell;
+            table[base + 1] = gcmap;
+        }
     }
 }
 
@@ -55,17 +97,6 @@ impl Drop for LoopAsmResources {
                     if still_ours {
                         labels.remove(&id);
                     }
-                }
-            }
-        }
-        let mut reg = crate::failguard::FAIL_DESCR_REGISTRY.lock();
-        if let Some(vec) = reg.as_mut() {
-            for index in self.fail_indices.drain(..) {
-                if index < crate::failguard::FINISH_EXIT_INDEX_COUNT {
-                    continue;
-                }
-                if let Some(slot) = vec.get_mut(index as usize) {
-                    *slot = crate::failguard::FailDescrSlot::Reserved;
                 }
             }
         }

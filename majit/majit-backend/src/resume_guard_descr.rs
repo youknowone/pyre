@@ -184,10 +184,6 @@ pub struct ResumeGuardDescr {
     /// alongside RPython `AbstractResumeGuardDescr.status`; keeping it here
     /// makes eviction of the guard reclaim the state automatically.
     pub bridge_declined_terminally: AtomicBool,
-    /// Wasm module replacement temporarily withdraws this guard's dispatch.
-    /// See `FailDescr::wasm_dispatch_withdrawn`. Absent from native layouts.
-    #[cfg(target_arch = "wasm32")]
-    pub wasm_dispatch_withdrawn: AtomicBool,
     /// Codegen-time trace-op index for the originating guard op
     /// (`pyjitpl._compile_one_block` parity — the live op object passed
     /// at compile time has an implicit index in `loop.operations`).
@@ -394,8 +390,6 @@ impl Descr for ResumeGuardDescr {
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
             bridge_declined_terminally: AtomicBool::new(false),
-            #[cfg(target_arch = "wasm32")]
-            wasm_dispatch_withdrawn: AtomicBool::new(false),
             source_op_index: UnsafeCell::new(None),
             back_edge_poll: AtomicBool::new(false),
             fail_count: AtomicU32::new(0),
@@ -438,27 +432,6 @@ impl FailDescr for ResumeGuardDescr {
     fn set_bridge_declined_terminally(&self) {
         self.bridge_declined_terminally
             .store(true, Ordering::Release);
-    }
-    fn wasm_dispatch_withdrawn(&self) -> bool {
-        #[cfg(target_arch = "wasm32")]
-        {
-            self.wasm_dispatch_withdrawn.load(Ordering::Acquire)
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            false
-        }
-    }
-    fn set_wasm_dispatch_withdrawn(&self, withdrawn: bool) {
-        #[cfg(target_arch = "wasm32")]
-        {
-            self.wasm_dispatch_withdrawn
-                .store(withdrawn, Ordering::Release);
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let _ = withdrawn;
-        }
     }
     fn fail_arg_types(&self) -> &[Type] {
         unsafe { &*self.types.get() }
@@ -682,8 +655,6 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
         bridge_declined_terminally: AtomicBool::new(false),
-        #[cfg(target_arch = "wasm32")]
-        wasm_dispatch_withdrawn: AtomicBool::new(false),
         source_op_index: UnsafeCell::new(None),
         back_edge_poll: AtomicBool::new(false),
         fail_count: AtomicU32::new(0),

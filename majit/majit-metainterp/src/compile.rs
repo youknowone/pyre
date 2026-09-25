@@ -3657,8 +3657,6 @@ pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef 
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
         bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
-        #[cfg(target_arch = "wasm32")]
-        wasm_dispatch_withdrawn: std::sync::atomic::AtomicBool::new(false),
         source_op_index: UnsafeCell::new(None),
         back_edge_poll: std::sync::atomic::AtomicBool::new(false),
         fail_count: AtomicU32::new(0),
@@ -3743,8 +3741,6 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
         bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
-        #[cfg(target_arch = "wasm32")]
-        wasm_dispatch_withdrawn: std::sync::atomic::AtomicBool::new(false),
         source_op_index: UnsafeCell::new(None),
         back_edge_poll: std::sync::atomic::AtomicBool::new(false),
         fail_count: AtomicU32::new(0),
@@ -3911,16 +3907,6 @@ impl FailDescr for ResumeAtPositionDescr {
         self.inner
             .bridge_declined_terminally
             .store(true, Ordering::Release);
-    }
-    #[cfg(target_arch = "wasm32")]
-    fn wasm_dispatch_withdrawn(&self) -> bool {
-        self.inner.wasm_dispatch_withdrawn.load(Ordering::Acquire)
-    }
-    #[cfg(target_arch = "wasm32")]
-    fn set_wasm_dispatch_withdrawn(&self, withdrawn: bool) {
-        self.inner
-            .wasm_dispatch_withdrawn
-            .store(withdrawn, Ordering::Release);
     }
     fn fail_arg_types(&self) -> &[Type] {
         unsafe { &*self.inner.types.get() }
@@ -4089,8 +4075,6 @@ pub fn make_resume_at_position_descr_typed(types: Vec<Type>) -> DescrRef {
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
             bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(target_arch = "wasm32")]
-            wasm_dispatch_withdrawn: std::sync::atomic::AtomicBool::new(false),
             source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
             fail_count: AtomicU32::new(0),
@@ -4345,16 +4329,6 @@ impl FailDescr for ResumeGuardForcedDescr {
             .bridge_declined_terminally
             .store(true, Ordering::Release);
     }
-    #[cfg(target_arch = "wasm32")]
-    fn wasm_dispatch_withdrawn(&self) -> bool {
-        self.inner.wasm_dispatch_withdrawn.load(Ordering::Acquire)
-    }
-    #[cfg(target_arch = "wasm32")]
-    fn set_wasm_dispatch_withdrawn(&self, withdrawn: bool) {
-        self.inner
-            .wasm_dispatch_withdrawn
-            .store(withdrawn, Ordering::Release);
-    }
     fn fail_arg_types(&self) -> &[Type] {
         unsafe { &*self.inner.types.get() }
     }
@@ -4522,8 +4496,6 @@ pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>) -> DescrRef {
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
             bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(target_arch = "wasm32")]
-            wasm_dispatch_withdrawn: std::sync::atomic::AtomicBool::new(false),
             source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
             fail_count: AtomicU32::new(0),
@@ -4612,16 +4584,6 @@ impl FailDescr for ResumeGuardExcDescr {
         self.inner
             .bridge_declined_terminally
             .store(true, Ordering::Release);
-    }
-    #[cfg(target_arch = "wasm32")]
-    fn wasm_dispatch_withdrawn(&self) -> bool {
-        self.inner.wasm_dispatch_withdrawn.load(Ordering::Acquire)
-    }
-    #[cfg(target_arch = "wasm32")]
-    fn set_wasm_dispatch_withdrawn(&self, withdrawn: bool) {
-        self.inner
-            .wasm_dispatch_withdrawn
-            .store(withdrawn, Ordering::Release);
     }
     fn fail_arg_types(&self) -> &[Type] {
         unsafe { &*self.inner.types.get() }
@@ -4790,8 +4752,6 @@ pub fn make_resume_guard_exc_descr_typed(types: Vec<Type>) -> DescrRef {
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
             bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(target_arch = "wasm32")]
-            wasm_dispatch_withdrawn: std::sync::atomic::AtomicBool::new(false),
             source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
             fail_count: AtomicU32::new(0),
@@ -4870,9 +4830,6 @@ pub struct ResumeGuardCopiedDescr {
     /// Deterministic structural bridge refusal, owned by this copied guard
     /// exactly like its independent `status` word.
     bridge_declined_terminally: std::sync::atomic::AtomicBool,
-    /// Per-emission wasm dispatch state, independent of the copied donor.
-    #[cfg(target_arch = "wasm32")]
-    wasm_dispatch_withdrawn: std::sync::atomic::AtomicBool,
     /// Pyre-only per-emission slot: codegen-time trace-op index.
     /// Classified per-emission alongside `history.py:132
     /// AbstractFailDescr._attrs_` `rd_locs` / `adr_jump_offset`
@@ -4999,8 +4956,6 @@ impl majit_ir::Descr for ResumeGuardCopiedDescr {
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
             bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(target_arch = "wasm32")]
-            wasm_dispatch_withdrawn: std::sync::atomic::AtomicBool::new(false),
             source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
             fail_count: AtomicU32::new(0),
@@ -5036,15 +4991,6 @@ impl FailDescr for ResumeGuardCopiedDescr {
     fn set_bridge_declined_terminally(&self) {
         self.bridge_declined_terminally
             .store(true, Ordering::Release);
-    }
-    #[cfg(target_arch = "wasm32")]
-    fn wasm_dispatch_withdrawn(&self) -> bool {
-        self.wasm_dispatch_withdrawn.load(Ordering::Acquire)
-    }
-    #[cfg(target_arch = "wasm32")]
-    fn set_wasm_dispatch_withdrawn(&self, withdrawn: bool) {
-        self.wasm_dispatch_withdrawn
-            .store(withdrawn, Ordering::Release);
     }
     /// compile.py `get_resumestorage(): return prev`: reads chase
     /// to the donor.  The `fail_arg_types` slot is shared too —
@@ -5359,8 +5305,6 @@ impl majit_ir::Descr for ResumeGuardCopiedExcDescr {
                 trace_id: AtomicU64::new(0),
                 fail_index_per_trace: AtomicU32::new(0),
                 bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
-                #[cfg(target_arch = "wasm32")]
-                wasm_dispatch_withdrawn: std::sync::atomic::AtomicBool::new(false),
                 source_op_index: UnsafeCell::new(None),
                 back_edge_poll: std::sync::atomic::AtomicBool::new(false),
                 fail_count: AtomicU32::new(0),
@@ -5400,16 +5344,6 @@ impl FailDescr for ResumeGuardCopiedExcDescr {
         self.inner
             .bridge_declined_terminally
             .store(true, Ordering::Release);
-    }
-    #[cfg(target_arch = "wasm32")]
-    fn wasm_dispatch_withdrawn(&self) -> bool {
-        self.inner.wasm_dispatch_withdrawn.load(Ordering::Acquire)
-    }
-    #[cfg(target_arch = "wasm32")]
-    fn set_wasm_dispatch_withdrawn(&self, withdrawn: bool) {
-        self.inner
-            .wasm_dispatch_withdrawn
-            .store(withdrawn, Ordering::Release);
     }
     fn fail_arg_types(&self) -> &[Type] {
         self.inner.fail_arg_types()
@@ -5583,8 +5517,6 @@ pub fn make_resume_guard_copied_descr(prev: DescrRef) -> DescrRef {
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
         bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
-        #[cfg(target_arch = "wasm32")]
-        wasm_dispatch_withdrawn: std::sync::atomic::AtomicBool::new(false),
         source_op_index: UnsafeCell::new(None),
         back_edge_poll: std::sync::atomic::AtomicBool::new(false),
         fail_count: AtomicU32::new(0),
@@ -5623,8 +5555,6 @@ pub fn make_resume_guard_copied_exc_descr(prev: DescrRef) -> DescrRef {
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
             bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(target_arch = "wasm32")]
-            wasm_dispatch_withdrawn: std::sync::atomic::AtomicBool::new(false),
             source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
             fail_count: AtomicU32::new(0),
@@ -5820,8 +5750,6 @@ impl majit_ir::Descr for CompileLoopVersionDescr {
                 trace_id: AtomicU64::new(0),
                 fail_index_per_trace: AtomicU32::new(0),
                 bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
-                #[cfg(target_arch = "wasm32")]
-                wasm_dispatch_withdrawn: std::sync::atomic::AtomicBool::new(false),
                 source_op_index: UnsafeCell::new(None),
                 back_edge_poll: std::sync::atomic::AtomicBool::new(false),
                 fail_count: AtomicU32::new(0),
@@ -5864,16 +5792,6 @@ impl FailDescr for CompileLoopVersionDescr {
         self.inner
             .bridge_declined_terminally
             .store(true, Ordering::Release);
-    }
-    #[cfg(target_arch = "wasm32")]
-    fn wasm_dispatch_withdrawn(&self) -> bool {
-        self.inner.wasm_dispatch_withdrawn.load(Ordering::Acquire)
-    }
-    #[cfg(target_arch = "wasm32")]
-    fn set_wasm_dispatch_withdrawn(&self, withdrawn: bool) {
-        self.inner
-            .wasm_dispatch_withdrawn
-            .store(withdrawn, Ordering::Release);
     }
     fn fail_arg_types(&self) -> &[Type] {
         unsafe { &*self.inner.types.get() }
@@ -6048,8 +5966,6 @@ fn make_compile_loop_version_descr_with_payload(types: Vec<Type>, payload: RdPay
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
             bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(target_arch = "wasm32")]
-            wasm_dispatch_withdrawn: std::sync::atomic::AtomicBool::new(false),
             source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
             fail_count: AtomicU32::new(0),
@@ -6694,8 +6610,6 @@ mod fail_descr_tests {
                 trace_id: AtomicU64::new(0),
                 fail_index_per_trace: AtomicU32::new(0),
                 bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
-                #[cfg(target_arch = "wasm32")]
-                wasm_dispatch_withdrawn: std::sync::atomic::AtomicBool::new(false),
                 source_op_index: UnsafeCell::new(None),
                 back_edge_poll: std::sync::atomic::AtomicBool::new(false),
                 fail_count: AtomicU32::new(0),

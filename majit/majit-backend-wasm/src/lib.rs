@@ -23,7 +23,7 @@ pub use func_sig::{FuncSigVal, WasmSig, decode_func_sig, encode_func_sig};
 /// The wasm host compiles and resumes on the thread that ran the
 /// compiled frame (`eval.rs` post-`run_compiled`). cargo's default
 /// harness is N threads against one process-global cpu
-/// (`FAIL_DESCR_REGISTRY`, ExtraHeap, `cpu.gc_ll_descr`). PyPy never
+/// (finish cells, ExtraHeap, `cpu.gc_ll_descr`). PyPy never
 /// interleaves those. Cargo.toml has no per-package `test-threads`;
 /// `#[serial]` only serializes bodies (TLS teardown still races).
 /// This constructor runs before libtest's `main` reads
@@ -847,9 +847,9 @@ fn guard_fail_args_advanced(
 use failguard::{
     CallAssemblerTarget, ChainedTraceMeta, CompiledWasmLoop, LabelTarget, WasmFailDescr,
     WasmFrameData, ca_dispatch_mark_gnf2, ca_dispatch_mark_gnf2_for_compiled_ptr,
-    ca_dispatch_publish, ca_dispatch_redirect, ca_dispatch_slot, call_assembler_target,
-    global_fail_descr, label_target, mark_call_assembler_targets_gnf2_for_compiled_ptr,
-    publish_call_assembler_target, publish_label_target, register_fail_descrs, reserve_fail_descrs,
+    ca_dispatch_publish, ca_dispatch_redirect, ca_dispatch_slot, call_assembler_target, descr_at,
+    fill_exit_cell, label_target, mark_call_assembler_targets_gnf2_for_compiled_ptr,
+    publish_call_assembler_target, publish_label_target,
 };
 use majit_backend::{AsmInfo, BackendError, DeadFrame, JitCellToken};
 use majit_gc::GcAllocator;
@@ -1020,13 +1020,12 @@ fn stamp_and_publish_label_targets(
     (label_descrs, published_descrs)
 }
 
-/// JIT exception state, mirroring the native backends' `JIT_EXC_VALUE` /
-/// `JIT_EXC_TYPE` globals. A can-raise helper publishes the pending exception
-/// here via `jit_exc_raise`; the compiled trace's `GuardNoException` /
-/// `GuardException` read these slots by absolute address through the shared
-/// linear memory (host and trace import the same `env.memory`) and fail the
-/// guard accordingly. Single-slot per process, matching the single-threaded
-/// dynasm/cranelift backends.
+/// Process-wide pending-exception pair. `llmodel.py` `pos_exception` /
+/// `pos_exc_value`: the interpreter's current exception, which a residual
+/// raise publishes and the trace's `GuardNoException` / `GuardException`
+/// load by absolute address. A `must_save_exception` exit copies
+/// `pos_exc_value` into the frame's `jf_guard_exc` and clears both cells;
+/// `grab_exc_value` reads the frame, not this pair.
 static JIT_EXC_VALUE: AtomicI64 = AtomicI64::new(0);
 static JIT_EXC_TYPE: AtomicI64 = AtomicI64::new(0);
 
@@ -2555,7 +2554,6 @@ pub extern "C" fn wasm_jit_ca_pop_frame(_items_base: i64) -> i64 {
     if jf.is_null() {
         return 0;
     }
-    install_post_finish_force_gcmap(jf);
     wasm_jit_write_barrier(jf as i64);
     majit_gc::shadow_stack::pop_jf_top();
     0
@@ -2678,7 +2676,7 @@ pub struct WasmBackend {
     /// Lifetime tokens for the blocks recorded above. The host keeps every
     /// instantiated module for as long as this backend can enter it, so the
     /// tokens are held for the backend's life and give `used` back with it.
-    asm_memory_blocks: Vec<majit_backend::AsmMemoryBlock>,
+    asm_memory_blocks: std::cell::RefCell<Vec<majit_backend::AsmMemoryBlock>>,
     trace_counter: u64,
     /// One-shot header PC the metainterp publishes before `compile_loop`.
     next_header_pc: u64,
@@ -2794,24 +2792,6 @@ pub extern "C" fn wasm_jit_union_gcmap(old: i64, new: i64) -> i64 {
     }
 }
 
-/// Allocate the immutable guard-token gcmap which PyPy's
-/// `store_force_descr` retains as `_finish_gcmap`.
-fn leak_gcmap_for_indices(own: &mut release::LoopAsmResources, indices: &[u32]) -> usize {
-    let bits_per_word = usize::BITS as usize;
-    let num_words = indices
-        .iter()
-        .copied()
-        .max()
-        .map_or(1, |last| last as usize / bits_per_word + 1);
-    let mut gcmap = vec![0usize; 1 + num_words];
-    gcmap[0] = num_words;
-    for &index in indices {
-        let index = index as usize;
-        gcmap[1 + index / bits_per_word] |= 1usize << (index % bits_per_word);
-    }
-    own.park_gcmap(gcmap.into_boxed_slice())
-}
-
 /// `__indirect_function_table` slot of `call_jit::wasm_ca_resume_deopt`,
 /// published by pyre-jit at boot (`init_jit_hooks`). When an in-guest
 /// self-recursive CALL_ASSEMBLER callee leaves its trace through a guard with no
@@ -2880,10 +2860,9 @@ const DEFAULT_INLINE_EAGER_MAX_BYTES: u32 = 4096;
 /// [`INLINE_TRIP_THRESHOLD`] entries into the bridge compiled in its place.
 ///
 /// Installation replaces the retained wasm module after compiled execution
-/// returns. Until that publish the source guard keeps dispatching to this
-/// bridge (`assembler.py` `patch_jump_for_descr` never clears the jump
-/// before the new target is written). Invalidation remains owned by the
-/// loop token across module replacement.
+/// returns. Until that swap the guard keeps dispatching to the attached
+/// bridge, the same window `patch_jump_for_descr` leaves closed. Invalidation
+/// remains owned by the loop token across module replacement.
 struct PendingInline {
     /// The loop this region merges into. Weak so a leftover retry
     /// cannot keep an otherwise unreachable owner (and its module)
@@ -2908,34 +2887,6 @@ impl PendingInline {
 
     fn same_owner(&self, owner: &Arc<JitCellToken>) -> bool {
         self.owner().is_some_and(|o| Arc::ptr_eq(&o, owner))
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-impl PendingInline {
-    fn set_dispatch_withdrawn(&self, withdrawn: bool) {
-        // The trip helper runs in the guest. Do not expect/index: a
-        // missing owner or out-of-range fail index must leave
-        // must_compile alone rather than abort the loop.
-        let Some(owner) = self.owner() else {
-            return;
-        };
-        let Some(source) = compiled_wasm_loop(&owner) else {
-            return;
-        };
-        let guards = source.fail_descrs.borrow();
-        let Some(guard) = guards.get(self.region.source_fail_index as usize) else {
-            return;
-        };
-        // get_latest_descr_arc returns the canonical metainterp descriptor,
-        // not this backend wrapper. Backend-only synthetic guards have no
-        // metainterp hotness state to suppress.
-        if let Some(meta) = &guard.meta_descr
-            && (meta.is_resume_guard() || meta.is_resume_guard_copied())
-            && let Some(fail) = meta.as_fail_descr()
-        {
-            fail.set_wasm_dispatch_withdrawn(withdrawn);
-        }
     }
 }
 
@@ -3009,12 +2960,10 @@ impl PendingInlineGuard {
 
 impl Drop for PendingInlineGuard {
     fn drop(&mut self) {
-        if let Some(pending_id) = self.0
-            && let Some(_item) =
-                with_pending_inlines_mut(|pending| pending.shift_remove(&pending_id))
-        {
-            #[cfg(target_arch = "wasm32")]
-            _item.set_dispatch_withdrawn(false);
+        if let Some(pending_id) = self.0 {
+            with_pending_inlines_mut(|pending| {
+                pending.shift_remove(&pending_id);
+            });
         }
     }
 }
@@ -3046,12 +2995,43 @@ fn merged_region_fail_index(
 }
 
 /// Note that a bridge has counted its way to the threshold. Called from
-/// compiled code: queue the rebuild, but leave the source guard's cell
-/// pointing at this bridge. Module installation runs after compiled code
-/// returns (`assembler.py` `patch_jump_for_descr` redirects only once the
-/// new target exists).
+/// compiled code, inside the bridge module. When a loop is on the wasm
+/// stack, install now: the parent is not re-entered, and its next back-edge
+/// loads the resume cell. Otherwise queue for the host after return.
 pub fn record_inline_trip(pending_id: i64) {
     push_tripped_inline(pending_id);
+    let backend = EXECUTING_WASM_BACKEND.load(std::sync::atomic::Ordering::Relaxed);
+    if !backend.is_null() {
+        // The pointer is the backend whose `execute_token` is inside
+        // `glue::execute` on this thread. Install only writes a cell and
+        // replaces a module; it does not call the running function.
+        unsafe { (*backend).install_pending_inline(pending_id) };
+    }
+}
+
+/// Backend currently inside `glue::execute`. Not a loop table: one call,
+/// cleared when that call returns. The wasm host is single-threaded.
+static EXECUTING_WASM_BACKEND: std::sync::atomic::AtomicPtr<WasmBackend> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+struct ExecutingBackendGuard;
+
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+impl ExecutingBackendGuard {
+    fn enter(backend: &WasmBackend) -> Self {
+        EXECUTING_WASM_BACKEND.store(
+            backend as *const WasmBackend as *mut WasmBackend,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        Self
+    }
+}
+
+impl Drop for ExecutingBackendGuard {
+    fn drop(&mut self) {
+        EXECUTING_WASM_BACKEND.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 fn sweep_dead_pending() {
@@ -3063,13 +3043,9 @@ fn sweep_dead_pending() {
             if !owner.is_invalidated() {
                 return true;
             }
-            // The one-shot trip already zeroed the cell and marked the
-            // shared FailDescr withdrawn. Dropping the entry without
-            // restoring those leaves the next compile of that descr
-            // permanently cold.
+            // The cell still names the attached bridge. Republish it so an
+            // invalidated owner does not keep a stale slot for the next compile.
             if item.remap.is_none() {
-                #[cfg(target_arch = "wasm32")]
-                item.set_dispatch_withdrawn(false);
                 WasmBackend::restore_dispatch_cell(&owner, item.region.source_fail_index);
             }
             false
@@ -3296,7 +3272,7 @@ impl WasmBackend {
         WasmBackend {
             cpu_tracker: std::sync::Arc::new(majit_backend::CpuTotalTracker::default()),
             asm_memory_stats: std::sync::Arc::new(majit_backend::AsmMemoryManagerStats::default()),
-            asm_memory_blocks: Vec::new(),
+            asm_memory_blocks: std::cell::RefCell::new(Vec::new()),
             trace_counter: 0,
             next_header_pc: 0,
             constants: indexmap::IndexMap::new(),
@@ -3540,7 +3516,7 @@ impl WasmBackend {
     /// has since taken a region for the same guard — is dropped rather than
     /// retried: the bridge is already installed and correct, so the only thing
     /// lost is the merge.
-    pub fn install_pending_inline(&mut self, pending_id: i64) {
+    pub fn install_pending_inline(&self, pending_id: i64) {
         sweep_dead_pending();
         let Some(pending) = with_pending_inlines_mut(|p| p.shift_remove(&pending_id)) else {
             return;
@@ -3549,12 +3525,7 @@ impl WasmBackend {
             return;
         };
         // The driver has already classified the exit, and no compiled frame
-        // remains. Clear before rebuilding: re-emission preserves the same
-        // canonical descriptor, so replacing its wasm wrapper cannot clear it.
-        #[cfg(target_arch = "wasm32")]
-        if pending.remap.is_none() {
-            pending.set_dispatch_withdrawn(false);
-        }
+        // remains. Re-emission swaps the owner's module here.
         diag_bump(55);
         let mut work = vec![(pending_id, pending.region, pending.remap)];
         // Other trips for this owner would each re-emit the whole module.
@@ -3575,10 +3546,6 @@ impl WasmBackend {
         sibling_ids.sort_unstable();
         for id in sibling_ids {
             if let Some(item) = with_pending_inlines_mut(|p| p.shift_remove(&id)) {
-                #[cfg(target_arch = "wasm32")]
-                if item.remap.is_none() {
-                    item.set_dispatch_withdrawn(false);
-                }
                 work.push((id, item.region, item.remap));
             }
         }
@@ -3600,10 +3567,6 @@ impl WasmBackend {
             if let Some(item) = with_pending_inlines_mut(|p| p.shift_remove(&id)) {
                 // Remapped children still name a parent-local fail index;
                 // the owner's descr array does not hold that guard.
-                #[cfg(target_arch = "wasm32")]
-                if item.remap.is_none() {
-                    item.set_dispatch_withdrawn(false);
-                }
                 work.push((id, item.region, item.remap));
             }
         }
@@ -3694,10 +3657,6 @@ impl WasmBackend {
                 remap,
                 retry_on_sibling: remap.is_none(),
             };
-            #[cfg(target_arch = "wasm32")]
-            if remap.is_none() {
-                item.set_dispatch_withdrawn(false);
-            }
             with_pending_inlines_mut(|pending| {
                 pending.insert(id, item);
             });
@@ -3737,18 +3696,14 @@ impl WasmBackend {
     /// Rebuild `owner` with `region` merged into it. `false` leaves the owner
     /// exactly as it was, for a caller that still has an out-of-line bridge to
     /// fall back on.
-    fn install_inline_region(
-        &mut self,
-        owner: &JitCellToken,
-        region: codegen::InlinedBridge,
-    ) -> bool {
+    fn install_inline_region(&self, owner: &JitCellToken, region: codegen::InlinedBridge) -> bool {
         self.install_inline_region_batch(owner, vec![(region, None)])
             .0
             .is_empty()
     }
 
     fn install_inline_region_batch(
-        &mut self,
+        &self,
         owner: &JitCellToken,
         regions: Vec<(codegen::InlinedBridge, Option<(u64, u32)>)>,
     ) -> (Vec<(codegen::InlinedBridge, Option<(u64, u32)>)>, bool) {
@@ -3943,7 +3898,7 @@ impl WasmBackend {
     /// slot. The retained inputs are post-intern, so this does not allocate a
     /// second GC reference table or change any reference-constant immediate.
     #[allow(unreachable_code, unused_variables)]
-    pub fn reemit_loop(&mut self, token: &JitCellToken) -> Result<(), BackendError> {
+    pub fn reemit_loop(&self, token: &JitCellToken) -> Result<(), BackendError> {
         let compiled = token
             .compiled
             .get()
@@ -3985,7 +3940,7 @@ impl WasmBackend {
                 "wasm backend: merged owner exceeds parameter-bridge guard limit".into(),
             ));
         }
-        inputs.fail_index_base = reserve_fail_descrs(merged_guard_count);
+        inputs.fail_index_base = 0;
         let (new_cells_base, new_cells_owner) = codegen::alloc_bridge_cells(merged_guard_count);
         inputs.bridge_cells_base = new_cells_base;
         inputs.ca.compute_home_gcmap = true;
@@ -3998,7 +3953,29 @@ impl WasmBackend {
         inputs.ca.home_gcmap_min_ordinary = compiled.num_ref_homes.get();
         inputs.ca.home_gcmap_min_labels = compiled.used_label_homes.get();
         let mut asm_resources = release::LoopAsmResources::default();
+        inputs.ca.exit_table_base = asm_resources.alloc_exit_table(merged_guard_count) as u32;
         inputs.ca.gcmap_sink = &mut asm_resources as *mut _ as usize;
+        // The module still running has the back-edge check. This
+        // replacement is what that check tail-calls, so its jump is a
+        // plain `br`, matching the jump left by `patch_jump_for_descr`.
+        // A later replace is entered by the bridge's closing
+        // `return_call_indirect` of this same slot.
+        inputs.ca.resume_entry_addr = 0;
+        inputs.ca.resume_generation = 0;
+        let resume_generation = {
+            #[cfg(target_arch = "wasm32")]
+            {
+                compiled
+                    .resume_entry
+                    .generation
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .wrapping_add(1)
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                0u32
+            }
+        };
         let (wasm_bytes, guard_exits, merged_ref_homes, merged_labels) =
             codegen::build_wasm_module(&inputs)?;
         let code_size = wasm_bytes.len();
@@ -4024,10 +4001,7 @@ impl WasmBackend {
                     fail_locs: g.fail_locs.clone(),
                     is_finish: g.is_finish,
                     force_args_offset: inputs.frame.force_slot_base as u32,
-                    force_gcmap_ptr: leak_gcmap_for_indices(
-                        &mut asm_resources,
-                        &g.force_ref_home_indices,
-                    ),
+                    force_gcmap_ptr: g.exit_gcmap_ptr,
                     meta_descr: g.meta_descr.clone(),
                 })
             })
@@ -4074,9 +4048,24 @@ impl WasmBackend {
             }
             handle
         };
+        #[cfg(target_arch = "wasm32")]
+        if install_handle == old_handle
+            && old_handle != 0
+            && compiled
+                .resume_entry
+                .slot
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == old_handle
+            && inputs.frame.frame_bytes == compiled.frame.frame_bytes
+        {
+            compiled
+                .resume_entry
+                .generation
+                .store(resume_generation, std::sync::atomic::Ordering::Relaxed);
+        }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let _ = (wasm_bytes, labels_grew);
+            let _ = (wasm_bytes, labels_grew, resume_generation);
             return Err(BackendError::Unsupported(
                 "wasm backend: no host replacement binding".into(),
             ));
@@ -4089,11 +4078,11 @@ impl WasmBackend {
         // Both instances remain resident, so account for the replacement block
         // in the same lifetime ledger as an ordinary compiled module.
         let block = self.asm_memory_stats.record_block(code_size, code_size);
-        self.asm_memory_blocks.push(block);
+        self.asm_memory_blocks.borrow_mut().push(block);
         if install_handle != 0 && install_handle != old_handle {
             asm_resources.table_slots.push(install_handle);
         }
-        asm_resources.fail_indices = descrs.iter().map(|descr| descr.fail_index).collect();
+        publish_exit_slots(&mut asm_resources, &guard_exits, &descrs);
         asm_resources.label_owner = token.number;
         // Keep still-standalone bridge descriptors after the rebuilt merged
         // prefix. Adding regions grows that prefix, so every old positional
@@ -4103,7 +4092,6 @@ impl WasmBackend {
         let mut replacement_descrs = descrs.clone();
         replacement_descrs.extend(chained_descrs);
         *compiled.fail_descrs.borrow_mut() = replacement_descrs;
-        register_fail_descrs(&descrs);
         Self::register_meta_descrs(token, &descrs);
         let guard_growth = guard_exits.len().saturating_sub(old_guard_count);
         if guard_growth != 0 {
@@ -4687,7 +4675,7 @@ pub fn mark_call_assembler_terminal_decline(compiled_ptr: usize) {
 /// `resolve_guard_value_operand` reads back through `get_value_direct` for
 /// `make_a_counter_per_value`; it is never a fail argument, so it stays out of
 /// `fail_arg_types` and out of every typed exit decode.
-fn exit_slot_count(fail_descr: &failguard::WasmFailDescr) -> usize {
+pub(crate) fn exit_slot_count(fail_descr: &failguard::WasmFailDescr) -> usize {
     let fail_args = fail_descr.fail_arg_types.len();
     fail_descr
         .meta_descr
@@ -4706,64 +4694,60 @@ fn exit_arg_word(frame_ptr: usize, fail_descr: &WasmFailDescr, index: usize) -> 
     })
 }
 
-/// Box an `execute_token` exit for the host classifier.
+/// Host `execute_token` reader for `compile.py`
+/// `PropagateExceptionDescr.handle_fail`.
 ///
-/// A propagate-exception guard is retargeted at
-/// `exit_frame_with_exception_descr_ref` first
-/// (`failguard::stage_propagate_exception_exit`, `compile.py`
-/// `PropagateExceptionDescr.handle_fail`). The in-guest CALL_ASSEMBLER
-/// path does not come through here: `dead_frame_from_ran_frame` keeps the
-/// singleton so `wasm_ca_resume_deopt` can publish it to the caller's
+/// `failguard::stage_propagate_exception_exit` retargets the guard at
+/// `exit_frame_with_exception_descr_ref`. The exception moves from
+/// `jf_guard_exc` into fail-arg slot 0, the identity slot that finish
+/// descr reads, and `jf_descr` / `jf_gcmap` follow
+/// (`assembler.py` `gcmap_for_finish`). The deadframe stays this jitframe.
+/// The in-guest CALL_ASSEMBLER path does not come through here:
+/// `dead_frame_from_ran_frame` keeps the singleton so
+/// `wasm_ca_resume_deopt` publishes `jf_guard_exc` to the caller's
 /// `GUARD_NO_EXCEPTION`.
 #[cfg(target_arch = "wasm32")]
-fn box_exit_frame(
-    raw_values: Vec<i64>,
+fn stage_propagate_on_live_frame(
+    jf: *mut majit_backend::jitframe::JitFrame,
     fail_descr: Arc<WasmFailDescr>,
-    exc_value: i64,
-) -> Box<WasmFrameData> {
-    if let Some((staged, exc)) = failguard::stage_propagate_exception_exit(&fail_descr, exc_value) {
-        WasmFrameData::boxed(vec![exc], staged, 0)
-    } else {
-        WasmFrameData::boxed(raw_values, fail_descr, exc_value)
+) -> Arc<WasmFailDescr> {
+    let exc_value = unsafe { (*jf).jf_guard_exc as i64 };
+    let Some((staged, exc)) = failguard::stage_propagate_exception_exit(&fail_descr, exc_value)
+    else {
+        return fail_descr;
+    };
+    let items = jf as usize + majit_backend::jitframe::FIRST_ITEM_OFFSET;
+    unsafe {
+        *((items + codegen::FRAME_SLOT_BASE as usize) as *mut i64) = exc;
+        (*jf).jf_gcmap = codegen::memory_error_gcmap_ptr();
+        (*jf).jf_guard_exc = 0;
+        (*jf).jf_descr = failguard::finish_descr_ptr(failguard::FINISH_EXIT_INDEX_EXC);
     }
+    staged
 }
 
 /// Reconstruct a [`DeadFrame`] from a callee frame an in-guest `call_indirect`
 /// already ran to a guard/finish exit (the self-recursive CALL_ASSEMBLER fast
 /// path, `PYRE_WASM_CA`). This is the post-`glue::execute` tail of
 /// [`WasmBackend::execute_token`] factored for a frame the host did not itself
-/// enter: `frame[0]` holds the exit `fail_index`, `frame[1..]` the exit slots,
-/// and the pending-exception cell is captured with `jit_exc_take` exactly as
-/// `execute_token` does after a GuardNoException / GuardException exit.
+/// enter: `jf_descr` holds the exit's descr cell, `jf_frame` the exit slots.
+/// `grab_exc_value` reads `jf_guard_exc`, stored by the failing arm.
 /// `pyre-jit`'s `call_jit::wasm_ca_resume_deopt` calls this, then drives the
 /// resulting `DeadFrame` through the same `get_latest_descr_arc` /
 /// `get_*_value` / `grab_exc_value` Backend path the host's outermost deopt
 /// handling uses, so the in-guest deopt completes identically.
 ///
-/// `frame[0]` resolves through the GLOBAL fail-index space
-/// (`failguard::global_fail_descr`) — the exit may belong to a bridge chained
-/// past the source loop. `_compiled_ptr` (the source loop's metadata address,
-/// baked into the CA arm) is kept in the trace ABI but no longer consulted.
+/// `jf_descr` is the failing guard's [`failguard::FailDescrCell`]. The exit
+/// may belong to a bridge chained past the source loop; the pointer names
+/// that descr. `_compiled_ptr` stays in the trace ABI and is not consulted.
 pub fn dead_frame_from_ran_frame(_compiled_ptr: usize, frame_ptr: usize) -> DeadFrame {
-    let frame = frame_ptr as *const i64;
-    let exc_value = jit_exc_take();
-    let fail_index = unsafe { *frame } as u32;
-    let fail_descr =
-        global_fail_descr(fail_index).expect("invalid fail_index from in-guest CA callee frame");
-    let num_outputs = exit_slot_count(&fail_descr);
-    let raw_values: Vec<i64> = (0..num_outputs)
-        .map(|i| exit_arg_word(frame_ptr, &fail_descr, i))
-        .collect();
-    let mut jf_slot = (frame_ptr - majit_backend::jitframe::FIRST_ITEM_OFFSET) as i64;
-    let depth = majit_gc::shadow_stack::resume_ref_roots_depth();
-    unsafe {
-        majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(&mut jf_slot));
-    }
-    let mut data = WasmFrameData::boxed(raw_values, fail_descr, exc_value);
-    let jf = jf_slot as *mut majit_backend::jitframe::JitFrame;
-    data.seed_savedata_from_jf(jf);
-    majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
-    DeadFrame::Boxed(data)
+    let jf = (frame_ptr - majit_backend::jitframe::FIRST_ITEM_OFFSET)
+        as *mut majit_backend::jitframe::JitFrame;
+    let fail_descr = descr_at(unsafe { (*jf).jf_descr })
+        .expect("invalid jf_descr from in-guest CA callee frame");
+    DeadFrame::Boxed(WasmFrameData::from_live_frame(
+        jf, fail_descr, false, true, None,
+    ))
 }
 
 /// Reconstruct a [`DeadFrame`] for a frame a FORCE interrupted while its call
@@ -4790,64 +4774,40 @@ fn force_arg_word(frame_ptr: usize, fail_descr: &WasmFailDescr, index: usize) ->
     unsafe { *((frame_ptr + offset) as *const i64) }
 }
 
-fn dead_frame_from_forced_frame(frame_ptr: usize, fail_index: u32) -> DeadFrame {
-    let fail_descr =
-        global_fail_descr(fail_index).expect("invalid fail_index from a forced wasm frame");
-    let num_outputs = exit_slot_count(&fail_descr);
-    let types = fail_descr.fail_arg_types.as_slice();
-    let raw_values: Vec<i64> = (0..num_outputs)
-        .map(|i| {
-            let word = force_arg_word(frame_ptr, &fail_descr, i);
-            // `emit_force_arm` publishes a Ref as `home_offset * 2 + 1`
-            // (bit 0) so the value is read out of the traced home a
-            // collection inside the bracketed call forwards. A non-null
-            // ConstPtr has no home; it is published as `table_addr | 3`
-            // (bits 0 and 1) so this path reloads the forwarded GC-table
-            // slot. A literal is even (Ref pointers are 8-aligned; a
-            // null and a non-Ref argument are published as themselves).
-            let value = if types.get(i) == Some(&majit_ir::Type::Ref) && word & 1 == 1 {
-                let addr = if word & 2 == 2 {
-                    (word & !3) as usize
-                } else {
-                    frame_ptr + (word >> 1) as usize
-                };
-                // The GC table stores `GcRef` (= `usize`) slots; wasm32
-                // entries are 32-bit (`emit_gc_table_load` uses `i64.load32_u`).
-                if word & 2 == 2 && std::mem::size_of::<majit_ir::GcRef>() == 4 {
-                    unsafe { i64::from(*(addr as *const u32)) }
-                } else {
-                    unsafe { *(addr as *const i64) }
-                }
-            } else {
-                word
-            };
-            value
-        })
-        .collect();
-    let mut jf_slot = (frame_ptr - majit_backend::jitframe::FIRST_ITEM_OFFSET) as i64;
-    let depth = majit_gc::shadow_stack::resume_ref_roots_depth();
-    unsafe {
-        majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(&mut jf_slot));
+fn decoded_force_word(frame_ptr: usize, fail_descr: &WasmFailDescr, index: usize) -> i64 {
+    let word = force_arg_word(frame_ptr, fail_descr, index);
+    // `emit_force_arm` publishes a Ref as `home_offset * 2 + 1`
+    // (bit 0) so the value is read out of the traced home a
+    // collection inside the bracketed call forwards. A non-null
+    // ConstPtr has no home; it is published as `table_addr | 3`
+    // (bits 0 and 1) so this path reloads the forwarded GC-table
+    // slot. A literal is even (Ref pointers are 8-aligned; a
+    // null and a non-Ref argument are published as themselves).
+    if fail_descr.fail_arg_types.get(index) == Some(&majit_ir::Type::Ref) && word & 1 == 1 {
+        let addr = if word & 2 == 2 {
+            (word & !3) as usize
+        } else {
+            frame_ptr + (word >> 1) as usize
+        };
+        if word & 2 == 2 && std::mem::size_of::<majit_ir::GcRef>() == 4 {
+            unsafe { i64::from(*(addr as *const u32)) }
+        } else {
+            unsafe { *(addr as *const i64) }
+        }
+    } else {
+        word
     }
-    let mut data = WasmFrameData::boxed(raw_values, fail_descr, 0);
-    data.attach_origin_jf(jf_slot as *mut majit_backend::jitframe::JitFrame);
-    majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
-    DeadFrame::Boxed(data)
 }
 
-/// Install the recovery guard's compile-time map before dropping the execution
-/// root. This is wasm's `finish_gcmap`: PyPy's `store_force_descr` retains the
-/// guard token's static gcmap and `genop_finish` publishes that same map.
-fn install_post_finish_force_gcmap(jf: *mut majit_backend::jitframe::JitFrame) {
-    let encoded = unsafe { (*jf).jf_force_descr };
-    if encoded == 0 {
-        unsafe { (*jf).jf_gcmap = std::ptr::null() };
-        return;
-    }
-    let fail_index = u32::try_from(encoded - 1).expect("wasm force descriptor index overflow");
-    let fail_descr =
-        global_fail_descr(fail_index).expect("invalid post-FINISH wasm force descriptor");
-    unsafe { (*jf).jf_gcmap = fail_descr.force_gcmap_ptr as *const u8 };
+fn dead_frame_from_forced_frame(frame_ptr: usize, fail_descr: Arc<WasmFailDescr>) -> DeadFrame {
+    let jf = (frame_ptr - majit_backend::jitframe::FIRST_ITEM_OFFSET)
+        as *mut majit_backend::jitframe::JitFrame;
+    // The compiled run still owns this frame (it is on the shadow stack).
+    // Borrow it: freeing or dropping the GC root here would unroot a frame
+    // the call is still using. `read_force` makes get_* decode the force spill.
+    DeadFrame::Boxed(WasmFrameData::from_live_frame(
+        jf, fail_descr, true, true, None,
+    ))
 }
 
 /// The `run_compiled` frame pop, as one step: remember the (old-gen) frame so
@@ -4858,6 +4818,44 @@ fn install_post_finish_force_gcmap(jf: *mut majit_backend::jitframe::JitFrame) {
 fn remember_and_drop_execution_frame(jf: *mut majit_backend::jitframe::JitFrame, saved: usize) {
     wasm_jit_write_barrier(jf as i64);
     majit_gc::shadow_stack::pop_jf_to(saved);
+}
+
+fn publish_exit_slots(
+    resources: &mut release::LoopAsmResources,
+    guards: &[codegen::GuardExit],
+    descrs: &[Arc<WasmFailDescr>],
+) {
+    for (index, (guard, descr)) in guards.iter().zip(descrs).enumerate() {
+        fill_exit_cell(guard.descr_cell, Arc::clone(descr));
+        let cell = if guard.is_finish {
+            failguard::attached_finish_exit_index(&guard.meta_descr)
+                .map(failguard::finish_descr_ptr)
+                .unwrap_or(guard.descr_cell)
+        } else {
+            guard.descr_cell
+        };
+        resources.write_exit_slot(index, cell, guard.exit_gcmap_ptr);
+    }
+}
+
+fn wasm_frame_data(frame: &DeadFrame) -> &WasmFrameData {
+    frame
+        .boxed_data()
+        .and_then(|d| d.downcast_ref::<WasmFrameData>())
+        .expect("not WasmFrameData")
+}
+
+/// Logical fail-arg `index` from the live jitframe, or from the synthetic
+/// `raw_values` vector when no frame is attached.
+fn wasm_frame_word(data: &WasmFrameData, index: usize) -> i64 {
+    let Some(base) = data.items_base() else {
+        return data.raw_values[index];
+    };
+    if data.read_force() {
+        decoded_force_word(base, &data.fail_descr, index)
+    } else {
+        exit_arg_word(base, &data.fail_descr, index)
+    }
 }
 
 impl majit_backend::Backend for WasmBackend {
@@ -4875,14 +4873,14 @@ impl majit_backend::Backend for WasmBackend {
         // bracket its call published, then mark it so the GUARD_NOT_FORCED
         // waiting past that call deopts instead of running on.
         let jf = force_token.0 as *mut majit_backend::jitframe::JitFrame;
-        let encoded = unsafe { (*jf).jf_force_descr as usize };
-        assert_ne!(encoded, 0, "force: wasm frame carries no force descriptor");
-        let fail_index = u32::try_from(encoded - 1).expect("wasm force descriptor index overflow");
+        let cell = unsafe { (*jf).jf_force_descr };
+        assert_ne!(cell, 0, "force: wasm frame carries no force descriptor");
+        // assembler.py `force`: publish the armed descr into `jf_descr` so
+        // GUARD_NOT_FORCED's `CMP [jf_descr], 0` fails.
+        unsafe { (*jf).jf_descr = cell };
+        let fail_descr = descr_at(cell).expect("invalid jf_force_descr on a forced wasm frame");
         let items_base = forced_frame_items_base(force_token);
-        let slot = items_base as *mut i64;
-        let word = unsafe { *slot };
-        unsafe { *slot = word | codegen::FORCE_TAKEN_BIT };
-        Some(dead_frame_from_forced_frame(items_base, fail_index))
+        Some(dead_frame_from_forced_frame(items_base, fail_descr))
     }
 
     fn is_force_token_armed(&self, force_token: GcRef) -> bool {
@@ -5167,11 +5165,11 @@ impl majit_backend::Backend for WasmBackend {
         // index on wasm32; taking it here keeps the function in the table.
         let alloc = alloc_helpers();
         let wb = wasm_write_barrier_helpers();
-        // Exit indices come from the global fail-index space so a cross-trace
-        // chain's `frame[0]` resolves regardless of which module wrote it
-        // (`failguard::FAIL_DESCR_REGISTRY`).
+        // Each exit stores its `FailDescrCell` in `jf_descr`. The cell lives
+        // in this loop's `LoopAsmResources`, so a chained module names its
+        // own descr without a global index.
         let guard_exit_count = codegen::guard_exit_count(inputargs, ops);
-        let fail_index_base = reserve_fail_descrs(guard_exit_count);
+        let fail_index_base = 0u32;
         let (bridge_cells_base, bridge_cells_owner) = codegen::alloc_bridge_cells(guard_exit_count);
         let bridge_param_dispatch = bridge_param_dispatch_for(guard_exit_count);
         // assembler.py keeps `_finish_gcmap` with the compiled loop. The
@@ -5230,7 +5228,14 @@ impl majit_backend::Backend for WasmBackend {
             ),
         };
         let mut asm_resources = release::LoopAsmResources::default();
+        module_inputs.ca.exit_table_base = asm_resources.alloc_exit_table(guard_exit_count) as u32;
         module_inputs.ca.gcmap_sink = &mut asm_resources as *mut _ as usize;
+        let resume_entry = Box::new(failguard::ResumeEntry::new());
+        #[cfg(target_arch = "wasm32")]
+        {
+            module_inputs.ca.resume_entry_addr = resume_entry.addr();
+            module_inputs.ca.resume_generation = 1;
+        }
         let (wasm_bytes, guard_exits, num_ref_homes, _used_labels) =
             match codegen::build_wasm_module(&module_inputs) {
                 Ok(built) => built,
@@ -5255,10 +5260,7 @@ impl majit_backend::Backend for WasmBackend {
                     fail_locs: g.fail_locs.clone(),
                     is_finish: g.is_finish,
                     force_args_offset: frame.force_slot_base as u32,
-                    force_gcmap_ptr: leak_gcmap_for_indices(
-                        &mut asm_resources,
-                        &g.force_ref_home_indices,
-                    ),
+                    force_gcmap_ptr: g.exit_gcmap_ptr,
                     meta_descr: g.meta_descr.clone(),
                 })
             })
@@ -5338,7 +5340,7 @@ impl majit_backend::Backend for WasmBackend {
         // the token retained for it would charge its bytes for the backend's
         // whole life.
         let block = self.asm_memory_stats.record_block(code_size, code_size);
-        self.asm_memory_blocks.push(block);
+        self.asm_memory_blocks.borrow_mut().push(block);
 
         // A peeled loop carries real work before its (last) LABEL — the
         // unrolled first iteration. codegen emits the `loop` at that LABEL, so
@@ -5358,7 +5360,7 @@ impl majit_backend::Backend for WasmBackend {
         asm_resources.label_ids = published_labels;
         asm_resources.label_handle = func_handle;
         asm_resources.label_owner = token.number;
-        asm_resources.fail_indices = fail_descrs.iter().map(|descr| descr.fail_index).collect();
+        publish_exit_slots(&mut asm_resources, &guard_exits, &fail_descrs);
         if let Some(cells) = bridge_cells_owner {
             asm_resources.bridge_cells.push(cells);
         }
@@ -5377,6 +5379,7 @@ impl majit_backend::Backend for WasmBackend {
             trace_id,
             input_types: inputargs.iter().map(|ia| ia.tp.get()).collect(),
             func_handle: std::cell::Cell::new(func_handle),
+            resume_entry,
             pending_wasm_bytes: std::cell::RefCell::new(defer_host_compile.then_some(wasm_bytes)),
             compiled_loop_token: token.compiled_loop_token_expect(),
             descrs_registered: std::cell::Cell::new(false),
@@ -5437,6 +5440,10 @@ impl majit_backend::Backend for WasmBackend {
         if !defer_host_compile || cfg!(not(target_arch = "wasm32")) {
             compiled.register_descrs_once();
         }
+        compiled
+            .resume_entry
+            .slot
+            .store(func_handle, std::sync::atomic::Ordering::Relaxed);
         // For a pending self target this is the exact map already embedded in
         // the module's CA arm. Reuse it for the published metadata so the
         // loop and its self-callee have demonstrably identical geometry. A
@@ -6268,19 +6275,15 @@ impl majit_backend::Backend for WasmBackend {
                 gc_const_keys: gc_const_keys_of(gc_table.as_deref()),
                 constants: self.constants.clone(),
             };
-            // The owner's size prices this merge. The source guard's cell
-            // stays on the current bridge until the host publishes the
-            // merged module (`assembler.py` `patch_jump_for_descr`).
+            // The owner's size prices this merge alone.
             let owner_module_bytes =
                 compiled_wasm_loop(&owner).map_or(0, |loop_| loop_.module_bytes.get());
             register_pending_inline(owner, region, owner_module_bytes, remap)
         });
         let pending_guard = PendingInlineGuard(inline_trip.map(|probe| probe.pending_id));
 
-        // This bridge's exit indices come from the global fail-index space,
-        // like every trace's (`failguard::FAIL_DESCR_REGISTRY`).
         let guard_exit_count = codegen::guard_exit_count(inputargs, ops);
-        let base = reserve_fail_descrs(guard_exit_count);
+        let base = 0u32;
         // `rpython/jit/backend/model.py:145`: a bridge compiled after an
         // invalidation starts valid; only a later invalidation may kill its
         // `GUARD_NOT_INVALIDATED` operations.
@@ -6314,6 +6317,7 @@ impl majit_backend::Backend for WasmBackend {
             ca: ca_params,
         };
         let mut asm_resources = release::LoopAsmResources::default();
+        module_inputs.ca.exit_table_base = asm_resources.alloc_exit_table(guard_exit_count) as u32;
         module_inputs.ca.gcmap_sink = &mut asm_resources as *mut _ as usize;
         let (wasm_bytes, guard_exits, _num_ref_homes, _used_labels) =
             match codegen::build_wasm_module(&module_inputs) {
@@ -6335,10 +6339,7 @@ impl majit_backend::Backend for WasmBackend {
                     fail_locs: g.fail_locs.clone(),
                     is_finish: g.is_finish,
                     force_args_offset: source_frame.force_slot_base as u32,
-                    force_gcmap_ptr: leak_gcmap_for_indices(
-                        &mut asm_resources,
-                        &g.force_ref_home_indices,
-                    ),
+                    force_gcmap_ptr: g.exit_gcmap_ptr,
                     meta_descr: g.meta_descr.clone(),
                 })
             })
@@ -6366,7 +6367,7 @@ impl majit_backend::Backend for WasmBackend {
         // The host accepted the bridge. Only now publish its global exit
         // descriptors and attach their resume-data tracer to the source CLT;
         // a rejected module can never execute and must retain neither.
-        register_fail_descrs(&bridge_descrs);
+        publish_exit_slots(&mut asm_resources, &guard_exits, &bridge_descrs);
         Self::register_meta_descrs(original_token, &bridge_descrs);
         // Past every path that can fail with no module published: from here the
         // probe exists and its callback owns the pending entry.
@@ -6408,7 +6409,6 @@ impl majit_backend::Backend for WasmBackend {
         asm_resources.label_ids = published_label_descrs.clone();
         asm_resources.label_handle = bridge_slot;
         asm_resources.label_owner = original_token.number;
-        asm_resources.fail_indices = bridge_descrs.iter().map(|descr| descr.fail_index).collect();
         if let Some(cells) = bridge_cells_owner {
             asm_resources.bridge_cells.push(cells);
         }
@@ -6578,7 +6578,7 @@ impl majit_backend::Backend for WasmBackend {
         // `asmmemmgr.py:37`, as in `compile_loop` above: a bridge's module is a
         // block of its own.
         let block = self.asm_memory_stats.record_block(code_size, code_size);
-        self.asm_memory_blocks.push(block);
+        self.asm_memory_blocks.borrow_mut().push(block);
 
         // The first bridge installation is the identity re-emission probe.
         // A failed probe leaves the old module installed and must not disrupt
@@ -6723,14 +6723,6 @@ impl majit_backend::Backend for WasmBackend {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            // The pending-exception cell is global, unlike the native
-            // per-jitframe `jf_guard_exc`. A residual raise on a blackhole
-            // resume path (publish_residual_call_exception) writes it outside
-            // any trace and nothing clears it, so clear it before running this
-            // trace; otherwise jit_exc_take below would surface a stale
-            // exception from a previous frame's resume as this trace's.
-            jit_exc_clear();
-
             // Orthodox frame path (PYRE_WASM_CA): run the trace on a real
             // GC-managed `JitFrame` so a collecting allocation forwards the live
             // Ref-home slots through the `jf_gcmap` custom trace, discovered via
@@ -6781,33 +6773,20 @@ impl majit_backend::Backend for WasmBackend {
                 }
 
                 let saved = majit_gc::shadow_stack::push_jf(jf_ref);
-                glue::execute(func_handle, items_base as u32);
+                {
+                    let _exec = ExecutingBackendGuard::enter(self);
+                    glue::execute(func_handle, items_base as u32);
+                }
 
-                let exc_value = jit_exc_take();
-                let fail_index = unsafe { *(items_base as *const i64) } as u32;
-                // Global fail-index space: a cross-trace chain may exit through
-                // a sibling loop's guard, so `frame[0]` never resolves against
-                // this loop's own `fail_descrs`.
-                let fail_descr =
-                    global_fail_descr(fail_index).expect("invalid fail_index from compiled wasm");
-                let num_outputs = exit_slot_count(&fail_descr);
-                let raw_values: Vec<i64> = (0..num_outputs)
-                    .map(|i| exit_arg_word(items_base, &fail_descr, i))
-                    .collect();
-
-                // `assembler.py::_finish_gcmap`: after FINISH, retain only the
-                // Ref homes needed by the still-armed GUARD_NOT_FORCED_2.  The
-                // virtualizable token is an independent edge to this JITFRAME;
-                // its lazy force may arrive after the execution root is gone.
-                install_post_finish_force_gcmap(jf);
                 wasm_jit_write_barrier(jf as i64);
-                let mut data = box_exit_frame(raw_values, fail_descr, exc_value);
-                // `boxed` registers the copied Ref slots and may collect.
-                // Keep the JITFRAME on the shadow stack across that call so
-                // `jf_savedata` is forwarded, then publish the updated
-                // address before dropping the frame root.
+                // Re-read: the barrier can collect and forward the frame.
+                // The exit stored the descr cell in `jf_descr` and its gcmap
+                // in `jf_gcmap` (`generate_quick_failure` / `genop_finish`).
                 let jf = majit_gc::shadow_stack::peek_jf(saved).0 as *mut JitFrame;
-                data.seed_savedata_from_jf(jf);
+                let fail_descr = descr_at(unsafe { (*jf).jf_descr })
+                    .expect("invalid jf_descr from compiled wasm");
+                let fail_descr = stage_propagate_on_live_frame(jf, fail_descr);
+                let data = WasmFrameData::from_live_frame(jf, fail_descr, false, true, None);
                 majit_gc::shadow_stack::pop_jf_to(saved);
 
                 return DeadFrame::Boxed(data);
@@ -6863,26 +6842,21 @@ impl majit_backend::Backend for WasmBackend {
             let saved = majit_gc::shadow_stack::push_jf(GcRef(jf as usize));
             {
                 let _bh_phase = majit_gc::BhProbePhase::enter("compiled");
-                glue::execute(func_handle, items as usize as u32);
+                {
+                    let _exec = ExecutingBackendGuard::enter(self);
+                    glue::execute(func_handle, items as usize as u32);
+                }
             }
             majit_gc::shadow_stack::pop_jf_to(saved);
-            install_post_finish_force_gcmap(jf);
             for h in 0..compiled.frame.home_slots {
                 let slot = unsafe { items.add(home_base + h) } as *mut GcRef;
                 wasm_gc_remove_root(slot);
             }
-            let exc_value = jit_exc_take();
-            let fail_index = unsafe { *items } as u32;
-            // Global fail-index space (see the CA-path resolution above).
             let fail_descr =
-                global_fail_descr(fail_index).expect("invalid fail_index from compiled wasm");
-            let num_outputs = exit_slot_count(&fail_descr);
-            let raw_values: Vec<i64> = (0..num_outputs)
-                .map(|i| exit_arg_word(items as usize, &fail_descr, i))
-                .collect();
-            // FINISH(force_token) parks this JitFrame pointer in raw_values.
-            // Own the off-GC block before `boxed` so a later `force` does
-            // not dereference a freed frame.
+                descr_at(unsafe { (*jf).jf_descr }).expect("invalid jf_descr from compiled wasm");
+            // FINISH(force_token) parks this JitFrame pointer in the frame.
+            // Own the off-GC block so a later `force` does not dereference
+            // a freed frame. Fail args stay in the frame.
             let owner = unsafe {
                 majit_backend::libc_deadframe::LibcJitFrameDeadFrame::owning(
                     jf,
@@ -6894,9 +6868,14 @@ impl majit_backend::Backend for WasmBackend {
                     None,
                 )
             };
-            let mut data = box_exit_frame(raw_values, fail_descr, exc_value);
-            data.take_host_frame(owner);
-            DeadFrame::Boxed(data)
+            let fail_descr = stage_propagate_on_live_frame(jf, fail_descr);
+            DeadFrame::Boxed(WasmFrameData::from_live_frame(
+                jf,
+                fail_descr,
+                false,
+                false,
+                Some(owner),
+            ))
         }
     }
 
@@ -6941,41 +6920,31 @@ impl majit_backend::Backend for WasmBackend {
     }
 
     fn get_int_value(&self, frame: &DeadFrame, index: usize) -> i64 {
-        let data = frame
-            .boxed_data()
-            .and_then(|d| d.downcast_ref::<WasmFrameData>())
-            .expect("not WasmFrameData");
-        data.raw_values[index]
+        wasm_frame_word(wasm_frame_data(frame), index)
     }
 
     fn get_value_direct(&self, frame: &DeadFrame, slot: usize) -> i64 {
-        // Wasm's slot space is the dense fail-value vector.
+        // The counter stamp is a logical fail-arg index, the same space
+        // `get_int_value` reads. A live frame decodes it through fail_locs.
         self.get_int_value(frame, slot)
     }
 
     fn get_float_value(&self, frame: &DeadFrame, index: usize) -> f64 {
-        let data = frame
-            .boxed_data()
-            .and_then(|d| d.downcast_ref::<WasmFrameData>())
-            .expect("not WasmFrameData");
-        f64::from_bits(data.raw_values[index] as u64)
+        f64::from_bits(self.get_int_value(frame, index) as u64)
     }
 
     fn get_ref_value(&self, frame: &DeadFrame, index: usize) -> GcRef {
-        let data = frame
-            .boxed_data()
-            .and_then(|d| d.downcast_ref::<WasmFrameData>())
-            .expect("not WasmFrameData");
-        GcRef(data.raw_values[index] as usize)
+        GcRef(self.get_int_value(frame, index) as usize)
     }
 
-    /// llmodel.py grab_exc_value parity: the exception captured when the
-    /// trace exited through a GuardNoException / GuardException.
+    /// `llmodel.py` `grab_exc_value`: `deadframe.jf_guard_exc`.
     fn grab_exc_value(&self, frame: &DeadFrame) -> GcRef {
-        let data = frame
-            .boxed_data()
-            .and_then(|d| d.downcast_ref::<WasmFrameData>())
-            .expect("not WasmFrameData");
+        let data = wasm_frame_data(frame);
+        if let Some(base) = data.items_base() {
+            let jf = (base - majit_backend::jitframe::FIRST_ITEM_OFFSET)
+                as *const majit_backend::jitframe::JitFrame;
+            return GcRef(unsafe { (*jf).jf_guard_exc });
+        }
         GcRef(data.exc_value as usize)
     }
 
@@ -6988,11 +6957,15 @@ impl majit_backend::Backend for WasmBackend {
     }
 
     fn get_savedata_ref(&self, frame: &DeadFrame) -> Option<GcRef> {
-        let data = frame
-            .boxed_data()
-            .and_then(|d| d.downcast_ref::<WasmFrameData>())
-            .expect("not WasmFrameData");
-        let r = GcRef(data.savedata as usize);
+        let data = wasm_frame_data(frame);
+        let word = if let Some(base) = data.items_base() {
+            let jf = (base - majit_backend::jitframe::FIRST_ITEM_OFFSET)
+                as *const majit_backend::jitframe::JitFrame;
+            unsafe { (*jf).jf_savedata }
+        } else {
+            data.savedata as usize
+        };
+        let r = GcRef(word);
         if r.is_null() { None } else { Some(r) }
     }
 
@@ -7435,8 +7408,13 @@ mod tests {
         });
         wasm_jit_ca_pop_frame((old.0 + FIRST_ITEM_OFFSET) as i64);
         assert_eq!(majit_gc::shadow_stack::jf_depth(), saved);
+        // The exit already stored the guard gcmap. Pop forwards the frame
+        // and leaves that map in place (`genop_finish` / `push_gcmap`).
         unsafe {
-            assert!((*(forwarded.0 as *const JitFrame)).jf_gcmap.is_null());
+            assert_eq!(
+                (*(forwarded.0 as *const JitFrame)).jf_gcmap,
+                map.as_ptr().cast()
+            );
             assert_eq!((*(old.0 as *const JitFrame)).jf_gcmap, map.as_ptr().cast());
         }
     }
