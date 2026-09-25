@@ -328,12 +328,11 @@ unsafe fn simplequeue_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
 
 /// The GC types this module owns, in `build_gc` registration order.
 pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType>) {
-    use pyre_interpreter::importing::{ModuleGcAnchor, ModuleGcLayout, ModuleGcType};
+    use pyre_interpreter::importing::{ModuleGcLayout, ModuleGcType};
     use pyre_object::lltype::PyreClassPyTypeOf;
     // `_queue.SimpleQueue` is unconditional, so it registers ahead of the
     // target-gated tail and keeps one id on every target.
     types.push(ModuleGcType {
-        anchor: ModuleGcAnchor::AfterGcStats,
         descriptor: <W_SimpleQueue as PyreClassPyTypeOf>::DESCRIPTOR,
         layout: ModuleGcLayout::CustomTrace(simplequeue_custom_trace),
         destructor: Some(gc_destructor!(w_simplequeue_dealloc)),

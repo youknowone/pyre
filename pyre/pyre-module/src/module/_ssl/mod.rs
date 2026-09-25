@@ -3518,20 +3518,18 @@ unsafe fn ssl_socket_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_
 
 /// The GC types this module owns, in `build_gc` registration order.
 pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType>) {
-    use pyre_interpreter::importing::{ModuleGcAnchor, ModuleGcLayout, ModuleGcType};
+    use pyre_interpreter::importing::{ModuleGcLayout, ModuleGcType};
     use pyre_object::lltype::PyreClassPyTypeOf;
     // rustls objects sit behind opaque native pointers.  Context and
     // MemoryBIO are subclassable native layouts, so their marker walks the
     // mapdict prefix; Context additionally owns Python callbacks/path values.
     // The sweep destructors release the opaque rustls allocations.
     types.push(ModuleGcType {
-        anchor: ModuleGcAnchor::AfterScandirIterator,
         descriptor: <W_SSLContext as PyreClassPyTypeOf>::DESCRIPTOR,
         layout: ModuleGcLayout::CustomTrace(ssl_context_custom_trace),
         destructor: Some(gc_destructor!(w_ssl_context_dealloc)),
     });
     types.push(ModuleGcType {
-        anchor: ModuleGcAnchor::AfterScandirIterator,
         descriptor: <W_MemoryBIO as PyreClassPyTypeOf>::DESCRIPTOR,
         layout: ModuleGcLayout::CustomTrace(
             pyre_interpreter::objspace::std::mapdict::mapdict_storage_custom_trace,
@@ -3539,19 +3537,16 @@ pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType
         destructor: Some(gc_destructor!(w_memory_bio_dealloc)),
     });
     types.push(ModuleGcType {
-        anchor: ModuleGcAnchor::AfterScandirIterator,
         descriptor: <W_SSLSession as PyreClassPyTypeOf>::DESCRIPTOR,
         layout: ModuleGcLayout::Object,
         destructor: Some(gc_destructor!(w_ssl_session_dealloc)),
     });
     types.push(ModuleGcType {
-        anchor: ModuleGcAnchor::AfterScandirIterator,
         descriptor: <W_SSLSocket as PyreClassPyTypeOf>::DESCRIPTOR,
         layout: ModuleGcLayout::CustomTrace(ssl_socket_custom_trace),
         destructor: Some(gc_destructor!(w_ssl_socket_dealloc)),
     });
     types.push(ModuleGcType {
-        anchor: ModuleGcAnchor::AfterScandirIterator,
         descriptor: <W_Certificate as PyreClassPyTypeOf>::DESCRIPTOR,
         layout: ModuleGcLayout::PyreClass {
             memory_pressure_offset: None,

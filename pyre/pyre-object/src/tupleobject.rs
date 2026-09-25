@@ -97,8 +97,8 @@ pub struct W_TupleObjectUser {
 /// call sites.
 pub const W_TUPLE_GC_TYPE_ID: u32 = 8;
 pub const W_TUPLE_OBJECT_SIZE: usize = std::mem::size_of::<W_TupleObject>();
-/// User-subclass tuple layout (`typedef.py` `_getusercls`). Unconditional id 187.
-pub const W_TUPLE_USER_GC_TYPE_ID: u32 = 187;
+/// User-subclass tuple layout (`typedef.py` `_getusercls`). Unconditional id 169.
+pub const W_TUPLE_USER_GC_TYPE_ID: u32 = 169;
 pub const W_TUPLE_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_TupleObjectUser>();
 
 impl crate::lltype::GcType for W_TupleObjectUser {
