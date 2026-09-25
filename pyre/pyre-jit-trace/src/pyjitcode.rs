@@ -8,7 +8,7 @@
 //!   * `majit_metainterp::jitcode::JitCode` is the current runtime
 //!     adapter bytecode container (`code`, `constants_*`, `num_regs_*`,
 //!     plus pyre-only `exec.*` pools). It is not the canonical
-//!     codewriter `majit_translate::jitcode::JitCode`.
+//!     codewriter `majit_jitcode::jitcode::JitCode`.
 //!   * `PyJitCode` (this struct) wraps that JitCode together with
 //!     pyre-only translation metadata — the per-Python-PC resume tables
 //!     (Python PC → byte offset), the runtime `w_code` wrapper, and

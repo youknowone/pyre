@@ -3559,7 +3559,7 @@ pub(crate) fn fbw_callee_body_replay_scan(
     num_regs_i: usize,
     constants_i: &[i64],
     num_regs_r: usize,
-    constants_r: &[majit_translate::codewriter::jitcode::ConstSlotR],
+    constants_r: &[majit_jitcode::codewriter::jitcode::ConstSlotR],
     callee_descr_refs: &[DescrRef],
     method_form_deferred_helpers: bool,
 ) -> CalleeReplayScan {

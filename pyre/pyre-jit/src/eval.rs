@@ -11817,7 +11817,7 @@ fn handle_jit_outcome(
 /// resume.py allocate_struct(typedescr) → cpu.bh_new(typedescr).
 fn allocate_struct(typedescr: &dyn majit_ir::SizeDescr) -> usize {
     let size = typedescr.size();
-    let descr = majit_translate::jitcode::BhDescr::Size {
+    let descr = majit_jitcode::jitcode::BhDescr::Size {
         size,
         // `descr.py` cache identity — `SizeDescr.cache_key()`
         // returns the `LLType::Struct(path_hash)` slot stamped at
@@ -11825,18 +11825,18 @@ fn allocate_struct(typedescr: &dyn majit_ir::SizeDescr) -> usize {
         type_id: typedescr.cache_key(),
         vtable: 0,
         owner: String::new(),
-        all_fielddescrs: majit_translate::jitcode::bh_field_specs_from_size_descr(typedescr),
+        all_fielddescrs: majit_jitcode::jitcode::bh_field_specs_from_size_descr(typedescr),
         is_gc_managed: typedescr.is_gc_managed(),
     };
     let (driver, _) = driver_pair();
     driver.meta_interp().backend().bh_new(&descr) as usize
 }
 
-fn bh_array_descr_from_descr(arraydescr: &majit_ir::DescrRef) -> majit_translate::jitcode::BhDescr {
+fn bh_array_descr_from_descr(arraydescr: &majit_ir::DescrRef) -> majit_jitcode::jitcode::BhDescr {
     let ad = arraydescr
         .as_array_descr()
         .expect("resume array path requires an ArrayDescr");
-    majit_translate::jitcode::BhDescr::from_array_descr(ad)
+    majit_jitcode::jitcode::BhDescr::from_array_descr(ad)
 }
 
 fn bh_new_array_from_descr(length: usize, arraydescr: &majit_ir::DescrRef, clear: bool) -> i64 {
@@ -11901,7 +11901,7 @@ fn bh_setarrayitem_float_from_descr(
 fn allocate_with_vtable(descr: &dyn majit_ir::SizeDescr) -> usize {
     let size = descr.size();
     let vtable = descr.vtable();
-    let bh_descr = majit_translate::jitcode::BhDescr::Size {
+    let bh_descr = majit_jitcode::jitcode::BhDescr::Size {
         size,
         // `resolve_gc_tid`'s producer contract: `allocate_with_vtable` widens
         // the descr's own dense tid into the slot rather than serializing the
@@ -11913,7 +11913,7 @@ fn allocate_with_vtable(descr: &dyn majit_ir::SizeDescr) -> usize {
         type_id: descr.type_id() as u64,
         vtable: vtable as u64,
         owner: String::new(),
-        all_fielddescrs: majit_translate::jitcode::bh_field_specs_from_size_descr(descr),
+        all_fielddescrs: majit_jitcode::jitcode::bh_field_specs_from_size_descr(descr),
         is_gc_managed: descr.is_gc_managed(),
     };
     let (driver, _) = driver_pair();
@@ -12232,7 +12232,7 @@ fn materialize_virtual_from_rd(
             let cd = calldescr
                 .as_call_descr()
                 .expect("OS_RAW_MALLOC_VARSIZE_CHAR calldescr must downcast to CallDescr");
-            let bh_calldescr = majit_translate::jitcode::BhCallDescr::from_call_descr(cd);
+            let bh_calldescr = majit_jitcode::jitcode::BhCallDescr::from_call_descr(cd);
             // resume.py:1456: self.cpu.bh_call_i(func, [size], None, None, calldescr)
             let buffer = driver.meta_interp().backend().bh_call_i(
                 *func,
@@ -12254,7 +12254,7 @@ fn materialize_virtual_from_rd(
             for i in 0..offsets.len() {
                 let fnum = fieldnums[i];
                 let di = &descrs[i];
-                let bh_descr = majit_translate::jitcode::BhDescr::from_array_descr_info(di);
+                let bh_descr = majit_jitcode::jitcode::BhDescr::from_array_descr_info(di);
                 // resume.py:1544: assert not descr.is_array_of_pointers()
                 assert!(
                     !bh_descr.is_array_of_pointers(),
@@ -12415,7 +12415,7 @@ fn materialize_virtual_from_rd(
             let cd = calldescr
                 .as_call_descr()
                 .expect("VStr/VUni Concat calldescr must downcast to CallDescr");
-            let bh_calldescr = majit_translate::jitcode::BhCallDescr::from_call_descr(cd);
+            let bh_calldescr = majit_jitcode::jitcode::BhCallDescr::from_call_descr(cd);
             // resume.py concat_strings / resume.py
             // concat_unicodes — cpu.bh_call_r(func, [left, right], descr).
             let backend = driver.meta_interp().backend();
@@ -12490,7 +12490,7 @@ fn materialize_virtual_from_rd(
             let cd = calldescr
                 .as_call_descr()
                 .expect("VStr/VUni Slice calldescr must downcast to CallDescr");
-            let bh_calldescr = majit_translate::jitcode::BhCallDescr::from_call_descr(cd);
+            let bh_calldescr = majit_jitcode::jitcode::BhCallDescr::from_call_descr(cd);
             // resume.py slice_string / resume.py
             // slice_unicode — cpu.bh_call_r(func, [str, start, stop], descr).
             let backend = driver.meta_interp().backend();
@@ -14018,13 +14018,13 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         let sd = typedescr
             .as_size_descr()
             .expect("allocate_struct: not a SizeDescr");
-        let bh_descr = majit_translate::jitcode::BhDescr::Size {
+        let bh_descr = majit_jitcode::jitcode::BhDescr::Size {
             size: sd.size(),
             // `descr.py` cache identity via `SizeDescr.cache_key()`.
             type_id: sd.cache_key(),
             vtable: 0,
             owner: String::new(),
-            all_fielddescrs: majit_translate::jitcode::bh_field_specs_from_size_descr(sd),
+            all_fielddescrs: majit_jitcode::jitcode::bh_field_specs_from_size_descr(sd),
             is_gc_managed: sd.is_gc_managed(),
         };
         let (driver, _) = driver_pair();
@@ -14051,13 +14051,13 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
             W_INT_GC_TYPE_ID => pyre_object::intobject::w_int_new_unique(0) as i64,
             W_FLOAT_GC_TYPE_ID => pyre_object::floatobject::w_float_new(0.0) as i64,
             _ => {
-                let bh_descr = majit_translate::jitcode::BhDescr::Size {
+                let bh_descr = majit_jitcode::jitcode::BhDescr::Size {
                     size: descr_size,
                     // Note: u32 gc tid widened to u64 cache key slot.
                     type_id: descr_index as u64,
                     vtable: vtable as u64,
                     owner: String::new(),
-                    all_fielddescrs: majit_translate::jitcode::bh_field_specs_from_size_descr(sd),
+                    all_fielddescrs: majit_jitcode::jitcode::bh_field_specs_from_size_descr(sd),
                     is_gc_managed: sd.is_gc_managed(),
                 };
                 let (driver, _) = driver_pair();
@@ -14252,7 +14252,7 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         let cd = calldescr
             .as_call_descr()
             .expect("OS_RAW_MALLOC_VARSIZE_CHAR calldescr must downcast to CallDescr");
-        let bh_calldescr = majit_translate::jitcode::BhCallDescr::from_call_descr(cd);
+        let bh_calldescr = majit_jitcode::jitcode::BhCallDescr::from_call_descr(cd);
         driver.meta_interp().backend().bh_call_i(
             func,
             Some(&[size as i64]),
@@ -14270,7 +14270,7 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         value: i64,
         descr: &majit_ir::ArrayDescrInfo,
     ) {
-        let bh_descr = majit_translate::jitcode::BhDescr::from_array_descr_info(descr);
+        let bh_descr = majit_jitcode::jitcode::BhDescr::from_array_descr_info(descr);
         let (driver, _) = driver_pair();
         let backend = driver.meta_interp().backend();
         backend.bh_raw_store_f(buffer, offset, f64::from_bits(value as u64), &bh_descr);
@@ -14284,7 +14284,7 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         value: i64,
         descr: &majit_ir::ArrayDescrInfo,
     ) {
-        let bh_descr = majit_translate::jitcode::BhDescr::from_array_descr_info(descr);
+        let bh_descr = majit_jitcode::jitcode::BhDescr::from_array_descr_info(descr);
         let (driver, _) = driver_pair();
         let backend = driver.meta_interp().backend();
         backend.bh_raw_store_i(buffer, offset, value, &bh_descr);

@@ -8,6 +8,7 @@ description = "The part of majit's codewriter that the JIT runtime reads: jitcod
 
 [dependencies]
 majit-ir = { workspace = true }
+bincode = { workspace = true }
 serde = { workspace = true, features = ["rc"] }
 indexmap = { workspace = true }
 parking_lot = { workspace = true }

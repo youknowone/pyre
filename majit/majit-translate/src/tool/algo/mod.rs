@@ -19,4 +19,4 @@ pub use majit_jitcode::tool::algo::color;
 pub mod graphlib;
 pub mod regalloc;
 pub mod sparsemat;
-pub mod unionfind;
+pub use majit_jitcode::tool::algo::unionfind;

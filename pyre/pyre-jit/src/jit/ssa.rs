@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use majit_translate::tool::algo::unionfind::UnionFind;
+use majit_jitcode::tool::algo::unionfind::UnionFind;
 
 use super::flow::{
     BlockRef, ExitSwitch, ExitSwitchElement, FlowValue, FunctionGraph, Variable, mkentrymap,

@@ -89,7 +89,8 @@ pub fn discover(repo_root: &Path, manifest_dir: &Path) -> CacheInputs {
         section_workspace_deps(&read_to_string(&crate_toml), "build-dependencies")
             .into_iter()
             .filter(|name| {
-                !LLBC_CRATES.contains(&name.as_str()) && !UNLINKED_BUILD_DEPS.contains(&name.as_str())
+                !LLBC_CRATES.contains(&name.as_str())
+                    && !UNLINKED_BUILD_DEPS.contains(&name.as_str())
             })
             .collect();
 

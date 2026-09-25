@@ -129,50 +129,7 @@ pub struct PipelineResult {
     pub flattened: SSARepr,
 }
 
-/// Compiled identity of one configured JIT driver.
-///
-/// RPython equivalent: `JitDriverStaticData.portal_graph` together with
-/// `JitDriverStaticData.mainjitcode.index` after
-/// `CallControl.grab_initial_jitcodes()` and codewriter draining.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CompiledJitDriver {
-    pub portal: CallPath,
-    /// RPython: `jitdriver_sd.portal_runner_ptr`, preserved as source-level
-    /// identity alongside the run-time `portal_runner_adr`.
-    #[serde(default)]
-    pub portal_runner: Option<CallPath>,
-    pub main_jitcode_index: usize,
-    /// RPython: `jitdriver.greens` — the green names, in declaration order.
-    #[serde(default)]
-    pub greens: Vec<String>,
-    /// RPython: `jitdriver.reds`. Empty for an auto-red driver, whose reds were
-    /// never declared; `red_args_types` describes them in that case.
-    #[serde(default)]
-    pub reds: Vec<String>,
-    /// RPython: `jd._green_args_spec` (`warmspot.py
-    /// make_args_specification`), parallel to `greens`.
-    ///
-    /// Upstream stores each marker operand's full `concretetype`, including
-    /// `Ptr(rstr.STR)` / `Ptr(rstr.UNICODE)`.  Pyre's graph-side
-    /// `ConcreteType` has already projected every GC pointer to `GcRef` before
-    /// `Transformer::marker_operand_kinds` reads it, so this artifact can only
-    /// preserve the IR kind today.  Widening this field to `GreenType` would
-    /// not recover information its producer cannot supply.
-    #[serde(default)]
-    pub green_args_spec: Vec<majit_ir::Type>,
-    /// RPython: `jd.red_args_types` (`warmspot.py:664`).
-    ///
-    /// Read off the merge-point operands during codewriting, so a consumer
-    /// building the run-time driver takes the kinds the graph actually has
-    /// rather than re-typing the build's declaration. Without this the two
-    /// accounts are independent and nothing makes them agree.
-    #[serde(default)]
-    pub red_args_types: Vec<majit_ir::Type>,
-    /// RPython: `jitdriver.virtualizables` — the red names declared
-    /// virtualizable. Empty is the common non-pyre case.
-    #[serde(default)]
-    pub virtualizables: Vec<String>,
-}
+pub use majit_jitcode::artifacts::CompiledJitDriver;
 
 /// Result of running the pipeline on a full program.
 #[derive(Debug, Clone, Serialize)]

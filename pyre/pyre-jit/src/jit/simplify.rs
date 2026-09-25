@@ -48,7 +48,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use majit_translate::tool::algo::unionfind::{UnionFind, UnionFindInfo};
+use majit_jitcode::tool::algo::unionfind::{UnionFind, UnionFindInfo};
 
 use super::flow::{
     BlockRef, Constant, ConstantValue, ExitSwitch, ExitSwitchElement, FlowListOfKind, FlowValue,

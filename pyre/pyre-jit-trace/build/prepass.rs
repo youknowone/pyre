@@ -313,7 +313,9 @@ fn analysis_llbc_paths(repo_root: &str) -> Vec<String> {
         }
     }
 
-    let llbc_dir = std::path::Path::new(repo_root).join("build").join(LLBC_SUBDIR);
+    let llbc_dir = std::path::Path::new(repo_root)
+        .join("build")
+        .join(LLBC_SUBDIR);
     LLBC_CRATES
         .iter()
         .map(|crate_name| llbc_dir.join(format!("{crate_name}.ullbc")))
@@ -414,7 +416,10 @@ fn preflight_llbc_or_fail() {
         .map(|(key, value)| format!("{key}={value} "))
         .collect();
     let (extract_cmd, override_extra) = if sidecars.is_empty() {
-        (format!("{extract_env}scripts/extract-llbc.py"), String::new())
+        (
+            format!("{extract_env}scripts/extract-llbc.py"),
+            String::new(),
+        )
     } else {
         let target = std::env::var("TARGET").unwrap_or_default();
         (

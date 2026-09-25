@@ -14,7 +14,7 @@
 //! `dispatch_inline_call_*` per-shape dispatchers. The `inline_call_*`
 //! opname arms stay in `handle` (mod.rs) and call into these.
 
-use majit_translate::codewriter::jitcode::{DESCENT_ENTRY_LEN_SLOTS, DescentBlockerSummary};
+use majit_jitcode::codewriter::jitcode::{DESCENT_ENTRY_LEN_SLOTS, DescentBlockerSummary};
 use pyre_interpreter::locals_w;
 use rustpython_wtf8::Wtf8;
 
@@ -1066,7 +1066,7 @@ fn collect_descent_unlowered_helper_blockers(
         if d.opname.starts_with("residual_call") {
             let funcbox = body.code.get(d.pc + 1).copied().unwrap_or(0) as usize;
             if let Some(Some(fnaddr)) = known_i.get(funcbox)
-                && majit_translate::codewriter::call::is_symbolic_fnaddr(*fnaddr)
+                && majit_jitcode::codewriter::call::is_symbolic_fnaddr(*fnaddr)
                 && !blockers.contains(fnaddr)
             {
                 blockers.push(*fnaddr);
@@ -1727,7 +1727,7 @@ pub(crate) fn summarize_body_blockers_with(
             // operand, so it is the byte right after the opcode.
             let funcbox = code.get(d.pc + 1).copied().unwrap_or(0) as usize;
             if let Some(Some(fnaddr)) = known_i.get(funcbox)
-                && majit_translate::codewriter::call::is_symbolic_fnaddr(*fnaddr)
+                && majit_jitcode::codewriter::call::is_symbolic_fnaddr(*fnaddr)
             {
                 let slot = if effect {
                     &mut summary.blocker_after_effect
@@ -14533,14 +14533,14 @@ fn inline_fnaddr_call_setup_from_jc<Sym: WalkSym>(
     float_args: &[OpRef],
 ) -> Result<InlineFnaddrCall, DispatchError> {
     let fnaddr = jc.fnaddr;
-    if fnaddr == 0 || majit_translate::codewriter::call::is_symbolic_fnaddr(fnaddr) {
+    if fnaddr == 0 || majit_jitcode::codewriter::call::is_symbolic_fnaddr(fnaddr) {
         return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
             pc,
             symbolic: fnaddr,
         });
     }
     let calldescr = jc.calldescr().clone();
-    let descr = crate::descr::make_descr_from_bh(&majit_translate::jitcode::BhDescr::Call {
+    let descr = crate::descr::make_descr_from_bh(&majit_jitcode::jitcode::BhDescr::Call {
         calldescr: calldescr.clone(),
     });
     let funcbox = ctx.trace_ctx.const_int(fnaddr);

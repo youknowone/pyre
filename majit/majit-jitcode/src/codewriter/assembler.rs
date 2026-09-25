@@ -12,6 +12,21 @@ use vecset::VecSet;
 use super::flatten::Label;
 use majit_ir::CallInfoCollection;
 
+/// Non-canonical tag marking a deferred prebuilt-string slot in
+/// `constants_r`.  x86-64 user addresses occupy `0..2^48`, so this high-word
+/// pattern can never alias a real GCREF / host-static address; the low 48
+/// bits carry the [`super::jitcode::StrConstDescriptor`] ordinal.  The runtime load pass
+/// overwrites every such slot with a live immortal STR address before the
+/// jitcode is used, so the sentinel is never dereferenced (a non-canonical
+/// deref would fault, surfacing any missed patch immediately).
+pub const STR_CONST_SENTINEL_BASE: i64 = 0x7E57_0000_0000_0000u64 as i64;
+
+/// Non-canonical tag marking a deferred unit-variant singleton slot in
+/// `constants_r`, disjoint from [`STR_CONST_SENTINEL_BASE`] in the same
+/// non-canonical high-word space; the low 48 bits carry the
+/// [`super::jitcode::UnitVariantConstDescriptor`] ordinal.
+pub const UNIT_VARIANT_CONST_SENTINEL_BASE: i64 = 0x7E58_0000_0000_0000u64 as i64;
+
 /// RPython `class AssemblerError(Exception)` (assembler.py).
 ///
 /// Upstream raises this for unsupported constant kinds while assembling

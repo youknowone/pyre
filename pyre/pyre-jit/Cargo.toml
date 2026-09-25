@@ -23,12 +23,6 @@ dynasm = ["jit", "majit-backend-dynasm", "majit-metainterp/dynasm", "pyre-jit-tr
 # Build opt-in majit audit instrumentation. Individual audits remain selected
 # at runtime by their environment gates.
 jit-audits = ["majit-metainterp/jit-audits", "majit-ir/jit-audits"]
-# Forward the majit-translate `mir-frontend` feature so pyre-jit builds
-# can select the MIR front-end from the top level
-# (`cargo build --features pyre-jit/mir-frontend`).  Production
-# validation runs check.py with this enabled and
-# MAJIT_MIR_FRONTEND_LLBC pointing at an extracted .ullbc.
-mir-frontend = ["majit-translate/mir-frontend"]
 # Collect on every allocation so instance / container GC tracing is
 # exercised eagerly. majit-gc is compiled once per build, so this single
 # edge enables the stress mode for the whole pyre-jit dependency closure.
@@ -55,7 +49,7 @@ linkme = { workspace = true }
 majit-ir = { workspace = true }
 majit-macros = { workspace = true }
 majit-metainterp = { workspace = true }
-majit-translate = { workspace = true }
+majit-jitcode = { workspace = true }
 majit-backend = { workspace = true }
 majit-trace = { workspace = true }
 majit-gc = { workspace = true }

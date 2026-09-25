@@ -12,16 +12,20 @@ pub mod codewriter {
     pub mod flatten;
     pub mod insns;
     pub mod jitcode;
+    pub mod jtransform;
     pub mod liveness;
 }
 
 pub use codewriter::{insns, jitcode, liveness};
 
+pub mod artifacts;
 pub mod parse;
 pub mod rclass;
+pub mod rffi;
 
 pub mod tool {
     pub mod algo {
         pub mod color;
+        pub mod unionfind;
     }
 }

@@ -60,20 +60,7 @@ pub fn depth0_sep(spelling: &str, sep: char) -> Option<usize> {
     None
 }
 
-/// One ARRAY lltype, one descr key.
-///
-/// `[i64]` and `GcArray<i64>` (and the `f64` pair) are the same
-/// `GcArray(Signed)` / `GcArray(Float)` that `cpu.arraydescrof` and
-/// `get_array_descr` key once. Callers that turn a spelling into a
-/// `_cache_array` key or an effectinfo array index run the spelling
-/// through here first. Every other identity is unchanged.
-pub fn canonical_array_type_id(array_type_id: &str) -> std::borrow::Cow<'_, str> {
-    match array_type_id {
-        "[i64]" => std::borrow::Cow::Borrowed("GcArray<i64>"),
-        "[f64]" => std::borrow::Cow::Borrowed("GcArray<f64>"),
-        other => std::borrow::Cow::Borrowed(other),
-    }
-}
+pub use majit_jitcode::codewriter::jtransform::canonical_array_type_id;
 
 /// Decide whether a registered `array_type_id` describes a
 /// headerless item-run pointee or a length-prefixed wrapper.  Bare

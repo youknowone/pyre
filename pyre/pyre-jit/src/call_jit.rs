@@ -1904,7 +1904,7 @@ fn materialize_str_call_for_cranelift(
     let cd = calldescr
         .as_call_descr()
         .expect("materialize_str_call: calldescr must downcast to CallDescr");
-    let bh_calldescr = majit_translate::jitcode::BhCallDescr::from_call_descr(cd);
+    let bh_calldescr = majit_jitcode::jitcode::BhCallDescr::from_call_descr(cd);
     let result = backend.bh_call_r(
         func,
         if args_i.is_empty() {

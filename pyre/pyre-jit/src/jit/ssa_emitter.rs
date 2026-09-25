@@ -73,7 +73,7 @@ impl SSAReprEmitter {
     pub fn set_fnaddr_and_calldescr(
         &mut self,
         fnaddr: i64,
-        calldescr: majit_translate::jitcode::BhCallDescr,
+        calldescr: majit_jitcode::jitcode::BhCallDescr,
     ) {
         self.builder.set_fnaddr(fnaddr);
         self.builder.set_calldescr(calldescr);

@@ -212,7 +212,7 @@ fn build(tail: OperatorTail) -> Option<(i32, usize)> {
     builder.patch_live_offset(live_patch, liveness_offset);
 
     let (funcptr, result_type) = tail.tail_call();
-    let calldescr = majit_translate::codewriter::jitcode::BhCallDescr {
+    let calldescr = majit_jitcode::codewriter::jitcode::BhCallDescr {
         // One `Ref` argument — the box the dunder returned — and the result
         // bank the caller's own call-result register lives in.
         arg_classes: "r".to_string(),

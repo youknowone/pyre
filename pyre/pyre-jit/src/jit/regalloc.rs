@@ -30,7 +30,7 @@
 //!
 //! The chordal coloring algorithm itself is shared with
 //! `majit-translate`'s flow-graph regalloc through
-//! `majit_translate::regalloc::DependencyGraph::find_node_coloring`
+//! `majit_jitcode::tool::algo::color::DependencyGraph::find_node_coloring`
 //! (line-by-line port of `rpython/tool/algo/color.py:31-85`).
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -51,8 +51,8 @@ type HashSet<T> = FxHashSet<T>;
 /// codewriter passes that build one directly or take one by reference.
 pub type Coloring = FxHashMap<super::flow::VariableId, u16>;
 
-use majit_translate::regalloc::DependencyGraph;
-use majit_translate::tool::algo::unionfind::UnionFind;
+use majit_jitcode::tool::algo::color::DependencyGraph;
+use majit_jitcode::tool::algo::unionfind::UnionFind;
 
 use super::flatten::{DescrOperand, Insn, Kind, Operand, Register, SSARepr, TLabel};
 use super::flow::{ExitSwitch, ExitSwitchElement, FlowValue, FunctionGraph as FlowGraph, Variable};

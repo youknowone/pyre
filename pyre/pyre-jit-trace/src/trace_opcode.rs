@@ -1176,7 +1176,7 @@ impl MIFrame {
                     let mut cursor = off + 3;
                     let mut out: Vec<(LiveBank, usize)> =
                         Vec::with_capacity((length_i + length_r + length_f) as usize);
-                    use majit_translate::liveness::LivenessIterator;
+                    use majit_jitcode::liveness::LivenessIterator;
                     if length_i != 0 {
                         let mut it = LivenessIterator::new(cursor, length_i, &all_liveness);
                         while let Some(reg_idx) = it.next() {
@@ -1526,7 +1526,7 @@ impl MIFrame {
         // IndexError contract — a liveness-listed index out of bank
         // range is an encoder/codewriter invariant violation, not a
         // silent NONE.
-        use majit_translate::liveness::LivenessIterator;
+        use majit_jitcode::liveness::LivenessIterator;
         if length_i != 0 {
             let mut it = LivenessIterator::new(cursor, length_i, &all_liveness);
             while let Some(reg_idx) = it.next() {
@@ -3549,7 +3549,7 @@ mod tests {
     #[test]
     fn get_list_of_active_boxes_reads_kind_specific_register_banks() {
         use indexmap::IndexMap;
-        use majit_translate::liveness::encode_liveness;
+        use majit_jitcode::liveness::encode_liveness;
         use std::sync::Arc;
 
         let mut all_liveness = vec![1, 1, 1];
@@ -3565,7 +3565,7 @@ mod tests {
 
         let runtime_jc = {
             let inner = majit_metainterp::jitcode::JitCode::new("get_list_of_active_boxes_test");
-            inner.set_body(majit_translate::jitcode::JitCodeBody {
+            inner.set_body(majit_jitcode::jitcode::JitCodeBody {
                 code: vec![majit_metainterp::jitcode::insns::BC_LIVE, 0, 0],
                 c_num_regs_i: 4,
                 c_num_regs_r: 4,
@@ -3639,7 +3639,7 @@ mod tests {
     #[test]
     fn pre_opcode_snapshot_reads_coalesced_stack_color_by_semantic_slot() {
         use indexmap::IndexMap;
-        use majit_translate::liveness::encode_liveness;
+        use majit_jitcode::liveness::encode_liveness;
         use std::sync::Arc;
 
         let mut all_liveness = vec![0, 1, 0];
@@ -3655,7 +3655,7 @@ mod tests {
             let inner = majit_metainterp::jitcode::JitCode::new(
                 "pre_opcode_snapshot_coalesced_stack_color_test",
             );
-            inner.set_body(majit_translate::jitcode::JitCodeBody {
+            inner.set_body(majit_jitcode::jitcode::JitCodeBody {
                 code: vec![majit_metainterp::jitcode::insns::BC_LIVE, 0, 0],
                 c_num_regs_r: 3,
                 startpoints: Some([0_usize].into_iter().collect()),

@@ -33,7 +33,9 @@
 
 use indexmap::IndexMap;
 use rustc_hash::{FxBuildHasher, FxHashMap};
+use std::cell::RefCell;
 use std::hash::Hash;
+use std::rc::Rc;
 
 /// The three tables key on whatever the caller partitions — a flow-graph
 /// `Variable`, a jitcode variable id.  Upstream's dictionaries hash those by
@@ -57,6 +59,19 @@ pub trait UnionFindInfo: Sized {
 /// (unionfind.py `if info1 is not None`).
 impl UnionFindInfo for () {
     fn absorb(&mut self, _other: Self) {}
+}
+
+/// An info object shared by reference, as every upstream info object is.
+/// `absorb` receives both handles, so an implementation can also write to
+/// the absorbed side (`MemoTable.absorb` sets `other.do_not_process`).
+pub trait SharedUnionFindInfo: Sized {
+    fn absorb_shared(this: &Rc<RefCell<Self>>, other: Rc<RefCell<Self>>);
+}
+
+impl<T: SharedUnionFindInfo> UnionFindInfo for Rc<RefCell<T>> {
+    fn absorb(&mut self, other: Self) {
+        T::absorb_shared(self, other);
+    }
 }
 
 /// RPython `class UnionFind(object)` (unionfind.py).

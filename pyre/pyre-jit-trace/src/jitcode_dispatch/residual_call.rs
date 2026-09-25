@@ -2109,7 +2109,7 @@ fn residual_operands_are_not_all_objects<Sym: WalkSym>(
         // executor declines on the same condition.
         return true;
     };
-    majit_translate::codewriter::call::is_symbolic_fnaddr(addr)
+    majit_jitcode::codewriter::call::is_symbolic_fnaddr(addr)
         || pyre_interpreter::is_abi_unsound_argument_residual(addr as usize)
         || BIGINT_FNADDRS.contains(&addr)
 }
@@ -2924,13 +2924,13 @@ pub(crate) fn try_fold_pure_call_via_executor<Sym: WalkSym>(
     // more executable than an unpatched symbolic path hash; leave the call
     // unfolded so the main residual-call gate can abort/decline it without
     // jumping through address zero.
-    if func_ptr == 0 || majit_translate::codewriter::call::is_symbolic_fnaddr(func_ptr) {
+    if func_ptr == 0 || majit_jitcode::codewriter::call::is_symbolic_fnaddr(func_ptr) {
         return recorded;
     }
     // Cap at MAX_HOST_CALL_ARITY (`call_int_function` / `call_void_function`
     // panic on excess arity).  `allboxes.len() - 1` is the arg count
     // (funcbox doesn't pass through).
-    if allboxes.len() - 1 > majit_translate::codewriter::insns::MAX_HOST_CALL_ARITY {
+    if allboxes.len() - 1 > majit_jitcode::codewriter::insns::MAX_HOST_CALL_ARITY {
         return recorded;
     }
     let mut args = Vec::with_capacity(allboxes.len() - 1);
@@ -3483,7 +3483,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         && allboxes.first().is_some_and(|b| b.is_constant())
         && let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(allboxes[0])
     {
-        if addr == 0 || majit_translate::codewriter::call::is_symbolic_fnaddr(addr) {
+        if addr == 0 || majit_jitcode::codewriter::call::is_symbolic_fnaddr(addr) {
             // `symbolic` resolves against `symbolic_fnaddr_paths` in the
             // build's jit metadata, so carry the hash for the report.
             Some(("symbolic", addr, addr))
@@ -3614,7 +3614,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // high-16-bit tag no real funcptr can carry on any target (a bit-47
     // range test would misclassify every real funcptr on aarch64 Linux,
     // whose 48-bit VA maps code at 0xaaab…/0xffff…).
-    if func_ptr == 0 || majit_translate::codewriter::call::is_symbolic_fnaddr(func_ptr) {
+    if func_ptr == 0 || majit_jitcode::codewriter::call::is_symbolic_fnaddr(func_ptr) {
         return Ok(declined_symbolic(call_opcode));
     }
     // Same unsound-argument set the inline-subwalk gate consults above.
@@ -3685,7 +3685,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // the way the descent scan already does not.
     let is_rewindable_root_bracket =
         pyre_interpreter::is_rewindable_root_bracket_residual(func_ptr as usize);
-    if allboxes.len() - 1 > majit_translate::codewriter::insns::MAX_HOST_CALL_ARITY {
+    if allboxes.len() - 1 > majit_jitcode::codewriter::insns::MAX_HOST_CALL_ARITY {
         return Ok(declined_symbolic(call_opcode));
     }
     // A void residual (CALL_N family) is a side effect with no result box, so
@@ -10825,7 +10825,7 @@ pub(crate) fn dispatch_conditional_call_ir_v<Sym: WalkSym>(
     if cond_true && ctx.is_authoritative_executor {
         if let Some(majit_ir::Value::Int(func_addr)) = ctx.trace_ctx.box_value(funcptr)
             && func_addr != 0
-            && !majit_translate::codewriter::call::is_symbolic_fnaddr(func_addr)
+            && !majit_jitcode::codewriter::call::is_symbolic_fnaddr(func_addr)
             && let Some(concrete_args) = cond_record_concrete_args(ctx, &allboxes)
         {
             majit_metainterp::call_void_function(func_addr as *const (), &concrete_args);
@@ -10913,7 +10913,7 @@ fn dispatch_conditional_call_value_ir<Sym: WalkSym>(
     let (result, concrete) = if should_call && ctx.is_authoritative_executor {
         if let Some(majit_ir::Value::Int(func_addr)) = ctx.trace_ctx.box_value(funcptr)
             && func_addr != 0
-            && !majit_translate::codewriter::call::is_symbolic_fnaddr(func_addr)
+            && !majit_jitcode::codewriter::call::is_symbolic_fnaddr(func_addr)
             && let Some(concrete_args) = cond_record_concrete_args(ctx, &allboxes)
         {
             match dst_bank {

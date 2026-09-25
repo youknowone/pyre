@@ -134,7 +134,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     // Top-level jitcode's per-bank constant pool — seeded into
     // register slots `[num_regs_*, num_regs_* + constants_*.len())`
     // per `pyjitpl.py copy_constants`.
-    top_constants_r: &[majit_translate::codewriter::jitcode::ConstSlotR],
+    top_constants_r: &[majit_jitcode::codewriter::jitcode::ConstSlotR],
     top_constants_i: &[i64],
     top_constants_f: &[i64],
     // PyPy `pyjitpl.py setup_call(argboxes)` analog.

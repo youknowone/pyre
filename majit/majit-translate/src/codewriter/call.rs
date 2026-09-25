@@ -2190,7 +2190,9 @@ impl DescrIndexRegistry {
             .map(crate::front::typestr::canonical_array_type_id)
         {
             Some(std::borrow::Cow::Borrowed(id))
-                if array_type_id.as_deref().is_some_and(|orig| std::ptr::eq(orig, id)) =>
+                if array_type_id
+                    .as_deref()
+                    .is_some_and(|orig| std::ptr::eq(orig, id)) =>
             {
                 std::borrow::Cow::Borrowed(array_type_id)
             }

@@ -3421,15 +3421,6 @@ fn check_result(int: (usize, usize), reference: (usize, usize), float: (usize, u
     }
 }
 
-/// Non-canonical tag marking a deferred prebuilt-string slot in
-/// `constants_r`.  x86-64 user addresses occupy `0..2^48`, so this high-word
-/// pattern can never alias a real GCREF / host-static address; the low 48
-/// bits carry the [`StrConstDescriptor`] ordinal.  The runtime load pass
-/// overwrites every such slot with a live immortal STR address before the
-/// jitcode is used, so the sentinel is never dereferenced (a non-canonical
-/// deref would fault, surfacing any missed patch immediately).
-pub const STR_CONST_SENTINEL_BASE: i64 = 0x7E57_0000_0000_0000u64 as i64;
-
 /// `STR_CONST_SENTINEL_BASE | ordinal` — see [`STR_CONST_SENTINEL_BASE`].
 fn str_const_sentinel(ordinal: usize) -> i64 {
     debug_assert!(
@@ -3438,12 +3429,6 @@ fn str_const_sentinel(ordinal: usize) -> i64 {
     );
     STR_CONST_SENTINEL_BASE | ordinal as i64
 }
-
-/// Non-canonical tag marking a deferred unit-variant singleton slot in
-/// `constants_r`, disjoint from [`STR_CONST_SENTINEL_BASE`] in the same
-/// non-canonical high-word space; the low 48 bits carry the
-/// [`super::jitcode::UnitVariantConstDescriptor`] ordinal.
-pub const UNIT_VARIANT_CONST_SENTINEL_BASE: i64 = 0x7E58_0000_0000_0000u64 as i64;
 
 /// `UNIT_VARIANT_CONST_SENTINEL_BASE | ordinal` — see
 /// [`UNIT_VARIANT_CONST_SENTINEL_BASE`].

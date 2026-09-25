@@ -39,7 +39,7 @@ linkme = { workspace = true }
 majit-ir = { workspace = true }
 majit-macros = { workspace = true }
 majit-metainterp = { workspace = true }
-majit-translate = { workspace = true }
+majit-jitcode = { workspace = true }
 majit-backend = { workspace = true }
 majit-trace = { workspace = true }
 majit-gc = { workspace = true }
@@ -79,6 +79,7 @@ walkdir = { workspace = true, optional = true }
 
 [dev-dependencies]
 majit-ir = { workspace = true, features = ["test-support"] }
+majit-translate = { workspace = true }
 insta = { workspace = true }
 # `#[test]`s here drive interpreter frames through `init_typeobjects` without
 # compiling pyre-interpreter under `cfg(test)`; enable its `test-hooks` feature

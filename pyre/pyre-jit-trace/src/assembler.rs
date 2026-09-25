@@ -108,7 +108,7 @@ impl AssemblerState {
 pub(crate) fn liveness_positions_of(
     all_liveness: &[u8],
 ) -> IndexMap<(Vec<u8>, Vec<u8>, Vec<u8>), u16> {
-    majit_translate::liveness::decode_liveness_records(all_liveness)
+    majit_jitcode::liveness::decode_liveness_records(all_liveness)
         .into_iter()
         .filter_map(|(live_i, live_r, live_f, offset)| {
             Some(((live_i, live_r, live_f), u16::try_from(offset).ok()?))
@@ -292,7 +292,7 @@ mod tests {
     #[test]
     fn interned_liveness_counts_the_deduped_set_not_the_raw_slice() {
         use indexmap::IndexMap;
-        use majit_translate::liveness::decode_liveness_records;
+        use majit_jitcode::liveness::decode_liveness_records;
 
         let mut insns = IndexMap::new();
         insns.insert("live/".to_string(), 0u8);

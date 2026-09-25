@@ -305,7 +305,7 @@ pub struct SubJitCodeBody {
     /// because the GC walker forwards it in place once a collection moves the
     /// object it names, and by then the pool is reachable only through an
     /// `Arc`.
-    pub constants_r: &'static [majit_translate::codewriter::jitcode::ConstSlotR],
+    pub constants_r: &'static [majit_jitcode::codewriter::jitcode::ConstSlotR],
     /// Callee's Float-bank constant pool (`JitCode.constants_f`).
     pub constants_f: &'static [i64],
 }
@@ -406,7 +406,7 @@ impl<'a> RawDescrPool<'a> {
     /// per-fn slot whose `RuntimeBhDescr` is not an ordinary `Descr`
     /// (a `JitCode` / `Call` / `AssemblerToken` slot — never read as a
     /// vable-array descr operand).
-    fn bh_descr_at(self, idx: usize) -> Option<&'a majit_translate::jitcode::BhDescr> {
+    fn bh_descr_at(self, idx: usize) -> Option<&'a majit_jitcode::jitcode::BhDescr> {
         match self {
             Self::Global => crate::jitcode_runtime::get_descr_by_index(idx),
             Self::PerFn(descrs) => descrs.get(idx).and_then(|d| d.as_bh_descr()),
@@ -7808,7 +7808,7 @@ fn portal_vable_bookkeeping_anchor(
                     Some(majit_metainterp::jitcode::RuntimeBhDescr::Descr(descr))
                         if matches!(
                             descr.as_ref(),
-                            majit_translate::jitcode::BhDescr::VableField { .. }
+                            majit_jitcode::jitcode::BhDescr::VableField { .. }
                         )
                 ) {
                     return false;
@@ -8664,10 +8664,9 @@ fn direct_libffi_call<Sym: WalkSym>(
     // pyjitpl.py: "for now, any call via libffi saves and restores
     // everything (that is, errno and SetLastError/GetLastError on Windows).
     // Note these flags match the ones in clibffi.ll_callback".
-    let c_saveall = ctx.trace_ctx.const_int(
-        majit_translate::translator::rtyper::lltypesystem::rffi::RFFI_ERR_ALL
-            | majit_translate::translator::rtyper::lltypesystem::rffi::RFFI_ALT_ERRNO,
-    );
+    let c_saveall = ctx
+        .trace_ctx
+        .const_int(majit_jitcode::rffi::RFFI_ERR_ALL | majit_jitcode::rffi::RFFI_ALT_ERRNO);
     // pyjitpl.py: opnum = rop.call_release_gil_for_descr(orig_calldescr),
     // asserted equal to the one the dynamic descr selects.
     let opcode = match dst_bank {
@@ -9410,7 +9409,7 @@ fn walker_execute_may_force_boxed_outcome<Sym: WalkSym>(
         Some(majit_ir::Value::Int(addr)) => addr,
         _ => return None,
     };
-    if func_ptr == 0 || majit_translate::codewriter::call::is_symbolic_fnaddr(func_ptr) {
+    if func_ptr == 0 || majit_jitcode::codewriter::call::is_symbolic_fnaddr(func_ptr) {
         return None;
     }
     let mut args = Vec::with_capacity(allboxes.len() - 1);

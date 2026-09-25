@@ -23,7 +23,7 @@ use crate::flowspace::model::{
     HostObject, Link, SpaceOperation, Variable,
 };
 use crate::flowspace::pygraph::PyGraph;
-use crate::tool::algo::unionfind::{UnionFind, UnionFindInfo};
+use crate::tool::algo::unionfind::{SharedUnionFindInfo, UnionFind};
 
 /// RPython `MemoTable.fieldnamecounter` (specialize.py) — a process-
 /// wide counter feeding `getuniquefieldname`.
@@ -816,14 +816,14 @@ fn is_false_true(values: &[ConstValue]) -> bool {
         && matches!(values[1], ConstValue::Bool(true))
 }
 
-impl UnionFindInfo for Rc<RefCell<MemoTable>> {
+impl SharedUnionFindInfo for MemoTable {
     /// RPython `MemoTable.absorb(self, other)` (specialize.py):
     /// `self.table.update(other.table); assert self.graph is None;
     /// other.do_not_process = True`.
-    fn absorb(&mut self, other: Self) {
+    fn absorb_shared(this: &Rc<RefCell<Self>>, other: Rc<RefCell<Self>>) {
         {
             let other_ref = other.borrow();
-            let mut me = self.borrow_mut();
+            let mut me = this.borrow_mut();
             // upstream: `self.table.update(other.table)`.
             for (k, v) in &other_ref.table {
                 me.table.insert(k.clone(), v.clone());
