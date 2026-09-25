@@ -2442,9 +2442,24 @@ impl AssemblerEncode for Assembler {
                 let (reg, kc) = self.lookup_reg_with_kind_var(elem_index, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
-                let (reg, kc) = self.lookup_reg_with_kind_var(value, regallocs);
-                state.code.push(reg);
-                argcodes.push(kc);
+                // `jtransform.py` `rewrite_op_setarrayitem` passes the value
+                // through. A constant is a pool slot, same as
+                // `setfield_vable_*` (`assembler.py` constant registers).
+                let value_kind = match value {
+                    crate::model::LinkArg::Value(var) => {
+                        let (reg, kc) = self.lookup_reg_with_kind_var(var, regallocs);
+                        state.code.push(reg);
+                        argcodes.push(kc);
+                        kc
+                    }
+                    crate::model::LinkArg::Const(c) => {
+                        let kind = crate::flatten::constant_kind(c);
+                        let byte = self.emit_const(&c.value, kind, state, callcontrol);
+                        state.code.push(byte);
+                        argcodes.push(kind);
+                        kind
+                    }
+                };
                 // RPython: two descriptors — fielddescr (vable array field) + arraydescr.
                 let descr_idx = self.emit_ready_descr(crate::jitcode::BhDescr::VableArray {
                     index: *array_index,
@@ -2461,7 +2476,7 @@ impl AssemblerEncode for Assembler {
                 state.code.push((descr_idx2 & 0xFF) as u8);
                 state.code.push((descr_idx2 >> 8) as u8);
                 argcodes.push('d');
-                let opname = op_kind_to_opname(&op.kind);
+                let opname = format!("setarrayitem_vable_{value_kind}");
                 let key = format!("{opname}/{argcodes}");
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
@@ -7778,6 +7793,107 @@ mod tests {
                 asm.insns.keys().collect::<Vec<_>>()
             );
         }
+    }
+
+    /// `jtransform.py` `rewrite_op_setarrayitem` passes `op.args[2]` through.
+    /// A constant store into a virtualizable array stays `LinkArg::Const`;
+    /// the assembler encodes that constant as the value slot of
+    /// `setarrayitem_vable_*`.
+    #[test]
+    fn vable_array_write_of_a_constant_encodes_the_pool_slot() {
+        use crate::flatten::flatten_graph;
+        use crate::flowspace::model::{ConstValue, Constant};
+        use crate::front::mir::release_declared_vable_array_address;
+        use crate::jtransform::{GraphTransformConfig, Transformer, VirtualizableFieldDescriptor};
+        use crate::model::{FieldDescriptor, FunctionGraph, LinkArg, OpKind, ValueType};
+        use crate::virtualizable_decl::register_virtualizable_declarations;
+
+        register_virtualizable_declarations([("Frame".to_string(), vec!["words[*]".to_string()])]);
+        struct ClearDecl;
+        impl Drop for ClearDecl {
+            fn drop(&mut self) {
+                register_virtualizable_declarations(std::iter::empty::<(String, Vec<String>)>());
+            }
+        }
+        let _clear = ClearDecl;
+
+        let mut graph = FunctionGraph::new("vable_array_const_store");
+        let frame = push_input_var(&mut graph, "frame", ValueType::Ref(None));
+        let index = push_input_var(&mut graph, "index", ValueType::Int);
+        let array = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: frame.clone(),
+                    field: FieldDescriptor::new("words", Some("Frame".into()))
+                        .with_taken_by_address(true),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        assert!(release_declared_vable_array_address(&mut graph, &array));
+        let stored = LinkArg::Const(Constant::new(ConstValue::Int(0)));
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::ArrayWrite {
+                base: array,
+                index: index.clone(),
+                value: stored,
+                item_ty: ValueType::Int,
+                array_type_id: Some("[Signed]".to_string()),
+                nolength: false,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+        FunctionGraph::set_concretetype_of_inline(
+            &frame,
+            crate::codewriter::type_state::ConcreteType::GcRef,
+        );
+        FunctionGraph::set_concretetype_of_inline(
+            &index,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        let config = GraphTransformConfig {
+            vable_arrays: vec![VirtualizableFieldDescriptor::new_with_arraydescr(
+                "words",
+                Some("Frame".into()),
+                0,
+                8,
+                true,
+            )],
+            ..Default::default()
+        };
+        let mut rewritten = Transformer::new(&config).transform(&graph).graph;
+        let write = rewritten
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find(|op| matches!(op.kind, OpKind::VableArrayWrite { .. }));
+        let Some(write) = write else {
+            panic!("constant vable store must rewrite to VableArrayWrite");
+        };
+        match &write.kind {
+            OpKind::VableArrayWrite { value, .. } => {
+                assert!(
+                    matches!(value, LinkArg::Const(c) if matches!(c.value, ConstValue::Int(0))),
+                    "rewrite_op_setarrayitem must keep the constant, got {value:?}"
+                );
+            }
+            _ => unreachable!(),
+        }
+        regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten);
+        let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
+        let mut flat = flatten_graph(&rewritten, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
+        assert!(
+            asm.insns.contains_key("setarrayitem_vable_i/riidd"),
+            "constant setarrayitem_vable_i missing, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]

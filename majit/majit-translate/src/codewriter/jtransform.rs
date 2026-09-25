@@ -2241,12 +2241,13 @@ impl<'a> Transformer<'a> {
         &self,
         args: &[crate::flowspace::model::Variable],
         graph_name: &str,
+        via: &str,
     ) -> (
         Vec<crate::flowspace::model::Variable>,
         Vec<crate::flowspace::model::Variable>,
         Vec<crate::flowspace::model::Variable>,
     ) {
-        self.check_no_vable_array(args.iter(), graph_name, "call argument");
+        self.check_no_vable_array(args.iter(), graph_name, via);
         self.make_three_lists_from_vars(args)
     }
 
@@ -5064,8 +5065,8 @@ impl<'a> Transformer<'a> {
                 detail: format!("rewrite: array[idx] = v → VableArrayWrite[{arr_idx}]"),
             });
             self.vable_rewrites += 1;
-            // `jtransform.py:798-801` — `-live-` leads the virtualizable
-            // array write.
+            // `jtransform.py:798-801` — `-live-` then `setarrayitem_vable_*`
+            // with the value argument unchanged, constant or variable.
             return RewriteResult::Replace(vec![
                 SpaceOperation {
                     result: None,
@@ -5077,13 +5078,7 @@ impl<'a> Transformer<'a> {
                         base: vable_base,
                         array_index: arr_idx,
                         elem_index: index.clone(),
-                        // The vable rewrite only fires for virtualizable
-                        // arrays, which never carry an inline-const store; a
-                        // VableArrayWrite value is always a register.
-                        value: value
-                            .as_variable()
-                            .expect("vable array writes carry a Variable value")
-                            .clone(),
+                        value: value.clone(),
                         item_ty: typed_item_ty,
                         array_itemsize: itemsize,
                         array_is_signed: is_signed,
@@ -7656,7 +7651,8 @@ impl<'a> Transformer<'a> {
         };
         // RPython jtransform.py: rewrite_call(op, 'inline_call', [jitcode])
         // Split args by kind (RPython make_three_lists)
-        let (args_i, args_r, args_f) = self.rewrite_call_three_lists(args, graph_name);
+        let (args_i, args_r, args_f) =
+            self.rewrite_call_three_lists(args, graph_name, &format!("call argument ({target})"));
         let result_kind = self.resolve_call_result(op.result.as_ref(), result_ty).kind;
         self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
 
@@ -8083,7 +8079,11 @@ impl<'a> Transformer<'a> {
             "conditional_call target must not force virtualizable"
         );
         // jtransform.py: rewrite_call with force_ir=True
-        let (args_i, args_r, args_f) = self.rewrite_call_three_lists(func_args, graph_name);
+        let (args_i, args_r, args_f) = self.rewrite_call_three_lists(
+            func_args,
+            graph_name,
+            "call argument (conditional_call)",
+        );
         assert!(
             args_f.is_empty(),
             "force_ir: no float args in conditional_call"
@@ -8533,7 +8533,11 @@ impl<'a> Transformer<'a> {
         // jtransform.py:302-307: record_known_result_{i|r}
         let opname = format!("record_known_result_{result_kind}");
         // jtransform.py: rewrite_call with force_ir=True
-        let (args_i, args_r, args_f) = self.rewrite_call_three_lists(func_args, graph_name);
+        let (args_i, args_r, args_f) = self.rewrite_call_three_lists(
+            func_args,
+            graph_name,
+            "call argument (record_known_result)",
+        );
         assert!(
             args_f.is_empty(),
             "force_ir: no float args in record_known_result"
@@ -8623,7 +8627,8 @@ impl<'a> Transformer<'a> {
         });
         self.calls_classified += 1;
         // RPython jtransform.py: rewrite_call(op, 'residual_call', ...)
-        let (args_i, args_r, args_f) = self.rewrite_call_three_lists(args, graph_name);
+        let (args_i, args_r, args_f) =
+            self.rewrite_call_three_lists(args, graph_name, &format!("call argument ({target})"));
         // RPython reads `op.result.concretetype` directly because rtyper
         // has typed every Variable. Pyre's front-end can leave a callee's
         // declared return as `ValueType::Unknown` (re-export shadowing,
@@ -8711,7 +8716,8 @@ impl<'a> Transformer<'a> {
             .map(|cc| cc.non_void_actual_args_for_graphs(graphs, args))
             .unwrap_or_else(|| args.to_vec());
         let args = filtered_args.as_slice();
-        let (args_i, args_r, args_f) = self.rewrite_call_three_lists(args, graph_name);
+        let (args_i, args_r, args_f) =
+            self.rewrite_call_three_lists(args, graph_name, "call argument (indirect)");
         let resolved_result = self.resolve_call_result(op.result.as_ref(), result_ty);
         let result_kind = resolved_result.kind;
         self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
@@ -8852,7 +8858,8 @@ impl<'a> Transformer<'a> {
             detail: format!("call {target} → elidable"),
         });
         self.calls_classified += 1;
-        let (args_i, args_r, args_f) = self.rewrite_call_three_lists(args, graph_name);
+        let (args_i, args_r, args_f) =
+            self.rewrite_call_three_lists(args, graph_name, &format!("call argument ({target})"));
         let result_kind = self.resolve_call_result(op.result.as_ref(), result_ty).kind;
         self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
         let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, target);
@@ -8896,7 +8903,8 @@ impl<'a> Transformer<'a> {
             detail: format!("call {target} → may_force"),
         });
         self.calls_classified += 1;
-        let (args_i, args_r, args_f) = self.rewrite_call_three_lists(args, graph_name);
+        let (args_i, args_r, args_f) =
+            self.rewrite_call_three_lists(args, graph_name, &format!("call argument ({target})"));
         let result_kind = self.resolve_call_result(op.result.as_ref(), result_ty).kind;
         self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
         let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, target);
@@ -10146,7 +10154,7 @@ fn remap_op(
             base: remap_value(base, aliases),
             array_index: *array_index,
             elem_index: remap_value(elem_index, aliases),
-            value: remap_value(value, aliases),
+            value: value.map_value(|v| remap_value(v, aliases)),
             item_ty: item_ty.clone(),
             array_itemsize: *array_itemsize,
             array_is_signed: *array_is_signed,

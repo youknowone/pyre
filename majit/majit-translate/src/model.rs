@@ -1267,12 +1267,14 @@ pub enum OpKind {
         array_is_signed: bool,
     },
     /// Virtualizable array write → writes to boxes.
-    /// RPython: `setarrayitem_vable_i/r/f`
+    /// RPython: `setarrayitem_vable_i/r/f`. `rewrite_op_setarrayitem` passes
+    /// the value through; a `Constant` stays a `LinkArg::Const` and the
+    /// assembler encodes it (`jtransform.py` `rewrite_op_setarrayitem`).
     VableArrayWrite {
         base: crate::flowspace::model::Variable,
         array_index: usize,
         elem_index: crate::flowspace::model::Variable,
-        value: crate::flowspace::model::Variable,
+        value: LinkArg,
         item_ty: ValueType,
         /// RPython: arraydescr.itemsize from VirtualizableInfo.array_descrs.
         array_itemsize: usize,

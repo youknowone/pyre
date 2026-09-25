@@ -716,7 +716,7 @@ pub(crate) fn remap_op_kind(
             base: remap_var(base),
             array_index: *array_index,
             elem_index: remap_var(elem_index),
-            value: remap_var(value),
+            value: value.map_value(remap_var),
             item_ty: item_ty.clone(),
             array_itemsize: *array_itemsize,
             array_is_signed: *array_is_signed,
@@ -1103,7 +1103,13 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
             elem_index,
             value,
             ..
-        } => vec![clone_var(base), clone_var(elem_index), clone_var(value)],
+        } => {
+            let mut refs = vec![clone_var(base), clone_var(elem_index)];
+            if let Some(var) = value.as_variable() {
+                refs.push(clone_var(var));
+            }
+            refs
+        }
         OpKind::BinOp { lhs, rhs, .. } => vec![clone_var(lhs), clone_var(rhs)],
         OpKind::UnaryOp { operand, .. } => vec![clone_var(operand)],
         OpKind::CallElidable {
