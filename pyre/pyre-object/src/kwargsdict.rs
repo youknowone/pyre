@@ -447,9 +447,9 @@ mod tests {
             }
             items.reverse();
             let fresh = KWARGS_DICT_STRATEGY.items(w_dict);
-            assert_eq!(crate::w_str_get_value(fresh[0].0), "first");
+            assert_eq!(crate::w_str_get_wtf8(fresh[0].0), "first");
             assert_eq!(crate::w_int_get_value(fresh[0].1), 1);
-            assert_eq!(crate::w_str_get_value(fresh[1].0), "second");
+            assert_eq!(crate::w_str_get_wtf8(fresh[1].0), "second");
             assert_eq!(crate::w_int_get_value(fresh[1].1), 2);
         }
     }
@@ -462,7 +462,7 @@ mod tests {
 
             for (index, (key, value)) in [("a", 10), ("b", 20), ("c", 30)].into_iter().enumerate() {
                 let (w_key, w_value) = strategy.nth_item(w_dict, index).unwrap();
-                assert_eq!(crate::w_str_get_value(w_key), key);
+                assert_eq!(crate::w_str_get_wtf8(w_key), key);
                 assert_eq!(crate::w_int_get_value(w_value), value);
                 assert_eq!(
                     crate::w_int_get_value(strategy.nth_value(w_dict, index).unwrap()),
@@ -475,7 +475,7 @@ mod tests {
             let reversed = strategy.getiterreversed(w_dict);
             let keys: Vec<_> = reversed
                 .iter()
-                .map(|&(key, _)| crate::w_str_get_value(key).to_owned())
+                .map(|&(key, _)| crate::w_str_get_wtf8(key).as_str().unwrap())
                 .collect();
             assert_eq!(keys, ["c", "b", "a"]);
         }
@@ -493,7 +493,7 @@ mod tests {
             );
             assert_eq!(strategy.length(w_dict), 2);
             let (w_key, w_value) = strategy.nth_item(w_dict, 0).unwrap();
-            assert_eq!(crate::w_str_get_value(w_key), "a");
+            assert_eq!(crate::w_str_get_wtf8(w_key), "a");
             assert_eq!(crate::w_int_get_value(w_value), 9);
             assert_eq!(
                 crate::w_int_get_value(strategy.nth_value(w_dict, 1).unwrap()),

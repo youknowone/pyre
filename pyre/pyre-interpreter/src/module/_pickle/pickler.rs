@@ -2842,8 +2842,12 @@ fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<ModuleName, PyError> {
                     {
                         continue;
                     }
-                    let modname = unsafe { pyre_object::unicodeobject::w_str_get_value(w_modname) }
-                        .to_string();
+                    let Some(modname) =
+                        (unsafe { pyre_object::unicodeobject::w_str_get_value_opt(w_modname) })
+                    else {
+                        continue;
+                    };
+                    let modname = modname.to_string();
                     if modname == "__main__" || modname == "__mp_main__" {
                         continue;
                     }
@@ -3648,9 +3652,7 @@ fn func_name_str(w_func: PyObjectRef) -> Result<Option<String>, PyError> {
         return Ok(None);
     };
     if unsafe { pyre_object::is_str(w_name) } {
-        Ok(Some(
-            unsafe { pyre_object::unicodeobject::w_str_get_value(w_name) }.to_string(),
-        ))
+        Ok(Some(crate::baseobjspace::str_utf8_w(w_name)?.to_string()))
     } else {
         Ok(None)
     }

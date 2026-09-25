@@ -1563,7 +1563,7 @@ unsafe fn call_vector(
                 ));
             }
             names.push(rustpython_wtf8::Wtf8Buf::from_string(
-                unsafe { pyre_object::w_str_get_value(name) }.to_owned(),
+                crate::baseobjspace::str_utf8_w(name)?.to_owned(),
             ));
         }
     }

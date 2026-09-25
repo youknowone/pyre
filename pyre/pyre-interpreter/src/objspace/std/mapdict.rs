@@ -6927,13 +6927,13 @@ mod tests {
             // keys / items / values in insertion order.
             let keys = MAP_DICT_STRATEGY.w_keys(w_dict);
             assert_eq!(keys.len(), 2);
-            assert_eq!(pyre_object::w_str_get_value(keys[0]), "x");
-            assert_eq!(pyre_object::w_str_get_value(keys[1]), "y");
+            assert_eq!(pyre_object::w_str_get_wtf8(keys[0]), "x");
+            assert_eq!(pyre_object::w_str_get_wtf8(keys[1]), "y");
             let items = MAP_DICT_STRATEGY.items(w_dict);
             assert_eq!(items.len(), 2);
-            assert_eq!(pyre_object::w_str_get_value(items[0].0), "x");
+            assert_eq!(pyre_object::w_str_get_wtf8(items[0].0), "x");
             assert_eq!(items[0].1, sentinel(0x11));
-            assert_eq!(pyre_object::w_str_get_value(items[1].0), "y");
+            assert_eq!(pyre_object::w_str_get_wtf8(items[1].0), "y");
             assert_eq!(items[1].1, sentinel(0x22));
             assert_eq!(
                 MAP_DICT_STRATEGY.values(w_dict),
@@ -6989,7 +6989,7 @@ mod tests {
             assert_eq!(instance_node_getdictvalue(obj_ref, &sur), None);
 
             let (w_ascii_key, w_ascii_value) = MAP_DICT_STRATEGY.popitem(w_dict).unwrap();
-            assert_eq!(pyre_object::w_str_get_value(w_ascii_key), "ascii");
+            assert_eq!(pyre_object::w_str_get_wtf8(w_ascii_key), "ascii");
             assert_eq!(w_ascii_value, sentinel(0x44));
             assert_eq!(MAP_DICT_STRATEGY.length(w_dict), 0);
             assert_eq!(MAP_DICT_STRATEGY.getitem_str(w_dict, "ascii"), None);

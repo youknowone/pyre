@@ -633,7 +633,12 @@ fn unpack_complex(w_ob: PyObjectRef) -> Result<(f64, f64), PyError> {
 /// `W_CTypePrimitive._overflow`.
 fn overflow(ct: &W_CType, w_ob: PyObjectRef) -> PyError {
     let rendered = pyre_interpreter::builtins::builtin_str(&[w_ob])
-        .map(|w| unsafe { pyre_object::w_str_get_value(w) }.to_string())
+        .map(|w| {
+            pyre_interpreter::baseobjspace::str_utf8_w(w)
+                .ok()
+                .map(str::to_string)
+                .unwrap_or_default()
+        })
         .unwrap_or_default();
     PyError::overflow_error(format!("integer {rendered} does not fit '{}'", ct.name()))
 }

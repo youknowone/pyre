@@ -8,6 +8,7 @@
 
 use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
+use rustpython_wtf8::Wtf8Buf;
 use std::sync::OnceLock;
 
 use super::ctypeobj::{self, W_CType};
@@ -123,7 +124,7 @@ impl W_CData {
     }
 
     /// `W_CData._repr_extra` and the overrides of it.
-    pub fn repr_extra(&self) -> Result<String, PyError> {
+    pub fn repr_extra(&self) -> Result<Wtf8Buf, PyError> {
         let ct = self.ctype_ref()?;
         match self.flavor {
             FLAVOR_NEW_STD | FLAVOR_NEW_NONSTD => {
@@ -136,38 +137,39 @@ impl W_CData {
                 } else {
                     self.sizeof()?
                 };
-                Ok(format!("owning {bytes} bytes"))
+                Ok(Wtf8Buf::from(format!("owning {bytes} bytes")))
             }
-            FLAVOR_SLICED => Ok(format!("sliced length {}", self.length)),
+            FLAVOR_SLICED => Ok(Wtf8Buf::from(format!("sliced length {}", self.length))),
             // `W_CDataPtrToStructOrUnion._repr_extra`.
             FLAVOR_PTR_TO_STRUCT => match W_CData::from_obj(self.w_keepalive) {
                 Some(structobj) => structobj.repr_extra(),
-                None => Ok("NULL".to_string()),
+                None => Ok(Wtf8Buf::from("NULL")),
             },
-            // `W_CDataHandle._repr_extra`.
+            // `W_CDataHandle._repr_extra`. The keepalive repr is `text_w`:
+            // a lone surrogate stays in the spelling.
             FLAVOR_HANDLE => {
                 let roots = pyre_object::gc_roots::push_roots();
                 let keepalive_slot = roots.base();
                 let _ = roots.pin_root(self.w_keepalive);
                 let w_repr =
                     pyre_interpreter::builtins::builtin_repr(&[roots.get(keepalive_slot)])?;
-                Ok(format!("handle to {}", unsafe {
-                    pyre_object::w_str_get_value(w_repr)
-                }))
+                let mut msg = Wtf8Buf::from("handle to ");
+                msg.push_wtf8(unsafe { pyre_object::w_str_get_wtf8(w_repr) });
+                Ok(msg)
             }
             // `W_CDataFromBuffer._repr_extra`.
             FLAVOR_FROM_BUFFER => {
                 if self.w_keepalive.is_null() {
-                    return Ok("buffer RELEASED".to_string());
+                    return Ok(Wtf8Buf::from("buffer RELEASED"));
                 }
                 let type_name = pyre_interpreter::type_methods::arg_type_name(self.w_keepalive);
                 if ct.kind == ctypeobj::KIND_ARRAY {
-                    Ok(format!(
+                    Ok(Wtf8Buf::from(format!(
                         "buffer len {} from '{}' object",
                         self.length, type_name
-                    ))
+                    )))
                 } else {
-                    Ok(format!("buffer from '{}' object", type_name))
+                    Ok(Wtf8Buf::from(format!("buffer from '{}' object", type_name)))
                 }
             }
             // `W_ExternPython._repr_extra`.
@@ -176,11 +178,13 @@ impl W_CData {
                 let callable_slot = roots.base();
                 let _ = roots.pin_root(self.w_keepalive);
                 let w_repr = pyre_interpreter::builtins::builtin_repr(&[roots.get(callable_slot)])?;
-                Ok(format!("calling {}", unsafe {
-                    pyre_object::w_str_get_value(w_repr)
-                }))
+                let mut msg = Wtf8Buf::from("calling ");
+                msg.push_wtf8(unsafe { pyre_object::w_str_get_wtf8(w_repr) });
+                Ok(msg)
             }
-            _ => unsafe { ct.extra_repr(self.ptr as *const u8) },
+            _ => Ok(Wtf8Buf::from(unsafe {
+                ct.extra_repr(self.ptr as *const u8)
+            }?)),
         }
     }
 }
@@ -721,10 +725,9 @@ fn cdata_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     } else {
         ""
     };
-    Ok(pyre_object::w_str_new_managed(&format!(
-        "<cdata '{}{extra1}' {extra}>",
-        ct.name()
-    )))
+    Ok(pyre_object::w_str_from_wtf8_managed(
+        pyre_interpreter::display::wtf8_format!("<cdata '", ct.name(), extra1, "' ", extra, ">"),
+    ))
 }
 
 /// `W_CData.bool`.
@@ -1426,10 +1429,11 @@ pub fn unpack(w_cdata: PyObjectRef, length: i64) -> Result<PyObjectRef, PyError>
     }
     if cdata.ptr == 0 {
         let w_repr = pyre_interpreter::builtins::builtin_repr(&[w_cdata])?;
-        return Err(PyError::runtime_error(format!(
-            "cannot use unpack() on {}",
-            unsafe { pyre_object::w_str_get_value(w_repr) }
-        )));
+        return Err(PyError::runtime_error(
+            pyre_interpreter::display::wtf8_format!("cannot use unpack() on ", unsafe {
+                pyre_object::w_str_get_wtf8(w_repr)
+            }),
+        ));
     }
     let item = ctypeobj::ctype_at(ct.ctitem)
         .ok_or_else(|| PyError::system_error("pointer without an item type"))?;

@@ -6035,7 +6035,7 @@ mod tests {
             assert!(l.items.is_null());
             assert!(!l.ascii_items.block.is_null());
             let wrapped = w_list_getitem(list, 0).unwrap();
-            assert_eq!(crate::w_str_get_value(wrapped), "alpha");
+            assert_eq!(crate::w_str_get_wtf8(wrapped), "alpha");
             assert_eq!(w_str_storage(wrapped), a_storage);
 
             w_list_append(list, crate::w_str_new("gamma"));
@@ -6092,20 +6092,11 @@ mod tests {
             w_list_delslice(list, 1, 2);
             w_list_setslice(list, 1, 1, donor).unwrap();
             assert!(w_list_sort_strings(list, false));
-            assert_eq!(
-                crate::w_str_get_value(w_list_getitem(list, 0).unwrap()),
-                "a"
-            );
-            assert_eq!(
-                crate::w_str_get_value(w_list_getitem(list, 1).unwrap()),
-                "b"
-            );
-            assert_eq!(
-                crate::w_str_get_value(w_list_getitem(list, 2).unwrap()),
-                "c"
-            );
+            assert_eq!(crate::w_str_get_wtf8(w_list_getitem(list, 0).unwrap()), "a");
+            assert_eq!(crate::w_str_get_wtf8(w_list_getitem(list, 1).unwrap()), "b");
+            assert_eq!(crate::w_str_get_wtf8(w_list_getitem(list, 2).unwrap()), "c");
             w_list_reverse(list);
-            assert_eq!(crate::w_str_get_value(w_list_pop(list, 0).unwrap()), "c");
+            assert_eq!(crate::w_str_get_wtf8(w_list_pop(list, 0).unwrap()), "c");
             assert_eq!(
                 (*(list as *const W_ListObject)).strategy,
                 ListStrategy::Ascii

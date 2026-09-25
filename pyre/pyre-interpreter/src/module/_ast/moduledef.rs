@@ -33,21 +33,23 @@ fn ast_type() -> PyObjectRef {
 pub(crate) fn load_singleton() -> PyObjectRef {
     **LOAD_SINGLETON
         .get()
-        .expect("_ast Load singleton initialized before AST construction")
-        as PyObjectRef
+        .expect("_ast Load singleton initialized before AST construction") as PyObjectRef
 }
 
 fn tuple_of_names(names: &[&str]) -> PyObjectRef {
-    pyre_object::w_tuple_new(names.iter().map(|name| pyre_object::w_str_new(name)).collect())
+    pyre_object::w_tuple_new(
+        names
+            .iter()
+            .map(|name| pyre_object::w_str_new(name))
+            .collect(),
+    )
 }
 
 fn ast_instance_type_name(object: PyObjectRef) -> &'static str {
     // PyPy `W_AST_init` asks `space.type(self)`: every public AST node uses
     // the common `W_ObjectObject` payload, so its payload vtable only says
     // `object`; the heap class lives in `w_class`.
-    unsafe {
-        pyre_object::w_type_get_name(pyre_object::w_instance_get_type(object))
-    }
+    unsafe { pyre_object::w_type_get_name(pyre_object::w_instance_get_type(object)) }
 }
 
 fn ast_fields_owner_name(w_type: PyObjectRef) -> String {
@@ -55,8 +57,7 @@ fn ast_fields_owner_name(w_type: PyObjectRef) -> String {
     if name == "AST" {
         let bases = unsafe { pyre_object::w_type_get_bases(w_type) };
         if unsafe { pyre_object::w_tuple_len(bases) } == 1
-            && unsafe { pyre_object::w_tuple_getitem(bases, 0) }
-                == Some(crate::typedef::w_object())
+            && unsafe { pyre_object::w_tuple_getitem(bases, 0) } == Some(crate::typedef::w_object())
         {
             // CPython's generated root retains the static tp_name `ast.AST`,
             // while PyPy `State.make_new_type` owns it as the heap type `AST`.
@@ -142,10 +143,7 @@ fn ast_method_descriptor(
     let text_signature_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(pyre_object::w_str_new(text_signature));
     unsafe {
-        crate::function::function_set_qualname(
-            roots.get(wrapper_slot),
-            roots.get(qualname_slot),
-        );
+        crate::function::function_set_qualname(roots.get(wrapper_slot), roots.get(qualname_slot));
         crate::function::function_set_objclass(roots.get(wrapper_slot), ast_type());
         crate::function::fset_func_text_signature(
             roots.get(wrapper_slot),
@@ -257,16 +255,14 @@ fn ast_repr_max_depth(
     for index in 0..num_fields {
         let index_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(pyre_object::w_int_new(index));
-        let name =
-            crate::baseobjspace::getitem(roots.get(fields_slot), roots.get(index_slot))?;
+        let name = crate::baseobjspace::getitem(roots.get(fields_slot), roots.get(index_slot))?;
         let name_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(name);
         let value = crate::baseobjspace::getattr(object(), roots.get(name_slot))?;
         let value_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(value);
         let value = roots.get(value_slot);
-        let value_repr = if unsafe { pyre_object::is_list(value) || pyre_object::is_tuple(value) }
-        {
+        let value_repr = if unsafe { pyre_object::is_list(value) || pyre_object::is_tuple(value) } {
             ast_repr_list(value, depth)?
         } else if is_ast_instance(value) {
             ast_repr_max_depth(value, depth - 1)?
@@ -299,17 +295,13 @@ fn ast_warn(message: rustpython_wtf8::Wtf8Buf) -> Result<(), crate::PyError> {
     )
 }
 
-fn is_ast_method_descriptor(
-    descr: PyObjectRef,
-    expected: crate::gateway::BuiltinCodeFn,
-) -> bool {
+fn is_ast_method_descriptor(descr: PyObjectRef, expected: crate::gateway::BuiltinCodeFn) -> bool {
     // PyPy `W_AST.typedef` owns these descriptors and generated AST types
     // inherit their `wrapper_descriptor` carrier.  It deliberately sits
     // outside `function::is_function`, so recognize that PyPy slot shape
     // before reading the common immutable Function/BuiltinCode payload.
     if !unsafe {
-        crate::function::is_slot_wrapper(descr)
-            || crate::function::is_method_descriptor(descr)
+        crate::function::is_slot_wrapper(descr) || crate::function::is_method_descriptor(descr)
     } {
         return false;
     }
@@ -347,9 +339,8 @@ fn call_type_with_raw_kwargs(
         return None;
     }
     let new_descr = unsafe { crate::baseobjspace::lookup_in_type(w_type, "__new__") }?;
-    let object_new = unsafe {
-        crate::baseobjspace::lookup_in_type(crate::typedef::w_object(), "__new__")
-    }?;
+    let object_new =
+        unsafe { crate::baseobjspace::lookup_in_type(crate::typedef::w_object(), "__new__") }?;
     if new_descr != object_new {
         return None;
     }
@@ -520,18 +511,18 @@ fn ast_init(args: &[PyObjectRef]) -> crate::PyResult {
     let zelf = || roots.get(positional_base);
     let w_type_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(unsafe { pyre_object::w_instance_get_type(zelf()) });
-    let fields_obj =
-        match crate::baseobjspace::findattr_result(roots.get(w_type_slot), "_fields")? {
-            Some(fields_obj) => fields_obj,
-            None => {
-                let owner = ast_fields_owner_name(roots.get(w_type_slot));
-                return Err(crate::PyError::attribute_error_with_context(
-                    format!("type object '{owner}' has no attribute '_fields'"),
-                    roots.get(w_type_slot),
-                    "_fields",
-                ));
-            }
-        };
+    let fields_obj = match crate::baseobjspace::findattr_result(roots.get(w_type_slot), "_fields")?
+    {
+        Some(fields_obj) => fields_obj,
+        None => {
+            let owner = ast_fields_owner_name(roots.get(w_type_slot));
+            return Err(crate::PyError::attribute_error_with_context(
+                format!("type object '{owner}' has no attribute '_fields'"),
+                roots.get(w_type_slot),
+                "_fields",
+            ));
+        }
+    };
     let fields_obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(fields_obj);
     // PyPy `W_AST_init` uses `space.fixedview`, and CPython uses the sequence
@@ -587,7 +578,7 @@ fn ast_init(args: &[PyObjectRef]) -> crate::PyResult {
             let value_slot = key_slot + 1;
             let key = roots.get(key_slot);
             if unsafe {
-                pyre_object::is_str(key) && pyre_object::w_str_get_value(key) == "__pyre_kw__"
+                pyre_object::is_str(key) && pyre_object::w_str_get_wtf8(key) == "__pyre_kw__"
             } {
                 continue;
             }
@@ -608,10 +599,8 @@ fn ast_init(args: &[PyObjectRef]) -> crate::PyResult {
                 let attributes = if let Some(slot) = attributes_slot {
                     roots.get(slot)
                 } else {
-                    let value = crate::baseobjspace::getattr_str(
-                        roots.get(w_type_slot),
-                        "_attributes",
-                    )?;
+                    let value =
+                        crate::baseobjspace::getattr_str(roots.get(w_type_slot), "_attributes")?;
                     let slot = pyre_object::gc_roots::shadow_stack_len();
                     let _ = roots.pin_root(value);
                     attributes_slot = Some(slot);
@@ -628,11 +617,7 @@ fn ast_init(args: &[PyObjectRef]) -> crate::PyResult {
                     ))?;
                 }
             }
-            crate::baseobjspace::setattr(
-                zelf(),
-                roots.get(key_slot),
-                roots.get(value_slot),
-            )?;
+            crate::baseobjspace::setattr(zelf(), roots.get(key_slot), roots.get(value_slot))?;
         }
     }
 
@@ -653,10 +638,8 @@ fn ast_init(args: &[PyObjectRef]) -> crate::PyResult {
     roots.normalize(remaining_base, remaining.len());
     for index in 0..remaining.len() {
         let field_slot = remaining_base + index;
-        let Some(field_type) = crate::baseobjspace::finditem(
-            roots.get(field_types_slot),
-            roots.get(field_slot),
-        )?
+        let Some(field_type) =
+            crate::baseobjspace::finditem(roots.get(field_types_slot), roots.get(field_slot))?
         else {
             let field_repr = ast_field_repr(roots.get(field_slot))?;
             ast_warn(crate::display::wtf8_format!(
@@ -676,11 +659,7 @@ fn ast_init(args: &[PyObjectRef]) -> crate::PyResult {
             let empty = pyre_object::w_list_new(Vec::new());
             let empty_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = roots.pin_root(empty);
-            crate::baseobjspace::setattr(
-                zelf(),
-                roots.get(field_slot),
-                roots.get(empty_slot),
-            )?;
+            crate::baseobjspace::setattr(zelf(), roots.get(field_slot), roots.get(empty_slot))?;
         } else if crate::baseobjspace::is_w(roots.get(field_type_slot), expr_context_type()) {
             crate::baseobjspace::setattr(zelf(), roots.get(field_slot), load_singleton())?;
         } else {
@@ -782,7 +761,7 @@ fn ast_replace(args: &[PyObjectRef]) -> crate::PyResult {
         let value = roots.get(keyword_base + index * 2 + 1);
         if unsafe {
             pyre_object::is_str(key)
-                && pyre_object::w_str_get_value(key) == "__pyre_kw__"
+                && pyre_object::w_str_get_wtf8(key) == "__pyre_kw__"
                 && pyre_object::kw_marker::is_kw_marker_sentinel(value)
         } {
             continue;
@@ -879,13 +858,13 @@ fn ast_replace(args: &[PyObjectRef]) -> crate::PyResult {
     let payload_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(pyre_object::w_dict_new());
     if let Some(dict_slot) = dict_slot {
-        for (base, len) in [(fields_base, fields.len()), (attributes_base, attributes.len())] {
+        for (base, len) in [
+            (fields_base, fields.len()),
+            (attributes_base, attributes.len()),
+        ] {
             for index in 0..len {
                 if let Some(value) =
-                    crate::baseobjspace::finditem(
-                        roots.get(dict_slot),
-                        roots.get(base + index),
-                    )?
+                    crate::baseobjspace::finditem(roots.get(dict_slot), roots.get(base + index))?
                 {
                     let value_slot = pyre_object::gc_roots::shadow_stack_len();
                     let _ = roots.pin_root(value);
@@ -903,7 +882,7 @@ fn ast_replace(args: &[PyObjectRef]) -> crate::PyResult {
         let value = roots.get(keyword_base + index * 2 + 1);
         if unsafe {
             pyre_object::is_str(key)
-                && pyre_object::w_str_get_value(key) == "__pyre_kw__"
+                && pyre_object::w_str_get_wtf8(key) == "__pyre_kw__"
                 && pyre_object::kw_marker::is_kw_marker_sentinel(value)
         } {
             continue;
@@ -920,9 +899,7 @@ fn ast_replace(args: &[PyObjectRef]) -> crate::PyResult {
     if result.is_null() {
         match crate::call::take_call_error() {
             Some(error) => Err(error),
-            None => Err(crate::PyError::runtime_error(
-                "AST.__replace__ call failed",
-            )),
+            None => Err(crate::PyError::runtime_error("AST.__replace__ call failed")),
         }
     } else {
         Ok(result)
@@ -968,8 +945,23 @@ fn node_fields(name: &str) -> &'static [&'static str] {
         "Interactive" => &["body"],
         "Expression" => &["body"],
         "FunctionType" => &["argtypes", "returns"],
-        "FunctionDef" | "AsyncFunctionDef" => &["name", "args", "body", "decorator_list", "returns", "type_comment", "type_params"],
-        "ClassDef" => &["name", "bases", "keywords", "body", "decorator_list", "type_params"],
+        "FunctionDef" | "AsyncFunctionDef" => &[
+            "name",
+            "args",
+            "body",
+            "decorator_list",
+            "returns",
+            "type_comment",
+            "type_params",
+        ],
+        "ClassDef" => &[
+            "name",
+            "bases",
+            "keywords",
+            "body",
+            "decorator_list",
+            "type_params",
+        ],
         "Return" => &["value"],
         "Delete" => &["targets"],
         "Assign" => &["targets", "value", "type_comment"],
@@ -1025,7 +1017,15 @@ fn node_fields(name: &str) -> &'static [&'static str] {
         "TypeVar" => &["name", "bound", "default_value"],
         "ParamSpec" | "TypeVarTuple" => &["name", "default_value"],
         "comprehension" => &["target", "iter", "ifs", "is_async"],
-        "arguments" => &["posonlyargs", "args", "vararg", "kwonlyargs", "kw_defaults", "kwarg", "defaults"],
+        "arguments" => &[
+            "posonlyargs",
+            "args",
+            "vararg",
+            "kwonlyargs",
+            "kw_defaults",
+            "kwarg",
+            "defaults",
+        ],
         "arg" => &["arg", "annotation", "type_comment"],
         "keyword" => &["arg", "value"],
         "alias" => &["name", "asname"],
@@ -1047,10 +1047,21 @@ fn node_field_types(name: &str) -> &'static [&'static str] {
         "Expression" => &["expr"],
         "FunctionType" => &["expr*", "expr"],
         "FunctionDef" | "AsyncFunctionDef" => &[
-            "identifier", "arguments", "stmt*", "expr*", "expr?", "string?", "type_param*",
+            "identifier",
+            "arguments",
+            "stmt*",
+            "expr*",
+            "expr?",
+            "string?",
+            "type_param*",
         ],
         "ClassDef" => &[
-            "identifier", "expr*", "keyword*", "stmt*", "expr*", "type_param*",
+            "identifier",
+            "expr*",
+            "keyword*",
+            "stmt*",
+            "expr*",
+            "type_param*",
         ],
         "Return" => &["expr?"],
         "Delete" => &["expr*"],
@@ -1121,8 +1132,9 @@ fn asdl_base_type(lookup: &dyn Fn(&str) -> Option<PyObjectRef>, name: &str) -> P
         "identifier" | "string" => crate::typedef::gettypeobject(&pyre_object::STR_TYPE),
         "int" => crate::typedef::gettypeobject(&pyre_object::INT_TYPE),
         "constant" => crate::typedef::w_object(),
-        _ => lookup(name)
-            .unwrap_or_else(|| panic!("_ast ASDL field type {name} was not registered")),
+        _ => {
+            lookup(name).unwrap_or_else(|| panic!("_ast ASDL field type {name} was not registered"))
+        }
     }
 }
 
@@ -1145,10 +1157,9 @@ fn asdl_field_type(
             crate::typedef::gettypeobject(&pyre_object::LIST_TYPE),
             roots.get(base_slot),
         ),
-        '?' => crate::_pypy_generic_alias::create_union(
-            roots.get(base_slot),
-            pyre_object::w_none(),
-        ),
+        '?' => {
+            crate::_pypy_generic_alias::create_union(roots.get(base_slot), pyre_object::w_none())
+        }
         _ => Ok(roots.get(base_slot)),
     }
 }
@@ -1156,7 +1167,11 @@ fn asdl_field_type(
 fn node_signature(name: &str) -> String {
     let fields = node_fields(name);
     let types = node_field_types(name);
-    assert_eq!(fields.len(), types.len(), "ASDL signature fields for {name}");
+    assert_eq!(
+        fields.len(),
+        types.len(),
+        "ASDL signature fields for {name}"
+    );
     if fields.is_empty() {
         name.to_owned()
     } else {
@@ -1208,7 +1223,11 @@ fn node_doc(name: &str, variants: Option<&[&str]>) -> String {
 fn install_field_types(lookup: &dyn Fn(&str) -> Option<PyObjectRef>, name: &str) {
     let fields = node_fields(name);
     let types = node_field_types(name);
-    assert_eq!(fields.len(), types.len(), "ASDL field/type count for {name}");
+    assert_eq!(
+        fields.len(),
+        types.len(),
+        "ASDL field/type count for {name}"
+    );
 
     let roots = pyre_object::gc_roots::push_roots();
     let type_slot = roots.base();
@@ -1218,23 +1237,14 @@ fn install_field_types(lookup: &dyn Fn(&str) -> Option<PyObjectRef>, name: &str)
     for (&field, &spelling) in fields.iter().zip(types) {
         let value_roots = pyre_object::gc_roots::push_roots();
         let value_slot = value_roots.base();
-        let _ = value_roots.pin_root(
-            asdl_field_type(lookup, spelling).expect("construct _ast ASDL field type"),
-        );
+        let _ = value_roots
+            .pin_root(asdl_field_type(lookup, spelling).expect("construct _ast ASDL field type"));
         let key = pyre_object::w_str_new(field);
-        crate::baseobjspace::setitem(
-            roots.get(dict_slot),
-            key,
-            value_roots.get(value_slot),
-        )
-        .expect("set _ast ASDL field type");
+        crate::baseobjspace::setitem(roots.get(dict_slot), key, value_roots.get(value_slot))
+            .expect("set _ast ASDL field type");
     }
-    crate::baseobjspace::setattr_str(
-        roots.get(type_slot),
-        "_field_types",
-        roots.get(dict_slot),
-    )
-    .expect("set _field_types on _ast node type");
+    crate::baseobjspace::setattr_str(roots.get(type_slot), "_field_types", roots.get(dict_slot))
+        .expect("set _field_types on _ast node type");
     crate::baseobjspace::setattr_str(
         roots.get(type_slot),
         "__annotations__",
@@ -1378,8 +1388,7 @@ fn build_ast_types() -> Vec<(&'static str, PyObjectRef)> {
         // PyPy `State.make_new_type`: optional ASDL fields are class-level
         // `None` defaults, inherited from the owner for optional attributes.
         for &field in node_default_none_fields(name) {
-            put(dict_slot, field, pyre_object::w_none())
-                .expect("set optional AST field default");
+            put(dict_slot, field, pyre_object::w_none()).expect("set optional AST field default");
         }
         // `type_descr_new` reads the metatype off the first argument, the way
         // `descr__new__` takes it as a parameter beside `arguments_w`.  Every
@@ -1418,10 +1427,7 @@ fn build_ast_types() -> Vec<(&'static str, PyObjectRef)> {
     let mut names: Vec<&'static str> = Vec::new();
 
     // Root: AST(object).
-    register_root(
-        &AST_TYPE,
-        make("AST", crate::typedef::w_object(), None),
-    );
+    register_root(&AST_TYPE, make("AST", crate::typedef::w_object(), None));
     let ast_slot = first;
     let _ = roots.pin_root(ast_type());
     names.push("AST");
@@ -1444,35 +1450,82 @@ fn build_ast_types() -> Vec<(&'static str, PyObjectRef)> {
             .expect("set AST.__init__");
         crate::baseobjspace::setattr_str(ast_type(), "__repr__", method_roots.get(repr_slot))
             .expect("set AST.__repr__");
-        crate::baseobjspace::setattr_str(
-            ast_type(),
-            "__replace__",
-            method_roots.get(replace_slot),
-        )
-        .expect("set AST.__replace__");
+        crate::baseobjspace::setattr_str(ast_type(), "__replace__", method_roots.get(replace_slot))
+            .expect("set AST.__replace__");
     }
 
     // Abstract groups (direct AST subclasses) and their concrete members,
     // per the ASDL grammar.
     let groups: &[(&'static str, &[&'static str])] = &[
-        ("mod", &["Module", "Interactive", "Expression", "FunctionType"]),
+        (
+            "mod",
+            &["Module", "Interactive", "Expression", "FunctionType"],
+        ),
         (
             "stmt",
             &[
-                "FunctionDef", "AsyncFunctionDef", "ClassDef", "Return", "Delete", "Assign",
-                "TypeAlias", "AugAssign", "AnnAssign", "For", "AsyncFor", "While", "If", "With",
-                "AsyncWith", "Match", "Raise", "Try", "TryStar", "Assert", "Import", "ImportFrom",
-                "Global", "Nonlocal", "Expr", "Pass", "Break", "Continue",
+                "FunctionDef",
+                "AsyncFunctionDef",
+                "ClassDef",
+                "Return",
+                "Delete",
+                "Assign",
+                "TypeAlias",
+                "AugAssign",
+                "AnnAssign",
+                "For",
+                "AsyncFor",
+                "While",
+                "If",
+                "With",
+                "AsyncWith",
+                "Match",
+                "Raise",
+                "Try",
+                "TryStar",
+                "Assert",
+                "Import",
+                "ImportFrom",
+                "Global",
+                "Nonlocal",
+                "Expr",
+                "Pass",
+                "Break",
+                "Continue",
             ],
         ),
         (
             "expr",
             &[
-                "BoolOp", "NamedExpr", "BinOp", "UnaryOp", "Lambda", "IfExp", "Dict", "Set",
-                "ListComp", "SetComp", "DictComp", "GeneratorExp", "Await", "Yield", "YieldFrom",
-                "Compare", "Call", "FormattedValue", "Interpolation", "JoinedStr",
-                "TemplateStr", "Constant", "Attribute", "Subscript", "Starred", "Name", "List",
-                "Tuple", "Slice",
+                "BoolOp",
+                "NamedExpr",
+                "BinOp",
+                "UnaryOp",
+                "Lambda",
+                "IfExp",
+                "Dict",
+                "Set",
+                "ListComp",
+                "SetComp",
+                "DictComp",
+                "GeneratorExp",
+                "Await",
+                "Yield",
+                "YieldFrom",
+                "Compare",
+                "Call",
+                "FormattedValue",
+                "Interpolation",
+                "JoinedStr",
+                "TemplateStr",
+                "Constant",
+                "Attribute",
+                "Subscript",
+                "Starred",
+                "Name",
+                "List",
+                "Tuple",
+                "Slice",
             ],
         ),
         ("expr_context", &["Load", "Store", "Del"]),
@@ -1485,13 +1538,24 @@ fn build_ast_types() -> Vec<(&'static str, PyObjectRef)> {
             ],
         ),
         ("unaryop", &["Invert", "Not", "UAdd", "USub"]),
-        ("cmpop", &["Eq", "NotEq", "Lt", "LtE", "Gt", "GtE", "Is", "IsNot", "In", "NotIn"]),
+        (
+            "cmpop",
+            &[
+                "Eq", "NotEq", "Lt", "LtE", "Gt", "GtE", "Is", "IsNot", "In", "NotIn",
+            ],
+        ),
         ("excepthandler", &["ExceptHandler"]),
         (
             "pattern",
             &[
-                "MatchValue", "MatchSingleton", "MatchSequence", "MatchMapping", "MatchClass",
-                "MatchStar", "MatchAs", "MatchOr",
+                "MatchValue",
+                "MatchSingleton",
+                "MatchSequence",
+                "MatchMapping",
+                "MatchClass",
+                "MatchStar",
+                "MatchAs",
+                "MatchOr",
             ],
         ),
         ("type_ignore", &["TypeIgnore"]),
@@ -1509,7 +1573,13 @@ fn build_ast_types() -> Vec<(&'static str, PyObjectRef)> {
 
     // Leaf node types that are direct AST subclasses (no further subclasses).
     let standalone: &[&'static str] = &[
-        "comprehension", "arguments", "arg", "keyword", "alias", "withitem", "match_case",
+        "comprehension",
+        "arguments",
+        "arg",
+        "keyword",
+        "alias",
+        "withitem",
+        "match_case",
     ];
     for name in standalone {
         let _ = roots.pin_root(make(name, roots.get(ast_slot), None));

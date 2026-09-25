@@ -11050,8 +11050,10 @@ fn mark_trace_reads_module_global_from_frame_name(
     if w_globals.is_null() {
         return false;
     }
-    let name = unsafe {
-        pyre_object::unicodeobject::w_str_get_value(w_name_ptr as pyre_object::PyObjectRef)
+    let Some(name) = (unsafe {
+        pyre_object::unicodeobject::w_str_get_value_opt(w_name_ptr as pyre_object::PyObjectRef)
+    }) else {
+        return false;
     };
     mark_trace_reads_module_global(tc, w_globals, name);
     true

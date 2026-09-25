@@ -23607,8 +23607,10 @@ pub(crate) fn try_walker_load_name_cell_fold<Sym: WalkSym>(
     if !w_locals.is_null() && !std::ptr::eq(w_locals, w_globals) {
         return Ok(false);
     }
-    let name = unsafe {
-        pyre_object::unicodeobject::w_str_get_value(w_name_ptr as pyre_object::PyObjectRef)
+    let Some(name) = (unsafe {
+        pyre_object::unicodeobject::w_str_get_value_opt(w_name_ptr as pyre_object::PyObjectRef)
+    }) else {
+        return Ok(false);
     };
     if frame_code_deletes_name(frame, name) {
         return Ok(false);
@@ -23676,8 +23678,10 @@ pub(crate) fn try_walker_store_name_cell_fold<Sym: WalkSym>(
             return Ok(false);
         }
     }
-    let name = unsafe {
-        pyre_object::unicodeobject::w_str_get_value(w_name_ptr as pyre_object::PyObjectRef)
+    let Some(name) = (unsafe {
+        pyre_object::unicodeobject::w_str_get_value_opt(w_name_ptr as pyre_object::PyObjectRef)
+    }) else {
+        return Ok(false);
     };
     if frame_code_deletes_name(frame, name) {
         return Ok(false);

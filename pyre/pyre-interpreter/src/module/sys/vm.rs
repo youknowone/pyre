@@ -258,14 +258,11 @@ fn namespace_update_dict(
     let sp = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(self_obj);
     let _ = pyre_object::gc_roots::pin_root(source);
-    let destination = crate::baseobjspace::getattr_str(
-        pyre_object::gc_roots::shadow_stack_get(sp),
-        "__dict__",
-    )?;
+    let destination =
+        crate::baseobjspace::getattr_str(pyre_object::gc_roots::shadow_stack_get(sp), "__dict__")?;
     let _ = pyre_object::gc_roots::pin_root(destination);
-    let items = unsafe {
-        pyre_object::w_dict_items(pyre_object::gc_roots::shadow_stack_get(sp + 1))
-    };
+    let items =
+        unsafe { pyre_object::w_dict_items(pyre_object::gc_roots::shadow_stack_get(sp + 1)) };
     let items_sp = pyre_object::gc_roots::shadow_stack_len();
     for &(key, value) in &items {
         let _ = pyre_object::gc_roots::pin_root(key);
@@ -440,9 +437,8 @@ fn simple_namespace_method(
 ) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     let slot = pyre_object::gc_roots::shadow_stack_len();
-    let method = crate::gateway::make_builtin_function_with_arity_and_doc(
-        name, function, arity, doc,
-    );
+    let method =
+        crate::gateway::make_builtin_function_with_arity_and_doc(name, function, arity, doc);
     let _ = pyre_object::gc_roots::pin_root(method);
     let signature = w_str_new(text_signature);
     let method = pyre_object::gc_roots::shadow_stack_get(slot);
@@ -668,10 +664,8 @@ fn simple_namespace_repr(args: &[PyObjectRef]) -> crate::PyResult {
     let Some(_guard) = crate::display::ReprGuard::enter(self_obj) else {
         return Ok(w_str_new_managed(&format!("{name}(...)")));
     };
-    let dict = crate::baseobjspace::getattr_str(
-        pyre_object::gc_roots::shadow_stack_get(sp),
-        "__dict__",
-    )?;
+    let dict =
+        crate::baseobjspace::getattr_str(pyre_object::gc_roots::shadow_stack_get(sp), "__dict__")?;
     let _ = pyre_object::gc_roots::pin_root(dict);
     let keys = unsafe {
         pyre_object::w_dict_items(pyre_object::gc_roots::shadow_stack_get(sp + 1))
@@ -686,9 +680,7 @@ fn simple_namespace_repr(args: &[PyObjectRef]) -> crate::PyResult {
     let mut parts = Vec::with_capacity(keys.len());
     for i in 0..keys.len() {
         let key = pyre_object::gc_roots::shadow_stack_get(keys_sp + i);
-        if !unsafe { pyre_object::is_str(key) }
-            || unsafe { pyre_object::w_str_len(key) == 0 }
-        {
+        if !unsafe { pyre_object::is_str(key) } || unsafe { pyre_object::w_str_len(key) == 0 } {
             continue;
         }
         let value = match crate::baseobjspace::getitem(
@@ -707,7 +699,9 @@ fn simple_namespace_repr(args: &[PyObjectRef]) -> crate::PyResult {
         parts.push(crate::display::wtf8_format!(
             unsafe { crate::display::py_str_wtf8(key)? },
             "=",
-            unsafe { crate::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(value_sp))? }
+            unsafe {
+                crate::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(value_sp))?
+            }
         ));
     }
     let mut text = rustpython_wtf8::Wtf8Buf::from_string(format!("{name}("));
@@ -777,10 +771,8 @@ fn simple_namespace_richcompare(
     let sp = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(self_obj);
     let _ = pyre_object::gc_roots::pin_root(other);
-    let self_dict = crate::baseobjspace::getattr_str(
-        pyre_object::gc_roots::shadow_stack_get(sp),
-        "__dict__",
-    )?;
+    let self_dict =
+        crate::baseobjspace::getattr_str(pyre_object::gc_roots::shadow_stack_get(sp), "__dict__")?;
     let _ = pyre_object::gc_roots::pin_root(self_dict);
     let other_dict = crate::baseobjspace::getattr_str(
         pyre_object::gc_roots::shadow_stack_get(sp + 1),
@@ -809,10 +801,8 @@ fn simple_namespace_reduce(args: &[PyObjectRef]) -> crate::PyResult {
     let _ = pyre_object::gc_roots::pin_root(w_type);
     let w_args = w_tuple_new(Vec::new());
     let _ = pyre_object::gc_roots::pin_root(w_args);
-    let w_dict = crate::baseobjspace::getattr_str(
-        pyre_object::gc_roots::shadow_stack_get(sp),
-        "__dict__",
-    )?;
+    let w_dict =
+        crate::baseobjspace::getattr_str(pyre_object::gc_roots::shadow_stack_get(sp), "__dict__")?;
     let _ = pyre_object::gc_roots::pin_root(w_dict);
     Ok(w_tuple_new(vec![
         pyre_object::gc_roots::shadow_stack_get(sp + 1),
@@ -850,19 +840,19 @@ fn simple_namespace_replace(args: &[PyObjectRef]) -> crate::PyResult {
     // particular before `type(self)()` could execute a foreign constructor.
     if !unsafe { crate::baseobjspace::issubtype_w(self_type, simple_namespace_type()) } {
         let received = if self_type.is_null() {
-            "object".to_string()
+            rustpython_wtf8::Wtf8Buf::from("object")
         } else {
             unsafe { crate::baseobjspace::type_fully_qualified_name(self_type) }
         };
-        return Err(crate::PyError::type_error(format!(
-            "descriptor '__replace__' for 'types.SimpleNamespace' objects doesn't apply to a '{received}' object"
+        return Err(crate::PyError::type_error(crate::display::wtf8_format!(
+            "descriptor '__replace__' for 'types.SimpleNamespace' objects doesn't apply to a '",
+            received,
+            "' object"
         )));
     }
     let _ = pyre_object::gc_roots::pin_root(self_type);
     let result = crate::call::call_function_impl_result(
-        pyre_object::gc_roots::shadow_stack_get(
-            sp + 1 + usize::from(kwargs.is_some()),
-        ),
+        pyre_object::gc_roots::shadow_stack_get(sp + 1 + usize::from(kwargs.is_some())),
         &[],
     )?;
     let _ = pyre_object::gc_roots::pin_root(result);
@@ -876,31 +866,27 @@ fn simple_namespace_replace(args: &[PyObjectRef]) -> crate::PyResult {
         .unwrap_or(PY_NULL);
     if !unsafe { crate::baseobjspace::issubtype_w(result_type, simple_namespace_type()) } {
         let constructed = unsafe {
-            crate::baseobjspace::type_fully_qualified_name(
-                pyre_object::gc_roots::shadow_stack_get(
-                    sp + 1 + usize::from(kwargs.is_some()),
-                ),
-            )
+            crate::baseobjspace::type_fully_qualified_name(pyre_object::gc_roots::shadow_stack_get(
+                sp + 1 + usize::from(kwargs.is_some()),
+            ))
         };
         let returned = if result_type.is_null() {
             "object"
         } else {
             unsafe { w_type_get_name(result_type) }
         };
-        return Err(crate::PyError::type_error(format!(
-            "expect types.SimpleNamespace type, but {constructed}() returned '{returned}' object"
+        return Err(crate::PyError::type_error(crate::display::wtf8_format!(
+            "expect types.SimpleNamespace type, but ",
+            constructed,
+            format!("() returned '{returned}' object")
         )));
     }
-    let source_dict = crate::baseobjspace::getattr_str(
-        pyre_object::gc_roots::shadow_stack_get(sp),
-        "__dict__",
-    )?;
+    let source_dict =
+        crate::baseobjspace::getattr_str(pyre_object::gc_roots::shadow_stack_get(sp), "__dict__")?;
     let _ = pyre_object::gc_roots::pin_root(source_dict);
     namespace_update_dict(
         pyre_object::gc_roots::shadow_stack_get(result_slot),
-        pyre_object::gc_roots::shadow_stack_get(
-            sp + 3 + usize::from(kwargs.is_some()),
-        ),
+        pyre_object::gc_roots::shadow_stack_get(sp + 3 + usize::from(kwargs.is_some())),
         false,
     )?;
     if kwargs.is_some() {
@@ -1373,13 +1359,15 @@ fn sys_baserepl(_args: &[PyObjectRef]) -> crate::PyResult {
     // collection that forwards the slot without touching a local copy.
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(crate::baseobjspace::getattr_str(code_module, "interact")?);
+    let _ =
+        pyre_object::gc_roots::pin_root(crate::baseobjspace::getattr_str(code_module, "interact")?);
     // `interact(banner, readfunc, local, exitmsg)`.  Both messages are empty:
     // the console this stands in for prints neither a banner nor a farewell.
     let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(""));
     let main_module = crate::importing::get_sys_module("__main__")
         .ok_or_else(|| crate::PyError::runtime_error("no module named '__main__'"))?;
-    let _ = pyre_object::gc_roots::pin_root(crate::baseobjspace::getattr_str(main_module, "__dict__")?);
+    let _ =
+        pyre_object::gc_roots::pin_root(crate::baseobjspace::getattr_str(main_module, "__dict__")?);
     let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(""));
     let slot = pyre_object::gc_roots::shadow_stack_get;
     crate::call::call_function_impl_result(
@@ -1477,19 +1465,14 @@ fn exc_info_is_binary_subscr(
 /// tuple component/slice that cannot reach slot 2.  This is the JIT-relevant
 /// part of PyPy's implementation: returning None in slot 2 prevents the live
 /// traceback/frame chain from forcing the virtual frame.
-fn exc_info_result_needs_traceback_at(
-    frame: &crate::pyframe::PyFrame,
-    call_pc: usize,
-) -> bool {
+fn exc_info_result_needs_traceback_at(frame: &crate::pyframe::PyFrame, call_pc: usize) -> bool {
     use crate::bytecode::{BuildSliceArgCount, Instruction};
 
     if frame.hide() {
         return true;
     }
     let code = frame.getcode();
-    let Some((call_instruction, _)) =
-        crate::pyopcode::decode_instruction_at(code, call_pc)
-    else {
+    let Some((call_instruction, _)) = crate::pyopcode::decode_instruction_at(code, call_pc) else {
         return true;
     };
     if !matches!(call_instruction.deoptimize(), Instruction::Call { .. }) {
@@ -1564,8 +1547,7 @@ fn exc_info_result_needs_traceback_at(
     if crate::pyopcode::build_slice_arg(argc, slice_arg) != BuildSliceArgCount::Two {
         return true;
     }
-    let Some((_, subscr_instruction, subscr_arg)) =
-        exc_info_next_instruction(code, slice_pc + 1)
+    let Some((_, subscr_instruction, subscr_arg)) = exc_info_next_instruction(code, slice_pc + 1)
     else {
         return true;
     };
@@ -1598,11 +1580,8 @@ fn exc_info_tuple(include_traceback: bool) -> PyObjectRef {
     let exc = crate::eval::get_sys_exception();
     unsafe {
         if exc.is_null() {
-            crate::runtime_ops::jit_build_tuple_3(
-                w_none() as i64,
-                w_none() as i64,
-                w_none() as i64,
-            ) as PyObjectRef
+            crate::runtime_ops::jit_build_tuple_3(w_none() as i64, w_none() as i64, w_none() as i64)
+                as PyObjectRef
         } else {
             let exc_type = crate::baseobjspace::exception_getclass(exc);
             let exc_type = if exc_type.is_null() {
@@ -1687,11 +1666,7 @@ pub fn sys_exception_direct() -> PyObjectRef {
     // carrier or None, and `get_w_value()` returns its value without another
     // isinstance check. Pyre stores that value directly in `sys_exc_value`;
     // the slot's writers preserve the same exception-or-null invariant.
-    if exc.is_null() {
-        w_none()
-    } else {
-        exc
-    }
+    if exc.is_null() { w_none() } else { exc }
 }
 
 /// The `BuiltinCode.func` behind `sys.exception`.
@@ -2081,11 +2056,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         fields.push(w_int_new(i64::from(crate::importing::inspect_flag())));
         fields.push(w_int_new(i64::from(crate::importing::interactive_flag())));
         fields.push(w_int_new(crate::importing::optimize_level()));
-        fields.push(w_int_new(i64::from(crate::importing::dont_write_bytecode_flag())));
+        fields.push(w_int_new(i64::from(
+            crate::importing::dont_write_bytecode_flag(),
+        )));
         fields.push(w_int_new(i64::from(crate::importing::no_user_site_flag())));
         // `-S` (skip `import site`) is recorded by the launcher.
         fields.push(w_int_new(i64::from(crate::importing::no_site_flag())));
-        fields.push(w_int_new(i64::from(crate::importing::ignore_environment_flag())));
+        fields.push(w_int_new(i64::from(
+            crate::importing::ignore_environment_flag(),
+        )));
         fields.push(w_int_new(crate::importing::verbose_flag()));
         fields.push(w_int_new(crate::importing::bytes_warning_flag()));
         fields.push(w_int_new(i64::from(crate::importing::quiet_flag())));
@@ -2279,9 +2258,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // "expected integer".
                 let new_limit = crate::builtins::space_index_w(args[0])?;
                 if !(i32::MIN as i64..=i32::MAX as i64).contains(&new_limit) {
-                    return Err(crate::PyError::overflow_error(
-                        "expected a 32-bit integer",
-                    ));
+                    return Err(crate::PyError::overflow_error("expected a 32-bit integer"));
                 }
                 let new_limit = new_limit as i32;
                 crate::stack_check::set_recursion_limit(new_limit)?;
@@ -2466,15 +2443,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         let implementation_version = crate::runtime_ops::module_ns_get(ns, "pyre_version_info")
             .expect("sys.pyre_version_info was installed above");
         crate::baseobjspace::setdictvalue_native(impl_obj, "version", implementation_version);
-        let version_major = env!("CARGO_PKG_VERSION_MAJOR")
-            .parse::<i64>()
-            .unwrap_or(0);
-        let version_minor = env!("CARGO_PKG_VERSION_MINOR")
-            .parse::<i64>()
-            .unwrap_or(0);
-        let version_micro = env!("CARGO_PKG_VERSION_PATCH")
-            .parse::<i64>()
-            .unwrap_or(0);
+        let version_major = env!("CARGO_PKG_VERSION_MAJOR").parse::<i64>().unwrap_or(0);
+        let version_minor = env!("CARGO_PKG_VERSION_MINOR").parse::<i64>().unwrap_or(0);
+        let version_micro = env!("CARGO_PKG_VERSION_PATCH").parse::<i64>().unwrap_or(0);
         let implementation_hexversion =
             (version_major << 24) | (version_minor << 16) | (version_micro << 8) | 0xf0;
         crate::baseobjspace::setdictvalue_native(
@@ -2505,8 +2476,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         let ty = crate::_structseq::make_struct_seq(
             "sys.hash_info",
             &[
-                "width", "modulus", "inf", "nan", "imag", "algorithm", "hash_bits",
-                "seed_bits", "cutoff",
+                "width",
+                "modulus",
+                "inf",
+                "nan",
+                "imag",
+                "algorithm",
+                "hash_bits",
+                "seed_bits",
+                "cutoff",
             ],
         );
         let mut fields = pyre_object::gc_roots::RootedItems::new();
@@ -2526,8 +2504,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         let ty = crate::_structseq::make_struct_seq(
             "sys.float_info",
             &[
-                "max", "max_exp", "max_10_exp", "min", "min_exp", "min_10_exp", "dig",
-                "mant_dig", "epsilon", "radix", "rounds",
+                "max",
+                "max_exp",
+                "max_10_exp",
+                "min",
+                "min_exp",
+                "min_10_exp",
+                "dig",
+                "mant_dig",
+                "epsilon",
+                "radix",
+                "rounds",
             ],
         );
         let mut fields = pyre_object::gc_roots::RootedItems::new();
@@ -2549,10 +2536,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // uses David Gay's shortest-round-trip algorithm (always, here).
     module_ns_store(ns, "float_repr_style", w_str_new("short"));
     {
-        let ty = crate::_structseq::make_struct_seq(
-            "sys.thread_info",
-            &["name", "lock", "version"],
-        );
+        let ty =
+            crate::_structseq::make_struct_seq("sys.thread_info", &["name", "lock", "version"]);
         let mut fields = pyre_object::gc_roots::RootedItems::new();
         fields.push(w_str_new(if cfg!(windows) { "nt" } else { "pthread" }));
         fields.push(if cfg!(windows) {
@@ -2602,11 +2587,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         module_ns_store(ns, "base_exec_prefix", fs_path(&paths.base_prefix));
         // FrozenImporter uses the resolved stdlib root to reconstruct source
         // filenames for frozen stdlib modules.
-        let stdlib_dir = paths
-            .stdlib
-            .as_deref()
-            .map(fs_path)
-            .unwrap_or_else(w_none);
+        let stdlib_dir = paths.stdlib.as_deref().map(fs_path).unwrap_or_else(w_none);
         module_ns_store(ns, "_stdlib_dir", stdlib_dir);
     }
     #[cfg(not(feature = "host_env"))]
@@ -3197,9 +3178,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 }
                 let result = unsafe { (*ec).call_tracing(args[0], args[1]) };
                 if result.is_null() {
-                    Err(crate::call::take_call_error().unwrap_or_else(|| {
-                        crate::PyError::runtime_error("call_tracing failed")
-                    }))
+                    Err(crate::call::take_call_error()
+                        .unwrap_or_else(|| crate::PyError::runtime_error("call_tracing failed")))
                 } else {
                     Ok(result)
                 }
@@ -3293,13 +3273,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         crate::type_methods::arg_type_name(args[0]),
                     )));
                 }
-                let exact = unsafe {
-                    pyre_object::is_exact_type(args[0], &pyre_object::STR_TYPE)
-                };
+                let exact = unsafe { pyre_object::is_exact_type(args[0], &pyre_object::STR_TYPE) };
                 Ok(w_bool_from(
-                    exact && unsafe {
-                        pyre_object::unicodeobject::is_interned_exact_str(args[0])
-                    },
+                    exact && unsafe { pyre_object::unicodeobject::is_interned_exact_str(args[0]) },
                 ))
             },
             1,
@@ -3310,7 +3286,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         "_is_immortal",
         make_builtin_function_with_arity(
             "_is_immortal",
-            |args| Ok(w_bool_from(!pyre_object::gc_hook::try_gc_owns_object(args[0].cast()))),
+            |args| {
+                Ok(w_bool_from(!pyre_object::gc_hook::try_gc_owns_object(
+                    args[0].cast(),
+                )))
+            },
             1,
         ),
     );
@@ -4096,7 +4076,10 @@ fn locale_asks_for_surrogateescape() -> bool {
             // `initstdio` installs the locale the environment names before
             // reading it back, so what is tested is the locale the C library
             // took rather than the variables that asked for it.
-            rustpython_host_env::locale::setlocale(rustpython_host_env::locale::LC_CTYPE, Some(c""));
+            rustpython_host_env::locale::setlocale(
+                rustpython_host_env::locale::LC_CTYPE,
+                Some(c""),
+            );
             let effective =
                 rustpython_host_env::locale::setlocale(rustpython_host_env::locale::LC_CTYPE, None);
             // [3.14-spec] CPython `config_get_stdio_errors` also consults
@@ -4105,8 +4088,7 @@ fn locale_asks_for_surrogateescape() -> bool {
             // flow here, while those observable stdio errors follow 3.14.
             matches!(
                 effective.as_deref(),
-                None
-                    | Some(b"C")
+                None | Some(b"C")
                     | Some(b"POSIX")
                     | Some(b"C.UTF-8")
                     | Some(b"C.utf8")
@@ -4239,7 +4221,11 @@ fn live_stdio_encoding_errors(stream_name: &str, default_errors: &str) -> (Strin
         crate::baseobjspace::getattr_str(stream, name)
             .ok()
             .filter(|value| unsafe { is_str(*value) })
-            .map(|value| unsafe { w_str_get_value(value) }.to_string())
+            .and_then(|value| {
+                crate::baseobjspace::str_utf8_w(value)
+                    .ok()
+                    .map(str::to_string)
+            })
             .unwrap_or_else(|| default.to_string())
     };
     (
@@ -4404,7 +4390,9 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
     // pyopcode load_method dispatch), so the first arg may be the string
     // directly. Pick whichever element is a real str.
     fn pick_str(args: &[PyObjectRef]) -> Option<PyObjectRef> {
-        args.iter().find(|&&a| !a.is_null() && unsafe { is_str(a) }).copied()
+        args.iter()
+            .find(|&&a| !a.is_null() && unsafe { is_str(a) })
+            .copied()
     }
     /// The error a `write` call that handed over no `str` owes.
     ///

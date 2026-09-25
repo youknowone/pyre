@@ -24,7 +24,7 @@ pub fn register_pkg(ns: pyre_object::PyObjectRef) {
                         "import_module: name must be str",
                     ));
                 }
-                let name_str = pyre_object::w_str_get_value(name).to_string();
+                let name_str = crate::baseobjspace::str_utf8_w(name)?.to_string();
                 // `load_source_module` reads `execution_context.builtins_module`
                 // to seed a fresh module namespace, so it must be the live EC,
                 // not null — pass the thread's current context.

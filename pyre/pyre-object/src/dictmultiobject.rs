@@ -8242,10 +8242,10 @@ mod tests {
             let items = w_dict_items(dict);
             assert_eq!(items.len(), 2);
             assert!(items.iter().any(|&(key, value)| {
-                crate::w_str_get_value(key) == "alpha" && w_int_get_value(value) == 1
+                crate::w_str_get_wtf8(key) == "alpha" && w_int_get_value(value) == 1
             }));
             assert!(items.iter().any(|&(key, value)| {
-                crate::w_str_get_value(key) == "beta" && w_int_get_value(value) == 2
+                crate::w_str_get_wtf8(key) == "beta" && w_int_get_value(value) == 2
             }));
 
             let mut str_entries = w_dict_str_entries(dict);

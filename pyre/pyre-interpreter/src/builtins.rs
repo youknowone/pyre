@@ -4195,7 +4195,7 @@ unsafe fn stream_encoding_errors(stream: PyObjectRef) -> (String, String) {
         crate::baseobjspace::getattr_str(stream, name)
             .ok()
             .filter(|v| !v.is_null() && unsafe { pyre_object::is_str(*v) })
-            .map(|v| unsafe { pyre_object::w_str_get_value(v) }.to_string())
+            .and_then(|v| crate::baseobjspace::str_utf8_w(v).ok().map(str::to_string))
             .unwrap_or_else(|| default.to_string())
     };
     (attr("encoding", "utf-8"), attr("errors", "strict"))
@@ -9597,7 +9597,10 @@ fn exception_getset_name(w_descr: PyObjectRef) -> String {
     if w_name.is_null() || !unsafe { pyre_object::is_str(w_name) } {
         return String::new();
     }
-    unsafe { pyre_object::w_str_get_value(w_name) }.to_string()
+    crate::baseobjspace::str_utf8_w(w_name)
+        .ok()
+        .map(str::to_string)
+        .unwrap_or_default()
 }
 
 /// A name the receiving exception kind does not declare — `OSError`'s
@@ -20090,7 +20093,7 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
             |args| {
                 let line = file_method_readline(args)?;
                 unsafe {
-                    let s = pyre_object::w_str_get_value(line);
+                    let s = pyre_object::w_str_get_wtf8(line);
                     if s.is_empty() {
                         return Err(crate::PyError::stop_iteration());
                     }
@@ -20127,7 +20130,11 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
                 file_check_closed(args[0])?;
                 let mode = crate::baseobjspace::getattr_str(args[0], "__file_mode__")
                     .ok()
-                    .map(|m| unsafe { pyre_object::w_str_get_value(m).to_string() })
+                    .and_then(|m| {
+                        unsafe { crate::baseobjspace::str_utf8_w(m) }
+                            .ok()
+                            .map(str::to_string)
+                    })
                     .unwrap_or_default();
                 Ok(w_bool_from(mode.contains('r') || mode.contains('+')))
             },
@@ -20143,7 +20150,11 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
                 file_check_closed(args[0])?;
                 let mode = crate::baseobjspace::getattr_str(args[0], "__file_mode__")
                     .ok()
-                    .map(|m| unsafe { pyre_object::w_str_get_value(m).to_string() })
+                    .and_then(|m| {
+                        unsafe { crate::baseobjspace::str_utf8_w(m) }
+                            .ok()
+                            .map(str::to_string)
+                    })
                     .unwrap_or_default();
                 Ok(w_bool_from(
                     mode.contains('w')
@@ -20529,7 +20540,13 @@ fn fileio_method_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     let mode = crate::baseobjspace::getattr_str(self_obj, "__file_public_mode__")
         .ok()
         .and_then(|value| unsafe {
-            pyre_object::is_str(value).then(|| pyre_object::w_str_get_value(value).to_string())
+            if pyre_object::is_str(value) {
+                crate::baseobjspace::str_utf8_w(value)
+                    .ok()
+                    .map(str::to_string)
+            } else {
+                None
+            }
         })
         .unwrap_or_default();
     let body = if let Ok(name) = crate::baseobjspace::getattr_str(self_obj, "name") {
@@ -20762,7 +20779,13 @@ fn file_mode_string(self_obj: PyObjectRef) -> String {
     crate::baseobjspace::getattr_str(self_obj, "__file_mode__")
         .ok()
         .and_then(|mode| unsafe {
-            pyre_object::is_str(mode).then(|| pyre_object::w_str_get_value(mode).to_string())
+            if pyre_object::is_str(mode) {
+                crate::baseobjspace::str_utf8_w(mode)
+                    .ok()
+                    .map(str::to_string)
+            } else {
+                None
+            }
         })
         .unwrap_or_default()
 }
@@ -21754,7 +21777,7 @@ fn file_method_readlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
             if pyre_object::bytesobject::is_bytes_like(line) {
                 pyre_object::bytesobject::bytes_like_data(line).is_empty()
             } else {
-                pyre_object::w_str_get_value(line).is_empty()
+                pyre_object::w_str_get_wtf8(line).is_empty()
             }
         };
         if empty {
@@ -21923,7 +21946,7 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         };
         let append = crate::baseobjspace::getattr_str(args[0], "__file_mode__")
             .ok()
-            .map(|mode| pyre_object::w_str_get_value(mode).contains('a'))
+            .map(|mode| pyre_object::w_str_get_wtf8(mode).as_bytes().contains(&b'a'))
             .unwrap_or(false);
         let pos = if append {
             prev.len()
@@ -22055,8 +22078,8 @@ fn file_flush_dirty(obj: PyObjectRef) -> Result<(), crate::PyError> {
             crate::baseobjspace::getattr_str(obj, "__file_name__"),
             crate::baseobjspace::getattr_str(obj, "__file_mode__"),
         ) {
-            let name_s = unsafe { pyre_object::w_str_get_value(name).to_string() };
-            let mode_s = unsafe { pyre_object::w_str_get_value(mode).to_string() };
+            let name_s = unsafe { crate::baseobjspace::str_utf8_w(name)?.to_string() };
+            let mode_s = unsafe { crate::baseobjspace::str_utf8_w(mode)?.to_string() };
             let data = file_get_data(obj);
             let append = mode_s.contains('a');
             let write_res = if append {

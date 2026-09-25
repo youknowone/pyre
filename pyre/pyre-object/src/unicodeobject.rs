@@ -927,24 +927,14 @@ pub fn box_str_constant(value: &Wtf8) -> PyObjectRef {
     obj
 }
 
-/// Extract the &str value from a known W_UnicodeObject pointer.
+/// There is no panicking `&str` view of a `W_UnicodeObject`.
 ///
-/// # Safety
-/// `obj` must point to a valid `W_UnicodeObject`.
-///
-/// # Panics
-/// The backing buffer is WTF-8.  Surrogateescape / surrogatepass decoding
-/// can produce surrogate-bearing strings, so a `&str` view is not
-/// guaranteed.  Consumers that must tolerate lone surrogates read through
-/// [`w_str_get_wtf8`]; `&str` consumers reach this accessor and panic on a
-/// surrogate rather than silently corrupting.
-#[inline]
-pub unsafe fn w_str_get_value(obj: PyObjectRef) -> &'static str {
-    match unsafe { w_str_get_value_opt(obj) } {
-        Some(value) => value,
-        None => panic!("w_str_get_value: backing Wtf8Buf is not valid UTF-8 (lone surrogate)"),
-    }
-}
+/// `W_UnicodeObject.text_w` returns `self._utf8` verbatim, surrogates
+/// included, so a caller that only forwards the buffer uses
+/// [`w_str_get_wtf8`]. A caller that needs valid UTF-8 uses
+/// [`w_str_get_value_opt`] and reports `UnicodeEncodeError`
+/// ("surrogates not allowed"), the strict utf-8 encoder's reason
+/// (`unicodehelper.py`).
 
 /// The `&str` view of a WTF-8 buffer already known to hold no lone
 /// surrogate.
@@ -1905,7 +1895,7 @@ mod tests {
             unsafe {
                 assert!(is_str(obj), "case {name}");
                 assert!(!is_int(obj), "case {name}");
-                assert_eq!(w_str_get_value(obj), value, "case {name}");
+                assert_eq!(w_str_get_wtf8(obj), value, "case {name}");
             }
         }
     }
@@ -1924,7 +1914,7 @@ mod tests {
         let obj = w_str_new("hello");
         unsafe {
             assert_eq!(w_str_len(obj), 5);
-            assert_eq!(w_str_get_value(obj).len(), 5);
+            assert_eq!(w_str_get_wtf8(obj).len(), 5);
         }
     }
 
@@ -1967,9 +1957,9 @@ mod tests {
     fn test_str_getitem_is_getitem_result() {
         unsafe {
             let ascii = w_str_new("abcde");
-            assert_eq!(w_str_get_value(w_str_getitem(ascii, 0).unwrap()), "a");
-            assert_eq!(w_str_get_value(w_str_getitem(ascii, 4).unwrap()), "e");
-            assert_eq!(w_str_get_value(w_str_getitem(ascii, -1).unwrap()), "e");
+            assert_eq!(w_str_get_wtf8(w_str_getitem(ascii, 0).unwrap()), "a");
+            assert_eq!(w_str_get_wtf8(w_str_getitem(ascii, 4).unwrap()), "e");
+            assert_eq!(w_str_get_wtf8(w_str_getitem(ascii, -1).unwrap()), "e");
             assert!(w_str_getitem(ascii, 5).is_none());
             assert!(w_str_getitem(ascii, -6).is_none());
             let first = w_str_getitem(ascii, 0).unwrap();
@@ -1977,10 +1967,10 @@ mod tests {
             assert_eq!(w_str_len(first), 1);
 
             let wide = w_str_new("aé中");
-            assert_eq!(w_str_get_value(w_str_getitem(wide, 0).unwrap()), "a");
-            assert_eq!(w_str_get_value(w_str_getitem(wide, 1).unwrap()), "é");
-            assert_eq!(w_str_get_value(w_str_getitem(wide, 2).unwrap()), "中");
-            assert_eq!(w_str_get_value(w_str_getitem(wide, -1).unwrap()), "中");
+            assert_eq!(w_str_get_wtf8(w_str_getitem(wide, 0).unwrap()), "a");
+            assert_eq!(w_str_get_wtf8(w_str_getitem(wide, 1).unwrap()), "é");
+            assert_eq!(w_str_get_wtf8(w_str_getitem(wide, 2).unwrap()), "中");
+            assert_eq!(w_str_get_wtf8(w_str_getitem(wide, -1).unwrap()), "中");
         }
     }
 
@@ -2022,7 +2012,7 @@ mod tests {
         assert_eq!(jit_str_find_bounds(hay as i64, needle as i64, 2, 6), 5);
         let sliced = jit_str_slice(hay as i64, 1, 4) as PyObjectRef;
         unsafe {
-            assert_eq!(w_str_get_value(sliced), "二三四");
+            assert_eq!(w_str_get_wtf8(sliced), "二三四");
         }
         let full = jit_str_slice(hay as i64, 0, unsafe { w_str_len(hay) } as i64) as PyObjectRef;
         assert!(
@@ -2126,8 +2116,8 @@ mod tests {
         let cat = jit_str_concat(a as i64, b as i64) as PyObjectRef;
         let rep = jit_str_repeat(a as i64, 3) as PyObjectRef;
         unsafe {
-            assert_eq!(w_str_get_value(cat), "abcd");
-            assert_eq!(w_str_get_value(rep), "ababab");
+            assert_eq!(w_str_get_wtf8(cat), "abcd");
+            assert_eq!(w_str_get_wtf8(rep), "ababab");
             assert!(jit_str_compare(a as i64, b as i64) < 0);
             assert_eq!(jit_str_compare(a as i64, a as i64), 0);
             assert!(jit_str_compare(b as i64, a as i64) > 0);
@@ -2175,11 +2165,11 @@ mod tests {
     #[test]
     fn test_jit_int_str_renders_decimal() {
         unsafe {
-            assert_eq!(w_str_get_value(jit_int_str(0) as PyObjectRef), "0");
-            assert_eq!(w_str_get_value(jit_int_str(123) as PyObjectRef), "123");
-            assert_eq!(w_str_get_value(jit_int_str(-7) as PyObjectRef), "-7");
+            assert_eq!(w_str_get_wtf8(jit_int_str(0) as PyObjectRef), "0");
+            assert_eq!(w_str_get_wtf8(jit_int_str(123) as PyObjectRef), "123");
+            assert_eq!(w_str_get_wtf8(jit_int_str(-7) as PyObjectRef), "-7");
             assert_eq!(
-                w_str_get_value(jit_int_str(i64::MIN) as PyObjectRef),
+                w_str_get_wtf8(jit_int_str(i64::MIN) as PyObjectRef),
                 "-9223372036854775808",
             );
         }

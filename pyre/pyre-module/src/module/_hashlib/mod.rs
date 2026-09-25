@@ -178,7 +178,9 @@ impl W_HashState {
     }
 
     fn canonical_name(&self) -> &str {
-        unsafe { w_str_get_value(self.name) }
+        // A lone surrogate is not a hash name. The empty view misses every
+        // algorithm and the caller reports `unsupported hash type`.
+        unsafe { w_str_get_wtf8(self.name) }.as_str().unwrap_or("")
     }
 
     fn digest_bytes(
@@ -585,7 +587,8 @@ mod hmac_class {
         }
 
         fn __repr__(&self) -> String {
-            let name = unsafe { w_str_get_value(self.name) };
+            let raw = unsafe { w_str_get_wtf8(self.name) };
+            let name = raw.as_str().unwrap_or("");
             let name = name.strip_prefix("hmac-").unwrap_or(name);
             format!("<{name} HMAC object @ {:#x}>", self as *const Self as usize)
         }

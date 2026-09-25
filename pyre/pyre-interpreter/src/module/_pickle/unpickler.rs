@@ -175,7 +175,7 @@ impl W_Unpickler {
         let encoding = if unsafe { pyre_object::is_none(encoding) } {
             String::from("ASCII")
         } else if unsafe { pyre_object::is_str(encoding) } {
-            unsafe { pyre_object::unicodeobject::w_str_get_value(encoding) }.to_string()
+            crate::baseobjspace::str_utf8_w(encoding)?.to_string()
         } else {
             return Err(PyError::type_error(format!(
                 "Unpickler() argument 'encoding' must be str, not {}",
@@ -186,7 +186,7 @@ impl W_Unpickler {
         let errors = if unsafe { pyre_object::is_none(errors) } {
             String::from("strict")
         } else if unsafe { pyre_object::is_str(errors) } {
-            unsafe { pyre_object::unicodeobject::w_str_get_value(errors) }.to_string()
+            crate::baseobjspace::str_utf8_w(errors)?.to_string()
         } else {
             return Err(PyError::type_error(format!(
                 "Unpickler() argument 'errors' must be str, not {}",

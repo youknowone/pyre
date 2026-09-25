@@ -1609,7 +1609,8 @@ pub fn array_repr_wtf8(obj: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf, PyE
     let w_type = crate::typedef::r#type(current_obj())
         .expect("an array instance must have a Python type object");
     let class_name = unsafe {
-        pyre_object::w_str_get_value(pyre_object::w_type_get_name_obj(w_type.as_ptr())).to_string()
+        crate::baseobjspace::str_utf8_w(pyre_object::w_type_get_name_obj(w_type.as_ptr()))?
+            .to_string()
     };
     let tc = unsafe { arr::w_array_typecode(current_obj()) } as char;
     let len = unsafe { arr::w_array_len(current_obj()) };

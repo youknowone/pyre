@@ -468,7 +468,11 @@ impl BufferView {
                 BufferView::Simple { .. } => "B",
                 BufferView::Raw { w_fmt, .. }
                 | BufferView::View1D { w_fmt, .. }
-                | BufferView::CBuffer { w_fmt, .. } => crate::w_str_get_value(*w_fmt),
+                | BufferView::CBuffer { w_fmt, .. } => {
+                    // A lone surrogate is not a format code. Empty is already
+                    // rejected by the format-length check.
+                    crate::w_str_get_value_opt(*w_fmt).unwrap_or("")
+                }
                 BufferView::Slice { parent, .. } | BufferView::ViewND { parent, .. } => {
                     parent.format_str()
                 }

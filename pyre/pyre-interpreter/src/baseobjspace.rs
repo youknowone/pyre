@@ -5268,7 +5268,7 @@ pub(crate) fn named_key_hash(key: &str, pycode: PyObjectRef, nameindex: usize) -
     // caller borrowed `key` from — the same pairing [`wrapped_key`] already
     // stores under.  A mismatch would probe a bucket the key is not in.
     debug_assert_eq!(
-        unsafe { pyre_object::unicodeobject::w_str_get_value(w_name) },
+        unsafe { pyre_object::unicodeobject::w_str_get_wtf8(w_name) },
         key,
         "co_names_w slot names a different key than the opcode borrowed"
     );
@@ -7528,6 +7528,7 @@ unsafe fn getattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, name: &Wtf8) 
                 // non-surrogate path's `module_getattr_fallback`.
                 if is_module(obj) {
                     let w_dict = pyre_object::w_module_get_w_dict(obj);
+                    let mut from_hook = false;
                     if !w_dict.is_null()
                         && let Some(mod_getattr) = finditem_str(w_dict, "__getattr__")?
                         && !mod_getattr.is_null()
@@ -7536,9 +7537,16 @@ unsafe fn getattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, name: &Wtf8) 
                             Ok(v) => return Ok(v),
                             Err(e2) if e2.kind == crate::PyErrorKind::AttributeError => {
                                 e = e2;
+                                from_hook = true;
                             }
                             Err(e2) => return Err(e2),
                         }
+                    }
+                    // module.py `descr_getattribute` phrases a miss that no module
+                    // `__getattr__` claimed. A lone surrogate is still the
+                    // attribute name (`text_w`).
+                    if !from_hook {
+                        e = unsafe { module_miss_error(obj, name) }?;
                     }
                 }
                 // `space.lookup(w_obj, '__getattr__')` walks `type(w_obj)` —
@@ -7730,7 +7738,7 @@ unsafe fn setattr_surrogate(
 /// legitimately reach a data descriptor (`setattr(cls, '\udc80', descr)`),
 /// so the descriptor walk runs the same as for an identifier name, just
 /// keyed through the WTF-8 MRO view.
-pub(crate) unsafe fn object_setattr_surrogate(
+pub unsafe fn object_setattr_surrogate(
     obj: PyObjectRef,
     w_name: PyObjectRef,
     name: &Wtf8,
@@ -8040,7 +8048,7 @@ pub(crate) unsafe fn module_getattribute_wtf8(
 unsafe fn module_getattr_hook_wtf8(
     obj: PyObjectRef,
     w_name: PyObjectRef,
-    err: PyError,
+    _err: PyError,
 ) -> PyResult {
     unsafe {
         let w_dict = pyre_object::w_module_get_w_dict(obj);
@@ -8050,7 +8058,121 @@ unsafe fn module_getattr_hook_wtf8(
         {
             return crate::call::call_function_impl_result(mod_getattr, &[w_name]);
         }
-        Err(err)
+        let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
+        Err(unsafe { module_miss_error(obj, name) }?)
+    }
+}
+
+/// module.py `descr_getattribute` miss after the `__getattr__` hook: phrase
+/// the AttributeError from `__name__` and `__spec__` (`oefmt` on `w_name` /
+/// `w_attr`). A surrogate attribute never matches
+/// `is_spec_uninitialized_submodule`, which compares a UTF-8 name.
+unsafe fn module_miss_error(obj: PyObjectRef, name: &Wtf8) -> Result<PyError, PyError> {
+    // `name` is borrowed from the attribute string, and `__name__` from the
+    // module dict. Own both before `module_shadow_info` / `is_spec_initializing`,
+    // which allocate and can move those strings.
+    let name = name.to_wtf8_buf();
+    unsafe {
+        let w_dict = pyre_object::w_module_get_w_dict(obj);
+        if w_dict.is_null() {
+            return Ok(attr_error_wtf8(obj, &name));
+        }
+        let w_modname = match finditem_str(w_dict, "__name__")? {
+            Some(w) if !w.is_null() && pyre_object::is_str(w) => w,
+            _ => {
+                let mut msg = Wtf8Buf::from("module has no attribute '");
+                msg.push_wtf8(&name);
+                msg.push_str("'");
+                return Ok(PyError::new(PyErrorKind::AttributeError, msg));
+            }
+        };
+        let _scope = pyre_object::gc_roots::push_roots();
+        let name_slot = pyre_object::gc_roots::shadow_stack_len();
+        let w_modname = pyre_object::gc_roots::pin_root(w_modname);
+        let nm = pyre_object::w_str_get_wtf8(w_modname).to_wtf8_buf();
+        let w_spec = finditem_str(w_dict, "__spec__")?.filter(|w| !w.is_null());
+        let msg = if let Some(w_spec) = w_spec {
+            let spec_slot = pyre_object::gc_roots::shadow_stack_len();
+            let w_spec = pyre_object::gc_roots::pin_root(w_spec);
+            let w_modname = pyre_object::gc_roots::shadow_stack_get(name_slot);
+            let (origin, is_shadowing, is_shadowing_stdlib) =
+                crate::importing::module_shadow_info(w_spec, w_modname)?;
+            let w_spec = pyre_object::gc_roots::shadow_stack_get(spec_slot);
+            let with_origin = |head: Wtf8Buf, tail: &str| {
+                let mut msg = head;
+                msg.push_wtf8(origin.as_deref().unwrap_or(Wtf8::new("")));
+                msg.push_str(tail);
+                msg
+            };
+            if is_shadowing_stdlib {
+                with_origin(
+                    crate::display::wtf8_format!(
+                        "module '",
+                        nm,
+                        "' has no attribute '",
+                        name,
+                        "' (consider renaming '"
+                    ),
+                    &format!(
+                        "' since it has the same name as the standard library module \
+                         named '{nm}' and prevents importing that standard library \
+                         module)"
+                    ),
+                )
+            } else if crate::importing::is_spec_initializing(w_spec)? {
+                if is_shadowing {
+                    with_origin(
+                        crate::display::wtf8_format!(
+                            "module '",
+                            nm,
+                            "' has no attribute '",
+                            name,
+                            "' (consider renaming '"
+                        ),
+                        "' if it has the same name as a library you intended to import)",
+                    )
+                } else if origin.is_some() {
+                    let mut msg = crate::display::wtf8_format!(
+                        "partially initialized module '",
+                        nm,
+                        "' from '"
+                    );
+                    msg.push_wtf8(origin.as_deref().unwrap_or(Wtf8::new("")));
+                    msg.push_str("' has no attribute '");
+                    msg.push_wtf8(&name);
+                    msg.push_str("' (most likely due to a circular import)");
+                    msg
+                } else {
+                    crate::display::wtf8_format!(
+                        "partially initialized module '",
+                        nm,
+                        "' has no attribute '",
+                        name,
+                        "' (most likely due to a circular import)"
+                    )
+                }
+            } else {
+                let w_spec = pyre_object::gc_roots::shadow_stack_get(spec_slot);
+                let uninit = match name.as_str() {
+                    Ok(name) => crate::importing::is_spec_uninitialized_submodule(w_spec, name)?,
+                    Err(_) => false,
+                };
+                if uninit {
+                    crate::display::wtf8_format!(
+                        "cannot access submodule '",
+                        name,
+                        "' of module '",
+                        nm,
+                        "' (most likely due to a circular import)"
+                    )
+                } else {
+                    crate::display::wtf8_format!("module '", nm, "' has no attribute '", name, "'")
+                }
+            }
+        } else {
+            crate::display::wtf8_format!("module '", nm, "' has no attribute '", name, "'")
+        };
+        Ok(PyError::new(PyErrorKind::AttributeError, msg))
     }
 }
 
@@ -8087,92 +8209,9 @@ unsafe fn module_getattr_hook_or_err(
     if suppress {
         return Err(err);
     }
-    // No module `__getattr__`: phrase the miss with the module's `__name__`
-    // when it is a string, falling back to the bare form otherwise
-    // (module.py:143-162).  Own the name up front so the `__spec__` lookups
-    // below, which allocate, cannot dangle the dict-borrowed slice.
-    let w_name = match finditem_str(w_dict, "__name__")? {
-        Some(w) if !w.is_null() && pyre_object::is_str(w) => w,
-        _ => {
-            return Err(PyError::new(
-                PyErrorKind::AttributeError,
-                format!("module has no attribute '{name}'"),
-            ));
-        }
-    };
-    // Pin the name across the `__spec__` / shadowing lookups below, which
-    // allocate, then read the display form back from its slot.
-    let _scope = pyre_object::gc_roots::push_roots();
-    let name_slot = pyre_object::gc_roots::shadow_stack_len();
-    let w_name = pyre_object::gc_roots::pin_root(w_name);
-    let nm = pyre_object::w_str_get_wtf8(w_name).to_string();
-    // Classify the miss through `__spec__`: a same-named file shadowing a
-    // search-path module is flagged first (the stdlib hint takes priority over
-    // the circular-import cause), then a module still executing, then an unset
-    // submodule slot.
-    let w_spec = finditem_str(w_dict, "__spec__")?.filter(|w| !w.is_null());
-    let msg = if let Some(w_spec) = w_spec {
-        let spec_slot = pyre_object::gc_roots::shadow_stack_len();
-        let w_spec = pyre_object::gc_roots::pin_root(w_spec);
-        let w_name = pyre_object::gc_roots::shadow_stack_get(name_slot);
-        let (origin, is_shadowing, is_shadowing_stdlib) =
-            crate::importing::module_shadow_info(w_spec, w_name)?;
-        let w_spec = pyre_object::gc_roots::shadow_stack_get(spec_slot);
-        // The origin is a filename and may hold a surrogate escape, so each
-        // message that names it is assembled as WTF-8; `format!` would render
-        // it through `Display` and substitute U+FFFD.
-        let with_origin = |head: String, tail: String| {
-            let mut msg = Wtf8Buf::from_string(head);
-            msg.push_wtf8(origin.as_deref().unwrap_or(Wtf8::new("")));
-            msg.push_str(&tail);
-            msg
-        };
-        if is_shadowing_stdlib {
-            with_origin(
-                format!("module '{nm}' has no attribute '{name}' (consider renaming '"),
-                format!(
-                    "' since it has the same name as the standard library module \
-                     named '{nm}' and prevents importing that standard library \
-                     module)"
-                ),
-            )
-        } else if crate::importing::is_spec_initializing(w_spec)? {
-            if is_shadowing {
-                with_origin(
-                    format!("module '{nm}' has no attribute '{name}' (consider renaming '"),
-                    "' if it has the same name as a library you intended to import)".to_string(),
-                )
-            } else if origin.is_some() {
-                with_origin(
-                    format!("partially initialized module '{nm}' from '"),
-                    format!(
-                        "' has no attribute '{name}' (most likely due to a \
-                         circular import)"
-                    ),
-                )
-            } else {
-                format!(
-                    "partially initialized module '{nm}' has no attribute \
-                     '{name}' (most likely due to a circular import)"
-                )
-                .into()
-            }
-        } else {
-            let w_spec = pyre_object::gc_roots::shadow_stack_get(spec_slot);
-            if crate::importing::is_spec_uninitialized_submodule(w_spec, name)? {
-                format!(
-                    "cannot access submodule '{name}' of module '{nm}' \
-                     (most likely due to a circular import)"
-                )
-                .into()
-            } else {
-                format!("module '{nm}' has no attribute '{name}'").into()
-            }
-        }
-    } else {
-        Wtf8Buf::from_string(format!("module '{nm}' has no attribute '{name}'"))
-    };
-    Err(PyError::new(PyErrorKind::AttributeError, msg))
+    // module.py `descr_getattribute`: no module `__getattr__`, so phrase the
+    // miss from `__name__` and `__spec__`.
+    Err(unsafe { module_miss_error(obj, Wtf8::new(name)) }?)
 }
 
 /// module.py `Module.descr_getattribute` AttributeError tail for the inlined
@@ -11646,10 +11685,10 @@ pub unsafe fn lookup_in_type_where(w_type: PyObjectRef, name: &str) -> Option<Py
 ///
 /// # Safety
 /// `w_obj` must be a valid, non-null `PyObject`.
-pub unsafe fn getfulltypename(w_obj: PyObjectRef) -> String {
+pub unsafe fn getfulltypename(w_obj: PyObjectRef) -> Wtf8Buf {
     match crate::typedef::r#type(w_obj) {
         Some(w_type) => getfulltypename_of_type(w_type.as_ptr()),
-        None => "object".to_string(),
+        None => Wtf8Buf::from("object"),
     }
 }
 
@@ -11677,16 +11716,24 @@ pub unsafe fn type_owner_is_in_dict(w_type: PyObjectRef) -> bool {
 ///
 /// # Safety
 /// `w_type` must be a valid `W_TypeObject`.
-pub unsafe fn getfulltypename_of_type(w_type: PyObjectRef) -> String {
+pub unsafe fn getfulltypename_of_type(w_type: PyObjectRef) -> Wtf8Buf {
     if !unsafe { type_owner_is_in_dict(w_type) } {
-        return w_type_get_name(w_type).to_string();
+        return Wtf8Buf::from(w_type_get_name(w_type));
     }
-    let qualname = pyre_object::w_type_get_qualname(w_type).to_string();
+    let qualname = pyre_object::w_type_get_qualname(w_type);
     // `w_type.lookup("__module__")` prepends a string module name; a
     // non-string `__module__` is ignored (`utf8_w` raises `TypeError`).
+    // A string module is `W_UnicodeObject.text_w`: the raw buffer, so a
+    // lone surrogate stays in the rendered name.
     match lookup_in_type(w_type, "__module__") {
-        Some(m) if is_str(m) => format!("{}.{qualname}", w_str_get_value(m)),
-        _ => qualname,
+        Some(m) if is_str(m) => {
+            let mut out = Wtf8Buf::new();
+            out.push_wtf8(unsafe { w_str_get_wtf8(m) });
+            out.push_str(".");
+            out.push_str(qualname);
+            out
+        }
+        _ => Wtf8Buf::from(qualname),
     }
 }
 
@@ -11697,20 +11744,28 @@ pub unsafe fn getfulltypename_of_type(w_type: PyObjectRef) -> String {
 ///
 /// # Safety
 /// `w_type` must be a valid `W_TypeObject`.
-pub unsafe fn type_repr_qualified_name(w_type: PyObjectRef) -> String {
-    let name = w_type_get_name(w_type).to_string();
+pub unsafe fn type_repr_qualified_name(w_type: PyObjectRef) -> Wtf8Buf {
+    let name = w_type_get_name(w_type);
     if !unsafe { type_owner_is_in_dict(w_type) } {
-        return name;
+        return Wtf8Buf::from(name);
     }
-    let module = lookup_in_type_where(w_type, "__module__")
-        .filter(|m| is_str(*m))
-        .map(|m| w_str_get_value(m).to_string());
+    // `descr_repr` reads the module string. A lone surrogate has a WTF-8
+    // spelling (`text_w`) and is part of `<class '…'>`.
+    let module = lookup_in_type_where(w_type, "__module__").filter(|m| is_str(*m));
     match module {
-        Some(m) if m != "builtins" => {
-            let qualname = pyre_object::w_type_get_qualname(w_type).to_string();
-            format!("{m}.{qualname}")
+        Some(m) => {
+            let module = unsafe { w_str_get_wtf8(m) };
+            if module != "builtins" {
+                let qualname = pyre_object::w_type_get_qualname(w_type);
+                let mut out = Wtf8Buf::new();
+                out.push_wtf8(module);
+                out.push_str(".");
+                out.push_str(qualname);
+                return out;
+            }
+            Wtf8Buf::from(name)
         }
-        _ => name,
+        _ => Wtf8Buf::from(name),
     }
 }
 
@@ -11817,25 +11872,32 @@ pub unsafe fn load_special_fast_path(
 ///
 /// # Safety
 /// `w_type` must be a valid `W_TypeObject`.
-pub unsafe fn type_fully_qualified_name(w_type: PyObjectRef) -> String {
+pub unsafe fn type_fully_qualified_name(w_type: PyObjectRef) -> Wtf8Buf {
     if !unsafe { type_owner_is_in_dict(w_type) } {
-        return w_type_get_name(w_type).to_string();
+        return Wtf8Buf::from(w_type_get_name(w_type));
     }
-    let qualname = pyre_object::w_type_get_qualname(w_type).to_string();
+    let qualname = pyre_object::w_type_get_qualname(w_type);
     // typeobject.c:type_module reads the heap type's own namespace, not an
-    // inherited `__module__`.
+    // inherited `__module__`. The string is the raw buffer (`text_w`).
     let dict = pyre_object::w_type_get_dict_ptr(w_type) as PyObjectRef;
     let module = (!dict.is_null())
         .then(|| pyre_object::w_dict_getitem_str(dict, "__module__"))
         .flatten()
         .map(|m| pyre_object::celldict::unwrap_cell(m))
-        .filter(|m| is_str(*m))
-        .map(|m| w_str_get_value(m).to_string());
-    match module.as_deref() {
-        Some(module) if module != "builtins" && module != "__main__" => {
-            format!("{module}.{qualname}")
+        .filter(|m| is_str(*m));
+    match module {
+        Some(m) => {
+            let module = unsafe { w_str_get_wtf8(m) };
+            if module != "builtins" && module != "__main__" {
+                let mut out = Wtf8Buf::new();
+                out.push_wtf8(module);
+                out.push_str(".");
+                out.push_str(qualname);
+                return out;
+            }
+            Wtf8Buf::from(qualname)
         }
-        _ => qualname,
+        None => Wtf8Buf::from(qualname),
     }
 }
 
@@ -13334,11 +13396,12 @@ pub(crate) unsafe fn member_typecheck_error(
 /// `getfulltypename` result while keeping eager message construction behind
 /// the same rejected-access boundary as upstream's `oefmt`.
 unsafe fn member_missing_error(obj: PyObjectRef, slot_name: &str) -> crate::PyError {
-    PyError::attribute_error(format!(
-        "'{}' object has no attribute '{}'",
-        getfulltypename(obj),
-        slot_name,
-    ))
+    let mut msg = Wtf8Buf::from("'");
+    msg.push_wtf8(&getfulltypename(obj));
+    msg.push_str("' object has no attribute '");
+    msg.push_str(slot_name);
+    msg.push_str("'");
+    PyError::attribute_error(msg)
 }
 
 /// Call a descriptor's __get__ method.
@@ -23458,7 +23521,7 @@ mod tests {
 
         setattr_str(module, "ps1", w_str_new("py> ")).unwrap();
         let result = getattr_str(module, "ps1").unwrap();
-        unsafe { assert_eq!(w_str_get_value(result), "py> ") };
+        unsafe { assert_eq!(w_str_get_wtf8(result), "py> ") };
     }
 
     #[test]

@@ -1044,7 +1044,7 @@ mod tests {
             );
             assert_eq!(
                 unsafe {
-                    pyre_object::w_str_get_value(
+                    pyre_object::w_str_get_wtf8(
                         pyre_interpreter::baseobjspace::getattr_str(ty, "__module__").unwrap(),
                     )
                 },

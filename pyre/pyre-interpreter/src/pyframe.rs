@@ -737,9 +737,10 @@ pub mod frame_locals_proxy {
                     .map(|tp| unsafe {
                         crate::baseobjspace::type_fully_qualified_name(tp.as_ptr())
                     })
-                    .unwrap_or_else(|| "object".to_string());
-                return Err(crate::PyError::type_error(format!(
-                    "expect frame, not {received}"
+                    .unwrap_or_else(|| rustpython_wtf8::Wtf8Buf::from("object"));
+                return Err(crate::PyError::type_error(crate::display::wtf8_format!(
+                    "expect frame, not ",
+                    received
                 )));
             }
             let _roots = pyre_object::gc_roots::push_roots();

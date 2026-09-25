@@ -6298,9 +6298,14 @@ pub extern "C" fn bh_load_from_dict_or_globals_fn(
 /// HLOp's name operand to (`flatten_constant_operand` → `box_str_constant`),
 /// the same interned-name ABI as `_pure_lookup_where_with_method_cache`.
 pub extern "C" fn bh_getattr_fn(obj: i64, w_name: i64) -> i64 {
-    let name =
-        unsafe { pyre_object::unicodeobject::w_str_get_value(w_name as pyre_object::PyObjectRef) };
-    let res = pyre_interpreter::baseobjspace::getattr_str(obj as pyre_object::PyObjectRef, name);
+    let obj = obj as pyre_object::PyObjectRef;
+    let w_name = w_name as pyre_object::PyObjectRef;
+    // A lone surrogate is not a `&str` key. `getattr` is the existing
+    // object-name path, which already declines to the surrogate lookup.
+    let res = match unsafe { pyre_object::unicodeobject::w_str_get_value_opt(w_name) } {
+        Some(name) => pyre_interpreter::baseobjspace::getattr_str(obj, name),
+        None => pyre_interpreter::baseobjspace::getattr(obj, w_name),
+    };
     match res {
         Ok(w_value) => w_value as i64,
         Err(mut err) => {
@@ -6793,8 +6798,19 @@ pub extern "C" fn bh_load_name_fn(frame_ptr: i64, w_name: i64, namei: i64) -> i6
          site must thread portal_frame_reg as the leading ref operand"
     );
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-    let name =
-        unsafe { pyre_object::unicodeobject::w_str_get_value(w_name as pyre_object::PyObjectRef) };
+    let w_name = w_name as pyre_object::PyObjectRef;
+    // `&str` namespace tables cannot hold a lone surrogate, so this is the
+    // same miss `load_name_checked_value` reports for an unknown name.
+    let Some(name) = (unsafe { pyre_object::unicodeobject::w_str_get_value_opt(w_name) }) else {
+        let text = unsafe { pyre_object::unicodeobject::w_str_get_wtf8(w_name) };
+        let mut msg = rustpython_wtf8::Wtf8Buf::from("name '");
+        msg.push_wtf8(text);
+        msg.push_str("' is not defined");
+        let mut err = pyre_interpreter::PyError::new(pyre_interpreter::PyErrorKind::NameError, msg);
+        err.w_name_context = w_name;
+        publish_residual_call_exception(err.to_exc_object() as i64);
+        return 0;
+    };
     match frame.load_name_checked_value(name, namei as usize) {
         Ok(w_value) => w_value as i64,
         Err(mut err) => {
@@ -7031,8 +7047,17 @@ pub extern "C" fn bh_delete_global_fn(frame_ptr: i64, w_name: i64) -> i64 {
          site must thread portal_frame_reg as the leading ref operand"
     );
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-    let name =
-        unsafe { pyre_object::unicodeobject::w_str_get_value(w_name as pyre_object::PyObjectRef) };
+    let w_name = w_name as pyre_object::PyObjectRef;
+    // Same miss as `delete_global` for a name the `&str` dict cannot hold.
+    let Some(name) = (unsafe { pyre_object::unicodeobject::w_str_get_value_opt(w_name) }) else {
+        let text = unsafe { pyre_object::unicodeobject::w_str_get_wtf8(w_name) };
+        let mut msg = rustpython_wtf8::Wtf8Buf::from("'");
+        msg.push_wtf8(text);
+        msg.push_str("'");
+        let mut err = pyre_interpreter::PyError::key_error(msg);
+        publish_residual_call_exception(err.to_exc_object() as i64);
+        return 0;
+    };
     match frame.delete_global(name) {
         Ok(()) => 1,
         Err(mut err) => {

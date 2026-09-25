@@ -189,7 +189,10 @@ impl Signature {
             if !pyre_object::is_str(w_name) {
                 return -1;
             }
-            let name = pyre_object::w_str_get_value(w_name);
+            // A lone surrogate matches no `&str` parameter name.
+            let Some(name) = pyre_object::w_str_get_value_opt(w_name) else {
+                return -1;
+            };
             self.find_argname(name)
         }
     }

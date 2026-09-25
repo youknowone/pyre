@@ -95,7 +95,11 @@ fn structseq_field_get(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
             "structseq field descriptor has no name",
         ));
     }
-    let name = unsafe { pyre_object::w_str_get_value(name_obj) };
+    let Some(name) = (unsafe { pyre_object::w_str_get_value_opt(name_obj) }) else {
+        return Err(PyError::attribute_error(
+            "structseq object has no field with a lone surrogate in its name",
+        ));
+    };
     let cls = unsafe { (*inst).w_class };
 
     enum Resolved {
@@ -264,28 +268,26 @@ fn structseq_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         )));
     }
 
-    let changes: Vec<(String, PyObjectRef)> = kwargs
+    let mut changes: Vec<(String, PyObjectRef)> = Vec::new();
+    for (key, value) in kwargs
         .map(|dict| unsafe { pyre_object::w_dict_items(dict) })
         .unwrap_or_default()
-        .into_iter()
-        .filter_map(|(key, value)| {
-            if unsafe { pyre_object::is_str(key) }
-                && unsafe { pyre_object::w_str_get_value(key) } == "__pyre_kw__"
-            {
-                None
-            } else if unsafe { pyre_object::is_str(key) } {
-                Some((
-                    unsafe { pyre_object::w_str_get_value(key) }.to_string(),
-                    value,
-                ))
-            } else {
-                // Python call syntax guarantees string keyword names.  Keep a
-                // defensive non-string marker without invoking user `repr`
-                // while the copied structseq fields are held in raw locals.
-                Some(("<non-string>".to_string(), value))
-            }
-        })
-        .collect();
+    {
+        if unsafe { pyre_object::is_str(key) }
+            && unsafe { pyre_object::w_str_get_wtf8(key) } == "__pyre_kw__"
+        {
+            continue;
+        } else if unsafe { pyre_object::is_str(key) } {
+            // A lone surrogate is not a field name. `str_utf8_w` reports it
+            // as UnicodeEncodeError ("surrogates not allowed").
+            changes.push((crate::baseobjspace::str_utf8_w(key)?.to_string(), value));
+        } else {
+            // Python call syntax guarantees string keyword names.  Keep a
+            // defensive non-string marker without invoking user `repr`
+            // while the copied structseq fields are held in raw locals.
+            changes.push(("<non-string>".to_string(), value));
+        }
+    }
     let unexpected: Vec<String> = changes
         .iter()
         .filter(|(key, _)| !fields.contains(key) && !extra_fields.contains(key))
@@ -344,8 +346,16 @@ fn structseq_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     if !unsafe { pyre_object::is_str(attr_obj) } {
         return Err(PyError::type_error("attribute name must be string"));
     }
-    let attr = unsafe { pyre_object::w_str_get_value(attr_obj) };
     let cls = unsafe { (*inst).w_class };
+    let Some(attr) = (unsafe { pyre_object::w_str_get_value_opt(attr_obj) }) else {
+        let cls_name = unsafe { pyre_object::w_type_get_name(cls) };
+        let text = unsafe { pyre_object::w_str_get_wtf8(attr_obj) };
+        let mut msg =
+            rustpython_wtf8::Wtf8Buf::from(format!("'{cls_name}' object has no attribute '"));
+        msg.push_wtf8(text);
+        msg.push_str("'");
+        return Err(PyError::attribute_error(msg));
+    };
     // `attr not in type(self).__dict__` — own-dict membership, not MRO.
     let in_type_dict = crate::type_dict_contains(cls, attr);
     if !in_type_dict {
@@ -451,7 +461,9 @@ pub(crate) fn structseq_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, P
                 if !unsafe { pyre_object::is_str(key) } {
                     return true;
                 }
-                let key = unsafe { pyre_object::w_str_get_value(key) };
+                let Some(key) = (unsafe { pyre_object::w_str_get_value_opt(key) }) else {
+                    return true;
+                };
                 !allowed.iter().any(|name| name == key)
             });
         if has_unexpected {

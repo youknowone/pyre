@@ -1382,7 +1382,15 @@ pub unsafe fn w_type_peek_name_obj(obj: PyObjectRef) -> PyObjectRef {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_set_name(obj: PyObjectRef, w_name: PyObjectRef) {
     let t = &mut *(obj as *mut W_TypeObject);
-    *t.name = crate::w_str_get_value(w_name).to_string();
+    // SURROGATE-NAME: `name` is `*mut String` (`NameStorage = String`).
+    // `w_type_get_name` returns `&str` and is read from the interpreter, the
+    // JIT GC trace, cpyext, and extension modules, so this slot is not switched
+    // to `Wtf8Buf` here. A lone surrogate has no UTF-8 `String` that is not
+    // U+FFFD; only a name with a `&str` view updates the slot. `w_name` still
+    // keeps the assigned object.
+    if let Some(name) = crate::w_str_get_value_opt(w_name) {
+        *t.name = name.to_string();
+    }
     t.w_name = w_name;
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }

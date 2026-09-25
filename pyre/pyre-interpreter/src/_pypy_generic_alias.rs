@@ -970,7 +970,7 @@ pub(crate) fn dir_list(ga: PyObjectRef) -> crate::PyResult {
         if let Some(item) = unsafe { w_list_getitem(dir_origin, i as i64) }
             && unsafe { is_str(item) }
         {
-            names.push(unsafe { w_str_get_value(item) }.to_string());
+            names.push(crate::baseobjspace::str_utf8_w(item)?.to_string());
         }
     }
     names.sort();

@@ -15,6 +15,7 @@
 //! so the PyPy `__init__` invariant chain runs once.
 
 use pyre_object::PyObjectRef;
+use rustpython_wtf8::Wtf8Buf;
 
 /// The `%T` conversion `oefmt` applies, for the `*args` / `**kwargs` parity
 /// messages below ("argument after * must be an iterable, not %T", "argument
@@ -963,7 +964,7 @@ impl Arguments {
             for (w_name, w_value) in names.iter().zip(values.iter()) {
                 let key = unsafe {
                     if pyre_object::is_str(*w_name) {
-                        pyre_object::w_str_get_value(*w_name).to_string()
+                        crate::baseobjspace::str_utf8_w(*w_name)?.to_string()
                     } else {
                         // argument.py:72 — `space.text_w(...)`.  PyPy's
                         // `_typed_unwrap_error` (baseobjspace.py)
@@ -1214,12 +1215,15 @@ impl Arguments {
                     // OperationError propagates back to the caller as a
                     // TypeError.  Pyre mirrors that propagation rather
                     // than silently substituting an empty string.
-                    let mut name = String::new();
+                    let mut name = Wtf8Buf::new();
                     if num_remainingkwds == 1 {
                         for (i, &w_n) in names_w.iter().enumerate() {
                             if !mapping_contains(&mapping, i as isize) {
                                 if unsafe { pyre_object::is_str(w_n) } {
-                                    name = unsafe { pyre_object::w_str_get_value(w_n).to_string() };
+                                    // `text_w` returns the raw buffer. A lone
+                                    // surrogate is still the unexpected name.
+                                    name =
+                                        unsafe { pyre_object::w_str_get_wtf8(w_n) }.to_wtf8_buf();
                                 } else {
                                     // baseobjspace.py `_typed_unwrap_error`
                                     // → `TypeError("expected str, got %T object")`.
@@ -1426,11 +1430,13 @@ impl Arguments {
     ) -> Result<usize, crate::PyError> {
         match self.match_signature(w_firstarg, scope_w, signature, defaults_w, w_kw_defs, 0) {
             Ok(()) => Ok(signature.scope_length()),
-            Err(MatchSignatureError::Shape(e)) => Err(crate::PyError::type_error(format!(
-                "{}() {}",
-                fnname,
-                e.getmsg()
-            ))),
+            Err(MatchSignatureError::Shape(e)) => {
+                let msg = e.getmsg_wtf8();
+                Err(crate::PyError::type_error(crate::display::wtf8_format!(
+                    format!("{fnname}() "),
+                    msg
+                )))
+            }
             Err(MatchSignatureError::Py(e)) => Err(e),
         }
     }
@@ -1473,14 +1479,19 @@ impl Arguments {
                         fnname,
                     )));
                 }
-                let msg = ArgErr::UnknownKwds { num_kwds, kwd_name }.getmsg();
-                Err(crate::PyError::type_error(format!("{}() {}", fnname, msg)))
+                let msg = ArgErr::UnknownKwds { num_kwds, kwd_name }.getmsg_wtf8();
+                Err(crate::PyError::type_error(crate::display::wtf8_format!(
+                    format!("{fnname}() "),
+                    msg
+                )))
             }
-            Err(MatchSignatureError::Shape(e)) => Err(crate::PyError::type_error(format!(
-                "{}() {}",
-                fnname,
-                e.getmsg()
-            ))),
+            Err(MatchSignatureError::Shape(e)) => {
+                let msg = e.getmsg_wtf8();
+                Err(crate::PyError::type_error(crate::display::wtf8_format!(
+                    format!("{fnname}() "),
+                    msg
+                )))
+            }
             Err(MatchSignatureError::Py(e)) => Err(e),
         }
     }
@@ -1656,7 +1667,7 @@ pub fn match_keywords(
             // 313-315 `_typed_unwrap_error` message).
             if (blindargs as isize) <= j {
                 let name = if !w_name.is_null() && unsafe { pyre_object::is_str(w_name) } {
-                    unsafe { pyre_object::w_str_get_value(w_name).to_string() }
+                    unsafe { crate::baseobjspace::str_utf8_w(w_name)?.to_string() }
                 } else {
                     let tp = type_name_of(w_name);
                     return Err(MatchSignatureError::Py(crate::PyError::type_error(
@@ -1786,7 +1797,7 @@ pub enum ArgErr {
     /// keyword_names_w list to extract a single offending name when
     /// `num_remainingkwds == 1`; pyre stores the resolved name string
     /// directly so the formatter can stay free of space refs.
-    UnknownKwds { num_kwds: usize, kwd_name: String },
+    UnknownKwds { num_kwds: usize, kwd_name: Wtf8Buf },
     /// argument.py `ArgErrPosonlyAsKwds(posonly_kwds)`.
     PosonlyAsKwds { posonly_kwds: Vec<String> },
 }
@@ -1798,6 +1809,23 @@ impl ArgErr {
     /// `ArgErrMultipleValues.getmsg`, :620-627
     /// `ArgErrUnknownKwds.getmsg`, :635-640
     /// `ArgErrPosonlyAsKwds.getmsg` — line-by-line ports.
+    /// Same text as [`Self::getmsg`], keeping a lone surrogate in the
+    /// unexpected-keyword name (`text_w` returns the raw buffer).
+    pub fn getmsg_wtf8(&self) -> Wtf8Buf {
+        match self {
+            ArgErr::UnknownKwds {
+                num_kwds: 1,
+                kwd_name,
+            } => {
+                let mut msg = Wtf8Buf::from("got an unexpected keyword argument '");
+                msg.push_wtf8(kwd_name);
+                msg.push_str("'");
+                msg
+            }
+            other => Wtf8Buf::from(other.getmsg()),
+        }
+    }
+
     pub fn getmsg(&self) -> String {
         match self {
             ArgErr::Missing {
@@ -1986,12 +2014,12 @@ mod tests {
     fn arg_err_unknown_kwds_branches() {
         let one = ArgErr::UnknownKwds {
             num_kwds: 1,
-            kwd_name: "wibble".to_string(),
+            kwd_name: Wtf8Buf::from("wibble"),
         };
         assert_eq!(one.getmsg(), "got an unexpected keyword argument 'wibble'");
         let many = ArgErr::UnknownKwds {
             num_kwds: 3,
-            kwd_name: String::new(),
+            kwd_name: Wtf8Buf::new(),
         };
         assert_eq!(many.getmsg(), "got 3 unexpected keyword arguments");
     }
@@ -2369,7 +2397,7 @@ mod tests {
         assert_eq!(names.len(), 1);
         assert_eq!(values.len(), 1);
         unsafe {
-            assert_eq!(pyre_object::w_str_get_value(names[0]), "k");
+            assert_eq!(pyre_object::w_str_get_wtf8(names[0]), "k");
             assert_eq!(pyre_object::w_int_get_value(values[0]), 99);
         }
     }

@@ -360,7 +360,7 @@ fn resolve_from_tuple(t: PyObjectRef) -> Result<usize, pyre_interpreter::PyError
     let handle_obj = pyre_interpreter::baseobjspace::getattr_str(dll_obj, "_handle")?;
     let handle = pyre_interpreter::baseobjspace::int_w(handle_obj)? as usize;
     let name_bytes: Vec<u8> = if unsafe { pyre_object::is_str(name_obj) } {
-        unsafe { pyre_object::w_str_get_value(name_obj) }
+        unsafe { pyre_object::w_str_get_wtf8(name_obj) }
             .as_bytes()
             .to_vec()
     } else if unsafe { pyre_object::is_bytes(name_obj) } {
@@ -770,7 +770,7 @@ fn reject_kwargs(kwargs: Option<PyObjectRef>) -> Result<(), pyre_interpreter::Py
     let Some(kw) = kwargs else { return Ok(()) };
     for (key_obj, _) in unsafe { pyre_object::w_dict_items(kw) } {
         if unsafe { pyre_object::is_str(key_obj) }
-            && unsafe { pyre_object::w_str_get_value(key_obj) } == "__pyre_kw__"
+            && unsafe { pyre_object::w_str_get_wtf8(key_obj) } == "__pyre_kw__"
         {
             continue;
         }
@@ -1604,7 +1604,11 @@ fn build_callargs(
             .then(|| unsafe { pyre_object::w_tuple_getitem(item, 1) })
             .flatten()
             .filter(|&n| unsafe { pyre_object::is_str(n) })
-            .map(|n| unsafe { pyre_object::w_str_get_value(n) }.to_string());
+            .and_then(|n| {
+                pyre_interpreter::baseobjspace::str_utf8_w(n)
+                    .ok()
+                    .map(str::to_string)
+            });
         let defval = if item_len > 2 {
             unsafe { pyre_object::w_tuple_getitem(item, 2) }
         } else {

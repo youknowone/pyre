@@ -96,30 +96,32 @@ fn get_codepoint(
         if can_be_none {
             return Ok(None);
         }
-        return Err(PyError::type_error(format!(
-            "\"{name}\" must be {}, not {}",
-            codepoint_kind(can_be_none),
-            unsafe { pyre_interpreter::baseobjspace::getfulltypename(w_src) },
-        )));
+        return Err(PyError::type_error(
+            pyre_interpreter::display::wtf8_format!(
+                format!("\"{name}\" must be {}, not ", codepoint_kind(can_be_none)),
+                unsafe { pyre_interpreter::baseobjspace::getfulltypename(w_src) },
+            ),
+        ));
     }
     if !unsafe { pyre_object::is_str(w_src) } {
-        return Err(PyError::type_error(format!(
-            "\"{name}\" must be {}, not {}",
-            codepoint_kind(can_be_none),
-            unsafe { pyre_interpreter::baseobjspace::getfulltypename(w_src) },
-        )));
+        return Err(PyError::type_error(
+            pyre_interpreter::display::wtf8_format!(
+                format!("\"{name}\" must be {}, not ", codepoint_kind(can_be_none)),
+                unsafe { pyre_interpreter::baseobjspace::getfulltypename(w_src) },
+            ),
+        ));
     }
-    let s = unsafe { pyre_object::w_str_get_value(w_src) };
-    let mut chars = s.chars();
-    if let Some(c) = chars.next()
-        && chars.next().is_none()
+    let s = unsafe { pyre_object::w_str_get_wtf8(w_src) };
+    let mut cps = s.code_points();
+    if let Some(cp) = cps.next()
+        && cps.next().is_none()
     {
-        return Ok(Some(c as u32));
+        return Ok(Some(cp.to_u32()));
     }
     Err(PyError::type_error(format!(
         "\"{name}\" must be {}, not a string of length {}",
         codepoint_kind(can_be_none),
-        s.chars().count(),
+        s.code_points().count(),
     )))
 }
 
@@ -151,12 +153,14 @@ fn get_str(w_src: PyObjectRef, default: &str, name: &str) -> Result<String, PyEr
         return Ok(default.to_string());
     }
     if !unsafe { pyre_object::is_str(w_src) } {
-        return Err(PyError::type_error(format!(
-            "\"{name}\" must be a string, not {}",
-            unsafe { pyre_interpreter::baseobjspace::getfulltypename(w_src) },
-        )));
+        return Err(PyError::type_error(
+            pyre_interpreter::display::wtf8_format!(
+                format!("\"{name}\" must be a string, not "),
+                unsafe { pyre_interpreter::baseobjspace::getfulltypename(w_src) },
+            ),
+        ));
     }
-    Ok(unsafe { pyre_object::w_str_get_value(w_src) }.to_string())
+    Ok(pyre_interpreter::baseobjspace::str_utf8_w(w_src)?.to_string())
 }
 
 /// `dialect_check_char` / `dialect_check_chars` — the cross-field
@@ -387,11 +391,11 @@ fn read_char_field(d: PyObjectRef, name: &str) -> Result<Option<u32>, PyError> {
         return Ok(None);
     }
     if unsafe { pyre_object::is_str(v) } {
-        let mut chars = unsafe { pyre_object::w_str_get_value(v) }.chars();
-        if let Some(c) = chars.next()
-            && chars.next().is_none()
+        let mut cps = unsafe { pyre_object::w_str_get_wtf8(v) }.code_points();
+        if let Some(cp) = cps.next()
+            && cps.next().is_none()
         {
-            return Ok(Some(c as u32));
+            return Ok(Some(cp.to_u32()));
         }
     }
     Ok(None)
@@ -423,7 +427,7 @@ fn derive_config(d: PyObjectRef) -> Result<DialectConfig, PyError> {
     let lineterminator = {
         let v = pyre_interpreter::baseobjspace::getattr_str(d, "_csv_lineterminator")?;
         if unsafe { pyre_object::is_str(v) } {
-            unsafe { pyre_object::w_str_get_value(v) }.to_string()
+            pyre_interpreter::baseobjspace::str_utf8_w(v)?.to_string()
         } else {
             "\r\n".to_string()
         }
@@ -758,12 +762,15 @@ fn reader_next_inner(self_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
             )));
         }
         if !unsafe { pyre_object::is_str(line) } {
-            return Err(csv_error(format!(
-                "line {line_num}: iterator should return strings, not {} (the file should be opened in text mode)",
+            return Err(csv_error(pyre_interpreter::display::wtf8_format!(
+                format!("line {line_num}: iterator should return strings, not "),
                 unsafe { pyre_interpreter::baseobjspace::getfulltypename(line) },
+                " (the file should be opened in text mode)",
             )));
         }
-        let s = unsafe { pyre_object::w_str_get_value(line) };
+        // Field text is a `String`, so a lone surrogate has no encoding here.
+        // `str_utf8_w` reports UnicodeEncodeError ("surrogates not allowed").
+        let s = pyre_interpreter::baseobjspace::str_utf8_w(line)?;
         for c in s.chars() {
             let cp = c as u32;
             let is_nl = cp == 10 || cp == 13;

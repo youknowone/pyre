@@ -270,7 +270,7 @@ mod tests {
             assert!(is_module(obj));
             assert!(!is_int(obj));
             let w_name = w_module_get_name(obj);
-            assert_eq!(crate::w_str_get_value(w_name), "test_mod");
+            assert_eq!(crate::w_str_get_wtf8(w_name), "test_mod");
         }
     }
 }
