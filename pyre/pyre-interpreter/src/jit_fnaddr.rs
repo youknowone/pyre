@@ -2326,6 +2326,17 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::_pure_lookup_class_with_method_cache",
         pure_lookup_class_with_method_cache,
     );
+    // `celldict.py _getdictvalue_no_unwrapping_pure` over the interned key:
+    // the elidable module-dict probe LOAD_GLOBAL / LOAD_NAME reach through
+    // `getitem_str_w`.
+    let module_dict_getdictvalue_pure_w: extern "C" fn(i64, i64, i64) -> i64 =
+        pyre_object::celldict::__majit_call_target__getdictvalue_no_unwrapping_pure_w;
+    cpa3(
+        &mut entries,
+        "pyre_object::celldict::_getdictvalue_no_unwrapping_pure_w",
+        "pyre_object::_getdictvalue_no_unwrapping_pure_w",
+        module_dict_getdictvalue_pure_w,
+    );
     // `W_Super.getattribute` walks the MRO itself and reads each class's own
     // namespace, so it needs the single-type elidable rather than the
     // method-cache pair above.

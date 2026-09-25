@@ -408,7 +408,12 @@ pub unsafe fn store_would_bump_version(w_cell: Option<PyObjectRef>, w_value: PyO
 /// increasing counter — pointer-identity matches PyPy's `is` test
 /// because each `Box<VersionTag>` allocates a fresh address but a
 /// counter is JIT-friendlier and trivially `Copy`.
+///
+/// `repr(transparent)`: the tag is stored inline as one word, so the
+/// translator types a `.version` read as that integer word rather than as a
+/// pointer to a separate `VersionTag` instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
 pub struct VersionTag(pub u64);
 
 /// The serial [`VersionTag::fresh`] hands out — a process-global counter
@@ -531,6 +536,30 @@ fn module_dict_entries_get_iff(entries: &ModuleDictEntries, key: &str) -> bool {
 #[majit_macros::look_inside_iff(module_dict_entries_get_iff)]
 pub fn module_dict_entries_get(entries: &ModuleDictEntries, key: &str) -> Option<PyObjectRef> {
     entries.get(key).copied()
+}
+
+/// `celldict.py _getdictvalue_no_unwrapping_pure` over the interned key.
+///
+/// Upstream's `@jit.elidable_promote('0,1,2')` original is an elidable the
+/// JIT calls opaquely (`policy.py` rejects `_elidable_function_` graphs).
+/// RPython's `str` key is one GCREF; here it is the interned unicode object
+/// `getname_w` returns, and the result is a raw pointer (null for a missing
+/// key) because the residual-call ABI carries one word per argument and
+/// result.  `version_tag` is the strategy's quasi-immutable version, the
+/// elidable's key rather than an input the body reads.
+///
+/// # Safety
+/// `w_dict` must be a module dict and `w_key` an exact `str`.
+#[majit_macros::elidable]
+pub unsafe fn _getdictvalue_no_unwrapping_pure_w(
+    w_dict: PyObjectRef,
+    w_key: PyObjectRef,
+    version_tag: u64,
+) -> PyObjectRef {
+    let _ = version_tag;
+    let key = unsafe { crate::unicodeobject::w_str_get_value(w_key) };
+    unsafe { crate::dictmultiobject::w_module_dict_module_storage(w_dict).get(key) }
+        .unwrap_or(std::ptr::null_mut())
 }
 
 /// The store side of [`module_dict_entries_get`] — `celldict.py getdictvalue_no_unwrapping`'s
@@ -1024,7 +1053,14 @@ impl ModuleDictStrategy {
         w_dict: PyObjectRef,
         w_key: PyObjectRef,
     ) -> Option<PyObjectRef> {
-        self._getdictvalue_no_unwrapping_pure_w(self.version, w_dict, w_key)
+        // `celldict.py getdictvalue_no_unwrapping`: `self = jit.promote(self)`
+        // and `@jit.elidable_promote('0,1,2')` promotes `self`, `version` and
+        // `w_dict` ahead of the elidable call.
+        let _ = majit_ir::jit::promote(self as *const Self as usize);
+        let version = majit_ir::jit::promote(self.version.0);
+        let w_dict = majit_ir::jit::promote(w_dict);
+        let raw = unsafe { _getdictvalue_no_unwrapping_pure_w(w_dict, w_key, version) };
+        if raw.is_null() { None } else { Some(raw) }
     }
 
     /// `celldict.py _getdictvalue_no_unwrapping_pure` — keep the module dict
@@ -1042,24 +1078,6 @@ impl ModuleDictStrategy {
         w_dict: PyObjectRef,
         key: &str,
     ) -> Option<PyObjectRef> {
-        unsafe { crate::dictmultiobject::w_module_dict_module_storage(w_dict).get(key) }
-    }
-
-    /// Same elidable as [`Self::_getdictvalue_no_unwrapping_pure`]. The key
-    /// is the interned unicode GCREF (`celldict.py`
-    /// `_getdictvalue_no_unwrapping_pure`).
-    #[majit_macros::elidable_promote(promote_args = "0,1,2")]
-    #[expect(
-        clippy::not_unsafe_ptr_arg_deref,
-        reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the object-space boundary"
-    )]
-    pub fn _getdictvalue_no_unwrapping_pure_w(
-        &self,
-        _version: VersionTag,
-        w_dict: PyObjectRef,
-        w_key: PyObjectRef,
-    ) -> Option<PyObjectRef> {
-        let key = unsafe { crate::unicodeobject::w_str_get_value(w_key) };
         unsafe { crate::dictmultiobject::w_module_dict_module_storage(w_dict).get(key) }
     }
 
