@@ -11050,6 +11050,32 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // Clause-bound `PartialEq::eq` / `ne` (`Q: Eq` in
+                // `Equivalent::equivalent`) is the comparison itself.
+                // Emit `BinOp` so the pairtype picks `ll_streq` / `int_eq`
+                // from the operand types.  An impl whose body is present
+                // is not this arm; it is traced as that function.
+                if args.len() == 2
+                    && let Some(op) = self.partial_eq_clause_binop(&reg)
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::BinOp {
+                            op,
+                            lhs: args[0].clone(),
+                            rhs: args[1].clone(),
+                            result_ty: ValueType::Int,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `w_str_get_wtf8(obj)` is `_utf8`.  The receiver is a
                 // `PyObjectRef`, so aliasing dest to args[0] would paint
                 // dest `SomeInstance(pyobject::PyObject)` and every later
@@ -17204,6 +17230,27 @@ impl<'a> Lowering<'a> {
                 .is_some_and(Self::fun_borrow_body_is_present),
             _ => false,
         }
+    }
+
+    /// `core::cmp::PartialEq::{eq,ne}` still bound to a clause, not a
+    /// selected impl.  The comparison is a `BinOp`; a resolved impl
+    /// with a body stays a call of that body.
+    fn partial_eq_clause_binop(&self, reg: &RegularCall) -> Option<String> {
+        let CallKind::Trait(v) = &reg.kind else {
+            return None;
+        };
+        let fn_id = v.as_array()?.get(2)?.as_u64()?;
+        let path = self.llbc.fn_by_id(fn_id)?.item_meta.name_path();
+        let leaf = match path.as_str() {
+            "core::cmp::PartialEq::eq" => "eq",
+            "core::cmp::PartialEq::ne" => "ne",
+            _ => return None,
+        };
+        let tref = v.as_array()?.first()?;
+        if traitref_impl_id(tref, self.llbc, 0).is_some() {
+            return None;
+        }
+        Some(leaf.to_string())
     }
 
     fn borrow_call_is_unresolved_clause(&self, reg: &RegularCall) -> bool {
