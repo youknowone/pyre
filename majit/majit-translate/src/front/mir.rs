@@ -11548,10 +11548,7 @@ impl<'a> Lowering<'a> {
                 // its `pyre_` fence admits exactly the three element banks
                 // named above, all of them one word.
                 if let Some((item_ty, array_type_id)) = index_element
-                    && (workspace_index
-                        || array_type_id.is_some()
-                        || element_is_addressable
-                        || vable_array_var.is_some())
+                    && (workspace_index || array_type_id.is_some() || element_is_addressable)
                 {
                     // `&frame.items[i]` is a bounds-checked index (`nolength:
                     // false` below). When `items` is a declared virtualizable
