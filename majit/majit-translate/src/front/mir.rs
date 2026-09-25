@@ -7244,6 +7244,9 @@ impl<'a> Lowering<'a> {
             // itself. Aliasing the dest local to the referent Variable
             // keeps the IR small, treating `&x` as a same-Variable copy.
             Rvalue::Ref { place, .. } => {
+                if let Some(address) = self.lower_inline_substruct_address(mir_bb, &place)? {
+                    return Ok((None, address));
+                }
                 let projection = Self::place_ref_is_address_of(&place);
                 let before = self.graph.block(self.block_id[mir_bb]).operations.len();
                 let v = self.resolve_place(mir_bb, place)?;
@@ -7255,6 +7258,9 @@ impl<'a> Lowering<'a> {
             // and references identically at the IR level (lifetime
             // tracking lives outside the JIT).
             Rvalue::RawPtr { place, .. } => {
+                if let Some(address) = self.lower_inline_substruct_address(mir_bb, &place)? {
+                    return Ok((None, address));
+                }
                 let projection = Self::place_ref_is_address_of(&place);
                 let before = self.graph.block(self.block_id[mir_bb]).operations.len();
                 let v = self.resolve_place(mir_bb, place)?;
@@ -8372,6 +8378,99 @@ impl<'a> Lowering<'a> {
     ///
     /// The `Deref` test is spelled as `resolve_place` and
     /// `emit_projection_write` already spell it, applied one level out.
+    /// Byte offset of `(*p).f` inside `*p` when `f` is a by-value struct
+    /// stored inline, so `&(*p).f` is an interior address rather than a word
+    /// the container holds.
+    ///
+    /// `jtransform.py rewrite_op_getsubstruct` lowers that access to
+    /// `int_add(p, offsetof(STRUCT, f))`.  The generic `Rvalue::Ref` arm
+    /// aliases a borrow to its referent's value, which for an inline struct
+    /// reads the substructure's first word and hands it on as the address.
+    /// The offset is Charon's layout for the build target, the same one the
+    /// descr layer records.  `None` leaves the place to the generic arm: a
+    /// non-deref container (a local aggregate), an enum payload, a field that
+    /// is itself a pointer or scalar, a `core`/`alloc`/`std` type the front
+    /// models by value, or a container without a resolved layout.
+    fn inline_substruct_field_offset(&self, place: &Place) -> Option<u64> {
+        let PlaceKind::Projection(inner, ProjectionElem::Tagged(elem)) = &place.kind else {
+            return None;
+        };
+        let PlaceKind::Projection(_, ProjectionElem::Atom(deref)) = &inner.kind else {
+            return None;
+        };
+        if deref != "Deref" {
+            return None;
+        }
+        let payload = elem.as_object()?.get("Field")?.as_array()?;
+        let [container, field_idx] = payload.as_slice() else {
+            return None;
+        };
+        let adt = container.as_object()?.get("Adt")?.as_array()?;
+        if adt.get(1).is_some_and(|variant| !variant.is_null()) {
+            return None;
+        }
+        let head = adt.first()?;
+        let owner_id = match head.as_u64() {
+            Some(id) => id,
+            None => head.get("id")?.get("Adt")?.as_u64()?,
+        };
+        let owner = self.llbc.type_by_id(owner_id)?;
+        if !matches!(owner.kind, TypeDeclKind::Struct(_)) {
+            return None;
+        }
+        let field_decl = self
+            .llbc
+            .type_by_id(adt_node_def_id(tyref_node(&place.ty, self.llbc)?)?)?;
+        let TypeDeclKind::Struct(fields) = &field_decl.kind else {
+            return None;
+        };
+        if fields.is_empty() || field_decl.is_repr_transparent() {
+            return None;
+        }
+        let field_path = field_decl.item_meta.name_path();
+        if ["core::", "alloc::", "std::"]
+            .iter()
+            .any(|prefix| field_path.starts_with(prefix))
+        {
+            return None;
+        }
+        let target = std::env::var("TARGET").unwrap_or_default();
+        owner
+            .layout_for_target(&target)?
+            .struct_field_offset(field_idx.as_u64()? as usize)
+    }
+
+    /// Lower `&(*p).f` / `&raw (*p).f` for an inline struct field as
+    /// `rewrite_op_getsubstruct` does.  Offset zero is `p` itself.  A nonzero
+    /// offset takes the same deferred refusal `rewrite_op_getfield` gives a
+    /// nonzero `getsubstruct`: an interior address cannot enter the Ref bank,
+    /// so the graph aborts the trace when it reaches the access.
+    fn lower_inline_substruct_address(
+        &mut self,
+        mir_bb: usize,
+        place: &Place,
+    ) -> Result<Option<Variable>, LowerError> {
+        let Some(offset) = self.inline_substruct_field_offset(place) else {
+            return Ok(None);
+        };
+        let PlaceKind::Projection(inner, _) = &place.kind else {
+            unreachable!("inline_substruct_field_offset matched a projection");
+        };
+        let base = self.resolve_place(mir_bb, clone_place(inner))?;
+        if offset != 0 {
+            let bb_id = self.block_id[mir_bb];
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::Abort {
+                    kind: crate::model::UnknownKind::UnsupportedExpr {
+                        variant: crate::model::UnsupportedExprKind::RawAddr,
+                    },
+                },
+            });
+        }
+        Ok(Some(base))
+    }
+
     fn place_ref_is_address_of(place: &Place) -> bool {
         match &place.kind {
             PlaceKind::Projection(_, ProjectionElem::Atom(s)) if s == "Deref" => false,
