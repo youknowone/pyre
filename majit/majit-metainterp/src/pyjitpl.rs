@@ -30071,12 +30071,14 @@ mod tests {
         }
         {
             let ctx = meta.trace_ctx().unwrap();
+            // No structured key: the banks are the declared greens, whose
+            // first int is the back-edge target (`next_instr`).
             ctx.set_driver_descriptor(crate::jitdriver::JitDriverStaticData::new(
-                vec![("g", Type::Int)],
+                vec![("next_instr", Type::Int), ("g", Type::Int)],
                 vec![("r", Type::Int)],
             ));
             ctx.close_green_pc = Some(pc);
-            ctx.close_greens = Some((vec![extra], Vec::new(), Vec::new()));
+            ctx.close_greens = Some((vec![pc, extra], Vec::new(), Vec::new()));
         }
         let closed = meta
             .trace_ctx()
