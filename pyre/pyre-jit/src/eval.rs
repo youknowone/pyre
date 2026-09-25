@@ -2908,11 +2908,17 @@ fn build_gc() -> Box<MiniMarkGC> {
     // wrapped value could be reclaimed while a still-installed
     // cell holds the pointer.  Mirrors `Cell`'s
     // `contents` registration (`nestedscope.rs`'s `Cell`).
-    let w_object_mutable_cell_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-        std::mem::size_of::<pyre_object::celldict::ObjectMutableCell>(),
-        object_tid,
-        pyre_object::celldict::W_OBJECT_MUTABLE_CELL_GC_PTR_OFFSETS.to_vec(),
-    ));
+    // `typeobject.py MutableCell(W_Root)` assigns no typedef, so
+    // `referents.py try_cast_gcref_to_w_root` returns None and the
+    // inspector looks through the cell.
+    let w_object_mutable_cell_tid = gc.register_type(
+        TypeInfo::object_subclass_with_gc_ptrs(
+            std::mem::size_of::<pyre_object::celldict::ObjectMutableCell>(),
+            object_tid,
+            pyre_object::celldict::W_OBJECT_MUTABLE_CELL_GC_PTR_OFFSETS.to_vec(),
+        )
+        .without_app_level_typedef(),
+    );
     debug_assert_eq!(
         w_object_mutable_cell_tid,
         pyre_object::celldict::W_OBJECT_MUTABLE_CELL_GC_TYPE_ID,
@@ -2926,10 +2932,13 @@ fn build_gc() -> Box<MiniMarkGC> {
         &pyre_object::celldict::OBJECT_MUTABLE_CELL_TYPE as *const _ as usize,
         w_object_mutable_cell_tid,
     );
-    let w_int_mutable_cell_tid = gc.register_type(TypeInfo::object_subclass(
-        std::mem::size_of::<pyre_object::celldict::IntMutableCell>(),
-        object_tid,
-    ));
+    let w_int_mutable_cell_tid = gc.register_type(
+        TypeInfo::object_subclass(
+            std::mem::size_of::<pyre_object::celldict::IntMutableCell>(),
+            object_tid,
+        )
+        .without_app_level_typedef(),
+    );
     debug_assert_eq!(
         w_int_mutable_cell_tid,
         pyre_object::celldict::W_INT_MUTABLE_CELL_GC_TYPE_ID,
@@ -2967,11 +2976,17 @@ fn build_gc() -> Box<MiniMarkGC> {
     // Weakref struct itself survives across collections; the
     // weakptr inside the Weakref is invalidated separately by the
     // collector's invalidate_*_weakrefs hooks.
-    let gc_weakref_box_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-        std::mem::size_of::<pyre_object::weakref::GcWeakrefBox>(),
-        object_tid,
-        pyre_object::weakref::GC_WEAKREF_BOX_GC_PTR_OFFSETS.to_vec(),
-    ));
+    // `new_pytype("__GcWeakrefBox")` is not a typedef, so
+    // `try_cast_gcref_to_w_root` rejects the box the same way it
+    // rejects `MutableCell`.
+    let gc_weakref_box_tid = gc.register_type(
+        TypeInfo::object_subclass_with_gc_ptrs(
+            std::mem::size_of::<pyre_object::weakref::GcWeakrefBox>(),
+            object_tid,
+            pyre_object::weakref::GC_WEAKREF_BOX_GC_PTR_OFFSETS.to_vec(),
+        )
+        .without_app_level_typedef(),
+    );
     debug_assert_eq!(
         gc_weakref_box_tid,
         pyre_object::weakref::GC_WEAKREF_BOX_GC_TYPE_ID,

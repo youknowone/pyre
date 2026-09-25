@@ -438,8 +438,17 @@ pub struct TypeInfo {
     /// is omitted from app-level `gc.get_objects()` enumeration.  This models
     /// 3.11+ interpreter frames: owning coroutine/traceback objects expose
     /// their relevant edges, while an unmaterialized execution frame is not
-    /// itself reported as an app-level referrer.
+    /// itself reported as an app-level referrer.  The frame still has a
+    /// typedef, so `referents._list_w_obj_referents` stops on it.
     pub hide_from_app_level_inspector: bool,
+    /// `referents.py try_cast_gcref_to_w_root` returns None for a `W_Root`
+    /// whose typedef is null (`MutableCell`, `WeakrefLifeline`).  Such an
+    /// instance is not an app-level object: `gc.get_objects` omits it and
+    /// `get_rpy_roots` / `get_rpy_referents` wrap the raw gcref, while
+    /// `_list_w_obj_referents` looks through it to the value it holds.
+    /// Distinct from `hide_from_app_level_inspector`, which still stops the
+    /// referents walk.
+    pub has_no_typedef: bool,
     /// One frontend-owned GC edge in the common OBJECT header that keeps
     /// runtime class metadata alive but is not an app-level referent.  PyPy's
     /// RPython objects carry their class in the non-GC `typeptr`; pyre's
@@ -511,6 +520,7 @@ impl TypeInfo {
             is_object: false,
             has_subclass_range: false,
             hide_from_app_level_inspector: false,
+            has_no_typedef: false,
             app_level_inspector_hidden_edge_offset: None,
             parent: None,
             subclassrange_min: 0,
@@ -539,6 +549,7 @@ impl TypeInfo {
             is_object: false,
             has_subclass_range: false,
             hide_from_app_level_inspector: false,
+            has_no_typedef: false,
             app_level_inspector_hidden_edge_offset: None,
             parent: None,
             subclassrange_min: 0,
@@ -613,6 +624,15 @@ impl TypeInfo {
         self
     }
 
+    /// Mark an OBJECT-layout `W_Root` that has no typedef.
+    /// `referents.py try_cast_gcref_to_w_root` rejects it, so app-level
+    /// inspection expands the instance instead of stopping on it, and
+    /// `gc.get_objects` does not list it.
+    pub fn without_app_level_typedef(mut self) -> Self {
+        self.has_no_typedef = true;
+        self
+    }
+
     /// Mark the frontend's managed mirror of RPython's non-GC type pointer.
     /// This changes app-level inspection only; ordinary GC tracing continues
     /// to visit the edge.
@@ -645,6 +665,7 @@ impl TypeInfo {
             is_object: false,
             has_subclass_range: false,
             hide_from_app_level_inspector: false,
+            has_no_typedef: false,
             app_level_inspector_hidden_edge_offset: None,
             parent: None,
             subclassrange_min: 0,
@@ -679,6 +700,7 @@ impl TypeInfo {
             is_object: true,
             has_subclass_range: true,
             hide_from_app_level_inspector: false,
+            has_no_typedef: false,
             app_level_inspector_hidden_edge_offset: None,
             parent: None,
             subclassrange_min: 0,
@@ -712,6 +734,7 @@ impl TypeInfo {
             is_object: true,
             has_subclass_range: true,
             hide_from_app_level_inspector: false,
+            has_no_typedef: false,
             app_level_inspector_hidden_edge_offset: None,
             parent: None,
             subclassrange_min: 0,
@@ -743,6 +766,7 @@ impl TypeInfo {
             is_object: true,
             has_subclass_range: true,
             hide_from_app_level_inspector: false,
+            has_no_typedef: false,
             app_level_inspector_hidden_edge_offset: None,
             parent: Some(parent_typeid),
             subclassrange_min: 0,
@@ -783,6 +807,7 @@ impl TypeInfo {
             is_object: true,
             has_subclass_range: true,
             hide_from_app_level_inspector: false,
+            has_no_typedef: false,
             app_level_inspector_hidden_edge_offset: None,
             parent: Some(parent_typeid),
             subclassrange_min: 0,
@@ -813,6 +838,7 @@ impl TypeInfo {
             is_object: true,
             has_subclass_range: true,
             hide_from_app_level_inspector: false,
+            has_no_typedef: false,
             app_level_inspector_hidden_edge_offset: None,
             parent: Some(parent_typeid),
             subclassrange_min: 0,
@@ -840,6 +866,7 @@ impl TypeInfo {
             is_object: false,
             has_subclass_range: false,
             hide_from_app_level_inspector: false,
+            has_no_typedef: false,
             app_level_inspector_hidden_edge_offset: None,
             parent: None,
             subclassrange_min: 0,
@@ -906,6 +933,7 @@ impl TypeInfo {
             is_object: false,
             has_subclass_range: false,
             hide_from_app_level_inspector: false,
+            has_no_typedef: false,
             app_level_inspector_hidden_edge_offset: None,
             parent: None,
             subclassrange_min: 0,
@@ -933,6 +961,7 @@ impl TypeInfo {
             is_object: false,
             has_subclass_range: false,
             hide_from_app_level_inspector: false,
+            has_no_typedef: false,
             app_level_inspector_hidden_edge_offset: None,
             parent: None,
             subclassrange_min: 0,
@@ -976,6 +1005,7 @@ impl TypeInfo {
             is_object: false,
             has_subclass_range: false,
             hide_from_app_level_inspector: false,
+            has_no_typedef: false,
             app_level_inspector_hidden_edge_offset: None,
             parent: None,
             subclassrange_min: 0,

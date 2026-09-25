@@ -6094,10 +6094,12 @@ impl MiniMarkGC {
                 _ => false,
             };
             let type_id = unsafe { (*hdr).type_id() };
+            let info = self.types.get(type_id);
             if is_requested_generation
                 && !unsafe { (*hdr).has_flag(GcFlags::GCFLAG_DUMMY) }
-                && self.types.get(type_id).is_object
-                && !self.types.get(type_id).hide_from_app_level_inspector
+                && info.is_object
+                && !info.hide_from_app_level_inspector
+                && !info.has_no_typedef
             {
                 result.push(gcref);
             }
@@ -6330,15 +6332,18 @@ impl MiniMarkGC {
     }
 
     /// `referents.py try_cast_gcref_to_w_root`.  The translated
-    /// `T_IS_RPYTHON_INSTANCE` bit is `TypeInfo::is_object`; the explicit hide
-    /// bit covers internal structs that share a Python-object prefix but have
-    /// no app-level typedef.
+    /// `T_IS_RPYTHON_INSTANCE` bit is `TypeInfo::is_object`.  Two flags then
+    /// reject an instance: `hide_from_app_level_inspector` (a frame that has
+    /// a typedef but is omitted from `gc.get_objects`) and `has_no_typedef`
+    /// (a `W_Root` whose typedef is null).
     ///
     /// This is the predicate behind the `gc.get_objects` filter and the
     /// `get_rpy_*` wrap decision. The referents walk has one deliberate extra
     /// boundary: an OBJECT-layout value hidden from enumeration (the
-    /// CPython-compatible execution-frame shape described on
-    /// `TypeInfo::hide_from_app_level_inspector`) still stops traversal.
+    /// execution-frame shape described on
+    /// `TypeInfo::hide_from_app_level_inspector`) still stops traversal.  A
+    /// typedef-less `W_Root` does not: `try_cast_gcref_to_w_root` returns
+    /// None and `_list_w_obj_referents` expands it.
     fn is_app_level_object_ref(&self, obj: GcRef) -> bool {
         // `referents.py rgc.get_gcflag_dummy(gcref)`: a dummy stands in for
         // an object the collector no longer holds, so it is never an app-level
@@ -6356,16 +6361,16 @@ impl MiniMarkGC {
             return false;
         }
         let info = self.types.get(type_id);
-        info.is_object && !info.hide_from_app_level_inspector
+        info.is_object && !info.hide_from_app_level_inspector && !info.has_no_typedef
     }
 
     /// Whether app-level referents inspection must stop at `obj`.
     ///
-    /// PyPy `referents._list_w_obj_referents` stops at every valid `W_Root`.
-    /// Pyre additionally omits executing frames from `gc.get_objects()` to
-    /// match CPython, but a frame is still a Python object and
-    /// `traceback.tb_frame` remains a direct referent boundary. Looking
-    /// through it incorrectly attributes all frame locals to the traceback.
+    /// `referents._list_w_obj_referents` stops when
+    /// `try_cast_gcref_to_w_root` returns a `W_Root`.  An execution frame is
+    /// omitted from `gc.get_objects` but still has a typedef, so it remains
+    /// a boundary.  A typedef-less `W_Root` (`TypeInfo::has_no_typedef`) is
+    /// expanded, the same as any other non-`W_Root` gcref.
     fn is_app_level_referent_boundary(&self, obj: GcRef) -> bool {
         // Preserve every ordinary app-level boundary first, including
         // prebuilt/foreign W_Root objects which are not managed by this heap.
@@ -6380,7 +6385,11 @@ impl MiniMarkGC {
         let Some(type_id) = self.get_actual_typeid(obj) else {
             return false;
         };
-        (type_id as usize) < self.types.len() && self.types.get(type_id).is_object
+        if (type_id as usize) >= self.types.len() {
+            return false;
+        }
+        let info = self.types.get(type_id);
+        info.is_object && !info.has_no_typedef
     }
 
     /// `pypy/module/gc/referents.py _list_w_obj_referents`: visit the
@@ -11045,6 +11054,45 @@ mod tests {
         assert_eq!(referents, vec![tail]);
 
         for object in [holder, hidden, dummy, leaf, tail] {
+            assert!(!unsafe { (*header_of(object.0)).has_flag(GcFlags::GCFLAG_EXTRA) });
+        }
+        gc.roots.clear();
+    }
+
+    /// A typedef-less OBJECT (`referents.py try_cast_gcref_to_w_root` returns
+    /// None) is expanded by `get_referents` and omitted from `get_objects`.
+    /// Unlike `hide_from_app_level_inspector`, it is not a referent boundary.
+    #[test]
+    fn get_referents_looks_through_typedef_less_object() {
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        let object_tid = gc.register_type(TypeInfo::object_with_gc_ptrs(ptr_size, vec![0]));
+        let cell_tid = gc.register_type(
+            TypeInfo::object_subclass_with_gc_ptrs(ptr_size, object_tid, vec![0])
+                .without_app_level_typedef(),
+        );
+
+        let value = gc.alloc_with_type(object_tid, ptr_size);
+        let cell = gc.alloc_with_type(cell_tid, ptr_size);
+        let mut holder = gc.alloc_with_type(object_tid, ptr_size);
+        unsafe {
+            *(cell.0 as *mut GcRef) = value;
+            *(holder.0 as *mut GcRef) = cell;
+            gc.roots.add(&mut holder);
+        }
+
+        let mut referents = Vec::new();
+        gc.do_get_referents(holder, &mut |gcref| referents.push(gcref));
+        assert_eq!(referents, vec![value]);
+        assert!(!gc.is_app_level_object_ref(cell));
+        assert!(!gc.is_app_level_referent_boundary(cell));
+
+        let mut objects = Vec::new();
+        gc.do_get_objects(-1, &mut |gcref| objects.push(gcref));
+        assert!(!objects.contains(&cell));
+        assert!(objects.contains(&value));
+        assert!(objects.contains(&holder));
+        for object in [holder, cell, value] {
             assert!(!unsafe { (*header_of(object.0)).has_flag(GcFlags::GCFLAG_EXTRA) });
         }
         gc.roots.clear();
