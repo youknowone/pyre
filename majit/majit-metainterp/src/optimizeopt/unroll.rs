@@ -10407,4 +10407,95 @@ mod tests {
             "PureOp.add_op_to_short must record CALL_PURE, not the demoted CALL"
         );
     }
+
+    /// virtualstate.py `VirtualStateInfo._generalization_of_structpart` matches
+    /// two virtual instances by `known_class.same_constant` and fielddescr
+    /// identity, not by the allocation's SizeDescr object. A guard-failure
+    /// bridge whose `new_with_vtable` carries a different SizeDescr allocation
+    /// of the same class must still jump to the peeled target, and must not
+    /// force the virtual (`NewWithVtable` in the bridge).
+    #[test]
+    fn bridge_virtual_of_the_same_class_jumps_to_the_peeled_target() {
+        use crate::history::TargetToken;
+        use crate::optimizeopt::info::AbstractVirtualPtrInfo;
+        use crate::optimizeopt::virtualstate::{VirtualState, VirtualStateInfo};
+        use std::sync::Arc;
+
+        use majit_ir::descr::SimpleSizeDescr;
+        use majit_ir::ptr_info::{PtrInfo, VirtualInfo};
+
+        let vtable = 0x1000i64;
+        let size_of = |index: u32| {
+            Arc::new(SimpleSizeDescr::with_vtable(index, 16, 7, vtable as usize)) as DescrRef
+        };
+        let target_descr = size_of(1);
+        let bridge_descr = size_of(2);
+        assert_ne!(
+            majit_ir::descr_identity(&target_descr),
+            majit_ir::descr_identity(&bridge_descr)
+        );
+
+        let virtual_shape = |descr: DescrRef| VirtualStateInfo::Virtual {
+            descr,
+            known_class: Some(vtable),
+            ob_type_descr: None,
+            fields: Vec::new(),
+            field_descrs: Vec::new(),
+        };
+        let target_vs = VirtualState::new(vec![virtual_shape(target_descr.clone())]);
+        let incoming = VirtualState::new(vec![virtual_shape(bridge_descr.clone())]);
+
+        let mut optimizer = Optimizer::new();
+        let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(1, 0);
+        let arg = OpRef::ref_op(11);
+        let arg_box = ctx.materialize_operand_at(arg);
+        ctx.set_ptr_info(
+            &arg_box,
+            PtrInfo::Virtual(VirtualInfo {
+                descr: bridge_descr,
+                known_class: Some(vtable),
+                ob_type_descr: None,
+                fields: Default::default(),
+                last_guard_pos: -1,
+                avpi: AbstractVirtualPtrInfo::new(),
+            }),
+        );
+
+        let mut target_tokens = vec![TargetToken::new_loop(1)];
+        let peeled = target_tokens[0].as_jump_target_descr();
+        target_tokens[0].virtual_state = Some(target_vs);
+
+        let unroll = OptUnroll::default();
+        let vs = unroll.jump_to_existing_trace_with_vs(
+            &[arg],
+            None,
+            &mut target_tokens,
+            &mut optimizer,
+            &mut ctx,
+            false,
+            &[arg],
+            Some(incoming),
+        );
+        assert!(
+            vs.is_none(),
+            "same virtual class must jump to the peeled target, not fall through \
+             to the preamble"
+        );
+        let jump = ctx
+            .new_operations
+            .last()
+            .expect("a successful match emits the retargeted JUMP");
+        assert_eq!(jump.opcode, OpCode::Jump);
+        let jump_descr = jump.getdescr().expect("JUMP carries the target descr");
+        assert_eq!(
+            majit_ir::descr_identity(&jump_descr),
+            majit_ir::descr_identity(&peeled)
+        );
+        assert!(
+            ctx.new_operations
+                .iter()
+                .all(|op| op.opcode != OpCode::NewWithVtable),
+            "matching virtuals stay virtual; the bridge must not materialize them"
+        );
+    }
 }

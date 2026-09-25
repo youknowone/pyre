@@ -1809,29 +1809,22 @@ impl VirtualState {
             // positional pairing.
             (
                 VirtualStateInfo::Virtual {
-                    descr: ed,
                     known_class: ekc,
                     fields: ef,
                     field_descrs: efd,
                     ..
                 },
                 VirtualStateInfo::Virtual {
-                    descr: id,
                     known_class: ikc,
                     fields: if_,
                     field_descrs: ifd,
                     ..
                 },
             ) => {
-                // virtualstate.py VirtualStateInfo._generalization_of_structpart:
-                // `known_class.same_constant(other.known_class)`. The descr
-                // identity check is pyre-additional (descr carries typedescr-
-                // like struct identity); RPython relies on known_class +
-                // fielddescrs `is` checks alone. Object identity (Arc::as_ptr)
-                // per virtualstate.py `is not` shape.
-                if descr_identity(ed) != descr_identity(id) {
-                    return Err(VirtualStatesCantMatch::default());
-                }
+                // virtualstate.py VirtualStateInfo._generalization_of_structpart
+                // checks `known_class.same_constant` only. SizeDescr Arc
+                // identity is not part of that check: two `new_with_vtable`
+                // results of one class do not share one descr allocation.
                 // known_class.same_constant(other.known_class) is True only for
                 // two equal ConstInts; an absent (None) class on either side
                 // rejects, mirroring same_constant's isinstance gate.
