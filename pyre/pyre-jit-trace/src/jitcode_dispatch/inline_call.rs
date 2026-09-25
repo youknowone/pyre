@@ -6524,9 +6524,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // EXACT int/float only.  These feed `fbw_callee_body_replay_scan`, whose
     // question is "will the walker specialize this body's BINARY_OP to a native
     // op, leaving no residual to replay?".  The walker's specialization admits
-    // only exact builtin numbers (`walker_int_specialization_operands` /
-    // `walker_float_specialization_operands` both require
-    // `is_exact_builtin_instance`), because a numeric subclass keeps the
+    // only exact builtin numbers (`is_exact_builtin_instance`), because a numeric subclass keeps the
     // builtin layout while its Python-visible class lives in `w_class` and may
     // define its own `__add__`.  `is_int` / `is_float` are `ob_type` checks
     // that a subclass passes, so using them here claims a specialization that
@@ -14460,13 +14458,6 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
                 })? {
                     return Ok(outcome.into());
                 }
-                if let Some(outcome) = spec_gate(SpecFold::BinaryOpFloat, || {
-                    super::specialize::try_emit_exact_float_binop(
-                        ctx, pc, op_tag, ref_args, dst, dst_bank,
-                    )
-                })? {
-                    return Ok(outcome.into());
-                }
                 if matches!(
                     pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag),
                     Some(pyre_interpreter::bytecode::BinaryOperator::Subscr)
@@ -15744,30 +15735,6 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
     }
 
     if dst_bank == 'r'
-        && args.len() == 1
-        && crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index).is_some_and(|jc| {
-            jc.code.as_ptr() == sub_body.code.as_ptr()
-                && (jc.name == "neg" || jc.name.ends_with("::neg"))
-        })
-    {
-        let dst = code[op.pc + 1 + 2 + arg_width] as usize;
-        if let Some(outcome) = spec_gate(SpecFold::UnaryNeg, || {
-            super::specialize::try_walker_orthodox_unary_neg(ctx, op.pc, &args, dst, dst_bank)
-        })? {
-            return Ok((outcome, op.next_pc));
-        }
-        if let Some(DispatchOutcome::SubReturn {
-            result: Some(boxed),
-        }) = spec_gate(SpecFold::UnaryNeg, || {
-            super::specialize::try_emit_exact_int_uneg(ctx, op.pc, &args, dst, dst_bank)
-        })? {
-            let concrete_for_shadow = concrete_from_recorded_opref(ctx, boxed);
-            write_ref_reg(ctx, op.pc, dst, boxed, concrete_for_shadow)?;
-            return Ok((DispatchOutcome::Continue, op.next_pc));
-        }
-    }
-
-    if dst_bank == 'r'
         && args.len() == 2
         && crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)
             .is_some_and(|jc| jc.code.as_ptr() == sub_body.code.as_ptr())
@@ -15820,14 +15787,6 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
             )
         })? {
             return Ok((outcome, op.next_pc));
-        }
-        if let Some(DispatchOutcome::SubReturn {
-            result: Some(boxed),
-        }) = spec_gate(SpecFold::BinaryOpFloat, || {
-            super::specialize::try_emit_exact_float_binop(ctx, op.pc, op_tag, &args, dst, dst_bank)
-        })? {
-            write_boxed(ctx, boxed)?;
-            return Ok((DispatchOutcome::Continue, op.next_pc));
         }
         // Named `add`/`mul` helpers are the same BINARY family as
         // `binary_value_from_tag`.  A Python forward dunder must be
@@ -16242,21 +16201,6 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
             )
         })? {
             return Ok((outcome, op.next_pc));
-        }
-        // Orthodox descent admits only exact int/bool.  Float (and a
-        // declined int walk) must not fall through to a successful
-        // `binary_value_from_tag` walk that residualizes `descr_add` as
-        // `CallMayForce` — that is the 19x `float_loop` hole.
-        if let Some(DispatchOutcome::SubReturn {
-            result: Some(boxed),
-        }) = spec_gate(SpecFold::BinaryOpFloat, || {
-            super::specialize::try_emit_exact_float_binop(
-                ctx, op.pc, op_tag, &ref_args, dst, dst_bank,
-            )
-        })? {
-            let concrete_for_shadow = concrete_from_recorded_opref(ctx, boxed);
-            write_ref_reg(ctx, op.pc, dst, boxed, concrete_for_shadow)?;
-            return Ok((DispatchOutcome::Continue, op.next_pc));
         }
         // Residual BINARY_OP's long/int family. Flatten lands bigint
         // `//` `%` `**` here, so the same folds must fire.

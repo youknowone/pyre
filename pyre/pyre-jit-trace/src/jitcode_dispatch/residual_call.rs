@@ -5894,17 +5894,15 @@ pub(crate) enum SpecializedBinop {
 /// Non-numeric operands stay an impure residual, so admitting them here would
 /// trigger the nested-residual 6421 abort storm.
 ///
-/// The accepted set is every tag handled either by the generated exact-int
-/// descent or by the remaining float specialization without an unsafe replay
-/// residual.  In-place tags select the same concrete builtin arithmetic as
-/// their plain forms, so the two forms are admitted together:
+/// The accepted set is every tag the generated descent records without an
+/// unsafe replay residual.  In-place tags select the same concrete builtin
+/// arithmetic as their plain forms, so the two forms are admitted together:
 ///
 /// - `Add` / `Subtract` / `Multiply` (+ in-place) — the generated
-///   `binary_value_from_tag` descent for exact ints, and `FloatAdd` /
-///   `FloatSub` / `FloatMul` in `try_walker_specialize_binary_op_float`.
-/// - `And` / `Or` / `Xor` (+ in-place) — `IntAnd` / `IntOr` / `IntXor`, also
-///   unconditional, but *int-only*: the float table falls through to
-///   `_ => return Ok(None)` for them.  Hence the separate
+///   `binary_value_from_tag` descent, including `FloatAdd` / `FloatSub` /
+///   `FloatMul` for float operands.
+/// - `And` / `Or` / `Xor` (+ in-place) — `IntAnd` / `IntOr` / `IntXor`,
+///   *int-only*.  Hence the separate
 ///   [`SpecializedBinop::PlainInt`] arm, which additionally demands both
 ///   operands be proven plain ints.
 /// - `FloorDivide` / `Remainder` (+ in-place) — exact-int-only generated
@@ -5916,14 +5914,14 @@ pub(crate) enum SpecializedBinop {
 /// Every other tag is excluded because its lowering can still decline and
 /// leave a residual that is NOT replay-safe on its own:
 ///
-/// - `TrueDivide` (+ in-place) — float-table only, and it declines a zero
-///   divisor so the raising `descr_truediv` stays recorded.
+/// - `TrueDivide` (+ in-place) — declines a zero divisor so the raising
+///   `descr_truediv` stays recorded.
 /// - shifts (+ in-place) — the generated descent handles exact-int sites, but
 ///   this replay admission remains conservative around the count-dependent
 ///   exception and large-count arms.
-/// - `Power` (+ in-place) — the int table has no arm; the float table inlines
-///   `_pow` but keeps a cold-path residual for nan/inf/negative-base operands.
-/// - `Subscr`, `MatrixMultiply` (+ in-place) — no arm in either table.
+/// - `Power` (+ in-place) — keeps a cold-path residual for
+///   nan/inf/negative-base operands.
+/// - `Subscr`, `MatrixMultiply` (+ in-place) — no arm.
 ///
 /// The two provenance sets describe the actual operands of each binop.  This
 /// admits `def f(self, x): return x + 1` when only `x` is numeric, while still
@@ -5948,10 +5946,9 @@ pub(crate) fn residual_call_specialized_plain_numeric_binop(
     ) {
         return None;
     }
-    // `iIR`: the R-list follows the I-list.  `walker_int_specialization_operands`
-    // / `walker_float_specialization_operands` read exactly `r_args[0]` (lhs)
-    // and `r_args[1]` (rhs) and decline any other arity, so demand the same
-    // shape here and require both operands to be proven.
+    // `iIR`: the R-list follows the I-list.  The specialization reads exactly
+    // `r_args[0]` (lhs) and `r_args[1]` (rhs) and declines any other arity,
+    // so demand the same shape here and require both operands to be proven.
     let Some(&i_len) = body_code.get(d.pc + 2) else {
         return None;
     };
@@ -5982,11 +5979,9 @@ pub(crate) fn residual_call_specialized_plain_numeric_binop(
     else {
         return None;
     };
-    // Both compare tables map all six `ComparisonOperator`s unconditionally
-    // (`IntLt/Le/Gt/Ge/Eq/Ne` in `try_walker_specialize_compare_op_int`,
-    // `FloatLt/Le/Gt/Ge/Eq/Ne` in `try_walker_specialize_compare_op_float`), so
-    // no tag leaves the residual in place and there is no int-only carve-out
-    // like the bitwise binops need.  `CHECK_EXC_MATCH` reuses the `CompareOp`
+    // All six `ComparisonOperator`s are admitted.  The hand int and float
+    // compare folds are retired; `compare_op_descent` records the
+    // exact-builtin sites.  `CHECK_EXC_MATCH` reuses the `CompareOp`
     // shape with `ISINSTANCE_OP` (tag 10), which is not one of the six and so
     // stays excluded.
     if helper == Some(majit_ir::RuntimeHelperKind::CompareOp) {
@@ -7367,19 +7362,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         }
     }
 
-    // BINARY_SLICE of an exact `str` plus exact-int / None bounds:
-    // `_unicode_sliced` instead of the opaque MayForce residual.
-    if foldable_runtime_helper == majit_ir::RuntimeHelperKind::BinarySlice
-        && ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && spec_gate(SpecFold::BinarySliceStr, || {
-            try_walker_specialize_binary_slice_str(ctx, op, &r_args, dst)
-        })?
-        .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-
     // FORMAT_SIMPLE on an exact `int` / `str`: the empty-spec fast path
     // `format_w` already takes, instead of the opaque MayForce residual.
     // Keyed off the helper tag; anything else (bool, subclass, user
@@ -7642,18 +7624,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && r_args.len() == 1
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::UnaryNot
-        && spec_gate(SpecFold::UnaryNot, || {
-            try_walker_specialize_unary_not(ctx, op.pc, r_args[0], dst, dst_bank)
-        })?
-        .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && r_args.len() == 1
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::UnaryInvert
     {
         if let Some(outcome) = try_walker_orthodox_unary_invert(ctx, op.pc, &r_args, dst, dst_bank)?
@@ -7669,26 +7639,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     {
         if let Some(outcome) = try_walker_orthodox_unary_pos(ctx, op.pc, &r_args, dst, dst_bank)? {
             return Ok((outcome, op.next_pc));
-        }
-    }
-
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && r_args.len() == 1
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::UnaryNegative
-    {
-        if let Some(outcome) = spec_gate(SpecFold::UnaryNeg, || {
-            try_walker_orthodox_unary_neg(ctx, op.pc, &r_args, dst, dst_bank)
-        })? {
-            return Ok((outcome, op.next_pc));
-        }
-        if let Some(DispatchOutcome::SubReturn {
-            result: Some(boxed),
-        }) = spec_gate(SpecFold::UnaryNeg, || {
-            try_emit_exact_int_uneg(ctx, op.pc, &r_args, dst, dst_bank)
-        })? {
-            write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, boxed)?;
-            return Ok((DispatchOutcome::Continue, op.next_pc));
         }
     }
 
@@ -9993,8 +9943,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         })? {
                             return Ok((outcome, op.next_pc));
                         }
-                        // Float (including mixed int/float) remains a hand
-                        // fallback.  Exact int pairs have already been taken
+                        // Exact int pairs have already been taken
                         // whole by `binary_op_descent`, including overflow and
                         // zero-division exception arms.
                         // longobject.py `_make_generic_descr_binop` and
@@ -10066,28 +10015,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                                 )
                             })?;
                         }
-                        if specialized.is_none() {
-                            if let Some(outcome) = spec_gate(SpecFold::BinaryOpFloat, || {
-                                try_walker_specialize_binary_op_float(
-                                    ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
-                                    dst_bank,
-                                )
-                            })? {
-                                return Ok((outcome, op.next_pc));
-                            }
-                        }
-                        if specialized.is_none() {
-                            // `str + str` last: every numeric arm above
-                            // declines a Ref operand, and `descr_add`
-                            // (unicodeobject.py) is the only body left for two
-                            // exact strings.
-                            specialized = spec_gate(SpecFold::BinaryOpStr, || {
-                                try_walker_specialize_binary_op_str(
-                                    ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
-                                    dst_bank,
-                                )
-                            })?;
-                        }
                         specialized
                     }
                 } else if op_tag == 10 && ctx.is_authoritative_executor {
@@ -10097,7 +10024,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                     // const bool (the immortal TRUE/FALSE singleton) so the
                     // exception stays virtual and DCEs, eliding the may-force
                     // compare + its truth-extract residual.  Declines (falls
-                    // through to the int/float compare attempts, which also
+                    // through to the remaining compare attempts, which also
                     // decline for Ref operands → generic residual) when an
                     // operand has no concrete shadow or the match target is
                     // not a valid exception class.
@@ -10133,49 +10060,28 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                     })? {
                         return Ok((outcome, op.next_pc));
                     }
-                    // int compare first; then long (two-bigint operands keep
-                    // bigint comparison); float (incl. mixed int/float) last.
-                    match spec_gate(SpecFold::CompareOpInt, || {
-                        try_walker_specialize_compare_op_int(
+                    // Two-bigint operands keep bigint comparison. Exact strings
+                    // follow: `_compare` (unicodeobject.py) answers from one
+                    // WTF-8 ordering. Short exact tuples of ints or None are
+                    // folded by `try_walker_fold_small_tuple_eq`.
+                    match spec_gate(SpecFold::CompareOpLongInt, || {
+                        try_walker_specialize_compare_op_long_int(
                             ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
                         )
                     })? {
                         Some(()) => Some(()),
-                        None => match spec_gate(SpecFold::CompareOpLongInt, || {
-                            try_walker_specialize_compare_op_long_int(
+                        None => match spec_gate(SpecFold::CompareOpLong, || {
+                            try_walker_specialize_compare_op_long(
                                 ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
                             )
                         })? {
                             Some(()) => Some(()),
-                            None => match spec_gate(SpecFold::CompareOpLong, || {
-                                try_walker_specialize_compare_op_long(
+                            None => spec_gate(SpecFold::CompareOpStr, || {
+                                try_walker_specialize_compare_op_str(
                                     ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
                                     dst_bank,
                                 )
-                            })? {
-                                Some(()) => Some(()),
-                                None => match spec_gate(SpecFold::CompareOpFloat, || {
-                                    try_walker_specialize_compare_op_float(
-                                        ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
-                                        dst_bank,
-                                    )
-                                })? {
-                                    Some(()) => Some(()),
-                                    // Two exact strings: `_compare`
-                                    // (unicodeobject.py) answers from one WTF-8
-                                    // ordering, which no numeric arm above can
-                                    // express.
-                                    // Short exact tuples of ints or None are folded
-                                    // by `try_walker_fold_small_tuple_eq`. Longer
-                                    // tuples and subclasses still reach this residual.
-                                    None => spec_gate(SpecFold::CompareOpStr, || {
-                                        try_walker_specialize_compare_op_str(
-                                            ctx, op.pc, op_tag, &r_args, &allboxes, call_descr,
-                                            dst, dst_bank,
-                                        )
-                                    })?,
-                                },
-                            },
+                            })?,
                         },
                     }
                 };

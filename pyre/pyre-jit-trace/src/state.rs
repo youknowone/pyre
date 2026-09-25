@@ -15580,7 +15580,7 @@ pub(crate) fn setup_reconstructed_callee_frame(
         // `box.value` parity at the frame boundary (mirror `ref_return/r`):
         // thread the reconstructed slot's concrete onto the OpRef-keyed shadow
         // so the re-executed callee's speculation gates
-        // (`walker_int_specialization_operands`) see the live value's class. The
+        // see the live value's class. The
         // emitted specialization stays runtime-correct (guard_class + int_op on
         // the unboxed register); the concrete is only the tracing shadow, as for
         // any resumed operand. Skips constants (`constants.get_value` is
