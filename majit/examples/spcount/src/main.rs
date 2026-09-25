@@ -9,6 +9,9 @@
 use majit_metainterp::virt_array::VirtArray;
 pub type Bytecode = [u8];
 
+#[cfg(test)]
+mod shapes;
+
 // Opcodes
 const PUSH: u8 = 2; // [PUSH, imm]: push a signed-byte immediate
 const POP: u8 = 3; // pop top

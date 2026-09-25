@@ -234,6 +234,10 @@ pub struct JitCodeBuilder {
     /// markers while leaving this first offset unchanged. The LLBC sibling
     /// enforces `jtransform.py`'s single-marker portal-graph contract.
     jit_merge_point_offset: Option<usize>,
+    /// Latched by `load_state_field` / `store_state_field` and the ref,
+    /// float, and array forms. `finish` copies it to
+    /// `JitCodeExecState::reads_identity_slots`.
+    reads_identity_slots: bool,
     /// RPython `jitcode.py` `self.fnaddr = fnaddr`. RPython hands
     /// `fnaddr` to `JitCode.__init__` *before* the assembler fills the
     /// body; pyre stages it here through `set_fnaddr` so `finish()` can
@@ -559,6 +563,7 @@ impl JitCodeBuilder {
     /// `assembler.py:165-167` `i` argcode emits 1-byte register index;
     /// `assembler.py:197-207` `d` argcode emits 2-byte descr index.
     pub fn load_state_field(&mut self, field_idx: u16, dest: u16) {
+        self.reads_identity_slots = true;
         self.touch_reg(dest);
         self.write_insn("load_state_field/di");
         self.push_u16(field_idx);
@@ -567,6 +572,7 @@ impl JitCodeBuilder {
 
     /// Store an int register value into a scalar state field.
     pub fn store_state_field(&mut self, field_idx: u16, src: u16) {
+        self.reads_identity_slots = true;
         self.touch_reg(src);
         self.write_insn("store_state_field/di");
         self.push_u16(field_idx);
@@ -578,6 +584,7 @@ impl JitCodeBuilder {
     /// `getfield_gc_*` reads its struct base from a real ref value.
     /// `d` = u16 field index, `r` = ref register.
     pub fn load_state_field_ref(&mut self, field_idx: u16, dest: u16) {
+        self.reads_identity_slots = true;
         self.touch_ref_reg(dest);
         self.write_insn("load_state_field_ref/dr");
         self.push_u16(field_idx);
@@ -586,6 +593,7 @@ impl JitCodeBuilder {
 
     /// Store a ref register value into a ref-typed scalar state field.
     pub fn store_state_field_ref(&mut self, field_idx: u16, src: u16) {
+        self.reads_identity_slots = true;
         self.touch_ref_reg(src);
         self.write_insn("store_state_field_ref/dr");
         self.push_u16(field_idx);
@@ -596,6 +604,7 @@ impl JitCodeBuilder {
     /// concrete shadow is carried as raw f64 bits in the float register bank.
     /// `d` = u16 field index, `f` = float register.
     pub fn load_state_field_float(&mut self, field_idx: u16, dest: u16) {
+        self.reads_identity_slots = true;
         self.touch_float_reg(dest);
         self.write_insn("load_state_field_float/df");
         self.push_u16(field_idx);
@@ -604,6 +613,7 @@ impl JitCodeBuilder {
 
     /// Store a float register value into a float-typed scalar state field.
     pub fn store_state_field_float(&mut self, field_idx: u16, src: u16) {
+        self.reads_identity_slots = true;
         self.touch_float_reg(src);
         self.write_insn("store_state_field_float/df");
         self.push_u16(field_idx);
@@ -613,6 +623,7 @@ impl JitCodeBuilder {
     /// Load an array state field element into an int register.
     /// The element index comes from another int register.
     pub fn load_state_array(&mut self, array_idx: u16, index_reg: u16, dest: u16) {
+        self.reads_identity_slots = true;
         self.touch_reg(index_reg);
         self.touch_reg(dest);
         self.write_insn("load_state_array/dii");
@@ -624,6 +635,7 @@ impl JitCodeBuilder {
     /// Store an int register value into an array state field element.
     /// The element index comes from another int register.
     pub fn store_state_array(&mut self, array_idx: u16, index_reg: u16, src: u16) {
+        self.reads_identity_slots = true;
         self.touch_reg(index_reg);
         self.touch_reg(src);
         self.write_insn("store_state_array/dii");
@@ -6215,6 +6227,7 @@ impl JitCodeBuilder {
             // by direct seek instead of byte-stream scan
             // (blackhole.py:107-156 argcode-based decode parity).
             jit_merge_point_offset: self.jit_merge_point_offset,
+            reads_identity_slots: self.reads_identity_slots,
         };
         // codewriter.py `jitcode.index = index` — back-stamped by
         // `state::jitcode_for` at registration time. JitCode::new

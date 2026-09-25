@@ -1368,6 +1368,52 @@ pub unsafe fn builtin_function_new_managed(func: PyObjectRef) -> PyObjectRef {
     raw as PyObjectRef
 }
 
+/// `mixedmodule.py _load_lazily` after `BuiltinFunction(func)`:
+/// `w_module` is the module name, and `name` / `qualname` are the name
+/// the module dict stores. `w_moduleobj` stays null until the module
+/// object exists (`builtin_function_set_module_obj`).
+///
+/// Install runs once per name, so the `_builtinversion_` cache is not kept.
+/// A failed managed allocation returns `func` unchanged (`demote` does not
+/// retag a function that still has globals).
+///
+/// # Safety
+/// `func` must be a live plain `Function`. `w_module` must be the module-name
+/// string, kept alive by the caller for the duration of the call.
+pub unsafe fn builtin_function_from_function(
+    func: PyObjectRef,
+    name: &str,
+    w_module: PyObjectRef,
+) -> PyObjectRef {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let func_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(func);
+    let module_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_module);
+    let bltin = builtin_function_new_managed(pyre_object::gc_roots::shadow_stack_get(func_slot));
+    if !py_type_check(bltin, &BUILTIN_FUNCTION_TYPE) {
+        return pyre_object::gc_roots::shadow_stack_get(func_slot);
+    }
+    let bltin_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(bltin);
+    let w_name = pyre_object::w_str_new_managed(name);
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_name);
+    function_set_func_name(
+        pyre_object::gc_roots::shadow_stack_get(bltin_slot),
+        pyre_object::gc_roots::shadow_stack_get(name_slot),
+    );
+    function_set_qualname(
+        pyre_object::gc_roots::shadow_stack_get(bltin_slot),
+        pyre_object::gc_roots::shadow_stack_get(name_slot),
+    );
+    builtin_function_set_module_attr(
+        pyre_object::gc_roots::shadow_stack_get(bltin_slot),
+        pyre_object::gc_roots::shadow_stack_get(module_slot),
+    );
+    pyre_object::gc_roots::shadow_stack_get(bltin_slot)
+}
+
 /// Stamp the `__self__` of a builtin `__new__` carrier — the defining
 /// type whose `tp_new` it wraps (`typeobject.c add_tp_new_wrapper`).
 /// Only touches functions whose `w_new_self` is still unset, so an

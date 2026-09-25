@@ -13469,6 +13469,47 @@ fn reject_unresolved_inline_call(
 /// already interprets that shape when `fnaddr` is 0. The canonical
 /// handlers must do the same, or `convert_and_run_from_pyjitpl` aborts
 /// mid-opcode and the portal sees `usize::MAX` instead of a merge point.
+/// Copy the portal identity-slot registers into a callee blackhole frame.
+///
+/// `blackhole.py` `bhimpl_inline_call_*` does not build a callee interpreter.
+/// `resume.py` `rebuild_from_resumedata` writes each live register through
+/// `consume_boxes`. The slots `load_state_field` reads are those registers
+/// when the parent already holds them.
+fn copy_identity_slots_from_parent(
+    parent: &BlackholeInterpreter,
+    callee: &mut BlackholeInterpreter,
+) {
+    // The callee must already be seated (`setposition`). Only a body that
+    // emitted `load_state_field` / `store_state_field` reads these indices
+    // as identity slots.
+    if !callee.jitcode.reads_identity_slots() {
+        return;
+    }
+    let layout = &parent.state_field_layout;
+    let i_end = layout.int_scalar_base.saturating_add(layout.total_slots());
+    for slot in layout.int_scalar_base..i_end {
+        if slot < parent.registers_i.len() && slot < callee.registers_i.len() {
+            callee.registers_i[slot] = parent.registers_i[slot];
+        }
+    }
+    let r_end = layout
+        .ref_scalar_base
+        .saturating_add(layout.num_ref_scalars);
+    for slot in layout.ref_scalar_base..r_end {
+        if slot < parent.registers_r.len() && slot < callee.registers_r.len() {
+            callee.registers_r[slot] = parent.registers_r[slot];
+        }
+    }
+    let f_end = layout
+        .float_scalar_base
+        .saturating_add(layout.num_float_scalars);
+    for slot in layout.float_scalar_base..f_end {
+        if slot < parent.registers_f.len() && slot < callee.registers_f.len() {
+            callee.registers_f[slot] = parent.registers_f[slot];
+        }
+    }
+}
+
 fn interpret_unresolved_inline_call(
     bh: &mut BlackholeInterpreter,
     handle: &CallDescrHandle,
@@ -13511,6 +13552,11 @@ fn interpret_unresolved_inline_call(
             callee.registers_f[index] = value;
         }
     }
+    // `resume.py` `rebuild_from_resumedata` fills a callee's registers via
+    // `consume_boxes`. A byte-interpreted arm also reads the portal identity
+    // slots (`load_state_field`), which are not inline-call arguments, so
+    // copy the slots the parent frame already holds.
+    copy_identity_slots_from_parent(bh, &mut callee);
 
     let outcome = 'callee: {
         match callee.run() {
@@ -14352,6 +14398,7 @@ fn handler_inline_call_nested_ext(
             }
         }
     }
+    copy_identity_slots_from_parent(bh, &mut callee);
 
     let dest = decode_return_slot_at(code, &mut p);
 

@@ -2048,6 +2048,10 @@ where
             } else {
                 None
             };
+        // The root portal frame's reds live in `__JitSym` and are copied
+        // into its register bank for this capture only. A callee frame
+        // already holds its identity slots: `exec_typed_inline_call` seeded
+        // them when the frame was pushed (`pyjitpl.py` `MIFrame.setup_call`).
         sym.populate_frame_int_regs(&mut self.frames.frames[0]);
         if crate::callee_rca_enabled() {
             let virtualizable_snapshot = ctx.virtualizable_boxes.clone().unwrap_or_default();
@@ -4094,6 +4098,20 @@ where
                 let (opref, value) = self.read_int_reg(src);
                 sym.set_state_field_ref(field_idx, opref);
                 sym.set_state_field_value(field_idx, value);
+                // The identity slot is a register the frame holds, same as
+                // `blackhole.py` reading reds out of `registers_i`. A store
+                // that updated only `__JitSym` would leave the slot at the
+                // value seeded when the frame was pushed.
+                let slot = sym.int_identity_slots_base() + field_idx;
+                if slot < sym.int_identity_slots_end()
+                    && self
+                        .frames
+                        .frames
+                        .last()
+                        .is_some_and(|frame| slot < frame.int_regs.len())
+                {
+                    self.set_int_reg(slot, Some(opref), Some(value));
+                }
             }
             // Ref-typed scalar state field: same shape as the int load/store
             // but the value lives in the ref register bank, so its OpRef
@@ -7608,6 +7626,7 @@ where
                 sub_frame.return_i = return_i;
                 sub_frame.return_r = return_r;
                 sub_frame.return_f = return_f;
+                self.seed_pushed_frame_identity_slots(sym, &mut sub_frame);
                 self.frames.push(sub_frame);
             }
             jitcode::insns::BC_INLINE_CALL_R_I
@@ -7620,7 +7639,7 @@ where
             | jitcode::insns::BC_INLINE_CALL_IRF_R
             | jitcode::insns::BC_INLINE_CALL_IRF_I
             | jitcode::insns::BC_INLINE_CALL_IRF_V => {
-                match self.exec_typed_inline_call(ctx, bytecode) {
+                match self.exec_typed_inline_call(ctx, sym, bytecode) {
                     TraceAction::Continue => {}
                     action => return action,
                 }
@@ -11164,11 +11183,25 @@ where
         TraceAction::Continue
     }
 
+    /// `pyjitpl.py` `MIFrame.setup_call` writes the callee's arguments when
+    /// `MetaInterp.newframe` creates the frame. A per-arm sub-JitCode also
+    /// reads the portal identity slots, which are not inline-call arguments,
+    /// so those slots are seeded from `__JitSym` before the frame is pushed
+    /// and then left in place.
+    fn seed_pushed_frame_identity_slots(&self, sym: &S, frame: &mut MIFrame) {
+        // Only a `; state` arm sub-JitCode addresses these indices as
+        // identity slots. An ordinary inline JitCode uses them as working
+        // registers (`goto_if_not` reads one as a bool).
+        if frame.jitcode.reads_identity_slots() {
+            sym.populate_frame_int_regs(frame);
+        }
+    }
+
     /// Trace the canonical `inline_call_{r,ir,irf}_*` family by entering a
     /// callee frame.  RPython `rpython/jit/metainterp/pyjitpl.py:1266-1332`
     /// enters the frame, and `:144-160` copies each grouped argument
     /// positionally.
-    fn exec_typed_inline_call(&mut self, ctx: &mut TraceCtx, bytecode: u8) -> TraceAction {
+    fn exec_typed_inline_call(&mut self, ctx: &mut TraceCtx, sym: &S, bytecode: u8) -> TraceAction {
         let (has_i_list, has_f_list, return_kind) = match bytecode {
             jitcode::insns::BC_INLINE_CALL_R_I => (false, false, Some(JitArgKind::Int)),
             jitcode::insns::BC_INLINE_CALL_R_R => (false, false, Some(JitArgKind::Ref)),
@@ -11278,6 +11311,7 @@ where
             }
             None => {}
         }
+        self.seed_pushed_frame_identity_slots(sym, &mut sub_frame);
         self.frames.push(sub_frame);
         TraceAction::Continue
     }
@@ -12165,6 +12199,16 @@ where
             None,
             Some(ctx),
         );
+        // `resume.py` `rebuild_from_resumedata` does `newframe`, then
+        // `setup_resume_at_op`, then `consume_boxes` into that frame's
+        // registers. Seed the identity slots the same way a pushed arm
+        // frame is seeded, then let the resume registers overwrite any
+        // slot the guard actually captured (`consume_boxes`). An ordinary
+        // inline frame has no identity slots; seeding would overwrite a
+        // working register the resume list does not restore.
+        if resume_frame.jitcode.reads_identity_slots() {
+            sym.populate_frame_int_regs(&mut frame);
+        }
         for reg in &resume_frame.regs {
             let index = reg.index as usize;
             let (bank_regs, bank_values) = match reg.bank {

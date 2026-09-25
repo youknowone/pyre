@@ -7123,13 +7123,31 @@ impl<S: JitState> JitDriver<S> {
             if let Some(frame) = result.deadframe.as_ref() {
                 raw_values.extend(self.meta.raw_exit_slots_from_deadframe(frame, fd));
             }
-            if let Some(pc) = self.bridge_from_guard_resume_position(
-                &descr_arc,
-                state,
-                env,
-                &raw_values,
-                target_pc,
-            ) {
+            // `resume.py` `ResumeDataBoxReader.load_box_from_cpu` reads the
+            // deadframe at decode time. This scratch is already a copy of
+            // those slots; root its Ref words for the bridge setup below,
+            // which allocates (`allocate_with_vtable`) and then reads them.
+            // The guard ends before `raw_values` is moved.
+            let ref_slot: Vec<bool> = fd
+                .fail_arg_types()
+                .iter()
+                .map(|tp| *tp == majit_ir::Type::Ref)
+                .collect();
+            let bridge_pc = {
+                let _fail_arg_roots = unsafe {
+                    crate::resume::DeadFrameRefRoots::enter(&mut raw_values, |index| {
+                        ref_slot.get(index).copied().unwrap_or(false)
+                    })
+                };
+                self.bridge_from_guard_resume_position(
+                    &descr_arc,
+                    state,
+                    env,
+                    &raw_values,
+                    target_pc,
+                )
+            };
+            if let Some(pc) = bridge_pc {
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[bridge] guard-resume bridge key={} trace={} fail={} resume_pc={}",
@@ -10247,8 +10265,18 @@ impl<S: JitState> JitDriver<S> {
             // history InputArgs, as pyjitpl.py
             // `initialize_state_from_guard_failure` filters its holes. Resume
             // decoding still needs the uncompressed deadframe coordinate
-            // space, so use the positional slice retained above.
-            let raw_values = frontend_fail_values.to_vec();
+            // space, so keep the positional slice the caller passed.
+            //
+            // `resume.py` `ResumeDataBoxReader.load_box_from_cpu` reads
+            // `cpu.get_ref_value(self.deadframe, num)` at the moment the box
+            // is decoded. The deadframe stays a traced root, so a collection
+            // inside `allocate_with_vtable` forwards the slot before that
+            // read. Snapshotting the words here would leave that collection
+            // updating the caller's buffer while `setup_bridge_sym` still
+            // indexes the copy (`materialize_concrete_virtual_ptr` allocates,
+            // then a later field or box reads `fail_values[n]`). The caller
+            // keeps this slice on a GC-visible holder for the whole call —
+            // the deadframe, or `DeadFrameRefRoots` over the Ref slots.
             // resume.py consume_boxes parity: decode the guard frame's
             // per-bank live register indices here, where the dispatch JitCode
             // + `liveness_info` are reachable, and stash them on the trace ctx.
@@ -10317,7 +10345,7 @@ impl<S: JitState> JitDriver<S> {
                 ctx,
                 bfm,
                 retrace.storage.as_deref().map(|s| s.rd_virtuals()),
-                &raw_values,
+                frontend_fail_values,
                 &retrace.fail_types,
                 replay_allocator,
             );
