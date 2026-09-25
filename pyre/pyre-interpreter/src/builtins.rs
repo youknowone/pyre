@@ -13327,13 +13327,20 @@ fn iter_cold(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `operation.py iter` / `iter_sentinel`. Two arguments build a
 /// `_CallableIterator`; one argument on that iterator is `__iter__`
 /// returning self. Every other shape stays in `builtin_iter`.
+///
+/// Builtin keyword calls append a trailing `__pyre_kw__` marker dict to this
+/// same flat slice (`split_builtin_kwargs`). The wrapper tests that tail with
+/// the scalar `builtin_kwargs_marker_tail` instead of building the positional
+/// sub-slice, so `iter(f, **{})` and `iter(f, sentinel=x)` reach
+/// `builtin_iter` through the cold arm: a real keyword is its TypeError, and
+/// an empty marker is not a sentinel.
 pub fn __majit_wrap_builtin_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() == 2 {
         let callable = args[0];
         let sentinel = args[1];
         // A function (the hot `iter(f, sentinel)` shape) skips the general
         // callable test, which closes over a type lookup.
-        if unsafe { crate::is_function(callable) } {
+        if unsafe { crate::is_function(callable) } && !builtin_kwargs_marker_tail(sentinel) {
             return Ok(pyre_object::operation::w_callable_iterator_new(
                 callable, sentinel,
             ));
@@ -13342,17 +13349,12 @@ pub fn __majit_wrap_builtin_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
     }
     if args.len() == 1 {
         let obj = args[0];
+        // `iter(**{})` is the lone marker word; `builtin_iter` rejects it.
         if unsafe { pyre_object::operation::is_callable_iterator(obj) } {
             return Ok(obj);
         }
-        return iter_one_cold(obj);
     }
     iter_cold(args)
-}
-
-#[majit_macros::dont_look_inside]
-fn iter_one_cold(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-    crate::baseobjspace::iter(obj)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -13366,9 +13368,17 @@ static __majit_wrap_builtin_iter_target: crate::gateway::BuiltinWrapperDescripto
 
 /// `__iter__` of an iterator — `operation.py _CallableIterator.__iter__`.
 pub fn __majit_wrap_iter_self(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if let [obj] = args {
-        return Ok(*obj);
+    // A slice pattern compares the list with the integer length and has no
+    // rtype. One positional word is `__iter__` returning self; a keyword
+    // dict makes the slice longer and stays in the cold body.
+    if args.len() == 1 {
+        return Ok(args[0]);
     }
+    iter_self_cold(args)
+}
+
+#[majit_macros::dont_look_inside]
+fn iter_self_cold(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::baseobjspace::iter_self_method(args)
 }
 
@@ -23962,13 +23972,14 @@ fn machine_int_pow3(
         }
         let iv = crate::objspace::descroperation::int_value(base);
         let iw = crate::objspace::descroperation::int_value(exp);
-        if iw < 0 {
+        // Negative exponent and `ovfcheck(-iz)` on `i64::MIN` leave the
+        // machine body. The remaining calls return the residue.
+        if iw < 0 || iz == i64::MIN {
             return pow3_cold(base, exp, modulus);
         }
-        match crate::objspace::descroperation::_pow_mod(iv, iw, iz) {
-            Ok(result) => Ok(pyre_object::w_int_new(result)),
-            Err(_) => pow3_cold(base, exp, modulus),
-        }
+        Ok(pyre_object::w_int_new(
+            crate::objspace::descroperation::_pow_mod(iv, iw, iz)?,
+        ))
     }
 }
 
@@ -23990,6 +24001,8 @@ fn pow_dispatch_cold(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 /// `descr_pow` / `_pow_mod`; every other shape, including keywords, falls
 /// through to `builtin_pow`.
 pub fn __majit_wrap_builtin_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // `pow(2, 3, mod=5)` is three words ending in the keyword dict, which is
+    // not a machine int, so the fast path falls through to `builtin_pow`.
     if args.len() == 3 {
         let base = args[0];
         let exp = args[1];
