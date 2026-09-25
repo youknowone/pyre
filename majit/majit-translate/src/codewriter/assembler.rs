@@ -3545,12 +3545,6 @@ fn unit_variant_const_sentinel(ordinal: usize) -> i64 {
     UNIT_VARIANT_CONST_SENTINEL_BASE | ordinal as i64
 }
 
-/// Non-canonical tag marking a deferred type-static slot in
-/// `constants_r`, disjoint from the string and unit-variant bases in
-/// the same high-word space; the low 48 bits carry the
-/// [`super::jitcode::TypeStaticConstDescriptor`] ordinal.
-pub const TYPE_STATIC_CONST_SENTINEL_BASE: i64 = 0x7E59_0000_0000_0000u64 as i64;
-
 /// `TYPE_STATIC_CONST_SENTINEL_BASE | ordinal`.
 fn type_static_const_sentinel(ordinal: usize) -> i64 {
     debug_assert!(
