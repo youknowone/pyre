@@ -9831,7 +9831,11 @@ mod tests {
             .map(|a| a.to_opref())
             .collect();
         let mut jump_args = base.to_vec();
-        jump_args.extend(extras.into_iter().filter(|arg| short_extra_is_carried(*arg)));
+        jump_args.extend(
+            extras
+                .into_iter()
+                .filter(|arg| short_extra_is_carried(*arg)),
+        );
         assert_eq!(
             jump_args, label_args,
             "a bridge JUMP and its loop LABEL carry the same boxes"

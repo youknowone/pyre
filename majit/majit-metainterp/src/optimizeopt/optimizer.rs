@@ -24,8 +24,7 @@ pub const ALL_OPTS: &[(&str, bool)] = &[
 ];
 
 /// `rlib/jit.py` `ENABLE_ALL_OPTS`.
-pub const ENABLE_ALL_OPTS: &str =
-    "intbounds:rewrite:virtualize:string:pure:earlyforce:heap:unroll";
+pub const ENABLE_ALL_OPTS: &str = "intbounds:rewrite:virtualize:string:pure:earlyforce:heap:unroll";
 /// Main optimization driver.
 ///
 /// Translated from rpython/jit/metainterp/optimizeopt/optimizer.py.
@@ -7070,7 +7069,15 @@ mod tests {
         assert_eq!(opt.num_passes(), 7);
         assert_eq!(
             opt.pass_names(),
-            ["intbounds", "rewrite", "virtualize", "string", "pure", "earlyforce", "heap",]
+            [
+                "intbounds",
+                "rewrite",
+                "virtualize",
+                "string",
+                "pure",
+                "earlyforce",
+                "heap",
+            ]
         );
     }
 

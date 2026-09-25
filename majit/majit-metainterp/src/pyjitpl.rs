@@ -5814,10 +5814,8 @@ impl<M: Clone> MetaInterp<M> {
     fn make_optimizer(&self) -> Optimizer {
         // compile.py `CompileData.optimize_trace` → `build_opt_chain(enable_opts)`.
         let enable_opts = self.warm_state.get_enable_opts();
-        let mut opt = Optimizer::build_opt_chain(
-            enable_opts,
-            self.current_virtualizable_optimizer_config(),
-        );
+        let mut opt =
+            Optimizer::build_opt_chain(enable_opts, self.current_virtualizable_optimizer_config());
         self.pin_optimizer_host_state(&mut opt);
         opt
     }
