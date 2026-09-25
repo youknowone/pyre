@@ -7009,7 +7009,12 @@ impl<'a> AssemblerARM64<'a> {
             crate::runner::malloc_fixedsize_or(Self::new_alloc_fn_addr()),
         );
         dynasm!(self.mc ; .arch aarch64 ; blr x2);
-        self.inline_memzero(obj_size);
+        // `GcLLDescr_boehm.malloc_fixedsize` is `GC_malloc`
+        // (`malloc_zero_filled`). A raw `malloc` is not, so only that
+        // fallback is cleared here — never both.
+        if crate::runner::malloc_fixedsize_or(0) == 0 {
+            self.inline_memzero(obj_size);
+        }
         if vtable != 0 {
             self.emit_mov_imm64(1, vtable);
             dynasm!(self.mc ; .arch aarch64 ; str x1, [x0]);

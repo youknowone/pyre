@@ -8597,15 +8597,20 @@ impl<'a> Assembler386<'a> {
         self.emit_abi_int_arg_from_imm(0, obj_size);
         rx86::mov_ri(&mut self.mc, rx86::EAX, malloc_ptr);
         self.emit_abi_call_rax();
-        self.emit_abi_int_arg_from_reg(0, 0);
-        self.emit_abi_int_arg_from_imm(1, 0);
-        self.emit_abi_int_arg_from_imm(2, obj_size);
-        dynasm!(self.mc ; .arch x64
-        ; push rax
-        );
-        rx86::mov_ri(&mut self.mc, rx86::EAX, libc::memset as *const () as i64);
-        self.emit_abi_call_rax_after_one_push();
-        dynasm!(self.mc ; .arch x64 ; pop rax);
+        // `GcLLDescr_boehm.malloc_fixedsize` is `GC_malloc`
+        // (`malloc_zero_filled`). A raw `malloc` is not, so only that
+        // fallback is cleared here — never both.
+        if crate::runner::malloc_fixedsize_or(0) == 0 {
+            self.emit_abi_int_arg_from_reg(0, 0);
+            self.emit_abi_int_arg_from_imm(1, 0);
+            self.emit_abi_int_arg_from_imm(2, obj_size);
+            dynasm!(self.mc ; .arch x64
+            ; push rax
+            );
+            rx86::mov_ri(&mut self.mc, rx86::EAX, libc::memset as *const () as i64);
+            self.emit_abi_call_rax_after_one_push();
+            dynasm!(self.mc ; .arch x64 ; pop rax);
+        }
         // Write vtable at offset 0 (`GcLLDescr_boehm`, fielddescr_vtable at 0).
         if vtable != 0 {
             rx86::mov_ri(&mut self.mc, rx86::ECX, vtable);

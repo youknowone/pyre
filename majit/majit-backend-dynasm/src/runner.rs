@@ -647,19 +647,18 @@ pub(crate) fn new_via_gc_enabled() -> bool {
     NEW_VIA_GC.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// `GcLLDescr_boehm.malloc_fixedsize`: zeroed storage from the published
-/// function, or `None` when [`majit_gc::set_malloc_fixedsize`] is unset.
+/// `GcLLDescr_boehm.malloc_fixedsize`: storage from the published function,
+/// or `None` when [`majit_gc::set_malloc_fixedsize`] is unset.
+///
+/// `GC_malloc` returns zero-filled bytes (`malloc_zero_filled`). The caller
+/// does not clear the block again.
 pub(crate) fn call_malloc_fixedsize(size: usize) -> Option<*mut u8> {
     let addr = majit_gc::malloc_fixedsize_addr();
     if addr == 0 {
         return None;
     }
     let malloc: extern "C" fn(usize) -> *mut u8 = unsafe { std::mem::transmute(addr) };
-    let ptr = malloc(size);
-    if !ptr.is_null() {
-        unsafe { libc::memset(ptr.cast(), 0, size) };
-    }
-    Some(ptr)
+    Some(malloc(size))
 }
 
 /// Address `genop_new_with_vtable` calls: the Boehm hook when published,
