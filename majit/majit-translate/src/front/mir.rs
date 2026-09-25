@@ -3344,11 +3344,10 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             rewire_result_try_call_sites(&mut lo.graph, &lo.result_try_sites, return_owners)
         };
         // A `?` whose diamond did not match still has `Try::branch`.
-        // `Result::branch` is a match on the discriminant: Ok is
-        // `ControlFlow::Continue` and Err is `ControlFlow::Break`, with the
-        // same variant order and the same payload word. The value is already
-        // that `ControlFlow`; a residual call is not.
-        lower_result_branch_to_control_flow(&mut lo.graph);
+        // `same_as` is exact only when the `Result` and the `ControlFlow`
+        // share a layout. Otherwise the call is the match: read the
+        // discriminant and build `Continue` / `Break`.
+        lower_result_branch_to_control_flow(&mut lo.graph, &lo.branch_same_layout);
         // The `bool::then` short-circuit rewrite (`front::bool_then`) splits
         // the residual `then` call block into a `Some`/`None` diamond.  It
         // runs on the post-lowering graph (its block A is closed with a
@@ -5010,6 +5009,10 @@ struct Lowering<'a> {
     /// The Option sibling is [`Lowering::option_try_sites`]; exception-carrier
     /// Results stay on [`Lowering::result_exc_call_results`].
     result_try_sites: Vec<ResultTrySite>,
+    /// `Result::branch` results whose `Result<T, E>` and
+    /// `ControlFlow<Result<Infallible, E>, T>` type-decl layouts are both
+    /// known and equal. Anything else is lowered as the discriminant match.
+    branch_same_layout: std::collections::HashSet<Variable>,
     /// Result-var ids of one-word niche `Option` discriminant reads folded to
     /// a pointer null-test (`ne(base, null_mut())`, `build_rvalue`
     /// `Rvalue::Discriminant` niche arm).  Such a discriminant is a `SomeBool`
@@ -5342,6 +5345,7 @@ impl<'a> Lowering<'a> {
             closure_select_sites: Vec::new(),
             disc_combinator_sites: Vec::new(),
             result_try_sites: Vec::new(),
+            branch_same_layout: std::collections::HashSet::new(),
             niche_disc_vars: std::collections::HashSet::new(),
             cast_ptr_to_int_src: std::collections::HashMap::new(),
             root_scope_moved_locals,
@@ -15136,6 +15140,7 @@ impl<'a> Lowering<'a> {
             {
                 self.result_try_sites.push(site);
             }
+            self.note_result_branch_layout(first_arg_ty.as_ref(), &call.dest.ty, &result_var);
         }
         // Capture `bool::then(cond, closure_env)` sites for the
         // short-circuit `Option` diamond `front::bool_then` synthesizes.
@@ -19568,6 +19573,39 @@ impl<'a> Lowering<'a> {
                 .map(|ty| tyref_to_ast_string(&ty, self.llbc))
                 .unwrap_or_default(),
         })
+    }
+
+    /// Record a `Result::branch` whose operand and `ControlFlow` result have
+    /// the same Charon type-decl layout. A missing layout is not a match.
+    fn note_result_branch_layout(
+        &mut self,
+        recv_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+        result_var: &Variable,
+    ) {
+        let Some(recv_ty) = recv_ty else {
+            return;
+        };
+        if !crate::front::result_exc::tyref_is_result(recv_ty, self.llbc) {
+            return;
+        }
+        let Some(result_layout) = self.layout_of_tyref(recv_ty) else {
+            return;
+        };
+        let Some(flow_layout) = self.layout_of_tyref(dest_ty) else {
+            return;
+        };
+        if type_layouts_equal(&result_layout, &flow_layout) {
+            self.branch_same_layout.insert(result_var.clone());
+        }
+    }
+
+    fn layout_of_tyref(&self, ty: &TyRef) -> Option<majit_charon_reader::ullbc::TypeLayout> {
+        let def_id = self
+            .tyref_adt_def_id(ty)
+            .or_else(|| self.tyref_ref_adt_def_id(ty))?;
+        let target = std::env::var("TARGET").unwrap_or_default();
+        self.llbc.type_by_id(def_id)?.layout_for_target(&target)
     }
 
     fn resolve_result_return_owners(&self, output_ty: &TyRef) -> Option<ResultTryReturnOwners> {
@@ -34872,14 +34910,47 @@ fn emit_payload_read(
     payload
 }
 
+/// Two Charon type-decl layouts describe the same bits: size, alignment,
+/// per-variant field offsets, and the discriminant encoding.
+fn type_layouts_equal(
+    a: &majit_charon_reader::ullbc::TypeLayout,
+    b: &majit_charon_reader::ullbc::TypeLayout,
+) -> bool {
+    if a.size != b.size || a.align != b.align {
+        return false;
+    }
+    if a.variant_layouts.len() != b.variant_layouts.len() {
+        return false;
+    }
+    if a.variant_layouts
+        .iter()
+        .zip(&b.variant_layouts)
+        .any(|(left, right)| left.field_offsets != right.field_offsets)
+    {
+        return false;
+    }
+    if a.discriminator != b.discriminator {
+        return false;
+    }
+    let transparent = |layout: &majit_charon_reader::ullbc::TypeLayout| {
+        layout.repr.as_ref().is_some_and(|repr| repr.transparent)
+    };
+    transparent(a) == transparent(b)
+}
+
 /// `Try::branch` on a `Result` that the diamond rewrites did not consume.
 ///
-/// `Ok(v)` and `Err(e)` are `ControlFlow::Continue(v)` and
-/// `ControlFlow::Break(e)`: same discriminant, same payload word. The call
-/// is that match, so the result is the operand.
-fn lower_result_branch_to_control_flow(graph: &mut FunctionGraph) {
-    for block in &mut graph.blocks {
-        for op in &mut block.operations {
+/// `same_layout` holds results whose `Result` and `ControlFlow` type-decl
+/// layouts are equal, so the value already is that `ControlFlow`. Every
+/// other call is the match: read the discriminant, build `Continue` or
+/// `Break`.
+fn lower_result_branch_to_control_flow(
+    graph: &mut FunctionGraph,
+    same_layout: &std::collections::HashSet<Variable>,
+) {
+    let mut sites = Vec::new();
+    for (bi, block) in graph.blocks.iter().enumerate() {
+        for (oi, op) in block.operations.iter().enumerate() {
             let OpKind::Call {
                 target,
                 args,
@@ -34896,24 +34967,206 @@ fn lower_result_branch_to_control_flow(graph: &mut FunctionGraph) {
             else {
                 continue;
             };
-            if name != "branch" {
-                continue;
-            }
-            let root = receiver_root.as_deref().unwrap_or("");
-            if !root.ends_with("Result") {
+            if name != "branch" || !receiver_root.as_deref().unwrap_or("").ends_with("Result") {
                 continue;
             }
             let Some(operand) = args.first().and_then(LinkArg::as_variable).cloned() else {
                 continue;
             };
-            let result_ty = result_ty.clone();
-            op.kind = OpKind::UnaryOp {
+            let Some(result) = op.result.clone() else {
+                continue;
+            };
+            sites.push((
+                bi,
+                oi,
+                operand,
+                result,
+                result_ty.clone(),
+                receiver_root
+                    .clone()
+                    .unwrap_or_else(|| "core::result::Result".to_string()),
+            ));
+        }
+    }
+    for (bi, oi, operand, result, result_ty, result_owner) in sites.into_iter().rev() {
+        if same_layout.contains(&result) {
+            graph.blocks[bi].operations[oi].kind = OpKind::UnaryOp {
                 op: "same_as".to_string(),
                 operand,
                 result_ty,
             };
+        } else {
+            lower_result_branch_as_match(
+                graph,
+                BlockId(bi),
+                oi,
+                &operand,
+                &result,
+                &result_owner,
+                &result_ty,
+            );
         }
     }
+}
+
+fn control_flow_owner(result_ty: &ValueType) -> String {
+    match result_ty {
+        ValueType::Ref(Some(owner)) if !owner.is_empty() => owner.clone(),
+        _ => "core::ops::control_flow::ControlFlow".to_string(),
+    }
+}
+
+fn push_enum_field_read(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    base: Variable,
+    owner: &str,
+    field: &str,
+    ty: ValueType,
+) -> Variable {
+    let read = graph.alloc_value_var();
+    graph.block_mut(block).operations.push(SpaceOperation {
+        result: Some(read.clone()),
+        kind: OpKind::FieldRead {
+            base,
+            field: FieldDescriptor {
+                name: field.to_string(),
+                owner_root: Some(owner.to_string()),
+                owner_id: None,
+                base_is_deref: None,
+                taken_by_address: false,
+                inline_vec: false,
+                vec_part: None,
+            },
+            ty,
+            pure: true,
+        },
+    });
+    read
+}
+
+/// Replace one `Result::branch` call with a discriminant switch that builds
+/// `ControlFlow::Continue` or `ControlFlow::Break`.
+fn lower_result_branch_as_match(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    op_idx: usize,
+    operand: &Variable,
+    result: &Variable,
+    result_owner: &str,
+    result_ty: &ValueType,
+) {
+    use crate::front::bool_then::{emit_sum_variant, map_source};
+
+    let cf_owner = control_flow_owner(result_ty);
+    let payload_ty = ValueType::Ref(None);
+    let mut prefix_defined = graph.block(block).inputargs.clone();
+    for op in graph.block(block).operations.iter().take(op_idx) {
+        if let Some(produced) = &op.result {
+            prefix_defined.push(produced.clone());
+        }
+    }
+    prefix_defined.retain(|var| var != result);
+    if !prefix_defined.iter().any(|var| var == operand) {
+        prefix_defined.push(operand.clone());
+    }
+
+    graph.block_mut(block).operations.remove(op_idx);
+    let tail = graph.block_mut(block).operations.split_off(op_idx);
+    let exitswitch = graph.block_mut(block).exitswitch.take();
+    let exits = std::mem::take(&mut graph.block_mut(block).exits);
+
+    let (cont, inputs) = graph.create_block_with_arg_vars(prefix_defined.len() + 1);
+    let phi = inputs.last().expect("phi").clone();
+    let mut remap_map: std::collections::HashMap<Variable, Variable> = prefix_defined
+        .iter()
+        .cloned()
+        .zip(inputs.iter().cloned())
+        .collect();
+    remap_map.insert(result.clone(), phi);
+    let remap = |var: &Variable| remap_map.get(var).cloned().unwrap_or_else(|| var.clone());
+    graph.block_mut(cont).operations = tail
+        .into_iter()
+        .map(|op| SpaceOperation {
+            result: op.result.clone(),
+            kind: crate::inline::remap_op_kind(&op.kind, &remap),
+        })
+        .collect();
+    graph.block_mut(cont).exitswitch = match exitswitch {
+        Some(ExitSwitch::Value(var)) => Some(ExitSwitch::Value(remap(&var))),
+        Some(ExitSwitch::Fused { opname, args }) => Some(ExitSwitch::Fused {
+            opname,
+            args: args.into_iter().map(|arg| remap(&arg)).collect(),
+        }),
+        other => other,
+    };
+    graph.block_mut(cont).exits = exits
+        .into_iter()
+        .map(|mut link| {
+            for arg in &mut link.args {
+                if let Some(var) = arg.as_variable()
+                    && let Some(mapped) = remap_map.get(var)
+                {
+                    *arg = LinkArg::Value(mapped.clone());
+                }
+            }
+            link
+        })
+        .collect();
+
+    let disc = push_enum_field_read(
+        graph,
+        block,
+        operand.clone(),
+        result_owner,
+        "__discriminant",
+        ValueType::Int,
+    );
+
+    let mut arm_ids = Vec::new();
+    let mut arm_sources = Vec::new();
+    for (tag, flow_variant, result_variant) in [(0i64, "Continue", "Ok"), (1i64, "Break", "Err")] {
+        let sources = prefix_defined.clone();
+        let (arm, arm_inputs) = graph.create_block_with_arg_vars(sources.len());
+        let operand_arm = map_source(&sources, &arm_inputs, operand).expect("operand threaded");
+        let payload = push_enum_field_read(
+            graph,
+            arm,
+            operand_arm,
+            &format!("{result_owner}::{result_variant}"),
+            "__pos_0",
+            payload_ty.clone(),
+        );
+        let payload_owner = format!("{cf_owner}::{flow_variant}");
+        let built = emit_sum_variant(
+            graph,
+            arm,
+            &cf_owner,
+            flow_variant,
+            tag,
+            Some((&payload_owner, payload, payload_ty.clone())),
+        );
+        let mut args: Vec<Variable> = sources
+            .iter()
+            .map(|var| map_source(&sources, &arm_inputs, var).expect("prefix threaded"))
+            .collect();
+        args.push(built);
+        graph.set_goto(arm, cont, args);
+        arm_ids.push(arm);
+        arm_sources.push(sources);
+    }
+    let break_sources = arm_sources.pop().expect("break");
+    let continue_sources = arm_sources.pop().expect("continue");
+    let break_arm = arm_ids.pop().expect("break");
+    let continue_arm = arm_ids.pop().expect("continue");
+    graph.set_branch(
+        block,
+        disc,
+        break_arm,
+        break_sources,
+        continue_arm,
+        continue_sources,
+    );
 }
 
 fn rewire_result_try_call_sites(
@@ -37643,6 +37896,117 @@ mod tests {
             super::enumerate_item_peel(false, true),
             "plain slice::Iter::next still peels the reference it added"
         );
+    }
+
+    fn branch_layout(disc_off: u64, payload_off: u64) -> majit_charon_reader::ullbc::TypeLayout {
+        majit_charon_reader::ullbc::TypeLayout {
+            size: Some(16),
+            align: Some(8),
+            variant_layouts: vec![
+                majit_charon_reader::ullbc::VariantLayout {
+                    field_offsets: vec![payload_off],
+                },
+                majit_charon_reader::ullbc::VariantLayout {
+                    field_offsets: vec![payload_off],
+                },
+            ],
+            discriminator: Some(serde_json::json!({
+                "Branch": {"offset": disc_off, "int_ty": {"Signed": "I64"}}
+            })),
+            repr: None,
+        }
+    }
+
+    fn graph_with_result_branch() -> (FunctionGraph, Variable) {
+        let mut graph = FunctionGraph::new("result_branch");
+        let entry = graph.startblock;
+        let operand = graph
+            .push_op_var(entry, OpKind::ConstInt(1), true)
+            .expect("operand");
+        let result = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::method("branch", Some("core::result::Result".into())),
+                    args: vec![LinkArg::Value(operand)],
+                    result_ty: ValueType::Ref(Some("core::ops::control_flow::ControlFlow".into())),
+                },
+                true,
+            )
+            .expect("branch");
+        graph.set_return(entry, Some(result.clone()));
+        (graph, result)
+    }
+
+    fn count_branch_calls(graph: &FunctionGraph) -> usize {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::Method { name, .. },
+                        ..
+                    } if name == "branch"
+                )
+            })
+            .count()
+    }
+
+    #[test]
+    fn equal_result_and_control_flow_layouts_lower_branch_to_same_as() {
+        let same = branch_layout(0, 8);
+        assert!(super::type_layouts_equal(&same, &branch_layout(0, 8)));
+        let (mut graph, result) = graph_with_result_branch();
+        let mut same_layout = std::collections::HashSet::new();
+        same_layout.insert(result);
+        super::lower_result_branch_to_control_flow(&mut graph, &same_layout);
+        assert_eq!(count_branch_calls(&graph), 0);
+        assert!(
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| block.operations.iter())
+                .any(|op| { matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as") }),
+            "equal layouts keep the bits with same_as"
+        );
+    }
+
+    #[test]
+    fn niche_result_layout_lowers_branch_as_a_discriminant_match() {
+        let explicit = branch_layout(0, 8);
+        let niche = branch_layout(8, 0);
+        assert!(!super::type_layouts_equal(&explicit, &niche));
+        let (mut graph, _result) = graph_with_result_branch();
+        super::lower_result_branch_to_control_flow(&mut graph, &std::collections::HashSet::new());
+        assert_eq!(count_branch_calls(&graph), 0, "branch must not stay a call");
+        let reads_disc = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. } if field.name == "__discriminant"
+                )
+            });
+        assert!(reads_disc, "the match reads the Result discriminant");
+        let mut ctors = Vec::new();
+        for block in &graph.blocks {
+            for op in &block.operations {
+                if let OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { name, .. },
+                    ..
+                } = &op.kind
+                {
+                    ctors.push(name.clone());
+                }
+            }
+        }
+        assert!(ctors.iter().any(|name| name == "Continue"), "{ctors:?}");
+        assert!(ctors.iter().any(|name| name == "Break"), "{ctors:?}");
     }
 
     #[test]
