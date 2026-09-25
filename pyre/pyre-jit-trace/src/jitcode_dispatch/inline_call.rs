@@ -16228,26 +16228,6 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         {
             return Ok((outcome, op.next_pc));
         }
-        // `descr_pow` still declines inside `long_pow`, so the mixed
-        // long/int power fold stays. The other long binary folds no longer fire.
-        if let Ok(setup) = inline_fnaddr_call_setup_binary_helper(ctx, op.pc, &int_args, &ref_args)
-            && let Some(call_descr) = setup.descr.as_call_descr()
-            && spec_gate(SpecFold::BinaryOpLongIntPow, || {
-                super::specialize::try_walker_specialize_binary_op_long_int_pow(
-                    ctx,
-                    op.pc,
-                    op_tag,
-                    &ref_args,
-                    &setup.allboxes,
-                    call_descr,
-                    dst,
-                    dst_bank,
-                )
-            })?
-            .is_some()
-        {
-            return Ok((DispatchOutcome::Continue, op.next_pc));
-        }
         // Residual BINARY_OP used to admit a Python forward dunder here.
         // Flatten now lowers BINARY to `inline_call` of
         // `binary_value_from_tag`, so the residual gate never sees

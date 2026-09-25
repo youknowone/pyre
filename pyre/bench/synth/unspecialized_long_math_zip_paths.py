@@ -1,8 +1,7 @@
-# pyre-check: spec-folds=builtin_zip,zip_two_tuple_iters,binary_op_long_int_pow,math_frexp,math_ldexp
-# The throughput gate for eight hand-written trace-time folds that no other
-# fixture makes fire: `zip` over two tuples (positional and `strict=True`), a
-# long/int comparison, a two-bigint true-divide, `bigint ** int`,
-# `bigint << int` / `bigint >> int`, and `math.frexp` / `math.ldexp`.
+# pyre-check: spec-folds=builtin_zip,zip_two_tuple_iters,math_frexp,math_ldexp
+# Throughput gate for the hand-written folds this file still fires: `zip`
+# over two tuples (positional and `strict=True`), and `math.frexp` /
+# `math.ldexp`. `bigint ** int` is the descended `long_pow` body.
 #
 # Which folds a leg fires is a census question, not a reading of the source:
 # `PYRE_FBW_SPEC_CENSUS=1` prints `fold=<label> consulted=N fired=N` per label.

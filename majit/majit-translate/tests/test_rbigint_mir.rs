@@ -1612,6 +1612,18 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
     assert!(
         pow_calls.iter().any(|segments| segments
             .last()
+            .is_some_and(|leaf| leaf == "jit_bigint_int_pow_nomod")),
+        "long_pow must retarget bigint_int_pow_nomod: {pow_calls:?}"
+    );
+    assert!(
+        !pow_calls.iter().any(|segments| segments
+            .last()
+            .is_some_and(|leaf| leaf == "bigint_int_pow_nomod")),
+        "long_pow retained bigint_int_pow_nomod: {pow_calls:?}"
+    );
+    assert!(
+        pow_calls.iter().any(|segments| segments
+            .last()
             .is_some_and(|leaf| leaf == "jit_bigint_int_eq")),
         "long_pow int_eq(1) must retarget to jit_bigint_int_eq: {pow_calls:?}"
     );

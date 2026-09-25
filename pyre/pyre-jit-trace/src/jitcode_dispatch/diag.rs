@@ -434,7 +434,6 @@ spec_folds! {
     LoadBoundMethodAttr  => ("load_bound_method_attr",   "residual_call", "-"),
     Subscr               => ("subscr",                   "residual_call,inline_call", "-"),
     BinaryOpIntZeroDiv   => ("binary_op_int_zero_div",   "residual_call,inline_call", "-"),
-    BinaryOpLongIntPow   => ("binary_op_long_int_pow",   "residual_call", "-"),
     CompareOpStr         => ("compare_op_str",           "residual_call", "-"),
     Unpack               => ("unpack",                   "residual_call", "-"),
     SubscrTupleDescent   => ("subscr_tuple_descent",     "specialize",    "subscr"),

@@ -9923,17 +9923,10 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         })? {
                             return Ok((outcome, op.next_pc));
                         }
-                        // Exact int pairs have already been taken
-                        // whole by `binary_op_descent`, including overflow and
-                        // zero-division exception arms.
-                        // `descr_pow` keeps a `W_IntObject` exponent unwrapped
-                        // and calls `rbigint.int_pow`. Descent still stops in
-                        // `long_pow`, so this fold remains.
-                        spec_gate(SpecFold::BinaryOpLongIntPow, || {
-                            try_walker_specialize_binary_op_long_int_pow(
-                                ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
-                            )
-                        })?
+                        // Exact int pairs and long `**` are recorded by
+                        // `binary_op_descent` (`long_pow` →
+                        // `jit_bigint_int_pow_nomod`).
+                        None
                     }
                 } else if op_tag == 10 && ctx.is_authoritative_executor {
                     // `op_tag == 10` is CHECK_EXC_MATCH
