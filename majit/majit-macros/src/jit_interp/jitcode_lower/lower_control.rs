@@ -593,6 +593,9 @@ impl<'c> Lowerer<'c> {
             // refuses there.
             dispatch_loop_label: None,
             pc_pinned: self.pc_pinned,
+            // The body does not copy bindings back. Assignments to names that
+            // existed here move into those registers (`insert_renamings`).
+            join_merge: self.enclosing_join_merge(),
             // Never inherited: a loop body statement is not the arm body's
             // tail, so a `return` inside it must be rejected, not lowered.
             inline_arm_tail_stmt: false,
@@ -1329,6 +1332,197 @@ mod unroll_binding_tests {
             lowerer.lower_while_loop(&expr).is_none(),
             "a labelled continue must not retarget the innermost header"
         );
+    }
+
+    fn bind_loop_locals(lowerer: &mut Lowerer<'_>) {
+        for (name, reg) in [("found", 1u16), ("i", 2u16), ("n", 3u16)] {
+            lowerer.bindings.insert(name.to_string(), int_binding(reg));
+        }
+        // The inserted registers are already live. A later `alloc_reg` must
+        // not hand one of them out as a temporary.
+        lowerer.next_reg = 4;
+    }
+
+    fn moves_into(lowerer: &Lowerer<'_>, reg: u16) -> usize {
+        lowerer
+            .op_metadata
+            .iter()
+            .filter(|op| op.kind == OpKind::MoveI && op.writes == vec![Register::int(reg)])
+            .count()
+    }
+
+    /// `found = i + 1; break` must copy into the pre-loop register.
+    /// `lower_local_reassign` used to rebind only the nested loop lowerer, so
+    /// the header and the exit kept reading the initializer's register and no
+    /// `move_i` wrote it.
+    #[test]
+    fn loop_reassign_before_break_writes_the_header_register() {
+        let mut lowerer = Lowerer::new(None);
+        bind_loop_locals(&mut lowerer);
+        let expr: syn::ExprWhile = syn::parse_quote! {
+            while i < n {
+                if i == 1 {
+                    found = i + 1;
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+        };
+        assert!(lowerer.lower_while_loop(&expr).is_some());
+        assert_eq!(lowerer.bindings["found"].reg, 1);
+        assert!(
+            moves_into(&lowerer, 1) >= 1,
+            "the break edge must carry the assignment into found's register"
+        );
+    }
+
+    /// Both arms of a nested `if`/`else` assign `found`. Each edge copies
+    /// into the one header register (`insert_renamings`).
+    #[test]
+    fn loop_reassign_in_both_nested_if_arms_writes_the_header_register() {
+        let mut lowerer = Lowerer::new(None);
+        bind_loop_locals(&mut lowerer);
+        let expr: syn::ExprWhile = syn::parse_quote! {
+            while i < n {
+                if i < n {
+                    if i == 1 {
+                        found = i + 1;
+                    } else {
+                        found = 0;
+                    }
+                }
+                i += 1;
+            }
+        };
+        assert!(lowerer.lower_while_loop(&expr).is_some());
+        assert_eq!(lowerer.bindings["found"].reg, 1);
+        assert!(
+            moves_into(&lowerer, 1) >= 2,
+            "each arm must move its value into found's register, got {}",
+            moves_into(&lowerer, 1)
+        );
+    }
+
+    /// `found = i + 1; continue` carries the value on the back edge, not only
+    /// on `break`.
+    #[test]
+    fn loop_reassign_before_continue_writes_the_header_register() {
+        let mut lowerer = Lowerer::new(None);
+        bind_loop_locals(&mut lowerer);
+        let expr: syn::ExprWhile = syn::parse_quote! {
+            while i < n {
+                if i == 1 {
+                    found = i + 1;
+                    continue;
+                } else {
+                    i += 1;
+                }
+            }
+        };
+        assert!(lowerer.lower_while_loop(&expr).is_some());
+        assert_eq!(lowerer.bindings["found"].reg, 1);
+        assert_eq!(lowerer.bindings["i"].reg, 2);
+        assert!(
+            moves_into(&lowerer, 1) >= 1,
+            "the continue edge must carry the assignment into found's register"
+        );
+    }
+
+    /// `if c { found = 5; }` is a join. The arm lowerer drops its bindings, so
+    /// the assignment must move into the pre-`if` register (`mergeblock`).
+    #[test]
+    fn if_reassign_writes_the_pre_if_register() {
+        let mut lowerer = Lowerer::new(None);
+        bind_loop_locals(&mut lowerer);
+        let expr: syn::ExprIf = syn::parse_quote! {
+            if i == 1 {
+                found = 5;
+            }
+        };
+        assert!(lowerer.lower_if_stmt(&expr).is_some());
+        assert_eq!(lowerer.bindings["found"].reg, 1);
+        assert!(
+            moves_into(&lowerer, 1) >= 1,
+            "the taken arm must move into found's register"
+        );
+    }
+
+    /// Both arms assign. Each predecessor copies into the one join register.
+    #[test]
+    fn if_else_reassign_in_both_arms_writes_the_pre_if_register() {
+        let mut lowerer = Lowerer::new(None);
+        bind_loop_locals(&mut lowerer);
+        let expr: syn::ExprIf = syn::parse_quote! {
+            if i == 1 {
+                found = i + 1;
+            } else {
+                found = 0;
+            }
+        };
+        assert!(lowerer.lower_if_stmt(&expr).is_some());
+        assert_eq!(lowerer.bindings["found"].reg, 1);
+        assert!(
+            moves_into(&lowerer, 1) >= 2,
+            "each arm must move into found's register, got {}",
+            moves_into(&lowerer, 1)
+        );
+    }
+
+    /// `match` arms are the same join. Both must land in the pre-match register.
+    #[test]
+    fn match_reassign_in_both_arms_writes_the_pre_match_register() {
+        let mut lowerer = Lowerer::new(None);
+        bind_loop_locals(&mut lowerer);
+        let expr: syn::ExprMatch = syn::parse_quote! {
+            match i {
+                1 => {
+                    found = i + 1;
+                }
+                _ => {
+                    found = 0;
+                }
+            }
+        };
+        assert!(lowerer.lower_match_stmt(&expr).is_some());
+        assert_eq!(lowerer.bindings["found"].reg, 1);
+        assert!(
+            moves_into(&lowerer, 1) >= 2,
+            "each match arm must move into found's register, got {}",
+            moves_into(&lowerer, 1)
+        );
+    }
+
+    /// `+=` already writes the existing register, in a loop and in an `if`.
+    #[test]
+    fn if_local_update_writes_the_pre_if_register() {
+        let mut lowerer = Lowerer::new(None);
+        bind_loop_locals(&mut lowerer);
+        let expr: syn::ExprIf = syn::parse_quote! {
+            if i == 1 {
+                found += 1;
+            }
+        };
+        assert!(lowerer.lower_if_stmt(&expr).is_some());
+        assert_eq!(lowerer.bindings["found"].reg, 1);
+        assert!(
+            lowerer
+                .op_metadata
+                .iter()
+                .any(|op| { op.kind == OpKind::BinopI && op.writes == vec![Register::int(1)] }),
+            "found += 1 must update found's register in place"
+        );
+    }
+
+    /// No join follows a straight-line assignment, so the name rebinds.
+    #[test]
+    fn straight_line_reassign_rebinds_instead_of_moving() {
+        let mut lowerer = Lowerer::new(None);
+        bind_loop_locals(&mut lowerer);
+        let stmt: syn::Stmt = syn::parse_quote! { found = 5; };
+        assert!(lowerer.lower_stmt(&stmt).is_some());
+        assert_ne!(lowerer.bindings["found"].reg, 1);
+        assert_eq!(moves_into(&lowerer, 1), 0);
     }
 
     #[test]

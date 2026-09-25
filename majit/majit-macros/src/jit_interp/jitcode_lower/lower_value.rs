@@ -1018,13 +1018,16 @@ impl<'c> Lowerer<'c> {
     /// considered equal to arg0, so the LHS aliases the RHS binding
     /// (`x = promote(y)` makes `x` read from y's register).
     /// Reassign a local variable that already has a binding: `pc = expr`.
-    /// Lowers the RHS via `lower_value_expr` and rebinds the LHS name to
-    /// the new register. RPython parity: the flat dispatch's
-    /// `pc = target; continue` updates the JitCode's pc register in-place
-    /// (`flatten.py` emits a goto to the bytecode label, not an SSA rename,
-    /// but majit's binding model is SSA-like — rebinding the name achieves
-    /// the same effect because subsequent reads of `pc` pick up the new
-    /// register).
+    /// Lowers the RHS via `lower_value_expr`. On a straight-line lowerer the
+    /// name is rebound to the RHS register. Across a join (`join_merge`,
+    /// from `FlowContext.mergeblock`) the enclosing register is the one
+    /// variable, so the RHS is moved into it (`GraphFlattener.insert_renamings`)
+    /// and the name keeps that register.
+    /// RPython parity: the flat dispatch's `pc = target; continue` updates
+    /// the JitCode's pc register in-place (`flatten.py` emits a goto to the
+    /// bytecode label, not an SSA rename, but majit's binding model is
+    /// SSA-like — rebinding the name achieves the same effect because
+    /// subsequent reads of `pc` pick up the new register).
     pub(super) fn lower_local_reassign(&mut self, expr: &Expr) -> Option<()> {
         let Expr::Assign(assign) = expr else {
             return None;
@@ -1039,7 +1042,48 @@ impl<'c> Lowerer<'c> {
         if lhs_ident == "pc" && !self.pc_pinned {
             return None;
         }
+        let lhs = self.bindings.get(&lhs_ident)?.clone();
+        // Still the enclosing binding, not a `let` that shadowed it. The
+        // join reads this register; a kind change has no single link
+        // argument (`FrameState.union`).
+        let merges = self.join_merge.get(&lhs_ident).copied() == Some(lhs.reg);
+        // Same refusal as `lower_local_update`: a green is a caller local
+        // threaded through the merge point, and writing this body's register
+        // would not carry the value back. Refuse before the RHS emits.
+        if merges
+            && let Some(config) = self.config
+            && super::lower_stmt::green_idents(config).contains(&lhs_ident)
+        {
+            return None;
+        }
         let binding = self.lower_value_expr(&assign.right)?;
+        if merges {
+            if lhs.kind != binding.kind {
+                return None;
+            }
+            if lhs.reg != binding.reg {
+                let dst = lhs.reg;
+                let src = binding.reg;
+                let (op_kind, tokens) = match binding.kind {
+                    BindingKind::Int => (OpKind::MoveI, quote! { __builder.move_i(#dst, #src); }),
+                    BindingKind::Ref => (OpKind::MoveR, quote! { __builder.move_r(#dst, #src); }),
+                    BindingKind::Float => (OpKind::MoveF, quote! { __builder.move_f(#dst, #src); }),
+                };
+                let register = Register::new(binding.kind, dst);
+                self.emit_op(
+                    OpMeta::linear(
+                        op_kind,
+                        vec![Register::from_binding(&binding)],
+                        vec![register],
+                    ),
+                    tokens,
+                );
+            }
+            let mut kept = lhs;
+            kept.struct_type = binding.struct_type;
+            self.bindings.insert(lhs_ident, kept);
+            return Some(());
+        }
         self.bindings.insert(lhs_ident, binding);
         Some(())
     }
@@ -3141,6 +3185,7 @@ impl<'c> Lowerer<'c> {
             in_dispatch_arm_body: self.in_dispatch_arm_body,
             dispatch_loop_label: self.dispatch_loop_label.clone(),
             pc_pinned: self.pc_pinned,
+            join_merge: self.enclosing_join_merge(),
             // Never inherited: a nested block statement is not the arm body's
             // tail, so a `return` inside it must be rejected, not lowered.
             inline_arm_tail_stmt: false,
@@ -3184,6 +3229,7 @@ impl<'c> Lowerer<'c> {
             in_dispatch_arm_body: self.in_dispatch_arm_body,
             dispatch_loop_label: self.dispatch_loop_label.clone(),
             pc_pinned: self.pc_pinned,
+            join_merge: self.enclosing_join_merge(),
             // Never inherited: a branch arm's value expression is not the arm
             // body's tail, so a `return` inside it must be rejected.
             inline_arm_tail_stmt: false,

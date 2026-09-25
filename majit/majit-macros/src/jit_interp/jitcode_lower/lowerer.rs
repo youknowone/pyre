@@ -98,6 +98,16 @@ pub(super) struct Lowerer<'c> {
     /// the sub-JitCode arm path (BC_INLINE_CALL copies args caller→callee
     /// only, so a sub-JitCode pc-write cannot reach the dispatch reg0).
     pub(super) pc_pinned: bool,
+    /// Name → register for bindings that existed in the enclosing lowerer.
+    ///
+    /// This lowerer's bindings are not copied back (`lower_branch_expr`,
+    /// `lower_loop_body`). `flowcontext.py` `FlowContext.mergeblock` /
+    /// `framestate.py` `FrameState.union` give that join one variable, and
+    /// `flatten.py` `GraphFlattener.insert_renamings` copies each predecessor
+    /// into it. An assignment whose current register is still one of these
+    /// moves into it. A straight-line lowerer leaves the map empty and
+    /// rebinds. A `let` that shadows the name is absent here and rebinds too.
+    pub(super) join_merge: HashMap<String, u16>,
     /// One-shot marker for "the statement `lower_stmt` is about to lower is
     /// the inline dispatch arm body's FINAL statement".  Set per-statement by
     /// `try_inline_dispatch_arm` and **consumed** (`mem::take`) at the top of
@@ -166,10 +176,20 @@ impl<'c> Lowerer<'c> {
             in_dispatch_arm_body: false,
             dispatch_loop_label: None,
             pc_pinned: false,
+            join_merge: HashMap::new(),
             inline_arm_tail_stmt: false,
         };
         this.install_vable_input_binding();
         this
+    }
+
+    /// Registers a nested lowerer must keep writing. The caller's bindings
+    /// do not come back from `lower_branch_expr` or `lower_loop_body`.
+    pub(super) fn enclosing_join_merge(&self) -> HashMap<String, u16> {
+        self.bindings
+            .iter()
+            .map(|(name, binding)| (name.clone(), binding.reg))
+            .collect()
     }
 
     /// Consume the recorded refusal reason, falling back to the historical
