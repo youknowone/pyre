@@ -26,7 +26,12 @@ fn encode_varint_bytes(value: i32) -> ([u8; 3], usize) {
     } else if item < (1 << 14) {
         ([(item | 0x80) as u8, (item >> 7) as u8, 0], 2)
     } else {
-        assert!(item < (1 << 16), "resumecode item too large: {item}");
+        // `resumecode.py` `append_numbering` asserts `item < 2**16` because
+        // `append_int` feeds it a SHORT. A jitcode pc is a `fix_labels`
+        // target (`0 <= target <= 0xFFFF`); its zigzag is `target * 2` and
+        // still fits this 3-byte form (`item >> 14` in one byte, so
+        // `item < 2**22`).
+        assert!(item < (1 << 22), "resumecode item too large: {item}");
         (
             [
                 (item | 0x80) as u8,
@@ -145,12 +150,16 @@ impl Writer {
     /// rather than a silently-truncated copy.
     #[track_caller]
     pub fn append_int(&mut self, item: i64) {
-        let short = item as i16;
+        // `resumecode.py` `append_int` casts through `rffi.SHORT`. A jitcode
+        // pc is also a `fix_labels` target (`assert 0 <= target <= 0xFFFF`),
+        // so that unsigned range has to round-trip too.
+        let fits_short = (item as i16) as i64 == item;
+        let fits_label = (0..=u16::MAX as i64).contains(&item);
         assert!(
-            short as i64 == item,
-            "append_int: value {item} out of i16 range"
+            fits_short || fits_label,
+            "append_int: value {item} out of i16 range and fix_labels u16 range"
         );
-        self.append_short(short as i32);
+        self.append_short(item as i32);
     }
 
     /// resumecode.py: create_numbering
@@ -429,7 +438,9 @@ mod tests {
             ("one_byte", &[0, 1, -1, 63, -63]),
             (
                 "two_and_three_byte",
-                &[64, -64, 127, -128, 8191, -8192, 16383, -16384],
+                &[
+                    64, -64, 127, -128, 8191, -8192, 16383, -16384, 32768, 40479, 65535,
+                ],
             ),
         ];
         for (name, values) in cases {
