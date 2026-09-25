@@ -6465,9 +6465,14 @@ impl MiniMarkGC {
             let gcref = unsafe { *root_ptr };
             self.regray_or_seed_major_root(gcref, "registered_root");
         }
-        crate::shadow_stack::walk_extra_roots(|gcref| {
-            self.regray_or_seed_major_root(*gcref, "rescan_extra_root");
-        });
+        // Snapshot before regray. The walker reads interpreter globals while
+        // `regray_or_seed_major_root` mutates the mark state; doing both in
+        // one callback re-enters that state mid-walk.
+        let mut extra_roots = Vec::new();
+        crate::shadow_stack::walk_extra_roots(|gcref| extra_roots.push(*gcref));
+        for gcref in extra_roots {
+            self.regray_or_seed_major_root(gcref, "rescan_extra_root");
+        }
         // TLS exception cells live on the per-mutator frame area for the
         // first pass. Upstream's second `collect_nonstack_roots` still
         // repeats the non-stack carriers that can be written after the
@@ -7498,9 +7503,13 @@ impl MiniMarkGC {
     /// black root can therefore come to hold the only reference to a white
     /// object. Walking these sets once more here can only add survivors.
     fn rescan_major_stack_roots_black_and_drain(&mut self) {
-        Self::walk_stack_shaped_roots(|gcref, _site| {
+        // Same split as the non-stack rescan: finish the walk, then mutate
+        // the mark state. `walk_stack_shaped_roots` reads TLS root slots.
+        let mut roots = Vec::new();
+        Self::walk_stack_shaped_roots(|gcref, _site| roots.push(gcref));
+        for gcref in roots {
             self.regray_or_seed_major_root(gcref, "marking_regray_root");
-        });
+        }
         self.drain_gray_stack();
     }
 
