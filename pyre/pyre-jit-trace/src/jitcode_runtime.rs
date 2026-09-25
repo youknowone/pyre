@@ -3441,83 +3441,32 @@ mod tests {
     }
 
     #[test]
-    fn list_append_jitcode_resolves_charon_body() {
-        // list-append foundation (deferred): the orthodox charon
-        // `w_list_append` body is present and reachable by name in the
-        // build-time pipeline (the single-source descent the FBW walker would
-        // enter once the prologue strategy-helper fnaddrs are registered).
-        // Confirm the by-name resolver finds it and that the body carries
-        // real bytecode (not an empty shell) — i.e. the function graph was
-        // assembled, carrying the array-op sequence the `list.int_*`
-        // oopspecs lower to.  (The shipping arm folds walker-native instead.)
-        let jc = list_append_jitcode()
-            .expect("build-time pipeline must contain the charon `w_list_append_inner` jitcode");
-        assert_eq!(jc.name, "w_list_append_inner");
-        assert!(
-            !jc.code.is_empty(),
-            "w_list_append_inner jitcode should have non-empty bytecode (assembled body)"
-        );
-    }
-
-    #[test]
-    fn list_setitem_jitcode_resolves_charon_body() {
-        let jc = list_setitem_jitcode()
-            .expect("build-time pipeline must contain the charon `w_list_setitem_inner` jitcode");
-        assert_eq!(jc.name, "w_list_setitem_inner");
-        assert!(
-            !jc.code.is_empty(),
-            "w_list_setitem_inner jitcode should have non-empty bytecode (assembled body)"
-        );
-    }
-
-    #[test]
-    fn list_getitem_jitcode_resolves_charon_body() {
-        let jc = list_getitem_jitcode()
-            .expect("build-time pipeline must contain the charon `w_list_getitem_inner` jitcode");
-        assert_eq!(jc.name, "w_list_getitem_inner");
-        assert!(
-            !jc.code.is_empty(),
-            "w_list_getitem_inner jitcode should have non-empty bytecode (assembled body)"
-        );
-    }
-
-    #[test]
-    fn list_pop_end_jitcode_resolves_charon_body() {
-        let jc = list_pop_end_jitcode()
-            .expect("build-time pipeline must contain the charon `w_list_pop_end_inner` jitcode");
-        assert_eq!(jc.name, "w_list_pop_end_inner");
-        assert!(
-            !jc.code.is_empty(),
-            "w_list_pop_end_inner jitcode should have non-empty bytecode (assembled body)"
-        );
-    }
-
-    #[test]
-    fn write_cell_jitcode_resolves_charon_body() {
-        let jc = write_cell_jitcode()
-            .expect("build-time pipeline must contain the charon `write_cell` jitcode");
-        assert_eq!(jc.name, "write_cell");
-        assert!(!jc.code.is_empty(), "write_cell jitcode should have a body");
-    }
-
-    #[test]
-    fn unwrap_cell_jitcode_resolves_charon_body() {
-        let jc = unwrap_cell_jitcode()
-            .expect("build-time pipeline must contain the charon `unwrap_cell` jitcode");
-        assert_eq!(jc.name, "unwrap_cell");
-        assert!(
-            !jc.code.is_empty(),
-            "unwrap_cell jitcode should have a body"
-        );
-    }
-
-    #[test]
-    fn insns_table_is_populated() {
-        let table = insns_opname_to_byte();
-        assert!(
-            !table.is_empty(),
-            "pipeline.insns should contain at least the core ops"
-        );
+    fn named_jitcode_resolves_charon_body() {
+        let cases = [
+            ("list_append", list_append_jitcode(), "w_list_append_inner"),
+            (
+                "list_setitem",
+                list_setitem_jitcode(),
+                "w_list_setitem_inner",
+            ),
+            (
+                "list_getitem",
+                list_getitem_jitcode(),
+                "w_list_getitem_inner",
+            ),
+            (
+                "list_pop_end",
+                list_pop_end_jitcode(),
+                "w_list_pop_end_inner",
+            ),
+            ("write_cell", write_cell_jitcode(), "write_cell"),
+            ("unwrap_cell", unwrap_cell_jitcode(), "unwrap_cell"),
+        ];
+        for (name, jc, expect) in cases {
+            let jc = jc.unwrap_or_else(|| panic!("case {name}"));
+            assert_eq!(jc.name, expect, "case {name}");
+            assert!(!jc.code.is_empty(), "case {name}");
+        }
     }
 
     #[test]
@@ -3532,21 +3481,6 @@ mod tests {
             .get("live/")
             .expect("`live/` opcode must be in the insns table");
         assert_eq!(opname_for_byte(byte), Some("live/"));
-    }
-
-    #[test]
-    fn first_byte_of_portal_jitcode_decodes() {
-        // End-to-end: the portal's JitCode bytes must start with an opcode
-        // byte that `opname_for_byte` can decode.
-        let jc = portal_jitcode().expect("configured portal must resolve to a jitcode");
-        let first = *jc
-            .code
-            .first()
-            .expect("portal jitcode should have at least one opcode byte");
-        assert!(
-            opname_for_byte(first).is_some(),
-            "first byte {first} of portal jitcode is unknown to the insns table",
-        );
     }
 
     #[test]

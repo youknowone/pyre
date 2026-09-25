@@ -112,16 +112,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sum_program_structure() {
-        let prog = sum_program(100);
-        assert!(!prog.is_empty());
-        assert_eq!(prog.last(), Some(&ByteCode::Halt));
-    }
-
-    #[test]
-    fn factorial_program_structure() {
-        let prog = factorial_program(10);
-        assert!(!prog.is_empty());
-        assert_eq!(prog.last(), Some(&ByteCode::Halt));
+    fn built_program_is_nonempty_and_halts() {
+        let cases = [
+            ("sum", sum_program(100)),
+            ("factorial", factorial_program(10)),
+        ];
+        for (name, prog) in cases {
+            assert!(!prog.is_empty(), "case {name}");
+            assert_eq!(prog.last(), Some(&ByteCode::Halt), "case {name}");
+        }
     }
 }

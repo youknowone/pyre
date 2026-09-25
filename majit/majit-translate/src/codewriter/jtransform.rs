@@ -11960,85 +11960,59 @@ mod tests {
         }
     }
 
-    /// The `bool` hop `set_branch` puts before every exitswitch has to come out
-    /// of the rewrite fusable.  Naming the op `int_is_true` is what
-    /// `optimize_goto_if_not` matches on.  Its `concretetype` test is not the
-    /// reason the stamp exists: that gate also takes a non-`Bool` exitswitch
-    /// whose two exits carry the false/true `llexitcase` pair
-    /// (`exits_are_bool_pair`).  The `Bool` stamp is read elsewhere — by this
-    /// rewrite's own identity arm, which drops a hop over an operand already
-    /// stamped `Bool`, and on `null_test_rewrite`'s `ptr_iszero` result.
+    /// A `bool` hop over an int operand fuses to `int_is_true`; the same hop
+    /// over a Ref operand fuses to `ptr_nonzero`. Both keep the `Bool` stamp
+    /// that `optimize_goto_if_not` matches.
     #[test]
-    fn transform_graph_leaves_the_bool_hop_fusable() {
+    fn transform_graph_leaves_bool_hops_fusable() {
         use crate::model::ExitSwitch;
 
-        let mut graph = FunctionGraph::new("bool_hop_fusable");
-        let start = graph.startblock;
-        let a = graph
-            .push_op_var(
-                start,
-                OpKind::Input {
-                    name: "a".into(),
-                    ty: ValueType::Int,
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
-        FunctionGraph::set_concretetype_of_inline(&a, ConcreteType::Signed);
-        let if_true = graph.create_block();
-        let if_false = graph.create_block();
-        graph.set_return(if_true, None);
-        graph.set_return(if_false, None);
-        graph.set_branch(start, a.clone(), if_true, vec![], if_false, vec![]);
+        let cases = [
+            (
+                "bool",
+                "bool_hop_fusable",
+                ValueType::Int,
+                ConcreteType::Signed,
+                "int_is_true",
+            ),
+            (
+                "ref_bool",
+                "ref_bool_hop_fusable",
+                ValueType::Ref(None),
+                ConcreteType::GcRef,
+                "ptr_nonzero",
+            ),
+        ];
+        for (name, graph_name, ty, concrete, opname) in cases {
+            let mut graph = FunctionGraph::new(graph_name);
+            let start = graph.startblock;
+            let a = graph
+                .push_op_var(
+                    start,
+                    OpKind::Input {
+                        name: "a".into(),
+                        ty,
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            FunctionGraph::set_concretetype_of_inline(&a, concrete);
+            let if_true = graph.create_block();
+            let if_false = graph.create_block();
+            graph.set_return(if_true, None);
+            graph.set_return(if_false, None);
+            graph.set_branch(start, a.clone(), if_true, vec![], if_false, vec![]);
 
-        let config = GraphTransformConfig::default();
-        let transformed = Transformer::new(&config).transform(&graph);
-        match &transformed.graph.blocks[start.0].exitswitch {
-            Some(ExitSwitch::Fused { opname, args }) => {
-                assert_eq!(opname, "int_is_true");
-                assert_eq!(args, &vec![a]);
+            let config = GraphTransformConfig::default();
+            let transformed = Transformer::new(&config).transform(&graph);
+            match &transformed.graph.blocks[start.0].exitswitch {
+                Some(ExitSwitch::Fused { opname: got, args }) => {
+                    assert_eq!(got, opname, "case {name}");
+                    assert_eq!(args, &vec![a], "case {name}");
+                }
+                other => panic!("case {name}: expected a fused {opname} exitswitch, got {other:?}"),
             }
-            other => panic!("expected a fused int_is_true exitswitch, got {other:?}"),
-        }
-    }
-
-    /// The Ref-kind sibling of [`transform_graph_leaves_the_bool_hop_fusable`].
-    /// A `bool` hop over a Ref operand rewrites to `ptr_nonzero`, which
-    /// `optimize_goto_if_not` also fuses, and it carries the same `Bool` stamp
-    /// — the value-kind channel banks the result as an int either way.
-    #[test]
-    fn transform_graph_leaves_the_ref_bool_hop_fusable() {
-        use crate::model::ExitSwitch;
-
-        let mut graph = FunctionGraph::new("ref_bool_hop_fusable");
-        let start = graph.startblock;
-        let a = graph
-            .push_op_var(
-                start,
-                OpKind::Input {
-                    name: "a".into(),
-                    ty: ValueType::Ref(None),
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
-        FunctionGraph::set_concretetype_of_inline(&a, ConcreteType::GcRef);
-        let if_true = graph.create_block();
-        let if_false = graph.create_block();
-        graph.set_return(if_true, None);
-        graph.set_return(if_false, None);
-        graph.set_branch(start, a.clone(), if_true, vec![], if_false, vec![]);
-
-        let config = GraphTransformConfig::default();
-        let transformed = Transformer::new(&config).transform(&graph);
-        match &transformed.graph.blocks[start.0].exitswitch {
-            Some(ExitSwitch::Fused { opname, args }) => {
-                assert_eq!(opname, "ptr_nonzero");
-                assert_eq!(args, &vec![a]);
-            }
-            other => panic!("expected a fused ptr_nonzero exitswitch, got {other:?}"),
         }
     }
 
@@ -14071,248 +14045,100 @@ mod tests {
         assert_eq!(residual.0.get_extra_info().oopspecindex, OopSpecIndex::None);
     }
 
+    /// Replace output is not re-traversed in this pass, so these int ops emit
+    /// the llop residual directly instead of leaving a bare div or mod.
     #[test]
-    fn mod_assign_rewrites_directly_to_int_mod_residual() {
-        // Rust low-level → RPython low-level: pyre constructs
-        // `mod_assign` from Rust's `%=` operator on i64, which has
-        // C-truncating remainder semantics.  That maps to RPython's
-        // explicit `llop.int_mod` route (`support.py:266-271
-        // _ll_2_int_mod`), not to Python-level `%=` / `rtype_mod`
-        // (`rint.py:260-262`, which calls `py_mod`).  The assign arm
-        // must emit the `_ll_2_int_mod` residual directly because
-        // `transform_op`'s Replace output is not re-traversed within
-        // the same pass — leaving a bare `mod` here would leak past
-        // the jtransform rewrite gate.
-        let mut graph = FunctionGraph::new("mod_assign_body");
-        let lhs_var = graph
-            .push_op_var(
-                graph.startblock,
-                OpKind::Input {
-                    name: "lhs".into(),
-                    ty: ValueType::Int,
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
-        let rhs_var = graph
-            .push_op_var(
-                graph.startblock,
-                OpKind::Input {
-                    name: "rhs".into(),
-                    ty: ValueType::Int,
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
-        let result_var = graph
-            .push_op_var(
-                graph.startblock,
-                OpKind::BinOp {
-                    op: "mod_assign".to_string(),
-                    lhs: lhs_var.clone(),
-                    rhs: rhs_var.clone(),
-                    result_ty: ValueType::Int,
-                },
-                true,
-            )
-            .unwrap();
-        graph.set_return(graph.startblock, Some(result_var.clone()));
+    fn int_divmod_rewrites_directly_to_residual() {
+        let cases: &[(&str, &str, &str, &[&str])] = &[
+            (
+                "mod_assign",
+                "mod_assign_body",
+                "mod_assign",
+                &["mod_assign", "mod"],
+            ),
+            (
+                "div_assign",
+                "div_assign_body",
+                "div_assign",
+                &["div_assign", "div", "floordiv"],
+            ),
+            ("plain_div", "int_div_body", "div", &["div", "floordiv"]),
+        ];
+        for &(name, graph_name, binop, forbidden) in cases {
+            let mut graph = FunctionGraph::new(graph_name);
+            let lhs_var = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: "lhs".into(),
+                        ty: ValueType::Int,
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            let rhs_var = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: "rhs".into(),
+                        ty: ValueType::Int,
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            let result_var = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::BinOp {
+                        op: binop.to_string(),
+                        lhs: lhs_var.clone(),
+                        rhs: rhs_var.clone(),
+                        result_ty: ValueType::Int,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.set_return(graph.startblock, Some(result_var.clone()));
 
-        FunctionGraph::set_concretetype_of_inline(&lhs_var, ConcreteType::Signed);
-        FunctionGraph::set_concretetype_of_inline(&rhs_var, ConcreteType::Signed);
-        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::Signed);
-        let config = GraphTransformConfig::default();
-        let mut cc = crate::call::CallControl::new();
-        let transformed = Transformer::new(&config)
-            .with_callcontrol(&mut cc)
-            .transform(&graph);
+            FunctionGraph::set_concretetype_of_inline(&lhs_var, ConcreteType::Signed);
+            FunctionGraph::set_concretetype_of_inline(&rhs_var, ConcreteType::Signed);
+            FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::Signed);
+            let config = GraphTransformConfig::default();
+            let mut cc = crate::call::CallControl::new();
+            let transformed = Transformer::new(&config)
+                .with_callcontrol(&mut cc)
+                .transform(&graph);
 
-        let ops = &transformed.graph.block(graph.startblock).operations;
-        assert!(
+            let ops = &transformed.graph.block(graph.startblock).operations;
+            assert!(
             !ops.iter().any(|op| matches!(
                 &op.kind,
-                OpKind::BinOp { op, .. } if op == "mod_assign" || op == "mod"
+                OpKind::BinOp { op, .. } if forbidden.iter().any(|forbidden_name| op == forbidden_name)
             )),
-            "mod_assign must not survive as a bare BinOp: {ops:?}"
+            "case {name}: binop must not survive: {ops:?}"
         );
-        let residual = ops
-            .iter()
-            .find_map(|op| match &op.kind {
-                OpKind::CallResidual {
-                    descriptor,
-                    result_kind,
-                    args_i,
-                    ..
-                } => Some((descriptor, *result_kind, args_i)),
-                _ => None,
-            })
-            .expect("mod_assign must rewrite to residual _ll_2_int_mod call");
-        assert_eq!(residual.1, 'i');
-        assert_eq!(residual.2, &vec![lhs_var, rhs_var]);
-        assert_eq!(residual.0.result_ir_type(), majit_ir::Type::Int);
-    }
-
-    #[test]
-    fn div_assign_rewrites_directly_to_int_floordiv_residual() {
-        // Rust low-level → RPython low-level: pyre constructs
-        // `div_assign` from Rust's `/=` operator on i64, which has
-        // C-truncating division semantics.  That maps to RPython's
-        // explicit `llop.int_floordiv` route (`support.py
-        // _ll_2_int_floordiv`), not to Python-level `/=` /
-        // `rtype_inplace_div` (`rint.py`, which aliases to
-        // `rtype_floordiv` and calls `py_div`).  The assign arm
-        // aliases `"div"` to `floordiv` and emits the residual
-        // directly so no bare `div` / `floordiv` survives this pass.
-        let mut graph = FunctionGraph::new("div_assign_body");
-        let lhs_var = graph
-            .push_op_var(
-                graph.startblock,
-                OpKind::Input {
-                    name: "lhs".into(),
-                    ty: ValueType::Int,
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
-        let rhs_var = graph
-            .push_op_var(
-                graph.startblock,
-                OpKind::Input {
-                    name: "rhs".into(),
-                    ty: ValueType::Int,
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
-        let result_var = graph
-            .push_op_var(
-                graph.startblock,
-                OpKind::BinOp {
-                    op: "div_assign".to_string(),
-                    lhs: lhs_var.clone(),
-                    rhs: rhs_var.clone(),
-                    result_ty: ValueType::Int,
-                },
-                true,
-            )
-            .unwrap();
-        graph.set_return(graph.startblock, Some(result_var.clone()));
-
-        FunctionGraph::set_concretetype_of_inline(&lhs_var, ConcreteType::Signed);
-        FunctionGraph::set_concretetype_of_inline(&rhs_var, ConcreteType::Signed);
-        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::Signed);
-        let config = GraphTransformConfig::default();
-        let mut cc = crate::call::CallControl::new();
-        let transformed = Transformer::new(&config)
-            .with_callcontrol(&mut cc)
-            .transform(&graph);
-
-        let ops = &transformed.graph.block(graph.startblock).operations;
-        assert!(
-            !ops.iter().any(|op| matches!(
-                &op.kind,
-                OpKind::BinOp { op, .. }
-                    if op == "div_assign" || op == "div" || op == "floordiv"
-            )),
-            "div_assign must not survive as a bare BinOp: {ops:?}"
-        );
-        let residual = ops
-            .iter()
-            .find_map(|op| match &op.kind {
-                OpKind::CallResidual {
-                    descriptor,
-                    result_kind,
-                    args_i,
-                    ..
-                } => Some((descriptor, *result_kind, args_i)),
-                _ => None,
-            })
-            .expect("div_assign must rewrite to residual _ll_2_int_floordiv call");
-        assert_eq!(residual.1, 'i');
-        assert_eq!(residual.2, &vec![lhs_var, rhs_var]);
-        assert_eq!(residual.0.result_ir_type(), majit_ir::Type::Int);
-    }
-
-    #[test]
-    fn plain_int_div_rewrites_directly_to_int_floordiv_residual() {
-        // `rint.py rtype_div = rtype_floordiv`: a plain
-        // `BinOp { op:"div" }` over int operands (Rust `a / b` on
-        // i64s) routes through the same `_ll_2_int_floordiv`
-        // residual as `floordiv`.  RPython has no `int_div` op; the
-        // rtyper aliases `div` to `floordiv` for integer reprs.
-        let mut graph = FunctionGraph::new("int_div_body");
-        let lhs_var = graph
-            .push_op_var(
-                graph.startblock,
-                OpKind::Input {
-                    name: "lhs".into(),
-                    ty: ValueType::Int,
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
-        let rhs_var = graph
-            .push_op_var(
-                graph.startblock,
-                OpKind::Input {
-                    name: "rhs".into(),
-                    ty: ValueType::Int,
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
-        let result_var = graph
-            .push_op_var(
-                graph.startblock,
-                OpKind::BinOp {
-                    op: "div".to_string(),
-                    lhs: lhs_var.clone(),
-                    rhs: rhs_var.clone(),
-                    result_ty: ValueType::Int,
-                },
-                true,
-            )
-            .unwrap();
-        graph.set_return(graph.startblock, Some(result_var.clone()));
-
-        FunctionGraph::set_concretetype_of_inline(&lhs_var, ConcreteType::Signed);
-        FunctionGraph::set_concretetype_of_inline(&rhs_var, ConcreteType::Signed);
-        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::Signed);
-        let config = GraphTransformConfig::default();
-        let mut cc = crate::call::CallControl::new();
-        let transformed = Transformer::new(&config)
-            .with_callcontrol(&mut cc)
-            .transform(&graph);
-
-        let ops = &transformed.graph.block(graph.startblock).operations;
-        assert!(
-            !ops.iter().any(|op| matches!(
-                &op.kind,
-                OpKind::BinOp { op, .. } if op == "div" || op == "floordiv"
-            )),
-            "plain int div must not survive as a bare BinOp: {ops:?}"
-        );
-        let residual = ops
-            .iter()
-            .find_map(|op| match &op.kind {
-                OpKind::CallResidual {
-                    descriptor,
-                    result_kind,
-                    args_i,
-                    ..
-                } => Some((descriptor, *result_kind, args_i)),
-                _ => None,
-            })
-            .expect("int div must rewrite to residual _ll_2_int_floordiv call");
-        assert_eq!(residual.1, 'i');
-        assert_eq!(residual.2, &vec![lhs_var, rhs_var]);
-        assert_eq!(residual.0.result_ir_type(), majit_ir::Type::Int);
+            let residual = ops
+                .iter()
+                .find_map(|op| match &op.kind {
+                    OpKind::CallResidual {
+                        descriptor,
+                        result_kind,
+                        args_i,
+                        ..
+                    } => Some((descriptor, *result_kind, args_i)),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("case {name}: must rewrite to a residual call"));
+            assert_eq!(residual.1, 'i', "case {name}");
+            assert_eq!(residual.2, &vec![lhs_var, rhs_var], "case {name}");
+            assert_eq!(
+                residual.0.result_ir_type(),
+                majit_ir::Type::Int,
+                "case {name}"
+            );
+        }
     }
 
     #[test]
@@ -17350,100 +17176,75 @@ mod tests {
         }
     }
 
-    /// The MIR front rewrites `f64::from_bits` to
-    /// `longlong2float.longlong2float`. `LongLong2FloatEntry.specialize_call`
-    /// emits `convert_longlong_bytes_to_float`; a leftover Call here
-    /// must do the same rather than residualize the path.
+    /// `longlong2float` rewrites to `convert_longlong_bytes_to_float` and
+    /// `float2longlong` rewrites to `convert_float_bytes_to_longlong`.
     #[test]
-    fn longlong2float_call_rewrites_to_convert_llop() {
-        let config = GraphTransformConfig::default();
-        let mut transformer = Transformer::new(&config);
-        let mut graph = FunctionGraph::new("longlong2float_call");
-        let bits = graph.alloc_value_var_with_type(ConcreteType::Signed);
-        let result_var = graph.alloc_value_var_with_type(ConcreteType::Float);
-        let target = CallTarget::function_path(["longlong2float", "longlong2float"]);
-        let result_ty = ValueType::Float;
-        let op = SpaceOperation {
-            result: Some(result_var.clone()),
-            kind: OpKind::Call {
-                target: target.clone(),
-                args: crate::model::call_args(vec![bits.clone()]),
-                result_ty: result_ty.clone(),
-            },
-        };
-        let rewritten = transformer.rewrite_op_direct_call(
-            &op,
-            &target,
-            std::slice::from_ref(&bits),
-            &result_ty,
-            "longlong2float_call",
-            &mut graph,
-        );
-        match rewritten {
-            RewriteResult::Replace(ops) => {
-                assert_eq!(ops.len(), 1);
-                match &ops[0].kind {
-                    OpKind::UnaryOp {
-                        op,
-                        operand,
-                        result_ty,
-                    } => {
-                        assert_eq!(op, "convert_longlong_bytes_to_float");
-                        assert_eq!(operand, &bits);
-                        assert_eq!(*result_ty, ValueType::Float);
+    fn float_longlong_calls_rewrite_to_convert_llop() {
+        let cases = [
+            (
+                "longlong2float",
+                "longlong2float_call",
+                ConcreteType::Signed,
+                ConcreteType::Float,
+                ["longlong2float", "longlong2float"],
+                ValueType::Float,
+                "convert_longlong_bytes_to_float",
+                ValueType::Float,
+            ),
+            (
+                "float2longlong",
+                "float2longlong_call",
+                ConcreteType::Float,
+                ConcreteType::Signed,
+                ["longlong2float", "float2longlong"],
+                ValueType::Int,
+                "convert_float_bytes_to_longlong",
+                ValueType::Int,
+            ),
+        ];
+        for (name, graph_name, arg_ty, result_concrete, path, result_ty, opname, unary_ty) in cases
+        {
+            let config = GraphTransformConfig::default();
+            let mut transformer = Transformer::new(&config);
+            let mut graph = FunctionGraph::new(graph_name);
+            let arg = graph.alloc_value_var_with_type(arg_ty);
+            let result_var = graph.alloc_value_var_with_type(result_concrete);
+            let target = CallTarget::function_path(path);
+            let op = SpaceOperation {
+                result: Some(result_var.clone()),
+                kind: OpKind::Call {
+                    target: target.clone(),
+                    args: crate::model::call_args(vec![arg.clone()]),
+                    result_ty: result_ty.clone(),
+                },
+            };
+            let rewritten = transformer.rewrite_op_direct_call(
+                &op,
+                &target,
+                std::slice::from_ref(&arg),
+                &result_ty,
+                graph_name,
+                &mut graph,
+            );
+            match rewritten {
+                RewriteResult::Replace(ops) => {
+                    assert_eq!(ops.len(), 1, "case {name}");
+                    match &ops[0].kind {
+                        OpKind::UnaryOp {
+                            op,
+                            operand,
+                            result_ty,
+                        } => {
+                            assert_eq!(op, opname, "case {name}");
+                            assert_eq!(operand, &arg, "case {name}");
+                            assert_eq!(*result_ty, unary_ty, "case {name}");
+                        }
+                        other => panic!("case {name}: expected {opname}, got {other:?}"),
                     }
-                    other => panic!("expected convert_longlong_bytes_to_float, got {other:?}"),
+                    assert_eq!(ops[0].result.as_ref(), Some(&result_var), "case {name}");
                 }
-                assert_eq!(ops[0].result.as_ref(), Some(&result_var));
+                _ => panic!("case {name}: expected Replace({opname})"),
             }
-            _ => panic!("expected Replace(convert_longlong_bytes_to_float)"),
-        }
-    }
-
-    /// `float2longlong` is the inverse: `convert_float_bytes_to_longlong`.
-    #[test]
-    fn float2longlong_call_rewrites_to_convert_llop() {
-        let config = GraphTransformConfig::default();
-        let mut transformer = Transformer::new(&config);
-        let mut graph = FunctionGraph::new("float2longlong_call");
-        let value = graph.alloc_value_var_with_type(ConcreteType::Float);
-        let result_var = graph.alloc_value_var_with_type(ConcreteType::Signed);
-        let target = CallTarget::function_path(["longlong2float", "float2longlong"]);
-        let result_ty = ValueType::Int;
-        let op = SpaceOperation {
-            result: Some(result_var.clone()),
-            kind: OpKind::Call {
-                target: target.clone(),
-                args: crate::model::call_args(vec![value.clone()]),
-                result_ty: result_ty.clone(),
-            },
-        };
-        let rewritten = transformer.rewrite_op_direct_call(
-            &op,
-            &target,
-            std::slice::from_ref(&value),
-            &result_ty,
-            "float2longlong_call",
-            &mut graph,
-        );
-        match rewritten {
-            RewriteResult::Replace(ops) => {
-                assert_eq!(ops.len(), 1);
-                match &ops[0].kind {
-                    OpKind::UnaryOp {
-                        op,
-                        operand,
-                        result_ty,
-                    } => {
-                        assert_eq!(op, "convert_float_bytes_to_longlong");
-                        assert_eq!(operand, &value);
-                        assert_eq!(*result_ty, ValueType::Int);
-                    }
-                    other => panic!("expected convert_float_bytes_to_longlong, got {other:?}"),
-                }
-                assert_eq!(ops[0].result.as_ref(), Some(&result_var));
-            }
-            _ => panic!("expected Replace(convert_float_bytes_to_longlong)"),
         }
     }
 
@@ -20292,74 +20093,45 @@ mod tests {
     }
 
     #[test]
-    fn indirect_regular_call_r_i() {
-        check_indirect_regular_call_kind(&[], ValueType::Int, (0, 1, 0), 'i');
-    }
-    #[test]
-    fn indirect_regular_call_r_r() {
-        check_indirect_regular_call_kind(&[], ValueType::Ref(None), (0, 1, 0), 'r');
-    }
-    #[test]
-    fn indirect_regular_call_r_f() {
-        check_indirect_regular_call_kind(&[], ValueType::Float, (0, 1, 0), 'f');
-    }
-    #[test]
-    fn indirect_regular_call_r_v() {
-        check_indirect_regular_call_kind(&[], ValueType::Void, (0, 1, 0), 'v');
-    }
-
-    #[test]
-    fn indirect_regular_call_ir_i() {
-        check_indirect_regular_call_kind(&[ValueType::Int], ValueType::Int, (1, 1, 0), 'i');
-    }
-    #[test]
-    fn indirect_regular_call_ir_r() {
-        check_indirect_regular_call_kind(&[ValueType::Int], ValueType::Ref(None), (1, 1, 0), 'r');
-    }
-    #[test]
-    fn indirect_regular_call_ir_f() {
-        check_indirect_regular_call_kind(&[ValueType::Int], ValueType::Float, (1, 1, 0), 'f');
-    }
-    #[test]
-    fn indirect_regular_call_ir_v() {
-        check_indirect_regular_call_kind(&[ValueType::Int], ValueType::Void, (1, 1, 0), 'v');
+    fn indirect_regular_call_kinds() {
+        let none: &[ValueType] = &[];
+        let int_only: &[ValueType] = &[ValueType::Int];
+        let int_float: &[ValueType] = &[ValueType::Int, ValueType::Float];
+        let arg_sets: &[(&str, &[ValueType], (usize, usize, usize))] = &[
+            ("r", none, (0, 1, 0)),
+            ("ir", int_only, (1, 1, 0)),
+            ("irf", int_float, (1, 1, 1)),
+        ];
+        let results = [
+            ("i", ValueType::Int, 'i'),
+            ("r", ValueType::Ref(None), 'r'),
+            ("f", ValueType::Float, 'f'),
+            ("v", ValueType::Void, 'v'),
+        ];
+        for (arg_name, extras, expect) in arg_sets {
+            for (res_name, result_ty, kind) in &results {
+                let name = format!("{arg_name}_{res_name}");
+                let result_ty = result_ty.clone();
+                let kind = *kind;
+                let expect = *expect;
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    check_indirect_regular_call_kind(extras, result_ty, expect, kind);
+                }));
+                if let Err(payload) = result {
+                    panic!("case {name}: {}", panic_payload_jt(&payload));
+                }
+            }
+        }
     }
 
-    #[test]
-    fn indirect_regular_call_irf_i() {
-        check_indirect_regular_call_kind(
-            &[ValueType::Int, ValueType::Float],
-            ValueType::Int,
-            (1, 1, 1),
-            'i',
-        );
-    }
-    #[test]
-    fn indirect_regular_call_irf_r() {
-        check_indirect_regular_call_kind(
-            &[ValueType::Int, ValueType::Float],
-            ValueType::Ref(None),
-            (1, 1, 1),
-            'r',
-        );
-    }
-    #[test]
-    fn indirect_regular_call_irf_f() {
-        check_indirect_regular_call_kind(
-            &[ValueType::Int, ValueType::Float],
-            ValueType::Float,
-            (1, 1, 1),
-            'f',
-        );
-    }
-    #[test]
-    fn indirect_regular_call_irf_v() {
-        check_indirect_regular_call_kind(
-            &[ValueType::Int, ValueType::Float],
-            ValueType::Void,
-            (1, 1, 1),
-            'v',
-        );
+    fn panic_payload_jt(payload: &Box<dyn std::any::Any + Send>) -> String {
+        if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else if let Some(s) = payload.downcast_ref::<&str>() {
+            (*s).to_string()
+        } else {
+            "assertion failed".to_string()
+        }
     }
 
     // ── Kind matrix: `indirect_residual_call_{r,ir,irf}_{i,r,f,v}` ───
@@ -20541,74 +20313,35 @@ mod tests {
     }
 
     #[test]
-    fn indirect_residual_call_r_i() {
-        check_indirect_residual_call_kind(&[], ValueType::Int, (0, 1, 0), 'i');
-    }
-    #[test]
-    fn indirect_residual_call_r_r() {
-        check_indirect_residual_call_kind(&[], ValueType::Ref(None), (0, 1, 0), 'r');
-    }
-    #[test]
-    fn indirect_residual_call_r_f() {
-        check_indirect_residual_call_kind(&[], ValueType::Float, (0, 1, 0), 'f');
-    }
-    #[test]
-    fn indirect_residual_call_r_v() {
-        check_indirect_residual_call_kind(&[], ValueType::Void, (0, 1, 0), 'v');
-    }
-
-    #[test]
-    fn indirect_residual_call_ir_i() {
-        check_indirect_residual_call_kind(&[ValueType::Int], ValueType::Int, (1, 1, 0), 'i');
-    }
-    #[test]
-    fn indirect_residual_call_ir_r() {
-        check_indirect_residual_call_kind(&[ValueType::Int], ValueType::Ref(None), (1, 1, 0), 'r');
-    }
-    #[test]
-    fn indirect_residual_call_ir_f() {
-        check_indirect_residual_call_kind(&[ValueType::Int], ValueType::Float, (1, 1, 0), 'f');
-    }
-    #[test]
-    fn indirect_residual_call_ir_v() {
-        check_indirect_residual_call_kind(&[ValueType::Int], ValueType::Void, (1, 1, 0), 'v');
-    }
-
-    #[test]
-    fn indirect_residual_call_irf_i() {
-        check_indirect_residual_call_kind(
-            &[ValueType::Int, ValueType::Float],
-            ValueType::Int,
-            (1, 1, 1),
-            'i',
-        );
-    }
-    #[test]
-    fn indirect_residual_call_irf_r() {
-        check_indirect_residual_call_kind(
-            &[ValueType::Int, ValueType::Float],
-            ValueType::Ref(None),
-            (1, 1, 1),
-            'r',
-        );
-    }
-    #[test]
-    fn indirect_residual_call_irf_f() {
-        check_indirect_residual_call_kind(
-            &[ValueType::Int, ValueType::Float],
-            ValueType::Float,
-            (1, 1, 1),
-            'f',
-        );
-    }
-    #[test]
-    fn indirect_residual_call_irf_v() {
-        check_indirect_residual_call_kind(
-            &[ValueType::Int, ValueType::Float],
-            ValueType::Void,
-            (1, 1, 1),
-            'v',
-        );
+    fn indirect_residual_call_kinds() {
+        let none: &[ValueType] = &[];
+        let int_only: &[ValueType] = &[ValueType::Int];
+        let int_float: &[ValueType] = &[ValueType::Int, ValueType::Float];
+        let arg_sets: &[(&str, &[ValueType], (usize, usize, usize))] = &[
+            ("r", none, (0, 1, 0)),
+            ("ir", int_only, (1, 1, 0)),
+            ("irf", int_float, (1, 1, 1)),
+        ];
+        let results = [
+            ("i", ValueType::Int, 'i'),
+            ("r", ValueType::Ref(None), 'r'),
+            ("f", ValueType::Float, 'f'),
+            ("v", ValueType::Void, 'v'),
+        ];
+        for (arg_name, extras, expect) in arg_sets {
+            for (res_name, result_ty, kind) in &results {
+                let name = format!("{arg_name}_{res_name}");
+                let result_ty = result_ty.clone();
+                let kind = *kind;
+                let expect = *expect;
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    check_indirect_residual_call_kind(extras, result_ty, expect, kind);
+                }));
+                if let Err(payload) = result {
+                    panic!("case {name}: {}", panic_payload_jt(&payload));
+                }
+            }
+        }
     }
 
     /// `rpython/jit/codewriter/jtransform.py:599-606` — when a

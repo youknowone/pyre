@@ -13789,12 +13789,6 @@ mod tests {
     // transient ClassDefKey transport invariants.
 
     #[test]
-    fn call_target_method_default_resolved_path_is_none() {
-        let t = CallTarget::method("foo", Some("Bar".to_string()));
-        assert_eq!(t.resolved_path(), None);
-    }
-
-    #[test]
     fn call_target_method_resolved_path_is_skipped_by_serde() {
         use crate::parse::CallPath;
         let path = CallPath::for_impl_method("PyFrame", "foo");

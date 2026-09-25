@@ -657,27 +657,12 @@ mod tests {
     }
 
     #[test]
-    fn new_context_starts_without_annotator() {
-        let ctx = TranslationContext::new();
-        assert!(ctx.annotator().is_none());
-    }
-
-    #[test]
     fn buildannotator_records_shared_identity() {
         let ctx = Rc::new(TranslationContext::new());
         let ann = ctx.buildannotator(None);
         let stored = ctx.annotator().expect("annotator should be installed");
         assert!(Rc::ptr_eq(&ann, &stored));
         assert!(Rc::ptr_eq(&ann.translator, &ctx));
-    }
-
-    #[test]
-    fn buildannotator_backlink_returns_same_annotator() {
-        let ctx = Rc::new(TranslationContext::new());
-        let ann = ctx.buildannotator(None);
-        assert!(ctx.annotator().is_some());
-        let stored = ctx.annotator().unwrap();
-        assert!(Rc::ptr_eq(&stored, &ann));
     }
 
     #[test]
@@ -716,12 +701,6 @@ mod tests {
             let _ = ctx.buildannotator(None);
         }));
         assert!(err.is_err());
-    }
-
-    #[test]
-    fn new_context_starts_without_rtyper() {
-        let ctx = TranslationContext::new();
-        assert!(ctx.rtyper().is_none());
     }
 
     #[test]

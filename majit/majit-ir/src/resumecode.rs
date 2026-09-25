@@ -408,7 +408,7 @@ impl std::ops::Deref for NumberingRef {
 mod tests {
     use super::*;
 
-    fn roundtrip(values: &[i32]) {
+    fn roundtrip(case: &str, values: &[i32]) {
         let mut buf = Vec::new();
         for &v in values {
             encode_varint(&mut buf, v);
@@ -416,21 +416,25 @@ mod tests {
         let mut index = 0;
         for &expected in values {
             let (got, next) = decode_varint(&buf, index);
-            assert_eq!(got, expected, "decode {expected}");
+            assert_eq!(got, expected, "case {case} decode {expected}");
             index = next;
         }
-        assert_eq!(index, buf.len());
+        assert_eq!(index, buf.len(), "case {case}");
     }
 
     #[test]
-    fn decode_varint_one_byte_items() {
-        // zigzag `item < 2**7` is one byte: 0, ±1, ±63.
-        roundtrip(&[0, 1, -1, 63, -63]);
-    }
-
-    #[test]
-    fn decode_varint_two_and_three_byte_items() {
-        roundtrip(&[64, -64, 127, -128, 8191, -8192, 16383, -16384]);
+    fn decode_varint_roundtrips_item_widths() {
+        // one byte: zigzag `item < 2**7` (0, ±1, ±63). Then two- and three-byte items.
+        let cases: &[(&str, &[i32])] = &[
+            ("one_byte", &[0, 1, -1, 63, -63]),
+            (
+                "two_and_three_byte",
+                &[64, -64, 127, -128, 8191, -8192, 16383, -16384],
+            ),
+        ];
+        for (name, values) in cases {
+            roundtrip(name, values);
+        }
     }
 
     #[test]

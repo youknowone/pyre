@@ -486,14 +486,6 @@ mod tests {
     }
 
     #[test]
-    fn test_stats_enabled_checks_env() {
-        // Parity: MAJIT_STATS=1 or MAJIT_LOG=1 enables stats
-        // We can't reliably set env vars in parallel tests, so just verify
-        // the function doesn't panic and returns a bool
-        let _ = stats_enabled();
-    }
-
-    #[test]
     fn test_from_env_returns_none_when_disabled() {
         // In a normal test env without MAJIT_STATS=1, from_env returns None
         // (unless the test env happens to set it — that's fine too)
@@ -546,19 +538,6 @@ mod tests {
         log.log_loop_entry(99);
         assert_eq!(*log.loop_entry_counts().get(&42).unwrap(), 10);
         assert_eq!(*log.loop_entry_counts().get(&99).unwrap(), 1);
-    }
-
-    #[test]
-    fn test_jit_timer_measures_duration() {
-        let timer = JitTimer::start();
-        // Do a tiny amount of work
-        let mut _x = 0;
-        for i in 0..1000 {
-            _x += i;
-        }
-        let elapsed = timer.elapsed();
-        // Should be non-negative (well, Duration is always non-negative)
-        assert!(elapsed >= Duration::ZERO);
     }
 
     #[test]

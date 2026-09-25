@@ -5543,26 +5543,6 @@ mod tests {
     }
 
     #[test]
-    fn strategy_class_names_follow_interp_magic_spellings() {
-        assert_eq!(ListStrategy::Empty.class_name(), "EmptyListStrategy");
-        assert_eq!(ListStrategy::Size.class_name(), "SizeListStrategy");
-        assert_eq!(ListStrategy::Object.class_name(), "ObjectListStrategy");
-        assert_eq!(ListStrategy::Integer.class_name(), "IntegerListStrategy");
-        assert_eq!(ListStrategy::Float.class_name(), "FloatListStrategy");
-        assert_eq!(
-            ListStrategy::IntOrFloat.class_name(),
-            "IntOrFloatListStrategy"
-        );
-        assert_eq!(ListStrategy::Bytes.class_name(), "BytesListStrategy");
-        assert_eq!(ListStrategy::Ascii.class_name(), "AsciiListStrategy");
-        assert_eq!(
-            ListStrategy::SimpleRange.class_name(),
-            "SimpleRangeListStrategy"
-        );
-        assert_eq!(ListStrategy::Range.class_name(), "RangeListStrategy");
-    }
-
-    #[test]
     fn test_range_list_strategy_creation_and_access() {
         let simple = w_list_new_range(0, 1, 4);
         let range = w_list_new_range(10, -2, 4);

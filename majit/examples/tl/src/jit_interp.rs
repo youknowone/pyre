@@ -562,15 +562,12 @@ mod tests {
     }
 
     #[test]
-    fn jit_sum_5() {
+    fn jit_sum() {
         let bc = sum_bytecode();
-        assert_eq!(run_jit(&bc, 5), 15);
-    }
-
-    #[test]
-    fn jit_sum_100() {
-        let bc = sum_bytecode();
-        assert_eq!(run_jit(&bc, 100), 5050);
+        let cases = [("5", 5, 15), ("100", 100, 5050)];
+        for (name, n, want) in cases {
+            assert_eq!(run_jit(&bc, n), want, "case {name}");
+        }
     }
 
     #[test]

@@ -5154,45 +5154,37 @@ mod tests {
     }
 
     #[test]
-    fn oefmt_without_arguments_keeps_the_format_string_verbatim() {
-        // `OpErrFmtNoArgs(w_type, valuefmt)` reports `valuefmt` itself.
-        let err = super::oefmt(std::ptr::null_mut(), "dictionary is empty", &[]);
-        assert_eq!(err.render_exception(), "RuntimeError: dictionary is empty");
-    }
-
-    #[test]
-    fn oefmt_interleaves_the_rendered_argument() {
-        let err = super::oefmt(
-            std::ptr::null_mut(),
-            "cannot add %s",
-            &[super::FmtArg::Text("int")],
-        );
-        assert_eq!(err.render_exception(), "RuntimeError: cannot add int");
-    }
-
-    #[test]
-    fn oefmt_fills_each_format_code_from_its_own_argument() {
-        // One argument per format code, in order: a shape carrying several
-        // codes must not report one of them in all the others' places.
-        let err = super::oefmt(
-            std::ptr::null_mut(),
-            "cannot add %s to %s",
-            &[super::FmtArg::Text("int"), super::FmtArg::Text("str")],
-        );
-        assert_eq!(
-            err.render_exception(),
-            "RuntimeError: cannot add int to str"
-        );
-    }
-
-    #[test]
-    fn oefmt_applies_scalar_conversion_per_format_code() {
-        let err = super::oefmt(
-            std::ptr::null_mut(),
-            "%d %s",
-            &[super::FmtArg::Int(-42), super::FmtArg::Text("items")],
-        );
-        assert_eq!(err.render_exception(), "RuntimeError: -42 items");
+    fn oefmt_renders_format_string_and_arguments() {
+        let cases: &[(&str, &str, &[super::FmtArg], &str)] = &[
+            (
+                "verbatim",
+                "dictionary is empty",
+                &[],
+                "RuntimeError: dictionary is empty",
+            ),
+            (
+                "one_text",
+                "cannot add %s",
+                &[super::FmtArg::Text("int")],
+                "RuntimeError: cannot add int",
+            ),
+            (
+                "two_texts",
+                "cannot add %s to %s",
+                &[super::FmtArg::Text("int"), super::FmtArg::Text("str")],
+                "RuntimeError: cannot add int to str",
+            ),
+            (
+                "scalar",
+                "%d %s",
+                &[super::FmtArg::Int(-42), super::FmtArg::Text("items")],
+                "RuntimeError: -42 items",
+            ),
+        ];
+        for (name, fmt, args, want) in cases {
+            let err = super::oefmt(std::ptr::null_mut(), fmt, args);
+            assert_eq!(err.render_exception(), *want, "case {name}");
+        }
     }
 
     #[test]
@@ -5268,55 +5260,59 @@ mod tests {
     }
 
     #[test]
-    fn traceback_frame_names_module_matches_a_frozen_pseudo_name_exactly() {
-        let names = ["<frozen importlib._bootstrap>", "importlib/_bootstrap.py"];
-        assert!(super::traceback_frame_names_module(
-            "<frozen importlib._bootstrap>",
-            &names
-        ));
-        // Upstream's membership test is exact, so a longer pseudo-name that
-        // merely starts the same is a different module.
-        assert!(!super::traceback_frame_names_module(
-            "<frozen importlib._bootstrap_external>",
-            &names
-        ));
-    }
-
-    #[test]
-    fn traceback_frame_names_module_matches_an_installed_path_by_its_tail() {
-        let names = ["importlib/_bootstrap.py"];
-        assert!(super::traceback_frame_names_module(
-            "/usr/lib/python3.14/importlib/_bootstrap.py",
-            &names
-        ));
-        // A Windows spelling of the same file reaches the same verdict.
-        assert!(super::traceback_frame_names_module(
-            r"C:\Python314\Lib\importlib\_bootstrap.py",
-            &names
-        ));
-    }
-
-    #[test]
-    fn traceback_frame_names_module_needs_a_separator_before_the_tail() {
-        // `my_importlib/_bootstrap.py` ends with the name but is a different
-        // package, so the tail match only counts on a path boundary.
-        assert!(!super::traceback_frame_names_module(
-            "/app/my_importlib/_bootstrap.py",
-            &["importlib/_bootstrap.py"]
-        ));
-        assert!(!super::traceback_frame_names_module(
-            "/app/notimportlib/_bootstrap.py",
-            &["importlib/_bootstrap.py"]
-        ));
-    }
-
-    #[test]
-    fn traceback_frame_names_module_answers_no_for_an_application_frame() {
-        assert!(!super::traceback_frame_names_module(
-            "/app/main.py",
-            &["<frozen importlib._bootstrap>", "importlib/_bootstrap.py"]
-        ));
-        assert!(!super::traceback_frame_names_module("/app/main.py", &[]));
+    fn traceback_frame_names_module_matches_frozen_and_installed_paths() {
+        let cases: &[(&str, &str, &[&str], bool)] = &[
+            (
+                "frozen_exact",
+                "<frozen importlib._bootstrap>",
+                &["<frozen importlib._bootstrap>", "importlib/_bootstrap.py"],
+                true,
+            ),
+            (
+                "frozen_longer_prefix",
+                "<frozen importlib._bootstrap_external>",
+                &["<frozen importlib._bootstrap>", "importlib/_bootstrap.py"],
+                false,
+            ),
+            (
+                "installed_tail",
+                "/usr/lib/python3.14/importlib/_bootstrap.py",
+                &["importlib/_bootstrap.py"],
+                true,
+            ),
+            (
+                "installed_tail_windows",
+                r"C:\Python314\Lib\importlib\_bootstrap.py",
+                &["importlib/_bootstrap.py"],
+                true,
+            ),
+            (
+                "needs_separator",
+                "/app/my_importlib/_bootstrap.py",
+                &["importlib/_bootstrap.py"],
+                false,
+            ),
+            (
+                "needs_separator_prefix",
+                "/app/notimportlib/_bootstrap.py",
+                &["importlib/_bootstrap.py"],
+                false,
+            ),
+            (
+                "application_frame",
+                "/app/main.py",
+                &["<frozen importlib._bootstrap>", "importlib/_bootstrap.py"],
+                false,
+            ),
+            ("application_frame_empty_names", "/app/main.py", &[], false),
+        ];
+        for (name, filename, modules, want) in cases {
+            assert_eq!(
+                super::traceback_frame_names_module(filename, modules),
+                *want,
+                "case {name}",
+            );
+        }
     }
 
     #[test]

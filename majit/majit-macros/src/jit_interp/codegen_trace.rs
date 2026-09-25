@@ -993,37 +993,26 @@ mod find_dispatch_match_tests {
     }
 
     #[test]
-    fn opcode_match_after_merge_point_is_the_dispatch() {
-        let block = fn_block(
-            "while pc < program.len() {
-                jit_merge_point!(driver, program, pc; state);
-                let opcode = program[pc];
-                match opcode {
-                    0 => {},
-                    1 => {},
-                    _ => break,
-                }
-            }",
-        );
-        let found = find_dispatch_match(&block).expect("dispatch match");
-        assert_eq!(found.arms.len(), 3);
-    }
-
-    #[test]
-    fn get_op_method_match_is_the_dispatch() {
-        let block = fn_block(
-            "while pc < program.len() {
-                jit_merge_point!(driver, program, pc; state);
-                let opcode = program.get_op(pc);
-                match opcode {
-                    0 => {},
-                    1 => {},
-                    _ => break,
-                }
-            }",
-        );
-        let found = find_dispatch_match(&block).expect("dispatch match");
-        assert_eq!(found.arms.len(), 3);
+    fn opcode_fetch_match_is_the_dispatch() {
+        let cases = [
+            ("index", "let opcode = program[pc];"),
+            ("get_op", "let opcode = program.get_op(pc);"),
+        ];
+        for (name, fetch) in cases {
+            let block = fn_block(&format!(
+                "while pc < program.len() {{
+                    jit_merge_point!(driver, program, pc; state);
+                    {fetch}
+                    match opcode {{
+                        0 => {{}},
+                        1 => {{}},
+                        _ => break,
+                    }}
+                }}"
+            ));
+            let found = find_dispatch_match(&block).unwrap_or_else(|| panic!("case {name}"));
+            assert_eq!(found.arms.len(), 3, "case {name}");
+        }
     }
 
     #[test]
@@ -1077,73 +1066,54 @@ mod find_dispatch_match_tests {
     }
 
     #[test]
-    fn a_post_merge_local_match_is_not_the_dispatch() {
-        let block = fn_block(
-            "while pos < len {
-                jit_merge_point!(driver, program, pc; state);
-                match acc {
+    fn a_non_opcode_match_is_not_the_dispatch() {
+        let cases = [
+            (
+                "local",
+                "match acc {
                     0 => {},
                     1 => {},
                     _ => {},
-                }
-                pos = pos + 1;
-            }",
-        );
-        assert!(find_dispatch_match(&block).is_none());
-        assert!(portal_loop_body(&block).is_some());
-    }
-
-    #[test]
-    fn program_len_match_is_not_the_dispatch() {
-        let block = fn_block(
-            "while pos < len {
-                jit_merge_point!(driver, program, pc; state);
-                let n = program.len();
+                }",
+            ),
+            (
+                "program_len",
+                "let n = program.len();
                 match n {
                     0 => {},
                     1 => {},
                     _ => {},
-                }
-                pos = pos + 1;
-            }",
-        );
-        assert!(find_dispatch_match(&block).is_none());
-        assert!(portal_loop_body(&block).is_some());
-    }
-
-    #[test]
-    fn match_on_program_data_index_is_not_the_dispatch() {
-        let block = fn_block(
-            "while pos < len {
-                jit_merge_point!(driver, program, pc; state);
-                match program[pos] {
+                }",
+            ),
+            (
+                "program_data_index",
+                "match program[pos] {
                     0 => {},
                     1 => {},
                     _ => {},
-                }
-                pos = pos + 1;
-            }",
-        );
-        assert!(find_dispatch_match(&block).is_none());
-        assert!(portal_loop_body(&block).is_some());
-    }
-
-    #[test]
-    fn a_let_of_program_data_index_is_not_the_dispatch() {
-        let block = fn_block(
-            "while pos < len {
-                jit_merge_point!(driver, program, pc; state);
-                let byte = program[pos];
+                }",
+            ),
+            (
+                "let_program_data_index",
+                "let byte = program[pos];
                 match byte {
                     0 => {},
                     1 => {},
                     _ => {},
-                }
-                pos = pos + 1;
-            }",
-        );
-        assert!(find_dispatch_match(&block).is_none());
-        assert!(portal_loop_body(&block).is_some());
+                }",
+            ),
+        ];
+        for (name, matched) in cases {
+            let block = fn_block(&format!(
+                "while pos < len {{
+                    jit_merge_point!(driver, program, pc; state);
+                    {matched}
+                    pos = pos + 1;
+                }}"
+            ));
+            assert!(find_dispatch_match(&block).is_none(), "case {name}");
+            assert!(portal_loop_body(&block).is_some(), "case {name}");
+        }
     }
 
     #[test]
@@ -1197,63 +1167,27 @@ mod find_dispatch_match_tests {
     }
 
     #[test]
-    fn a_mutating_let_before_merge_is_unsupported() {
-        let block = fn_block(
-            "while pos < len {
-                let ignored = { state.acc += 1; 0 };
-                jit_merge_point!(driver, program, pc; state);
-                pos = pos + 1;
-            }",
-        );
-        assert!(first_unsupported_pre_merge_stmt(&block).is_some());
-    }
-
-    #[test]
-    fn a_qualified_call_let_before_merge_is_unsupported() {
-        let block = fn_block(
-            "while pos < len {
-                let ignored = crate::tick();
-                jit_merge_point!(driver, program, pc; state);
-                pos = pos + 1;
-            }",
-        );
-        assert!(first_unsupported_pre_merge_stmt(&block).is_some());
-    }
-
-    #[test]
-    fn a_macro_let_before_merge_is_unsupported() {
-        let block = fn_block(
-            "while pos < len {
-                let ignored = tick!(state);
-                jit_merge_point!(driver, program, pc; state);
-                pos = pos + 1;
-            }",
-        );
-        assert!(first_unsupported_pre_merge_stmt(&block).is_some());
-    }
-
-    #[test]
-    fn a_return_in_a_pre_merge_let_is_unsupported() {
-        let block = fn_block(
-            "while pos < len {
-                let ignored = if stop { return 7 } else { 0 };
-                jit_merge_point!(driver, program, pc; state);
-                pos = pos + 1;
-            }",
-        );
-        assert!(first_unsupported_pre_merge_stmt(&block).is_some());
-    }
-
-    #[test]
-    fn an_indexed_let_before_merge_is_unsupported() {
-        let block = fn_block(
-            "while pos < len {
-                let ignored = [1, 2][state.pos];
-                jit_merge_point!(driver, program, pc; state);
-                pos = pos + 1;
-            }",
-        );
-        assert!(first_unsupported_pre_merge_stmt(&block).is_some());
+    fn an_effectful_let_before_merge_is_unsupported() {
+        let cases = [
+            ("mutating", "let ignored = { state.acc += 1; 0 };"),
+            ("qualified_call", "let ignored = crate::tick();"),
+            ("macro_call", "let ignored = tick!(state);"),
+            ("return", "let ignored = if stop { return 7 } else { 0 };"),
+            ("indexed", "let ignored = [1, 2][state.pos];"),
+        ];
+        for (name, stmt) in cases {
+            let block = fn_block(&format!(
+                "while pos < len {{
+                    {stmt}
+                    jit_merge_point!(driver, program, pc; state);
+                    pos = pos + 1;
+                }}"
+            ));
+            assert!(
+                first_unsupported_pre_merge_stmt(&block).is_some(),
+                "case {name}"
+            );
+        }
     }
 
     #[test]

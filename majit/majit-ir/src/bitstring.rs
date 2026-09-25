@@ -48,20 +48,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn make_bitstring_empty() {
-        assert_eq!(make_bitstring(&[]), Vec::<u8>::new());
-    }
-
-    #[test]
-    fn make_bitstring_single_byte() {
-        // bits 0, 3, 7 → byte 0b10001001 = 0x89.
-        assert_eq!(make_bitstring(&[0, 3, 7]), vec![0x89]);
-    }
-
-    #[test]
-    fn make_bitstring_multi_byte() {
-        // bits 0, 8, 15 → bytes [0x01, 0x81].
-        assert_eq!(make_bitstring(&[0, 8, 15]), vec![0x01, 0x81]);
+    fn make_bitstring_encodes_indices() {
+        // empty; bits 0, 3, 7 → 0x89; bits 0, 8, 15 → [0x01, 0x81].
+        let cases: &[(&str, &[u32], &[u8])] = &[
+            ("empty", &[], &[]),
+            ("single_byte", &[0, 3, 7], &[0x89]),
+            ("multi_byte", &[0, 8, 15], &[0x01, 0x81]),
+        ];
+        for (name, bits, want) in cases {
+            assert_eq!(make_bitstring(bits), *want, "case {name}");
+        }
     }
 
     #[test]

@@ -163,23 +163,12 @@ mod tests {
     }
 
     #[test]
-    fn test_countdown_3() {
+    fn test_countdown() {
         let bc = countdown_bytecode();
-        let res = run(&bc, WObject::Int(3));
-        assert_eq!(res.int_value(), 3);
-    }
-
-    #[test]
-    fn test_countdown_10() {
-        let bc = countdown_bytecode();
-        let res = run(&bc, WObject::Int(10));
-        assert_eq!(res.int_value(), 10);
-    }
-
-    #[test]
-    fn test_countdown_100() {
-        let bc = countdown_bytecode();
-        let res = run(&bc, WObject::Int(100));
-        assert_eq!(res.int_value(), 100);
+        let cases = [("3", 3), ("10", 10), ("100", 100)];
+        for (name, n) in cases {
+            let res = run(&bc, WObject::Int(n));
+            assert_eq!(res.int_value(), n, "case {name}");
+        }
     }
 }

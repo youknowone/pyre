@@ -177,25 +177,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lltypesystem_rlist_exposes_concrete_list_repr_paths() {
-        fn assert_repr<T: Repr>() {}
-
-        assert_repr::<FixedSizeListRepr>();
-        assert_repr::<ListRepr>();
-
-        assert_eq!(
-            std::any::type_name::<FixedSizeListRepr>()
-                .rsplit("::")
-                .next(),
-            Some("FixedSizeListRepr")
-        );
-        assert_eq!(
-            std::any::type_name::<ListRepr>().rsplit("::").next(),
-            Some("ListRepr")
-        );
-    }
-
-    #[test]
     fn lltypesystem_rlist_exposes_deferred_helper_surface() {
         let _base = BaseListRepr;
         let _iter = ListIteratorRepr;

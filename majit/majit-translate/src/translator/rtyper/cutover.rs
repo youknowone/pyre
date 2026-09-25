@@ -5669,24 +5669,17 @@ mod tests {
     }
 
     #[test]
-    fn lowleveltype_to_concrete_signedlonglonglong_returns_missing_rtype_err() {
-        let err = lowleveltype_to_concrete(&LowLevelType::SignedLongLongLong)
-            .expect_err("SignedLongLongLong has no history.getkind mapping");
-        assert!(err.is_missing_rtype_operation());
-    }
-
-    #[test]
-    fn lowleveltype_to_concrete_unsignedlonglonglong_returns_missing_rtype_err() {
-        let err = lowleveltype_to_concrete(&LowLevelType::UnsignedLongLongLong)
-            .expect_err("UnsignedLongLongLong has no history.getkind mapping");
-        assert!(err.is_missing_rtype_operation());
-    }
-
-    #[test]
-    fn lowleveltype_to_concrete_longfloat_returns_missing_rtype_err() {
-        let err = lowleveltype_to_concrete(&LowLevelType::LongFloat)
-            .expect_err("LongFloat has no history.getkind mapping");
-        assert!(err.is_missing_rtype_operation());
+    fn lowleveltype_to_concrete_extended_floats_return_missing_rtype_err() {
+        let cases = [
+            ("SignedLongLongLong", LowLevelType::SignedLongLongLong),
+            ("UnsignedLongLongLong", LowLevelType::UnsignedLongLongLong),
+            ("LongFloat", LowLevelType::LongFloat),
+        ];
+        for (name, ty) in cases {
+            let msg = format!("case {name}: has no history.getkind mapping");
+            let err = lowleveltype_to_concrete(&ty).expect_err(&msg);
+            assert!(err.is_missing_rtype_operation(), "case {name}");
+        }
     }
 
     #[test]

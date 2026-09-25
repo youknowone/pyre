@@ -262,28 +262,19 @@ mod tests {
     }
 
     #[test]
-    fn test_sum_3() {
-        assert_eq!(interpret(&sum_bytecode(), 3), 6);
+    fn test_sum() {
+        let cases = [("3", 3, 6), ("10", 10, 55), ("100", 100, 5050)];
+        for (name, n, want) in cases {
+            assert_eq!(interpret(&sum_bytecode(), n), want, "case {name}");
+        }
     }
 
     #[test]
-    fn test_sum_10() {
-        assert_eq!(interpret(&sum_bytecode(), 10), 55);
-    }
-
-    #[test]
-    fn test_sum_100() {
-        assert_eq!(interpret(&sum_bytecode(), 100), 5050);
-    }
-
-    #[test]
-    fn test_factorial_5() {
-        assert_eq!(interpret(&factorial_bytecode(), 5), 120);
-    }
-
-    #[test]
-    fn test_factorial_7() {
-        assert_eq!(interpret(&factorial_bytecode(), 7), 5040);
+    fn test_factorial() {
+        let cases = [("5", 5, 120), ("7", 7, 5040)];
+        for (name, n, want) in cases {
+            assert_eq!(interpret(&factorial_bytecode(), n), want, "case {name}");
+        }
     }
 
     #[test]

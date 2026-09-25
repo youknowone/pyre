@@ -8072,15 +8072,7 @@ pub fn cranelift_resumedata_deopt(
 #[cfg(test)]
 mod tests_bh_normalize_raise {
     use super::*;
-    use majit_backend::jitframe::{FIRST_ITEM_OFFSET, JF_FRAME_OFS};
     use pyre_interpreter::{PyErrorKind, compile_exec};
-
-    #[test]
-    fn jitframe_layout_descrs_uses_frame_relative_offsets() {
-        let descrs = jitframe_layout_descrs();
-        assert_eq!(descrs.jf_frame_baseitemofs, FIRST_ITEM_OFFSET);
-        assert_eq!(descrs.jf_frame_lengthofs, JF_FRAME_OFS);
-    }
 
     #[test]
     fn bh_normalize_raise_varargs_rejects_builtin_callables_that_are_not_exception_classes() {

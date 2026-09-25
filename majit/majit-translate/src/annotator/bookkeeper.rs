@@ -4416,7 +4416,7 @@ impl Drop for PositionGuard {
 mod tests {
     use super::*;
     use crate::annotator::annrpython::RPythonAnnotator;
-    use crate::annotator::model::{SomeByteArray, SomeChar, SomeFloat};
+    use crate::annotator::model::{SomeChar, SomeFloat};
     use crate::flowspace::model::GraphFunc;
     use rustpython_compiler::{Mode, compile as rp_compile};
     use rustpython_compiler_core::bytecode::ConstantData;
@@ -6628,15 +6628,6 @@ mod tests {
     }
 
     #[test]
-    fn position_key_set_and_get() {
-        let bk = bk();
-        assert!(bk.current_position_key().is_none());
-        let prev = bk.set_position_key(Some(PositionKey::new(1, 1, 1)));
-        assert!(prev.is_none());
-        assert_eq!(bk.current_position_key(), Some(PositionKey::new(1, 1, 1)));
-    }
-
-    #[test]
     fn unicode_through_const_unistr() {
         let bk = bk();
         let s = bk.immutablevalue(&ConstValue::uni_str("abc")).unwrap();
@@ -6644,15 +6635,6 @@ mod tests {
             SomeValue::UnicodeString(st) => assert!(st.inner.no_nul),
             other => panic!("expected SomeUnicodeString, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn byte_array_not_yet_routed() {
-        // ConstValue has no dedicated Bytes variant; bytearray inputs
-        // therefore don't round-trip through immutablevalue today.
-        // Test the type itself stays buildable from the annotator
-        // model — sanity check in lieu of a full input path.
-        let _ = SomeByteArray::default();
     }
 
     #[test]

@@ -449,19 +449,14 @@ mod tests {
 
     #[test]
     fn test_int_create_and_read() {
-        let obj = w_int_new(42);
-        unsafe {
-            assert!(is_int(obj));
-            assert!(!is_bool(obj));
-            assert_eq!(w_int_get_value(obj), 42);
-        }
-    }
-
-    #[test]
-    fn test_int_negative() {
-        let obj = w_int_new(-7);
-        unsafe {
-            assert_eq!(w_int_get_value(obj), -7);
+        let cases = [("positive", 42_i64), ("negative", -7)];
+        for (name, value) in cases {
+            let obj = w_int_new(value);
+            unsafe {
+                assert!(is_int(obj), "case {name}");
+                assert!(!is_bool(obj), "case {name}");
+                assert_eq!(w_int_get_value(obj), value, "case {name}");
+            }
         }
     }
 

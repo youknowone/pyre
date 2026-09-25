@@ -664,20 +664,15 @@ mod tests {
     }
 
     #[test]
-    fn encode_liveness_empty() {
-        assert_eq!(encode_liveness(&[]), Vec::<u8>::new());
-    }
-
-    #[test]
-    fn encode_liveness_small() {
-        // live = [0, 1, 7] -> first byte has bits 0, 1, 7 set = 0b1000_0011 = 0x83
-        assert_eq!(encode_liveness(&[0u8, 1, 7]), vec![0x83]);
-    }
-
-    #[test]
-    fn encode_liveness_multi_byte() {
-        // live = [0, 8, 15] -> byte 0 = 0x01, byte 1 = 0b1000_0001 = 0x81
-        assert_eq!(encode_liveness(&[0u8, 8, 15]), vec![0x01, 0x81]);
+    fn encode_liveness_bitmaps() {
+        let cases: &[(&str, &[u8], &[u8])] = &[
+            ("empty", &[], &[]),
+            ("small", &[0, 1, 7], &[0x83]),
+            ("multi_byte", &[0, 8, 15], &[0x01, 0x81]),
+        ];
+        for &(name, live, want) in cases {
+            assert_eq!(encode_liveness(live), want, "case {name}");
+        }
     }
 
     #[test]

@@ -2953,30 +2953,20 @@ mod tests {
     }
 
     #[test]
-    fn command_dedent_empties_whitespace_only_line_shallower_than_prefix() {
-        let source = "    print(\"first\")\n  \n    print(\"second\")\n";
-        assert_eq!(
-            dedent_command(source).as_ref(),
-            "print(\"first\")\n\nprint(\"second\")\n"
-        );
-    }
-
-    #[test]
-    fn command_dedent_empties_whitespace_only_line_deeper_than_prefix() {
-        let source = "    print(\"first\")\n        \n    print(\"second\")\n";
-        assert_eq!(
-            dedent_command(source).as_ref(),
-            "print(\"first\")\n\nprint(\"second\")\n"
-        );
-    }
-
-    #[test]
-    fn command_dedent_empties_whitespace_only_line_equal_to_prefix() {
-        let source = "    print(\"first\")\n    \n    print(\"second\")\n";
-        assert_eq!(
-            dedent_command(source).as_ref(),
-            "print(\"first\")\n\nprint(\"second\")\n"
-        );
+    fn command_dedent_empties_whitespace_only_line() {
+        let cases = [
+            ("shallower", "  "),
+            ("deeper", "        "),
+            ("equal", "    "),
+        ];
+        for (name, indent) in cases {
+            let source = format!("    print(\"first\")\n{indent}\n    print(\"second\")\n");
+            assert_eq!(
+                dedent_command(&source).as_ref(),
+                "print(\"first\")\n\nprint(\"second\")\n",
+                "case {name}",
+            );
+        }
     }
 
     #[test]

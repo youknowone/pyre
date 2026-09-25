@@ -51,14 +51,6 @@ static ALLOC: majit_gc::HostNurseryClock<mimalloc::MiMalloc> =
 static ALLOC: majit_gc::HostNurseryClock<std::alloc::System> =
     majit_gc::HostNurseryClock(std::alloc::System);
 
-#[test]
-#[cfg(all(feature = "fast-alloc", not(feature = "alloc-census")))]
-fn fast_allocator_is_selected_without_the_census() {
-    // A dependency feature alone does not replace Rust's global allocator.
-    // Pin the actual global's type in the clean timing configuration.
-    let _: &majit_gc::HostNurseryClock<mimalloc::MiMalloc> = &ALLOC;
-}
-
 use regex::{NodeRec, bench_regex, bench_regex_left, count, depth, lower, nonmatching, vectors};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;

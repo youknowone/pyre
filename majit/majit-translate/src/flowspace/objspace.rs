@@ -154,86 +154,45 @@ mod tests {
     }
 
     #[test]
-    fn assert_rpythonic_rejects_missing_code() {
-        // GraphFunc default has no code attached.
-        let func = GraphFunc::new("f", empty_globals());
-        let err = _assert_rpythonic(&func).unwrap_err();
-        match err {
-            FlowContextError::Flowing(err) => {
-                assert!(err.message.contains("is not RPython"));
-            }
-            other => panic!("unexpected error variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn assert_rpythonic_rejects_closure_bearing_func() {
-        let mut func = GraphFunc::new("inner", empty_globals());
-        // attach a dummy HostCode with CO_NEWLOCALS set so co_cellvars
-        // is the check that fires first.
-        let mut code = make_empty_host_code();
-        code.co_flags = CoFlags::NEWLOCALS.bits();
-        code.co_cellvars.push("x".to_string());
-        func.code = Some(Box::new(code));
-
-        let err = _assert_rpythonic(&func).unwrap_err();
-        match err {
-            FlowContextError::Flowing(err) => {
-                assert!(err.message.contains("cannot create closures"));
-            }
-            other => panic!("unexpected error variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn assert_rpythonic_rejects_not_rpython_marker() {
-        let mut func = GraphFunc::new("marked", empty_globals());
-        let mut code = make_empty_host_code();
-        code.co_flags = CoFlags::NEWLOCALS.bits();
-        func.code = Some(Box::new(code));
-        func.not_rpython = true;
-
-        let err = _assert_rpythonic(&func).unwrap_err();
-        match err {
-            FlowContextError::Flowing(err) => {
-                assert!(err.message.contains("@not_rpython"));
-            }
-            other => panic!("unexpected error variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn assert_rpythonic_rejects_not_rpython_docstring() {
-        let mut func = GraphFunc::new("doc", empty_globals());
-        let mut code = make_empty_host_code();
-        code.co_flags = CoFlags::NEWLOCALS.bits();
-        code.consts.push(ConstantData::Str {
+    fn assert_rpythonic_rejects_malformed_funcs() {
+        let missing_code = GraphFunc::new("f", empty_globals());
+        let mut closure = GraphFunc::new("inner", empty_globals());
+        let mut closure_code = make_empty_host_code();
+        closure_code.co_flags = CoFlags::NEWLOCALS.bits();
+        closure_code.co_cellvars.push("x".to_string());
+        closure.code = Some(Box::new(closure_code));
+        let mut marker = GraphFunc::new("marked", empty_globals());
+        let mut marker_code = make_empty_host_code();
+        marker_code.co_flags = CoFlags::NEWLOCALS.bits();
+        marker.code = Some(Box::new(marker_code));
+        marker.not_rpython = true;
+        let mut docstring = GraphFunc::new("doc", empty_globals());
+        let mut doc_code = make_empty_host_code();
+        doc_code.co_flags = CoFlags::NEWLOCALS.bits();
+        doc_code.consts.push(ConstantData::Str {
             value: "NOT_RPYTHON: skip me".to_string().into(),
         });
-        func.code = Some(Box::new(code));
+        docstring.code = Some(Box::new(doc_code));
+        let mut missing_newlocals = GraphFunc::new("toplevel", empty_globals());
+        let mut bare_code = make_empty_host_code();
+        bare_code.co_flags = 0;
+        missing_newlocals.code = Some(Box::new(bare_code));
 
-        let err = _assert_rpythonic(&func).unwrap_err();
-        match err {
-            FlowContextError::Flowing(err) => {
-                assert!(err.message.contains("NOT_RPYTHON"));
+        let cases = [
+            ("missing_code", &missing_code, "is not RPython"),
+            ("closure", &closure, "cannot create closures"),
+            ("not_rpython_marker", &marker, "@not_rpython"),
+            ("not_rpython_docstring", &docstring, "NOT_RPYTHON"),
+            ("missing_co_newlocals", &missing_newlocals, "CO_NEWLOCALS"),
+        ];
+        for (name, func, needle) in cases {
+            let err = _assert_rpythonic(func).unwrap_err();
+            match err {
+                FlowContextError::Flowing(err) => {
+                    assert!(err.message.contains(needle), "case {name}: {}", err.message);
+                }
+                other => panic!("case {name}: unexpected error variant: {other:?}"),
             }
-            other => panic!("unexpected error variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn assert_rpythonic_rejects_missing_co_newlocals() {
-        let mut func = GraphFunc::new("toplevel", empty_globals());
-        let mut code = make_empty_host_code();
-        code.co_flags = 0; // no CO_NEWLOCALS
-        func.code = Some(Box::new(code));
-
-        let err = _assert_rpythonic(&func).unwrap_err();
-        match err {
-            FlowContextError::Flowing(err) => {
-                assert!(err.message.contains("CO_NEWLOCALS"));
-            }
-            other => panic!("unexpected error variant: {other:?}"),
         }
     }
 

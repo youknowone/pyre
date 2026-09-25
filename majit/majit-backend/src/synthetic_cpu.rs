@@ -250,14 +250,4 @@ mod tests {
         assert!(!is_synthetic_fnaddr(i64::MAX));
         assert!(is_synthetic_fnaddr(SYNTHETIC_FNADDR_BASE));
     }
-
-    #[test]
-    fn implements_backend_trait() {
-        // Structural check: SyntheticCpu satisfies the Backend
-        // trait (all required methods supplied, even if dormant).  An
-        // accidentally-deleted trait method, or a signature drift, would
-        // fail this coercion.
-        let cpu = SyntheticCpu::new();
-        let _: &dyn crate::Backend = &cpu;
-    }
 }

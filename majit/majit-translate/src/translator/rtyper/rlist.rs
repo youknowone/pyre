@@ -8070,35 +8070,30 @@ mod tests {
     }
 
     #[test]
-    fn makerepr_resized_somelist_routes_to_list_repr() {
-        let rtyper = fresh_rtyper_live();
-        // `resized=true` → the `ListRepr` (resized) branch.
-        let ldef = ListDef::new(
-            None,
-            SomeValue::Integer(SomeInteger::new(false, false)),
-            false,
-            true,
-        );
-        let sv = SomeValue::List(SomeList::new(ldef));
-        let repr = rtyper_makerepr(&sv, &rtyper).expect("rtyper_makerepr resized list");
-        assert_eq!(repr.class_name(), "ListRepr");
-        assert_eq!(repr.repr_class_id(), ReprClassId::ListRepr);
-    }
-
-    #[test]
-    fn makerepr_nonresized_somelist_routes_to_fixed_size_list_repr() {
-        let rtyper = fresh_rtyper_live();
-        // `resized=false` → the `FixedSizeListRepr` branch (unchanged).
-        let ldef = ListDef::new(
-            None,
-            SomeValue::Integer(SomeInteger::new(false, false)),
-            false,
-            false,
-        );
-        let sv = SomeValue::List(SomeList::new(ldef));
-        let repr = rtyper_makerepr(&sv, &rtyper).expect("rtyper_makerepr non-resized list");
-        assert_eq!(repr.class_name(), "FixedSizeListRepr");
-        assert_eq!(repr.repr_class_id(), ReprClassId::FixedSizeListRepr);
+    fn makerepr_somelist_routes_by_resized_flag() {
+        let cases = [
+            ("resized", true, "ListRepr", ReprClassId::ListRepr),
+            (
+                "nonresized",
+                false,
+                "FixedSizeListRepr",
+                ReprClassId::FixedSizeListRepr,
+            ),
+        ];
+        for (name, resized, class_name, class_id) in cases {
+            let rtyper = fresh_rtyper_live();
+            let ldef = ListDef::new(
+                None,
+                SomeValue::Integer(SomeInteger::new(false, false)),
+                false,
+                resized,
+            );
+            let sv = SomeValue::List(SomeList::new(ldef));
+            let repr = rtyper_makerepr(&sv, &rtyper)
+                .unwrap_or_else(|err| panic!("case {name}: rtyper_makerepr: {err:?}"));
+            assert_eq!(repr.class_name(), class_name, "case {name}");
+            assert_eq!(repr.repr_class_id(), class_id, "case {name}");
+        }
     }
 
     /// rlist.py:247-267 nonneg + checkidx=False branch on an UNMUTATED

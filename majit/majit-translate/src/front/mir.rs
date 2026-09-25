@@ -31119,35 +31119,48 @@ mod f64_bitcast_path_tests {
     use super::path_ends_with_segments;
 
     #[test]
-    fn f64_from_bits_is_a_path_suffix_not_a_substring() {
-        assert!(path_ends_with_segments(
-            "core::f64::<Impl>::from_bits",
-            "f64::<Impl>::from_bits"
-        ));
-        assert!(path_ends_with_segments(
-            "std::f64::<Impl>::from_bits",
-            "f64::<Impl>::from_bits"
-        ));
-        assert!(!path_ends_with_segments(
-            "rhai::grain::vm::jit::position_from_bits",
-            "f64::<Impl>::from_bits"
-        ));
-        assert!(!path_ends_with_segments(
-            "rhai::grain::format::StepFlags::<Impl>::from_bits",
-            "f64::<Impl>::from_bits"
-        ));
-    }
-
-    #[test]
-    fn f64_to_bits_is_a_path_suffix_not_a_substring() {
-        assert!(path_ends_with_segments(
-            "core::f64::<Impl>::to_bits",
-            "f64::<Impl>::to_bits"
-        ));
-        assert!(!path_ends_with_segments(
-            "some_host::position_to_bits",
-            "f64::<Impl>::to_bits"
-        ));
+    fn f64_bit_casts_are_path_suffixes_not_substrings() {
+        let cases = [
+            (
+                "from_bits_core",
+                "core::f64::<Impl>::from_bits",
+                "f64::<Impl>::from_bits",
+                true,
+            ),
+            (
+                "from_bits_std",
+                "std::f64::<Impl>::from_bits",
+                "f64::<Impl>::from_bits",
+                true,
+            ),
+            (
+                "from_bits_position",
+                "rhai::grain::vm::jit::position_from_bits",
+                "f64::<Impl>::from_bits",
+                false,
+            ),
+            (
+                "from_bits_step_flags",
+                "rhai::grain::format::StepFlags::<Impl>::from_bits",
+                "f64::<Impl>::from_bits",
+                false,
+            ),
+            (
+                "to_bits_core",
+                "core::f64::<Impl>::to_bits",
+                "f64::<Impl>::to_bits",
+                true,
+            ),
+            (
+                "to_bits_position",
+                "some_host::position_to_bits",
+                "f64::<Impl>::to_bits",
+                false,
+            ),
+        ];
+        for (name, path, suffix, want) in cases {
+            assert_eq!(path_ends_with_segments(path, suffix), want, "case {name}");
+        }
     }
 }
 
@@ -42932,65 +42945,70 @@ mod tests {
     }
 
     #[test]
-    fn host_float2longlong_projects_to_float_bytes_llop() {
-        let llbc = scalar_method_call_fixture(
-            "pyre_float2longlong",
-            &["pyre_object", "longlong2float", "float2longlong"],
-            serde_json::json!({"Literal": {"Float": "F64"}}),
-            serde_json::json!({"Literal": {"Int": "I64"}}),
-        );
-        let graph = super::lower_function(&llbc, "pyre_float2longlong")
-            .expect("lower pyre_object::longlong2float::float2longlong");
-        assert_unary_llop(
-            &graph_ops(&graph),
-            "convert_float_bytes_to_longlong",
-            ValueType::Int,
-        );
-    }
-
-    #[test]
-    fn host_longlong2float_projects_to_float_bytes_llop() {
-        let llbc = scalar_method_call_fixture(
-            "pyre_longlong2float",
-            &["pyre_interpreter", "longlong2float", "longlong2float"],
-            serde_json::json!({"Literal": {"Int": "I64"}}),
-            serde_json::json!({"Literal": {"Float": "F64"}}),
-        );
-        let graph = super::lower_function(&llbc, "pyre_longlong2float")
-            .expect("lower pyre_interpreter::longlong2float::longlong2float");
-        assert_unary_llop(
-            &graph_ops(&graph),
-            "convert_longlong_bytes_to_float",
-            ValueType::Float,
-        );
-    }
-
-    #[test]
-    fn host_lltype_cast_ptr_to_int_projects_to_llop() {
+    fn host_scalar_calls_project_to_llops() {
         let ptr_ty = serde_json::json!({"RawPtr": [{"Literal": {"Int": "I64"}}, "Mut"]});
-        let llbc = scalar_method_call_fixture(
-            "pyre_cast_ptr_to_int",
-            &["pyre_object", "lltype", "cast_ptr_to_int"],
-            ptr_ty,
-            serde_json::json!({"Literal": {"Int": "I64"}}),
-        );
-        let graph = super::lower_function(&llbc, "pyre_cast_ptr_to_int")
-            .expect("lower pyre_object::lltype::cast_ptr_to_int");
-        assert_unary_llop(&graph_ops(&graph), "cast_ptr_to_int", ValueType::Int);
+        let i64_ty = serde_json::json!({"Literal": {"Int": "I64"}});
+        let f64_ty = serde_json::json!({"Literal": {"Float": "F64"}});
+        let cases = [
+            (
+                "float2longlong",
+                "pyre_float2longlong",
+                ["pyre_object", "longlong2float", "float2longlong"],
+                f64_ty,
+                i64_ty.clone(),
+                "convert_float_bytes_to_longlong",
+                ValueType::Int,
+            ),
+            (
+                "longlong2float",
+                "pyre_longlong2float",
+                ["pyre_interpreter", "longlong2float", "longlong2float"],
+                i64_ty,
+                serde_json::json!({"Literal": {"Float": "F64"}}),
+                "convert_longlong_bytes_to_float",
+                ValueType::Float,
+            ),
+            (
+                "cast_ptr_to_int",
+                "pyre_cast_ptr_to_int",
+                ["pyre_object", "lltype", "cast_ptr_to_int"],
+                ptr_ty.clone(),
+                serde_json::json!({"Literal": {"Int": "I64"}}),
+                "cast_ptr_to_int",
+                ValueType::Int,
+            ),
+            (
+                "cast_int_to_ptr",
+                "pyre_cast_int_to_ptr",
+                ["pyre_object", "lltype", "cast_int_to_ptr"],
+                serde_json::json!({"Literal": {"Int": "I64"}}),
+                ptr_ty,
+                "cast_int_to_ptr",
+                ValueType::Ref(None),
+            ),
+        ];
+        for (name, func, path, arg_ty, ret_ty, llop, result_ty) in cases {
+            let llbc = scalar_method_call_fixture(func, &path, arg_ty, ret_ty);
+            let lowered = format!("case {name}: lower {func}");
+            let graph = super::lower_function(&llbc, func).expect(&lowered);
+            let ops = graph_ops(&graph);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                assert_unary_llop(&ops, llop, result_ty);
+            }));
+            if let Err(payload) = result {
+                panic!("case {name}: {}", panic_payload_mir(&payload));
+            }
+        }
     }
 
-    #[test]
-    fn host_lltype_cast_int_to_ptr_projects_to_llop() {
-        let ptr_ty = serde_json::json!({"RawPtr": [{"Literal": {"Int": "I64"}}, "Mut"]});
-        let llbc = scalar_method_call_fixture(
-            "pyre_cast_int_to_ptr",
-            &["pyre_object", "lltype", "cast_int_to_ptr"],
-            serde_json::json!({"Literal": {"Int": "I64"}}),
-            ptr_ty,
-        );
-        let graph = super::lower_function(&llbc, "pyre_cast_int_to_ptr")
-            .expect("lower pyre_object::lltype::cast_int_to_ptr");
-        assert_unary_llop(&graph_ops(&graph), "cast_int_to_ptr", ValueType::Ref(None));
+    fn panic_payload_mir(payload: &Box<dyn std::any::Any + Send>) -> String {
+        if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else if let Some(s) = payload.downcast_ref::<&str>() {
+            (*s).to_string()
+        } else {
+            "assertion failed".to_string()
+        }
     }
 
     #[test]
@@ -46749,33 +46767,6 @@ mod tests {
     }
 
     #[test]
-    fn niche_option_raw_nominal_ptr_none_is_null_some_is_identity() {
-        // `HostRegistry` (def-id 4) is a sized nominal struct in the
-        // checked-in corpus.
-        let payload = serde_json::json!({
-            "RawPtr": [
-                {
-                    "Adt": {
-                        "id": { "Adt": 4 },
-                        "generics": {
-                            "regions": [], "types": [],
-                            "const_generics": [], "trait_refs": []
-                        }
-                    }
-                },
-                "Mut"
-            ]
-        });
-        let graph = lower_option_source_with_payload(payload);
-        let (null_muts, transparent_ctors) = niche_ctor_shape(&graph);
-        assert_eq!(null_muts, 1, "None must lower to one null pointer");
-        assert_eq!(
-            transparent_ctors, 0,
-            "Some(raw nominal pointer) must be the payload identity, with no Option aggregate"
-        );
-    }
-
-    #[test]
     fn niche_option_raw_nominal_ptr_without_layout_is_null_test() {
         use crate::model::OpKind;
         // Cross-crate pointees often have a type decl and no `layout`
@@ -46815,9 +46806,7 @@ mod tests {
     }
 
     #[test]
-    fn niche_option_boxed_nominal_none_is_null_some_is_identity() {
-        // Charon represents Box as alloc::boxed::Box's ordinary ADT on the
-        // real extraction route (the Builtin spelling is accepted too).
+    fn niche_option_nominal_pointers_none_is_null_some_is_identity() {
         let corpus = Llbc::load(crate::runtime_names::artifacts::CHARON_CORPUS_ULLBC)
             .expect("load checked-in corpus LLBC");
         let box_def_id = corpus
@@ -46825,9 +46814,21 @@ mod tests {
             .find(|td| td.item_meta.name_path() == "alloc::boxed::Box")
             .map(|td| td.def_id)
             .expect("Box type declaration in corpus");
-        // A Box of the corpus's sized `HostRegistry` struct is one non-null
-        // owning pointer. Rust stores Option<Box<_>> in that same word.
-        let payload = serde_json::json!({
+        let raw_nominal = serde_json::json!({
+            "RawPtr": [
+                {
+                    "Adt": {
+                        "id": { "Adt": 4 },
+                        "generics": {
+                            "regions": [], "types": [],
+                            "const_generics": [], "trait_refs": []
+                        }
+                    }
+                },
+                "Mut"
+            ]
+        });
+        let boxed = serde_json::json!({
             "Adt": {
                 "id": { "Adt": box_def_id },
                 "generics": {
@@ -46845,13 +46846,26 @@ mod tests {
                 }
             }
         });
-        let graph = lower_option_source_with_payload(payload);
-        let (null_muts, transparent_ctors) = niche_ctor_shape(&graph);
-        assert_eq!(null_muts, 1, "None must lower to one null owning pointer");
-        assert_eq!(
-            transparent_ctors, 0,
-            "Some(Box<nominal>) must be the payload identity, with no Option aggregate"
-        );
+        let cases = [
+            (
+                "raw_nominal_ptr",
+                raw_nominal,
+                "None must lower to one null pointer",
+                "Some(raw nominal pointer) must be the payload identity, with no Option aggregate",
+            ),
+            (
+                "boxed_nominal",
+                boxed,
+                "None must lower to one null owning pointer",
+                "Some(Box<nominal>) must be the payload identity, with no Option aggregate",
+            ),
+        ];
+        for (name, payload, none_msg, some_msg) in cases {
+            let graph = lower_option_source_with_payload(payload);
+            let (null_muts, transparent_ctors) = niche_ctor_shape(&graph);
+            assert_eq!(null_muts, 1, "case {name}: {none_msg}");
+            assert_eq!(transparent_ctors, 0, "case {name}: {some_msg}");
+        }
     }
 
     /// Real-LLBC anchor for the `FixedObjectArray` Index intercept.  The
@@ -47323,25 +47337,11 @@ mod tests {
     }
 
     #[test]
-    fn niche_option_raw_scalar_ptr_remains_aggregate() {
-        let payload = serde_json::json!({
+    fn niche_option_non_niche_payloads_remain_aggregate() {
+        let scalar_ptr = serde_json::json!({
             "RawPtr": [{ "Literal": { "UInt": "U8" } }, "Mut"]
         });
-        let graph = lower_option_source_with_payload(payload);
-        let (null_muts, transparent_ctors) = niche_ctor_shape(&graph);
-        assert_eq!(
-            null_muts, 0,
-            "Option<*mut u8> must not collapse None to the payload null word"
-        );
-        assert!(
-            transparent_ctors >= 2,
-            "Option<*mut u8> must retain the tagged Some and None aggregates"
-        );
-    }
-
-    #[test]
-    fn niche_option_tuple_remains_aggregate() {
-        let payload = serde_json::json!({
+        let tuple = serde_json::json!({
             "Adt": {
                 "id": "Tuple",
                 "generics": {
@@ -47355,16 +47355,26 @@ mod tests {
                 }
             }
         });
-        let graph = lower_option_source_with_payload(payload);
-        let (null_muts, transparent_ctors) = niche_ctor_shape(&graph);
-        assert_eq!(
-            null_muts, 0,
-            "Option<(i64, bool)> must not collapse None to a payload null word"
-        );
-        assert!(
-            transparent_ctors >= 2,
-            "Option<(i64, bool)> must retain the tagged Some and None aggregates"
-        );
+        let cases = [
+            (
+                "raw_scalar_ptr",
+                scalar_ptr,
+                "Option<*mut u8> must not collapse None to the payload null word",
+                "Option<*mut u8> must retain the tagged Some and None aggregates",
+            ),
+            (
+                "tuple",
+                tuple,
+                "Option<(i64, bool)> must not collapse None to a payload null word",
+                "Option<(i64, bool)> must retain the tagged Some and None aggregates",
+            ),
+        ];
+        for (name, payload, none_msg, agg_msg) in cases {
+            let graph = lower_option_source_with_payload(payload);
+            let (null_muts, transparent_ctors) = niche_ctor_shape(&graph);
+            assert_eq!(null_muts, 0, "case {name}: {none_msg}");
+            assert!(transparent_ctors >= 2, "case {name}: {agg_msg}");
+        }
     }
 
     /// `gettypeobject` (`gettypefor(..).map_or(PY_NULL, |p| p.as_ptr())`)

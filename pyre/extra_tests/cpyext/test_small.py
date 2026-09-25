@@ -1,0 +1,262 @@
+# cpyext-fixture: cpyext_small
+# cpyext-expect: cpyext-small-ok
+
+# The small entry points an extension reaches for in passing: the unqualified
+# type name, the repr recursion guard, the locale codec, a string built from
+# code points, the buffer hash, `setdefault` and `origin[args]`.
+#
+# Every expectation was taken from CPython 3.14.6 running this same script
+# against this same fixture.
+
+import cpyext_small as m
+
+
+def eq(name, got, want):
+    assert got == want, '%s: got %r, want %r' % (name, got, want)
+
+
+class Named:
+    pass
+
+
+class Boom:
+    def __hash__(self):
+        raise ValueError('boom')
+
+
+# ── the unqualified type name ──────────────────────────────────────────
+
+eq('names int', m.type_names(int), ('int', 'int'))
+eq('names class', m.type_names(Named), ('Named', 'Named'))
+eq('names module', m.type_names(type(m)), ('module', 'module'))
+
+# ── the repr recursion guard ───────────────────────────────────────────
+
+# The entry is recorded, so the second ask says the object is already being
+# rendered; the third is after the leave and is the first ask again.
+value = []
+eq('guard list', m.repr_guard(value), (0, 1, 0))
+eq('guard list again', m.repr_guard(value), (0, 1, 0))
+eq('guard tuple', m.repr_guard((1, 2)), (0, 1, 0))
+
+# The set is the one the interpreter's own containers consult, so a `tp_repr`
+# that entered a list and then asks for its repr gets the elision rather than
+# the body.
+eq('guarded repr', m.guarded_repr([1, 2]), '[...]')
+loop = []
+loop.append(loop)
+eq('guarded repr cycle', m.guarded_repr(loop), '[...]')
+
+# ── the locale codec ───────────────────────────────────────────────────
+
+DECODE_ERROR = ('UnicodeDecodeError',
+                "'locale' codec can't decode byte 0xff in position 1: decoding error")
+UNSUPPORTED = ('ValueError', 'unsupported error handler')
+
+eq('decode ascii', m.decode_locale(b'abc', None), ('abc', None))
+eq('decode utf8', m.decode_locale(b'a\xc3\xa9z', None), ('a\xe9z', None))
+eq('decode empty', m.decode_locale(b'', None), ('', None))
+eq('decode undecodable', m.decode_locale(b'a\xffz', None), DECODE_ERROR)
+eq('decode strict named', m.decode_locale(b'a\xffz', 'strict'), DECODE_ERROR)
+# The byte with no text spelling comes back as the surrogate escape that
+# re-encodes to itself.
+eq('decode surrogateescape', m.decode_locale(b'a\xffz', 'surrogateescape'),
+   ('a\udcffz', None))
+# Only those two handlers: the conversion refuses the rest before it runs
+# rather than reaching the codec registry.
+eq('decode replace', m.decode_locale(b'abc', 'replace'), UNSUPPORTED)
+# The block is read to its first NUL, so one before the end has nowhere to go.
+eq('decode embedded nul', m.decode_locale(b'a\x00b', None),
+   ('ValueError', 'embedded null byte'))
+eq('decode str', m.decode_locale_str(b'abc', None), ('abc', None))
+
+ENCODE_ERROR = ('UnicodeEncodeError',
+                "'locale' codec can't encode character '\\udcff' in position 1: encoding error")
+
+eq('encode ascii', m.encode_locale('abc', None), (b'abc', None))
+eq('encode wide', m.encode_locale('a\xe9z', None), (b'a\xc3\xa9z', None))
+eq('encode astral', m.encode_locale('a\U0001F600z', None),
+   (b'a\xf0\x9f\x98\x80z', None))
+eq('encode empty', m.encode_locale('', None), (b'', None))
+eq('encode surrogate strict', m.encode_locale('a\udcffz', None), ENCODE_ERROR)
+eq('encode surrogate escape', m.encode_locale('a\udcffz', 'surrogateescape'),
+   (b'a\xffz', None))
+# A surrogate outside the escape range stands for no byte, so it has no
+# spelling under either handler.
+eq('encode lone surrogate', m.encode_locale('a\ud800z', 'surrogateescape'),
+   ('UnicodeEncodeError',
+    "'locale' codec can't encode character '\\ud800' in position 1: encoding error"))
+eq('encode nul', m.encode_locale('a\x00b', None),
+   ('ValueError', 'embedded null character'))
+eq('encode replace', m.encode_locale('abc', 'replace'), UNSUPPORTED)
+eq('encode nonstr', m.encode_locale(42, None),
+   ('TypeError', 'bad argument type for built-in operation'))
+
+# ── a string from code points ──────────────────────────────────────────
+
+# The units are code points rather than an encoding, so each width reads its
+# array as it stands and a surrogate is one character.
+eq('kind 1', m.from_kind(1, [104, 105]), ('hi', None))
+eq('kind 1 high', m.from_kind(1, [0xE9]), ('\xe9', None))
+eq('kind 1 empty', m.from_kind(1, []), ('', None))
+eq('kind 2', m.from_kind(2, [104, 0x4E00]), ('h一', None))
+eq('kind 2 surrogate', m.from_kind(2, [0xD800]), ('\ud800', None))
+eq('kind 4', m.from_kind(4, [104, 0x1F600]), ('h\U0001F600', None))
+eq('kind 4 nul', m.from_kind(4, [104, 0, 105]), ('h\x00i', None))
+eq('kind 4 empty', m.from_kind(4, []), ('', None))
+eq('kind 0', m.from_kind_bad(0, 1), ('SystemError', 'invalid kind'))
+eq('kind 3', m.from_kind_bad(3, 1), ('SystemError', 'invalid kind'))
+eq('kind negative size', m.from_kind_bad(4, -1),
+   ('ValueError', 'size must be positive'))
+
+# ── the buffer hash ────────────────────────────────────────────────────
+
+for data in [b'', b'a', b'hello world', bytes(range(64))]:
+    eq('hash %r' % data[:8], m.hash_buffer(data), hash(data))
+
+# ── setdefault ─────────────────────────────────────────────────────────
+
+mapping = {'a': 1}
+eq('setdefault present', m.set_default(mapping, 'a', 99), (1, 1, None))
+eq('setdefault absent', m.set_default(mapping, 'b', 2), (0, 2, None))
+eq('setdefault inserted', mapping, {'a': 1, 'b': 2})
+# A NULL result is the caller wanting the insertion and not the value.
+eq('setdefault no result', m.set_default_no_result(mapping, 'c', 3), (0, None))
+eq('setdefault no result again', m.set_default_no_result(mapping, 'c', 4), (1, None))
+eq('setdefault inserted 2', mapping, {'a': 1, 'b': 2, 'c': 3})
+
+# Nothing is handed back when the call fails, whatever the failure was.
+unhashable = m.set_default(mapping, [], 1)
+eq('setdefault unhashable', (unhashable[0], unhashable[1], unhashable[2][0]),
+   (-1, None, 'TypeError'))
+raising = m.set_default(mapping, Boom(), 1)
+eq('setdefault hash raises', raising, (-1, None, ('ValueError', 'boom')))
+# Only the code and the empty result: what is not a dict is refused the way
+# every entry point in the family refuses it, which names the function where
+# CPython reports a bad internal call.
+refused = m.set_default([], 'a', 1)
+eq('setdefault not a dict', (refused[0], refused[1]), (-1, None))
+eq('setdefault untouched', mapping, {'a': 1, 'b': 2, 'c': 3})
+# Whether the key was there is answered without looking for it a second time,
+# so a key that counts what is asked of it sees one hash either way.
+
+
+class Counted:
+    def __init__(self, name):
+        self.name = name
+        self.hashes = 0
+
+    def __hash__(self):
+        self.hashes += 1
+        return hash(self.name)
+
+    def __eq__(self, other):
+        return isinstance(other, Counted) and other.name == self.name
+
+
+held = Counted('k')
+counted = {held: 'was there'}
+probe = Counted('k')
+eq('setdefault counted present', m.set_default(counted, probe, 'default'),
+   (1, 'was there', None))
+eq('setdefault probes once', probe.hashes, 1)
+fresh = Counted('new')
+eq('setdefault counted absent', m.set_default(counted, fresh, 'default'),
+   (0, 'default', None))
+eq('setdefault probes once inserting', fresh.hashes, 1)
+# The default landing on a key that already maps to an equal value is still
+# the key having been there.
+eq('setdefault same value', m.set_default({'x': 1}, 'x', 1), (1, 1, None))
+
+# ── origin[args] ───────────────────────────────────────────────────────
+
+alias, error = m.generic_alias(list, int)
+eq('alias error', error, None)
+eq('alias str', str(alias), 'list[int]')
+eq('alias origin', alias.__origin__ is list, True)
+eq('alias args', alias.__args__, (int,))
+eq('alias equal', alias == list[int], True)
+# A tuple is the whole argument list rather than one argument that is a tuple.
+pair, error = m.generic_alias(dict, (str, int))
+eq('alias pair error', error, None)
+eq('alias pair str', str(pair), 'dict[str, int]')
+eq('alias pair args', pair.__args__, (str, int))
+
+# ── the count field ────────────────────────────────────────────────────
+
+# `Py_SET_REFCNT` and `Py_REFCNT` speak the same units, so the bracket Cython
+# puts around a `__dealloc__` body leaves the count where it found it.
+subject = ['held']
+eq('refcount bracket', m.refcount_round_trip(subject), (1, 0))
+eq('refcount bracket again', m.refcount_round_trip(subject), (1, 0))
+eq('the object is untouched', subject, ['held'])
+
+# A count that must never be reached is left alone.
+eq('immortal is left alone', m.refcount_immortal(), (1, 1))
+# The write it refused would have freed the block `Py_None` names, so the
+# singleton still being itself is the other half of the answer.
+eq('None is still None', [None, None.__class__], [None, type(None)])
+
+# ── the number a prefix of a string reads as ───────────────────────────
+
+# With an `endptr` the caller owns whatever follows the number.
+eq('a whole number', m.string_to_double('2.5', 1), (2.5, '', None))
+eq('a number and a tail', m.string_to_double('2.5abc', 1), (2.5, 'abc', None))
+eq('an exponent', m.string_to_double('1e3', 1), (1000.0, '', None))
+# An `e` no exponent follows ends the number before it.
+eq('an e with nothing after it', m.string_to_double('1e', 1), (1.0, 'e', None))
+eq('a leading point', m.string_to_double('.5', 1), (0.5, '', None))
+eq('a trailing point', m.string_to_double('5.', 1), (5.0, '', None))
+eq('a sign', m.string_to_double('-2.5', 1), (-2.5, '', None))
+eq('infinity', m.string_to_double('-Infinity', 1), (float('-inf'), '', None))
+# The separators a Python literal may carry are not part of this grammar.
+eq('an underscore ends it', m.string_to_double('1_000', 1), (1.0, '_000', None))
+
+# Without one there is nowhere to report a remainder, so a remainder fails.
+eq('a tail with nowhere to go', m.string_to_double('2.5abc', 0),
+   ('ValueError', "could not convert string to float: '2.5abc'"))
+eq('nothing at all', m.string_to_double('abc', 1),
+   ('ValueError', "could not convert string to float: 'abc'"))
+eq('the empty string', m.string_to_double('', 1),
+   ('ValueError', "could not convert string to float: ''"))
+
+# A magnitude the type cannot hold is only an error where a class was named
+# to report it through.
+eq('overflow unreported', m.string_to_double('1e500', 1), (float('inf'), '', None))
+eq('overflow reported', m.string_to_double('1e500', 1, OverflowError),
+   ('OverflowError', "value too large to convert to float: '1e500'"))
+# `inf` spells the value rather than overflowing to it.
+eq('inf is not an overflow', m.string_to_double('inf', 1, OverflowError),
+   (float('inf'), '', None))
+
+eq('the double behind a float', m.float_as_double(2.5), 2.5)
+eq('float from a str', m.float_from_string('2.5'), (2.5, None))
+eq('float from a str with spaces', m.float_from_string('  2.5  '), (2.5, None))
+eq('float from a str that is not one', m.float_from_string('x')[0], 'ValueError')
+
+# ── splitting a str ────────────────────────────────────────────────────
+
+eq('split on a separator', m.split('a,b,c', ',', -1), (['a', 'b', 'c'], None))
+eq('split with a limit', m.split('a,b,c', ',', 1), (['a', 'b,c'], None))
+# A null separator splits on runs of whitespace, dropping the empty pieces.
+eq('split on whitespace', m.split('  a  b ', None, -1), (['a', 'b'], None))
+eq('split what is not a str', m.split(3, ',', -1),
+   ('TypeError', 'must be str, not int'))
+eq('split on what is not a str', m.split('a b', 3, -1),
+   ('TypeError', 'must be str, not int'))
+
+# ── the namespace behind a type ────────────────────────────────────────
+
+
+class Named:
+    marker = 7
+
+
+namespace, again = m.type_dict(Named)
+eq('the namespace answers', namespace['marker'], 7)
+# The same block every time: a copy would take a write nothing reads back.
+eq('the same block twice', again, 1)
+namespace_of_int, _ = m.type_dict(int)
+eq('a builtin has one too', namespace_of_int['real'] is int.real, True)
+
+print('cpyext-small-ok')

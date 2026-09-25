@@ -92,11 +92,6 @@ mod tests {
     }
 
     #[test]
-    fn generated_stdlib_blob_round_trips() {
-        assert!(!unpack(STDLIB_BLOB).unwrap().is_empty());
-    }
-
-    #[test]
     fn generated_stdlib_blob_contains_playground_modules() {
         let names: std::collections::HashSet<String> = unpack(STDLIB_BLOB)
             .unwrap()

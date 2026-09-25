@@ -3102,78 +3102,52 @@ mod tests {
     }
 
     #[test]
-    fn getattr_constfold_function_carrier_dunder_name_returns_constant_str() {
-        let globals = Constant::new(ConstValue::None);
-        let func = ConstValue::Function(Box::new(crate::flowspace::model::GraphFunc::new(
-            "pkg.demo.user_fn",
-            globals,
-        )));
-        let op = HLOperation::new(OpKind::GetAttr, vec![c(func), cs("__name__")]);
-        let folded = op.constfold().expect("function.__name__ should fold");
-        let Some(Hlvalue::Constant(name_constant)) = folded else {
-            panic!("expected Constant result");
-        };
-        assert_eq!(name_constant.value, ConstValue::byte_str("user_fn"));
-    }
-
-    #[test]
-    fn getattr_constfold_function_carrier_dunder_module_returns_constant_str() {
-        let globals = Constant::new(ConstValue::None);
-        let func = ConstValue::Function(Box::new(crate::flowspace::model::GraphFunc::new(
-            "pkg.demo.user_fn",
-            globals,
-        )));
-        let op = HLOperation::new(OpKind::GetAttr, vec![c(func), cs("__module__")]);
-        let folded = op.constfold().expect("function.__module__ should fold");
-        let Some(Hlvalue::Constant(module_constant)) = folded else {
-            panic!("expected Constant result");
-        };
-        assert_eq!(module_constant.value, ConstValue::byte_str("pkg.demo"));
-    }
-
-    #[test]
-    fn getattr_constfold_function_carrier_dunder_globals_returns_constant_dict() {
-        let globals = Constant::new(ConstValue::Dict(HashMap::new()));
-        let func = ConstValue::Function(Box::new(crate::flowspace::model::GraphFunc::new(
-            "pkg.demo.user_fn",
-            globals,
-        )));
-        let op = HLOperation::new(OpKind::GetAttr, vec![c(func), cs("__globals__")]);
-        let folded = op.constfold().expect("function.__globals__ should fold");
-        let Some(Hlvalue::Constant(globals_constant)) = folded else {
-            panic!("expected Constant result");
-        };
-        assert_eq!(globals_constant.value, ConstValue::Dict(HashMap::new()));
-    }
-
-    #[test]
-    fn getattr_constfold_function_carrier_dunder_defaults_returns_none_when_absent() {
-        let globals = Constant::new(ConstValue::Dict(HashMap::new()));
-        let func = ConstValue::Function(Box::new(crate::flowspace::model::GraphFunc::new(
-            "pkg.demo.user_fn",
-            globals,
-        )));
-        let op = HLOperation::new(OpKind::GetAttr, vec![c(func), cs("__defaults__")]);
-        let folded = op.constfold().expect("function.__defaults__ should fold");
-        let Some(Hlvalue::Constant(defaults_constant)) = folded else {
-            panic!("expected Constant result");
-        };
-        assert_eq!(defaults_constant.value, ConstValue::None);
-    }
-
-    #[test]
-    fn getattr_constfold_function_carrier_dunder_closure_returns_none_when_absent() {
-        let globals = Constant::new(ConstValue::Dict(HashMap::new()));
-        let func = ConstValue::Function(Box::new(crate::flowspace::model::GraphFunc::new(
-            "pkg.demo.user_fn",
-            globals,
-        )));
-        let op = HLOperation::new(OpKind::GetAttr, vec![c(func), cs("__closure__")]);
-        let folded = op.constfold().expect("function.__closure__ should fold");
-        let Some(Hlvalue::Constant(closure_constant)) = folded else {
-            panic!("expected Constant result");
-        };
-        assert_eq!(closure_constant.value, ConstValue::None);
+    fn getattr_constfold_function_carrier_dunder_attrs() {
+        let cases = [
+            (
+                "name",
+                ConstValue::None,
+                "__name__",
+                ConstValue::byte_str("user_fn"),
+            ),
+            (
+                "module",
+                ConstValue::None,
+                "__module__",
+                ConstValue::byte_str("pkg.demo"),
+            ),
+            (
+                "globals",
+                ConstValue::Dict(HashMap::new()),
+                "__globals__",
+                ConstValue::Dict(HashMap::new()),
+            ),
+            (
+                "defaults",
+                ConstValue::Dict(HashMap::new()),
+                "__defaults__",
+                ConstValue::None,
+            ),
+            (
+                "closure",
+                ConstValue::Dict(HashMap::new()),
+                "__closure__",
+                ConstValue::None,
+            ),
+        ];
+        for (name, globals, attr, want) in cases {
+            let func = ConstValue::Function(Box::new(crate::flowspace::model::GraphFunc::new(
+                "pkg.demo.user_fn",
+                Constant::new(globals),
+            )));
+            let op = HLOperation::new(OpKind::GetAttr, vec![c(func), cs(attr)]);
+            let folded_msg = format!("case {name}: function.{attr} should fold");
+            let folded = op.constfold().expect(&folded_msg);
+            let Some(Hlvalue::Constant(constant)) = folded else {
+                panic!("case {name}: expected Constant result");
+            };
+            assert_eq!(constant.value, want, "case {name}");
+        }
     }
 
     #[test]

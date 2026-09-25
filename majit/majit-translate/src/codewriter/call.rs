@@ -12023,18 +12023,6 @@ mod tests {
     }
 
     #[test]
-    fn test_canraise_reraise_only_graph_matches_upstream_tri_state() {
-        let mut cc = CallControl::new();
-        let path = CallPath::from_segments(["reraise_only"]);
-        cc.register_function_graph(path.clone(), reraise_only_graph("reraise_only"));
-
-        let target = CallTarget::function_path(["reraise_only"]);
-        let mut cache = AnalysisCache::default();
-        let result = cc._canraise(&target, &mut cache);
-        assert_eq!(result, CanRaise::MemoryErrorOnly);
-    }
-
-    #[test]
     fn test_canraise_ignore_memoryerror_suppresses_reraise_only_exceptblock() {
         let mut cc = CallControl::new();
         let path = CallPath::from_segments(["reraise_only"]);

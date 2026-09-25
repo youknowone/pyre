@@ -7784,23 +7784,6 @@ mod tests {
         assert!(opt.protect_speculative_operation(&get_op, &ctx));
     }
 
-    #[test]
-    fn test_pending_fields() {
-        let mut opt = Optimizer::new();
-        assert!(!opt.has_pending_fields());
-        assert_eq!(opt.num_pending_fields(), 0);
-
-        opt.add_pending_field(Op::new(
-            OpCode::SetfieldGc,
-            &[
-                rooted_resop_operand(Type::Int, 0),
-                rooted_resop_operand(Type::Int, 1),
-            ],
-        ));
-        assert!(opt.has_pending_fields());
-        assert_eq!(opt.num_pending_fields(), 1);
-    }
-
     /// optimizer.py `getnullness(op)` parity test.
     ///
     /// Returns the upstream INFO_NULL / INFO_NONNULL / INFO_UNKNOWN

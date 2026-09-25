@@ -3671,13 +3671,6 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_short_preamble() {
-        let sp = ShortPreamble::empty();
-        assert!(sp.is_empty());
-        assert_eq!(sp.len(), 0);
-    }
-
-    #[test]
     fn test_extract_from_peeled_trace() {
         // Simulate a peeled trace:
         // 0: guard_true(v100)        ← preamble guard on loop-carried value

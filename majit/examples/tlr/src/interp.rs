@@ -75,23 +75,16 @@ mod tests {
     }
 
     #[test]
-    fn test_square_1() {
-        assert_eq!(interpret(&square_bytecode(), 1), 1);
-    }
-
-    #[test]
-    fn test_square_5() {
-        assert_eq!(interpret(&square_bytecode(), 5), 25);
-    }
-
-    #[test]
-    fn test_square_10() {
-        assert_eq!(interpret(&square_bytecode(), 10), 100);
-    }
-
-    #[test]
-    fn test_square_100() {
-        assert_eq!(interpret(&square_bytecode(), 100), 10_000);
+    fn test_square() {
+        let cases = [
+            ("1", 1, 1),
+            ("5", 5, 25),
+            ("10", 10, 100),
+            ("100", 100, 10_000),
+        ];
+        for (name, n, want) in cases {
+            assert_eq!(interpret(&square_bytecode(), n), want, "case {name}");
+        }
     }
 
     #[test]

@@ -3680,39 +3680,6 @@ mod tests {
     }
 
     #[test]
-    fn remove_dead_exceptions_noop_on_non_raising_block() {
-        // No canraise block → function is effectively a no-op and
-        // doesn't panic.
-        use crate::flowspace::model::{ConstValue as CV, Constant as C};
-        let start = Block::shared(vec![]);
-        let graph = FunctionGraph::new("f", start.clone());
-        let link = Link::new(
-            vec![Hlvalue::Constant(C::new(CV::Int(0)))],
-            Some(graph.returnblock.clone()),
-            None,
-        )
-        .into_ref();
-        start.closeblock(vec![link]);
-        remove_dead_exceptions(&graph);
-    }
-
-    #[test]
-    fn simplify_exceptions_noop_on_simple_graph() {
-        // No Exception-terminated canraise block → pass is a no-op.
-        use crate::flowspace::model::{ConstValue as CV, Constant as C};
-        let start = Block::shared(vec![]);
-        let graph = FunctionGraph::new("f", start.clone());
-        let link = Link::new(
-            vec![Hlvalue::Constant(C::new(CV::Int(0)))],
-            Some(graph.returnblock.clone()),
-            None,
-        )
-        .into_ref();
-        start.closeblock(vec![link]);
-        simplify_exceptions(&graph);
-    }
-
-    #[test]
     fn remove_identical_vars_ssa_dedupes_duplicate_phis() {
         // Same fixture as remove_identical_vars_dedupes_duplicate_phi_inputs
         // — verify the SSA variant collapses constant-fed duplicate
@@ -4226,22 +4193,6 @@ mod tests {
             Some(translator),
             Some(graph_a.borrow().startblock.clone()),
         );
-    }
-
-    #[test]
-    fn coalesce_bool_noop_on_simple_graph() {
-        // No bool op at block tail → pass is a no-op.
-        use crate::flowspace::model::{ConstValue as CV, Constant as C};
-        let start = Block::shared(vec![]);
-        let graph = FunctionGraph::new("f", start.clone());
-        let link = Link::new(
-            vec![Hlvalue::Constant(C::new(CV::Int(0)))],
-            Some(graph.returnblock.clone()),
-            None,
-        )
-        .into_ref();
-        start.closeblock(vec![link]);
-        coalesce_bool(&graph);
     }
 
     #[test]

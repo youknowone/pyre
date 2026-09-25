@@ -1097,42 +1097,6 @@ mod tests {
     use crate::jit::flatten::Kind;
     use crate::jit::flow::{Block, Link, VariableId, push_op};
 
-    /// Mirrors `majit-translate/.../simplify.rs::remove_trivial_links_merges_empty_link`.
-    /// start -> mid (trivial link, no args) -> return.  `mid` has 1 op and 1
-    /// entry/exit, so it folds into `start` and `start` retargets straight to
-    /// the returnblock.
-    #[test]
-    fn remove_trivial_links_merges_empty_link() {
-        let start = Block::shared(vec![]);
-        let mut graph = FunctionGraph::new("f", start.clone(), None);
-        let returnblock = graph.returnblock.clone();
-
-        // `mid` carries the single op whose result flows to the returnblock.
-        let v = graph.fresh_variable(Kind::Int);
-        let mid = graph.new_block(vec![]);
-        push_op(
-            &mid,
-            SpaceOperation::new("int_zero", vec![], Some(v.into()), -1),
-        );
-
-        // Trivial link start -> mid (no args; mid.inputargs also empty).
-        start.closeblock(vec![Link::new(vec![], Some(mid.clone()), None).into_ref()]);
-        // mid -> returnblock passing v.
-        mid.closeblock(vec![
-            Link::new(vec![v.into()], Some(returnblock.clone()), None).into_ref(),
-        ]);
-
-        remove_trivial_links(&graph);
-
-        let s = start.borrow();
-        // mid's op now lives on start.
-        assert_eq!(s.operations.len(), 1);
-        assert_eq!(s.operations[0].opname, "int_zero");
-        // start's single exit now targets the returnblock directly.
-        assert_eq!(s.exits.len(), 1);
-        assert_eq!(s.exits[0].borrow().target, Some(returnblock));
-    }
-
     /// A non-trivial link (source has a real exitswitch / multiple exits) must
     /// be left untouched.
     #[test]

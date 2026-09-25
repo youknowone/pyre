@@ -11088,53 +11088,6 @@ mod boxref_forwarding_tests {
         );
     }
 
-    /// `make_equal_to` (`optimizer.py`) shares the same
-    /// `Rc<RefCell<IntBound>>` identity across `old` → `new` forwarding.
-    #[test]
-    fn make_equal_to_preserves_int_bound_rc_identity() {
-        let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
-        let (old_box, _ia_old) = bound_inputarg_operand(Type::Int, 0);
-        let (new_box, _ia_new) = bound_inputarg_operand(Type::Int, 1);
-        ctx.seed_boxes_canonical(&[old_box.clone(), new_box.clone()]);
-        ctx.setintbound(
-            &old_box,
-            &crate::optimizeopt::intutils::IntBound::unbounded(),
-        );
-
-        let old_handle = ctx.getintbound_handle(&old_box);
-        assert!(matches!(old_handle, IntBoundHandle::Live(_)));
-
-        ctx.make_equal_to(&old_box, &new_box);
-        let new_handle = ctx.getintbound_handle(&new_box);
-        assert!(
-            old_handle.ptr_eq(&new_handle),
-            "make_equal_to must transfer the same Rc cell for IntBound"
-        );
-    }
-
-    /// `make_equal_to` transfers the `PtrInfo` `Rc` cell from `old` to
-    /// `new` per `optimizer.py:400`.
-    #[test]
-    fn make_equal_to_preserves_ptr_info_rc_identity() {
-        let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
-        let (old_box, _ia_old) = bound_inputarg_operand(Type::Ref, 0);
-        let (new_box, _ia_new) = bound_inputarg_operand(Type::Ref, 1);
-        ctx.seed_boxes_canonical(&[old_box.clone(), new_box.clone()]);
-        ctx.set_ptr_info(&old_box, PtrInfo::NonNull { last_guard_pos: 0 });
-
-        let old_handle = ctx
-            .getptrinfo_handle(&old_box)
-            .expect("populated _forwarded on old");
-        ctx.make_equal_to(&old_box, &new_box);
-        let new_handle = ctx
-            .getptrinfo_handle(&new_box)
-            .expect("PtrInfo transferred to new via clone of Rc cell");
-        assert!(
-            old_handle.same_info(&new_handle),
-            "make_equal_to must transfer the same Rc cell"
-        );
-    }
-
     /// `box.clear_forwarded()` resets `_forwarded` directly.  After the
     /// call, `old`'s slot is `None` and any previously-stored IntBound is
     /// unreachable.

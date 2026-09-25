@@ -23421,55 +23421,32 @@ mod tests {
     }
 
     #[test]
-    fn test_guard_isnull_passes() {
-        let mut backend = CraneliftBackend::new();
+    fn test_guard_isnull() {
+        let cases = [("passes", 45u64, 0i64), ("fails", 46u64, 42i64)];
+        for (name, token_id, input) in cases {
+            let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int_rc(0)];
-        let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
-            mk_op(
-                OpCode::GuardIsnull,
-                &[OpRef::input_arg_int(0)],
-                OpRef::NONE.raw(),
-            ),
-            mk_op(
-                OpCode::Finish,
-                &[OpRef::input_arg_int(0)],
-                OpRef::NONE.raw(),
-            ),
-        ];
+            let inputargs = vec![InputArg::new_int_rc(0)];
+            let ops = vec![
+                mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
+                mk_op(
+                    OpCode::GuardIsnull,
+                    &[OpRef::input_arg_int(0)],
+                    OpRef::NONE.raw(),
+                ),
+                mk_op(
+                    OpCode::Finish,
+                    &[OpRef::input_arg_int(0)],
+                    OpRef::NONE.raw(),
+                ),
+            ];
 
-        let token = JitCellToken::new(45);
-        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+            let token = JitCellToken::new(token_id);
+            backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
-        let frame = backend.execute_token(&token, &[Value::Int(0)]);
-        assert_eq!(backend.get_int_value(&frame, 0), 0);
-    }
-
-    #[test]
-    fn test_guard_isnull_fails() {
-        let mut backend = CraneliftBackend::new();
-
-        let inputargs = vec![InputArg::new_int_rc(0)];
-        let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
-            mk_op(
-                OpCode::GuardIsnull,
-                &[OpRef::input_arg_int(0)],
-                OpRef::NONE.raw(),
-            ),
-            mk_op(
-                OpCode::Finish,
-                &[OpRef::input_arg_int(0)],
-                OpRef::NONE.raw(),
-            ),
-        ];
-
-        let token = JitCellToken::new(46);
-        backend.compile_loop(&inputargs, &ops, &token).unwrap();
-
-        let frame = backend.execute_token(&token, &[Value::Int(42)]);
-        assert_eq!(backend.get_int_value(&frame, 0), 42);
+            let frame = backend.execute_token(&token, &[Value::Int(input)]);
+            assert_eq!(backend.get_int_value(&frame, 0), input, "case {name}");
+        }
     }
 
     #[test]

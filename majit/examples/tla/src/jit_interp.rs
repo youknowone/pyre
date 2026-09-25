@@ -221,13 +221,12 @@ mod tests {
     }
 
     #[test]
-    fn jit_countdown_5() {
-        assert_eq!(run_jit(&countdown_bytecode(), 5), 5);
-    }
-
-    #[test]
-    fn jit_countdown_30() {
-        assert_eq!(run_jit(&countdown_bytecode(), 30), 30);
+    fn jit_countdown() {
+        let bc = countdown_bytecode();
+        let cases = [("5", 5), ("30", 30)];
+        for (name, n) in cases {
+            assert_eq!(run_jit(&bc, n), n, "case {name}");
+        }
     }
 
     #[test]

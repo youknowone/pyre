@@ -24816,43 +24816,35 @@ mod tests {
     }
 
     #[test]
-    fn builtin_ord_identity_uses_wrapped_code_not_display_name() {
+    fn builtin_identity_uses_wrapped_code_not_display_name() {
         crate::typedef::init_typeobjects();
-        let ord = make_module_builtin_function_with_arity("ord", builtin_ord, 1);
-        let renamed_ord = make_module_builtin_function_with_arity("ord", builtin_repr, 1);
-
-        assert!(is_builtin_ord_function(ord));
-        assert!(!is_builtin_ord_function(renamed_ord));
-        assert!(!is_builtin_ord_function(std::ptr::null_mut()));
-    }
-
-    #[test]
-    fn builtin_isinstance_identity_uses_manual_gateway_wrapper() {
-        crate::typedef::init_typeobjects();
-        let isinstance = make_module_builtin_function_with_arity(
-            "isinstance",
-            __majit_wrap_builtin_isinstance,
-            2,
-        );
-        let renamed_isinstance =
-            make_module_builtin_function_with_arity("isinstance", builtin_repr, 2);
-
-        assert!(is_builtin_isinstance_function(isinstance));
-        assert!(!is_builtin_isinstance_function(renamed_isinstance));
-        assert!(!is_builtin_isinstance_function(std::ptr::null_mut()));
-    }
-
-    #[test]
-    fn builtin_issubclass_identity_uses_wrapped_code() {
-        crate::typedef::init_typeobjects();
-        let issubclass =
-            make_module_builtin_function_with_arity("issubclass", builtin_issubclass, 2);
-        let renamed_issubclass =
-            make_module_builtin_function_with_arity("issubclass", builtin_repr, 2);
-
-        assert!(is_builtin_issubclass_function(issubclass));
-        assert!(!is_builtin_issubclass_function(renamed_issubclass));
-        assert!(!is_builtin_issubclass_function(std::ptr::null_mut()));
+        let cases: &[(
+            &str,
+            fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+            u16,
+            fn(PyObjectRef) -> bool,
+        )] = &[
+            ("ord", builtin_ord, 1, is_builtin_ord_function),
+            (
+                "isinstance",
+                __majit_wrap_builtin_isinstance,
+                2,
+                is_builtin_isinstance_function,
+            ),
+            (
+                "issubclass",
+                builtin_issubclass,
+                2,
+                is_builtin_issubclass_function,
+            ),
+        ];
+        for (name, code, arity, is_builtin) in cases {
+            let wrapped = make_module_builtin_function_with_arity(name, *code, *arity);
+            let renamed = make_module_builtin_function_with_arity(name, builtin_repr, *arity);
+            assert!(is_builtin(wrapped), "case {name}");
+            assert!(!is_builtin(renamed), "case {name}");
+            assert!(!is_builtin(std::ptr::null_mut()), "case {name}");
+        }
     }
 
     #[test]
@@ -25294,21 +25286,18 @@ mod tests {
     }
 
     #[test]
-    fn test_builtin_pow_three_arg_delegates_through_proxy() {
+    fn test_builtin_pow_delegates_through_proxy() {
         let _g = crate::module::_weakref::interp__weakref::lock_proxy_tests();
         crate::typedef::init_typeobjects();
-        let proxy = crate::module::_weakref::interp__weakref::W_Proxy_new(w_int_new(5), PY_NULL);
-        let result = builtin_pow(&[proxy, w_int_new(3), w_int_new(13)]).unwrap();
-        assert_eq!(unsafe { w_int_get_value(result) }, 8);
-    }
-
-    #[test]
-    fn test_builtin_pow_two_arg_delegates_through_proxy() {
-        let _g = crate::module::_weakref::interp__weakref::lock_proxy_tests();
-        crate::typedef::init_typeobjects();
-        let proxy = crate::module::_weakref::interp__weakref::W_Proxy_new(w_int_new(5), PY_NULL);
-        let result = builtin_pow(&[proxy, w_int_new(3)]).unwrap();
-        assert_eq!(unsafe { w_int_get_value(result) }, 125);
+        let cases: &[(&str, &[i64], i64)] = &[("three_arg", &[3, 13], 8), ("two_arg", &[3], 125)];
+        for (name, exponents, want) in cases {
+            let proxy =
+                crate::module::_weakref::interp__weakref::W_Proxy_new(w_int_new(5), PY_NULL);
+            let mut args = vec![proxy];
+            args.extend(exponents.iter().copied().map(w_int_new));
+            let result = builtin_pow(&args).unwrap();
+            assert_eq!(unsafe { w_int_get_value(result) }, *want, "case {name}");
+        }
     }
 
     #[test]

@@ -17,17 +17,13 @@
 use pyre_jit_trace::llbc_fingerprint::{FreshnessMode, freshness_policy};
 
 #[test]
-fn both_unset_is_strict_and_says_nothing() {
-    let p = freshness_policy(None, None);
-    assert_eq!(p.mode, FreshnessMode::Strict);
-    assert!(p.diagnostics.is_empty(), "{:?}", p.diagnostics);
-}
-
-#[test]
-fn strict_one_promotes_to_error() {
-    let p = freshness_policy(Some("1"), None);
-    assert_eq!(p.mode, FreshnessMode::Strict);
-    assert!(p.diagnostics.is_empty(), "{:?}", p.diagnostics);
+fn strict_unset_or_one_says_nothing() {
+    let cases = [("unset", None), ("one", Some("1"))];
+    for (name, strict) in cases {
+        let p = freshness_policy(strict, None);
+        assert_eq!(p.mode, FreshnessMode::Strict, "case {name}");
+        assert!(p.diagnostics.is_empty(), "case {name}: {:?}", p.diagnostics);
+    }
 }
 
 /// `PYRE_LLBC_STRICT=0` is the only value that lets a stale artefact through

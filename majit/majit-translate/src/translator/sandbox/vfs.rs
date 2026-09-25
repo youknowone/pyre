@@ -288,12 +288,6 @@ mod tests {
     }
 
     #[test]
-    fn file_open_returns_data() {
-        let file = FSObject::File(File::new(b"hello".to_vec()));
-        assert_eq!(file.open().unwrap(), b"hello");
-    }
-
-    #[test]
     fn stat_caches_inode_per_node() {
         let file = FSObject::File(File::new(b"x".to_vec()));
         assert_eq!(file.stat().st_ino, file.stat().st_ino);

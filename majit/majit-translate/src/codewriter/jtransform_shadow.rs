@@ -621,14 +621,14 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_op_names_are_unique() {
-        let unique: HashSet<&&str> = REWRITE_OP_OPNAMES.iter().collect();
-        assert_eq!(unique.len(), REWRITE_OP_OPNAMES.len());
-    }
-
-    #[test]
-    fn bhimpl_default_names_are_unique() {
-        let unique: HashSet<&&str> = BHIMPL_DEFAULT_OPNAMES.iter().collect();
-        assert_eq!(unique.len(), BHIMPL_DEFAULT_OPNAMES.len());
+    fn opname_slices_are_unique() {
+        let cases: &[(&str, &[&str])] = &[
+            ("rewrite", REWRITE_OP_OPNAMES),
+            ("bhimpl_default", BHIMPL_DEFAULT_OPNAMES),
+        ];
+        for (name, names) in cases {
+            let unique: std::collections::HashSet<&&str> = names.iter().collect();
+            assert_eq!(unique.len(), names.len(), "case {name}");
+        }
     }
 }

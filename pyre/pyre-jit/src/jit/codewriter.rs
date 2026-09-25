@@ -17220,19 +17220,6 @@ mod tests {
     }
 
     #[test]
-    fn null_stack_sentinel_is_none_ref_constant() {
-        let value = null_stack_sentinel();
-        let FlowValue::Constant(constant) = value else {
-            panic!("null stack sentinel must be a Constant");
-        };
-        assert_eq!(constant.kind, Some(Kind::Ref));
-        assert!(matches!(
-            constant.value,
-            crate::jit::flow::ConstantValue::None
-        ));
-    }
-
-    #[test]
     fn duplicate_shadow_tos_clones_existing_top_value() {
         let start = Block::shared(Vec::new());
         let mut graph = FunctionGraph::new("dup_shadow_tos", start, None);

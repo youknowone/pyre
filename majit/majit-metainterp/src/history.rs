@@ -1397,31 +1397,6 @@ mod tests {
         assert_eq!(trace.num_inputargs(), 1);
     }
 
-    #[test]
-    fn test_trace_with_finish() {
-        let inputargs = vec![InputArg::new_int(0)];
-        let ops = vec![
-            Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(0)]),
-            Op::new(OpCode::Finish, &[iop_box(1)]),
-        ];
-        let trace = TreeLoop::new(inputargs, ops);
-        assert!(!trace.is_loop());
-        assert!(trace.is_finished());
-    }
-
-    #[test]
-    fn test_inputarg_types() {
-        let inputargs = vec![
-            InputArg::new_int(0),
-            InputArg::new_ref(1),
-            InputArg::new_float(2),
-        ];
-        let trace = TreeLoop::new(inputargs, vec![]);
-        assert_eq!(trace.inputargs[0].tp.get(), Type::Int);
-        assert_eq!(trace.inputargs[1].tp.get(), Type::Ref);
-        assert_eq!(trace.inputargs[2].tp.get(), Type::Float);
-    }
-
     // History / TreeLoop parity tests
     // Local parity coverage for history.py TreeLoop structure.
 

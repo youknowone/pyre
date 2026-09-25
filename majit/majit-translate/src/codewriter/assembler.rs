@@ -6864,12 +6864,6 @@ mod tests {
     }
 
     #[test]
-    fn assembler_error_message_matches_exception_payload() {
-        let err = AssemblerError::message("unimplemented const in graph");
-        assert_eq!(err.to_string(), "unimplemented const in graph");
-    }
-
-    #[test]
     fn emit_const_unknown_kind_raises_assembler_error() {
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut asm = Assembler::new();

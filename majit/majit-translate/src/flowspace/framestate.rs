@@ -470,7 +470,7 @@ pub fn recursively_flatten(lst: &[StackElem]) -> Vec<Hlvalue> {
 
 #[cfg(test)]
 mod test {
-    use super::super::flowcontext::{FlowSignal, FlowSignalTag, FrameBlockKind};
+    use super::super::flowcontext::{FlowSignal, FrameBlockKind};
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -679,18 +679,5 @@ mod test {
             0,
         );
         assert!(fs1.matches(&fs2));
-    }
-
-    #[test]
-    fn matches_uses_tag_for_flow_signal() {
-        // Ensure the FlowSignal import path used by tests resolves —
-        // the tag check is exercised by union_stack in union(), not
-        // by matches(), but pin the import so developers know
-        // the enum lives at super::flowcontext::FlowSignal.
-        let tag = FlowSignal::Return {
-            w_value: Hlvalue::Constant(Constant::new(ConstValue::Int(1))),
-        }
-        .tag();
-        assert_eq!(tag, FlowSignalTag::Return);
     }
 }

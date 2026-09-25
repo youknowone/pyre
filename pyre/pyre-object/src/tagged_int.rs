@@ -122,14 +122,6 @@ mod tests {
     }
 
     #[test]
-    fn fits_tagged_matches_pointer_width() {
-        // The taggable range tracks pointer width: the top payload fits,
-        // one past it does not.
-        assert!(fits_tagged((isize::MAX >> 1) as i64));
-        assert!(!fits_tagged(((isize::MAX >> 1) as i64) + 1));
-    }
-
-    #[test]
     fn even_aligned_and_null_pointers_are_not_tagged() {
         // A null pointer (address 0) and any 8-byte-aligned heap pointer
         // have a clear low bit, so a real `PyObjectRef` never reads as

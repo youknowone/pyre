@@ -1273,6 +1273,12 @@ jobs:
       env:
         PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}
       run: ${{ steps.cpython.outputs.python-path }} pyre/extra_tests/run.py --gated-only ${{ matrix.only }}
+    - name: Run pyre/extra_tests/cpyext
+      # check.py's dynasm build carries `cpyext` (pyre/check.py backend table
+      # "extra": [..., "dynasm,cpyext"]), and these were previously one Rust
+      # test binary each.
+      if: ${{ !cancelled() && runner.os != 'Windows' && contains(matrix.backend, 'dynasm') }}
+      run: ${{ steps.cpython.outputs.python-path }} pyre/extra_tests/cpyext/run.py
     - name: Run the vendored root extra_tests
       # PyPy's own `extra_tests/` tree, run in place through a driver that
       # supplies the pytest names those files use. Only `run.py`'s ENABLED list

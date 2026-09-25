@@ -6818,19 +6818,6 @@ mod tests {
 
     // ── Metadata table coverage ──
 
-    #[test]
-    fn test_every_opcode_has_name() {
-        for op in all_opcodes() {
-            let name = op.name();
-            assert!(
-                !name.is_empty(),
-                "OpCode {:?} (u16={}) has empty name",
-                op,
-                op.as_u16()
-            );
-        }
-    }
-
     /// `from_u16` is the left-inverse of `as_u16` over the defined
     /// `0..OPCODE_COUNT` range, and returns `None` everywhere outside it.
     #[test]
@@ -6841,34 +6828,6 @@ mod tests {
         }
         assert_eq!(OpCode::from_u16(OPCODE_COUNT as u16), None);
         assert_eq!(OpCode::from_u16(u16::MAX), None);
-    }
-
-    #[test]
-    fn test_every_opcode_has_result_type() {
-        for op in all_opcodes() {
-            let _tp = op.result_type();
-        }
-    }
-
-    #[test]
-    fn test_every_opcode_has_arity_entry() {
-        for op in all_opcodes() {
-            let _arity = op.arity();
-        }
-    }
-
-    #[test]
-    fn test_every_opcode_has_descr_entry() {
-        for op in all_opcodes() {
-            let _has_descr = op.has_descr();
-        }
-    }
-
-    #[test]
-    fn test_every_opcode_has_bool_entry() {
-        for op in all_opcodes() {
-            let _returns_bool = op.returns_bool();
-        }
     }
 
     // ── Arity: nullary / unary / binary / variadic ──
@@ -7620,17 +7579,6 @@ mod tests {
             let debug = format!("{:?}", op);
             assert_eq!(name, debug, "name() and Debug should match for {:?}", op);
         }
-    }
-
-    #[test]
-    fn test_specific_opnames() {
-        assert_eq!(OpCode::IntAdd.name(), "IntAdd");
-        assert_eq!(OpCode::GuardTrue.name(), "GuardTrue");
-        assert_eq!(OpCode::CallI.name(), "CallI");
-        assert_eq!(OpCode::Jump.name(), "Jump");
-        assert_eq!(OpCode::Finish.name(), "Finish");
-        assert_eq!(OpCode::New.name(), "New");
-        assert_eq!(OpCode::SetfieldGc.name(), "SetfieldGc");
     }
 
     // ── Op construction ──

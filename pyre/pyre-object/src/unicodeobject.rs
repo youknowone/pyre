@@ -1852,20 +1852,14 @@ mod tests {
 
     #[test]
     fn test_str_create_and_read() {
-        let obj = w_str_new("hello");
-        unsafe {
-            assert!(is_str(obj));
-            assert!(!is_int(obj));
-            assert_eq!(w_str_get_value(obj), "hello");
-        }
-    }
-
-    #[test]
-    fn test_str_empty() {
-        let obj = w_str_new("");
-        unsafe {
-            assert!(is_str(obj));
-            assert_eq!(w_str_get_value(obj), "");
+        let cases = [("hello", "hello"), ("empty", "")];
+        for (name, value) in cases {
+            let obj = w_str_new(value);
+            unsafe {
+                assert!(is_str(obj), "case {name}");
+                assert!(!is_int(obj), "case {name}");
+                assert_eq!(w_str_get_value(obj), value, "case {name}");
+            }
         }
     }
 
