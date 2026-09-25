@@ -11548,7 +11548,10 @@ impl<'a> Lowering<'a> {
                 // its `pyre_` fence admits exactly the three element banks
                 // named above, all of them one word.
                 if let Some((item_ty, array_type_id)) = index_element
-                    && (workspace_index || array_type_id.is_some() || element_is_addressable)
+                    && (workspace_index
+                        || array_type_id.is_some()
+                        || element_is_addressable
+                        || vable_array_var.is_some())
                 {
                     // `&frame.items[i]` is a bounds-checked index (`nolength:
                     // false` below). When `items` is a declared virtualizable
@@ -29970,6 +29973,10 @@ fn json_ty_scalar_element_spelling(node: &serde_json::Value, llbc: &Llbc) -> Opt
 /// A pointer is one word only while it is thin: a pointer to an unsized
 /// pointee carries a length or a vtable beside the address.
 fn json_ty_is_thin_pointer_element(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    // `Box<T>` of a sized `T` is one pointer word, the same width as `&T`.
+    if type_node_is_thin_box(node, llbc) {
+        return true;
+    }
     let Some(obj) = strip_ty_indirections(node, llbc).and_then(serde_json::Value::as_object) else {
         return false;
     };
@@ -43366,6 +43373,79 @@ mod tests {
         ));
         assert!(thin(serde_json::json!({"RawPtr": [named_adt, "Mut"]})));
         assert!(!thin(uint("U8")));
+    }
+
+    /// `Vec::index_mut` of `Vec<Box<T>>` is one word per element when `T` has
+    /// a concrete size. `IndexMut::index_mut` then lowers to `ArrayRead`
+    /// (`getarrayitem`) instead of staying a residual call.
+    #[test]
+    fn a_box_of_a_sized_adt_is_a_thin_pointer_element() {
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+        }});
+        let meta = serde_json::json!({
+            "name": [{"Ident": ["fixture", 0]}, {"Ident": ["Payload", 0]}],
+            "span": span, "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [{
+                    "def_id": 0,
+                    "item_meta": meta,
+                    "kind": {"Struct": []},
+                    "layout": [{
+                        "key": "fixture-target",
+                        "value": {
+                            "size": 16,
+                            "align": 8,
+                            "variant_layouts": [{"field_offsets": []}],
+                            "repr": {"transparent": false}
+                        }
+                    }]
+                }],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let payload = serde_json::json!({
+            "Adt": {
+                "id": {"Adt": 0},
+                "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+            }
+        });
+        let boxed = serde_json::json!({
+            "Adt": {
+                "id": {"Builtin": "Box"},
+                "generics": {"regions": [], "types": [payload], "const_generics": [], "trait_refs": []}
+            }
+        });
+        assert!(
+            json_ty_is_thin_pointer_element(&boxed, &llbc),
+            "Box<sized ADT> is one pointer word, so index_mut can emit ArrayRead"
+        );
+        let fat_box = serde_json::json!({
+            "Adt": {
+                "id": {"Builtin": "Box"},
+                "generics": {
+                    "regions": [],
+                    "types": [{"Slice": {"Literal": {"UInt": "U8"}}}],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        });
+        assert!(
+            !json_ty_is_thin_pointer_element(&fat_box, &llbc),
+            "Box<[u8]> is a fat pointer and must not take the one-word stride"
+        );
     }
 
     #[test]
