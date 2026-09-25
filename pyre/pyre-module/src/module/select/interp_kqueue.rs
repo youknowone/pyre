@@ -149,9 +149,12 @@ impl W_Kqueue {
 
         // `interp_kqueue.py descr_control` — EINTR retry, recomputing the
         // remaining timeout each pass.
-        let deadline = timeout
-            .as_ref()
-            .and_then(|ts| ts.to_duration().map(|d| std::time::Instant::now() + d));
+        let deadline = match timeout.as_ref().and_then(|ts| ts.to_duration()) {
+            Some(d) => Some(std::time::Instant::now().checked_add(d).ok_or_else(|| {
+                pyre_interpreter::PyError::overflow_error("timeout is too large")
+            })?),
+            None => None,
+        };
         let nfds = loop {
             let (result, errno) = pyre_interpreter::module::thread::call_external_function(|| {
                 host_kqueue::kevent(self.kqfd, &changelist, &mut eventlist, timeout.as_ref())
