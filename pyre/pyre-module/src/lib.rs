@@ -91,7 +91,6 @@ pub fn install_optional_modules() {
     #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("_ssl", module::_ssl::init);
     pyre_interpreter::importing::register_builtin_module("_statistics", module::_statistics::init);
-    pyre_interpreter::importing::register_builtin_module("_template", module::_template::init);
     #[cfg(windows)]
     pyre_interpreter::importing::register_builtin_module("_winapi", module::_winapi::init);
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]

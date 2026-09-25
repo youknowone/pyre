@@ -4,7 +4,7 @@
 //! app-level Python the BUILD_TEMPLATE / BUILD_INTERPOLATION opcodes construct
 //! through `_build_template` / `_build_interpolation`.
 
-pyre_interpreter::py_module! {
+crate::py_module! {
     "_template",
     appleveldefs: {
         "_template_app.py" => [
@@ -19,11 +19,11 @@ pyre_interpreter::py_module! {
         // CPython BASETYPE projection per type; mutating the shared TypeDef
         // would make object itself unacceptable as a base.
         for name in ["Template", "Interpolation"] {
-            if let Some(t) = pyre_interpreter::module_ns_get(ns, name) {
+            if let Some(t) = crate::module_ns_get(ns, name) {
                 // CPython 3.14 exposes both as immutable non-heap types.
                 // Keep the PyPy app-level owner internally and project only
                 // the caller-visible static/immutable type capabilities.
-                pyre_interpreter::typedef::mark_cpython_static_extension_type(t);
+                crate::typedef::mark_cpython_static_extension_type(t);
                 unsafe { pyre_object::w_type_suppress_cpython_basetype(t) };
             }
         }
