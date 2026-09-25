@@ -17611,11 +17611,8 @@ impl<'a> Lowering<'a> {
         })
     }
 
-    /// `FixedObjectArray::len` (`pyre-object/src/object_array.rs`) — the
-    /// `PyFrame.locals_cells_stack_w` `Ptr(GcArray(PyObjectRef))` accessor.
-    /// Its body reads the array's own length header, so the call *is*
-    /// `arraylen_gc`; see the `ArrayLen` emission site for why this one
-    /// cannot share `is_container_len`'s `__len` routing.
+    /// `items_block_capacity` — the `ItemsBlock` capacity header read,
+    /// `len(l.items)` of the GcArray.
     fn is_items_block_capacity(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
@@ -17699,6 +17696,11 @@ impl<'a> Lowering<'a> {
         Some(self.llbc.type_by_id(type_id)?.item_meta.name_path())
     }
 
+    /// `FixedObjectArray::len` (`pyre-object/src/object_array.rs`) — the
+    /// `PyFrame.locals_cells_stack_w` `Ptr(GcArray(PyObjectRef))` accessor.
+    /// Its body reads the array's own length header, so the call *is*
+    /// `arraylen_gc`; see the `ArrayLen` emission site for why this one
+    /// cannot share `is_container_len`'s `__len` routing.
     fn is_object_array_len(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
