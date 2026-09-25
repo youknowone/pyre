@@ -14,8 +14,6 @@
 ///
 /// arch.rs, codebuf.rs, guard.rs, regloc.rs are from llsupport/.
 // ── Shared modules (llsupport/ parity) ──
-use std::cell::RefCell;
-
 pub mod arch;
 pub mod callbuilder;
 pub mod codebuf;
@@ -109,26 +107,6 @@ static JIT_EXC_VALUE: AtomicI64 = AtomicI64::new(0);
 // Holds the pending exception's `typeptr` (an immortal static `PyType`), never a
 // managed object, so it is deliberately not GC-rooted.
 static JIT_EXC_TYPE: AtomicI64 = AtomicI64::new(0);
-/// Stands in for the slot array before any slot is written, so the base a
-/// compiled entry receives is always a readable address rather than null.
-/// `llmodel.py:319-322` does the same in untranslated runs, handing the entry a
-/// dummy container instead of the real `pypy_threadlocal_s`.
-static DUMMY_THREADLOCAL_SLOT: i64 = 0;
-/// Set by [`jit_threadlocalref_set`]. Until then every entry receives the
-/// dummy word: `llop.threadlocalref_addr` is one load, and an empty
-/// `RefCell<Vec>` borrow on the unset path was that load plus a TLS flag.
-static THREADLOCAL_SLOTS_USED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-thread_local! {
-    /// llmodel.py / :317-323 `threadlocalref_addr` parity: compiled
-    /// entries take the thread-local slot-array base as their second argument.
-    /// The aarch64 prologue spills it to `SAVED_THREADLOCAL_OFS` and the
-    /// CALL_ASSEMBLER path reloads it into x1 before invoking the callee trace,
-    /// so the ABI holds through the whole call chain even though
-    /// THREADLOCALREF_GET lowering does not exist yet.
-    static JIT_THREADLOCAL_SLOTS: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
-}
 
 /// llmodel.py _store_exception parity: set JIT exception state.
 /// `value` is a valid OBJECTPTR (or 0). Exception class derived from
@@ -194,31 +172,15 @@ pub fn jit_exc_type_addr() -> usize {
 
 /// Write a thread-local slot that compiled entrypoints may read back.
 pub fn jit_threadlocalref_set(offset: i64, value: i64) {
-    THREADLOCAL_SLOTS_USED.store(true, std::sync::atomic::Ordering::Release);
-    JIT_THREADLOCAL_SLOTS.with(|slots| {
-        let mut slots = slots.borrow_mut();
-        let idx = (offset / 8) as usize;
-        if idx >= slots.len() {
-            slots.resize(idx + 1, 0);
-        }
-        slots[idx] = value;
-    });
+    majit_rlib::rthread::threadlocalref_set(offset as usize, value);
 }
 
-/// Return the base pointer passed to compiled entrypoints as x1.
+/// `llmodel.py` `threadlocalref_addr`: the `pypy_threadlocal_s` address a
+/// compiled entry receives as its second argument. The prologue spills it
+/// and `CALL_ASSEMBLER` reloads it for the callee.
 #[inline]
 pub(crate) fn jit_threadlocalref_base() -> *const i64 {
-    if !THREADLOCAL_SLOTS_USED.load(std::sync::atomic::Ordering::Acquire) {
-        return &raw const DUMMY_THREADLOCAL_SLOT;
-    }
-    JIT_THREADLOCAL_SLOTS.with(|slots| {
-        let slots = slots.borrow();
-        if slots.is_empty() {
-            &raw const DUMMY_THREADLOCAL_SLOT
-        } else {
-            slots.as_ptr()
-        }
-    })
+    majit_rlib::rthread::threadlocalref_addr()
 }
 
 // ── CALL_ASSEMBLER helper infrastructure ──

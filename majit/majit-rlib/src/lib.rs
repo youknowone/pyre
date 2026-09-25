@@ -10,13 +10,21 @@
 //! in a crate above the module that allocates it. The module path spells the
 //! upstream package it came from.
 
+#[cfg(target_os = "windows")]
+#[allow(non_snake_case)]
+pub mod _rsocket_rffi;
 pub mod cache;
 pub mod debug;
 pub mod jit;
 pub mod lltypesystem;
 pub mod nonconst;
 pub mod rbigint;
+pub mod rposix;
+pub mod rthread;
 pub mod rvmprof;
+#[cfg(target_os = "windows")]
+#[allow(non_snake_case)]
+pub mod rwin32;
 
 /// `lltype.malloc(T, flavor='raw')` (`rpython/rtyper/lltypesystem/lltype.py`) —
 /// an allocation the collector neither traces nor reclaims.

@@ -78,6 +78,19 @@ const X86_FLOAT_REGS: [crate::regloc::RegLoc; 8] = [
 /// repaired later.
 const MIN_RELOCATED_JUMP_TARGET: usize = 4096;
 
+/// Where `_call_header` keeps the thread-local address the entry received as
+/// its second argument: the body-rsp-relative padding slot above the saved
+/// registers. `arch.py` names this `THREADLOCAL_OFS`; this frame packs the
+/// saved registers from offset 0 and has no `PASS_ON_MY_FRAME` area, so the
+/// slot lands at the padding word instead. The offset differs, the mechanism
+/// does not.
+///
+/// Reads must add any `push` or `sub rsp` in effect at the read point.
+#[cfg(not(target_os = "windows"))]
+const SAVED_THREADLOCAL_OFS: i32 = 48;
+#[cfg(target_os = "windows")]
+const SAVED_THREADLOCAL_OFS: i32 = 64;
+
 /// Resolved argument: either a frame slot (frame-pointer-relative offset) or a constant.
 enum ResolvedArg {
     /// Frame-pointer-relative byte offset: [rbp + offset] on x64, [x29, #offset] on aarch64.
@@ -1609,7 +1622,8 @@ impl<'a> Assembler386<'a> {
         //            +48 pad]   → SUB 56 (6 slots + 1 padding; body rsp
         //            at 0 mod 16)
         //
-        // The trailing padding slot (`+64` Win64, `+48` SysV) brings the
+        // The trailing padding slot (`+64` Win64, `+48` SysV) holds the
+        // thread-local address (`SAVED_THREADLOCAL_OFS`), and it brings the
         // body rsp from the function-entry 8-mod-16 down to 0-mod-16,
         // matching PyPy's body alignment convention.  This lets every
         // inner CALL omit the per-call `SUB rsp, 8` alignment fixup
@@ -1637,6 +1651,9 @@ impl<'a> Assembler386<'a> {
             ; mov [rsp + 40], r15
             ; mov [rsp + 48], rbp
             ; mov [rsp + 56], r13
+            // assembler.py `_call_header`: keep the thread-local address
+            // the entry received as its second argument.
+            ; mov [rsp + SAVED_THREADLOCAL_OFS], rdx
             ; mov rbp, rcx
         );
         #[cfg(not(target_os = "windows"))]
@@ -1649,6 +1666,9 @@ impl<'a> Assembler386<'a> {
             ; mov [rsp + 24], r14
             ; mov [rsp + 32], r15
             ; mov [rsp + 40], rbp
+            // assembler.py `_call_header`: keep the thread-local address
+            // the entry received as its second argument.
+            ; mov [rsp + SAVED_THREADLOCAL_OFS], rsi
             ; mov rbp, rdi
         );
         let propagate_descr = self.propagate_exception_descr_ptr();
@@ -7163,7 +7183,154 @@ impl<'a> Assembler386<'a> {
     /// arg1 reads it as Gpr(rdx)).  Linux SysV escaped the same code
     /// path because its rdi/rsi placement happened not to collide with
     /// regalloc-chosen rcx/rdx for these traces.
-    fn emit_call_from_arglocs(&mut self, op: &Op, arglocs: &[Loc], func_index: usize) {
+    /// callbuilder.py `write_real_errno`, just before the raw call: copy the
+    /// saved `errno` (and on Windows the saved last error) into the real one.
+    /// `esp_ofs` is how far rsp sits below the body rsp here. Only r10/r11 are
+    /// clobbered, since every argument register and rax (the callee) are
+    /// already loaded.
+    fn write_real_errno(&mut self, save_err: i64, esp_ofs: i32) {
+        use majit_jitcode::rffi::{RFFI_ALT_ERRNO, RFFI_READSAVED_ERRNO, RFFI_ZERO_ERRNO_BEFORE};
+        use majit_rlib::rthread::{
+            TLFIELD_ALT_ERRNO_OFS, TLFIELD_P_ERRNO_OFS, TLFIELD_RPY_ERRNO_OFS,
+        };
+        let tlofs = SAVED_THREADLOCAL_OFS + esp_ofs;
+        let p_errno = TLFIELD_P_ERRNO_OFS as i32;
+
+        #[cfg(target_os = "windows")]
+        if save_err & majit_jitcode::rffi::RFFI_READSAVED_LASTERROR != 0 {
+            use majit_rlib::rthread::{TLFIELD_ALT_LASTERROR_OFS, TLFIELD_RPY_LASTERROR_OFS};
+            let lasterror = if save_err & RFFI_ALT_ERRNO != 0 {
+                TLFIELD_ALT_LASTERROR_OFS
+            } else {
+                TLFIELD_RPY_LASTERROR_OFS
+            } as i32;
+            let set_last_error = majit_rlib::rwin32::_SetLastError as *const () as i64;
+            // `win64_save_register_args`: keep the four argument registers
+            // of both banks and the callee in rax across SetLastError(),
+            // above a fresh shadow area.  112 keeps rsp 16-byte aligned.
+            let tlofs = tlofs + 112;
+            dynasm!(self.mc ; .arch x64
+                ; sub rsp, 112
+                ; mov [rsp + 32], rcx
+                ; mov [rsp + 40], rdx
+                ; mov [rsp + 48], r8
+                ; mov [rsp + 56], r9
+                ; mov [rsp + 64], rax
+                ; movsd [rsp + 72], xmm0
+                ; movsd [rsp + 80], xmm1
+                ; movsd [rsp + 88], xmm2
+                ; movsd [rsp + 96], xmm3
+                ; mov r11, [rsp + tlofs]
+                ; mov ecx, [r11 + lasterror]
+                ; mov rax, QWORD set_last_error
+                ; call rax
+                ; mov rcx, [rsp + 32]
+                ; mov rdx, [rsp + 40]
+                ; mov r8, [rsp + 48]
+                ; mov r9, [rsp + 56]
+                ; mov rax, [rsp + 64]
+                ; movsd xmm0, [rsp + 72]
+                ; movsd xmm1, [rsp + 80]
+                ; movsd xmm2, [rsp + 88]
+                ; movsd xmm3, [rsp + 96]
+                ; add rsp, 112
+            );
+        }
+
+        if save_err & RFFI_READSAVED_ERRNO != 0 {
+            // Just before a call, read '*_errno' and write it into the
+            // real 'errno'.
+            let rpy_errno = if save_err & RFFI_ALT_ERRNO != 0 {
+                TLFIELD_ALT_ERRNO_OFS
+            } else {
+                TLFIELD_RPY_ERRNO_OFS
+            } as i32;
+            dynasm!(self.mc ; .arch x64
+                ; mov r11, [rsp + tlofs]
+                ; mov r10, [r11 + p_errno]
+                ; mov r11d, [r11 + rpy_errno]
+                ; mov [r10], r11d
+            );
+        } else if save_err & RFFI_ZERO_ERRNO_BEFORE != 0 {
+            // Same, but write zero.
+            dynasm!(self.mc ; .arch x64
+                ; mov r11, [rsp + tlofs]
+                ; mov r10, [r11 + p_errno]
+                ; mov DWORD [r10], 0
+            );
+        }
+    }
+
+    /// callbuilder.py `read_real_errno`, after the raw call and after the
+    /// stack pointer is restored: save the real `errno` (and on Windows the
+    /// last error) into the thread-local copy. rax/xmm0 hold the result.
+    fn read_real_errno(&mut self, save_err: i64, esp_ofs: i32) {
+        use majit_jitcode::rffi::{RFFI_ALT_ERRNO, RFFI_SAVE_ERRNO};
+        use majit_rlib::rthread::{
+            TLFIELD_ALT_ERRNO_OFS, TLFIELD_P_ERRNO_OFS, TLFIELD_RPY_ERRNO_OFS,
+        };
+        let tlofs = SAVED_THREADLOCAL_OFS + esp_ofs;
+
+        if save_err & RFFI_SAVE_ERRNO != 0 {
+            // Just after a call, read the real 'errno' and save a copy of
+            // it inside our thread-local '*_errno'.
+            let rpy_errno = if save_err & RFFI_ALT_ERRNO != 0 {
+                TLFIELD_ALT_ERRNO_OFS
+            } else {
+                TLFIELD_RPY_ERRNO_OFS
+            } as i32;
+            let p_errno = TLFIELD_P_ERRNO_OFS as i32;
+            dynasm!(self.mc ; .arch x64
+                ; mov r11, [rsp + tlofs]
+                ; mov r10, [r11 + p_errno]
+                ; mov r10d, [r10]
+                ; mov [r11 + rpy_errno], r10d
+            );
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            use majit_jitcode::rffi::{RFFI_SAVE_LASTERROR, RFFI_SAVE_WSALASTERROR};
+            use majit_rlib::rthread::{TLFIELD_ALT_LASTERROR_OFS, TLFIELD_RPY_LASTERROR_OFS};
+            if save_err & (RFFI_SAVE_LASTERROR | RFFI_SAVE_WSALASTERROR) != 0 {
+                let get_last_error = if save_err & RFFI_SAVE_LASTERROR != 0 {
+                    majit_rlib::rwin32::_GetLastError as *const () as i64
+                } else {
+                    majit_rlib::_rsocket_rffi::_WSAGetLastError as *const () as i64
+                };
+                let lasterror = if save_err & RFFI_ALT_ERRNO != 0 {
+                    TLFIELD_ALT_LASTERROR_OFS
+                } else {
+                    TLFIELD_RPY_LASTERROR_OFS
+                } as i32;
+                // `save_result_value`: keep rax/xmm0 above a fresh shadow
+                // area. rsp is 8 mod 16 here (one push below the body rsp),
+                // so 56 realigns it.
+                debug_assert_eq!(esp_ofs % 16, 8);
+                let tlofs = tlofs + 56;
+                dynasm!(self.mc ; .arch x64
+                    ; sub rsp, 56
+                    ; mov [rsp + 32], rax
+                    ; movsd [rsp + 40], xmm0
+                    ; mov rax, QWORD get_last_error
+                    ; call rax
+                    ; mov r11, [rsp + tlofs]
+                    ; mov [r11 + lasterror], eax
+                    ; mov rax, [rsp + 32]
+                    ; movsd xmm0, [rsp + 40]
+                    ; add rsp, 56
+                );
+            }
+        }
+    }
+
+    fn emit_call_from_arglocs(
+        &mut self,
+        op: &Op,
+        arglocs: &[Loc],
+        func_index: usize,
+        save_err: i64,
+    ) {
         let arg_count = arglocs.len();
         let call_arg_count = arg_count.saturating_sub(func_index + 1);
         let descr_arc = op.getdescr();
@@ -7260,9 +7427,14 @@ impl<'a> Assembler386<'a> {
                 other => panic!("unsupported x86-64 call target {other:?}"),
             }
         }
+        // llsupport/callbuilder.py `emit_call_release_gil`:
+        // write_real_errno(); emit_raw_call(); restore_stack_pointer();
+        // read_real_errno().
+        self.write_real_errno(save_err, WORD as i32 + call_area_adjust);
         dynasm!(self.mc ; .arch x64 ; call rax);
 
         self.emit_release_abi_call_area(call_area_adjust);
+        self.read_real_errno(save_err, WORD as i32);
         dynasm!(self.mc ; .arch x64 ; pop rbp);
     }
 
@@ -7300,8 +7472,15 @@ impl<'a> Assembler386<'a> {
     }
 
     fn _genop_call_with_arglocs(&mut self, op: &Op, arglocs: &[Loc]) {
-        let func_index = 3 + usize::from(op.opcode.is_call_release_gil());
-        self.emit_call_from_arglocs(op, arglocs, func_index);
+        // [resloc, size, sign, saveerr, func, args...] for CALL_RELEASE_GIL.
+        let is_call_release_gil = op.opcode.is_call_release_gil();
+        let save_err = if is_call_release_gil {
+            Self::argloc_imm(arglocs, 3)
+        } else {
+            0
+        };
+        let func_index = 3 + usize::from(is_call_release_gil);
+        self.emit_call_from_arglocs(op, arglocs, func_index, save_err);
         if op.opcode.result_type() == Type::Int {
             self.ensure_call_result_bit_extension(arglocs);
         }
@@ -7643,6 +7822,12 @@ impl<'a> Assembler386<'a> {
         let pushed_gcmap = self.push_pending_call_gcmap();
         self.emit_load_to_rax(frame_loc); // rax = callee jf_ptr
         self.emit_abi_int_arg_from_reg(0, 0); // arg0 = jf (Windows: rcx = rax)
+        // `simple_call(addr, [argloc, threadlocal_loc])`: the callee's
+        // `_call_header` saves its own copy of the thread-local address.
+        #[cfg(not(target_os = "windows"))]
+        dynasm!(self.mc ; .arch x64 ; mov rsi, [rsp + SAVED_THREADLOCAL_OFS]);
+        #[cfg(target_os = "windows")]
+        dynasm!(self.mc ; .arch x64 ; mov rdx, [rsp + SAVED_THREADLOCAL_OFS]);
         if let Some(addr) = target_addr.immediate {
             dynasm!(self.mc ; .arch x64 ; mov rax, QWORD addr as i64);
             self.emit_abi_call_rax_aligned();
@@ -8593,7 +8778,7 @@ impl<'a> Assembler386<'a> {
         // has no slot mapping and would panic in `resolve_opref` (or read a
         // stale slot).  Mirrors the AArch64 `genop_discard_cond_call`.
         push_all_regs_to_jitframe_raw(&mut self.mc, &[], true);
-        self.emit_call_from_arglocs(op, arglocs, 1);
+        self.emit_call_from_arglocs(op, arglocs, 1, 0);
         pop_all_regs_from_jitframe_raw(&mut self.mc, &[], true);
 
         dynasm!(self.mc ; .arch x64 ; =>skip_label);
@@ -8617,7 +8802,7 @@ impl<'a> Assembler386<'a> {
         let skip_label = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch x64 ; test rax, rax ; jnz =>skip_label);
 
-        self.emit_call_from_arglocs(op, arglocs, 1);
+        self.emit_call_from_arglocs(op, arglocs, 1, 0);
 
         dynasm!(self.mc ; .arch x64 ; =>skip_label);
 
