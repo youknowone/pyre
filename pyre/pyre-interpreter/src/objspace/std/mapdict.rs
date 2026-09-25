@@ -1609,6 +1609,13 @@ pub unsafe fn load_attr_caching(
     nameindex: usize,
     name: &str,
 ) -> Result<PyObjectRef, PyError> {
+    // mapdict.py `map = w_obj._get_mapdict_map()` answers None for an object
+    // without mapdict storage, so `entry.is_valid_for_map(map)` fails and
+    // `LOAD_ATTR_slowpath` skips its map arm.  The layout test reads only
+    // immutable header words, so that answer needs neither lock.
+    if !unsafe { has_mapdict_layout(w_obj) } {
+        return unsafe { load_attr_slowpath(pycode, w_obj, nameindex, name, std::ptr::null()) };
+    }
     // Copy the immortal-node cache entry under its code-owned lock, then
     // release that lock before touching an instance. Holding both locks
     // across the slow path would extend them across arbitrary descriptor

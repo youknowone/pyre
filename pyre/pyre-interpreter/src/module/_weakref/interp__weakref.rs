@@ -420,6 +420,8 @@ pub fn proxy_type() -> PyObjectRef {
         unsafe {
             pyre_object::w_type_set_hasdict(tp, true);
             pyre_object::w_type_set_acceptable_as_base_class(tp, false);
+            // `proxy_typedef_dict` `__getattribute__` (`proxy_getattribute`).
+            pyre_object::w_type_set_dispatch_own_getattribute(tp);
         }
         tp as usize
     }) as PyObjectRef
@@ -491,6 +493,8 @@ pub fn callable_proxy_type() -> PyObjectRef {
         unsafe {
             pyre_object::w_type_set_hasdict(tp, true);
             pyre_object::w_type_set_acceptable_as_base_class(tp, false);
+            // `callable_proxy_typedef_dict` shares `proxy_getattribute`.
+            pyre_object::w_type_set_dispatch_own_getattribute(tp);
         }
         tp as usize
     }) as PyObjectRef

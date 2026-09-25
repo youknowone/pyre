@@ -6432,15 +6432,6 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
     // dedicated deref opcodes; a cell that reaches ordinary object-space
     // operations is a user-visible object in its own right.
     //
-    // pypy/module/_weakref/interp__weakref.py — proxy_typedef_dict
-    // wraps every space op in `force(space, w_obj)`. PyPy then dispatches
-    // through the type's `__getattribute__` slot at the C level, so the
-    // proxy's wrapper runs before any inline path. pyre's `getattr` does
-    // not consult the type's `__getattribute__`, so we apply the same
-    // effect by forcing the receiver here. `force()` is a no-op for any
-    // non-proxy operand, costing only one ptr-equality check on the hot
-    // path.
-    let obj = crate::module::_weakref::interp__weakref::force(obj)?;
     // `ObjSpace.getattr` keeps `w_obj` live across the lookup and the
     // `get_and_call_function` / `w_method_new` allocations below. Pin the
     // receiver here; each later collecting call reloads from this slot.
@@ -6502,277 +6493,6 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
         };
         if owns_default {
             return type_get_annotations(obj);
-        }
-    }
-
-    // GenericAlias.__getattribute__ (`_pypy_generic_alias.py`) — every
-    // attribute outside `_ATTR_EXCEPTIONS` delegates to `__origin__`.
-    // pyre's `getattr` does not dispatch through a typedef
-    // `__getattribute__` for builtin W_Roots, so the delegation is wired
-    // here; the exception names fall through to the normal lookup that
-    // serves the `__origin__`/`__args__`/`__parameters__` getsets.
-    if unsafe { pyre_object::is_generic_alias(obj) }
-        && !crate::_pypy_generic_alias::is_attr_exception(name)
-        && !crate::_pypy_generic_alias::is_attr_blocked(name)
-    {
-        let origin = unsafe { pyre_object::w_generic_alias_get_origin(obj) };
-        return getattr_str(origin, name);
-    }
-
-    // super proxy — PyPy: pypy/module/__builtin__/descriptor.py
-    // `W_Super.getattribute`.  Only an exact `super` reaches this direct
-    // builtin slot: a subclass must first dispatch through its Python-level
-    // `__getattribute__`, so an override is observable.  The inherited
-    // builtin slot is handled in the generic dispatch below.
-    unsafe {
-        if pyre_object::is_exact_type(obj, &pyre_object::descriptor::SUPER_TYPE) {
-            // Only the unwrapped name here, so the walk takes the raw
-            // dict probe rather than the elidable (see `w_type_getdictvalue`).
-            return super_getattribute_str(obj, name, PY_NULL);
-        }
-    }
-
-    // Native itertools fallback methods.  Every concrete iterator TypeDef now
-    // exposes the iterator slots directly; keep this dispatch only as the
-    // interpreter-level next/iter adapter used by those implementations.
-    unsafe {
-        if pyre_object::interp_itertools::is_count(obj)
-            || pyre_object::interp_itertools::is_repeat(obj)
-            || pyre_object::interp_itertools::is_takewhile(obj)
-            || pyre_object::interp_itertools::is_dropwhile(obj)
-            || pyre_object::interp_itertools::is_filterfalse(obj)
-            || pyre_object::interp_itertools::is_compress(obj)
-            || pyre_object::interp_itertools::is_starmap(obj)
-            || pyre_object::interp_itertools::is_pairwise(obj)
-            || pyre_object::interp_itertools::is_cycle(obj)
-            || pyre_object::interp_itertools::is_chain(obj)
-            || pyre_object::interp_itertools::is_batched(obj)
-            || pyre_object::interp_itertools::is_product(obj)
-            || pyre_object::interp_itertools::is_combinations(obj)
-            || pyre_object::interp_itertools::is_combinations_with_replacement(obj)
-            || pyre_object::interp_itertools::is_permutations(obj)
-            || pyre_object::interp_itertools::is_groupby(obj)
-            || pyre_object::interp_itertools::is_groupby_iterator(obj)
-            || pyre_object::interp_itertools::is_tee_iterable(obj)
-        {
-            let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str, u16)> = match name {
-                "__next__" => Some((iter_next_method, "__next__", 1)),
-                "__iter__" => Some((iter_self_method, "__iter__", 1)),
-                _ => None,
-            };
-            if let Some((func, sname, arity)) = entry {
-                let func_obj = crate::make_builtin_function_with_arity(sname, func, arity);
-                return Ok(pyre_object::w_method_new(
-                    func_obj,
-                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
-                    pyre_object::PY_NULL,
-                ));
-            }
-        }
-    }
-
-    // range attributes/methods — functional.py W_Range.
-    // `.start`/`.stop`/`.step` read-only ints; count/index/__iter__/
-    // __reversed__ exposed as bound methods.
-    unsafe {
-        if pyre_object::is_w_range(obj) {
-            match name {
-                "start" | "stop" | "step" => {
-                    let (start, stop, step) = pyre_object::w_range_fields(obj);
-                    return Ok(match name {
-                        "start" => start,
-                        "stop" => stop,
-                        _ => step,
-                    });
-                }
-                _ => {}
-            }
-            let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str, u16)> = match name {
-                "count" => Some((range_count_method, "count", 2)),
-                "index" => Some((range_index_method, "index", 2)),
-                "__iter__" => Some((range_iter_method, "__iter__", 1)),
-                "__reversed__" => Some((range_reversed_method, "__reversed__", 1)),
-                "__reduce__" => Some((range_reduce_method, "__reduce__", 1)),
-                "__hash__" => Some((range_hash_method, "__hash__", 1)),
-                _ => None,
-            };
-            if let Some((func, sname, arity)) = entry {
-                let func_obj = crate::make_builtin_function_with_arity(sname, func, arity);
-                unsafe { crate::typedef::stamp_builtin_owner(func_obj, "range") };
-                return Ok(pyre_object::w_method_new(
-                    func_obj,
-                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
-                    pyre_object::PY_NULL,
-                ));
-            }
-        }
-    }
-
-    // Native iterator methods — `iter(x)` products: list/tuple/str/set/
-    // bytes/zip/map/reversed share the seq-iter type; range, the dict
-    // views and enumerate are distinct.  `next(it)` and `for` already
-    // drive these through the iternext slot; expose `__next__` and
-    // `__iter__` so explicit `it.__next__()` / `it.__iter__()` work too.
-    unsafe {
-        if is_seq_iter(obj)
-            || pyre_object::is_list_iter(obj)
-            || pyre_object::is_list_reverse_iter(obj)
-            || pyre_object::is_tuple_iter(obj)
-            || is_range_iter(obj)
-            || pyre_object::is_long_range_iter(obj)
-            || pyre_object::dictmultiobject::is_dict_view_iterator(obj)
-            || pyre_object::functional::is_enumerate(obj)
-            || pyre_object::functional::is_reversed(obj)
-            || pyre_object::functional::is_filter(obj)
-            || pyre_object::functional::is_map(obj)
-            || pyre_object::functional::is_zip(obj)
-            || pyre_object::operation::is_callable_iterator(obj)
-        {
-            let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str)> = match name {
-                "__next__" => Some((iter_next_method, "__next__")),
-                "__iter__" => Some((iter_self_method, "__iter__")),
-                _ => None,
-            };
-            if let Some((func, sname)) = entry {
-                let func_obj = crate::make_builtin_function_with_arity(sname, func, 1);
-                return Ok(pyre_object::w_method_new(
-                    func_obj,
-                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
-                    pyre_object::PY_NULL,
-                ));
-            }
-            // Per-iterator-type pickle protocol: `__reduce__` /
-            // `__setstate__` / `__length_hint__` recreate the iterator's
-            // Python 3.14 pickle shape.  `arity` includes `self`.  The
-            // producer-specific seq-iter identities do not all declare the
-            // full trio: `memory_iterator` declares none of it and
-            // `arrayiterator` omits `__length_hint__`, so the shared payload's
-            // accessors stay hidden for those.
-            let entry: Option<(fn(&[PyObjectRef]) -> PyResult, &str, u16)> = if is_seq_iter(obj) {
-                let undeclared: &[&str] = if unsafe { pyre_object::iterobject::is_memory_iter(obj) }
-                {
-                    &["__reduce__", "__setstate__", "__length_hint__"]
-                } else if unsafe { pyre_object::iterobject::is_array_iter(obj) } {
-                    &["__length_hint__"]
-                } else {
-                    &[]
-                };
-                match name {
-                    _ if undeclared.contains(&name) => None,
-                    "__reduce__" => Some((seq_iter_reduce_method, "__reduce__", 1)),
-                    "__setstate__" => Some((seq_iter_setstate_method, "__setstate__", 2)),
-                    "__length_hint__" => Some((seq_iter_length_hint_method, "__length_hint__", 1)),
-                    _ => None,
-                }
-            } else if pyre_object::is_list_iter(obj) {
-                match name {
-                    "__reduce__" => Some((list_iter_reduce_method, "__reduce__", 1)),
-                    "__setstate__" => Some((list_iter_setstate_method, "__setstate__", 2)),
-                    "__length_hint__" => Some((list_iter_length_hint_method, "__length_hint__", 1)),
-                    _ => None,
-                }
-            } else if pyre_object::is_list_reverse_iter(obj) {
-                match name {
-                    "__reduce__" => Some((list_reverse_iter_reduce_method, "__reduce__", 1)),
-                    "__setstate__" => Some((list_reverse_iter_setstate_method, "__setstate__", 2)),
-                    "__length_hint__" => {
-                        Some((list_reverse_iter_length_hint_method, "__length_hint__", 1))
-                    }
-                    _ => None,
-                }
-            } else if pyre_object::is_tuple_iter(obj) {
-                match name {
-                    "__reduce__" => Some((tuple_iter_reduce_method, "__reduce__", 1)),
-                    "__setstate__" => Some((tuple_iter_setstate_method, "__setstate__", 2)),
-                    "__length_hint__" => {
-                        Some((tuple_iter_length_hint_method, "__length_hint__", 1))
-                    }
-                    _ => None,
-                }
-            } else if is_range_iter(obj) {
-                match name {
-                    "__reduce__" => Some((range_iter_reduce_method, "__reduce__", 1)),
-                    "__length_hint__" => {
-                        Some((range_iter_length_hint_method, "__length_hint__", 1))
-                    }
-                    _ => None,
-                }
-            } else if pyre_object::is_long_range_iter(obj) {
-                match name {
-                    "__reduce__" => Some((long_range_iter_reduce_method, "__reduce__", 1)),
-                    "__length_hint__" => {
-                        Some((long_range_iter_length_hint_method, "__length_hint__", 1))
-                    }
-                    _ => None,
-                }
-            } else if pyre_object::dictmultiobject::is_dict_view_iterator(obj) {
-                match name {
-                    "__reduce__" => Some((dict_view_iter_reduce_method, "__reduce__", 1)),
-                    "__length_hint__" => {
-                        Some((dict_view_iter_length_hint_method, "__length_hint__", 1))
-                    }
-                    _ => None,
-                }
-            } else if pyre_object::functional::is_enumerate(obj) {
-                match name {
-                    "__reduce__" => Some((enumerate_reduce_method, "__reduce__", 1)),
-                    _ => None,
-                }
-            } else if pyre_object::functional::is_reversed(obj) {
-                match name {
-                    "__reduce__" => Some((reversed_reduce_method, "__reduce__", 1)),
-                    "__setstate__" => Some((reversed_setstate_method, "__setstate__", 2)),
-                    "__length_hint__" => Some((reversed_length_hint_method, "__length_hint__", 1)),
-                    _ => None,
-                }
-            } else if pyre_object::functional::is_filter(obj) {
-                match name {
-                    "__reduce__" => Some((filter_reduce_method, "__reduce__", 1)),
-                    _ => None,
-                }
-            } else if pyre_object::functional::is_map(obj) {
-                match name {
-                    "__reduce__" => Some((map_reduce_method, "__reduce__", 1)),
-                    "__setstate__" => Some((map_setstate_method, "__setstate__", 2)),
-                    _ => None,
-                }
-            } else if pyre_object::functional::is_zip(obj) {
-                match name {
-                    "__reduce__" => Some((zip_reduce_method, "__reduce__", 1)),
-                    "__setstate__" => Some((zip_setstate_method, "__setstate__", 2)),
-                    _ => None,
-                }
-            } else if pyre_object::operation::is_callable_iterator(obj) {
-                match name {
-                    "__reduce__" => Some((callable_iter_reduce_method, "__reduce__", 1)),
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            if let Some((func, sname, arity)) = entry {
-                let func_obj = crate::make_builtin_function_with_arity(sname, func, arity);
-                return Ok(pyre_object::w_method_new(
-                    func_obj,
-                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
-                    pyre_object::PY_NULL,
-                ));
-            }
-        }
-    }
-
-    // Member descriptor attributes — typedef.py Member.__name__, __objclass__
-    unsafe {
-        if pyre_object::typedef::is_member(obj) {
-            match name {
-                "__name__" => {
-                    return Ok(pyre_object::w_str_new_managed(
-                        pyre_object::w_member_get_name(obj),
-                    ));
-                }
-                "__objclass__" => return Ok(pyre_object::w_member_get_cls(obj)),
-                _ => {}
-            }
         }
     }
 
@@ -6873,57 +6593,6 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
     //      → call w_descr.__get__(obj, type)
     //   5. Return w_descr as-is
     unsafe {
-        // `pypy/interpreter/typedef.py:825-826 Method.typedef` exposes
-        // `__func__` / `__self__` as `interp_attrproperty_w` getset
-        // descriptors that resolve to the wrapped function / instance
-        // directly on attribute access.  Pyre's method typedef
-        // registers them as regular `make_builtin_function` entries
-        // which the descriptor protocol below would surface as bound
-        // methods (binding the `__func__` helper to the method
-        // instance), breaking `m.__func__ is C.m` and `m.__self__ is
-        // c` identity.  Short-circuit before the `is_instance` branch
-        // so the type dispatch path matches PyPy's getset semantics.
-        // PyPy3 exposes only the dunder names — `im_func` / `im_self`
-        // were dropped in 3.x, so do not surface them here.
-        if pyre_object::function::is_method(obj) {
-            match name {
-                "__func__" => {
-                    return Ok(pyre_object::function::w_method_get_func(obj));
-                }
-                "__self__" => {
-                    return Ok(pyre_object::function::w_method_get_self(obj));
-                }
-                // `__class__` resolves to the `method` type itself (handled by
-                // the generic type dispatch below), never forwarded.
-                "__class__" => {}
-                _ => {
-                    // The Python 3.14 METH_CLASS qualname delta, ahead of the
-                    // forwarding test below: the two carriers it applies to are
-                    // published as `builtin_function_or_method`, whose type
-                    // defines `__qualname__`, so `on_method_type` is true for
-                    // them and the forwarding branch never runs.
-                    if name == "__qualname__"
-                        && let Some(qualname) = crate::function::method_class_bound_qualname(obj)?
-                    {
-                        return Ok(qualname);
-                    }
-                    // `classobject.c method_getattro` — attributes defined on
-                    // the method type win (`__call__` / `__repr__` / `__eq__`
-                    // / `__hash__`); any other name is forwarded to `__func__`
-                    // (`__name__` / `__qualname__` / `__code__` / `__doc__` /
-                    // `__defaults__` / `__annotations__` / …).
-                    let on_method_type = crate::typedef::r#type(obj)
-                        .map(|t| lookup_in_type_where(t.as_ptr(), name).is_some())
-                        .unwrap_or(false);
-                    if !on_method_type {
-                        let func = pyre_object::function::w_method_get_func(obj);
-                        if !func.is_null() {
-                            return getattr_str(func, name);
-                        }
-                    }
-                }
-            }
-        }
         // objspace.py:664-670 gates the slot dispatch on `space.type(w_obj)`
         // with no layout test, so a receiver that is neither a type nor a
         // module reaches it whatever its representation.  `is_instance` alone
@@ -6959,18 +6628,15 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
             // still routes through the type's custom `__getattribute__`, so the
             // slot dispatch runs for every name, including "__getattribute__".
             if let Some(slot) = getattribute_if_not_from_object(w_type) {
-                // `super`, bound `method`, `types.GenericAlias`,
-                // `types.UnionType` and the two weakref proxies each register
-                // a `__getattribute__` of their own, so the identity compare
-                // against `object`'s answers `Some` for them too. Those
-                // receivers are served by the shims above — the bound-method
-                // one just above forwards to `__func__` — and running their
-                // slot through `get_and_call_function` here would re-enter
-                // it. Restricting dispatch to a heap-type owner or an opted-in
-                // builtin owner admits the slots object space must call and
-                // leaves every other receiver on its existing descriptor
-                // protocol. A `W_ObjectObject` receiver reaches this arm only
-                // through its own class, so the check is skipped for it.
+                // A builtin owner dispatches its own `__getattribute__`
+                // only after `w_type_set_dispatch_own_getattribute`
+                // (`descriptor.py W_Super.getattribute`,
+                // `function.py Method.descr_method_getattribute`,
+                // `_pypy_generic_alias.py GenericAlias.__getattribute__`).
+                // Heap types always dispatch. Every other builtin stays on
+                // the descriptor protocol below. A `W_ObjectObject` receiver
+                // reaches this arm only through its own class, so the check
+                // is skipped for it.
                 let owner_dispatches_getattribute = is_instance(obj)
                     || lookup_where_with_method_cache(w_type, "__getattribute__").is_some_and(
                         |(owner, found)| {
@@ -8613,40 +8279,199 @@ pub(crate) fn type_del_doc(obj: PyObjectRef) -> PyResult {
     )))
 }
 
+/// `typedef.py descr_get_dict` on `W_BaseException`.  `PY_NULL` is never
+/// returned: every exception owns the slot.
+pub(crate) fn exception_descr_get_dict(obj: PyObjectRef) -> PyResult {
+    Ok(unsafe { pyre_object::interp_exceptions::w_exception_getdict(obj) })
+}
+
+/// `typedef.py descr_set_dict` — replaces the whole instance dict.
+pub(crate) fn exception_descr_set_dict(obj: PyObjectRef, value: PyObjectRef) -> PyResult {
+    setdict(obj, value)?;
+    Ok(w_none())
+}
+
+/// `typedef.py descr_del_dict` refuses deletion of an exception dict.
+pub(crate) fn exception_descr_del_dict(_obj: PyObjectRef) -> PyResult {
+    Err(PyError::type_error("cannot delete __dict__"))
+}
+
+/// `interp_exceptions.py W_BaseException.descr_getargs`.
+pub(crate) fn exception_descr_getargs(obj: PyObjectRef) -> PyResult {
+    Ok(unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) })
+}
+
+/// `interp_exceptions.py W_BaseException.descr_setargs`.
+pub(crate) fn exception_descr_setargs(obj: PyObjectRef, value: PyObjectRef) -> PyResult {
+    let coerced = unsafe { coerce_to_list_for_args(value)? };
+    unsafe { pyre_object::interp_exceptions::w_exception_set_args(obj, coerced) };
+    Ok(w_none())
+}
+
+/// `interp_exceptions.py descr_delargs` / `descr_delcause` /
+/// `descr_delcontext` / `descr_deltraceback` — the name may not be deleted.
+pub(crate) fn exception_descr_del_refused(name: &str) -> PyResult {
+    Err(PyError::type_error(format!("{name} may not be deleted")))
+}
+
+/// `interp_exceptions.py descr_getcause`.  `None` when the slot is empty.
+pub(crate) fn exception_descr_getcause(obj: PyObjectRef) -> PyResult {
+    let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_cause(obj) };
+    Ok(if stored.is_null() { w_none() } else { stored })
+}
+
+/// `interp_exceptions.py descr_setcause`.  `None` or a `BaseException`,
+/// and the store always sets `suppress_context`.
+pub(crate) fn exception_descr_setcause(obj: PyObjectRef, value: PyObjectRef) -> PyResult {
+    if !unsafe { pyre_object::is_none(value) } {
+        let value_type = crate::typedef::r#type(value).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
+        if value_type.is_null() || !unsafe { exception_is_valid_class_w(value_type) } {
+            return Err(PyError::type_error(
+                "exception cause must be None or derive from BaseException",
+            ));
+        }
+    }
+    unsafe {
+        pyre_object::interp_exceptions::w_exception_set_cause(obj, value);
+        pyre_object::interp_exceptions::w_exception_set_suppress_context(obj, true);
+    };
+    Ok(w_none())
+}
+
+/// `interp_exceptions.py descr_getcontext`.
+pub(crate) fn exception_descr_getcontext(obj: PyObjectRef) -> PyResult {
+    let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_context(obj) };
+    Ok(if stored.is_null() { w_none() } else { stored })
+}
+
+/// `interp_exceptions.py descr_setcontext`.
+pub(crate) fn exception_descr_setcontext(obj: PyObjectRef, value: PyObjectRef) -> PyResult {
+    if !unsafe { pyre_object::is_none(value) } {
+        let value_type = crate::typedef::r#type(value).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
+        if value_type.is_null() || !unsafe { exception_is_valid_class_w(value_type) } {
+            return Err(PyError::type_error(
+                "exception context must be None or derive from BaseException",
+            ));
+        }
+    }
+    unsafe { pyre_object::interp_exceptions::w_exception_set_context(obj, value) };
+    Ok(w_none())
+}
+
+/// `interp_exceptions.py W_BaseException.descr_gettraceback`.  The traceback
+/// reaches app level, so its frame is marked escaped.  Empty slot is `None`.
+pub(crate) fn exception_descr_gettraceback(obj: PyObjectRef) -> PyResult {
+    let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(obj) };
+    unsafe { crate::pytraceback::mark_traceback_escaped(stored) };
+    Ok(if stored.is_null() { w_none() } else { stored })
+}
+
+/// `interp_exceptions.py descr_settraceback` — `None` or a traceback.
+pub(crate) fn exception_descr_settraceback(obj: PyObjectRef, value: PyObjectRef) -> PyResult {
+    let accept =
+        unsafe { pyre_object::is_none(value) || crate::pytraceback::is_pytraceback(value) };
+    if !accept {
+        return Err(PyError::type_error(
+            "__traceback__ must be a traceback or None",
+        ));
+    }
+    let stored = if unsafe { pyre_object::is_none(value) } {
+        pyre_object::PY_NULL
+    } else {
+        value
+    };
+    unsafe { pyre_object::interp_exceptions::w_exception_set_traceback(obj, stored) };
+    Ok(w_none())
+}
+
+/// `interp_exceptions.py W_OSError.descr_get_written`.  `Ok(PY_NULL)` when
+/// the receiver is not an `OSError` (the descriptor is inherited, the slot
+/// is not).  An unset slot (`written == -1`) is `AttributeError`.
+pub(crate) fn exception_descr_get_written(obj: PyObjectRef) -> PyResult {
+    if crate::builtins::lookup_exc_class("OSError")
+        .is_some_and(|os_error| unsafe { isinstance_w(obj, os_error) })
+    {
+        let written = unsafe { pyre_object::interp_exceptions::w_exception_get_written(obj) };
+        if written == -1 {
+            return Err(PyError::attribute_error("characters_written"));
+        }
+        return Ok(pyre_object::w_int_new(written));
+    }
+    Ok(pyre_object::PY_NULL)
+}
+
+/// `interp_exceptions.py W_OSError.descr_set_written`.  `Ok(PY_NULL)` when
+/// the receiver is not an `OSError`.
+pub(crate) fn exception_descr_set_written(obj: PyObjectRef, value: PyObjectRef) -> PyResult {
+    let Some(os_error) = crate::builtins::lookup_exc_class("OSError") else {
+        return Ok(pyre_object::PY_NULL);
+    };
+    if unsafe { isinstance_w(obj, os_error) } {
+        let written = int_w(value)?;
+        unsafe { pyre_object::interp_exceptions::w_exception_set_written(obj, written) };
+        return Ok(w_none());
+    }
+    Ok(pyre_object::PY_NULL)
+}
+
+/// `interp_exceptions.py W_OSError.descr_del_written`.
+pub(crate) fn exception_descr_del_written(obj: PyObjectRef) -> PyResult {
+    let Some(os_error) = crate::builtins::lookup_exc_class("OSError") else {
+        return Ok(pyre_object::PY_NULL);
+    };
+    if unsafe { isinstance_w(obj, os_error) } {
+        let written = unsafe { pyre_object::interp_exceptions::w_exception_get_written(obj) };
+        if written == -1 {
+            return Err(PyError::attribute_error("characters_written"));
+        }
+        unsafe { pyre_object::interp_exceptions::w_exception_set_written(obj, -1) };
+        return Ok(w_none());
+    }
+    Ok(pyre_object::PY_NULL)
+}
+
+/// `interp_group.py` `interp_attrproperty_w` for `w_message` / `w_exceptions`.
+/// `Ok(PY_NULL)` when the receiver is not a `BaseExceptionGroup` or the slot
+/// is empty.
+pub(crate) fn exception_descr_get_group(obj: PyObjectRef, name: &str) -> PyResult {
+    if let Some(base_group) = crate::builtins::lookup_exc_class("BaseExceptionGroup")
+        && isinstance(obj, base_group)?
+    {
+        let value = unsafe {
+            if name == "message" {
+                pyre_object::interp_exceptions::w_exception_get_group_message(obj)
+            } else {
+                pyre_object::interp_exceptions::w_exception_get_group_exceptions(obj)
+            }
+        };
+        if !value.is_null() {
+            return Ok(value);
+        }
+    }
+    Ok(pyre_object::PY_NULL)
+}
+
+/// Group `message` / `exceptions` are read-only `interp_attrproperty_w` slots.
+/// `Ok(PY_NULL)` when the receiver is not a `BaseExceptionGroup`.
+pub(crate) fn exception_descr_set_group(obj: PyObjectRef) -> PyResult {
+    if crate::builtins::lookup_exc_class("BaseExceptionGroup")
+        .is_some_and(|base_group| isinstance(obj, base_group).unwrap_or(false))
+    {
+        return Err(PyError::attribute_error("readonly attribute"));
+    }
+    Ok(pyre_object::PY_NULL)
+}
+
 /// The `W_BaseException` typedef's attribute reads, shared by the
 /// per-class `GetSetProperty` descriptors and the instance-attribute miss
 /// path.  `PY_NULL` means the name is not one this exception kind
 /// declares, so the caller continues its own lookup.
 pub(crate) fn exception_attr_get(obj: PyObjectRef, name: &str) -> PyResult {
     match name {
-        "__dict__" => {
-            // `interp_exceptions.py` `W_BaseException.typedef` installs
-            // `GetSetProperty(descr_get_dict, descr_set_dict)`.  Every
-            // exception owns a writable instance dict, allocated eagerly by
-            // pyre's flattened W_BaseException layout.
-            return Ok(unsafe { pyre_object::interp_exceptions::w_exception_getdict(obj) });
-        }
-        "__traceback__" => {
-            // `interp_exceptions.py W_BaseException.descr_gettraceback`
-            // returns the `w_traceback` slot stamped by
-            // `descr_settraceback` and the `raise` machinery's
-            // `record_application_traceback`; `None` when none has
-            // been set.  The traceback reaches app level here, so its
-            // frame is marked escaped.
-            let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(obj) };
-            unsafe { crate::pytraceback::mark_traceback_escaped(stored) };
-            return Ok(if stored.is_null() { w_none() } else { stored });
-        }
-        "__cause__" => {
-            // `interp_exceptions.py descr_getcause`.
-            let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_cause(obj) };
-            return Ok(if stored.is_null() { w_none() } else { stored });
-        }
-        "__context__" => {
-            // `interp_exceptions.py descr_getcontext`.
-            let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_context(obj) };
-            return Ok(if stored.is_null() { w_none() } else { stored });
-        }
+        "__dict__" => return exception_descr_get_dict(obj),
+        "__traceback__" => return exception_descr_gettraceback(obj),
+        "__cause__" => return exception_descr_getcause(obj),
+        "__context__" => return exception_descr_getcontext(obj),
         "__suppress_context__" => {
             // `interp_exceptions.py descr_getsuppresscontext`
             // returns `space.newbool(self.suppress_context)`.
@@ -8656,33 +8481,8 @@ pub(crate) fn exception_attr_get(obj: PyObjectRef, name: &str) -> PyResult {
                 unsafe { pyre_object::interp_exceptions::w_exception_get_suppress_context(obj) };
             return Ok(pyre_object::w_bool_from(b));
         }
-        "args" => {
-            // `interp_exceptions.py` `W_BaseException.descr_getargs` returns
-            // `space.newtuple(self.args_w)` — a freshly-built
-            // tuple per call.  `w_exception_get_args` does the
-            // same: it walks the internal list slot and rebuilds
-            // a `W_TupleObject`, returning the empty tuple when
-            // the slot was never stamped.
-            return Ok(unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) });
-        }
-        "message" | "exceptions" => {
-            if let Some(base_group) = crate::builtins::lookup_exc_class("BaseExceptionGroup")
-                && isinstance(obj, base_group)?
-            {
-                // `interp_group.py:71-72` — both are `interp_attrproperty_w`
-                // slots on the instance, not instance-dictionary entries.
-                let value = unsafe {
-                    if name == "message" {
-                        pyre_object::interp_exceptions::w_exception_get_group_message(obj)
-                    } else {
-                        pyre_object::interp_exceptions::w_exception_get_group_exceptions(obj)
-                    }
-                };
-                if !value.is_null() {
-                    return Ok(value);
-                }
-            }
-        }
+        "args" => return exception_descr_getargs(obj),
+        "message" | "exceptions" => return exception_descr_get_group(obj, name),
         "value" => {
             // `pypy/module/exceptions/interp_exceptions.py
             // W_StopIteration.descr_init` stores `value = w_args[0]`,
@@ -14029,22 +13829,12 @@ pub fn readonly_descr_attr_raise_is_stable(obj: PyObjectRef, name: &str) -> Opti
 /// path.  `PY_NULL` means the name is not one this exception kind
 /// declares, so the caller falls back to the instance dict.
 pub(crate) fn exception_attr_set(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
-    if matches!(name, "message" | "exceptions")
-        && crate::builtins::lookup_exc_class("BaseExceptionGroup")
-            .is_some_and(|base_group| isinstance(obj, base_group).unwrap_or(false))
-    {
-        return Err(PyError::attribute_error("readonly attribute"));
+    if matches!(name, "message" | "exceptions") {
+        return exception_descr_set_group(obj);
     }
-    // `interp_exceptions.py` `W_BaseException.descr_setargs` →
-    //   self.args_w = space.fixedview(w_newargs)
-    // `space.fixedview` materialises any iterable into a list of
-    // wrapped objects; pyre stores `args_w` as a tuple `PyObjectRef`,
-    // so coerce the incoming value into a tuple shape (tuple stays
-    // as-is, list wraps into tuple, anything else iterates).
+    // `interp_exceptions.py` `W_BaseException.descr_setargs`.
     if name == "args" {
-        let coerced = unsafe { coerce_to_list_for_args(value)? };
-        unsafe { pyre_object::interp_exceptions::w_exception_set_args(obj, coerced) };
-        return Ok(w_none());
+        return exception_descr_setargs(obj, value);
     }
     // `W_BaseException.typedef` — the four special exception
     // attributes (`__cause__`, `__context__`, `__traceback__`,
@@ -14055,69 +13845,10 @@ pub(crate) fn exception_attr_set(obj: PyObjectRef, name: &str, value: PyObjectRe
     // line 113-117).  Storage lives on `W_BaseException`
     // directly — no side store for these four names.
     match name {
-        "__dict__" => {
-            // `interp_exceptions.py` `W_BaseException.typedef` registers
-            // `__dict__ = GetSetProperty(descr_get_dict, descr_set_dict)`
-            // whose setter routes to `setdict` (typedef.py
-            // descr_set_dict) — replaces the whole instance dict.
-            setdict(obj, value)?;
-            return Ok(w_none());
-        }
-        "__cause__" => {
-            // `interp_exceptions.py descr_setcause` — None
-            // OR an instance whose type derives from `BaseException`,
-            // and always flips `suppress_context` to True.
-            if !unsafe { pyre_object::is_none(value) } {
-                let value_type =
-                    crate::typedef::r#type(value).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
-                if value_type.is_null() || !unsafe { exception_is_valid_class_w(value_type) } {
-                    return Err(PyError::type_error(
-                        "exception cause must be None or derive from BaseException",
-                    ));
-                }
-            }
-            unsafe {
-                pyre_object::interp_exceptions::w_exception_set_cause(obj, value);
-                pyre_object::interp_exceptions::w_exception_set_suppress_context(obj, true);
-            };
-            return Ok(w_none());
-        }
-        "__context__" => {
-            // `interp_exceptions.py descr_setcontext` — None
-            // OR an instance whose type derives from `BaseException`.
-            if !unsafe { pyre_object::is_none(value) } {
-                let value_type =
-                    crate::typedef::r#type(value).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
-                if value_type.is_null() || !unsafe { exception_is_valid_class_w(value_type) } {
-                    return Err(PyError::type_error(
-                        "exception context must be None or derive from BaseException",
-                    ));
-                }
-            }
-            unsafe { pyre_object::interp_exceptions::w_exception_set_context(obj, value) };
-            return Ok(w_none());
-        }
-        "__traceback__" => {
-            // `interp_exceptions.py descr_settraceback` —
-            // accept None or PyTraceback only.  Now that real
-            // PyTraceback exists, narrow the type check to the
-            // exact pair PyPy accepts; reject everything else as
-            // TypeError per PyPy.
-            let accept =
-                unsafe { pyre_object::is_none(value) || crate::pytraceback::is_pytraceback(value) };
-            if !accept {
-                return Err(PyError::type_error(
-                    "__traceback__ must be a traceback or None",
-                ));
-            }
-            let stored = if unsafe { pyre_object::is_none(value) } {
-                pyre_object::PY_NULL
-            } else {
-                value
-            };
-            unsafe { pyre_object::interp_exceptions::w_exception_set_traceback(obj, stored) };
-            return Ok(w_none());
-        }
+        "__dict__" => return exception_descr_set_dict(obj, value),
+        "__cause__" => return exception_descr_setcause(obj, value),
+        "__context__" => return exception_descr_setcontext(obj, value),
+        "__traceback__" => return exception_descr_settraceback(obj, value),
         "__suppress_context__" => {
             // `interp_exceptions.py descr_setsuppresscontext`
             // — `space.bool_w(w_value)` coerces via `__bool__`.
@@ -14225,20 +13956,8 @@ pub(crate) fn exception_attr_set(obj: PyObjectRef, name: &str, value: PyObjectRe
                 return Ok(w_none());
             }
         }
-        // `interp_exceptions.py W_OSError.descr_set_written` — the
-        // descriptor is declared on OSError (and therefore applies to every
-        // subclass), converts through `space.int_w`, and stores independently
-        // from the constructor args tuple.
-        "characters_written" => {
-            let Some(os_error) = crate::builtins::lookup_exc_class("OSError") else {
-                return Ok(pyre_object::PY_NULL);
-            };
-            if unsafe { isinstance_w(obj, os_error) } {
-                let written = int_w(value)?;
-                unsafe { pyre_object::interp_exceptions::w_exception_set_written(obj, written) };
-                return Ok(w_none());
-            }
-        }
+        // `interp_exceptions.py W_OSError.descr_set_written`.
+        "characters_written" => return exception_descr_set_written(obj, value),
         // `W_OSError.typedef`: the `winerror` descriptor is
         // installed only where the platform has Windows error codes, so
         // elsewhere the name falls through to the ordinary instance dict.
@@ -14620,15 +14339,14 @@ pub enum ExceptionAttrSlot {
 }
 
 /// True for a `GetSetProperty` `make_exc_type` installed from the class's
-/// `interp_exceptions.py` typedef.  Every one shares a single `fget`
-/// function object, so identity on that slot separates them from a user
-/// override of the same name on a heap subclass.
+/// `interp_exceptions.py` typedef.  Each name has its own `fget`; membership
+/// in that set separates them from a user override of the same name.
 fn is_exception_typedef_getset(descr: PyObjectRef) -> bool {
     if descr.is_null() || !unsafe { pyre_object::typedef::is_getset_property(descr) } {
         return false;
     }
     let fget = unsafe { pyre_object::typedef::w_getset_get_fget(descr) };
-    !fget.is_null() && std::ptr::eq(fget, crate::builtins::exception_getset_fget_obj())
+    !fget.is_null() && crate::builtins::is_exception_canonical_fget(fget)
 }
 
 /// The member-descriptor half of [`is_exception_typedef_getset`].
@@ -15223,12 +14941,9 @@ unsafe fn exception_deletable_slot(obj: PyObjectRef, name: &str) -> bool {
 /// `PY_NULL` means the name is not one this exception kind declares.
 pub(crate) fn exception_attr_delete(obj: PyObjectRef, name: &str) -> PyResult {
     match name {
-        "__dict__" => {
-            // Python 3.14 BaseException.__dict__ exposes no delete operation.
-            return Err(PyError::type_error("cannot delete __dict__"));
-        }
+        "__dict__" => return exception_descr_del_dict(obj),
         "args" | "__cause__" | "__context__" | "__traceback__" => {
-            return Err(PyError::type_error(format!("{name} may not be deleted")));
+            return exception_descr_del_refused(name);
         }
         "__suppress_context__" => {
             return Err(PyError::type_error("can't delete numeric/char attribute"));
@@ -15243,22 +14958,8 @@ pub(crate) fn exception_attr_delete(obj: PyObjectRef, name: &str) -> PyResult {
         {
             return Err(PyError::type_error("can't delete numeric/char attribute"));
         }
-        // `interp_exceptions.py W_OSError.descr_del_written` — an
-        // already-unset slot raises; otherwise deletion restores `-1`.
-        "characters_written" => {
-            let Some(os_error) = crate::builtins::lookup_exc_class("OSError") else {
-                return Ok(pyre_object::PY_NULL);
-            };
-            if unsafe { isinstance_w(obj, os_error) } {
-                let written =
-                    unsafe { pyre_object::interp_exceptions::w_exception_get_written(obj) };
-                if written == -1 {
-                    return Err(PyError::attribute_error("characters_written"));
-                }
-                unsafe { pyre_object::interp_exceptions::w_exception_set_written(obj, -1) };
-                return Ok(w_none());
-            }
-        }
+        // `interp_exceptions.py W_OSError.descr_del_written`.
+        "characters_written" => return exception_descr_del_written(obj),
         _ if unsafe { exception_deletable_slot(obj, name) } => {
             return object_setattr(obj, name, w_none());
         }
