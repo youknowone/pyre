@@ -2991,8 +2991,8 @@ impl TraceCtx {
         // for PyFrame) to release the immutable borrow before reborrowing
         // `virtualizable_values` mutably.  The decode loop below reads
         // statics + array items field-by-field straight into the shadow,
-        // avoiding the `Vec<i64>` + `Vec<Vec<i64>>` allocations that
-        // `read_all_boxes` would materialise on every hot-path call.
+        // avoiding the `Vec<i64>` allocation that `read_boxes` would
+        // materialise on every hot-path call.
         let array_lengths = lengths.clone();
         let static_count = info.num_static_extra_boxes;
         let info = info.clone();

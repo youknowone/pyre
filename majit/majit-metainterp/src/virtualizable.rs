@@ -1418,7 +1418,7 @@ impl VirtualizableInfo {
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
     /// The static half of `virtualizable.py read_boxes`.  Upstream reads the
-    /// statics and then every array item in one pass; [`Self::read_all_boxes`]
+    /// statics and then every array item in one pass; [`Self::read_boxes`]
     /// is the port of the whole.
     pub unsafe fn read_static_boxes(&self, obj_ptr: *const u8) -> Vec<i64> {
         unsafe {
@@ -1488,63 +1488,65 @@ impl VirtualizableInfo {
     /// that needs the typed box zips this with it.
     pub fn box_types<'a>(&'a self, array_lengths: &'a [usize]) -> impl Iterator<Item = Type> + 'a {
         let statics = self.static_fields.iter().map(|field| field.field_type);
-        let arrays = self.array_fields.iter().enumerate().flat_map(move |(index, array)| {
-            std::iter::repeat_n(array.item_type, array_lengths.get(index).copied().unwrap_or(0))
-        });
+        let arrays = self
+            .array_fields
+            .iter()
+            .enumerate()
+            .flat_map(move |(index, array)| {
+                std::iter::repeat_n(
+                    array.item_type,
+                    array_lengths.get(index).copied().unwrap_or(0),
+                )
+            });
         statics.chain(arrays)
     }
 
-    /// [`Self::read_boxes`] regrouped per array field, which is the shape
-    /// `JitState::import_virtualizable_boxes` and the walker's vable shadow
-    /// take. It reads through `read_boxes`, so one function reads the object.
+    /// The writing half of `virtualizable.py write_boxes` for an object whose
+    /// array lengths the caller supplies: the statics from the front of
+    /// `boxes`, then `array_lengths[i]` items of each array, in
+    /// [`Self::read_boxes`] order.  Returns how many boxes it wrote.
+    ///
+    /// [`Self::write_boxes`] is the same walk with each length read off the
+    /// object, as upstream reads `len(lst)`.  An array declared with no length
+    /// word answers `can_read_length_from_heap` false and can only be written
+    /// through this one.  The list it takes is the fields alone, so there is
+    /// no trailing `vable_box` slot and no count assertion.
     ///
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
-    pub unsafe fn read_all_boxes(
+    pub unsafe fn write_boxes_with_lengths(
         &self,
-        obj_ptr: *const u8,
+        obj_ptr: *mut u8,
+        boxes: &[i64],
         array_lengths: &[usize],
-    ) -> (Vec<i64>, Vec<Vec<i64>>) {
+    ) -> usize {
         unsafe {
-            let boxes = self.read_boxes(obj_ptr, array_lengths);
-            let mut cursor = self.static_fields.len();
-            let static_boxes = boxes[..cursor].to_vec();
-            let mut array_boxes = Vec::with_capacity(self.array_fields.len());
-            for (index, _) in self.array_fields.iter().enumerate() {
-                let length = array_lengths.get(index).copied().unwrap_or(0);
-                array_boxes.push(boxes[cursor..cursor + length].to_vec());
-                cursor += length;
-            }
-            (static_boxes, array_boxes)
+            self.write_boxes_by(obj_ptr, boxes, |index| {
+                array_lengths.get(index).copied().unwrap_or(0)
+            })
         }
     }
 
-    /// [`Self::write_boxes`]'s values regrouped per array field, the write
-    /// twin of [`Self::read_all_boxes`].
-    ///
-    /// It is a second writer of the same fields rather than a caller of
-    /// `write_boxes`, and the reason is the lengths: `write_boxes` takes each
-    /// array's length from the object, as upstream does, while this one takes
-    /// the caller's. An array declared with no length word answers
-    /// `can_read_length_from_heap` false, so `get_array_length` has nothing to
-    /// read for it and `write_boxes` cannot write it at all. Folding the two
-    /// together means giving every such array a length in the object first.
-    ///
-    /// # Safety
-    /// `obj_ptr` must point to a valid virtualizable object.
-    pub unsafe fn write_all_boxes(
+    /// The walk both writers run; `length_of(i)` is array `i`'s length.
+    unsafe fn write_boxes_by(
         &self,
         obj_ptr: *mut u8,
-        static_boxes: &[i64],
-        array_boxes: &[Vec<i64>],
-    ) {
+        boxes: &[i64],
+        length_of: impl Fn(usize) -> usize,
+    ) -> usize {
         unsafe {
-            self.write_static_boxes(obj_ptr, static_boxes);
-            for (array_index, values) in array_boxes.iter().enumerate() {
-                for (item_index, &value) in values.iter().enumerate() {
-                    self.write_array_item(obj_ptr, array_index, item_index, value);
+            let mut i = 0;
+            for fi in 0..self.static_fields.len() {
+                self.write_field(obj_ptr, fi, boxes[i]);
+                i += 1;
+            }
+            for ai in 0..self.array_fields.len() {
+                for ei in 0..length_of(ai) {
+                    self.write_array_item(obj_ptr, ai, ei, boxes[i]);
+                    i += 1;
                 }
             }
+            i
         }
     }
 
@@ -1561,20 +1563,8 @@ impl VirtualizableInfo {
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn write_boxes(&self, obj_ptr: *mut u8, boxes: &[i64]) {
         unsafe {
-            let mut i = 0;
-            // Static fields
-            for fi in 0..self.static_fields.len() {
-                self.write_field(obj_ptr, fi, boxes[i]);
-                i += 1;
-            }
             // Array elements — read actual length from heap (RPython: len(lst))
-            for ai in 0..self.array_fields.len() {
-                let len = self.get_array_length(obj_ptr, ai);
-                for ei in 0..len {
-                    self.write_array_item(obj_ptr, ai, ei, boxes[i]);
-                    i += 1;
-                }
-            }
+            let i = self.write_boxes_by(obj_ptr, boxes, |ai| self.get_array_length(obj_ptr, ai));
             // virtualizable.py:113: assert len(boxes) == i + 1
             assert_eq!(
                 boxes.len(),
@@ -2296,13 +2286,12 @@ mod tests {
         info.add_field("y", Type::Int, 16);
         test_add_array_field(&mut info, "stack", Type::Int, 24, 0, 8);
 
-        // Use read_array_lengths + read_all_boxes (the auto path)
+        // Use read_array_lengths + read_boxes (the auto path)
         let lengths = unsafe { read_array_lengths(&info, obj.as_ptr()) };
         assert_eq!(lengths, vec![2]);
 
-        let (static_boxes, array_boxes) = unsafe { info.read_all_boxes(obj.as_ptr(), &lengths) };
-        assert_eq!(static_boxes, vec![42, 99]);
-        assert_eq!(array_boxes, vec![vec![10, 20]]);
+        let boxes = unsafe { info.read_boxes(obj.as_ptr(), &lengths) };
+        assert_eq!(boxes, vec![42, 99, 10, 20]);
     }
 
     #[test]
@@ -2329,8 +2318,8 @@ mod tests {
         let lengths = unsafe { read_array_lengths(&info, obj.as_ptr()) };
         assert_eq!(lengths, vec![3]);
 
-        let (_, array_boxes) = unsafe { info.read_all_boxes(obj.as_ptr(), &lengths) };
-        assert_eq!(array_boxes, vec![vec![100, 200, 300]]);
+        let boxes = unsafe { info.read_boxes(obj.as_ptr(), &lengths) };
+        assert_eq!(boxes, vec![100, 200, 300]);
 
         // Verify write roundtrip with custom layout
         let mut obj_mut = obj.clone();
@@ -2342,15 +2331,15 @@ mod tests {
             );
         }
         // Re-read from the actual array_data (obj_mut still points to array_data)
-        let (_, array_boxes2) = unsafe { info.read_all_boxes(obj_mut.as_ptr(), &lengths) };
-        assert_eq!(array_boxes2, vec![vec![111, 222, 333]]);
+        let boxes2 = unsafe { info.read_boxes(obj_mut.as_ptr(), &lengths) };
+        assert_eq!(boxes2, vec![111, 222, 333]);
     }
 
     #[test]
     fn test_virtualizable_with_array_read_write() {
         // RPython parity: test_virtualizable_with_array
         // VirtualizableInfo with 1 static field + 1 array field.
-        // read_all → modify → write_all → verify heap updated.
+        // read_boxes → modify → write_boxes_with_lengths → verify heap updated.
 
         // Heap layout:
         //   obj[0..8]:   vable_token
@@ -2383,16 +2372,14 @@ mod tests {
         let lengths = unsafe { read_array_lengths(&info, obj.as_ptr()) };
         assert_eq!(lengths, vec![3]);
 
-        let (static_boxes, array_boxes) = unsafe { info.read_all_boxes(obj.as_ptr(), &lengths) };
-        assert_eq!(static_boxes, vec![7]);
-        assert_eq!(array_boxes, vec![vec![10, 20, 30]]);
+        let boxes = unsafe { info.read_boxes(obj.as_ptr(), &lengths) };
+        assert_eq!(boxes, vec![7, 10, 20, 30]);
 
         // Modify and write back
-        let new_static = vec![42i64];
-        let new_arrays = vec![vec![100i64, 200, 300]];
-        unsafe {
-            info.write_all_boxes(obj.as_mut_ptr(), &new_static, &new_arrays);
-        }
+        let written = unsafe {
+            info.write_boxes_with_lengths(obj.as_mut_ptr(), &[42, 100, 200, 300], &lengths)
+        };
+        assert_eq!(written, 4);
 
         // Verify heap was updated
         unsafe {
@@ -2432,11 +2419,12 @@ mod tests {
         let boxes = unsafe { info.read_boxes(obj.as_ptr(), &lengths) };
         assert_eq!(boxes, vec![7, 10, 20, 30]);
 
-        // `read_all_boxes` regroups that same list rather than reading the
-        // object a second way.
-        let (static_boxes, array_boxes) = unsafe { info.read_all_boxes(obj.as_ptr(), &lengths) };
-        assert_eq!(static_boxes, boxes[..1].to_vec());
-        assert_eq!(array_boxes, vec![boxes[1..].to_vec()]);
+        // `write_boxes_with_lengths` runs the same walk with the lengths
+        // handed in, and writes as many boxes as `read_boxes` read.
+        assert_eq!(
+            unsafe { info.write_boxes_with_lengths(obj.as_mut_ptr(), &boxes, &lengths) },
+            boxes.len()
+        );
 
         let mut written = vec![42i64, 100, 200, 300];
         written.push(obj.as_ptr() as i64);
@@ -2461,7 +2449,10 @@ mod tests {
             info.box_types(&[2, 1]).collect::<Vec<_>>(),
             vec![Type::Float, Type::Ref, Type::Int, Type::Int, Type::Ref]
         );
-        assert_eq!(info.box_types(&[]).collect::<Vec<_>>(), vec![Type::Float, Type::Ref]);
+        assert_eq!(
+            info.box_types(&[]).collect::<Vec<_>>(),
+            vec![Type::Float, Type::Ref]
+        );
     }
 
     #[test]
@@ -2489,9 +2480,8 @@ mod tests {
         assert_eq!(lengths, vec![3]);
         assert_eq!(boxes, vec![0x1000, 0, 0x2000]);
 
-        let new_array_boxes = vec![vec![0x3000_i64, 0, 0x4000_i64]];
         unsafe {
-            info.write_all_boxes(obj.as_mut_ptr(), &[], &new_array_boxes);
+            info.write_boxes_with_lengths(obj.as_mut_ptr(), &[0x3000_i64, 0, 0x4000_i64], &lengths);
         }
 
         unsafe {
@@ -2566,19 +2556,15 @@ mod tests {
 
         // sync_before_jit: read from heap
         let lengths = unsafe { read_array_lengths(&info, obj.as_ptr()) };
-        let (mut statics, mut arrays) = unsafe { info.read_all_boxes(obj.as_ptr(), &lengths) };
-        assert_eq!(statics, vec![11, 22]);
-        assert_eq!(arrays, vec![vec![50, 60]]);
+        let mut boxes = unsafe { info.read_boxes(obj.as_ptr(), &lengths) };
+        assert_eq!(boxes, vec![11, 22, 50, 60]);
 
         // Simulate JIT execution modifying values
-        statics[0] = 111;
-        statics[1] = 222;
-        arrays[0][0] = 500;
-        arrays[0][1] = 600;
+        boxes.copy_from_slice(&[111, 222, 500, 600]);
 
         // sync_after_jit: write back to heap
         unsafe {
-            info.write_all_boxes(obj.as_mut_ptr(), &statics, &arrays);
+            info.write_boxes_with_lengths(obj.as_mut_ptr(), &boxes, &lengths);
         }
 
         // Verify heap has new values

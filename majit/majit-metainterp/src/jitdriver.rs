@@ -1933,12 +1933,11 @@ struct EntryScratch {
     raw: Vec<i64>,
     /// `JitState::live_value_types` output.
     types: Vec<Type>,
-    /// `JitState::export_virtualizable_boxes_into` static-field output.
-    vable_static: Vec<i64>,
-    /// `JitState::export_virtualizable_boxes_into` array-field output. The
-    /// inner `Vec`s are retained across entries too, so a virtualizable whose
-    /// array lengths are stable reuses their storage as well.
-    vable_arrays: Vec<Vec<i64>>,
+    /// `JitState::export_virtualizable_boxes_into` field output, in
+    /// `VirtualizableInfo::read_boxes` order.
+    vable_boxes: Vec<i64>,
+    /// `JitState::export_virtualizable_boxes_into` per-array lengths.
+    vable_lengths: Vec<usize>,
 }
 
 thread_local! {
@@ -6625,8 +6624,8 @@ impl<S: JitState> JitDriver<S> {
                         &compiled_meta,
                         vable,
                         &mut scratch.live_values,
-                        &mut scratch.vable_static,
-                        &mut scratch.vable_arrays,
+                        &mut scratch.vable_boxes,
+                        &mut scratch.vable_lengths,
                     );
                     // Answered and not acted on: the shipping pass below takes
                     // the decision, and a probe pass that declined would only
@@ -6636,10 +6635,8 @@ impl<S: JitState> JitDriver<S> {
                     scratch.live_values.clear();
                     scratch.raw.clear();
                     scratch.types.clear();
-                    scratch.vable_static.clear();
-                    for array in &mut scratch.vable_arrays {
-                        array.clear();
-                    }
+                    scratch.vable_boxes.clear();
+                    scratch.vable_lengths.clear();
                 }
             }
             if let Some(values) = direct_live_values {
@@ -6666,8 +6663,8 @@ impl<S: JitState> JitDriver<S> {
                     &compiled_meta,
                     vable,
                     &mut scratch.live_values,
-                    &mut scratch.vable_static,
-                    &mut scratch.vable_arrays,
+                    &mut scratch.vable_boxes,
+                    &mut scratch.vable_lengths,
                 ) {
                     self.entry_scratch_out(scratch);
                     return None;
@@ -7926,8 +7923,7 @@ impl<S: JitState> JitDriver<S> {
     /// starts from empty buffers (correct, just slower).
     ///
     /// The buffers arrive with their previous contents dropped and their
-    /// capacity kept. `vable_arrays` keeps its outer elements so the inner
-    /// buffers survive too — see `JitState::export_virtualizable_boxes_into`.
+    /// capacity kept — see `JitState::export_virtualizable_boxes_into`.
     ///
     /// A nested entry finds the slot empty and builds its own set, which is the
     /// `unwrap_or_default` arm; the allocation it costs is the price of nesting
@@ -7937,10 +7933,8 @@ impl<S: JitState> JitDriver<S> {
         scratch.live_values.clear();
         scratch.raw.clear();
         scratch.types.clear();
-        scratch.vable_static.clear();
-        for array in &mut scratch.vable_arrays {
-            array.clear();
-        }
+        scratch.vable_boxes.clear();
+        scratch.vable_lengths.clear();
         scratch
     }
 
@@ -8044,33 +8038,6 @@ impl<S: JitState> JitDriver<S> {
             .all(|(var, value)| var.tp == value.get_type())
     }
 
-    fn flatten_virtualizable_values_into(
-        info: &VirtualizableInfo,
-        static_boxes: &[i64],
-        array_boxes: &[Vec<i64>],
-        out: &mut Vec<Value>,
-    ) {
-        out.reserve(static_boxes.len() + array_boxes.iter().map(Vec::len).sum::<usize>());
-        for (field, &raw) in info.static_fields.iter().zip(static_boxes.iter()) {
-            out.push(match field.field_type {
-                Type::Int => Value::Int(raw),
-                Type::Ref => Value::Ref(majit_ir::GcRef(raw as usize)),
-                Type::Float => Value::Float(f64::from_bits(raw as u64)),
-                Type::Void => Value::Void,
-            });
-        }
-        for (array, items) in info.array_fields.iter().zip(array_boxes.iter()) {
-            for &raw in items {
-                out.push(match array.item_type {
-                    Type::Int => Value::Int(raw),
-                    Type::Ref => Value::Ref(majit_ir::GcRef(raw as usize)),
-                    Type::Float => Value::Float(f64::from_bits(raw as u64)),
-                    Type::Void => Value::Void,
-                });
-            }
-        }
-    }
-
     /// warmstate.py:482-511: extend live values with virtualizable fields
     /// when the compiled loop expects more inputs than currently available.
     /// RPython always has jitdriver_sd available; pyre may have descriptor=None
@@ -8079,7 +8046,7 @@ impl<S: JitState> JitDriver<S> {
     ///
     /// Appends in place and reports success, so the compiled-entry path can
     /// hand it a buffer that already has the artifact's capacity instead of a
-    /// freshly minted one. `statics` and `arrays` are scratch for the export;
+    /// freshly minted one. `boxes` and `array_lengths` are scratch for the export;
     /// they arrive cleared and their contents are not read on return. On
     /// `false` `live_values` is restored to the length it arrived with, so a
     /// declining caller sees the buffer it passed.
@@ -8090,8 +8057,8 @@ impl<S: JitState> JitDriver<S> {
         meta: &S::Meta,
         virtualizable: Option<&JitDriverVar>,
         live_values: &mut Vec<Value>,
-        statics: &mut Vec<i64>,
-        arrays: &mut Vec<Vec<i64>>,
+        boxes: &mut Vec<i64>,
+        array_lengths: &mut Vec<usize>,
     ) -> bool {
         // `warmstate.py:188 cell.loop_token` is the single PyPy source of
         // truth for the entry-path inputarg shape, and this token IS what
@@ -8121,11 +8088,16 @@ impl<S: JitState> JitDriver<S> {
             Some(virtualizable) => &virtualizable.name,
             None => &info.name,
         };
-        if !state.export_virtualizable_boxes_into(meta, name, info, statics, arrays) {
+        if !state.export_virtualizable_boxes_into(meta, name, info, boxes, array_lengths) {
             return false;
         }
         let base = live_values.len();
-        Self::flatten_virtualizable_values_into(info, statics, arrays, live_values);
+        live_values.extend(
+            boxes
+                .iter()
+                .zip(info.box_types(array_lengths))
+                .map(|(&raw, ty)| crate::pyjitpl::heap_value_for_pub(ty, raw)),
+        );
         if live_values.len() != compiled_inputs {
             live_values.truncate(base);
             return false;
@@ -8147,16 +8119,16 @@ impl<S: JitState> JitDriver<S> {
         // The cold form keeps the lookup: its callers hold a green key and no
         // token.
         let procedure_token = self.meta.warm_state_ref().get_compiled(green_key)?;
-        let mut statics = Vec::new();
-        let mut arrays = Vec::new();
+        let mut boxes = Vec::new();
+        let mut array_lengths = Vec::new();
         self.extend_compiled_live_values_into(
             &procedure_token,
             state,
             meta,
             virtualizable,
             &mut live_values,
-            &mut statics,
-            &mut arrays,
+            &mut boxes,
+            &mut array_lengths,
         )
         .then_some(live_values)
     }

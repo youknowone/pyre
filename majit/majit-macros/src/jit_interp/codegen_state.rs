@@ -67,7 +67,7 @@ fn vable_array_add_tokens(array: &super::VableArrayDecl) -> TokenStream {
 /// `virtualizable.py` `VirtualizableInfo.__init__` plus
 /// `warmstate.py` `execute_assembler`'s `clear_vable_token`: the object
 /// is the storage, so entry and exit only reset the token. Field boxes
-/// are read off the object (`read_all_boxes`) when a compiled entry
+/// are read off the object (`read_boxes`) when a compiled entry
 /// still expects the expanded input list.
 fn heap_frame_virtualizable_methods(
     decl: &VirtualizableDecl,
@@ -157,13 +157,14 @@ fn heap_frame_virtualizable_methods(
             meta: &Self::Meta,
             virtualizable: &str,
             info: &majit_metainterp::virtualizable::VirtualizableInfo,
-        ) -> Option<(::std::vec::Vec<i64>, ::std::vec::Vec<::std::vec::Vec<i64>>)> {
+        ) -> Option<(::std::vec::Vec<i64>, ::std::vec::Vec<usize>)> {
             let __ptr = self.virtualizable_heap_ptr(meta, virtualizable, info)?;
             if !info.can_read_all_array_lengths_from_heap() {
                 return None;
             }
             let __lengths = unsafe { info.read_array_lengths_from_heap(__ptr) };
-            Some(unsafe { info.read_all_boxes(__ptr, &__lengths) })
+            let __boxes = unsafe { info.read_boxes(__ptr, &__lengths) };
+            Some((__boxes, __lengths))
         }
     }
 }
@@ -2404,26 +2405,11 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             .collect();
         // Field idents in `virt_arrays` order — the same order
         // `register_virt_array_field` registers them, which is the order
-        // `flatten_virtualizable_values` (jitdriver.rs) reads them back.
-        let virt_array_export_parts: Vec<TokenStream> = virt_arrays
-            .iter()
-            .map(|(_, f)| {
-                let fname = &f.name;
-                match &f.kind {
-                    StateFieldKind::VirtArray(tp) if tp == "float" => {
-                        quote! { self.#fname.iter().map(|&__x| __x.to_bits() as i64).collect() }
-                    }
-                    _ => quote! { self.#fname.iter().map(|&__x| __x as i64).collect() },
-                }
-            })
-            .collect();
-        // The same reads appended into a caller-owned slot rather than
-        // collected into a fresh `Vec`. Indexed by position so the two forms
-        // fill the outer list in the identical order.
+        // `VirtualizableInfo::box_types` names their items in. Each pushes its
+        // array's length and appends its items to the one box list.
         let virt_array_export_into_parts: Vec<TokenStream> = virt_arrays
             .iter()
-            .enumerate()
-            .map(|(i, (_, f))| {
+            .map(|(_, f)| {
                 let fname = &f.name;
                 let source = match &f.kind {
                     StateFieldKind::VirtArray(tp) if tp == "float" => {
@@ -2431,7 +2417,10 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     }
                     _ => quote! { self.#fname.iter().map(|&__x| __x as i64) },
                 };
-                quote! { arrays[#i].extend(#source); }
+                quote! {
+                    array_lengths.push(self.#fname.len());
+                    boxes.extend(#source);
+                }
             })
             .collect();
         // `extract_live` pushes int scalars, then every fixed array's items,
@@ -2568,23 +2557,29 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
 
             fn export_virtualizable_boxes(
                 &self,
-                _meta: &Self::Meta,
-                _virtualizable: &str,
-                _info: &majit_metainterp::virtualizable::VirtualizableInfo,
-            ) -> Option<(::std::vec::Vec<i64>, ::std::vec::Vec<::std::vec::Vec<i64>>)> {
+                meta: &Self::Meta,
+                virtualizable: &str,
+                info: &majit_metainterp::virtualizable::VirtualizableInfo,
+            ) -> Option<(::std::vec::Vec<i64>, ::std::vec::Vec<usize>)> {
                 // warmstate.py:482-511: supply the live virtualizable field
                 // values so `extend_compiled_live_values` can grow the entry
                 // `live_values` to the compiled loop's full inputarg width.
                 // The array elements were seeded as boxes by
                 // `initialize_virtualizable` at trace start and carried as
                 // loop inputargs; re-entry must re-supply them in
-                // `flatten_virtualizable_values` order (statics then arrays,
-                // each array ascending).
-                let __static_boxes = ::std::vec![#(#scalar_export_parts),*];
-                let __array_boxes: ::std::vec::Vec<::std::vec::Vec<i64>> = ::std::vec![
-                    #( #virt_array_export_parts ),*
-                ];
-                Some((__static_boxes, __array_boxes))
+                // `VirtualizableInfo::read_boxes` order (statics, then each
+                // array ascending).
+                let mut boxes = ::std::vec::Vec::new();
+                let mut array_lengths = ::std::vec::Vec::new();
+                <Self as majit_metainterp::JitState>::export_virtualizable_boxes_into(
+                    self,
+                    meta,
+                    virtualizable,
+                    info,
+                    &mut boxes,
+                    &mut array_lengths,
+                )
+                .then_some((boxes, array_lengths))
             }
 
             // Export into driver-owned buffers, preserving their capacity.
@@ -2593,14 +2588,13 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 _meta: &Self::Meta,
                 _virtualizable: &str,
                 _info: &majit_metainterp::virtualizable::VirtualizableInfo,
-                _statics: &mut ::std::vec::Vec<i64>,
-                arrays: &mut ::std::vec::Vec<::std::vec::Vec<i64>>,
+                boxes: &mut ::std::vec::Vec<i64>,
+                array_lengths: &mut ::std::vec::Vec<usize>,
             ) -> bool {
                 // A virt-array-only state has no static boxes, so this
                 // slice is empty. `extend([])` cannot pick `Extend<i64>`
                 // over `Extend<&i64>`; `extend_from_slice` names `&[i64]`.
-                _statics.extend_from_slice(&[#(#scalar_export_parts),*]);
-                arrays.resize_with(#num_virt_arrays, ::std::vec::Vec::new);
+                boxes.extend_from_slice(&[#(#scalar_export_parts),*]);
                 #( #virt_array_export_into_parts )*
                 true
             }
