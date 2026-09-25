@@ -36,12 +36,12 @@ pub mod _stat;
 pub mod _suggestions;
 #[allow(non_snake_case)]
 pub mod _symtable;
+pub mod _template;
 #[allow(non_snake_case)]
 pub mod _tokenize;
 #[allow(non_snake_case)]
 pub mod _types;
 #[allow(non_snake_case)]
-pub mod _template;
 pub mod _typing;
 pub mod _warnings;
 pub mod _weakref;
