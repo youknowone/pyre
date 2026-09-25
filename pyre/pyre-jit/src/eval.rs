@@ -4796,11 +4796,6 @@ fn register_thread_root_areas() {
             "fbw_finish_concrete",
         );
         register(
-            fbw_finish_payload_root_walker_area,
-            pyre_jit_trace::jitcode_dispatch::capture_fbw_finish_payload_root_area(),
-            "fbw_finish_payload",
-        );
-        register(
             walk_end_root_walker_area,
             pyre_jit_trace::trace::capture_walk_end_root_area(),
             "walk_end",
@@ -5885,13 +5880,6 @@ unsafe fn fbw_finish_concrete_root_walker_area(
     unsafe {
         pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_root_walker_area(data, visitor)
     };
-}
-
-unsafe fn fbw_finish_payload_root_walker_area(
-    data: *const (),
-    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
-) {
-    unsafe { pyre_jit_trace::jitcode_dispatch::fbw_finish_payload_root_walker_area(data, visitor) };
 }
 
 unsafe fn walk_end_root_walker_area(
@@ -11031,7 +11019,7 @@ fn compile_and_run_once(
             } else {
                 let concrete_frame = frame_root.frame().snapshot_for_tracing();
                 let live_frame_addr = frame_root.frame() as *const PyFrame as usize;
-                let (action, executed_frame) = trace_bytecode(
+                let (action, executed_frame, walk_end_flushed) = trace_bytecode(
                     meta,
                     sym,
                     code,
@@ -11040,7 +11028,6 @@ fn compile_and_run_once(
                     live_frame_addr,
                     true,
                 );
-                let walk_end_flushed = pyre_jit_trace::trace::take_walk_end_flush_committed();
                 let walk_end_restart_pc = pyre_jit_trace::trace::take_walk_end_restart_pc();
                 if walk_end_flushed {
                     frame_root

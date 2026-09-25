@@ -4235,7 +4235,7 @@ pub fn trace_and_compile_from_bridge(
                 // root was taken.  Read it back out of the root, the same way
                 // `trace_frame` above is.
                 let live_frame_addr = bridge_frame_root.frame() as *const PyFrame as usize;
-                let (action, executed) = trace_bytecode(
+                let (action, executed, walk_end_flushed) = trace_bytecode(
                     meta,
                     sym,
                     code,
@@ -4252,7 +4252,7 @@ pub fn trace_and_compile_from_bridge(
                 // executed concretely, so resuming at the guard would
                 // re-apply every side effect.  Uncommitted → fall through
                 // to the guard-state restore below (legacy replay).
-                if pyre_jit_trace::trace::take_walk_end_flush_committed() {
+                if walk_end_flushed {
                     let frame = bridge_frame_root.frame();
                     frame.restore_resume_state_from(&executed);
                     adopted_walk_end_state = true;

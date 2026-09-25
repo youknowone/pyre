@@ -5379,7 +5379,16 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
                 )))
             }
         }
-        DispatchOutcome::Terminate => Ok(Some((DispatchOutcome::Terminate, op.next_pc))),
+        DispatchOutcome::Terminate {
+            finish_arg,
+            finish_arg_type,
+        } => Ok(Some((
+            DispatchOutcome::Terminate {
+                finish_arg,
+                finish_arg_type,
+            },
+            op.next_pc,
+        ))),
         DispatchOutcome::SwitchToBlackhole {
             reason,
             raising_exception,
@@ -5728,7 +5737,16 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
                 )))
             }
         }
-        DispatchOutcome::Terminate => Ok(Some((DispatchOutcome::Terminate, op.next_pc))),
+        DispatchOutcome::Terminate {
+            finish_arg,
+            finish_arg_type,
+        } => Ok(Some((
+            DispatchOutcome::Terminate {
+                finish_arg,
+                finish_arg_type,
+            },
+            op.next_pc,
+        ))),
         DispatchOutcome::SwitchToBlackhole {
             reason,
             raising_exception,
@@ -15959,7 +15977,16 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
                 Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc))
             }
         }
-        DispatchOutcome::Terminate => Ok((DispatchOutcome::Terminate, op.next_pc)),
+        DispatchOutcome::Terminate {
+            finish_arg,
+            finish_arg_type,
+        } => Ok((
+            DispatchOutcome::Terminate {
+                finish_arg,
+                finish_arg_type,
+            },
+            op.next_pc,
+        )),
         DispatchOutcome::SwitchToBlackhole {
             reason,
             raising_exception,
@@ -16445,7 +16472,16 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                 Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc))
             }
         }
-        DispatchOutcome::Terminate => Ok((DispatchOutcome::Terminate, op.next_pc)),
+        DispatchOutcome::Terminate {
+            finish_arg,
+            finish_arg_type,
+        } => Ok((
+            DispatchOutcome::Terminate {
+                finish_arg,
+                finish_arg_type,
+            },
+            op.next_pc,
+        )),
         DispatchOutcome::SwitchToBlackhole {
             reason,
             raising_exception,
@@ -16669,7 +16705,16 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
                 Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc))
             }
         }
-        DispatchOutcome::Terminate => Ok((DispatchOutcome::Terminate, op.next_pc)),
+        DispatchOutcome::Terminate {
+            finish_arg,
+            finish_arg_type,
+        } => Ok((
+            DispatchOutcome::Terminate {
+                finish_arg,
+                finish_arg_type,
+            },
+            op.next_pc,
+        )),
         DispatchOutcome::SwitchToBlackhole {
             reason,
             raising_exception,

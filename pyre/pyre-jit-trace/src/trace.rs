@@ -63,15 +63,7 @@ impl Drop for ObjectVecRoot {
 }
 
 thread_local! {
-    /// pyjitpl.py `raise_continue_running_normally` seam: set
-    /// when the authoritative full-body walk committed its end-of-walk
-    /// frame state into the trace's concrete frame snapshot
-    /// (`flush_walk_end_state_to_frame`).  The portal call sites consume
-    /// it via [`take_walk_end_flush_committed`] to decide whether the
-    /// returned `FrameBox` carries adoptable end state for the LIVE
-    /// frame (no-replay) or still holds the entry state (legacy replay).
-    static WALK_END_FLUSH_COMMITTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Which flush leg set [`WALK_END_FLUSH_COMMITTED`], recorded so the
+    /// Which flush leg committed the walk-end flush, recorded so the
     /// per-walk census can name it (the legs differ in what they resume at,
     /// so "committed" alone does not say whether the region re-runs).
     /// See `WalkEndCommitLeg`.
@@ -106,12 +98,6 @@ struct WalkEndRootArea {
     propagated_exception: *const std::cell::RefCell<Option<pyre_interpreter::PyError>>,
 }
 
-/// Take-and-reset the walk-end flush flag for the trace that just
-/// returned from [`trace_bytecode`].
-pub fn take_walk_end_flush_committed() -> bool {
-    WALK_END_FLUSH_COMMITTED.with(|c| c.replace(false))
-}
-
 /// The flush legs that can commit a walk's end state, in the order they are
 /// tried in the epilogue.  Recorded per walk so the census can distinguish
 /// them: they resume the interpreter at different pcs, and the ones that
@@ -138,8 +124,8 @@ pub(crate) enum WalkEndCommitLeg {
     /// Not a flush leg: the portal/CALL_ASSEMBLER `Terminate` no-replay
     /// shortcut.  It keeps the journal like the legs above, but by a different
     /// caller protocol — the caller consumes the walk's concrete result
-    /// instead of adopting a resume pc — so it must NOT set
-    /// [`WALK_END_FLUSH_COMMITTED`].  Tagged anyway because the census
+    /// instead of adopting a resume pc — so it must NOT set the flush
+    /// bit [`trace_bytecode`] returns.  Tagged anyway because the census
     /// otherwise reports these walks as `committed=true leg=0`, which reads as
     /// "no leg" when it means "a commit path outside the leg contract".
     TerminateNoReplay = 8,
@@ -253,7 +239,7 @@ pub(crate) enum WalkEndResume {
     AfterApplied,
 }
 
-/// Set [`WALK_END_FLUSH_COMMITTED`] and record which leg did it.
+/// Record which leg committed the walk-end flush and set `flush_committed`.
 ///
 /// Returns whether the commit was taken.  A [`WalkEndResume::Rewind`] leg whose
 /// odometer moved since its resume point is declined here rather than
@@ -278,7 +264,7 @@ pub(crate) fn walk_end_resume_provable(resume: WalkEndResume) -> bool {
 
 /// Name the path that kept this walk's journal, for the census only.  Every
 /// journal-keeping path goes through here so none stays anonymous; the flush
-/// legs additionally set [`WALK_END_FLUSH_COMMITTED`] via [`commit_walk_end`],
+/// legs additionally set the flush bit via [`commit_walk_end`],
 /// which is what tells the portal the returned `FrameBox` carries adoptable end
 /// state.  A path with a different caller protocol must tag WITHOUT that flag.
 #[must_use]
@@ -291,11 +277,15 @@ pub(crate) fn record_walk_end_leg(leg: WalkEndCommitLeg, resume: WalkEndResume) 
 }
 
 #[must_use]
-pub(crate) fn commit_walk_end(leg: WalkEndCommitLeg, resume: WalkEndResume) -> bool {
+pub(crate) fn commit_walk_end(
+    flush_committed: &std::cell::Cell<bool>,
+    leg: WalkEndCommitLeg,
+    resume: WalkEndResume,
+) -> bool {
     if !record_walk_end_leg(leg, resume) {
         return false;
     }
-    WALK_END_FLUSH_COMMITTED.with(|c| c.set(true));
+    flush_committed.set(true);
     true
 }
 
@@ -710,6 +700,7 @@ fn exception_delivery_stack_is_sourceable(
 /// in its own right or as the callee-rebuild leg's fallback.
 fn try_commit_entry_carrier_call(
     ctx: &TraceCtx,
+    flush_committed: &std::cell::Cell<bool>,
     cf_addr: usize,
     abort_jit_pc: usize,
     outer_jitcode_index: u32,
@@ -758,7 +749,7 @@ fn try_commit_entry_carrier_call(
             call_stack.len()
         );
     }
-    let committed = commit_walk_end(WalkEndCommitLeg::EntryCarrierCall, resume);
+    let committed = commit_walk_end(flush_committed, WalkEndCommitLeg::EntryCarrierCall, resume);
     debug_assert!(committed, "provability re-checked after a pure flush");
     Some(call_py_pc)
 }
@@ -1268,16 +1259,16 @@ pub fn trace_bytecode<Sym: WalkSym>(
     mut concrete_frame: pyre_interpreter::pyframe::FrameBox,
     live_frame_addr: usize,
     allow_propagate_out: bool,
-) -> (TraceAction, pyre_interpreter::pyframe::FrameBox) {
+) -> (TraceAction, pyre_interpreter::pyframe::FrameBox, bool) {
     // `llmodel.py:557` parity — install pyre's `Cpu` impl so the
     // optimizer's `protect_speculative_string` / `bh_strlen` /
     // `bh_strgetitem` family routes through rstr `STR` `str_descr`
     // (`pyre_cpu` module).
     meta.set_cpu(crate::pyre_cpu::shared());
 
-    // A stale flag from a prior trace on this thread must not leak into
-    // this trace's adoption decision.
-    WALK_END_FLUSH_COMMITTED.with(|c| c.set(false));
+    // A fresh cell: a prior trace on this thread cannot leak into this
+    // adoption decision. [`trace_bytecode`] returns it with the action.
+    let flush_committed = std::cell::Cell::new(false);
     WALK_END_COMMIT_LEG.with(|c| c.set(0));
     WALK_END_PROPAGATED_EXCEPTION.with(|c| *c.borrow_mut() = None);
     WALK_END_PROPAGATE_ALLOWED.with(|c| c.set(allow_propagate_out));
@@ -1377,9 +1368,17 @@ pub fn trace_bytecode<Sym: WalkSym>(
         // Reconstruct the in-flight callee framestack and drive it
         // innermost-first via the drain sub-walk, which compiles the N-deep
         // carrier (recipes 1..=7) or cleanly deopts to the blackhole.
-        let action = drive_bridge_carrier_walk(ctx, sym, w_code, start_pc, cf_addr, carrier);
+        let action = drive_bridge_carrier_walk(
+            ctx,
+            &flush_committed,
+            sym,
+            w_code,
+            start_pc,
+            cf_addr,
+            carrier,
+        );
         finish_trace_namespace_dependency(meta);
-        return (action, concrete_frame);
+        return (action, concrete_frame, flush_committed.get());
     }
     // Gated diagnostic: `PYRE_WALK_PERFN_JITCODE=1` attempts to walk the
     // per-CodeObject JitCode body via `dispatch_via_miframe` from the resume
@@ -1391,7 +1390,7 @@ pub fn trace_bytecode<Sym: WalkSym>(
     if carrier.is_none() && std::env::var_os("PYRE_WALK_PERFN_JITCODE").is_some() {
         probe_walk_perfn_jitcode(ctx, sym, w_code, start_pc, cf_addr);
         finish_trace_namespace_dependency(meta);
-        return (TraceAction::Abort, concrete_frame);
+        return (TraceAction::Abort, concrete_frame, false);
     }
     // The per-CodeObject JitCode body is traced via the authoritative
     // full-body walk — the walker-as-tracer path that makes
@@ -1412,6 +1411,7 @@ pub fn trace_bytecode<Sym: WalkSym>(
     {
         let action = full_body_walk_trace(
             ctx,
+            &flush_committed,
             sym,
             w_code,
             start_pc,
@@ -1420,14 +1420,14 @@ pub fn trace_bytecode<Sym: WalkSym>(
             None,
         );
         finish_trace_namespace_dependency(meta);
-        return (action, concrete_frame);
+        return (action, concrete_frame, flush_committed.get());
     }
     // Any path the walker did not trace above re-interprets without JIT for
     // this key. The location stays trace-eligible (no `DONT_TRACE_HERE`).
     crate::jitcode_dispatch::census_record("Trait::DeclinedAbort");
     let action = TraceAction::Decline;
     finish_trace_namespace_dependency(meta);
-    (action, concrete_frame)
+    (action, concrete_frame, flush_committed.get())
 }
 
 /// Read-only walker-as-tracer diagnostic probe.
@@ -1955,6 +1955,7 @@ fn carrier_contains_recursive_portal(
 
 fn drive_bridge_carrier_walk<Sym: WalkSym>(
     ctx: &mut TraceCtx,
+    flush_committed: &std::cell::Cell<bool>,
     sym: &mut Sym,
     w_code: *const (),
     root_pc: usize,
@@ -2206,6 +2207,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         let n = carrier.recipes.len();
         if let Some(action) = drive_middles_finishframe(
             ctx,
+            flush_committed,
             &session,
             sym,
             w_code,
@@ -2248,6 +2250,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         if depth_ok {
             if let Some(action) = drive_carrier_finishframe_exception(
                 ctx,
+                flush_committed,
                 &session,
                 sym,
                 w_code,
@@ -2354,7 +2357,13 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     // leaving whatever the adopt installs intact.
     crate::jitcode_dispatch::fbw_finish_payload_reset();
     let adopted = crate::jitcode_dispatch::fbw_executed_effect_count() != effects_at_entry
-        && try_adopt_blackhole(ctx, cf_addr, live_root_addr, WalkEndCommitLeg::CarrierAbort);
+        && try_adopt_blackhole(
+            flush_committed,
+            ctx,
+            cf_addr,
+            live_root_addr,
+            WalkEndCommitLeg::CarrierAbort,
+        );
     if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
         eprintln!(
             "[p2-drain-abort] effects={} adopted={adopted}",
@@ -2401,6 +2410,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
 #[allow(clippy::too_many_arguments)]
 fn drive_middles_finishframe<Sym: WalkSym>(
     ctx: &mut TraceCtx,
+    flush_committed: &std::cell::Cell<bool>,
     session: &std::cell::RefCell<crate::jitcode_dispatch::WalkSession>,
     sym: &mut Sym,
     w_code: *const (),
@@ -2431,6 +2441,7 @@ fn drive_middles_finishframe<Sym: WalkSym>(
                 crate::jitcode_dispatch::census_record("P2Drain::MiddleFinishframeException");
                 return drive_carrier_finishframe_exception(
                     ctx,
+                    flush_committed,
                     session,
                     sym,
                     w_code,
@@ -2448,7 +2459,16 @@ fn drive_middles_finishframe<Sym: WalkSym>(
             None => return None,
         }
     }
-    compile_root_from_carrier_result(ctx, sym, w_code, root_pc, cf_addr, carrier, result)
+    compile_root_from_carrier_result(
+        ctx,
+        flush_committed,
+        sym,
+        w_code,
+        root_pc,
+        cf_addr,
+        carrier,
+        result,
+    )
 }
 
 /// `pyjitpl.py finishframe_exception` over `middles` (a prefix of the
@@ -2462,6 +2482,7 @@ fn drive_middles_finishframe<Sym: WalkSym>(
 #[allow(clippy::too_many_arguments)]
 fn drive_carrier_finishframe_exception<Sym: WalkSym>(
     ctx: &mut TraceCtx,
+    flush_committed: &std::cell::Cell<bool>,
     session: &std::cell::RefCell<crate::jitcode_dispatch::WalkSession>,
     sym: &mut Sym,
     w_code: *const (),
@@ -2543,6 +2564,7 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
                 Some(Ok(result)) => {
                     return drive_middles_finishframe(
                         ctx,
+                        flush_committed,
                         session,
                         sym,
                         w_code,
@@ -2582,6 +2604,7 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
             as usize;
     let action = full_body_walk_trace(
         ctx,
+        flush_committed,
         sym,
         w_code,
         root_py_pc,
@@ -2599,6 +2622,7 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
 
 fn compile_root_from_carrier_result<Sym: WalkSym>(
     ctx: &mut TraceCtx,
+    flush_committed: &std::cell::Cell<bool>,
     sym: &mut Sym,
     w_code: *const (),
     root_pc: usize,
@@ -2616,6 +2640,7 @@ fn compile_root_from_carrier_result<Sym: WalkSym>(
             as usize;
     let action = full_body_walk_trace(
         ctx,
+        flush_committed,
         sym,
         w_code,
         root_py_pc,
@@ -2996,6 +3021,7 @@ fn adopt_blackhole_crn(snapshot: usize, live_root: usize, resume_py_pc: usize) {
 /// zero declines, and no corpus file's output differing from the
 /// interpreter's.
 fn try_adopt_single_frame_blackhole(
+    flush_committed: &std::cell::Cell<bool>,
     ctx: &mut TraceCtx,
     cf_addr: usize,
     live_root_addr: usize,
@@ -3486,7 +3512,7 @@ fn try_adopt_single_frame_blackhole(
     crate::jitcode_dispatch::fbw_foriter_inflight_clear();
     // The blackhole ran the region to a frame terminal, so the resume is
     // the frame's RESULT, not a pc that re-runs anything.
-    let _ = commit_walk_end(commit_leg, WalkEndResume::Terminal);
+    let _ = commit_walk_end(flush_committed, commit_leg, WalkEndResume::Terminal);
     fbw_diag::bump(fbw_diag::BLACKHOLE_ADOPTED_SINGLE_FRAME);
     if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
         eprintln!(
@@ -3499,6 +3525,7 @@ fn try_adopt_single_frame_blackhole(
 }
 
 fn try_adopt_multi_frame_blackhole(
+    flush_committed: &std::cell::Cell<bool>,
     ctx: &mut TraceCtx,
     cf_addr: usize,
     live_root_addr: usize,
@@ -3984,7 +4011,7 @@ fn try_adopt_multi_frame_blackhole(
     // because `convert_and_run_from_pyjitpl` overrides each level's
     // `virtualizable_ptr` from `per_frame` — so its `setfield_vable` stores
     // landed there, not in the snapshot.  EVERY adopted arm below sets
-    // `WALK_END_FLUSH_COMMITTED`, and the portal epilogue then copies the
+    // the flush bit `trace_bytecode` returns, and the portal epilogue then copies the
     // SNAPSHOT's whole locals array onto the live frame
     // (`restore_resume_state_from`), which would revert every one of those
     // stores.  Fold them into the snapshot before the arms so it is once again
@@ -4171,7 +4198,7 @@ fn try_adopt_multi_frame_blackhole(
     crate::jitcode_dispatch::discard_escape_flush_undo();
     crate::jitcode_dispatch::fbw_foriter_inflight_clear();
     // Same as the single-frame adoption: a frame terminal, not a resume pc.
-    let _ = commit_walk_end(commit_leg, WalkEndResume::Terminal);
+    let _ = commit_walk_end(flush_committed, commit_leg, WalkEndResume::Terminal);
     fbw_diag::bump(fbw_diag::BLACKHOLE_ADOPTED_MULTI_FRAME);
     if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
         eprintln!("[fbw-blackhole] adopted multi-frame terminal depth={depth}");
@@ -4227,13 +4254,20 @@ fn walk_abort_leg_enabled() -> bool {
 }
 
 fn try_adopt_blackhole(
+    flush_committed: &std::cell::Cell<bool>,
     ctx: &mut TraceCtx,
     cf_addr: usize,
     live_root_addr: usize,
     commit_leg: WalkEndCommitLeg,
 ) -> bool {
-    try_adopt_multi_frame_blackhole(ctx, cf_addr, live_root_addr, commit_leg)
-        || try_adopt_single_frame_blackhole(ctx, cf_addr, live_root_addr, commit_leg)
+    try_adopt_multi_frame_blackhole(flush_committed, ctx, cf_addr, live_root_addr, commit_leg)
+        || try_adopt_single_frame_blackhole(
+            flush_committed,
+            ctx,
+            cf_addr,
+            live_root_addr,
+            commit_leg,
+        )
 }
 
 fn blackhole_terminal_error(error: &crate::jitcode_dispatch::DispatchError) -> bool {
@@ -4246,6 +4280,7 @@ fn blackhole_terminal_error(error: &crate::jitcode_dispatch::DispatchError) -> b
 
 fn run_perfn_walk<Sym: WalkSym>(
     ctx: &mut TraceCtx,
+    flush_committed: &std::cell::Cell<bool>,
     sym: &mut Sym,
     w_code: *const (),
     start_pc: usize,
@@ -5030,7 +5065,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                     } else {
                         WalkEndCommitLeg::LoopHeader
                     };
-                    let _ = commit_walk_end(leg, WalkEndResume::Terminal);
+                    let _ = commit_walk_end(flush_committed, leg, WalkEndResume::Terminal);
                 } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                     eprintln!(
                         "[fbw-end-flush] declined at header_pc={header_pc} (shadow slot \
@@ -5057,26 +5092,36 @@ fn run_perfn_walk<Sym: WalkSym>(
         // forward abort has already distinguished an outside mark from a mark
         // inside its discarded attempt.
         let live_root_addr = sym.live_vable_frame_addr();
-        let trace_too_long_adopted =
-            matches!(
-                &walk_result,
-                Err(crate::jitcode_dispatch::DispatchError::TraceTooLong { .. })
-            ) && try_adopt_blackhole(ctx, cf_addr, live_root_addr, WalkEndCommitLeg::TraceTooLong);
+        let trace_too_long_adopted = matches!(
+            &walk_result,
+            Err(crate::jitcode_dispatch::DispatchError::TraceTooLong { .. })
+        ) && try_adopt_blackhole(
+            flush_committed,
+            ctx,
+            cf_addr,
+            live_root_addr,
+            WalkEndCommitLeg::TraceTooLong,
+        );
         // A successful segment cut arrives as `Ok`; a cut whose guard snapshot
         // could not be represented arrives as the dedicated `Err` below so the
         // partial segment is discarded. Both own the same already-preflighted
         // forward image. Without the adopt the epilogue rolls the journals
         // back and the interpreter replays the region the walk already ran.
-        let segment_adopted =
-            matches!(
-                &walk_result,
-                Ok((
-                    crate::jitcode_dispatch::DispatchOutcome::SegmentTrace { .. },
-                    _
-                )) | Err(
-                    crate::jitcode_dispatch::DispatchError::SegmentTraceSnapshotUnavailable { .. }
-                )
-            ) && try_adopt_blackhole(ctx, cf_addr, live_root_addr, WalkEndCommitLeg::SegmentTrace);
+        let segment_adopted = matches!(
+            &walk_result,
+            Ok((
+                crate::jitcode_dispatch::DispatchOutcome::SegmentTrace { .. },
+                _
+            )) | Err(
+                crate::jitcode_dispatch::DispatchError::SegmentTraceSnapshotUnavailable { .. }
+            )
+        ) && try_adopt_blackhole(
+            flush_committed,
+            ctx,
+            cf_addr,
+            live_root_addr,
+            WalkEndCommitLeg::SegmentTrace,
+        );
         if segment_adopted && crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!("[fbw-blackhole] adopted ABORT_SEGMENTED_TRACE forward resume");
         }
@@ -5114,7 +5159,13 @@ fn run_perfn_walk<Sym: WalkSym>(
                 crate::jitcode_dispatch::DispatchError::ForceQuasiImmutable { .. }
             ) || session.borrow().abort_in_subwalk))
             && walk_abort_leg_enabled()
-            && try_adopt_blackhole(ctx, cf_addr, live_root_addr, WalkEndCommitLeg::WalkAbort);
+            && try_adopt_blackhole(
+                flush_committed,
+                ctx,
+                cf_addr,
+                live_root_addr,
+                WalkEndCommitLeg::WalkAbort,
+            );
         if walk_abort_adopted && crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!("[fbw-blackhole] adopted WALK_ABORT forward resume");
         }
@@ -5123,7 +5174,13 @@ fn run_perfn_walk<Sym: WalkSym>(
             Err(crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. })
         );
         let force_blackhole_adopted = vable_escaped
-            && try_adopt_blackhole(ctx, cf_addr, live_root_addr, WalkEndCommitLeg::VableEscape);
+            && try_adopt_blackhole(
+                flush_committed,
+                ctx,
+                cf_addr,
+                live_root_addr,
+                WalkEndCommitLeg::VableEscape,
+            );
         let mut escape_pc_adopted = false;
         // What a VableEscape whose adopt did not commit must do once the walk
         // has already applied heap writes: replaying the traced region would
@@ -5132,7 +5189,11 @@ fn run_perfn_walk<Sym: WalkSym>(
         // forced) and take the no-replay resume instead of legacy replay.
         // `AfterApplied` is always provable, so this commit always lands.
         let keep_flushed_frame_after_applied = || {
-            let _ = commit_walk_end(WalkEndCommitLeg::VableEscape, WalkEndResume::AfterApplied);
+            let _ = commit_walk_end(
+                flush_committed,
+                WalkEndCommitLeg::VableEscape,
+                WalkEndResume::AfterApplied,
+            );
             crate::jitcode_dispatch::discard_escape_flush_undo();
             // Same live→snapshot mirror as the exact-escape commit: the portal
             // copies `executed_frame` onto the live frame, so a stale snapshot
@@ -5172,7 +5233,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                     WalkEndResume::RewindUnproven
                 }
             };
-            if commit_walk_end(WalkEndCommitLeg::VableEscape, resume) {
+            if commit_walk_end(flush_committed, WalkEndCommitLeg::VableEscape, resume) {
                 crate::jitcode_dispatch::discard_escape_flush_undo();
                 // The force-time escape flush wrote the resume state into the
                 // LIVE frame (the frame the callee inspected).  The portal
@@ -5212,7 +5273,7 @@ fn run_perfn_walk<Sym: WalkSym>(
         }
         // No adopt took the escape, and the walk already applied heap writes.
         if vable_escaped
-            && !WALK_END_FLUSH_COMMITTED.with(|c| c.get())
+            && !flush_committed.get()
             && crate::jitcode_dispatch::fbw_executed_effect_count() > 0
         {
             keep_flushed_frame_after_applied();
@@ -5239,7 +5300,7 @@ fn run_perfn_walk<Sym: WalkSym>(
             && !force_blackhole_adopted
             && !escape_pc_adopted
             && !walk_abort_adopted
-            && !WALK_END_FLUSH_COMMITTED.with(|c| c.get())
+            && !flush_committed.get()
         {
             crate::jitcode_dispatch::restore_escape_flush_undo();
         }
@@ -5293,6 +5354,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                 }) => {
                     committed_entry_carrier_call_py_pc = try_commit_entry_carrier_call(
                         ctx,
+                        flush_committed,
                         cf_addr,
                         abort_jit_pc,
                         *outer_jitcode_index,
@@ -5343,6 +5405,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                             // behind it.  Nothing re-runs; committing is what
                             // keeps those effects.
                             let _ = commit_walk_end(
+                                flush_committed,
                                 WalkEndCommitLeg::CalleeRebuild,
                                 WalkEndResume::AfterApplied,
                             );
@@ -5357,6 +5420,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                                 // stores.
                                 committed_entry_carrier_call_py_pc = try_commit_entry_carrier_call(
                                     ctx,
+                                    flush_committed,
                                     cf_addr,
                                     abort_jit_pc,
                                     payload.outer_jitcode_index,
@@ -5417,8 +5481,11 @@ fn run_perfn_walk<Sym: WalkSym>(
                             // Drop the in-flight item so the legacy deliver
                             // cannot push it again or roll the cursor back.
                             crate::jitcode_dispatch::fbw_foriter_inflight_clear();
-                            let _ =
-                                commit_walk_end(WalkEndCommitLeg::AbortPc, WalkEndResume::Terminal);
+                            let _ = commit_walk_end(
+                                flush_committed,
+                                WalkEndCommitLeg::AbortPc,
+                                WalkEndResume::Terminal,
+                            );
                         } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                             eprintln!(
                                 "[fbw-abort-flush] declined at resume_py_pc={resume_py_pc} \
@@ -5454,7 +5521,7 @@ fn run_perfn_walk<Sym: WalkSym>(
             // cannot see effects applied by the plain interpretation the
             // rebuild resumed into (the `MidBodyDecline::AfterRun` argument,
             // which the carrier block applies only to its own fallback).
-            if WALK_END_FLUSH_COMMITTED.with(|c| c.get()) {
+            if flush_committed.get() {
                 crate::jitcode_dispatch::fbw_abort_outer_resume_reset();
                 if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                     eprintln!(
@@ -5532,8 +5599,11 @@ fn run_perfn_walk<Sym: WalkSym>(
                                          resume_py_pc={resume_py_pc} (nested inline decline)"
                                 );
                             }
-                            let committed =
-                                commit_walk_end(WalkEndCommitLeg::NestedInlineOuterCall, resume);
+                            let committed = commit_walk_end(
+                                flush_committed,
+                                WalkEndCommitLeg::NestedInlineOuterCall,
+                                resume,
+                            );
                             debug_assert!(committed, "provability re-checked after a pure flush");
                         } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                             eprintln!(
@@ -5623,7 +5693,8 @@ fn run_perfn_walk<Sym: WalkSym>(
                              resume_py_pc={resume_py_pc}"
                         );
                     }
-                    let committed = commit_walk_end(WalkEndCommitLeg::AbortPc, resume);
+                    let committed =
+                        commit_walk_end(flush_committed, WalkEndCommitLeg::AbortPc, resume);
                     debug_assert!(committed, "provability re-checked after a pure flush");
                 } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                     eprintln!(
@@ -5667,7 +5738,7 @@ fn run_perfn_walk<Sym: WalkSym>(
         };
         if let Some(pc) = kept_stack_abort_pc {
             let abort_jit_pc = pc;
-            if WALK_END_FLUSH_COMMITTED.with(|c| c.get()) {
+            if flush_committed.get() {
                 // A walk commits at most ONE leg.  The gh#467 CALL-forward block
                 // above now also serves these aborts, and its flush already
                 // repositioned the frame; flushing again here would move it a
@@ -5761,7 +5832,11 @@ fn run_perfn_walk<Sym: WalkSym>(
                     crate::jitcode_dispatch::fbw_foriter_inflight_clear();
                     // The abort pc is where the walk stopped, and the in-flight
                     // item is delivered exactly once by the flush above.
-                    let _ = commit_walk_end(WalkEndCommitLeg::BranchGuard, WalkEndResume::Terminal);
+                    let _ = commit_walk_end(
+                        flush_committed,
+                        WalkEndCommitLeg::BranchGuard,
+                        WalkEndResume::Terminal,
+                    );
                     if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                         eprintln!(
                             "[fbw-branch-flush] COMMIT abort_jit_pc={abort_jit_pc} \
@@ -5818,7 +5893,10 @@ fn run_perfn_walk<Sym: WalkSym>(
         || crate::jitcode_dispatch::fbw_bridge_noreplay_armed())
         && matches!(
             &walk_result,
-            Ok((crate::jitcode_dispatch::DispatchOutcome::Terminate, _))
+            Ok((
+                crate::jitcode_dispatch::DispatchOutcome::Terminate { .. },
+                _
+            ))
         )
         && crate::jitcode_dispatch::fbw_finish_concrete_peek().is_some()
         && !crate::jitcode_dispatch::fbw_has_unjournaled_effect();
@@ -5844,7 +5922,7 @@ fn run_perfn_walk<Sym: WalkSym>(
             crate::jitcode_dispatch::DispatchOutcome::SegmentTrace { .. },
             _
         ))
-    )) && WALK_END_FLUSH_COMMITTED.with(|slot| slot.get())
+    )) && flush_committed.get()
         && crate::jitcode_dispatch::fbw_finish_concrete_peek().is_some();
     if !terminate_no_replay && !blackhole_terminal_no_replay {
         crate::jitcode_dispatch::fbw_finish_concrete_reset();
@@ -5869,7 +5947,7 @@ fn run_perfn_walk<Sym: WalkSym>(
     if is_bridge_trace && crate::jitcode_dispatch::fbw_debug_abort_enabled() {
         let outcome_kind = match &walk_result {
             Ok((crate::jitcode_dispatch::DispatchOutcome::Continue, _)) => "Continue",
-            Ok((crate::jitcode_dispatch::DispatchOutcome::Terminate, _)) => "Terminate",
+            Ok((crate::jitcode_dispatch::DispatchOutcome::Terminate { .. }, _)) => "Terminate",
             Ok((crate::jitcode_dispatch::DispatchOutcome::SubReturn { .. }, _)) => "SubReturn",
             Ok((crate::jitcode_dispatch::DispatchOutcome::SubRaise { .. }, _)) => "SubRaise",
             Ok((crate::jitcode_dispatch::DispatchOutcome::SwitchToBlackhole { .. }, _)) => {
@@ -5884,13 +5962,13 @@ fn run_perfn_walk<Sym: WalkSym>(
         };
         eprintln!(
             "[fbw-bridge-epilogue] committed={} store_journal_len={} unjournaled={} outcome={}",
-            WALK_END_FLUSH_COMMITTED.with(|c| c.get()),
+            flush_committed.get(),
             crate::jitcode_dispatch::fbw_store_journal_len(),
             crate::jitcode_dispatch::fbw_has_unjournaled_effect(),
             outcome_kind,
         );
     }
-    let committed = WALK_END_FLUSH_COMMITTED.with(|c| c.get()) || terminate_no_replay;
+    let committed = flush_committed.get() || terminate_no_replay;
     let (jstore, jappend, jcell) = crate::jitcode_dispatch::fbw_journaled_effect_lens();
     let journaled = jstore + jappend + jcell;
     if committed {
@@ -6004,6 +6082,23 @@ fn run_perfn_walk<Sym: WalkSym>(
         }
     }
 
+    // The epilogue above can allocate.  `walk_session_roots` forwards a
+    // `ConstPtr` finish operand on the session; copy that address onto the
+    // outcome the caller records as the FINISH arg.
+    if let Ok((
+        crate::jitcode_dispatch::DispatchOutcome::Terminate {
+            finish_arg,
+            finish_arg_type,
+        },
+        _,
+    )) = &mut walk_result
+    {
+        if let Some((arg, ty)) = session.borrow_mut().finish_payload.take() {
+            *finish_arg = arg;
+            *finish_arg_type = ty;
+        }
+    }
+
     Some((entry, code_len, walk_result))
 }
 
@@ -6029,8 +6124,10 @@ fn probe_walk_perfn_jitcode<Sym: WalkSym>(
     // every op the diagnostic recorded (the walk discards its trace).
     let pre_pos = ctx.get_trace_position();
     let is_being_profiled = crate::driver::frame_is_being_profiled(cf_addr);
+    let flush_committed = std::cell::Cell::new(false);
     let Some((entry, code_len, walk_result)) = run_perfn_walk(
         ctx,
+        &flush_committed,
         sym,
         w_code,
         start_pc,
@@ -6684,6 +6781,7 @@ enum WalkJournals {
 /// `DispatchError`) aborts the trace and returns to interpretation.
 fn full_body_walk_trace<Sym: WalkSym>(
     ctx: &mut TraceCtx,
+    flush_committed: &std::cell::Cell<bool>,
     sym: &mut Sym,
     w_code: *const (),
     start_pc: usize,
@@ -6810,6 +6908,7 @@ fn full_body_walk_trace<Sym: WalkSym>(
     }
     let walk_result = run_perfn_walk(
         ctx,
+        flush_committed,
         sym,
         w_code,
         start_pc,
@@ -6863,37 +6962,41 @@ fn full_body_walk_trace<Sym: WalkSym>(
                     loop_header_pc: Some(loop_header_pc),
                 }
             }
-            crate::jitcode_dispatch::DispatchOutcome::Terminate => {
+            crate::jitcode_dispatch::DispatchOutcome::Terminate {
+                finish_arg,
+                finish_arg_type,
+            } => {
                 // A loop-free portal exit: the top-level `*_return` reached
                 // `done_with_this_frame` with no back-edge.  The return arm
                 // routed through `fbw_terminate_with_finish`, which re-boxed the
                 // result to Type::Ref, recorded the vable store-back +
-                // GUARD_NOT_FORCED_2, and stashed the finish payload.  Build the
-                // portal-exit FINISH from it so the compile pipeline records
+                // GUARD_NOT_FORCED_2, and returned the finish operand.  Build
+                // the portal-exit FINISH from it so the compile pipeline records
                 // FINISH from `finish_args` (matching `StepResult::Return` in
-                // trace_opcode.rs).  No payload → `Abort`.
+                // trace_opcode.rs).  `run_perfn_walk` copies the session's
+                // forwarded `ConstPtr` onto this outcome before returning.
                 let finish_is_exception = crate::jitcode_dispatch::fbw_finish_is_exception();
-                match crate::jitcode_dispatch::fbw_finish_payload_take() {
-                    // A top-level `void_return/` stashes a `Type::Void`-marked
-                    // payload: the portal exits with no value, so build a
-                    // FINISH with empty args.  The compile pipeline maps an
-                    // empty `finish_arg_types` to `done_with_this_frame_descr_void`
+                match finish_arg_type {
+                    // A top-level `void_return/` carries `Type::Void`: the portal
+                    // exits with no value, so build a FINISH with empty args.
+                    // The compile pipeline maps an empty `finish_arg_types` to
+                    // `done_with_this_frame_descr_void`
                     // (pyjitpl.rs `done_with_this_frame_descr_from_types`).
-                    Some((_, majit_ir::Type::Void)) => TraceAction::Finish {
+                    majit_ir::Type::Void => TraceAction::Finish {
                         finish_args: vec![],
                         finish_arg_types: vec![],
                         exit_with_exception: false,
                         exc_value: 0,
                     },
-                    // A top-level uncaught raise stashes the exception box as an
-                    // `is_exception` payload (`fbw_terminate_with_raise`): build
-                    // the portal-exit FINISH against
-                    // `exit_frame_with_exception_descr` (mirror of the trait
-                    // tracer's `compile_exit_frame_with_exception`,
-                    // pyjitpl.py:3238-3242) so the frame exits carrying the
-                    // exception to the caller instead of aborting the bridge.
-                    Some((exc, _)) if finish_is_exception => TraceAction::Finish {
-                        finish_args: vec![exc],
+                    // A top-level uncaught raise carries the exception box
+                    // (`fbw_terminate_with_raise`): build the portal-exit FINISH
+                    // against `exit_frame_with_exception_descr` (mirror of the
+                    // trait tracer's `compile_exit_frame_with_exception`,
+                    // pyjitpl.py `compile_exit_frame_with_exception`) so the
+                    // frame exits carrying the exception to the caller instead
+                    // of aborting the bridge.
+                    _ if finish_is_exception => TraceAction::Finish {
+                        finish_args: vec![finish_arg],
                         finish_arg_types: vec![majit_ir::Type::Ref],
                         exit_with_exception: true,
                         // The full-body walk delivers its own uncaught raise
@@ -6902,21 +7005,12 @@ fn full_body_walk_trace<Sym: WalkSym>(
                         // covered and no value needs to ride the action.
                         exc_value: 0,
                     },
-                    Some((finish_value, finish_type)) => TraceAction::Finish {
-                        finish_args: vec![finish_value],
-                        finish_arg_types: vec![finish_type],
+                    _ => TraceAction::Finish {
+                        finish_args: vec![finish_arg],
+                        finish_arg_types: vec![finish_arg_type],
                         exit_with_exception: false,
                         exc_value: 0,
                     },
-                    None => {
-                        crate::jitcode_dispatch::census_record("Terminate::NoFinishPayload");
-                        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                            eprintln!(
-                                "[fbw-abort] start_pc={start_pc} Terminate without finish payload (ungated portal exit)"
-                            );
-                        }
-                        TraceAction::Abort
-                    }
                 }
             }
             crate::jitcode_dispatch::DispatchOutcome::CompileTracePending { .. } => {

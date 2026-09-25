@@ -228,34 +228,22 @@ pub(crate) fn fbw_strict_fold_frame_reg<Sym: WalkSym>(ctx: &WalkContext<'_, '_, 
 }
 
 thread_local! {
-    /// Finish payload stashed by a top-level `*_return` arm, read back by
-    /// [`crate::trace::full_body_walk_trace`] to build a
-    /// `TraceAction::Finish` for a loop-free (Finish-terminated) portal.
-    ///
-    /// `(finish_value, finish_arg_type)` — the re-boxed return value and
-    /// its `Type::Ref` portal-exit type.
-    /// Reset at the start of every walk (`fbw_finish_payload_reset`) so a
-    /// stale payload from a prior aborted walk cannot leak into this one.
-    static FBW_FINISH_PAYLOAD: std::cell::Cell<Option<(OpRef, Type)>> =
-        const { std::cell::Cell::new(None) };
-
-    /// Discriminates the `FBW_FINISH_PAYLOAD` disposition: `true` when the
-    /// payload is a top-level uncaught raise (`fbw_terminate_with_raise`),
+    /// Discriminates a top-level [`DispatchOutcome::Terminate`] payload:
+    /// `true` when it is an uncaught raise (`fbw_terminate_with_raise`),
     /// so [`crate::trace::full_body_walk_trace`] builds a
     /// `TraceAction::Finish { exit_with_exception: true }`
     /// (`compile_exit_frame_with_exception`) rather than a value-return
     /// FINISH.  A dedicated flag rather than the `FBW_FINISH_CONCRETE::Raise`
     /// marker because the latter is null-guarded for GC-rooting and so is
-    /// absent when the raised exception has no concrete Ref.  Reset with the
-    /// payload at the start of every walk.
+    /// absent when the raised exception has no concrete Ref.  Reset at the
+    /// start of every walk.
     static FBW_FINISH_IS_EXCEPTION: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 
     /// The terminal disposition a top-level walk produced, set for a
     /// loop-free portal exit (`DispatchOutcome::Terminate`).  Unlike
-    /// `FBW_FINISH_PAYLOAD` (the symbolic re-boxed `OpRef` the compile
-    /// consumer records into the trace), this holds the value the walk
-    /// *concretely* computed.
+    /// the symbolic `OpRef` the compile consumer records into the trace,
+    /// this holds the value the walk *concretely* computed.
     ///
     /// A function trace that fully unrolls to `done_with_this_frame`
     /// executed every residual call concretely (consuming side-effecting
@@ -476,14 +464,8 @@ pub fn fbw_import_residual_locals_enabled() -> bool {
 /// concrete-return cell so a stale value from a prior aborted walk cannot leak
 /// into this one.
 pub(crate) fn fbw_finish_payload_reset() {
-    FBW_FINISH_PAYLOAD.with(|c| c.set(None));
     FBW_FINISH_IS_EXCEPTION.with(|c| c.set(false));
     FBW_FINISH_CONCRETE.with(|c| c.set(None));
-}
-
-/// Consume the Finish payload stashed by a top-level `*_return` arm.
-pub(crate) fn fbw_finish_payload_take() -> Option<(OpRef, Type)> {
-    FBW_FINISH_PAYLOAD.with(|c| c.take())
 }
 
 /// Stash the concrete return value of a top-level value-returning
@@ -534,19 +516,6 @@ pub fn fbw_finish_concrete_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::Gc
 
 pub fn capture_fbw_finish_concrete_root_area() -> *const () {
     FBW_FINISH_CONCRETE.with(|value| value as *const _ as *const ())
-}
-
-/// `history.py ConstPtr` parity for the symbolic FINISH payload.  RPython's
-/// box remains in the translated GC graph while compilation allocates; pyre's
-/// inline `GcRef` lives in this TLS cell instead, so it must be registered as
-/// an explicit root and updated when the collector forwards it.
-pub fn fbw_finish_payload_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    let data = capture_fbw_finish_payload_root_area();
-    unsafe { fbw_finish_payload_root_walker_area(data, visitor) };
-}
-
-pub fn capture_fbw_finish_payload_root_area() -> *const () {
-    FBW_FINISH_PAYLOAD.with(|value| value as *const _ as *const ())
 }
 
 /// Record that `op` is a walker-built inline exception (construction fold).
@@ -2932,16 +2901,20 @@ pub(crate) fn fbw_store_token_in_vable<Sym: WalkSym>(
 /// does NOT record the `FINISH` op: under the gate the compile consumer
 /// (`finish_and_compile` -> `recorder.finish`, mod.rs) records it from
 /// `finish_args`, so recording it here too would double it.
+///
+/// Returns the FINISH operand (`N_aryOp._args`) and stores the same pair
+/// on the walk session so `walk_session_roots` can forward a `ConstPtr`.
 pub(crate) fn fbw_terminate_with_finish<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     result: OpRef,
     op_pc: usize,
-) -> Result<(), DispatchError> {
+) -> Result<(OpRef, Type), DispatchError> {
     let finish_value = fbw_ensure_boxed_for_ca(ctx, op_pc, result)?;
     fbw_publish_exit_last_instr(ctx, op_pc);
     fbw_store_token_in_vable(ctx, op_pc)?;
-    FBW_FINISH_PAYLOAD.with(|c| c.set(Some((finish_value, Type::Ref))));
-    Ok(())
+    let payload = (finish_value, Type::Ref);
+    ctx.session.borrow_mut().finish_payload = Some(payload);
+    Ok(payload)
 }
 
 /// Void variant of [`fbw_terminate_with_finish`] for the top-level
@@ -2955,11 +2928,12 @@ pub(crate) fn fbw_terminate_with_finish<Sym: WalkSym>(
 pub(crate) fn fbw_terminate_void_with_finish<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
-) -> Result<(), DispatchError> {
+) -> Result<(OpRef, Type), DispatchError> {
     fbw_publish_exit_last_instr(ctx, op_pc);
     fbw_store_token_in_vable(ctx, op_pc)?;
-    FBW_FINISH_PAYLOAD.with(|c| c.set(Some((OpRef::NONE, Type::Void))));
-    Ok(())
+    let payload = (OpRef::NONE, Type::Void);
+    ctx.session.borrow_mut().finish_payload = Some(payload);
+    Ok(payload)
 }
 
 /// Publish the exiting instruction's Python coordinate into the standard
@@ -3080,19 +3054,25 @@ pub(crate) fn fbw_publish_exit_last_instr<Sym: WalkSym>(
 /// full_body_walk_trace`]'s Terminate arm builds
 /// `TraceAction::Finish { exit_with_exception: true }` and the compile
 /// consumer records it once against `exit_frame_with_exception_descr`.
-pub(crate) fn fbw_terminate_with_raise(exc: OpRef, exc_concrete: ConcreteValue) {
-    FBW_FINISH_PAYLOAD.with(|c| c.set(Some((exc, Type::Ref))));
+pub(crate) fn fbw_terminate_with_raise<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    exc: OpRef,
+    exc_concrete: ConcreteValue,
+) -> (OpRef, Type) {
+    let payload = (exc, Type::Ref);
+    ctx.session.borrow_mut().finish_payload = Some(payload);
     FBW_FINISH_IS_EXCEPTION.with(|c| c.set(true));
     if let ConcreteValue::Ref(p) = exc_concrete {
         if !p.is_null() {
             fbw_finish_raise_set(exc_concrete);
         }
     }
+    payload
 }
 
-/// Whether the stashed `FBW_FINISH_PAYLOAD` is a top-level uncaught raise
-/// (see [`fbw_terminate_with_raise`]).  Read by the Terminate arm before
-/// taking the payload; reset with the payload at the start of every walk.
+/// Whether the terminating payload is a top-level uncaught raise
+/// (see [`fbw_terminate_with_raise`]).  Read by the Terminate arm;
+/// reset at the start of every walk.
 pub(crate) fn fbw_finish_is_exception() -> bool {
     FBW_FINISH_IS_EXCEPTION.with(|c| c.get())
 }

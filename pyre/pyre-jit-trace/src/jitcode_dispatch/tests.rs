@@ -88,21 +88,35 @@ fn session_root_callback_rejects_a_borrow_across_collection() {
     drop(held);
 }
 
+fn finish_payload_of(outcome: &DispatchOutcome) -> Option<(OpRef, Type)> {
+    match outcome {
+        DispatchOutcome::Terminate {
+            finish_arg,
+            finish_arg_type,
+        } => Some((*finish_arg, *finish_arg_type)),
+        _ => None,
+    }
+}
+
 #[test]
 fn finish_payload_root_walker_writes_back_forwarded_const_ptr() {
-    fbw_finish_payload_reset();
-    fbw_terminate_with_raise(
-        OpRef::const_ptr(majit_ir::GcRef(0x1000)),
-        ConcreteValue::Ref(std::ptr::null_mut()),
-    );
-
-    fbw_finish_payload_root_walker(&mut |gcref| gcref.0 = 0x2000);
-
+    let _runtime = crate::trace_ctx_for_test(0);
+    let _stw = majit_gc::gc_sync::quiesce_mutators();
+    let session = std::cell::RefCell::new(WalkSession {
+        finish_payload: Some((OpRef::const_ptr(majit_ir::GcRef(0x1000)), Type::Ref)),
+        ..WalkSession::default()
+    });
+    let _roots = WalkSessionRoots::new(&session);
+    let _stw = majit_gc::gc_sync::quiesce_mutators();
+    majit_gc::shadow_stack::walk_my_extra_areas(|gcref| {
+        if gcref.0 == 0x1000 {
+            gcref.0 = 0x2000;
+        }
+    });
     assert_eq!(
-        fbw_finish_payload_take(),
+        session.borrow().finish_payload,
         Some((OpRef::const_ptr(majit_ir::GcRef(0x2000)), Type::Ref))
     );
-    fbw_finish_payload_reset();
 }
 
 extern "C" fn count_static_refusal_prefix() {
@@ -5012,7 +5026,7 @@ fn inline_call_recursion_writes_subreturn_into_caller_dst_register() {
     };
     fbw_finish_payload_reset();
     let (outcome, end_pc) = walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
-    assert_eq!(outcome, DispatchOutcome::Terminate);
+    assert!(matches!(outcome, DispatchOutcome::Terminate { .. }));
     assert_eq!(end_pc, caller_code.len());
     assert_eq!(
         wc.last_exc_value(),
@@ -5042,7 +5056,7 @@ fn inline_call_recursion_writes_subreturn_into_caller_dst_register() {
         "no op recorded: the compile consumer records the FINISH from the payload",
     );
     assert_eq!(
-        fbw_finish_payload_take(),
+        finish_payload_of(&outcome),
         Some((arg_value, Type::Ref)),
         "outermost finish payload must carry the arg value the caller threaded \
              through inline_call_r_r",
@@ -5142,7 +5156,7 @@ fn inline_call_subwalk_uses_heap_frames_past_the_old_host_stack_cap() {
     };
     fbw_finish_payload_reset();
     let (outcome, end_pc) = walk(&root_code, 0, &mut walk_ctx).unwrap();
-    assert_eq!(outcome, DispatchOutcome::Terminate);
+    assert!(matches!(outcome, DispatchOutcome::Terminate { .. }));
     assert_eq!(end_pc, root_code.len());
     drop(walk_ctx);
     assert_eq!(regs_r[0], expected);
@@ -5150,7 +5164,7 @@ fn inline_call_subwalk_uses_heap_frames_past_the_old_host_stack_cap() {
         trace_ctx.heap_cache().is_class_known(expected),
         "a child push must restore the parent's pre-CALL heap-cache knowledge"
     );
-    assert_eq!(fbw_finish_payload_take(), Some((expected, Type::Ref)));
+    assert_eq!(finish_payload_of(&outcome), Some((expected, Type::Ref)));
 }
 
 #[test]
@@ -5933,9 +5947,8 @@ fn inline_call_recursion_propagates_subraise_from_callee() {
     };
     fbw_finish_payload_reset();
     let (outcome, _) = walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
-    assert_eq!(
-        outcome,
-        DispatchOutcome::Terminate,
+    assert!(
+        matches!(outcome, DispatchOutcome::Terminate { .. }),
         "top-level walk must convert uncaught SubRaise to Terminate",
     );
     drop(wc);
@@ -5954,7 +5967,7 @@ fn inline_call_recursion_propagates_subraise_from_callee() {
         "a top-level propagated SubRaise must mark the finish payload as an exception exit",
     );
     let (finish_value, finish_ty) =
-        fbw_finish_payload_take().expect("exception finish payload must be stashed");
+        finish_payload_of(&outcome).expect("exception finish payload must be stashed");
     assert_eq!(finish_ty, Type::Ref, "portal-exit FINISH carries Type::Ref");
     assert_eq!(
         finish_value, arg_value,
@@ -6215,7 +6228,7 @@ fn step_through_ref_return_records_finish_with_descr_and_correct_arg() {
     };
     fbw_finish_payload_reset();
     let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ref_return/r must dispatch");
-    assert_eq!(outcome, DispatchOutcome::Terminate);
+    assert!(matches!(outcome, DispatchOutcome::Terminate { .. }));
     assert_eq!(next_pc, 2, "ref_return/r consumes 1 register byte");
     drop(wc);
     assert_eq!(
@@ -6225,7 +6238,7 @@ fn step_through_ref_return_records_finish_with_descr_and_correct_arg() {
              records it from the stashed finish payload",
     );
     assert_eq!(
-        fbw_finish_payload_take(),
+        finish_payload_of(&outcome),
         Some((expected_arg, Type::Ref)),
         "finish payload must select registers_r[3], not registers_r[0]",
     );
@@ -6423,7 +6436,7 @@ fn step_through_int_return_records_finish_with_int_descr() {
     let ops_before = wc.trace_ctx.num_ops();
     fbw_finish_payload_reset();
     let (outcome, next_pc) = step(&code, 0, &mut wc).expect("int_return/i must dispatch");
-    assert_eq!(outcome, DispatchOutcome::Terminate);
+    assert!(matches!(outcome, DispatchOutcome::Terminate { .. }));
     assert_eq!(next_pc, 2);
     drop(wc);
     assert_eq!(
@@ -6432,7 +6445,7 @@ fn step_through_int_return_records_finish_with_int_descr() {
         "wrapint must record NEW_WITH_VTABLE + SETFIELD_GC for the boxed payload",
     );
     let (finish_value, finish_ty) =
-        fbw_finish_payload_take().expect("finish payload must be stashed");
+        finish_payload_of(&outcome).expect("finish payload must be stashed");
     assert_eq!(finish_ty, Type::Ref, "portal-exit FINISH carries Type::Ref");
     let ops = tc.ops();
     let new_box = &ops[ops.len() - 2];
@@ -6585,7 +6598,7 @@ fn step_through_void_return_stashes_void_finish_payload() {
     let ops_before = wc.trace_ctx.num_ops();
     fbw_finish_payload_reset();
     let (outcome, next_pc) = step(&code, 0, &mut wc).expect("void_return/ must dispatch");
-    assert_eq!(outcome, DispatchOutcome::Terminate);
+    assert!(matches!(outcome, DispatchOutcome::Terminate { .. }));
     assert_eq!(next_pc, 1, "void_return/ has zero operand bytes");
     drop(wc);
     assert_eq!(
@@ -6595,7 +6608,7 @@ fn step_through_void_return_stashes_void_finish_payload() {
              consumer records FINISH([]) from the empty finish_args",
     );
     assert_eq!(
-        fbw_finish_payload_take(),
+        finish_payload_of(&outcome),
         Some((OpRef::NONE, Type::Void)),
         "void portal exit stashes a Type::Void-marked payload",
     );
@@ -7117,7 +7130,7 @@ fn step_through_raise_records_outermost_finish_and_terminates() {
     };
     fbw_finish_payload_reset();
     let (outcome, next_pc) = walk(&code, 0, &mut wc).expect("raise/r must dispatch");
-    assert_eq!(outcome, DispatchOutcome::Terminate);
+    assert!(matches!(outcome, DispatchOutcome::Terminate { .. }));
     assert_eq!(next_pc, 2);
     drop(wc);
     // The exception is stashed as an `is_exception` finish payload, NOT
@@ -7136,7 +7149,7 @@ fn step_through_raise_records_outermost_finish_and_terminates() {
         "top-level raise/r must mark the finish payload as an exception exit",
     );
     let (finish_value, finish_ty) =
-        fbw_finish_payload_take().expect("exception finish payload must be stashed");
+        finish_payload_of(&outcome).expect("exception finish payload must be stashed");
     assert_eq!(finish_ty, Type::Ref, "portal-exit FINISH carries Type::Ref");
     assert_eq!(
         finish_value, expected_exc,
@@ -7205,9 +7218,9 @@ fn top_level_raise_settles_the_vable_token() {
     wc.outer_resume_marker_jit_pc = Some(0);
     fbw_finish_payload_reset();
     let (outcome, _next_pc) = walk(&code, 0, &mut wc).expect("raise/r must dispatch");
-    assert_eq!(outcome, DispatchOutcome::Terminate);
+    assert!(matches!(outcome, DispatchOutcome::Terminate { .. }));
     drop(wc);
-    let _ = fbw_finish_payload_take();
+    let _ = finish_payload_of(&outcome);
     assert!(
         tc.num_ops() > ops_before,
         "the exception exit must record the virtualizable token protocol",
@@ -7337,7 +7350,7 @@ fn raise_r_emits_guard_class_when_concrete_exc_pinned_in_shadow() {
     wc.outer_resume_marker_jit_pc = Some(0);
     fbw_finish_payload_reset();
     let (outcome, _next_pc) = walk(&code, 0, &mut wc).expect("raise/r must dispatch");
-    assert_eq!(outcome, DispatchOutcome::Terminate);
+    assert!(matches!(outcome, DispatchOutcome::Terminate { .. }));
     drop(wc);
 
     // Only the GuardClass op lands inline: `raise/r` records it during
@@ -7355,7 +7368,7 @@ fn raise_r_emits_guard_class_when_concrete_exc_pinned_in_shadow() {
         "top-level raise/r must mark the finish payload as an exception exit",
     );
     let (finish_value, _finish_ty) =
-        fbw_finish_payload_take().expect("exception finish payload must be stashed");
+        finish_payload_of(&outcome).expect("exception finish payload must be stashed");
     assert_eq!(
         finish_value, exc_box,
         "the stashed payload must carry the exception OpRef",
@@ -7449,7 +7462,7 @@ fn step_through_reraise_at_top_level_records_outermost_finish() {
     // outermost FINISH + converts to Terminate.
     fbw_finish_payload_reset();
     let (outcome, next_pc) = walk(&code, 0, &mut wc).expect("reraise/ must dispatch");
-    assert_eq!(outcome, DispatchOutcome::Terminate);
+    assert!(matches!(outcome, DispatchOutcome::Terminate { .. }));
     assert_eq!(next_pc, 1, "reraise/ has no operand");
     drop(wc);
     // As with `raise/r`, the standing exception is stashed as an
@@ -7465,7 +7478,7 @@ fn step_through_reraise_at_top_level_records_outermost_finish() {
         "top-level reraise/ must mark the finish payload as an exception exit",
     );
     let (finish_value, finish_ty) =
-        fbw_finish_payload_take().expect("exception finish payload must be stashed");
+        finish_payload_of(&outcome).expect("exception finish payload must be stashed");
     assert_eq!(finish_ty, Type::Ref, "portal-exit FINISH carries Type::Ref");
     assert_eq!(
         finish_value, active_exc,
@@ -7719,9 +7732,8 @@ fn inline_call_subraise_jumps_to_caller_catch_exception_target() {
     };
     fbw_finish_payload_reset();
     let (outcome, end_pc) = walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
-    assert_eq!(
-        outcome,
-        DispatchOutcome::Terminate,
+    assert!(
+        matches!(outcome, DispatchOutcome::Terminate { .. }),
         "caller must reach handler's ref_return and terminate (not bubble SubRaise)",
     );
     assert_eq!(
@@ -7739,7 +7751,7 @@ fn inline_call_subraise_jumps_to_caller_catch_exception_target() {
     // distinct_const_refs OpRef (caller's inline_call dst write
     // happens *only* on SubReturn, not SubRaise-then-catch).
     assert_eq!(
-        fbw_finish_payload_take(),
+        finish_payload_of(&outcome),
         Some((handler_ret, Type::Ref)),
         "finish payload must exist and carry the handler's ref_return arg",
     );
@@ -12877,9 +12889,8 @@ fn walk_return_value_helper_terminates_at_first_ref_return() {
     };
     let (outcome, end_pc) =
         walk(&jc.code, 0, &mut wc).expect("ReturnValue helper must walk to a terminator");
-    assert_eq!(
-        outcome,
-        DispatchOutcome::Terminate,
+    assert!(
+        matches!(outcome, DispatchOutcome::Terminate { .. }),
         "top-level walk must end on Terminate",
     );
     assert!(
@@ -12902,7 +12913,7 @@ fn walk_return_value_helper_terminates_at_first_ref_return() {
     // Sub-walks stash nothing (they surface `SubReturn`), so exactly one
     // payload — the caller's — is pending.
     assert_eq!(
-        fbw_finish_payload_take().map(|(_, ty)| ty),
+        finish_payload_of(&outcome).map(|(_, ty)| ty),
         Some(Type::Ref),
         "outermost ref_return must stash a Type::Ref finish payload",
     );
@@ -13002,9 +13013,8 @@ fn walk_pop_top_helper_terminates_with_recorded_ops() {
     // codewriter-emitted callee jitcode (resolved via
     // `production_sub_jitcodes`); on success the outermost
     // `ref_return/r` lands a FINISH at top level.
-    assert_eq!(
-        outcome,
-        DispatchOutcome::Terminate,
+    assert!(
+        matches!(outcome, DispatchOutcome::Terminate { .. }),
         "top-level PopTop walk must end on Terminate",
     );
     assert!(
@@ -13145,9 +13155,11 @@ fn helper_descent_defers_the_limit_check_to_the_enclosing_frame() {
         "an enclosing Python frame must abort at its own step",
     );
 
-    assert_eq!(
-        walk_past_the_limit(true).map(|(outcome, _)| outcome),
-        Ok(DispatchOutcome::Terminate),
+    assert!(
+        matches!(
+            walk_past_the_limit(true),
+            Ok((DispatchOutcome::Terminate { .. }, _))
+        ),
         "a helper descent must finish its body and leave the check to its caller",
     );
 }
@@ -13343,7 +13355,7 @@ fn inline_call_r_v_accepts_void_returning_callee() {
     };
     let (outcome, _) =
         walk(&caller_code, 0, &mut wc).expect("inline_call_r_v with void callee must succeed");
-    assert_eq!(outcome, DispatchOutcome::Terminate);
+    assert!(matches!(outcome, DispatchOutcome::Terminate { .. }));
     assert_eq!(wc.last_exc_value(), None);
     assert_eq!(wc.last_exc_value_concrete(), ConcreteValue::Null);
 }
@@ -13526,7 +13538,7 @@ fn inline_call_ir_v_accepts_void_returning_callee() {
     };
     let (outcome, _) =
         walk(&caller_code, 0, &mut wc).expect("inline_call_ir_v with void callee must succeed");
-    assert_eq!(outcome, DispatchOutcome::Terminate);
+    assert!(matches!(outcome, DispatchOutcome::Terminate { .. }));
 }
 
 #[test]
@@ -13711,7 +13723,7 @@ fn inline_call_irf_v_accepts_void_returning_callee() {
     };
     let (outcome, _) =
         walk(&caller_code, 0, &mut wc).expect("inline_call_irf_v with void callee must succeed");
-    assert_eq!(outcome, DispatchOutcome::Terminate);
+    assert!(matches!(outcome, DispatchOutcome::Terminate { .. }));
 }
 
 #[test]
@@ -15072,13 +15084,13 @@ fn dispatch_via_miframe_runs_ref_return_through_real_miframe_state() {
         &[],
     )
     .expect("dispatch_via_miframe must succeed for ref_return r2");
-    assert_eq!(outcome, DispatchOutcome::Terminate);
+    assert!(matches!(outcome, DispatchOutcome::Terminate { .. }));
     assert_eq!(end_pc, 2);
 
     // Drop miframe so we can inspect tc directly.
     drop(miframe);
     assert_eq!(
-        fbw_finish_payload_take(),
+        finish_payload_of(&outcome),
         Some((expected_arg, Type::Ref)),
         "finish payload must be sym.registers_r[2] threaded through the MIFrame bridge",
     );
@@ -15154,7 +15166,7 @@ fn dispatch_via_miframe_mirrors_last_exc_value_back_into_sym() {
         &[],
     )
     .expect("dispatch_via_miframe must succeed for raise r3");
-    assert_eq!(outcome, DispatchOutcome::Terminate);
+    assert!(matches!(outcome, DispatchOutcome::Terminate { .. }));
     drop(miframe);
     // Post-condition: sym.last_exc_box was mirrored from the
     // walker's last_exc_value (set by raise/r before terminate).
@@ -15233,10 +15245,10 @@ fn dispatch_via_miframe_bridge_inside_catch_answers_last_exc_value() {
     pyre_interpreter::eval::set_current_exception(prev);
     let (outcome, end_pc) =
         result.expect("catch-region bridge must answer last_exc_value/>r instead of aborting");
-    assert_eq!(outcome, DispatchOutcome::Terminate);
+    assert!(matches!(outcome, DispatchOutcome::Terminate { .. }));
     assert_eq!(end_pc, code.len());
     let (finish_value, finish_ty) =
-        fbw_finish_payload_take().expect("ref_return must stash the seeded exception");
+        finish_payload_of(&outcome).expect("ref_return must stash the seeded exception");
     assert_eq!(finish_ty, Type::Ref);
     assert_eq!(
         tc.box_value(finish_value),
