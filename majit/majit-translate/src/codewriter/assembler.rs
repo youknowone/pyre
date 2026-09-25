@@ -1757,11 +1757,21 @@ impl Assembler {
             // same `arraydescrof(item_ty, array_type_id, len_offset=Some(0))`
             // shape `ArrayRead`/`ArrayWrite` mint for the length-prefixed
             // items block.
-            OpKind::NewArrayClear {
+            OpKind::NewArray {
+                length,
+                item_ty,
+                array_type_id,
+            }
+            | OpKind::NewArrayClear {
                 length,
                 item_ty,
                 array_type_id,
             } => {
+                let opname = if matches!(op.kind, OpKind::NewArray { .. }) {
+                    "new_array"
+                } else {
+                    "new_array_clear"
+                };
                 let (reg, kc) = self.lookup_reg_with_kind_var(length, regallocs);
                 assert_eq!(
                     kc, 'i',
@@ -1790,7 +1800,7 @@ impl Assembler {
                 state.code.push(reg);
                 argcodes.push('>');
                 argcodes.push('r');
-                let key = format!("new_array_clear/{argcodes}");
+                let key = format!("{opname}/{argcodes}");
                 state.code[startposition] = self.get_opnum(&key);
             }
             // `newlist_clear/idddd>r` (`handler_newlist_clear`,
@@ -3263,6 +3273,7 @@ impl Assembler {
                 OpKind::GetSlice { .. } => "GetSlice",
                 OpKind::New { .. } => "New",
                 OpKind::NewWithVtable { .. } => "NewWithVtable",
+                OpKind::NewArray { .. } => "NewArray",
                 OpKind::NewArrayClear { .. } => "NewArrayClear",
                 OpKind::NewListClear { .. } => "NewListClear",
                 OpKind::LoweredBlackholeOp { .. } => "LoweredBlackholeOp",
@@ -5080,12 +5091,12 @@ fn arraydescrof(
             // ei_index across the BhDescr boundary so make_descr_from_bh
             // republishes it on the runtime SimpleArrayDescr.
             ei_index: descr.get_ei_index(),
-            // descr.py:348-360 cache identity — carry the codewriter
-            // `array_type_id` across the BhDescr boundary so the
-            // runtime `ArrayDescrKey` keeps two distinct ARRAY lltypes
-            // on distinct slots even when their structural tuples
-            // coincide (`type_id == 0` default, same item layout).
-            array_type_id: array_type_id.clone(),
+            // `cpu.arraydescrof` keys one ARRAY. `[i64]` / `GcArray<i64>`
+            // (and the f64 pair) are that one lltype, so the pool string
+            // is the canonical spelling `get_array_descr` hashed.
+            array_type_id: array_type_id
+                .as_ref()
+                .map(|id| crate::front::typestr::canonical_array_type_id(id).into_owned()),
             interior_fields: bh_interior_field_specs_from_array_descr(array_descr),
             is_gc_managed: array_descr.is_gc_managed(),
         };
@@ -5152,10 +5163,11 @@ fn arraydescrof(
         // path that needs EffectInfo heap invalidation must pass CallControl
         // so `arraydescrof_for_type` can publish the real `ei_index`.
         ei_index: u32::MAX,
-        // Codewriter-less fallback still carries the ARRAY identity
-        // string so the runtime registry keeps distinct lltypes
-        // distinct.
-        array_type_id: array_type_id.clone(),
+        // Same canonical spelling as the CallControl path: `[i64]` and
+        // `GcArray<i64>` (and the f64 pair) are one ARRAY.
+        array_type_id: array_type_id
+            .as_ref()
+            .map(|id| crate::front::typestr::canonical_array_type_id(id).into_owned()),
         interior_fields: Vec::new(),
         // Shape-only fallback is for GC arrays; the raw `pool_arrays`
         // base is minted only via `add_ptr_array_descr`.
@@ -5372,6 +5384,7 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         // encoded by their dedicated `encode_op` arms, never the
         // descriptor-less default path that calls this helper — these arms
         // exist only to keep the opname map exhaustive.
+        OpKind::NewArray { .. } => "new_array".into(),
         OpKind::NewArrayClear { .. } => "new_array_clear".into(),
         OpKind::NewListClear { .. } => "newlist_clear".into(),
         // RPython: getarrayitem_gc_i etc.

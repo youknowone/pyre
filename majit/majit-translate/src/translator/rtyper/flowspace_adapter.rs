@@ -3363,9 +3363,8 @@ fn post_rtyper_jtransform_variant_name(kind: &OpKind) -> Option<&'static str> {
         OpKind::Live => "Live (jtransform.py:469,481,533)",
         OpKind::JitMergePoint { .. } => "JitMergePoint (jtransform.py:1690-1718)",
         OpKind::LoopHeader { .. } => "LoopHeader (jtransform.py:1690-1718)",
-        OpKind::NewArrayClear { .. } => {
-            "NewArrayClear (jtransform.py:1858-1863 do_fixed_newlist_clear)"
-        }
+        OpKind::NewArray { .. } => "NewArray (jtransform.py do_fixed_newlist)",
+        OpKind::NewArrayClear { .. } => "NewArrayClear (jtransform.py do_fixed_newlist_clear)",
         OpKind::NewListClear { .. } => {
             "NewListClear (jtransform.py:1938-1943 do_resizable_newlist_clear)"
         }

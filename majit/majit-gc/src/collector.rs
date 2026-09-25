@@ -13897,6 +13897,18 @@ mod tests {
         gc.debug_check_consistency_at("unspecified");
     }
 
+    /// A headerless digit body is not a heap object. Its length word and the
+    /// digit 1 must not be read as a header or as a pointer.
+    #[test]
+    fn debug_check_ignores_headerless_digit_body() {
+        let mut gc = debug_gc(4096);
+        let block = Box::leak(Box::new([1usize, 1usize]));
+        let mut root = GcRef(block.as_mut_ptr() as usize);
+        unsafe { gc.roots.add(&mut root) };
+        gc.debug_check_consistency_at("unspecified");
+        gc.roots.clear();
+    }
+
     /// Without the level the body returns before the first assertion, so the
     /// same broken flag goes unreported.
     #[test]
