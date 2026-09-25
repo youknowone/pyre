@@ -5958,6 +5958,13 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
                         .entry(target_iarg.clone())
                         .or_default()
                         .push(arg_var.clone());
+                    // A void operand is omitted from `Call.args`
+                    // (`NON_VOID_ARGS`) but the definition still crosses
+                    // this edge. Keeping the target inputarg read retains
+                    // that `ConstNone` and the link that carries it.
+                    if FunctionGraph::concretetype_of(arg_var) == ConcreteType::Void {
+                        read_vars.insert(target_iarg.clone());
+                    }
                 }
             }
         }
