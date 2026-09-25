@@ -5216,7 +5216,7 @@ impl PyFrame {
 
     #[inline]
     pub fn failed_attr_after_stack_pop(&mut self) {
-        if !(1..=3).contains(&self.failed_attr_cleanup) {
+        if !matches!(self.failed_attr_cleanup, 1..=3) {
             return;
         }
         self.failed_attr_cleanup -= 1;
