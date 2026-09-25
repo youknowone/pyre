@@ -7926,6 +7926,15 @@ mod tests {
                 assert_eq!(w_long_get_raw_value(result), payload);
             }
 
+            // Two nonzero operands: `bigint_add` allocates the sum.
+            let other = w_long_new(magnitude.lshift(3).unwrap());
+            let other_payload = w_long_get_raw_value(other);
+            let sum = long_add(value, other).unwrap();
+            let sum_payload = w_long_get_raw_value(sum);
+            assert_ne!(sum_payload, payload);
+            assert_ne!(sum_payload, other_payload);
+            assert!(w_long_get_value(sum).eq(&magnitude.add(&magnitude.lshift(3).unwrap())));
+
             // `rbigint.int_floordiv(1)` returns `self`, but the long-divisor
             // path goes through `rbigint.divmod` -> `int_divmod`, whose
             // quotient is freshly constructed.
