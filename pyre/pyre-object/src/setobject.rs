@@ -1206,6 +1206,101 @@ pub unsafe fn w_set_key_at(
     (*s.items).get_slot(slot).map(|(&key, _)| key)
 }
 
+/// `num_ever_used_items` (`rordereddict.py` `_ll_dictnext`): one past the
+/// highest slot a walk may name. Dead slots below it read as null from
+/// [`w_set_iterkey_at`].
+///
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`) so the
+/// entries-length read stays inside this residual and the caller's merge
+/// loop only sees a word.
+///
+/// # Safety
+/// `obj` must point to a valid `W_SetObject`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_set_num_ever_used_items(obj: *mut PyObject) -> usize {
+    let _set_guard = w_set_lock(obj);
+    let s = &*(obj as *const W_SetObject);
+    (*s.items).entry_slots()
+}
+
+/// One step of `iterkeys_with_hash` (`rlib/objectmodel.py`): the key stored
+/// at `index`, or null when that slot is dead or past the end.
+///
+/// The slot read (`RDict::get_slot`, the `get_index` lookup the merge used to
+/// inline) is residual (`@jit.dont_look_inside`, `rlib/jit.py`) so a traced
+/// merge loop does not lower it. The digest half is [`w_set_iterkey_hash_at`].
+/// Parameters are `*mut PyObject` so the word-ABI trampoline is emitted; a
+/// `PyObjectRef` alias is not that token.
+///
+/// # Safety
+/// `obj` must point to a valid `W_SetObject`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_set_iterkey_at(obj: *mut PyObject, index: usize) -> *mut PyObject {
+    let _set_guard = w_set_lock(obj);
+    let s = &*(obj as *const W_SetObject);
+    match (*s.items).get_slot(index) {
+        Some((key, _)) => key.obj,
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Digest half of [`w_set_iterkey_at`]. Only meaningful when that call
+/// returned a key. Same residual boundary.
+///
+/// # Safety
+/// `obj` must point to a valid `W_SetObject`, and `index` must name a live slot.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_set_iterkey_hash_at(obj: *mut PyObject, index: usize) -> i64 {
+    let _set_guard = w_set_lock(obj);
+    let s = &*(obj as *const W_SetObject);
+    match (*s.items).get_slot(index) {
+        Some((key, _)) => key.hash,
+        None => 0,
+    }
+}
+
+/// `contains_with_hash` (`rlib/objectmodel.py` / `ll_dict_contains_with_hash`).
+///
+/// Returns `1` when present, `0` when absent, and `-1` when user `__eq__`
+/// raised. The concrete exception stays in the pending dict-key slot, the
+/// same channel [`w_set_contains_key_checked`] uses. The reentrant scan lives
+/// inside this residual so the caller's loop does not lower it.
+///
+/// # Safety
+/// `obj` must point to a valid `W_SetObject`, and `hash` must be the digest
+/// `key` was stored under.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_set_contains_with_hash(obj: *mut PyObject, key: *mut PyObject, hash: i64) -> i64 {
+    match w_set_contains_key_checked(obj, crate::dictmultiobject::ObjectKey { hash, obj: key }) {
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// `setitem_with_hash` (`rlib/objectmodel.py` / `ll_dict_setitem_with_hash`)
+/// placing `None` as the set value.
+///
+/// Returns `0` on success, `-1` when user `__eq__` raised (the exception is
+/// in the pending dict-key slot), and `-2` when a callback resized the table
+/// (`SetUpdateError::ChangedSize`). Absence was
+/// already decided by [`w_set_contains_with_hash`]; insertion still probes,
+/// because a callback may have changed the table, and that probe is
+/// [`w_set_insert_key_checked`] (callback-free, then
+/// [`scan_set_key_reentrant`]).
+///
+/// # Safety
+/// `obj` must point to a valid `W_SetObject`, and `hash` must be the digest
+/// `key` was stored under.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_set_setitem_with_hash(obj: *mut PyObject, key: *mut PyObject, hash: i64) -> i64 {
+    match w_set_insert_key_checked(obj, crate::dictmultiobject::ObjectKey { hash, obj: key }) {
+        Ok(()) => 0,
+        Err(SetUpdateError::Key(_)) => -1,
+        Err(SetUpdateError::ChangedSize) => -2,
+    }
+}
+
 /// Snapshot the contained elements as a `Vec`.
 ///
 /// # Safety

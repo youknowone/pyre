@@ -3072,7 +3072,7 @@ pub unsafe fn w_dict_store_checked(
     value: PyObjectRef,
 ) -> Result<(), DictKeyError> {
     lock_dict_refs!(_dict_guard, obj, key, value);
-    w_dict_store_checked_inner(obj, key, value, None)
+    w_dict_store_checked_inner(obj, key, value, 0, 0)
 }
 
 /// [`w_dict_store_checked`] keyed on a `space.hash_w` digest the caller
@@ -3089,14 +3089,15 @@ pub unsafe fn w_dict_store_hashed_checked(
     hash: i64,
 ) -> Result<(), DictKeyError> {
     lock_dict_refs!(_dict_guard, obj, key, value);
-    w_dict_store_checked_inner(obj, key, value, Some(hash))
+    w_dict_store_checked_inner(obj, key, value, hash, 1)
 }
 
 unsafe fn w_dict_store_checked_inner(
     mut obj: PyObjectRef,
     key: PyObjectRef,
     mut value: PyObjectRef,
-    hash: Option<i64>,
+    keyhash: i64,
+    hash_known: i64,
 ) -> Result<(), DictKeyError> {
     debug_assert!(!value.is_null(), "w_dict_store_checked: null value");
     if is_module_dict(obj) {
@@ -3106,14 +3107,14 @@ unsafe fn w_dict_store_checked_inner(
     let strategy = dstrategy.imp;
     if strategy_is(dstrategy, StrategyKind::Empty) {
         crate::dictmultiobject::EMPTY_DICT_STRATEGY.switch_to_correct_strategy(obj, key);
-        return w_dict_store_checked_inner(obj, key, value, hash);
+        return w_dict_store_checked_inner(obj, key, value, keyhash, hash_known);
     }
     if strategy_is(dstrategy, StrategyKind::EmptyKwargs) {
         crate::dictmultiobject::EMPTY_KWARGS_DICT_STRATEGY.switch_to_correct_strategy(obj, key);
-        return w_dict_store_checked_inner(obj, key, value, hash);
+        return w_dict_store_checked_inner(obj, key, value, keyhash, hash_known);
     }
     if strategy_is(dstrategy, StrategyKind::Object) {
-        return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
+        return w_dict_store_object_strategy_checked_inner(obj, key, value, keyhash, hash_known);
     }
     if strategy_is(dstrategy, StrategyKind::Bytes) {
         if crate::is_bytes(key) {
@@ -3121,13 +3122,13 @@ unsafe fn w_dict_store_checked_inner(
             return Ok(());
         }
         crate::with_roots!(obj, value => strategy.switch_to_object_strategy(obj));
-        return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
+        return w_dict_store_object_strategy_checked_inner(obj, key, value, keyhash, hash_known);
     }
     if strategy_is(dstrategy, StrategyKind::Unicode) {
         if !crate::is_exact_type(key, &crate::STR_TYPE) {
             w_dict_set_strategy(obj, &crate::dictmultiobject::OBJECT_DICT_STRATEGY_REF);
         }
-        return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
+        return w_dict_store_object_strategy_checked_inner(obj, key, value, keyhash, hash_known);
     }
     if strategy_is(dstrategy, StrategyKind::Int) {
         if crate::listobject::is_plain_int1(key) {
@@ -3135,7 +3136,7 @@ unsafe fn w_dict_store_checked_inner(
             return Ok(());
         }
         crate::with_roots!(obj, value => strategy.switch_to_object_strategy(obj));
-        return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
+        return w_dict_store_object_strategy_checked_inner(obj, key, value, keyhash, hash_known);
     }
     if strategy_is(dstrategy, StrategyKind::Identity) {
         if key_compares_by_identity(key) {
@@ -3143,7 +3144,7 @@ unsafe fn w_dict_store_checked_inner(
             return Ok(());
         }
         crate::with_roots!(obj, value => strategy.switch_to_object_strategy(obj));
-        return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
+        return w_dict_store_object_strategy_checked_inner(obj, key, value, keyhash, hash_known);
     }
     if strategy_is(dstrategy, StrategyKind::Kwargs) {
         if crate::is_exact_type(key, &crate::STR_TYPE) {
@@ -3151,7 +3152,7 @@ unsafe fn w_dict_store_checked_inner(
             return Ok(());
         }
         crate::with_roots!(obj, value => strategy.switch_to_object_strategy(obj));
-        return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
+        return w_dict_store_object_strategy_checked_inner(obj, key, value, keyhash, hash_known);
     }
     if strategy.strategy_kind() == StrategyKind::Map {
         // mapdict.py MapDictStrategy.setitem — exact str keys stay
@@ -3166,7 +3167,7 @@ unsafe fn w_dict_store_checked_inner(
             return Ok(());
         }
         crate::with_roots!(obj, value => strategy.switch_to_object_strategy(obj));
-        return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
+        return w_dict_store_object_strategy_checked_inner(obj, key, value, keyhash, hash_known);
     }
     strategy.setitem(obj, key, value);
     if take_dict_key_error() {
@@ -3466,36 +3467,51 @@ pub unsafe fn w_dict_store_object_strategy_checked(
     value: PyObjectRef,
 ) -> Result<(), DictKeyError> {
     lock_dict_refs!(_dict_guard, obj, key, value);
-    w_dict_store_object_strategy_checked_inner(obj, key, value, None)
+    w_dict_store_object_strategy_checked_inner(obj, key, value, 0, 0)
 }
 
-unsafe fn w_dict_store_object_strategy_checked_inner(
-    obj: PyObjectRef,
-    key: PyObjectRef,
-    value: PyObjectRef,
-    hash: Option<i64>,
-) -> Result<(), DictKeyError> {
+/// Callback-free half of `ll_dict_setitem` (`rordereddict.py`
+/// `_ll_dict_setitem_lookup_done`).
+///
+/// Returns `0` when the entry was written, `1` when a comparison left the
+/// builtin ladder and the caller must rerun through
+/// [`w_dict_object_setitem_reentrant`], and `-1` when `__hash__` or `__eq__`
+/// raised. The concrete exception stays in the pending dict-key slot.
+/// `hash_known == 0` hashes `key` once and writes that digest to `hash_out`
+/// so the reentrant retry does not call `__hash__` again.
+///
+/// The table probe is residual (`@jit.dont_look_inside`, `rlib/jit.py`): the
+/// entry array and the `ObjectKey` pair stay inside this leaf, and the
+/// caller's store only sees a word. Parameters are `*mut PyObject` so the
+/// word-ABI trampoline is emitted.
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject`. `hash_out` must be non-null.
+/// When `hash_known != 0`, `hash` is the digest `key` was stored under.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_dict_object_setitem_callback_free(
+    obj: *mut PyObject,
+    key: *mut PyObject,
+    hash: i64,
+    hash_known: i64,
+    value: *mut PyObject,
+    hash_out: *mut i64,
+) -> i64 {
     debug_assert!(!value.is_null(), "w_dict_store_object_strategy: null value");
-    // `object_key_for_checked` hashes through the key's `__hash__`, so it is a
-    // collection point; the caller's `lock_dict_refs!` bindings are raw copies
-    // taken before it. Publish the receiver and the value here and reload them
-    // once the key exists, or the insert below writes a moved `value` and
-    // reaches the `IndexMap` through the dict's pre-move address.
     let _roots = crate::gc_roots::push_roots();
     let obj_slot = crate::gc_roots::pin_roots(&[obj, value]);
     let value_slot = obj_slot + 1;
-    let object_key = match hash {
-        Some(hash) => object_key_hashed(key, hash),
-        None => object_key_for_checked(key)?,
+    let object_key = if hash_known != 0 {
+        object_key_hashed(key, hash)
+    } else {
+        match object_key_for_checked(key) {
+            Ok(object_key) => object_key,
+            Err(_) => return -1,
+        }
     };
+    *hash_out = object_key.hash;
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let value = crate::gc_roots::shadow_stack_get(value_slot);
-    // Single setitem probe (matches `r_dict.setitem`'s one bucket scan), run
-    // callback-free so no user `__eq__` mutates the dict while the `IndexMap`
-    // borrow is live.  When every same-hash comparison stays inside the
-    // builtin ladder the probe updates or appends in place; a pair it cannot
-    // decide breaks the probe, withholds the store, and re-runs it over
-    // `scan_dict_key_reentrant`.
     if let Some(result) = callback_free_dict_op!({
         let dict = &mut *(obj as *mut W_DictObject);
         let entries = &mut *(dict.dstorage as *mut ObjectDictStorage);
@@ -3513,16 +3529,38 @@ unsafe fn w_dict_store_object_strategy_checked_inner(
             dict_write_barrier(obj);
         }
     }) {
-        return result;
+        return match result {
+            Ok(()) => 0,
+            Err(_) => -1,
+        };
     }
+    1
+}
 
-    // `value` is a native local held across the scan; a mid-scan GC in a
-    // probing `__eq__` could move it before the overwrite/insert below, so pin
-    // and reload it alongside the container the scan returns.
+/// Reentrant half of `ll_dict_setitem`: [`scan_dict_key_reentrant`] then the
+/// overwrite or the callback-free placement insert. Same status word as
+/// [`w_dict_object_setitem_callback_free`], except `1` is not returned — the
+/// scan already decided equality. The fat `(slot, ObjectKey)` pair never
+/// leaves this residual.
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject`, and `hash` must be the digest
+/// already computed for `key`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_dict_object_setitem_reentrant(
+    obj: *mut PyObject,
+    key: *mut PyObject,
+    hash: i64,
+    value: *mut PyObject,
+) -> i64 {
+    let object_key = object_key_hashed(key, hash);
     let _value_root = crate::gc_roots::push_roots();
     let value_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(value);
-    let (found, object_key, obj) = scan_dict_key_reentrant(obj, object_key)?;
+    let (found, object_key, obj) = match scan_dict_key_reentrant(obj, object_key) {
+        Ok(found) => found,
+        Err(_) => return -1,
+    };
     let value = crate::gc_roots::shadow_stack_get(value_slot);
     match found {
         Some(i) => {
@@ -3531,9 +3569,6 @@ unsafe fn w_dict_store_object_strategy_checked_inner(
             *entries.get_slot_mut(i).unwrap().1 = value;
         }
         None => {
-            // The scan proved inequality against every same-hash key.  Keep
-            // IndexMap's placement probe callback-free so any comparison
-            // outside the builtin ladder answers false, reproducing that scan.
             crate::dict_eq_hook::begin_callback_free_probe();
             let dict = &mut *(obj as *mut W_DictObject);
             let entries = &mut *(dict.dstorage as *mut ObjectDictStorage);
@@ -3543,6 +3578,34 @@ unsafe fn w_dict_store_object_strategy_checked_inner(
         }
     }
     dict_write_barrier(obj);
+    0
+}
+
+unsafe fn w_dict_store_object_strategy_checked_inner(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+    value: PyObjectRef,
+    hash: i64,
+    hash_known: i64,
+) -> Result<(), DictKeyError> {
+    debug_assert!(!value.is_null(), "w_dict_store_object_strategy: null value");
+    // `ll_dict_setitem`: one callback-free bucket scan, then the paranoia
+    // restart when a comparison leaves the builtin ladder. Both probes are
+    // residual leaves; this function only branches on the status word.
+    // The digest arrives as a word. Matching `Option<i64>` is a classdef-less
+    // `__pos_0` read, which phase A cannot lower.
+    let mut keyhash = hash;
+    let probed =
+        w_dict_object_setitem_callback_free(obj, key, keyhash, hash_known, value, &mut keyhash);
+    if probed < 0 {
+        return Err(DictKeyError);
+    }
+    if probed == 0 {
+        return Ok(());
+    }
+    if w_dict_object_setitem_reentrant(obj, key, keyhash, value) < 0 {
+        return Err(DictKeyError);
+    }
     Ok(())
 }
 
@@ -3580,6 +3643,37 @@ pub unsafe fn w_module_dict_store_inner(obj: PyObjectRef, key: PyObjectRef, valu
     dict_write_barrier(obj);
 }
 
+/// Object-strategy `ll_dict_setitem` for a module dict that has already
+/// switched. Returns `0` on success and `-1` when `__hash__` or `__eq__`
+/// raised. A raising probe that appended a spurious entry is popped, matching
+/// the previous inline body. The `ObjectKey` and the entry array stay inside
+/// this residual.
+///
+/// # Safety
+/// `obj` must point to a valid object-strategy `W_ModuleDictObject`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_module_dict_store_object_key(
+    obj: *mut PyObject,
+    key: *mut PyObject,
+    value: *mut PyObject,
+) -> i64 {
+    let object_key = match object_key_for_checked(key) {
+        Ok(object_key) => object_key,
+        Err(_) => return -1,
+    };
+    let entries = w_module_dict_object_storage_mut(obj);
+    let previous = dict_entries_insert_hashed(entries, object_key.hash, object_key.obj, value);
+    if take_dict_key_error() {
+        dict_entries_pop_last(entries);
+        return -1;
+    }
+    if previous.is_none() {
+        w_dict_bump_keys_version(obj);
+    }
+    dict_write_barrier(obj);
+    0
+}
+
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
@@ -3589,6 +3683,8 @@ pub unsafe fn w_module_dict_store_inner_checked(
     value: PyObjectRef,
 ) -> Result<(), DictKeyError> {
     lock_dict_refs!(_module_guard, obj, key, value);
+    // `celldict.py` `ModuleDictStrategy.setitem_str` stays in this graph.
+    // A non-str key promotes, then one object-strategy `ll_dict_setitem`.
     if !w_module_dict_is_object_strategy(obj)
         && let Some(ks) = key_as_utf8(key)
     {
@@ -3598,22 +3694,12 @@ pub unsafe fn w_module_dict_store_inner_checked(
     if !w_module_dict_is_object_strategy(obj) {
         w_module_dict_switch_to_object_strategy(obj);
     }
-    let object_key = object_key_for_checked(key)?;
     let obj = _module_guard.root(0);
+    let key = _module_guard.root(1);
     let value = _module_guard.root(2);
-    let entries = w_module_dict_object_storage_mut(obj);
-    // Single setitem probe; on an `__eq__` raise mid-probe `insert` appends
-    // a spurious entry, so drop it with `pop` and leave the dict unchanged
-    // (see `w_dict_store_object_strategy_checked`).
-    let previous = dict_entries_insert_hashed(entries, object_key.hash, object_key.obj, value);
-    if take_dict_key_error() {
-        dict_entries_pop_last(entries);
+    if w_module_dict_store_object_key(obj, key, value) < 0 {
         return Err(DictKeyError);
     }
-    if previous.is_none() {
-        w_dict_bump_keys_version(obj);
-    }
-    dict_write_barrier(obj);
     Ok(())
 }
 
