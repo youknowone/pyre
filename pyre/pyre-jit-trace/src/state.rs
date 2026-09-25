@@ -5703,7 +5703,7 @@ fn clobbered_locals_slots(
         .collect()
 }
 
-pub(crate) fn flush_locals_region_to_frame(ctx: &TraceCtx, frame: usize) -> bool {
+pub(crate) fn flush_locals_region_to_frame(ctx: &TraceCtx, mut frame: usize) -> bool {
     if frame == 0 {
         return false;
     }
@@ -5749,10 +5749,11 @@ pub(crate) fn flush_locals_region_to_frame(ctx: &TraceCtx, frame: usize) -> bool
         // Boxing an Int/Float slot allocates. A JIT-created frame can be
         // nursery-resident, so a minor collection here moves it; store
         // through the frame's current address and its current array.
-        let frame_now =
-            pyre_object::gc_hook::try_gc_current_object_address(frame as *mut u8) as usize;
+        // The forwarding word is readable only until the next minor
+        // collection, so carry the current address into the next slot.
+        frame = pyre_object::gc_hook::try_gc_current_object_address(frame as *mut u8) as usize;
         let arr_ptr = unsafe {
-            *((frame_now as *const u8).add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            *((frame as *const u8).add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
                 as *const *mut pyre_object::FixedObjectArray)
         };
         unsafe {
@@ -5760,7 +5761,7 @@ pub(crate) fn flush_locals_region_to_frame(ctx: &TraceCtx, frame: usize) -> bool
         }
         // Each minor collection consumes the array's remembered-set entry,
         // so re-arm per store.
-        frame_array_write_barrier(frame_now as *mut u8, arr_ptr);
+        frame_array_write_barrier(frame as *mut u8, arr_ptr);
     }
     if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
         eprintln!("[fbw-flush] locals-region written: nlocals={nlocals} clobbered={clobbered:?}");
@@ -5795,6 +5796,7 @@ pub(crate) fn flush_known_locals_region_to_frame(ctx: &TraceCtx, frame: usize) -
         return Vec::new();
     }
     let mut written = Vec::new();
+    let mut frame = frame;
     for abs in 0..nlocals {
         let Some((_opref, value)) = ctx.virtualizable_entry_at(base + abs) else {
             continue;
@@ -5805,12 +5807,10 @@ pub(crate) fn flush_known_locals_region_to_frame(ctx: &TraceCtx, frame: usize) -
         if matches!(value, Value::Ref(gc) if gc == majit_ir::GcRef::NO_CONCRETE) {
             continue;
         }
-        let boxed = boxed_slot_value_for_type(Type::Ref, &value);
-        unsafe {
-            (*arr_ptr).as_mut_slice()[abs] = boxed;
+        if let Some(frame_now) = store_boxed_frame_local(frame, abs, &value) {
+            frame = frame_now;
+            written.push(abs as i64);
         }
-        frame_array_write_barrier(frame as *mut u8, arr_ptr);
-        written.push(abs as i64);
     }
     written
 }
@@ -5840,12 +5840,35 @@ pub(crate) fn store_frame_local_value(frame: usize, abs: usize, value: &Value) -
     if arr_ptr.is_null() || unsafe { &*arr_ptr }.as_slice().len() <= abs {
         return false;
     }
+    store_boxed_frame_local(frame, abs, value).is_some()
+}
+
+/// Boxing an Int/Float local allocates. A nursery-resident frame moves in
+/// that minor collection, so the pre-allocation locals array and frame are
+/// both stale. Re-read the forwarded frame, then store and barrier that
+/// address. Returns the frame's current address: the forwarding word is only
+/// readable until the next minor collection reuses the old slot, so a caller
+/// that stores again must pass this address, not the one it started with.
+fn store_boxed_frame_local(frame: usize, abs: usize, value: &Value) -> Option<usize> {
     let boxed = boxed_slot_value_for_type(Type::Ref, value);
+    let frame_now = pyre_object::gc_hook::try_gc_current_object_address(frame as *mut u8) as usize;
+    // A reused nursery slot's forwarding word is the debug fill. That
+    // address is not a live object; writing through it faults.
+    if frame_now == 0 || !pyre_object::gc_hook::try_gc_owns_object(frame_now as *mut u8) {
+        return None;
+    }
+    let arr_ptr = unsafe {
+        *((frame_now as *const u8).add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            as *const *mut pyre_object::FixedObjectArray)
+    };
+    if arr_ptr.is_null() || unsafe { &*arr_ptr }.as_slice().len() <= abs {
+        return None;
+    }
     unsafe {
         (*arr_ptr).as_mut_slice()[abs] = boxed;
     }
-    frame_array_write_barrier(frame as *mut u8, arr_ptr);
-    true
+    frame_array_write_barrier(frame_now as *mut u8, arr_ptr);
+    Some(frame_now)
 }
 
 /// gh#467 forward-flush AT an inlined-callee CALL boundary.  When an
@@ -5942,16 +5965,20 @@ pub(crate) fn flush_walk_end_state_at_outer_call(
     frame_array_write_barrier(frame as *mut u8, arr_ptr);
     // Commit the locals from the shadow, re-reading per slot.
     let clobbered = clobbered_locals_slots(ctx, arr_ptr, base, nlocals);
+    let mut frame = frame;
     for abs in 0..nlocals {
         let Some((_opref, value)) = ctx.virtualizable_entry_at(base + abs) else {
             return false;
         };
-        let boxed = boxed_slot_value_for_type(Type::Ref, &value);
-        unsafe {
-            (*arr_ptr).as_mut_slice()[abs] = boxed;
-        }
-        frame_array_write_barrier(frame as *mut u8, arr_ptr);
+        let Some(frame_now) = store_boxed_frame_local(frame, abs, &value) else {
+            return false;
+        };
+        frame = frame_now;
     }
+    let arr_ptr = unsafe {
+        *((frame as *const u8).add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            as *const *mut pyre_object::FixedObjectArray)
+    };
     unsafe {
         let pf = &mut *(frame as *mut PyFrame);
         pf.valuestackdepth = end_vsd;
@@ -6405,22 +6432,26 @@ pub(crate) fn can_write_back_outer_locals(ctx: &TraceCtx, frame: usize) -> bool 
 }
 
 pub(crate) fn write_back_outer_locals(ctx: &TraceCtx, frame: usize) -> bool {
-    let Some((nlocals, arr_ptr, base)) = outer_locals_publish_target(ctx, frame) else {
+    let Some((nlocals, _arr_ptr, base)) = outer_locals_publish_target(ctx, frame) else {
         return false;
     };
     // Boxing an Int/Float slot allocates; the detached frame array is
     // forwarded only while it is in the remembered set, and each minor
     // consumes that entry, so re-arm the barrier after every store.
+    let mut frame = frame;
     for abs in 0..nlocals {
         let (_opref, value) = ctx
             .virtualizable_entry_at(base + abs)
             .expect("outer-locals target was completely preflighted");
-        let boxed = boxed_slot_value_for_type(Type::Ref, &value);
-        unsafe {
-            (*arr_ptr).as_mut_slice()[abs] = boxed;
-        }
-        frame_array_write_barrier(frame as *mut u8, arr_ptr);
+        let Some(frame_now) = store_boxed_frame_local(frame, abs, &value) else {
+            return false;
+        };
+        frame = frame_now;
     }
+    let arr_ptr = unsafe {
+        *((frame as *const u8).add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            as *const *mut pyre_object::FixedObjectArray)
+    };
     frame_array_write_barrier(frame as *mut u8, arr_ptr);
     true
 }
