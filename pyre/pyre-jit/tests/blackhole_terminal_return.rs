@@ -79,8 +79,7 @@ fn terminal_ref_return_finishes_the_frame_and_leaves_its_execution_scope() {
                 }
                 writer.append_int(0); // no virtualrefs
                 writer.append_int(index as i64);
-                writer.append_int(0); // -live- position
-                writer.append_int(0); // Python position
+                writer.append_int(0); // -live- position (`ResumeDataLoopMemo.number`)
                 writer.append_int(tag(0, TAGBOX).unwrap() as i64); // ref register 0
                 writer.patch_current_size(0);
 

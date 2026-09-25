@@ -359,9 +359,6 @@ pub struct RebuiltFrame {
     pub jitcode_index: i32,
     /// resume.py:250 `pc` — the JitCode byte offset.
     pub pc: i32,
-    /// Forward-carried Python instruction PC; `-1` is the no-snapshot
-    /// sentinel paired with `pc == -1`.
-    pub py_pc: i32,
     pub values: Vec<RebuiltValue>,
 }
 
@@ -449,16 +446,16 @@ pub fn decode_tagged_value(
 
 /// Decode rd_numb back into vable/vref values and per-frame tagged values.
 ///
-/// resume.py:249-253, resume.py:1049-1055: RPython encodes frames as
-/// `jitcode_index, pc, py_pc, [tagged_values...]` and uses jitcode liveness
-/// (`get_current_position_info`) at the decode site to know how many
-/// values each frame has.
+/// resume.py `ResumeDataLoopMemo.number` / `ResumeDataDirectReader.read_jitcode_pos_pc`:
+/// frames are `jitcode_index, pc, [tagged_values...]`. Liveness
+/// (`get_current_position_info`) at the decode site says how many values
+/// each frame has.
 ///
 /// `frame_value_count`: when `Some(f)`, `f(jitcode_index, pc)`
 /// returns the number of tagged values for that frame (RPython parity:
 /// liveness-driven decode). When `None`, all remaining items after
-/// `(jitcode_index, pc, py_pc)` are consumed as a single frame (backward-compat for
-/// callers that only ever see single-frame data).
+/// `(jitcode_index, pc)` are consumed as a single frame (callers that only
+/// ever see single-frame data).
 ///
 /// `fail_arg_types`: parent guard's per-failarg type vector. resume.py:1245
 /// `decode_box(num, kind)` parity — TAGBOX values use this to fill in their
@@ -510,8 +507,8 @@ pub fn rebuild_from_numbering(
         ));
     }
 
-    // Pyre M73: frame section — jitcode_index, pc, py_pc, [tagged_values...].
-    // RPython uses consume_one_section → enumerate_vars(liveness) to split frames.
+    // resume.py number: jitcode_index, pc, [tagged_values...].
+    // consume_one_section → enumerate_vars(liveness) splits frames.
     let mut frames = Vec::new();
     while reader.items_read < total_size as usize && reader.has_more() {
         let jitcode_index = reader.next_item();
@@ -519,11 +516,6 @@ pub fn rebuild_from_numbering(
             reader.next_item()
         } else {
             0
-        };
-        let py_pc = if reader.has_more() && reader.items_read < total_size as usize {
-            reader.next_item()
-        } else {
-            -1
         };
         let box_count = if let Some(f) = &frame_value_count {
             // RPython parity: liveness-driven frame boundary.
@@ -549,7 +541,6 @@ pub fn rebuild_from_numbering(
         frames.push(RebuiltFrame {
             jitcode_index,
             pc,
-            py_pc,
             values,
         });
     }

@@ -183,14 +183,8 @@ pub type VirtualFieldSource = ResumeValueSource;
 pub struct FrameInfo {
     /// resume.py:250 jitcode_index — index into metainterp_sd.jitcodes[].
     pub jitcode_index: i32,
-    /// Bytecode position (program counter) for this frame.  In RPython
-    /// this slot carries the JitCode byte offset; pyre's deviation
-    /// populates it with the Python bytecode PC because pyre's tracer
-    /// records Python bytecode rather than JitCode.
+    /// JitCode byte offset (`resume.py` `ResumeDataLoopMemo.number`).
     pub pc: u64,
-    /// Forward-carried Python instruction PC. `-1` is the no-snapshot
-    /// sentinel and must round-trip through every resume encoder unchanged.
-    pub py_pc: i32,
     /// Mapping from slot index to a tagged resume source.
     pub slot_map: Vec<FrameSlotSource>,
 }

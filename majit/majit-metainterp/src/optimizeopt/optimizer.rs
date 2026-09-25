@@ -516,7 +516,7 @@ pub struct Optimizer {
     /// section. opencoder.py create_top_snapshot records vref_boxes
     /// alongside vable_boxes.
     pub snapshot_vref_boxes: SnapshotBoxes,
-    /// Per-guard per-frame (jitcode_index, pc, py_pc) from tracing-time snapshots.
+    /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
     pub snapshot_frame_pcs: SnapshotFramePcs,
     /// Byte-mode bridge only. `store_final_boxes_in_guard` numbers one
     /// guard from `SnapshotIterator` through this source. Loop compile and
