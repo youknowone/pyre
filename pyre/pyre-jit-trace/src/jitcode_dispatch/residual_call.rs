@@ -289,6 +289,11 @@ pub(crate) fn current_inline_concrete_frame() -> usize {
 
 pub(crate) struct EscapeFlushUndo {
     frame: usize,
+    /// Owner-root for `frame`. A minor collection forwards the nursery
+    /// object and then poisons the old address, so a later
+    /// `gc_current_object_address` on the captured word cannot find it.
+    /// [`Self::current_frame`] re-reads the slot the collector updates.
+    frame_root: Option<majit_gc::shadow_stack::OwnerRootGuard>,
     last_instr: isize,
     valuestackdepth: usize,
     pub(crate) slots: Vec<pyre_object::PyObjectRef>,
@@ -297,6 +302,54 @@ pub(crate) struct EscapeFlushUndo {
     /// after the capture; empty means no flush image was recorded, and the
     /// restore then puts every captured slot back as it always did.
     pub(crate) flush_image: Vec<pyre_object::PyObjectRef>,
+}
+
+impl EscapeFlushUndo {
+    /// Address of the frame now. The captured word stays the identity the
+    /// guards compare; dereferences go through the root.
+    fn current_frame(&self) -> usize {
+        self.frame_root
+            .as_ref()
+            .map(|root| root.get().0)
+            .unwrap_or(self.frame)
+    }
+}
+
+fn owner_root_if_gc(addr: usize) -> Option<majit_gc::shadow_stack::OwnerRootGuard> {
+    (addr != 0 && majit_gc::gc_owns_object(addr))
+        .then(|| majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(addr)))
+}
+
+/// Owner-root for the walk's live frame across one residual.
+///
+/// The call collects. Afterwards the nursery word is poison, and
+/// `gc_current_object_address` cannot recover the new address. Drop
+/// publishes the forwarded word back onto the snapshot so the next
+/// residual does not start from the abandoned address.
+struct LiveFrameRoot<Sym: WalkSym> {
+    root: Option<majit_gc::shadow_stack::OwnerRootGuard>,
+    sym: *mut Sym,
+}
+
+impl<Sym: WalkSym> LiveFrameRoot<Sym> {
+    fn current(&self, fallback: usize) -> usize {
+        self.root
+            .as_ref()
+            .map(|root| root.get().0)
+            .unwrap_or(fallback)
+    }
+}
+
+impl<Sym: WalkSym> Drop for LiveFrameRoot<Sym> {
+    fn drop(&mut self) {
+        let Some(root) = self.root.as_ref() else {
+            return;
+        };
+        let now = root.get().0;
+        if now != 0 && !self.sym.is_null() {
+            unsafe { (*self.sym).set_live_vable_frame_addr(now) };
+        }
+    }
 }
 
 /// The operand stack an abort image publishes, resolved from the walker's
@@ -1450,6 +1503,9 @@ pub(super) fn finalize_published_last_instr(frame: usize, last_instr: isize) {
 /// Leaving the executing value behind makes an abort replay one opcode late.
 struct LiveLastInstrGuard {
     frame: *mut pyre_interpreter::PyFrame,
+    /// Re-read on drop. `frame` is the address at enter and is what the
+    /// publication cell compares; the object may have moved.
+    frame_root: Option<majit_gc::shadow_stack::OwnerRootGuard>,
     saved: isize,
     prev: Option<(usize, isize)>,
 }
@@ -1482,6 +1538,7 @@ impl LiveLastInstrGuard {
         }
         let saved = unsafe { (*frame).last_instr };
         unsafe { (*frame).last_instr = py_pc as isize };
+        let frame_root = owner_root_if_gc(frame as usize);
         // Save/restore rather than set/clear: a residual can run user code that
         // records a nested walk whose own residual enters a second guard, and
         // clearing on the inner drop would leave the still-live outer
@@ -1490,7 +1547,12 @@ impl LiveLastInstrGuard {
         // Same discipline as [`InlineConcreteFrameGuard`] and
         // [`ResidualFrameChainGuard`].
         let prev = PUBLISHED_LAST_INSTR.with(|slot| slot.replace(Some((frame as usize, saved))));
-        Some(Self { frame, saved, prev })
+        Some(Self {
+            frame,
+            frame_root,
+            saved,
+            prev,
+        })
     }
 }
 
@@ -1517,7 +1579,12 @@ impl Drop for LiveLastInstrGuard {
             slot.borrow().as_ref().map(|undo| undo.frame) == Some(self.frame as usize)
         });
         if !flushed {
-            unsafe { (*self.frame).last_instr = restore };
+            let frame = self
+                .frame_root
+                .as_ref()
+                .map(|root| root.get().0 as *mut pyre_interpreter::PyFrame)
+                .unwrap_or(self.frame);
+            unsafe { (*frame).last_instr = restore };
         }
     }
 }
@@ -1954,6 +2021,7 @@ fn capture_escape_flush_undo(frame: usize) {
             .map_or(pf.last_instr, |(_, saved)| saved);
         *slot = Some(EscapeFlushUndo {
             frame,
+            frame_root: owner_root_if_gc(frame),
             last_instr,
             valuestackdepth: pf.valuestackdepth,
             slots: locals_w!(pf).as_slice().to_vec(),
@@ -1979,6 +2047,7 @@ fn capture_escape_flush_undo(frame: usize) {
 fn report_post_residual_shadow<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     live_frame: usize,
+    frame_root: Option<&majit_gc::shadow_stack::OwnerRootGuard>,
     before: Option<&[pyre_object::PyObjectRef]>,
 ) {
     let diag = fbw_debug_abort_enabled();
@@ -2002,7 +2071,10 @@ fn report_post_residual_shadow<Sym: WalkSym>(
     let flushed = ESCAPE_FLUSH_UNDO.with(|slot| {
         let slot = slot.borrow();
         slot.as_ref()
-            .filter(|undo| undo.frame == live_frame && !undo.flush_image.is_empty())
+            .filter(|undo| {
+                (undo.frame == live_frame || undo.current_frame() == live_frame)
+                    && !undo.flush_image.is_empty()
+            })
             .map(|undo| undo.flush_image.clone())
     });
     let baseline: &[pyre_object::PyObjectRef] = match (flushed.as_deref(), before) {
@@ -2026,7 +2098,9 @@ fn report_post_residual_shadow<Sym: WalkSym>(
         }
         return;
     }
-    let frame = live_frame;
+    // `flush_image.clone` above can collect. Re-read the owner root after
+    // that allocation; the address argument is the word from before it.
+    let frame = frame_root.map(|root| root.get().0).unwrap_or(live_frame);
     let pf = unsafe { &*(frame as *const pyre_interpreter::PyFrame) };
     let live = locals_w!(pf).as_slice();
     let n = live.len().min(baseline.len());
@@ -2246,14 +2320,13 @@ fn record_escape_flush_image(frame: usize) {
         let Some(undo) = slot.as_mut() else {
             return;
         };
-        if undo.frame != frame {
+        if undo.frame != frame && undo.current_frame() != frame {
             return;
         }
-        // The flush boxes Int/Float locals, and a minor collection there
-        // moves a nursery-resident frame; read the image from where the
-        // frame lives now, as `restore_escape_flush_undo` does.
-        let frame_now =
-            pyre_object::gc_hook::try_gc_current_object_address(frame as *mut u8) as usize;
+        // The flush boxes Int/Float locals and can collect. The captured
+        // address is not reloaded: the nursery stub is gone once the
+        // collection finishes. Read the owner root instead.
+        let frame_now = undo.current_frame();
         let pf = unsafe { &*(frame_now as *const pyre_interpreter::PyFrame) };
         undo.flush_image = locals_w!(pf).as_slice().to_vec();
     });
@@ -2269,12 +2342,10 @@ pub(crate) fn restore_escape_flush_undo() {
         let Some(undo) = slot.borrow_mut().take() else {
             return;
         };
-        // A JIT-created frame can be nursery-resident, and a minor collection
-        // between the flush and this restore drags it out, leaving a forwarding
-        // stub at the captured address.  Restoring through the stale address
-        // would write the abandoned copy and leave the live frame flushed.
-        let frame =
-            pyre_object::gc_hook::try_gc_current_object_address(undo.frame as *mut u8) as usize;
+        // A minor collection between the flush and this restore moves a
+        // nursery frame and then drops the forwarding stub. Re-read the
+        // owner root taken at capture; the captured word is the old address.
+        let frame = undo.current_frame();
         unsafe {
             let pf = &mut *(frame as *mut pyre_interpreter::PyFrame);
             let arr_ptr = pf.locals_cells_stack_w;
@@ -4387,6 +4458,11 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             majit_gc::gc_current_object_address(raw)
         }
     };
+    // See [`LiveFrameRoot`].
+    let live_frame_root = LiveFrameRoot {
+        root: owner_root_if_gc(live_frame),
+        sym: ctx.fbw_mode.snapshot_sym as *mut Sym,
+    };
     // Resolved against the callee's OWN metadata, because `vstack_cur_pypc` is
     // the outer walk's mirror and a sub-walk never advances it.
     let inline_callee_pc = inline_callee_py_pc(ctx, op_pc);
@@ -4540,15 +4616,12 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         || fbw_import_residual_locals_enabled())
         && is_may_force
         && live_frame != 0
-        && majit_gc::gc_owns_object(live_frame))
+        && majit_gc::gc_owns_object(live_frame_root.current(live_frame)))
     .then(|| unsafe {
-        // The residual is a collection point. `live_frame` is a raw
-        // copy of the virtualizable; follow the nursery stub before
-        // projecting `locals_cells_stack_w` (`incminimark`
-        // `gc_current_object_address`). A collected frame is refused
-        // by `gc_owns_object` above so this memcpy never runs on a
-        // from-space slice (exception_reused_object_tb_not_doubled).
-        let live_frame = majit_gc::gc_current_object_address(live_frame);
+        // Re-read the owner root. The captured word is not chased: a
+        // finished collection has already dropped the forwarding stub
+        // (exception_reused_object_tb_not_doubled).
+        let live_frame = live_frame_root.current(live_frame);
         let pf = &*(live_frame as *const pyre_interpreter::PyFrame);
         let snapshot = locals_w!(pf).as_slice().to_vec();
         let roots = pyre_object::gc_roots::push_roots();
@@ -4664,10 +4737,16 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         } else {
             live_py_pc_from_snapshot(ctx, op_pc).unwrap_or(ctx.vstack_cur_pypc)
         };
-        let _callee_last_instr =
-            LiveLastInstrGuard::enter(live_frame, live_py_pc, inline_callee_pc);
+        let _callee_last_instr = LiveLastInstrGuard::enter(
+            live_frame_root.current(live_frame),
+            live_py_pc,
+            inline_callee_pc,
+        );
         let _caller_last_instr = ctx.fbw_mode.inline_caller_py_pc.map(|py_pc| {
-            LiveLastInstrGuard::enter_frame(live_frame as *mut pyre_interpreter::PyFrame, py_pc)
+            LiveLastInstrGuard::enter_frame(
+                live_frame_root.current(live_frame) as *mut pyre_interpreter::PyFrame,
+                py_pc,
+            )
         });
         let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter(ctx.trace_ctx);
         majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args)
@@ -5011,7 +5090,12 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                     .map(|k| roots.get(base + k))
                     .collect::<Vec<pyre_object::PyObjectRef>>()
             });
-            report_post_residual_shadow(ctx, live_frame, residual_locals_before.as_deref());
+            report_post_residual_shadow(
+                ctx,
+                live_frame_root.current(live_frame),
+                live_frame_root.root.as_ref(),
+                residual_locals_before.as_deref(),
+            );
             if fbw_debug_abort_enabled() {
                 // `vable_after_residual_call`'s
                 // `debug_print('vable escaped during a call in %s')`: name the
@@ -5078,7 +5162,12 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // the slots the flush did not write).
     if let Some((roots, base, len)) = residual_locals_roots.take() {
         let before: Vec<pyre_object::PyObjectRef> = (0..len).map(|k| roots.get(base + k)).collect();
-        report_post_residual_shadow(ctx, live_frame, Some(&before));
+        report_post_residual_shadow(
+            ctx,
+            live_frame_root.current(live_frame),
+            live_frame_root.root.as_ref(),
+            Some(&before),
+        );
     }
     // A flush that ran without a forced abort (an unarmed token or a missing
     // vable root) must not leak the moved frame into the continuing walk.
