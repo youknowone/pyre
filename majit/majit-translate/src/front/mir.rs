@@ -11271,11 +11271,7 @@ impl<'a> Lowering<'a> {
                         && self.is_vec_index_call(&reg, second_arg_ty.as_ref())
                         && !reaches_declared_vable_array(&self.graph, &args[0])
                     {
-                        self.retarget_vec_part(
-                            bb_id,
-                            &args[0],
-                            crate::model::VecFieldPart::Buf,
-                        )
+                        self.retarget_vec_part(bb_id, &args[0], crate::model::VecFieldPart::Buf)
                     } else {
                         args[0].clone()
                     };
