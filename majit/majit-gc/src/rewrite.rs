@@ -627,13 +627,6 @@ struct RewriteState<'a> {
     /// live-track its producer instead of fabricating position-only
     /// boxes (#9 operand-union grind).
     out: Vec<majit_ir::OpRc>,
-    /// `pos -> emitted op` index over [`Self::out`], maintained by the two
-    /// `emit*` methods.  `emit_pending_zeros` resolves a delayed
-    /// zero-setfield's malloc base by position, and it is flushed at every
-    /// guard (rewrite.py:376-377), so scanning `out` for the producer made
-    /// the GC rewrite quadratic in trace length.  Void results share
-    /// `OpRef::NONE` and are not indexed.
-    out_by_pos: FxIndexMap<OpRef, majit_ir::OpRc>,
     /// Next position index for emitted result ops that do not have an
     /// explicit source position to preserve.
     next_pos: u32,
@@ -687,7 +680,9 @@ struct RewriteState<'a> {
     /// pending at the next can-collect / flush point is emitted as
     /// `GC_STORE(ptr, ofs, 0, WORD)` by `emit_pending_zeros`
     /// (rewrite.py:761-766).
-    _delayed_zero_setfields: FxIndexMap<OpRef, FxIndexSet<i64>>,
+    /// The dict key is the base box; the map keys it by position and keeps
+    /// the box beside its offsets so the flush stores through it.
+    _delayed_zero_setfields: FxIndexMap<OpRef, (Operand, FxIndexSet<i64>)>,
 
     // ── INT_ADD/INT_SUB constant-fold tracking (rewrite.py:64) ──
     /// `_constant_additions[box]` = `(older_box, constant_add)` for an
@@ -773,7 +768,6 @@ impl<'a> RewriteState<'a> {
             .map_or(0, |m| m + 1);
         RewriteState {
             out: Vec::with_capacity(hint + hint / 4),
-            out_by_pos: IndexMap::default(),
             next_pos,
             constants,
             pending_malloc_idx: None,
@@ -930,13 +924,13 @@ impl<'a> RewriteState<'a> {
     }
 
     fn push_emitted(&mut self, rc: OpRc, pos: OpRef) -> Operand {
-        self.out.push(rc.clone());
-        if pos.is_none() || rc.result_type() == Type::Void {
+        let result = if pos.is_none() || rc.result_type() == Type::Void {
             Operand::none()
         } else {
-            self.out_by_pos.insert(pos, rc.clone());
             Operand::from_bound_op(&rc)
-        }
+        };
+        self.out.push(rc);
+        result
     }
 
     /// rewrite.py `emit_op` — append `op` itself unless an arg (or a
@@ -1175,8 +1169,12 @@ impl<'a> RewriteState<'a> {
     /// per-base byte-offset set, resolving `r` through the forwarding
     /// map first (RPython calls `get_box_replacement(op)` here).
     fn delayed_zero_setfields(&mut self, r: &Operand) -> &mut FxIndexSet<i64> {
-        let key = self.resolve(r.clone()).to_opref();
-        self._delayed_zero_setfields.entry(key).or_default()
+        let base = self.resolve(r.clone());
+        &mut self
+            ._delayed_zero_setfields
+            .entry(base.to_opref())
+            .or_insert_with(|| (base, FxIndexSet::default()))
+            .1
     }
 
     /// Record that a SETARRAYITEM wrote to `array_ref[index]`,
@@ -1241,19 +1239,9 @@ impl<'a> RewriteState<'a> {
         // ConstInt(0), ConstInt(WORD))`, which is what we emit here
         // directly.
         let pending_zsf = std::mem::take(&mut self._delayed_zero_setfields);
-        for (ptr, entries) in pending_zsf {
-            // The pending-zero base is the result of an earlier malloc/New
-            // already emitted into `self.out`; bind the GC_STORE base to that
-            // producer so the arg sheds to `Operand::Op` (RPython keeps the
-            // base Box object). `Operand::from_opref` only materialises the
-            // None/Const arms; a position-only ref has no producer and would
-            // panic, so resolve the producer here. `to_opref()` is unchanged
-            // either way.
-            let ptr_box = self
-                .out_by_pos
-                .get(&ptr)
-                .map(Operand::from_bound_op)
-                .unwrap_or_else(|| Operand::from_opref(ptr));
+        for (_, (v, entries)) in pending_zsf {
+            // rewrite.py `v = self.get_box_replacement(v)`.
+            let ptr_box = self.resolve(v);
             for ofs in entries.iter().copied() {
                 let ofs_ref = self.const_int(ofs);
                 let zero_ref = self.const_int(0);
@@ -2370,7 +2358,7 @@ impl GcRewriterImpl {
         };
         let offset = fd.offset() as i64;
         let base = st.resolve(op.arg(0));
-        if let Some(entries) = st._delayed_zero_setfields.get_mut(&base.to_opref()) {
+        if let Some((_, entries)) = st._delayed_zero_setfields.get_mut(&base.to_opref()) {
             entries.swap_remove(&offset);
         }
     }
@@ -2703,7 +2691,7 @@ impl GcRewriterImpl {
         // rewrite.py `consider_setfield_gc`: a store at this offset
         // cancels the delayed NULL `clear_gc_fields` recorded.
         let base = st.resolve(ptr.clone());
-        if let Some(entries) = st._delayed_zero_setfields.get_mut(&base.to_opref()) {
+        if let Some((_, entries)) = st._delayed_zero_setfields.get_mut(&base.to_opref()) {
             entries.swap_remove(&ofs);
         }
         let zero = st.const_int(0);
