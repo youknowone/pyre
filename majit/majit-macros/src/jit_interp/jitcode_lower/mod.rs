@@ -1280,6 +1280,11 @@ impl LowererConfig {
         // discards the entry), compiling a config that does not do what it
         // declares.  Reject the typo at expansion time instead.
         for entry in residual_writes {
+            // `@ Struct` names the layout itself. A state ref-scalar is only
+            // required when the struct has to be recovered from one.
+            if entry.struct_type.is_some() {
+                continue;
+            }
             let name = entry.ref_scalar.to_string();
             assert!(
                 state_ref_scalars.contains_key(&name),
@@ -2178,6 +2183,49 @@ impl LoweredSequence {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `@ Struct` is the layout. The name before the dot is not a state field.
+    #[test]
+    fn residual_writes_at_struct_does_not_need_a_state_ref_scalar() {
+        let state_type = syn::parse_quote!(State);
+        let env_type = syn::parse_quote!(Env);
+        let entry = crate::jit_interp::ResidualWriteEntry {
+            ref_scalar: syn::parse_quote!(col),
+            field: syn::parse_quote!(data),
+            struct_type: Some(syn::parse_quote!(W_IntColumn)),
+            writes_elements: true,
+            helpers: vec![syn::parse_quote!(append_cell)],
+        };
+        let config = LowererConfig::new(
+            &[],
+            &[],
+            false,
+            None,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            &state_type,
+            &env_type,
+            &[entry],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            false,
+        );
+        assert_eq!(config.residual_writes.len(), 1);
+        assert_eq!(config.residual_writes[0].0, vec!["append_cell".to_string()]);
+        assert!(config.residual_writes[0].3);
+    }
 
     #[test]
     fn pointer_cast_temporaries_are_colored_with_their_builder_operands() {
