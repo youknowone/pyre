@@ -4134,6 +4134,18 @@ impl OptUnroll {
                         );
                     }
                 }
+                // The assembled LABEL's extra tail is `used_boxes` with
+                // constants removed. An extended builder records a short
+                // jump arg that tail never carried, and the bridge JUMP
+                // is then one arg longer than the stored LABEL.
+                let prefix = extra.len().min(sp.used_boxes.len());
+                let mut kept = Vec::with_capacity(prefix);
+                for i in 0..prefix {
+                    if short_extra_is_carried(sp.used_boxes[i]) {
+                        kept.push(extra[i]);
+                    }
+                }
+                extra = kept;
             }
 
             // A short-preamble replay that hit an unresolvable Phase 1 arg or
@@ -5471,7 +5483,7 @@ fn assemble_peeled_trace_with_jump_args(
     // HeapField result that still has optimizer constant knowledge attached).
     for (idx, &label_arg) in extra_label_args.iter().enumerate() {
         let jump_arg = extra_jump_args.get(idx).copied().unwrap_or(label_arg);
-        if label_arg.is_constant() {
+        if !short_extra_is_carried(label_arg) {
             continue;
         }
         filtered_extra_label_args.push(label_arg);
@@ -6609,6 +6621,14 @@ impl Optimization for OptUnroll {
     fn name(&self) -> &'static str {
         "unroll"
     }
+}
+
+/// A literal Const short-preamble extra is not a LABEL or JUMP slot.
+/// The loop assembler and the bridge close both consult this, so a
+/// constant virtualizable field cannot make the bridge JUMP one arg
+/// longer than the loop LABEL.
+fn short_extra_is_carried(arg: OpRef) -> bool {
+    !arg.is_constant()
 }
 
 #[cfg(test)]
@@ -9775,6 +9795,46 @@ mod tests {
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
             &[OpRef::int_op(10), OpRef::int_op(8)]
+        );
+    }
+
+    #[test]
+    fn loop_label_and_bridge_jump_drop_the_same_constant_extra() {
+        let extras = [
+            OpRef::const_int(16),
+            OpRef::int_op(8),
+            OpRef::const_int(0),
+            OpRef::int_op(9),
+        ];
+        let base = [OpRef::int_op(10)];
+        let p2_ops = vec![Op::new(
+            OpCode::Jump,
+            &[rooted_resop_operand(Type::Int, 10)],
+        )];
+        let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+        let combined = assemble_peeled_trace(
+            &[],
+            &p2_ops,
+            &base,
+            &[OpRef::int_op(0)],
+            &extras,
+            1,
+            true,
+            &[],
+            &constants,
+            None,
+            None,
+        );
+        let label_args: Vec<_> = combined[0]
+            .getarglist()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect();
+        let mut jump_args = base.to_vec();
+        jump_args.extend(extras.into_iter().filter(|arg| short_extra_is_carried(*arg)));
+        assert_eq!(
+            jump_args, label_args,
+            "a bridge JUMP and its loop LABEL carry the same boxes"
         );
     }
 

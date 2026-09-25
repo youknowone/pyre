@@ -8219,10 +8219,10 @@ impl<'a> Lowering<'a> {
     }
 }
 
-/// True when `var` is a declared virtualizable array, or was loaded out of
-/// one. A buffer getfield from that pointer is the escape
-/// `jtransform` rejects (`vable array field` passed around).
-fn reaches_declared_vable_array(graph: &FunctionGraph, var: &Variable) -> bool {
+/// The field-read variable of a declared virtualizable array that `var`
+/// was loaded from, if any. That variable is the one `vable_array_vars`
+/// keys, so the array op has to name it rather than a later deref.
+fn declared_vable_array_var(graph: &FunctionGraph, var: &Variable) -> Option<Variable> {
     let mut current = var.clone();
     for _ in 0..6 {
         let mut base = None;
@@ -8246,9 +8246,6 @@ fn reaches_declared_vable_array(graph: &FunctionGraph, var: &Variable) -> bool {
                         }
                         base = Some(field_base.clone());
                     }
-                    // `deref` / `same_as` alias the operand. The codewriter
-                    // drops them, so a buffer getfield on the result is a
-                    // getfield on the array.
                     OpKind::UnaryOp { operand, .. } => {
                         base = Some(operand.clone());
                     }
@@ -8257,14 +8254,18 @@ fn reaches_declared_vable_array(graph: &FunctionGraph, var: &Variable) -> bool {
             }
         }
         if declared {
-            return true;
+            return Some(current);
         }
         match base {
             Some(next) => current = next,
-            None => return false,
+            None => return None,
         }
     }
-    false
+    None
+}
+
+fn reaches_declared_vable_array(graph: &FunctionGraph, var: &Variable) -> bool {
+    declared_vable_array_var(graph, var).is_some()
 }
 
 fn retarget_vec_operand(
@@ -11345,8 +11346,16 @@ impl<'a> Lowering<'a> {
                 let element_is_addressable = element_spelling.is_some()
                     || element_node
                         .is_some_and(|elem| json_ty_is_thin_pointer_element(elem, self.llbc));
+                let vable_array_var = (args.len() == 2)
+                    .then(|| declared_vable_array_var(&self.graph, &args[0]))
+                    .flatten();
+                // A declared virtualizable array is `setarrayitem_vable` /
+                // `getarrayitem_vable`. Leaving `Vec::index_mut` as a call
+                // makes the trace abort on a symbolic residual, and the
+                // bounds check belongs on the array op as a guard.
                 let index_leg = args.len() == 2
                     && (workspace_index
+                        || vable_array_var.is_some()
                         || (self.is_vec_index_call(&reg, second_arg_ty.as_ref())
                             && (!is_vec_index_mut_call(&reg, second_arg_ty.as_ref(), self.llbc)
                                 || index_mut_result_is_element(self.body, dest_local)))
@@ -11508,8 +11517,17 @@ impl<'a> Lowering<'a> {
                     // array, the address mark would keep the field read out of
                     // `vable_array_vars` and the index would stay a plain
                     // `getarrayitem_gc`.
-                    let vable_array = self.release_declared_vable_array_address(&args[0]);
-                    let array_base = if !vable_array
+                    let vable_array = if let Some(root) = &vable_array_var {
+                        self.release_declared_vable_array_address(root)
+                    } else {
+                        self.release_declared_vable_array_address(&args[0])
+                    };
+                    // Name the field-read variable. A later deref is not the
+                    // key `vable_array_vars` stores, so `setarrayitem` would
+                    // miss the virtualizable rewrite and write the header.
+                    let array_base = if let Some(root) = &vable_array_var {
+                        root.clone()
+                    } else if !vable_array
                         && self.is_vec_index_call(&reg, second_arg_ty.as_ref())
                         && !reaches_declared_vable_array(&self.graph, &args[0])
                     {
