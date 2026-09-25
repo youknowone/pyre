@@ -292,6 +292,11 @@ pub struct TraceCtx {
     /// [`Self::portal_trace_push_fn`] into `MetaInterp.portal_trace_positions`.
     /// Structured green key values (if provided by the interpreter).
     green_key_values: Option<GreenKey>,
+    /// Whether the driver's entry keys carry the back-edge target in front
+    /// of the declared greens (the structured `can_enter_jit` layout).  A
+    /// structured root sets it; a bridge inherits its driver's layout, since
+    /// the loop it may close into was filed under that layout.
+    pub(crate) green_key_prepends_pc: bool,
     /// Declarative driver layout metadata, if provided by the interpreter.
     pub(crate) driver_descriptor: Option<JitDriverStaticData>,
     /// Standard virtualizable boxes -- OpRefs for each static field + array element.
@@ -1920,6 +1925,7 @@ impl TraceCtx {
             root_green_key_raw: (0, 0),
             inline_frames: Vec::new(),
             green_key_values: None,
+            green_key_prepends_pc: false,
             driver_descriptor: None,
             virtualizable_boxes: None,
             virtualizable_values: None,
@@ -1997,6 +2003,7 @@ impl TraceCtx {
             root_green_key_raw: (0, 0),
             inline_frames: Vec::new(),
             green_key_values: Some(green_key_values),
+            green_key_prepends_pc: true,
             driver_descriptor: None,
             virtualizable_boxes: None,
             virtualizable_values: None,
@@ -2615,7 +2622,9 @@ impl TraceCtx {
         //   are the declared greens, and for pypyjit the first int *is*
         //   `next_instr`. Prepending `pc` again hashed the loop under
         //   `[pc, pc, profiled, pycode]` so `can_enter` never found it.
-        //   `warmstate.py` `JitCell.get_uhash`.
+        //   `warmstate.py` `JitCell.get_uhash`. A bridge of a structured
+        //   driver has no key of its own but must still file and find
+        //   loops under the prepended layout (`green_key_prepends_pc`).
         let (spec, prepend_pc): (
             smallvec::SmallVec<[GreenType; majit_ir::GREEN_INLINE]>,
             bool,
@@ -2634,7 +2643,7 @@ impl TraceCtx {
                         .map(|d| d.green_args_spec())?
                         .into_iter(),
                 ),
-                false,
+                self.green_key_prepends_pc,
             )
         };
 
