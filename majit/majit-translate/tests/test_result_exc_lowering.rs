@@ -629,7 +629,8 @@ fn raise_path_calls(name: &str) -> (usize, usize, usize) {
             };
             match segments.last().map(String::as_str) {
                 Some("pyerror_type_error_to_exc_object")
-                | Some("pyerror_zero_division_to_exc_object") => fused += 1,
+                | Some("pyerror_zero_division_to_exc_object")
+                | Some("pyerror_value_error_to_exc_object") => fused += 1,
                 Some("pyerror_to_exc_object") => materialise += 1,
                 Some(_) if segments.len() >= 2 && segments[segments.len() - 2] == "PyError" => {
                     ctors += 1
@@ -653,6 +654,47 @@ fn constant_message_raise_sites_fuse_their_constructor() {
     assert!(fused > 0, "the fusion must fire on a literal-message raise");
     assert_eq!(ctors, 0, "no PyError constructor may survive");
     assert_eq!(materialise, 0, "no unfused materialisation may survive");
+}
+
+#[test]
+fn negative_shift_value_error_fuses_its_constructor() {
+    // `descr_lshift` / `descr_rshift` raise `PyError::value_error` with the
+    // literal "negative shift count" before `rbigint.lshift` / `rbigint.rshift`.
+    // That constructor must become `pyerror_value_error_to_exc_object`. Leaving
+    // the `PyError` aggregate in the graph makes the native materialiser read
+    // the message word as a `Wtf8Buf` niche (empty message, or the shift count
+    // as a huge length).
+    for name in [
+        "pyre_interpreter::objspace::descroperation::long_lshift",
+        "pyre_interpreter::objspace::descroperation::long_rshift",
+        "pyre_interpreter::objspace::descroperation::int_lshift",
+        "pyre_interpreter::objspace::descroperation::int_rshift",
+    ] {
+        let (fused, _materialise, _ctors) = raise_path_calls(name);
+        let graph = lower_function(interp(), name).expect("lower");
+        let leftover: Vec<String> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("value_error") => {
+                    Some(segments.join("::"))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            fused > 0,
+            "{name}: literal ValueError must fuse (fused={fused})"
+        );
+        assert!(
+            leftover.is_empty(),
+            "{name}: PyError::value_error must not survive: {leftover:?}"
+        );
+    }
 }
 
 #[test]

@@ -4249,12 +4249,19 @@ pub(crate) fn collapse_pos0_read(
 ///
 /// Gateway wrappers contribute the `type_error` sites; the exact-int
 /// `int_floordiv` / `int_mod` bodies contribute the literal-message
-/// `zero_division` sites.  Each entry removes the Rust carrier aggregate from
-/// the generated JitCode while preserving the interpreter's exception-object
-/// materialisation as one opaque call.
+/// `zero_division` sites; `long_lshift` / `long_rshift` / `int_lshift` /
+/// `int_rshift` contribute the literal-message `value_error` sites.  Each
+/// entry removes the Rust carrier aggregate from the generated JitCode while
+/// preserving the interpreter's exception-object materialisation as one
+/// opaque call.
 const FUSED_KIND_CTORS: &[(&str, &str)] = &[
     ("type_error", "pyerror_type_error_to_exc_object"),
     ("zero_division", "pyerror_zero_division_to_exc_object"),
+    // `descr_lshift` / `descr_rshift` raise this before `rbigint.lshift` /
+    // `rbigint.rshift`. The literal must stay a `STR` payload; leaving the
+    // `PyError` aggregate in the graph stores that word as a `Wtf8Buf` niche
+    // and the native materialiser reads an empty or huge length.
+    ("value_error", "pyerror_value_error_to_exc_object"),
 ];
 
 /// Fuse `PyError::<kind>(msg)` and the `pyerror_to_exc_object` that consumes
