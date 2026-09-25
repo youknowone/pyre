@@ -742,14 +742,21 @@ pub fn w_exception_new(kind: ExcKind, message: &str) -> PyObjectRef {
     // `PY_NULL` so `args` reads as `()`), matching the prebuilt
     // singletons (`MemoryError`, `StopIteration`).
     if !message.is_empty() {
-        // Root the fresh managed exception across the arg-list build: `exc`
-        // lives only in this Rust local while `w_list_new` allocates, so a
-        // collection there could sweep the unrooted (non-moving oldgen)
-        // exception before `w_exception_set_args` writes through it.
+        // Root the fresh nursery exception across the arg-list build.
+        // `w_exception_args_new` collects (`collect_and_reserve`), so the
+        // pin is re-read before the store: the local is not rewritten.
         let _roots = crate::gc_roots::push_roots();
-        let exc = crate::gc_roots::pin_root(exc);
-        let arg = crate::gc_roots::pin_root(crate::unicodeobject::w_str_new_managed(message));
-        unsafe { w_exception_set_args(exc, w_exception_args_new(vec![arg])) };
+        let exc_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(exc);
+        let arg_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(crate::unicodeobject::w_str_new_managed(message));
+        let arg = crate::gc_roots::shadow_stack_get(arg_slot);
+        let args = w_exception_args_new(vec![arg]);
+        let exc = crate::gc_roots::shadow_stack_get(exc_slot);
+        unsafe {
+            w_exception_set_args(exc, args);
+        }
+        return exc;
     }
     exc
 }
@@ -759,13 +766,20 @@ pub fn w_exception_new(kind: ExcKind, message: &str) -> PyObjectRef {
 pub fn w_exception_new_wtf8(kind: ExcKind, message: &Wtf8) -> PyObjectRef {
     let exc = w_exception_new_empty(kind);
     if !message.is_empty() {
-        // See `w_exception_new`: pin `exc` across the allocating arg build.
+        // See `w_exception_new`: pin `exc` across the allocating arg build
+        // and return the forwarded address. `w_exception_args_new` collects.
         let _roots = crate::gc_roots::push_roots();
-        let exc = crate::gc_roots::pin_root(exc);
-        let arg = crate::gc_roots::pin_root(crate::unicodeobject::w_str_from_wtf8_managed(
+        let exc_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(exc);
+        let arg_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(crate::unicodeobject::w_str_from_wtf8_managed(
             message.to_wtf8_buf(),
         ));
-        unsafe { w_exception_set_args(exc, w_exception_args_new(vec![arg])) };
+        let arg = crate::gc_roots::shadow_stack_get(arg_slot);
+        let args = w_exception_args_new(vec![arg]);
+        let exc = crate::gc_roots::shadow_stack_get(exc_slot);
+        unsafe { w_exception_set_args(exc, args) };
+        return exc;
     }
     exc
 }
@@ -801,25 +815,44 @@ pub fn w_exception_new_empty_immortal(kind: ExcKind) -> PyObjectRef {
 /// cluster whose type word is not a constant address does not lower — the word
 /// rides on the allocation or not at all, since a `setfield_gc` whose descr
 /// `is_typeptr()` is removed downstream. The primary allocation is hand-rolled
-/// through `try_gc_alloc_stable_raw` besides, which is not one of the
+/// through `try_gc_alloc_collecting_rooted` besides, which is not one of the
 /// `lltype::malloc*` spellings `fuse_boxing_alloc` recognises. Residualise the
 /// whole constructor — the JIT models it by signature as a plain
 /// `PyObjectRef` GCREF and emits a residual call.
-/// `framework.py malloc` for a non-immortal exception. Nursery, same as
-/// `ll_newlist` / `rlist_new`. A born-old instance plus a nursery `args_w`
-/// rlist is a permanent old→young edge: if the setter misses the
-/// remembered set, the next minor recycles the items block and a type-9
-/// walk reads a pointer as capacity.
-fn alloc_exception_nursery<T: crate::lltype::GcType>(value: T) -> PyObjectRef {
+/// `framework.py malloc_fixedsize` for a non-immortal exception. Nursery,
+/// same as `ll_newlist` / `rlist_new`: a full nursery takes
+/// `collect_and_reserve` (a minor collection) instead of spilling the
+/// instance straight into the old generation. A born-old instance plus a
+/// nursery `args_w` rlist is a permanent old→young edge: if the setter
+/// misses the remembered set, the next minor recycles the items block and
+/// a type-9 walk reads a pointer as capacity.
+///
+/// `value` is built first. At birth the only live GC child is `w_class`
+/// (`w_exception_base_defaults` / the extended-layout builder leave every
+/// other pointer `PY_NULL`). That word is the rooted slot
+/// `try_gc_alloc_collecting_rooted` forwards across the minor; the shadow
+/// stack does not stand in for it. The collector rewrites the slot, so the
+/// word is stored back into `value` before `ptr::write`.
+fn alloc_exception_nursery<T: crate::lltype::GcType>(mut value: T) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
+    let mut rooted_class = exception_header_w_class(&value);
+    let mut needs_write_barrier = true;
     let tid = T::type_id();
     let raw = if tid != 0 {
-        crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc(tid, T::SIZE))
-            .allocated_or_abort(T::SIZE)
-            .unwrap_or(std::ptr::null_mut())
+        crate::gc_hook::GcAllocOutcome::from_hook(unsafe {
+            crate::gc_hook::try_gc_alloc_collecting_rooted(
+                tid,
+                T::SIZE,
+                (&mut rooted_class as *mut PyObjectRef).cast(),
+                &mut needs_write_barrier,
+            )
+        })
+        .allocated_or_abort(T::SIZE)
+        .unwrap_or(std::ptr::null_mut())
     } else {
         std::ptr::null_mut()
     };
+    set_exception_header_w_class(&mut value, rooted_class);
     if !raw.is_null() {
         let slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(raw as PyObjectRef);
@@ -827,10 +860,36 @@ fn alloc_exception_nursery<T: crate::lltype::GcType>(value: T) -> PyObjectRef {
         unsafe {
             std::ptr::write(raw as *mut T, value);
         }
-        crate::gc_hook::try_gc_write_barrier(raw);
+        // A nursery header needs no creation barrier. The collecting
+        // allocator can still spill old (pinned nursery gap); only that
+        // placement remembers the `w_class` edge.
+        if needs_write_barrier {
+            crate::gc_hook::try_gc_write_barrier(raw);
+        }
         return raw as PyObjectRef;
     }
     crate::lltype::malloc_typed(value) as PyObjectRef
+}
+
+/// `ob_header.w_class` of a `W_BaseException` or a `W_ExceptionExtended`.
+/// Both layouts start with that header (`base` is the extended struct's
+/// first field), so the offset is the `PyObject.w_class` offset.
+fn exception_header_w_class<T>(value: &T) -> PyObjectRef {
+    let base = std::ptr::from_ref(value).cast::<u8>();
+    unsafe {
+        *base
+            .add(std::mem::offset_of!(PyObject, w_class))
+            .cast::<PyObjectRef>()
+    }
+}
+
+fn set_exception_header_w_class<T>(value: &mut T, w_class: PyObjectRef) {
+    let base = std::ptr::from_mut(value).cast::<u8>();
+    unsafe {
+        *base
+            .add(std::mem::offset_of!(PyObject, w_class))
+            .cast::<PyObjectRef>() = w_class;
+    }
 }
 
 #[majit_macros::dont_look_inside]
@@ -1099,17 +1158,30 @@ pub fn rlist_new(items: Vec<PyObjectRef>) -> PyObjectRef {
             .unwrap_or(std::ptr::null_mut()) as *mut crate::object_array::ItemsBlock
     };
     // rlist.py `ll_newlist` mallocs the LIST header in the nursery, same
-    // as the items GcArray. A born-old header (`try_gc_alloc_stable_raw`)
-    // plus a nursery items block is a permanent old→young edge: if the
-    // header misses the remembered set, a minor collection moves or
-    // recycles the block and the next scan of the header walks stale
-    // nursery bytes as a type-9 array (GC BUG invalid type_id / huge
-    // holder_offset on StopIteration-heavy tests).
+    // as the items GcArray (`malloc_fixedsize` → `collect_and_reserve`).
+    // A born-old header (`try_gc_alloc_stable_raw`) plus a nursery items
+    // block is a permanent old→young edge: if the header misses the
+    // remembered set, a minor collection moves or recycles the block and
+    // the next scan of the header walks stale nursery bytes as a type-9
+    // array (GC BUG invalid type_id / huge holder_offset on
+    // StopIteration-heavy tests). The items block is the one GC child
+    // manufactured before the header. The rooted slot is what the minor
+    // forwards; `reload_block` still re-reads the shadow-stack pin, which
+    // the same collection rewrites.
+    let mut allocation_root = reload_block() as *mut u8;
+    let mut needs_write_barrier = true;
     let tid = rlist_gc_type_id();
     let raw = if tid != 0 {
-        crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc(tid, RLIST_SIZE))
-            .allocated_or_abort(RLIST_SIZE)
-            .unwrap_or(std::ptr::null_mut())
+        crate::gc_hook::GcAllocOutcome::from_hook(unsafe {
+            crate::gc_hook::try_gc_alloc_collecting_rooted(
+                tid,
+                RLIST_SIZE,
+                &mut allocation_root,
+                &mut needs_write_barrier,
+            )
+        })
+        .allocated_or_abort(RLIST_SIZE)
+        .unwrap_or(std::ptr::null_mut())
     } else {
         std::ptr::null_mut()
     };
@@ -1124,7 +1196,9 @@ pub fn rlist_new(items: Vec<PyObjectRef>) -> PyObjectRef {
         unsafe {
             std::ptr::write(raw as *mut RList, value);
         }
-        crate::gc_hook::try_gc_write_barrier(raw);
+        if needs_write_barrier {
+            crate::gc_hook::try_gc_write_barrier(raw);
+        }
         return raw as PyObjectRef;
     }
     let value = RList {

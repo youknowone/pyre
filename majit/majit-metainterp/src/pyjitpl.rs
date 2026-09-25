@@ -82,6 +82,22 @@ pub fn active_backend_jit_exc_value_peek() -> i64 {
     majit_backend_dynasm::jit_exc_value_peek()
 }
 
+/// Write a forwarded pending-exception address back into the native CPU's
+/// `JIT_EXC_VALUE` cell (see `active_backend_jit_exc_value_peek`).
+#[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
+pub fn active_backend_jit_exc_value_forward(old: i64, new: i64) {
+    majit_backend_cranelift::jit_exc_value_forward(old, new)
+}
+
+#[cfg(all(
+    feature = "dynasm",
+    not(feature = "cranelift"),
+    not(target_arch = "wasm32")
+))]
+pub fn active_backend_jit_exc_value_forward(old: i64, new: i64) {
+    majit_backend_dynasm::jit_exc_value_forward(old, new)
+}
+
 static RD_CONSTS_WALK_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(not(any(feature = "cranelift", feature = "dynasm", target_arch = "wasm32")))]

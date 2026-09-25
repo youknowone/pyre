@@ -11,17 +11,38 @@ use serde::{Deserialize, Serialize};
 use crate::jitcode::{BhDescr, JitCode};
 
 /// Dense allocation order, with a separate graph key for colliding leaf names.
+///
+/// Body bytes are sliced by `offsets`. Symbolic residual funcptr constants
+/// are a second table: entry `i` is
+/// `reachable_symbolic_residuals[reachable_symbolic_offsets[i]..reachable_symbolic_offsets[i + 1]]`,
+/// sorted and distinct, including constants reached through `inline_call`
+/// callees. `reachable_symbolic_visited[i]` is how many jitcodes that walk
+/// entered, including `i`.
 #[derive(Serialize, Deserialize)]
 pub struct JitCodeIndex {
     pub names: Vec<String>,
     pub paths: Vec<String>,
     pub offsets: Vec<u32>,
+    pub reachable_symbolic_residuals: Vec<i64>,
+    pub reachable_symbolic_offsets: Vec<u32>,
+    pub reachable_symbolic_visited: Vec<u32>,
+}
+
+/// Per-jitcode symbolic residual closure, flat so the index stays one bincode
+/// record. `values[offsets[i] as usize..offsets[i + 1] as usize]` is sorted
+/// and distinct. `visited[i]` counts jitcodes entered from `i`, including `i`.
+#[derive(Clone, Debug)]
+pub struct ReachableSymbolicResidualTable {
+    pub values: Vec<i64>,
+    pub offsets: Vec<u32>,
+    pub visited: Vec<u32>,
 }
 
 impl JitCodeIndex {
     pub fn encode(
         jitcodes: &[Arc<JitCode>],
         paths: Vec<String>,
+        reachable: ReachableSymbolicResidualTable,
     ) -> bincode::Result<(Self, Vec<u8>)> {
         assert_eq!(paths.len(), jitcodes.len());
         let mut bodies = Vec::new();
@@ -29,6 +50,9 @@ impl JitCodeIndex {
             names: Vec::new(),
             paths,
             offsets: vec![0],
+            reachable_symbolic_residuals: reachable.values,
+            reachable_symbolic_offsets: reachable.offsets,
+            reachable_symbolic_visited: reachable.visited,
         };
         for jitcode in jitcodes {
             index.names.push(jitcode.name.clone());
@@ -37,6 +61,7 @@ impl JitCodeIndex {
                 .offsets
                 .push(u32::try_from(bodies.len()).expect("JitCode archive exceeds u32 offsets"));
         }
+        index.validate(&bodies)?;
         Ok((index, bodies))
     }
 
@@ -47,17 +72,39 @@ impl JitCodeIndex {
     }
 
     fn validate(&self, bodies: &[u8]) -> bincode::Result<()> {
+        let residual_end = self.reachable_symbolic_offsets.last().map(|&n| n as usize);
         if self.paths.len() != self.names.len()
             || self.offsets.len() != self.names.len() + 1
             || self.offsets.first().copied() != Some(0)
             || self.offsets.last().map(|&n| n as usize) != Some(bodies.len())
             || !self.offsets.windows(2).all(|p| p[0] <= p[1])
+            || self.reachable_symbolic_offsets.len() != self.offsets.len()
+            || self.reachable_symbolic_visited.len() + 1 != self.reachable_symbolic_offsets.len()
+            || self.reachable_symbolic_offsets.first().copied() != Some(0)
+            || residual_end != Some(self.reachable_symbolic_residuals.len())
+            || !self
+                .reachable_symbolic_offsets
+                .windows(2)
+                .all(|p| p[0] <= p[1])
         {
             return Err(Box::new(bincode::ErrorKind::Custom(
                 "invalid JitCode archive index".into(),
             )));
         }
         Ok(())
+    }
+
+    /// Symbolic residual constants and visited-jitcode count for `index`.
+    ///
+    /// `None` when `index` is outside the table or an offset points past
+    /// `reachable_symbolic_residuals`. A table that passed [`Self::decode`]
+    /// answers `Some` for every jitcode index.
+    pub fn reachable_symbolic_residuals_at(&self, index: usize) -> Option<(&[i64], u32)> {
+        let start = *self.reachable_symbolic_offsets.get(index)? as usize;
+        let end = *self.reachable_symbolic_offsets.get(index + 1)? as usize;
+        let values = self.reachable_symbolic_residuals.get(start..end)?;
+        let visited = *self.reachable_symbolic_visited.get(index)?;
+        Some((values, visited))
     }
 
     pub fn load(&self, bodies: &[u8], index: usize) -> bincode::Result<Arc<JitCode>> {
@@ -77,6 +124,11 @@ impl JitCodeIndex {
         bincode::deserialize(bytes)
     }
 }
+
+/// Wire-format version of [`EmbeddedArtifacts`]. Version 2 added the
+/// reachable-symbolic-residual table to [`JitCodeIndex`]; a version-1 index
+/// has no such table and is rejected rather than decoded as garbage.
+const ARTIFACT_VERSION: u32 = 2;
 
 /// Encoded bodies remain bytes until requested, so this envelope is Send+Sync
 /// without publishing translation-time graphs across threads.
@@ -98,9 +150,10 @@ impl EmbeddedArtifacts {
         for (path, jitcode) in &pipeline.jitcodes_by_path {
             paths[jitcode.index()] = path.canonical_key();
         }
-        let (index, bodies) = JitCodeIndex::encode(&pipeline.jitcodes, paths)?;
+        let reachable = reachable_symbolic_residual_table(&pipeline.jitcodes, &pipeline.descrs);
+        let (index, bodies) = JitCodeIndex::encode(&pipeline.jitcodes, paths, reachable)?;
         Ok(Self {
-            version: 1,
+            version: ARTIFACT_VERSION,
             index,
             bodies,
             descrs: bincode::serialize(&pipeline.descrs)?,
@@ -114,12 +167,16 @@ impl EmbeddedArtifacts {
     }
 
     pub fn decode(bytes: &[u8]) -> bincode::Result<Self> {
-        let artifacts: Self = bincode::deserialize(bytes)?;
-        if artifacts.version != 1 {
+        // `version` leads the envelope. Read it alone first, so an envelope of
+        // another layout is rejected by its version rather than failing
+        // partway through an index shaped differently.
+        let version: u32 = bincode::deserialize(bytes)?;
+        if version != ARTIFACT_VERSION {
             return Err(Box::new(bincode::ErrorKind::Custom(
                 "unsupported JitCode artifact version".into(),
             )));
         }
+        let artifacts: Self = bincode::deserialize(bytes)?;
         artifacts.index.validate(&artifacts.bodies)?;
         Ok(artifacts)
     }
@@ -135,31 +192,234 @@ impl EmbeddedArtifacts {
     }
 }
 
+/// Sorted distinct symbolic residual funcptrs reachable from each jitcode,
+/// plus how many jitcodes the walk entered.
+///
+/// A residual-call opcode at a `startpoints` pc reads `code[pc + 1]` as the
+/// funcptr register. The register is a constant when it is `>= num_regs_i`,
+/// and the constant is `constants_i[reg - num_regs_i]`. It is recorded when
+/// [`crate::call::is_symbolic_fnaddr`] is true. An inline-call opcode reads
+/// `u16::from_le_bytes(code[pc + 1..pc + 3])` as a descr index and continues
+/// through [`BhDescr::JitCode`]'s `jitcode_index`. A missing body or missing
+/// `startpoints` contributes the jitcode to the visit count and no further
+/// edges.
+pub fn reachable_symbolic_residual_table(
+    jitcodes: &[Arc<JitCode>],
+    descrs: &[BhDescr],
+) -> ReachableSymbolicResidualTable {
+    let mut values = Vec::new();
+    let mut offsets = Vec::with_capacity(jitcodes.len() + 1);
+    let mut visited = Vec::with_capacity(jitcodes.len());
+    offsets.push(0);
+    for root in 0..jitcodes.len() {
+        let (targets, seen) = reachable_symbolic_residuals_from(root, jitcodes, descrs);
+        values.extend(targets);
+        offsets.push(
+            u32::try_from(values.len())
+                .expect("reachable symbolic residual table exceeds u32 offsets"),
+        );
+        visited.push(
+            u32::try_from(seen).expect("reachable symbolic residual visit count exceeds u32"),
+        );
+    }
+    ReachableSymbolicResidualTable {
+        values,
+        offsets,
+        visited,
+    }
+}
+
+fn reachable_symbolic_residuals_from(
+    root: usize,
+    jitcodes: &[Arc<JitCode>],
+    descrs: &[BhDescr],
+) -> (Vec<i64>, usize) {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut targets = std::collections::BTreeSet::new();
+    let mut stack = Vec::new();
+    if root < jitcodes.len() {
+        seen.insert(root);
+        stack.push(root);
+    }
+    while let Some(index) = stack.pop() {
+        let Some(body) = jitcodes[index].try_body() else {
+            continue;
+        };
+        let Some(starts) = body.startpoints.as_ref() else {
+            continue;
+        };
+        let num_regs_i = body.c_num_regs_i as usize;
+        for &pc in starts {
+            let Some(&opcode) = body.code.get(pc) else {
+                continue;
+            };
+            if is_residual_call_opcode(opcode) {
+                let Some(&funcptr_reg) = body.code.get(pc + 1) else {
+                    continue;
+                };
+                let funcptr_reg = funcptr_reg as usize;
+                if funcptr_reg < num_regs_i {
+                    continue;
+                }
+                let Some(&target) = body.constants_i.get(funcptr_reg - num_regs_i) else {
+                    continue;
+                };
+                if crate::call::is_symbolic_fnaddr(target) {
+                    targets.insert(target);
+                }
+                continue;
+            }
+            if !is_inline_call_opcode(opcode) {
+                continue;
+            }
+            let Some((&lo, &hi)) = body.code.get(pc + 1).zip(body.code.get(pc + 2)) else {
+                continue;
+            };
+            let descr_index = u16::from_le_bytes([lo, hi]) as usize;
+            if let Some(BhDescr::JitCode { jitcode_index, .. }) = descrs.get(descr_index)
+                && *jitcode_index < jitcodes.len()
+                && seen.insert(*jitcode_index)
+            {
+                stack.push(*jitcode_index);
+            }
+        }
+    }
+    (targets.into_iter().collect(), seen.len())
+}
+
+fn is_residual_call_opcode(opcode: u8) -> bool {
+    matches!(
+        opcode,
+        crate::insns::BC_RESIDUAL_CALL_R_V
+            | crate::insns::BC_RESIDUAL_CALL_IR_V
+            | crate::insns::BC_RESIDUAL_CALL_IRF_V
+            | crate::insns::BC_RESIDUAL_CALL_R_I
+            | crate::insns::BC_RESIDUAL_CALL_IR_I
+            | crate::insns::BC_RESIDUAL_CALL_IRF_I
+            | crate::insns::BC_RESIDUAL_CALL_R_R
+            | crate::insns::BC_RESIDUAL_CALL_IR_R
+            | crate::insns::BC_RESIDUAL_CALL_IRF_R
+            | crate::insns::BC_RESIDUAL_CALL_IRF_F
+    )
+}
+
+fn is_inline_call_opcode(opcode: u8) -> bool {
+    matches!(
+        opcode,
+        crate::insns::BC_INLINE_CALL
+            | crate::insns::BC_INLINE_CALL_R_I
+            | crate::insns::BC_INLINE_CALL_R_R
+            | crate::insns::BC_INLINE_CALL_R_V
+            | crate::insns::BC_INLINE_CALL_IR_I
+            | crate::insns::BC_INLINE_CALL_IR_R
+            | crate::insns::BC_INLINE_CALL_IR_V
+            | crate::insns::BC_INLINE_CALL_IRF_I
+            | crate::insns::BC_INLINE_CALL_IRF_R
+            | crate::insns::BC_INLINE_CALL_IRF_F
+            | crate::insns::BC_INLINE_CALL_IRF_V
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn index_bytes(
+        names: Vec<String>,
+        paths: Vec<String>,
+        offsets: Vec<u32>,
+        residuals: Vec<i64>,
+        residual_offsets: Vec<u32>,
+        visited: Vec<u32>,
+    ) -> Vec<u8> {
+        bincode::serialize(&(names, paths, offsets, residuals, residual_offsets, visited)).unwrap()
+    }
+
     #[test]
     fn indexed_format_preserves_existing_tuple_wire_format() {
+        let old = index_bytes(
+            vec!["same".to_string(); 2],
+            vec!["a::same".to_string(), "b::same".to_string()],
+            vec![0_u32, 1, 2],
+            vec![4, 9],
+            vec![0, 2, 2],
+            vec![3, 1],
+        );
+        let index = JitCodeIndex::decode(&old, &[0, 0]).unwrap();
+        assert_eq!(index.paths, ["a::same", "b::same"]);
+        assert_eq!(index.reachable_symbolic_residuals, [4, 9]);
+        assert_eq!(index.reachable_symbolic_visited, [3, 1]);
+        assert_eq!(
+            index.reachable_symbolic_residuals_at(0),
+            Some((&[4, 9][..], 3))
+        );
+        assert_eq!(index.reachable_symbolic_residuals_at(1), Some((&[][..], 1)));
+        assert_eq!(bincode::serialize(&index).unwrap(), old);
+    }
+
+    #[test]
+    fn stale_index_without_residual_table_is_rejected() {
         let old = bincode::serialize(&(
             vec!["same".to_string(); 2],
             vec!["a::same".to_string(), "b::same".to_string()],
             vec![0_u32, 1, 2],
         ))
         .unwrap();
-        let index = JitCodeIndex::decode(&old, &[0, 0]).unwrap();
-        assert_eq!(index.paths, ["a::same", "b::same"]);
-        assert_eq!(bincode::serialize(&index).unwrap(), old);
+        assert!(JitCodeIndex::decode(&old, &[0, 0]).is_err());
     }
 
     #[test]
     fn rejects_corrupt_offsets_and_lengths() {
         for offsets in [vec![], vec![1_u32, 2], vec![0, 3], vec![0, 2, 1]] {
-            let bytes =
-                bincode::serialize(&(vec!["one".to_string()], vec![String::new()], offsets))
-                    .unwrap();
+            let bytes = index_bytes(
+                vec!["one".to_string()],
+                vec![String::new()],
+                offsets,
+                Vec::new(),
+                vec![0, 0],
+                vec![0],
+            );
             assert!(JitCodeIndex::decode(&bytes, &[0, 0]).is_err());
         }
+        // Body span is empty and valid. The residual offset span claims one
+        // constant while the flat table holds two.
+        let mismatched_len = index_bytes(
+            vec!["one".to_string()],
+            vec![String::new()],
+            vec![0, 0],
+            vec![7, 9],
+            vec![0, 1],
+            vec![1],
+        );
+        assert!(JitCodeIndex::decode(&mismatched_len, &[]).is_err());
+        // `last == values.len()`, but the span is not monotonic.
+        let non_monotonic = index_bytes(
+            vec!["a".to_string(), "b".to_string()],
+            vec![String::new(), String::new()],
+            vec![0, 0, 0],
+            vec![9],
+            vec![0, 2, 1],
+            vec![1, 1],
+        );
+        assert!(JitCodeIndex::decode(&non_monotonic, &[]).is_err());
+        let bad_origin = index_bytes(
+            vec!["one".to_string()],
+            vec![String::new()],
+            vec![0, 0],
+            vec![5],
+            vec![1, 1],
+            vec![1],
+        );
+        assert!(JitCodeIndex::decode(&bad_origin, &[]).is_err());
+        let bad_visited = index_bytes(
+            vec!["one".to_string()],
+            vec![String::new()],
+            vec![0, 0],
+            Vec::new(),
+            vec![0, 0],
+            Vec::new(),
+        );
+        assert!(JitCodeIndex::decode(&bad_visited, &[]).is_err());
     }
 
     #[test]
@@ -170,9 +430,11 @@ mod tests {
             constants_i: vec![17, -4],
             ..Default::default()
         });
-        let (index, bodies) = JitCodeIndex::encode(&[code], vec!["module::helper".into()]).unwrap();
+        let reachable = reachable_symbolic_residual_table(std::slice::from_ref(&code), &[]);
+        let (index, bodies) =
+            JitCodeIndex::encode(&[code], vec!["module::helper".into()], reachable).unwrap();
         let mut original = EmbeddedArtifacts {
-            version: 1,
+            version: ARTIFACT_VERSION,
             index,
             bodies,
             descrs: bincode::serialize(&Vec::<BhDescr>::new()).unwrap(),
@@ -185,12 +447,180 @@ mod tests {
         assert_eq!(codes[0].index(), 0);
         assert_eq!(codes[0].body().constants_i, [17, -4]);
         assert_eq!(loaded.index.paths, ["module::helper"]);
+        assert_eq!(loaded.index.reachable_symbolic_visited, [1]);
+        assert!(loaded.index.reachable_symbolic_residuals.is_empty());
         assert_eq!(loaded.symbolic_fnaddrs, original.symbolic_fnaddrs);
         assert_eq!(loaded.liveness, original.liveness);
         assert!(loaded.descrs().unwrap().is_empty());
         assert!(loaded.index.load(&loaded.bodies, 1).is_err());
         assert!(loaded.index.load(&loaded.bodies, usize::MAX).is_err());
-        original.version = 2;
+        original.version = ARTIFACT_VERSION + 1;
         assert!(EmbeddedArtifacts::decode(&original.encode().unwrap()).is_err());
+    }
+
+    fn symbolic(tag: u64) -> i64 {
+        (crate::call::SYMBOLIC_FNADDR_BASE | tag) as i64
+    }
+
+    fn push_residual(code: &mut Vec<u8>, starts: &mut Vec<usize>, reg: u8) {
+        starts.push(code.len());
+        code.push(crate::insns::BC_RESIDUAL_CALL_R_V);
+        code.push(reg);
+    }
+
+    fn push_inline(code: &mut Vec<u8>, starts: &mut Vec<usize>, descr: u16) {
+        starts.push(code.len());
+        code.push(crate::insns::BC_INLINE_CALL_R_V);
+        code.push(descr as u8);
+        code.push((descr >> 8) as u8);
+    }
+
+    fn assembled(
+        name: &str,
+        index: usize,
+        num_regs_i: u8,
+        code: Vec<u8>,
+        constants_i: Vec<i64>,
+        starts: Vec<usize>,
+    ) -> Arc<JitCode> {
+        let jitcode = Arc::new(JitCode::new(name));
+        jitcode.set_index(index);
+        jitcode.set_body(crate::jitcode::JitCodeBody {
+            c_num_regs_i: num_regs_i,
+            code,
+            constants_i,
+            startpoints: Some(starts.into_iter().collect()),
+            ..Default::default()
+        });
+        jitcode
+    }
+
+    /// A diamond plus a cycle, a non-constant funcptr, a real address, a
+    /// non-startpoint byte equal to a residual opcode, a non-jitcode descr,
+    /// and an out-of-range descr. Only symbolic constants at real instruction
+    /// starts are recorded, once per closure.
+    #[test]
+    fn reachable_symbolic_residual_table_follows_inline_calls() {
+        let symbolic_a = symbolic(1);
+        let symbolic_b = symbolic(2);
+        let symbolic_c = symbolic(3);
+        let symbolic_d = symbolic(4);
+        let real = 0x1234_5678i64;
+        let wrong_tag = 0x7ADE_0000_0000_0001u64 as i64;
+        assert!(crate::call::is_symbolic_fnaddr(symbolic_a));
+        assert!(!crate::call::is_symbolic_fnaddr(real));
+        assert!(!crate::call::is_symbolic_fnaddr(wrong_tag));
+
+        let mut code = Vec::new();
+        let mut starts = Vec::new();
+        push_residual(&mut code, &mut starts, 1);
+        push_residual(&mut code, &mut starts, 0);
+        push_residual(&mut code, &mut starts, 2);
+        push_residual(&mut code, &mut starts, 3);
+        push_inline(&mut code, &mut starts, 0);
+        push_inline(&mut code, &mut starts, 1);
+        push_inline(&mut code, &mut starts, 3);
+        push_inline(&mut code, &mut starts, 5);
+        push_inline(&mut code, &mut starts, 4);
+        // Operand bytes, not an instruction start. A linear scan would read
+        // the residual opcode here and pick up `symbolic_d`.
+        code.push(crate::insns::BC_INLINE_CALL_R_V);
+        code.push(crate::insns::BC_RESIDUAL_CALL_R_V);
+        code.push(4);
+
+        let root = assembled(
+            "root",
+            0,
+            1,
+            code,
+            vec![symbolic_a, real, wrong_tag, symbolic_d],
+            starts,
+        );
+
+        let mut mid_b = Vec::new();
+        let mut mid_b_starts = Vec::new();
+        push_residual(&mut mid_b, &mut mid_b_starts, 0);
+        push_inline(&mut mid_b, &mut mid_b_starts, 2);
+        let via_b = assembled("via_b", 1, 0, mid_b, vec![symbolic_b], mid_b_starts);
+
+        let mut mid_c = Vec::new();
+        let mut mid_c_starts = Vec::new();
+        push_residual(&mut mid_c, &mut mid_c_starts, 0);
+        push_inline(&mut mid_c, &mut mid_c_starts, 2);
+        let via_c = assembled("via_c", 2, 0, mid_c, vec![symbolic_b], mid_c_starts);
+
+        let mut leaf = Vec::new();
+        let mut leaf_starts = Vec::new();
+        push_residual(&mut leaf, &mut leaf_starts, 0);
+        let leaf = assembled("leaf", 3, 0, leaf, vec![symbolic_c], leaf_starts);
+
+        let shell = Arc::new(JitCode::new("shell"));
+        shell.set_index(4);
+
+        let unscanned = Arc::new(JitCode::new("no-starts"));
+        unscanned.set_index(5);
+        unscanned.set_body(crate::jitcode::JitCodeBody {
+            c_num_regs_i: 0,
+            code: vec![crate::insns::BC_RESIDUAL_CALL_R_V, 0],
+            constants_i: vec![symbolic_d],
+            startpoints: None,
+            ..Default::default()
+        });
+
+        let jitcodes = vec![root, via_b, via_c, leaf, shell, unscanned];
+        let descrs = vec![
+            BhDescr::JitCode {
+                jitcode_index: 1,
+                fnaddr: 0,
+                calldescr: Default::default(),
+            },
+            BhDescr::JitCode {
+                jitcode_index: 2,
+                fnaddr: 0,
+                calldescr: Default::default(),
+            },
+            BhDescr::JitCode {
+                jitcode_index: 3,
+                fnaddr: 0,
+                calldescr: Default::default(),
+            },
+            BhDescr::JitCode {
+                jitcode_index: 0,
+                fnaddr: 0,
+                calldescr: Default::default(),
+            },
+            BhDescr::Call {
+                calldescr: Default::default(),
+            },
+        ];
+
+        let table = reachable_symbolic_residual_table(&jitcodes, &descrs);
+        let row = |index: usize| -> (Vec<i64>, u32) {
+            let start = table.offsets[index] as usize;
+            let end = table.offsets[index + 1] as usize;
+            (table.values[start..end].to_vec(), table.visited[index])
+        };
+        assert_eq!(row(0), (vec![symbolic_a, symbolic_b, symbolic_c], 4));
+        assert_eq!(row(1), (vec![symbolic_b, symbolic_c], 2));
+        assert_eq!(row(2), (vec![symbolic_b, symbolic_c], 2));
+        assert_eq!(row(3), (vec![symbolic_c], 1));
+        assert_eq!(row(4), (Vec::<i64>::new(), 1));
+        assert_eq!(row(5), (Vec::<i64>::new(), 1));
+
+        let paths = vec![String::new(); jitcodes.len()];
+        let (index, bodies) = JitCodeIndex::encode(&jitcodes, paths, table.clone()).unwrap();
+        let decoded = JitCodeIndex::decode(&bincode::serialize(&index).unwrap(), &bodies).unwrap();
+        assert_eq!(
+            decoded.reachable_symbolic_residuals,
+            index.reachable_symbolic_residuals
+        );
+        assert_eq!(
+            decoded.reachable_symbolic_visited,
+            index.reachable_symbolic_visited
+        );
+        assert_eq!(
+            decoded.reachable_symbolic_residuals_at(0),
+            Some((&[symbolic_a, symbolic_b, symbolic_c][..], 4))
+        );
     }
 }

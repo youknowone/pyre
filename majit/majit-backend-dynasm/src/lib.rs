@@ -46,17 +46,15 @@ pub mod x86;
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
-/// Whether `MAJIT_LOG` is set, cached at first access.
+/// Whether a `debug_print` would be emitted on this thread.
 ///
-/// `std::env::var_os` acquires a global env lock and walks the env table on
-/// every call. The flag never changes after process startup, so checking it
-/// from hot dispatch paths shows up in profiles. The `LazyLock` caches the
-/// boolean. Mirrors the equivalent helper in `majit-backend-cranelift`.
+/// `have_debug_prints` — true only inside a debug section the `MAJIT_LOG`
+/// prefix filter accepts, so a category filter silences these sites.
+/// Not a cached `std::env::var_os`: the ready bit changes when a section
+/// opens. Mirrors the equivalent helper in `majit-backend-cranelift`.
 #[inline]
 pub fn majit_log_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("MAJIT_LOG").is_some());
-    *ENABLED
+    majit_ir::debug::have_debug_prints()
 }
 
 /// Log backend emission events without enabling per-execution diagnostics.
@@ -166,6 +164,13 @@ pub fn jit_exc_value_raw() -> i64 {
 /// `jit_exc_value_raw`, which swaps the cell to 0).
 pub fn jit_exc_value_peek() -> i64 {
     JIT_EXC_VALUE.load(Ordering::Relaxed)
+}
+
+/// Root-walker write-back for `JIT_EXC_VALUE`: a minor collection moved the
+/// pending exception from `old` to `new`. A compare-exchange, so a cell that
+/// no longer holds `old` is left alone.
+pub fn jit_exc_value_forward(old: i64, new: i64) {
+    let _ = JIT_EXC_VALUE.compare_exchange(old, new, Ordering::Relaxed, Ordering::Relaxed);
 }
 
 /// Clear exception state.
@@ -546,6 +551,21 @@ fn handle_fail_dispatch(
     // is held by `clt.asmmemmgr_gcreftracers` for the lifetime of the
     // executing JIT code.
     let descr_arc = { unsafe { majit_ir::recover_fail_descr_cell(descr_raw) } };
+    // `compile.py` `PropagateExceptionDescr.handle_fail`
+    // (`compile_tmp_callback`). The compare above matches the singleton
+    // cell `AbstractDescr.hide` bakes. This guard's recovery stub writes
+    // its own `FailDescrCell`. `show` (`recover_fail_descr_cell`) of that
+    // cell is the same Arc as `show` of the singleton when the guard's
+    // descr is `propagate_exception_descr`; otherwise the resume-guard
+    // path finds no `rd_numb`, drops `jf_guard_exc`, and the caller
+    // continues as if the call returned NULL.
+    if attached.propagate_exception_descr != 0 {
+        let singleton =
+            unsafe { majit_ir::recover_fail_descr_cell(attached.propagate_exception_descr) };
+        if std::sync::Arc::ptr_eq(&descr_arc, &singleton) {
+            return handle_fail_propagate_exception(frame_ptr);
+        }
+    }
     let descr_fd = match descr_arc.as_fail_descr() {
         Some(fd) => fd,
         None => return 0,
@@ -702,34 +722,25 @@ fn handle_fail_resume_guard(
     // GUARD_NOT_FORCED) staged `pos_exc_value` here; non-exception guards
     // leave it null.
     //
-    // The grab is read-only upstream; the additional clear below is pyre's,
-    // so the rooted local is the carrier for the blackhole arm. The bridge
-    // hook re-reads the slot, so the value is written back across that call.
+    // The grab is read-only (`llmodel.py` `grab_exc_value` returns the
+    // field and does not store). The bridge hook re-reads the slot
+    // (`jit_ca_handle_guard_failure`; `BridgeFn` does not carry the
+    // exception), so the slot stays set across that call and is cleared
+    // after it returns. Clearing it before that read traces an
+    // exception-guard bridge as the no-exception continuation
+    // (`pyjitpl.py` `prepare_resume_from_failure` null arm). The rooted
+    // local is the carrier for the blackhole arm.
     //
-    // Clearing the slot drops the only GC root for the exception object
-    // (`jf_guard_exc` is a GCREF visited by `jitframe_trace`).  The bridge
-    // hook below can allocate and trigger a collection, and an exception is
-    // allocated non-moving, so what is at stake is liveness rather than a
-    // stale address: with no root left, a major sweeps the object out from
-    // under the bare `usize` copy.  RPython keeps the `grab_exc_value` result
-    // alive across `_trace_and_compile_from_bridge` automatically
-    // (shadowstack-rooted local); pyre has no GC-transform pass, so root the
-    // value explicitly for the duration of the bridge hook.
-    let mut guard_exc_root = majit_ir::GcRef(unsafe {
-        let slot = &mut (*frame_ptr).jf_guard_exc;
-        let v = *slot;
-        *slot = 0;
-        v
-    });
+    // The slot stays the jitframe root across the bridge hook. The local
+    // is an additional root for the blackhole that runs after the slot is
+    // cleared — the hook can allocate, and a bare `usize` is not a GC root.
+    let mut guard_exc_root = majit_ir::GcRef(unsafe { (*frame_ptr).jf_guard_exc });
     // The blackhole receiver parks this same value in the metainterp's raw
     // guard-exception carrier as soon as it is entered, so across the
-    // `blackhole` call below the value is rooted twice over. The bridge hook
-    // does not take the exception as an argument: `jit_ca_handle_guard_failure`
-    // re-reads `jf_guard_exc` (`llmodel.py grab_exc_value`). Clearing the slot
-    // before that read makes a `GUARD_EXCEPTION` failure look exception-free,
-    // so the bridge walk resumes the no-exception continuation and runs the
-    // already-executed call again. Put the grabbed value back for the read.
-    // The rooted local stays the carrier for the blackhole arm.
+    // `blackhole` call below the value is rooted twice over. Collapsing the
+    // pair onto the park alone is not reachable from here: this crate does not
+    // depend on `majit-metainterp`, and `BridgeFn` does not carry the
+    // exception, so the bridge hook cannot park a value it never receives.
     let _guard_exc_scope = (guard_exc_root.0 != 0).then(|| {
         let slot = &mut guard_exc_root as *mut majit_ir::GcRef;
         unsafe { majit_gc::gc_add_root(slot) };
@@ -748,17 +759,22 @@ fn handle_fail_resume_guard(
             guard_value_operand.unwrap_or(0),
             guard_value_operand.is_some(),
         );
-        // The blackhole arm below consumes `guard_exc_root`, not the slot.
+        // Consumed by the bridge hook's re-read. Drop it so a later
+        // non-exception guard on this frame does not observe it
+        // (`pyjitpl.py` `_prepare_exception_resumption` asserts no
+        // exception on that flavor). The blackhole arm below consumes
+        // `guard_exc_root`, not the slot.
         unsafe { (*frame_ptr).jf_guard_exc = 0 };
         if let Some(result) = bridged {
             return result;
         }
     }
+    unsafe { (*frame_ptr).jf_guard_exc = 0 };
 
     // compile.py `else: resume_in_blackhole(descr, deadframe)`.
-    let bh_result = CA_BLACKHOLE_FN
-        .get()
-        .and_then(|blackhole| blackhole(descr_raw, frame_ptr, guard_exc_root.0 as i64));
+    let blackhole = CA_BLACKHOLE_FN.get();
+    let bh_result =
+        blackhole.and_then(|blackhole| blackhole(descr_raw, frame_ptr, guard_exc_root.0 as i64));
     if let Some(bh_result) = bh_result {
         if majit_log_enabled() {
             eprintln!(
@@ -769,12 +785,23 @@ fn handle_fail_resume_guard(
     }
     if majit_log_enabled() {
         eprintln!(
-            "[dynasm][ca-helper] resume-guard trace_id={trace_id} fail_index={fail_index} fell through to 0 descr=0x{descr_raw:x} frame={frame_ptr:p}"
+            "[dynasm][ca-helper] resume-guard trace_id={trace_id} fail_index={fail_index} fell through to 0 descr=0x{descr_raw:x} frame={frame_ptr:p} guard_exc=0x{:x}",
+            guard_exc_root.0
         );
     }
     // `assert 0, "unreachable"` upstream — pyre returns 0 when neither
     // hook is registered (e.g. bare-backend tests exercise the helper
-    // without a metainterp behind it).
+    // without a metainterp behind it). A pending exception must still
+    // reach the caller's GUARD_NO_EXCEPTION / GUARD_EXCEPTION: the
+    // failure stub already moved it out of `pos_exc_value` into
+    // `jf_guard_exc`, and returning 0 with the cell empty is a normal
+    // NULL result. Leave an exception the blackhole already published
+    // (stack overflow) in place. A registered blackhole that answered
+    // `None` bailed to the interpreter after delivering the exception to
+    // a handler, so there is nothing left to raise.
+    if blackhole.is_none() && guard_exc_root.0 != 0 && !jit_exc_is_pending() {
+        jit_exc_raise(guard_exc_root.0 as i64);
+    }
     0
 }
 

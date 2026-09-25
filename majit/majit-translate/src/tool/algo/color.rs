@@ -1,6 +1,9 @@
 //! Chordal graph coloring helper from `rpython/tool/algo/color.py`.
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use std::hash::BuildHasherDefault;
+
+use indexmap::IndexSet;
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
 /// Nodes are compiler-internal identities — a flow-graph `Variable`, a jitcode
 /// variable id — and upstream hashes them by object identity, so a probe there
@@ -75,15 +78,13 @@ impl<N: Eq + std::hash::Hash + Clone> DependencyGraph<N> {
             .remove(&vold)
             .expect("DependencyGraph.coalesce: old node must exist");
         for n in old_neighbours {
-            self.neighbours
+            let n_neighbours = self
+                .neighbours
                 .get_mut(&n)
-                .expect("DependencyGraph.coalesce: neighbour node must exist")
-                .remove(&vold);
+                .expect("DependencyGraph.coalesce: neighbour node must exist");
+            n_neighbours.remove(&vold);
             assert!(vnew != n);
-            self.neighbours
-                .get_mut(&n)
-                .expect("DependencyGraph.coalesce: neighbour node must exist")
-                .insert(vnew.clone());
+            n_neighbours.insert(vnew.clone());
             self.neighbours
                 .get_mut(&vnew)
                 .expect("DependencyGraph.coalesce: new node must exist")
@@ -115,28 +116,70 @@ impl<N: Eq + std::hash::Hash + Clone> DependencyGraph<N> {
     /// which is identically O(n²); the quadratic term only manifests on
     /// pathologically large single-function graphs, not the small per-function
     /// graphs real code produces.
+    ///
+    /// `sigma`, upstream a list of lists, is kept as one flat run of items
+    /// plus the length of each list in order, and every refinement writes the
+    /// next `sigma` into a second pair of buffers that are then swapped in, so
+    /// a step allocates nothing.
+    ///
+    /// The items of `sigma` are positions in `getnodes()`.  `x in neighb` is
+    /// answered from `marked[x]`, the step at which `x` was last entered as a
+    /// neighbour of the popped node, so a step looks up the popped node's
+    /// neighbours once instead of probing its neighbour set for every
+    /// remaining node.
     pub fn lexicographic_order(&self) -> Vec<N> {
-        let nodes = self.getnodes();
+        let nodes: IndexSet<N, BuildHasherDefault<FxHasher>> =
+            self.getnodes().into_iter().collect();
         if nodes.is_empty() {
             return Vec::new();
         }
-        let mut sigma: Vec<Vec<N>> = vec![nodes.into_iter().rev().collect()];
-        let mut result = Vec::new();
-        while !sigma.is_empty() && !sigma[0].is_empty() {
-            let v = sigma[0].pop().unwrap();
-            let neighb = self.neighbours.get(&v).cloned().unwrap_or_default();
-            result.push(v);
-            let mut new_sigma = Vec::new();
-            for s in sigma {
-                let (s1, s2): (Vec<_>, Vec<_>) = s.into_iter().partition(|x| neighb.contains(x));
-                if !s1.is_empty() {
-                    new_sigma.push(s1);
-                }
-                if !s2.is_empty() {
-                    new_sigma.push(s2);
+        let mut marked: Vec<usize> = vec![usize::MAX; nodes.len()];
+        let mut sigma_items: Vec<usize> = (0..nodes.len()).rev().collect();
+        let mut sigma_lens: Vec<usize> = vec![sigma_items.len()];
+        let mut new_items: Vec<usize> = Vec::with_capacity(sigma_items.len());
+        let mut new_lens: Vec<usize> = Vec::new();
+        let mut s2: Vec<usize> = Vec::new();
+        let mut result = Vec::with_capacity(nodes.len());
+        while !sigma_lens.is_empty() && sigma_lens[0] != 0 {
+            // `v = sigma[0].pop()`: the popped item is left out of the
+            // first list when it is split below.
+            let v = &nodes[sigma_items[sigma_lens[0] - 1]];
+            let step = result.len();
+            if let Some(neighb) = self.neighbours.get(v) {
+                for n in neighb {
+                    if let Some(x) = nodes.get_index_of(n) {
+                        marked[x] = step;
+                    }
                 }
             }
-            sigma = new_sigma;
+            result.push(v.clone());
+            new_items.clear();
+            new_lens.clear();
+            let mut start = 0;
+            for (k, &len) in sigma_lens.iter().enumerate() {
+                let end = start + len;
+                let s = &sigma_items[start..if k == 0 { end - 1 } else { end }];
+                start = end;
+                // `s1` (the neighbours of `v`) goes straight into the new
+                // `sigma`; `s2` waits in its own buffer to follow it.
+                let s1_start = new_items.len();
+                for &x in s {
+                    if marked[x] == step {
+                        new_items.push(x);
+                    } else {
+                        s2.push(x);
+                    }
+                }
+                if new_items.len() != s1_start {
+                    new_lens.push(new_items.len() - s1_start);
+                }
+                if !s2.is_empty() {
+                    new_lens.push(s2.len());
+                    new_items.append(&mut s2);
+                }
+            }
+            std::mem::swap(&mut sigma_items, &mut new_items);
+            std::mem::swap(&mut sigma_lens, &mut new_lens);
         }
         result
     }
@@ -166,8 +209,10 @@ impl<N: Eq + std::hash::Hash + Clone> DependencyGraph<N> {
     /// Uses `HashSet<usize>` — no color limit (fixes u64 overflow).
     pub fn find_node_coloring(&self) -> HashMap<N, usize> {
         let mut result = HashMap::default();
+        // Emptied per node rather than rebuilt.
+        let mut forbidden: HashSet<usize> = HashSet::default();
         for v in self.lexicographic_order() {
-            let mut forbidden: HashSet<usize> = HashSet::default();
+            forbidden.clear();
             if let Some(neighbours) = self.neighbours.get(&v) {
                 for n in neighbours {
                     if let Some(&color) = result.get(n) {

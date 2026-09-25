@@ -122,10 +122,35 @@ impl<'a> RegAllocator<'a> {
     }
 
     fn make_dependencies(&mut self) {
+        self.make_dependencies_among(None);
+    }
+
+    /// `_unionfind.find_rep(id)` when a pre-merge put `id` in the
+    /// union-find, `id` itself otherwise.  `find_rep` would answer the same
+    /// for an absent `id`, but it would also enter it as a new singleton,
+    /// which nothing here reads back.
+    fn merged_rep(&mut self, id: super::flow::VariableId) -> super::flow::VariableId {
+        if self._unionfind.contains(&id) {
+            self._unionfind.find_rep(id)
+        } else {
+            id
+        }
+    }
+
+    /// `make_dependencies`, recording only the edges whose two endpoints are
+    /// both in `tracked` (every edge when `None`).  Nodes are still added for
+    /// every variable, and liveness is computed over all of them.
+    fn make_dependencies_among(&mut self, tracked: Option<&HashSet<super::flow::VariableId>>) {
         let kind = self.kind;
+        let is_tracked = |v: &super::flow::VariableId| tracked.is_none_or(|set| set.contains(v));
+        // Per-block tables, emptied at the end of each block rather than
+        // reallocated for the next one.
+        let mut die_at: HashMap<super::flow::VariableId, usize> = HashMap::default();
+        let mut die_list: Vec<(usize, super::flow::VariableId)> = Vec::new();
+        let mut livevar_reps: Vec<super::flow::VariableId> = Vec::new();
+        let mut livevars: HashSet<super::flow::VariableId> = HashSet::default();
         for block in self.graph.iterblocks() {
             let block_borrow = block.borrow();
-            let mut die_at: HashMap<super::flow::VariableId, usize> = HashMap::default();
             for arg in &block_borrow.inputargs {
                 if let Some(v) = arg.as_variable() {
                     if v.kind == Some(kind) {
@@ -142,7 +167,7 @@ impl<'a> RegAllocator<'a> {
                         // When `_unionfind` has no pre-merges, find_rep
                         // returns the input ID unchanged so this matches
                         // upstream `regalloc.py:26-77` exactly.
-                        let rep = self._unionfind.find_rep(v.id);
+                        let rep = self.merged_rep(v.id);
                         die_at.insert(rep, 0);
                     }
                 }
@@ -151,14 +176,14 @@ impl<'a> RegAllocator<'a> {
                 for arg in &op.args {
                     for v in arg.variables() {
                         if v.kind == Some(kind) {
-                            let rep = self._unionfind.find_rep(v.id);
+                            let rep = self.merged_rep(v.id);
                             die_at.insert(rep, i);
                         }
                     }
                 }
                 if let Some(v) = op.result.as_ref().and_then(FlowValue::as_variable) {
                     if v.kind == Some(kind) {
-                        let rep = self._unionfind.find_rep(v.id);
+                        let rep = self.merged_rep(v.id);
                         die_at.insert(rep, i + 1);
                     }
                 }
@@ -166,7 +191,7 @@ impl<'a> RegAllocator<'a> {
             match &block_borrow.exitswitch {
                 Some(ExitSwitch::Value(value)) => {
                     if let Some(v) = value.as_variable() {
-                        let rep = self._unionfind.find_rep(v.id);
+                        let rep = self.merged_rep(v.id);
                         die_at.remove(&rep);
                     }
                 }
@@ -174,7 +199,7 @@ impl<'a> RegAllocator<'a> {
                     for value in values {
                         if let ExitSwitchElement::Value(value) = value {
                             if let Some(v) = value.as_variable() {
-                                let rep = self._unionfind.find_rep(v.id);
+                                let rep = self.merged_rep(v.id);
                                 die_at.remove(&rep);
                             }
                         }
@@ -185,38 +210,44 @@ impl<'a> RegAllocator<'a> {
             for link in &block_borrow.exits {
                 for arg in &link.borrow().args {
                     if let Some(v) = arg.as_ref().and_then(FlowValue::as_variable) {
-                        let rep = self._unionfind.find_rep(v.id);
+                        let rep = self.merged_rep(v.id);
                         die_at.remove(&rep);
                     }
                 }
             }
-            let mut die_list: Vec<(usize, super::flow::VariableId)> =
-                die_at.into_iter().map(|(var, time)| (time, var)).collect();
+            die_list.clear();
+            die_list.extend(die_at.drain().map(|(var, time)| (time, var)));
             die_list.sort_by_key(|(time, _)| *time);
             die_list.push((usize::MAX, super::flow::VariableId(u32::MAX)));
 
-            let livevar_reps: Vec<super::flow::VariableId> = block_borrow
-                .inputargs
-                .iter()
-                .filter_map(FlowValue::as_variable)
-                .filter(|v| v.kind == Some(kind))
-                .map(|v| self._unionfind.find_rep(v.id))
-                .collect();
+            livevar_reps.clear();
+            livevar_reps.extend(
+                block_borrow
+                    .inputargs
+                    .iter()
+                    .filter_map(FlowValue::as_variable)
+                    .filter(|v| v.kind == Some(kind))
+                    .map(|v| self.merged_rep(v.id)),
+            );
             for (i, &v) in livevar_reps.iter().enumerate() {
                 self._depgraph.add_node(v);
+                if !is_tracked(&v) {
+                    continue;
+                }
                 for j in 0..i {
                     // Pre-merged inputargs can collapse to the same
                     // representative.  RPython's DependencyGraph asserts
                     // against self-edges, so skip the edge here instead
                     // of weakening the shared color.py port.
-                    if livevar_reps[j] != v {
+                    if livevar_reps[j] != v && is_tracked(&livevar_reps[j]) {
                         self._depgraph.add_edge(livevar_reps[j], v);
                     }
                 }
             }
-            // upstream: `livevars = set(livevars)` — shadow the list
-            // with the set rather than renaming to `alive`.
-            let mut livevars: HashSet<super::flow::VariableId> = livevar_reps.into_iter().collect();
+            // upstream: `livevars = set(livevars)`.  An untracked variable
+            // takes part in no recorded edge, so it is left out.
+            livevars.clear();
+            livevars.extend(livevar_reps.iter().copied().filter(|v| is_tracked(v)));
             let mut die_index = 0;
             for (i, op) in block_borrow.operations.iter().enumerate() {
                 while die_list[die_index].0 == i {
@@ -225,7 +256,7 @@ impl<'a> RegAllocator<'a> {
                 }
                 if let Some(result) = op.result.as_ref().and_then(FlowValue::as_variable) {
                     if result.kind == Some(kind) {
-                        let rep = self._unionfind.find_rep(result.id);
+                        let rep = self.merged_rep(result.id);
                         self._depgraph.add_node(rep);
                         // upstream (`regalloc.py:73`): add an edge from
                         // every live var to `result`.  `result` is added
@@ -233,12 +264,14 @@ impl<'a> RegAllocator<'a> {
                         // Pyre's pin pre-merge can make an already-live
                         // inputarg and this result share a representative,
                         // so keep the RPython add_edge invariant locally.
-                        for &v in &livevars {
-                            if v != rep {
-                                self._depgraph.add_edge(v, rep);
+                        if is_tracked(&rep) {
+                            for &v in &livevars {
+                                if v != rep {
+                                    self._depgraph.add_edge(v, rep);
+                                }
                             }
+                            livevars.insert(rep);
                         }
-                        livevars.insert(rep);
                     }
                 }
             }
@@ -372,7 +405,7 @@ impl<'a> RegAllocator<'a> {
     }
 
     fn getcolor(&mut self, v: Variable) -> Option<u16> {
-        let rep = self._unionfind.find_rep(v.id);
+        let rep = self.merged_rep(v.id);
         self._coloring.get(&rep).copied()
     }
 
@@ -466,39 +499,47 @@ pub fn perform_register_allocation_with_pairs(
     allocator.find_node_coloring();
 
     let mut coloring = HashMap::default();
+    // A variable met again already has its color, so only its first
+    // occurrence asks the allocator.
+    let mut record = |v: Variable| {
+        if v.kind != Some(kind) {
+            return;
+        }
+        if let std::collections::hash_map::Entry::Vacant(entry) = coloring.entry(v.id) {
+            if let Some(color) = allocator.getcolor(v) {
+                entry.insert(color);
+            }
+        }
+    };
     for block in graph.iterblocks() {
         let block_borrow = block.borrow();
-        for variable in block_borrow.getvariables() {
-            if variable.kind == Some(kind) {
-                if let Some(color) = allocator.getcolor(variable) {
-                    coloring.insert(variable.id, color);
-                }
-            }
+        // `Block.getvariables()` walked in place.
+        let block_variables = block_borrow
+            .inputargs
+            .iter()
+            .filter_map(FlowValue::as_variable)
+            .chain(block_borrow.operations.iter().flat_map(|op| {
+                op.args
+                    .iter()
+                    .flat_map(|arg| arg.variables())
+                    .chain(op.result.as_ref().and_then(FlowValue::as_variable))
+            }));
+        for variable in block_variables {
+            record(variable);
         }
         for link in &block_borrow.exits {
             let link_borrow = link.borrow();
-            if let Some(v) = link_borrow.last_exception {
-                if v.kind == Some(kind) {
-                    if let Some(color) = allocator.getcolor(v) {
-                        coloring.insert(v.id, color);
-                    }
-                }
-            }
-            if let Some(v) = link_borrow.last_exc_value {
-                if v.kind == Some(kind) {
-                    if let Some(color) = allocator.getcolor(v) {
-                        coloring.insert(v.id, color);
-                    }
-                }
-            }
-            for arg in &link_borrow.args {
-                if let Some(v) = arg.as_ref().and_then(FlowValue::as_variable) {
-                    if v.kind == Some(kind) {
-                        if let Some(color) = allocator.getcolor(v) {
-                            coloring.insert(v.id, color);
-                        }
-                    }
-                }
+            let link_variables = [link_borrow.last_exception, link_borrow.last_exc_value]
+                .into_iter()
+                .flatten()
+                .chain(
+                    link_borrow
+                        .args
+                        .iter()
+                        .filter_map(|arg| arg.as_ref().and_then(FlowValue::as_variable)),
+                );
+            for v in link_variables {
+                record(v);
             }
         }
     }
@@ -553,7 +594,13 @@ pub fn filter_coalesce_pairs_by_interference(
     pairs: &[(super::flow::VariableId, super::flow::VariableId)],
 ) -> Vec<(super::flow::VariableId, super::flow::VariableId)> {
     let mut allocator = RegAllocator::new(graph, kind);
-    allocator.make_dependencies();
+    // Every `has_edge` below asks about two representatives of merged
+    // endpoint classes, and a merged node's neighbours are the union of its
+    // members' (`DependencyGraph.coalesce`).  So only edges between two pair
+    // endpoints can change an answer; the rest of the graph is not built.
+    let endpoints: HashSet<super::flow::VariableId> =
+        pairs.iter().flat_map(|&(v, w)| [v, w]).collect();
+    allocator.make_dependencies_among(Some(&endpoints));
     let mut kept = Vec::with_capacity(pairs.len());
     for &(v_id, w_id) in pairs {
         if v_id == w_id {

@@ -542,16 +542,13 @@ impl SpaceOperationArg {
         }
     }
 
-    pub fn variables(&self) -> Vec<Variable> {
-        match self {
-            Self::Value(value) => value.as_variable().into_iter().collect(),
-            Self::ListOfKind(list) => list
-                .content
-                .iter()
-                .filter_map(FlowValue::as_variable)
-                .collect(),
-            Self::Descr(_) | Self::IndirectCallTargets(_) => Vec::new(),
-        }
+    pub fn variables(&self) -> impl Iterator<Item = Variable> + '_ {
+        let values: &[FlowValue] = match self {
+            Self::Value(value) => std::slice::from_ref(value),
+            Self::ListOfKind(list) => &list.content,
+            Self::Descr(_) | Self::IndirectCallTargets(_) => &[],
+        };
+        values.iter().filter_map(FlowValue::as_variable)
     }
 
     pub fn constants(&self) -> Vec<Constant> {
@@ -1179,17 +1176,17 @@ impl FunctionGraph {
     pub fn iterblocks(&self) -> Vec<BlockRef> {
         let start = self.startblock.clone();
         let mut out = vec![start.clone()];
-        let mut seen = vec![start.clone()];
+        let mut seen = rustc_hash::FxHashSet::default();
+        seen.insert(start.clone());
         let mut stack: Vec<LinkRef> = start.borrow().exits.iter().rev().cloned().collect();
 
         while let Some(link) = stack.pop() {
             let Some(block) = link.borrow().target.clone() else {
                 continue;
             };
-            if seen.contains(&block) {
+            if !seen.insert(block.clone()) {
                 continue;
             }
-            seen.push(block.clone());
             out.push(block.clone());
             let more: Vec<LinkRef> = block.borrow().exits.iter().rev().cloned().collect();
             stack.extend(more);
@@ -1202,7 +1199,8 @@ impl FunctionGraph {
     pub fn iterlinks(&self) -> Vec<LinkRef> {
         let start = self.startblock.clone();
         let mut out = Vec::new();
-        let mut seen = vec![start.clone()];
+        let mut seen = rustc_hash::FxHashSet::default();
+        seen.insert(start.clone());
         let mut stack: Vec<LinkRef> = start.borrow().exits.iter().rev().cloned().collect();
 
         while let Some(link) = stack.pop() {
@@ -1211,8 +1209,7 @@ impl FunctionGraph {
             let Some(block) = target else {
                 continue;
             };
-            if !seen.contains(&block) {
-                seen.push(block.clone());
+            if seen.insert(block.clone()) {
                 let more: Vec<LinkRef> = block.borrow().exits.iter().rev().cloned().collect();
                 stack.extend(more);
             }
@@ -1230,13 +1227,16 @@ fn observe_values_for_next_id(next_variable_id: &mut u32, values: &[FlowValue]) 
     }
 }
 
+/// `model.py` `uniqueitems`: first occurrences in order, with `seen`
+/// answering membership.
 fn uniqueitems<T>(values: Vec<T>) -> Vec<T>
 where
-    T: Eq + Clone,
+    T: Eq + Hash + Clone,
 {
     let mut result = Vec::new();
+    let mut seen = rustc_hash::FxHashSet::default();
     for value in values {
-        if !result.contains(&value) {
+        if seen.insert(value.clone()) {
             result.push(value);
         }
     }
@@ -1795,7 +1795,11 @@ mod tests {
             Some(return_var)
         );
         assert_eq!(
-            copied_mid.borrow().operations[0].args[0].variables()[0].kind,
+            copied_mid.borrow().operations[0].args[0]
+                .variables()
+                .next()
+                .unwrap()
+                .kind,
             Some(Kind::Ref)
         );
         assert_eq!(

@@ -39,6 +39,18 @@ pub struct AssemblerState {
     pub all_liveness_length: usize,
     pub all_liveness_positions: Option<IndexMap<(Vec<u8>, Vec<u8>, Vec<u8>), u16>>,
     pub num_liveness_ops: usize,
+    /// The writer whose `insns` / `all_liveness` this mirror holds verbatim,
+    /// with their lengths at that publish. `None` once anything but that
+    /// writer's publish has touched the mirror. See [`publish_state_from`].
+    pub(crate) synced_with: Option<SyncedWriter>,
+}
+
+/// A [`publish_state_from`] writer token and the buffer lengths it published.
+#[derive(Clone, Copy)]
+pub(crate) struct SyncedWriter {
+    token: u64,
+    insns_len: usize,
+    all_liveness_len: usize,
 }
 
 impl AssemblerState {
@@ -73,6 +85,7 @@ impl AssemblerState {
             all_liveness,
             all_liveness_length,
             num_liveness_ops: 0,
+            synced_with: None,
         }
     }
 }
@@ -158,21 +171,82 @@ pub fn publish_state(
     all_liveness_length: usize,
     num_liveness_ops: usize,
 ) {
-    ASSEMBLER_STATE.with(|r| {
+    publish_state_from(
+        0,
+        insns,
+        all_liveness,
+        all_liveness_length,
+        num_liveness_ops,
+    );
+}
+
+/// [`publish_state`] for a writer identified by `token` (non-zero, unique
+/// per writer `Assembler`).
+///
+/// The writer publishes after every `-live-` intern, and its `insns` and
+/// `all_liveness` start from the whole build-time tables, so replacing the
+/// mirror each time costs `interns × table size`. Both writer buffers are
+/// append-only (`assembler.py` `Assembler`: `insns` only gains keys, `all_liveness`
+/// only grows), so while the mirror still holds exactly what the same writer
+/// published last, the new snapshot is that plus a tail and only the tail is
+/// copied. The result is the same mirror a wholesale replace would leave.
+/// Token `0` always replaces.
+pub fn publish_state_from(
+    token: u64,
+    insns: &IndexMap<String, u8>,
+    all_liveness: &[u8],
+    all_liveness_length: usize,
+    num_liveness_ops: usize,
+) {
+    let liveness_changed = ASSEMBLER_STATE.with(|r| {
         let mut asm = r.borrow_mut();
-        asm.insns = insns.clone();
-        asm.all_liveness.clear();
-        asm.all_liveness.extend_from_slice(all_liveness);
+        let extends = token != 0
+            && asm.synced_with.is_some_and(|synced| {
+                synced.token == token
+                    && synced.insns_len <= insns.len()
+                    && synced.all_liveness_len <= all_liveness.len()
+            });
+        let liveness_changed = if extends {
+            debug_assert!(asm.insns.iter().eq(insns.iter().take(asm.insns.len())));
+            debug_assert!(all_liveness.starts_with(&asm.all_liveness));
+            let known_insns = asm.insns.len();
+            for (key, &byte) in insns.iter().skip(known_insns) {
+                asm.insns.insert(key.clone(), byte);
+            }
+            let known_liveness = asm.all_liveness.len();
+            asm.all_liveness
+                .extend_from_slice(&all_liveness[known_liveness..]);
+            all_liveness.len() != known_liveness
+        } else {
+            asm.insns = insns.clone();
+            asm.all_liveness.clear();
+            asm.all_liveness.extend_from_slice(all_liveness);
+            true
+        };
         asm.all_liveness_length = all_liveness_length;
         asm.num_liveness_ops = num_liveness_ops;
         // The dedup table describes the *previous* buffer, so drop it and let
         // the next reader-side intern derive one from the bytes just installed.
         // Clearing it to an empty dict instead would leave the mirror unable to
         // see any record in the fresh bytes, and that intern would append a
-        // duplicate of one already there.
-        asm.all_liveness_positions = None;
+        // duplicate of one already there. Unchanged bytes keep a table that
+        // still describes them.
+        if liveness_changed {
+            asm.all_liveness_positions = None;
+        }
+        asm.synced_with = (token != 0).then_some(SyncedWriter {
+            token,
+            insns_len: insns.len(),
+            all_liveness_len: all_liveness.len(),
+        });
+        liveness_changed
     });
-    crate::state::publish_liveness_info(all_liveness.to_vec());
+    // Unchanged bytes are already what `liveness_info` holds: this writer's
+    // previous publish installed them, and `intern_liveness`, the only other
+    // producer, clears `synced_with`.
+    if liveness_changed {
+        crate::state::publish_liveness_info(all_liveness.to_vec());
+    }
 }
 
 #[cfg(test)]

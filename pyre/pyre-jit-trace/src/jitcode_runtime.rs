@@ -180,6 +180,25 @@ fn runtime_jitcode_cells() -> &'static [std::sync::OnceLock<Arc<majit_metainterp
     })
 }
 
+fn seeded_reachable_symbolic_residuals(
+    index: usize,
+) -> majit_metainterp::jitcode::ReachableSymbolicResiduals {
+    let (values, visited) = jitcode_index()
+        .reachable_symbolic_residuals_at(index)
+        .unwrap_or_else(|| panic!("jitcode {index} has no reachable symbolic residual row"));
+    // Constants this process rewrote are no longer symbolic in the patched
+    // body. The table still names the build-time hashes.
+    let targets = values
+        .iter()
+        .copied()
+        .filter(|value| !crate::runtime_fnaddr_patch::is_bound_symbolic_fnaddr(*value))
+        .collect();
+    majit_metainterp::jitcode::ReachableSymbolicResiduals {
+        targets,
+        visited_jitcodes: visited as usize,
+    }
+}
+
 pub fn get_runtime_jitcode_by_index(
     index: usize,
 ) -> Option<Arc<majit_metainterp::jitcode::JitCode>> {
@@ -188,9 +207,10 @@ pub fn get_runtime_jitcode_by_index(
         cell.get_or_init(|| {
             let canonical = get_jitcode_by_index(index)
                 .expect("runtime JitCode cell index must resolve canonically");
-            Arc::new(majit_metainterp::jitcode::JitCode::from_canonical(
-                (*canonical).clone(),
-            ))
+            Arc::new(
+                majit_metainterp::jitcode::JitCode::from_canonical((*canonical).clone())
+                    .with_reachable_symbolic_residuals(seeded_reachable_symbolic_residuals(index)),
+            )
         })
         .clone(),
     )
@@ -356,11 +376,12 @@ pub fn portal_metainterp_jitcode() -> Option<Arc<majit_metainterp::jitcode::JitC
     static PORTAL_META: OnceLock<Option<Arc<majit_metainterp::jitcode::JitCode>>> = OnceLock::new();
     PORTAL_META
         .get_or_init(|| {
-            portal_jitcode().map(|canonical| {
-                Arc::new(majit_metainterp::jitcode::JitCode::from_canonical(
-                    (*canonical).clone(),
-                ))
-            })
+            let canonical = portal_jitcode()?;
+            let index = canonical.index();
+            Some(Arc::new(
+                majit_metainterp::jitcode::JitCode::from_canonical((*canonical).clone())
+                    .with_reachable_symbolic_residuals(seeded_reachable_symbolic_residuals(index)),
+            ))
         })
         .clone()
 }
@@ -1017,6 +1038,15 @@ fn descr_layout_at(index: usize) -> std::sync::Arc<majit_translate::jitcode::BhS
 }
 
 fn load_descr_uncached(index: usize) -> BhDescr {
+    load_descr_with_parent(index, descr_layout_at)
+}
+
+/// Decode descriptor slot `index`, taking a Field's parent layout from
+/// `parent_layout_at` instead of decoding it anew.
+fn load_descr_with_parent(
+    index: usize,
+    parent_layout_at: impl FnOnce(usize) -> std::sync::Arc<majit_translate::jitcode::BhSizeSpec>,
+) -> BhDescr {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descrs.bin"));
     let offsets = &descrs_index().offsets;
     let start = offsets[index] as usize;
@@ -1037,7 +1067,7 @@ fn load_descr_uncached(index: usize) -> BhDescr {
             parent.is_none(),
             "wire Field unexpectedly embeds its parent layout"
         );
-        *parent = Some(descr_layout_at(parent_layout as usize));
+        *parent = Some(parent_layout_at(parent_layout as usize));
     }
     descr
 }
@@ -1327,11 +1357,25 @@ pub fn materialize_gccache_owned_descrs() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         let index = descrs_index();
+        // Every Field of a struct names the same parent layout, which carries
+        // the struct's whole `all_fielddescrs`, and a struct's Fields mostly
+        // sit in consecutive slots.  Reuse the previous slot's layout when it
+        // is the same one: at most one decoded layout is held beyond the slot
+        // that uses it, so the transient stays bounded (see `descr_layout_at`).
+        let mut last_layout: Option<(usize, std::sync::Arc<majit_translate::jitcode::BhSizeSpec>)> =
+            None;
         for (i, kind) in index.kinds.iter().copied().enumerate() {
             if kind != 0 {
                 continue;
             }
-            let bh = load_descr_uncached(i);
+            let bh = load_descr_with_parent(i, |layout| match &last_layout {
+                Some((last, spec)) if *last == layout => spec.clone(),
+                _ => {
+                    let spec = descr_layout_at(layout);
+                    last_layout = Some((layout, spec.clone()));
+                    spec
+                }
+            });
             debug_assert!(!matches!(
                 bh,
                 BhDescr::Call { .. } | BhDescr::JitCode { .. }

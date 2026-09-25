@@ -1673,8 +1673,10 @@ two-phase-never-a-subject	pyre_object::celldict::<Impl>::setitem
 two-phase-never-a-subject	pyre_object::celldict::<Impl>::setitem_str
 two-phase-never-a-subject	pyre_object::celldict::_orig_module_dict_entries_get
 two-phase-never-a-subject	pyre_object::celldict::_orig_module_dict_entries_insert
+two-phase-never-a-subject	pyre_object::celldict::classify_cell_write
 two-phase-never-a-subject	pyre_object::celldict::module_dict_entries_get
 two-phase-never-a-subject	pyre_object::celldict::module_dict_entries_insert
+two-phase-never-a-subject	pyre_object::celldict::write_cell
 two-phase-never-a-subject	pyre_object::complexobject::w_complex_slot_get
 two-phase-never-a-subject	pyre_object::dict_eq_hook::try_hash_str
 two-phase-never-a-subject	pyre_object::dictmultiobject::<Impl>::copy
@@ -1864,6 +1866,7 @@ two-phase-never-a-subject	pyre_object::object_array::items_block_layout
 two-phase-never-a-subject	pyre_object::object_array::try_alloc_typed_items_block
 two-phase-never-a-subject	pyre_object::object_array::try_grow_typed_items_block
 two-phase-never-a-subject	pyre_object::object_array::try_items_block_layout
+two-phase-never-a-subject	pyre_object::pyobject::is_w
 two-phase-never-a-subject	pyre_object::pyobject::notify_w_class_mutated_then
 two-phase-never-a-subject	pyre_object::quasiimmut::<Impl>::invalidate
 two-phase-never-a-subject	pyre_object::quasiimmut::<Impl>::invalidate_then_store

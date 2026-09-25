@@ -1469,17 +1469,12 @@ pub fn trace_bytecode<Sym: WalkSym>(
 ///
 pub(crate) fn bridge_resume_merge_point_regs(
     code: &[u8],
+    scan: &crate::pyjitcode::LoopScanIndex,
     entry: usize,
 ) -> Option<(Vec<u8>, Vec<u8>)> {
-    let merge_point_pcs = || {
-        crate::jitcode_runtime::decoded_ops(code)
-            .filter(|op| op.opname == "jit_merge_point")
-            .map(|op| op.pc)
-    };
-    let mp_pc = merge_point_pcs()
-        .filter(|&pc| pc <= entry)
-        .max()
-        .or_else(|| merge_point_pcs().filter(|&pc| pc >= entry).min())?;
+    let mp_pc = scan
+        .merge_point_at_or_before(entry)
+        .or_else(|| scan.merge_point_at_or_after(entry))?;
     let mut cursor = mp_pc + 1 + 1; // opcode byte + jdindex (`c`)
     let mut lists: [Vec<u8>; 6] = Default::default();
     for slot in lists.iter_mut() {
@@ -1505,11 +1500,12 @@ pub(crate) fn bridge_resume_merge_point_regs(
 /// are deliberately not positional call arguments. The sidecar enters before
 /// the marker, so forward selection (unlike bridge resume's backward
 /// selection) identifies the marker owned by this green entry.
-fn static_entry_merge_point_green_ref_regs(code: &[u8], entry: usize) -> Option<Vec<u8>> {
-    let mp_pc = crate::jitcode_runtime::decoded_ops(code)
-        .filter(|op| op.opname == "jit_merge_point" && op.pc >= entry)
-        .map(|op| op.pc)
-        .min()?;
+fn static_entry_merge_point_green_ref_regs(
+    code: &[u8],
+    scan: &crate::pyjitcode::LoopScanIndex,
+    entry: usize,
+) -> Option<Vec<u8>> {
+    let mp_pc = scan.merge_point_at_or_after(entry)?;
     let mut cursor = mp_pc + 1 + 1; // opcode byte + jdindex (`c`)
     let mut lists: [Vec<u8>; 6] = Default::default();
     for slot in lists.iter_mut() {
@@ -4456,7 +4452,7 @@ fn run_perfn_walk<Sym: WalkSym>(
     let static_entry_green_ref_regs = if is_bridge_trace {
         None
     } else {
-        static_entry_merge_point_green_ref_regs(pjc.jitcode.code.as_slice(), entry)
+        static_entry_merge_point_green_ref_regs(pjc.jitcode.code.as_slice(), pjc.loop_scan(), entry)
     };
     let portal_frame_reg = pjc.metadata.portal_frame_reg;
     let portal_ec_reg = pjc.metadata.portal_ec_reg;
@@ -4507,7 +4503,11 @@ fn run_perfn_walk<Sym: WalkSym>(
             reserved_red_colors.push(frame_color);
             reserved_red_colors.push(ec_color);
         } else {
-            match bridge_resume_merge_point_regs(pjc.jitcode.code.as_slice(), entry) {
+            match bridge_resume_merge_point_regs(
+                pjc.jitcode.code.as_slice(),
+                pjc.loop_scan(),
+                entry,
+            ) {
                 Some((gr, rr)) => {
                     if let Some(&r) = gr.first() {
                         seed(r, pycode_box);
@@ -6091,63 +6091,36 @@ fn probe_walk_perfn_jitcode<Sym: WalkSym>(
 /// narrowing would have to seed every handler the walk can reach, which for
 /// these shapes is the whole tail again.
 ///
-/// The scan exempts one marker class: `LOAD_FAST_CHECK`'s null arm.  The
-/// decline above is a refusal over an *unported* opcode, whose arm bails
-/// without modelling the stack effect the walk then keeps interpreting.
-/// `LOAD_FAST_CHECK` is ported: the codewriter splits it on `ptr_nonzero`,
-/// compiles the bound arm normally, and sends the null arm to a dead-end block.
-/// A walk that finds the local bound takes the bound arm and never sees the
-/// marker; a walk that finds it unbound reaches the marker with the seeding
-/// intact and declines reactively, the ordinary path.  Neither leaves the loop
-/// guard mis-seeded, so the static refusal has nothing to prevent.
-///
-/// The widened `loop_in_try` tail is where this bites: putting the loop inside
-/// a `try` is itself what makes the tail read a loop variable through
-/// `LOAD_FAST_CHECK` rather than `LOAD_FAST` — the raise can reach the handler
-/// before the loop assigns the slot, so the slot is only conditionally bound on
-/// the join — and declining over that marker meant the widening's own predicate
-/// manufactured the marker it tripped on.
-///
 /// The owning opcode comes from `abort_permanent_py_pc_by_jit_pc`, the exact
-/// marker inverse, NOT from `py_floor_by_jit_pc`: the null arm's block is
-/// emitted after the whole body, and the floor table keys each Python PC to its
-/// FIRST jitcode offset, so it attributes that late block to whichever opcode
-/// last opened a segment.
+/// marker inverse, NOT from `py_floor_by_jit_pc`: a marker can sit in a block
+/// the codewriter appends after the whole body, and the floor table keys each
+/// Python PC to its FIRST jitcode offset, so it attributes that late block to
+/// whichever opcode last opened a segment.
 fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<usize> {
     let Some(pjc) = crate::state::pyjitcode_for_code(w_code) else {
         return None;
     };
     let code = pjc.jitcode.code.as_slice();
+    let scan = pjc.loop_scan();
     let Some(merge_point) = pjc
         .merge_entry_for(start_pc)
-        .and_then(|entry| {
-            crate::jitcode_runtime::decoded_ops(code)
-                .filter(|op| op.opname == "jit_merge_point" && op.pc >= entry)
-                .map(|op| op.pc)
-                .min()
-        })
-        .or_else(|| {
-            crate::jitcode_runtime::decoded_ops(code)
-                .find(|op| op.opname == "jit_merge_point")
-                .map(|op| op.pc)
-        })
+        .and_then(|entry| scan.merge_point_at_or_after(entry))
+        .or_else(|| scan.merge_points.first().copied())
     else {
         return None;
     };
 
-    let mut back_edges: Vec<(usize, usize)> = Vec::new();
-    let mut abort_permanent_pcs: Vec<usize> = Vec::new();
-    for op in crate::jitcode_runtime::decoded_ops(code).filter(|op| op.pc > merge_point) {
-        if op.opname == "abort_permanent" {
-            abort_permanent_pcs.push(op.pc);
-        }
-        if op.opname.starts_with("goto") && op.argcodes.ends_with('L') {
-            let target = u16::from_le_bytes([code[op.next_pc - 2], code[op.next_pc - 1]]) as usize;
-            if target <= merge_point {
-                back_edges.push((target, op.pc));
-            }
-        }
-    }
+    let back_edges: Vec<(usize, usize)> = scan
+        .label_gotos
+        .iter()
+        .filter(|&&(pc, target)| pc > merge_point && target <= merge_point)
+        .map(|&(pc, target)| (target, pc))
+        .collect();
+    let abort_permanent_pcs = scan
+        .abort_permanents
+        .iter()
+        .copied()
+        .filter(|&pc| pc > merge_point);
 
     // A backward goto closes the loop headed at `merge_point` only when it
     // jumps to that header.  One that jumps further back closes an ENCLOSING
@@ -6205,7 +6178,6 @@ fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<us
         loop_handler.map(|(target, _, _)| target as usize / 2)
     };
     abort_permanent_pcs
-        .into_iter()
         .filter(|pc| {
             if *pc < loop_end {
                 return true;
@@ -6217,7 +6189,7 @@ fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<us
             // conservative direction `abort_permanent_owner` documents.
             abort_permanent_owner(w_code, &pjc, *pc).is_none_or(|(py_pc, _)| py_pc >= handler_py_pc)
         })
-        .find(|pc| !marker_is_load_fast_check_null_arm(w_code, &pjc, *pc))
+        .next()
 }
 
 /// The Python PC and decoded opcode that emitted the `abort_permanent` at
@@ -6247,22 +6219,7 @@ fn abort_permanent_owner(
     Some((py_pc, instr))
 }
 
-/// True when the `abort_permanent` at `marker_jit_pc` is the dead-end arm
-/// `LOAD_FAST_CHECK` emits for a conditionally-bound slot (`codewriter.rs`
-/// `Instruction::LoadFastCheck`, the `emit_abort_permanent!(py_pc,
-/// closes_block)` leg).
-fn marker_is_load_fast_check_null_arm(
-    w_code: *const (),
-    pjc: &crate::pyjitcode::PyJitCodePayload,
-    marker_jit_pc: usize,
-) -> bool {
-    matches!(
-        abort_permanent_owner(w_code, pjc, marker_jit_pc),
-        Some((_, pyre_interpreter::Instruction::LoadFastCheck { .. }))
-    )
-}
-
-/// `"py_pc=47 LoadFastCheck"` for the `PYRE_FBW_DEBUG_ABORT` line, or
+/// `"py_pc=47 YieldValue"` for the `PYRE_FBW_DEBUG_ABORT` line, or
 /// `"owner=?"` when the inverse cannot name it.
 ///
 /// A bare jitcode offset does not say which opcode declined the frame, and the
@@ -7431,12 +7388,13 @@ mod tests {
             0,  // rf
         ];
 
+        let scan = crate::pyjitcode::LoopScanIndex::build(&code);
         assert_eq!(
-            super::static_entry_merge_point_green_ref_regs(&code, 0),
+            super::static_entry_merge_point_green_ref_regs(&code, &scan, 0),
             Some(vec![9])
         );
         assert_eq!(
-            super::static_entry_merge_point_green_ref_regs(&code, code.len()),
+            super::static_entry_merge_point_green_ref_regs(&code, &scan, code.len()),
             None,
             "a sidecar after the marker must not bind an earlier sibling marker"
         );

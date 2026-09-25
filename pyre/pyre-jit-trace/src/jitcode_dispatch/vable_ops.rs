@@ -340,7 +340,6 @@ mod frame_replacement_tests {
                 frame: old,
                 w_code: 0,
                 last_instruction: 7,
-                lineno: 8,
             };
             let tail = ctx.trace_ctx.const_ref(0);
             let guards_before = ctx.trace_ctx.num_guards();

@@ -5289,117 +5289,7 @@ pub(crate) fn named_key_hash(key: &str, pycode: PyObjectRef, nameindex: usize) -
 
 /// PyPy-compatible identity check returning a raw boolean value.
 pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
-    if std::ptr::eq(w_one, w_two) {
-        return true;
-    }
-    // `W_AbstractIntObject.is_w` (intobject.py): two plain `int`s
-    // — `W_IntObject` or the BigInt-backed `W_LongObject` — are
-    // identical when their values are equal.  `bool`
-    // (`W_BoolObject.is_w` is pure pointer identity, boolobject.py)
-    // and `int` subclasses (`user_overridden_class`) keep pointer
-    // identity — the exact-type gate excludes both (a `bool`'s
-    // `w_class` is `bool`, a subclass instance's is the subclass), so
-    // they fall through to the `ptr::eq` above.
-    //
-    // Tagged immediates need no special case: `is_exact_type` reports a
-    // tagged int as an exact `int` (never a subclass — those stay boxed),
-    // and `range_obj_to_bigint` reads its value through the tag-aware
-    // `w_int_get_value`. Two equal-valued immediates already matched the
-    // `ptr::eq` above (identical bit patterns); an immediate and a boxed
-    // int of the same value fall here and compare equal by value.
-    unsafe {
-        if pyre_object::pyobject::is_exact_type(w_one, &pyre_object::pyobject::INT_TYPE)
-            && pyre_object::pyobject::is_exact_type(w_two, &pyre_object::pyobject::INT_TYPE)
-        {
-            // `space.bigint_w(self).eq(space.bigint_w(w_other))`
-            // (intobject.py:51-53). A `W_LongObject` stores a `BigInt`
-            // pointer, so it must be read as a bigint, not as an i64.
-            return pyre_object::functional::range_obj_to_bigint(w_one)
-                == pyre_object::functional::range_obj_to_bigint(w_two);
-        }
-        // `W_FloatObject.is_w` (floatobject.py): two plain
-        // `float`s are identical when their bit patterns are equal
-        // (`float2longlong`), so `0.0 is -0.0` is false. `float` subclasses
-        // (`user_overridden_class`) keep pointer identity — the exact-type
-        // gate excludes them.
-        //
-        // CPython 3.14 gives NaNs pointer identity; unlike finite floats they
-        // stay boxed (`cpython_differences.rst`, "Object Identity of Primitive
-        // Values, `is` and `id`").
-        if pyre_object::pyobject::is_exact_type(w_one, &pyre_object::pyobject::FLOAT_TYPE)
-            && pyre_object::pyobject::is_exact_type(w_two, &pyre_object::pyobject::FLOAT_TYPE)
-        {
-            let one = pyre_object::floatobject::w_float_get_value(w_one);
-            let two = pyre_object::floatobject::w_float_get_value(w_two);
-            if one.is_nan() || two.is_nan() {
-                return false;
-            }
-            return one.to_bits() == two.to_bits();
-        }
-        // CPython 3.14 gives complex objects pointer identity, handled above.
-        // `W_AbstractTupleObject.is_w` (tupleobject.py): a `tuple` is
-        // identical to another only when both are the empty tuple — "empty
-        // tuples are unique-ified". Non-empty tuples keep pointer identity
-        // (the `ptr::eq` above handled `self is w_other`); `tuple`
-        // subclasses keep pointer identity through the exact-type gate. The
-        // specialised arity-2 tuples carry the canonical `tuple` w_class, so
-        // they pass the gate but are never empty (length 2).
-        if pyre_object::pyobject::is_exact_type(w_one, &pyre_object::pyobject::TUPLE_TYPE)
-            && pyre_object::pyobject::is_exact_type(w_two, &pyre_object::pyobject::TUPLE_TYPE)
-        {
-            return pyre_object::tupleobject::w_tuple_len(w_one) == 0
-                && pyre_object::tupleobject::w_tuple_len(w_two) == 0;
-        }
-        // `W_AbstractBytesObject.is_w` (bytesobject.py): for distinct
-        // exact-`bytes` operands, `len(s2) > 1` returns `s1 is s2` (storage
-        // identity); BytesListStrategy re-wraps the same erased rpython string,
-        // so distinct wrappers may deliberately share that backing block.
-        // `len(s2) == 0` returns `len(s1) == 0`; `len(s2) == 1`
-        // (unique-ified) returns `len(s1) == 1 && s1[0] == s2[0]`.
-        if pyre_object::pyobject::is_exact_type(w_one, &pyre_object::bytesobject::BYTES_TYPE)
-            && pyre_object::pyobject::is_exact_type(w_two, &pyre_object::bytesobject::BYTES_TYPE)
-        {
-            let len1 = pyre_object::bytesobject::w_bytes_len(w_one);
-            let len2 = pyre_object::bytesobject::w_bytes_len(w_two);
-            if len2 > 1 {
-                return pyre_object::bytesobject::w_bytes_block(w_one)
-                    == pyre_object::bytesobject::w_bytes_block(w_two);
-            }
-            if len2 == 0 {
-                return len1 == 0;
-            }
-            return len1 == 1
-                && pyre_object::bytesobject::w_bytes_getitem(w_one, 0)
-                    == pyre_object::bytesobject::w_bytes_getitem(w_two, 0);
-        }
-        // `W_UnicodeObject.is_w` (unicodeobject.py): strings longer than one
-        // code point use `_utf8` storage identity; AsciiListStrategy
-        // deliberately re-wraps that same storage. Zero- and one-code-point
-        // strings are unique-ified and compare by value.
-        // `str` subclasses keep pointer identity through the exact-type gate.
-        if pyre_object::pyobject::is_exact_type(w_one, &pyre_object::pyobject::STR_TYPE)
-            && pyre_object::pyobject::is_exact_type(w_two, &pyre_object::pyobject::STR_TYPE)
-        {
-            if pyre_object::unicodeobject::w_str_len(w_one) > 1 {
-                return pyre_object::unicodeobject::w_str_storage(w_one)
-                    == pyre_object::unicodeobject::w_str_storage(w_two);
-            }
-            return pyre_object::unicodeobject::w_str_get_wtf8(w_one)
-                == pyre_object::unicodeobject::w_str_get_wtf8(w_two);
-        }
-        // `W_FrozensetObject.is_w` (setobject.py): two `frozenset`s
-        // are identical only when both are empty — "empty frozensets are
-        // unique-ified". The mutable `set` carries a distinct type tag and
-        // does not override `is_w`, so the `FROZENSET_TYPE` gate excludes
-        // it; `frozenset` subclasses are excluded too.
-        if pyre_object::pyobject::is_exact_type(w_one, &pyre_object::setobject::FROZENSET_TYPE)
-            && pyre_object::pyobject::is_exact_type(w_two, &pyre_object::setobject::FROZENSET_TYPE)
-        {
-            return pyre_object::setobject::w_set_len(w_one) == 0
-                && pyre_object::setobject::w_set_len(w_two) == 0;
-        }
-    }
-    false
+    pyre_object::pyobject::is_w(w_one, w_two)
 }
 
 /// PyPy-compatible identity check returning a Python bool object.
@@ -21061,16 +20951,23 @@ unsafe fn generator_kind(gen_obj: PyObjectRef) -> &'static str {
 /// return, which surfaces through the `Ok`/`frame_finished_execution` path.
 unsafe fn leak_generator_iteration(mut e: PyError, message: &str) -> PyError {
     use pyre_object::interp_exceptions::*;
+    // `generator.py _leak_stopiteration` / `chain_exceptions_from_cause`:
+    // the leaked exception becomes both `__context__` and `__cause__` of the
+    // RuntimeError. It is a nursery object (`alloc_exception_nursery`), and
+    // `w_exception_new` collects (`collect_and_reserve`), so the pin is the
+    // root the minor rewrites. The `PyError` cache and this local are not.
     let w_stopiter = e.to_exc_object();
-    // Root the leaked StopIteration across the RuntimeError allocation below:
-    // it lives only in this Rust local, which the precise collector does not
-    // scan, so a collection inside `w_exception_new` could sweep it before it
-    // is stamped onto `rt` as `__context__` / `__cause__`.
     let _roots = pyre_object::gc_roots::push_roots();
+    let stop_slot = pyre_object::gc_roots::shadow_stack_len();
     if !w_stopiter.is_null() {
         let _ = pyre_object::gc_roots::pin_root(w_stopiter);
     }
     let rt = w_exception_new(ExcKind::RuntimeError, message);
+    let w_stopiter = if w_stopiter.is_null() {
+        w_stopiter
+    } else {
+        pyre_object::gc_roots::shadow_stack_get(stop_slot)
+    };
     if pyre_object::is_exception(rt) && !w_stopiter.is_null() {
         w_exception_set_context(rt, w_stopiter);
         w_exception_set_cause(rt, w_stopiter);

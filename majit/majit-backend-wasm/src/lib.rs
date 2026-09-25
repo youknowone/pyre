@@ -1070,6 +1070,13 @@ pub fn jit_exc_value_peek() -> i64 {
     JIT_EXC_VALUE.load(Ordering::Relaxed)
 }
 
+/// Root-walker write-back for `JIT_EXC_VALUE`: a minor collection moved the
+/// pending exception from `old` to `new`. A compare-exchange, so a cell that
+/// no longer holds `old` is left alone.
+pub fn jit_exc_value_forward(old: i64, new: i64) {
+    let _ = JIT_EXC_VALUE.compare_exchange(old, new, Ordering::Relaxed, Ordering::Relaxed);
+}
+
 /// Clear both exception slots without reading the value.
 pub fn jit_exc_clear() {
     JIT_EXC_VALUE.store(0, Ordering::Relaxed);
@@ -4808,6 +4815,28 @@ fn exit_arg_word(frame_ptr: usize, fail_descr: &WasmFailDescr, index: usize) -> 
     })
 }
 
+/// Box an `execute_token` exit for the host classifier.
+///
+/// A propagate-exception guard is retargeted at
+/// `exit_frame_with_exception_descr_ref` first
+/// (`failguard::stage_propagate_exception_exit`, `compile.py`
+/// `PropagateExceptionDescr.handle_fail`). The in-guest CALL_ASSEMBLER
+/// path does not come through here: `dead_frame_from_ran_frame` keeps the
+/// singleton so `wasm_ca_resume_deopt` can publish it to the caller's
+/// `GUARD_NO_EXCEPTION`.
+#[cfg(target_arch = "wasm32")]
+fn box_exit_frame(
+    raw_values: Vec<i64>,
+    fail_descr: Arc<WasmFailDescr>,
+    exc_value: i64,
+) -> Box<WasmFrameData> {
+    if let Some((staged, exc)) = failguard::stage_propagate_exception_exit(&fail_descr, exc_value) {
+        WasmFrameData::boxed(vec![exc], staged, 0)
+    } else {
+        WasmFrameData::boxed(raw_values, fail_descr, exc_value)
+    }
+}
+
 /// Reconstruct a [`DeadFrame`] from a callee frame an in-guest `call_indirect`
 /// already ran to a guard/finish exit (the self-recursive CALL_ASSEMBLER fast
 /// path, `PYRE_WASM_CA`). This is the post-`glue::execute` tail of
@@ -5592,6 +5621,10 @@ impl majit_backend::Backend for WasmBackend {
 
     fn set_exit_frame_with_exception_descr_ref(&mut self, descr: Arc<dyn majit_ir::Descr>) {
         failguard::attach_finish_descr(failguard::FINISH_EXIT_INDEX_EXC, descr);
+    }
+
+    fn set_propagate_exception_descr(&mut self, descr: Arc<dyn majit_ir::Descr>) {
+        failguard::attach_propagate_exception_descr(descr);
     }
 
     fn set_next_header_pc(&mut self, header_pc: u64) {
@@ -6830,7 +6863,7 @@ impl majit_backend::Backend for WasmBackend {
                 // its lazy force may arrive after the execution root is gone.
                 install_post_finish_force_gcmap(jf);
                 wasm_jit_write_barrier(jf as i64);
-                let mut data = WasmFrameData::boxed(raw_values, fail_descr, exc_value);
+                let mut data = box_exit_frame(raw_values, fail_descr, exc_value);
                 // `boxed` registers the copied Ref slots and may collect.
                 // Keep the JITFRAME on the shadow stack across that call so
                 // `jf_savedata` is forwarded, then publish the updated
@@ -6923,7 +6956,7 @@ impl majit_backend::Backend for WasmBackend {
                     None,
                 )
             };
-            let mut data = WasmFrameData::boxed(raw_values, fail_descr, exc_value);
+            let mut data = box_exit_frame(raw_values, fail_descr, exc_value);
             data.take_host_frame(owner);
             DeadFrame::Boxed(data)
         }

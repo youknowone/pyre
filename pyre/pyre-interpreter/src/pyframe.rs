@@ -523,11 +523,22 @@ pub mod frame_locals_proxy {
         /// plus freevars, which is green.  The extras half is bounded by the
         /// dict's length instead, so it is not part of this scan.
         #[majit_macros::unroll_safe]
-        fn pin_entries(&self, roots: &pyre_object::gc_roots::RootScope) -> usize {
+        fn pin_entries(
+            &self,
+            roots: &pyre_object::gc_roots::RootScope,
+            frame_slot: usize,
+        ) -> usize {
             let mut count = 0;
             // `code` addresses the compiler code object, which lives outside
             // the GC heap and so stays valid across those collections.
-            let code = self.frame().code();
+            // The frame itself is nursery-allocated and `intern_str_value`
+            // below can collect, so each iteration re-reads `frame_slot`
+            // (`shadowstack.py` restores the livevar after the call).
+            let frame = || unsafe { &mut *(roots.get(frame_slot) as *mut PyFrame) };
+            // `pycode` is outside the GC heap. Take the pointer once so the
+            // `CodeObject` borrow does not keep the frame temporary alive.
+            let code_ptr = unsafe { crate::pyframe::pyframe_get_pycode(frame()) };
+            let code = unsafe { &*code_ptr };
             // The first slot this scan claims. Reading it from the bracket
             // rather than from `roots.base()` keeps the pair arithmetic below
             // correct for a caller that had already pinned something.
@@ -535,7 +546,7 @@ pub mod frame_locals_proxy {
             // A plain loop rather than a closure over `self`, for the reason
             // [`PyFrame::frame_locals_proxy_snapshot`] gives.
             for (index, name, cell_slot) in locals_plus_names(code) {
-                let frame = self.frame();
+                let frame = frame();
                 if index >= locals_w!(frame).len() {
                     continue;
                 }
@@ -872,14 +883,20 @@ pub mod frame_locals_proxy {
         #[majit_macros::unroll_safe]
         fn collect_entries(&self, part: usize) -> Result<PyObjectRef, crate::PyError> {
             let roots = pyre_object::gc_roots::push_roots();
-            let base = roots.base();
-            let count = self.pin_entries(&roots);
+            // Nursery frame (`emit_new_pyframe_inline_with_params`).
+            // `w_list_new` collects, and this `&self` is not a root, so
+            // the frame word is pinned and re-read afterwards.
+            let frame_slot = roots.base();
+            let _ = roots.pin_root(self.w_frame);
+            let base = pyre_object::gc_roots::shadow_stack_len();
+            let count = self.pin_entries(&roots, frame_slot);
             let mut entries: Vec<PyObjectRef> = Vec::with_capacity(count);
             for index in 0..count {
                 entries.push(roots.get(base + index * 2 + part));
             }
             let entries = pyre_object::w_list_new(entries);
-            let extra = self.frame().get_extra_locals();
+            let frame = unsafe { &*(roots.get(frame_slot) as *const PyFrame) };
+            let extra = frame.get_extra_locals();
             if extra.is_null() {
                 return Ok(entries);
             }
@@ -894,8 +911,10 @@ pub mod frame_locals_proxy {
             // scan and the tuples already built are pre-allocation copies by
             // the next iteration.  Publish both and read them back.
             let roots = pyre_object::gc_roots::push_roots();
-            let pairs_base = roots.base();
-            let count = self.pin_entries(&roots);
+            let frame_slot = roots.base();
+            let _ = roots.pin_root(self.w_frame);
+            let pairs_base = pyre_object::gc_roots::shadow_stack_len();
+            let count = self.pin_entries(&roots, frame_slot);
             let out_base = roots.publish(&[]);
             for index in 0..count {
                 let _ = roots.pin_root(pyre_object::w_tuple_new(vec![
@@ -908,7 +927,8 @@ pub mod frame_locals_proxy {
                 out.push(roots.get(out_base + i));
             }
             let items = pyre_object::w_list_new(out);
-            let extra = self.frame().get_extra_locals();
+            let frame = unsafe { &*(roots.get(frame_slot) as *const PyFrame) };
+            let extra = frame.get_extra_locals();
             if extra.is_null() {
                 return Ok(items);
             }

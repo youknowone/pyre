@@ -2743,7 +2743,7 @@ pub fn blackhole_resume_via_rd_numb<'df>(
     // CALL_ASSEMBLER caller: the decode below rebuilds virtuals through the
     // blackhole allocator while the grabbed exception is still only a bare
     // pointer with no deadframe root behind it.
-    let _guard_exc_root = majit_metainterp::blackhole::GuardExcRoot::park(guard_exc);
+    let guard_exc_root = majit_metainterp::blackhole::GuardExcRoot::park(guard_exc);
 
     use majit_metainterp::resume;
 
@@ -3077,6 +3077,10 @@ pub fn blackhole_resume_via_rd_numb<'df>(
     // loop advances to nextblackholeinterp), so walk the chain here.
     if guard_exc != 0 {
         loop {
+            // The traceback records below allocate their nodes through the
+            // collecting nursery hook and can move the exception; the park
+            // holds its forwarded address, `guard_exc` the pre-move copy.
+            let guard_exc = guard_exc_root.get();
             if bh.handle_exception_in_frame(guard_exc) {
                 // Handler found in this frame; `position` now points at it.
                 // Fall through to the run loop to execute the handler.
@@ -3101,6 +3105,8 @@ pub fn blackhole_resume_via_rd_numb<'df>(
                     // resolves the raise coordinate and honours a bare reraise,
                     // as it does for the sibling propagation loop.
                     if !frame_ptr.is_null() {
+                        // Re-read past `leave_resumed_blackhole_frame`.
+                        let guard_exc = guard_exc_root.get();
                         match jitcode_index {
                             Some(jitcode_index) => record_caught_blackhole_traceback(
                                 guard_exc,
@@ -3122,11 +3128,16 @@ pub fn blackhole_resume_via_rd_numb<'df>(
                 None => {
                     // blackhole.py:1629 bottommost frame, unhandled →
                     // raise ExitFrameWithExceptionRef(exc).
-                    let err = exit_frame_exception_ref(guard_exc, "guard_exc propagation", || {
-                        format!(
-                            "jitcode={jitcode_index:?} last_opcode_position={last_opcode_position}"
-                        )
-                    });
+                    let mut err = exit_frame_exception_ref(
+                        guard_exc_root.get(),
+                        "guard_exc propagation",
+                        || {
+                            format!(
+                                "jitcode={jitcode_index:?} \
+                                 last_opcode_position={last_opcode_position}"
+                            )
+                        },
+                    );
                     if !frame_ptr.is_null() {
                         match jitcode_index {
                             // Every indexed frame recorded during blackhole
@@ -3147,6 +3158,9 @@ pub fn blackhole_resume_via_rd_numb<'df>(
                                 );
                             },
                         }
+                        // `err` was built from the parked exception, which
+                        // the record above can move.
+                        err.exc_object = guard_exc_root.get() as PyObjectRef;
                     }
                     // `guard_exc` is now owned by the typed
                     // `ExitFrameWithExceptionRef` result. A can-raise
@@ -3253,18 +3267,19 @@ pub fn blackhole_resume_via_rd_numb<'df>(
             // exception lives only in a Rust local — and this block
             // allocates: `record_application_traceback` builds a traceback
             // node, and so does the caller's `handle_exception_in_frame` →
-            // `route_to_catch`.  Exception objects do not move
-            // (`w_exception_new_empty` uses the stable old gen) but old gen is
-            // mark-sweep, so an unrooted one in that window is collectable and
-            // its block reusable — which is what hands
-            // `exit_frame_exception_ref` a mapped object of the wrong class.
+            // `route_to_catch`.  The exception is a nursery object
+            // (`w_exception_new_empty` → `alloc_exception_nursery`,
+            // `malloc_fixedsize` → `collect_and_reserve`), so that allocation
+            // moves it.  An unrooted local keeps the pre-move address, which
+            // is what hands `exit_frame_exception_ref` a mapped object of the
+            // wrong class.
             // `blackhole.py _run_forever` keeps every interp in the chain
             // — and with it `exception_last_value` — transitively traced for
             // its whole life; root the value across the equivalent window.
             let _exc_roots = pyre_object::gc_roots::push_roots();
             let exc_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(bh.exception_last_value as PyObjectRef);
-            let exc_value = bh.exception_last_value;
+            let exc_value = pyre_object::gc_roots::shadow_stack_get(exc_slot) as i64;
             let next = bh.nextblackholeinterp.take();
             let frame_ptr = bh.virtualizable_ptr as *mut PyFrame;
             let jitcode_index = bh.jitcode.try_index().map(|v| v as i32);
@@ -3316,6 +3331,7 @@ pub fn blackhole_resume_via_rd_numb<'df>(
             // pytraceback.py record_application_traceback at every Python
             // frame boundary. A forwarding raise preserves the existing chain.
             if !keeps_existing_traceback && !frame_ptr.is_null() {
+                let exc_value = pyre_object::gc_roots::shadow_stack_get(exc_slot) as i64;
                 if let Some(jitcode_index) = jitcode_index {
                     record_caught_blackhole_traceback(
                         exc_value,
@@ -4678,6 +4694,13 @@ fn try_compile_ca_bridge(
     descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
     raw_values: &[i64],
     guard_value_operand: Option<i64>,
+    // `cpu.grab_exc_value(deadframe)` (llmodel.py). `jit_ca_handle_guard_failure`
+    // re-reads `jf_guard_exc` and threads that word; the wasm deopt has already
+    // moved it into this argument (`dead_frame_from_ran_frame`'s `jit_exc_take`).
+    // `prepare_resume_from_failure` (pyjitpl.py) calls `execute_ll_raised` then
+    // `handle_possible_exception`, so the bridge enters the handler with the
+    // exception live. `0` is the no-exception resume.
+    guard_exc: i64,
 ) -> CaBridgeAttempt {
     if raw_values.is_empty() {
         return CaBridgeAttempt {
@@ -4734,7 +4757,7 @@ fn try_compile_ca_bridge(
     let frame = unsafe { &mut *frame_ptr };
     let _guard = crate::eval::GuardCompilingScope::new(descr_arc);
     let _compiled = matches!(
-        trace_and_compile_from_bridge(descr_arc, frame, raw_values, &exit_layout, 0, false),
+        trace_and_compile_from_bridge(descr_arc, frame, raw_values, &exit_layout, guard_exc, false,),
         BridgeResolution::CompiledContinue
     );
     // The wasm CALL_ASSEMBLER path likewise bypasses handle_fail's dependency drain.
@@ -4827,6 +4850,23 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             } else {
                 Outcome::Finished(result)
             }
+        } else if majit_backend_wasm::failguard::is_propagate_exception_descr(&descr_arc) {
+            // compile.py `PropagateExceptionDescr.handle_fail`
+            // (`compile_tmp_callback`). The guard's descr is the cpu's
+            // `propagate_exception_descr` singleton and its failargs are
+            // empty, so the resume-guard arm below has no `rd_numb` and
+            // the caller would continue as if the call returned NULL.
+            // `grab_exc_value` reads the exception the guard left in the
+            // frame; an empty cell falls back to `memory_error`. Publish
+            // it the way the ExitFrameWithException arm does, so the
+            // caller's GUARD_NO_EXCEPTION sees the raise.
+            let exc_val = backend.grab_exc_value(&frame).0 as i64;
+            let value = if exc_val != 0 {
+                exc_val
+            } else {
+                majit_backend::memory_error_singleton_ref()
+            };
+            Outcome::FinishedException(value)
         } else {
             let green_key = majit_backend::descr_owning_jct(descr)
                 .map(|jct| jct.green_key())
@@ -4901,7 +4941,8 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
                     exit_layout.is_traced_ref_slot(index)
                 })
             };
-            let attempt = try_compile_ca_bridge(&descr_arc, &raw_values, guard_value_operand);
+            let attempt =
+                try_compile_ca_bridge(&descr_arc, &raw_values, guard_value_operand, guard_exc);
             if attempt.terminal_declined {
                 // This target cannot reach compiled steady state: each CA
                 // invocation would blackhole.  Invalidate callers so the next

@@ -120,9 +120,9 @@ pub struct SSARepr {
     ///
     /// `pc_first_insn_pos` above cannot answer "which opcode owns this
     /// marker": it keeps only the FIRST position per Python PC, so a block
-    /// emitted out of source order — the `LoadFastCheck` null arm, appended
-    /// after the whole body — is attributed to whichever PC last opened a
-    /// segment.  Markers are the one op class that needs the exact inverse
+    /// emitted out of source order — appended after the whole body — is
+    /// attributed to whichever PC last opened a segment.  Markers are the one
+    /// op class that needs the exact inverse
     /// (`loop_body_abort_permanent_pc` decides a whole frame on it), and there
     /// are a handful per jitcode, so recording them exactly costs nothing that
     /// a dense per-op table would.
@@ -2352,10 +2352,10 @@ impl<'a> GraphFlattener<'a> {
         // PC dispatch via per-PC `Insn::Label("pc{N}")`; that runtime
         // mechanism remains on the walker side for now, but canonical
         // now matches upstream's structure exactly.
-        let operations = block.borrow().operations.clone();
-        let exits_len = block.borrow().exits.len();
-        let exitswitch_is_last_exception = block.borrow().canraise();
-        for op in &operations {
+        let block_borrow = block.borrow();
+        let exits_len = block_borrow.exits.len();
+        let exitswitch_is_last_exception = block_borrow.canraise();
+        for op in &block_borrow.operations {
             // `flatten.py:120-125` `_ovf` validity check: an overflow-
             // checked op must live in a canraise block with 2 or 3
             // exits; otherwise the rtyper-side guarantee that an
@@ -2382,6 +2382,7 @@ impl<'a> GraphFlattener<'a> {
                 break;
             }
         }
+        drop(block_borrow);
         self.insert_exits(&block, handling_ovf);
     }
 

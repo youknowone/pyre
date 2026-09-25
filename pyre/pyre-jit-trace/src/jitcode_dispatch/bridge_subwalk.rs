@@ -32,7 +32,7 @@ use super::*;
 fn record_bridge_handler_entry_traceback<Sym: WalkSym>(
     wc: &mut WalkContext<'_, '_, Sym>,
     exc: OpRef,
-    exc_concrete: ConcreteValue,
+    mut exc_concrete: ConcreteValue,
     position: usize,
 ) -> Result<(), DispatchError> {
     // The handler is part of the trace, so once this bridge runs compiled it
@@ -45,8 +45,15 @@ fn record_bridge_handler_entry_traceback<Sym: WalkSym>(
     // does not leave the node behind for the metainterp's own delivery to
     // record on top of.
     let emit_runtime = !record_prepend_application_traceback(wc, exc, exc_concrete, position)?;
-    record_inline_application_traceback(wc, exc, exc_concrete, position, true, emit_runtime);
-    record_top_level_application_traceback(wc, exc, exc_concrete, position, true, emit_runtime);
+    record_inline_application_traceback(wc, exc, &mut exc_concrete, position, true, emit_runtime);
+    record_top_level_application_traceback(
+        wc,
+        exc,
+        &mut exc_concrete,
+        position,
+        true,
+        emit_runtime,
+    );
     Ok(())
 }
 
@@ -513,22 +520,14 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             // reads (`last_exc_value/>r`) is the SAVE_EXCEPTION box — the
             // runtime-restored value, NOT a baked constant — so a value-using
             // handler (`except E as e`) sees the actual exception.
-            wc.set_last_exc_value(value_op, ConcreteValue::Ref(exc_edge_concrete));
+            let mut exc_edge_box = ConcreteValue::Ref(exc_edge_concrete);
+            wc.set_last_exc_value(value_op, exc_edge_box);
             wc.fbw_mode.class_of_last_exc_is_const = true;
             // The inlined callees this route unwound clear out of, innermost
             // first, BEFORE the catching frame's own node: both recorders
             // prepend, so emission order is the chain read outermost-first.
-            record_exc_edge_discarded_tracebacks(
-                &mut wc,
-                value_op,
-                ConcreteValue::Ref(exc_edge_concrete),
-            );
-            record_bridge_handler_entry_traceback(
-                &mut wc,
-                value_op,
-                ConcreteValue::Ref(exc_edge_concrete),
-                position,
-            )?;
+            record_exc_edge_discarded_tracebacks(&mut wc, value_op, &mut exc_edge_box);
+            record_bridge_handler_entry_traceback(&mut wc, value_op, exc_edge_box, position)?;
             // Reconstruct the handler-entry operand stack + push the exc box on
             // the new TOS (mirrors the mid-walk SubRaise catch routing).
             vstack_enter_exception_handler(&mut wc, catch_target, value_op);
@@ -538,7 +537,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             // already-caught exception (mirrors `blackhole.rs route_to_catch`).
             majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
             catch_target
-        } else if let Some(seed) = carrier_raise_seed {
+        } else if let Some(mut seed) = carrier_raise_seed {
             // Carrier-boundary raise: the inlined callee's sub-walk already
             // RECORDED the exception (a NewWithVtable of a known const class from
             // its inline RAISE), so `seed.exc` is a live trace box carrying its
@@ -593,7 +592,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
                     record_top_level_application_traceback(
                         &mut wc,
                         seed.exc,
-                        seed.exc_concrete,
+                        &mut seed.exc_concrete,
                         position,
                         true,
                         false,

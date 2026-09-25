@@ -844,6 +844,57 @@ pub fn exit_frame_with_exception_attached() -> bool {
     finish_exit(FINISH_EXIT_INDEX_EXC).meta_descr.is_some()
 }
 
+/// `pyjitpl.py` `self.cpu.propagate_exception_descr = exc_descr`.
+///
+/// Dynasm and cranelift compare `Arc::as_ptr` of this singleton, and of the
+/// `FailDescrCell` a `GUARD_NO_EXCEPTION` recovery stub writes, against
+/// `jf_descr`. A wasm frame stores an exit index; `get_latest_descr_arc`
+/// recovers this Arc from `WasmFailDescr.meta_descr`, so the same identity
+/// compare is `Arc::ptr_eq`.
+static PROPAGATE_EXCEPTION_DESCR: parking_lot::Mutex<Option<DescrRef>> =
+    parking_lot::Mutex::new(None);
+
+pub fn attach_propagate_exception_descr(descr: DescrRef) {
+    *PROPAGATE_EXCEPTION_DESCR.lock() = Some(descr);
+}
+
+pub fn is_propagate_exception_descr(descr: &DescrRef) -> bool {
+    PROPAGATE_EXCEPTION_DESCR
+        .lock()
+        .as_ref()
+        .is_some_and(|propagate| Arc::ptr_eq(descr, propagate))
+}
+
+/// `compile.py` `PropagateExceptionDescr.handle_fail` for the host's
+/// outermost exit reader.
+///
+/// That descr's `fail_index` is `u32::MAX` and `is_finish` is false, so the
+/// reader treats the exit as a loop-back JUMP and drops the exception.
+/// When `fail_descr` carries the propagate singleton, return the attached
+/// `exit_frame_with_exception_descr_ref` and the grabbed value (or
+/// `memory_error` when the cell is empty) so the finish reader raises
+/// `ExitFrameWithExceptionRef` from slot 0. `None` when this is not that
+/// exit, when the exception descr was never attached — a bare finish would
+/// hand the object back as the loop result — or when neither cell holds one.
+pub fn stage_propagate_exception_exit(
+    fail_descr: &WasmFailDescr,
+    exc_value: i64,
+) -> Option<(Arc<WasmFailDescr>, i64)> {
+    let meta = fail_descr.meta_descr.as_ref()?;
+    if !is_propagate_exception_descr(meta) || !exit_frame_with_exception_attached() {
+        return None;
+    }
+    let exc = if exc_value != 0 {
+        exc_value
+    } else {
+        majit_backend::memory_error_singleton_ref()
+    };
+    if exc == 0 {
+        return None;
+    }
+    Some((finish_exit(FINISH_EXIT_INDEX_EXC), exc))
+}
+
 /// Stable, guest-memory dispatch entries, keyed by CALL_ASSEMBLER token.
 /// `Box` is intentional: an emitted module bakes the entry address.
 pub static WASM_CA_DISPATCH: parking_lot::Mutex<

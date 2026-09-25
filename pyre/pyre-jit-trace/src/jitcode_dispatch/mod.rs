@@ -868,10 +868,56 @@ impl WalkSession {
 /// deliveries, and the handler reads the whole chain twice over.
 /// `fbw_store_journal_rollback` splices the journaled link back out; the commit
 /// path keeps it, because a committed walk's node IS this iteration's.
-fn journaled_concrete_traceback_attach(exc_ptr: pyre_object::PyObjectRef, attach: impl FnOnce()) {
-    let previous_head = crate::jitcode_dispatch::fbw_traceback_journal_head(exc_ptr);
-    attach();
-    crate::jitcode_dispatch::fbw_traceback_journal_push_if_attached(exc_ptr, previous_head);
+/// `attach` receives the shadow-stack slot of `exc_ptr`. A concrete
+/// `record_application_traceback` (`w_pytraceback_new`) collects, and the
+/// slot — not the `PyObjectRef` copy — is what the collector rewrites.
+/// Re-read that slot after every allocating step inside `attach`.
+fn journaled_concrete_traceback_attach(
+    exc_ptr: &mut pyre_object::PyObjectRef,
+    attach: impl FnOnce(usize),
+) {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(*exc_ptr);
+    let live = pyre_object::gc_roots::shadow_stack_get(slot);
+    let previous_head = crate::jitcode_dispatch::fbw_traceback_journal_head(live);
+    // The previous head is a nursery traceback node. Pin it too: the attach
+    // moves it, and the journal's "head changed" compare needs the forwarded
+    // address (`fbw_traceback_journal_push_if_attached`).
+    let prev_slot = match previous_head {
+        Some(head) if !head.is_null() => {
+            let prev_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(head);
+            Some(prev_slot)
+        }
+        _ => None,
+    };
+    attach(slot);
+    let live = pyre_object::gc_roots::shadow_stack_get(slot);
+    let previous_head = match previous_head {
+        Some(_) => Some(match prev_slot {
+            Some(prev_slot) => pyre_object::gc_roots::shadow_stack_get(prev_slot),
+            None => pyre_object::PY_NULL,
+        }),
+        None => None,
+    };
+    crate::jitcode_dispatch::fbw_traceback_journal_push_if_attached(live, previous_head);
+    *exc_ptr = pyre_object::gc_roots::shadow_stack_get(slot);
+}
+
+fn note_forwarded_exc<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    exc_concrete: &mut ConcreteValue,
+    old: pyre_object::PyObjectRef,
+    live: pyre_object::PyObjectRef,
+) {
+    *exc_concrete = ConcreteValue::Ref(live);
+    // `WalkSession::last_exc_value_concrete` is the copy `SubRaise` was
+    // built from. It is not an `ExceptionRoot` (`TraceRoots` walks
+    // `PyreSym::last_exc_value` / `current_exc_value` only).
+    if ctx.last_exc_value_concrete() == ConcreteValue::Ref(old) {
+        ctx.set_last_exc_value_concrete(ConcreteValue::Ref(live));
+    }
 }
 
 /// Record the implicit `__context__` of an exception this trace catches itself.
@@ -947,7 +993,7 @@ fn record_inline_exception_context(ctx: &mut TraceCtx, exc: OpRef, exc_concrete:
 fn record_top_level_application_traceback<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     exc: OpRef,
-    exc_concrete: ConcreteValue,
+    exc_concrete: &mut ConcreteValue,
     opcode_position: usize,
     execute_concrete: bool,
     emit_runtime: bool,
@@ -955,7 +1001,7 @@ fn record_top_level_application_traceback<Sym: WalkSym>(
     if !ctx.is_top_level {
         return;
     }
-    let ConcreteValue::Ref(exc_ptr) = exc_concrete else {
+    let ConcreteValue::Ref(mut exc_ptr) = *exc_concrete else {
         return;
     };
     if exc_ptr.is_null() {
@@ -967,18 +1013,23 @@ fn record_top_level_application_traceback<Sym: WalkSym>(
     };
     if execute_concrete {
         // Attaching the live frame to a traceback escapes the virtualizable, so
-        // publish the walk's locals first.  `virtualizable.py:101-138
-        // write_boxes` makes that write unconditional, and `pyopcode.py:148`
-        // performs it before attaching the application traceback.
-        crate::state::flush_locals_region_to_frame(ctx.trace_ctx, frame_ptr);
-        journaled_concrete_traceback_attach(exc_ptr, || {
+        // publish the walk's locals first.  `virtualizable.py write_boxes`
+        // makes that write unconditional, and `pyopcode.py` performs it
+        // before attaching the application traceback.  Both that flush and
+        // `w_pytraceback_new` collect; the exception word stays on the
+        // shadow stack `journaled_concrete_traceback_attach` publishes.
+        let old = exc_ptr;
+        journaled_concrete_traceback_attach(&mut exc_ptr, |slot| {
+            crate::state::flush_locals_region_to_frame(ctx.trace_ctx, frame_ptr);
+            let live = pyre_object::gc_roots::shadow_stack_get(slot);
             majit_metainterp::record_application_traceback_for_recording(
-                exc_ptr as usize as i64,
+                live as usize as i64,
                 frame_ptr as i64,
                 jitcode_index,
                 opcode_position as i32,
             );
         });
+        note_forwarded_exc(ctx, exc_concrete, old, exc_ptr);
     }
     let hook = majit_metainterp::record_application_traceback_hook_address();
     let frame = crate::state::pyjitcode_for_jitcode_index(jitcode_index)
@@ -1021,13 +1072,13 @@ fn record_top_level_application_traceback<Sym: WalkSym>(
 fn record_exc_edge_discarded_tracebacks<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     exc: OpRef,
-    exc_concrete: ConcreteValue,
+    exc_concrete: &mut ConcreteValue,
 ) {
     let levels = take_exc_edge_discarded_levels();
     if levels.is_empty() {
         return;
     }
-    let ConcreteValue::Ref(exc_ptr) = exc_concrete else {
+    let ConcreteValue::Ref(mut exc_ptr) = *exc_concrete else {
         return;
     };
     if exc_ptr.is_null() {
@@ -1035,13 +1086,16 @@ fn record_exc_edge_discarded_tracebacks<Sym: WalkSym>(
     }
     let hook = majit_metainterp::record_discarded_level_traceback_hook_address();
     for &(w_code, py_pc) in levels.iter().rev() {
-        journaled_concrete_traceback_attach(exc_ptr, || {
+        let old = exc_ptr;
+        journaled_concrete_traceback_attach(&mut exc_ptr, |slot| {
+            let live = pyre_object::gc_roots::shadow_stack_get(slot);
             majit_metainterp::record_discarded_level_traceback_for_recording(
-                exc_ptr as usize as i64,
+                live as usize as i64,
                 w_code as i64,
                 py_pc as i64,
             );
         });
+        note_forwarded_exc(ctx, exc_concrete, old, exc_ptr);
         if hook.is_null() || exc.is_none() {
             continue;
         }
@@ -1059,7 +1113,7 @@ fn record_exc_edge_discarded_tracebacks<Sym: WalkSym>(
 fn record_inline_application_traceback<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     exc: OpRef,
-    exc_concrete: ConcreteValue,
+    exc_concrete: &mut ConcreteValue,
     opcode_position: usize,
     execute_concrete: bool,
     emit_runtime: bool,
@@ -1084,7 +1138,7 @@ fn record_inline_application_traceback<Sym: WalkSym>(
     if !unsafe { pyre_interpreter::pycode::is_code(consts.w_code as pyre_object::PyObjectRef) } {
         return;
     }
-    let ConcreteValue::Ref(exc_ptr) = exc_concrete else {
+    let ConcreteValue::Ref(mut exc_ptr) = *exc_concrete else {
         return;
     };
     if exc_ptr.is_null() {
@@ -1112,29 +1166,42 @@ fn record_inline_application_traceback<Sym: WalkSym>(
                 .expect("an inlined MIFrame must carry its own concrete PyFrame");
             (frame, py_pc, frame_reg)
         });
-        if node_frame.is_some() {
-            // `dispatch_bytecode` publishes the executing instruction through
-            // the frame field before handling the exception.  Keep all three
-            // views in step here as well: emitted IR, the recording-time frame,
-            // and heapcache knowledge used by a following `f_lasti` read.
-            residual_call::record_and_publish_inline_callee_last_instr(ctx, opcode_position);
-        }
-        journaled_concrete_traceback_attach(exc_ptr, || {
-            if let Some((frame_ptr, py_pc, frame_reg)) = node_frame {
+        let old = exc_ptr;
+        journaled_concrete_traceback_attach(&mut exc_ptr, |slot| {
+            if let Some((frame_ptr, _py_pc, frame_reg)) = node_frame {
+                // `dispatch_bytecode` publishes the executing instruction through
+                // the frame field before handling the exception.  Keep all three
+                // views in step here as well: emitted IR, the recording-time frame,
+                // and heapcache knowledge used by a following `f_lasti` read.
                 // Attaching the live frame to a traceback escapes the
                 // virtualizable, so publish this callee's walk-time locals
                 // first.  `virtualizable.py write_boxes` makes that
-                // write unconditional before `pyopcode.py:148` attaches the
-                // application traceback.
-                flush_callee_locals_region_to_frame(ctx, frame_ptr, frame_reg);
+                // write unconditional before `pyopcode.py` attaches the
+                // application traceback.  The flush boxes locals and can
+                // collect; the exception stays in `slot` and the frame
+                // stays on this bracket.
+                let _frame_roots = pyre_object::gc_roots::push_roots();
+                let frame_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(frame_ptr as pyre_object::PyObjectRef);
+                residual_call::record_and_publish_inline_callee_last_instr(ctx, opcode_position);
+                flush_callee_locals_region_to_frame(
+                    ctx,
+                    pyre_object::gc_roots::shadow_stack_get(frame_slot)
+                        as *mut pyre_interpreter::PyFrame,
+                    frame_reg,
+                );
+                let frame_ptr = pyre_object::gc_roots::shadow_stack_get(frame_slot)
+                    as *mut pyre_interpreter::PyFrame;
+                let live = pyre_object::gc_roots::shadow_stack_get(slot);
                 majit_metainterp::record_application_traceback_for_recording(
-                    exc_ptr as usize as i64,
+                    live as usize as i64,
                     frame_ptr as i64,
                     consts.jitcode_index,
                     opcode_position as i32,
                 )
             }
         });
+        note_forwarded_exc(ctx, exc_concrete, old, exc_ptr);
     }
     let frame = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index)
         .and_then(|jitcode| {
@@ -1384,7 +1451,6 @@ struct TracebackNodeSite {
     frame: OpRef,
     w_code: usize,
     last_instruction: i32,
-    lineno: i64,
 }
 
 /// Resolve the `PyTraceback` fields of the frame the walk is currently in.
@@ -1428,12 +1494,6 @@ fn traceback_node_site<Sym: WalkSym>(
         jitcode_index,
         opcode_position as i32,
     )?;
-    let lineno = unsafe {
-        pyre_interpreter::pyframe::offset2lineno(
-            w_code as pyre_object::PyObjectRef,
-            last_instruction as isize,
-        )
-    } as i64;
     let frame = ctx
         .registers_r
         .get(jitcode.metadata.portal_frame_reg as usize)
@@ -1459,7 +1519,6 @@ fn traceback_node_site<Sym: WalkSym>(
         frame,
         w_code,
         last_instruction,
-        lineno,
     })
 }
 
@@ -1485,7 +1544,13 @@ fn emit_traceback_node<Sym: WalkSym>(
             1,
         ),
         (w_next, 2),
-        (ctx.trace_ctx.const_int(site.lineno), 3),
+        // `record_application_traceback` leaves `lineno` at
+        // `LINENO_NOT_COMPUTED`; the `tb_lineno` getter resolves it.
+        (
+            ctx.trace_ctx
+                .const_int(pyre_interpreter::pytraceback::LINENO_NOT_COMPUTED),
+            3,
+        ),
         (ctx.trace_ctx.const_ref(site.w_code as i64), 4),
         (
             ctx.trace_ctx
@@ -3817,7 +3882,7 @@ pub fn walk<Sym: WalkSym>(
             | DispatchOutcome::SegmentTrace { .. } => {
                 return Ok((outcome, pc));
             }
-            DispatchOutcome::SubRaise { exc, exc_concrete } => {
+            DispatchOutcome::SubRaise { exc, mut exc_concrete } => {
                 // RPython `finishframe_exception`: before
                 // unwinding to the caller, scan THIS frame for a matching
                 // `catch_exception/L` handler at the post-op position. A
@@ -3866,7 +3931,7 @@ pub fn walk<Sym: WalkSym>(
                     record_inline_application_traceback(
                         ctx,
                         exc,
-                        exc_concrete,
+                        &mut exc_concrete,
                         opcode_position,
                         true,
                         emit_runtime,
@@ -3874,7 +3939,7 @@ pub fn walk<Sym: WalkSym>(
                     record_top_level_application_traceback(
                         ctx,
                         exc,
-                        exc_concrete,
+                        &mut exc_concrete,
                         recording_opcode_position,
                         true,
                         emit_runtime,
@@ -3927,7 +3992,7 @@ pub fn walk<Sym: WalkSym>(
                         record_top_level_application_traceback(
                             ctx,
                             exc,
-                            exc_concrete,
+                            &mut exc_concrete,
                             recording_opcode_position,
                             true,
                             false,
@@ -3965,7 +4030,7 @@ pub fn walk<Sym: WalkSym>(
                             record_top_level_application_traceback(
                                 ctx,
                                 exc,
-                                exc_concrete,
+                                &mut exc_concrete,
                                 recording_opcode_position,
                                 false,
                                 true,
@@ -4002,7 +4067,7 @@ pub fn walk<Sym: WalkSym>(
                         record_inline_application_traceback(
                             ctx,
                             exc,
-                            exc_concrete,
+                            &mut exc_concrete,
                             opcode_position,
                             true,
                             emit_runtime,
@@ -11318,7 +11383,6 @@ fn emit_module_dict_cell_fold<Sym: WalkSym>(
     dst_bank: char,
     w_globals: pyre_object::PyObjectRef,
     name: &str,
-    w_code_ptr: usize,
 ) -> Result<bool, DispatchError> {
     // Cell fast path applies only to a module dict still in strategy mode
     // whose slot holds a raw value, an `ObjectMutableCell`, or an
@@ -11326,35 +11390,13 @@ fn emit_module_dict_cell_fold<Sym: WalkSym>(
     if let Some(slot) = crate::state::module_dict_cell_slot_direct(w_globals, name) {
         if let Some(stored) = crate::state::module_dict_cell_value_direct(w_globals, slot) {
             if !stored.is_null() {
-                // `celldict.py getdictvalue_no_unwrapping` is
-                // `@elidable_promote` on `version?` for every lookup,
-                // cell or raw.  `code_pins_namespace_version` skips that
-                // pin when this CodeObject `DELETE_NAME`s (`delitem`
-                // always `mutated()`) or when a `JUMP_BACKWARD` span in
-                // a body with an exception table still stores a bare
-                // name (`store_would_bump_version`).  A watcher already
-                // installed makes `opimpl_jit_force_quasi_immutable`
-                // abort the same trace.  A load that still pins does so
-                // because an in-place rebind would otherwise become a
-                // `GUARD_VALUE` that never retraces (`global_reassign`).
-                let pin_version = specialize::code_pins_namespace_version(w_code_ptr, w_globals);
-                // A raw slot folded without `version?` is `unwrap_cell`'s
-                // identity return. A later promoting store would not revoke it.
-                if !pin_version
-                    && specialize::raw_fold_needs_version_pin(w_code_ptr, w_globals, stored)
-                {
-                    return Ok(false);
-                }
+                // `celldict.py getdictvalue_no_unwrapping` promotes `self`
+                // and reads `version?` on every lookup, cell or raw.
+                // `_setitem_str_cell_known` and `delitem` call `mutated()`.
+                // A watcher already installed makes
+                // `pyjitpl.py opimpl_jit_force_quasi_immutable` abort the trace.
                 return emit_namespace_cell_fold(
-                    ctx,
-                    op_pc,
-                    dst,
-                    dst_bank,
-                    w_globals,
-                    slot,
-                    stored,
-                    true,
-                    pin_version,
+                    ctx, op_pc, dst, dst_bank, w_globals, slot, stored, true, true,
                 );
             }
         }
@@ -14053,7 +14095,7 @@ fn handle<Sym: WalkSym>(
                     record_inline_application_traceback(
                         ctx,
                         exc,
-                        concrete_exc,
+                        &mut concrete_exc,
                         op.pc,
                         false,
                         emit_runtime,
@@ -14061,7 +14103,7 @@ fn handle<Sym: WalkSym>(
                     record_top_level_application_traceback(
                         ctx,
                         exc,
-                        concrete_exc,
+                        &mut concrete_exc,
                         op.pc,
                         false,
                         emit_runtime,

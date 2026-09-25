@@ -110,12 +110,11 @@ pub struct PyJitCodeMetadata {
     ///
     /// The floor table above answers the same question for ordinary ops, but
     /// only because they are emitted in source order.  A marker can sit in a
-    /// block the codewriter appends AFTER the whole body — the `LoadFastCheck`
-    /// null arm is the standing case — and `py_floor_by_jit_pc` keys each
-    /// Python PC to its FIRST offset, so that late block floors to whichever PC
-    /// last opened a segment instead of to its own opcode.  Markers are decided
-    /// on per frame by `loop_body_abort_permanent_pc`, so they get the exact
-    /// inverse.  Empty for skeleton / fixture metadata.
+    /// block the codewriter appends AFTER the whole body, and `py_floor_by_jit_pc`
+    /// keys each Python PC to its FIRST offset, so that late block floors to
+    /// whichever PC last opened a segment instead of to its own opcode.  Markers
+    /// are decided on per frame by `loop_body_abort_permanent_pc`, so they get
+    /// the exact inverse.  Empty for skeleton / fixture metadata.
     pub abort_permanent_py_pc_by_jit_pc: Vec<(u32, u32)>,
     /// Trace-entry green py_pc → JitCode byte offset where tracing enters
     /// for that green. This is the restriction of resume-marker resolution to
@@ -335,6 +334,54 @@ pub(crate) struct InlineBodyFacts {
     pub(crate) has_exception_table: bool,
 }
 
+/// Code positions of the ops the loop-entry pre-scans in `trace.rs` look
+/// for, each list in code order.  Every trace attempt on a body asks the same
+/// questions of the same bytes, so they are decoded once per body.
+///
+/// Carried on the payload for the reason [`InlineBodyFacts`] is.
+pub(crate) struct LoopScanIndex {
+    /// Every `jit_merge_point`.
+    pub(crate) merge_points: Vec<usize>,
+    /// Every `abort_permanent`.
+    pub(crate) abort_permanents: Vec<usize>,
+    /// `(pc, target)` of every `goto*` op whose last operand is a label.
+    pub(crate) label_gotos: Vec<(usize, usize)>,
+}
+
+impl LoopScanIndex {
+    pub(crate) fn build(code: &[u8]) -> Self {
+        let mut index = LoopScanIndex {
+            merge_points: Vec::new(),
+            abort_permanents: Vec::new(),
+            label_gotos: Vec::new(),
+        };
+        for op in crate::jitcode_runtime::decoded_ops(code) {
+            if op.opname == "jit_merge_point" {
+                index.merge_points.push(op.pc);
+            } else if op.opname == "abort_permanent" {
+                index.abort_permanents.push(op.pc);
+            } else if op.opname.starts_with("goto") && op.argcodes.ends_with('L') {
+                let target =
+                    u16::from_le_bytes([code[op.next_pc - 2], code[op.next_pc - 1]]) as usize;
+                index.label_gotos.push((op.pc, target));
+            }
+        }
+        index
+    }
+
+    /// The first `jit_merge_point` at or after `pc`.
+    pub(crate) fn merge_point_at_or_after(&self, pc: usize) -> Option<usize> {
+        let i = self.merge_points.partition_point(|&mp| mp < pc);
+        self.merge_points.get(i).copied()
+    }
+
+    /// The last `jit_merge_point` at or before `pc`.
+    pub(crate) fn merge_point_at_or_before(&self, pc: usize) -> Option<usize> {
+        let i = self.merge_points.partition_point(|&mp| mp <= pc);
+        i.checked_sub(1).map(|i| self.merge_points[i])
+    }
+}
+
 /// Compiled JitCode plus pyre-only metadata.
 pub struct PyJitCodePayload {
     pub jitcode: std::sync::Arc<RuntimeJitCode>,
@@ -361,6 +408,17 @@ pub struct PyJitCodePayload {
     /// Lazily-decided [`InlineBodyFacts`], built on the first call site that
     /// asks and dropped with the body by `replace_with`.
     pub(crate) inline_body_facts: std::cell::OnceCell<InlineBodyFacts>,
+    /// Lazily-built [`LoopScanIndex`] of this body, dropped with it by
+    /// `replace_with`.
+    pub(crate) loop_scan: std::cell::OnceCell<LoopScanIndex>,
+}
+
+impl PyJitCodePayload {
+    /// [`LoopScanIndex`] of this body, decoded on first use.
+    pub(crate) fn loop_scan(&self) -> &LoopScanIndex {
+        self.loop_scan
+            .get_or_init(|| LoopScanIndex::build(self.jitcode.code.as_slice()))
+    }
 }
 
 /// Shared `PyJitCode` identity whose payload is filled in place.
@@ -529,6 +587,7 @@ impl PyJitCode {
             has_abort,
             sub_descr_pool: std::cell::OnceCell::new(),
             inline_body_facts: std::cell::OnceCell::new(),
+            loop_scan: std::cell::OnceCell::new(),
         })
     }
 
@@ -566,6 +625,7 @@ impl PyJitCode {
             has_abort,
             sub_descr_pool,
             inline_body_facts,
+            loop_scan,
         } = next.payload.into_inner();
         let next_jitcode = std::sync::Arc::try_unwrap(next_jitcode)
             .expect("freshly assembled PyJitCode must uniquely own its runtime JitCode");
@@ -585,6 +645,7 @@ impl PyJitCode {
             // Same reasoning for the body verdicts: they describe the body
             // being replaced, so they go with it rather than outliving it.
             current.inline_body_facts = inline_body_facts;
+            current.loop_scan = loop_scan;
             let current_jitcode = std::sync::Arc::as_ptr(&current.jitcode) as *mut RuntimeJitCode;
             *current_jitcode = next_jitcode;
             current.metadata = metadata;

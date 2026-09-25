@@ -244,12 +244,11 @@ pub fn gc_nursery_poison_enabled() -> bool {
     *ENABLED
 }
 
-/// `MAJIT_LOG`, read once — the same gate `majit_metainterp::majit_log_enabled`
-/// caches, for the collector's own per-collection sites.
+/// `have_debug_prints_for("gc")` for the collector's own per-collection
+/// sites: a collection opens no debug section of its own, so the section
+/// ready bit would silence them under a `gc` prefix filter.
 pub fn majit_log_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("MAJIT_LOG").is_some());
-    *ENABLED
+    majit_ir::debug::have_debug_prints_for("gc")
 }
 
 /// `MAJIT_GC_DRAIN_CENSUS` — aggregate how much each minor collection drains.

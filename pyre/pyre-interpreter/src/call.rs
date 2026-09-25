@@ -4053,7 +4053,12 @@ fn call_with_kwargs_in_ctx_impl(
             // typeobject.py `space.get_and_call_args`: exact
             // Function takes the instance explicitly; every other descriptor
             // binds itself and receives only the original constructor args.
-            let init_result = if unsafe { crate::is_function(init_descr) } {
+            // A slot wrapper (`object.__init__`, `BaseException.__init__`) is
+            // an interp2app Function there and takes the same arm; its
+            // `__get__` only wraps it back up around the same slot.
+            let init_result = if unsafe {
+                crate::is_function(init_descr) || crate::is_slot_wrapper(init_descr)
+            } {
                 let mut init_args = Vec::with_capacity(1 + pos_args.len());
                 // The `__new__` result and the constructor arguments are
                 // movable nursery objects, and `__new__` has just run
@@ -6490,7 +6495,11 @@ fn type_descr_call_with_mode(
         && let Some(init_descr) =
             unsafe { crate::baseobjspace::lookup_in_type(w_insttype, "__init__") }
     {
-        let init_result = if unsafe { crate::is_function(init_descr) } {
+        // `get_and_call_args`: a slot wrapper is an interp2app Function there,
+        // so it takes the instance explicitly like one.
+        let init_result = if unsafe {
+            crate::is_function(init_descr) || crate::is_slot_wrapper(init_descr)
+        } {
             let mut init_args = Vec::with_capacity(1 + args.len());
             init_args.push(current_instance());
             extend_current_args(&mut init_args);

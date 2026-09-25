@@ -36,7 +36,7 @@
 
 use std::cell::Cell;
 use std::ffi::OsStr;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 
 /// Tri-state: 0 = not yet read from env, 1 = disabled, 2 = enabled.
 static STATE: AtomicU8 = AtomicU8::new(0);
@@ -155,35 +155,32 @@ static COLLECT_STATE: AtomicU8 = AtomicU8::new(0);
 /// the collector will ever set, so no answer is reached late enough to matter.
 const POLL_INTERVAL: u32 = 1024;
 
-thread_local! {
-    /// Enabled dispatches since this thread last asked the collector; see
-    /// [`POLL_INTERVAL`]. The cached feature gates are the only work allowed
-    /// ahead of this counter, so it paces dispatches without first paying for
-    /// the collector query it exists to avoid.
-    /// Thread-local rather than atomic because the query it paces is itself
-    /// per-thread, and a `fetch_add` on every dispatch would cost about what it
-    /// is here to avoid.
-    static POLL_TICK: Cell<u32> = const { Cell::new(0) };
-}
-
-/// Whether this dispatch is the one that asks the collector.
+/// `executioncontext.py ActionFlag._ticker`: dispatches left before the next
+/// one asks the collector.
 ///
-/// Reads the runtime-mutable `POLL_TICK` thread-local, not a build-time
-/// constant, so the JIT residualizes the call instead of tracing into it
-/// (`@dont_look_inside`, the [`at_outermost_activation`] sibling). The
-/// `-> bool` return fits a single word and it cannot raise.
+/// One process-wide counter, decremented by every dispatch that has the
+/// safepoint armed, as `bytecode_trace` decrements the single `actionflag`
+/// ticker under the GIL. Relaxed loads and stores: the GIL orders dispatches,
+/// and a lost decrement only moves a poll by one dispatch.
+static POLL_TICKER: AtomicI32 = AtomicI32::new(POLL_INTERVAL as i32);
+
+/// `executioncontext.py ActionFlag.decrement_ticker(by) < 0` — whether this
+/// dispatch is the one that asks the collector.
+///
+/// Reads the runtime-mutable `POLL_TICKER`, not a build-time constant, so the
+/// JIT residualizes the call instead of tracing into it (`@dont_look_inside`,
+/// the [`at_outermost_activation`] sibling). The `-> bool` return fits a
+/// single word and it cannot raise.
 #[majit_macros::dont_look_inside]
 pub fn poll_due() -> bool {
-    POLL_TICK.with(|t| {
-        let n = t.get() + 1;
-        if n >= POLL_INTERVAL {
-            t.set(0);
-            true
-        } else {
-            t.set(n);
-            false
-        }
-    })
+    let ticker = POLL_TICKER.load(Ordering::Relaxed) - 1;
+    if ticker < 0 {
+        POLL_TICKER.store(POLL_INTERVAL as i32, Ordering::Relaxed);
+        true
+    } else {
+        POLL_TICKER.store(ticker, Ordering::Relaxed);
+        false
+    }
 }
 
 /// Whether interpreter allocations are routed through the GC and the

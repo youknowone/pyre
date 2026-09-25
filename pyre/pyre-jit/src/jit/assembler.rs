@@ -65,6 +65,10 @@ pub struct Assembler {
     /// `self.setup_indirectcalltargets(asm.indirectcalltargets)` pipes
     /// this set to `MetaInterpStaticData.setup_indirectcalltargets`.
     pub indirectcalltargets: HashSet<ArcByPtr>,
+    /// This assembler's identity for
+    /// `pyre_jit_trace::assembler::publish_state_from`; `0` until the first
+    /// publish assigns one.
+    publish_token: u64,
 }
 
 /// Identity-keyed wrapper around `Arc<JitCode>` so `HashSet<ArcByPtr>`
@@ -113,9 +117,9 @@ struct AssemblyState {
     label_positions: IndexMap<String, usize>,
     /// Builder adapter for `Label/TLabel` name → builder label id.
     /// RPython stores bytecode positions directly in `label_positions`; this
-    /// extra vector exists only because `JitCodeBuilder` patches jumps by
+    /// extra map exists only because `JitCodeBuilder` patches jumps by
     /// symbolic label id rather than by rewriting raw bytes in `fix_labels()`.
-    builder_labels: Vec<(String, u16)>,
+    builder_labels: IndexMap<String, u16>,
 }
 
 impl Assembler {
@@ -193,6 +197,20 @@ impl Assembler {
         }
     }
 
+    /// A process-unique non-zero token for this assembler, assigned on first
+    /// use. The reader-side mirror appends only the new tail of a snapshot
+    /// from the writer it last synced with, and this is how it tells writers
+    /// apart.
+    fn publish_token(&mut self) -> u64 {
+        static NEXT_PUBLISH_TOKEN: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        if self.publish_token == 0 {
+            self.publish_token =
+                NEXT_PUBLISH_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.publish_token
+    }
+
     /// `assembler.py:29` accessor.
     pub fn all_liveness(&self) -> &[u8] {
         &self.all_liveness
@@ -248,7 +266,8 @@ impl Assembler {
     /// at exactly the same point as `codewriter.py:85`.
     pub fn finished(&mut self, callinfocollection: &super::call::CallInfoCollection) {
         let _ = callinfocollection;
-        pyre_jit_trace::assembler::publish_state(
+        pyre_jit_trace::assembler::publish_state_from(
+            self.publish_token(),
             &self.insns,
             &self.all_liveness,
             self.all_liveness_length,
@@ -297,7 +316,7 @@ impl Assembler {
         let mut state = AssemblyState {
             builder,
             label_positions: IndexMap::new(),
-            builder_labels: Vec::new(),
+            builder_labels: IndexMap::new(),
         };
 
         ssarepr.insns_pos = Some(Vec::with_capacity(ssarepr.insns.len()));
@@ -489,7 +508,8 @@ impl Assembler {
             self.all_liveness_positions.insert(key, pos);
             pos
         };
-        pyre_jit_trace::assembler::publish_state(
+        pyre_jit_trace::assembler::publish_state_from(
+            self.publish_token(),
             &self.insns,
             &self.all_liveness,
             self.all_liveness_length,
@@ -697,15 +717,11 @@ fn dump_assembled_ssarepr(ssarepr: &SSARepr, jitcode: &JitCode) {
 }
 
 fn builder_label(state: &mut AssemblyState, name: &str) -> u16 {
-    if let Some((_, label)) = state
-        .builder_labels
-        .iter()
-        .find(|(existing, _)| existing == name)
-    {
-        return *label;
+    if let Some(&label) = state.builder_labels.get(name) {
+        return label;
     }
     let label = state.builder.new_label();
-    state.builder_labels.push((name.to_owned(), label));
+    state.builder_labels.insert(name.to_owned(), label);
     label
 }
 

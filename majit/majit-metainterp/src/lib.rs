@@ -153,8 +153,8 @@ pub(crate) mod parity;
 mod pyjitpl;
 #[cfg(not(target_arch = "wasm32"))]
 pub use pyjitpl::{
-    active_backend_jit_exc_value_peek, install_active_backend_gc_standalone,
-    register_active_backend_jitframe_gc_type,
+    active_backend_jit_exc_value_forward, active_backend_jit_exc_value_peek,
+    install_active_backend_gc_standalone, register_active_backend_jitframe_gc_type,
 };
 pub mod quasiimmut;
 pub use quasiimmut::set_force_quasi_immutable_hook;
@@ -425,16 +425,17 @@ pub mod loop_census {
     }
 }
 
-/// Whether `MAJIT_LOG` is set, cached at first access.
+/// `have_debug_prints` — true when this thread's debug section is accepted
+/// by the `MAJIT_LOG` prefix filter, or when logging is on and no prefix
+/// list was given.
 ///
-/// `std::env::var_os` acquires a global env lock and walks the env table on
-/// every call. The flag never changes after process startup, so checking it
-/// from hot dispatch paths (e.g. `run_compiled_code_inner` per bridge hop)
-/// shows up in profiles. The `LazyLock` caches the boolean.
+/// `debug_print.c` `pypy_have_debug_prints`: `debug_start` shifts the
+/// thread-local ready word and sets the low bit for an accepted category;
+/// `debug_stop` shifts it back. Direct `eprintln!` sites use this gate, so
+/// a prefix filter silences them outside an accepted section. The word is
+/// a thread-local load, not an environment lookup.
 pub fn majit_log_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("MAJIT_LOG").is_some());
-    *ENABLED
+    debug::have_debug_prints()
 }
 
 thread_local! {

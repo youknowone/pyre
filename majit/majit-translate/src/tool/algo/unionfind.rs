@@ -163,13 +163,23 @@ where
     /// created via `info_factory`. Performs path compression on the
     /// walk from `obj` to its root.
     pub fn find(&mut self, obj: K) -> (bool, K) {
-        if !self.link_to_parent.contains_key(&obj) {
+        let Some(parent) = self.link_to_parent.get(&obj).cloned() else {
             // upstream: fresh singleton partition.
             let info = (self.info_factory)(&obj);
             self.root_info.insert(obj.clone(), info);
             self.weight.insert(obj.clone(), 1);
             self.link_to_parent.insert(obj.clone(), obj.clone());
             return (true, obj);
+        };
+
+        // A root, or a node linked straight to its root: the compression
+        // below would write back every link it walks unchanged, so the
+        // answer needs neither the walk nor the writes.
+        if parent == obj {
+            return (false, obj);
+        }
+        if self.link_to_parent[&parent] == parent {
+            return (false, parent);
         }
 
         // upstream: `to_root = [obj]`; walk parents until fixed point.

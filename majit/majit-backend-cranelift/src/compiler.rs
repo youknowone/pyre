@@ -71,16 +71,10 @@ mod slice_x2_probe {
     }
 }
 
-/// Whether `MAJIT_LOG` is set, cached at first access.
-///
-/// `std::env::var_os` acquires a global env lock and walks the env table on
-/// every call. The flag never changes after process startup, so checking it
-/// from hot dispatch paths (e.g. `run_compiled_code_inner` per bridge hop)
-/// shows up in profiles. `LazyLock` caches the boolean.
+/// `have_debug_prints` — true only inside a debug section the `MAJIT_LOG`
+/// prefix filter accepts, so a category filter silences these sites.
 fn majit_log_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("MAJIT_LOG").is_some());
-    *ENABLED
+    majit_ir::debug::have_debug_prints()
 }
 
 /// The three flags a compiled entry reads, resolved together.
@@ -91,16 +85,16 @@ struct EntryFlags {
     verify_enabled: bool,
 }
 
-/// One `LazyLock` check per entry instead of three; each is an env var fixed
-/// at process start.
+/// The two log gates follow this thread's open debug section, so they are
+/// read on every entry; a disabled log answers them without touching the
+/// section state.
 #[inline]
 fn entry_flags() -> EntryFlags {
-    static FLAGS: std::sync::LazyLock<EntryFlags> = std::sync::LazyLock::new(|| EntryFlags {
+    EntryFlags {
         log_enabled: majit_log_enabled(),
         debug_prints: majit_ir::debug::have_debug_prints(),
         verify_enabled: majit_verify_enabled(),
-    });
-    *FLAGS
+    }
 }
 
 /// Whether `MAJIT_VERIFY` is set, cached at first access.
@@ -992,6 +986,18 @@ pub fn jit_exc_value_addr() -> usize {
 /// the swap-to-0 read `jit_exc_value_raw`).
 pub fn jit_exc_value_peek() -> i64 {
     JIT_EXC_VALUE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Root-walker write-back for `JIT_EXC_VALUE`: a minor collection moved the
+/// pending exception from `old` to `new`. A compare-exchange, so a cell that
+/// no longer holds `old` is left alone.
+pub fn jit_exc_value_forward(old: i64, new: i64) {
+    let _ = JIT_EXC_VALUE.compare_exchange(
+        old,
+        new,
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// Return the address of JIT_EXC_TYPE for direct memory store in JIT code.
@@ -3282,13 +3288,23 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
             // reach the two returns below never read a slot vector, and the
             // frame the slots live in stays valid for the whole arm
             // (`llmodel.py:240-250`).
-            let outputs = exec.extract_outputs(cur_max_output_slots.max(1));
+            // `rd_locs` indexes the whole frame, including ref-root and
+            // demoted homes past the dense fail-arg prefix.
+            let dense_len = cur_max_output_slots.max(1);
+            let frame_depth = cur_max_output_slots
+                .saturating_add(cur_num_ref_roots)
+                .max(dense_len);
+            let frame_slots = exec.extract_outputs(frame_depth);
             if bridge.loop_reentry {
                 // loop_reentry: use raw fail_args (same as run_compiled_code
                 // bridge dispatch). rebuild_state_after_failure transforms
                 // outputs for blackhole resume which may change Vec length.
-                let bridge_frame =
-                    CraneliftBackend::execute_bridge(&bridge, &outputs, fail_descr_fd, attachments);
+                let bridge_frame = CraneliftBackend::execute_bridge(
+                    &bridge,
+                    &frame_slots,
+                    fail_descr_fd,
+                    attachments,
+                );
                 let bridge_descr = get_latest_descr_from_deadframe(&bridge_frame)
                     .expect("bridge deadframe must have descriptor");
                 // llgraph/runner.py Jump exception on external JUMP:
@@ -3329,7 +3345,8 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
             // unregistered.  Matches PyPy's `pyjitpl.py:3424
             // MetaInterp.rebuild_state_after_failure(resumedescr, deadframe)`
             // shape.
-            let mut mat_outputs = outputs.clone();
+            let mut mat_outputs =
+                overlay_rd_locs_on_dense(&frame_slots, fail_descr_fd.rd_locs(), dense_len);
             let fail_arg_types = fail_descr_fd.fail_arg_types();
             rebuild_state_after_failure_dispatch(
                 &fail_descr.to_arc(),
@@ -3337,9 +3354,30 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
                 fail_arg_types,
                 bridge.num_inputs,
             );
+            // `mat_outputs` is indexed by logical resume position, while
+            // `execute_bridge` decodes `rd_locs` against physical frame slots
+            // (`llmodel.py _decode_pos`). Write each rebuilt value back to its
+            // home slot.
+            let rd_locs = fail_descr_fd.rd_locs();
+            let bridge_outputs = if rd_locs.is_empty() {
+                mat_outputs
+            } else {
+                let mut slots = frame_slots;
+                for (index, &loc) in rd_locs.iter().enumerate() {
+                    if loc == 0xFFFF {
+                        continue;
+                    }
+                    if let (Some(&value), Some(slot)) =
+                        (mat_outputs.get(index), slots.get_mut(loc as usize))
+                    {
+                        *slot = value;
+                    }
+                }
+                slots
+            };
             return CraneliftBackend::execute_bridge(
                 &bridge,
-                &mat_outputs,
+                &bridge_outputs,
                 fail_descr_fd,
                 attachments,
             );
@@ -3651,6 +3689,32 @@ fn emit_memory_error_check(
     builder.seal_block(cont_block);
 }
 
+/// compile.py `PropagateExceptionDescr.handle_fail`.
+///
+/// Reads `jf_guard_exc` (`cpu.grab_exc_value`), falls back to
+/// `memory_error` when it is empty, and republishes through
+/// `jit_exc_raise` so the CALL_ASSEMBLER caller's GUARD_NO_EXCEPTION
+/// sees the exception the recovery stub moved out of the globals.
+fn handle_fail_propagate_exception(frame_ptr: i64) -> i64 {
+    let exc_val = if frame_ptr == 0 {
+        0
+    } else {
+        unsafe {
+            let frame = &mut *(frame_ptr as *mut majit_backend::jitframe::JitFrame);
+            let v = frame.jf_guard_exc;
+            frame.jf_guard_exc = 0;
+            v as i64
+        }
+    };
+    let value = if exc_val != 0 {
+        exc_val
+    } else {
+        majit_backend::memory_error_singleton_ref()
+    };
+    jit_exc_raise(value);
+    value
+}
+
 /// direct call_assembler path. Ultra-lightweight: just increments
 /// fail count, checks bridge (atomic + mutex only when bridge exists),
 /// and defers bridge compilation. Falls back to force_fn.
@@ -3750,6 +3814,14 @@ fn call_assembler_guard_failure_inner(
         jit_exc_raise(exc_value);
         return 0;
     }
+    // `_build_propagate_exception_path` writes `Arc::as_ptr` of the
+    // singleton into `jf_descr`. That address is not a `FailDescrCell`;
+    // `recover_fail_descr_cell` on it is undefined.
+    if attached_ptrs.propagate_exception_descr != 0
+        && fail_descr_ptr as usize == attached_ptrs.propagate_exception_descr
+    {
+        return handle_fail_propagate_exception(frame_ptr);
+    }
 
     let _target = unsafe { &*fast_lookup_ca_target(token_number) };
 
@@ -3759,6 +3831,20 @@ fn call_assembler_guard_failure_inner(
     // `Arc::from_raw` (`recover_fail_descr_cell`).  Strong refcount
     // lives on the callee `CompiledLoop::fail_descr_cells`.
     let fail_descr_owned = unsafe { majit_ir::recover_fail_descr_cell(fail_descr_ptr as usize) };
+    // `compile.py` `PropagateExceptionDescr.handle_fail`
+    // (`compile_tmp_callback`): that GUARD_NO_EXCEPTION's descr is the
+    // cpu's `propagate_exception_descr` singleton and its failargs are
+    // empty. The recovery stub writes the `FailDescrCell` thin pointer
+    // into `jf_descr`, not `Arc::as_ptr` of the singleton, so the
+    // identity compare above misses it. The resume-guard path then
+    // finds no `rd_numb` and returns 0, and the caller continues as
+    // if the call returned NULL.
+    if attached_ptrs.propagate_exception_descr != 0
+        && Arc::as_ptr(&fail_descr_owned) as *const () as usize
+            == attached_ptrs.propagate_exception_descr
+    {
+        return handle_fail_propagate_exception(frame_ptr);
+    }
     let fail_descr_ref: &dyn FailDescr = as_fd(&fail_descr_owned);
 
     // Fast path: read the attached bridge directly from the fail_descr
@@ -3767,7 +3853,26 @@ fn call_assembler_guard_failure_inner(
     // code jumps to the bridge instead of re-entering the guard helper.
     if let Some(bridge) = fail_descr_bridge_ref(fail_descr_ref) {
         let raw_num = fail_descr_ref.fail_arg_types().len();
-        let parent_outputs = unsafe { std::slice::from_raw_parts(outputs_ptr, raw_num) };
+        // `rd_locs` may name a ref-root or demoted home past the dense
+        // fail-arg prefix. Those words live in the same `jf_frame` this
+        // helper was handed; the slice has to cover the frame's own length,
+        // not only `fail_arg_types`.
+        debug_assert!(
+            frame_ptr == 0
+                || outputs_ptr.is_null()
+                || outputs_ptr as usize == frame_ptr as usize + JF_FRAME_ITEM0_OFS as usize
+        );
+        let frame_len = if frame_ptr == 0 {
+            0
+        } else {
+            unsafe { *((frame_ptr as usize + JF_FRAME_LENGTH_OFS as usize) as *const usize) }
+        };
+        let parent_len = if frame_ptr == 0 || outputs_ptr.is_null() {
+            raw_num
+        } else {
+            raw_num.max(frame_len)
+        };
+        let parent_outputs = unsafe { std::slice::from_raw_parts(outputs_ptr, parent_len) };
         let frame =
             CraneliftBackend::execute_bridge(&bridge, parent_outputs, fail_descr_ref, attachments);
         if let Some(result) = call_assembler_finish_or_blackhole_deadframe(frame) {
@@ -3909,7 +4014,7 @@ fn call_assembler_shim_inner(
         "call_assembler shim outcome buffer must be non-null"
     );
 
-    if std::env::var_os("MAJIT_LOG").is_some() {
+    if majit_log_enabled() {
         let i0 = input_slice.first().copied().unwrap_or(-1);
         eprintln!(
             "[ca-shim] entering trace_id={} num_inputs={} input0={:#x}",
@@ -3947,7 +4052,7 @@ fn call_assembler_shim_inner(
             Type::Void => 0,
         })
         .collect();
-    if std::env::var_os("MAJIT_LOG").is_some() {
+    if majit_log_enabled() {
         eprintln!(
             "[ca-shim] guard fail_idx={} nvals={}",
             fail_index,
@@ -4941,7 +5046,7 @@ fn validate_oprefs_for_compile(
                 || is_rewriter_immediate_arg(op.opcode, 0)
                 || seen.contains(&arg.to_opref().raw());
             if !bound {
-                if std::env::var_os("MAJIT_LOG").is_some() {
+                if majit_log_enabled() {
                     eprintln!(
                         "[validate-oprefs] op[{}] {:?} dereferences undefined OpRef::int_op({}) — InvalidLoop",
                         op_idx,
@@ -5596,7 +5701,7 @@ fn build_ref_root_slots(
     // majit's flat, typeless OpRef can (SameAsF/SameAsI replacing a Ref).
     // Report it rather than compensating for it: a trace that reaches the
     // backend ill-typed is a defect upstream of codegen.
-    if std::env::var_os("MAJIT_LOG").is_some() {
+    if majit_log_enabled() {
         log_internal_jump_type_mismatches(ops, type_index, overrides);
     }
 
@@ -5640,7 +5745,7 @@ fn build_ref_root_slots(
             slots.push((input.index, slots.len()));
         } else if input.tp.get() == Type::Ref
             && !used_inputargs.contains(&input.index)
-            && std::env::var_os("MAJIT_LOG").is_some()
+            && majit_log_enabled()
         {
             eprintln!(
                 "[ref-root] SKIP inputarg idx={}: not referenced by ops (constant-folded)",
@@ -5653,7 +5758,7 @@ fn build_ref_root_slots(
         if op.result_type() == Type::Ref {
             let vi = op_var_index(op, op_idx, inputargs.len()) as u32;
             if !force_tokens.contains(&vi) && seen.insert(vi) {
-                if std::env::var_os("MAJIT_LOG").is_some() {
+                if majit_log_enabled() {
                     eprintln!(
                         "[ref-root] op idx={} opcode={:?} vi={}",
                         op_idx, op.opcode, vi
@@ -6931,10 +7036,12 @@ fn emit_indirect_call_from_parts(
 
 /// Emit a guard/finish side-exit.
 ///
-/// _build_failure_recovery (assembler.py:2080-2109) parity:
-///   1. _push_all_regs_to_frame  — save live values to jf_frame slots
-///   2. POP [ebp + jf_descr]     — store fail_descr index to jf_descr
-///   3. _call_footer              — mov eax, ebp; ret (return jitframe)
+/// `generate_quick_failure` parity: the per-guard stub.  It saves the
+/// fail-args to their jf_frame slots (`_push_all_regs_to_frame`, done here
+/// per value because the backend, not this code, chooses their registers),
+/// stores `jf_gcmap`, runs the attached-loop and bridge dispatches, and jumps
+/// to the function's [`FailureRecovery`] block with the fail descr, as the
+/// stub `PUSH`es the descr before its `JMP` to `failure_recovery_code`.
 ///
 /// x86/assembler.py _cmp_guard_class:
 ///   loc_ptr = locs[0]
@@ -7391,6 +7498,187 @@ fn emit_attached_loop_dispatch(
 /// running cold code, so it is cold too.  Run that to a fixpoint.  Coldness is
 /// a layout and register-allocation hint only, so this changes placement and
 /// spill preference, never behaviour.
+/// Byte offset from the jitframe base to a `jf_frame` slot index.
+///
+/// Ref-root homes sit at `max_output_slots + root_slot`. Demoted non-ref
+/// homes sit past that region. Both are absolute frame slots, the same
+/// index `llmodel.py _decode_pos` consumes.
+fn frame_slot_for_jf_offset(offset: i32) -> Option<u16> {
+    if offset < JF_FRAME_ITEM0_OFS {
+        return None;
+    }
+    let delta = offset - JF_FRAME_ITEM0_OFS;
+    if delta % 8 != 0 {
+        return None;
+    }
+    let slot = u16::try_from(delta / 8).ok()?;
+    (slot != 0xFFFF).then_some(slot)
+}
+
+/// Frame slot a fail arg already occupies, when `resolve_failarg_opref`
+/// would reload it from the jitframe instead of from an SSA variable.
+///
+/// The two homes are a demoted fail arg (`demoted_failarg_slots`) and a
+/// stale ref root (`ref_root_slots` ∩ `stale_ref_vars`). Constants and
+/// gc-table rematerializations are values, not frame homes.
+fn resident_failarg_home(
+    ref_root_slots: &[(u32, usize)],
+    stale_ref_vars: &IndexSet<u32>,
+    demoted_failarg_slots: &IndexMap<u32, i32>,
+    ref_root_base_ofs: i32,
+    opref: OpRef,
+) -> Option<u16> {
+    if opref.is_none() {
+        return None;
+    }
+    if !opref.is_constant() && gc_table_index_for_var(opref.raw()).is_some() {
+        return None;
+    }
+    if opref.inline_const_bits().is_some() {
+        return None;
+    }
+    if let Some(offset) = demoted_failarg_offset(demoted_failarg_slots, opref.raw()) {
+        return frame_slot_for_jf_offset(offset);
+    }
+    if let Some((_, root_slot)) = ref_root_slots
+        .iter()
+        .find(|(var_idx, _)| *var_idx == opref.raw() && stale_ref_vars.contains(var_idx))
+    {
+        let offset = ref_root_base_ofs + (*root_slot as i32) * 8;
+        return frame_slot_for_jf_offset(offset);
+    }
+    None
+}
+
+/// Point `rd_locs` at a fail arg's existing frame home and drop that arg
+/// from the positional publish.
+///
+/// `llsupport/assembler.py rebuild_faillocs_from_descr` records where each
+/// fail arg lives; readers (`llmodel.py _decode_pos`, `execute_bridge`,
+/// the shared-frame tail jump) decode the table. A stale ref root or a
+/// demoted home is already that word, so the guard exit must not copy it
+/// into `jf_frame[k]`. Every other fail arg keeps positional slot `k`.
+/// Holes stay `0xFFFF`. When nothing was redirected the descr's table is
+/// left alone, so an empty `rd_locs` remains the identity fast path.
+///
+/// Returns one flag per fail arg, true when the positional store is
+/// skipped. Empty when the layout stays identity.
+fn apply_resident_failarg_locs(
+    info: &mut GuardInfo,
+    fail_descrs: &[DescrRef],
+    ref_root_slots: &[(u32, usize)],
+    stale_ref_vars: &IndexSet<u32>,
+    demoted_failarg_slots: &IndexMap<u32, i32>,
+    ref_root_base_ofs: i32,
+) -> Vec<bool> {
+    if !info.redirect_resident_failargs {
+        return Vec::new();
+    }
+    let Some(fd) = fail_descrs
+        .get(info.fail_index as usize)
+        .and_then(|descr| descr.as_fail_descr())
+    else {
+        return Vec::new();
+    };
+    // FINISH singletons and propagate descrs either have no `rd_locs`
+    // slot or are read positionally (`jf_frame[0]`). Only resume-family
+    // guards publish a recovery map.
+    if !(fd.is_resume_guard() || fd.is_resume_guard_copied()) {
+        return Vec::new();
+    }
+    let existing: Vec<u16> = fd.rd_locs().to_vec();
+    // The reduced scalar is not the vector's frame home. Those positions
+    // keep the positional store `accum_info` already describes.
+    let accum_positions: IndexSet<usize> =
+        info.accum_info.iter().map(|ai| ai.failargs_pos).collect();
+    let mut locs: Vec<u16> = Vec::with_capacity(info.fail_arg_refs.len());
+    let mut skip_store: Vec<bool> = Vec::with_capacity(info.fail_arg_refs.len());
+    let mut redirected = false;
+    for (k, &arg) in info.fail_arg_refs.iter().enumerate() {
+        if arg.is_none() || existing.get(k).copied() == Some(0xFFFF) {
+            locs.push(0xFFFF);
+            skip_store.push(false);
+            continue;
+        }
+        let Ok(positional) = u16::try_from(k) else {
+            // A slot index that does not fit the `rd_locs` USHORT cannot
+            // be named. Leave the whole guard on the identity publish.
+            return Vec::new();
+        };
+        if positional == 0xFFFF {
+            return Vec::new();
+        }
+        if !accum_positions.contains(&k)
+            && let Some(home) = resident_failarg_home(
+                ref_root_slots,
+                stale_ref_vars,
+                demoted_failarg_slots,
+                ref_root_base_ofs,
+                arg,
+            )
+            && home != positional
+        {
+            redirected = true;
+            locs.push(home);
+            skip_store.push(true);
+            continue;
+        }
+        // Stored at `k`. An identity-with-holes table already names that
+        // index; an empty table is identity. Rewriting the whole table
+        // (because some other arg was redirected) keeps this entry on the
+        // slot the publish writes.
+        locs.push(positional);
+        skip_store.push(false);
+    }
+    if !redirected {
+        return Vec::new();
+    }
+    fd.set_rd_locs(locs.iter().copied().collect());
+    info.bridge_source_slots = locs
+        .iter()
+        .copied()
+        .filter(|&loc| loc != 0xFFFF)
+        .map(|loc| loc as usize)
+        .collect();
+    // The deadframe gcmap has to mark the word the reader will load. A
+    // ref that moved to its home is no longer in the dense slot, so the
+    // map names the home instead of `k`.
+    let mut ref_slots = Vec::new();
+    for (k, &loc) in locs.iter().enumerate() {
+        if loc != 0xFFFF && info.failarg_ref_slots.contains(&k) {
+            ref_slots.push(loc as usize);
+        }
+    }
+    ref_slots.sort_unstable();
+    ref_slots.dedup();
+    info.failarg_ref_slots = ref_slots;
+    info.gcmap = allocate_gcmap(&info.failarg_ref_slots);
+    skip_store
+}
+
+/// Dense image a `FailArgSource::Slice` reader indexes by logical fail-arg
+/// position. Identity entries stay the raw frame word (including an
+/// unwritten hole). A redirected entry is copied in from its home so the
+/// slice agrees with `rd_locs` without changing the vector's length.
+fn overlay_rd_locs_on_dense(frame: &[i64], rd_locs: &[u16], dense_len: usize) -> Vec<i64> {
+    let mut outputs: Vec<i64> = frame.iter().copied().take(dense_len).collect();
+    if outputs.len() < dense_len {
+        outputs.resize(dense_len, 0);
+    }
+    if rd_locs.is_empty() {
+        return outputs;
+    }
+    for (index, &loc) in rd_locs.iter().enumerate() {
+        if loc == 0xFFFF || index >= outputs.len() || loc as usize == index {
+            continue;
+        }
+        if let Some(&value) = frame.get(loc as usize) {
+            outputs[index] = value;
+        }
+    }
+    outputs
+}
+
 fn propagate_cold_blocks(func: &mut Function) {
     let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(func);
     let entry = func.layout.entry_block();
@@ -7428,20 +7716,35 @@ fn emit_guard_exit(
     builder: &mut FunctionBuilder,
     constants: &indexmap::IndexMap<u32, i64>,
     jf_ptr: CValue,
-    info: &GuardInfo,
+    info: &mut GuardInfo,
     ref_root_slots: &[(u32, usize)],
     stale_ref_vars: &IndexSet<u32>,
     demoted_failarg_slots: &IndexMap<u32, i32>,
     ref_root_base_ofs: i32,
     ptr_type: cranelift_codegen::ir::Type,
     call_conv: cranelift_codegen::isa::CallConv,
+    failure_recovery: &mut FailureRecovery,
+    fail_descrs: &[DescrRef],
 ) {
     // _push_all_regs_to_frame / save_into_mem parity:
     // store fail_args to jf_frame[slot]
     //
+    // A fail arg that already occupies a frame home is not stored again.
+    // `apply_resident_failarg_locs` records that home in `rd_locs`
+    // (`rebuild_faillocs_from_descr`); the positional publish below is
+    // only the args that still live in registers or as immediates.
+    //
     // vector_ext.py:119-156 _update_at_exit parity:
     // If accumulation is done in this loop, at the guard exit some vector
     // values must be reduced to scalars before storing to jf_frame.
+    let skip_store = apply_resident_failarg_locs(
+        info,
+        fail_descrs,
+        ref_root_slots,
+        stale_ref_vars,
+        demoted_failarg_slots,
+        ref_root_base_ofs,
+    );
     let accum_positions: IndexMap<usize, &AccumInfo> = info
         .accum_info
         .iter()
@@ -7492,6 +7795,9 @@ fn emit_guard_exit(
                 }
             };
             publish.store(builder, jf_ptr, offset, reduced);
+        } else if skip_store.get(slot).copied().unwrap_or(false) {
+            // Already at the frame home `rd_locs` names. Copying it into
+            // the positional slot is a frame-to-frame move.
         } else {
             let val = resolve_failarg_opref(
                 builder,
@@ -7647,54 +7953,93 @@ fn emit_guard_exit(
         );
     }
 
-    // _build_failure_recovery (assembler.py:2089-2096) parity:
-    // if exc: MOV ebx, [pos_exc_value]; MOV [pos_exception], 0;
-    //         MOV [pos_exc_value], 0; MOV [jf_guard_exc], ebx
-    if info.must_save_exception {
-        // _store_and_reset_exception (assembler.py:1826-1842) parity:
-        // Store pos_exc_value → jf_guard_exc, clear both globals to 0.
-        // exc_class is derived from exc_value.typeptr (pyjitpl.py:3119-3123).
-        let exc_addr = builder
-            .ins()
-            .iconst(cl_types::I64, jit_exc_value_addr() as i64);
-        let exc_val = builder
-            .ins()
-            .load(cl_types::I64, MemFlagsData::trusted(), exc_addr, 0);
-        builder
-            .ins()
-            .store(MemFlagsData::trusted(), exc_val, jf_ptr, JF_GUARD_EXC_OFS);
-        let zero = builder.ins().iconst(cl_types::I64, 0);
-        builder
-            .ins()
-            .store(MemFlagsData::trusted(), zero, exc_addr, 0);
-        let exc_type_addr = builder
-            .ins()
-            .iconst(cl_types::I64, jit_exc_type_addr() as i64);
-        builder
-            .ins()
-            .store(MemFlagsData::trusted(), zero, exc_type_addr, 0);
+    let recovery = failure_recovery.block(builder, info.must_save_exception);
+    builder.ins().jump(recovery, &[BlockArg::from(descr_val)]);
+}
+
+/// `_build_failure_recovery(exc)`: the deadframe return every guard exit of a
+/// function shares, one block per `exc` flavour.  The block takes the fail
+/// descr the exit stub hands it (`POP [ebp + jf_descr]`), stages a pending
+/// exception into `jf_guard_exc` when `exc`, and returns the jitframe
+/// (`_call_footer`).
+#[derive(Default)]
+struct FailureRecovery {
+    blocks: [Option<Block>; 2],
+}
+
+impl FailureRecovery {
+    fn block(&mut self, builder: &mut FunctionBuilder, exc: bool) -> Block {
+        *self.blocks[usize::from(exc)].get_or_insert_with(|| {
+            let block = builder.create_block();
+            builder.append_block_param(block, cl_types::I64);
+            builder.set_cold_block(block);
+            block
+        })
     }
-    if info.must_save_exception {
-        // `jf_guard_exc` is a header GCREF field (jitframe.py:105-109), traced
-        // on every walk and independent of the gcmap, so the staging store
-        // above needs its own barrier. The fail-arg publish is covered by the
-        // barrier that runs before the dispatch tail-calls.
-        emit_jitframe_write_barrier(
-            builder,
-            ptr_type,
-            call_conv,
-            jf_ptr,
-            jitframe_write_barrier_flag(),
-        );
+
+    /// Fill the blocks some exit jumped to.  Runs once the body is emitted,
+    /// so every predecessor is known when a block is sealed.
+    fn emit(
+        self,
+        builder: &mut FunctionBuilder,
+        ptr_type: cranelift_codegen::ir::Type,
+        call_conv: cranelift_codegen::isa::CallConv,
+    ) {
+        for (exc, block) in self.blocks.into_iter().enumerate() {
+            let Some(block) = block else {
+                continue;
+            };
+            builder.switch_to_block(block);
+            builder.seal_block(block);
+            let descr_val = builder.block_params(block)[0];
+            let jf_ptr = builder.ins().get_pinned_reg(ptr_type);
+            if exc == 1 {
+                // _store_and_reset_exception (assembler.py) parity:
+                // Store pos_exc_value → jf_guard_exc, clear both globals to 0.
+                // exc_class is derived from exc_value.typeptr (pyjitpl.py handle_jitexception).
+                let exc_addr = builder
+                    .ins()
+                    .iconst(cl_types::I64, jit_exc_value_addr() as i64);
+                let exc_val =
+                    builder
+                        .ins()
+                        .load(cl_types::I64, MemFlagsData::trusted(), exc_addr, 0);
+                builder
+                    .ins()
+                    .store(MemFlagsData::trusted(), exc_val, jf_ptr, JF_GUARD_EXC_OFS);
+                let zero = builder.ins().iconst(cl_types::I64, 0);
+                builder
+                    .ins()
+                    .store(MemFlagsData::trusted(), zero, exc_addr, 0);
+                let exc_type_addr = builder
+                    .ins()
+                    .iconst(cl_types::I64, jit_exc_type_addr() as i64);
+                builder
+                    .ins()
+                    .store(MemFlagsData::trusted(), zero, exc_type_addr, 0);
+                // `jf_guard_exc` is a header GCREF field (jitframe.py JITFRAME),
+                // traced on every walk and independent of the gcmap, so the
+                // staging store above needs its own barrier. The fail-arg
+                // publish is covered by the barrier that runs before the
+                // dispatch tail-calls.
+                emit_jitframe_write_barrier(
+                    builder,
+                    ptr_type,
+                    call_conv,
+                    jf_ptr,
+                    jitframe_write_barrier_flag(),
+                );
+            }
+            builder
+                .ins()
+                .store(MemFlagsData::trusted(), descr_val, jf_ptr, JF_DESCR_OFS); // #2105
+            // assembler.py _call_footer → _call_footer_shadowstack:
+            // SUB [rootstacktop], 2*WORD — inline, no function call.
+            emit_call_footer_shadowstack(builder, ptr_type);
+            // _call_footer (assembler.py): mov eax, ebp; ret
+            builder.ins().return_(&[jf_ptr]);
+        }
     }
-    builder
-        .ins()
-        .store(MemFlagsData::trusted(), descr_val, jf_ptr, JF_DESCR_OFS); // #2105
-    // assembler.py:1101 _call_footer → _call_footer_shadowstack:
-    // SUB [rootstacktop], 2*WORD — inline, no function call.
-    emit_call_footer_shadowstack(builder, ptr_type);
-    // _call_footer (assembler.py:1097): mov eax, ebp; ret
-    builder.ins().return_(&[jf_ptr]);
 }
 
 // Compiled loop data
@@ -8299,6 +8644,49 @@ fn resolve_exit_descr(
     }
 }
 
+/// `assembler.py` `gcmap_for_finish`: one bitmap word with bit 0 set, the
+/// map a FINISH returning a Ref leaves on the frame so slot 0 is traced.
+static GCMAP_FOR_FINISH: [isize; 2] = [1, 1];
+
+/// compile.py `PropagateExceptionDescr.handle_fail`: move `jf_guard_exc`
+/// (or `memory_error` when it is empty) into frame slot 0 and retarget
+/// `jf_descr` at the attached `exit_frame_with_exception_descr_ref`, so
+/// the ExitFrameWithExceptionRef reader picks the exception up.
+fn stage_propagate_exception_as_exit(
+    result_jf: *mut i64,
+    attachments: &'static CpuDescrAttachments,
+) {
+    let header_words = JF_FRAME_ITEM0_OFS as usize / 8;
+    let exc_val = unsafe {
+        let slot = result_jf.add(JF_GUARD_EXC_OFS as usize / 8);
+        let v = *slot;
+        *slot = 0;
+        v
+    };
+    let exc_val = if exc_val != 0 {
+        exc_val
+    } else {
+        // compile.py `cast_instance_to_gcref(memory_error)`
+        majit_backend::memory_error_singleton_ref()
+    };
+    // Slot 0 now holds the only reference to the exception. The propagate
+    // guard has no failargs, so its gcmap marks no slot; install
+    // `gcmap_for_finish` so the frame keeps the value rooted and forwarded
+    // until the exit reader consumes it.
+    unsafe {
+        *result_jf.add(header_words) = exc_val;
+        *result_jf.add(JF_GCMAP_OFS as usize / 8) = GCMAP_FOR_FINISH.as_ptr() as i64;
+    }
+    // When unattached (unit-test setup) this writes 0, and
+    // `resolve_exit_descr` surfaces the cranelift singleton.
+    // `AbstractDescr.hide`: the attached word is the cell address, not
+    // `Arc::as_ptr`'s data half.
+    let attached_exit = attachments.descr_ptrs().exit_frame_with_exception_descr_ref;
+    unsafe {
+        *result_jf.add(JF_DESCR_OFS as usize / 8) = attached_exit as i64;
+    }
+}
+
 fn run_compiled_code_inner(
     code_ptr: *const u8,
     fail_descrs: &[DescrRef],
@@ -8313,9 +8701,9 @@ fn run_compiled_code_inner(
     let depth = max_output_slots.max(inputs.len()).max(1);
     let header_words = (JF_FRAME_ITEM0_OFS as usize) / 8; // 8 words = 64 bytes
     let frame_depth = depth + num_ref_roots;
-    // Read once, ahead of the run. Each of these is a `Once`-guarded load of a
-    // flag fixed at process start, and the compiled call between the sites
-    // below is opaque to the optimizer, so asking again after it re-reads.
+    // Read once per entry, ahead of the run: the compiled call between the
+    // sites below is opaque to the optimizer, so asking again after it
+    // re-reads.
     let EntryFlags {
         log_enabled,
         debug_prints,
@@ -8526,43 +8914,42 @@ fn run_compiled_code_inner(
     // clear) and stage the result into `jf_frame[0]` so
     // `EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL`'s consumer path
     // (compile.py:660) reads it through the existing accessor.
+    // Singleton cell (`AbstractDescr.hide` / `descr_instance_ptr`), the
+    // word `_build_propagate_exception_path` writes. The recovery stub
+    // writes the guard's own `FailDescrCell`; that case is the
+    // `cell_is_propagate` arm below (`compile.py`
+    // `PropagateExceptionDescr.handle_fail`, `compile_tmp_callback`).
     let propagate_descr_ptr = attachments.descr_ptrs().propagate_exception_descr;
-    if propagate_descr_ptr != 0 && jf_descr_raw as usize == propagate_descr_ptr {
-        let header_words = JF_FRAME_ITEM0_OFS as usize / 8;
-        let exc_val = unsafe {
-            let slot = result_jf.add(JF_GUARD_EXC_OFS as usize / 8);
-            let v = *slot;
-            *slot = 0;
-            v
-        };
-        let exc_val = if exc_val != 0 {
-            exc_val
-        } else {
-            // compile.py `cast_instance_to_gcref(memory_error)`
-            // — fallback when Layer 1's singleton store didn't fire
-            // (no provider registered, or test setup that bypasses
-            // pyre's malloc helpers).
-            majit_backend::memory_error_singleton_ref()
-        };
-        unsafe {
-            *result_jf.add(header_words) = exc_val;
-        }
-        // Reroute jf_descr to the attached
-        // `exit_frame_with_exception_descr_ref` so the existing
-        // match arm picks up the ExitFrameWithExceptionRef tail.
-        // When unattached (unit-test setup), fall through to the
-        // cranelift singleton via `direct_descr` below.
-        let attached_exit = attachments.descr_ptrs().exit_frame_with_exception_descr_ref;
-        if attached_exit != 0 {
-            unsafe {
-                *result_jf.add(JF_DESCR_OFS as usize / 8) = attached_exit as i64;
-            }
-        }
+    let raw_propagate = propagate_descr_ptr != 0 && jf_descr_raw as usize == propagate_descr_ptr;
+    if raw_propagate {
+        stage_propagate_exception_as_exit(result_jf, attachments);
     }
-    let jf_descr_raw = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) };
+    let mut jf_descr_raw = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) };
 
-    let (fail_index, direct_descr) =
+    let (mut fail_index, mut direct_descr) =
         resolve_exit_descr(jf_descr_raw, fail_descrs, attachments, propagate_descr_ptr);
+    // The guard-cell `jf_descr` is resolved above. When the wrapped
+    // descr is `propagate_exception_descr`, stage the same exit the
+    // raw-pointer arm does. Otherwise the resume-guard path finds no
+    // `rd_numb` and the caller continues as if the call returned NULL
+    // (`compile.py` `PropagateExceptionDescr.handle_fail`,
+    // `compile_tmp_callback`).
+    let cell_is_propagate = !raw_propagate
+        && attachments
+            .propagate_exception_descr
+            .as_ref()
+            .is_some_and(|propagate| {
+                direct_descr.as_ref().is_some_and(|descr| {
+                    let recovered = descr.to_arc();
+                    Arc::ptr_eq(&recovered, propagate)
+                })
+            });
+    if cell_is_propagate {
+        stage_propagate_exception_as_exit(result_jf, attachments);
+        jf_descr_raw = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) };
+        (fail_index, direct_descr) =
+            resolve_exit_descr(jf_descr_raw, fail_descrs, attachments, propagate_descr_ptr);
+    }
     #[cfg(feature = "__execute-stage-probe")]
     if majit_backend::deadframe::probe_extra_stage()
         == majit_backend::deadframe::ProbeExtraStage::Descr
@@ -8620,6 +9007,11 @@ struct GuardInfo {
     /// is keyed by and the one a merged region names as its `source_fail_index`.
     fail_index: u32,
     can_have_bridge: bool,
+    /// Guards other than `GuardNotForced2` may retarget a fail arg that
+    /// already has a frame home through `rd_locs` and skip its positional
+    /// store. FINISH, external JUMP, and `GuardNotForced2` keep publishing
+    /// every value themselves.
+    redirect_resident_failargs: bool,
     fail_arg_refs: Vec<OpRef>,
     /// The GUARD_VALUE operand this exit stores in the trace's counter slot
     /// so `make_a_counter_per_value` has a slot to name, paired with that
@@ -8628,16 +9020,22 @@ struct GuardInfo {
     /// assembler.py must_save_exception(): true for
     /// GUARD_EXCEPTION, GUARD_NO_EXCEPTION, GUARD_NOT_FORCED.
     must_save_exception: bool,
-    /// Dense output slots holding this guard's Ref fail-args. They are the
-    /// guard's whole gcmap (`GuardToken.compute_gcmap`), and the slots a
-    /// paired CALL_MAY_FORCE / CALL_RELEASE_GIL publishes into before its call.
+    /// Slots in this guard's gcmap (`GuardToken.compute_gcmap`).
+    /// Collected as the dense index of each Ref fail arg. A paired
+    /// CALL_MAY_FORCE / CALL_RELEASE_GIL reads that dense set and publishes
+    /// it before the call. `apply_resident_failarg_locs` then replaces the
+    /// dense index of a ref whose value already occupies a frame home with
+    /// that home's frame index, so the deadframe map marks the word
+    /// `rd_locs` actually names.
     failarg_ref_slots: Vec<usize>,
     /// `llsupport/assembler.py rebuild_faillocs_from_descr`: the physical
     /// frame slot each of an attached bridge's inputargs is read from, in
     /// bridge inputarg order.  Decoded from this guard's `rd_locs` — one
     /// entry per logical resume position, `0xFFFF` for a hole — which
     /// `optimizeopt/mod.rs` writes as identity-with-holes for this backend.
-    /// Empty when the descr carries no `rd_locs`, i.e. plain identity.
+    /// Emission may replace an identity entry with the fail arg's frame
+    /// home when that value is not stored again. Empty when the descr
+    /// carries no `rd_locs` and nothing was redirected, i.e. plain identity.
     bridge_source_slots: Vec<usize>,
     /// Leaked `[length, data...]` gcmap pointer, or 0 for NULLGCMAP.
     /// allocate_gcmap (gcmap.py) parity.
@@ -9026,7 +9424,7 @@ impl CraneliftBackend {
                             && !fail_descr_has_bridge(as_fd(&new_d))
                             && let Some(b) = fail_descr_bridge_ref(as_fd(prev_d))
                         {
-                            if std::env::var_os("MAJIT_LOG").is_some() {
+                            if majit_log_enabled() {
                                 eprintln!(
                                     "[jit] propagate bridge tid={} fi={} to new token",
                                     tid, fi,
@@ -9692,7 +10090,14 @@ impl CraneliftBackend {
         if let Some(next_bridge) = fail_descr_bridge_ref(fail_descr_fd) {
             // Extracted on the one arm that feeds it forward; the FINISH and
             // no-bridge exits above and below return the frame itself.
-            let outputs = exec.extract_outputs(bridge.max_output_slots.max(1));
+            // Span the ref-root region so a redirected `rd_locs` entry is
+            // inside the slice `execute_bridge` indexes.
+            let outputs = exec.extract_outputs(
+                bridge
+                    .max_output_slots
+                    .saturating_add(bridge.num_ref_roots)
+                    .max(1),
+            );
             return Self::execute_bridge(&next_bridge, &outputs, fail_descr_fd, attachments);
         }
 
@@ -10099,6 +10504,7 @@ impl CraneliftBackend {
         // compile-local state for the duration of this invocation.
         let mut func_ctx = std::mem::replace(&mut self.func_ctx, FunctionBuilderContext::new());
         let mut builder = FunctionBuilder::new(&mut func, &mut func_ctx);
+        let mut failure_recovery = FailureRecovery::default();
 
         let entry_block = builder.create_block();
         builder.append_block_params_for_function_params(entry_block);
@@ -10311,7 +10717,7 @@ impl CraneliftBackend {
         // RPython: refs are always in jf_frame; gcmap marks which slots
         // are live at each GC point (regalloc.py get_gcmap).
         let ref_root_base_ofs = JF_FRAME_ITEM0_OFS + (max_output_slots as i32) * 8;
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if majit_log_enabled() {
             eprintln!(
                 "[codegen] max_output={} ref_roots={} longevity={:?}",
                 max_output_slots,
@@ -10621,17 +11027,22 @@ impl CraneliftBackend {
         // `JF_FRAME_ITEM0_OFS + i*8`, which overlap the ref-root region when
         // `max_output_slots < arity`, so seeding here would clobber a carried
         // value before its loader reads it. A linear entry needs no eager
-        // root-home write at all. A guard's
-        // `allocate_gcmap(&failarg_ref_slots)` contains only dense indices,
-        // while `ref_root_base_ofs` starts at `max_output_slots`, which is at
-        // least `inputargs.len()`, so no guard gcmap can name the ref-root word
-        // such a store would write. Every `emit_push_gcmap` is preceded by
-        // `spill_ref_roots` over the same slot list, and `get_gcmap` uses the
-        // same ref-root predicate as that spill. Its two mark-without-spill
-        // escapes are inert here: demotion requires a LABEL, and
-        // `stale_ref_vars` has no insertion anywhere. The home's first write
-        // is therefore the first spill. Any future path that marks a ref-root
-        // word without a preceding spill is a live GC bug.
+        // root-home write at all.
+        //
+        // A guard gcmap names a ref-root slot only when `rd_locs` redirects
+        // that fail arg onto a home that already holds the value: a demoted
+        // ref seeded at its LABEL, or a stale root spilled before the guard.
+        // That home's frame index is `max_output_slots + root_slot` (a demoted
+        // non-ref home sits past the ref roots). Every other ref fail arg
+        // stays at its dense index, below `max_output_slots` and so below
+        // `ref_root_base_ofs`. At this entry neither home exists — demotion
+        // requires a LABEL, and `stale_ref_vars` has no insertion yet — so an
+        // entry guard still cannot name a ref-root word. Every
+        // `emit_push_gcmap` is preceded by `spill_ref_roots` over the same
+        // slot list, and `get_gcmap` uses the same ref-root predicate as that
+        // spill. The home's first write is therefore the first spill or the
+        // LABEL seed. Any path that marks a ref-root word no spill and no
+        // seed has written is a live GC bug.
         let mut deferred_entry_root_syncs: Vec<(u32, CValue)> = Vec::new();
         let has_labels = !label_indices.is_empty();
         debug_assert!(
@@ -11073,13 +11484,16 @@ impl CraneliftBackend {
                     // A kept param whose raw is NOT frame-resident needs no
                     // ref-root store here: `regalloc.py` publishes a reference to
                     // its frame home at `before_call()`, not at a LABEL, and every
-                    // reader agrees.  A guard's map is
-                    // `allocate_gcmap(&failarg_ref_slots)` and so never names the
-                    // ref-root region; `get_gcmap`, which does name it, is a
-                    // call-site map that `spill_ref_roots` refreshes on the
-                    // instruction before; and `resolve_failarg_opref` reaches the
-                    // raw through `use_var`.  Storing every one of them here put a
-                    // store per live reference on the loop header, i.e. on every
+                    // reader agrees.  A guard map names a ref-root slot only for
+                    // a fail arg `rd_locs` redirects onto a home that already
+                    // exists (a demoted ref, or a stale root).  A kept param is
+                    // neither: `resolve_failarg_opref` reaches it through
+                    // `use_var`, and the exit stores it at its dense fail-arg
+                    // slot, so the map names that dense index.  `get_gcmap`,
+                    // which does name the ref-root region, is a call-site map
+                    // that `spill_ref_roots` refreshes on the instruction
+                    // before.  Storing every kept reference here put a store
+                    // per live reference on the loop header, i.e. on every
                     // iteration of the loop.
                     //
                     // A raw carried in `demoted_failarg_slots` is the exception
@@ -11472,7 +11886,7 @@ impl CraneliftBackend {
                 | OpCode::GuardFalse
                 | OpCode::GuardNonnull
                 | OpCode::GuardIsnull => {
-                    let info = &guard_infos[guard_idx];
+                    let info = &mut guard_infos[guard_idx];
                     guard_idx += 1;
 
                     let cond = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
@@ -11512,6 +11926,8 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &mut failure_recovery,
+                        &fail_descrs,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -11519,7 +11935,7 @@ impl CraneliftBackend {
                 }
 
                 OpCode::GuardValue => {
-                    let info = &guard_infos[guard_idx];
+                    let info = &mut guard_infos[guard_idx];
                     guard_idx += 1;
 
                     let (a, b) = resolve_binop(&mut builder, &constants, op);
@@ -11547,6 +11963,8 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &mut failure_recovery,
+                        &fail_descrs,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -11560,7 +11978,7 @@ impl CraneliftBackend {
                     //       CMP(mem(loc_ptr, offset), loc_classptr)
                     //   else:
                     //       _cmp_guard_gc_type(loc_ptr, expected_typeid)
-                    let info = &guard_infos[guard_idx];
+                    let info = &mut guard_infos[guard_idx];
                     guard_idx += 1;
 
                     let (obj, expected_class) = resolve_binop(&mut builder, &constants, op);
@@ -11599,6 +12017,8 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &mut failure_recovery,
+                        &fail_descrs,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -11606,7 +12026,7 @@ impl CraneliftBackend {
                 }
 
                 OpCode::GuardNonnullClass => {
-                    let info = &guard_infos[guard_idx];
+                    let info = &mut guard_infos[guard_idx];
                     guard_idx += 1;
 
                     let (obj, expected_class) = resolve_binop(&mut builder, &constants, op);
@@ -11653,6 +12073,8 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &mut failure_recovery,
+                        &fail_descrs,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -11660,7 +12082,7 @@ impl CraneliftBackend {
                 }
 
                 OpCode::GuardNoException => {
-                    let info = &guard_infos[guard_idx];
+                    let info = &mut guard_infos[guard_idx];
                     guard_idx += 1;
 
                     // Direct memory load from global JIT_EXC_VALUE (no TLS/host call).
@@ -11699,6 +12121,8 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &mut failure_recovery,
+                        &fail_descrs,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -11713,7 +12137,7 @@ impl CraneliftBackend {
                     //   _store_and_reset_exception → resloc = [pos_exc_value];
                     //     [pos_exception] = 0; [pos_exc_value] = 0
                     // All inline loads/stores, no host calls.
-                    let info = &guard_infos[guard_idx];
+                    let info = &mut guard_infos[guard_idx];
                     guard_idx += 1;
 
                     let expected_type =
@@ -11752,6 +12176,8 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &mut failure_recovery,
+                        &fail_descrs,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -11786,7 +12212,7 @@ impl CraneliftBackend {
                         continue;
                     }
                     // Side-exit if overflow DID occur (ovf != 0).
-                    let info = &guard_infos[guard_idx];
+                    let info = &mut guard_infos[guard_idx];
                     guard_idx += 1;
                     let ovf = last_ovf_flag.take().unwrap();
                     let exit_block = builder.create_block();
@@ -11814,6 +12240,8 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &mut failure_recovery,
+                        &fail_descrs,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -11821,7 +12249,7 @@ impl CraneliftBackend {
                 }
                 OpCode::GuardOverflow => {
                     // Side-exit if overflow did NOT occur (ovf == 0).
-                    let info = &guard_infos[guard_idx];
+                    let info = &mut guard_infos[guard_idx];
                     guard_idx += 1;
 
                     let ovf = last_ovf_flag
@@ -11852,6 +12280,8 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &mut failure_recovery,
+                        &fail_descrs,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -11866,7 +12296,7 @@ impl CraneliftBackend {
                     //   self.implement_guard(guard_token)
                     // Pairing validation is done by CALL_MAY_FORCE (forward
                     // lookup, _find_nearby_operation(+1) parity).
-                    let info = &guard_infos[guard_idx];
+                    let info = &mut guard_infos[guard_idx];
                     guard_idx += 1;
 
                     let jf_descr = builder.ins().load(
@@ -11901,6 +12331,8 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &mut failure_recovery,
+                        &fail_descrs,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -11919,7 +12351,7 @@ impl CraneliftBackend {
                     // emit_guard_exit does this for inline guards. For
                     // GUARD_NOT_FORCED_2 (no inline branch), we write fail_args
                     // to jf_frame[0..n] here so force() sees correct values.
-                    let info = &guard_infos[guard_idx];
+                    let info = &mut guard_infos[guard_idx];
                     guard_idx += 1;
 
                     // _store_force_index(op): store descr to jf_force_descr
@@ -11978,7 +12410,7 @@ impl CraneliftBackend {
                 }
 
                 OpCode::GuardNotInvalidated => {
-                    let info = &guard_infos[guard_idx];
+                    let info = &mut guard_infos[guard_idx];
                     guard_idx += 1;
 
                     if let Some(flag_addr) = invalidation_flag_ptr {
@@ -12031,6 +12463,8 @@ impl CraneliftBackend {
                             ref_root_base_ofs,
                             ptr_type,
                             call_conv,
+                            &mut failure_recovery,
+                            &fail_descrs,
                         );
 
                         builder.switch_to_block(cont_block);
@@ -12041,7 +12475,7 @@ impl CraneliftBackend {
                 OpCode::GuardFutureCondition => {
                     // Future condition: the guard condition is computed lazily.
                     // For now, behave like GuardTrue on args[0].
-                    let info = &guard_infos[guard_idx];
+                    let info = &mut guard_infos[guard_idx];
                     guard_idx += 1;
 
                     let cond = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
@@ -12071,6 +12505,8 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &mut failure_recovery,
+                        &fail_descrs,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -12079,7 +12515,7 @@ impl CraneliftBackend {
 
                 OpCode::GuardAlwaysFails => {
                     // Always-failing guard: unconditionally side-exit.
-                    let info = &guard_infos[guard_idx];
+                    let info = &mut guard_infos[guard_idx];
                     guard_idx += 1;
 
                     let cur_jf = builder.ins().get_pinned_reg(ptr_type);
@@ -12094,6 +12530,8 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &mut failure_recovery,
+                        &fail_descrs,
                     );
 
                     // Create a continuation block for subsequent ops (dead code).
@@ -12106,7 +12544,7 @@ impl CraneliftBackend {
                     // args[0] = object ref, args[1] = expected type_id (as Int)
                     // Load the GC header (8 bytes before the obj pointer),
                     // extract the lower 32 bits (type_id), and compare.
-                    let info = &guard_infos[guard_idx];
+                    let info = &mut guard_infos[guard_idx];
                     guard_idx += 1;
 
                     let obj_ptr = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
@@ -12148,6 +12586,8 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &mut failure_recovery,
+                        &fail_descrs,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -12175,7 +12615,7 @@ impl CraneliftBackend {
                     //     self.mc.TEST8(loc_infobits, imm(IS_OBJECT_FLAG))
                     //     self.guard_success_cc = rx86.Conditions['NZ']
                     //     self.implement_guard(guard_token)
-                    let info = &guard_infos[guard_idx];
+                    let info = &mut guard_infos[guard_idx];
                     guard_idx += 1;
 
                     if !cranelift_gc_active() {
@@ -12259,6 +12699,8 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &mut failure_recovery,
+                        &fail_descrs,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -12291,7 +12733,7 @@ impl CraneliftBackend {
                     //     self.mc.CMP_ri(loc_tmp, check_max - check_min)
                     //     self.guard_success_cc = Conditions['B']
                     //     self.implement_guard(guard_token)
-                    let info = &guard_infos[guard_idx];
+                    let info = &mut guard_infos[guard_idx];
                     guard_idx += 1;
 
                     if !cranelift_gc_active() {
@@ -12419,6 +12861,8 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &mut failure_recovery,
+                        &fail_descrs,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -12591,7 +13035,7 @@ impl CraneliftBackend {
                         && (next.opcode == OpCode::GuardNotForced
                             || next.opcode == OpCode::GuardNotForced2)
                     {
-                        let info = &guard_infos[guard_idx];
+                        let info = &mut guard_infos[guard_idx];
                         let descr_val = builder.ins().iconst(cl_types::I64, info.fail_descr_ptr);
                         let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                         builder.ins().store(
@@ -13028,7 +13472,7 @@ impl CraneliftBackend {
                     //   self._store_force_index(self._find_nearby_operation(+1))
                     //   self._genop_call(op, arglocs, result_loc)
                     check_paired_guard_not_forced(ops, op_idx, op.opcode, "call_may_force")?;
-                    let info = &guard_infos[guard_idx];
+                    let info = &mut guard_infos[guard_idx];
                     // x86/assembler.py _store_force_index parity:
                     // Store the GUARD_NOT_FORCED fail descriptor pointer
                     // into jf_force_descr before the call. If the callee
@@ -13097,7 +13541,7 @@ impl CraneliftBackend {
                     //   self._store_force_index(self._find_nearby_operation(+1))
                     //   self._genop_call(op, arglocs, result_loc, is_call_release_gil=True)
                     check_paired_guard_not_forced(ops, op_idx, op.opcode, "call_release_gil")?;
-                    let info = &guard_infos[guard_idx];
+                    let info = &mut guard_infos[guard_idx];
                     let descr_val = builder.ins().iconst(cl_types::I64, info.fail_descr_ptr);
                     let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                     builder.ins().store(
@@ -14906,7 +15350,7 @@ impl CraneliftBackend {
                         // External JUMP (bridge → loop body) — emit as
                         // Finish exit. The dispatcher will re-enter the
                         // target loop with these output values.
-                        let info = &guard_infos[guard_idx];
+                        let info = &mut guard_infos[guard_idx];
                         guard_idx += 1;
                         let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                         emit_guard_exit(
@@ -14920,12 +15364,14 @@ impl CraneliftBackend {
                             ref_root_base_ofs,
                             ptr_type,
                             call_conv,
+                            &mut failure_recovery,
+                            &fail_descrs,
                         );
                     }
                 }
 
                 OpCode::Finish => {
-                    let info = &guard_infos[guard_idx];
+                    let info = &mut guard_infos[guard_idx];
                     guard_idx += 1;
                     let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                     emit_guard_exit(
@@ -14939,6 +15385,8 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &mut failure_recovery,
+                        &fail_descrs,
                     );
                 }
 
@@ -15083,7 +15531,7 @@ impl CraneliftBackend {
 
                 // ── Vector guards ──
                 OpCode::VecGuardTrue => {
-                    let info = &guard_infos[guard_idx];
+                    let info = &mut guard_infos[guard_idx];
                     guard_idx += 1;
                     let cond = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let zero = builder.ins().iconst(cl_types::I64, 0);
@@ -15111,12 +15559,14 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &mut failure_recovery,
+                        &fail_descrs,
                     );
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
                 }
                 OpCode::VecGuardFalse => {
-                    let info = &guard_infos[guard_idx];
+                    let info = &mut guard_infos[guard_idx];
                     guard_idx += 1;
                     let cond = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let zero = builder.ins().iconst(cl_types::I64, 0);
@@ -15144,6 +15594,8 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &mut failure_recovery,
+                        &fail_descrs,
                     );
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -15950,6 +16402,7 @@ impl CraneliftBackend {
         if label_blocks.is_empty() && loop_block != entry_block {
             builder.seal_block(loop_block);
         }
+        failure_recovery.emit(&mut builder, ptr_type, call_conv);
         builder.finalize(frontend_config);
         self.func_ctx = func_ctx;
         propagate_cold_blocks(&mut func);
@@ -16070,7 +16523,7 @@ impl CraneliftBackend {
             .module
             .define_function(entry_id, &mut wrapper_compile_ctx)
         {
-            if std::env::var_os("MAJIT_LOG").is_some() {
+            if majit_log_enabled() {
                 eprintln!(
                     "[jit][clif-error] wrapper {e}\nCLIF IR:\n{}",
                     wrapper_compile_ctx.func.display()
@@ -16118,7 +16571,7 @@ impl CraneliftBackend {
             })?;
             asm_memory_blocks.push(block);
         }
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if majit_log_enabled() {
             let fail_descr_preview: Vec<(u32, usize)> = fail_descrs
                 .iter()
                 .map(|descr| {
@@ -16579,7 +17032,7 @@ fn collect_guards(
         } else {
             None
         };
-        if std::env::var_os("MAJIT_LOG").is_some() && guard_resume_pc.is_some() {
+        if majit_log_enabled() && guard_resume_pc.is_some() {
             eprintln!(
                 "[guard-resume] fail_index={} last_ref={:?} resume_pc={:?}",
                 fail_index,
@@ -17080,7 +17533,7 @@ fn collect_guards(
             }
             descr
         };
-        if std::env::var_os("MAJIT_LOG").is_some() && !is_finish && !is_external_jump {
+        if majit_log_enabled() && !is_finish && !is_external_jump {
             eprintln!(
                 "[cl-guard-token] fail_index={} op_index={} opcode={:?} fail_args={:?} fail_arg_types={:?}",
                 fail_index,
@@ -17222,6 +17675,7 @@ fn collect_guards(
             source_op_index: op_idx,
             fail_index,
             can_have_bridge,
+            redirect_resident_failargs: is_guard && op.opcode != OpCode::GuardNotForced2,
             fail_arg_refs,
             counter_value_spill,
             must_save_exception,
@@ -17229,8 +17683,12 @@ fn collect_guards(
             // `failargs` x `fail_locs` and nothing else — a guard's map is
             // narrower than `regalloc.get_gcmap()`, which is reserved for sites
             // where `before_call` has just refreshed every named slot. dynasm
-            // ports the same split (`guard_gcmap_from_faillocs`). Anything a
-            // guard exit does not itself write must stay out of this map.
+            // ports the same split (`guard_gcmap_from_faillocs`). The set
+            // starts as the dense index of each Ref fail arg. Emission
+            // retargets a ref whose value already lives in a frame home to
+            // that home's frame index — the slot `rd_locs` names, and the
+            // one the deadframe walk must mark. A slot this exit does not
+            // write and that is not such a home stays out of the map.
             bridge_source_slots,
             gcmap: allocate_gcmap(&failarg_ref_slots),
             failarg_ref_slots,
@@ -17938,8 +18396,23 @@ impl majit_backend::Backend for CraneliftBackend {
             let direct_descr = exec.direct_descr.clone();
             // Kept eager here, unlike the dispatch loops above: this entry's
             // whole contract is to hand back the raw exit slots, so every exit
-            // out of it reads the vector.
-            let mut outputs = exec.extract_outputs(cur_max_output_slots.max(1));
+            // out of it reads the vector. The image covers ref-root and
+            // demoted homes; the dense prefix is what an external JUMP
+            // re-enters with, and a guard/finish return projects `rd_locs`
+            // onto that prefix.
+            let dense_len = cur_max_output_slots.max(1);
+            let frame_depth = cur_max_output_slots
+                .saturating_add(cur_num_ref_roots)
+                .max(dense_len);
+            let frame_slots = exec.extract_outputs(frame_depth);
+            let mut outputs = frame_slots
+                .iter()
+                .copied()
+                .take(dense_len)
+                .collect::<Vec<_>>();
+            if outputs.len() < dense_len {
+                outputs.resize(dense_len, 0);
+            }
 
             // CALL_ASSEMBLER deadframe interception — exits raw dispatch.
             if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &exec) {
@@ -18059,7 +18532,8 @@ impl majit_backend::Backend for CraneliftBackend {
                 let exception = GcRef(exc_raw);
 
                 let exit_arity = fail_descr_fd.fail_arg_types().len();
-                outputs.truncate(exit_arity);
+                outputs =
+                    overlay_rd_locs_on_dense(&frame_slots, fail_descr_fd.rd_locs(), exit_arity);
                 let mut typed_outputs = Vec::with_capacity(exit_arity);
                 for (&raw, &tp) in outputs.iter().zip(fail_descr_fd.fail_arg_types().iter()) {
                     match tp {
@@ -18120,7 +18594,7 @@ impl majit_backend::Backend for CraneliftBackend {
             let exception = GcRef(exc_raw);
 
             let exit_arity = fail_descr_fd.fail_arg_types().len();
-            outputs.truncate(exit_arity);
+            outputs = overlay_rd_locs_on_dense(&frame_slots, fail_descr_fd.rd_locs(), exit_arity);
             let mut typed_outputs = Vec::with_capacity(exit_arity);
             for (&raw, &tp) in outputs.iter().zip(fail_descr_fd.fail_arg_types().iter()) {
                 match tp {

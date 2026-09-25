@@ -1100,16 +1100,14 @@ fn maybe_print_jit_stats() {
     if !PRINT_ROOT_ONLY_JIT_STATS.get().copied().unwrap_or(true) {
         return;
     }
-    // warmspot.py finish helper: `if profiler.initialized:
-    // profiler.finish()` — emits the PYPYLOG `jit-summary` section on
-    // stderr, visible under `MAJIT_LOG` (the `[jit-stats]` line below
-    // stays the `MAJIT_STATS` machine-readable summary).
-    if majit_metainterp::majit_log_enabled() {
-        let profiler = &pyre_jit::eval::driver_pair()
-            .0
-            .meta_interp()
-            .staticdata
-            .profiler;
+    // `WarmRunnerDesc.add_finish`: `if profiler.initialized: profiler.finish()`.
+    // `Profiler.print_stats` opens `debug_start("jit-summary")` and emits
+    // the body only while that section's ready bit is set, so the
+    // `MAJIT_LOG` filter applies inside `finish`. The driver is borrowed
+    // only when this thread already built it; constructing one here would
+    // run `init_gc_subsystem` on a run that never entered the JIT.
+    if let Some(pair) = pyre_jit::eval::existing_driver_pair() {
+        let profiler = &pair.0.meta_interp().staticdata.profiler;
         if profiler
             .initialized
             .load(std::sync::atomic::Ordering::Relaxed)
