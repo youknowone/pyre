@@ -133,6 +133,8 @@ cc = "1.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Resolver 2 does not unify this feature into a normal or release build.
+pyre-object = { workspace = true, features = ["test-hooks"] }
 
 # `type_object()` accessors publish their residual-call address through a
 # `linkme` link section off wasm32.  wasm32 rejects that section — a custom

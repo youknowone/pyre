@@ -112,50 +112,58 @@ pub fn register_gc_alloc_hook(hook: GcAllocHookFn) {
     GC_ALLOC_HOOK.set(Some(hook));
 }
 
-/// Serializes tests that publish the process-global alloc hooks, the lowlevel
-/// string type id, or the GC singleton.
-///
-/// The hooks are process-global fn cells. While the guard is alive they are
-/// visible only to the owning thread: every other thread takes the
-/// unregistered answer (`None` / string type id 0). Production never enters
-/// the guard, so `HOOK_TEST_OWNER == 0` leaves the cells visible to every
-/// thread. The mutex keeps two installers from publishing over each other.
-static HOOK_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-static HOOK_TEST_OWNER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Test-only owner gate. Compiled for `pyre-object`'s own unit tests
+/// (`cfg(test)`) and for dependents that opt into the `test-hooks` feature.
+/// A normal or release build does not contain the lock, the owner atomic, or
+/// the alloc-path checks.
+#[cfg(any(test, feature = "test-hooks"))]
+mod hook_test_owner {
+    /// Serializes tests that publish the process-global alloc hooks, the
+    /// lowlevel string type id, or the GC singleton.
+    static HOOK_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    static HOOK_TEST_OWNER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-thread_local! {
-    static HOOK_TEST_THREAD_TAG: u8 = const { 0 };
-}
+    thread_local! {
+        static HOOK_TEST_THREAD_TAG: u8 = const { 0 };
+    }
 
-fn hook_test_thread_tag() -> u64 {
-    HOOK_TEST_THREAD_TAG.with(|tag| tag as *const u8 as u64)
-}
+    fn hook_test_thread_tag() -> u64 {
+        HOOK_TEST_THREAD_TAG.with(|tag| tag as *const u8 as u64)
+    }
 
-pub(crate) fn hook_test_effects_visible() -> bool {
-    let owner = HOOK_TEST_OWNER.load(std::sync::atomic::Ordering::Acquire);
-    owner == 0 || owner == hook_test_thread_tag()
-}
+    /// Hooks installed under [`super::hook_test_guard`] are visible only to
+    /// that thread. Other threads take the unregistered answer.
+    pub(crate) fn hook_test_effects_visible() -> bool {
+        let owner = HOOK_TEST_OWNER.load(std::sync::atomic::Ordering::Acquire);
+        owner == 0 || owner == hook_test_thread_tag()
+    }
 
-pub struct HookTestGuard {
-    _lock: parking_lot::MutexGuard<'static, ()>,
-}
+    pub struct HookTestGuard {
+        _lock: parking_lot::MutexGuard<'static, ()>,
+    }
 
-/// Take [`HOOK_TEST_LOCK`] and hide hook effects from every other thread
-/// until the guard drops. Drop clears the nursery and stable alloc hooks so
-/// a panic cannot leave them installed.
-pub fn hook_test_guard() -> HookTestGuard {
-    let lock = HOOK_TEST_LOCK.lock();
-    HOOK_TEST_OWNER.store(hook_test_thread_tag(), std::sync::atomic::Ordering::Release);
-    HookTestGuard { _lock: lock }
-}
+    /// Take [`HOOK_TEST_LOCK`] and hide hook effects from every other thread
+    /// until the guard drops. Drop clears the nursery and stable alloc hooks
+    /// so a panic cannot leave them installed.
+    pub fn hook_test_guard() -> HookTestGuard {
+        let lock = HOOK_TEST_LOCK.lock();
+        HOOK_TEST_OWNER.store(hook_test_thread_tag(), std::sync::atomic::Ordering::Release);
+        HookTestGuard { _lock: lock }
+    }
 
-impl Drop for HookTestGuard {
-    fn drop(&mut self) {
-        clear_gc_alloc_hook();
-        clear_gc_alloc_stable_hook();
-        HOOK_TEST_OWNER.store(0, std::sync::atomic::Ordering::Release);
+    impl Drop for HookTestGuard {
+        fn drop(&mut self) {
+            super::clear_gc_alloc_hook();
+            super::clear_gc_alloc_stable_hook();
+            HOOK_TEST_OWNER.store(0, std::sync::atomic::Ordering::Release);
+        }
     }
 }
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) use hook_test_owner::hook_test_effects_visible;
+#[cfg(any(test, feature = "test-hooks"))]
+pub use hook_test_owner::{HookTestGuard, hook_test_guard};
 
 /// Remove the callback. Subsequent [`try_gc_alloc`] returns `None` until a
 /// new hook is registered.
@@ -168,6 +176,7 @@ pub fn clear_gc_alloc_hook() {
 /// returned null.
 #[inline]
 pub fn try_gc_alloc(type_id: u32, payload_size: usize) -> Option<*mut u8> {
+    #[cfg(any(test, feature = "test-hooks"))]
     if !hook_test_effects_visible() {
         return None;
     }
@@ -225,6 +234,7 @@ pub fn clear_gc_alloc_stable_hook() {
 /// `None` when no hook is installed.
 #[inline]
 pub fn try_gc_alloc_stable(type_id: u32, payload_size: usize) -> Option<*mut u8> {
+    #[cfg(any(test, feature = "test-hooks"))]
     if !hook_test_effects_visible() {
         return None;
     }

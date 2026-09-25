@@ -40,6 +40,13 @@ pub fn set_lowlevel_str_gc_type_id(id: u32) {
     majit_gc::set_lowlevel_str_type_id(id);
 }
 
+/// Undo [`set_lowlevel_str_gc_type_id`] so a unit test can force the managed
+/// string path and then put the process back on the immortal fallback.
+pub fn clear_lowlevel_str_gc_type_id() {
+    LOWLEVEL_STR_GC_TYPE_ID.store(0, std::sync::atomic::Ordering::Release);
+    majit_gc::clear_lowlevel_str_type_id();
+}
+
 pub fn set_lowlevel_unicode_gc_type_id(id: u32) {
     debug_assert_ne!(id, 0, "0 is the unpublished sentinel");
     LOWLEVEL_UNICODE_GC_TYPE_ID.store(id, std::sync::atomic::Ordering::Release);
@@ -47,6 +54,13 @@ pub fn set_lowlevel_unicode_gc_type_id(id: u32) {
 }
 
 pub fn lowlevel_str_gc_type_id() -> u32 {
+    // A unit test publishes a probe id only for its own thread. Other
+    // threads keep the unpublished sentinel and stay on the immortal path.
+    // Absent from a normal or release build.
+    #[cfg(any(test, feature = "test-hooks"))]
+    if !crate::gc_hook::hook_test_effects_visible() {
+        return 0;
+    }
     LOWLEVEL_STR_GC_TYPE_ID.load(std::sync::atomic::Ordering::Acquire)
 }
 

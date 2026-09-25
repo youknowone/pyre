@@ -10,6 +10,10 @@ description = "Python object model for pyre interpreter"
 # Collect on every allocation. Forwarded so list/object rooting tests can run
 # under the same gate as `pyre-jit`.
 gc_stress = ["majit-gc/gc_stress"]
+# Alloc-hook owner gate for unit tests. Empty so a normal build that does not
+# name it compiles the production alloc path with no test branch. Interpreter
+# tests enable it from `[dev-dependencies]` only.
+test-hooks = []
 
 [dependencies]
 num-traits = { workspace = true }
