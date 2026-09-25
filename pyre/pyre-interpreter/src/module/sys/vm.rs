@@ -4492,8 +4492,8 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
             if let Some(s_obj) = pick_str(args) {
                 let (encoding, _) = live_stdio_encoding_errors("stderr", "backslashreplace");
                 let bytes = encode_stdio_text(s_obj, "stderr", &encoding, "backslashreplace")?;
-                // An embedder with no fd 2 (wasm32) takes the bytes through
-                // its hook; otherwise fall through to the descriptor.
+                // An embedder that installed a hook takes the bytes here;
+                // otherwise fall through to the descriptor.
                 if !crate::stderr_hook_emit(&bytes) {
                     // Under sandbox fd 1 is the marshalling pipe, so a raw write
                     // would corrupt the protocol: route through ll_os_write(2,…)
@@ -4523,8 +4523,7 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
                 let (encoding, errors) = live_stdio_encoding_errors("stdout", "strict");
                 let bytes = encode_stdio_text(s_obj, "stdout", &encoding, &errors)?;
                 // Same seam `print` rides, so an embedder that captures stdout
-                // (wasm32, which has no fd 1) sees `sys.stdout.write` too and
-                // the two stay in order.
+                // sees `sys.stdout.write` too and the two stay in order.
                 if !crate::print_hook_emit_bytes(&bytes) {
                     #[cfg(not(feature = "sandbox"))]
                     {

@@ -21850,8 +21850,8 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         }
         #[cfg(all(feature = "host_env", target_arch = "wasm32"))]
         {
-            let _ = bytes;
-            return Err(wasm_fd::fd_refuse_write(fd));
+            let n = wasm_fd::fd_write(fd, &bytes)?;
+            return Ok(w_int_new(n));
         }
         #[cfg(not(feature = "host_env"))]
         {
