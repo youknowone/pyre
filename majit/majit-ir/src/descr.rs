@@ -1441,11 +1441,13 @@ impl GcCache {
     /// same insertion order, before any still-unresolved descriptor.
     pub fn replay_synthetic_struct_tids(
         &mut self,
-        base: u32,
-        mut register: impl FnMut(usize, Vec<usize>, Option<u32>) -> u32,
+        mut register: impl FnMut(usize, Vec<usize>) -> u32,
     ) {
-        let mut stamped: Vec<(u32, usize, Vec<usize>)> = Vec::new();
-        let mut fresh: Vec<(usize, Vec<usize>, *const SimpleSizeDescr)> = Vec::new();
+        // A replacement collector does not hand the same ids back: its
+        // `build_gc` prefix can be one longer than the collector that
+        // stamped these descriptors. The old heap is gone, so the
+        // descriptor adopts the id this collector just assigned.
+        let mut pending: Vec<(usize, Vec<usize>, *const SimpleSizeDescr)> = Vec::new();
         for descr in self._cache_size.values() {
             let Some(sd) = descr
                 .as_any()
@@ -1453,7 +1455,7 @@ impl GcCache {
             else {
                 continue;
             };
-            if !sd.is_gc_managed() || sd.headerless() || sd.cache_key() == 0 {
+            if !sd.is_gc_managed() || sd.headerless() || sd.cache_key() <= u32::MAX as u64 {
                 continue;
             }
             let ref_offsets = sd
@@ -1461,18 +1463,10 @@ impl GcCache {
                 .iter()
                 .map(|field| field.offset())
                 .collect();
-            if struct_tid_is_unresolved(sd.cache_key(), sd.type_id()) {
-                fresh.push((sd.size(), ref_offsets, sd as *const SimpleSizeDescr));
-            } else if sd.type_id() >= base {
-                stamped.push((sd.type_id(), sd.size(), ref_offsets));
-            }
+            pending.push((sd.size(), ref_offsets, sd as *const SimpleSizeDescr));
         }
-        stamped.sort_by_key(|(tid, _, _)| *tid);
-        for (stored, size, offsets) in stamped {
-            let _ = register(size, offsets, Some(stored));
-        }
-        for (size, offsets, sd) in fresh {
-            let tid = register(size, offsets, None);
+        for (size, offsets, sd) in pending {
+            let tid = register(size, offsets);
             unsafe { (*sd).set_type_id(tid) };
         }
     }

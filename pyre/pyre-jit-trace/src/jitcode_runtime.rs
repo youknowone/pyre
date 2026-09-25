@@ -1422,16 +1422,8 @@ fn register_synthetic_struct_tids() {
             });
             return;
         }
-        let base = gc.type_count() as u32;
-        cache.replay_synthetic_struct_tids(base, |size, offsets, stored| {
-            let tid = gc.register_type(majit_gc::trace::TypeInfo::with_gc_ptrs(size, offsets));
-            if let Some(stored) = stored {
-                assert_eq!(
-                    tid, stored,
-                    "synthetic struct tid changed after the collector was replaced"
-                );
-            }
-            tid
+        cache.replay_synthetic_struct_tids(|size, offsets| {
+            gc.register_type(majit_gc::trace::TypeInfo::with_gc_ptrs(size, offsets))
         });
     });
 }
