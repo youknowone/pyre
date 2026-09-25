@@ -5996,8 +5996,8 @@ impl<M: Clone> MetaInterp<M> {
         //   self.staticdata.profiler.start_tracing()    # INNER open
         //   self.staticdata.try_to_free_some_loops()
         // `ensure_jitlog_initialised` is pyre's pre-`_setup_once` jitlog
-        // bootstrap; it has no PyPy analog (jitlog wiring runs inside
-        // `_setup_once` upstream) and stays idempotent.
+        // bootstrap; jitlog wiring runs inside `_setup_once` upstream, so
+        // it shares that one-shot `globaldata.initialized` gate.
         //
         // The debug section wraps `_setup_once` upstream so any
         // `debug_print` inside the one-shot bootstrap (vector-ext
@@ -6006,7 +6006,9 @@ impl<M: Clone> MetaInterp<M> {
         // the debug section *before* `_setup_once` and the profiler
         // event *after*, splitting the work that
         // [`enter_profiler_tracing`] would normally combine.
-        self.warm_state.ensure_jitlog_initialised();
+        if !self.staticdata.globaldata.lock().initialized {
+            self.warm_state.ensure_jitlog_initialised();
+        }
         // `_setup_once` contains unconditional asserts (vector_ext
         // setup, jitdriver registration sanity, etc.) — a failure
         // panics out of this function.  Use a dismissable RAII
@@ -22517,9 +22519,10 @@ impl MetaInterpStaticData {
     ///         self.globaldata.initialized = True
     /// ```
     ///
-    /// Pyre owns the jitlog `Logger` on
+    /// The binary `rjitlog` writer is process-global, so its
+    /// `setup_once` runs here. Pyre owns the stats `Logger` on
     /// `WarmEnterState`, not on `MetaInterpStaticData` as PyPy does
-    /// on `self.jitlog`.  The PyPy `setup_once` step `self.jitlog
+    /// on `self.jitlog`.  That half of `self.jitlog
     /// .setup_once()` therefore cannot run from here — it would need
     /// a list of registered warmstates that pyre doesn't keep, and
     /// the per-warmstate `Option<Logger>` is initialised eagerly by
@@ -22587,6 +22590,7 @@ impl MetaInterpStaticData {
              before the first trace start (pyjitpl.py:2274-2281; \
              warmspot.py:1013-1017)"
         );
+        crate::rjitlog::setup_once();
         self.debug_print_jit_starting_line();
         backend.setup_once();
         backend.vector_ext_setup_once();
