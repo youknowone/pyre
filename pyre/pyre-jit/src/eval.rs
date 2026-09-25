@@ -4992,12 +4992,6 @@ pub fn init_gc_subsystem() {
     majit_gc::set_type_registry_close_hook(
         pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs,
     );
-    // Kind-0 descr decode and the synthetic struct tids. The close hook
-    // still runs this before `freeze_types` if a trace wins the race.
-    // Doing it here as well puts the cost in every process, including the
-    // empty-program startup a ratio subtracts, instead of only in the
-    // first trace.
-    pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs();
     // rbigint.py constructs `_parts_cache_10` at module import.  Force pyre's
     // translated prebuilt equivalent before any collector root walk rather
     // than lazily manufacturing it from inside the walker. After registration,
