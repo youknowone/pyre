@@ -11931,7 +11931,8 @@ pub unsafe fn type_attr_cell_fast_path(
     if version_tag == 0 {
         return None;
     }
-    if lookup_in_type_where_wtf8(metatype, name).is_some_and(|descr| is_data_descr(descr)) {
+    let w_name = pyre_object::unicodeobject::box_str_constant(name);
+    if lookup_in_type_where_wtf8(metatype, w_name).is_some_and(|descr| is_data_descr(descr)) {
         return None;
     }
     let stored = type_attr_stored(w_type, name)?;
@@ -11945,7 +11946,11 @@ pub unsafe fn type_attr_cell_fast_path(
     // A function or staticmethod is a different fold.  This path is the
     // unbound value `get` returns unchanged.
     let value_type = crate::typedef::r#type(unwrapped)?.as_ptr();
-    if lookup_in_type(value_type, "__get__").is_some()
+    if lookup_in_type(
+        value_type,
+        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__get__")),
+    )
+    .is_some()
         || pyre_object::w_type_is_heaptype(value_type)
         || pyre_object::is_exact_type(unwrapped, &pyre_object::function::STATICMETHOD_TYPE)
         || std::ptr::eq((*unwrapped).ob_type, &crate::FUNCTION_TYPE as *const _)
