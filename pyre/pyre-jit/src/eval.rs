@@ -5609,6 +5609,15 @@ unsafe extern "C" fn force_pyframe(frame: *mut pyre_interpreter::PyFrame) {
 // dont_look_inside: JIT-driver global accessor (JIT_DRIVER TLS).
 #[majit_macros::dont_look_inside]
 pub fn driver_pair() -> &'static mut JitDriverPair {
+    // `warmspot.py` builds the jitdriver once at translation time; reaching it
+    // costs nothing afterwards. The driver is published below only after
+    // `init_gc_subsystem` has run on this thread, and none of that bootstrap's
+    // per-thread flags is ever cleared, so a thread that already owns its
+    // driver skips the bootstrap. `can_enter_jit` reaches this on every back
+    // edge.
+    if let Some(pair) = existing_driver_pair() {
+        return pair;
+    }
     init_gc_subsystem();
     JIT_DRIVER.with(|cell| unsafe {
         let slot = &mut *cell.get();
@@ -9276,12 +9285,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         // pyframe root walker; no bytecode handler holds a Rust-stack temporary
         // here. A no-op unless the flag is on and enough interpreter objects
         // have accumulated to warrant a collection.
-        if dispatch_breaker
-            & (majit_ir::eval_breaker_word::EB_GC_INTERP | majit_ir::eval_breaker_word::EB_GC)
-            != 0
-        {
-            pyre_object::gc_interp::safepoint();
-        }
+        pyre_object::gc_interp::dispatch_safepoint(dispatch_breaker);
 
         // Stop-the-world safepoint: a compiled loop's back-edge poll deopts
         // here when a collector has requested STW; park until it completes.

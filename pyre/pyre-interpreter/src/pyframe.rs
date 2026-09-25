@@ -4604,10 +4604,14 @@ impl PyFrame {
     /// site.
     #[inline]
     pub fn pop(&mut self) -> PyObjectRef {
-        if self.valuestackdepth <= self.stack_base() {
+        // `pyframe.py popvalue_maybe_none`: `assert_stack_index` checks
+        // against `_stack_start()` only untranslated, and `assert depth >= 0`
+        // is the one check the translated interpreter keeps.
+        if self.valuestackdepth == 0 {
             report_stack_underflow(self);
         }
         let depth = self.valuestackdepth - 1;
+        self.assert_stack_index(depth);
         let value = locals_w!(self)[depth];
         self.set_locals_w(depth, PY_NULL);
         self.valuestackdepth = depth;
@@ -4630,8 +4634,14 @@ impl PyFrame {
     #[inline]
     #[allow(dead_code)]
     pub fn peek_at(&self, depth: usize) -> PyObjectRef {
+        // `pyframe.py peekvalue_maybe_none`: the same two checks as
+        // [`Self::pop`].
+        if self.valuestackdepth <= depth {
+            report_stack_underflow(self);
+        }
         // Hoisted for the reason given on [`Self::peek`].
         let index = self.valuestackdepth - 1 - depth;
+        self.assert_stack_index(index);
         locals_w!(self)[index]
     }
 

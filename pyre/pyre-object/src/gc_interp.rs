@@ -172,6 +172,7 @@ static POLL_TICKER: AtomicI32 = AtomicI32::new(POLL_INTERVAL as i32);
 /// the [`at_outermost_activation`] sibling). The `-> bool` return fits a
 /// single word and it cannot raise.
 #[majit_macros::dont_look_inside]
+#[inline]
 pub fn poll_due() -> bool {
     let ticker = POLL_TICKER.load(Ordering::Relaxed) - 1;
     if ticker < 0 {
@@ -366,6 +367,40 @@ pub fn safepoint() {
     if !enabled() || !collect_enabled() || !poll_due() {
         return;
     }
+    collect_if_threshold_reached();
+}
+
+/// `executioncontext.py bytecode_trace` for the dispatch loops: decrement the
+/// action ticker inline and leave the dispatch only for the slow path —
+/// `actionflag.decrement_ticker(decr_by) < 0` → `action_dispatcher`.
+///
+/// `breaker` is the dispatch's own read of the eval-breaker word. An armed
+/// request (`EB_GC`) goes to [`safepoint`] at once, as before: it carries the
+/// allocator's threshold answer, and an explicit request always travels with
+/// it ([`request_oldgen_collection`], [`note_eval_activation_exit`]).
+/// Otherwise `EB_GC_INTERP` is the process-stable "poll armed" switch, and
+/// only the dispatch that crosses the ticker pays a call.
+#[inline]
+pub fn dispatch_safepoint(breaker: usize) {
+    if breaker & majit_ir::eval_breaker_word::EB_GC != 0 {
+        safepoint();
+    } else if breaker & majit_ir::eval_breaker_word::EB_GC_INTERP != 0 && poll_due() {
+        poll_safepoint();
+    }
+}
+
+/// The `action_dispatcher` half of [`dispatch_safepoint`]: the ticker has
+/// already crossed zero, so ask the collector without decrementing it again.
+#[majit_macros::dont_look_inside]
+#[cold]
+pub fn poll_safepoint() {
+    if !enabled() || !collect_enabled() {
+        return;
+    }
+    collect_if_threshold_reached();
+}
+
+fn collect_if_threshold_reached() {
     if crate::gc_hook::try_gc_isenabled()
         && at_outermost_activation()
         && crate::gc_hook::try_gc_major_threshold_reached()

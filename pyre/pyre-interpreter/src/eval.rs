@@ -11,7 +11,7 @@ use crate::{
     IterOpcodeHandler, LocalOpcodeHandler, NamespaceOpcodeHandler, OpcodeStepExecutor, PyError,
     PyErrorKind, PyResult, SharedOpcodeHandler, StackOpcodeHandler, StepResult, TruthOpcodeHandler,
     build_list_from_refs, build_map_from_refs, build_tuple_from_refs, decode_instruction_forward,
-    ensure_range_iter, execute_opcode_step, stack_underflow_error, unpack_sequence_exact,
+    ensure_range_iter, execute_opcode_step, unpack_sequence_exact,
 };
 use crate::{locals_w, locals_w_mut};
 use pyre_object::*;
@@ -2597,12 +2597,7 @@ fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext) -> PyResul
         // the flag is on and enough interpreter objects have accumulated.
         // Without it, a JIT-off run reclaims interpreter-routed old-gen
         // allocations only at explicit `gc.collect`, so RSS grows unbounded.
-        if dispatch_breaker
-            & (majit_ir::eval_breaker_word::EB_GC_INTERP | majit_ir::eval_breaker_word::EB_GC)
-            != 0
-        {
-            pyre_object::gc_interp::safepoint();
-        }
+        pyre_object::gc_interp::dispatch_safepoint(dispatch_breaker);
         // Free-threaded stop-the-world rendezvous.  Worker threads deliberately
         // execute this plain evaluator (their JitDriver state is thread-owned),
         // so they must poll the same process breaker as compiled/JIT-warm
@@ -2770,24 +2765,10 @@ impl SharedOpcodeHandler for PyFrame {
     }
 
     fn pop_value(&mut self) -> Result<Self::Value, PyError> {
-        if self.valuestackdepth <= self.stack_base() {
-            return Err(stack_underflow_error("interpreter opcode"));
-        }
         Ok(self.pop())
     }
 
     fn peek_at(&mut self, depth: usize) -> Result<Self::Value, PyError> {
-        // The operand stack starts at `stack_base()` (`co_nlocals` + cell +
-        // free slots), matching `_stack_start()`; guarding against `nlocals()`
-        // alone would let an underflow slip into the cell/free region.
-        // `valuestackdepth` is a `usize` field (seeded unsigned) whereas
-        // `stack_base() + depth` seeds signed; cast both to `i64` (lowered as
-        // `intmask`, identity on non-negative counts) so the guard compares
-        // within one signedness instead of tripping the rtyper's
-        // signed-vs-unsigned refusal.
-        if (self.valuestackdepth as i64) <= (self.stack_base() + depth) as i64 {
-            return Err(stack_underflow_error("interpreter peek"));
-        }
         Ok(PyFrame::peek_at(self, depth))
     }
 
