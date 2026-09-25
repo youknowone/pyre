@@ -2764,36 +2764,15 @@ pub fn blackhole_resume_via_rd_numb<'df>(
         BH_BUILDER_RD.with(|cell| unsafe { (&mut *cell.get()).release_interp(bh) });
     };
 
-    // resume.py:1339 jitcodes[jitcode_pos]: resolve jitcode_index + pc
-    // through the store the frame numbered against.
+    // `resume.py` `blackhole_from_resumedata` indexes `jitcodes[jitcode_pos]`,
+    // the list `blackhole.py` `resume_in_blackhole` passes
+    // (`MetaInterpStaticData.jitcodes` from `CodeWriter.make_jitcodes`).
+    // `novable` only means this stream has no vable section.
     let resolve_jitcode = |jitcode_index: i32, pc: i32| -> Option<resume::ResolvedJitCode> {
         if pc < 0 {
             return None;
         }
         let op_live = pyre_jit_trace::state::blackhole_control_opcodes().0 as u8;
-        // A novable jitdriver (jd1 `unpackiterable_driver`) numbers its drain
-        // frames' `jitcode_index` in the build-time `jitcode_runtime` table
-        // (the extracted `_unpackiterable_unknown_length` body plus its inlined
-        // build-time callees), NOT the runtime `MetaInterpStaticData.jitcodes`
-        // store.  The runtime store is a different index space keyed by Python
-        // CodeObject, so its low indices hold unrelated jd0 PyCode jitcodes
-        // whose liveness at the same pc mistypes the drain's 2 refs as ints
-        // (`Const::getint on Ref`).  Resolve against the same table the frame
-        // numbered against — mirroring the driver's own bridge resume
-        // (`run_compiled_detailed_with_bridge_keyed`, jitdriver.rs), which
-        // resolves through the flat build-time `jitcode_registry`.
-        if novable {
-            let canonical =
-                pyre_jit_trace::jitcode_runtime::get_jitcode_by_index(jitcode_index as usize)?;
-            if !canonical.can_decode_live_vars(pc as usize, op_live) {
-                return None;
-            }
-            let core = majit_metainterp::JitCode::from_canonical((*canonical).clone());
-            return Some(resume::ResolvedJitCode::new(
-                std::sync::Arc::new(core),
-                pc as usize,
-            ));
-        }
         let pyjitcode = pyre_jit_trace::state::pyjitcode_for_jitcode_index(jitcode_index)?;
         if pyjitcode.has_abort_opcode() {
             return None;
