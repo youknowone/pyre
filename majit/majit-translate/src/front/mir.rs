@@ -11037,45 +11037,6 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `Borrow::borrow` when the borrowed view is the same
-                // lifted value as the receiver.  A user impl whose body
-                // does real work is not aliased here; `call_target_segments`
-                // sends that call to the impl function so the body is traced.
-                if args.len() == 1
-                    && self.is_borrow_identity_view(&reg, first_arg_ty.as_ref(), &call.dest.ty)
-                {
-                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
-                }
-                // Clause-bound `PartialEq::eq` / `ne` (`Q: Eq` in
-                // `Equivalent::equivalent`) is the comparison itself.
-                // Emit `BinOp` so the pairtype picks `ll_streq` / `int_eq`
-                // from the operand types.  An impl whose body is present
-                // is not this arm; it is traced as that function.
-                if args.len() == 2
-                    && let Some(op) = self.partial_eq_clause_binop(&reg)
-                {
-                    let res = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(res.clone()),
-                        kind: OpKind::BinOp {
-                            op,
-                            lhs: args[0].clone(),
-                            rhs: args[1].clone(),
-                            result_ty: ValueType::Int,
-                        },
-                    });
-                    self.local_var[dest_local] = Some(res);
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
-                }
                 // `w_str_get_wtf8(obj)` is `_utf8`.  The receiver is a
                 // `PyObjectRef`, so aliasing dest to args[0] would paint
                 // dest `SomeInstance(pyobject::PyObject)` and every later
@@ -15849,9 +15810,7 @@ impl<'a> Lowering<'a> {
                 let direct = fn_id
                     .and_then(|id| self.llbc.fn_by_id(id))
                     .and_then(trait_method_owner);
-                if let Some(path) = self.borrow_working_impl_path(reg) {
-                    Ok((path, None))
-                } else if let Some((trait_leaf, method_leaf)) = direct {
+                if let Some((trait_leaf, method_leaf)) = direct {
                     Ok((vec![trait_leaf, method_leaf], None))
                 } else {
                     let label = trait_call_label(v);
@@ -17134,172 +17093,6 @@ impl<'a> Lowering<'a> {
             return false;
         }
         tyref_strips_to_str(dest_ty, self.llbc)
-    }
-
-    /// `Borrow::borrow` is a view of the same lifted value for
-    /// `<T as Borrow<T>>`, `<&T as Borrow<T>>` (the reference peels
-    /// away), `<String as Borrow<str>>`, and `<Vec<T> as Borrow<[T]>>`.
-    ///
-    /// A call that selects a user `impl Borrow` whose body is present
-    /// is not a view: that body is traced as an ordinary call.  A
-    /// clause-bound call (the impl is not selected in this generic
-    /// body) is a view only when this crate extracted no such body, so
-    /// every `Borrow` impl it can reach is one of the views above.
-    fn is_borrow_identity_view(
-        &self,
-        reg: &RegularCall,
-        first_arg_ty: Option<&TyRef>,
-        dest_ty: &TyRef,
-    ) -> bool {
-        if !self.is_borrow_borrow_call(reg) {
-            return false;
-        }
-        if self.borrow_call_selects_working_body(reg) {
-            return false;
-        }
-        if lifted_borrow_values_match(first_arg_ty, dest_ty, self.llbc) {
-            return true;
-        }
-        self.borrow_call_is_unresolved_clause(reg) && !self.llbc_has_working_borrow_impl()
-    }
-
-    /// The call is `core::borrow::Borrow::borrow`, either the trait
-    /// method or a concrete impl of that trait.
-    fn is_borrow_borrow_call(&self, reg: &RegularCall) -> bool {
-        match &reg.kind {
-            CallKind::Trait(v) => {
-                let Some(fn_id) = v.as_array().and_then(|a| a.get(2)).and_then(|id| id.as_u64())
-                else {
-                    return false;
-                };
-                self.llbc.fn_by_id(fn_id).is_some_and(|fd| {
-                    fd.item_meta.name_path() == "core::borrow::Borrow::borrow"
-                })
-            }
-            CallKind::Fun(FunId::Regular { id }) => self
-                .llbc
-                .fn_by_id(*id)
-                .is_some_and(|fd| self.fun_is_borrow_impl(fd)),
-            _ => false,
-        }
-    }
-
-    fn borrow_trait_decl_id(&self) -> Option<u64> {
-        self.llbc.iter_trait_decls().find_map(|td| {
-            (td.item_meta.name_path() == "core::borrow::Borrow").then_some(td.def_id)
-        })
-    }
-
-    fn fun_is_borrow_impl(&self, fd: &FunDecl) -> bool {
-        if fd.item_meta.name_path().rsplit("::").next() != Some("borrow") {
-            return false;
-        }
-        let Some(impl_id) = fd.item_meta.trait_impl_id() else {
-            return false;
-        };
-        let Some(borrow_id) = self.borrow_trait_decl_id() else {
-            return false;
-        };
-        self.llbc
-            .trait_impl_by_id(impl_id)
-            .and_then(|ti| ti.get("impl_trait"))
-            .and_then(|t| t.get("id"))
-            .and_then(serde_json::Value::as_u64)
-            == Some(borrow_id)
-    }
-
-    /// The impl function has a body in this LLBC, so the call must run
-    /// that body instead of aliasing the receiver.
-    fn fun_borrow_body_is_present(fd: &FunDecl) -> bool {
-        fd.body
-            .as_ref()
-            .is_some_and(|raw| raw.get().trim_start().starts_with('{'))
-    }
-
-    fn borrow_call_selects_working_body(&self, reg: &RegularCall) -> bool {
-        match &reg.kind {
-            CallKind::Fun(FunId::Regular { id }) => self
-                .llbc
-                .fn_by_id(*id)
-                .is_some_and(Self::fun_borrow_body_is_present),
-            CallKind::Trait(v) => self
-                .borrow_trait_ref(v)
-                .and_then(|tref| traitref_impl_id(tref, self.llbc, 0))
-                .and_then(|impl_id| self.borrow_impl_method_id(impl_id))
-                .and_then(|fn_id| self.llbc.fn_by_id(fn_id))
-                .is_some_and(Self::fun_borrow_body_is_present),
-            _ => false,
-        }
-    }
-
-    /// `core::cmp::PartialEq::{eq,ne}` still bound to a clause, not a
-    /// selected impl.  The comparison is a `BinOp`; a resolved impl
-    /// with a body stays a call of that body.
-    fn partial_eq_clause_binop(&self, reg: &RegularCall) -> Option<String> {
-        let CallKind::Trait(v) = &reg.kind else {
-            return None;
-        };
-        let fn_id = v.as_array()?.get(2)?.as_u64()?;
-        let path = self.llbc.fn_by_id(fn_id)?.item_meta.name_path();
-        let leaf = match path.as_str() {
-            "core::cmp::PartialEq::eq" => "eq",
-            "core::cmp::PartialEq::ne" => "ne",
-            _ => return None,
-        };
-        let tref = v.as_array()?.first()?;
-        if traitref_impl_id(tref, self.llbc, 0).is_some() {
-            return None;
-        }
-        Some(leaf.to_string())
-    }
-
-    fn borrow_call_is_unresolved_clause(&self, reg: &RegularCall) -> bool {
-        let CallKind::Trait(v) = &reg.kind else {
-            return false;
-        };
-        self.borrow_trait_ref(v)
-            .is_some_and(|tref| traitref_impl_id(tref, self.llbc, 0).is_none())
-    }
-
-    fn borrow_trait_ref<'r>(
-        &self,
-        kind: &'r serde_json::Value,
-    ) -> Option<&'r serde_json::Value> {
-        kind.as_array().and_then(|a| a.first())
-    }
-
-    fn borrow_impl_method_id(&self, impl_id: u64) -> Option<u64> {
-        let methods = self.llbc.trait_impl_by_id(impl_id)?.get("methods")?.as_array()?;
-        methods.iter().find_map(|method| {
-            let fn_id = method.get("skip_binder")?.get("id")?.as_u64()?;
-            let fd = self.llbc.fn_by_id(fn_id)?;
-            (fd.item_meta.name_path().rsplit("::").next() == Some("borrow")).then_some(fn_id)
-        })
-    }
-
-    fn llbc_has_working_borrow_impl(&self) -> bool {
-        self.llbc
-            .iter_local_fns()
-            .any(|fd| self.fun_is_borrow_impl(fd) && Self::fun_borrow_body_is_present(fd))
-    }
-
-    /// Path of a `Borrow::borrow` impl whose body is in this LLBC, so
-    /// the call traces that body instead of the bodyless trait method.
-    fn borrow_working_impl_path(&self, reg: &RegularCall) -> Option<Vec<String>> {
-        let CallKind::Trait(v) = &reg.kind else {
-            return None;
-        };
-        let tref = self.borrow_trait_ref(v)?;
-        let impl_id = traitref_impl_id(tref, self.llbc, 0)?;
-        let fn_id = self.borrow_impl_method_id(impl_id)?;
-        let fd = self.llbc.fn_by_id(fn_id)?;
-        if !Self::fun_borrow_body_is_present(fd) {
-            return None;
-        }
-        let (owner, method) = impl_method_owner_for_fundecl(self.llbc, fd)?;
-        Some(
-            crate::parse::CallPath::for_trait_impl_method(&owner, impl_id, &method).segments,
-        )
     }
 
     /// `w_str_get_wtf8(obj)` — `_utf8`.  Dest is the receiver's
@@ -28907,47 +28700,6 @@ fn tyref_strips_to_str(ty: &TyRef, llbc: &Llbc) -> bool {
         .and_then(|id| id.get("Builtin"))
         .and_then(serde_json::Value::as_str)
         == Some("Str")
-}
-
-/// `Borrow::borrow`'s receiver and result are one lifted value.
-///
-/// References peel off, so `<T as Borrow<T>>` and `<&T as Borrow<T>>`
-/// meet.  `String` / `str` / `Wtf8` / `Wtf8Buf` are one string, and
-/// `Vec<T>` / `[T]` are one list.
-fn lifted_borrow_values_match(arg: Option<&TyRef>, dest: &TyRef, llbc: &Llbc) -> bool {
-    let Some(arg) = arg else {
-        return false;
-    };
-    if tyref_is_string_value(arg, llbc) && tyref_is_string_value(dest, llbc) {
-        return true;
-    }
-    if (tyref_is_vec_value(arg, llbc) && tyref_strips_to_slice(dest, llbc))
-        || (tyref_is_vec_value(dest, llbc) && tyref_strips_to_slice(arg, llbc))
-    {
-        return true;
-    }
-    let Some(a) = tyref_node(arg, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
-        return false;
-    };
-    let Some(b) = tyref_node(dest, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
-        return false;
-    };
-    a == b
-}
-
-fn tyref_strips_to_slice(ty: &TyRef, llbc: &Llbc) -> bool {
-    tyref_node(ty, llbc)
-        .and_then(|n| strip_ty_wrappers(n, llbc))
-        .and_then(|n| {
-            n.as_object()?
-                .get("Adt")?
-                .as_object()?
-                .get("id")?
-                .as_object()
-        })
-        .and_then(|id| id.get("Builtin"))
-        .and_then(serde_json::Value::as_str)
-        == Some("Slice")
 }
 
 /// Whether a `TyRef` resolves (behind `Ref` / dedup wrappers) to a
