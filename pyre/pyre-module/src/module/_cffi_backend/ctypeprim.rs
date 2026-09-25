@@ -178,9 +178,7 @@ pub unsafe fn convert_from_object(
                     if ct.has(ctypeobj::CTypeFlags::VALUE_SMALLER_THAN_LONG)
                         && value != misc::signext(value, ct.size)
                     {
-                        return Err(unsafe {
-                            PyError::from_exc_object(overflow(ct, roots.get(ob_slot)))
-                        });
+                        return Err(overflow(ct, roots.get(ob_slot)));
                     }
                     misc::write_raw_signed_data(cdata, value, ct.size)
                 } else {
@@ -196,9 +194,7 @@ pub unsafe fn convert_from_object(
                     let _ = roots.pin_root(w_ob);
                     let value = misc::as_unsigned_long(roots.get(ob_slot), true)?;
                     if ct.has(ctypeobj::CTypeFlags::VALUE_FITS_LONG) && value > vrange_max(ct) {
-                        return Err(unsafe {
-                            PyError::from_exc_object(overflow(ct, roots.get(ob_slot)))
-                        });
+                        return Err(overflow(ct, roots.get(ob_slot)));
                     }
                     misc::write_raw_unsigned_data(cdata, value, ct.size)
                 } else {
@@ -761,19 +757,35 @@ unsafe fn convert_from_object_complex(
     }
 }
 
-/// `W_CTypePrimitive._overflow` — `oefmt("integer %s does not fit '%s'")`.
+/// `W_CTypePrimitive._overflow` — `space.str(w_ob)`, then the `oefmt`.
+///
+/// What `space.str` raises propagates unchanged.
+pub(crate) fn overflow(ct: &W_CType, w_ob: PyObjectRef) -> PyError {
+    match pyre_interpreter::builtins::builtin_str(&[w_ob]) {
+        Ok(w_s) => unsafe { PyError::from_exc_object(overflow_does_not_fit(ct, w_s)) },
+        Err(e) => e,
+    }
+}
+
+/// `W_CTypePrimitive._overflow` — `space.text_w(w_s)` and
+/// `oefmt(space.w_OverflowError, "integer %s does not fit '%s'")`.
+///
+/// `W_UnicodeObject.text_w` hands back `_utf8`, lone surrogates included,
+/// so the text is read as WTF-8.  `error::oefmt` renders the message
+/// eagerly, so the rendering stays behind `dont_look_inside`, shaped as
+/// `float_w_must_be_real`.
 #[majit_macros::dont_look_inside]
-pub(crate) fn overflow(ct: &W_CType, w_ob: PyObjectRef) -> PyObjectRef {
-    let rendered = pyre_interpreter::builtins::builtin_str(&[w_ob])
-        .map(|w| {
-            pyre_interpreter::baseobjspace::str_utf8_w(w)
-                .ok()
-                .map(str::to_string)
-                .unwrap_or_default()
-        })
-        .unwrap_or_default();
-    PyError::overflow_error(format!("integer {rendered} does not fit '{}'", ct.name()))
-        .to_exc_object()
+fn overflow_does_not_fit(ct: &W_CType, w_s: PyObjectRef) -> PyObjectRef {
+    let mut e = match pyre_interpreter::baseobjspace::text_wtf8_w(w_s) {
+        Ok(s) => {
+            let mut msg = rustpython_wtf8::Wtf8Buf::from("integer ");
+            msg.push_wtf8(s);
+            msg.push_str(&format!(" does not fit '{}'", ct.name()));
+            PyError::overflow_error(msg)
+        }
+        Err(e) => e,
+    };
+    e.to_exc_object()
 }
 
 /// `W_CTypePrimitive._overflow` for a machine-int that missed the range.
