@@ -646,7 +646,7 @@ jobs:
       shell: bash
       # Separate compilation failures from test failures in the job log. The
       # following test command reuses these artifacts.
-      run: cargo test --all --no-run --no-default-features --features dynasm,cpyext
+      run: cargo test --all --no-run --no-default-features --features dynasm,cpyext,pyre-module
 
     - name: Run cargo tests (dynasm)
       shell: bash
@@ -659,11 +659,13 @@ jobs:
       # relinking ~15 extra test binaries (the majit-translate harness alone
       # links >2900 tests). The backend-independent cpyext tests also run here
       # once, rather than changing the feature set of the cranelift pass.
+      # `pyre-module` keeps the launcher tests that import the stdlib test
+      # support package, which needs the product modules.
       #
       # `majit-backend-wasm --lib` is excluded from `--all` and run
       # serially below on Linux/Windows. See the in-script comment.
       run: |
-        cargo test --all --no-default-features --features dynasm,cpyext \
+        cargo test --all --no-default-features --features dynasm,cpyext,pyre-module \
           --exclude majit-backend-wasm
         # The lib suite shares process-global fail-descr / CALL_ASSEMBLER /
         # extra-root walkers and per-thread MiniMark boxes. On macOS that
@@ -714,7 +716,7 @@ jobs:
       # placeholder path. Measured locally, 139s and 281s for those two
       # forms against 3s for this one, with 0 crates compiled.
       run: |
-        cargo test --all --no-default-features --features dynasm,cpyext \
+        cargo test --all --no-default-features --features dynasm,cpyext,pyre-module \
           --test llbc_fingerprint_format_test -- --ignored
 
     - name: Build test binaries (cranelift)
