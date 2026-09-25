@@ -577,6 +577,13 @@ pub struct JitCodeExecState {
     /// bytecode — RPython `blackhole.py:107-156` argcode-based decode
     /// parity, no payload-byte collision risk.
     pub jit_merge_point_offset: Option<usize>,
+    /// The body addresses portal identity slots through
+    /// `load_state_field` / `store_state_field` (and the array forms).
+    /// Set by `JitCodeBuilder` when it emits one of those ops. An
+    /// ordinary inline JitCode leaves this false: the same register
+    /// indices are working registers, and seeding them would overwrite
+    /// a live value.
+    pub reads_identity_slots: bool,
 }
 
 // Wrapper `JitCode` — runtime jitcode = canonical core + descr pool.
@@ -708,6 +715,16 @@ impl JitCode {
 
     pub fn uses_global_descr_pool(&self) -> bool {
         self.uses_global_descr_pool
+    }
+
+    /// Whether this body's register file reserves portal identity slots.
+    ///
+    /// True only when the lowering emitted `load_state_field` /
+    /// `store_state_field` (or the ref, float, or array form). Those ops
+    /// address `int_identity_slots_base + field`. A translated helper
+    /// JitCode never emits them.
+    pub fn reads_identity_slots(&self) -> bool {
+        self.exec.reads_identity_slots
     }
 
     /// Borrow the canonical core (e.g. for serialization that
