@@ -289,4 +289,19 @@ ParkedObj.method = live
 parked_obj, _ = m.type_dict(ParkedObj)
 eq('an absorbed object store is the object', parked_obj['method'] is live, True)
 
+
+# The same, with a payload outside the prebuilt small-int range: unwrapping that
+# cell boxes, so the de-cell that runs while the mirror is being stamped can
+# collect, and the namespace block moves when it does.
+class ParkedBig:
+    marker = 10**18
+
+
+ParkedBig.marker = 10**18 + 1
+ParkedBig.marker = 10**18 + 2
+parked_big, _ = m.type_dict(ParkedBig)
+eq('a boxed absorbed store is a value', parked_big['marker'], 10**18 + 2)
+eq('and C reads the same block', m.set_default(parked_big, 'marker', -1)[1], 10**18 + 2)
+eq('the type still answers', ParkedBig.marker, 10**18 + 2)
+
 print('cpyext-small-ok')

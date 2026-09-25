@@ -2078,7 +2078,7 @@ pub(crate) fn seed_virtualizable_boxes(
     ctx.set_virtualizable_heap_ptr(heap_ptr);
 }
 
-/// Decode a raw `vinfo.read_all_boxes` entry into the typed Value a
+/// Decode a raw `vinfo.read_boxes` entry into the typed Value a
 /// virtualizable shadow slot expects.  Local helper that mirrors
 /// `majit-metainterp::pyjitpl::heap_value_for` so both seed sites (root
 /// portal in `initialize_virtualizable` and bridge entry here) use the
@@ -7373,14 +7373,16 @@ impl PyreSym {
             let vable_ref = OpRef::input_arg_ref(crate::virtualizable_gen::SYM_FRAME_IDX);
             let array_lengths = [array_len];
             let (input_values, vable_ref_value) = if concrete_frame != 0 {
-                let (static_boxes, array_boxes) =
-                    unsafe { info.read_all_boxes(concrete_frame as *const u8, &array_lengths) };
+                let boxes = unsafe { info.read_boxes(concrete_frame as *const u8, &array_lengths) };
+                let (static_boxes, mut items_left) = boxes.split_at(info.static_fields.len());
                 let mut values = Vec::with_capacity(num_vable_scalars + array_len);
-                for (i, bits) in static_boxes.iter().enumerate() {
-                    values.push(value_for_slot(info.static_fields[i].field_type, *bits));
+                for (field, bits) in info.static_fields.iter().zip(static_boxes) {
+                    values.push(value_for_slot(field.field_type, *bits));
                 }
-                for (a, items) in array_boxes.iter().enumerate() {
-                    let item_ty = info.array_fields[a].item_type;
+                for (array, &length) in info.array_fields.iter().zip(&array_lengths) {
+                    let (items, rest) = items_left.split_at(length);
+                    items_left = rest;
+                    let item_ty = array.item_type;
                     for (item_idx, bits) in items.iter().enumerate() {
                         // Seed a tagged-immediate local as the heap `W_IntObject`
                         // it stands for, so the recorded body reads it through the
@@ -7414,7 +7416,7 @@ impl PyreSym {
                 // LIVE interpreter frame (the frame the compiled loop runs on),
                 // not the discarded `snapshot_for_tracing` copy.  At root entry
                 // the snapshot is a fresh copy so its field VALUES equal the
-                // live frame's (read_all_boxes above); only the identity ADDRESS
+                // live frame's (read_boxes above); only the identity ADDRESS
                 // must be the live one, matching the SYM_FRAME_IDX input arg's
                 // runtime value (the live frame supplied by extract_live_values).
                 // Falls back to the snapshot address when no live frame was
@@ -8092,25 +8094,27 @@ impl PyreJitState {
         }
     }
 
-    fn import_virtualizable_state(
-        &mut self,
-        static_boxes: &[i64],
-        array_boxes: &[Vec<i64>],
-    ) -> bool {
+    fn import_virtualizable_state(&mut self, boxes: &[i64], array_lengths: &[usize]) -> bool {
         // virtualizable.py write_from_resume_data_partial parity:
         // write ALL static fields to heap via VirtualizableInfo.
         let info = crate::frame_layout::build_pyframe_virtualizable_info();
+        let Some((static_boxes, items)) = boxes.split_at_checked(info.static_fields.len()) else {
+            return false;
+        };
         if !self.virt_import_static_boxes(&info, static_boxes) {
             return false;
         }
 
         // virtualizable.py:134-137: write array items to heap.
         // Validate array structure matches VirtualizableInfo.
-        if array_boxes.len() != info.array_fields.len() {
+        if array_lengths.len() != info.array_fields.len() {
             return false;
         }
-        let Some(unified) = array_boxes.first() else {
+        let Some(&unified_len) = array_lengths.first() else {
             return info.array_fields.is_empty();
+        };
+        let Some(unified) = items.get(..unified_len) else {
+            return false;
         };
         let Some(frame_arr) = self.locals_cells_stack_array_mut() else {
             return false;
@@ -8124,7 +8128,7 @@ impl PyreJitState {
         true
     }
 
-    fn export_virtualizable_state(&self) -> (Vec<i64>, Vec<Vec<i64>>) {
+    fn export_virtualizable_state(&self) -> (Vec<i64>, Vec<usize>) {
         let info = crate::frame_layout::build_pyframe_virtualizable_info();
         self.virt_export_all(&info)
     }
@@ -11445,7 +11449,7 @@ impl JitState for PyreJitState {
         // CURRENT_FRAME chain, so `walk_pyframe_roots` forwards its
         // `locals_cells_stack_w` items on every collection — its slots are
         // always live. Read them directly, mirroring the root-trace seed
-        // (`read_all_boxes` from the rooted portal frame). Falls back to the
+        // (`read_boxes` from the rooted portal frame). Falls back to the
         // decoded values only when no live pointer is bound (unit-test /
         // init-before-run). The seed helper pads short arrays with const-NULL
         // OpRef; match that here by padding concrete values with
@@ -12162,10 +12166,10 @@ impl JitState for PyreJitState {
         _meta: &Self::Meta,
         _virtualizable: &str,
         _info: &VirtualizableInfo,
-        static_boxes: &[i64],
-        array_boxes: &[Vec<i64>],
+        boxes: &[i64],
+        array_lengths: &[usize],
     ) -> bool {
-        self.import_virtualizable_state(static_boxes, array_boxes)
+        self.import_virtualizable_state(boxes, array_lengths)
     }
 
     fn export_virtualizable_boxes(
@@ -12173,7 +12177,7 @@ impl JitState for PyreJitState {
         _meta: &Self::Meta,
         _virtualizable: &str,
         _info: &VirtualizableInfo,
-    ) -> Option<(Vec<i64>, Vec<Vec<i64>>)> {
+    ) -> Option<(Vec<i64>, Vec<usize>)> {
         Some(self.export_virtualizable_state())
     }
 

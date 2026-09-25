@@ -757,9 +757,8 @@ pub trait JitState: Sized {
             };
             lengths
         };
-        let (static_boxes, array_boxes) =
-            unsafe { info.read_all_boxes(obj_ptr.cast_const(), &lengths) };
-        self.import_virtualizable_boxes(meta, virtualizable, info, &static_boxes, &array_boxes)
+        let boxes = unsafe { info.read_boxes(obj_ptr.cast_const(), &lengths) };
+        self.import_virtualizable_boxes(meta, virtualizable, info, &boxes, &lengths)
     }
 
     fn sync_virtualizable_after_jit(
@@ -771,13 +770,13 @@ pub trait JitState: Sized {
         let Some(obj_ptr) = self.virtualizable_heap_ptr(meta, virtualizable, info) else {
             return;
         };
-        let Some((static_boxes, array_boxes)) =
+        let Some((boxes, array_lengths)) =
             self.export_virtualizable_boxes(meta, virtualizable, info)
         else {
             return;
         };
         unsafe {
-            info.write_all_boxes(obj_ptr, &static_boxes, &array_boxes);
+            info.write_boxes_with_lengths(obj_ptr, &boxes, &array_lengths);
             info.reset_vable_token(obj_ptr);
         }
     }
@@ -841,23 +840,29 @@ pub trait JitState: Sized {
         None
     }
 
+    /// Take the virtualizable's fields as [`VirtualizableInfo::read_boxes`]
+    /// lists them — every static, then every array item — with the length of
+    /// each array.
     fn import_virtualizable_boxes(
         &mut self,
         _meta: &Self::Meta,
         _virtualizable: &str,
         _info: &VirtualizableInfo,
-        _static_boxes: &[i64],
-        _array_boxes: &[Vec<i64>],
+        _boxes: &[i64],
+        _array_lengths: &[usize],
     ) -> bool {
         true
     }
 
+    /// The virtualizable's fields in [`VirtualizableInfo::read_boxes`] order,
+    /// with the length of each array: the pair
+    /// [`VirtualizableInfo::write_boxes_with_lengths`] takes.
     fn export_virtualizable_boxes(
         &self,
         _meta: &Self::Meta,
         _virtualizable: &str,
         _info: &VirtualizableInfo,
-    ) -> Option<(Vec<i64>, Vec<Vec<i64>>)> {
+    ) -> Option<(Vec<i64>, Vec<usize>)> {
         None
     }
 
@@ -872,13 +877,11 @@ pub trait JitState: Sized {
     /// read is fixed by the artifact's inputarg shape and so need not be
     /// reallocated each time.
     ///
-    /// `statics` arrives cleared with whatever capacity previous entries left
-    /// it. `arrays` arrives with each inner `Vec` cleared but the outer length
-    /// left as it was, so an implementation that resizes the outer to the
-    /// field count and extends each inner in place reuses both levels of
-    /// storage. Returns whether the export succeeded, matching the `Option` of
-    /// the owning form; on `false` the buffers' contents are unspecified and
-    /// the caller discards them.
+    /// `boxes` and `array_lengths` arrive cleared with whatever capacity
+    /// previous entries left them, so an implementation that extends them in
+    /// place reuses that storage. Returns whether the export succeeded,
+    /// matching the `Option` of the owning form; on `false` the buffers'
+    /// contents are unspecified and the caller discards them.
     ///
     /// The default defers to [`Self::export_virtualizable_boxes`] so existing
     /// implementations keep working unchanged.
@@ -887,14 +890,14 @@ pub trait JitState: Sized {
         meta: &Self::Meta,
         virtualizable: &str,
         info: &VirtualizableInfo,
-        statics: &mut Vec<i64>,
-        arrays: &mut Vec<Vec<i64>>,
+        boxes: &mut Vec<i64>,
+        array_lengths: &mut Vec<usize>,
     ) -> bool {
-        let Some((s, a)) = self.export_virtualizable_boxes(meta, virtualizable, info) else {
+        let Some((b, l)) = self.export_virtualizable_boxes(meta, virtualizable, info) else {
             return false;
         };
-        *statics = s;
-        *arrays = a;
+        *boxes = b;
+        *array_lengths = l;
         true
     }
 

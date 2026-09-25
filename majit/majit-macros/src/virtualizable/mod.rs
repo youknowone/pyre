@@ -680,7 +680,7 @@ fn generate_standalone_hooks(
             state: &#state_type,
             _virtualizable: &str,
             info: &majit_metainterp::virtualizable::VirtualizableInfo,
-        ) -> Option<(Vec<i64>, Vec<Vec<i64>>)> {
+        ) -> Option<(Vec<i64>, Vec<usize>)> {
             if _virtualizable != #vable_name {
                 return None;
             }
@@ -690,7 +690,8 @@ fn generate_standalone_hooks(
             } else {
                 virt_array_lengths(state, _virtualizable, info)?
             };
-            Some(unsafe { info.read_all_boxes(obj_ptr, &lengths) })
+            let boxes = unsafe { info.read_boxes(obj_ptr, &lengths) };
+            Some((boxes, lengths))
         }
 
     }

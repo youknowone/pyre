@@ -5144,16 +5144,29 @@ fn slot_descr_delete(
 /// is: [`ready`] makes it immortal, and the namespace outlives the type no
 /// more than the type outlives itself.
 fn stamp_tp_dict(tp: *mut CPyTypeObject, w_type: PyObjectRef) {
-    let w_dict = unsafe { pyre_object::w_type_get_dict_ptr(w_type) } as PyObjectRef;
-    if w_dict.is_null() {
-        return;
-    }
     // The block goes out as it stands, and a C reader has no `unwrap_cell` in
     // front of it, so a cell an earlier rebind parked would read as the
     // attribute.  `type_setdictvalue_wtf8` keeps a mirrored type's namespace
     // raw from here on; this is the same boundary for the stores that happened
     // before the mirror existed.
-    unsafe { crate::objspace::std::classdict::uncell_type_namespace(w_type) };
+    //
+    // De-celling boxes an `IntMutableCell` payload, so it can collect, and the
+    // comment above says what that means here: the mirror stays put, the dict it
+    // links to moves.  Root the type over the call and read both the type and
+    // the block back from the shadow stack afterwards.
+    let roots = pyre_object::gc_roots::push_roots();
+    let type_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_type);
+    unsafe {
+        crate::objspace::std::classdict::uncell_type_namespace(
+            pyre_object::gc_roots::shadow_stack_get(type_slot),
+        )
+    };
+    let w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
+    let w_dict = unsafe { pyre_object::w_type_get_dict_ptr(w_type) } as PyObjectRef;
+    if w_dict.is_null() {
+        return;
+    }
     unsafe { (*tp).tp_dict = pyobject::make_ref(w_dict) };
 }
 

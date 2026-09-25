@@ -713,7 +713,7 @@ pub fn expand_state(input: DeriveInput) -> TokenStream {
             /// The STATIC half of `virtualizable.py read_boxes`.  Upstream's
             /// `read_boxes` reads statics and then every array item;
             /// `read_static_boxes` is the first half only, and
-            /// `VirtualizableInfo::read_all_boxes` is what answers for the whole.
+            /// `VirtualizableInfo::read_boxes` is what answers for the whole.
             /// Reads ALL static fields from the heap via VirtualizableInfo.
             pub fn virt_export_static_boxes(
                 &self,
@@ -748,12 +748,13 @@ pub fn expand_state(input: DeriveInput) -> TokenStream {
                 true
             }
 
-            /// virtualizable.py read_boxes + array parity.
-            /// Reads ALL static + array fields from heap via VirtualizableInfo.
+            /// virtualizable.py read_boxes: every static field, then every
+            /// array item, from the heap via VirtualizableInfo, with the length
+            /// of each array.
             pub fn virt_export_all(
                 &self,
                 info: &majit_metainterp::virtualizable::VirtualizableInfo,
-            ) -> (Vec<i64>, Vec<Vec<i64>>) {
+            ) -> (Vec<i64>, Vec<usize>) {
                 let heap_ptr = self.#frame_ident as *const u8;
                 if heap_ptr.is_null() {
                     return (vec![0i64; info.num_fields()], vec![]);
@@ -763,7 +764,8 @@ pub fn expand_state(input: DeriveInput) -> TokenStream {
                 } else {
                     vec![]
                 };
-                unsafe { info.read_all_boxes(heap_ptr, &lengths) }
+                let boxes = unsafe { info.read_boxes(heap_ptr, &lengths) };
+                (boxes, lengths)
             }
         }
     }

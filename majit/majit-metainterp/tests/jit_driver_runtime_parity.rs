@@ -657,12 +657,13 @@ impl JitState for AutoVirtualizableState {
         _meta: &Self::Meta,
         virtualizable: &str,
         _info: &VirtualizableInfo,
-        static_boxes: &[i64],
-        array_boxes: &[Vec<i64>],
+        boxes: &[i64],
+        array_lengths: &[usize],
     ) -> bool {
         assert_eq!(virtualizable, "frame");
-        self.stackpos = static_boxes[0];
-        self.top = array_boxes[0][0];
+        assert_eq!(array_lengths, &[1]);
+        self.stackpos = boxes[0];
+        self.top = boxes[1];
         true
     }
 
@@ -671,9 +672,9 @@ impl JitState for AutoVirtualizableState {
         _meta: &Self::Meta,
         virtualizable: &str,
         _info: &VirtualizableInfo,
-    ) -> Option<(Vec<i64>, Vec<Vec<i64>>)> {
+    ) -> Option<(Vec<i64>, Vec<usize>)> {
         assert_eq!(virtualizable, "frame");
-        Some((vec![self.stackpos], vec![vec![self.top]]))
+        Some((vec![self.stackpos, self.top], vec![1]))
     }
 
     fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef> {

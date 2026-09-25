@@ -16898,7 +16898,7 @@ fn mirroring_a_static_vable_field_flushes_it_to_the_live_frame() {
     let info = crate::frame_layout::build_pyframe_virtualizable_info();
     let slot_count = info.num_static_extra_boxes;
 
-    // A frame-shaped block for the flush to land in.  `write_all_boxes` walks
+    // A frame-shaped block for the flush to land in.  `write_virtualizable_back` walks
     // every static field and the array pointer, so the buffer has to span the
     // whole struct and the array block needs its `[len][items]` header.
     let mut frame = Box::new(std::mem::MaybeUninit::<pyre_interpreter::PyFrame>::zeroed());

@@ -2991,8 +2991,8 @@ impl TraceCtx {
         // for PyFrame) to release the immutable borrow before reborrowing
         // `virtualizable_values` mutably.  The decode loop below reads
         // statics + array items field-by-field straight into the shadow,
-        // avoiding the `Vec<i64>` + `Vec<Vec<i64>>` allocations that
-        // `read_all_boxes` would materialise on every hot-path call.
+        // avoiding the `Vec<i64>` allocation that `read_boxes` would
+        // materialise on every hot-path call.
         let array_lengths = lengths.clone();
         let static_count = info.num_static_extra_boxes;
         let info = info.clone();
@@ -3899,12 +3899,11 @@ impl TraceCtx {
             .virtualizable_array_lengths()
             .map(|lengths| lengths.to_vec())
             .unwrap_or_default();
-        let (static_boxes, array_boxes) = unsafe { info.read_all_boxes(vable_ptr, &array_lengths) };
-        let cap = static_boxes.len() + array_boxes.iter().map(Vec::len).sum::<usize>() + 1;
-        let mut boxes = Vec::with_capacity(cap);
-        let mut values = Vec::with_capacity(cap);
-        for (index, value) in static_boxes.into_iter().enumerate() {
-            let (opref, concrete) = match info.static_fields[index].field_type {
+        let raw = unsafe { info.read_boxes(vable_ptr, &array_lengths) };
+        let mut boxes = Vec::with_capacity(raw.len() + 1);
+        let mut values = Vec::with_capacity(raw.len() + 1);
+        for (value, ty) in raw.into_iter().zip(info.box_types(&array_lengths)) {
+            let (opref, concrete) = match ty {
                 majit_ir::Type::Int => (self.const_int(value), Value::Int(value)),
                 majit_ir::Type::Ref => (
                     self.const_ref(value),
@@ -3918,25 +3917,6 @@ impl TraceCtx {
             };
             boxes.push(opref);
             values.push(concrete);
-        }
-        for (array_index, items) in array_boxes.into_iter().enumerate() {
-            let item_type = info.array_fields[array_index].item_type;
-            for value in items {
-                let (opref, concrete) = match item_type {
-                    majit_ir::Type::Int => (self.const_int(value), Value::Int(value)),
-                    majit_ir::Type::Ref => (
-                        self.const_ref(value),
-                        Value::Ref(majit_ir::GcRef(value as usize)),
-                    ),
-                    majit_ir::Type::Float => (
-                        self.const_float(value),
-                        Value::Float(f64::from_bits(value as u64)),
-                    ),
-                    majit_ir::Type::Void => continue,
-                };
-                boxes.push(opref);
-                values.push(concrete);
-            }
         }
         boxes.push(vable_box);
         // The vable identity's concrete value is the heap pointer itself.
