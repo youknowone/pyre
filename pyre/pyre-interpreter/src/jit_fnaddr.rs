@@ -1927,6 +1927,22 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "gc_roots::RootScope::pin_roots",
         pyre_object::gc_roots::root_scope_pin_roots_jit_abi,
     );
+    // The list lock bracket (`rthread.py` `Lock.acquire` / `release`): the
+    // `ListGuard` is its lock word, which the jitcode's drop of the guard
+    // hands to `w_list_lock_release`.
+    cpa1(
+        &mut entries,
+        "pyre_object::listobject::w_list_lock",
+        "pyre_object::w_list_lock",
+        pyre_object::listobject::w_list_lock_jit_abi,
+    );
+    let w_list_lock_release: unsafe fn(usize) = pyre_object::listobject::w_list_lock_release;
+    upa1(
+        &mut entries,
+        "pyre_object::listobject::w_list_lock_release",
+        "pyre_object::w_list_lock_release",
+        w_list_lock_release,
+    );
     let w_dict_setitem_str_hashed_w: unsafe fn(
         pyre_object::PyObjectRef,
         pyre_object::PyObjectRef,
