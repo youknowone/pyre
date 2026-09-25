@@ -466,6 +466,11 @@ impl RootScope {
     }
 
     /// First slot owned by this root bracket.
+    ///
+    /// Residual like every other `RootScope` method: a jitcode holds the
+    /// guard as its `save_point` word (see `root_scope_base_jit_abi`), so an
+    /// inlined body reading `self.save_point` would dereference that word.
+    #[majit_macros::dont_look_inside_cannot_raise]
     #[inline]
     pub fn base(&self) -> usize {
         self.save_point
