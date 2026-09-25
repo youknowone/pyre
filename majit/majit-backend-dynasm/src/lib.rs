@@ -667,6 +667,21 @@ fn handle_fail_resume_guard(
     let guard_value_operand = majit_backend::guard_value_counter_slot(descr)
         .map(|slot| unsafe { llmodel::get_int_value_direct(frame_ptr, slot) as i64 });
 
+    // The bridge hook allocates. A nursery jitframe is then poison, and
+    // `jf_forward` is no longer a stub `JitFrame::resolve` can follow.
+    // The owner root is updated by the collector; re-read it after every
+    // call that can collect. Pin is declined for a frame that holds GC
+    // pointers, so it does not keep this address stable.
+    let frame_root = (!frame_ptr.is_null() && majit_gc::gc_owns_object(frame_ptr as usize))
+        .then(|| majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(frame_ptr as usize)));
+    let mut frame_ptr = frame_ptr;
+    let current_frame = |root: &Option<majit_gc::shadow_stack::OwnerRootGuard>,
+                         frame_ptr: *mut jitframe::JitFrame| {
+        root.as_ref()
+            .map(|root| root.get().0 as *mut jitframe::JitFrame)
+            .unwrap_or(frame_ptr)
+    };
+
     // pyjitpl.py:2921-2923 parity: recover the owning Arc<JitCellToken>
     // identity from the descr.  When the weakref is dead (memmgr-evicted
     // JCT — "should be rare" per upstream), `compile.giveup()` raises
@@ -681,6 +696,7 @@ fn handle_fail_resume_guard(
     // would mis-route resume storage and trip `compile_bridge`'s
     // `debug_assert_eq!(source_jct.green_key, green_key)` (pyjitpl.rs).
     let owning_jct = majit_backend::descr_owning_jct(descr);
+    frame_ptr = current_frame(&frame_root, frame_ptr);
 
     // `jf_guard_exc` stays where the failure stub wrote it. `grab_exc_value`
     // (`llmodel.py`) only reads the field. The slot is a GCREF visited by
@@ -700,6 +716,7 @@ fn handle_fail_resume_guard(
             guard_value_operand.unwrap_or(0),
             guard_value_operand.is_some(),
         );
+        frame_ptr = current_frame(&frame_root, frame_ptr);
         if let Some(result) = bridged {
             return result;
         }
