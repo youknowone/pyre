@@ -3344,10 +3344,10 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             rewire_result_try_call_sites(&mut lo.graph, &lo.result_try_sites, return_owners)
         };
         // A `?` whose diamond did not match still has `Try::branch`.
-        // `same_as` is exact only when the `Result` and the `ControlFlow`
-        // share a layout. Otherwise the call is the match: read the
-        // discriminant and build `Continue` / `Break`.
-        lower_result_branch_to_control_flow(&mut lo.graph, &lo.branch_same_layout);
+        // Equal `Result` / `ControlFlow` layouts were already emitted as
+        // `same_as`. Anything left is the match: read the discriminant
+        // and build `Continue` / `Break`.
+        lower_result_branch_to_control_flow(&mut lo.graph);
         // The `bool::then` short-circuit rewrite (`front::bool_then`) splits
         // the residual `then` call block into a `Some`/`None` diamond.  It
         // runs on the post-lowering graph (its block A is closed with a
@@ -5009,10 +5009,6 @@ struct Lowering<'a> {
     /// The Option sibling is [`Lowering::option_try_sites`]; exception-carrier
     /// Results stay on [`Lowering::result_exc_call_results`].
     result_try_sites: Vec<ResultTrySite>,
-    /// `Result::branch` results whose `Result<T, E>` and
-    /// `ControlFlow<Result<Infallible, E>, T>` type-decl layouts are both
-    /// known and equal. Anything else is lowered as the discriminant match.
-    branch_same_layout: std::collections::HashSet<Variable>,
     /// Result-var ids of one-word niche `Option` discriminant reads folded to
     /// a pointer null-test (`ne(base, null_mut())`, `build_rvalue`
     /// `Rvalue::Discriminant` niche arm).  Such a discriminant is a `SomeBool`
@@ -5345,7 +5341,6 @@ impl<'a> Lowering<'a> {
             closure_select_sites: Vec::new(),
             disc_combinator_sites: Vec::new(),
             result_try_sites: Vec::new(),
-            branch_same_layout: std::collections::HashSet::new(),
             niche_disc_vars: std::collections::HashSet::new(),
             cast_ptr_to_int_src: std::collections::HashMap::new(),
             root_scope_moved_locals,
@@ -15155,7 +15150,6 @@ impl<'a> Lowering<'a> {
             {
                 self.result_try_sites.push(site);
             }
-            self.note_result_branch_layout(first_arg_ty.as_ref(), &call.dest.ty, &result_var);
         }
         // Capture `bool::then(cond, closure_env)` sites for the
         // short-circuit `Option` diamond `front::bool_then` synthesizes.
@@ -15556,6 +15550,8 @@ impl<'a> Lowering<'a> {
         {
             self.disc_combinator_sites.push(site);
         }
+        let op_kind =
+            self.rewrite_equal_layout_result_branch(op_kind, first_arg_ty.as_ref(), &call.dest.ty);
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result_var.clone()),
             kind: op_kind,
@@ -19590,29 +19586,28 @@ impl<'a> Lowering<'a> {
         })
     }
 
-    /// Record a `Result::branch` whose operand and `ControlFlow` result have
-    /// the same Charon type-decl layout. A missing layout is not a match.
-    fn note_result_branch_layout(
-        &mut self,
+    /// `Result::branch` whose operand and `ControlFlow` result share a
+    /// Charon type-decl layout is already that value: emit `same_as`.
+    /// A missing layout stays a call for the later discriminant match.
+    fn rewrite_equal_layout_result_branch(
+        &self,
+        op_kind: OpKind,
         recv_ty: Option<&TyRef>,
         dest_ty: &TyRef,
-        result_var: &Variable,
-    ) {
+    ) -> OpKind {
         let Some(recv_ty) = recv_ty else {
-            return;
+            return op_kind;
         };
         if !crate::front::result_exc::tyref_is_result(recv_ty, self.llbc) {
-            return;
+            return op_kind;
         }
         let Some(result_layout) = self.layout_of_tyref(recv_ty) else {
-            return;
+            return op_kind;
         };
         let Some(flow_layout) = self.layout_of_tyref(dest_ty) else {
-            return;
+            return op_kind;
         };
-        if type_layouts_equal(&result_layout, &flow_layout) {
-            self.branch_same_layout.insert(result_var.clone());
-        }
+        rewrite_result_branch_for_layouts(op_kind, Some(&result_layout), Some(&flow_layout))
     }
 
     fn layout_of_tyref(&self, ty: &TyRef) -> Option<majit_charon_reader::ullbc::TypeLayout> {
@@ -34940,16 +34935,54 @@ fn type_layouts_equal(
     transparent(a) == transparent(b)
 }
 
-/// `Try::branch` on a `Result` that the diamond rewrites did not consume.
+/// Replace a `Result::branch` call with `same_as` when the two type-decl
+/// layouts are equal. A missing layout, or two layouts that differ, leaves
+/// the call for [`lower_result_branch_to_control_flow`].
+fn rewrite_result_branch_for_layouts(
+    kind: OpKind,
+    recv_layout: Option<&majit_charon_reader::ullbc::TypeLayout>,
+    flow_layout: Option<&majit_charon_reader::ullbc::TypeLayout>,
+) -> OpKind {
+    let (Some(recv_layout), Some(flow_layout)) = (recv_layout, flow_layout) else {
+        return kind;
+    };
+    if !type_layouts_equal(recv_layout, flow_layout) {
+        return kind;
+    }
+    let OpKind::Call {
+        target,
+        args,
+        result_ty,
+    } = &kind
+    else {
+        return kind;
+    };
+    let CallTarget::Method {
+        name,
+        receiver_root,
+        ..
+    } = target
+    else {
+        return kind;
+    };
+    if name != "branch" || !receiver_root.as_deref().unwrap_or("").ends_with("Result") {
+        return kind;
+    }
+    let Some(operand) = args.first().and_then(LinkArg::as_variable).cloned() else {
+        return kind;
+    };
+    OpKind::UnaryOp {
+        op: "same_as".to_string(),
+        operand,
+        result_ty: result_ty.clone(),
+    }
+}
+
+/// `Try::branch` on a `Result` that the diamond rewrites did not consume
+/// and that was not already emitted as `same_as`.
 ///
-/// `same_layout` holds results whose `Result` and `ControlFlow` type-decl
-/// layouts are equal, so the value already is that `ControlFlow`. Every
-/// other call is the match: read the discriminant, build `Continue` or
-/// `Break`.
-fn lower_result_branch_to_control_flow(
-    graph: &mut FunctionGraph,
-    same_layout: &std::collections::HashSet<Variable>,
-) {
+/// Read the discriminant and build `Continue` or `Break`.
+fn lower_result_branch_to_control_flow(graph: &mut FunctionGraph) {
     let mut sites = Vec::new();
     for (bi, block) in graph.blocks.iter().enumerate() {
         for (oi, op) in block.operations.iter().enumerate() {
@@ -34991,23 +35024,15 @@ fn lower_result_branch_to_control_flow(
         }
     }
     for (bi, oi, operand, result, result_ty, result_owner) in sites.into_iter().rev() {
-        if same_layout.contains(&result) {
-            graph.blocks[bi].operations[oi].kind = OpKind::UnaryOp {
-                op: "same_as".to_string(),
-                operand,
-                result_ty,
-            };
-        } else {
-            lower_result_branch_as_match(
-                graph,
-                BlockId(bi),
-                oi,
-                &operand,
-                &result,
-                &result_owner,
-                &result_ty,
-            );
-        }
+        lower_result_branch_as_match(
+            graph,
+            BlockId(bi),
+            oi,
+            &operand,
+            &result,
+            &result_owner,
+            &result_ty,
+        );
     }
 }
 
@@ -35235,6 +35260,9 @@ fn rewire_one_result_try_site(
             args,
             ..
         } if m == "branch" && args.len() == 1 => args[0].clone(),
+        // Equal Result and ControlFlow layouts are emitted as `same_as`
+        // of the Result operand. The diamond still reads that Result.
+        OpKind::UnaryOp { op, operand, .. } if op == "same_as" => LinkArg::Value(operand.clone()),
         other => {
             return Err(format!(
                 "{name}: Result branch producer is not a one-arg branch method call: {other:?}"
@@ -37960,11 +37988,24 @@ mod tests {
     #[test]
     fn equal_result_and_control_flow_layouts_lower_branch_to_same_as() {
         let same = branch_layout(0, 8);
-        assert!(super::type_layouts_equal(&same, &branch_layout(0, 8)));
-        let (mut graph, result) = graph_with_result_branch();
-        let mut same_layout = std::collections::HashSet::new();
-        same_layout.insert(result);
-        super::lower_result_branch_to_control_flow(&mut graph, &same_layout);
+        let (mut graph, _result) = graph_with_result_branch();
+        let entry = graph.startblock;
+        let call_idx = graph.block(entry).operations.iter().position(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } if name == "branch"
+            )
+        });
+        let call_idx = call_idx.expect("branch call");
+        let kind = std::mem::replace(
+            &mut graph.block_mut(entry).operations[call_idx].kind,
+            OpKind::ConstInt(0),
+        );
+        graph.block_mut(entry).operations[call_idx].kind =
+            super::rewrite_result_branch_for_layouts(kind, Some(&same), Some(&same));
         assert_eq!(count_branch_calls(&graph), 0);
         assert!(
             graph
@@ -37982,7 +38023,34 @@ mod tests {
         let niche = branch_layout(8, 0);
         assert!(!super::type_layouts_equal(&explicit, &niche));
         let (mut graph, _result) = graph_with_result_branch();
-        super::lower_result_branch_to_control_flow(&mut graph, &std::collections::HashSet::new());
+        let entry = graph.startblock;
+        let call_idx = graph
+            .block(entry)
+            .operations
+            .iter()
+            .position(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::Method { name, .. },
+                        ..
+                    } if name == "branch"
+                )
+            })
+            .expect("branch call");
+        let kind = graph.block(entry).operations[call_idx].kind.clone();
+        let kept = super::rewrite_result_branch_for_layouts(kind, Some(&explicit), Some(&niche));
+        assert!(
+            matches!(
+                kept,
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } if name == "branch"
+            ),
+            "unequal layouts stay a branch call"
+        );
+        super::lower_result_branch_to_control_flow(&mut graph);
         assert_eq!(count_branch_calls(&graph), 0, "branch must not stay a call");
         let reads_disc = graph
             .blocks
