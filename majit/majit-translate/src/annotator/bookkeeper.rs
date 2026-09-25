@@ -2402,6 +2402,26 @@ impl Bookkeeper {
             {
                 attr.s_value = s_value;
             }
+            // A shaped aggregate's `__pos_N` is written by the constructor
+            // (`generalize_attr` of the element annotation). An untyped
+            // `Ref` force shell contains every instance, so that write
+            // cannot install the element's classdef. Drop the shell back
+            // to lattice bottom and let the constructor's value be the
+            // item annotation `SomeIterator.next` reads.
+            if (majit_ir::descr::is_shaped_tuple_name(n)
+                || majit_ir::descr::is_shaped_array_name(n))
+                && field_name.starts_with("__pos_")
+                && matches!(
+                    &attr.s_value,
+                    SomeValue::Instance(inst)
+                        if inst.classdef.is_none()
+                            && !inst.can_be_none
+                            && inst.flags.is_empty()
+                            && inst.base.const_box.is_none()
+                )
+            {
+                attr.s_value = SomeValue::Impossible;
+            }
         }
         Ok(())
     }
