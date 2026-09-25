@@ -318,12 +318,10 @@ def main() -> int:
     # Relocation is the ordinary shape of progress here: a graph that
     # stops declining on its first blocker reaches a later one and is
     # categorised by that instead.
-    pair_added = flat_got - flat_want
-    pair_gone = flat_want - flat_got
     def module_move_key(name: str) -> str:
         # `#1854` moved optional modules from `pyre-interpreter` to
         # `pyre-module`. The graph is the same subject; only the crate
-        # prefix changed.
+        # prefix changed, so both spellings compare as one name.
         for prefix in (
             "pyre_interpreter::module::",
             "pyre_module::module::",
@@ -332,21 +330,14 @@ def main() -> int:
                 return "module::" + name[len(prefix) :]
         return name
 
+    pair_added = ({(c, module_move_key(s)) for c, s in flat_got}
+                  - {(c, module_move_key(s)) for c, s in flat_want})
+    pair_gone = ({(c, module_move_key(s)) for c, s in flat_want}
+                 - {(c, module_move_key(s)) for c, s in flat_got})
     gone_names = {s for _, s in pair_gone}
     added_names = {s for _, s in pair_added}
-
-    def prefix_moved(name: str, other: set[str]) -> bool:
-        key = module_move_key(name)
-        # Same spelling is a class change, not a crate move. Keep it so
-        # `relocated` still reports old class -> new class.
-        if key == name:
-            return False
-        return any(module_move_key(o) == key and o != name for o in other)
-
-    added_names = {s for s in added_names if not prefix_moved(s, gone_names)}
-    gone_names = {s for s in gone_names if not prefix_moved(s, {s for _, s in pair_added})}
-    added = sorted((c, s) for c, s in pair_added if s in added_names)
-    gone = sorted((c, s) for c, s in pair_gone if s in gone_names)
+    added = sorted((c, s) for c, s in pair_added if s not in gone_names)
+    gone = sorted((c, s) for c, s in pair_gone if s not in added_names)
     relocated = sorted(
         (s, before, now)
         for s in gone_names & added_names

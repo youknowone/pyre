@@ -197,13 +197,16 @@ pub fn raw_write_f64(p: usize, v: f64) {
 /// typed load/store (`_raw_memcopy_tp`); anything else is the opaque
 /// residual (`_raw_memcopy_opaque`).
 pub fn raw_memcopy(source: usize, dest: usize, size: usize) {
-    match size {
-        1 => raw_write_u8(dest, raw_read_u8(source)),
-        2 => raw_write_u16(dest, raw_read_u16(source)),
-        4 => raw_write_u32(dest, raw_read_u32(source)),
-        8 => raw_write_u64(dest, raw_read_u64(source)),
-        _ => raw_memcopy_opaque(source, dest, size),
+    if majit_rlib::jit::isconstant(&size) {
+        match size {
+            1 => return raw_write_u8(dest, raw_read_u8(source)),
+            2 => return raw_write_u16(dest, raw_read_u16(source)),
+            4 => return raw_write_u32(dest, raw_read_u32(source)),
+            8 => return raw_write_u64(dest, raw_read_u64(source)),
+            _ => {}
+        }
     }
+    raw_memcopy_opaque(source, dest, size)
 }
 
 /// `misc.py _raw_memcopy_opaque`.

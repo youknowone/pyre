@@ -3129,12 +3129,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             // matcher sees the switch, leaving the plain 0/1 pair.
             // Untouched graphs skip this and keep their single
             // end-of-lowering simplify, byte-identical.
-            simplify_lowered_graph(
-                &mut lo.graph,
-                struct_field_attrs,
-                lo.static_addrs.pytypes_by_struct,
-                false,
-            );
+            simplify_lowered_graph(&mut lo.graph, struct_field_attrs, false);
         }
         let mut tail_forwarded_returns = 0usize;
         if !lo.slice_index_rangefrom_sites.is_empty() {
@@ -3611,12 +3606,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         {
             crate::model::clear_unreachable_blocks(&mut lo.graph);
         }
-        simplify_lowered_graph(
-            &mut lo.graph,
-            struct_field_attrs,
-            lo.static_addrs.pytypes_by_struct,
-            true,
-        );
+        simplify_lowered_graph(&mut lo.graph, struct_field_attrs, true);
         // `format!`-chain expansion (descriptor census): rewrite the recognized
         // `Argument::new_display`/`Arguments::new`/`alloc::fmt::format`
         // chain into native `str` + `ll_strconcat` ops so the graph-less
@@ -3670,12 +3660,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // so untouched graphs keep their single end-of-lowering simplify.
         if collapse_panic_message_chains(&mut lo.graph) > 0 {
             crate::model::clear_unreachable_blocks(&mut lo.graph);
-            simplify_lowered_graph(
-                &mut lo.graph,
-                struct_field_attrs,
-                lo.static_addrs.pytypes_by_struct,
-                true,
-            );
+            simplify_lowered_graph(&mut lo.graph, struct_field_attrs, true);
         }
         Ok(())
     };
@@ -3837,7 +3822,6 @@ fn lower_unstructured_with_static_addrs_and_attrs(
 fn simplify_lowered_graph(
     graph: &mut FunctionGraph,
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
-    pytypes_by_struct: &[(&str, i64)],
     sweep_dead_vars: bool,
 ) {
     // Collapse the operation-less blocks the MIR lowering leaves behind.
@@ -3874,9 +3858,7 @@ fn simplify_lowered_graph(
     // native `NewWithVtable` + payload stores before the dead-aggregate sweep,
     // which then reclaims the orphaned construct-on-stack ctor and header
     // field writes.
-    dirty |=
-        crate::model::fuse_boxing_alloc_with_pytypes(graph, struct_field_attrs, pytypes_by_struct)
-            > 0;
+    dirty |= crate::model::fuse_boxing_alloc(graph, struct_field_attrs) > 0;
     // Reclaim boxing-cluster remnants (fused header ctors/casts, and a
     // `vec![…]` box whose consumer became a `newlist`) using dependency-flow
     // liveness (`transform_dead_op_vars`, simplify.py) with the
@@ -9070,8 +9052,7 @@ impl<'a> Lowering<'a> {
                     .or_else(|| self.fold_named_const_int_array_global(id))
                     .or_else(|| primitive_float_const(&segments))
                     .or_else(|| code_flags_const(&segments))
-                    .or_else(|| bitflags_trait_empty_const(&segments))
-                    .or_else(|| crate::codewriter::jtransform::ctype_flags_const(&segments));
+                    .or_else(|| bitflags_trait_empty_const(&segments));
                 // No lane produced a value for this static.  The synthetic
                 // nullary call below targets the static's own path, which is
                 // not a function, so the failure only becomes visible two
@@ -34579,9 +34560,8 @@ fn block_reachable(graph: &FunctionGraph, target: BlockId) -> bool {
 /// on `0x81..=0xBF` (neither a literal length nor a placeholder), on an
 /// indirect width/precision bit, on a truncated field, on a missing `0x00`
 /// terminator, and on non-UTF-8 literal bytes.  A placeholder that carries
-/// flags/width/precision is decoded rather than refused; each collapse
-/// consults `is_default()`, `is_lower_hex_alternate()`, or
-/// `is_lower_hex_byte_02()` for the shape it rewrites.
+/// flags/width/precision is decoded rather than refused; refusing it is the
+/// job of `FmtPlaceholder::is_default()`, which every collapse consults.
 fn decode_packed_format_pieces(bytes: &[u8]) -> Option<(Vec<String>, Vec<FmtPlaceholder>)> {
     let mut pieces: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -34729,23 +34709,6 @@ impl FmtPlaceholder {
             && self.precision.is_none()
             && !self.width_indirect
             && !self.precision_indirect
-    }
-
-    /// Rust `{:#x}` — alternate lower hex, no width/precision.
-    /// `hex(i)` / `ll_int2hex(i, True)`. Fill/align defaults may ride
-    /// in the flag word with the alternate bit.
-    fn is_lower_hex_alternate(self) -> bool {
-        const ALTERNATE: u32 = 1 << 23;
-        const FILL_SPACE: u32 = b' ' as u32;
-        const ALIGN_UNKNOWN: u32 = 3 << 29;
-        const ALLOWED: u32 = ALTERNATE | FILL_SPACE | ALIGN_UNKNOWN;
-        self.width.is_none()
-            && self.precision.is_none()
-            && !self.width_indirect
-            && !self.precision_indirect
-            && self
-                .flags
-                .is_some_and(|f| f & ALTERNATE != 0 && (f & !ALLOWED) == 0)
     }
 }
 
@@ -36841,7 +36804,6 @@ fn emit_fmt_expansion_ops(
     pieces: &[String],
     value: &Variable,
     result: Variable,
-    render_op: &str,
 ) -> Vec<SpaceOperation> {
     use crate::model::{CallTarget, OpKind, ValueType};
     let str_const = |graph: &mut FunctionGraph, ops: &mut Vec<SpaceOperation>, text: &str| {
@@ -36864,12 +36826,12 @@ fn emit_fmt_expansion_ops(
     if !pieces[0].is_empty() {
         parts.push(str_const(graph, &mut ops, &pieces[0]));
     }
-    // `str(value)` / `hex(value)` — render the single placeholder.
+    // `str(value)` — render the single Display placeholder.
     let rendered = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
     ops.push(SpaceOperation {
         result: Some(rendered.clone()),
         kind: OpKind::UnaryOp {
-            op: render_op.to_string(),
+            op: "str".to_string(),
             operand: value.clone(),
             result_ty: ValueType::Ref(None),
         },
@@ -37124,8 +37086,6 @@ struct FmtCollapse {
     format_block: BlockId,
     format_result: u64,
     pieces: Vec<String>,
-    /// `str` for Display `{}`; `hex` for alternate lower-hex `{:#x}`.
-    render_op: &'static str,
     /// `(block, exit_index, arg_pos, replacement)` — replace the chain
     /// value the link forwarded with the threaded rendered value.
     link_rewrites: Vec<(BlockId, usize, usize, Variable)>,
@@ -37157,10 +37117,6 @@ struct SingleArgFmtChainNav {
     /// The argument tuple is exactly Rust `(u8,)`; used by the LowerHex
     /// parity collapse to prove that two hexadecimal digits cannot truncate.
     context_is_u8: bool,
-    /// The argument tuple is a single machine integer (`i8`..`i64`/`isize`
-    /// or `u8`..`u64`/`usize`). `format!("{:#x}", n)` is `hex(n)` /
-    /// `ll_int2hex(i, True)` (`rint.py rtype_hex`).
-    context_is_int: bool,
     /// `(block, exit_index, arg_pos, replacement)` — re-thread the deleted
     /// chain value the link forwarded onto a still-live value so no link
     /// references a deleted result var after the chain ops are removed.
@@ -37170,24 +37126,6 @@ struct SingleArgFmtChainNav {
     dead_results: Vec<u64>,
     /// Aggregate base var ids whose `FieldWrite`s are deleted.
     dead_bases: Vec<u64>,
-}
-
-/// Charon names a one-element integer tuple `Tuple<i32>` / `Tuple<u32>`
-/// and so on. `rtype_hex` feeds that word to `ll_int2hex(i, True)`.
-fn is_int_tuple_ctor(name: &str) -> bool {
-    matches!(
-        name,
-        "Tuple<u8>"
-            | "Tuple<u16>"
-            | "Tuple<u32>"
-            | "Tuple<u64>"
-            | "Tuple<usize>"
-            | "Tuple<i8>"
-            | "Tuple<i16>"
-            | "Tuple<i32>"
-            | "Tuple<i64>"
-            | "Tuple<isize>"
-    )
 }
 
 /// Back-navigate the single-argument `format!` chain the charon lowering
@@ -37286,18 +37224,13 @@ fn navigate_single_arg_fmt_chain(
     })?;
     // The rendered value written into the argument tuple field.
     let context = unwrap_fmt_arg_tuple_ref(graph, &arg_ref)?;
-    let tuple_ctor_name = block_0.operations.iter().find_map(|op| match &op.kind {
-        OpKind::Call {
-            target: CallTarget::SyntheticTransparentCtor { name, .. },
-            ..
-        } if op.result.as_ref().map(|r| r.id()) == Some(tuple_var.id()) => Some(name.as_str()),
-        _ => None,
+    let context_is_u8 = block_0.operations.iter().any(|op| {
+        matches!(&op.kind,
+            OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor { name, .. },
+                ..
+            } if op.result.as_ref().map(|r| r.id()) == Some(tuple_var.id()) && name == "Tuple<u8>")
     });
-    // Charon names a one-element tuple `Tuple<T>`; the `{:02x}` byte
-    // collapse needs `T == u8`, the `{:#x}` hex collapse needs a
-    // machine integer (`ll_int2hex`).
-    let context_is_u8 = tuple_ctor_name == Some("Tuple<u8>");
-    let context_is_int = tuple_ctor_name.is_some_and(is_int_tuple_ctor);
 
     // Thread `context` straight through the slots the chain values used:
     // B0→Bp forwards `context` where it forwarded `new_*`, Bp→Bf forwards
@@ -37325,7 +37258,6 @@ fn navigate_single_arg_fmt_chain(
         format_result,
         context,
         context_is_u8,
-        context_is_int,
         link_rewrites,
         dead_results,
         dead_bases,
@@ -37338,25 +37270,15 @@ fn navigate_single_arg_fmt_chain(
 /// leaves the graph untouched.
 fn collect_fmt_collapse(graph: &FunctionGraph, bf: BlockId, fi: usize) -> Option<FmtCollapse> {
     let nav = navigate_single_arg_fmt_chain(graph, bf, fi)?;
-    let render_op = match nav.kind {
-        FmtArgKind::Display if nav.placeholder.is_default() => "str",
-        // `hex(i)` / `ll_int2hex(i, True)` — `format!("{:#x}", n)` on a
-        // machine int. `ll_int2hex` takes the sign of a Signed word
-        // (`i < 0` then `-` + magnitude); an Unsigned word is never
-        // negative. Rust `{:#x}` on signed is two's-complement bits,
-        // which is the format! shell this rewrite replaces.
-        FmtArgKind::LowerHex if nav.placeholder.is_lower_hex_alternate() && nav.context_is_int => {
-            "hex"
-        }
-        // `{:?}` Debug has no native rstr counterpart, so leave a Debug
-        // chain to `collapse_debug_enum_fmt_chains`.
-        _ => return None,
-    };
+    if nav.kind != FmtArgKind::Display || !nav.placeholder.is_default() {
+        // `str(value)` renders Display; `{:?}` Debug has no native rstr
+        // counterpart, so leave a Debug chain to `collapse_debug_enum_fmt_chains`.
+        return None;
+    }
     Some(FmtCollapse {
         format_block: bf,
         format_result: nav.format_result.id(),
         pieces: nav.pieces,
-        render_op,
         link_rewrites: nav.link_rewrites,
         dead_results: nav.dead_results,
         dead_bases: nav.dead_bases,
@@ -37452,7 +37374,7 @@ fn collapse_fmt_chains(graph: &mut FunctionGraph) -> usize {
         else {
             continue;
         };
-        let expansion = emit_fmt_expansion_ops(graph, &site.pieces, &value, result, site.render_op);
+        let expansion = emit_fmt_expansion_ops(graph, &site.pieces, &value, result);
         graph
             .block_mut(site.format_block)
             .operations
@@ -39402,7 +39324,7 @@ mod tests {
         graph.set_goto(entry, forwarding, vec![array.clone()]);
         graph.set_return(forwarding, None);
 
-        simplify_lowered_graph(&mut graph, &std::collections::HashMap::new(), &[], true);
+        simplify_lowered_graph(&mut graph, &std::collections::HashMap::new(), true);
 
         let entry_exit = &graph.block(entry).exits[0];
         assert_eq!(
@@ -39904,9 +39826,9 @@ mod tests {
     #[test]
     fn final_simplify_rewrites_struct_ctors_prepass_does_not() {
         let mut graph = struct_ctor_graph(false);
-        simplify_lowered_graph(&mut graph, &empty_struct_attrs(), &[], false);
+        simplify_lowered_graph(&mut graph, &empty_struct_attrs(), false);
         assert_eq!(struct_ctor_ops(&graph), (1, 0, 1));
-        simplify_lowered_graph(&mut graph, &empty_struct_attrs(), &[], true);
+        simplify_lowered_graph(&mut graph, &empty_struct_attrs(), true);
         assert_eq!(struct_ctor_ops(&graph), (0, 0, 0));
         assert_eq!(same_as_count(&graph), 1);
     }
@@ -40194,7 +40116,7 @@ mod tests {
     #[test]
     fn final_simplify_leaves_boxing_cluster_ctors_including_nested_header() {
         let mut graph = boxing_cluster_with_nested_header();
-        simplify_lowered_graph(&mut graph, &std::collections::HashMap::new(), &[], true);
+        simplify_lowered_graph(&mut graph, &std::collections::HashMap::new(), true);
         assert_eq!(boxing_cluster_ctor_new_counts(&graph), (2, 0));
     }
 
@@ -40979,17 +40901,6 @@ mod tests {
         assert_eq!(placeholders.len(), 1);
         assert!(placeholders[0].is_lower_hex_byte_02());
 
-        // `format!("{:#x}", n)` / `format!("{n:#x}")`.  0xC1 selects flags
-        // only; 0x60800020 is space fill, alternate (`#`), unknown alignment
-        // (`core::fmt` flag word). No width/precision field.
-        let (pieces, placeholders) =
-            decode_packed_format_pieces(&[0xC1, 0x20, 0, 0x80, 0x60, 0]).unwrap();
-        assert_eq!(pieces, [String::new(), String::new()]);
-        assert_eq!(placeholders.len(), 1);
-        assert!(placeholders[0].is_lower_hex_alternate());
-        assert!(!placeholders[0].is_lower_hex_byte_02());
-        assert!(!placeholders[0].is_default());
-
         // A literal length that overruns the buffer bails.
         assert_eq!(decode_packed_format_pieces(&[5, 65, 66, 0]), None);
 
@@ -41439,193 +41350,6 @@ mod tests {
         assert_eq!(b0_exit.args[0].as_variable().unwrap().id(), ctx.id());
         let bp_exit = &bp_block.exits[0];
         assert_eq!(bp_exit.args[0].as_variable().unwrap().id(), arg_in.id());
-    }
-
-    /// Three-block `format!("{:#x}", n)` chain: B0 `new_lower_hex` off a
-    /// one-element Tuple, Bp `Arguments::new`, Bf `alloc::fmt::format`.
-    /// Packed template is the `{:#x}` flag word from
-    /// `decode_packed_format_pieces_bails_and_handles_edges`.
-    fn build_lower_hex_alternate_fmt_chain(
-        tuple_ctor: &str,
-    ) -> (crate::model::FunctionGraph, crate::model::BlockId) {
-        use crate::flowspace::model::Variable;
-        use crate::model::{
-            CallTarget, FieldDescriptor, FunctionGraph, Link, LinkArg, OpKind, SpaceOperation,
-            ValueType,
-        };
-
-        let mut graph = FunctionGraph::new("fmt_hex_collapse");
-        let b0 = graph.create_block();
-        let bp = graph.create_block();
-        let bf = graph.create_block();
-        let bret = graph.create_block();
-
-        let ctx = Variable::new();
-        graph.block_mut(b0).inputargs = vec![ctx.clone()];
-        let tuple = Variable::new();
-        graph.block_mut(b0).operations.push(SpaceOperation {
-            result: Some(tuple.clone()),
-            kind: OpKind::Call {
-                target: CallTarget::synthetic_transparent_ctor(tuple_ctor),
-                args: crate::model::call_args(vec![]),
-                result_ty: ValueType::Ref(Some(tuple_ctor.to_string())),
-            },
-        });
-        graph.block_mut(b0).operations.push(SpaceOperation {
-            result: None,
-            kind: OpKind::FieldWrite {
-                base: tuple.clone(),
-                field: FieldDescriptor::new("__pos_0", Some(tuple_ctor.to_string())),
-                value: LinkArg::Value(ctx.clone()),
-                ty: ValueType::Int,
-            },
-        });
-        let arg_ref = Variable::new();
-        graph.block_mut(b0).operations.push(SpaceOperation {
-            result: Some(arg_ref.clone()),
-            kind: OpKind::FieldRead {
-                base: tuple,
-                field: FieldDescriptor::new("__pos_0", Some(tuple_ctor.to_string())),
-                ty: ValueType::Int,
-                pure: false,
-            },
-        });
-        let new_hex = Variable::new();
-        graph.block_mut(b0).operations.push(SpaceOperation {
-            result: Some(new_hex.clone()),
-            kind: OpKind::Call {
-                target: CallTarget::FunctionPath {
-                    segments: ["fmt", "rt", "Argument", "new_lower_hex"]
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect(),
-                    fun_decl_id: None,
-                },
-                args: crate::model::call_args(vec![arg_ref]),
-                result_ty: ValueType::Ref(None),
-            },
-        });
-        let arg_in = Variable::new();
-        graph.block_mut(bp).inputargs = vec![arg_in.clone()];
-        graph.block_mut(b0).exits =
-            vec![Link::from_variables(&graph, vec![new_hex], bp, None).with_prevblock(b0)];
-
-        let args_arr = Variable::new();
-        graph.block_mut(bp).operations.push(SpaceOperation {
-            result: Some(args_arr.clone()),
-            kind: OpKind::Call {
-                target: CallTarget::synthetic_transparent_ctor("Array"),
-                args: crate::model::call_args(vec![]),
-                result_ty: ValueType::Ref(Some("Array".to_string())),
-            },
-        });
-        graph.block_mut(bp).operations.push(SpaceOperation {
-            result: None,
-            kind: OpKind::FieldWrite {
-                base: args_arr.clone(),
-                field: FieldDescriptor::new("__pos_0", Some("Array".to_string())),
-                value: LinkArg::Value(arg_in.clone()),
-                ty: ValueType::Ref(None),
-            },
-        });
-        let pieces_arr = Variable::new();
-        graph.block_mut(bp).operations.push(SpaceOperation {
-            result: Some(pieces_arr.clone()),
-            kind: OpKind::Call {
-                target: CallTarget::synthetic_transparent_ctor("Array"),
-                args: crate::model::call_args(vec![]),
-                result_ty: ValueType::Ref(Some("Array".to_string())),
-            },
-        });
-        // Packed `format!("{:#x}", n)`: flags-only placeholder, space fill,
-        // alternate, unknown alignment, terminator.
-        for (i, byte) in [0xC1i64, 0x20, 0, 0x80, 0x60, 0].iter().enumerate() {
-            let v = Variable::new();
-            graph.block_mut(bp).operations.push(SpaceOperation {
-                result: Some(v.clone()),
-                kind: OpKind::ConstInt(*byte),
-            });
-            graph.block_mut(bp).operations.push(SpaceOperation {
-                result: None,
-                kind: OpKind::FieldWrite {
-                    base: pieces_arr.clone(),
-                    field: FieldDescriptor::new(format!("__pos_{i}"), Some("Array".to_string())),
-                    value: LinkArg::Value(v),
-                    ty: ValueType::Int,
-                },
-            });
-        }
-        let fmt_args = Variable::new();
-        graph.block_mut(bp).operations.push(SpaceOperation {
-            result: Some(fmt_args.clone()),
-            kind: OpKind::Call {
-                target: CallTarget::FunctionPath {
-                    segments: ["fmt", "Arguments", "new"]
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect(),
-                    fun_decl_id: None,
-                },
-                args: crate::model::call_args(vec![pieces_arr, args_arr]),
-                result_ty: ValueType::Ref(None),
-            },
-        });
-        let fmt_args_in = Variable::new();
-        graph.block_mut(bf).inputargs = vec![fmt_args_in.clone()];
-        graph.block_mut(bp).exits =
-            vec![Link::from_variables(&graph, vec![fmt_args], bf, None).with_prevblock(bp)];
-
-        let formatted = Variable::new();
-        graph.block_mut(bf).operations.push(SpaceOperation {
-            result: Some(formatted.clone()),
-            kind: OpKind::Call {
-                target: CallTarget::FunctionPath {
-                    segments: ["alloc", "fmt", "format"]
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect(),
-                    fun_decl_id: None,
-                },
-                args: crate::model::call_args(vec![fmt_args_in.clone()]),
-                result_ty: ValueType::Ref(None),
-            },
-        });
-        let ret = Variable::new();
-        graph.block_mut(bret).inputargs = vec![ret];
-        graph.block_mut(bf).exits =
-            vec![Link::from_variables(&graph, vec![formatted], bret, None).with_prevblock(bf)];
-        (graph, bf)
-    }
-
-    #[test]
-    fn collapse_fmt_chains_expands_unsigned_hex_alternate_to_hex_unop() {
-        use super::collapse_fmt_chains;
-
-        let (mut graph, bf) = build_lower_hex_alternate_fmt_chain("Tuple<u64>");
-        assert_eq!(collapse_fmt_chains(&mut graph), 1);
-        let bf_block = graph.blocks.iter().find(|b| b.id == bf).unwrap();
-        assert_eq!(bf_block.operations.len(), 1);
-        match &bf_block.operations[0].kind {
-            OpKind::UnaryOp { op, .. } => assert_eq!(op, "hex"),
-            other => panic!("Bf op[0] not a hex UnaryOp: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn collapse_fmt_chains_expands_signed_hex_alternate_to_hex_unop() {
-        use super::collapse_fmt_chains;
-
-        // `ll_int2hex` takes the sign of a Signed word (`i < 0` then `-`
-        // + magnitude). `hex(i)` is that helper; the format! shell's
-        // two's-complement `{:#x}` is what this rewrite replaces.
-        let (mut graph, bf) = build_lower_hex_alternate_fmt_chain("Tuple<i64>");
-        assert_eq!(collapse_fmt_chains(&mut graph), 1);
-        let bf_block = graph.blocks.iter().find(|b| b.id == bf).unwrap();
-        assert_eq!(bf_block.operations.len(), 1);
-        match &bf_block.operations[0].kind {
-            OpKind::UnaryOp { op, .. } => assert_eq!(op, "hex"),
-            other => panic!("Bf op[0] not a hex UnaryOp: {other:?}"),
-        }
     }
 
     /// Build the `alloc::fmt::format` block shape a fieldless-enum `{:?}`

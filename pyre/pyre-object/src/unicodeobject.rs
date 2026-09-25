@@ -1876,27 +1876,6 @@ pub fn int_str_text(v: i64) -> String {
     v.to_string()
 }
 
-/// `hex(i)` / `ll_int2hex(i, True)` (`ll_str.py`). Optional minus, then
-/// `0x`, then digits of the magnitude. Rust `{:#x}` on a signed value
-/// prints the two's-complement bit pattern (`-26` → `0xffffffffffffffe6`),
-/// which is not `hex()`.
-pub fn int_hex_text(v: i64) -> String {
-    let (sign, mag) = if v < 0 {
-        ("-", v.wrapping_neg() as u64)
-    } else {
-        ("", v as u64)
-    };
-    format!("{sign}0x{mag:x}")
-}
-
-/// Residual `hex(i)` for an exact machine int. Same wrapping as
-/// [`jit_int_str`]: `ll_int2hex` is elidable but the unicode box is a
-/// fresh allocation, so the call is `CanRaise` rather than elidable.
-#[majit_macros::dont_look_inside]
-pub extern "C" fn jit_int_hex(v: i64) -> i64 {
-    w_str_new_managed(&int_hex_text(v)) as i64
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2185,19 +2164,6 @@ mod tests {
             assert_eq!(
                 w_str_get_wtf8(jit_int_str(i64::MIN) as PyObjectRef),
                 "-9223372036854775808",
-            );
-        }
-    }
-
-    #[test]
-    fn test_jit_int_hex_renders_alternate_lower_hex() {
-        unsafe {
-            assert_eq!(w_str_get_value(jit_int_hex(0) as PyObjectRef), "0x0");
-            assert_eq!(w_str_get_value(jit_int_hex(26) as PyObjectRef), "0x1a");
-            assert_eq!(w_str_get_value(jit_int_hex(-26) as PyObjectRef), "-0x1a");
-            assert_eq!(
-                w_str_get_value(jit_int_hex(i64::MIN) as PyObjectRef),
-                "-0x8000000000000000",
             );
         }
     }

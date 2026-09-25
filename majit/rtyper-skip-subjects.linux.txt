@@ -3,10 +3,11 @@
 # leave this list, and may not join it.  Empty is the epic's
 # done-when.
 # corpus=eff93b0bce4cea6c platform=linux
-# New subjects from looking inside from_exc_object and the split
-# primitive convert helpers. The two-phase prepass never saw them.
-two-phase-never-a-subject	pyre_interpreter::error::<Impl>::empty_object_message
-two-phase-never-a-subject	pyre_interpreter::error::<Impl>::from_exc_object
+# The `ctypeprim.py` / `misc.py` convert helpers split out of the
+# primitive ctypes.  Their bodies stop on the phase-A walls that
+# `misc::bad_integer_size`, `misc::as_long` and `misc::read_raw_signed_data`
+# already stop on (`Integer ∪ Instance(Adt)` / `Integer ∪
+# Instance(error::PyError)`), and `unpack_complex`'s failed source lift.
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::convert_from_object_complex
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::convert_from_object_float
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::convert_from_object_longdouble
@@ -17,6 +18,8 @@ two-phase-never-a-subject	pyre_module::module::_cffi_backend::ctypeprim::convert
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::misc::as_long_long
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::misc::read_raw_long_data
 two-phase-never-a-subject	pyre_module::module::_cffi_backend::misc::read_raw_ulong_data
+# Already on the darwin baseline at main: phase B cannot convert the
+# `Func()->Void` pointer it returns to an object repr.
 two-phase-rtype-skipped	pyre_interpreter::gateway::builtin_fixed_arity_fn
 two-phase-never-a-subject	eval_loop_jit_portal
 two-phase-never-a-subject	ll_int_abs

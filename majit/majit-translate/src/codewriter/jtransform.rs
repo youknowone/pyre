@@ -171,10 +171,6 @@ pub struct GraphTransformConfig {
     /// `rstr.py ll_int2dec` via `rint.py rtype_str`.
     #[serde(default = "default_int_str_helper")]
     pub int_str_helper: String,
-    /// The host's `hex(i)` helper (`ll_int2hex(i, True)`). Same contract
-    /// as [`Self::int_str_helper`].
-    #[serde(default = "default_int_hex_helper")]
-    pub int_hex_helper: String,
 }
 
 /// The [`GraphTransformConfig::jitdriver_receiver_roots`] default: pyre's own
@@ -199,10 +195,6 @@ fn default_int_str_helper() -> String {
     "jit_int_str".to_string()
 }
 
-fn default_int_hex_helper() -> String {
-    "jit_int_hex".to_string()
-}
-
 impl Default for GraphTransformConfig {
     fn default() -> Self {
         Self {
@@ -215,7 +207,6 @@ impl Default for GraphTransformConfig {
             jitdriver_receiver_roots: default_jitdriver_receiver_roots(),
             str_concat_helper: default_str_concat_helper(),
             int_str_helper: default_int_str_helper(),
-            int_hex_helper: default_int_hex_helper(),
         }
     }
 }
@@ -615,24 +606,12 @@ pub struct Transformer<'a> {
     /// pre-rename operand (`jtransform.py` `rewrite_op_direct_ptradd`
     /// reads `op.args[0].concretetype`).
     direct_ptradd_type_arg: Option<crate::flowspace::model::Variable>,
-    /// Results of a construct-on-stack `PyObject` header ctor rewritten
-    /// to `ConstRefNull`. Nested `ob_type` / `w_class` stores into that
-    /// result are dropped — `rclass.py` embeds `OBJECT` in the instance
-    /// and `rewrite_op_setfield` already ignores `typeptr`.
-    header_stack_results: std::collections::HashSet<crate::flowspace::model::Variable>,
-    /// Bases of in-graph GC `FieldWrite` / `ArrayWrite` stores. A
-    /// `try_gc_write_barrier` call is dropped only when its argument
-    /// (after `resolve_alias` and identity casts) is one of these —
-    /// `rewrite.py handle_write_barrier_setfield` emits `COND_CALL_GC_WB`
-    /// on `SETFIELD_GC` of a pointer, not on a residual or raw store.
-    /// `None` until computed once per graph.
-    gc_stored_bases: Option<std::collections::HashSet<crate::flowspace::model::Variable>>,
     /// Results of `FieldRead`s whose `(owner, field)` is an immutable
     /// array rank (`name[*]`, `rclass.py _parse_field_list`).  An
     /// `ArrayRead` whose base (after `canonical_gc_base` and pointer
     /// arithmetic) is one of these is `getarrayitem_gc_*_pure` —
     /// `jtransform.py rewrite_op_getarrayitem` `ARRAY._immutable_field(None)`.
-    /// `None` until computed once per graph, same as `gc_stored_bases`.
+    /// `None` until computed once per graph.
     immutable_array_vars: Option<std::collections::HashSet<crate::flowspace::model::Variable>>,
     notes: Vec<GraphTransformNote>,
     vable_rewrites: usize,
@@ -872,62 +851,20 @@ pub(crate) fn is_generic_default_path(segments: &[String]) -> bool {
     joined == "Default" || joined.starts_with("core::default") || joined.starts_with("std::default")
 }
 
-/// Supply the value of a `CTypeFlags` associated constant.
-///
-/// `bitflags!` generates each flag as `impl CTypeFlags { const NAME: Self }`
-/// whose initializer Charon records as an `Opaque` body (the impl module
-/// anonymizes to `_`), so `const_eval_global` finds no in-LLBC init.
-/// The bits are a fixed compile-time `i64` mask (`ctypeobj.rs`
-/// `CTypeFlags`). `W_CType.has(CTypeFlags::SIGNED_WCHAR)` is then the
-/// integer bit-and PyPy's immutable `is_signed_wchar` field reads as
-/// after promotion.
-pub(crate) fn ctype_flags_const(segments: &[String]) -> Option<OpKind> {
-    let [.., owner, impl_seg, leaf] = segments else {
-        return None;
-    };
-    if owner.as_str() != "_" || impl_seg.as_str() != "<Impl>" {
-        return None;
-    }
-    let path = segments.join("::");
-    if !path.contains("ctypeobj") {
-        return None;
-    }
-    let bits: i64 = match leaf.as_str() {
-        "PRIMITIVE_INTEGER" => 1 << 0,
-        "NONFUNC_POINTER_OR_ARRAY" => 1 << 1,
-        "ACCEPT_STR" => 1 << 2,
-        "VOID_PTR" => 1 << 3,
-        "VOIDCHAR_PTR" => 1 << 4,
-        "ONEBYTE_PTR" => 1 << 5,
-        "FILE_PTR" => 1 << 6,
-        "VALUE_FITS_LONG" => 1 << 7,
-        "VALUE_SMALLER_THAN_LONG" => 1 << 8,
-        "VALUE_FITS_ULONG" => 1 << 9,
-        "SIGNED_WCHAR" => 1 << 10,
-        "ELLIPSIS" => 1 << 11,
-        "ENUM" => 1 << 12,
-        "CUSTOM_FIELD_POS" => 1 << 13,
-        "WITH_VAR_ARRAY" => 1 << 14,
-        "WITH_PACKED_CHANGE" => 1 << 15,
-        _ => return None,
-    };
-    Some(OpKind::ConstInt(bits))
-}
-
-/// `try_gc_write_barrier` / `try_gc_write_barrier_managed` — the
-/// interpreter stand-in for a raw store. `rewrite.py
-/// handle_write_barrier_setfield` emits `COND_CALL_GC_WB` on
-/// `SETFIELD_GC` of a pointer; the hook itself is
-/// `@dont_look_inside` and must not survive as a residual helper
-/// **when that store is in this graph**. A barrier whose argument
-/// has no GC `FieldWrite` / `ArrayWrite` in the graph stays residual.
-/// `try_gc_write_barrier_before_move` is a different op
+/// `gc_hook::try_gc_write_barrier` / `try_gc_write_barrier_managed` —
+/// the interpreter's spelling of `llop.gc_writebarrier`, which
+/// [`drop_guarded_gc_write_barriers`] drops when the store it guards
+/// follows. `try_gc_write_barrier_before_move` is a different op
 /// (`gct_gc_writebarrier_before_move`) and is not this.
 fn is_gc_write_barrier_path(segments: &[String]) -> bool {
-    matches!(
-        segments.last().map(String::as_str),
-        Some("try_gc_write_barrier") | Some("try_gc_write_barrier_managed")
-    )
+    let [.., module, leaf] = segments else {
+        return false;
+    };
+    module == "gc_hook"
+        && matches!(
+            leaf.as_str(),
+            "try_gc_write_barrier" | "try_gc_write_barrier_managed"
+        )
 }
 
 /// Identity-cast markers `rewrite_op_direct_call` folds to `same_as`
@@ -1027,29 +964,56 @@ fn canonical_gc_base(
     cur
 }
 
-/// Bases of in-graph GC `FieldWrite` / `ArrayWrite` stores, after
-/// identity-cast chasing. Computed once per graph.
-fn collect_gc_stored_bases(
-    graph: &FunctionGraph,
-) -> std::collections::HashSet<crate::flowspace::model::Variable> {
+/// `framework.py gct_gc_writebarrier` turns `llop.gc_writebarrier` into a
+/// call the JIT rewriter does not keep: `rewrite.py
+/// handle_write_barrier_setfield` already grows `COND_CALL_GC_WB` on the
+/// `SETFIELD_GC` / `SETARRAYITEM_GC` of a pointer. The interpreter spells
+/// that barrier as an explicit `try_gc_write_barrier(obj)` right before the
+/// store it guards, so the call is dropped only when a GC `FieldWrite` /
+/// `ArrayWrite` of the same base follows it in the same block: that store
+/// lowers to the op the backend barriers. Any other barrier stays residual.
+///
+/// The result becomes `true`: the hook is installed before any compiled
+/// code runs.
+fn drop_guarded_gc_write_barriers(graph: &mut FunctionGraph) {
     let aliases = std::collections::HashMap::new();
-    let mut set = std::collections::HashSet::new();
-    for block in &graph.blocks {
-        for op in &block.operations {
-            match &op.kind {
-                OpKind::FieldWrite { base, ty, .. } if value_type_is_gc_ref(ty) => {
-                    set.insert(canonical_gc_base(graph, &aliases, base));
-                    set.insert(base.clone());
-                }
-                OpKind::ArrayWrite { base, item_ty, .. } if value_type_is_gc_ref(item_ty) => {
-                    set.insert(canonical_gc_base(graph, &aliases, base));
-                    set.insert(base.clone());
-                }
-                _ => {}
+    let mut drops: Vec<(usize, usize)> = Vec::new();
+    for (bi, block) in graph.blocks.iter().enumerate() {
+        for (oi, op) in block.operations.iter().enumerate() {
+            let OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if args.len() != 1 || !is_gc_write_barrier_path(segments) {
+                continue;
+            }
+            let Some(arg) = args[0].as_variable() else {
+                continue;
+            };
+            let canon = canonical_gc_base(graph, &aliases, arg);
+            let guarded = block.operations[oi + 1..].iter().any(|next| {
+                let base = match &next.kind {
+                    OpKind::FieldWrite { base, ty, .. } if value_type_is_gc_ref(ty) => base,
+                    OpKind::ArrayWrite { base, item_ty, .. } if value_type_is_gc_ref(item_ty) => {
+                        base
+                    }
+                    _ => return false,
+                };
+                base == arg || canonical_gc_base(graph, &aliases, base) == canon
+            });
+            if guarded {
+                drops.push((bi, oi));
             }
         }
     }
-    set
+    for (bi, oi) in drops {
+        let op = &mut graph.blocks[bi].operations[oi];
+        op.kind = OpKind::ConstBool(true);
+    }
 }
 
 /// Variables that hold an immutable array: each is the result of a
@@ -1081,6 +1045,20 @@ fn collect_immutable_array_vars(
     set
 }
 
+/// `<*T>::add` / `wrapping_add` — rustc's `direct_ptradd`, which keeps the
+/// array pointer it offsets.
+fn is_ptr_add_path(segments: &[String]) -> bool {
+    let Some(leaf) = segments.last() else {
+        return false;
+    };
+    if leaf != "add" && leaf != "wrapping_add" {
+        return false;
+    }
+    let joined = segments.join("::");
+    (joined.starts_with("core::ptr::") || joined.starts_with("std::ptr::"))
+        && (joined.contains("mut_ptr") || joined.contains("const_ptr"))
+}
+
 /// Operand of a pointer-arithmetic Call that produced `var`, if any.
 /// The front's `items_block_items_base` accessor aliases to its receiver;
 /// a leftover `ptr::add` / `wrapping_add` of that receiver still names
@@ -1102,8 +1080,7 @@ fn ptr_arith_base_operand(
             else {
                 continue;
             };
-            let leaf = segments.last()?.as_str();
-            if args.len() == 2 && (leaf == "add" || leaf == "wrapping_add") {
+            if args.len() == 2 && is_ptr_add_path(segments) {
                 return args.first()?.as_variable().cloned();
             }
         }
@@ -1983,8 +1960,6 @@ impl<'a> Transformer<'a> {
             cast_ptr_to_int_src: std::collections::HashMap::new(),
             fn_const_results: std::collections::HashMap::new(),
             direct_ptradd_type_arg: None,
-            header_stack_results: std::collections::HashSet::new(),
-            gc_stored_bases: None,
             immutable_array_vars: None,
             notes: Vec::new(),
             vable_rewrites: 0,
@@ -2080,7 +2055,7 @@ impl<'a> Transformer<'a> {
 
         let exceptblock = rewritten.exceptblock;
         let graph_name = rewritten.name.clone();
-        self.gc_stored_bases = Some(collect_gc_stored_bases(&rewritten));
+        drop_guarded_gc_write_barriers(&mut rewritten);
         self.immutable_array_vars = Some(collect_immutable_array_vars(
             &rewritten,
             self.callcontrol.as_deref(),
@@ -2822,13 +2797,6 @@ impl<'a> Transformer<'a> {
             } if unop_name == "str" && self.get_value_kind_var(operand) == 'i' => {
                 Some(self.config.int_str_helper.as_str())
             }
-            OpKind::UnaryOp {
-                op: unop_name,
-                operand,
-                ..
-            } if unop_name == "hex" && self.get_value_kind_var(operand) == 'i' => {
-                Some(self.config.int_hex_helper.as_str())
-            }
             OpKind::BinOp {
                 op: binop_name,
                 lhs,
@@ -2910,16 +2878,6 @@ impl<'a> Transformer<'a> {
                 operand,
                 ..
             } if unop_name == "cast_opaque_ptr" => RewriteResult::Identity(operand.clone()),
-            // `cast_int_to_ptr` is `i>r` (`insns.rs`, `blackhole.py
-            // bhimpl_cast_int_to_ptr`). A Ref operand is already a
-            // pointer; emitting `/r>r` is not a wired op.
-            OpKind::UnaryOp {
-                op: unop_name,
-                operand,
-                ..
-            } if unop_name == "cast_int_to_ptr" && self.get_value_kind_var(operand) != 'i' => {
-                RewriteResult::Identity(operand.clone())
-            }
             // ── fold of the `_we_are_jitted` symbolic ──
             //
             // Inside the tracer / blackhole interpreter `we_are_jitted()`
@@ -3179,44 +3137,6 @@ impl<'a> Transformer<'a> {
             // allocation.  `jit_int_str` performs both, and sharing that
             // allocation between two renders of one operand is visible to
             // `is_w`, which gives a `str` of `_len() > 1` storage identity.
-            // `hex` over an unboxed integer. `rint.py rtype_hex` /
-            // `ll_str.py ll_int2hex(i, True)` lower `hex(int)` to a
-            // `direct_call` during rtyping. Same wrapping as `str` /
-            // `jit_int_str`: `ll_int2hex` is elidable but the unicode
-            // box is a fresh allocation, so the residual is `CanRaise`.
-            OpKind::UnaryOp {
-                op: unop_name,
-                operand,
-                ..
-            } if unop_name == "hex"
-                && self.get_value_kind_var(operand) == 'i'
-                && !self.config.int_hex_helper.is_empty() =>
-            {
-                let target = CallTarget::function_path([self.config.int_hex_helper.as_str()]);
-                let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
-                let mut ops = vec![funcptr_op];
-                ops.push(SpaceOperation {
-                    result: op.result.clone(),
-                    kind: OpKind::CallResidual {
-                        funcptr: CallFuncPtr::Value(funcptr),
-                        descriptor: CallDescriptor::from_signature(
-                            &[majit_ir::value::Type::Int],
-                            majit_ir::value::Type::Ref,
-                            EffectInfo::new(ExtraEffect::CanRaise, OopSpecIndex::None),
-                        ),
-                        args_i: vec![operand.clone()],
-                        args_r: vec![],
-                        args_f: vec![],
-                        result_kind: 'r',
-                        indirect_targets: None,
-                    },
-                });
-                ops.push(SpaceOperation {
-                    result: None,
-                    kind: OpKind::Live,
-                });
-                RewriteResult::Replace(ops)
-            }
             OpKind::UnaryOp {
                 op: unop_name,
                 operand,
@@ -6375,43 +6295,6 @@ impl<'a> Transformer<'a> {
                 result: op.result.clone(),
                 kind,
             }]);
-        }
-        // `framework.py gct_gc_writebarrier` turns `llop.gc_writebarrier`
-        // into a call the rewriter does not keep: `SETFIELD_GC` of a
-        // pointer already grows `COND_CALL_GC_WB`. Drop the explicit hook
-        // only when that store is in this graph as a GC `FieldWrite` /
-        // `ArrayWrite` of the same base; otherwise the barrier stays
-        // residual (`RewriteResult` fallthrough) — a raw or residual
-        // store has no `handle_write_barrier_setfield` to emit
-        // `COND_CALL_GC_WB`.
-        if let CallTarget::FunctionPath { segments, .. } = target
-            && args.len() == 1
-            && is_gc_write_barrier_path(segments)
-        {
-            if self.gc_stored_bases.is_none() {
-                self.gc_stored_bases = Some(collect_gc_stored_bases(graph));
-            }
-            let arg = resolve_alias(&args[0], &self.aliases);
-            let canon = canonical_gc_base(graph, &self.aliases, &arg);
-            let has_gc_store = self
-                .gc_stored_bases
-                .as_ref()
-                .is_some_and(|bases| bases.contains(&arg) || bases.contains(&canon));
-            if has_gc_store {
-                return if op.result.is_some() {
-                    self.stamp_value_kind_from_value_type(
-                        graph,
-                        op.result.clone(),
-                        &ValueType::Bool,
-                    );
-                    RewriteResult::Replace(vec![SpaceOperation {
-                        result: op.result.clone(),
-                        kind: OpKind::ConstBool(true),
-                    }])
-                } else {
-                    RewriteResult::Replace(vec![])
-                };
-            }
         }
         // `rewrite_op_cast_pointer` → `rewrite_op_same_as`
         // (jtransform.py:254-257): the JIT does not distinguish a
@@ -13264,126 +13147,13 @@ mod tests {
         (graph, n_var)
     }
 
-    #[test]
-    fn transform_graph_lowers_int_hex_to_jit_int_hex_residual_call() {
-        let (graph, n_var) = int_hex_graph();
-        let config = GraphTransformConfig::default();
-        let transformed = Transformer::new(&config).transform(&graph);
-        let ops = &transformed.graph.block(graph.startblock).operations;
-        assert_eq!(ops.len(), 4, "Input + fnptr + call + Live");
-        let expected_fnaddr =
-            crate::call::symbolic_fnaddr_for_target(&CallTarget::function_path(["jit_int_hex"]));
-        assert!(matches!(&ops[1].kind, OpKind::ConstInt(fnaddr) if *fnaddr == expected_fnaddr));
-        match &ops[2].kind {
-            OpKind::CallResidual {
-                funcptr,
-                descriptor,
-                args_i,
-                args_r,
-                args_f,
-                result_kind,
-                indirect_targets,
-            } => {
-                assert!(matches!(funcptr, CallFuncPtr::Value(_)));
-                assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
-                assert_eq!(args_i, &vec![n_var.clone()]);
-                assert!(args_r.is_empty());
-                assert!(args_f.is_empty());
-                assert_eq!(*result_kind, 'r');
-                assert!(indirect_targets.is_none());
-            }
-            other => panic!("expected CallResidual, got {other:?}"),
-        }
-        assert!(matches!(ops[3].kind, OpKind::Live));
-    }
-
-    /// `hex(int)` over an Int operand, as one graph, for the tests below.
-    fn int_hex_graph() -> (FunctionGraph, crate::flowspace::model::Variable) {
-        let mut graph = FunctionGraph::new("int_hex");
-        let n_var = graph
-            .push_op_var(
-                graph.startblock,
-                OpKind::Input {
-                    name: "n".into(),
-                    ty: ValueType::Int,
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
-        let result_var = graph
-            .push_op_var(
-                graph.startblock,
-                OpKind::UnaryOp {
-                    op: "hex".into(),
-                    operand: n_var.clone(),
-                    result_ty: ValueType::Ref(None),
-                },
-                true,
-            )
-            .unwrap();
-        graph.set_return(graph.startblock, Some(result_var.clone()));
-        FunctionGraph::set_concretetype_of_inline(&n_var, ConcreteType::Signed);
-        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::GcRef);
-        (graph, n_var)
-    }
-
     /// The callee is the host's, not this layer's: a pipeline that names its
     /// own render helper gets a call to that one.
     ///
     /// Upstream needs no such setting because rtyping happens inside the
-    /// interpreter's own translation, so `rstr.py ll_int2hex` is already the
+    /// interpreter's own translation, so `rstr.py ll_int2dec` is already the
     /// host's function. A Rust front end reads MIR that has no such helper in
     /// it, so the name has to come from the embedding pipeline.
-    #[test]
-    fn a_named_int_hex_helper_is_the_call_target() {
-        let (graph, _n_var) = int_hex_graph();
-        let config = GraphTransformConfig {
-            int_hex_helper: "grain_render_hex".to_string(),
-            ..Default::default()
-        };
-        let transformed = Transformer::new(&config).transform(&graph);
-        let ops = &transformed.graph.block(graph.startblock).operations;
-        let expected = crate::call::symbolic_fnaddr_for_target(&CallTarget::function_path([
-            "grain_render_hex",
-        ]));
-        assert!(
-            matches!(&ops[1].kind, OpKind::ConstInt(fnaddr) if *fnaddr == expected),
-            "the fnptr names the configured hex helper",
-        );
-    }
-
-    #[test]
-    fn an_unnamed_int_hex_helper_aborts_before_the_original_op() {
-        let (graph, _n_var) = int_hex_graph();
-        let config = GraphTransformConfig {
-            int_hex_helper: String::new(),
-            ..Default::default()
-        };
-        let transformed = Transformer::new(&config).transform(&graph);
-        let ops = &transformed.graph.block(graph.startblock).operations;
-        assert!(
-            !ops.iter()
-                .any(|op| matches!(op.kind, OpKind::CallResidual { .. })),
-            "no helper is named, so nothing is called: {ops:?}",
-        );
-        assert!(
-            matches!(
-                &ops[1].kind,
-                OpKind::Abort {
-                    kind: crate::model::UnknownKind::UnsupportedExpr {
-                        variant: crate::model::UnsupportedExprKind::HostHelperRefused,
-                    },
-                }
-            ),
-            "the host refusal must be explicit: {ops:?}",
-        );
-        assert!(
-            matches!(&ops[2].kind, OpKind::UnaryOp { op: name, .. } if name == "hex"),
-            "the original op stays residual after the abort: {ops:?}",
-        );
-    }
-
     #[test]
     fn a_named_int_str_helper_is_the_call_target() {
         let (graph, _n_var) = int_str_graph();
@@ -19315,79 +19085,86 @@ mod tests {
         }
     }
 
-    /// `handle_write_barrier_setfield` owns the barrier on SETFIELD_GC.
-    /// The explicit hook must not survive as a residual helper when the
-    /// paired GC `FieldWrite` is in the graph.
+    fn wb_call(obj: &crate::flowspace::model::Variable, leaf: &str) -> OpKind {
+        OpKind::Call {
+            target: CallTarget::function_path(["pyre_object", "gc_hook", leaf]),
+            args: crate::model::call_args(vec![obj.clone()]),
+            result_ty: ValueType::Bool,
+        }
+    }
+
+    fn wb_store(
+        obj: &crate::flowspace::model::Variable,
+        stored: &crate::flowspace::model::Variable,
+    ) -> OpKind {
+        OpKind::FieldWrite {
+            base: obj.clone(),
+            field: FieldDescriptor::new("w_value", Some("W_Foo".to_string())),
+            value: crate::model::LinkArg::Value(stored.clone()),
+            ty: ValueType::Ref(None),
+        }
+    }
+
+    fn is_wb_call(kind: &OpKind) -> bool {
+        matches!(kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+            if is_gc_write_barrier_path(segments))
+    }
+
+    /// `rewrite.py handle_write_barrier_setfield` owns the barrier on
+    /// SETFIELD_GC: the explicit hook right before the GC store it guards
+    /// does not survive as a residual helper.
     #[test]
-    fn gc_write_barrier_call_is_dropped() {
-        let config = GraphTransformConfig::default();
-        let mut transformer = Transformer::new(&config);
+    fn gc_write_barrier_before_its_store_is_dropped() {
         let mut graph = FunctionGraph::new("wb_drop");
         let obj = graph.alloc_value_var_with_type(ConcreteType::GcRef);
         let stored = graph.alloc_value_var_with_type(ConcreteType::GcRef);
         let entry = graph.startblock;
-        graph.push_op_var(
-            entry,
-            OpKind::FieldWrite {
-                base: obj.clone(),
-                field: FieldDescriptor::new("w_value", Some("W_Foo".to_string())),
-                value: crate::model::LinkArg::Value(stored),
-                ty: ValueType::Ref(None),
-            },
-            false,
-        );
-        let target =
-            CallTarget::function_path(["pyre_object", "gc_hook", "try_gc_write_barrier_managed"]);
-        let op = SpaceOperation {
-            result: None,
-            kind: OpKind::Call {
-                target: target.clone(),
-                args: crate::model::call_args(vec![obj.clone()]),
-                result_ty: ValueType::Bool,
-            },
-        };
-        match transformer.rewrite_op_direct_call(
-            &op,
-            &target,
-            std::slice::from_ref(&obj),
-            &ValueType::Bool,
-            "wb_drop",
-            &mut graph,
-        ) {
-            RewriteResult::Replace(ops) => assert!(ops.is_empty()),
-            _ => panic!("expected empty Replace"),
-        }
+        graph.push_op_var(entry, wb_call(&obj, "try_gc_write_barrier_managed"), false);
+        graph.push_op_var(entry, wb_store(&obj, &stored), false);
+        drop_guarded_gc_write_barriers(&mut graph);
+        let ops = &graph.blocks[entry.0].operations;
+        assert!(matches!(ops[0].kind, OpKind::ConstBool(true)));
+        assert!(matches!(ops[1].kind, OpKind::FieldWrite { .. }));
     }
 
-    /// A barrier whose argument has no GC store in the graph stays a
-    /// residual call — dropping it would be a GC hole.
+    /// A barrier whose argument has no GC store after it in its block
+    /// stays a residual call — dropping it would be a GC hole.
     #[test]
-    fn gc_write_barrier_without_gc_store_stays_residual() {
-        let config = GraphTransformConfig::default();
-        let mut transformer = Transformer::new(&config);
+    fn gc_write_barrier_without_following_store_stays_residual() {
         let mut graph = FunctionGraph::new("wb_keep");
         let obj = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-        let target =
-            CallTarget::function_path(["pyre_object", "gc_hook", "try_gc_write_barrier_managed"]);
-        let op = SpaceOperation {
-            result: None,
-            kind: OpKind::Call {
-                target: target.clone(),
-                args: crate::model::call_args(vec![obj.clone()]),
-                result_ty: ValueType::Bool,
-            },
-        };
-        match transformer.rewrite_op_direct_call(
-            &op,
-            &target,
-            std::slice::from_ref(&obj),
-            &ValueType::Bool,
-            "wb_keep",
-            &mut graph,
-        ) {
-            RewriteResult::Keep => {}
-            _ => panic!("expected residual Keep"),
-        }
+        let stored = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let entry = graph.startblock;
+        // The store precedes the barrier: it does not guard it.
+        graph.push_op_var(entry, wb_store(&obj, &stored), false);
+        graph.push_op_var(entry, wb_call(&obj, "try_gc_write_barrier"), false);
+        drop_guarded_gc_write_barriers(&mut graph);
+        assert!(is_wb_call(&graph.blocks[entry.0].operations[1].kind));
+
+        let mut graph = FunctionGraph::new("wb_keep_alone");
+        let obj = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let entry = graph.startblock;
+        graph.push_op_var(entry, wb_call(&obj, "try_gc_write_barrier"), false);
+        drop_guarded_gc_write_barriers(&mut graph);
+        assert!(is_wb_call(&graph.blocks[entry.0].operations[0].kind));
+    }
+
+    /// Only the `gc_hook` barrier is this op: a same-named leaf in another
+    /// module is an ordinary call.
+    #[test]
+    fn gc_write_barrier_path_requires_gc_hook_module() {
+        let path = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(is_gc_write_barrier_path(&path(&[
+            "pyre_object",
+            "gc_hook",
+            "try_gc_write_barrier"
+        ])));
+        assert!(!is_gc_write_barrier_path(&path(&[
+            "pyre_object",
+            "other",
+            "try_gc_write_barrier"
+        ])));
+        assert!(!is_gc_write_barrier_path(&path(&["try_gc_write_barrier"])));
     }
 
     #[test]

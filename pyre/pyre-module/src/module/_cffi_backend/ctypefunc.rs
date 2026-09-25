@@ -101,12 +101,12 @@ pub fn call(ct: &W_CType, funcaddr: usize, args_w: &[PyObjectRef]) -> Result<PyO
     // `self = jit.promote(self)`.
     let ct: &W_CType = unsafe { &*majit_metainterp::jit::promote(ct as *const W_CType) };
     if funcaddr == 0 {
-        return Err(cannot_call_null(ct));
+        return Err(unsafe { PyError::from_exc_object(cannot_call_null(ct)) });
     }
     let nargs = fargs_len(ct.fargs);
     if ct.cif_descr != 0 {
         if args_w.len() != nargs {
-            return Err(wrong_nargs(ct, nargs, args_w.len()));
+            return Err(unsafe { PyError::from_exc_object(wrong_nargs(ct, nargs, args_w.len())) });
         }
         return do_call(ct, funcaddr, args_w);
     }
@@ -115,22 +115,24 @@ pub fn call(ct: &W_CType, funcaddr: usize, args_w: &[PyObjectRef]) -> Result<PyO
 
 /// `W_CTypeFunc.call` — `oefmt("cannot call null function pointer from cdata '%s'")`.
 #[majit_macros::dont_look_inside]
-pub(crate) fn cannot_call_null(ct: &W_CType) -> PyError {
+pub(crate) fn cannot_call_null(ct: &W_CType) -> PyObjectRef {
     PyError::runtime_error(format!(
         "cannot call null function pointer from cdata '{}'",
         ct.name()
     ))
+    .to_exc_object()
 }
 
 /// `W_CTypeFunc.call` — `oefmt("'%s' expects %d arguments, got %d")`.
 #[majit_macros::dont_look_inside]
-pub(crate) fn wrong_nargs(ct: &W_CType, expected: usize, got: usize) -> PyError {
+pub(crate) fn wrong_nargs(ct: &W_CType, expected: usize, got: usize) -> PyObjectRef {
     PyError::type_error(format!(
         "'{}' expects {} arguments, got {}",
         ct.name(),
         expected,
         got
     ))
+    .to_exc_object()
 }
 
 /// `len(self.fargs)` — the declared argument count of a function type.
@@ -254,7 +256,16 @@ fn do_call(ct: &W_CType, funcaddr: usize, args_w: &[PyObjectRef]) -> Result<PyOb
                 Err(e) => break 'body Err(e),
             }
         }
+        // `clibffi.py c_ffi_call` carries `save_err=RFFI_ERR_ALL |
+        // RFFI_ALT_ERRNO`, which swaps the thread's alternate errno into the C
+        // runtime around the foreign call.  Pyre spells that swap as its own
+        // two calls rather than as a flag the callee reads: no backend acts on
+        // the `saveerr` operand `direct_libffi_call` records on
+        // `CALL_RELEASE_GIL` yet (`callbuilder.py write_real_errno` /
+        // `read_real_errno`).
+        super::cerrno::errno_before();
         unsafe { jit_ffi_call(cif, funcaddr, buffer) };
+        super::cerrno::errno_after();
         let resultdata = cdataobj::raw_ptradd(buffer, unsafe { exchange_result(cif) });
         unsafe { ctypeobj::copy_and_convert_to_object(fresult, resultdata) }
     };
@@ -311,7 +322,9 @@ fn do_call_fargs(
                 Err(e) => break 'body Err(e),
             }
         }
+        super::cerrno::errno_before();
         unsafe { jit_ffi_call(cif, funcaddr, buffer) };
+        super::cerrno::errno_after();
         let resultdata = cdataobj::raw_ptradd(buffer, unsafe { exchange_result(cif) });
         unsafe { ctypeobj::copy_and_convert_to_object(fresult, resultdata) }
     };
