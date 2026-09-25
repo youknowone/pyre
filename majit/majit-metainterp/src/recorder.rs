@@ -363,7 +363,7 @@ fn untag_snapshot_pools(
 }
 
 /// Untag one snapshot word and rewrite it into the prepare cache's namespace.
-fn snapshot_box_from_tagged(
+fn snapshot_box_from_tagged<'c>(
     tagged: i64,
     inputargs: &[InputArgRc],
     slots: &[FrontendSlot],
@@ -371,8 +371,8 @@ fn snapshot_box_from_tagged(
     refs: &[u64],
     floats: &[u64],
     bigints: &[i64],
-    unique_cache: &[Option<Operand>],
-) -> crate::resume::SnapshotBox {
+    unique_cache: &'c [Option<Operand>],
+) -> (crate::resume::SnapshotBox, Option<&'c Operand>) {
     let decoded = untag_snapshot_pools(
         inputargs,
         slots,
@@ -383,7 +383,13 @@ fn snapshot_box_from_tagged(
         tagged,
     );
     let snap_box = crate::pyjitpl::snapshot_tagged_to_box(&decoded, inputargs);
-    snap_box.map_opref(|opref| crate::pyjitpl::translate_trace_iter_opref(opref, unique_cache))
+    // opencoder.py `SnapshotIterator._untag` returns `_cache[i]`, the box
+    // object itself.
+    let cached = crate::pyjitpl::trace_iter_cached_box(snap_box.opref(), unique_cache);
+    (
+        snap_box.map_opref(|opref| crate::pyjitpl::translate_trace_iter_opref(opref, unique_cache)),
+        cached,
+    )
 }
 
 /// One byte-mode bridge's resume source.

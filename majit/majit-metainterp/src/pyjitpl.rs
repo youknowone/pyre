@@ -1419,6 +1419,20 @@ pub(crate) fn translate_trace_iter_opref(
     translated
 }
 
+/// opencoder.py `TraceIterator._get(i)`: the box object `_cache[i]` holds
+/// for a recorded position, or `None` for a constant / absent slot.
+pub(crate) fn trace_iter_cached_box(
+    opref: OpRef,
+    cache: &[Option<majit_ir::operand::Operand>],
+) -> Option<&majit_ir::operand::Operand> {
+    if opref.is_none() || opref.is_constant() {
+        return None;
+    }
+    cache
+        .get(opref.raw() as usize)
+        .and_then(|slot| slot.as_ref())
+}
+
 fn translate_trace_iter_box_map(
     mut box_map: SnapshotBoxes,
     cache: &[Option<majit_ir::operand::Operand>],

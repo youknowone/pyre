@@ -5027,6 +5027,9 @@ impl Optimizer {
         _start_pass: usize,
         ctx: &mut OptContext,
     ) -> Result<(), crate::optimize::InvalidLoop> {
+        if ctx.extra_operations_after.is_empty() {
+            return Ok(());
+        }
         // RPython `send_extra_operation` walks the list in place. Take the
         // queued deque instead of copying each entry into a fresh one.
         let pending = std::mem::take(&mut ctx.extra_operations_after);

@@ -16,6 +16,7 @@ use majit_backend::{
     ExitFrameLayout, ExitPendingFieldLayout, ExitRecoveryLayout, ExitValueSourceLayout,
     ExitVirtualLayout, FailArgSource,
 };
+use majit_ir::operand::Operand;
 use majit_ir::{Const, GcRef, OpRef, Type};
 
 /// resume.py:656-670: element kind from arraydescr.
@@ -4235,7 +4236,7 @@ impl ResumeDataLoopMemo {
         env: &dyn BoxEnv,
     ) -> Result<(), TagOverflow> {
         for snapshot_box in boxes {
-            self._number_one(*snapshot_box, numb_state, env)?;
+            self._number_one(*snapshot_box, None, numb_state, env)?;
         }
         Ok(())
     }
@@ -4246,9 +4247,14 @@ impl ResumeDataLoopMemo {
     /// (`iter_vable_array` / `iter_vref_array` / `iter_array`) and numbers it
     /// before the next box is decoded. Callers that already hold a slice use
     /// `_number_boxes`; the byte-bridge walk calls this directly.
+    ///
+    /// `cached` is the box object `TraceIterator._cache` holds for the slot
+    /// when the caller has it (`SnapshotIterator._untag` hands out that
+    /// object), so the replacement walk starts from the box itself.
     fn _number_one(
         &mut self,
         snapshot_box: SnapshotBox,
+        cached: Option<&Operand>,
         numb_state: &mut NumberingState,
         env: &dyn BoxEnv,
     ) -> Result<(), TagOverflow> {
@@ -4264,7 +4270,29 @@ impl ResumeDataLoopMemo {
             numb_state.append_short(self.getconst(bits, raw_opref.ty().unwrap())?);
             return Ok(());
         }
-        let b = env.get_box_replacement_operand(raw_opref);
+        let b = match cached {
+            Some(cached) => {
+                let b = cached.get_box_replacement(false);
+                // An unregistered position mints a fresh box on every
+                // positional lookup, so only a registered one has an answer
+                // to compare against.
+                #[cfg(debug_assertions)]
+                {
+                    let positional = env.get_box_replacement_operand(raw_opref);
+                    if positional.same_box(&env.get_box_replacement_operand(raw_opref)) {
+                        debug_assert!(
+                            b.same_box(&positional),
+                            "_number_one {raw_opref:?}: cached box resolves to {:?}, \
+                             position resolves to {:?}",
+                            b.to_opref(),
+                            positional.to_opref()
+                        );
+                    }
+                }
+                b
+            }
+            None => env.get_box_replacement_operand(raw_opref),
+        };
         let opref = b.to_opref();
         if opref.is_none() {
             numb_state.append_short(NULLREF);
@@ -4325,15 +4353,16 @@ impl ResumeDataLoopMemo {
     /// stored in the resume bytes). `frames` is
     /// `(jitcode_index, pc, box_count)`. `next_vable`, `next_vref`,
     /// and `next_frame_box` are pulled that many times, in that order —
-    /// the same order `SnapshotIterator` yields.
-    pub(crate) fn number_sections(
+    /// the same order `SnapshotIterator` yields. Each pull may also hand
+    /// out the slot's `TraceIterator._cache` box (see [`Self::_number_one`]).
+    pub(crate) fn number_sections<'c>(
         &mut self,
         vable_len: i64,
-        mut next_vable: impl FnMut() -> SnapshotBox,
+        mut next_vable: impl FnMut() -> (SnapshotBox, Option<&'c Operand>),
         vref_len: i64,
-        mut next_vref: impl FnMut() -> SnapshotBox,
+        mut next_vref: impl FnMut() -> (SnapshotBox, Option<&'c Operand>),
         frames: &[(i32, i32, usize)],
-        mut next_frame_box: impl FnMut() -> SnapshotBox,
+        mut next_frame_box: impl FnMut() -> (SnapshotBox, Option<&'c Operand>),
         env: &dyn BoxEnv,
         minimum_virtualizable_size: i64,
     ) -> Result<NumberingState, TagOverflow> {
@@ -4371,14 +4400,16 @@ impl ResumeDataLoopMemo {
         // resume.py number: virtualizable array, identity-first, unchanged.
         numb_state.append_int(vable_len);
         for _ in 0..vable_len.max(0) as usize {
-            self._number_one(next_vable(), &mut numb_state, env)?;
+            let (snapshot_box, cached) = next_vable();
+            self._number_one(snapshot_box, cached, &mut numb_state, env)?;
         }
 
         // resume.py number: virtualref array. The stored count is pairs.
         debug_assert!(vref_len & 1 == 0, "vref_array length must be even");
         numb_state.append_int(vref_len >> 1);
         for _ in 0..vref_len.max(0) as usize {
-            self._number_one(next_vref(), &mut numb_state, env)?;
+            let (snapshot_box, cached) = next_vref();
+            self._number_one(snapshot_box, cached, &mut numb_state, env)?;
         }
 
         // resume.py number: frame chain.
@@ -4387,7 +4418,8 @@ impl ResumeDataLoopMemo {
             numb_state.append_int(jitcode_index as i64);
             numb_state.append_int(pc as i64);
             for _ in 0..nboxes {
-                self._number_one(next_frame_box(), &mut numb_state, env)?;
+                let (snapshot_box, cached) = next_frame_box();
+                self._number_one(snapshot_box, cached, &mut numb_state, env)?;
             }
         }
 
@@ -4452,13 +4484,13 @@ impl ResumeDataLoopMemo {
             || {
                 let snap_box = vable_array[vable_i];
                 vable_i += 1;
-                snap_box
+                (snap_box, None)
             },
             vref_array.len() as i64,
             || {
                 let snap_box = vref_array[vref_i];
                 vref_i += 1;
-                snap_box
+                (snap_box, None)
             },
             &frame_meta,
             || {
@@ -4468,7 +4500,7 @@ impl ResumeDataLoopMemo {
                 }
                 let snap_box = frames[frame_i].2[box_i];
                 box_i += 1;
-                snap_box
+                (snap_box, None)
             },
             env,
             minimum_virtualizable_size,
