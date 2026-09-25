@@ -66,6 +66,20 @@ pub fn encode_jit_bigint_result(value: *mut BigInt) -> JitBigIntResult {
     value as usize as i64
 }
 
+/// Inverse of [`encode_jit_bigint_result`]. Native `JitBigIntResult` is already
+/// the payload pointer; wasm32 stores that pointer in an i64 word.
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+pub fn decode_jit_bigint_result(value: JitBigIntResult) -> *mut BigInt {
+    value
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline]
+pub fn decode_jit_bigint_result(value: JitBigIntResult) -> *mut BigInt {
+    value as usize as *mut BigInt
+}
+
 /// Payload size and traced-field offsets of the `tuple2` of two rbigints.
 pub const BIGINT_PAIR_SIZE: usize = majit_rlib::rbigint::RBIGINT_PAIR_SIZE;
 pub const BIGINT_PAIR_ITEM0_OFFSET: usize = majit_rlib::rbigint::RBIGINT_PAIR_ITEM0_OFFSET;

@@ -1087,12 +1087,17 @@ unsafe fn long_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         return Ok(w_long_new(w_long_get_value(b).int_add(w_int_get_value(a))));
     }
     debug_assert!(is_long(a) && is_long(b));
-    // `rbigint.add` is `@jit.elidable` and already returns the other operand
-    // when either sign is 0. A traced `is_zero` test here becomes a guard on
-    // the concrete remainder of the traced iteration (`q * d + r` in
-    // `side_exit_contracts`), which fails on the next non-zero remainder and
-    // compiles a bridge. Leave the test inside the elidable call.
-    Ok(w_long_new(w_long_get_value(a).add(w_long_get_value(b))))
+    // `rbigint.add` (`@jit.elidable`) returns the other operand when either
+    // sign is 0. The traced `is_zero` test guarded the concrete remainder of
+    // `q * d + r` and compiled a bridge on the next non-zero remainder.
+    // `jit_bigint_add` keeps that alias and returns the payload pointer;
+    // `descr_add` only wraps it.
+    Ok(pyre_object::longobject::w_long_from_raw(
+        pyre_object::longobject::decode_jit_bigint_result(jit_bigint_add(
+            w_long_get_raw_value(a) as i64,
+            w_long_get_raw_value(b) as i64,
+        )),
+    ))
 }
 
 unsafe fn long_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
