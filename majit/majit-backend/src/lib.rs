@@ -29,6 +29,16 @@ pub fn take_null_mem_access() -> bool {
     NULL_MEM_ACCESS.with(|cell| cell.replace(false))
 }
 
+/// `rstr.STR` / `symbolic.get_field_token(..., 'hash')`: hash word at 0.
+pub const BUILTIN_STRING_HASH_OFFSET: usize = 0;
+/// `symbolic.get_array_token(rstr.STR).ofs_length`: length word after the hash.
+pub const BUILTIN_STRING_LEN_OFFSET: usize = std::mem::size_of::<usize>();
+/// First `chars[]` byte. `get_array_token` basesize counts `extra_item_after_alloc`,
+/// so chars sit at `basesize - 1` (`strgetsetitem_token`).
+pub const BUILTIN_STRING_CHARS_OFFSET: usize = 2 * std::mem::size_of::<usize>();
+/// STR token basesize: hash + length + the extra NUL (`rstr.STR` `extra_item_after_alloc`).
+pub const BUILTIN_STR_TOKEN_BASE_SIZE: usize = 2 * std::mem::size_of::<usize>() + 1;
+
 /// `rpython.rlib.rjitlog.redirect_assembler` — assemblers import
 /// `rjitlog` directly.  The writer lives in `majit-metainterp` (crate
 /// split of `rlib/rjitlog`); backends call this and the metainterp

@@ -2633,27 +2633,69 @@ fn thin_with_stamp(thin: u64, stamp: u32) -> Option<u64> {
     intern_thin_stamped(vtable_id, stamp, 0, 0).and_then(|id| thin_stamped_payload_word(data, id))
 }
 
-fn intern_thin_stamped(vtable: u8, stamp: u32, data: usize, fwd_tag: u8) -> Option<u64> {
-    let mut v = THIN_STAMPED.lock().unwrap_or_else(|e| e.into_inner());
+/// Refuse a new thin-stamp id once `len` has reached `limit`.
+/// `THIN_STAMPED_ID_LIMIT` is the production limit; tests pass a local
+/// table and the same limit without publishing into [`THIN_STAMPED`].
+fn thin_stamped_id_available(len: usize, limit: usize) -> bool {
+    len < limit
+}
+
+fn intern_thin_stamped_on(
+    table: &mut ThinStampedTable,
+    limit: usize,
+    vtable: u8,
+    stamp: u32,
+    data: usize,
+    fwd_tag: u8,
+    install: impl FnOnce(usize, ThinStamped),
+) -> Option<u64> {
     let key = ThinStamped {
         vtable,
         stamp,
         data,
         fwd_tag,
     };
-    if let Some(&i) = v.index.get(&key) {
+    if let Some(&i) = table.index.get(&key) {
         return Some(i as u64);
     }
     // Stop before id `0x1FFE`. The slot array still covers the whole
     // 13-bit mask so a word stamped under the old limit can be read.
-    if v.len >= THIN_STAMPED_ID_LIMIT as usize {
+    if !thin_stamped_id_available(table.len, limit) {
         return None;
     }
-    let i = v.len;
-    let _ = THIN_STAMPED_SLOTS[i].set(key);
-    v.len += 1;
-    v.index.insert(key, i);
+    let i = table.len;
+    install(i, key);
+    table.len += 1;
+    table.index.insert(key, i);
     Some(i as u64)
+}
+
+fn intern_thin_stamped(vtable: u8, stamp: u32, data: usize, fwd_tag: u8) -> Option<u64> {
+    let mut v = THIN_STAMPED.lock().unwrap_or_else(|e| e.into_inner());
+    intern_thin_stamped_on(
+        &mut v,
+        THIN_STAMPED_ID_LIMIT as usize,
+        vtable,
+        stamp,
+        data,
+        fwd_tag,
+        |i, key| {
+            let _ = THIN_STAMPED_SLOTS[i].set(key);
+        },
+    )
+}
+
+/// Stamp did not fit in the thin word. Box it, keeping `w`'s descr.
+fn box_thin_stamp_word(slot: &DescrSlot, w: u64, stamp: u32) {
+    unsafe {
+        *slot.word.get() = 0;
+    }
+    let boxed = alloc_thin_stamp(w, stamp);
+    debug_assert_eq!(boxed as usize & 7, 0);
+    debug_assert_eq!(boxed as u64 & !THIN_DESCR_PTR_MASK, 0);
+    unsafe {
+        *slot.word.get() = boxed as u64 | SLOT_STAMP_BOX_BIT;
+    }
 }
 
 fn thin_with_forwarded(thin: u64, packed: u64) -> Option<u64> {
@@ -2970,15 +3012,7 @@ impl DescrSlot {
             }
             // Keep the ThinFwd box; wrap it in ThinStamp (16 B) instead
             // of promoting to a 24 B DescrWords + DescrFwd.
-            unsafe {
-                *self.word.get() = 0;
-            }
-            let boxed = alloc_thin_stamp(w, stamp);
-            debug_assert_eq!(boxed as usize & 7, 0);
-            debug_assert_eq!(boxed as u64 & !THIN_DESCR_PTR_MASK, 0);
-            unsafe {
-                *self.word.get() = boxed as u64 | SLOT_STAMP_BOX_BIT;
-            }
+            box_thin_stamp_word(self, w, stamp);
             return;
         }
         if w & SLOT_BOX_BIT != 0 {
@@ -3035,15 +3069,7 @@ impl DescrSlot {
         }
         // Thin descr / extra / both / inline forwarded: 16 B ThinStamp,
         // not a 24 B DescrWords.
-        unsafe {
-            *self.word.get() = 0;
-        }
-        let boxed = alloc_thin_stamp(w, stamp);
-        debug_assert_eq!(boxed as usize & 7, 0);
-        debug_assert_eq!(boxed as u64 & !THIN_DESCR_PTR_MASK, 0);
-        unsafe {
-            *self.word.get() = boxed as u64 | SLOT_STAMP_BOX_BIT;
-        }
+        box_thin_stamp_word(self, w, stamp);
     }
 
     fn write_thin_fwd(&self, thin: u64, forwarded: u64) {
@@ -6612,7 +6638,6 @@ mod tests {
         assert!(!super::is_stamp_inline(readable));
         assert_eq!(readable & super::THIN_DESCR_PTR_MASK, payload);
 
-        let thin = payload | super::THIN_DESCR_BIT;
         // `pack_stamp` of an out-of-range int is `STAMP_WIDE | (id << 2)`.
         // The first ids fit the 6-bit thin field and never consult the
         // intern table. Advance until the stamp must intern.
@@ -6623,31 +6648,32 @@ mod tests {
             stamp = super::pack_stamp(crate::value::Value::Int(probe));
         }
 
-        // `intern_thin_stamped` refuses once `len` hits
-        // `THIN_STAMPED_ID_LIMIT`, after the index hit. Raise `len` only.
-        // `THIN_STAMPED_SLOTS` is write-once: a dummy `set` survives any
-        // later rewind, the next intern's `set` fails, and
-        // `thin_stamped_at` reads the dummy.
-        let saved_len = {
-            let mut table = super::THIN_STAMPED
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let saved = table.len;
-            table.len = super::THIN_STAMPED_ID_LIMIT as usize;
-            saved
+        // Refusal is decided against a local table at the production
+        // limit. The process-global `THIN_STAMPED` stays untouched, so a
+        // parallel test can intern a new key during this window.
+        let mut local = super::ThinStampedTable {
+            len: super::THIN_STAMPED_ID_LIMIT as usize,
+            index: rustc_hash::FxHashMap::default(),
         };
-        let refused = super::thin_with_stamp(thin, stamp).is_none();
+        let mut installed = false;
+        let refused = super::intern_thin_stamped_on(
+            &mut local,
+            super::THIN_STAMPED_ID_LIMIT as usize,
+            1,
+            stamp,
+            0,
+            0,
+            |_, _| installed = true,
+        )
+        .is_none();
+        assert!(!installed);
+        assert_eq!(local.len, super::THIN_STAMPED_ID_LIMIT as usize);
         let descr = crate::make_loop_target_descr(12, false);
         let op = Op::with_descr(OpCode::GetfieldGcI, &[], descr.clone());
-        op.set_value(crate::value::Value::Int(probe));
+        let word = op.descr.word();
+        super::box_thin_stamp_word(&op.descr, word, stamp);
         let promoted_descr = op.descr.borrow();
         let promoted_value = op.get_value();
-        {
-            let mut table = super::THIN_STAMPED
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            table.len = saved_len;
-        }
         assert!(refused);
         assert!(std::sync::Arc::ptr_eq(
             &promoted_descr.expect("promoted stamp keeps the descr"),

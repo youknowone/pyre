@@ -18,8 +18,6 @@ use majit_backend::{
 };
 use majit_ir::{Const, GcRef, OpRef, Type};
 
-pub type LiveboxTypeMap = indexmap::IndexMap<majit_ir::OpRef, majit_ir::Type, FxBuildHasher>;
-
 /// resume.py:656-670: element kind from arraydescr.
 /// 0=ref (is_array_of_pointers), 1=int, 2=float (is_array_of_floats).
 fn array_kind_from_descr(arraydescr: Option<&majit_ir::DescrRef>) -> u8 {
@@ -239,17 +237,6 @@ pub struct NumberingState {
     pub liveboxes: LiveboxMap,
     pub num_boxes: i32,
     pub num_virtuals: i32,
-    /// RPython Box.type parity: type of each TAGBOX livebox, captured at
-    /// numbering time when env.get_type() is called. Eliminates the need
-    /// for post-hoc type inference cascades in store_final_boxes_in_guard.
-    ///
-    /// Keyed by the typed OpRef (resoperation.py:719-739 InputArg{Int,
-    /// Ref,Float}, resoperation.py:564-638 *Op mixins) so that
-    /// `InputArgRef(0)` and `RefOp(0)` do not collapse onto the same
-    /// raw u32 — pyre's flat-OpRef stand-in for PyPy's `box is box`
-    /// identity. See `LiveboxMap` for the matching typed-key
-    /// convention.
-    pub livebox_types: LiveboxTypeMap,
 }
 
 impl NumberingState {
@@ -259,9 +246,6 @@ impl NumberingState {
             liveboxes: LiveboxMap::new(),
             num_boxes: 0,
             num_virtuals: 0,
-            // At most one entry per numbered box, and `size` counts the
-            // boxes, so the table never rehashes mid-guard.
-            livebox_types: indexmap::IndexMap::with_capacity_and_hasher(size, FxBuildHasher),
         }
     }
     pub fn append_short(&mut self, item: i16) {
@@ -3501,7 +3485,6 @@ pub struct ResumeDataLoopMemo {
     ordered_livebox_scratch: Vec<majit_ir::operand::Operand>,
     livebox_map_scratch: LiveboxMap,
     new_livebox_map_scratch: LiveboxMap,
-    livebox_types_scratch: LiveboxTypeMap,
     virtual_fields_scratch: indexmap::IndexMap<majit_ir::OpRef, majit_ir::VirtualFieldsInfo>,
     virtual_worklist_scratch: Vec<majit_ir::OpRef>,
 }
@@ -3522,7 +3505,6 @@ impl ResumeDataLoopMemo {
             ordered_livebox_scratch: Vec::new(),
             livebox_map_scratch: LiveboxMap::new(),
             new_livebox_map_scratch: LiveboxMap::new(),
-            livebox_types_scratch: LiveboxTypeMap::default(),
             virtual_fields_scratch: indexmap::IndexMap::new(),
             virtual_worklist_scratch: Vec::new(),
         }
@@ -3541,7 +3523,6 @@ impl ResumeDataLoopMemo {
         self.nvreused = 0;
         self.livebox_map_scratch.clear();
         self.new_livebox_map_scratch.clear();
-        self.livebox_types_scratch.clear();
         self.virtual_fields_scratch.clear();
         self.virtual_worklist_scratch.clear();
     }
@@ -3569,19 +3550,6 @@ impl ResumeDataLoopMemo {
         map.clear();
         if map.entries.capacity() > self.new_livebox_map_scratch.entries.capacity() {
             self.new_livebox_map_scratch = map;
-        }
-    }
-
-    fn take_livebox_types(&mut self) -> LiveboxTypeMap {
-        let mut types = std::mem::take(&mut self.livebox_types_scratch);
-        types.clear();
-        types
-    }
-
-    pub fn recycle_livebox_types(&mut self, mut types: LiveboxTypeMap) {
-        types.clear();
-        if types.capacity() > self.livebox_types_scratch.capacity() {
-            self.livebox_types_scratch = types;
         }
     }
 
@@ -4348,26 +4316,9 @@ impl ResumeDataLoopMemo {
             numb_state.num_virtuals += 1;
             t
         } else {
-            // RPython Box.type parity: capture type alongside TAGBOX
-            // assignment. This is the equivalent of Box.type being
-            // intrinsic — the type is determined once at numbering time.
-            //
-            // Typed OpRef variants (InputArg{Int,Ref,Float} and the *Op
-            // mixins) carry the type intrinsically (variant tag IS
-            // RPython Box class identity). The `livebox_types`
-            // HashMap is a legacy side-table that must agree with
-            // `opref.ty()`; a divergence would indicate an
-            // encoder/decoder mismatch we want to fail-loud on. Remove the
-            // side-table once all consumers use the intrinsic type.
-            if let Some(intrinsic_tp) = opref.ty() {
-                debug_assert_eq!(
-                    intrinsic_tp, box_type,
-                    "livebox numbering: typed OpRef {:?} intrinsic type {:?} \
-                     disagrees with snapshot/env type {:?}",
-                    opref, intrinsic_tp, box_type
-                );
-            }
-            numb_state.livebox_types.insert(opref, box_type);
+            // resume.py `_number_boxes` reads `box.type` off the box.
+            // `box_type` above is `opref.ty()` (Operand::type_ / OpRef::ty),
+            // with `env.get_type` only when the variant carries no tag.
             let t = tag(numb_state.num_boxes, TAGBOX)?;
             numb_state.num_boxes += 1;
             t
@@ -4408,14 +4359,11 @@ impl ResumeDataLoopMemo {
         };
         writer.current.clear();
         writer.current.reserve(size_hint);
-        let mut livebox_types = self.take_livebox_types();
-        livebox_types.reserve(size_hint);
         let mut numb_state = NumberingState {
             writer,
             liveboxes: self.take_livebox_map(),
             num_boxes: 0,
             num_virtuals: 0,
-            livebox_types,
         };
 
         // resume.py number: patch later
@@ -4626,9 +4574,9 @@ impl ResumeDataLoopMemo {
     /// `optimizer_knowledge`: bridgeopt.py serialize_optimizer_knowledge.
     ///   Heap field triples and known-class info for bridge compilation.
     ///
-    /// Returns `(rd_numb, rd_consts, rd_virtuals, liveboxes, livebox_types)`.
-    /// `livebox_types` maps typed OpRef → Type, captured at numbering time
-    /// (RPython Box.type parity).
+    /// Returns `(rd_numb, rd_consts, rd_virtuals, liveboxes)`.
+    /// `resume.py` `_number_boxes` keeps `numb_state.liveboxes` and reads
+    /// `box.type` off each box. There is no type dict.
     #[expect(
         clippy::type_complexity,
         reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
@@ -4645,7 +4593,6 @@ impl ResumeDataLoopMemo {
             Arc<majit_ir::SharedConstPool>,
             Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>,
             Vec<majit_ir::operand::Operand>,
-            LiveboxTypeMap,
         ),
         TagOverflow,
     > {
@@ -4873,21 +4820,7 @@ impl ResumeDataLoopMemo {
         self.return_virtual_fields(virtual_fields);
         self.return_virtual_worklist(virtual_worklist);
 
-        // Merge livebox_types: numbering-time types + types for boxes
-        // discovered during virtual field walking.
-        let mut all_livebox_types = numb_state.livebox_types;
-        for b in &ordered_liveboxes {
-            if !b.is_none() {
-                all_livebox_types.insert(b.to_opref(), b.type_());
-            }
-        }
-        Ok((
-            rd_numb,
-            rd_consts,
-            rd_virtuals,
-            ordered_liveboxes,
-            all_livebox_types,
-        ))
+        Ok((rd_numb, rd_consts, rd_virtuals, ordered_liveboxes))
     }
 
     /// resume.py finish (on ResumeDataVirtualAdder) — encode with shared pool.
@@ -5837,7 +5770,7 @@ mod tests {
             ],
         );
         let numb_state = memo.number(&snapshot, &env, -1).unwrap();
-        let (rd_numb, rd_consts, _rd_virtuals, liveboxes, _livebox_types) =
+        let (rd_numb, rd_consts, _rd_virtuals, liveboxes) =
             memo.finish(numb_state, &env, &mut [], None).unwrap();
 
         // liveboxes should contain only TAGBOX entries: OpRef::int_op(1) and OpRef::int_op(3)
@@ -5942,12 +5875,13 @@ mod tests {
         // `_number_boxes` inserts the canonical replacement producer.
         assert_eq!(
             numb_state
-                .livebox_types
-                .get_index(0)
-                .map(|(opref, _)| *opref),
+                .liveboxes
+                .iter()
+                .next()
+                .map(|(op, _)| op.to_opref()),
             Some(collapsed),
         );
-        let (rd_numb, rd_consts, _rd_virtuals, liveboxes, _livebox_types) =
+        let (rd_numb, rd_consts, _rd_virtuals, liveboxes) =
             memo.finish(numb_state, &env, &mut [], None).unwrap();
 
         // resume.py `_number_boxes` keys the canonical replacement object.
@@ -5991,12 +5925,12 @@ mod tests {
 
         let first = Snapshot::single_frame(0, 1, vec![OpRef::const_int(1)]);
         let first_state = memo.number(&first, &env, -1).unwrap();
-        let (_, first_pool, _, _, _) = memo.finish(first_state, &env, &mut [], None).unwrap();
+        let (_, first_pool, _, _) = memo.finish(first_state, &env, &mut [], None).unwrap();
         assert!(first_pool.is_empty());
 
         let second = Snapshot::single_frame(0, 2, vec![OpRef::const_int(100_000)]);
         let second_state = memo.number(&second, &env, -1).unwrap();
-        let (_, second_pool, _, _, _) = memo.finish(second_state, &env, &mut [], None).unwrap();
+        let (_, second_pool, _, _) = memo.finish(second_state, &env, &mut [], None).unwrap();
 
         assert!(std::sync::Arc::ptr_eq(&first_pool, &second_pool));
         assert_eq!(first_pool.as_slice(), &[majit_ir::Const::Int(100_000)]);

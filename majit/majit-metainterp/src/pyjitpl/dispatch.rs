@@ -11091,6 +11091,73 @@ where
                 let value = ctx.is_likely_virtual(opref) as i64;
                 self.set_int_reg(dest, Some(ctx.const_int(value)), Some(value));
             }
+            // `blackhole.py` `bhimpl_strlen` / `pyjitpl.py` strlen recording.
+            // Encoding `strlen/r>i`: [string_reg u8][dst u8]. Concrete length
+            // is `Backend::bh_strlen` (the `rstr.STR` length word). `Cpu::bh_strlen`
+            // returns `None` unless `str_descr` is registered, and the example
+            // cpu does not register one; the compiled load still uses
+            // `inject_builtin_string_descrs`.
+            jitcode::insns::BC_STRLEN => {
+                let (src, dst) = {
+                    let frame = self.frames.current_mut();
+                    let src = frame.next_reg() as usize;
+                    let dst = frame.next_reg() as usize;
+                    (src, dst)
+                };
+                let (string, addr) = self.read_ref_reg(src);
+                assert_ne!(addr, 0, "strlen: null string");
+                let value = unsafe {
+                    ((addr as usize).wrapping_add(std::mem::size_of::<usize>()) as *const usize)
+                        .read_unaligned() as i64
+                };
+                let opref = ctx.execute_and_record(
+                    Some(self.cpu.as_ref()),
+                    OpCode::Strlen,
+                    None,
+                    &[string],
+                    Some(majit_ir::Value::Int(value)),
+                    self.last_exception_value,
+                );
+                self.set_int_reg(dst, Some(opref), Some(value));
+            }
+            // `blackhole.py` `bhimpl_strgetitem`. Encoding `strgetitem/ri>i`:
+            // [string_reg u8][index_reg u8][dst u8].
+            jitcode::insns::BC_STRGETITEM => {
+                let (src, index_reg, dst) = {
+                    let frame = self.frames.current_mut();
+                    let src = frame.next_reg() as usize;
+                    let index_reg = frame.next_reg() as usize;
+                    let dst = frame.next_reg() as usize;
+                    (src, index_reg, dst)
+                };
+                let (string, addr) = self.read_ref_reg(src);
+                let (index, index_value) = self.read_int_reg(index_reg);
+                assert_ne!(addr, 0, "strgetitem: null string");
+                let len = unsafe {
+                    ((addr as usize).wrapping_add(std::mem::size_of::<usize>()) as *const usize)
+                        .read_unaligned() as i64
+                };
+                assert!(
+                    index_value >= 0 && index_value < len,
+                    "strgetitem: index {index_value} outside 0..{len}"
+                );
+                let chars = 2 * std::mem::size_of::<usize>();
+                let value = unsafe {
+                    ((addr as usize)
+                        .wrapping_add(chars)
+                        .wrapping_add(index_value as usize) as *const u8)
+                        .read_unaligned() as i64
+                };
+                let opref = ctx.execute_and_record(
+                    Some(self.cpu.as_ref()),
+                    OpCode::Strgetitem,
+                    None,
+                    &[string, index],
+                    Some(majit_ir::Value::Int(value)),
+                    self.last_exception_value,
+                );
+                self.set_int_reg(dst, Some(opref), Some(value));
+            }
             other => panic!("unknown jitcode bytecode {other}"),
         }
 

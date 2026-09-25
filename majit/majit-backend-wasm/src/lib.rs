@@ -2315,12 +2315,10 @@ pub fn rewrite_ops_for_gc_with(
     for (&k, &v) in constants {
         const_map.insert(k, majit_ir::Const::from_raw_i64(v, majit_ir::Type::Int));
     }
-    let (rewritten, new_constants, gcrefs) =
-        rewriter.rewrite_for_gc_with_constants(&boxed, &const_map);
-    let mut out_constants = indexmap::IndexMap::new();
-    for (k, c) in new_constants {
-        out_constants.insert(k, c.as_raw_i64());
-    }
+    let (rewritten, gcrefs) = rewriter.rewrite_for_gc_with_constants(&boxed, &const_map);
+    // `resolve_constant` only reads the pool, so the caller's i64 map is
+    // the map the next pass should see.
+    let out_constants = constants.clone();
     let ops: Vec<Op> = rewritten.iter().map(|rc| (**rc).clone()).collect();
     let table = (!gcrefs.is_empty()).then(|| majit_gc::GcTable::from_gcrefs(&gcrefs));
     let gc_table_base = table.as_ref().map_or(0, |t| t.base_addr() as u32);

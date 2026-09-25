@@ -368,6 +368,10 @@ pub enum StateFieldKind {
     /// int bank.
     #[allow(dead_code)]
     Ref(syn::Path),
+    /// RPython `str` red (`rstr.STR`). One ref inputarg, same bank as
+    /// `ref(T)`. `ll_strlen` / `ll_strgetitem` on it record `Strlen` /
+    /// `Strgetitem` (`jtransform.py` `rewrite_op_getinteriorfield`).
+    Str,
 }
 
 /// Reject a path declared in two of the mutually exclusive call vocabularies.
@@ -1397,8 +1401,11 @@ fn parse_state_fields(input: ParseStream) -> syn::Result<StateFieldsConfig> {
         } else {
             // Scalar forms: `int`, `int(<TypePath>)`, `float`,
             // `float(<TypePath>)`, or `opaque(TypePath)`.
-            let head: Ident = content.parse()?;
-            if head == "opaque" {
+            // `str` is a keyword, so `Ident::parse` rejects `s: str`.
+            let head = syn::Ident::parse_any(&content)?;
+            if head == "str" {
+                StateFieldKind::Str
+            } else if head == "opaque" {
                 let inner;
                 syn::parenthesized!(inner in content);
                 let type_path: syn::Path = inner.parse()?;
@@ -1424,7 +1431,7 @@ fn parse_state_fields(input: ParseStream) -> syn::Result<StateFieldsConfig> {
                     format!(
                         "state_fields scalar `{name}` uses unsupported type `{head}`; \
                          supported: `int`, `int(<TypePath>)`, `float`, \
-                         `float(<TypePath>)`, `opaque(TypePath)`"
+                         `float(<TypePath>)`, `opaque(TypePath)`, `str`"
                     ),
                 ));
             }
@@ -4291,6 +4298,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_state_fields_accepts_str_red() {
+        let tokens: proc_macro2::TokenStream = parse_quote! {
+            {
+                pos: int,
+                s: str,
+            }
+        };
+        let parsed = syn::parse2::<StateFieldsWrapper>(tokens).unwrap().0;
+        assert!(matches!(
+            parsed.fields[0].kind,
+            StateFieldKind::Scalar { .. }
+        ));
+        assert!(matches!(parsed.fields[1].kind, StateFieldKind::Str));
+    }
+
     fn parse_state_fields_accepts_ref_scalar() {
         let tokens: proc_macro2::TokenStream = parse_quote! {
             {

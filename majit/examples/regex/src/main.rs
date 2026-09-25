@@ -32,6 +32,7 @@ pub mod gc;
 pub mod interp;
 pub mod jit_interp;
 pub mod regex;
+pub mod rstr;
 pub mod shortcircuit;
 
 #[cfg(feature = "alloc-census")]

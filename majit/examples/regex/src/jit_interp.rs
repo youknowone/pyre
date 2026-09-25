@@ -37,12 +37,12 @@
 //!
 //! ```text
 //! 194 ops: 0 getfield_gc_r, 24 getfield_gc_i, 93 setfield_gc,
-//!          2 int_eq, 0 guard_value, 1 getarrayitem_gc_i
+//!          2 int_eq, 0 guard_value, 1 strgetitem
 //! ```
 //!
 //! Not one pointer read: the 92 edges of the tree walk are gone. 93 stores is
 //! one mark per node, so every node is in the trace. The promote and the
-//! input buffer's base pointer are loop invariant and sit in the preamble. And
+//! string pointer are loop invariant and sit in the preamble. And
 //! `2 int_eq` for 46 `Char` nodes is the subset construction itself — a node
 //! whose incoming mark the optimizer proved constant zero has nothing to
 //! compare, so its comparison is not in the loop at all.
@@ -54,8 +54,8 @@
 //! enough to read line by line — and the test below reproduces it op for op,
 //! same ops in the same order, on both backends. Ours is that listing minus
 //! two reads: the repetition's mark, which the preamble reads once and the
-//! back edge then carries in a register, and `len(s0)`, which is a red state
-//! field here and so arrives as a loop argument. 15 ops per character, and
+//! back edge then carries in a register, and `len(s0)`, which `OptPure`
+//! hoists when `s` is invariant. 15 ops per character, and
 //! no `getfield_gc_i` at all.
 
 use crate::regex::{KIND_ALTERNATIVE, KIND_CHAR, KIND_REPETITION, KIND_SEQUENCE, NodeRec};
@@ -112,25 +112,12 @@ pub type Bytecode = [u8];
 /// dispatch on it; `pc` stays 0 so the green key is the regex.
 pub const PROGRAM: [u8; 1] = [0];
 
-/// The input string, as a headerless buffer plus its length.
-///
-/// It is reached through a `ref` state field and read with `array_fields`, NOT
-/// carried as an `[int; virt]` state array: a virtualizable array's elements
-/// ride every guard's `vable_array` resume section, so the snapshot would be
-/// O(input length) — past 32767 characters that overflows the tagged short a
-/// resume entry is written as (`resumecode.py Writer.append_int`).
-#[repr(C)]
-struct Input {
-    data: *mut u8,
-    len: i64,
-}
-
+/// `marked.py` `match` reds: position, running result, the `rstr.STR`.
 struct MatchState {
-    /// The input buffer.
-    inp: usize,
     pos: i64,
-    len: i64,
     result: i64,
+    /// `rstr.STR` pointer (`ll_strlen` / `ll_strgetitem`).
+    s: usize,
 }
 
 pub static COMPILES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -162,12 +149,10 @@ pub static GUARD_FAILURE_PROBE: std::sync::atomic::AtomicBool =
     env = Bytecode,
     greens = [pc, program, root: ref],
     state_fields = {
-        inp: ref(Input),
         pos: int,
-        len: int,
         result: int,
+        s: str,
     },
-    array_fields = { Input::data => u8 },
     ref_fields = {
         NodeRec::left => NodeRec,
         NodeRec::right => NodeRec,
@@ -185,24 +170,22 @@ fn mainloop(
     program: &Bytecode,
     mut driver: &mut JitDriver<MatchState>,
     root: usize,
-    inp: usize,
-    len: i64,
+    s: usize,
     first: i64,
 ) -> i64 {
     let mut pc: usize = 0;
     let mut state = MatchState {
-        inp,
         pos: 1i64,
-        len,
         result: first,
+        s,
     };
     // marked.py: first char is outside; the header tick is what
     // `rewrite_can_enter_jit` inserts in front of `jit_merge_point`.
-    while state.pos < state.len {
+    // `while i < len(s)` records `Strlen`; `ord(s[i])` records `Strgetitem`.
+    while state.pos < crate::rstr::ll_strlen(state.s) {
         can_enter_jit!(driver, 0usize, &mut state, program, || {});
         jit_merge_point!(driver, program, pc; state);
-        let idx = state.pos as usize;
-        let c = state.inp.data[idx] as i64;
+        let c = crate::rstr::ll_strgetitem(state.s, state.pos);
         state.result = shift(root, c, false) as i64;
         state.pos = state.pos + 1i64;
     }
@@ -240,10 +223,9 @@ impl Matcher {
         {
             use majit_metainterp::JitState as _;
             MatchState {
-                inp: 0,
                 pos: 0,
-                len: 0,
                 result: 0,
+                s: 0,
             }
             .build_meta(0, &PROGRAM)
             .install_canonical_liveness(&mut driver);
@@ -259,16 +241,12 @@ impl Matcher {
         let result = if s.len() == 1 {
             first
         } else {
-            let mut input = Input {
-                data: s.as_ptr() as *mut u8,
-                len: s.len() as i64,
-            };
+            let input = crate::rstr::RpyStr::from_bytes(s);
             mainloop(
                 &PROGRAM,
                 &mut self.driver,
                 self.root as usize,
-                &mut input as *mut Input as usize,
-                input.len,
+                input.as_usize(),
                 first,
             )
         };
@@ -484,10 +462,10 @@ mod tests {
              supposed to fold; body={body:?}"
         );
         assert_eq!(
-            n(OpCode::GetarrayitemGcI),
+            n(OpCode::Strgetitem),
             1,
-            "one character is read per pass and the buffer base is loop \
-             invariant, so exactly one array read belongs here; body={body:?}"
+            "one character is read per pass and the string is loop \
+             invariant, so exactly one strgetitem belongs here; body={body:?}"
         );
         assert_eq!(
             n(OpCode::GuardValue),
@@ -509,10 +487,7 @@ mod tests {
     /// `Label` carries: the loop's arguments.
     const POST_BODY: [(OpCode, &str); 15] = [
         (OpCode::Label, "[i0, result0, s0]  # arguments"),
-        (
-            OpCode::GetarrayitemGcI,
-            "char = s0[i0]      # read character",
-        ),
+        (OpCode::Strgetitem, "char = s0[i0]      # read character"),
         (OpCode::IntEq, "i7 = char == 'a'"),
         (OpCode::IntAnd, "i8 = i5 & i7"),
         (OpCode::IntEq, "i10 = char == 'b'"),
@@ -542,8 +517,8 @@ mod tests {
          and passes it into the label, and the store at the bottom of each \
          pass forwards to the next one's read, so the mark rides the back \
          edge in a register instead of being reloaded",
-        "i18 = len(s0)  -- the length is a red state field, so it is a loop \
-         argument here and never a read at all",
+        "i18 = len(s0)  -- strlen(s) is pure and s is invariant, so OptPure \
+         hoists it and the length rides the back edge",
     ];
 
     /// The RPython spelling of an opcode: `SetfieldGc` prints as `setfield_gc`,
@@ -622,7 +597,7 @@ mod tests {
 
         let n = |op: OpCode| body.iter().filter(|o| **o == op).count();
         assert_eq!(
-            n(OpCode::GetarrayitemGcI),
+            n(OpCode::Strgetitem),
             1,
             "the post reads the character once per pass and so should this; \
              more than one means the buffer base or the index stopped being \

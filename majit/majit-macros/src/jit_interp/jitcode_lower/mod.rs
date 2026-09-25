@@ -1225,6 +1225,13 @@ impl LowererConfig {
                         ref_scalars.insert(f.name.to_string(), (ref_scalar_idx, p.clone()));
                         ref_scalar_idx += 1;
                     }
+                    // `str` is a ref inputarg with no heap class. The path is
+                    // only stored so the slot shares `state_ref_scalars`.
+                    StateFieldKind::Str => {
+                        let path: syn::Path = syn::parse_quote!(rpy_string);
+                        ref_scalars.insert(f.name.to_string(), (ref_scalar_idx, path));
+                        ref_scalar_idx += 1;
+                    }
                 }
             }
             (scalars, arrays, virt_arrays, ref_scalars, float_scalars)

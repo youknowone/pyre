@@ -1146,14 +1146,14 @@ extern "C" fn jit_reacquire_gil_shim() {
 // (b) emitting a 2-load indirection in the backend.
 
 /// `symbolic.get_field_token(rstr.STR/UNICODE, 'hash', ...).offset`.
-const BUILTIN_STRING_HASH_OFFSET: usize = 0;
+const BUILTIN_STRING_HASH_OFFSET: usize = majit_backend::BUILTIN_STRING_HASH_OFFSET;
 /// `symbolic.get_field_token(..., 'hash', ...).size` — assert == WORD at
 /// rewrite.py:286,292.
 const BUILTIN_STRING_HASH_SIZE: usize = std::mem::size_of::<usize>();
 /// `symbolic.get_array_token(...).ofs_length`.
-const BUILTIN_STRING_LEN_OFFSET: usize = std::mem::size_of::<usize>();
+const BUILTIN_STRING_LEN_OFFSET: usize = majit_backend::BUILTIN_STRING_LEN_OFFSET;
 /// STR token `basesize` — header + extra_item_after_alloc.
-const BUILTIN_STR_TOKEN_BASE_SIZE: usize = 2 * std::mem::size_of::<usize>() + 1;
+const BUILTIN_STR_TOKEN_BASE_SIZE: usize = majit_backend::BUILTIN_STR_TOKEN_BASE_SIZE;
 /// UNICODE token `basesize` — header only.
 const BUILTIN_UNICODE_TOKEN_BASE_SIZE: usize = 2 * std::mem::size_of::<usize>();
 /// Byte offset of the first `chars[]` slot at runtime, for backend tests
@@ -9808,7 +9808,6 @@ impl CraneliftBackend {
         &mut self,
         inputargs: &[InputArgRc],
         ops: &[Op],
-        constants: &majit_ir::ConstMap<majit_ir::Const>,
     ) -> (Vec<Op>, Vec<GcRef>) {
         let mut normalized = normalize_ops_for_codegen_simple(inputargs, ops);
         inject_builtin_string_descrs(&mut normalized);
@@ -9817,18 +9816,10 @@ impl CraneliftBackend {
             // The rewriter takes/returns `OpRc`; cranelift still owns a
             // `Vec<Op>` past this boundary, so wrap and unwrap here.
             let boxed: Vec<OpRc> = normalized.into_iter().map(OpRc::new).collect();
-            // The rewriter takes the typed `Const` pool directly; each box
-            // variant carries its own type (`Const::get_type`).
-            let (result, new_constants, gcrefs) =
-                rewriter.rewrite_for_gc_with_constants(&boxed, constants);
+            // `RewriteState::const_int` emits fresh `ConstInt`s inline, so
+            // the borrowed pool is not extended.
+            let (result, gcrefs) = rewriter.rewrite_for_gc_with_constants(&boxed, &self.constants);
             let result: Vec<Op> = result.iter().map(|rc| (**rc).clone()).collect();
-            // rewrite.py creates fresh ConstInt boxes for sizes, offsets
-            // and helper addresses; `new_constants` is the full typed pool.
-            // Pre-existing keys `or_insert`-no-op, keeping their original
-            // `Const`.
-            for (k, c) in new_constants {
-                self.constants.entry(k).or_insert(c);
-            }
             (result, gcrefs)
         }
     }
@@ -10114,8 +10105,7 @@ impl CraneliftBackend {
         caller_layout: Option<&ExitRecoveryLayout>,
     ) -> Result<CompiledLoop, BackendError> {
         validate_call_assembler_rewrite_prereqs(ops)?;
-        let (owner_prepared, gcrefs) =
-            self.prepare_ops_for_compile(inputargs, ops, &self.constants.clone());
+        let (owner_prepared, gcrefs) = self.prepare_ops_for_compile(inputargs, ops);
         let ops = owner_prepared.as_slice();
         // assembler.py:793-824 parity: build the per-loop gc_table from
         // the rewrite's reference-constant list. Its base address is baked

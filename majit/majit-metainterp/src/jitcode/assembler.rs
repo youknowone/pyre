@@ -1949,6 +1949,30 @@ impl JitCodeBuilder {
     ///
     /// Used by the dispatch JitCode body to encode `let opcode = program[pc]`
     /// (pyopcode.py:171 `ord(co_code[next_instr])`).
+    /// `blackhole.py` `bhimpl_strlen`: `[string_reg][dst]`, `strlen/r>i`.
+    ///
+    /// Records `OpCode::Strlen` on `rstr.STR` (hash, length, chars). No descr
+    /// byte: `inject_builtin_string_descrs` stamps `str_descr` at compile.
+    pub fn strlen(&mut self, dst: u16, string_reg: u16) {
+        self.touch_ref_reg(string_reg);
+        self.touch_reg(dst);
+        self.write_insn("strlen/r>i");
+        self.push_reg_u8(string_reg, "strlen string");
+        self.push_reg_u8(dst, "strlen dst");
+    }
+
+    /// `blackhole.py` `bhimpl_strgetitem`: `[string_reg][index_reg][dst]`,
+    /// `strgetitem/ri>i`.
+    pub fn strgetitem(&mut self, dst: u16, string_reg: u16, index_reg: u16) {
+        self.touch_ref_reg(string_reg);
+        self.touch_reg(index_reg);
+        self.touch_reg(dst);
+        self.write_insn("strgetitem/ri>i");
+        self.push_reg_u8(string_reg, "strgetitem string");
+        self.push_reg_u8(index_reg, "strgetitem index");
+        self.push_reg_u8(dst, "strgetitem dst");
+    }
+
     pub fn getarrayitem_gc_i(&mut self, dst: u16, array_reg: u16, index_reg: u16, descr_idx: u16) {
         self.touch_ref_reg(array_reg);
         self.touch_reg(index_reg);

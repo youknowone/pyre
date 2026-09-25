@@ -370,6 +370,11 @@ impl<'c> Lowerer<'c> {
             Expr::Unary(ExprUnary { op, expr, .. }) => self.lower_unary(op, expr),
             Expr::Binary(binary) => self.lower_binary(binary),
             Expr::Call(call) => {
+                // `jtransform.py` `rewrite_op_getinteriorfield`: `len(s)` /
+                // `s[i]` on an RPython `str` become `strlen` / `strgetitem`.
+                if let Some(binding) = self.lower_rstr_call(call) {
+                    return Some(binding);
+                }
                 // jtransform.py rewrite_op_hint: promote → int_guard_value
                 if let Some(binding) = self.lower_promote_call(call) {
                     return Some(binding);
@@ -1205,6 +1210,66 @@ impl<'c> Lowerer<'c> {
     fn declared_return_struct(&self, func: &Expr) -> Option<syn::Path> {
         let segments = canonical_expr_segments(func)?;
         self.config?.call_returns.get(&segments).cloned()
+    }
+
+    /// `ll_strlen(s)` / `ll_strgetitem(s, i)` on a `str` red.
+    ///
+    /// Real functions so the interpreter fallback compiles; the trace records
+    /// `OpCode::Strlen` / `OpCode::Strgetitem` instead of a residual call.
+    /// `jtransform.py` `rewrite_op_getinteriorfield` emits the same ops for
+    /// `rstr.STR`.
+    fn lower_rstr_call(&mut self, call: &ExprCall) -> Option<Binding> {
+        let segs = canonical_expr_segments(&call.func)?;
+        let name = segs.last()?.as_str();
+        match (name, call.args.len()) {
+            ("ll_strlen", 1) => {
+                let arg = self.lower_value_expr(&call.args[0])?;
+                if arg.kind != BindingKind::Ref {
+                    return None;
+                }
+                let reg = self.alloc_reg();
+                let src = arg.reg;
+                self.emit_op(
+                    OpMeta::linear(
+                        OpKind::UnaryI,
+                        vec![Register::ref_(src)],
+                        vec![Register::int(reg)],
+                    ),
+                    quote! { __builder.strlen(#reg, #src); },
+                );
+                Some(Binding {
+                    reg,
+                    kind: BindingKind::Int,
+                    depends_on_stack: arg.depends_on_stack,
+                    struct_type: None,
+                })
+            }
+            ("ll_strgetitem", 2) => {
+                let string = self.lower_value_expr(&call.args[0])?;
+                let index = self.lower_value_expr(&call.args[1])?;
+                if string.kind != BindingKind::Ref || index.kind != BindingKind::Int {
+                    return None;
+                }
+                let reg = self.alloc_reg();
+                let src = string.reg;
+                let idx = index.reg;
+                self.emit_op(
+                    OpMeta::linear(
+                        OpKind::UnaryI,
+                        vec![Register::ref_(src), Register::int(idx)],
+                        vec![Register::int(reg)],
+                    ),
+                    quote! { __builder.strgetitem(#reg, #src, #idx); },
+                );
+                Some(Binding {
+                    reg,
+                    kind: BindingKind::Int,
+                    depends_on_stack: string.depends_on_stack || index.depends_on_stack,
+                    struct_type: None,
+                })
+            }
+            _ => None,
+        }
     }
 
     pub(super) fn lower_call_value(&mut self, call: &ExprCall) -> Option<Binding> {

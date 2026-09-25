@@ -224,14 +224,16 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 // opaque(T) fields are pass-through; the JIT does not
                 // enumerate them as inputargs, so any T is allowed. ref(T) is
                 // a ref-typed scalar (usize carrier), also any T.
-                StateFieldKind::Opaque(_) | StateFieldKind::Ref(_) => return None,
+                StateFieldKind::Opaque(_) | StateFieldKind::Ref(_) | StateFieldKind::Str => {
+                    return None;
+                }
             };
             (!supported).then_some(rendered)
         })
         .collect();
     if !unsupported_fields.is_empty() {
         let message = format!(
-            "state_fields supports int, float, [int], [int; virt], [float; virt], ref(T), and opaque(T); unsupported: {}",
+            "state_fields supports int, float, [int], [int; virt], [float; virt], ref(T), opaque(T), and str; unsupported: {}",
             unsupported_fields.join(", ")
         );
         return quote! {
@@ -278,7 +280,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         .fields
         .iter()
         .enumerate()
-        .filter(|(_, f)| matches!(f.kind, StateFieldKind::Ref(_)))
+        .filter(|(_, f)| matches!(f.kind, StateFieldKind::Ref(_) | StateFieldKind::Str))
         .collect();
     let mut float_scalars: Vec<_> = sf
         .fields
