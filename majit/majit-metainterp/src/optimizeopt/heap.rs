@@ -749,7 +749,7 @@ impl ArrayCachedItem {
 /// 1:1.
 struct ArrayCacheSubMap {
     /// heap.py: const_indexes = {} (int -> ArrayCachedItem)
-    const_indexes: indexmap::IndexMap<i64, ArrayCachedItem>,
+    const_indexes: crate::FxIndexMap<i64, ArrayCachedItem>,
     /// heap.py:305-306: cached_varindex_triples = None
     /// List of (arrayinfo, indexbox, resbox). RPython uses Python object
     /// identity for arrayinfo; majit uses the canonical array OpRef.
@@ -759,7 +759,7 @@ struct ArrayCacheSubMap {
 impl ArrayCacheSubMap {
     fn new() -> Self {
         ArrayCacheSubMap {
-            const_indexes: indexmap::IndexMap::new(),
+            const_indexes: crate::FxIndexMap::default(),
             cached_varindex_triples: None,
         }
     }
@@ -872,7 +872,7 @@ pub struct OptHeap {
     /// keyed by operand identity (`Rc::ptr_eq`) — box identity, not the retired
     /// `opref.raw()` slot index. OptHeap ownership preserves `setup()`'s per-run
     /// reset, which a per-box flag on a shared `Box` could not bulk-clear.
-    unescaped: indexmap::IndexSet<Operand>,
+    unescaped: crate::FxIndexSet<Operand>,
     /// heapcache.py:209/298-307/453-455 `box._heapc_deps` — per-Box
     /// dependency list. RPython attaches `_heapc_deps: list | None`
     /// as an attribute on the `RefFrontendOp` Box object itself;
@@ -881,7 +881,7 @@ pub struct OptHeap {
     /// the value is recorded as a dependency of the container instead
     /// of being immediately escaped. When the container escapes later,
     /// all its dependencies are transitively escaped.
-    heapc_deps: indexmap::IndexMap<Operand, Vec<Operand>>,
+    heapc_deps: crate::FxIndexMap<Operand, Vec<Operand>>,
 
     /// heap.py:27 Optimization.last_emitted_operation is REMOVED.
     /// Set to true when `_optimize_CALL_DICT_LOOKUP` folds a lookup;
@@ -891,7 +891,7 @@ pub struct OptHeap {
     /// Consecutive dict lookups on the same dict+key are deduplicated.
     /// Inner key uses `DictArgKey` so Const args compare by value
     /// (util.py args_dict / args_eq via history.py same_box).
-    cached_dict_reads: indexmap::IndexMap<usize, indexmap::IndexMap<[DictArgKey; 2], OpRef>>,
+    cached_dict_reads: crate::FxIndexMap<usize, crate::FxIndexMap<[DictArgKey; 2], OpRef>>,
     /// heap.py:560: corresponding_array_descrs — maps extradescrs[1] (entries
     /// array descr) → extradescrs[0] dict identity.
     ///
@@ -902,13 +902,13 @@ pub struct OptHeap {
     /// happen via `descr.get_ei_index()` at `force_from_effectinfo`.
     /// The map key is the descriptor object's identity; `descr.index()` is
     /// not globally unique across descriptor objects.
-    corresponding_array_descrs: indexmap::IndexMap<usize, (DescrRef, usize)>,
+    corresponding_array_descrs: crate::FxIndexMap<usize, (DescrRef, usize)>,
     /// Fields known to be quasi-immutable: (obj box, field_idx) -> cached value
     /// OpRef. Keyed by the object's `Operand` identity (heap keys structs by box,
     /// not by the retired `opref.raw()` slot). Populated by QUASIIMMUT_FIELD,
     /// consumed by subsequent GETFIELD_GC_*. Survives calls (guarded by
     /// GUARD_NOT_INVALIDATED).
-    quasi_immut_cache: indexmap::IndexMap<(Operand, usize), OpRef>,
+    quasi_immut_cache: crate::FxIndexMap<(Operand, usize), OpRef>,
 }
 
 impl OptHeap {
@@ -920,12 +920,12 @@ impl OptHeap {
             seen_guard_not_invalidated: false,
             postponed_op: None,
             seen_allocation: BitSet::new(),
-            unescaped: indexmap::IndexSet::new(),
-            heapc_deps: indexmap::IndexMap::new(),
+            unescaped: crate::FxIndexSet::default(),
+            heapc_deps: crate::FxIndexMap::default(),
             last_emitted_removed: false,
-            cached_dict_reads: indexmap::IndexMap::new(),
-            corresponding_array_descrs: indexmap::IndexMap::new(),
-            quasi_immut_cache: indexmap::IndexMap::new(),
+            cached_dict_reads: crate::FxIndexMap::default(),
+            corresponding_array_descrs: crate::FxIndexMap::default(),
+            quasi_immut_cache: crate::FxIndexMap::default(),
         }
     }
 
@@ -1746,7 +1746,7 @@ impl OptHeap {
         // re-register and diverge from RPython.
         if !self.cached_dict_reads.contains_key(&descr1_id) {
             self.cached_dict_reads
-                .insert(descr1_id, indexmap::IndexMap::new());
+                .insert(descr1_id, crate::FxIndexMap::default());
             self.corresponding_array_descrs
                 .insert(descr_identity(&descr2), (descr2, descr1_id));
         }

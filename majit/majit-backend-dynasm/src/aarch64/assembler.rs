@@ -553,7 +553,7 @@ pub struct AssemblerARM64<'a> {
     /// displacement to the recovery stub it binds that label to.  The earliest
     /// branch is the one that has to reach furthest, and a label with no entry
     /// was never branched to in the short form.
-    short_guard_branch_offsets: IndexMap<DynamicLabel, usize>,
+    short_guard_branch_offsets: IndexMap<DynamicLabel, usize, rustc_hash::FxBuildHasher>,
     /// `(branch offset, stub offset)` for every short guard branch whose stub
     /// landed outside `b.cond`'s forward reach.  Read by `check_guard_reach`.
     guard_reach_violations: Vec<(usize, usize)>,
@@ -564,7 +564,7 @@ pub struct AssemblerARM64<'a> {
 
     /// x86/assembler.py:93 target_tokens_currently_compiling parity.
     /// Keyed by descriptor pointer identity (PyPy uses Python `is`).
-    target_tokens_currently_compiling: IndexMap<usize, DynamicLabel>,
+    target_tokens_currently_compiling: IndexMap<usize, DynamicLabel, rustc_hash::FxBuildHasher>,
     compiled_target_tokens: Vec<majit_ir::DescrRef>,
     /// llmodel.py:64-69 self.vtable_offset — typeptr field byte offset.
     /// `None` corresponds to RPython's gcremovetypeptr config.
@@ -809,10 +809,10 @@ impl<'a> AssemblerARM64<'a> {
             guard_success_cc: None,
             pending_cmp_cc: None,
             long_guard_branch: false,
-            short_guard_branch_offsets: IndexMap::new(),
+            short_guard_branch_offsets: IndexMap::with_hasher(rustc_hash::FxBuildHasher),
             guard_reach_violations: Vec::new(),
             unrelocated_jump_target: None,
-            target_tokens_currently_compiling: IndexMap::new(),
+            target_tokens_currently_compiling: IndexMap::with_hasher(rustc_hash::FxBuildHasher),
             compiled_target_tokens: Vec::new(),
             vtable_offset,
             subclassrange_min_offset,

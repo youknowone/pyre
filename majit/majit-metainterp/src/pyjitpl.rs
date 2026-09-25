@@ -621,7 +621,7 @@ pub(crate) struct CompiledTrace {
     /// Static exit metadata for each guard/finish in this trace.
     pub(crate) exit_layouts: crate::FxIndexMap<u32, StoredExitLayout>,
     /// Static exit metadata for terminal FINISH/JUMP ops, keyed by op index.
-    pub(crate) terminal_exit_layouts: indexmap::IndexMap<usize, StoredExitLayout>,
+    pub(crate) terminal_exit_layouts: crate::FxIndexMap<usize, StoredExitLayout>,
 }
 
 #[derive(Debug, Clone)]
@@ -1896,8 +1896,8 @@ fn densify_root_loop_inputargs(
     args: &[OpRef],
     ops: Vec<majit_ir::OpRc>,
 ) -> (Vec<InputArgRc>, Vec<majit_ir::OpRc>) {
-    let mut replacements: indexmap::IndexMap<OpRef, majit_ir::InputArgRc> =
-        indexmap::IndexMap::new();
+    let mut replacements: crate::FxIndexMap<OpRef, majit_ir::InputArgRc> =
+        crate::FxIndexMap::default();
     let inputargs = args
         .iter()
         .enumerate()
@@ -2333,7 +2333,7 @@ pub struct MetaInterp<M: Clone> {
     /// Lets a bridge that closes on a merge point resolve the procedure token
     /// of the loop living AT that merge point (pyjitpl.py:3005), which the
     /// `u64` key alone cannot be inverted to.
-    pub(crate) loop_header_greens: indexmap::IndexMap<u64, (Vec<i64>, Vec<i64>, Vec<i64>)>,
+    pub(crate) loop_header_greens: crate::FxIndexMap<u64, (Vec<i64>, Vec<i64>, Vec<i64>)>,
     /// Keys whose compiled loop came from a cross-loop CUT (compile.py:269-270,
     /// `TraceCtx::cut_inner_green_key`), rather than from a loop closing at its
     /// own header.
@@ -2365,7 +2365,7 @@ pub struct MetaInterp<M: Clone> {
     /// so an entry that has not run the discarded prefix loads and stores out
     /// of bounds. Only the cutting trace's own closing JUMP arrives with those
     /// facts proven.
-    pub(crate) cut_compiled_keys: indexmap::IndexSet<u64>,
+    pub(crate) cut_compiled_keys: crate::FxIndexSet<u64>,
     /// The [`Self::cut_compiled_keys`] entry the running `compile_loop_body`
     /// recorded on the way in, kept so `compile_loop` can retire it when the
     /// body returns without installing a loop.
@@ -2620,7 +2620,7 @@ pub struct MetaInterp<M: Clone> {
     /// even when Phase 2 raises InvalidLoop. Indexed by `green_key`; entries
     /// are added on InvalidLoop and removed when the next retrace succeeds,
     /// so the active set is bounded by the count of in-flight retraces.
-    pending_preamble_tokens: indexmap::IndexMap<u64, Vec<crate::history::TargetToken>>,
+    pending_preamble_tokens: crate::FxIndexMap<u64, Vec<crate::history::TargetToken>>,
     // pyjitpl.py `self.staticdata.all_descrs = self.cpu.setup_descrs()` now
     // lives on MetaInterpStaticData (RPython `metainterp_sd.all_descrs`).
     // Access via `self.staticdata.all_descrs()`.
@@ -2836,7 +2836,7 @@ pub struct MetaInterp<M: Clone> {
     /// Memoized symbolic names for boxes (debug/log output only).
     /// Pyre uses simple `OpRef → String` mapping; populated lazily by
     /// the on-demand log formatter.
-    pub box_names_memo: indexmap::IndexMap<OpRef, String>,
+    pub box_names_memo: crate::FxIndexMap<OpRef, String>,
 
     /// pyjitpl.py `self.trace_length_at_last_tco = -1`.
     ///
@@ -4133,7 +4133,8 @@ impl<M: Clone> MetaInterp<M> {
             self.backend
                 .compiled_trace_fail_descr_layouts(token, trace_id)
         }) {
-            let mut merged: indexmap::IndexMap<u32, CompiledExitLayout> = indexmap::IndexMap::new();
+            let mut merged: crate::FxIndexMap<u32, CompiledExitLayout> =
+                crate::FxIndexMap::default();
             for layout in exit_layouts.drain(..) {
                 merged.insert(layout.fail_index, layout);
             }
@@ -4184,8 +4185,8 @@ impl<M: Clone> MetaInterp<M> {
             self.backend
                 .compiled_trace_terminal_exit_layouts(token, trace_id)
         }) {
-            let mut merged: indexmap::IndexMap<usize, CompiledTerminalExitLayout> =
-                indexmap::IndexMap::new();
+            let mut merged: crate::FxIndexMap<usize, CompiledTerminalExitLayout> =
+                crate::FxIndexMap::default();
             for layout in terminal_exit_layouts.drain(..) {
                 merged.insert(layout.op_index, layout);
             }
@@ -4235,8 +4236,8 @@ impl<M: Clone> MetaInterp<M> {
             compiled_loops: crate::FxIndexMap::default(),
             compiled_loops_generation: 0,
             compiled_graph_minor_scan_pending: true,
-            loop_header_greens: indexmap::IndexMap::new(),
-            cut_compiled_keys: indexmap::IndexSet::new(),
+            loop_header_greens: crate::FxIndexMap::default(),
+            cut_compiled_keys: crate::FxIndexSet::default(),
             speculative_cut_owned_key: None,
             tracing: None,
             compile_tracing: None,
@@ -4283,7 +4284,7 @@ impl<M: Clone> MetaInterp<M> {
             cached_optimizer: None,
             retrace_after_bridge: false,
             keep_tracing_after_close: false,
-            pending_preamble_tokens: indexmap::IndexMap::new(),
+            pending_preamble_tokens: crate::FxIndexMap::default(),
             pending_frontend_boxes: None,
             pending_frontend_box_types: None,
             cpu: crate::cpu::default_cpu(),
@@ -4310,7 +4311,7 @@ impl<M: Clone> MetaInterp<M> {
             class_of_last_exc_is_const: false,
             forced_virtualizable: 0,
             ovf_flag: false,
-            box_names_memo: indexmap::IndexMap::new(),
+            box_names_memo: crate::FxIndexMap::default(),
             trace_length_at_last_tco: -1,
             active_trace_session: None,
             bridge_info: None,
@@ -7605,14 +7606,14 @@ impl<M: Clone> MetaInterp<M> {
     pub fn finish_trace_for_parity(
         &mut self,
         finish_args: &[OpRef],
-    ) -> Option<(TreeLoop, indexmap::IndexMap<u32, i64>)> {
+    ) -> Option<(TreeLoop, crate::FxIndexMap<u32, i64>)> {
         self.force_finish_trace = false;
         self.compile_tracing = self.tracing.take();
         let _compile_tracing_guard = CompileTracingGuard::new(&mut self.compile_tracing);
         let ctx = self.compile_tracing.as_mut()?;
         let green_key = ctx.green_key;
         ctx.finish(finish_args, crate::make_fail_descr(finish_args.len()));
-        let constants = indexmap::IndexMap::new();
+        let constants = crate::FxIndexMap::default();
         let ctx = self.compile_tracing.take().unwrap();
         let trace = ctx.into_tree_loop();
         self.warm_state.abort_tracing(green_key, false);
@@ -8365,8 +8366,8 @@ impl<M: Clone> MetaInterp<M> {
                 eprint!("{}", majit_ir::format_trace(trace_ops, &constants));
             } else {
                 eprintln!("  [trace too large for full dump, showing op counts]");
-                let mut counts: indexmap::IndexMap<majit_ir::OpCode, usize> =
-                    indexmap::IndexMap::new();
+                let mut counts: crate::FxIndexMap<majit_ir::OpCode, usize> =
+                    crate::FxIndexMap::default();
                 for op in trace_ops {
                     *counts.entry(op.opcode).or_insert(0) += 1;
                 }
@@ -8954,8 +8955,8 @@ impl<M: Clone> MetaInterp<M> {
                 (1.0 - compiled_ops.len() as f64 / num_ops_before as f64) * 100.0
             );
             if crate::diag_enabled() {
-                let mut counts: indexmap::IndexMap<majit_ir::OpCode, usize> =
-                    indexmap::IndexMap::new();
+                let mut counts: crate::FxIndexMap<majit_ir::OpCode, usize> =
+                    crate::FxIndexMap::default();
                 for op in &compiled_ops {
                     *counts.entry(op.opcode).or_insert(0) += 1;
                 }
@@ -8985,8 +8986,8 @@ impl<M: Clone> MetaInterp<M> {
                 // looks for, which is indistinguishable from a trace that really
                 // contains none.
                 crate::debug::debug_print("[trace too large for full dump, showing op counts]");
-                let mut counts: indexmap::IndexMap<majit_ir::OpCode, usize> =
-                    indexmap::IndexMap::new();
+                let mut counts: crate::FxIndexMap<majit_ir::OpCode, usize> =
+                    crate::FxIndexMap::default();
                 for op in &compiled_ops {
                     *counts.entry(op.opcode).or_insert(0) += 1;
                 }
@@ -15880,8 +15881,7 @@ impl<M: Clone> MetaInterp<M> {
         if jump_arg_oprefs.is_empty() {
             return jump_arg_oprefs;
         }
-        let mut concrete: std::collections::HashMap<OpRef, Value> =
-            std::collections::HashMap::new();
+        let mut concrete: rustc_hash::FxHashMap<OpRef, Value> = rustc_hash::FxHashMap::default();
         for ia in bridge_inputargs {
             if let Some(v) = ia.get_value() {
                 concrete.insert(OpRef::input_arg_typed(ia.index, ia.tp.get()), v);
@@ -21663,7 +21663,7 @@ pub struct MetaInterpStaticData {
     /// across the metainterp / trace / bridge pipelines (mirroring
     /// `all_descrs` above).
     pub dispatch_array_descr_cache:
-        parking_lot::Mutex<indexmap::IndexMap<DispatchArrayDescrKey, DescrRef>>,
+        parking_lot::Mutex<crate::FxIndexMap<DispatchArrayDescrKey, DescrRef>>,
     /// pyjitpl.py `self.profiler = ProfilerClass()` —
     /// `metainterp_sd.profiler` is the shared counter sink hit from
     /// every metainterp / optimizer / heapcache / tracer site
@@ -21697,13 +21697,13 @@ pub struct MetaInterpStaticData {
 #[derive(Debug, Default)]
 pub struct MetaInterpGlobalData {
     /// pyjitpl.py:2308-2318 `addr2name`: `fnaddr → name` for debugging.
-    pub addr2name: Option<indexmap::IndexMap<usize, String>>,
-    /// pyjitpl.py bytecode_for_address `indirectcall_dict`: `fnaddr → JitCode`.
+    pub addr2name: Option<crate::FxIndexMap<usize, String>>,
+    /// pyjitpl.py:2326-2343 `indirectcall_dict`: `fnaddr → JitCode`.
     /// Stores the current runtime-adapter `JitCode`; the helper that
     /// builds this dict is intentionally type-agnostic so canonical
     /// codewriter jitcodes can reuse the same semantics.
     pub indirectcall_dict:
-        Option<indexmap::IndexMap<usize, std::sync::Arc<crate::jitcode::JitCode>>>,
+        Option<crate::FxIndexMap<usize, std::sync::Arc<crate::jitcode::JitCode>>>,
     /// pyjitpl.py `initialized` — guards `_setup_once` so the
     /// runtime side-effects (profiler start, jitlog setup) fire once.
     pub initialized: bool,
@@ -21712,8 +21712,8 @@ pub struct MetaInterpGlobalData {
 fn build_indirectcall_dict<T>(
     targets: &[std::sync::Arc<T>],
     fnaddr_of: impl Fn(&T) -> usize,
-) -> indexmap::IndexMap<usize, std::sync::Arc<T>> {
-    let mut d: indexmap::IndexMap<usize, std::sync::Arc<T>> = indexmap::IndexMap::new();
+) -> crate::FxIndexMap<usize, std::sync::Arc<T>> {
+    let mut d: crate::FxIndexMap<usize, std::sync::Arc<T>> = crate::FxIndexMap::default();
     for jitcode in targets {
         let fnaddr = fnaddr_of(jitcode);
         debug_assert!(
@@ -21727,7 +21727,7 @@ fn build_indirectcall_dict<T>(
 
 fn bytecode_for_address_in_targets<T>(
     targets: &[std::sync::Arc<T>],
-    cache: &mut Option<indexmap::IndexMap<usize, std::sync::Arc<T>>>,
+    cache: &mut Option<crate::FxIndexMap<usize, std::sync::Arc<T>>>,
     fnaddress: usize,
     fnaddr_of: impl Fn(&T) -> usize,
 ) -> Option<std::sync::Arc<T>> {
@@ -21761,7 +21761,7 @@ fn unique_effect_info_snapshots(
 ) -> (Vec<majit_ir::EffectInfo>, Vec<DescrRef>) {
     let mut owned_eis = Vec::new();
     let mut writeback_descrs = Vec::new();
-    let mut seen_eis: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut seen_eis: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
     for d in all_descrs {
         if let Some(cd) = d.as_call_descr() {
             let ei = cd.get_extra_info();
@@ -22625,7 +22625,7 @@ impl MetaInterpStaticData {
     pub fn get_name_from_address(&self, addr: usize) -> String {
         let mut gd = self.globaldata.lock();
         let dict = gd.addr2name.get_or_insert_with(|| {
-            let mut d: indexmap::IndexMap<usize, String> = indexmap::IndexMap::new();
+            let mut d: crate::FxIndexMap<usize, String> = crate::FxIndexMap::default();
             for (i, key) in self._addr2name_keys.iter().enumerate() {
                 if let Some(value) = self._addr2name_values.get(i) {
                     d.insert(*key, value.clone());
@@ -26767,7 +26767,7 @@ mod tests {
                 ops: Vec::new(),
                 constants: majit_ir::ConstMap::default(),
                 exit_layouts,
-                terminal_exit_layouts: indexmap::IndexMap::new(),
+                terminal_exit_layouts: crate::FxIndexMap::default(),
             },
         );
         let mut meta = MetaInterp::<()>::new(1);
@@ -27183,7 +27183,7 @@ mod tests {
                 ops: ops.into_iter().map(OpRc::new).collect(),
                 constants,
                 exit_layouts: crate::FxIndexMap::default(),
-                terminal_exit_layouts: indexmap::IndexMap::new(),
+                terminal_exit_layouts: crate::FxIndexMap::default(),
             },
         );
         // `compile.py` — `send_loop_to_backend` registers the token
@@ -27254,7 +27254,7 @@ mod tests {
                 ops: ops.into_iter().map(OpRc::new).collect(),
                 constants,
                 exit_layouts: crate::FxIndexMap::default(),
-                terminal_exit_layouts: indexmap::IndexMap::new(),
+                terminal_exit_layouts: crate::FxIndexMap::default(),
             },
         );
         // `compile.py` — `send_loop_to_backend` registers the token
@@ -27578,7 +27578,7 @@ mod tests {
                 ops: vec![],
                 constants: majit_ir::ConstMap::default(),
                 exit_layouts,
-                terminal_exit_layouts: indexmap::IndexMap::new(),
+                terminal_exit_layouts: crate::FxIndexMap::default(),
             },
         );
 
@@ -27663,7 +27663,7 @@ mod tests {
                 ops: vec![],
                 constants: majit_ir::ConstMap::default(),
                 exit_layouts,
-                terminal_exit_layouts: indexmap::IndexMap::new(),
+                terminal_exit_layouts: crate::FxIndexMap::default(),
             },
         );
 
@@ -27749,7 +27749,7 @@ mod tests {
                 ops: vec![],
                 constants: majit_ir::ConstMap::default(),
                 exit_layouts,
-                terminal_exit_layouts: indexmap::IndexMap::new(),
+                terminal_exit_layouts: crate::FxIndexMap::default(),
             },
         );
 

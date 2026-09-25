@@ -1586,14 +1586,14 @@ pub struct Trace {
     rooted_refs: Vec<majit_gc::shadow_stack::OwnerRootGuard>,
     /// opencoder.py:483 self._refs_dict — caches addr → index into
     /// `_refs`. Cleared by `tracing_done`.
-    pub _refs_dict: indexmap::IndexMap<u64, u32>,
+    pub _refs_dict: crate::FxIndexMap<u64, u32>,
     /// opencoder.py:484 self._bigints — constant pool for big ints
     /// (> SMALL_INT_STOP). Indexed via `(idx << 1)` in TAGCONSTOTHER
     /// (bit 0 = 0 means bigint).
     pub _bigints: Vec<i64>,
     /// opencoder.py:485 self._bigints_dict — caches value → index.
     /// Cleared by `tracing_done`.
-    pub _bigints_dict: indexmap::IndexMap<i64, u32>,
+    pub _bigints_dict: crate::FxIndexMap<i64, u32>,
     /// opencoder.py:486 self._floats — constant pool for floats. Indexed
     /// via `(idx << 1) | 1` in TAGCONSTOTHER (bit 0 = 1 means float).
     pub _floats: Vec<u64>,
@@ -1698,9 +1698,9 @@ impl Trace {
                 refs
             },
             rooted_refs: Vec::with_capacity(32),
-            _refs_dict: indexmap::IndexMap::with_capacity(32),
+            _refs_dict: crate::FxIndexMap::with_capacity_and_hasher(32, Default::default()),
             _bigints: Vec::new(),
-            _bigints_dict: indexmap::IndexMap::new(),
+            _bigints_dict: crate::FxIndexMap::default(),
             _floats: Vec::new(),
             _snapshot_data: Vec::with_capacity(128),
             _snapshot_array_data: Vec::with_capacity(128),

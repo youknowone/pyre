@@ -133,7 +133,8 @@ pub(crate) fn remap_frame_layout<A: RegallocMoves + ?Sized>(
     tmpreg: Loc,
 ) {
     let mut pending_dests = dst_locations.len() as i32;
-    let mut srccount: IndexMap<i32, i32> = IndexMap::new();
+    let mut srccount: IndexMap<i32, i32, rustc_hash::FxBuildHasher> =
+        IndexMap::with_hasher(rustc_hash::FxBuildHasher);
     for dst in dst_locations {
         // `jump.py:7 assert key not in srccount`. A repeated destination shares
         // one entry while `pending_dests` counts both, so the second one can
@@ -187,7 +188,8 @@ pub(crate) fn remap_frame_layout<A: RegallocMoves + ?Sized>(
             }
         }
         if !progress {
-            let mut sources: IndexMap<i32, Loc> = IndexMap::new();
+            let mut sources: IndexMap<i32, Loc, rustc_hash::FxBuildHasher> =
+                IndexMap::with_hasher(rustc_hash::FxBuildHasher);
             for i in 0..dst_locations.len() {
                 sources.insert(loc_as_key(&dst_locations[i]), src_locations[i]);
             }
@@ -236,7 +238,7 @@ pub(crate) fn remap_frame_layout_mixed<A: RegallocMoves + ?Sized>(
     tmpreg2: Loc,
 ) {
     let mut extrapushes = Vec::new();
-    let mut dst_keys = IndexMap::new();
+    let mut dst_keys = IndexMap::with_hasher(rustc_hash::FxBuildHasher);
     for loc in dst_locations1 {
         dst_keys.insert(loc_as_key(loc), ());
     }

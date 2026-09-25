@@ -110,7 +110,7 @@ fn callee_rca_virtual_state_summary(
         prefix: String,
         node: &crate::optimizeopt::virtualstate::VirtualStateInfoNode,
         out: &mut Vec<String>,
-        seen: &mut IndexSet<usize>,
+        seen: &mut crate::FxIndexSet<usize>,
     ) {
         let key = node as *const _ as usize;
         let kind = match &node.info {
@@ -189,7 +189,7 @@ fn callee_rca_virtual_state_summary(
     }
 
     let mut out = Vec::new();
-    let mut seen = IndexSet::new();
+    let mut seen = crate::FxIndexSet::default();
     for (idx, node) in vs.state.iter().enumerate() {
         walk(format!("state[{idx}]"), node, &mut out, &mut seen);
     }
@@ -1707,7 +1707,7 @@ impl UnrollOptimizer {
                     }
                 }
                 {
-                    let mut visited_force: indexmap::IndexSet<OpRef> = indexmap::IndexSet::new();
+                    let mut visited_force: crate::FxIndexSet<OpRef> = crate::FxIndexSet::default();
                     // `shortpreamble.py:250` keeps the produced short boxes in a
                     // DICT and looks them up by box (`:284`, `:312`, `:338`,
                     // `:347`). pyre held a list and rescanned it per argument,
@@ -1728,7 +1728,7 @@ impl UnrollOptimizer {
                     // is just `source != resolved(source)` -- decidable once,
                     // here. `or_insert` keeps the FIRST entry per key, which is
                     // what `find` returned.
-                    let mut produced_by_resolved = std::collections::HashMap::new();
+                    let mut produced_by_resolved = rustc_hash::FxHashMap::default();
                     for (_, produced) in exported_short_boxes_produced.iter() {
                         let source = produced.res.to_opref();
                         let resolved_source = final_ctx.get_replacement_opref(source);
@@ -1933,7 +1933,7 @@ impl UnrollOptimizer {
             // when two virtuals share the same OpRef. Allocate fresh
             // OpRefs for duplicates so the LABEL carries independent slots.
             {
-                let mut seen_used: indexmap::IndexSet<OpRef> = indexmap::IndexSet::new();
+                let mut seen_used: crate::FxIndexSet<OpRef> = crate::FxIndexSet::default();
                 let mut next_fresh = current_label_args
                     .iter()
                     .copied()
@@ -2314,7 +2314,7 @@ impl UnrollOptimizer {
         // RPython Box parity: drop duplicate-position ops. In RPython
         // each Box is unique so collisions can't happen. Keep first.
         {
-            let mut seen: indexmap::IndexSet<u32> = indexmap::IndexSet::new();
+            let mut seen: crate::FxIndexSet<u32> = crate::FxIndexSet::default();
             combined.retain(|op| {
                 if op.pos().get().is_none() || op.result_type() == Type::Void {
                     return true;
@@ -2402,7 +2402,7 @@ impl UnrollOptimizer {
     /// unroll.py: _map_args(mapping, arglist)
     /// Remap a list of OpRefs through a forwarding mapping.
     /// Constant OpRefs are left unchanged because they are not remapped.
-    pub fn map_args(mapping: &indexmap::IndexMap<OpRef, OpRef>, args: &[OpRef]) -> Vec<OpRef> {
+    pub fn map_args(mapping: &crate::FxIndexMap<OpRef, OpRef>, args: &[OpRef]) -> Vec<OpRef> {
         args.iter()
             .map(|&arg| mapping.get(&arg).copied().unwrap_or(arg))
             .collect()
@@ -3150,8 +3150,8 @@ impl ExportedState {
             // Re-share slots that originally aliased: walk the snapshot
             // map and copy each group's first canonical Rc into every
             // peer slot, restoring the pre-GC `Rc::as_ptr` equivalences.
-            let mut canonical_by_old: indexmap::IndexMap<usize, Rc<VirtualStateInfoNode>> =
-                indexmap::IndexMap::new();
+            let mut canonical_by_old: crate::FxIndexMap<usize, Rc<VirtualStateInfoNode>> =
+                crate::FxIndexMap::default();
             for (slot_idx, &old_ptr) in original_ptrs.iter().enumerate() {
                 let entry = canonical_by_old.entry_or_insert_with(old_ptr, || {
                     Rc::clone(&self.virtual_state.state[slot_idx])
@@ -3304,7 +3304,7 @@ impl OptUnroll {
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
         exported_int_bounds: Option<
-            &indexmap::IndexMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
+            &crate::FxIndexMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
         >,
     ) -> ExportedState {
         // The preview's VS/inputarg evaluation, when it ran to completion.
@@ -3636,7 +3636,7 @@ impl OptUnroll {
         arg_box: &Operand,
         ctx: &OptContext,
         exported_int_bounds: Option<
-            &indexmap::IndexMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
+            &crate::FxIndexMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
         >,
         infos: &mut indexmap::IndexMap<Operand, crate::optimizeopt::info::OpInfo>,
     ) {
@@ -3690,7 +3690,7 @@ impl OptUnroll {
         opref: OpRef,
         ctx: &OptContext,
         exported_int_bounds: Option<
-            &indexmap::IndexMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
+            &crate::FxIndexMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
         >,
         infos: &mut indexmap::IndexMap<Operand, crate::optimizeopt::info::OpInfo>,
     ) {
@@ -4252,7 +4252,7 @@ impl OptUnroll {
              the backend (merge_backend_constants_from_ctx no longer exports ctx.const_pool)"
         );
 
-        let mut mapping: indexmap::IndexMap<OpRef, OpRef> = indexmap::IndexMap::new();
+        let mut mapping: crate::FxIndexMap<OpRef, OpRef> = crate::FxIndexMap::default();
 
         // unroll.py `assert len(short_inputargs) == len(jump_args)` —
         // the mapping below is positional, so a length mismatch misaligns
@@ -4389,7 +4389,7 @@ impl OptUnroll {
         // input-vs-result key disjointness. (A colliding non-allocation op is a
         // real recomputation and must NOT be preserved: its fresh result IS the
         // correct binding.)
-        let seeded_input_keys: indexmap::IndexSet<OpRef> = mapping.keys().copied().collect();
+        let seeded_input_keys: crate::FxIndexSet<OpRef> = mapping.keys().copied().collect();
 
         let mut replay_index = 0;
 
@@ -5051,7 +5051,7 @@ impl OptUnroll {
         opref: OpRef,
         ctx: &OptContext,
         exported_int_bounds: Option<
-            &indexmap::IndexMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
+            &crate::FxIndexMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
         >,
     ) -> Option<crate::optimizeopt::info::OpInfo> {
         use crate::optimizeopt::info::{FloatConstInfo, OpInfo, PtrInfo};
@@ -5177,7 +5177,7 @@ pub(crate) fn export_state(
     optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
     ctx: &mut OptContext,
     exported_int_bounds: Option<
-        &indexmap::IndexMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
+        &crate::FxIndexMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
     >,
 ) -> ExportedState {
     OptUnroll::new().export_state_with_bounds(
@@ -5421,7 +5421,7 @@ fn emit_alias_same_as_for_imports(
 /// never received.
 fn push_fallthrough_same_as(
     fallthrough_aliases: &mut Vec<Op>,
-    stream_defs: &indexmap::IndexSet<OpRef>,
+    stream_defs: &crate::FxIndexSet<OpRef>,
     arg: OpRef,
     constants: &majit_ir::ConstMap<majit_ir::Value>,
     ctx: &mut crate::optimizeopt::OptContext,
@@ -5599,8 +5599,8 @@ fn assemble_peeled_trace_with_jump_args(
     // typed variants from `inputarg_types` so this set's OpRefs match the
     // typed mints used at trace start / Phase 2 import under variant-aware
     // Eq.
-    let preamble_defs: indexmap::IndexSet<OpRef> = {
-        let mut s: indexmap::IndexSet<OpRef> = (0..body_num_inputs)
+    let preamble_defs: crate::FxIndexSet<OpRef> = {
+        let mut s: crate::FxIndexSet<OpRef> = (0..body_num_inputs)
             .map(|i| {
                 let pos = inputarg_base + i as u32;
                 // history.py:220 box.type / resoperation.py InputArgInt/727/739  allow-line-citation
@@ -5677,7 +5677,7 @@ fn assemble_peeled_trace_with_jump_args(
     // OpRef can be appended directly to full_label_args — the JUMP's
     // mapped_base_args path picks up the corresponding fresh value on the
     // next iteration. The filter only needs to skip filtered_extra_jump_args.
-    let mut carried_source_slots: indexmap::IndexSet<OpRef> = indexmap::IndexSet::new();
+    let mut carried_source_slots: crate::FxIndexSet<OpRef> = crate::FxIndexSet::default();
     carried_source_slots.extend(filtered_extra_jump_args.iter().copied());
     // `label_set` tracks which OpRefs are already carried by the label so
     // that the body-use-before-def pass doesn't add the same OpRef twice
@@ -5687,7 +5687,7 @@ fn assemble_peeled_trace_with_jump_args(
     // is NOT the Issue 1 dedup — which drops distinct Boxes that happen
     // to share an OpRef — it is RPython parity: the same Box appears
     // once in the label arglist.
-    let mut label_set: indexmap::IndexSet<OpRef> = full_label_args.iter().copied().collect();
+    let mut label_set: crate::FxIndexSet<OpRef> = full_label_args.iter().copied().collect();
     let mut fallthrough_aliases = Vec::new();
     let remap_dsts: &[OpRef] = if emit_start_label {
         start_label_args
@@ -5699,14 +5699,14 @@ fn assemble_peeled_trace_with_jump_args(
     // args are destinations of that LABEL, not producers. Seeding them
     // here drops the fallthrough SameAs that binds a preamble box onto
     // a remapped LABEL slot.
-    let mut stream_defs: indexmap::IndexSet<OpRef> = if emit_start_label {
+    let mut stream_defs: crate::FxIndexSet<OpRef> = if emit_start_label {
         start_label_args
             .iter()
             .copied()
             .filter(|a| is_trace_runtime_ref(*a, constants))
             .collect()
     } else {
-        indexmap::IndexSet::new()
+        crate::FxIndexSet::default()
     };
     for op in &result {
         if !op.pos().get().is_none() && op.opcode != OpCode::Jump && op.result_type() != Type::Void
@@ -5719,8 +5719,8 @@ fn assemble_peeled_trace_with_jump_args(
     // used to do this translation; assembly now owns it). A Phase-2
     // InputArg that is not rewritten here is appended as a LABEL live-in
     // with no producer (`InputArgRef(99)` with token inputs `[0, 1]`).
-    let mut phase2_input_remap: std::collections::HashMap<OpRef, OpRef> =
-        std::collections::HashMap::new();
+    let mut phase2_input_remap: rustc_hash::FxHashMap<OpRef, OpRef> =
+        rustc_hash::FxHashMap::default();
     if inputarg_base > 0 {
         for i in 0..body_num_inputs {
             let tp = ctx.inputarg_type_at_strict(i);
@@ -5735,7 +5735,7 @@ fn assemble_peeled_trace_with_jump_args(
         }
     }
     {
-        let mut seen_body_defs = indexmap::IndexSet::new();
+        let mut seen_body_defs = crate::FxIndexSet::default();
         for op in p2_ops {
             // compile.py assembles the loop LABEL from `label_op` plus
             // short-preamble `used_boxes`; the terminal JUMP's target-local
@@ -5885,15 +5885,15 @@ fn assemble_peeled_trace_with_jump_args(
     // Keyed lookup only (`get`/`insert`, never iterated — codegen order comes
     // from the `p2_ops` walk below), so a hash map keeps each per-op remap O(1)
     // instead of the IndexMap linear `get_index_of` scan on long peeled traces.
-    let mut body_result_remap: std::collections::HashMap<OpRef, OpRef> =
-        std::collections::HashMap::new();
-    let visible_before_label: indexmap::IndexSet<OpRef> = full_label_args
+    let mut body_result_remap: rustc_hash::FxHashMap<OpRef, OpRef> =
+        rustc_hash::FxHashMap::default();
+    let visible_before_label: crate::FxIndexSet<OpRef> = full_label_args
         .iter()
         .copied()
         .chain(preamble_defs.iter().copied())
         .collect();
 
-    let mut assembly_alias_remap: std::collections::HashMap<OpRef, OpRef> = phase2_input_remap;
+    let mut assembly_alias_remap: rustc_hash::FxHashMap<OpRef, OpRef> = phase2_input_remap;
     for (i, &source_slot) in filtered_extra_label_args.iter().enumerate() {
         if source_slot.is_none() {
             continue;
@@ -5930,14 +5930,14 @@ fn assemble_peeled_trace_with_jump_args(
         }
     }
 
-    let mut seen_body_defs = indexmap::IndexSet::new();
+    let mut seen_body_defs = crate::FxIndexSet::default();
     let mut current_inner_label_index: Option<usize> = None;
-    let mut defs_since_inner_label: indexmap::IndexSet<OpRef> = indexmap::IndexSet::new();
+    let mut defs_since_inner_label: crate::FxIndexSet<OpRef> = crate::FxIndexSet::default();
     // Combined-trace position → emitted clone, so remap hits bind to the
     // body clone producer instead of re-minting a position-only box (SSA:
     // a remapped arg's target clone was pushed in an earlier iteration).
-    let mut emitted_at: std::collections::HashMap<OpRef, majit_ir::OpRc> =
-        std::collections::HashMap::new();
+    let mut emitted_at: rustc_hash::FxHashMap<OpRef, majit_ir::OpRc> =
+        rustc_hash::FxHashMap::default();
     for (op_idx, op) in p2_ops.iter().enumerate() {
         let mut new_op = (**op).clone();
         // compile.py never snapshots every body's arglist. Only the Label
@@ -5957,10 +5957,10 @@ fn assemble_peeled_trace_with_jump_args(
         // installed Const forwarding after the guard was emitted, and PyPy keeps
         // the guard's original runtime argument.
         let remap_body_arg = |arg: OpRef,
-                              assembly_alias_remap: &std::collections::HashMap<OpRef, OpRef>,
-                              body_result_remap: &std::collections::HashMap<OpRef, OpRef>,
-                              seen_body_defs: &indexmap::IndexSet<OpRef>,
-                              visible_before_label: &indexmap::IndexSet<OpRef>|
+                              assembly_alias_remap: &rustc_hash::FxHashMap<OpRef, OpRef>,
+                              body_result_remap: &rustc_hash::FxHashMap<OpRef, OpRef>,
+                              seen_body_defs: &crate::FxIndexSet<OpRef>,
+                              visible_before_label: &crate::FxIndexSet<OpRef>|
          -> OpRef {
             if let Some(&mapped) = assembly_alias_remap.get(&arg) {
                 return mapped;
@@ -6002,10 +6002,10 @@ fn assemble_peeled_trace_with_jump_args(
             }
         }
         if new_op.opcode == OpCode::Label {
-            let mut seen_after_label_defs = indexmap::IndexSet::new();
+            let mut seen_after_label_defs = crate::FxIndexSet::default();
             let mut extra_inner_sources = Vec::new();
-            let mut extra_inner_set = indexmap::IndexSet::new();
-            let label_arg_set: indexmap::IndexSet<OpRef> = original_args
+            let mut extra_inner_set = crate::FxIndexSet::default();
+            let label_arg_set: crate::FxIndexSet<OpRef> = original_args
                 .iter()
                 .copied()
                 .filter(|arg| !arg.is_none())
@@ -6250,7 +6250,7 @@ fn assemble_peeled_trace_with_jump_args(
             }
             new_op.visit_failarg_oprefs(&mut consider_arg);
             if !extra_live_args.is_empty() {
-                let existing: indexmap::IndexSet<OpRef> = result[label_idx]
+                let existing: crate::FxIndexSet<OpRef> = result[label_idx]
                     .getarglist()
                     .iter()
                     .map(|a| a.to_opref())
@@ -6421,7 +6421,7 @@ impl OptUnroll {
         &self,
         jump_op: &Op,
         ctx: &mut OptContext,
-    ) -> indexmap::IndexMap<OpRef, OpRef> {
+    ) -> crate::FxIndexMap<OpRef, OpRef> {
         // First pass: reserve peeled-iteration positions, tagged with each
         // source op's result type ( `OpRef.ty()`
         // matches RPython's `box.type` at allocation time).
@@ -6430,7 +6430,7 @@ impl OptUnroll {
             .iter()
             .map(|op| ctx.reserve_pos_typed(op.result_type()))
             .collect();
-        let mut ref_map: indexmap::IndexMap<OpRef, OpRef> = indexmap::IndexMap::new();
+        let mut ref_map: crate::FxIndexMap<OpRef, OpRef> = crate::FxIndexMap::default();
         for (op, &new_pos) in self.buffer.iter().zip(peeled_positions.iter()) {
             ref_map.insert(op.pos().get(), new_pos);
         }
@@ -6480,7 +6480,7 @@ impl OptUnroll {
             .iter()
             .map(|op| ctx.reserve_pos_typed(op.result_type()))
             .collect();
-        let mut orig_ref_map: indexmap::IndexMap<OpRef, OpRef> = indexmap::IndexMap::new();
+        let mut orig_ref_map: crate::FxIndexMap<OpRef, OpRef> = crate::FxIndexMap::default();
         for (op, &new_pos) in self.buffer.iter().zip(body_positions.iter()) {
             orig_ref_map.insert(op.pos().get(), new_pos);
         }
@@ -6537,7 +6537,7 @@ fn fresh_snapshot_key(ctx: &OptContext) -> i32 {
 
 fn remap_snapshot_boxes(
     boxes: &[SnapshotBox],
-    ref_map: &indexmap::IndexMap<OpRef, OpRef>,
+    ref_map: &crate::FxIndexMap<OpRef, OpRef>,
 ) -> crate::optimizeopt::SnapshotBoxList {
     boxes
         .iter()
@@ -6548,7 +6548,7 @@ fn remap_snapshot_boxes(
 fn clone_guard_snapshot_remapped(
     ctx: &mut OptContext,
     guard: &mut Op,
-    ref_map: &indexmap::IndexMap<OpRef, OpRef>,
+    ref_map: &crate::FxIndexMap<OpRef, OpRef>,
 ) {
     let old_pos = guard.rd_resume_position();
     if old_pos < 0 {
@@ -7799,8 +7799,8 @@ mod tests {
         use crate::optimizeopt::intutils::IntBound;
 
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(4, 0);
-        let mut exported_bounds: indexmap::IndexMap<majit_ir::operand::Operand, IntBound> =
-            indexmap::IndexMap::new();
+        let mut exported_bounds: crate::FxIndexMap<majit_ir::operand::Operand, IntBound> =
+            crate::FxIndexMap::default();
         // Bind the export-input position at its source (a forced end-arg is a
         // bound box in production); virtualstate.py create_state
         // receives real AbstractValues.

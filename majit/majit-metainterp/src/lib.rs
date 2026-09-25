@@ -2045,6 +2045,7 @@ fn guard_census_enabled() -> bool {
 /// lookups the guard-failure and optimizer paths make per event cost no
 /// hashing to speak of; the default `RandomState` (SipHash) does.
 pub(crate) type FxIndexMap<K, V> = indexmap::IndexMap<K, V, rustc_hash::FxBuildHasher>;
+pub(crate) type FxIndexSet<K> = indexmap::IndexSet<K, rustc_hash::FxBuildHasher>;
 
 pub fn guard_census_record(green_key: u64, trace_id: u64, fail_index: u32) {
     if !guard_census_enabled() {

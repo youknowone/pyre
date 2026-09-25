@@ -816,11 +816,11 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>, A: AsRef<InputArg>>(
     pc: u64,
     frame_value_count_fn: Option<fn(i32, i32) -> usize>,
 ) -> (
-    indexmap::IndexMap<u32, crate::resume::ResumeLayoutSummary>,
+    crate::FxIndexMap<u32, crate::resume::ResumeLayoutSummary>,
     crate::FxIndexMap<u32, StoredExitLayout>,
 ) {
-    let result: indexmap::IndexMap<u32, crate::resume::ResumeLayoutSummary> =
-        indexmap::IndexMap::new();
+    let result: crate::FxIndexMap<u32, crate::resume::ResumeLayoutSummary> =
+        crate::FxIndexMap::default();
     let mut exit_layouts: crate::FxIndexMap<u32, StoredExitLayout> = Default::default();
     let mut fail_index = 0u32;
     // The driver-scoped override wins: a driver whose frames are numbered
@@ -1612,7 +1612,7 @@ pub(crate) fn enrich_resume_layout_with_frame_stack(
 }
 
 pub(crate) fn merge_backend_terminal_exit_layouts<T: AsRef<majit_ir::Op>>(
-    terminal_exit_layouts: &mut indexmap::IndexMap<usize, StoredExitLayout>,
+    terminal_exit_layouts: &mut crate::FxIndexMap<usize, StoredExitLayout>,
     backend_layouts: &[TerminalExitLayout],
     ops: &[T],
 ) {
@@ -1799,8 +1799,8 @@ pub(crate) fn infer_terminal_exit_layout<T: AsRef<majit_ir::Op>, A: AsRef<InputA
 pub(crate) fn build_terminal_exit_layouts<T: AsRef<majit_ir::Op>, A: AsRef<InputArg>>(
     inputargs: &[A],
     ops: &[T],
-) -> indexmap::IndexMap<usize, StoredExitLayout> {
-    let mut layouts: indexmap::IndexMap<usize, StoredExitLayout> = indexmap::IndexMap::new();
+) -> crate::FxIndexMap<usize, StoredExitLayout> {
+    let mut layouts: crate::FxIndexMap<usize, StoredExitLayout> = crate::FxIndexMap::default();
     for (op_index, op) in ops.iter().enumerate() {
         let op = op.as_ref();
         if op.opcode != OpCode::Finish && op.opcode != OpCode::Jump {
@@ -1846,7 +1846,7 @@ pub(crate) fn normalize_closing_jump_args(
         return ops;
     };
 
-    let defined: indexmap::IndexSet<OpRef> = ops
+    let defined: crate::FxIndexSet<OpRef> = ops
         .iter()
         .filter(|op| op.result_type() != majit_ir::Type::Void && !op.pos().get().is_none())
         .map(|op| op.pos().get())
@@ -2105,7 +2105,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         forwarding: &mut LocalForwarding,
         slot_targets: &[(OpRef, Operand)],
     ) {
-        let slot_of: std::collections::HashMap<OpRef, usize> = slot_targets
+        let slot_of: rustc_hash::FxHashMap<OpRef, usize> = slot_targets
             .iter()
             .enumerate()
             .filter(|(_, (old_opref, _))| old_opref.is_input_arg())
@@ -2458,7 +2458,7 @@ pub(crate) fn strip_stray_overflow_guards(ops: Vec<majit_ir::OpRc>) -> Vec<majit
 }
 
 pub(crate) fn enrich_guard_resume_layouts_for_trace<A: AsRef<InputArg>>(
-    _resume_layouts: &mut indexmap::IndexMap<u32, crate::resume::ResumeLayoutSummary>,
+    _resume_layouts: &mut crate::FxIndexMap<u32, crate::resume::ResumeLayoutSummary>,
     exit_layouts: &mut crate::FxIndexMap<u32, StoredExitLayout>,
     trace_id: u64,
     inputargs: &[A],
@@ -2512,7 +2512,7 @@ pub(crate) fn patch_backend_terminal_recovery_layouts_for_trace(
     backend: &mut dyn majit_backend::Backend,
     token: &majit_backend::JitCellToken,
     trace_id: u64,
-    terminal_exit_layouts: &mut indexmap::IndexMap<usize, StoredExitLayout>,
+    terminal_exit_layouts: &mut crate::FxIndexMap<usize, StoredExitLayout>,
 ) {
     for (&op_index, exit_layout) in terminal_exit_layouts.iter_mut() {
         let Some(resume_layout) = exit_layout.resume_layout.as_ref() else {
