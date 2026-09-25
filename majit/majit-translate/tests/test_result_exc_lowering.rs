@@ -249,10 +249,11 @@ fn check_len_result_match_does_not_rebuild_a_result_shell() {
 }
 
 #[test]
-fn pop_value_lowers_to_raise_links() {
+fn list_append_underflow_lowers_to_raise_links() {
     let llbc = interp();
-    let graph =
-        lower_function(llbc, "pyre_interpreter::eval::<Impl>::pop_value").expect("lower pop_value");
+    // `opcode_list_append`'s `depth == 0` arm returns
+    // `Err(stack_underflow_error(..))` directly.
+    let graph = lower_function(llbc, "opcode_list_append").expect("lower opcode_list_append");
     let mut result_ctors = 0usize;
     let mut to_exc_object_calls = 0usize;
     let mut except_links = 0usize;
@@ -290,7 +291,9 @@ fn pop_value_lowers_to_raise_links() {
         "Err arm materialises the exception object"
     );
     assert!(except_links >= 1, "Err arm raises towards exceptblock");
-    eprintln!("pop_value: to_exc_object={to_exc_object_calls} except_links={except_links}");
+    eprintln!(
+        "opcode_list_append: to_exc_object={to_exc_object_calls} except_links={except_links}"
+    );
 }
 
 #[test]
@@ -770,14 +773,11 @@ fn formatted_message_raise_sites_keep_the_two_call_form() {
 }
 
 #[test]
-fn pop_value_keeps_its_unfused_materialisation() {
-    // `pop_value` raises through `shared_opcode::stack_underflow_error`, not
-    // a `PyError` constructor, so there is nothing to fuse and the single
-    // materialisation call stands.
-    assert_eq!(
-        raise_path_calls("pyre_interpreter::eval::<Impl>::pop_value"),
-        (0, 1, 0)
-    );
+fn list_append_underflow_keeps_its_unfused_materialisation() {
+    // `opcode_list_append` raises through
+    // `shared_opcode::stack_underflow_error`, not a `PyError` constructor, so
+    // there is nothing to fuse and the single materialisation call stands.
+    assert_eq!(raise_path_calls("opcode_list_append"), (0, 1, 0));
 }
 
 /// Family C: the dual-gate slot on always-`Err` `__new__` wrappers is
