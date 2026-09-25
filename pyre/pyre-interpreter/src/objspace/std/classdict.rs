@@ -383,11 +383,18 @@ pub(crate) unsafe fn uncell_type_namespace(w_type: PyObjectRef) {
     if w_type.is_null() || !pyre_object::is_type(w_type) {
         return;
     }
-    // A cell is only ever parked in the `version_tag != 0` branch of
-    // [`type_setdictvalue_wtf8`], so an unversioned type cannot hold one and
-    // needs no scan.  This is what keeps the mirror path off the namespaces of
-    // the static types, which are the large ones.
-    if crate::baseobjspace::w_type_version_tag(w_type) == 0 {
+    // [`type_setdictvalue_wtf8`] is the only thing that parks a cell and it
+    // refuses a type that is not a heaptype, so a non-heaptype cannot hold one
+    // and needs no scan.  This is what keeps the mirror path off the namespaces
+    // of the static types, which are the large ones.
+    //
+    // Not `version_tag != 0`: the tag being 0 today does not mean it always was.
+    // `compute_and_set_mro` runs a metaclass `mro()` while the nascent type
+    // still carries its initial tag -- so a rebind there parks a cell -- and
+    // `w_type_set_mro` then demotes the tag to 0 for an MRO that is not purely
+    // of types.  That type reaches this function with a parked cell and a zero
+    // tag.
+    if !pyre_object::w_type_is_heaptype(w_type) {
         return;
     }
     let ns = type_namespace(w_type);
