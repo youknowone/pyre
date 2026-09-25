@@ -2715,32 +2715,70 @@ impl JitCodeBuilder {
         self.push_u8(dst as u8);
     }
 
-    /// `jtransform.py` `rewrite_op_int_floordiv = _do_builtin_call`:
-    /// residual `_ll_2_int_floordiv` (C-truncating). Rust `/` is the same
-    /// truncation. This is **not** `int.py_div` (`ll_int_py_div`, Python
-    /// floor) — that oopspec is `_handle_int_special` for `//`.
-    /// `lloperation.py` marks `int_floordiv` `canfold=True`; zero is a
-    /// caller precondition, matching `emit_int_mod_or_floordiv_residual`.
+    /// `support.py` `_ll_2_int_floordiv`, inlined because `int_floordiv` is
+    /// in `inline_calls_to`. The body is Python-floor `int.py_div` plus the
+    /// branch-free truncation adjustment:
+    /// `r + (((x ^ y) >> (LONG_BIT - 1)) & (p != x))` with `p = r * y`.
+    /// A zero divisor still panics inside `ll_int_py_div`, the same
+    /// precondition as `blackhole::_ll_2_int_floordiv`.
     pub fn record_int_floordiv(&mut self, dst: u16, lhs: u16, rhs: u16) {
-        self.record_int_py_helper(
-            dst,
-            lhs,
-            rhs,
-            crate::blackhole::_ll_2_int_floordiv as *const (),
-            crate::call_descr::cannot_raise_effect_info(),
-        );
+        self.touch_reg(lhs);
+        self.touch_reg(rhs);
+        self.touch_reg(dst);
+        // `support.py` `_ll_2_int_floordiv`: LONG_BIT - 1 on a 64-bit Signed.
+        let kshift = 63i64;
+        let base = self.alloc_int_temps(6);
+        let r = base;
+        let p = base + 1;
+        let xor = base + 2;
+        let shifted = base + 3;
+        let cmp = base + 4;
+        let k = base + 5;
+        self.load_const_i_value(k, kshift);
+        self.record_int_py_div(r, lhs, rhs);
+        self.record_binop_i(p, OpCode::IntMul, r, rhs);
+        self.record_binop_i(xor, OpCode::IntXor, lhs, rhs);
+        self.record_binop_i(shifted, OpCode::IntRshift, xor, k);
+        self.record_binop_i(cmp, OpCode::IntNe, p, lhs);
+        self.record_binop_i(shifted, OpCode::IntAnd, shifted, cmp);
+        self.record_binop_i(dst, OpCode::IntAdd, r, shifted);
     }
 
-    /// `jtransform.py` `rewrite_op_int_mod = _do_builtin_call`: residual
-    /// `_ll_2_int_mod` (C-truncating remainder). See [`Self::record_int_floordiv`].
+    /// `support.py` `_ll_2_int_mod`, inlined because `int_mod` is in
+    /// `inline_calls_to`:
+    /// `r -= y & (((x ^ y) & (r | -r)) >> (LONG_BIT - 1))`
+    /// with `r = int.py_mod(x, y)`. See [`Self::record_int_floordiv`].
     pub fn record_int_mod(&mut self, dst: u16, lhs: u16, rhs: u16) {
-        self.record_int_py_helper(
-            dst,
-            lhs,
-            rhs,
-            crate::blackhole::_ll_2_int_mod as *const (),
-            crate::call_descr::cannot_raise_effect_info(),
-        );
+        self.touch_reg(lhs);
+        self.touch_reg(rhs);
+        self.touch_reg(dst);
+        let kshift = 63i64;
+        let base = self.alloc_int_temps(5);
+        let r = base;
+        let folded = base + 1;
+        let xor = base + 2;
+        let shifted = base + 3;
+        let k = base + 4;
+        self.load_const_i_value(k, kshift);
+        self.record_int_py_mod(r, lhs, rhs);
+        self.record_unary_i(folded, OpCode::IntNeg, r);
+        self.record_binop_i(folded, OpCode::IntOr, r, folded);
+        self.record_binop_i(xor, OpCode::IntXor, lhs, rhs);
+        self.record_binop_i(shifted, OpCode::IntAnd, xor, folded);
+        self.record_binop_i(shifted, OpCode::IntRshift, shifted, k);
+        self.record_binop_i(shifted, OpCode::IntAnd, rhs, shifted);
+        self.record_binop_i(dst, OpCode::IntSub, r, shifted);
+    }
+
+    /// Fresh int registers above every register already touched, including
+    /// the operands of the instruction about to expand. Dead once that
+    /// instruction's result is written; later ops may reuse the numbers.
+    fn alloc_int_temps(&mut self, n: u16) -> u16 {
+        let base = self.num_regs_i;
+        for i in 0..n {
+            self.touch_reg(base.saturating_add(i));
+        }
+        base
     }
 
     /// `jtransform.py` `_handle_int_special` `int.py_div` → residual

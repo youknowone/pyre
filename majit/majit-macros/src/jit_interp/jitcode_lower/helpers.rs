@@ -687,11 +687,12 @@ pub(crate) fn helper_policy_path(expr: &Expr) -> Option<Path> {
 
 /// Emit the int-binop recording call for `dst = lhs <op> rhs`.
 ///
-/// `jtransform.py` `rewrite_op_int_floordiv` / `rewrite_op_int_mod` are
-/// `_do_builtin_call`, which residual-calls `support.py`
-/// `_ll_2_int_floordiv` / `_ll_2_int_mod` (C-truncating). Rust `/` and
-/// `%` are the same truncation. `int.py_div` / `int.py_mod` are a
-/// different rewrite (`_handle_int_special`) for Python-floor `//`.
+/// Rust `/` and `%` are C-truncating, so they record `support.py`
+/// `_ll_2_int_floordiv` / `_ll_2_int_mod`. Those two are in
+/// `inline_calls_to`: the assembler emits the inlined body (`int.py_div`
+/// / `int.py_mod` plus the truncation adjustment), not a residual call.
+/// `int.py_div` / `int.py_mod` alone are `_handle_int_special` for
+/// Python-floor `//` and `%`.
 pub(super) fn binop_i_emit_tokens(
     dst: u16,
     opcode: &Ident,
