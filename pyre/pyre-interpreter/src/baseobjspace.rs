@@ -11406,6 +11406,15 @@ fn name_content_hash(name: &Wtf8) -> u64 {
     hash
 }
 
+/// [`name_content_hash`] for the residual-call ABI.  A jitcode carries a
+/// `&Wtf8` as the one word of the str object it was read from
+/// (`w_str_get_wtf8` lowers to the identity on its receiver), so the wrapper
+/// takes that object and reads the name back, as
+/// `jit_instance_getdictvalue` does.
+pub extern "C" fn name_content_hash_jit_abi(w_name: PyObjectRef) -> u64 {
+    name_content_hash(unsafe { pyre_object::unicodeobject::w_str_get_wtf8(w_name) })
+}
+
 /// `typeobject.py:541` `cache.names[method_hash] == name`, and the same
 /// comparison in `mapdict.py`'s `_find_map_attr_cache`.
 ///
@@ -11888,6 +11897,21 @@ pub(crate) unsafe fn type_attr_stored_is_cell(w_type: PyObjectRef, name: &Wtf8) 
         .is_some_and(|value| pyre_object::celldict::is_mutable_cell(value))
 }
 
+/// [`type_attr_stored_is_cell`] for a caller that holds the interned name
+/// object and has already read a nonzero `version_tag`.  The probe is the
+/// `@elidable` [`_pure_lookup_where_with_method_cache`], which the JIT calls
+/// opaquely (`policy.py` never looks inside an elidable), instead of the
+/// `MethodCache` body [`_cached_lookup_where_name`] runs in the interpreter.
+unsafe fn type_attr_stored_is_cell_w(
+    w_type: PyObjectRef,
+    w_name: PyObjectRef,
+    version_tag: u64,
+) -> bool {
+    debug_assert_ne!(version_tag, 0, "an uncacheable type has no method-cache entry");
+    let value = unsafe { _pure_lookup_where_with_method_cache(w_type, w_name, version_tag) };
+    !value.is_null() && unsafe { pyre_object::celldict::is_mutable_cell(value) }
+}
+
 /// The class-namespace entry for `name` when it is an `ObjectMutableCell`, and
 /// null when it is anything else.
 ///
@@ -12315,7 +12339,7 @@ pub unsafe fn load_method_fast_path(
     }
     // A cell's payload moves without `_version_tag`.  The cell fold reads
     // `ObjectMutableCell.w_value`; this arm only bakes a stable descriptor.
-    if type_attr_stored_is_cell(w_type, pyre_object::unicodeobject::w_str_get_wtf8(w_name)) {
+    if type_attr_stored_is_cell_w(w_type, w_name, version_tag) {
         return None;
     }
     // callmethod.py:59 `_pure_lookup_where_with_method_cache`.
