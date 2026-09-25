@@ -1640,6 +1640,63 @@ pub(crate) fn tuple_field_value_type(type_name: &str) -> ValueType {
     }
 }
 
+/// Lowlevel field spelling the annotator publishes.
+///
+/// `rbigint.py` stores `_digits` as `GcArray(Signed)`. Rust stores that
+/// array behind `*mut TypedItemsBlock`; the implementation pointer drops
+/// the list annotation. `tupleobject.py` `FixedSizeListRepr` stores
+/// `wrappeditems` as the immutable list itself (`GcArray(OBJECTPTR)`,
+/// `ll_fixed_length` / `ll_fixed_items`). Rust spells the same storage
+/// `*mut ItemsBlock`. Exact Charon layout still supplies the pointer-sized
+/// offset; this spelling is the lowleveltype those operations key on.
+fn published_struct_field_layout(
+    type_path: &str,
+    field_name: &str,
+    field_ty: &TyRef,
+    llbc: &Llbc,
+) -> String {
+    let leaf = type_path.rsplit("::").next().unwrap_or(type_path);
+    let is_rbigint = type_path == "rbigint::RBigInt" || type_path.ends_with("::rbigint::RBigInt");
+    let is_tuple_object = leaf == "W_TupleObject"
+        && (type_path == "tupleobject::W_TupleObject"
+            || type_path.ends_with("::tupleobject::W_TupleObject"));
+    if is_rbigint && field_name == "_digits" {
+        "[i64]".to_string()
+    } else if is_tuple_object && field_name == "wrappeditems" {
+        "[*mut PyObject]".to_string()
+    } else {
+        tyref_to_field_layout_string(field_ty, llbc)
+    }
+}
+
+/// A fixed-list GcArray: `[ *mut PyObject ]` (published
+/// [`published_struct_field_layout`]) or `FixedObjectArray`. Both are
+/// `ll_fixed_length` / `arraylen_gc` under [`OBJECT_REF_GCARRAY_TYPE_ID`].
+/// An `ItemsBlock` header pointer is the resizable list's `ll_items` and
+/// is not this type.
+fn type_spelling_is_fixed_object_array(spelling: &str) -> bool {
+    let normalized = peel_ref_prefix(spelling);
+    if normalized.starts_with('[')
+        && slice_array_type_id(normalized).as_deref() == Some(OBJECT_REF_GCARRAY_TYPE_ID)
+    {
+        return true;
+    }
+    let mut bare = normalized;
+    loop {
+        let next = bare
+            .strip_prefix("*const ")
+            .or_else(|| bare.strip_prefix("*mut "))
+            .or_else(|| bare.strip_prefix("&mut "))
+            .or_else(|| bare.strip_prefix('&'))
+            .map(str::trim_start);
+        match next {
+            Some(rest) if rest != bare => bare = rest,
+            _ => break,
+        }
+    }
+    bare.rsplit("::").next().unwrap_or(bare) == "FixedObjectArray"
+}
+
 /// Derive whole-program type-metadata fields of `SemanticProgram` from
 /// Charon's `type_decls` + `trait_decls` tables.
 ///
@@ -1723,39 +1780,12 @@ fn derive_program_metadata(
                 // so downstream lookups (`canonical_call_target`'s
                 // bare-leaf fallback) resolve either spelling.
                 let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
-                let is_rbigint = name == "rbigint::RBigInt" || name.ends_with("::rbigint::RBigInt");
-                let is_tuple_object = leaf == "W_TupleObject"
-                    && (name == "tupleobject::W_TupleObject"
-                        || name.ends_with("::tupleobject::W_TupleObject"));
                 let rows: Vec<(String, String)> = fields
                     .iter()
                     .enumerate()
                     .map(|(i, f)| {
                         let fname = f.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
-                        // RPython rbigint.py stores `_digits` as
-                        // `GcArray(Signed)`.  Rust stores the same translated
-                        // array behind a `*mut TypedItemsBlock`; exposing that
-                        // implementation pointer to the annotator loses the
-                        // list annotation and makes the always-inline
-                        // `digit()` projection classdef-less.  Preserve the
-                        // source-level RPython field shape here.  Exact Charon
-                        // layout still supplies the physical pointer-sized
-                        // field offset/size to the backend.
-                        let field_ty = if is_rbigint && fname == "_digits" {
-                            "[i64]".to_string()
-                        } else if is_tuple_object && fname == "wrappeditems" {
-                            // tupleobject.py:376-390: wrappeditems is the
-                            // immutable `list` / translated
-                            // `GcArray(OBJECTPTR)`. Rust's `*mut ItemsBlock`
-                            // is only its physical storage spelling; exposing
-                            // that wrapper makes getitem dispatch on a
-                            // classdef-less instance. Preserve the upstream
-                            // field shape while Charon's ExactLayout continues
-                            // to provide the real pointer-sized offset.
-                            "[*mut PyObject]".to_string()
-                        } else {
-                            tyref_to_field_layout_string(&f.ty, llbc)
-                        };
+                        let field_ty = published_struct_field_layout(&name, &fname, &f.ty, llbc);
                         (fname, field_ty)
                     })
                     .collect();
@@ -12898,6 +12928,37 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `items_block_capacity` on a fixed-list GcArray is
+                // `ll_fixed_length` (`rlist.py` `FixedSizeListRepr`): `len`
+                // of the array itself. The same callee on an `ItemsBlock`
+                // header is `len(l.items)` of a resizable list and stays a
+                // call. The split is the operand's lowleveltype
+                // (`[*mut PyObject]` / `FixedObjectArray` vs the header).
+                if args.len() == 1
+                    && self.is_items_block_capacity(&reg)
+                    && arg_locals
+                        .first()
+                        .copied()
+                        .flatten()
+                        .is_some_and(|local| self.local_is_fixed_object_array(local))
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::ArrayLen {
+                            base: args[0].clone(),
+                            array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+                            nolength: false,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `FixedObjectArray::len` reads the array's own length
                 // header, which is `arraylen_gc` — so emit `ArrayLen`
                 // rather than routing it through the `__len` call below.
@@ -17555,6 +17616,89 @@ impl<'a> Lowering<'a> {
     /// Its body reads the array's own length header, so the call *is*
     /// `arraylen_gc`; see the `ArrayLen` emission site for why this one
     /// cannot share `is_container_len`'s `__len` routing.
+    fn is_items_block_capacity(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            fd.item_meta.name_path() == "pyre_object::object_array::items_block_capacity"
+        })
+    }
+
+    /// The operand's lowleveltype is a fixed-list GcArray
+    /// (`[*mut PyObject]` / `FixedObjectArray`), so `len` of it is
+    /// `ll_fixed_length`. Follows copies to the producing place; the
+    /// decision is [`type_spelling_is_fixed_object_array`] on that
+    /// place's published type, not the field it was read from.
+    fn local_is_fixed_object_array(&self, mut local: usize) -> bool {
+        for _ in 0..8 {
+            let mut producers = 0usize;
+            let mut followed: Option<usize> = None;
+            let mut is_fixed = false;
+            for bb in &self.body.body {
+                for stmt in &bb.statements {
+                    let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
+                        continue;
+                    };
+                    if !matches!(&place.kind, PlaceKind::Local(i) if *i as usize == local) {
+                        continue;
+                    }
+                    producers += 1;
+                    let Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) = rvalue else {
+                        continue;
+                    };
+                    if let PlaceKind::Local(i) = &src.kind {
+                        followed = Some(*i as usize);
+                    } else if self.place_lowlevel_is_fixed_object_array(&src) {
+                        is_fixed = true;
+                    }
+                }
+            }
+            if producers != 1 {
+                return false;
+            }
+            if is_fixed {
+                return true;
+            }
+            match followed {
+                Some(next) => local = next,
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// Published lowleveltype of `place`. A field uses
+    /// [`published_struct_field_layout`]; any other place uses its own
+    /// layout spelling.
+    fn place_lowlevel_is_fixed_object_array(&self, place: &Place) -> bool {
+        let spelling = if let PlaceKind::Projection(_, ProjectionElem::Tagged(field)) = &place.kind
+            && let Some(payload) = field.as_object().and_then(|obj| obj.get("Field"))
+            && let Some((_, name, ty, _)) = self.resolve_adt_field(payload)
+            && let Some(type_path) = self.field_decl_path(payload)
+        {
+            published_struct_field_layout(&type_path, &name, &ty, self.llbc)
+        } else {
+            tyref_to_field_layout_string(&place.ty, self.llbc)
+        };
+        type_spelling_is_fixed_object_array(&spelling)
+    }
+
+    fn field_decl_path(&self, payload: &serde_json::Value) -> Option<String> {
+        let arr = payload.as_array()?;
+        if arr.len() != 2 {
+            return None;
+        }
+        let container = arr[0].as_object()?;
+        let adt = container.get("Adt")?.as_array()?;
+        let head = adt.first()?;
+        let type_id = match head.as_u64() {
+            Some(id) => id,
+            None => head.get("id")?.get("Adt")?.as_u64()?,
+        };
+        Some(self.llbc.type_by_id(type_id)?.item_meta.name_path())
+    }
+
     fn is_object_array_len(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
