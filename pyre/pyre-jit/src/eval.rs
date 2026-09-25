@@ -4699,9 +4699,6 @@ fn walk_parked_exception_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     // Children of the off-GC exception singletons, which no carrier and no
     // collection phase reaches on its own.
     walk_immortal_exception_singleton_roots(visitor);
-    // Stored `PyError` carrier whose GC refs the precise collector cannot
-    // reach through its raw TLS cell. Mirrors `walk_pending_call_error`.
-    crate::call_jit::walk_last_ca_exception(visitor);
 }
 
 /// The immortal, process-global stores whose GC-heap slots nothing else
@@ -7580,11 +7577,6 @@ fn drive_unpack_iterable_trace(
         // producer today) and is promoted instead of discarded; an exit that
         // already picked one keeps it, since that one is the earlier failure.
         if let Err(err) = pyre_interpreter::stack_check::drain_jit_pending_exception()
-            && !err.matches_stop_iteration()
-        {
-            pending_err.get_or_insert(err);
-        }
-        if let Some(err) = crate::call_jit::take_ca_exception()
             && !err.matches_stop_iteration()
         {
             pending_err.get_or_insert(err);
@@ -10693,12 +10685,6 @@ fn execute_assembler(
         return Some(LoopResult::Done(Err(exc)));
     }
 
-    // warmspot.py:998 ExitFrameWithExceptionRef: check for exceptions
-    // stashed by blackhole/force callbacks across FFI boundaries.
-    if let Some(exc) = crate::call_jit::take_ca_exception() {
-        return Some(LoopResult::Done(Err(exc)));
-    }
-
     if majit_metainterp::majit_log_enabled() {
         let kind = match &outcome {
             DetailedDriverRunOutcome::Finished { .. } => "finished",
@@ -11543,11 +11529,6 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         // the JIT-overflow flag the backend probe records when it
         // trips during compiled execution at function entry.
         if let Err(exc) = pyre_interpreter::stack_check::drain_jit_pending_exception() {
-            return Some(Err(exc));
-        }
-        // warmspot.py:998 ExitFrameWithExceptionRef: check for exceptions
-        // stashed by blackhole/force callbacks across FFI boundaries.
-        if let Some(exc) = crate::call_jit::take_ca_exception() {
             return Some(Err(exc));
         }
         if majit_metainterp::majit_log_enabled() {

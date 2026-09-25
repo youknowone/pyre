@@ -44,10 +44,6 @@ use pyre_jit_trace::trace::trace_bytecode;
 // natively without memoization.
 
 thread_local! {
-    /// Stash Python exceptions from blackhole/force paths that cross
-    /// FFI boundaries (compiled code → callback → exception).
-    static LAST_CA_EXCEPTION: std::cell::RefCell<Option<pyre_interpreter::error::PyError>> =
-        const { std::cell::RefCell::new(None) };
     /// Callee PyFrame address whose CALL_ASSEMBLER bridge walk committed
     /// and adopted its end-of-walk state (raise_continue_running_normally
     /// analogue). The CA slow path calls the bridge hook and then the
@@ -94,40 +90,6 @@ impl Drop for FrameRoot {
     fn drop(&mut self) {
         majit_gc::shadow_stack::try_pop_to(self.depth);
     }
-}
-
-/// Take stashed exception from blackhole/force FFI paths.
-// dont_look_inside: reads LAST_CA_EXCEPTION TLS; bridge/force machinery.
-#[majit_macros::dont_look_inside]
-pub fn take_ca_exception() -> Option<pyre_interpreter::error::PyError> {
-    LAST_CA_EXCEPTION.with(|c| c.borrow_mut().take())
-}
-
-/// Root the exception parked in `LAST_CA_EXCEPTION` across the call-assembler
-/// FFI boundary. Compiled code runs between `set_pending_ca_exception` and
-/// `take_ca_exception` — it can drive a major collection and can overwrite the
-/// single in-flight-exception cell with a later raise — so the parked
-/// `PyError`'s GC refs must be forwarded here or the stashed exception is swept
-/// before it surfaces. Never materialises the lazy-null `exc_object`.
-pub fn walk_last_ca_exception(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    LAST_CA_EXCEPTION.with(|c| {
-        // SAFETY: `as_ptr` yields the `Option<PyError>` interior; this closure
-        // holds the only reference for its duration and does not re-borrow the
-        // cell, so no borrow-flag conflict with a walker-triggered path.
-        let opt = unsafe { &mut *c.as_ptr() };
-        if let Some(err) = opt.as_mut() {
-            err.walk_gc_refs(visitor);
-        }
-    });
-}
-
-/// Park a Python exception that needs to surface across an FFI boundary
-/// (callback emitted by compiled code → here → eventually picked up by
-/// `take_ca_exception` in the eval loop).
-pub fn set_pending_ca_exception(err: pyre_interpreter::error::PyError) {
-    LAST_CA_EXCEPTION.with(|c| {
-        *c.borrow_mut() = Some(err);
-    });
 }
 
 // warmspot.py:449 portal result_type == REF: FINISH always boxes via
