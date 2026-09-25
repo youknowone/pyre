@@ -3343,6 +3343,12 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             let return_owners = lo.resolve_result_return_owners(&fd.signature.output);
             rewire_result_try_call_sites(&mut lo.graph, &lo.result_try_sites, return_owners)
         };
+        // A `?` whose diamond did not match still has `Try::branch`.
+        // `Result::branch` is a match on the discriminant: Ok is
+        // `ControlFlow::Continue` and Err is `ControlFlow::Break`, with the
+        // same variant order and the same payload word. The value is already
+        // that `ControlFlow`; a residual call is not.
+        lower_result_branch_to_control_flow(&mut lo.graph);
         // The `bool::then` short-circuit rewrite (`front::bool_then`) splits
         // the residual `then` call block into a `Some`/`None` diamond.  It
         // runs on the post-lowering graph (its block A is closed with a
@@ -11335,7 +11341,7 @@ impl<'a> Lowering<'a> {
                     && (workspace_index
                         || (self.is_vec_index_call(&reg, second_arg_ty.as_ref())
                             && (!is_vec_index_mut_call(&reg, second_arg_ty.as_ref(), self.llbc)
-                                || add_dest_used_only_as_single_deref(self.body, dest_local)))
+                                || index_mut_result_is_element(self.body, dest_local)))
                         || (self.is_slice_scalar_index_call(&reg, second_arg_ty.as_ref())
                             && (!self.is_slice_scalar_index_mut_call(&reg)
                                 || add_dest_used_only_as_single_deref(self.body, dest_local))));
@@ -11493,15 +11499,11 @@ impl<'a> Lowering<'a> {
                         && self.is_vec_index_call(&reg, second_arg_ty.as_ref())
                         && !reaches_declared_vable_array(&self.graph, &args[0])
                     {
-                        let buf = self.retarget_vec_part(
+                        self.retarget_vec_part(
                             bb_id,
                             &args[0],
                             crate::model::VecFieldPart::Buf,
-                        );
-                        if let Some(local) = arg_locals.first().copied().flatten() {
-                            self.local_var[local] = Some(buf.clone());
-                        }
-                        buf
+                        )
                     } else {
                         args[0].clone()
                     };
@@ -24695,47 +24697,98 @@ fn scan_rvalue_dest_ref(rvalue: &Rvalue, dest: usize, derefs: &mut usize, other:
 /// `ArrayRead` / `ArrayWrite` captures, so the `add` must stay residual.
 /// `StorageLive` / `StorageDead` / `PlaceMention` are borrow-ck markers,
 /// not loads, so they are ignored.
-fn add_dest_used_only_as_single_deref(body: &Unstructured, dest: usize) -> bool {
-    let mut defs = 0usize;
-    let mut derefs = 0usize;
-    let mut other = 0usize;
+struct DestDerefCensus {
+    defs: usize,
+    /// `*dest` appearing in a read position.
+    read_derefs: usize,
+    /// `*dest = v`.
+    write_derefs: usize,
+    other: usize,
+}
+
+fn dest_deref_census(body: &Unstructured, dest: usize) -> DestDerefCensus {
+    let mut census = DestDerefCensus {
+        defs: 0,
+        read_derefs: 0,
+        write_derefs: 0,
+        other: 0,
+    };
     for bb in &body.body {
         for stmt in &bb.statements {
             match stmt.stmt_kind() {
                 Ok(StmtKind::Assign(place, rvalue)) => {
-                    scan_rvalue_dest_ref(&rvalue, dest, &mut derefs, &mut other);
-                    classify_write_place(&place, dest, &mut defs, &mut derefs, &mut other);
+                    scan_rvalue_dest_ref(&rvalue, dest, &mut census.read_derefs, &mut census.other);
+                    classify_write_place(
+                        &place,
+                        dest,
+                        &mut census.defs,
+                        &mut census.write_derefs,
+                        &mut census.other,
+                    );
                 }
                 Ok(StmtKind::Assert(assert)) => bump_dest_ref(
                     operand_dest_ref(&assert.cond, dest),
-                    &mut derefs,
-                    &mut other,
+                    &mut census.read_derefs,
+                    &mut census.other,
                 ),
                 _ => {}
             }
         }
         match bb.term() {
-            Ok(TermKind::Switch { discr, .. }) => {
-                bump_dest_ref(operand_dest_ref(&discr, dest), &mut derefs, &mut other)
-            }
+            Ok(TermKind::Switch { discr, .. }) => bump_dest_ref(
+                operand_dest_ref(&discr, dest),
+                &mut census.read_derefs,
+                &mut census.other,
+            ),
             Ok(TermKind::Call { call, .. }) => {
                 if let CallFunc::Dynamic(op) = &call.func {
-                    bump_dest_ref(operand_dest_ref(op, dest), &mut derefs, &mut other);
+                    bump_dest_ref(
+                        operand_dest_ref(op, dest),
+                        &mut census.read_derefs,
+                        &mut census.other,
+                    );
                 }
                 for arg in &call.args {
-                    bump_dest_ref(operand_dest_ref(arg, dest), &mut derefs, &mut other);
+                    bump_dest_ref(
+                        operand_dest_ref(arg, dest),
+                        &mut census.read_derefs,
+                        &mut census.other,
+                    );
                 }
-                classify_write_place(&call.dest, dest, &mut defs, &mut derefs, &mut other);
+                classify_write_place(
+                    &call.dest,
+                    dest,
+                    &mut census.defs,
+                    &mut census.write_derefs,
+                    &mut census.other,
+                );
             }
             Ok(TermKind::Assert { assert, .. }) => bump_dest_ref(
                 operand_dest_ref(&assert.cond, dest),
-                &mut derefs,
-                &mut other,
+                &mut census.read_derefs,
+                &mut census.other,
             ),
             _ => {}
         }
     }
-    defs == 1 && derefs == 1 && other == 0
+    census
+}
+
+fn add_dest_used_only_as_single_deref(body: &Unstructured, dest: usize) -> bool {
+    let census = dest_deref_census(body, dest);
+    census.defs == 1 && census.read_derefs + census.write_derefs == 1 && census.other == 0
+}
+
+/// `index_mut` result used only as the element: one deref load, one deref
+/// store, or both (`*p += k`). Two loads, or any use of the pointer itself,
+/// stay residual.
+fn index_mut_result_is_element(body: &Unstructured, dest: usize) -> bool {
+    let census = dest_deref_census(body, dest);
+    census.defs == 1
+        && census.other == 0
+        && census.read_derefs <= 1
+        && census.write_derefs <= 1
+        && census.read_derefs + census.write_derefs >= 1
 }
 
 /// The MIR local behind a plain-local [`Operand`], or `None` for a
@@ -25627,7 +25680,7 @@ fn compute_index_write_extra_live(body: &Unstructured, llbc: &Llbc) -> Vec<Vec<u
         // undefined.
         let is_deferred_write_producer = is_workspace_index_regular(reg, llbc)
             || (is_vec_index_mut_call(reg, call.args.get(1).and_then(operand_tyref), llbc)
-                && add_dest_used_only_as_single_deref(body, p as usize))
+                && index_mut_result_is_element(body, p as usize))
             || is_list_items_elem_ptr_add_parts(
                 reg,
                 call.args.len(),
@@ -34821,6 +34874,50 @@ fn emit_payload_read(
         },
     });
     payload
+}
+
+/// `Try::branch` on a `Result` that the diamond rewrites did not consume.
+///
+/// `Ok(v)` and `Err(e)` are `ControlFlow::Continue(v)` and
+/// `ControlFlow::Break(e)`: same discriminant, same payload word. The call
+/// is that match, so the result is the operand.
+fn lower_result_branch_to_control_flow(graph: &mut FunctionGraph) {
+    for block in &mut graph.blocks {
+        for op in &mut block.operations {
+            let OpKind::Call {
+                target,
+                args,
+                result_ty,
+            } = &op.kind
+            else {
+                continue;
+            };
+            let CallTarget::Method {
+                name,
+                receiver_root,
+                ..
+            } = target
+            else {
+                continue;
+            };
+            if name != "branch" {
+                continue;
+            }
+            let root = receiver_root.as_deref().unwrap_or("");
+            if !root.ends_with("Result") {
+                continue;
+            }
+            let Some(operand) = args.first().and_then(LinkArg::as_variable).cloned() else {
+                continue;
+            };
+            let result_ty = result_ty.clone();
+            op.kind = OpKind::UnaryOp {
+                op: "same_as".to_string(),
+                operand,
+                result_ty,
+            };
+        }
+    }
 }
 
 fn rewire_result_try_call_sites(
