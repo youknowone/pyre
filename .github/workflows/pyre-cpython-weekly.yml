@@ -87,14 +87,14 @@ jobs:
       run: scripts/extract-llbc.py majit-rlib pyre-object pyre-interpreter pyre-module pyre-jit
     - name: Build the dynasm backend
       id: build-dynasm
-      run: cargo build --release -p pyrex --bin pyre-dynasm --no-default-features --features dynasm,full
+      run: cargo build --release -p pyrex --bin pyre-dynasm --no-default-features --features dynasm,pyre-module
     - name: Build the cranelift backend
       id: build-cranelift
       # `!cancelled()` so a dynasm-only break does not also cost the run its
       # cranelift report: the two share the sources but not the feature set.
       # The price is that a failed setup step no longer stops this build.
       if: ${{ !cancelled() }}
-      run: cargo build --release -p pyrex --bin pyre-cranelift --no-default-features --features cranelift,full
+      run: cargo build --release -p pyrex --bin pyre-cranelift --no-default-features --features cranelift,pyre-module
     # Each lane names the build whose binary it runs, so no lane depends on
     # where the other builds and lanes sit in the list.
     - name: dynasm (JIT on)

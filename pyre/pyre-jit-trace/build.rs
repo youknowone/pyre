@@ -9,7 +9,7 @@
 //! exists, so nothing here can run then — and nothing needs to: the
 //! artefacts only have to satisfy rustc so `pyre-jit`'s MIR is exposed. The
 //! prepass itself is the reason this script build-depends on
-//! `pyre-interpreter`, `majit-translate`, and under `full` `pyre-module`;
+//! `pyre-interpreter`, `majit-translate`, and under its feature `pyre-module`;
 //! behind the `prepass` feature those are optional, so an extraction pass
 //! (`--no-default-features`) does not compile a host copy of the interpreter
 //! stack whose only purpose would be to write empty files.

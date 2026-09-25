@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 /// added as single files through [`interpreter_fn_calls`], not as a tree.
 ///
 /// Order is the production hash/load order. Changing it rekeys the cache.
-#[cfg(feature = "full")]
+#[cfg(feature = "pyre-module")]
 pub const LLBC_CRATES: &[&str] = &[
     "majit-rlib",
     "pyre-object",
@@ -44,25 +44,20 @@ pub const LLBC_CRATES: &[&str] = &[
 /// The core translation: `pyre-module` is not part of it, the way a PyPy
 /// build without `objspace.usemodules.<name>` never translates that module.
 /// Its builtins stay opaque residual calls.
-#[cfg(not(feature = "full"))]
+#[cfg(not(feature = "pyre-module"))]
 pub const LLBC_CRATES: &[&str] = &["majit-rlib", "pyre-object", "pyre-interpreter", "pyre-jit"];
 
-/// Directory under `build/` holding the artefacts `LLBC_CRATES` names.
-///
-/// The core set is extracted with `PYRE_JIT_CORE=1`
-/// (`pyre/scripts/extract-llbc.py`), from an interpreter built without
-/// `full`, so it cannot share the product directory.
-#[cfg(feature = "full")]
+/// Directory under `build/` holding the artefacts `LLBC_CRATES` names. The
+/// core reads the product set's artefacts for its crates: none of them
+/// depends on `pyre-module`.
 pub const LLBC_SUBDIR: &str = "llbc";
-#[cfg(not(feature = "full"))]
-pub const LLBC_SUBDIR: &str = "llbc-jit-core";
 
 /// Build-dependencies the manifest declares but this translation never links:
-/// `pyre-module` is optional and enabled by `full` alone, so the core cache
+/// `pyre-module` is optional and linked only under its own feature, so the core cache
 /// key must not hash a tree its prepass never reads.
-#[cfg(feature = "full")]
+#[cfg(feature = "pyre-module")]
 const UNLINKED_BUILD_DEPS: &[&str] = &[];
-#[cfg(not(feature = "full"))]
+#[cfg(not(feature = "pyre-module"))]
 const UNLINKED_BUILD_DEPS: &[&str] = &["pyre-module"];
 
 /// Repo-relative trees and files the cache key should hash, plus every
