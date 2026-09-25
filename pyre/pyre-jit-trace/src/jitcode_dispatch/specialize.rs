@@ -8238,14 +8238,6 @@ const FLOAT_POS_DESCENT: HelperDescent = HelperDescent {
     decline_tag: "FLOAT-POS-SUBWALK",
 };
 
-/// ll_math.py `sqrt_nonneg` after the domain pin.
-const FLOAT_SQRT_DESCENT: HelperDescent = HelperDescent {
-    path: "pyre_interpreter::objspace::descroperation::_float_sqrt",
-    commit_label: "float_sqrt_commit",
-    call_site_label: "float_sqrt_call_site",
-    decline_tag: "FLOAT-SQRT-SUBWALK",
-};
-
 /// ll_math.py `ll_math_sin` after the finite pin.
 const FLOAT_SIN_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_float_sin",
@@ -14134,8 +14126,6 @@ pub(crate) fn try_walker_specialize_sys_exc_info<Sym: WalkSym>(
 /// The branches of a math1 leaf the trace has to pin before descent.
 #[derive(Clone, Copy, PartialEq)]
 enum MathFloatDomain {
-    /// `ll_math_sqrt`: not negative, and finite.
-    NonNegativeFinite,
     /// `ll_math_log`: strictly positive, and finite.
     PositiveFinite,
     /// `ll_math_{cos,sin}`: finite.
@@ -14159,7 +14149,6 @@ impl MathFloatDomain {
     fn admits(self, values: &[f64]) -> bool {
         let x = values[0];
         match self {
-            Self::NonNegativeFinite => x.is_finite() && x >= 0.0,
             Self::PositiveFinite => x.is_finite() && x > 0.0,
             Self::Finite => x.is_finite(),
             Self::GreaterThanMinusOne => x.is_finite() && x > -1.0,
@@ -14182,10 +14171,6 @@ impl MathFloatDomain {
         }
         let zero = ctx.trace_ctx.const_float(0.0f64.to_bits() as i64);
         match self {
-            // `x >= 0`, the `ValueError` direction of `ll_math_sqrt`.
-            Self::NonNegativeFinite => {
-                walker_float_cmp_guard(ctx, pc, OpCode::FloatLt, &[x, zero], false)?
-            }
             // `x > 0`, the domain of `ll_math_log`.
             Self::PositiveFinite => {
                 walker_float_cmp_guard(ctx, pc, OpCode::FloatLt, &[zero, x], true)?
@@ -14230,31 +14215,6 @@ fn is_math_builtin(callable: pyre_object::PyObjectRef, name: &str) -> bool {
     pyre_interpreter::importing::optional_module_hooks()
         .and_then(|hooks| (hooks.math_builtin_name)(callable))
         == Some(name)
-}
-
-/// `math.sqrt(x)` on an exact int/float argument: the domain-guarded pure
-/// `CALL_F(sqrt_nonneg_jit)` (ll_math.rs `ll_math_sqrt` → `sqrt_nonneg`) in
-/// place of the opaque `bh_call_fn(sqrt_builtin, NULL, x)` residual.  A
-/// negative argument raises in the authentic pre-execution and declines to the
-/// generic residual, which records the raise.
-pub(crate) fn try_walker_specialize_math_sqrt<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    code: &[u8],
-    op: &DecodedOp,
-    r_args: &[OpRef],
-    dst: usize,
-) -> Result<Option<()>, DispatchError> {
-    if let Some((callable, operands)) = plain_builtin_call_concretes(ctx, code, op, r_args, 1) {
-        if is_math_builtin(callable, "sqrt") && r_args.len() >= 3 {
-            walker_guard_fold_callable(ctx, op.pc, r_args[0], callable)?;
-            if try_walker_orthodox_float_sqrt(ctx, op.pc, r_args[2], operands[0], dst, 'r')?
-                .is_some()
-            {
-                return Ok(Some(()));
-            }
-        }
-    }
-    Ok(None)
 }
 
 /// `math.log/cos/sin(x)` on an exact int/float argument — the direct
@@ -14761,46 +14721,6 @@ pub(crate) fn try_walker_orthodox_float_abs<Sym: WalkSym>(
         dst,
         dst_bank,
         &FLOAT_ABS_DESCENT,
-    )
-}
-
-/// Exact non-negative finite `math.sqrt`: walk `_float_sqrt`.
-pub(crate) fn try_walker_orthodox_float_sqrt<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    operand: OpRef,
-    obj: pyre_object::PyObjectRef,
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<DispatchOutcome>, DispatchError> {
-    if !ctx.is_authoritative_executor || dst_bank != 'r' {
-        return Ok(None);
-    }
-    if !unsafe { pyre_object::is_exact_builtin_instance(obj) } {
-        return Ok(None);
-    }
-    let (is_int, x) = if unsafe { pyre_object::is_float(obj) } {
-        (false, unsafe { pyre_object::w_float_get_value(obj) })
-    } else if unsafe { pyre_object::is_int(obj) || pyre_object::is_bool(obj) } {
-        (true, unsafe { pyre_object::w_int_get_value(obj) as f64 })
-    } else {
-        return Ok(None);
-    };
-    if !x.is_finite() || x < 0.0 {
-        return Ok(None);
-    }
-    let xa =
-        walker_coerce_dispatching_operand_to_float(ctx, op_pc, operand, obj, is_int, x, false)?;
-    MathFloatDomain::NonNegativeFinite.emit_operand_guards(ctx, op_pc, xa)?;
-    try_walker_orthodox_descent(
-        ctx,
-        op_pc,
-        &[],
-        &[],
-        &[(xa, x)],
-        dst,
-        dst_bank,
-        &FLOAT_SQRT_DESCENT,
     )
 }
 
