@@ -5631,24 +5631,37 @@ fn _pow_nomod_iff(_iv: i64, iw: i64) -> bool {
 }
 
 #[majit_macros::look_inside_iff(_pow_nomod_iff)]
-pub(crate) fn _pow_nomod(iv: i64, mut iw: i64) -> Result<i64, PowMachineFail> {
+pub(crate) fn _pow_nomod(iv: i64, mut iw: i64) -> Result<i64, PyError> {
     if iw <= 0 {
         if iw == 0 {
             return Ok(1);
         }
-        return Err(PowMachineFail::Value);
+        // `intobject.py _pow_nomod`: a negative exponent always returns a float,
+        // so the machine body raises and the caller takes the float path.
+        return Err(PyError::value_error(""));
     }
     let mut temp = iv;
     let mut ix = 1_i64;
     loop {
         if iw & 1 != 0 {
-            ix = ix.checked_mul(temp).ok_or(PowMachineFail::Overflow)?;
+            // `ovfcheck(ix * temp)` — `checked_mul` plus a `Some`/`None` match.
+            let Some(value) = ix.checked_mul(temp) else {
+                return Err(PyError::overflow_error(
+                    "signed integer expression did overflow",
+                ));
+            };
+            ix = value;
         }
         iw >>= 1;
         if iw == 0 {
             break;
         }
-        temp = temp.checked_mul(temp).ok_or(PowMachineFail::Overflow)?;
+        let Some(value) = temp.checked_mul(temp) else {
+            return Err(PyError::overflow_error(
+                "signed integer expression did overflow",
+            ));
+        };
+        temp = value;
     }
     Ok(ix)
 }
@@ -5657,16 +5670,6 @@ pub(crate) fn _pow_nomod(iv: i64, mut iw: i64) -> Result<i64, PowMachineFail> {
 /// are both constants, so the squaring loop unrolls into `mulmod` calls.
 fn _pow_mod_iff(_iv: i64, iw: i64, iz: i64) -> bool {
     majit_rlib::jit::isconstant(&iw) && majit_rlib::jit::isconstant(&iz)
-}
-
-/// Why `_pow` / `_pow_mod` left the machine-int body.
-pub(crate) enum PowMachineFail {
-    /// `ovfcheck` failed; `descr_pow` continues in `_pow_ovf2long`.
-    Overflow,
-    /// Negative exponent with no modulus: the result is a float.
-    Value,
-    /// Negative exponent with a modulus: `invmod`, then the long path.
-    Negative,
 }
 
 /// Floor remainder. `iz` may be negative (`1 % iz` when the exponent is 0).
@@ -5679,17 +5682,26 @@ fn floor_mod_i64(iv: i64, iz: i64) -> i64 {
 }
 
 #[majit_macros::look_inside_iff(_pow_mod_iff)]
-pub(crate) fn _pow_mod(mut iv: i64, mut iw: i64, mut iz: i64) -> Result<i64, PowMachineFail> {
+pub(crate) fn _pow_mod(mut iv: i64, mut iw: i64, mut iz: i64) -> Result<i64, PyError> {
     if iw == 0 {
         return Ok(floor_mod_i64(1, iz));
     }
     let mut iz_negative = false;
     if iz < 0 {
-        iz = iz.checked_neg().ok_or(PowMachineFail::Overflow)?;
+        // `intobject.py _pow_mod`: `iz = ovfcheck(-iz)`. `checked_neg` plus a
+        // `Some`/`None` match is that overflow edge; `i64::MIN` raises.
+        let Some(negated) = iz.checked_neg() else {
+            return Err(PyError::overflow_error(
+                "signed integer expression did overflow",
+            ));
+        };
+        iz = negated;
         iz_negative = true;
     }
     if iw <= 0 {
-        return Err(PowMachineFail::Negative);
+        // A negative exponent takes `invmod` on the long path. Signal that
+        // with ValueError so the caller leaves this machine body.
+        return Err(PyError::value_error(""));
     }
     let mut temp = iv;
     let mut ix = 1_i64;
@@ -5710,7 +5722,7 @@ pub(crate) fn _pow_mod(mut iv: i64, mut iw: i64, mut iz: i64) -> Result<i64, Pow
 }
 
 /// `intobject.py _pow`. `iz == 0` is the two-argument form.
-pub(crate) fn _pow(iv: i64, iw: i64, iz: i64) -> Result<i64, PowMachineFail> {
+pub(crate) fn _pow(iv: i64, iw: i64, iz: i64) -> Result<i64, PyError> {
     if iz == 0 {
         _pow_nomod(iv, iw)
     } else {
@@ -5748,10 +5760,10 @@ pub(crate) fn try_int_long_pow_with_modulo(
                 return Err(PyError::value_error("pow() 3rd argument cannot be 0"));
             }
             if iw >= 0 {
-                match _pow_mod(iv, iw, iz) {
-                    Ok(result) => return Ok(Some(w_int_new(result))),
-                    Err(PowMachineFail::Overflow) => {}
-                    Err(PowMachineFail::Negative) | Err(PowMachineFail::Value) => {}
+                // Overflow (`ovfcheck(-iz)`) and a negative exponent both leave
+                // the machine body; the long path below is that continuation.
+                if let Ok(result) = _pow_mod(iv, iw, iz) {
+                    return Ok(Some(w_int_new(result)));
                 }
             }
         }
