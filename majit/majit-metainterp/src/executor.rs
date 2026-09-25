@@ -951,11 +951,21 @@ pub fn execute_cast_const_row(opcode: OpCode, arg: majit_ir::Value) -> ConstFold
         }
         // `assembler.py:1528-1529 genop_cast_ptr_to_int =
         // _genop_same_as` / `genop_cast_int_to_ptr = _genop_same_as`.
-        // PyPy treats both casts as raw identity at every level:
-        // backend, executor, and test_lltype.py test_odd_ints /
-        // runner_test.py test_cast_int_to_ptr expect
-        // `cast_int_to_ptr(21) → cast_ptr_to_int == 21`.
-        (OpCode::CastPtrToInt, Value::Ref(r)) => ConstFold::Folded(Value::Int(r.0 as i64)),
+        // `rewrite.py optimize_CAST_PTR_TO_INT` emits the cast; it does not
+        // fold it. A managed pointer folded to `ConstInt` leaves the gc
+        // table (`remove_constptr` only rewrites a live `ConstPtr` to
+        // `LoadFromGcTable`). The immediate then dangles after the nursery
+        // reuses the slot, and `jit_bigint_divrem_returns_lhs_remainder`
+        // reads `_digits == 0x29`. Untagged non-GC addresses still fold:
+        // `runner_test.py` `cast_int_to_ptr(21)` round-trips through
+        // `cast_ptr_to_int`.
+        (OpCode::CastPtrToInt, Value::Ref(r)) => {
+            if majit_gc::gc_owns_object(r.0) {
+                ConstFold::Declined
+            } else {
+                ConstFold::Folded(Value::Int(r.0 as i64))
+            }
+        }
         (OpCode::CastIntToPtr, Value::Int(i)) => ConstFold::Folded(Value::Ref(GcRef(i as usize))),
         _ => ConstFold::Unregistered,
     }
