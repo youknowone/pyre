@@ -770,6 +770,20 @@ pub fn install_builtin_modules() {
     pyre_install_module!(errno);
     pyre_install_module!(_opcode);
     pyre_install_module!(pypyjit);
+    // `Modules/Setup.bootstrap`: the modules built into the interpreter.
+    // Frozen importlib imports `_stat` while bootstrapping a sandbox that
+    // mounts no stdlib files, so it is unconditional.
+    pyre_install_module!(_abc);
+    pyre_install_module!(_functools);
+    pyre_install_module!(_stat);
+    pyre_install_module!(_suggestions);
+    pyre_install_module!(_symtable);
+    pyre_install_module!(_tokenize);
+    pyre_install_module!(_typing);
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+    pyre_install_module!(faulthandler);
+    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+    pyre_install_module!(pwd);
 
     // C-extension stubs required for stdlib import chains
     // (PyPy: pypy/module/* mixed modules).
@@ -812,8 +826,7 @@ pub fn install_builtin_modules() {
 
     // Host-access modules — arbitrary FFI (`_ctypes`), real signals.
     // `select`, `mmap`, `_socket`/`_ssl`, `pwd`/`grp`, `errno`, `_stat`,
-    // `_abc`, `_typing`, `_symtable`, `_pypy_generic_alias`,
-    // `_functools`, and the Windows host modules
+    // `_pypy_generic_alias`, and the Windows host modules
     // live in `pyre-module`.  None of the host
     // ones belong to the mediated ll_os/ll_time surface, so the sandbox
     // interpreter omits them entirely: `import _ctypes` then raises
