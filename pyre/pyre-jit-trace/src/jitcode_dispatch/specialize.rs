@@ -22201,18 +22201,19 @@ fn try_walker_specialize_for_iter_list<Sym: WalkSym>(
         match (concrete_continues, sid) {
             (true, 1) => pyre_object::listobject::w_list_int_items_raw(seq_obj)
                 .map(|(items, _)| Value::Int(*items.add(index as usize))),
-            (true, 4) => {
-                let list = &*(seq_obj as *const pyre_object::listobject::W_ListObject);
-                Some(Value::Int(
-                    pyre_object::listobject::ll_list_int_getitem_fast(list, index as usize),
-                ))
-            }
             (true, 2) => pyre_object::listobject::w_list_float_items_raw(seq_obj)
                 .map(|(items, _)| Value::Float(*items.add(index as usize))),
             _ => None,
         }
     };
-    if concrete_continues && matches!(sid, 1 | 2 | 4) && raw_elem.is_none() {
+    if concrete_continues && matches!(sid, 1 | 2) && raw_elem.is_none() {
+        return Ok(None);
+    }
+    // IntOrFloat getitem is `w_list_getitem_inner`. A sub-walk of that body
+    // from this cursor records the traced element as a loop constant (the
+    // compiled add becomes +0 and the total freezes). Leave the step on the
+    // residual `descr_next` path until that load stays red.
+    if sid == pyre_object::listobject::ListStrategy::IntOrFloat as i64 {
         return Ok(None);
     }
 
@@ -22340,50 +22341,8 @@ fn try_walker_specialize_for_iter_list<Sym: WalkSym>(
             walker_box_int(ctx, op_pc, raw, elem)?
         }
         4 => {
-            // IntOrFloatListStrategy.getitem: the array word is the
-            // nan-boxed longlong. Stamp that word on the load. The tag
-            // is `is_int32_from_longlong_nan` (arithmetic >> 32 == -2);
-            // an int decodes with signext of the low 32 bits, a float
-            // is `convert_longlong_bytes_to_float`.
-            let block = crate::state::opimpl_getfield_gc_r(
-                ctx.trace_ctx,
-                seq_op,
-                crate::descr::list_int_items_block_descr(),
-            );
-            let raw = crate::state::trace_int_block_getitem_value(ctx.trace_ctx, block, index_op);
-            let Value::Int(encoded) = raw_elem.expect("int-or-float storage read its raw element")
-            else {
-                unreachable!("int-or-float storage stamps an Int")
-            };
-            ctx.trace_ctx.set_opref_concrete(raw, Value::Int(encoded));
-            let thirty_two = ctx.trace_ctx.const_int(32);
-            let high = ctx
-                .trace_ctx
-                .record_op(OpCode::IntRshift, &[raw, thirty_two]);
-            let high_c = encoded >> 32;
-            ctx.trace_ctx.set_opref_concrete(high, Value::Int(high_c));
-            let tag = ctx.trace_ctx.const_int(-2);
-            let is_int = ctx.trace_ctx.record_op(OpCode::IntEq, &[high, tag]);
-            let is_int_c = i64::from(high_c == -2);
-            ctx.trace_ctx
-                .set_opref_concrete(is_int, Value::Int(is_int_c));
-            if is_int_c == 1 {
-                walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[is_int])?;
-                let width = ctx.trace_ctx.const_int(4);
-                let decoded = ctx.trace_ctx.record_op(OpCode::IntSignext, &[raw, width]);
-                let decoded_c = encoded as u32 as i32 as i64;
-                ctx.trace_ctx
-                    .set_opref_concrete(decoded, Value::Int(decoded_c));
-                walker_box_int(ctx, op_pc, decoded, decoded_c)?
-            } else {
-                walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[is_int])?;
-                let bits = ctx
-                    .trace_ctx
-                    .record_op(OpCode::ConvertLonglongBytesToFloat, &[raw]);
-                ctx.trace_ctx
-                    .set_opref_concrete(bits, Value::Float(f64::from_bits(encoded as u64)));
-                crate::state::wrapfloat(ctx.trace_ctx, bits)
-            }
+            // Declined above, before any iterator op is recorded.
+            return Ok(None);
         }
         2 => {
             let block = crate::state::opimpl_getfield_gc_r(
@@ -22895,6 +22854,15 @@ fn walker_contains_descent_callback_free(
                 == pyre_object::listobject::ListStrategy::Integer
                 && pyre_object::listobject::is_plain_int1(needle)
                 && pyre_object::is_int(needle)
+        };
+    }
+    // Exact `set` of plain ints: `descr_contains` hashes with the int
+    // digest and probes with `int_eq`.  No stored element runs a user
+    // `__eq__` / `__hash__`.  A subclass set or a non-int needle stays
+    // on the residual.
+    if exact(haystack, &pyre_object::setobject::SET_TYPE) {
+        return unsafe {
+            pyre_object::listobject::is_plain_int1(needle) && pyre_object::is_int(needle)
         };
     }
     false
