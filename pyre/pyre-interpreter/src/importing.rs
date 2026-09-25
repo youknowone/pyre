@@ -4350,8 +4350,41 @@ pub trait AppleveldefNamespace {
 
 impl AppleveldefNamespace for PyObjectRef {
     fn store(&mut self, name: &str, value: PyObjectRef) {
-        crate::module_ns_store(*self, name, value);
+        // Only a mixed-module dict is wrapped. `load_builtin_module` stamps
+        // `__name__` before `init`. Callers that install into a fresh dict
+        // (`app_functional`, `async_operation`, `reduce_protocol`) have no
+        // module name there, and those values stay plain functions.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(*self);
+        let value_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(value);
+        let stored = applevel_module_value(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            name,
+            pyre_object::gc_roots::shadow_stack_get(value_slot),
+        );
+        let stored_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(stored);
+        crate::module_ns_store(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            name,
+            pyre_object::gc_roots::shadow_stack_get(stored_slot),
+        );
     }
+}
+
+/// `mixedmodule.py _load_lazily`: a plain `Function` placed directly in a
+/// mixed-module dict becomes `BuiltinFunction` (no `__get__`). Classes and
+/// every other object are stored as they are.
+fn applevel_module_value(ns: PyObjectRef, name: &str, value: PyObjectRef) -> PyObjectRef {
+    let Some(w_module) = (unsafe { pyre_object::w_dict_getitem_str(ns, "__name__") }) else {
+        return value;
+    };
+    if !unsafe { pyre_object::py_type_check(value, &crate::function::FUNCTION_TYPE) } {
+        return value;
+    }
+    unsafe { crate::function::builtin_function_from_function(value, name, w_module) }
 }
 
 pub fn appleveldef_install(
