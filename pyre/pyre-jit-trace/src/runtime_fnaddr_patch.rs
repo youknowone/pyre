@@ -587,7 +587,7 @@ pub fn materialize_type_static_consts(jitcodes: &mut [Arc<JitCode>]) {
             let name = body.type_static_consts[i].name.as_str();
             assert_eq!(
                 (body.constants_r[idx].get() as u64) & SENTINEL_HIGH_MASK,
-                (majit_translate::assembler::TYPE_STATIC_CONST_SENTINEL_BASE as u64)
+                (majit_jitcode::codewriter::assembler::TYPE_STATIC_CONST_SENTINEL_BASE as u64)
                     & SENTINEL_HIGH_MASK,
                 "constants_r[{idx}] did not hold a type-static sentinel",
             );
@@ -774,7 +774,7 @@ mod tests {
 
     #[test]
     fn materialize_type_static_consts_overwrites_sentinel_with_live_int_type() {
-        use majit_translate::jitcode::TypeStaticConstDescriptor;
+        use majit_jitcode::jitcode::TypeStaticConstDescriptor;
 
         let jc = JitCode::new("test");
         jc.set_body(JitCodeBody {
@@ -782,7 +782,9 @@ mod tests {
                 constants_r_index: 0,
                 name: "pyobject::INT_TYPE".into(),
             }],
-            constants_r: vec![(majit_translate::assembler::TYPE_STATIC_CONST_SENTINEL_BASE).into()],
+            constants_r: vec![
+                (majit_jitcode::codewriter::assembler::TYPE_STATIC_CONST_SENTINEL_BASE).into(),
+            ],
             ..Default::default()
         });
         let mut jcs = vec![Arc::new(jc)];
