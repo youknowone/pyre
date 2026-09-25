@@ -10279,4 +10279,132 @@ mod tests {
              must be declined and the caller left to jump_to_preamble"
         );
     }
+
+    /// A loop-invariant `CALL_PURE` on a label arg the jump passes back
+    /// unchanged, an immutable getfield of its result, and `int_add_ovf` on
+    /// that field. `PureOp.add_op_to_short` records the call as `CALL_PURE`,
+    /// `inline_short_preamble` sends it through the optimizer, and
+    /// `HeapOp.produce_op` / `CachedField._getfield` share the resolved box,
+    /// so the peeled body (the ops after the loop label, including the
+    /// jump tail) contains none of the three.
+    #[test]
+    fn peeled_loop_reuses_invariant_call_pure_immutable_getfield_and_ovf() {
+        use majit_ir::descr::{make_call_descr, make_simple_descr_group};
+        use majit_ir::{ArrayFlag, EffectInfo, ExtraEffect, OopSpecIndex, Type, Value};
+
+        let passed = rooted_inputarg_operand(Type::Int, 0);
+        let idx = rooted_inputarg_operand(Type::Int, 1);
+        let func = Operand::const_from_value(Value::Int(0x1000));
+        let one = Operand::const_from_value(Value::Int(1));
+        let thousand = Operand::const_from_value(Value::Int(1000));
+        let mut call = Op::new(OpCode::CallPureR, &[func, passed.clone(), one]);
+        call.setdescr(make_call_descr(
+            vec![Type::Int, Type::Int, Type::Int],
+            Type::Ref,
+            EffectInfo::new(ExtraEffect::ElidableCannotRaise, OopSpecIndex::None),
+        ));
+        let group = make_simple_descr_group(
+            1,
+            16,
+            1,
+            0,
+            &[majit_ir::descr::SimpleFieldDescrSpec {
+                is_class_word: Some(false),
+                index: 1,
+                field_key: "intval".to_string(),
+                name: "intval".to_string(),
+                offset: 8,
+                field_size: 8,
+                field_type: Type::Int,
+                is_immutable: true,
+                is_quasi_immutable: false,
+                flag: ArrayFlag::Signed,
+                virtualizable: false,
+                index_in_parent: 0,
+            }],
+        );
+        let descr = group.field_descrs[0].clone();
+        let getfield = Op::with_descr(
+            OpCode::GetfieldGcI,
+            &[rooted_resop_operand(Type::Ref, 2)],
+            descr,
+        );
+        let ovf = Op::new(
+            OpCode::IntAddOvf,
+            &[rooted_resop_operand(Type::Int, 3), thousand],
+        );
+        let guard = Op::new(OpCode::GuardNoOverflow, &[]);
+        let inc = Op::new(
+            OpCode::IntAdd,
+            &[idx, Operand::const_from_value(Value::Int(1))],
+        );
+        let mut ops = vec![call, getfield, ovf, guard, inc];
+        assign_positions(&mut ops, 2);
+        let jump = Op::new(OpCode::Jump, &[passed, rooted_resop_operand(Type::Int, 6)]);
+        ops.push(jump);
+
+        let (ops, snapshots) = crate::optimizeopt::seed_empty_guard_snapshots(&ops);
+        let mut unroll = UnrollOptimizer::new();
+        unroll.trace_inputargs = OpRef::inputarg_refs(&[Type::Int, Type::Int]);
+        unroll.snapshot_boxes = snapshots;
+        let (result, _) = unroll.optimize_trace_with_constants_and_inputs(
+            &ops,
+            &mut majit_ir::ConstMap::default(),
+            2,
+        );
+        let label_at = result
+            .iter()
+            .rposition(|op| op.opcode == OpCode::Label)
+            .expect("peeled loop has a label");
+        let body = &result[label_at + 1..];
+        let bad: Vec<_> = body
+            .iter()
+            .filter(|op| {
+                op.opcode.is_call()
+                    || op.opcode == OpCode::GetfieldGcI
+                    || op.opcode == OpCode::IntAddOvf
+                    || op.opcode == OpCode::GuardNoOverflow
+            })
+            .map(|op| op.opcode)
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "peeled body must drop the invariant call, getfield and ovf, got {bad:?}"
+        );
+    }
+
+    /// `PureOp.add_op_to_short` rewrites a demoted CALL to `CALL_PURE` before
+    /// the short preamble is replayed. `inline_short_preamble` then sends
+    /// that op through the optimizer, so a jump onto a target whose short
+    /// preamble contains the call does not append the plain CALL.
+    #[test]
+    fn short_preamble_records_call_as_call_pure() {
+        use crate::optimizeopt::shortpreamble::{PreambleOpKind, ShortBoxes};
+        use majit_ir::descr::make_call_descr;
+        use majit_ir::{EffectInfo, ExtraEffect, OopSpecIndex, Type, Value};
+
+        let mut ctx = crate::optimizeopt::OptContext::with_inputarg_types(8, &[Type::Int]);
+        let passed = ctx.materialize_operand_at(OpRef::input_arg_int(0));
+        let func = Operand::const_from_value(Value::Int(0x1000));
+        let mut call = Op::new(OpCode::CallR, &[func, passed]);
+        call.pos().set(OpRef::ref_op(2));
+        call.setdescr(make_call_descr(
+            vec![Type::Int, Type::Int],
+            Type::Ref,
+            EffectInfo::new(ExtraEffect::ElidableCannotRaise, OopSpecIndex::None),
+        ));
+        let i0 = OpRef::input_arg_int(0);
+        let mut sb = ShortBoxes::with_label_args(&[i0]);
+        sb.add_pure_op(&mut ctx, call);
+        let short_boxes = sb.create_short_boxes(&mut ctx, &[i0], &[Type::Int]);
+        let pure = short_boxes
+            .iter()
+            .find(|produced| produced.kind == PreambleOpKind::Pure)
+            .expect("the call is a short-preamble pure op");
+        assert_eq!(
+            pure.preamble_op.opcode,
+            OpCode::CallPureR,
+            "PureOp.add_op_to_short must record CALL_PURE, not the demoted CALL"
+        );
+    }
 }

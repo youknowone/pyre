@@ -1813,7 +1813,7 @@ impl ProducedShortOp {
                     !info.is_virtual(),
                     "shortpreamble.py:74: imported heap field on virtual"
                 );
-                info.set_preamble_field(descr_idx, pop_for_field);
+                info.set_preamble_field(descr_idx, pop_for_field.clone());
             }
         });
         // shortpreamble.py produce_op keeps `self.res` (the body-visible Box)
@@ -2176,14 +2176,17 @@ impl AbstractShortPreambleBuilderState {
             {
                 continue;
             }
-            // shortpreamble.py: `arg.get_forwarded() is None` →
-            // pass; otherwise append the arg (the dep replay op itself)
-            // and consume the marker.
+            // shortpreamble.py: `arg.get_forwarded() is None` → pass;
+            // otherwise append the arg and consume the marker. The
+            // demoted CALL is `make_equal_to`-forwarded to its result;
+            // appending that producer replays a plain CALL that
+            // `optimize_call_pure` never sees. `PureOp.add_op_to_short`
+            // already recorded the same call as `CALL_PURE_*`.
             let Some(dep) = arg.bound_op() else { continue };
-            if matches!(
-                &dep.forwarded().borrow(),
-                majit_ir::forwarding::Forwarded::None
-            ) {
+            let forwarded = dep.forwarded().borrow().clone();
+            if matches!(forwarded, majit_ir::forwarding::Forwarded::None)
+                || dep.opcode.is_real_call()
+            {
                 continue;
             }
             *dep.forwarded().borrow_mut() = majit_ir::forwarding::Forwarded::None;

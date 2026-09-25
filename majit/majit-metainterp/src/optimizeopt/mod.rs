@@ -9804,12 +9804,18 @@ impl OptContext {
         // optimizer.py:497: opinfo.last_guard_pos = last_guard_pos
         new_info.set_last_guard_pos(last_guard_pos);
         // optimizer.py:498: arg0.set_forwarded(opinfo)
+        // `arg0` is already `get_box_replacement`. `materialize_write_host`
+        // reseats onto the producer at `to_opref()`, which is a different box
+        // once the replacement is a forwarded target, so `CachedField._getfield`
+        // (`get_box_replacement` + `getptrinfo`) misses the field. Write on the
+        // replacement when it is a real box. An unbound operand has no slot
+        // (`Operand::with_forwarding_host`); only then mint the host.
         use crate::optimizeopt::info::OpInfo;
-        // The write receiver must be the canonical `_forwarded` host: a
-        // chain-resolved operand may sit on a position that was never
-        // registered in `resop_refs` (a short-preamble replay slot), and guard
-        // resume numbering later has no producer to bind for it.
-        let arg0_box = self.materialize_write_host(arg0_box);
+        let arg0_box = if arg0_box.bound_op().is_some() || arg0_box.bound_inputarg().is_some() {
+            arg0_box
+        } else {
+            self.materialize_write_host(arg0_box)
+        };
         arg0_box.set_forwarded_info(OpInfo::ptr(new_info));
         // optimizer.py:499: return opinfo — hand back the operand so
         // subsequent mutations land on the authoritative slot.
