@@ -169,7 +169,7 @@ mod imp {
         // `interp_subprocess.fork_exec` rejects the sequence before allocating
         // its raw gid_t array.  POSIX permits sysconf to be indeterminate;
         // PyPy's configure-time fallback for that case is 64.
-        let configured_max = unsafe { libc::sysconf(libc::_SC_NGROUPS_MAX) };
+        let configured_max = host_posix::sysconf(host_posix::_SC_NGROUPS_MAX).unwrap_or(-1);
         let max_groups = if configured_max < 0 {
             64
         } else {

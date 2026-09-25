@@ -581,48 +581,49 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
             };
         }
         // `interp_kqueue.py symbol_map` — KQ_FILTER_* / KQ_EV_*.
-        kq!("KQ_FILTER_READ", libc::EVFILT_READ);
-        kq!("KQ_FILTER_WRITE", libc::EVFILT_WRITE);
-        kq!("KQ_FILTER_AIO", libc::EVFILT_AIO);
-        kq!("KQ_FILTER_VNODE", libc::EVFILT_VNODE);
-        kq!("KQ_FILTER_PROC", libc::EVFILT_PROC);
-        kq!("KQ_FILTER_SIGNAL", libc::EVFILT_SIGNAL);
-        kq!("KQ_FILTER_TIMER", libc::EVFILT_TIMER);
-        kq!("KQ_EV_ADD", libc::EV_ADD);
-        kq!("KQ_EV_DELETE", libc::EV_DELETE);
-        kq!("KQ_EV_ENABLE", libc::EV_ENABLE);
-        kq!("KQ_EV_DISABLE", libc::EV_DISABLE);
-        kq!("KQ_EV_ONESHOT", libc::EV_ONESHOT);
-        kq!("KQ_EV_CLEAR", libc::EV_CLEAR);
-        kq!("KQ_EV_EOF", libc::EV_EOF);
-        kq!("KQ_EV_ERROR", libc::EV_ERROR);
+        use rustpython_host_env::select::kqueue as host_kqueue;
+        kq!("KQ_FILTER_READ", host_kqueue::EVFILT_READ);
+        kq!("KQ_FILTER_WRITE", host_kqueue::EVFILT_WRITE);
+        kq!("KQ_FILTER_AIO", host_kqueue::EVFILT_AIO);
+        kq!("KQ_FILTER_VNODE", host_kqueue::EVFILT_VNODE);
+        kq!("KQ_FILTER_PROC", host_kqueue::EVFILT_PROC);
+        kq!("KQ_FILTER_SIGNAL", host_kqueue::EVFILT_SIGNAL);
+        kq!("KQ_FILTER_TIMER", host_kqueue::EVFILT_TIMER);
+        kq!("KQ_EV_ADD", host_kqueue::EV_ADD);
+        kq!("KQ_EV_DELETE", host_kqueue::EV_DELETE);
+        kq!("KQ_EV_ENABLE", host_kqueue::EV_ENABLE);
+        kq!("KQ_EV_DISABLE", host_kqueue::EV_DISABLE);
+        kq!("KQ_EV_ONESHOT", host_kqueue::EV_ONESHOT);
+        kq!("KQ_EV_CLEAR", host_kqueue::EV_CLEAR);
+        kq!("KQ_EV_EOF", host_kqueue::EV_EOF);
+        kq!("KQ_EV_ERROR", host_kqueue::EV_ERROR);
         // `symbol_map` stops here — it comments out the two internal
         // `EV_` flags as "not defined on FreeBSD" and never names the
         // `NOTE_*` family at all.  `selectmodule.c` publishes both under
         // `#ifdef`, and darwin defines every one of them.
-        kq!("KQ_EV_SYSFLAGS", libc::EV_SYSFLAGS);
-        kq!("KQ_EV_FLAG1", libc::EV_FLAG1);
+        kq!("KQ_EV_SYSFLAGS", host_kqueue::EV_SYSFLAGS);
+        kq!("KQ_EV_FLAG1", host_kqueue::EV_FLAG1);
         // READ / WRITE filter flag.
-        kq!("KQ_NOTE_LOWAT", libc::NOTE_LOWAT);
+        kq!("KQ_NOTE_LOWAT", host_kqueue::NOTE_LOWAT);
         // VNODE filter flags.
-        kq!("KQ_NOTE_DELETE", libc::NOTE_DELETE);
-        kq!("KQ_NOTE_WRITE", libc::NOTE_WRITE);
-        kq!("KQ_NOTE_EXTEND", libc::NOTE_EXTEND);
-        kq!("KQ_NOTE_ATTRIB", libc::NOTE_ATTRIB);
-        kq!("KQ_NOTE_LINK", libc::NOTE_LINK);
-        kq!("KQ_NOTE_RENAME", libc::NOTE_RENAME);
-        kq!("KQ_NOTE_REVOKE", libc::NOTE_REVOKE);
+        kq!("KQ_NOTE_DELETE", host_kqueue::NOTE_DELETE);
+        kq!("KQ_NOTE_WRITE", host_kqueue::NOTE_WRITE);
+        kq!("KQ_NOTE_EXTEND", host_kqueue::NOTE_EXTEND);
+        kq!("KQ_NOTE_ATTRIB", host_kqueue::NOTE_ATTRIB);
+        kq!("KQ_NOTE_LINK", host_kqueue::NOTE_LINK);
+        kq!("KQ_NOTE_RENAME", host_kqueue::NOTE_RENAME);
+        kq!("KQ_NOTE_REVOKE", host_kqueue::NOTE_REVOKE);
         // PROC filter flags.  `NOTE_PCTRLMASK` is `~NOTE_PDATAMASK` over a
         // signed `int` in `<sys/event.h>`, so it publishes negative; the rest
         // are unsigned literals and publish as written.
-        kq!("KQ_NOTE_EXIT", libc::NOTE_EXIT);
-        kq!("KQ_NOTE_FORK", libc::NOTE_FORK);
-        kq!("KQ_NOTE_EXEC", libc::NOTE_EXEC);
-        kq!("KQ_NOTE_PCTRLMASK", libc::NOTE_PCTRLMASK as i32);
-        kq!("KQ_NOTE_PDATAMASK", libc::NOTE_PDATAMASK);
-        kq!("KQ_NOTE_TRACK", libc::NOTE_TRACK);
-        kq!("KQ_NOTE_CHILD", libc::NOTE_CHILD);
-        kq!("KQ_NOTE_TRACKERR", libc::NOTE_TRACKERR);
+        kq!("KQ_NOTE_EXIT", host_kqueue::NOTE_EXIT);
+        kq!("KQ_NOTE_FORK", host_kqueue::NOTE_FORK);
+        kq!("KQ_NOTE_EXEC", host_kqueue::NOTE_EXEC);
+        kq!("KQ_NOTE_PCTRLMASK", host_kqueue::NOTE_PCTRLMASK as i32);
+        kq!("KQ_NOTE_PDATAMASK", host_kqueue::NOTE_PDATAMASK);
+        kq!("KQ_NOTE_TRACK", host_kqueue::NOTE_TRACK);
+        kq!("KQ_NOTE_CHILD", host_kqueue::NOTE_CHILD);
+        kq!("KQ_NOTE_TRACKERR", host_kqueue::NOTE_TRACKERR);
     }
 
     // `interp_select.py:35 W_Error = OSError` — expose the real type so

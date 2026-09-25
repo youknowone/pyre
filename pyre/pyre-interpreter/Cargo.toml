@@ -102,33 +102,14 @@ parking_lot = { workspace = true }
 libffi = { version = "5", features = ["system"] }
 
 [target.'cfg(windows)'.dependencies]
-# Remaining Windows FFI host_env does not wrap 1:1 (WinSock, Bluetooth,
-# IpHelper, SEH, OVERLAPPED). crypt32 store
-# readers are `cert_store` when host_env is on. `EXCEPTION_CONTINUE_SEARCH`
-# for the `faulthandler` vectored exception handler, and `winsound`'s
-# three calls (PlaySoundW in Media_Audio, Beep and MessageBeep in
-# System_Diagnostics_Debug), and the OVERLAPPED record `_winapi.Overlapped`
-# owns with the CancelIoEx/GetOverlappedResult pair that drives it
-# (System_IO).
+# Remaining Windows FFI host_env does not wrap 1:1 (WinSock types).
+# `not(host_env)` SEH still reads Foundation exception codes.
 # Kept on the same 0.61 line rustpython-host_env's nt module resolves to, so
 # HANDLE types match at the boundary.
 windows-sys = { version = "0.61", features = [
-    "Win32_Devices_Bluetooth",
     "Win32_Foundation",
-    "Win32_Media_Audio",
-    "Win32_NetworkManagement_IpHelper",
-    "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
-    "Win32_Security",
-    "Win32_Security_Cryptography",
-    "Win32_System_Diagnostics_Debug",
-    "Win32_System_Environment",
-    "Win32_System_IO",
-    "Win32_System_Ole",
-    "Win32_System_Variant",
-    "Win32_System_Wmi",
-    "Win32_UI_Shell",
-    "Win32_UI_WindowsAndMessaging",
+    "Win32_Devices_Bluetooth",
 ] }
 # Builds the `WideCStr` key/value-name arguments the `rustpython_host_env::winreg`
 # Reg* wrappers take. Same 1.x line host_env resolves to.

@@ -9,16 +9,17 @@
 //! GC-correct with no Rust-side side tables.
 
 use pyre_object::PyObjectRef;
+use rustpython_host_env::ctypes as host_ctypes;
 use std::sync::OnceLock;
 
 /// Reserved key under which the carrier lives in a ctypes type's own dict.
 const STGINFO_KEY: &str = "__stginfo__";
 
 // Storage-flag bits (subset of the full flag set).
-pub(super) const TYPEFLAG_ISPOINTER: i64 = 0x100;
-pub(super) const TYPEFLAG_HASPOINTER: i64 = 0x200;
+pub(super) const TYPEFLAG_ISPOINTER: i64 = host_ctypes::TYPEFLAG_ISPOINTER as i64;
+pub(super) const TYPEFLAG_HASPOINTER: i64 = host_ctypes::TYPEFLAG_HASPOINTER as i64;
 pub(super) const TYPEFLAG_HASUNION: i64 = 0x400;
-pub(super) const DICTFLAG_FINAL: i64 = 0x1000;
+pub(super) const DICTFLAG_FINAL: i64 = host_ctypes::DICTFLAG_FINAL as i64;
 
 // Carrier field keys.
 const K_SIZE: &str = "size";

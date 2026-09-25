@@ -9,6 +9,8 @@
 use super::interp_kevent::W_Kevent;
 #[cfg(all(target_os = "macos", feature = "host_env"))]
 use pyre_object::PyObjectRef;
+#[cfg(all(target_os = "macos", feature = "host_env"))]
+use rustpython_host_env::select::kqueue as host_kqueue;
 
 /// `select.kqueue` object — PyPy: `interp_kqueue.py class W_Kqueue`.
 ///
@@ -40,22 +42,14 @@ impl W_Kqueue {
     /// clearing its inheritable flag.
     #[staticmethod]
     fn __new__(_cls: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-        let kqfd = unsafe { libc::kqueue() };
-        if kqfd < 0 {
-            let e = std::io::Error::last_os_error();
-            return Err(pyre_interpreter::PyError::os_error_with_errno(
+        let cell = host_kqueue::create().map_err(|e| {
+            pyre_interpreter::PyError::os_error_with_errno(
                 e.raw_os_error().unwrap_or(0),
                 format!("kqueue: {e}"),
-            ));
-        }
-        unsafe {
-            let flags = libc::fcntl(kqfd, libc::F_GETFD);
-            if flags >= 0 {
-                libc::fcntl(kqfd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
-            }
-        }
+            )
+        })?;
         Ok(W_Kqueue::allocate(W_Kqueue {
-            kqfd,
+            kqfd: host_kqueue::fd(&cell),
             ..Default::default()
         }))
     }
@@ -85,11 +79,9 @@ impl W_Kqueue {
 
     fn close(&mut self) {
         if self.kqfd >= 0 {
-            let fd = self.kqfd;
+            let cell = host_kqueue::from_fd(self.kqfd);
             self.kqfd = -1;
-            unsafe {
-                libc::close(fd);
-            }
+            let _ = host_kqueue::close(&cell);
         }
     }
 
@@ -114,9 +106,9 @@ impl W_Kqueue {
         }
 
         // Build the changelist from the supplied kevent objects.
-        let mut changelist: Vec<libc::kevent> = Vec::new();
+        let mut changelist: Vec<host_kqueue::Event> = Vec::new();
         if !unsafe { pyre_object::is_none(w_changelist) } {
-            // `interp_kqueue.py:179` — space.listview accepts any iterable.
+            // `interp_kqueue.py descr_control` — space.listview accepts any iterable.
             let items = pyre_interpreter::baseobjspace::unpackiterable(w_changelist, -1)?;
             for item in items {
                 let ev = W_Kevent::from_obj(item).ok_or_else(|| {
@@ -124,91 +116,75 @@ impl W_Kqueue {
                         "arg 1 must be a sequence of kevent objects",
                     )
                 })?;
-                changelist.push(libc::kevent {
-                    ident: ev.ident as libc::uintptr_t,
+                changelist.push(host_kqueue::Event {
+                    ident: ev.ident as usize,
                     filter: ev.filter,
                     flags: ev.flags,
                     fflags: ev.fflags,
-                    data: ev.data as libc::intptr_t,
-                    udata: ev.udata as *mut libc::c_void,
+                    data: ev.data as isize,
+                    udata: ev.udata as usize,
                 });
             }
         }
 
-        // Resolve the timeout into a `timespec` (None blocks forever).
-        let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
-        let have_timeout = !unsafe { pyre_object::is_none(w_timeout) };
-        if have_timeout {
-            // `interp_kqueue.py:187` — space.float_w honours __float__.
-            let w_secs = pyre_interpreter::builtins::builtin_float(&[w_timeout])?;
-            let secs = unsafe { pyre_object::w_float_get_value(w_secs) };
-            if secs < 0.0 {
-                return Err(pyre_interpreter::PyError::value_error(format!(
-                    "Timeout must be None or >= 0, got {secs}"
-                )));
-            }
-            ts.tv_sec = secs as libc::time_t;
-            ts.tv_nsec = ((secs - secs.floor()) * 1e9) as libc::c_long;
-        }
+        // Resolve the timeout into a `Timespec` (None blocks forever).
+        let mut timeout =
+            if unsafe { pyre_object::is_none(w_timeout) } {
+                None
+            } else {
+                // `interp_kqueue.py descr_control` — space.float_w honours __float__.
+                let w_secs = pyre_interpreter::builtins::builtin_float(&[w_timeout])?;
+                let secs = unsafe { pyre_object::w_float_get_value(w_secs) };
+                if secs < 0.0 {
+                    return Err(pyre_interpreter::PyError::value_error(format!(
+                        "Timeout must be None or >= 0, got {secs}"
+                    )));
+                }
+                Some(host_kqueue::Timespec::from_secs(secs).ok_or_else(|| {
+                    pyre_interpreter::PyError::overflow_error("timeout is too large")
+                })?)
+            };
 
-        let mut eventlist: Vec<libc::kevent> = Vec::with_capacity(max_events as usize);
-        let ptimeout: *const libc::timespec = if have_timeout { &ts } else { std::ptr::null() };
-        let pchangelist: *const libc::kevent = if changelist.is_empty() {
-            std::ptr::null()
-        } else {
-            changelist.as_ptr()
-        };
+        let mut eventlist = vec![host_kqueue::Event::default(); max_events as usize];
 
-        // `interp_kqueue.py:214` — EINTR retry, recomputing the remaining
-        // timeout each pass (`ptimeout` aliases the mutable `ts`).
-        let deadline = if have_timeout {
-            Some(
-                std::time::Instant::now()
-                    + std::time::Duration::new(ts.tv_sec.max(0) as u64, ts.tv_nsec.max(0) as u32),
-            )
-        } else {
-            None
+        // `interp_kqueue.py descr_control` — EINTR retry, recomputing the
+        // remaining timeout each pass.
+        let deadline = match timeout.as_ref().and_then(|ts| ts.to_duration()) {
+            Some(d) => Some(std::time::Instant::now().checked_add(d).ok_or_else(|| {
+                pyre_interpreter::PyError::overflow_error("timeout is too large")
+            })?),
+            None => None,
         };
         let nfds = loop {
-            let (r, errno) = pyre_interpreter::module::thread::call_external_function(|| unsafe {
-                libc::kevent(
-                    self.kqfd,
-                    pchangelist,
-                    changelist.len() as libc::c_int,
-                    eventlist.as_mut_ptr(),
-                    max_events as libc::c_int,
-                    ptimeout,
-                )
+            let (result, errno) = pyre_interpreter::module::thread::call_external_function(|| {
+                host_kqueue::kevent(self.kqfd, &changelist, &mut eventlist, timeout.as_ref())
             });
-            if r >= 0 {
-                break r;
-            }
-            if errno == libc::EINTR {
-                // `interp_kqueue.py:223-226` — deliver a pending signal, then
-                // retry with the remaining timeout recomputed.
-                pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
-                if let Some(dl) = deadline {
-                    let now = std::time::Instant::now();
-                    let rem = if now >= dl {
-                        std::time::Duration::ZERO
-                    } else {
-                        dl - now
-                    };
-                    ts.tv_sec = rem.as_secs() as libc::time_t;
-                    ts.tv_nsec = rem.subsec_nanos() as libc::c_long;
+            match result {
+                Ok(n) => break n,
+                Err(e) if rustpython_host_env::io::is_interrupted_error(&e) => {
+                    // `interp_kqueue.py descr_control` — deliver a pending
+                    // signal, then retry with the remaining timeout recomputed.
+                    pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
+                    if let Some(dl) = deadline {
+                        timeout = Some(host_kqueue::Timespec::from_duration(
+                            dl.saturating_duration_since(std::time::Instant::now()),
+                        ));
+                    }
+                    continue;
                 }
-                continue;
+                Err(e) => {
+                    let errno = e.raw_os_error().unwrap_or(errno);
+                    return Err(pyre_interpreter::PyError::os_error_with_errno(
+                        errno,
+                        format!("kevent: {e}"),
+                    ));
+                }
             }
-            let e = std::io::Error::from_raw_os_error(errno);
-            return Err(pyre_interpreter::PyError::os_error_with_errno(
-                errno,
-                format!("kevent: {e}"),
-            ));
         };
-        unsafe { eventlist.set_len(nfds as usize) };
 
         let result: Vec<PyObjectRef> = eventlist
             .iter()
+            .take(nfds)
             .map(|evt| {
                 W_Kevent::allocate(W_Kevent {
                     ident: evt.ident as u64,

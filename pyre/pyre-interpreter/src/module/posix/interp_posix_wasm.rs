@@ -1339,8 +1339,22 @@ static SYMLINK_SIG: WriteSig = WriteSig {
 
 /// Two of the four `access` mode bits, which the constant table publishes
 /// under the same names.
+#[cfg(feature = "host_env")]
+const X_OK: i64 = rustpython_host_env::os::X_OK as i64;
+#[cfg(not(feature = "host_env"))]
 const X_OK: i64 = 1;
+#[cfg(feature = "host_env")]
+const W_OK: i64 = rustpython_host_env::os::W_OK as i64;
+#[cfg(not(feature = "host_env"))]
 const W_OK: i64 = 2;
+#[cfg(feature = "host_env")]
+const F_OK: i64 = rustpython_host_env::os::F_OK as i64;
+#[cfg(not(feature = "host_env"))]
+const F_OK: i64 = 0;
+#[cfg(feature = "host_env")]
+const R_OK: i64 = rustpython_host_env::os::R_OK as i64;
+#[cfg(not(feature = "host_env"))]
+const R_OK: i64 = 4;
 
 /// `posix.access(path, mode, ...)` — whether the name is there and the access
 /// asked for is one this mount grants.
@@ -1776,10 +1790,10 @@ pub fn register_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
         ("O_EXCL", oflag::EXCL),
         ("O_DIRECTORY", oflag::DIRECTORY),
         ("O_CLOEXEC", oflag::CLOEXEC),
-        ("F_OK", 0),
+        ("F_OK", F_OK),
         ("X_OK", X_OK),
         ("W_OK", W_OK),
-        ("R_OK", 4),
+        ("R_OK", R_OK),
         ("SEEK_SET", 0),
         ("SEEK_CUR", 1),
         ("SEEK_END", 2),

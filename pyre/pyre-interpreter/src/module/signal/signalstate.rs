@@ -9,6 +9,15 @@
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicPtr, Ordering};
 
+#[cfg(all(windows, not(feature = "host_env")))]
+use libc::SIG_ERR;
+#[cfg(all(any(unix, windows), not(feature = "host_env")))]
+use libc::{SIG_DFL, SIG_IGN};
+#[cfg(all(windows, feature = "host_env"))]
+use rustpython_host_env::signal::SIG_ERR;
+#[cfg(all(any(unix, windows), feature = "host_env"))]
+use rustpython_host_env::signal::{SIG_DFL, SIG_IGN};
+
 /// `signals.c:34` — one past the highest signal number the platform has,
 /// which is what `Py_NSIG` names and what every range check answers from.
 /// The libc crate does not surface it, so `<signal.h>`'s own number is
@@ -271,13 +280,13 @@ pub fn pypysig_setflag(signum: i32) -> bool {
 /// `signals.c:75-87 pypysig_default` — restore the OS default action.
 #[cfg(unix)]
 pub fn pypysig_default(signum: i32) -> bool {
-    install_handler(signum, libc::SIG_DFL)
+    install_handler(signum, SIG_DFL)
 }
 
 /// `signals.c:61-73 pypysig_ignore` — ignore the signal at the OS level.
 #[cfg(unix)]
 pub fn pypysig_ignore(signum: i32) -> bool {
-    install_handler(signum, libc::SIG_IGN)
+    install_handler(signum, SIG_IGN)
 }
 
 /// `signals.c:190-203 pypysig_reinstall` — no-op on platforms with
@@ -453,7 +462,7 @@ pub fn unblock_async_signals_on_interp_thread() {}
 #[cfg(windows)]
 fn install_handler(signum: i32, handler: libc::sighandler_t) -> bool {
     let previous = crate::builtins::crt_call!(libc::signal(signum, handler));
-    previous != libc::SIG_ERR as libc::sighandler_t
+    previous != SIG_ERR as libc::sighandler_t
 }
 
 /// The wakeup byte on a descriptor that answered the socket probe
@@ -564,12 +573,12 @@ pub fn pypysig_setflag(signum: i32) -> bool {
 
 #[cfg(windows)]
 pub fn pypysig_default(signum: i32) -> bool {
-    install_handler(signum, libc::SIG_DFL)
+    install_handler(signum, SIG_DFL)
 }
 
 #[cfg(windows)]
 pub fn pypysig_ignore(signum: i32) -> bool {
-    install_handler(signum, libc::SIG_IGN)
+    install_handler(signum, SIG_IGN)
 }
 
 /// The handler puts itself back as it runs, so there is nothing left to do

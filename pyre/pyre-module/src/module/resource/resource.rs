@@ -87,7 +87,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                             ));
                         }
                     } else {
-                        return Err(pyre_interpreter::PyError::type_error("getrusage() missing argument"));
+                        return Err(pyre_interpreter::PyError::type_error(
+                            "getrusage() missing argument",
+                        ));
                     };
                     match rustpython_host_env::resource::getrusage(who) {
                         Ok(r) => Ok(make_struct_rusage(&r)),
@@ -97,7 +99,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                             // an invalid `who`; only other errno values are
                             // surfaced as OSError.
                             if errno == libc::EINVAL {
-                                return Err(pyre_interpreter::PyError::value_error("invalid who parameter"));
+                                return Err(pyre_interpreter::PyError::value_error(
+                                    "invalid who parameter",
+                                ));
                             }
                             Err(pyre_interpreter::PyError::os_error_with_errno(
                                 errno,
@@ -134,7 +138,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                             ));
                         }
                     } else {
-                        return Err(pyre_interpreter::PyError::type_error("getrlimit() missing argument"));
+                        return Err(pyre_interpreter::PyError::type_error(
+                            "getrlimit() missing argument",
+                        ));
                     };
                     match rustpython_host_env::resource::getrlimit(res) {
                         Ok(rl) => {
@@ -252,71 +258,75 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     // ── Constants (POSIX subset matching CPython) ──
     #[cfg(unix)]
     {
+        #[cfg(not(feature = "host_env"))]
+        use libc as host_resource;
+        #[cfg(feature = "host_env")]
+        use rustpython_host_env::resource as host_resource;
         pyre_interpreter::module_ns_store(
             ns,
             "RUSAGE_SELF",
-            pyre_object::w_int_new(libc::RUSAGE_SELF as i64),
+            pyre_object::w_int_new(host_resource::RUSAGE_SELF as i64),
         );
         pyre_interpreter::module_ns_store(
             ns,
             "RUSAGE_CHILDREN",
-            pyre_object::w_int_new(libc::RUSAGE_CHILDREN as i64),
+            pyre_object::w_int_new(host_resource::RUSAGE_CHILDREN as i64),
         );
         pyre_interpreter::module_ns_store(
             ns,
             "RLIMIT_CPU",
-            pyre_object::w_int_new(libc::RLIMIT_CPU as i64),
+            pyre_object::w_int_new(host_resource::RLIMIT_CPU as i64),
         );
         pyre_interpreter::module_ns_store(
             ns,
             "RLIMIT_FSIZE",
-            pyre_object::w_int_new(libc::RLIMIT_FSIZE as i64),
+            pyre_object::w_int_new(host_resource::RLIMIT_FSIZE as i64),
         );
         pyre_interpreter::module_ns_store(
             ns,
             "RLIMIT_DATA",
-            pyre_object::w_int_new(libc::RLIMIT_DATA as i64),
+            pyre_object::w_int_new(host_resource::RLIMIT_DATA as i64),
         );
         pyre_interpreter::module_ns_store(
             ns,
             "RLIMIT_STACK",
-            pyre_object::w_int_new(libc::RLIMIT_STACK as i64),
+            pyre_object::w_int_new(host_resource::RLIMIT_STACK as i64),
         );
         pyre_interpreter::module_ns_store(
             ns,
             "RLIMIT_CORE",
-            pyre_object::w_int_new(libc::RLIMIT_CORE as i64),
+            pyre_object::w_int_new(host_resource::RLIMIT_CORE as i64),
         );
         pyre_interpreter::module_ns_store(
             ns,
             "RLIMIT_NOFILE",
-            pyre_object::w_int_new(libc::RLIMIT_NOFILE as i64),
+            pyre_object::w_int_new(host_resource::RLIMIT_NOFILE as i64),
         );
         pyre_interpreter::module_ns_store(
             ns,
             "RLIMIT_AS",
-            pyre_object::w_int_new(libc::RLIMIT_AS as i64),
+            pyre_object::w_int_new(host_resource::RLIMIT_AS as i64),
         );
         pyre_interpreter::module_ns_store(
             ns,
             "RLIMIT_RSS",
-            pyre_object::w_int_new(libc::RLIMIT_RSS as i64),
+            pyre_object::w_int_new(host_resource::RLIMIT_RSS as i64),
         );
         pyre_interpreter::module_ns_store(
             ns,
             "RLIMIT_NPROC",
-            pyre_object::w_int_new(libc::RLIMIT_NPROC as i64),
+            pyre_object::w_int_new(host_resource::RLIMIT_NPROC as i64),
         );
         pyre_interpreter::module_ns_store(
             ns,
             "RLIMIT_MEMLOCK",
-            pyre_object::w_int_new(libc::RLIMIT_MEMLOCK as i64),
+            pyre_object::w_int_new(host_resource::RLIMIT_MEMLOCK as i64),
         );
         // RLIM_INFINITY: unsigned max — pyre stores as i64 (-1 on signed widen).
         pyre_interpreter::module_ns_store(
             ns,
             "RLIM_INFINITY",
-            pyre_object::w_int_new(libc::RLIM_INFINITY as i64),
+            pyre_object::w_int_new(host_resource::RLIM_INFINITY as i64),
         );
     }
     Ok(())

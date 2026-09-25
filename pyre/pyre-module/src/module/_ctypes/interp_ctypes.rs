@@ -11,12 +11,8 @@
 //! the buffer-view machinery aliases nested/pointed-to memory.
 //!
 //! All host/FFI work is delegated to `rustpython_host_env::ctypes`; the module
-//! contains no direct `libc::` FFI.  The one exception is the Windows loader,
-//! which calls `windows-sys` directly: `LoadLibrary` has to reach
-//! `LoadLibraryExW`'s flags argument, and that layer's Windows door is
-//! `libloading::Library::new`, which has none.  The handle is then the
-//! `HMODULE` rather than a key into its library cache, so `FreeLibrary` and
-//! [`lookup_symbol`] are the plain Win32 calls that go with one.
+//! contains no direct `libc::` FFI.  Windows `LoadLibrary` is
+//! `host_ctypes::load_library_ex_w`, so the flags reach `LoadLibraryExW`.
 
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
     #[cfg(all(any(unix, windows), feature = "host_env"))]
@@ -328,13 +324,31 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
 
     // ── import-time constants ──
     pyre_interpreter::module_ns_store(ns, "__version__", pyre_object::w_str_new("1.1.0"));
-    // `crates/vm/src/stdlib/_ctypes.rs`: CDECL=0x1, PYTHONAPI=0x4,
-    // USE_ERRNO=0x8, USE_LASTERROR=0x10.
-    pyre_interpreter::module_ns_store(ns, "FUNCFLAG_CDECL", pyre_object::w_int_new(0x1));
-    pyre_interpreter::module_ns_store(ns, "FUNCFLAG_PYTHONAPI", pyre_object::w_int_new(0x4));
-    pyre_interpreter::module_ns_store(ns, "FUNCFLAG_USE_ERRNO", pyre_object::w_int_new(0x8));
-    pyre_interpreter::module_ns_store(ns, "FUNCFLAG_USE_LASTERROR", pyre_object::w_int_new(0x10));
-    pyre_interpreter::module_ns_store(ns, "CTYPES_MAX_ARGCOUNT", pyre_object::w_int_new(1024));
+    pyre_interpreter::module_ns_store(
+        ns,
+        "FUNCFLAG_CDECL",
+        pyre_object::w_int_new(i64::from(host_ctypes::FUNCFLAG_CDECL)),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "FUNCFLAG_PYTHONAPI",
+        pyre_object::w_int_new(i64::from(host_ctypes::FUNCFLAG_PYTHONAPI)),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "FUNCFLAG_USE_ERRNO",
+        pyre_object::w_int_new(i64::from(host_ctypes::FUNCFLAG_USE_ERRNO)),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "FUNCFLAG_USE_LASTERROR",
+        pyre_object::w_int_new(i64::from(host_ctypes::FUNCFLAG_USE_LASTERROR)),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "CTYPES_MAX_ARGCOUNT",
+        pyre_object::w_int_new(host_ctypes::CTYPES_MAX_ARGCOUNT as i64),
+    );
 
     #[cfg(target_os = "macos")]
     pyre_interpreter::module_ns_store(
@@ -535,8 +549,16 @@ fn register_windows_loader(ns: pyre_object::PyObjectRef) {
     // marks a return value `_check_HRESULT` inspects.  Both sit inside the
     // same `#ifdef MS_WIN32` as the functions below, so neither is defined on
     // the posix side.
-    pyre_interpreter::module_ns_store(ns, "FUNCFLAG_STDCALL", pyre_object::w_int_new(0x0));
-    pyre_interpreter::module_ns_store(ns, "FUNCFLAG_HRESULT", pyre_object::w_int_new(0x2));
+    pyre_interpreter::module_ns_store(
+        ns,
+        "FUNCFLAG_STDCALL",
+        pyre_object::w_int_new(i64::from(host_ctypes::FUNCFLAG_STDCALL)),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "FUNCFLAG_HRESULT",
+        pyre_object::w_int_new(i64::from(host_ctypes::FUNCFLAG_HRESULT)),
+    );
 
     // ── LoadLibrary(name, load_flags=0) → HMODULE ──
     //

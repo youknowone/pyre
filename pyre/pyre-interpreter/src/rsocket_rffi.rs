@@ -14,6 +14,14 @@ pub use libc::{addrinfo, sockaddr, sockaddr_in, sockaddr_in6, sockaddr_storage};
 #[cfg(windows)]
 use windows_sys::Win32::Networking::WinSock as ws;
 
+/// Integer names the shared body compares against.  `host_env` is the owner
+/// when present; `ws` is only the `not(host_env)` fallback.  Types and the
+/// WinSock entry points stay on `ws` — host_env does not wrap those 1:1.
+#[cfg(all(windows, feature = "host_env"))]
+use rustpython_host_env::socket as win_c;
+#[cfg(all(windows, not(feature = "host_env")))]
+use ws as win_c;
+
 #[cfg(windows)]
 pub use ws::{
     ADDRINFOA as addrinfo, SOCKADDR as sockaddr, SOCKADDR_IN as sockaddr_in,
@@ -51,7 +59,7 @@ pub fn is_invalid(s: Socket) -> bool {
 }
 #[cfg(windows)]
 pub fn is_invalid(s: Socket) -> bool {
-    s == ws::INVALID_SOCKET
+    s == win_c::INVALID_SOCKET
 }
 
 /// `fileno()` reports the descriptor as a Python int, and `_fd` stores it as
@@ -86,40 +94,38 @@ pub const AI_PASSIVE: libc::c_int = libc::AI_PASSIVE;
 pub const INADDR_BROADCAST: u32 = libc::INADDR_BROADCAST;
 
 #[cfg(windows)]
-pub const AF_UNSPEC: libc::c_int = ws::AF_UNSPEC as libc::c_int;
+pub const AF_UNSPEC: libc::c_int = win_c::AF_UNSPEC as libc::c_int;
 #[cfg(windows)]
-pub const AF_INET: libc::c_int = ws::AF_INET as libc::c_int;
+pub const AF_INET: libc::c_int = win_c::AF_INET as libc::c_int;
 #[cfg(windows)]
-pub const AF_INET6: libc::c_int = ws::AF_INET6 as libc::c_int;
+pub const AF_INET6: libc::c_int = win_c::AF_INET6 as libc::c_int;
 #[cfg(windows)]
-pub const SOCK_STREAM: libc::c_int = ws::SOCK_STREAM;
+pub const SOCK_STREAM: libc::c_int = win_c::SOCK_STREAM;
 #[cfg(windows)]
-pub const SOCK_DGRAM: libc::c_int = ws::SOCK_DGRAM;
+pub const SOCK_DGRAM: libc::c_int = win_c::SOCK_DGRAM;
 #[cfg(windows)]
-pub const SOL_SOCKET: libc::c_int = ws::SOL_SOCKET;
+pub const SOL_SOCKET: libc::c_int = win_c::SOL_SOCKET;
 #[cfg(windows)]
-pub const SO_TYPE: libc::c_int = ws::SO_TYPE;
+pub const SO_TYPE: libc::c_int = win_c::SO_TYPE;
 #[cfg(windows)]
-pub const SO_ERROR: libc::c_int = ws::SO_ERROR;
+pub const SO_ERROR: libc::c_int = win_c::SO_ERROR;
 /// The code a call about a descriptor that is not a socket comes back with.
 #[cfg(windows)]
-pub const WSAENOTSOCK: i32 = ws::WSAENOTSOCK;
+pub const WSAENOTSOCK: i32 = win_c::WSAENOTSOCK;
 /// The code a send that would have blocked comes back with — a buffer with no
 /// room left, which is the one failure a caller may choose to drop.
 #[cfg(windows)]
-pub const WSAEWOULDBLOCK: i32 = ws::WSAEWOULDBLOCK;
+pub const WSAEWOULDBLOCK: i32 = win_c::WSAEWOULDBLOCK;
 #[cfg(windows)]
-pub const NI_MAXHOST: usize = ws::NI_MAXHOST as usize;
+pub const NI_MAXHOST: usize = win_c::NI_MAXHOST as usize;
 #[cfg(windows)]
-pub const INADDR_ANY: u32 = ws::INADDR_ANY;
+pub const INADDR_ANY: u32 = win_c::INADDR_ANY;
 #[cfg(windows)]
-pub const AI_NUMERICHOST: libc::c_int = ws::AI_NUMERICHOST as libc::c_int;
+pub const AI_NUMERICHOST: libc::c_int = win_c::AI_NUMERICHOST as libc::c_int;
 #[cfg(windows)]
-pub const AI_PASSIVE: libc::c_int = ws::AI_PASSIVE as libc::c_int;
-/// WinSock declares it as a preprocessor macro, which the generated bindings
-/// do not carry.  It is all ones, so it reads the same in either byte order.
+pub const AI_PASSIVE: libc::c_int = win_c::AI_PASSIVE as libc::c_int;
 #[cfg(windows)]
-pub const INADDR_BROADCAST: u32 = 0xffff_ffff;
+pub const INADDR_BROADCAST: u32 = win_c::INADDR_BROADCAST;
 
 // ── WinSock initialisation ──
 
@@ -152,7 +158,13 @@ pub fn init() {}
 pub fn last_error_code() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
-#[cfg(windows)]
+#[cfg(all(windows, feature = "host_env"))]
+pub fn last_error_code() -> i32 {
+    rustpython_host_env::socket::last_socket_error()
+        .raw_os_error()
+        .unwrap_or(0)
+}
+#[cfg(all(windows, not(feature = "host_env")))]
 pub fn last_error_code() -> i32 {
     unsafe { ws::WSAGetLastError() }
 }
@@ -169,7 +181,7 @@ pub fn error_is_interrupted(code: i32) -> bool {
 }
 #[cfg(windows)]
 pub fn error_is_interrupted(code: i32) -> bool {
-    code == ws::WSAEINTR
+    code == win_c::WSAEINTR
 }
 
 /// Whether a code means the operation would have blocked.  PyPy keeps every
@@ -182,7 +194,7 @@ pub fn error_is_would_block(code: i32) -> bool {
 }
 #[cfg(windows)]
 pub fn error_is_would_block(code: i32) -> bool {
-    code == ws::WSAEWOULDBLOCK
+    code == win_c::WSAEWOULDBLOCK
 }
 
 /// `rsocket.py HAVE_SOCK_CLOEXEC` / `HAVE_SOCK_NONBLOCK`: the two creation
@@ -206,7 +218,7 @@ pub fn error_is_connect_in_progress(code: i32) -> bool {
 }
 #[cfg(windows)]
 pub fn error_is_connect_in_progress(code: i32) -> bool {
-    code == ws::WSAEWOULDBLOCK
+    code == win_c::WSAEWOULDBLOCK
 }
 
 /// `gai_strerror`.  Unix only: the symbol is a header-level inline over the
@@ -282,7 +294,7 @@ pub fn inet_aton(text: &std::ffi::CStr) -> Option<[u8; 4]> {
     }
     init();
     let addr = unsafe { ws::inet_addr(text.as_ptr() as *const u8) };
-    (addr != ws::INADDR_NONE).then(|| addr.to_ne_bytes())
+    (addr != win_c::INADDR_NONE).then(|| addr.to_ne_bytes())
 }
 
 /// `inet_ntoa` — the dotted-quad spelling of four address bytes in network
@@ -411,7 +423,7 @@ pub fn apply_timeout(s: Socket, timeout: f64) -> std::io::Result<()> {
 #[cfg(windows)]
 pub fn apply_timeout(s: Socket, timeout: f64) -> std::io::Result<()> {
     let mut nonblocking: u32 = u32::from(timeout >= 0.0);
-    if unsafe { ws::ioctlsocket(s, ws::FIONBIO, &mut nonblocking) } == ws::SOCKET_ERROR {
+    if unsafe { ws::ioctlsocket(s, win_c::FIONBIO, &mut nonblocking) } == win_c::SOCKET_ERROR {
         return Err(last_error());
     }
     Ok(())
@@ -449,7 +461,7 @@ pub fn poll_writable(s: Socket, timeout_ms: libc::c_int) -> (libc::c_int, i32) {
 }
 #[cfg(windows)]
 pub fn poll_readable(s: Socket, timeout_ms: libc::c_int) -> (libc::c_int, i32) {
-    poll_one(s, ws::POLLIN, timeout_ms)
+    poll_one(s, win_c::POLLIN as i16, timeout_ms)
 }
 
 /// The other half of `RSocket._select`, which `internal_connect` waits on: a
@@ -780,7 +792,7 @@ pub unsafe fn wsa_ioctl(
             None,
         )
     };
-    (result != ws::SOCKET_ERROR).then_some(returned)
+    (result != win_c::SOCKET_ERROR).then_some(returned)
 }
 
 /// `SIO_TCP_SET_ACK_FREQUENCY`, which is what `TCP_QUICKACK` names here.
@@ -789,15 +801,20 @@ pub unsafe fn wsa_ioctl(
 /// Nothing reads it back: WinSock exposes no query for the current setting.
 #[cfg(windows)]
 pub unsafe fn set_ack_frequency(s: Socket, flag: libc::c_int) -> libc::c_int {
+    let code = win_c::SIO_TCP_SET_ACK_FREQUENCY as u32;
     let sent = unsafe {
         wsa_ioctl(
             s,
-            ws::SIO_TCP_SET_ACK_FREQUENCY,
+            code,
             (&raw const flag).cast(),
             core::mem::size_of::<libc::c_int>() as u32,
         )
     };
-    if sent.is_some() { 0 } else { ws::SOCKET_ERROR }
+    if sent.is_some() {
+        0
+    } else {
+        win_c::SOCKET_ERROR
+    }
 }
 
 #[cfg(unix)]

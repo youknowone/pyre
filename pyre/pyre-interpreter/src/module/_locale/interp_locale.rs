@@ -262,34 +262,59 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // a different category, so it must come from libc there as well.
     #[cfg(any(unix, windows))]
     {
+        #[cfg(not(feature = "host_env"))]
+        use libc as host_locale;
+        #[cfg(feature = "host_env")]
+        use rustpython_host_env::locale as host_locale;
         crate::module_ns_store(
             ns,
             "LC_CTYPE",
-            pyre_object::w_int_new(libc::LC_CTYPE as i64),
+            pyre_object::w_int_new(host_locale::LC_CTYPE as i64),
         );
         crate::module_ns_store(
             ns,
             "LC_NUMERIC",
-            pyre_object::w_int_new(libc::LC_NUMERIC as i64),
+            pyre_object::w_int_new(host_locale::LC_NUMERIC as i64),
         );
-        crate::module_ns_store(ns, "LC_TIME", pyre_object::w_int_new(libc::LC_TIME as i64));
+        crate::module_ns_store(
+            ns,
+            "LC_TIME",
+            pyre_object::w_int_new(host_locale::LC_TIME as i64),
+        );
         crate::module_ns_store(
             ns,
             "LC_COLLATE",
-            pyre_object::w_int_new(libc::LC_COLLATE as i64),
+            pyre_object::w_int_new(host_locale::LC_COLLATE as i64),
         );
         crate::module_ns_store(
             ns,
             "LC_MONETARY",
-            pyre_object::w_int_new(libc::LC_MONETARY as i64),
+            pyre_object::w_int_new(host_locale::LC_MONETARY as i64),
         );
-        crate::module_ns_store(ns, "LC_ALL", pyre_object::w_int_new(libc::LC_ALL as i64));
+        crate::module_ns_store(
+            ns,
+            "LC_ALL",
+            pyre_object::w_int_new(host_locale::LC_ALL as i64),
+        );
     }
     // `LC_MESSAGES` is a POSIX category the MSVC CRT has no counterpart for.
     // `locale.py` appends it to `__all__` only if the name survived
     // its `from _locale import *`, so publishing it here on Windows puts a
     // category into `from locale import *` that no call can be made with.
-    #[cfg(unix)]
+    #[cfg(all(
+        unix,
+        feature = "host_env",
+        not(any(target_os = "ios", target_os = "redox"))
+    ))]
+    crate::module_ns_store(
+        ns,
+        "LC_MESSAGES",
+        pyre_object::w_int_new(rustpython_host_env::locale::LC_MESSAGES as i64),
+    );
+    #[cfg(all(
+        unix,
+        not(all(feature = "host_env", not(any(target_os = "ios", target_os = "redox"))))
+    ))]
     crate::module_ns_store(
         ns,
         "LC_MESSAGES",
@@ -525,7 +550,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // instead.  That pair is `LC_ALL..=LC_TIME`, the numbering
                 // the constants above are published from.
                 #[cfg(windows)]
-                if !(libc::LC_ALL..=libc::LC_TIME).contains(&cat) {
+                if !(rustpython_host_env::locale::LC_ALL..=rustpython_host_env::locale::LC_TIME)
+                    .contains(&cat)
+                {
                     return Err(locale_error("invalid locale category"));
                 }
                 #[cfg(windows)]

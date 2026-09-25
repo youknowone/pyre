@@ -273,22 +273,22 @@ fn check_signum_in_range(signum: i64) -> Result<(), crate::PyError> {
 }
 
 /// The runtime's own signal, absent from the libc crate.
-#[cfg(windows)]
+#[cfg(all(windows, feature = "host_env"))]
+const SIGBREAK: i32 = rustpython_host_env::signal::SIGBREAK;
+#[cfg(all(windows, not(feature = "host_env")))]
 const SIGBREAK: i32 = 21;
 
 /// Whether the runtime has a signal under this number at all.  `SIGBREAK` is
 /// its own, so the set is spelled out rather than taken from `libc`.
 #[cfg(windows)]
 fn windows_handles_signal(signum: i32) -> bool {
+    #[cfg(not(feature = "host_env"))]
+    use libc::{SIGABRT, SIGFPE, SIGILL, SIGINT, SIGSEGV, SIGTERM};
+    #[cfg(feature = "host_env")]
+    use rustpython_host_env::signal::{SIGABRT, SIGFPE, SIGILL, SIGINT, SIGSEGV, SIGTERM};
     matches!(
         signum,
-        libc::SIGINT
-            | libc::SIGILL
-            | libc::SIGFPE
-            | libc::SIGSEGV
-            | libc::SIGTERM
-            | SIGBREAK
-            | libc::SIGABRT
+        SIGINT | SIGILL | SIGFPE | SIGSEGV | SIGTERM | SIGBREAK | SIGABRT
     )
 }
 
@@ -1074,6 +1074,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     );
     #[cfg(unix)]
     {
+        #[cfg(not(feature = "host_env"))]
+        use libc as sig;
+        #[cfg(feature = "host_env")]
+        use rustpython_host_env::signal as sig;
         // moduledef.py:17 `'ItimerError': 'interp_signal.get_itimer_error(space)'`
         // — `signal.new_exception_class("signal.ItimerError", space.w_IOError)`.
         // An OSError subclass so `setitimer`'s `exception_from_saved_errno`
@@ -1290,17 +1294,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::module_ns_store(
             ns,
             "ITIMER_REAL",
-            pyre_object::w_int_new(libc::ITIMER_REAL as i64),
+            pyre_object::w_int_new(sig::ITIMER_REAL as i64),
         );
         crate::module_ns_store(
             ns,
             "ITIMER_VIRTUAL",
-            pyre_object::w_int_new(libc::ITIMER_VIRTUAL as i64),
+            pyre_object::w_int_new(sig::ITIMER_VIRTUAL as i64),
         );
         crate::module_ns_store(
             ns,
             "ITIMER_PROF",
-            pyre_object::w_int_new(libc::ITIMER_PROF as i64),
+            pyre_object::w_int_new(sig::ITIMER_PROF as i64),
         );
         // sigwait(sigset) -> signum — interp_signal.py
         crate::module_ns_store(
@@ -1530,17 +1534,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::module_ns_store(
             ns,
             "SIG_BLOCK",
-            pyre_object::w_int_new(libc::SIG_BLOCK as i64),
+            pyre_object::w_int_new(sig::SIG_BLOCK as i64),
         );
         crate::module_ns_store(
             ns,
             "SIG_UNBLOCK",
-            pyre_object::w_int_new(libc::SIG_UNBLOCK as i64),
+            pyre_object::w_int_new(sig::SIG_UNBLOCK as i64),
         );
         crate::module_ns_store(
             ns,
             "SIG_SETMASK",
-            pyre_object::w_int_new(libc::SIG_SETMASK as i64),
+            pyre_object::w_int_new(sig::SIG_SETMASK as i64),
         );
         // pidfd_send_signal(pidfd, sig, siginfo=None, flags=0) - Linux-only
         #[cfg(target_os = "linux")]
@@ -1596,7 +1600,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             }),
         );
     }
+    #[cfg(all(any(unix, windows), feature = "host_env"))]
+    crate::module_ns_store(
+        ns,
+        "SIG_DFL",
+        pyre_object::w_int_new(rustpython_host_env::signal::SIG_DFL as i64),
+    );
+    #[cfg(all(any(unix, windows), feature = "host_env"))]
+    crate::module_ns_store(
+        ns,
+        "SIG_IGN",
+        pyre_object::w_int_new(rustpython_host_env::signal::SIG_IGN as i64),
+    );
+    #[cfg(not(all(any(unix, windows), feature = "host_env")))]
     crate::module_ns_store(ns, "SIG_DFL", pyre_object::w_int_new(0));
+    #[cfg(not(all(any(unix, windows), feature = "host_env")))]
     crate::module_ns_store(ns, "SIG_IGN", pyre_object::w_int_new(1));
     crate::module_ns_store(
         ns,
@@ -1611,43 +1629,43 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     }
     #[cfg(unix)]
     {
-        crate::module_ns_store(ns, "SIGHUP", pyre_object::w_int_new(libc::SIGHUP as i64));
-        crate::module_ns_store(ns, "SIGINT", pyre_object::w_int_new(libc::SIGINT as i64));
-        crate::module_ns_store(ns, "SIGQUIT", pyre_object::w_int_new(libc::SIGQUIT as i64));
-        crate::module_ns_store(ns, "SIGILL", pyre_object::w_int_new(libc::SIGILL as i64));
-        crate::module_ns_store(ns, "SIGTRAP", pyre_object::w_int_new(libc::SIGTRAP as i64));
-        crate::module_ns_store(ns, "SIGABRT", pyre_object::w_int_new(libc::SIGABRT as i64));
-        crate::module_ns_store(ns, "SIGBUS", pyre_object::w_int_new(libc::SIGBUS as i64));
-        crate::module_ns_store(ns, "SIGFPE", pyre_object::w_int_new(libc::SIGFPE as i64));
-        crate::module_ns_store(ns, "SIGKILL", pyre_object::w_int_new(libc::SIGKILL as i64));
-        crate::module_ns_store(ns, "SIGUSR1", pyre_object::w_int_new(libc::SIGUSR1 as i64));
-        crate::module_ns_store(ns, "SIGSEGV", pyre_object::w_int_new(libc::SIGSEGV as i64));
-        crate::module_ns_store(ns, "SIGUSR2", pyre_object::w_int_new(libc::SIGUSR2 as i64));
-        crate::module_ns_store(ns, "SIGPIPE", pyre_object::w_int_new(libc::SIGPIPE as i64));
-        crate::module_ns_store(ns, "SIGALRM", pyre_object::w_int_new(libc::SIGALRM as i64));
-        crate::module_ns_store(ns, "SIGTERM", pyre_object::w_int_new(libc::SIGTERM as i64));
-        crate::module_ns_store(ns, "SIGCHLD", pyre_object::w_int_new(libc::SIGCHLD as i64));
-        crate::module_ns_store(ns, "SIGCONT", pyre_object::w_int_new(libc::SIGCONT as i64));
-        crate::module_ns_store(ns, "SIGSTOP", pyre_object::w_int_new(libc::SIGSTOP as i64));
-        crate::module_ns_store(ns, "SIGTSTP", pyre_object::w_int_new(libc::SIGTSTP as i64));
-        crate::module_ns_store(ns, "SIGTTIN", pyre_object::w_int_new(libc::SIGTTIN as i64));
-        crate::module_ns_store(ns, "SIGTTOU", pyre_object::w_int_new(libc::SIGTTOU as i64));
-        crate::module_ns_store(ns, "SIGURG", pyre_object::w_int_new(libc::SIGURG as i64));
-        crate::module_ns_store(ns, "SIGXCPU", pyre_object::w_int_new(libc::SIGXCPU as i64));
-        crate::module_ns_store(ns, "SIGXFSZ", pyre_object::w_int_new(libc::SIGXFSZ as i64));
+        #[cfg(not(feature = "host_env"))]
+        use libc as sig;
+        #[cfg(feature = "host_env")]
+        use rustpython_host_env::signal as sig;
+        crate::module_ns_store(ns, "SIGHUP", pyre_object::w_int_new(sig::SIGHUP as i64));
+        crate::module_ns_store(ns, "SIGINT", pyre_object::w_int_new(sig::SIGINT as i64));
+        crate::module_ns_store(ns, "SIGQUIT", pyre_object::w_int_new(sig::SIGQUIT as i64));
+        crate::module_ns_store(ns, "SIGILL", pyre_object::w_int_new(sig::SIGILL as i64));
+        crate::module_ns_store(ns, "SIGTRAP", pyre_object::w_int_new(sig::SIGTRAP as i64));
+        crate::module_ns_store(ns, "SIGABRT", pyre_object::w_int_new(sig::SIGABRT as i64));
+        crate::module_ns_store(ns, "SIGBUS", pyre_object::w_int_new(sig::SIGBUS as i64));
+        crate::module_ns_store(ns, "SIGFPE", pyre_object::w_int_new(sig::SIGFPE as i64));
+        crate::module_ns_store(ns, "SIGKILL", pyre_object::w_int_new(sig::SIGKILL as i64));
+        crate::module_ns_store(ns, "SIGUSR1", pyre_object::w_int_new(sig::SIGUSR1 as i64));
+        crate::module_ns_store(ns, "SIGSEGV", pyre_object::w_int_new(sig::SIGSEGV as i64));
+        crate::module_ns_store(ns, "SIGUSR2", pyre_object::w_int_new(sig::SIGUSR2 as i64));
+        crate::module_ns_store(ns, "SIGPIPE", pyre_object::w_int_new(sig::SIGPIPE as i64));
+        crate::module_ns_store(ns, "SIGALRM", pyre_object::w_int_new(sig::SIGALRM as i64));
+        crate::module_ns_store(ns, "SIGTERM", pyre_object::w_int_new(sig::SIGTERM as i64));
+        crate::module_ns_store(ns, "SIGCHLD", pyre_object::w_int_new(sig::SIGCHLD as i64));
+        crate::module_ns_store(ns, "SIGCONT", pyre_object::w_int_new(sig::SIGCONT as i64));
+        crate::module_ns_store(ns, "SIGSTOP", pyre_object::w_int_new(sig::SIGSTOP as i64));
+        crate::module_ns_store(ns, "SIGTSTP", pyre_object::w_int_new(sig::SIGTSTP as i64));
+        crate::module_ns_store(ns, "SIGTTIN", pyre_object::w_int_new(sig::SIGTTIN as i64));
+        crate::module_ns_store(ns, "SIGTTOU", pyre_object::w_int_new(sig::SIGTTOU as i64));
+        crate::module_ns_store(ns, "SIGURG", pyre_object::w_int_new(sig::SIGURG as i64));
+        crate::module_ns_store(ns, "SIGXCPU", pyre_object::w_int_new(sig::SIGXCPU as i64));
+        crate::module_ns_store(ns, "SIGXFSZ", pyre_object::w_int_new(sig::SIGXFSZ as i64));
         crate::module_ns_store(
             ns,
             "SIGVTALRM",
-            pyre_object::w_int_new(libc::SIGVTALRM as i64),
+            pyre_object::w_int_new(sig::SIGVTALRM as i64),
         );
-        crate::module_ns_store(ns, "SIGPROF", pyre_object::w_int_new(libc::SIGPROF as i64));
-        crate::module_ns_store(
-            ns,
-            "SIGWINCH",
-            pyre_object::w_int_new(libc::SIGWINCH as i64),
-        );
-        crate::module_ns_store(ns, "SIGIO", pyre_object::w_int_new(libc::SIGIO as i64));
-        crate::module_ns_store(ns, "SIGSYS", pyre_object::w_int_new(libc::SIGSYS as i64));
+        crate::module_ns_store(ns, "SIGPROF", pyre_object::w_int_new(sig::SIGPROF as i64));
+        crate::module_ns_store(ns, "SIGWINCH", pyre_object::w_int_new(sig::SIGWINCH as i64));
+        crate::module_ns_store(ns, "SIGIO", pyre_object::w_int_new(sig::SIGIO as i64));
+        crate::module_ns_store(ns, "SIGSYS", pyre_object::w_int_new(sig::SIGSYS as i64));
         // `SIGIOT` is the BSD spelling of `SIGABRT` and `SIGEMT`/`SIGINFO` are
         // BSD signals linux has no number for, so the three are answered where
         // `<signal.h>` names them.
@@ -1666,14 +1684,32 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // `Signals(2)` answer from here.
     #[cfg(windows)]
     {
-        crate::module_ns_store(ns, "SIGINT", pyre_object::w_int_new(libc::SIGINT as i64));
-        crate::module_ns_store(ns, "SIGILL", pyre_object::w_int_new(libc::SIGILL as i64));
-        crate::module_ns_store(ns, "SIGFPE", pyre_object::w_int_new(libc::SIGFPE as i64));
-        crate::module_ns_store(ns, "SIGSEGV", pyre_object::w_int_new(libc::SIGSEGV as i64));
-        crate::module_ns_store(ns, "SIGTERM", pyre_object::w_int_new(libc::SIGTERM as i64));
+        #[cfg(not(feature = "host_env"))]
+        use libc as sig;
+        #[cfg(feature = "host_env")]
+        use rustpython_host_env::signal as sig;
+        crate::module_ns_store(ns, "SIGINT", pyre_object::w_int_new(sig::SIGINT as i64));
+        crate::module_ns_store(ns, "SIGILL", pyre_object::w_int_new(sig::SIGILL as i64));
+        crate::module_ns_store(ns, "SIGFPE", pyre_object::w_int_new(sig::SIGFPE as i64));
+        crate::module_ns_store(ns, "SIGSEGV", pyre_object::w_int_new(sig::SIGSEGV as i64));
+        crate::module_ns_store(ns, "SIGTERM", pyre_object::w_int_new(sig::SIGTERM as i64));
         crate::module_ns_store(ns, "SIGBREAK", pyre_object::w_int_new(SIGBREAK.into()));
-        crate::module_ns_store(ns, "SIGABRT", pyre_object::w_int_new(libc::SIGABRT as i64));
+        crate::module_ns_store(ns, "SIGABRT", pyre_object::w_int_new(sig::SIGABRT as i64));
+        #[cfg(feature = "host_env")]
+        crate::module_ns_store(
+            ns,
+            "CTRL_C_EVENT",
+            pyre_object::w_int_new(sig::CTRL_C_EVENT as i64),
+        );
+        #[cfg(feature = "host_env")]
+        crate::module_ns_store(
+            ns,
+            "CTRL_BREAK_EVENT",
+            pyre_object::w_int_new(sig::CTRL_BREAK_EVENT as i64),
+        );
+        #[cfg(not(feature = "host_env"))]
         crate::module_ns_store(ns, "CTRL_C_EVENT", pyre_object::w_int_new(0));
+        #[cfg(not(feature = "host_env"))]
         crate::module_ns_store(ns, "CTRL_BREAK_EVENT", pyre_object::w_int_new(1));
     }
     Ok(())
