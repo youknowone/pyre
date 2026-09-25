@@ -7610,9 +7610,10 @@ fn exc_no_keywords_error(w_self: PyObjectRef, fallback: &str) -> crate::PyError 
 /// `interp_exceptions.py W_SyntaxError.descr_init` — validate the
 /// optional details sequence before forwarding the original positional
 /// arguments to `BaseException.__init__`.  The details tuple must contain
-/// either four fields or all six location fields; a five-field form is
-/// specifically rejected because `end_offset` is required with
-/// `end_lineno`.  SyntaxError subclasses inherit this initializer.
+/// four fields, all six location fields, or those six followed by the
+/// private `_metadata`; a five-field form is specifically rejected because
+/// `end_offset` is required with `end_lineno`.  SyntaxError subclasses
+/// inherit this initializer.
 fn exc_syntax_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let w_self = *args.first().ok_or_else(|| {
         crate::PyError::type_error("__init__() missing 1 required positional argument: 'self'")
@@ -7643,7 +7644,12 @@ fn exc_syntax_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
         let details =
             crate::baseobjspace::fixedview(pyre_object::gc_roots::shadow_stack_get(base + 2), -1)?;
         match details.len() {
-            4 | 6 => {}
+            // `descr_init` stops at six.  3.14 parses the details tuple with
+            // `"OOOO|OOO"`, whose third optional is the private `_metadata`
+            // that `traceback.py` reads back as `(line, offset, source)` to
+            // place the caret under a syntax error, so the seven-field form is
+            // an accepted argument shape here.
+            4 | 6 | 7 => {}
             5 => {
                 return Err(crate::PyError::type_error(
                     "end_offset must be provided when end_lineno is provided",
@@ -7656,7 +7662,7 @@ fn exc_syntax_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
             }
             n => {
                 return Err(crate::PyError::type_error(format!(
-                    "function takes at most 6 arguments ({n} given)"
+                    "function takes at most 7 arguments ({n} given)"
                 )));
             }
         }
@@ -7666,7 +7672,7 @@ fn exc_syntax_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
             pyre_object::interp_exceptions::w_exception_set_syntax_lineno(w_self, details[1]);
             pyre_object::interp_exceptions::w_exception_set_syntax_offset(w_self, details[2]);
             pyre_object::interp_exceptions::w_exception_set_syntax_text(w_self, details[3]);
-            if details.len() == 6 {
+            if details.len() >= 6 {
                 pyre_object::interp_exceptions::w_exception_set_syntax_end_lineno(
                     w_self, details[4],
                 );
@@ -7684,6 +7690,13 @@ fn exc_syntax_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
                     w_self,
                     pyre_object::w_none(),
                 );
+            }
+            if details.len() == 7 {
+                // Only a supplied seventh field writes `_metadata`: the
+                // details parse clears the two end positions up front but
+                // leaves this one, so a re-`__init__` with a shorter tuple
+                // keeps whatever was stored.
+                pyre_object::interp_exceptions::w_exception_set_syntax_metadata(w_self, details[6]);
             }
         }
     }
@@ -10790,11 +10803,20 @@ fn exception_group_condition(
     if valid_type || valid_tuple {
         return Ok(ExceptionGroupCondition::Class(w_condition));
     }
-    if crate::baseobjspace::callable_w(w_condition) {
+    // `get_condition_filter` takes any `callable(condition)` as the
+    // predicate.  3.14's `get_matcher_type` requires
+    // `PyCallable_Check(value) && !PyType_Check(value)`, so a class that is
+    // not an exception type is rejected rather than called once per leaf and
+    // read back through its instance: `eg.subgroup(C)` for a one-argument
+    // `class C` answers a group upstream and raises at 3.14, which the pinned
+    // `test_basics_subgroup_split__bad_arg_type` lists among its `bad_args`.
+    if crate::baseobjspace::callable_w(w_condition) && !unsafe { pyre_object::is_type(w_condition) }
+    {
         return Ok(ExceptionGroupCondition::Callable(w_condition));
     }
     Err(crate::PyError::type_error(
-        "expected a function, exception type or tuple of exception types",
+        "expected an exception type, a tuple of exception types, or a callable \
+         (other than a class)",
     ))
 }
 

@@ -1851,23 +1851,17 @@ unsafe fn exception_descr_str_wtf8(obj: PyObjectRef) -> Result<Option<Wtf8Buf>, 
                 }
                 out
             };
-            // `line %d` / `lines %d-%d` when `end_lineno > lineno`.
+            // `line %ld` from `lineno` alone.  `descr_str` instead prints
+            // `lines %d-%d` once `end_lineno` is larger, and `str()` is
+            // observable, so 3.14's single-line form governs here.  3.14 reads
+            // the line number through `PyLong_AsLongAndOverflow` and prints its
+            // return value without consulting the overflow flag, so a number
+            // too wide for a C long prints as `-1`.
             let w_lineno = crate::baseobjspace::syntax_error_attr(obj, "lineno");
             let lineno_str: Option<Wtf8Buf> =
                 if pyre_object::pyobject::is_exact_type(w_lineno, &INT_TYPE) {
-                    let lineno = crate::baseobjspace::int_w(w_lineno).unwrap_or(0);
-                    let w_end = crate::baseobjspace::syntax_error_attr(obj, "end_lineno");
-                    let end = if pyre_object::pyobject::is_exact_type(w_end, &INT_TYPE) {
-                        crate::baseobjspace::int_w(w_end).ok()
-                    } else {
-                        None
-                    };
-                    Some(match end {
-                        Some(end) if end > lineno => {
-                            Wtf8Buf::from_string(format!("lines {lineno}-{end}"))
-                        }
-                        _ => Wtf8Buf::from_string(format!("line {lineno}")),
-                    })
+                    let lineno = crate::baseobjspace::int_w(w_lineno).unwrap_or(-1);
+                    Some(Wtf8Buf::from_string(format!("line {lineno}")))
                 } else {
                     None
                 };
