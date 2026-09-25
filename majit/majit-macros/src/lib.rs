@@ -216,6 +216,8 @@ fn rewrite_jit_inline_ref_param_fields(
         // field holds the buffer BASE POINTER, so an indexed access derefs
         // through it rather than reading the field itself.
         array_field_elems: HashMap<String, syn::Path>,
+        // `ElementType in Header`: element 0 is `Header.items`, not `*field`.
+        array_headers: HashMap<String, syn::Path>,
         struct_allocs: HashMap<Vec<String>, syn::Path>,
         // Outer struct segments -> (base field, base path); empty unless a
         // caller declares a leading substructure.
@@ -257,10 +259,19 @@ fn rewrite_jit_inline_ref_param_fields(
             )
         }
 
-        fn array_field_elem(&self, struct_path: &syn::Path, field_name: &str) -> Option<syn::Path> {
+        fn array_field_key(struct_path: &syn::Path, field_name: &str) -> Option<String> {
             let struct_last = struct_path.segments.last()?.ident.to_string();
-            let key = format!("{}::{}", struct_last, field_name);
+            Some(format!("{}::{}", struct_last, field_name))
+        }
+
+        fn array_field_elem(&self, struct_path: &syn::Path, field_name: &str) -> Option<syn::Path> {
+            let key = Self::array_field_key(struct_path, field_name)?;
             self.array_field_elems.get(&key).cloned()
+        }
+
+        fn array_header(&self, struct_path: &syn::Path, field_name: &str) -> Option<syn::Path> {
+            let key = Self::array_field_key(struct_path, field_name)?;
+            self.array_headers.get(&key).cloned()
         }
 
         fn record_ref_field_local(&mut self, local: &syn::Local) {
@@ -377,6 +388,11 @@ fn rewrite_jit_inline_ref_param_fields(
             {
                 let base = (*field.base).clone();
                 let member = field.member.clone();
+                let member_name = member_id.to_string();
+                let header = self.array_header(&struct_path, &member_name);
+                let element = self
+                    .array_field_elem(&struct_path, &member_name)
+                    .expect("array field element");
                 let mut idx = (*index_expr.index).clone();
                 let mut rhs = (*assign.right).clone();
                 self.visit_expr_mut(&mut idx);
@@ -384,16 +400,40 @@ fn rewrite_jit_inline_ref_param_fields(
                 // The assigned value is evaluated before the assignee place,
                 // so an index or RHS with side effects must not be reordered:
                 // `base.data[next_index()] = compute_value()` runs
-                // `compute_value()` first.
-                *expr = syn::parse_quote! {
-                    {
-                        let __majit_arr_val = #rhs;
-                        let __majit_arr_obj = #base;
-                        let __majit_arr_idx = #idx;
-                        unsafe {
-                            *((*(__majit_arr_obj as *mut #struct_path))
-                                .#member
-                                .add(__majit_arr_idx as usize)) = __majit_arr_val;
+                // `compute_value()` first. A header array's field addresses
+                // the block, and element 0 is `header.items` — the same
+                // concrete shape `jit_interp` emits for `ElementType in Header`.
+                *expr = if let Some(header) = header {
+                    syn::parse_quote! {
+                        {
+                            let __majit_arr_val = #rhs;
+                            let __majit_arr_obj = #base;
+                            let __majit_arr_idx = #idx;
+                            unsafe {
+                                let __majit_arr_block = core::mem::transmute::<
+                                    _,
+                                    *mut #header,
+                                >(
+                                    (*(__majit_arr_obj as *const #struct_path)).#member,
+                                );
+                                let __majit_arr_items = (__majit_arr_block as *mut u8).add(
+                                    core::mem::offset_of!(#header, items),
+                                ) as *mut #element;
+                                *__majit_arr_items.add(__majit_arr_idx as usize) = __majit_arr_val;
+                            }
+                        }
+                    }
+                } else {
+                    syn::parse_quote! {
+                        {
+                            let __majit_arr_val = #rhs;
+                            let __majit_arr_obj = #base;
+                            let __majit_arr_idx = #idx;
+                            unsafe {
+                                *((*(__majit_arr_obj as *mut #struct_path))
+                                    .#member
+                                    .add(__majit_arr_idx as usize)) = __majit_arr_val;
+                            }
                         }
                     }
                 };
@@ -412,16 +452,42 @@ fn rewrite_jit_inline_ref_param_fields(
             {
                 let base = (*field.base).clone();
                 let member = field.member.clone();
+                let member_name = member_id.to_string();
+                let header = self.array_header(&struct_path, &member_name);
+                let element = self
+                    .array_field_elem(&struct_path, &member_name)
+                    .expect("array field element");
                 let mut idx = (*index_expr.index).clone();
                 self.visit_expr_mut(&mut idx);
-                *expr = syn::parse_quote! {
-                    {
-                        let __majit_arr_obj = #base;
-                        let __majit_arr_idx = #idx;
-                        unsafe {
-                            *((*(__majit_arr_obj as *const #struct_path))
-                                .#member
-                                .add(__majit_arr_idx as usize))
+                *expr = if let Some(header) = header {
+                    syn::parse_quote! {
+                        {
+                            let __majit_arr_obj = #base;
+                            let __majit_arr_idx = #idx;
+                            unsafe {
+                                let __majit_arr_block = core::mem::transmute::<
+                                    _,
+                                    *mut #header,
+                                >(
+                                    (*(__majit_arr_obj as *const #struct_path)).#member,
+                                );
+                                let __majit_arr_items = (__majit_arr_block as *mut u8).add(
+                                    core::mem::offset_of!(#header, items),
+                                ) as *mut #element;
+                                *__majit_arr_items.add(__majit_arr_idx as usize)
+                            }
+                        }
+                    }
+                } else {
+                    syn::parse_quote! {
+                        {
+                            let __majit_arr_obj = #base;
+                            let __majit_arr_idx = #idx;
+                            unsafe {
+                                *((*(__majit_arr_obj as *const #struct_path))
+                                    .#member
+                                    .add(__majit_arr_idx as usize))
+                            }
                         }
                     }
                 };
@@ -536,6 +602,14 @@ fn rewrite_jit_inline_ref_param_fields(
                     format!("{}::{}", struct_last, entry.field),
                     entry.element_type.clone(),
                 )
+            })
+            .collect(),
+        array_headers: array_fields
+            .iter()
+            .filter_map(|entry| {
+                let header = entry.header.clone()?;
+                let struct_last = entry.struct_type.segments.last()?.ident.to_string();
+                Some((format!("{}::{}", struct_last, entry.field), header))
             })
             .collect(),
         struct_allocs: struct_allocs_map,
