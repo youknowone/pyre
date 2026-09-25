@@ -1,8 +1,9 @@
 # pyre-check: no-cpython
-# pyre-check: skip-backends=wasm
+# pyre-check: skip-backends=wasm,cranelift
 # The dump's destination is a file, and the wasm guest has no filesystem: it
 # ships no `os` module at all, so the `import os` below raises before any of
 # this runs. Nothing here is about the backend.
+# cranelift runs the core build, which has no `pyre-module` and so no `math`.
 import gc
 import os
 import sys

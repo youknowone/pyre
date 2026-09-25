@@ -1,4 +1,6 @@
 # pyre-check: max-pypy-ratio=12
+# pyre-check: skip-backends=cranelift
+# cranelift runs the core build, which has no `pyre-module` and so no `math`.
 # The ceiling is twice the slowest ratio observed, 14.2x on the macos runner.
 # A function-entry trace records only the early-return arm.  The first true
 # call then fails that guard and blackhole-replays the previously unvisited

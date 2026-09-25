@@ -1,4 +1,6 @@
 # pyre-check: max-pypy-ratio=8
+# pyre-check: skip-backends=cranelift
+# cranelift runs the core build, which has no `pyre-module` and so no `math`.
 # Ubuntu run 33279264115: 1.9-4x; the ceiling is twice the slowest,
 # rounded up to one decimal place.
 # A comparison helper (like test_math.testIsqrt's assertLessEqual/assertLess)
