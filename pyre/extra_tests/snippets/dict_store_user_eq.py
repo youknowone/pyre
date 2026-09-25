@@ -4,6 +4,7 @@
 The hot loop is what the JIT traces. The per-key probe stays a residual leaf.
 """
 
+import gc
 import types
 
 
@@ -102,3 +103,31 @@ def mutated():
 
 
 print("mutate", mutated())
+
+
+class CollectingKey:
+    def __init__(self, k):
+        self.k = k
+
+    def __hash__(self):
+        gc.collect()
+        return hash(self.k)
+
+    def __eq__(self, other):
+        return isinstance(other, CollectingKey) and self.k == other.k
+
+
+def collected():
+    module = types.ModuleType("c")
+    space = vars(module)
+    store(space, CollectingKey(0), "switch")
+    for i in range(1, 30):
+        store(space, CollectingKey(i), [i] * 3)
+    total = 0
+    for item, value in space.items():
+        if isinstance(item, CollectingKey) and item.k:
+            total += sum(value)
+    return total, space[CollectingKey(0)]
+
+
+print("collect", collected())

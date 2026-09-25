@@ -3657,10 +3657,14 @@ pub unsafe fn w_module_dict_store_object_key(
     key: *mut PyObject,
     value: *mut PyObject,
 ) -> i64 {
+    lock_dict_refs!(_leaf_guard, obj, value);
     let object_key = match object_key_for_checked(key) {
         Ok(object_key) => object_key,
         Err(_) => return -1,
     };
+    // `__hash__` may have run a moving collection.
+    let obj = _leaf_guard.root(0);
+    let value = _leaf_guard.root(1);
     let entries = w_module_dict_object_storage_mut(obj);
     let previous = dict_entries_insert_hashed(entries, object_key.hash, object_key.obj, value);
     if take_dict_key_error() {
