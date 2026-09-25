@@ -602,8 +602,8 @@ fn eval_loop_custom_match_gets_catch_and_rewrap() {
         .filter(|op| {
             matches!(
                 &op.kind,
-                OpKind::Call { target: CallTarget::Method { name, .. }, .. }
-                    if name == "from_exc_object"
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                    if segments.last().map(String::as_str) == Some("from_exc_object")
             )
         })
         .count();
