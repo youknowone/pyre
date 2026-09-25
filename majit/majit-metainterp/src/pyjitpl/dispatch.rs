@@ -811,6 +811,24 @@ pub trait JitCodeSym {
         0
     }
 
+    /// `StateFieldLayout::ref_scalar_slot`. `None` when this symbol has no
+    /// ref-scalar identity slot for `field_idx`.
+    fn ref_scalar_slot(&self, _field_idx: usize) -> Option<usize> {
+        None
+    }
+
+    /// `StateFieldLayout::float_scalar_slot`. `None` when this symbol has no
+    /// float-scalar identity slot for `field_idx`.
+    fn float_scalar_slot(&self, _field_idx: usize) -> Option<usize> {
+        None
+    }
+
+    /// `StateFieldLayout::array_elem_slot`. `None` when this symbol has no
+    /// fixed-array element slot for `(array_idx, elem)`.
+    fn array_elem_slot(&self, _array_idx: usize, _elem: usize) -> Option<usize> {
+        None
+    }
+
     /// One past the last ref-bank register used as a canonical
     /// ref-scalar identity slot (`StateFieldLayout::ref_scalar_slot`).
     /// `record_state_guard` saves/restores `ref_regs[..end]` around the
@@ -4134,6 +4152,20 @@ where
                 let (opref, value) = self.read_ref_reg(src);
                 sym.set_state_ref_field_ref(field_idx, opref);
                 sym.set_state_ref_field_value(field_idx, value);
+                // `handler_store_state_field_ref_dr` writes
+                // `registers_r[StateFieldLayout::ref_scalar_slot]`. The slot
+                // is a register the frame holds; a store that updated only
+                // `__JitSym` would leave it at the value seeded at push.
+                if let Some(slot) = sym.ref_scalar_slot(field_idx)
+                    && slot < sym.ref_identity_slots_end()
+                    && self
+                        .frames
+                        .frames
+                        .last()
+                        .is_some_and(|frame| slot < frame.ref_regs.len())
+                {
+                    self.set_ref_reg(slot, Some(opref), Some(value));
+                }
             }
             jitcode::insns::BC_LOAD_STATE_FIELD_FLOAT => {
                 let field_idx = self.frames.current_mut().next_u16() as usize;
@@ -4152,6 +4184,18 @@ where
                 let (opref, value) = self.read_float_reg(src);
                 sym.set_state_float_field_ref(field_idx, opref);
                 sym.set_state_float_field_value(field_idx, value);
+                // `handler_store_state_field_float_df` writes
+                // `registers_f[StateFieldLayout::float_scalar_slot]`.
+                if let Some(slot) = sym.float_scalar_slot(field_idx)
+                    && slot < sym.float_identity_slots_end()
+                    && self
+                        .frames
+                        .frames
+                        .last()
+                        .is_some_and(|frame| slot < frame.float_regs.len())
+                {
+                    self.set_float_reg(slot, Some(opref), Some(value));
+                }
             }
             jitcode::insns::BC_LOAD_STATE_ARRAY => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
@@ -4232,6 +4276,18 @@ where
                 let (opref, value) = self.read_int_reg(src);
                 sym.set_state_array_ref(array_idx, elem_idx, opref);
                 sym.set_state_array_value(array_idx, elem_idx, value);
+                // `handler_store_state_array_dii` writes
+                // `registers_i[StateFieldLayout::array_elem_slot]`.
+                if let Some(slot) = sym.array_elem_slot(array_idx, elem_idx)
+                    && slot < sym.int_identity_slots_end()
+                    && self
+                        .frames
+                        .frames
+                        .last()
+                        .is_some_and(|frame| slot < frame.int_regs.len())
+                {
+                    self.set_int_reg(slot, Some(opref), Some(value));
+                }
             }
 
             // -- First-class virtualizable access (RPython getfield_vable_*) --

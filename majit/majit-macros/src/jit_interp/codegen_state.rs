@@ -648,6 +648,45 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             }
         })
         .collect();
+    // `StateFieldLayout::array_elem_slot`: int_scalar_base + num_scalars
+    // + sum of earlier array lengths + elem. Lengths are the sym vecs
+    // `populate_frame_int_regs` walks, so the slot matches that seed.
+    let array_elem_slot_arms: Vec<TokenStream> = arrays
+        .iter()
+        .enumerate()
+        .map(|(array_idx, (_, f))| {
+            let fname = &f.name;
+            let prev: Vec<TokenStream> = arrays[..array_idx]
+                .iter()
+                .map(|(_, prev)| {
+                    let prev_name = &prev.name;
+                    quote! { + self.#prev_name.len() }
+                })
+                .collect();
+            quote! {
+                #array_idx => {
+                    let __base = #int_identity_base + #num_scalars #(#prev)*;
+                    if elem < self.#fname.len() {
+                        Some(__base + elem)
+                    } else {
+                        None
+                    }
+                }
+            }
+        })
+        .collect();
+    let array_elem_slot_override: TokenStream = if arrays.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            fn array_elem_slot(&self, array_idx: usize, elem: usize) -> Option<usize> {
+                match array_idx {
+                    #(#array_elem_slot_arms)*
+                    _ => None,
+                }
+            }
+        }
+    };
     // Virtualizable populate: ONE slot holding the `&state` identity, past the
     // scalars and fixed-array elements, matching
     // `live_slots_for_state_field_jit` and `StateFieldLayout::total_slots`.
@@ -2120,6 +2159,13 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             fn float_identity_slots_end(&self) -> usize {
                 #float_identity_end
             }
+            fn float_scalar_slot(&self, field_idx: usize) -> Option<usize> {
+                if field_idx < #num_float_scalars {
+                    Some(#float_identity_base + field_idx)
+                } else {
+                    None
+                }
+            }
         }
     } else {
         quote! {}
@@ -2153,6 +2199,13 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
 
             fn ref_identity_slots_end(&self) -> usize {
                 #ref_identity_end
+            }
+            fn ref_scalar_slot(&self, field_idx: usize) -> Option<usize> {
+                if field_idx < #num_ref_scalars {
+                    Some(#ref_identity_base + field_idx)
+                } else {
+                    None
+                }
             }
         }
     } else {
@@ -2978,6 +3031,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     _ => {}
                 }
             }
+
+            #array_elem_slot_override
 
             #[allow(unused_assignments, unused_variables)]
             fn populate_frame_int_regs(

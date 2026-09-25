@@ -117,3 +117,141 @@ mod tests {
         }
     }
 }
+
+/// Ref and float stores, then a guard in the same arm.
+///
+/// `ADVANCE` writes `cur` and `acc` and then guards `left > 0`. The guard's
+/// snapshot is taken from the arm frame's identity registers. After the guard
+/// fails, resume reads those fields; the pair must match a run with no JIT.
+
+#[repr(C)]
+struct Link {
+    tag: i64,
+    next: *mut Link,
+}
+
+struct WalkState {
+    left: i64,
+    seen: i64,
+    cur: usize,
+    acc: f64,
+}
+
+const ADVANCE: u8 = 1;
+
+fn link_chain(n: usize) -> Vec<Link> {
+    let mut links = Vec::with_capacity(n + 1);
+    for i in 0..=n {
+        links.push(Link {
+            tag: i as i64,
+            next: std::ptr::null_mut(),
+        });
+    }
+    for i in 0..n {
+        let next = std::ptr::from_mut(&mut links[i + 1]);
+        links[i].next = next;
+    }
+    links
+}
+
+#[majit_macros::jit_interp(
+    state = WalkState,
+    env = Code,
+    auto_calls = true,
+    greens = [pc, program],
+    state_fields = {
+        left: int,
+        seen: int,
+        cur: ref(Link),
+        acc: float,
+    },
+    ref_fields = { Link::next => Link },
+    int_fields = { Link::tag => i64 },
+)]
+#[allow(unused_assignments, unused_variables)]
+pub fn walk_mainloop(program: &Code, n: i64, threshold: u32) -> (i64, f64) {
+    let links = link_chain(n as usize);
+    let mut driver: majit_metainterp::JitDriver<WalkState> =
+        majit_metainterp::JitDriver::new(threshold);
+    majit_metainterp::embed::Census::install(&mut driver);
+    let mut pc: usize = 0;
+    let stacksize: i32 = 0;
+    let mut state = WalkState {
+        left: n,
+        seen: 0,
+        cur: std::ptr::from_ref(&links[0]) as usize,
+        acc: 0.0,
+    };
+
+    {
+        use majit_metainterp::JitState as _;
+        state
+            .build_meta(0, program)
+            .install_canonical_liveness(&mut driver);
+    }
+
+    while pc < program.len() {
+        jit_merge_point!(driver, program, pc; state);
+        let opcode = program[pc];
+        match opcode {
+            ADVANCE => {
+                state.cur = state.cur.next;
+                state.seen = state.cur.tag;
+                state.acc = state.acc + 1.0;
+                state.left -= 1;
+                if state.left > 0 {
+                    can_enter_jit!(driver, 0, &mut state, program, || {});
+                    continue;
+                }
+                pc += 1;
+            }
+            _ => break,
+        }
+    }
+    let tag = unsafe { (*(state.cur as *const Link)).tag };
+    (tag, state.acc)
+}
+
+fn advance_program() -> Vec<u8> {
+    vec![ADVANCE]
+}
+
+/// Same steps as `walk_mainloop`, with no JIT hooks.
+fn walk_interp(n: i64) -> (i64, f64) {
+    let links = link_chain(n as usize);
+    let mut cur = std::ptr::from_ref(&links[0]) as usize;
+    let mut seen = 0;
+    let mut acc = 0.0;
+    let mut left = n;
+    while left > 0 {
+        cur = unsafe { (*(cur as *const Link)).next as usize };
+        seen = unsafe { (*(cur as *const Link)).tag };
+        acc += 1.0;
+        left -= 1;
+    }
+    (seen, acc)
+}
+
+#[cfg(test)]
+mod walk_tests {
+    use super::*;
+    use majit_metainterp::embed::Census;
+
+    #[test]
+    fn ref_and_float_store_survives_guard_resume() {
+        for n in [20_i64, 50] {
+            let census = Census::begin();
+            let jit = walk_mainloop(&advance_program(), n, 3);
+            let plain = walk_interp(n);
+            let compiles = census.counts().loops_compiled;
+            assert!(
+                compiles >= 1,
+                "walk loop never compiled for n={n} (jit={jit:?})"
+            );
+            assert_eq!(
+                jit, plain,
+                "guard resume diverged from the interpreter for n={n} (compiles={compiles})"
+            );
+        }
+    }
+}
