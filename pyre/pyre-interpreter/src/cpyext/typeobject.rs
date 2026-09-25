@@ -5148,6 +5148,12 @@ fn stamp_tp_dict(tp: *mut CPyTypeObject, w_type: PyObjectRef) {
     if w_dict.is_null() {
         return;
     }
+    // The block goes out as it stands, and a C reader has no `unwrap_cell` in
+    // front of it, so a cell an earlier rebind parked would read as the
+    // attribute.  `type_setdictvalue_wtf8` keeps a mirrored type's namespace
+    // raw from here on; this is the same boundary for the stores that happened
+    // before the mirror existed.
+    unsafe { crate::objspace::std::classdict::uncell_type_namespace(w_type) };
     unsafe { (*tp).tp_dict = pyobject::make_ref(w_dict) };
 }
 

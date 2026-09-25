@@ -4987,6 +4987,17 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
             w_class,
             version_tag,
         )?;
+        // After the pin, never before: the pin is what makes the cell pointer a
+        // constant.  The tag covers a REPLACING store, which builds a fresh
+        // cell and revokes the tag here and in every subclass; an in-place
+        // write returns `None` from `write_cell` and moves nothing, so the
+        // entry that resolved this wrapper is read and promoted.  The same pair
+        // `try_walker_inline_call`'s app-level `__call__` arm carries.
+        if let Some((cell, expected)) =
+            unsafe { inline_attr_cell_guard(w_class, "__call__", callable) }
+        {
+            walker_promote_object_mutable_cell(ctx, op.pc, cell, expected)?;
+        }
         callable_guard_op = ctx.trace_ctx.const_ref(callable as i64);
         receiver_op = Some(r_args[0]);
     }

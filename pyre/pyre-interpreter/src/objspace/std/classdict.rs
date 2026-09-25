@@ -285,7 +285,46 @@ pub(crate) unsafe fn type_setdictvalue_wtf8(
             crate::baseobjspace::_pure_getdictvalue_no_unwrapping(w_type, w_name, version_tag);
         let w_curr = if raw.is_null() { None } else { Some(raw) };
         match pyre_object::celldict::write_cell(w_curr, w_value) {
-            None => return Ok(()),
+            None => {
+                // The cell already holds `w_value`; the store is done.  What the
+                // early return skips is `mutated()`, and keeping `_version_tag`
+                // still is the whole point of it -- otherwise every
+                // class-attribute store in a hot loop revokes the loop.
+                //
+                // For these two names that silence is observable twice over.
+                // `uses_object_getattribute` / `uses_object_setattr` are
+                // memoised by `getattribute_if_not_from_object` /
+                // `setattr_if_not_from_object` and cleared nowhere else, and a
+                // `MapdictCacheEntry` filled by a `STORE_ATTR` site carries
+                // `valid_for_store` keyed on the tag, so `store_attr_slowpath`
+                // writes the instance slot without ever asking
+                // `setattr_if_not_from_object` again.  Both keep answering "this
+                // type inherits object's accessor" for a type that stopped
+                // inheriting it.
+                //
+                // [3.14-spec] PyPy returns here unconditionally and leaves both
+                // stale; `type_setattro` re-fixes the accessor slots on every
+                // store, so the rebound hook runs.  Running `mutated()` for
+                // these two names reaches that answer, and it is what the first
+                // rebind of the same name already does -- that one replaces a
+                // plain value, so `write_cell` builds a cell and the store falls
+                // through below.  Every other name still returns with the tag
+                // untouched, which is the case the early return exists for.
+                //
+                // `W_TypeObject._immutable_fields_` lists `_version_tag?`, so
+                // the tag is quasi-immutable and a write to it is what revokes
+                // the code that folded it -- the field's own invalidation path,
+                // which `mutated()` already takes on every store that is not
+                // absorbed.  The two flags carry no hint at all
+                // (`uses_object_getattribute` / `uses_object_setattr` are plain
+                // class attributes there), so clearing them alone would be
+                // free; it would also leave the store cache answering for the
+                // old hook, which is the wrong answer this exists to remove.
+                if matches!(name.as_str(), Ok("__getattribute__" | "__setattr__")) {
+                    crate::baseobjspace::mutated(w_type, name.as_str().ok());
+                }
+                return Ok(());
+            }
             Some(stored) => w_value = stored,
         }
     }
@@ -307,6 +346,88 @@ unsafe fn type_deldictvalue_wtf8(w_type: PyObjectRef, name: &Wtf8) -> Result<boo
         crate::baseobjspace::mutated(w_type, name.as_str().ok());
     }
     Ok(removed)
+}
+
+/// Replace every `MutableCell` in `w_type`'s namespace with the value it holds.
+///
+/// [`type_setdictvalue_wtf8`] keeps a type that already has a C mirror
+/// cell-free, because `tp_dict` publishes this very block and nothing puts an
+/// `unwrap_cell` in front of an extension's `PyDict_GetItemString`.  A type
+/// rebound before its mirror existed still holds the cells those stores parked,
+/// so the same boundary has to be closed from the mirror side as well —
+/// otherwise `PyType_GetDict` answers with the private wrapper.
+///
+/// Cells only ever sit under text keys, since [`type_setdictvalue_wtf8`] is the
+/// only thing that creates one and it is keyed by `&Wtf8`.
+///
+/// The keys are copied out of the namespace before anything else runs, and the
+/// type is re-read from the shadow stack on every iteration: `unwrap_cell` on an
+/// `IntMutableCell` boxes the value (`space.newint`), so the loop below holds no
+/// namespace reference across a collection point.
+///
+/// `mutated()` runs once when anything changed: a trace that promoted a cell
+/// payload resolved against a cell this removes.
+///
+/// # Safety
+/// `w_type` must be a valid `PyObjectRef` pointing at a `W_TypeObject`
+/// (null tolerated).
+// `stamp_tp_dict` is the only caller and the `cpyext` module carries this same
+// cfg, so without it a build with no C-API layer has nothing to publish and
+// nothing to de-cell.
+#[cfg(all(
+    feature = "cpyext",
+    not(feature = "sandbox"),
+    any(target_os = "macos", target_os = "linux")
+))]
+pub(crate) unsafe fn uncell_type_namespace(w_type: PyObjectRef) {
+    if w_type.is_null() || !pyre_object::is_type(w_type) {
+        return;
+    }
+    // A cell is only ever parked in the `version_tag != 0` branch of
+    // [`type_setdictvalue_wtf8`], so an unversioned type cannot hold one and
+    // needs no scan.  This is what keeps the mirror path off the namespaces of
+    // the static types, which are the large ones.
+    if crate::baseobjspace::w_type_version_tag(w_type) == 0 {
+        return;
+    }
+    let ns = type_namespace(w_type);
+    if ns.is_null() {
+        return;
+    }
+    let names: Vec<rustpython_wtf8::Wtf8Buf> = pyre_object::w_dict_items(ns)
+        .into_iter()
+        .filter(|&(w_key, w_value)| {
+            pyre_object::is_str(w_key) && pyre_object::celldict::is_mutable_cell(w_value)
+        })
+        .map(|(w_key, _)| pyre_object::w_str_get_wtf8(w_key).to_owned())
+        .collect();
+    if names.is_empty() {
+        return;
+    }
+    let roots = pyre_object::gc_roots::push_roots();
+    let type_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_type);
+    let mut changed = false;
+    for name in &names {
+        let w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
+        let Some(stored) = crate::type_dict_lookup_wtf8_no_unwrapping(w_type, name) else {
+            continue;
+        };
+        if !pyre_object::celldict::is_mutable_cell(stored) {
+            continue;
+        }
+        let unwrapped = pyre_object::celldict::unwrap_cell(stored);
+        if unwrapped.is_null() {
+            continue;
+        }
+        // The boxing above may have moved the type, so the store reads it back.
+        let w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
+        crate::type_dict_store_wtf8(w_type, name, unwrapped);
+        changed = true;
+    }
+    if changed {
+        crate::baseobjspace::mutated(pyre_object::gc_roots::shadow_stack_get(type_slot), None);
+    }
 }
 
 /// `W_TypeObject.getdict` — `space.fromcache(ClassDictStrategy)` then

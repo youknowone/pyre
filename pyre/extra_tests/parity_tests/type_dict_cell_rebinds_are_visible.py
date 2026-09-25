@@ -231,6 +231,36 @@ def instance_attr_gains_a_data_descriptor():
     expect(total, 1, 9, 'instance attribute kept shadowing a data descriptor')
 
 
+# The interpreter's own `LOAD_ATTR` cache, not a trace: `LOAD_ATTR_slowpath`
+# classifies the class-namespace entry and caches the instance slot under
+# `_version_tag`.  A rebind absorbed by the cell moves no tag, so the entry has
+# to be rejected at classify time -- which is why the classification reads the
+# raw entry and gives up on a `MutableCell`.  `str` is the shape that reaches
+# it: a non-data descriptor of an immutable type is the one payload
+# `_classify_attr` still calls cacheable.
+class Cached:
+    x = 'a'
+
+
+Cached.x = 'b'
+
+
+def read_cached(obj):
+    return obj.x
+
+
+def absorbed_rebind_beats_the_attr_cache():
+    obj = Cached()
+    obj.x = 'instance'
+    assert read_cached(obj) == 'instance'
+    # A data descriptor now shadows the instance dict, and the store that
+    # installs it is absorbed by the cell.
+    Cached.x = property(lambda self: 'from-property')
+    got = read_cached(obj)
+    assert got == 'from-property', 'stale LOAD_ATTR cache: %r' % (got,)
+
+
+absorbed_rebind_beats_the_attr_cache()
 instance_call()
 method_becomes_property()
 user_hash()

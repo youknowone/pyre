@@ -259,4 +259,34 @@ eq('the same block twice', again, 1)
 namespace_of_int, _ = m.type_dict(int)
 eq('a builtin has one too', namespace_of_int['real'] is int.real, True)
 
+
+# A class rebound twice before any C call reaches it: the first store parks a
+# `MutableCell` in the namespace and the second is absorbed by it.  This block
+# is published as `tp_dict` unchanged and nothing puts an `unwrap_cell` in front
+# of a C reader, so what it holds has to be the value.
+class Parked:
+    marker = 1
+
+
+Parked.marker = 2
+Parked.marker = 3
+parked_int, _ = m.type_dict(Parked)
+eq('an absorbed int store is a value', parked_int['marker'], 3)
+eq('and C reads the same', m.set_default(parked_int, 'marker', -1)[1], 3)
+
+
+def live():
+    return 3
+
+
+class ParkedObj:
+    def method(self):
+        return 1
+
+
+ParkedObj.method = lambda self: 2
+ParkedObj.method = live
+parked_obj, _ = m.type_dict(ParkedObj)
+eq('an absorbed object store is the object', parked_obj['method'] is live, True)
+
 print('cpyext-small-ok')
