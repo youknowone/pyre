@@ -1019,6 +1019,11 @@ impl TypeInfo {
         }
 
         // Variable-part GC pointer items.
+        // Callers reject a forwarded header before this load: its type id
+        // is outside the table (`FORWARDED_MARKER`), so `debug_check_*`
+        // returns first. `_get_size_for_typeid` reads the length raw once
+        // the address is the live object; `get_possibly_forwarded_type_id`
+        // is what substitutes the copy, and that already happened.
         if self.items_have_gc_ptrs && self.item_size > 0 {
             let length = unsafe { *((obj_addr + self.length_offset) as *const usize) };
             let items_start = obj_addr + self.size;
@@ -1094,6 +1099,18 @@ impl TypeRegistry {
             }
             info.gc_ptr_offsets = offsets;
             info.has_gc_ptrs = !info.gc_ptr_offsets.is_empty() || info.items_have_gc_ptrs;
+        }
+        // `offsets_to_gc_pointers` only records offsets inside the fixed
+        // part. An offset at or past `size` is the variable part (or a
+        // field list borrowed from another object) and `mark_object`'s
+        // `major_fixed_field` loop would dereference it.
+        for &offset in &info.gc_ptr_offsets {
+            assert!(
+                offset < info.size,
+                "TypeRegistry::register gc_ptr offset {offset} is past fixed size {} \
+                 (gctypelayout.offsets_to_gc_pointers)",
+                info.size
+            );
         }
         self.entries.push(info);
         // No row address is published until `freeze_types`; fill it there once
@@ -1588,6 +1605,13 @@ mod tests {
         let info = TypeInfo::varsize(8, 8, 0, true, Vec::new());
         assert_eq!(info.total_instance_size(10), 88); // 8 + 8*10
         assert_eq!(info.total_instance_size(0), 8);
+    }
+
+    #[test]
+    #[should_panic(expected = "gc_ptr offset 8 is past fixed size 8")]
+    fn register_rejects_gc_ptr_offset_past_fixed_size() {
+        let mut reg = TypeRegistry::new();
+        let _ = reg.register(TypeInfo::with_gc_ptrs(8, vec![8]));
     }
 
     #[test]

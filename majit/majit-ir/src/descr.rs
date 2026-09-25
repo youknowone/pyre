@@ -1421,11 +1421,21 @@ impl GcCache {
             {
                 continue;
             }
-            let ref_offsets = sd
+            // `gc_fielddescrs` already dropped offsets outside the fixed
+            // size (`offsets_to_gc_pointers`). Passing that list through
+            // is the whole registration; `TypeRegistry::register` asserts
+            // each offset is `< size`.
+            let ref_offsets: Vec<usize> = sd
                 .gc_fielddescrs()
                 .iter()
                 .map(|field| field.offset())
                 .collect();
+            debug_assert!(
+                ref_offsets.iter().all(|offset| *offset < sd.size()),
+                "gc_fielddescrs offset past fixed size on cache_key {:#x} size {}",
+                sd.cache_key(),
+                sd.size()
+            );
             let tid = register(sd.size(), ref_offsets);
             sd.set_type_id(tid);
             registered += 1;
@@ -6285,9 +6295,16 @@ impl SimpleSizeDescr {
     /// `gc_fielddescrs` subset is derived by filtering on
     /// `FieldDescr::is_pointer_field()` (heaptracker.py:70).
     pub fn with_all_fielddescrs(mut self, all_fielddescrs: Vec<Arc<dyn FieldDescr>>) -> Self {
+        // `gc_fielddescrs` is `all_fielddescrs(only_gc=True)`: a pointer
+        // field inside the fixed part. An inlined array is not a `Ptr`
+        // (`offsets_to_gc_pointers` skips `lltype.Array`; `all_fielddescrs`
+        // recurses into a struct and does not record the array's address).
+        // A field whose offset is at or past `size` is that variable part,
+        // or a capture's interior offset adopted onto the closure. Neither
+        // is a fixed GC slot.
         self.gc_fielddescrs = all_fielddescrs
             .iter()
-            .filter(|fd| fd.is_pointer_field())
+            .filter(|fd| fd.is_pointer_field() && fd.offset() < self.size)
             .cloned()
             .collect();
         self.all_fielddescrs = all_fielddescrs;
@@ -8024,6 +8041,17 @@ mod register_keyed_size_authority_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gc_fielddescrs_drops_offsets_outside_the_fixed_part() {
+        let inside: Arc<dyn FieldDescr> =
+            Arc::new(SimpleFieldDescr::new(0, 0, 8, Type::Ref, false));
+        let array_tail: Arc<dyn FieldDescr> =
+            Arc::new(SimpleFieldDescr::new(1, 8, 8, Type::Ref, false));
+        let sd = SimpleSizeDescr::new(0, 8, 0).with_all_fielddescrs(vec![inside, array_tail]);
+        let offsets: Vec<usize> = sd.gc_fielddescrs().iter().map(|fd| fd.offset()).collect();
+        assert_eq!(offsets, vec![0]);
+    }
 
     /// A struct-array descr and its interior field descrs point at each
     /// other (the "CYCLE, accepted" row of the Arc cycle audit at the top
