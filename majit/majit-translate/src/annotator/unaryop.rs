@@ -3876,8 +3876,71 @@ pub(crate) fn container_getanyitem(
         SomeValue::UnicodeString(_) => {
             SomeValue::UnicodeCodePoint(super::model::SomeUnicodeCodePoint::new(false))
         }
+        // A Rust fixed array is a `SomeInstance` of its shaped `Array<T;N>`
+        // class, not a `SomeList`. RPython's fixed-size list is still a
+        // `SomeList` whose `SomeIterator.next` reads `listdef.read_item`
+        // (`ListItem.read_locations`). The item annotation here is the
+        // constructor's `__pos_N` cells; `record_getattr` is the reader set
+        // `ClassDef.generalize_attr` reflows (`Attribute.read_locations`).
+        SomeValue::Instance(inst) => shaped_array_getanyitem(inst),
         other => panic!("getanyitem: unsupported container {other:?}"),
     }
+}
+
+fn instance_is_shaped_array(s: &SomeValue) -> bool {
+    let SomeValue::Instance(inst) = s else {
+        return false;
+    };
+    inst.classdef
+        .as_ref()
+        .is_some_and(|cd| majit_ir::descr::is_shaped_array_name(&cd.borrow().name))
+}
+
+/// Item annotation of a shaped `Array<T;N>` instance: the union of the
+/// constructor-written `__pos_N` cells. Registers each field as a getattr
+/// reader at the current bookkeeper position so a later `generalize_attr`
+/// reflows this `next`, the same role `ListItem.read_locations` plays for
+/// `listdef.read_item`.
+fn shaped_array_getanyitem(inst: &super::model::SomeInstance) -> SomeValue {
+    let Some(classdef) = inst.classdef.clone() else {
+        panic!("getanyitem: array instance has no classdef");
+    };
+    let name = classdef.borrow().name.clone();
+    if !majit_ir::descr::is_shaped_array_name(&name) {
+        panic!("getanyitem: unsupported container instance {name}");
+    }
+    let fields: Vec<String> = {
+        let borrowed = classdef.borrow();
+        let mut names: Vec<String> = borrowed
+            .attrs
+            .keys()
+            .filter(|k| k.starts_with("__pos_"))
+            .cloned()
+            .collect();
+        names.sort_by_key(|n| {
+            n.strip_prefix("__pos_")
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(usize::MAX)
+        });
+        names
+    };
+    if fields.is_empty() {
+        return s_impossible_value();
+    }
+    let classdesc = classdef.borrow().classdesc.clone();
+    if let Some(bk) = classdef.borrow().bookkeeper.upgrade() {
+        for field in &fields {
+            let _ = bk.record_getattr(&classdesc, field);
+        }
+    }
+    let mut items = Vec::with_capacity(fields.len());
+    for field in &fields {
+        match super::classdesc::ClassDef::s_getattr(&classdef, field, &inst.flags) {
+            Ok(s) => items.push(s),
+            Err(_) => items.push(s_impossible_value()),
+        }
+    }
+    super::model::unionof(items.iter()).unwrap_or_else(|_| s_impossible_value())
 }
 
 // =====================================================================
@@ -4120,6 +4183,26 @@ fn init_someinstance_overrides(
         std::collections::HashMap<SomeValueTag, Specialization>,
     >,
 ) {
+    // Shaped `Array<T;N>` only. `iter_SomeInstance` declines the
+    // `__iter__` rewrite for that class so this arm runs: `SomeIterator`
+    // of the array, matching `SomeList.iter`. Any other instance keeps
+    // the transform and never reaches here.
+    register(
+        reg,
+        OpKind::Iter,
+        SomeValueTag::Instance,
+        Specialization {
+            apply: pure(|ann, hl| {
+                let sv = ann.annotation(&hl.args[0]).expect("instance.iter: unbound");
+                if instance_is_shaped_array(&sv) {
+                    SomeValue::Iterator(SomeIterator::new(sv, vec![]))
+                } else {
+                    s_impossible_value()
+                }
+            }),
+            can_only_throw: CanOnlyThrow::List(vec![]),
+        },
+    );
     // unaryop.py — SomeInstance.getattr(self, s_attr).
     //
     //   def getattr(self, s_attr):
@@ -4763,7 +4846,18 @@ pub fn len_SomeInstance(_ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec
 }
 
 #[allow(non_snake_case)]
-pub fn iter_SomeInstance(_ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
+pub fn iter_SomeInstance(ann: &RPythonAnnotator, args: &[Hlvalue]) -> Option<Vec<HLOperation>> {
+    // `Array<T;N>` is iterated as a container: `iter` yields
+    // `SomeIterator(self)` and `next` reads the element via `getanyitem`
+    // (`SomeIterator.next`). Rewriting to `__iter__` would type the
+    // element from the residual return shell (`Ref` → classdef-less
+    // instance) instead of the constructor's item annotation.
+    if ann
+        .annotation(&args[0])
+        .is_some_and(|s| instance_is_shaped_array(&s))
+    {
+        return None;
+    }
     let v_arg = args[0].clone();
     let get_iter = mk_hlop(
         OpKind::GetAttr,
@@ -5718,6 +5812,86 @@ mod tests {
         );
         let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Iterator(_)), "got {:?}", r);
+    }
+
+    /// A fixed array of synthetic tuples yields the tuple classdef from
+    /// `next`, so `.1` (`__pos_1`) reads the constructor's field.
+    #[test]
+    fn array_of_synthetic_tuples_next_element_keeps_tuple_classdef() {
+        use super::super::super::flowspace::model::HostObject;
+        use super::super::classdesc::{ClassDef, ClassDesc};
+        use super::super::model::SomeInstance;
+
+        let ann = mk_ann();
+        let bk = Rc::clone(&ann.bookkeeper);
+        let tuple_name = "Tuple<*mut PyObject,str>";
+        let tuple_host = HostObject::new_class(tuple_name, vec![]);
+        let tuple_desc = ClassDesc::new(&bk, tuple_host, Some(tuple_name.to_string()), None, None)
+            .expect("tuple ClassDesc");
+        let tuple_cd = ClassDef::new(&bk, &tuple_desc);
+        ClassDef::generalize_attr(
+            &tuple_cd,
+            "__pos_1",
+            Some(SomeValue::String(SomeString::new(false, true))),
+        )
+        .expect("tuple __pos_1");
+        let elem = SomeValue::Instance(SomeInstance::new(
+            Some(tuple_cd),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+
+        let array_name = "Array<Tuple<*mut PyObject,str>;2>";
+        let array_host = HostObject::new_class(array_name, vec![]);
+        let array_desc = ClassDesc::new(&bk, array_host, Some(array_name.to_string()), None, None)
+            .expect("array ClassDesc");
+        let array_cd = ClassDef::new(&bk, &array_desc);
+        ClassDef::generalize_attr(&array_cd, "__pos_0", Some(elem.clone())).expect("array __pos_0");
+        ClassDef::generalize_attr(&array_cd, "__pos_1", Some(elem)).expect("array __pos_1");
+        let array = SomeValue::Instance(SomeInstance::new(
+            Some(array_cd),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+
+        let mut arr = Variable::named("arr");
+        ann.setbinding(&mut arr, array);
+        let iter_hl = HLOperation::new(OpKind::Iter, vec![Hlvalue::Variable(arr)]);
+        assert!(
+            iter_hl.transform(&ann).is_none(),
+            "shaped array iter must not rewrite to __iter__"
+        );
+        let s_iter = iter_hl.consider(&ann).unwrap().unwrap();
+        let mut it = Variable::named("it");
+        ann.setbinding(&mut it, s_iter);
+        let next_hl = HLOperation::new(OpKind::Next, vec![Hlvalue::Variable(it)]);
+        let s_elem = next_hl.consider(&ann).unwrap().unwrap();
+        let SomeValue::Instance(inst) = &s_elem else {
+            panic!("element annotation must be the tuple instance, got {s_elem:?}");
+        };
+        let class_name = inst
+            .classdef
+            .as_ref()
+            .expect("element classdef")
+            .borrow()
+            .name
+            .clone();
+        assert_eq!(class_name, tuple_name);
+
+        let mut ev = Variable::named("elem");
+        ann.setbinding(&mut ev, s_elem);
+        let get = HLOperation::new(
+            OpKind::GetAttr,
+            vec![
+                Hlvalue::Variable(ev),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("__pos_1"))),
+            ],
+        );
+        let field = get.consider(&ann).unwrap().unwrap();
+        assert!(
+            matches!(field, SomeValue::String(_)),
+            ".__pos_1 of the element, got {field:?}"
+        );
     }
 
     #[test]

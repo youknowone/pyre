@@ -568,16 +568,11 @@ impl CodeWriter {
             || self.dual_gate_publish_concretetypes(graph, callcontrol, &canonical_diag),
         );
 
-        // Step 0b: rtyper-equivalent indirect_call lowering
-        // (`translator/rtyper/rpbc.rs::lower_indirect_calls`).
-        // RPython rpbc.py:199-217 emits `indirect_call(funcptr, *args,
-        // c_graphs)` during rtype; pyre runs the same pass here so
-        // jtransform sees `OpKind::IndirectCall` (with funcptr already
-        // a regular Variable), never `CallTarget::Indirect`.
+        // Indirect calls were lowered in place on the graphs `CallControl`
+        // owns (`CallControl::lower_registered_indirect_calls`), before this
+        // clone. The clone is the graph jtransform rewrites; it must not
+        // still contain `CallTarget::Indirect`.
         let mut graph_owned = graph.clone();
-        crate::codewriter::transform_profile::time_phase("step0b_lower_indirect_calls", || {
-            crate::translator::rtyper::rpbc::lower_indirect_calls(&mut graph_owned, callcontrol)
-        });
         #[cfg(debug_assertions)]
         crate::translator::rtyper::rpbc::assert_no_indirect_call_targets(&graph_owned);
         // Pre-jtransform rtyper fold of unit-variant ctors to singleton
