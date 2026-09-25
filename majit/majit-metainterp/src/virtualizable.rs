@@ -1449,11 +1449,40 @@ impl VirtualizableInfo {
         }
     }
 
-    /// Port of `virtualizable.py read_boxes`. Upstream returns one flat list
-    /// of statics then array items; this splits them into
-    /// `(Vec<i64>, Vec<Vec<i64>>)`. Convergence is to flatten the pair into
-    /// one list so that `write_all_boxes` becomes a caller of `write_boxes`
-    /// rather than a second writer of the same fields.
+    /// `virtualizable.py read_boxes`: every static field in declaration
+    /// order, then every item of every array field, as one flat list.
+    ///
+    /// Upstream takes a `startindex` because each value goes through
+    /// `wrap(cpu, x, startindex)`; pyre's boxes are the raw payload words, so
+    /// there is no per-index wrapper to build and no index to thread.
+    ///
+    /// Upstream reads each length off the object
+    /// (`lst = getattr(virtualizable, fieldname); for i in range(len(lst))`).
+    /// The lengths are a parameter here because an array declared with no
+    /// length word in the object answers `can_read_length_from_heap` false,
+    /// and `sync_virtualizable_before_jit` then supplies
+    /// `virtualizable_array_lengths` instead. Pass
+    /// [`Self::read_array_lengths_from_heap`] for upstream's own source.
+    ///
+    /// # Safety
+    /// `obj_ptr` must point to a valid virtualizable object.
+    pub unsafe fn read_boxes(&self, obj_ptr: *const u8, array_lengths: &[usize]) -> Vec<i64> {
+        unsafe {
+            let mut boxes = self.read_static_boxes(obj_ptr);
+            for (index, _) in self.array_fields.iter().enumerate() {
+                let length = array_lengths.get(index).copied().unwrap_or(0);
+                boxes.reserve(length);
+                for item_index in 0..length {
+                    boxes.push(self.read_array_item(obj_ptr, index, item_index));
+                }
+            }
+            boxes
+        }
+    }
+
+    /// [`Self::read_boxes`] regrouped per array field, which is the shape
+    /// `JitState::import_virtualizable_boxes` and the walker's vable shadow
+    /// take. It reads through `read_boxes`, so one function reads the object.
     ///
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
@@ -1463,25 +1492,29 @@ impl VirtualizableInfo {
         array_lengths: &[usize],
     ) -> (Vec<i64>, Vec<Vec<i64>>) {
         unsafe {
-            let static_boxes = self.read_static_boxes(obj_ptr);
+            let boxes = self.read_boxes(obj_ptr, array_lengths);
+            let mut cursor = self.static_fields.len();
+            let static_boxes = boxes[..cursor].to_vec();
             let mut array_boxes = Vec::with_capacity(self.array_fields.len());
             for (index, _) in self.array_fields.iter().enumerate() {
                 let length = array_lengths.get(index).copied().unwrap_or(0);
-                let mut values = Vec::with_capacity(length);
-                for item_index in 0..length {
-                    values.push(self.read_array_item(obj_ptr, index, item_index));
-                }
-                array_boxes.push(values);
+                array_boxes.push(boxes[cursor..cursor + length].to_vec());
+                cursor += length;
             }
             (static_boxes, array_boxes)
         }
     }
 
-    /// Port of `virtualizable.py write_boxes`. Upstream takes one flat list
-    /// of statics then array items; this takes the same values as
-    /// `(&[i64], &[Vec<i64>])`. Convergence is to flatten the pair into one
-    /// list so that `write_all_boxes` becomes a caller of `write_boxes`
-    /// rather than a second writer of the same fields.
+    /// [`Self::write_boxes`]'s values regrouped per array field, the write
+    /// twin of [`Self::read_all_boxes`].
+    ///
+    /// It is a second writer of the same fields rather than a caller of
+    /// `write_boxes`, and the reason is the lengths: `write_boxes` takes each
+    /// array's length from the object, as upstream does, while this one takes
+    /// the caller's. An array declared with no length word answers
+    /// `can_read_length_from_heap` false, so `get_array_length` has nothing to
+    /// read for it and `write_boxes` cannot write it at all. Folding the two
+    /// together means giving every such array a length in the object first.
     ///
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
@@ -2355,6 +2388,49 @@ mod tests {
             assert_eq!(*(array_data.as_ptr().add(16) as *const i64), 200);
             assert_eq!(*(array_data.as_ptr().add(24) as *const i64), 300);
         }
+    }
+
+    /// `virtualizable.py read_boxes` hands back one list in the order
+    /// `write_boxes` consumes it: the statics, then every item of every array.
+    /// The trailing slot is the `vable_box` the caller appends and
+    /// `write_boxes` does not write (`assert len(boxes) == i + 1`).
+    #[test]
+    fn read_boxes_is_the_flat_order_write_boxes_consumes() {
+        let mut array_data = vec![0u8; 8 + 3 * 8];
+        unsafe {
+            *(array_data.as_mut_ptr() as *mut usize) = 3;
+            *(array_data.as_mut_ptr().add(8) as *mut i64) = 10;
+            *(array_data.as_mut_ptr().add(16) as *mut i64) = 20;
+            *(array_data.as_mut_ptr().add(24) as *mut i64) = 30;
+        }
+
+        let mut obj = vec![0u8; 24];
+        unsafe {
+            *(obj.as_mut_ptr().add(8) as *mut i64) = 7;
+            *(obj.as_mut_ptr().add(16) as *mut *const u8) = array_data.as_ptr();
+        }
+
+        let mut info = VirtualizableInfo::new(0);
+        info.add_field("pc", Type::Int, 8);
+        test_add_array_field(&mut info, "stack", Type::Int, 16, 0, 8);
+
+        let lengths = unsafe { read_array_lengths(&info, obj.as_ptr()) };
+        let boxes = unsafe { info.read_boxes(obj.as_ptr(), &lengths) };
+        assert_eq!(boxes, vec![7, 10, 20, 30]);
+
+        // `read_all_boxes` regroups that same list rather than reading the
+        // object a second way.
+        let (static_boxes, array_boxes) = unsafe { info.read_all_boxes(obj.as_ptr(), &lengths) };
+        assert_eq!(static_boxes, boxes[..1].to_vec());
+        assert_eq!(array_boxes, vec![boxes[1..].to_vec()]);
+
+        let mut written = vec![42i64, 100, 200, 300];
+        written.push(obj.as_ptr() as i64);
+        unsafe { info.write_boxes(obj.as_mut_ptr(), &written) };
+        assert_eq!(
+            unsafe { info.read_boxes(obj.as_ptr(), &lengths) },
+            vec![42, 100, 200, 300]
+        );
     }
 
     #[test]
