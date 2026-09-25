@@ -882,6 +882,8 @@ pub struct Assembler386<'a> {
     pending_malloc_nursery_gcmap: Option<usize>,
     /// Frame depth (in WORD units) for the current trace.
     frame_depth: usize,
+    /// `BaseAssembler._previous_rd_locs`.
+    previous_rd_locs: majit_ir::RdLocs,
     /// Fail descriptors built during assembly — wrapped in `FailDescrCell`
     /// so `Arc::as_ptr` is a thin pointer suitable for direct
     /// `Arc::from_raw` recovery (`history.py AbstractDescr.show`).
@@ -1189,6 +1191,7 @@ impl<'a> Assembler386<'a> {
             min_bytes_before_label: 0,
             pending_malloc_nursery_gcmap: None,
             frame_depth: JITFRAME_FIXED_SIZE,
+            previous_rd_locs: majit_ir::RdLocs::new(),
             fail_descrs: FailDescrStore::default(),
             trace_id,
             header_pc,
@@ -5930,35 +5933,15 @@ impl<'a> Assembler386<'a> {
             );
         }
 
-        // `llsupport/assembler.py store_info_on_descr` parity:
-        // encode each fail-arg location as a USHORT.  PyPy's encoding —
-        //   None              → 0xFFFF
-        //   GPR register      → position in `cpu.gen_regs`
-        //   float register    → len(gen_regs) + position in `cpu.float_regs`
-        //   stack             → (loc.value - base_ofs) // WORD
-        //                         (here: `f.get_position() + JITFRAME_FIXED_SIZE`)
-        // PyPy regalloc never passes `Const` to `getfailargs()` — `loc()`
-        // returns the immediate inline.  Pyre allocates a const-store
-        // slot for `Loc::Immed` at codegen time and encodes the slot
-        // into `rd_locs` so the deopt path treats it as a normal stack
-        // position (`_decode_pos` in `llmodel.py`).
-        let mut const_stores: Vec<(usize, i64)> = Vec::new();
-        let rd_locs: majit_ir::RdLocs = faillocs
-            .iter()
-            .map(|fl| match fl {
-                None => 0xFFFF,
-                Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => {
-                    // Allocate a const-store slot at codegen time;
-                    // encode the slot into `rd_locs` (PyPy stack-position
-                    // form) so deopt reads it like any other stack fail-arg.
-                    let slot = self.frame_depth;
-                    self.frame_depth += 1;
-                    const_stores.push((slot, i.value));
-                    slot as u16
-                }
-                Some(loc) => deadframe_slot_for_loc(loc).unwrap_or(0xFFFF),
-            })
-            .collect();
+        // `BaseAssembler.store_info_on_descr`: one encode, and the
+        // previous vector when it matches. An immediate still takes a
+        // fresh const-store slot, so that position will not match.
+        let (rd_locs, const_stores) = crate::guard::store_info_on_descr(
+            &mut self.previous_rd_locs,
+            &mut self.frame_depth,
+            faillocs,
+            deadframe_slot_for_loc,
+        );
         // Stamp source_op_index directly on the meta descr (UnsafeCell slot
         // owned by ResumeGuardDescr / ResumeGuardCopiedDescr per
         // resume_guard_descr.rs); `layout_for_fail_descr` reads it back
