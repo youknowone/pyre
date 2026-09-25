@@ -8600,22 +8600,31 @@ fn count_operators(bytes: &[u8], mut f: impl FnMut(&wasmparser::Operator<'_>)) {
 /// args[0].
 #[test]
 fn cond_call_value_tests_its_value_and_calls_arg_one() {
+    use majit_ir::descr::SimpleCallDescr;
+    use std::sync::Arc;
+
     let inputargs = vec![
         InputArg::from_type_rc(Type::Int, 0),
         InputArg::from_type_rc(Type::Int, 1),
     ];
-    let ops = vec![
-        make_op(
-            OpCode::CondCallValueI,
-            &[
-                OpRef::input_arg_int(0),
-                OpRef::const_int(0x100),
-                OpRef::input_arg_int(1),
-            ],
-            OpRef::int_op(2),
-        ),
-        Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))]),
-    ];
+    let call = make_op(
+        OpCode::CondCallValueI,
+        &[
+            OpRef::input_arg_int(0),
+            OpRef::const_int(0x100),
+            OpRef::input_arg_int(1),
+        ],
+        OpRef::int_op(2),
+    );
+    call.setdescr(Arc::new(SimpleCallDescr::new(
+        0,
+        vec![Type::Int],
+        Type::Int,
+        false,
+        8,
+        EffectInfo::default(),
+    )));
+    let ops = vec![call, Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))])];
     let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
     validate_wasm(&bytes);
     let (mut eqz, mut ifs) = (0, 0);
@@ -8626,10 +8635,7 @@ fn cond_call_value_tests_its_value_and_calls_arg_one() {
     });
     assert!(eqz >= 1, "COND_CALL_VALUE tests its value with i64.eqz");
     assert_eq!(ifs, 1, "the call sits under exactly one predicate");
-    assert!(
-        import_func_type(&bytes, "jit_call_compact").is_some(),
-        "COND_CALL_VALUE uses the residual trampoline"
-    );
+    assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
 }
 
 /// x86/assembler.py `genop_guard_guard_nonnull_class` guards the class compare
@@ -9175,20 +9181,32 @@ fn zero_array_uses_memory_fill_for_the_rewriter_range() {
 /// `genop_discard_cond_call`: CondCallN is a real conditional call, not a no-op.
 #[test]
 fn cond_call_reload_sits_on_the_arm_that_called() {
+    use majit_ir::descr::SimpleCallDescr;
+    use std::sync::Arc;
+
     let inputargs = vec![
         InputArg::from_type_rc(Type::Int, 0),
         InputArg::from_type_rc(Type::Ref, 1),
     ];
+    let call = make_op(
+        OpCode::CondCallN,
+        &[
+            OpRef::input_arg_int(0),
+            OpRef::const_int(0x100),
+            OpRef::input_arg_ref(1),
+        ],
+        OpRef::NONE,
+    );
+    call.setdescr(Arc::new(SimpleCallDescr::new(
+        0,
+        vec![Type::Ref],
+        Type::Void,
+        false,
+        8,
+        EffectInfo::default(),
+    )));
     let ops = vec![
-        make_op(
-            OpCode::CondCallN,
-            &[
-                OpRef::input_arg_int(0),
-                OpRef::const_int(0x100),
-                OpRef::input_arg_ref(1),
-            ],
-            OpRef::NONE,
-        ),
+        call,
         Op::new(OpCode::Finish, &[rb(OpRef::input_arg_ref(1))]),
     ];
     let frame = codegen::FrameGeometry::compact(
@@ -9232,7 +9250,50 @@ fn cond_call_reload_sits_on_the_arm_that_called() {
 }
 
 #[test]
-fn cond_call_n_emits_predicate_and_trampoline() {
+fn cond_call_n_emits_predicate_and_direct_call() {
+    use majit_ir::descr::SimpleCallDescr;
+    use std::sync::Arc;
+
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+    ];
+    let call = make_op(
+        OpCode::CondCallN,
+        &[
+            OpRef::input_arg_int(0),
+            OpRef::const_int(0x100),
+            OpRef::input_arg_int(1),
+        ],
+        OpRef::NONE,
+    );
+    call.setdescr(Arc::new(SimpleCallDescr::new(
+        0,
+        vec![Type::Int],
+        Type::Void,
+        false,
+        8,
+        EffectInfo::default(),
+    )));
+    let ops = vec![
+        call,
+        Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
+    ];
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    let (mut eqz, mut ifs) = (0, 0);
+    count_operators(&bytes, |op| match op {
+        wasmparser::Operator::I64Eqz => eqz += 1,
+        wasmparser::Operator::If { .. } => ifs += 1,
+        _ => {}
+    });
+    assert!(eqz >= 1, "CondCallN tests the predicate with i64.eqz");
+    assert!(ifs >= 1, "CondCallN wraps the call in an if");
+    assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
+}
+
+#[test]
+fn cond_call_without_call_descr_is_unsupported() {
     let inputargs = vec![
         InputArg::from_type_rc(Type::Int, 0),
         InputArg::from_type_rc(Type::Int, 1),
@@ -9249,19 +9310,38 @@ fn cond_call_n_emits_predicate_and_trampoline() {
         ),
         Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
     ];
-    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
-    validate_wasm(&bytes);
-    let (mut eqz, mut ifs) = (0, 0);
-    count_operators(&bytes, |op| match op {
-        wasmparser::Operator::I64Eqz => eqz += 1,
-        wasmparser::Operator::If { .. } => ifs += 1,
-        _ => {}
-    });
-    assert!(eqz >= 1, "CondCallN tests the predicate with i64.eqz");
-    assert!(ifs >= 1, "CondCallN wraps the call in an if");
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.clone(),
+        ops,
+        inlined_bridges: Vec::new(),
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        gc_const_keys: Vec::new(),
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::fixed(),
+        ca: codegen::CaParams::default(),
+    };
     assert!(
-        import_func_type(&bytes, "jit_call_compact").is_some(),
-        "CondCallN uses the residual trampoline"
+        matches!(
+            codegen::build_wasm_module(&inputs),
+            Err(majit_backend::BackendError::Unsupported(_))
+        ),
+        "COND_CALL without a call descr must decline"
     );
 }
 

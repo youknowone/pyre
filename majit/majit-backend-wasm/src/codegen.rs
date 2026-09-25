@@ -2035,84 +2035,64 @@ fn emit_wb_helper_call(
 /// Emit a write-barrier check on `base_ref` for a rewriter `CondCallGcWb` /
 /// `CondCallGcWbArray`.
 ///
-/// With the residual type family declared (`residual_type_base`), this is
 /// `_write_barrier_fastpath`: one test of the flag byte, and only a flagged
 /// object enters the body. A `card_index` store then follows
 /// `WriteBarrierSlowPath` — CARDS_SET already armed marks the card inline,
 /// otherwise `jit_remember_young_pointer_from_array` runs and the same test
-/// decides again on its return. Everything else calls `wasm_jit_write_barrier`.
+/// decides again on its return. A field store calls `wasm_jit_write_barrier`.
 ///
-/// Operand-stack-neutral: every push is consumed by a store, the call, or the
-/// result drop.
+/// The `(i64)->i64` residual type is declared for every module that contains
+/// one of these ops (`direct_helper_i64_arity`). Operand-stack-neutral: every
+/// push is consumed by a store, the call, or the result drop.
 #[allow(clippy::too_many_arguments)]
 fn emit_write_barrier(
     sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
     value_types: &ValueLocals,
-    jit_call_idx: Option<u32>,
     residual_type_base: Option<u32>,
     wb: &WriteBarrierHelpers,
     base_ref: OpRef,
     card_index: Option<OpRef>,
-) {
-    if let Some(base) = residual_type_base {
-        emit_load_wb_flag_byte(sink, constants, value_types, wb, base_ref);
-        sink.i32_const(wb.flag_mask(card_index.is_some()));
-        sink.i32_and();
-        sink.if_(BlockType::Empty);
-        match card_index {
-            Some(index) => {
-                emit_load_wb_flag_byte(sink, constants, value_types, wb, base_ref);
-                sink.i32_const(i32::from(wb.cards_set));
-                sink.i32_and();
-                sink.if_(BlockType::Empty);
-                emit_inline_card_mark(sink, constants, value_types, wb, base_ref, index);
-                sink.else_();
-                emit_wb_helper_call(
-                    sink,
-                    constants,
-                    value_types,
-                    base,
-                    wb.array_fn_ptr,
-                    base_ref,
-                );
-                emit_load_wb_flag_byte(sink, constants, value_types, wb, base_ref);
-                sink.i32_const(i32::from(wb.cards_set));
-                sink.i32_and();
-                sink.if_(BlockType::Empty);
-                emit_inline_card_mark(sink, constants, value_types, wb, base_ref, index);
-                sink.end();
-                sink.end();
-            }
-            None => {
-                emit_wb_helper_call(sink, constants, value_types, base, wb.fn_ptr, base_ref);
-            }
-        }
-        sink.end();
-        return;
-    }
-    // Host-trampoline fallback: the call area carries the base and nothing
-    // else, so this arm always takes the plain barrier, which is
-    // `gen_write_barrier_array`'s own fall-back case. The helper re-checks the
-    // flag itself.
-    let Some(jit_call) = jit_call_idx else {
-        return;
+) -> Result<(), BackendError> {
+    let Some(base) = residual_type_base else {
+        return Err(BackendError::Unsupported(
+            "wasm codegen: write barrier has no residual call type".into(),
+        ));
     };
-    // func_ptr = wasm_jit_write_barrier
-    emit_call_area_addr(sink);
-    sink.i64_const(wb.fn_ptr);
-    sink.i64_store(mem64(STATIC_CALL_FUNC_OFS));
-    // num_args = 1 (the trampoline reflects arity from the wasm signature;
-    // written for protocol symmetry with the alloc/call paths)
-    emit_call_area_addr(sink);
-    sink.i64_const(1);
-    sink.i64_store(mem64(STATIC_CALL_NARGS_OFS));
-    // arg0 = base object pointer
-    emit_call_area_addr(sink);
-    emit_resolve(sink, constants, value_types, base_ref);
-    sink.i64_store(mem64(STATIC_CALL_ARGS_OFS));
-    // call trampoline; void result ignored
-    emit_jit_call(sink, jit_call);
+    emit_load_wb_flag_byte(sink, constants, value_types, wb, base_ref);
+    sink.i32_const(wb.flag_mask(card_index.is_some()));
+    sink.i32_and();
+    sink.if_(BlockType::Empty);
+    match card_index {
+        Some(index) => {
+            emit_load_wb_flag_byte(sink, constants, value_types, wb, base_ref);
+            sink.i32_const(i32::from(wb.cards_set));
+            sink.i32_and();
+            sink.if_(BlockType::Empty);
+            emit_inline_card_mark(sink, constants, value_types, wb, base_ref, index);
+            sink.else_();
+            emit_wb_helper_call(
+                sink,
+                constants,
+                value_types,
+                base,
+                wb.array_fn_ptr,
+                base_ref,
+            );
+            emit_load_wb_flag_byte(sink, constants, value_types, wb, base_ref);
+            sink.i32_const(i32::from(wb.cards_set));
+            sink.i32_and();
+            sink.if_(BlockType::Empty);
+            emit_inline_card_mark(sink, constants, value_types, wb, base_ref, index);
+            sink.end();
+            sink.end();
+        }
+        None => {
+            emit_wb_helper_call(sink, constants, value_types, base, wb.fn_ptr, base_ref);
+        }
+    }
+    sink.end();
+    Ok(())
 }
 
 /// Publish Ref-home writes made since the preceding safepoint.  A live old
@@ -2121,13 +2101,14 @@ fn emit_write_barrier(
 /// later home store can survive the next collection.
 fn emit_jitframe_write_barrier(
     sink: &mut PeepSink<'_, '_>,
-    jit_call_idx: Option<u32>,
     residual_type_base: Option<u32>,
     wb: &WriteBarrierHelpers,
-) {
-    if residual_type_base.is_none() && jit_call_idx.is_none() {
-        return;
-    }
+) -> Result<(), BackendError> {
+    let Some(base) = residual_type_base else {
+        return Err(BackendError::Unsupported(
+            "wasm codegen: jitframe write barrier has no residual call type".into(),
+        ));
+    };
     // aarch64/assembler.py _reload_frame_if_necessary invokes
     // _write_barrier_fastpath(is_frame=True): frames never use card marking.
     // Off-GC frames reserve a zeroed header too (alloc_off_gc_jitframe), so
@@ -2141,34 +2122,15 @@ fn emit_jitframe_write_barrier(
     sink.i32_const(i32::from(wb.if_flag));
     sink.i32_and();
     sink.if_(BlockType::Empty);
-    if let Some(base) = residual_type_base {
-        sink.local_get(0);
-        sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
-        sink.i32_sub();
-        sink.i64_extend_i32_u();
-        sink.i32_const(wb.fn_ptr as i32);
-        sink.call_indirect(0, base + 1);
-        sink.drop();
-        sink.end();
-        return;
-    }
-    let Some(jit_call) = jit_call_idx else {
-        return;
-    };
-    emit_call_area_addr(sink);
-    sink.i64_const(wb.fn_ptr);
-    sink.i64_store(mem64(STATIC_CALL_FUNC_OFS));
-    emit_call_area_addr(sink);
-    sink.i64_const(1);
-    sink.i64_store(mem64(STATIC_CALL_NARGS_OFS));
-    emit_call_area_addr(sink);
     sink.local_get(0);
     sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
     sink.i32_sub();
     sink.i64_extend_i32_u();
-    sink.i64_store(mem64(STATIC_CALL_ARGS_OFS));
-    emit_jit_call(sink, jit_call);
+    sink.i32_const(wb.fn_ptr as i32);
+    sink.call_indirect(0, base + 1);
+    sink.drop();
     sink.end();
+    Ok(())
 }
 
 /// Date a use at `at` unless it is an owner-defined value leaking into an
@@ -3262,7 +3224,7 @@ fn conditional_call_true_void_arity(
 /// If `op` is a residual CALL whose ABI is uniformly i64 (all Int/Ref args and
 /// an Int/Ref result), return its argument count — eligible for a direct
 /// `call_indirect` of type `(i64×n) -> i64`. `None` keeps the `jit_call`
-/// trampoline: void / float / release-GIL / cond / assembler calls, a missing
+/// trampoline: void / float / release-GIL / assembler calls, a missing
 /// call descr, or an arg-count/descr-shape mismatch (defensive).
 ///
 /// This includes `CallMayForce{I,R}` when their ABI is uniformly i64: the force
@@ -3271,8 +3233,8 @@ fn conditional_call_true_void_arity(
 /// which neither lowering touches, so a direct call is sound. `CallReleaseGilI`
 /// is the same ABI with the callee at arg 1 (`direct_call_release_gil`);
 /// wasm32 has no GIL to drop, so the call itself is an ordinary residual.
-/// Float / cond / assembler calls and non-reflectable descrs remain on
-/// the trampoline.
+/// Float / assembler calls and non-reflectable descrs remain on
+/// the trampoline. `COND_CALL` declines instead of using it.
 fn residual_func_ofs(opcode: OpCode) -> usize {
     usize::from(matches!(
         opcode,
@@ -3383,8 +3345,8 @@ fn residual_call_typed_sig(
 /// data region (`emit_force_bracket_before_call` before the call,
 /// `GuardNotForced` after), which neither lowering touches, so a direct call is
 /// sound.
-/// Float / release-GIL / cond / assembler calls and non-reflectable descrs
-/// remain on the trampoline.
+/// Float / release-GIL / assembler calls and non-reflectable descrs
+/// remain on the trampoline. `COND_CALL` declines instead of using it.
 fn residual_call_void_word_arity(
     op: &Op,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -3423,9 +3385,9 @@ fn residual_call_void_word_arity(
 /// True-void counterpart of [`residual_call_void_word_arity`]: an eligible
 /// void residual CALL whose descr records a `()` result (`result_size == 0`).
 /// Int/Ref-only arguments lower through the `(i64×n) -> ()` type family with
-/// no result to drop. Float / release-GIL / cond / assembler calls,
+/// no result to drop. Float / release-GIL / assembler calls,
 /// non-reflectable descrs, and descr/operand arity mismatches remain on the
-/// trampoline.
+/// trampoline. `COND_CALL` declines instead of using it.
 fn residual_call_void_true_arity(
     op: &Op,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -3507,8 +3469,9 @@ fn direct_helper_i64_arity(
 /// Keep this in lockstep with the individual emission arms below: the uniform
 /// i64, typed float, and true-void residual families, `CallMallocNursery*`,
 /// and write barriers are direct when the call descr and the callee's table
-/// type agree; a mismatch, a host import, and string allocation retain the
-/// trampoline.
+/// type agree. A `COND_CALL` whose descr does not establish that signature
+/// declines. A mismatch, a host import, and string allocation retain the
+/// trampoline for ordinary calls.
 fn has_trampoline_calls(
     inputargs: &[InputArgRc],
     ops: &[Op],
@@ -5908,7 +5871,7 @@ fn build_function(
             continue;
         }
         if frame_can_escape && ref_homes.len() != 0 && op.opcode.can_malloc() {
-            emit_jitframe_write_barrier(&mut sink, jit_call_idx, residual_type_base, wb);
+            emit_jitframe_write_barrier(&mut sink, residual_type_base, wb)?;
         }
         if op.opcode == OpCode::Label && key_dispatch && labels_passed < num_labels {
             // End of the segment before label j (key-0 / earlier-label path).
@@ -7348,12 +7311,11 @@ fn build_function(
                     &mut sink,
                     constants,
                     value_types,
-                    jit_call_idx,
                     residual_type_base,
                     wb,
                     op.arg(0).to_opref(),
                     None,
-                );
+                )?;
             }
             OpCode::CondCallGcWbArray => {
                 // rewrite.py `gen_write_barrier_array`: cards_set == 0
@@ -7364,19 +7326,18 @@ fn build_function(
                     &mut sink,
                     constants,
                     value_types,
-                    jit_call_idx,
                     residual_type_base,
                     wb,
                     op.arg(0).to_opref(),
                     card,
-                );
+                )?;
             }
             OpCode::CondCallN => {
                 // x86/assembler.py `genop_discard_cond_call`: TEST cond; JZ
                 // skip; CALL. The predicate is arg 0, the callee is arg 1, and
-                // the rest are the call's own arguments. A descr-proven word
-                // ABI reaches the shared table directly; only unresolved or
-                // mixed signatures retain the host trampoline.
+                // the rest are the call's own arguments. The call descr's
+                // word or true-void ABI is a direct `call_indirect`. A descr
+                // that does not establish that signature declines the trace.
                 //
                 // `do_conditional_call` asserts the callee forces no virtual or
                 // virtualizable, so unlike the CALL arm this needs no force
@@ -7422,20 +7383,9 @@ fn build_function(
                     sink.i32_wrap_i64();
                     sink.call_indirect(0, base + nargs as u32);
                 } else {
-                    let jit_call =
-                        jit_call_idx.expect("COND_CALL op present but jit_call not imported");
-                    emit_call_area_addr(&mut sink);
-                    emit_resolve(&mut sink, constants, value_types, func);
-                    sink.i64_store(mem64(STATIC_CALL_FUNC_OFS));
-                    emit_call_area_addr(&mut sink);
-                    sink.i64_const(call_args.len() as i64);
-                    sink.i64_store(mem64(STATIC_CALL_NARGS_OFS));
-                    for (i, arg) in call_args.iter().enumerate() {
-                        emit_call_area_addr(&mut sink);
-                        emit_resolve(&mut sink, constants, value_types, arg.to_opref());
-                        sink.i64_store(mem64(STATIC_CALL_ARGS_OFS + i as u64 * SLOT_SIZE));
-                    }
-                    emit_jit_call(&mut sink, jit_call);
+                    return Err(BackendError::Unsupported(
+                        "wasm codegen: COND_CALL has no direct residual signature".into(),
+                    ));
                 }
                 // COND_CALL sits inside the CALL opcode range, so a Ref living
                 // across it already owns a home. Only the arm that called can
@@ -7524,28 +7474,9 @@ fn build_function(
                         sink.drop();
                     }
                 } else {
-                    let jit_call =
-                        jit_call_idx.expect("COND_CALL_VALUE op present but jit_call not imported");
-                    emit_call_area_addr(&mut sink);
-                    emit_resolve(&mut sink, constants, value_types, func);
-                    sink.i64_store(mem64(STATIC_CALL_FUNC_OFS));
-                    emit_call_area_addr(&mut sink);
-                    sink.i64_const(call_args.len() as i64);
-                    sink.i64_store(mem64(STATIC_CALL_NARGS_OFS));
-                    for (i, arg) in call_args.iter().enumerate() {
-                        emit_call_area_addr(&mut sink);
-                        emit_resolve(&mut sink, constants, value_types, arg.to_opref());
-                        sink.i64_store(mem64(STATIC_CALL_ARGS_OFS + i as u64 * SLOT_SIZE));
-                    }
-                    emit_jit_call(&mut sink, jit_call);
-                    // Int and Ref are the only result types minted here.
-                    emit_call_area_addr(&mut sink);
-                    sink.i64_load(mem64(STATIC_CALL_RESULT_OFS));
-                    if has_result {
-                        sink.local_set(value_types.local(vi));
-                    } else {
-                        sink.drop();
-                    }
+                    return Err(BackendError::Unsupported(
+                        "wasm codegen: COND_CALL_VALUE has no direct residual signature".into(),
+                    ));
                 }
                 // Only the arm that called can have collected, so the reload
                 // sits on it rather than after the `if`.
