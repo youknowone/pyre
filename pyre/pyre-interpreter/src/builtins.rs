@@ -7378,24 +7378,23 @@ static __majit_wrap_base_exception_descr_init_target: crate::gateway::BuiltinWra
         func: __majit_wrap_base_exception_descr_init,
     };
 
-/// `ValueError(x)` — one positional.  The general `exc_value_error_new`
-/// graph has no jitcode of its own, so `ValueError(...)` declined with
-/// `no jitcode for address`.
+/// `ValueError(x)` — one positional that is not the trailing `__pyre_kw__`
+/// marker.  `descr_new_base_exception(space, w_subtype, __args__)` receives
+/// `__args__` unbound: this flat slice, keywords included as that marker
+/// dict.  The body does `args_w, kwds_w = __args__.unpack()` and then
+/// `# ignore kwds`, so the dict is discarded rather than rejected.
 ///
-/// `descr_new_base_exception` reads `args_w` and ignores keywords
-/// (`# ignore kwds`).  The binder therefore always lays this wrapper out as
-/// `[cls, args_tuple, kwargs_dict]`; the dict is not read.  Three words whose
-/// second is not that tuple are an unbound `[cls, a, b]`.  Packing `a` would
-/// drop `b`, so that slice falls through with every word intact.
+/// TODO: the general `exc_value_error_new` graph has no jitcode of its own,
+/// so a call that misses this one-arg guard declines with
+/// `no jitcode for address`.  Binding `__args__` at the gateway closed that
+/// gap and is the wrong fix.  Upstream recovers it by tracing the matcher:
+/// `Arguments._match_signature` carries `@jit.unroll_safe` and
+/// `Arguments.unpack` carries `@jit.look_inside_iff`.
 pub fn __majit_wrap_exc_value_error_descr_new(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() == 3 && !args[0].is_null() && packed_arg_is_tuple(args[1]) {
-        let item = packed_single_arg(args[1]);
-        if !item.is_null() {
-            return Ok(value_error_one_arg(args[0], item));
-        }
-        return exc_value_error_new_packed(args[0], args[1]);
+    if args.len() == 2 && !args[0].is_null() && !builtin_kwargs_marker_tail(args[1]) {
+        return Ok(value_error_one_arg(args[0], args[1]));
     }
     // The four-word residual cannot see a longer tail, and a bare exception
     // takes any number of positional arguments. Hand the real slice over
@@ -7491,16 +7490,6 @@ static __majit_wrap_exc_value_error_descr_new_target: crate::gateway::BuiltinWra
         func: __majit_wrap_exc_value_error_descr_new,
     };
 
-/// Whether `packed` is the `*args` tuple the binder appended after `cls`.
-///
-/// An unbound `[cls, a, b]` carries the positional itself here.  A non-tuple
-/// answers false so the wrapper keeps `b`; the traced wrapper cannot ask
-/// this itself, for the same reason as [`packed_single_arg`].
-#[majit_macros::dont_look_inside_cannot_raise]
-fn packed_arg_is_tuple(packed: PyObjectRef) -> bool {
-    !packed.is_null() && unsafe { pyre_object::is_tuple(packed) }
-}
-
 /// The one object a `*args` tuple of length one holds, or `PY_NULL` for any
 /// other shape — including a `packed` that is not a tuple at all, which is
 /// what an unbound caller passes.
@@ -7541,28 +7530,6 @@ fn exc_base_exception_init_packed(
         }
     }
     exc_base_exception_init(&flat)
-}
-
-/// Expand the `*args` tuple the signature binder appended after `cls`.
-/// An unbound caller reaches here with the positional itself rather than a
-/// tuple holding it; take it as the one argument it is.
-#[majit_macros::dont_look_inside]
-fn exc_value_error_new_packed(
-    cls: PyObjectRef,
-    packed: PyObjectRef,
-) -> Result<PyObjectRef, crate::PyError> {
-    if packed.is_null() || !unsafe { pyre_object::is_tuple(packed) } {
-        return exc_value_error_new(&[cls, packed]);
-    }
-    let n = unsafe { pyre_object::w_tuple_len(packed) };
-    let mut flat = Vec::with_capacity(1 + n);
-    flat.push(cls);
-    for index in 0..n as i64 {
-        if let Some(item) = unsafe { pyre_object::w_tuple_getitem(packed, index) } {
-            flat.push(item);
-        }
-    }
-    exc_value_error_new(&flat)
 }
 
 fn exc_base_exception_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -9473,29 +9440,18 @@ fn exc_unicode_encode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
 }
 
 /// `cls.__new__` wrapper that strips `cls` and calls an exception constructor.
-/// PyPy: `_new.descr_new_base_exception` unpacks `__args__`, stores `args_w`,
-/// and deliberately ignores `kwds_w`; each exception type's descr__new__ then
-/// creates a W_<Kind>Object.  Pyre's flat builtin ABI carries those keywords
-/// in a trailing marker dict, so remove it before constructing `args_w`.
+/// `descr_new_base_exception` unpacks unbound `__args__`, stores `args_w`,
+/// and deliberately ignores `kwds_w` (`# ignore kwds`); each exception type's
+/// descr__new__ then creates a W_<Kind>Object.  The flat builtin ABI carries
+/// those keywords in a trailing `__pyre_kw__` marker dict, so strip it and
+/// discard the dict before constructing `args_w`.
 macro_rules! exc_new_wrapper {
     ($wrapper:ident, $ctor:ident) => {
-        exc_new_wrapper!(@body $wrapper, $ctor, true);
-    };
-    ($wrapper:ident, $ctor:ident, nosplit) => {
-        exc_new_wrapper!(@body $wrapper, $ctor, false);
-    };
-    (@body $wrapper:ident, $ctor:ident, $split:expr) => {
         pub fn $wrapper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             let cls = args.first().copied();
             let rest: &[PyObjectRef] = if args.is_empty() { args } else { &args[1..] };
-            // ValueError's `(cls, *args)` signature already rejected keywords,
-            // so its slice has no marker dict. Every other constructor still
-            // receives one.
-            let (positional, _) = if $split {
-                split_builtin_kwargs(rest)
-            } else {
-                (rest, None)
-            };
+            // `# ignore kwds`: the marker dict is not an element of `args_w`.
+            let (positional, _) = split_builtin_kwargs(rest);
             let _roots = pyre_object::gc_roots::push_roots();
             let cls_slot = cls.map(|cls| {
                 let slot = pyre_object::gc_roots::shadow_stack_len();
@@ -9525,7 +9481,7 @@ exc_new_wrapper!(exc_eof_error_new, exc_eof_error);
 exc_new_wrapper!(exc_arithmetic_error_new, exc_arithmetic_error);
 exc_new_wrapper!(exc_zero_division_new, exc_zero_division);
 exc_new_wrapper!(exc_type_error_new, exc_type_error);
-exc_new_wrapper!(exc_value_error_new, exc_value_error, nosplit);
+exc_new_wrapper!(exc_value_error_new, exc_value_error);
 exc_new_wrapper!(exc_key_error_new, exc_key_error);
 exc_new_wrapper!(exc_index_error_new, exc_index_error);
 exc_new_wrapper!(exc_attribute_error_new, exc_attribute_error);
@@ -9969,19 +9925,13 @@ pub fn make_exc_type_with_init(
             if let Some(doc) = doc {
                 type_ns_store(ns_slot, "__doc__", pyre_object::w_str_new(doc));
             }
-            // `descr_init(self, space, args_w)` rejects keywords.
-            // ValueError's `__new__` is `descr_new_base_exception`:
-            // `cls, *args, **kwargs`, and the body ignores `kwds`.
-            let new_sig = match name {
-                "ValueError" => Some(crate::gateway::Signature::new(
-                    vec!["cls"],
-                    Some("args"),
-                    Some("kwargs"),
-                    0,
-                    0,
-                )),
-                _ => None,
-            };
+            // `descr_new_base_exception(space, w_subtype, __args__)` takes
+            // `__args__` unbound.  No Signature: keywords stay on the flat
+            // slice as the trailing `__pyre_kw__` marker, and the body
+            // ignores them (`# ignore kwds`).  `descr_init(self, space,
+            // args_w)` is the side that rejects keywords, and only
+            // BaseException's `__init__` carries that Signature.
+            let new_sig = None;
             type_ns_store(
                 ns_slot,
                 "__new__",
