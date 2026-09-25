@@ -1,8 +1,6 @@
 #!/bin/sh
-# Fast core for JIT-quality loops. Drops the native-library modules behind
-# the `full` feature (`_socket`, `_ssl`, `_ctypes`, `_cffi_backend`, `mmap`,
-# `select`) and does not extract `pyre-module` or wasm layout sidecars.
-# The product `build/llbc` set is left alone.
+# Fast core for JIT-quality loops. Leaves `pyre-module` out of the binary and
+# out of the extraction; the other artefacts are the product `build/llbc` set.
 #
 #   pyre/scripts/build-jit-core.sh
 #   pyre/scripts/build-jit-core.sh --check   # cargo check, no release codegen
@@ -13,12 +11,9 @@ MODE=release
 if [ "${1:-}" = "--check" ]; then
     MODE=check
 fi
-export PYRE_JIT_CORE=1
-export LLBC_LAYOUT_TARGETS=
-export LLBC_DEST="$ROOT/build/llbc-jit-core"
 python3 pyre/scripts/extract-llbc.py majit-rlib pyre-object pyre-interpreter pyre-jit
-# Without `full`, `pyre-jit-trace`'s prepass reads this directory and checks
-# its stamps itself, and neither links nor hashes `pyre-module`.
+# Without `pyre-module`, `pyre-jit-trace`'s prepass neither links nor hashes
+# `pyre-module` and does not read its artefact.
 if [ "$MODE" = check ]; then
     exec cargo check -p pyrex --bin pyre-dynasm --no-default-features --features dynasm,mimalloc
 fi

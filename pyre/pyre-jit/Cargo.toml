@@ -7,10 +7,9 @@ repository.workspace = true
 description = "JIT compiler integration for pyre interpreter"
 
 [features]
-default = ["dynasm", "prepass", "full"]
-# Keep JIT-side module references in lockstep with the interpreter's module
-# set, the way `sandbox` does.
-full = ["pyre-interpreter/full", "pyre-jit-trace/full"]
+default = ["dynasm", "prepass", "pyre-module"]
+# The binary links `pyre-module`; the prepass then translates its modules too.
+pyre-module = ["pyre-jit-trace/pyre-module"]
 jit = []  # meta feature: enabled by cranelift or dynasm
 # `pyre-jit-trace`'s translation prepass. Forwarded rather than inherited
 # through that dependency's defaults so an LLBC extraction pass of this crate
