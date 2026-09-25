@@ -18,3 +18,10 @@ RUST_MIN_STACK = "16777216"
 # dispatched.
 [target.wasm32-unknown-unknown]
 rustflags = ["-C", "link-arg=--export-table"]
+
+# The PE default main-thread reserve is 1 MiB. `RUST_MIN_STACK` only
+# applies to threads Rust itself spawns, so a recursive CALL_ASSEMBLER
+# chain that fits in Linux's 8 MiB main stack dies here with
+# STATUS_STACK_BUFFER_OVERRUN (0xC0000409) and empty stderr.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:8388608"]
