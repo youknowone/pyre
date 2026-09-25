@@ -4193,13 +4193,14 @@ fn register_helper_fn_pointers(
         cpu.format_with_spec_fn as *const (),
         CallFlavor::MayForce,
     );
-    // `bh_build_string_from_array` concatenates the forced fragment array;
-    // fragments are already strings, so this runs no user code → `Plain`.
-    // Appended last to preserve fn_ptr indices.
+    // `bh_build_string_from_array` concatenates the forced fragment array.
+    // A non-str fragment raises `TypeError` and the helper runs no user
+    // code, so `CanRaise` (no virtualizable force).  Appended last to
+    // preserve fn_ptr indices.
     let build_string_from_array_fn = bind(
         assembler,
         cpu.build_string_from_array_fn as *const (),
-        CallFlavor::Plain,
+        CallFlavor::CanRaise,
     );
     // `bh_convert_value_fn` converts a value (user `__str__` / `__repr__`
     // may run Python) → `MayForce`.  Appended last to preserve fn_ptr indices.
@@ -12380,9 +12381,9 @@ impl CodeWriter {
                         // array build as BuildSet, then a single
                         // `build_string_from_array` residual concatenating the
                         // forced fragment array.  The length travels in the
-                        // array (no arity cap).  Fragments are already strings
-                        // (FORMAT_SIMPLE / FORMAT_WITH_SPEC / CONVERT_VALUE ran
-                        // first), so the residual runs no user code → `Plain`.
+                        // array (no arity cap).  A non-str fragment raises
+                        // `TypeError` and the residual runs no user code →
+                        // `CanRaise`.
                         Instruction::BuildString { count } => {
                             let n = count.get(op_arg) as usize;
                             let mut item_values_rev = Vec::with_capacity(n);

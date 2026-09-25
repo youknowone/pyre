@@ -1478,30 +1478,12 @@ fn register_synthetic_positional_metadata(
         // embedded 16-byte structs: the FORCE attribute already records the
         // translated item repr as `Ref`, and the low-level tuple field must
         // use that same pointer repr.  Scalar/float/string rows keep their
-        // existing specialized spelling.
+        // existing specialized spelling. An inline `[T; N]` item is that
+        // array's bytes (`positional_field_type`), not a pointer to it.
         let rows: Vec<(String, String)> = items
             .iter()
-            .zip(&attrs)
             .enumerate()
-            .map(|(index, (ty, (_, value_type)))| {
-                let ty = ty.trim();
-                let field_ty = if matches!(value_type, ValueType::Ref(_))
-                    && !ty.starts_with('&')
-                    && !ty.starts_with("*mut ")
-                    && !ty.starts_with("*const ")
-                    && !ty.starts_with("Box<")
-                    && !ty.starts_with("Arc<")
-                    && !ty.starts_with("Rc<")
-                    && !ty.starts_with("Vec<")
-                    && !ty.starts_with("Option<")
-                    && ty != "String"
-                {
-                    format!("&{ty}")
-                } else {
-                    ty.to_string()
-                };
-                (format!("__pos_{index}"), field_ty)
-            })
+            .map(|(index, ty)| (format!("__pos_{index}"), positional_field_type(ty)))
             .collect();
         let sid = majit_ir::descr::StructId::from_canonical(&shape);
         known_struct_names.insert(shape.clone());
@@ -1576,8 +1558,19 @@ fn split_top_level_type_args(input: &str) -> Vec<&str> {
 /// Split a shaped fixed-array owner (`Array<T;N>`) into its item spelling and
 /// concrete length. The last semicolon is the outer array separator, so nested
 /// array item spellings (`Array<[T;M];N>`) remain intact.
-fn shaped_array_parts(shape: &str) -> Option<(&str, usize)> {
-    let inner = shape.strip_prefix("Array<")?.strip_suffix('>')?;
+/// Split `Array<T;N>` or `[T; N]` into the item spelling and the length.
+/// The last semicolon is the outer separator, so a nested item
+/// (`Array<[T;M];N>`) stays intact. A slice `[T]` has no semicolon and
+/// is not a shaped array.
+pub(crate) fn shaped_array_parts(shape: &str) -> Option<(&str, usize)> {
+    let shape = shape.trim();
+    let inner = if let Some(rest) = shape.strip_prefix("Array<") {
+        rest.strip_suffix('>')?
+    } else if let Some(rest) = shape.strip_prefix('[') {
+        rest.strip_suffix(']')?
+    } else {
+        return None;
+    };
     let (item, len) = inner.rsplit_once(';')?;
     let item = item.trim();
     if item.is_empty() {
@@ -1586,7 +1579,35 @@ fn shaped_array_parts(shape: &str) -> Option<(&str, usize)> {
     Some((item, len.trim().parse().ok()?))
 }
 
-fn tuple_field_value_type(type_name: &str) -> ValueType {
+/// Low-level field spelling of one positional `__pos_N` item.
+///
+/// `TupleRepr` stores an instance as one GC pointer, so a nominal item is
+/// prefixed with `&`. An inline `[T; N]` is the array payload itself:
+/// `get_type_flag` sizes `[u8; 4]` as four bytes, and prefixing `&` would
+/// turn that item into a word-sized reference.
+pub(crate) fn positional_field_type(ty: &str) -> String {
+    let ty = ty.trim();
+    let value_type = tuple_field_value_type(ty);
+    let inline_array = ty.starts_with('[') && ty.ends_with(']');
+    if matches!(value_type, ValueType::Ref(_))
+        && !inline_array
+        && !ty.starts_with('&')
+        && !ty.starts_with("*mut ")
+        && !ty.starts_with("*const ")
+        && !ty.starts_with("Box<")
+        && !ty.starts_with("Arc<")
+        && !ty.starts_with("Rc<")
+        && !ty.starts_with("Vec<")
+        && !ty.starts_with("Option<")
+        && ty != "String"
+    {
+        format!("&{ty}")
+    } else {
+        ty.to_string()
+    }
+}
+
+pub(crate) fn tuple_field_value_type(type_name: &str) -> ValueType {
     match type_name.trim() {
         "()" => ValueType::Void,
         "f64" => ValueType::Float,
@@ -6396,8 +6417,10 @@ impl<'a> Lowering<'a> {
         // concrete ARRAY type (`op.args[0].concretetype`). Charon keeps the
         // same owner on the pre-projection Place, so preserve it before
         // consuming `inner`.
+        let value_local = matches!(inner.kind, PlaceKind::Local(_));
+        let index_spelling = tyref_to_ast_string(&inner.ty, self.llbc);
         let (projection_array_type_id, projection_array_nolength) =
-            array_projection_metadata(&inner.ty, self.llbc);
+            fixed_array_index_identity(value_local, &index_spelling);
         let base = self.resolve_place(mir_bb, inner)?;
         let bb_id = self.block_id[mir_bb];
         let op = match &elem {
@@ -6425,18 +6448,16 @@ impl<'a> Lowering<'a> {
                         // exact cast_opaque_ptr operation.
                         value = self.narrow_value_to_instance_root(bb_id, value, "str");
                     }
-                    let arr = if matches!(
-                        alias.array_type_id.as_deref(),
-                        Some("[i64]" | "[f64]" | STRING_GCREF_GCARRAY_TYPE_ID)
-                    ) {
-                        self.narrow_value_to_instance_root(
-                            bb_id,
-                            LinkArg::Value(arr),
-                            alias.array_type_id.as_deref().expect("matched Some above"),
-                        )
-                        .as_variable()
-                        .expect("a materialized typed-items base stays a Variable")
-                        .clone()
+                    let cast_root = match alias.array_type_id.as_deref() {
+                        Some("[i64]" | "[f64]") => alias.array_type_id.as_deref(),
+                        Some(id) if id == STRING_GCREF_GCARRAY_TYPE_ID => Some(id),
+                        _ => None,
+                    };
+                    let arr = if let Some(root) = cast_root {
+                        self.narrow_value_to_instance_root(bb_id, LinkArg::Value(arr), root)
+                            .as_variable()
+                            .expect("a materialized typed-items base stays a Variable")
+                            .clone()
                     } else {
                         arr
                     };
@@ -8333,8 +8354,10 @@ impl<'a> Lowering<'a> {
                         .string_array_view_locals
                         .iter()
                         .any(|(local, _)| place_references_local(&inner, *local));
+                    let value_local = matches!(inner.kind, PlaceKind::Local(_));
+                    let index_spelling = tyref_to_ast_string(&inner.ty, self.llbc);
                     let (mut array_type_id, mut nolength) =
-                        array_projection_metadata(&inner.ty, self.llbc);
+                        fixed_array_index_identity(value_local, &index_spelling);
                     if string_array_view {
                         array_type_id = Some(STRING_GCREF_GCARRAY_TYPE_ID.to_string());
                         nolength = crate::front::typestr::nolength_from_array_type_id(
@@ -11079,8 +11102,11 @@ impl<'a> Lowering<'a> {
                         // through such a receiver would stride past its
                         // neighbours.
                         slice_object_element
-                            .then(|| OBJECT_REF_GCARRAY_TYPE_ID.to_string())
-                            .or_else(|| element_spelling.as_deref().map(|elem| format!("[{elem}]")))
+                            .then(|| {
+                                slice_array_type_id("*mut PyObject")
+                                    .expect("object-pointer slice names the object gcarray")
+                            })
+                            .or_else(|| element_spelling.as_deref().and_then(slice_array_type_id))
                             .or_else(|| {
                                 if !matches!(
                                     item_ty,
@@ -15557,13 +15583,19 @@ impl<'a> Lowering<'a> {
         // T, not a Rust slot reference.  Read the bank from the call's T
         // generic before looking at the reference-wrapped destination.
         let item_ty = tyref_to_value_type_with(&element_ty, self.llbc, self.tombstoned_leaves);
-        // An object-pointer slice names its ARRAY; see `slice_object_element`
-        // at the `Index::index` arm.
+        // Identity only for an object pointer or a scalar element spelling.
+        // A fallback type string must not hand an inline aggregate or an
+        // unproven pointer an ARRAY identity. A thin pointer is one word
+        // and carries no identity.
         if json_ty_is_objectptr(element, self.llbc) {
-            return Some((item_ty, Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string())));
+            let array_type_id = slice_array_type_id("*mut PyObject")
+                .expect("an object-pointer slice names the object gcarray");
+            return Some((item_ty, Some(array_type_id)));
         }
         if let Some(spelling) = json_ty_scalar_element_spelling(element, self.llbc) {
-            return Some((item_ty, Some(format!("[{spelling}]"))));
+            let array_type_id =
+                slice_array_type_id(&spelling).unwrap_or_else(|| format!("[{spelling}]"));
+            return Some((item_ty, Some(array_type_id)));
         }
         json_ty_is_thin_pointer_element(element, self.llbc).then_some((item_ty, None))
     }
@@ -16719,11 +16751,15 @@ impl<'a> Lowering<'a> {
     }
 
     /// ARRAY identity of a `<[T]>::len` / `is_empty` receiver whose `T` is
-    /// an object pointer; see `slice_object_element` at the index arm.
+    /// an object pointer. Every other slice keeps the identity-less length
+    /// read. The identity string itself comes from [`slice_array_type_id`].
     fn slice_object_array_type_id(&self, reg: &RegularCall) -> Option<String> {
         self.slice_swap_elem_tyref(reg)
             .is_some_and(|ty| output_type_is_objectptr(&ty, self.llbc))
-            .then(|| OBJECT_REF_GCARRAY_TYPE_ID.to_string())
+            .then(|| {
+                slice_array_type_id("*mut PyObject")
+                    .expect("object-pointer slice names the object gcarray")
+            })
     }
 
     fn is_slice_len(&self, reg: &RegularCall) -> bool {
@@ -29542,28 +29578,146 @@ fn tyref_reference_layout_string(ty: &TyRef, llbc: &Llbc) -> Option<String> {
     visit(value, llbc, 0)
 }
 
-/// Concrete ARRAY metadata for a Charon `ProjectionElem::Index`.
+fn peel_ref_prefix(spelling: &str) -> &str {
+    let mut normalized = spelling.trim();
+    loop {
+        let stripped = normalized
+            .strip_prefix("&mut ")
+            .or_else(|| normalized.strip_prefix('&'))
+            .or_else(|| normalized.strip_prefix("mut "))
+            .map(str::trim_start);
+        match stripped {
+            Some(rest) if rest != normalized => normalized = rest,
+            _ => return normalized,
+        }
+    }
+}
+
+/// `[T; N]` at bracket depth 0. A slice of arrays (`[[u8; 4]]`) is not one:
+/// its `;` sits inside the element.
+fn fixed_array_spelling(spelling: &str) -> bool {
+    let Some(inner) = spelling
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    else {
+        return false;
+    };
+    crate::front::typestr::depth0_sep(inner, ';').is_some()
+}
+
+fn slice_element_spelling(spelling: &str) -> Option<&str> {
+    let inner = spelling
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))?;
+    if crate::front::typestr::depth0_sep(inner, ';').is_some() {
+        return None;
+    }
+    let inner = inner.trim();
+    (!inner.is_empty()).then_some(inner)
+}
+
+fn object_pointer_spelling(element: &str) -> bool {
+    let mut pointee = element.trim();
+    let mut pointer = false;
+    loop {
+        let stripped = pointee
+            .strip_prefix("*const ")
+            .or_else(|| pointee.strip_prefix("*mut "))
+            .or_else(|| pointee.strip_prefix("&mut "))
+            .or_else(|| pointee.strip_prefix('&'))
+            .map(str::trim_start);
+        match stripped {
+            Some(rest) if rest != pointee => {
+                pointer = true;
+                pointee = rest;
+            }
+            _ => break,
+        }
+    }
+    pointer && (pointee == "PyObject" || pointee.ends_with("::PyObject"))
+}
+
+/// Spellings `json_ty_scalar_element_spelling` hands to a slice reader.
+fn reader_scalar_spelling(element: &str) -> bool {
+    matches!(
+        element,
+        "bool"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "usize"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "isize"
+            | "f32"
+            | "f64"
+    )
+}
+
+/// ARRAY identity a `&[T]` / `Vec<T>` reader already names for `T`.
 ///
-/// The identity stays on the Place itself, matching RPython's
-/// `box.concretetype`; no identity-keyed side table is introduced.
-fn array_projection_metadata(ty: &TyRef, llbc: &Llbc) -> (Option<String>, bool) {
-    let identity = tyref_to_ast_string(ty, llbc);
-    if identity.starts_with("??") {
+/// `Index::index`, `ProjectionElem::Index`, and `<[T]>::get` all call
+/// this. An object pointer is [`OBJECT_REF_GCARRAY_TYPE_ID`]. A scalar
+/// spelling is `[{spelling}]` — `[u8]` / `[i64]` / `[f64]` are the
+/// length-prefixed identities `nolength_from_array_type_id` already
+/// treats as a GcArray, and every other scalar (`[u32]`, `[i32]`,
+/// `[bool]`, `[usize]`, `[f32]`, …) stays a headerless item run. A
+/// `[T; N]` place is not a slice and returns `None`. Any other slice
+/// place keeps its own spelling, which is what the reader used before
+/// a fixed array was allocated to match it.
+pub fn slice_array_type_id(spelling: &str) -> Option<String> {
+    let normalized = peel_ref_prefix(spelling);
+    if normalized.starts_with("??") || normalized.is_empty() {
+        return None;
+    }
+    // Fixed-array path. A `[T; N]` place is not a slice reader. It uses
+    // the `&[T]` reader identity. `[i64]` / `[f64]` and `GcArray<i64>` /
+    // `GcArray<f64>` become one descr in `canonical_array_type_id`.
+    if fixed_array_spelling(normalized) {
+        let (item, _) = shaped_array_parts(normalized)?;
+        return slice_array_type_id(&format!("&[{item}]"));
+    }
+    let element = slice_element_spelling(normalized).unwrap_or(normalized);
+    if element.is_empty() {
+        return None;
+    }
+    if object_pointer_spelling(element) {
+        return Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string());
+    }
+    if reader_scalar_spelling(element) {
+        return Some(format!("[{element}]"));
+    }
+    slice_element_spelling(normalized).map(|_| normalized.to_string())
+}
+
+/// Identity of an index of `type_spelling`.
+///
+/// `value_local` is the projection shape: the indexed place is the
+/// `[T; N]` value itself (`local[i]`, including a copy or a phi of that
+/// local). A field projection (`local.field[i]`) or a pointer
+/// (`(*p)[i]`, a `&[T; N]` parameter) is not that value. Only the value
+/// uses the length-prefixed reader identity. Every other `[T; N]` place
+/// keeps its own spelling, which `nolength_from_array_type_id` treats as
+/// headerless, so item 0 stays at the pointer — the positional layout
+/// of an inline `FixedSizeArray`, not a `GcArray`.
+pub(crate) fn fixed_array_index_identity(
+    value_local: bool,
+    type_spelling: &str,
+) -> (Option<String>, bool) {
+    if type_spelling.starts_with("??") || type_spelling.is_empty() {
         return (None, false);
     }
-    // A `&[T]` is one GC array pointer whose length `ArrayLen` reads from the
-    // block header, so an object-pointer slice is the length-prefixed
-    // `GcArray(Ptr(PyObject))` every other access to that block names.
-    if matches!(
-        identity
-            .trim_start_matches(['&', ' '])
-            .trim_start_matches("mut "),
-        "[*mut PyObject]" | "[*const PyObject]"
-    ) {
-        return (Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()), false);
-    }
-    let nolength = crate::front::typestr::nolength_from_array_type_id(Some(identity.as_str()));
-    (Some(identity), nolength)
+    let normalized = peel_ref_prefix(type_spelling);
+    let id = if value_local || !fixed_array_spelling(normalized) {
+        slice_array_type_id(type_spelling).unwrap_or_else(|| normalized.to_string())
+    } else {
+        normalized.to_string()
+    };
+    let nolength = crate::front::typestr::nolength_from_array_type_id(Some(id.as_str()));
+    (Some(id), nolength)
 }
 
 /// ARRAY identity for a scalar element read whose element is an integer
@@ -29575,7 +29729,7 @@ fn array_projection_metadata(ty: &TyRef, llbc: &Llbc) -> (Option<String>, bool) 
 /// strides every int-banked element by 8.  `get_type_flag` already returns
 /// the real width, but it is keyed on the element spelling and that arm has
 /// none — recovering the spelling from the receiver is what routes the read
-/// onto it.  Same identity role as [`array_projection_metadata`], reached
+/// onto it.  Same identity role as [`fixed_array_index_identity`], reached
 /// from a `Index::index` callsite instead of a `ProjectionElem::Index`.
 ///
 /// Declines unless the spelling round-trips:

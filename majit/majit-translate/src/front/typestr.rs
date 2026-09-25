@@ -46,6 +46,35 @@ pub fn first_top_level_generic_arg(args: &str) -> Option<&str> {
     if args.is_empty() { None } else { Some(args) }
 }
 
+/// Index of `sep` at bracket depth 0. Nested `[]` / `<>` / `()` do not split.
+pub fn depth0_sep(spelling: &str, sep: char) -> Option<usize> {
+    let mut depth = 0usize;
+    for (idx, ch) in spelling.char_indices() {
+        match ch {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth = depth.saturating_sub(1),
+            c if c == sep && depth == 0 => return Some(idx),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// One ARRAY lltype, one descr key.
+///
+/// `[i64]` and `GcArray<i64>` (and the `f64` pair) are the same
+/// `GcArray(Signed)` / `GcArray(Float)` that `cpu.arraydescrof` and
+/// `get_array_descr` key once. Callers that turn a spelling into a
+/// `_cache_array` key or an effectinfo array index run the spelling
+/// through here first. Every other identity is unchanged.
+pub fn canonical_array_type_id(array_type_id: &str) -> std::borrow::Cow<'_, str> {
+    match array_type_id {
+        "[i64]" => std::borrow::Cow::Borrowed("GcArray<i64>"),
+        "[f64]" => std::borrow::Cow::Borrowed("GcArray<f64>"),
+        other => std::borrow::Cow::Borrowed(other),
+    }
+}
+
 /// Decide whether a registered `array_type_id` describes a
 /// headerless item-run pointee or a length-prefixed wrapper.  Bare
 /// pointers to identifier types address `items[0]` (no length word);
@@ -97,7 +126,7 @@ pub fn nolength_from_array_type_id(array_type_id: Option<&str>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::nolength_from_array_type_id;
+    use super::{canonical_array_type_id, depth0_sep, nolength_from_array_type_id};
 
     #[test]
     fn synthetic_gcarray_spellings_are_length_prefixed() {
@@ -132,5 +161,22 @@ mod tests {
                 "{id} has no length header"
             );
         }
+    }
+
+    #[test]
+    fn i64_and_f64_spellings_share_one_canonical_identity() {
+        assert_eq!(canonical_array_type_id("[i64]").as_ref(), "GcArray<i64>");
+        assert_eq!(
+            canonical_array_type_id("GcArray<i64>").as_ref(),
+            "GcArray<i64>"
+        );
+        assert_eq!(canonical_array_type_id("[f64]").as_ref(), "GcArray<f64>");
+        assert_eq!(
+            canonical_array_type_id("GcArray<f64>").as_ref(),
+            "GcArray<f64>"
+        );
+        assert_eq!(canonical_array_type_id("[u32]").as_ref(), "[u32]");
+        assert_eq!(depth0_sep("a;b<c;d>;e", ';'), Some(1));
+        assert_eq!(depth0_sep("[u8; 4];2", ';'), Some(7));
     }
 }

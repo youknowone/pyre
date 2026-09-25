@@ -2580,16 +2580,20 @@ impl<'a> Transformer<'a> {
             // of virtualizable lowering.  `rewrite_op_getfield` internally
             // falls through to `RewriteResult::Keep` for mutable fields and
             // plain immutables (their purity is carried on the descriptor).
+            OpKind::FieldRead { field, .. }
+                if let Some(rewritten) = rewrite_shaped_array_field(graph, op, field, None) =>
+            {
+                rewritten
+            }
             OpKind::FieldRead { field, ty, .. } => {
                 self.rewrite_op_getfield(op, field, ty, graph_name)
             }
             // ── rewrite_op_setfield ──
-            OpKind::FieldWrite {
-                base, field, value, ..
-            } if escaping_object_array_len(graph, base).is_some()
-                && tuple_pos_field_index(&field.name).is_some() =>
+            OpKind::FieldWrite { field, value, .. }
+                if let Some(rewritten) =
+                    rewrite_shaped_array_field(graph, op, field, Some(value)) =>
             {
-                self.rewrite_escaping_object_array_store(op, base, field, value, graph)
+                rewritten
             }
             OpKind::FieldWrite {
                 field, value, ty, ..
@@ -4881,40 +4885,6 @@ impl<'a> Transformer<'a> {
         RewriteResult::Keep
     }
 
-    /// Element store of an `Array<*mut PyObject;N>` that was lowered to
-    /// `new_array_clear` because its address is a call argument.
-    /// `do_fixed_newlist_clear` fills that array with `setarrayitem_gc`,
-    /// not `setfield` of `__pos_N`.
-    fn rewrite_escaping_object_array_store(
-        &mut self,
-        op: &SpaceOperation,
-        base: &crate::flowspace::model::Variable,
-        field: &FieldDescriptor,
-        value: &LinkArg,
-        graph: &mut crate::model::FunctionGraph,
-    ) -> RewriteResult {
-        let index_n = tuple_pos_field_index(&field.name).expect("guard checked __pos_N");
-        let index =
-            graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::Signed);
-        RewriteResult::Replace(vec![
-            SpaceOperation {
-                result: Some(index.clone()),
-                kind: OpKind::ConstInt(index_n as i64),
-            },
-            SpaceOperation {
-                result: op.result.clone(),
-                kind: OpKind::ArrayWrite {
-                    base: base.clone(),
-                    index,
-                    value: value.clone(),
-                    item_ty: ValueType::Ref(None),
-                    array_type_id: Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
-                    nolength: false,
-                },
-            },
-        ])
-    }
-
     /// RPython: rewrite_op_getarrayitem
     fn rewrite_op_getarrayitem(
         &mut self,
@@ -5654,64 +5624,65 @@ impl<'a> Transformer<'a> {
                 },
             }]);
         }
-        // RPython `rtyper/rtuple.py TupleRepr.newtuple` provides the
-        // corresponding fixed-layout lowering shape: allocate the concrete
-        // aggregate, then emit one field write per item. A fixed-size Rust
-        // array with constant-index projections is represented here by that
-        // same positional `__pos_N` struct shape, so its synthetic constructor
-        // is an allocation rather than a host call.
-        //
-        // Bare `Array` is deliberately excluded: only `Array<T;N>` carries a
-        // complete low-level owner identity. The owner-path gate keeps nominal
-        // user types out of this builtin aggregate policy.
+        // A fixed `Array<T;N>` is allocated in the layout its `&[T]` reader
+        // already uses (`slice_array_type_id`). `FixedSizeListRepr` /
+        // `do_fixed_newlist` is that layout only when the reader identity is
+        // length-prefixed: object pointers (`OBJECT_REF_GCARRAY_TYPE_ID`) and
+        // the scalar spellings `nolength_from_array_type_id` already treats
+        // as a GcArray (`[u8]`, `[str]`, `[i64]`, `[f64]`). `do_fixed_newlist`
+        // then picks `new_array_clear` when `ARRAY.OF` is a GC pointer or a
+        // struct holding one, otherwise `new_array`. A headerless reader
+        // (`[u32]`, an inline `[u8; 4]` item, …) addresses item 0 at the
+        // pointer, so the allocation is the positional `__pos_N` struct — a
+        // length word at offset 0 would be read as item 0. Bare `Array` is
+        // excluded: only `Array<T;N>` names the item and the length.
         if let CallTarget::SyntheticTransparentCtor {
             name, owner_path, ..
         } = target
             && owner_path.is_empty()
             && majit_ir::descr::is_shaped_array_name(name)
             && args.is_empty()
-            && let ValueType::Ref(Some(owner)) = result_ty
-            && op
-                .result
-                .as_ref()
-                .is_none_or(|array| !array_has_nonconstant_index_read(graph, array))
+            && let Some((item, length_n)) = crate::front::mir::shaped_array_parts(name)
         {
-            // A fixed `Array<T;N>` whose address is a call argument is the
-            // callee's list, not a struct of `__pos_N` fields. `split_builtin_kwargs`
-            // reads it with `arraylen_gc` / `getarrayitem_gc` (`rlist.py`
-            // `ll_length` / `ll_getitem_fast`). `do_fixed_newlist_clear`
-            // (`jtransform.py`) is the allocation that carries that length word.
-            // A struct `new` stores the first element where the length word
-            // sits, so the length comes back as a pointer.
-            if let Some(array) = op.result.as_ref()
-                && let Some(len) = shaped_object_ptr_array_len(name)
-                && shaped_array_is_call_argument(graph, array)
+            if let Some((array_type_id, nolength)) = fixed_list_reader(item)
+                && !nolength
+                && let Some(array) = op.result.clone()
             {
                 let length = graph
                     .alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::Signed);
+                let item_ty = crate::front::mir::tuple_field_value_type(item);
+                let kind = if fixed_list_clears(item) {
+                    OpKind::NewArrayClear {
+                        length: length.clone(),
+                        item_ty,
+                        array_type_id: Some(array_type_id),
+                    }
+                } else {
+                    OpKind::NewArray {
+                        length: length.clone(),
+                        item_ty,
+                        array_type_id: Some(array_type_id),
+                    }
+                };
                 return RewriteResult::Replace(vec![
                     SpaceOperation {
-                        result: Some(length.clone()),
-                        kind: OpKind::ConstInt(len as i64),
+                        result: Some(length),
+                        kind: OpKind::ConstInt(length_n as i64),
                     },
                     SpaceOperation {
-                        result: op.result.clone(),
-                        kind: OpKind::NewArrayClear {
-                            length,
-                            item_ty: ValueType::Ref(None),
-                            array_type_id: Some(
-                                crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
-                            ),
-                        },
+                        result: Some(array),
+                        kind,
                     },
                 ]);
             }
-            return RewriteResult::Replace(vec![SpaceOperation {
-                result: op.result.clone(),
-                kind: OpKind::New {
-                    owner: owner.clone(),
-                },
-            }]);
+            if let ValueType::Ref(Some(owner)) = result_ty {
+                return RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::New {
+                        owner: owner.clone(),
+                    },
+                }]);
+            }
         }
         // A niladic named-struct ctor is an allocation, exactly like the tuple
         // and array forms above: `front::mir` emits the constructor with empty
@@ -9626,128 +9597,101 @@ fn fn_const_target_from_field_write(
     found
 }
 
-/// `Array<*mut PyObject;N>` / `Array<PyObjectRef;N>` length. Other item
-/// types keep the struct aggregate.
-fn shaped_object_ptr_array_len(name: &str) -> Option<usize> {
-    let inner = name.strip_prefix("Array<")?.strip_suffix('>')?;
-    let (item, len) = inner.rsplit_once(';')?;
-    let len = len.trim().parse().ok()?;
-    match item.trim() {
-        "*mut PyObject" | "PyObjectRef" => Some(len),
-        _ => None,
+/// `do_fixed_newlist`: `new_array_clear` when `ARRAY.OF` is a GC pointer
+/// or a struct holding one, otherwise `new_array`. An inline `[T; N]`
+/// follows its element. A bare nominal spelling is not assumed to be a
+/// pointer — `get_type_flag`'s unknown-name fallback is a word `Ref`, and
+/// that is not evidence the item holds a GC pointer.
+fn fixed_list_clears(item: &str) -> bool {
+    let item = item.trim();
+    if let Some(inner) = item
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        && let Some(semi) = crate::front::typestr::depth0_sep(inner, ';')
+    {
+        return fixed_list_clears(inner[..semi].trim());
     }
+    if item == "*const u8" {
+        return false;
+    }
+    matches!(item, "str" | "String")
+        || item.starts_with("*mut ")
+        || item.starts_with("*const ")
+        || item.starts_with('&')
+        || item.starts_with("Box<")
+        || item.starts_with("Arc<")
+        || item.starts_with("Rc<")
+        || item.starts_with("Vec<")
+        || item.starts_with("Option<")
 }
 
-/// The ctor result (or a direct alias of it) is passed to a call.
-fn shaped_array_is_call_argument(
-    graph: &crate::model::FunctionGraph,
-    array: &crate::flowspace::model::Variable,
-) -> bool {
-    let id = array.id();
-    graph.blocks.iter().any(|block| {
-        block.operations.iter().any(|op| {
-            let crate::model::OpKind::Call { args, .. } = &op.kind else {
-                return false;
-            };
-            crate::model::call_arg_vars(args).iter().any(|arg| {
-                if arg.id() == id {
-                    return true;
-                }
-                crate::front::mir::resolve_to_producer_op(graph, arg)
-                    .and_then(|(block_id, op_index)| {
-                        graph
-                            .blocks
-                            .iter()
-                            .find(|candidate| candidate.id == block_id)?
-                            .operations
-                            .get(op_index)?
-                            .result
-                            .as_ref()
-                    })
-                    .is_some_and(|result| result.id() == id)
-            })
-        })
-    })
+/// Identity and `nolength` of a fixed `Array<ITEM;N>`
+/// (`slice_array_type_id`'s fixed-array path).
+fn fixed_list_reader(item: &str) -> Option<(String, bool)> {
+    let id = crate::front::mir::slice_array_type_id(&format!("[{item};0]"))?;
+    let nolength = crate::front::typestr::nolength_from_array_type_id(Some(id.as_str()));
+    Some((id, nolength))
 }
 
-/// `base` is an object-pointer fixed array passed to a call.
-fn escaping_object_array_len(
-    graph: &crate::model::FunctionGraph,
-    base: &crate::flowspace::model::Variable,
-) -> Option<usize> {
-    let (block_id, op_index) = crate::front::mir::resolve_to_producer_op(graph, base)?;
-    let op = graph
-        .blocks
-        .iter()
-        .find(|block| block.id == block_id)?
-        .operations
-        .get(op_index)?;
-    let crate::model::OpKind::Call {
-        target:
-            crate::model::CallTarget::SyntheticTransparentCtor {
-                name, owner_path, ..
-            },
-        ..
-    } = &op.kind
-    else {
+/// `__pos_N` on a length-prefixed `Array<T;N>` is `getarrayitem_gc` /
+/// `setarrayitem_gc` on the ARRAY `do_fixed_newlist` allocated. A
+/// headerless item keeps the positional field: its `&[T]` reader has no
+/// length word, and the struct field is the item. A tuple `__pos_N` is
+/// not a shaped array and stays a field.
+fn rewrite_shaped_array_field(
+    graph: &mut FunctionGraph,
+    op: &SpaceOperation,
+    field: &crate::model::FieldDescriptor,
+    value: Option<&LinkArg>,
+) -> Option<RewriteResult> {
+    let index_n = field.name.strip_prefix("__pos_")?.parse::<i64>().ok()?;
+    let shape = field.owner_root.as_deref()?;
+    // Only the synthetic ctor `Array<T;N>` is the fixed-list value.
+    // A raw `[T; N]` owner is an inline field's positional access.
+    if !shape.starts_with("Array<") {
         return None;
+    }
+    let (item, _) = crate::front::mir::shaped_array_parts(shape)?;
+    let (array_type_id, nolength) = fixed_list_reader(item)?;
+    if nolength {
+        return None;
+    }
+    let item_ty = crate::front::mir::tuple_field_value_type(item);
+    let base = match &op.kind {
+        OpKind::FieldRead { base, .. } | OpKind::FieldWrite { base, .. } => base.clone(),
+        _ => return None,
     };
-    if !owner_path.is_empty() {
-        return None;
-    }
-    let len = shaped_object_ptr_array_len(name)?;
-    let result = op.result.as_ref()?;
-    shaped_array_is_call_argument(graph, result).then_some(len)
-}
-
-/// Whether `array` feeds a fixed-array `ArrayRead` whose index is not a graph
-/// constant. `resolve_to_producer_op` follows block-link aliases, so a read in
-/// a successor is matched to the constructor that produced its base.
-///
-/// The shaped aggregate allocation models constant positions as struct fields.
-/// A runtime index needs the native array path and must retain its residual
-/// constructor until that representation has a shared lowering.
-fn array_has_nonconstant_index_read(
-    graph: &FunctionGraph,
-    array: &crate::flowspace::model::Variable,
-) -> bool {
-    graph
-        .blocks
-        .iter()
-        .flat_map(|block| &block.operations)
-        .filter_map(|op| match &op.kind {
-            OpKind::ArrayRead { base, index, .. } => Some((base, index)),
-            _ => None,
-        })
-        .any(|(base, index)| {
-            let base_is_array = crate::front::mir::resolve_to_producer_op(graph, base).and_then(
-                |(block_id, op_index)| {
-                    graph
-                        .blocks
-                        .iter()
-                        .find(|block| block.id == block_id)?
-                        .operations
-                        .get(op_index)?
-                        .result
-                        .as_ref()
-                },
-            ) == Some(array);
-            if !base_is_array {
-                return false;
-            }
-            !crate::front::mir::resolve_to_producer_op(graph, index).is_some_and(
-                |(block_id, op_index)| {
-                    graph
-                        .blocks
-                        .iter()
-                        .find(|block| block.id == block_id)
-                        .and_then(|block| block.operations.get(op_index))
-                        .is_some_and(|op| {
-                            matches!(op.kind, OpKind::ConstInt(_) | OpKind::ConstUInt(_))
-                        })
-                },
-            )
-        })
+    let index =
+        graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::Signed);
+    let kind = if let Some(value) = value {
+        OpKind::ArrayWrite {
+            base,
+            index: index.clone(),
+            value: value.clone(),
+            item_ty,
+            array_type_id: Some(array_type_id),
+            nolength: false,
+        }
+    } else {
+        OpKind::ArrayRead {
+            base,
+            index: index.clone(),
+            item_ty,
+            array_type_id: Some(array_type_id),
+            nolength: false,
+            pure: false,
+        }
+    };
+    Some(RewriteResult::Replace(vec![
+        SpaceOperation {
+            result: Some(index),
+            kind: OpKind::ConstInt(index_n),
+        },
+        SpaceOperation {
+            result: op.result.clone(),
+            kind,
+        },
+    ]))
 }
 
 fn tuple_pos_field_index(name: &str) -> Option<usize> {
@@ -9905,6 +9849,15 @@ fn remap_op(
         },
         OpKind::NewList { args } => OpKind::NewList {
             args: args.iter().map(|a| remap_value(a, aliases)).collect(),
+        },
+        OpKind::NewArray {
+            length,
+            item_ty,
+            array_type_id,
+        } => OpKind::NewArray {
+            length: remap_value(length, aliases),
+            item_ty: item_ty.clone(),
+            array_type_id: array_type_id.clone(),
         },
         OpKind::NewArrayClear {
             length,
@@ -18214,11 +18167,10 @@ mod tests {
         ));
     }
 
-    /// A fixed-size array aggregate has the same allocation-plus-positional-
-    /// writes shape as the tuple arm above. Its item type and length remain in
-    /// the owner so the resulting SizeDescr is per shape.
+    /// `FixedSizeListRepr` of a GC pointer is `new_array_clear` of the
+    /// object gcarray, whether or not the value escapes.
     #[test]
-    fn shaped_synthetic_array_ctor_lowers_to_new() {
+    fn shaped_synthetic_array_ctor_lowers_to_cleared_gcarray() {
         let config = GraphTransformConfig::default();
         let mut transformer = Transformer::new(&config);
         let mut graph = FunctionGraph::new("shaped_array_malloc");
@@ -18245,12 +18197,20 @@ mod tests {
         ) else {
             panic!("shaped Array aggregate must lower to malloc");
         };
+        let expected = crate::front::mir::slice_array_type_id("&[*mut PyObject]").unwrap();
         assert!(matches!(
             ops.as_slice(),
             [SpaceOperation {
+                kind: OpKind::ConstInt(1),
+                ..
+            }, SpaceOperation {
                 result: Some(result),
-                kind: OpKind::New { owner: allocated },
-            }] if result == &result_var && allocated == &owner
+                kind: OpKind::NewArrayClear {
+                    array_type_id: Some(id),
+                    item_ty: ValueType::Ref(None),
+                    ..
+                },
+            }] if result == &result_var && id == &expected
         ));
     }
 
@@ -18318,6 +18278,338 @@ mod tests {
                 .any(|kind| matches!(kind, OpKind::New { owner } if owner.contains("Array<"))),
             "escaping array must not be a struct new: {ops:?}"
         );
+    }
+
+    /// Allocation and every read of a fixed array share the `&[T]` reader's
+    /// identity, `nolength`, and item size (`slice_array_type_id`).
+    #[test]
+    fn fixed_array_matches_slice_reader() {
+        fn reader(slice_spelling: &str) -> String {
+            crate::front::mir::slice_array_type_id(slice_spelling)
+                .unwrap_or_else(|| panic!("reader {slice_spelling}"))
+        }
+        fn nolength(id: &str) -> bool {
+            crate::front::typestr::nolength_from_array_type_id(Some(id))
+        }
+        fn item_size(id: &str) -> usize {
+            let elem = crate::codewriter::call::extract_element_type_from_str(id)
+                .unwrap_or_else(|| id.to_string());
+            crate::codewriter::call::get_type_flag(&elem).2
+        }
+
+        // Host-slice readers stay the origin/main identities. Narrow scalars
+        // and `Vec<T>` (the index leg uses the element spelling) are
+        // headerless item runs. `&[i64]` stays `[i64]`, the same descr as
+        // `raw_ptr_typed_items_element`, not `GcArray<i64>`.
+        for (spelling, id, headerless, size) in [
+            ("&[u32]", "[u32]", true, 4usize),
+            ("u32", "[u32]", true, 4usize),
+            ("&[i32]", "[i32]", true, 4usize),
+            ("&[bool]", "[bool]", true, 1usize),
+            (
+                "&[usize]",
+                "[usize]",
+                true,
+                crate::layout::target_word_size(),
+            ),
+            ("&[f32]", "[f32]", true, 4usize),
+            ("&[i64]", "[i64]", false, 8usize),
+            ("&[f64]", "[f64]", false, 8usize),
+            (
+                "&[*mut PyObject]",
+                crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID,
+                false,
+                crate::layout::target_word_size(),
+            ),
+        ] {
+            let got = reader(spelling);
+            assert_eq!(got, id, "{spelling}");
+            assert_ne!(got, "GcArray<i64>");
+            assert_ne!(got, "GcArray<f64>");
+            assert_eq!(nolength(&got), headerless, "{spelling}");
+            assert_eq!(item_size(&got), size, "{spelling}");
+        }
+        assert!(crate::front::mir::slice_array_type_id("Vec<u32>").is_none());
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+
+        // `[u32; 4]` passed as `&[u32]`: headerless allocation, and `xs[0]`
+        // uses the same identity / nolength / item size as a host `&[u32]`.
+        // `<[T]>::len` of a non-object slice stays identity-less.
+        {
+            let owner = "Array<u32;4>";
+            let expected = reader("&[u32]");
+            assert!(nolength(&expected));
+            assert_eq!(item_size(&expected), 4);
+            let mut graph = FunctionGraph::new("u32_slice");
+            let result_ty = ValueType::Ref(Some(owner.to_string()));
+            let target = CallTarget::synthetic_transparent_ctor(owner);
+            let op = SpaceOperation {
+                result: Some(graph.alloc_value_var_with_type(ConcreteType::GcRef)),
+                kind: OpKind::Call {
+                    target: target.clone(),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: result_ty.clone(),
+                },
+            };
+            let RewriteResult::Replace(ops) = transformer.rewrite_op_direct_call(
+                &op,
+                &target,
+                &[],
+                &result_ty,
+                "u32_slice",
+                &mut graph,
+            ) else {
+                panic!("u32 alloc");
+            };
+            assert!(
+                ops.iter()
+                    .any(|op| matches!(&op.kind, OpKind::New { owner } if owner == "Array<u32;4>"))
+            );
+            assert!(!ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::NewArray { .. } | OpKind::NewArrayClear { .. }
+            )));
+            assert_eq!(item_size(&expected), 4);
+        }
+
+        // cpyext-like `&[i64]` index keeps `[i64]`, not `LIST_INT_ITEMS_ARRAY`.
+        {
+            let expected = reader("&[i64]");
+            assert_eq!(expected, "[i64]");
+            assert!(!nolength(&expected));
+            assert_eq!(item_size(&expected), 8);
+        }
+
+        // `[*mut PyObject; 2]` passed as a slice: length-prefixed object gcarray.
+        {
+            let owner = "Array<*mut PyObject;2>";
+            let expected = reader("&[*mut PyObject]");
+            assert_eq!(expected, crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID);
+            assert!(!nolength(&expected));
+            assert_eq!(item_size(&expected), crate::layout::target_word_size());
+            let mut graph = FunctionGraph::new("obj_slice");
+            let result_ty = ValueType::Ref(Some(owner.to_string()));
+            let target = CallTarget::synthetic_transparent_ctor(owner);
+            let array = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+            let op = SpaceOperation {
+                result: Some(array.clone()),
+                kind: OpKind::Call {
+                    target: target.clone(),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: result_ty.clone(),
+                },
+            };
+            let RewriteResult::Replace(ops) = transformer.rewrite_op_direct_call(
+                &op,
+                &target,
+                &[],
+                &result_ty,
+                "obj_slice",
+                &mut graph,
+            ) else {
+                panic!("object alloc");
+            };
+            assert!(ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::NewArrayClear { array_type_id: Some(id), item_ty: ValueType::Ref(None), .. }
+                    if id == &expected
+            )));
+            let field = crate::model::FieldDescriptor::new("__pos_0", Some(owner.to_string()));
+            let stored = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+            let write = SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: array,
+                    field: field.clone(),
+                    value: LinkArg::Value(stored.clone()),
+                    ty: ValueType::Ref(None),
+                },
+            };
+            let RewriteResult::Replace(writes) = rewrite_shaped_array_field(
+                &mut graph,
+                &write,
+                &field,
+                Some(&LinkArg::Value(stored)),
+            )
+            .unwrap() else {
+                panic!("object store");
+            };
+            assert!(writes.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::ArrayWrite { array_type_id: Some(id), nolength: false, item_ty: ValueType::Ref(None), .. }
+                    if id == &expected
+            )));
+        }
+
+        // `Array<[u8; 4]; 2>`: inline item is 4 bytes, not a pointer, and is
+        // not cleared. Headerless, so `__pos_1` stays a field at offset 4.
+        {
+            let owner = "Array<[u8;4];2>";
+            let field_ty = crate::front::mir::positional_field_type("[u8;4]");
+            assert_eq!(field_ty, "[u8;4]");
+            let (flag, _, size) = crate::codewriter::call::get_type_flag(&field_ty);
+            assert_eq!(size, 4, "__pos_1 strides 4");
+            assert_ne!(flag, majit_ir::descr::ArrayFlag::Pointer);
+            assert!(!fixed_list_clears("[u8;4]"));
+            let mut graph = FunctionGraph::new("nested_shaped_array");
+            let result_ty = ValueType::Ref(Some(owner.to_string()));
+            let target = CallTarget::synthetic_transparent_ctor(owner);
+            let op = SpaceOperation {
+                result: Some(graph.alloc_value_var_with_type(ConcreteType::GcRef)),
+                kind: OpKind::Call {
+                    target: target.clone(),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: result_ty.clone(),
+                },
+            };
+            let RewriteResult::Replace(ops) = transformer.rewrite_op_direct_call(
+                &op,
+                &target,
+                &[],
+                &result_ty,
+                "nested_shaped_array",
+                &mut graph,
+            ) else {
+                panic!("nested alloc");
+            };
+            assert!(
+                ops.iter().any(
+                    |op| matches!(&op.kind, OpKind::New { owner } if owner == "Array<[u8;4];2>")
+                )
+            );
+            let field =
+                crate::model::FieldDescriptor::new("__pos_1", Some("Array<[u8;4];2>".into()));
+            let read = SpaceOperation {
+                result: Some(graph.alloc_value_var_with_type(ConcreteType::GcRef)),
+                kind: OpKind::FieldRead {
+                    base: op.result.clone().unwrap(),
+                    field: field.clone(),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+            };
+            assert!(rewrite_shaped_array_field(&mut graph, &read, &field, None).is_none());
+            let slice_id = reader("&[[u8;4]]");
+            assert!(nolength(&slice_id));
+            assert_eq!(item_size(&slice_id), 4);
+        }
+
+        // `[i64]` and `GcArray<i64>` are the same layout.
+        // `arraydescrof_concrete` takes the element from
+        // `extract_element_type_from_str`, the item size from
+        // `get_type_flag`, and the length offset from `nolength`
+        // (`Some(0)` when `nolength_from_array_type_id` is false). Both
+        // spellings extract `i64` / `f64` and are length-prefixed, so a
+        // `&[i64]` reader of a fixed `[i64; N]` addresses the same bytes.
+        {
+            for (slice_id, list_id) in [
+                ("[i64]", LIST_INT_ITEMS_ARRAY),
+                ("[f64]", LIST_FLOAT_ITEMS_ARRAY),
+            ] {
+                let slice_elem = crate::codewriter::call::extract_element_type_from_str(slice_id);
+                let list_elem = crate::codewriter::call::extract_element_type_from_str(list_id);
+                assert_eq!(slice_elem, list_elem, "{slice_id}");
+                assert_eq!(item_size(slice_id), item_size(list_id), "{slice_id}");
+                assert_eq!(nolength(slice_id), nolength(list_id), "{slice_id}");
+                assert!(!nolength(list_id), "{list_id}");
+            }
+        }
+
+        // Runtime-indexed `[i64; 4]` uses the `&[i64]` reader identity.
+        // `canonical_array_type_id` joins that spelling with
+        // `GcArray<i64>` when the string becomes a descr key.
+        {
+            let owner = "Array<i64;4>";
+            let expected = "[i64]".to_string();
+            let mut graph = FunctionGraph::new("runtime_index");
+            let result_ty = ValueType::Ref(Some(owner.to_string()));
+            let target = CallTarget::synthetic_transparent_ctor(owner);
+            let array = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+            let op = SpaceOperation {
+                result: Some(array.clone()),
+                kind: OpKind::Call {
+                    target: target.clone(),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: result_ty.clone(),
+                },
+            };
+            let RewriteResult::Replace(ops) = transformer.rewrite_op_direct_call(
+                &op,
+                &target,
+                &[],
+                &result_ty,
+                "runtime_index",
+                &mut graph,
+            ) else {
+                panic!("i64 alloc");
+            };
+            assert!(ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::NewArray { array_type_id: Some(id), item_ty: ValueType::Int, .. }
+                    if id == &expected
+            )));
+            assert!(!fixed_list_clears("i64"));
+            // `local[i]` of the fixed-list value is the length-prefixed
+            // reader. `local.field[i]` and `(*p)[i]` keep the headerless
+            // `[i64; 4]` spelling, so item 0 stays at the pointer.
+            let (local_id, local_nolength) =
+                crate::front::mir::fixed_array_index_identity(true, "[i64; 4]");
+            assert_eq!(local_id.as_deref(), Some("[i64]"));
+            assert!(!local_nolength);
+            let (field_id, field_nolength) =
+                crate::front::mir::fixed_array_index_identity(false, "[i64; 4]");
+            assert_eq!(field_id.as_deref(), Some("[i64; 4]"));
+            assert!(field_nolength);
+            let (param_id, param_nolength) =
+                crate::front::mir::fixed_array_index_identity(false, "&[i64; 4]");
+            assert_eq!(param_id.as_deref(), Some("[i64; 4]"));
+            assert!(param_nolength);
+            // A slice reader is unchanged either way.
+            let (slice_id, slice_nolength) =
+                crate::front::mir::fixed_array_index_identity(false, "&[i64]");
+            assert_eq!(slice_id.as_deref(), Some("[i64]"));
+            assert!(!slice_nolength);
+            // Constant index of the ctor value is `__pos_N` on `Array<T;N>`
+            // and becomes the same length-prefixed array op. An inline
+            // field's `__pos_N` uses the raw spelling and stays a field.
+            let pos = crate::model::FieldDescriptor::new("__pos_0", Some(owner.to_string()));
+            let stored = graph.alloc_value_var_with_type(ConcreteType::Signed);
+            let write = SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: array,
+                    field: pos.clone(),
+                    value: crate::model::LinkArg::Value(stored.clone()),
+                    ty: ValueType::Int,
+                },
+            };
+            let RewriteResult::Replace(writes) = rewrite_shaped_array_field(
+                &mut graph,
+                &write,
+                &pos,
+                Some(&crate::model::LinkArg::Value(stored)),
+            )
+            .unwrap() else {
+                panic!("ctor element");
+            };
+            assert!(writes.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::ArrayWrite { array_type_id: Some(id), nolength: false, .. } if id == &expected
+            )));
+            let inline = crate::model::FieldDescriptor::new("__pos_0", Some("[i64; 4]".into()));
+            let inline_read = SpaceOperation {
+                result: Some(graph.alloc_value_var_with_type(ConcreteType::Signed)),
+                kind: OpKind::FieldRead {
+                    base: graph.alloc_value_var_with_type(ConcreteType::GcRef),
+                    field: inline.clone(),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+            };
+            assert!(rewrite_shaped_array_field(&mut graph, &inline_read, &inline, None).is_none());
+        }
     }
 
     #[test]

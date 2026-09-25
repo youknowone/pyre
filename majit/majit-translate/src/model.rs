@@ -963,11 +963,22 @@ pub enum OpKind {
         owner: String,
         vtable: i64,
     },
+    /// RPython `new_array(v_length, arraydescr)` — the uninitialised
+    /// fixed-size array allocation `do_fixed_newlist` emits when
+    /// `ARRAY.OF` is neither a GC `Ptr` nor a `Struct`.  Operand shape
+    /// matches `NewArrayClear`; only the opcode differs
+    /// (`new_array/id>r`, `bhimpl_new_array`).
+    NewArray {
+        length: crate::flowspace::model::Variable,
+        item_ty: ValueType,
+        /// ARRAY identity for `cpu.arraydescrof(ARRAY)`, same role as
+        /// `ArrayRead::array_type_id`.
+        array_type_id: Option<String>,
+    },
     /// RPython `new_array_clear(v_length, arraydescr)` — the cleared
     /// fixed-size array allocation `do_fixed_newlist_clear` emits
-    /// (`jtransform.py:1858-1863`, `corresponds to rtyper.rlist.
-    /// ll_alloc_and_clear: needs to clear the items`).  Also the
-    /// allocation half `do_fixed_newlist` picks (`jtransform.py`)
+    /// (`corresponds to rtyper.rlist.ll_alloc_and_clear: needs to clear
+    /// the items`).  Also the allocation half `do_fixed_newlist` picks
     /// when `ARRAY.OF` is a GC `Ptr` or `Struct` — the exact case that
     /// distinguishes `new_array_clear` from the uninitialised `new_array`.
     ///

@@ -2255,7 +2255,10 @@ impl DescrIndexRegistry {
         len_offset: Option<usize>,
     ) -> u32 {
         let mut inner = self.inner.borrow_mut();
-        let key = (item_ty_discriminant, array_type_id.clone(), len_offset);
+        let canonical_id = array_type_id
+            .as_ref()
+            .map(|id| crate::front::typestr::canonical_array_type_id(id).into_owned());
+        let key = (item_ty_discriminant, canonical_id, len_offset);
         if let Some(&idx) = inner.array_indices.get(&key) {
             return idx;
         }
@@ -2715,6 +2718,11 @@ impl CallControl {
             Option<majit_ir::effectinfo::DescrSetMember>,
         ) = match array_type_id.as_deref() {
             Some(atid) => {
+                // `[i64]` and `GcArray<i64>` (and the f64 pair) are one
+                // ARRAY. `get_array_descr` keys `_cache_array` on this
+                // spelling, so both must hash the canonical form.
+                let canonical = crate::front::typestr::canonical_array_type_id(atid);
+                let atid = canonical.as_ref();
                 let path_hash_u64 = majit_ir::descr::path_hash(atid);
                 let nolength = len_offset.is_none();
                 let length_offset = len_offset.unwrap_or(0);
@@ -2747,9 +2755,10 @@ impl CallControl {
                 // annotations.  Field-level immutability collapses onto the
                 // array-type identity here so the shared per-ARRAY descr's
                 // `is_pure` propagates without per-call owner threading.
-                let is_pure = array_type_id
-                    .as_deref()
-                    .is_some_and(|aid| self.immutable_array_types.contains(aid));
+                let is_pure = self.immutable_array_types.contains(atid)
+                    || array_type_id
+                        .as_deref()
+                        .is_some_and(|raw| self.immutable_array_types.contains(raw));
                 let cached: majit_ir::descr::DescrRef =
                     majit_ir::descr::gc_cache().lock().get_array_descr(
                         majit_ir::descr::LLType::Array(path_hash_u64),
@@ -7043,6 +7052,7 @@ impl CallControl {
                     // to make — every allocation op here is a GC one.
                     OpKind::New { .. }
                     | OpKind::NewWithVtable { .. }
+                    | OpKind::NewArray { .. }
                     | OpKind::NewArrayClear { .. }
                     | OpKind::NewListClear { .. } => return true,
                     OpKind::Call { target, .. } => {
@@ -8482,7 +8492,7 @@ pub(crate) fn extract_element_type_from_str(type_str: &str) -> Option<String> {
     // Square brackets: [T] or [T; N]
     if s.starts_with('[') && s.ends_with(']') {
         let inner = &s[1..s.len() - 1];
-        let elem = if let Some(semi) = inner.find(';') {
+        let elem = if let Some(semi) = crate::front::typestr::depth0_sep(inner, ';') {
             inner[..semi].trim()
         } else {
             inner.trim()
@@ -9502,6 +9512,14 @@ pub(crate) fn get_type_flag(
         "u16" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 2),
         "u8" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 1),
         "bool" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 1),
+        // An inline `[T; N]` is N repeats of T. `get_type_flag`'s unknown-name
+        // fallback would bank it as a word-sized `Ref`, so `__pos_1` of
+        // `[u8; 4]` would stride 8. A GC-pointer element keeps `FLAG_POINTER`;
+        // a scalar keeps that scalar's flag and the multiplied size.
+        s if let Some((elem, len)) = crate::front::mir::shaped_array_parts(s) => {
+            let (flag, item_type, elem_size) = get_type_flag(elem);
+            (flag, item_type, elem_size.saturating_mul(len))
+        }
         // Zero-sized types occupy no storage and contribute no field slot
         // (heaptracker.py:60-62; lltype.py `_names_without_voids()`).
         s if s == "()" || s == "PhantomData" || s.starts_with("PhantomData<") => {
@@ -9545,6 +9563,7 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         // varsize allocation, same class.
         OpKind::New { .. }
         | OpKind::NewWithVtable { .. }
+        | OpKind::NewArray { .. }
         | OpKind::NewArrayClear { .. }
         | OpKind::NewListClear { .. } => RaiseClass::MemoryErrorOnly,
         // RPython LL: getarrayitem_gc, setarrayitem_gc, arraylen_gc → cannot raise
@@ -10048,6 +10067,7 @@ pub(crate) fn describe_call(target: &CallTarget) -> Option<CallDescriptor> {
 mod tests {
     use super::*;
     use crate::model::{ExitSwitch, FunctionGraph, Link, LinkArg, ValueType, exception_exitcase};
+    use majit_ir::descr::Descr;
 
     /// An earlier alias's hint set is unioned with a later one, not replaced.
     #[test]
@@ -10824,6 +10844,58 @@ mod tests {
         );
     }
 
+    /// `[i64]` and `GcArray<i64>` (and the f64 pair) are one ARRAY, so
+    /// `get_array_descr` and `array_index` return one object and one
+    /// effect index. `[u32]` stays a different array.
+    #[test]
+    fn i64_and_f64_spellings_share_one_descr_and_effect_index() {
+        let cc = CallControl::new();
+        let cases = [
+            (
+                "[i64]",
+                "GcArray<i64>",
+                ValueType::Int,
+                majit_ir::value::Type::Int,
+            ),
+            (
+                "[f64]",
+                "GcArray<f64>",
+                ValueType::Float,
+                majit_ir::value::Type::Float,
+            ),
+        ];
+        for (slice_id, list_id, item_ty, ir_type) in cases {
+            let slice_ty = Some(slice_id.to_string());
+            let list_ty = Some(list_id.to_string());
+            let slice_descr = cc.arraydescrof_for_type(&item_ty, &slice_ty, ir_type, Some(0));
+            let list_descr = cc.arraydescrof_for_type(&item_ty, &list_ty, ir_type, Some(0));
+            assert!(
+                std::sync::Arc::ptr_eq(&slice_descr, &list_descr),
+                "{slice_id} and {list_id} minted two descrs"
+            );
+            let slice_ei =
+                cc.descr_indices
+                    .array_index(value_type_discriminant(&item_ty), &slice_ty, Some(0));
+            let list_ei =
+                cc.descr_indices
+                    .array_index(value_type_discriminant(&item_ty), &list_ty, Some(0));
+            assert_eq!(slice_ei, list_ei, "{slice_id} vs {list_id}");
+            assert_eq!(slice_descr.get_ei_index(), slice_ei);
+        }
+        let int_ty = ValueType::Int;
+        let i64_ei = cc.descr_indices.array_index(
+            value_type_discriminant(&int_ty),
+            &Some("[i64]".to_string()),
+            Some(0),
+        );
+        let u32_ei = cc.descr_indices.array_index(
+            value_type_discriminant(&int_ty),
+            &Some("[u32]".to_string()),
+            Some(0),
+        );
+        assert_ne!(i64_ei, u32_ei);
+    }
+
     /// Helper: create a FunctionGraph with just a return.
     fn simple_graph(name: &str) -> FunctionGraph {
         let mut g = FunctionGraph::new(name);
@@ -10856,6 +10928,11 @@ mod tests {
             OpKind::NewWithVtable {
                 owner: "W_FloatObject".to_string(),
                 vtable: 1,
+            },
+            OpKind::NewArray {
+                length: crate::flowspace::model::Variable::new(),
+                item_ty: ValueType::Int,
+                array_type_id: None,
             },
             OpKind::NewArrayClear {
                 length: crate::flowspace::model::Variable::new(),

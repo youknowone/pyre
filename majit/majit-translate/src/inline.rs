@@ -484,6 +484,15 @@ pub(crate) fn remap_op_kind(
             owner: owner.clone(),
             vtable: *vtable,
         },
+        OpKind::NewArray {
+            length,
+            item_ty,
+            array_type_id,
+        } => OpKind::NewArray {
+            length: remap_var(length),
+            item_ty: item_ty.clone(),
+            array_type_id: array_type_id.clone(),
+        },
         OpKind::NewArrayClear {
             length,
             item_ty,
@@ -987,7 +996,9 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         OpKind::NewList { args } => args.iter().map(clone_var).collect(),
         // `new_array_clear(v_length, arraydescr)` — only the length Variable
         // is an SSA operand; the arraydescr is a descriptor, not a value.
-        OpKind::NewArrayClear { length, .. } => vec![clone_var(length)],
+        OpKind::NewArray { length, .. } | OpKind::NewArrayClear { length, .. } => {
+            vec![clone_var(length)]
+        }
         // `newlist_clear(v_length, ...)` — same operand shape: only the
         // length Variable is an SSA operand; the struct/array descrs are
         // descriptors, not values.
@@ -1213,6 +1224,7 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         // Python `is` object identity would break.
         OpKind::New { .. }
         | OpKind::NewWithVtable { .. }
+        | OpKind::NewArray { .. }
         | OpKind::NewArrayClear { .. }
         | OpKind::NewListClear { .. }
         // `newlist` subclasses `HLOperation` (`operation.py`), not

@@ -3891,7 +3891,9 @@ pub fn pyobject_gcarray_descr() -> DescrRef {
 /// the GC tid stamped here reaches the shared `_cache_array` slot first.
 pub(crate) fn runtime_gcarray_descr(array_type_id: &str) -> Option<DescrRef> {
     use majit_translate::codewriter::jtransform as jt;
-    match array_type_id {
+    use majit_translate::front::typestr::canonical_array_type_id;
+    let canonical = canonical_array_type_id(array_type_id);
+    match canonical.as_ref() {
         jt::LIST_INT_ITEMS_ARRAY => Some(int_gcarray_descr()),
         jt::LIST_FLOAT_ITEMS_ARRAY => Some(float_gcarray_descr()),
         jt::LIST_OBJ_ITEMS_ARRAY => Some(pyobject_gcarray_descr()),

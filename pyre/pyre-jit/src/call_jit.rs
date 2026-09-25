@@ -7299,9 +7299,9 @@ pub extern "C" fn bh_build_set_from_array(array: i64) -> i64 {
 /// BUILD_STRING residual (`build_string_from_array` HLOp →
 /// `residual_call_r_r`).  Concatenates the forced fragment array into a
 /// single `str` through the shared `runtime_ops::build_string_from_refs`.
-/// Fragments are already strings (FORMAT_SIMPLE / CONVERT_VALUE ran first),
-/// so this never runs user code → `Plain` (infallible, no exception
-/// publish), mirroring `bh_newtuple_from_array`.
+/// A non-`str` fragment raises `TypeError` (`CanRaise`, no user code); on
+/// error the exception is published through `BH_LAST_EXC_VALUE` for the
+/// trailing `GuardNoException` and the call returns 0.
 pub extern "C" fn bh_build_string_from_array(array: i64) -> i64 {
     let arr = array as *const pyre_object::object_array::GcTypedArray;
     let len = pyre_object::object_array::gcarray_len(arr);
@@ -7309,7 +7309,13 @@ pub extern "C" fn bh_build_string_from_array(array: i64) -> i64 {
     for i in 0..len {
         items.push(pyre_object::object_array::getarrayitem_ref(arr, i));
     }
-    pyre_interpreter::runtime_ops::build_string_from_refs(&items) as i64
+    match pyre_interpreter::runtime_ops::build_string_from_refs(&items) {
+        Ok(s) => s as i64,
+        Err(mut err) => {
+            publish_residual_call_exception(err.to_exc_object() as i64);
+            0
+        }
+    }
 }
 
 /// FORMAT_SIMPLE residual (`format_simple` HLOp → `residual_call_r_r`).

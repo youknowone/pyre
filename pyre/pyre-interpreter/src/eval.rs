@@ -6013,21 +6013,17 @@ impl OpcodeStepExecutor for PyFrame {
     /// `pyopcode.py BUILD_STRING` is `@jit.unroll_safe`.
     #[majit_macros::unroll_safe]
     fn build_string(&mut self, count: usize) -> Result<(), PyError> {
-        let mut builder = pyre_object::rutf8::Utf8StringBuilder::new(0);
+        // `peekvalue` is index-from-top; reversing walks source order
+        // (first pushed = index 0), the order `build_string_from_refs` reports.
+        let mut parts = Vec::with_capacity(count);
         for i in (0..count).rev() {
-            let w_item = self.peekvalue(i);
-            let utf8 = unsafe { pyre_object::unicodeobject::w_str_storage(w_item) };
-            let length = unsafe { pyre_object::unicodeobject::w_str_len(w_item) } as i64;
-            builder.append_utf8(utf8, length);
+            parts.push(self.peekvalue(i));
         }
+        let result = crate::runtime_ops::build_string_from_refs(&parts)?;
         for _ in 0..count {
             let _ = self.pop();
         }
-        let payload = builder.build();
-        self.push(pyre_object::unicodeobject::w_str_from_storage_and_length(
-            payload,
-            builder.getlength() as usize,
-        ));
+        self.push(result);
         Ok(())
     }
 
