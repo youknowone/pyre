@@ -1,9 +1,6 @@
-# pyre-check: max-pypy-ratio=5
-# The 4x floor was a 3.7x cranelift reading from when descr materialize sat
-# in the subtracted empty-program startup. It now runs on the first trace,
-# so that cost stays in this script's exec. ubuntu cranelift measured 4.3x;
-# the gate report called that 1.08x of pypy startup. Same allowance shape
-# as exception_reduce.
+# pyre-check: max-pypy-ratio=4
+# ubuntu cranelift measured 3.7x against a 3.5 gate; the check said that
+# needs 0.29x of pypy startup to be noise. Same allowance as exception_reduce.
 # A bare re-raise caught in the same frame keeps the original traceback: no
 # node is attached at a re-raise coordinate (RaiseWithExplicitTraceback,
 # attach_tb=False). The module-level loop's recording iteration runs that
