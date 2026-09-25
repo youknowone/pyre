@@ -1861,11 +1861,18 @@ unsafe fn int_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // Rust source spelling the MIR front lowers back to `int_mul_ovf`.
     match int_pow_nomod(va, vb) {
         Ok(r) => Ok(w_int_new(r)),
-        Err(_) => {
-            let base = BigInt::from(va);
-            Ok(w_long_new(bigint_int_pow_nomod(&base, vb)?))
-        }
+        Err(_) => Ok(w_long_new(pow_ovf2long(va, vb)?)),
     }
+}
+
+/// intobject.py `_pow_ovf2long`: `W_LongObject.fromint(iv)` then
+/// `rbigint.int_pow(iw)`.  The base is built inside this opaque call, so
+/// the traced `int_pow` never passes a stack `BigInt` to the
+/// `jit_bigint_int_pow_nomod` residual, which reads a heap rbigint pointer.
+#[majit_macros::dont_look_inside]
+fn pow_ovf2long(iv: i64, iw: i64) -> Result<BigInt, PyError> {
+    let base = BigInt::from(iv);
+    bigint_int_pow_nomod(&base, iw)
 }
 
 /// Negative-exponent `int ** int` float route, kept opaque so `int_pow`
