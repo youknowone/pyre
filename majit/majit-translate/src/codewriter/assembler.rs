@@ -5252,6 +5252,7 @@ mod tests {
             owner_id,
             StructLayout {
                 size: 6 * word,
+                align: word,
                 fields: vec![
                     StructFieldLayout {
                         name: "bytes".into(),
@@ -5552,6 +5553,7 @@ mod tests {
             owner_id,
             StructLayout {
                 size: 16,
+                align: 8,
                 fields: vec![
                     StructFieldLayout {
                         name: "visible_zero".to_string(),
@@ -5638,6 +5640,7 @@ mod tests {
             owner_id,
             StructLayout {
                 size: 8,
+                align: 8,
                 fields: vec![StructFieldLayout {
                     name: "visible_zero".to_string(),
                     offset: 0,

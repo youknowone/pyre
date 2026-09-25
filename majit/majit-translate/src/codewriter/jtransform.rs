@@ -10980,6 +10980,7 @@ mod tests {
             owner_id,
             StructLayout {
                 size: 24,
+                align: word,
                 fields: vec![
                     StructFieldLayout {
                         name: "cell".to_string(),
@@ -15080,6 +15081,7 @@ mod tests {
             sid,
             crate::call::StructLayout {
                 size: 12,
+                align: 4,
                 fields: vec![],
             },
         );

@@ -92,6 +92,7 @@ pub trait LayoutProvider {
 pub struct HeuristicLayoutProvider {
     known_struct_names: HashSet<String>,
     known_struct_sizes: HashMap<String, usize>,
+    known_struct_aligns: HashMap<String, usize>,
     fields_by_struct: HashMap<String, Vec<(String, String)>>,
     /// RPython: per-class `_immutable_fields_` declarations paired with
     /// `ImmutableRank` (see `rpython/rtyper/rclass.py:644-678`).  Empty
@@ -120,6 +121,10 @@ impl HeuristicLayoutProvider {
             .map(|(k, v)| (k.clone(), v.iter().map(|(n, r)| (n.clone(), *r)).collect()))
             .collect();
         let mut known_sizes: HashMap<String, usize> = HashMap::new();
+        let mut known_aligns: HashMap<String, usize> = fields_by_struct
+            .keys()
+            .map(|name| (name.clone(), 1))
+            .collect();
         loop {
             let mut changed = false;
             for (struct_name, fields) in fields_by_struct {
@@ -128,10 +133,14 @@ impl HeuristicLayoutProvider {
                     fields,
                     &HashSet::new(),
                     &known_sizes,
+                    &known_aligns,
                     &imm_ranks,
                 );
-                if known_sizes.get(struct_name) != Some(&layout.size) {
+                if known_sizes.get(struct_name) != Some(&layout.size)
+                    || known_aligns.get(struct_name) != Some(&layout.align)
+                {
                     known_sizes.insert(struct_name.clone(), layout.size);
+                    known_aligns.insert(struct_name.clone(), layout.align);
                     changed = true;
                 }
             }
@@ -142,6 +151,7 @@ impl HeuristicLayoutProvider {
         Self {
             known_struct_names: known_struct_names.clone(),
             known_struct_sizes: known_sizes,
+            known_struct_aligns: known_aligns,
             fields_by_struct: fields_by_struct.clone(),
             immutable_fields_by_struct: immutable,
         }
@@ -160,6 +170,7 @@ impl LayoutProvider for HeuristicLayoutProvider {
             fields,
             &self.known_struct_names,
             &self.known_struct_sizes,
+            &self.known_struct_aligns,
             &imm_ranks,
         ))
     }
