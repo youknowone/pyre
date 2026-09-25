@@ -172,6 +172,23 @@ fn divrem_returns_input_as_remainder(a: &BigInt, b: &BigInt) -> bool {
         || (size_a == size_b && a.digit((size_a - 1).abs()) < b.digit((size_b - 1).abs()))
 }
 
+/// Host form of `rbigint.add` used by `long_add`.
+///
+/// The MIR front retargets this call to `jit_bigint_add` and models the
+/// result as one GC reference, the same way [`bigint_pow_nomod`] becomes
+/// `jit_bigint_pow_nomod`. A zero sign returns the other operand's payload;
+/// otherwise the sum is a fresh payload.
+#[majit_macros::dont_look_inside]
+fn bigint_add(a: &BigInt, b: &BigInt) -> *mut BigInt {
+    if a.get_sign() == 0 {
+        return b as *const BigInt as *mut BigInt;
+    }
+    if b.get_sign() == 0 {
+        return a as *const BigInt as *mut BigInt;
+    }
+    pyre_object::longobject::alloc_bigint_nursery(a.add(b))
+}
+
 /// Host form of `rbigint.pow(a, b, None)` used by `long_pow`.
 ///
 /// The MIR front erases this Rust `Result` carrier back to RPython's implicit
@@ -1087,17 +1104,13 @@ unsafe fn long_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         return Ok(w_long_new(w_long_get_value(b).int_add(w_int_get_value(a))));
     }
     debug_assert!(is_long(a) && is_long(b));
-    // `rbigint.add` (`@jit.elidable`) returns the other operand when either
-    // sign is 0. The traced `is_zero` test guarded the concrete remainder of
-    // `q * d + r` and compiled a bridge on the next non-zero remainder.
-    // `jit_bigint_add` keeps that alias and returns the payload pointer;
-    // `descr_add` only wraps it.
-    Ok(pyre_object::longobject::w_long_from_raw(
-        pyre_object::longobject::decode_jit_bigint_result(jit_bigint_add(
-            w_long_get_raw_value(a) as i64,
-            w_long_get_raw_value(b) as i64,
-        )),
-    ))
+    // `rbigint.add` returns the other operand when either sign is 0.
+    // `bigint_add` keeps that alias and returns the payload pointer; the MIR
+    // front retargets the call to `jit_bigint_add`. `descr_add` only wraps it.
+    Ok(pyre_object::longobject::w_long_from_raw(bigint_add(
+        w_long_get_value(a),
+        w_long_get_value(b),
+    )))
 }
 
 unsafe fn long_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -1799,22 +1812,22 @@ fn int_pow_nomod_iff(_iv: i64, iw: i64) -> bool {
 /// Exponentiation by squaring for a non-negative machine exponent.
 /// A variable exponent stays a residual call of the trampoline.
 #[majit_macros::look_inside_iff(int_pow_nomod_iff)]
-fn int_pow_nomod(iv: i64, mut iw: i64) -> Option<i64> {
+fn int_pow_nomod(iv: i64, mut iw: i64) -> Result<i64, PyError> {
     let mut temp = iv;
     let mut ix = 1_i64;
     loop {
         if iw & 1 != 0 {
             let Some(value) = ix.checked_mul(temp) else {
-                return None;
+                return Err(PyError::overflow_error("integer overflow"));
             };
             ix = value;
         }
         iw >>= 1;
         if iw == 0 {
-            return Some(ix);
+            return Ok(ix);
         }
         let Some(value) = temp.checked_mul(temp) else {
-            return None;
+            return Err(PyError::overflow_error("integer overflow"));
         };
         temp = value;
     }
@@ -1827,7 +1840,10 @@ unsafe fn int_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         // intobject.py _pow_nomod raises ValueError for iw < 0,
         // descr_pow catches it and routes through float pow — which
         // carries the ZeroDivisionError guard from floatobject.py:910-913.
-        return Ok(w_float_new(float_pow_raw(va as f64, vb as f64)?));
+        // `float_pow_raw` is not a prepass subject (its overflow arm reaches
+        // `PyError::errno_pair`, whose `io::Error::from_raw_os_error` has no
+        // lowering), so the call stays opaque here.
+        return Ok(w_float_new(int_pow_negative(va, vb)?));
     }
     // intobject.py:415 / longobject.py:229: x ** 0 == 1 for any x.
     if vb == 0 {
@@ -1843,15 +1859,20 @@ unsafe fn int_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // intobject.py `_pow_nomod`: exponentiation by squaring with an
     // overflow check at each machine multiplication. `checked_mul` is the
     // Rust source spelling the MIR front lowers back to `int_mul_ovf`.
-    let machine_result = int_pow_nomod(va, vb);
-    match machine_result {
-        Some(r) => Ok(w_int_new(r)),
-        None => {
-            Ok(w_long_new(BigInt::from(va).int_pow(vb, None).map_err(
-                |_| PyError::memory_error("exponent too large"),
-            )?))
+    match int_pow_nomod(va, vb) {
+        Ok(r) => Ok(w_int_new(r)),
+        Err(_) => {
+            let base = BigInt::from(va);
+            Ok(w_long_new(bigint_int_pow_nomod(&base, vb)?))
         }
     }
+}
+
+/// Negative-exponent `int ** int` float route, kept opaque so `int_pow`
+/// does not inline `float_pow_raw`.
+#[majit_macros::dont_look_inside]
+fn int_pow_negative(base: i64, exp: i64) -> Result<f64, PyError> {
+    float_pow_raw(base as f64, exp as f64)
 }
 
 unsafe fn long_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {

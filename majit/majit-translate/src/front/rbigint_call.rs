@@ -221,6 +221,35 @@ pub(crate) fn int_comparison_residual_for_method(leaf: &str) -> Option<Vec<Strin
     )
 }
 
+/// `descroperation::bigint_add(&RBigInt, &RBigInt) -> *mut RBigInt` is the
+/// source spelling of `rbigint.add`. The call is retargeted to
+/// `jit_bigint_add`, whose result the front models as one GC reference.
+pub(crate) fn bigint_add_residual_path(segments: &[String]) -> Option<Vec<String>> {
+    if segments.last().map(String::as_str) != Some("bigint_add") {
+        return None;
+    }
+    if !segments
+        .iter()
+        .rev()
+        .skip(1)
+        .take(2)
+        .eq(["descroperation", "objspace"])
+    {
+        return None;
+    }
+    Some(
+        [
+            crate::runtime_names::crates::INTERPRETER,
+            "objspace",
+            "descroperation",
+            "jit_bigint_add",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+    )
+}
+
 /// `descroperation::bigint_pow_nomod(&RBigInt, &RBigInt) ->
 /// Result<RBigInt, PyError>` is Rust's source-level spelling of RPython's
 /// elidable `rbigint.pow` call with an implicit MemoryError edge.  The caller
@@ -659,6 +688,27 @@ mod tests {
         }
         assert!(int_comparison_residual_for_method("lt").is_none());
         assert!(int_comparison_residual_for_method("int_add").is_none());
+    }
+
+    #[test]
+    fn maps_bigint_add_leaf_to_pointer_abi() {
+        assert_eq!(
+            bigint_add_residual_path(&segs(&[
+                crate::runtime_names::crates::INTERPRETER,
+                "objspace",
+                "descroperation",
+                "bigint_add",
+            ])),
+            Some(segs(&[
+                crate::runtime_names::crates::INTERPRETER,
+                "objspace",
+                "descroperation",
+                "jit_bigint_add",
+            ]))
+        );
+        assert!(
+            bigint_add_residual_path(&segs(&["majit_rlib", "rbigint", "RBigInt", "add"])).is_none()
+        );
     }
 
     #[test]

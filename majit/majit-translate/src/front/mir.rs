@@ -14275,7 +14275,8 @@ impl<'a> Lowering<'a> {
         // translated shape is instead one GCREF result plus an implicit
         // MemoryError edge. Retarget the exact host helper to that pointer ABI;
         // the Result-of-PyError capture immediately below rewires the compiler
-        // generated `?` diamond into LastException exits.
+        // generated `?` diamond into LastException exits. `bigint_add` returns
+        // the payload pointer directly and takes the same GC-reference swap.
         let op_kind = if let OpKind::Call {
             target: CallTarget::FunctionPath { segments, .. },
             args,
@@ -14289,6 +14290,7 @@ impl<'a> Lowering<'a> {
                 .as_ref()
                 .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
             && let Some(residual) = crate::front::rbigint_call::pow_nomod_residual_path(segments)
+                .or_else(|| crate::front::rbigint_call::bigint_add_residual_path(segments))
         {
             OpKind::Call {
                 target: CallTarget::FunctionPath {

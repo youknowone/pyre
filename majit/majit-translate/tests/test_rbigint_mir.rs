@@ -1309,6 +1309,7 @@ const SINGLE_GRAPHS: &[&str] = &[
     "bigint_and",
     "long_int_compare",
     "long_pow",
+    "long_add",
     "long_lshift",
     "int_lshift",
 ];
@@ -1619,6 +1620,44 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
             .iter()
             .any(|segments| segments.last().is_some_and(|leaf| leaf == "int_eq")),
         "long_pow retained RBigInt::int_eq: {pow_calls:?}"
+    );
+
+    let long_add = program
+        .functions
+        .iter()
+        .find(|function| {
+            function.name == "long_add"
+                && function.module_path.ends_with("objspace::descroperation")
+        })
+        .expect("descroperation::long_add graph");
+    let add_calls: Vec<Vec<String>> = long_add
+        .graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|operation| match &operation.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => Some(segments.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        add_calls.iter().any(|segments| segments
+            == &[
+                "pyre_interpreter",
+                "objspace",
+                "descroperation",
+                "jit_bigint_add",
+            ]),
+        "long_add must retarget bigint_add to the elidable pointer ABI: {add_calls:?}"
+    );
+    assert!(
+        !add_calls
+            .iter()
+            .any(|segments| segments.last().is_some_and(|leaf| leaf == "bigint_add")),
+        "the host bigint_add wrapper must not survive in the translated graph: {add_calls:?}"
     );
 
     let module_loaded = llbcs.len() > 1;
