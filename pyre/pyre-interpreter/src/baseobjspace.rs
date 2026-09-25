@@ -8729,11 +8729,12 @@ pub(crate) fn exception_attr_get(obj: PyObjectRef, name: &str) -> PyResult {
                 let written =
                     unsafe { pyre_object::interp_exceptions::w_exception_get_written(obj) };
                 if written == -1 {
-                    // `descr_get_written` raises AttributeError under the
-                    // descriptor's own name for an unset slot.  Falling through
-                    // to the ordinary lookup would instead report the receiver
-                    // as having no such attribute.
-                    return Err(PyError::attribute_error("characters_written"));
+                    // Unset slot: `descr_get_written` raises, but only after
+                    // MRO lookup.  A subclass class attribute must win first
+                    // (`class E(OSError): characters_written = 42`).  `PY_NULL`
+                    // lets the caller continue; the OSError getset fget still
+                    // raises `AttributeError("characters_written")`.
+                    return Ok(pyre_object::PY_NULL);
                 }
                 return Ok(pyre_object::w_int_new(written));
             }

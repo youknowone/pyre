@@ -9083,10 +9083,21 @@ fn traceback_c_int_arg(obj: PyObjectRef) -> Result<i64, crate::PyError> {
 }
 
 fn traceback_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() != 5 {
+    // 3.14's `traceback()` names its four arguments, so a short call reports
+    // the first one still missing and a long one reports the limit; both
+    // messages carry the type's own name, not the `types` alias.
+    const ARG_NAMES: [&str; 4] = ["tb_next", "tb_frame", "tb_lasti", "tb_lineno"];
+    let given = args.len().saturating_sub(1);
+    if given < ARG_NAMES.len() {
         return Err(crate::PyError::type_error(format!(
-            "TracebackType() takes exactly 4 arguments ({} given)",
-            args.len().saturating_sub(1)
+            "traceback() missing required argument '{}' (pos {})",
+            ARG_NAMES[given],
+            given + 1
+        )));
+    }
+    if given > ARG_NAMES.len() {
+        return Err(crate::PyError::type_error(format!(
+            "traceback() takes at most 4 arguments ({given} given)"
         )));
     }
     let w_next = args[1];
@@ -9111,7 +9122,7 @@ fn traceback_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         || !unsafe { pyre_object::py_type_check(w_frame, &crate::pyframe::FRAME_TYPE) }
     {
         return Err(crate::PyError::type_error(format!(
-            "TracebackType() argument 'tb_frame' must be frame, not {}",
+            "traceback() argument 'tb_frame' must be frame, not {}",
             type_name_of(w_frame)
         )));
     }
@@ -9338,9 +9349,13 @@ fn init_pytraceback_type(ns: PyObjectRef) {
             if w_new.is_null() || unsafe { pyre_object::is_none(w_new) } {
                 w_new = pyre_object::PY_NULL;
             } else if !unsafe { crate::pytraceback::is_pytraceback(w_new) } {
-                return Err(crate::PyError::type_error(
-                    "expected traceback object or None".to_string(),
-                ));
+                // `check_traceback`'s caller passes the message in; 3.14's
+                // `tb_next` setter names the rejected object's type and omits
+                // the `or None` it has already accepted above.
+                return Err(crate::PyError::type_error(format!(
+                    "expected traceback object, got '{}'",
+                    type_name_of(w_new)
+                )));
             }
             if unsafe { crate::pytraceback::w_pytraceback_set_w_next(tb, w_new) }.is_err() {
                 return Err(crate::PyError::new(
