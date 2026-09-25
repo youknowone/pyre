@@ -6214,13 +6214,16 @@ fn set_init_from_iterable_impl(
             }) else {
                 break;
             };
-            unsafe {
-                pyre_object::setobject::w_set_insert_key_checked(
+            // `setitem_with_hash` residual: the dict walk already holds the
+            // cached digest, and the set insert (including a reentrant
+            // `__eq__`) stays inside the leaf.
+            set_setitem_with_hash_result(unsafe {
+                pyre_object::w_set_setitem_with_hash(
                     pyre_object::gc_roots::shadow_stack_get(set_slot),
-                    key,
+                    key.obj,
+                    key.hash,
                 )
-            }
-            .map_err(crate::baseobjspace::map_set_update_error)?;
+            })?;
             copied_hashed_key = true;
             index = slot + 1;
         }
@@ -29357,6 +29360,56 @@ fn set_method_symmetric_difference_update(
     Ok(pyre_object::w_none())
 }
 
+/// Map a `w_set_setitem_with_hash` result: `-1` is the pending `__eq__` /
+/// `__hash__` exception, `-2` a table resized by a callback.
+fn set_setitem_with_hash_result(rc: i64) -> Result<(), crate::PyError> {
+    match rc {
+        0 => Ok(()),
+        -2 => Err(crate::PyError::runtime_error(
+            "Set changed size during iteration",
+        )),
+        _ => Err(crate::baseobjspace::take_pending_hash_error()),
+    }
+}
+
+/// One `iterkeys_with_hash` pass of
+/// `ObjectSetStrategy._symmetric_difference_unwrapped`: keys of `walk` that
+/// `contains_with_hash` misses in `probe` are placed in `d_new`.
+fn symmetric_difference_one_side(
+    walk: pyre_object::PyObjectRef,
+    probe: pyre_object::PyObjectRef,
+    d_new: pyre_object::PyObjectRef,
+) -> Result<(), crate::PyError> {
+    unsafe {
+        let mut index = 0usize;
+        loop {
+            if index >= pyre_object::w_set_num_ever_used_items(walk) {
+                break;
+            }
+            let key = pyre_object::w_set_iterkey_at(walk, index);
+            if !key.is_null() {
+                let keyhash = pyre_object::w_set_iterkey_hash_at(walk, index);
+                let present = pyre_object::w_set_contains_with_hash(probe, key, keyhash);
+                if present < 0 {
+                    return Err(crate::baseobjspace::take_pending_hash_error());
+                }
+                if present == 0 {
+                    let key = pyre_object::w_set_iterkey_at(walk, index);
+                    if key.is_null() {
+                        break;
+                    }
+                    let keyhash = pyre_object::w_set_iterkey_hash_at(walk, index);
+                    set_setitem_with_hash_result(pyre_object::w_set_setitem_with_hash(
+                        d_new, key, keyhash,
+                    ))?;
+                }
+            }
+            index += 1;
+        }
+        Ok(())
+    }
+}
+
 /// The elements on exactly one of the two sides, as a set.
 ///
 /// `setobject.py _symmetric_difference_unwrapped` — each side is
@@ -29367,16 +29420,18 @@ fn set_method_symmetric_difference_update(
 /// bare `eq_w` scan over the elements would instead call two objects the same
 /// element on `__eq__` alone, and place them where their hashes never meet.
 ///
-/// Walked one index at a time through `w_set_key_at` and probed with
-/// `w_set_contains_key_checked`, the same shape as `set_intersect_update`, so
-/// the merge loop stays traced and only the per-key table probe/insert cross a
-/// residual boundary. The two operands are reached from the frame and stay
-/// rooted, but `d_new` is only reachable from this frame's Rust locals; a probe
-/// `eq_w` that triggers a collection would sweep the unrooted body, so it is
-/// pinned for the whole merge. The set bodies are old-gen and keep their
-/// addresses across a collection, but their elements are young and move, so
-/// each key is re-read from the table the collector rewrites rather than
-/// carried across the `eq_w` a bucket probe can run.
+/// Walked as `iterkeys_with_hash` (`setobject.py`
+/// `ObjectSetStrategy._symmetric_difference_unwrapped`): each live slot yields
+/// a key and the digest it was stored under, `contains_with_hash` probes the
+/// other side, and a miss is placed with `setitem_with_hash`. Those three are
+/// residual leaves, so this loop stays traced and only the per-key table
+/// operations cross a residual boundary. The two operands are reached from the
+/// frame and stay rooted, but `d_new` is only reachable from this frame's Rust
+/// locals; a probe `eq_w` that triggers a collection would sweep the unrooted
+/// body, so it is pinned for the whole merge. The set bodies are old-gen and
+/// keep their addresses across a collection, but their elements are young and
+/// move, so each key is re-read from the table the collector rewrites rather
+/// than carried across the `eq_w` a bucket probe can run.
 fn set_symmetric_difference_storage(
     w_set: pyre_object::PyObjectRef,
     w_other: pyre_object::PyObjectRef,
@@ -29385,24 +29440,11 @@ fn set_symmetric_difference_storage(
         let _roots = pyre_object::gc_roots::push_roots();
         let d_new = pyre_object::w_set_new();
         let d_new = pyre_object::gc_roots::pin_root(d_new);
-        for (walk, probe) in [(w_other, w_set), (w_set, w_other)] {
-            let mut i = 0;
-            while let Some(slot) = pyre_object::w_set_next_slot(walk, i) {
-                let Some(key) = pyre_object::w_set_key_at(walk, slot) else {
-                    break;
-                };
-                if !pyre_object::w_set_contains_key_checked(probe, key)
-                    .map_err(|_| crate::baseobjspace::take_pending_hash_error())?
-                {
-                    let Some(key) = pyre_object::w_set_key_at(walk, slot) else {
-                        break;
-                    };
-                    pyre_object::w_set_insert_key_checked(d_new, key)
-                        .map_err(crate::baseobjspace::map_set_update_error)?;
-                }
-                i = slot + 1;
-            }
-        }
+        // Two passes, the order in `_symmetric_difference_unwrapped`: the
+        // other side first, then this side. A pair array would be a
+        // classdef-less instance whose `__pos_1` getattr phase A cannot lower.
+        symmetric_difference_one_side(w_other, w_set, d_new)?;
+        symmetric_difference_one_side(w_set, w_other, d_new)?;
         Ok(d_new)
     }
 }
