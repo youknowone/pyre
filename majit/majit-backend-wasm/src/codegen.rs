@@ -2922,6 +2922,9 @@ pub struct GuardExit {
     /// GUARD_VALUE, or when its operand is already one of the fail arguments
     /// and so already has a slot. See `counter_value_spill`.
     pub counter_value_spill: Option<OpRef>,
+    /// Guest address of this guard's bridge-target cell. `0` when the
+    /// module has no bridge dispatch. Stamped onto `adr_jump_offset`.
+    pub bridge_cell: u32,
     /// `op.descr` snapshot — passed through to `WasmFailDescr.meta_descr`
     /// so `get_latest_descr_arc` can return the canonical metainterp Arc
     /// (parity with dynasm/cranelift's `meta_descr` forwarding).
@@ -3613,6 +3616,7 @@ fn collect_guards_and_vars(inputargs: &[InputArgRc], ops: &[Op]) -> (Vec<GuardEx
                 descr_cell: 0,
                 exit_gcmap_ptr: 0,
                 counter_value_spill,
+                bridge_cell: 0,
                 meta_descr,
             });
             fail_index += 1;
@@ -4125,6 +4129,10 @@ pub struct ModuleBuildInputs {
     pub gc_const_keys: Vec<usize>,
     pub fail_index_base: u32,
     pub bridge_cells_base: u32,
+    /// Per-guard cell addresses in collect order. A non-zero entry is the
+    /// guard's existing cell; re-emission passes these so the new module
+    /// loads the same cells instead of a fresh array.
+    pub guard_cell_addrs: Vec<u32>,
     /// A bridge reached from an armed guard takes its fail values as `i64`
     /// parameters after the frame pointer. Float bits use the same i64 carrier,
     /// so a single function type per arity covers every failure signature.
@@ -4302,6 +4310,7 @@ impl Clone for ModuleBuildInputs {
             gc_const_keys: self.gc_const_keys.clone(),
             fail_index_base: self.fail_index_base,
             bridge_cells_base: self.bridge_cells_base,
+            guard_cell_addrs: self.guard_cell_addrs.clone(),
             bridge_entry_arity: self.bridge_entry_arity,
             bridge_param_dispatch: self.bridge_param_dispatch,
             trace_entry_census: self.trace_entry_census,
@@ -4458,6 +4467,7 @@ pub fn build_wasm_module(
         gc_const_keys,
         fail_index_base,
         bridge_cells_base,
+        guard_cell_addrs,
         bridge_entry_arity,
         bridge_param_dispatch,
         trace_entry_census,
@@ -4635,9 +4645,41 @@ pub fn build_wasm_module(
     // The exit names itself by the descr cell in `jf_descr`, so a chained
     // module does not share an index space. `build_function` seeds
     // `guard_idx` with this base; mirror that on `GuardExit.fail_index`.
-    for g in &mut guards {
-        g.fail_index += fail_index_base;
+    for (index, g) in guards.iter_mut().enumerate() {
+        g.fail_index += *fail_index_base;
+        let from_list = guard_cell_addrs
+            .get(index)
+            .copied()
+            .filter(|&addr| addr != 0);
+        let preexisting = g
+            .meta_descr
+            .as_ref()
+            .and_then(|meta| meta.as_fail_descr())
+            .map(|fd| fd.adr_jump_offset())
+            .filter(|&addr| addr != 0);
+        let addr = if let Some(addr) = from_list.or(preexisting.map(|addr| addr as u32)) {
+            addr
+        } else if *bridge_cells_base != 0 {
+            *bridge_cells_base
+                + (g.fail_index - *fail_index_base) * std::mem::size_of::<u32>() as u32
+        } else {
+            0
+        };
+        g.bridge_cell = addr;
+        if addr != 0 && preexisting.is_none() {
+            if let Some(meta) = g.meta_descr.as_ref() {
+                if let Some(fd) = meta.as_fail_descr() {
+                    if !fd.is_finish() {
+                        let stamp = std::panic::AssertUnwindSafe(|| {
+                            fd.set_adr_jump_offset(addr as usize);
+                        });
+                        let _ = std::panic::catch_unwind(stamp);
+                    }
+                }
+            }
+        }
     }
+    let cell_addrs: Vec<u32> = guards.iter().map(|g| g.bridge_cell).collect();
 
     // Inter-trace chaining: a loop trace's guard exits dispatch to a compiled
     // bridge in-module via `call_indirect` through the shared
@@ -4654,7 +4696,7 @@ pub fn build_wasm_module(
     // into its CA bridge, and a BRIDGE's own guards chain nested sub-bridges the
     // same way (a hot guard inside a chained bridge would otherwise round-trip
     // to the host forever). So any guarded trace wants dispatch cells.
-    let bridge_dispatch = *bridge_cells_base != 0;
+    let bridge_dispatch = *bridge_cells_base != 0 || cell_addrs.iter().any(|&addr| addr != 0);
     // All boundary values use an i64 carrier, including raw Float bits. That
     // makes the call type depend only on arity while preserving f64 payloads.
     let bridge_param_arities: Vec<usize> = if *bridge_param_dispatch && bridge_dispatch {
@@ -5167,6 +5209,7 @@ pub fn build_wasm_module(
         &ref_homes,
         &label_resume,
         *bridge_cells_base,
+        &cell_addrs,
         bridge_dispatch,
         *bridge_entry_arity,
         &bridge_param_type_indices,
@@ -5316,6 +5359,7 @@ fn build_function(
     ref_homes: &RefHomes,
     label_resume: &LabelResumeData,
     cells_base: u32,
+    cell_addrs: &[u32],
     bridge_dispatch: bool,
     bridge_entry_arity: Option<usize>,
     bridge_param_type_indices: &indexmap::IndexMap<usize, u32>,
@@ -5558,6 +5602,7 @@ fn build_function(
         .collect();
     let guard_dispatch = BridgeDispatch {
         cells_base,
+        cell_addrs,
         fail_index_base,
         bridge_slot_local,
         enabled: bridge_dispatch,
@@ -9481,8 +9526,15 @@ fn build_function(
     // The shared epilogue remains only for the established frame-entry form.
     if bridge_dispatch && bridge_param_type_indices.is_empty() {
         // slot = *(bridge_slot_local), where the local holds a cell address.
+        // Address 0 is a guard with no cell; do not load guest address 0.
+        sink.local_get(bridge_slot_local);
+        sink.i32_eqz();
+        sink.if_(BlockType::Result(ValType::I32));
+        sink.i32_const(0);
+        sink.else_();
         sink.local_get(bridge_slot_local);
         sink.i32_load(memarg(0, 2));
+        sink.end();
         sink.local_tee(bridge_slot_local);
         sink.if_(BlockType::Empty);
         sink.local_get(0); // frame_ptr argument to the bridge
@@ -10436,6 +10488,9 @@ struct InlineGuard<'a> {
 #[derive(Clone, Copy)]
 struct BridgeDispatch<'a> {
     cells_base: u32,
+    /// Per-guard cell addresses, indexed by `guard_idx - fail_index_base`.
+    /// A zero entry falls back to `cells_base + index * 4`.
+    cell_addrs: &'a [u32],
     fail_index_base: u32,
     bridge_slot_local: u32,
     enabled: bool,
@@ -10777,6 +10832,19 @@ fn live_fail_args_of(op: &Op) -> Vec<OpRef> {
         .collect()
 }
 
+fn dispatch_cell_addr(dispatch: BridgeDispatch<'_>, guard_idx: u32) -> u32 {
+    let index = guard_idx.wrapping_sub(dispatch.fail_index_base) as usize;
+    if let Some(&addr) = dispatch.cell_addrs.get(index) {
+        if addr != 0 {
+            return addr;
+        }
+    }
+    if dispatch.cells_base == 0 {
+        return 0;
+    }
+    dispatch.cells_base + index as u32 * std::mem::size_of::<u32>() as u32
+}
+
 fn emit_guard_param_tail_call(
     sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -10793,8 +10861,10 @@ fn emit_guard_param_tail_call(
         .expect("parameter dispatch type missing for guard fail arity");
     debug_assert!(dispatch.enabled);
     debug_assert!(guard_idx >= dispatch.fail_index_base);
-    let cell_addr = dispatch.cells_base
-        + (guard_idx - dispatch.fail_index_base) * std::mem::size_of::<u32>() as u32;
+    let cell_addr = dispatch_cell_addr(dispatch, guard_idx);
+    if cell_addr == 0 {
+        return;
+    }
     sink.i32_const(cell_addr as i32);
     sink.i32_load(memarg(0, 2));
     sink.local_tee(dispatch.bridge_slot_local);
@@ -10879,8 +10949,12 @@ fn emit_guard_bridge_dispatch(
     dispatch: BridgeDispatch<'_>,
 ) {
     debug_assert!(guard_idx >= dispatch.fail_index_base);
-    let cell_addr = dispatch.cells_base
-        + (guard_idx - dispatch.fail_index_base) * std::mem::size_of::<u32>() as u32;
+    let cell_addr = dispatch_cell_addr(dispatch, guard_idx);
+    if cell_addr == 0 {
+        sink.i32_const(0);
+        sink.local_set(dispatch.bridge_slot_local);
+        return;
+    }
     sink.i32_const(cell_addr as i32);
     sink.local_set(dispatch.bridge_slot_local);
 }
@@ -12471,6 +12545,7 @@ mod tests {
         };
         let dispatch = BridgeDispatch {
             cells_base: 0,
+            cell_addrs: &[],
             fail_index_base: 0,
             bridge_slot_local: 0,
             enabled: false,

@@ -28,6 +28,8 @@ pub struct LoopAsmResources {
     /// outlives every module that can still leave through that exit because
     /// this block is `asmmemmgr_blocks`.
     pub fail_cells: Vec<Box<crate::failguard::FailDescrCell>>,
+    /// CALL_ASSEMBLER indirect cell. Its address is `JitCellToken._ll_function_addr`.
+    pub ca_entry: Option<Box<crate::failguard::WasmCaDispatchEntry>>,
     pub bridge_cells: Vec<Box<[u32]>>,
     /// `[descr_cell, gcmap]` pairs the exit loads. The address is baked
     /// into the module; the allocation does not move.

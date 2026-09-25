@@ -845,11 +845,9 @@ fn guard_fail_args_advanced(
 }
 
 use failguard::{
-    CallAssemblerTarget, ChainedTraceMeta, CompiledWasmLoop, LabelTarget, WasmFailDescr,
-    WasmFrameData, ca_dispatch_mark_gnf2, ca_dispatch_mark_gnf2_for_compiled_ptr,
-    ca_dispatch_publish, ca_dispatch_redirect, ca_dispatch_slot, call_assembler_target, descr_at,
-    fill_exit_cell, label_target, mark_call_assembler_targets_gnf2_for_compiled_ptr,
-    publish_call_assembler_target, publish_label_target,
+    CallAssemblerTarget, CompiledWasmLoop, LabelTarget, WasmFailDescr, WasmFrameData, descr_at,
+    ensure_ca_cell, fill_exit_cell, label_target, mark_gnf2_token, publish_label_target,
+    publish_token_target, target_from_token,
 };
 use majit_backend::{AsmInfo, BackendError, DeadFrame, JitCellToken};
 use majit_gc::GcAllocator;
@@ -2226,23 +2224,20 @@ pub extern "C" fn wasm_malloc_unicode(type_id: i64, length: i64) -> i64 {
     )
 }
 
-struct CaCalleeReg {
-    clt: Weak<majit_backend::CompiledLoopToken>,
-    index_of_virtualizable: i32,
-}
-
-thread_local! {
-    /// dynasm `CALL_ASSEMBLER_TARGETS`: per-thread, because token numbers
-    /// are reused across threads in backend tests. `free_loop_and_bridges`
-    /// retracts an entry through `unregister_wasm_ca_target`.
-    static CA_CALLEE_REGS: RefCell<IndexMap<u64, CaCalleeReg>> = RefCell::new(IndexMap::new());
-}
-
-fn unregister_wasm_ca_target(number: u64) {
-    let _ = CA_CALLEE_REGS.try_with(|cell| {
-        cell.borrow_mut().swap_remove(&number);
-    });
-    crate::failguard::remove_call_assembler_target(number);
+fn ca_locs_from_token(token: &JitCellToken) -> Option<majit_gc::rewrite::CallAssemblerCalleeLocs> {
+    let clt = token.compiled_loop_token()?;
+    let frame_info_ptr = {
+        let info = clt.frame_info.lock();
+        &*info as *const majit_backend::JitFrameInfo as usize
+    };
+    let frame_depth = clt.frame_info.lock().depth() as usize;
+    let ll_initial_locs = clt._ll_initial_locs.lock().clone();
+    Some(majit_gc::rewrite::CallAssemblerCalleeLocs {
+        _ll_initial_locs: ll_initial_locs,
+        frame_depth,
+        frame_info_ptr,
+        index_of_virtualizable: token.virtualizable_arg_index().map_or(-1, |i| i as i32),
+    })
 }
 
 /// `call_jit.rs` `jitframe_layout_descrs`. Offsets are from the object base
@@ -2278,48 +2273,43 @@ fn publish_ca_initial_locs(token: &majit_backend::JitCellToken, n_inputs: usize)
         .map(|i| codegen::FRAME_SLOT_BASE as i32 + (i as i32) * 8)
         .collect();
     *clt._ll_initial_locs.lock() = locs;
-    let index_of_virtualizable = token.virtualizable_arg_index().map_or(-1, |i| i as i32);
-    CA_CALLEE_REGS.with(|cell| {
-        cell.borrow_mut().insert(
-            token.number,
-            CaCalleeReg {
-                clt: Arc::downgrade(&clt),
-                index_of_virtualizable,
-            },
-        );
-    });
+    ensure_ca_cell(token);
 }
 
 fn lookup_call_assembler_callee_locs(
     token_number: u64,
+    tokens: &std::collections::HashMap<u64, std::sync::Arc<JitCellToken>>,
 ) -> Option<majit_gc::rewrite::CallAssemblerCalleeLocs> {
-    let (clt, index_of_virtualizable) = CA_CALLEE_REGS.with(|cell| {
-        let map = cell.borrow();
-        let reg = map.get(&token_number)?;
-        Some((reg.clt.upgrade()?, reg.index_of_virtualizable))
-    })?;
-    let frame_info_ptr = {
-        let info = clt.frame_info.lock();
-        &*info as *const majit_backend::JitFrameInfo as usize
-    };
-    let frame_depth = clt.frame_info.lock().depth() as usize;
-    let ll_initial_locs = clt._ll_initial_locs.lock().clone();
-    Some(majit_gc::rewrite::CallAssemblerCalleeLocs {
-        _ll_initial_locs: ll_initial_locs,
-        frame_depth,
-        frame_info_ptr,
-        index_of_virtualizable,
-    })
+    ca_locs_from_token(tokens.get(&token_number)?)
+}
+
+fn ca_tokens_in(ops: &[Op]) -> std::collections::HashMap<u64, std::sync::Arc<JitCellToken>> {
+    let mut tokens = std::collections::HashMap::new();
+    for op in ops.iter().filter(|op| op.opcode.is_call_assembler()) {
+        let Some(descr) = op.getdescr() else {
+            continue;
+        };
+        let Some(token) = descr
+            .as_loop_token_descr()
+            .and_then(|ltd| ltd.token_handle_any())
+            .and_then(|any| any.downcast_ref::<std::sync::Arc<JitCellToken>>())
+        else {
+            continue;
+        };
+        tokens.insert(token.number, std::sync::Arc::clone(token));
+    }
+    tokens
 }
 
 /// A `CALL_ASSEMBLER` whose callee has not published locs cannot be rewritten.
 /// The message matches `wasm_unsupported_trace_reason` so the decline tally
 /// stays on the same string.
 fn missing_call_assembler_locs(ops: &[Op]) -> Option<String> {
+    let tokens = ca_tokens_in(ops);
     for op in ops.iter().filter(|op| op.opcode.is_call_assembler()) {
         let ready = op.getdescr().is_some_and(|d| {
             d.as_loop_token_descr()
-                .and_then(|lt| lookup_call_assembler_callee_locs(lt.loop_token_number()))
+                .and_then(|lt| lookup_call_assembler_callee_locs(lt.loop_token_number(), &tokens))
                 .is_some()
         });
         if !ready {
@@ -2359,7 +2349,10 @@ pub fn gc_rewriter() -> majit_gc::rewrite::GcRewriterImpl {
         max_nursery_size,
         wb_descr,
         jitframe_info: Some(wasm_jitframe_descrs()),
-        call_assembler_callee_locs: Some(Box::new(lookup_call_assembler_callee_locs)),
+        call_assembler_callee_locs: Some(Box::new(|token_number| {
+            let _ = token_number;
+            None
+        })),
         load_supported_factors: &[1],
         supports_load_effective_address: true,
         malloc_zero_filled: is_boehm,
@@ -2404,7 +2397,12 @@ pub fn rewrite_ops_for_gc(
     indexmap::IndexMap<u32, i64>,
     Option<Arc<majit_gc::GcTable>>,
 ) {
-    rewrite_ops_for_gc_with(&gc_rewriter(), ops, constants)
+    let mut rewriter = gc_rewriter();
+    let tokens = ca_tokens_in(&ops);
+    rewriter.call_assembler_callee_locs = Some(Box::new(move |token_number| {
+        lookup_call_assembler_callee_locs(token_number, &tokens)
+    }));
+    rewrite_ops_for_gc_with(&rewriter, ops, constants)
 }
 
 /// [`rewrite_ops_for_gc`] with an explicit rewriter (tests that need
@@ -3663,8 +3661,113 @@ impl WasmBackend {
         }
     }
 
-    /// Re-point a guard's dispatch cell at the bridge `bridge_slots` still
-    /// names for it.
+    fn cell_for_meta(
+        descrs: &[std::sync::Arc<WasmFailDescr>],
+        meta: &majit_ir::DescrRef,
+    ) -> Option<u32> {
+        descrs.iter().find_map(|descr| {
+            descr
+                .meta_descr
+                .as_ref()
+                .is_some_and(|existing| std::sync::Arc::ptr_eq(existing, meta))
+                .then_some(descr.bridge_cell)
+                .filter(|&addr| addr != 0)
+        })
+    }
+
+    /// Cell address of each guard and `Finish`, in collect order.
+    ///
+    /// `region_trace` is set for an inlined bridge. `owner_base` is the loop's
+    /// original cell array; only the owner's own exits are indexed into it.
+    /// A failing guard that still has no cell gets one here. That is the
+    /// descr's cell from this compile onward.
+    fn reemit_guard_cells(
+        source_loop: &CompiledWasmLoop,
+        ops: &[Op],
+        region_trace: Option<u64>,
+        owner_base: Option<u32>,
+        owner_limit: usize,
+        fresh: &mut Vec<Box<[u32]>>,
+    ) -> Vec<u32> {
+        let descrs = source_loop.fail_descrs.borrow();
+        let mut ordinal = 0u32;
+        let mut addrs = Vec::new();
+        for op in ops
+            .iter()
+            .filter(|op| op.opcode.is_guard() || op.opcode == majit_ir::OpCode::Finish)
+        {
+            let meta = op.getdescr();
+            let mut addr = meta
+                .as_ref()
+                .and_then(|meta| Self::cell_for_meta(&descrs, meta))
+                .unwrap_or(0);
+            if addr == 0 {
+                if let Some(trace_id) = region_trace {
+                    if let Some(found) = descrs.iter().find_map(|descr| {
+                        (descr.trace_id == trace_id
+                            && descr.fail_index == ordinal
+                            && descr.bridge_cell != 0)
+                            .then_some(descr.bridge_cell)
+                    }) {
+                        addr = found;
+                    }
+                } else if let Some(base) = owner_base.filter(|&base| base != 0) {
+                    if (ordinal as usize) < owner_limit {
+                        addr = base + ordinal * std::mem::size_of::<u32>() as u32;
+                    }
+                }
+            }
+            let finish = meta
+                .as_ref()
+                .and_then(|meta| meta.as_fail_descr())
+                .is_some_and(|fd| fd.is_finish());
+            if addr == 0 && op.opcode.is_guard() && !finish {
+                let (cell, owner) = codegen::alloc_bridge_cells(1);
+                if let Some(owner) = owner {
+                    fresh.push(owner);
+                }
+                addr = cell;
+            }
+            ordinal += 1;
+            addrs.push(addr);
+        }
+        addrs
+    }
+
+    fn owner_guard_descr(
+        source_loop: &CompiledWasmLoop,
+        fail_index: u32,
+    ) -> Option<Arc<WasmFailDescr>> {
+        source_loop.fail_descrs.borrow().iter().find_map(|descr| {
+            (descr.trace_id == source_loop.trace_id && descr.fail_index == fail_index)
+                .then(|| Arc::clone(descr))
+        })
+    }
+
+    /// Put each guard's stable cell address back on `adr_jump_offset` so a
+    /// rebuild bakes that address. `compile_bridge` clears the slot after
+    /// patching; `WasmFailDescr.bridge_cell` keeps it.
+    fn restore_guard_cell_offsets(source_loop: &CompiledWasmLoop, ops: &[Op]) {
+        let descrs = source_loop.fail_descrs.borrow();
+        for op in ops.iter().filter(|op| op.opcode.is_guard()) {
+            let Some(meta) = op.getdescr() else {
+                continue;
+            };
+            let Some(fd) = meta.as_fail_descr() else {
+                continue;
+            };
+            if fd.is_finish() || fd.adr_jump_offset() != 0 {
+                continue;
+            }
+            let Some(addr) = Self::cell_for_meta(&descrs, &meta).filter(|&addr| addr != 0) else {
+                continue;
+            };
+            let stamp = std::panic::AssertUnwindSafe(|| fd.set_adr_jump_offset(addr as usize));
+            let _ = std::panic::catch_unwind(stamp);
+        }
+    }
+
+    /// Re-point a guard's dispatch cell at the bridge slot stored on its descr.
     fn restore_dispatch_cell(owner: &JitCellToken, source_fail_index: u32) {
         let Some(source_loop) = owner
             .compiled
@@ -3673,24 +3776,13 @@ impl WasmBackend {
         else {
             return;
         };
-        let cells_base = source_loop.bridge_cells_base.get();
-        if (source_fail_index as usize) >= source_loop.num_guard_cells.get() {
-            return;
-        }
-        let Some(slot) = source_loop
-            .bridge_slots
-            .borrow()
-            .get(&source_fail_index)
-            .copied()
-        else {
+        let Some(descr) = Self::owner_guard_descr(source_loop, source_fail_index) else {
             return;
         };
-        let _ = (cells_base, slot);
-        #[cfg(target_arch = "wasm32")]
-        if cells_base != 0 {
-            let cell = (cells_base as usize + source_fail_index as usize * 4) as *mut u32;
-            unsafe { core::ptr::write(cell, slot) };
-        }
+        crate::failguard::write_guard_cell(
+            descr.bridge_cell,
+            descr.bridge_slot.load(std::sync::atomic::Ordering::Relaxed),
+        );
     }
 
     /// Rebuild `owner` with `region` merged into it. `false` leaves the owner
@@ -3824,31 +3916,25 @@ impl WasmBackend {
         // `num_guard_cells`, which is the live array. `register_pending_inline`
         // already refuses to aim the trip probe at an owner cell then;
         // writing one here would store past the array into the guest heap.
-        let source_cells_base = source_loop.bridge_cells_base.get();
         let live_cell_count = source_loop.num_guard_cells.get();
         let attached_fail_indices: Vec<u32> = candidate.inlined_bridges
             [candidate.inlined_bridges.len() - attached..]
             .iter()
             .map(|region| region.source_fail_index)
             .collect();
-        let mut old_bridge_slots = Vec::new();
+        let mut zeroed_cells = Vec::new();
         for &source_fail_index in &attached_fail_indices {
             if (source_fail_index as usize) >= live_cell_count {
                 continue;
             }
-            if let Some(slot) = source_loop
-                .bridge_slots
-                .borrow_mut()
-                .remove(&source_fail_index)
-            {
-                old_bridge_slots.push((source_fail_index, slot));
+            let Some(descr) = Self::owner_guard_descr(source_loop, source_fail_index) else {
+                continue;
+            };
+            if descr.bridge_cell == 0 {
+                continue;
             }
-            #[cfg(target_arch = "wasm32")]
-            if source_cells_base != 0 {
-                let cell =
-                    (source_cells_base as usize + source_fail_index as usize * 4) as *mut u32;
-                unsafe { core::ptr::write(cell, 0) };
-            }
+            zeroed_cells.push(Arc::clone(&descr));
+            crate::failguard::write_guard_cell(descr.bridge_cell, 0);
         }
         // Eligibility IS the emission: `reemit_loop` runs the same
         // `build_wasm_module` over the same candidate, and nothing it does
@@ -3863,34 +3949,24 @@ impl WasmBackend {
                 for _ in 0..attached {
                     diag_bump(32);
                 }
-                // `bridge_slots` no longer names these — they were removed
-                // above so re-emission cannot replay them. Keep their
-                // LABEL_TARGETS rows: inbound JUMPs still enter the old
-                // module, whose LABEL dest the replacement owner does not
-                // recreate.
+                // The guard cell stays zero so the inlined region is not
+                // also dispatched. Keep LABEL_TARGETS rows: inbound JUMPs
+                // still enter the old module.
                 return (leftover, false);
             }
             Err(error) => {
                 source_loop.reemit.replace(old_inputs);
-                for (source_fail_index, slot) in old_bridge_slots {
-                    source_loop
-                        .bridge_slots
-                        .borrow_mut()
-                        .insert(source_fail_index, slot);
-                    #[cfg(target_arch = "wasm32")]
-                    if source_cells_base != 0 {
-                        let cell = (source_cells_base as usize + source_fail_index as usize * 4)
-                            as *mut u32;
-                        unsafe { core::ptr::write(cell, slot) };
-                    }
-                    let _ = source_fail_index;
+                for descr in zeroed_cells {
+                    crate::failguard::write_guard_cell(
+                        descr.bridge_cell,
+                        descr.bridge_slot.load(std::sync::atomic::Ordering::Relaxed),
+                    );
                 }
                 record_inline_trial_error(&error);
                 classify_inline_install_error(&error);
                 leftover.splice(0..0, attached_pairs);
             }
         }
-        let _ = source_cells_base;
         (leftover, true)
     }
 
@@ -3941,8 +4017,34 @@ impl WasmBackend {
             ));
         }
         inputs.fail_index_base = 0;
-        let (new_cells_base, new_cells_owner) = codegen::alloc_bridge_cells(merged_guard_count);
-        inputs.bridge_cells_base = new_cells_base;
+        // Every guard the rebuilt module can fail through names the cell its
+        // descr already owns. A guard that was inlined before it had a module
+        // of its own has no cell yet; allocate that cell now, before emit, so
+        // the descr and the module share it.
+        Self::restore_guard_cell_offsets(compiled, &inputs.ops);
+        let mut fresh_cells = Vec::new();
+        let mut guard_cell_addrs = Self::reemit_guard_cells(
+            compiled,
+            &inputs.ops,
+            None,
+            Some(compiled.bridge_cells_base.get()),
+            own_guard_count,
+            &mut fresh_cells,
+        );
+        for region in &inputs.inlined_bridges {
+            Self::restore_guard_cell_offsets(compiled, &region.ops);
+            guard_cell_addrs.extend(Self::reemit_guard_cells(
+                compiled,
+                &region.ops,
+                Some(region.trace_id),
+                None,
+                0,
+                &mut fresh_cells,
+            ));
+        }
+        inputs.guard_cell_addrs = guard_cell_addrs;
+        inputs.bridge_cells_base = 0;
+        let _fresh_cells = fresh_cells;
         inputs.ca.compute_home_gcmap = true;
         inputs.ca.home_gcmap_has_prior = true;
         // Do not null grown LABEL homes on every keyed entry. A later
@@ -3953,6 +4055,7 @@ impl WasmBackend {
         inputs.ca.home_gcmap_min_ordinary = compiled.num_ref_homes.get();
         inputs.ca.home_gcmap_min_labels = compiled.used_label_homes.get();
         let mut asm_resources = release::LoopAsmResources::default();
+        asm_resources.bridge_cells.extend(_fresh_cells);
         inputs.ca.exit_table_base = asm_resources.alloc_exit_table(merged_guard_count) as u32;
         inputs.ca.gcmap_sink = &mut asm_resources as *mut _ as usize;
         // The module still running has the back-edge check. This
@@ -3994,6 +4097,14 @@ impl WasmBackend {
                         contains.then_some(region.trace_id)
                     })
                     .unwrap_or(compiled.trace_id);
+                let previous = compiled.fail_descrs.borrow().iter().find_map(|descr| {
+                    descr
+                        .meta_descr
+                        .as_ref()
+                        .zip(g.meta_descr.as_ref())
+                        .is_some_and(|(existing, meta)| std::sync::Arc::ptr_eq(existing, meta))
+                        .then(|| Arc::clone(descr))
+                });
                 Arc::new(WasmFailDescr {
                     fail_index: g.fail_index,
                     trace_id,
@@ -4002,6 +4113,40 @@ impl WasmBackend {
                     is_finish: g.is_finish,
                     force_args_offset: inputs.frame.force_slot_base as u32,
                     force_gcmap_ptr: g.exit_gcmap_ptr,
+                    bridge_cell: g.bridge_cell,
+                    fail_arg_advanced: previous
+                        .as_ref()
+                        .map(|descr| descr.fail_arg_advanced.clone())
+                        .filter(|advanced| !advanced.is_empty())
+                        .unwrap_or_else(|| {
+                            let live = codegen::live_fail_arg_count(
+                                g.meta_descr.as_ref(),
+                                g.fail_arg_refs.len(),
+                            );
+                            vec![false; live]
+                        }),
+                    trace_ref_homes: previous
+                        .as_ref()
+                        .map(|descr| descr.trace_ref_homes)
+                        .unwrap_or(0)
+                        .max(compiled.num_ref_homes.get()),
+                    trace_label_homes: previous
+                        .as_ref()
+                        .map(|descr| descr.trace_label_homes)
+                        .unwrap_or(0)
+                        .max(compiled.used_label_homes.get()),
+                    param_dispatch: previous
+                        .as_ref()
+                        .map(|descr| descr.param_dispatch)
+                        .unwrap_or(inputs.bridge_param_dispatch),
+                    bridge_slot: std::sync::atomic::AtomicU32::new(
+                        previous
+                            .as_ref()
+                            .map(|descr| {
+                                descr.bridge_slot.load(std::sync::atomic::Ordering::Relaxed)
+                            })
+                            .unwrap_or(0),
+                    ),
                     meta_descr: g.meta_descr.clone(),
                 })
             })
@@ -4028,11 +4173,6 @@ impl WasmBackend {
                 ));
             }
             compiled.func_handle.set(new_handle);
-            if compiled.retained_owner_cells_base.get() == 0 {
-                compiled
-                    .retained_owner_cells_base
-                    .set(compiled.bridge_cells_base.get());
-            }
             new_handle
         } else {
             // A slot shared through the module cache comes back as a fresh
@@ -4114,35 +4254,9 @@ impl WasmBackend {
         // those new slots are nulled at keyed entry, and publication is
         // monotonic in the marked-bit set. Dropping them forced
         // `trace_eagerness` (200) extra guard failures.
-        // When the LABEL-capture tail grows, a pre-growth loop-closing
-        // bridge still keys into this replacement and restores the new
-        // captures from uninitialized words. Drop those owner attachments
-        // so the next fail retraces against the merged floor. The region
-        // just inlined is already gone from `bridge_slots`.
-        if old_labels < widened_labels {
-            let dropped: Vec<u32> = compiled.bridge_slots.borrow().keys().copied().collect();
-            compiled.bridge_slots.borrow_mut().clear();
-            if !dropped.is_empty() {
-                let owner_tid = compiled.trace_id;
-                compiled
-                    .bridge_descr_ranges
-                    .borrow_mut()
-                    .retain(|(tid, fail_index, _, _)| {
-                        !(*tid == owner_tid && dropped.contains(fail_index))
-                    });
-            }
-        }
-        #[cfg(target_arch = "wasm32")]
-        if new_cells_base != 0 {
-            for (&fail_index, &bridge_slot) in compiled.bridge_slots.borrow().iter() {
-                let cell = (new_cells_base as usize + fail_index as usize * 4) as *mut u32;
-                unsafe { core::ptr::write(cell, bridge_slot) };
-            }
-        }
-        if let Some(owner) = new_cells_owner {
-            asm_resources.bridge_cells.push(owner);
-        }
-        compiled.bridge_cells_base.set(new_cells_base);
+        // The rebuilt module loads each guard's existing cell, so an
+        // attached bridge stays reachable. The inlined region's cell was
+        // already zeroed by the installer.
         compiled.module_bytes.set(code_size as u32);
         compiled.num_guard_cells.set(guard_exits.len());
         compiled.num_ref_homes.set(widened);
@@ -4153,80 +4267,6 @@ impl WasmBackend {
             widened,
             widened_labels,
         ));
-        {
-            let mut metas = compiled.chained_trace_meta.borrow_mut();
-            let mut offset = own_guard_count;
-            for region in &inputs.inlined_bridges {
-                let count = codegen::guard_exit_count(&region.inputargs, &region.ops);
-                let exits = &guard_exits[offset..offset + count];
-                let (prev_homes, prev_labels, retained_cells_base) = metas
-                    .get(&region.trace_id)
-                    .map(|m| {
-                        let retained = if m.retained_cells_base != 0 {
-                            m.retained_cells_base
-                        } else {
-                            m.cells_base
-                        };
-                        (m.num_ref_homes, m.used_label_homes, retained)
-                    })
-                    .unwrap_or_else(|| {
-                        (
-                            codegen::count_ref_homes(&region.inputargs, &region.ops),
-                            codegen::label_ref_capture_slots(&region.inputargs, &region.ops),
-                            0,
-                        )
-                    });
-                // `RefHomes::collect` reassigns across the merged stream, so
-                // this region's standalone count can sit below the slots its
-                // rebased refs now occupy. Floor to the merged extent.
-                let num_ref_homes = prev_homes.max(widened);
-                let used_label_homes = prev_labels.max(widened_labels);
-                // Nested sub-bridges keep their dispatch slots. They no
-                // longer overwrite a wider owner map (bridge publish is
-                // null-only), so a grow does not need a retrace.
-                if new_cells_base != 0 {
-                    // This region's guards are carved out of the array that
-                    // was just reallocated. Replay still-valid nested
-                    // sub-bridges into the new cells; unreplayed, a guard
-                    // deopts and retraces a bridge it can never reach.
-                    for (&(trace_id, fail_index), &bridge_slot) in
-                        compiled.chained_bridge_slots.borrow().iter()
-                    {
-                        if trace_id != region.trace_id || fail_index as usize >= count {
-                            continue;
-                        }
-                        crate::failguard::write_bridge_cell_aliases(
-                            new_cells_base + offset as u32 * 4,
-                            retained_cells_base,
-                            fail_index,
-                            bridge_slot,
-                        );
-                    }
-                }
-                metas.insert(
-                    region.trace_id,
-                    ChainedTraceMeta {
-                        cells_base: new_cells_base + offset as u32 * 4,
-                        retained_cells_base,
-                        num_cells: count,
-                        guard_fail_arg_advanced: guard_fail_args_advanced(&region.ops, exits),
-                        guard_fail_arg_counts: exits
-                            .iter()
-                            .map(|guard| {
-                                crate::codegen::live_fail_arg_count(
-                                    guard.meta_descr.as_ref(),
-                                    guard.fail_arg_refs.len(),
-                                )
-                            })
-                            .collect(),
-                        bridge_param_dispatch: inputs.bridge_param_dispatch,
-                        num_ref_homes,
-                        used_label_homes,
-                    },
-                );
-                offset += count;
-            }
-        }
         *compiled.reemit.borrow_mut() = Some(inputs.clone());
 
         // LABEL targets bake only the stable table slot, so restamp them for
@@ -4241,7 +4281,7 @@ impl WasmBackend {
         );
         asm_resources.label_ids = published_labels;
         release::push_resources(token, asm_resources);
-        if let Some(mut target) = call_assembler_target(token.number) {
+        if let Some(mut target) = target_from_token(token) {
             target.func_handle = install_handle;
             target.compiled_ptr = compiled as *const CompiledWasmLoop as usize as u64;
             target.marked_ordinary = compiled.num_ref_homes.get() as u32;
@@ -4252,21 +4292,7 @@ impl WasmBackend {
             // module still finishes through it.
             target.has_guard_not_forced_2 |=
                 module_has_guard_not_forced_2(&inputs.ops, &inputs.inlined_bridges);
-            ca_dispatch_publish(
-                token.number,
-                install_handle,
-                target.compiled_ptr as u32,
-                target.callee_frame_bytes,
-                target.dispatch_key_ofs as u32,
-                target.callee_gcmap_ptr,
-                target.home_slot_base,
-                target.home_slots,
-                target.has_guard_not_forced_2,
-                target.marked_ordinary,
-                target.marked_labels,
-                target.label_ref_slots,
-            );
-            publish_call_assembler_target(token.number, target);
+            publish_token_target(token, &target);
         }
         Ok(())
     }
@@ -4447,11 +4473,16 @@ fn general_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssemblerTa
             diag_bump(59);
             return None;
         }
-        let Some(target_token) = descr.call_target_token() else {
+        let Some(owned) = descr_ref
+            .as_loop_token_descr()
+            .and_then(|ltd| ltd.token_handle_any())
+            .and_then(|any| any.downcast_ref::<std::sync::Arc<JitCellToken>>())
+        else {
             diag_bump(58);
             return None;
         };
-        let Some(mut registered) = call_assembler_target(target_token) else {
+        let target_token = owned.number;
+        let Some(mut registered) = target_from_token(owned) else {
             diag_bump(60);
             return None;
         };
@@ -4474,21 +4505,7 @@ fn general_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssemblerTa
                 return None;
             }
             registered.func_handle = handle;
-            ca_dispatch_publish(
-                target_token,
-                handle,
-                registered.compiled_ptr as u32,
-                registered.callee_frame_bytes,
-                registered.dispatch_key_ofs as u32,
-                registered.callee_gcmap_ptr,
-                registered.home_slot_base,
-                registered.home_slots,
-                registered.has_guard_not_forced_2,
-                registered.marked_ordinary,
-                registered.marked_labels,
-                registered.label_ref_slots,
-            );
-            publish_call_assembler_target(target_token, registered.clone());
+            publish_token_target(owned, &registered);
         }
         if registered.input_types.as_slice() != arg_types {
             diag_bump(62);
@@ -4547,11 +4564,11 @@ fn ca_codegen_targets(
 ) -> std::collections::HashMap<u64, codegen::CaTarget> {
     targets
         .iter()
-        .map(|(token, _target)| {
+        .map(|(token, target)| {
             (
                 *token,
                 codegen::CaTarget {
-                    dispatch_entry: ca_dispatch_slot(*token),
+                    dispatch_entry: target.dispatch_entry,
                 },
             )
         })
@@ -4909,17 +4926,6 @@ impl majit_backend::Backend for WasmBackend {
         "wasm"
     }
 
-    fn bridge_decline_is_terminal(&self) -> bool {
-        // Every `compile_bridge` `Unsupported` return is a deterministic
-        // structural decline — a function of the (ops, source-loop) shape that
-        // re-tracing the same guard reproduces identically: CALL_ASSEMBLER /
-        // cross-loop JUMP shape, missing source loop, loop-closing bridge into a
-        // peeled preamble, non-direct loop guard, ref-home overflow, or the
-        // codegen frame-slot / unhandled-opcode declines. So re-firing the guard
-        // only rebuilds the same unsupported bridge; record it terminal.
-        true
-    }
-
     // ── Blackhole allocation (llmodel.py:775-790) ──
     //
     // The blackhole interpreter materializes virtuals (e.g. a virtualized
@@ -5057,7 +5063,6 @@ impl majit_backend::Backend for WasmBackend {
         // creates the `CompiledLoopToken`.
         if let Some(clt) = token.compiled_loop_token() {
             majit_backend::record_compiled_loop_token(&self.cpu_tracker, &clt);
-            clt.set_ca_unregister(unregister_wasm_ca_target);
         }
         let mut ops_owned: Vec<Op> = normalize_ops_for_codegen(inputargs, ops);
         codegen::materialize_unbound_label_args(inputargs, &mut ops_owned);
@@ -5194,6 +5199,7 @@ impl majit_backend::Backend for WasmBackend {
             gc_const_keys: gc_const_keys_of(gc_table.as_deref()),
             fail_index_base,
             bridge_cells_base,
+            guard_cell_addrs: Vec::new(),
             bridge_entry_arity: None,
             bridge_param_dispatch,
             trace_entry_census,
@@ -5261,6 +5267,12 @@ impl majit_backend::Backend for WasmBackend {
                     is_finish: g.is_finish,
                     force_args_offset: frame.force_slot_base as u32,
                     force_gcmap_ptr: g.exit_gcmap_ptr,
+                    bridge_cell: g.bridge_cell,
+                    fail_arg_advanced: Vec::new(),
+                    trace_ref_homes: 0,
+                    trace_label_homes: 0,
+                    param_dispatch: false,
+                    bridge_slot: std::sync::atomic::AtomicU32::new(0),
                     meta_descr: g.meta_descr.clone(),
                 })
             })
@@ -5408,10 +5420,6 @@ impl majit_backend::Backend for WasmBackend {
                 .collect(),
             bridge_param_dispatch,
             bridge_descr_ranges: std::cell::RefCell::new(Vec::new()),
-            chained_trace_meta: std::cell::RefCell::new(std::collections::HashMap::new()),
-            _bridge_owned_cells: std::cell::RefCell::new(Vec::new()),
-            bridge_slots: std::cell::RefCell::new(HashMap::new()),
-            chained_bridge_slots: std::cell::RefCell::new(HashMap::new()),
             // Retaining the snapshot costs long-lived heap for the token's
             // whole lifetime, which moves when the collector next runs and so
             // moves which iteration a back edge's eval-breaker guard bails on.
@@ -5462,24 +5470,11 @@ impl majit_backend::Backend for WasmBackend {
         // immutable geometry metadata: previously compiled CALL_ASSEMBLER
         // modules load this stable entry at runtime.
         let has_guard_not_forced_2 = module_has_guard_not_forced_2(ops, &[]);
-        ca_dispatch_publish(
-            token.number,
-            compiled.eager_func_handle(),
-            compiled as *const CompiledWasmLoop as usize as u32,
-            compiled.frame.ca_frame_bytes,
-            compiled.frame.dispatch_key_ofs as u32,
-            callee_gcmap_ptr,
-            compiled.frame.home_slot_base as u32,
-            compiled.frame.home_slots as u32,
-            has_guard_not_forced_2,
-            num_ref_homes as u32,
-            used_label_homes as u32,
-            compiled.frame.label_ref_slots as u32,
-        );
-        publish_call_assembler_target(
-            token.number,
-            CallAssemblerTarget {
+        publish_token_target(
+            token,
+            &CallAssemblerTarget {
                 token_number: token.number,
+                dispatch_entry: 0,
                 func_handle: compiled.eager_func_handle(),
                 input_types: compiled.input_types.clone(),
                 dispatch_key_ofs: compiled.frame.dispatch_key_ofs,
@@ -5616,35 +5611,31 @@ impl majit_backend::Backend for WasmBackend {
                         "wasm backend: bridge source token has no compiled loop".into(),
                     )
                 })?;
-            // Resolve the failing guard's owning trace by the descr's
-            // `trace_id`: the source loop itself, or one of the bridges
-            // already chained onto it (`chained_trace_meta`) — a NESTED
-            // sub-bridge source. Either way the resolution yields the owning
-            // trace's guard-cell array, cell count, and the guard's
-            // per-fail-arg advance flags. `None` = foreign trace (declined
-            // below, diag 3).
             let is_direct = source_trace_id == source_loop.trace_id;
-            let source_used_homes = if is_direct {
-                (
+            let fail_ptr = fail_descr as *const dyn FailDescr as *const ();
+            let descrs = source_loop.fail_descrs.borrow();
+            let by_meta = descrs.iter().find_map(|descr| {
+                descr
+                    .meta_descr
+                    .as_ref()
+                    .is_some_and(|meta| std::sync::Arc::as_ptr(meta) as *const () == fail_ptr)
+                    .then(|| Arc::clone(descr))
+            });
+            let by_key = descrs.iter().find_map(|descr| {
+                (descr.trace_id == source_trace_id && descr.fail_index == source_fail_index)
+                    .then(|| Arc::clone(descr))
+            });
+            let wasm_guard = by_meta.or(by_key);
+            let source_used_homes = wasm_guard
+                .as_ref()
+                .filter(|descr| !is_direct)
+                .map(|descr| (descr.trace_ref_homes, descr.trace_label_homes))
+                .unwrap_or((
                     source_loop.num_ref_homes.get(),
                     source_loop.used_label_homes.get(),
-                )
-            } else {
-                source_loop
-                    .chained_trace_meta
-                    .borrow()
-                    .get(&source_trace_id)
-                    .map(|m| (m.num_ref_homes, m.used_label_homes))
-                    .unwrap_or((
-                        source_loop.num_ref_homes.get(),
-                        source_loop.used_label_homes.get(),
-                    ))
-            };
+                ));
             let guard = if is_direct {
                 Some((
-                    source_loop.bridge_cells_base.get(),
-                    source_loop.retained_owner_cells_base.get(),
-                    source_loop.num_guard_cells.get(),
                     source_loop
                         .guard_fail_arg_advanced
                         .get(source_fail_index as usize)
@@ -5657,25 +5648,13 @@ impl majit_backend::Backend for WasmBackend {
                     source_loop.bridge_param_dispatch,
                 ))
             } else {
-                source_loop
-                    .chained_trace_meta
-                    .borrow()
-                    .get(&source_trace_id)
-                    .map(|m| {
-                        (
-                            m.cells_base,
-                            m.retained_cells_base,
-                            m.num_cells,
-                            m.guard_fail_arg_advanced
-                                .get(source_fail_index as usize)
-                                .cloned()
-                                .unwrap_or_default(),
-                            m.guard_fail_arg_counts
-                                .get(source_fail_index as usize)
-                                .copied(),
-                            m.bridge_param_dispatch,
-                        )
-                    })
+                wasm_guard.as_ref().map(|descr| {
+                    (
+                        descr.fail_arg_advanced.clone(),
+                        Some(descr.fail_arg_advanced.len()),
+                        descr.param_dispatch,
+                    )
+                })
             };
             (
                 guard,
@@ -5686,31 +5665,36 @@ impl majit_backend::Backend for WasmBackend {
                 source_used_homes,
             )
         };
-        // The failing guard must belong to the source loop or to a bridge
-        // already chained onto it, and its per-trace index must have a cell in
-        // that trace's array. A foreign descr has no cell to flip; decline so
-        // the metainterp keeps the correct interpreter fallback rather than
-        // installing an unreachable bridge module.
-        let Some((
-            source_cells_base,
-            source_retained_cells_base,
-            source_num_cells,
-            source_fail_arg_advanced,
-            source_fail_arg_count,
-            source_bridge_param_dispatch,
-        )) = source_guard
-        else {
-            diag_bump(3); // declined: source guard's trace is not chained here
-            return Err(BackendError::Unsupported(
-                "wasm backend: bridge source guard is not a direct loop guard".into(),
-            ));
+        // The bridge cell hangs off `fail_descr.adr_jump_offset`, including
+        // when the guard was emitted inside a nested trace. A missing side
+        // table row is not a decline.
+        let (source_fail_arg_advanced, source_fail_arg_count, source_bridge_param_dispatch) =
+            source_guard.unwrap_or((Vec::new(), None, false));
+        let source_cells_base = {
+            let stamped = fail_descr.adr_jump_offset() as u32;
+            if stamped != 0 {
+                stamped
+            } else {
+                let fail_ptr = fail_descr as *const dyn FailDescr as *const ();
+                original_token
+                    .compiled
+                    .get()
+                    .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
+                    .and_then(|loop_| {
+                        loop_.fail_descrs.borrow().iter().find_map(|descr| {
+                            let same_meta = descr.meta_descr.as_ref().is_some_and(|meta| {
+                                std::sync::Arc::as_ptr(meta) as *const () == fail_ptr
+                            });
+                            let same_key = descr.trace_id == source_trace_id
+                                && descr.fail_index == source_fail_index;
+                            (same_meta || same_key)
+                                .then_some(descr.bridge_cell)
+                                .filter(|&addr| addr != 0)
+                        })
+                    })
+                    .unwrap_or(0)
+            }
         };
-        if source_fail_index as usize >= source_num_cells {
-            diag_bump(3);
-            return Err(BackendError::Unsupported(
-                "wasm backend: bridge source guard index has no dispatch cell".into(),
-            ));
-        }
         let bridge_entry_arity = if source_bridge_param_dispatch {
             if source_fail_arg_count != Some(inputargs.len()) {
                 diag_bump(46);
@@ -5966,9 +5950,9 @@ impl majit_backend::Backend for WasmBackend {
             // below consumes before the last `decline` call is out of scope.
             let bridge_trace_id = self.trace_counter;
             // `source_fail_index` is the SOURCE TRACE's own exit ordinal, and
-            // stays that everywhere else in this function: the dispatch cell,
-            // `chained_bridge_slots` and `bridge_descr_ranges` are all keyed by
-            // it, and the metainterp re-derives that key off the FailDescr. The
+            // stays that everywhere else in this function: the dispatch cell
+            // and `bridge_descr_ranges` are keyed by it, and the metainterp
+            // re-derives that key off the FailDescr. The
             // region handed to the owner is the one thing that indexes the
             // merged stream instead.
             let merged_source_fail_index = if is_direct {
@@ -6254,9 +6238,8 @@ impl majit_backend::Backend for WasmBackend {
         };
 
         // The region carries the trace id of the bridge standing in for it, so
-        // the sub-bridges chained onto this bridge's guards
-        // (`chained_bridge_slots`, keyed by that id) are replayed into the
-        // merged region's cells when the owner is finally rebuilt.
+        // a guard of this bridge that fails later resolves to its merged region
+        // (`merged_region_fail_index`) when the owner is finally rebuilt.
         let inline_trip = defer_inline.map(|(owner, merged_fail_index, outside_loop, remap)| {
             if region_external.is_some() {
                 diag_bump(51);
@@ -6306,6 +6289,7 @@ impl majit_backend::Backend for WasmBackend {
             gc_const_keys: gc_const_keys_of(gc_table.as_deref()),
             fail_index_base: base,
             bridge_cells_base,
+            guard_cell_addrs: Vec::new(),
             bridge_entry_arity,
             bridge_param_dispatch,
             trace_entry_census,
@@ -6329,9 +6313,14 @@ impl majit_backend::Backend for WasmBackend {
             };
 
         // Bridge exit descrs (fail_index already base-offset by build_wasm_module).
+        let bridge_advanced = guard_fail_args_advanced(ops, &guard_exits);
+        let bridge_ref_floor = bridge_ref_homes.max(source_used_homes.0);
+        let bridge_label_floor =
+            codegen::label_ref_capture_slots(inputargs, ops).max(source_used_homes.1);
         let bridge_descrs: Vec<Arc<WasmFailDescr>> = guard_exits
             .iter()
-            .map(|g| {
+            .enumerate()
+            .map(|(index, g)| {
                 Arc::new(WasmFailDescr {
                     fail_index: g.fail_index,
                     trace_id,
@@ -6340,6 +6329,12 @@ impl majit_backend::Backend for WasmBackend {
                     is_finish: g.is_finish,
                     force_args_offset: source_frame.force_slot_base as u32,
                     force_gcmap_ptr: g.exit_gcmap_ptr,
+                    bridge_cell: g.bridge_cell,
+                    fail_arg_advanced: bridge_advanced.get(index).cloned().unwrap_or_default(),
+                    trace_ref_homes: bridge_ref_floor,
+                    trace_label_homes: bridge_label_floor,
+                    param_dispatch: bridge_param_dispatch,
+                    bridge_slot: std::sync::atomic::AtomicU32::new(0),
                     meta_descr: g.meta_descr.clone(),
                 })
             })
@@ -6438,31 +6433,6 @@ impl majit_backend::Backend for WasmBackend {
                     count,
                 ));
             }
-            // Publish this bridge's own guard-dispatch metadata so a hot guard
-            // INSIDE it can chain a nested sub-bridge (same resolution the
-            // loop's own guards get, keyed by this bridge's trace_id).
-            source_loop.chained_trace_meta.borrow_mut().insert(
-                trace_id,
-                ChainedTraceMeta {
-                    cells_base: bridge_cells_base,
-                    retained_cells_base: 0,
-                    num_cells: guard_exits.len(),
-                    guard_fail_arg_advanced: guard_fail_args_advanced(ops, &guard_exits),
-                    guard_fail_arg_counts: guard_exits
-                        .iter()
-                        .map(|guard| {
-                            crate::codegen::live_fail_arg_count(
-                                guard.meta_descr.as_ref(),
-                                guard.fail_arg_refs.len(),
-                            )
-                        })
-                        .collect(),
-                    bridge_param_dispatch,
-                    num_ref_homes: bridge_ref_homes.max(source_used_homes.0),
-                    used_label_homes: codegen::label_ref_capture_slots(inputargs, ops)
-                        .max(source_used_homes.1),
-                },
-            );
             // The bridge module lives as long as this source loop, so hand its
             // own cell array (if any) to the loop, freed when the loop drops.
             source_loop.bridge_owned_label_targets.borrow_mut().extend(
@@ -6506,73 +6476,47 @@ impl majit_backend::Backend for WasmBackend {
             .iter()
             .any(|op| op.opcode == majit_ir::OpCode::GuardNotForced2)
         {
-            ca_dispatch_mark_gnf2(original_token.number);
-            let compiled_ptr = original_token
-                .compiled
-                .get()
-                .and_then(|compiled| compiled.downcast_ref::<CompiledWasmLoop>())
-                .map(|loop_| loop_ as *const CompiledWasmLoop as u32);
-            if let Some(compiled_ptr) = compiled_ptr.filter(|&ptr| ptr != 0) {
-                ca_dispatch_mark_gnf2_for_compiled_ptr(compiled_ptr);
-                mark_call_assembler_targets_gnf2_for_compiled_ptr(compiled_ptr);
-            }
-            if let Some(mut target) = call_assembler_target(original_token.number) {
+            mark_gnf2_token(original_token);
+            if let Some(mut target) = target_from_token(original_token) {
                 if target.has_guard_not_forced_2 == 0 {
                     target.has_guard_not_forced_2 = 1;
-                    ca_dispatch_publish(
-                        original_token.number,
-                        target.func_handle,
-                        target.compiled_ptr as u32,
-                        target.callee_frame_bytes,
-                        target.dispatch_key_ofs as u32,
-                        target.callee_gcmap_ptr,
-                        target.home_slot_base,
-                        target.home_slots,
-                        1,
-                        target.marked_ordinary,
-                        target.marked_labels,
-                        target.label_ref_slots,
-                    );
-                    publish_call_assembler_target(original_token.number, target);
+                    publish_token_target(original_token, &target);
                 }
             }
         }
-        #[cfg(target_arch = "wasm32")]
-        if source_cells_base != 0 && bridge_slot != 0 {
-            let cell = (source_cells_base as usize + source_fail_index as usize * 4) as *mut u32;
-            if unsafe { core::ptr::read(cell) } != 0 {
-                diag_bump(29); // this guard already had a reachable bridge
+        // `assembler.py` `patch_jump_for_descr`: write the bridge slot through
+        // `faildescr.adr_jump_offset`, then clear the slot ("patched").
+        let patch_cell = {
+            let stamped = fail_descr.adr_jump_offset() as u32;
+            if stamped != 0 {
+                stamped
+            } else {
+                source_cells_base
             }
-            crate::failguard::write_bridge_cell_aliases(
-                source_cells_base,
-                source_retained_cells_base,
-                source_fail_index,
-                bridge_slot,
-            );
-            // Retained module replacement and loop-closing bridge inlining
-            // restore this cell after allocating a fresh dispatch array.
-            if reemit_enabled() || inline_bridge_enabled() {
-                if let Some(source_loop) = original_token
-                    .compiled
-                    .get()
-                    .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
-                {
-                    if is_direct {
-                        source_loop
-                            .bridge_slots
-                            .borrow_mut()
-                            .insert(source_fail_index, bridge_slot);
-                    } else {
-                        source_loop
-                            .chained_bridge_slots
-                            .borrow_mut()
-                            .insert((source_trace_id, source_fail_index), bridge_slot);
-                    }
+        };
+        #[cfg(target_arch = "wasm32")]
+        if patch_cell != 0 && bridge_slot != 0 {
+            if unsafe { core::ptr::read(patch_cell as *const u32) } != 0 {
+                diag_bump(29);
+            }
+            crate::failguard::write_guard_cell(patch_cell, bridge_slot);
+            fail_descr.set_adr_jump_offset(0);
+            if let Some(source_loop) = original_token
+                .compiled
+                .get()
+                .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
+            {
+                if let Some(descr) = source_loop.fail_descrs.borrow().iter().find(|descr| {
+                    descr.trace_id == source_trace_id && descr.fail_index == source_fail_index
+                }) {
+                    descr
+                        .bridge_slot
+                        .store(bridge_slot, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
         #[cfg(not(target_arch = "wasm32"))]
-        let _ = (source_cells_base, source_retained_cells_base, bridge_slot);
+        let _ = (patch_cell, bridge_slot, source_cells_base);
 
         let code_size = wasm_bytes.len();
         // `asmmemmgr.py:37`, as in `compile_loop` above: a bridge's module is a
@@ -6975,8 +6919,10 @@ impl majit_backend::Backend for WasmBackend {
 
     fn free_loop(&mut self, token: &JitCellToken) {
         // `llmodel.py` `AbstractLLCPU.free_loop_and_bridges`. Dropping
-        // `asmmemmgr_blocks` releases this loop's wasm resources. The
-        // metainterp reaches the same clear from `JitCellToken::drop`.
+        // `asmmemmgr_blocks` releases this loop's wasm resources, including
+        // the CALL_ASSEMBLER cell whose address is `_ll_function_addr`.
+        // Clear that stand-in first so a later lookup does not load it.
+        token.set_ll_function_addr(0);
         if let Some(clt) = token.compiled_loop_token() {
             clt.free_loop_and_bridges();
         }
@@ -6999,76 +6945,9 @@ impl majit_backend::Backend for WasmBackend {
         old: &JitCellToken,
         new: &JitCellToken,
     ) -> Result<(), BackendError> {
-        let Some(old_target) = call_assembler_target(old.number) else {
-            // Without the old metadata, no baked frame geometry is available
-            // to prove an existing caller can enter the replacement safely.
-            return Err(BackendError::Unsupported(format!(
-                "call-assembler redirect from token {} has no preserved geometry",
-                old.number
-            )));
-        };
-        let Some(mut new_target) = call_assembler_target(new.number) else {
-            return Err(BackendError::Unsupported(format!(
-                "call-assembler redirect to token {} has no compiled target",
-                new.number
-            )));
-        };
-        if old_target.input_types != new_target.input_types {
-            return Err(BackendError::Unsupported(format!(
-                "call-assembler redirect from token {} to {} changed input types",
-                old.number, new.number
-            )));
-        }
-        if new_target.func_handle == 0 && new_target.compiled_ptr != 0 {
-            let new_loop = unsafe {
-                (new_target.compiled_ptr as *const CompiledWasmLoop)
-                    .as_ref()
-                    .expect("published CALL_ASSEMBLER target has a live compiled loop")
-            };
-            let handle = new_loop.materialize_func_handle()?;
-            #[cfg(target_arch = "wasm32")]
-            if handle == 0 {
-                return Err(BackendError::Unsupported(format!(
-                    "call-assembler redirect to token {} could not materialize wasm code",
-                    new.number
-                )));
-            }
-            new_target.func_handle = handle;
-            ca_dispatch_publish(
-                new.number,
-                handle,
-                new_target.compiled_ptr as u32,
-                new_target.callee_frame_bytes,
-                new_target.dispatch_key_ofs as u32,
-                new_target.callee_gcmap_ptr,
-                new_target.home_slot_base,
-                new_target.home_slots,
-                new_target.has_guard_not_forced_2,
-                new_target.marked_ordinary,
-                new_target.marked_labels,
-                new_target.label_ref_slots,
-            );
-            publish_call_assembler_target(new.number, new_target.clone());
-        }
-        let movable_callee = new_target.callee_frame_bytes != 0
-            && new_target.callee_gcmap_ptr != 0
-            && new_target.compiled_ptr != 0
-            && unsafe {
-                (new_target.compiled_ptr as *const CompiledWasmLoop)
-                    .as_ref()
-                    .is_some_and(|loop_| !loop_.ca_terminal_declined.get())
-            };
-        if !movable_callee {
-            return Err(BackendError::Unsupported(format!(
-                "call-assembler redirect to token {} is not a movable-CA callee",
-                new.number
-            )));
-        }
-
-        // `x86/assembler.py::redirect_call_assembler` first calls
-        // `newlooptoken.compiled_loop_token.update_frame_info(old, baseofs)`.
-        // In particular, a real loop may need a deeper frame than the temporary
-        // callback it replaces; rejecting that growth is not PyPy semantics.
+        // `x86/assembler.py` `redirect_call_assembler` copies frame info, then
+        // patches the target at `oldlooptoken._ll_function_addr`. It does not
+        // refuse. The wasm cell is that address; callers already baked it.
         if let (Some(new_clt), Some(old_clt)) =
             (new.compiled_loop_token(), old.compiled_loop_token())
         {
@@ -7077,27 +6956,23 @@ impl majit_backend::Backend for WasmBackend {
             let old_weak = std::sync::Arc::downgrade(&old_clt);
             new_clt.update_frame_info(&old_clt, old_weak, baseofs);
         }
-
-        // Existing callers retain `old`'s stable entry.  Make both the
-        // runtime dispatch values and the metadata lookup resolve to `new`.
-        ca_dispatch_redirect(
-            old.number,
-            new_target.func_handle,
-            new_target.compiled_ptr as u32,
-            new_target.callee_frame_bytes,
-            new_target.dispatch_key_ofs as u32,
-            new_target.callee_gcmap_ptr,
-            new_target.home_slot_base,
-            new_target.home_slots,
-            new_target.has_guard_not_forced_2,
-            new_target.marked_ordinary,
-            new_target.marked_labels,
-            new_target.label_ref_slots,
-        );
-        transfer_call_assembler_target_activity(&old_target, &new_target);
-        new_target.token_number = old.number;
-        publish_call_assembler_target(old.number, new_target);
-        // Non-x86 assemblers log `newlooptoken.number`.
+        if let Some(mut new_target) = target_from_token(new) {
+            if new_target.func_handle == 0 && new_target.compiled_ptr != 0 {
+                if let Some(loop_) =
+                    unsafe { (new_target.compiled_ptr as *const CompiledWasmLoop).as_ref() }
+                {
+                    if let Ok(handle) = loop_.materialize_func_handle() {
+                        new_target.func_handle = handle;
+                        publish_token_target(new, &new_target);
+                    }
+                }
+            }
+            let old_target = target_from_token(old);
+            publish_token_target(old, &new_target);
+            if let Some(old_target) = old_target.as_ref() {
+                transfer_call_assembler_target_activity(old_target, &new_target);
+            }
+        }
         majit_backend::redirect_assembler(old, new, new.number);
         Ok(())
     }
@@ -7113,6 +6988,7 @@ impl majit_backend::Backend for WasmBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use failguard::{ca_entry, ca_mark_entry, ca_publish, mark_cells_holding};
     use majit_backend::{Backend, JitCellToken};
     use majit_gc::collector::MiniMarkGC;
     use majit_gc::trace::TypeInfo;
@@ -7176,7 +7052,7 @@ mod tests {
         backend
             .compile_loop(&inputargs, &ops, &token)
             .expect("loop compiles");
-        assert!(failguard::call_assembler_target(token.number).is_some());
+        assert!(target_from_token(&token).is_some());
         assert!(failguard::label_target(label_id).is_some());
         let fail = FreeFailDescr {
             fail_index: 0,
@@ -7221,7 +7097,7 @@ mod tests {
         drop(clt);
 
         backend.free_loop(&token);
-        assert!(failguard::call_assembler_target(token.number).is_none());
+        assert!(token.ll_function_addr() == 0 || target_from_token(&token).is_none());
         assert!(failguard::label_target(label_id).is_none());
         assert!(
             token
@@ -7563,51 +7439,45 @@ mod tests {
         assert!(compiled.pending_wasm_bytes.borrow().is_some());
     }
 
-    struct DispatchCleanup {
-        numbers: Vec<u64>,
-        ptrs: Vec<u32>,
+    fn fresh_entry() -> Box<failguard::WasmCaDispatchEntry> {
+        Box::new(failguard::WasmCaDispatchEntry::pending())
     }
 
-    impl Drop for DispatchCleanup {
-        fn drop(&mut self) {
-            for number in &self.numbers {
-                failguard::ca_dispatch_remove(*number);
-            }
-            for ptr in &self.ptrs {
-                failguard::ca_dispatch_remove_compiled_ptr(*ptr);
-            }
-        }
+    fn publish_entry(
+        entry: &failguard::WasmCaDispatchEntry,
+        handle: u32,
+        compiled_ptr: u32,
+        gnf2: u32,
+    ) {
+        ca_publish(
+            entry,
+            handle,
+            compiled_ptr as u64,
+            33,
+            44,
+            55,
+            0,
+            0,
+            gnf2,
+            0,
+            0,
+            0,
+        );
     }
 
     #[test]
     fn identical_call_assembler_publication_reuses_the_runtime_snapshot() {
         let _compile_guard = failguard::lock_cpu();
-        let token_number = 9_900_000;
+        let entry = fresh_entry();
         let compiled_ptr = 1_000_022;
-        let _cleanup = DispatchCleanup {
-            numbers: vec![token_number],
-            ptrs: vec![compiled_ptr],
-        };
-        ca_dispatch_publish(token_number, 11, compiled_ptr, 33, 44, 55, 0, 0, 0, 0, 0, 0);
-        ca_dispatch_publish(token_number, 11, compiled_ptr, 33, 44, 55, 0, 0, 0, 0, 0, 0);
-
-        let table = failguard::WASM_CA_DISPATCH.lock();
-        let entry = table
-            .as_ref()
-            .and_then(|table| table.get(&token_number))
-            .expect("published dispatch entry");
+        publish_entry(&entry, 11, compiled_ptr, 0);
+        publish_entry(&entry, 11, compiled_ptr, 0);
         {
             let targets = entry.targets.lock().unwrap();
             assert_eq!(targets.len(), 1);
             assert_eq!(targets[0].has_guard_not_forced_2, 0);
         }
-        drop(table);
-        ca_dispatch_publish(token_number, 11, compiled_ptr, 33, 44, 55, 0, 0, 1, 0, 0, 0);
-        let table = failguard::WASM_CA_DISPATCH.lock();
-        let entry = table
-            .as_ref()
-            .and_then(|table| table.get(&token_number))
-            .expect("published dispatch entry");
+        publish_entry(&entry, 11, compiled_ptr, 1);
         {
             let targets = entry.targets.lock().unwrap();
             assert_eq!(targets.len(), 2);
@@ -7619,13 +7489,7 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Acquire),
             1
         );
-        drop(table);
-        ca_dispatch_publish(token_number, 11, compiled_ptr, 33, 44, 55, 0, 0, 0, 0, 0, 0);
-        let table = failguard::WASM_CA_DISPATCH.lock();
-        let entry = table
-            .as_ref()
-            .and_then(|table| table.get(&token_number))
-            .expect("published dispatch entry");
+        publish_entry(&entry, 11, compiled_ptr, 0);
         assert_eq!(
             entry
                 .has_guard_not_forced_2
@@ -7638,60 +7502,36 @@ mod tests {
     #[test]
     fn mark_gnf2_sets_the_cell_without_a_new_snapshot() {
         let _compile_guard = failguard::lock_cpu();
-        let token_number = 9_900_001;
-        let compiled_ptr = 1_000_023;
-        let _cleanup = DispatchCleanup {
-            numbers: vec![token_number],
-            ptrs: vec![compiled_ptr],
-        };
-        ca_dispatch_publish(token_number, 11, compiled_ptr, 33, 44, 55, 0, 0, 0, 0, 0, 0);
-        failguard::ca_dispatch_mark_gnf2(token_number);
-        let table = failguard::WASM_CA_DISPATCH.lock();
-        let entry = table
-            .as_ref()
-            .and_then(|table| table.get(&token_number))
-            .expect("published dispatch entry");
+        let entry = fresh_entry();
+        publish_entry(&entry, 11, 1_000_023, 0);
+        ca_mark_entry(&entry);
         assert_eq!(
             entry
                 .has_guard_not_forced_2
                 .load(std::sync::atomic::Ordering::Acquire),
             1
         );
-        {
-            let targets = entry.targets.lock().unwrap();
-            assert_eq!(targets.len(), 1);
-            assert_eq!(targets[0].has_guard_not_forced_2, 0);
-        }
+        let targets = entry.targets.lock().unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].has_guard_not_forced_2, 0);
     }
 
     #[test]
     fn mark_gnf2_raises_redirected_alias_cells() {
         let _compile_guard = failguard::lock_cpu();
-        let old_number = 9_900_030;
-        let new_number = 9_900_031;
-        let old_ptr = 1_000_024;
+        let old = fresh_entry();
+        let new = fresh_entry();
         let new_ptr = 1_000_025;
-        let _cleanup = DispatchCleanup {
-            numbers: vec![old_number, new_number],
-            ptrs: vec![old_ptr, new_ptr],
-        };
-        ca_dispatch_publish(old_number, 1, old_ptr, 33, 44, 55, 0, 0, 0, 0, 0, 0);
-        ca_dispatch_publish(new_number, 2, new_ptr, 33, 44, 55, 0, 0, 0, 0, 0, 0);
-        ca_dispatch_redirect(old_number, 2, new_ptr, 33, 44, 55, 0, 0, 0, 0, 0, 0);
-        failguard::ca_dispatch_mark_gnf2(new_number);
-
-        let table = failguard::WASM_CA_DISPATCH.lock();
-        for number in [old_number, new_number] {
-            let entry = table
-                .as_ref()
-                .and_then(|table| table.get(&number))
-                .expect("dispatch entry");
+        publish_entry(&old, 1, 1_000_024, 0);
+        publish_entry(&new, 2, new_ptr, 0);
+        publish_entry(&old, 2, new_ptr, 0);
+        mark_cells_holding(&[old.as_ref(), new.as_ref()], new_ptr);
+        for entry in [&old, &new] {
             assert_eq!(
                 entry
                     .has_guard_not_forced_2
                     .load(std::sync::atomic::Ordering::Acquire),
-                1,
-                "token {number} must see GNF2 after the replacement loop is marked"
+                1
             );
         }
     }
@@ -7699,68 +7539,44 @@ mod tests {
     #[test]
     fn mark_gnf2_raises_cells_that_retain_a_historical_target() {
         let _compile_guard = failguard::lock_cpu();
-        let alias = 9_900_040;
-        let source = 9_900_041;
+        let alias = fresh_entry();
+        let source = fresh_entry();
         let source_ptr = 1_000_026;
-        let later_ptr = 1_000_027;
-        let _cleanup = DispatchCleanup {
-            numbers: vec![alias, source],
-            ptrs: vec![source_ptr, later_ptr],
-        };
-        ca_dispatch_publish(alias, 1, source_ptr, 33, 44, 55, 0, 0, 0, 0, 0, 0);
-        ca_dispatch_publish(source, 2, source_ptr, 33, 44, 55, 0, 0, 0, 0, 0, 0);
-        // Second redirect replaces `.last()`; the S snapshot stays in
-        // `targets` for in-flight callers that already loaded it.
-        ca_dispatch_redirect(alias, 3, later_ptr, 33, 44, 55, 0, 0, 0, 0, 0, 0);
-        failguard::ca_dispatch_mark_gnf2(source);
-
-        let table = failguard::WASM_CA_DISPATCH.lock();
-        let entry = table
-            .as_ref()
-            .and_then(|table| table.get(&alias))
-            .expect("alias dispatch entry");
+        publish_entry(&alias, 1, source_ptr, 0);
+        publish_entry(&source, 2, source_ptr, 0);
+        publish_entry(&alias, 3, 1_000_027, 0);
+        mark_cells_holding(&[alias.as_ref(), source.as_ref()], source_ptr);
         {
-            let targets = entry.targets.lock().unwrap();
+            let targets = alias.targets.lock().unwrap();
             assert_eq!(targets.len(), 2);
             assert_eq!(targets[0].compiled_ptr, source_ptr);
-            assert_eq!(targets[1].compiled_ptr, later_ptr);
+            assert_eq!(targets[1].compiled_ptr, 1_000_027);
         }
         assert_eq!(
-            entry
+            alias
                 .has_guard_not_forced_2
                 .load(std::sync::atomic::Ordering::Acquire),
-            1,
-            "a cell that still retains S must rise even after a later redirect"
+            1
         );
     }
 
     #[test]
     fn publish_after_mark_raises_a_new_alias_cell() {
         let _compile_guard = failguard::lock_cpu();
-        let source = 9_900_050;
-        let alias = 9_900_051;
+        let source = fresh_entry();
+        let alias = fresh_entry();
         let compiled_ptr = 1_000_028;
-        let _cleanup = DispatchCleanup {
-            numbers: vec![source, alias],
-            ptrs: vec![compiled_ptr],
-        };
-        ca_dispatch_publish(source, 2, compiled_ptr, 33, 44, 55, 0, 0, 0, 0, 0, 0);
-        failguard::ca_dispatch_mark_gnf2(source);
-        // Redirect-shaped publish with a stale zero flag, as if the
-        // CallAssemblerTarget clone was taken before the mark.
-        ca_dispatch_publish(alias, 2, compiled_ptr, 33, 44, 55, 0, 0, 0, 0, 0, 0);
-
-        let table = failguard::WASM_CA_DISPATCH.lock();
-        let entry = table
-            .as_ref()
-            .and_then(|table| table.get(&alias))
-            .expect("alias dispatch entry");
+        publish_entry(&source, 2, compiled_ptr, 0);
+        ca_mark_entry(&source);
+        let flag = source
+            .has_guard_not_forced_2
+            .load(std::sync::atomic::Ordering::Acquire);
+        publish_entry(&alias, 2, compiled_ptr, flag);
         assert_eq!(
-            entry
+            alias
                 .has_guard_not_forced_2
                 .load(std::sync::atomic::Ordering::Acquire),
-            1,
-            "a publish after mark must raise the new alias cell"
+            1
         );
     }
 
@@ -7804,10 +7620,6 @@ mod tests {
         let mut backend = WasmBackend::new();
         let tmp = JitCellToken::new(9_900_060);
         let real = JitCellToken::new(9_900_061);
-        let _cleanup = DispatchCleanup {
-            numbers: vec![tmp.number, real.number],
-            ptrs: Vec::new(),
-        };
         compile_with_depth(&mut backend, &tmp, 1);
         compile_with_depth(&mut backend, &real, 96);
 
@@ -7816,8 +7628,8 @@ mod tests {
         let tmp_depth = tmp_clt.frame_info.lock().depth();
         let real_depth = real_clt.frame_info.lock().depth();
         assert!(tmp_depth < real_depth);
-        let tmp_target = call_assembler_target(tmp.number).expect("tmp callback metadata");
-        let real_target = call_assembler_target(real.number).expect("real loop metadata");
+        let tmp_target = target_from_token(&tmp).expect("tmp callback metadata");
+        let real_target = target_from_token(&real).expect("real loop metadata");
         assert_ne!(tmp_target.dispatch_key_ofs, real_target.dispatch_key_ofs);
 
         backend
@@ -7825,17 +7637,13 @@ mod tests {
             .expect("redirect tmp callback to deeper real loop");
         assert_eq!(tmp_clt.frame_info.lock().depth(), real_depth);
 
-        let redirected = call_assembler_target(tmp.number).expect("redirected target metadata");
-        let installed = call_assembler_target(real.number).expect("real target metadata");
+        let redirected = target_from_token(&tmp).expect("redirected target metadata");
+        let installed = target_from_token(&real).expect("real target metadata");
         assert_eq!(redirected.callee_frame_bytes, installed.callee_frame_bytes);
         assert_eq!(redirected.dispatch_key_ofs, installed.dispatch_key_ofs);
         assert_eq!(redirected.callee_gcmap_ptr, installed.callee_gcmap_ptr);
 
-        let table = failguard::WASM_CA_DISPATCH.lock();
-        let entry = table
-            .as_ref()
-            .and_then(|table| table.get(&tmp.number))
-            .expect("redirected dispatch entry");
+        let entry = ca_entry(tmp.ll_function_addr()).expect("redirected dispatch entry");
         let targets = entry.targets.lock().unwrap();
         let target = targets.last().expect("published runtime target");
         assert_eq!(target.callee_frame_bytes, installed.callee_frame_bytes);
@@ -8040,6 +7848,7 @@ mod tests {
             gc_const_keys: Vec::new(),
             fail_index_base: 0,
             bridge_cells_base: 0,
+            guard_cell_addrs: Vec::new(),
             bridge_entry_arity: None,
             bridge_param_dispatch: false,
             trace_entry_census: None,
