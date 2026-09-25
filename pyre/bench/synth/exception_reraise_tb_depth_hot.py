@@ -1,5 +1,6 @@
-# pyre-check: max-pypy-ratio=5
-# cranelift CI: ubuntu 4.2x, macos 4.4x against a 4 gate.
+# pyre-check: max-pypy-ratio=4
+# ubuntu cranelift measured 3.7x against a 3.5 gate; the check said that
+# needs 0.29x of pypy startup to be noise. Same allowance as exception_reduce.
 # A bare re-raise caught in the same frame keeps the original traceback: no
 # node is attached at a re-raise coordinate (RaiseWithExplicitTraceback,
 # attach_tb=False). The module-level loop's recording iteration runs that

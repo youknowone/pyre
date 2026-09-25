@@ -67,9 +67,11 @@ const S_IFPORT: Mode = rustpython_host_env::os::S_IFPORT as Mode;
 const S_IFPORT: Mode = 0;
 
 /// `libc` carries no `S_IFWHT`; the value is the one the Apple headers use.
-#[cfg(feature = "host_env")]
+/// host_env publishes 0o160000 only on macOS, so other Apple targets keep
+/// the previous header value.
+#[cfg(all(feature = "host_env", target_os = "macos"))]
 const S_IFWHT: Mode = rustpython_host_env::os::S_IFWHT as Mode;
-#[cfg(not(feature = "host_env"))]
+#[cfg(not(all(feature = "host_env", target_os = "macos")))]
 const S_IFWHT: Mode = if cfg!(target_vendor = "apple") {
     0o160000
 } else {
@@ -169,11 +171,17 @@ const SF_SETTABLE: std::ffi::c_long =
 
 #[cfg(all(target_os = "macos", feature = "host_env"))]
 const SF_SUPPORTED: u32 = rustpython_host_env::os::SF_SUPPORTED;
-#[cfg(all(target_vendor = "apple", not(feature = "host_env")))]
+#[cfg(all(
+    target_vendor = "apple",
+    not(all(target_os = "macos", feature = "host_env"))
+))]
 const SF_SUPPORTED: u32 = 0x009f0000;
 #[cfg(all(target_os = "macos", feature = "host_env"))]
 const SF_SYNTHETIC: u32 = rustpython_host_env::os::SF_SYNTHETIC;
-#[cfg(all(target_vendor = "apple", not(feature = "host_env")))]
+#[cfg(all(
+    target_vendor = "apple",
+    not(all(target_os = "macos", feature = "host_env"))
+))]
 const SF_SYNTHETIC: u32 = 0xc0000000;
 
 /// The `st_*` field positions of the 10-tuple form of a stat result.
