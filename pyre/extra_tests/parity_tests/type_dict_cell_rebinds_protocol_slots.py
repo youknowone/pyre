@@ -1,5 +1,5 @@
 # CPython-suite gap: no suite test rebinds `__next__`, `__iter__`, `__index__`,
-# `__getattr__` or `__getattribute__` twice and then keeps using the slot in a
+# `__getattr__`, `__getattribute__`, `__enter__` or `__exit__` twice and then keeps using the slot in a
 # loop hot enough to compile.  The second rebind is the one that matters.
 #
 # `typeobject.py W_TypeObject.setdictvalue` routes every class-namespace store
@@ -125,9 +125,43 @@ def user_getattribute():
     expect(total, 1, 7, 'stale __getattribute__')
 
 
+class Cm:
+    def __enter__(self):
+        return 1
+
+    def __exit__(self, *args):
+        return None
+
+
+Cm.__enter__ = lambda self: 1
+Cm.__exit__ = lambda self, *args: None
+
+
+def user_with():
+    obj = Cm()
+    total = 0
+    i = 0
+    while i < N:
+        with obj as v:
+            total += v
+        if i == SWITCH:
+            Cm.__enter__ = lambda self: 7
+
+            def counting_exit(self, *args):
+                global exit_calls
+                exit_calls += 1
+
+            Cm.__exit__ = counting_exit
+        i += 1
+    expect(total, 1, 7, 'stale __enter__')
+    assert exit_calls == N - SWITCH - 1, 'stale __exit__: %r' % exit_calls
+
+
+exit_calls = 0
 user_next()
 user_iter()
 user_index()
 user_getattr()
 user_getattribute()
+user_with()
 print('OK')

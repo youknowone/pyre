@@ -3167,6 +3167,42 @@ mod portal_driver_tests {
         let mut codewriter = codewriter::CodeWriter::new();
         let all = codewriter.make_jitcodes(&mut call_control, &config.transform);
         assert!(all.by_path.contains_key(&portal));
+
+        // The in-place pass fills `Handler::run` with its one registered
+        // impl and leaves `Unregistered::go` as a `CallTarget::Indirect`.
+        let stored = call_control
+            .function_graphs()
+            .get(&portal)
+            .expect("portal graph stays registered");
+        let ops: Vec<_> = stored
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+        let filled: Vec<_> = ops
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::IndirectCall {
+                    graphs, family_key, ..
+                } => Some((graphs.clone(), family_key.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            filled,
+            vec![(Some(vec![CallPath::from_segments(["A", "run"])]), None)],
+            "Handler::run must keep A::run as its only candidate"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::Indirect { trait_root, method_name },
+                    ..
+                } if trait_root == "Unregistered" && method_name == "go"
+            )),
+            "Unregistered::go must stay an unresolved indirect call"
+        );
     }
 
     #[test]
