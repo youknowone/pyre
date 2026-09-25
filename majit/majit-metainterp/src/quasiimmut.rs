@@ -50,7 +50,7 @@ pub fn set_force_quasi_immutable_hook(hook: Option<ForceQuasiImmutable>) {
 /// point of the test is that an object no loop watches pays nothing.
 pub fn do_force_quasi_immutable(
     struct_ptr: i64,
-    mutatefielddescr: &majit_translate::jitcode::BhDescr,
+    mutatefielddescr: &majit_jitcode::jitcode::BhDescr,
 ) {
     if struct_ptr == 0 {
         return;

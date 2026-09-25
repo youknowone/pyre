@@ -34,7 +34,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
-use majit_translate::jitcode::JitCode;
+use majit_jitcode::jitcode::JitCode;
 
 /// Path recorded for a `symbolic_fnaddr_for_path` / `symbolic_fnaddr_for_target`
 /// hash. The codewriter's registry lives in the build-script process; this is
@@ -416,7 +416,7 @@ pub(crate) fn runtime_fnaddr(build_fnaddr: i64) -> i64 {
 }
 
 /// High 16 bits of a deferred prebuilt-string sentinel (see
-/// [`majit_translate::assembler::STR_CONST_SENTINEL_BASE`]).  x86-64 user
+/// [`majit_jitcode::codewriter::assembler::STR_CONST_SENTINEL_BASE`]).  x86-64 user
 /// addresses occupy `0..2^48`, so a real GCREF / host-static address always
 /// has these bits clear, while every sentinel has them set to the base
 /// pattern.
@@ -482,7 +482,8 @@ pub fn materialize_str_consts(jitcodes: &mut [Arc<JitCode>]) {
             // real address (which has the high bits clear).
             assert_eq!(
                 (body.constants_r[idx].get() as u64) & SENTINEL_HIGH_MASK,
-                (majit_translate::assembler::STR_CONST_SENTINEL_BASE as u64) & SENTINEL_HIGH_MASK,
+                (majit_jitcode::codewriter::assembler::STR_CONST_SENTINEL_BASE as u64)
+                    & SENTINEL_HIGH_MASK,
                 "constants_r[{idx}] did not hold a prebuilt-string sentinel",
             );
             body.constants_r[idx] = addr.into();
@@ -543,7 +544,7 @@ pub fn materialize_unit_variant_consts(jitcodes: &mut [Arc<JitCode>]) {
             // a real address (which has the high bits clear).
             assert_eq!(
                 (body.constants_r[idx].get() as u64) & SENTINEL_HIGH_MASK,
-                (majit_translate::assembler::UNIT_VARIANT_CONST_SENTINEL_BASE as u64)
+                (majit_jitcode::codewriter::assembler::UNIT_VARIANT_CONST_SENTINEL_BASE as u64)
                     & SENTINEL_HIGH_MASK,
                 "constants_r[{idx}] did not hold a unit-variant sentinel",
             );
@@ -555,8 +556,8 @@ pub fn materialize_unit_variant_consts(jitcodes: &mut [Arc<JitCode>]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majit_translate::assembler::STR_CONST_SENTINEL_BASE;
-    use majit_translate::jitcode::{JitCode, JitCodeBody, StrConstDescriptor};
+    use majit_jitcode::codewriter::assembler::STR_CONST_SENTINEL_BASE;
+    use majit_jitcode::jitcode::{JitCode, JitCodeBody, StrConstDescriptor};
 
     fn sentinel(ordinal: i64) -> i64 {
         STR_CONST_SENTINEL_BASE | ordinal
@@ -662,14 +663,14 @@ mod tests {
     }
 
     fn unit_variant_sentinel(ordinal: i64) -> i64 {
-        majit_translate::assembler::UNIT_VARIANT_CONST_SENTINEL_BASE | ordinal
+        majit_jitcode::codewriter::assembler::UNIT_VARIANT_CONST_SENTINEL_BASE | ordinal
     }
 
     /// Mirror of [`jitcode_with_str_consts`] for the unit-variant bank: the
     /// assembler seeds `constants_r` with one sentinel per descriptor, in
     /// emit order.
     fn jitcode_with_unit_variant_consts(
-        descs: Vec<majit_translate::jitcode::UnitVariantConstDescriptor>,
+        descs: Vec<majit_jitcode::jitcode::UnitVariantConstDescriptor>,
     ) -> Arc<JitCode> {
         let len = descs
             .iter()
@@ -692,8 +693,8 @@ mod tests {
     fn unit_variant_desc(
         qualname: &str,
         tag: i64,
-    ) -> majit_translate::jitcode::UnitVariantConstDescriptor {
-        majit_translate::jitcode::UnitVariantConstDescriptor {
+    ) -> majit_jitcode::jitcode::UnitVariantConstDescriptor {
+        majit_jitcode::jitcode::UnitVariantConstDescriptor {
             constants_r_index: 0,
             qualname: qualname.to_owned(),
             tag,

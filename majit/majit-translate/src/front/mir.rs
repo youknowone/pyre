@@ -4491,25 +4491,7 @@ impl std::error::Error for LowerError {}
 // Lowering state
 // ---------------------------------------------------------------------------
 
-/// Identity carrier for the length-prefixed `Ptr(GcArray(PyObjectRef))`
-/// block — the `ItemsBlock` behind list / tuple storage and the
-/// `FixedObjectArray` behind frame locals and mro blocks, which share one
-/// tid and one runtime descr singleton (`pyobject_gcarray_descr`).
-///
-/// `descr.py get_array_descr` keys `cache[ARRAY]` on the ARRAY
-/// lltype's object identity; every lltype op carries its `concretetype`,
-/// so upstream never meets an identity-less array. The arms below reach
-/// these blocks through devirtualized accessor calls rather than a MIR
-/// `Place` projection, so there is no type to read the identity off —
-/// name it explicitly instead. Without a name `arraydescrof_concrete`
-/// returns no descr-set key, `canonicalize_keyed_descrs` drops the whole
-/// set, and the callee's `EffectInfo` degrades to `EF_RANDOM_EFFECTS`.
-///
-/// Runtime `pyobject_gcarray_descr` publishes under this same string
-/// (`cpu.arraydescrof(ARRAY)` / `descr.py get_array_descr` cache[ARRAY])
-/// so short-preamble `ArrayPtrInfo.make_guards` can resolve
-/// `PY_OBJECT_ARRAY_GC_TYPE_ID` from `path_hash` of this identity.
-pub const OBJECT_REF_GCARRAY_TYPE_ID: &str = "majit::object_ref_gcarray";
+pub use majit_jitcode::codewriter::jtransform::OBJECT_REF_GCARRAY_TYPE_ID;
 /// PyPy `BytesListStrategy` / `AsciiListStrategy` expose `SomeString`
 /// elements, while `rmodel.externalvsinternal(..., gcref=True)` stores those
 /// GC pointers in `GcArray(GCREF)`.  The logical list identity must therefore

@@ -9,7 +9,7 @@
 //! liveness encoding and before bytecode flattening at macro-expansion time.
 
 use super::*;
-use majit_translate::tool::algo::color::DependencyGraph;
+use majit_jitcode::tool::algo::color::DependencyGraph;
 use quote::{ToTokens, quote};
 use std::collections::{BTreeSet, HashMap};
 use syn::visit_mut::VisitMut;

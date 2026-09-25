@@ -183,7 +183,7 @@ impl crate::Backend for SyntheticCpu {
         _args_i: Option<&[i64]>,
         _args_r: Option<&[i64]>,
         _args_f: Option<&[i64]>,
-        _calldescr: &majit_translate::jitcode::BhCallDescr,
+        _calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> i64 {
         unimplemented!("synthetic bh_call_i dispatch awaits cross-crate wiring")
     }
@@ -194,7 +194,7 @@ impl crate::Backend for SyntheticCpu {
         _args_i: Option<&[i64]>,
         _args_r: Option<&[i64]>,
         _args_f: Option<&[i64]>,
-        _calldescr: &majit_translate::jitcode::BhCallDescr,
+        _calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
         unimplemented!("synthetic bh_call_r dispatch awaits cross-crate wiring")
     }
@@ -205,7 +205,7 @@ impl crate::Backend for SyntheticCpu {
         _args_i: Option<&[i64]>,
         _args_r: Option<&[i64]>,
         _args_f: Option<&[i64]>,
-        _calldescr: &majit_translate::jitcode::BhCallDescr,
+        _calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> f64 {
         unimplemented!("synthetic bh_call_f dispatch awaits cross-crate wiring")
     }
@@ -216,7 +216,7 @@ impl crate::Backend for SyntheticCpu {
         _args_i: Option<&[i64]>,
         _args_r: Option<&[i64]>,
         _args_f: Option<&[i64]>,
-        _calldescr: &majit_translate::jitcode::BhCallDescr,
+        _calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) {
         unimplemented!("synthetic bh_call_v dispatch awaits cross-crate wiring")
     }

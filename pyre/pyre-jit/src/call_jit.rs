@@ -1837,7 +1837,7 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
 /// exception, which the propagate path resolves through its
 /// `memory_error_singleton_ref()` fallback — a `MemoryError` where the program
 /// is owed a `RecursionError`.
-#[cfg(feature = "dynasm")]
+#[cfg(any(feature = "dynasm", feature = "cranelift"))]
 extern "C" fn jit_prologue_stack_check_slowpath(current: usize) -> u8 {
     let result = pyre_interpreter::stack_check::pyre_stack_check_slowpath_for_backend(current);
     if result != 0
@@ -1904,7 +1904,7 @@ fn materialize_str_call_for_cranelift(
     let cd = calldescr
         .as_call_descr()
         .expect("materialize_str_call: calldescr must downcast to CallDescr");
-    let bh_calldescr = majit_translate::jitcode::BhCallDescr::from_call_descr(cd);
+    let bh_calldescr = majit_jitcode::jitcode::BhCallDescr::from_call_descr(cd);
     let result = backend.bh_call_r(
         func,
         if args_i.is_empty() {

@@ -285,7 +285,7 @@ mod tests {
     fn frozen_effects_rejoin_the_opcode_field_after_serialization() {
         use majit_ir::effectinfo::{DescrMintEntry, DescrMintSpec, DescrSetKeys, DescrSetMember};
         use majit_ir::{EffectInfo, ExtraEffect, Type};
-        use majit_translate::jitcode::{BhCallDescr, BhFieldSpec, BhSizeSpec};
+        use majit_jitcode::jitcode::{BhCallDescr, BhFieldSpec, BhSizeSpec};
         let member = DescrSetMember::Field {
             struct_id: 0x475241494e454649,
             field_name: "depth".into(),
@@ -477,11 +477,11 @@ mod tests {
 
     #[test]
     fn symbolic_fnaddrs_are_resolved_before_the_table_is_published() {
-        let symbolic = majit_translate::codewriter::call::SYMBOLIC_FNADDR_BASE as i64 | 7;
+        let symbolic = majit_jitcode::codewriter::call::SYMBOLIC_FNADDR_BASE as i64 | 7;
         let runtime = 0x1234_i64;
         let callee = CanonicalJitCode::new("callee");
         callee.set_index(0);
-        callee.set_body(majit_translate::jitcode::JitCodeBody {
+        callee.set_body(majit_jitcode::jitcode::JitCodeBody {
             constants_i: vec![symbolic, 11],
             ..Default::default()
         });
@@ -513,7 +513,7 @@ mod tests {
                 let mut code = CanonicalJitCode::new("support");
                 code.fnaddr = symbolic;
                 code.set_index(0);
-                code.set_body(majit_translate::jitcode::JitCodeBody {
+                code.set_body(majit_jitcode::jitcode::JitCodeBody {
                     constants_i: vec![symbolic],
                     ..Default::default()
                 });

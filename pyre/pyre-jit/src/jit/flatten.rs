@@ -20,8 +20,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use majit_ir::Descr;
-use majit_translate::codewriter::flatten::reorder_renaming_list;
-use majit_translate::jitcode::BhDescr;
+use majit_jitcode::codewriter::flatten::reorder_renaming_list;
+use majit_jitcode::jitcode::BhDescr;
 
 use super::flow::{
     BlockRef, Constant, ConstantValue, FlowValue, LinkRef, SpaceOperation, SpaceOperationArg,
@@ -356,7 +356,7 @@ impl ListOfKind {
 /// sites and with the assembler's `indirectcalltargets` set).  pyre still
 /// stores the runtime adapter `majit_metainterp::jitcode::JitCode` here;
 /// `Arc` preserves the shared-reference semantics of the Python object
-/// reference, but the canonical codewriter `majit_translate::jitcode::JitCode`
+/// reference, but the canonical codewriter `majit_jitcode::jitcode::JitCode`
 /// has not reached this runtime path yet.
 #[derive(Debug, Clone, Default)]
 pub struct IndirectCallTargets {
@@ -3334,17 +3334,17 @@ fn flatten_descr_by_ptr(descr: &super::flow::DescrByPtr) -> Operand {
         };
         let parent = field.get_parent_descr().and_then(|parent| {
             parent.as_size_descr().map(|size| {
-                std::sync::Arc::new(majit_translate::jitcode::BhSizeSpec {
+                std::sync::Arc::new(majit_jitcode::jitcode::BhSizeSpec {
                     size: size.size(),
                     type_id: size.cache_key(),
                     vtable: size.vtable() as u64,
                     is_gc_managed: size.is_gc_managed(),
                     headerless: size.headerless(),
-                    all_fielddescrs: majit_translate::jitcode::bh_field_specs_from_size_descr(size),
+                    all_fielddescrs: majit_jitcode::jitcode::bh_field_specs_from_size_descr(size),
                 })
             })
         });
-        return Operand::descr(DescrOperand::Bh(majit_translate::jitcode::BhDescr::Field {
+        return Operand::descr(DescrOperand::Bh(majit_jitcode::jitcode::BhDescr::Field {
             offset: field.offset(),
             field_size: field.field_size(),
             field_type: field.field_type(),
@@ -6577,8 +6577,7 @@ fn fully_bound_callee_body(
     // `blackhole.py bhimpl_inline_call_*` calls `jitcode.fnaddr`.  A
     // fully-bound body with no host address aborts the frame on every
     // guard-failure resume (`reject_unresolved_inline_call`).
-    if jitcode.fnaddr == 0 || majit_translate::codewriter::call::is_symbolic_fnaddr(jitcode.fnaddr)
-    {
+    if jitcode.fnaddr == 0 || majit_jitcode::codewriter::call::is_symbolic_fnaddr(jitcode.fnaddr) {
         return None;
     }
     Some(jitcode)

@@ -8068,7 +8068,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         bh: &mut BlackholeInterpreter,
         vinfo: Option<&dyn VirtualizableInfo>,
     ) {
-        use majit_translate::liveness::LivenessIterator;
+        use majit_jitcode::liveness::LivenessIterator;
 
         let all_liveness: &[u8] = self.all_liveness;
 
@@ -8130,7 +8130,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         info: usize,
         mut cb: impl FnMut(majit_ir::Type, u32, i64),
     ) {
-        use majit_translate::liveness::LivenessIterator;
+        use majit_jitcode::liveness::LivenessIterator;
 
         // `self.all_liveness` is `&'a [u8]` — copying the reference does
         // not borrow `self`, so the inner `self.next_*` calls below are
@@ -8730,7 +8730,7 @@ pub fn read_frame_liveness_reg_indices(
     let mut int = Vec::with_capacity(all_liveness[info] as usize);
     let mut ref_ = Vec::with_capacity(all_liveness[info + 1] as usize);
     let mut float = Vec::with_capacity(all_liveness[info + 2] as usize);
-    majit_translate::codewriter::jitcode::enumerate_vars(
+    majit_jitcode::codewriter::jitcode::enumerate_vars(
         info,
         all_liveness,
         |index| int.push(index),
@@ -9007,7 +9007,7 @@ pub fn blackhole_from_resumedata<'a>(
         resumereader.consume_one_section(&mut nextbh, vinfo);
 
         // resume.py:1342
-        if nextbh.op_rvmprof_code != majit_translate::insns::BC_ABSENT {
+        if nextbh.op_rvmprof_code != majit_jitcode::insns::BC_ABSENT {
             nextbh.handle_rvmprof_enter();
         }
 

@@ -8,7 +8,7 @@
 use std::fmt;
 use std::rc::Rc;
 
-use majit_translate::config::config::{Config, ConfigError, ConfigValue, OptionValue};
+use majit_config::config::{Config, ConfigError, ConfigValue, OptionValue};
 
 /// gc.py `GcDescription`.
 #[derive(Clone)]
@@ -116,12 +116,10 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{GC_boehm, GC_incminimark, get_description};
-    use majit_translate::config::config::OptionValue;
-    use majit_translate::config::translationoption::get_combined_translation_config;
+    use majit_config::config::OptionValue;
+    use majit_config::translationoption::get_combined_translation_config;
 
-    fn translation_config_with_gc(
-        gc: &str,
-    ) -> std::rc::Rc<majit_translate::config::config::Config> {
+    fn translation_config_with_gc(gc: &str) -> std::rc::Rc<majit_config::config::Config> {
         let mut overrides = HashMap::new();
         overrides.insert(
             "translation.gc".to_string(),

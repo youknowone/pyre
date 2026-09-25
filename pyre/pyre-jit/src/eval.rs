@@ -31,6 +31,7 @@ use majit_metainterp::blackhole::ExceptionState;
 use majit_metainterp::jit_env::{env_var, env_var_os};
 use majit_metainterp::warmstate::FunctionEntryStep;
 use majit_metainterp::{CompiledExitLayout, DetailedDriverRunOutcome, JitState};
+use pyre_interpreter::importing::{ModuleGcAnchor, ModuleGcLayout};
 
 /// Host tracer registered with majit-gc so `walk_jf_roots` can reach
 /// the interior Ref slots of our libc-allocated jitframes. The
@@ -894,213 +895,12 @@ unsafe fn array_object_destructor(obj_addr: usize) {
     }
 }
 
-/// Reclaim the owned Rust heap (source string, token / error vectors, line
-/// table) of a swept tokenizer iterator, which `register_pyre_class` registers
-/// through the generic no-destructor path.
-unsafe fn tokenizer_iter_destructor(obj_addr: usize) {
-    let obj = obj_addr as pyre_object::PyObjectRef;
-    unsafe { pyre_module::module::_tokenize::w_tokenizer_iter_dealloc(obj) };
-}
-
-unsafe fn hashlib_hash_state_destructor(obj_addr: usize) {
-    unsafe {
-        pyre_module::module::_hashlib::w_hash_state_dealloc(obj_addr as pyre_object::PyObjectRef);
-    }
-}
-
-unsafe fn hashlib_hmac_destructor(obj_addr: usize) {
-    unsafe {
-        pyre_module::module::_hashlib::w_hmac_dealloc(obj_addr as pyre_object::PyObjectRef);
-    }
-}
-
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-unsafe fn ssl_context_destructor(obj_addr: usize) {
-    unsafe {
-        pyre_module::module::_ssl::w_ssl_context_dealloc(obj_addr as pyre_object::PyObjectRef)
-    };
-}
-
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-unsafe fn memory_bio_destructor(obj_addr: usize) {
-    unsafe {
-        pyre_module::module::_ssl::w_memory_bio_dealloc(obj_addr as pyre_object::PyObjectRef)
-    };
-}
-
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-unsafe fn ssl_session_destructor(obj_addr: usize) {
-    unsafe {
-        pyre_module::module::_ssl::w_ssl_session_dealloc(obj_addr as pyre_object::PyObjectRef)
-    };
-}
-
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-unsafe fn ssl_socket_destructor(obj_addr: usize) {
-    unsafe {
-        pyre_module::module::_ssl::w_ssl_socket_dealloc(obj_addr as pyre_object::PyObjectRef)
-    };
-}
-
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-unsafe fn mmap_destructor(obj_addr: usize) {
-    unsafe { pyre_module::module::mmap::w_mmap_dealloc(obj_addr as pyre_object::PyObjectRef) };
-}
-
-unsafe fn zlib_compress_destructor(obj_addr: usize) {
-    unsafe { pyre_module::module::zlib::w_compress_dealloc(obj_addr as pyre_object::PyObjectRef) };
-}
-
-unsafe fn zlib_decompress_destructor(obj_addr: usize) {
-    unsafe {
-        pyre_module::module::zlib::w_decompress_dealloc(obj_addr as pyre_object::PyObjectRef)
-    };
-}
-
-unsafe fn zlib_zdecompress_destructor(obj_addr: usize) {
-    unsafe {
-        pyre_module::module::zlib::w_zdecompress_dealloc(obj_addr as pyre_object::PyObjectRef)
-    };
-}
-
-unsafe fn bz2_compressor_destructor(obj_addr: usize) {
-    unsafe {
-        pyre_module::module::_bz2::w_bz2compressor_dealloc(obj_addr as pyre_object::PyObjectRef)
-    };
-}
-
-unsafe fn bz2_decompressor_destructor(obj_addr: usize) {
-    unsafe {
-        pyre_module::module::_bz2::w_bz2decompressor_dealloc(obj_addr as pyre_object::PyObjectRef)
-    };
-}
-
-unsafe fn lzma_compressor_destructor(obj_addr: usize) {
-    unsafe {
-        pyre_module::module::_lzma::w_lzmacompressor_dealloc(obj_addr as pyre_object::PyObjectRef)
-    };
-}
-
-unsafe fn lzma_decompressor_destructor(obj_addr: usize) {
-    unsafe {
-        pyre_module::module::_lzma::w_lzmadecompressor_dealloc(obj_addr as pyre_object::PyObjectRef)
-    };
-}
-
-unsafe fn lsprof_profiler_destructor(obj_addr: usize) {
-    unsafe {
-        pyre_module::module::_lsprof::w_profiler_dealloc(obj_addr as pyre_object::PyObjectRef)
-    };
-}
-
-unsafe fn queue_simplequeue_destructor(obj_addr: usize) {
-    unsafe {
-        pyre_module::module::_queue::w_simplequeue_dealloc(obj_addr as pyre_object::PyObjectRef)
-    };
-}
-
-/// Frees the block a `newp`-owned cdata malloc'd; a cdata that only borrows
-/// someone else's memory frees nothing.
-#[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
-unsafe fn cffi_cdata_destructor(obj_addr: usize) {
-    unsafe {
-        pyre_module::module::_cffi_backend::cdataobj::w_cdata_dealloc(
-            obj_addr as pyre_object::PyObjectRef,
-        )
-    };
-}
-
-/// `W_Library._finalize_` — closes a library nothing names any more, unless
-/// the handle was opened by someone else.
-#[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
-unsafe fn cffi_library_destructor(obj_addr: usize) {
-    unsafe {
-        pyre_module::module::_cffi_backend::libraryobj::w_library_dealloc(
-            obj_addr as pyre_object::PyObjectRef,
-        )
-    };
-}
-
-/// `FreeCtxObj.__del__` — releases an FFI object's copied parser context.
-#[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
-unsafe fn cffi_ffi_destructor(obj_addr: usize) {
-    unsafe {
-        pyre_module::module::_cffi_backend::ffi_obj::w_ffi_dealloc(
-            obj_addr as pyre_object::PyObjectRef,
-        )
-    };
-}
-
-/// `W_DlOpenLibObject._finalize_` — closes an ABI library nothing names.
-#[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
-unsafe fn cffi_lib_destructor(obj_addr: usize) {
-    unsafe {
-        pyre_module::module::_cffi_backend::lib_obj::w_lib_dealloc(
-            obj_addr as pyre_object::PyObjectRef,
-        )
-    };
-}
-
-#[cfg(all(windows, not(feature = "sandbox")))]
-unsafe fn overlapped_destructor(obj_addr: usize) {
-    unsafe {
-        pyre_module::module::_overlapped::w_overlapped_dealloc(obj_addr as pyre_object::PyObjectRef)
-    };
-}
-
-#[cfg(all(windows, not(feature = "sandbox")))]
-unsafe fn winapi_overlapped_destructor(obj_addr: usize) {
-    unsafe {
-        pyre_module::module::_winapi::overlapped::w_overlapped_dealloc(
-            obj_addr as pyre_object::PyObjectRef,
-        )
-    };
-}
-
-/// Custom trace for objects carrying the `MapdictStorageMixin` prefix
-/// (`W_ObjectObject` and native-layout Python subclasses such as
-/// `W_Random`; instance `map`+`storage`, `mapdict.py:907-910`).
-///
-/// `storage` is a GC-managed leaf block (`W_MAPDICT_STORAGE_GC_TYPE_ID`,
-/// allocated stable and non-moving by `alloc_mapdict_storage_block`), so the
-/// collector reaches its slots only through this trace:
-/// `instance_walk_boxed_storage` forwards the `storage` reference itself and
-/// then every slot in `0..capacity` in place.  It consults no map — an
-/// unboxed longlong attribute stores the erased `GC_INT_ARRAY` block
-/// (`erase_unboxed`, `mapdict.py:601/612`), which is an ordinary GC reference
-/// like every boxed slot (`mapdict.py:438/447` `erase_item`), so no slot has
-/// to be skipped.  The block itself never moves; only the slot contents are
-/// relocated.
-///
-/// `ob_header.w_class` is the instance's class reachability edge — the
-/// equivalent of PyPy reaching the class through the traced
-/// `terminator.w_cls` (`mapdict.py:751-752`, a strong `_immutable_field_`).
-/// Pyre stores the class in the inline header word
-/// (`objectobject.rs`'s `W_ObjectObject`, `typeptr` in `rclass.py`), so it
-/// must be forwarded here or an instance whose class is reachable only
-/// through it would have that class reclaimed once heap types become
-/// GC-managed.  Inert while heap types remain `malloc_typed`
-/// Box-immortal — the visitor's `is_in_nursery` / `is_managed_heap_object`
-/// guard skips the non-managed type pointer — exactly as
-/// `generator_object_custom_trace` forwards `pycode` ahead of the
-/// code-object migration.
-unsafe fn mapdict_storage_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
-    let obj = obj_addr as pyre_object::PyObjectRef;
-    f(unsafe { std::ptr::addr_of_mut!((*obj).w_class) } as *mut majit_ir::GcRef);
-    pyre_interpreter::objspace::std::mapdict::instance_walk_boxed_storage(
-        obj,
-        &mut |slot: *mut pyre_object::PyObjectRef| {
-            f(slot as *mut majit_ir::GcRef);
-        },
-    );
-}
-
 unsafe fn object_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
-    unsafe { mapdict_storage_custom_trace(obj_addr, f) };
+    unsafe { pyre_interpreter::objspace::std::mapdict::mapdict_storage_custom_trace(obj_addr, f) };
 }
 
 unsafe fn int_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
-    unsafe { mapdict_storage_custom_trace(obj_addr, f) };
+    unsafe { pyre_interpreter::objspace::std::mapdict::mapdict_storage_custom_trace(obj_addr, f) };
 }
 
 /// Custom trace for `_random.Random`.  It carries the mapdict prefix like any
@@ -1113,66 +913,6 @@ unsafe fn random_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maj
     unsafe { object_object_custom_trace(obj_addr, f) };
     let inst = unsafe { &mut *(obj_addr as *mut pyre_interpreter::module::_random::W_Random) };
     f(std::ptr::addr_of_mut!(inst.rnd) as *mut majit_ir::GcRef);
-}
-
-/// `_ssl._SSLContext` has the native-layout mapdict prefix plus the three
-/// Python callback/path references owned by the context wrapper.
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-unsafe fn ssl_context_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
-    unsafe { object_object_custom_trace(obj_addr, f) };
-    let context = unsafe { &mut *(obj_addr as *mut pyre_module::module::_ssl::W_SSLContext) };
-    f(std::ptr::addr_of_mut!(context.sni_callback) as *mut majit_ir::GcRef);
-    f(std::ptr::addr_of_mut!(context.msg_callback) as *mut majit_ir::GcRef);
-    f(std::ptr::addr_of_mut!(context.keylog_filename) as *mut majit_ir::GcRef);
-}
-
-/// `ssl.MemoryBIO` is subclassable and therefore carries mapdict storage even
-/// though its rustls transport state contains no Python references.
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-unsafe fn memory_bio_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
-    unsafe { object_object_custom_trace(obj_addr, f) };
-}
-
-/// `mmap.mmap` is subclassable and carries the same mapdict prefix; its
-/// mapping/fd payload contains no Python references.
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-unsafe fn mmap_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
-    unsafe { object_object_custom_trace(obj_addr, f) };
-}
-
-/// PyPy's zlib stream TypeDefs are acceptable base classes.  Their native
-/// payloads contain no Python references, but Python subclasses use the normal
-/// mapdict prefix and therefore require the same custom trace as W_MMap.
-unsafe fn zlib_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
-    unsafe { object_object_custom_trace(obj_addr, f) };
-}
-
-/// `_lsprof.Profiler` owns the PyPy `ProfilerEntry` / `ProfilerContext`
-/// bookkeeping in Rust vectors, so its Python references are not visible as
-/// inline payload offsets.
-unsafe fn lsprof_profiler_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
-    unsafe { object_object_custom_trace(obj_addr, f) };
-    unsafe { pyre_module::module::_lsprof::w_profiler_custom_trace(obj_addr, f) };
-}
-
-/// `_queue.SimpleQueue` is subclassable and owns a FIFO of Python objects.
-unsafe fn queue_simplequeue_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
-    unsafe { object_object_custom_trace(obj_addr, f) };
-    unsafe { pyre_module::module::_queue::w_simplequeue_custom_trace(obj_addr, f) };
-}
-
-/// `_ssl._SSLSocket` owns its context, transport endpoints, public owner,
-/// and hostname directly on the typed object.
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-unsafe fn ssl_socket_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
-    let socket = unsafe { &mut *(obj_addr as *mut pyre_module::module::_ssl::W_SSLSocket) };
-    f(std::ptr::addr_of_mut!(socket.ob.w_class) as *mut majit_ir::GcRef);
-    f(std::ptr::addr_of_mut!(socket.context) as *mut majit_ir::GcRef);
-    f(std::ptr::addr_of_mut!(socket.socket) as *mut majit_ir::GcRef);
-    f(std::ptr::addr_of_mut!(socket.incoming) as *mut majit_ir::GcRef);
-    f(std::ptr::addr_of_mut!(socket.outgoing) as *mut majit_ir::GcRef);
-    f(std::ptr::addr_of_mut!(socket.owner) as *mut majit_ir::GcRef);
-    f(std::ptr::addr_of_mut!(socket.server_hostname) as *mut majit_ir::GcRef);
 }
 
 /// Custom trace for `W_ModuleDictObject`
@@ -1955,9 +1695,11 @@ fn register_traced_storage_box<T: 'static>(
 /// Build and configure the MiniMarkGC with all type registrations,
 /// vtable mappings, and subclass ranges.
 fn build_gc() -> Box<MiniMarkGC> {
-    // Optional-module rclass aliases must be in the census before the
-    // vtable assertion below.  Launchers also call `register`; this is
-    // the backstop for unit tests and late `driver_pair` entry.
+    // The launcher installs the optional-module hooks (rclass aliases, module
+    // GC types) with `pyre_module::register` before any collector is built.
+    // Unit tests have no launcher and link the modules only as a
+    // dev-dependency, so they install the hooks here.
+    #[cfg(test)]
     pyre_module::register();
     // translationoption.py `taggedpointers` — kept in lockstep with the
     // pyre-object representation switch so the collector-core immediate
@@ -2221,6 +1963,54 @@ fn build_gc() -> Box<MiniMarkGC> {
          pytype_to_tid: &mut HashMap<usize, u32>,
          descr: &'static pyre_object::lltype::PyreClassDescriptor|
          -> u32 { register_pyre_class_with_pressure(gc, pytype_to_tid, descr, None) };
+    // The GC types `pyre-module` owns, each declaring its own layout and sweep
+    // destructor; `build_gc` only fixes where in the id order they register.
+    // Missing hooks would shift every later type id away from the ids
+    // `SUBCLASS_RANGE_HIERARCHY` hardcodes, so fail here instead.
+    let module_hooks = pyre_interpreter::importing::optional_module_hooks()
+        .expect("pyre_module::register must run before the collector is built");
+    let module_gc_types = (module_hooks.gc_types)();
+    let module_immortal_w_class_only_descriptors =
+        (module_hooks.immortal_w_class_only_descriptors)();
+    let register_module_gc_types = |gc: &mut MiniMarkGC,
+                                    pytype_to_tid: &mut HashMap<usize, u32>,
+                                    anchor: ModuleGcAnchor| {
+        for ty in module_gc_types.iter().filter(|ty| ty.anchor == anchor) {
+            let descr = ty.descriptor;
+            let type_info = match ty.layout {
+                ModuleGcLayout::PyreClass {
+                    memory_pressure_offset,
+                } => {
+                    let tid = register_pyre_class_with_pressure(
+                        gc,
+                        pytype_to_tid,
+                        descr,
+                        memory_pressure_offset,
+                    );
+                    if let Some(destructor) = ty.destructor {
+                        gc.types.set_destructor(tid, destructor);
+                    }
+                    continue;
+                }
+                ModuleGcLayout::Object => TypeInfo::object_subclass(descr.object_size, object_tid),
+                ModuleGcLayout::CustomTrace(trace) => TypeInfo::object_subclass_with_custom_trace(
+                    descr.object_size,
+                    object_tid,
+                    trace,
+                ),
+            };
+            let type_info = match ty.destructor {
+                Some(destructor) => type_info.with_destructor_fn(destructor),
+                None => type_info,
+            };
+            let tid = gc.register_type(type_info);
+            descr.gc_type_id.set(tid);
+            let pytype_ptr = descr.pytype_ptr as usize;
+            majit_gc::GcAllocator::register_vtable_for_type(gc, pytype_ptr, tid);
+            pytype_to_tid.insert(pytype_ptr, tid);
+            pyre_object::gc_hook::register_pyre_class_offsets(pytype_ptr, descr.ptr_offsets);
+        }
+    };
     majit_gc::GcAllocator::register_vtable_for_type(
         &mut gc,
         &pyre_object::pyobject::INSTANCE_TYPE as *const _ as usize,
@@ -3863,18 +3653,12 @@ fn build_gc() -> Box<MiniMarkGC> {
         <pyre_interpreter::module::_collections::W_DequeRevIter
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
-    let tokenizer_iter_tid = register_pyre_class(
+    // `_tokenize`'s iterator owns Rust heap its sweep destructor frees.
+    register_module_gc_types(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_module::module::_tokenize::W_TokenizerIter
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        ModuleGcAnchor::AfterDequeRevIter,
     );
-    // W_TokenizerIter owns Rust heap (source string, token / error vectors, the
-    // line table); as an immortal it was never swept, but now that it is
-    // GC-managed the marker reclaims dead instances, so attach a destructor to
-    // run its Drop glue and free that heap instead of leaking it.
-    gc.types
-        .set_destructor(tokenizer_iter_tid, tokenizer_iter_destructor);
     // Python 3.14 FrameLocalsProxy — its sole managed edge owns the live
     // PyFrame whose fast locals it exposes.  Keep the proxy in the ordinary
     // AUTO-ID class chain so the generated offset walker forwards that frame
@@ -4054,33 +3838,22 @@ fn build_gc() -> Box<MiniMarkGC> {
     // registry learns the edge.
     for descriptor in pyre_interpreter::all_immortal_w_class_only_descriptors()
         .into_iter()
-        .chain(pyre_module::all_immortal_w_class_only_descriptors())
+        .chain(module_immortal_w_class_only_descriptors)
     {
         pyre_object::gc_hook::register_pyre_class_offsets(
             descriptor.pytype_ptr as usize,
             descriptor.ptr_offsets,
         );
     }
-    // `_functools.keyobject`: the comparator and wrapped object are both
-    // managed edges.  Keep this AUTO-ID payload at the absolute tail so adding
-    // the accelerator type does not renumber any established GC id.
-    register_pyre_class(
+    // `_functools.keyobject` and `unicodedata.UCD`, appended so no
+    // established AUTO-ID moves.
+    register_module_gc_types(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_module::module::_functools::W_KeyWrapper
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        ModuleGcAnchor::AfterWClassOnlyTypes,
     );
-    // `unicodedata.UCD` and `__pypy__.Bufferable`: `allocate_stable` types with
-    // no inline object payload, so the header `w_class` — which a Python
-    // subclass instance points at a managed heap type — is the only edge their
-    // marker forwards.  Appended after the accelerator so no established
-    // AUTO-ID moves.
-    register_pyre_class(
-        &mut gc,
-        &mut pytype_to_tid,
-        <pyre_module::module::unicodedata::W_UCD
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-    );
+    // `__pypy__.Bufferable`: an `allocate_stable` type with no inline object
+    // payload, so the header `w_class` is the only edge its marker forwards.
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
@@ -4119,41 +3892,8 @@ fn build_gc() -> Box<MiniMarkGC> {
         <pyre_interpreter::module::_io::W_StringIO
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
-    // `_json.Scanner` keeps the `make_scanner` protocol callbacks and memo in
-    // traced payload fields beside its native recursion counter.
-    register_pyre_class(
-        &mut gc,
-        &mut pytype_to_tid,
-        <pyre_module::module::_json::W_Scanner
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-    );
-    // `_json.Encoder` keeps the `make_encoder` arguments in traced payload
-    // fields beside its native fast-mode and recursion state.
-    register_pyre_class(
-        &mut gc,
-        &mut pytype_to_tid,
-        <pyre_module::module::_json::W_Encoder
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-    );
-    // CPython's EVPobject and HMACobject own their native contexts.  Pyre's
-    // fixed-size opaque contexts live inline on the equivalent managed owner;
-    // attach drop glue so sweeping the owner releases the RustCrypto state.
-    let hashlib_hash_state_tid = register_pyre_class(
-        &mut gc,
-        &mut pytype_to_tid,
-        <pyre_module::module::_hashlib::W_HashState
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-    );
-    gc.types
-        .set_destructor(hashlib_hash_state_tid, hashlib_hash_state_destructor);
-    let hashlib_hmac_tid = register_pyre_class(
-        &mut gc,
-        &mut pytype_to_tid,
-        <pyre_module::module::_hashlib::W_Hmac
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-    );
-    gc.types
-        .set_destructor(hashlib_hmac_tid, hashlib_hmac_destructor);
+    // `_json`'s scanner and encoder, then `_hashlib`'s native-state owners.
+    register_module_gc_types(&mut gc, &mut pytype_to_tid, ModuleGcAnchor::AfterStringIO);
     // `pypy/module/gc/referents.py W_GcRef`: the wrapper's raw gcref
     // field is a normal traced edge so an internal object stays live and is
     // forwarded in place.  Register it before the target-gated DirEntry slot;
@@ -4182,154 +3922,10 @@ fn build_gc() -> Box<MiniMarkGC> {
         <pyre_interpreter::module::gc::stats::W_GcStats
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
-    // `interp_zlib.py` stores each rzlib stream and its lock directly on the
-    // corresponding W_Root owner.  Register these unconditional native owners
-    // before target-gated DirEntry/SSL/mmap so their ids agree on wasm/native.
-    for (descr, destructor) in [
-        (
-            <pyre_module::module::zlib::W_Compress
-                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-            zlib_compress_destructor as majit_gc::trace::DestructorFn,
-        ),
-        (
-            <pyre_module::module::zlib::W_Decompress
-                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-            zlib_decompress_destructor as majit_gc::trace::DestructorFn,
-        ),
-        (
-            <pyre_module::module::zlib::W_ZlibDecompressor
-                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-            zlib_zdecompress_destructor as majit_gc::trace::DestructorFn,
-        ),
-    ] {
-        let tid = gc.register_type(
-            TypeInfo::object_subclass_with_custom_trace(
-                descr.object_size,
-                object_tid,
-                zlib_object_custom_trace,
-            )
-            .with_destructor_fn(destructor),
-        );
-        descr.gc_type_id.set(tid);
-        majit_gc::GcAllocator::register_vtable_for_type(
-            &mut gc,
-            descr.pytype_ptr as usize,
-            tid,
-        );
-        pytype_to_tid.insert(descr.pytype_ptr as usize, tid);
-        pyre_object::gc_hook::register_pyre_class_offsets(
-            descr.pytype_ptr as usize,
-            descr.ptr_offsets,
-        );
-    }
-    // `interp_bz2.py` likewise keeps each libbz2 stream and its lock on the
-    // W_Root owner, and `_lzma`'s two stream objects own their liblzma coder
-    // the same way.  None of the four is subclassable, so they carry no
-    // mapdict prefix and no inline GC edge beyond the header's `w_class`; the
-    // sweep destructor releases the native stream.  Unconditional, and placed
-    // with the zlib owners so their ids agree on wasm/native.
-    for (descr, destructor) in [
-        (
-            <pyre_module::module::_bz2::W_BZ2Compressor
-                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-            bz2_compressor_destructor as majit_gc::trace::DestructorFn,
-        ),
-        (
-            <pyre_module::module::_bz2::W_BZ2Decompressor
-                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-            bz2_decompressor_destructor as majit_gc::trace::DestructorFn,
-        ),
-        (
-            <pyre_module::module::_lzma::W_LZMACompressor
-                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-            lzma_compressor_destructor as majit_gc::trace::DestructorFn,
-        ),
-        (
-            <pyre_module::module::_lzma::W_LZMADecompressor
-                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-            lzma_decompressor_destructor as majit_gc::trace::DestructorFn,
-        ),
-    ] {
-        let tid = gc.register_type(
-            TypeInfo::object_subclass(descr.object_size, object_tid)
-                .with_destructor_fn(destructor),
-        );
-        descr.gc_type_id.set(tid);
-        majit_gc::GcAllocator::register_vtable_for_type(
-            &mut gc,
-            descr.pytype_ptr as usize,
-            tid,
-        );
-        pytype_to_tid.insert(descr.pytype_ptr as usize, tid);
-        pyre_object::gc_hook::register_pyre_class_offsets(
-            descr.pytype_ptr as usize,
-            descr.ptr_offsets,
-        );
-    }
-    // `interp_lsprof.py` keeps the profiler's entry trees on the W_Root owner,
-    // behind Rust vectors no inline offset can name, so it needs a marker; it is
-    // also `cProfile.Profile`'s base class, hence the mapdict prefix walk.  The
-    // two stats result objects hold their code and call-list references in
-    // inline fields and are not instantiable, so they register like any other
-    // rclass owner.
-    let profiler_descr = <pyre_module::module::_lsprof::W_Profiler
-        as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
-    let profiler_tid = gc.register_type(
-        TypeInfo::object_subclass_with_custom_trace(
-            profiler_descr.object_size,
-            object_tid,
-            lsprof_profiler_custom_trace,
-        )
-        .with_destructor_fn(lsprof_profiler_destructor),
-    );
-    profiler_descr.gc_type_id.set(profiler_tid);
-    majit_gc::GcAllocator::register_vtable_for_type(
-        &mut gc,
-        profiler_descr.pytype_ptr as usize,
-        profiler_tid,
-    );
-    pytype_to_tid.insert(profiler_descr.pytype_ptr as usize, profiler_tid);
-    pyre_object::gc_hook::register_pyre_class_offsets(
-        profiler_descr.pytype_ptr as usize,
-        profiler_descr.ptr_offsets,
-    );
-
-    register_pyre_class(
-        &mut gc,
-        &mut pytype_to_tid,
-        <pyre_module::module::_lsprof::W_StatsEntry
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-    );
-    register_pyre_class(
-        &mut gc,
-        &mut pytype_to_tid,
-        <pyre_module::module::_lsprof::W_StatsSubEntry
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-    );
-
-    // `_queue.SimpleQueue` is unconditional, so it registers ahead of the
-    // target-gated `posix` rclasses below and keeps one id on every target.
-    let simplequeue_descr = <pyre_module::module::_queue::W_SimpleQueue
-        as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
-    let simplequeue_tid = gc.register_type(
-        TypeInfo::object_subclass_with_custom_trace(
-            simplequeue_descr.object_size,
-            object_tid,
-            queue_simplequeue_custom_trace,
-        )
-        .with_destructor_fn(queue_simplequeue_destructor),
-    );
-    simplequeue_descr.gc_type_id.set(simplequeue_tid);
-    majit_gc::GcAllocator::register_vtable_for_type(
-        &mut gc,
-        simplequeue_descr.pytype_ptr as usize,
-        simplequeue_tid,
-    );
-    pytype_to_tid.insert(simplequeue_descr.pytype_ptr as usize, simplequeue_tid);
-    pyre_object::gc_hook::register_pyre_class_offsets(
-        simplequeue_descr.pytype_ptr as usize,
-        simplequeue_descr.ptr_offsets,
-    );
+    // The unconditional native owners of `zlib`, `_bz2`, `_lzma`, `_lsprof`
+    // and `_queue`, ahead of the target-gated tail so their ids agree on
+    // wasm and native.
+    register_module_gc_types(&mut gc, &mut pytype_to_tid, ModuleGcAnchor::AfterGcStats);
 
     // `_PyLineIterator` / `_PyPositionsIterator` / `_PyBranchesIterator` —
     // each holds the code object its suspended walk reads.  All three are
@@ -4421,152 +4017,14 @@ fn build_gc() -> Box<MiniMarkGC> {
         <pyre_interpreter::module::posix::W_ScandirIterator
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
-    // `_ssl` keeps rustls objects behind opaque native pointers.  Context and
-    // MemoryBIO are subclassable native layouts, so their marker walks the
-    // mapdict prefix; Context additionally owns Python callbacks/path values.
-    // Their sweep destructors release the opaque rustls allocations.
-    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-    {
-        let context_descr = <pyre_module::module::_ssl::W_SSLContext
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
-        let context_tid = gc.register_type(
-            TypeInfo::object_subclass_with_custom_trace(
-                context_descr.object_size,
-                object_tid,
-                ssl_context_custom_trace,
-            )
-            .with_destructor_fn(ssl_context_destructor),
-        );
-        context_descr.gc_type_id.set(context_tid);
-        majit_gc::GcAllocator::register_vtable_for_type(
-            &mut gc,
-            context_descr.pytype_ptr as usize,
-            context_tid,
-        );
-        pytype_to_tid.insert(context_descr.pytype_ptr as usize, context_tid);
-        pyre_object::gc_hook::register_pyre_class_offsets(
-            context_descr.pytype_ptr as usize,
-            context_descr.ptr_offsets,
-        );
+    // The target-gated module owners: `_ssl`, `mmap`, and the two Windows
+    // `Overlapped` records.
+    register_module_gc_types(
+        &mut gc,
+        &mut pytype_to_tid,
+        ModuleGcAnchor::AfterScandirIterator,
+    );
 
-        let bio_descr = <pyre_module::module::_ssl::W_MemoryBIO
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
-        let bio_tid = gc.register_type(
-            TypeInfo::object_subclass_with_custom_trace(
-                bio_descr.object_size,
-                object_tid,
-                memory_bio_custom_trace,
-            )
-            .with_destructor_fn(memory_bio_destructor),
-        );
-        bio_descr.gc_type_id.set(bio_tid);
-        majit_gc::GcAllocator::register_vtable_for_type(
-            &mut gc,
-            bio_descr.pytype_ptr as usize,
-            bio_tid,
-        );
-        pytype_to_tid.insert(bio_descr.pytype_ptr as usize, bio_tid);
-        pyre_object::gc_hook::register_pyre_class_offsets(
-            bio_descr.pytype_ptr as usize,
-            bio_descr.ptr_offsets,
-        );
-
-        let session_descr = <pyre_module::module::_ssl::W_SSLSession
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
-        let session_tid = gc.register_type(
-            TypeInfo::object_subclass(session_descr.object_size, object_tid)
-                .with_destructor_fn(ssl_session_destructor),
-        );
-        session_descr.gc_type_id.set(session_tid);
-        majit_gc::GcAllocator::register_vtable_for_type(
-            &mut gc,
-            session_descr.pytype_ptr as usize,
-            session_tid,
-        );
-        pytype_to_tid.insert(session_descr.pytype_ptr as usize, session_tid);
-        pyre_object::gc_hook::register_pyre_class_offsets(
-            session_descr.pytype_ptr as usize,
-            session_descr.ptr_offsets,
-        );
-
-        let socket_descr = <pyre_module::module::_ssl::W_SSLSocket
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
-        let socket_tid = gc.register_type(
-            TypeInfo::object_subclass_with_custom_trace(
-                socket_descr.object_size,
-                object_tid,
-                ssl_socket_custom_trace,
-            )
-            .with_destructor_fn(ssl_socket_destructor),
-        );
-        socket_descr.gc_type_id.set(socket_tid);
-        majit_gc::GcAllocator::register_vtable_for_type(
-            &mut gc,
-            socket_descr.pytype_ptr as usize,
-            socket_tid,
-        );
-        pytype_to_tid.insert(socket_descr.pytype_ptr as usize, socket_tid);
-        pyre_object::gc_hook::register_pyre_class_offsets(
-            socket_descr.pytype_ptr as usize,
-            socket_descr.ptr_offsets,
-        );
-
-        register_pyre_class(
-            &mut gc,
-            &mut pytype_to_tid,
-            <pyre_module::module::_ssl::W_Certificate
-                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-        );
-    }
-    // PyPy's W_MMap directly owns rmmap.MMap.  The typed wrapper carries the
-    // subclass mapdict prefix and a sweep destructor for the native mapping
-    // and duplicated fd.
-    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-    {
-        let mmap_descr = <pyre_module::module::mmap::W_MMap
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
-        let mmap_tid = gc.register_type(
-            TypeInfo::object_subclass_with_custom_trace(
-                mmap_descr.object_size,
-                object_tid,
-                mmap_custom_trace,
-            )
-            .with_destructor_fn(mmap_destructor),
-        );
-        mmap_descr.gc_type_id.set(mmap_tid);
-        majit_gc::GcAllocator::register_vtable_for_type(
-            &mut gc,
-            mmap_descr.pytype_ptr as usize,
-            mmap_tid,
-        );
-        pytype_to_tid.insert(mmap_descr.pytype_ptr as usize, mmap_tid);
-        pyre_object::gc_hook::register_pyre_class_offsets(
-            mmap_descr.pytype_ptr as usize,
-            mmap_descr.ptr_offsets,
-        );
-    }
-    // `lib_pypy/_overlapped.py Overlapped`: the object owns its native
-    // OVERLAPPED record and pending buffers until cancellation/completion.
-    // Its three Python fields are ordinary generated trace offsets; sweep
-    // performs PyPy's cancel/wait-before-free ordering and closes hEvent.
-    #[cfg(all(windows, not(feature = "sandbox")))]
-    {
-        let descr = <pyre_module::module::_overlapped::W_Overlapped
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
-        let tid = register_pyre_class(&mut gc, &mut pytype_to_tid, descr);
-        gc.types.set_destructor(tid, overlapped_destructor);
-    }
-    // `_winapi.Overlapped` owns the same kind of native record, waited on
-    // through its own event rather than a completion port. Sweep cancels and
-    // waits out an operation still in flight before the buffer it writes into
-    // is freed, then closes that event.
-    #[cfg(all(windows, not(feature = "sandbox")))]
-    {
-        let descr = <pyre_module::module::_winapi::overlapped::W_Overlapped
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
-        let tid = register_pyre_class(&mut gc, &mut pytype_to_tid, descr);
-        gc.types.set_destructor(tid, winapi_overlapped_destructor);
-    }
     // `_io._WindowsConsoleIO` is a PEP 528 raw stream: its own fields are the
     // descriptor, the three mode flags and the carry buffer, but the type
     // accepts subclasses and carries a dict, so the header prefix its marker
@@ -4583,90 +4041,13 @@ fn build_gc() -> Box<MiniMarkGC> {
         <pyre_interpreter::module::_io::W_WindowsConsoleIO
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
-    // `_cffi_backend` is absent on wasm32 and under `sandbox`, so its thirteen
-    // object types register at the end of the rclass census where the sandbox
-    // hierarchy filter can remove one contiguous trailing slice.  A ctype,
-    // the array iterator, struct field, allocator, MiniBuffer and offset
-    // carrier hold ordinary traced fields; a cdata additionally owns the block
-    // that `newp` malloc'd for it and a library owns its loader handle, which
-    // their sweep destructors release.
-    #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
-    {
-        for descriptor in [
-            <pyre_module::module::_cffi_backend::ctypeobj::W_CType
-                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-            <pyre_module::module::_cffi_backend::ctypearray::W_CDataIter
-                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-        ] {
-            register_pyre_class(&mut gc, &mut pytype_to_tid, descriptor);
-        }
-        {
-            let descr = <pyre_module::module::_cffi_backend::cdataobj::W_CData
-                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
-            let tid = register_pyre_class_with_pressure(
-                &mut gc,
-                &mut pytype_to_tid,
-                descr,
-                Some(std::mem::offset_of!(
-                    pyre_module::module::_cffi_backend::cdataobj::W_CData,
-                    special_memory_pressure
-                )),
-            );
-            gc.types.set_destructor(tid, cffi_cdata_destructor);
-        }
-        register_pyre_class(
-            &mut gc,
-            &mut pytype_to_tid,
-            <pyre_module::module::_cffi_backend::ctypestruct::W_CField
-                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-        );
-        {
-            let descr = <pyre_module::module::_cffi_backend::libraryobj::W_Library
-                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
-            let tid = register_pyre_class(&mut gc, &mut pytype_to_tid, descr);
-            gc.types.set_destructor(tid, cffi_library_destructor);
-        }
-        for descriptor in [
-            <pyre_module::module::_cffi_backend::allocator::W_Allocator
-                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-            <pyre_module::module::_cffi_backend::cbuffer::MiniBuffer
-                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-        ] {
-            register_pyre_class(&mut gc, &mut pytype_to_tid, descriptor);
-        }
-        register_pyre_class(
-            &mut gc,
-            &mut pytype_to_tid,
-            <pyre_module::module::_cffi_backend::func::OffsetInBytes
-                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-        );
-        {
-            let descr = <pyre_module::module::_cffi_backend::ffi_obj::W_FFIObject
-                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
-            let tid = register_pyre_class(&mut gc, &mut pytype_to_tid, descr);
-            gc.types.set_destructor(tid, cffi_ffi_destructor);
-        }
-        register_pyre_class(
-            &mut gc,
-            &mut pytype_to_tid,
-            <pyre_module::module::_cffi_backend::realize_c_type::W_RawFuncType
-                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-        );
-        {
-            let descr = <pyre_module::module::_cffi_backend::lib_obj::W_LibObject
-                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
-            let tid = register_pyre_class(&mut gc, &mut pytype_to_tid, descr);
-            gc.types.set_destructor(tid, cffi_lib_destructor);
-        }
-        for descriptor in [
-            <pyre_module::module::_cffi_backend::cglob::W_GlobSupport
-                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-            <pyre_module::module::_cffi_backend::wrapper::W_FunctionWrapper
-                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-        ] {
-            register_pyre_class(&mut gc, &mut pytype_to_tid, descriptor);
-        }
-    }
+    // `_cffi_backend`'s object types, at the end of the rclass census where
+    // the sandbox hierarchy filter can remove one contiguous trailing slice.
+    register_module_gc_types(
+        &mut gc,
+        &mut pytype_to_tid,
+        ModuleGcAnchor::AfterWindowsConsoleIO,
+    );
     // `rrandom.Random` — the Mersenne Twister `interp_random.py` allocates
     // beside its holder. Like W_DequeBlock it is GC-managed without being an
     // rclass.OBJECT subclass and has no Python-visible vtable, so it takes a
@@ -5538,11 +4919,6 @@ fn install_pyre_object_hooks() {
 /// `gc_sync::is_initialized()` + `gc_sync::store_singleton()` ensures
 /// exactly one GC is created even under cargo test's parallel threads.
 fn build_gc_global() {
-    // `build_gc` always registers the optional-module types this crate
-    // names.  Their rclass aliases live behind `pyre_module::register`;
-    // install them before the census assertion, including on paths that
-    // reach the collector without going through a launcher.
-    pyre_module::register();
     // `is_initialized()` is a plain check-then-act, so on a fresh process
     // every thread that reaches here before the first `store_singleton`
     // observes the flag unset and would each run `build_gc()`.  `build_gc`
@@ -5883,14 +5259,6 @@ fn build_jit_driver_pair() -> JitDriverPair {
             majit_backend_wasm::codegen::ResidualCallAbi::Vouched,
         );
         let mut faithful = vec![
-            // (f64) -> i64
-            pyre_module::module::math::interp_math::jit_math_frexp_exponent as *const () as usize
-                as i64,
-            // (f64, i64) -> f64
-            pyre_module::module::math::interp_math::jit_math_ldexp_raw as *const () as usize as i64,
-            // (f64, f64) -> i64
-            pyre_module::module::math::interp_math::jit_math_isclose_default as *const () as usize
-                as i64,
             // (i64, i64) -> f64
             pyre_interpreter::objspace::descroperation::jit_w_long_truediv_raw as *const () as usize
                 as i64,
@@ -5910,7 +5278,9 @@ fn build_jit_driver_pair() -> JitDriverPair {
         ];
         // (i64) -> f64, one per float-result builtin fold.
         faithful.extend(pyre_interpreter::jit_builtin_folds::float_fold_helper_addrs());
-        faithful.extend(pyre_module::module::math::interp_math::math_float_fold_helper_addrs());
+        if let Some(hooks) = pyre_interpreter::importing::optional_module_hooks() {
+            faithful.extend((hooks.math_faithful_residual_call_addrs)());
+        }
         faithful.extend(pyre_jit_trace::walker_float_helper_addrs());
         majit_backend_wasm::set_faithful_residual_call_addrs(&faithful);
         for addr in pyre_interpreter::jit_builtin_folds::word_fold_helper_addrs() {
@@ -5943,7 +5313,6 @@ fn build_jit_driver_pair() -> JitDriverPair {
             majit_backend_wasm::vouch_residual_call_addr(addr);
         }
         use pyre_interpreter::objspace::descroperation as desc;
-        use pyre_module::module::math::interp_math as math;
         use pyre_object::floatobject as flt;
         use pyre_object::intobject as intobj;
         use pyre_object::listobject as list;
@@ -5986,7 +5355,6 @@ fn build_jit_driver_pair() -> JitDriverPair {
             desc::jit_w_long_mod_raw as *const () as usize as i64,
             desc::jit_w_long_lshift_raw as *const () as usize as i64,
             desc::jit_w_long_rshift_raw as *const () as usize as i64,
-            math::jit_math_isqrt_i64 as *const () as usize as i64,
             long::jit_bigint_fits_int as *const () as usize as i64,
             long::jit_bigint_cmp as *const () as usize as i64,
             long::jit_bigint_from_i64 as *const () as usize as i64,
@@ -6070,6 +5438,11 @@ fn build_jit_driver_pair() -> JitDriverPair {
             pyre_interpreter::jit_build_list_4 as *const () as usize as i64,
         ] {
             majit_backend_wasm::vouch_residual_call_addr_returning_word(addr);
+        }
+        if let Some(hooks) = pyre_interpreter::importing::optional_module_hooks() {
+            for addr in (hooks.math_word_residual_call_addrs)() {
+                majit_backend_wasm::vouch_residual_call_addr_returning_word(addr);
+            }
         }
     }
     pyre_interpreter::executioncontext::register_force_frame_hook(force_pyframe);
@@ -10893,6 +10266,111 @@ fn handle_fail(
     HandleFailOutcome::ResumeInBlackhole
 }
 
+/// Flattened `handle_fail` result after blackhole resume, shared by the
+/// three compiled-run doors.
+enum HandleFailDispatch {
+    ContinueRunningNormally,
+    Done(PyResult),
+    Fallthrough,
+}
+
+/// compile.py `handle_fail` never returns: a compiled bridge raises
+/// ContinueRunningNormally / DoneWithThisFrame, otherwise
+/// resume_in_blackhole raises. This is that single flow.
+///
+/// `continue_on_compiled`: the loop doors map a compiled bridge and a
+/// blackhole ContinueRunningNormally to [`HandleFailDispatch::ContinueRunningNormally`];
+/// the function-entry door falls through to eval_loop_jit.
+/// `log_bh_return`: the function-entry door logs a blackhole Done.
+// dont_look_inside: compile.py handle_fail; post-trace outcome dispatch.
+#[majit_macros::dont_look_inside]
+fn dispatch_handle_fail(
+    frame_root: &mut FrameRoot,
+    green_key: u64,
+    trace_id: u64,
+    fail_index: u32,
+    descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
+    should_bridge: bool,
+    owning_key: u64,
+    exit_layout: &CompiledExitLayout,
+    raw_values: &mut [i64],
+    guard_exc: i64,
+    info: &majit_metainterp::virtualizable::VirtualizableInfo,
+    savedata: Option<majit_ir::GcRef>,
+    continue_on_compiled: bool,
+    log_bh_return: bool,
+) -> HandleFailDispatch {
+    let compiled = || {
+        if continue_on_compiled {
+            HandleFailDispatch::ContinueRunningNormally
+        } else {
+            HandleFailDispatch::Fallthrough
+        }
+    };
+    match handle_fail(
+        frame_root.frame(),
+        green_key,
+        trace_id,
+        fail_index,
+        descr_arc,
+        should_bridge,
+        owning_key,
+        exit_layout,
+        raw_values,
+        guard_exc,
+        info,
+    ) {
+        HandleFailOutcome::BridgeCompiled => compiled(),
+        HandleFailOutcome::BridgeFinished(v) => HandleFailDispatch::Done(Ok(v)),
+        HandleFailOutcome::BridgeRaised(err) => HandleFailDispatch::Done(Err(err)),
+        HandleFailOutcome::ResumeInBlackhole => {
+            // compile.py:710-716 / pyjitpl.py:2906 SwitchToBlackhole
+            let bh_result = resume_in_blackhole_from_exit_layout(
+                raw_values,
+                exit_layout,
+                guard_exc,
+                false,
+                savedata,
+            );
+            match &bh_result {
+                crate::call_jit::BlackholeResult::ContinueRunningNormally { green_int, .. } => {
+                    apply_blackhole_crn_handoff(frame_root.frame(), green_int);
+                    compiled()
+                }
+                crate::call_jit::BlackholeResult::BailToInterpreter => {
+                    HandleFailDispatch::Fallthrough
+                }
+                // warmspot.py:988-1005 — box the typed DoneWithThisFrame*
+                // result for the portal's `result_type=Ref`, or propagate
+                // the ExitFrameWithExceptionRef exception rather than
+                // swallowing it.  Spelled once, in `take_pyresult`.
+                _ => {
+                    let Some(r) = bh_result.take_pyresult() else {
+                        return HandleFailDispatch::Fallthrough;
+                    };
+                    if log_bh_return && majit_metainterp::majit_log_enabled() {
+                        let returned_intval = match &r {
+                            Ok(obj)
+                                if !obj.is_null()
+                                    && unsafe { pyre_object::pyobject::is_int(*obj) } =>
+                            {
+                                Some(unsafe { pyre_object::intobject::w_int_get_value(*obj) })
+                            }
+                            _ => None,
+                        };
+                        eprintln!(
+                            "[jit][handle-outcome] bh-return arg0={:?} intval={:?}",
+                            debug_first_arg_int(frame_root.frame()),
+                            returned_intval,
+                        );
+                    }
+                    HandleFailDispatch::Done(r)
+                }
+            }
+        }
+    }
+}
+
 /// Short tag for a `BlackholeResult` variant, for the `[bh-rd-numb]`
 /// blackhole-resume log line.
 fn blackhole_result_tag(r: &crate::call_jit::BlackholeResult) -> &'static str {
@@ -11333,51 +10811,28 @@ fn execute_assembler(
             guard_exc,
             savedata,
             deadframe: _deadframe,
-        } => {
-            match handle_fail(
-                frame_root.frame(),
-                green_key,
-                trace_id,
-                fail_index,
-                descr_arc,
-                should_bridge,
-                owning_key,
-                exit_layout,
-                raw_values,
-                guard_exc,
-                info,
-            ) {
-                HandleFailOutcome::BridgeCompiled => Some(LoopResult::ContinueRunningNormally),
-                // #177: single-frame bridge walk returned a concrete Finish.
-                HandleFailOutcome::BridgeFinished(v) => Some(LoopResult::Done(Ok(v))),
-                HandleFailOutcome::BridgeRaised(err) => Some(LoopResult::Done(Err(err))),
-                HandleFailOutcome::ResumeInBlackhole => {
-                    // compile.py:710-716 / pyjitpl.py:2906 SwitchToBlackhole
-                    let bh_result = resume_in_blackhole_from_exit_layout(
-                        raw_values,
-                        exit_layout,
-                        guard_exc,
-                        false,
-                        savedata,
-                    );
-                    match &bh_result {
-                        crate::call_jit::BlackholeResult::ContinueRunningNormally {
-                            green_int,
-                            ..
-                        } => {
-                            apply_blackhole_crn_handoff(frame_root.frame(), green_int);
-                            Some(LoopResult::ContinueRunningNormally)
-                        }
-                        crate::call_jit::BlackholeResult::BailToInterpreter => None,
-                        // warmspot.py:988-1005 — box the typed DoneWithThisFrame*
-                        // result for the portal's `result_type=Ref`, or propagate
-                        // the ExitFrameWithExceptionRef exception rather than
-                        // swallowing it.  Spelled once, in `take_pyresult`.
-                        _ => bh_result.take_pyresult().map(LoopResult::Done),
-                    }
-                }
+        } => match dispatch_handle_fail(
+            &mut frame_root,
+            green_key,
+            trace_id,
+            fail_index,
+            descr_arc,
+            should_bridge,
+            owning_key,
+            exit_layout,
+            raw_values,
+            guard_exc,
+            info,
+            savedata,
+            true,
+            false,
+        ) {
+            HandleFailDispatch::ContinueRunningNormally => {
+                Some(LoopResult::ContinueRunningNormally)
             }
-        }
+            HandleFailDispatch::Done(r) => Some(LoopResult::Done(r)),
+            HandleFailDispatch::Fallthrough => None,
+        },
         DetailedDriverRunOutcome::Jump { .. } | DetailedDriverRunOutcome::Abort { .. } => None,
     }
 }
@@ -11841,8 +11296,8 @@ fn bound_reached(
             deadframe: _deadframe,
         } = outcome
         {
-            match handle_fail(
-                frame_root.frame(),
+            match dispatch_handle_fail(
+                &mut frame_root,
                 green_key,
                 trace_id,
                 fail_index,
@@ -11853,41 +11308,15 @@ fn bound_reached(
                 raw_values,
                 guard_exc,
                 info,
+                savedata,
+                true,
+                false,
             ) {
-                HandleFailOutcome::BridgeCompiled => {
+                HandleFailDispatch::ContinueRunningNormally => {
                     return Some(LoopResult::ContinueRunningNormally);
                 }
-                // #177: single-frame bridge walk returned a concrete Finish.
-                HandleFailOutcome::BridgeFinished(v) => {
-                    return Some(LoopResult::Done(Ok(v)));
-                }
-                HandleFailOutcome::BridgeRaised(err) => {
-                    return Some(LoopResult::Done(Err(err)));
-                }
-                HandleFailOutcome::ResumeInBlackhole => {
-                    let bh_result = resume_in_blackhole_from_exit_layout(
-                        raw_values,
-                        exit_layout,
-                        guard_exc,
-                        false,
-                        savedata,
-                    );
-                    match &bh_result {
-                        crate::call_jit::BlackholeResult::ContinueRunningNormally {
-                            green_int,
-                            ..
-                        } => {
-                            apply_blackhole_crn_handoff(frame_root.frame(), green_int);
-                            return Some(LoopResult::ContinueRunningNormally);
-                        }
-                        crate::call_jit::BlackholeResult::BailToInterpreter => {}
-                        _ => {
-                            if let Some(r) = bh_result.take_pyresult() {
-                                return Some(LoopResult::Done(r));
-                            }
-                        }
-                    }
-                }
+                HandleFailDispatch::Done(r) => return Some(LoopResult::Done(r)),
+                HandleFailDispatch::Fallthrough => {}
             }
         } else {
             match handle_jit_outcome(outcome, &jit_state, frame_root.frame(), info, green_key) {
@@ -12152,8 +11581,8 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             deadframe: _deadframe,
         } = outcome
         {
-            match handle_fail(
-                frame_root.frame(),
+            match dispatch_handle_fail(
+                &mut frame_root,
                 green_key,
                 trace_id,
                 fail_index,
@@ -12164,64 +11593,14 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                 raw_values,
                 guard_exc,
                 info,
+                savedata,
+                false,
+                true,
             ) {
-                HandleFailOutcome::BridgeCompiled => {
-                    // Bridge compiled → ContinueRunningNormally → re-enter
-                    // compiled code which will follow the new bridge.
-                    // Fall through to eval_loop_jit below.
-                }
-                // #177: single-frame bridge walk returned a concrete Finish.
-                // This site returns `Option<PyResult>` (not `LoopResult`).
-                HandleFailOutcome::BridgeFinished(v) => {
-                    return Some(Ok(v));
-                }
-                HandleFailOutcome::BridgeRaised(err) => {
-                    return Some(Err(err));
-                }
-                HandleFailOutcome::ResumeInBlackhole => {
-                    let bh_result = resume_in_blackhole_from_exit_layout(
-                        raw_values,
-                        exit_layout,
-                        guard_exc,
-                        false,
-                        savedata,
-                    );
-                    match &bh_result {
-                        crate::call_jit::BlackholeResult::ContinueRunningNormally {
-                            green_int,
-                            ..
-                        } => {
-                            apply_blackhole_crn_handoff(frame_root.frame(), green_int);
-                            // Fall through to eval_loop_jit
-                        }
-                        crate::call_jit::BlackholeResult::BailToInterpreter => {}
-                        _ => {
-                            if let Some(r) = bh_result.take_pyresult() {
-                                if majit_metainterp::majit_log_enabled() {
-                                    let returned_intval = match &r {
-                                        Ok(obj)
-                                            if !obj.is_null()
-                                                && unsafe {
-                                                    pyre_object::pyobject::is_int(*obj)
-                                                } =>
-                                        {
-                                            Some(unsafe {
-                                                pyre_object::intobject::w_int_get_value(*obj)
-                                            })
-                                        }
-                                        _ => None,
-                                    };
-                                    eprintln!(
-                                        "[jit][handle-outcome] bh-return arg0={:?} intval={:?}",
-                                        debug_first_arg_int(frame_root.frame()),
-                                        returned_intval,
-                                    );
-                                }
-                                return Some(r);
-                            }
-                        }
-                    }
-                }
+                HandleFailDispatch::Done(r) => return Some(r),
+                // Bridge compiled / blackhole CRN: ContinueRunningNormally
+                // re-enters compiled code via eval_loop_jit below.
+                HandleFailDispatch::ContinueRunningNormally | HandleFailDispatch::Fallthrough => {}
             }
         } else {
             match handle_jit_outcome(outcome, &jit_state, frame_root.frame(), info, green_key) {
@@ -12438,7 +11817,7 @@ fn handle_jit_outcome(
 /// resume.py allocate_struct(typedescr) → cpu.bh_new(typedescr).
 fn allocate_struct(typedescr: &dyn majit_ir::SizeDescr) -> usize {
     let size = typedescr.size();
-    let descr = majit_translate::jitcode::BhDescr::Size {
+    let descr = majit_jitcode::jitcode::BhDescr::Size {
         size,
         // `descr.py` cache identity — `SizeDescr.cache_key()`
         // returns the `LLType::Struct(path_hash)` slot stamped at
@@ -12446,18 +11825,18 @@ fn allocate_struct(typedescr: &dyn majit_ir::SizeDescr) -> usize {
         type_id: typedescr.cache_key(),
         vtable: 0,
         owner: String::new(),
-        all_fielddescrs: majit_translate::jitcode::bh_field_specs_from_size_descr(typedescr),
+        all_fielddescrs: majit_jitcode::jitcode::bh_field_specs_from_size_descr(typedescr),
         is_gc_managed: typedescr.is_gc_managed(),
     };
     let (driver, _) = driver_pair();
     driver.meta_interp().backend().bh_new(&descr) as usize
 }
 
-fn bh_array_descr_from_descr(arraydescr: &majit_ir::DescrRef) -> majit_translate::jitcode::BhDescr {
+fn bh_array_descr_from_descr(arraydescr: &majit_ir::DescrRef) -> majit_jitcode::jitcode::BhDescr {
     let ad = arraydescr
         .as_array_descr()
         .expect("resume array path requires an ArrayDescr");
-    majit_translate::jitcode::BhDescr::from_array_descr(ad)
+    majit_jitcode::jitcode::BhDescr::from_array_descr(ad)
 }
 
 fn bh_new_array_from_descr(length: usize, arraydescr: &majit_ir::DescrRef, clear: bool) -> i64 {
@@ -12522,7 +11901,7 @@ fn bh_setarrayitem_float_from_descr(
 fn allocate_with_vtable(descr: &dyn majit_ir::SizeDescr) -> usize {
     let size = descr.size();
     let vtable = descr.vtable();
-    let bh_descr = majit_translate::jitcode::BhDescr::Size {
+    let bh_descr = majit_jitcode::jitcode::BhDescr::Size {
         size,
         // `resolve_gc_tid`'s producer contract: `allocate_with_vtable` widens
         // the descr's own dense tid into the slot rather than serializing the
@@ -12534,7 +11913,7 @@ fn allocate_with_vtable(descr: &dyn majit_ir::SizeDescr) -> usize {
         type_id: descr.type_id() as u64,
         vtable: vtable as u64,
         owner: String::new(),
-        all_fielddescrs: majit_translate::jitcode::bh_field_specs_from_size_descr(descr),
+        all_fielddescrs: majit_jitcode::jitcode::bh_field_specs_from_size_descr(descr),
         is_gc_managed: descr.is_gc_managed(),
     };
     let (driver, _) = driver_pair();
@@ -12853,7 +12232,7 @@ fn materialize_virtual_from_rd(
             let cd = calldescr
                 .as_call_descr()
                 .expect("OS_RAW_MALLOC_VARSIZE_CHAR calldescr must downcast to CallDescr");
-            let bh_calldescr = majit_translate::jitcode::BhCallDescr::from_call_descr(cd);
+            let bh_calldescr = majit_jitcode::jitcode::BhCallDescr::from_call_descr(cd);
             // resume.py:1456: self.cpu.bh_call_i(func, [size], None, None, calldescr)
             let buffer = driver.meta_interp().backend().bh_call_i(
                 *func,
@@ -12875,7 +12254,7 @@ fn materialize_virtual_from_rd(
             for i in 0..offsets.len() {
                 let fnum = fieldnums[i];
                 let di = &descrs[i];
-                let bh_descr = majit_translate::jitcode::BhDescr::from_array_descr_info(di);
+                let bh_descr = majit_jitcode::jitcode::BhDescr::from_array_descr_info(di);
                 // resume.py:1544: assert not descr.is_array_of_pointers()
                 assert!(
                     !bh_descr.is_array_of_pointers(),
@@ -13036,7 +12415,7 @@ fn materialize_virtual_from_rd(
             let cd = calldescr
                 .as_call_descr()
                 .expect("VStr/VUni Concat calldescr must downcast to CallDescr");
-            let bh_calldescr = majit_translate::jitcode::BhCallDescr::from_call_descr(cd);
+            let bh_calldescr = majit_jitcode::jitcode::BhCallDescr::from_call_descr(cd);
             // resume.py concat_strings / resume.py
             // concat_unicodes — cpu.bh_call_r(func, [left, right], descr).
             let backend = driver.meta_interp().backend();
@@ -13111,7 +12490,7 @@ fn materialize_virtual_from_rd(
             let cd = calldescr
                 .as_call_descr()
                 .expect("VStr/VUni Slice calldescr must downcast to CallDescr");
-            let bh_calldescr = majit_translate::jitcode::BhCallDescr::from_call_descr(cd);
+            let bh_calldescr = majit_jitcode::jitcode::BhCallDescr::from_call_descr(cd);
             // resume.py slice_string / resume.py
             // slice_unicode — cpu.bh_call_r(func, [str, start, stop], descr).
             let backend = driver.meta_interp().backend();
@@ -14639,13 +14018,13 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         let sd = typedescr
             .as_size_descr()
             .expect("allocate_struct: not a SizeDescr");
-        let bh_descr = majit_translate::jitcode::BhDescr::Size {
+        let bh_descr = majit_jitcode::jitcode::BhDescr::Size {
             size: sd.size(),
             // `descr.py` cache identity via `SizeDescr.cache_key()`.
             type_id: sd.cache_key(),
             vtable: 0,
             owner: String::new(),
-            all_fielddescrs: majit_translate::jitcode::bh_field_specs_from_size_descr(sd),
+            all_fielddescrs: majit_jitcode::jitcode::bh_field_specs_from_size_descr(sd),
             is_gc_managed: sd.is_gc_managed(),
         };
         let (driver, _) = driver_pair();
@@ -14672,13 +14051,13 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
             W_INT_GC_TYPE_ID => pyre_object::intobject::w_int_new_unique(0) as i64,
             W_FLOAT_GC_TYPE_ID => pyre_object::floatobject::w_float_new(0.0) as i64,
             _ => {
-                let bh_descr = majit_translate::jitcode::BhDescr::Size {
+                let bh_descr = majit_jitcode::jitcode::BhDescr::Size {
                     size: descr_size,
                     // Note: u32 gc tid widened to u64 cache key slot.
                     type_id: descr_index as u64,
                     vtable: vtable as u64,
                     owner: String::new(),
-                    all_fielddescrs: majit_translate::jitcode::bh_field_specs_from_size_descr(sd),
+                    all_fielddescrs: majit_jitcode::jitcode::bh_field_specs_from_size_descr(sd),
                     is_gc_managed: sd.is_gc_managed(),
                 };
                 let (driver, _) = driver_pair();
@@ -14873,7 +14252,7 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         let cd = calldescr
             .as_call_descr()
             .expect("OS_RAW_MALLOC_VARSIZE_CHAR calldescr must downcast to CallDescr");
-        let bh_calldescr = majit_translate::jitcode::BhCallDescr::from_call_descr(cd);
+        let bh_calldescr = majit_jitcode::jitcode::BhCallDescr::from_call_descr(cd);
         driver.meta_interp().backend().bh_call_i(
             func,
             Some(&[size as i64]),
@@ -14891,7 +14270,7 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         value: i64,
         descr: &majit_ir::ArrayDescrInfo,
     ) {
-        let bh_descr = majit_translate::jitcode::BhDescr::from_array_descr_info(descr);
+        let bh_descr = majit_jitcode::jitcode::BhDescr::from_array_descr_info(descr);
         let (driver, _) = driver_pair();
         let backend = driver.meta_interp().backend();
         backend.bh_raw_store_f(buffer, offset, f64::from_bits(value as u64), &bh_descr);
@@ -14905,7 +14284,7 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         value: i64,
         descr: &majit_ir::ArrayDescrInfo,
     ) {
-        let bh_descr = majit_translate::jitcode::BhDescr::from_array_descr_info(descr);
+        let bh_descr = majit_jitcode::jitcode::BhDescr::from_array_descr_info(descr);
         let (driver, _) = driver_pair();
         let backend = driver.meta_interp().backend();
         backend.bh_raw_store_i(buffer, offset, value, &bh_descr);

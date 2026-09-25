@@ -30,7 +30,7 @@ fn field<'a>(
     builder: &'a JitCodeBuilder,
     type_id: u64,
     name: &str,
-) -> &'a majit_translate::jitcode::BhFieldSpec {
+) -> &'a majit_jitcode::jitcode::BhFieldSpec {
     builder
         .struct_size_spec(type_id)
         .unwrap_or_else(|| panic!("no layout registered for {type_id:#x}"))

@@ -1055,3 +1055,37 @@ mod tests {
         }
     }
 }
+
+/// The GC types this module owns, in `build_gc` registration order.
+pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType>) {
+    use pyre_interpreter::importing::{ModuleGcAnchor, ModuleGcLayout, ModuleGcType};
+    use pyre_object::lltype::PyreClassPyTypeOf;
+    // `interp_zlib.py` stores each rzlib stream and its lock directly on the
+    // corresponding W_Root owner.  The stream TypeDefs are acceptable base
+    // classes: their native payloads contain no Python references, but Python
+    // subclasses carry the mapdict prefix, which the trace walks.
+    types.push(ModuleGcType {
+        anchor: ModuleGcAnchor::AfterGcStats,
+        descriptor: <W_Compress as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::CustomTrace(
+            pyre_interpreter::objspace::std::mapdict::mapdict_storage_custom_trace,
+        ),
+        destructor: Some(gc_destructor!(w_compress_dealloc)),
+    });
+    types.push(ModuleGcType {
+        anchor: ModuleGcAnchor::AfterGcStats,
+        descriptor: <W_Decompress as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::CustomTrace(
+            pyre_interpreter::objspace::std::mapdict::mapdict_storage_custom_trace,
+        ),
+        destructor: Some(gc_destructor!(w_decompress_dealloc)),
+    });
+    types.push(ModuleGcType {
+        anchor: ModuleGcAnchor::AfterGcStats,
+        descriptor: <W_ZlibDecompressor as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::CustomTrace(
+            pyre_interpreter::objspace::std::mapdict::mapdict_storage_custom_trace,
+        ),
+        destructor: Some(gc_destructor!(w_zdecompress_dealloc)),
+    });
+}

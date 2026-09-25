@@ -193,8 +193,8 @@ impl JitState for UnpackJitState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use majit_jitcode::jitcode::BhDescr;
     use majit_metainterp::{JitCode, RuntimeBhDescr};
-    use majit_translate::jitcode::BhDescr;
 
     /// jd1's extracted main JitCode carries an empty per-jitcode `exec.descrs`;
     /// its `d`/`j` argcodes resolve through the shared global build-time descr

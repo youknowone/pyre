@@ -6982,7 +6982,7 @@ mod tests {
     #[test]
     fn make_call_descr_from_bh_round_trips_most_general_effectinfo() {
         use majit_ir::EffectInfo;
-        use majit_translate::jitcode::BhCallDescr;
+        use majit_jitcode::jitcode::BhCallDescr;
 
         let bh = BhCallDescr::from_arg_classes("r".to_string(), 'r', EffectInfo::MOST_GENERAL);
 
@@ -7002,7 +7002,7 @@ mod tests {
     #[test]
     fn make_call_descr_from_bh_round_trips_cannot_raise_effectinfo() {
         use majit_ir::{EffectInfo, ExtraEffect, OopSpecIndex};
-        use majit_translate::jitcode::BhCallDescr;
+        use majit_jitcode::jitcode::BhCallDescr;
 
         let extra_info = EffectInfo::const_new(ExtraEffect::CannotRaise, OopSpecIndex::None);
         let bh = BhCallDescr::from_arg_classes("ir".to_string(), 'v', extra_info.clone());
@@ -7022,7 +7022,7 @@ mod tests {
     #[test]
     fn make_call_descr_from_bh_preserves_singlefloat_result_layout() {
         use majit_ir::EffectInfo;
-        use majit_translate::jitcode::{BhCallDescr, CallResultErasedKey};
+        use majit_jitcode::jitcode::{BhCallDescr, CallResultErasedKey};
 
         let bh = BhCallDescr::from_arg_classes("S".to_string(), 'S', EffectInfo::MOST_GENERAL);
 
@@ -7065,7 +7065,7 @@ mod tests {
     #[test]
     fn a_class_word_declaration_survives_the_blackhole_round_trip() {
         use majit_ir::descr::ArrayFlag;
-        use majit_translate::jitcode::{BhFieldSpec, BhSizeSpec};
+        use majit_jitcode::jitcode::{BhFieldSpec, BhSizeSpec};
 
         let spec = |field_key: &str,
                     name: &str,
@@ -7145,7 +7145,7 @@ mod tests {
     #[test]
     fn make_descr_from_bh_field_preserves_parent_name_index() {
         use majit_ir::descr::ArrayFlag;
-        use majit_translate::jitcode::{BhDescr, BhFieldSpec, BhSizeSpec};
+        use majit_jitcode::jitcode::{BhDescr, BhFieldSpec, BhSizeSpec};
 
         let parent = BhSizeSpec {
             size: 24,
@@ -7221,9 +7221,9 @@ mod tests {
     /// the pre-store read alive across the store.
     #[test]
     fn make_descr_from_bh_list_int_block_is_the_runtime_gcarray_descr() {
-        use majit_translate::jitcode::BhDescr;
+        use majit_jitcode::jitcode::BhDescr;
         let token = &pyre_object::TYPED_ITEMS_BLOCK_INT_TOKEN;
-        let atid = majit_translate::codewriter::jtransform::LIST_INT_ITEMS_ARRAY;
+        let atid = majit_jitcode::codewriter::jtransform::LIST_INT_ITEMS_ARRAY;
         let bridged = make_descr_from_bh(&BhDescr::Array {
             base_size: token.base_size,
             itemsize: token.item_size,
@@ -7253,7 +7253,7 @@ mod tests {
     #[test]
     fn make_descr_from_bh_items_block_capacity_with_parent_is_canonical() {
         use majit_ir::descr::ArrayFlag;
-        use majit_translate::jitcode::{BhDescr, BhFieldSpec, BhSizeSpec};
+        use majit_jitcode::jitcode::{BhDescr, BhFieldSpec, BhSizeSpec};
 
         let capacity = BhFieldSpec {
             index: 0,
@@ -7302,7 +7302,7 @@ mod tests {
     #[test]
     fn make_descr_from_bh_bridges_codewriter_strategy_items_leaves_to_group() {
         use majit_ir::descr::ArrayFlag;
-        use majit_translate::jitcode::BhDescr;
+        use majit_jitcode::jitcode::BhDescr;
 
         // Shape `_handle_list_call` emits and the codewriter assembler
         // round-trips: dotted nested name, owner `W_ListObject`, offset 0
@@ -7357,7 +7357,7 @@ mod tests {
     #[test]
     fn make_descr_from_bh_bridges_codewriter_bare_items_aliases_to_block_group() {
         use majit_ir::descr::ArrayFlag;
-        use majit_translate::jitcode::BhDescr;
+        use majit_jitcode::jitcode::BhDescr;
 
         // A bare `int_items` / `float_items` / `bytes_items` read (the
         // `w_list_append` body
@@ -7400,7 +7400,7 @@ mod tests {
     #[test]
     fn make_descr_from_bh_bridges_codewriter_list_header_fields_to_group() {
         use majit_ir::descr::ArrayFlag;
-        use majit_translate::jitcode::BhDescr;
+        use majit_jitcode::jitcode::BhDescr;
 
         // The `w_list_append` body reads `list.{strategy,length,items}`
         // directly. The codewriter mints these as a `SimpleFieldDescr` with no
@@ -7538,7 +7538,7 @@ mod tests {
     #[test]
     fn make_descr_from_bh_bridges_codewriter_box_payload_fields_to_group() {
         use majit_ir::descr::ArrayFlag;
-        use majit_translate::jitcode::BhDescr;
+        use majit_jitcode::jitcode::BhDescr;
 
         // A codewriter-lowered body reads a box payload through the producer's
         // struct-layout descr: `W_IntObject` is modeled with a header, so its
@@ -7584,9 +7584,9 @@ mod tests {
 
     /// A `PyObject.w_class` `BhDescr` describing the same access as the
     /// canonical header descr, for both owner spellings the codewriter emits.
-    fn w_class_bh(owner: &str, field_size: usize) -> majit_translate::jitcode::BhDescr {
+    fn w_class_bh(owner: &str, field_size: usize) -> majit_jitcode::jitcode::BhDescr {
         use majit_ir::descr::ArrayFlag;
-        use majit_translate::jitcode::BhDescr;
+        use majit_jitcode::jitcode::BhDescr;
 
         BhDescr::Field {
             offset: pyre_object::pyobject::W_CLASS_OFFSET,
@@ -7660,7 +7660,7 @@ mod tests {
     #[test]
     fn make_descr_from_bh_bridges_execution_context_fields_to_declared_group() {
         use majit_ir::descr::ArrayFlag;
-        use majit_translate::jitcode::BhDescr;
+        use majit_jitcode::jitcode::BhDescr;
 
         for (name, offset, canonical) in [
             (
@@ -7719,7 +7719,7 @@ mod tests {
     #[test]
     fn make_descr_from_bh_struct_array_preserves_type_and_interior_fields() {
         use majit_ir::descr::ArrayFlag;
-        use majit_translate::jitcode::{BhDescr, BhFieldSpec, BhInteriorFieldSpec, BhSizeSpec};
+        use majit_jitcode::jitcode::{BhDescr, BhFieldSpec, BhInteriorFieldSpec, BhSizeSpec};
 
         let fields = vec![
             BhFieldSpec {
@@ -7830,7 +7830,7 @@ mod tests {
         let array = descr
             .as_array_descr()
             .expect("pyobject_gcarray_descr must be an ArrayDescr");
-        let atid = majit_translate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID;
+        let atid = majit_jitcode::codewriter::jtransform::OBJECT_REF_GCARRAY_TYPE_ID;
         let cache_key = majit_ir::descr::path_hash(atid);
         assert_eq!(array.type_id(), PY_OBJECT_ARRAY_GC_TYPE_ID);
         assert_eq!(
@@ -7873,7 +7873,7 @@ pub fn make_jit_w_long_toint_calldescr() -> DescrRef {
 }
 
 fn simple_field_spec_from_bh(
-    spec: &majit_translate::jitcode::BhFieldSpec,
+    spec: &majit_jitcode::jitcode::BhFieldSpec,
 ) -> majit_ir::descr::SimpleFieldDescrSpec {
     majit_ir::descr::SimpleFieldDescrSpec {
         index: spec.index,
@@ -8088,7 +8088,7 @@ fn force_declared_group(cache_key: u64) {
 }
 
 fn simple_descr_group_from_bh_size(
-    spec: &majit_translate::jitcode::BhSizeSpec,
+    spec: &majit_jitcode::jitcode::BhSizeSpec,
 ) -> majit_ir::descr::SimpleDescrGroup {
     let field_specs: Vec<_> = spec
         .all_fielddescrs
@@ -8148,8 +8148,8 @@ fn simple_descr_group_from_bh_size(
 /// standalone `BhDescr::Field` can be in. Flattening it here is what made the
 /// unresolved-mint table unsplittable.
 fn field_descr_from_bh_field(
-    field: &majit_translate::jitcode::BhFieldSpec,
-    parent: Option<&majit_translate::jitcode::BhSizeSpec>,
+    field: &majit_jitcode::jitcode::BhFieldSpec,
+    parent: Option<&majit_jitcode::jitcode::BhSizeSpec>,
     claimed_index: Option<usize>,
 ) -> DescrRef {
     if let Some(parent) = parent {
@@ -8262,7 +8262,7 @@ pub fn make_struct_array_descr_full_keyed(
     type_id: u32,
     cache_key: u64,
     item_type: Type,
-    interior_fields: &[majit_translate::jitcode::BhInteriorFieldSpec],
+    interior_fields: &[majit_jitcode::jitcode::BhInteriorFieldSpec],
 ) -> DescrRef {
     use majit_ir::descr::{ArrayFlag, LLType, SimpleArrayDescr, gc_cache, try_downcast_arc};
     // `descr.py get_array_descr(gccache, ARRAY)` cache-or-mint:
@@ -8404,7 +8404,7 @@ pub fn make_struct_array_descr_full_keyed(
 /// `calldescr` + the callee's bytecode body and is emitted directly as
 /// the descr operand of `inline_call_*`. The codewriter side surfaces
 /// this as `BhDescr::JitCode { jitcode_index, fnaddr, calldescr }`
-/// (`majit-translate/src/codewriter/jitcode.rs`); the trace-side
+/// (`majit-jitcode/src/codewriter/jitcode.rs`); the trace-side
 /// walker (`jitcode_dispatch.rs::WalkContext`) consumes
 /// `&[Arc<dyn Descr>]` and queries `as_jitcode_descr()` /
 /// `jitcode_index()`.
@@ -8550,7 +8550,7 @@ impl Descr for PyreVtableMethodDescr {
 }
 
 /// `assembler.py Assembler.descrs` parity adapter — translate one
-/// codewriter-side `BhDescr` slot (`majit-translate/src/codewriter/jitcode.rs`)
+/// codewriter-side `BhDescr` slot (`majit-jitcode/src/codewriter/jitcode.rs`)
 /// into the matching trace-side `Arc<dyn Descr>` so trace ops emitted
 /// by the walker (`crate::jitcode_dispatch::dispatch_via_miframe`) can carry
 /// real-content descrs instead of `make_fail_descr` placeholders.
@@ -8581,8 +8581,8 @@ impl Descr for PyreVtableMethodDescr {
 /// * `Switch` / `VableField` / `VableArray` / `VtableMethod` — trace-side
 ///   adapters preserve the descriptor slot instead of substituting a
 ///   fail-descr placeholder.
-pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
-    use majit_translate::jitcode::BhDescr;
+pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
+    use majit_jitcode::jitcode::BhDescr;
     match bh {
         BhDescr::Field {
             offset,
@@ -8821,7 +8821,7 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
             // `BhFieldSpec.index` so the `parent` matching fallback
             // produces a `SimpleFieldDescr` whose `index()` matches the
             // upstream value rather than a `u32::MAX` sentinel.
-            let field = majit_translate::jitcode::BhFieldSpec {
+            let field = majit_jitcode::jitcode::BhFieldSpec {
                 // `index()` is the key the `HeapCache` files a field read
                 // under, so it has to separate every field one object can be
                 // read through.  A numbered field answers with its position;
@@ -9011,7 +9011,7 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                 // Truncate `as u32` until gc_cache routing.
                 make_size_descr_with_type_and_vtable(*size, *type_id as u32, *vtable as usize)
             } else {
-                let spec = majit_translate::jitcode::BhSizeSpec {
+                let spec = majit_jitcode::jitcode::BhSizeSpec {
                     size: *size,
                     type_id: *type_id,
                     vtable: *vtable,
@@ -9878,7 +9878,7 @@ pub fn prepare_frozen_effect_info(ei: &mut majit_ir::EffectInfo) {
 /// `arg_classes` is RPython `CallDescr.arg_classes`: one char per non-void
 /// function argument. Uppercase `I/R/F` are assembler list markers and must not
 /// appear here.
-pub fn make_call_descr_from_bh(bh: &majit_translate::jitcode::BhCallDescr) -> DescrRef {
+pub fn make_call_descr_from_bh(bh: &majit_jitcode::jitcode::BhCallDescr) -> DescrRef {
     let arg_types: Vec<Type> = bh
         .arg_classes
         .chars()

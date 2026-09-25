@@ -148,7 +148,7 @@ fn build_bh_jitdrivers_sd(
                 .portal_calldescr
                 .as_ref()
                 .and_then(|descr| descr.as_call_descr())
-                .map(majit_translate::jitcode::BhCallDescr::from_call_descr)
+                .map(majit_jitcode::jitcode::BhCallDescr::from_call_descr)
                 .unwrap_or_default();
             crate::blackhole::BhJitDriverSd {
                 result_type,
@@ -475,7 +475,7 @@ fn writeback_live_state_scalars_from_blackhole<S: crate::JitState>(
     bh: &crate::blackhole::BlackholeInterpreter,
     all_liveness: &[u8],
 ) {
-    use majit_translate::liveness::LivenessIterator;
+    use majit_jitcode::liveness::LivenessIterator;
 
     let info = bh.get_current_position_info();
     if info + 3 > all_liveness.len() {
@@ -962,7 +962,7 @@ where
              parity)",
         )
     });
-    use majit_translate::codewriter::insns::{BC_JIT_MERGE_POINT, BC_JIT_MERGE_POINT_C};
+    use majit_jitcode::codewriter::insns::{BC_JIT_MERGE_POINT, BC_JIT_MERGE_POINT_C};
     let body = &jc.code;
     // Read the opcode byte directly from the captured offset.  Both routes
     // into a body record it at the position they reserve for the opcode:
@@ -1867,8 +1867,7 @@ pub struct JitDriver<S: JitState> {
     /// `sync_liveness_info_from_shared_asm()`.  This preserves PyPy's
     /// `make_jitcodes() -> finish_setup()` order while keeping
     /// `MetaInterpStaticData.liveness_info` immutable during tracing.
-    shared_asm:
-        std::sync::Arc<parking_lot::Mutex<majit_translate::codewriter::assembler::Assembler>>,
+    shared_asm: std::sync::Arc<parking_lot::Mutex<majit_jitcode::codewriter::assembler::Assembler>>,
     /// resume.py:1367 — CPU allocation backend for virtual materialization
     /// during blackhole resume. Registered by the embedding interpreter at
     /// startup.
@@ -2161,7 +2160,7 @@ impl<S: JitState> JitDriver<S> {
                 reason = "Arc preserves shared JitCode/descriptor identity across compiled artifacts; the non-Send translator payload is confined to the single-threaded build phase and is never transferred between threads"
             )]
             shared_asm: std::sync::Arc::new(parking_lot::Mutex::new(
-                majit_translate::codewriter::assembler::Assembler::new(),
+                majit_jitcode::codewriter::assembler::Assembler::new(),
             )),
         }
     }
@@ -2175,7 +2174,7 @@ impl<S: JitState> JitDriver<S> {
     /// same underlying mutex.
     pub fn shared_asm(
         &self,
-    ) -> std::sync::Arc<parking_lot::Mutex<majit_translate::codewriter::assembler::Assembler>> {
+    ) -> std::sync::Arc<parking_lot::Mutex<majit_jitcode::codewriter::assembler::Assembler>> {
         self.shared_asm.clone()
     }
 
@@ -2199,7 +2198,7 @@ impl<S: JitState> JitDriver<S> {
     /// `CallControl` construction, which is not yet wired.
     ///
     /// Caller responsibility: build a fresh
-    /// `majit_translate::codewriter::assembler::Assembler`,
+    /// `majit_jitcode::codewriter::assembler::Assembler`,
     /// register the canonical
     /// `__JitMeta::canonical_liveness_slots()` triple via
     /// `Assembler::_encode_liveness`, then pass `&asm` here.  The
@@ -2207,7 +2206,7 @@ impl<S: JitState> JitDriver<S> {
     /// applies — call before the first trace.
     pub fn install_canonical_liveness(
         &mut self,
-        asm: &majit_translate::codewriter::assembler::Assembler,
+        asm: &majit_jitcode::codewriter::assembler::Assembler,
     ) {
         self.meta.install_canonical_liveness(asm);
     }
@@ -6131,7 +6130,7 @@ impl<S: JitState> JitDriver<S> {
                             });
                             cursor += 1;
                         };
-                        majit_translate::codewriter::jitcode::enumerate_vars_by_bank(
+                        majit_jitcode::codewriter::jitcode::enumerate_vars_by_bank(
                             info,
                             &all_liveness,
                             |bank, index| consume(bank, index),
@@ -10803,7 +10802,7 @@ mod tests {
         // codewriter-owned registry a real translated portal always has.
         // Returning the one restored int also lets the synthetic failing
         // guard finish its reconstructed frame normally.
-        let mut resume_asm = majit_translate::codewriter::assembler::Assembler::new();
+        let mut resume_asm = majit_jitcode::codewriter::assembler::Assembler::new();
         resume_asm.register_insn("live/", crate::jitcode::insns::BC_LIVE);
         resume_asm.register_insn(
             "catch_exception/L",
@@ -12721,7 +12720,7 @@ mod tests {
         // (`pyjitpl.rs::metainterp_install_canonical_liveness_publishes_asm_bytes`)
         // exercises the inner layer; this driver-level test guards the
         // pass-through wrapper the macro actually targets.
-        use majit_translate::codewriter::assembler::Assembler;
+        use majit_jitcode::codewriter::assembler::Assembler;
 
         // Build the canonical liveness exactly the way the macro expansion
         // does (orth-6 helper + orth-2 _encode_liveness + insns
@@ -13482,10 +13481,10 @@ mod jitcode_registry_tests {
     }
 
     fn seeded_portal(name: &str, index: usize, jitdriver_sd: usize) -> Arc<JitCode> {
-        let core = majit_translate::jitcode::JitCode::new(name);
-        core.set_body(majit_translate::jitcode::JitCodeBody {
+        let core = majit_jitcode::jitcode::JitCode::new(name);
+        core.set_body(majit_jitcode::jitcode::JitCodeBody {
             code: vec![
-                majit_translate::codewriter::insns::BC_JIT_MERGE_POINT,
+                majit_jitcode::codewriter::insns::BC_JIT_MERGE_POINT,
                 jitdriver_sd as u8,
                 0,
                 0,
@@ -13518,8 +13517,8 @@ mod jitcode_registry_tests {
         prenumbered: Option<usize>,
         jit_merge_point_offset: Option<usize>,
     ) -> JitCode {
-        let core = majit_translate::jitcode::JitCode::new(name);
-        core.set_body(majit_translate::jitcode::JitCodeBody {
+        let core = majit_jitcode::jitcode::JitCode::new(name);
+        core.set_body(majit_jitcode::jitcode::JitCodeBody {
             jit_merge_point_offset,
             ..Default::default()
         });
@@ -13531,7 +13530,7 @@ mod jitcode_registry_tests {
 
     /// A dispatch jitcode that inline-calls each of `callees`.
     fn dispatch_calling(callees: &[Arc<JitCode>]) -> JitCode {
-        let core = majit_translate::jitcode::JitCode::new("dispatch");
+        let core = majit_jitcode::jitcode::JitCode::new("dispatch");
         core.set_body(Default::default());
         let mut dispatch = JitCode::from_canonical(core);
         dispatch.exec.descrs = callees
@@ -13741,10 +13740,10 @@ mod jitcode_registry_tests {
     #[test]
     #[should_panic(expected = "payload slot 0 count 1 disagrees")]
     fn adoption_validates_the_seeded_object_that_it_installs() {
-        let seeded_core = majit_translate::jitcode::JitCode::new("mainloop");
-        seeded_core.set_body(majit_translate::jitcode::JitCodeBody {
+        let seeded_core = majit_jitcode::jitcode::JitCode::new("mainloop");
+        seeded_core.set_body(majit_jitcode::jitcode::JitCodeBody {
             code: vec![
-                majit_translate::codewriter::insns::BC_JIT_MERGE_POINT,
+                majit_jitcode::codewriter::insns::BC_JIT_MERGE_POINT,
                 0,
                 1,
                 0,

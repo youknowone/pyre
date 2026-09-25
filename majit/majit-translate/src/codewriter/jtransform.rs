@@ -762,15 +762,9 @@ pub(crate) enum JitMarkerKey {
     LoopHeader,
 }
 
-/// ARRAY identity of the list backing blocks, the key `cpu.arraydescrof`
-/// caches on.  `rlist.py` has one `GcArray(ITEM)` lltype per item kind, so
-/// every access to such a block names the same ArrayDescr as the runtime's
-/// own descr for it.
-pub const LIST_INT_ITEMS_ARRAY: &str = "GcArray<i64>";
-pub const LIST_FLOAT_ITEMS_ARRAY: &str = "GcArray<f64>";
-/// The object block is the one `front::mir` already names for tuple items,
-/// frame locals and mro blocks.
-pub const LIST_OBJ_ITEMS_ARRAY: &str = crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID;
+pub use majit_jitcode::codewriter::jtransform::{
+    LIST_FLOAT_ITEMS_ARRAY, LIST_INT_ITEMS_ARRAY, LIST_OBJ_ITEMS_ARRAY,
+};
 
 /// pyre's own driver receiver types, and the
 /// [`GraphTransformConfig::jitdriver_receiver_roots`] default. Each becomes its

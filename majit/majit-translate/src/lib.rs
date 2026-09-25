@@ -32,7 +32,7 @@ pub mod artifacts;
     )
 )]
 pub mod codewriter;
-pub mod config;
+pub use majit_config as config;
 // Decline census — no upstream counterpart.  Upstream gates that cannot
 // lower a shape raise a named error (`jtransform.py _handle_list_call`);
 // every gate here declines silently, so the refusals are counted instead.
@@ -3189,6 +3189,7 @@ mod portal_driver_tests {
             .body()
             ._ssarepr
             .as_ref()
+            .and_then(|ssarepr| ssarepr.as_any().downcast_ref::<SSARepr>())
             .expect("assembled portal keeps its SSA representation")
             .insns
             .iter()

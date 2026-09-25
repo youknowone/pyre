@@ -148,7 +148,7 @@ fn range_probe(op: &SpaceOperation) -> Option<()> {
 /// confirms one.  `originates_from_iter_op` is this with the container
 /// discarded; [`iter_next_item_type`] needs it, because the container is the
 /// only thing that separates the two iterator reprs.
-fn iter_op_container_with(
+pub(crate) fn iter_op_container_with(
     graph: &FunctionGraph,
     edges: &BackEdges,
     var: &Variable,
@@ -183,7 +183,7 @@ pub(crate) fn walk_back_to_source<T>(
     walk_back_with(graph, &edges, var, probe)
 }
 
-fn walk_back_with<T>(
+pub(crate) fn walk_back_with<T>(
     graph: &FunctionGraph,
     edges: &BackEdges,
     var: &Variable,
@@ -233,7 +233,7 @@ fn walk_back_with<T>(
 /// visits that fact: op results in block/op order, the first inputarg
 /// slot of the var in each block, and links that enter a block in
 /// predecessor-block then exit order.
-struct BackEdges {
+pub(crate) struct BackEdges {
     row_of: rustc_hash::FxHashMap<u64, u32>,
     producer_range: Vec<(u32, u32)>,
     producer_at: Vec<(u32, u32)>,
@@ -760,7 +760,7 @@ fn rewire_one_next_site(
     // inner list iterator can take the native `next` op.  Validate-only
     // here — mutation waits until the diamond is confirmed.
     let enumerate_inner =
-        crate::front::iter_adapter::enumerate_list_inner(graph, &next_target, &iter_arg)?;
+        crate::front::iter_adapter::enumerate_list_inner(graph, edges, &next_target, &iter_arg)?;
     let enum_pair = enumerate_inner.is_some().then(|| iter_arg.clone());
     let next_iter = enumerate_inner.clone().unwrap_or_else(|| iter_arg.clone());
 
@@ -1224,7 +1224,7 @@ fn rewire_one_next_site(
     *mutated = true;
 
     if let Some(pair) = &enum_pair {
-        crate::front::iter_adapter::rewrite_enumerate_ctor_to_pair(graph, pair, &next_iter)?;
+        crate::front::iter_adapter::rewrite_enumerate_ctor_to_pair(graph, edges, pair, &next_iter)?;
     }
 
     // The Some target reads the payload via `opt.__pos_0`; with the `next`

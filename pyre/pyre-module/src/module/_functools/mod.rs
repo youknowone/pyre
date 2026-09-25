@@ -492,3 +492,19 @@ cmp_to_key = staticmethod(cmp_to_key)
         "reduce" / * = reduce,
     },
 }
+
+/// The GC types this module owns, in `build_gc` registration order.
+pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType>) {
+    use pyre_interpreter::importing::{ModuleGcAnchor, ModuleGcLayout, ModuleGcType};
+    use pyre_object::lltype::PyreClassPyTypeOf;
+    // `_functools.keyobject`: the comparator and wrapped object are both
+    // managed edges.
+    types.push(ModuleGcType {
+        anchor: ModuleGcAnchor::AfterWClassOnlyTypes,
+        descriptor: <W_KeyWrapper as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::PyreClass {
+            memory_pressure_offset: None,
+        },
+        destructor: None,
+    });
+}

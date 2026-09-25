@@ -40,7 +40,7 @@ fn execute_box_str_constant(args: &[Value]) -> Option<Value> {
 fn registry() -> &'static HashMap<i64, Entry> {
     static REGISTRY: OnceLock<HashMap<i64, Entry>> = OnceLock::new();
     REGISTRY.get_or_init(|| {
-        let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments([
+        let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments([
             "pyre_object",
             "unicodeobject",
             "box_str_constant",
@@ -77,7 +77,7 @@ pub(crate) fn try_fold_registered_symbolic_residual<Sym: WalkSym>(
     let Some(Value::Int(symbolic)) = ctx.trace_ctx.box_value(funcbox) else {
         return Ok(false);
     };
-    if !majit_translate::codewriter::call::is_symbolic_fnaddr(symbolic) {
+    if !majit_jitcode::codewriter::call::is_symbolic_fnaddr(symbolic) {
         return Ok(false);
     }
     let Some(entry) = registry().get(&symbolic) else {

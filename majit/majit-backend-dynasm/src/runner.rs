@@ -801,7 +801,7 @@ fn dynasm_alloc_oldgen_typed(type_id: u32, size: usize) -> GcRef {
 /// Non-GC descrs (`type_id == 0`, raw buffers) keep the plain zeroed malloc.
 /// A typed descr never does: absence/failure of its collector is NULL, the
 /// translated `do_malloc_fixedsize_clear` failure edge.
-fn bh_alloc_struct(sizedescr: &majit_translate::jitcode::BhDescr) -> *mut libc::c_void {
+fn bh_alloc_struct(sizedescr: &majit_jitcode::jitcode::BhDescr) -> *mut libc::c_void {
     let size = sizedescr.as_size();
     let type_id = sizedescr.resolve_gc_tid();
     let gc_ptr = if sizedescr.is_headerless() {
@@ -3597,11 +3597,11 @@ impl Backend for DynasmBackend {
         (descr.adr_jump_offset() != 0).then_some(false)
     }
 
-    fn bh_new(&self, sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
+    fn bh_new(&self, sizedescr: &majit_jitcode::jitcode::BhDescr) -> i64 {
         bh_alloc_struct(sizedescr) as i64
     }
 
-    fn bh_new_with_vtable(&self, sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
+    fn bh_new_with_vtable(&self, sizedescr: &majit_jitcode::jitcode::BhDescr) -> i64 {
         let vtable = sizedescr.get_vtable();
         let ptr = bh_alloc_struct(sizedescr);
         if !ptr.is_null() {
@@ -3619,7 +3619,7 @@ impl Backend for DynasmBackend {
     }
 
     /// llmodel.py bh_new_array / bh_new_array_clear.
-    fn bh_new_array(&self, length: i64, arraydescr: &majit_translate::jitcode::BhDescr) -> i64 {
+    fn bh_new_array(&self, length: i64, arraydescr: &majit_jitcode::jitcode::BhDescr) -> i64 {
         let Ok(length) = usize::try_from(length) else {
             return 0;
         };
@@ -3651,11 +3651,7 @@ impl Backend for DynasmBackend {
     }
 
     /// llmodel.py bh_new_array_clear = bh_new_array.
-    fn bh_new_array_clear(
-        &self,
-        length: i64,
-        arraydescr: &majit_translate::jitcode::BhDescr,
-    ) -> i64 {
+    fn bh_new_array_clear(&self, length: i64, arraydescr: &majit_jitcode::jitcode::BhDescr) -> i64 {
         self.bh_new_array(length, arraydescr)
     }
 
@@ -3693,7 +3689,7 @@ impl Backend for DynasmBackend {
         args_i: Option<&[i64]>,
         args_r: Option<&[i64]>,
         args_f: Option<&[i64]>,
-        calldescr: &majit_translate::jitcode::BhCallDescr,
+        calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> i64 {
         assert_ne!(func, 0, "bh_call_i: null function pointer");
         majit_backend::call_stub::verify_result_type(calldescr.result_type, "iS");
@@ -3718,7 +3714,7 @@ impl Backend for DynasmBackend {
         args_i: Option<&[i64]>,
         args_r: Option<&[i64]>,
         args_f: Option<&[i64]>,
-        calldescr: &majit_translate::jitcode::BhCallDescr,
+        calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
         assert_ne!(func, 0, "bh_call_r: null function pointer");
         majit_backend::call_stub::verify_result_type(calldescr.result_type, "r");
@@ -3744,7 +3740,7 @@ impl Backend for DynasmBackend {
         args_i: Option<&[i64]>,
         args_r: Option<&[i64]>,
         args_f: Option<&[i64]>,
-        calldescr: &majit_translate::jitcode::BhCallDescr,
+        calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> f64 {
         assert_ne!(func, 0, "bh_call_f: null function pointer");
         majit_backend::call_stub::verify_result_type(calldescr.result_type, "fL");
@@ -3771,7 +3767,7 @@ impl Backend for DynasmBackend {
         args_i: Option<&[i64]>,
         args_r: Option<&[i64]>,
         args_f: Option<&[i64]>,
-        calldescr: &majit_translate::jitcode::BhCallDescr,
+        calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) {
         assert_ne!(func, 0, "bh_call_v: null function pointer");
         majit_backend::call_stub::verify_result_type(calldescr.result_type, "v");
@@ -3791,7 +3787,7 @@ impl Backend for DynasmBackend {
         &self,
         addr: i64,
         offset: i64,
-        descr: &majit_translate::jitcode::BhDescr,
+        descr: &majit_jitcode::jitcode::BhDescr,
     ) -> i64 {
         // llmodel.py: ofs, size, sign = self.unpack_arraydescr_size(descr)
         // ofs == 0 always for raw lengthless arrays (llmodel.py:749 assert)
@@ -3807,7 +3803,7 @@ impl Backend for DynasmBackend {
         addr: i64,
         offset: i64,
         newvalue: i64,
-        descr: &majit_translate::jitcode::BhDescr,
+        descr: &majit_jitcode::jitcode::BhDescr,
     ) {
         // llmodel.py: ofs, size, _ = self.unpack_arraydescr_size(descr)
         // ofs == 0 always for raw lengthless arrays (llmodel.py:741 assert)
@@ -3821,7 +3817,7 @@ impl Backend for DynasmBackend {
         &self,
         addr: i64,
         offset: i64,
-        _descr: &majit_translate::jitcode::BhDescr,
+        _descr: &majit_jitcode::jitcode::BhDescr,
     ) -> f64 {
         // llmodel.py: return self.read_float_at_mem(addr, offset)
         self.read_float_at_mem(addr, offset)
@@ -3833,7 +3829,7 @@ impl Backend for DynasmBackend {
         addr: i64,
         offset: i64,
         newvalue: f64,
-        _descr: &majit_translate::jitcode::BhDescr,
+        _descr: &majit_jitcode::jitcode::BhDescr,
     ) {
         // llmodel.py: self.write_float_at_mem(addr, offset, newvalue)
         self.write_float_at_mem(addr, offset, newvalue);
@@ -3846,7 +3842,7 @@ impl Backend for DynasmBackend {
     fn bh_getfield_gc_i(
         &self,
         struct_ptr: i64,
-        fielddescr: &majit_translate::jitcode::BhDescr,
+        fielddescr: &majit_jitcode::jitcode::BhDescr,
     ) -> i64 {
         let (offset, size, sign) = fielddescr.unpack_fielddescr_size();
         self.read_int_at_mem(struct_ptr, offset as i64, size, sign)
@@ -3860,7 +3856,7 @@ impl Backend for DynasmBackend {
         &self,
         struct_ptr: i64,
         value: i64,
-        fielddescr: &majit_translate::jitcode::BhDescr,
+        fielddescr: &majit_jitcode::jitcode::BhDescr,
     ) {
         let (offset, size, _sign) = fielddescr.unpack_fielddescr_size();
         self.write_int_at_mem(struct_ptr, offset as i64, size, value);
@@ -3870,7 +3866,7 @@ impl Backend for DynasmBackend {
         &self,
         struct_ptr: i64,
         value: GcRef,
-        fielddescr: &majit_translate::jitcode::BhDescr,
+        fielddescr: &majit_jitcode::jitcode::BhDescr,
     ) {
         let offset = fielddescr.as_offset();
         unsafe { *((struct_ptr as *mut u8).add(offset) as *mut usize) = value.0 };
@@ -3891,7 +3887,7 @@ impl Backend for DynasmBackend {
         &self,
         array_ptr: i64,
         index: i64,
-        arraydescr: &majit_translate::jitcode::BhDescr,
+        arraydescr: &majit_jitcode::jitcode::BhDescr,
     ) -> i64 {
         let (base_size, itemsize, sign) = arraydescr.unpack_arraydescr_size();
         let offset = (base_size as i64) + index * (itemsize as i64);
@@ -3900,11 +3896,7 @@ impl Backend for DynasmBackend {
 
     /// model.py / llmodel.py bh_arraylen_gc.
     /// Read the length word from `arraydescr.lendescr.offset`.
-    fn bh_arraylen_gc(
-        &self,
-        array_ptr: i64,
-        arraydescr: &majit_translate::jitcode::BhDescr,
-    ) -> i64 {
+    fn bh_arraylen_gc(&self, array_ptr: i64, arraydescr: &majit_jitcode::jitcode::BhDescr) -> i64 {
         let ofs = arraydescr
             .array_len_offset()
             .expect("bh_arraylen_gc requires ArrayDescr.lendescr");
@@ -3919,7 +3911,7 @@ impl Backend for DynasmBackend {
         &self,
         array_ptr: i64,
         index: i64,
-        arraydescr: &majit_translate::jitcode::BhDescr,
+        arraydescr: &majit_jitcode::jitcode::BhDescr,
     ) -> majit_ir::GcRef {
         let base_size = arraydescr.array_base_size();
         let offset = (base_size as i64) + index * 8;
@@ -3935,7 +3927,7 @@ impl Backend for DynasmBackend {
         &self,
         array_ptr: i64,
         index: i64,
-        arraydescr: &majit_translate::jitcode::BhDescr,
+        arraydescr: &majit_jitcode::jitcode::BhDescr,
     ) -> f64 {
         let base_size = arraydescr.array_base_size();
         let offset = (base_size as i64) + index * 8;
@@ -3948,7 +3940,7 @@ impl Backend for DynasmBackend {
         array_ptr: i64,
         index: i64,
         newvalue: i64,
-        arraydescr: &majit_translate::jitcode::BhDescr,
+        arraydescr: &majit_jitcode::jitcode::BhDescr,
     ) {
         let (base_size, itemsize, _sign) = arraydescr.unpack_arraydescr_size();
         let offset = (base_size as i64) + index * (itemsize as i64);
@@ -3961,7 +3953,7 @@ impl Backend for DynasmBackend {
         array_ptr: i64,
         index: i64,
         newvalue: majit_ir::GcRef,
-        arraydescr: &majit_translate::jitcode::BhDescr,
+        arraydescr: &majit_jitcode::jitcode::BhDescr,
     ) {
         let base_size = arraydescr.array_base_size();
         let offset = (base_size as i64) + index * 8;
@@ -3984,7 +3976,7 @@ impl Backend for DynasmBackend {
         array_ptr: i64,
         index: i64,
         newvalue: f64,
-        arraydescr: &majit_translate::jitcode::BhDescr,
+        arraydescr: &majit_jitcode::jitcode::BhDescr,
     ) {
         let base_size = arraydescr.array_base_size();
         let offset = (base_size as i64) + index * 8;
@@ -3999,9 +3991,9 @@ impl Backend for DynasmBackend {
         array_ptr: i64,
         index: i64,
         newvalue: i64,
-        descr: &majit_translate::jitcode::BhDescr,
+        descr: &majit_jitcode::jitcode::BhDescr,
     ) {
-        let majit_translate::jitcode::BhDescr::InteriorField { array, field } = descr else {
+        let majit_jitcode::jitcode::BhDescr::InteriorField { array, field } = descr else {
             panic!("bh_setinteriorfield_gc_i: descr is not an InteriorField: {descr:?}");
         };
         let (base_size, itemsize, _) = array.unpack_arraydescr_size();
@@ -4017,9 +4009,9 @@ impl Backend for DynasmBackend {
         array_ptr: i64,
         index: i64,
         newvalue: majit_ir::GcRef,
-        descr: &majit_translate::jitcode::BhDescr,
+        descr: &majit_jitcode::jitcode::BhDescr,
     ) {
-        let majit_translate::jitcode::BhDescr::InteriorField { array, field } = descr else {
+        let majit_jitcode::jitcode::BhDescr::InteriorField { array, field } = descr else {
             panic!("bh_setinteriorfield_gc_r: descr is not an InteriorField: {descr:?}");
         };
         let (base_size, itemsize, _) = array.unpack_arraydescr_size();
@@ -4041,9 +4033,9 @@ impl Backend for DynasmBackend {
         array_ptr: i64,
         index: i64,
         newvalue: f64,
-        descr: &majit_translate::jitcode::BhDescr,
+        descr: &majit_jitcode::jitcode::BhDescr,
     ) {
-        let majit_translate::jitcode::BhDescr::InteriorField { array, field } = descr else {
+        let majit_jitcode::jitcode::BhDescr::InteriorField { array, field } = descr else {
             panic!("bh_setinteriorfield_gc_f: descr is not an InteriorField: {descr:?}");
         };
         let (base_size, itemsize, _) = array.unpack_arraydescr_size();
@@ -4059,7 +4051,7 @@ impl Backend for DynasmBackend {
     fn bh_getfield_gc_f(
         &self,
         struct_ptr: i64,
-        fielddescr: &majit_translate::jitcode::BhDescr,
+        fielddescr: &majit_jitcode::jitcode::BhDescr,
     ) -> f64 {
         let (offset, size, _) = fielddescr.unpack_fielddescr_size();
         let Some(ptr) = Self::raw_mem_ptr(struct_ptr, offset as i64) else {
@@ -4075,7 +4067,7 @@ impl Backend for DynasmBackend {
         &self,
         struct_ptr: i64,
         value: f64,
-        fielddescr: &majit_translate::jitcode::BhDescr,
+        fielddescr: &majit_jitcode::jitcode::BhDescr,
     ) {
         let (offset, size, _) = fielddescr.unpack_fielddescr_size();
         let Some(ptr) = Self::raw_mem_ptr(struct_ptr, offset as i64) else {
@@ -4266,7 +4258,7 @@ mod tests {
                 "Node.value".into(),
                 "value".into(),
             );
-            let bh = majit_translate::jitcode::BhDescr::from_field_descr(&fd);
+            let bh = majit_jitcode::jitcode::BhDescr::from_field_descr(&fd);
             assert_eq!(
                 backend.bh_getfield_gc_r(field_words.as_ptr() as i64, &bh),
                 majit_ir::GcRef(field_words[1])

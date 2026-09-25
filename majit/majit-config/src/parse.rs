@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::config::config::OptionValue;
+use crate::config::OptionValue;
 
 pub fn parse_info(text: &str) -> HashMap<String, OptionValue> {
     let text = text.trim_start();

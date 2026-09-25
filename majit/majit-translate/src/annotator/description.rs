@@ -42,7 +42,7 @@ use crate::flowspace::model::{
     BlockRefExt, ConstValue, Constant, HostObject, checkgraph, host_getattr,
 };
 use crate::flowspace::pygraph::PyGraph;
-use crate::tool::algo::unionfind::UnionFindInfo;
+use crate::tool::algo::unionfind::SharedUnionFindInfo;
 
 pub type GraphBuilder<'a> = Box<
     dyn FnOnce(
@@ -259,9 +259,9 @@ impl CallFamily {
     }
 }
 
-impl UnionFindInfo for Rc<RefCell<CallFamily>> {
-    fn absorb(&mut self, other: Self) {
-        self.borrow_mut().absorb(&other.borrow());
+impl SharedUnionFindInfo for CallFamily {
+    fn absorb_shared(this: &Rc<RefCell<Self>>, other: Rc<RefCell<Self>>) {
+        this.borrow_mut().absorb(&other.borrow());
     }
 }
 
@@ -325,9 +325,9 @@ impl FrozenAttrFamily {
     }
 }
 
-impl UnionFindInfo for Rc<RefCell<FrozenAttrFamily>> {
-    fn absorb(&mut self, other: Self) {
-        self.borrow_mut().absorb(&other.borrow());
+impl SharedUnionFindInfo for FrozenAttrFamily {
+    fn absorb_shared(this: &Rc<RefCell<Self>>, other: Rc<RefCell<Self>>) {
+        this.borrow_mut().absorb(&other.borrow());
     }
 }
 
@@ -408,14 +408,14 @@ impl ClassAttrFamily {
     }
 }
 
-impl UnionFindInfo for Rc<RefCell<ClassAttrFamily>> {
-    fn absorb(&mut self, other: Self) {
+impl SharedUnionFindInfo for ClassAttrFamily {
+    fn absorb_shared(this: &Rc<RefCell<Self>>, other: Rc<RefCell<Self>>) {
         // `absorb = update` (description.py). `update` propagates a
         // `UnionError`; `UnionFindInfo` has no Result channel, so we
         // swallow here — the error surfaces at the next
         // `get_s_value` / set_s_value consumer if the value becomes
         // malformed.
-        let _ = self.borrow_mut().absorb(&other.borrow());
+        let _ = this.borrow_mut().absorb(&other.borrow());
     }
 }
 

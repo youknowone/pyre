@@ -137,7 +137,7 @@ fn unbound_symbolic_residual_refuses_before_a_bound_residual_side_effect() {
             majit_ir::OopSpecIndex::None,
         ),
     );
-    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments([
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments([
         "unbound_symbolic_residual_refuses_before_a_bound_residual_side_effect",
     ]);
     let unbound = builder.add_fn_ptr(symbolic as usize as *const ());
@@ -311,7 +311,7 @@ fn arraylen_gc(array: u8, descr: u16, dst: u8) -> Vec<u8> {
 /// says a rewind covers it.
 #[test]
 fn a_blocker_on_an_arm_reached_without_an_effect_is_not_a_decline() {
-    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
     let mut code = goto_if_not(0, 11);
     code.extend(residual_call_with_funcbox(1));
     code.extend(void_return());
@@ -332,9 +332,9 @@ fn a_blocker_on_an_arm_reached_without_an_effect_is_not_a_decline() {
 /// the Python call and apply it twice.
 #[test]
 fn a_blocker_behind_an_executed_call_is_a_decline() {
-    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
     let real = 0x1234_5678i64;
-    assert!(!majit_translate::codewriter::call::is_symbolic_fnaddr(real));
+    assert!(!majit_jitcode::codewriter::call::is_symbolic_fnaddr(real));
 
     let mut code = residual_call_with_funcbox(1);
     code.extend(goto_if_not(0, 17));
@@ -360,7 +360,7 @@ fn a_blocker_behind_an_executed_call_is_a_decline() {
 /// would turn an effect and blocker that cannot execute into a false decline.
 #[test]
 fn a_known_goto_condition_does_not_scan_the_dead_arm() {
-    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
     let real = 0x1234_5678i64;
 
     // 0: i0 = const <src>; 3: goto_if_not i0 -> 20
@@ -399,7 +399,7 @@ fn a_known_goto_condition_does_not_scan_the_dead_arm() {
 /// so the path-sensitive scan must not join the arity-error arm back in.
 #[test]
 fn a_known_wrapper_array_length_selects_only_the_executed_arity_arm() {
-    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
     let real = 0x1234_5678i64;
 
     // 0: i0 = arraylen(r0); 5: goto_if_not i0 -> 22
@@ -440,7 +440,7 @@ fn a_known_wrapper_array_length_selects_only_the_executed_arity_arm() {
 /// conservative reading.
 #[test]
 fn a_blocker_behind_an_effect_free_call_is_not_a_decline() {
-    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
     let real = 0x1234_5678i64;
 
     let mut code = residual_call_with_funcbox(1);
@@ -480,7 +480,7 @@ fn a_blocker_behind_an_effect_free_call_is_not_a_decline() {
 /// fill from a `new*` keeps the conservative reading.
 #[test]
 fn a_write_into_a_fresh_allocation_is_not_an_effect() {
-    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
     let table = insns_opname_to_byte();
     let new = *table
         .get("new/d>r")
@@ -512,7 +512,7 @@ fn a_write_into_a_fresh_allocation_is_not_an_effect() {
 /// arm names; without the table every instruction start is a successor.
 #[test]
 fn a_switch_with_a_known_table_does_not_leak_its_state_to_every_start() {
-    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
     let real = 0x1234_5678i64;
     let switch = *insns_opname_to_byte()
         .get("switch/id")
@@ -552,9 +552,9 @@ fn a_switch_with_a_known_table_does_not_leak_its_state_to_every_start() {
 /// blocker no rollback covers.
 #[test]
 fn a_callees_rewindable_blocker_is_not_rewindable_behind_an_effect() {
-    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
     let real = 0x1234_5678i64;
-    let callee = majit_translate::codewriter::jitcode::DescentBlockerSummary {
+    let callee = majit_jitcode::codewriter::jitcode::DescentBlockerSummary {
         blocker_effect_free: Some(symbolic),
         ..Default::default()
     };
@@ -597,7 +597,7 @@ fn live() -> Vec<u8> {
     ];
     v.extend(std::iter::repeat_n(
         0u8,
-        majit_translate::liveness::OFFSET_SIZE,
+        majit_jitcode::liveness::OFFSET_SIZE,
     ));
     v
 }
@@ -615,7 +615,7 @@ fn catch_exception(target: u16) -> Vec<u8> {
 /// terminal would leave that whole region, and any blocker in it, unwalked.
 #[test]
 fn a_raise_caught_in_this_frame_reaches_its_handler() {
-    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
     let mut code = raise_r(0);
     code.extend(live());
     let handler = (code.len() + 3 + 1) as u16;
@@ -647,7 +647,7 @@ fn a_raise_caught_in_this_frame_reaches_its_handler() {
 /// unnamed, which reads as a body that has none.
 #[test]
 fn a_blocker_in_a_handler_reads_its_funcbox_from_the_surviving_constants() {
-    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
     let handler = 3 + 1;
     let mut code = catch_exception(handler);
     code.extend(void_return());
@@ -676,7 +676,7 @@ fn a_blocker_in_a_handler_reads_its_funcbox_from_the_surviving_constants() {
 /// it.
 #[test]
 fn an_inline_call_whose_callee_does_not_resolve_is_a_decline() {
-    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
     let mut code = inline_call_with_descr(7);
     code.extend(residual_call_with_funcbox(1));
     code.extend(void_return());
@@ -742,7 +742,7 @@ fn every_jitcode_descr_names_an_installed_body() {
 /// separate flag.
 #[test]
 fn a_body_that_does_not_decode_to_the_end_is_a_decline() {
-    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
     let mut code = residual_call_with_funcbox(0);
     let goto = goto_if_not(0, 5);
     code.extend(&goto[..goto.len() - 1]);
@@ -842,7 +842,7 @@ fn test_outer_resume_jitcode_index() -> u32 {
         return index;
     }
     let runtime_jc = majit_metainterp::jitcode::JitCode::new("guard_resume_test");
-    runtime_jc.set_body(majit_translate::jitcode::JitCodeBody {
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
         code: vec![crate::state::op_live(), 0, 0],
         startpoints: Some([0_usize].into_iter().collect()),
         ..Default::default()
@@ -870,7 +870,7 @@ fn after_residual_guard_uses_trailing_live_before_fallthrough_twin() {
         .expect("int_add/ii>i must be in the insns table");
     let live = crate::state::op_live();
     let runtime_jc = majit_metainterp::jitcode::JitCode::new("after_residual_marker_test");
-    runtime_jc.set_body(majit_translate::jitcode::JitCodeBody {
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
         // The immediate marker at pc=4 models the call's trailing `-live-`;
         // pc=7 models the later normal-fallthrough marker a Python-PC twin can
         // resolve to after `catch_exception/L`.
@@ -1283,7 +1283,7 @@ fn inline_call_callee_name(
     }
     let pool_index = code[op.pc + 1] as usize | ((code[op.pc + 2] as usize) << 8);
     match crate::jitcode_runtime::all_descrs().get(pool_index)? {
-        majit_translate::codewriter::jitcode::BhDescr::JitCode { jitcode_index, .. } => {
+        majit_jitcode::codewriter::jitcode::BhDescr::JitCode { jitcode_index, .. } => {
             crate::jitcode_runtime::all_jitcodes()
                 .get(*jitcode_index)
                 .map(|jitcode| jitcode.name.as_str())
@@ -1704,7 +1704,7 @@ fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
     );
 
     let runtime_jc = majit_metainterp::jitcode::JitCode::new("trace_too_long_arbitrary_pc");
-    runtime_jc.set_body(majit_translate::jitcode::JitCodeBody {
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
         code: vec![0, 0],
         c_num_regs_r: 3,
         // Two single-byte ops, so pc 1 is a post-step position that starts an
@@ -1734,7 +1734,7 @@ fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
     // blackhole `setposition`s onto it and dispatches, so it would read an
     // operand byte as an opcode.
     let mid_instruction_jc = majit_metainterp::jitcode::JitCode::new("trace_too_long_mid_insn");
-    mid_instruction_jc.set_body(majit_translate::jitcode::JitCodeBody {
+    mid_instruction_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
         code: vec![0, 0],
         c_num_regs_r: 3,
         startpoints: Some([0_usize].into_iter().collect()),
@@ -2227,14 +2227,14 @@ fn a_nonstandard_vable_array_access_does_not_promote_the_index() {
         tc.set_opref_concrete(index, Value::Int(0));
         assert!(!index.is_constant(), "the index box must be promotable");
 
-        let bh_array = majit_translate::jitcode::BhDescr::from_array_descr(
+        let bh_array = majit_jitcode::jitcode::BhDescr::from_array_descr(
             info.array_descrs[0]
                 .as_array_descr()
                 .expect("the fixture's array descr"),
         );
         let raw_pool = vec![
             majit_metainterp::jitcode::RuntimeBhDescr::Descr(Box::new(
-                majit_translate::jitcode::BhDescr::VableArray { index: 0 },
+                majit_jitcode::jitcode::BhDescr::VableArray { index: 0 },
             )),
             majit_metainterp::jitcode::RuntimeBhDescr::Descr(Box::new(bh_array)),
         ];
@@ -2821,10 +2821,10 @@ struct AllocTestCpu {
     block: i64,
 }
 impl majit_backend::Backend for AllocTestCpu {
-    fn bh_new(&self, _sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
+    fn bh_new(&self, _sizedescr: &majit_jitcode::jitcode::BhDescr) -> i64 {
         self.block
     }
-    fn bh_new_with_vtable(&self, _sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
+    fn bh_new_with_vtable(&self, _sizedescr: &majit_jitcode::jitcode::BhDescr) -> i64 {
         self.block
     }
     fn compile_loop(
@@ -4199,12 +4199,12 @@ fn int_truediv_and_newfloat_jitcodes_are_the_pypy_leaf() {
                 let name = descr_idx
                     .and_then(crate::jitcode_runtime::get_descr_by_index)
                     .map(|d| match d {
-                        majit_translate::jitcode::BhDescr::JitCode { jitcode_index, .. } => {
+                        majit_jitcode::jitcode::BhDescr::JitCode { jitcode_index, .. } => {
                             crate::jitcode_runtime::get_jitcode_ref_by_index(*jitcode_index)
                                 .map(|jc| format!("jitcode:{}", jc.name))
                                 .unwrap_or_else(|| format!("jitcode_idx:{jitcode_index}"))
                         }
-                        majit_translate::jitcode::BhDescr::Call { calldescr } => {
+                        majit_jitcode::jitcode::BhDescr::Call { calldescr } => {
                             format!("call:{calldescr:?}")
                         }
                         other => format!("{other:?}"),
@@ -4830,7 +4830,7 @@ fn descr_pool_with_jitcode_adapters(pool_len: usize) -> Vec<DescrRef> {
     let all_bh = crate::jitcode_runtime::all_descrs();
     (0..pool_len)
         .map(|i| match all_bh.get(i) {
-            Some(majit_translate::jitcode::BhDescr::JitCode { jitcode_index, .. }) => {
+            Some(majit_jitcode::jitcode::BhDescr::JitCode { jitcode_index, .. }) => {
                 make_jitcode_descr(*jitcode_index)
             }
             // Residual calls surfaced during inline_call recursion (e.g.
@@ -4838,7 +4838,7 @@ fn descr_pool_with_jitcode_adapters(pool_len: usize) -> Vec<DescrRef> {
             // `as_call_descr()`. Build a real CallDescr for `BhDescr::Call`
             // entries, mirroring production (`descr.rs make_call_descr_from_bh`),
             // so the walk does not surface ResidualCallDescrNotCallDescr.
-            Some(majit_translate::jitcode::BhDescr::Call { calldescr }) => {
+            Some(majit_jitcode::jitcode::BhDescr::Call { calldescr }) => {
                 crate::descr::make_call_descr_from_bh(calldescr)
             }
             _ => make_fail_descr(1 + i),
@@ -6089,7 +6089,7 @@ fn step_through_live_opcode_advances_by_offset_size() {
     assert_eq!(outcome, DispatchOutcome::Continue);
     assert_eq!(
         next_pc,
-        1 + majit_translate::liveness::OFFSET_SIZE,
+        1 + majit_jitcode::liveness::OFFSET_SIZE,
         "live/ must advance past the OFFSET_SIZE liveness slot",
     );
 }
@@ -10580,7 +10580,7 @@ fn run_symbolic_box_str_dispatch(
     // funcptr=i[0], one Ref arg r[0], descr=0, dst=r[1].
     let code = [residual_byte, 0, 1, 0, 0, 0, 1];
     let mut tc = fresh_trace_ctx();
-    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments([
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments([
         "pyre_object",
         "unicodeobject",
         "box_str_constant",
@@ -10684,7 +10684,7 @@ fn symbolic_box_str_constant_residual_folds_before_recording() {
 
 #[test]
 fn symbolic_box_str_constant_residual_declines_unsafe_arguments() {
-    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments([
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments([
         "pyre_object",
         "unicodeobject",
         "box_str_constant",
@@ -15614,8 +15614,8 @@ fn structural_midbody_anchor_requires_exact_floor_segment_start() {
 
 #[test]
 fn portal_vable_bookkeeping_anchor_accepts_only_same_pc_same_frame_vable_writes() {
+    use majit_jitcode::jitcode::BhDescr;
     use majit_metainterp::jitcode::RuntimeBhDescr;
-    use majit_translate::jitcode::BhDescr;
 
     let setfield = *insns_opname_to_byte()
         .get("setfield_vable_i/rid")
@@ -15681,8 +15681,8 @@ fn portal_vable_bookkeeping_anchor_accepts_only_same_pc_same_frame_vable_writes(
 
 #[test]
 fn portal_vable_bookkeeping_anchor_accepts_registered_entry_marker_prefix() {
+    use majit_jitcode::jitcode::BhDescr;
     use majit_metainterp::jitcode::RuntimeBhDescr;
-    use majit_translate::jitcode::BhDescr;
 
     let setfield = *insns_opname_to_byte()
         .get("setfield_vable_i/rid")
@@ -15732,8 +15732,8 @@ fn portal_vable_bookkeeping_anchor_accepts_registered_entry_marker_prefix() {
 /// sources live values from.
 #[test]
 fn portal_vable_bookkeeping_anchor_admits_this_frames_spills_and_reloads_only() {
+    use majit_jitcode::jitcode::BhDescr;
     use majit_metainterp::jitcode::RuntimeBhDescr;
-    use majit_translate::jitcode::BhDescr;
 
     let setarrayitem = *insns_opname_to_byte()
         .get("setarrayitem_vable_r/rirdd")

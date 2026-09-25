@@ -8,7 +8,9 @@ Declares the pyre crate table and delegates to the neutral engine in
 
 from __future__ import annotations
 
+import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -140,21 +142,19 @@ SPECS: dict[str, CrateSpec] = {
         name="pyre-jit",
         crate_dir=ROOT / "pyre" / "pyre-jit",
         output_name="pyre-jit.ullbc",
-        # `eval.rs` names moved optional types (`_tokenize`, `_json`,
-        # `_bz2`, `math`) through `pyre_module`.  Without the opaque
-        # marker Charon would re-translate those bodies — and the
-        # rustpython_common engines they call — into pyre-jit.ullbc.
-        charon_args=[
-            *PYRE_RUNTIME_CHARON_ARGS,
-            "--opaque",
-            "pyre_module",
-        ],
-        # `--no-default-features` drops `prepass` and nothing else (`dynasm` is
-        # the other default and is named): `pyre-jit-trace`'s build script
-        # then writes its placeholders without build-depending on a host copy
-        # of `pyre-interpreter` + `majit-translate`, the one unit set this pass
-        # compiled that no artefact ever read.
-        cargo_args=["--no-default-features", "--features", "{features}"],
+        charon_args=PYRE_RUNTIME_CHARON_ARGS,
+        # `--no-default-features` drops `prepass`: `pyre-jit-trace`'s build
+        # script then writes its placeholders without build-depending on a
+        # host copy of `pyre-interpreter` + `majit-translate`, the one unit
+        # set this pass compiled that no artefact ever read. `full` is named
+        # beside `{features}` because it is a default too, and dropping it
+        # would extract a JIT artefact whose module surface is the core
+        # build's. It is named on the interpreter rather than on this crate:
+        # this crate's `full` also turns on `pyre-jit-trace/full`, which links
+        # `pyre-module` into that build script and so brings the host copy
+        # of the interpreter back. The core driver replaces this spec and
+        # leaves `full` off.
+        cargo_args=["--no-default-features", "--features", "{features},pyre-interpreter/full"],
         # No layout sidecar. A cross-target pass has to pass cargo
         # `--target`, and cargo then stops applying `RUSTFLAGS` to host
         # units — including `pyre-jit-trace`'s build script, which
@@ -211,15 +211,47 @@ BASE_PATHSPECS = [
 
 
 def main() -> None:
+    # `PYRE_JIT_CORE=1` extracts the fast core: interpreter `full` stays off,
+    # so `_socket` / `_ssl` / `_ctypes` / `_cffi_backend` / `mmap` / `select`
+    # are not rustc inputs, and `pyre-module` is not extracted. Artefacts go
+    # to `build/llbc-jit-core` unless `LLBC_DEST` already names a directory,
+    # so they do not replace the product `build/llbc` set.
+    jit_core = os.environ.get("PYRE_JIT_CORE") == "1"
+    specs = SPECS
+    crates = DEFAULT_CRATES
+    layout_targets = LAYOUT_TARGETS
+    out_dir = ROOT / "build" / "llbc"
+    if jit_core:
+        specs = dict(SPECS)
+        # `dynasm` here is the interpreter's own feature (it forwards the
+        # metainterp backend). `full` stays off, so the six native-library
+        # modules are not rustc inputs. No wasm layout sidecar.
+        specs["pyre-interpreter"] = replace(
+            SPECS["pyre-interpreter"],
+            cargo_args=["--no-default-features", "--features", "host_env,dynasm"],
+            layout_targets=(),
+        )
+        # pyre-jit has no `host_env` feature; the interpreter dep names that
+        # itself. Leave `full` out of this `--features` list so the JIT
+        # artefact matches the core binary. `prepass` stays off, as in the
+        # product spec, because the build script must not re-enter extraction.
+        specs["pyre-jit"] = replace(
+            SPECS["pyre-jit"],
+            cargo_args=["--no-default-features", "--features", "dynasm"],
+        )
+        crates = [name for name in DEFAULT_CRATES if name != "pyre-module"]
+        layout_targets = ()
+        if "LLBC_DEST" not in os.environ:
+            out_dir = ROOT / "build" / "llbc-jit-core"
     run_cli(
-        SPECS,
-        DEFAULT_CRATES,
+        specs,
+        crates,
         root=ROOT,
-        out_dir=ROOT / "build" / "llbc",
+        out_dir=out_dir,
         extraction_abi=EXTRACTION_ABI,
         base_pathspecs=BASE_PATHSPECS,
         metadata_feature_crates=("pyre-interpreter", "pyre-jit"),
-        layout_targets=LAYOUT_TARGETS,
+        layout_targets=layout_targets,
         layout_target_rustflags=LAYOUT_TARGET_RUSTFLAGS,
     )
 
@@ -232,9 +264,12 @@ def main() -> None:
     modes_without_an_artefact = {"--fingerprint", "--list-inputs", "--self-test"}
     if not modes_without_an_artefact.intersection(sys.argv[1:]):
         requested = [arg for arg in sys.argv[1:] if not arg.startswith("-")]
-        crates = requested or DEFAULT_CRATES
-        dest_dir = llbc_dest_path(ROOT / "build" / "llbc", ROOT)
-        for crate in crates:
+        # `crates` is the set `run_cli` was just asked to extract. Falling
+        # back to `DEFAULT_CRATES` here would demand `pyre-module.ullbc` from
+        # a core run that deliberately did not produce it.
+        check_crates = requested or crates
+        dest_dir = llbc_dest_path(out_dir, ROOT)
+        for crate in check_crates:
             if crate not in {"pyre-module", "pyre-interpreter", "pyre-jit"}:
                 continue
             artefact = dest_dir / SPECS[crate].output_name

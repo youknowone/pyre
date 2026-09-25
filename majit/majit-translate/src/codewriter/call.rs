@@ -6,7 +6,11 @@
 //! which should remain as opaque calls ("residual").  Also handles builtin
 //! (oopspec) and recursive (portal) call classification.
 
-use parking_lot::Mutex;
+pub use majit_jitcode::codewriter::call::{
+    GreenFieldInfoHandle, SYMBOLIC_FNADDR_BASE, SYMBOLIC_FNADDR_HIGH_MASK, VirtualRefInfoHandle,
+    VirtualizableInfoHandle, is_symbolic_fnaddr, record_symbolic_fnaddr, stable_symbolic_fnaddr,
+    symbolic_fnaddr_for_path, symbolic_fnaddr_for_segments, symbolic_fnaddr_paths_snapshot,
+};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::OnceLock;
 
@@ -599,50 +603,6 @@ pub enum CallKind {
     Recursive,
 }
 
-/// virtualizable.py `VirtualizableInfo.is_vtypeptr(TYPE)` —
-/// identity check for the VTYPEPTR (struct-pointer type) the
-/// virtualizable describes.
-///
-/// TODO: pyre has no `lltype` so VTYPEPTR identity is
-/// expressed via a `usize` token (typically the SizeDescr identity from
-/// `majit_ir::descr::descr_identity`).  Hosts attach their rich
-/// `VirtualizableInfo` (defined in `majit-metainterp::virtualizable`) by
-/// implementing this trait so codewriter, which sits below metainterp in
-/// the crate graph, can still consult `jd.virtualizable_info` per
-/// `call.py CallControl.get_vinfo`.
-pub trait VirtualizableInfoHandle: std::fmt::Debug + Send + Sync {
-    /// virtualizable.py `is_vtypeptr(TYPE) → TYPE == self.VTYPEPTR`.
-    fn is_vtypeptr(&self, vtypeptr_id: usize) -> bool;
-    /// warmspot.py `WarmRunnerDesc.finish` → `vinfo.finish()`.
-    ///
-    /// `virtualizable.py VirtualizableInfo.finish` stamps
-    /// `clear_vable_ptr` / `clear_vable_descr`. The stamp happens at
-    /// construction (`set_clear_vable` / `build_pyframe_virtualizable_info`).
-    /// Residual `jit_force_virtualizable` rewrite lives on
-    /// [`CallControl::finish`] (`replace_force_virtualizable_with_call`
-    /// over the graphs this handle does not own). Default is a no-op.
-    fn finish(&self) {}
-    /// Codewriter-side VTYPE name (`red_types[index_of_virtualizable]`).
-    fn vtype_name(&self) -> Option<&str> {
-        None
-    }
-    /// `fname in vinfo.static_field_to_extra_box` (`jtransform.py
-    /// is_virtualizable_getset`).
-    fn has_static_field(&self, _name: &str) -> bool {
-        false
-    }
-    /// `fname in vinfo.array_fields` (`jtransform.py
-    /// is_virtualizable_getset`).
-    fn has_array_field(&self, _name: &str) -> bool {
-        false
-    }
-    /// `vinfo.static_field_to_extra_box[fieldname]` (`jtransform.py
-    /// get_virtualizable_field_descr`).
-    fn static_field_index(&self, _name: &str) -> Option<usize> {
-        None
-    }
-}
-
 /// Thin `VirtualizableInfo` for the codewriter. Runtime offsets live in
 /// `majit-metainterp::VirtualizableInfo`; this handle only answers
 /// `get_vinfo` / `is_virtualizable_getset` / `get_virtualizable_field_descr`.
@@ -725,49 +685,6 @@ pub(crate) fn names_same_type(a: &str, b: &str) -> bool {
             .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with("::"))
     };
     names_tail(a, b) || names_tail(b, a)
-}
-
-/// greenfield.py `GreenFieldInfo.green_fields` membership test.
-///
-/// TODO: same crate-boundary reasoning as
-/// `VirtualizableInfoHandle`.  Hosts implement this on their rich
-/// `GreenFieldInfo` so `CallControl.could_be_green_field`
-/// (call.py:387-393) can walk `jd.greenfield_info` without depending on
-/// metainterp.
-pub trait GreenFieldInfoHandle: std::fmt::Debug + Send + Sync {
-    /// `(GTYPE, fieldname) in self.green_fields`.
-    fn contains_green_field(&self, gtype: &str, fieldname: &str) -> bool;
-}
-
-/// `virtualref.py VirtualRefInfo` opaque carrier handle.
-///
-/// TODO: same crate-boundary reasoning as
-/// `VirtualizableInfoHandle`.  `VirtualRefInfo` is defined in
-/// `majit-metainterp::virtualref` (the JIT runtime side); codewriter
-/// sits below metainterp in the crate graph and cannot import it.
-/// Hosts implement this trait on `VirtualRefInfo` so
-/// `CodeWriter.setup_vrefinfo` (`codewriter.py`) can store the
-/// instance on `CallControl.virtualref_info`
-/// (`call.py CallControl virtualref_info = None`) for later forwarding to
-/// `metainterp_sd.virtualref_info = codewriter.callcontrol.virtualref_info`
-/// (`pyjitpl.py:2267`).  The three accessors expose the three `u32`
-/// descriptor indices the rebuilt `VirtualRefInfo` consumes on the
-/// metainterp side — `descr_virtual_token` / `descr_forced` index the
-/// `JitVirtualRef` field descriptors, `descr_size` indexes the struct
-/// size descriptor.
-pub trait VirtualRefInfoHandle: std::fmt::Debug + Send + Sync {
-    /// `virtualref.py:48 jit_virtual_ref_vtable` ↔ pyre
-    /// `VirtualRefInfo.descr_virtual_token` — field descr index for
-    /// `JitVirtualRef.virtual_token`.
-    fn descr_virtual_token(&self) -> u32;
-    /// `virtualref.py:49 jit_virtual_ref_vtable` ↔ pyre
-    /// `VirtualRefInfo.descr_forced` — field descr index for
-    /// `JitVirtualRef.forced`.
-    fn descr_forced(&self) -> u32;
-    /// `virtualref.py:48-49` size token ↔ pyre
-    /// `VirtualRefInfo.descr_size` — size descr index for the
-    /// `JitVirtualRef` struct itself.
-    fn descr_size(&self) -> u32;
 }
 
 /// `warmspot.py WarmRunnerDesc.__init__ VirtualRefInfo(self)` ↔ majit codewriter-time
@@ -2214,15 +2131,19 @@ struct DescrIndexRegistryInner {
     /// `effectinfo.py compute_bitstrings`. The value scales with the
     /// global descr count; `bitstring.make_bitstring` (`bitstring.py`)
     /// produces a bytestring whose length matches the largest index.
-    field_indices: HashMap<(Option<String>, String), u32>,
+    /// Keyed owner first, then field name, so a lookup borrows both parts
+    /// instead of building an owned key.
+    field_indices: rustc_hash::FxHashMap<Option<String>, rustc_hash::FxHashMap<String, u32>>,
     /// (item_ty_discriminant, array_type_id, len_offset) → unbounded `ei_index`.
     /// RPython: cpu.arraydescrof(ARRAY).get_ei_index()
-    array_indices: HashMap<(u8, Option<String>, Option<usize>), u32>,
+    array_indices:
+        rustc_hash::FxHashMap<(u8, Option<usize>), rustc_hash::FxHashMap<Option<String>, u32>>,
     /// (array_type_id, field_name) → unbounded `ei_index`.
     /// RPython: cpu.interiorfielddescrof(ARRAY, fieldname).get_ei_index()
     /// Separate from field_indices — RPython keys on (ARRAY, fieldname)
     /// not (STRUCT, fieldname).
-    interiorfield_indices: HashMap<(Option<String>, String), u32>,
+    interiorfield_indices:
+        rustc_hash::FxHashMap<Option<String>, rustc_hash::FxHashMap<String, u32>>,
     next_field_index: u32,
     next_array_index: u32,
     next_interiorfield_index: u32,
@@ -2237,13 +2158,20 @@ impl DescrIndexRegistry {
     /// (`effectinfo.py compute_bitstrings`).
     pub fn field_index(&self, owner_root: &Option<String>, field_name: &str) -> u32 {
         let mut inner = self.inner.borrow_mut();
-        let key = (owner_root.clone(), field_name.to_string());
-        if let Some(&idx) = inner.field_indices.get(&key) {
+        if let Some(&idx) = inner
+            .field_indices
+            .get(owner_root)
+            .and_then(|fields| fields.get(field_name))
+        {
             return idx;
         }
         let idx = inner.next_field_index;
         inner.next_field_index += 1;
-        inner.field_indices.insert(key, idx);
+        inner
+            .field_indices
+            .entry(owner_root.clone())
+            .or_default()
+            .insert(field_name.to_string(), idx);
         idx
     }
 
@@ -2255,29 +2183,56 @@ impl DescrIndexRegistry {
         len_offset: Option<usize>,
     ) -> u32 {
         let mut inner = self.inner.borrow_mut();
-        let canonical_id = array_type_id
-            .as_ref()
-            .map(|id| crate::front::typestr::canonical_array_type_id(id).into_owned());
-        let key = (item_ty_discriminant, canonical_id, len_offset);
-        if let Some(&idx) = inner.array_indices.get(&key) {
+        // `canonical_array_type_id` borrows its input unless it renames it,
+        // so the common lookup keys on the caller's own string.
+        let canonical_id: std::borrow::Cow<'_, Option<String>> = match array_type_id
+            .as_deref()
+            .map(crate::front::typestr::canonical_array_type_id)
+        {
+            Some(std::borrow::Cow::Borrowed(id))
+                if array_type_id
+                    .as_deref()
+                    .is_some_and(|orig| std::ptr::eq(orig, id)) =>
+            {
+                std::borrow::Cow::Borrowed(array_type_id)
+            }
+            other => std::borrow::Cow::Owned(other.map(std::borrow::Cow::into_owned)),
+        };
+        let shape = (item_ty_discriminant, len_offset);
+        if let Some(&idx) = inner
+            .array_indices
+            .get(&shape)
+            .and_then(|ids| ids.get(canonical_id.as_ref()))
+        {
             return idx;
         }
         let idx = inner.next_array_index;
         inner.next_array_index += 1;
-        inner.array_indices.insert(key, idx);
+        inner
+            .array_indices
+            .entry(shape)
+            .or_default()
+            .insert(canonical_id.into_owned(), idx);
         idx
     }
 
     /// RPython: `cpu.interiorfielddescrof(ARRAY, fieldname).get_ei_index()`
     pub fn interiorfield_index(&self, array_type_id: &Option<String>, field_name: &str) -> u32 {
         let mut inner = self.inner.borrow_mut();
-        let key = (array_type_id.clone(), field_name.to_string());
-        if let Some(&idx) = inner.interiorfield_indices.get(&key) {
+        if let Some(&idx) = inner
+            .interiorfield_indices
+            .get(array_type_id)
+            .and_then(|fields| fields.get(field_name))
+        {
             return idx;
         }
         let idx = inner.next_interiorfield_index;
         inner.next_interiorfield_index += 1;
-        inner.interiorfield_indices.insert(key, idx);
+        inner
+            .interiorfield_indices
+            .entry(array_type_id.clone())
+            .or_default()
+            .insert(field_name.to_string(), idx);
         idx
     }
 }
@@ -7800,72 +7755,6 @@ impl CallControl {
     }
 }
 
-/// High-16-bit tag stamped on every symbolic fnaddr hash so consumers can
-/// discriminate a placeholder from a real code address by an exact bit
-/// pattern instead of a range heuristic.  User-space addresses keep bits
-/// 48..64 clear on every 64-bit target pyre builds for, and wasm32 addresses
-/// are 32-bit, so no real funcptr can carry the tag.  (A bit-47 range test is
-/// NOT enough: aarch64 Linux uses a 48-bit VA and maps PIE code and mmap
-/// regions with bit 47 set — 0xaaab…/0xffff… — so every real funcptr there
-/// would read as symbolic.)  Same scheme as
-/// `assembler::STR_CONST_SENTINEL_BASE`.
-///
-/// Bit 63 stays CLEAR: `BhDescr::JitCode.fnaddr` also carries the synthetic
-/// tag, whose whole space is "negative `i64`"
-/// (`majit-backend::synthetic_cpu`: `SYNTHETIC_FNADDR_BASE = i64::MIN`,
-/// `is_synthetic_fnaddr(x) = x < 0`).  A tag setting bit 63 would put every
-/// symbolic hash inside that space, and `decode_synthetic` would answer with
-/// a fabricated jitcode index.
-pub const SYMBOLIC_FNADDR_HIGH_MASK: u64 = 0xFFFF_0000_0000_0000;
-pub const SYMBOLIC_FNADDR_BASE: u64 = 0x7ADD_0000_0000_0000;
-
-/// Whether `fnaddr` is a `symbolic_fnaddr_for_path` placeholder rather than a
-/// callable code address.
-#[inline]
-pub fn is_symbolic_fnaddr(fnaddr: i64) -> bool {
-    (fnaddr as u64) & SYMBOLIC_FNADDR_HIGH_MASK == SYMBOLIC_FNADDR_BASE
-}
-
-fn stable_symbolic_fnaddr<T: std::hash::Hash>(value: &T) -> i64 {
-    use std::hash::Hasher;
-
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    value.hash(&mut hasher);
-    ((hasher.finish() & !SYMBOLIC_FNADDR_HIGH_MASK) | SYMBOLIC_FNADDR_BASE) as i64
-}
-
-static SYMBOLIC_FNADDR_PATHS: OnceLock<Mutex<HashMap<i64, String>>> = OnceLock::new();
-
-fn record_symbolic_fnaddr(value: i64, description: String) {
-    let registry = SYMBOLIC_FNADDR_PATHS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut paths = registry.lock();
-    paths
-        .entry(value)
-        .and_modify(|existing| {
-            if description < *existing {
-                existing.clone_from(&description);
-            }
-        })
-        .or_insert(description);
-}
-
-pub(crate) fn symbolic_fnaddr_paths_snapshot() -> Vec<(i64, String)> {
-    let registry = SYMBOLIC_FNADDR_PATHS.get_or_init(|| Mutex::new(HashMap::new()));
-    let paths = registry.lock();
-    let mut snapshot: Vec<_> = paths
-        .iter()
-        .map(|(&value, description)| (value, description.clone()))
-        .collect();
-    snapshot.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
-    snapshot
-}
-
-pub(crate) fn symbolic_fnaddr_for_path(path: &CallPath) -> i64 {
-    let symbolic = stable_symbolic_fnaddr(path);
-    record_symbolic_fnaddr(symbolic, path.canonical_key());
-    symbolic
-}
-
 /// The `@jit.dont_look_inside` builder residual helpers (`rbuilder.py`
 /// `ll_append_res0` / `ll_append_res_slice`): the general residual targets the
 /// append / append_slice jit arms route through. When a native runtime helper
@@ -7894,13 +7783,6 @@ pub(crate) fn is_dont_look_inside_residual_helper(path: &CallPath) -> bool {
         path.last_segment(),
         Some("ll_append_res0") | Some("ll_append_res_slice")
     )
-}
-
-/// Compute the symbolic function address for the same segmented path shape
-/// used by the codewriter.
-pub fn symbolic_fnaddr_for_segments<'a>(segments: impl IntoIterator<Item = &'a str>) -> i64 {
-    let path = CallPath::from_segments(segments);
-    symbolic_fnaddr_for_path(&path)
 }
 
 pub(crate) fn symbolic_fnaddr_for_target(target: &CallTarget) -> i64 {
@@ -7944,6 +7826,7 @@ fn analyze_readwrite(
         return WriteAnalysis::bottom_result();
     };
     let mut analysis = WriteAnalysis::bottom_result();
+    let mut minted = MintedDescrs::default();
     let mut seen = HashSet::new();
     let mut is_top = false;
     apply_readwrite_replay(
@@ -7953,6 +7836,7 @@ fn analyze_readwrite(
         descr_indices,
         &mut seen,
         &mut analysis,
+        &mut minted,
         &mut is_top,
     );
     analysis.is_top = is_top;
@@ -7973,6 +7857,7 @@ fn analyze_readwrite_indirect_family(
         return WriteAnalysis::top_result();
     };
     let mut analysis = WriteAnalysis::bottom_result();
+    let mut minted = MintedDescrs::default();
     let mut seen = HashSet::new();
     let mut is_top = false;
     for path in graphs {
@@ -7983,6 +7868,7 @@ fn analyze_readwrite_indirect_family(
             descr_indices,
             &mut seen,
             &mut analysis,
+            &mut minted,
             &mut is_top,
         );
         if is_top {
@@ -8520,6 +8406,18 @@ pub(crate) fn extract_element_type_from_str(type_str: &str) -> Option<String> {
 /// / `arraydescrof` / `interiorfielddescrof` of each index still happens
 /// on the first DFS visit, and a later query repeats the mints that walk
 /// repeated.
+/// The `index()` of every descr already in each `WriteAnalysis` descr
+/// list, so a push tests membership without scanning the list.
+#[derive(Default)]
+struct MintedDescrs {
+    field_read: rustc_hash::FxHashSet<u32>,
+    field_write: rustc_hash::FxHashSet<u32>,
+    array_read: rustc_hash::FxHashSet<u32>,
+    array_write: rustc_hash::FxHashSet<u32>,
+    interior_read: rustc_hash::FxHashSet<u32>,
+    interior_write: rustc_hash::FxHashSet<u32>,
+}
+
 fn apply_readwrite_replay(
     path: &CallPath,
     function_graphs: &GraphStore,
@@ -8527,6 +8425,7 @@ fn apply_readwrite_replay(
     descr_indices: &DescrIndexRegistry,
     seen: &mut HashSet<CallPath>,
     acc: &mut WriteAnalysis,
+    minted: &mut MintedDescrs,
     is_top: &mut bool,
 ) {
     if *is_top {
@@ -8545,6 +8444,7 @@ fn apply_readwrite_replay(
             } => push_field_effect(
                 &mut acc.read_fields,
                 &mut acc.field_read_descrs,
+                &mut minted.field_read,
                 descr_indices,
                 cc,
                 owner_root,
@@ -8558,6 +8458,7 @@ fn apply_readwrite_replay(
             } => push_field_effect(
                 &mut acc.write_fields,
                 &mut acc.field_write_descrs,
+                &mut minted.field_write,
                 descr_indices,
                 cc,
                 owner_root,
@@ -8582,6 +8483,7 @@ fn apply_readwrite_replay(
                 push_array_effect(
                     &mut acc.read_arrays,
                     &mut acc.array_read_descrs,
+                    &mut minted.array_read,
                     descr_indices,
                     cc,
                     &resolved_id,
@@ -8607,6 +8509,7 @@ fn apply_readwrite_replay(
                 push_array_effect(
                     &mut acc.write_arrays,
                     &mut acc.array_write_descrs,
+                    &mut minted.array_write,
                     descr_indices,
                     cc,
                     &resolved_id,
@@ -8636,8 +8539,10 @@ fn apply_readwrite_replay(
                 push_interior_effect(
                     &mut acc.read_interiorfields,
                     &mut acc.interior_read_descrs,
+                    &mut minted.interior_read,
                     &mut acc.read_arrays,
                     &mut acc.array_read_descrs,
+                    &mut minted.array_read,
                     descr_indices,
                     cc,
                     &resolved_id,
@@ -8667,8 +8572,10 @@ fn apply_readwrite_replay(
                 push_interior_effect(
                     &mut acc.write_interiorfields,
                     &mut acc.interior_write_descrs,
+                    &mut minted.interior_write,
                     &mut acc.write_arrays,
                     &mut acc.array_write_descrs,
+                    &mut minted.array_write,
                     descr_indices,
                     cc,
                     &resolved_id,
@@ -8688,6 +8595,7 @@ fn apply_readwrite_replay(
                         descr_indices,
                         seen,
                         acc,
+                        minted,
                         is_top,
                     );
                 }
@@ -8705,6 +8613,7 @@ fn apply_readwrite_replay(
                         descr_indices,
                         seen,
                         acc,
+                        minted,
                         is_top,
                     );
                     if *is_top {
@@ -8719,6 +8628,7 @@ fn apply_readwrite_replay(
 fn push_field_effect(
     indices: &mut Vec<u32>,
     descrs: &mut Vec<EffectDescr>,
+    minted: &mut rustc_hash::FxHashSet<u32>,
     descr_indices: &DescrIndexRegistry,
     cc: &CallControl,
     owner_root: &Option<String>,
@@ -8728,9 +8638,10 @@ fn push_field_effect(
     let idx = descr_indices.field_index(owner_root, name);
     indices.push(idx);
     if let Some(owner) = owner_root.as_deref()
-        && !descrs.iter().any(|d| d.0.index() == idx)
+        && !minted.contains(&idx)
         && let Some(descr) = cc.fielddescrof_keyed(idx, owner, owner_id, name)
     {
+        minted.insert(descr.0.index());
         descrs.push((descr.0, Some(descr.1)));
     }
 }
@@ -8738,6 +8649,7 @@ fn push_field_effect(
 fn push_array_effect(
     indices: &mut Vec<u32>,
     descrs: &mut Vec<EffectDescr>,
+    minted: &mut rustc_hash::FxHashSet<u32>,
     descr_indices: &DescrIndexRegistry,
     cc: &CallControl,
     resolved_id: &Option<String>,
@@ -8746,21 +8658,21 @@ fn push_array_effect(
 ) {
     let idx = descr_indices.array_index(value_type_discriminant(item_ty), resolved_id, len_offset);
     indices.push(idx);
-    if !descrs.iter().any(|d| d.0.index() == idx) {
-        descrs.push(cc.arraydescrof_keyed(
-            idx,
-            resolved_id,
-            effect_array_ir_type(item_ty),
-            len_offset,
-        ));
+    if !minted.contains(&idx) {
+        let descr =
+            cc.arraydescrof_keyed(idx, resolved_id, effect_array_ir_type(item_ty), len_offset);
+        minted.insert(descr.0.index());
+        descrs.push(descr);
     }
 }
 
 fn push_interior_effect(
     interior_indices: &mut Vec<u32>,
     interior_descrs: &mut Vec<EffectDescr>,
+    interior_minted: &mut rustc_hash::FxHashSet<u32>,
     array_indices: &mut Vec<u32>,
     array_descrs: &mut Vec<EffectDescr>,
+    array_minted: &mut rustc_hash::FxHashSet<u32>,
     descr_indices: &DescrIndexRegistry,
     cc: &CallControl,
     resolved_id: &Option<String>,
@@ -8769,9 +8681,10 @@ fn push_interior_effect(
 ) {
     let ifield_idx = descr_indices.interiorfield_index(resolved_id, field_name);
     interior_indices.push(ifield_idx);
-    if !interior_descrs.iter().any(|d| d.0.index() == ifield_idx)
+    if !interior_minted.contains(&ifield_idx)
         && let Some(descr) = cc.interiorfielddescrof_keyed(ifield_idx, resolved_id, field_name)
     {
+        interior_minted.insert(descr.0.index());
         interior_descrs.push((descr.0, Some(descr.1)));
     }
     let arr_idx = descr_indices.array_index(
@@ -8780,13 +8693,11 @@ fn push_interior_effect(
         len_offset,
     );
     array_indices.push(arr_idx);
-    if !array_descrs.iter().any(|d| d.0.index() == arr_idx) {
-        array_descrs.push(cc.arraydescrof_keyed(
-            arr_idx,
-            resolved_id,
-            majit_ir::value::Type::Ref,
-            len_offset,
-        ));
+    if !array_minted.contains(&arr_idx) {
+        let descr =
+            cc.arraydescrof_keyed(arr_idx, resolved_id, majit_ir::value::Type::Ref, len_offset);
+        array_minted.insert(descr.0.index());
+        array_descrs.push(descr);
     }
 }
 

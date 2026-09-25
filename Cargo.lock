@@ -1933,7 +1933,7 @@ dependencies = [
  "libc",
  "majit-gc",
  "majit-ir",
- "majit-translate",
+ "majit-jitcode",
  "parking_lot",
  "region",
 ]
@@ -1951,7 +1951,7 @@ dependencies = [
  "majit-backend",
  "majit-gc",
  "majit-ir",
- "majit-translate",
+ "majit-jitcode",
  "parking_lot",
  "region",
  "smallvec",
@@ -1969,8 +1969,8 @@ dependencies = [
  "majit-backend",
  "majit-gc",
  "majit-ir",
+ "majit-jitcode",
  "majit-trace",
- "majit-translate",
  "parking_lot",
  "rustc-hash",
  "smallvec",
@@ -1984,7 +1984,7 @@ dependencies = [
  "majit-backend",
  "majit-gc",
  "majit-ir",
- "majit-translate",
+ "majit-jitcode",
  "parking_lot",
  "smallvec",
  "wasm-bindgen",
@@ -2008,6 +2008,13 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "majit-config"
+version = "0.0.2"
+dependencies = [
+ "parking_lot",
 ]
 
 [[package]]
@@ -2036,14 +2043,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "majit-jitcode"
+version = "0.0.2"
+dependencies = [
+ "bincode",
+ "indexmap",
+ "majit-ir",
+ "parking_lot",
+ "rustc-hash",
+ "serde",
+ "vecset",
+]
+
+[[package]]
 name = "majit-macros"
 version = "0.0.2"
 dependencies = [
  "ctor",
  "linkme",
  "majit-ir",
+ "majit-jitcode",
  "majit-metainterp",
- "majit-translate",
  "proc-macro2",
  "quote",
  "syn",
@@ -2063,9 +2083,12 @@ dependencies = [
  "majit-backend-cranelift",
  "majit-backend-dynasm",
  "majit-backend-wasm",
+ "majit-config",
  "majit-gc",
  "majit-ir",
+ "majit-jitcode",
  "majit-macros",
+ "majit-rlib",
  "majit-trace",
  "majit-translate",
  "parking_lot",
@@ -2114,7 +2137,9 @@ dependencies = [
  "indexmap",
  "libc",
  "majit-charon-reader",
+ "majit-config",
  "majit-ir",
+ "majit-jitcode",
  "md-5 0.10.6",
  "parking_lot",
  "proc-macro2",
@@ -2796,11 +2821,11 @@ dependencies = [
  "majit-backend-wasm",
  "majit-gc",
  "majit-ir",
+ "majit-jitcode",
  "majit-macros",
  "majit-metainterp",
  "majit-rlib",
  "majit-trace",
- "majit-translate",
  "num-traits",
  "parking_lot",
  "pyre-interpreter",
@@ -2828,6 +2853,7 @@ dependencies = [
  "majit-backend-wasm",
  "majit-gc",
  "majit-ir",
+ "majit-jitcode",
  "majit-macros",
  "majit-metainterp",
  "majit-rlib",

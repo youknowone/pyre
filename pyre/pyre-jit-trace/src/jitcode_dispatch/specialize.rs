@@ -3949,12 +3949,11 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         }
     }
 
-    // `module/mod.rs` gates `_cffi_backend` on the same two conditions.
-    #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
-    if let Some(lib) =
-        pyre_module::module::_cffi_backend::lib_obj::W_LibObject::from_obj(concrete_obj)
+    // `_cffi_backend` answers through the optional-module hooks; a build
+    // without it has no `Lib` object to recognise.
+    if let Some(hooks) = pyre_interpreter::importing::optional_module_hooks()
+        && let Some(w_dict) = (hooks.cffi_lib_dict)(concrete_obj)
         && spec_gate(SpecFold::LoadAttrCffiLib, || {
-            let w_dict = lib.dict_w;
             if w_dict.is_null() || majit_gc::can_move(majit_ir::GcRef(w_dict as usize)) {
                 return Ok(None);
             }
@@ -3970,8 +3969,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
                 // a live C-memory read; returning the dict cell would expose
                 // the support object itself, and `lib_setattr` does not mutate
                 // the dict version when it writes through the support object.
-                || pyre_module::module::_cffi_backend::cglob::W_GlobSupport::from_obj(stored)
-                    .is_some()
+                || (hooks.cffi_is_glob_support)(stored)
             {
                 return Ok(None);
             }
@@ -15918,6 +15916,14 @@ impl MathFloatDomain {
     }
 }
 
+/// Whether `callable` is the canonical builtin `math.<name>`, asked of the
+/// `math` module through the optional-module hooks.
+fn is_math_builtin(callable: pyre_object::PyObjectRef, name: &str) -> bool {
+    pyre_interpreter::importing::optional_module_hooks()
+        .and_then(|hooks| (hooks.math_builtin_name)(callable))
+        == Some(name)
+}
+
 /// `math.sqrt(x)` on an exact int/float argument: the domain-guarded pure
 /// `CALL_F(sqrt_nonneg_jit)` (ll_math.rs `ll_math_sqrt` → `sqrt_nonneg`) in
 /// place of the opaque `bh_call_fn(sqrt_builtin, NULL, x)` residual.  A
@@ -15931,9 +15937,7 @@ pub(crate) fn try_walker_specialize_math_sqrt<Sym: WalkSym>(
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
     if let Some((callable, operands)) = plain_builtin_call_concretes(ctx, code, op, r_args, 1) {
-        if pyre_module::module::math::interp_math::is_math_sqrt_function(callable)
-            && r_args.len() >= 3
-        {
+        if is_math_builtin(callable, "sqrt") && r_args.len() >= 3 {
             walker_guard_fold_callable(ctx, op.pc, r_args[0], callable)?;
             if try_walker_orthodox_float_sqrt(ctx, op.pc, r_args[2], operands[0], dst, 'r')?
                 .is_some()
@@ -15957,14 +15961,13 @@ pub(crate) fn try_walker_specialize_math_log_trig<Sym: WalkSym>(
 ) -> Result<Option<()>, DispatchError> {
     if let Some((callable, operands)) = plain_builtin_call_concretes(ctx, code, op, r_args, 1) {
         if r_args.len() >= 3 {
-            use pyre_module::module::math::interp_math;
-            let walked = if interp_math::is_math_sin_function(callable) {
+            let walked = if is_math_builtin(callable, "sin") {
                 walker_guard_fold_callable(ctx, op.pc, r_args[0], callable)?;
                 try_walker_orthodox_float_sin(ctx, op.pc, r_args[2], operands[0], dst, 'r')?
-            } else if interp_math::is_math_cos_function(callable) {
+            } else if is_math_builtin(callable, "cos") {
                 walker_guard_fold_callable(ctx, op.pc, r_args[0], callable)?;
                 try_walker_orthodox_float_cos(ctx, op.pc, r_args[2], operands[0], dst, 'r')?
-            } else if interp_math::is_math_log_function(callable) {
+            } else if is_math_builtin(callable, "log") {
                 walker_guard_fold_callable(ctx, op.pc, r_args[0], callable)?;
                 try_walker_orthodox_float_math1(
                     ctx,
@@ -16001,9 +16004,7 @@ pub(crate) fn try_walker_specialize_math_frexp<Sym: WalkSym>(
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
     if let Some((callable, operands)) = plain_builtin_call_concretes(ctx, code, op, r_args, 1) {
-        if pyre_module::module::math::interp_math::is_math_frexp_function(callable)
-            && r_args.len() >= 3
-        {
+        if is_math_builtin(callable, "frexp") && r_args.len() >= 3 {
             walker_guard_fold_callable(ctx, op.pc, r_args[0], callable)?;
             if try_walker_orthodox_frexp(ctx, op.pc, r_args[2], operands[0], dst, 'r')?.is_some() {
                 return Ok(Some(()));
@@ -16142,9 +16143,7 @@ pub(crate) fn try_walker_specialize_math_ldexp<Sym: WalkSym>(
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
     if let Some((callable, operands)) = plain_builtin_call_concretes(ctx, code, op, r_args, 2) {
-        if pyre_module::module::math::interp_math::is_math_ldexp_function(callable)
-            && r_args.len() >= 4
-        {
+        if is_math_builtin(callable, "ldexp") && r_args.len() >= 4 {
             walker_guard_fold_callable(ctx, op.pc, r_args[0], callable)?;
             if try_walker_orthodox_ldexp(
                 ctx,
@@ -16251,9 +16250,7 @@ pub(crate) fn try_walker_specialize_math_isqrt<Sym: WalkSym>(
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
     if let Some((callable, operands)) = plain_builtin_call_concretes(ctx, code, op, r_args, 1) {
-        if pyre_module::module::math::interp_math::is_math_isqrt_function(callable)
-            && r_args.len() >= 3
-        {
+        if is_math_builtin(callable, "isqrt") && r_args.len() >= 3 {
             walker_guard_fold_callable(ctx, op.pc, r_args[0], callable)?;
             if try_walker_orthodox_isqrt(ctx, op.pc, r_args[2], operands[0], dst, 'r')?.is_some() {
                 return Ok(Some(()));
@@ -16570,10 +16567,9 @@ impl Math1ResultCheck {
                 if x <= 0.0 && x == x.trunc() {
                     return false;
                 }
-                pyre_module::module::math::interp_math::math1_gamma_result_finite(
-                    x,
-                    matches!(self, Self::Lgamma),
-                )
+                pyre_interpreter::importing::optional_module_hooks().is_some_and(|hooks| {
+                    (hooks.math1_gamma_result_finite)(x, matches!(self, Self::Lgamma))
+                })
             }
         }
     }
@@ -16586,134 +16582,133 @@ impl Math1ResultCheck {
 fn math1_descent_for(
     callable: pyre_object::PyObjectRef,
 ) -> Option<(&'static HelperDescent, MathFloatDomain, Math1ResultCheck)> {
-    use pyre_module::module::math::interp_math as m;
-    if m::is_math_tan_function(callable) {
+    if is_math_builtin(callable, "tan") {
         Some((
             &FLOAT_TAN_DESCENT,
             MathFloatDomain::Finite,
             Math1ResultCheck::None,
         ))
-    } else if m::is_math_atan_function(callable) {
+    } else if is_math_builtin(callable, "atan") {
         Some((
             &FLOAT_ATAN_DESCENT,
             MathFloatDomain::Finite,
             Math1ResultCheck::None,
         ))
-    } else if m::is_math_exp_function(callable) {
+    } else if is_math_builtin(callable, "exp") {
         Some((
             &FLOAT_EXP_DESCENT,
             MathFloatDomain::Finite,
             Math1ResultCheck::Exp,
         ))
-    } else if m::is_math_log1p_function(callable) {
+    } else if is_math_builtin(callable, "log1p") {
         Some((
             &FLOAT_LOG1P_DESCENT,
             MathFloatDomain::GreaterThanMinusOne,
             Math1ResultCheck::None,
         ))
-    } else if m::is_math_asin_function(callable) {
+    } else if is_math_builtin(callable, "asin") {
         Some((
             &FLOAT_ASIN_DESCENT,
             MathFloatDomain::AbsLeOne,
             Math1ResultCheck::None,
         ))
-    } else if m::is_math_acos_function(callable) {
+    } else if is_math_builtin(callable, "acos") {
         Some((
             &FLOAT_ACOS_DESCENT,
             MathFloatDomain::AbsLeOne,
             Math1ResultCheck::None,
         ))
-    } else if m::is_math_sinh_function(callable) {
+    } else if is_math_builtin(callable, "sinh") {
         Some((
             &FLOAT_SINH_DESCENT,
             MathFloatDomain::Finite,
             Math1ResultCheck::Sinh,
         ))
-    } else if m::is_math_cosh_function(callable) {
+    } else if is_math_builtin(callable, "cosh") {
         Some((
             &FLOAT_COSH_DESCENT,
             MathFloatDomain::Finite,
             Math1ResultCheck::Cosh,
         ))
-    } else if m::is_math_tanh_function(callable) {
+    } else if is_math_builtin(callable, "tanh") {
         Some((
             &FLOAT_TANH_DESCENT,
             MathFloatDomain::Finite,
             Math1ResultCheck::None,
         ))
-    } else if m::is_math_asinh_function(callable) {
+    } else if is_math_builtin(callable, "asinh") {
         Some((
             &FLOAT_ASINH_DESCENT,
             MathFloatDomain::Finite,
             Math1ResultCheck::None,
         ))
-    } else if m::is_math_acosh_function(callable) {
+    } else if is_math_builtin(callable, "acosh") {
         Some((
             &FLOAT_ACOSH_DESCENT,
             MathFloatDomain::GreaterEqualOne,
             Math1ResultCheck::None,
         ))
-    } else if m::is_math_atanh_function(callable) {
+    } else if is_math_builtin(callable, "atanh") {
         Some((
             &FLOAT_ATANH_DESCENT,
             MathFloatDomain::AbsLtOne,
             Math1ResultCheck::None,
         ))
-    } else if m::is_math_cbrt_function(callable) {
+    } else if is_math_builtin(callable, "cbrt") {
         Some((
             &FLOAT_CBRT_DESCENT,
             MathFloatDomain::Total,
             Math1ResultCheck::None,
         ))
-    } else if m::is_math_exp2_function(callable) {
+    } else if is_math_builtin(callable, "exp2") {
         Some((
             &FLOAT_EXP2_DESCENT,
             MathFloatDomain::Finite,
             Math1ResultCheck::Exp2,
         ))
-    } else if m::is_math_expm1_function(callable) {
+    } else if is_math_builtin(callable, "expm1") {
         Some((
             &FLOAT_EXPM1_DESCENT,
             MathFloatDomain::Finite,
             Math1ResultCheck::Expm1,
         ))
-    } else if m::is_math_erf_function(callable) {
+    } else if is_math_builtin(callable, "erf") {
         Some((
             &FLOAT_ERF_DESCENT,
             MathFloatDomain::Total,
             Math1ResultCheck::None,
         ))
-    } else if m::is_math_erfc_function(callable) {
+    } else if is_math_builtin(callable, "erfc") {
         Some((
             &FLOAT_ERFC_DESCENT,
             MathFloatDomain::Total,
             Math1ResultCheck::None,
         ))
-    } else if m::is_math_gamma_function(callable) {
+    } else if is_math_builtin(callable, "gamma") {
         Some((
             &FLOAT_GAMMA_DESCENT,
             MathFloatDomain::Finite,
             Math1ResultCheck::Gamma,
         ))
-    } else if m::is_math_lgamma_function(callable) {
+    } else if is_math_builtin(callable, "lgamma") {
         Some((
             &FLOAT_LGAMMA_DESCENT,
             MathFloatDomain::Finite,
             Math1ResultCheck::Lgamma,
         ))
-    } else if m::is_math_ulp_function(callable) {
+    } else if is_math_builtin(callable, "ulp") {
         Some((
             &FLOAT_ULP_DESCENT,
             MathFloatDomain::Total,
             Math1ResultCheck::None,
         ))
-    } else if m::is_math_degrees_function(callable) {
+    } else if is_math_builtin(callable, "degrees") {
         Some((
             &FLOAT_DEGREES_DESCENT,
             MathFloatDomain::Total,
             Math1ResultCheck::None,
         ))
-    } else if m::is_math_radians_function(callable) {
+    } else if is_math_builtin(callable, "radians") {
         Some((
             &FLOAT_RADIANS_DESCENT,
             MathFloatDomain::Total,
@@ -16863,16 +16858,15 @@ impl MathFloat2Domain {
 fn math2_descent_for(
     callable: pyre_object::PyObjectRef,
 ) -> Option<(&'static HelperDescent, MathFloat2Domain)> {
-    use pyre_module::module::math::interp_math as m;
-    if m::is_math_pow_function(callable) {
+    if is_math_builtin(callable, "pow") {
         Some((&FLOAT_POW_DESCENT, MathFloat2Domain::Pow))
-    } else if m::is_math_fmod_function(callable) {
+    } else if is_math_builtin(callable, "fmod") {
         Some((&FLOAT_FMOD_DESCENT, MathFloat2Domain::YNonZero))
-    } else if m::is_math_copysign_function(callable) {
+    } else if is_math_builtin(callable, "copysign") {
         Some((&FLOAT_COPYSIGN_DESCENT, MathFloat2Domain::Total))
-    } else if m::is_math_remainder_function(callable) {
+    } else if is_math_builtin(callable, "remainder") {
         Some((&FLOAT_REMAINDER_DESCENT, MathFloat2Domain::YNonZero))
-    } else if m::is_math_atan2_function(callable) {
+    } else if is_math_builtin(callable, "atan2") {
         Some((&FLOAT_ATAN2_DESCENT, MathFloat2Domain::Total))
     } else {
         None
@@ -16949,9 +16943,7 @@ pub(crate) fn try_walker_specialize_math_fabs<Sym: WalkSym>(
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
     if let Some((callable, operands)) = plain_builtin_call_concretes(ctx, code, op, r_args, 1) {
-        if pyre_module::module::math::interp_math::is_math_fabs_function(callable)
-            && r_args.len() >= 3
-        {
+        if is_math_builtin(callable, "fabs") && r_args.len() >= 3 {
             walker_guard_fold_callable(ctx, op.pc, r_args[0], callable)?;
             if try_walker_orthodox_float_abs(ctx, op.pc, r_args[2], operands[0], dst, 'r')?
                 .is_some()
@@ -17012,12 +17004,12 @@ pub(crate) fn try_walker_specialize_math_round_to_int<Sym: WalkSym>(
     if concrete_callable.is_null() || !null_or_self.is_null() || arg_obj.is_null() {
         return Ok(None);
     }
-    let is_this_builtin: fn(pyre_object::PyObjectRef) -> bool = match mode {
-        MathRoundMode::Floor => pyre_module::module::math::interp_math::is_math_floor_function,
-        MathRoundMode::Ceil => pyre_module::module::math::interp_math::is_math_ceil_function,
-        MathRoundMode::Trunc => pyre_module::module::math::interp_math::is_math_trunc_function,
+    let builtin_name = match mode {
+        MathRoundMode::Floor => "floor",
+        MathRoundMode::Ceil => "ceil",
+        MathRoundMode::Trunc => "trunc",
     };
-    if !is_this_builtin(concrete_callable) {
+    if !is_math_builtin(concrete_callable, builtin_name) {
         return Ok(None);
     }
     let value = unsafe {
@@ -17252,7 +17244,7 @@ pub(crate) fn try_walker_specialize_math_isclose<Sym: WalkSym>(
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
     if let Some((callable, operands)) = plain_builtin_call_concretes(ctx, code, op, r_args, 2) {
-        if pyre_module::module::math::interp_math::is_math_isclose_function(callable) {
+        if is_math_builtin(callable, "isclose") {
             walker_guard_fold_callable(ctx, op.pc, r_args[0], callable)?;
             if try_walker_orthodox_float_math2(
                 ctx,

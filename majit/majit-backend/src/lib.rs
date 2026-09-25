@@ -3547,7 +3547,7 @@ pub trait Backend: Send {
     fn bh_getfield_gc_i(
         &self,
         struct_ptr: i64,
-        fielddescr: &majit_translate::jitcode::BhDescr,
+        fielddescr: &majit_jitcode::jitcode::BhDescr,
     ) -> i64 {
         let (offset, size, sign) = fielddescr.unpack_fielddescr_size();
         let addr = (struct_ptr as usize).wrapping_add(offset);
@@ -3574,7 +3574,7 @@ pub trait Backend: Send {
     fn bh_getfield_gc_r(
         &self,
         struct_ptr: i64,
-        fielddescr: &majit_translate::jitcode::BhDescr,
+        fielddescr: &majit_jitcode::jitcode::BhDescr,
     ) -> GcRef {
         let offset = fielddescr.as_offset();
         // `llmodel.py bh_getfield_gc_r` always loads the value. Address
@@ -3589,7 +3589,7 @@ pub trait Backend: Send {
     fn bh_getfield_gc_f(
         &self,
         struct_ptr: i64,
-        fielddescr: &majit_translate::jitcode::BhDescr,
+        fielddescr: &majit_jitcode::jitcode::BhDescr,
     ) -> f64 {
         let (offset, size, _) = fielddescr.unpack_fielddescr_size();
         // SAFETY: see `bh_getfield_gc_i`.
@@ -3604,7 +3604,7 @@ pub trait Backend: Send {
         &self,
         struct_ptr: i64,
         newvalue: i64,
-        fielddescr: &majit_translate::jitcode::BhDescr,
+        fielddescr: &majit_jitcode::jitcode::BhDescr,
     ) {
         let (offset, size, _sign) = fielddescr.unpack_fielddescr_size();
         // SAFETY: `struct_ptr` is a GC-managed struct pointer; `offset`/`size`
@@ -3617,7 +3617,7 @@ pub trait Backend: Send {
         &self,
         struct_ptr: i64,
         newvalue: GcRef,
-        fielddescr: &majit_translate::jitcode::BhDescr,
+        fielddescr: &majit_jitcode::jitcode::BhDescr,
     ) {
         let offset = fielddescr.as_offset();
         majit_gc::bh_probe_note_store(struct_ptr as usize, offset, 9);
@@ -3634,7 +3634,7 @@ pub trait Backend: Send {
         &self,
         struct_ptr: i64,
         newvalue: f64,
-        fielddescr: &majit_translate::jitcode::BhDescr,
+        fielddescr: &majit_jitcode::jitcode::BhDescr,
     ) {
         let (offset, size, _) = fielddescr.unpack_fielddescr_size();
         // SAFETY: see `bh_setfield_gc_i`.
@@ -3661,9 +3661,9 @@ pub trait Backend: Send {
         &self,
         array_ptr: i64,
         index: i64,
-        arraydescr: &majit_translate::jitcode::BhDescr,
+        arraydescr: &majit_jitcode::jitcode::BhDescr,
     ) -> i64 {
-        use majit_translate::jitcode::BhDescr;
+        use majit_jitcode::jitcode::BhDescr;
         let (base_size, itemsize, is_signed) = match arraydescr {
             BhDescr::Array {
                 base_size,
@@ -3710,7 +3710,7 @@ pub trait Backend: Send {
         &self,
         array_ptr: i64,
         index: i64,
-        arraydescr: &majit_translate::jitcode::BhDescr,
+        arraydescr: &majit_jitcode::jitcode::BhDescr,
     ) -> GcRef {
         let base_size = arraydescr.array_base_size();
         let item_addr = (array_ptr as usize)
@@ -3733,9 +3733,9 @@ pub trait Backend: Send {
         &self,
         array_ptr: i64,
         index: i64,
-        arraydescr: &majit_translate::jitcode::BhDescr,
+        arraydescr: &majit_jitcode::jitcode::BhDescr,
     ) -> f64 {
-        use majit_translate::jitcode::BhDescr;
+        use majit_jitcode::jitcode::BhDescr;
         let base_size = match arraydescr {
             BhDescr::Array { base_size, .. } => *base_size,
             other => panic!(
@@ -3762,7 +3762,7 @@ pub trait Backend: Send {
         array_ptr: i64,
         index: i64,
         newvalue: i64,
-        arraydescr: &majit_translate::jitcode::BhDescr,
+        arraydescr: &majit_jitcode::jitcode::BhDescr,
     ) {
         let (base_size, itemsize, _sign) = arraydescr.unpack_arraydescr_size();
         let item_addr = (array_ptr as usize)
@@ -3786,7 +3786,7 @@ pub trait Backend: Send {
         array_ptr: i64,
         index: i64,
         newvalue: GcRef,
-        arraydescr: &majit_translate::jitcode::BhDescr,
+        arraydescr: &majit_jitcode::jitcode::BhDescr,
     ) {
         let base_size = arraydescr.array_base_size();
         let item_addr = (array_ptr as usize)
@@ -3803,7 +3803,7 @@ pub trait Backend: Send {
         array_ptr: i64,
         index: i64,
         newvalue: f64,
-        arraydescr: &majit_translate::jitcode::BhDescr,
+        arraydescr: &majit_jitcode::jitcode::BhDescr,
     ) {
         let base_size = arraydescr.array_base_size();
         const FSIZE: usize = 8;
@@ -3824,7 +3824,7 @@ pub trait Backend: Send {
         &self,
         array: i64,
         index: i64,
-        arraydescr: &majit_translate::jitcode::BhDescr,
+        arraydescr: &majit_jitcode::jitcode::BhDescr,
     ) -> i64 {
         self.bh_getarrayitem_gc_i(array, index, arraydescr)
     }
@@ -3838,7 +3838,7 @@ pub trait Backend: Send {
         &self,
         array: i64,
         index: i64,
-        arraydescr: &majit_translate::jitcode::BhDescr,
+        arraydescr: &majit_jitcode::jitcode::BhDescr,
     ) -> f64 {
         self.bh_getarrayitem_gc_f(array, index, arraydescr)
     }
@@ -3848,7 +3848,7 @@ pub trait Backend: Send {
         array: i64,
         index: i64,
         newvalue: i64,
-        arraydescr: &majit_translate::jitcode::BhDescr,
+        arraydescr: &majit_jitcode::jitcode::BhDescr,
     ) {
         // `LLtypeMixin.bh_setarrayitem_raw_i` is the GC implementation
         // verbatim: raw changes ownership, not the addressed layout.
@@ -3860,7 +3860,7 @@ pub trait Backend: Send {
         array: i64,
         index: i64,
         newvalue: f64,
-        arraydescr: &majit_translate::jitcode::BhDescr,
+        arraydescr: &majit_jitcode::jitcode::BhDescr,
     ) {
         self.bh_setarrayitem_gc_f(array, index, newvalue, arraydescr)
     }
@@ -3868,11 +3868,7 @@ pub trait Backend: Send {
     /// model.py bh_arraylen_gc(array, arraydescr).
     ///
     /// `LLtypeMixin.bh_arraylen_gc` reads the descriptor's length field.
-    fn bh_arraylen_gc(
-        &self,
-        array_ptr: i64,
-        arraydescr: &majit_translate::jitcode::BhDescr,
-    ) -> i64 {
+    fn bh_arraylen_gc(&self, array_ptr: i64, arraydescr: &majit_jitcode::jitcode::BhDescr) -> i64 {
         let offset = arraydescr
             .array_len_offset()
             .expect("bh_arraylen_gc requires ArrayDescr.lendescr");
@@ -3883,11 +3879,11 @@ pub trait Backend: Send {
 
     // ── model.py:230-236 allocation ──
     /// model.py / llmodel.py bh_new(sizedescr)
-    fn bh_new(&self, _sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
+    fn bh_new(&self, _sizedescr: &majit_jitcode::jitcode::BhDescr) -> i64 {
         panic!("Backend::bh_new requires an LLtypeMixin allocation implementation")
     }
     /// model.py / llmodel.py bh_new_with_vtable(sizedescr)
-    fn bh_new_with_vtable(&self, _sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
+    fn bh_new_with_vtable(&self, _sizedescr: &majit_jitcode::jitcode::BhDescr) -> i64 {
         panic!("Backend::bh_new_with_vtable requires an LLtypeMixin allocation implementation")
     }
 
@@ -3903,14 +3899,14 @@ pub trait Backend: Send {
         None
     }
     /// model.py bh_new_array(length, arraydescr)
-    fn bh_new_array(&self, _length: i64, _arraydescr: &majit_translate::jitcode::BhDescr) -> i64 {
+    fn bh_new_array(&self, _length: i64, _arraydescr: &majit_jitcode::jitcode::BhDescr) -> i64 {
         panic!("Backend::bh_new_array requires an LLtypeMixin allocation implementation")
     }
     /// model.py:234 bh_new_array_clear(length, arraydescr)
     fn bh_new_array_clear(
         &self,
         _length: i64,
-        _arraydescr: &majit_translate::jitcode::BhDescr,
+        _arraydescr: &majit_jitcode::jitcode::BhDescr,
     ) -> i64 {
         panic!("Backend::bh_new_array_clear requires an LLtypeMixin allocation implementation")
     }
@@ -3986,7 +3982,7 @@ pub trait Backend: Send {
         args_i: Option<&[i64]>,
         args_r: Option<&[i64]>,
         args_f: Option<&[i64]>,
-        calldescr: &majit_translate::jitcode::BhCallDescr,
+        calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> i64 {
         assert_ne!(func, 0, "bh_call_i: null function pointer");
         // llmodel.py AbstractLLCPU.bh_call_i `calldescr.verify_types(..., history.INT + 'S')`.
@@ -4006,7 +4002,7 @@ pub trait Backend: Send {
         args_i: Option<&[i64]>,
         args_r: Option<&[i64]>,
         args_f: Option<&[i64]>,
-        calldescr: &majit_translate::jitcode::BhCallDescr,
+        calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> GcRef {
         assert_ne!(func, 0, "bh_call_r: null function pointer");
         // llmodel.py AbstractLLCPU.bh_call_r `calldescr.verify_types(..., history.REF)`.
@@ -4026,7 +4022,7 @@ pub trait Backend: Send {
         args_i: Option<&[i64]>,
         args_r: Option<&[i64]>,
         args_f: Option<&[i64]>,
-        calldescr: &majit_translate::jitcode::BhCallDescr,
+        calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) -> f64 {
         assert_ne!(func, 0, "bh_call_f: null function pointer");
         // llmodel.py AbstractLLCPU.bh_call_f `calldescr.verify_types(..., history.FLOAT + 'L')`.
@@ -4045,7 +4041,7 @@ pub trait Backend: Send {
         args_i: Option<&[i64]>,
         args_r: Option<&[i64]>,
         args_f: Option<&[i64]>,
-        calldescr: &majit_translate::jitcode::BhCallDescr,
+        calldescr: &majit_jitcode::jitcode::BhCallDescr,
     ) {
         assert_ne!(func, 0, "bh_call_v: null function pointer");
         // llmodel.py AbstractLLCPU.bh_call_v `calldescr.verify_types(..., history.VOID)`.
@@ -4148,7 +4144,7 @@ pub trait Backend: Send {
         &self,
         addr: i64,
         offset: i64,
-        descr: &majit_translate::jitcode::BhDescr,
+        descr: &majit_jitcode::jitcode::BhDescr,
     ) -> i64 {
         let (base, size, sign) = descr.unpack_arraydescr_size();
         assert_eq!(base, 0, "bh_raw_load_i requires a lengthless raw array");
@@ -4160,7 +4156,7 @@ pub trait Backend: Send {
         addr: i64,
         offset: i64,
         newvalue: i64,
-        descr: &majit_translate::jitcode::BhDescr,
+        descr: &majit_jitcode::jitcode::BhDescr,
     ) {
         let (base, size, _) = descr.unpack_arraydescr_size();
         assert_eq!(base, 0, "bh_raw_store_i requires a lengthless raw array");
@@ -4172,9 +4168,9 @@ pub trait Backend: Send {
         &self,
         array_ptr: i64,
         index: i64,
-        descr: &majit_translate::jitcode::BhDescr,
+        descr: &majit_jitcode::jitcode::BhDescr,
     ) -> i64 {
-        let majit_translate::jitcode::BhDescr::InteriorField { array, field } = descr else {
+        let majit_jitcode::jitcode::BhDescr::InteriorField { array, field } = descr else {
             panic!("bh_getinteriorfield_gc_i: expected InteriorField, got {descr:?}");
         };
         let (base, itemsize, _) = array.unpack_arraydescr_size();
@@ -4187,9 +4183,9 @@ pub trait Backend: Send {
         &self,
         array_ptr: i64,
         index: i64,
-        descr: &majit_translate::jitcode::BhDescr,
+        descr: &majit_jitcode::jitcode::BhDescr,
     ) -> GcRef {
-        let majit_translate::jitcode::BhDescr::InteriorField { array, field } = descr else {
+        let majit_jitcode::jitcode::BhDescr::InteriorField { array, field } = descr else {
             panic!("bh_getinteriorfield_gc_r: expected InteriorField, got {descr:?}");
         };
         let (base, itemsize, _) = array.unpack_arraydescr_size();
@@ -4202,9 +4198,9 @@ pub trait Backend: Send {
         &self,
         array_ptr: i64,
         index: i64,
-        descr: &majit_translate::jitcode::BhDescr,
+        descr: &majit_jitcode::jitcode::BhDescr,
     ) -> f64 {
-        let majit_translate::jitcode::BhDescr::InteriorField { array, field } = descr else {
+        let majit_jitcode::jitcode::BhDescr::InteriorField { array, field } = descr else {
             panic!("bh_getinteriorfield_gc_f: expected InteriorField, got {descr:?}");
         };
         let (base, itemsize, _) = array.unpack_arraydescr_size();
@@ -4218,9 +4214,9 @@ pub trait Backend: Send {
         array_ptr: i64,
         index: i64,
         newvalue: i64,
-        descr: &majit_translate::jitcode::BhDescr,
+        descr: &majit_jitcode::jitcode::BhDescr,
     ) {
-        let majit_translate::jitcode::BhDescr::InteriorField { array, field } = descr else {
+        let majit_jitcode::jitcode::BhDescr::InteriorField { array, field } = descr else {
             panic!("bh_setinteriorfield_gc_i: expected InteriorField, got {descr:?}");
         };
         let (base, itemsize, _) = array.unpack_arraydescr_size();
@@ -4241,9 +4237,9 @@ pub trait Backend: Send {
         array_ptr: i64,
         index: i64,
         newvalue: GcRef,
-        descr: &majit_translate::jitcode::BhDescr,
+        descr: &majit_jitcode::jitcode::BhDescr,
     ) {
-        let majit_translate::jitcode::BhDescr::InteriorField { array, field } = descr else {
+        let majit_jitcode::jitcode::BhDescr::InteriorField { array, field } = descr else {
             panic!("bh_setinteriorfield_gc_r: expected InteriorField, got {descr:?}");
         };
         let (base, itemsize, _) = array.unpack_arraydescr_size();
@@ -4259,9 +4255,9 @@ pub trait Backend: Send {
         array_ptr: i64,
         index: i64,
         newvalue: f64,
-        descr: &majit_translate::jitcode::BhDescr,
+        descr: &majit_jitcode::jitcode::BhDescr,
     ) {
-        let majit_translate::jitcode::BhDescr::InteriorField { array, field } = descr else {
+        let majit_jitcode::jitcode::BhDescr::InteriorField { array, field } = descr else {
             panic!("bh_setinteriorfield_gc_f: expected InteriorField, got {descr:?}");
         };
         let (base, itemsize, _) = array.unpack_arraydescr_size();
@@ -4301,7 +4297,7 @@ pub trait Backend: Send {
         scale: i64,
         base_ofs: i64,
         bytes: i64,
-        _descr: &majit_translate::jitcode::BhDescr,
+        _descr: &majit_jitcode::jitcode::BhDescr,
     ) {
         assert!(bytes > 0);
         let offset = base_ofs.wrapping_add(scale.wrapping_mul(index));
@@ -4318,7 +4314,7 @@ pub trait Backend: Send {
         scale: i64,
         base_ofs: i64,
         bytes: i64,
-        _descr: &majit_translate::jitcode::BhDescr,
+        _descr: &majit_jitcode::jitcode::BhDescr,
     ) {
         assert_eq!(bytes as usize, std::mem::size_of::<f64>());
         let offset = base_ofs.wrapping_add(scale.wrapping_mul(index));
@@ -4329,7 +4325,7 @@ pub trait Backend: Send {
         &self,
         addr: i64,
         offset: i64,
-        _descr: &majit_translate::jitcode::BhDescr,
+        _descr: &majit_jitcode::jitcode::BhDescr,
     ) -> f64 {
         let at = (addr as usize).wrapping_add(offset as usize);
         unsafe { (at as *const f64).read_unaligned() }
@@ -4340,7 +4336,7 @@ pub trait Backend: Send {
         addr: i64,
         offset: i64,
         newvalue: f64,
-        _descr: &majit_translate::jitcode::BhDescr,
+        _descr: &majit_jitcode::jitcode::BhDescr,
     ) {
         unsafe { crate::llmodel::write_float_at_mem(addr as usize, offset as usize, newvalue) }
     }
@@ -4348,21 +4344,21 @@ pub trait Backend: Send {
     fn bh_getfield_raw_i(
         &self,
         struct_ptr: i64,
-        fielddescr: &majit_translate::jitcode::BhDescr,
+        fielddescr: &majit_jitcode::jitcode::BhDescr,
     ) -> i64 {
         self.bh_getfield_gc_i(struct_ptr, fielddescr)
     }
     fn bh_getfield_raw_r(
         &self,
         struct_ptr: i64,
-        fielddescr: &majit_translate::jitcode::BhDescr,
+        fielddescr: &majit_jitcode::jitcode::BhDescr,
     ) -> GcRef {
         self.bh_getfield_gc_r(struct_ptr, fielddescr)
     }
     fn bh_getfield_raw_f(
         &self,
         struct_ptr: i64,
-        fielddescr: &majit_translate::jitcode::BhDescr,
+        fielddescr: &majit_jitcode::jitcode::BhDescr,
     ) -> f64 {
         self.bh_getfield_gc_f(struct_ptr, fielddescr)
     }
@@ -4370,7 +4366,7 @@ pub trait Backend: Send {
         &self,
         struct_ptr: i64,
         newvalue: i64,
-        fielddescr: &majit_translate::jitcode::BhDescr,
+        fielddescr: &majit_jitcode::jitcode::BhDescr,
     ) {
         self.bh_setfield_gc_i(struct_ptr, newvalue, fielddescr)
     }
@@ -4378,7 +4374,7 @@ pub trait Backend: Send {
         &self,
         struct_ptr: i64,
         newvalue: f64,
-        fielddescr: &majit_translate::jitcode::BhDescr,
+        fielddescr: &majit_jitcode::jitcode::BhDescr,
     ) {
         self.bh_setfield_gc_f(struct_ptr, newvalue, fielddescr)
     }

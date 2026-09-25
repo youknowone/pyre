@@ -5,38 +5,38 @@ mod frozen_effects;
 pub(crate) use assembler::scalar_size;
 pub use assembler::{JitCodeBuilder, JitCodeIntOperand, live_slots_for_state_field_jit};
 pub use embedded::EmbeddedJitCodeTable;
-pub use majit_translate::jitcode::{
+pub use majit_jitcode::jitcode::{
     BhCallDescr as CanonicalBhCallDescr, BhDescr as CanonicalBhDescr, BhInteriorFieldSpec,
     JitCode as CanonicalJitCode,
 };
 
 // `BC_*` constants and `MAX_HOST_CALL_ARITY` live in
-// `majit_translate::insns` (, slice #86c). The module is
+// `majit_jitcode::insns` (, slice #86c). The module is
 // re-exported here as the canonical access path; in-crate and external
 // consumers reach `BC_*` / `MAX_HOST_CALL_ARITY` via
 // `jitcode::insns::BC_*`.
-pub use majit_translate::insns;
+pub use majit_jitcode::insns;
 
 /// Alias for `BC_JUMP`; used in dispatch JitCode loop-close tests
 /// (7) and `jitcode_lower::lower_dispatch_body` jump emission.
 pub const BC_GOTO: u8 = insns::BC_JUMP;
 
 // `insn_byte` and `wellknown_bh_insns` were moved to
-// `majit_translate::insns` in slice #86d. Re-exports keep
+// `majit_jitcode::insns` in slice #86d. Re-exports keep
 // internal callers (`jitcode::assembler::JitCodeBuilder`) and external
 // callers (`pyre/pyre-jit/src/jit/assembler.rs`) resolving unchanged
 // — the import-path sweep is slice #86e.
-pub(crate) use majit_translate::insns::insn_byte;
+pub(crate) use majit_jitcode::insns::insn_byte;
 
-pub use majit_translate::insns::{extension_insns, wellknown_bh_insns};
+pub use majit_jitcode::insns::{extension_insns, wellknown_bh_insns};
 
 /// Re-export of the canonical `enumerate_vars` function so existing
 /// metainterp callers can keep using `crate::jitcode::enumerate_vars`.
 ///
 /// RPython places this function in `rpython/jit/codewriter/jitcode.py`,
 /// not in metainterp. majit follows the same module placement: the
-/// definition lives in `majit_translate::jitcode::enumerate_vars`.
-pub use majit_translate::jitcode::enumerate_vars;
+/// definition lives in `majit_jitcode::jitcode::enumerate_vars`.
+pub use majit_jitcode::jitcode::enumerate_vars;
 
 // Runtime descr pool types — RPython
 // `BlackholeInterpBuilder.descrs` / `BlackholeInterpreter.descrs`
@@ -44,7 +44,7 @@ pub use majit_translate::jitcode::enumerate_vars;
 //
 // RPython keeps the descr pool on the blackhole interpreter, NOT on
 // the JitCode object.  In majit the canonical
-// `majit_translate::jitcode::JitCode` mirrors that — it is a
+// `majit_jitcode::jitcode::JitCode` mirrors that — it is a
 // source-only RPython parity type with no descrs field.  The runtime
 // adapter state (descrs pool + call/assembler targets) lives here
 // alongside the wrapper `JitCode` defined below, which carries
@@ -583,7 +583,7 @@ pub struct JitCodeExecState {
 //
 // RPython parity:
 //   * `core` is the source-only `rpython/jit/codewriter/jitcode.py`
-//     `JitCode` analog (`majit_translate::jitcode::JitCode`).  It
+//     `JitCode` analog (`majit_jitcode::jitcode::JitCode`).  It
 //     holds `name`, `fnaddr`, `jitdriver_sd`, `index`, body
 //     (`code`, `constants_*`, `c_num_regs_*`, ...) — exactly the
 //     fields RPython's `JitCode` carries.
@@ -600,7 +600,7 @@ pub struct JitCodeExecState {
 // Serde: the wrapper itself is intentionally NOT
 // `Serialize`/`Deserialize`.  The build-time bincode embed in
 // `pyre-jit-trace::jitcode_runtime` serializes
-// `Vec<Arc<majit_translate::jitcode::JitCode>>` (canonical core)
+// `Vec<Arc<majit_jitcode::jitcode::JitCode>>` (canonical core)
 // because build-time jitcodes never carry descrs.  Wrappers are
 // constructed at the runtime ingress (where the canonical Arc enters
 // dispatch) via `JitCode::from_canonical`.  Per-CodeObject runtime
@@ -612,7 +612,7 @@ pub struct JitCodeExecState {
 pub struct JitCode {
     /// Canonical source-only `JitCode` (RPython
     /// `rpython/jit/codewriter/jitcode.py class JitCode`).
-    core: majit_translate::jitcode::JitCode,
+    core: majit_jitcode::jitcode::JitCode,
     /// Per-jitcode descr pool — pyre's analog of
     /// `BlackholeInterpBuilder.descrs` (RPython
     /// `blackhole.py:103`).  Empty for build-time canonical jitcodes
@@ -664,12 +664,12 @@ unsafe impl Sync for JitCode {}
 
 impl JitCode {
     /// Construct a fresh runtime jitcode wrapping a canonical
-    /// `majit_translate::jitcode::JitCode::new(name)` core with an
+    /// `majit_jitcode::jitcode::JitCode::new(name)` core with an
     /// empty descr pool.  RPython `jitcode.py:14-20`
     /// `JitCode.__init__(name, fnaddr=None, calldescr=None, called_from=None)`.
     pub fn new(name: impl Into<String>) -> Self {
         Self {
-            core: majit_translate::jitcode::JitCode::new(name),
+            core: majit_jitcode::jitcode::JitCode::new(name),
             exec: JitCodeExecState::default(),
             uses_global_descr_pool: false,
             reachable_symbolic_residuals: std::sync::OnceLock::new(),
@@ -687,7 +687,7 @@ impl JitCode {
     /// descr pool.  Build-time jitcodes resolve their `'d'`/`'j'`
     /// argcodes through the global `ALL_DESCRS` table and never
     /// populate `exec.descrs`.
-    pub fn from_canonical(core: majit_translate::jitcode::JitCode) -> Self {
+    pub fn from_canonical(core: majit_jitcode::jitcode::JitCode) -> Self {
         // The offset comes across because the two routes record it at the
         // same point and a consumer cannot recover it afterwards: an operand
         // byte may equal the opcode byte, so only the encoder knows which
@@ -712,7 +712,7 @@ impl JitCode {
 
     /// Borrow the canonical core (e.g. for serialization that
     /// re-serializes only the canonical fields).
-    pub fn core(&self) -> &majit_translate::jitcode::JitCode {
+    pub fn core(&self) -> &majit_jitcode::jitcode::JitCode {
         &self.core
     }
 
@@ -720,14 +720,14 @@ impl JitCode {
     /// post-`set_body` `body_mut()` etc.).  RPython mutates `JitCode`
     /// fields directly post-`setup()`; pyre routes the mutation
     /// through this accessor so the wrapper stays transparent.
-    pub fn core_mut(&mut self) -> &mut majit_translate::jitcode::JitCode {
+    pub fn core_mut(&mut self) -> &mut majit_jitcode::jitcode::JitCode {
         &mut self.core
     }
 }
 
 impl Default for JitCode {
     fn default() -> Self {
-        let mut jitcode = Self::from_canonical(majit_translate::jitcode::JitCode::default());
+        let mut jitcode = Self::from_canonical(majit_jitcode::jitcode::JitCode::default());
         jitcode.uses_global_descr_pool = false;
         jitcode
     }
@@ -845,7 +845,7 @@ pub fn compute_reachable_symbolic_residuals(root: &JitCode) -> ReachableSymbolic
                     continue;
                 };
                 if crate::pyjitpl::resolve_symbolic_fnaddr_path(target).is_some()
-                    || majit_translate::codewriter::call::is_symbolic_fnaddr(target)
+                    || majit_jitcode::codewriter::call::is_symbolic_fnaddr(target)
                 {
                     targets.insert(target);
                 }
@@ -877,14 +877,14 @@ pub fn compute_reachable_symbolic_residuals(root: &JitCode) -> ReachableSymbolic
 }
 
 impl std::ops::Deref for JitCode {
-    type Target = majit_translate::jitcode::JitCode;
-    fn deref(&self) -> &majit_translate::jitcode::JitCode {
+    type Target = majit_jitcode::jitcode::JitCode;
+    fn deref(&self) -> &majit_jitcode::jitcode::JitCode {
         &self.core
     }
 }
 
 impl std::ops::DerefMut for JitCode {
-    fn deref_mut(&mut self) -> &mut majit_translate::jitcode::JitCode {
+    fn deref_mut(&mut self) -> &mut majit_jitcode::jitcode::JitCode {
         &mut self.core
     }
 }
@@ -1270,7 +1270,7 @@ pub(crate) fn read_u16(code: &[u8], cursor: &mut usize) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majit_translate::jitcode::{JitCode as BuildJitCode, JitCodeBody as BuildJitCodeBody};
+    use majit_jitcode::jitcode::{JitCode as BuildJitCode, JitCodeBody as BuildJitCodeBody};
 
     #[test]
     fn resolved_call_entry_reuses_its_descriptor_and_preserves_result_abi() {
@@ -1410,7 +1410,7 @@ mod tests {
 
     #[test]
     fn wellknown_bh_insns_stays_canonical_and_avoids_false_call_family_keys() {
-        use majit_translate::insns as ti;
+        use majit_jitcode::insns as ti;
         let insns = wellknown_bh_insns();
         assert!(
             !insns.contains_key("jump/L"),
@@ -1467,7 +1467,7 @@ mod tests {
         assert!(insns.contains_key("inline_call_irf_f/dIRF>f"));
         assert_ne!(
             insns.get("inline_call_ir_r/dIR>r").copied(),
-            Some(majit_translate::insns::BC_INLINE_CALL),
+            Some(majit_jitcode::insns::BC_INLINE_CALL),
             "canonical inline_call_ir_r byte must NOT collide with \
              helper-side BC_INLINE_CALL adapter byte",
         );
@@ -1573,11 +1573,11 @@ mod tests {
             // pyre nested-bytecode inline_call (pyre-only `P` argcode).
             ("inline_call_nested_ext/P", insns::BC_INLINE_CALL),
             // Ref-result variant of the borrow-checker abort signal.
-            ("abort/>r", majit_translate::insns::BC_ABORT_RESULT_R),
+            ("abort/>r", majit_jitcode::insns::BC_ABORT_RESULT_R),
             // dyn-trait method pointer reification (backend epic).
             (
                 "vtable_method_ptr/rd>i",
-                majit_translate::insns::BC_VTABLE_METHOD_PTR,
+                majit_jitcode::insns::BC_VTABLE_METHOD_PTR,
             ),
         ];
 
@@ -1594,7 +1594,7 @@ mod tests {
                  fixed BC_* byte",
             );
             assert_eq!(
-                majit_translate::insns::insn_byte(key),
+                majit_jitcode::insns::insn_byte(key),
                 expected_byte,
                 "insn_byte must resolve {key} via the merged extension+\
                  wellknown table",

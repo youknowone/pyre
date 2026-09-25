@@ -174,7 +174,7 @@ impl Assembler {
         // The `-live-` operand is 2 bytes, so those duplicates come out of one
         // shared 64 KiB budget.
         let all_liveness_positions =
-            majit_translate::liveness::decode_liveness_records(&all_liveness)
+            majit_jitcode::liveness::decode_liveness_records(&all_liveness)
                 .into_iter()
                 .filter_map(|(live_i, live_r, live_f, offset)| {
                     let offset = u16::try_from(offset).ok()?;
@@ -470,7 +470,7 @@ impl Assembler {
         live_r: &VecSet<u8>,
         live_f: &VecSet<u8>,
     ) -> u16 {
-        use majit_translate::liveness::encode_liveness;
+        use majit_jitcode::liveness::encode_liveness;
 
         self.num_liveness_ops += 1;
         let key = (live_i.clone(), live_r.clone(), live_f.clone());
@@ -543,7 +543,7 @@ impl Assembler {
                 (0u16..=u8::MAX as u16)
                     .map(|value| value as u8)
                     .find(|value| {
-                        !majit_translate::insns::is_reserved_opcode_byte(*value)
+                        !majit_jitcode::insns::is_reserved_opcode_byte(*value)
                             && !self.insns.values().any(|used| used == value)
                     })
                     .unwrap_or_else(|| panic!("runtime assembler opcode space exhausted for {key}"))
@@ -1485,7 +1485,7 @@ fn dispatch_op(
             let offset = expect_int_reg_or_pool(state, &args[1]);
             let descr_idx = match &args[2] {
                 Operand::Descr(d) => match &**d {
-                    DescrOperand::Bh(majit_translate::jitcode::BhDescr::Array {
+                    DescrOperand::Bh(majit_jitcode::jitcode::BhDescr::Array {
                         itemsize,
                         is_item_signed,
                         ..
@@ -2319,10 +2319,10 @@ fn expect_vable_arraylen_args(args: &[Operand]) -> (u16, u16) {
 /// `assembler.py _encode_descr` — the descr operand of a heap
 /// array op is appended to `Assembler.descrs` and encoded as a 2-byte
 /// index.
-fn expect_field_bh_descr(op: &Operand, ctx: &'static str) -> majit_translate::jitcode::BhDescr {
+fn expect_field_bh_descr(op: &Operand, ctx: &'static str) -> majit_jitcode::jitcode::BhDescr {
     match op {
         Operand::Descr(d) => match &**d {
-            DescrOperand::Bh(field @ majit_translate::jitcode::BhDescr::Field { .. }) => {
+            DescrOperand::Bh(field @ majit_jitcode::jitcode::BhDescr::Field { .. }) => {
                 field.clone()
             }
             other => panic!("{ctx} expects DescrOperand::Bh(BhDescr::Field), got {other:?}"),
@@ -2334,7 +2334,7 @@ fn expect_field_bh_descr(op: &Operand, ctx: &'static str) -> majit_translate::ji
 fn expect_array_bh_descr(state: &mut AssemblyState, op: &Operand, ctx: &'static str) -> u16 {
     match op {
         Operand::Descr(d) => match &**d {
-            DescrOperand::Bh(bh @ majit_translate::jitcode::BhDescr::Array { .. }) => {
+            DescrOperand::Bh(bh @ majit_jitcode::jitcode::BhDescr::Array { .. }) => {
                 state.builder.add_array_descr(bh.clone())
             }
             other => panic!("{ctx} expects DescrOperand::Bh(BhDescr::Array), got {other:?}"),
@@ -2772,8 +2772,8 @@ mod tests {
             .get("goto_if_not_int_gt/icL")
             .expect("short rhs branch key");
         assert_ne!(sub, branch);
-        assert!(!majit_translate::insns::is_reserved_opcode_byte(sub));
-        assert!(!majit_translate::insns::is_reserved_opcode_byte(branch));
+        assert!(!majit_jitcode::insns::is_reserved_opcode_byte(sub));
+        assert!(!majit_jitcode::insns::is_reserved_opcode_byte(branch));
         assert_eq!(jitcode.code[0], sub);
         assert_eq!(jitcode.code[4], branch);
     }
@@ -3263,15 +3263,15 @@ mod tests {
         let insns = assembler.insns_snapshot();
         assert_eq!(
             insns.get("conditional_call_ir_v/iiIRd").copied(),
-            Some(majit_translate::insns::BC_CONDITIONAL_CALL_IR_V),
+            Some(majit_jitcode::insns::BC_CONDITIONAL_CALL_IR_V),
         );
         assert_eq!(
             insns.get("conditional_call_value_ir_r/riIRd>r").copied(),
-            Some(majit_translate::insns::BC_CONDITIONAL_CALL_VALUE_IR_R),
+            Some(majit_jitcode::insns::BC_CONDITIONAL_CALL_VALUE_IR_R),
         );
         assert_eq!(
             insns.get("record_known_result_r_ir_v/riIRd").copied(),
-            Some(majit_translate::insns::BC_RECORD_KNOWN_RESULT_R_IR_V),
+            Some(majit_jitcode::insns::BC_RECORD_KNOWN_RESULT_R_IR_V),
         );
     }
 
@@ -3374,7 +3374,7 @@ mod tests {
             }),
         );
 
-        // majit_translate::insns::BC_RESIDUAL_CALL_IRF_F = 168.
+        // majit_jitcode::insns::BC_RESIDUAL_CALL_IRF_F = 168.
         assert_eq!(jitcode.code[0], 168);
     }
 
@@ -3455,7 +3455,7 @@ mod tests {
 
         assert_eq!(
             jitcode.code,
-            vec![majit_translate::insns::BC_INLINE_CALL_R_R, 0, 0, 1, 0, 1,]
+            vec![majit_jitcode::insns::BC_INLINE_CALL_R_R, 0, 0, 1, 0, 1,]
         );
         match &jitcode.exec.descrs[0] {
             majit_metainterp::jitcode::RuntimeBhDescr::JitCode(stored) => {
@@ -3511,7 +3511,7 @@ mod tests {
         assert_eq!(
             jitcode.code,
             vec![
-                majit_translate::insns::BC_INLINE_CALL_IR_R,
+                majit_jitcode::insns::BC_INLINE_CALL_IR_R,
                 0,
                 0,
                 1,
@@ -3551,7 +3551,7 @@ mod tests {
             .iter()
             .filter_map(|descr| descr.as_bh_descr())
             .find_map(|descr| match descr {
-                majit_translate::jitcode::BhDescr::Call { calldescr } => Some(calldescr),
+                majit_jitcode::jitcode::BhDescr::Call { calldescr } => Some(calldescr),
                 _ => None,
             })
             .expect("word-returning residual_call_r_v must emit a BhCallDescr");
@@ -3585,7 +3585,7 @@ mod tests {
             .iter()
             .filter_map(|descr| descr.as_bh_descr())
             .find_map(|descr| match descr {
-                majit_translate::jitcode::BhDescr::Call { calldescr } => Some(calldescr),
+                majit_jitcode::jitcode::BhDescr::Call { calldescr } => Some(calldescr),
                 _ => None,
             })
             .expect("set_current_exception residual_call_r_v must emit a BhCallDescr");

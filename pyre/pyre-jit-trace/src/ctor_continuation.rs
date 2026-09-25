@@ -170,7 +170,7 @@ fn build() -> Option<(i32, usize)> {
     builder.patch_live_offset(live_patch, liveness_offset);
 
     let funcptr = bh_check_init_returned_none as *const () as i64;
-    let calldescr = majit_translate::codewriter::jitcode::BhCallDescr {
+    let calldescr = majit_jitcode::codewriter::jitcode::BhCallDescr {
         // One `Ref` argument, no result: the same signature
         // `bh_check_init_returned_none` is declared with.
         arg_classes: "r".to_string(),

@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use crate::assembler::Assembler;
+use crate::assembler::{Assembler, AssemblerExt};
 use crate::call::CallControl;
 use crate::jitcode::JitCode;
 use crate::jtransform::GraphTransformConfig;
@@ -77,7 +77,45 @@ pub struct CodeWriter {
     >,
 }
 
+/// `codewriter` as `MetaInterpStaticData.finish_setup` sees it: this
+/// `CodeWriter` does not own its `CallControl`, so the pair stands in for
+/// `codewriter.callcontrol`.
+pub struct CodeWriterWithCallControl<'a> {
+    pub codewriter: &'a CodeWriter,
+    pub callcontrol: &'a CallControl,
+}
+
+impl majit_jitcode::codewriter::codewriter::CodeWriterSetup for CodeWriterWithCallControl<'_> {
+    fn assembler(&self) -> &Assembler {
+        &self.codewriter.assembler
+    }
+
+    fn virtualref_info(&self) -> Option<&std::sync::Arc<dyn crate::call::VirtualRefInfoHandle>> {
+        self.callcontrol.virtualref_info.as_ref()
+    }
+
+    fn callinfocollection(&self) -> &majit_ir::CallInfoCollection {
+        &self.callcontrol.callinfocollection
+    }
+
+    fn has_libffi_call(&self) -> bool {
+        self.callcontrol.has_libffi_call
+    }
+}
+
 impl CodeWriter {
+    /// Pair this codewriter with the `CallControl` it drove, for
+    /// `MetaInterpStaticData.finish_setup(codewriter)`.
+    pub fn with_callcontrol<'a>(
+        &'a self,
+        callcontrol: &'a CallControl,
+    ) -> CodeWriterWithCallControl<'a> {
+        CodeWriterWithCallControl {
+            codewriter: self,
+            callcontrol,
+        }
+    }
+
     /// RPython: `CodeWriter.__init__(cpu, jitdrivers_sd)` (codewriter.py).
     ///
     /// `debug` mirrors the class-level default `debug = True`

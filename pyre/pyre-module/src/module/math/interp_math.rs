@@ -785,6 +785,72 @@ pub fn math_float2_fold_helper(callable: PyObjectRef) -> Option<extern "C" fn(f6
         .map(|fold| fold.raw)
 }
 
+/// The name of the canonical `math` builtin `callable` is, or `None` for any
+/// other value.  A value rebound under a `math` name carries a different
+/// builtin code and answers `None`.
+pub fn math_builtin_name(callable: PyObjectRef) -> Option<&'static str> {
+    let wrapper = unsafe { builtin_wrapper_addr(callable)? };
+    let wrappers = MATH_WRAPPERS.get()?;
+    [
+        ("sqrt", wrappers.sqrt),
+        ("log", wrappers.log),
+        ("cos", wrappers.cos),
+        ("sin", wrappers.sin),
+        ("tan", wrappers.tan),
+        ("atan", wrappers.atan),
+        ("exp", wrappers.exp),
+        ("log1p", wrappers.log1p),
+        ("asin", wrappers.asin),
+        ("acos", wrappers.acos),
+        ("sinh", wrappers.sinh),
+        ("cosh", wrappers.cosh),
+        ("tanh", wrappers.tanh),
+        ("asinh", wrappers.asinh),
+        ("acosh", wrappers.acosh),
+        ("atanh", wrappers.atanh),
+        ("cbrt", wrappers.cbrt),
+        ("exp2", wrappers.exp2),
+        ("expm1", wrappers.expm1),
+        ("erf", wrappers.erf),
+        ("erfc", wrappers.erfc),
+        ("gamma", wrappers.gamma),
+        ("lgamma", wrappers.lgamma),
+        ("ulp", wrappers.ulp),
+        ("degrees", wrappers.degrees),
+        ("radians", wrappers.radians),
+        ("frexp", wrappers.frexp),
+        ("ldexp", wrappers.ldexp),
+        ("isqrt", wrappers.isqrt),
+        ("fabs", wrappers.fabs),
+        ("floor", wrappers.floor),
+        ("ceil", wrappers.ceil),
+        ("trunc", wrappers.trunc),
+        ("isclose", wrappers.isclose),
+        ("pow", wrappers.pow),
+        ("fmod", wrappers.fmod),
+        ("copysign", wrappers.copysign),
+        ("remainder", wrappers.remainder),
+        ("atan2", wrappers.atan2),
+    ]
+    .into_iter()
+    .find(|&(_, addr)| addr == wrapper)
+    .map(|(name, _)| name)
+}
+
+/// The residual targets `math` vouches for as faithful to their wasm ABI.
+pub fn math_faithful_residual_call_addrs() -> Vec<i64> {
+    let mut addrs = vec![
+        // (f64) -> i64
+        jit_math_frexp_exponent as *const () as usize as i64,
+        // (f64, i64) -> f64
+        jit_math_ldexp_raw as *const () as usize as i64,
+        // (f64, f64) -> i64
+        jit_math_isclose_default as *const () as usize as i64,
+    ];
+    addrs.extend(math_float_fold_helper_addrs());
+    addrs
+}
+
 /// Addresses of the `math` float-fold helpers for
 /// `set_faithful_residual_call_addrs`. Each is `(f64) -> f64` or
 /// `(f64, f64) -> f64`, which the wasm backend will not lower from a

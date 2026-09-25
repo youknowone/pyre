@@ -21,7 +21,7 @@ type HashSet<T> = FxHashSet<T>;
 ///
 /// Generic over the node identity type `N` so both
 /// majit-translate (which keys nodes on
-/// [`crate::flowspace::model::Variable`] — upstream-orthodox
+/// `flowspace::model::Variable` — upstream-orthodox
 /// `tool/algo/regalloc.py:31 coloring: dict[Variable, int]`) and
 /// the pyre CPython-bytecode codewriter
 /// (`pyre/pyre-jit/src/jit/regalloc.rs`, which keys on

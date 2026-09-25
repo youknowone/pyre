@@ -5923,6 +5923,49 @@ pub unsafe fn instance_walk_boxed_storage(obj: PyObjectRef, f: &mut dyn FnMut(*m
     }
 }
 
+/// Custom trace for objects carrying the `MapdictStorageMixin` prefix
+/// (`W_ObjectObject` and native-layout Python subclasses such as
+/// `W_Random`; instance `map`+`storage`, `mapdict.py:907-910`).
+///
+/// `storage` is a GC-managed leaf block (`W_MAPDICT_STORAGE_GC_TYPE_ID`,
+/// allocated stable and non-moving by `alloc_mapdict_storage_block`), so the
+/// collector reaches its slots only through this trace:
+/// [`instance_walk_boxed_storage`] forwards the `storage` reference itself and
+/// then every slot in `0..capacity` in place.  It consults no map — an
+/// unboxed longlong attribute stores the erased `GC_INT_ARRAY` block
+/// (`erase_unboxed`, `mapdict.py:601/612`), which is an ordinary GC reference
+/// like every boxed slot (`mapdict.py:438/447` `erase_item`), so no slot has
+/// to be skipped.  The block itself never moves; only the slot contents are
+/// relocated.
+///
+/// `ob_header.w_class` is the instance's class reachability edge — the
+/// equivalent of PyPy reaching the class through the traced
+/// `terminator.w_cls` (`mapdict.py:751-752`, a strong `_immutable_field_`).
+/// Pyre stores the class in the inline header word
+/// (`objectobject.rs`'s `W_ObjectObject`, `typeptr` in `rclass.py`), so it
+/// must be forwarded here or an instance whose class is reachable only
+/// through it would have that class reclaimed once heap types become
+/// GC-managed.  Inert while heap types remain `malloc_typed`
+/// Box-immortal — the visitor's `is_in_nursery` / `is_managed_heap_object`
+/// guard skips the non-managed type pointer — exactly as
+/// `generator_object_custom_trace` forwards `pycode` ahead of the
+/// code-object migration.
+///
+/// # Safety
+/// `obj_addr` must point to a live object with the mapdict prefix.
+pub unsafe fn mapdict_storage_custom_trace(
+    obj_addr: usize,
+    f: &mut dyn FnMut(*mut majit_ir::GcRef),
+) {
+    let obj = obj_addr as PyObjectRef;
+    f(unsafe { std::ptr::addr_of_mut!((*obj).w_class) } as *mut majit_ir::GcRef);
+    unsafe {
+        instance_walk_boxed_storage(obj, &mut |slot: *mut PyObjectRef| {
+            f(slot as *mut majit_ir::GcRef);
+        })
+    };
+}
+
 /// Walk roots held by pyre's temporary mapdict side tables.
 ///
 /// PyPy stores the instance dict and weakref lifeline in mapdict SPECIAL slots,

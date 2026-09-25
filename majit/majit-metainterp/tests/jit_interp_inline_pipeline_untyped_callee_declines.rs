@@ -30,8 +30,8 @@ const OP_UNTYPED: u8 = 1;
 fn build_time_table() -> &'static EmbeddedJitCodeTable {
     static TABLE: OnceLock<&'static EmbeddedJitCodeTable> = OnceLock::new();
     TABLE.get_or_init(|| {
-        let core = majit_translate::jitcode::JitCode::new("pipeline_untyped");
-        core.set_body(majit_translate::jitcode::JitCodeBody {
+        let core = majit_jitcode::jitcode::JitCode::new("pipeline_untyped");
+        core.set_body(majit_jitcode::jitcode::JitCodeBody {
             code: vec![majit_metainterp::jitcode::insns::BC_VOID_RETURN],
             ..Default::default()
         });

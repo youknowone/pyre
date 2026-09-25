@@ -1,0 +1,16 @@
+[package]
+name = "majit-jitcode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The part of majit's codewriter that the JIT runtime reads: jitcode opcode tables and register coloring"
+
+[dependencies]
+majit-ir = { workspace = true }
+bincode = { workspace = true }
+serde = { workspace = true, features = ["rc"] }
+indexmap = { workspace = true }
+parking_lot = { workspace = true }
+vecset = { workspace = true }
+rustc-hash = { workspace = true }

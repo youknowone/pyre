@@ -259,3 +259,25 @@ pyre_interpreter::py_module! {
         }
     },
 }
+
+/// The GC types this module owns, in `build_gc` registration order.
+pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType>) {
+    use pyre_interpreter::importing::{ModuleGcAnchor, ModuleGcLayout, ModuleGcType};
+    use pyre_object::lltype::PyreClassPyTypeOf;
+    // `interp_bz2.py` keeps each libbz2 stream and its lock on the W_Root
+    // owner.  Neither type is subclassable, so they carry no mapdict prefix and
+    // no inline GC edge beyond the header's `w_class`; the sweep destructor
+    // releases the native stream.
+    types.push(ModuleGcType {
+        anchor: ModuleGcAnchor::AfterGcStats,
+        descriptor: <W_BZ2Compressor as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::Object,
+        destructor: Some(gc_destructor!(w_bz2compressor_dealloc)),
+    });
+    types.push(ModuleGcType {
+        anchor: ModuleGcAnchor::AfterGcStats,
+        descriptor: <W_BZ2Decompressor as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::Object,
+        destructor: Some(gc_destructor!(w_bz2decompressor_dealloc)),
+    });
+}

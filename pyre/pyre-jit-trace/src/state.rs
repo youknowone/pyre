@@ -552,7 +552,7 @@ impl MetaInterpStaticData {
 /// `self.liveness_info = "".join(asm.all_liveness)` after each append.
 pub fn intern_liveness(live_i: &[u8], live_r: &[u8], live_f: &[u8]) -> Option<u16> {
     use crate::assembler::ASSEMBLER_STATE;
-    use majit_translate::liveness::encode_liveness;
+    use majit_jitcode::liveness::encode_liveness;
 
     ensure_finish_setup();
 
@@ -1351,7 +1351,7 @@ fn clear_dead_ref_registers_at_live_marker(
         // `0 <= val < 256`), so the live set fits a fixed 256-bit mask and the
         // hook allocates nothing.
         let mut live_r: [u64; 4] = [0; 4];
-        majit_translate::codewriter::jitcode::enumerate_vars(
+        majit_jitcode::codewriter::jitcode::enumerate_vars(
             info,
             all_liveness,
             |_| {},
@@ -1690,7 +1690,7 @@ fn sub_jitcode_body_from_payload(
             num_regs_f: jc.num_regs_f() as usize,
             constants_i: &*(jc.constants_i.as_slice() as *const [i64]),
             constants_r: &*(jc.constants_r.as_slice()
-                as *const [majit_translate::codewriter::jitcode::ConstSlotR]),
+                as *const [majit_jitcode::codewriter::jitcode::ConstSlotR]),
             constants_f: &*(jc.constants_f.as_slice() as *const [i64]),
         }
     })
@@ -1887,7 +1887,7 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
 }
 
 fn decode_live_var_count(
-    jitcode: &majit_translate::jitcode::JitCode,
+    jitcode: &majit_jitcode::jitcode::JitCode,
     pc: i32,
     op_live: u8,
     all_liveness: &[u8],
@@ -2173,7 +2173,7 @@ pub fn try_frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
         let length_f = all_liveness[off + 2] as u32;
         // Diagnostic removed — use post-decode logging instead.
         let mut cursor = off + 3;
-        use majit_translate::liveness::LivenessIterator;
+        use majit_jitcode::liveness::LivenessIterator;
 
         fn read_bank(cursor: &mut usize, length: u32, all_liveness: &[u8]) -> Vec<u32> {
             if length == 0 {
@@ -3882,7 +3882,7 @@ pub fn pyobject_gcarray_descr() -> DescrRef {
     // analyzer mint under this key would otherwise keep a different tid.
     majit_ir::descr_registry::force_register_keyed_array(
         majit_ir::descr::LLType::Array(majit_ir::descr::path_hash(
-            majit_translate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID,
+            majit_jitcode::codewriter::jtransform::OBJECT_REF_GCARRAY_TYPE_ID,
         )),
         descr.clone(),
     );
@@ -3893,9 +3893,8 @@ pub fn pyobject_gcarray_descr() -> DescrRef {
 /// identity.  The build-time descr pool consults this before minting, so
 /// the GC tid stamped here reaches the shared `_cache_array` slot first.
 pub(crate) fn runtime_gcarray_descr(array_type_id: &str) -> Option<DescrRef> {
-    use majit_translate::codewriter::jtransform as jt;
-    use majit_translate::front::typestr::canonical_array_type_id;
-    let canonical = canonical_array_type_id(array_type_id);
+    use majit_jitcode::codewriter::jtransform as jt;
+    let canonical = jt::canonical_array_type_id(array_type_id);
     match canonical.as_ref() {
         jt::LIST_INT_ITEMS_ARRAY => Some(int_gcarray_descr()),
         jt::LIST_FLOAT_ITEMS_ARRAY => Some(float_gcarray_descr()),
@@ -3918,7 +3917,7 @@ pub(crate) fn int_gcarray_descr() -> DescrRef {
         Some(token.len_offset),
         Type::Int,
         true,
-        Some(majit_translate::codewriter::jtransform::LIST_INT_ITEMS_ARRAY.to_string()),
+        Some(majit_jitcode::codewriter::jtransform::LIST_INT_ITEMS_ARRAY.to_string()),
     )
 }
 
@@ -3966,7 +3965,7 @@ pub(crate) fn float_gcarray_descr() -> DescrRef {
         Some(token.len_offset),
         Type::Float,
         false,
-        Some(majit_translate::codewriter::jtransform::LIST_FLOAT_ITEMS_ARRAY.to_string()),
+        Some(majit_jitcode::codewriter::jtransform::LIST_FLOAT_ITEMS_ARRAY.to_string()),
     )
 }
 
@@ -9290,7 +9289,7 @@ fn prepare_bridge_pending_fields(
                     let Some(fielddescr) = descr.as_field_descr() else {
                         break 'execute;
                     };
-                    let bh_descr = majit_translate::jitcode::BhDescr::from_field_descr(fielddescr);
+                    let bh_descr = majit_jitcode::jitcode::BhDescr::from_field_descr(fielddescr);
                     match (fielddescr.field_type(), value_concrete) {
                         (Type::Ref, majit_ir::Value::Ref(value)) => {
                             backend.bh_setfield_gc_r(target_ptr, value, &bh_descr)
@@ -9307,7 +9306,7 @@ fn prepare_bridge_pending_fields(
                     let Some(arraydescr) = descr.as_array_descr() else {
                         break 'execute;
                     };
-                    let bh_descr = majit_translate::jitcode::BhDescr::from_array_descr(arraydescr);
+                    let bh_descr = majit_jitcode::jitcode::BhDescr::from_array_descr(arraydescr);
                     let index = i64::from(pending.item_index);
                     match (arraydescr.item_type(), value_concrete) {
                         (Type::Ref, majit_ir::Value::Ref(value)) => {
@@ -9430,8 +9429,8 @@ fn decode_tagged_concrete(
     }
 }
 
-fn bh_field_descr_from_info(fd: &majit_ir::FieldDescrInfo) -> majit_translate::jitcode::BhDescr {
-    majit_translate::jitcode::BhDescr::Field {
+fn bh_field_descr_from_info(fd: &majit_ir::FieldDescrInfo) -> majit_jitcode::jitcode::BhDescr {
+    majit_jitcode::jitcode::BhDescr::Field {
         offset: fd.offset,
         field_size: fd.field_size,
         field_type: fd.field_type,
@@ -9450,25 +9449,25 @@ fn bh_field_descr_from_info(fd: &majit_ir::FieldDescrInfo) -> majit_translate::j
 fn bh_size_descr_from_size_descr(
     size_descr: &dyn majit_ir::descr::SizeDescr,
     vtable: usize,
-) -> majit_translate::jitcode::BhDescr {
-    majit_translate::jitcode::BhDescr::Size {
+) -> majit_jitcode::jitcode::BhDescr {
+    majit_jitcode::jitcode::BhDescr::Size {
         size: size_descr.size(),
         // descr.py type_id is the dense GC tid for alloc_nursery_typed,
         // not the cache_key structural identity
         type_id: size_descr.type_id() as u64,
         vtable: vtable as u64,
         owner: String::new(),
-        all_fielddescrs: majit_translate::jitcode::bh_field_specs_from_size_descr(size_descr),
+        all_fielddescrs: majit_jitcode::jitcode::bh_field_specs_from_size_descr(size_descr),
         // Round-trip the GC-header flag off the descr.
         is_gc_managed: size_descr.is_gc_managed(),
     }
 }
 
-fn bh_array_descr_from_descr(descr: &majit_ir::DescrRef) -> majit_translate::jitcode::BhDescr {
+fn bh_array_descr_from_descr(descr: &majit_ir::DescrRef) -> majit_jitcode::jitcode::BhDescr {
     let ad = descr
         .as_array_descr()
         .expect("resume.py: allocate_array requires ArrayDescr");
-    majit_translate::jitcode::BhDescr::from_array_descr(ad)
+    majit_jitcode::jitcode::BhDescr::from_array_descr(ad)
 }
 
 fn decode_tagged_for_kind(
@@ -9559,7 +9558,7 @@ fn setarrayitem_concrete_from_tagged(
     array_ptr: i64,
     index: usize,
     arraydescr: &dyn majit_ir::descr::ArrayDescr,
-    bh_descr: &majit_translate::jitcode::BhDescr,
+    bh_descr: &majit_jitcode::jitcode::BhDescr,
     fieldnum: i16,
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
     fail_values: &[i64],
@@ -9639,7 +9638,7 @@ fn setinteriorfield_concrete_from_tagged(
     let ifd = interior_descr
         .as_interior_field_descr()
         .expect("VArrayStructInfo: fielddescr is not an InteriorFieldDescr");
-    let bh = majit_translate::jitcode::BhDescr::from_interior_field_descr(ifd);
+    let bh = majit_jitcode::jitcode::BhDescr::from_interior_field_descr(ifd);
     match ifd.field_descr().field_type() {
         Type::Ref => {
             let value = decode_tagged_for_kind(
@@ -9713,7 +9712,7 @@ fn bh_call_r_for_oopspec(
     let cd = calldescr
         .as_call_descr()
         .expect("VStr/VUni oopspec calldescr must be CallDescr");
-    let bh_calldescr = majit_translate::jitcode::BhCallDescr::from_call_descr(cd);
+    let bh_calldescr = majit_jitcode::jitcode::BhCallDescr::from_call_descr(cd);
     backend.bh_call_r(func as i64, args_i, args_r, None, &bh_calldescr)
 }
 
@@ -10196,7 +10195,7 @@ fn materialize_concrete_virtual_int(
             let cd = descr_ref
                 .as_call_descr()
                 .expect("OS_RAW_MALLOC_VARSIZE_CHAR: not a CallDescr");
-            let bh = majit_translate::jitcode::BhCallDescr::from_arg_classes(
+            let bh = majit_jitcode::jitcode::BhCallDescr::from_arg_classes(
                 cd.arg_classes(),
                 cd.result_class(),
                 cd.get_extra_info().clone(),
@@ -10225,7 +10224,7 @@ fn materialize_concrete_virtual_int(
                 // so the value is stored through bh_raw_store_{f,i} with the
                 // real descr — no caller-side field-size truncation.
                 let store_descr =
-                    majit_translate::jitcode::BhDescr::from_array_descr_info(&descrs[i]);
+                    majit_jitcode::jitcode::BhDescr::from_array_descr_info(&descrs[i]);
                 if descrs[i].item_type == 2 {
                     let value = decode_tagged_concrete(
                         fnum,
@@ -12514,7 +12513,7 @@ fn materialize_virtual_raw_buffer(
     let cd = descr_ref
         .as_call_descr()
         .expect("OS_RAW_MALLOC_VARSIZE_CHAR: not a CallDescr");
-    let bh_calldescr = majit_translate::jitcode::BhCallDescr::from_arg_classes(
+    let bh_calldescr = majit_jitcode::jitcode::BhCallDescr::from_arg_classes(
         cd.arg_classes(),
         cd.result_class(),
         cd.get_extra_info().clone(),
@@ -12534,7 +12533,7 @@ fn materialize_virtual_raw_buffer(
     for i in 0..offsets.len() {
         let concrete = values[i].resolve_with_refs(materialized_refs)?;
         let di = &descrs[i];
-        let bh_descr = majit_translate::jitcode::BhDescr::from_array_descr_info(di);
+        let bh_descr = majit_jitcode::jitcode::BhDescr::from_array_descr_info(di);
         // resume.py:1544: assert not descr.is_array_of_pointers()
         assert!(
             !bh_descr.is_array_of_pointers(),
@@ -12861,7 +12860,7 @@ mod tests {
         fn bh_arraylen_gc(
             &self,
             array_ptr: i64,
-            arraydescr: &majit_translate::jitcode::BhDescr,
+            arraydescr: &majit_jitcode::jitcode::BhDescr,
         ) -> i64 {
             let ofs = arraydescr
                 .array_len_offset()
@@ -13113,7 +13112,7 @@ mod tests {
         live_r: &[u8],
         live_f: &[u8],
     ) -> *mut JitCode {
-        use majit_translate::liveness::encode_liveness;
+        use majit_jitcode::liveness::encode_liveness;
         let raw_code = unsafe {
             pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
                 as *const CodeObject
@@ -13137,7 +13136,7 @@ mod tests {
         };
         let runtime_jc = {
             let inner = majit_metainterp::jitcode::JitCode::new("close_loop_args_test");
-            inner.set_body(majit_translate::jitcode::JitCodeBody {
+            inner.set_body(majit_jitcode::jitcode::JitCodeBody {
                 code: vec![majit_metainterp::jitcode::insns::BC_LIVE, 0, 0],
                 c_num_regs_i: num_regs(live_i),
                 c_num_regs_r: num_regs(live_r),
@@ -15763,7 +15762,7 @@ mod indirectcalltargets_tests {
         // `is_drained` set; give the fixture both so it is not classified
         // as a skeleton (`is_skeleton()` now tests `code.is_empty()`).
         let runtime_jc = majit_metainterp::jitcode::JitCode::new("populated_pyjit_test");
-        runtime_jc.set_body(majit_translate::jitcode::JitCodeBody {
+        runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
             code: vec![majit_metainterp::jitcode::insns::BC_LIVE, 0, 0],
             startpoints: Some([0_usize].into_iter().collect()),
             ..Default::default()
@@ -15775,7 +15774,7 @@ mod indirectcalltargets_tests {
 
     fn pyjit_with_ref_constant(value: usize) -> Arc<crate::PyJitCode> {
         let runtime_jc = majit_metainterp::jitcode::JitCode::new("ref_constant_test");
-        runtime_jc.set_body(majit_translate::jitcode::JitCodeBody {
+        runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
             code: vec![majit_metainterp::jitcode::insns::BC_LIVE, 0, 0],
             constants_r: vec![(value as i64).into()],
             startpoints: Some([0_usize].into_iter().collect()),

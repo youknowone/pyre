@@ -919,8 +919,8 @@ pub(crate) fn vable_array_descrs_from_jitcode<Sym: WalkSym>(
         ctx.raw_descrs.bh_descr_at(array_pool_idx),
     ) {
         (
-            Some(majit_translate::jitcode::BhDescr::VableArray { index }),
-            Some(majit_translate::jitcode::BhDescr::Array { .. }),
+            Some(majit_jitcode::jitcode::BhDescr::VableArray { index }),
+            Some(majit_jitcode::jitcode::BhDescr::Array { .. }),
         ) => *index,
         _ => {
             if std::env::var("PYRE_FBW_INLINE_DIAG").is_ok() {

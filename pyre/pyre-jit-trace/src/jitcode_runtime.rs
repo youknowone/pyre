@@ -6,7 +6,7 @@
 //! `CallControl.jitcodes` directly into `MetaInterpStaticData`; the two
 //! stores reference the same Python objects.
 //!
-//! majit's build-time side lives in `majit_translate::jitcode::JitCode`
+//! majit's build-time side lives in `majit_jitcode::jitcode::JitCode`
 //! (serde-serializable, emitted by `build.rs` into `$OUT_DIR/jitcodes.bin`).
 //! This module uses the separately encoded name/offset index to deserialize
 //! each `Arc<JitCode>` on first access. The configured portal index is read
@@ -23,10 +23,10 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, LazyLock, Once, OnceLock};
 
 use majit_ir::DescrRef;
-use majit_translate::CompiledJitDriver;
-use majit_translate::jitcode::{BhDescr, DescrTable, JitCode};
+use majit_jitcode::artifacts::CompiledJitDriver;
+use majit_jitcode::jitcode::{BhDescr, DescrTable, JitCode};
 
-use majit_translate::artifacts::JitCodeIndex;
+use majit_jitcode::artifacts::JitCodeIndex;
 
 /// Runtime-frozen canonical JitCode.
 ///
@@ -669,7 +669,7 @@ pub fn newutf8_jitcode() -> Option<Arc<JitCode>> {
 ///
 /// `Assembler::get_opnum` mirrors RPython
 /// `assembler.py setdefault(key, len(self.insns))`: keys present
-/// in `majit_translate::insns::{wellknown_bh_insns, extension_insns}`
+/// in `majit_jitcode::insns::{wellknown_bh_insns, extension_insns}`
 /// reuse their reserved `BC_*` byte for build/runtime stability, and
 /// translator-only keys outside the canonical universe get the lowest
 /// available non-reserved dynamic byte.  Both kinds land here verbatim,
@@ -748,8 +748,8 @@ static INSNS_OPNAME_TO_BYTE: LazyLock<indexmap::IndexMap<String, u8>> = LazyLock
             }
         }
     }
-    overlay_insns(&mut table, &majit_translate::insns::wellknown_bh_insns());
-    overlay_insns(&mut table, &majit_translate::insns::extension_insns());
+    overlay_insns(&mut table, &majit_jitcode::insns::wellknown_bh_insns());
+    overlay_insns(&mut table, &majit_jitcode::insns::extension_insns());
     table
 });
 
@@ -1008,7 +1008,7 @@ fn descr_layout_offsets() -> &'static [u32] {
     })
 }
 
-fn descr_layout_at(index: usize) -> std::sync::Arc<majit_translate::jitcode::BhSizeSpec> {
+fn descr_layout_at(index: usize) -> std::sync::Arc<majit_jitcode::jitcode::BhSizeSpec> {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descr_layouts.bin"));
     let offsets = descr_layout_offsets();
     let start = offsets[index] as usize;
@@ -1045,7 +1045,7 @@ fn load_descr_uncached(index: usize) -> BhDescr {
 /// `parent_layout_at` instead of decoding it anew.
 fn load_descr_with_parent(
     index: usize,
-    parent_layout_at: impl FnOnce(usize) -> std::sync::Arc<majit_translate::jitcode::BhSizeSpec>,
+    parent_layout_at: impl FnOnce(usize) -> std::sync::Arc<majit_jitcode::jitcode::BhSizeSpec>,
 ) -> BhDescr {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descrs.bin"));
     let offsets = &descrs_index().offsets;
@@ -1319,7 +1319,7 @@ fn call_descr_result_type(result_type: char) -> majit_ir::Type {
     }
 }
 
-fn rehydrated_call_descr_ref(bh: majit_translate::jitcode::BhCallDescr) -> majit_ir::DescrRef {
+fn rehydrated_call_descr_ref(bh: majit_jitcode::jitcode::BhCallDescr) -> majit_ir::DescrRef {
     let arg_types = call_descr_arg_types(&bh.arg_classes);
     let result_type = call_descr_result_type(bh.result_type);
     // This BhCallDescr was decoded solely for setup.  Move its EffectInfo
@@ -1362,7 +1362,7 @@ pub fn materialize_gccache_owned_descrs() {
         // sit in consecutive slots.  Reuse the previous slot's layout when it
         // is the same one: at most one decoded layout is held beyond the slot
         // that uses it, so the transient stays bounded (see `descr_layout_at`).
-        let mut last_layout: Option<(usize, std::sync::Arc<majit_translate::jitcode::BhSizeSpec>)> =
+        let mut last_layout: Option<(usize, std::sync::Arc<majit_jitcode::jitcode::BhSizeSpec>)> =
             None;
         for (i, kind) in index.kinds.iter().copied().enumerate() {
             if kind != 0 {
@@ -2469,7 +2469,7 @@ pub fn decode_op_at(code: &[u8], pc: usize) -> Option<DecodedOp> {
         // blackhole.py bhimpl_live(pc): position += OFFSET_SIZE.
         // The `live/` key has empty argcodes so the generic walker would
         // advance 0 bytes, but dispatch skips 2 bytes of liveness offset.
-        cursor += majit_translate::liveness::OFFSET_SIZE;
+        cursor += majit_jitcode::liveness::OFFSET_SIZE;
         if cursor > code.len() {
             return None;
         }
@@ -2795,7 +2795,7 @@ mod tests {
 
         let mut first_parent_by_layout: std::collections::BTreeMap<
             u32,
-            std::sync::Arc<majit_translate::jitcode::BhSizeSpec>,
+            std::sync::Arc<majit_jitcode::jitcode::BhSizeSpec>,
         > = std::collections::BTreeMap::new();
         let mut parent_references = 0usize;
         for (slot, &layout_index) in index.parent_layouts.iter().enumerate() {
@@ -3018,13 +3018,13 @@ mod tests {
         // entry, and sitting between two samples it charged that churn to
         // whichever stage followed it.
         {
-            use majit_translate::jitcode::BhDescr;
+            use majit_jitcode::jitcode::BhDescr;
             let mut variants: std::collections::BTreeMap<&str, usize> = Default::default();
             let mut specs = 0usize;
             let mut distinct_layouts: std::collections::HashSet<u64> = Default::default();
             let mut strings = 0usize;
             let mut string_bytes = 0usize;
-            let note = |sp: &majit_translate::jitcode::BhSizeSpec,
+            let note = |sp: &majit_jitcode::jitcode::BhSizeSpec,
                         specs: &mut usize,
                         strings: &mut usize,
                         string_bytes: &mut usize,
@@ -3289,7 +3289,7 @@ mod tests {
     }
 
     /// Every key in build-observed `pipeline.insns` that ALSO appears in
-    /// the canonical universe (`majit_translate::insns::
+    /// the canonical universe (`majit_jitcode::insns::
     /// {wellknown_bh_insns, extension_insns}`) must carry the
     /// matching reserved byte.  Translator-only keys allocated by
     /// `Assembler::get_opnum`'s `setdefault` fallback (`assembler.py`
@@ -3303,11 +3303,11 @@ mod tests {
     #[test]
     fn pipeline_insns_canonical_keys_match_canonical_bytes() {
         let observed = insns_opname_to_byte();
-        let mut canonical: HashMap<String, u8> = majit_translate::insns::wellknown_bh_insns()
+        let mut canonical: HashMap<String, u8> = majit_jitcode::insns::wellknown_bh_insns()
             .into_iter()
             .map(|(k, v)| (k.to_string(), v))
             .collect();
-        for (k, v) in majit_translate::insns::extension_insns() {
+        for (k, v) in majit_jitcode::insns::extension_insns() {
             assert!(
                 canonical.insert(k.to_string(), v).is_none(),
                 "duplicate opname {k:?} between wellknown_bh_insns() and \
@@ -3325,7 +3325,7 @@ mod tests {
                 );
             } else {
                 assert!(
-                    !majit_translate::insns::is_reserved_opcode_byte(observed_byte),
+                    !majit_jitcode::insns::is_reserved_opcode_byte(observed_byte),
                     "pipeline.insns key {key:?} is absent from \
                      wellknown_bh_insns() ∪ extension_insns() but \
                      was assigned reserved byte {observed_byte}; \
@@ -3497,7 +3497,7 @@ mod tests {
         assert_eq!(op.pc, 0);
         assert_eq!(
             op.next_pc,
-            1 + majit_translate::liveness::OFFSET_SIZE,
+            1 + majit_jitcode::liveness::OFFSET_SIZE,
             "live/ must advance by OFFSET_SIZE past the opcode byte",
         );
     }
@@ -4340,7 +4340,7 @@ mod tests {
 
         let jc = {
             let inner = majit_metainterp::jitcode::JitCode::new("test_setposition");
-            inner.set_body(majit_translate::jitcode::JitCodeBody {
+            inner.set_body(majit_jitcode::jitcode::JitCodeBody {
                 c_num_regs_i: 1,
                 constants_i: vec![42],
                 code: code.clone(),

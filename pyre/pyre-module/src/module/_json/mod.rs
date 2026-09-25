@@ -1424,3 +1424,29 @@ pyre_interpreter::py_module! {
         publish_fast_encode_fns(ns);
     }
 }
+
+/// The GC types this module owns, in `build_gc` registration order.
+pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType>) {
+    use pyre_interpreter::importing::{ModuleGcAnchor, ModuleGcLayout, ModuleGcType};
+    use pyre_object::lltype::PyreClassPyTypeOf;
+    // `_json.Scanner` keeps the `make_scanner` protocol callbacks and memo in
+    // traced payload fields beside its native recursion counter.
+    types.push(ModuleGcType {
+        anchor: ModuleGcAnchor::AfterStringIO,
+        descriptor: <W_Scanner as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::PyreClass {
+            memory_pressure_offset: None,
+        },
+        destructor: None,
+    });
+    // `_json.Encoder` keeps the `make_encoder` arguments in traced payload
+    // fields beside its native fast-mode and recursion state.
+    types.push(ModuleGcType {
+        anchor: ModuleGcAnchor::AfterStringIO,
+        descriptor: <W_Encoder as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::PyreClass {
+            memory_pressure_offset: None,
+        },
+        destructor: None,
+    });
+}

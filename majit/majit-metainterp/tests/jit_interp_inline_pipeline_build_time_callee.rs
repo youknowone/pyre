@@ -50,9 +50,9 @@ fn build_time_table() -> &'static EmbeddedJitCodeTable {
     })
 }
 
-fn canonical_void_jitcode(name: &str, index: usize) -> Arc<majit_translate::jitcode::JitCode> {
-    let core = majit_translate::jitcode::JitCode::new(name);
-    core.set_body(majit_translate::jitcode::JitCodeBody {
+fn canonical_void_jitcode(name: &str, index: usize) -> Arc<majit_jitcode::jitcode::JitCode> {
+    let core = majit_jitcode::jitcode::JitCode::new(name);
+    core.set_body(majit_jitcode::jitcode::JitCodeBody {
         code: vec![majit_metainterp::jitcode::insns::BC_VOID_RETURN],
         ..Default::default()
     });
@@ -63,9 +63,9 @@ fn canonical_void_jitcode(name: &str, index: usize) -> Arc<majit_translate::jitc
 /// `int_return/i` reading int register 0 — the minimum
 /// `trailing_return_info()` accepts, which the `inline_pipeline_*` lowering
 /// requires of its callee.
-fn canonical_jitcode(name: &str, index: usize) -> Arc<majit_translate::jitcode::JitCode> {
-    let core = majit_translate::jitcode::JitCode::new(name);
-    core.set_body(majit_translate::jitcode::JitCodeBody {
+fn canonical_jitcode(name: &str, index: usize) -> Arc<majit_jitcode::jitcode::JitCode> {
+    let core = majit_jitcode::jitcode::JitCode::new(name);
+    core.set_body(majit_jitcode::jitcode::JitCodeBody {
         code: vec![majit_metainterp::jitcode::insns::BC_INT_RETURN, 0],
         c_num_regs_i: 1,
         ..Default::default()

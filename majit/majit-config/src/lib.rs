@@ -10,10 +10,6 @@
 //! Deferred: full `support.py` (`detect_pax`, C-backend concern) lands
 //! alongside first consumers.
 
-#[expect(
-    clippy::module_inception,
-    reason = "module names mirror the corresponding RPython package and file layout for line-by-line parity"
-)]
 pub mod config;
 pub mod parse;
 pub mod support;

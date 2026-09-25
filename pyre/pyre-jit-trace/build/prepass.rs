@@ -5,7 +5,7 @@
 //! Analyzes all source files from:
 //! - pyre-object (Python object types: W_IntObject, W_FloatObject, etc.)
 //! - pyre-interpreter (object space, bytecode dispatch, eval loop)
-//! - pyre-module (optional builtin modules: math, _csv, …)
+//! - pyre-module (optional builtin modules: math, _csv, …), `full` only
 
 #[path = "../src/call_spec.rs"]
 mod call_spec;
@@ -20,7 +20,7 @@ mod ullbc_semantic;
 #[path = "../src/virtualizable_spec.rs"]
 mod virtualizable_spec;
 
-use codegen_cache::LLBC_CRATES;
+use codegen_cache::{LLBC_CRATES, LLBC_SUBDIR};
 use walkdir::WalkDir;
 
 /// The translation prepass churns the whole graph universe through short-lived
@@ -313,7 +313,9 @@ fn analysis_llbc_paths(repo_root: &str) -> Vec<String> {
         }
     }
 
-    let llbc_dir = std::path::Path::new(repo_root).join("build").join("llbc");
+    let llbc_dir = std::path::Path::new(repo_root)
+        .join("build")
+        .join(LLBC_SUBDIR);
     LLBC_CRATES
         .iter()
         .map(|crate_name| llbc_dir.join(format!("{crate_name}.ullbc")))
@@ -329,9 +331,10 @@ fn analysis_llbc_paths(repo_root: &str) -> Vec<String> {
 /// Pre-flight the LLBC prerequisite, mirroring the resolution order in
 /// `majit-translate` (`build_semantic_program_via_active_frontend`):
 /// honour the `MAJIT_MIR_FRONTEND_LLBC` override, else require the
-/// `LLBC_CRATES` artefacts under `build/llbc/`. `pyre-jit` contains the
-/// exact `eval::eval_loop_jit` portal; `pyre-module` holds optional
-/// builtin-module graphs so look_inside/elidable survive the crate split.
+/// `LLBC_CRATES` artefacts under `build/<LLBC_SUBDIR>/`. `pyre-jit` contains
+/// the exact `eval::eval_loop_jit` portal; `pyre-module`, in a `full` build
+/// only, holds optional builtin-module graphs so look_inside/elidable survive
+/// the crate split.
 ///
 /// When neither resolves, emit a clean, copy-pasteable bootstrap message
 /// and fail the build *before* the worker spawns — so the contributor
@@ -359,7 +362,7 @@ fn preflight_llbc_or_fail() {
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..");
-    let llbc_dir = repo_root.join("build").join("llbc");
+    let llbc_dir = repo_root.join("build").join(LLBC_SUBDIR);
     let mut missing: Vec<String> = LLBC_CRATES
         .iter()
         .map(|crate_name| format!("{crate_name}.ullbc"))
@@ -395,7 +398,7 @@ fn preflight_llbc_or_fail() {
     // explicit non-zero exit is the belt-and-suspenders stop for a Cargo
     // too old to recognise `cargo::error`.
     println!(
-        "cargo::error=pyre-jit codegen needs the Charon-extracted LLBC artefacts, but build/llbc/ is missing: {}",
+        "cargo::error=pyre-jit codegen needs the Charon-extracted LLBC artefacts, but build/{LLBC_SUBDIR}/ is missing: {}",
         missing.join(", "),
     );
     if !charon_present {
@@ -408,12 +411,19 @@ fn preflight_llbc_or_fail() {
     // since `MAJIT_MIR_FRONTEND_LLBC` is treated as the complete input set and
     // returns before the sidecar check above.
     let sidecars = llbc_layout_sidecars();
+    let extract_env: String = CORE_EXTRACTION_ENV
+        .iter()
+        .map(|(key, value)| format!("{key}={value} "))
+        .collect();
     let (extract_cmd, override_extra) = if sidecars.is_empty() {
-        ("scripts/extract-llbc.py".to_string(), String::new())
+        (
+            format!("{extract_env}scripts/extract-llbc.py"),
+            String::new(),
+        )
     } else {
         let target = std::env::var("TARGET").unwrap_or_default();
         (
-            format!("LLBC_LAYOUT_TARGETS={target} scripts/extract-llbc.py"),
+            format!("{extract_env}LLBC_LAYOUT_TARGETS={target} scripts/extract-llbc.py"),
             sidecars
                 .iter()
                 .map(|name| format!(":/abs/{name}"))
@@ -445,7 +455,7 @@ fn preflight_llbc_or_fail() {
 ========================================================================\n",
         missing
             .iter()
-            .map(|name| format!("   build/llbc/{name}"))
+            .map(|name| format!("   build/{LLBC_SUBDIR}/{name}"))
             .collect::<Vec<_>>()
             .join("\n"),
         install_line,
@@ -472,6 +482,13 @@ use llbc_fingerprint::{
     FingerprintFields, FreshnessMode, freshness_policy, parse_fingerprint_fields, platform_key,
     stamp_field,
 };
+
+/// The switch that makes `extract-llbc.py` describe the core set; empty for
+/// the product set.
+#[cfg(feature = "full")]
+const CORE_EXTRACTION_ENV: &[(&str, &str)] = &[];
+#[cfg(not(feature = "full"))]
+const CORE_EXTRACTION_ENV: &[(&str, &str)] = &[("PYRE_JIT_CORE", "1")];
 
 /// Wait for the fingerprint oracle with a deadline.
 ///
@@ -541,6 +558,8 @@ fn llbc_current_fingerprint(
             .current_dir(repo_root)
             .env("CARGO_FEATURES", features)
             .env("LLBC_LAYOUT_TARGETS", layout_targets)
+            .env("LLBC_DEST", repo_root.join("build").join(LLBC_SUBDIR))
+            .envs(CORE_EXTRACTION_ENV.iter().copied())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -644,7 +663,7 @@ fn fail_if_llbc_stale(repo_root: &std::path::Path) {
         );
         return;
     }
-    let llbc_dir = repo_root.join("build").join("llbc");
+    let llbc_dir = repo_root.join("build").join(LLBC_SUBDIR);
     // `(crate, field, recorded, current)`. One crate can be stale on both
     // fields, and which one moved is the difference between "your own sources
     // changed" and "a dependency in another checkout changed".
@@ -936,6 +955,8 @@ fn real_main() {
         // admits `module::*` only when a matching source path is in
         // this census. Interpreter `module/mod.rs` currently contributes
         // the `module` root as well, but the moved graphs belong here.
+        // The core translation leaves the crate out with its LLBC.
+        #[cfg(feature = "full")]
         format!("{pyre_base}/pyre-module/src"),
     ];
 
@@ -1140,11 +1161,13 @@ fn real_main() {
     // `compute_builtin_wrapper_indirect_graphs` records
     // `no jitcode for address`. `register` is idempotent with the
     // crate's ctor.
+    #[cfg(feature = "full")]
     pyre_module::register();
     let fnaddr_bindings = pyre_interpreter::jit_trace_fnaddrs();
     // Host-only: `BUILTIN_WRAPPER_DESCRIPTORS` is empty on wasm32.
     // A missing row here means the build-dep was dropped and every
     // moved builtin will residualise at `no jitcode for address`.
+    #[cfg(feature = "full")]
     if !fnaddr_bindings
         .iter()
         .any(|(path, _)| path.contains("pyre_module::module::") && path.contains("__majit_wrap_"))
@@ -2028,10 +2051,10 @@ fn emit_rerun_directives(repo_root: &str, source_paths: &[String]) {
     // production input, and a copy of the list that missed it would let cargo
     // skip this script after that artefact alone changed.
     for crate_name in LLBC_CRATES {
-        println!("cargo::rerun-if-changed={repo_root}/build/llbc/{crate_name}.ullbc");
+        println!("cargo::rerun-if-changed={repo_root}/build/{LLBC_SUBDIR}/{crate_name}.ullbc");
     }
     for sidecar in llbc_layout_sidecars() {
-        println!("cargo::rerun-if-changed={repo_root}/build/llbc/{sidecar}");
+        println!("cargo::rerun-if-changed={repo_root}/build/{LLBC_SUBDIR}/{sidecar}");
     }
 }
 
@@ -2535,7 +2558,7 @@ fn hash_llbc_inputs(h: &mut CacheHasher, repo_root: &std::path::Path) {
             repo_root,
             &repo_root
                 .join("build")
-                .join("llbc")
+                .join(LLBC_SUBDIR)
                 .join(format!("{crate_name}.ullbc")),
         );
     }
@@ -2549,7 +2572,7 @@ fn hash_llbc_inputs(h: &mut CacheHasher, repo_root: &std::path::Path) {
         hash_ullbc_file(
             h,
             repo_root,
-            &repo_root.join("build").join("llbc").join(&sidecar),
+            &repo_root.join("build").join(LLBC_SUBDIR).join(&sidecar),
         );
     }
 }
