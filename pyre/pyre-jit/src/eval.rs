@@ -4308,10 +4308,10 @@ fn build_gc() -> Box<MiniMarkGC> {
     );
 
     // `GcLLDescr_framework.init_size_descr` asks `TypeLayoutBuilder.get_type_id`
-    // for synthetic struct tids during translation. pyre stamps them on the
-    // first JIT use (`materialize_gccache_owned_descrs`, installed below as
-    // the type-registry close hook) so a process that never traces does not
-    // decode the descr table.
+    // for synthetic struct tids during translation. pyre stamps them from
+    // `init_gc_subsystem` via `materialize_gccache_owned_descrs`, once this
+    // collector is installed. They are not registered in this function: it
+    // runs before `gc_sync` publishes the collector.
 
     // `bytes` `data` block — `rstr.py`'s `STR.chars`, an
     // `Array(Char)`. A varsize GcArray of bytes with no inner refs, so it
@@ -4322,7 +4322,8 @@ fn build_gc() -> Box<MiniMarkGC> {
     // slot, the same edge the storage box was reached by.
     //
     // Registered at the tail of the fixed layouts. Synthetic struct tids are
-    // stamped on the first JIT use and do not occupy a slot here. A tid is a
+    // stamped later, from `init_gc_subsystem`, and do not occupy a slot here.
+    // A tid is a
     // position in this chain, and the interpreter spells many of them as
     // literals — `W_BYTES_GC_TYPE_ID` is 27, `W_LIST_GC_TYPE_ID` is 7 — so an
     // insertion anywhere earlier renumbers every registration below it while the
@@ -4991,6 +4992,12 @@ pub fn init_gc_subsystem() {
     majit_gc::set_type_registry_close_hook(
         pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs,
     );
+    // Kind-0 descr decode and the synthetic struct tids. The close hook
+    // still runs this before `freeze_types` if a trace wins the race.
+    // Doing it here as well puts the cost in every process, including the
+    // empty-program startup a ratio subtracts, instead of only in the
+    // first trace.
+    pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs();
     // rbigint.py constructs `_parts_cache_10` at module import.  Force pyre's
     // translated prebuilt equivalent before any collector root walk rather
     // than lazily manufacturing it from inside the walker. After registration,
