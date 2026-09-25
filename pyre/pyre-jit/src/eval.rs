@@ -1973,9 +1973,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     // destructor. They register after every interpreter class, so an
     // interpreter without the module hooks keeps the same ids for its own.
     let module_hooks = pyre_interpreter::importing::optional_module_hooks();
-    let module_gc_types = module_hooks
-        .map(|hooks| (hooks.gc_types)())
-        .unwrap_or_default();
+    let module_gc_types = pyre_interpreter::module_gc_types();
     let module_immortal_w_class_only_descriptors = module_hooks
         .map(|hooks| (hooks.immortal_w_class_only_descriptors)())
         .unwrap_or_default();

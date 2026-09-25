@@ -11,7 +11,7 @@ static STRUCT_PASSWD_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new
 #[cfg(unix)]
 fn struct_passwd_type() -> pyre_object::PyObjectRef {
     *STRUCT_PASSWD_TYPE.get_or_init(|| {
-        pyre_interpreter::_structseq::make_struct_seq(
+        crate::_structseq::make_struct_seq(
             "pwd.struct_passwd",
             &[
                 "pw_name",
@@ -35,13 +35,11 @@ fn struct_passwd_type() -> pyre_object::PyObjectRef {
 /// OverflowError "user id is greater than maximum".  Floats / non-int
 /// inputs raise TypeError via `int_w`.
 #[cfg(unix)]
-fn pwd_uid_converter(
-    w_uid: pyre_object::PyObjectRef,
-) -> Result<libc::uid_t, pyre_interpreter::PyError> {
-    let val = match pyre_interpreter::baseobjspace::int_w(w_uid) {
+fn pwd_uid_converter(w_uid: pyre_object::PyObjectRef) -> Result<libc::uid_t, crate::PyError> {
+    let val = match crate::baseobjspace::int_w(w_uid) {
         Ok(v) => v,
-        Err(e) if matches!(e.kind, pyre_interpreter::PyErrorKind::OverflowError) => {
-            return Err(pyre_interpreter::PyError::overflow_error(
+        Err(e) if matches!(e.kind, crate::PyErrorKind::OverflowError) => {
+            return Err(crate::PyError::overflow_error(
                 "user id is greater than maximum",
             ));
         }
@@ -51,13 +49,13 @@ fn pwd_uid_converter(
         return Ok((-1i64) as libc::uid_t);
     }
     if val < 0 {
-        return Err(pyre_interpreter::PyError::overflow_error(
+        return Err(crate::PyError::overflow_error(
             "user id is less than minimum",
         ));
     }
     let uid = val as libc::uid_t;
     if uid as i64 != val {
-        return Err(pyre_interpreter::PyError::overflow_error(
+        return Err(crate::PyError::overflow_error(
             "user id is greater than maximum",
         ));
     }
@@ -77,7 +75,7 @@ fn pwd_uid_converter(
 ///
 /// Backed by `rustpython_host_env::pwd` (a thin `nix` wrapper).
 #[cfg(unix)]
-pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
+pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     #[cfg(feature = "host_env")]
     fn make_struct_passwd(pw: &rustpython_host_env::pwd::Passwd) -> pyre_object::PyObjectRef {
         let mut fields = pyre_object::gc_roots::RootedItems::new();
@@ -88,22 +86,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         fields.push(pyre_object::w_str_new_managed(&pw.gecos));
         fields.push(pyre_object::w_str_new_managed(&pw.dir));
         fields.push(pyre_object::w_str_new_managed(&pw.shell));
-        pyre_interpreter::_structseq::new_instance(struct_passwd_type(), fields.take())
+        crate::_structseq::new_instance(struct_passwd_type(), fields.take())
     }
 
     // `app_pwd.py class struct_passwd(metaclass=structseqtype)`.
-    pyre_interpreter::module_ns_store(ns, "struct_passwd", struct_passwd_type());
-    pyre_interpreter::module_ns_store(ns, "struct_pwent", struct_passwd_type());
-    pyre_interpreter::module_ns_store(
+    crate::module_ns_store(ns, "struct_passwd", struct_passwd_type());
+    crate::module_ns_store(ns, "struct_pwent", struct_passwd_type());
+    crate::module_ns_store(
         ns,
         "getpwuid",
-        pyre_interpreter::make_builtin_function_with_arity(
+        crate::make_builtin_function_with_arity(
             "getpwuid",
             |args| {
                 if args.is_empty() {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "getpwuid() missing argument",
-                    ));
+                    return Err(crate::PyError::type_error("getpwuid() missing argument"));
                 }
                 // `interp_pwd.py uid_converter`: -1 sentinel passes
                 // through; negative-other → OverflowError "less than
@@ -113,20 +109,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 // found".
                 let uid = match pwd_uid_converter(args[0]) {
                     Ok(u) => u,
-                    Err(e) if matches!(e.kind, pyre_interpreter::PyErrorKind::OverflowError) => {
-                        return Err(pyre_interpreter::PyError::key_error(
-                            "getpwuid(): uid not found",
-                        ));
+                    Err(e) if matches!(e.kind, crate::PyErrorKind::OverflowError) => {
+                        return Err(crate::PyError::key_error("getpwuid(): uid not found"));
                     }
                     Err(e) => return Err(e),
                 };
                 match rustpython_host_env::pwd::getpwuid(uid) {
                     Ok(Some(pw)) => Ok(make_struct_passwd(&pw)),
-                    Ok(None) => Err(pyre_interpreter::PyError::key_error(format!(
+                    Ok(None) => Err(crate::PyError::key_error(format!(
                         "getpwuid(): uid not found: {}",
                         uid as i64
                     ))),
-                    Err(e) => Err(pyre_interpreter::PyError::os_error_with_errno(
+                    Err(e) => Err(crate::PyError::os_error_with_errno(
                         e.raw_os_error().unwrap_or(0),
                         format!("getpwuid: {e}"),
                     )),
@@ -135,33 +129,31 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
             1,
         ),
     );
-    pyre_interpreter::module_ns_store(
+    crate::module_ns_store(
         ns,
         "getpwnam",
-        pyre_interpreter::make_builtin_function_with_arity(
+        crate::make_builtin_function_with_arity(
             "getpwnam",
             |args| {
                 if args.is_empty() {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "getpwnam() missing argument",
-                    ));
+                    return Err(crate::PyError::type_error("getpwnam() missing argument"));
                 }
                 if !unsafe { pyre_object::is_str(args[0]) } {
-                    return Err(pyre_interpreter::PyError::type_error(
+                    return Err(crate::PyError::type_error(
                         "getpwnam(): name should be a string",
                     ));
                 }
-                let name = pyre_interpreter::baseobjspace::str_utf8_w(args[0])?;
+                let name = crate::baseobjspace::str_utf8_w(args[0])?;
                 // `interp_pwd.py @unwrap_spec(name='text0')` rejects
                 // embedded NULs.
                 if name.as_bytes().contains(&0) {
-                    return Err(pyre_interpreter::PyError::value_error(
+                    return Err(crate::PyError::value_error(
                         "getpwnam: name must not contain NUL bytes",
                     ));
                 }
                 match rustpython_host_env::pwd::getpwnam(name) {
                     Some(pw) => Ok(make_struct_passwd(&pw)),
-                    None => Err(pyre_interpreter::PyError::key_error(format!(
+                    None => Err(crate::PyError::key_error(format!(
                         "getpwnam(): name not found: {}",
                         name
                     ))),
@@ -170,10 +162,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
             1,
         ),
     );
-    pyre_interpreter::module_ns_store(
+    crate::module_ns_store(
         ns,
         "getpwall",
-        pyre_interpreter::make_builtin_function_with_arity(
+        crate::make_builtin_function_with_arity(
             "getpwall",
             |_| {
                 // Every entry is freshly allocated and the next one allocates

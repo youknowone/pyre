@@ -34,7 +34,6 @@ pub mod module;
 /// The interpreter does not depend on this crate. The final binary calls
 /// [`register`] before `install_builtin_modules`.
 pub fn install_optional_modules() {
-    pyre_interpreter::importing::register_builtin_module("_abc", module::_abc::init);
     pyre_interpreter::importing::register_builtin_module("_bisect", module::_bisect::init);
     pyre_interpreter::importing::register_builtin_module("_blake2", module::_blake2::init);
     #[cfg(all(
@@ -50,7 +49,6 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("_ctypes", module::_ctypes::init);
     pyre_interpreter::importing::register_builtin_module("_bz2", module::_bz2::init);
     pyre_interpreter::importing::register_builtin_module("_csv", module::_csv::init);
-    pyre_interpreter::importing::register_builtin_module("_functools", module::_functools::init);
     pyre_interpreter::importing::register_builtin_module("_codecs_cn", module::_codecs_cn::init);
     pyre_interpreter::importing::register_builtin_module("_codecs_hk", module::_codecs_hk::init);
     pyre_interpreter::importing::register_builtin_module(
@@ -92,18 +90,8 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("_socket", module::_socket::init);
     #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("_ssl", module::_ssl::init);
-    // Frozen importlib imports `_stat` while bootstrapping a sandbox that
-    // mounts no stdlib files, so this stays an unconditional builtin.
-    pyre_interpreter::importing::register_builtin_module("_stat", module::_stat::init);
     pyre_interpreter::importing::register_builtin_module("_statistics", module::_statistics::init);
-    pyre_interpreter::importing::register_builtin_module(
-        "_suggestions",
-        module::_suggestions::init,
-    );
-    pyre_interpreter::importing::register_builtin_module("_symtable", module::_symtable::init);
     pyre_interpreter::importing::register_builtin_module("_template", module::_template::init);
-    pyre_interpreter::importing::register_builtin_module("_tokenize", module::_tokenize::init);
-    pyre_interpreter::importing::register_builtin_module("_typing", module::_typing::init);
     #[cfg(windows)]
     pyre_interpreter::importing::register_builtin_module("_winapi", module::_winapi::init);
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
@@ -114,11 +102,6 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("_scproxy", module::_scproxy::init);
     pyre_interpreter::importing::register_builtin_module("binascii", module::binascii::init);
     pyre_interpreter::importing::register_builtin_module("cmath", module::cmath::init);
-    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-    pyre_interpreter::importing::register_builtin_module(
-        "faulthandler",
-        module::faulthandler::init,
-    );
     pyre_interpreter::importing::register_builtin_module("math", module::math::init);
     #[cfg(all(windows, feature = "host_env"))]
     pyre_interpreter::importing::register_builtin_module("msvcrt", module::msvcrt::init);
@@ -132,8 +115,6 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("fcntl", module::fcntl::init);
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("grp", module::grp::init);
-    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
-    pyre_interpreter::importing::register_builtin_module("pwd", module::pwd::init);
     pyre_interpreter::importing::register_builtin_module("pyexpat", module::pyexpat::init);
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("resource", module::resource::init);
@@ -419,8 +400,6 @@ unsafe fn hook_libffi_cif_shape(
 /// `pyre_interpreter::MODULE_FIRST_TYPE_ID`.
 fn module_gc_types() -> Vec<pyre_interpreter::importing::ModuleGcType> {
     let mut types = Vec::new();
-    module::_tokenize::gc_types(&mut types);
-    module::_functools::gc_types(&mut types);
     module::unicodedata::gc_types(&mut types);
     module::_json::gc_types(&mut types);
     module::_hashlib::gc_types(&mut types);
@@ -1189,8 +1168,6 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
 
 fn walk_optional_global_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     let _ = visitor;
-    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-    module::faulthandler::handler::walk_faulthandler_roots(visitor);
     #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
     module::_ctypes::cdata::walk_pyobj_container_roots(visitor);
 }

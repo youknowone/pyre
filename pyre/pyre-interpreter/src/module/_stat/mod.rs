@@ -289,28 +289,24 @@ const IO_REPARSE_TAGS: [(&str, i64); 3] = [
 
 /// `_PyLong_AsMode_t` — take the `__index__` of the argument, refuse a
 /// negative, and refuse a value the platform's `mode_t` cannot hold.
-fn mode_t_w(value: PyObjectRef) -> Result<Mode, pyre_interpreter::PyError> {
-    let index = pyre_interpreter::baseobjspace::space_index(value)?;
-    let value = pyre_interpreter::baseobjspace::int_w(index)?;
+fn mode_t_w(value: PyObjectRef) -> Result<Mode, crate::PyError> {
+    let index = crate::baseobjspace::space_index(value)?;
+    let value = crate::baseobjspace::int_w(index)?;
     if value < 0 {
-        return Err(pyre_interpreter::PyError::overflow_error(
+        return Err(crate::PyError::overflow_error(
             "can't convert negative value to unsigned int",
         ));
     }
     let mode = value as Mode;
     if i64::from(mode) != value {
-        return Err(pyre_interpreter::PyError::overflow_error(
-            "mode out of range",
-        ));
+        return Err(crate::PyError::overflow_error("mode out of range"));
     }
     Ok(mode)
 }
 
-fn argument_mode(args: &[PyObjectRef], function: &str) -> Result<Mode, pyre_interpreter::PyError> {
+fn argument_mode(args: &[PyObjectRef], function: &str) -> Result<Mode, crate::PyError> {
     let mode = args.first().copied().ok_or_else(|| {
-        pyre_interpreter::PyError::type_error(format!(
-            "{function}() takes exactly one argument (0 given)"
-        ))
+        crate::PyError::type_error(format!("{function}() takes exactly one argument (0 given)"))
     })?;
     mode_t_w(mode)
 }
@@ -321,12 +317,12 @@ fn is_format(
     args: &[PyObjectRef],
     format: Mode,
     function: &str,
-) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+) -> Result<PyObjectRef, crate::PyError> {
     let mode = argument_mode(args, function)?;
     Ok(w_bool_from(format != 0 && mode & S_IFMT == format))
 }
 
-fn s_imode(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+fn s_imode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     /* From Python's stat.py */
     const S_IMODE: Mode = 0o7777;
     Ok(w_int_new(i64::from(
@@ -334,7 +330,7 @@ fn s_imode(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErro
     )))
 }
 
-fn s_ifmt(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+fn s_ifmt(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_int_new(i64::from(
         argument_mode(args, "S_IFMT")? & S_IFMT,
     )))
@@ -396,7 +392,7 @@ fn fileperm(mode: Mode, buf: &mut [u8; 9]) {
     buf[8] = special(S_ISVTX, S_IXOTH, b't', b'T');
 }
 
-fn filemode(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+fn filemode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mode = argument_mode(args, "filemode")?;
     let mut buf = [0u8; 10];
     buf[0] = filetype(mode);
@@ -407,7 +403,7 @@ fn filemode(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErr
     ))
 }
 
-pyre_interpreter::py_module! {
+crate::py_module! {
     "_stat",
     int_constants: {
         "S_IFDIR" => S_IFDIR,
@@ -481,23 +477,23 @@ pyre_interpreter::py_module! {
     },
     extra_init: |ns| {
         for (position, name) in ST_CONSTANTS.iter().enumerate() {
-            pyre_interpreter::module_ns_store(ns, name, w_int_new(position as i64));
+            crate::module_ns_store(ns, name, w_int_new(position as i64));
         }
         #[cfg(any(
             all(target_os = "macos", feature = "host_env"),
             all(target_vendor = "apple", not(feature = "host_env"))
         ))]
         {
-            pyre_interpreter::module_ns_store(ns, "SF_SUPPORTED", w_int_new(i64::from(SF_SUPPORTED)));
-            pyre_interpreter::module_ns_store(ns, "SF_SYNTHETIC", w_int_new(i64::from(SF_SYNTHETIC)));
+            crate::module_ns_store(ns, "SF_SUPPORTED", w_int_new(i64::from(SF_SUPPORTED)));
+            crate::module_ns_store(ns, "SF_SYNTHETIC", w_int_new(i64::from(SF_SYNTHETIC)));
         }
         #[cfg(all(windows, feature = "host_env"))]
         for (name, value) in FILE_ATTRIBUTES {
-            pyre_interpreter::module_ns_store(ns, name, w_int_new(value));
+            crate::module_ns_store(ns, name, w_int_new(value));
         }
         #[cfg(windows)]
         for (name, value) in IO_REPARSE_TAGS {
-            pyre_interpreter::module_ns_store(ns, name, w_int_new(value));
+            crate::module_ns_store(ns, name, w_int_new(value));
         }
     }
 }

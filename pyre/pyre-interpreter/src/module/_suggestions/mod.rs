@@ -8,33 +8,31 @@
 
 use pyre_object::*;
 
-fn generate_suggestions(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+fn generate_suggestions(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (Some(candidates), Some(item)) = (args.first().copied(), args.get(1).copied()) else {
-        return Err(pyre_interpreter::PyError::type_error(
+        return Err(crate::PyError::type_error(
             "_generate_suggestions expected 2 arguments",
         ));
     };
     // The `unicode` converter runs while the arguments are parsed, so a
     // non-`str` name is reported ahead of the list test in the body.
     if !unsafe { is_str(item) } {
-        return Err(pyre_interpreter::PyError::type_error(format!(
+        return Err(crate::PyError::type_error(format!(
             "_generate_suggestions() argument 2 must be str, not {}",
-            pyre_interpreter::error::type_name_of(item)
+            crate::error::type_name_of(item)
         )));
     }
     // `PyList_CheckExact`, so a list subclass is refused with everything else
     // that is not a list.
     if !unsafe { is_exact_type(candidates, &LIST_TYPE) } {
-        return Err(pyre_interpreter::PyError::type_error(
-            "candidates must be a list",
-        ));
+        return Err(crate::PyError::type_error("candidates must be a list"));
     }
     let items = unsafe {
         w_list_items_copy_as_vec_mode(candidates, majit_metainterp::jit::we_are_jitted())
     };
     for element in &items {
         if !unsafe { is_str(*element) } {
-            return Err(pyre_interpreter::PyError::type_error(
+            return Err(crate::PyError::type_error(
                 "all elements in 'candidates' must be strings",
             ));
         }
@@ -42,7 +40,7 @@ fn generate_suggestions(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interp
     // `_Py_CalculateSuggestions` gives up on a set this large before it reads
     // any name at all, so a candidate that has no UTF-8 encoding is never
     // reached and never reported here either.
-    if items.len() >= pyre_interpreter::error::MAX_SUGGESTION_CANDIDATES {
+    if items.len() >= crate::error::MAX_SUGGESTION_CANDIDATES {
         return Ok(w_none());
     }
     // `PyUnicode_AsUTF8AndSize` is what the search reads each name through,
@@ -50,20 +48,18 @@ fn generate_suggestions(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interp
     // strict encoder reports, not a name quietly left out of the ranking.
     // The wrong name is read first, which is the one order in which a
     // candidate equal to it cannot be the name that reports the failure.
-    let wrong_name = pyre_interpreter::baseobjspace::str_utf8_w(item)?.to_string();
+    let wrong_name = crate::baseobjspace::str_utf8_w(item)?.to_string();
     let mut names = Vec::with_capacity(items.len());
     for element in items {
-        names.push(pyre_interpreter::baseobjspace::str_utf8_w(element)?.to_string());
+        names.push(crate::baseobjspace::str_utf8_w(element)?.to_string());
     }
-    Ok(
-        match pyre_interpreter::error::best_suggestion(&names, &wrong_name) {
-            Some(name) => w_str_new_managed(&name),
-            None => w_none(),
-        },
-    )
+    Ok(match crate::error::best_suggestion(&names, &wrong_name) {
+        Some(name) => w_str_new_managed(&name),
+        None => w_none(),
+    })
 }
 
-pyre_interpreter::py_module! {
+crate::py_module! {
     "_suggestions",
     functions: {
         "_generate_suggestions" / 2 = generate_suggestions,
