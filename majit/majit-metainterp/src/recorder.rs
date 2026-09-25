@@ -192,18 +192,14 @@ pub struct SnapshotFrame {
     /// longer a second, Python-keyed coordinate here and no translation table
     /// between the two.
     pub pc: u32,
-    /// Forward-carried Python instruction PC for this JitCode position.
+    /// Trace-time Python instruction PC. Not a numbering word:
+    /// `ResumeDataLoopMemo.number` writes `jitcode_index` and `pc` only.
+    /// Guard resume recovers the Python pc with
+    /// `resume_py_pc_for_jitcode_word`.
     ///
-    /// Unlike the `i32`-typed twins this type carries no no-snapshot sentinel:
-    /// both fields here are `u32`, no writer stamps one, and "no snapshot" is
-    /// the absence of a frame rather than a value inside one. The `-1` sentinel
-    /// belongs to `resume::SnapshotFrame` and `resumedata::RebuiltFrame`, whose
-    /// signed fields can represent it.
-    ///
-    /// Upstream derives the Python-level position where it needs one; this
-    /// carries it, because the resume decoder that reads it back for
-    /// `f_lasti` and traceback reconstruction holds no jitcode metadata and
-    /// so has no jitcode→Python inverse available at that point.
+    /// Unlike `resume::SnapshotFrame` this field is `u32`: no writer stamps
+    /// the `-1` no-snapshot sentinel, and "no snapshot" is the absence of a
+    /// frame.
     pub py_pc: u32,
     /// Tagged references to the live boxes in this frame.
     pub boxes: Vec<SnapshotTagged>,
@@ -643,12 +639,6 @@ impl Trace {
         use smallvec::SmallVec;
 
         let offset = self.snapshot_offsets[resume_pos as usize];
-        let (py_start, py_len) = self
-            .py_pc_spans
-            .get(resume_pos as usize)
-            .copied()
-            .unwrap_or((0, 0));
-        let py_pcs = &self.py_pc_data[py_start as usize..py_start as usize + py_len as usize];
         let inputargs = self.inputargs.as_slice();
         let slots = self.slots.as_slice();
         let trb = self
@@ -665,17 +655,11 @@ impl Trace {
         // Copy the frame offsets out of `framestack` before calling back into
         // `it`: the iterator borrow and `iter_array` cannot overlap.
         let snaps: SmallVec<[usize; 16]> = it.framestack.iter().copied().collect();
-        let mut headers: SmallVec<[(i32, i32, i32, usize); 16]> = SmallVec::new();
-        for (fi, &snap) in snaps.iter().enumerate() {
+        let mut headers: SmallVec<[(i32, i32, usize); 16]> = SmallVec::new();
+        for &snap in snaps.iter() {
             let nboxes = it.iter_array(snap).len();
             let (jc, pc) = it.unpack_jitcode_pc(snap);
-            let py_pc = py_pcs.get(fi).copied().unwrap_or(pc as u32) as i32;
-            headers.push((
-                Self::decode_jitcode_index(jc) as i32,
-                pc as i32,
-                py_pc,
-                nboxes,
-            ));
+            headers.push((Self::decode_jitcode_index(jc) as i32, pc as i32, nboxes));
         }
 
         let mut vable = it.iter_vable_array();

@@ -2658,10 +2658,10 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
 /// Three callers genuinely hold nothing else (`bridge_subwalk.rs`
 /// `recipe.jitcode_pc`, `residual_call.rs` `op_pc`, `resume_snapshot.rs`
 /// `callee_jitcode_pc`). The two `RebuiltFrame` callers (`state.rs`
-/// `reconstruct_inline_recipe` and `setup_bridge_sym`) do hold one — the
-/// forward-carried `RebuiltFrame::py_pc`, but the JitCode-keyed containing
-/// depth twin preserves their frame width without routing the JitCode word
-/// through a Python-keyed map.
+/// `reconstruct_inline_recipe` and `setup_bridge_sym`) hold `jitcode_index`
+/// and `pc`; `resume_py_pc_for_jitcode_word` recovers the Python coordinate.
+/// This function uses the JitCode-keyed containing depth twin and does not
+/// route the JitCode word through a Python-keyed map.
 pub(crate) fn bridge_semantic_maps_from_jitcode_pc(
     jitcode_index: i32,
     jitcode_pc: i32,
@@ -14638,7 +14638,6 @@ mod tests {
             frames: vec![RebuiltFrame {
                 jitcode_index,
                 pc: 0,
-                py_pc: 0,
                 values: vec![
                     RebuiltValue::Const(majit_ir::Const::Ref(majit_ir::GcRef::NULL)),
                     RebuiltValue::Box(7, Type::Ref),

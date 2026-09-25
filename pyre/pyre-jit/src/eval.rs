@@ -13575,12 +13575,12 @@ fn build_resumed_frames(
 
     let mut result = Vec::with_capacity(frames.len());
     for (idx, (frame, values)) in frames.iter().zip(all_values.into_iter()).enumerate() {
-        // Forward-carried Python resume pc, recorded at guard capture from the
-        // codewriter `(jitcode_pc, py_pc)` marker pair (no jitcode→py inverse at
-        // decode).  py_pc=-1 is the no-snapshot sentinel (pc<0) → fall back to
-        // the vable next-instr.
-        let py_pc = if frame.py_pc >= 0 {
-            frame.py_pc as usize
+        // resume.py writes jitcode_index and pc. The Python resume pc is
+        // `resume_py_pc_for_jitcode_word` (the codewriter forward twin).
+        // pc<0 is the no-snapshot sentinel → fall back to the vable next-instr.
+        let py_pc = if frame.pc >= 0 {
+            pyre_jit_trace::py_coord::resume_py_pc_for_jitcode_word(frame.jitcode_index, frame.pc)
+                as usize
         } else {
             vable_ni
         };

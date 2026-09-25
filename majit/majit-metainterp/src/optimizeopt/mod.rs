@@ -505,7 +505,7 @@ impl<T: PartialEq> PartialEq for SnapshotRunTable<T> {
 impl<T: Eq> Eq for SnapshotRunTable<T> {}
 
 pub type SnapshotFrameSizes = SnapshotRunTable<usize>;
-pub type SnapshotFramePcs = SnapshotRunTable<(i32, i32, i32)>;
+pub type SnapshotFramePcs = SnapshotRunTable<(i32, i32)>;
 
 #[cfg(test)]
 mod snapshot_box_list_size {
@@ -1350,7 +1350,7 @@ pub struct OptContext {
     /// resume.py _number_boxes consumes vref_array as a section
     /// after vable_array. opencoder.py:767 records vref_boxes here.
     pub snapshot_vref_boxes: SnapshotBoxes,
-    /// Per-guard per-frame (jitcode_index, pc, py_pc) from tracing-time snapshots.
+    /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
     pub snapshot_frame_pcs: SnapshotFramePcs,
     /// Byte-mode bridge resume. See `Optimizer::byte_bridge_resume`.
     pub(crate) byte_bridge_resume: Option<crate::recorder::ByteBridgeResume>,

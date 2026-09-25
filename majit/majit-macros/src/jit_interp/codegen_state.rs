@@ -3170,7 +3170,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 // to innermost, each stamping its own absolute jitcode index —
                 // so a `#[jit_inline]` callee on the frame stack at guard time
                 // publishes a multi-frame stream.  Decoding that with the `None`
-                // fallback folds the next section's [jitcode_index, pc, py_pc]
+                // fallback folds the next section's [jitcode_index, pc]
                 // header and values into frame 0, so frame 0 stops matching its
                 // own liveness and the per-bank register -> sym-slot map in
                 // `setup_bridge_sym` is meaningless.

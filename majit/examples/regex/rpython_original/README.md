@@ -517,17 +517,13 @@ by the upstream symbol pyre should match. In order:
    already has `enumerate_vars`; the bridge walk does not use it.
 2. **`BH_PROBE_PHASE`.** Two thread-local resolves per `BlackholeInterpreter::run`,
    not gated on the probe flag; `blackhole.py` has no such phase label.
-3. **`py_pc`, a third numbering word per frame.** `ResumeDataLoopMemo.number`
-   appends `jitcode_index` and `pc` only; pyre's `number_sections` appends a
-   third item that `read_jitcode_pos_pc` and `rebuild_from_numbering` then
-   consume on every walk.
-4. **`ResumeStorage::virtual_infos`.** The `OnceLock` documented as "built on
+3. **`ResumeStorage::virtual_infos`.** The `OnceLock` documented as "built on
    the first resume and shared" has no callers; `virtual_info_from_rd` rebuilds
    a `VirtualInfo` per failure where `_prepare_virtuals` assigns
    `rd_virtuals` and never rebuilds. Empty on this row, so a Python-side item.
-5. **Identity-override compare per live ref** in `next_ref_for_resume_slot`;
+4. **Identity-override compare per live ref** in `next_ref_for_resume_slot`;
    `ResumeDataDirectReader.next_ref` decodes and writes.
-6. **The recorder owner.** During recording `attach_byte_buffer` writes the
+5. **The recorder owner.** During recording `attach_byte_buffer` writes the
    ported `opencoder::TraceRecordBuffer`, but `TraceCtx.recorder` is still
    `recorder::Trace`: a `FrontendSlot` per op, and `into_tree_loop` /
    `materialize_into_ops` rebuild a `Vec<OpRc>` of 240-byte `Op`s in front of

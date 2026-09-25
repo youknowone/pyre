@@ -1021,7 +1021,7 @@ fn snapshot_map_from_trace_snapshots(
     let mut vref_map = Vec::with_capacity(snapshot_count);
     // Not `pc_map`: that name belongs to the `-live-` marker table keyed by
     // Python pc (`pc_map[py_pc]`, `pyre-jit/src/jit/codewriter.rs`). This is
-    // keyed by snapshot id and holds one `(jitcode_index, pc, py_pc)` per frame.
+    // keyed by snapshot id and holds one `(jitcode_index, pc)` per frame.
     let mut frame_pcs_map = SnapshotFramePcs::with_capacity(snapshot_count, 0);
     frame_pcs_map.reserve_frames(total_frames);
     // opencoder.py _encode: trace snapshot recorder only emits Box
@@ -1053,7 +1053,7 @@ fn snapshot_map_from_trace_snapshots(
         frame_pcs_map.push_run(
             snap.frames
                 .iter()
-                .map(|f| (f.jitcode_index as i32, f.pc as i32, f.py_pc as i32)),
+                .map(|f| (f.jitcode_index as i32, f.pc as i32)),
         );
     }
     (box_map, size_map, vable_map, vref_map, frame_pcs_map)
@@ -1100,7 +1100,7 @@ fn snapshot_map_from_byte_recorder(
     let tagged_to_box = |t: crate::recorder::SnapshotTagged| -> SnapshotBox {
         snapshot_tagged_to_box(&t, inputargs)
     };
-    recorder.for_each_captured_snapshot_arrays(|it, py_pcs| {
+    recorder.for_each_captured_snapshot_arrays(|it, _py_pcs| {
         let n_boxes: usize = it
             .framestack
             .iter()
@@ -1114,12 +1114,11 @@ fn snapshot_map_from_byte_recorder(
                 .iter()
                 .map(|&snap_idx| it.iter_array(snap_idx).len()),
         );
-        frame_pcs_map.push_run(it.framestack.iter().enumerate().map(|(fi, &snap_idx)| {
+        frame_pcs_map.push_run(it.framestack.iter().map(|&snap_idx| {
             let (jc, pc) = it.unpack_jitcode_pc(snap_idx);
             (
                 crate::recorder::Trace::decode_jitcode_index(jc) as i32,
                 pc as i32,
-                py_pcs.get(fi).copied().unwrap_or(pc as u32) as i32,
             )
         }));
         for &snap_idx in it.framestack.iter() {

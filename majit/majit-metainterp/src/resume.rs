@@ -349,10 +349,12 @@ mod snapshot_box_size {
 pub struct SnapshotFrame {
     /// Index into the jitcode table (resume.py:250 jitcode_index).
     pub jitcode_index: i32,
-    /// JitCode byte offset (resume.py:250 pc).
+    /// JitCode byte offset (`resume.py` `ResumeDataLoopMemo.number`).
     pub pc: i32,
-    /// Forward-carried Python instruction PC. `-1` is the no-snapshot
-    /// sentinel, paired with `pc == -1`.
+    /// Python instruction coordinate captured with the snapshot. Not a
+    /// numbering word: `ResumeDataLoopMemo.number` writes `jitcode_index`
+    /// and `pc` only. Resume recovers the Python pc from those two via
+    /// `resume_py_pc_for_jitcode_word`.
     pub py_pc: i32,
     /// Live boxes for this frame's registers (resume.py:253).
     pub boxes: Vec<SnapshotBox>,
@@ -428,7 +430,7 @@ impl Snapshot {
 
     /// Estimated encoded size for NumberingState capacity hint.
     pub fn estimated_size(&self) -> usize {
-        let frame_size: usize = self.framestack.iter().map(|f| f.boxes.len() + 3).sum();
+        let frame_size: usize = self.framestack.iter().map(|f| f.boxes.len() + 2).sum();
         self.vable_array.len() + self.vref_array.len() + frame_size + 4
     }
 }
@@ -1013,7 +1015,6 @@ fn resume_frame_layout_to_frame_info(layout: &ResumeFrameLayoutSummary) -> Frame
     FrameInfo {
         jitcode_index: layout.jitcode_index,
         pc: layout.pc,
-        py_pc: -1,
         slot_map: layout
             .slot_layouts
             .iter()
@@ -2307,7 +2308,6 @@ impl EncodedResumeData {
         for frame in frames {
             rd_numb.push(frame.jitcode_index as i64);
             rd_numb.push(encode_u64(frame.pc));
-            rd_numb.push(encode_u64(frame.py_pc as u64));
             // resume.py _number_boxes(snapshot_iter, iter_array(snapshot), numb_state)
             for source in &frame.slot_map {
                 let tagged = memo.encode_tagged_source(source, &mut liveboxes, &mut box_map);
@@ -2384,17 +2384,15 @@ impl EncodedResumeData {
         for _ in 0..(vref_count * 2) {
             vref_array.push(self.decode_box(self.next_word(&mut cursor)));
         }
-        // resume.py:1049-1055: frame section.
-        // Per-frame: jitcode_index, pc, py_pc, [tagged_values...].
-        // RPython uses jitcode.get_live_vars_info(pc) for frame boundary;
-        // we use self.frame_sizes[] stored at encode time.
+        // resume.py number: per-frame jitcode_index, pc, [tagged_values...].
+        // jitcode.get_live_vars_info(pc) is the frame boundary;
+        // self.frame_sizes[] stored at encode time is that count.
         let items_resume_len = decode_len(items_resume_section);
         let mut frames = Vec::new();
         let mut frame_idx = 0usize;
         while cursor < items_resume_len {
             let jitcode_index = self.next_word(&mut cursor) as i32;
             let pc = decode_u64(self.next_word(&mut cursor));
-            let py_pc = self.next_word(&mut cursor) as i32;
             let slot_count = if frame_idx < self.frame_sizes.len() {
                 self.frame_sizes[frame_idx]
             } else {
@@ -2408,7 +2406,6 @@ impl EncodedResumeData {
             frames.push(FrameInfo {
                 jitcode_index,
                 pc,
-                py_pc,
                 slot_map,
             });
             frame_idx += 1;
@@ -2673,7 +2670,6 @@ impl ResumeDataExt for ResumeData {
             frames: vec![FrameInfo {
                 jitcode_index: 0,
                 pc,
-                py_pc: -1,
                 slot_map,
             }],
             virtuals: Vec::new(),
@@ -3216,7 +3212,6 @@ pub struct ResumeDataVirtualAdder {
 struct FrameInfoBuilder {
     jitcode_index: i32,
     pc: u64,
-    py_pc: i32,
     slot_map: Vec<FrameSlotSource>,
 }
 
@@ -3237,12 +3232,11 @@ impl ResumeDataVirtualAdder {
     }
 
     /// Push a new frame onto the stack.
-    /// resume.py:249-252: jitcode_index, pc, py_pc per frame.
-    pub fn push_frame(&mut self, jitcode_index: i32, pc: u64, py_pc: i32) {
+    /// resume.py `ResumeDataLoopMemo.number`: jitcode_index, pc per frame.
+    pub fn push_frame(&mut self, jitcode_index: i32, pc: u64) {
         self.frames.push(FrameInfoBuilder {
             jitcode_index,
             pc,
-            py_pc,
             slot_map: Vec::new(),
         });
     }
@@ -3423,7 +3417,6 @@ impl ResumeDataVirtualAdder {
                 .map(|f| FrameInfo {
                     jitcode_index: f.jitcode_index,
                     pc: f.pc,
-                    py_pc: f.py_pc,
                     slot_map: f.slot_map,
                 })
                 .collect(),
@@ -4333,7 +4326,7 @@ impl ResumeDataLoopMemo {
     /// `vable_len` / `vref_len` are the array lengths (`vref_len` is the
     /// pair count times two, matching `vref_array` before the `>> 1`
     /// stored in the resume bytes). `frames` is
-    /// `(jitcode_index, pc, py_pc, box_count)`. `next_vable`, `next_vref`,
+    /// `(jitcode_index, pc, box_count)`. `next_vable`, `next_vref`,
     /// and `next_frame_box` are pulled that many times, in that order —
     /// the same order `SnapshotIterator` yields.
     pub(crate) fn number_sections(
@@ -4342,17 +4335,14 @@ impl ResumeDataLoopMemo {
         mut next_vable: impl FnMut() -> SnapshotBox,
         vref_len: i64,
         mut next_vref: impl FnMut() -> SnapshotBox,
-        frames: &[(i32, i32, i32, usize)],
+        frames: &[(i32, i32, usize)],
         mut next_frame_box: impl FnMut() -> SnapshotBox,
         env: &dyn BoxEnv,
         minimum_virtualizable_size: i64,
     ) -> Result<NumberingState, TagOverflow> {
         let size_hint = (vable_len.max(0) as usize)
             + (vref_len.max(0) as usize)
-            + frames
-                .iter()
-                .map(|(_, _, _, boxes)| boxes + 3)
-                .sum::<usize>()
+            + frames.iter().map(|(_, _, boxes)| boxes + 2).sum::<usize>()
             + 4;
         let mut writer = majit_ir::resumecode::Writer {
             current: std::mem::take(&mut self.writer_scratch),
@@ -4395,11 +4385,10 @@ impl ResumeDataLoopMemo {
         }
 
         // resume.py number: frame chain.
-        // Per-frame: jitcode_index, pc, py_pc, [tagged_values...].
-        for &(jitcode_index, pc, py_pc, nboxes) in frames {
+        // Per-frame: jitcode_index, pc, [tagged_values...].
+        for &(jitcode_index, pc, nboxes) in frames {
             numb_state.append_int(jitcode_index as i64);
             numb_state.append_int(pc as i64);
-            numb_state.append_int(py_pc as i64);
             for _ in 0..nboxes {
                 self._number_one(next_frame_box(), &mut numb_state, env)?;
             }
@@ -4420,12 +4409,12 @@ impl ResumeDataLoopMemo {
     ///      [tagged boxes for vable_array]
     /// [n]  vref_array_length   (0 if no virtualrefs)
     ///      [tagged boxes for vref_array]
-    /// [m]  frame0_jitcode_index frame0_pc frame0_py_pc frame0_slots...
-    /// [m+] frame1_jitcode_index frame1_pc frame1_py_pc frame1_slots...
+    /// [m]  frame0_jitcode_index frame0_pc frame0_slots...
+    /// [m+] frame1_jitcode_index frame1_pc frame1_slots...
     /// ...
     /// ```
     ///
-    /// `frames` carries `(jitcode_index, pc, py_pc, fail_args_slice)` for each frame.
+    /// `frames` carries `(jitcode_index, pc, fail_args_slice)` for each frame.
     /// In pyre (single frame), this is typically one frame.
     /// resume.py number() — serialize a guard's full snapshot.
     ///
@@ -4449,13 +4438,13 @@ impl ResumeDataLoopMemo {
         &mut self,
         vable_array: &[SnapshotBox],
         vref_array: &[SnapshotBox],
-        frames: &[(i32, i32, i32, &[SnapshotBox])],
+        frames: &[(i32, i32, &[SnapshotBox])],
         env: &dyn BoxEnv,
         minimum_virtualizable_size: i64,
     ) -> Result<NumberingState, TagOverflow> {
-        let frame_meta: SmallVec<[(i32, i32, i32, usize); 16]> = frames
+        let frame_meta: SmallVec<[(i32, i32, usize); 16]> = frames
             .iter()
-            .map(|(jc, pc, py, boxes)| (*jc, *pc, *py, boxes.len()))
+            .map(|(jc, pc, boxes)| (*jc, *pc, boxes.len()))
             .collect();
         let mut vable_i = 0usize;
         let mut vref_i = 0usize;
@@ -4476,11 +4465,11 @@ impl ResumeDataLoopMemo {
             },
             &frame_meta,
             || {
-                while frames[frame_i].3.is_empty() || box_i == frames[frame_i].3.len() {
+                while frames[frame_i].2.is_empty() || box_i == frames[frame_i].2.len() {
                     frame_i += 1;
                     box_i = 0;
                 }
-                let snap_box = frames[frame_i].3[box_i];
+                let snap_box = frames[frame_i].2[box_i];
                 box_i += 1;
                 snap_box
             },
@@ -4495,17 +4484,10 @@ impl ResumeDataLoopMemo {
         env: &dyn BoxEnv,
         minimum_virtualizable_size: i64,
     ) -> Result<NumberingState, TagOverflow> {
-        let frames: SmallVec<[(i32, i32, i32, &[SnapshotBox]); 16]> = snapshot
+        let frames: SmallVec<[(i32, i32, &[SnapshotBox]); 16]> = snapshot
             .framestack
             .iter()
-            .map(|frame| {
-                (
-                    frame.jitcode_index,
-                    frame.pc,
-                    frame.py_pc,
-                    frame.boxes.as_slice(),
-                )
-            })
+            .map(|frame| (frame.jitcode_index, frame.pc, frame.boxes.as_slice()))
             .collect();
         self.number_slices(
             &snapshot.vable_array,
@@ -4528,13 +4510,13 @@ impl ResumeDataLoopMemo {
         &mut self,
         snapshot_boxes: &[SnapshotBox],
         frame_sizes: Option<&[usize]>,
-        frame_pcs: &[(i32, i32, i32)],
+        frame_pcs: &[(i32, i32)],
         vable_array: &[SnapshotBox],
         vref_array: &[SnapshotBox],
         env: &dyn BoxEnv,
         minimum_virtualizable_size: i64,
     ) -> Result<NumberingState, TagOverflow> {
-        let mut frames: SmallVec<[(i32, i32, i32, &[SnapshotBox]); 16]> = SmallVec::new();
+        let mut frames: SmallVec<[(i32, i32, &[SnapshotBox]); 16]> = SmallVec::new();
         // An explicitly empty framestack is the terminal force snapshot
         // (opencoder.py create_empty_top_snapshot), not an absent layout.
         // A one-frame sizes vector is the default single-frame case
@@ -4545,13 +4527,13 @@ impl ResumeDataLoopMemo {
             let mut offset = 0;
             for (i, &size) in sizes.iter().enumerate() {
                 let end = (offset + size).min(snapshot_boxes.len());
-                let (jitcode_index, pc, py_pc) = frame_pcs.get(i).copied().unwrap_or((0, 0, 0));
-                frames.push((jitcode_index, pc, py_pc, &snapshot_boxes[offset..end]));
+                let (jitcode_index, pc) = frame_pcs.get(i).copied().unwrap_or((0, 0));
+                frames.push((jitcode_index, pc, &snapshot_boxes[offset..end]));
                 offset = end;
             }
         } else {
-            let (jitcode_index, pc, py_pc) = frame_pcs.first().copied().unwrap_or((0, 0, 0));
-            frames.push((jitcode_index, pc, py_pc, snapshot_boxes));
+            let (jitcode_index, pc) = frame_pcs.first().copied().unwrap_or((0, 0));
+            frames.push((jitcode_index, pc, snapshot_boxes));
         }
         self.number_slices(
             vable_array,
@@ -4849,12 +4831,11 @@ impl ResumeDataLoopMemo {
             rd_numb.push(tagged);
         }
 
-        // resume.py:249-253: per-frame: jitcode_index, pc, py_pc, [tagged_values...].
+        // resume.py number: per-frame jitcode_index, pc, [tagged_values...].
         let mut frame_sizes = Vec::with_capacity(rd.frames.len());
         for frame in &rd.frames {
             rd_numb.push(frame.jitcode_index as i64);
             rd_numb.push(encode_u64(frame.pc));
-            rd_numb.push(encode_u64(frame.py_pc as u64));
             for source in &frame.slot_map {
                 let tagged = self.encode_tagged_source(source, &mut liveboxes, &mut box_map);
                 rd_numb.push(tagged);
@@ -5273,7 +5254,6 @@ mod tests {
             frames: vec![FrameInfo {
                 jitcode_index: 0,
                 pc: 100,
-                py_pc: -1,
                 slot_map: vec![
                     FrameSlotSource::FailArg(2),
                     FrameSlotSource::Unavailable,
@@ -5305,13 +5285,11 @@ mod tests {
                 FrameInfo {
                     jitcode_index: 0,
                     pc: 10,
-                    py_pc: -1,
                     slot_map: vec![FrameSlotSource::FailArg(0), FrameSlotSource::FailArg(1)],
                 },
                 FrameInfo {
                     jitcode_index: 1,
                     pc: 20,
-                    py_pc: -1,
                     slot_map: vec![FrameSlotSource::FailArg(2), FrameSlotSource::FailArg(3)],
                 },
             ],
@@ -5338,7 +5316,7 @@ mod tests {
     #[test]
     fn test_builder() {
         let mut builder = ResumeDataVirtualAdder::new();
-        builder.push_frame(0, 42, -1);
+        builder.push_frame(0, 42);
         builder.map_slot(0, 0);
         builder.map_slot(2, 1); // gap at slot 1
         let rd = builder.build();
@@ -5366,7 +5344,7 @@ mod tests {
             vec![OpRef::const_int(42), OpRef::int_op(1), OpRef::int_op(2)],
         );
         let numb_state = memo.number(&snapshot, &env, -1).unwrap();
-        // Should have: [size, num_failargs, 0(vable), 0(vref), 0(jitcode), 8(pc), 8(py_pc), tagged...]
+        // Should have: [size, num_failargs, 0(vable), 0(vref), 0(jitcode), 8(pc), tagged...]
         let items = crate::resumecode::unpack_numbering(&numb_state.create_numbering());
         // items[0] = total size
         assert!(items[0] > 0);
@@ -5381,18 +5359,16 @@ mod tests {
         assert_eq!(items[4], 0);
         // items[5] = pc = 8
         assert_eq!(items[5], 8);
-        // items[6] = py_pc = 8 (forward-carried Python pc; single_frame sets py_pc = pc)
-        assert_eq!(items[6], 8);
-        // items[7] = inline-Const(42) tagged as TAGINT(42) since 42 fits in 13 bits
-        let (val, tagbits) = untag(items[7] as i16);
+        // items[6] = inline-Const(42) tagged as TAGINT(42) since 42 fits in 13 bits
+        let (val, tagbits) = untag(items[6] as i16);
         assert_eq!(tagbits, TAGINT);
         assert_eq!(val, 42);
-        // items[8] = OpRef::int_op(1) tagged as TAGBOX(0) — first live box
-        let (val, tagbits) = untag(items[8] as i16);
+        // items[7] = OpRef::int_op(1) tagged as TAGBOX(0) — first live box
+        let (val, tagbits) = untag(items[7] as i16);
         assert_eq!(tagbits, TAGBOX);
         assert_eq!(val, 0);
-        // items[9] = OpRef::int_op(2) tagged as TAGBOX(1) — second live box
-        let (val, tagbits) = untag(items[9] as i16);
+        // items[8] = OpRef::int_op(2) tagged as TAGBOX(1) — second live box
+        let (val, tagbits) = untag(items[8] as i16);
         assert_eq!(tagbits, TAGBOX);
         assert_eq!(val, 1);
     }
@@ -5448,7 +5424,7 @@ mod tests {
         let boxes = snapshot.framestack[0].boxes.clone();
         let short_size = Some(&[1usize][..]);
         let actual = ResumeDataLoopMemo::new()
-            .number_from_parts(&boxes, short_size, &[(3, 4, 5)], &[], &[], &env, -1)
+            .number_from_parts(&boxes, short_size, &[(3, 4)], &[], &[], &env, -1)
             .unwrap()
             .create_numbering();
         assert_eq!(
@@ -5543,18 +5519,16 @@ mod tests {
         let items = crate::resumecode::unpack_numbering(&numb_state.create_numbering());
         // items[1] = num_failargs: 0 (not patched — RPython patches in finish())
         assert_eq!(items[1], 0);
-        // items[6] = py_pc = 10 (single_frame sets py_pc = pc)
-        assert_eq!(items[6], 10);
-        // items[7] = OpRef::int_op(1) → TAGBOX(0)
-        let (val, tagbits) = untag(items[7] as i16);
+        // items[6] = OpRef::int_op(1) → TAGBOX(0)
+        let (val, tagbits) = untag(items[6] as i16);
         assert_eq!(tagbits, TAGBOX);
         assert_eq!(val, 0);
-        // items[8] = OpRef::ref_op(2) → TAGVIRTUAL(0)
-        let (val, tagbits) = untag(items[8] as i16);
+        // items[7] = OpRef::ref_op(2) → TAGVIRTUAL(0)
+        let (val, tagbits) = untag(items[7] as i16);
         assert_eq!(tagbits, TAGVIRTUAL);
         assert_eq!(val, 0);
-        // items[9] = OpRef::int_op(3) → TAGBOX(1)
-        let (val, tagbits) = untag(items[9] as i16);
+        // items[8] = OpRef::int_op(3) → TAGBOX(1)
+        let (val, tagbits) = untag(items[8] as i16);
         assert_eq!(tagbits, TAGBOX);
         assert_eq!(val, 1);
     }
@@ -5670,10 +5644,8 @@ mod tests {
         let numb_state = memo.number(&snapshot, &env, -1).unwrap();
         let items = crate::resumecode::unpack_numbering(&numb_state.create_numbering());
 
-        // items[6] = py_pc = 10 (single_frame sets py_pc = pc)
-        assert_eq!(items[6], 10);
-        // items[7] = the frame's box.
-        let (val, tagbits) = untag(items[7] as i16);
+        // items[6] = the frame's box.
+        let (val, tagbits) = untag(items[6] as i16);
         assert_eq!(tagbits, TAGVIRTUAL);
         assert_eq!(val, 0);
         assert_eq!(numb_state.num_boxes, 0);
@@ -5712,16 +5684,12 @@ mod tests {
         // Multi-frame encoding: no box_count, RPython parity.
         let items = crate::resumecode::unpack_numbering(&rd_numb);
         assert_eq!(items[1], 3); // num_failargs: 3 boxes patched
-        // Frame 0: items[4]=jitcode(0), items[5]=pc(10), items[6]=py_pc(10),
-        // items[7..8]=tagged.
+        // Frame 0: items[4]=jitcode(0), items[5]=pc(10), items[6..7]=tagged.
         assert_eq!(items[4], 0);
         assert_eq!(items[5], 10);
-        assert_eq!(items[6], 10);
-        // Frame 1: items[9]=jitcode(1), items[10]=pc(20), items[11]=py_pc(20),
-        // items[12..13]=tagged.
-        assert_eq!(items[9], 1);
-        assert_eq!(items[10], 20);
-        assert_eq!(items[11], 20);
+        // Frame 1: items[8]=jitcode(1), items[9]=pc(20).
+        assert_eq!(items[8], 1);
+        assert_eq!(items[9], 20);
 
         // Roundtrip with liveness-based closure.
         let rd_consts: Vec<majit_ir::Const> = memo.consts().to_vec();
@@ -5743,11 +5711,9 @@ mod tests {
         assert_eq!(rebuilt_frames.len(), 2);
         assert_eq!(rebuilt_frames[0].jitcode_index, 0);
         assert_eq!(rebuilt_frames[0].pc, 10);
-        assert_eq!(rebuilt_frames[0].py_pc, 10);
         assert_eq!(rebuilt_frames[0].values.len(), 2);
         assert_eq!(rebuilt_frames[1].jitcode_index, 1);
         assert_eq!(rebuilt_frames[1].pc, 20);
-        assert_eq!(rebuilt_frames[1].py_pc, 20);
         assert_eq!(rebuilt_frames[1].values.len(), 2);
     }
 
@@ -5973,12 +5939,11 @@ mod tests {
         assert_eq!(items[5], 0); // vref_array_length
         assert_eq!(items[6], 0); // jitcode_index
         assert_eq!(items[7], 8); // pc
-        assert_eq!(items[8], 8); // py_pc (single_frame sets py_pc = pc)
 
         // The frame slot reuses the payload tag because numbering follows
         // Box identity exactly: upstream dedups only when the same Box object
         // appears twice, and in this test we passed the same OpRef twice.
-        let (val, tagbits) = untag(items[9] as i16);
+        let (val, tagbits) = untag(items[8] as i16);
         assert_eq!(tagbits, TAGBOX);
         assert_eq!(val, 0);
     }
@@ -5996,7 +5961,6 @@ mod tests {
         writer.append_int(0); // vref_array length
         writer.append_int(0); // jitcode_pos
         writer.append_int(0); // pc
-        writer.append_int(0); // py_pc
         writer.patch_current_size(0);
         let rd_numb = writer.create_numbering();
 
@@ -6104,7 +6068,6 @@ mod tests {
         writer.append_int(0); // vref_array length
         writer.append_int(0); // jitcode_pos
         writer.append_int(0); // pc
-        writer.append_int(0); // py_pc
         writer.patch_current_size(0);
         let rd_numb = writer.create_numbering();
 
@@ -6249,7 +6212,6 @@ mod tests {
         writer.append_int(0); // vref_array length
         writer.append_int(0); // jitcode_pos
         writer.append_int(0); // pc
-        writer.append_int(0); // py_pc
         writer.append_int(NULLREF as i64); // frame ref register r0: null
         writer.patch_current_size(0);
         let rd_numb = writer.create_numbering();
@@ -7838,12 +7800,10 @@ impl<'a> ResumeDataDirectReader<'a> {
 
     // ---- AbstractResumeDataReader methods (resume.py) ----
 
-    /// resume.py read_jitcode_pos_pc. The wire header also carries
-    /// forward `py_pc`, which blackhole does not use but must consume.
+    /// resume.py `read_jitcode_pos_pc`.
     pub fn read_jitcode_pos_pc(&mut self) -> (i32, i32) {
         let jitcode_pos = self.resumecodereader.next_item();
         let pc = self.resumecodereader.next_item();
-        let _py_pc = self.resumecodereader.next_item();
         (jitcode_pos, pc)
     }
 
