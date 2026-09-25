@@ -1541,9 +1541,12 @@ unsafe fn classify_attr(
         None => (DICT, false),
         Some(d) => {
             // mapdict.py:1511-1512 — a MutableCell can change without bumping the
-            // version_tag, so give up. pyre type dicts store values directly, not
-            // wrapped in cells (`celldict.rs` — the cell port has not landed),
-            // so this never fires today; kept for structural parity.
+            // version_tag, so give up.  Reaching this arm is why every caller
+            // reads the namespace entry through `type_attr_stored` rather than
+            // `lookup_in_type_where`: upstream's
+            // `_pure_lookup_where_with_method_cache` does not unwrap, and an
+            // unwrapped snapshot cached under an unmoved tag is exactly the
+            // staleness this rejects.
             if unsafe { pyre_object::celldict::is_mutable_cell(d) } {
                 return (INVALID, false);
             }
@@ -1666,8 +1669,12 @@ unsafe fn load_attr_slowpath(
         let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(w_type) };
         // mapdict.py:1501 `if version_tag is not None:` (0 = None).
         if version_tag != 0 {
-            // mapdict.py:1504-1505 `_, w_descr = _pure_lookup_where_with_method_cache`.
-            let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) };
+            // mapdict.py:1504-1505 `_, w_descr = _pure_lookup_where_with_method_cache`
+            // -- the raw entry, not `lookup`: the comment above that line names
+            // the reason ("obscure cases in which the w_descr is a MutableCell,
+            // which may change without changing the version_tag"), and
+            // `classify_attr` gives up on one.
+            let w_descr = unsafe { crate::baseobjspace::type_attr_stored(w_type, Wtf8::new(name)) };
             // mapdict.py:1507-1524 classify.
             let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, false) };
             // mapdict.py `if attrkind != INVALID:`.
@@ -3018,8 +3025,9 @@ unsafe fn store_attr_slowpath(
         }
         // mapdict.py:1616 `if version_tag is not None:` (0 = None).
         if version_tag != 0 {
-            // mapdict.py:1618-1619 `_, w_descr = _pure_lookup_where_with_method_cache`.
-            let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) };
+            // mapdict.py:1618-1619 `_, w_descr = _pure_lookup_where_with_method_cache`
+            // -- the raw entry, so `classify_attr` can give up on a MutableCell.
+            let w_descr = unsafe { crate::baseobjspace::type_attr_stored(w_type, Wtf8::new(name)) };
             // mapdict.py:1620-1626 classify (no non-data heaptype branch for STORE).
             let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, true) };
             // mapdict.py `if attrkind != INVALID:`.
@@ -4695,7 +4703,9 @@ pub unsafe fn classify_mapdict_write_attr(w_obj: PyObjectRef, name: &str) -> Opt
     if w_type.is_null() {
         return None;
     }
-    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) };
+    // The raw entry, as `STORE_ATTR_slowpath` reads it, so `classify_attr`
+    // gives up on a MutableCell instead of classifying what it holds.
+    let w_descr = unsafe { crate::baseobjspace::type_attr_stored(w_type, Wtf8::new(name)) };
     Some(unsafe { classify_attr(w_type, w_descr, true) })
 }
 
