@@ -608,6 +608,20 @@ pub fn push_roots() -> RootScope {
     RootScope::new()
 }
 
+/// One-word residual ABI for [`push_roots`].
+///
+/// `RootScope` is the `save_point` word (`gct_fv_gc_malloc.push_roots`).
+/// The residual dispatcher reads one result register, and dropping the guard
+/// here would run `pop_roots` before the bracketed allocation. The word stays
+/// live until `root_scope_close`.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn push_roots_jit_abi() -> i64 {
+    let scope = push_roots();
+    let save_point = scope.base() as i64;
+    std::mem::forget(scope);
+    save_point
+}
+
 /// A set of freshly allocated items held as GC roots while the rest of the
 /// set is still being built.
 ///
@@ -814,6 +828,28 @@ pub fn publish_roots(roots: &[PyObjectRef]) -> usize {
         }
         base
     })
+}
+
+/// One-word residual ABI for [`publish_roots`].
+///
+/// `&[PyObjectRef]` is `Ptr(GcArray(Ptr(PyObject)))`: one word, length at
+/// offset 0 (`bh_newtuple_from_array`). The executor passes that word, not a
+/// fat `(ptr, len)` pair.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn publish_roots_jit_abi(array: i64) -> i64 {
+    let items = gcarray_ref_items(array);
+    publish_roots(&items) as i64
+}
+
+/// Copy the items of a length-prefixed ref `GcTypedArray` word.
+pub fn gcarray_ref_items(array: i64) -> Vec<PyObjectRef> {
+    let arr = array as *const crate::object_array::GcTypedArray;
+    let len = crate::object_array::gcarray_len(arr);
+    let mut items = Vec::with_capacity(len);
+    for index in 0..len {
+        items.push(crate::object_array::getarrayitem_ref(arr, index));
+    }
+    items
 }
 
 /// Resolve forwarding across the `len` published slots starting at `base` —
