@@ -4,6 +4,15 @@
 # entries valid, when a cell absorbs the store, so its third access still takes
 # `object`'s hook
 #
+# CPython-suite gap: no suite test rebinds `__getattribute__` or `__setattr__`
+# twice on one class, and the second rebind is the one that matters -- it is the
+# store an installed cell absorbs.
+#
+# parity-tests reason: that store moves no `_version_tag`, so the accessor memo
+# and the `LOAD_ATTR` / `STORE_ATTR` cache entry keep answering for the hook
+# they were filled with.  The attribute itself reads back correctly, so it
+# surfaces as a wrong answer rather than as a missed optimisation.
+#
 # `typeobject.py W_TypeObject.setdictvalue` offers every store to `write_cell`.
 # The store that replaces the class-body value installs a `MutableCell`; every
 # store after that writes inside the installed cell, `write_cell` returns `None`
