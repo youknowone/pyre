@@ -1969,7 +1969,7 @@ pub fn install_jit_call_bridge() {
         });
         publish_pyre_host_hooks();
         majit_metainterp::register_allow_small_ref_residual(
-            pyre_interpreter::is_frame_anchor_word_residual,
+            pyre_interpreter::is_one_word_guard_residual,
         );
         majit_metainterp::register_bh_portal_frame(|| {
             pyre_interpreter::eval::current_frame() as i64

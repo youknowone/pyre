@@ -967,6 +967,42 @@ pub fn is_frame_anchor_word_residual(addr: usize) -> bool {
     addrs.contains(&(addr as i64))
 }
 
+/// True when `addr` is a `RootScope` bracket op whose `Ref` argument is the
+/// guard's one-word `save_point`, not a heap pointer — the same aliasing
+/// [`is_frame_anchor_word_residual`] describes for `FrameAnchor`.  A save
+/// point is a shadow-stack depth, so it is as small as a walk-local index.
+pub fn is_root_scope_word_residual(addr: usize) -> bool {
+    use std::sync::OnceLock;
+    static ADDRS: OnceLock<Vec<i64>> = OnceLock::new();
+    let addrs = ADDRS.get_or_init(|| {
+        jit_trace_fnaddrs()
+            .into_iter()
+            .filter(|(path, _)| {
+                path.ends_with("::RootScope::pin_root")
+                    || path.ends_with("::RootScope::get")
+                    || path.ends_with("::RootScope::base")
+                    || path.ends_with("::RootScope::set")
+                    || path.ends_with("::RootScope::normalize")
+                    || path.ends_with("::RootScope::normalize_moved")
+                    || path.ends_with("::RootScope::publish")
+                    || path.ends_with("::RootScope::pin_roots")
+                    || path.ends_with("::RootScope::drop_in_place")
+                    || path.ends_with("::gc_roots::root_scope_close")
+                    || *path == "pyre_object::root_scope_close"
+            })
+            .map(|(_, fnaddr)| fnaddr)
+            .collect()
+    });
+    addrs.contains(&(addr as i64))
+}
+
+/// A residual whose `Ref` argument is a one-word guard rather than a heap
+/// pointer: [`is_frame_anchor_word_residual`] or
+/// [`is_root_scope_word_residual`].
+pub fn is_one_word_guard_residual(addr: usize) -> bool {
+    is_frame_anchor_word_residual(addr) || is_root_scope_word_residual(addr)
+}
+
 pub fn is_pyframe_operand_stack_accessor(addr: usize) -> bool {
     use std::sync::OnceLock;
     static ACCESSOR_ADDRS: OnceLock<Vec<i64>> = OnceLock::new();
@@ -1695,12 +1731,21 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // The bracket's close, which a lowered `Drop` of the guard calls with the
     // guard itself: one word in, nothing out, and the truncate above behind
     // it.  A crate that carries no declaration of the guard's fields cannot
-    // spell the close as those two reads, so it names this instead.
-    pa1(
+    // spell the close as those two reads, so it names this instead.  The
+    // jitcode passes the guard's value, not its address (`front::mir` aliases
+    // `&guard` to the guard's own Variable), so the close is bound to the
+    // word bridge, as is every other `RootScope` residual below.
+    cpa1(
         &mut entries,
         "pyre_object::gc_roots::root_scope_close",
         "pyre_object::root_scope_close",
-        pyre_object::gc_roots::root_scope_close,
+        pyre_object::gc_roots::root_scope_close_jit_abi,
+    );
+    cpa0(
+        &mut entries,
+        "pyre_object::gc_roots::push_roots",
+        "pyre_object::push_roots",
+        pyre_object::gc_roots::push_roots_jit_abi,
     );
     cpa2(
         &mut entries,
@@ -1808,23 +1853,41 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // `roots.get(slot)`: the same pin through the cached cell, and its
     // read-back half.  The codewriter names an inherent method by its
     // crate-stripped path, so that spelling is the alias.
-    let scope_pin_root: fn(
-        &pyre_object::gc_roots::RootScope,
-        pyre_object::PyObjectRef,
-    ) -> pyre_object::PyObjectRef = pyre_object::gc_roots::RootScope::pin_root;
-    pa2(
+    cpa2(
         &mut entries,
         "pyre_object::gc_roots::RootScope::pin_root",
         "gc_roots::RootScope::pin_root",
-        scope_pin_root,
+        pyre_object::gc_roots::root_scope_pin_root_jit_abi,
     );
-    let scope_get: fn(&pyre_object::gc_roots::RootScope, usize) -> pyre_object::PyObjectRef =
-        pyre_object::gc_roots::RootScope::get;
-    pa2(
+    cpa2(
         &mut entries,
         "pyre_object::gc_roots::RootScope::get",
         "gc_roots::RootScope::get",
-        scope_get,
+        pyre_object::gc_roots::root_scope_get_jit_abi,
+    );
+    cpa1(
+        &mut entries,
+        "pyre_object::gc_roots::RootScope::base",
+        "gc_roots::RootScope::base",
+        pyre_object::gc_roots::root_scope_base_jit_abi,
+    );
+    cpa3(
+        &mut entries,
+        "pyre_object::gc_roots::RootScope::set",
+        "gc_roots::RootScope::set",
+        pyre_object::gc_roots::root_scope_set_jit_abi,
+    );
+    cpa3(
+        &mut entries,
+        "pyre_object::gc_roots::RootScope::normalize",
+        "gc_roots::RootScope::normalize",
+        pyre_object::gc_roots::root_scope_normalize_jit_abi,
+    );
+    cpa3(
+        &mut entries,
+        "pyre_object::gc_roots::RootScope::normalize_moved",
+        "gc_roots::RootScope::normalize_moved",
+        pyre_object::gc_roots::root_scope_normalize_moved_jit_abi,
     );
     pa2(
         &mut entries,
@@ -1832,13 +1895,37 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "gc_roots::publish_one_at",
         pyre_object::gc_roots::publish_one_at,
     );
-    let root_scope_drop_in_place: unsafe fn(*mut pyre_object::gc_roots::RootScope) =
-        pyre_object::gc_roots::root_scope_drop_in_place;
-    upa1(
+    cpa1(
         &mut entries,
         "gc_roots::RootScope::drop_in_place",
         "pyre_object::gc_roots::RootScope::drop_in_place",
-        root_scope_drop_in_place,
+        pyre_object::gc_roots::root_scope_drop_in_place_jit_abi,
+    );
+    // The slice-taking half of the bracket: the jitcode passes the
+    // `&[PyObjectRef]` as the `object_ref_gcarray` its aggregate built.
+    cpa1(
+        &mut entries,
+        "pyre_object::gc_roots::publish_roots",
+        "pyre_object::publish_roots",
+        pyre_object::gc_roots::publish_roots_jit_abi,
+    );
+    cpa1(
+        &mut entries,
+        "pyre_object::gc_roots::pin_roots",
+        "pyre_object::pin_roots",
+        pyre_object::gc_roots::pin_roots_jit_abi,
+    );
+    cpa2(
+        &mut entries,
+        "pyre_object::gc_roots::RootScope::publish",
+        "gc_roots::RootScope::publish",
+        pyre_object::gc_roots::root_scope_publish_jit_abi,
+    );
+    cpa2(
+        &mut entries,
+        "pyre_object::gc_roots::RootScope::pin_roots",
+        "gc_roots::RootScope::pin_roots",
+        pyre_object::gc_roots::root_scope_pin_roots_jit_abi,
     );
     let w_dict_setitem_str_hashed_w: unsafe fn(
         pyre_object::PyObjectRef,
@@ -6607,12 +6694,45 @@ mod tests {
             bindings["pyre_object::dictmultiobject::w_dict_setitem_str_hashed_w"],
             expected,
         );
-        let drop_expected =
-            pyre_object::gc_roots::root_scope_drop_in_place as *const () as usize as i64;
+        let drop_expected = pyre_object::gc_roots::root_scope_drop_in_place_jit_abi as *const ()
+            as usize as i64;
         assert_eq!(
             bindings["gc_roots::RootScope::drop_in_place"],
             drop_expected,
         );
+        // Every `RootScope` residual takes the guard as its one word.
+        let word_bridges: [(&str, *const ()); 5] = [
+            (
+                "pyre_object::gc_roots::push_roots",
+                pyre_object::gc_roots::push_roots_jit_abi as *const (),
+            ),
+            (
+                "pyre_object::gc_roots::root_scope_close",
+                pyre_object::gc_roots::root_scope_close_jit_abi as *const (),
+            ),
+            (
+                "gc_roots::RootScope::pin_root",
+                pyre_object::gc_roots::root_scope_pin_root_jit_abi as *const (),
+            ),
+            (
+                "gc_roots::RootScope::get",
+                pyre_object::gc_roots::root_scope_get_jit_abi as *const (),
+            ),
+            (
+                "gc_roots::RootScope::base",
+                pyre_object::gc_roots::root_scope_base_jit_abi as *const (),
+            ),
+        ];
+        for (path, bridge) in word_bridges {
+            assert_eq!(bindings[path], bridge as usize as i64, "{path}");
+            // The guard word is a small integer in a Ref register; the walk
+            // must still run the bridges that take it.
+            assert_eq!(
+                super::is_one_word_guard_residual(bridge as usize),
+                !path.ends_with("::push_roots"),
+                "{path}"
+            );
+        }
     }
 
     #[test]
