@@ -616,9 +616,9 @@ pub struct JitFrameDeadFrame {
     /// Original attached `jf_descr` identity for finish exits emitted by
     /// the metainterp (`DoneWithThisFrame*` / `ExitFrameWithExceptionDescrRef`).
     pub latest_descr: Option<DescrRef>,
-    /// Side-channel: caller-prefix layout assembled from the
-    /// `CALL_ASSEMBLER_CALLER_STACK` top at deadframe interception
-    /// (`wrap_call_assembler_deadframe_with_caller_prefix`).  When `Some`,
+    /// Side-channel: caller-prefix layout passed into
+    /// `wrap_call_assembler_deadframe_with_caller_prefix` at deadframe
+    /// interception.  When `Some`,
     /// the exit's recovery layout is prefixed by this value.  Replaces the old
     /// overlay descr synthesis — the deadframe's `fail_descr` keeps the
     /// callee's own Arc identity rather than being swapped for a synthetic one.

@@ -69,8 +69,6 @@ thread_local! {
         const { std::cell::Cell::new(0) };
     static CA_WALK_RESUME_FRAME: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
-    static CA_WALK_RESUME_DEADFRAME: std::cell::RefCell<Option<Vec<i64>>> =
-        const { std::cell::RefCell::new(None) };
     static SELF_RECURSIVE_DISPATCH_CACHE: UnsafeCell<Option<(u64, Option<u64>)>> =
         const { UnsafeCell::new(None) };
 }
@@ -1119,9 +1117,6 @@ pub(crate) extern "C" fn record_discarded_level_traceback(
 
 #[majit_macros::jit_may_force]
 pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
-    #[cfg(feature = "cranelift")]
-    let _ = majit_backend_cranelift::take_pending_frame_restore();
-
     // `assembler_call_helper` (warmspot.py) resumes the callee
     // frame the rewritten CALL_ASSEMBLER passed as arg 0.
     run_frame_through_portal(frame_ptr, PortalEntry::Resume)
@@ -2140,7 +2135,6 @@ fn jit_blackhole_resume_from_guard(
     let ca_adopted_frame = CA_WALK_ADOPTED_FRAME.with(|c| c.replace(0));
     let ca_finished_frame = CA_WALK_FINISHED_FRAME.with(|c| c.replace(0));
     let ca_resume_frame = CA_WALK_RESUME_FRAME.with(|c| c.replace(0));
-    let ca_resume_deadframe = CA_WALK_RESUME_DEADFRAME.with(|c| c.borrow_mut().take());
 
     // rstack.stack_check_slowpath → _StackOverflow parity: drain the
     // pending JIT-prologue overflow exception when the backend probe
@@ -2187,11 +2181,9 @@ fn jit_blackhole_resume_from_guard(
     let trace_id = descr_fd.trace_id();
     let fail_index = descr_fd.fail_index_per_trace();
     let n_fail_args = descr_fd.fail_arg_types().len();
-    let fail_args = if let Some(values) = ca_resume_deadframe.as_deref() {
-        majit_backend::FailArgSource::Slice(values)
-    } else {
-        majit_backend::FailArgSource::from_jitframe(deadframe, descr_fd, n_fail_args)
-    };
+    // `resume_in_blackhole` reads fail args off the deadframe
+    // (`cpu.grab_exc_value` / `get_latest_descr` path in `llmodel.py`).
+    let fail_args = majit_backend::FailArgSource::from_jitframe(deadframe, descr_fd, n_fail_args);
     let fail0 = if ca_resume_frame != 0 {
         ca_resume_frame as i64
     } else if fail_args.len() > 0 {

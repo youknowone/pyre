@@ -4658,7 +4658,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         let _caller_last_instr = ctx.fbw_mode.inline_caller_py_pc.map(|py_pc| {
             LiveLastInstrGuard::enter_frame(live_frame as *mut pyre_interpreter::PyFrame, py_pc)
         });
-        let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter();
+        let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter(ctx.trace_ctx);
         majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args)
     };
     // A Ref result is a nursery object. The next residual in this walk

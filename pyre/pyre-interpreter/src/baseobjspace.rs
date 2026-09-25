@@ -15431,6 +15431,47 @@ pub fn call_valuestack(
     call_function(callable, &args)
 }
 
+/// Root the GC children of a `malloc_typed` exception the collector does not
+/// trace. A managed exception is reached through its own pinned slot.
+/// Returns the shadow-stack base and the offset table written back after the
+/// hook. No heap allocation: publishing after a `Vec` would collect before
+/// the children were visible.
+fn pin_unmanaged_exception_children(exc: PyObjectRef) -> Option<(usize, &'static [usize])> {
+    if exc.is_null() || unsafe { !pyre_object::interp_exceptions::is_exception(exc) } {
+        return None;
+    }
+    if pyre_object::gc_hook::try_gc_owns_object(exc as *mut u8) {
+        return None;
+    }
+    let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc) };
+    let offsets: &'static [usize] =
+        if pyre_object::interp_exceptions::exc_kind_uses_extended_layout(kind) {
+            &pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_GC_PTR_OFFSETS
+        } else {
+            &pyre_object::interp_exceptions::W_BASE_EXCEPTION_GC_PTR_OFFSETS
+        };
+    let mut buf = [pyre_object::PY_NULL; 35];
+    const _: () =
+        assert!(pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_GC_PTR_OFFSETS.len() <= 35);
+    debug_assert!(offsets.len() <= buf.len());
+    for (index, &offset) in offsets.iter().enumerate() {
+        buf[index] = unsafe { *((exc as usize + offset) as *const PyObjectRef) };
+    }
+    let base = pyre_object::gc_roots::publish_roots(&buf[..offsets.len()]);
+    pyre_object::gc_roots::normalize_roots(base, offsets.len());
+    Some((base, offsets))
+}
+
+fn write_unmanaged_exception_children(exc: PyObjectRef, base: usize, offsets: &[usize]) {
+    if exc.is_null() {
+        return;
+    }
+    for (index, &offset) in offsets.iter().enumerate() {
+        let live = pyre_object::gc_roots::shadow_stack_get(base + index);
+        unsafe { *((exc as usize + offset) as *mut PyObjectRef) = live };
+    }
+}
+
 /// PyPy: baseobjspace.py `call_args_and_c_profile`.
 ///
 /// ```python
@@ -15544,16 +15585,38 @@ pub fn call_args_and_c_profile_args(
             // stash already holds the original OperationError; if
             // c_exception_trace raises, overwrite the stash so the
             // tracer error is what propagates.
-            // The bare `raise` re-raises the error the call left pending, so it
-            // has to outlive the hook — and the hook runs Python, whose every
-            // call resets the one-cell stash.  Park it where the collector
-            // still walks it for the duration.
-            let parked = crate::call::park_call_error();
+            // `ObjSpace.call_args_and_c_profile` keeps the `OperationError`
+            // as a local across `ExecutionContext.c_exception_trace`, then
+            // re-raises it. The hook runs Python and every call resets the
+            // one-cell stash, so the local is rooted on the shadow stack for
+            // the call and written back with `set_call_error`. A tracer error
+            // replaces it, matching `except` replacing the in-flight error.
+            let mut parked = crate::call::take_call_error();
+            let parked_base = parked.as_ref().map(|err| {
+                let base = pyre_object::gc_roots::publish_roots(&[
+                    err.exc_object,
+                    err.w_name_context,
+                    err.w_obj_context,
+                ]);
+                pyre_object::gc_roots::normalize_roots(base, 3);
+                base
+            });
+            let exc_children = parked
+                .as_ref()
+                .and_then(|err| pin_unmanaged_exception_children(err.exc_object));
             let traced = unsafe {
                 (*ec).c_exception_trace(frame as *mut crate::pyframe::PyFrame, callable())
             };
-            if parked {
-                crate::call::unpark_call_error();
+            if let Some(mut err) = parked.take() {
+                if let Some(base) = parked_base {
+                    err.exc_object = pyre_object::gc_roots::shadow_stack_get(base);
+                    err.w_name_context = pyre_object::gc_roots::shadow_stack_get(base + 1);
+                    err.w_obj_context = pyre_object::gc_roots::shadow_stack_get(base + 2);
+                }
+                if let Some((child_base, offsets)) = exc_children {
+                    write_unmanaged_exception_children(err.exc_object, child_base, offsets);
+                }
+                crate::call::set_call_error(err);
             }
             if let Err(trace_err) = traced {
                 crate::call::set_call_error(trace_err);

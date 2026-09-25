@@ -1,20 +1,6 @@
 use majit_backend::{Backend, ExitValueSourceLayout};
 
 thread_local! {
-    /// Set while a full-body-walk trace executes a residual may-force call
-    /// concretely (`pyre-jit-trace`'s `try_execute_residual_call_via_walker`).
-    /// A Python-level callee re-enters the interpreter (`eval_loop_jit` →
-    /// `jit_merge_point`) while the outer walk still holds the driver in the
-    /// tracing state; without this guard `jit_merge_point_keyed` would start a
-    /// NESTED trace that shares — and corrupts — the outer walk's `TraceCtx`
-    /// (observed as a flaky `libsystem_malloc` freelist abort during deep
-    /// recursion).  While set, `jit_merge_point_keyed` skips the
-    /// trace-continuation block so the re-entrant call runs as plain
-    /// interpretation.
-    static TRACE_CONTINUATION_SUSPENDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-thread_local! {
     /// Per-thread pool for the structured back-edge blackhole resume.
     /// `build_inline_call_only_bh_builder` wires ~100 string-keyed insns and
     /// their handlers — a fixed dispatch table independent of any trace — so
@@ -532,27 +518,28 @@ fn writeback_live_state_scalars_from_blackhole<S: crate::JitState>(
     }
 }
 
-/// Whether re-entrant trace continuation is currently suspended — see
-/// `TRACE_CONTINUATION_SUSPENDED`.
-pub fn trace_continuation_suspended() -> bool {
-    TRACE_CONTINUATION_SUSPENDED.with(|c| c.get())
+/// RAII guard that suspends re-entrant trace continuation on the owning
+/// `TraceCtx` for its lifetime, restoring the previous state on drop
+/// (nesting-safe).
+#[must_use = "the guard suspends trace continuation only while held; a bare \
+              `TraceContinuationSuspendGuard::enter(ctx);` drops it immediately"]
+pub struct TraceContinuationSuspendGuard<'a> {
+    cell: &'a std::cell::Cell<bool>,
+    prev: bool,
 }
 
-/// RAII guard that suspends re-entrant trace continuation for its lifetime,
-/// restoring the previous state on drop (nesting-safe).
-#[must_use = "the guard suspends trace continuation only while held; a bare \
-              `TraceContinuationSuspendGuard::enter();` drops it immediately"]
-pub struct TraceContinuationSuspendGuard(bool);
-
-impl TraceContinuationSuspendGuard {
-    pub fn enter() -> Self {
-        Self(TRACE_CONTINUATION_SUSPENDED.with(|c| c.replace(true)))
+impl<'a> TraceContinuationSuspendGuard<'a> {
+    pub fn enter(ctx: &'a crate::trace_ctx::TraceCtx) -> Self {
+        Self {
+            prev: ctx.trace_continuation_suspended.replace(true),
+            cell: &ctx.trace_continuation_suspended,
+        }
     }
 }
 
-impl Drop for TraceContinuationSuspendGuard {
+impl Drop for TraceContinuationSuspendGuard<'_> {
     fn drop(&mut self) {
-        TRACE_CONTINUATION_SUSPENDED.with(|c| c.set(self.0));
+        self.cell.set(self.prev);
     }
 }
 
@@ -5539,7 +5526,7 @@ impl<S: JitState> JitDriver<S> {
         // (not is_tracing_key) to accept all bytecodes from the tracing
         // portal. Nested function calls are prevented by JIT_TRACING
         // flag in eval_loop_jit.
-        if self.meta.is_tracing() && !trace_continuation_suspended() {
+        if self.meta.is_tracing() && !self.meta.trace_continuation_suspended() {
             // pyjitpl.py: record frame.pc for capture_resumedata.
             if let Some(ctx) = self.meta.trace_ctx() {
                 ctx.last_traced_pc = target_pc;

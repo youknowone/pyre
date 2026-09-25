@@ -7407,6 +7407,14 @@ impl<M: Clone> MetaInterp<M> {
         self.tracing.is_some()
     }
 
+    /// The active session asked `jit_merge_point_keyed` not to start a nested
+    /// trace. False when nothing is tracing.
+    pub fn trace_continuation_suspended(&self) -> bool {
+        self.tracing
+            .as_ref()
+            .is_some_and(|ctx| ctx.trace_continuation_suspended.get())
+    }
+
     /// pyjitpl.py `blackhole_if_trace_too_long`.
     ///
     /// Runs the too-long bookkeeping (`disable_noninlinable_function` /

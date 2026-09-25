@@ -1055,7 +1055,7 @@ fn try_commit_midbody_abort_inner(
     // suspends continuation across user code for the same reason
     // (`residual_call.rs`); the rebuilt callee is that same situation.
     let ran = {
-        let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter();
+        let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter(ctx);
         frame.execute_frame(None, None)
     };
     // `type_descr_call_impl`'s tail, which this leg has no frame for: discard
