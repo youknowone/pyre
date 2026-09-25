@@ -5022,7 +5022,7 @@ class Check:
         """
         print(f"  {name}")
         if spec_folds and not self._check_spec_folds(
-            name, script, spec_folds, timeout, "-", "-",
+            name, script, spec_folds, timeout, "-", "-", skip_backends,
         ):
             return
         for backend in ALL_BACKENDS:
@@ -5181,7 +5181,9 @@ class Check:
 
     # ── synthetic parity suite ──
 
-    def _check_spec_folds(self, name, path, spec_folds, timeout, t_cpython, t_pypy):
+    def _check_spec_folds(
+        self, name, path, spec_folds, timeout, t_cpython, t_pypy, skip_backends=(),
+    ):
         """True if every fold the fixture declares fired; else record and report.
 
         The census reads the same on every backend that shares the trace
@@ -5195,14 +5197,21 @@ class Check:
         is the fixture's own unscaled budget: the scale belongs to a backend,
         and which one that is is not known until the line above. A caller that
         hands over its own already-scaled figure squares the scale.
+
+        *skip_backends* is the fixture's `# pyre-check: skip-backends=` list;
+        the census never runs on a backend the fixture opts out of.
         """
         sys.stdout.write(f"    {'folds':<10s}")
         sys.stdout.flush()
         backend = next(
-            (b for b in ALL_BACKENDS if self.enabled(b) and b != "wasm"), None
+            (
+                b for b in ALL_BACKENDS
+                if self.enabled(b) and b != "wasm" and b not in skip_backends
+            ),
+            None,
         )
         if backend is None:
-            if not self.enabled("wasm"):
+            if not self.enabled("wasm") or "wasm" in skip_backends:
                 print(dim("skip (no backend enabled)"))
                 return True
             backend = "wasm"
@@ -5330,7 +5339,7 @@ class Check:
             return
 
         if spec_folds and not self._check_spec_folds(
-            name, path, spec_folds, timeout, t_cpython, t_pypy,
+            name, path, spec_folds, timeout, t_cpython, t_pypy, skip_backends,
         ):
             return
 
