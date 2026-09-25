@@ -4236,17 +4236,47 @@ impl JitCodeBuilder {
     ///
     /// The producer already stamped its classification onto the
     /// `JitCallTarget` (`add_call_target_with_save_err` /
-    /// `add_fn_ptr_with_slot`), so the residual descr reads that slot
-    /// instead of inventing a row here: a hand-classified
-    /// `#[dont_look_inside]` helper keeps `EF_CAN_RAISE`, while a helper
-    /// registered as [`crate::call_descr::EffectInfoSlot::Unanalyzed`]
-    /// keeps `MOST_GENERAL`. A `fn_ptr_idx` that is not a call target is
-    /// left to the `_with_effect_info` sibling's own panic.
+    /// `add_fn_ptr_with_slot`). `cond_call` / `record_known_result` read
+    /// that slot here. An unanalyzed `residual_call_*` does not: see
+    /// [`Self::residual_effect_info_for_target`]. A `fn_ptr_idx` that is
+    /// not a call target is left to the `_with_effect_info` sibling's
+    /// own panic.
     fn effect_info_for_target(&self, fn_ptr_idx: u16) -> majit_ir::descr::EffectInfo {
         match self.descrs.get(fn_ptr_idx as usize) {
             Some(RuntimeBhDescr::Call(target)) => {
                 crate::call_descr::effect_info_for_slot(target.effect_info_slot)
             }
+            _ => crate::call_descr::default_effect_info(),
+        }
+    }
+
+    /// Effect info for `residual_call_*_canonical_via_target`.
+    ///
+    /// `effectinfo.py effectinfo_from_writeanalyze` turns an unknown /
+    /// `top_set` result into `EF_RANDOM_EFFECTS`
+    /// (`EffectInfo.MOST_GENERAL`). The default
+    /// [`crate::call_descr::EffectInfoSlot::CanRaise`] slot is that
+    /// unknown: a `dont_look_inside` / `residual_*` helper whose Rust body
+    /// was never write-analyzed. Promoting it here is what
+    /// `heap.py OptHeap.emitting_operation` needs in order to take the
+    /// `has_random_effects` branch (`force_all_lazy_sets` + `clean_caches`)
+    /// instead of believing the empty `can_raise_effect_info` sets.
+    ///
+    /// A precise slot (`elidable_*`, `cannot_raise`, `loopinvariant`) stays
+    /// on `effect_info_for_slot`. Callers that already pass an effect info
+    /// (`residual_writes`, `nursery_alloc`) use the `_with_effect_info`
+    /// siblings and never reach this helper. `cond_call` keeps
+    /// [`Self::effect_info_for_target`]: `MOST_GENERAL` forces virtuals,
+    /// which `jtransform.py _rewrite_op_cond_call` rejects.
+    fn residual_effect_info_for_target(&self, fn_ptr_idx: u16) -> majit_ir::descr::EffectInfo {
+        match self.descrs.get(fn_ptr_idx as usize) {
+            Some(RuntimeBhDescr::Call(target)) => match target.effect_info_slot {
+                crate::call_descr::EffectInfoSlot::CanRaise
+                | crate::call_descr::EffectInfoSlot::Unanalyzed => {
+                    crate::call_descr::default_effect_info()
+                }
+                slot => crate::call_descr::effect_info_for_slot(slot),
+            },
             _ => crate::call_descr::default_effect_info(),
         }
     }
@@ -4257,13 +4287,11 @@ impl JitCodeBuilder {
         arg_regs: &[JitCallArg],
     ) {
         // pyjitpl.py do_residual_call invalidates the heapcache from
-        // descriptor effects before recording the call, so the descr must
-        // carry the callee's own classification —
-        // `effect_info_for_target`. `check_can_raise()`
-        // (`effectinfo.py extraeffect > EF_CANNOT_RAISE`) holds for
-        // every row it can return, so the walker keeps emitting
-        // `GUARD_NO_EXCEPTION`.
-        let effect_info = self.effect_info_for_target(fn_ptr_idx);
+        // descriptor effects before recording the call. An unanalyzed
+        // residual is `EF_RANDOM_EFFECTS` (`residual_effect_info_for_target`);
+        // `check_can_raise()` holds for that row, so the walker keeps
+        // emitting `GUARD_NO_EXCEPTION`.
+        let effect_info = self.residual_effect_info_for_target(fn_ptr_idx);
         self.residual_call_void_canonical_via_target_with_effect_info(
             fn_ptr_idx,
             arg_regs,
@@ -4718,7 +4746,7 @@ impl JitCodeBuilder {
         arg_regs: &[JitCallArg],
         dst: u16,
     ) {
-        let effect_info = self.effect_info_for_target(fn_ptr_idx);
+        let effect_info = self.residual_effect_info_for_target(fn_ptr_idx);
         self.residual_call_int_canonical_via_target_with_effect_info(
             fn_ptr_idx,
             arg_regs,
@@ -4760,7 +4788,7 @@ impl JitCodeBuilder {
         arg_regs: &[JitCallArg],
         dst: u16,
     ) {
-        let effect_info = self.effect_info_for_target(fn_ptr_idx);
+        let effect_info = self.residual_effect_info_for_target(fn_ptr_idx);
         self.residual_call_ref_canonical_via_target_with_effect_info(
             fn_ptr_idx,
             arg_regs,
@@ -4872,7 +4900,7 @@ impl JitCodeBuilder {
         arg_regs: &[JitCallArg],
         dst: u16,
     ) {
-        let effect_info = self.effect_info_for_target(fn_ptr_idx);
+        let effect_info = self.residual_effect_info_for_target(fn_ptr_idx);
         self.residual_call_float_canonical_via_target_with_effect_info(
             fn_ptr_idx,
             arg_regs,

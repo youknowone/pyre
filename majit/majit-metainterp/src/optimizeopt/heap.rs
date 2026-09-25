@@ -7455,6 +7455,92 @@ mod tests {
     }
 
     #[test]
+    fn test_unanalyzed_residual_flushes_lazy_sets_and_drops_field_cache() {
+        // effectinfo.py `effectinfo_from_writeanalyze`: an unknown write
+        // analysis is `EF_RANDOM_EFFECTS` (`EffectInfo.MOST_GENERAL`,
+        // `has_random_effects`). heap.py `OptHeap.emitting_operation`
+        // then skips `force_from_effectinfo` and runs
+        // `force_all_lazy_sets` + `clean_caches`, so a lazy
+        // `setfield_gc` / `setarrayitem_gc` is emitted before the call
+        // and a field read cached before it is not reused after it.
+        // `default_effect_info` is the descr
+        // `residual_effect_info_for_target` stamps on an unanalyzed residual.
+        let field = descr(0);
+        let array = descr(1);
+        let call_d = call_descr(80, crate::call_descr::default_effect_info());
+        let mut ops = vec![
+            Op::with_descr(
+                OpCode::GetfieldGcI,
+                &[rooted_inputarg_operand(Type::Ref, 100)],
+                field.clone(),
+            ),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[
+                    rooted_inputarg_operand(Type::Ref, 100),
+                    rooted_inputarg_operand(Type::Int, 101),
+                ],
+                field.clone(),
+            ),
+            Op::with_descr(
+                OpCode::SetarrayitemGc,
+                &[
+                    rooted_inputarg_operand(Type::Ref, 110),
+                    Operand::const_from_value(majit_ir::Value::Int(0)),
+                    rooted_inputarg_operand(Type::Int, 111),
+                ],
+                array,
+            ),
+            Op::with_descr(
+                OpCode::CallN,
+                &[rooted_inputarg_operand(Type::Ref, 200)],
+                call_d,
+            ),
+            Op::with_descr(
+                OpCode::GetfieldGcI,
+                &[rooted_inputarg_operand(Type::Ref, 100)],
+                field,
+            ),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt_typed(&mut ops, &[101, 111]);
+
+        let call_pos = result
+            .iter()
+            .position(|op| op.opcode == OpCode::CallN)
+            .expect("unanalyzed residual call must survive");
+        let setfield_pos = result
+            .iter()
+            .position(|op| op.opcode == OpCode::SetfieldGc)
+            .expect("lazy setfield_gc must be emitted");
+        let setarray_pos = result
+            .iter()
+            .position(|op| op.opcode == OpCode::SetarrayitemGc)
+            .expect("lazy setarrayitem_gc must be emitted");
+        assert!(
+            setfield_pos < call_pos,
+            "setfield_gc must be emitted before the residual call; got {:?}",
+            result.iter().map(|op| op.opcode).collect::<Vec<_>>()
+        );
+        assert!(
+            setarray_pos < call_pos,
+            "setarrayitem_gc must be emitted before the residual call; got {:?}",
+            result.iter().map(|op| op.opcode).collect::<Vec<_>>()
+        );
+        let gets_after = result
+            .iter()
+            .skip(call_pos)
+            .filter(|op| op.opcode == OpCode::GetfieldGcI)
+            .count();
+        assert_eq!(
+            gets_after,
+            1,
+            "a field read cached before an unanalyzed residual must not be reused after it; got {:?}",
+            result.iter().map(|op| op.opcode).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn test_call_may_force_uses_effectinfo_to_invalidate_written_cached_fields() {
         let d0 = descr(0);
         // PyPy `effectinfo.py:526 mapping.setdefault(...)` would assign
