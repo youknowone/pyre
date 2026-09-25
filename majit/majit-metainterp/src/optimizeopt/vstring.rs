@@ -1722,64 +1722,85 @@ mod tests {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptString::new()));
 
-        // Seed constants into the context. Since Optimizer::optimize
-        // creates its own context, we use a custom approach: run the pass
-        // manually. Seed reserve_pos above any trace op.pos so that
-        // force_virtual's synthesized ops don't collide with the original
-        // trace positions — matches the invariant
-        // `optimize_with_constants_and_inputs` maintains
-        // (start_next_pos = max(num_inputs, max_pos + 1)).
-        let max_pos = ops
+        // Constants are Const operands in the args (oparser `ConstInt`), not a
+        // SameAs stand-in registered at the same position as a rooted operand.
+        let mut owned: Vec<Op> = ops.to_vec();
+        for op in &mut owned {
+            for i in 0..op.num_args() {
+                let r = op.arg(i).to_opref();
+                if let Some(val) = constants
+                    .iter()
+                    .find_map(|&(idx, val)| (r == OpRef::int_op(idx)).then_some(val))
+                {
+                    op.setarg(i, Operand::const_from_value(Value::Int(val)));
+                }
+            }
+        }
+
+        // One object per position: a producer's result box is what later args
+        // at that position carry, and a leaf keeps the first operand seen.
+        let mut wrapped: Vec<OpRc> = Vec::with_capacity(owned.len());
+        let mut leaves: Vec<Operand> = Vec::new();
+        for op in &owned {
+            let rc = OpRc::new(op.clone());
+            for i in 0..rc.num_args() {
+                let arg = rc.arg(i);
+                if arg.is_constant() || arg.is_none() {
+                    continue;
+                }
+                let opref = arg.to_opref();
+                if let Some(prod) = wrapped.iter().rev().find(|p| {
+                    let pos = p.pos().get();
+                    pos == opref && p.opcode.result_type() != Type::Void
+                }) {
+                    rc.setarg(i, Operand::from_bound_op(prod));
+                    continue;
+                }
+                if let Some(leaf) = leaves.iter().find(|leaf| leaf.to_opref() == opref) {
+                    rc.setarg(i, leaf.clone());
+                    continue;
+                }
+                leaves.push(arg);
+            }
+            wrapped.push(rc);
+        }
+
+        // Seed reserve_pos above any trace op.pos so that force_virtual's
+        // synthesized ops don't collide with the original trace positions —
+        // the same start_next_pos `optimize_with_constants_and_inputs` uses.
+        let max_pos = wrapped
             .iter()
             .map(|op| op.pos().get())
             .filter(|op| !op.is_none() && !op.is_constant())
             .map(|op| op.raw())
             .max()
             .unwrap_or(0);
-        let start_next_pos = (max_pos + 1).max(ops.len() as u32);
-        let mut ctx = OptContext::with_num_inputs_and_start_pos(ops.len(), 0, 0, start_next_pos);
-        for &(idx, val) in constants {
-            let b = ctx.materialize_operand_at(OpRef::int_op(idx));
-            ctx.make_constant_box(&b, Value::Int(val));
-        }
+        let start_next_pos = (max_pos + 1).max(wrapped.len() as u32);
+        let mut ctx =
+            OptContext::with_num_inputs_and_start_pos(wrapped.len(), 0, 0, start_next_pos);
 
-        // Register every non-constant LEAF arg position as a bound synthetic
-        // producer in the context (`resop_refs`). The trace's char / source
-        // operands are leaf values with no producing op in this fixture slice;
-        // without a registered producer, a later force/emit resolves such an
-        // arg to a position-only `from_opref` box that mints `Operand::Box`.
-        // `materialize_operand_at` binds a `SameAs*` synthetic at the same position
-        // (oparser's leaf-var wiring), so resolution sheds to `Operand::Op`.
-        // Positions produced by a trace op are skipped — materializing a
-        // synthetic there would shadow the real producer and defeat
-        // virtualization. Constant positions already carry a Const box.
+        // Register each leaf arg's own producer. A fresh SameAs stand-in
+        // would be a second object at that position.
         let produced: std::collections::HashSet<OpRef> =
-            ops.iter().map(|op| op.pos().get()).collect();
-        for op in ops {
-            for i in 0..op.num_args() {
-                let r = op.arg(i).to_opref();
-                if !r.is_none() && !r.is_constant() && !produced.contains(&r) {
-                    ctx.materialize_operand_at(r);
-                }
-            }
-        }
+            wrapped.iter().map(|op| op.pos().get()).collect();
+        let leaf_args: Vec<Operand> = leaves
+            .into_iter()
+            .filter(|arg| !produced.contains(&arg.to_opref()))
+            .collect();
+        ctx.seed_boxes_canonical(&leaf_args);
 
         let mut pass = OptString::new();
         pass.setup();
 
-        for op in ops {
-            // Resolve forwarded arguments.
-            let mut resolved_op = op.clone();
-            // optimizer.py:651-652 setarg loop parity. Store the canonical
-            // terminal box (carrying the live _forwarded chain) like
-            // propagate_from_pass_range, so the pass reads PtrInfo/IntBound
-            // directly off resolved_op.arg(i) instead of a fresh unbound box.
-            for i in 0..resolved_op.num_args() {
-                resolved_op.setarg(i, ctx.resolve_operand_operand(&resolved_op.arg(i)));
+        for rc in &wrapped {
+            // optimizer.py setarg loop. Resolve on this OpRc so the registered
+            // producer and the args are the same object.
+            for i in 0..rc.num_args() {
+                let resolved = ctx.resolve_operand_operand(&rc.arg(i));
+                rc.setarg(i, resolved);
             }
-            let resolved_rc = OpRc::new(resolved_op.clone());
-            ctx.bind_input_resops(std::slice::from_ref(&resolved_rc));
-            match pass.propagate_forward(&resolved_op, &resolved_rc, &mut ctx) {
+            ctx.bind_input_resops(std::slice::from_ref(rc));
+            match pass.propagate_forward(rc, rc, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -1790,7 +1811,7 @@ mod tests {
                     // Op removed, nothing emitted.
                 }
                 OptimizationResult::PassOn => {
-                    ctx.emit(resolved_op);
+                    ctx.emit_rc(rc.clone());
                 }
                 OptimizationResult::InvalidLoop(_) => {
                     panic!("unexpected InvalidLoop in test");
@@ -2228,9 +2249,10 @@ mod tests {
 
         // STRGETITEM(slice, index) with a non-constant index.
         let index_ref = OpRef::int_op(302);
-        ctx.materialize_operand_at(index_ref);
+        let index_box = ctx.materialize_operand_at(index_ref);
+        let slice_box = ctx.materialize_operand_at(slice_ref);
         let pos = ctx.alloc_op_position_typed(majit_ir::Type::Int);
-        let mut getitem = Op::new(OpCode::Strgetitem, &[rop(11), iop(302)]);
+        let mut getitem = Op::new(OpCode::Strgetitem, &[slice_box, index_box]);
         getitem.pos().set(pos);
         let op_rc = OpRc::new(getitem.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op_rc));
@@ -2286,10 +2308,11 @@ mod tests {
         );
 
         // STRGETITEM(slice, 1) → concat[start 1 + 1 = 2] → vright[2 - len 2 = 0].
-        let b = ctx.materialize_operand_at(OpRef::int_op(302));
-        ctx.make_constant_box(&b, Value::Int(1));
+        let index_box = ctx.materialize_operand_at(OpRef::int_op(302));
+        ctx.make_constant_box(&index_box, Value::Int(1));
+        let slice_box = ctx.materialize_operand_at(slice_ref);
         let pos = ctx.alloc_op_position_typed(majit_ir::Type::Int);
-        let mut getitem = Op::new(OpCode::Strgetitem, &[rop(13), iop(302)]);
+        let mut getitem = Op::new(OpCode::Strgetitem, &[slice_box, index_box]);
         getitem.pos().set(pos);
         let op_rc = OpRc::new(getitem.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op_rc));

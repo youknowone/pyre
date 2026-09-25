@@ -3332,22 +3332,21 @@ mod tests {
 
         let mut passes = test_pass_chain();
 
-        // Simulate the optimizer loop
+        // Simulate the optimizer loop on the spec OpRcs. Cloning into a fresh
+        // OpRc would register a second producer at the same position.
         for (i, op) in ops.iter().enumerate() {
-            let mut resolved = (**op).clone();
-            // optimizer.py:651-652 setarg loop parity.
-            for i in 0..resolved.num_args() {
-                resolved.setarg(i, ctx.resolve_operand_operand(&resolved.arg(i)));
+            for a in 0..op.num_args() {
+                let resolved_arg = ctx.resolve_operand_operand(&op.arg(a));
+                op.setarg(a, resolved_arg);
             }
-            let __pf_rc = OpRc::new(resolved.clone());
-            ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+            ctx.bind_input_resops(std::slice::from_ref(op));
             let mut result = OptimizationResult::PassOn;
             // The production loop absorbs SameAs* before the passes
             // (optimizer.py:864-867); the argless SameAsI fixtures here
             // stand in for inputs and are emitted directly.
-            if resolved.opcode != OpCode::SameAsI {
+            if op.opcode != OpCode::SameAsI {
                 for pass in passes.iter_mut() {
-                    result = pass.propagate_forward(&resolved, &__pf_rc, &mut ctx);
+                    result = pass.propagate_forward(&**op, op, &mut ctx);
                     if !matches!(result, OptimizationResult::PassOn) {
                         break;
                     }
@@ -3363,7 +3362,7 @@ mod tests {
                 }
                 OptimizationResult::Remove => {}
                 OptimizationResult::PassOn => {
-                    ctx.emit(resolved);
+                    ctx.emit_rc(op.clone());
                 }
                 OptimizationResult::InvalidLoop(_) => {
                     std::panic::panic_any(crate::optimize::InvalidLoop(
@@ -3371,9 +3370,9 @@ mod tests {
                     ));
                 }
             }
-            // Set op1 as constant 0 after it has been emitted
+            // op1 is the zero constant the following IntAdd folds.
             if i == 1 {
-                let b = ctx.materialize_operand_at(OpRef::int_op(1));
+                let b = Operand::from_bound_op(op);
                 ctx.make_constant_box(&b, Value::Int(0));
             }
         }
@@ -3403,19 +3402,17 @@ mod tests {
 
         let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             for op in &ops {
-                let mut resolved = (**op).clone();
-                // optimizer.py:651-652 setarg loop parity.
-                for i in 0..resolved.num_args() {
-                    resolved.setarg(i, ctx.resolve_operand_operand(&resolved.arg(i)));
+                for a in 0..op.num_args() {
+                    let resolved_arg = ctx.resolve_operand_operand(&op.arg(a));
+                    op.setarg(a, resolved_arg);
                 }
-                let __pf_rc = OpRc::new(resolved.clone());
-                ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
+                ctx.bind_input_resops(std::slice::from_ref(op));
                 let mut result = OptimizationResult::PassOn;
                 // SameAsI input fixtures bypass the passes, as in the
                 // production loop's SameAs absorption (optimizer.py:864-867).
-                if resolved.opcode != OpCode::SameAsI {
+                if op.opcode != OpCode::SameAsI {
                     for pass in passes.iter_mut() {
-                        result = pass.propagate_forward(&resolved, &__pf_rc, &mut ctx);
+                        result = pass.propagate_forward(&**op, op, &mut ctx);
                         if !matches!(result, OptimizationResult::PassOn) {
                             break;
                         }
@@ -3431,7 +3428,7 @@ mod tests {
                     }
                     OptimizationResult::Remove => {}
                     OptimizationResult::PassOn => {
-                        ctx.emit(resolved);
+                        ctx.emit_rc(op.clone());
                     }
                     OptimizationResult::InvalidLoop(_) => {
                         std::panic::panic_any(crate::optimize::InvalidLoop(

@@ -5597,33 +5597,26 @@ mod tests {
         // i2 = getarrayitem_gc_i(p0, i_idx, descr=d0)   <- eliminated
         // We need i_idx to be a known constant.
         let d = descr(0);
-        let idx = OpRef::int_op(50);
+        let arr = rooted_resop_operand(Type::Int, 100);
+        let val = rooted_resop_operand(Type::Int, 101);
+        let idx = Operand::const_from_value(majit_ir::Value::Int(3));
         let mut ops = vec![
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[
-                    rooted_resop_operand(Type::Int, 100),
-                    rooted_resop_operand(Type::Int, idx.raw()),
-                    rooted_resop_operand(Type::Int, 101),
-                ],
+                &[arr.clone(), idx.clone(), val.clone()],
                 d.clone(),
             ),
             Op::with_descr(
                 OpCode::GetarrayitemGcI,
-                &[
-                    rooted_resop_operand(Type::Int, 100),
-                    rooted_resop_operand(Type::Int, idx.raw()),
-                ],
+                &[arr.clone(), idx.clone()],
                 d.clone(),
             ),
             Op::new(OpCode::Jump, &[]),
         ];
         assign_positions(&mut ops);
 
-        // We need to make the index a known constant in the context.
         let mut ctx = OptContext::new(ops.len());
-        let b = ctx.materialize_operand_at(idx);
-        ctx.make_constant_box(&b, majit_ir::Value::Int(3));
+        ctx.seed_boxes_canonical(&[arr, val]);
 
         let mut pass = OptHeap::new();
         pass.setup();
@@ -5821,35 +5814,26 @@ mod tests {
     #[test]
     fn test_getarrayitem_non_pure_invalidated_by_setarrayitem() {
         let d = descr(0);
-        let idx = OpRef::int_op(50);
+        let arr = rooted_resop_operand(Type::Ref, 100);
         let new_val_box = rooted_resop_operand(Type::Ref, 102);
+        let idx = Operand::const_from_value(majit_ir::Value::Int(3));
         let mut ops = vec![
             // r1 = getarrayitem_gc_r(p0, i_idx)
             Op::with_descr(
                 OpCode::GetarrayitemGcR,
-                &[
-                    rooted_resop_operand(Type::Ref, 100),
-                    rooted_resop_operand(Type::Int, idx.raw()),
-                ],
+                &[arr.clone(), idx.clone()],
                 d.clone(),
             ),
             // setarrayitem_gc(p0, i_idx, r_new)
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[
-                    rooted_resop_operand(Type::Ref, 100),
-                    rooted_resop_operand(Type::Int, idx.raw()),
-                    new_val_box.clone(),
-                ],
+                &[arr.clone(), idx.clone(), new_val_box.clone()],
                 d.clone(),
             ),
             // r2 = getarrayitem_gc_r(p0, i_idx)
             Op::with_descr(
                 OpCode::GetarrayitemGcR,
-                &[
-                    rooted_resop_operand(Type::Ref, 100),
-                    rooted_resop_operand(Type::Int, idx.raw()),
-                ],
+                &[arr.clone(), idx.clone()],
                 d.clone(),
             ),
             Op::new(OpCode::Jump, &[]),
@@ -5859,9 +5843,7 @@ mod tests {
         let r2_pos = ops[2].pos().get();
 
         let mut ctx = OptContext::new(ops.len());
-        let cidx = ctx.materialize_operand_at(idx);
-        ctx.make_constant_box(&cidx, majit_ir::Value::Int(3));
-        ctx.materialize_operand_at(OpRef::ref_op(100));
+        ctx.seed_boxes_canonical(&[arr, new_val_box.clone()]);
 
         let mut pass = OptHeap::new();
         pass.setup();
@@ -6059,26 +6041,18 @@ mod tests {
         // subsequent getarrayitem on the same (array, index) reads
         // the value back via getfield_from_cache's _lazy_set check.
         let d = descr(0);
-        let idx = OpRef::int_op(50);
+        let arr = rooted_resop_operand(Type::Int, 100);
+        let rhs = rooted_resop_operand(Type::Int, 101);
+        let idx = Operand::const_from_value(majit_ir::Value::Int(3));
         let mut op = Op::with_descr(
             OpCode::SetarrayitemGc,
-            &[
-                rooted_resop_operand(Type::Int, 100),
-                rooted_resop_operand(Type::Int, idx.raw()),
-                rooted_resop_operand(Type::Int, 101),
-            ],
+            &[arr.clone(), idx, rhs.clone()],
             d.clone(),
         );
 
         let mut ctx = OptContext::new(256);
-        let b = ctx.materialize_operand_at(idx);
-        ctx.make_constant_box(&b, majit_ir::Value::Int(3));
-        let pos100 = ctx.materialize_operand_at(OpRef::int_op(100));
-        ctx.set_ptr_info(&pos100, PtrInfo::virtual_array(d.clone(), 8, false));
-        // Register a producer for the rhs operand position so the forced
-        // lazy setarrayitem resolves it to a bound `Operand::Op` producer
-        // rather than minting a position-only `Operand::Box`.
-        ctx.materialize_operand_at(OpRef::int_op(101));
+        ctx.seed_boxes_canonical(&[arr.clone(), rhs]);
+        ctx.set_ptr_info(&arr, PtrInfo::virtual_array(d.clone(), 8, false));
 
         let mut pass = OptHeap::new();
         pass.setup();
@@ -8185,23 +8159,18 @@ mod tests {
         // setarrayitem_gc(p0, idx, val, descr=byte_array)
         // i2 = getarrayitem_gc_i(p0, idx, descr=byte_array)  <- eliminated
         let d = byte_array_descr(50);
-        let idx = OpRef::int_op(60);
+        let arr = rooted_resop_operand(Type::Int, 100);
+        let val = rooted_resop_operand(Type::Int, 101);
+        let idx = Operand::const_from_value(majit_ir::Value::Int(5));
         let mut ops = vec![
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[
-                    rooted_resop_operand(Type::Int, 100),
-                    rooted_resop_operand(Type::Int, idx.raw()),
-                    rooted_resop_operand(Type::Int, 101),
-                ],
+                &[arr.clone(), idx.clone(), val.clone()],
                 d.clone(),
             ),
             Op::with_descr(
                 OpCode::GetarrayitemGcI,
-                &[
-                    rooted_resop_operand(Type::Int, 100),
-                    rooted_resop_operand(Type::Int, idx.raw()),
-                ],
+                &[arr.clone(), idx.clone()],
                 d.clone(),
             ),
             Op::new(OpCode::Jump, &[]),
@@ -8209,8 +8178,7 @@ mod tests {
         assign_positions(&mut ops);
 
         let mut ctx = OptContext::new(ops.len());
-        let b = ctx.materialize_operand_at(idx);
-        ctx.make_constant_box(&b, majit_ir::Value::Int(5)); // byte index 5
+        ctx.seed_boxes_canonical(&[arr, val]);
 
         let mut pass = OptHeap::new();
         pass.setup();

@@ -6485,7 +6485,7 @@ mod tests {
             ctx: &mut OptContext,
         ) -> OptimizationResult {
             if op.pos().get() == self.target {
-                let b = ctx.materialize_operand_at(op.pos().get());
+                let b = majit_ir::operand::Operand::from_bound_op(_op_rc);
                 ctx.make_constant_box(&b, majit_ir::Value::Int(self.value));
                 return OptimizationResult::Remove;
             }
@@ -6689,9 +6689,11 @@ mod tests {
             if !self.queued && op.opcode == OpCode::IntAdd {
                 self.queued = true;
 
+                // The IntAdd args are the only objects at those positions.
+                ctx.seed_boxes_canonical(&[op.arg(0), op.arg(1)]);
                 let alloc = ctx.emit_extra(ctx.current_pass_idx, Op::new(OpCode::New, &[]));
                 let alloc_box = ctx.materialize_operand_at(alloc);
-                let value = ctx.materialize_operand_at(OpRef::int_op(0));
+                let value = op.arg(0);
                 let mut set = Op::new(OpCode::SetfieldGc, &[alloc_box, value]);
                 set.setdescr(self.field_descr.clone());
                 ctx.emit_extra(ctx.current_pass_idx, set);
@@ -7512,21 +7514,11 @@ mod tests {
         opt.add_pass(Box::new(OptHeap::new()));
         opt.add_pass(Box::new(crate::optimizeopt::unroll::OptUnroll::new()));
 
+        let v0 = rooted_resop_operand(Type::Int, 0);
+        let v1 = rooted_resop_operand(Type::Int, 1);
         let mut ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    rooted_resop_operand(Type::Int, 0),
-                    rooted_resop_operand(Type::Int, 1),
-                ],
-            ),
-            Op::new(
-                OpCode::Jump,
-                &[
-                    rooted_resop_operand(Type::Int, 0),
-                    rooted_resop_operand(Type::Int, 1),
-                ],
-            ),
+            Op::new(OpCode::IntAdd, &[v0.clone(), v1.clone()]),
+            Op::new(OpCode::Jump, &[v0, v1]),
         ];
         ops[0].pos().set(OpRef::int_op(2));
         ops[1].pos().set(OpRef::void_op(3));
@@ -7568,16 +7560,17 @@ mod tests {
             if !self.queued && op.opcode == OpCode::IntAdd {
                 self.queued = true;
 
+                ctx.seed_boxes_canonical(&[op.arg(0), op.arg(1)]);
                 let alloc_a = ctx.emit_extra(ctx.current_pass_idx, Op::new(OpCode::New, &[]));
                 let alloc_a_box = ctx.materialize_operand_at(alloc_a);
-                let value_a = ctx.materialize_operand_at(OpRef::int_op(0));
+                let value_a = op.arg(0);
                 let mut set_a = Op::new(OpCode::SetfieldGc, &[alloc_a_box, value_a]);
                 set_a.setdescr(self.field_descr.clone());
                 ctx.emit_extra(ctx.current_pass_idx, set_a);
 
                 let alloc_b = ctx.emit_extra(ctx.current_pass_idx, Op::new(OpCode::New, &[]));
                 let alloc_b_box = ctx.materialize_operand_at(alloc_b);
-                let value_b = ctx.materialize_operand_at(OpRef::int_op(1));
+                let value_b = op.arg(1);
                 let mut set_b = Op::new(OpCode::SetfieldGc, &[alloc_b_box, value_b]);
                 set_b.setdescr(self.field_descr.clone());
                 ctx.emit_extra(ctx.current_pass_idx, set_b);
@@ -7599,21 +7592,11 @@ mod tests {
         }));
         opt.add_pass(Box::new(OptHeap::new()));
 
+        let v0 = rooted_resop_operand(Type::Int, 0);
+        let v1 = rooted_resop_operand(Type::Int, 1);
         let mut ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    rooted_resop_operand(Type::Int, 0),
-                    rooted_resop_operand(Type::Int, 1),
-                ],
-            ),
-            Op::new(
-                OpCode::Jump,
-                &[
-                    rooted_resop_operand(Type::Int, 0),
-                    rooted_resop_operand(Type::Int, 1),
-                ],
-            ),
+            Op::new(OpCode::IntAdd, &[v0.clone(), v1.clone()]),
+            Op::new(OpCode::Jump, &[v0, v1]),
         ];
         ops[0].pos().set(OpRef::int_op(2));
         ops[1].pos().set(OpRef::void_op(3));
@@ -7659,21 +7642,11 @@ mod tests {
         }));
         opt.add_pass(Box::new(OptHeap::new()));
 
+        let v0 = rooted_resop_operand(Type::Int, 0);
+        let v1 = rooted_resop_operand(Type::Int, 1);
         let mut ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[
-                    rooted_resop_operand(Type::Int, 0),
-                    rooted_resop_operand(Type::Int, 1),
-                ],
-            ),
-            Op::new(
-                OpCode::Jump,
-                &[
-                    rooted_resop_operand(Type::Int, 0),
-                    rooted_resop_operand(Type::Int, 1),
-                ],
-            ),
+            Op::new(OpCode::IntAdd, &[v0.clone(), v1.clone()]),
+            Op::new(OpCode::Jump, &[v0, v1]),
         ];
         ops[0].pos().set(OpRef::int_op(2));
         ops[1].pos().set(OpRef::void_op(3));

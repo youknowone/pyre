@@ -5739,7 +5739,39 @@ impl OptContext {
         Operand::bound_from_opref(opref)
     }
 
-    /// "Box always exists" materializer (`resoperation.py AbstractResOpOrInputArg
+    /// Write receiver for `op.set_forwarded(info)` on an already
+    /// chain-resolved operand. A bound ResOp is its own host; its position is
+    /// made to resolve to it, since guard resume numbering reads by position.
+    /// Other operands go through `materialize_operand_at`. The `None`
+    /// sentinel passes through untouched.
+    pub(crate) fn materialize_write_host(&mut self, o: Operand) -> Operand {
+        let pos = o.to_opref();
+        if pos.is_none() {
+            return o;
+        }
+        let Some(op) = o.bound_op() else {
+            return self.materialize_operand_at(pos);
+        };
+        // `op.set_forwarded(info)` writes the chain terminal itself. A
+        // terminal its position does not resolve to becomes the position's
+        // producer, and an unforwarded stand-in registered there is
+        // forwarded to it, so position readers reach the same box.
+        match self.find_producer_op(pos) {
+            Some(p) if OpRc::ptr_eq(&p, &op) => {}
+            Some(p) => {
+                use majit_ir::forwarding::ForwardingHost;
+                if matches!(p.get_forwarded(), majit_ir::forwarding::Forwarded::None) {
+                    p.set_forwarded_op(&op);
+                }
+            }
+            None => {
+                self.resop_refs.insert(pos, op);
+            }
+        }
+        o
+    }
+
+    /// "Box always exists" materializer (`resoperation.py:233-248
     /// AbstractResOpOrInputArg._forwarded`). Returns the canonical bound
     /// `_forwarded` host for `opref` as an [`Operand`] (`Op` / `InputArg`),
     /// minting a `SameAs*` synthetic into `resop_refs` when no producer is
@@ -5752,20 +5784,6 @@ impl OptContext {
     /// fixtures, short-preamble replay slots). The sentinel `OpRef::none()`
     /// has no operand (debug-asserted); resolve it with
     /// `resolve_to_operand` / `get_box_replacement_operand` instead.
-    /// Write-receiver form of [`materialize_operand_at`](Self::materialize_operand_at)
-    /// for a receiver that is already an [`Operand`]: returns its canonical
-    /// `_forwarded` host, registering a producer when the position has none.
-    /// A chain-resolved operand is not necessarily registered, and an
-    /// unregistered position later reaches guard resume numbering, where
-    /// `get_box_replacement_operand` has no producer to bind. The `None`
-    /// sentinel has no operand to mint, so it passes through untouched.
-    pub(crate) fn materialize_write_host(&mut self, o: Operand) -> Operand {
-        if o.to_opref().is_none() {
-            return o;
-        }
-        self.materialize_operand_at(o.to_opref())
-    }
-
     pub(crate) fn materialize_operand_at(&mut self, opref: OpRef) -> Operand {
         debug_assert!(
             !opref.is_none(),
@@ -6012,9 +6030,48 @@ impl OptContext {
         imported.is_constant().then_some(imported)
     }
 
+    /// `get_box_replacement(op)`: walk the operand's own `_forwarded`
+    /// chain. A self-resolved InputArg in the peeled body keeps the
+    /// constant rejoin of `imported_inputarg_operand`. Debug builds check
+    /// the result against the positional resolver.
     pub fn resolve_operand_operand(&self, arg: &Operand) -> Operand {
-        if let Some(resolved) = self.heal_arg_to_canonical(arg) {
-            return resolved;
+        if arg.is_constant() {
+            return arg.clone();
+        }
+        if !arg.is_resop() && !arg.is_inputarg() {
+            return self.get_box_replacement_operand(arg.to_opref());
+        }
+        let resolved = arg.get_box_replacement(false);
+        let resolved = if resolved.same_box(arg) && arg.is_inputarg() {
+            self.imported_inputarg_operand(arg).unwrap_or(resolved)
+        } else {
+            resolved
+        };
+        // An unregistered position has no positional answer: the old
+        // resolver fabricated a fresh box for it on every call.
+        #[cfg(debug_assertions)]
+        if self.resolve_to_operand(arg.to_opref()).is_some() {
+            let old = self.resolve_operand_operand_positional(arg);
+            debug_assert!(
+                resolved.same_box(&old),
+                "resolve_operand_operand {:?}: new {:?} old {:?}",
+                arg.to_opref(),
+                resolved.to_opref(),
+                old.to_opref()
+            );
+        }
+        resolved
+    }
+
+    #[cfg(debug_assertions)]
+    fn resolve_operand_operand_positional(&self, arg: &Operand) -> Operand {
+        // The canonical `heal_arg_to_canonical` would link to, read without
+        // writing `_forwarded`, so the witness leaves no trace in debug runs.
+        if arg.bound_op().is_some()
+            && matches!(arg.get_forwarded(), majit_ir::forwarding::Forwarded::None)
+            && let Some(canon) = self.get_box_replacement_operand_opt(arg.to_opref())
+        {
+            return canon;
         }
 
         // `Const.get_box_replacement()` is identity in resoperation.py: a
