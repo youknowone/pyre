@@ -553,16 +553,14 @@ struct InputArgInnerHeap {
 unsafe impl Send for InputArgInnerHeap {}
 unsafe impl Sync for InputArgInnerHeap {}
 
-static INPUTARG_INNER_HEAP: std::sync::Mutex<InputArgInnerHeap> =
-    std::sync::Mutex::new(InputArgInnerHeap {
+static INPUTARG_INNER_HEAP: parking_lot::Mutex<InputArgInnerHeap> =
+    parking_lot::Mutex::new(InputArgInnerHeap {
         chunks: Vec::new(),
         free: Vec::new(),
     });
 
 fn alloc_inputarg_inner() -> std::ptr::NonNull<InputArgInner> {
-    let mut heap = INPUTARG_INNER_HEAP
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut heap = INPUTARG_INNER_HEAP.lock();
     if let Some(p) = heap.free.pop() {
         return p;
     }
@@ -582,11 +580,7 @@ fn alloc_inputarg_inner() -> std::ptr::NonNull<InputArgInner> {
 }
 
 fn free_inputarg_inner(p: std::ptr::NonNull<InputArgInner>) {
-    INPUTARG_INNER_HEAP
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .free
-        .push(p);
+    INPUTARG_INNER_HEAP.lock().free.push(p);
 }
 
 impl InputArgRc {

@@ -1269,13 +1269,13 @@ struct OpInnerHeap {
 unsafe impl Send for OpInnerHeap {}
 unsafe impl Sync for OpInnerHeap {}
 
-static OP_INNER_HEAP: std::sync::Mutex<OpInnerHeap> = std::sync::Mutex::new(OpInnerHeap {
+static OP_INNER_HEAP: parking_lot::Mutex<OpInnerHeap> = parking_lot::Mutex::new(OpInnerHeap {
     chunks: Vec::new(),
     free: Vec::new(),
 });
 
 fn alloc_op_inner() -> std::ptr::NonNull<OpInner> {
-    let mut heap = OP_INNER_HEAP.lock().unwrap_or_else(|e| e.into_inner());
+    let mut heap = OP_INNER_HEAP.lock();
     if let Some(p) = heap.free.pop() {
         return p;
     }
@@ -1294,11 +1294,7 @@ fn alloc_op_inner() -> std::ptr::NonNull<OpInner> {
 }
 
 fn free_op_inner(p: std::ptr::NonNull<OpInner>) {
-    OP_INNER_HEAP
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .free
-        .push(p);
+    OP_INNER_HEAP.lock().free.push(p);
 }
 
 /// `GuardResOp` extra lives on the ResOperation in the nursery upstream.
@@ -1335,13 +1331,13 @@ struct ExtraHeap {
 unsafe impl Send for ExtraHeap {}
 unsafe impl Sync for ExtraHeap {}
 
-static EXTRA_HEAP: std::sync::Mutex<ExtraHeap> = std::sync::Mutex::new(ExtraHeap {
+static EXTRA_HEAP: parking_lot::Mutex<ExtraHeap> = parking_lot::Mutex::new(ExtraHeap {
     chunks: Vec::new(),
     free: Vec::new(),
 });
 
 fn extra_slot() -> *mut OpKindExtra {
-    let mut heap = EXTRA_HEAP.lock().unwrap_or_else(|e| e.into_inner());
+    let mut heap = EXTRA_HEAP.lock();
     if let Some(p) = heap.free.pop() {
         return p;
     }
@@ -1366,11 +1362,7 @@ fn alloc_extra(e: OpKindExtra) -> *mut OpKindExtra {
 }
 
 fn release_extra_slot(p: *mut OpKindExtra) {
-    EXTRA_HEAP
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .free
-        .push(p);
+    EXTRA_HEAP.lock().free.push(p);
 }
 
 fn drop_extra(p: *mut OpKindExtra) {
@@ -1390,13 +1382,13 @@ struct BothHeap {
 unsafe impl Send for BothHeap {}
 unsafe impl Sync for BothHeap {}
 
-static BOTH_HEAP: std::sync::Mutex<BothHeap> = std::sync::Mutex::new(BothHeap {
+static BOTH_HEAP: parking_lot::Mutex<BothHeap> = parking_lot::Mutex::new(BothHeap {
     chunks: Vec::new(),
     free: Vec::new(),
 });
 
 fn both_slot() -> *mut BothPayload {
-    let mut heap = BOTH_HEAP.lock().unwrap_or_else(|e| e.into_inner());
+    let mut heap = BOTH_HEAP.lock();
     if let Some(p) = heap.free.pop() {
         return p;
     }
@@ -1421,11 +1413,7 @@ fn alloc_both(b: BothPayload) -> *mut BothPayload {
 }
 
 fn release_both_slot(p: *mut BothPayload) {
-    BOTH_HEAP
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .free
-        .push(p);
+    BOTH_HEAP.lock().free.push(p);
 }
 
 fn drop_both(p: *mut BothPayload) {
@@ -1592,11 +1580,11 @@ struct FailArgHeap {
 unsafe impl Send for FailArgHeap {}
 unsafe impl Sync for FailArgHeap {}
 
-static FAILARG8_HEAP: std::sync::Mutex<FailArgHeap> = std::sync::Mutex::new(FailArgHeap {
+static FAILARG8_HEAP: parking_lot::Mutex<FailArgHeap> = parking_lot::Mutex::new(FailArgHeap {
     chunks: Vec::new(),
     free: Vec::new(),
 });
-static FAILARG16_HEAP: std::sync::Mutex<FailArgHeap> = std::sync::Mutex::new(FailArgHeap {
+static FAILARG16_HEAP: parking_lot::Mutex<FailArgHeap> = parking_lot::Mutex::new(FailArgHeap {
     chunks: Vec::new(),
     free: Vec::new(),
 });
@@ -1609,8 +1597,8 @@ fn failarg_data(h: *mut FailArgHeader) -> *mut Operand {
     unsafe { (h as *mut u8).add(std::mem::size_of::<FailArgHeader>()) as *mut Operand }
 }
 
-fn alloc_failarg_class(heap: &std::sync::Mutex<FailArgHeap>, cap: usize) -> *mut FailArgHeader {
-    let mut heap = heap.lock().unwrap_or_else(|e| e.into_inner());
+fn alloc_failarg_class(heap: &parking_lot::Mutex<FailArgHeap>, cap: usize) -> *mut FailArgHeader {
+    let mut heap = heap.lock();
     if let Some(p) = heap.free.pop() {
         return p;
     }
@@ -1685,17 +1673,9 @@ fn release_failargs(h: *mut FailArgHeader) {
             data.add(i).drop_in_place();
         }
         if cap <= FAILARG_SMALL {
-            FAILARG8_HEAP
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .free
-                .push(h);
+            FAILARG8_HEAP.lock().free.push(h);
         } else if cap <= FAILARG_LARGE {
-            FAILARG16_HEAP
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .free
-                .push(h);
+            FAILARG16_HEAP.lock().free.push(h);
         } else {
             let layout = std::alloc::Layout::from_size_align(failarg_slot_size(cap), 8)
                 .expect("fail_args overflow slot");
@@ -1992,7 +1972,7 @@ fn unpack_op_pos(packed: u64) -> OpRef {
 
 #[cold]
 fn intern_overflow_pos(r: OpRef) -> u32 {
-    let mut slab = OVERFLOW_POS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut slab = OVERFLOW_POS.lock();
     let idx = u32::try_from(slab.len()).expect("Op.pos overflow slab exhausted");
     slab.push(r);
     idx
@@ -2000,35 +1980,31 @@ fn intern_overflow_pos(r: OpRef) -> u32 {
 
 #[cold]
 fn overflow_pos(idx: u32) -> OpRef {
-    let slab = OVERFLOW_POS.lock().unwrap_or_else(|e| e.into_inner());
+    let slab = OVERFLOW_POS.lock();
     slab[idx as usize]
 }
 
-static OVERFLOW_POS: std::sync::Mutex<Vec<OpRef>> = std::sync::Mutex::new(Vec::new());
+static OVERFLOW_POS: parking_lot::Mutex<Vec<OpRef>> = parking_lot::Mutex::new(Vec::new());
 
 /// Full fail-arg type lists that do not fit in [`GuardExtra::types`].
 /// Entries are leaked slices so `fail_arg_types` can return them after
 /// the lock drops.
-static FAIL_ARG_TYPES_OVERFLOW: std::sync::Mutex<Vec<&'static [Type]>> =
-    std::sync::Mutex::new(Vec::new());
+static FAIL_ARG_TYPES_OVERFLOW: parking_lot::Mutex<Vec<&'static [Type]>> =
+    parking_lot::Mutex::new(Vec::new());
 
 const FAIL_ARG_TYPES_INLINE: usize = 4;
 const FAIL_ARG_TYPES_HEAP: i8 = -2;
 
 fn intern_fail_arg_types(types: &[Type]) -> u32 {
     let leaked: &'static [Type] = Box::leak(types.to_vec().into_boxed_slice());
-    let mut slab = FAIL_ARG_TYPES_OVERFLOW
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut slab = FAIL_ARG_TYPES_OVERFLOW.lock();
     let idx = u32::try_from(slab.len()).expect("fail-arg types overflow slab exhausted");
     slab.push(leaked);
     idx
 }
 
 fn overflow_fail_arg_types(idx: u32) -> &'static [Type] {
-    let slab = FAIL_ARG_TYPES_OVERFLOW
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let slab = FAIL_ARG_TYPES_OVERFLOW.lock();
     slab[idx as usize]
 }
 
@@ -2109,13 +2085,13 @@ struct Arg32Heap {
 unsafe impl Send for Arg32Heap {}
 unsafe impl Sync for Arg32Heap {}
 
-static ARG32_HEAP: std::sync::Mutex<Arg32Heap> = std::sync::Mutex::new(Arg32Heap {
+static ARG32_HEAP: parking_lot::Mutex<Arg32Heap> = parking_lot::Mutex::new(Arg32Heap {
     chunks: Vec::new(),
     free: Vec::new(),
 });
 
 fn alloc_arg32() -> *mut Operand {
-    let mut heap = ARG32_HEAP.lock().unwrap_or_else(|e| e.into_inner());
+    let mut heap = ARG32_HEAP.lock();
     if let Some(p) = heap.free.pop() {
         return p;
     }
@@ -2135,11 +2111,7 @@ fn alloc_arg32() -> *mut Operand {
 }
 
 fn free_arg32(p: *mut Operand) {
-    ARG32_HEAP
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .free
-        .push(p);
+    ARG32_HEAP.lock().free.push(p);
 }
 
 /// Packed `N_aryOp._args`. Two `Operand`s are 16 B; the length lives on
@@ -2367,13 +2339,13 @@ struct Slot16Heap {
 unsafe impl Send for Slot16Heap {}
 unsafe impl Sync for Slot16Heap {}
 
-static SLOT16_HEAP: std::sync::Mutex<Slot16Heap> = std::sync::Mutex::new(Slot16Heap {
+static SLOT16_HEAP: parking_lot::Mutex<Slot16Heap> = parking_lot::Mutex::new(Slot16Heap {
     chunks: Vec::new(),
     free: Vec::new(),
 });
 
 fn alloc_slot16() -> *mut u8 {
-    let mut heap = SLOT16_HEAP.lock().unwrap_or_else(|e| e.into_inner());
+    let mut heap = SLOT16_HEAP.lock();
     if let Some(p) = heap.free.pop() {
         return p;
     }
@@ -2393,11 +2365,7 @@ fn alloc_slot16() -> *mut u8 {
 }
 
 fn free_slot16(p: *mut u8) {
-    SLOT16_HEAP
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .free
-        .push(p);
+    SLOT16_HEAP.lock().free.push(p);
 }
 
 fn alloc_thin_stamp(inner: u64, stamp: u32) -> *mut ThinStamp {
@@ -2464,9 +2432,9 @@ struct ThinStampedTable {
     index: rustc_hash::FxHashMap<ThinStamped, usize>,
 }
 
-static THIN_STAMPED: std::sync::LazyLock<std::sync::Mutex<ThinStampedTable>> =
+static THIN_STAMPED: std::sync::LazyLock<parking_lot::Mutex<ThinStampedTable>> =
     std::sync::LazyLock::new(|| {
-        std::sync::Mutex::new(ThinStampedTable {
+        parking_lot::Mutex::new(ThinStampedTable {
             len: 0,
             index: rustc_hash::FxHashMap::default(),
         })
@@ -2483,7 +2451,7 @@ static THIN_STAMPED_SLOTS: [std::sync::OnceLock<ThinStamped>; THIN_STAMPED_SLOT_
 static DESCR_VTABLE_SLOTS: [std::sync::atomic::AtomicUsize; 256] =
     [const { std::sync::atomic::AtomicUsize::new(0) }; 256];
 static DESCR_VTABLE_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-static DESCR_VTABLE_INSERT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static DESCR_VTABLE_INSERT: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 fn find_descr_vtable(vtable: usize, n: usize) -> Option<u8> {
     DESCR_VTABLE_SLOTS[..n]
@@ -2497,9 +2465,7 @@ fn intern_descr_vtable(vtable: usize) -> Option<u8> {
     if let Some(id) = find_descr_vtable(vtable, n) {
         return Some(id);
     }
-    let _guard = DESCR_VTABLE_INSERT
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _guard = DESCR_VTABLE_INSERT.lock();
     let n = DESCR_VTABLE_LEN.load(std::sync::atomic::Ordering::Acquire);
     if let Some(id) = find_descr_vtable(vtable, n) {
         return Some(id);
@@ -2611,7 +2577,7 @@ fn intern_thin_stamped_on(
 }
 
 fn intern_thin_stamped(vtable: u8, stamp: u32) -> Option<u64> {
-    let mut v = THIN_STAMPED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut v = THIN_STAMPED.lock();
     intern_thin_stamped_on(
         &mut v,
         THIN_STAMPED_ID_LIMIT as usize,
