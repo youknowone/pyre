@@ -50,10 +50,6 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("_ctypes", module::_ctypes::init);
     pyre_interpreter::importing::register_builtin_module("_bz2", module::_bz2::init);
     pyre_interpreter::importing::register_builtin_module("_csv", module::_csv::init);
-    pyre_interpreter::importing::register_builtin_module(
-        "_contextvars",
-        module::_contextvars::init,
-    );
     pyre_interpreter::importing::register_builtin_module("_functools", module::_functools::init);
     pyre_interpreter::importing::register_builtin_module("_codecs_cn", module::_codecs_cn::init);
     pyre_interpreter::importing::register_builtin_module("_codecs_hk", module::_codecs_hk::init);
@@ -121,7 +117,6 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("_uuid", module::_uuid::init);
     #[cfg(target_os = "macos")]
     pyre_interpreter::importing::register_builtin_module("_scproxy", module::_scproxy::init);
-    pyre_interpreter::importing::register_builtin_module("atexit", module::atexit::init);
     pyre_interpreter::importing::register_builtin_module("binascii", module::binascii::init);
     pyre_interpreter::importing::register_builtin_module("cmath", module::cmath::init);
     pyre_interpreter::importing::register_builtin_module("errno", module::errno::init);
