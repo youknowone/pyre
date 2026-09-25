@@ -320,7 +320,8 @@ configuration.
 `MAJIT_MIR_FRAMESTATE_STRICT`, `PYRE_NO_JD1`, `MAJIT_NO_UNROLL`,
 `PYRE_PCMAP_AFTERRESIDUAL_AUDIT`, `PYRE_PCMAP_CONTAINING_AUDIT`,
 `PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT`, `PYRE_PCMAP_RESIDUAL_CENSUS`,
-`MAJIT_PORTAL_RCA`, `PYRE_PORTAL_METATRACE`, `PYRE_PROBE_BH_STARTUP`,
+`MAJIT_PORTAL_RCA`, `PYRE_PORTAL_INTERPRET`, `PYRE_PORTAL_METATRACE`,
+`PYRE_PROBE_BH_STARTUP`,
 `PYRE_PROBE_SNAPSHOT`,
 `MAJIT_PROBE_SUBSCR`, `MAJIT_PROFILE_PIPELINE`,
 `PYRE_RERAISE_DIAG`, `MAJIT_SIZE_SHELL_OWNERS`, `PYRE_SNAPSHOT_DIAG`,
@@ -392,6 +393,13 @@ native portal; an incomplete generated instruction is a failed probe, not
 permission to replay its Python opcode. Terminal-return and compiled-exit
 coverage are still prerequisites for enabling this path in ordinary warmstate.
 It is unset by default and retires when that migration completes.
+
+`PYRE_PORTAL_INTERPRET` makes `compile_and_run_once` trace an admitted loop by
+running `MetaInterp::interpret` over the build-time portal jitcode (the
+`pyjitpl.py _compile_and_run_once` shape) instead of the bytecode walker. An
+abort blackholes the live framestack to the end of the portal iteration. It is
+unset by default; the walker stays the default path until the interpret path
+passes the synthetic suite, and the gate retires with the walker.
 
 `PYRE_LOOP_CENSUS` prints one `[loop-census] <arm> <name>` line per compiled
 trace, naming it through `get_printable_location` — the JitDriver green-key

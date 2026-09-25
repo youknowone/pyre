@@ -234,6 +234,11 @@ pub fn install_current_frame_tls_only(frame: &mut PyFrame) -> CurrentFrameGuard 
 /// Pushing the frame onto the shadow stack lets the root walker forward it in
 /// place during the collection; `live()` reads the forwarded pointer back.
 /// This mirrors the JIT eval layer's `FrameRoot`.
+///
+/// The JIT models the anchor as its depth word. `#[repr(transparent)]` is
+/// that declaration: the only sized field is `depth`, and a borrow of the
+/// anchor is that word.
+#[repr(transparent)]
 pub struct FrameAnchor {
     depth: usize,
     /// The shadow stack is per-thread, so a depth taken on one thread names a
@@ -271,25 +276,9 @@ impl FrameAnchor {
 
     /// Read the anchored frame back out of its shadow-stack slot.
     ///
-    /// Opaque to the tracer for the same reason `new` is, arrived at
-    /// differently: `new`'s aggregate return keeps it out of inlining on its
-    /// own, while this one returns a single word and would otherwise be
-    /// inlined. An inlined body is wrong here. `front::mir` aliases an
-    /// `Rvalue::Ref` over a bare local to that local's own Variable without
-    /// emitting an address-of, so `&self` arrives as the one-word anchor's
-    /// VALUE — the depth — and the inlined body's `getfield_gc_i` on
-    /// `FrameAnchor.depth` reads that depth as an address. A walk of
-    /// `push_anchored` faulted on exactly that, at the depth itself
-    /// (`KERN_INVALID_ADDRESS at 0x9`, offset 0 of a one-field struct).
-    /// `frame_anchor_live_method_jit_abi` is the spelling that reconstructs
-    /// the anchor from the word, and it is only reachable while this stays a
-    /// residual.
-    ///
-    /// No effect information is lost by closing it: the whole body is a call
-    /// to `frame_anchor_live`, which is `dont_look_inside` already, so the
-    /// wrapper's graph could never have told the optimizer more than its
-    /// callee's does.
-    #[majit_macros::dont_look_inside]
+    /// The anchor is its `depth` word, and a borrow of that by-value struct
+    /// is the same word, so `self.depth` is `depth`. The body is the
+    /// `dont_look_inside` read `frame_anchor_live`.
     pub fn live(&self) -> *mut PyFrame {
         frame_anchor_live(self.depth)
     }
@@ -5051,6 +5040,10 @@ impl OpcodeStepExecutor for PyFrame {
         let anchor = FrameAnchor::new(self);
         match crate::baseobjspace::getitem(mapping, key) {
             Ok(value) => {
+                // The mapping may be the raw type namespace.  `setdictvalue`
+                // parks an `ObjectMutableCell` there; the loaded name is the
+                // payload.
+                let value = unsafe { pyre_object::celldict::unwrap_cell(value) };
                 return Self::push_anchored(&anchor, value);
             }
             Err(err) if matches!(err.kind, PyErrorKind::KeyError) => {}
@@ -5074,6 +5067,10 @@ impl OpcodeStepExecutor for PyFrame {
         let anchor = FrameAnchor::new(self);
         match crate::baseobjspace::getitem(mapping, key) {
             Ok(value) => {
+                // The mapping is the raw type namespace (`__classdictcell__`).
+                // An `ObjectMutableCell` parked by `setdictvalue` must not
+                // surface as the bound.
+                let value = unsafe { pyre_object::celldict::unwrap_cell(value) };
                 return Self::push_anchored(&anchor, value);
             }
             Err(err) if matches!(err.kind, PyErrorKind::KeyError) => {}

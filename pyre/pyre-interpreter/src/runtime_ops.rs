@@ -1337,7 +1337,10 @@ pub fn type_dict_has_storage(cls: PyObjectRef) -> bool {
     !type_dict_ptr(cls).is_null()
 }
 
-pub fn type_dict_lookup(cls: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+/// Raw namespace read (`_getdictvalue_no_unwrapping`): the stored object,
+/// which may be a `MutableCell`.  Callers that run after type creation and
+/// hand the result to Python use [`type_dict_lookup`] instead.
+pub fn type_dict_lookup_no_unwrapping(cls: PyObjectRef, name: &str) -> Option<PyObjectRef> {
     let dict = type_dict_ptr(cls);
     if dict.is_null() {
         return None;
@@ -1346,12 +1349,26 @@ pub fn type_dict_lookup(cls: PyObjectRef, name: &str) -> Option<PyObjectRef> {
     if value.is_null() { None } else { Some(value) }
 }
 
-pub fn type_dict_lookup_wtf8(cls: PyObjectRef, name: &Wtf8) -> Option<PyObjectRef> {
+pub fn type_dict_lookup_wtf8_no_unwrapping(cls: PyObjectRef, name: &Wtf8) -> Option<PyObjectRef> {
     let dict = type_dict_ptr(cls);
     if dict.is_null() {
         return None;
     }
     let value = unsafe { pyre_object::w_dict_getitem_wtf8(dict as PyObjectRef, name)? };
+    if value.is_null() { None } else { Some(value) }
+}
+
+/// `W_TypeObject.getdictvalue`: the namespace entry with a `MutableCell`
+/// unwrapped.  The raw form is [`type_dict_lookup_no_unwrapping`].
+pub fn type_dict_lookup(cls: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+    let value = type_dict_lookup_no_unwrapping(cls, name)?;
+    let value = unsafe { pyre_object::celldict::unwrap_cell(value) };
+    if value.is_null() { None } else { Some(value) }
+}
+
+pub fn type_dict_lookup_wtf8(cls: PyObjectRef, name: &Wtf8) -> Option<PyObjectRef> {
+    let value = type_dict_lookup_wtf8_no_unwrapping(cls, name)?;
+    let value = unsafe { pyre_object::celldict::unwrap_cell(value) };
     if value.is_null() { None } else { Some(value) }
 }
 

@@ -2436,6 +2436,13 @@ static W_OBJECT_MUTABLE_CELL_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyL
     )
 });
 
+/// `typeobject.py ObjectMutableCell.w_value`. Mutable: `write_cell` rewrites
+/// the payload in place and does not move `_version_tag`. The cell pointer is
+/// the constant; this field is a live `getfield`.
+pub fn object_mutable_cell_value_descr() -> DescrRef {
+    field_descr_from_group(&W_OBJECT_MUTABLE_CELL_DESCR_GROUP, 0)
+}
+
 /// `nestedscope.py Cell` field layout — `contents`, `family`.
 ///
 /// `contents` is MUTABLE: `w_cell_set` rewrites it in place on every rebinding

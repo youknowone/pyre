@@ -1757,6 +1757,13 @@ pub unsafe fn load_attr_fast_path(
     if version_tag == 0 {
         return None;
     }
+    // `classify_attr` settles the attrkind from the type-level entry and the
+    // fold bakes that verdict.  A `MutableCell` entry is one `write_cell`
+    // rewrites in place without moving `version_tag`, so a rebind from a plain
+    // value to a data descriptor would leave the classification stale.
+    if unsafe { crate::baseobjspace::type_attr_stored_is_cell(w_type, Wtf8::new(name)) } {
+        return None;
+    }
     // mapdict.py:1504-1524 `_pure_lookup_where_with_method_cache` + classify.
     let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) };
     let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, false) };
@@ -1837,6 +1844,14 @@ pub unsafe fn class_attr_fast_path(
     }
     let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(w_type) };
     if version_tag == 0 {
+        return None;
+    }
+    // The LOAD_ATTR fold bakes `w_descr` as a constant under this version
+    // pin.  Decline when the namespace holds a `MutableCell`: the pin does
+    // not move on an in-place cell write, so the baked value would be stale.
+    if unsafe {
+        crate::baseobjspace::type_attr_stored_is_cell(w_type, rustpython_wtf8::Wtf8::new(name))
+    } {
         return None;
     }
     let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) }?;
@@ -1932,6 +1947,14 @@ pub unsafe fn getattr_hook_fast_path(
     name: &str,
 ) -> Option<(PyObjectRef, u64, MapRef, PyObjectRef)> {
     let (w_type, version_tag, map) = unsafe { getattr_resolves_nowhere(w_obj, name) }?;
+    if unsafe {
+        crate::baseobjspace::type_attr_stored_is_cell(
+            w_type,
+            rustpython_wtf8::Wtf8::new("__getattr__"),
+        )
+    } {
+        return None;
+    }
     let w_getattr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, "__getattr__") }?;
     Some((w_type, version_tag, map, w_getattr))
 }
@@ -1969,6 +1992,14 @@ pub unsafe fn getattribute_hook_fast_path(
     }
     let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(w_type) };
     if version_tag == 0 {
+        return None;
+    }
+    if unsafe {
+        crate::baseobjspace::type_attr_stored_is_cell(
+            w_type,
+            rustpython_wtf8::Wtf8::new("__getattribute__"),
+        )
+    } {
         return None;
     }
     let w_getattribute = unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }?;
@@ -2112,6 +2143,13 @@ pub unsafe fn instance_dict_attr_fast_path(
     if version_tag == 0 {
         return None;
     }
+    // `classify_attr` settles the attrkind from the type-level entry and the
+    // fold bakes that verdict.  A `MutableCell` entry is one `write_cell`
+    // rewrites in place without moving `version_tag`, so a rebind from a plain
+    // value to a data descriptor would leave the classification stale.
+    if unsafe { crate::baseobjspace::type_attr_stored_is_cell(w_type, Wtf8::new(name)) } {
+        return None;
+    }
     // mapdict.py:1504-1526 `_pure_lookup_where_with_method_cache` + classify.
     let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) };
     let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, false) };
@@ -2187,6 +2225,9 @@ unsafe fn property_descr_fast_path_wtf8(
     }
     let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(w_type) };
     if version_tag == 0 {
+        return None;
+    }
+    if unsafe { crate::baseobjspace::type_attr_stored_is_cell(w_type, name) } {
         return None;
     }
     let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where_wtf8(w_type, name) }?;
@@ -2285,6 +2326,11 @@ pub unsafe fn data_descriptor_get_fast_path(
     if version_tag == 0 {
         return None;
     }
+    if unsafe {
+        crate::baseobjspace::type_attr_stored_is_cell(w_type, rustpython_wtf8::Wtf8::new(name))
+    } {
+        return None;
+    }
     let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) }?;
     if !unsafe { crate::baseobjspace::is_data_descr(w_descr) } {
         return None;
@@ -2296,6 +2342,11 @@ pub unsafe fn data_descriptor_get_fast_path(
     }
     let descr_map = unsafe { mapdict_map_or_null(w_descr) };
     if descr_map.is_null() {
+        return None;
+    }
+    // Baked by identity under `descr_version_tag`, which an in-place cell
+    // write does not move.
+    if unsafe { crate::baseobjspace::type_attr_stored_is_cell(descr_type, Wtf8::new("__get__")) } {
         return None;
     }
     let w_get = unsafe { crate::baseobjspace::lookup_in_type_where(descr_type, "__get__") }?;
@@ -2363,6 +2414,13 @@ pub unsafe fn load_attr_unboxed_fast_path(
     // mapdict.py:1500-1501 `version_tag = w_type.version_tag(); if is not None:`.
     let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(w_type) };
     if version_tag == 0 {
+        return None;
+    }
+    // `classify_attr` settles the attrkind from the type-level entry and the
+    // fold bakes that verdict.  A `MutableCell` entry is one `write_cell`
+    // rewrites in place without moving `version_tag`, so a rebind from a plain
+    // value to a data descriptor would leave the classification stale.
+    if unsafe { crate::baseobjspace::type_attr_stored_is_cell(w_type, Wtf8::new(name)) } {
         return None;
     }
     // mapdict.py:1504-1524 `_pure_lookup_where_with_method_cache` + classify.
@@ -2440,6 +2498,13 @@ pub unsafe fn store_attr_unboxed_fast_path(
     if version_tag == 0 {
         return None;
     }
+    // `classify_attr` settles the attrkind from the type-level entry and the
+    // fold bakes that verdict.  A `MutableCell` entry is one `write_cell`
+    // rewrites in place without moving `version_tag`, so a rebind from a plain
+    // value to a data descriptor would leave the classification stale.
+    if unsafe { crate::baseobjspace::type_attr_stored_is_cell(w_type, Wtf8::new(name)) } {
+        return None;
+    }
     // mapdict.py:1618-1627 `_pure_lookup_where_with_method_cache` + classify.
     let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) };
     let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, true) };
@@ -2501,6 +2566,13 @@ pub unsafe fn store_attr_boxed_fast_path(
     // mapdict.py:1616 `if version_tag is not None:`.
     let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(w_type) };
     if version_tag == 0 {
+        return None;
+    }
+    // `classify_attr` settles the attrkind from the type-level entry and the
+    // fold bakes that verdict.  A `MutableCell` entry is one `write_cell`
+    // rewrites in place without moving `version_tag`, so a rebind from a plain
+    // value to a data descriptor would leave the classification stale.
+    if unsafe { crate::baseobjspace::type_attr_stored_is_cell(w_type, Wtf8::new(name)) } {
         return None;
     }
     // mapdict.py:1618-1627 `_pure_lookup_where_with_method_cache` + classify.
@@ -2610,6 +2682,13 @@ pub unsafe fn store_attr_add_fast_path(
     // mapdict.py:1616 `if version_tag is not None:`.
     let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(w_type) };
     if version_tag == 0 {
+        return None;
+    }
+    // `classify_attr` settles the attrkind from the type-level entry and the
+    // fold bakes that verdict.  A `MutableCell` entry is one `write_cell`
+    // rewrites in place without moving `version_tag`, so a rebind from a plain
+    // value to a data descriptor would leave the classification stale.
+    if unsafe { crate::baseobjspace::type_attr_stored_is_cell(w_type, Wtf8::new(name)) } {
         return None;
     }
     // mapdict.py:1618-1627 `_pure_lookup_where_with_method_cache` + classify.

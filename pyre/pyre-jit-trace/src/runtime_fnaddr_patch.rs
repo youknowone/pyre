@@ -36,6 +36,28 @@ use std::sync::{Arc, LazyLock};
 
 use majit_translate::jitcode::JitCode;
 
+/// Path recorded for a `symbolic_fnaddr_for_path` / `symbolic_fnaddr_for_target`
+/// hash. The codewriter's registry lives in the build-script process; this is
+/// that snapshot (`pipeline.symbolic_fnaddr_paths`).
+pub fn symbolic_fnaddr_path(fnaddr: i64) -> Option<&'static str> {
+    static TABLE: LazyLock<Vec<(i64, String)>> = LazyLock::new(|| {
+        const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/symbolic_fnaddr_paths.bin"));
+        let mut entries: Vec<(i64, String)> = bincode::deserialize(BYTES).unwrap_or_else(|e| {
+            panic!(
+                "pyre-jit-trace: failed to deserialize symbolic_fnaddr_paths.bin ({} bytes): {e}",
+                BYTES.len(),
+            )
+        });
+        entries.sort_by_key(|entry| entry.0);
+        entries
+    });
+    let table: &'static [(i64, String)] = &TABLE;
+    table
+        .binary_search_by_key(&fnaddr, |entry| entry.0)
+        .ok()
+        .map(|index| table[index].1.as_str())
+}
+
 /// Build-time `(path, build_fnaddr)` snapshot — bincoded by
 /// `pyre-jit-trace/build.rs` from
 /// `pyre_interpreter::jit_trace_fnaddrs()` immediately before the

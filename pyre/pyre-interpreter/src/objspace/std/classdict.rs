@@ -249,10 +249,17 @@ fn type_namespace(w_type: PyObjectRef) -> PyObjectRef {
 }
 
 /// `W_TypeObject.setdictvalue`.
-unsafe fn type_setdictvalue_wtf8(
+///
+/// When the type has a version tag, `write_cell` (`typeobject.py`) either
+/// updates an existing `MutableCell` in place and returns `None`, or returns
+/// the object the namespace must store (the raw value on the first write, a
+/// fresh `ObjectMutableCell` or `IntMutableCell` once the previous value
+/// cannot absorb the new one).  `None` skips `mutated()`, so `_version_tag`
+/// does not move.  A type with no tag stores the raw value and always mutates.
+pub(crate) unsafe fn type_setdictvalue_wtf8(
     w_type: PyObjectRef,
     name: &Wtf8,
-    w_value: PyObjectRef,
+    mut w_value: PyObjectRef,
 ) -> Result<(), PyError> {
     if !pyre_object::w_type_is_heaptype(w_type) {
         return Err(PyError::type_error(format!(
@@ -261,11 +268,27 @@ unsafe fn type_setdictvalue_wtf8(
             pyre_object::w_type_get_name(w_type),
         )));
     }
-    // Upstream `setdictvalue` first offers the store to `write_cell` and
-    // returns without `mutated` when the existing MutableCell absorbs it.
-    // Pyre's type dicts hold raw values everywhere (cells are module-dict
-    // only; `object_setattr`'s type arm stores raw too), so the read-side
-    // `unwrap_cell` is a no-op and the cell step has nothing to update.
+    // `version_tag()` is `None` when the field is 0.
+    let version_tag = crate::baseobjspace::w_type_version_tag(w_type);
+    // A type that already has a C mirror publishes this very block through
+    // `tp_dict` (`stamp_tp_dict`), and `PyType_GetDict` hands it back
+    // unchanged.  There is no `unwrap_cell` in front of an extension's
+    // `PyDict_GetItemString`, so such a type keeps the value raw and pays the
+    // `mutated()` every store instead of parking a cell an extension would
+    // read as the attribute.
+    let has_c_mirror = !pyre_object::w_type_get_cpy_ref(w_type).is_null();
+    if version_tag != 0 && !has_c_mirror {
+        // `W_TypeObject.setdictvalue` reads through
+        // `_pure_getdictvalue_no_unwrapping`, which does not unwrap.
+        let w_name = pyre_object::unicodeobject::box_str_constant(name);
+        let raw =
+            crate::baseobjspace::_pure_getdictvalue_no_unwrapping(w_type, w_name, version_tag);
+        let w_curr = if raw.is_null() { None } else { Some(raw) };
+        match pyre_object::celldict::write_cell(w_curr, w_value) {
+            None => return Ok(()),
+            Some(stored) => w_value = stored,
+        }
+    }
     crate::baseobjspace::mutated(w_type, name.as_str().ok());
     crate::type_dict_store_wtf8(w_type, name, w_value);
     Ok(())

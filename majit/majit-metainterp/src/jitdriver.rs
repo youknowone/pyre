@@ -2882,7 +2882,18 @@ impl<S: JitState> JitDriver<S> {
     /// whose per-element slots have no sym-side collector.  No frontend
     /// currently declares one — the supported loop-carried form is
     /// `[.. ; virt]`.
+    pub fn take_interpret_bail_residual(&mut self) -> Option<String> {
+        self.meta.interpret_bail_residual.take()
+    }
+
+    pub fn interpret_abort_reason_label(&self) -> Option<&'static str> {
+        self.meta
+            .last_interpret_abort_reason
+            .map(abort_counter_name)
+    }
+
     pub fn run_pending_abort_blackhole(&mut self, state: &mut S, env: &S::Env) -> Option<usize> {
+        self.meta.interpret_bail_residual = None;
         let pending = self.meta.pending_abort_blackhole.take()?;
         let PendingAbortBlackhole {
             framestack,
@@ -2917,12 +2928,18 @@ impl<S: JitState> JitDriver<S> {
             state.writeback_virt_array_state_fields_from_values(&values);
             self.meta.single_pass_virt_array_values = None;
         }
-        // `jitdriver.rs seed_deopt_vinfo_ptr`: a state-field machine's
-        // `bh_clear_vable_token` is inert, so a non-null vinfo is safe and lets
-        // mid-body vable-array opcodes resolve; a real heap virtualizable
-        // (`token_offset > 0`, e.g. PyFrame) keeps the null-vinfo resume
-        // contract and reaches the chain with `virtualizable_info` unset.
-        let vinfo_ptr = seed_deopt_vinfo_ptr(self.meta.virtualizable_info());
+        // Guard-failure resume still uses `seed_deopt_vinfo_ptr` (null for a
+        // heap virtualizable). This drive re-executes the aborted opcode,
+        // including vable ops inside an inlined callee. Upstream reads that
+        // handle from `fielddescr.get_vinfo()` (`blackhole.py`
+        // `bhimpl_getfield_vable_*`), which every interpreter can see.
+        // pyre keeps it on the interpreter, so the chain — and any child
+        // `interpret_unresolved_inline_call` clones from it — must carry the
+        // driver's `virtualizable_info` rather than the null resume seed.
+        let vinfo_held = self.meta.virtualizable_info().cloned();
+        let vinfo_ptr = vinfo_held
+            .as_ref()
+            .map_or(std::ptr::null(), std::sync::Arc::as_ptr);
         let root = framestack.frames.first_mut()?;
         if let Some(slot) = layout.vable_identity_slot()
             && slot < root.int_values.len()
@@ -2997,16 +3014,9 @@ impl<S: JitState> JitDriver<S> {
             let Some(terminal) = terminal.as_ref() else {
                 return;
             };
-            let int_base = layout.int_scalar_base.min(terminal.registers_i.len());
-            let ref_base = layout.ref_scalar_base.min(terminal.registers_r.len());
-            let float_base = layout.float_scalar_base.min(terminal.registers_f.len());
+            let (ints, refs, floats) = abort_blackhole_restore_banks(&layout, terminal);
             let meta = S::build_meta(state, resume_pc, env);
-            state.restore_banked3(
-                &meta,
-                &terminal.registers_i[int_base..],
-                &terminal.registers_r[ref_base..],
-                &terminal.registers_f[float_base..],
-            );
+            state.restore_banked3(&meta, ints, refs, floats);
             state.recover_after_compiled_run();
         };
         match outcome {
@@ -3034,7 +3044,19 @@ impl<S: JitState> JitDriver<S> {
                     return Some(usize::MAX);
                 };
                 let resume_pc = resume_pc as usize;
-                writeback(state, resume_pc);
+                // `iirrr` portal registers pack greens in front of reds
+                // (`next_instr`, `is_being_profiled`, then `pycode`). A
+                // state with no scalar identity slots has `int_scalar_base`
+                // 0, so the int bank's first word is that green pc.
+                // `restore` reads `values[0]` as the red frame.
+                // `ContinueRunningNormally` already split the colors
+                // (`warmspot.py handle_jitexception`); re-enter with the
+                // reds. A state-field machine keeps the identity-slot
+                // slice: its reds live past `int_scalar_base`.
+                let meta = S::build_meta(state, resume_pc, env);
+                let (ints, refs, floats) = crn_restore_banks(&layout, terminal.as_ref(), args);
+                state.restore_banked3(&meta, ints, refs, floats);
+                state.recover_after_compiled_run();
                 Some(resume_pc)
             }
             // The portal itself returned inside the blackhole
@@ -3096,7 +3118,20 @@ impl<S: JitState> JitDriver<S> {
             // aborted opcodes' tails against the real heap, so the `None`
             // source-pc handoff would run them twice.
             crate::jitexc::JitException::BailToInterpreter => {
-                writeback(state, usize::MAX);
+                // The terminal image is the nested jitcode's register
+                // file (e.g. `new` with 5 ints), not the portal
+                // virtualizable (`PyFrame` has 6 scalars). Writing it
+                // back panics in `virt_restore_scalars_raw` and would
+                // smash the live frame residuals already updated.
+                // Leave `state` as the heap left it.
+                // Upstream's blackhole never returns. The interpret
+                // portal panics with this residual instead of rewinding.
+                self.meta.interpret_bail_residual = Some(
+                    terminal
+                        .as_ref()
+                        .and_then(|image| image.bail_residual.clone())
+                        .unwrap_or_else(|| "BailToInterpreter".to_owned()),
+                );
                 self.meta.single_pass_finish = true;
                 Some(usize::MAX)
             }
@@ -5098,23 +5133,53 @@ impl<S: JitState> JitDriver<S> {
                         // sym's state-field image so the `jit_merge_point!` hook can
                         // finish the half-executed opcodes in the blackhole and take
                         // the resume position from the merge point they reach.
-                        let staged = self.meta.trace_ctx().and_then(|ctx| {
-                            let framestack = ctx.aborted_framestack.take()?;
-                            Some((
-                                framestack,
+                        let aborted = self
+                            .meta
+                            .tracing
+                            .as_mut()
+                            .and_then(|ctx| ctx.aborted_framestack.take());
+                        let virt_and_ptr = self.meta.trace_ctx().map(|ctx| {
+                            (
                                 ctx.collect_virtualizable_element_values(),
                                 ctx.virtualizable_heap_ptr().map_or(0, |p| p as i64),
-                            ))
+                            )
                         });
-                        if let (
-                            Some((framestack, virt_array_values, virtualizable_ptr)),
-                            Some(sym),
-                        ) = (staged, self.sym.as_ref())
-                        {
+                        // Standalone walks publish into `aborted_framestack`.
+                        // `MetaInterp::interpret` keeps the same stack on the
+                        // MetaInterp (`pyjitpl.py` `_interpret`).
+                        let staged = aborted
+                            .or_else(|| {
+                                (!self.meta.framestack.is_empty()).then(|| {
+                                    std::mem::replace(
+                                        &mut self.meta.framestack,
+                                        crate::pyjitpl::MIFrameStack::empty(),
+                                    )
+                                })
+                            })
+                            .map(|framestack| {
+                                let (virt_array_values, virtualizable_ptr) =
+                                    virt_and_ptr.unwrap_or((None, 0));
+                                (framestack, virt_array_values, virtualizable_ptr)
+                            });
+                        // `blackhole.py convert_and_run_from_pyjitpl` only
+                        // needs the metainterp framestack. The sym image is
+                        // extra state-field seed for generated machines;
+                        // the Python portal has none, so missing `self.sym`
+                        // must not drop the conversion.
+                        if let Some((framestack, virt_array_values, virtualizable_ptr)) = staged {
+                            let (scalar_values, ref_scalar_values) =
+                                if let Some(sym) = self.sym.as_ref() {
+                                    (
+                                        S::collect_scalar_state_field_values(sym),
+                                        S::collect_ref_scalar_state_field_values(sym),
+                                    )
+                                } else {
+                                    (Vec::new(), Vec::new())
+                                };
                             self.meta.pending_abort_blackhole = Some(PendingAbortBlackhole {
                                 framestack,
-                                scalar_values: S::collect_scalar_state_field_values(sym),
-                                ref_scalar_values: S::collect_ref_scalar_state_field_values(sym),
+                                scalar_values,
+                                ref_scalar_values,
                                 virt_array_values,
                                 virtualizable_ptr,
                                 // `blackhole.py:1811-1814` reads
@@ -10333,6 +10398,68 @@ impl<S: JitState> JitDriver<S> {
     }
 }
 
+/// A jitdriver with no scalar identity slots. The portal is this shape:
+/// its reds are the virtualizable frame and `ec`, not `#[jit_interp]`
+/// scalars, and `state_field_layout` stays the empty default.
+fn layout_has_no_scalar_identity(layout: &crate::blackhole::StateFieldLayout) -> bool {
+    layout.num_scalars == 0
+        && layout.num_ref_scalars == 0
+        && layout.num_float_scalars == 0
+        && layout.num_vable_identity_slots == 0
+        && layout.array_lens.is_empty()
+}
+
+/// `ContinueRunningNormally` restore inputs.
+///
+/// No scalar identity slots: the portal calldescr is `iirrr`, so the
+/// int bank is greens (`next_instr`, `is_being_profiled`) and the ref
+/// bank leads with the green `pycode`. The red frame is
+/// `args.red_ref[0]` (`interp_jit.py` reds `['frame', 'ec']`).
+/// Passing the int bank to `restore` stores the green pc as that frame.
+///
+/// A state-field layout keeps the identity-slot slice of the terminal
+/// register file. `terminal` is absent only when the chain produced no
+/// image; the reds are still the CRN arguments.
+fn crn_restore_banks<'a>(
+    layout: &crate::blackhole::StateFieldLayout,
+    terminal: Option<&'a crate::blackhole::BlackholeTerminalImage>,
+    args: &'a crate::jitexc::ContinueRunningNormallyArgs,
+) -> (&'a [i64], &'a [i64], &'a [i64]) {
+    if layout_has_no_scalar_identity(layout) {
+        return (&args.red_int, &args.red_ref, &args.red_float);
+    }
+    match terminal {
+        Some(terminal) => abort_blackhole_restore_banks(layout, terminal),
+        None => (&args.red_int, &args.red_ref, &args.red_float),
+    }
+}
+
+fn abort_counter_name(reason: i32) -> &'static str {
+    match reason {
+        crate::pyjitpl::counters::ABORT_TOO_LONG => "ABORT_TOO_LONG",
+        crate::pyjitpl::counters::ABORT_BRIDGE => "ABORT_BRIDGE",
+        crate::pyjitpl::counters::ABORT_BAD_LOOP => "ABORT_BAD_LOOP",
+        crate::pyjitpl::counters::ABORT_ESCAPE => "ABORT_ESCAPE",
+        crate::pyjitpl::counters::ABORT_FORCE_QUASIIMMUT => "ABORT_FORCE_QUASIIMMUT",
+        crate::pyjitpl::counters::ABORT_SEGMENTED_TRACE => "ABORT_SEGMENTED_TRACE",
+        _ => "ABORT",
+    }
+}
+
+fn abort_blackhole_restore_banks<'a>(
+    layout: &crate::blackhole::StateFieldLayout,
+    terminal: &'a crate::blackhole::BlackholeTerminalImage,
+) -> (&'a [i64], &'a [i64], &'a [i64]) {
+    let int_base = layout.int_scalar_base.min(terminal.registers_i.len());
+    let ref_base = layout.ref_scalar_base.min(terminal.registers_r.len());
+    let float_base = layout.float_scalar_base.min(terminal.registers_f.len());
+    (
+        &terminal.registers_i[int_base..],
+        &terminal.registers_r[ref_base..],
+        &terminal.registers_f[float_base..],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10369,6 +10496,38 @@ mod tests {
             seed_deopt_vinfo_ptr(Some(&heap_vable)).is_null(),
             "a token_offset>0 heap virtualizable must keep the null-vinfo contract",
         );
+    }
+
+    #[test]
+    fn portal_iirrr_crn_restore_feeds_red_frame_not_green_pc() {
+        use crate::blackhole::{BlackholeTerminalImage, StateFieldLayout};
+        use crate::jitexc::ContinueRunningNormallyArgs;
+
+        let layout = StateFieldLayout::default();
+        let terminal = BlackholeTerminalImage {
+            jitcode_index: 0,
+            registers_i: vec![34, 0],
+            registers_r: vec![0x111, 0x222, 0x333],
+            registers_f: Vec::new(),
+            position: 0,
+            last_opcode_position: 0,
+            abort_permanent_bail: false,
+            bail_residual: None,
+        };
+        let args = ContinueRunningNormallyArgs {
+            green_int: vec![34, 0],
+            green_ref: vec![0x111],
+            red_ref: vec![0xABC0, 0xEC],
+            ..ContinueRunningNormallyArgs::default()
+        };
+        let (ints, refs, floats) = crn_restore_banks(&layout, Some(&terminal), &args);
+        assert!(
+            ints.is_empty(),
+            "green pc must not be the first restored int"
+        );
+        assert_eq!(refs, &[0xABC0, 0xEC]);
+        assert!(floats.is_empty());
+        assert_ne!(refs.first().copied(), Some(34));
     }
 
     #[derive(Default)]
