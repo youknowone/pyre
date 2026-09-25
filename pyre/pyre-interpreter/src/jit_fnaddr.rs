@@ -3515,6 +3515,14 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::pyerror_zero_division_to_exc_object",
         pyerror_zero_division_to_exc_object,
     );
+    let pyerror_value_error_to_exc_object: extern "C" fn(i64) -> i64 =
+        crate::error::__majit_call_target_pyerror_value_error_to_exc_object;
+    cpa1(
+        &mut entries,
+        "pyre_interpreter::error::pyerror_value_error_to_exc_object",
+        "pyre_interpreter::pyerror_value_error_to_exc_object",
+        pyerror_value_error_to_exc_object,
+    );
     // `elidable_cannot_raise` subclass-range check; the trampoline widens its
     // one-word bool return by zero-extension.
     let ll_issubclass: extern "C" fn(i64, i64) -> i64 =
@@ -6361,6 +6369,18 @@ mod tests {
         assert_eq!(
             bindings["pyre_interpreter::pyerror_zero_division_to_exc_object"],
             zd
+        );
+
+        let ve: extern "C" fn(i64) -> i64 =
+            crate::error::__majit_call_target_pyerror_value_error_to_exc_object;
+        let ve = ve as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::error::pyerror_value_error_to_exc_object"],
+            ve
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::pyerror_value_error_to_exc_object"],
+            ve
         );
     }
 

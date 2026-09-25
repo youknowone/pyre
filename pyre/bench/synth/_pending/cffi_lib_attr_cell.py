@@ -1,4 +1,3 @@
-# pyre-check: spec-folds=load_attr_cffi_lib
 # pyre-check: skip-cpython
 # pyre-check: skip-backends=wasm
 # `_cffi_backend` is built into pypy but is not a CPython builtin, and this
@@ -21,9 +20,10 @@
 # is what this file wants. Every leg's wall-clock is dominated by the libffi
 # trampoline pyre still pays per foreign call -- `direct_libffi_call` is
 # unported, so `OS_LIBFFI_CALL` never reaches a dynamic calldescr -- and a
-# ceiling here would therefore gate that hole rather than this arm. `spec-folds`
-# is the gate: an arm that stops firing reads exactly like one nobody wrote a
-# leg for.
+# ceiling here would therefore gate that hole rather than this arm. The
+# `load_attr_cffi_lib` cell fold fired 0 times on the synthetic corpus and
+# was retired; this file stays staged until a descent of
+# `W_LibObject.descr_getattribute` records the same cell read.
 #
 # What the arm does: `lib.<name>` on a `_cffi_backend.Lib` is a dict-first
 # lookup (`lib_obj.py _get_attr` / `W_LibObject.descr_getattribute`), and the

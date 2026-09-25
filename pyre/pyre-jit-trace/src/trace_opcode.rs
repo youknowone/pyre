@@ -16,7 +16,7 @@ use majit_metainterp::{
     CANNOT_RAISE_NO_HEAP_EFFECT_INFO, TraceAction, TraceCtx, default_effect_info,
 };
 
-use pyre_interpreter::bytecode::{BinaryOperator, CodeObject, ComparisonOperator, Instruction};
+use pyre_interpreter::bytecode::{CodeObject, ComparisonOperator, Instruction};
 
 #[allow(dead_code)]
 extern "C" fn trace_function_get_defaults(func: i64) -> i64 {
@@ -265,76 +265,6 @@ use pyre_object::{
 #[allow(dead_code)]
 fn trace_abort_error(reason: &'static str) -> PyError {
     PyError::internal_trace_abort(reason)
-}
-
-/// The elidable `rbigint` payload helper + effect for a walker-specialised
-/// W_LongObject binary op (see [`long_binop_raw_helper`]). The bigint result is
-/// boxed by the caller as a `W_LongObject` unconditionally (`newlong` never
-/// demotes); the shift ops additionally guard that the shift count fits a
-/// machine int, deopting a huge count to the generic leg (which produces the
-/// `space.newint` W_IntObject).
-/// True-divide is NOT here — it returns a float (`CallPureF` + `wrapfloat`), so
-/// it has its own specialisation ([`try_walker_specialize_truediv_op_long`]).
-pub(crate) struct LongBinopSpec {
-    /// Pure `rbigint` op over the two bare `*const BigInt` *payloads*
-    /// `[Ref, Ref] -> Ref`. The walker emits this after a
-    /// immutable `GetfieldGc(value)` on each operand, so the elidable call is pure on
-    /// the immutable bigints (not the wrappers) and the optimizer never
-    /// reorders it ahead of the boxing `setfield_gc` that initializes a fresh
-    /// result wrapper.
-    pub payload_fn: extern "C" fn(i64, i64) -> i64,
-    pub effect: majit_ir::EffectInfo,
-}
-
-/// Map a `BinaryOperator` to its `rbigint` payload helper, or `None` when the
-/// operator is not specialised here (Power → modular/float, TrueDivide → float
-/// fast path, Subscr → non-arithmetic). Every specialised op records `CallPure*`
-/// + a trailing `GuardNoException`: the arithmetic ops (add/sub/mul/and/or/xor)
-/// allocate a new bigint so they are `EF_ELIDABLE_OR_MEMORYERROR` (`call.py:294`,
-/// `cr == "mem"`); the divmod / shift ops also raise (ZeroDivision /
-/// ValueError·Overflow) so they are `EF_ELIDABLE_CAN_RAISE` (`call.py:296`).
-/// Both classes have `check_can_raise()` true, so `pyjitpl.py:2110-2112` emits
-/// the guard. The legacy trait path delegated to the generic residual because
-/// it cannot reuse the authentic boxed result's payload.
-pub(crate) fn long_binop_raw_helper(op: BinaryOperator) -> Option<LongBinopSpec> {
-    use majit_metainterp::{ELIDABLE_EFFECT_INFO, ELIDABLE_OR_MEMERROR_EFFECT_INFO};
-    use pyre_interpreter::objspace::descroperation as desc;
-    use pyre_object::longobject as lo;
-    type PayloadFn = extern "C" fn(i64, i64) -> i64;
-    let (payload_fn, effect): (PayloadFn, _) = match op {
-        BinaryOperator::Add | BinaryOperator::InplaceAdd => {
-            (lo::jit_bigint_add, ELIDABLE_OR_MEMERROR_EFFECT_INFO)
-        }
-        BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => {
-            (lo::jit_bigint_sub, ELIDABLE_OR_MEMERROR_EFFECT_INFO)
-        }
-        BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => {
-            (lo::jit_bigint_mul, ELIDABLE_OR_MEMERROR_EFFECT_INFO)
-        }
-        BinaryOperator::And | BinaryOperator::InplaceAnd => {
-            (lo::jit_bigint_and, ELIDABLE_OR_MEMERROR_EFFECT_INFO)
-        }
-        BinaryOperator::Or | BinaryOperator::InplaceOr => {
-            (lo::jit_bigint_or, ELIDABLE_OR_MEMERROR_EFFECT_INFO)
-        }
-        BinaryOperator::Xor | BinaryOperator::InplaceXor => {
-            (lo::jit_bigint_xor, ELIDABLE_OR_MEMERROR_EFFECT_INFO)
-        }
-        BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide => {
-            (desc::jit_bigint_floordiv, ELIDABLE_EFFECT_INFO)
-        }
-        BinaryOperator::Remainder | BinaryOperator::InplaceRemainder => {
-            (desc::jit_bigint_mod, ELIDABLE_EFFECT_INFO)
-        }
-        BinaryOperator::Lshift | BinaryOperator::InplaceLshift => {
-            (desc::jit_bigint_lshift, ELIDABLE_EFFECT_INFO)
-        }
-        BinaryOperator::Rshift | BinaryOperator::InplaceRshift => {
-            (desc::jit_bigint_rshift, ELIDABLE_EFFECT_INFO)
-        }
-        _ => return None,
-    };
-    Some(LongBinopSpec { payload_fn, effect })
 }
 
 /// Emit `GetfieldGcR(w_class) → PtrEq(expected) → GuardTrue` so the trace

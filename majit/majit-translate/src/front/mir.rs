@@ -10317,6 +10317,10 @@ impl<'a> Lowering<'a> {
             Operand::Copy(p) | Operand::Move(p) => Some(clone_tyref(&p.ty)),
             Operand::Const(_) => None,
         });
+        // Captured before `call.args` is consumed. A constant word
+        // (`RBigInt::from(1)`) has no place type; its `ty` is what the
+        // constructor residual below classifies.
+        let const_arg_ty = call.args.first().and_then(const_operand_tyref);
         // Captured before `call.args` is consumed: `slice::len` on
         // `Copy(*byte_view)` must see the mark `Rvalue::Len` already follows.
         let first_arg_is_string_byte_view = call
@@ -10335,6 +10339,10 @@ impl<'a> Lowering<'a> {
             Operand::Copy(p) | Operand::Move(p) => Some(clone_tyref(&p.ty)),
             Operand::Const(_) => None,
         });
+        // A constant word (`vb.int_eq(1)`) has no place type. Its declared
+        // `ty` is what the int-comparison residual classifies, the same way
+        // `RBigInt::from(1)` uses `const_arg_ty`.
+        let second_const_arg_ty = call.args.get(1).and_then(const_operand_tyref);
         // Function-item identity of arg #1, captured before `call.args` is
         // consumed.  `Option::map(opt, named_fn)` passes a `FnDef` constant
         // (or a Copy/Move of a `FnDef`-typed local); that shape has no
@@ -13840,14 +13848,18 @@ impl<'a> Lowering<'a> {
         // both operand orders (the int-left descriptor reverses the relation).
         // The receiver remains one RBigInt GCREF, the other operand is exactly
         // Signed, and the result occupies the bool/int bank.
+        let cmp_int_ty = second_arg_ty.as_ref().or(second_const_arg_ty.as_ref());
         let op_kind = if let OpKind::Call { target, args, .. } = &op_kind
             && args.len() == 2
             && first_arg_ty
                 .as_ref()
                 .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
-            && second_arg_ty
-                .as_ref()
-                .is_some_and(|ty| self.tyref_literal_int_atom(ty) == Some("I64"))
+            && cmp_int_ty.is_some_and(|ty| {
+                matches!(
+                    self.tyref_literal_int_atom(ty),
+                    Some("I8" | "I16" | "I32" | "I64" | "Isize")
+                )
+            })
             && let Some(residual) = match target {
                 CallTarget::FunctionPath { segments, .. } => segments.last().and_then(|leaf| {
                     crate::front::rbigint_call::int_comparison_residual_for_method(leaf)
@@ -13864,6 +13876,48 @@ impl<'a> Lowering<'a> {
                 },
                 args: args.clone(),
                 result_ty: ValueType::Bool,
+            }
+        } else {
+            op_kind
+        };
+
+        // Zero-checked long/int leaves (`bigint_int_floordiv_nonzero`,
+        // `bigint_int_modulo_int_result_nonzero`, `bigint_rshift`) are elidable
+        // and either return `BigInt` by value or have no published address.
+        // Retarget each to the `jit_bigint_*` wrapper that already exists.
+        // The remainder wrapper returns the machine word; the other two return
+        // the GC reference.
+        let nonzero_int_ty = second_arg_ty.as_ref().or(second_const_arg_ty.as_ref());
+        let op_kind = if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
+            && first_arg_ty
+                .as_ref()
+                .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
+            && nonzero_int_ty.is_some_and(|ty| {
+                matches!(
+                    self.tyref_literal_int_atom(ty),
+                    Some("I8" | "I16" | "I32" | "I64" | "Isize")
+                )
+            })
+            && let Some((residual, scalar_result)) =
+                crate::front::rbigint_call::nonzero_leaf_residual_path(segments)
+        {
+            let result_ty = match scalar_result {
+                crate::front::rbigint_call::ScalarResult::Int => ValueType::Int,
+                crate::front::rbigint_call::ScalarResult::Bool => ValueType::Bool,
+                crate::front::rbigint_call::ScalarResult::Ref => ValueType::Ref(None),
+            };
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: residual,
+                    fun_decl_id: None,
+                },
+                args: args.clone(),
+                result_ty,
             }
         } else {
             op_kind
@@ -14102,6 +14156,7 @@ impl<'a> Lowering<'a> {
             let result_ty = match scalar_result {
                 crate::front::rbigint_call::ScalarResult::Int => ValueType::Int,
                 crate::front::rbigint_call::ScalarResult::Bool => ValueType::Bool,
+                crate::front::rbigint_call::ScalarResult::Ref => ValueType::Ref(None),
             };
             OpKind::Call {
                 target: CallTarget::function_path(segments),
@@ -14116,6 +14171,11 @@ impl<'a> Lowering<'a> {
         // GC reference. Retarget word-sized Rust constructors to wrappers
         // whose C ABI returns `*mut RBigInt`; never narrow i128/u128, which
         // RPython's JIT deliberately has no register kind for.
+        //
+        // A constant word argument (`RBigInt::from(1)` in `long_pow`) has no
+        // place type; `const_arg_ty` is its declared type, so it retargets
+        // the same way a place argument does.
+        let ctor_arg_ty = first_arg_ty.as_ref().or(const_arg_ty.as_ref());
         let op_kind = if let OpKind::Call {
             target: CallTarget::FunctionPath { segments, .. },
             args,
@@ -14123,12 +14183,14 @@ impl<'a> Lowering<'a> {
         } = &op_kind
             && args.len() == 1
             && tyref_is_rbigint(&call.dest.ty, self.llbc)
-            && let Some(arg_ty) = first_arg_ty.as_ref()
+            && let Some(arg_ty) = ctor_arg_ty
         {
+            // `bool` is `frombool`: 0 or 1 in the signed word, same residual
+            // as `I32`/`I64`. `U128`/`I128` stay out of this list.
             let signed = matches!(
                 self.tyref_literal_int_atom(arg_ty),
                 Some("I8" | "I16" | "I32" | "I64" | "Isize")
-            );
+            ) || tyref_is_literal_bool(arg_ty, self.llbc);
             let unsigned = matches!(
                 self.tyref_literal_uint_atom(arg_ty),
                 Some("U8" | "U16" | "U32" | "U64" | "Usize")
@@ -14213,7 +14275,8 @@ impl<'a> Lowering<'a> {
         // translated shape is instead one GCREF result plus an implicit
         // MemoryError edge. Retarget the exact host helper to that pointer ABI;
         // the Result-of-PyError capture immediately below rewires the compiler
-        // generated `?` diamond into LastException exits.
+        // generated `?` diamond into LastException exits. `bigint_add` returns
+        // the payload pointer directly and takes the same GC-reference swap.
         let op_kind = if let OpKind::Call {
             target: CallTarget::FunctionPath { segments, .. },
             args,
@@ -14227,6 +14290,7 @@ impl<'a> Lowering<'a> {
                 .as_ref()
                 .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
             && let Some(residual) = crate::front::rbigint_call::pow_nomod_residual_path(segments)
+                .or_else(|| crate::front::rbigint_call::bigint_add_residual_path(segments))
         {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
@@ -23710,6 +23774,30 @@ fn operand_tyref(op: &Operand) -> Option<&TyRef> {
         Operand::Copy(p) | Operand::Move(p) => Some(&p.ty),
         Operand::Const(_) => None,
     }
+}
+
+/// Declared type of an `Operand::Const`.
+///
+/// Charon stores it beside the literal (`{"ty": {"Deduplicated": N}}` or an
+/// inline `HashConsedValue`). [`operand_tyref`] stays place-only; the rbigint
+/// constructor gate is the caller that has to see a constant word.
+fn const_operand_tyref(op: &Operand) -> Option<TyRef> {
+    let Operand::Const(value) = op else {
+        return None;
+    };
+    let ty = value.as_object()?.get("ty")?;
+    serde_json::from_value(ty.clone()).ok()
+}
+
+/// `{"Literal": "Bool"}` or `{"Literal": {"Bool": ...}}`, after dedup.
+fn tyref_is_literal_bool(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc) else {
+        return false;
+    };
+    let Some(lit) = node.as_object().and_then(|obj| obj.get("Literal")) else {
+        return false;
+    };
+    lit.as_str() == Some("Bool") || lit.as_object().is_some_and(|obj| obj.contains_key("Bool"))
 }
 
 /// The decomposed brick-3 element-`add` gate

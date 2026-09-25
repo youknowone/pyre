@@ -118,6 +118,7 @@ pub(crate) fn is_exception_object_materializer(key: &FunctionPathKey) -> bool {
         "pyerror_to_exc_object"
             | "pyerror_type_error_to_exc_object"
             | "pyerror_zero_division_to_exc_object"
+            | "pyerror_value_error_to_exc_object"
     ) {
         return false;
     }
@@ -1276,6 +1277,7 @@ mod tests {
             "pyerror_to_exc_object",
             "pyerror_type_error_to_exc_object",
             "pyerror_zero_division_to_exc_object",
+            "pyerror_value_error_to_exc_object",
         ] {
             for path in [
                 vec!["pyre_interpreter", "error", leaf],

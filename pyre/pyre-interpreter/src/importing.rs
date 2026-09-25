@@ -599,11 +599,6 @@ pub struct OptionalModuleHooks {
     /// # Safety
     /// The address must be a block `_cffi_backend` built.
     pub libffi_cif_shape: unsafe fn(usize) -> Option<LibffiCifShape>,
-    /// `Some(dict_w)` when the object is a `_cffi_backend` `Lib`.
-    pub cffi_lib_dict: fn(PyObjectRef) -> Option<PyObjectRef>,
-    /// Whether the object is a `_cffi_backend` global-variable support
-    /// object, which `Lib.__getattribute__` turns into a C-memory read.
-    pub cffi_is_glob_support: fn(PyObjectRef) -> bool,
     /// The name of the canonical `math` builtin a callable is, if any.
     pub math_builtin_name: fn(PyObjectRef) -> Option<&'static str>,
     /// Whether `math.gamma` (or `lgamma` when the flag is set) is finite at

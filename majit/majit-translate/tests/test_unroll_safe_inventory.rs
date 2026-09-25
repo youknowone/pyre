@@ -271,6 +271,12 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
         "_orig_str_join_many_items",
         "rlib/jit.py look_inside_iff unroll_safe(_str_join_many_items)",
     ),
+    // Same `func = unroll_safe(func)`, for `intobject.py _pow_nomod`, which is
+    // `@jit.look_inside_iff(lambda iv, iw: jit.isconstant(iw))`.
+    (
+        "_orig_int_pow_nomod",
+        "rlib/jit.py look_inside_iff unroll_safe(_pow_nomod)",
+    ),
     // `error.py OperationError.normalize_exception` is `@jit.unroll_safe`.
     // Both pyre methods that share this leaf (the throw-surface table and
     // the `PyError` materialiser) are loop-free, so `look_inside_graph`

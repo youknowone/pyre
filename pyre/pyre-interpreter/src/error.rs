@@ -585,6 +585,22 @@ pub unsafe fn pyerror_zero_division_to_exc_object(
     PyError::zero_division(fused_raise_message(w_msg)).to_exc_object()
 }
 
+/// Literal-message `ValueError` twin of [`pyerror_zero_division_to_exc_object`].
+///
+/// `long_lshift` / `long_rshift` (`descr_lshift` / `descr_rshift`) raise
+/// `PyError::value_error("negative shift count")` before `rbigint.lshift` /
+/// `rbigint.rshift`. Fusing that constructor keeps the `PyError` aggregate,
+/// whose `Wtf8Buf` is not a one-word `STR`, out of the operator JitCode.
+///
+/// # Safety
+/// `w_msg` is a live rstr `STR` payload.
+#[majit_macros::dont_look_inside]
+pub unsafe fn pyerror_value_error_to_exc_object(
+    w_msg: *mut pyre_object::PyObject,
+) -> *mut pyre_object::PyObject {
+    PyError::value_error(fused_raise_message(w_msg)).to_exc_object()
+}
+
 impl PyError {
     /// Forward the up-to-three GC-managed references a `PyError` holds — the
     /// cached exception object and the lazy NameError/AttributeError name/obj

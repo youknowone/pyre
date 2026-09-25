@@ -54,9 +54,9 @@ pub(crate) fn bigint_binop_residual_path(segments: &[String]) -> Option<Vec<Stri
 /// `CallTarget::Method` leaf directly.
 pub(crate) fn bigint_binop_residual_for_method(leaf: &str) -> Option<Vec<String>> {
     let residual_leaf = match leaf {
-        "bitand" => "jit_bigint_and",
-        "bitor" => "jit_bigint_or",
-        "bitxor" => "jit_bigint_xor",
+        "bitand" | "and_" => "jit_bigint_and",
+        "bitor" | "or_" => "jit_bigint_or",
+        "bitxor" | "xor" => "jit_bigint_xor",
         "sub" => "jit_bigint_sub",
         "mul" => "jit_bigint_mul",
         "add" => "jit_bigint_add",
@@ -187,8 +187,11 @@ mod tests {
     fn maps_each_retargetable_operator_to_its_residual() {
         for (op, residual) in [
             ("bitand", "jit_bigint_and"),
+            ("and_", "jit_bigint_and"),
             ("bitor", "jit_bigint_or"),
+            ("or_", "jit_bigint_or"),
             ("bitxor", "jit_bigint_xor"),
+            ("xor", "jit_bigint_xor"),
             ("sub", "jit_bigint_sub"),
             ("mul", "jit_bigint_mul"),
             ("add", "jit_bigint_add"),

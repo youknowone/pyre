@@ -68,7 +68,8 @@
 //! `eval_loop_jit*` portals whose `match step_result` merges seven
 //! predecessors) — gets the [`catch_and_rewrap`] treatment: `LastException`
 //! exits on the call block whose arms locally re-encode the `Result`
-//! (`Ok(raw)` / `Err(PyError::from_exc_object(last_exc_value))`), leaving
+//! (`Ok(raw)` / `Err(PyError::from_exc_object(last_exc_value))` as a
+//! static call on the registered impl path), leaving
 //! the downstream destructuring untouched.  A call shape neither rule
 //! recognises declines — the graph degrades to a residual call, no
 //! miscompile.
@@ -2019,6 +2020,82 @@ fn rewire_one_call_site(
     Ok(SiteOutcome::Diamond)
 }
 
+/// The `Err` payload of the match `exit` reaches is never read.
+///
+/// `Err(_)` still switches on the discriminant. The handler does not use
+/// the caught carrier, so rebuilding it would pass an `Exception` into
+/// `from_exc_object`'s `PyObject` parameter.
+fn err_payload_is_dead(graph: &FunctionGraph, exit: &Link, r: &Variable) -> bool {
+    let Some(pos) = exit
+        .args
+        .iter()
+        .position(|arg| matches!(arg, LinkArg::Value(v) if v == r))
+    else {
+        return false;
+    };
+    let Some(shell) = graph.blocks[exit.target.0].inputargs.get(pos).cloned() else {
+        return false;
+    };
+    let Ok((_, _, disc_shell)) = match_discriminant(graph, exit.target.0) else {
+        return false;
+    };
+    if disc_shell != shell {
+        return false;
+    }
+    let Ok((_ok_link, err_link)) =
+        split_diamond_exits(&graph.blocks[exit.target.0].exits, "err payload")
+    else {
+        return false;
+    };
+    // `split_diamond_exits` returns `(case 0, case 1)`. Result's Err is 1.
+    let Ok(err_shell) = arm_shell_var(graph, &err_link, &shell) else {
+        return true;
+    };
+    let Ok(walk) = shell_pos0_reads(graph, err_link.target.0, &err_shell) else {
+        return false;
+    };
+    walk.reads.iter().all(|(block, pos)| {
+        let carrier = graph.blocks[*block].inputargs[*pos].clone();
+        let Some(result) = graph.blocks[*block]
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::FieldRead { base, field, .. }
+                    if base == &carrier && field.name == "__pos_0" && op.result.is_some() =>
+                {
+                    op.result.clone()
+                }
+                _ => None,
+            })
+        else {
+            return false;
+        };
+        !variable_is_used(graph, &result)
+    })
+}
+
+fn variable_is_used(graph: &FunctionGraph, var: &Variable) -> bool {
+    graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            op_operand_vars(&op.kind)
+                .iter()
+                .any(|operand| operand == var)
+        }) || block.exits.iter().any(|link| {
+            link.args
+                .iter()
+                .any(|arg| matches!(arg, LinkArg::Value(v) if v == var))
+                || link
+                    .last_exception
+                    .as_ref()
+                    .is_some_and(|arg| matches!(arg, LinkArg::Value(v) if v == var))
+                || link
+                    .last_exc_value
+                    .as_ref()
+                    .is_some_and(|arg| matches!(arg, LinkArg::Value(v) if v == var))
+        })
+    })
+}
+
 /// Custom-match fallback: the call's `Result` is consumed by a
 /// hand-written `match` (eval.rs `eval_loop` dispatches `StepResult` +
 /// the error handler) — possibly behind a multi-predecessor merge
@@ -2128,37 +2205,41 @@ fn catch_and_rewrap(
     let (e_id, e_inputs) = graph.create_block_with_arg_vars(nonr_args.len() + 2);
     let e_exc_value_in = e_inputs[nonr_args.len() + 1].clone();
     let (e_shell, err_payload): (Option<Variable>, Option<Variable>) = if has_r {
-        // The rebuild is an associated fn on the carrier (no `self`),
-        // spelled as a `Method` whose `receiver_root` is the type leaf
-        // (`PyError`) so the annotator's getattr surface stays on that
-        // leaf. The codewriter resolves statically: `resolved_path` is
-        // the FunDecl's registered impl path
-        // (`for_impl_method` of the crate-stripped carrier, not the
-        // owner leaf). `exc_value` flows positionally into the callee's
-        // first param. A FunctionPath of just the leaf pair misses that
-        // registration.
-        //
         // A carrier that declares no rebuild pair is its own exception
         // value (the mirror of the raise site's `None` arm), so the caught
         // word goes straight into the `Err` shell.
-        let v_err = match spec.from_exc_object {
-            Some((receiver_root, method)) => {
-                let owner = crate::front::mir::strip_crate_prefix(spec.carrier_path);
-                let target = CallTarget::method(method, Some(receiver_root.to_string()))
-                    .with_resolved_path(crate::parse::CallPath::for_impl_method(&owner, method));
-                graph
-                    .push_op_var(
-                        e_id,
-                        OpKind::Call {
-                            target,
-                            args: crate::model::call_args(vec![e_exc_value_in]),
-                            result_ty: ValueType::Ref(None),
-                        },
-                        true,
-                    )
-                    .expect("from_exc_object must produce a value")
+        //
+        // `from_exc_object` is an associated fn. A `Method` target lowers
+        // to `getattr(args[0], name)` on the caught exception and blocks.
+        // The registered identity is the impl path, spelled as a
+        // `FunctionPath` so the annotator emits a static call. That call's
+        // parameter is a `PyObject`, and the caught word is an `Exception`;
+        // those two classes have no common base, so the call is only
+        // emitted when the `Err` payload is actually read. A dead payload
+        // (`Err(_)`) keeps the caught word and no rebuild, matching a
+        // `try`/`except` whose handler does not use the exception value.
+        let payload_dead = err_payload_is_dead(graph, &orig, r);
+        let v_err = if payload_dead {
+            e_exc_value_in
+        } else {
+            match spec.from_exc_object {
+                Some((_, method)) => {
+                    let owner = crate::front::mir::strip_crate_prefix(spec.carrier_path);
+                    let path = crate::parse::CallPath::for_impl_method(&owner, method);
+                    graph
+                        .push_op_var(
+                            e_id,
+                            OpKind::Call {
+                                target: CallTarget::function_path(path.segments),
+                                args: crate::model::call_args(vec![e_exc_value_in.clone()]),
+                                result_ty: ValueType::Ref(None),
+                            },
+                            true,
+                        )
+                        .expect("from_exc_object must produce a value")
+                }
+                None => e_exc_value_in,
             }
-            None => e_exc_value_in,
         };
         let shell = build_shell(
             graph,
@@ -4249,12 +4330,19 @@ pub(crate) fn collapse_pos0_read(
 ///
 /// Gateway wrappers contribute the `type_error` sites; the exact-int
 /// `int_floordiv` / `int_mod` bodies contribute the literal-message
-/// `zero_division` sites.  Each entry removes the Rust carrier aggregate from
-/// the generated JitCode while preserving the interpreter's exception-object
-/// materialisation as one opaque call.
+/// `zero_division` sites; `long_lshift` / `long_rshift` / `int_lshift` /
+/// `int_rshift` contribute the literal-message `value_error` sites.  Each
+/// entry removes the Rust carrier aggregate from the generated JitCode while
+/// preserving the interpreter's exception-object materialisation as one
+/// opaque call.
 const FUSED_KIND_CTORS: &[(&str, &str)] = &[
     ("type_error", "pyerror_type_error_to_exc_object"),
     ("zero_division", "pyerror_zero_division_to_exc_object"),
+    // `descr_lshift` / `descr_rshift` raise this before `rbigint.lshift` /
+    // `rbigint.rshift`. The literal must stay a `STR` payload; leaving the
+    // `PyError` aggregate in the graph stores that word as a `Wtf8Buf` niche
+    // and the native materialiser reads an empty or huge length.
+    ("value_error", "pyerror_value_error_to_exc_object"),
 ];
 
 /// Fuse `PyError::<kind>(msg)` and the `pyerror_to_exc_object` that consumes

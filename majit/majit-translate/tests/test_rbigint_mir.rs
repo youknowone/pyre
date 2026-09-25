@@ -1309,6 +1309,7 @@ const SINGLE_GRAPHS: &[&str] = &[
     "bigint_and",
     "long_int_compare",
     "long_pow",
+    "long_add",
     "long_lshift",
     "int_lshift",
 ];
@@ -1608,6 +1609,56 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
             .is_some_and(|leaf| leaf == "bigint_pow_nomod")),
         "the host Result wrapper must not survive in the translated graph: {pow_calls:?}"
     );
+    assert!(
+        pow_calls.iter().any(|segments| segments
+            .last()
+            .is_some_and(|leaf| leaf == "jit_bigint_int_eq")),
+        "long_pow int_eq(1) must retarget to jit_bigint_int_eq: {pow_calls:?}"
+    );
+    assert!(
+        !pow_calls
+            .iter()
+            .any(|segments| segments.last().is_some_and(|leaf| leaf == "int_eq")),
+        "long_pow retained RBigInt::int_eq: {pow_calls:?}"
+    );
+
+    let long_add = program
+        .functions
+        .iter()
+        .find(|function| {
+            function.name == "long_add"
+                && function.module_path.ends_with("objspace::descroperation")
+        })
+        .expect("descroperation::long_add graph");
+    let add_calls: Vec<Vec<String>> = long_add
+        .graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|operation| match &operation.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => Some(segments.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        add_calls.iter().any(|segments| segments
+            == &[
+                "pyre_interpreter",
+                "objspace",
+                "descroperation",
+                "jit_bigint_add",
+            ]),
+        "long_add must retarget bigint_add to the elidable pointer ABI: {add_calls:?}"
+    );
+    assert!(
+        !add_calls
+            .iter()
+            .any(|segments| segments.last().is_some_and(|leaf| leaf == "bigint_add")),
+        "the host bigint_add wrapper must not survive in the translated graph: {add_calls:?}"
+    );
 
     let module_loaded = llbcs.len() > 1;
     for &(module_suffix, caller_name) in BORROWED_PAYLOAD_CALLERS {
@@ -1746,6 +1797,55 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         );
     }
 
+    for (caller_name, residual_name, forbidden) in [
+        (
+            "long_floordiv",
+            "jit_bigint_int_div_floor",
+            "bigint_int_floordiv_nonzero",
+        ),
+        (
+            "long_mod",
+            "jit_bigint_int_mod_int_result",
+            "bigint_int_modulo_int_result_nonzero",
+        ),
+        ("long_rshift", "jit_bigint_shr", "bigint_rshift"),
+        ("long_bitxor", "jit_bigint_xor", "xor"),
+    ] {
+        let caller = program
+            .functions
+            .iter()
+            .find(|function| {
+                function.name == caller_name
+                    && function.module_path.ends_with("objspace::descroperation")
+            })
+            .unwrap_or_else(|| panic!("descroperation::{caller_name} graph"));
+        let calls: Vec<Vec<String>> = caller
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|operation| match &operation.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => Some(segments.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            calls
+                .iter()
+                .any(|segments| segments.last().is_some_and(|leaf| leaf == residual_name)),
+            "{caller_name} must target {residual_name}: {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|segments| segments.last().is_some_and(|leaf| leaf == forbidden)),
+            "{caller_name} retained {forbidden}: {calls:?}"
+        );
+    }
+
     for &(caller_name, residual_name) in UNARY_RESIDUAL_CALLERS {
         let caller = program
             .functions
@@ -1857,6 +1957,42 @@ fn rbigint_add_residual_calls_the_gc_transformed_payload_body_once() {
         constructor_residuals, 1,
         "RBigInt::from(i64) must return one GC reference through its residual"
     );
+
+    // `long_pow`'s zero-exponent arm is `BigInt::from(1)`, an `Operand::Const`
+    // of `I32`. The place-only constructor gate used to leave that call as
+    // `rbigint::RBigInt::from`.
+    if std::path::Path::new(INTERPRETER_LLBC).is_file() {
+        let interpreter = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter.ullbc");
+        let long_pow = lower_function(&interpreter, "long_pow").expect("lower long_pow");
+        let long_pow_calls: Vec<Vec<String>> = long_pow
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|operation| match &operation.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => Some(segments.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            long_pow_calls.iter().any(|segments| {
+                segments
+                    .last()
+                    .is_some_and(|leaf| leaf == "jit_bigint_from_i64")
+            }),
+            "long_pow constant word constructors must retarget: {long_pow_calls:?}"
+        );
+        assert!(
+            !long_pow_calls.iter().any(|segments| {
+                segments.len() >= 2
+                    && segments[segments.len() - 2] == "RBigInt"
+                    && segments.last().is_some_and(|leaf| leaf == "from")
+            }),
+            "long_pow must not residualize rbigint::RBigInt::from: {long_pow_calls:?}"
+        );
+    }
 
     let clone_caller = program
         .functions

@@ -442,8 +442,6 @@ pub fn register() {
             gc_types: module_gc_types,
             immortal_w_class_only_descriptors: all_immortal_w_class_only_descriptors,
             libffi_cif_shape: hook_libffi_cif_shape,
-            cffi_lib_dict: hook_cffi_lib_dict,
-            cffi_is_glob_support: hook_cffi_is_glob_support,
             math_builtin_name: module::math::interp_math::math_builtin_name,
             math1_gamma_result_finite: module::math::interp_math::math1_gamma_result_finite,
             math_faithful_residual_call_addrs:
@@ -453,50 +451,6 @@ pub fn register() {
             },
         },
     );
-}
-
-fn hook_cffi_lib_dict(obj: pyre_object::PyObjectRef) -> Option<pyre_object::PyObjectRef> {
-    #[cfg(all(
-        feature = "full",
-        feature = "host_env",
-        not(feature = "sandbox"),
-        not(target_arch = "wasm32")
-    ))]
-    {
-        return module::_cffi_backend::lib_obj::W_LibObject::from_obj(obj).map(|lib| lib.dict_w);
-    }
-    #[cfg(not(all(
-        feature = "full",
-        feature = "host_env",
-        not(feature = "sandbox"),
-        not(target_arch = "wasm32")
-    )))]
-    {
-        let _ = obj;
-        None
-    }
-}
-
-fn hook_cffi_is_glob_support(obj: pyre_object::PyObjectRef) -> bool {
-    #[cfg(all(
-        feature = "full",
-        feature = "host_env",
-        not(feature = "sandbox"),
-        not(target_arch = "wasm32")
-    ))]
-    {
-        return module::_cffi_backend::cglob::W_GlobSupport::from_obj(obj).is_some();
-    }
-    #[cfg(not(all(
-        feature = "full",
-        feature = "host_env",
-        not(feature = "sandbox"),
-        not(target_arch = "wasm32")
-    )))]
-    {
-        let _ = obj;
-        false
-    }
 }
 
 /// `jit_libffi.py`'s reading of a `CIF_DESCRIPTION` block for the tracer.

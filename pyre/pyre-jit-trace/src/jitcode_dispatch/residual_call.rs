@@ -3383,6 +3383,27 @@ fn transparent_helper_recordable_leaf(path: &str) -> bool {
     })
 }
 
+/// Funcptr word of a residual that is NULL or a `symbolic_fnaddr` hash.
+/// Other `ResidualDecline::Symbolic` causes (non-const funcbox, LoadConst)
+/// stay recorded: those calls are real at runtime.
+fn recorded_symbolic_funcptr<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    allboxes: &[OpRef],
+) -> Option<i64> {
+    let funcbox = allboxes.first()?;
+    if !funcbox.is_constant() {
+        return None;
+    }
+    match ctx.trace_ctx.box_value(*funcbox) {
+        Some(majit_ir::Value::Int(addr))
+            if addr == 0 || majit_jitcode::codewriter::call::is_symbolic_fnaddr(addr) =>
+        {
+            Some(addr)
+        }
+        _ => None,
+    }
+}
+
 /// The symbolic decline, minted in one place so it carries provenance.
 ///
 /// Ten preconditions inside [`try_execute_residual_call_via_executor`] end in
@@ -5978,9 +5999,10 @@ pub(crate) fn residual_call_specialized_plain_numeric_binop(
     else {
         return None;
     };
-    // All six `ComparisonOperator`s are admitted.  The hand int and float
-    // compare folds are retired; `compare_op_descent` records the
-    // exact-builtin sites.  `CHECK_EXC_MATCH` reuses the `CompareOp`
+    // All six `ComparisonOperator`s are admitted.  The hand int, long,
+    // mixed long/int and float compare folds are retired;
+    // `compare_op_descent` records the exact-builtin sites.
+    // `CHECK_EXC_MATCH` reuses the `CompareOp`
     // shape with `ISINSTANCE_OP` (tag 10), which is not one of the six and so
     // stays excluded.
     if helper == Some(majit_ir::RuntimeHelperKind::CompareOp) {
@@ -8666,6 +8688,19 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         let resid_raised = match resid_exec {
             ResidualExecOutcome::Executed(result) => result.is_err(),
             ResidualExecOutcome::Declined(cause) => {
+                // The call op is already recorded. A symbolic fnaddr decline
+                // must not leave it: the backend emits a call to the hash.
+                // Cut back to the position taken before the record, then
+                // abort this walk so the result box is not used.
+                if cause == ResidualDecline::Symbolic
+                    && let Some(addr) = recorded_symbolic_funcptr(ctx, &allboxes)
+                {
+                    ctx.trace_ctx.cut_trace_with_snapshots(patch_pos);
+                    return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
+                        pc: op.pc,
+                        symbolic: addr,
+                    });
+                }
                 fbw_abort_nested_unjournaled_residual(ctx, op.pc, Some(cause))?;
                 fbw_mark_unjournaled_effect(cause);
                 false
@@ -9947,76 +9982,14 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         // Exact int pairs have already been taken
                         // whole by `binary_op_descent`, including overflow and
                         // zero-division exception arms.
-                        // longobject.py `_make_generic_descr_binop` and
-                        // `descr_sub` use the rbigint.int_* family for
-                        // mixed Long/Int operands.
-                        let mut specialized = spec_gate(SpecFold::BinaryOpLongInt, || {
-                            try_walker_specialize_binary_op_long_int(
+                        // `descr_pow` keeps a `W_IntObject` exponent unwrapped
+                        // and calls `rbigint.int_pow`. Descent still stops in
+                        // `long_pow`, so this fold remains.
+                        spec_gate(SpecFold::BinaryOpLongIntPow, || {
+                            try_walker_specialize_binary_op_long_int_pow(
                                 ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
                             )
-                        })?;
-                        if specialized.is_none() {
-                            // `_make_descr_binop` gives shifts with an Int
-                            // count their own `_int_lshift` / `_int_rshift`
-                            // path before Long/Long.
-                            if let Some(outcome) =
-                                spec_gate(SpecFold::BinaryOpLongIntShift, || {
-                                    try_walker_specialize_binary_op_long_int_shift(
-                                        ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
-                                        dst_bank,
-                                    )
-                                })?
-                            {
-                                return Ok((outcome, op.next_pc));
-                            }
-                        }
-                        if specialized.is_none() {
-                            // `_int_floordiv` / `_int_mod` are the same family:
-                            // an Int divisor keeps its machine word instead of
-                            // being widened to a bigint, and `_int_mod`'s
-                            // result is a machine int rather than a long.
-                            if let Some(outcome) = spec_gate(SpecFold::BinaryOpLongIntDiv, || {
-                                try_walker_specialize_binary_op_long_int_div(
-                                    ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
-                                    dst_bank,
-                                )
-                            })? {
-                                return Ok((outcome, op.next_pc));
-                            }
-                        }
-                        if specialized.is_none() {
-                            // `descr_pow` keeps a `W_IntObject` exponent
-                            // unwrapped and calls `rbigint.int_pow`; only a
-                            // long exponent reaches `rbigint.pow`.
-                            specialized = spec_gate(SpecFold::BinaryOpLongIntPow, || {
-                                try_walker_specialize_binary_op_long_int_pow(
-                                    ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
-                                    dst_bank,
-                                )
-                            })?;
-                        }
-                        if specialized.is_none() {
-                            // W_LongObject operands take the long fast path
-                            // before float so bigint arithmetic retains its
-                            // payload representation.
-                            specialized = spec_gate(SpecFold::BinaryOpLong, || {
-                                try_walker_specialize_binary_op_long(
-                                    ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
-                                    dst_bank,
-                                )
-                            })?;
-                        }
-                        if specialized.is_none() {
-                            // Two-long true-divide → float fast path
-                            // (CallPureF + wrapfloat).
-                            specialized = spec_gate(SpecFold::TruedivOpLong, || {
-                                try_walker_specialize_truediv_op_long(
-                                    ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
-                                    dst_bank,
-                                )
-                            })?;
-                        }
-                        specialized
+                        })?
                     }
                 } else if op_tag == 10 && ctx.is_authoritative_executor {
                     // `op_tag == 10` is CHECK_EXC_MATCH
@@ -10061,30 +10034,18 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                     })? {
                         return Ok((outcome, op.next_pc));
                     }
-                    // Two-bigint operands keep bigint comparison. Exact strings
-                    // follow: `_compare` (unicodeobject.py) answers from one
-                    // WTF-8 ordering. Short exact tuples of ints or None are
-                    // folded by `try_walker_fold_small_tuple_eq`.
-                    match spec_gate(SpecFold::CompareOpLongInt, || {
-                        try_walker_specialize_compare_op_long_int(
+                    // Exact int and long compares are recorded by the descent
+                    // above (`compare_value_from_tag` → `compare_slot`).
+                    // Two exact strings: `_compare` (unicodeobject.py) answers
+                    // from one WTF-8 ordering.
+                    // Short exact tuples of ints or None are folded by
+                    // `try_walker_fold_small_tuple_eq`. Longer tuples and
+                    // subclasses still reach this residual.
+                    spec_gate(SpecFold::CompareOpStr, || {
+                        try_walker_specialize_compare_op_str(
                             ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
                         )
-                    })? {
-                        Some(()) => Some(()),
-                        None => match spec_gate(SpecFold::CompareOpLong, || {
-                            try_walker_specialize_compare_op_long(
-                                ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
-                            )
-                        })? {
-                            Some(()) => Some(()),
-                            None => spec_gate(SpecFold::CompareOpStr, || {
-                                try_walker_specialize_compare_op_str(
-                                    ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
-                                    dst_bank,
-                                )
-                            })?,
-                        },
-                    }
+                    })?
                 };
                 if specialized.is_some() {
                     return Ok((DispatchOutcome::Continue, op.next_pc));
@@ -10279,6 +10240,19 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         let resid_raised = match resid_exec {
             ResidualExecOutcome::Executed(result) => result.is_err(),
             ResidualExecOutcome::Declined(cause) => {
+                // The call op is already recorded. A symbolic fnaddr decline
+                // must not leave it: the backend emits a call to the hash.
+                // Cut back to the position taken before the record, then
+                // abort this walk so the result box is not used.
+                if cause == ResidualDecline::Symbolic
+                    && let Some(addr) = recorded_symbolic_funcptr(ctx, &allboxes)
+                {
+                    ctx.trace_ctx.cut_trace_with_snapshots(patch_pos);
+                    return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
+                        pc: op.pc,
+                        symbolic: addr,
+                    });
+                }
                 fbw_abort_nested_unjournaled_residual(ctx, op.pc, Some(cause))?;
                 fbw_mark_unjournaled_effect(cause);
                 false
@@ -10587,6 +10561,19 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
         let resid_raised = match resid_exec {
             ResidualExecOutcome::Executed(result) => result.is_err(),
             ResidualExecOutcome::Declined(cause) => {
+                // The call op is already recorded. A symbolic fnaddr decline
+                // must not leave it: the backend emits a call to the hash.
+                // Cut back to the position taken before the record, then
+                // abort this walk so the result box is not used.
+                if cause == ResidualDecline::Symbolic
+                    && let Some(addr) = recorded_symbolic_funcptr(ctx, &allboxes)
+                {
+                    ctx.trace_ctx.cut_trace_with_snapshots(patch_pos);
+                    return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
+                        pc: op.pc,
+                        symbolic: addr,
+                    });
+                }
                 fbw_abort_nested_unjournaled_residual(ctx, op.pc, Some(cause))?;
                 fbw_mark_unjournaled_effect(cause);
                 false
