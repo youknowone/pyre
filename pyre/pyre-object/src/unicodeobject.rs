@@ -1341,8 +1341,12 @@ pub extern "C" fn jit_str_concat(a: PyObjectRef, b: PyObjectRef) -> PyObjectRef 
 /// upstream.  A null handed back with no exception set would pass the
 /// `GuardNoException` that follows the call and store a null ref, so the
 /// overflow aborts until MemoryError propagation is ported; `"" * n` does
-/// not loop.
+/// not loop.  `times == 1` returns the receiver (`descr_mul`): an exact
+/// `str` repeated once is that object, so two `s * 1` sites stay identical.
 pub extern "C" fn jit_str_repeat(s: PyObjectRef, n: i64) -> PyObjectRef {
+    if n == 1 {
+        return s;
+    }
     unsafe {
         let sv = w_str_get_wtf8(s);
         let count = if n < 0 { 0 } else { n as usize };
