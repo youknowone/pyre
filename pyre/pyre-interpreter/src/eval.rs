@@ -4465,6 +4465,28 @@ pub fn load_super_attr_value(
 }
 
 impl PyFrame {
+    /// pyopcode.py LOAD_ATTR as traced: `w_attributename =
+    /// self.getname_w(nameindex)`; `space.getattr(w_obj, w_attributename)`.
+    fn load_attr_w(&mut self, nameindex: usize) -> Result<(), PyError> {
+        let obj = self.pop_value()?;
+        let roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = roots.base();
+        let obj = roots.pin_root(obj);
+        let w_name =
+            unsafe { crate::pycode::w_code_getname_w(self.pycode as PyObjectRef, nameindex) };
+        let anchor = FrameAnchor::new(self);
+        let w_value = match crate::baseobjspace::getattr(obj, w_name) {
+            Ok(w_value) => w_value,
+            Err(error) => {
+                if finalize_failed_attr_receiver_now(roots.get(obj_slot)) {
+                    unsafe { &mut *anchor.live() }.defer_failed_attr_until_pop_except();
+                }
+                return Err(error);
+            }
+        };
+        Self::push_anchored(&anchor, w_value)
+    }
+
     /// `argument.py` `make_arguments` copies the explicit args, then calls.
     /// `@jit.unroll_safe` so the `nargs` walk is not a backedge of `call`.
     /// The list stays here: returning a `Vec` is a pointer plus a length,
@@ -5981,25 +6003,7 @@ impl OpcodeStepExecutor for PyFrame {
         // the annotator off the bare-`!` hazard. The cache path's helpers are
         // `dont_look_inside`, so the JIT never traces into them.
         if majit_metainterp::jit::we_are_jitted() {
-            // pyopcode.py LOAD_ATTR: `w_attributename = self.getname_w(nameindex)`;
-            // `space.getattr(w_obj, w_attributename)`.
-            let obj = self.pop_value()?;
-            let roots = pyre_object::gc_roots::push_roots();
-            let obj_slot = roots.base();
-            let obj = roots.pin_root(obj);
-            let w_name =
-                unsafe { crate::pycode::w_code_getname_w(self.pycode as PyObjectRef, nameindex) };
-            return crate::baseobjspace::getattr(obj, w_name)
-                .map(|attr| {
-                    let live = unsafe { &mut *FrameAnchor::new(self).live() };
-                    live.push(attr);
-                })
-                .map_err(|error| {
-                    if finalize_failed_attr_receiver_now(roots.get(obj_slot)) {
-                        self.defer_failed_attr_until_pop_except();
-                    }
-                    error
-                });
+            return self.load_attr_w(nameindex);
         }
         // Graceful underflow (`shared_opcode.rs`'s `opcode_load_attr` →
         // `pop_value()?`): a corrupted concrete-execution stack during
