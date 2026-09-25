@@ -7275,22 +7275,20 @@ exc_constructor!(
 /// `super().__init__(*args)`, instead of leaving the full original
 /// argument list captured by `__new__`.  `args[0]` is `self`.
 ///
-/// `descr_init(self, space, args_w)` is registered with that signature, so
-/// the binder rejects keywords before this runs and packs `*args` into one
-/// tuple.  One positional — the tuple holding a single argument — stores
-/// `args` without the general walk.  Any other arity that fits in six words
-/// stays in [`exc_base_exception_init_slow`]; a longer slice is passed
-/// through whole.
+/// `descr_init(self, space, args_w)` takes `args_w` bound as the positional
+/// list, so no tuple stands between the caller and the body: this is the flat
+/// slice, with any keywords riding it as the trailing `__pyre_kw__` marker.
+/// One positional that is not that marker stores `args` without the general
+/// walk.  Any other arity that fits in six words stays in
+/// [`exc_base_exception_init_slow`]; a longer slice is passed through whole,
+/// and both of those reach [`exc_base_exception_init`], which rejects the
+/// keywords.
 pub fn __majit_wrap_base_exception_descr_init(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() == 2 && !args[0].is_null() {
-        let item = packed_single_arg(args[1]);
-        if !item.is_null() {
-            exc_init_one_positional(args[0], item);
-            return Ok(pyre_object::w_none());
-        }
-        return exc_base_exception_init_packed(args[0], args[1]);
+    if args.len() == 2 && !args[0].is_null() && !builtin_kwargs_marker_tail(args[1]) {
+        exc_init_one_positional(args[0], args[1]);
+        return Ok(pyre_object::w_none());
     }
     // The six-word residual cannot see a longer tail. Hand the real slice
     // to the initializer instead of shortening it.
@@ -7490,61 +7488,25 @@ static __majit_wrap_exc_value_error_descr_new_target: crate::gateway::BuiltinWra
         func: __majit_wrap_exc_value_error_descr_new,
     };
 
-/// The one object a `*args` tuple of length one holds, or `PY_NULL` for any
-/// other shape — including a `packed` that is not a tuple at all, which is
-/// what an unbound caller passes.
-///
-/// `visit_args_w` reads the tuple `_match_signature` packed, and this is
-/// that read.  Residual because the traced wrapper cannot perform it: the
-/// item comes out of the tuple's `ItemsBlock`, and merging that with the
-/// wrapper's own `args` list leaves the annotator no union arm, so the
-/// wrapper's graph falls to the legacy walker.
-#[majit_macros::dont_look_inside_cannot_raise]
-fn packed_single_arg(packed: PyObjectRef) -> PyObjectRef {
-    if packed.is_null() || !unsafe { pyre_object::is_tuple(packed) } {
-        return pyre_object::PY_NULL;
-    }
-    if unsafe { pyre_object::w_tuple_len(packed) } != 1 {
-        return pyre_object::PY_NULL;
-    }
-    unsafe { pyre_object::w_tuple_getitem(packed, 0) }.unwrap_or(pyre_object::PY_NULL)
-}
-
-/// Expand the `*args` tuple the signature binder appended after `self`.
-/// An unbound caller reaches here with the positional itself rather than a
-/// tuple holding it; take it as the one argument it is.
-#[majit_macros::dont_look_inside]
-fn exc_base_exception_init_packed(
-    w_self: PyObjectRef,
-    packed: PyObjectRef,
-) -> Result<PyObjectRef, crate::PyError> {
-    if packed.is_null() || !unsafe { pyre_object::is_tuple(packed) } {
-        return exc_base_exception_init(&[w_self, packed]);
-    }
-    let n = unsafe { pyre_object::w_tuple_len(packed) };
-    let mut flat = Vec::with_capacity(1 + n);
-    flat.push(w_self);
-    for index in 0..n as i64 {
-        if let Some(item) = unsafe { pyre_object::w_tuple_getitem(packed, index) } {
-            flat.push(item);
-        }
-    }
-    exc_base_exception_init(&flat)
-}
-
 fn exc_base_exception_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let w_self = *args.first().ok_or_else(|| {
         crate::PyError::type_error("__init__() missing 1 required positional argument: 'self'")
     })?;
-    // `descr_init` stores the positional `args_w` its signature already bound.
-    let positional = &args[1..];
-    // `interp_exceptions.py descr_init` and `:277-282
-    // descr_new_base_exception` both store the `args_w` list their own
-    // signature was bound to, so `type.__call__` reaches here holding a list
-    // that already contains exactly these objects.  Keep it rather than build
-    // a second one over the same elements: `args` is read out as a fresh
-    // tuple and the storage is never handed out, so its identity is not
-    // observable.
+    // `descr_init(self, space, args_w)` has `args_w` bound as the positional
+    // list, so a keyword never reaches the body and the caller gets a
+    // TypeError.  The flat builtin ABI carries keywords in a trailing
+    // `__pyre_kw__` marker instead, so reject them here: every arity path
+    // reaches this initializer, the single point `descr_init` is upstream.
+    let (positional, kwargs) = split_builtin_kwargs(&args[1..]);
+    if has_real_kwargs(kwargs) {
+        return Err(exc_no_keywords_error(w_self, "BaseException"));
+    }
+    // `interp_exceptions.py descr_init` and `descr_new_base_exception` both
+    // store the `args_w` list they were handed, so `type.__call__` reaches
+    // here holding a list that already contains exactly these objects.  Keep
+    // it rather than build a second one over the same elements: `args` is read
+    // out as a fresh tuple and the storage is never handed out, so its
+    // identity is not observable.
     if !exception_args_already(w_self, positional) {
         let _roots = pyre_object::gc_roots::push_roots();
         let self_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -9938,16 +9900,15 @@ pub fn make_exc_type_with_init(
                 crate::typedef::make_new_descr_maybe_sig(new_fn, new_sig),
             );
             if let Some(init_fn) = init_fn {
-                let init_sig = match name {
-                    "BaseException" => Some(crate::gateway::Signature::new(
-                        vec!["self"],
-                        Some("args"),
-                        None,
-                        0,
-                        0,
-                    )),
-                    _ => None,
-                };
+                // `descr_init(self, space, args_w)` binds `args_w` as the
+                // positional list.  No Signature: a `*args` one would pack
+                // those positionals into a fresh tuple on every exception
+                // construction, where `descr_init` only stores the list it was
+                // handed (`space.newtuple(self.args_w)` runs in
+                // `descr_getargs`, when `args` is read).  Keywords stay on the
+                // flat slice as the trailing marker and
+                // `exc_base_exception_init` rejects them.
+                let init_sig = None;
                 type_ns_store(
                     ns_slot,
                     "__init__",
