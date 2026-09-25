@@ -20049,7 +20049,9 @@ pub(crate) fn try_walker_specialize_build_string<Sym: WalkSym>(
         return Ok(None);
     }
 
-    let boxed_result = pyre_interpreter::runtime_ops::build_string_from_refs(&concretes);
+    let Ok(boxed_result) = pyre_interpreter::runtime_ops::build_string_from_refs(&concretes) else {
+        return Ok(None);
+    };
     if boxed_result.is_null()
         || !unsafe { pyre_object::is_exact_type(boxed_result, &pyre_object::STR_TYPE) }
     {
@@ -20065,7 +20067,12 @@ pub(crate) fn try_walker_specialize_build_string<Sym: WalkSym>(
         let prefix = if i + 1 == fragments.len() {
             boxed_result
         } else {
-            pyre_interpreter::runtime_ops::build_string_from_refs(&concretes[..=i])
+            let Ok(prefix) =
+                pyre_interpreter::runtime_ops::build_string_from_refs(&concretes[..=i])
+            else {
+                return Ok(None);
+            };
+            prefix
         };
         acc = emit_walker_descr_add(ctx, op_pc, acc, fragments[i], prefix)?;
     }
@@ -24361,8 +24368,13 @@ fn try_walker_specialize_zip_two_tuple_iters<Sym: WalkSym>(
             }
             let seq = pyre_object::w_tuple_iter_seq(inner);
             let index = pyre_object::w_tuple_iter_index(inner);
+            // `W_FastTupleIterObject.descr_next` indexes `tupleitems` captured
+            // by `W_AbstractTupleObject.descr_iter` from `tolist()`. Only
+            // `W_TupleObject.wrappeditems` is that array. An arity-2
+            // `W_SpecialisedTupleObject_*` stores `value0`/`value1` inline, so
+            // a `wrappeditems` load reads the payload as a pointer.
             if seq.is_null()
-                || !pyre_object::is_tuple(seq)
+                || !std::ptr::eq((*seq).ob_type, &pyre_object::TUPLE_TYPE)
                 || !pyre_object::is_exact_builtin_instance(seq)
                 || index < 0
             {

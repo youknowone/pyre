@@ -3597,12 +3597,13 @@ pub struct LoweringContext {
     pub build_set_from_array_fn_idx: u16,
     /// `build_string_from_array_fn` descrs-pool index — see codewriter.rs
     /// `register_helper_fn_pointers` (`bind(assembler,
-    /// cpu.build_string_from_array_fn, CallFlavor::Plain)`).  BUILD_STRING
+    /// cpu.build_string_from_array_fn, CallFlavor::CanRaise)`).  BUILD_STRING
     /// records the same `new_array_clear` + unrolled `setarrayitem_gc_r`
     /// fragment array, then the `build_string_from_array(array)` HLOp lowers
     /// to `residual_call_r_r(ConstInt(fn_idx), ListR([array]), Descr) → reg`
     /// via [`lower_tuple_build_hlop_to_insn`]; `bh_build_string_from_array`
-    /// concatenates already-formatted fragments (no user code → `Plain`).
+    /// concatenates the fragments (a non-str fragment raises `TypeError`,
+    /// no user code → `CanRaise`).
     pub build_string_from_array_fn_idx: u16,
     /// `format_simple_fn` descrs-pool index — see codewriter.rs
     /// `register_helper_fn_pointers` (`bind(assembler, cpu.format_simple_fn,
@@ -5052,13 +5053,12 @@ where
                 Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
                 _ => return None,
             };
-            // String concatenation over already-formatted fragments runs no
-            // user code (no `__str__` dispatch — FORMAT_* / CONVERT_VALUE ran
-            // first) → `Plain`, like the allocation-only `newtuple_from_array`.
+            // A non-str fragment raises `TypeError`.  No user code runs, so
+            // the residual is `CanRaise` (no virtualizable force).
             Some(build_residual_call_r_r_insn_from_operands(
                 ctx.build_string_from_array_fn_idx,
                 vec![array_operand],
-                CallFlavor::Plain,
+                CallFlavor::CanRaise,
                 majit_ir::RuntimeHelperKind::BuildStringFromArray,
                 dst_reg,
             ))
@@ -12868,7 +12868,7 @@ mod tests {
         // `build_string_from_array(array)` →
         // `residual_call_r_r(ConstInt(build_string_from_array_fn_idx),
         // ListR([array]), Descr) → reg`, the BuildSet-style array consumer
-        // (Plain — fragment concatenation runs no user code).
+        // (CanRaise — a non-str fragment raises TypeError).
         let array_var = Variable::new(VariableId(8), Kind::Ref);
         let result_var = Variable::new(VariableId(9), Kind::Ref);
         let (ctx, _, _) = load_attr_lowering_fixture();
