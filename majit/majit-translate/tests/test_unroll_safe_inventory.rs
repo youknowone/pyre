@@ -46,6 +46,10 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     ),
     // `pyframe.py` `fast2locals`.
     ("fast2locals", "pyframe.py fast2locals"),
+    // `pyframe.py` `popvalues` is `@jit.unroll_safe`; the CALL arm pops its
+    // `nargs` explicit arguments through it before `call_valuestack`, and the
+    // count is fixed by the call site's bytecode.
+    ("call_explicit_args", "pyframe.py popvalues"),
     // `typeobject.py` `lookup_starting_at`, the MRO-suffix walk `super`
     // attribute lookup runs.  Without the hint `look_inside_graph` rejects the
     // graph for its loop and the whole lookup is one opaque residual.

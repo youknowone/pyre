@@ -7559,6 +7559,10 @@ pub fn invert_inner(a: PyObjectRef) -> PyResult {
 
 #[cfg(test)]
 mod tests {
+    // The binop shortcuts probe the GIL-guarded method cache through
+    // `shortcut_binop`'s `space.lookup`, whose type dicts hash their keys, so
+    // a test reaching one installs the test hooks (and enters the runtime
+    // thread) first.
     use super::*;
 
     #[cfg(target_pointer_width = "64")]
@@ -7590,6 +7594,7 @@ mod tests {
 
     #[test]
     fn test_int_add() {
+        crate::test_hooks::install_hash_hook();
         let a = w_int_new(3);
         let b = w_int_new(4);
         let result = add(a, b).unwrap();
@@ -7655,6 +7660,7 @@ mod tests {
 
     #[test]
     fn test_zero_division() {
+        crate::test_hooks::install_hash_hook();
         let a = w_int_new(5);
         let b = w_int_new(0);
         assert!(floordiv(a, b).is_err());
@@ -7662,6 +7668,7 @@ mod tests {
 
     #[test]
     fn test_int_floordiv_and_mod_bounce_min_overflow_to_rbigint() {
+        crate::test_hooks::install_hash_hook();
         // intobject.py uses `ovfcheck` for both operations.  On a signed
         // machine word MIN / -1 is their sole non-zero-divisor overflow.
         let a = w_int_new(i64::MIN);
@@ -7676,6 +7683,7 @@ mod tests {
 
     #[test]
     fn test_long_floordiv_and_mod_keep_python_sign_rules() {
+        crate::test_hooks::install_hash_hook();
         let magnitude = BigInt::one().lshift(80).unwrap().int_add(13);
         for (lhs, rhs) in [
             (magnitude.clone(), BigInt::fromint(10)),
@@ -7705,6 +7713,7 @@ mod tests {
 
     #[test]
     fn test_int_add_overflow() {
+        crate::test_hooks::install_hash_hook();
         let a = w_int_new(i64::MAX);
         let b = w_int_new(1);
         let result = add(a, b).unwrap();
@@ -7719,6 +7728,7 @@ mod tests {
 
     #[test]
     fn test_int_sub_overflow() {
+        crate::test_hooks::install_hash_hook();
         let a = w_int_new(i64::MIN);
         let b = w_int_new(1);
         let result = sub(a, b).unwrap();
@@ -7733,6 +7743,7 @@ mod tests {
 
     #[test]
     fn test_int_mul_overflow() {
+        crate::test_hooks::install_hash_hook();
         let a = w_int_new(i64::MAX);
         let b = w_int_new(2);
         let result = mul(a, b).unwrap();
@@ -8350,12 +8361,14 @@ mod tests {
 
     #[test]
     fn test_int_lshift() {
+        crate::test_hooks::install_hash_hook();
         let result = lshift(w_int_new(1), w_int_new(10)).unwrap();
         unsafe { assert_eq!(w_int_get_value(result), 1024) };
     }
 
     #[test]
     fn test_int_lshift_overflow() {
+        crate::test_hooks::install_hash_hook();
         let result = lshift(w_int_new(1), w_int_new(64)).unwrap();
         unsafe {
             assert!(is_long(result));
@@ -8374,12 +8387,14 @@ mod tests {
 
     #[test]
     fn test_int_rshift() {
+        crate::test_hooks::install_hash_hook();
         let result = rshift(w_int_new(1024), w_int_new(3)).unwrap();
         unsafe { assert_eq!(w_int_get_value(result), 128) };
     }
 
     #[test]
     fn test_long_shift_mixed_operands_and_large_counts() {
+        crate::test_hooks::install_hash_hook();
         unsafe {
             let base = BigInt::one().lshift(70).unwrap();
             let shifted = lshift(w_long_new(base.clone()), w_long_new(BigInt::from(5))).unwrap();
@@ -8413,6 +8428,7 @@ mod tests {
 
     #[test]
     fn test_negative_shift_count() {
+        crate::test_hooks::install_hash_hook();
         assert!(lshift(w_int_new(1), w_int_new(-1)).is_err());
         assert!(rshift(w_int_new(1), w_int_new(-1)).is_err());
         assert!(lshift(w_long_new(BigInt::from(1)), w_long_new(BigInt::from(-1))).is_err());
@@ -8432,6 +8448,7 @@ mod tests {
 
     #[test]
     fn test_int_bitand() {
+        crate::test_hooks::install_hash_hook();
         let result = and_(w_int_new(0xFF), w_int_new(0x0F)).unwrap();
         unsafe { assert_eq!(w_int_get_value(result), 0x0F) };
     }
@@ -8458,6 +8475,7 @@ mod tests {
 
     #[test]
     fn inplace_add_fallthrough_takes_same_type_int_shortcut() {
+        crate::test_hooks::install_hash_hook();
         init_interned_binop_names();
         let result = binop_with_shortcut(w_int_new(1189), w_int_new(1), BinopDunder::Add).unwrap();
         unsafe { assert_eq!(w_int_get_value(result), 1190) };
@@ -8465,6 +8483,7 @@ mod tests {
 
     #[test]
     fn wrapint_and_load_small_int_take_mod_shortcut() {
+        crate::test_hooks::install_hash_hook();
         unsafe {
             init_interned_binop_names();
             let wrap = w_int_new(1189);
@@ -8481,6 +8500,7 @@ mod tests {
 
     #[test]
     fn test_bool_bitwise_shortcuts_return_bool_singletons() {
+        crate::test_hooks::install_hash_hook();
         unsafe {
             let tand = and_(w_bool_from(true), w_bool_from(true)).unwrap();
             let tand_f = and_(w_bool_from(true), w_bool_from(false)).unwrap();
@@ -8495,12 +8515,14 @@ mod tests {
 
     #[test]
     fn test_int_bitor() {
+        crate::test_hooks::install_hash_hook();
         let result = or_(w_int_new(0xF0), w_int_new(0x0F)).unwrap();
         unsafe { assert_eq!(w_int_get_value(result), 0xFF) };
     }
 
     #[test]
     fn test_int_bitxor() {
+        crate::test_hooks::install_hash_hook();
         let result = xor(w_int_new(0xFF), w_int_new(0x0F)).unwrap();
         unsafe { assert_eq!(w_int_get_value(result), 0xF0) };
     }
