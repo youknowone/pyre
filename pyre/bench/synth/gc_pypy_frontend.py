@@ -1,4 +1,12 @@
 # pyre-check: no-cpython
+# pyre-check: jitstats-band=guard_failures=8
+# The `<module>` list comprehension over gc.get_rpy_roots() is hot in pyre
+# (about 22.5k roots; pypy3 has 638) and its GuardClass fails once per root
+# type change. The roots list differs by platform, so guard_failures is
+# deterministic per runner but measured at 470 (windows), 473 (macos) and
+# 481 (ubuntu). The root count gap is the open prebuilt-root divergence:
+# incminimark adds a GCFLAG_NO_HEAP_PTRS prebuilt object to
+# prebuilt_root_objects only when a write barrier first fires on it.
 import gc
 import sys
 
