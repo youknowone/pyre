@@ -31,6 +31,8 @@
 //! bytecode, `GILReleaseAction` (gil.py) yields it from the periodic
 //! action; [`yield_thread`] is that yield.
 
+use std::collections::VecDeque;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicIsize, AtomicPtr, AtomicUsize, Ordering};
 // thread_pthread.c's mutex1_t and mutex2_t own native synchronization objects.
 // rpy_init_mutexes resets them in the forked child. A parking_lot mutex also
@@ -137,18 +139,112 @@ impl Mutex2 {
     }
 }
 
+/// `mutex_gil_stealer`, as the queue its own comment describes:
+/// "Enter the waiting queue from the end. Assuming a roughly first-in-first-out
+/// order, this gives the threads a round-robin chance."
+///
+/// A plain mutex does not give that order. It hands ownership to whichever
+/// waiter the platform picks, and a thread that just released it can retake it
+/// before a sleeping waiter is even scheduled — macOS's `firstfit` mutex barges
+/// in favour of the running thread by design, and a futex-backed one is no
+/// fairer under sustained contention. What starves is the thread that blocks:
+/// with five mutators in a `gc.collect()` loop, a thread returning from a
+/// blocking call re-entered this queue and lost it thousands of times in a row
+/// (`test_stop_the_world_during_finalization`: 1385 of 1429 samples parked
+/// here).
+///
+/// Waiters enqueue at the tail under the serving mutex, matching
+/// `mutex1_lock`, and unlock wakes only the head, matching `mutex1_unlock`.
+struct StealerQueue {
+    inner: Mutex<StealerInner>,
+}
+
+struct StealerInner {
+    held: bool,
+    waiters: VecDeque<StealerWaiterPtr>,
+}
+
+struct StealerWaiter {
+    ready: bool,
+    cond: Condvar,
+}
+
+/// Pointer to a `StealerWaiter` parked on another thread's stack. The waiter
+/// stays alive until it observes `ready` and returns from [`StealerQueue::lock`].
+struct StealerWaiterPtr(NonNull<StealerWaiter>);
+
+// SAFETY: the pointer is only used while the waiter is queued, and only under
+// `StealerQueue::inner`. The waiting thread does not deallocate it until it
+// has been popped and notified.
+unsafe impl Send for StealerWaiterPtr {}
+
+impl StealerQueue {
+    const fn new() -> Self {
+        StealerQueue {
+            inner: Mutex::new(StealerInner {
+                held: false,
+                waiters: VecDeque::new(),
+            }),
+        }
+    }
+
+    /// Enqueue at the tail and wait to become the head. Stands in for
+    /// `mutex1_lock`; the returned guard is what `mutex1_unlock` would end.
+    fn lock(&self) -> StealerTicket<'_> {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.held && inner.waiters.is_empty() {
+            inner.held = true;
+            return StealerTicket { queue: self };
+        }
+        let mut waiter = StealerWaiter {
+            ready: false,
+            cond: Condvar::new(),
+        };
+        inner
+            .waiters
+            .push_back(StealerWaiterPtr(NonNull::from(&mut waiter)));
+        loop {
+            if waiter.ready {
+                break;
+            }
+            inner = waiter.cond.wait(inner).unwrap();
+        }
+        StealerTicket { queue: self }
+    }
+}
+
+struct StealerTicket<'a> {
+    queue: &'a StealerQueue,
+}
+
+impl Drop for StealerTicket<'_> {
+    fn drop(&mut self) {
+        let mut inner = self.queue.inner.lock().unwrap();
+        if let Some(next) = inner.waiters.pop_front() {
+            // SAFETY: the waiter lives on the waiting thread's stack until it
+            // observes `ready` and returns from `lock`. Popping removes the
+            // only remaining alias.
+            let waiter = unsafe { &mut *next.0.as_ptr() };
+            waiter.ready = true;
+            waiter.cond.notify_one();
+        } else {
+            inner.held = false;
+        }
+    }
+}
+
 /// thread_gil.c:89-90. Held in one cell because `rpy_init_mutexes` re-creates
 /// both of them together. The native wait queues do not retain the parent
 /// threads when the child replaces these synchronization objects.
 struct GilMutexes {
-    stealer: Mutex<()>,
+    stealer: StealerQueue,
     gil: Mutex2,
 }
 
 impl GilMutexes {
     const fn new() -> Self {
         GilMutexes {
-            stealer: Mutex::new(()),
+            stealer: StealerQueue::new(),
             gil: Mutex2::new_locked(),
         }
     }
@@ -401,7 +497,7 @@ fn acquire_slow_path(ident: usize) {
     // first-in-first-out order, this gives the threads a round-robin chance.
     {
         let mutexes = mutexes();
-        let _stealer = mutexes.stealer.lock().unwrap();
+        let _stealer = mutexes.stealer.lock();
         let mut gil = mutexes.gil.loop_start();
 
         // We are now the stealer thread. Steals!
@@ -581,7 +677,7 @@ mod tests {
             let started = ready.clone();
             let waiter = std::thread::spawn(move || {
                 started.store(true, Ordering::Release);
-                let _guard = mutexes().stealer.lock().unwrap();
+                let _guard = mutexes().stealer.lock();
             });
             while !ready.load(Ordering::Acquire) {
                 std::thread::yield_now();
@@ -592,7 +688,7 @@ mod tests {
         }
 
         allocate(); // Installs the real rpy_init_mutexes child hook.
-        let held = mutexes().stealer.lock().unwrap();
+        let held = mutexes().stealer.lock();
         let parent_waiter = start_waiter();
         let child = unsafe { libc::fork() };
         assert!(child >= 0, "fork failed");
@@ -601,7 +697,7 @@ mod tests {
             // that new mutex through the guard for its old incarnation.
             std::mem::forget(held);
             unsafe { libc::alarm(5) };
-            let held = mutexes().stealer.lock().unwrap();
+            let held = mutexes().stealer.lock();
             let child_waiter = start_waiter();
             drop(held);
             child_waiter.join().unwrap();
@@ -615,5 +711,36 @@ mod tests {
             libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
             "child stalled after GIL mutex reinitialization: wait status {status}"
         );
+    }
+
+    #[test]
+    fn stealer_queue_serves_waiters_in_arrival_order() {
+        let queue = StealerQueue::new();
+        let held = queue.lock();
+        let order = Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            let mut waiters = Vec::new();
+            let queue = &queue;
+            let order = &order;
+            for i in 0..8 {
+                let entered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let started = entered.clone();
+                let handle = scope.spawn(move || {
+                    started.store(true, Ordering::Release);
+                    let _ticket = queue.lock();
+                    order.lock().push(i);
+                });
+                while !entered.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                std::thread::sleep(Duration::from_millis(20));
+                waiters.push(handle);
+            }
+            drop(held);
+            for waiter in waiters {
+                waiter.join().unwrap();
+            }
+        });
+        assert_eq!(*order.lock(), [0, 1, 2, 3, 4, 5, 6, 7]);
     }
 }
