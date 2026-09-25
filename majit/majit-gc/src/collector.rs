@@ -4756,6 +4756,9 @@ impl MiniMarkGC {
                 (*(shadow_hdr_ptr as *mut GcHeader)).set_flag(GcFlags::GCFLAG_VISITED);
             }
             if item_size > 0 {
+                // `find_shadow` has already rejected a forwarded header.
+                // `is_forwarded` is nursery-only, and this object is still
+                // the uncopied nursery original, so the length word is its own.
                 *((shadow_obj + length_offset) as *mut usize) =
                     *((obj_addr + length_offset) as *const usize);
             }
@@ -4895,14 +4898,47 @@ impl MiniMarkGC {
         );
     }
 
+    /// `get_possibly_forwarded_type_id`: follow a nursery corpse before
+    /// reading its size. `set_forwarding_address` writes the live address
+    /// at payload offset 0, which is `length_offset` for a varsize type
+    /// whose length is its first field.
+    ///
+    /// `None` when the header is forwarded but the copy is not a live
+    /// managed object. An object outside the nursery is never forwarded
+    /// (`is_forwarded`).
+    fn resolve_possibly_forwarded(&self, obj_addr: usize, type_id: u32) -> Option<(usize, u32)> {
+        if !self.is_in_nursery(obj_addr) {
+            return Some((obj_addr, type_id));
+        }
+        let hdr = unsafe { *header_of(obj_addr) };
+        if !hdr.is_forwarded() {
+            return Some((obj_addr, type_id));
+        }
+        let live = unsafe { GcHeader::forwarding_address(header_of(obj_addr)) };
+        if !self.is_managed_heap_object(live) {
+            return None;
+        }
+        let live_hdr = unsafe { *header_of(live) };
+        if live_hdr.is_forwarded() {
+            return None;
+        }
+        Some((live, live_hdr.type_id()))
+    }
+
     /// `base.py _get_size_for_typeid` — the payload size of `obj_addr`,
     /// reading the length field when the type is varsize. `None` when the
     /// length cannot describe an allocation.
+    ///
+    /// The length is read from the object `get_possibly_forwarded_type_id`
+    /// would hand to `get_size`. `_get_size_for_typeid` itself still loads
+    /// the word raw; the forward step is the caller's, done here because
+    /// this function is that caller for every size query.
     ///
     /// Upstream rounds the result here. Pyre's callers each apply their own
     /// rounding (nursery geometry, arena minimum, inspector alignment), so the
     /// rounding stays at the call sites.
     fn try_size_for_typeid(&self, obj_addr: usize, type_id: u32) -> Option<usize> {
+        let (obj_addr, type_id) = self.resolve_possibly_forwarded(obj_addr, type_id)?;
         if (type_id as usize) >= self.types.len() {
             return None;
         }
@@ -4963,6 +4999,9 @@ impl MiniMarkGC {
         if type_info.item_size == 0 {
             return false;
         }
+        // A forwarded header is `FORWARDED_MARKER`, so every flag bit reads
+        // set and the `GCFLAG_HAS_SHADOW` test above already returned. This
+        // write therefore addresses the nursery original, not a corpse.
         let length_ptr = (obj_addr + type_info.length_offset) as *mut usize;
         assert!(
             smaller_length <= unsafe { *length_ptr },
@@ -4984,8 +5023,23 @@ impl MiniMarkGC {
         match self.try_size_for_typeid(obj_addr, type_id) {
             Some(size) => size,
             None => {
-                let type_info = self.types.get(type_id);
-                let length = unsafe { *((obj_addr + type_info.length_offset) as *const usize) };
+                // Same address `try_size_for_typeid` sized. A corpse that
+                // resolved contributes the copy's length; one that did not
+                // still reports the word at the caller's address.
+                let (read_addr, read_tid) = self
+                    .resolve_possibly_forwarded(obj_addr, type_id)
+                    .unwrap_or((obj_addr, type_id));
+                let type_info = self.types.get(if (read_tid as usize) < self.types.len() {
+                    read_tid
+                } else {
+                    type_id
+                });
+                let length_addr = if (read_tid as usize) < self.types.len() {
+                    read_addr
+                } else {
+                    obj_addr
+                };
+                let length = unsafe { *((length_addr + type_info.length_offset) as *const usize) };
                 // `set_forwarding_address` stores the new address in the word
                 // right after the header — `obj_addr + 0`.  Every type whose
                 // `length_offset` is 0 therefore has its length word overwritten
@@ -5448,6 +5502,10 @@ impl MiniMarkGC {
 
         // Process variable-part items if they contain GC pointers.
         if items_have_gc_ptrs && item_size > 0 {
+            // The holder is the live object. `validate_type_id` already
+            // rejected a forwarded header: `FORWARDED_MARKER`'s type id sits
+            // outside the table. `_trace_drag_out` returns before `get_size`
+            // on a corpse and traces the copy later, as an old object.
             let length = unsafe { *((obj_addr + length_offset) as *const usize) };
             let items_start = obj_addr + base_size;
             for i in 0..length {
@@ -5898,6 +5956,9 @@ impl MiniMarkGC {
             visitor((obj_addr + offset) as *mut GcRef);
         }
         if type_info.items_have_gc_ptrs && type_info.item_size > 0 {
+            // `validate_type_id` ran on this header. A forwarded nursery
+            // corpse fails that check (`get_possibly_forwarded_type_id`
+            // would have replaced the address first) and never gets here.
             let length = unsafe { *((obj_addr + type_info.length_offset) as *const usize) };
             let items_start = obj_addr + type_info.size;
             for i in 0..length {
@@ -5984,6 +6045,8 @@ impl MiniMarkGC {
             }
         }
         if type_info.items_have_gc_ptrs && type_info.item_size > 0 {
+            // Same gate as `visit_referent_slots`: the type id was taken
+            // from this header and checked, so the address is not a corpse.
             let length = unsafe { *((obj_addr + type_info.length_offset) as *const usize) };
             let items_start = obj_addr + type_info.size;
             for i in 0..length {
@@ -7373,6 +7436,9 @@ impl MiniMarkGC {
             // large GC-managed pointer array does not double the marking-side
             // peak memory or retain that capacity for the collector's lifetime.
             if items_have_gc_ptrs && item_size > 0 {
+                // The nursery arm above asserts `!is_forwarded`. An old
+                // object is never forwarded (`is_forwarded` requires the
+                // nursery), so this length is the object's own.
                 let length = unsafe { *((obj_addr + length_offset) as *const usize) };
                 let items_start = obj_addr + fixed_size;
                 for i in 0..length {
@@ -7941,6 +8007,10 @@ impl MiniMarkGC {
             }
         }
         if info.items_have_gc_ptrs && info.item_size > 0 {
+            // The type id was read from this header. A forwarded header's
+            // type id is outside the table, so `types.get` does not reach
+            // a corpse; `get_possibly_forwarded_type_id` is the path that
+            // would have substituted the copy first.
             let length = unsafe { *((obj_addr + info.length_offset) as *const usize) };
             let items_start = obj_addr + info.size;
             for i in 0..length {
@@ -8870,6 +8940,8 @@ impl MiniMarkGC {
         let type_id = unsafe { (*hdr).type_id() };
         let type_info = self.types.get(type_id);
         let length_offset = type_info.length_offset;
+        // Card bytes belong to an old array. `is_forwarded` is nursery-only,
+        // so this length word has not been overwritten with a forwarding address.
         let length = unsafe { *((obj.0 + length_offset) as *const usize) };
         let bytes = self.card_marking_bytes_for_length(length);
         let mut result = Vec::new();
@@ -8900,6 +8972,9 @@ impl MiniMarkGC {
             let type_id = unsafe { (*hdr).type_id() };
             let type_info = self.types.get(type_id);
             let length_offset = type_info.length_offset;
+            // `old_objects_with_cards_set` holds old arrays. A nursery
+            // corpse is never on that list (`is_forwarded` asserts the
+            // nursery), so the length word is the array's own.
             let length = unsafe { *((obj + length_offset) as *const usize) };
             let bytes = self.card_marking_bytes_for_length(length);
 
@@ -9014,6 +9089,7 @@ impl MiniMarkGC {
         let type_id = unsafe { (*hdr).type_id() };
         let type_info = self.types.get(type_id);
         let length_offset = type_info.length_offset;
+        // Same old-array precondition as `dirty_cards`: not a nursery corpse.
         let length = unsafe { *((obj_addr + length_offset) as *const usize) };
         let bytes = self.card_marking_bytes_for_length(length);
         for bi in 0..bytes {
@@ -12792,6 +12868,24 @@ mod tests {
         let tid = gc.register_type(TypeInfo::varsize(16, 8, 0, false, Vec::new()));
         let length = std::cell::Cell::new(usize::MAX);
         gc.size_for_typeid(length.as_ptr() as usize, tid, "test");
+    }
+
+    /// `get_possibly_forwarded_type_id` then `get_size`. The nursery corpse's
+    /// first payload word is the forwarding address (`set_forwarding_address`),
+    /// and that word is the length when `length_offset == 0`.
+    #[test]
+    fn forwarded_varsize_length_is_read_from_the_copy() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::varsize(16, 8, 0, false, Vec::new()));
+        let corpse = gc.alloc_varsize_typed(tid, 16, 8, 1);
+        let live = gc.alloc_oldgen_typed(tid, 16 + 8 * 4);
+        assert!(gc.is_in_nursery(corpse.0));
+        assert!(!gc.is_in_nursery(live.0));
+        unsafe {
+            *((live.0) as *mut usize) = 4;
+            GcHeader::set_forwarding_address(header_of(corpse.0), live.0);
+        }
+        assert_eq!(gc.try_size_for_typeid(corpse.0, tid), Some(16 + 8 * 4));
     }
 
     /// llsupport/gc.py GcLLDescr_framework
