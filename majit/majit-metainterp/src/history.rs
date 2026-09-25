@@ -984,7 +984,13 @@ impl TreeLoop {
             let mut stack: Vec<(OpRef, bool)> = vec![(*root, true)];
             while let Some((r, is_root)) = stack.pop() {
                 if r.raw() < num_original_inputargs {
-                    if inputarg_consts.get(r.raw() as usize).is_none() {
+                    // A missing slot and an explicit `OpRef::None` (a bridge
+                    // hole) are the same: there is no value to bake in, and a
+                    // loop cut must not invent an inputarg for it.
+                    let deliverable = inputarg_consts
+                        .get(r.raw() as usize)
+                        .is_some_and(|c| !c.is_none());
+                    if !deliverable {
                         if promote_snapshot_inputargs && is_root {
                             return Some(SnapshotSeed::Promote);
                         }
@@ -1143,7 +1149,9 @@ impl TreeLoop {
         let mut new_ia_boxes = original_box_opref;
         let mut new_ia_types = original_box_types;
         for &r in &orig_inputarg_escaped {
-            if let Some(&const_opref) = inputarg_consts.get(r.raw() as usize) {
+            if let Some(&const_opref) = inputarg_consts.get(r.raw() as usize)
+                && !const_opref.is_none()
+            {
                 // Remap to the pre-allocated pool constant (already GC-rooted).
                 remap.insert(r, const_opref);
             } else {

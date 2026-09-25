@@ -8319,14 +8319,17 @@ impl<M: Clone> MetaInterp<M> {
             // though — it lands on the outcome the `except InvalidLoop` arm
             // just below it already defines, "this trace produced no loop",
             // reached one step earlier because pyre's cut is materialized.
-            // A snapshot box with no replayable definition becomes a cut
-            // inputarg (`opencoder.py CutTrace`). The patch keeps that tail
-            // on the loop entry instead of counting it as a vable field.
+            // A loop entry (`compile.py compile_loop`) supplies only the
+            // merge-point red boxes. A snapshot box that cannot be replayed
+            // is an inputarg only on a bridge (`compile.py compile_retrace`,
+            // `opencoder.py CutTrace`); appending it here widens the entry
+            // `patch_new_loop_to_load_virtualizable_fields` asserts, so the
+            // cut declines and this compilation is cancelled.
             let Some(cut) = trace.cut_trace_from_with_consts(
                 start,
                 original_boxes,
                 &ctx.initial_inputarg_consts,
-                true,
+                false,
             ) else {
                 return CompileOutcome::Cancelled;
             };
