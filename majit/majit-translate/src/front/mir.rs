@@ -8828,6 +8828,22 @@ impl<'a> Lowering<'a> {
                         return Ok(res);
                     }
                 }
+                // `*_r` reads the place recorded when `_r` was bound, the
+                // same place a later write updates. The binding itself
+                // holds the value from before that write.
+                if let ProjectionElem::Atom(name) = &elem
+                    && name == "Deref"
+                    && let PlaceKind::Local(local) = inner.kind
+                    && let Some(recorded) = self.atomic_ref_place.get(&(local as usize)).cloned()
+                {
+                    let followed = self.concrete_borrow_place(recorded);
+                    // A local is the slot `mem::replace` writes. A projection
+                    // stays the borrowed value: re-resolving it would emit a
+                    // fresh field or index read for every borrow.
+                    if matches!(followed.kind, PlaceKind::Local(_)) {
+                        return self.resolve_place(mir_bb, followed);
+                    }
+                }
                 match elem {
                     ProjectionElem::Tagged(_) | ProjectionElem::Atom(_) => {
                         self.resolve_place(mir_bb, *inner)
@@ -11425,14 +11441,20 @@ impl<'a> Lowering<'a> {
                         && !reaches_declared_vable_array(&self.graph, &args[0])
                     {
                         // The buffer is headerless. `[u8]` is the length-prefixed
-                        // byte block, so a Vec keeps its own identity: element
-                        // `u8`, `nolength`, cache key distinct from `[u8]`.
+                        // byte block, so a Vec of an addressable element keeps
+                        // its own identity: element `u8`, `nolength`, cache key
+                        // distinct from `[u8]`. A multi-word element has no
+                        // width in that string, so the call stays residual.
                         // A declared virtualizable array keeps the length-prefixed
                         // descr the vable protocol already uses.
-                        first_arg_ty
-                            .as_ref()
-                            .map(|ty| tyref_to_ast_string(ty, self.llbc))
-                            .filter(|identity| !identity.starts_with("??"))
+                        if element_is_addressable || element_spelling.is_some() {
+                            first_arg_ty
+                                .as_ref()
+                                .map(|ty| tyref_to_ast_string(ty, self.llbc))
+                                .filter(|identity| !identity.starts_with("??"))
+                        } else {
+                            None
+                        }
                     } else {
                         // `get_array_descr` keys the descr cache on the ARRAY
                         // lltype, so two sites naming the same element name the

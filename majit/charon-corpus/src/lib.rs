@@ -491,3 +491,12 @@ pub fn replace_field(cell: &mut ReplaceField, new: i64) -> i64 {
 pub fn replace_elem(items: &mut [i64], index: usize, new: i64) -> i64 {
     std::mem::replace(&mut items[index], new)
 }
+
+/// `mem::replace(&mut *r, new)` where `r` reborrows a local, then `*r`.
+/// The read must observe `new`, not the value bound into `r`.
+#[inline(never)]
+pub fn replace_reborrow_then_read(mut slot: i64, new: i64) -> i64 {
+    let r = &mut slot;
+    std::mem::replace(&mut *r, new);
+    *r
+}

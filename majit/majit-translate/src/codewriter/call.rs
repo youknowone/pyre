@@ -2016,7 +2016,7 @@ impl StructLayout {
                         .unwrap_or(crate::layout::target_word_size())
                         .min(crate::layout::target_word_size())
                 } else {
-                    get_type_flag(ty).2
+                    type_align(ty)
                 }
             })
             .filter(|s| *s > 0)
@@ -9267,7 +9267,7 @@ fn all_interiorfielddescrs(
     }
     let max_align = fields
         .iter()
-        .map(|(_, ty)| get_type_flag(ty).2)
+        .map(|(_, ty)| type_align(ty))
         .filter(|s| *s > 0)
         .max()
         .unwrap_or_else(crate::layout::target_word_size);
@@ -9449,7 +9449,7 @@ fn compute_struct_size_uncached(
                     .unwrap_or(crate::layout::target_word_size())
                     .min(crate::layout::target_word_size())
             } else {
-                get_type_flag(ty).2
+                type_align(ty)
             }
         })
         .filter(|s| *s > 0)
@@ -9600,6 +9600,23 @@ pub(crate) fn get_type_flag(
             majit_ir::value::Type::Ref,
             crate::layout::target_word_size(),
         ),
+    }
+}
+
+/// Byte alignment of a type string. A scalar or pointer-sized value's
+/// size is already a power of two and is its alignment. A non-scalar
+/// multi-word value is not: `[T; N]` is aligned as `T`, and an inline
+/// aggregate whose size is not a power of two (`Vec<T>` is three words)
+/// is aligned to one word. Struct-size rounding uses this, not the size.
+pub(crate) fn type_align(type_str: &str) -> usize {
+    if let Some((elem, len)) = crate::front::mir::shaped_array_parts(type_str) {
+        return if len == 0 { 0 } else { type_align(elem) };
+    }
+    let size = get_type_flag(type_str).2;
+    if size == 0 || size.is_power_of_two() {
+        size
+    } else {
+        crate::layout::target_word_size()
     }
 }
 
@@ -10384,6 +10401,40 @@ mod tests {
         assert_eq!(layout.fields[0].flag, ArrayFlag::Struct);
         assert_eq!(layout.fields[1].name, "depth");
         assert_eq!(layout.fields[1].offset, 3 * word);
+        // `depth` is a word, so the struct's alignment is a word and the
+        // size stays `3 * word + word`.
+        assert_eq!(layout.size, 4 * word);
+
+        let vec_only = StructLayout::from_type_strings(
+            &[("v".into(), "Vec<u8>".into())],
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(vec_only.fields.len(), 1);
+        assert_eq!(vec_only.fields[0].size, 3 * word);
+        assert_eq!(vec_only.size, 3 * word);
+
+        let vec_then_flag = StructLayout::from_type_strings(
+            &[("v".into(), "Vec<u8>".into()), ("flag".into(), "u8".into())],
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(vec_then_flag.fields[1].offset, 3 * word);
+        assert_eq!(vec_then_flag.size, 4 * word);
+
+        let mut heuristic = CallControl::new();
+        let mut rows = crate::front::StructFieldRegistry::default();
+        rows.fields
+            .insert("vec_only".into(), vec![("v".into(), "Vec<u8>".into())]);
+        rows.fields.insert(
+            "vec_then_flag".into(),
+            vec![("v".into(), "Vec<u8>".into()), ("flag".into(), "u8".into())],
+        );
+        heuristic.set_struct_fields(rows);
+        assert_eq!(compute_struct_size(&heuristic, "vec_only"), 3 * word);
+        assert_eq!(compute_struct_size(&heuristic, "vec_then_flag"), 4 * word);
 
         let owner = "vec_field_layout::Vm";
         let owner_id = majit_ir::descr::StructId::from_canonical(owner);
