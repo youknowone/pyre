@@ -554,7 +554,7 @@ pub unsafe fn w_range_iter_has_next(obj: PyObjectRef) -> bool {
 /// the bound and the per-iteration cursor work is one load, one add and one
 /// store — `step` is the constant 1 and `remaining` is derived as
 /// `stop - current`.
-#[pyre_class("range_iterator", type_id = 183, static_name = "RANGE_ITER_STEP_ONE")]
+#[pyre_class("range_iterator", type_id = 165, static_name = "RANGE_ITER_STEP_ONE")]
 pub struct W_IntRangeStepOneIterator {
     pub current: i64,
     pub stop: i64,
@@ -566,7 +566,7 @@ pub struct W_IntRangeStepOneIterator {
 /// class.
 ///
 /// Layout: `[ob_type | current: i64 | stop: i64]`
-#[pyre_class("range_iterator", type_id = 184, static_name = "RANGE_ITER_ONE_ARG")]
+#[pyre_class("range_iterator", type_id = 166, static_name = "RANGE_ITER_ONE_ARG")]
 pub struct W_IntRangeOneArgIterator {
     pub current: i64,
     pub stop: i64,

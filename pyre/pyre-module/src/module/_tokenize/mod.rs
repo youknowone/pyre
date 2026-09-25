@@ -1033,14 +1033,13 @@ pyre_interpreter::py_module! {
 
 /// The GC types this module owns, in `build_gc` registration order.
 pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType>) {
-    use pyre_interpreter::importing::{ModuleGcAnchor, ModuleGcLayout, ModuleGcType};
+    use pyre_interpreter::importing::{ModuleGcLayout, ModuleGcType};
     use pyre_object::lltype::PyreClassPyTypeOf;
     // W_TokenizerIter owns Rust heap (source string, token / error vectors, the
     // line table); as an immortal it was never swept, but now that it is
     // GC-managed the marker reclaims dead instances, so a destructor runs its
     // Drop glue and frees that heap instead of leaking it.
     types.push(ModuleGcType {
-        anchor: ModuleGcAnchor::AfterDequeRevIter,
         descriptor: <W_TokenizerIter as PyreClassPyTypeOf>::DESCRIPTOR,
         layout: ModuleGcLayout::PyreClass {
             memory_pressure_offset: None,

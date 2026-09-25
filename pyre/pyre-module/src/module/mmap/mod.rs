@@ -13,13 +13,12 @@ pub use interp_mmap::{W_MMap, w_mmap_dealloc};
 
 /// The GC types this module owns, in `build_gc` registration order.
 pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType>) {
-    use pyre_interpreter::importing::{ModuleGcAnchor, ModuleGcLayout, ModuleGcType};
+    use pyre_interpreter::importing::{ModuleGcLayout, ModuleGcType};
     use pyre_object::lltype::PyreClassPyTypeOf;
     // PyPy's W_MMap directly owns rmmap.MMap.  The typed wrapper carries the
     // subclass mapdict prefix (its mapping/fd payload holds no Python
     // reference) and a sweep destructor for the native mapping and duplicated fd.
     types.push(ModuleGcType {
-        anchor: ModuleGcAnchor::AfterScandirIterator,
         descriptor: <W_MMap as PyreClassPyTypeOf>::DESCRIPTOR,
         layout: ModuleGcLayout::CustomTrace(
             pyre_interpreter::objspace::std::mapdict::mapdict_storage_custom_trace,

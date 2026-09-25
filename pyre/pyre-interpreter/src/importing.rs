@@ -498,28 +498,6 @@ static SYS_PATH_0_PENDING: LazyLock<Mutex<Option<std::ffi::OsString>>> =
 pub(crate) static BUILTIN_MODULES: LazyLock<Mutex<HashMap<&'static str, BuiltinModuleDef>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Where a module-owned GC type joins `build_gc`'s registration order.
-///
-/// GC type ids are handed out in registration order and
-/// `SUBCLASS_RANGE_HIERARCHY` names them by number, so each module type keeps
-/// the slot it had when the JIT registered it by name: `build_gc` drains the
-/// types of one anchor at the point the anchor names.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ModuleGcAnchor {
-    /// Behind `_collections.deque_reverse_iterator`.
-    AfterDequeRevIter,
-    /// Behind the interpreter's header-only `#[pyre_class]` types.
-    AfterWClassOnlyTypes,
-    /// Behind `_io.StringIO`.
-    AfterStringIO,
-    /// Behind `gc` `W_GcStats`.
-    AfterGcStats,
-    /// Behind `posix.ScandirIterator`, where the target-gated tail begins.
-    AfterScandirIterator,
-    /// Behind `_io._WindowsConsoleIO`, the last interpreter rclass.
-    AfterWindowsConsoleIO,
-}
-
 /// The GC layout a module type declares for itself.
 #[derive(Clone, Copy)]
 pub enum ModuleGcLayout {
@@ -539,7 +517,6 @@ pub enum ModuleGcLayout {
 /// the sweep destructor that releases it (`_finalize_` / `__del__`).
 #[derive(Clone, Copy)]
 pub struct ModuleGcType {
-    pub anchor: ModuleGcAnchor,
     pub descriptor: &'static pyre_object::lltype::PyreClassDescriptor,
     pub layout: ModuleGcLayout,
     pub destructor: Option<majit_gc::trace::DestructorFn>,
@@ -570,7 +547,6 @@ pub struct OptionalModuleHooks {
     pub install_modules: fn(),
     pub walk_global_roots: fn(&mut dyn FnMut(&mut majit_ir::GcRef)),
     pub walk_prebuilt_slots: fn(&mut dyn FnMut(&mut PyObjectRef)),
-    pub subclass_range_aliases: fn() -> Vec<pyre_object::pyobject::SubclassRangeAlias>,
     /// Residual addresses whose functions live in `pyre-module` (`ll_math`
     /// hypot/atan2/…). `jit_trace_fnaddrs` appends these after the
     /// interpreter-owned table.
@@ -586,8 +562,9 @@ pub struct OptionalModuleHooks {
     pub ctypes_bytes_object: fn(PyObjectRef) -> Option<PyObjectRef>,
     pub ctypes_array_instance: fn(PyObjectRef) -> bool,
     pub ctypes_pointer_instance: fn(PyObjectRef) -> bool,
-    /// The GC types the modules own, in registration order within each
-    /// [`ModuleGcAnchor`].
+    /// The GC types the modules own, in registration order. `build_gc`
+    /// numbers them from [`crate::MODULE_FIRST_TYPE_ID`], after every
+    /// interpreter class.
     pub gc_types: fn() -> Vec<ModuleGcType>,
     /// Header-only `#[pyre_class]` types the modules allocate immortal; only
     /// the immortal-root walker learns their `w_class` edge.
