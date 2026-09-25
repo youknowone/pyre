@@ -5121,14 +5121,6 @@ fn build_jit_driver_pair() -> JitDriverPair {
                 addrs
             },
         });
-        majit_metainterp::register_frame_anchor_push_residual(
-            majit_metainterp::FrameAnchorPushResidual {
-                fnaddrs: pyre_interpreter::jit_trace_fnaddrs()
-                    .into_iter()
-                    .filter_map(|(name, addr)| name.contains("frame_anchor_push").then_some(addr))
-                    .collect(),
-            },
-        );
         majit_metainterp::register_frame_anchor_live_residual(
             majit_metainterp::FrameAnchorLiveResidual {
                 fnaddrs: pyre_interpreter::jit_trace_fnaddrs()
@@ -5141,9 +5133,9 @@ fn build_jit_driver_pair() -> JitDriverPair {
             fnaddrs: pyre_interpreter::jit_trace_fnaddrs()
                 .into_iter()
                 .filter_map(|(name, addr)| {
-                    (name.contains("frame_anchor_release")
-                        || name.contains("frame_anchor_drop")
-                        || name.contains("stack_check")
+                    // `frame_anchor_push` is a recorded `CallI` whose depth
+                    // word the trace keeps, so its release is recorded too.
+                    (name.contains("stack_check")
                         || name.contains("set_in_flight_exception"))
                     .then_some(addr)
                 })
