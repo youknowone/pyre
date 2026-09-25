@@ -429,41 +429,20 @@ fn is_a_float(w_ob: PyObjectRef) -> bool {
     unsafe { pyre_object::pyobject::is_float(w_ob) }
 }
 
-/// True when `w_ob` is an `int` (or `bool`) whose value is already a machine
-/// word — `space.int_w(w_ob, allow_conversion=False)`'s success case.
-fn exact_int_w(w_ob: PyObjectRef) -> Option<Result<i64, PyError>> {
-    unsafe {
-        if pyre_object::pyobject::is_bool(w_ob) {
-            return Some(Ok(i64::from(pyre_object::boolobject::w_bool_get_value(
-                w_ob,
-            ))));
-        }
-        if pyre_object::pyobject::is_int(w_ob) {
-            return Some(Ok(pyre_object::intobject::w_int_get_value(w_ob)));
-        }
-        if pyre_object::pyobject::is_long(w_ob) {
-            let big = pyre_object::longobject::w_long_get_value(w_ob);
-            if pyre_object::longobject::jit_bigint_to_i64_fits(big) != 0 {
-                return Some(Ok(pyre_object::longobject::jit_bigint_to_i64_value(big)));
-            }
-            return Some(Err(PyError::overflow_error(OVF_MSG)));
-        }
-    }
-    None
-}
-
 /// `misc.py as_long`.  Accepts an `int`, and anything with `__index__`;
 /// refuses a float.
 pub fn as_long(w_ob: PyObjectRef) -> Result<i64, PyError> {
-    match exact_int_w(w_ob) {
-        Some(Ok(value)) => return Ok(value),
-        // `as_long` lets an OverflowError through only after re-reading the
-        // object with conversion allowed, which is where a bigint too large
-        // for a word raises again.
-        Some(Err(_)) => {}
-        None => {
-            if is_a_float(w_ob) {
-                return Err(PyError::type_error("integer expected, got float"));
+    match pyre_interpreter::baseobjspace::int_w_allow_conversion(w_ob, false) {
+        Ok(value) => return Ok(value),
+        Err(e) => {
+            // `space.int_w(w_ob, allow_conversion=False)` runs no
+            // application code, so its error is one of the two kinds it
+            // builds itself and `e.match` reads the kind.
+            if !(e.kind == pyre_interpreter::PyErrorKind::OverflowError
+                || e.kind == pyre_interpreter::PyErrorKind::TypeError)
+                || is_a_float(w_ob)
+            {
+                return Err(e);
             }
         }
     }
@@ -479,22 +458,23 @@ pub fn as_long_long(w_ob: PyObjectRef) -> Result<i64, PyError> {
 /// as `OverflowError`; otherwise the value is masked and a float rounded
 /// down, which is what an explicit `ffi.cast()` asks for.
 pub fn as_unsigned_long_long(w_ob: PyObjectRef, strict: bool) -> Result<u64, PyError> {
-    match exact_int_w(w_ob) {
-        Some(Ok(value)) => {
+    match pyre_interpreter::baseobjspace::int_w_allow_conversion(w_ob, false) {
+        Ok(value) => {
             if strict && value < 0 {
                 return Err(PyError::overflow_error(NEG_MSG));
             }
             return Ok(value as u64);
         }
-        // A bigint wider than a word reaches the path below either way, which
-        // reads it back through `space.int`.
-        Some(Err(_)) => {}
-        None => {
-            if strict && is_a_float(w_ob) {
-                return Err(PyError::type_error("integer expected, got float"));
+        Err(e) => {
+            if !(e.kind == pyre_interpreter::PyErrorKind::OverflowError
+                || e.kind == pyre_interpreter::PyErrorKind::TypeError)
+                || (strict && is_a_float(w_ob))
+            {
+                return Err(e);
             }
         }
     }
+    // Note that if not `strict`, then `space.int()` will round down floats.
     let w_int = pyre_interpreter::baseobjspace::space_int(w_ob)?;
     if strict {
         // `toulonglong` signals a negative value as `ValueError` and a value
