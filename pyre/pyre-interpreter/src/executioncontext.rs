@@ -2599,7 +2599,7 @@ impl ActionFlagOps for ActionFlag {
             self._ticker -= by;
             // This path bypasses reset_ticker, so mirror a future periodic
             // decrement that crosses negative.
-            if self.is_registered_ticker() && self._ticker < 0 {
+            if self._ticker < 0 && self.is_registered_ticker() {
                 arm_async_eval_breaker();
             }
         }

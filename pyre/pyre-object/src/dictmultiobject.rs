@@ -2310,11 +2310,11 @@ pub unsafe fn w_module_dict_setitem_str_no_proxy(
 
 unsafe fn w_module_dict_setitem_str_internal(obj: PyObjectRef, key: &str, w_value: PyObjectRef) {
     lock_dict_refs!(_module_guard, obj, w_value);
-    // Module-dict storage is Box-immortal, reached only by the
-    // prebuilt-family root walk; record the store (gc_roots.rs
-    // prebuilt-root write tracking).
-    crate::gc_roots::mark_prebuilt_roots_dirty();
     if w_module_dict_is_object_strategy(obj) {
+        // Module-dict storage is Box-immortal, reached only by the
+        // prebuilt-family root walk; record the store (gc_roots.rs
+        // prebuilt-root write tracking).
+        crate::gc_roots::mark_prebuilt_roots_dirty();
         // Post-switch: ObjectDictStrategy storage = r_dict(space.eq_w,
         // space.hash_w) per `dictmultiobject.py`; pyre's
         // `dict_keys_equal` enforces the same bucket invariant
@@ -2348,12 +2348,13 @@ unsafe fn w_module_dict_setitem_str_internal(obj: PyObjectRef, key: &str, w_valu
     {
         let strategy = w_module_dict_module_strategy_mut(obj);
         let old_len = w_module_dict_module_storage(obj).len();
+        // `_setitem_str_cell_known` barriers whichever object it stores
+        // into: the cell for an in-place rewrite, the storage otherwise.
         strategy.setitem_str(obj, key, w_value);
         if w_module_dict_module_storage(obj).len() != old_len {
             w_dict_bump_keys_version(obj);
         }
     }
-    dict_write_barrier(obj);
 }
 
 /// `celldict.py getitem_str`.
