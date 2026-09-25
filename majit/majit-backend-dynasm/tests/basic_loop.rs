@@ -197,6 +197,46 @@ fn test_float_add() {
     );
 }
 
+/// `genop_float_neg` flips the sign bit. Subtracting from zero instead passes
+/// every magnitude and fails only on zero, where `(+0) - (+0)` is `+0` — so
+/// the assertions compare bit patterns rather than values.
+#[test]
+fn test_float_neg_keeps_the_sign_of_zero() {
+    let mut backend = DynasmBackend::new();
+    backend.attach_default_test_descrs();
+    let token = JitCellToken::new(1);
+
+    let i0 = OpRef::input_arg_float(0);
+    let inputargs = vec![InputArg::from_type_rc(Type::Float, 0)];
+
+    let neg_op = Op::new(OpCode::FloatNeg, &[rb(i0)]);
+    neg_op.pos().set(OpRef::float_op(1));
+
+    let finish_op = Op::new(OpCode::Finish, &[rb(OpRef::float_op(1))]);
+    finish_op.pos().set(OpRef::void_op(2));
+    finish_op.set_fail_arg_types(vec![Type::Float]);
+    finish_op.setfailargs(vec![rb(OpRef::float_op(1))].into());
+
+    let ops = vec![neg_op, finish_op];
+    let ops_rc: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+
+    let result = backend.compile_loop(&inputargs, &ops_rc, &token);
+    assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
+
+    for (input, expected) in [(0.0f64, -0.0f64), (-0.0, 0.0), (1.5, -1.5), (-2.25, 2.25)] {
+        let frame = backend.execute_token(&token, &[Value::Float(input)]);
+        let descr = backend.get_latest_descr(&frame);
+        assert!(descr.is_finish());
+
+        let got = backend.get_float_value(&frame, 0);
+        assert_eq!(
+            got.to_bits(),
+            expected.to_bits(),
+            "-({input}) should be {expected}, got {got}"
+        );
+    }
+}
+
 #[test]
 fn test_setarrayitem_raw_float_roundtrip() {
     let mut backend = DynasmBackend::new();

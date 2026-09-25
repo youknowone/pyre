@@ -3324,15 +3324,19 @@ impl<'a> Assembler386<'a> {
             }
             OpCode::FloatNeg => {
                 if let Some(Loc::Reg(r)) = result_loc {
-                    // XMM scratch must be X86_64_XMM_SCRATCH_REG (outside
-                    // the allocation pool); reusing the GPR scratch INDEX
-                    // (r11 → xmm11) addressed a pool register and clobbered
-                    // whatever the allocator kept there.
+                    let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+                    // `genop_float_neg`: res = x ^ 0x8000000000000000. Staging
+                    // the mask through the XMM scratch, which must be
+                    // X86_64_XMM_SCRATCH_REG (outside the allocation pool);
+                    // reusing the GPR scratch INDEX (r11 → xmm11) addressed a
+                    // pool register and clobbered whatever the allocator kept
+                    // there. Subtracting from zero instead would answer `+0.0`
+                    // for a `+0.0` operand, since `(+0) - (+0)` is positive.
                     let xmm_scratch = crate::regloc::X86_64_XMM_SCRATCH_REG.value;
                     dynasm!(self.mc ; .arch x64
-                        ; xorpd Rx(xmm_scratch), Rx(xmm_scratch)
-                        ; subsd Rx(xmm_scratch), Rx(r.value)
-                        ; movsd Rx(r.value), Rx(xmm_scratch)
+                        ; mov Rq(scratch), QWORD 0x8000000000000000_u64 as i64
+                        ; movq Rx(xmm_scratch), Rq(scratch)
+                        ; xorpd Rx(r.value), Rx(xmm_scratch)
                     );
                 }
             }
