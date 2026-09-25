@@ -1267,12 +1267,14 @@ impl MIFrame {
     pub fn replace_active_box_in_frame(&mut self, oldbox: OpRef, newbox: OpRef, oldbox_type: Type) {
         // All three banks are flat `Vec<Option<OpRef>>`; the shared replace
         // logic compares by OpRef value (pyre's flat-OpRef adaptation of
-        // pyjitpl.py `registers[i] is oldbox`).
-        let registers = match oldbox_type {
-            Type::Int => &mut self.int_regs,
-            Type::Float => &mut self.float_regs,
-            Type::Ref => &mut self.ref_regs,
-            // pyjitpl.py replace_active_box_in_frame `else: assert 0, oldbox` — RPython rejects
+        // pyjitpl.py `registers[i] is oldbox`). Only the working registers
+        // `[0, num_regs_X)` are scanned; the constants area above them
+        // holds Const boxes that are never `oldbox`.
+        let (count, registers) = match oldbox_type {
+            Type::Int => (self.jitcode.num_regs_i(), &mut self.int_regs),
+            Type::Float => (self.jitcode.num_regs_f(), &mut self.float_regs),
+            Type::Ref => (self.jitcode.num_regs_r(), &mut self.ref_regs),
+            // pyjitpl.py:236-244 `else: assert 0, oldbox` — RPython rejects
             // any box whose `type` attribute is not 'i' / 'r' / 'f'.
             // Mirroring that assertion strength keeps the contract: the
             // caller must resolve a typed Box; passing a Void-typed
@@ -1283,10 +1285,10 @@ impl MIFrame {
                  RPython parity rejects unknown/void box types (pyjitpl.py:236)"
             ),
         };
-        if registers.is_empty() {
+        if count == 0 {
             return;
         }
-        for slot in registers.iter_mut() {
+        for slot in &mut registers[..count] {
             if *slot == Some(oldbox) {
                 *slot = Some(newbox);
             }
