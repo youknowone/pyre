@@ -747,10 +747,12 @@ fn unify_duplicate_pos0_reads(graph: &mut FunctionGraph, block_idx: usize, at: &
     for op in &mut block.operations {
         op.kind = crate::inline::remap_op_kind(&op.kind, &rename);
     }
-    let (sw, exits) =
-        crate::model::remap_control_flow_metadata_var(&block.exitswitch, &block.exits, rename, |b| {
-            b
-        });
+    let (sw, exits) = crate::model::remap_control_flow_metadata_var(
+        &block.exitswitch,
+        &block.exits,
+        rename,
+        |b| b,
+    );
     block.exitswitch = sw;
     block.exits = exits;
 }

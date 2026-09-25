@@ -374,7 +374,10 @@ pub(crate) fn pack_enumerate_payload(
     let tup = graph.alloc_value_var();
     let owner = enumerate_yield_owner(item_ty);
     let element = graph.blocks[some_target].operations.iter().find_map(|op| {
-        let OpKind::FieldRead { base, field, ty, .. } = &op.kind else {
+        let OpKind::FieldRead {
+            base, field, ty, ..
+        } = &op.kind
+        else {
             return None;
         };
         (base == item && field.name == "__pos_1")
@@ -489,9 +492,12 @@ pub(crate) fn rewrite_forwarded_payload(
         .iter()
         .enumerate()
         .flat_map(|(exit_i, link)| {
-            link.args.iter().enumerate().filter_map(move |(arg_i, arg)| {
-                matches!(arg, LinkArg::Value(v) if v == carrier).then_some((exit_i, arg_i))
-            })
+            link.args
+                .iter()
+                .enumerate()
+                .filter_map(move |(arg_i, arg)| {
+                    matches!(arg, LinkArg::Value(v) if v == carrier).then_some((exit_i, arg_i))
+                })
         })
         .collect();
     for (exit_i, arg_i) in forwards {
@@ -570,8 +576,6 @@ pub(crate) fn successor_reads_packed_payload(
     }
     saw
 }
-
-
 
 /// `collapse_pos0_read` but the payload is `onto`, not the Option slot
 /// itself: after packing, `opt.__pos_0` is the `(i, a)` tuple.
@@ -2106,19 +2110,23 @@ mod tests {
         )
         .unwrap();
         g.set_return(succ, None);
-        g.block_mut(some_id).exits = vec![Link::new_mixed(
-            vec![LinkArg::Value(carrier.clone())],
-            succ,
-            None,
-        )
-        .with_prevblock(some_id)];
+        g.block_mut(some_id).exits = vec![
+            Link::new_mixed(vec![LinkArg::Value(carrier.clone())], succ, None)
+                .with_prevblock(some_id),
+        ];
         let rewritten = rewire_next_call_sites(&mut g, &[(opt, ValueType::Str)]);
-        assert_eq!(rewritten, 1, "a successor __pos_0 read of the forward folds");
+        assert_eq!(
+            rewritten, 1,
+            "a successor __pos_0 read of the forward folds"
+        );
         let exit_val = match &g.block_mut(some_id).exits[0].args[0] {
             LinkArg::Value(v) => v.clone(),
             other => panic!("packed forward must be a value, got {other:?}"),
         };
-        assert_ne!(exit_val, carrier, "the successor must not receive the old payload");
+        assert_ne!(
+            exit_val, carrier,
+            "the successor must not receive the old payload"
+        );
         let succ_block = g.blocks.iter().find(|b| b.id == succ).expect("successor");
         assert!(
             succ_block.operations.iter().any(|op| {
@@ -2165,18 +2173,12 @@ mod tests {
         g.set_return(succ, None);
         let (other, _) = g.create_block_with_arg_vars(0);
         let other_val = g.alloc_value_var();
-        g.block_mut(other).exits = vec![Link::new_mixed(
-            vec![LinkArg::Value(other_val)],
-            succ,
-            None,
-        )
-        .with_prevblock(other)];
-        g.block_mut(some_id).exits = vec![Link::new_mixed(
-            vec![LinkArg::Value(carrier)],
-            succ,
-            None,
-        )
-        .with_prevblock(some_id)];
+        g.block_mut(other).exits = vec![
+            Link::new_mixed(vec![LinkArg::Value(other_val)], succ, None).with_prevblock(other),
+        ];
+        g.block_mut(some_id).exits = vec![
+            Link::new_mixed(vec![LinkArg::Value(carrier)], succ, None).with_prevblock(some_id),
+        ];
         let rewritten = rewire_next_call_sites(&mut g, &[(opt, ValueType::Str)]);
         assert_eq!(rewritten, 0, "a merge successor must decline");
         assert_eq!(count_calls(&g, is_enumerate_ctor_target), 1);
@@ -2212,14 +2214,14 @@ mod tests {
         .unwrap();
         g.set_return(succ, None);
         g.block_mut(succ).exitswitch = Some(ExitSwitch::Value(received));
-        g.block_mut(some_id).exits = vec![Link::new_mixed(
-            vec![LinkArg::Value(carrier)],
-            succ,
-            None,
-        )
-        .with_prevblock(some_id)];
+        g.block_mut(some_id).exits = vec![
+            Link::new_mixed(vec![LinkArg::Value(carrier)], succ, None).with_prevblock(some_id),
+        ];
         let rewritten = rewire_next_call_sites(&mut g, &[(opt, ValueType::Str)]);
-        assert_eq!(rewritten, 0, "an exitswitch on the forwarded slot must decline");
+        assert_eq!(
+            rewritten, 0,
+            "an exitswitch on the forwarded slot must decline"
+        );
         assert_eq!(count_calls(&g, is_enumerate_ctor_target), 1);
     }
 
