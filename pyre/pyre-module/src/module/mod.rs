@@ -70,7 +70,6 @@ pub mod _ssl;
 #[allow(non_snake_case)]
 pub mod _statistics;
 #[allow(non_snake_case)]
-pub mod _template;
 #[allow(non_snake_case)]
 #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
 pub mod _uuid;
