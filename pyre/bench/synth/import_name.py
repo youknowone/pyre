@@ -1,4 +1,6 @@
 # pyre-check: max-pypy-ratio=205
+# pyre-check: skip-backends=cranelift
+# cranelift runs the core build, which has no `pyre-module` and so no `math`.
 # pyre-check: spec-folds=import_cached
 N = 400000
 

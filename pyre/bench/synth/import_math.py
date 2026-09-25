@@ -1,4 +1,6 @@
 # pyre-check: max-pypy-ratio=2
+# pyre-check: skip-backends=cranelift
+# cranelift runs the core build, which has no `pyre-module` and so no `math`.
 # pyre-check: skip-cpython
 # A count cpython could finish inside its reference timeout leaves pypy back
 # on the floor, so cpython is dropped deliberately rather than by spending

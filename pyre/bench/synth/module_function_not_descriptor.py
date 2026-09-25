@@ -1,4 +1,6 @@
 # A function directly in a builtin module is a non-descriptor builtin function
+# pyre-check: skip-backends=cranelift
+# cranelift runs the core build, which has no `pyre-module` and so no `math`.
 # (no `__get__`), so storing it on a user class and reading it through an
 # instance returns the SAME function object — it does not synthesize a bound
 # method or inject `self`.  Mirrors mixedmodule.py:_load_lazily; guards
