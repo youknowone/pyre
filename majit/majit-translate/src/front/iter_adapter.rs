@@ -315,6 +315,48 @@ pub(crate) fn insert_pair_iter_read(
     (inner, next_idx + 1)
 }
 
+/// `SomeTuple(items)` (`annotator/model.py`) and `TupleRepr`
+/// (`rtyper/rtuple.py`, chosen by `rtyper.getrepr`) are one shape per
+/// item-repr list. The `(count, item)` tuple uses that shape as its owner.
+pub(crate) fn enumerate_yield_owner(item_ty: &ValueType) -> String {
+    let atom = match item_ty {
+        ValueType::Str => "String",
+        ValueType::Int => "isize",
+        ValueType::Unsigned => "usize",
+        ValueType::Float => "f64",
+        ValueType::SingleFloat => "f32",
+        ValueType::Bool => "bool",
+        ValueType::Int128 => "i128",
+        ValueType::UInt128 => "u128",
+        ValueType::Ref(Some(root)) => root.as_str(),
+        ValueType::Ref(None) => "Ptr",
+        ValueType::StringBuilder => "StringBuilder",
+        ValueType::Void => "()",
+        ValueType::State => "State",
+        ValueType::Unknown => "Unknown",
+    };
+    format!("Tuple<usize,{atom}>")
+}
+
+fn paint_pos_owner(graph: &mut FunctionGraph, block: usize, base: &Variable, owner: &str) {
+    for op in &mut graph.blocks[block].operations {
+        let field = match &mut op.kind {
+            OpKind::FieldRead {
+                base: read_base,
+                field,
+                ..
+            }
+            | OpKind::FieldWrite {
+                base: read_base,
+                field,
+                ..
+            } if read_base == base && field.name.starts_with("__pos_") => field,
+            _ => continue,
+        };
+        field.owner_root = Some(owner.to_string());
+    }
+}
+
 /// On the Some arm: increment `pair.count` and pack `(count, item)` as
 /// the value the residual `opt.__pos_0` read named — the adapter's
 /// `Some((i, a))`.
@@ -330,6 +372,18 @@ pub(crate) fn pack_enumerate_payload(
     let one = graph.alloc_value_var();
     let new_count = graph.alloc_value_var();
     let tup = graph.alloc_value_var();
+    let owner = enumerate_yield_owner(item_ty);
+    let element = graph.blocks[some_target].operations.iter().find_map(|op| {
+        let OpKind::FieldRead {
+            base, field, ty, ..
+        } = &op.kind
+        else {
+            return None;
+        };
+        (base == item && field.name == "__pos_1")
+            .then(|| op.result.clone().map(|result| (result, ty.clone())))
+            .flatten()
+    });
     let mut prefix = vec![
         SpaceOperation {
             result: Some(count.clone()),
@@ -362,30 +416,33 @@ pub(crate) fn pack_enumerate_payload(
         SpaceOperation {
             result: Some(tup.clone()),
             kind: OpKind::Call {
-                target: CallTarget::synthetic_transparent_ctor("Tuple"),
+                target: CallTarget::synthetic_transparent_ctor(&owner),
                 args: Vec::new(),
-                result_ty: ValueType::Ref(Some("Tuple".into())),
+                result_ty: ValueType::Ref(Some(owner.clone())),
             },
         },
         SpaceOperation {
             result: None,
             kind: OpKind::FieldWrite {
                 base: tup.clone(),
-                field: FieldDescriptor::new("__pos_0", Some("Tuple".into())),
+                field: FieldDescriptor::new("__pos_0", Some(owner.clone())),
                 value: LinkArg::Value(count),
                 ty: ValueType::Unsigned,
             },
         },
-        SpaceOperation {
-            result: None,
-            kind: OpKind::FieldWrite {
-                base: tup.clone(),
-                field: FieldDescriptor::new("__pos_1", Some("Tuple".into())),
-                value: LinkArg::Value(item.clone()),
-                ty: item_ty.clone(),
-            },
-        },
     ];
+    let pos1_write = |value: Variable, ty: ValueType| SpaceOperation {
+        result: None,
+        kind: OpKind::FieldWrite {
+            base: tup.clone(),
+            field: FieldDescriptor::new("__pos_1", Some(owner.clone())),
+            value: LinkArg::Value(value),
+            ty,
+        },
+    };
+    if element.is_none() {
+        prefix.push(pos1_write(item.clone(), item_ty.clone()));
+    }
     // Decide before the prefix is spliced in. The `__pos_1` write below
     // names `item`, so a use-count taken afterwards would see that write
     // and refuse the unread `for _ in` arm.
@@ -398,10 +455,126 @@ pub(crate) fn pack_enumerate_payload(
     });
     prefix.append(&mut graph.blocks[some_target].operations);
     graph.blocks[some_target].operations = prefix;
+    if let Some((value, ty)) = element {
+        let at = graph.blocks[some_target]
+            .operations
+            .iter()
+            .position(|op| op.result.as_ref() == Some(&value))
+            .expect("item read precedes its copy onto the packed tuple");
+        graph.blocks[some_target]
+            .operations
+            .insert(at + 1, pos1_write(value, ty));
+    }
     if has_pos0 {
         collapse_pos0_onto(graph, some_target, item, &tup, name)?;
     }
+    paint_pos_owner(graph, some_target, &tup, &owner);
     Ok(tup)
+}
+
+/// The Some arm forwarded the old payload. Replace that exit value with
+/// the packed tuple when the successor's only use of the slot is a
+/// `__pos_N` read, and paint those reads with the packed owner.
+pub(crate) fn rewrite_forwarded_payload(
+    graph: &mut FunctionGraph,
+    some_block: usize,
+    carrier: &Variable,
+    packed: &Variable,
+    owner: &str,
+) {
+    // Validation already declined a merge or an exitswitch on the slot.
+    // Re-check so a caller cannot paint one predecessor of a merge.
+    if !successor_reads_packed_payload(graph, some_block, carrier) {
+        return;
+    }
+    let forwards: Vec<(usize, usize)> = graph.blocks[some_block]
+        .exits
+        .iter()
+        .enumerate()
+        .flat_map(|(exit_i, link)| {
+            link.args
+                .iter()
+                .enumerate()
+                .filter_map(move |(arg_i, arg)| {
+                    matches!(arg, LinkArg::Value(v) if v == carrier).then_some((exit_i, arg_i))
+                })
+        })
+        .collect();
+    for (exit_i, arg_i) in forwards {
+        let target = graph.blocks[some_block].exits[exit_i].target.0;
+        graph.blocks[some_block].exits[exit_i].args[arg_i] = LinkArg::Value(packed.clone());
+        if let Some(slot) = graph.blocks[target].inputargs.get(arg_i).cloned() {
+            paint_pos_owner(graph, target, &slot, owner);
+        }
+    }
+}
+
+/// `true` when every forward of `carrier` lands on a successor input whose
+/// only uses are `__pos_N` reads. A bare forward, or any other use, keeps
+/// the old payload shape reachable and must decline.
+pub(crate) fn successor_reads_packed_payload(
+    graph: &FunctionGraph,
+    some_block: usize,
+    carrier: &Variable,
+) -> bool {
+    let mut saw = false;
+    for link in &graph.blocks[some_block].exits {
+        for (arg_i, arg) in link.args.iter().enumerate() {
+            let LinkArg::Value(value) = arg else {
+                continue;
+            };
+            if value != carrier {
+                continue;
+            }
+            saw = true;
+            let target_idx = link.target.0;
+            let preds = graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.exits)
+                .filter(|link| link.target.0 == target_idx)
+                .count();
+            // A merge still has another predecessor passing the old shape.
+            if preds != 1 {
+                return false;
+            }
+            let target = &graph.blocks[target_idx];
+            let Some(slot) = target.inputargs.get(arg_i) else {
+                return false;
+            };
+            let mut read = false;
+            for op in &target.operations {
+                let OpKind::FieldRead { base, field, .. } = &op.kind else {
+                    if crate::front::result_exc::op_operand_vars(&op.kind).contains(slot) {
+                        return false;
+                    }
+                    continue;
+                };
+                if base == slot {
+                    if !field.name.starts_with("__pos_") {
+                        return false;
+                    }
+                    read = true;
+                }
+            }
+            match &target.exitswitch {
+                Some(ExitSwitch::Value(switched)) if switched == slot => return false,
+                Some(ExitSwitch::Fused { args, .. }) if args.contains(slot) => return false,
+                _ => {}
+            }
+            if target.exits.iter().any(|link| {
+                link.args
+                    .iter()
+                    .any(|arg| matches!(arg, LinkArg::Value(v) if v == slot))
+            }) {
+                return false;
+            }
+            if !read {
+                return false;
+            }
+        }
+    }
+    saw
 }
 
 /// `collapse_pos0_read` but the payload is `onto`, not the Option slot
@@ -1306,7 +1479,7 @@ mod tests {
         assert_eq!(
             count_calls(&g, |t| matches!(
                 t,
-                CallTarget::SyntheticTransparentCtor { name, .. } if name == "Tuple"
+                CallTarget::SyntheticTransparentCtor { name, .. } if name.starts_with("Tuple<")
             )),
             1,
             "packed (i, item) tuple on the Some arm"
@@ -1851,7 +2024,7 @@ mod tests {
                     &op.kind,
                     OpKind::FieldWrite { field, ty, .. }
                         if field.name == "__pos_1"
-                            && field.owner_root.as_deref() == Some("Tuple")
+                            && field.owner_root.as_deref() == Some("Tuple<usize,isize>")
                             && *ty == ValueType::Int
                 )
             }),
@@ -1862,6 +2035,194 @@ mod tests {
             0,
             "Enumerate::next residual must be gone"
         );
+    }
+
+    /// Two enumerate sites with different item types do not share a tuple owner.
+    #[test]
+    fn two_enumerate_item_types_keep_distinct_owners() {
+        let mut g = FunctionGraph::new("two_enumerate_items");
+        let (b0, a0) = g.create_block_with_arg_vars(1);
+        let (b1, a1) = g.create_block_with_arg_vars(1);
+        let pair0 = g.alloc_value_var();
+        let pair1 = g.alloc_value_var();
+        pack_enumerate_payload(&mut g, b0.0, &a0[0], &ValueType::Int, &pair0, "int_site").unwrap();
+        pack_enumerate_payload(&mut g, b1.0, &a1[0], &ValueType::Str, &pair1, "str_site").unwrap();
+        let owners: Vec<String> = g
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldWrite { field, .. } if field.name == "__pos_1" => {
+                    field.owner_root.clone()
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            owners,
+            vec![
+                "Tuple<usize,isize>".to_string(),
+                "Tuple<usize,String>".to_string()
+            ]
+        );
+        let ctors: Vec<String> = g
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { name, .. },
+                    ..
+                } if name.starts_with("Tuple<") => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ctors, owners);
+    }
+
+    /// A successor that reads `__pos_0` of the forwarded payload receives
+    /// the packed tuple, not the pre-collapse shape.
+    #[test]
+    fn successor_reads_pos0_of_forwarded_packed_payload() {
+        let (mut g, opt, _) = build_enumerate_diamond();
+        let some = g
+            .blocks
+            .iter()
+            .position(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "__pos_0")
+                })
+            })
+            .expect("some arm");
+        let carrier = g.blocks[some].inputargs[0].clone();
+        let some_id = g.blocks[some].id;
+        let (succ, succ_args) = g.create_block_with_arg_vars(1);
+        let received = succ_args[0].clone();
+        g.push_op_var(
+            succ,
+            OpKind::FieldRead {
+                base: received.clone(),
+                field: FieldDescriptor::new("__pos_0", None),
+                ty: ValueType::Unsigned,
+                pure: false,
+            },
+            true,
+        )
+        .unwrap();
+        g.set_return(succ, None);
+        g.block_mut(some_id).exits = vec![
+            Link::new_mixed(vec![LinkArg::Value(carrier.clone())], succ, None)
+                .with_prevblock(some_id),
+        ];
+        let rewritten = rewire_next_call_sites(&mut g, &[(opt, ValueType::Str)]);
+        assert_eq!(
+            rewritten, 1,
+            "a successor __pos_0 read of the forward folds"
+        );
+        let exit_val = match &g.block_mut(some_id).exits[0].args[0] {
+            LinkArg::Value(v) => v.clone(),
+            other => panic!("packed forward must be a value, got {other:?}"),
+        };
+        assert_ne!(
+            exit_val, carrier,
+            "the successor must not receive the old payload"
+        );
+        let succ_block = g.blocks.iter().find(|b| b.id == succ).expect("successor");
+        assert!(
+            succ_block.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldRead { base, field, .. }
+                        if base == &received
+                            && field.name == "__pos_0"
+                            && field.owner_root.as_deref() == Some("Tuple<usize,String>")
+                )
+            }),
+            "the successor __pos_0 read is the packed tuple owner"
+        );
+    }
+
+    /// A merge successor has another predecessor that still passes the old
+    /// payload. Painting its `__pos_N` reads would retarget that edge too.
+    #[test]
+    fn rewrite_declines_forward_into_merge_successor() {
+        let (mut g, opt, _) = build_enumerate_diamond();
+        let some = g
+            .blocks
+            .iter()
+            .position(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "__pos_0")
+                })
+            })
+            .expect("some arm");
+        let carrier = g.blocks[some].inputargs[0].clone();
+        let some_id = g.blocks[some].id;
+        let (succ, succ_args) = g.create_block_with_arg_vars(1);
+        g.push_op_var(
+            succ,
+            OpKind::FieldRead {
+                base: succ_args[0].clone(),
+                field: FieldDescriptor::new("__pos_0", None),
+                ty: ValueType::Unsigned,
+                pure: false,
+            },
+            true,
+        )
+        .unwrap();
+        g.set_return(succ, None);
+        let (other, _) = g.create_block_with_arg_vars(0);
+        let other_val = g.alloc_value_var();
+        g.block_mut(other).exits = vec![
+            Link::new_mixed(vec![LinkArg::Value(other_val)], succ, None).with_prevblock(other),
+        ];
+        g.block_mut(some_id).exits = vec![
+            Link::new_mixed(vec![LinkArg::Value(carrier)], succ, None).with_prevblock(some_id),
+        ];
+        let rewritten = rewire_next_call_sites(&mut g, &[(opt, ValueType::Str)]);
+        assert_eq!(rewritten, 0, "a merge successor must decline");
+        assert_eq!(count_calls(&g, is_enumerate_ctor_target), 1);
+    }
+
+    /// Switching on the forwarded slot is a use of the old payload shape.
+    #[test]
+    fn rewrite_declines_successor_switching_on_forwarded_slot() {
+        let (mut g, opt, _) = build_enumerate_diamond();
+        let some = g
+            .blocks
+            .iter()
+            .position(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "__pos_0")
+                })
+            })
+            .expect("some arm");
+        let carrier = g.blocks[some].inputargs[0].clone();
+        let some_id = g.blocks[some].id;
+        let (succ, succ_args) = g.create_block_with_arg_vars(1);
+        let received = succ_args[0].clone();
+        g.push_op_var(
+            succ,
+            OpKind::FieldRead {
+                base: received.clone(),
+                field: FieldDescriptor::new("__pos_0", None),
+                ty: ValueType::Unsigned,
+                pure: false,
+            },
+            true,
+        )
+        .unwrap();
+        g.set_return(succ, None);
+        g.block_mut(succ).exitswitch = Some(ExitSwitch::Value(received));
+        g.block_mut(some_id).exits = vec![
+            Link::new_mixed(vec![LinkArg::Value(carrier)], succ, None).with_prevblock(some_id),
+        ];
+        let rewritten = rewire_next_call_sites(&mut g, &[(opt, ValueType::Str)]);
+        assert_eq!(
+            rewritten, 0,
+            "an exitswitch on the forwarded slot must decline"
+        );
+        assert_eq!(count_calls(&g, is_enumerate_ctor_target), 1);
     }
 
     /// A Some arm that uses the payload slot for something other than

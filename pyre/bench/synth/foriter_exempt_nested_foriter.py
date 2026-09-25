@@ -7,12 +7,13 @@
 # branch-bearing callee with a SECOND FOR_ITER (nested), not the loop header.
 # Two shared generators; inner FOR_ITER advance is a non-header foriter (Finding #2).
 # Post-inner declining residual forces abort while inner item in-flight.
-# N cannot be raised to clear `FLOOR_GATE_MIN_BASELINE_S`: generator resume
-# has no merge point (`caro_no_merge_entry`), so gouter/ginner stay
-# interpreted and the true ratio is ~100x.  Lengthening only makes that
-# honest.  40000 is twice the original size, so pypy's execution clears the
-# 0.00s reading; the 20x ceiling is the compiled `run()` loop's budget.
-N = 40000
+# N is large enough that pypy's user time clears startup noise (~0.24s).
+# A single-yield generator is inlined at FOR_ITER: `dispatch`'s `except Yield`
+# `popvalue` (`generator_resume_yield`) returns the suspended value.
+# `MAJIT_STATS` on this loop records `caro_no_merge_entry=0` and one compiled
+# trace (`loops_compiled=1`), so gouter/ginner are not left interpreted.
+# The 20x ceiling is that compiled loop.
+N = 12000000
 
 
 class Shared:

@@ -71,6 +71,19 @@ def interpreter_charon_args(crate_dir: Path) -> list[str]:
         "crate::module",
         "--include",
         "crate::module::_",
+        # Charon has no const-only matcher: `--include PATH` translates that
+        # item and its subitems. These are the localsplus flag consts the
+        # interpreter reads (`bytecode.rs` `CO_FAST_*`). Naming each const
+        # translates its initializer and leaves the rest of
+        # `rustpython_compiler_core::bytecode` opaque.
+        "--include",
+        "rustpython_compiler_core::bytecode::CO_FAST_HIDDEN",
+        "--include",
+        "rustpython_compiler_core::bytecode::CO_FAST_LOCAL",
+        "--include",
+        "rustpython_compiler_core::bytecode::CO_FAST_CELL",
+        "--include",
+        "rustpython_compiler_core::bytecode::CO_FAST_FREE",
         "--start-from",
         "crate",
     ]

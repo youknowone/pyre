@@ -721,6 +721,42 @@ pub(crate) fn peel_recast_chain(
     Ok(cur)
 }
 
+/// Several `__pos_0` reads of one Option payload are one value. Keep the
+/// first read and retarget every later result onto it.
+fn unify_duplicate_pos0_reads(graph: &mut FunctionGraph, block_idx: usize, at: &[usize]) {
+    let keep = graph.blocks[block_idx].operations[at[0]]
+        .result
+        .clone()
+        .expect("caller checked __pos_0 results");
+    let extras: Vec<Variable> = at
+        .iter()
+        .skip(1)
+        .filter_map(|&i| graph.blocks[block_idx].operations[i].result.clone())
+        .collect();
+    for &i in at.iter().skip(1).rev() {
+        graph.blocks[block_idx].operations.remove(i);
+    }
+    let rename = |v: &Variable| -> Variable {
+        if extras.iter().any(|e| e == v) {
+            keep.clone()
+        } else {
+            v.clone()
+        }
+    };
+    let block = &mut graph.blocks[block_idx];
+    for op in &mut block.operations {
+        op.kind = crate::inline::remap_op_kind(&op.kind, &rename);
+    }
+    let (sw, exits) = crate::model::remap_control_flow_metadata_var(
+        &block.exitswitch,
+        &block.exits,
+        rename,
+        |b| b,
+    );
+    block.exitswitch = sw;
+    block.exits = exits;
+}
+
 fn rewire_one_next_site(
     graph: &mut FunctionGraph,
     edges: &BackEdges,
@@ -1066,21 +1102,24 @@ fn rewire_one_next_site(
             .get(pos)
             .cloned()
             .ok_or_else(|| format!("{name}: enumerate Some arm lacks payload slot {pos}"))?;
-        let block = &graph.blocks[some_target.0];
-        let pos0_at: Vec<usize> = block
-            .operations
-            .iter()
-            .enumerate()
-            .filter(|(_, op)| {
-                matches!(
-                    &op.kind,
-                    OpKind::FieldRead { base, field, .. }
-                        if base == &carrier && field.name == "__pos_0"
-                )
-            })
-            .map(|(i, _)| i)
-            .collect();
+        let pos0_at: Vec<usize> = {
+            let block = &graph.blocks[some_target.0];
+            block
+                .operations
+                .iter()
+                .enumerate()
+                .filter(|(_, op)| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldRead { base, field, .. }
+                            if base == &carrier && field.name == "__pos_0"
+                    )
+                })
+                .map(|(i, _)| i)
+                .collect()
+        };
         if pos0_at.is_empty() {
+            let block = &graph.blocks[some_target.0];
             let uses = block
                 .operations
                 .iter()
@@ -1096,24 +1135,20 @@ fn rewire_one_next_site(
                     "{name}: enumerate Some arm uses the payload outside a __pos_0 read"
                 ));
             }
-        } else if pos0_at.len() != 1 || block.operations[pos0_at[0]].result.is_none() {
-            let why = if block.operations[pos0_at[0]].result.is_none() {
-                "__pos_0 read without result"
-            } else {
-                "enumerate Some arm reads __pos_0 more than once"
-            };
-            return Err(format!("{name}: {why}"));
+        } else if pos0_at
+            .iter()
+            .any(|&i| graph.blocks[some_target.0].operations[i].result.is_none())
+        {
+            return Err(format!("{name}: __pos_0 read without result"));
         } else {
-            // The one `__pos_0` read is the only reference to the carrier.
-            // A second operand, an exit arg, or an exitswitch use would
-            // keep the original payload after the read collapses onto the
-            // packed tuple.
-            let read_at = pos0_at[0];
-            let other_operand = block
-                .operations
-                .iter()
-                .enumerate()
-                .any(|(i, op)| i != read_at && op_operand_vars(&op.kind).contains(&carrier));
+            // Duplicate `__pos_0` reads are the same Some payload (`for (i, x)`
+            // projects it once per field). They are merged after validation.
+            // A forward still declines unless the successor only reads
+            // `__pos_N` of that slot — then the packed tuple is what it receives.
+            let block = &graph.blocks[some_target.0];
+            let other_operand = block.operations.iter().enumerate().any(|(i, op)| {
+                !pos0_at.contains(&i) && op_operand_vars(&op.kind).contains(&carrier)
+            });
             let forwarded = block.exits.iter().any(|link| {
                 link.args
                     .iter()
@@ -1124,7 +1159,13 @@ fn rewire_one_next_site(
                 Some(ExitSwitch::Fused { args, .. }) if args.contains(&carrier) => true,
                 _ => false,
             };
-            if other_operand || forwarded || switched {
+            let packed_forward = forwarded
+                && crate::front::iter_adapter::successor_reads_packed_payload(
+                    graph,
+                    some_target.0,
+                    &carrier,
+                );
+            if other_operand || switched || (forwarded && !packed_forward) {
                 return Err(format!(
                     "{name}: enumerate Some arm uses the payload outside a __pos_0 read"
                 ));
@@ -1223,6 +1264,28 @@ fn rewire_one_next_site(
     // --- All structural validation passed; mutate the graph. ---
     *mutated = true;
 
+    if enum_pair.is_some() {
+        let pos = payload_positions[0];
+        if let Some(carrier) = graph.blocks[some_target.0].inputargs.get(pos).cloned() {
+            let at: Vec<usize> = graph.blocks[some_target.0]
+                .operations
+                .iter()
+                .enumerate()
+                .filter(|(_, op)| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldRead { base, field, .. }
+                            if base == &carrier && field.name == "__pos_0"
+                    )
+                })
+                .map(|(i, _)| i)
+                .collect();
+            if at.len() > 1 {
+                unify_duplicate_pos0_reads(graph, some_target.0, &at);
+            }
+        }
+    }
+
     if let Some(pair) = &enum_pair {
         crate::front::iter_adapter::rewrite_enumerate_ctor_to_pair(graph, edges, pair, &next_iter)?;
     }
@@ -1246,7 +1309,7 @@ fn rewire_one_next_site(
             pair,
             &mut normal_args,
         );
-        crate::front::iter_adapter::pack_enumerate_payload(
+        let packed = crate::front::iter_adapter::pack_enumerate_payload(
             graph,
             some_target.0,
             &item_in_some,
@@ -1254,6 +1317,13 @@ fn rewire_one_next_site(
             &pair_in_some,
             &name,
         )?;
+        crate::front::iter_adapter::rewrite_forwarded_payload(
+            graph,
+            some_target.0,
+            &item_in_some,
+            &packed,
+            &crate::front::iter_adapter::enumerate_yield_owner(&item_ty),
+        );
     } else {
         for pos in payload_positions {
             collapse_pos0_read(graph, some_target, pos, &name)?;
