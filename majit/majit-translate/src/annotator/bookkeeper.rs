@@ -2710,17 +2710,11 @@ impl Bookkeeper {
         // `_gckind == 'raw'`, so `getkind` is Signed — the dual-gate twin
         // of the legacy walker's address word (`gateway::builtin_code_get`).
         if is_fn_type_spelling(t) {
-            return SomeValue::Ptr(super::model::SomePtr::new(
-                crate::translator::rtyper::lltypesystem::lltype::Ptr {
-                    TO: crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Func(
-                        crate::translator::rtyper::lltypesystem::lltype::FuncType {
-                            args: vec![],
-                            result:
-                                crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void,
-                        },
-                    ),
-                },
-            ));
+            // `lltype.FuncType` / `SomePtr` (`lltype.py` `SomePtr`). A raw
+            // function pointer is not a GC instance; `Option<fn>`'s null
+            // (`fn_null_constant`) uses this same `ll_ptrtype` so the two
+            // arms union (`llannotation.py` `pairtype(SomePtr, SomePtr).union`).
+            return raw_fn_ptr_somevalue();
         }
         // A raw-pointer field (`*const T` / `*mut T`) holds a one-word
         // pointer, not a `T`.  Projecting the pointee is right for an
@@ -4059,6 +4053,20 @@ fn is_nullable_sum_spelling(field_ty: &str) -> bool {
         .trim_start_matches("mut ")
         .trim();
     strip_generic_one(t, "Option<").is_some() || strip_generic_one(t, "Result<").is_some()
+}
+
+/// `SomePtr(Ptr(FuncType([], Void)))` — the annotation of a raw function
+/// pointer whose signature was erased to the field-registry spelling
+/// (`is_fn_type_spelling`). Shared with `fn_null_constant` so a null
+/// `Option<fn>` and a `fn` field read are one `ll_ptrtype`.
+pub(crate) fn raw_fn_ptr_somevalue() -> SomeValue {
+    use crate::translator::rtyper::lltypesystem::lltype::{FuncType, LowLevelType, Ptr, PtrTarget};
+    SomeValue::Ptr(super::model::SomePtr::new(Ptr {
+        TO: PtrTarget::Func(FuncType {
+            args: vec![],
+            result: LowLevelType::Void,
+        }),
+    }))
 }
 
 /// Charon spelling of a Rust function-pointer type (`fn`, `fn(…)`,

@@ -7308,6 +7308,23 @@ impl FunctionGraph {
         res
     }
 
+    /// Null function pointer for `Option<fn>`'s `None` arm. Annotates as
+    /// `SomePtr(FuncType)` (`fn_null_constant`), the same `ll_ptrtype` as a
+    /// `fn` field read, so the two arms union. A `null_mut()` null is a
+    /// classdef-less `SomeInstance` and does not.
+    pub fn push_null_fn_ptr(&mut self, block: BlockId) -> crate::flowspace::model::Variable {
+        let res = self.alloc_value_var();
+        self.block_mut(block).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["core", "ptr", "null_fn"]),
+                args: crate::model::call_args(vec![]),
+                result_ty: ValueType::Int,
+            },
+        });
+        res
+    }
+
     /// Mint a fresh value [`crate::flowspace::model::Variable`] with its
     /// [`ConcreteType`] stamped at construction — pyre's analogue of
     /// upstream `Variable(concretetype=...)` (RPython

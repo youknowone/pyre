@@ -19747,6 +19747,25 @@ impl<'a> Lowering<'a> {
             .is_some_and(|td| type_decl_is_fieldless_enum(td, self.llbc))
     }
 
+    /// `Option<fn>` payload — the null arm is `null_fn` (`SomePtr`), not
+    /// `null_mut` (`SomeInstance`).
+    fn option_payload_is_fn_ptr(&self, option_ty: &TyRef) -> bool {
+        if !crate::front::result_exc::tyref_is_option(option_ty, self.llbc) {
+            return false;
+        }
+        let Some(payload) = tyref_node(option_ty, self.llbc)
+            .and_then(|node| node.as_object())
+            .and_then(|m| m.get("Adt"))
+            .and_then(|a| a.get("generics"))
+            .and_then(|g| g.get("types"))
+            .and_then(|t| t.as_array())
+            .and_then(|t| t.first())
+        else {
+            return false;
+        };
+        type_node_is_fn_ptr(payload, self.llbc)
+    }
+
     /// `true` when `ty` is represented as a one-word nullable `Option` in
     /// the translated RPython model:
     /// `Option<NonNull<T>>`, `Option<Box<T>>`, `Option<fn(..)>`, `Option<&mut T>`,
@@ -19984,6 +20003,13 @@ impl<'a> Lowering<'a> {
     /// one repr-adaptive source.
     fn push_niche_null_ptr(&mut self, mir_bb: usize, option_ty: &TyRef) -> Variable {
         let bb_id = self.block_id[mir_bb];
+        // `Option<fn>` is a null function pointer (`SomePtr(FuncType)`),
+        // not a nullable GC instance. `null_mut()` annotates as
+        // classdef-less `SomeInstance` and then cannot union with the
+        // `fn` field read (`llannotation.py` `pairtype(SomePtr, SomePtr)`).
+        if self.option_payload_is_fn_ptr(option_ty) {
+            return self.graph.push_null_fn_ptr(bb_id);
+        }
         let null = self.graph.push_null_mut_ptr(bb_id);
         let Some((root, result_ty)) = self.option_niche_null_cast(option_ty) else {
             return null;

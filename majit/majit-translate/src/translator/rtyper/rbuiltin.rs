@@ -491,6 +491,9 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
         ("std.ptr", "null_mut", rtype_ptr_null),
         ("core.ptr", "null", rtype_ptr_null),
         ("std.ptr", "null", rtype_ptr_null),
+        // Null `Option<fn>` — `SomePtr(FuncType)`, `lltype.nullptr`.
+        ("core.ptr", "null_fn", rtype_null_fn),
+        ("std.ptr", "null_fn", rtype_null_fn),
         // `core.ptr` shares the `std.ptr` attr instance (model.rs), so
         // one entry covers both spellings.
         ("std.ptr", "eq", rtype_ptr_eq),
@@ -3456,6 +3459,36 @@ fn rtype_ptr_null(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeR
         .ok_or_else(|| TyperError::message("rtype_ptr_null: r_result missing".to_string()))?;
     let c = crate::translator::rtyper::rmodel::inputconst(r_result.as_ref(), &ConstValue::None)?;
     Ok(Some(Hlvalue::Constant(c)))
+}
+
+/// `core.ptr.null_fn` — `lltype.nullptr(FuncType)` (`rptr.py`
+/// `PtrRepr` over a function type). The annotation is `SomePtr`, so the
+/// null is an `LLPtr` of the result's function type rather than
+/// `convert_const(None)` on an `InstanceRepr`.
+fn rtype_null_fn(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::flowspace::model::{ConstValue, Hlvalue};
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget, nullptr};
+
+    hop.exception_cannot_occur()?;
+    let r_result_borrow = hop.r_result.borrow();
+    let r_result = r_result_borrow
+        .as_ref()
+        .ok_or_else(|| TyperError::message("rtype_null_fn: r_result missing".to_string()))?;
+    let ll = r_result.lowleveltype().clone();
+    let LowLevelType::Ptr(ptr) = &ll else {
+        return Err(TyperError::message(format!(
+            "rtype_null_fn: result is not a pointer, got {ll:?}"
+        )));
+    };
+    let PtrTarget::Func(func) = &ptr.TO else {
+        return Err(TyperError::message(format!(
+            "rtype_null_fn: result is not a function pointer, got {ll:?}"
+        )));
+    };
+    let null = nullptr(LowLevelType::Func(Box::new(func.clone()))).map_err(TyperError::message)?;
+    Ok(Some(Hlvalue::Constant(
+        crate::flowspace::model::Constant::with_concretetype(ConstValue::LLPtr(Box::new(null)), ll),
+    )))
 }
 
 /// Empty-string constructors — `String::new()` / `String::with_capacity(n)`
