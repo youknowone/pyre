@@ -7371,6 +7371,19 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         }
     }
 
+    // BINARY_SLICE of an exact `str` plus exact-int / None bounds:
+    // `_unicode_sliced` instead of the opaque MayForce residual.
+    if foldable_runtime_helper == majit_ir::RuntimeHelperKind::BinarySlice
+        && ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && spec_gate(SpecFold::BinarySliceStr, || {
+            try_walker_specialize_binary_slice_str(ctx, op, &r_args, dst)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     // FORMAT_SIMPLE on an exact `int` / `str`: the empty-spec fast path
     // `format_w` already takes, instead of the opaque MayForce residual.
     // Keyed off the helper tag; anything else (bool, subclass, user
