@@ -10,21 +10,21 @@ use num_complex::Complex64;
 use pymath::cmath as pmc;
 use pyre_object::*;
 
-type PyResult = Result<PyObjectRef, pyre_interpreter::PyError>;
+type PyResult = Result<PyObjectRef, crate::PyError>;
 
 /// `space.unpackcomplex(w_z)` — reuse the `complexobject.py unpackcomplex`
 /// port that `complex()` construction goes through.
-fn unpack(obj: PyObjectRef) -> Result<Complex64, pyre_interpreter::PyError> {
-    let (re, im) = pyre_interpreter::builtins::complex_coerce(obj)?;
+fn unpack(obj: PyObjectRef) -> Result<Complex64, crate::PyError> {
+    let (re, im) = crate::builtins::complex_coerce(obj)?;
     Ok(Complex64::new(re, im))
 }
 
 /// `call_c_func` (interp_cmath.py) — errno-style failures become the
 /// fixed cmath messages.
-fn map_err(e: pymath::Error) -> pyre_interpreter::PyError {
+fn map_err(e: pymath::Error) -> crate::PyError {
     match e {
-        pymath::Error::EDOM => pyre_interpreter::PyError::value_error("math domain error"),
-        pymath::Error::ERANGE => pyre_interpreter::PyError::overflow_error("math range error"),
+        pymath::Error::EDOM => crate::PyError::value_error("math domain error"),
+        pymath::Error::ERANGE => crate::PyError::overflow_error("math range error"),
     }
 }
 
@@ -62,19 +62,19 @@ cm1!(atanh);
 /// `wrapped_log` (interp_cmath.py) — with a base, `log(z)/log(base)`;
 /// `pymath::cmath::log` carries the `_Py_c_quot` division itself.
 pub fn log(args: &[PyObjectRef]) -> PyResult {
-    let (pos, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-    if pyre_interpreter::builtins::has_real_kwargs(kwargs) {
-        return Err(pyre_interpreter::PyError::type_error(
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if crate::builtins::has_real_kwargs(kwargs) {
+        return Err(crate::PyError::type_error(
             "cmath.log() takes no keyword arguments",
         ));
     }
     if pos.is_empty() {
-        return Err(pyre_interpreter::PyError::type_error(
+        return Err(crate::PyError::type_error(
             "log expected at least 1 argument, got 0",
         ));
     }
     if pos.len() > 2 {
-        return Err(pyre_interpreter::PyError::type_error(format!(
+        return Err(crate::PyError::type_error(format!(
             "log expected at most 2 arguments, got {}",
             pos.len()
         )));
@@ -102,8 +102,8 @@ pub fn polar(args: &[PyObjectRef]) -> PyResult {
 /// `wrapped_rect` — arguments go through `space.float_w`, so a complex
 /// operand is rejected rather than unpacked.
 pub fn rect(args: &[PyObjectRef]) -> PyResult {
-    let r = pyre_interpreter::baseobjspace::float_w(args[0])?;
-    let phi = pyre_interpreter::baseobjspace::float_w(args[1])?;
+    let r = crate::baseobjspace::float_w(args[0])?;
+    let phi = crate::baseobjspace::float_w(args[1])?;
     pmc::rect(r, phi).map(wrap).map_err(map_err)
 }
 
@@ -125,25 +125,25 @@ pub fn isnan(args: &[PyObjectRef]) -> PyResult {
 /// `cmath.isclose(a, b, *, rel_tol=1e-09, abs_tol=0.0)` — complex
 /// `_Py_c_isclose` equivalent over the two operands' components.
 pub fn isclose(args: &[PyObjectRef]) -> PyResult {
-    let (pos, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
-    pyre_interpreter::builtins::kwarg_reject_unknown(kwargs, &["rel_tol", "abs_tol"], "isclose")?;
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    crate::builtins::kwarg_reject_unknown(kwargs, &["rel_tol", "abs_tol"], "isclose")?;
     if pos.len() < 2 {
-        return Err(pyre_interpreter::PyError::type_error(
+        return Err(crate::PyError::type_error(
             "isclose() missing required argument",
         ));
     }
-    let (ar, ai) = pyre_interpreter::builtins::complex_coerce(pos[0])?;
-    let (br, bi) = pyre_interpreter::builtins::complex_coerce(pos[1])?;
-    let tol = |name: &str, default: f64| -> Result<f64, pyre_interpreter::PyError> {
-        match pyre_interpreter::builtins::kwarg_get(kwargs, name) {
-            Some(v) => pyre_interpreter::baseobjspace::float_w(v),
+    let (ar, ai) = crate::builtins::complex_coerce(pos[0])?;
+    let (br, bi) = crate::builtins::complex_coerce(pos[1])?;
+    let tol = |name: &str, default: f64| -> Result<f64, crate::PyError> {
+        match crate::builtins::kwarg_get(kwargs, name) {
+            Some(v) => crate::baseobjspace::float_w(v),
             None => Ok(default),
         }
     };
     let rel_tol = tol("rel_tol", 1e-9)?;
     let abs_tol = tol("abs_tol", 0.0)?;
     if rel_tol < 0.0 || abs_tol < 0.0 {
-        return Err(pyre_interpreter::PyError::value_error(
+        return Err(crate::PyError::value_error(
             "tolerances must be non-negative",
         ));
     }

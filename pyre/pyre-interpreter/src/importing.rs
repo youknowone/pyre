@@ -547,9 +547,9 @@ pub struct OptionalModuleHooks {
     pub install_modules: fn(),
     pub walk_global_roots: fn(&mut dyn FnMut(&mut majit_ir::GcRef)),
     pub walk_prebuilt_slots: fn(&mut dyn FnMut(&mut PyObjectRef)),
-    /// Residual addresses whose functions live in `pyre-module` (`ll_math`
-    /// hypot/atan2/…). `jit_trace_fnaddrs` appends these after the
-    /// interpreter-owned table.
+    /// Residual addresses whose functions live in `pyre-module` (`mmap`'s
+    /// type object, `_cffi_backend`'s `jit_libffi` helpers).
+    /// `jit_trace_fnaddrs` appends these after the interpreter-owned table.
     pub publish_fnaddrs: fn(&mut Vec<(&'static str, i64)>),
     pub mini_buffer_params: fn(PyObjectRef) -> Option<(*mut u8, usize)>,
     /// `Some(calls_python)` when `obj` is a cdata flavor this path handles.
@@ -576,11 +576,6 @@ pub struct OptionalModuleHooks {
     /// # Safety
     /// The address must be a block `_cffi_backend` built.
     pub libffi_cif_shape: unsafe fn(usize) -> Option<LibffiCifShape>,
-    /// The name of the canonical `math` builtin a callable is, if any.
-    pub math_builtin_name: fn(PyObjectRef) -> Option<&'static str>,
-    /// Whether `math.gamma` (or `lgamma` when the flag is set) is finite at
-    /// the argument.
-    pub math1_gamma_result_finite: fn(f64, bool) -> bool,
 }
 
 static OPTIONAL_MODULE_HOOKS: std::sync::OnceLock<OptionalModuleHooks> = std::sync::OnceLock::new();
@@ -846,7 +841,9 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_random);
     pyre_install_module!(_pickle);
     register_collectible_builtin_module("_struct", crate::module::r#struct::init);
+    pyre_install_module!(cmath);
     pyre_install_module!(marshal);
+    pyre_install_module!(math);
     pyre_install_module!(gc);
 
     // Modules whose stdlib wrapper does `import X` + attribute access or

@@ -7,7 +7,7 @@ pub mod interp_math;
 
 use interp_math as m;
 
-pyre_interpreter::py_module! {
+crate::py_module! {
     "math",
     interpleveldefs: {
         "e"   => pyre_object::floatobject::w_float_new(pymath::math::E),

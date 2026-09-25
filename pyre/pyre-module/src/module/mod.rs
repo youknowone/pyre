@@ -79,12 +79,10 @@ pub mod _winapi;
 #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
 pub mod _wmi;
 pub mod binascii;
-pub mod cmath;
 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 pub mod fcntl;
 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 pub mod grp;
-pub mod math;
 #[cfg(all(
     not(target_arch = "wasm32"),
     feature = "host_env",
