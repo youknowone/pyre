@@ -4757,6 +4757,21 @@ mod tests {
         }
 
         #[test]
+        fn unresolved_call_and_vtable_bail_set_abort_permanent_bail() {
+            let mut builder = build_test_bh_builder();
+            let mut bh = builder.acquire_interp();
+            let err = super::super::reject_unresolved_call(&mut bh, 0);
+            assert!(matches!(err, DispatchError::LeaveFrame));
+            assert!(bh.aborted && bh.abort_permanent_bail);
+
+            bh.aborted = false;
+            bh.abort_permanent_bail = false;
+            let err = super::super::handler_vtable_method_ptr_bail(&mut bh, &[], 0);
+            assert!(matches!(err, Err(DispatchError::LeaveFrame)));
+            assert!(bh.aborted && bh.abort_permanent_bail);
+        }
+
+        #[test]
         fn setposition_ref_does_not_clone_an_already_seated_jitcode() {
             let mut b = JitCodeBuilder::default();
             b.int_return(0);
@@ -10019,7 +10034,11 @@ fn reject_unresolved_call(bh: &mut BlackholeInterpreter, func: i64) -> DispatchE
             .map(str::to_owned)
             .unwrap_or_else(|| format!("fnaddr {func:#x}")),
     );
+    // `convert_and_run_from_pyjitpl` turns every abort into one resume.
+    // Consumers accept that resume only when `abort_permanent_bail` is set
+    // (`bhimpl_abort_permanent` is the other producer of this pair).
     bh.aborted = true;
+    bh.abort_permanent_bail = true;
     DispatchError::LeaveFrame
 }
 
@@ -11985,19 +12004,21 @@ fn handler_guard_class_r(
     bh.registers_r[code[p + 1] as usize] = typeptr;
     Ok(p + 2)
 }
-/// Safe fallback for the obsolete pyre-only named vtable lookup.
+/// Fallback for the obsolete pyre-only named vtable lookup.
 ///
 /// PyPy's `ClassRepr.getclsfield` emits an ordinary field read; it never tries
 /// to resolve `(trait, method)` strings in the blackhole.  If an old frozen
 /// graph or the still-conservative abstract-trait path reaches this opcode, no
-/// faithful pointer can be manufactured from its descriptor.  Hand execution
-/// back to the source interpreter like the other unsupported-op markers.
+/// faithful pointer can be manufactured from its descriptor.
+/// `convert_and_run_from_pyjitpl` resumes from one abort, and the resume
+/// consumers require `abort_permanent_bail` (`bhimpl_abort_permanent`).
 fn handler_vtable_method_ptr_bail(
     bh: &mut BlackholeInterpreter,
     _code: &[u8],
     _p: usize,
 ) -> Result<usize, DispatchError> {
     bh.aborted = true;
+    bh.abort_permanent_bail = true;
     Err(DispatchError::LeaveFrame)
 }
 
