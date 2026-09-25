@@ -16210,17 +16210,22 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
             write_ref_reg(ctx, op.pc, dst, boxed, concrete_for_shadow)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
-        if let Some(outcome) = spec_gate(SpecFold::BinaryOpDescent, || {
-            super::specialize::try_walker_orthodox_binary_op(
-                ctx,
-                op.pc,
-                op_tag,
-                int_args_tag,
-                &ref_args,
-                dst,
-                dst_bank,
-            )
-        })? {
+        // Inside a transparent helper subwalk this frame already walks the
+        // `binary_value_from_tag` body; descending again re-enters the same
+        // inline_call.  Walk the callee body instead (see the `iRd` site).
+        if !ctx.fbw_mode.transparent_helper_subwalk
+            && let Some(outcome) = spec_gate(SpecFold::BinaryOpDescent, || {
+                super::specialize::try_walker_orthodox_binary_op(
+                    ctx,
+                    op.pc,
+                    op_tag,
+                    int_args_tag,
+                    &ref_args,
+                    dst,
+                    dst_bank,
+                )
+            })?
+        {
             return Ok((outcome, op.next_pc));
         }
         // `descr_pow` still declines inside `long_pow`, so the mixed
