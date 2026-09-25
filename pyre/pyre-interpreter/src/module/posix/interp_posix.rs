@@ -238,135 +238,160 @@ fn collect_env_entries(
 
 #[cfg(all(unix, feature = "host_env", not(target_os = "redox")))]
 fn sysconf_names() -> &'static [(&'static str, i32)] {
+    use rustpython_host_env::posix as host_posix;
     &[
-        ("SC_2_CHAR_TERM", libc::_SC_2_CHAR_TERM),
-        ("SC_2_C_BIND", libc::_SC_2_C_BIND),
-        ("SC_2_C_DEV", libc::_SC_2_C_DEV),
-        ("SC_2_FORT_DEV", libc::_SC_2_FORT_DEV),
-        ("SC_2_FORT_RUN", libc::_SC_2_FORT_RUN),
-        ("SC_2_LOCALEDEF", libc::_SC_2_LOCALEDEF),
-        ("SC_2_SW_DEV", libc::_SC_2_SW_DEV),
-        ("SC_2_UPE", libc::_SC_2_UPE),
-        ("SC_2_VERSION", libc::_SC_2_VERSION),
-        ("SC_AIO_LISTIO_MAX", libc::_SC_AIO_LISTIO_MAX),
-        ("SC_AIO_MAX", libc::_SC_AIO_MAX),
-        ("SC_AIO_PRIO_DELTA_MAX", libc::_SC_AIO_PRIO_DELTA_MAX),
-        ("SC_ARG_MAX", libc::_SC_ARG_MAX),
-        ("SC_ASYNCHRONOUS_IO", libc::_SC_ASYNCHRONOUS_IO),
-        ("SC_ATEXIT_MAX", libc::_SC_ATEXIT_MAX),
-        ("SC_BC_BASE_MAX", libc::_SC_BC_BASE_MAX),
-        ("SC_BC_DIM_MAX", libc::_SC_BC_DIM_MAX),
-        ("SC_BC_SCALE_MAX", libc::_SC_BC_SCALE_MAX),
-        ("SC_BC_STRING_MAX", libc::_SC_BC_STRING_MAX),
-        ("SC_CHILD_MAX", libc::_SC_CHILD_MAX),
-        ("SC_CLK_TCK", libc::_SC_CLK_TCK),
-        ("SC_COLL_WEIGHTS_MAX", libc::_SC_COLL_WEIGHTS_MAX),
-        ("SC_DELAYTIMER_MAX", libc::_SC_DELAYTIMER_MAX),
-        ("SC_EXPR_NEST_MAX", libc::_SC_EXPR_NEST_MAX),
-        ("SC_FSYNC", libc::_SC_FSYNC),
-        ("SC_GETGR_R_SIZE_MAX", libc::_SC_GETGR_R_SIZE_MAX),
-        ("SC_GETPW_R_SIZE_MAX", libc::_SC_GETPW_R_SIZE_MAX),
-        ("SC_IOV_MAX", libc::_SC_IOV_MAX),
-        ("SC_JOB_CONTROL", libc::_SC_JOB_CONTROL),
-        ("SC_LINE_MAX", libc::_SC_LINE_MAX),
-        ("SC_LOGIN_NAME_MAX", libc::_SC_LOGIN_NAME_MAX),
-        ("SC_MAPPED_FILES", libc::_SC_MAPPED_FILES),
-        ("SC_MEMLOCK", libc::_SC_MEMLOCK),
-        ("SC_MEMLOCK_RANGE", libc::_SC_MEMLOCK_RANGE),
-        ("SC_MEMORY_PROTECTION", libc::_SC_MEMORY_PROTECTION),
-        ("SC_MESSAGE_PASSING", libc::_SC_MESSAGE_PASSING),
-        ("SC_MQ_OPEN_MAX", libc::_SC_MQ_OPEN_MAX),
-        ("SC_MQ_PRIO_MAX", libc::_SC_MQ_PRIO_MAX),
-        ("SC_NGROUPS_MAX", libc::_SC_NGROUPS_MAX),
-        ("SC_NPROCESSORS_CONF", libc::_SC_NPROCESSORS_CONF),
-        ("SC_NPROCESSORS_ONLN", libc::_SC_NPROCESSORS_ONLN),
-        ("SC_OPEN_MAX", libc::_SC_OPEN_MAX),
-        ("SC_PAGE_SIZE", libc::_SC_PAGE_SIZE),
-        ("SC_PAGESIZE", libc::_SC_PAGE_SIZE),
+        ("SC_2_CHAR_TERM", host_posix::_SC_2_CHAR_TERM),
+        ("SC_2_C_BIND", host_posix::_SC_2_C_BIND),
+        ("SC_2_C_DEV", host_posix::_SC_2_C_DEV),
+        ("SC_2_FORT_DEV", host_posix::_SC_2_FORT_DEV),
+        ("SC_2_FORT_RUN", host_posix::_SC_2_FORT_RUN),
+        ("SC_2_LOCALEDEF", host_posix::_SC_2_LOCALEDEF),
+        ("SC_2_SW_DEV", host_posix::_SC_2_SW_DEV),
+        ("SC_2_UPE", host_posix::_SC_2_UPE),
+        ("SC_2_VERSION", host_posix::_SC_2_VERSION),
+        ("SC_AIO_LISTIO_MAX", host_posix::_SC_AIO_LISTIO_MAX),
+        ("SC_AIO_MAX", host_posix::_SC_AIO_MAX),
+        ("SC_AIO_PRIO_DELTA_MAX", host_posix::_SC_AIO_PRIO_DELTA_MAX),
+        ("SC_ARG_MAX", host_posix::_SC_ARG_MAX),
+        ("SC_ASYNCHRONOUS_IO", host_posix::_SC_ASYNCHRONOUS_IO),
+        ("SC_ATEXIT_MAX", host_posix::_SC_ATEXIT_MAX),
+        ("SC_BC_BASE_MAX", host_posix::_SC_BC_BASE_MAX),
+        ("SC_BC_DIM_MAX", host_posix::_SC_BC_DIM_MAX),
+        ("SC_BC_SCALE_MAX", host_posix::_SC_BC_SCALE_MAX),
+        ("SC_BC_STRING_MAX", host_posix::_SC_BC_STRING_MAX),
+        ("SC_CHILD_MAX", host_posix::_SC_CHILD_MAX),
+        ("SC_CLK_TCK", host_posix::_SC_CLK_TCK),
+        ("SC_COLL_WEIGHTS_MAX", host_posix::_SC_COLL_WEIGHTS_MAX),
+        ("SC_DELAYTIMER_MAX", host_posix::_SC_DELAYTIMER_MAX),
+        ("SC_EXPR_NEST_MAX", host_posix::_SC_EXPR_NEST_MAX),
+        ("SC_FSYNC", host_posix::_SC_FSYNC),
+        ("SC_GETGR_R_SIZE_MAX", host_posix::_SC_GETGR_R_SIZE_MAX),
+        ("SC_GETPW_R_SIZE_MAX", host_posix::_SC_GETPW_R_SIZE_MAX),
+        ("SC_IOV_MAX", host_posix::_SC_IOV_MAX),
+        ("SC_JOB_CONTROL", host_posix::_SC_JOB_CONTROL),
+        ("SC_LINE_MAX", host_posix::_SC_LINE_MAX),
+        ("SC_LOGIN_NAME_MAX", host_posix::_SC_LOGIN_NAME_MAX),
+        ("SC_MAPPED_FILES", host_posix::_SC_MAPPED_FILES),
+        ("SC_MEMLOCK", host_posix::_SC_MEMLOCK),
+        ("SC_MEMLOCK_RANGE", host_posix::_SC_MEMLOCK_RANGE),
+        ("SC_MEMORY_PROTECTION", host_posix::_SC_MEMORY_PROTECTION),
+        ("SC_MESSAGE_PASSING", host_posix::_SC_MESSAGE_PASSING),
+        ("SC_MQ_OPEN_MAX", host_posix::_SC_MQ_OPEN_MAX),
+        ("SC_MQ_PRIO_MAX", host_posix::_SC_MQ_PRIO_MAX),
+        ("SC_NGROUPS_MAX", host_posix::_SC_NGROUPS_MAX),
+        ("SC_NPROCESSORS_CONF", host_posix::_SC_NPROCESSORS_CONF),
+        ("SC_NPROCESSORS_ONLN", host_posix::_SC_NPROCESSORS_ONLN),
+        ("SC_OPEN_MAX", host_posix::_SC_OPEN_MAX),
+        ("SC_PAGE_SIZE", host_posix::_SC_PAGE_SIZE),
+        ("SC_PAGESIZE", host_posix::_SC_PAGE_SIZE),
         #[cfg(any(
             target_os = "linux",
             target_vendor = "apple",
             target_os = "netbsd",
             target_os = "fuchsia"
         ))]
-        ("SC_PASS_MAX", libc::_SC_PASS_MAX),
-        ("SC_PHYS_PAGES", libc::_SC_PHYS_PAGES),
-        ("SC_PRIORITIZED_IO", libc::_SC_PRIORITIZED_IO),
-        ("SC_PRIORITY_SCHEDULING", libc::_SC_PRIORITY_SCHEDULING),
-        ("SC_REALTIME_SIGNALS", libc::_SC_REALTIME_SIGNALS),
-        ("SC_RE_DUP_MAX", libc::_SC_RE_DUP_MAX),
-        ("SC_RTSIG_MAX", libc::_SC_RTSIG_MAX),
-        ("SC_SAVED_IDS", libc::_SC_SAVED_IDS),
-        ("SC_SEMAPHORES", libc::_SC_SEMAPHORES),
-        ("SC_SEM_NSEMS_MAX", libc::_SC_SEM_NSEMS_MAX),
-        ("SC_SEM_VALUE_MAX", libc::_SC_SEM_VALUE_MAX),
-        ("SC_SHARED_MEMORY_OBJECTS", libc::_SC_SHARED_MEMORY_OBJECTS),
-        ("SC_SIGQUEUE_MAX", libc::_SC_SIGQUEUE_MAX),
-        ("SC_STREAM_MAX", libc::_SC_STREAM_MAX),
-        ("SC_SYNCHRONIZED_IO", libc::_SC_SYNCHRONIZED_IO),
-        ("SC_THREADS", libc::_SC_THREADS),
-        ("SC_THREAD_ATTR_STACKADDR", libc::_SC_THREAD_ATTR_STACKADDR),
-        ("SC_THREAD_ATTR_STACKSIZE", libc::_SC_THREAD_ATTR_STACKSIZE),
+        ("SC_PASS_MAX", host_posix::_SC_PASS_MAX),
+        ("SC_PHYS_PAGES", host_posix::_SC_PHYS_PAGES),
+        ("SC_PRIORITIZED_IO", host_posix::_SC_PRIORITIZED_IO),
+        (
+            "SC_PRIORITY_SCHEDULING",
+            host_posix::_SC_PRIORITY_SCHEDULING,
+        ),
+        ("SC_REALTIME_SIGNALS", host_posix::_SC_REALTIME_SIGNALS),
+        ("SC_RE_DUP_MAX", host_posix::_SC_RE_DUP_MAX),
+        ("SC_RTSIG_MAX", host_posix::_SC_RTSIG_MAX),
+        ("SC_SAVED_IDS", host_posix::_SC_SAVED_IDS),
+        ("SC_SEMAPHORES", host_posix::_SC_SEMAPHORES),
+        ("SC_SEM_NSEMS_MAX", host_posix::_SC_SEM_NSEMS_MAX),
+        ("SC_SEM_VALUE_MAX", host_posix::_SC_SEM_VALUE_MAX),
+        (
+            "SC_SHARED_MEMORY_OBJECTS",
+            host_posix::_SC_SHARED_MEMORY_OBJECTS,
+        ),
+        ("SC_SIGQUEUE_MAX", host_posix::_SC_SIGQUEUE_MAX),
+        ("SC_STREAM_MAX", host_posix::_SC_STREAM_MAX),
+        ("SC_SYNCHRONIZED_IO", host_posix::_SC_SYNCHRONIZED_IO),
+        ("SC_THREADS", host_posix::_SC_THREADS),
+        (
+            "SC_THREAD_ATTR_STACKADDR",
+            host_posix::_SC_THREAD_ATTR_STACKADDR,
+        ),
+        (
+            "SC_THREAD_ATTR_STACKSIZE",
+            host_posix::_SC_THREAD_ATTR_STACKSIZE,
+        ),
         (
             "SC_THREAD_DESTRUCTOR_ITERATIONS",
-            libc::_SC_THREAD_DESTRUCTOR_ITERATIONS,
+            host_posix::_SC_THREAD_DESTRUCTOR_ITERATIONS,
         ),
-        ("SC_THREAD_KEYS_MAX", libc::_SC_THREAD_KEYS_MAX),
+        ("SC_THREAD_KEYS_MAX", host_posix::_SC_THREAD_KEYS_MAX),
         (
             "SC_THREAD_PRIORITY_SCHEDULING",
-            libc::_SC_THREAD_PRIORITY_SCHEDULING,
+            host_posix::_SC_THREAD_PRIORITY_SCHEDULING,
         ),
-        ("SC_THREAD_PRIO_INHERIT", libc::_SC_THREAD_PRIO_INHERIT),
-        ("SC_THREAD_PRIO_PROTECT", libc::_SC_THREAD_PRIO_PROTECT),
-        ("SC_THREAD_PROCESS_SHARED", libc::_SC_THREAD_PROCESS_SHARED),
-        ("SC_THREAD_SAFE_FUNCTIONS", libc::_SC_THREAD_SAFE_FUNCTIONS),
-        ("SC_THREAD_STACK_MIN", libc::_SC_THREAD_STACK_MIN),
-        ("SC_THREAD_THREADS_MAX", libc::_SC_THREAD_THREADS_MAX),
-        ("SC_TIMERS", libc::_SC_TIMERS),
-        ("SC_TIMER_MAX", libc::_SC_TIMER_MAX),
-        ("SC_TTY_NAME_MAX", libc::_SC_TTY_NAME_MAX),
-        ("SC_TZNAME_MAX", libc::_SC_TZNAME_MAX),
-        ("SC_VERSION", libc::_SC_VERSION),
-        ("SC_XOPEN_CRYPT", libc::_SC_XOPEN_CRYPT),
-        ("SC_XOPEN_ENH_I18N", libc::_SC_XOPEN_ENH_I18N),
-        ("SC_XOPEN_LEGACY", libc::_SC_XOPEN_LEGACY),
-        ("SC_XOPEN_REALTIME", libc::_SC_XOPEN_REALTIME),
+        (
+            "SC_THREAD_PRIO_INHERIT",
+            host_posix::_SC_THREAD_PRIO_INHERIT,
+        ),
+        (
+            "SC_THREAD_PRIO_PROTECT",
+            host_posix::_SC_THREAD_PRIO_PROTECT,
+        ),
+        (
+            "SC_THREAD_PROCESS_SHARED",
+            host_posix::_SC_THREAD_PROCESS_SHARED,
+        ),
+        (
+            "SC_THREAD_SAFE_FUNCTIONS",
+            host_posix::_SC_THREAD_SAFE_FUNCTIONS,
+        ),
+        ("SC_THREAD_STACK_MIN", host_posix::_SC_THREAD_STACK_MIN),
+        ("SC_THREAD_THREADS_MAX", host_posix::_SC_THREAD_THREADS_MAX),
+        ("SC_TIMERS", host_posix::_SC_TIMERS),
+        ("SC_TIMER_MAX", host_posix::_SC_TIMER_MAX),
+        ("SC_TTY_NAME_MAX", host_posix::_SC_TTY_NAME_MAX),
+        ("SC_TZNAME_MAX", host_posix::_SC_TZNAME_MAX),
+        ("SC_VERSION", host_posix::_SC_VERSION),
+        ("SC_XOPEN_CRYPT", host_posix::_SC_XOPEN_CRYPT),
+        ("SC_XOPEN_ENH_I18N", host_posix::_SC_XOPEN_ENH_I18N),
+        ("SC_XOPEN_LEGACY", host_posix::_SC_XOPEN_LEGACY),
+        ("SC_XOPEN_REALTIME", host_posix::_SC_XOPEN_REALTIME),
         (
             "SC_XOPEN_REALTIME_THREADS",
-            libc::_SC_XOPEN_REALTIME_THREADS,
+            host_posix::_SC_XOPEN_REALTIME_THREADS,
         ),
-        ("SC_XOPEN_SHM", libc::_SC_XOPEN_SHM),
-        ("SC_XOPEN_UNIX", libc::_SC_XOPEN_UNIX),
-        ("SC_XOPEN_VERSION", libc::_SC_XOPEN_VERSION),
-        ("SC_XOPEN_XCU_VERSION", libc::_SC_XOPEN_XCU_VERSION),
+        ("SC_XOPEN_SHM", host_posix::_SC_XOPEN_SHM),
+        ("SC_XOPEN_UNIX", host_posix::_SC_XOPEN_UNIX),
+        ("SC_XOPEN_VERSION", host_posix::_SC_XOPEN_VERSION),
+        ("SC_XOPEN_XCU_VERSION", host_posix::_SC_XOPEN_XCU_VERSION),
         #[cfg(any(
             target_os = "linux",
             target_vendor = "apple",
             target_os = "netbsd",
             target_os = "fuchsia"
         ))]
-        ("SC_XBS5_ILP32_OFF32", libc::_SC_XBS5_ILP32_OFF32),
+        ("SC_XBS5_ILP32_OFF32", host_posix::_SC_XBS5_ILP32_OFF32),
         #[cfg(any(
             target_os = "linux",
             target_vendor = "apple",
             target_os = "netbsd",
             target_os = "fuchsia"
         ))]
-        ("SC_XBS5_ILP32_OFFBIG", libc::_SC_XBS5_ILP32_OFFBIG),
+        ("SC_XBS5_ILP32_OFFBIG", host_posix::_SC_XBS5_ILP32_OFFBIG),
         #[cfg(any(
             target_os = "linux",
             target_vendor = "apple",
             target_os = "netbsd",
             target_os = "fuchsia"
         ))]
-        ("SC_XBS5_LP64_OFF64", libc::_SC_XBS5_LP64_OFF64),
+        ("SC_XBS5_LP64_OFF64", host_posix::_SC_XBS5_LP64_OFF64),
         #[cfg(any(
             target_os = "linux",
             target_vendor = "apple",
             target_os = "netbsd",
             target_os = "fuchsia"
         ))]
-        ("SC_XBS5_LPBIG_OFFBIG", libc::_SC_XBS5_LPBIG_OFFBIG),
+        ("SC_XBS5_LPBIG_OFFBIG", host_posix::_SC_XBS5_LPBIG_OFFBIG),
     ]
 }
 
@@ -1922,23 +1947,29 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     );
     // POSIX constants — real libc values (cross-platform subset).
     for (name, val) in [
-        // F_OK/R_OK/W_OK/X_OK: Windows doesn't have them in libc crate,
-        // define standard POSIX values directly.
-        #[cfg(unix)]
+        #[cfg(feature = "host_env")]
+        ("F_OK", rustpython_host_env::os::F_OK as i64),
+        #[cfg(all(not(feature = "host_env"), unix))]
         ("F_OK", libc::F_OK as i64),
-        #[cfg(not(unix))]
+        #[cfg(all(not(feature = "host_env"), not(unix)))]
         ("F_OK", 0i64),
-        #[cfg(unix)]
+        #[cfg(feature = "host_env")]
+        ("R_OK", rustpython_host_env::os::R_OK as i64),
+        #[cfg(all(not(feature = "host_env"), unix))]
         ("R_OK", libc::R_OK as i64),
-        #[cfg(not(unix))]
+        #[cfg(all(not(feature = "host_env"), not(unix)))]
         ("R_OK", 4i64),
-        #[cfg(unix)]
+        #[cfg(feature = "host_env")]
+        ("W_OK", rustpython_host_env::os::W_OK as i64),
+        #[cfg(all(not(feature = "host_env"), unix))]
         ("W_OK", libc::W_OK as i64),
-        #[cfg(not(unix))]
+        #[cfg(all(not(feature = "host_env"), not(unix)))]
         ("W_OK", 2i64),
-        #[cfg(unix)]
+        #[cfg(feature = "host_env")]
+        ("X_OK", rustpython_host_env::os::X_OK as i64),
+        #[cfg(all(not(feature = "host_env"), unix))]
         ("X_OK", libc::X_OK as i64),
-        #[cfg(not(unix))]
+        #[cfg(all(not(feature = "host_env"), not(unix)))]
         ("X_OK", 1i64),
         ("O_RDONLY", libc::O_RDONLY as i64),
         ("O_WRONLY", libc::O_WRONLY as i64),
@@ -2034,7 +2065,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         ("O_TEXT", libc::O_TEXT as i64),
         ("O_NOINHERIT", libc::O_NOINHERIT as i64),
         ("O_TEMPORARY", libc::O_TEMPORARY as i64),
-        ("O_SHORT_LIVED", libc::_O_SHORT_LIVED as i64),
+        ("O_SHORT_LIVED", {
+            #[cfg(feature = "host_env")]
+            {
+                rustpython_host_env::msvcrt::O_SHORT_LIVED as i64
+            }
+            #[cfg(not(feature = "host_env"))]
+            {
+                libc::_O_SHORT_LIVED as i64
+            }
+        }),
         ("O_RANDOM", libc::O_RANDOM as i64),
         ("O_SEQUENTIAL", libc::O_SEQUENTIAL as i64),
     ] {
@@ -2074,7 +2114,43 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     //
     // `EX_OK` is the one member of the `<sysexits.h>` family Windows answers to
     // as well, and it carries the same 0 there.
-    #[cfg(windows)]
+    #[cfg(all(windows, feature = "host_env"))]
+    {
+        use rustpython_host_env::msvcrt as host_msvcrt;
+        use rustpython_host_env::nt as host_nt;
+        for (name, val) in [
+            ("EX_OK", host_msvcrt::EX_OK as i64),
+            ("P_WAIT", host_msvcrt::P_WAIT as i64),
+            ("P_NOWAIT", host_msvcrt::P_NOWAIT as i64),
+            ("P_OVERLAY", host_msvcrt::P_OVERLAY as i64),
+            ("P_NOWAITO", host_msvcrt::P_NOWAITO as i64),
+            ("P_DETACH", host_msvcrt::P_DETACH as i64),
+            ("TMP_MAX", host_msvcrt::TMP_MAX as i64),
+            (
+                "_LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR",
+                host_nt::LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR as i64,
+            ),
+            (
+                "_LOAD_LIBRARY_SEARCH_APPLICATION_DIR",
+                host_nt::LOAD_LIBRARY_SEARCH_APPLICATION_DIR as i64,
+            ),
+            (
+                "_LOAD_LIBRARY_SEARCH_USER_DIRS",
+                host_nt::LOAD_LIBRARY_SEARCH_USER_DIRS as i64,
+            ),
+            (
+                "_LOAD_LIBRARY_SEARCH_SYSTEM32",
+                host_nt::LOAD_LIBRARY_SEARCH_SYSTEM32 as i64,
+            ),
+            (
+                "_LOAD_LIBRARY_SEARCH_DEFAULT_DIRS",
+                host_nt::LOAD_LIBRARY_SEARCH_DEFAULT_DIRS as i64,
+            ),
+        ] {
+            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+        }
+    }
+    #[cfg(all(windows, not(feature = "host_env")))]
     for (name, val) in [
         ("EX_OK", 0i64),
         ("P_WAIT", 0i64),
@@ -2082,10 +2158,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         ("P_OVERLAY", 2),
         ("P_NOWAITO", 3),
         ("P_DETACH", 4),
-        // The number of names `tempfile` will try before giving up.
         ("TMP_MAX", 2_147_483_647),
-        // LoadLibraryEx search flags, which `os.add_dll_directory` and
-        // `ctypes` pass through.
         ("_LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR", 0x100),
         ("_LOAD_LIBRARY_SEARCH_APPLICATION_DIR", 0x200),
         ("_LOAD_LIBRARY_SEARCH_USER_DIRS", 0x400),
@@ -2099,6 +2172,43 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // `<sysexits.h>`. The header is a verbatim descendant of the 4.3BSD one
         // wherever it is carried, so the values are the same on every host that
         // has it and the `libc` crate binds none of them.
+        #[cfg(feature = "host_env")]
+        for (name, val) in [
+            ("EX_OK", rustpython_host_env::posix::EX_OK as i64),
+            ("EX_USAGE", rustpython_host_env::posix::EX_USAGE as i64),
+            ("EX_DATAERR", rustpython_host_env::posix::EX_DATAERR as i64),
+            ("EX_NOINPUT", rustpython_host_env::posix::EX_NOINPUT as i64),
+            ("EX_NOUSER", rustpython_host_env::posix::EX_NOUSER as i64),
+            ("EX_NOHOST", rustpython_host_env::posix::EX_NOHOST as i64),
+            (
+                "EX_UNAVAILABLE",
+                rustpython_host_env::posix::EX_UNAVAILABLE as i64,
+            ),
+            (
+                "EX_SOFTWARE",
+                rustpython_host_env::posix::EX_SOFTWARE as i64,
+            ),
+            ("EX_OSERR", rustpython_host_env::posix::EX_OSERR as i64),
+            ("EX_OSFILE", rustpython_host_env::posix::EX_OSFILE as i64),
+            (
+                "EX_CANTCREAT",
+                rustpython_host_env::posix::EX_CANTCREAT as i64,
+            ),
+            ("EX_IOERR", rustpython_host_env::posix::EX_IOERR as i64),
+            (
+                "EX_TEMPFAIL",
+                rustpython_host_env::posix::EX_TEMPFAIL as i64,
+            ),
+            (
+                "EX_PROTOCOL",
+                rustpython_host_env::posix::EX_PROTOCOL as i64,
+            ),
+            ("EX_NOPERM", rustpython_host_env::posix::EX_NOPERM as i64),
+            ("EX_CONFIG", rustpython_host_env::posix::EX_CONFIG as i64),
+        ] {
+            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+        }
+        #[cfg(not(feature = "host_env"))]
         for (name, val) in [
             ("EX_OK", 0i64),
             ("EX_USAGE", 64),
@@ -2179,6 +2289,38 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         }
         // The `cmd` `lockf` takes, which is the whole of its vocabulary and
         // which os.py neither writes nor names.
+        #[cfg(all(
+            feature = "host_env",
+            any(
+                target_os = "android",
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "netbsd",
+                target_os = "redox"
+            )
+        ))]
+        for (name, val) in [
+            ("F_ULOCK", rustpython_host_env::fcntl::F_ULOCK as i64),
+            ("F_LOCK", rustpython_host_env::fcntl::F_LOCK as i64),
+            ("F_TLOCK", rustpython_host_env::fcntl::F_TLOCK as i64),
+            ("F_TEST", rustpython_host_env::fcntl::F_TEST as i64),
+        ] {
+            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+        }
+        #[cfg(not(all(
+            feature = "host_env",
+            any(
+                target_os = "android",
+                target_os = "dragonfly",
+                target_os = "freebsd",
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "netbsd",
+                target_os = "redox"
+            )
+        )))]
         for (name, val) in [
             ("F_ULOCK", libc::F_ULOCK as i64),
             ("F_LOCK", libc::F_LOCK as i64),
@@ -3969,16 +4111,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             // Only an integer second can be out of a `time_t`'s range. A
             // quotient that is not one at all — `divmod` answers a float pair
             // for `ns=(1.5, 2.5)` — keeps the conversion's own refusal.
-            let sec = crate::builtins::space_index_w(pyre_object::gc_roots::shadow_stack_get(
-                sec_slot,
-            ))
-            .map_err(|err| {
-                if err.kind == crate::PyErrorKind::OverflowError {
-                    time_t_overflow()
-                } else {
-                    err
-                }
-            })?;
+            let sec =
+                crate::builtins::space_index_w(pyre_object::gc_roots::shadow_stack_get(sec_slot))
+                    .map_err(|err| {
+                    if err.kind == crate::PyErrorKind::OverflowError {
+                        time_t_overflow()
+                    } else {
+                        err
+                    }
+                })?;
             Ok(UTime {
                 sec,
                 nsec: crate::builtins::space_index_w(pyre_object::gc_roots::shadow_stack_get(
@@ -5337,7 +5478,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     /// name for the identity.
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     fn stat_fields_from_find_data(data: &WinFindData) -> StatFields {
-        const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+        const IO_REPARSE_TAG_SYMLINK: u32 = rustpython_host_env::nt::IO_REPARSE_TAG_SYMLINK;
         // A `FILETIME` counts 100ns ticks from 1601-01-01.
         const SECS_BETWEEN_EPOCHS: i64 = 11_644_473_600;
 
@@ -5892,7 +6033,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         {
             // The walk reported that tag, so the answer costs no call and
             // survives the name being removed.
-            const IO_REPARSE_TAG_MOUNT_POINT: i64 = 0xA000_0003;
+            const IO_REPARSE_TAG_MOUNT_POINT: i64 =
+                rustpython_host_env::nt::IO_REPARSE_TAG_MOUNT_POINT as i64;
             let de = W_DirEntry::from_obj(_args[0])
                 .ok_or_else(|| crate::PyError::type_error("expected a 'posix.DirEntry' object"))?;
             return Ok(pyre_object::w_bool_from(
@@ -7240,7 +7382,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             "pread: negative length",
                         ));
                     }
-                    let n = length as usize;
+                    // unwrap_spec(length=int): space.int_w is a machine
+                    // word. A value that does not fit usize is OverflowError,
+                    // not a wrapped allocation size.
+                    let n = usize::try_from(length).map_err(|_| {
+                        crate::PyError::overflow_error(
+                            "Python int too large to convert to C ssize_t",
+                        )
+                    })?;
                     let mut buf = Vec::new();
                     buf.try_reserve_exact(n)
                         .map_err(|_| crate::PyError::memory_error(""))?;
@@ -7999,11 +8148,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             ),
         );
 
-        // PyPy interp_posix.py:1703-1706 delegates to
-        // `_run_forking_function(space, "P")`, so forkpty must use the same
-        // before/parent/child hook and thread-reinitialization lifecycle as
-        // fork above while returning the master descriptor as its second item.
-        #[cfg(not(feature = "sandbox"))]
+        // PyPy `interp_posix.forkpty` delegates to `_run_forking_function`
+        // with kind `"P"`, so forkpty uses the same before/parent/child hook
+        // and thread-reinitialization lifecycle as fork above while returning
+        // the master descriptor as its second item.
+        #[cfg(not(any(feature = "sandbox", target_os = "redox")))]
         crate::module_ns_store(
             ns,
             "forkpty",
@@ -8023,34 +8172,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     drop(blocked);
                     run_fork_callbacks("before");
-                    let mut master_fd = -1;
-                    let fork_result = majit_gc::gc_sync::fork_under_stw(|| {
-                        let pid = unsafe {
-                            libc::forkpty(
-                                &mut master_fd,
-                                std::ptr::null_mut(),
-                                std::ptr::null_mut(),
-                                std::ptr::null_mut(),
-                            )
-                        };
-                        if pid == -1 {
-                            Err(std::io::Error::last_os_error())
-                        } else {
-                            Ok(pid)
-                        }
-                    });
-                    match fork_result {
-                        Ok(0) => {
+                    crate::module::imp::interp_imp::before_fork();
+                    match majit_gc::gc_sync::fork_under_stw(host_posix::forkpty) {
+                        Ok((0, master_fd)) => {
                             crate::module::thread::after_fork_child();
                             run_fork_callbacks("child");
+                            crate::module::imp::interp_imp::after_fork_child();
+                            pyre_object::gc_interp::request_oldgen_collection();
                             drop(fork_serial);
                             let mut fields = pyre_object::gc_roots::RootedItems::new();
                             fields.push(pyre_object::w_int_new(0));
                             fields.push(pyre_object::w_int_new(master_fd as i64));
                             Ok(pyre_object::w_tuple_new(fields.take()))
                         }
-                        Ok(pid) => {
+                        Ok((pid, master_fd)) => {
                             run_fork_callbacks("parent");
+                            crate::module::imp::interp_imp::after_fork_parent()?;
                             drop(fork_serial);
                             let mut fields = pyre_object::gc_roots::RootedItems::new();
                             fields.push(pyre_object::w_int_new(pid as i64));
@@ -8059,6 +8196,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         }
                         Err(error) => {
                             run_fork_callbacks("parent");
+                            let _ = crate::module::imp::interp_imp::after_fork_parent();
                             drop(fork_serial);
                             Err(io_err(error, ""))
                         }
@@ -8363,6 +8501,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 crate::PyError::runtime_error("resource module is not initialized")
             })?;
             let cls = crate::baseobjspace::getattr_str(resource, "struct_rusage")?;
+            // Field boxing and the argument tuple can collect, so the type is
+            // pinned before the first allocation and re-read for the call.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(cls);
             let tv_to_f = |tv: libc::timeval| tv.tv_sec as f64 + (tv.tv_usec as f64) * 1e-6;
             let mut fields = pyre_object::gc_roots::RootedItems::new();
             fields.push(pyre_object::floatobject::w_float_new(tv_to_f(ru.ru_utime)));
@@ -8381,7 +8524,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             fields.push(pyre_object::w_int_new(ru.ru_nsignals));
             fields.push(pyre_object::w_int_new(ru.ru_nvcsw));
             fields.push(pyre_object::w_int_new(ru.ru_nivcsw));
-            Ok(crate::_structseq::new_instance(cls, fields.take()))
+            // `_make_struct_rusage` calls `struct_rusage((...))`, so a
+            // rebound type's constructor is observable.
+            let tuple = pyre_object::w_tuple_new(fields.take());
+            crate::call::call_function_impl_result(
+                pyre_object::gc_roots::shadow_stack_get(cls_slot),
+                &[tuple],
+            )
         }
 
         fn wait_with_rusage<F>(wait: F) -> Result<PyObjectRef, crate::PyError>
@@ -10419,7 +10568,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     bound[1].expect("argv is required"),
                     bound[2].expect("env is required"),
                 ]);
-                let kwargs_slot = kwargs.map(|kwargs| pyre_object::gc_roots::publish_roots(&[kwargs]));
+                let kwargs_slot =
+                    kwargs.map(|kwargs| pyre_object::gc_roots::publish_roots(&[kwargs]));
                 pyre_object::gc_roots::normalize_roots(
                     positional_base,
                     3 + usize::from(kwargs_slot.is_some()),
@@ -10919,16 +11069,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         const PATHCONF_NAMES: &[(&str, i32)] = &[
             ("PC_ALLOC_SIZE_MIN", libc::_PC_ALLOC_SIZE_MIN),
             ("PC_ASYNC_IO", libc::_PC_ASYNC_IO),
-            ("PC_CHOWN_RESTRICTED", libc::_PC_CHOWN_RESTRICTED),
+            ("PC_CHOWN_RESTRICTED", host_posix::_PC_CHOWN_RESTRICTED),
             ("PC_FILESIZEBITS", libc::_PC_FILESIZEBITS),
-            ("PC_LINK_MAX", libc::_PC_LINK_MAX),
-            ("PC_MAX_CANON", libc::_PC_MAX_CANON),
-            ("PC_MAX_INPUT", libc::_PC_MAX_INPUT),
+            ("PC_LINK_MAX", host_posix::_PC_LINK_MAX),
+            ("PC_MAX_CANON", host_posix::_PC_MAX_CANON),
+            ("PC_MAX_INPUT", host_posix::_PC_MAX_INPUT),
             ("PC_MIN_HOLE_SIZE", libc::_PC_MIN_HOLE_SIZE),
-            ("PC_NAME_MAX", libc::_PC_NAME_MAX),
-            ("PC_NO_TRUNC", libc::_PC_NO_TRUNC),
-            ("PC_PATH_MAX", libc::_PC_PATH_MAX),
-            ("PC_PIPE_BUF", libc::_PC_PIPE_BUF),
+            ("PC_NAME_MAX", host_posix::_PC_NAME_MAX),
+            ("PC_NO_TRUNC", host_posix::_PC_NO_TRUNC),
+            ("PC_PATH_MAX", host_posix::_PC_PATH_MAX),
+            ("PC_PIPE_BUF", host_posix::_PC_PIPE_BUF),
             ("PC_PRIO_IO", libc::_PC_PRIO_IO),
             ("PC_REC_INCR_XFER_SIZE", libc::_PC_REC_INCR_XFER_SIZE),
             ("PC_REC_MAX_XFER_SIZE", libc::_PC_REC_MAX_XFER_SIZE),
@@ -10936,31 +11086,31 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             ("PC_REC_XFER_ALIGN", libc::_PC_REC_XFER_ALIGN),
             ("PC_SYMLINK_MAX", libc::_PC_SYMLINK_MAX),
             ("PC_SYNC_IO", libc::_PC_SYNC_IO),
-            ("PC_VDISABLE", libc::_PC_VDISABLE),
+            ("PC_VDISABLE", host_posix::_PC_VDISABLE),
         ];
         #[cfg(target_os = "linux")]
         const PATHCONF_NAMES: &[(&str, i32)] = &[
-            ("PC_2_SYMLINKS", 20),
-            ("PC_ALLOC_SIZE_MIN", 18),
-            ("PC_ASYNC_IO", 10),
-            ("PC_CHOWN_RESTRICTED", 6),
-            ("PC_FILESIZEBITS", 13),
-            ("PC_LINK_MAX", 0),
-            ("PC_MAX_CANON", 1),
-            ("PC_MAX_INPUT", 2),
-            ("PC_NAME_MAX", 3),
-            ("PC_NO_TRUNC", 7),
-            ("PC_PATH_MAX", 4),
-            ("PC_PIPE_BUF", 5),
-            ("PC_PRIO_IO", 11),
-            ("PC_REC_INCR_XFER_SIZE", 14),
-            ("PC_REC_MAX_XFER_SIZE", 15),
-            ("PC_REC_MIN_XFER_SIZE", 16),
-            ("PC_REC_XFER_ALIGN", 17),
+            ("PC_2_SYMLINKS", host_posix::_PC_2_SYMLINKS),
+            ("PC_ALLOC_SIZE_MIN", host_posix::_PC_ALLOC_SIZE_MIN),
+            ("PC_ASYNC_IO", host_posix::_PC_ASYNC_IO),
+            ("PC_CHOWN_RESTRICTED", host_posix::_PC_CHOWN_RESTRICTED),
+            ("PC_FILESIZEBITS", host_posix::_PC_FILESIZEBITS),
+            ("PC_LINK_MAX", host_posix::_PC_LINK_MAX),
+            ("PC_MAX_CANON", host_posix::_PC_MAX_CANON),
+            ("PC_MAX_INPUT", host_posix::_PC_MAX_INPUT),
+            ("PC_NAME_MAX", host_posix::_PC_NAME_MAX),
+            ("PC_NO_TRUNC", host_posix::_PC_NO_TRUNC),
+            ("PC_PATH_MAX", host_posix::_PC_PATH_MAX),
+            ("PC_PIPE_BUF", host_posix::_PC_PIPE_BUF),
+            ("PC_PRIO_IO", host_posix::_PC_PRIO_IO),
+            ("PC_REC_INCR_XFER_SIZE", host_posix::_PC_REC_INCR_XFER_SIZE),
+            ("PC_REC_MAX_XFER_SIZE", host_posix::_PC_REC_MAX_XFER_SIZE),
+            ("PC_REC_MIN_XFER_SIZE", host_posix::_PC_REC_MIN_XFER_SIZE),
+            ("PC_REC_XFER_ALIGN", host_posix::_PC_REC_XFER_ALIGN),
             ("PC_SOCK_MAXBUF", 12),
-            ("PC_SYMLINK_MAX", 19),
-            ("PC_SYNC_IO", 9),
-            ("PC_VDISABLE", 8),
+            ("PC_SYMLINK_MAX", host_posix::_PC_SYMLINK_MAX),
+            ("PC_SYNC_IO", host_posix::_PC_SYNC_IO),
+            ("PC_VDISABLE", host_posix::_PC_VDISABLE),
         ];
         #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
         const PATHCONF_NAMES: &[(&str, i32)] = &[];
@@ -11437,10 +11587,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         }
 
         /// The descriptor's handle, or `None` when it names none.
-        fn fd_handle(fd: i32) -> Option<windows_sys::Win32::Foundation::HANDLE> {
+        fn fd_handle(fd: i32) -> Option<host_nt::Handle> {
             let handle = host_nt::handle_from_fd(fd);
-            (!handle.is_null() && handle != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE)
-                .then_some(handle)
+            (!host_nt::is_invalid_handle(handle)).then_some(handle)
         }
 
         // os.dup(fd) -> new_fd.  `_Py_dup` makes the copy non-inheritable, so

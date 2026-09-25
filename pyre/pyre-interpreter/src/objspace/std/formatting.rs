@@ -761,8 +761,12 @@ fn check_min_field_width(spec: &CFormatSpec) -> Result<(), PyError> {
 }
 
 unsafe fn spec_format_bytes(spec: &CFormatSpec, obj: PyObjectRef) -> Result<Vec<u8>, PyError> {
+    if let CFormatType::Unsupported { ch, index } = spec.format_type {
+        return Err(unsupported_format_error(ch.to_u32(), index, true));
+    }
     check_min_field_width(spec)?;
     match &spec.format_type {
+        CFormatType::Unsupported { .. } => unreachable!("checked above"),
         CFormatType::String(CFormatConversion::Repr | CFormatConversion::Ascii) => {
             Ok(spec.format_bytes(crate::builtins::py_ascii(obj)?.as_bytes()))
         }
@@ -894,8 +898,12 @@ unsafe fn has_getitem(obj: PyObjectRef) -> bool {
 /// `formatting.py fmt_s / fmt_d / fmt_f / ...` — the per-conversion value
 /// coercion and formatting.
 unsafe fn spec_format_string(spec: &CFormatSpec, obj: PyObjectRef) -> Result<Wtf8Buf, PyError> {
+    if let CFormatType::Unsupported { ch, index } = spec.format_type {
+        return Err(unsupported_format_error(ch.to_u32(), index, false));
+    }
     check_min_field_width(spec)?;
     match &spec.format_type {
+        CFormatType::Unsupported { .. } => unreachable!("checked above"),
         CFormatType::String(conversion) => {
             let result = match conversion {
                 CFormatConversion::Str => crate::py_str_wtf8(obj)?,

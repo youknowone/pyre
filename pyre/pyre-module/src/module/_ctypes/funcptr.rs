@@ -22,12 +22,12 @@ use rustpython_host_env::ctypes as host_ctypes;
 use std::sync::OnceLock;
 
 /// `_flags_ & FUNCFLAG_USE_ERRNO` — swap the ctypes-local errno around the call.
-pub(super) const FUNCFLAG_USE_ERRNO: i64 = 0x8;
+pub(super) const FUNCFLAG_USE_ERRNO: i64 = host_ctypes::FUNCFLAG_USE_ERRNO as i64;
 
 /// `_flags_ & FUNCFLAG_USE_LASTERROR` — swap the ctypes-local last error
 /// around the call, so `ctypes.get_last_error()` reports what the callee set
 /// and no call made since can have overwritten it.
-pub(super) const FUNCFLAG_USE_LASTERROR: i64 = 0x10;
+pub(super) const FUNCFLAG_USE_LASTERROR: i64 = host_ctypes::FUNCFLAG_USE_LASTERROR as i64;
 
 /// The `restype` a CDLL function has when none is declared: `c_int`.
 const DEFAULT_RESTYPE_CODE: TypeCode = TypeCode::from_char('i');

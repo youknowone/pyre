@@ -113,7 +113,9 @@ fn semlock_ismine(obj: PyObjectRef) -> bool {
 /// that close stays with the Python object, so the view must not drop.
 #[cfg(all(unix, feature = "host_env"))]
 fn sem_view(handle: SemRaw) -> core::mem::ManuallyDrop<host_mp::SemHandle> {
-    core::mem::ManuallyDrop::new(host_mp::SemHandle::from_raw(handle))
+    // SAFETY: the Python object still owns the close; `from_raw` only
+    // rebuilds a view, and `ManuallyDrop` stops `SemHandle`'s Drop.
+    core::mem::ManuallyDrop::new(unsafe { host_mp::SemHandle::from_raw(handle) })
 }
 
 #[cfg(all(unix, feature = "host_env"))]

@@ -2,7 +2,6 @@
 //!
 //! Verbatim move of the inline block previously in importing.rs.
 
-
 /// fcntl module — PyPy: pypy/module/fcntl/interp_fcntl.py.
 ///
 /// fcntl(fd, cmd, arg=0) / ioctl(fd, request, arg=0) / flock(fd, op) /
@@ -45,7 +44,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     };
                     loop {
                         let outcome = {
-                            let _blocked = pyre_interpreter::module::thread::before_external_block();
+                            let _blocked =
+                                pyre_interpreter::module::thread::before_external_block();
                             rustpython_host_env::fcntl::fcntl_with_bytes(fd, cmd, &mut buf)
                         };
                         match outcome {
@@ -135,8 +135,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     } else {
                         true
                     };
-                    let immutable =
-                        unsafe { pyre_object::bytesobject::is_bytes(arg) || pyre_object::is_str(arg) };
+                    let immutable = unsafe {
+                        pyre_object::bytesobject::is_bytes(arg) || pyre_object::is_str(arg)
+                    };
                     if mutate
                         && !immutable
                         && let Ok((slice, _owner, _made_view)) =
@@ -181,7 +182,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 #[cfg(all(unix, feature = "host_env"))]
                 {
                     if args.len() < 2 {
-                        return Err(pyre_interpreter::PyError::type_error("flock() requires 2 arguments"));
+                        return Err(pyre_interpreter::PyError::type_error(
+                            "flock() requires 2 arguments",
+                        ));
                     }
                     if !unsafe { pyre_object::is_int(args[1]) } {
                         return Err(pyre_interpreter::PyError::type_error(
@@ -198,7 +201,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     // the pending handlers and resumes rather than surfacing.
                     loop {
                         let outcome = {
-                            let _blocked = pyre_interpreter::module::thread::before_external_block();
+                            let _blocked =
+                                pyre_interpreter::module::thread::before_external_block();
                             rustpython_host_env::fcntl::flock(fd, op)
                         };
                         match outcome {
@@ -273,7 +277,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                         // helper was an internal pyre detail.
                         Ok(_) => return Ok(pyre_object::w_none()),
                         Err(rustpython_host_env::fcntl::LockfError::InvalidCmd) => {
-                            return Err(pyre_interpreter::PyError::value_error("lockf: invalid cmd"));
+                            return Err(pyre_interpreter::PyError::value_error(
+                                "lockf: invalid cmd",
+                            ));
                         }
                         Err(rustpython_host_env::fcntl::LockfError::Overflow(s)) => {
                             return Err(pyre_interpreter::PyError::value_error(format!(
@@ -307,30 +313,34 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     // not exposed here.
     #[cfg(unix)]
     {
+        #[cfg(not(feature = "host_env"))]
+        use libc as host_fcntl;
+        #[cfg(feature = "host_env")]
+        use rustpython_host_env::fcntl as host_fcntl;
         macro_rules! cst {
             ($name:literal, $val:expr) => {
                 pyre_interpreter::module_ns_store(ns, $name, pyre_object::w_int_new($val as i64));
             };
         }
-        cst!("F_GETFD", libc::F_GETFD);
-        cst!("F_SETFD", libc::F_SETFD);
-        cst!("F_GETFL", libc::F_GETFL);
-        cst!("F_SETFL", libc::F_SETFL);
-        cst!("F_DUPFD", libc::F_DUPFD);
-        cst!("F_DUPFD_CLOEXEC", libc::F_DUPFD_CLOEXEC);
-        cst!("F_GETLK", libc::F_GETLK);
-        cst!("F_SETLK", libc::F_SETLK);
-        cst!("F_SETLKW", libc::F_SETLKW);
-        cst!("F_GETOWN", libc::F_GETOWN);
-        cst!("F_SETOWN", libc::F_SETOWN);
-        cst!("F_RDLCK", libc::F_RDLCK);
-        cst!("F_WRLCK", libc::F_WRLCK);
-        cst!("F_UNLCK", libc::F_UNLCK);
-        cst!("FD_CLOEXEC", libc::FD_CLOEXEC);
-        cst!("LOCK_SH", libc::LOCK_SH);
-        cst!("LOCK_EX", libc::LOCK_EX);
-        cst!("LOCK_UN", libc::LOCK_UN);
-        cst!("LOCK_NB", libc::LOCK_NB);
+        cst!("F_GETFD", host_fcntl::F_GETFD);
+        cst!("F_SETFD", host_fcntl::F_SETFD);
+        cst!("F_GETFL", host_fcntl::F_GETFL);
+        cst!("F_SETFL", host_fcntl::F_SETFL);
+        cst!("F_DUPFD", host_fcntl::F_DUPFD);
+        cst!("F_DUPFD_CLOEXEC", host_fcntl::F_DUPFD_CLOEXEC);
+        cst!("F_GETLK", host_fcntl::F_GETLK);
+        cst!("F_SETLK", host_fcntl::F_SETLK);
+        cst!("F_SETLKW", host_fcntl::F_SETLKW);
+        cst!("F_GETOWN", host_fcntl::F_GETOWN);
+        cst!("F_SETOWN", host_fcntl::F_SETOWN);
+        cst!("F_RDLCK", host_fcntl::F_RDLCK);
+        cst!("F_WRLCK", host_fcntl::F_WRLCK);
+        cst!("F_UNLCK", host_fcntl::F_UNLCK);
+        cst!("FD_CLOEXEC", host_fcntl::FD_CLOEXEC);
+        cst!("LOCK_SH", host_fcntl::LOCK_SH);
+        cst!("LOCK_EX", host_fcntl::LOCK_EX);
+        cst!("LOCK_UN", host_fcntl::LOCK_UN);
+        cst!("LOCK_NB", host_fcntl::LOCK_NB);
 
         // Linux-only fcntl constants.  Values for ones libc does not
         // expose (F_GETSIG/F_SETSIG/F_GETLK64/F_SETLK64/F_SETLKW64/
@@ -339,9 +349,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         // overrides at `interp_fcntl.py:48-52`.
         #[cfg(target_os = "linux")]
         {
-            cst!("F_SETLEASE", libc::F_SETLEASE);
-            cst!("F_GETLEASE", libc::F_GETLEASE);
-            cst!("F_NOTIFY", libc::F_NOTIFY);
+            cst!("F_SETLEASE", host_fcntl::F_SETLEASE);
+            cst!("F_GETLEASE", host_fcntl::F_GETLEASE);
+            cst!("F_NOTIFY", host_fcntl::F_NOTIFY);
             cst!("F_GETSIG", 11);
             cst!("F_SETSIG", 10);
             cst!("F_GETLK64", 12);
@@ -360,32 +370,43 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
             cst!("DN_RENAME", 16);
             cst!("DN_ATTRIB", 32);
             cst!("DN_MULTISHOT", 0x80000000u32);
-            cst!("F_ADD_SEALS", libc::F_ADD_SEALS);
-            cst!("F_GET_SEALS", libc::F_GET_SEALS);
-            cst!("F_SEAL_SEAL", libc::F_SEAL_SEAL);
-            cst!("F_SEAL_SHRINK", libc::F_SEAL_SHRINK);
-            cst!("F_SEAL_GROW", libc::F_SEAL_GROW);
-            cst!("F_SEAL_WRITE", libc::F_SEAL_WRITE);
-            cst!("F_SETPIPE_SZ", libc::F_SETPIPE_SZ);
-            cst!("F_GETPIPE_SZ", libc::F_GETPIPE_SZ);
+            cst!("F_ADD_SEALS", host_fcntl::F_ADD_SEALS);
+            cst!("F_GET_SEALS", host_fcntl::F_GET_SEALS);
+            cst!("F_SEAL_SEAL", host_fcntl::F_SEAL_SEAL);
+            cst!("F_SEAL_SHRINK", host_fcntl::F_SEAL_SHRINK);
+            cst!("F_SEAL_GROW", host_fcntl::F_SEAL_GROW);
+            cst!("F_SEAL_WRITE", host_fcntl::F_SEAL_WRITE);
+            cst!("F_SETPIPE_SZ", host_fcntl::F_SETPIPE_SZ);
+            cst!("F_GETPIPE_SZ", host_fcntl::F_GETPIPE_SZ);
         }
         // The darwin half of the same list.  `F_SETLEASE`/`F_GETLEASE` carry
         // different numbers here than under linux, so they are spelled per
         // platform rather than shared.
         #[cfg(target_vendor = "apple")]
         {
-            cst!("FASYNC", 64);
-            cst!("F_FULLFSYNC", libc::F_FULLFSYNC);
-            cst!("F_GETLEASE", 107);
-            cst!("F_SETLEASE", 106);
-            cst!("F_GETNOSIGPIPE", 74);
-            cst!("F_SETNOSIGPIPE", 73);
-            cst!("F_GETPATH", libc::F_GETPATH);
-            cst!("F_NOCACHE", libc::F_NOCACHE);
-            cst!("F_RDAHEAD", libc::F_RDAHEAD);
-            cst!("F_OFD_GETLK", libc::F_OFD_GETLK);
-            cst!("F_OFD_SETLK", libc::F_OFD_SETLK);
-            cst!("F_OFD_SETLKW", libc::F_OFD_SETLKW);
+            #[cfg(feature = "host_env")]
+            {
+                cst!("FASYNC", host_fcntl::FASYNC);
+                cst!("F_GETLEASE", host_fcntl::F_GETLEASE);
+                cst!("F_SETLEASE", host_fcntl::F_SETLEASE);
+                cst!("F_GETNOSIGPIPE", host_fcntl::F_GETNOSIGPIPE);
+                cst!("F_SETNOSIGPIPE", host_fcntl::F_SETNOSIGPIPE);
+            }
+            #[cfg(not(feature = "host_env"))]
+            {
+                cst!("FASYNC", 64);
+                cst!("F_GETLEASE", 107);
+                cst!("F_SETLEASE", 106);
+                cst!("F_GETNOSIGPIPE", 74);
+                cst!("F_SETNOSIGPIPE", 73);
+            }
+            cst!("F_FULLFSYNC", host_fcntl::F_FULLFSYNC);
+            cst!("F_GETPATH", host_fcntl::F_GETPATH);
+            cst!("F_NOCACHE", host_fcntl::F_NOCACHE);
+            cst!("F_RDAHEAD", host_fcntl::F_RDAHEAD);
+            cst!("F_OFD_GETLK", host_fcntl::F_OFD_GETLK);
+            cst!("F_OFD_SETLK", host_fcntl::F_OFD_SETLK);
+            cst!("F_OFD_SETLKW", host_fcntl::F_OFD_SETLKW);
         }
     }
     Ok(())
@@ -427,19 +448,24 @@ fn arg_readbuf(
 /// Run `ioctl` with `arg` as its third argument, reporting the errno on
 /// failure.
 #[cfg(all(unix, feature = "host_env"))]
-fn ioctl_ptr(fd: i32, request: libc::c_ulong, ptr: *mut u8) -> Result<i32, pyre_interpreter::PyError> {
+fn ioctl_ptr(
+    fd: i32,
+    request: libc::c_ulong,
+    ptr: *mut u8,
+) -> Result<i32, pyre_interpreter::PyError> {
     // The errno is read inside the released region, as
     // `llexternal(..., save_err=rffi.RFFI_SAVE_ERRNO)` does: retaking the GIL
     // goes through `mutex2_lock_timeout`, whose timed wait is a syscall of its
     // own and overwrites what this call left behind.
     let result = {
         let _blocked = pyre_interpreter::module::thread::before_external_block();
-        unsafe {
-            rustpython_host_env::fcntl::ioctl_ptr(fd, request, ptr as *mut libc::c_void)
-        }
+        unsafe { rustpython_host_env::fcntl::ioctl_ptr(fd, request, ptr as *mut libc::c_void) }
     };
     result.map_err(|e| {
-        pyre_interpreter::PyError::os_error_with_errno(e.raw_os_error().unwrap_or(0), format!("ioctl: {e}"))
+        pyre_interpreter::PyError::os_error_with_errno(
+            e.raw_os_error().unwrap_or(0),
+            format!("ioctl: {e}"),
+        )
     })
 }
 
@@ -494,7 +520,9 @@ fn ioctl_readonly(
     arg: &[u8],
 ) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
     let Some(mut buf) = stage_arg(arg) else {
-        return Err(pyre_interpreter::PyError::value_error("ioctl argument 3 is too long"));
+        return Err(pyre_interpreter::PyError::value_error(
+            "ioctl argument 3 is too long",
+        ));
     };
     ioctl_ptr(fd, request, buf.as_mut_ptr())?;
     guard_intact(&buf, arg.len())?;
