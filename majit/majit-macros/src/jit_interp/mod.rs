@@ -647,6 +647,11 @@ pub(crate) enum CallPolicyKind {
     /// nursery bump. Result is a
     /// real escaping Ref — no virtualization.
     NurseryAllocRef,
+    /// Fresh allocation that is not a fixed-size nursery bump. Empty write
+    /// sets (`can_raise_effect_info`, `analyze_external_call` `bottom_result`)
+    /// so the call does not flush cached fields, and the compiled code still
+    /// enters the function.
+    AllocRef,
     ResidualRefWrapped,
     /// `EF_CANNOT_RAISE` for ref-returning residual helpers.
     /// Mirrors `ResidualIntCannotRaiseWrapped`; the unwrapped variant
@@ -730,6 +735,7 @@ pub(crate) fn parse_call_policy_kind(kind: &Ident) -> Option<CallPolicyKind> {
         "elidable_int_or_memerror_wrapped" => CallPolicyKind::ElidableIntOrMemerrorWrapped,
         "residual_ref" => CallPolicyKind::ResidualRef,
         "nursery_alloc_ref" => CallPolicyKind::NurseryAllocRef,
+        "alloc_ref" => CallPolicyKind::AllocRef,
         "residual_ref_wrapped" => CallPolicyKind::ResidualRefWrapped,
         "residual_ref_cannot_raise_wrapped" => CallPolicyKind::ResidualRefCannotRaiseWrapped,
         "may_force_ref_wrapped" => CallPolicyKind::MayForceRefWrapped,

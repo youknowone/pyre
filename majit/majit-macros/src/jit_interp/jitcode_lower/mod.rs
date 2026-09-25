@@ -570,6 +570,7 @@ pub(super) fn call_policy_effect_slot(
         | K::ResidualIntWrapped
         | K::ResidualRef
         | K::NurseryAllocRef
+        | K::AllocRef
         | K::ResidualRefWrapped
         | K::ResidualFloatWrapped => Some(CondCallEffectSlot::CanRaise),
 
@@ -689,6 +690,7 @@ pub(super) fn call_policy_result_kind(
 
         K::ResidualRef
         | K::NurseryAllocRef
+        | K::AllocRef
         | K::ResidualRefWrapped
         | K::ResidualRefCannotRaiseWrapped
         | K::MayForceRefWrapped
