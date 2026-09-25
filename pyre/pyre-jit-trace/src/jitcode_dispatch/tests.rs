@@ -9646,6 +9646,65 @@ fn unsupported_opname_surfaces_typed_error() {
 }
 
 #[test]
+fn new_array_id_records_new_array() {
+    let opname = "new_array/id>r";
+    let byte = *insns_opname_to_byte()
+        .get(opname)
+        .unwrap_or_else(|| panic!("`{opname}` must be in insns table"));
+    // `id>r`: 1B length reg, 2B descr, 1B dest ref reg.
+    let code = [byte, 0, 0, 0, 0];
+    let mut tc = fresh_trace_ctx();
+    let length = tc.const_int(4);
+    let descr = done_descr_ref_for_tests();
+    let descr_pool = vec![descr];
+    let dummy = tc.record_op(majit_ir::OpCode::IntAdd, &[]);
+    let mut regs_r = [dummy];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: vec![ConcreteValue::Null],
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        inline_poison_pcs: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new([length]),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    step(&code, 0, &mut wc).expect("new_array/id>r records");
+    let recorded = tc
+        .ops()
+        .iter()
+        .any(|op| op.opcode == majit_ir::OpCode::NewArray);
+    assert!(recorded, "new_array/id>r must record NEW_ARRAY");
+}
+
+#[test]
 fn canonical_cond_record_keys_have_walker_arms() {
     // Assembler emit now publishes these four keys. The production
     // walker must decode them; UnsupportedOpname here would abort a

@@ -18545,9 +18545,9 @@ mod tests {
                     if id == &expected
             )));
             assert!(!fixed_list_clears("i64"));
-            // `local[i]` of the fixed-list value is the length-prefixed
-            // reader. `local.field[i]` and `(*p)[i]` keep the headerless
-            // `[i64; 4]` spelling, so item 0 stays at the pointer.
+            // `local[i]` of the fixed-list value, and a borrow of that
+            // value (`g(&a)` / `(*p)[i]`), use the length-prefixed reader.
+            // `local.field[i]` and a host `&[u8; N]` stay headerless.
             let (local_id, local_nolength) =
                 crate::front::mir::fixed_array_index_identity(true, "[i64; 4]");
             assert_eq!(local_id.as_deref(), Some("[i64]"));
@@ -18558,8 +18558,20 @@ mod tests {
             assert!(field_nolength);
             let (param_id, param_nolength) =
                 crate::front::mir::fixed_array_index_identity(false, "&[i64; 4]");
-            assert_eq!(param_id.as_deref(), Some("[i64; 4]"));
-            assert!(param_nolength);
+            assert_eq!(param_id.as_deref(), Some("[i64]"));
+            assert!(!param_nolength);
+            let (host_id, host_nolength) =
+                crate::front::mir::fixed_array_index_identity(false, "&[u8; 16]");
+            assert_eq!(host_id.as_deref(), Some("[u8; 16]"));
+            assert!(host_nolength);
+            let (ptr_id, ptr_nolength) =
+                crate::front::mir::fixed_array_index_identity(false, "*const [f64; 2]");
+            assert_eq!(ptr_id.as_deref(), Some("[f64]"));
+            assert!(!ptr_nolength);
+            assert_eq!(
+                crate::front::mir::fixed_array_index_identity(false, "&??"),
+                (None, false)
+            );
             // A slice reader is unchanged either way.
             let (slice_id, slice_nolength) =
                 crate::front::mir::fixed_array_index_identity(false, "&[i64]");

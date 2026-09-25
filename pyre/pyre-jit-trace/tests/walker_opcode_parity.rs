@@ -258,10 +258,9 @@ const PYRE_ONLY: &[&str] = &[
     "getarrayitem_gc_f/rid>f",
     "getarrayitem_gc_f_pure/rid>f",
     "getarrayitem_gc_r_pure/rid>r",
-    // Constant-index array shapes; majit's tracer decodes only the
-    // register-index ones.
+    // Constant-length form. The register-length `new_array_clear/id>r`
+    // is decoded by both tracers.
     "new_array_clear/cd>r",
-    "new_array_clear/id>r",
     "setarrayitem_gc_i/ricd",
     "setarrayitem_gc_r/rcrd",
     // The push/pop bank transfers.
@@ -308,7 +307,6 @@ const NEITHER: &[&str] = &[
     "getlistitem_gc_f/ridd>f",
     "getlistitem_gc_i/ridd>i",
     "getlistitem_gc_r/ridd>r",
-    "new_array/id>r",
     "newlist/idddd>r",
     "newlist_hint/idddd>r",
     "record_quasiimmut_field/rdd",
