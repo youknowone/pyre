@@ -1480,6 +1480,20 @@ impl VirtualizableInfo {
         }
     }
 
+    /// The type of each position [`Self::read_boxes`] fills, in the same
+    /// order: every static field's type, then each array's item type once per
+    /// item.  `virtualizable.py read_boxes` builds a typed box for each value
+    /// (`wrap(cpu, x, startindex)` over `unroll_static_fields` and
+    /// `unroll_array_fields`); pyre's list holds the raw words, so a caller
+    /// that needs the typed box zips this with it.
+    pub fn box_types<'a>(&'a self, array_lengths: &'a [usize]) -> impl Iterator<Item = Type> + 'a {
+        let statics = self.static_fields.iter().map(|field| field.field_type);
+        let arrays = self.array_fields.iter().enumerate().flat_map(move |(index, array)| {
+            std::iter::repeat_n(array.item_type, array_lengths.get(index).copied().unwrap_or(0))
+        });
+        statics.chain(arrays)
+    }
+
     /// [`Self::read_boxes`] regrouped per array field, which is the shape
     /// `JitState::import_virtualizable_boxes` and the walker's vable shadow
     /// take. It reads through `read_boxes`, so one function reads the object.
@@ -2431,6 +2445,23 @@ mod tests {
             unsafe { info.read_boxes(obj.as_ptr(), &lengths) },
             vec![42, 100, 200, 300]
         );
+    }
+
+    /// `box_types` names each position of `read_boxes` in the same order:
+    /// the statics by their field type, then every array item by its item
+    /// type, so a mixed layout lines the two up position by position.
+    #[test]
+    fn box_types_follows_read_boxes_order() {
+        let mut info = VirtualizableInfo::new(0);
+        info.add_field("f", Type::Float, 8);
+        info.add_field("r", Type::Ref, 16);
+        test_add_array_field(&mut info, "stack", Type::Int, 24, 0, 8);
+        test_add_array_field(&mut info, "refs", Type::Ref, 32, 0, 8);
+        assert_eq!(
+            info.box_types(&[2, 1]).collect::<Vec<_>>(),
+            vec![Type::Float, Type::Ref, Type::Int, Type::Int, Type::Ref]
+        );
+        assert_eq!(info.box_types(&[]).collect::<Vec<_>>(), vec![Type::Float, Type::Ref]);
     }
 
     #[test]

@@ -5346,19 +5346,12 @@ impl<M: Clone> MetaInterp<M> {
         // `vinfo.read_boxes(cpu, virtualizable, startindex)` — always
         // the heap object unwrap produced, never an expanded live_values tail.
         let vable_values: Vec<Value> = if !virtualizable_ptr.is_null() {
-            let (static_boxes, array_boxes) =
-                unsafe { info.read_all_boxes(virtualizable_ptr as *const u8, &array_lengths) };
-            let mut out = Vec::with_capacity(total_vable);
-            for (i, bits) in static_boxes.iter().enumerate() {
-                out.push(heap_value_for(info.static_fields[i].field_type, *bits));
-            }
-            for (a, items) in array_boxes.iter().enumerate() {
-                let item_ty = info.array_fields[a].item_type;
-                for bits in items {
-                    out.push(heap_value_for(item_ty, *bits));
-                }
-            }
-            out
+            let boxes = unsafe { info.read_boxes(virtualizable_ptr as *const u8, &array_lengths) };
+            boxes
+                .into_iter()
+                .zip(info.box_types(&array_lengths))
+                .map(|(bits, ty)| heap_value_for(ty, bits))
+                .collect()
         } else if has_expanded_tail {
             live_values[num_reds..num_reds + total_vable].to_vec()
         } else {
