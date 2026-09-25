@@ -10351,6 +10351,14 @@ impl<'a> Lowering<'a> {
                 if drop_place_is_frame_anchor(&place, self.body, self.llbc) {
                     return self.lower_frame_anchor_drop(mir_bb, place, target as usize);
                 }
+                if drop_place_is_list_guard(&place, self.llbc) {
+                    return self.lower_one_word_guard_release(
+                        mir_bb,
+                        place,
+                        target as usize,
+                        LIST_LOCK_RELEASE_PATH,
+                    );
+                }
                 if drop_lowers_as_glue_call(&place, &fn_ptr, self.llbc) {
                     self.emit_root_scope_close(mir_bb, &place);
                 }
@@ -10379,9 +10387,26 @@ impl<'a> Lowering<'a> {
         place: Place,
         target: usize,
     ) -> Result<(), LowerError> {
+        self.lower_one_word_guard_release(
+            mir_bb,
+            place,
+            target,
+            ["pyre_interpreter", "eval", "frame_anchor_release"],
+        )
+    }
+
+    /// Drop a one-word guard local by passing its word to the bound release
+    /// residual `release`, then continue to `target`.
+    fn lower_one_word_guard_release(
+        &mut self,
+        mir_bb: usize,
+        place: Place,
+        target: usize,
+        release: [&str; 3],
+    ) -> Result<(), LowerError> {
         let PlaceKind::Local(local) = place.kind else {
             return Err(LowerError::Unsupported(format!(
-                "bb{mir_bb}: FrameAnchor Drop over a projection place"
+                "bb{mir_bb}: guard Drop over a projection place ({release:?})"
             )));
         };
         let bb_id = self.block_id[mir_bb];
@@ -10389,11 +10414,7 @@ impl<'a> Lowering<'a> {
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: None,
                 kind: OpKind::Call {
-                    target: CallTarget::function_path([
-                        "pyre_interpreter",
-                        "eval",
-                        "frame_anchor_release",
-                    ]),
+                    target: CallTarget::function_path(release),
                     args: crate::model::call_args(vec![arg]),
                     result_ty: ValueType::Void,
                 },
@@ -25195,6 +25216,41 @@ fn drop_place_is_frame_anchor(place: &Place, body: &Unstructured, llbc: &Llbc) -
         || tyref_is_frame_anchor(&decl.ty, llbc)
 }
 
+/// The release residual a `ListGuard` drop lowers to (`rthread.py`
+/// `Lock.release`).
+const LIST_LOCK_RELEASE_PATH: [&str; 3] = ["pyre_object", "listobject", "w_list_lock_release"];
+
+/// A drop of the list lock's one-word `ListGuard` (`listobject::ListGuard`).
+/// Its `Drop` releases the lock word; without this arm the drop fell through
+/// to a plain goto and the jitcode never released an acquisition.
+fn drop_place_is_list_guard(place: &Place, llbc: &Llbc) -> bool {
+    if !matches!(place.kind, PlaceKind::Local(_)) {
+        return false;
+    }
+    let Some(node) = tyref_node(&place.ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
+        return false;
+    };
+    adt_id_flexible(node)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|td| {
+            let path = td.item_meta.name_path();
+            let segments: Vec<&str> = path.split("::").collect();
+            segments.last() == Some(&"ListGuard") && segments.contains(&"listobject")
+        })
+}
+
+/// Match the bound `w_list_lock_release` residual a `ListGuard` drop emits.
+pub(crate) fn is_list_lock_release_call(kind: &OpKind) -> bool {
+    let OpKind::Call {
+        target: CallTarget::FunctionPath { segments, .. },
+        ..
+    } = kind
+    else {
+        return false;
+    };
+    segments.last().map(String::as_str) == Some(LIST_LOCK_RELEASE_PATH[2])
+}
+
 /// Drops supported by both lowering and its liveness analysis.
 fn drop_lowers_as_glue_call(place: &Place, fn_ptr: &RegularCall, llbc: &Llbc) -> bool {
     if !matches!(place.kind, PlaceKind::Local(_)) {
@@ -25242,10 +25298,12 @@ pub(crate) fn is_frame_anchor_release_call(kind: &OpKind) -> bool {
     segments.last().map(String::as_str) == Some("frame_anchor_release")
 }
 
-/// Shadow-stack closes that an exceptional Result rewrite must replay
-/// on the raise edge.
+/// Guard releases that an exceptional Result rewrite must replay on the
+/// raise edge: shadow-stack closes and the list lock release.
 pub(crate) fn is_shadow_stack_bracket_close(kind: &OpKind) -> bool {
-    is_root_scope_drop_glue_call(kind) || is_frame_anchor_release_call(kind)
+    is_root_scope_drop_glue_call(kind)
+        || is_frame_anchor_release_call(kind)
+        || is_list_lock_release_call(kind)
 }
 
 fn glue_call_drop_blocks(body: &Unstructured, llbc: &Llbc) -> bit_set::BitSet {
@@ -25253,6 +25311,7 @@ fn glue_call_drop_blocks(body: &Unstructured, llbc: &Llbc) -> bit_set::BitSet {
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if let Ok(TermKind::Drop { place, fn_ptr, .. }) = bb.term()
             && (drop_place_is_frame_anchor(&place, body, llbc)
+                || drop_place_is_list_guard(&place, llbc)
                 || drop_lowers_as_glue_call(&place, &fn_ptr, llbc))
         {
             out.insert(bb_idx);
