@@ -2794,6 +2794,26 @@ pub(crate) fn resolve_kwargs(
         return Err(crate::PyError::type_error(msg));
     }
 
+    // `argument.py` `_match_signature` fills `scope_w` while that list is
+    // rooted.  `w_tuple_getitem` re-boxes a specialised default and the
+    // kwonly fill allocates `w_str_new_managed` per empty slot.  `result`
+    // and the original `args` are plain copies: publish every live word
+    // before the first of those allocations, then read the slots back.
+    // A signature with no star still takes this bracket — the kwonly key
+    // allocation is the collection, and the tail pack below is not.
+    let roots = pyre_object::gc_roots::push_roots();
+    let func_slot = roots.publish(&[target_func, kwarg_names]);
+    let args_base = roots.publish(args);
+    let result_slot = roots.publish(&result);
+    let mut extra_flat = Vec::with_capacity(extra_kwargs.len() * 2);
+    for &(key, value) in &extra_kwargs {
+        extra_flat.push(key);
+        extra_flat.push(value);
+    }
+    let extra_slot = roots.publish(&extra_flat);
+    roots.normalize(func_slot, 2 + args.len() + result.len() + extra_flat.len());
+    let live = |index| roots.get(result_slot + index);
+
     // Fill positional defaults (PyPy: _match_signature defs_w)
     // Defaults cover the LAST N of the positional params (arg_count), which
     // `argument.py:278` spells as a *signed* `def_first = co_argcount -
@@ -2801,18 +2821,23 @@ pub(crate) fn resolve_kwargs(
     // drives it negative, and `defnum = i - def_first` (`argument.py:309`) then
     // names the tuple's tail.  Clamping `def_first` at zero instead would bind
     // the head, silently passing the wrong value.
-    let defaults = unsafe { crate::function_get_defaults(target_func) };
-    if !defaults.is_null() && unsafe { pyre_object::is_tuple(defaults) } {
-        let ndefaults = unsafe { pyre_object::w_tuple_len(defaults) };
+    let defaults = unsafe { crate::function_get_defaults(roots.get(func_slot)) };
+    let defaults_slot = roots.pin_roots(&[defaults]);
+    if !roots.get(defaults_slot).is_null()
+        && unsafe { pyre_object::is_tuple(roots.get(defaults_slot)) }
+    {
+        let ndefaults = unsafe { pyre_object::w_tuple_len(roots.get(defaults_slot)) };
         let def_first = n_pos_params as isize - ndefaults as isize;
         for pi in 0..n_pos_params {
-            if result[pi].is_null() {
+            if live(pi).is_null() {
                 let di = pi as isize - def_first;
                 if di < 0 {
                     continue;
                 }
-                if let Some(v) = unsafe { pyre_object::w_tuple_getitem(defaults, di as i64) } {
-                    result[pi] = v;
+                if let Some(v) =
+                    unsafe { pyre_object::w_tuple_getitem(roots.get(defaults_slot), di as i64) }
+                {
+                    roots.set(result_slot + pi, v);
                 }
             }
         }
@@ -2820,23 +2845,26 @@ pub(crate) fn resolve_kwargs(
 
     // Fill keyword-only defaults from kwdefaults dict
     // PyPy: _match_signature fills from w_kw_defs
-    let kwdefaults = unsafe { crate::function_get_kwdefaults(target_func) };
-    if !kwdefaults.is_null() && unsafe { pyre_object::is_dict(kwdefaults) } {
+    let kwdefaults = unsafe { crate::function_get_kwdefaults(roots.get(func_slot)) };
+    let kwdefaults_slot = roots.pin_roots(&[kwdefaults]);
+    if !roots.get(kwdefaults_slot).is_null()
+        && unsafe { pyre_object::is_dict(roots.get(kwdefaults_slot)) }
+    {
         let nkwonly = code.kwonlyarg_count as usize;
         for ki in 0..nkwonly {
             let pi = n_pos_params + ki; // position in result
-            if result[pi].is_null() {
+            if live(pi).is_null() {
                 let param_name = &code.varnames[skip_cls + pi];
                 let _key_roots = pyre_object::gc_roots::push_roots();
                 let key_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(param_name));
                 if let Some(val) = unsafe {
                     pyre_object::w_dict_lookup(
-                        kwdefaults,
+                        roots.get(kwdefaults_slot),
                         pyre_object::gc_roots::shadow_stack_get(key_slot),
                     )
                 } {
-                    result[pi] = val;
+                    roots.set(result_slot + pi, val);
                 }
             }
         }
@@ -2846,7 +2874,7 @@ pub(crate) fn resolve_kwargs(
     // defaults application.  Errors here mirror ArgErrMissing.
     let mut missing_positional: Vec<&str> = Vec::new();
     for pi in 0..n_pos_params {
-        if result[pi].is_null() {
+        if live(pi).is_null() {
             missing_positional.push(code.varnames[skip_cls + pi].as_str());
         }
     }
@@ -2861,7 +2889,7 @@ pub(crate) fn resolve_kwargs(
     let mut missing_kwonly: Vec<&str> = Vec::new();
     for ki in 0..nkwonly {
         let pi = n_pos_params + ki;
-        if result[pi].is_null() {
+        if live(pi).is_null() {
             missing_kwonly.push(code.varnames[skip_cls + pi].as_str());
         }
     }
@@ -2875,35 +2903,22 @@ pub(crate) fn resolve_kwargs(
 
     // Pack *args and **kwargs into scope — PyPy _match_signature lines 207-259.
     // This produces the final scope_w that maps directly to frame locals.
-    // `gct_fv_gc_malloc` bracket (`framework.py`).  Every reference
-    // live across the packing is a raw copy: the parameters already bound into
-    // `result`, the unmatched keyword pairs, and the two tail objects.  Each
-    // allocation below — the tail objects, `w_dict_store`'s strategy promotion
-    // — leaves RUNNING before taking `gc_mutex` (`gc_sync.rs`), so a
-    // collector on another thread relocates whatever the shadow stack does not
-    // name.  Pin them all, then read every one back out.
-    //
-    // A signature with no star parameter allocates nothing here, so it skips
-    // the bracket entirely: `pin_root` is `dont_look_inside`, and a pin per
-    // bound parameter on every keyword call is a residual the tracer has to
-    // carry through the compiled loop.
+    // `gct_fv_gc_malloc` bracket (`framework.py`).  The parameters and the
+    // unmatched keyword pairs are already in `roots` from the defaults fill.
+    // Each allocation below — the tail objects, `w_dict_store`'s strategy
+    // promotion — leaves RUNNING before taking `gc_mutex` (`gc_sync.rs`), so
+    // a collector on another thread relocates whatever the shadow stack does
+    // not name.
+    let mut result: Vec<PyObjectRef> = (0..result.len()).map(live).collect();
     if !has_varargs && !has_varkw {
         return Ok(result);
     }
-    let roots = pyre_object::gc_roots::push_roots();
-    let result_slot = roots.base();
-    for &value in &result {
-        let _ = roots.pin_root(value);
-    }
-    let extra_slot = result_slot + result.len();
-    for &(key, value) in &extra_kwargs {
-        let _ = roots.pin_root(key);
-        let _ = roots.pin_root(value);
-    }
-    let varargs_slot = extra_slot + extra_kwargs.len() * 2;
+    let varargs_slot = pyre_object::gc_roots::shadow_stack_len();
     if has_varargs {
         let extra_pos: Vec<PyObjectRef> = if n_pos > n_pos_params {
-            args[n_pos_params..n_pos].to_vec()
+            (n_pos_params..n_pos)
+                .map(|i| roots.get(args_base + i))
+                .collect()
         } else {
             vec![]
         };
@@ -3788,25 +3803,48 @@ fn call_with_kwargs_in_ctx_impl(
                 return Err(binding_error(crate::PyError::type_error(msg)));
             }
 
+            // `w_tuple_getitem` re-boxes a specialised default and the kwonly
+            // fill allocates `w_str_new_managed` per empty slot. Publish
+            // `result` before either allocation; a later pin of the Vec would
+            // name the pre-collection addresses, and nursery poison does not
+            // heal those.
+            let _bound_roots = pyre_object::gc_roots::push_roots();
+            let bound_root_base = pyre_object::gc_roots::publish_roots(&result);
+            pyre_object::gc_roots::normalize_roots(bound_root_base, result.len());
+            let set_bound = |index: usize, value: PyObjectRef| {
+                pyre_object::gc_roots::shadow_stack_set(bound_root_base + index, value);
+            };
+
             // Fill positional defaults from __defaults__ tuple, on the signed
             // `def_first = co_argcount - len(defaults_w)` of `argument.py:278`
             // so that a `__defaults__` longer than the positional parameters
             // binds the tuple's tail (`defnum = i - def_first`,
             // `argument.py:309`) rather than its head.
             let defaults = unsafe { crate::function_get_defaults(current_callable()) };
-            if !defaults.is_null() && unsafe { pyre_object::is_tuple(defaults) } {
-                let ndefaults = unsafe { pyre_object::w_tuple_len(defaults) };
+            let defaults_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(defaults);
+            if !pyre_object::gc_roots::shadow_stack_get(defaults_slot).is_null()
+                && unsafe {
+                    pyre_object::is_tuple(pyre_object::gc_roots::shadow_stack_get(defaults_slot))
+                }
+            {
+                let ndefaults = unsafe {
+                    pyre_object::w_tuple_len(pyre_object::gc_roots::shadow_stack_get(defaults_slot))
+                };
                 let def_first = n_pos_params as isize - ndefaults as isize;
                 for pi in 0..n_pos_params {
-                    if result[pi].is_null() {
+                    if pyre_object::gc_roots::shadow_stack_get(bound_root_base + pi).is_null() {
                         let di = pi as isize - def_first;
                         if di < 0 {
                             continue;
                         }
-                        if let Some(v) =
-                            unsafe { pyre_object::w_tuple_getitem(defaults, di as i64) }
-                        {
-                            result[pi] = v;
+                        if let Some(v) = unsafe {
+                            pyre_object::w_tuple_getitem(
+                                pyre_object::gc_roots::shadow_stack_get(defaults_slot),
+                                di as i64,
+                            )
+                        } {
+                            set_bound(pi, v);
                         }
                     }
                 }
@@ -3817,10 +3855,21 @@ fn call_with_kwargs_in_ctx_impl(
             let nkwonly = code.kwonlyarg_count as usize;
             if nkwonly > 0 {
                 let kwdefaults = unsafe { crate::function_get_kwdefaults(current_callable()) };
-                if !kwdefaults.is_null() && unsafe { pyre_object::is_dict(kwdefaults) } {
+                let kwdefaults_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(kwdefaults);
+                if !pyre_object::gc_roots::shadow_stack_get(kwdefaults_slot).is_null()
+                    && unsafe {
+                        pyre_object::is_dict(pyre_object::gc_roots::shadow_stack_get(
+                            kwdefaults_slot,
+                        ))
+                    }
+                {
                     for ki in 0..nkwonly {
                         let slot = n_pos_params + ki;
-                        if slot < result.len() && result[slot].is_null() {
+                        if slot < result.len()
+                            && pyre_object::gc_roots::shadow_stack_get(bound_root_base + slot)
+                                .is_null()
+                        {
                             let param_name = &code.varnames[slot];
                             let _key_roots = pyre_object::gc_roots::push_roots();
                             let key_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -3829,11 +3878,11 @@ fn call_with_kwargs_in_ctx_impl(
                             );
                             if let Some(v) = unsafe {
                                 pyre_object::w_dict_lookup(
-                                    kwdefaults,
+                                    pyre_object::gc_roots::shadow_stack_get(kwdefaults_slot),
                                     pyre_object::gc_roots::shadow_stack_get(key_slot),
                                 )
                             } {
-                                result[slot] = v;
+                                set_bound(slot, v);
                             }
                         }
                     }
@@ -3843,7 +3892,7 @@ fn call_with_kwargs_in_ctx_impl(
             // `argument.py:302-338` — missing-required after defaults fill.
             let mut missing_positional: Vec<&str> = Vec::new();
             for pi in 0..n_pos_params {
-                if result[pi].is_null() {
+                if pyre_object::gc_roots::shadow_stack_get(bound_root_base + pi).is_null() {
                     missing_positional.push(code.varnames[pi].as_str());
                 }
             }
@@ -3855,7 +3904,7 @@ fn call_with_kwargs_in_ctx_impl(
             let mut missing_kwonly: Vec<&str> = Vec::new();
             for ki in 0..nkwonly {
                 let slot = n_pos_params + ki;
-                if result[slot].is_null() {
+                if pyre_object::gc_roots::shadow_stack_get(bound_root_base + slot).is_null() {
                     missing_kwonly.push(code.varnames[slot].as_str());
                 }
             }
@@ -3865,14 +3914,8 @@ fn call_with_kwargs_in_ctx_impl(
                 )));
             }
 
-            // Keep the matched parameter array live while packing *args and
-            // **kwargs: both allocations can relocate values already copied
-            // into `result`.
-            let _bound_roots = pyre_object::gc_roots::push_roots();
-            let bound_root_base = pyre_object::gc_roots::shadow_stack_len();
-            for &value in &result {
-                let _ = pyre_object::gc_roots::pin_root(value);
-            }
+            // `result` was published before the defaults fill. The tail
+            // objects below are the allocations still ahead of the frame.
             let mut packed_tail_slots = Vec::new();
             if has_varargs {
                 let extra_pos: Vec<PyObjectRef> = if pos_args.len() > n_pos_params {
@@ -5092,27 +5135,274 @@ fn pack_varargs(code: &crate::CodeObject, args: Vec<PyObjectRef>) -> Vec<PyObjec
         return args;
     }
 
-    let mut packed = Vec::with_capacity(nparams + 2);
-    // Regular positional args
-    for i in 0..nparams.min(args.len()) {
-        packed.push(args[i]);
+    // `argument.py` `_match_signature` stores the `*vararg` tuple into the
+    // rooted scope before `space.newdict` for `**kwargs`. This `Vec` is not
+    // a root area: a collection during `w_tuple_new` relocates positionals
+    // already copied into it, and `w_dict_new` relocates that tuple. Pin the
+    // inputs and re-read after each allocation — the keyword-call arm does
+    // the same around `packed_tail_slots`.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let args_base = _roots.pin_roots(&args);
+    let star_slot = if has_varargs {
+        let extra: Vec<PyObjectRef> = if args.len() > nparams {
+            (nparams..args.len())
+                .map(|i| _roots.get(args_base + i))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let w_star = pyre_object::w_tuple_new(extra);
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = _roots.pin_root(w_star);
+        Some(slot)
+    } else {
+        None
+    };
+    let kw_slot = if has_varkw {
+        let w_kw = pyre_object::w_dict_new();
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = _roots.pin_root(w_kw);
+        Some(slot)
+    } else {
+        None
+    };
+
+    let mut packed =
+        Vec::with_capacity(nparams + usize::from(has_varargs) + usize::from(has_varkw));
+    let n_keep = nparams.min(args.len());
+    for i in 0..n_keep {
+        packed.push(_roots.get(args_base + i));
     }
-    // Fill missing params with PY_NULL
     while packed.len() < nparams {
         packed.push(pyre_object::PY_NULL);
     }
-    if has_varargs {
-        let extra: Vec<_> = if args.len() > nparams {
-            args[nparams..].to_vec()
-        } else {
-            vec![]
-        };
-        packed.push(pyre_object::w_tuple_new(extra));
+    if let Some(slot) = star_slot {
+        packed.push(_roots.get(slot));
     }
-    if has_varkw {
-        packed.push(pyre_object::w_dict_new());
+    if let Some(slot) = kw_slot {
+        packed.push(_roots.get(slot));
     }
     packed
+}
+
+#[cfg(test)]
+mod pack_varargs_tests {
+    use std::cell::Cell;
+    use std::sync::Once;
+
+    use super::pack_varargs;
+    use majit_gc::GcAllocator;
+    use majit_gc::collector::MiniMarkGC;
+    use majit_gc::trace::TypeInfo;
+    use majit_ir::GcRef;
+    use rustpython_compiler_core::bytecode::ConstantData;
+
+    const PROBE_PAYLOAD: usize = 16;
+
+    thread_local! {
+        static COLLECT_ON_ALLOC: Cell<bool> = const { Cell::new(false) };
+    }
+
+    fn walk_pinned_pyre_roots(visitor: &mut dyn FnMut(&mut GcRef)) {
+        pyre_object::gc_roots::walk_shadow_stack(|slot| {
+            // PyObjectRef and GcRef are both pointer-sized.
+            let gcref = unsafe { &mut *(slot as *mut pyre_object::PyObjectRef as *mut GcRef) };
+            visitor(gcref);
+        });
+    }
+
+    /// `w_tuple_new` allocates through the no-collect hook, which spills
+    /// instead of moving. This test hook takes the collecting entry so a
+    /// full nursery relocates a pinned positional during that allocation.
+    fn collecting_alloc_hook(type_id: u32, payload_size: usize) -> *mut u8 {
+        if !COLLECT_ON_ALLOC.with(Cell::get) {
+            let layout = std::alloc::Layout::from_size_align(payload_size.max(1), 8)
+                .expect("probe fallback layout");
+            return unsafe { std::alloc::alloc_zeroed(layout) };
+        }
+        majit_gc::gc_sync::gc_op(|gc| gc.alloc_with_type(type_id, payload_size)).0 as *mut u8
+    }
+
+    fn install_collecting_heap() {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            let mut gc = MiniMarkGC::new();
+            for _ in 0..16 {
+                let _ = gc.register_type(TypeInfo::simple(PROBE_PAYLOAD));
+            }
+            if !majit_gc::gc_sync::is_initialized() {
+                majit_gc::gc_sync::store_singleton(Box::new(gc));
+            }
+            majit_gc::shadow_stack::register_extra_root_walker(walk_pinned_pyre_roots);
+        });
+        // `compile_exec` already entered this thread. A second
+        // `register_thread` panics; this acquire is idempotent.
+        crate::module::thread::ensure_runtime_thread();
+    }
+
+    fn nursery_gap() -> usize {
+        majit_gc::gc_sync::gc_op(|gc| {
+            (gc.nursery_top() as usize).saturating_sub(gc.nursery_free() as usize)
+        })
+    }
+
+    fn star_code() -> crate::CodeObject {
+        let module = crate::compile_exec("def f(head, *args):\n    pass\n")
+            .expect("star function should compile");
+        module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                ConstantData::Code { code } => Some((**code).clone()),
+                _ => None,
+            })
+            .expect("nested function code")
+    }
+
+    /// A still-young probe with less free nursery than a tuple header, so the
+    /// next collecting allocation runs a minor collection.
+    fn young_probe_in_a_tight_nursery() -> (pyre_object::gc_roots::RootScope, usize) {
+        let step = majit_gc::header::GcHeader::SIZE + PROBE_PAYLOAD;
+        let young = majit_gc::gc_sync::gc_op(|gc| {
+            while (gc.nursery_top() as usize).saturating_sub(gc.nursery_free() as usize) >= step * 2
+            {
+                let _ = gc.alloc_with_type_no_collect(0, PROBE_PAYLOAD);
+            }
+            gc.alloc_with_type(0, PROBE_PAYLOAD)
+        });
+        assert_ne!(young.0, 0, "probe allocation failed");
+        let roots = pyre_object::gc_roots::push_roots();
+        let slot = roots.base();
+        let _ = roots.pin_root(young.0 as pyre_object::PyObjectRef);
+        majit_gc::gc_sync::gc_op(|gc| {
+            while (gc.nursery_top() as usize).saturating_sub(gc.nursery_free() as usize) >= step {
+                let _ = gc.alloc_with_type_no_collect(0, PROBE_PAYLOAD);
+            }
+        });
+        assert!(
+            majit_gc::gc_is_nursery_object(roots.get(slot) as usize),
+            "probe left the nursery before pack_varargs"
+        );
+        assert!(
+            nursery_gap() < pyre_object::W_TUPLE_OBJECT_SIZE,
+            "nursery still has room for the tuple header"
+        );
+        (roots, slot)
+    }
+
+    #[test]
+    fn pack_varargs_rereads_a_young_positional_after_the_tuple_alloc() {
+        // Hides the nursery hook and the collector singleton's alloc path
+        // from every other test thread for the whole body.
+        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
+        let code = star_code();
+        assert!(code.flags.contains(crate::CodeFlags::VARARGS));
+        assert!(!code.flags.contains(crate::CodeFlags::VARKEYWORDS));
+        assert_eq!(code.arg_count, 1);
+        install_collecting_heap();
+        let (roots, slot) = young_probe_in_a_tight_nursery();
+        let before = roots.get(slot);
+        // One overflow word, not a second real positional: `w_tuple_new` pins
+        // the overflow itself. The kept positional is only in this vector.
+        let args = vec![before, pyre_object::PY_NULL];
+        // Install only across the call. A hook that stays up makes every
+        // other test's `try_gc_alloc` take this process's collector.
+        struct ClearHook;
+        impl Drop for ClearHook {
+            fn drop(&mut self) {
+                COLLECT_ON_ALLOC.with(|flag| flag.set(false));
+                pyre_object::gc_hook::clear_gc_alloc_hook();
+            }
+        }
+        COLLECT_ON_ALLOC.with(|flag| flag.set(true));
+        pyre_object::gc_hook::register_gc_alloc_hook(collecting_alloc_hook);
+        let _clear = ClearHook;
+        let packed = pack_varargs(&code, args);
+        drop(_clear);
+        let after = roots.get(slot);
+        assert_ne!(
+            before, after,
+            "the tuple allocation did not collect, so the test did not run"
+        );
+        assert_eq!(
+            packed[0], after,
+            "positional kept the pre-collection address {:p}, live address is {:p}",
+            before, after
+        );
+    }
+
+    fn collecting_stable_hook(type_id: u32, payload_size: usize) -> *mut u8 {
+        if COLLECT_ON_ALLOC.with(Cell::get) {
+            // A full nursery makes the collecting entry run a minor collection
+            // before this stable request returns.
+            let _ = majit_gc::gc_sync::gc_op(|gc| gc.alloc_with_type(type_id.min(15), 16));
+        }
+        let layout = std::alloc::Layout::from_size_align(payload_size.max(1), 8)
+            .expect("stable fallback layout");
+        unsafe { std::alloc::alloc_zeroed(layout) }
+    }
+
+    #[test]
+    fn resolve_kwargs_rereads_a_positional_across_the_kwonly_default_alloc() {
+        // Same installer lock as the nursery-hook test. The string type id
+        // and the stable hook stay invisible to every other thread.
+        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
+        let module = crate::compile_exec("def f(a, *, b=1, c=2):\n    pass\n")
+            .expect("kwonly function should compile");
+        let code = module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                ConstantData::Code { code } => Some((**code).clone()),
+                _ => None,
+            })
+            .expect("nested function code");
+        assert!(code.kwonlyarg_count >= 2);
+        assert!(!code.flags.contains(crate::CodeFlags::VARKEYWORDS));
+        assert!(!code.flags.contains(crate::CodeFlags::VARARGS));
+        // Dict, function and the default string are born before the collecting
+        // heap exists, so they are off-heap and do not move with the probe.
+        crate::test_hooks::install_hash_hook();
+        let w_code = crate::pycode::box_code_object(code);
+        let func = crate::function::function_new_from_code(w_code, pyre_object::w_dict_new());
+        let kwdefaults = pyre_object::w_dict_new();
+        let default_value = pyre_object::w_str_new("v");
+        assert!(!default_value.is_null(), "kwonly default value");
+        unsafe {
+            pyre_object::w_dict_store(kwdefaults, pyre_object::w_str_new("b"), default_value);
+            crate::function::function_set_kwdefaults(func, kwdefaults);
+        }
+        let names = pyre_object::w_tuple_new(vec![pyre_object::w_str_new("c")]);
+        install_collecting_heap();
+        // `w_str_new_managed` stays on the immortal path while this id is 0.
+        pyre_object::lowlevel_string::set_lowlevel_str_gc_type_id(1);
+        let (roots, slot) = young_probe_in_a_tight_nursery();
+        let before = roots.get(slot);
+        struct ClearHook;
+        impl Drop for ClearHook {
+            fn drop(&mut self) {
+                COLLECT_ON_ALLOC.with(|flag| flag.set(false));
+                pyre_object::gc_hook::clear_gc_alloc_stable_hook();
+                pyre_object::lowlevel_string::clear_lowlevel_str_gc_type_id();
+            }
+        }
+        COLLECT_ON_ALLOC.with(|flag| flag.set(true));
+        pyre_object::gc_hook::register_gc_alloc_stable_hook(collecting_stable_hook);
+        let _clear = ClearHook;
+        let resolved = super::resolve_kwargs(func, &[before, default_value], names)
+            .expect("keyword binding should succeed");
+        drop(_clear);
+        let after = roots.get(slot);
+        assert_ne!(
+            before, after,
+            "the kwonly default allocation did not collect, so the test did not run"
+        );
+        assert_eq!(
+            resolved[0], after,
+            "positional kept the pre-collection address {:p}, live address is {:p}",
+            before, after
+        );
+    }
 }
 
 /// Resolve `__mro_entries__` for every base that is not a type.

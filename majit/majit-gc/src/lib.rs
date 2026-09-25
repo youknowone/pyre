@@ -65,6 +65,12 @@ pub fn set_lowlevel_str_type_id(id: u32) {
     LOWLEVEL_STR_TYPE_ID.store(id, std::sync::atomic::Ordering::Release);
 }
 
+/// Pair of [`set_lowlevel_str_type_id`] for a test that published an id only
+/// for the duration of one call. `0` is the unpublished sentinel.
+pub fn clear_lowlevel_str_type_id() {
+    LOWLEVEL_STR_TYPE_ID.store(0, std::sync::atomic::Ordering::Release);
+}
+
 pub fn set_lowlevel_unicode_type_id(id: u32) {
     debug_assert_ne!(id, 0);
     LOWLEVEL_UNICODE_TYPE_ID.store(id, std::sync::atomic::Ordering::Release);
