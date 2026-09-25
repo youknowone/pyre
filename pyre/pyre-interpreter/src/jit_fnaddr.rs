@@ -2326,6 +2326,14 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::_pure_lookup_class_with_method_cache",
         pure_lookup_class_with_method_cache,
     );
+    // `compute_hash(name)` inside the method-cache probe: the jitcode passes
+    // the `&Wtf8` as the str object it came from.
+    cpa1(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::name_content_hash",
+        "pyre_interpreter::name_content_hash",
+        crate::baseobjspace::name_content_hash_jit_abi,
+    );
     // `celldict.py _getdictvalue_no_unwrapping_pure` over the interned key:
     // the elidable module-dict probe LOAD_GLOBAL / LOAD_NAME reach through
     // `getitem_str_w`.
