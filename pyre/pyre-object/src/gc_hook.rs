@@ -263,6 +263,37 @@ pub fn try_gc_alloc_stable_raw(type_id: u32, payload_size: usize) -> *mut u8 {
         .unwrap_or(core::ptr::null_mut())
 }
 
+majit_gc::global_hook!(static GC_ALLOC_YOUNG_NONMOVING_HOOK: GcAllocHookFn);
+
+/// Install the young non-moving allocation callback
+/// (`external_malloc(..., alloc_young=True)`).
+pub fn register_gc_alloc_young_nonmoving_hook(hook: GcAllocHookFn) {
+    GC_ALLOC_YOUNG_NONMOVING_HOOK.set(Some(hook));
+}
+
+/// Remove the young non-moving allocation callback.
+pub fn clear_gc_alloc_young_nonmoving_hook() {
+    GC_ALLOC_YOUNG_NONMOVING_HOOK.set(None);
+}
+
+/// [`try_gc_alloc_stable_raw`]'s young twin: the address is as stable, but
+/// the block is born young, so the next minor collection frees it unless a
+/// root or a traced edge reaches it, and a young pointer stored into it
+/// needs no barrier. The caller owes the block a root for as long as it
+/// holds only the raw address — the old-generation twin would have
+/// survived to the next major instead.
+///
+/// With no young hook installed this answers exactly as the stable twin.
+#[majit_macros::dont_look_inside]
+pub fn try_gc_alloc_young_nonmoving_raw(type_id: u32, payload_size: usize) -> *mut u8 {
+    let Some(hook) = GC_ALLOC_YOUNG_NONMOVING_HOOK.get() else {
+        return try_gc_alloc_stable_raw(type_id, payload_size);
+    };
+    GcAllocOutcome::from_hook(Some(hook(type_id, payload_size)))
+        .allocated_or_abort(payload_size)
+        .unwrap_or(core::ptr::null_mut())
+}
+
 /// [`try_gc_alloc_stable_raw`]'s nursery twin — `malloc_fixedsize`
 /// (`framework.py`), the allocation every RPython constructor takes.
 ///

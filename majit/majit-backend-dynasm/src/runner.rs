@@ -411,6 +411,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
         dynasm_alloc_nursery_collecting_typed_roots,
     ));
     majit_gc::set_active_alloc_oldgen_typed(Some(dynasm_alloc_oldgen_typed));
+    majit_gc::set_active_alloc_young_nonmoving_typed(Some(dynasm_alloc_young_nonmoving_typed));
     majit_gc::set_active_collect_generation(Some(dynasm_collect_generation));
     majit_gc::set_active_collect_step(Some(dynasm_collect_step));
     majit_gc::set_active_get_objects(Some(dynasm_get_objects));
@@ -775,6 +776,20 @@ fn dynasm_alloc_oldgen_typed(type_id: u32, size: usize) -> GcRef {
         return GcRef(0);
     }
     majit_gc::gc_sync::gc_op(|g| g.alloc_oldgen_typed(type_id, size))
+}
+
+/// Host-side young non-moving allocation trampoline
+/// (`external_malloc(..., alloc_young=True)`): the address is as stable as
+/// [`dynasm_alloc_oldgen_typed`]'s, but the next minor collection frees the
+/// block unless a root or a traced edge reaches it.
+fn dynasm_alloc_young_nonmoving_typed(type_id: u32, size: usize) -> GcRef {
+    if let Some(r) = gc_box::with_mut(|g| g.alloc_young_nonmoving_typed(type_id, size)) {
+        return r;
+    }
+    if !majit_gc::gc_sync::is_initialized() {
+        return GcRef(0);
+    }
+    majit_gc::gc_sync::gc_op(|g| g.alloc_young_nonmoving_typed(type_id, size))
 }
 
 /// Allocate the struct a `bh_new` / `bh_new_with_vtable` descr describes

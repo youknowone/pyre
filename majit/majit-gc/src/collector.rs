@@ -9457,6 +9457,19 @@ impl GcAllocator for MiniMarkGC {
         obj
     }
 
+    fn alloc_young_nonmoving_typed(&mut self, type_id: u32, size: usize) -> GcRef {
+        let Some(total_size) = GcHeader::SIZE.checked_add(size) else {
+            return GcRef(0);
+        };
+        // incminimark.py `external_malloc(..., alloc_young=True)`; a refused
+        // young birth (weakref type, old-style finalizer,
+        // `MAJIT_GC_YOUNG_RAWMALLOC=0`) is born old instead.
+        if let Some(obj) = self.try_alloc_young_nonmoving_clear(type_id, total_size) {
+            return obj;
+        }
+        self.alloc_oldgen_typed(type_id, size)
+    }
+
     fn collection_counts(&self) -> (usize, usize) {
         (self.minor_collections, self.major_collections)
     }

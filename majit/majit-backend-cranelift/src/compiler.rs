@@ -370,6 +370,9 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
         alloc_nursery_collecting_typed_roots_via_active_runtime,
     ));
     majit_gc::set_active_alloc_oldgen_typed(Some(alloc_oldgen_typed_via_active_runtime));
+    majit_gc::set_active_alloc_young_nonmoving_typed(Some(
+        alloc_young_nonmoving_typed_via_active_runtime,
+    ));
     majit_gc::set_active_collect_generation(Some(collect_generation_via_active_runtime));
     majit_gc::set_active_collect_step(Some(collect_step_via_active_runtime));
     majit_gc::set_active_get_objects(Some(get_objects_via_active_runtime));
@@ -1788,6 +1791,12 @@ unsafe fn alloc_nursery_collecting_typed_roots_via_active_runtime(
 /// active runtime is set on this thread.
 fn alloc_oldgen_typed_via_active_runtime(type_id: u32, size: usize) -> GcRef {
     with_cranelift_gc(|gc| gc.alloc_oldgen_typed(type_id, size)).unwrap_or(GcRef(0))
+}
+
+/// `external_malloc(..., alloc_young=True)` on the active cranelift-owned GC:
+/// a stable address that the next minor frees unless something reaches it.
+fn alloc_young_nonmoving_typed_via_active_runtime(type_id: u32, size: usize) -> GcRef {
+    with_cranelift_gc(|gc| gc.alloc_young_nonmoving_typed(type_id, size)).unwrap_or(GcRef(0))
 }
 
 /// User-level `gc.collect(n)` trampoline — drives
