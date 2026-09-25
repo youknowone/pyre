@@ -2748,6 +2748,11 @@ fn make_jitcodes(
     // `type_error`) is unioned across all its callers before being rtyped.
     codewriter.run_two_phase_prepass(call_control);
     prof.mark("  run_two_phase_prepass");
+    // RPython lowers indirect calls once on the translator's graphs,
+    // before codewriter and the effect analyzers read them. The prepass
+    // above still needed `family_key`; this consumes it.
+    call_control.lower_registered_indirect_calls();
+    prof.mark("  lower_registered_indirect_calls");
     codewriter.drain_pending_graphs(call_control, &pipeline_config.transform);
     prof.mark("  drain_pending_graphs");
 

@@ -1100,6 +1100,23 @@ impl GraphStore {
         self.graphs.values_mut().map(|slot| &mut slot.graph)
     }
 
+    /// Source-funcobj identities, one per stored graph.
+    fn graph_keys(&self) -> Vec<GraphKey> {
+        self.graphs.keys().cloned().collect()
+    }
+
+    /// Remove one source graph so a caller can mutate it while still
+    /// borrowing the rest of the store. Alias paths keep their `GraphKey`.
+    fn take_graph(&mut self, key: &GraphKey) -> Option<FunctionGraph> {
+        self.graphs.remove(key).map(|slot| slot.graph)
+    }
+
+    /// Put back a graph taken by [`Self::take_graph`] under the same key.
+    fn restore_graph(&mut self, key: GraphKey, graph: FunctionGraph) {
+        let signature = Self::signature_from_graph(&graph);
+        self.graphs.insert(key, GraphSlot { graph, signature });
+    }
+
     /// Number of registered alias spellings (path count), matching the old
     /// `HashMap<CallPath, _>::len()` so `iter()`-sized allocations stay correct.
     pub(crate) fn len(&self) -> usize {
@@ -3573,7 +3590,71 @@ impl CallControl {
     /// Register a free function graph.
     /// RPython: graphs are discovered via funcptr linkage.
     pub fn register_function_graph(&mut self, path: CallPath, graph: FunctionGraph) {
-        self.insert_function_graph_indexed(path, graph);
+        self.insert_function_graph_indexed(path.clone(), graph);
+        // The deferred `Some([])` marker is resolvable as soon as its
+        // `(trait, method)` impls are registered. Fill it on the stored
+        // graph so a later analyzer does not fold the empty family to
+        // "cannot raise". `family_key` stays: the prepass still reads it.
+        self.fill_resolvable_empty_indirect_family(&path);
+    }
+
+    /// Replace `IndirectCall { graphs: Some([]) }` when `family_key` names a
+    /// non-empty `all_impls_for_indirect` family. An empty lookup is left
+    /// as the marker so a later registration can still fill it.
+    fn fill_resolvable_empty_indirect_family(&mut self, path: &CallPath) {
+        let CallControl {
+            trait_method_impls,
+            function_graphs,
+            ..
+        } = self;
+        let Some(graph) = function_graphs.get_mut(path) else {
+            return;
+        };
+        for block in &mut graph.blocks {
+            for op in &mut block.operations {
+                let OpKind::IndirectCall {
+                    graphs, family_key, ..
+                } = &mut op.kind
+                else {
+                    continue;
+                };
+                if !graphs.as_deref().is_some_and(<[_]>::is_empty) {
+                    continue;
+                }
+                let Some((trait_root, method_name)) = family_key.as_ref() else {
+                    continue;
+                };
+                let family = trait_method_impls
+                    .get(&(trait_root.clone(), method_name.clone()))
+                    .into_iter()
+                    .flatten()
+                    .map(|impl_type| {
+                        CallPath::for_impl_method(impl_type.as_str(), method_name.as_str())
+                    })
+                    .collect::<Vec<_>>();
+                if !family.is_empty() {
+                    *graphs = Some(family);
+                }
+            }
+        }
+    }
+
+    /// Lower every indirect call on the graphs this `CallControl` owns.
+    ///
+    /// RPython lowers PBC families once, in place, during rtyping, before
+    /// `CallControl` and the effect analyzers read the same graphs. Runs
+    /// after the flowspace prepass (which still needs `family_key`) and
+    /// before `transform_graph_to_jitcode`.
+    pub(crate) fn lower_registered_indirect_calls(&mut self) {
+        let _frozen = self.builtin_wrapper_indirect_graphs();
+        let keys = self.function_graphs.graph_keys();
+        for key in keys {
+            let Some(mut graph) = self.function_graphs.take_graph(&key) else {
+                continue;
+            };
+            crate::translator::rtyper::rpbc::lower_indirect_calls_with(&mut graph, self, false);
+            self.function_graphs.restore_graph(key, graph);
+        }
     }
 
     /// Whether a graph is registered under `path`.
@@ -13245,6 +13326,59 @@ mod tests {
             cc._canraise(&CallTarget::indirect("Unheard", "run"), &mut cache),
             CanRaise::Yes,
             "a family with no enumerable members is unknown, not proven empty"
+        );
+    }
+
+    /// A callee still carrying the deferred PBC marker
+    /// `IndirectCall { graphs: Some([]) }` must not be analyzed as an empty
+    /// family. `all_impls_for_indirect` can name a member that raises; the
+    /// caller that reaches that callee has to report the raise. An empty
+    /// `for` over `Some([])` answers `CanRaise::No`.
+    #[test]
+    fn deferred_empty_indirect_family_propagates_callee_raise() {
+        let mut cc = CallControl::new();
+        cc.register_trait_method("run", Some("Handler"), "Loud", raising_graph("Loud::run"));
+        let loud = CallPath::for_impl_method("Loud", "run");
+        assert_eq!(
+            cc.all_impls_for_indirect("Handler", "run"),
+            vec![loud],
+            "the marker must resolve to the raising impl"
+        );
+
+        let callee_path = CallPath::from_segments(["callee"]);
+        let mut callee = FunctionGraph::new("callee");
+        let funcptr = callee.alloc_value_var();
+        callee
+            .block_mut(callee.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::IndirectCall {
+                    funcptr,
+                    args: Vec::new(),
+                    graphs: Some(Vec::new()),
+                    family_key: Some(("Handler".to_string(), "run".to_string())),
+                    result_ty: ValueType::Void,
+                },
+            });
+        cc.register_function_graph(callee_path.clone(), callee);
+
+        let caller_path = CallPath::from_segments(["caller"]);
+        cc.register_function_graph(
+            caller_path,
+            graph_calling("caller", CallTarget::function_path(["callee"])),
+        );
+
+        let mut cache = AnalysisCache::default();
+        assert_eq!(
+            cc._canraise(&CallTarget::function_path(["Loud", "run"]), &mut cache),
+            CanRaise::Yes,
+            "control: the impl itself raises"
+        );
+        assert_eq!(
+            cc._canraise(&CallTarget::function_path(["caller"]), &mut cache),
+            CanRaise::Yes,
+            "a caller of the deferred-family callee must see the impl raise"
         );
     }
 

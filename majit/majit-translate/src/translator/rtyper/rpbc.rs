@@ -330,6 +330,18 @@ pub(crate) fn select_call_family_row(
 /// RPython's `convert_to_concrete_llfn` materialises the funcptr but the
 /// eventual `indirect_call` still receives `self, ...` as ordinary args.
 pub fn lower_indirect_calls(graph: &mut JitFunctionGraph, call_control: &CallControl) {
+    lower_indirect_calls_with(graph, call_control, true);
+}
+
+/// Same as [`lower_indirect_calls`]. `collapse_unresolved` rewrites an
+/// empty lookup to the unknown family (`graphs: None`). The in-place pass
+/// passes `false` and leaves that marker: the one empty family it still
+/// sees is not registered on any translated graph.
+pub(crate) fn lower_indirect_calls_with(
+    graph: &mut JitFunctionGraph,
+    call_control: &CallControl,
+    collapse_unresolved: bool,
+) {
     // Generated gateway wrappers enter the MIR graph as a plain function-
     // pointer `IndirectCall` with `Some([])` as a deferred PBC-family marker.
     // At rtype time CallControl owns both the translated graphs and the
@@ -342,9 +354,20 @@ pub fn lower_indirect_calls(graph: &mut JitFunctionGraph, call_control: &CallCon
                 graphs, family_key, ..
             } = &mut op.kind
             {
-                if let Some((trait_root, method_name)) = family_key.take() {
+                if let Some((trait_root, method_name)) = family_key.clone() {
                     let family = call_control.all_impls_for_indirect(&trait_root, &method_name);
-                    *graphs = (!family.is_empty()).then_some(family);
+                    if !family.is_empty() {
+                        *graphs = Some(family);
+                        *family_key = None;
+                    } else if collapse_unresolved {
+                        // An empty lookup cannot be told from "not
+                        // registered yet". `None` is the unknown family.
+                        // The in-place pass leaves the marker when asked
+                        // not to collapse, so a later registration can
+                        // still fill it.
+                        *graphs = None;
+                        *family_key = None;
+                    }
                     continue;
                 }
                 if !graphs.as_deref().is_some_and(<[_]>::is_empty) {
@@ -353,13 +376,13 @@ pub fn lower_indirect_calls(graph: &mut JitFunctionGraph, call_control: &CallCon
                 // Filling the marker with an empty wrapper set would leave
                 // `Some([])`, which every family analyzer reads as "the
                 // family is known and has no members" and folds to its
-                // bottom result — silently asserting that a callee this
-                // side never enumerated has no effects.  Nothing here can
-                // tell "no wrappers registered" from "wrappers exist but
-                // were not registered", so an unfilled marker is an unknown
-                // family: `None`, the same fold this function makes for an
-                // empty `(trait, method)` family below.
-                *graphs = (!builtin_wrappers.is_empty()).then(|| builtin_wrappers.to_vec());
+                // bottom result. An unfilled marker is an unknown family
+                // (`None`) when collapsing; otherwise it stays a marker.
+                if !builtin_wrappers.is_empty() && collapse_unresolved {
+                    *graphs = Some(builtin_wrappers.to_vec());
+                } else if collapse_unresolved {
+                    *graphs = None;
+                }
             }
         }
     }
@@ -405,14 +428,21 @@ pub fn lower_indirect_calls(graph: &mut JitFunctionGraph, call_control: &CallCon
             } => (trait_root, method_name),
             _ => unreachable!("site filter mismatch"),
         };
+        let family = call_control.all_impls_for_indirect(&trait_root, &method_name);
+        // An empty lookup is an unknown family. Collapsing it to `None`
+        // on the shared graph makes effect analysis report random effects
+        // for a call the analyzers previously did not enumerate. Leave the
+        // `CallTarget::Indirect` in place unless this pass is collapsing.
+        if family.is_empty() && !collapse_unresolved {
+            continue;
+        }
         // `rpbc.py FunctionReprBase.call` assigns the call result's
         // concretetype from the selected call-family row.  Use that family
         // result here as well: a dependency LLBC can expose a transparent
         // scalar wrapper only as an opaque declaration, while a local family
         // member still supplies the complete translated signature.
-        if let Some(declared) =
-            call_control.declared_result_type_for_indirect(&trait_root, &method_name)
-        {
+        let declared = call_control.declared_result_type_for_indirect(&trait_root, &method_name);
+        if let Some(declared) = declared {
             result_ty = match declared {
                 majit_ir::value::Type::Int => ValueType::Int,
                 majit_ir::value::Type::Ref => ValueType::Ref(None),
@@ -461,7 +491,6 @@ pub fn lower_indirect_calls(graph: &mut JitFunctionGraph, call_control: &CallCon
         // because the family is truly empty or because the impls live
         // outside the analyzed sources, so we take the conservative
         // `None` path.
-        let family = call_control.all_impls_for_indirect(&trait_root, &method_name);
         let graphs = if family.is_empty() {
             None
         } else {
