@@ -769,11 +769,11 @@ impl<'c> Lowerer<'c> {
     /// Lower a struct literal `Path { f0: v0, f1: v1, .. }` to a JIT
     /// allocation plus per-field stores: `new` (size from `size_of`) then
     /// `setfield_gc_<kind>` at each field's `offset_of`.  Mirrors
-    /// `jtransform.py` malloc + setfield rewrite; the optimizer's
-    /// virtualize pass folds the New away when the struct does not escape.
+    /// `jtransform.py` `rewrite_op_malloc` + `rewrite_op_setfield`; the
+    /// optimizer's virtualize pass folds the New away when the struct does
+    /// not escape. A float field is `setfield_gc_f` (`getkind` `f`).
     /// Returns the result ref binding, or `None` (helper falls back to a
-    /// residual call) for struct-update base syntax or float fields, which
-    /// the bytecode field-op path does not express yet.
+    /// residual call) for struct-update base syntax.
     fn lower_struct_value(&mut self, s: &syn::ExprStruct) -> Option<Binding> {
         if s.rest.is_some() {
             return None;
@@ -818,9 +818,6 @@ impl<'c> Lowerer<'c> {
                 continue;
             }
             let value = self.lower_value_expr(expr)?;
-            if matches!(value.kind, BindingKind::Float) {
-                return None;
-            }
             depends_on_stack |= value.depends_on_stack;
             value_fields.push((owner.clone(), member.clone(), value));
         }
@@ -842,6 +839,9 @@ impl<'c> Lowerer<'c> {
             .iter()
             .map(|(owner, member, value)| {
                 let is_ref = matches!(value.kind, BindingKind::Ref);
+                // `descr.py` `get_type_flag`: the value's kind is the field's
+                // lltype. A float binding is `FLOAT` at registration.
+                let is_float = matches!(value.kind, BindingKind::Float);
                 // `rewrite_op_malloc` + `rewrite_op_setfield` register
                 // each field through `fielddescrof`, which reads width
                 // and signedness from FIELDTYPE. Use the same
@@ -874,6 +874,7 @@ impl<'c> Lowerer<'c> {
                         stringify!(#member),
                         #size,
                         #signed,
+                        #is_float,
                     )
                 }}
             })
@@ -951,7 +952,21 @@ impl<'c> Lowerer<'c> {
                         );
                     },
                 ),
-                BindingKind::Float => unreachable!("float fields rejected above"),
+                // `jtransform.py` `rewrite_op_setfield`: `kind = getkind(RESULT)[0]`
+                // is `f`, so the store is `setfield_gc_f`. The layout entry
+                // already named this field `FLOAT` (`descr.py` `get_type_flag`).
+                BindingKind::Float => (
+                    vec![Register::ref_(result_reg), Register::float(value_reg)],
+                    quote! {
+                        __builder.setfield_gc_f(
+                            #result_reg,
+                            #value_reg,
+                            ::core::mem::offset_of!(#owner, #member),
+                            #type_id,
+                            stringify!(#member),
+                        );
+                    },
+                ),
             };
             self.emit_op(OpMeta::linear(OpKind::SetfieldGc, reads, vec![]), tokens);
         }
@@ -3435,6 +3450,30 @@ mod tests {
         assert!(emitted.contains("setfield_gc_r"));
         assert!(emitted.contains("offset_of"));
         assert!(emitted.contains("size_of"));
+    }
+
+    #[test]
+    fn struct_literal_float_field_lowers_to_setfield_gc_f() {
+        // `jtransform.py` `rewrite_op_setfield` with `getkind` `f`.
+        let mut lowerer = Lowerer::new(None);
+        lowerer
+            .bindings
+            .insert("f".to_string(), binding(1, BindingKind::Float));
+        let expr: Expr = syn::parse_str("Num { floatval: f }").expect("parse struct literal");
+        let result = lowerer.lower_value_expr(&expr).expect("struct lowers");
+        assert!(matches!(result.kind, BindingKind::Ref));
+        assert_eq!(
+            lowerer.op_metadata[1].reads,
+            vec![Register::ref_(result.reg), Register::float(1)]
+        );
+        let emitted = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(!emitted.contains("retag_struct_field_float"));
+        assert!(emitted.contains("setfield_gc_f"));
+        assert!(emitted.contains("true"));
     }
 
     #[test]

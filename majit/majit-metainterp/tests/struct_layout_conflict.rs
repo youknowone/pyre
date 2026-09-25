@@ -46,7 +46,10 @@ fn conflicts_for(type_id: u64) -> Vec<majit_metainterp::StructLayoutConflict> {
 fn a_site_re_registering_what_it_already_declared_is_not_a_conflict() {
     let before = majit_metainterp::struct_layout_comparisons();
     let mut builder = JitCodeBuilder::new();
-    let layout = &[(0, true, "head", 8, false), (8, false, "size", 8, true)][..];
+    let layout = &[
+        (0, true, "head", 8, false, false),
+        (8, false, "size", 8, true, false),
+    ][..];
     // Two access sites on one struct, each re-declaring the whole layout —
     // the shape `#[jit_interp]` emits, one call per getfield/setfield.
     builder.register_struct_layout(16, TID_AGREE, false, false, layout, "");
@@ -78,7 +81,7 @@ fn one_word_declared_a_pointer_and_a_scalar_is_a_conflict() {
         TID_REDESCRIBED,
         false,
         false,
-        &[(0, true, "head", 8, false)],
+        &[(0, true, "head", 8, false, false)],
         // these tests are about offset disagreement; nothing is declared
         "",
     );
@@ -87,7 +90,7 @@ fn one_word_declared_a_pointer_and_a_scalar_is_a_conflict() {
         TID_REDESCRIBED,
         false,
         false,
-        &[(0, false, "head", 8, true)],
+        &[(0, false, "head", 8, true, false)],
         // these tests are about offset disagreement; nothing is declared
         "",
     );
@@ -118,7 +121,7 @@ fn a_sibling_at_an_occupied_offset_is_reported_as_dropped() {
         TID_SIBLING,
         false,
         false,
-        &[(8, false, "agg", 8, true)],
+        &[(8, false, "agg", 8, true, false)],
         "",
     );
     builder.register_struct_layout(
@@ -126,7 +129,7 @@ fn a_sibling_at_an_occupied_offset_is_reported_as_dropped() {
         TID_SIBLING,
         false,
         false,
-        &[(8, true, "leaf", 8, false)],
+        &[(8, true, "leaf", 8, false, false)],
         // these tests are about offset disagreement; nothing is declared
         "",
     );
@@ -153,8 +156,22 @@ fn a_sibling_at_an_occupied_offset_is_reported_as_dropped() {
 fn the_gate_reports_a_conflict_rather_than_passing_on_it() {
     let mut builder = JitCodeBuilder::new();
     const TID: u64 = 0x4741_5445_4441;
-    builder.register_struct_layout(16, TID, false, false, &[(0, true, "head", 8, false)], "");
-    builder.register_struct_layout(16, TID, false, false, &[(0, false, "head", 8, true)], "");
+    builder.register_struct_layout(
+        16,
+        TID,
+        false,
+        false,
+        &[(0, true, "head", 8, false, false)],
+        "",
+    );
+    builder.register_struct_layout(
+        16,
+        TID,
+        false,
+        false,
+        &[(0, false, "head", 8, true, false)],
+        "",
+    );
     let _ = builder.finish();
 
     let failure = std::panic::catch_unwind(majit_metainterp::assert_no_struct_layout_conflicts)

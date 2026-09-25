@@ -1300,6 +1300,7 @@ impl<'c> Lowerer<'c> {
                             stringify!(#member),
                             #__fsize,
                             #__fsigned,
+                            false,
                         )],
                         {
                             // The struct's own `_immutable_fields_` declaration.  Read through
@@ -1350,6 +1351,7 @@ impl<'c> Lowerer<'c> {
                             stringify!(#member),
                             #__fsize,
                             #__fsigned,
+                            false,
                         )],
                         {
                             // The struct's own `_immutable_fields_` declaration.  Read through
@@ -1480,6 +1482,7 @@ impl<'c> Lowerer<'c> {
                             stringify!(#member),
                             #__fsize,
                             #__fsigned,
+                            false,
                         )],
                         {
                             // The struct's own `_immutable_fields_` declaration.  Read through
@@ -1529,6 +1532,7 @@ impl<'c> Lowerer<'c> {
                             stringify!(#member),
                             #__fsize,
                             #__fsigned,
+                            false,
                         )],
                         {
                             // The struct's own `_immutable_fields_` declaration.  Read through
@@ -1743,6 +1747,7 @@ impl<'c> Lowerer<'c> {
                         true,
                         stringify!(#member),
                         ::core::mem::size_of::<usize>(),
+                        false,
                         false,
                     )],
                     {
@@ -2130,6 +2135,7 @@ impl<'c> Lowerer<'c> {
                             stringify!(#member),
                             #__fsize,
                             #__fsigned,
+                            false,
                         )],
                         {
                             // The struct's own `_immutable_fields_` declaration.  Read through
@@ -2178,6 +2184,7 @@ impl<'c> Lowerer<'c> {
                             stringify!(#member),
                             #__fsize,
                             #__fsigned,
+                            false,
                         )],
                         {
                             // The struct's own `_immutable_fields_` declaration.  Read through
@@ -2280,6 +2287,7 @@ impl<'c> Lowerer<'c> {
                             stringify!(#member),
                             #__fsize,
                             #__fsigned,
+                            false,
                         )],
                         {
                             // The struct's own `_immutable_fields_` declaration.  Read through
@@ -2327,6 +2335,7 @@ impl<'c> Lowerer<'c> {
                             stringify!(#member),
                             #__fsize,
                             #__fsigned,
+                            false,
                         )],
                         {
                             // The struct's own `_immutable_fields_` declaration.  Read through

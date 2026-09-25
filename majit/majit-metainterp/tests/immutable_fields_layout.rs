@@ -19,11 +19,11 @@ const TID_UNDECLARED: u64 = 0x494D_4D55_5402;
 const TID_LATE: u64 = 0x494D_4D55_5403;
 const TID_NEVER: u64 = 0x494D_4D55_5404;
 
-const NODE: &[(usize, bool, &str, usize, bool)] = &[
-    (0, false, "kind", 1, false),
-    (2, false, "marked", 1, false),
-    (8, true, "left", 8, false),
-    (16, false, "version", 8, true),
+const NODE: &[(usize, bool, &str, usize, bool, bool)] = &[
+    (0, false, "kind", 1, false, false),
+    (2, false, "marked", 1, false, false),
+    (8, true, "left", 8, false, false),
+    (16, false, "version", 8, true, false),
 ];
 
 fn field<'a>(
@@ -118,7 +118,7 @@ fn a_struct_that_declares_nothing_has_no_immutable_field() {
     let mut builder = JitCodeBuilder::new();
     builder.register_struct_layout(24, TID_NEVER + 16, false, false, NODE, "");
 
-    for (_, _, name, _, _) in NODE {
+    for (_, _, name, _, _, _) in NODE {
         assert!(
             !field(&builder, TID_NEVER + 16, name).is_immutable,
             "{name} was declared immutable by nothing",

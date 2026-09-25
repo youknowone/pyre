@@ -1497,7 +1497,8 @@ impl LowererConfig {
     /// first field already occupies for the same object.
     ///
     /// Returns `(entries, witness)`. `entries` are `(offset, is_ref, name,
-    /// size, signed)` tuples in the shape the layout registration takes;
+    /// size, signed, is_float)` tuples in the shape the layout registration
+    /// takes;
     /// offsets are relative to the OUTER struct. Empty when the struct embeds
     /// no declared base, which is the case for every struct unless a caller
     /// declares one.
@@ -1549,6 +1550,7 @@ impl LowererConfig {
                         stringify!(#field),
                         #size,
                         #signed,
+                        false,
                     )
                 });
             }

@@ -583,7 +583,7 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
     reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
 )]
 pub fn residual_write_effect_info(
-    layouts: &[(usize, u64, bool, &[(usize, bool, &str, usize, bool)])],
+    layouts: &[(usize, u64, bool, &[(usize, bool, &str, usize, bool, bool)])],
     arrays: &[(usize, bool)],
     can_raise: bool,
 ) -> majit_ir::EffectInfo {
@@ -591,47 +591,56 @@ pub fn residual_write_effect_info(
     // `index_in_parent` is the stable by-offset rank, scalar = one machine word.
     let mut fds = Vec::new();
     for &(struct_size, type_id, is_gc_managed, fields) in layouts {
-        let mut ordered: Vec<(usize, bool, &str, usize, bool)> = fields.to_vec();
-        ordered.sort_by_key(|&(offset, _, _, _, _)| offset);
+        let mut ordered: Vec<(usize, bool, &str, usize, bool, bool)> = fields.to_vec();
+        ordered.sort_by_key(|&(offset, _, _, _, _, _)| offset);
         let specs: Vec<majit_ir::descr::SimpleFieldDescrSpec> = ordered
             .iter()
             .enumerate()
-            .map(|(idx, &(offset, is_ref, name, decl_size, decl_signed))| {
-                let (field_type, field_size, flag) = if is_ref {
-                    (
-                        majit_ir::value::Type::Ref,
-                        jitcode::scalar_size(majit_ir::value::Type::Ref),
-                        majit_ir::descr::ArrayFlag::Pointer,
-                    )
-                } else {
-                    let flag = if decl_signed {
-                        majit_ir::descr::ArrayFlag::Signed
+            .map(
+                |(idx, &(offset, is_ref, name, decl_size, decl_signed, is_float))| {
+                    // Same split as `field_specs_from_layout`: `get_type_flag`.
+                    let (field_type, field_size, flag) = if is_ref {
+                        (
+                            majit_ir::value::Type::Ref,
+                            jitcode::scalar_size(majit_ir::value::Type::Ref),
+                            majit_ir::descr::ArrayFlag::Pointer,
+                        )
+                    } else if is_float {
+                        (
+                            majit_ir::value::Type::Float,
+                            jitcode::scalar_size(majit_ir::value::Type::Float),
+                            majit_ir::descr::ArrayFlag::Float,
+                        )
                     } else {
-                        majit_ir::descr::ArrayFlag::Unsigned
+                        let flag = if decl_signed {
+                            majit_ir::descr::ArrayFlag::Signed
+                        } else {
+                            majit_ir::descr::ArrayFlag::Unsigned
+                        };
+                        (majit_ir::value::Type::Int, decl_size, flag)
                     };
-                    (majit_ir::value::Type::Int, decl_size, flag)
-                };
-                majit_ir::descr::SimpleFieldDescrSpec {
-                    index: u32::MAX,
-                    field_key: name.to_string(),
-                    // The layout table names fields but declares no header
-                    // row, so the descr infers from the name.
-                    is_class_word: None,
-                    name: name.to_string(),
-                    offset,
-                    // Same width rule as the `field_specs_from_layout` twin
-                    // this mirrors: a `Ref` field is one target word (4 on
-                    // wasm32); an `Int` field is its declared storage, which is
-                    // a machine word unless the emit site named it narrower.
-                    field_size,
-                    field_type,
-                    is_immutable: false,
-                    is_quasi_immutable: false,
-                    flag,
-                    virtualizable: false,
-                    index_in_parent: idx,
-                }
-            })
+                    majit_ir::descr::SimpleFieldDescrSpec {
+                        index: u32::MAX,
+                        field_key: name.to_string(),
+                        // The layout table names fields but declares no header
+                        // row, so the descr infers from the name.
+                        is_class_word: None,
+                        name: name.to_string(),
+                        offset,
+                        // Same width rule as the `field_specs_from_layout` twin
+                        // this mirrors: a `Ref` field is one target word (4 on
+                        // wasm32); an `Int` field is its declared storage, which is
+                        // a machine word unless the emit site named it narrower.
+                        field_size,
+                        field_type,
+                        is_immutable: false,
+                        is_quasi_immutable: false,
+                        flag,
+                        virtualizable: false,
+                        index_in_parent: idx,
+                    }
+                },
+            )
             .collect();
         majit_ir::descr::make_simple_descr_group_keyed(
             u32::MAX,
@@ -643,7 +652,7 @@ pub fn residual_write_effect_info(
             &specs,
         );
         let struct_key = majit_ir::descr::LLType::Struct(type_id);
-        fds.extend(fields.iter().map(|(_, _, write_field, _, _)| {
+        fds.extend(fields.iter().map(|(_, _, write_field, _, _, _)| {
             majit_ir::descr::gc_cache()
                 .lock()
                 ._cache_field
@@ -15338,7 +15347,10 @@ mod tests {
             16,
             0xCD,
             false,
-            &[(0, false, "value", 8, true), (8, true, "next", 8, false)],
+            &[
+                (0, false, "value", 8, true, false),
+                (8, true, "next", 8, false, false),
+            ],
             "",
         ); // ref reg 0 = Node*
         builder.load_const_i_value(0, 99); // int reg 0 = 99
@@ -15424,8 +15436,8 @@ mod tests {
             0xCE,
             false,
             &[
-                (0, false, "cached_value", 8, true),
-                (8, true, "cached_next", 8, false),
+                (0, false, "cached_value", 8, true, false),
+                (8, true, "cached_next", 8, false, false),
             ],
             "",
         );
@@ -15464,8 +15476,8 @@ mod tests {
             0xD1,
             false,
             &[
-                (0, false, "hc_size", 8, true),
-                (8, true, "hc_buf", 8, false),
+                (0, false, "hc_size", 8, true, false),
+                (8, true, "hc_buf", 8, false, false),
             ],
             "",
         );
@@ -15504,7 +15516,10 @@ mod tests {
             16,
             0xCD,
             false,
-            &[(0, false, "value", 8, true), (8, true, "next", 8, false)],
+            &[
+                (0, false, "value", 8, true, false),
+                (8, true, "next", 8, false, false),
+            ],
             "",
         );
         builder.load_const_i_value(0, 99);
@@ -15546,7 +15561,10 @@ mod tests {
             16,
             0xCE,
             false,
-            &[(0, false, "value", 8, true), (8, true, "next", 8, false)],
+            &[
+                (0, false, "value", 8, true, false),
+                (8, true, "next", 8, false, false),
+            ],
             "",
         );
         builder.setfield_gc_i_c(0, -7, 0, 0xCE, "value"); // Node.value = -7 (inline const)

@@ -667,7 +667,7 @@ impl JitCodeBuilder {
         size: usize,
         type_id: u64,
         headerless: bool,
-        fields: &[(usize, bool, &str, usize, bool)],
+        fields: &[(usize, bool, &str, usize, bool, bool)],
         immutable_fields: &str,
     ) {
         self.touch_ref_reg(dest);
@@ -717,7 +717,7 @@ impl JitCodeBuilder {
         vtable: usize,
         headerless: bool,
         is_gc_managed: bool,
-        fields: &[(usize, bool, &str, usize, bool)],
+        fields: &[(usize, bool, &str, usize, bool, bool)],
         immutable_fields: &str,
     ) {
         self.touch_ref_reg(dest);
@@ -775,7 +775,7 @@ impl JitCodeBuilder {
         type_id: u64,
         is_gc_managed: bool,
         headerless: bool,
-        fields: &[(usize, bool, &str, usize, bool)],
+        fields: &[(usize, bool, &str, usize, bool, bool)],
         immutable_fields: &str,
     ) {
         crate::note_struct_layout_registration(fields.len());
@@ -876,7 +876,14 @@ impl JitCodeBuilder {
     fn record_layout_conflicts(
         existing: &BhSizeSpec,
         type_id: u64,
-        (offset, is_ref, name, decl_size, decl_signed): (usize, bool, &str, usize, bool),
+        (offset, is_ref, name, decl_size, decl_signed, is_float): (
+            usize,
+            bool,
+            &str,
+            usize,
+            bool,
+            bool,
+        ),
     ) -> bool {
         let mut at_offset = existing
             .all_fielddescrs
@@ -898,10 +905,12 @@ impl JitCodeBuilder {
             is_ref,
             size: if is_ref {
                 scalar_size(majit_ir::value::Type::Ref)
+            } else if is_float {
+                scalar_size(majit_ir::value::Type::Float)
             } else {
                 decl_size
             },
-            signed: !is_ref && decl_signed,
+            signed: !is_ref && !is_float && decl_signed,
         };
         let describe = |ef: &BhFieldSpec| crate::StructLayoutField {
             name: ef.name.clone(),
@@ -1000,58 +1009,66 @@ impl JitCodeBuilder {
     }
 
     fn field_specs_from_layout(
-        fields: &[(usize, bool, &str, usize, bool)],
+        fields: &[(usize, bool, &str, usize, bool, bool)],
         ranks: &[(String, ImmutableRank)],
     ) -> Vec<BhFieldSpec> {
-        let mut ordered: Vec<(usize, bool, &str, usize, bool)> = fields.to_vec();
-        ordered.sort_by_key(|&(offset, _, _, _, _)| offset);
+        let mut ordered: Vec<(usize, bool, &str, usize, bool, bool)> = fields.to_vec();
+        ordered.sort_by_key(|&(offset, _, _, _, _, _)| offset);
         ordered
             .iter()
             .enumerate()
-            .map(|(idx, &(offset, is_ref, name, decl_size, decl_signed))| {
-                // descr.py `get_type_flag(FIELDTYPE)`: a pointer field
-                // is FLAG_POINTER; an integer field is FLAG_SIGNED or
-                // FLAG_UNSIGNED by its own type and carries its own width.
-                // The emit site supplies both for an integer field; a ref field
-                // is a pointer word by construction.
-                let (field_type, field_size, field_flag, is_field_signed) = if is_ref {
-                    (
-                        majit_ir::value::Type::Ref,
-                        scalar_size(majit_ir::value::Type::Ref),
-                        majit_ir::descr::ArrayFlag::Pointer,
-                        false,
-                    )
-                } else {
-                    let flag = if decl_signed {
-                        majit_ir::descr::ArrayFlag::Signed
+            .map(
+                |(idx, &(offset, is_ref, name, decl_size, decl_signed, is_float))| {
+                    // descr.py `get_field_descr` reads FIELDTYPE once and
+                    // `get_type_flag` picks the flag: pointer, FLOAT, signed, or
+                    // unsigned. The emit site supplies that kind; nothing retags
+                    // the descr afterwards.
+                    let (field_type, field_size, field_flag, is_field_signed) = if is_ref {
+                        (
+                            majit_ir::value::Type::Ref,
+                            scalar_size(majit_ir::value::Type::Ref),
+                            majit_ir::descr::ArrayFlag::Pointer,
+                            false,
+                        )
+                    } else if is_float {
+                        (
+                            majit_ir::value::Type::Float,
+                            scalar_size(majit_ir::value::Type::Float),
+                            majit_ir::descr::ArrayFlag::Float,
+                            false,
+                        )
                     } else {
-                        majit_ir::descr::ArrayFlag::Unsigned
+                        let flag = if decl_signed {
+                            majit_ir::descr::ArrayFlag::Signed
+                        } else {
+                            majit_ir::descr::ArrayFlag::Unsigned
+                        };
+                        (majit_ir::value::Type::Int, decl_size, flag, decl_signed)
                     };
-                    (majit_ir::value::Type::Int, decl_size, flag, decl_signed)
-                };
-                BhFieldSpec {
-                    // descr.py:656 SimpleFieldDescr id is unset until the
-                    // runtime DescrCache mints one; index_in_parent carries
-                    // the structural slot the optimizer indexes by.
-                    index: u32::MAX,
-                    field_key: name.to_string(),
-                    name: name.to_string(),
-                    offset,
-                    field_size,
-                    field_type,
-                    field_flag,
-                    is_field_signed,
-                    is_immutable: Self::rank_of(ranks, name)
-                        .is_some_and(ImmutableRank::is_immutable),
-                    is_quasi_immutable: Self::rank_of(ranks, name)
-                        .is_some_and(ImmutableRank::is_quasi_immutable),
-                    index_in_parent: idx,
-                    // The emit-site layout table names fields but declares no
-                    // header row, so the rebuilding side falls back to the
-                    // name.
-                    is_class_word: None,
-                }
-            })
+                    BhFieldSpec {
+                        // descr.py:656 SimpleFieldDescr id is unset until the
+                        // runtime DescrCache mints one; index_in_parent carries
+                        // the structural slot the optimizer indexes by.
+                        index: u32::MAX,
+                        field_key: name.to_string(),
+                        name: name.to_string(),
+                        offset,
+                        field_size,
+                        field_type,
+                        field_flag,
+                        is_field_signed,
+                        is_immutable: Self::rank_of(ranks, name)
+                            .is_some_and(ImmutableRank::is_immutable),
+                        is_quasi_immutable: Self::rank_of(ranks, name)
+                            .is_some_and(ImmutableRank::is_quasi_immutable),
+                        index_in_parent: idx,
+                        // The emit-site layout table names fields but declares no
+                        // header row, so the rebuilding side falls back to the
+                        // name.
+                        is_class_word: None,
+                    }
+                },
+            )
             .collect()
     }
 
@@ -1246,6 +1263,29 @@ impl JitCodeBuilder {
         self.write_insn("setfield_gc_r/rrd");
         self.push_reg_u8(struct_reg, "setfield_gc_r struct");
         self.push_reg_u8(value_reg, "setfield_gc_r value");
+        self.push_u16(descr);
+    }
+
+    /// Emit `setfield_gc_f/rfd` (`jtransform.py` `rewrite_op_setfield`:
+    /// `kind = getkind(RESULT)[0]` is `f`, so the op is `setfield_gc_f`).
+    ///
+    /// The field's `FLOAT` flag is fixed when `register_struct_layout` builds
+    /// the descr (`descr.py` `get_field_descr` / `get_type_flag`).
+    pub fn setfield_gc_f(
+        &mut self,
+        struct_reg: u16,
+        value_reg: u16,
+        offset: usize,
+        type_id: u64,
+        field_name: &str,
+    ) {
+        self.touch_ref_reg(struct_reg);
+        self.touch_float_reg(value_reg);
+        let descr =
+            self.add_struct_field_descr(offset, majit_ir::value::Type::Float, type_id, field_name);
+        self.write_insn("setfield_gc_f/rfd");
+        self.push_reg_u8(struct_reg, "setfield_gc_f struct");
+        self.push_reg_u8(value_reg, "setfield_gc_f value");
         self.push_u16(descr);
     }
 
@@ -2353,12 +2393,14 @@ impl JitCodeBuilder {
                     "length",
                     scalar_size(majit_ir::value::Type::Int),
                     true,
+                    false,
                 ),
                 (
                     items_offset,
                     true,
                     "items",
                     scalar_size(majit_ir::value::Type::Ref),
+                    false,
                     false,
                 ),
             ],
@@ -7233,10 +7275,24 @@ mod tests {
         const TID: u64 = 0x5747_5F49_4458;
         let mut builder = JitCodeBuilder::new();
         // Site 1 registers only the HIGH offset, so the mint ranks it 0.
-        builder.register_struct_layout(24, TID, false, false, &[(16, false, "hi", 8, true)], "");
+        builder.register_struct_layout(
+            24,
+            TID,
+            false,
+            false,
+            &[(16, false, "hi", 8, true, false)],
+            "",
+        );
         builder.getfield_gc_i(0, 1, 16, TID, "hi");
         // Site 2 registers the LOW offset; the merge re-indexes to {8→0, 16→1}.
-        builder.register_struct_layout(24, TID, false, false, &[(8, false, "lo", 8, true)], "");
+        builder.register_struct_layout(
+            24,
+            TID,
+            false,
+            false,
+            &[(8, false, "lo", 8, true, false)],
+            "",
+        );
         builder.getfield_gc_i(2, 1, 8, TID, "lo");
         let jitcode = builder.finish();
 
@@ -7286,7 +7342,14 @@ mod tests {
     fn field_descr_runtime_entry_reuses_one_optimizer_identity() {
         const TID: u64 = 0x5254_4649_454c_44;
         let mut builder = JitCodeBuilder::new();
-        builder.register_struct_layout(16, TID, false, false, &[(8, false, "value", 8, true)], "");
+        builder.register_struct_layout(
+            16,
+            TID,
+            false,
+            false,
+            &[(8, false, "value", 8, true, false)],
+            "",
+        );
         builder.getfield_gc_i(0, 1, 8, TID, "value");
         let jitcode = builder.finish();
         let entry = jitcode
@@ -7333,7 +7396,10 @@ mod tests {
                 TID,
                 false,
                 false,
-                &[(8, false, "agg", 8, true), (8, true, "leaf", 8, false)],
+                &[
+                    (8, false, "agg", 8, true, false),
+                    (8, true, "leaf", 8, false, false),
+                ],
                 "",
             );
             builder.getfield_gc_i(0, 1, 8, TID, name);
@@ -7386,9 +7452,9 @@ mod tests {
     #[test]
     fn a_named_field_resolves_by_name_through_an_ambiguous_offset() {
         let fields = [
-            (0, false, "head", 8, false),
-            (8, false, "agg", 8, true),
-            (8, true, "leaf", 8, false),
+            (0, false, "head", 8, false, false),
+            (8, false, "agg", 8, true, false),
+            (8, true, "leaf", 8, false, false),
         ];
         assert_eq!(
             super::field_slot_in(
