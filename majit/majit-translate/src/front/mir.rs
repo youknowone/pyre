@@ -6417,8 +6417,7 @@ impl<'a> Lowering<'a> {
         // concrete ARRAY type (`op.args[0].concretetype`). Charon keeps the
         // same owner on the pre-projection Place, so preserve it before
         // consuming `inner`.
-        let value_local = matches!(inner.kind, PlaceKind::Local(_));
-        let index_spelling = tyref_to_ast_string(&inner.ty, self.llbc);
+        let (value_local, index_spelling) = index_identity_inputs(&inner, self.llbc);
         let (projection_array_type_id, projection_array_nolength) =
             fixed_array_index_identity(value_local, &index_spelling);
         let base = self.resolve_place(mir_bb, inner)?;
@@ -8354,8 +8353,7 @@ impl<'a> Lowering<'a> {
                         .string_array_view_locals
                         .iter()
                         .any(|(local, _)| place_references_local(&inner, *local));
-                    let value_local = matches!(inner.kind, PlaceKind::Local(_));
-                    let index_spelling = tyref_to_ast_string(&inner.ty, self.llbc);
+                    let (value_local, index_spelling) = index_identity_inputs(&inner, self.llbc);
                     let (mut array_type_id, mut nolength) =
                         fixed_array_index_identity(value_local, &index_spelling);
                     if string_array_view {
@@ -29693,28 +29691,83 @@ pub fn slice_array_type_id(spelling: &str) -> Option<String> {
     slice_element_spelling(normalized).map(|_| normalized.to_string())
 }
 
+/// `local[i]` versus `(*p)[i]`. A deref's type is the pointee, so the
+/// borrow spelling is the parent's (`&[T; N]`, `*const [T; N]`).
+fn index_identity_inputs(place: &Place, llbc: &Llbc) -> (bool, String) {
+    let (value_local, ty) = match &place.kind {
+        PlaceKind::Local(_) => (true, &place.ty),
+        PlaceKind::Projection(parent, ProjectionElem::Atom(name)) if name == "Deref" => {
+            (false, &parent.ty)
+        }
+        _ => (false, &place.ty),
+    };
+    (value_local, tyref_to_ast_string(ty, llbc))
+}
+
+/// Pointee spelling and whether a borrow or pointer prefix was peeled.
+fn pointee_spelling(spelling: &str) -> (&str, bool) {
+    let trimmed = spelling.trim();
+    let mut s = peel_ref_prefix(trimmed);
+    let mut borrowed = s.len() != trimmed.len();
+    loop {
+        let next = s
+            .strip_prefix("*const ")
+            .or_else(|| s.strip_prefix("*mut "))
+            .map(str::trim_start);
+        match next {
+            Some(rest) if rest != s => {
+                borrowed = true;
+                s = rest;
+            }
+            _ => return (s, borrowed),
+        }
+    }
+}
+
+/// A borrowed `[T; N]` whose `&[T]` reader is a length-prefixed GcArray,
+/// except `u8`. Every indexed `&[u8; N]` / `&mut [u8; N]` in the
+/// interpreter is a host or inline byte array (codec state, hex tables,
+/// md5 chunks, hash secrets, `smallbuf`, `Utf8LocElem::ofs`), so item 0
+/// is the first byte. No `&[i64; N]`, `&[f64; N]`, `&[str; N]`, or
+/// object-pointer fixed-array index exists; a borrow of those is the
+/// ctor value `do_fixed_newlist` allocated.
+fn borrowed_fixed_list_is_gcarray(fixed: &str) -> bool {
+    let Some((item, _)) = shaped_array_parts(fixed) else {
+        return false;
+    };
+    if item == "u8" {
+        return false;
+    }
+    let Some(id) = slice_array_type_id(&format!("&[{item}]")) else {
+        return false;
+    };
+    !crate::front::typestr::nolength_from_array_type_id(Some(id.as_str()))
+}
+
 /// Identity of an index of `type_spelling`.
 ///
-/// `value_local` is the projection shape: the indexed place is the
-/// `[T; N]` value itself (`local[i]`, including a copy or a phi of that
-/// local). A field projection (`local.field[i]`) or a pointer
-/// (`(*p)[i]`, a `&[T; N]` parameter) is not that value. Only the value
-/// uses the length-prefixed reader identity. Every other `[T; N]` place
-/// keeps its own spelling, which `nolength_from_array_type_id` treats as
-/// headerless, so item 0 stays at the pointer — the positional layout
-/// of an inline `FixedSizeArray`, not a `GcArray`.
+/// `value_local` is `local[i]` of the `[T; N]` value itself (a copy or a
+/// phi included). A field projection stays the headerless spelling: item
+/// 0 is at the pointer, the positional layout of an inline
+/// `FixedSizeArray`. A borrow (`&[T; N]`, `(*p)[i]`, `*const [T; N]`)
+/// follows the pointee: length-prefixed when [`borrowed_fixed_list_is_gcarray`]
+/// says the corpus's pointees are ctor GcArrays, headerless for `u8`.
 pub(crate) fn fixed_array_index_identity(
     value_local: bool,
     type_spelling: &str,
 ) -> (Option<String>, bool) {
-    if type_spelling.starts_with("??") || type_spelling.is_empty() {
+    let (normalized, borrowed) = pointee_spelling(type_spelling);
+    if normalized.starts_with("??") || normalized.is_empty() {
         return (None, false);
     }
-    let normalized = peel_ref_prefix(type_spelling);
-    let id = if value_local || !fixed_array_spelling(normalized) {
-        slice_array_type_id(type_spelling).unwrap_or_else(|| normalized.to_string())
+    let id = if fixed_array_spelling(normalized) {
+        if (value_local && !borrowed) || (borrowed && borrowed_fixed_list_is_gcarray(normalized)) {
+            slice_array_type_id(normalized).unwrap_or_else(|| normalized.to_string())
+        } else {
+            normalized.to_string()
+        }
     } else {
-        normalized.to_string()
+        slice_array_type_id(type_spelling).unwrap_or_else(|| normalized.to_string())
     };
     let nolength = crate::front::typestr::nolength_from_array_type_id(Some(id.as_str()));
     (Some(id), nolength)

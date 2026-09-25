@@ -13227,16 +13227,23 @@ fn handle<Sym: WalkSym>(
             write_ref_reg(ctx, op.pc, dst, resbox, concrete)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
-        // RPython `pyjitpl.py opimpl_new_array_clear` —
-        // `_opimpl_new_array(rop.NEW_ARRAY_CLEAR, lengthbox,
-        // arraydescr)` records the op and seeds the heapcache via
-        // `heapcache.new_array(resbox, lengthbox)`.  Operand layout
-        // per `bhimpl_new_array_clear @arguments("cpu","i","d",
+        // RPython `pyjitpl.py opimpl_new_array` /
+        // `opimpl_new_array_clear` — both are
+        // `_opimpl_new_array(rop.NEW_ARRAY{,_CLEAR}, lengthbox,
+        // arraydescr)`, which records that opnum and seeds
+        // `heapcache.new_array(resbox, lengthbox)`. Operand layout
+        // per `bhimpl_new_array{,_clear} @arguments("cpu","i","d",
         // returns="r")`: 1B i-reg(length) + 2B descr + 1B r-reg(dst).
         // The `cd>r` arm is the `c`-argcode form (inline signed-byte
         // length, USE_C_FORM): identical byte layout, length decoded
-        // as ConstInt.
-        "new_array_clear/id>r" | "new_array_clear/cd>r" => {
+        // as ConstInt. `new_array/cd>r` is not in the encoding table.
+        "new_array/id>r" | "new_array_clear/id>r" | "new_array_clear/cd>r" => {
+            let clear = op.key.starts_with("new_array_clear/");
+            let opcode = if clear {
+                OpCode::NewArrayClear
+            } else {
+                OpCode::NewArray
+            };
             let length = if op.key == "new_array_clear/cd>r" {
                 OpRef::ConstInt(code[op.pc + 1] as i8 as i64)
             } else {
@@ -13246,17 +13253,14 @@ fn handle<Sym: WalkSym>(
             let is_ref_array = descr
                 .as_array_descr()
                 .map_or(false, |a| a.is_array_of_pointers());
-            // pyjitpl.py:631-637 `_opimpl_new_array`.
+            // pyjitpl.py `_opimpl_new_array`.
             ctx.trace_ctx
                 .profiler()
-                .count_ops(OpCode::NewArrayClear, majit_metainterp::counters::OPS);
-            ctx.trace_ctx.profiler().count_ops(
-                OpCode::NewArrayClear,
-                majit_metainterp::counters::RECORDED_OPS,
-            );
-            let resbox =
-                ctx.trace_ctx
-                    .record_op_with_descr(OpCode::NewArrayClear, &[length], descr);
+                .count_ops(opcode, majit_metainterp::counters::OPS);
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(opcode, majit_metainterp::counters::RECORDED_OPS);
+            let resbox = ctx.trace_ctx.record_op_with_descr(opcode, &[length], descr);
             // heapcache.py `new_array(box, lengthbox)` adds
             // the virtual/unescaped flags only when `lengthbox` is a
             // Const ("only constant-length arrays are virtuals").
