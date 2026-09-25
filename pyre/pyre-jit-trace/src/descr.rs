@@ -6589,8 +6589,8 @@ mod tests {
     #[test]
     fn pycode_field_descrs_share_parent_and_preserve_specs() {
         // The `always_pure` column is `pycode.py _immutable_fields_`:
-        // only `co_firstlineno` is listed there, so only its descr answers
-        // `is_always_pure()`. Stating it per field rather than asserting a
+        // `co_code` (the body `code_ptr` points at) and `co_firstlineno` are
+        // listed there, so only their descrs answer `is_always_pure()`. Stating it per field rather than asserting a
         // blanket "nothing is pure" keeps the test able to fail when a field's
         // immutability moves in either direction.
         let expected = [
@@ -6602,7 +6602,7 @@ mod tests {
                 Type::Int,
                 false,
                 0,
-                false,
+                true,
             ),
             (
                 pycode_co_firstlineno_descr(),

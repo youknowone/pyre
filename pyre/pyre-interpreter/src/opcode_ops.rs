@@ -1491,6 +1491,7 @@ mod tests {
 
     #[test]
     fn test_binary_value_reuses_objspace_dispatch() {
+        crate::test_hooks::install_hash_hook();
         let result = binary_value(w_int_new(8), w_int_new(3), BinaryOperator::Subtract)
             .expect("binary dispatch should succeed");
         unsafe {

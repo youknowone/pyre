@@ -6015,19 +6015,40 @@ mod tests {
         );
     }
 
+    /// Two macro helpers sharing one leaf name under different modules.
+    mod ambiguous_leaf_a {
+        #[majit_macros::dont_look_inside]
+        pub fn ambiguous_leaf_fixture(x: i64) -> i64 {
+            x + 1
+        }
+    }
+
+    mod ambiguous_leaf_b {
+        #[majit_macros::dont_look_inside]
+        pub fn ambiguous_leaf_fixture(x: i64) -> i64 {
+            x + 2
+        }
+    }
+
     #[test]
     fn merge_macro_helper_fnaddrs_omits_ambiguous_crate_leaf_alias() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        assert_eq!(ambiguous_leaf_a::ambiguous_leaf_fixture(0), 1);
+        assert_eq!(ambiguous_leaf_b::ambiguous_leaf_fixture(0), 2);
         assert!(
-            bindings.contains_key("pyre_interpreter::call::register_frame_locals_slot"),
-            "call::register_frame_locals_slot must be registered"
+            bindings.contains_key(
+                "pyre_interpreter::jit_fnaddr::tests::ambiguous_leaf_a::ambiguous_leaf_fixture"
+            ),
+            "ambiguous_leaf_a::ambiguous_leaf_fixture must be registered"
         );
         assert!(
-            bindings.contains_key("pyre_interpreter::pyframe::register_frame_locals_slot"),
-            "pyframe::register_frame_locals_slot must be registered"
+            bindings.contains_key(
+                "pyre_interpreter::jit_fnaddr::tests::ambiguous_leaf_b::ambiguous_leaf_fixture"
+            ),
+            "ambiguous_leaf_b::ambiguous_leaf_fixture must be registered"
         );
         assert!(
-            !bindings.contains_key("pyre_interpreter::register_frame_locals_slot"),
+            !bindings.contains_key("pyre_interpreter::ambiguous_leaf_fixture"),
             "short alias shared by two full paths must not be emitted"
         );
     }
