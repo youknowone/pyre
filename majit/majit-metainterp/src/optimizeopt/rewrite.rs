@@ -2246,7 +2246,9 @@ impl Optimization for OptRewrite {
                         let cached_result = match entry {
                             LoopInvariantEntry::Preamble(ref pop) => {
                                 // unroll.py: force_op_from_preamble(preamble_op)
-                                let forced = ctx.force_op_from_preamble_op(pop);
+                                let Some(forced) = ctx.force_op_from_preamble_op(pop) else {
+                                    return OptimizationResult::PassOn;
+                                };
                                 self.loop_invariant_results
                                     .insert(func_val, LoopInvariantEntry::Direct(forced));
                                 forced

@@ -226,7 +226,9 @@ impl RecentPureOps {
                 PureRingValue::Preamble { pop, forced: None } => (key.opcode, pop.clone()),
             }
         };
-        let forced = ctx.force_op_from_preamble_op(&pop);
+        let Some(forced) = ctx.force_op_from_preamble_op(&pop) else {
+            return None;
+        };
         if let Some((_, value)) = self.lst[index].as_mut() {
             *value = PureRingValue::Direct(forced);
         }
@@ -1232,7 +1234,9 @@ impl Optimization for OptPure {
             }
             if let Some((i, pop)) = matched {
                 let entry_result = if let Some(pop) = pop {
-                    let forced = ctx.force_op_from_preamble_op(&pop);
+                    let Some(forced) = ctx.force_op_from_preamble_op(&pop) else {
+                        return OptimizationResult::PassOn;
+                    };
                     let key = match &self.extra_call_pure[i] {
                         ExtraCallPureEntry::Preamble { key, .. } => key.clone(),
                         _ => unreachable!("matched index must still hold the Preamble entry"),
