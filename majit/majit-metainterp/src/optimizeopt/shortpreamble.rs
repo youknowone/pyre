@@ -2314,6 +2314,20 @@ impl ShortPreambleBuilder {
         self.produced_short_boxes.get(res).cloned()
     }
 
+    /// shortpreamble.py `ShortBoxes.produce_arg`, first arm:
+    /// `if op in self.produced_short_boxes: return
+    /// self.produced_short_boxes[op].preamble_op` — the dependency's replay
+    /// op itself, so a replay op built against `arg` reads its dependency the
+    /// way `use_box` walks it.
+    pub fn produced_arg(
+        &self,
+        arg: &majit_ir::operand::Operand,
+    ) -> Option<majit_ir::operand::Operand> {
+        self.produced_short_boxes
+            .get(arg)
+            .map(|dep| majit_ir::operand::Operand::from_bound_op(&dep.preamble_op))
+    }
+
     /// shortpreamble.py: add_preamble_op(preamble_op)
     /// Called from optimizer.force_box when popping from potential_extra_ops.
     ///
