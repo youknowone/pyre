@@ -93,6 +93,9 @@ pub(crate) struct ClosureSelectSite {
     /// True when the BUILT result is a niche `Option` — `Some(x)` is then `x`
     /// itself and `None` is null, the produce-side mirror of `niche`.
     pub result_niche: bool,
+    /// The built niche is `Option<fn>`. `None` is `null_fn` (int bank),
+    /// not `null_mut` (ref bank). Set from `tyref_option_payload_is_fn_ptr`.
+    pub result_fn_ptr: bool,
     /// `None` tag when the built result is `Option<E>` over a densely
     /// numbered fieldless enum.  `Some(e)` is the scalar `e` itself.
     pub result_fieldless_none_tag: Option<i64>,
@@ -376,11 +379,12 @@ fn rewire_one_closure_select_site(
             // A niche `Option` is a one-word pointer with no aggregate
             // `__discriminant` / `__pos_0`: `None` is null.
             if site.result_niche {
-                (
-                    graph.push_null_mut_ptr(else_bb),
-                    else_bb,
-                    else_inputs.clone(),
-                )
+                let null = if site.result_fn_ptr {
+                    graph.push_null_fn_ptr(else_bb)
+                } else {
+                    graph.push_null_mut_ptr(else_bb)
+                };
+                (null, else_bb, else_inputs.clone())
             } else if let Some(none_tag) = site.result_fieldless_none_tag {
                 (
                     graph
@@ -716,6 +720,7 @@ mod tests {
             result_option_owner: RESULT_OPTION.into(),
             result_some_owner: RESULT_SOME.into(),
             result_niche,
+            result_fn_ptr: false,
             result_fieldless_none_tag: None,
             call_once_result_exc: None,
         }

@@ -43,6 +43,10 @@ pub(crate) struct IsNoneSite {
     /// container projected to an RPython string/list repr. The null operand
     /// must enter that same repr before comparison.
     pub niche_null_cast: Option<(String, ValueType)>,
+    /// `Option<fn>`: the null arm is `core.ptr.null_fn` (`ValueType::Int`),
+    /// the same bank as the function pointer. `null_mut` is a GC ref and
+    /// would emit `is_` on mixed `ir` operands.
+    pub fn_ptr: bool,
 }
 
 /// Rewrite every recorded `is_none`/`is_some` call into the discriminant
@@ -90,12 +94,17 @@ fn rewire_one_is_none_site(graph: &mut FunctionGraph, site: &IsNoneSite) -> Resu
     // Structural validation passed; mutate the graph.
     let new_ops = if site.niche {
         let null = graph.alloc_value_var();
+        let (null_path, null_ty) = if site.fn_ptr {
+            (["core", "ptr", "null_fn"], ValueType::Int)
+        } else {
+            (["core", "ptr", "null_mut"], ValueType::Ref(None))
+        };
         let mut ops = vec![SpaceOperation {
             result: Some(null.clone()),
             kind: OpKind::Call {
-                target: CallTarget::function_path(["core", "ptr", "null_mut"]),
+                target: CallTarget::function_path(null_path),
                 args: crate::model::call_args(vec![]),
-                result_ty: ValueType::Ref(None),
+                result_ty: null_ty,
             },
         }];
         let rhs = if let Some((root, result_ty)) = &site.niche_null_cast {
@@ -201,6 +210,7 @@ mod tests {
             is_some,
             niche: false,
             niche_null_cast: None,
+            fn_ptr: false,
         }
     }
 
@@ -305,6 +315,7 @@ mod tests {
                 is_some: true,
                 niche: true,
                 niche_null_cast: None,
+                fn_ptr: false,
             }],
         );
         assert_eq!(rewritten, 1);

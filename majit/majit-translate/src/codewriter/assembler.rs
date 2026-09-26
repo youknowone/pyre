@@ -4955,6 +4955,10 @@ fn op_kind_to_opname_with_kinds(kind: &crate::model::OpKind, operand_kinds: &str
             ("eq", "rr") => return "ptr_eq".into(),
             ("ne", "rr") => return "ptr_ne".into(),
             ("is_", "rr") => return "ptr_eq".into(),
+            // `jtransform.py` `rewrite_op_ptr_eq` / `_rewrite_nongc_ptrs`:
+            // equality of non-GC pointers (`Ptr(FuncType)`, both in the int
+            // bank) is `int_eq`. A mixed `ri`/`ir` shape is a kind-flow gap.
+            ("is_", "ii") => return "int_eq".into(),
             _ => {}
         }
     }
@@ -8149,6 +8153,104 @@ mod tests {
         assert!(
             !asm.insns.keys().any(|key| key.starts_with("input_")),
             "unexpected input opcode keys: {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// `Option<fn>` is-none is `int_eq` of two int-bank addresses
+    /// (`jtransform.py` `rewrite_op_ptr_eq` / `_rewrite_nongc_ptrs`).
+    /// The null arm is `null_fn` (`ValueType::Int`), same bank as the
+    /// function pointer, so the compare is `ii`, never `int_is_/ri`.
+    #[test]
+    fn option_fn_is_none_lowers_to_int_eq() {
+        use crate::flatten::flatten_graph;
+        use crate::front::option_is_none::{IsNoneSite, rewire_is_none_call_sites};
+        use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
+
+        let mut graph = FunctionGraph::new("option_fn_is_none");
+        let opt = push_input_var(&mut graph, "opt", ValueType::Int);
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::method("is_none", Some("core::option::Option".into())),
+                    args: crate::model::call_args(vec![opt.clone()]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result.clone()));
+        let rewritten = rewire_is_none_call_sites(
+            &mut graph,
+            &[IsNoneSite {
+                result_var: result.clone(),
+                option_owner: "core::option::Option".into(),
+                is_some: false,
+                niche: true,
+                niche_null_cast: None,
+                fn_ptr: true,
+            }],
+        );
+        assert_eq!(rewritten, 1);
+
+        let null = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find_map(|op| match &op.kind {
+                OpKind::Call {
+                    target,
+                    result_ty,
+                    args,
+                    ..
+                } if target.to_string() == "core::ptr::null_fn"
+                    && args.is_empty()
+                    && *result_ty == ValueType::Int =>
+                {
+                    op.result.clone()
+                }
+                _ => None,
+            })
+            .expect("null_fn Int");
+        let is_none = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find(|op| op.result.as_ref() == Some(&result))
+            .expect("is_none producer");
+        match &is_none.kind {
+            OpKind::BinOp {
+                op,
+                lhs,
+                rhs,
+                result_ty,
+            } => {
+                assert_eq!(op, "is_");
+                assert_eq!(lhs, &opt);
+                assert_eq!(rhs, &null);
+                assert_eq!(*result_ty, ValueType::Int);
+            }
+            other => panic!("is_none is not is_ on two ints: {other:?}"),
+        }
+
+        FunctionGraph::set_concretetype_of_inline(&opt, crate::model::ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&null, crate::model::ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&result, crate::model::ConcreteType::Signed);
+
+        regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = regalloc::perform_all_register_allocations(&graph);
+        let mut flat = flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
+        assert!(
+            asm.insns.contains_key("int_eq/ii>i"),
+            "Option<fn> is-none must be int_eq on two ints, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !asm.insns.keys().any(|key| key.contains("int_is_")),
+            "Option<fn> is-none must not emit int_is_, got {:?}",
             asm.insns.keys().collect::<Vec<_>>()
         );
     }
