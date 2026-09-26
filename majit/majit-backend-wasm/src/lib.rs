@@ -57,7 +57,7 @@ use indexmap::IndexMap;
 use parking_lot::Mutex;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 /// Diagnostic-only `compile_bridge` outcome tallies, read out via the
@@ -109,8 +109,9 @@ use std::sync::{Arc, Weak};
 /// re-bridged after its first bridge was outgrown); a count that tracks
 /// `BRIDGE_OK` says the epilogue dispatch is not taking the cell at all and
 /// every bridge after the first is dead weight.
-/// 30 = a host-armed loop re-emission was attempted but failed;
-/// 31 = it succeeded and the rebuilt module is installed in the loop's
+/// 30 = a re-emitted module was rejected by the host, or there is no host
+/// replacement binding (`classify_inline_install_error`);
+/// 31 = re-emission succeeded and the rebuilt module is installed in the loop's
 /// original table slot. 31 is the only positive evidence that a re-emission
 /// ran at all: a re-emission that silently never fires is indistinguishable
 /// from one that fires and changes nothing.
@@ -118,8 +119,8 @@ use std::sync::{Arc, Weak};
 /// because the source guard belongs to an already chained trace; 34 = the
 /// bridge is not loop-closing; 35 = the owner has no retained module inputs;
 /// 36 = that guard already owns a region; 37 = the merged stream exceeds the
-/// owner's frozen frame geometry; 38 = the bridge does not resume at the loop
-/// header; 39 = the merged stream has no local loop LABEL for the wasm back
+/// owner's frozen frame geometry; 38 = unused since the non-header gate was
+/// removed; 39 = the merged stream has no local loop LABEL for the wasm back
 /// edge. 40-43 split a rejected inline trial into value-layout,
 /// Ref-home-layout, missing-local-label, and other backend errors. 44 = a
 /// bridge compiled with a parameter entry; 45 = parameter entry declined
@@ -127,8 +128,8 @@ use std::sync::{Arc, Weak};
 /// cannot name the source guard's fail arguments — a parameter entry whose
 /// arity disagrees with the guard's live count, or a frame entry whose
 /// positional slots are not where that guard spilled them (the two arms are
-/// mutually exclusive: `bridge_params_enabled` selects one for the whole
-/// process); 47 =
+/// mutually exclusive: `bridge_param_dispatch_for` selects one for the
+/// module from its guard count); 47 =
 /// LABEL publication suppressed because the bridge entry has nonzero parameters.
 /// 48 = an inline trial's LABEL-resume storage exceeds the frozen frame; 49 =
 /// the region carries a CALL_ASSEMBLER the owner build emits no arm for; 50 =
@@ -393,13 +394,6 @@ fn classify_inline_install_error(error: &BackendError) {
     }
 }
 
-static REEMIT_ENABLED: AtomicBool = AtomicBool::new(false);
-
-static INLINE_BRIDGE_ENABLED: AtomicBool = AtomicBool::new(true);
-/// On: non-header regions are placed outside the header `loop`, so they
-/// do not tax the fall-through path. See `inline_nonheader_enable`.
-static INLINE_NONHEADER_ENABLED: AtomicBool = AtomicBool::new(true);
-static BRIDGE_PARAMS_ENABLED: AtomicBool = AtomicBool::new(true);
 /// Above this many exits, duplicating a parameter bridge arm at every guard is
 /// larger and slower to compile than the shared frame-entry epilogue.
 ///
@@ -413,13 +407,6 @@ static BRIDGE_PARAMS_ENABLED: AtomicBool = AtomicBool::new(true);
 /// arm for ordinary traces and use the one shared frame dispatch once that
 /// replication is no longer bounded.
 const MAX_BRIDGE_PARAM_GUARDS: usize = 256;
-/// Entries a merge must earn per byte of the module it re-emits. See
-/// `inline_trip_threshold_for`. Zero leaves `INLINE_TRIP_THRESHOLD` as the
-/// whole rule.
-static INLINE_TRIP_BYTES_FACTOR: AtomicU64 = AtomicU64::new(DEFAULT_INLINE_TRIP_BYTES_FACTOR);
-/// Owner size at which the eager merge arm stops merging. See
-/// `DEFAULT_INLINE_EAGER_MAX_BYTES`.
-static INLINE_EAGER_MAX_BYTES: AtomicU32 = AtomicU32::new(DEFAULT_INLINE_EAGER_MAX_BYTES);
 static TRACE_ENTRY_CENSUS_FORCED: AtomicBool = AtomicBool::new(false);
 
 /// One compiled trace's guest-memory entry counters.  The generated module
@@ -514,67 +501,6 @@ pub fn trace_entry_census_summary() -> String {
     report
 }
 
-/// Arm loop-module replacement from the host before guest execution starts.
-pub fn reemit_enable() {
-    REEMIT_ENABLED.store(true, Ordering::Relaxed);
-}
-
-fn reemit_enabled() -> bool {
-    REEMIT_ENABLED.load(Ordering::Relaxed)
-}
-
-/// Disable loop-closing bridge inlining from the host before guest execution
-/// starts. A bridge that closes back onto its owner's loop is merged into the
-/// owner's module by default, so the guard reaching it becomes a branch inside
-/// one module instead of a call out to another; this carries the host's
-/// explicit opt-out into the backend.
-pub fn inline_bridge_disable() {
-    INLINE_BRIDGE_ENABLED.store(false, Ordering::Relaxed);
-}
-
-fn inline_bridge_enabled() -> bool {
-    INLINE_BRIDGE_ENABLED.load(Ordering::Relaxed)
-}
-
-/// Admit a region whose closing JUMP names a resumable LABEL that is not the
-/// loop header AND whose guard sits inside the loop body. Both halves of that
-/// class re-enter the same way — `codegen` wraps the entry dispatch in a `loop`
-/// the region branches back into, landing past the named label's resume loader
-/// with the values already in locals — but they are placed differently and they
-/// measure differently, so only this half is behind the flag.
-///
-/// A region attached to a PREAMBLE guard is admitted unconditionally: the
-/// `loop` holding the body regions' blocks has not been entered there, so
-/// `build_function` opens its blocks outside that loop and emits its body past
-/// the loop's `end`. On `str_getitem_len_hot`, whose bytes and bytearray legs
-/// fail a peeled-preamble GuardClass on every iteration, that removes 72.0M of
-/// 120.0M cross-module crossings and takes exec from 0.985s to 0.716s — 0.73x,
-/// min of 15 interleaved runs with each arm's startup floor subtracted.
-/// `spectral_norm` measures 0.95x and `fannkuch` 0.98x on the same change.
-///
-/// Loop-body non-header regions are placed outside the header `loop` (the
-/// same placement as preamble regions), so they do not tax the fall-through
-/// path. On by default; [`inline_nonheader_disable`] opts out.
-pub fn inline_nonheader_enable() {
-    INLINE_NONHEADER_ENABLED.store(true, Ordering::Relaxed);
-}
-
-/// Restore the pre-default policy: only preamble non-header regions merge.
-pub fn inline_nonheader_disable() {
-    INLINE_NONHEADER_ENABLED.store(false, Ordering::Relaxed);
-}
-
-fn inline_nonheader_enabled() -> bool {
-    INLINE_NONHEADER_ENABLED.load(Ordering::Relaxed)
-}
-
-/// Set the per-byte entry price a deferred merge must earn, from the host
-/// before guest execution, in place of [`DEFAULT_INLINE_TRIP_BYTES_FACTOR`].
-/// Zero leaves [`INLINE_TRIP_THRESHOLD`] as the whole rule.
-pub fn set_inline_trip_bytes_factor(entries_per_byte: u64) {
-    INLINE_TRIP_BYTES_FACTOR.store(entries_per_byte, Ordering::Relaxed);
-}
-
 /// The wasm loop `token` was last compiled as, when it has one. Both merge
 /// arms price themselves off its `module_bytes`.
 fn compiled_wasm_loop(token: &JitCellToken) -> Option<&CompiledWasmLoop> {
@@ -582,12 +508,6 @@ fn compiled_wasm_loop(token: &JitCellToken) -> Option<&CompiledWasmLoop> {
         .compiled
         .get()
         .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
-}
-
-/// Set the owner size above which eager merging becomes deferred, from the host
-/// before guest execution, in place of [`DEFAULT_INLINE_EAGER_MAX_BYTES`].
-pub fn set_inline_eager_max_bytes(max_bytes: u32) {
-    INLINE_EAGER_MAX_BYTES.store(max_bytes, Ordering::Relaxed);
 }
 
 /// Deferred merges waiting on their entry trip.
@@ -601,9 +521,9 @@ pub fn pending_inline_count() -> usize {
 /// A merge re-emits the whole owner, so its cost scales with the owner's size
 /// rather than the region's: cranelift charges about 0.65 ms per KB of module,
 /// while a cross-module crossing the merge removes is about 2.5 ns. Those two
-/// rates are what [`INLINE_TRIP_BYTES_FACTOR`] converts between; a bridge's
-/// entry count is a floor on the crossings removed, so the price is a floor
-/// too.
+/// rates are what [`DEFAULT_INLINE_TRIP_BYTES_FACTOR`] converts between; a
+/// bridge's entry count is a floor on the crossings removed, so the price is
+/// a floor too.
 ///
 /// [`INLINE_TRIP_THRESHOLD`] stays as the lower bound, because a fixture whose
 /// entire crossing budget is under a millisecond cannot pay back any rebuild.
@@ -612,35 +532,16 @@ pub fn pending_inline_count() -> usize {
 /// price only postpones a merge that is taken anyway, and every crossing in
 /// that window is paid for nothing. The default sits below that band.
 fn inline_trip_threshold_for(owner_module_bytes: u32) -> u64 {
-    let priced = INLINE_TRIP_BYTES_FACTOR
-        .load(Ordering::Relaxed)
-        .saturating_mul(owner_module_bytes as u64);
+    let priced = DEFAULT_INLINE_TRIP_BYTES_FACTOR.saturating_mul(owner_module_bytes as u64);
     priced.max(INLINE_TRIP_THRESHOLD)
 }
 
-/// Disable guard-to-bridge value parameters from the host before guest
-/// execution. By default, a generated guard keeps the ordinary frame recovery
-/// state for the uncompiled case, then passes its live failure values directly
-/// once a bridge table slot is present.
-pub fn bridge_params_disable() {
-    BRIDGE_PARAMS_ENABLED.store(false, Ordering::Relaxed);
-}
-
-/// Restore the default after [`bridge_params_disable`].
-pub fn bridge_params_enable() {
-    BRIDGE_PARAMS_ENABLED.store(true, Ordering::Relaxed);
-}
-
-fn bridge_params_enabled() -> bool {
-    BRIDGE_PARAMS_ENABLED.load(Ordering::Relaxed)
-}
-
-fn bridge_param_dispatch_profitable(enabled: bool, guard_count: usize) -> bool {
-    enabled && guard_count <= MAX_BRIDGE_PARAM_GUARDS
+fn bridge_param_dispatch_profitable(guard_count: usize) -> bool {
+    guard_count <= MAX_BRIDGE_PARAM_GUARDS
 }
 
 fn bridge_param_dispatch_for(guard_count: usize) -> bool {
-    bridge_param_dispatch_profitable(bridge_params_enabled(), guard_count)
+    bridge_param_dispatch_profitable(guard_count)
 }
 
 /// Read a `BRIDGE_DIAG` tally (saturating index). Surfaced to the host through
@@ -3864,13 +3765,6 @@ impl WasmBackend {
                     diag_bump(36);
                     continue;
                 }
-                if region.external_jump.is_none()
-                    && region.outside_loop
-                    && !inline_nonheader_enabled()
-                {
-                    still.push((region, remap));
-                    continue;
-                }
                 region.outside_loop = region.outside_loop
                     || codegen::source_guard_precedes_loop_label(&candidate.ops, source_fail_index)
                     || candidate.inlined_bridges.iter().any(|r| r.outside_loop);
@@ -4024,9 +3918,7 @@ impl WasmBackend {
             .map(|region| codegen::guard_exit_count(&region.inputargs, &region.ops))
             .collect();
         let merged_guard_count = own_guard_count + region_guard_counts.iter().sum::<usize>();
-        if inputs.bridge_param_dispatch
-            && !bridge_param_dispatch_profitable(true, merged_guard_count)
-        {
+        if inputs.bridge_param_dispatch && !bridge_param_dispatch_profitable(merged_guard_count) {
             // compile_bridge has already published functions with the source
             // guards' parameter ABI. Flipping this flag would call those
             // functions with the frame-only type and trap. Retain the existing
@@ -5430,13 +5322,9 @@ impl majit_backend::Backend for WasmBackend {
             // Retaining the snapshot costs long-lived heap for the token's
             // whole lifetime, which moves when the collector next runs and so
             // moves which iteration a back edge's eval-breaker guard bails on.
-            // Keep it only when a re-emission can actually consume it, so a run
-            // with the switches off allocates exactly what it did before.
-            reemit: std::cell::RefCell::new(
-                (entry_bridge_target.is_none() && (reemit_enabled() || inline_bridge_enabled()))
-                    .then_some(module_inputs),
-            ),
-            reemitted: std::cell::Cell::new(false),
+            // Keep it only for a loop a merge can rebuild. An entry bridge
+            // tail-calls another loop and stores none.
+            reemit: std::cell::RefCell::new(entry_bridge_target.is_none().then_some(module_inputs)),
             bridge_owned_label_targets: std::cell::RefCell::new(Vec::new()),
             ca_active: std::cell::Cell::new(false),
             ca_terminal_declined: std::cell::Cell::new(false),
@@ -5949,7 +5837,7 @@ impl majit_backend::Backend for WasmBackend {
         // Set by the inline block below to the owner of a merge candidate whose
         // merge waits on `INLINE_TRIP_THRESHOLD` entries into this bridge.
         let mut defer_inline: Option<(Arc<JitCellToken>, u32, bool, Option<(u64, u32)>)> = None;
-        if inline_bridge_enabled() {
+        {
             // `model.py`: a bridge compiled after `invalidate_loop`
             // starts valid, and only a later invalidation activates its
             // GUARD_NOT_INVALIDATED (`runner_test.py test_guard_not_invalidated`
@@ -6007,9 +5895,6 @@ impl majit_backend::Backend for WasmBackend {
                 // 0, so this stays a permanent out-of-line decline.
                 if inline_trip_helper_slot() != 0
                     && bridge_is_loop_closing
-                    && (resumes_at_loop_header
-                        || inline_nonheader_enabled()
-                        || region_external.is_some())
                     && let Some(owner) = original_token
                         .compiled_loop_token()
                         .and_then(|clt| clt.upgrade_loop_token())
@@ -6059,17 +5944,6 @@ impl majit_backend::Backend for WasmBackend {
                 } else if !codegen::merged_stream_has_loop_label(&candidate) {
                     diag_bump(39);
                     decline("no_loop_label");
-                } else if region_external.is_none()
-                    && !resumes_at_loop_header
-                    && !source_in_preamble
-                    && !inline_nonheader_enabled()
-                {
-                    // Resuming at the header lets a region inside the `loop`
-                    // `br` straight to it. Resuming at an earlier LABEL is
-                    // placed outside the header loop (no fall-through tax)
-                    // and is on by default.
-                    diag_bump(38);
-                    decline("not_header");
                 } else if inline_trip_helper_slot() == 0 {
                     // Nothing to defer to: without the callback published the
                     // count could never be acted on, so the bridge stays out of
@@ -6126,8 +6000,7 @@ impl majit_backend::Backend for WasmBackend {
                         || outside_loop
                         || region_external.is_some()
                         || compiled_wasm_loop(&owner).is_some_and(|loop_| {
-                            loop_.module_bytes.get()
-                                > INLINE_EAGER_MAX_BYTES.load(Ordering::Relaxed)
+                            loop_.module_bytes.get() > DEFAULT_INLINE_EAGER_MAX_BYTES
                         })
                     {
                         // compile.py::record_loop_or_bridge registers quasi-
@@ -6541,23 +6414,6 @@ impl majit_backend::Backend for WasmBackend {
         // block of its own.
         let block = self.asm_memory_stats.record_block(code_size, code_size);
         self.asm_memory_blocks.borrow_mut().push(block);
-
-        // The first bridge installation is the identity re-emission probe.
-        // A failed probe leaves the old module installed and must not disrupt
-        // the bridge that just became reachable.
-        if is_direct && reemit_enabled() {
-            let should_reemit = original_token
-                .compiled
-                .get()
-                .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
-                .is_some_and(|loop_| !loop_.reemitted.replace(true));
-            if should_reemit {
-                match self.reemit_loop(original_token) {
-                    Ok(()) => diag_bump(31),
-                    Err(_) => diag_bump(30),
-                }
-            }
-        }
 
         Ok(AsmInfo {
             code_addr: 0,
@@ -7375,15 +7231,10 @@ mod tests {
     #[test]
     fn parameter_bridge_dispatch_is_bounded_by_guard_population() {
         let _compile_guard = failguard::lock_cpu();
-        assert!(bridge_param_dispatch_profitable(
-            true,
-            MAX_BRIDGE_PARAM_GUARDS
-        ));
+        assert!(bridge_param_dispatch_profitable(MAX_BRIDGE_PARAM_GUARDS));
         assert!(!bridge_param_dispatch_profitable(
-            true,
             MAX_BRIDGE_PARAM_GUARDS + 1
         ));
-        assert!(!bridge_param_dispatch_profitable(false, 1));
     }
 
     #[test]

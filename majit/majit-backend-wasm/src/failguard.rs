@@ -1492,8 +1492,6 @@ pub struct CompiledWasmLoop {
     /// Post-intern module inputs retained for a loop re-emission. Entry
     /// bridges store `None` because they tail-call another loop.
     pub reemit: RefCell<Option<crate::codegen::ModuleBuildInputs>>,
-    /// The environment-gated identity re-emission runs once per token.
-    pub reemitted: Cell<bool>,
     /// Label descrs this loop published. `Drop` retracts a row that still
     /// names this loop's table slot (`TargetToken._ll_loop_code` cleared
     /// when the assembled code is freed).
