@@ -493,7 +493,6 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
         ("std.ptr", "null", rtype_ptr_null),
         // Null `Option<fn>` — `SomePtr(FuncType)`, `lltype.nullptr`.
         ("core.ptr", "null_fn", rtype_null_fn),
-        ("std.ptr", "null_fn", rtype_null_fn),
         // `core.ptr` shares the `std.ptr` attr instance (model.rs), so
         // one entry covers both spellings.
         ("std.ptr", "eq", rtype_ptr_eq),

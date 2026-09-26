@@ -1,3 +1,10 @@
+# CPython-suite gap: test_email reaches this only through
+# `email._header_value_parser`, and crashed there; no suite test drives
+# `str.find` / `count` with int bounds in a loop hot enough to compile.
+#
+# parity-tests reason: the bounds reach the elidable search as machine ints.
+# A boxed bound read back as an object crashes once the JIT makes it virtual.
+#
 # Virtual int bounds on str.find / rfind / count must reach the search as
 # machine ints. A pointer cast of the boxed bound crashes the residual.
 
