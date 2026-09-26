@@ -1128,10 +1128,37 @@ def _first_stderr_line(stderr):
     if not lines:
         return ""
     reason = lines[0][:160]
-    banner = "Traceback (most recent call last):"
-    if len(lines) > 1 and any(line.startswith(banner) for line in lines):
-        reason += f" | {lines[-1][:400]}"
+    exception = _traceback_exception_line((stderr or "").splitlines())
+    if exception:
+        reason += f" | {exception[:400]}"
     return f"  {reason}"
+
+
+def _traceback_exception_line(raw):
+    """The line naming the exception in the last traceback `raw` holds.
+
+    A traceback's frames are indented and the line naming the exception is not,
+    so the block ends at the first unindented line after the banner. The
+    stderr's final line is not that line whenever anything writes after the
+    interpreter unwinds, and something does: the trace logger flushes its
+    `=== JIT Statistics ===` summary at exit, whose last line is
+    `Compilation time: <n>ms`. A fixture that died on `ValueError` then reported
+    that timing as its reason, which names nothing -- the crash of
+    `synth/exception_reused_object_tb_not_doubled` on linux/x86 dynasm reached CI
+    as `Traceback (most recent call last): | Compilation time: 1.4ms`.
+
+    Chained reports repeat the banner and separate the blocks with their own
+    unindented line, so the scan starts at the LAST banner: that block ends with
+    the exception the process actually died on.
+    """
+    banner = "Traceback (most recent call last):"
+    starts = [i for i, line in enumerate(raw) if line.strip().startswith(banner)]
+    if not starts:
+        return ""
+    for line in raw[starts[-1] + 1:]:
+        if line.strip() and not line[0].isspace():
+            return line.strip()
+    return ""
 
 
 # Width of the panic MESSAGE kept next to the `panicked at file:line:col:`
