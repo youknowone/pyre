@@ -1345,12 +1345,13 @@ fn rehydrated_call_descr_ref(bh: majit_jitcode::jitcode::BhCallDescr) -> majit_i
 /// `GcLLDescr_framework.init_size_descr` asks `TypeLayoutBuilder.get_type_id`
 /// for those ids during translation, against Size objects already in
 /// `GcCache`. pyre cannot embed the collector ids in the executable.
-/// `init_jit_hooks` publishes Size and Array before user code when the JIT
-/// is on; `PYRE_JIT=0` never calls this. The Size wire record already
-/// carries `all_fielddescrs` (`descr.py get_size_descr`), so Field slots
-/// stay on the first `get_descr_by_index`. `set_type_registry_close_hook`
-/// runs this before `freeze_types`, so the registry is still open when the
-/// tids are registered. CallDescr restoration stays on the first slot lookup.
+/// `init_jit_hooks` publishes every kind-0 slot before user code when the
+/// JIT is on; `PYRE_JIT=0` never calls this. Leaving Field slots until the
+/// first trace makes `frame_chain` allocate about 1.8 TiB (Windows exit
+/// 3221226505). Field minting publishes the parent Size `init_size_descr`
+/// reads. `set_type_registry_close_hook` runs this before `freeze_types`,
+/// so the registry is still open when the tids are registered. CallDescr
+/// restoration stays on the first slot lookup.
 pub fn materialize_gccache_owned_descrs() {
     static ONCE: Once = Once::new();
     ONCE.call_once(decode_kind0_descrs_off_caller_stack);
@@ -1390,12 +1391,6 @@ fn decode_kind0_descrs() {
     let mut last_layout: Option<(usize, std::sync::Arc<majit_jitcode::jitcode::BhSizeSpec>)> = None;
     for (i, kind) in index.kinds.iter().copied().enumerate() {
         if kind != 0 {
-            continue;
-        }
-        // A parent layout marks a Field. `init_size_descr` only needs the
-        // Size (and Array) descr; the parent's `all_fielddescrs` is inside
-        // that record.
-        if index.parent_layouts[i] != u32::MAX {
             continue;
         }
         let bh = load_descr_with_parent(i, |layout| match &last_layout {
