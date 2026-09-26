@@ -15609,6 +15609,7 @@ mod tests {
             receiver_root: Some("Unrelated".to_string()),
             resolved_path: None,
             fun_decl_id: None,
+            branch_payloads: None,
         };
         assert!(!is_jit_force_virtualizable_target(&method));
         assert!(is_jit_force_virtualizable_target(

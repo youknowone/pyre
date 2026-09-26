@@ -541,6 +541,7 @@ mod tests {
                     receiver_root: None,
                     resolved_path: None,
                     fun_decl_id: None,
+                    branch_payloads: None,
                 },
                 args: call_args(vec![zst.clone(), tag.clone()]),
                 result_ty: ValueType::Void,

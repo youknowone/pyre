@@ -8307,36 +8307,43 @@ fn retarget_vec_operand(
     if reaches_declared_vable_array(graph, vec_var) {
         return vec_var.clone();
     }
-    let inline = graph.blocks.iter().any(|block| {
-        block.operations.iter().any(|op| {
-            op.result.as_ref() == Some(vec_var)
-                && matches!(
-                    &op.kind,
-                    OpKind::FieldRead { field, .. }
-                        if field.inline_vec && field.vec_part.is_none()
-                )
+    // One inline field read can feed both `.len()` and an index. Mutating
+    // that shared read into the first component makes the second use load a
+    // Vec word from the component. Keep the field read and emit a distinct
+    // component read for this use.
+    let inline_field = graph.blocks.iter().find_map(|block| {
+        block.operations.iter().find_map(|op| {
+            if op.result.as_ref() != Some(vec_var) {
+                return None;
+            }
+            match &op.kind {
+                OpKind::FieldRead {
+                    base, field, pure, ..
+                } if field.inline_vec && field.vec_part.is_none() => {
+                    Some((base.clone(), field.clone(), *pure))
+                }
+                _ => None,
+            }
         })
     });
-    if inline {
-        for block in &mut graph.blocks {
-            for op in &mut block.operations {
-                if op.result.as_ref() != Some(vec_var) {
-                    continue;
-                }
-                if let OpKind::FieldRead { field, ty, .. } = &mut op.kind
-                    && field.inline_vec
-                    && field.vec_part.is_none()
-                {
-                    field.vec_part = Some(part);
-                    field.taken_by_address = false;
-                    *ty = match part {
-                        crate::model::VecFieldPart::Buf => ValueType::Ref(None),
-                        crate::model::VecFieldPart::Len => ValueType::Int,
-                    };
-                }
-            }
-        }
-        return vec_var.clone();
+    if let Some((base, mut field, pure)) = inline_field {
+        field.vec_part = Some(part);
+        field.taken_by_address = false;
+        let ty = match part {
+            crate::model::VecFieldPart::Buf => ValueType::Ref(None),
+            crate::model::VecFieldPart::Len => ValueType::Int,
+        };
+        let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::FieldRead {
+                base,
+                field,
+                ty,
+                pure,
+            },
+        });
+        return res;
     }
     let name = match part {
         crate::model::VecFieldPart::Buf => "buf",
@@ -15624,6 +15631,8 @@ impl<'a> Lowering<'a> {
         }
         let op_kind =
             self.rewrite_equal_layout_result_branch(op_kind, first_arg_ty.as_ref(), &call.dest.ty);
+        let op_kind =
+            self.stamp_result_branch_payloads(op_kind, first_arg_ty.as_ref(), &call.dest.ty);
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result_var.clone()),
             kind: op_kind,
@@ -19757,6 +19766,74 @@ impl<'a> Lowering<'a> {
             return op_kind;
         };
         rewrite_result_branch_for_layouts(op_kind, Some(&result_layout), Some(&flow_layout))
+    }
+
+    /// Record each `Result::branch` variant payload from the Result and
+    /// ControlFlow type decls. The later match reads these instead of
+    /// assuming every payload is a reference.
+    fn stamp_result_branch_payloads(
+        &self,
+        kind: OpKind,
+        recv_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+    ) -> OpKind {
+        let OpKind::Call {
+            target,
+            args,
+            result_ty,
+        } = kind
+        else {
+            return kind;
+        };
+        let CallTarget::Method {
+            name,
+            receiver_root,
+            ..
+        } = &target
+        else {
+            return OpKind::Call {
+                target,
+                args,
+                result_ty,
+            };
+        };
+        if name != "branch" || !receiver_root.as_deref().unwrap_or("").ends_with("Result") {
+            return OpKind::Call {
+                target,
+                args,
+                result_ty,
+            };
+        }
+        let Some(recv_ty) = recv_ty else {
+            return OpKind::Call {
+                target,
+                args,
+                result_ty,
+            };
+        };
+        if !crate::front::result_exc::tyref_is_result(recv_ty, self.llbc) {
+            return OpKind::Call {
+                target,
+                args,
+                result_ty,
+            };
+        }
+        let payloads = crate::model::ResultBranchPayloads {
+            ok: adt_variant_payload_type(recv_ty, "Ok", self.llbc, self.tombstoned_leaves),
+            err: adt_variant_payload_type(recv_ty, "Err", self.llbc, self.tombstoned_leaves),
+            continue_ty: adt_variant_payload_type(
+                dest_ty,
+                "Continue",
+                self.llbc,
+                self.tombstoned_leaves,
+            ),
+            break_ty: adt_variant_payload_type(dest_ty, "Break", self.llbc, self.tombstoned_leaves),
+        };
+        OpKind::Call {
+            target: target.with_branch_payloads(payloads),
+            args,
+            result_ty,
+        }
     }
 
     fn layout_of_tyref(&self, ty: &TyRef) -> Option<majit_charon_reader::ullbc::TypeLayout> {
@@ -35208,6 +35285,12 @@ fn lower_result_branch_to_control_flow(graph: &mut FunctionGraph) {
             let Some(result) = op.result.clone() else {
                 continue;
             };
+            let payloads = match target {
+                CallTarget::Method {
+                    branch_payloads, ..
+                } => branch_payloads.clone(),
+                _ => None,
+            };
             sites.push((
                 bi,
                 oi,
@@ -35217,10 +35300,11 @@ fn lower_result_branch_to_control_flow(graph: &mut FunctionGraph) {
                 receiver_root
                     .clone()
                     .unwrap_or_else(|| "core::result::Result".to_string()),
+                payloads,
             ));
         }
     }
-    for (bi, oi, operand, result, result_ty, result_owner) in sites.into_iter().rev() {
+    for (bi, oi, operand, result, result_ty, result_owner, payloads) in sites.into_iter().rev() {
         lower_result_branch_as_match(
             graph,
             BlockId(bi),
@@ -35229,6 +35313,7 @@ fn lower_result_branch_to_control_flow(graph: &mut FunctionGraph) {
             &result,
             &result_owner,
             &result_ty,
+            payloads.as_ref(),
         );
     }
 }
@@ -35271,6 +35356,57 @@ fn push_enum_field_read(
 
 /// Replace one `Result::branch` call with a discriminant switch that builds
 /// `ControlFlow::Continue` or `ControlFlow::Break`.
+/// Register bank of one enum variant's payload, taken from that variant's
+/// field on the type decl. A `TypeVar` field is the corresponding generic
+/// argument of `ty`. Unit and other zero-sized payloads are `None`: the
+/// match emits no read and no field for them.
+fn adt_variant_payload_type(
+    ty: &TyRef,
+    variant: &str,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<ValueType> {
+    let node = tyref_node(ty, llbc).and_then(|node| strip_ty_wrappers(node, llbc))?;
+    let def_id = adt_node_def_id(node)?;
+    let td = llbc.type_by_id(def_id)?;
+    let TypeDeclKind::Enum(variants) = &td.kind else {
+        return None;
+    };
+    let field = variants
+        .iter()
+        .find(|decl| decl.name == variant)?
+        .fields
+        .first()?;
+    let concrete = substitute_typevar_field(&field.ty, node, llbc)?;
+    if is_unit_type(&concrete, llbc) || tyref_is_void_zst(&concrete, llbc) {
+        return None;
+    }
+    let value = tyref_enum_payload_value_type(&concrete, llbc, tombstoned);
+    if value == ValueType::Void {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn substitute_typevar_field(
+    field_ty: &TyRef,
+    owner_adt: &serde_json::Value,
+    llbc: &Llbc,
+) -> Option<TyRef> {
+    let node = tyref_node(field_ty, llbc).and_then(|node| strip_ty_indirections(node, llbc))?;
+    if let Some(index) = typevar_bound_index(node) {
+        let arg = owner_adt
+            .get("Adt")?
+            .get("generics")?
+            .get("types")?
+            .as_array()?
+            .get(index as usize)?;
+        return serde_json::from_value(arg.clone()).ok();
+    }
+    Some(clone_tyref(field_ty))
+}
+
 fn lower_result_branch_as_match(
     graph: &mut FunctionGraph,
     block: BlockId,
@@ -35279,11 +35415,11 @@ fn lower_result_branch_as_match(
     result: &Variable,
     result_owner: &str,
     result_ty: &ValueType,
+    payloads: Option<&crate::model::ResultBranchPayloads>,
 ) {
     use crate::front::bool_then::{emit_sum_variant, map_source};
 
     let cf_owner = control_flow_owner(result_ty);
-    let payload_ty = ValueType::Ref(None);
     let mut prefix_defined = graph.block(block).inputargs.clone();
     for op in graph.block(block).operations.iter().take(op_idx) {
         if let Some(produced) = &op.result {
@@ -35353,22 +35489,38 @@ fn lower_result_branch_as_match(
         let sources = prefix_defined.clone();
         let (arm, arm_inputs) = graph.create_block_with_arg_vars(sources.len());
         let operand_arm = map_source(&sources, &arm_inputs, operand).expect("operand threaded");
-        let payload = push_enum_field_read(
-            graph,
-            arm,
-            operand_arm,
-            &format!("{result_owner}::{result_variant}"),
-            "__pos_0",
-            payload_ty.clone(),
-        );
+        let (read_ty, write_ty) = match (tag, payloads) {
+            (0, Some(payloads)) => (payloads.ok.clone(), payloads.continue_ty.clone()),
+            (1, Some(payloads)) => (payloads.err.clone(), payloads.break_ty.clone()),
+            // A call lowered without type decls keeps the reference bank the
+            // match used before the decls were consulted.
+            _ => (Some(ValueType::Ref(None)), Some(ValueType::Ref(None))),
+        };
         let payload_owner = format!("{cf_owner}::{flow_variant}");
+        let payload = match (read_ty, write_ty) {
+            (Some(read_ty), Some(write_ty)) => Some((
+                payload_owner,
+                push_enum_field_read(
+                    graph,
+                    arm,
+                    operand_arm,
+                    &format!("{result_owner}::{result_variant}"),
+                    "__pos_0",
+                    read_ty,
+                ),
+                write_ty,
+            )),
+            _ => None,
+        };
         let built = emit_sum_variant(
             graph,
             arm,
             &cf_owner,
             flow_variant,
             tag,
-            Some((&payload_owner, payload, payload_ty.clone())),
+            payload
+                .as_ref()
+                .map(|(owner, value, ty)| (owner.as_str(), value.clone(), ty.clone())),
         );
         let mut args: Vec<Variable> = sources
             .iter()
@@ -38274,6 +38426,153 @@ mod tests {
         }
         assert!(ctors.iter().any(|name| name == "Continue"), "{ctors:?}");
         assert!(ctors.iter().any(|name| name == "Break"), "{ctors:?}");
+    }
+
+    fn result_flow_llbc(ok_ty: serde_json::Value, err_ty: serde_json::Value) -> Llbc {
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+        }});
+        let meta = |path: &[&str]| {
+            serde_json::json!({
+                "name": path.iter().map(|seg| serde_json::json!({"Ident": [seg, 0]})).collect::<Vec<_>>(),
+                "span": span.clone(),
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": false
+            })
+        };
+        let enum_decl = |def_id: u64, path: &[&str], variants: &[(&str, u64)]| {
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": meta(path),
+                "kind": {"Enum": variants.iter().map(|(name, index)| serde_json::json!({
+                    "name": name,
+                    "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, index]}}}],
+                    "discriminant": {"Scalar": {"Signed": ["Isize", index.to_string()]}}
+                })).collect::<Vec<_>>()},
+                "layout": []
+            })
+        };
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [
+                    enum_decl(0, &["core", "result", "Result"], &[("Ok", 0), ("Err", 1)]),
+                    enum_decl(1, &["core", "ops", "control_flow", "ControlFlow"], &[("Break", 0), ("Continue", 1)]),
+                ],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let _ = (ok_ty, err_ty);
+        Llbc::from_slice(file.to_string().as_bytes()).expect("result/controlflow llbc")
+    }
+
+    fn branch_adt_ty(def_id: u64, args: &[serde_json::Value]) -> TyRef {
+        serde_json::from_value(serde_json::json!({
+            "Adt": {
+                "id": {"Adt": def_id},
+                "generics": {"regions": [], "types": args, "const_generics": [], "trait_refs": []}
+            }
+        }))
+        .expect("adt ty")
+    }
+
+    fn branch_graph(payloads: crate::model::ResultBranchPayloads) -> FunctionGraph {
+        let mut graph = FunctionGraph::new("result_branch_payload");
+        let entry = graph.startblock;
+        let operand = graph
+            .push_op_var(entry, OpKind::ConstInt(1), true)
+            .expect("operand");
+        let result = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::method("branch", Some("core::result::Result".into()))
+                        .with_branch_payloads(payloads),
+                    args: vec![LinkArg::Value(operand)],
+                    result_ty: ValueType::Ref(Some("core::ops::control_flow::ControlFlow".into())),
+                },
+                true,
+            )
+            .expect("branch");
+        graph.set_return(entry, Some(result));
+        graph
+    }
+
+    fn payload_field_tys(graph: &FunctionGraph) -> (Vec<ValueType>, Vec<ValueType>) {
+        let mut reads = Vec::new();
+        let mut writes = Vec::new();
+        for op in graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+        {
+            match &op.kind {
+                OpKind::FieldRead { field, ty, .. } if field.name == "__pos_0" => {
+                    reads.push(ty.clone());
+                }
+                OpKind::FieldWrite { field, ty, .. } if field.name == "__pos_0" => {
+                    writes.push(ty.clone());
+                }
+                _ => {}
+            }
+        }
+        (reads, writes)
+    }
+
+    #[test]
+    fn result_branch_match_uses_int_payloads_from_the_type_decls() {
+        let i64_ty = serde_json::json!({"Literal": {"Int": "I64"}});
+        let llbc = result_flow_llbc(i64_ty.clone(), i64_ty.clone());
+        let result_ty = branch_adt_ty(0, &[i64_ty.clone(), i64_ty.clone()]);
+        // ControlFlow<B, C>: field 0 is Break, field 1 is Continue.
+        let flow_ty = branch_adt_ty(1, &[i64_ty.clone(), i64_ty]);
+        let tombstoned = std::collections::HashSet::new();
+        let payloads = crate::model::ResultBranchPayloads {
+            ok: super::adt_variant_payload_type(&result_ty, "Ok", &llbc, &tombstoned),
+            err: super::adt_variant_payload_type(&result_ty, "Err", &llbc, &tombstoned),
+            continue_ty: super::adt_variant_payload_type(&flow_ty, "Continue", &llbc, &tombstoned),
+            break_ty: super::adt_variant_payload_type(&flow_ty, "Break", &llbc, &tombstoned),
+        };
+        assert_eq!(payloads.ok, Some(ValueType::Int));
+        assert_eq!(payloads.err, Some(ValueType::Int));
+        assert_eq!(payloads.continue_ty, Some(ValueType::Int));
+        assert_eq!(payloads.break_ty, Some(ValueType::Int));
+        let mut graph = branch_graph(payloads);
+        super::lower_result_branch_to_control_flow(&mut graph);
+        let (reads, writes) = payload_field_tys(&graph);
+        assert_eq!(reads, vec![ValueType::Int, ValueType::Int]);
+        assert_eq!(writes, vec![ValueType::Int, ValueType::Int]);
+    }
+
+    #[test]
+    fn result_branch_match_emits_nothing_for_void_payloads() {
+        let unit = serde_json::json!({"Adt": {"id": "Tuple", "generics": {"types": []}}});
+        let llbc = result_flow_llbc(unit.clone(), unit.clone());
+        let result_ty = branch_adt_ty(0, &[unit.clone(), unit.clone()]);
+        let flow_ty = branch_adt_ty(1, &[unit.clone(), unit]);
+        let tombstoned = std::collections::HashSet::new();
+        let payloads = crate::model::ResultBranchPayloads {
+            ok: super::adt_variant_payload_type(&result_ty, "Ok", &llbc, &tombstoned),
+            err: super::adt_variant_payload_type(&result_ty, "Err", &llbc, &tombstoned),
+            continue_ty: super::adt_variant_payload_type(&flow_ty, "Continue", &llbc, &tombstoned),
+            break_ty: super::adt_variant_payload_type(&flow_ty, "Break", &llbc, &tombstoned),
+        };
+        assert_eq!(payloads.ok, None);
+        assert_eq!(payloads.err, None);
+        assert_eq!(payloads.continue_ty, None);
+        assert_eq!(payloads.break_ty, None);
+        let mut graph = branch_graph(payloads);
+        super::lower_result_branch_to_control_flow(&mut graph);
+        let (reads, writes) = payload_field_tys(&graph);
+        assert!(reads.is_empty(), "void payload emits no read: {reads:?}");
+        assert!(writes.is_empty(), "void payload emits no field: {writes:?}");
+        assert_eq!(count_branch_calls(&graph), 0);
     }
 
     #[test]
@@ -46223,8 +46522,24 @@ mod tests {
             .expect("stack field");
         let bb = inline.startblock;
         let buf = super::retarget_vec_operand(&mut inline, bb, &stack, VecFieldPart::Buf);
-        assert_eq!(buf, stack, "inline field retargets the field read in place");
-        assert_eq!(field_part(&inline, &stack), VecFieldPart::Buf);
+        assert_ne!(buf, stack, "inline field keeps the original read");
+        assert!(
+            inline
+                .blocks
+                .iter()
+                .flat_map(|block| block.operations.iter())
+                .any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldRead { field, .. }
+                            if op.result.as_ref() == Some(&stack)
+                                && field.inline_vec
+                                && field.vec_part.is_none()
+                    )
+                }),
+            "the shared field read stays the whole Vec"
+        );
+        assert_eq!(field_part(&inline, &buf), VecFieldPart::Buf);
 
         let mut local = FunctionGraph::new("vec_local");
         let arg = input(&mut local, "v");
@@ -46265,6 +46580,90 @@ mod tests {
             }
             other => panic!("box receiver must getfield the length word, got {other:?}"),
         }
+    }
+
+    /// `let v = &mut frame.items; let n = v.len(); v[0]` binds the inline
+    /// field once. Each use gets its own component read; neither read is
+    /// stacked on the other.
+    #[test]
+    fn shared_inline_vec_len_and_index_keep_the_field_read() {
+        use crate::model::{FieldDescriptor, FunctionGraph, OpKind, ValueType, VecFieldPart};
+
+        let mut graph = FunctionGraph::new("shared_inline_vec");
+        let frame = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "frame".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .expect("frame");
+        let v = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: frame.clone(),
+                    field: FieldDescriptor::new("items", Some("Frame".into()))
+                        .with_inline_vec(true),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .expect("items");
+        let bb = graph.startblock;
+        let len = super::retarget_vec_operand(&mut graph, bb, &v, VecFieldPart::Len);
+        let elem = super::retarget_vec_operand(&mut graph, bb, &v, VecFieldPart::Buf);
+        assert_ne!(len, v);
+        assert_ne!(elem, v);
+        assert_ne!(len, elem);
+        let mut component_bases = Vec::new();
+        let mut original_intact = false;
+        for op in graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+        {
+            match &op.kind {
+                OpKind::FieldRead {
+                    base, field, ty, ..
+                } if op.result.as_ref() == Some(&v) => {
+                    original_intact = field.inline_vec
+                        && field.vec_part.is_none()
+                        && field.name == "items"
+                        && base == &frame;
+                    let _ = ty;
+                }
+                OpKind::FieldRead {
+                    base, field, ty, ..
+                } if op.result.as_ref() == Some(&len) || op.result.as_ref() == Some(&elem) => {
+                    assert_eq!(
+                        base, &frame,
+                        "component read uses the struct, not a Vec word"
+                    );
+                    assert_eq!(field.name, "items");
+                    assert!(field.inline_vec);
+                    assert_ne!(base, &len);
+                    assert_ne!(base, &elem);
+                    component_bases.push((field.vec_part, ty.clone()));
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            original_intact,
+            "original field read must survive both uses"
+        );
+        assert_eq!(
+            component_bases,
+            vec![
+                (Some(VecFieldPart::Len), ValueType::Int),
+                (Some(VecFieldPart::Buf), ValueType::Ref(None)),
+            ]
+        );
     }
 
     /// The `Vec` index fold must accept a `usize` index.

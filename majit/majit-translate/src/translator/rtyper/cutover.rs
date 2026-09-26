@@ -6549,6 +6549,7 @@ mod tests {
                             receiver_root: Some("mut_ptr".to_string()),
                             resolved_path: None,
                             fun_decl_id: None,
+                            branch_payloads: None,
                         },
                         args: crate::model::call_args(vec![v_ok.clone()]),
                         result_ty: ValueType::Bool,

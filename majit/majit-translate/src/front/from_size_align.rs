@@ -736,6 +736,7 @@ mod tests {
             receiver_root: Some("Result".to_string()),
             resolved_path: None,
             fun_decl_id: None,
+            branch_payloads: None,
         }
     }
 
@@ -1074,6 +1075,7 @@ mod tests {
             receiver_root: Some("Result".to_string()),
             resolved_path: None,
             fun_decl_id: None,
+            branch_payloads: None,
         }
     }
 
@@ -1381,6 +1383,7 @@ mod tests {
             receiver_root: Some("Layout".to_string()),
             resolved_path: None,
             fun_decl_id: None,
+            branch_payloads: None,
         }
     }
 
