@@ -734,8 +734,7 @@ fn unpack_slow(this: &W_Struct, w_str: PyObjectRef) -> Result<PyObjectRef, crate
 ///
 /// The generated `#[pyre_methods]` wrapper `inline_call`s the method, and
 /// that call is an effect, so `pack_slow`'s `dont_look_inside` would sit
-/// after an effect.  The walk is spelled here, the way
-/// `__majit_wrap_str_descr_startswith` spells `rstring_prefix_eq`.
+/// after an effect.  The walk is spelled here instead.
 pub fn __majit_wrap_struct_pack(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let Some(this) = W_Struct::from_obj(args.get(0).copied().unwrap_or(PY_NULL)) else {
         return Err(crate::PyError::type_error(
